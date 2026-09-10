@@ -110,12 +110,19 @@ func (p *peerPool) OpenStream(ctx context.Context, host, addr string) (PeerStrea
 	// The endpoint is owned by hostPool and protected by h.mu. Keep the
 	// comparison under that lock as replacement mutates it while holding h.mu.
 	h.mu.Lock()
+	h.openers++
 	endpointChanged := h.addr != addr
 	h.mu.Unlock()
 	if endpointChanged {
 		h.replaceLocked(addr)
 	}
 	p.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		h.openers--
+		h.mu.Unlock()
+		h.evictIfEmpty()
+	}()
 	return h.open(ctx)
 }
 func (p *peerPool) Close() error {
@@ -130,9 +137,18 @@ func (p *peerPool) Close() error {
 		hs = append(hs, h)
 	}
 	p.mu.Unlock()
+	deadline := time.Now().Add(p.cfg.DrainTimeout)
+	var drains sync.WaitGroup
 	for _, h := range hs {
-		h.close()
+		h.mu.Lock()
+		h.closed = true
+		h.mu.Unlock()
 	}
+	for _, h := range hs {
+		drains.Add(1)
+		go func() { defer drains.Done(); h.close(deadline) }()
+	}
+	drains.Wait()
 	return nil
 }
 
@@ -149,6 +165,9 @@ type hostPool struct {
 	retryAt            time.Time
 	retired            int
 	replacing          bool
+	openers            int
+	eviction           *time.Timer
+	retiredConns       map[*peerConn]struct{}
 }
 
 const (
@@ -228,6 +247,8 @@ func (h *hostPool) replaceLocked(addr string) {
 	h.replacing = true
 	h.addr = addr
 	h.endpointGeneration++
+	h.failures = 0
+	h.retryAt = time.Time{}
 	// Detach the old endpoint connections from capacity accounting immediately.
 	// They remain alive only to drain their existing streams; retaining them in
 	// h.conns would consume the replacement endpoint's connection slots.
@@ -241,6 +262,10 @@ func (h *hostPool) replaceLocked(addr string) {
 		isIdle := c.active == 0
 		c.mu.Unlock()
 		h.retired++
+		if h.retiredConns == nil {
+			h.retiredConns = make(map[*peerConn]struct{})
+		}
+		h.retiredConns[c] = struct{}{}
 		h.parent.cfg.Telemetry.PeerConnection(-1)
 		if isIdle {
 			idle = append(idle, c)
@@ -256,13 +281,7 @@ func (h *hostPool) replaceLocked(addr string) {
 	}
 	h.mu.Lock()
 	h.replacing = false
-	empty := !h.closed && len(h.conns) == 0 && h.retired == 0 && !h.dialing
 	h.mu.Unlock()
-	if empty {
-		// replaceLocked is called while the parent map lock is held; defer
-		// eviction until that lock is released.
-		go h.evictIfEmpty()
-	}
 }
 func (h *hostPool) open(ctx context.Context) (PeerStream, error) {
 	for {
@@ -450,17 +469,33 @@ func (h *hostPool) open(ctx context.Context) (PeerStream, error) {
 }
 
 func (h *hostPool) evictIfEmpty() {
+	h.parent.mu.Lock()
+	defer h.parent.mu.Unlock()
 	h.mu.Lock()
-	empty := !h.closed && !h.replacing && len(h.conns) == 0 && h.retired == 0 && !h.dialing
-	h.mu.Unlock()
-	if !empty {
+	defer h.mu.Unlock()
+	if h.closed || h.replacing || h.openers != 0 || len(h.conns) != 0 || h.retired != 0 || h.dialing {
 		return
 	}
-	h.parent.mu.Lock()
+	// Retain failed-host retry state for a bounded idle period. Active callers
+	// pin the entry so eviction cannot orphan an in-flight open.
+	if h.failures > 0 {
+		if h.eviction != nil {
+			h.eviction.Stop()
+		}
+		h.eviction = time.AfterFunc(peerReconnectMaxBackoff, func() {
+			h.parent.mu.Lock()
+			defer h.parent.mu.Unlock()
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if h.openers == 0 && !h.dialing && len(h.conns) == 0 && h.retired == 0 && h.parent.hosts[h.host] == h {
+				delete(h.parent.hosts, h.host)
+			}
+		})
+		return
+	}
 	if h.parent.hosts[h.host] == h {
 		delete(h.parent.hosts, h.host)
 	}
-	h.parent.mu.Unlock()
 }
 
 func min(a, b int) int {
@@ -498,20 +533,6 @@ func (h *hostPool) markFailed(c *peerConn) {
 	}
 	h.mu.Unlock()
 	if found {
-		h.parent.mu.Lock()
-		if h.parent.hosts[h.host] == h {
-			// Failed capacity leaves no retired connections; discard the host
-			// entry once no dial is in flight so caller-supplied IDs stay bounded.
-			h.mu.Lock()
-			empty := len(h.conns) == 0 && h.retired == 0 && !h.dialing && !h.closed && !h.replacing
-			h.mu.Unlock()
-			if empty {
-				delete(h.parent.hosts, h.host)
-			}
-		}
-		h.parent.mu.Unlock()
-	}
-	if found {
 		c.mu.Lock()
 		c.draining = true
 		c.removed = true
@@ -529,22 +550,22 @@ func (h *hostPool) markFailed(c *peerConn) {
 			_ = s.PeerStream.Close()
 		}
 		h.parent.cfg.Telemetry.PeerFailure()
+		h.evictIfEmpty()
 	}
 }
 
 func (h *hostPool) remove(target *peerConn) {
 	h.mu.Lock()
-	removed := false
 	for i, c := range h.conns {
 		if c == target {
 			h.conns = append(h.conns[:i], h.conns[i+1:]...)
 			h.parent.cfg.Telemetry.PeerConnection(-1)
-			removed = true
 			break
 		}
 	}
 	if target.detached {
 		target.detached = false
+		delete(h.retiredConns, target)
 		if h.retired > 0 {
 			h.retired--
 		}
@@ -556,18 +577,11 @@ func (h *hostPool) remove(target *peerConn) {
 	}
 	target.drainScheduled = false
 	target.mu.Unlock()
-	shouldEvict := !h.closed && !h.replacing && len(h.conns) == 0 && h.retired == 0 && !h.dialing
+	replacing := h.replacing
 	h.mu.Unlock()
-	// Removal is the ownership boundary for pooled transports. Close even
-	// when the entry was already detached so every reclamation path releases
-	// the underlying connection exactly once.
 	target.close()
-	if shouldEvict || removed {
-		h.parent.mu.Lock()
-		if h.parent.hosts[h.host] == h && shouldEvict {
-			delete(h.parent.hosts, h.host)
-		}
-		h.parent.mu.Unlock()
+	if !replacing {
+		h.evictIfEmpty()
 	}
 }
 func (h *hostPool) scheduleDrain(c *peerConn) {
@@ -627,12 +641,17 @@ func (h *hostPool) scheduleDrain(c *peerConn) {
 		}
 	}()
 }
-func (h *hostPool) close() {
+func (h *hostPool) close(deadline time.Time) {
 	h.mu.Lock()
 	h.closed = true
 	cs := append([]*peerConn(nil), h.conns...)
+	for c := range h.retiredConns {
+		cs = append(cs, c)
+	}
+	if h.eviction != nil {
+		h.eviction.Stop()
+	}
 	h.mu.Unlock()
-	deadline := time.Now().Add(h.parent.cfg.DrainTimeout)
 	for _, c := range cs {
 		c.mu.Lock()
 		c.draining = true

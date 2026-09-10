@@ -86,7 +86,7 @@ func TestPeerPoolReusesConnectionAndGrowsLazily(t *testing.T) {
 	_ = p.Close()
 }
 
-func TestPeerPoolEvictsHostAfterIdleDialFailure(t *testing.T) {
+func TestPeerPoolRetainsBackoffAfterIdleDialFailure(t *testing.T) {
 	var dials atomic.Int32
 	p := NewPeerTransport(PeerPoolConfig{Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
 		dials.Add(1)
@@ -97,8 +97,8 @@ func TestPeerPoolEvictsHostAfterIdleDialFailure(t *testing.T) {
 	}
 	pp := p.(*peerPool)
 	pp.mu.Lock()
-	if len(pp.hosts) != 0 {
-		t.Fatalf("hosts after failed idle dial = %d, want 0", len(pp.hosts))
+	if len(pp.hosts) != 1 {
+		t.Fatalf("hosts after failed idle dial = %d, want 1", len(pp.hosts))
 	}
 	pp.mu.Unlock()
 	if dials.Load() != 1 {
@@ -221,12 +221,16 @@ func TestPeerPoolReplacementDuringDialDiscardsStaleConnection(t *testing.T) {
 		first <- err
 	}()
 	<-oldStarted
+	pp := p.(*peerPool)
+	pp.mu.Lock()
+	pp.hosts["host"].replaceLocked("new")
+	pp.mu.Unlock()
+	close(oldRelease)
 	second, err := p.OpenStream(context.Background(), "host", "new")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = second.Close()
-	close(oldRelease)
 	if err := <-first; err != nil {
 		t.Fatal(err)
 	}
@@ -587,4 +591,83 @@ func TestPeerPoolFailureTerminatesActiveStreamsWithoutReplayAndRecovers(t *testi
 	_ = s2.Close()
 	_ = s3.Close()
 	_ = p.Close()
+}
+
+func TestPeerPoolFailedDialBackoffAppliesToNextCaller(t *testing.T) {
+	var dials atomic.Int32
+	p := NewPeerTransport(PeerPoolConfig{Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		dials.Add(1)
+		return nil, nil, errors.New("unavailable")
+	}})
+	defer p.Close()
+	_, _ = p.OpenStream(context.Background(), "host", "addr")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := p.OpenStream(ctx, "host", "addr"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v", err)
+	}
+	if dials.Load() != 1 {
+		t.Fatalf("retried before backoff: %d", dials.Load())
+	}
+}
+
+func TestPeerPoolShutdownUsesOneDeadline(t *testing.T) {
+	dial, _, conns := testDialer()
+	p := NewPeerTransport(PeerPoolConfig{Dial: dial, DrainTimeout: 100 * time.Millisecond})
+	for _, host := range []string{"a", "b", "c", "d"} {
+		if _, err := p.OpenStream(context.Background(), host, "old"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.OpenStream(context.Background(), host, "new"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := time.Now()
+	_ = p.Close()
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("shutdown took %v", elapsed)
+	}
+	for _, conn := range *conns {
+		if conn.closed.Load() != 1 {
+			t.Fatalf("connection closed %d times", conn.closed.Load())
+		}
+	}
+}
+
+func TestPeerPoolReplacementRemainsRegistered(t *testing.T) {
+	dial, dials, _ := testDialer()
+	p := NewPeerTransport(PeerPoolConfig{Dial: dial, MaxConnections: 1}).(*peerPool)
+	defer p.Close()
+	stream, err := p.OpenStream(context.Background(), "host", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stream.Close()
+	p.mu.Lock()
+	original := p.hosts["host"]
+	original.mu.Lock()
+	original.openers++
+	original.mu.Unlock()
+	original.replaceLocked("new")
+	p.mu.Unlock()
+	original.evictIfEmpty()
+	p.mu.Lock()
+	same := p.hosts["host"] == original
+	p.mu.Unlock()
+	if !same {
+		t.Fatal("pending replacement was evicted")
+	}
+	original.mu.Lock()
+	original.openers--
+	original.mu.Unlock()
+	for i := 0; i < 10; i++ {
+		stream, err = p.OpenStream(context.Background(), "host", "new")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = stream.Close()
+	}
+	if dials.Load() != 2 {
+		t.Fatalf("dials = %d", dials.Load())
+	}
 }

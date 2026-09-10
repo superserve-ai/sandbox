@@ -21,17 +21,20 @@ func (c PeerTLSConfig) LoadClient() (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Load is server-oriented; retain its certificate/roots but use standard
-	// client chain verification and fail closed on a missing or mismatched
-	// SPIFFE peer identity. An empty ServerName intentionally skips DNS-name
-	// verification; the peer's SPIFFE URI is the authenticated identity.
+	// SPIFFE authenticates the URI rather than the dial target. Verify the
+	// chain explicitly because gRPC fills ServerName from that target.
 	return &tls.Config{Certificates: base.Certificates, RootCAs: base.ClientCAs, MinVersion: tls.VersionTLS13,
+		InsecureSkipVerify: true, // Chain and URI verification are mandatory below.
 		VerifyConnection: func(state tls.ConnectionState) error {
 			if len(state.PeerCertificates) == 0 {
 				return fmt.Errorf("missing peer certificate")
 			}
-			if len(state.VerifiedChains) == 0 {
-				return fmt.Errorf("peer certificate chain is not trusted")
+			intermediates := x509.NewCertPool()
+			for _, cert := range state.PeerCertificates[1:] {
+				intermediates.AddCert(cert)
+			}
+			if _, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{Roots: base.ClientCAs, Intermediates: intermediates, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+				return fmt.Errorf("verify peer certificate chain: %w", err)
 			}
 			for _, u := range state.PeerCertificates[0].URIs {
 				if u.String() == c.ExpectedSPIFFE {

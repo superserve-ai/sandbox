@@ -236,3 +236,5 @@ func TestSandboxLoggerIncludesSandboxAndHostID(t *testing.T) {
 }
 
 var _ telemetry.Recorder = (*captureTelemetryRecorder)(nil)
+
+func (*captureTelemetryRecorder) RecordPeerEvent(context.Context, telemetry.PeerEvent) {}

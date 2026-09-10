@@ -116,8 +116,8 @@ type OTelRecorder struct {
 	launcherReady            metric.Int64Gauge
 	peerIngressEvents        metric.Int64Counter
 	peerIngressDuration      metric.Float64Histogram
-	peerConnections          metric.Int64Gauge
-	peerStreams              metric.Int64Gauge
+	peerConnections          metric.Int64UpDownCounter
+	peerStreams              metric.Int64UpDownCounter
 	peerEvents               metric.Int64Counter
 	peerHandshakeDuration    metric.Float64Histogram
 }
@@ -267,10 +267,10 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	if r.launcherReady, err = meter.Int64Gauge("vmd_launcher_ready"); err != nil {
 		return nil, err
 	}
-	if r.peerConnections, err = meter.Int64Gauge("peer_connections"); err != nil {
+	if r.peerConnections, err = meter.Int64UpDownCounter("peer_connections"); err != nil {
 		return nil, err
 	}
-	if r.peerStreams, err = meter.Int64Gauge("peer_active_streams"); err != nil {
+	if r.peerStreams, err = meter.Int64UpDownCounter("peer_active_streams"); err != nil {
 		return nil, err
 	}
 	if r.peerEvents, err = meter.Int64Counter("peer_events_total"); err != nil {
@@ -290,9 +290,9 @@ func (r *OTelRecorder) RecordPeerEvent(ctx context.Context, e PeerEvent) {
 	attrs := metric.WithAttributes(r.attrs(attribute.String("kind", safePeerKind(e.Kind)), attribute.String("result", safeResult(e.Result)), attribute.String("region", safeRegion(e.Region)), attribute.String("host_id", safeHostID(e.HostID)), attribute.Bool("forced", e.Forced))...)
 	switch e.Kind {
 	case "connection":
-		r.peerConnections.Record(ctx, e.Delta, attrs)
+		r.peerConnections.Add(ctx, e.Delta, attrs)
 	case "stream":
-		r.peerStreams.Record(ctx, e.Delta, attrs)
+		r.peerStreams.Add(ctx, e.Delta, attrs)
 	case "handshake":
 		if e.Duration > 0 {
 			r.peerHandshakeDuration.Record(ctx, e.Duration.Seconds(), attrs)
