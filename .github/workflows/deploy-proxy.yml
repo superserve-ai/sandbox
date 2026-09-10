@@ -33,6 +33,7 @@ on:
       - 'cmd/proxy/**'
       - 'internal/analytics/**'
       - 'internal/auth/**'
+      - 'internal/db/**'
       - 'internal/preview/**'
       - 'internal/proxy/**'
       - 'internal/sentrylog/**'
