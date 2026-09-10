@@ -18,7 +18,9 @@ import (
 
 	"github.com/superserve-ai/sandbox/proto/peerpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 )
 
 func peerTestCredentials(t *testing.T) PeerTLSConfig {
@@ -148,6 +150,9 @@ func (echoPeerServer) Forward(stream grpc.BidiStreamingServer[peerpb.PeerProxyFr
 		if err != nil {
 			return err
 		}
+		if string(frame.Data) == "reject" {
+			return status.Error(codes.PermissionDenied, "denied")
+		}
 		if err := stream.Send(frame); err != nil {
 			return err
 		}
@@ -201,4 +206,51 @@ func TestPeerPoolClosingStreamDoesNotFailSibling(t *testing.T) {
 	if string(buf) != "x" {
 		t.Fatalf("payload = %q", buf)
 	}
+}
+
+func TestPeerPoolRPCRejectionDoesNotFailSibling(t *testing.T) {
+	cfg := peerTestCredentials(t)
+	serverTLS, err := cfg.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	peerpb.RegisterPeerProxyServer(server, echoPeerServer{})
+	go server.Serve(listener)
+	defer server.Stop()
+	pool := NewPeerTransport(PeerPoolConfig{Dial: GRPCPeerDialer(cfg.LoadClient), StreamsPerConnection: 2, MaxConnections: 1})
+	defer pool.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	a, err := pool.OpenStream(ctx, "host", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := pool.OpenStream(ctx, "host", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if _, err := a.Write([]byte("reject")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Read(make([]byte, 1)); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("error = %v", err)
+	}
+	if _, err := b.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	if _, err := b.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	c, err := pool.OpenStream(ctx, "host", listener.Addr().String())
+	if err != nil {
+		t.Fatal("failed RPC did not release capacity:", err)
+	}
+	_ = c.Close()
 }

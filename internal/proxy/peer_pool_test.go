@@ -671,3 +671,96 @@ func TestPeerPoolReplacementRemainsRegistered(t *testing.T) {
 		t.Fatalf("dials = %d", dials.Load())
 	}
 }
+
+func TestPeerPoolCancelsObsoleteDials(t *testing.T) {
+	for _, operation := range []string{"replace", "close"} {
+		t.Run(operation, func(t *testing.T) {
+			started := make(chan struct{})
+			p := NewPeerTransport(PeerPoolConfig{DrainTimeout: time.Second, Dial: func(ctx context.Context, _, addr string) (PeerClient, io.Closer, error) {
+				if addr == "old" {
+					close(started)
+					<-ctx.Done()
+					return nil, nil, ctx.Err()
+				}
+				return &testPeerClient{}, &countingCloser{}, nil
+			}})
+			done := make(chan error, 1)
+			go func() {
+				s, err := p.OpenStream(context.Background(), "host", "old")
+				if s != nil {
+					_ = s.Close()
+				}
+				done <- err
+			}()
+			<-started
+			if operation == "replace" {
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				s, err := p.OpenStream(ctx, "host", "new")
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = s.Close()
+			} else {
+				_ = p.Close()
+			}
+			select {
+			case err := <-done:
+				if operation == "replace" && err != nil {
+					t.Fatal(err)
+				}
+				if operation == "close" && err == nil {
+					t.Fatal("open succeeded after shutdown")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("obsolete dial was not canceled")
+			}
+			_ = p.Close()
+		})
+	}
+}
+
+type pendingPeerClient struct{ started, release chan struct{} }
+
+func (c *pendingPeerClient) OpenPeerStream(context.Context) (PeerStream, error) {
+	close(c.started)
+	<-c.release
+	return &testPeerStream{}, nil
+}
+func TestPeerPoolReclaimsStalePendingOpen(t *testing.T) {
+	old := &pendingPeerClient{started: make(chan struct{}), release: make(chan struct{})}
+	oldCloser := &countingCloser{}
+	p := NewPeerTransport(PeerPoolConfig{DrainTimeout: time.Second, Dial: func(_ context.Context, _, addr string) (PeerClient, io.Closer, error) {
+		if addr == "old" {
+			return old, oldCloser, nil
+		}
+		return &testPeerClient{}, &countingCloser{}, nil
+	}})
+	defer p.Close()
+	done := make(chan error, 1)
+	go func() {
+		s, err := p.OpenStream(context.Background(), "host", "old")
+		if s != nil {
+			_ = s.Close()
+		}
+		done <- err
+	}()
+	<-old.started
+	s, err := p.OpenStream(context.Background(), "host", "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	close(old.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending open stuck")
+	}
+	if oldCloser.closed.Load() != 1 {
+		t.Fatal("idle retired connection was not reclaimed")
+	}
+}
