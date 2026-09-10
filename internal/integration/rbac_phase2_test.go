@@ -33,6 +33,8 @@ func TestListTrialCreditWarningRecipients(t *testing.T) {
 	}
 	seedTeamRoleAssignment(t, ctx, owner, mustRoleID(t, ctx, "team_owner"), teamID)
 	seedTeamRoleAssignment(t, ctx, billingAdmin, mustRoleID(t, ctx, "billing_admin"), teamID)
+	// Multiple matching assignments must not produce duplicate sends either.
+	seedTeamRoleAssignment(t, ctx, billingAdmin, mustRoleID(t, ctx, "team_owner"), teamID)
 	seedTeamRoleAssignment(t, ctx, duplicate, mustRoleID(t, ctx, "billing_admin"), teamID)
 	seedTeamRoleAssignment(t, ctx, viewer, mustRoleID(t, ctx, "viewer"), teamID)
 	seedTeamRoleAssignment(t, ctx, inactive, mustRoleID(t, ctx, "billing_admin"), teamID)

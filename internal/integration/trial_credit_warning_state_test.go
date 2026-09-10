@@ -18,7 +18,7 @@ func TestTrialCreditWarningStateClaimCompleteRelease(t *testing.T) {
 	teamID := mustCreateTeam(t, ctx, "trial-warning-state-"+uuid.NewString()[:8])
 
 	// Two workers racing for the same team may produce at most one claim.
-	const workers = 2
+	const workers = 8
 	tokens := make(chan pgtype.UUID, workers)
 	var wg sync.WaitGroup
 	for range workers {
@@ -51,6 +51,13 @@ func TestTrialCreditWarningStateClaimCompleteRelease(t *testing.T) {
 	if err := testQueries.CompleteTrialCreditWarning(ctx, db.CompleteTrialCreditWarningParams{TeamID: teamID, ClaimToken: token}); err != nil {
 		t.Fatalf("CompleteTrialCreditWarning: %v", err)
 	}
+	var status string
+	if err := testPool.QueryRow(ctx, `SELECT status FROM trial_credit_warning_state WHERE team_id = $1`, teamID).Scan(&status); err != nil {
+		t.Fatalf("read completed warning status: %v", err)
+	}
+	if status != "sent" {
+		t.Fatalf("completed warning status = %q, want sent", status)
+	}
 	if _, err := testQueries.ClaimTrialCreditWarning(ctx, teamID); err != pgx.ErrNoRows {
 		t.Fatalf("claim after completion = %v, want pgx.ErrNoRows", err)
 	}
@@ -64,12 +71,34 @@ func TestTrialCreditWarningStateClaimCompleteRelease(t *testing.T) {
 	if err := testQueries.ReleaseTrialCreditWarning(ctx, db.ReleaseTrialCreditWarningParams{TeamID: teamID, ClaimToken: retryToken}); err != nil {
 		t.Fatalf("ReleaseTrialCreditWarning: %v", err)
 	}
+	if err := testPool.QueryRow(ctx, `SELECT status FROM trial_credit_warning_state WHERE team_id = $1`, teamID).Scan(&status); err != nil {
+		t.Fatalf("read released warning status: %v", err)
+	}
+	if status != "pending" {
+		t.Fatalf("released warning status = %q, want pending", status)
+	}
 	newToken, err := testQueries.ClaimTrialCreditWarning(ctx, teamID)
 	if err != nil {
 		t.Fatalf("claim after release: %v", err)
 	}
 	if newToken == retryToken {
 		t.Fatal("claim after release reused the prior claim token")
+	}
+	// A stale worker must not be able to mutate the replacement generation.
+	if err := testQueries.ReleaseTrialCreditWarning(ctx, db.ReleaseTrialCreditWarningParams{TeamID: teamID, ClaimToken: retryToken}); err != nil {
+		t.Fatalf("stale release: %v", err)
+	}
+	if err := testQueries.CompleteTrialCreditWarning(ctx, db.CompleteTrialCreditWarningParams{TeamID: teamID, ClaimToken: retryToken}); err != nil {
+		t.Fatalf("stale complete: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT status FROM trial_credit_warning_state WHERE team_id = $1`, teamID).Scan(&status); err != nil {
+		t.Fatalf("read claim status: %v", err)
+	}
+	if status != "claimed" {
+		t.Fatalf("stale claim changed state to %q", status)
+	}
+	if err := testQueries.CompleteTrialCreditWarning(ctx, db.CompleteTrialCreditWarningParams{TeamID: teamID, ClaimToken: newToken}); err != nil {
+		t.Fatalf("current complete: %v", err)
 	}
 }
 
@@ -97,7 +126,13 @@ func TestTrialCreditWarningLifecycleSuppressesIneligibleTrials(t *testing.T) {
 				}
 			}
 			if tc.activate {
-				if _, err := testPool.Exec(ctx, `UPDATE team_billing_account SET trial_ended_at = now(), stripe_subscription_status = 'active' WHERE team_id = $1`, teamID); err != nil {
+				if _, err := testPool.Exec(ctx, `
+					INSERT INTO team_billing_account (team_id, trial_ended_at, stripe_subscription_status)
+					VALUES ($1, now(), 'active')
+					ON CONFLICT (team_id) DO UPDATE
+					SET trial_ended_at = EXCLUDED.trial_ended_at,
+					    stripe_subscription_status = EXCLUDED.stripe_subscription_status
+				`, teamID); err != nil {
 					t.Fatalf("activate billing: %v", err)
 				}
 			}
@@ -109,5 +144,54 @@ func TestTrialCreditWarningLifecycleSuppressesIneligibleTrials(t *testing.T) {
 				t.Fatalf("lifecycle %q remained warning-eligible: state=%q remaining=%v", tc.name, balance.State, balance.RemainingUsd)
 			}
 		})
+	}
+}
+
+func TestRecentTrialBurnSampleUsesWallClockAndRejectsStaleData(t *testing.T) {
+	ctx := context.Background()
+	teamID := mustCreateTeam(t, ctx, "trial-warning-sample-"+uuid.NewString()[:8])
+	sandboxID := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,'sample','active',$3)`, sandboxID, teamID, testDefaultHostID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	// Two overlapping intervals provide spend over a two-hour wall-clock span;
+	// the query must not sum their concurrent runtime as the denominator.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason)
+		VALUES ($1,$2,1,1024,now()-interval '2 hours',now()-interval '1 hour','paused'),
+		       ($1,$2,1,1024,now()-interval '90 minutes',now(),'paused')`, sandboxID, teamID); err != nil {
+		t.Fatalf("insert sample intervals: %v", err)
+	}
+	sample, err := testQueries.GetRecentTrialBurnSample(ctx, teamID)
+	if err != nil {
+		t.Fatalf("GetRecentTrialBurnSample: %v", err)
+	}
+	if sample.StartedAt == nil || sample.EndedAt == nil || !sample.ElapsedSeconds.Valid {
+		t.Fatal("expected wall-clock bounds for recent sample")
+	}
+	seconds, err := sample.ElapsedSeconds.Float64Value()
+	if err != nil || !seconds.Valid {
+		t.Fatalf("elapsed seconds numeric value: %+v (err=%v)", seconds, err)
+	}
+	if seconds.Float64 < 7100 || seconds.Float64 > 7300 {
+		t.Fatalf("elapsed seconds = %v, want about 7200", seconds.Float64)
+	}
+
+	teamID = mustCreateTeam(t, ctx, "trial-warning-stale-"+uuid.NewString()[:8])
+	sandboxID = uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,'stale','active',$3)`, sandboxID, teamID, testDefaultHostID); err != nil {
+		t.Fatalf("create stale sandbox: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_compute_billing_interval (sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason)
+		VALUES ($1,$2,1,1024,now()-interval '8 hours',now()-interval '7 hours','paused')`, sandboxID, teamID); err != nil {
+		t.Fatalf("insert stale interval: %v", err)
+	}
+	stale, err := testQueries.GetRecentTrialBurnSample(ctx, teamID)
+	if err != nil {
+		t.Fatalf("GetRecentTrialBurnSample stale: %v", err)
+	}
+	if stale.StartedAt != nil || stale.EndedAt != nil {
+		t.Fatal("stale sample should have unavailable bounds")
 	}
 }

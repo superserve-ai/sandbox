@@ -1027,14 +1027,17 @@ WITH selected_plan AS (
     ORDER BY tpp.effective_from DESC LIMIT 1), 'payg') AS plan_key
 ), ranked_rates AS (
   SELECT r.resource, r.price_usd,
-         row_number() OVER (PARTITION BY r.resource ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC) AS rate_rank
-  FROM pricing_rate r JOIN selected_plan p ON p.plan_key = r.plan_key
+         row_number() OVER (PARTITION BY r.resource, r.unit ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC) AS rate_rank
+  FROM pricing_rate r
+  JOIN selected_plan p ON p.plan_key = r.plan_key
+  JOIN pricing_plan pp ON pp.key = r.plan_key AND pp.active
   WHERE r.unit = 'second' AND r.effective_from <= now() AND (r.effective_to IS NULL OR r.effective_to > now())
 ), rates AS (
   SELECT COALESCE(MAX(price_usd) FILTER (WHERE resource = 'vcpu' AND rate_rank = 1), 0)::numeric AS vcpu,
          COALESCE(MAX(price_usd) FILTER (WHERE resource = 'memory_gib' AND rate_rank = 1), 0)::numeric AS memory,
          COALESCE(MAX(price_usd) FILTER (WHERE resource = 'storage_gib' AND rate_rank = 1), 0)::numeric AS storage
   FROM ranked_rates
+  WHERE rate_rank = 1
 ), recent_compute AS MATERIALIZED (
   SELECT GREATEST(b.started_at, now() - interval '6 hours') AS started_at,
          b.ended_at, b.vcpu_count, b.memory_mib
@@ -1047,7 +1050,7 @@ WITH selected_plan AS (
 ), compute AS (
   -- Convert each resource's usage to USD before aggregating.  The raw
   -- interval duration is vCPU-seconds and must never be exposed as spend.
-  SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (COALESCE(b.ended_at, now()) - b.started_at)) * (b.vcpu_count * COALESCE(rates.vcpu, 0) + b.memory_mib / 1024.0 * COALESCE(rates.memory, 0))), 0)::numeric AS amount,
+  SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(b.ended_at, now()), now()) - b.started_at)) * (b.vcpu_count * rates.vcpu + b.memory_mib / 1024.0 * rates.memory)), 0)::numeric AS amount,
        MIN(b.started_at) AS started_at,
        MAX(COALESCE(b.ended_at, now())) AS ended_at
 FROM recent_compute b
@@ -1063,14 +1066,14 @@ FROM recent_compute b
   LIMIT 128
 ), sample_bounds AS (
   SELECT MIN(started_at) AS started_at,
-         MAX(ended_at) AS ended_at
+         MAX(LEAST(ended_at, now())) AS ended_at
   FROM (
     SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_compute
     UNION ALL
     SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_storage
   ) intervals
 )
-SELECT (compute.amount + CASE WHEN feature_enabled('billing_storage_billing_enabled', sqlc.arg(team_id)) THEN COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (COALESCE(s.ended_at, now()) - s.started_at)) * s.disk_mib / 1024.0 * rates.storage) FROM recent_storage s CROSS JOIN rates), 0) ELSE 0 END)::numeric AS spent_usd,
+SELECT round((compute.amount + CASE WHEN feature_enabled('billing_storage_billing_enabled', sqlc.arg(team_id)) THEN COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(s.ended_at, now()), now()) - s.started_at)) * s.disk_mib / 1024.0 * rates.storage) FROM recent_storage s CROSS JOIN rates), 0) ELSE 0 END)::numeric, 6) AS spent_usd,
        sample_bounds.started_at, sample_bounds.ended_at,
        EXTRACT(EPOCH FROM (sample_bounds.ended_at - sample_bounds.started_at))::numeric AS elapsed_seconds
 FROM compute, rates, sample_bounds;
@@ -1083,7 +1086,7 @@ VALUES (sqlc.arg(team_id), 'claimed', gen_random_uuid(), now())
 ON CONFLICT (team_id) DO UPDATE
 SET status = 'claimed', claim_token = gen_random_uuid(), claimed_at = now(), updated_at = now()
 WHERE trial_credit_warning_state.status = 'pending'
-RETURNING COALESCE(claim_token, gen_random_uuid()) AS claim_token;
+RETURNING claim_token;
 
 -- name: CompleteTrialCreditWarning :exec
 UPDATE trial_credit_warning_state SET status = 'sent', sent_at = now(), updated_at = now()

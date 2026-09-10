@@ -11,7 +11,11 @@ WITH account AS (
   WHERE team_id = p_team_id AND reason = 'signup trial credit'
 ), grants AS (
   SELECT COALESCE(SUM(amount_usd), 0)::numeric AS amount, COUNT(*)::int AS count,
-         COUNT(*) FILTER (WHERE expires_at IS NULL OR expires_at > now())::int AS active_count,
+         -- A grant with no remaining balance is no longer active, even when
+         -- it has no expiry timestamp.  Keep historical rows in the grant
+         -- count so exhausted trials remain terminal rather than becoming
+         -- warning-eligible again.
+         COUNT(*) FILTER (WHERE remaining_usd > 0 AND (expires_at IS NULL OR expires_at > now()))::int AS active_count,
          COALESCE(MIN(created_at), now()) AS started,
          MAX(expires_at) FILTER (WHERE expires_at IS NOT NULL) AS expires_end
   FROM team_credit_grant WHERE team_id = p_team_id AND reason = 'signup trial credit'

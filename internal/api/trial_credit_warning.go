@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -43,8 +44,44 @@ const trialCreditWarningTimeout = 30 * time.Second
 // A full scan must remain able to finish even when delivery is slow.
 var trialCreditWarningSlots = make(chan struct{}, 32)
 
+type trialCreditWarningJob struct {
+	h      *Handlers
+	ctx    context.Context
+	teamID uuid.UUID
+}
+
+var (
+	trialCreditWarningQueue   = make(chan trialCreditWarningJob, 256)
+	trialCreditWarningWorkers sync.Once
+)
+
+func startTrialCreditWarningWorkers() {
+	trialCreditWarningWorkers.Do(func() {
+		for i := 0; i < cap(trialCreditWarningSlots); i++ {
+			go func() {
+				for job := range trialCreditWarningQueue {
+					job.h.processTrialCreditWarning(job.ctx, job.teamID)
+					job.h.asyncMu.Lock()
+					job.h.asyncCount--
+					if job.h.asyncCount == 0 && job.h.asyncCond != nil {
+						job.h.asyncCond.Broadcast()
+					}
+					job.h.asyncMu.Unlock()
+				}
+			}()
+		}
+	})
+}
+
 type TrialCreditWarningSender interface {
 	SendTrialCreditWarning(context.Context, uuid.UUID, float64) error
+}
+
+// trialCreditWarningIdempotentSender binds provider deduplication to the
+// durable claim. This closes the acceptance/complete window without changing
+// the existing sender contract used by tests and alternate senders.
+type trialCreditWarningIdempotentSender interface {
+	SendTrialCreditWarningWithKey(context.Context, uuid.UUID, float64, uuid.UUID) error
 }
 
 // ResendTrialCreditWarningSender delivers the warning to all current billing
@@ -60,6 +97,14 @@ func NewResendTrialCreditWarningSender(apiKey, from string, queries *db.Queries)
 	return &ResendTrialCreditWarningSender{apiKey: apiKey, from: from, queries: queries, endpoint: resendEmailEndpoint, client: &http.Client{Timeout: 10 * time.Second}}
 }
 func (s *ResendTrialCreditWarningSender) SendTrialCreditWarning(ctx context.Context, teamID uuid.UUID, remaining float64) error {
+	return s.sendTrialCreditWarning(ctx, teamID, remaining, uuid.Nil)
+}
+
+func (s *ResendTrialCreditWarningSender) SendTrialCreditWarningWithKey(ctx context.Context, teamID uuid.UUID, remaining float64, claimToken uuid.UUID) error {
+	return s.sendTrialCreditWarning(ctx, teamID, remaining, claimToken)
+}
+
+func (s *ResendTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Context, teamID uuid.UUID, remaining float64, claimToken uuid.UUID) error {
 	if s == nil || s.apiKey == "" || s.from == "" || s.queries == nil {
 		// A missing provider configuration is a delivery failure, not a
 		// successful no-op. Returning nil here would mark the durable warning
@@ -80,9 +125,13 @@ func (s *ResendTrialCreditWarningSender) SendTrialCreditWarning(ctx context.Cont
 	}
 	// Submit one message per recipient. Resend's `to` array is rendered as a
 	// shared To header, which would disclose other billing members' addresses.
-	for _, recipient := range recipients {
+	for i, recipient := range recipients {
 		payload, _ := json.Marshal(map[string]any{"from": s.from, "to": recipient, "subject": "Your trial credit may run out soon", "html": trialCreditWarningHTML(team.Name, remaining)})
-		if err := s.sendEmail(ctx, payload); err != nil {
+		// Each recipient is a distinct provider request. Include its stable
+		// position in the claim-scoped idempotency key so Resend does not
+		// collapse the fan-out into a single message while retries remain
+		// deduplicated for that recipient.
+		if err := s.sendEmailWithKey(ctx, payload, claimToken, i); err != nil {
 			return err
 		}
 	}
@@ -90,12 +139,19 @@ func (s *ResendTrialCreditWarningSender) SendTrialCreditWarning(ctx context.Cont
 }
 
 func (s *ResendTrialCreditWarningSender) sendEmail(ctx context.Context, payload []byte) error {
+	return s.sendEmailWithKey(ctx, payload, uuid.Nil, 0)
+}
+
+func (s *ResendTrialCreditWarningSender) sendEmailWithKey(ctx context.Context, payload []byte, claimToken uuid.UUID, recipientIndex int) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	if claimToken != uuid.Nil {
+		req.Header.Set("Idempotency-Key", fmt.Sprintf("trial-credit-warning/%s/%d", claimToken, recipientIndex))
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return &unknownTrialCreditWarningError{err: err}
@@ -123,19 +179,32 @@ func (e *unknownTrialCreditWarningError) Unwrap() error                   { retu
 func (e *unknownTrialCreditWarningError) UnknownTrialCreditWarning() bool { return true }
 
 func tryDispatchTrialCreditWarning(h *Handlers, ctx context.Context, teamID uuid.UUID) bool {
-	// Always retain the work item. Acquiring the bounded slot happens inside
-	// the background bookkeeping goroutine, so a saturated provider cannot
-	// cause later teams in a stable-ordered page to be discarded or starved.
-	h.asyncBookkeeping("trial-credit-warning", func() {
-		select {
-		case trialCreditWarningSlots <- struct{}{}:
-		case <-ctx.Done():
-			return
+	startTrialCreditWarningWorkers()
+	h.asyncMu.Lock()
+	h.asyncCount++
+	h.asyncMu.Unlock()
+	select {
+	case trialCreditWarningQueue <- trialCreditWarningJob{h: h, ctx: ctx, teamID: teamID}:
+		return true
+	case <-ctx.Done():
+		h.asyncMu.Lock()
+		h.asyncCount--
+		if h.asyncCount == 0 && h.asyncCond != nil {
+			h.asyncCond.Broadcast()
 		}
-		defer func() { <-trialCreditWarningSlots }()
-		h.processTrialCreditWarning(ctx, teamID)
-	})
-	return true
+		h.asyncMu.Unlock()
+		return false
+	default:
+		// Advisory work is dropped when the bounded queue is full; the next
+		// reconciliation pass will retry without extending its critical path.
+		h.asyncMu.Lock()
+		h.asyncCount--
+		if h.asyncCount == 0 && h.asyncCond != nil {
+			h.asyncCond.Broadcast()
+		}
+		h.asyncMu.Unlock()
+		return false
+	}
 }
 
 func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UUID) {
@@ -192,6 +261,9 @@ func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UU
 	}
 	remaining = latestRemaining
 	if err = sendTrialCreditWarningIfEligible(latest.Eligible, latest.State, func() error {
+		if sender, ok := h.TrialWarningSender.(trialCreditWarningIdempotentSender); ok {
+			return sender.SendTrialCreditWarningWithKey(ctx, teamID, remaining, uuid.UUID(claimToken.Bytes))
+		}
 		return h.TrialWarningSender.SendTrialCreditWarning(ctx, teamID, remaining)
 	}); err != nil {
 		var unknown UnknownTrialCreditWarningOutcome

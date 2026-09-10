@@ -68,14 +68,49 @@ func TestResendTrialCreditWarningProviderAcceptance(t *testing.T) {
 	}
 }
 
-func TestResendTrialCreditWarningProviderFailureIsRetryable(t *testing.T) {
+func TestResendTrialCreditWarningSenderIncludesAuthoritativeBalanceAndCoarseCopy(t *testing.T) {
+	var gotBody string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+	s := &ResendTrialCreditWarningSender{apiKey: "key", from: "team@example.com", endpoint: srv.URL, client: srv.Client()}
+	body := []byte(trialCreditWarningHTML("example-team", 1.234))
+	if err := s.sendEmail(context.Background(), body); err != nil {
+		t.Fatalf("warning send returned error: %v", err)
+	}
+	for _, want := range []string{"example-team", "$1.23", "Less than 24 hours", "within the next 24 hours"} {
+		if !strings.Contains(gotBody, want) {
+			t.Fatalf("provider body missing %q: %s", want, gotBody)
+		}
+	}
+	if strings.Contains(gotBody, "exhaustion timestamp") || strings.Contains(gotBody, "hours remaining: 1") {
+		t.Fatalf("provider body exposed a precise forecast: %s", gotBody)
+	}
+}
+
+func TestResendTrialCreditWarningProviderFailureIsRetryable(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer srv.Close()
 	s := &ResendTrialCreditWarningSender{apiKey: "key", from: "team@example.com", endpoint: srv.URL, client: srv.Client()}
 	if err := s.sendEmail(context.Background(), []byte(`{}`)); err == nil || !strings.Contains(err.Error(), "503") {
 		t.Fatalf("provider failure = %v, want retryable status error", err)
+	}
+	if err := s.sendEmail(context.Background(), []byte(`{}`)); err != nil {
+		t.Fatalf("retry after provider failure returned error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("provider calls = %d, want 2 after retry", calls)
 	}
 }
 
@@ -109,28 +144,6 @@ func TestTrialCreditWarningEmailUsesCoarseCopyAndAuthoritativeBalance(t *testing
 	if strings.Contains(body, "hours remaining: 1") || strings.Contains(body, "exhaustion timestamp") {
 		t.Fatalf("warning email exposed a precise forecast: %s", body)
 	}
-}
-
-func TestTrialCreditWarningDispatchIsAdvisory(t *testing.T) {
-	// The sender is invoked only from processTrialCreditWarning's bounded,
-	// asynchronous path; reconciliation itself continues after dispatch.
-	if !strings.Contains("tryDispatchTrialCreditWarning(h, context.WithoutCancel(ctx), teamID)", "WithoutCancel") {
-		t.Fatal("warning dispatch must not inherit reconciliation cancellation")
-	}
-}
-
-func TestTrialCreditWarningDispatchQueuesWhenSlotsAreFull(t *testing.T) {
-	for i := 0; i < cap(trialCreditWarningSlots); i++ {
-		trialCreditWarningSlots <- struct{}{}
-	}
-	h := &Handlers{}
-	if !tryDispatchTrialCreditWarning(h, context.Background(), uuid.New()) {
-		t.Fatal("warning work must be retained when all delivery slots are busy")
-	}
-	for i := 0; i < cap(trialCreditWarningSlots); i++ {
-		<-trialCreditWarningSlots
-	}
-	h.WaitAsyncBookkeeping()
 }
 
 func TestNumericFloatPreservesDecimalScale(t *testing.T) {
@@ -197,6 +210,44 @@ func TestTrialCreditWarningProcessingDoesNotSendForInactiveTrials(t *testing.T) 
 				t.Fatal("inactive trial must not invoke the warning sender")
 			}
 		})
+	}
+}
+
+func TestTrialCreditWarningDeliveryPropagatesProviderOutcome(t *testing.T) {
+	called := 0
+	want := errors.New("provider rejected request")
+	if err := sendTrialCreditWarningIfEligible(true, "active", func() error {
+		called++
+		return want
+	}); !errors.Is(err, want) {
+		t.Fatalf("provider error = %v, want %v", err, want)
+	}
+	if called != 1 {
+		t.Fatalf("provider calls = %d, want 1", called)
+	}
+
+	called = 0
+	if err := sendTrialCreditWarningIfEligible(true, "active", func() error {
+		called++
+		return nil
+	}); err != nil {
+		t.Fatalf("accepted provider outcome = %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("provider calls after acceptance = %d, want 1", called)
+	}
+}
+
+func TestTrialCreditWarningDeliverySkipsProviderForIneligibleState(t *testing.T) {
+	called := 0
+	if err := sendTrialCreditWarningIfEligible(false, "ended_by_billing_activation", func() error {
+		called++
+		return errors.New("must not send")
+	}); err != nil {
+		t.Fatalf("ineligible delivery = %v, want nil", err)
+	}
+	if called != 0 {
+		t.Fatalf("provider calls for ended trial = %d, want 0", called)
 	}
 }
 
