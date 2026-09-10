@@ -18,6 +18,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -259,5 +260,50 @@ func TestIntegration_PauseReconcile_ClaimsOnlyWhatItCanDispatch(t *testing.T) {
 	}
 	if n := stale.Load(); n != 0 {
 		t.Fatalf("%d pause RPCs went to sandboxes that were already running again", n)
+	}
+}
+
+// A pause the reaper started and the reconciler finished is still recorded
+// as a timeout pause: the snapshot's trigger and the activity action carry
+// the original cause, not the fact that reconciliation did the last step.
+func TestIntegration_PauseReconcile_KeepsTheOriginalCause(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	var id uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO sandbox (team_id, name, status, host_id, timeout_seconds, created_at)
+		VALUES ($1, 'reconcile-cause', 'active', $2, 60, now() - interval '10 minutes') RETURNING id`,
+		teamID, testDefaultHostID).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testQueries.ClaimExpiredSandbox(ctx, db.ClaimExpiredSandboxParams{ID: id, LeaseSeconds: 90}); err != nil {
+		t.Fatalf("reaper claim: %v", err)
+	}
+	expireLease(t, id)
+
+	h := pauseHandlers(t, &stubVMD{})
+	h.ReconcilePendingPausesOnce(ctx, zerolog.Nop())
+	h.WaitAsyncBookkeeping()
+
+	var trigger string
+	if err := testPool.QueryRow(ctx, `SELECT trigger FROM snapshot WHERE sandbox_id = $1`, id).Scan(&trigger); err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	if trigger != "timeout" {
+		t.Fatalf("snapshot trigger = %q, want the reaper's timeout", trigger)
+	}
+	var logged int
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		if err := testPool.QueryRow(ctx,
+			`SELECT count(*) FROM activity WHERE sandbox_id = $1 AND action = 'timeout_paused'`, id).Scan(&logged); err != nil {
+			t.Fatal(err)
+		}
+		if logged > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no timeout_paused activity was recorded for the reconciled pause")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

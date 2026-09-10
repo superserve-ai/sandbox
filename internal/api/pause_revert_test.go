@@ -2,40 +2,34 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-// A pause that fails after BeginPause — whether at host resolution or at the
-// daemon — must compensate: status back to 'active' AND the billing interval
-// reopened. The two facts commit as ONE statement (RevertPauseToActive), so
-// this test asserts that single query fires with the sandbox's identity; the
-// atomicity and status-gating live in the SQL and are covered by the
-// integration test.
-func TestRevertPauseAsyncRestoresStatusAndInterval(t *testing.T) {
+// A pause that fails before anything is dispatched compensates in ONE fenced
+// statement (RevertPauseToActive): status back to 'active' and the billing
+// interval reopened, so a failure between the two facts is unrepresentable.
+func TestRevertPause_RestoresStatusAndIntervalUnderTheLease(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
 	lease := pauseLease{id: pgtype.UUID{Bytes: uuid.New(), Valid: true}, version: 3}
-	var mu sync.Mutex
 	var reverted bool
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if !strings.Contains(sql, "-- name: RevertPauseToActive :one") {
 				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
 			}
-			mu.Lock()
-			defer mu.Unlock()
 			if args[0] != sandboxID || args[1] != teamID || args[2] != lease.id || *(args[3].(*int64)) != lease.version {
 				t.Errorf("revert args = %v; want the sandbox, team, and the lease it holds", args)
 			}
@@ -48,23 +42,50 @@ func TestRevertPauseAsyncRestoresStatusAndInterval(t *testing.T) {
 	}
 	h := &Handlers{DB: db.New(mock)}
 
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	c.Request = httptest.NewRequest("POST", "/sandboxes/x/pause", nil)
+	h.revertPause(context.Background(), sandboxID, teamID, lease, nil, zerolog.Nop())
 
-	h.revertPauseAsync(c, sandboxID, teamID, lease, zerolog.Nop())
+	if !reverted {
+		t.Fatal("revert query never fired")
+	}
+}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		mu.Lock()
-		done := reverted
-		mu.Unlock()
-		if done {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("revert query never fired")
-		}
-		time.Sleep(2 * time.Millisecond)
+// When the host cannot be resolved the operation is undone before the
+// request is answered: the caller hears "failed" about a row that is already
+// 'active' again, and nothing is left for the reconciler to pick up.
+func TestPauseSandbox_UnresolvedHostRevertsBeforeResponding(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-1", Name: "sb", Status: db.SandboxStatusActive,
+		PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1}
+	var reverted bool
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: RevertPauseToActive :one"):
+				if args[2] != sb.PauseOpID || *(args[3].(*int64)) != sb.PauseOpLeaseVersion {
+					t.Errorf("revert args = %v; want the lease BeginPause minted", args)
+				}
+				reverted = true
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*int64) = 1
+					return nil
+				}}
+			case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+	}
+	h := &Handlers{DB: db.New(mock), Hosts: &stubHosts{resolve: func() (vmdclient.Client, error) {
+		return nil, errors.New("host not registered")
+	}}}
+
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+	if !reverted {
+		t.Fatal("responded before the operation was reverted")
 	}
 }

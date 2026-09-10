@@ -144,6 +144,11 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 		return
 	}
 
+	// Finalized and logged as what it was started as, not as a reconcile.
+	trigger := "pause"
+	if row.PauseOpTrigger != nil && *row.PauseOpTrigger != "" {
+		trigger = *row.PauseOpTrigger
+	}
 	fctx, fcancel := context.WithTimeout(ctx, asyncTimeout)
 	defer fcancel()
 	params := db.FinalizePauseParams{
@@ -153,7 +158,7 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 		PauseOpLeaseVersion: &lease.version,
 		Path:                snapshotPath,
 		MemPath:             &memPath,
-		Trigger:             "reconcile",
+		Trigger:             trigger,
 		PauseToken:          ackedToken,
 	}
 	applyManifest(&params, manifest)
@@ -170,7 +175,7 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 
 	l.Info().Msg("pause reconcile: sandbox paused")
 	RecordSandboxTransition(ctx, "reconcile_pause", telemetry.ResultSuccess, row.HostID, time.Since(started))
-	h.logSandboxActivity(ctx, row.ID, row.TeamID, nil, "sandbox", "paused", "success", &row.Name, nil, nil)
+	h.logSandboxActivity(ctx, row.ID, row.TeamID, nil, "sandbox", pauseActivity(trigger), "success", &row.Name, nil, nil)
 }
 
 // releasePauseLease hands an undecided pause back for a later attempt.
@@ -236,4 +241,13 @@ func (h *Handlers) flagPauseAttention(ctx context.Context, id uuid.UUID, lease p
 		// Error level so it reaches the error tracker; retries continue.
 		l.Error().Msg("pause pending past attention threshold: host has not given a decided answer")
 	}
+}
+
+// pauseActivity is the activity-log action for a pause cause: "paused" for a
+// requested pause, "<cause>_paused" for the automatic ones.
+func pauseActivity(trigger string) string {
+	if trigger == "pause" {
+		return "paused"
+	}
+	return trigger + "_paused"
 }

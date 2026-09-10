@@ -605,6 +605,8 @@ type Sandbox struct {
 	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
 	// When a pause pending past its age threshold was flagged for an operator; set once.
 	PauseOpAttentionAt pgtype.Timestamptz `json:"pause_op_attention_at"`
+	// Why the pause in flight was started (pause, timeout, billing_ineligible); kept so a reconciled pause records its original cause.
+	PauseOpTrigger *string `json:"pause_op_trigger"`
 }
 
 type SandboxActiveInterval struct {

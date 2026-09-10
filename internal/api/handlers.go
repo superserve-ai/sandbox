@@ -322,35 +322,31 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 	return c, nil
 }
 
-// revertPauseAsync undoes BeginPause's claim after a pause that failed
-// before completing — status back to 'active' and the billing interval
-// reopened, in ONE statement (RevertPauseToActive) so a failure between the
-// two facts is unrepresentable. Runs detached from the caller's cancellation
-// (a client disconnect must not orphan the revert) while keeping trace
-// context.
-func (h *Handlers) revertPauseAsync(c *gin.Context, sandboxID, teamID uuid.UUID, lease pauseLease, l zerolog.Logger) {
-	revertCtx := context.WithoutCancel(c.Request.Context())
-	actorID := actorIDFromContext(c)
-	go func() {
-		ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
-		defer cancel()
-		n, err := h.DB.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
-			SandboxID:           sandboxID,
-			TeamID:              teamID,
-			PauseOpID:           lease.id,
-			PauseOpLeaseVersion: &lease.version,
-			ActorID:             actorUUID(actorID),
-		})
-		if err != nil {
-			l.Error().Err(err).Msg("async pause revert failed")
-			return
-		}
-		if n == 0 {
-			// Another transition (delete, reaper) moved the sandbox out
-			// of 'pausing' first; its state wins over the revert.
-			l.Warn().Msg("pause revert skipped: sandbox no longer pausing")
-		}
-	}()
+// revertPause undoes BeginPause's claim when nothing was dispatched: status
+// back to 'active' and the billing interval reopened in one fenced statement
+// (RevertPauseToActive). Synchronous, on the failure path only: the caller is
+// about to report the pause as failed, and the row must say so before the
+// reconciler could ever take the operation up. Detached from the request's
+// cancellation so a client disconnect cannot orphan it.
+func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UUID, lease pauseLease, actorID *uuid.UUID, l zerolog.Logger) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	n, err := h.DB.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
+		SandboxID:           sandboxID,
+		TeamID:              teamID,
+		PauseOpID:           lease.id,
+		PauseOpLeaseVersion: &lease.version,
+		ActorID:             actorUUID(actorID),
+	})
+	if err != nil {
+		l.Error().Err(err).Msg("pause revert failed; the row stays 'pausing' for reconciliation")
+		return
+	}
+	if n == 0 {
+		// Another transition (delete, reaper) moved the sandbox out of
+		// 'pausing' first; its state wins over the revert.
+		l.Warn().Msg("pause revert skipped: sandbox no longer pausing")
+	}
 }
 
 // vmdTimeout is the default deadline for VMD gRPC calls.
@@ -3101,7 +3097,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("resolve VMD for pause failed")
-		h.revertPauseAsync(c, sandboxID, teamID, pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}, l)
+		h.revertPause(c.Request.Context(), sandboxID, teamID, pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}, actorIDFromContext(c), l)
 		respondError(c, ErrInternal)
 		return
 	}
