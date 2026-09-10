@@ -1914,9 +1914,13 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			}
 			if merr != nil {
 				// No manifest is safe for an unfrozen image; a stale frozen
-				// one is not. The stale one goes, durably, or the pause fails.
-				if rerr := removeWallClockManifestDurably(memPath); rerr != nil {
-					return "", "", nil, m.handleVMError(vmID, fmt.Errorf("wall-clock manifest write failed (%v) and the stale one could not be cleared: %w", merr, rerr))
+				// one is not. The stale one goes, durably, or the pause
+				// fails; a marker that was not a frozen manifest and will not
+				// go is harmless and only logged.
+				if frozen, rerr := removeWallClockManifest(memPath); rerr != nil && frozen {
+					return "", "", nil, m.failAfterSnapshot(vmID, socketPath, fmt.Errorf("wall-clock manifest write failed (%v) and the stale frozen one could not be cleared: %w", merr, rerr))
+				} else if rerr != nil {
+					log.Warn().Err(rerr).Str("path", WallClockMarkerPath(memPath)).Msg("pause: a stale marker could not be removed")
 				}
 				log.Warn().Err(merr).Str("path", WallClockMarkerPath(memPath)).
 					Msg("pause: wall-clock manifest write failed; resume falls back to legacy clock behaviour")
@@ -1924,14 +1928,19 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 	} else {
 		// A guest that cannot correct its clock gets no manifest; one an
-		// earlier image left here goes, durably, for the reason above.
+		// earlier image left here goes, durably, for the reason above. A
+		// marker that was not a frozen manifest and will not go is harmless:
+		// the image reads as legacy either way. The vCPUs are paused from
+		// the snapshot on, so a failure here must not strand them.
 		tManifest := time.Now()
-		merr := removeWallClockManifestDurably(memPath)
+		frozen, merr := removeWallClockManifest(memPath)
 		if d := time.Since(tManifest); d > time.Millisecond {
 			manifestDur = d
 		}
-		if merr != nil {
-			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("clear stale wall-clock manifest for %q: %w", memPath, merr))
+		if merr != nil && frozen {
+			return "", "", nil, m.failAfterSnapshot(vmID, socketPath, fmt.Errorf("clear stale wall-clock manifest for %q: %w", memPath, merr))
+		} else if merr != nil {
+			log.Warn().Err(merr).Str("path", WallClockMarkerPath(memPath)).Msg("pause: a stale marker could not be removed")
 		}
 	}
 
@@ -8441,6 +8450,21 @@ func (m *Manager) ensureWakeFloorTimed(op string) error {
 	return err
 }
 
+// failAfterSnapshot is the error return for a pause that fails after its
+// snapshot landed: Firecracker left the vCPUs paused for the snapshot, and
+// a pause that returns an error keeps the VM recorded Running, so the guest
+// is resumed first — a stopped sandbox that reads as running is the one
+// outcome this must never leave. Best-effort: a guest that cannot be
+// resumed is reported as the error it already was.
+func (m *Manager) failAfterSnapshot(vmID, socketPath string, err error) error {
+	uctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if uerr := fcUnpauseVM(uctx, socketPath); uerr != nil {
+		m.log.Error().Err(uerr).Str("vm_id", vmID).Msg("pause failed after its snapshot and the guest could not be resumed")
+	}
+	return m.handleVMError(vmID, err)
+}
+
 // frozenManifestAt reports whether any of the paths carries a manifest that
 // says frozen. A stat first: absent manifests, the common case, cost one
 // lookup each and no read.
@@ -8755,7 +8779,7 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 		// unfrozen or torn, so a manifest beside them that says frozen is
 		// stale either way and must not outlive the intent.
 		for _, name := range []string{"mem.diff", "mem.snap"} {
-			if err := removeWallClockManifestDurably(filepath.Join(dir, name)); err != nil {
+			if _, err := removeWallClockManifest(filepath.Join(dir, name)); err != nil {
 				log.Error().Err(err).Msg("reattach: a stale frozen manifest beside an interrupted rewrite could not be removed; parking as error")
 				return false
 			}

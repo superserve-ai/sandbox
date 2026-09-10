@@ -2306,3 +2306,202 @@ func TestUnfrozenOverwriteOfAFrozenImageIsCoveredByAnIntent(t *testing.T) {
 		t.Fatalf("intent = %+v; want it cleared after recovery", in)
 	}
 }
+
+// A pause that fails after its snapshot landed resumes the vCPUs before it
+// returns: Firecracker paused them for the snapshot, and a pause that
+// returns an error keeps the VM recorded Running. A marker that will not go
+// but was never a frozen manifest does not fail the pause at all.
+func TestPauseFailingAfterItsSnapshotResumesTheVCPUs(t *testing.T) {
+	useTempFloor(t)
+	raiseFloorForTest(t)
+	origF, origT, origDown, origUnpause := boxdFreezeGuest, boxdThawGuest, vmUnitFullyDown, fcUnpauseVM
+	t.Cleanup(func() {
+		boxdFreezeGuest, boxdThawGuest, vmUnitFullyDown, fcUnpauseVM = origF, origT, origDown, origUnpause
+	})
+	vmUnitFullyDown = func(string) bool { return false }
+	var unpaused []string
+	fcUnpauseVM = func(_ context.Context, socket string) error { unpaused = append(unpaused, socket); return nil }
+	boxdFreezeGuest = func(_ context.Context, _, token string) (freezeEcho, error) {
+		return freezeEcho{Version: WakeProtocolVersion, Token: token}, nil
+	}
+	boxdThawGuest = func(context.Context, string, string) error { return nil }
+
+	newVM := func(t *testing.T, corrects bool, freezeOn bool) (*Manager, *VMInstance, string, string) {
+		t.Helper()
+		fc := startSnapshotAPIFake(t, nil)
+		dir := t.TempDir()
+		vmDir := filepath.Join(dir, "vm-1")
+		if err := os.MkdirAll(vmDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		memSnap := filepath.Join(vmDir, "mem.snap")
+		if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects}
+		m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir, GuestClockFreezeEnabled: freezeOn}}
+		m.clockRealtimeCapable.Store(true)
+		return m, inst, vmDir, memSnap
+	}
+	// A marker that cannot be removed and is not a manifest: a directory
+	// with something in it.
+	stuckMarker := func(t *testing.T, memSnap string) {
+		t.Helper()
+		marker := WallClockMarkerPath(memSnap)
+		if err := os.MkdirAll(filepath.Join(marker, "x"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("legacy_pause_survives_a_marker_that_will_not_go", func(t *testing.T) {
+		m, inst, vmDir, memSnap := newVM(t, false, false)
+		stuckMarker(t, memSnap)
+		if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err != nil {
+			t.Fatalf("pause: %v; a marker that was never a frozen manifest must not fail the pause", err)
+		}
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+		if inst.Status != StatusPaused {
+			t.Fatalf("status %v, want Paused", inst.Status)
+		}
+	})
+
+	t.Run("a_frozen_pause_whose_manifest_cannot_land_resumes_the_guest", func(t *testing.T) {
+		m, inst, vmDir, memSnap := newVM(t, true, true)
+		stuckMarker(t, memSnap) // the manifest's rename onto it fails
+		unpaused = nil
+		if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+			t.Fatal("want the manifest failure")
+		}
+		if len(unpaused) == 0 || unpaused[0] != inst.SocketPath {
+			t.Fatalf("unpause calls = %v; the vCPUs must be resumed before the error returns", unpaused)
+		}
+		inst.mu.RLock()
+		defer inst.mu.RUnlock()
+		if inst.Status != StatusRunning {
+			t.Fatalf("status %v, want Running: the pause did not commit", inst.Status)
+		}
+	})
+
+	t.Run("a_frozen_manifest_that_cannot_be_removed_fails_the_pause_and_resumes_the_guest", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("needs a directory the process cannot write; root can")
+		}
+		m, _, vmDir, memSnap := newVM(t, false, false)
+		seedFrozenManifest(t, memSnap, "A")
+		if err := os.Chmod(vmDir, 0o555); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(vmDir, 0o755) })
+		unpaused = nil
+		if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+			t.Fatal("want the pause refused: a frozen manifest beside an unfrozen image cannot stay")
+		}
+		if len(unpaused) == 0 {
+			t.Fatal("the vCPUs must be resumed before the error returns")
+		}
+	})
+}
+
+// The dormancy contract: with the switches off, a legacy image's lifecycle
+// makes no guest call, writes no manifest or intent, records no new phase
+// and sends no wake. A frozen image on a host later switched off is still
+// woken (see TestResumeWakesFrozenWorkloadBeforeCommit, which runs with the
+// switch off).
+func TestDormantHostAddsNothingToALegacyLifecycle(t *testing.T) {
+	origF, origT, origW, origR, origP, origDown, origDead := boxdFreezeGuest, boxdThawGuest, boxdWakeGuest, boxdGuestRunning, boxdHealthProbe, vmUnitFullyDown, vmDeadForRetry
+	t.Cleanup(func() {
+		boxdFreezeGuest, boxdThawGuest, boxdWakeGuest, boxdGuestRunning, boxdHealthProbe, vmUnitFullyDown, vmDeadForRetry = origF, origT, origW, origR, origP, origDown, origDead
+	})
+	vmUnitFullyDown = func(string) bool { return false }
+	vmDeadForRetry = func(*Manager, string) bool { return true }
+	boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+		t.Error("a dormant host froze a guest")
+		return freezeEcho{}, errors.New("unexpected")
+	}
+	boxdThawGuest = func(context.Context, string, string) error { t.Error("a dormant host thawed a guest"); return nil }
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error {
+		t.Error("a dormant host woke a guest")
+		return nil
+	}
+	boxdGuestRunning = func(context.Context, string) error {
+		t.Error("a dormant host asked a guest whether it runs")
+		return nil
+	}
+	boxdHealthProbe = func(context.Context, string, time.Duration) error { return nil }
+
+	for _, tc := range []struct {
+		name   string
+		marker func(t *testing.T, memSnap string)
+	}{
+		{"absent_marker", func(*testing.T, string) {}},
+		{"empty_marker", func(t *testing.T, memSnap string) {
+			if err := os.WriteFile(WallClockMarkerPath(memSnap), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run("pause_"+tc.name, func(t *testing.T) {
+			fc := startSnapshotAPIFake(t, nil)
+			dir := t.TempDir()
+			vmDir := filepath.Join(dir, "vm-1")
+			if err := os.MkdirAll(vmDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			memSnap := filepath.Join(vmDir, "mem.snap")
+			if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tc.marker(t, memSnap)
+			inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap}
+			sink := &phaseSink{}
+			m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, recorder: sink, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+			if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err != nil {
+				t.Fatalf("pause: %v", err)
+			}
+			if _, err := os.Stat(WallClockMarkerPath(memSnap)); err == nil {
+				t.Fatal("a legacy pause left a marker beside its image")
+			}
+			if _, err := os.Stat(pauseIntentPath(vmDir)); err == nil {
+				t.Fatal("a legacy pause wrote an intent")
+			}
+			for _, phase := range []string{"freeze", "manifest", "wake_floor"} {
+				if sink.has("pause", phase) {
+					t.Fatalf("phases = %+v; a legacy pause recorded a %s phase", sink.phases, phase)
+				}
+			}
+		})
+	}
+
+	t.Run("create_sends_no_wake", func(t *testing.T) {
+		dir := t.TempDir()
+		snapPath, memPath, basePath := filepath.Join(dir, "vm.snap"), filepath.Join(dir, "mem.snap"), filepath.Join(dir, "base.ext4")
+		overlay := filepath.Join(dir, "vm-1", "overlay.ext4")
+		if err := os.MkdirAll(filepath.Dir(overlay), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range []string{snapPath, memPath, basePath, overlay} {
+			if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		sink := &phaseSink{}
+		m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1), recorder: sink}
+		m.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+			return 4321, SupervisionUnit, nil
+		}
+		m.restoreSnapshotHook = func(_, _, _ string, clock *bool) error {
+			if clock != nil {
+				t.Error("a dormant host asked Firecracker for a clock policy")
+			}
+			return nil
+		}
+		inst, err := m.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath}, nil, "team", "owner", "", nil, 0)
+		if err != nil || inst == nil {
+			t.Fatalf("restore: inst=%v err=%v", inst, err)
+		}
+		if sink.has("restore", "wake_floor") {
+			t.Fatalf("phases = %+v; a legacy create proved a floor", sink.phases)
+		}
+	})
+}

@@ -244,27 +244,30 @@ func WriteWallClockManifest(memPath string, m WallClockManifest) error {
 	return writeWallClockManifest(memPath, m, true)
 }
 
-// removeWallClockManifestDurably removes the manifest beside an image, if
-// any. One that said frozen is removed with a directory sync, so a crash
-// cannot bring it back beside an image it does not describe; any other
-// marker is simply removed, since its return would cost nothing but a
-// slower resume. Nothing to remove is not an error.
-func removeWallClockManifestDurably(memPath string) error {
+// removeWallClockManifest removes the manifest beside an image, if any, and
+// reports whether it said frozen. One that did is removed with a directory
+// sync, so a crash cannot bring it back beside an image it does not
+// describe; any other marker is simply removed, since its return would cost
+// nothing but a slower resume. Only a host with frozen images can hold a
+// frozen manifest, so elsewhere nothing is read: the removal is the one
+// call it always was. Nothing to remove is not an error.
+func removeWallClockManifest(memPath string) (frozen bool, err error) {
 	path := WallClockMarkerPath(memPath)
-	frozen := false
-	if man, err := ReadWallClockManifest(memPath); err == nil && man != nil && man.WorkloadFrozen {
-		frozen = true
+	if wakeProtocolFloorRaised() {
+		if man, rerr := ReadWallClockManifest(memPath); rerr == nil && man != nil && man.WorkloadFrozen {
+			frozen = true
+		}
 	}
 	if err := os.Remove(path); err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return false, nil
 		}
-		return err
+		return frozen, err
 	}
 	if !frozen {
-		return nil
+		return false, nil
 	}
-	return syncDir(filepath.Dir(path))
+	return true, syncDir(filepath.Dir(path))
 }
 
 // writeWallClockManifestLazy publishes atomically but with no durability
