@@ -40,15 +40,56 @@ var errPeerUnavailable = errors.New("peer connection unavailable")
 // Credentials are loaded for each new connection and peer identity is checked
 // by the TLS config before the client is published to the pool.
 func GRPCPeerDialer(tlsConfig func() (*tls.Config, error)) PeerDialer {
+	return grpcPeerDialer(tlsConfig, peerDialTimeout)
+}
+
+func grpcPeerDialer(tlsConfig func() (*tls.Config, error), timeout time.Duration) PeerDialer {
+	// File-backed loaders cannot be interrupted. Limit outstanding loads across
+	// all hosts so canceled attempts cannot accumulate blocked I/O goroutines.
+	loading := make(chan struct{}, 1)
+	type credentialsResult struct {
+		config *tls.Config
+		err    error
+	}
 	return func(ctx context.Context, _ string, addr string) (PeerClient, io.Closer, error) {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		attemptError := func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return errPeerUnavailable
 		}
-		cfg, err := tlsConfig()
-		if err != nil {
-			return nil, nil, err
+		if attemptCtx.Err() != nil {
+			return nil, nil, attemptError()
 		}
-		return dialGRPCPeer(ctx, addr, cfg, peerDialTimeout)
+		select {
+		case loading <- struct{}{}:
+		case <-attemptCtx.Done():
+			return nil, nil, attemptError()
+		}
+		result := make(chan credentialsResult, 1)
+		go func() {
+			defer func() { <-loading }()
+			cfg, err := tlsConfig()
+			result <- credentialsResult{config: cfg, err: err}
+		}()
+		select {
+		case <-attemptCtx.Done():
+			return nil, nil, attemptError()
+		case loaded := <-result:
+			if attemptCtx.Err() != nil {
+				return nil, nil, attemptError()
+			}
+			if loaded.err != nil {
+				return nil, nil, loaded.err
+			}
+			client, closer, err := dialGRPCPeer(attemptCtx, addr, loaded.config, timeout)
+			if err != nil && attemptCtx.Err() != nil {
+				err = attemptError()
+			}
+			return client, closer, err
+		}
 	}
 }
 
