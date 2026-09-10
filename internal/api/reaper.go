@@ -2,11 +2,13 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
@@ -349,12 +351,14 @@ func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxe
 
 func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxesRow, logger zerolog.Logger) {
 	h.pauseClaimed(ctx, db.ClaimExpiredSandboxesRow{
-		ID:            sbx.ID,
-		TeamID:        sbx.TeamID,
-		Name:          sbx.Name,
-		SnapshotID:    sbx.SnapshotID,
-		HostID:        sbx.HostID,
-		NetworkConfig: sbx.NetworkConfig,
+		ID:                  sbx.ID,
+		TeamID:              sbx.TeamID,
+		Name:                sbx.Name,
+		SnapshotID:          sbx.SnapshotID,
+		HostID:              sbx.HostID,
+		NetworkConfig:       sbx.NetworkConfig,
+		PauseOpID:           sbx.PauseOpID,
+		PauseOpLeaseVersion: sbx.PauseOpLeaseVersion,
 	}, "billing_ineligible", "billing_ineligible_pause", "billing_ineligible_paused", "billing: sandbox paused after eligibility loss", logger)
 }
 
@@ -384,11 +388,22 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	pauseToken := uuid.UUID(sbx.PauseOpID.Bytes).String()
 	snapshotPath, memPath, manifest, ackedPauseToken, err := pauseWithRetry(ctx, vmd, sbx.ID.String(), pauseToken)
 	if err != nil {
-		// Retry (see pauseWithRetry) didn't converge — the VM genuinely
-		// didn't pause, so revert to active and let the next tick retry.
-		l.Error().Err(err).Msg("reaper: VMD PauseInstance failed — reverting to active")
 		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
-		h.revertToActiveOrFail(ctx, sbx, err, l)
+		if !h.pauseReconcileEnabled() {
+			l.Error().Err(err).Msg("reaper: VMD PauseInstance failed — reverting to active")
+			h.revertToActiveOrFail(ctx, sbx, err, l)
+			return
+		}
+		lease := pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}
+		if isVMDNotFound(err) {
+			l.Warn().Err(err).Msg("reaper: VM gone from its host, marking failed")
+			h.failPause(ctx, sbx.ID, lease, l)
+			return
+		}
+		// An error after dispatch does not prove the VM still runs; the
+		// reconciler asks the host again (see pause_reconcile.go).
+		l.Warn().Err(err).Msg("reaper: VMD PauseInstance undecided — left pausing for reconciliation")
+		h.releasePauseLease(ctx, sbx.ID, lease, 0, l)
 		return
 	}
 
@@ -396,19 +411,32 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	defer postCancel()
 
 	params := db.FinalizePauseParams{
-		ID:      sbx.ID,
-		TeamID:  sbx.TeamID,
-		Path:    snapshotPath,
-		MemPath: &memPath,
-		Trigger: trigger,
+		ID:                  sbx.ID,
+		TeamID:              sbx.TeamID,
+		PauseOpID:           sbx.PauseOpID,
+		PauseOpLeaseVersion: &sbx.PauseOpLeaseVersion,
+		Path:                snapshotPath,
+		MemPath:             &memPath,
+		Trigger:             trigger,
 		// Only the daemon's echo may be stored (see PauseSandbox).
 		PauseToken: ackedPauseToken,
 	}
 	applyManifest(&params, manifest)
 	if _, err := h.finalizePause(postCtx, params); err != nil {
-		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
 		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
-		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
+		if !h.pauseReconcileEnabled() {
+			l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
+			h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
+			return
+		}
+		if errors.Is(err, pgx.ErrNoRows) {
+			l.Warn().Msg("reaper: row moved on before finalize")
+			return
+		}
+		// The snapshot exists on the host; a later attempt gets it back from
+		// the host's already-paused guard and finalizes again.
+		l.Error().Err(err).Msg("reaper: FinalizePause failed — left pausing for reconciliation")
+		h.releasePauseLease(ctx, sbx.ID, pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}, 0, l)
 		return
 	}
 

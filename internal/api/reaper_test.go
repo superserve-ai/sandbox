@@ -14,7 +14,10 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -45,6 +48,8 @@ func (r *stubRows) Scan(dest ...any) error {
 	*dest[2].(*string) = row.Name
 	*dest[3].(*pgtype.UUID) = row.SnapshotID
 	*dest[4].(*string) = row.HostID
+	*dest[6].(*pgtype.UUID) = row.PauseOpID
+	*dest[7].(*int64) = row.PauseOpLeaseVersion
 	return nil
 }
 
@@ -246,6 +251,97 @@ func TestReaper_VMDFails(t *testing.T) {
 	// A failure that doesn't converge after the retry reverts to active.
 	if got := atomic.LoadInt32(&revertCallCount); got != 2 {
 		t.Fatalf("expected 2 revert-to-active calls, got %d", got)
+	}
+}
+
+// With the reconciler on, a pause the host never answered stays 'pausing'
+// with its lease handed back for the reconciler; nothing reverts the row.
+func TestReaper_VMDFails_ReconcilerLeavesPausing(t *testing.T) {
+	row := expiredRow("sbx-a")
+	row.PauseOpID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	row.PauseOpLeaseVersion = 1
+	var reverts, releases int32
+
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
+			},
+			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+				switch {
+				case strings.Contains(sql, "-- name: ReleasePauseLease :execrows"):
+					atomic.AddInt32(&releases, 1)
+					if args[0].(int32) != 0 || args[2].(pgtype.UUID) != row.PauseOpID || args[3].(int64) != 1 {
+						t.Errorf("release args = %v, want retry 0 fenced to the claimed lease", args)
+					}
+				case strings.Contains(sql, "-- name: UpdateSandboxStatus"):
+					atomic.AddInt32(&reverts, 1)
+				}
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			},
+		},
+		&stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "", "", status.Error(codes.DeadlineExceeded, "pause timed out")
+		}},
+	)
+	h.Config = &config.Config{PauseReconcilerEnabled: true}
+
+	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
+
+	if got := atomic.LoadInt32(&releases); got != 1 {
+		t.Fatalf("expected 1 lease release, got %d", got)
+	}
+	if got := atomic.LoadInt32(&reverts); got != 0 {
+		t.Fatalf("expected no revert to active, got %d", got)
+	}
+}
+
+// NotFound from the resolved host is the one error that decides the pause:
+// the VM is gone, so the row is failed under the lease's fence, not reverted.
+func TestReaper_VMDNotFound_ReconcilerMarksFailed(t *testing.T) {
+	row := expiredRow("sbx-a")
+	row.PauseOpID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	row.PauseOpLeaseVersion = 1
+	var reverts, fails int32
+
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
+			},
+			queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+				if strings.Contains(sql, "-- name: MarkSandboxFailed :one") {
+					atomic.AddInt32(&fails, 1)
+					if args[1].(db.SandboxStatus) != db.SandboxStatusPausing || args[2].(pgtype.UUID) != row.PauseOpID {
+						t.Errorf("mark-failed args = %v, want observed pausing fenced to the claimed lease", args)
+					}
+					return &mockRow{scanFn: func(dest ...any) error {
+						*dest[0].(*int64) = 1
+						return nil
+					}}
+				}
+				return activityRow()
+			},
+			execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+				if strings.Contains(sql, "-- name: UpdateSandboxStatus") {
+					atomic.AddInt32(&reverts, 1)
+				}
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			},
+		},
+		&stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "", "", status.Error(codes.NotFound, "no such vm")
+		}},
+	)
+	h.Config = &config.Config{PauseReconcilerEnabled: true}
+
+	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
+
+	if got := atomic.LoadInt32(&fails); got != 1 {
+		t.Fatalf("expected 1 fenced mark-failed, got %d", got)
+	}
+	if got := atomic.LoadInt32(&reverts); got != 0 {
+		t.Fatalf("expected no revert to active, got %d", got)
 	}
 }
 

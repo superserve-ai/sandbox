@@ -3065,6 +3065,18 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 			return
 		}
 
+		if h.pauseReconcileEnabled() {
+			// Timeout, unavailable, or any other error after dispatch says
+			// nothing about whether the VM still runs; the row stays
+			// 'pausing' and the reconciler asks the host again.
+			l.Warn().Err(err).Msg("VMD PauseInstance undecided — left pausing for reconciliation")
+			lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
+			releaseCtx := context.WithoutCancel(c.Request.Context())
+			h.asyncBookkeeping("release-pause-lease", func() { h.releasePauseLease(releaseCtx, sandboxID, lease, 0, l) })
+			respondError(c, ErrInternal)
+			return
+		}
+
 		l.Error().Err(err).Msg("VMD PauseInstance failed")
 		h.revertPauseAsync(c, sandboxID, teamID, l)
 		respondError(c, ErrInternal)
@@ -3090,11 +3102,13 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		fctx, fcancel := context.WithTimeout(finalizeCtx, asyncTimeout)
 		defer fcancel()
 		params := db.FinalizePauseParams{
-			ID:      sandboxID,
-			TeamID:  teamID,
-			Path:    snapshotPath,
-			MemPath: &memPath,
-			Trigger: "pause",
+			ID:                  sandboxID,
+			TeamID:              teamID,
+			PauseOpID:           sandbox.PauseOpID,
+			PauseOpLeaseVersion: &sandbox.PauseOpLeaseVersion,
+			Path:                snapshotPath,
+			MemPath:             &memPath,
+			Trigger:             "pause",
 			// Store only what the daemon ECHOED: an older daemon drops the
 			// token, and storing it anyway would demand of its reports an
 			// identity they can never carry.

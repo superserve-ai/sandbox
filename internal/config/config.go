@@ -56,6 +56,11 @@ type Config struct {
 	// locally.
 	SchedulerCapacityShadow bool
 
+	// PauseReconcilerEnabled keeps a pause the host never answered in
+	// 'pausing' for the reconciler to finish, instead of reverting the row
+	// to 'active' on a guess. Set via PAUSE_RECONCILER_ENABLED.
+	PauseReconcilerEnabled bool
+
 	// SystemTeamID owns curated templates that are visible to every team
 	// (python-3.11, node-22, etc.). Set via SYSTEM_TEAM_ID; empty means
 	// "no system team configured" and users see only their own templates.
@@ -126,6 +131,7 @@ func Load() (*Config, error) {
 		EdgeProxyDomain:               envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
 		DefaultHostID:                 envOrDefault("DEFAULT_HOST_ID", "default"),
 		SchedulerCapacityShadow:       boolEnv("SCHEDULER_CAPACITY_SHADOW", false),
+		PauseReconcilerEnabled:        boolEnv("PAUSE_RECONCILER_ENABLED", false),
 		SystemTeamID:                  os.Getenv("SYSTEM_TEAM_ID"),
 		SentryDSN:                     os.Getenv("SENTRY_DSN"),
 		KMSKeyResource:                os.Getenv("KMS_KEY_RESOURCE"),
