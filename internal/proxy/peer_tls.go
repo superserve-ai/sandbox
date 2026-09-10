@@ -15,6 +15,34 @@ type PeerTLSConfig struct {
 	Log                                       zerolog.Logger
 }
 
+// LoadClient constructs client credentials with server authentication enabled.
+func (c PeerTLSConfig) LoadClient() (*tls.Config, error) {
+	base, err := c.Load()
+	if err != nil {
+		return nil, err
+	}
+	// Load is server-oriented; retain its certificate/roots but use standard
+	// client chain verification and fail closed on a missing or mismatched
+	// SPIFFE peer identity. An empty ServerName intentionally skips DNS-name
+	// verification; the peer's SPIFFE URI is the authenticated identity.
+	return &tls.Config{Certificates: base.Certificates, RootCAs: base.ClientCAs, MinVersion: tls.VersionTLS13,
+		VerifyConnection: func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
+				return fmt.Errorf("missing peer certificate")
+			}
+			if len(state.VerifiedChains) == 0 {
+				return fmt.Errorf("peer certificate chain is not trusted")
+			}
+			for _, u := range state.PeerCertificates[0].URIs {
+				if u.String() == c.ExpectedSPIFFE {
+					return nil
+				}
+			}
+			return fmt.Errorf("unauthorized peer identity")
+		},
+	}, nil
+}
+
 func (c PeerTLSConfig) Load() (*tls.Config, error) {
 	if strings.TrimSpace(c.ExpectedSPIFFE) == "" {
 		return nil, fmt.Errorf("expected peer SPIFFE URI is required")
