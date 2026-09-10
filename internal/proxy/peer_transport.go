@@ -103,11 +103,21 @@ func (s *generatedPeerStream) Read(p []byte) (int, error) {
 	}
 	return n, nil
 }
+
+// Leave ample room for protobuf framing below gRPC's receive-message limit.
+const peerFrameDataLimit = 64 * 1024
+
 func (s *generatedPeerStream) Write(p []byte) (int, error) {
-	if e := s.Send(&peerpb.PeerProxyFrame{Data: append([]byte(nil), p...)}); e != nil {
-		return 0, e
+	written := 0
+	for len(p) > 0 {
+		n := min(len(p), peerFrameDataLimit)
+		if err := s.Send(&peerpb.PeerProxyFrame{Data: append([]byte(nil), p[:n]...)}); err != nil {
+			return written, err
+		}
+		written += n
+		p = p[n:]
 	}
-	return len(p), nil
+	return written, nil
 }
 func (s *generatedPeerStream) Close() error { s.cancel(); return nil }
 

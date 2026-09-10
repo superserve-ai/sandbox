@@ -200,7 +200,8 @@ type peerConn struct {
 	client         PeerClient
 	closer         io.Closer
 	closeOnce      sync.Once
-	active         int
+	active         int // Includes reserved capacity for pending opens.
+	published      int // Streams whose telemetry increment has been emitted.
 	draining       bool
 	removed        bool
 	drainScheduled bool
@@ -334,6 +335,8 @@ retry:
 						c.streams = make(map[*countedPeerStream]struct{})
 					}
 					c.streams[cs] = struct{}{}
+					c.published++
+					h.parent.cfg.Telemetry.PeerStream(1)
 					c.mu.Unlock()
 					if watcher, ok := s.(peerStreamFailureWatcher); ok {
 						go func() {
@@ -343,7 +346,6 @@ retry:
 							h.markFailed(c)
 						}()
 					}
-					h.parent.cfg.Telemetry.PeerStream(1)
 					return cs, nil
 				}
 				h.releaseOpen(c)
@@ -637,20 +639,20 @@ func (h *hostPool) scheduleDrain(c *peerConn) {
 		active := c.active
 		c.draining = true
 		c.removed = true
-		// Forced reclamation closes attached streams without giving their
-		// wrappers a chance to run Close. Balance the active-stream gauge here;
-		// wrappers observe active == 0 and must not decrement it again.
-		forcedStreams := c.active
+		// Pending opens reserve capacity without publishing a stream metric.
+		// Balance only published streams; late wrapper cleanup is idempotent.
+		forcedStreams := c.published
+		c.published = 0
 		c.active = 0
 		c.mu.Unlock()
 		c.close()
 		// Reclaim the slot at the deadline even if attached streams have not
 		// closed yet; their subsequent cleanup is idempotent.
 		h.remove(c)
-		h.parent.cfg.Telemetry.PeerDrain(active > 0)
 		if forcedStreams > 0 {
 			h.parent.cfg.Telemetry.PeerStream(-forcedStreams)
 		}
+		h.parent.cfg.Telemetry.PeerDrain(active > 0)
 	}()
 }
 func (h *hostPool) releaseOpen(c *peerConn) {
@@ -729,16 +731,17 @@ func (h *hostPool) close(deadline time.Time) {
 			continue
 		}
 		c.draining = true
-		forcedStreams := c.active
+		forcedStreams := c.published
+		c.published = 0
 		c.active = 0
 		c.removed = true
 		c.mu.Unlock()
 		c.close()
 		h.remove(c)
-		h.parent.cfg.Telemetry.PeerDrain(true)
 		if forcedStreams > 0 {
 			h.parent.cfg.Telemetry.PeerStream(-forcedStreams)
 		}
+		h.parent.cfg.Telemetry.PeerDrain(true)
 	}
 }
 
@@ -776,10 +779,12 @@ func (s *countedPeerStream) Close() error {
 	s.once.Do(func() {
 		s.conn.mu.Lock()
 		delete(s.conn.streams, s)
-		decremented := false
 		if s.conn.active > 0 {
 			s.conn.active--
-			decremented = true
+		}
+		decremented := s.conn.published > 0
+		if decremented {
+			s.conn.published--
 		}
 		draining := s.conn.draining
 		active := s.conn.active
