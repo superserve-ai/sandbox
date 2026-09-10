@@ -12,6 +12,18 @@ SPEC.loader.exec_module(MODULE)
 
 
 class DeployOtelCollectorTests(unittest.TestCase):
+    def test_ssh_key_created_before_parallel_fanout(self):
+        # Per-host deploys run in parallel, and gcloud generates the runner's
+        # SSH key on first use. Two hosts starting together race ssh-keygen and
+        # one fails before uploading anything, so the key must exist before
+        # the pool starts.
+        source = SCRIPT.read_text()
+        keygen = source.find('"ssh-keygen", "-q"')
+        pool = source.find("ThreadPoolExecutor(max_workers=len(instances))")
+        self.assertNotEqual(keygen, -1)
+        self.assertNotEqual(pool, -1)
+        self.assertLess(keygen, pool)
+
     def test_probe_parser_returns_architecture_and_unique_staging_directory(self):
         self.assertEqual(
             MODULE._parse_remote_probe(

@@ -115,6 +115,15 @@ def main() -> int:
 
     print(f"Deploying proxy to {len(instances)} instance(s) in {where}")
 
+    # gcloud generates the runner's SSH key on first use. With per-host deploys
+    # running in parallel, two hosts can both find it missing and both run
+    # ssh-keygen; the loser fails with "already exists". Create it up front,
+    # locally, so no single host's reachability gates the others.
+    key = os.path.expanduser("~/.ssh/google_compute_engine")
+    if not os.path.exists(key):
+        os.makedirs(os.path.dirname(key), mode=0o700, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-q", "-t", "rsa", "-N", "", "-f", key], check=True)
+
     def deploy(inst):
         name, zone = inst["name"], inst["zone"]
         tag = f"{name}/{zone}"
