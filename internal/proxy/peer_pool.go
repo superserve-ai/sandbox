@@ -144,6 +144,7 @@ func (p *peerPool) Close() error {
 	for _, h := range hs {
 		h.mu.Lock()
 		h.closed = true
+		h.notifyLocked()
 		if h.dialCancel != nil {
 			h.dialCancel()
 		}
@@ -164,6 +165,7 @@ type hostPool struct {
 	conns              []*peerConn
 	dialing            bool
 	dialDone           chan struct{}
+	changed            chan struct{}
 	dialCancel         context.CancelFunc
 	closed             bool
 	endpointGeneration uint64
@@ -254,6 +256,7 @@ func (h *hostPool) replaceLocked(addr string) {
 	h.replacing = true
 	h.addr = addr
 	h.endpointGeneration++
+	h.notifyLocked()
 	if h.dialCancel != nil {
 		h.dialCancel()
 	}
@@ -315,22 +318,14 @@ retry:
 					// it so no new stream can escape on a stale connection.
 					h.mu.Lock()
 					c.mu.Lock()
-					stale := generation != h.endpointGeneration || c.draining
-					c.mu.Unlock()
-					h.mu.Unlock()
-					if stale {
+					if h.closed || generation != h.endpointGeneration || c.draining || c.removed {
+						c.mu.Unlock()
+						h.mu.Unlock()
 						h.releaseOpen(c)
 						_ = s.Close()
 						continue retry
 					}
 					cs := &countedPeerStream{PeerStream: s, conn: c, host: h, tele: h.parent.cfg.Telemetry}
-					c.mu.Lock()
-					if c.draining || c.removed {
-						c.mu.Unlock()
-						h.releaseOpen(c)
-						_ = s.Close()
-						continue retry
-					}
 					if c.streams == nil {
 						c.streams = make(map[*countedPeerStream]struct{})
 					}
@@ -338,6 +333,7 @@ retry:
 					c.published++
 					h.parent.cfg.Telemetry.PeerStream(1)
 					c.mu.Unlock()
+					h.mu.Unlock()
 					if watcher, ok := s.(peerStreamFailureWatcher); ok {
 						go func() {
 							<-watcher.Done()
@@ -377,24 +373,28 @@ retry:
 			// Coalesce concurrent callers behind the in-flight dial instead of
 			// polling every millisecond while an endpoint is unavailable.
 			done := h.dialDone
+			changed := h.changedLocked()
 			h.mu.Unlock()
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			case <-done:
+			case <-changed:
 			}
 			continue
 		}
 		if usable >= h.parent.cfg.MaxConnections {
+			changed := h.changedLocked()
 			h.mu.Unlock()
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Millisecond):
+			case <-changed:
 			}
 			continue
 		}
 		if wait := time.Until(h.retryAt); wait > 0 {
+			changed := h.changedLocked()
 			h.mu.Unlock()
 			t := time.NewTimer(wait)
 			select {
@@ -402,6 +402,8 @@ retry:
 				t.Stop()
 				return nil, ctx.Err()
 			case <-t.C:
+			case <-changed:
+				t.Stop()
 			}
 			continue
 		}
@@ -482,6 +484,28 @@ retry:
 	}
 }
 
+// Waiters subscribe under the host lock so capacity and endpoint changes cannot
+// be lost between checking the state and going to sleep.
+func (h *hostPool) changedLocked() <-chan struct{} {
+	if h.changed == nil {
+		h.changed = make(chan struct{})
+	}
+	return h.changed
+}
+
+func (h *hostPool) notifyLocked() {
+	if h.changed != nil {
+		close(h.changed)
+		h.changed = nil
+	}
+}
+
+func (h *hostPool) notify() {
+	h.mu.Lock()
+	h.notifyLocked()
+	h.mu.Unlock()
+}
+
 func (h *hostPool) evictIfEmpty() {
 	h.parent.mu.Lock()
 	defer h.parent.mu.Unlock()
@@ -544,12 +568,15 @@ func (h *hostPool) markFailed(c *peerConn) {
 		h.parent.cfg.Telemetry.PeerConnection(-1)
 		h.failures++
 		h.retryAt = time.Now().Add(peerReconnectBackoff(h.failures))
+		c.mu.Lock()
+		c.draining = true
+		c.removed = true
+		c.mu.Unlock()
+		h.notifyLocked()
 	}
 	h.mu.Unlock()
 	if found {
 		c.mu.Lock()
-		c.draining = true
-		c.removed = true
 		streams := make([]*countedPeerStream, 0, len(c.streams))
 		for s := range c.streams {
 			streams = append(streams, s)
@@ -559,9 +586,9 @@ func (h *hostPool) markFailed(c *peerConn) {
 		// safe when read/write failures race with stream-open or drain cleanup.
 		c.close()
 		// Force attached streams to observe the transport failure immediately.
-		// Closing the raw streams is safe even if their wrappers later close.
+		// Wrapper cleanup also releases their capacity and telemetry.
 		for _, s := range streams {
-			_ = s.PeerStream.Close()
+			_ = s.Close()
 		}
 		h.parent.cfg.Telemetry.PeerFailure()
 		h.evictIfEmpty()
@@ -592,6 +619,7 @@ func (h *hostPool) remove(target *peerConn) {
 	target.drainScheduled = false
 	target.mu.Unlock()
 	replacing := h.replacing
+	h.notifyLocked()
 	h.mu.Unlock()
 	target.close()
 	if !replacing {
@@ -656,6 +684,7 @@ func (h *hostPool) scheduleDrain(c *peerConn) {
 	}()
 }
 func (h *hostPool) releaseOpen(c *peerConn) {
+	defer h.notify()
 	c.mu.Lock()
 	if c.active > 0 {
 		c.active--
@@ -790,6 +819,7 @@ func (s *countedPeerStream) Close() error {
 		active := s.conn.active
 		removed := s.conn.removed
 		s.conn.mu.Unlock()
+		s.host.notify()
 		if decremented {
 			s.tele.PeerStream(-1)
 		}
