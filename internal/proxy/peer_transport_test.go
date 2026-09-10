@@ -631,3 +631,83 @@ func TestGRPCPeerClientCannotReconnectInternally(t *testing.T) {
 		t.Fatalf("dead client opened a stream: %v", err)
 	}
 }
+
+func TestGRPCPeerDialerBoundsCredentialLoading(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	var loads atomic.Int32
+	dial := grpcPeerDialer(func() (*tls.Config, error) {
+		if loads.Add(1) == 1 {
+			close(started)
+		}
+		<-release
+		return nil, errors.New("credentials unavailable")
+	}, 30*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { _, _, err := dial(ctx, "host", "127.0.0.1:1"); done <- err }()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled load: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled caller waited for credential I/O")
+	}
+	// A blocked load remains bounded even after successive dial deadlines.
+	for i := 0; i < 3; i++ {
+		_, _, err := dial(context.Background(), "host", "127.0.0.1:1")
+		if !errors.Is(err, errPeerUnavailable) {
+			t.Fatalf("attempt deadline: %v", err)
+		}
+	}
+	if got := loads.Load(); got != 1 {
+		t.Fatalf("concurrent stalled loads = %d, want 1", got)
+	}
+}
+
+func TestGRPCPeerDialerCredentialLoadDeadline(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	dial := grpcPeerDialer(func() (*tls.Config, error) {
+		close(started)
+		<-release
+		return nil, errors.New("credentials unavailable")
+	}, 20*time.Millisecond)
+	done := make(chan error, 1)
+	go func() { _, _, err := dial(context.Background(), "host", "127.0.0.1:1"); done <- err }()
+	<-started
+	select {
+	case err := <-done:
+		if !errors.Is(err, errPeerUnavailable) {
+			t.Fatalf("load deadline: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("dial deadline did not include credential loading")
+	}
+}
+
+func TestPeerPoolShutdownCancelsCredentialLoading(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	p := NewPeerTransport(PeerPoolConfig{Dial: GRPCPeerDialer(func() (*tls.Config, error) {
+		close(started)
+		<-release
+		return nil, errors.New("credentials unavailable")
+	}), DrainTimeout: time.Second})
+	done := make(chan error, 1)
+	go func() { _, err := p.OpenStream(context.Background(), "host", "127.0.0.1:1"); done <- err }()
+	<-started
+	_ = p.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("open succeeded after shutdown")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown left the open caller waiting on credential I/O")
+	}
+}
