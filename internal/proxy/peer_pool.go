@@ -556,6 +556,13 @@ func (h *hostPool) setBackoffLocked() {
 
 func (h *hostPool) markFailed(c *peerConn) {
 	h.mu.Lock()
+	c.mu.Lock()
+	intentional := c.draining || c.removed
+	c.mu.Unlock()
+	if intentional {
+		h.mu.Unlock()
+		return
+	}
 	found := false
 	for i, x := range h.conns {
 		if x == c {
@@ -727,9 +734,12 @@ func (h *hostPool) close(deadline time.Time) {
 	for _, c := range cs {
 		c.mu.Lock()
 		c.draining = true
-		active := c.active
+		reclaim := c.active == 0 && !c.removed
+		if reclaim {
+			c.removed = true
+		}
 		c.mu.Unlock()
-		if active == 0 {
+		if reclaim {
 			c.close()
 			h.remove(c)
 			h.parent.cfg.Telemetry.PeerDrain(false)
@@ -815,18 +825,16 @@ func (s *countedPeerStream) Close() error {
 		if decremented {
 			s.conn.published--
 		}
-		draining := s.conn.draining
-		active := s.conn.active
-		removed := s.conn.removed
+		reclaim := s.conn.draining && s.conn.active == 0 && !s.conn.removed
+		if reclaim {
+			s.conn.removed = true
+		}
 		s.conn.mu.Unlock()
 		s.host.notify()
 		if decremented {
 			s.tele.PeerStream(-1)
 		}
-		if draining && active == 0 && !removed {
-			s.conn.mu.Lock()
-			s.conn.removed = true
-			s.conn.mu.Unlock()
+		if reclaim {
 			s.conn.close()
 			s.host.remove(s.conn)
 			s.tele.PeerDrain(false)

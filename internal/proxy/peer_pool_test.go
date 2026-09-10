@@ -1069,3 +1069,83 @@ func TestPeerPoolAsyncFailureReleasesIdleStreamAccounting(t *testing.T) {
 		t.Fatal("late closes double-decremented stream metrics")
 	}
 }
+
+type peerShutdownTelemetry struct {
+	noopPeerTelemetry
+	failures         atomic.Int32
+	drains           atomic.Int32
+	closing, release chan struct{}
+}
+
+func (t *peerShutdownTelemetry) PeerFailure()   { t.failures.Add(1) }
+func (t *peerShutdownTelemetry) PeerDrain(bool) { t.drains.Add(1) }
+func (t *peerShutdownTelemetry) PeerStream(delta int) {
+	if delta < 0 && t.closing != nil {
+		close(t.closing)
+		<-t.release
+	}
+}
+
+func TestPeerPoolLastCloseClaimsDrainBeforeDeadline(t *testing.T) {
+	metrics := &peerShutdownTelemetry{closing: make(chan struct{}), release: make(chan struct{})}
+	dial, _, _ := testDialer()
+	p := NewPeerTransport(PeerPoolConfig{Dial: dial, Telemetry: metrics, DrainTimeout: 10 * time.Millisecond}).(*peerPool)
+	defer p.Close()
+	s, err := p.OpenStream(context.Background(), "host", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := p.hosts["host"]
+	p.mu.Lock()
+	h.replaceLocked("new")
+	p.mu.Unlock()
+	done := make(chan struct{})
+	go func() { _ = s.Close(); close(done) }()
+	<-metrics.closing
+	// Hold stream cleanup past the timer deadline, after accounting is updated.
+	time.Sleep(30 * time.Millisecond)
+	close(metrics.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stream cleanup stuck")
+	}
+	if got := metrics.drains.Load(); got != 1 {
+		t.Fatalf("drain events = %d, want 1", got)
+	}
+}
+
+type callbackPeerCloser struct{ close func() }
+
+func (c callbackPeerCloser) Close() error { c.close(); return nil }
+
+func TestPeerPoolIntentionalCloseDoesNotRecordFailure(t *testing.T) {
+	metrics := &peerShutdownTelemetry{}
+	var onClose func()
+	p := NewPeerTransport(PeerPoolConfig{Telemetry: metrics, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		return &testPeerClient{}, callbackPeerCloser{close: func() { onClose() }}, nil
+	}}).(*peerPool)
+	s, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := s.(*countedPeerStream)
+	onClose = func() { cs.host.markFailed(cs.conn) }
+	_ = s.Close()
+	done := make(chan struct{})
+	go func() { _ = p.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("intentional close was handled as transport failure")
+	}
+	if metrics.failures.Load() != 0 {
+		t.Fatal("intentional close recorded a failure")
+	}
+	cs.host.mu.Lock()
+	failures := cs.host.failures
+	cs.host.mu.Unlock()
+	if failures != 0 {
+		t.Fatal("intentional close scheduled reconnect backoff")
+	}
+}
