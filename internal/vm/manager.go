@@ -8452,6 +8452,9 @@ func (m *Manager) failAfterSnapshot(inst *VMInstance, socketPath string, err err
 // with no confirmed release: Error, so it is not served as running, with its
 // process, intent and artifacts kept for a release that still has the token.
 func (m *Manager) markUnservable(inst *VMInstance, log zerolog.Logger) {
+	// The process stays: capacity must keep charging it behind the Error
+	// record until a confirmed stop or the reconciler's reap clears this.
+	m.vmStopUnconfirmed.Store(inst.ID, struct{}{})
 	inst.mu.Lock()
 	inst.Status = StatusError
 	inst.mu.Unlock()

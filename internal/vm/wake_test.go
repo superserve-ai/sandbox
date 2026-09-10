@@ -2733,6 +2733,11 @@ func TestPauseWithAnUnconfirmedThawRecordsTheGuestAsError(t *testing.T) {
 		if in, err := readPauseIntent(vmDir); err != nil || in == nil || in.FreezeToken == "" {
 			t.Fatalf("intent = %+v err=%v; the token must be kept for a later release", in, err)
 		}
+		// The process was kept: capacity must go on charging it behind the
+		// Error record until its stop is confirmed.
+		if _, marked := m.vmStopUnconfirmed.Load("vm-1"); !marked {
+			t.Fatal("a retained process behind an Error record must be marked as possibly alive for capacity accounting")
+		}
 	}
 
 	t.Run("freeze_reply_lost_and_thaw_unconfirmed", func(t *testing.T) {
