@@ -17,8 +17,10 @@ Env vars:
   PROXY_DOMAINS              optional — comma-separated host suffixes; overrides
                              PROXY_DOMAIN on the proxy when set (DNS transitions)
   SANDBOX_ACCESS_TOKEN_SEED  optional — hex, >=32 bytes (>=64 hex chars)
+  DATABASE_URL               required — shared Postgres connection for ownership routing
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
+  PEER_PROXY_TARGET_ADDR     optional — loopback address for SS-470 peer ingress
   SENTRY_DSN                 optional — Sentry DSN URL for error reporting
   PEER_IDENTITY_HOSTS        optional — comma-separated hosts requiring identity bootstrap
   PEER_PROXY_LISTEN_ADDR     optional — private mTLS listener (auto or private IP:port)
@@ -65,6 +67,10 @@ def main() -> int:
     if access_seed and not re.fullmatch(r"[0-9a-fA-F]{64,}", access_seed):
         print("ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)", file=sys.stderr)
         return 1
+    database_url = os.environ.get("DATABASE_URL", "")
+    if not database_url:
+        print("ERROR: DATABASE_URL is required for cross-host routing", file=sys.stderr)
+        return 1
     terminal_origins = os.environ.get("PROXY_ALLOWED_ORIGINS", "")
     if terminal_origins and not re.fullmatch(r"[A-Za-z0-9.,:/*\-]+", terminal_origins):
         print("ERROR: PROXY_ALLOWED_ORIGINS contains disallowed characters", file=sys.stderr)
@@ -72,6 +78,10 @@ def main() -> int:
     require_data_plane = os.environ.get("REQUIRE_DATA_PLANE", "")
     if require_data_plane not in ("", "0", "1"):
         print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
+        return 1
+    peer_proxy_target_addr = os.environ.get("PEER_PROXY_TARGET_ADDR", "127.0.0.1:5010")
+    if not re.fullmatch(r"(?:127\.0\.0\.1|localhost|\[::1\]):[0-9]{1,5}", peer_proxy_target_addr):
+        print("ERROR: PEER_PROXY_TARGET_ADDR must be a loopback host:port", file=sys.stderr)
         return 1
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     peer_identity_hosts = set(filter(None, (host.strip() for host in
@@ -371,6 +381,8 @@ def main() -> int:
             SANDBOX_ACCESS_TOKEN_SEED={access_seed}
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
+            DATABASE_URL={shlex.quote(database_url)}
+            PEER_PROXY_TARGET_ADDR={peer_proxy_target_addr}
             SENTRY_DSN={sentry_dsn}
             PEER_PROXY_LISTEN_ADDR=$peer_listen_addr
             PEER_PROXY_TARGET_ADDR={peer_env['PEER_PROXY_TARGET_ADDR']}

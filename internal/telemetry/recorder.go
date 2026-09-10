@@ -173,6 +173,18 @@ type PeerEvent struct {
 	Duration time.Duration
 }
 
+// RoutingOutcome records one bounded public data-plane routing decision.
+// Callers must not attach sandbox, team, or user identifiers.
+type RoutingOutcome struct {
+	Outcome string // local | remote | ownership_error | peer_error
+	HostID  string
+}
+
+// RoutingOutcomeRecorder is optional so existing recorder fakes remain source-compatible.
+type RoutingOutcomeRecorder interface {
+	RecordRoutingOutcome(context.Context, RoutingOutcome)
+}
+
 // CapacityShadow is one shadow ranking evaluation: what capacity-based
 // placement WOULD have chosen, measured against what the live scheduler
 // actually did, plus how much of the fleet is describable at all.
@@ -249,3 +261,5 @@ func (noopRecorder) RecordLauncherState(context.Context, LauncherState)         
 func (noopRecorder) RecordLatencyPhase(context.Context, LatencyPhase)                       {}
 func (noopRecorder) RecordPeerIngress(context.Context, PeerIngress)                         {}
 func (noopRecorder) RecordPeerEvent(context.Context, PeerEvent)                             {}
+
+func (noopRecorder) RecordRoutingOutcome(context.Context, RoutingOutcome)                   {}

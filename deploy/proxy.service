@@ -10,6 +10,9 @@ Restart=always
 RestartSec=2
 
 Environment=PROXY_ADDR=:5007
+# SS-470 connects to this loopback-only listener so peer traffic bypasses the
+# public ownership router and terminates in the host-local Handler.
+Environment=PEER_PROXY_TARGET_ADDR=127.0.0.1:5010
 Environment=PROXY_REDIRECT_ADDR=:5008
 # Optional private peer ingress. Credentials are provisioned by the host
 # identity bootstrap. Outbound clients use credentials even without ingress.

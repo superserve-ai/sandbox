@@ -87,6 +87,7 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_STAGING }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_STAGING }}
           # Enables the proxy's OTLP exporter (host-local collector) so the
@@ -155,6 +156,7 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
           OTEL_ENVIRONMENT: production
@@ -201,6 +203,7 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USW }}
           # Production opts in separately after its staging-proven migration.
           PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_USW == 'true' && 'superserve-vmd-usw2-2' || '' }}

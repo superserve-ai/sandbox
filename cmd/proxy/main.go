@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/getsentry/sentry-go"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
@@ -43,7 +44,14 @@ func main() {
 	}
 
 	addr := envOrDefault("PROXY_ADDR", ":5007")
+	localAddr, err := loopbackAddr(envOrDefault("PEER_PROXY_TARGET_ADDR", "127.0.0.1:5010"))
+	if err != nil {
+		log.Fatal().Err(err).Msg("PEER_PROXY_TARGET_ADDR must be loopback-only")
+	}
 	redirectAddr := envOrDefault("PROXY_REDIRECT_ADDR", ":5008")
+	if err := validateListenerSeparation(localAddr, addr, redirectAddr); err != nil {
+		log.Fatal().Err(err).Msg("peer target listener must be distinct from public listeners")
+	}
 	vmdAddr := envOrDefault("VMD_ADDR", "http://127.0.0.1:9090")
 	domains := proxyDomains()
 	if legacy := os.Getenv("PROXY_DOMAIN"); legacy != "" && !slices.Contains(domains, legacy) {
@@ -64,6 +72,27 @@ func main() {
 
 	resolver := proxy.NewVMDResolver(vmdAddr)
 	proxyHandler := proxy.NewHandler(domains, resolver, log)
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal().Msg("DATABASE_URL is required for cross-host routing")
+	}
+	dbPool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		log.Fatal().Err(err).Msg("init ownership database")
+	}
+	defer dbPool.Close()
+	// Cross-host routing must not start in a silently local-only or
+	// unavailable state. Validate the shared persistence connection before
+	// bringing up either listener; later lookups still use their request
+	// contexts for cancellation and bounded work.
+	bootstrapCtx, bootstrapCancel := context.WithTimeout(ctx, 5*time.Second)
+	err = dbPool.Ping(bootstrapCtx)
+	bootstrapCancel()
+	if err != nil {
+		log.Fatal().Err(err).Msg("ownership database unavailable")
+	}
+	ownership := proxy.NewDBOwnershipResolver(dbPool)
+	var routingRecorder telemetry.RoutingOutcomeRecorder
 	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
 		interval, ierr := time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
 		if ierr != nil {
@@ -83,6 +112,7 @@ func main() {
 		} else {
 			peerRecorder = rec
 			proxyHandler.WithTelemetry(rec)
+			routingRecorder = rec
 			defer func() {
 				// Bounded: a stalled collector must not hang proxy restarts
 				// on the final flush.
@@ -296,6 +326,14 @@ type proxyHealthResponse struct {
 }
 
 func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
+	return newProxyMuxWithHandler(proxyHandler, proxyHandler)
+}
+
+func newDataPlaneMuxes(local *proxy.Handler, router *proxy.RoutingHandler) (publicMux, localMux *http.ServeMux) {
+	return newProxyMuxWithHandler(local, router), newProxyMux(local)
+}
+
+func newProxyMuxWithHandler(proxyHandler *proxy.Handler, dataPlane http.Handler) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if proxyHandler.ServesHost(r.Host) {
@@ -309,7 +347,7 @@ func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
 			ResolverReady: proxyHandler.ResolverReady(r.Context()),
 		})
 	})
-	mux.Handle("/", proxyHandler)
+	mux.Handle("/", dataPlane)
 	return mux
 }
 
