@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -541,4 +542,73 @@ func TestReaper_SweepsRunOnStartupWithUnsetSweepInterval(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("snapshot sweep did not run on startup")
+}
+
+// The billing pass schedules like the reaper: a free worker claims the next
+// sandbox while another is still on a slow pause.
+func TestBillingPause_FreeWorkerStartsTheNextPause(t *testing.T) {
+	teamID := uuid.New()
+	rows := make([]db.ClaimExpiredSandboxesRow, 11)
+	for i := range rows {
+		rows[i] = expiredRow(fmt.Sprintf("billing-%d", i))
+		rows[i].TeamID = teamID
+	}
+	var mu sync.Mutex
+	remaining := rows
+	calls := make(chan string, len(rows))
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+
+	h := newReaperHandlers(
+		&reaperMockDBTX{queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+			if !strings.Contains(sql, "-- name: ClaimBillingIneligibleSandboxes") {
+				return newStubRows(nil), nil
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			n := min(int(args[1].(int32)), len(remaining))
+			claimed := remaining[:n]
+			remaining = remaining[n:]
+			return newStubRows(claimed), nil
+		}},
+		&stubVMD{pauseFn: func(ctx context.Context, id, _ string) (string, string, error) {
+			calls <- id
+			if id == rows[0].ID.String() {
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return "", "", ctx.Err()
+				}
+			}
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		}},
+	)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.pauseBillingIneligibleTeam(context.Background(), teamID)
+	}()
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		<-done
+		h.WaitAsyncBookkeeping()
+	}()
+
+	for i := 0; i < 10; i++ {
+		select {
+		case <-calls:
+		case <-time.After(time.Second):
+			t.Fatal("initial billing pauses did not start")
+		}
+	}
+	select {
+	case id := <-calls:
+		if id != rows[10].ID.String() {
+			t.Fatalf("next pause = %s, want the eleventh row", id)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("one slow pause blocked the eleventh sandbox while workers were idle")
+	}
 }
