@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -762,5 +763,85 @@ func TestPeerPoolReclaimsStalePendingOpen(t *testing.T) {
 	}
 	if oldCloser.closed.Load() != 1 {
 		t.Fatal("idle retired connection was not reclaimed")
+	}
+}
+
+type eofWritePeerStream struct{ testPeerStream }
+
+func (*eofWritePeerStream) Write([]byte) (int, error) { return 0, io.EOF }
+
+type eofWritePeerClient struct{}
+
+func (eofWritePeerClient) OpenPeerStream(context.Context) (PeerStream, error) {
+	return &eofWritePeerStream{}, nil
+}
+func TestPeerPoolWriteEOFReleasesCapacity(t *testing.T) {
+	var dials atomic.Int32
+	closer := &countingCloser{}
+	p := NewPeerTransport(PeerPoolConfig{MaxConnections: 1, StreamsPerConnection: 1, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		dials.Add(1)
+		return eofWritePeerClient{}, closer, nil
+	}})
+	defer p.Close()
+	s, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write([]byte("x")); err != io.EOF {
+		t.Fatalf("write error = %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	next, err := p.OpenStream(ctx, "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = next.Close()
+	if dials.Load() != 1 || closer.closed.Load() != 0 {
+		t.Fatal("EOF retired the shared connection")
+	}
+}
+
+type peerEventRecorder struct{ events []telemetry.PeerEvent }
+
+func (r *peerEventRecorder) RecordPeerEvent(_ context.Context, e telemetry.PeerEvent) {
+	r.events = append(r.events, e)
+}
+func TestPeerPoolHandshakeOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"success", nil, telemetry.ResultSuccess},
+		{"failure", errors.New("unavailable"), telemetry.ResultError},
+		{"canceled", context.Canceled, telemetry.ResultError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := &peerEventRecorder{}
+			p := NewPeerTransport(PeerPoolConfig{Telemetry: RecorderPeerTelemetry{Recorder: recorder}, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+				if tc.err != nil {
+					return nil, nil, tc.err
+				}
+				return &testPeerClient{}, &countingCloser{}, nil
+			}})
+			s, _ := p.OpenStream(context.Background(), "host", "addr")
+			if s != nil {
+				_ = s.Close()
+			}
+			_ = p.Close()
+			found := false
+			for _, e := range recorder.events {
+				if e.Kind == "handshake" {
+					found = true
+					if e.Result != tc.want {
+						t.Fatalf("result = %s, want %s", e.Result, tc.want)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("missing handshake event")
+			}
+		})
 	}
 }
