@@ -607,6 +607,8 @@ type Sandbox struct {
 	PauseOpAttentionAt pgtype.Timestamptz `json:"pause_op_attention_at"`
 	// Why the pause in flight was started (pause, timeout, billing_ineligible); kept so a reconciled pause records its original cause.
 	PauseOpTrigger *string `json:"pause_op_trigger"`
+	// Who asked for the pause in flight; NULL for automatic pauses. Kept so a reconciled pause is attributed to them.
+	PauseOpActorID pgtype.UUID `json:"pause_op_actor_id"`
 }
 
 type SandboxActiveInterval struct {

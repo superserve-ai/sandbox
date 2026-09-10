@@ -90,7 +90,7 @@ WITH tpl AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
@@ -368,7 +368,7 @@ WITH failed AS (
   SET status = 'failed', auto_delete_at = NULL, updated_at = now(),
       pause_op_id = NULL, pause_op_started_at = NULL,
       pause_op_lease_until = NULL, pause_op_attention_at = NULL,
-      pause_op_trigger = NULL
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
     AND sandbox.status = sqlc.arg(observed_status)
     -- A pause worker may only fail the operation it holds the lease on.
@@ -436,7 +436,8 @@ WITH paused AS (
       pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
       pause_op_lease_version = pause_op_lease_version + 1,
       pause_op_attention_at = NULL,
-      pause_op_trigger = 'pause'
+      pause_op_trigger = 'pause',
+      pause_op_actor_id = sqlc.narg(actor_id)::uuid
   WHERE sandbox.id = sqlc.arg(id)
     AND sandbox.team_id = sqlc.arg(team_id)
     AND sandbox.destroyed_at IS NULL
@@ -476,7 +477,7 @@ WITH reverted AS (
       -- for it can no longer match this row.
       pause_op_id = NULL, pause_op_started_at = NULL,
       pause_op_lease_until = NULL, pause_op_attention_at = NULL,
-      pause_op_trigger = NULL
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
   WHERE sandbox.id = sqlc.arg(sandbox_id)
     AND sandbox.team_id = sqlc.arg(team_id)
     AND sandbox.destroyed_at IS NULL
@@ -700,7 +701,7 @@ SET snapshot_id = (SELECT snap_id FROM upserted),
     -- under its identity later. Its token lives on with the snapshot.
     pause_op_id = NULL, pause_op_started_at = NULL,
     pause_op_lease_until = NULL, pause_op_attention_at = NULL,
-      pause_op_trigger = NULL
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
 FROM upserted
 WHERE sandbox.id = @id AND sandbox.team_id = @team_id AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
@@ -792,7 +793,7 @@ SET snapshot_id = (SELECT snap_id FROM inserted),
     -- under its identity later. Its token lives on with the snapshot.
     pause_op_id = NULL, pause_op_started_at = NULL,
     pause_op_lease_until = NULL, pause_op_attention_at = NULL,
-      pause_op_trigger = NULL
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
 FROM inserted
 WHERE sandbox.id = @id AND sandbox.team_id = @team_id AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
@@ -1004,7 +1005,8 @@ paused AS (
       pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
       pause_op_lease_version = sandbox.pause_op_lease_version + 1,
       pause_op_attention_at = NULL,
-      pause_op_trigger = 'timeout'
+      pause_op_trigger = 'timeout',
+      pause_op_actor_id = NULL
   FROM expired
   WHERE sandbox.id = expired.id
   RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id, sandbox.network_config,
@@ -1066,7 +1068,8 @@ WITH candidates AS (
       pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
       pause_op_lease_version = sandbox.pause_op_lease_version + 1,
       pause_op_attention_at = NULL,
-      pause_op_trigger = 'billing_ineligible'
+      pause_op_trigger = 'billing_ineligible',
+      pause_op_actor_id = NULL
   FROM candidates
   WHERE sandbox.id = candidates.id
   RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config,
@@ -1213,7 +1216,8 @@ FROM due
 WHERE sandbox.id = due.id
 RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.host_id,
           sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until,
-          sandbox.pause_op_started_at, sandbox.pause_op_attention_at, sandbox.pause_op_trigger;
+          sandbox.pause_op_started_at, sandbox.pause_op_attention_at, sandbox.pause_op_trigger,
+          sandbox.pause_op_actor_id;
 -- name: ReleasePauseLease :execrows
 -- A worker gives its lease back, undecided, and says when the next attempt
 -- may start. Fenced on the lease it holds: a reclaimed lease releases

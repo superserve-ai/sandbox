@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc/codes"
@@ -224,5 +225,63 @@ func TestReconcilePause_ResolutionCannotOutliveTheLease(t *testing.T) {
 
 	if calls.Load() != 0 {
 		t.Fatalf("resolution crossed the attempt deadline, yet %d live RPCs were sent", calls.Load())
+	}
+}
+
+// The success entry for a pause is written when the row says paused, not
+// when the host answers: a finalize the reconciler must redo would otherwise
+// leave two entries for one pause.
+func TestPauseSandbox_NoPausedActivityUntilFinalized(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		finalizeErr  error
+		wantActivity int32
+	}{
+		{name: "finalize succeeds", wantActivity: 1},
+		{name: "finalize fails", finalizeErr: errors.New("db unavailable"), wantActivity: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sandboxID, teamID := uuid.New(), uuid.New()
+			sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive,
+				PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1}
+			var activities int32
+			mock := &mockDBTX{
+				queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+					switch {
+					case strings.Contains(sql, "-- name: CreateActivity "):
+						atomic.AddInt32(&activities, 1)
+						return activityRow()
+					case strings.Contains(sql, "upserted AS"), strings.Contains(sql, "INSERT INTO snapshot"):
+						if tc.finalizeErr != nil {
+							return errorRow(tc.finalizeErr)
+						}
+						return finalizePauseRow(uuid.New())
+					case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
+						return sandboxRow(sb)
+					}
+					return activityRow()
+				},
+				execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+					return pgconn.NewCommandTag("UPDATE 1"), nil
+				},
+			}
+			h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+
+			w := httptest.NewRecorder()
+			setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+			h.WaitAsyncBookkeeping()
+
+			if w.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
+			}
+			// The activity write runs on its own goroutine; give it a moment
+			// either way so an absent entry is a decision, not a race.
+			for deadline := time.Now().Add(300 * time.Millisecond); time.Now().Before(deadline) && atomic.LoadInt32(&activities) != tc.wantActivity; {
+				time.Sleep(5 * time.Millisecond)
+			}
+			if got := atomic.LoadInt32(&activities); got != tc.wantActivity {
+				t.Fatalf("paused activity entries = %d, want %d", got, tc.wantActivity)
+			}
+		})
 	}
 }

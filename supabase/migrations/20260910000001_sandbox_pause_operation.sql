@@ -12,7 +12,8 @@ ALTER TABLE sandbox
   ADD COLUMN IF NOT EXISTS pause_op_lease_until timestamptz,
   ADD COLUMN IF NOT EXISTS pause_op_lease_version bigint NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS pause_op_attention_at timestamptz,
-  ADD COLUMN IF NOT EXISTS pause_op_trigger text;
+  ADD COLUMN IF NOT EXISTS pause_op_trigger text,
+  ADD COLUMN IF NOT EXISTS pause_op_actor_id uuid REFERENCES profile(id);
 
 COMMENT ON COLUMN sandbox.pause_op_id IS
   'Identity of the pause in flight, reused as the pause token across every attempt; NULL when no pause is pending.';
@@ -22,3 +23,5 @@ COMMENT ON COLUMN sandbox.pause_op_attention_at IS
   'When a pause pending past its age threshold was flagged for an operator; set once.';
 COMMENT ON COLUMN sandbox.pause_op_trigger IS
   'Why the pause in flight was started (pause, timeout, billing_ineligible); kept so a reconciled pause records its original cause.';
+COMMENT ON COLUMN sandbox.pause_op_actor_id IS
+  'Who asked for the pause in flight; NULL for automatic pauses. Kept so a reconciled pause is attributed to them.';

@@ -307,3 +307,36 @@ func TestIntegration_PauseReconcile_KeepsTheOriginalCause(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A pause a user asked for that the reconciler had to finish is still
+// attributed to that user, not recorded as system-initiated.
+func TestIntegration_PauseReconcile_KeepsTheRequestingActor(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, profileID := seedTeamKeyAndProfile(t)
+	id := seedActiveSandbox(t, teamID, "reconcile-actor")
+	if _, err := testQueries.BeginPause(ctx, db.BeginPauseParams{
+		ID: id, TeamID: teamID, PauseOpID: pauseOpID(uuid.New()), LeaseSeconds: 90, ActorID: pauseOpID(profileID),
+	}); err != nil {
+		t.Fatalf("BeginPause: %v", err)
+	}
+	expireLease(t, id)
+
+	h := pauseHandlers(t, &stubVMD{})
+	h.ReconcilePendingPausesOnce(ctx, zerolog.Nop())
+	h.WaitAsyncBookkeeping()
+
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		var n int
+		if err := testPool.QueryRow(ctx,
+			`SELECT count(*) FROM activity WHERE sandbox_id = $1 AND action = 'paused' AND actor_id = $2`, id, profileID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n == 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("paused activity attributed to the requester = %d rows, want 1", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

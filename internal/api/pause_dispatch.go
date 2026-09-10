@@ -147,12 +147,11 @@ func (h *Handlers) dispatchPause(ctx context.Context, vmd VMDClient, sandbox db.
 			l.Error().Err(err).Msg("async DB FinalizePause failed — sandbox stays 'pausing' for reconciliation")
 			return
 		}
+		// Recorded once the row says paused: a finalize the reconciler has
+		// to redo must not leave two success entries for one pause.
+		h.logSandboxActivity(finalizeCtx, sandboxID, teamID, actorID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
+		h.captureFor(actorID, teamID, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
 	})
-
-	// The interval closed at BeginPause; this is the end of the host work,
-	// not the moment the sandbox left active.
-	h.logSandboxActivity(ctx, sandboxID, teamID, actorID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
-	h.captureFor(actorID, teamID, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
 	return pauseDone
 }
 

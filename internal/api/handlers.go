@@ -3057,6 +3057,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		TeamID:       teamID,
 		PauseOpID:    pgtype.UUID{Bytes: pauseOp, Valid: true},
 		LeaseSeconds: pauseLeaseSeconds,
+		ActorID:      actorUUID(actorIDFromContext(c)),
 	})
 	if err == nil {
 		pauseHostID = sandbox.HostID // label error outcomes past the claim too
