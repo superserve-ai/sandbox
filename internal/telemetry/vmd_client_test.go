@@ -31,6 +31,7 @@ func (r *captureRecorder) RecordPausedNetworkPressure(context.Context, PausedNet
 func (r *captureRecorder) RecordLauncherState(context.Context, LauncherState) {}
 func (r *captureRecorder) RecordLatencyPhase(context.Context, LatencyPhase)   {}
 func (r *captureRecorder) RecordPeerIngress(context.Context, PeerIngress)     {}
+func (r *captureRecorder) RecordPeerEvent(context.Context, PeerEvent)         {}
 
 func TestInstrumentedVMDClientRecordsHostID(t *testing.T) {
 	recorder := &captureRecorder{}
