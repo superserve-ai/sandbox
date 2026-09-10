@@ -175,7 +175,12 @@ func TestTrialCreditWarningLifecycleSuppressesIneligibleTrials(t *testing.T) {
 			if err != nil || !remaining.Valid || remaining.Float64 != 0 {
 				t.Fatalf("terminal trial remaining = %+v, err = %v, want zero", remaining, err)
 			}
-			if tc.usage {
+			if tc.state == "expired" {
+				consumed, err := balance.ConsumedUsd.Float64Value()
+				if err != nil || !consumed.Valid || consumed.Float64 != 0 {
+					t.Fatalf("expired trial consumption = %+v, err = %v, want zero", consumed, err)
+				}
+			} else if tc.usage {
 				consumed, err := balance.ConsumedUsd.Float64Value()
 				if err != nil || !consumed.Valid || consumed.Float64 < 0.000001 {
 					t.Fatalf("trial consumption = %+v, err = %v, want at least the grant amount", consumed, err)

@@ -242,7 +242,7 @@ func (f warningSenderFunc) SendTrialCreditWarning(ctx context.Context, team uuid
 }
 
 // Interpose only after the real atomic claim, so the next balance query must
-// observe a lifecycle change that happened after forecasting.
+// observe a balance or lifecycle change that happened after forecasting.
 type warningClaimHook struct {
 	*pgxpool.Pool
 	afterClaim func()
@@ -275,6 +275,7 @@ func TestTrialWarningWorkerRechecksLifecycleAfterClaim(t *testing.T) {
 		{"expired", `UPDATE team_credit_grant SET expires_at=now()-interval '1 second' WHERE team_id=$1`},
 		{"exhausted", `UPDATE team_credit_grant SET amount_usd=0.000001, remaining_usd=0 WHERE team_id=$1`},
 		{"stripe", `INSERT INTO team_billing_account(team_id, trial_ended_at) VALUES($1,now()) ON CONFLICT(team_id) DO UPDATE SET trial_ended_at=now()`},
+		{"topped_up", `UPDATE team_credit_grant SET amount_usd=100, remaining_usd=100 WHERE team_id=$1`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			team := seedWarningWorkerTeam(t)
@@ -292,10 +293,20 @@ func TestTrialWarningWorkerRechecksLifecycleAfterClaim(t *testing.T) {
 				t.Fatal("fixture did not reach the claim")
 			}
 			if calls != 0 {
-				t.Fatalf("sent %d warnings after lifecycle ended", calls)
+				t.Fatalf("sent %d warnings after eligibility changed", calls)
 			}
 			if got := warningStatus(t, team); got != "pending" {
 				t.Fatalf("suppressed claim status = %s", got)
+			}
+			if tc.name == "topped_up" {
+				if _, err := testPool.Exec(context.Background(), `UPDATE team_credit_grant SET amount_usd=1, remaining_usd=1 WHERE team_id=$1`, team); err != nil {
+					t.Fatal(err)
+				}
+				h.DB = testQueries
+				api.ProcessTrialCreditWarningForTest(h, context.Background(), team)
+				if got := warningStatus(t, team); calls != 1 || got != "sent" {
+					t.Fatalf("later eligible pass: calls=%d status=%s, want 1/sent", calls, got)
+				}
 			}
 		})
 	}

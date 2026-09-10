@@ -312,7 +312,8 @@ func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UU
 	if elapsedErr != nil || elapsedSeconds <= 0 {
 		return
 	}
-	if err != nil || !trialCreditWarningEligible(remaining, time.Now(), trialBurnSample{SpentUSD: spent, Started: started, Ended: ended, ElapsedSeconds: elapsedSeconds}) {
+	sample := trialBurnSample{SpentUSD: spent, Started: started, Ended: ended, ElapsedSeconds: elapsedSeconds}
+	if err != nil || !trialCreditWarningEligible(remaining, time.Now(), sample) {
 		return
 	}
 	claimToken, err := h.DB.ClaimTrialCreditWarning(ctx, teamID)
@@ -329,7 +330,7 @@ func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UU
 		return
 	}
 	latestRemaining, err := numericFloat(latest.RemainingUsd)
-	if err != nil || latestRemaining <= 0 {
+	if err != nil || !trialCreditWarningEligible(latestRemaining, time.Now(), sample) {
 		h.releaseTrialCreditWarning(teamID, claimToken)
 		return
 	}

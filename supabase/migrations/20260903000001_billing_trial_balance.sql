@@ -10,9 +10,9 @@ WITH account AS (
   FROM team_credit_grant
   WHERE team_id = p_team_id AND reason = 'signup trial credit'
 ), grants AS (
-  SELECT COALESCE(SUM(amount_usd), 0)::numeric AS amount, COUNT(*)::int AS count,
+  SELECT COALESCE(SUM(amount_usd) FILTER (WHERE expires_at IS NULL OR expires_at > now()), 0)::numeric AS amount, COUNT(*)::int AS count,
          COUNT(*) FILTER (WHERE expires_at IS NULL OR expires_at > now())::int AS active_count,
-         COALESCE(MIN(created_at), now()) AS started,
+         COALESCE(MIN(created_at) FILTER (WHERE expires_at IS NULL OR expires_at > now()), now()) AS started,
          MAX(expires_at) FILTER (WHERE expires_at IS NOT NULL) AS expires_end
   FROM team_credit_grant WHERE team_id = p_team_id AND reason = 'signup trial credit'
 ), bounds AS (
