@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -162,9 +163,12 @@ func TestRoutingHandlerPinsFailedStreamAndLooksUpNextRequest(t *testing.T) {
 		if selected != wantOwner {
 			t.Fatalf("request %d: selected %+v, want %+v", i, selected, wantOwner)
 		}
-		// Skip serialized HTTP headers and compare the application bytes exactly.
-		_, gotUpload, ok := bytes.Cut(stream.upload.Bytes(), []byte("\r\n\r\n"))
-		if !ok || !bytes.Equal(gotUpload, upload) {
+		forwarded, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(stream.upload.Bytes())))
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotUpload, err := io.ReadAll(forwarded.Body)
+		if err != nil || !bytes.Equal(gotUpload, upload) {
 			t.Fatalf("upload bytes=%x, want %x", gotUpload, upload)
 		}
 		if n, err := client.Read(make([]byte, 1)); n != 0 || err != io.EOF {
@@ -304,4 +308,43 @@ type routingOutcomeRecorderFunc func(context.Context, telemetry.RoutingOutcome)
 
 func (f routingOutcomeRecorderFunc) RecordRoutingOutcome(ctx context.Context, outcome telemetry.RoutingOutcome) {
 	f(ctx, outcome)
+}
+
+func (routePeerFunc) Close() error      { return nil }
+func (routePeerStub) Close() error      { return nil }
+func (*routePeerArgsStub) Close() error { return nil }
+func (*trackingPeerStub) Close() error  { return nil }
+
+type lookupRecorder struct {
+	lookup telemetry.OwnershipLookup
+	count  int
+}
+
+func (*lookupRecorder) RecordRoutingOutcome(context.Context, telemetry.RoutingOutcome) {}
+func (r *lookupRecorder) RecordOwnershipLookup(_ context.Context, lookup telemetry.OwnershipLookup) {
+	r.lookup = lookup
+	r.count++
+}
+
+func TestRoutingHandlerRecordsLookupTiming(t *testing.T) {
+	for _, tc := range []struct {
+		result string
+		err    error
+	}{
+		{"success", nil}, {"error", errors.New("database unavailable")},
+		{"timeout", fmt.Errorf("query: %w", context.DeadlineExceeded)}, {"canceled", context.Canceled},
+	} {
+		t.Run(tc.result, func(t *testing.T) {
+			recorder := &lookupRecorder{}
+			router := NewRoutingHandler([]string{"sandbox.test"}, "host-a", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+				return SandboxRoute{HostID: "host-a", ProxyAddr: "127.0.0.1:5009"}, tc.err
+			}), nil, http.NotFoundHandler(), zerolog.Nop(), recorder)
+			req := httptest.NewRequest("GET", "http://sandbox.test/", nil)
+			req.Header.Set(headerSandboxID, "sandbox-1")
+			router.ServeHTTP(httptest.NewRecorder(), req)
+			if recorder.count != 1 || recorder.lookup.Duration <= 0 || recorder.lookup.Result != tc.result {
+				t.Fatalf("lookup=%+v count=%d", recorder.lookup, recorder.count)
+			}
+		})
+	}
 }

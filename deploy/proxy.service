@@ -9,8 +9,15 @@ ExecStart=/usr/local/bin/proxy
 Restart=always
 RestartSec=2
 
+# Expose root-owned peer credentials to the dynamic service user.
+LoadCredential=peer-cert:/etc/superserve/peer/tls.crt
+LoadCredential=peer-key:/etc/superserve/peer/tls.key
+LoadCredential=peer-ca:/etc/superserve/peer/ca.crt
+Environment=PEER_PROXY_CERT_FILE=%d/peer-cert
+Environment=PEER_PROXY_KEY_FILE=%d/peer-key
+Environment=PEER_PROXY_CA_FILE=%d/peer-ca
 Environment=PROXY_ADDR=:5007
-# SS-470 connects to this loopback-only listener so peer traffic bypasses the
+# Peer ingress connects to this loopback-only listener so peer traffic bypasses the
 # public ownership router and terminates in the host-local Handler.
 Environment=PEER_PROXY_TARGET_ADDR=127.0.0.1:5010
 Environment=PROXY_REDIRECT_ADDR=:5008

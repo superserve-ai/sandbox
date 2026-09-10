@@ -862,3 +862,41 @@ func TestCapacityShadowSkipsCompositionOnError(t *testing.T) {
 		t.Error("a failed ranking must not publish composition; its zeros would erase readiness")
 	}
 }
+
+func TestOwnershipLookupHistogram(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer provider.Shutdown(ctx)
+	histogram, err := provider.Meter(instrumentationName).Float64Histogram("proxy_ownership_lookup_duration_seconds", metric.WithExplicitBucketBoundaries(latencyBuckets...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &OTelRecorder{ownershipLookupDuration: histogram, hostID: "host-a"}
+	for _, result := range []string{"success", "timeout", "canceled", "raw-error"} {
+		recorder.RecordOwnershipLookup(ctx, OwnershipLookup{Result: result, Duration: 100 * time.Millisecond})
+	}
+	var collected metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &collected); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"success": true, "timeout": true, "canceled": true, "error": true}
+	for _, scope := range collected.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			data, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("metric type=%T", m.Data)
+			}
+			for _, point := range data.DataPoints {
+				result, _ := point.Attributes.Value("result")
+				if !want[result.AsString()] || point.Count != 1 || point.Sum != 0.1 {
+					t.Fatalf("unexpected point: %+v", point)
+				}
+				delete(want, result.AsString())
+			}
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing results: %v", want)
+	}
+}

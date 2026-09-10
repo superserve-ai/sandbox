@@ -262,4 +262,14 @@ func (noopRecorder) RecordLatencyPhase(context.Context, LatencyPhase)           
 func (noopRecorder) RecordPeerIngress(context.Context, PeerIngress)                         {}
 func (noopRecorder) RecordPeerEvent(context.Context, PeerEvent)                             {}
 
-func (noopRecorder) RecordRoutingOutcome(context.Context, RoutingOutcome)                   {}
+func (noopRecorder) RecordRoutingOutcome(context.Context, RoutingOutcome) {}
+
+// OwnershipLookup measures the synchronous routing lookup without per-sandbox labels.
+type OwnershipLookup struct {
+	Duration time.Duration
+	Result   string
+}
+
+type OwnershipLookupRecorder interface {
+	RecordOwnershipLookup(context.Context, OwnershipLookup)
+}

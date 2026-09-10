@@ -93,6 +93,7 @@ func main() {
 	}
 	ownership := proxy.NewDBOwnershipResolver(dbPool)
 	var routingRecorder telemetry.RoutingOutcomeRecorder
+	var peerTelemetry proxy.RecorderPeerTelemetry
 	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
 		interval, ierr := time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
 		if ierr != nil {
@@ -113,6 +114,7 @@ func main() {
 			peerRecorder = rec
 			proxyHandler.WithTelemetry(rec)
 			routingRecorder = rec
+			peerTelemetry = proxy.RecorderPeerTelemetry{Recorder: rec, HostID: os.Getenv("HOST_ID"), Region: os.Getenv("HOST_REGION")}
 			defer func() {
 				// Bounded: a stalled collector must not hang proxy restarts
 				// on the final flush.
