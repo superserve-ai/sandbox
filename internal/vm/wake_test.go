@@ -2374,6 +2374,39 @@ func TestPauseFailingAfterItsSnapshotResumesTheVCPUs(t *testing.T) {
 		}
 	})
 
+	// An unpause that does not confirm leaves the guest's state unknown: a
+	// guest that answers stays Running; one that does not is parked.
+	t.Run("an_unconfirmed_unpause_parks_a_guest_that_does_not_answer", func(t *testing.T) {
+		origProbe := boxdHealthProbe
+		t.Cleanup(func() { boxdHealthProbe = origProbe })
+		for _, tc := range []struct {
+			name   string
+			answer error
+			want   VMStatus
+		}{
+			{"answers", nil, StatusRunning},
+			{"silent", errors.New("no answer"), StatusError},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				m, inst, vmDir, memSnap := newVM(t, false, false)
+				stuckMarker(t, memSnap)
+				fcUnpauseVM = func(context.Context, string) error { return errors.New("firecracker api timeout") }
+				t.Cleanup(func() {
+					fcUnpauseVM = func(_ context.Context, socket string) error { unpaused = append(unpaused, socket); return nil }
+				})
+				boxdHealthProbe = func(context.Context, string, time.Duration) error { return tc.answer }
+				if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+					t.Fatal("want the pause refused")
+				}
+				inst.mu.RLock()
+				defer inst.mu.RUnlock()
+				if inst.Status != tc.want {
+					t.Fatalf("status %v, want %v", inst.Status, tc.want)
+				}
+			})
+		}
+	})
+
 	// An empty marker that will not go is harmless: a restore reads it as
 	// legacy. The pause completes.
 	t.Run("legacy_pause_survives_an_empty_marker_that_will_not_go", func(t *testing.T) {

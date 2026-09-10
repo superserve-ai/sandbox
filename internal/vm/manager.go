@@ -8419,17 +8419,29 @@ func (m *Manager) ensureWakeFloorTimed(op string) error {
 
 // failAfterSnapshot is the error return for a pause that fails after its
 // snapshot: Firecracker left the vCPUs paused and the record says Running,
-// so the guest is resumed first, best-effort, before the error. The snapshot
-// consumed the dirty bitmap, so the retry must be Full: a Diff would hold
-// only the pages dirtied since, and the abandoned overlay's would be lost.
+// so the guest is resumed first. An unpause that did not confirm leaves the
+// guest's state unknown, so only a guest that answers stays recorded
+// Running; otherwise it is parked as Error, its artifacts kept. The snapshot
+// consumed the dirty bitmap, so the retry must be Full.
 func (m *Manager) failAfterSnapshot(inst *VMInstance, socketPath string, err error) error {
 	m.abandonDirtyBaseline(inst)
 	uctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if uerr := fcUnpauseVM(uctx, socketPath); uerr != nil {
-		m.log.Error().Err(uerr).Str("vm_id", inst.ID).Msg("pause failed after its snapshot and the guest could not be resumed")
+	uerr := fcUnpauseVM(uctx, socketPath)
+	cancel()
+	if uerr == nil {
+		return m.handleVMError(inst.ID, err)
 	}
-	return m.handleVMError(inst.ID, err)
+	inst.mu.RLock()
+	ip := inst.IP
+	inst.mu.RUnlock()
+	if perr := boxdHealthProbe(context.Background(), ip, 5*time.Second); perr == nil {
+		m.log.Warn().Err(uerr).Str("vm_id", inst.ID).Msg("pause failed after its snapshot; the unpause did not confirm but the guest answers")
+		return m.handleVMError(inst.ID, err)
+	}
+	m.log.Error().Err(uerr).Str("vm_id", inst.ID).Msg("pause failed after its snapshot and the guest neither resumed nor answers; parking as error")
+	m.parkUnservable(inst, true)
+	_, _ = m.persistStateIfPresent(inst)
+	return fmt.Errorf("%w; the guest could not be resumed and was parked as error", err)
 }
 
 // abandonDirtyBaseline forgets a dirty-tracking baseline a snapshot consumed
