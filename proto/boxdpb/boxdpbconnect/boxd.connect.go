@@ -25,6 +25,8 @@ const (
 	ProcessServiceName = "superserve.boxd.v1.ProcessService"
 	// FilesystemServiceName is the fully-qualified name of the FilesystemService service.
 	FilesystemServiceName = "superserve.boxd.v1.FilesystemService"
+	// DesktopServiceName is the fully-qualified name of the DesktopService service.
+	DesktopServiceName = "superserve.boxd.v1.DesktopService"
 )
 
 // These constants are the fully-qualified names of the RPCs defined in this package. They're
@@ -57,6 +59,17 @@ const (
 	FilesystemServiceRemoveProcedure = "/superserve.boxd.v1.FilesystemService/Remove"
 	// FilesystemServiceMoveProcedure is the fully-qualified name of the FilesystemService's Move RPC.
 	FilesystemServiceMoveProcedure = "/superserve.boxd.v1.FilesystemService/Move"
+	// DesktopServiceStreamProcedure is the fully-qualified name of the DesktopService's Stream RPC.
+	DesktopServiceStreamProcedure = "/superserve.boxd.v1.DesktopService/Stream"
+	// DesktopServiceSendPointerProcedure is the fully-qualified name of the DesktopService's
+	// SendPointer RPC.
+	DesktopServiceSendPointerProcedure = "/superserve.boxd.v1.DesktopService/SendPointer"
+	// DesktopServiceSendKeyProcedure is the fully-qualified name of the DesktopService's SendKey RPC.
+	DesktopServiceSendKeyProcedure = "/superserve.boxd.v1.DesktopService/SendKey"
+	// DesktopServiceScrollProcedure is the fully-qualified name of the DesktopService's Scroll RPC.
+	DesktopServiceScrollProcedure = "/superserve.boxd.v1.DesktopService/Scroll"
+	// DesktopServiceResizeProcedure is the fully-qualified name of the DesktopService's Resize RPC.
+	DesktopServiceResizeProcedure = "/superserve.boxd.v1.DesktopService/Resize"
 )
 
 // ProcessServiceClient is a client for the superserve.boxd.v1.ProcessService service.
@@ -309,7 +322,8 @@ func (c *filesystemServiceClient) Move(ctx context.Context, req *connect.Request
 	return c.move.CallUnary(ctx, req)
 }
 
-// FilesystemServiceHandler is an implementation of the superserve.boxd.v1.FilesystemService service.
+// FilesystemServiceHandler is an implementation of the superserve.boxd.v1.FilesystemService
+// service.
 type FilesystemServiceHandler interface {
 	// Stat returns file info.
 	Stat(context.Context, *connect.Request[boxdpb.StatRequest]) (*connect.Response[boxdpb.StatResponse], error)
@@ -399,4 +413,196 @@ func (UnimplementedFilesystemServiceHandler) Remove(context.Context, *connect.Re
 
 func (UnimplementedFilesystemServiceHandler) Move(context.Context, *connect.Request[boxdpb.MoveRequest]) (*connect.Response[boxdpb.MoveResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("superserve.boxd.v1.FilesystemService.Move is not implemented"))
+}
+
+// DesktopServiceClient is a client for the superserve.boxd.v1.DesktopService service.
+type DesktopServiceClient interface {
+	// Stream captures the desktop as a sequence of frame events at the
+	// requested cadence. Lifecycle mirrors ProcessService.Start: a Start event
+	// reports the display size, Data events carry frames, and an End event
+	// closes the stream (client cancellation or an unrecoverable capture
+	// failure).
+	Stream(context.Context, *connect.Request[boxdpb.FrameConfig]) (*connect.ServerStreamForClient[boxdpb.Frame], error)
+	// SendPointer moves the pointer and/or presses/releases/clicks a button.
+	SendPointer(context.Context, *connect.Request[boxdpb.PointerEvent]) (*connect.Response[boxdpb.PointerResponse], error)
+	// SendKey presses a key (optionally with modifiers) or types literal text.
+	SendKey(context.Context, *connect.Request[boxdpb.KeyEvent]) (*connect.Response[boxdpb.KeyResponse], error)
+	// Scroll scrolls the viewport under the pointer.
+	Scroll(context.Context, *connect.Request[boxdpb.ScrollEvent]) (*connect.Response[boxdpb.ScrollResponse], error)
+	// Resize changes the virtual display resolution.
+	Resize(context.Context, *connect.Request[boxdpb.DesktopResizeRequest]) (*connect.Response[boxdpb.DesktopResizeResponse], error)
+}
+
+// NewDesktopServiceClient constructs a client for the superserve.boxd.v1.DesktopService service. By
+// default, it uses the Connect protocol with the binary Protobuf Codec, asks for gzipped responses,
+// and sends uncompressed requests. To use the gRPC or gRPC-Web protocols, supply the
+// connect.WithGRPC() or connect.WithGRPCWeb() options.
+//
+// The URL supplied here should be the base URL for the Connect or gRPC server (for example,
+// http://api.acme.com or https://acme.com/grpc).
+func NewDesktopServiceClient(httpClient connect.HTTPClient, baseURL string, opts ...connect.ClientOption) DesktopServiceClient {
+	baseURL = strings.TrimRight(baseURL, "/")
+	desktopServiceMethods := boxdpb.File_proto_boxd_proto.Services().ByName("DesktopService").Methods()
+	return &desktopServiceClient{
+		stream: connect.NewClient[boxdpb.FrameConfig, boxdpb.Frame](
+			httpClient,
+			baseURL+DesktopServiceStreamProcedure,
+			connect.WithSchema(desktopServiceMethods.ByName("Stream")),
+			connect.WithClientOptions(opts...),
+		),
+		sendPointer: connect.NewClient[boxdpb.PointerEvent, boxdpb.PointerResponse](
+			httpClient,
+			baseURL+DesktopServiceSendPointerProcedure,
+			connect.WithSchema(desktopServiceMethods.ByName("SendPointer")),
+			connect.WithClientOptions(opts...),
+		),
+		sendKey: connect.NewClient[boxdpb.KeyEvent, boxdpb.KeyResponse](
+			httpClient,
+			baseURL+DesktopServiceSendKeyProcedure,
+			connect.WithSchema(desktopServiceMethods.ByName("SendKey")),
+			connect.WithClientOptions(opts...),
+		),
+		scroll: connect.NewClient[boxdpb.ScrollEvent, boxdpb.ScrollResponse](
+			httpClient,
+			baseURL+DesktopServiceScrollProcedure,
+			connect.WithSchema(desktopServiceMethods.ByName("Scroll")),
+			connect.WithClientOptions(opts...),
+		),
+		resize: connect.NewClient[boxdpb.DesktopResizeRequest, boxdpb.DesktopResizeResponse](
+			httpClient,
+			baseURL+DesktopServiceResizeProcedure,
+			connect.WithSchema(desktopServiceMethods.ByName("Resize")),
+			connect.WithClientOptions(opts...),
+		),
+	}
+}
+
+// desktopServiceClient implements DesktopServiceClient.
+type desktopServiceClient struct {
+	stream      *connect.Client[boxdpb.FrameConfig, boxdpb.Frame]
+	sendPointer *connect.Client[boxdpb.PointerEvent, boxdpb.PointerResponse]
+	sendKey     *connect.Client[boxdpb.KeyEvent, boxdpb.KeyResponse]
+	scroll      *connect.Client[boxdpb.ScrollEvent, boxdpb.ScrollResponse]
+	resize      *connect.Client[boxdpb.DesktopResizeRequest, boxdpb.DesktopResizeResponse]
+}
+
+// Stream calls superserve.boxd.v1.DesktopService.Stream.
+func (c *desktopServiceClient) Stream(ctx context.Context, req *connect.Request[boxdpb.FrameConfig]) (*connect.ServerStreamForClient[boxdpb.Frame], error) {
+	return c.stream.CallServerStream(ctx, req)
+}
+
+// SendPointer calls superserve.boxd.v1.DesktopService.SendPointer.
+func (c *desktopServiceClient) SendPointer(ctx context.Context, req *connect.Request[boxdpb.PointerEvent]) (*connect.Response[boxdpb.PointerResponse], error) {
+	return c.sendPointer.CallUnary(ctx, req)
+}
+
+// SendKey calls superserve.boxd.v1.DesktopService.SendKey.
+func (c *desktopServiceClient) SendKey(ctx context.Context, req *connect.Request[boxdpb.KeyEvent]) (*connect.Response[boxdpb.KeyResponse], error) {
+	return c.sendKey.CallUnary(ctx, req)
+}
+
+// Scroll calls superserve.boxd.v1.DesktopService.Scroll.
+func (c *desktopServiceClient) Scroll(ctx context.Context, req *connect.Request[boxdpb.ScrollEvent]) (*connect.Response[boxdpb.ScrollResponse], error) {
+	return c.scroll.CallUnary(ctx, req)
+}
+
+// Resize calls superserve.boxd.v1.DesktopService.Resize.
+func (c *desktopServiceClient) Resize(ctx context.Context, req *connect.Request[boxdpb.DesktopResizeRequest]) (*connect.Response[boxdpb.DesktopResizeResponse], error) {
+	return c.resize.CallUnary(ctx, req)
+}
+
+// DesktopServiceHandler is an implementation of the superserve.boxd.v1.DesktopService service.
+type DesktopServiceHandler interface {
+	// Stream captures the desktop as a sequence of frame events at the
+	// requested cadence. Lifecycle mirrors ProcessService.Start: a Start event
+	// reports the display size, Data events carry frames, and an End event
+	// closes the stream (client cancellation or an unrecoverable capture
+	// failure).
+	Stream(context.Context, *connect.Request[boxdpb.FrameConfig], *connect.ServerStream[boxdpb.Frame]) error
+	// SendPointer moves the pointer and/or presses/releases/clicks a button.
+	SendPointer(context.Context, *connect.Request[boxdpb.PointerEvent]) (*connect.Response[boxdpb.PointerResponse], error)
+	// SendKey presses a key (optionally with modifiers) or types literal text.
+	SendKey(context.Context, *connect.Request[boxdpb.KeyEvent]) (*connect.Response[boxdpb.KeyResponse], error)
+	// Scroll scrolls the viewport under the pointer.
+	Scroll(context.Context, *connect.Request[boxdpb.ScrollEvent]) (*connect.Response[boxdpb.ScrollResponse], error)
+	// Resize changes the virtual display resolution.
+	Resize(context.Context, *connect.Request[boxdpb.DesktopResizeRequest]) (*connect.Response[boxdpb.DesktopResizeResponse], error)
+}
+
+// NewDesktopServiceHandler builds an HTTP handler from the service implementation. It returns the
+// path on which to mount the handler and the handler itself.
+//
+// By default, handlers support the Connect, gRPC, and gRPC-Web protocols with the binary Protobuf
+// and JSON codecs. They also support gzip compression.
+func NewDesktopServiceHandler(svc DesktopServiceHandler, opts ...connect.HandlerOption) (string, http.Handler) {
+	desktopServiceMethods := boxdpb.File_proto_boxd_proto.Services().ByName("DesktopService").Methods()
+	desktopServiceStreamHandler := connect.NewServerStreamHandler(
+		DesktopServiceStreamProcedure,
+		svc.Stream,
+		connect.WithSchema(desktopServiceMethods.ByName("Stream")),
+		connect.WithHandlerOptions(opts...),
+	)
+	desktopServiceSendPointerHandler := connect.NewUnaryHandler(
+		DesktopServiceSendPointerProcedure,
+		svc.SendPointer,
+		connect.WithSchema(desktopServiceMethods.ByName("SendPointer")),
+		connect.WithHandlerOptions(opts...),
+	)
+	desktopServiceSendKeyHandler := connect.NewUnaryHandler(
+		DesktopServiceSendKeyProcedure,
+		svc.SendKey,
+		connect.WithSchema(desktopServiceMethods.ByName("SendKey")),
+		connect.WithHandlerOptions(opts...),
+	)
+	desktopServiceScrollHandler := connect.NewUnaryHandler(
+		DesktopServiceScrollProcedure,
+		svc.Scroll,
+		connect.WithSchema(desktopServiceMethods.ByName("Scroll")),
+		connect.WithHandlerOptions(opts...),
+	)
+	desktopServiceResizeHandler := connect.NewUnaryHandler(
+		DesktopServiceResizeProcedure,
+		svc.Resize,
+		connect.WithSchema(desktopServiceMethods.ByName("Resize")),
+		connect.WithHandlerOptions(opts...),
+	)
+	return "/superserve.boxd.v1.DesktopService/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case DesktopServiceStreamProcedure:
+			desktopServiceStreamHandler.ServeHTTP(w, r)
+		case DesktopServiceSendPointerProcedure:
+			desktopServiceSendPointerHandler.ServeHTTP(w, r)
+		case DesktopServiceSendKeyProcedure:
+			desktopServiceSendKeyHandler.ServeHTTP(w, r)
+		case DesktopServiceScrollProcedure:
+			desktopServiceScrollHandler.ServeHTTP(w, r)
+		case DesktopServiceResizeProcedure:
+			desktopServiceResizeHandler.ServeHTTP(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+}
+
+// UnimplementedDesktopServiceHandler returns CodeUnimplemented from all methods.
+type UnimplementedDesktopServiceHandler struct{}
+
+func (UnimplementedDesktopServiceHandler) Stream(context.Context, *connect.Request[boxdpb.FrameConfig], *connect.ServerStream[boxdpb.Frame]) error {
+	return connect.NewError(connect.CodeUnimplemented, errors.New("superserve.boxd.v1.DesktopService.Stream is not implemented"))
+}
+
+func (UnimplementedDesktopServiceHandler) SendPointer(context.Context, *connect.Request[boxdpb.PointerEvent]) (*connect.Response[boxdpb.PointerResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("superserve.boxd.v1.DesktopService.SendPointer is not implemented"))
+}
+
+func (UnimplementedDesktopServiceHandler) SendKey(context.Context, *connect.Request[boxdpb.KeyEvent]) (*connect.Response[boxdpb.KeyResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("superserve.boxd.v1.DesktopService.SendKey is not implemented"))
+}
+
+func (UnimplementedDesktopServiceHandler) Scroll(context.Context, *connect.Request[boxdpb.ScrollEvent]) (*connect.Response[boxdpb.ScrollResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("superserve.boxd.v1.DesktopService.Scroll is not implemented"))
+}
+
+func (UnimplementedDesktopServiceHandler) Resize(context.Context, *connect.Request[boxdpb.DesktopResizeRequest]) (*connect.Response[boxdpb.DesktopResizeResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("superserve.boxd.v1.DesktopService.Resize is not implemented"))
 }
