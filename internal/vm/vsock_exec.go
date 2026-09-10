@@ -267,10 +267,8 @@ func postBoxd(ctx context.Context, vmIP, path string, body []byte) ([]byte, erro
 }
 
 // waitForGuestWake tells a restored guest to correct its clock and release its
-// workload, and waits for it to confirm. clockFrozen is the policy the restore
-// used, so the guest knows whether correction is required. Returns
-// ErrGuestClockUnready as soon as the guest reports it cannot, so the caller
-// can retry the restore the unfrozen way instead of waiting out the budget.
+// workload, and waits for it to confirm. Returns ErrGuestClockUnready as soon
+// as the guest reports it cannot, so the caller retries the unfrozen way.
 func waitForGuestWake(ctx context.Context, vmIP string, timeout time.Duration, clockFrozen bool, token string) error {
 	url := fmt.Sprintf("http://%s:%d/wake", vmIP, boxdPort)
 	body, _ := json.Marshal(struct {
@@ -285,11 +283,9 @@ func waitForGuestWake(ctx context.Context, vmIP string, timeout time.Duration, c
 	const maxProbeInterval = 10 * time.Millisecond
 	interval := time.Millisecond
 	var lastErr error
-	// Consecutive answers of one kind make the verdict; anything in between —
-	// a transport error, another status, a body that does not parse, or the
-	// other kind — starts the count over. The first may be mid-correction,
-	// and a verdict assembled from answers that were not consecutive would
-	// park a guest that was recovering.
+	// Consecutive answers of one kind make the verdict; anything else in
+	// between starts the count over. The first may be mid-correction, and
+	// non-consecutive failures would park a guest that was recovering.
 	streakKind, streak := "", 0
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {

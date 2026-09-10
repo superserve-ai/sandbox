@@ -1503,11 +1503,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	var snapshotType string
 	var tSnapshot time.Time
 	var snapshotDur, stopDur time.Duration
-	// Deferred, gated on freeze or snapshot work having begun: a freeze that
-	// fails, or a CreateSnapshot that burns seconds and then fails, must land
-	// in the pause distributions — those are the pauses worth seeing. The
-	// already-paused retry guard (before either) still deliberately emits
-	// nothing.
+	// Deferred, gated on freeze or snapshot work having begun: a failed
+	// freeze or a slow failed snapshot must land in the pause distributions.
+	// The already-paused retry guard still emits nothing.
 	var freezeDur, manifestDur time.Duration
 	var tFreeze time.Time
 	defer func() {
@@ -1666,11 +1664,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	if correctsWallClock {
 		freezeToken, artifactID = NewFreezeToken(), NewArtifactID()
 	}
-	// Only a pause that will freeze the guest records its intent (see
-	// pause_intent.go), and only once this host's floor is up: recovery looks
-	// for intents on such hosts alone. Durable BEFORE the freeze: a crash
-	// after it must find the token, or the guest stays frozen with nobody
-	// able to release it.
+	// Only a pause that will freeze records its intent (see pause_intent.go),
+	// and only once the floor is up: recovery looks for intents there alone.
+	// Durable before the freeze, or a crash leaves a guest nobody can release.
 	willFreeze := correctsWallClock && m.cfg.GuestClockFreezeEnabled && m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load()
 	if willFreeze {
 		tFreeze = time.Now()
@@ -1678,11 +1674,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record the rollback floor before freezing: %w", err))
 		}
 	}
-	// Whatever this pause plans, an image of this guest is published only
-	// once a freeze an earlier pause may have left is resolved: a custom
-	// directory, or a host that cannot freeze today, does not turn a frozen
-	// workload into an unfrozen image. A pause refused here leaves that
-	// intent, and its token, for the next attempt.
+	// Whatever this pause plans, a freeze an earlier pause left is resolved
+	// first: a custom directory or a host that cannot freeze must not publish
+	// a frozen workload as unfrozen. A refusal keeps that intent for the retry.
 	if err := m.resolveOutstandingFreeze(ctx, vmID, socketPath, instIP, recordedArtifact, log); err != nil {
 		return "", "", nil, m.handleVMError(vmID, err)
 	}
@@ -1693,13 +1687,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record pause intent: %w", err))
 		}
 	} else if wakeProtocolFloorRaised() && snapshotDir == filepath.Join(m.cfg.SnapshotDir, vmID) && m.frozenManifestAt(overlayPath, fullPath) {
-		// An unfrozen pause about to overwrite an image whose manifest says
-		// frozen: the image is rewritten before that manifest is replaced,
-		// and a crash between the two would leave a frozen manifest beside
-		// an image that is not. The intent names the rewrite, so a restore
-		// refuses the image until recovery has removed the stale manifest.
-		// Only a host with frozen images can hold such a manifest, so only
-		// there is this looked for.
+		// An unfrozen pause overwriting an image whose manifest says frozen:
+		// the image is rewritten before the manifest is replaced, so the
+		// rewrite is recorded and a restore refuses the image until recovery
+		// removes the stale manifest. Only a host with frozen images holds one.
 		if artifactID == "" {
 			artifactID = NewArtifactID()
 		}
@@ -1871,18 +1862,11 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 	}
 
-	// The manifest lands only after the image exists, and only beside the
-	// image this pause wrote: the manifest of an image it did not touch keeps
-	// describing that image, which is still the last good one if this pause
-	// failed or died before here. A frozen image's manifest is mandatory and
-	// durable: an overlay that lost it would read as legacy on another host
-	// and its workload would never be woken, so the deferred thaw releases
-	// the guest on this failure. An unfrozen image's manifest only spares the
-	// next resume a slower path, so it is written without durability barriers
-	// and a failure is logged: nothing on the ordinary pause path waits on a
-	// sync for it. A guest that cannot correct its clock gets no manifest, so
-	// one an earlier image left at this path is removed: a stale frozen one
-	// beside this unfrozen image would send a wake nothing answers.
+	// The manifest lands after the image, beside the image this pause wrote
+	// only: an untouched image keeps its own, still the last good one if this
+	// pause dies here. Frozen: mandatory and durable, or an overlay would read
+	// as legacy elsewhere and never be woken; the deferred thaw releases the
+	// guest on failure.
 	if correctsWallClock {
 		man := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifactID, WorkloadFrozen: guestFrozen, GuestCorrectsClock: true}
 		if guestFrozen {
@@ -1896,12 +1880,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 				return "", "", nil, m.handleVMError(vmID, fmt.Errorf("write wall-clock manifest: %w", merr))
 			}
 		} else {
-			// Unfrozen. Where no manifest exists the write is lazy: lost to a
-			// crash, it costs the next resume a slower path, never a wrong
-			// clock. Where one exists it is REPLACED durably: the one there
-			// may say frozen under a token this guest already answered, and
-			// a crash that let it survive beside this image would have a
-			// restore present that token and run the clock uncorrected.
+			// Unfrozen: lazy where no manifest exists, since losing it costs
+			// only a slower resume; replaced durably where one exists, since
+			// it may say frozen under a token this guest already answered.
 			_, serr := os.Stat(clockFreezeMarkerPath(memPath))
 			replacing := serr == nil
 			var merr error
@@ -1927,11 +1908,10 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			}
 		}
 	} else {
-		// A guest that cannot correct its clock gets no manifest; one an
-		// earlier image left here goes, durably, for the reason above. A
-		// marker that was not a frozen manifest and will not go is harmless:
-		// the image reads as legacy either way. The vCPUs are paused from
-		// the snapshot on, so a failure here must not strand them.
+		// No manifest for a guest that cannot correct its clock; a stale one
+		// goes, durably. A marker that was never a frozen manifest and will
+		// not go is harmless. The vCPUs are paused from the snapshot on: a
+		// failure here must not strand them.
 		tManifest := time.Now()
 		frozen, merr := removeWallClockManifest(memPath)
 		if d := time.Since(tManifest); d > time.Millisecond {
@@ -2382,10 +2362,8 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	recordedCorrects, recordedFrozen, recordedToken := inst.CorrectsWallClock, inst.SnapshotWorkloadFrozen, inst.FreezeToken
 	pausedMemPath, recordedArtifact, entryUnverified := inst.MemFilePath, inst.ArtifactID, inst.Unverified
 	// The identity the record carried in: a frozen resume stamps this run's
-	// slot on it before the launch, and a resume that does not commit hands
-	// it back, since the slot is released. The token of the image being
-	// loaded rides WakeToken until the commit, so the record's own image and
-	// token stay paired whatever happens in between.
+	// slot before the launch and hands it back if it does not commit. The
+	// loaded image's token rides WakeToken until the commit.
 	entrySocket, entryIP, entryTAP, entryMAC, entryNS := inst.SocketPath, inst.IP, inst.TAPDevice, inst.MACAddress, inst.Namespace
 	inst.mu.RUnlock()
 	if wakeProtocolFloorRaised() {
@@ -2977,11 +2955,9 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	if snapshotDir == "" {
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID, fmt.Sprintf("snap-%d", time.Now().Unix()))
 	}
-	// An ad-hoc image is never marked, so it restores without a wake: it may
-	// only be taken of a running guest no earlier pause left frozen. A paused
-	// record's Firecracker may have outlived a failed stop, its workload
-	// frozen for the image that pause published; an image of it from here
-	// would never be woken.
+	// An ad-hoc image is never marked, so it restores without a wake: only a
+	// running guest no earlier pause left frozen may be captured. A paused
+	// record's Firecracker may have outlived a failed stop, workload frozen.
 	inst.mu.RLock()
 	adHocStatus := inst.Status
 	adHocSocket, adHocIP, adHocArtifact := inst.SocketPath, inst.IP, inst.ArtifactID
@@ -3465,13 +3441,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 	}
 	// What the image says about its guest, read once per restore: whether its
-	// workload is frozen (and so owes a wake with this token) and whether the
-	// guest corrects its clock. Read from the disk every time, never
-	// remembered by path: a template directory is meant to be immutable, but
-	// a cache here would turn any exception into a frozen image restored the
-	// old way, with its workload never released. One small open beside the
-	// sidecar read this path already does. A manifest this binary cannot
-	// trust refuses the restore here, before anything is launched.
+	// workload is frozen and whether the guest corrects its clock. Read from
+	// disk every time, never cached by path: a cache would turn any exception
+	// into a frozen image restored the old way. One small open beside the
+	// sidecar read here; an untrusted manifest refuses before any launch.
 	manifest, merr := imageManifest(memPath)
 	if merr != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
@@ -4069,12 +4042,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	if wakeErr != nil {
 		err := wakeErr
-		// The verdict this failure leaves behind. A wake the guest refused
-		// as another freeze's is terminal: Error, owing nothing, or recovery
-		// would read it as a resume to return to Paused. A wake that merely
-		// did not happen on an image the record was paused into leaves that
-		// image intact: the record returns to Paused, as a resume's failure
-		// does, rather than to an Error a restart would reap as stale.
+		// The verdict this failure leaves. A wake refused as another freeze's
+		// is terminal: Error, owing nothing. A wake that merely did not happen
+		// on the image the record was paused into returns it to Paused, as a
+		// resume's failure does, not to an Error a restart would reap.
 		verdict := StatusError
 		if errors.Is(err, ErrGuestTokenMismatch) {
 			inst.mu.Lock()
@@ -5053,11 +5024,10 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		return inst, true
 	}
 	m.mu.RUnlock()
-	// A request arriving while the startup pass still owes this VM its wake
-	// waits for that outcome rather than adopting a frozen guest — for as
-	// long as a wake can take behind everything queued ahead of it in the
-	// bounded pool, not the flight's own short budget: giving up early would
-	// report a live VM as missing and invite a replacement.
+	// A request meeting a wake the startup pass still owes waits for the
+	// outcome rather than adopting a frozen guest: as long as a wake can take
+	// behind everything queued ahead of it, since giving up early would
+	// report a live VM as missing.
 	if pw := m.pendingWake(rec.ID); pw != nil && !cleanupStale {
 		published := func() (*VMInstance, bool) {
 			m.mu.RLock()
@@ -5244,10 +5214,8 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		if fullyDown {
 			if rec.Status == StatusRunning && rec.Unverified && rec.WakePending && rec.WakeOwedFromPaused {
 				// A resume that published its wake-owed record and died before
-				// its Firecracker launched. The paused image is intact, so the
-				// sandbox returns to Paused rather than being reaped as a
-				// failed create; the record is rewritten before it is read as
-				// Paused, so a second restart sees the same thing.
+				// its launch: the paused image is intact, so the record returns
+				// to Paused instead of being reaped, rewritten before it is read.
 				log.Warn().Msg("resume interrupted before its launch — record returns to Paused")
 				rec.Status = StatusPaused
 				rec.WakePending, rec.ClockFrozen, rec.WakeOwedFromPaused, rec.Unverified = false, false, false, false
@@ -5394,11 +5362,10 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 	}
 	if rec.Status == StatusRunning && inst.WakePending {
 		if cleanupStale {
-			// The startup pass queues it for the pool after the pass, holding
-			// the VM's lifecycle lock from here until the pool publishes the
-			// outcome: a restore or resume for this id waits on that lock,
-			// never on the pool. If a request already holds the lock, its own
-			// lazy reattach completes the wake inline; nothing to queue.
+			// Queued for the pool after the pass, holding the lifecycle lock
+			// until the pool publishes the outcome, so a restore or resume for
+			// this id waits on the lock, never on the pool. A request already
+			// holding the lock completes the wake inline.
 			unlock, ok := m.tryLockVMOp(inst.ID)
 			if !ok {
 				log.Info().Msg("reattach: a request holds this VM's lock; leaving its owed wake to that request")
@@ -5538,12 +5505,10 @@ func (m *Manager) reattachByID(vmID string, cleanupStale bool) *VMInstance {
 		return got, nil
 	})
 	if errors.Is(err, errReattachDeferred) && !cleanupStale {
-		// The startup pass found this VM's lifecycle lock held and left its
-		// owed wake to whoever holds it — a caller that joined this very
-		// flight. That caller must not read the deferral as "no such VM": it
-		// reattaches itself, completing the wake inline. Through a flight of
-		// its own, so every joiner of the deferred one shares a single
-		// recovery instead of each running one against the same guest.
+		// The startup pass found this VM's lock held and left its owed wake to
+		// the holder, a caller that joined this flight: it reattaches itself,
+		// completing the wake inline through a flight of its own, so joiners
+		// share one recovery.
 		v2, _, _ := m.reattachSF.Do(vmID+"\x00retry", func() (any, error) {
 			rec, gerr := m.state.Get(vmID)
 			if gerr != nil || rec == nil {
@@ -8400,11 +8365,10 @@ func (m *Manager) verifyBoxdReady(callerCtx context.Context, ip string, inst *VM
 		}
 		return err
 	}
-	// The image this wake was owed for is the one running now. A resume
-	// from an override that died before its commit commits here, as its own
-	// commit would have: a retry of it then finds the sandbox up instead of
-	// relaunching over it. Its facts come from its manifest; one read, on
-	// the recovery path only.
+	// The image this wake was owed for is the one running now: a resume
+	// from an override that died before its commit commits here, so a retry
+	// finds the sandbox up instead of relaunching over it. One manifest
+	// read, on the recovery path only.
 	var image *WallClockManifest
 	if wakeMem != "" {
 		image, _ = imageManifest(wakeMem)
@@ -8451,11 +8415,8 @@ func (m *Manager) ensureWakeFloorTimed(op string) error {
 }
 
 // failAfterSnapshot is the error return for a pause that fails after its
-// snapshot landed: Firecracker left the vCPUs paused for the snapshot, and
-// a pause that returns an error keeps the VM recorded Running, so the guest
-// is resumed first — a stopped sandbox that reads as running is the one
-// outcome this must never leave. Best-effort: a guest that cannot be
-// resumed is reported as the error it already was.
+// snapshot: Firecracker left the vCPUs paused and the record says Running,
+// so the guest is resumed first, best-effort, before the error.
 func (m *Manager) failAfterSnapshot(vmID, socketPath string, err error) error {
 	uctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -8480,11 +8441,9 @@ func (m *Manager) frozenManifestAt(paths ...string) bool {
 	return false
 }
 
-// releaseFrozenGuest thaws a workload a pause froze, after making sure the
-// guest can answer: a snapshot pauses the vCPUs first, so a release after a
-// snapshot that then failed, or after a crash between the two, meets a guest
-// that cannot run boxd until Firecracker resumes it. The unpause is
-// best-effort — a guest never paused refuses it — and the thaw is the verdict.
+// releaseFrozenGuest thaws a workload a pause froze, after resuming the
+// vCPUs a snapshot may have paused so the guest can answer. The unpause is
+// best-effort; the thaw is the verdict.
 func (m *Manager) releaseFrozenGuest(ctx context.Context, socketPath, ip, token string) error {
 	// Each step bounded on its own: a stuck Firecracker API must neither hang
 	// this caller nor eat the thaw's budget.
@@ -8500,13 +8459,10 @@ func (m *Manager) releaseFrozenGuest(ctx context.Context, socketPath, ip, token 
 }
 
 // resolveOutstandingFreeze releases, or confirms released, a workload an
-// earlier pause of this VM may have left frozen (its reply lost, its thaw
-// unconfirmed), before any image of the guest can be published as unfrozen.
-// The intent that pause left is the only holder of its token; it is cleared
-// once nothing is frozen under it, and kept when that cannot be shown. The
-// leftover of a pause that completed names this record's artifact and is
-// nothing to resolve. Intents exist only on a host whose floor is up, so a
-// host with the floor down looks for nothing.
+// earlier pause may have left frozen, before any image of the guest is
+// published as unfrozen. Its intent is cleared once nothing is frozen under
+// it and kept otherwise; a completed pause's leftover names the record's
+// artifact and is nothing to resolve. Only a host whose floor is up holds intents.
 func (m *Manager) resolveOutstandingFreeze(ctx context.Context, vmID, socketPath, ip, recordedArtifact string, log zerolog.Logger) error {
 	if !wakeProtocolFloorRaised() {
 		return nil
@@ -8549,17 +8505,11 @@ func (m *Manager) releaseOrConfirmRunning(ctx context.Context, socketPath, ip, t
 var fcUnpauseVM = UnpauseVMContext
 
 // persistWakeOwed publishes Running with a wake owed and starts the durable
-// write so it overlaps the launch. A crash after the load must find a record
-// that owes a wake, or recovery could adopt an older verified record over a
-// guest whose workload is still frozen. The returned join waits for the
-// write, re-persists if the launch landed in another supervision mode, and
-// reports whether the record is durable; the caller must not load the
-// snapshot otherwise. The status is set directly: setStatus would persist
-// synchronously, on the launch path. PausedAt is kept: a failure returns a
-// resume to Paused in its place in the reclaim order, and the commit clears it.
-//
-// fromPaused says the record was Paused before this began, so recovery may
-// return it there; a create's record has nowhere to return to.
+// write under the launch: a crash after the load must find a record owing a
+// wake. The join waits for the write, re-persists if the launch landed in
+// another supervision mode, and reports durability; the caller must not load
+// otherwise. PausedAt is kept so a failure returns a resume to its place.
+// fromPaused says recovery may return the record to Paused.
 func (m *Manager) persistWakeOwed(inst *VMInstance, predicted Supervision, clockFrozen, fromPaused bool) (join func(actual Supervision) bool) {
 	inst.mu.Lock()
 	inst.Status = StatusRunning
@@ -8585,14 +8535,11 @@ func (m *Manager) persistWakeOwed(inst *VMInstance, predicted Supervision, clock
 	}
 }
 
-// persistWhileTracked writes the record and then checks the instance still
-// owns its id. DestroyVM takes no lifecycle lock, so its record delete can
-// land on either side of this write; a write that landed after it would
-// resurrect a VM the user destroyed, and the early failure paths of a launch
-// never write again to notice. Checking AFTER the write leaves no window: a
-// destroy either erased the record itself or is caught here, and the write
-// is erased in turn. Reports false when the VM is gone, so the caller
-// aborts a launch that has nothing to run for.
+// persistWhileTracked writes the record, then checks the instance still owns
+// its id: DestroyVM takes no lifecycle lock, so its delete can land either
+// side of this write, and a write landing after it would resurrect the VM.
+// Checked after the write there is no window; the write is erased and false
+// returned when the VM is gone.
 func (m *Manager) persistWhileTracked(inst *VMInstance) bool {
 	ok := m.persistState(inst)
 	m.mu.RLock()
@@ -8756,11 +8703,9 @@ func (m *Manager) completeOwedWake(ctx context.Context, inst *VMInstance, log ze
 	return nil
 }
 
-// recoverPauseIntent releases a guest that a pause froze and then died
-// before finishing. True when nothing is owed or the guest is released;
-// false when a frozen guest could not be released and must not be served.
-// Only a host whose floor is up ever holds an intent, so elsewhere nothing
-// is looked for.
+// recoverPauseIntent releases a guest a pause froze and then died before
+// finishing. True when nothing is owed or the guest is released; false when
+// a frozen guest could not be released and must not be served.
 func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log zerolog.Logger) bool {
 	if !wakeProtocolFloorRaised() {
 		return true
@@ -8816,13 +8761,10 @@ func (m *Manager) publishRecovered(inst *VMInstance) {
 	}
 }
 
-// parkUnservable stops a guest whose state recovery could not settle — a
-// freeze it could not release, a wake it did not answer. Stopped first, and
-// confirmed as far as the stop can confirm: a guest in an unknown state must
-// not keep running behind a record until a grace period reaps it. A resume
-// that never completed returns to Paused, as its own failure path would:
-// its image is intact and its workload never ran. A terminal verdict — a
-// wake the guest refused as another freeze's — and anything else is Error.
+// parkUnservable stops a guest whose recovery could not settle, confirmed as
+// far as the stop can, so an unknown guest never runs on behind a record. A
+// resume that never completed returns to Paused, its image intact; a refused
+// wake, or anything else, is Error.
 func (m *Manager) parkUnservable(inst *VMInstance, terminal bool) {
 	m.stopUnitDuringRestoreError(inst.ID)
 	inst.mu.Lock()

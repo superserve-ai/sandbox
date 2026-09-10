@@ -219,12 +219,10 @@ type VMRecord struct {
 	// cannot leave an older answer for the next resume to act on. Tri-state
 	// for the same reason as CorrectsWallClock; nil means "ask the disk".
 	SnapshotWorkloadFrozen *bool `json:"snapshot_workload_frozen,omitempty"`
-	// WakePending: restored but the guest has not yet been told to correct its
-	// clock and release its workload. Written with the Running record, so a
-	// daemon that crashes between the two completes the wake on recovery
-	// instead of verifying a stopped workload as ready. ClockFrozen is the
-	// policy that restore used, which the wake must carry. FreezeToken is the
-	// token the image's freeze carries; a wake or thaw must present it.
+	// WakePending: restored, the guest not yet told to correct its clock and
+	// release its workload; written with the Running record so a crash between
+	// the two completes the wake on recovery. ClockFrozen is the policy the
+	// restore used; FreezeToken the token the image's freeze carries.
 	WakePending bool   `json:"wake_pending,omitempty"`
 	ClockFrozen bool   `json:"clock_frozen,omitempty"`
 	FreezeToken string `json:"freeze_token,omitempty"`
@@ -233,11 +231,9 @@ type VMRecord struct {
 	// record names, until the commit. A resume from an override that dies
 	// between the two returns to Paused with its own image and token intact.
 	WakeToken string `json:"wake_token,omitempty"`
-	// WakeSnapshotPath / WakeMemPath name the image the owed wake is for when
-	// it is not the one the record names: a resume from an override. A wake
-	// completed by recovery commits them as the record's image, so a retry of
-	// that resume finds the sandbox up instead of relaunching it; a wake that
-	// fails drops them and the record keeps its own image.
+	// WakeSnapshotPath / WakeMemPath name the image an owed wake is for when
+	// it is not the record's own: a resume from an override. A wake completed
+	// by recovery commits them as the record's image; a failed one drops them.
 	WakeSnapshotPath string `json:"wake_snapshot_path,omitempty"`
 	WakeMemPath      string `json:"wake_mem_path,omitempty"`
 	// WakeOwedFromPaused: the record owing the wake was Paused before this

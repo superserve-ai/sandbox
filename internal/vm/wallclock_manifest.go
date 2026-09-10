@@ -90,10 +90,8 @@ func RecognizeWakeProtocolFloor() bool {
 }
 
 // PrimeWakeProtocolFloor proves recognised evidence durable in the
-// background, so the first request that acts on an image owing a wake after
-// a restart finds the floor already durable instead of paying the directory
-// sync itself. A host without evidence primes nothing: the floor is never
-// raised here, only proven.
+// background, so the first request needing the floor after a restart pays no
+// directory sync. Without evidence it primes nothing: proven here, never raised.
 func PrimeWakeProtocolFloor(log zerolog.Logger) {
 	if !wakeProtocolEvidenceSeen.Load() || wakeProtocolEvidenceDurable.Load() {
 		return
@@ -245,12 +243,10 @@ func WriteWallClockManifest(memPath string, m WallClockManifest) error {
 }
 
 // removeWallClockManifest removes the manifest beside an image, if any, and
-// reports whether it said frozen. One that did is removed with a directory
-// sync, so a crash cannot bring it back beside an image it does not
-// describe; any other marker is simply removed, since its return would cost
-// nothing but a slower resume. Only a host with frozen images can hold a
-// frozen manifest, so elsewhere nothing is read: the removal is the one
-// call it always was. Nothing to remove is not an error.
+// reports whether it said frozen: one that did is removed with a directory
+// sync so a crash cannot bring it back; any other marker is simply removed.
+// Only a host whose floor is up reads before removing. Nothing to remove is
+// not an error.
 func removeWallClockManifest(memPath string) (frozen bool, err error) {
 	path := WallClockMarkerPath(memPath)
 	if wakeProtocolFloorRaised() {
@@ -336,19 +332,15 @@ func imageManifest(memPath string) (*WallClockManifest, error) {
 	return ReadWallClockManifest(memPath)
 }
 
-// WatchTemplateManifests keeps the wake-protocol evidence in step with the
-// templates this host holds. Templates are seeded while the daemon runs, so
-// the first frozen one to land is what raises the rollback floor here — no
-// restore has to happen first. A directory listing at start and every few
-// minutes, off every request path.
-// The returned channel closes once the watcher has stopped, after ctx ends.
+// WatchTemplateManifests raises the rollback floor for frozen templates as
+// they land, so no restore has to happen first: a scan at start and every few
+// minutes plus a watch on the tree, off every request path. The returned
+// channel closes once the watcher has stopped.
 func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger) (stopped <-chan struct{}) {
 	done := make(chan struct{})
-	// Only a host that may act on frozen images watches for them: with the
-	// switch off this does no filesystem work at all. A frozen template must
-	// not reach such a host in the first place; that is enforced where
-	// templates are admitted, and the guard's floor rises at the first
-	// frozen image a host does restore.
+	// Only a host that may act on frozen images watches: with the switch off
+	// this does no filesystem work. A frozen template must not reach such a
+	// host, which is enforced where templates are admitted.
 	if m.cfg.SnapshotDir == "" || !m.cfg.GuestClockFreezeEnabled {
 		close(done)
 		return done
