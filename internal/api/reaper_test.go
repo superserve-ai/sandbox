@@ -50,6 +50,7 @@ func (r *stubRows) Scan(dest ...any) error {
 	*dest[4].(*string) = row.HostID
 	*dest[6].(*pgtype.UUID) = row.PauseOpID
 	*dest[7].(*int64) = row.PauseOpLeaseVersion
+	*dest[8].(*pgtype.Timestamptz) = row.PauseOpLeaseUntil
 	return nil
 }
 

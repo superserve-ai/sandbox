@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -17,6 +19,29 @@ import (
 // pauseAcceptBudget is how long a Prefer: respond-async request waits for the
 // host before it is told 'pausing'. A variable so tests can shorten it.
 var pauseAcceptBudget = 20 * time.Second
+
+var errPauseLeaseExpired = errors.New("pause lease expired before the host could be asked")
+
+// leaseDeadline is when a claim stops being its holder's: the expiry the claim
+// returned, or the nominal lease from when it was taken.
+func leaseDeadline(stored pgtype.Timestamptz, claimedAt time.Time, leaseSeconds int32) time.Time {
+	if stored.Valid {
+		return stored.Time
+	}
+	return claimedAt.Add(time.Duration(leaseSeconds) * time.Second)
+}
+
+// attemptDeadline bounds one host attempt: budget from now, or what is left of
+// the lease after room for the finalize write and clock skew, whichever comes
+// first. ok is false when nothing is left.
+func attemptDeadline(leaseUntil time.Time, budget time.Duration) (time.Time, bool) {
+	now := time.Now()
+	d := now.Add(budget)
+	if lease := leaseUntil.Add(-asyncTimeout - pauseLeaseSkew); lease.Before(d) {
+		d = lease
+	}
+	return d, d.After(now)
+}
 
 // prefersAsync reports whether the client asked for a 202 over a held
 // connection (RFC 7240 Prefer: respond-async).
@@ -62,13 +87,13 @@ func acceptPausing(c *gin.Context) {
 
 // dispatchPause runs the host RPC for a claimed pause and records its answer.
 // It knows nothing of the HTTP request; every write runs detached.
-func (h *Handlers) dispatchPause(ctx context.Context, vmd VMDClient, sandbox db.BeginPauseRow, actorID *uuid.UUID, l zerolog.Logger) pauseOutcome {
+func (h *Handlers) dispatchPause(ctx context.Context, vmd VMDClient, sandbox db.BeginPauseRow, leaseUntil time.Time, actorID *uuid.UUID, l zerolog.Logger) pauseOutcome {
 	sandboxID, teamID := sandbox.ID, sandbox.TeamID
 	// The pause's identity rides the RPC into the host's backup pipeline and
 	// returns in the upload report, naming this exact pause.
 	pauseToken := uuid.UUID(sandbox.PauseOpID.Bytes).String()
 	lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
-	snapshotPath, memPath, manifest, ackedPauseToken, err := h.pauseWithRetry(ctx, vmd, sandbox.HostID, sandboxID.String(), pauseToken)
+	snapshotPath, memPath, manifest, ackedPauseToken, err := h.pauseWithRetry(ctx, vmd, sandbox.HostID, sandboxID.String(), pauseToken, leaseUntil)
 	if err != nil {
 		bg := context.WithoutCancel(ctx)
 		// The resolved host has no such VM: it crashed or was removed

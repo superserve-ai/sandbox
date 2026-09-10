@@ -233,6 +233,7 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism in
 	// for a worker would burn its lease in the queue. batchSize caps a tick.
 	for claimed := int32(0); claimed < batchSize && ctx.Err() == nil; {
 		want := min(int32(parallelism), batchSize-claimed)
+		claimedAt := time.Now()
 		queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
 		expired, err := h.DB.ClaimExpiredSandboxes(queryCtx, db.ClaimExpiredSandboxesParams{
 			Limit:        want,
@@ -248,7 +249,7 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism in
 		}
 		logger.Info().Int("count", len(expired)).Msg("reaper: pausing expired sandboxes")
 		dispatchBounded(ctx, expired, parallelism, func(sbx db.ClaimExpiredSandboxesRow) {
-			h.pauseExpired(ctx, sbx, logger)
+			h.pauseExpired(ctx, sbx, claimedAt, logger)
 		})
 		claimed += int32(len(expired))
 		if int32(len(expired)) < want {
@@ -345,11 +346,13 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 //   - Step 1 NotFound → VM is gone → mark 'failed' under the lease.
 //   - Step 1 any other error, or step 2 fails → release the lease; the
 //     reconciler retries (a stopped VM answers from the already-paused guard).
-func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, logger zerolog.Logger) {
-	h.pauseClaimed(ctx, sbx, "timeout", "timeout_pause", "timeout_paused", "reaper: sandbox paused due to timeout", logger)
+func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, claimedAt time.Time, logger zerolog.Logger) {
+	leaseUntil := leaseDeadline(sbx.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
+	h.pauseClaimed(ctx, sbx, leaseUntil, "timeout", "timeout_pause", "timeout_paused", "reaper: sandbox paused due to timeout", logger)
 }
 
-func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxesRow, logger zerolog.Logger) {
+func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxesRow, claimedAt time.Time, logger zerolog.Logger) {
+	leaseUntil := leaseDeadline(sbx.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
 	h.pauseClaimed(ctx, db.ClaimExpiredSandboxesRow{
 		ID:                  sbx.ID,
 		TeamID:              sbx.TeamID,
@@ -359,10 +362,11 @@ func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBilli
 		NetworkConfig:       sbx.NetworkConfig,
 		PauseOpID:           sbx.PauseOpID,
 		PauseOpLeaseVersion: sbx.PauseOpLeaseVersion,
-	}, "billing_ineligible", "billing_ineligible_pause", "billing_ineligible_paused", "billing: sandbox paused after eligibility loss", logger)
+		PauseOpLeaseUntil:   sbx.PauseOpLeaseUntil,
+	}, leaseUntil, "billing_ineligible", "billing_ineligible_pause", "billing_ineligible_paused", "billing: sandbox paused after eligibility loss", logger)
 }
 
-func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, trigger, transition, activity, successMessage string, logger zerolog.Logger) {
+func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, leaseUntil time.Time, trigger, transition, activity, successMessage string, logger zerolog.Logger) {
 	l := logger.With().
 		Str("sandbox_id", sbx.ID.String()).
 		Str("host_id", sbx.HostID).
@@ -386,7 +390,7 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	// The pause's identity, minted by the claim; returns in the host's upload
 	// report to name this exact pause for coverage linkage.
 	pauseToken := uuid.UUID(sbx.PauseOpID.Bytes).String()
-	snapshotPath, memPath, manifest, ackedPauseToken, err := h.pauseWithRetry(ctx, vmd, sbx.HostID, sbx.ID.String(), pauseToken)
+	snapshotPath, memPath, manifest, ackedPauseToken, err := h.pauseWithRetry(ctx, vmd, sbx.HostID, sbx.ID.String(), pauseToken, leaseUntil)
 	if err != nil {
 		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		lease := pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}

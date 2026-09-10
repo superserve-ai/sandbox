@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -416,4 +417,53 @@ func TestIntegration_PauseOperation_ReaperClaimMintsTheOperation(t *testing.T) {
 	if got := readPauseOp(t, id); got.status != "pausing" || !got.leased || got.opID.Bytes != claimed.PauseOpID.Bytes {
 		t.Fatalf("after reaper claim: %+v", got)
 	}
+}
+
+// Claims go to the row that has waited longest since it became eligible, not
+// the one whose pause began first: a set of old operations that keep failing
+// cannot cycle ahead of a newer one that would succeed.
+func TestIntegration_PauseOperation_RetryOrderDoesNotStarveNewerRows(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	for i := 0; i < 8; i++ {
+		id := seedActiveSandbox(t, teamID, fmt.Sprintf("pause-op-slow-%d", i))
+		beginPause(t, id, teamID, uuid.New())
+		expireLease(t, id)
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET pause_op_started_at = now() - interval '1 hour' WHERE id = $1`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	healthy := seedActiveSandbox(t, teamID, "pause-op-healthy")
+	beginPause(t, healthy, teamID, uuid.New())
+	expireLease(t, healthy)
+
+	for wave := 0; wave < 12; wave++ {
+		rows, err := testQueries.ClaimPendingPauses(ctx, db.ClaimPendingPausesParams{LeaseSeconds: 75, MinAgeSeconds: 90, MaxRows: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			if row.ID == healthy {
+				if wave > 2 {
+					t.Fatalf("healthy row first claimed in wave %d, want within the third", wave)
+				}
+				return
+			}
+		}
+		// Time passes: every lease moves closer to expiry, and the slow rows
+		// come back undecided with a retry delay.
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET pause_op_lease_until = pause_op_lease_until - interval '60 seconds' WHERE team_id = $1`, teamID); err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			if _, err := testQueries.ReleasePauseLease(ctx, db.ReleasePauseLeaseParams{
+				ID: row.ID, PauseOpID: row.PauseOpID, PauseOpLeaseVersion: row.PauseOpLeaseVersion, RetryAfterSeconds: 45,
+			}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Fatal("the healthy row was never claimed")
 }

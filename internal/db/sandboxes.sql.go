@@ -415,7 +415,7 @@ WITH candidates AS (
   FROM candidates
   WHERE sandbox.id = candidates.id
   RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config,
-            sandbox.pause_op_id, sandbox.pause_op_lease_version
+            sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until
 ), closed_intervals AS (
   UPDATE sandbox_active_interval
   SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
@@ -430,7 +430,7 @@ WITH candidates AS (
   RETURNING sandbox_id
 )
 SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config,
-       p.pause_op_id, p.pause_op_lease_version
+       p.pause_op_id, p.pause_op_lease_version, p.pause_op_lease_until
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
 `
@@ -442,14 +442,15 @@ type ClaimBillingIneligibleSandboxesParams struct {
 }
 
 type ClaimBillingIneligibleSandboxesRow struct {
-	ID                  uuid.UUID   `json:"id"`
-	TeamID              uuid.UUID   `json:"team_id"`
-	Name                string      `json:"name"`
-	SnapshotID          pgtype.UUID `json:"snapshot_id"`
-	HostID              string      `json:"host_id"`
-	NetworkConfig       []byte      `json:"network_config"`
-	PauseOpID           pgtype.UUID `json:"pause_op_id"`
-	PauseOpLeaseVersion int64       `json:"pause_op_lease_version"`
+	ID                  uuid.UUID          `json:"id"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	Name                string             `json:"name"`
+	SnapshotID          pgtype.UUID        `json:"snapshot_id"`
+	HostID              string             `json:"host_id"`
+	NetworkConfig       []byte             `json:"network_config"`
+	PauseOpID           pgtype.UUID        `json:"pause_op_id"`
+	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
+	PauseOpLeaseUntil   pgtype.Timestamptz `json:"pause_op_lease_until"`
 }
 
 // Atomically claims active sandboxes for a team whose billing eligibility was
@@ -473,6 +474,7 @@ func (q *Queries) ClaimBillingIneligibleSandboxes(ctx context.Context, arg Claim
 			&i.NetworkConfig,
 			&i.PauseOpID,
 			&i.PauseOpLeaseVersion,
+			&i.PauseOpLeaseUntil,
 		); err != nil {
 			return nil, err
 		}
@@ -518,7 +520,7 @@ paused AS (
   FROM expired
   WHERE sandbox.id = expired.id
   RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id, sandbox.network_config,
-            sandbox.pause_op_id, sandbox.pause_op_lease_version
+            sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until
 ),
 closed_intervals AS (
   -- Same atomicity story as BeginPause: bundle the active-interval close
@@ -540,7 +542,7 @@ closed_billing_compute AS (
   RETURNING sandbox_id
 )
 SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config,
-       p.pause_op_id, p.pause_op_lease_version
+       p.pause_op_id, p.pause_op_lease_version, p.pause_op_lease_until
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
 `
@@ -551,14 +553,15 @@ type ClaimExpiredSandboxesParams struct {
 }
 
 type ClaimExpiredSandboxesRow struct {
-	ID                  uuid.UUID   `json:"id"`
-	TeamID              uuid.UUID   `json:"team_id"`
-	Name                string      `json:"name"`
-	SnapshotID          pgtype.UUID `json:"snapshot_id"`
-	HostID              string      `json:"host_id"`
-	NetworkConfig       []byte      `json:"network_config"`
-	PauseOpID           pgtype.UUID `json:"pause_op_id"`
-	PauseOpLeaseVersion int64       `json:"pause_op_lease_version"`
+	ID                  uuid.UUID          `json:"id"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	Name                string             `json:"name"`
+	SnapshotID          pgtype.UUID        `json:"snapshot_id"`
+	HostID              string             `json:"host_id"`
+	NetworkConfig       []byte             `json:"network_config"`
+	PauseOpID           pgtype.UUID        `json:"pause_op_id"`
+	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
+	PauseOpLeaseUntil   pgtype.Timestamptz `json:"pause_op_lease_until"`
 }
 
 // Atomically claims active sandboxes past their timeout and marks them 'pausing'.
@@ -593,6 +596,7 @@ func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, arg ClaimExpiredSan
 			&i.NetworkConfig,
 			&i.PauseOpID,
 			&i.PauseOpLeaseVersion,
+			&i.PauseOpLeaseUntil,
 		); err != nil {
 			return nil, err
 		}
@@ -611,7 +615,7 @@ WITH due AS (
     AND pause_op_id IS NOT NULL
     AND (pause_op_lease_until IS NULL OR pause_op_lease_until < now())
     AND pause_op_started_at < now() - make_interval(secs => $2::int)
-  ORDER BY pause_op_started_at ASC
+  ORDER BY pause_op_lease_until ASC NULLS FIRST, pause_op_started_at ASC
   LIMIT $3
   FOR UPDATE SKIP LOCKED
 )
@@ -621,7 +625,7 @@ SET pause_op_lease_until = now() + make_interval(secs => $1::int),
 FROM due
 WHERE sandbox.id = due.id
 RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.host_id,
-          sandbox.pause_op_id, sandbox.pause_op_lease_version,
+          sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until,
           sandbox.pause_op_started_at, sandbox.pause_op_attention_at
 `
 
@@ -638,14 +642,17 @@ type ClaimPendingPausesRow struct {
 	HostID              string             `json:"host_id"`
 	PauseOpID           pgtype.UUID        `json:"pause_op_id"`
 	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
+	PauseOpLeaseUntil   pgtype.Timestamptz `json:"pause_op_lease_until"`
 	PauseOpStartedAt    pgtype.Timestamptz `json:"pause_op_started_at"`
 	PauseOpAttentionAt  pgtype.Timestamptz `json:"pause_op_attention_at"`
 }
 
 // Leases pauses whose caller has given up: still 'pausing', lease expired or
-// absent, old enough that the caller's own attempt is over. SKIP LOCKED keeps
-// replicas apart; updated_at is left alone so a lease renewal never reads as
-// activity. Rows without an operation predate this contract and are skipped.
+// absent, old enough that the caller's own attempt is over. Longest-eligible
+// first, so a row that keeps failing cannot cycle ahead of newer ones; start
+// time is kept for the age alert only. SKIP LOCKED keeps replicas apart;
+// updated_at is left alone so a lease renewal never reads as activity. Rows
+// without an operation predate this contract and are skipped.
 func (q *Queries) ClaimPendingPauses(ctx context.Context, arg ClaimPendingPausesParams) ([]ClaimPendingPausesRow, error) {
 	rows, err := q.db.Query(ctx, claimPendingPauses, arg.LeaseSeconds, arg.MinAgeSeconds, arg.MaxRows)
 	if err != nil {
@@ -662,6 +669,7 @@ func (q *Queries) ClaimPendingPauses(ctx context.Context, arg ClaimPendingPauses
 			&i.HostID,
 			&i.PauseOpID,
 			&i.PauseOpLeaseVersion,
+			&i.PauseOpLeaseUntil,
 			&i.PauseOpStartedAt,
 			&i.PauseOpAttentionAt,
 		); err != nil {

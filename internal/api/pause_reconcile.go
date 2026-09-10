@@ -85,10 +85,9 @@ func (h *Handlers) ReconcilePendingPausesOnce(ctx context.Context, logger zerolo
 		if len(rows) == 0 {
 			return
 		}
-		leaseUntil := claimedAt.Add(time.Duration(pauseReconcileLease) * time.Second)
 		logger.Info().Int("count", len(rows)).Msg("pause reconcile: retrying abandoned pauses")
 		dispatchBounded(ctx, rows, pauseReconcileWorkers, func(row db.ClaimPendingPausesRow) {
-			h.reconcilePause(ctx, row, leaseUntil, logger)
+			h.reconcilePause(ctx, row, leaseDeadline(row.PauseOpLeaseUntil, claimedAt, pauseReconcileLease), logger)
 		})
 		claimed += len(rows)
 		if len(rows) < want {
@@ -110,11 +109,15 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauses
 		Logger()
 	started := time.Now()
 
-	budget := min(pauseReconcileRPC, time.Until(leaseUntil)-asyncTimeout-pauseLeaseSkew)
-	if budget <= 0 {
+	// One absolute deadline for everything below: the attention write and
+	// host resolution spend the same lease as the RPC.
+	deadline, ok := attemptDeadline(leaseUntil, pauseReconcileRPC)
+	if !ok {
 		l.Warn().Msg("pause reconcile: lease too short to dispatch, skipping")
 		return
 	}
+	dctx, dcancel := context.WithDeadline(ctx, deadline)
+	defer dcancel()
 
 	if row.PauseOpStartedAt.Valid && !row.PauseOpAttentionAt.Valid && time.Since(row.PauseOpStartedAt.Time) > pauseAttentionAfter {
 		h.flagPauseAttention(ctx, row.ID, lease, l)
@@ -122,16 +125,19 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauses
 
 	// Resolved fresh on every attempt: the host may have been replaced since
 	// the caller's try, and only the current host's answer counts.
-	vmd, err := h.vmdForHost(ctx, row.HostID)
+	vmd, err := h.vmdForHost(dctx, row.HostID)
 	if err != nil {
 		l.Warn().Err(err).Msg("pause reconcile: host unresolved, retrying later")
 		h.releasePauseLease(ctx, row.ID, lease, pauseRetryAfter(), l)
 		return
 	}
+	if !time.Now().Before(deadline) {
+		l.Warn().Msg("pause reconcile: lease ran out during host resolution, skipping")
+		h.releasePauseLease(ctx, row.ID, lease, pauseRetryAfter(), l)
+		return
+	}
 
-	rctx, rcancel := context.WithTimeout(ctx, budget)
-	snapshotPath, memPath, manifest, ackedToken, err := vmd.PauseInstance(rctx, row.ID.String(), "", uuid.UUID(row.PauseOpID.Bytes).String())
-	rcancel()
+	snapshotPath, memPath, manifest, ackedToken, err := vmd.PauseInstance(dctx, row.ID.String(), "", uuid.UUID(row.PauseOpID.Bytes).String())
 	if err != nil {
 		RecordSandboxTransition(ctx, "reconcile_pause", telemetry.ResultError, row.HostID, time.Since(started))
 		if isVMDNotFound(err) {

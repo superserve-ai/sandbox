@@ -2922,23 +2922,33 @@ const pauseLeaseSeconds int32 = 90
 
 // pauseWithRetry pauses a VM, retrying once on a non-NotFound failure: a
 // timed-out pause may have completed on the host, and PauseVM is idempotent,
-// so the retry returns the recorded snapshot. NotFound is terminal. The retry
-// re-resolves the host, whose address may have changed since the first try.
-func (h *Handlers) pauseWithRetry(reqCtx context.Context, vmd VMDClient, hostID, id, pauseToken string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
-	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
+// so the retry returns the recorded snapshot. NotFound is terminal. Every
+// attempt ends before leaseUntil, and the retry goes only to a freshly
+// resolved host: an answer from a machine the host no longer maps to says
+// nothing about the VM.
+func (h *Handlers) pauseWithRetry(reqCtx context.Context, vmd VMDClient, hostID, id, pauseToken string, leaseUntil time.Time) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
+	deadline, ok := attemptDeadline(leaseUntil, vmdTimeout)
+	if !ok {
+		return "", "", nil, "", errPauseLeaseExpired
+	}
+	ctx, cancel := context.WithDeadline(reqCtx, deadline)
 	snapshotPath, memPath, manifest, ackedToken, err = vmd.PauseInstance(ctx, id, "", pauseToken)
 	cancel()
 	if err == nil || isVMDNotFound(err) {
 		return snapshotPath, memPath, manifest, ackedToken, err
 	}
+	if deadline, ok = attemptDeadline(leaseUntil, vmdTimeout); !ok {
+		return "", "", nil, "", err
+	}
 	// Detached from the request: the client's deadline may already have
 	// fired, but the row must still converge.
-	rctx, rcancel := context.WithTimeout(context.WithoutCancel(reqCtx), vmdTimeout)
+	rctx, rcancel := context.WithDeadline(context.WithoutCancel(reqCtx), deadline)
 	defer rcancel()
-	if fresh, rerr := h.vmdForHost(rctx, hostID); rerr == nil {
-		vmd = fresh
+	fresh, rerr := h.vmdForHost(rctx, hostID)
+	if rerr != nil {
+		return "", "", nil, "", fmt.Errorf("resolve host for pause retry: %w", rerr)
 	}
-	return vmd.PauseInstance(rctx, id, "", pauseToken)
+	return fresh.PauseInstance(rctx, id, "", pauseToken)
 }
 
 func (h *Handlers) PauseSandbox(c *gin.Context) {
@@ -2970,6 +2980,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// return the right error code (404 vs 409).
 	// The pause's identity is minted before it is claimed, so the same id
 	// names it in the row, in every host call, and as its backup token.
+	claimedAt := time.Now()
 	pauseOp := uuid.New()
 	sandbox, err := h.DB.BeginPause(c.Request.Context(), db.BeginPauseParams{
 		ID:           sandboxID,
@@ -3024,9 +3035,10 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// Read from the request here: past this point the dispatch may outlive
 	// it, and nothing on another goroutine may touch c.
 	actorID := actorIDFromContext(c)
+	leaseUntil := leaseDeadline(sandbox.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
 
 	if !prefersAsync(c) {
-		respondPause(c, h.dispatchPause(c.Request.Context(), vmd, sandbox, actorID, l), false)
+		respondPause(c, h.dispatchPause(c.Request.Context(), vmd, sandbox, leaseUntil, actorID, l), false)
 		return
 	}
 
@@ -3034,7 +3046,7 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// detached so a client that stops waiting does not abandon the host call.
 	outcome := make(chan pauseOutcome, 1)
 	bg := context.WithoutCancel(c.Request.Context())
-	h.asyncBookkeeping("pause-dispatch", func() { outcome <- h.dispatchPause(bg, vmd, sandbox, actorID, l) })
+	h.asyncBookkeeping("pause-dispatch", func() { outcome <- h.dispatchPause(bg, vmd, sandbox, leaseUntil, actorID, l) })
 	timer := time.NewTimer(pauseAcceptBudget)
 	defer timer.Stop()
 	select {

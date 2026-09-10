@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -150,5 +151,78 @@ func TestReconcilePause_ExpiredLeaseDoesNotDispatch(t *testing.T) {
 	h.reconcilePause(context.Background(), row, time.Now().Add(time.Minute), zerolog.Nop())
 	if calls.Load() != 1 || atomic.LoadInt32(&finalizes) != 1 {
 		t.Fatalf("worker with a live lease: calls = %d, finalizes = %d; want 1 and 1", calls.Load(), finalizes)
+	}
+}
+
+// When the host cannot be resolved for the retry, the old client is not a
+// fallback: its answer would be about a machine the host no longer maps to.
+func TestPauseWithRetry_UnresolvedHostDoesNotRetryTheOldClient(t *testing.T) {
+	var oldCalls atomic.Int32
+	old := &stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+		if oldCalls.Add(1) == 1 {
+			return "", "", status.Error(codes.Unavailable, "old host disconnected")
+		}
+		return "", "", status.Error(codes.NotFound, "old machine no longer has this sandbox")
+	}}
+	h := &Handlers{Hosts: &stubHosts{resolve: func() (vmdclient.Client, error) {
+		return nil, errors.New("cannot verify current host address")
+	}}}
+
+	_, _, _, _, err := h.pauseWithRetry(context.Background(), old, "host-1", uuid.NewString(), uuid.NewString(), time.Now().Add(time.Minute))
+
+	if oldCalls.Load() != 1 || err == nil || isVMDNotFound(err) {
+		t.Fatalf("unresolved retry: old client calls = %d, err = %v; want one call and an undecided error", oldCalls.Load(), err)
+	}
+}
+
+// A claim can already have expired by the time its row comes back (a delayed
+// query, a suspended process); nothing is sent to the host on it.
+func TestPauseSandbox_ExpiredClaimDoesNotDispatch(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive,
+		PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1,
+		PauseOpLeaseUntil: pgtype.Timestamptz{Time: time.Now().Add(-time.Second), Valid: true}}
+	var calls atomic.Int32
+	var finalizes int32
+	h := &Handlers{DB: db.New(pauseMocks(sb, &finalizes)), VMD: &stubVMD{
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			calls.Add(1)
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		},
+	}}
+
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+
+	if calls.Load() != 0 {
+		t.Fatalf("foreground sent %d pause RPCs on an expired claim", calls.Load())
+	}
+}
+
+// Host resolution spends the same lease as the RPC: if it runs past the
+// attempt deadline, the RPC is not sent.
+func TestReconcilePause_ResolutionCannotOutliveTheLease(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-1", Status: db.SandboxStatusPausing,
+		PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1}
+	var calls atomic.Int32
+	var finalizes int32
+	leaseUntil := time.Now().Add(asyncTimeout + pauseLeaseSkew + 40*time.Millisecond)
+	h := &Handlers{DB: db.New(pauseMocks(sb, &finalizes)), Hosts: &stubHosts{resolve: func() (vmdclient.Client, error) {
+		time.Sleep(time.Until(leaseUntil.Add(-asyncTimeout-pauseLeaseSkew)) + 20*time.Millisecond)
+		return &stubVMD{pauseFn: func(ctx context.Context, _, _ string) (string, string, error) {
+			if ctx.Err() == nil {
+				calls.Add(1)
+			}
+			return "", "", status.Error(codes.Unavailable, "probe")
+		}}, nil
+	}}}
+
+	h.reconcilePause(context.Background(), db.ClaimPendingPausesRow{ID: sandboxID, TeamID: teamID, HostID: "host-1",
+		PauseOpID: sb.PauseOpID, PauseOpLeaseVersion: 1}, leaseUntil, zerolog.Nop())
+
+	if calls.Load() != 0 {
+		t.Fatalf("resolution crossed the attempt deadline, yet %d live RPCs were sent", calls.Load())
 	}
 }
