@@ -1149,3 +1149,39 @@ func TestPeerPoolIntentionalCloseDoesNotRecordFailure(t *testing.T) {
 		t.Fatal("intentional close scheduled reconnect backoff")
 	}
 }
+
+func TestPeerPoolShutdownClosesTransportDuringClaimedCleanup(t *testing.T) {
+	metrics := &peerShutdownTelemetry{closing: make(chan struct{}), release: make(chan struct{})}
+	closer := &countingCloser{}
+	p := NewPeerTransport(PeerPoolConfig{Telemetry: metrics, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		return &testPeerClient{}, closer, nil
+	}}).(*peerPool)
+	s, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := s.(*countedPeerStream)
+	cs.conn.mu.Lock()
+	cs.conn.draining = true
+	cs.conn.mu.Unlock()
+	streamDone := make(chan struct{})
+	go func() { _ = s.Close(); close(streamDone) }()
+	<-metrics.closing
+	shutdownDone := make(chan struct{})
+	go func() { _ = p.Close(); close(shutdownDone) }()
+	select {
+	case <-shutdownDone:
+	case <-time.After(time.Second):
+		close(metrics.release)
+		t.Fatal("shutdown waited for blocked stream telemetry")
+	}
+	closed := closer.closed.Load()
+	close(metrics.release)
+	<-streamDone
+	if closed != 1 {
+		t.Fatalf("transport close count at shutdown return = %d, want 1", closed)
+	}
+	if closer.closed.Load() != 1 || metrics.drains.Load() != 1 {
+		t.Fatal("cleanup was performed more than once")
+	}
+}
