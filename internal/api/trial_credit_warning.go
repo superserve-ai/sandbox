@@ -44,9 +44,33 @@ func trialCreditWarningHTML(teamName string, remaining float64) string {
 
 const trialCreditWarningTimeout = 30 * time.Second
 
-// Keep advisory work bounded independently of the reconciliation batch size.
-// A full scan must remain able to finish even when delivery is slow.
-var trialCreditWarningSlots = make(chan struct{}, 32)
+const trialCreditWarningConcurrency = 2
+
+type trialCreditWarningAdmission struct {
+	mu     sync.Mutex
+	active int32
+}
+
+func (a *trialCreditWarningAdmission) tryAcquire(maxConns, acquiredConns int32) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	// Reserve at least half the configured pool for non-warning work. Count
+	// admitted jobs against spare capacity even while they are between queries.
+	limit := min(int32(trialCreditWarningConcurrency), maxConns/2, maxConns-acquiredConns-1)
+	if a.active >= limit {
+		return false
+	}
+	a.active++
+	return true
+}
+
+func (a *trialCreditWarningAdmission) release() {
+	a.mu.Lock()
+	a.active--
+	a.mu.Unlock()
+}
+
+var trialCreditWarningAdmissions trialCreditWarningAdmission
 
 type trialCreditWarningJob struct {
 	h      *Handlers
@@ -61,10 +85,10 @@ var (
 
 func startTrialCreditWarningWorkers() {
 	trialCreditWarningWorkers.Do(func() {
-		for i := 0; i < cap(trialCreditWarningSlots); i++ {
+		for i := 0; i < trialCreditWarningConcurrency; i++ {
 			go func() {
 				for job := range trialCreditWarningQueue {
-					job.h.processTrialCreditWarning(job.ctx, job.teamID)
+					job.h.processTrialCreditWarningWithCapacity(job.ctx, job.teamID)
 					job.h.asyncMu.Lock()
 					job.h.asyncCount--
 					if job.h.asyncCount == 0 && job.h.asyncCond != nil {
@@ -75,6 +99,18 @@ func startTrialCreditWarningWorkers() {
 			}()
 		}
 	})
+}
+
+func (h *Handlers) processTrialCreditWarningWithCapacity(ctx context.Context, teamID uuid.UUID) {
+	if h.Pool == nil {
+		return
+	}
+	stats := h.Pool.Stat()
+	if !trialCreditWarningAdmissions.tryAcquire(stats.MaxConns(), stats.AcquiredConns()) {
+		return
+	}
+	defer trialCreditWarningAdmissions.release()
+	h.processTrialCreditWarning(ctx, teamID)
 }
 
 type TrialCreditWarningSender interface {
@@ -252,31 +288,50 @@ func (e *unknownTrialCreditWarningError) Error() string                   { retu
 func (e *unknownTrialCreditWarningError) Unwrap() error                   { return e.err }
 func (e *unknownTrialCreditWarningError) UnknownTrialCreditWarning() bool { return true }
 
-func tryDispatchTrialCreditWarning(h *Handlers, ctx context.Context, teamID uuid.UUID) bool {
-	startTrialCreditWarningWorkers()
+// Resume after the last accepted UUID on overflow so a stable scan order
+// cannot repeatedly fill the queue with the same prefix. Only one cursor is
+// retained; the existing eligibility sweep supplies the remaining teams.
+type trialCreditWarningPass struct {
+	after uuid.UUID
+	last  uuid.UUID
+	full  bool
+}
+
+func (h *Handlers) beginTrialCreditWarningPass() *trialCreditWarningPass {
 	h.asyncMu.Lock()
-	h.asyncCount++
-	h.asyncMu.Unlock()
-	select {
-	case trialCreditWarningQueue <- trialCreditWarningJob{h: h, ctx: ctx, teamID: teamID}:
-		return true
-	case <-ctx.Done():
-		h.asyncMu.Lock()
-		h.asyncCount--
-		if h.asyncCount == 0 && h.asyncCond != nil {
-			h.asyncCond.Broadcast()
-		}
-		h.asyncMu.Unlock()
+	defer h.asyncMu.Unlock()
+	return &trialCreditWarningPass{after: h.trialWarningAfter, last: h.trialWarningAfter}
+}
+
+func (h *Handlers) finishTrialCreditWarningPass(pass *trialCreditWarningPass, complete bool) {
+	h.asyncMu.Lock()
+	defer h.asyncMu.Unlock()
+	if complete && !pass.full {
+		h.trialWarningAfter = uuid.Nil
+	} else {
+		h.trialWarningAfter = pass.last
+	}
+}
+
+func (pass *trialCreditWarningPass) dispatch(h *Handlers, ctx context.Context, teamID uuid.UUID, queue chan<- trialCreditWarningJob) bool {
+	if pass.full || bytes.Compare(teamID[:], pass.after[:]) <= 0 {
 		return false
+	}
+	if ctx.Err() != nil {
+		pass.full = true
+		return false
+	}
+	// Hold the bookkeeping lock until admission is known. Failed enqueue
+	// attempts must neither leak counts nor strand a waiter at zero.
+	h.asyncMu.Lock()
+	defer h.asyncMu.Unlock()
+	select {
+	case queue <- trialCreditWarningJob{h: h, ctx: ctx, teamID: teamID}:
+		h.asyncCount++
+		pass.last = teamID
+		return true
 	default:
-		// Advisory work is dropped when the bounded queue is full; the next
-		// reconciliation pass will retry without extending its critical path.
-		h.asyncMu.Lock()
-		h.asyncCount--
-		if h.asyncCount == 0 && h.asyncCond != nil {
-			h.asyncCond.Broadcast()
-		}
-		h.asyncMu.Unlock()
+		pass.full = true
 		return false
 	}
 }

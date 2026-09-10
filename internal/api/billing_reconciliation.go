@@ -17,6 +17,10 @@ import (
 const billingEligibilityPauseBatchSize int32 = 50
 
 func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
+	warnings := h.beginTrialCreditWarningPass()
+	complete := false
+	defer func() { h.finishTrialCreditWarningPass(warnings, complete) }()
+	startTrialCreditWarningWorkers()
 	var after *uuid.UUID
 	for {
 		var afterID pgtype.UUID
@@ -43,7 +47,7 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 		// after the authoritative refresh pass, and let the warning's own
 		// bounded bookkeeping path perform forecasting and delivery.
 		for _, teamID := range teams {
-			tryDispatchTrialCreditWarning(h, context.WithoutCancel(ctx), teamID)
+			warnings.dispatch(h, context.WithoutCancel(ctx), teamID, trialCreditWarningQueue)
 		}
 		last := teams[len(teams)-1]
 		after = &last
@@ -51,6 +55,7 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 			break
 		}
 	}
+	complete = true
 	h.reconcileActiveIneligibleTeams(ctx)
 }
 

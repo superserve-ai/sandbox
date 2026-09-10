@@ -315,7 +315,7 @@ func TestTrialWarningWorkerRechecksLifecycleAfterClaim(t *testing.T) {
 func TestTrialWarningDispatchDoesNotBlockEligibilityRefresh(t *testing.T) {
 	team := seedWarningWorkerTeam(t)
 	entered, release := make(chan struct{}), make(chan struct{})
-	h := &api.Handlers{DB: db.New(warningDispatchScope{Pool: testPool, team: team}), TrialWarningSender: warningSenderFunc(func(ctx context.Context, id uuid.UUID, _ float64) error {
+	h := &api.Handlers{Pool: testPool, DB: db.New(warningDispatchScope{Pool: testPool, team: team}), TrialWarningSender: warningSenderFunc(func(ctx context.Context, id uuid.UUID, _ float64) error {
 		if id == team {
 			close(entered)
 			select {

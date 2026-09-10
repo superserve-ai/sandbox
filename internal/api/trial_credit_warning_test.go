@@ -3,20 +3,102 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+func TestTrialCreditWarningAdmissionReservesDatabaseCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		max, acquired int32
+		want          int32
+	}{
+		{"unknown capacity", 0, 0, 0},
+		{"single connection", 1, 0, 0},
+		{"two connections", 2, 0, 1},
+		{"three connections", 3, 0, 1},
+		{"four connections", 4, 0, 2},
+		{"large pool", 64, 0, 2},
+		{"saturated pool", 4, 4, 0},
+		{"last spare connection", 4, 3, 0},
+		{"two spare connections", 4, 2, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var admission trialCreditWarningAdmission
+			var admitted atomic.Int32
+			var wg sync.WaitGroup
+			for i := 0; i < 32; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if admission.tryAcquire(tc.max, tc.acquired) {
+						admitted.Add(1)
+					}
+				}()
+			}
+			wg.Wait()
+			if got := admitted.Load(); got != tc.want {
+				t.Fatalf("admitted %d jobs, want %d", got, tc.want)
+			}
+			for i := int32(0); i < tc.want; i++ {
+				admission.release()
+			}
+			if got := admission.tryAcquire(tc.max, tc.acquired); got != (tc.want > 0) {
+				t.Fatalf("admission after release = %v", got)
+			}
+		})
+	}
+}
+
+func TestTrialCreditWarningWorkerUsesPoolCapacity(t *testing.T) {
+	for _, maxConns := range []int32{0, 1, 2} {
+		t.Run(fmt.Sprint(maxConns), func(t *testing.T) {
+			reads := 0
+			h := &Handlers{DB: db.New(&mockDBTX{queryRowFn: func(context.Context, string, ...any) pgx.Row {
+				reads++
+				return &mockRow{scanFn: func(...any) error { return pgx.ErrNoRows }}
+			}}), TrialWarningSender: &recordingTrialWarningSender{}}
+			if maxConns > 0 {
+				config, err := pgxpool.ParseConfig("postgres://localhost/example?sslmode=disable")
+				if err != nil {
+					t.Fatal(err)
+				}
+				config.MaxConns = maxConns
+				config.MinConns = 0
+				h.Pool, err = pgxpool.NewWithConfig(context.Background(), config)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer h.Pool.Close()
+			}
+			for i := 0; i < 2; i++ {
+				h.processTrialCreditWarningWithCapacity(context.Background(), uuid.New())
+			}
+			want := 0
+			if maxConns == 2 {
+				want = 2 // A failed query must release admission for the next job.
+			}
+			if reads != want {
+				t.Fatalf("database reads = %d, want %d", reads, want)
+			}
+		})
+	}
+}
 
 func TestTrialCreditWarningWithoutSenderSkipsDatabase(t *testing.T) {
 	// A query through this unconnected database would panic.
@@ -402,4 +484,87 @@ func TestTrialCreditWarningProviderRejectionClassification(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTrialCreditWarningDispatchOverflowProgress(t *testing.T) {
+	h := &Handlers{}
+	queue := make(chan trialCreditWarningJob, 256)
+	teams := make([]uuid.UUID, 1031)
+	for i := range teams {
+		teams[i] = uuid.MustParse(fmt.Sprintf("00000000-0000-0000-0000-%012x", i+1))
+	}
+	seen := make(map[uuid.UUID]int)
+	// Keep workers stalled during each sweep, including across the 1000-team
+	// database page boundary. Terminal warnings still appear in later sweeps.
+	for cycle := 0; cycle < 2; cycle++ {
+		for sweep := 0; sweep < 5; sweep++ {
+			pass := h.beginTrialCreditWarningPass()
+			for start := 0; start < len(teams); start += 1000 {
+				for _, team := range teams[start:min(start+1000, len(teams))] {
+					pass.dispatch(h, context.Background(), team, queue)
+				}
+			}
+			h.finishTrialCreditWarningPass(pass, true)
+			if h.asyncCount != len(queue) {
+				t.Fatalf("bookkeeping count=%d, queued=%d", h.asyncCount, len(queue))
+			}
+			for len(queue) > 0 {
+				job := <-queue
+				seen[job.teamID]++
+				h.asyncCount--
+			}
+			h.WaitAsyncBookkeeping()
+		}
+		for _, team := range teams {
+			if seen[team] != cycle+1 {
+				t.Fatalf("team %s evaluated %d times after cycle %d", team, seen[team], cycle+1)
+			}
+		}
+		if h.trialWarningAfter != uuid.Nil {
+			t.Fatal("completed traversal did not wrap for later retries")
+		}
+	}
+}
+
+func TestTrialCreditWarningDispatchRetainsProgress(t *testing.T) {
+	h := &Handlers{}
+	queue := make(chan trialCreditWarningJob, 1)
+	first := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	second := uuid.MustParse("00000000-0000-0000-0000-000000000002")
+	pass := h.beginTrialCreditWarningPass()
+	if !pass.dispatch(h, context.Background(), first, queue) {
+		t.Fatal("first team was not enqueued")
+	}
+	if pass.dispatch(h, context.Background(), second, queue) {
+		t.Fatal("full queue accepted another job")
+	}
+	h.finishTrialCreditWarningPass(pass, true)
+	// Another sweep while workers remain blocked must not lose the cursor.
+	pass = h.beginTrialCreditWarningPass()
+	pass.dispatch(h, context.Background(), second, queue)
+	h.finishTrialCreditWarningPass(pass, true)
+	if h.trialWarningAfter != first || h.asyncCount != 1 {
+		t.Fatalf("full sweep changed progress/count: %s/%d", h.trialWarningAfter, h.asyncCount)
+	}
+	<-queue
+	h.asyncCount--
+	pass = h.beginTrialCreditWarningPass()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if pass.dispatch(h, ctx, second, queue) || h.asyncCount != 0 {
+		t.Fatal("canceled enqueue added work")
+	}
+	h.finishTrialCreditWarningPass(pass, false)
+	pass = h.beginTrialCreditWarningPass()
+	// The cursor team may have disappeared from the active-trial population.
+	if !pass.dispatch(h, context.Background(), second, queue) {
+		t.Fatal("overflow team did not progress after capacity became available")
+	}
+	h.finishTrialCreditWarningPass(pass, false)
+	if h.trialWarningAfter != second {
+		t.Fatal("interrupted traversal lost accepted progress")
+	}
+	<-queue
+	h.asyncCount--
+	h.WaitAsyncBookkeeping()
 }

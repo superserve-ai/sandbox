@@ -175,6 +175,8 @@ type Handlers struct {
 	asyncCond  *sync.Cond // lazily created by WaitAsyncBookkeeping, guarded by asyncMu
 	asyncCount int
 
+	trialWarningAfter uuid.UUID // guarded by asyncMu
+
 	// activityGate caps how many activity-log inserts may hold DB connections
 	// at once (see writeActivity). Lazily created so struct-literal
 	// construction keeps working.
