@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"io"
 	"sync"
@@ -843,5 +844,106 @@ func TestPeerPoolHandshakeOutcome(t *testing.T) {
 				t.Fatal("missing handshake event")
 			}
 		})
+	}
+}
+
+type drainStreamTelemetry struct {
+	noopPeerTelemetry
+	total    atomic.Int64
+	negative atomic.Bool
+	drained  chan struct{}
+}
+
+func (t *drainStreamTelemetry) PeerStream(delta int) {
+	if t.total.Add(int64(delta)) < 0 {
+		t.negative.Store(true)
+	}
+}
+func (t *drainStreamTelemetry) PeerDrain(bool) { t.drained <- struct{}{} }
+
+type mixedPendingPeerClient struct {
+	published        int32
+	calls            atomic.Int32
+	started, release chan struct{}
+}
+
+func (c *mixedPendingPeerClient) OpenPeerStream(context.Context) (PeerStream, error) {
+	if c.calls.Add(1) > c.published {
+		close(c.started)
+		<-c.release
+	}
+	return &testPeerStream{}, nil
+}
+func TestPeerPoolForcedDrainCountsOnlyPublishedStreams(t *testing.T) {
+	for _, operation := range []string{"shutdown", "replacement"} {
+		for _, published := range []int32{0, 1} {
+			t.Run(fmt.Sprintf("%s/published=%d", operation, published), func(t *testing.T) {
+				client := &mixedPendingPeerClient{published: published, started: make(chan struct{}), release: make(chan struct{})}
+				var release sync.Once
+				defer release.Do(func() { close(client.release) })
+				metrics := &drainStreamTelemetry{drained: make(chan struct{}, 16)}
+				p := NewPeerTransport(PeerPoolConfig{DrainTimeout: 10 * time.Millisecond, Telemetry: metrics, Dial: func(_ context.Context, _, addr string) (PeerClient, io.Closer, error) {
+					if addr == "old" {
+						return client, &countingCloser{}, nil
+					}
+					return &testPeerClient{}, &countingCloser{}, nil
+				}})
+				defer p.Close()
+				var old PeerStream
+				if published > 0 {
+					var err error
+					old, err = p.OpenStream(context.Background(), "host", "old")
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				done := make(chan PeerStream, 1)
+				go func() { s, _ := p.OpenStream(context.Background(), "host", "old"); done <- s }()
+				<-client.started
+				if got := metrics.total.Load(); got != int64(published) {
+					t.Fatalf("before drain = %d", got)
+				}
+				var replacement PeerStream
+				want := int64(0)
+				if operation == "shutdown" {
+					_ = p.Close()
+				} else {
+					var err error
+					replacement, err = p.OpenStream(context.Background(), "host", "new")
+					if err != nil {
+						t.Fatal(err)
+					}
+					want = 1
+				}
+				select {
+				case <-metrics.drained:
+				case <-time.After(time.Second):
+					t.Fatal("drain did not complete")
+				}
+
+				if got := metrics.total.Load(); got != want {
+					t.Fatalf("after drain = %d, want %d", got, want)
+				}
+				if old != nil {
+					_ = old.Close()
+				}
+				if replacement != nil {
+					_ = replacement.Close()
+					_ = p.Close()
+				}
+				release.Do(func() { close(client.release) })
+				select {
+				case late := <-done:
+					if late != nil {
+						_ = late.Close()
+					}
+				case <-time.After(time.Second):
+					t.Fatal("pending open did not finish")
+				}
+				if got := metrics.total.Load(); got != 0 || metrics.negative.Load() {
+					t.Fatalf("unbalanced stream metric: total=%d, negative=%v", got, metrics.negative.Load())
+				}
+			})
+		}
 	}
 }

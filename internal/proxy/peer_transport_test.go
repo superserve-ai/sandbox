@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,6 +9,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
+	"io"
 	"math/big"
 	"net"
 	"net/url"
@@ -253,4 +256,102 @@ func TestPeerPoolRPCRejectionDoesNotFailSibling(t *testing.T) {
 		t.Fatal("failed RPC did not release capacity:", err)
 	}
 	_ = c.Close()
+}
+
+func TestGRPCPeerLargeWritePreservesByteStream(t *testing.T) {
+	cfg := peerTestCredentials(t)
+	serverTLS, err := cfg.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	peerpb.RegisterPeerProxyServer(server, echoPeerServer{})
+	go server.Serve(listener)
+	defer server.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client, closer, err := GRPCPeerDialer(cfg.LoadClient)(ctx, "host", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closer.Close()
+	stream, err := client.OpenPeerStream(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	payload := make([]byte, 5*1024*1024+17)
+	for i := range payload {
+		payload[i] = byte(i*31 + i/1024)
+	}
+	done := make(chan error, 1)
+	go func() {
+		n, err := stream.Write(payload)
+		if err == nil && n != len(payload) {
+			err = io.ErrShortWrite
+		}
+		done <- err
+	}()
+	received := make([]byte, len(payload))
+	if _, err := io.ReadFull(stream, received); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(received, payload) {
+		t.Fatal("large write changed bytes or ordering")
+	}
+	if _, err := stream.Write([]byte("still open")); err != nil {
+		t.Fatal(err)
+	}
+	tail := make([]byte, len("still open"))
+	if _, err := io.ReadFull(stream, tail); err != nil {
+		t.Fatal(err)
+	}
+	if string(tail) != "still open" {
+		t.Fatalf("tail = %q", tail)
+	}
+}
+
+type failingFrameSender struct {
+	grpc.BidiStreamingClient[peerpb.PeerProxyFrame, peerpb.PeerProxyFrame]
+	frames []*peerpb.PeerProxyFrame
+	err    error
+}
+
+func (s *failingFrameSender) Send(frame *peerpb.PeerProxyFrame) error {
+	if len(s.frames) == 2 {
+		return s.err
+	}
+	s.frames = append(s.frames, frame)
+	return nil
+}
+func TestPeerWriteReportsOnlySuccessfullySentFrames(t *testing.T) {
+	sendErr := errors.New("send failed")
+	sender := &failingFrameSender{err: sendErr}
+	stream := &generatedPeerStream{BidiStreamingClient: sender}
+	payload := bytes.Repeat([]byte("x"), 3*peerFrameDataLimit+7)
+	n, err := stream.Write(payload)
+	if !errors.Is(err, sendErr) || n != 2*peerFrameDataLimit {
+		t.Fatalf("Write = (%d, %v)", n, err)
+	}
+	var sent []byte
+	for _, frame := range sender.frames {
+		if len(frame.Data) > peerFrameDataLimit {
+			t.Fatalf("oversize frame: %d", len(frame.Data))
+		}
+		sent = append(sent, frame.Data...)
+	}
+	if !bytes.Equal(sent, payload[:n]) {
+		t.Fatal("incorrect partial payload")
+	}
+	payload[0] = 'y'
+	if sender.frames[0].Data[0] != 'x' {
+		t.Fatal("sent frame aliases caller buffer")
+	}
 }
