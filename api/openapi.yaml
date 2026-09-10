@@ -1097,11 +1097,44 @@ paths:
         Snapshots the sandbox's full state (memory + disk), suspends the VM,
         and transitions to `paused`. Resume it later to continue exactly where
         it left off — same memory, same running processes, same files.
+
+        The request holds until the pause is decided. Send
+        `Prefer: respond-async` to be released with `202 Accepted` instead if
+        the host has not finished within the request's wait budget; the pause
+        continues, and `GET /sandboxes/{sandbox_id}` reports `paused` once it
+        lands (or `failed` if the VM turned out to be gone).
       security:
         - apiKey: []
+      parameters:
+        - name: Prefer
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: [respond-async]
+          description: >
+            Accept `202` with `{"status":"pausing"}` over a held connection.
       responses:
         "204":
           description: Sandbox paused
+        "202":
+          description: >
+            Pause still in progress; poll the sandbox until it is `paused`.
+            Only with `Prefer: respond-async`.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: Seconds to wait before polling.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [pausing]
         "404":
           $ref: "#/components/responses/NotFound"
         "409":

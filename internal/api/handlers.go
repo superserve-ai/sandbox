@@ -3049,84 +3049,31 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		return
 	}
 
-	// Call VMD to pause and snapshot the VM. The pause's identity rides the
-	// RPC into the host's backup pipeline and returns in the upload report,
-	// naming this exact pause for coverage linkage.
-	pauseToken := pauseOp.String()
-	snapshotPath, memPath, manifest, ackedPauseToken, err := pauseWithRetry(c.Request.Context(), vmd, sandboxID.String(), pauseToken)
-	if err != nil {
-		// VMD says the VM doesn't exist — it crashed or was removed out-of-band.
-		// Mark the sandbox failed and return 410 Gone. No revert — the VM is
-		// already dead, "active" was a lie.
-		if isVMDNotFound(err) {
-			l.Warn().Err(err).Msg("VMD PauseInstance: VM unavailable, marking sandbox failed")
-			h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID, sandbox.HostID, false)
-			respondError(c, ErrSandboxGone)
-			return
-		}
+	// Read from the request here: past this point the dispatch may outlive
+	// it, and nothing on another goroutine may touch c.
+	actorID := actorIDFromContext(c)
 
-		// Timeout, unavailable, or any other error after dispatch says
-		// nothing about whether the VM still runs; the row stays 'pausing'
-		// and the reconciler asks the host again (see pause_reconcile.go).
-		l.Warn().Err(err).Msg("VMD PauseInstance undecided — left pausing for reconciliation")
-		lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
-		releaseCtx := context.WithoutCancel(c.Request.Context())
-		h.asyncBookkeeping("release-pause-lease", func() { h.releasePauseLease(releaseCtx, sandboxID, lease, 0, l) })
-		respondError(c, ErrInternal)
+	if !prefersAsync(c) {
+		respondPause(c, h.dispatchPause(c.Request.Context(), vmd, sandbox, actorID, l))
 		return
 	}
 
-	l.Debug().
-		Str("snapshot_path", snapshotPath).
-		Str("mem_path", memPath).
-		Msg("VMD pause complete")
-
-	// Past this point the snapshot already exists on disk — the pause has
-	// physically happened, so the bookkeeping (snapshot row upsert + status
-	// flip pausing → paused in a single CTE) is fire-and-forget. BeginPause's
-	// gate write owns the row and every other transition is status-gated, so
-	// a racing resume sees 'pausing' and 409s until this lands. Detached from
-	// cancellation so a client disconnect cannot orphan the bookkeeping;
-	// trace/span context preserved. The upsert replaces the old "insert a new
-	// row + delete the previous" flow, so there's no explicit prev-snapshot
-	// cleanup to schedule here.
-	finalizeCtx := context.WithoutCancel(c.Request.Context())
-	h.asyncBookkeeping("finalize-pause", func() {
-		fctx, fcancel := context.WithTimeout(finalizeCtx, asyncTimeout)
-		defer fcancel()
-		params := db.FinalizePauseParams{
-			ID:                  sandboxID,
-			TeamID:              teamID,
-			PauseOpID:           sandbox.PauseOpID,
-			PauseOpLeaseVersion: &sandbox.PauseOpLeaseVersion,
-			Path:                snapshotPath,
-			MemPath:             &memPath,
-			Trigger:             "pause",
-			// Store only what the daemon ECHOED: an older daemon drops the
-			// token, and storing it anyway would demand of its reports an
-			// identity they can never carry.
-			PauseToken: ackedPauseToken,
-		}
-		applyManifest(&params, manifest)
-		if _, err := h.finalizePause(fctx, params); err != nil {
-			// ErrNoRows means the sandbox was soft-deleted between BeginPause
-			// and FinalizePause (a rare race with DeleteSandbox). The VM is
-			// already stopped and its snapshot files are on disk — nothing to
-			// finalize for a sandbox that no longer exists.
-			if err == pgx.ErrNoRows {
-				l.Warn().Msg("FinalizePause: sandbox deleted mid-pause")
-				return
-			}
-			l.Error().Err(err).Msg("async DB FinalizePause failed — sandbox may be stuck in 'pausing'")
-			return
-		}
-	})
-
-	// Interval was already closed at BeginPause; FinalizePause is the
-	// end of the VMD pause work, not the moment the sandbox left active.
-	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
-	h.capture(c, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
-	c.Status(http.StatusNoContent)
+	// The caller will poll rather than hold the connection. The dispatch is
+	// detached from the request so a client that stops waiting does not
+	// abandon the host call: it finishes on its own bounded deadline and
+	// records its answer, and the reconciler covers what it cannot decide.
+	outcome := make(chan pauseOutcome, 1)
+	bg := context.WithoutCancel(c.Request.Context())
+	h.asyncBookkeeping("pause-dispatch", func() { outcome <- h.dispatchPause(bg, vmd, sandbox, actorID, l) })
+	timer := time.NewTimer(pauseAcceptBudget)
+	defer timer.Stop()
+	select {
+	case o := <-outcome:
+		respondPause(c, o)
+	case <-timer.C:
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusAccepted, gin.H{"status": db.SandboxStatusPausing})
+	}
 }
 
 // ---------------------------------------------------------------------------
