@@ -119,11 +119,16 @@ func TestTrialCreditWarningLifecycleSuppressesIneligibleTrials(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		grant    string
+		usage    bool
 		activate bool
+		state    string
 	}{
-		{name: "no grant"},
-		{name: "exhausted", grant: `INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason) VALUES ($1, 5, 0, 'signup trial credit')`},
-		{name: "stripe activation", grant: `INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason) VALUES ($1, 5, 5, 'signup trial credit')`, activate: true},
+		{name: "no grant", state: "no_grant"},
+		{name: "exhausted without expiry", grant: `INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, created_at) VALUES ($1, 0.000001, 0, 'signup trial credit', now()-interval '3 hours')`, usage: true, state: "exhausted"},
+		{name: "exhausted before expiry", grant: `INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, created_at, expires_at) VALUES ($1, 0.000001, 0, 'signup trial credit', now()-interval '3 hours', now()+interval '1 day')`, usage: true, state: "exhausted"},
+		{name: "expired with credit", grant: `INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, expires_at) VALUES ($1, 5, 5, 'signup trial credit', now()-interval '1 hour')`, state: "expired"},
+		{name: "expired and exhausted", grant: `INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, created_at, expires_at) VALUES ($1, 0.000001, 0, 'signup trial credit', now()-interval '3 hours', now()-interval '1 minute')`, usage: true, state: "expired"},
+		{name: "stripe activation", grant: `INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason) VALUES ($1, 5, 5, 'signup trial credit')`, activate: true, state: "ended_by_billing_activation"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			teamID := mustCreateTeam(t, ctx, "trial-warning-lifecycle-"+uuid.NewString()[:8])
@@ -135,6 +140,14 @@ func TestTrialCreditWarningLifecycleSuppressesIneligibleTrials(t *testing.T) {
 			if tc.grant != "" {
 				if _, err := testPool.Exec(ctx, tc.grant, teamID); err != nil {
 					t.Fatalf("seed trial grant: %v", err)
+				}
+			}
+			if tc.usage {
+				sandboxID := seedPrivatePreviewSandbox(t, teamID, testDefaultHostID, "trial-lifecycle")
+				if _, err := testPool.Exec(ctx, `
+					INSERT INTO sandbox_compute_billing_interval (sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason)
+					VALUES ($1,$2,2,1024,now()-interval '2 hours',now()-interval '1 hour','paused')`, sandboxID, teamID); err != nil {
+					t.Fatalf("seed trial consumption: %v", err)
 				}
 			}
 			if tc.activate {
@@ -152,8 +165,21 @@ func TestTrialCreditWarningLifecycleSuppressesIneligibleTrials(t *testing.T) {
 			if err != nil {
 				t.Fatalf("GetTeamTrialBalance: %v", err)
 			}
-			if balance.Eligible && balance.State == "active" && balance.RemainingUsd.Valid {
-				t.Fatalf("lifecycle %q remained warning-eligible: state=%q remaining=%v", tc.name, balance.State, balance.RemainingUsd)
+			if balance.State != tc.state {
+				t.Fatalf("trial state = %q, want %q", balance.State, tc.state)
+			}
+			if balance.Eligible != tc.activate {
+				t.Fatalf("trial eligibility = %t, want %t", balance.Eligible, tc.activate)
+			}
+			remaining, err := balance.RemainingUsd.Float64Value()
+			if err != nil || !remaining.Valid || remaining.Float64 != 0 {
+				t.Fatalf("terminal trial remaining = %+v, err = %v, want zero", remaining, err)
+			}
+			if tc.usage {
+				consumed, err := balance.ConsumedUsd.Float64Value()
+				if err != nil || !consumed.Valid || consumed.Float64 < 0.000001 {
+					t.Fatalf("trial consumption = %+v, err = %v, want at least the grant amount", consumed, err)
+				}
 			}
 		})
 	}

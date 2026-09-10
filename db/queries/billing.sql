@@ -1090,11 +1090,28 @@ WHERE trial_credit_warning_state.status = 'pending'
 RETURNING claim_token;
 
 -- name: CompleteTrialCreditWarning :exec
-UPDATE trial_credit_warning_state SET status = 'sent', sent_at = now(), updated_at = now()
+-- A finished recipient loop with rejections is terminal, but not fully sent.
+UPDATE trial_credit_warning_state
+SET status = CASE WHEN EXISTS (
+        SELECT 1 FROM trial_credit_warning_delivery d WHERE d.team_id = sqlc.arg(team_id) AND d.rejected_at IS NOT NULL
+    ) THEN 'suppressed' ELSE 'sent' END,
+    sent_at = CASE WHEN EXISTS (
+        SELECT 1 FROM trial_credit_warning_delivery d WHERE d.team_id = sqlc.arg(team_id) AND d.rejected_at IS NOT NULL
+    ) THEN NULL ELSE now() END,
+    updated_at = now()
 WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.arg(claim_token);
 
 -- name: ListTrialCreditWarningDeliveries :many
-SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = sqlc.arg(team_id);
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = sqlc.arg(team_id) AND sent_at IS NOT NULL;
+
+-- name: ListTrialCreditWarningRejections :many
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = sqlc.arg(team_id) AND rejected_at IS NOT NULL;
+
+-- name: RecordTrialCreditWarningRejection :execrows
+INSERT INTO trial_credit_warning_delivery (team_id, recipient, sent_at, rejected_at)
+SELECT s.team_id, sqlc.arg(recipient)::text, NULL, now() FROM trial_credit_warning_state s
+WHERE s.team_id = sqlc.arg(team_id) AND s.status = 'claimed' AND s.claim_token = sqlc.arg(claim_token)
+ON CONFLICT (team_id, recipient) DO NOTHING;
 
 -- name: RecordTrialCreditWarningDelivery :execrows
 INSERT INTO trial_credit_warning_delivery (team_id, recipient)

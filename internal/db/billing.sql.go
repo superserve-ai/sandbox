@@ -284,7 +284,14 @@ func (q *Queries) ClaimTrialCreditWarning(ctx context.Context, teamID uuid.UUID)
 }
 
 const completeTrialCreditWarning = `-- name: CompleteTrialCreditWarning :exec
-UPDATE trial_credit_warning_state SET status = 'sent', sent_at = now(), updated_at = now()
+UPDATE trial_credit_warning_state
+SET status = CASE WHEN EXISTS (
+        SELECT 1 FROM trial_credit_warning_delivery d WHERE d.team_id = $1 AND d.rejected_at IS NOT NULL
+    ) THEN 'suppressed' ELSE 'sent' END,
+    sent_at = CASE WHEN EXISTS (
+        SELECT 1 FROM trial_credit_warning_delivery d WHERE d.team_id = $1 AND d.rejected_at IS NOT NULL
+    ) THEN NULL ELSE now() END,
+    updated_at = now()
 WHERE team_id = $1 AND status = 'claimed' AND claim_token = $2
 `
 
@@ -293,6 +300,7 @@ type CompleteTrialCreditWarningParams struct {
 	ClaimToken pgtype.UUID `json:"claim_token"`
 }
 
+// A finished recipient loop with rejections is terminal, but not fully sent.
 func (q *Queries) CompleteTrialCreditWarning(ctx context.Context, arg CompleteTrialCreditWarningParams) error {
 	_, err := q.db.Exec(ctx, completeTrialCreditWarning, arg.TeamID, arg.ClaimToken)
 	return err
@@ -1807,11 +1815,35 @@ func (q *Queries) ListTeamsWithActiveTrialSandboxes(ctx context.Context, arg Lis
 }
 
 const listTrialCreditWarningDeliveries = `-- name: ListTrialCreditWarningDeliveries :many
-SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = $1
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = $1 AND sent_at IS NOT NULL
 `
 
 func (q *Queries) ListTrialCreditWarningDeliveries(ctx context.Context, teamID uuid.UUID) ([]string, error) {
 	rows, err := q.db.Query(ctx, listTrialCreditWarningDeliveries, teamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var recipient string
+		if err := rows.Scan(&recipient); err != nil {
+			return nil, err
+		}
+		items = append(items, recipient)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTrialCreditWarningRejections = `-- name: ListTrialCreditWarningRejections :many
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = $1 AND rejected_at IS NOT NULL
+`
+
+func (q *Queries) ListTrialCreditWarningRejections(ctx context.Context, teamID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listTrialCreditWarningRejections, teamID)
 	if err != nil {
 		return nil, err
 	}
@@ -2223,6 +2255,27 @@ type RecordTrialCreditWarningDeliveryParams struct {
 
 func (q *Queries) RecordTrialCreditWarningDelivery(ctx context.Context, arg RecordTrialCreditWarningDeliveryParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordTrialCreditWarningDelivery, arg.Recipient, arg.TeamID, arg.ClaimToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordTrialCreditWarningRejection = `-- name: RecordTrialCreditWarningRejection :execrows
+INSERT INTO trial_credit_warning_delivery (team_id, recipient, sent_at, rejected_at)
+SELECT s.team_id, $1::text, NULL, now() FROM trial_credit_warning_state s
+WHERE s.team_id = $2 AND s.status = 'claimed' AND s.claim_token = $3
+ON CONFLICT (team_id, recipient) DO NOTHING
+`
+
+type RecordTrialCreditWarningRejectionParams struct {
+	Recipient  string      `json:"recipient"`
+	TeamID     uuid.UUID   `json:"team_id"`
+	ClaimToken pgtype.UUID `json:"claim_token"`
+}
+
+func (q *Queries) RecordTrialCreditWarningRejection(ctx context.Context, arg RecordTrialCreditWarningRejectionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordTrialCreditWarningRejection, arg.Recipient, arg.TeamID, arg.ClaimToken)
 	if err != nil {
 		return 0, err
 	}

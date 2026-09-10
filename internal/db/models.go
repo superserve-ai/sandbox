@@ -912,9 +912,10 @@ type TemplateBuild struct {
 }
 
 type TrialCreditWarningDelivery struct {
-	TeamID    uuid.UUID `json:"team_id"`
-	Recipient string    `json:"recipient"`
-	SentAt    time.Time `json:"sent_at"`
+	TeamID     uuid.UUID          `json:"team_id"`
+	Recipient  string             `json:"recipient"`
+	SentAt     pgtype.Timestamptz `json:"sent_at"`
+	RejectedAt pgtype.Timestamptz `json:"rejected_at"`
 }
 
 type TrialCreditWarningState struct {

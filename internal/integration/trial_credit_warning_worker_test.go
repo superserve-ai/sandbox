@@ -393,3 +393,84 @@ func (q warningDispatchScope) Query(ctx context.Context, sql string, args ...any
 	}
 	return q.Pool.Query(ctx, sql, args...)
 }
+
+func TestTrialWarningWorkerPermanentRejectionDoesNotBlockRecipients(t *testing.T) {
+	for _, allRejected := range []bool{false, true} {
+		t.Run(fmt.Sprintf("all_rejected=%t", allRejected), func(t *testing.T) {
+			ctx := context.Background()
+			team := seedWarningWorkerTeam(t)
+			for i := 0; i < 3; i++ {
+				owner := seedRBACProfile(t)
+				seedMembership(t, ctx, team, owner)
+				seedTeamRoleAssignment(t, ctx, owner, mustRoleID(t, ctx, "team_owner"), team)
+			}
+			calls := map[string]int{}
+			total := 0
+			var rejectedRecipient string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct{ To string }
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+				}
+				total++
+				calls[body.To]++
+				if total == 1 {
+					rejectedRecipient = body.To
+				}
+				if allRejected || body.To == rejectedRecipient {
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					_, _ = fmt.Fprint(w, `{"name":"validation_error"}`)
+					return
+				}
+				if total == 3 {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer server.Close()
+			run := func() {
+				h := &api.Handlers{DB: testQueries, TrialWarningSender: api.NewTrialCreditWarningSenderForTest(testQueries, server.URL, server.Client())}
+				api.ProcessTrialCreditWarningForTest(h, ctx, team)
+			}
+			run()
+			wantStatus, wantSent, wantRejected := "pending", 1, 1
+			if allRejected {
+				wantStatus, wantSent, wantRejected = "suppressed", 0, 3
+			}
+			if total != 3 || warningStatus(t, team) != wantStatus {
+				t.Fatalf("first pass: calls=%d status=%s", total, warningStatus(t, team))
+			}
+			assertOutcomes := func(sentCount, rejectedCount int) {
+				t.Helper()
+				sent, err := testQueries.ListTrialCreditWarningDeliveries(ctx, team)
+				if err != nil || len(sent) != sentCount {
+					t.Fatalf("sent=%v err=%v, want %d", sent, err, sentCount)
+				}
+				rejected, err := testQueries.ListTrialCreditWarningRejections(ctx, team)
+				if err != nil || len(rejected) != rejectedCount {
+					t.Fatalf("rejected=%v err=%v, want %d", rejected, err, rejectedCount)
+				}
+				for _, recipient := range sent {
+					if recipient == rejectedRecipient {
+						t.Fatal("rejected recipient marked sent")
+					}
+				}
+			}
+			assertOutcomes(wantSent, wantRejected)
+			run()
+			if got := warningStatus(t, team); got != "suppressed" {
+				t.Fatalf("final status=%s, want suppressed", got)
+			}
+			wantCalls := 3
+			if !allRejected {
+				wantCalls, wantSent = 4, 2
+			}
+			run()
+			if total != wantCalls || calls[rejectedRecipient] != 1 {
+				t.Fatalf("unexpected retries: total=%d by recipient=%v", total, calls)
+			}
+			assertOutcomes(wantSent, wantRejected)
+		})
+	}
+}

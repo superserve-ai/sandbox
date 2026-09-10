@@ -121,9 +121,16 @@ func (s *ResendTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Cont
 	if err != nil {
 		return err
 	}
-	sent := make(map[string]bool, len(delivered))
+	resolved := make(map[string]bool, len(delivered))
 	for _, recipient := range delivered {
-		sent[recipient] = true
+		resolved[recipient] = true
+	}
+	rejected, err := s.queries.ListTrialCreditWarningRejections(ctx, teamID)
+	if err != nil {
+		return err
+	}
+	for _, recipient := range rejected {
+		resolved[recipient] = true
 	}
 	recipients, err := s.queries.ListTrialCreditWarningRecipients(ctx, teamID)
 	if err != nil {
@@ -140,14 +147,28 @@ func (s *ResendTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Cont
 	// Submit one message per recipient. Resend's `to` array is rendered as a
 	// shared To header, which would disclose other billing members' addresses.
 	for _, recipient := range recipients {
-		if sent[recipient] {
+		if resolved[recipient] {
 			continue
 		}
 		payload, _ := json.Marshal(map[string]any{"from": s.from, "to": recipient, "subject": "Your trial credit may run out soon", "html": trialCreditWarningHTML(team.Name, remaining)})
 		// Provider identity uses the recipient, independent of list order.
-		// Persisted acceptance above suppresses duplicates across new claims.
+		// Persisted recipient outcomes suppress repeats across new claims.
 		if err := s.sendEmailWithKey(ctx, payload, claimToken, recipient); err != nil {
-			return err
+			var permanent *permanentTrialCreditWarningError
+			if !errors.As(err, &permanent) {
+				return err
+			}
+			rows, recordErr := s.queries.RecordTrialCreditWarningRejection(ctx, db.RecordTrialCreditWarningRejectionParams{
+				TeamID: teamID, Recipient: recipient, ClaimToken: pgtype.UUID{Bytes: claimToken, Valid: true},
+			})
+			if recordErr != nil {
+				return &unknownTrialCreditWarningError{err: fmt.Errorf("record trial warning rejection: %w", recordErr)}
+			}
+			if rows != 1 {
+				return &unknownTrialCreditWarningError{err: errors.New("trial warning rejection claim no longer current")}
+			}
+			log.Warn().Err(err).Str("team_id", teamID.String()).Msg("trial credit warning recipient permanently rejected; not retrying")
+			continue
 		}
 		rows, err := s.queries.RecordTrialCreditWarningDelivery(ctx, db.RecordTrialCreditWarningDeliveryParams{
 			TeamID: teamID, Recipient: recipient, ClaimToken: pgtype.UUID{Bytes: claimToken, Valid: true},
@@ -198,8 +219,24 @@ func (s *ResendTrialCreditWarningSender) sendEmailWithKey(ctx context.Context, p
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	return fmt.Errorf("resend returned %d: %s", resp.StatusCode, string(body))
+	var providerError struct {
+		Name string `json:"name"`
+	}
+	_ = json.Unmarshal(body, &providerError)
+	err = fmt.Errorf("resend returned %d (%s)", resp.StatusCode, providerError.Name)
+	// Keep recoverable provider configuration errors retryable, as in the quota notifier.
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 &&
+		resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden &&
+		resp.StatusCode != http.StatusTooManyRequests && providerError.Name != "invalid_from_address" {
+		return &permanentTrialCreditWarningError{err: err}
+	}
+	return err
 }
+
+type permanentTrialCreditWarningError struct{ err error }
+
+func (e *permanentTrialCreditWarningError) Error() string { return e.err.Error() }
+func (e *permanentTrialCreditWarningError) Unwrap() error { return e.err }
 
 // UnknownTrialCreditWarningOutcome indicates that delivery may have been
 // accepted despite the returned error (for example, a timeout after submit).
@@ -288,12 +325,12 @@ func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UU
 	// a warning for a no-longer-active trial.
 	latest, err := h.DB.GetTeamTrialBalance(ctx, teamID)
 	if err != nil || !trialCreditWarningLifecycleEligible(latest.Eligible, latest.State) {
-		_ = h.DB.ReleaseTrialCreditWarning(ctx, db.ReleaseTrialCreditWarningParams{TeamID: teamID, ClaimToken: claimToken})
+		h.releaseTrialCreditWarning(teamID, claimToken)
 		return
 	}
 	latestRemaining, err := numericFloat(latest.RemainingUsd)
 	if err != nil || latestRemaining <= 0 {
-		_ = h.DB.ReleaseTrialCreditWarning(ctx, db.ReleaseTrialCreditWarningParams{TeamID: teamID, ClaimToken: claimToken})
+		h.releaseTrialCreditWarning(teamID, claimToken)
 		return
 	}
 	remaining = latestRemaining
@@ -307,12 +344,21 @@ func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UU
 		if errors.As(err, &unknown) && unknown.UnknownTrialCreditWarning() {
 			_ = h.DB.MarkTrialCreditWarningUnknown(ctx, db.MarkTrialCreditWarningUnknownParams{TeamID: teamID, ClaimToken: claimToken})
 		} else {
-			_ = h.DB.ReleaseTrialCreditWarning(ctx, db.ReleaseTrialCreditWarningParams{TeamID: teamID, ClaimToken: claimToken})
+			h.releaseTrialCreditWarning(teamID, claimToken)
 		}
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("trial credit warning send failed")
 		return
 	}
 	_ = h.DB.CompleteTrialCreditWarning(ctx, db.CompleteTrialCreditWarningParams{TeamID: teamID, ClaimToken: claimToken})
+}
+
+func (h *Handlers) releaseTrialCreditWarning(teamID uuid.UUID, claimToken pgtype.UUID) {
+	// Definitive failures must remain retryable even after the work context expires.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.DB.ReleaseTrialCreditWarning(ctx, db.ReleaseTrialCreditWarningParams{TeamID: teamID, ClaimToken: claimToken}); err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("trial credit warning claim release failed")
+	}
 }
 
 // Keep the final lifecycle gate adjacent to delivery so an exhausted or

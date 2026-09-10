@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"io"
 	"math/big"
@@ -20,6 +22,79 @@ func TestTrialCreditWarningWithoutSenderSkipsDatabase(t *testing.T) {
 	// A query through this unconnected database would panic.
 	h := &Handlers{DB: db.New(nil)}
 	h.processTrialCreditWarning(context.Background(), uuid.New())
+}
+
+func TestTrialCreditWarningCancellationReleasesClaimForRetry(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	teamID := uuid.New()
+	claimToken := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	status := "pending"
+	balanceReads, releases := 0, 0
+	now := time.Now()
+	queries := &mockDBTX{
+		queryRowFn: func(queryCtx context.Context, sql string, args ...any) pgx.Row {
+			return &mockRow{scanFn: func(dest ...any) error {
+				switch {
+				case strings.Contains(sql, "-- name: GetTeamTrialBalance"):
+					balanceReads++
+					if balanceReads == 2 {
+						cancel()
+						return queryCtx.Err()
+					}
+					*dest[2].(*pgtype.Numeric) = pgtype.Numeric{Int: big.NewInt(1), Valid: true}
+					*dest[3].(*string) = "active"
+					*dest[4].(*bool) = true
+				case strings.Contains(sql, "-- name: GetRecentTrialBurnSample"):
+					*dest[0].(*pgtype.Numeric) = pgtype.Numeric{Int: big.NewInt(10), Valid: true}
+					*dest[1].(*any) = now.Add(-time.Hour)
+					*dest[2].(*any) = now
+					*dest[3].(*pgtype.Numeric) = pgtype.Numeric{Int: big.NewInt(3600), Valid: true}
+				case strings.Contains(sql, "-- name: ClaimTrialCreditWarning"):
+					if status != "pending" {
+						return pgx.ErrNoRows
+					}
+					status = "claimed"
+					*dest[0].(*pgtype.UUID) = claimToken
+				default:
+					t.Fatalf("unexpected query: %s", sql)
+				}
+				return nil
+			}}
+		},
+		execFn: func(cleanupCtx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			if err := cleanupCtx.Err(); err != nil {
+				return pgconn.CommandTag{}, err
+			}
+			if args[0] != teamID || args[1] != claimToken || status != "claimed" {
+				t.Fatalf("unexpected claim mutation: args=%v status=%s", args, status)
+			}
+			switch {
+			case strings.Contains(sql, "-- name: ReleaseTrialCreditWarning"):
+				deadline, ok := cleanupCtx.Deadline()
+				if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > 5*time.Second {
+					t.Fatal("claim release requires a fresh bounded context")
+				}
+				releases++
+				status = "pending"
+			case strings.Contains(sql, "-- name: CompleteTrialCreditWarning"):
+				status = "sent"
+			default:
+				t.Fatalf("unexpected execution: %s", sql)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	sender := &recordingTrialWarningSender{}
+	h := &Handlers{DB: db.New(queries), TrialWarningSender: sender}
+	h.processTrialCreditWarning(ctx, teamID)
+	if status != "pending" || releases != 1 || sender.teamID != uuid.Nil {
+		t.Fatalf("canceled pass: status=%s releases=%d sent team=%v", status, releases, sender.teamID)
+	}
+	h.processTrialCreditWarning(context.Background(), teamID)
+	if status != "sent" || sender.teamID != teamID || sender.remaining != 1 {
+		t.Fatalf("retry: status=%s sender=%+v", status, sender)
+	}
 }
 
 type recordingTrialWarningSender struct {
@@ -295,5 +370,36 @@ func TestTrialWarningProviderIdentityFollowsRecipient(t *testing.T) {
 	}
 	if len(keys) != 4 || keys[0] == "" || keys[1] == "" || keys[0] == keys[1] || keys[0] != keys[3] || keys[1] != keys[2] {
 		t.Fatalf("provider keys must distinguish recipients and survive reordering: %v", keys)
+	}
+}
+
+func TestTrialCreditWarningProviderRejectionClassification(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int
+		body      string
+		permanent bool
+	}{
+		{"invalid recipient", 422, `{"name":"validation_error"}`, true},
+		{"bad request", 400, `{"name":"validation_error"}`, true},
+		{"invalid sender", 422, `{"name":"invalid_from_address"}`, false},
+		{"unauthorized", 401, `{}`, false},
+		{"forbidden", 403, `{}`, false},
+		{"rate limited", 429, `{}`, false},
+		{"unavailable", 503, `{}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+			sender := &ResendTrialCreditWarningSender{endpoint: server.URL, client: server.Client()}
+			err := sender.sendEmail(context.Background(), []byte(`{}`))
+			var permanent *permanentTrialCreditWarningError
+			if err == nil || errors.As(err, &permanent) != tc.permanent {
+				t.Fatalf("error = %v, want permanent=%t", err, tc.permanent)
+			}
+		})
 	}
 }
