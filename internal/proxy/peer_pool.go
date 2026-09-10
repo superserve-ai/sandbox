@@ -723,6 +723,13 @@ func (h *hostPool) close(deadline time.Time) {
 		h.eviction.Stop()
 	}
 	h.mu.Unlock()
+	// A stream may have claimed removal but still be finishing callbacks.
+	// Shutdown must close its transport even while that cleanup is pending.
+	defer func() {
+		for _, c := range cs {
+			c.close()
+		}
+	}()
 	if dialDone != nil {
 		timer := time.NewTimer(max(time.Until(deadline), 0))
 		select {
