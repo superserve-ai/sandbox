@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -13,51 +14,47 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
-	"github.com/superserve-ai/sandbox/proto/peerpb"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 )
 
-// The test ingress forwards frames to a real HTTP listener, matching the
-// fixed-target Forward RPC contract without interpreting application bytes.
-type httpTestPeerIngress struct {
-	peerpb.UnimplementedPeerProxyServer
-	target string
+func startRoutingTestPeer(t *testing.T, target string) (PeerTransport, string) {
+	t.Helper()
+	cfg := peerTestCredentials(t)
+	tlsConfig, err := cfg.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ServePeerListener(ctx, listener, tlsConfig, target, zerolog.Nop()) }()
+	peers := NewPeerTransport(PeerPoolConfig{Dial: GRPCPeerDialer(cfg.LoadClient)})
+	t.Cleanup(func() {
+		peers.Close()
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("peer shutdown: %v", err)
+			}
+		case <-time.After(6 * time.Second):
+			t.Error("peer shutdown timed out")
+		}
+	})
+	return peers, listener.Addr().String()
 }
 
-func (s httpTestPeerIngress) Forward(stream grpc.BidiStreamingServer[peerpb.PeerProxyFrame, peerpb.PeerProxyFrame]) error {
-	conn, err := net.Dial("tcp", s.target)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	go func() {
-		for {
-			frame, err := stream.Recv()
-			if err != nil {
-				_ = conn.(*net.TCPConn).CloseWrite()
-				return
-			}
-			if _, err := conn.Write(frame.Data); err != nil {
-				return
-			}
-		}
-	}()
-	buffer := make([]byte, 4096)
-	for {
-		n, err := conn.Read(buffer)
-		if n > 0 {
-			if err := stream.Send(&peerpb.PeerProxyFrame{Data: append([]byte(nil), buffer[:n]...)}); err != nil {
-				return err
-			}
-		}
-		if err == io.EOF {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-	}
+func startRoutingTestOwner(t *testing.T, upstream *httptest.Server) (PeerTransport, string, string) {
+	t.Helper()
+	port := upstream.Listener.Addr().(*net.TCPAddr).Port
+	local := httptest.NewServer(NewHandler([]string{"sandbox.test"}, &stubResolver{
+		info: InstanceInfo{VMIP: "127.0.0.1", Status: "running"},
+	}, zerolog.Nop()))
+	t.Cleanup(local.Close)
+	peers, addr := startRoutingTestPeer(t, local.Listener.Addr().String())
+	return peers, addr, fmt.Sprintf("%d-12345678-1234-1234-1234-123456789abc.sandbox.test", port)
 }
 
 func TestRoutingHandlerHTTPBodiesOverMTLS(t *testing.T) {
@@ -68,41 +65,35 @@ func TestRoutingHandlerHTTPBodiesOverMTLS(t *testing.T) {
 			http.Error(w, "invalid body", 400)
 			return
 		}
-		if r.URL.Path == "/chunked" && r.Trailer.Get("X-Checksum") != "complete" {
+		if r.URL.Path == "/chunked-with-trailers" && r.Trailer.Get("X-Checksum") != "complete" {
 			http.Error(w, "missing trailer", 400)
 			return
 		}
 		_, _ = w.Write(body)
 	}))
 	defer target.Close()
-	cfg := peerTestCredentials(t)
-	tlsConfig, err := cfg.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsConfig)))
-	peerpb.RegisterPeerProxyServer(server, httpTestPeerIngress{target: strings.TrimPrefix(target.URL, "http://")})
-	go server.Serve(listener)
-	defer server.Stop()
-	peers := NewPeerTransport(PeerPoolConfig{Dial: GRPCPeerDialer(cfg.LoadClient)})
-	defer peers.Close()
+	peers, peerAddr, sandboxHost := startRoutingTestOwner(t, target)
 	router := httptest.NewServer(NewRoutingHandler([]string{"sandbox.test"}, "host-a", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
-		return SandboxRoute{HostID: "host-b", ProxyAddr: listener.Addr().String()}, nil
+		return SandboxRoute{HostID: "host-b", ProxyAddr: peerAddr}, nil
 	}), peers, http.NotFoundHandler(), zerolog.Nop()))
 	defer router.Close()
-	for _, framing := range []string{"length", "chunked"} {
+	directPeers, directAddr := startRoutingTestPeer(t, target.Listener.Addr().String())
+	directRouter := httptest.NewServer(NewRoutingHandler([]string{"sandbox.test"}, "host-a", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+		return SandboxRoute{HostID: "host-b", ProxyAddr: directAddr}, nil
+	}), directPeers, http.NotFoundHandler(), zerolog.Nop()))
+	defer directRouter.Close()
+	for _, framing := range []string{"length", "chunked", "chunked-with-trailers"} {
 		t.Run(framing, func(t *testing.T) {
-			req, err := http.NewRequest(http.MethodPost, router.URL+"/"+framing, bytes.NewReader(payload))
+			routerURL := router.URL
+			if framing == "chunked-with-trailers" {
+				routerURL = directRouter.URL
+			}
+			req, err := http.NewRequest(http.MethodPost, routerURL+"/"+framing, bytes.NewReader(payload))
 			if err != nil {
 				t.Fatal(err)
 			}
-			req.Host = "sandbox.test"
-			req.Header.Set(headerSandboxID, "sandbox-1")
-			if framing == "chunked" {
+			req.Host = sandboxHost
+			if framing != "length" {
 				req.ContentLength = -1
 				req.Trailer = http.Header{"X-Checksum": {"complete"}}
 			}
@@ -134,12 +125,10 @@ func TestRoutingHandlerUpgradeBufferedBytes(t *testing.T) {
 		}
 	}))
 	defer target.Close()
-	peers := routePeerFunc(func(ctx context.Context, _, addr string) (PeerStream, error) {
-		conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
-		return pipePeer{conn}, err
-	})
+	peers, peerAddr := startRoutingTestPeer(t, target.Listener.Addr().String())
+	sandboxHost := "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
 	router := httptest.NewServer(NewRoutingHandler([]string{"sandbox.test"}, "host-a", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
-		return SandboxRoute{HostID: "host-b", ProxyAddr: strings.TrimPrefix(target.URL, "http://")}, nil
+		return SandboxRoute{HostID: "host-b", ProxyAddr: peerAddr}, nil
 	}), peers, http.NotFoundHandler(), zerolog.Nop()))
 	defer router.Close()
 	conn, err := net.Dial("tcp", strings.TrimPrefix(router.URL, "http://"))
@@ -148,7 +137,7 @@ func TestRoutingHandlerUpgradeBufferedBytes(t *testing.T) {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	_, _ = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: sandbox.test\r\n"+headerSandboxID+": sandbox-1\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\nping")
+	_, _ = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: "+sandboxHost+"\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\nping")
 	reader := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(reader, nil)
 	if err != nil {

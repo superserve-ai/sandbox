@@ -147,8 +147,10 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 		if upgrade {
 			// Hijack may have already buffered bytes after the HTTP request.
 			_, _ = io.Copy(stream, buffered.Reader)
+			_ = stream.CloseSend()
 		}
-		_ = stream.CloseSend()
+		// HTTP framing ends the body. A TCP half-close at the destination would
+		// cancel net/http's request context before its reverse proxy responds.
 	}()
 	go func() {
 		defer wg.Done()

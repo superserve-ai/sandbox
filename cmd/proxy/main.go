@@ -44,14 +44,7 @@ func main() {
 	}
 
 	addr := envOrDefault("PROXY_ADDR", ":5007")
-	localAddr, err := loopbackAddr(envOrDefault("PEER_PROXY_TARGET_ADDR", "127.0.0.1:5010"))
-	if err != nil {
-		log.Fatal().Err(err).Msg("PEER_PROXY_TARGET_ADDR must be loopback-only")
-	}
 	redirectAddr := envOrDefault("PROXY_REDIRECT_ADDR", ":5008")
-	if err := validateListenerSeparation(localAddr, addr, redirectAddr); err != nil {
-		log.Fatal().Err(err).Msg("peer target listener must be distinct from public listeners")
-	}
 	vmdAddr := envOrDefault("VMD_ADDR", "http://127.0.0.1:9090")
 	domains := proxyDomains()
 	if legacy := os.Getenv("PROXY_DOMAIN"); legacy != "" && !slices.Contains(domains, legacy) {
@@ -178,14 +171,20 @@ func main() {
 	// Health check for the GCP LB and VMD's end-to-end capability probe.
 	// It only responds on non-sandbox hosts so the boxd-label lockdown isn't
 	// bypassed.
-	mux := newProxyMux(proxyHandler)
+	peerTLS, peers, err := newOutboundPeerTransport(log, peerTelemetry)
+	if err != nil {
+		log.Fatal().Err(err).Msg("invalid peer client credentials")
+	}
+	defer peers.Close()
+	router := proxy.NewRoutingHandler(domains, os.Getenv("HOST_ID"), ownership, peers, proxyHandler, log, routingRecorder)
+	mux, localMux := newDataPlaneMuxes(proxyHandler, router)
 	var localSrv *http.Server
 	var localErr <-chan error
 	if peerAddr := os.Getenv("PEER_PROXY_LISTEN_ADDR"); peerIngressEnabled(peerAddr) {
 		if err := validatePeerListener(peerAddr, addr, redirectAddr); err != nil {
 			log.Fatal().Err(err).Msg("invalid PEER_PROXY_LISTEN_ADDR")
 		}
-		cfg, err := (proxy.PeerTLSConfig{CertFile: os.Getenv("PEER_PROXY_CERT_FILE"), KeyFile: os.Getenv("PEER_PROXY_KEY_FILE"), CAFile: os.Getenv("PEER_PROXY_CA_FILE"), ExpectedSPIFFE: os.Getenv("PEER_PROXY_SPIFFE_URI"), Log: log}).Load()
+		cfg, err := peerTLS.Load()
 		if err != nil {
 			log.Fatal().Err(err).Msg("peer TLS setup failed")
 		}
@@ -194,12 +193,15 @@ func main() {
 			log.Fatal().Msg("PEER_PROXY_MAX_STREAMS must be a positive 32-bit integer")
 		}
 		target := envOrDefault("PEER_PROXY_TARGET_ADDR", "127.0.0.1:5010")
+		if err := validateListenerPorts(target, peerAddr, redirectAddr); err != nil {
+			log.Fatal().Err(err).Msg("peer target shares an ingress port")
+		}
 		localListener, err := bindLocalPeerTarget(target, addr, redirectAddr)
 		if err != nil {
 			log.Fatal().Err(err).Msg("local peer target bind failed")
 		}
 		// Peer traffic terminates at the local handler, never the public router.
-		localSrv = proxy.NewServer(target, newProxyMux(proxyHandler))
+		localSrv = proxy.NewServer(target, localMux)
 		localErrCh := make(chan error, 1)
 		localErr = localErrCh
 		go func() {
@@ -318,7 +320,7 @@ func validateListenerPorts(peerAddr, publicAddr, redirectAddr string) error {
 }
 
 // peerIngressEnabled keeps the optional listener gated solely by its explicit
-// address. Disabled proxy hosts must not attempt to load peer credentials.
+// address. Outbound client credentials remain mandatory when ingress is disabled.
 func peerIngressEnabled(addr string) bool { return addr != "" }
 
 type proxyHealthResponse struct {
@@ -339,7 +341,7 @@ func newProxyMuxWithHandler(proxyHandler *proxy.Handler, dataPlane http.Handler)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if proxyHandler.ServesHost(r.Host) {
-			proxyHandler.ServeHTTP(w, r)
+			dataPlane.ServeHTTP(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -380,4 +382,12 @@ func splitCSV(v string) []string {
 		}
 	}
 	return out
+}
+
+func newOutboundPeerTransport(log zerolog.Logger, recorder proxy.PeerPoolTelemetry) (proxy.PeerTLSConfig, proxy.PeerTransport, error) {
+	cfg := proxy.PeerTLSConfig{CertFile: os.Getenv("PEER_PROXY_CERT_FILE"), KeyFile: os.Getenv("PEER_PROXY_KEY_FILE"), CAFile: os.Getenv("PEER_PROXY_CA_FILE"), ExpectedSPIFFE: os.Getenv("PEER_PROXY_SPIFFE_URI"), Log: log}
+	if _, err := cfg.LoadClient(); err != nil {
+		return cfg, nil, err
+	}
+	return cfg, proxy.NewPeerTransport(proxy.PeerPoolConfig{Dial: proxy.GRPCPeerDialer(cfg.LoadClient), Telemetry: recorder}), nil
 }

@@ -81,14 +81,6 @@ def main() -> int:
     if require_data_plane not in ("", "0", "1"):
         print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
         return 1
-    peer_proxy_target_addr = os.environ.get("PEER_PROXY_TARGET_ADDR", "127.0.0.1:5010")
-    if not re.fullmatch(r"(?:127\.0\.0\.1|localhost|\[::1\]):[0-9]{1,5}", peer_proxy_target_addr):
-        print("ERROR: PEER_PROXY_TARGET_ADDR must be a loopback host:port", file=sys.stderr)
-        return 1
-    peer_spiffe_uri = os.environ.get("PEER_PROXY_SPIFFE_URI", "")
-    if not re.fullmatch(r"spiffe://[A-Za-z0-9./_:-]+", peer_spiffe_uri):
-        print("ERROR: PEER_PROXY_SPIFFE_URI is required and must be a SPIFFE URI", file=sys.stderr)
-        return 1
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     peer_identity_hosts = set(filter(None, (host.strip() for host in
         os.environ.get("PEER_IDENTITY_HOSTS", "").split(","))))
@@ -388,8 +380,6 @@ def main() -> int:
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
             DATABASE_URL={shlex.quote(database_url)}
-            PEER_PROXY_TARGET_ADDR={peer_proxy_target_addr}
-            PEER_PROXY_SPIFFE_URI={peer_spiffe_uri}
             SENTRY_DSN={sentry_dsn}
             PEER_PROXY_LISTEN_ADDR=$peer_listen_addr
             PEER_PROXY_TARGET_ADDR={peer_env['PEER_PROXY_TARGET_ADDR']}
