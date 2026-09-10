@@ -1611,7 +1611,10 @@ SET snapshot_id = (SELECT snap_id FROM upserted),
     -- leaves the deadline NULL (never deleted).
     auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
     updated_at = now(),
-    pause_op_lease_until = NULL
+    -- The operation is complete: clear it so nothing can claim this row
+    -- under its identity later. Its token lives on with the snapshot.
+    pause_op_id = NULL, pause_op_started_at = NULL,
+    pause_op_lease_until = NULL, pause_op_attention_at = NULL
 FROM upserted
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
@@ -1742,7 +1745,10 @@ SET snapshot_id = (SELECT snap_id FROM inserted),
     status = 'paused',
     auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
     updated_at = now(),
-    pause_op_lease_until = NULL
+    -- The operation is complete: clear it so nothing can claim this row
+    -- under its identity later. Its token lives on with the snapshot.
+    pause_op_id = NULL, pause_op_started_at = NULL,
+    pause_op_lease_until = NULL, pause_op_attention_at = NULL
 FROM inserted
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
@@ -2578,7 +2584,8 @@ WITH failed AS (
   -- and a stale one would resurface (or instantly fire) if the sandbox is
   -- ever returned to 'paused' by a recovery path.
   SET status = 'failed', auto_delete_at = NULL, updated_at = now(),
-      pause_op_lease_until = NULL
+      pause_op_id = NULL, pause_op_started_at = NULL,
+      pause_op_lease_until = NULL, pause_op_attention_at = NULL
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
     AND sandbox.status = $2
     -- A pause worker may only fail the operation it holds the lease on.
@@ -2747,7 +2754,8 @@ WITH reverted AS (
   SET status = 'active', updated_at = now(),
       -- The pause is over: drop its identity so a result that arrives late
       -- for it can no longer match this row.
-      pause_op_id = NULL, pause_op_lease_until = NULL
+      pause_op_id = NULL, pause_op_started_at = NULL,
+      pause_op_lease_until = NULL, pause_op_attention_at = NULL
   WHERE sandbox.id = $1
     AND sandbox.team_id = $2
     AND sandbox.destroyed_at IS NULL

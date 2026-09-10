@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -228,34 +229,46 @@ dispatch:
 }
 
 func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism int, logger zerolog.Logger) {
-	// Each claim (one CTE+UPDATE, FOR UPDATE SKIP LOCKED across replicas)
-	// takes only what can be dispatched at once: a claimed row that waited
-	// for a worker would burn its lease in the queue. batchSize caps a tick.
-	for claimed := int32(0); claimed < batchSize && ctx.Err() == nil; {
-		want := min(int32(parallelism), batchSize-claimed)
-		claimedAt := time.Now()
-		queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
-		expired, err := h.DB.ClaimExpiredSandboxes(queryCtx, db.ClaimExpiredSandboxesParams{
-			Limit:        want,
-			LeaseSeconds: pauseLeaseSeconds,
-		})
-		queryCancel()
+	claimEach(ctx, parallelism, batchSize, func(ctx context.Context, n int32) ([]db.ClaimExpiredSandboxesRow, error) {
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		rows, err := h.DB.ClaimExpiredSandboxes(qctx, db.ClaimExpiredSandboxesParams{Limit: n, LeaseSeconds: pauseLeaseSeconds})
 		if err != nil {
 			logger.Error().Err(err).Msg("reaper: ClaimExpiredSandboxes failed")
-			return
 		}
-		if len(expired) == 0 {
-			return
-		}
-		logger.Info().Int("count", len(expired)).Msg("reaper: pausing expired sandboxes")
-		dispatchBounded(ctx, expired, parallelism, func(sbx db.ClaimExpiredSandboxesRow) {
-			h.pauseExpired(ctx, sbx, claimedAt, logger)
-		})
-		claimed += int32(len(expired))
-		if int32(len(expired)) < want {
-			return
-		}
+		return rows, err
+	}, func(sbx db.ClaimExpiredSandboxesRow, claimedAt time.Time) {
+		h.pauseExpired(ctx, sbx, claimedAt, logger)
+	})
+}
+
+// claimEach runs workers that each claim one row at a time and process it:
+// a slow row never idles the others, and no claimed row waits in a queue
+// burning its lease. Stops when a claim comes back empty or fails, when ctx
+// ends, or once limit claims have been made in this call.
+func claimEach[T any](ctx context.Context, workers int, limit int32, claim func(ctx context.Context, n int32) ([]T, error), process func(row T, claimedAt time.Time)) {
+	var claims atomic.Int32
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ctx.Err() == nil && claims.Add(1) <= limit {
+				claimedAt := time.Now()
+				rows, err := claim(ctx, 1)
+				if err != nil || len(rows) == 0 {
+					return
+				}
+				for _, row := range rows {
+					if ctx.Err() != nil {
+						return
+					}
+					process(row, claimedAt)
+				}
+			}
+		}()
 	}
+	wg.Wait()
 }
 
 // sweepOrphanedSnapshotRows deletes snapshot rows for long-destroyed

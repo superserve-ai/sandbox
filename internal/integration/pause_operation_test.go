@@ -157,8 +157,8 @@ func TestIntegration_PauseOperation_FinalizeIsFencedToTheCurrentLease(t *testing
 		t.Fatalf("current finalize: %v", err)
 	}
 	got := readPauseOp(t, id)
-	if got.status != "paused" || got.leased || got.opID.Bytes != op {
-		t.Fatalf("after finalize: %+v, want paused, unleased, operation kept as the token record", got)
+	if got.status != "paused" || got.leased || got.opID.Valid {
+		t.Fatalf("after finalize: %+v, want paused, unleased, operation cleared", got)
 	}
 }
 
@@ -466,4 +466,44 @@ func TestIntegration_PauseOperation_RetryOrderDoesNotStarveNewerRows(t *testing.
 		}
 	}
 	t.Fatal("the healthy row was never claimed")
+}
+
+// A completed pause leaves no operation behind. During a mixed-version
+// rollout an older writer may begin the next pause without minting one; the
+// reconciler must not claim that pause under the previous identity while the
+// older writer's foreground attempt is still running.
+func TestIntegration_PauseOperation_CompletedOperationIsNotReclaimedByALegacyPause(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	id := seedActiveSandbox(t, teamID, "pause-op-legacy-writer")
+	op := uuid.New()
+	beginPause(t, id, teamID, op)
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET pause_op_started_at = now() - interval '5 minutes' WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalize(id, teamID, op, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPauseOp(t, id); got.status != "paused" || got.opID.Valid {
+		t.Fatalf("after finalize: %+v, want paused with no operation left", got)
+	}
+	if _, err := testQueries.BeginResume(ctx, db.BeginResumeParams{ID: id, TeamID: teamID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: id, TeamID: teamID, VcpuCount: 1, MemoryMib: 1024}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The next pause is begun the way a writer without operations does it.
+	tag, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'pausing', updated_at = now()
+		WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'active'`, id, teamID)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("legacy begin: rows=%d err=%v", tag.RowsAffected(), err)
+	}
+
+	for _, row := range claimPending(t) {
+		if row.ID == id {
+			t.Fatalf("claimed an in-flight legacy pause under the completed operation %s", uuid.UUID(row.PauseOpID.Bytes))
+		}
+	}
 }

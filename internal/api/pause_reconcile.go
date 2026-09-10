@@ -64,36 +64,25 @@ func (h *Handlers) StartPauseReconciler(ctx context.Context) {
 }
 
 // ReconcilePendingPausesOnce claims abandoned pauses, at most a batch per tick,
-// and drives each toward a decided state. Each claim takes only what can be
-// dispatched at once: a claimed row that waited for a worker would burn its
+// and drives each toward a decided state. Each worker claims one row at a
+// time (see claimEach): a claimed row that waited for a worker would burn its
 // lease in the queue. Exported so tests can run a tick directly.
 func (h *Handlers) ReconcilePendingPausesOnce(ctx context.Context, logger zerolog.Logger) {
-	for claimed := 0; claimed < int(pauseReconcileBatch) && ctx.Err() == nil; {
-		want := min(pauseReconcileWorkers, int(pauseReconcileBatch)-claimed)
-		claimedAt := time.Now()
-		qctx, qcancel := context.WithTimeout(ctx, 10*time.Second)
+	claimEach(ctx, pauseReconcileWorkers, pauseReconcileBatch, func(ctx context.Context, n int32) ([]db.ClaimPendingPausesRow, error) {
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
 		rows, err := h.DB.ClaimPendingPauses(qctx, db.ClaimPendingPausesParams{
 			LeaseSeconds:  pauseReconcileLease,
 			MinAgeSeconds: pauseReconcileMinAge,
-			MaxRows:       int32(want),
+			MaxRows:       n,
 		})
-		qcancel()
 		if err != nil {
 			logger.Error().Err(err).Msg("pause reconcile: claim failed")
-			return
 		}
-		if len(rows) == 0 {
-			return
-		}
-		logger.Info().Int("count", len(rows)).Msg("pause reconcile: retrying abandoned pauses")
-		dispatchBounded(ctx, rows, pauseReconcileWorkers, func(row db.ClaimPendingPausesRow) {
-			h.reconcilePause(ctx, row, leaseDeadline(row.PauseOpLeaseUntil, claimedAt, pauseReconcileLease), logger)
-		})
-		claimed += len(rows)
-		if len(rows) < want {
-			return
-		}
-	}
+		return rows, err
+	}, func(row db.ClaimPendingPausesRow, claimedAt time.Time) {
+		h.reconcilePause(ctx, row, leaseDeadline(row.PauseOpLeaseUntil, claimedAt, pauseReconcileLease), logger)
+	})
 }
 
 // reconcilePause makes one attempt on a claimed row. leaseUntil is when the

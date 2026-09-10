@@ -3,7 +3,6 @@ package api
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -334,16 +333,19 @@ func TestReaper_DBError(t *testing.T) {
 // TestReaper_BatchSizeRespected verifies that the batch limit is passed to
 // ClaimExpiredSandboxes (the SQL enforces LIMIT, but we confirm the value
 // reaches the query layer).
-// Each claim asks only for what the workers can start at once, and the
-// batch size caps a tick: 7 rows with 3 workers is three claims of 3, 3, 1.
-func TestReaper_ClaimsOnlyWhatItCanDispatch(t *testing.T) {
+// Each worker claims one row at a time, and the batch size caps the tick:
+// 3 workers with a cap of 7 make 7 single-row claims.
+func TestReaper_ClaimsOnePerFreeWorker(t *testing.T) {
 	var mu sync.Mutex
 	var limits []int32
 	var pauses int32
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, args ...any) (pgx.Rows, error) {
+			queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+				if !strings.Contains(sql, "-- name: ClaimExpiredSandboxes ") {
+					return newStubRows(nil), nil
+				}
 				limit := args[0].(int32)
 				mu.Lock()
 				limits = append(limits, limit)
@@ -365,11 +367,80 @@ func TestReaper_ClaimsOnlyWhatItCanDispatch(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if fmt.Sprint(limits) != "[3 3 1]" {
-		t.Fatalf("claim limits = %v, want [3 3 1]", limits)
+	if len(limits) != 7 {
+		t.Fatalf("claims = %v, want 7 of them", limits)
+	}
+	for _, l := range limits {
+		if l != 1 {
+			t.Fatalf("claim limits = %v, want one row each", limits)
+		}
 	}
 	if got := atomic.LoadInt32(&pauses); got != 7 {
 		t.Fatalf("pauses = %d, want the batch size 7", got)
+	}
+}
+
+// A worker that finishes claims the next row while another is still on a
+// slow pause; one slow host never idles the rest.
+func TestReaper_FreeWorkerStartsTheNextPause(t *testing.T) {
+	rows := []db.ClaimExpiredSandboxesRow{expiredRow("slow"), expiredRow("fast"), expiredRow("next")}
+	var mu sync.Mutex
+	remaining := rows
+	calls := make(chan string, 3)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+
+	h := newReaperHandlers(
+		&reaperMockDBTX{queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+			if !strings.Contains(sql, "-- name: ClaimExpiredSandboxes ") {
+				return newStubRows(nil), nil
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			n := min(int(args[0].(int32)), len(remaining))
+			claimed := remaining[:n]
+			remaining = remaining[n:]
+			return newStubRows(claimed), nil
+		}},
+		&stubVMD{pauseFn: func(ctx context.Context, id, _ string) (string, string, error) {
+			calls <- id
+			if id == rows[0].ID.String() {
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return "", "", ctx.Err()
+				}
+			}
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		}},
+	)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.reapOnce(context.Background(), 3, 2, zerolog.Nop())
+	}()
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		<-done
+		h.WaitAsyncBookkeeping()
+	}()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-calls:
+		case <-time.After(time.Second):
+			t.Fatal("first workers did not start")
+		}
+	}
+	select {
+	case id := <-calls:
+		if id != rows[2].ID.String() {
+			t.Fatalf("next pause = %s, want the third row", id)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("one slow pause blocked the next sandbox while a worker was idle")
 	}
 }
 
