@@ -589,6 +589,14 @@ type Sandbox struct {
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
 	// True once any secret binding has existed for this sandbox; false when the sandbox was created without one; NULL for rows predating the column. Never cleared — a detached or failure-cleared binding may still have had a JWT minted against it. Destroy revokes unless this is false.
 	HadSecretBindings *bool `json:"had_secret_bindings"`
+	// Digest of the binding set last injected into the guest; a resume re-injects when the current set differs.
+	SecretEnvFingerprint *string `json:"secret_env_fingerprint"`
+	// Guest IP the injected proxy JWT is bound to; a resume re-injects when the guest comes back on another.
+	SecretEnvIp *string `json:"secret_env_ip"`
+	// When the last injection landed; only a snapshot taken after it holds the injected environment.
+	SecretEnvInjectedAt pgtype.Timestamptz `json:"secret_env_injected_at"`
+	// Expiry of the injected proxy JWT; a resume re-injects when it is near.
+	SecretEnvExpiresAt pgtype.Timestamptz `json:"secret_env_expires_at"`
 }
 
 type SandboxActiveInterval struct {

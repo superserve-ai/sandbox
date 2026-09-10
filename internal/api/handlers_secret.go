@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1196,7 +1198,86 @@ func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, 
 	if err := vmd.InjectSandboxEnv(ctx, sandbox.ID.String(), mergeEnvVarsWithSecrets(nil, meta), jwt); err != nil {
 		return fmt.Errorf("inject sandbox env: %w", err)
 	}
+	if jwt != "" {
+		sourceIP := ""
+		if sandbox.IpAddress != nil {
+			sourceIP = sandbox.IpAddress.String()
+		}
+		h.recordSecretEnv(sandbox.ID, sourceIP, meta)
+	}
 	return nil
+}
+
+// secretEnvExpiryMargin is how much JWT life a resume requires before it
+// lets the guest keep the injected environment instead of re-minting.
+const secretEnvExpiryMargin = 24 * time.Hour
+
+// secretEnvFingerprint digests the environment as injected: the key that
+// signed the JWT, by both the kid a verifier looks it up under and its
+// material, and the binding set with each secret's env key, proxy token,
+// and auth shape. A change to any of them changes the digest, so a key
+// replaced under the same kid or relabeled under a new one reads as a new
+// environment; binding order does not.
+func secretEnvFingerprint(signingKeyFingerprint string, meta []SecretBindingMeta) string {
+	items := append([]SecretBindingMeta(nil), meta...)
+	sort.Slice(items, func(i, j int) bool { return items[i].EnvKey < items[j].EnvKey })
+	encoded, err := json.Marshal(struct {
+		SigningKey string
+		Bindings   []SecretBindingMeta
+	}{signingKeyFingerprint, items})
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+// signerKeyFingerprint names the key minting JWTs now; empty without a
+// signer, which matches no recorded environment.
+func (h *Handlers) signerKeyFingerprint() string {
+	if h.Signer == nil {
+		return ""
+	}
+	return h.Signer.KeyFingerprint()
+}
+
+// recordSecretEnv notes what the guest holds after a successful injection,
+// off the response path. A lost write only costs the next resume a
+// re-injection, so the write is not awaited.
+func (h *Handlers) recordSecretEnv(sandboxID uuid.UUID, sourceIP string, meta []SecretBindingMeta) {
+	fingerprint := secretEnvFingerprint(h.signerKeyFingerprint(), meta)
+	if fingerprint == "" || len(meta) == 0 || h.Signer == nil {
+		return
+	}
+	expiresAt := pgtype.Timestamptz{Time: time.Now().Add(SecretsJWTLifetime), Valid: true}
+	h.asyncBookkeeping("record-secret-env", func() {
+		ctx, cancel := context.WithTimeout(context.Background(), asyncTimeout)
+		defer cancel()
+		if err := h.DB.RecordSandboxSecretEnv(ctx, db.RecordSandboxSecretEnvParams{
+			ID:                   sandboxID,
+			SecretEnvFingerprint: &fingerprint,
+			SecretEnvIp:          &sourceIP,
+			SecretEnvExpiresAt:   expiresAt,
+		}); err != nil {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("record injected secret env")
+		}
+	})
+}
+
+// guestHoldsSecretEnv reports whether the snapshot's guest already holds the
+// environment the current bindings would inject: the same binding set
+// signed by the current key, bound to the IP the guest came back on, with
+// a JWT well within its lifetime, captured by a snapshot taken after that
+// injection. Any doubt means inject.
+func (h *Handlers) guestHoldsSecretEnv(sb db.Sandbox, snapshotAt pgtype.Timestamptz, meta []SecretBindingMeta) bool {
+	if sb.SecretEnvFingerprint == nil || sb.SecretEnvIp == nil || sb.IpAddress == nil ||
+		!sb.SecretEnvInjectedAt.Valid || !sb.SecretEnvExpiresAt.Valid || !snapshotAt.Valid {
+		return false
+	}
+	return *sb.SecretEnvFingerprint == secretEnvFingerprint(h.signerKeyFingerprint(), meta) &&
+		*sb.SecretEnvIp == sb.IpAddress.String() &&
+		time.Now().Add(secretEnvExpiryMargin).Before(sb.SecretEnvExpiresAt.Time) &&
+		!snapshotAt.Time.Before(sb.SecretEnvInjectedAt.Time)
 }
 
 // mintSecretsJWT builds the per-sandbox secrets JWT. Returns the signed JWT

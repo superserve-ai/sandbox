@@ -90,7 +90,7 @@ WITH tpl AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
@@ -514,6 +514,7 @@ FROM (
   SELECT sb.id,
          s.path AS snap_path,
          s.mem_path AS snap_mem_path,
+         s.created_at AS snap_created_at,
          COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
          COALESCE(p.access, 'legacy_public')::text AS wire_access,
          COALESCE(p.revision, 0)::bigint AS revision,
@@ -539,10 +540,21 @@ FROM (
 WHERE sandbox.id = lk.id AND sandbox.id = x.id
   AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
 RETURNING sqlc.embed(sandbox),
-          x.snap_path, x.snap_mem_path,
+          x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
           x.template_base_path;
+
+-- name: RecordSandboxSecretEnv :exec
+-- Bookkeeping after a successful secrets injection: what the guest now
+-- holds, for the resume-time reuse check. Off the hot path; a lost write
+-- only costs one re-injection.
+UPDATE sandbox
+SET secret_env_fingerprint = $2,
+    secret_env_ip = $3,
+    secret_env_injected_at = now(),
+    secret_env_expires_at = $4
+WHERE id = $1 AND destroyed_at IS NULL;
 
 -- name: RevertResumeToPaused :exec
 -- Compensate a failed resume attempt by flipping status back to 'paused'.

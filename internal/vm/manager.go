@@ -889,6 +889,27 @@ func (m *Manager) SetEgressProxy(proxy *network.EgressProxy) {
 	m.egressProxy = proxy
 }
 
+// applyAdoptedNetworkRules re-applies the request's egress rules to a VM a
+// retried resume adopts. The earlier attempt applied them before launch,
+// but the proxy's per-sandbox rules live in memory and a daemon restart
+// drops them, so the adopting resume applies them again. Reports whether
+// they are fully in place; otherwise the caller pushes them itself.
+func (m *Manager) applyAdoptedNetworkRules(vmID string, rules *sandboxNetworkRules) bool {
+	if rules == nil {
+		return true
+	}
+	if m.netMgr == nil {
+		return false
+	}
+	netInfo := m.netMgr.GetVMNetInfo(vmID)
+	if err := m.applySandboxNetworkRules(vmID, netInfo, rules); err != nil {
+		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("resume: egress rules not applied on adoption")
+		return false
+	}
+	// The proxy half needs the slot; without it only the firewall landed.
+	return netInfo != nil
+}
+
 func (m *Manager) applySandboxNetworkRules(vmID string, netInfo *network.VMNetInfo, rules *sandboxNetworkRules) error {
 	if rules == nil {
 		return nil
@@ -2034,7 +2055,7 @@ func fileExists(path string) bool {
 // this returning and those steps acting on it. The gRPC adapter is the sole
 // caller and owns that lock scope; there is deliberately no self-locking
 // wrapper, which would release the lock before those steps and reopen the race.
-func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string, networkRules *sandboxNetworkRules) (*VMInstance, error) {
+func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPath string, networkRules *sandboxNetworkRules) (*VMInstance, bool, error) {
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	tEntry := time.Now()
 	var tSlot, tVerify, tFcStart, tFcDone, tRestore, tRestoreDone time.Time
@@ -2099,7 +2120,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 
 	inst, err := m.getInstance(vmID)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if snapshotPath == "" {
@@ -2109,7 +2130,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		memPath = inst.MemFilePath
 	}
 	if snapshotPath == "" || memPath == "" {
-		return nil, status.Errorf(codes.InvalidArgument, "snapshot_path and mem_file_path are required")
+		return nil, false, status.Errorf(codes.InvalidArgument, "snapshot_path and mem_file_path are required")
 	}
 
 	// Retried resume (response lost mid-RPC): the VM may already be up from
@@ -2122,7 +2143,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			// detached telemetry), so adoption matches: record + live unit
 			// suffice.
 			log.Info().Msg("resume: VM already running and healthy, returning it")
-			return existing, nil
+			return existing, m.applyAdoptedNetworkRules(vmID, networkRules), nil
 		}
 		// An unverified target is the one case where blindness is unsafe in
 		// BOTH directions: blind adoption hands back a corpse, blind refusal
@@ -2148,17 +2169,17 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			// instead — the next attempt re-derives the verdict.
 			switch wrote, perr := m.persistStateIfPresent(existing); {
 			case perr != nil:
-				return nil, fmt.Errorf("record readiness verdict for vm %s: %w", vmID, perr)
+				return nil, false, fmt.Errorf("record readiness verdict for vm %s: %w", vmID, perr)
 			case !wrote:
-				return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during resume", vmID)
+				return nil, false, status.Errorf(codes.NotFound, "vm %s was destroyed during resume", vmID)
 			}
 			log.Warn().Err(verr).Msg("resume: unverified VM failed readiness — relaunching")
 		} else {
 			if cerr := m.commitVerifiedAdoption(existing); cerr != nil {
-				return nil, cerr
+				return nil, false, cerr
 			}
 			log.Info().Msg("resume: unverified VM verified and adopted")
-			return existing, nil
+			return existing, m.applyAdoptedNetworkRules(vmID, networkRules), nil
 		}
 	}
 
@@ -2175,15 +2196,15 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// pause-sourced restore.
 	if _, err := os.Stat(snapshotPath); err != nil {
 		if os.IsNotExist(err) {
-			return nil, status.Errorf(codes.FailedPrecondition, "snapshot file missing on host: %s", snapshotPath)
+			return nil, false, status.Errorf(codes.FailedPrecondition, "snapshot file missing on host: %s", snapshotPath)
 		}
-		return nil, status.Errorf(codes.FailedPrecondition, "stat snapshot %s: %v", snapshotPath, err)
+		return nil, false, status.Errorf(codes.FailedPrecondition, "stat snapshot %s: %v", snapshotPath, err)
 	}
 	if _, err := os.Stat(memPath); err != nil {
 		if os.IsNotExist(err) {
-			return nil, status.Errorf(codes.FailedPrecondition, "memory file missing on host: %s", memPath)
+			return nil, false, status.Errorf(codes.FailedPrecondition, "memory file missing on host: %s", memPath)
 		}
-		return nil, status.Errorf(codes.FailedPrecondition, "stat mem file %s: %v", memPath, err)
+		return nil, false, status.Errorf(codes.FailedPrecondition, "stat mem file %s: %v", memPath, err)
 	}
 	// What the image says about its guest, read before anything is launched.
 	// An ordinary resume reloads the exact image this VM was paused into, and
@@ -2198,15 +2219,15 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.mu.RUnlock()
 	if wakeProtocolFloorRaised() {
 		if blocked, why := pauseIntentBlocks(filepath.Dir(memPath), recordedArtifact); blocked {
-			return nil, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing resume until it is inspected", memPath, why)
+			return nil, false, status.Errorf(codes.FailedPrecondition, "image %q: %s; refusing resume until it is inspected", memPath, why)
 		}
 	}
 	resumeCorrectsWallClock, resumeWorkloadFrozen, merr := resumeWallClockProperty(memPath, pausedMemPath, recordedCorrects, recordedFrozen)
 	if merr != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
+		return nil, false, status.Errorf(codes.FailedPrecondition, "%v", merr)
 	}
 	if resumeWorkloadFrozen {
-		return nil, status.Errorf(codes.FailedPrecondition, "image %q holds a frozen workload that this supervisor cannot wake; refusing resume", memPath)
+		return nil, false, status.Errorf(codes.FailedPrecondition, "image %q holds a frozen workload that this supervisor cannot wake; refusing resume", memPath)
 	}
 	// Presence gate for layered overlays. Deterministic from a stat, so it
 	// belongs here with the other precondition checks — a post-boot refusal
@@ -2214,7 +2235,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	// auto-resume retry of a sandbox whose side-car was lost in transfer.
 	if isOverlayMemFile(memPath) {
 		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
-			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
+			return nil, false, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
 	}
 
@@ -2245,19 +2266,19 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		var nsErr error
 		netInfo, nsErr = m.netMgr.EnsureVMSlot(ctx, vmID, nsName, inst.IP, inst.MACAddress)
 		if nsErr != nil {
-			return nil, fmt.Errorf("ensure network slot for resume: %w", nsErr)
+			return nil, false, fmt.Errorf("ensure network slot for resume: %w", nsErr)
 		}
 	} else {
 		var netErr error
 		netInfo, netErr = m.netMgr.SetupVM(ctx, vmID, nil)
 		if netErr != nil {
-			return nil, fmt.Errorf("setup network for resume: %w", netErr)
+			return nil, false, fmt.Errorf("setup network for resume: %w", netErr)
 		}
 		nsName = netInfo.Namespace
 		needsNetworkCleanup = true
 	}
 	if err := m.applySandboxNetworkRules(vmID, netInfo, networkRules); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	tFcStart = time.Now()
@@ -2274,7 +2295,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.Supervision = resumeSupervision
 	inst.mu.Unlock()
 	if err != nil {
-		return nil, fmt.Errorf("start firecracker for restore: %w", err)
+		return nil, false, fmt.Errorf("start firecracker for restore: %w", err)
 	}
 	tFcDone = time.Now()
 
@@ -2296,7 +2317,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		}
 		if basePath == "" {
 			m.stopUnitDuringRestoreError(vmID)
-			return nil, status.Errorf(codes.FailedPrecondition,
+			return nil, false, status.Errorf(codes.FailedPrecondition,
 				"layered overlay %q has no recoverable base; refusing standalone restore", memPath)
 		}
 	}
@@ -2319,7 +2340,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		// Firecracker is already running; stop the unit before returning or it leaks.
 		m.stopUnitDuringRestoreError(vmID)
 		if errors.Is(restoreErr, ErrTornSnapshot) {
-			return nil, status.Errorf(codes.DataLoss,
+			return nil, false, status.Errorf(codes.DataLoss,
 				"snapshot %q is torn (overlay side-car empty); re-snapshot from a healthy source: %v",
 				snapshotPath, restoreErr)
 		}
@@ -2327,11 +2348,11 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			// Permanent: the overlay/base pairing is structurally invalid, so retrying
 			// the layered restore can't succeed. FailedPrecondition tells the caller not
 			// to retry (vs the generic Internal below, which it may).
-			return nil, status.Errorf(codes.FailedPrecondition,
+			return nil, false, status.Errorf(codes.FailedPrecondition,
 				"snapshot %q has an invalid layered overlay/base pairing; do not retry: %v",
 				snapshotPath, restoreErr)
 		}
-		return nil, fmt.Errorf("restore snapshot: %w", restoreErr)
+		return nil, false, fmt.Errorf("restore snapshot: %w", restoreErr)
 	}
 
 	inst.mu.RLock()
@@ -2353,7 +2374,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		if verr != nil {
 			m.stopUnitDuringRestoreError(vmID)
 			m.setStatus(vmID, StatusError)
-			return nil, fmt.Errorf("boxd not ready after relaunch of unverified vm %s: %w", vmID, verr)
+			return nil, false, fmt.Errorf("boxd not ready after relaunch of unverified vm %s: %w", vmID, verr)
 		}
 	}
 
@@ -2380,7 +2401,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 	inst.mu.Unlock()
 
 	if cerr := m.commitResumeState(inst); cerr != nil {
-		return nil, cerr
+		return nil, false, cerr
 	}
 	// A legacy paused record is the one case reattach cannot recover:
 	// it skips paused VMs because a paused VM has no Firecracker to ask.
@@ -2433,7 +2454,7 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 			Msg("boxd reachable after resume")
 		m.recordPhases("resume", "", map[string]time.Duration{"wait_boxd": time.Since(probeStart)})
 	}()
-	return inst, nil
+	return inst, true, nil
 }
 
 // restoreForResume picks the resume memory backend: UFFD (reusing the existing tap

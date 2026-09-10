@@ -16,6 +16,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // ---------------------------------------------------------------------------
@@ -450,5 +451,48 @@ func TestRollbackPausedVM_PersistsReplacementHostAndIP(t *testing.T) {
 	}
 	if strings.Join(callOrder, ",") != "host,status" {
 		t.Fatalf("rollback write order = %v, want host then status", callOrder)
+	}
+}
+
+// A rollback that adopts a VM left running by the earlier attempt can come
+// back with the daemon reporting the egress rules only partly applied; the
+// rollback must push them itself before the row goes active, and leave
+// them alone when the daemon reports them in place.
+func TestRollbackPausedVM_ReplaysEgressRulesUnlessAcked(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		acked       bool
+		wantReplays int
+	}{
+		{"unacked rules are pushed", false, 1},
+		{"acked rules are left alone", true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			replays := 0
+			h := &Handlers{
+				VMD: &stubVMD{
+					resumeFn:     func(context.Context, string, string, string, []byte) (string, error) { return "10.11.0.99", nil },
+					resumeAttest: vmdclient.ResumeAttestation{NetworkRulesApplied: tc.acked},
+					updateNetworkFn: func(_ context.Context, _ string, allowed, _, _ []string) error {
+						replays++
+						if len(allowed) != 1 || allowed[0] != "10.0.0.0/8" {
+							t.Errorf("replayed allow list = %v, want the persisted CIDR", allowed)
+						}
+						return nil
+					},
+				},
+				DB: db.New(&reaperMockDBTX{
+					execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.CommandTag{}, nil },
+				}),
+			}
+			sbx := db.ClaimExpiredSandboxesRow{
+				ID: uuid.New(), TeamID: uuid.New(), HostID: "host-1", Name: "sbx",
+				NetworkConfig: []byte(`{"egress":{"allowed_cidrs":["10.0.0.0/8"]}}`),
+			}
+			h.rollbackPausedVM(context.Background(), sbx, "/snapshots/vmstate.snap", "/snapshots/mem.snap", errors.New("pause write failed"), zerolog.Nop())
+			if replays != tc.wantReplays {
+				t.Fatalf("rule replays = %d, want %d", replays, tc.wantReplays)
+			}
+		})
 	}
 }
