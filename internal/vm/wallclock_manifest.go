@@ -381,7 +381,10 @@ func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger
 				case <-t.C:
 					scan()
 				case ev := <-events:
-					if !ev.Has(fsnotify.Create) && !ev.Has(fsnotify.Rename) {
+					// Writes too: an importer that creates the path and then
+					// streams the manifest into it is complete only at its
+					// last write, and a partial file simply fails to parse.
+					if !ev.Has(fsnotify.Create) && !ev.Has(fsnotify.Rename) && !ev.Has(fsnotify.Write) {
 						continue
 					}
 					if info, serr := os.Stat(ev.Name); serr == nil && info.IsDir() {

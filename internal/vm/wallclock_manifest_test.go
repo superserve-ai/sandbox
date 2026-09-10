@@ -456,3 +456,46 @@ func TestTemplateWatchWitnessesATemplateAsItLands(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A manifest streamed into its final path, created empty and written after,
+// is witnessed at its last write, not left for the next periodic scan.
+func TestTemplateWatchWitnessesAManifestStreamedIntoPlace(t *testing.T) {
+	dir := t.TempDir()
+	isolateEvidence(t, dir)
+	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
+	if err := os.MkdirAll(tpl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir, GuestClockFreezeEnabled: true}}
+	stopped := m.WatchTemplateManifests(ctx, zerolog.Nop())
+	defer func() { cancel(); <-stopped }()
+	time.Sleep(50 * time.Millisecond)
+
+	path := WallClockMarkerPath(filepath.Join(tpl, "mem.snap"))
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // the create is seen while the file is empty
+	body := `{"version":1,"artifact_id":"a","workload_frozen":true,"guest_corrects_clock":true,"freeze_token":"tok"}`
+	if _, err := f.WriteString(body[:20]); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // a partial write does not parse
+	if _, err := f.WriteString(body[20:]); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the streamed frozen manifest was not witnessed at its last write")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

@@ -3008,13 +3008,6 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	// clearing DirtyTracked and the unpause below. Failing here has done nothing
 	// yet.
 	//
-	// An ad-hoc image is never marked: restores from it take legacy behaviour,
-	// which is slower and always correct. Callers may also hand in a directory
-	// that already holds an image, so clear rather than assume.
-	if merr := os.Remove(clockFreezeMarkerPath(memPath)); merr != nil && !os.IsNotExist(merr) {
-		return "", "", fmt.Errorf("clear wall-clock marker for ad-hoc snapshot %q: %w", memPath, merr)
-	}
-
 	if err := CreateSnapshot(inst.SocketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
 		return "", "", fmt.Errorf("create snapshot: %w", err)
 	}
@@ -3041,6 +3034,20 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 
 	if err := UnpauseVM(inst.SocketPath); err != nil {
 		return snapshotPath, memPath, fmt.Errorf("resume after snapshot: %w", err)
+	}
+
+	// An ad-hoc image is never marked: restores from it take legacy behaviour,
+	// slower and always correct. A manifest an earlier image left at this path
+	// goes only now, after the image is replaced: a snapshot that failed left
+	// the earlier image, and its manifest must stay with it. One that will
+	// not go and is not known harmless would send a wake nothing answers, so
+	// the image is withdrawn rather than published beside it.
+	if blocking, merr := removeWallClockManifest(memPath); merr != nil && blocking {
+		_ = os.Remove(memPath)
+		_ = os.Remove(snapshotPath)
+		return "", "", fmt.Errorf("clear wall-clock manifest for ad-hoc snapshot %q: %w", memPath, merr)
+	} else if merr != nil {
+		m.log.Warn().Err(merr).Str("vm_id", vmID).Msg("ad-hoc snapshot: a stale marker could not be removed")
 	}
 
 	return snapshotPath, memPath, nil

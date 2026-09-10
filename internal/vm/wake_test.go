@@ -2759,3 +2759,43 @@ func TestPauseWithAnUnconfirmedThawRecordsTheGuestAsError(t *testing.T) {
 		check(t, m, inst, vmDir)
 	})
 }
+
+// An ad-hoc snapshot into a directory that already holds a frozen image
+// keeps that image's manifest until its own snapshot has replaced the image:
+// a snapshot that fails first must not turn a frozen image into one a
+// restore reads as legacy.
+func TestAdHocSnapshotKeepsTheOldManifestUntilItsSnapshotLands(t *testing.T) {
+	fail := true
+	fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
+		if fail {
+			return http.StatusInternalServerError, `{"fault_message":"disk full"}`
+		}
+		return http.StatusNoContent, ""
+	})
+	dir := t.TempDir()
+	snapDir := filepath.Join(dir, "adhoc")
+	if err := os.MkdirAll(snapDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	memPath := filepath.Join(snapDir, "mem.snap")
+	if err := os.WriteFile(memPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedFrozenManifest(t, memPath, "A")
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath}
+	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+
+	if _, _, err := m.CreateVMSnapshot(context.Background(), "vm-1", snapDir); err == nil {
+		t.Fatal("want the snapshot failure")
+	}
+	if man, err := ReadWallClockManifest(memPath); err != nil || man == nil || !man.WorkloadFrozen {
+		t.Fatalf("manifest=%+v err=%v; the earlier image's manifest must survive a failed snapshot", man, err)
+	}
+	fail = false
+	if _, _, err := m.CreateVMSnapshot(context.Background(), "vm-1", snapDir); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if man, err := ReadWallClockManifest(memPath); err != nil || man != nil {
+		t.Fatalf("manifest=%+v err=%v; an ad-hoc image is never marked", man, err)
+	}
+}
