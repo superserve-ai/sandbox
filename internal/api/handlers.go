@@ -322,12 +322,9 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 	return c, nil
 }
 
-// revertPause undoes BeginPause's claim when nothing was dispatched: status
-// back to 'active' and the billing interval reopened in one fenced statement
-// (RevertPauseToActive). Synchronous, on the failure path only: the caller is
-// about to report the pause as failed, and the row must say so before the
-// reconciler could ever take the operation up. Detached from the request's
-// cancellation so a client disconnect cannot orphan it.
+// revertPause undoes BeginPause's claim when nothing was dispatched, in one
+// fenced statement. Synchronous, failure path only: the row must be back to
+// 'active' before the caller hears "failed". Detached from request cancellation.
 func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UUID, lease pauseLease, actorID *uuid.UUID, l zerolog.Logger) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
 	defer cancel()
@@ -2990,12 +2987,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // the reconciler may take over: the foreground attempts plus a margin.
 const pauseLeaseSeconds int32 = 90
 
-// pauseWithRetry pauses a VM, retrying once on a non-NotFound failure: a
-// timed-out pause may have completed on the host, and PauseVM is idempotent,
-// so the retry returns the recorded snapshot. NotFound is terminal. Every
-// attempt ends before leaseUntil, and the retry goes only to a freshly
-// resolved host: an answer from a machine the host no longer maps to says
-// nothing about the VM.
+// pauseWithRetry pauses a VM, retrying once on an undecided failure (PauseVM
+// is idempotent, so a timed-out pause that completed returns its snapshot).
+// Every attempt ends before leaseUntil, and the retry goes only to a freshly
+// resolved host: a stale machine's answer says nothing about the VM.
 func (h *Handlers) pauseWithRetry(reqCtx context.Context, vmd VMDClient, hostID, id, pauseToken string, leaseUntil time.Time) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
 	deadline, ok := attemptDeadline(leaseUntil, vmdTimeout)
 	if !ok {

@@ -30,10 +30,8 @@ var errFinalizeInFlight = errors.New("pause finalization in flight")
 // for this sandbox: 'pausing' on the normal pause path, 'resuming' on the
 // resume-revert path (pauseAndRevert finalizes a pause from that status).
 // Bounded so a stranded transition cannot head-of-line-block the host's
-// outbox forever: a fresh transition counts, and so does a durable pause
-// operation whose lease is held or was renewed recently (its workers only
-// move the lease, never updated_at); a lease nobody has touched in a while
-// is a stranded one.
+// outbox: a fresh transition counts, as does a pause operation whose lease
+// was held or renewed recently (its workers move the lease, never updated_at).
 func finalizeInFlight(row db.LockSandboxRowRow) bool {
 	if row.Status != db.SandboxStatusPausing && row.Status != db.SandboxStatusResuming {
 		return false
@@ -304,11 +302,9 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		// as retryable instead; redelivery re-records coverage
 		// idempotently and the link and size sync land once the finalize
 		// has committed.
-		// Bounded (see finalizeInFlight): an unconditional 503 would
-		// head-of-line-block the host's outbox forever. A transition
-		// still being worked retries; a stranded one proceeds, and the
-		// identity checks below refuse exactly as for any other settled
-		// mismatch.
+		// Bounded (see finalizeInFlight): a transition still being worked
+		// retries; a stranded one proceeds and the identity checks below
+		// refuse it like any other settled mismatch.
 		if finalizeInFlight(row) {
 			return errFinalizeInFlight
 		}

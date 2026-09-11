@@ -252,11 +252,9 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism in
 	})
 }
 
-// claimEach hands candidate ids to at most workers goroutines. Each worker
-// claims its candidate at dispatch time (re-checked under lock, leased only
-// then) and runs it, so one candidate scan feeds every worker and no leased
-// row ever waits in a queue. A claim that comes back empty is skipped: another
-// replica took it, or it no longer qualifies.
+// claimEach hands candidate ids to at most workers goroutines; each claims
+// its candidate at dispatch time (re-checked under lock, leased only then), so
+// one scan feeds every worker and no leased row waits. An empty claim is skipped.
 func claimEach[T any](ctx context.Context, workers int, ids []uuid.UUID, claim func(ctx context.Context, id uuid.UUID) (T, error), process func(row T, claimedAt time.Time)) {
 	dispatchBounded(ctx, ids, workers, func(id uuid.UUID) {
 		claimedAt := time.Now()

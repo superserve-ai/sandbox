@@ -959,12 +959,9 @@ WHERE s.id = $1 AND s.destroyed_at IS NULL;
 -- tick feeds every worker, and a candidate holds nothing while it waits.
 -- ClaimExpiredSandbox re-checks each one under lock at dispatch time.
 --
--- timeout_seconds bounds an active session, not total lifetime, so the window
--- is anchored on the current session start (the open sandbox_active_interval
--- row, reopened on resume). COALESCE falls back to created_at when interval
--- bookkeeping left an active sandbox with no open interval. Only 'active' rows
--- are eligible; the 60s grace floor spares freshly started or resumed
--- sandboxes with very short timeouts.
+-- timeout_seconds bounds the current session (its open interval, reopened on
+-- resume), falling back to created_at when no interval is open; the 60s grace
+-- floor spares freshly started or resumed sandboxes with very short timeouts.
 WITH open_sessions AS (
   SELECT sandbox_id, max(started_at) AS session_start
   FROM sandbox_active_interval
@@ -1191,11 +1188,9 @@ FROM destroyed d;
 
 -- name: ListPendingPauses :many
 -- Pauses whose caller has given up: still 'pausing', lease expired or absent,
--- old enough that the caller's own attempt is over. Longest-eligible first,
--- so a row that keeps failing cannot cycle ahead of newer ones; start time is
--- kept for the age alert only. Unlocked: ClaimPendingPause takes each one at
--- dispatch time. Rows without an operation predate this contract and are
--- skipped.
+-- old enough that the caller's own attempt is over. Longest-eligible first so
+-- a row that keeps failing cannot cycle ahead of newer ones. Unlocked; rows
+-- without an operation predate this contract and are skipped.
 SELECT id FROM sandbox
 WHERE status = 'pausing' AND destroyed_at IS NULL
   AND pause_op_id IS NOT NULL
