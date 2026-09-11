@@ -492,3 +492,79 @@ func TestBridgeUpgradeRequiresSwitchingProtocols(t *testing.T) {
 		})
 	}
 }
+
+type tunnelReadResultConn struct {
+	net.Conn
+	ready  <-chan struct{}
+	result error
+}
+
+func (c tunnelReadResultConn) Read([]byte) (int, error) { <-c.ready; return 0, c.result }
+
+type tunnelHalfClosePeer struct {
+	net.Conn
+	halfClosed chan struct{}
+}
+
+func (s tunnelHalfClosePeer) CloseSend() error { close(s.halfClosed); return nil }
+func TestBridgeAcceptedTunnelReadTermination(t *testing.T) {
+	for _, orderly := range []bool{false, true} {
+		t.Run(fmt.Sprint(orderly), func(t *testing.T) {
+			client, server := net.Pipe()
+			peer, remote := net.Pipe()
+			defer client.Close()
+			defer remote.Close()
+			_ = client.SetDeadline(time.Now().Add(time.Second))
+			_ = remote.SetDeadline(time.Now().Add(time.Second))
+			ready := make(chan struct{})
+			halfClosed := make(chan struct{})
+			readErr := error(io.EOF)
+			if !orderly {
+				readErr = errors.New("client reset")
+			}
+			request := httptest.NewRequest(http.MethodGet, "http://first.example.com/", nil)
+			request.Header.Set("Connection", "Upgrade")
+			request.Header.Set("Upgrade", "websocket")
+			done := make(chan error, 1)
+			go func() {
+				done <- bridgeRequest(hijackWriter{tunnelReadResultConn{server, ready, readErr}}, request, tunnelHalfClosePeer{peer, halfClosed})
+			}()
+			go func() {
+				_, err := http.ReadRequest(bufio.NewReader(remote))
+				if err == nil {
+					_, _ = io.WriteString(remote, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+				}
+			}()
+			reader := bufio.NewReader(client)
+			if _, err := http.ReadResponse(reader, request); err != nil {
+				t.Fatal(err)
+			}
+			close(ready)
+			if orderly {
+				select {
+				case <-halfClosed:
+				case <-time.After(time.Second):
+					t.Fatal("EOF did not half-close")
+				}
+				select {
+				case err := <-done:
+					t.Fatalf("EOF closed download: %v", err)
+				case <-time.After(10 * time.Millisecond):
+				}
+				go func() { _, _ = remote.Write([]byte("ok")); _ = remote.Close() }()
+				payload := make([]byte, 2)
+				if _, err := io.ReadFull(reader, payload); err != nil || string(payload) != "ok" {
+					t.Fatalf("download=%q err=%v", payload, err)
+				}
+			}
+			select {
+			case err := <-done:
+				if !orderly && !errors.Is(err, readErr) {
+					t.Fatalf("error=%v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("bridge retained terminated client")
+			}
+		})
+	}
+}

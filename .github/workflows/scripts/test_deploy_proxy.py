@@ -33,13 +33,13 @@ class DeployProxyOrderingTest(unittest.TestCase):
 
 
 class DeployProxyTests(unittest.TestCase):
-    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0, database_url="postgres://postgres:postgres@localhost/sandbox_test", routing=""):
+    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0, database_url="postgres://postgres:postgres@localhost/sandbox_test", routing="", zone="us-central1-a"):
         scripts = []
 
         def run(args, **kwargs):
             output = ""
             if args[:4] == ["gcloud", "compute", "instances", "list"]:
-                output = "example-host,us-central1-a\n"
+                output = f"example-host,{zone}\n"
             elif args[:3] == ["gcloud", "compute", "ssh"]:
                 scripts.append(args[args.index("--command") + 1])
             elif args[:2] == ["ssh-keygen", "-q"]:
@@ -89,6 +89,12 @@ class DeployProxyTests(unittest.TestCase):
         self.assertIn("PEER_ROUTING_ENABLED=0\n", self.generate_script("auto"))
         self.assertIn("PEER_ROUTING_ENABLED=1\n", self.generate_script("auto", routing="1"))
         self.generate_script("auto", routing="true", expected_result=1)
+
+    def test_peer_region_comes_from_each_instance_zone(self):
+        for zone, region in (("us-central1-a", "us-central1"), ("us-east4-b", "us-east4"),
+                             ("https://www.googleapis.com/compute/v1/projects/example-project/zones/us-west2-a", "us-west2")):
+            with self.subTest(zone=zone):
+                self.assertIn(f"HOST_REGION={region}\n", self.generate_script("auto", zone=zone))
 
     def test_generated_shell_parses(self):
         for peer_addr in ("", "auto"):
