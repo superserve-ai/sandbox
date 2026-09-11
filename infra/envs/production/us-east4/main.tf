@@ -486,10 +486,11 @@ module "sandbox_host" {
 
 resource "google_compute_disk" "sandbox_data_a" {
   project = local.project_id
-  name    = "${module.sandbox_host.instance_name}-sandbox-data"
-  zone    = local.zone
-  type    = "hyperdisk-balanced"
-  size    = 1024
+  # Suffixed: the serving host's disk already carries the unsuffixed name.
+  name = "${module.sandbox_host.instance_name}-sandbox-data-a"
+  zone = local.zone
+  type = "hyperdisk-balanced"
+  size = 1024
 
   labels = merge(local.common_labels, {
     component = "vmd"
