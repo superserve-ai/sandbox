@@ -1,16 +1,22 @@
 package vm
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/fsnotify/fsnotify"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/rs/zerolog"
 )
 
 // WallClockManifest sits beside a memory image and says what a supervisor may
@@ -39,6 +45,10 @@ const WallClockManifestVersion = 1
 // echo. A different version space from the manifest's: the two are both 1
 // today by coincidence, and a bump to either must not pass for the other.
 const WakeProtocolVersion = 1
+
+// WakeProtocolCapability is the string a vmd that can wake a frozen image
+// carries; the host guard and the deploy check grep the binary for it.
+const WakeProtocolCapability = "wake-protocol-1"
 
 // wakeProtocolEvidencePath records that this host has held an image that
 // owes a wake, so the host-resident guard refuses a vmd without the wake
@@ -79,10 +89,49 @@ func RecognizeWakeProtocolFloor() bool {
 	return false
 }
 
+// PrimeWakeProtocolFloor proves recognised evidence durable in the
+// background, so the first request needing the floor after a restart pays no
+// directory sync. Without evidence it primes nothing: proven here, never raised.
+func PrimeWakeProtocolFloor(log zerolog.Logger) {
+	if !wakeProtocolEvidenceSeen.Load() || wakeProtocolEvidenceDurable.Load() {
+		return
+	}
+	go func() {
+		if err := ensureWakeProtocolFloor(); err != nil {
+			log.Warn().Err(err).Msg("wake-protocol floor could not be proven durable at startup; the first frozen restore will retry")
+		}
+	}()
+}
+
 // wakeProtocolFloorRaised reports what startup recognised, without I/O. A
 // pause intent is only ever written on a host whose floor is up, so on any
 // other host the checks for one are skipped, at no cost.
 func wakeProtocolFloorRaised() bool { return wakeProtocolEvidenceSeen.Load() }
+
+// wakeProtocolEvidenceMu makes concurrent first raises share one write
+// instead of each paying the sync.
+var wakeProtocolEvidenceMu sync.Mutex
+
+// ensureWakeProtocolFloor is the form a supervisor uses before it acts on an
+// image that owes a wake — freezing one, restoring one: durable once, then
+// free. Never on a request path for an image that owes nothing.
+func ensureWakeProtocolFloor() error {
+	if wakeProtocolEvidenceDurable.Load() {
+		return nil
+	}
+	wakeProtocolEvidenceMu.Lock()
+	defer wakeProtocolEvidenceMu.Unlock()
+	return RaiseWakeProtocolFloor()
+}
+
+// noteWakeProtocolEvidence is the best-effort form, for the template scan: a
+// host without the directory is not a fleet host.
+func noteWakeProtocolEvidence() {
+	if _, err := os.Stat(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
+		return
+	}
+	_ = ensureWakeProtocolFloor()
+}
 
 // RaiseWakeProtocolFloor durably records that this host holds, or is about to
 // hold, an image that owes a wake. The template builder calls it before it
@@ -193,6 +242,36 @@ func WriteWallClockManifest(memPath string, m WallClockManifest) error {
 	return writeWallClockManifest(memPath, m, true)
 }
 
+// removeWallClockManifest removes the manifest beside an image, if any. One
+// that said frozen is removed with a directory sync so a crash cannot bring
+// it back; any other marker is simply removed. Only a host whose floor is up
+// reads before removing. Nothing to remove is not an error. A marker that
+// will not go is blocking unless it is known harmless: readable and not
+// frozen, or empty. One a restore could not read would refuse the image.
+func removeWallClockManifest(memPath string) (blocking bool, err error) {
+	path := WallClockMarkerPath(memPath)
+	frozen := false
+	if wakeProtocolFloorRaised() {
+		if man, rerr := ReadWallClockManifest(memPath); rerr == nil && man != nil && man.WorkloadFrozen {
+			frozen = true
+		}
+	}
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		if frozen {
+			return true, err
+		}
+		man, rerr := ReadWallClockManifest(memPath)
+		return rerr != nil || (man != nil && man.WorkloadFrozen), err
+	}
+	if !frozen {
+		return false, nil
+	}
+	return true, syncDir(filepath.Dir(path))
+}
+
 // writeWallClockManifestLazy publishes atomically but with no durability
 // barrier, for a manifest whose loss costs only a slower resume: an unfrozen
 // one. Nothing on a lifecycle path waits on a sync for it.
@@ -257,4 +336,151 @@ func randomHex() string {
 // clock.
 func imageManifest(memPath string) (*WallClockManifest, error) {
 	return ReadWallClockManifest(memPath)
+}
+
+// WatchTemplateManifests raises the rollback floor for frozen templates as
+// they land, so no restore has to happen first: a scan at start and every few
+// minutes plus a watch on the tree, off every request path. The returned
+// channel closes once the watcher has stopped.
+func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger) (stopped <-chan struct{}) {
+	done := make(chan struct{})
+	// Only a host that may act on frozen images watches: with the switch off
+	// this does no filesystem work. A frozen template must not reach such a
+	// host, which is enforced where templates are admitted.
+	if m.cfg.SnapshotDir == "" || !m.cfg.GuestClockFreezeEnabled {
+		close(done)
+		return done
+	}
+	scan := func() {
+		if n := m.scanTemplateManifests(); n > 0 && !wakeProtocolEvidenceLogged.Swap(true) {
+			log.Info().Int("templates", n).Msg("this host holds images that owe a wake; a vmd without the wake protocol is refused from now on")
+		}
+	}
+	go func() {
+		defer close(done)
+		scan()
+		// A template lands by copy, between scans. The tree is watched so a
+		// frozen one is witnessed as it lands, with the periodic scan as the
+		// fallback for anything the watch missed; a host that cannot watch
+		// keeps the scan alone.
+		root := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)
+		// The root is created if absent, so the watch has something to
+		// attach to before the first template lands rather than after.
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			log.Warn().Err(err).Str("path", root).Msg("template root cannot be created; frozen templates are witnessed by the periodic scan alone")
+		}
+		var events <-chan fsnotify.Event
+		var errs <-chan error
+		if w, werr := fsnotify.NewWatcher(); werr == nil {
+			defer w.Close()
+			watchTemplateTree(w, root)
+			events, errs = w.Events, w.Errors
+			// Anything that landed while the watches were being added.
+			scan()
+			t := time.NewTicker(firecrackerCapabilityRefreshInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					scan()
+				case ev := <-events:
+					// Writes too: an importer that creates the path and then
+					// streams the manifest into it is complete only at its
+					// last write, and a partial file simply fails to parse.
+					if !ev.Has(fsnotify.Create) && !ev.Has(fsnotify.Rename) && !ev.Has(fsnotify.Write) {
+						continue
+					}
+					if info, serr := os.Stat(ev.Name); serr == nil && info.IsDir() {
+						// A new template or build directory: watch it, and
+						// read what may already be inside.
+						watchTemplateTree(w, ev.Name)
+						scan()
+						continue
+					}
+					if strings.HasSuffix(ev.Name, clockFreezeMarkerSuffix) {
+						if n := m.noteTemplateManifest(ev.Name); n > 0 && !wakeProtocolEvidenceLogged.Swap(true) {
+							log.Info().Str("path", ev.Name).Msg("a frozen template landed; a vmd without the wake protocol is refused from now on")
+						}
+					}
+				case <-errs:
+				}
+			}
+		} else {
+			log.Warn().Err(werr).Msg("template tree cannot be watched; frozen templates are witnessed by the periodic scan alone")
+		}
+		t := time.NewTicker(firecrackerCapabilityRefreshInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				scan()
+			}
+		}
+	}()
+	return done
+}
+
+// watchTemplateTree watches dir and every directory beneath it to the depth
+// templates live at (templates/<template>/<build>); inotify watches are not
+// recursive, so each level is added, and what is already there is added now.
+func watchTemplateTree(w *fsnotify.Watcher, dir string) {
+	_ = w.Add(dir)
+	if rel, err := filepath.Rel(filepath.Dir(dir), dir); err != nil || rel == "" {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			sub := filepath.Join(dir, e.Name())
+			_ = w.Add(sub)
+			if subs, err := os.ReadDir(sub); err == nil {
+				for _, b := range subs {
+					if b.IsDir() {
+						_ = w.Add(filepath.Join(sub, b.Name()))
+					}
+				}
+			}
+		}
+	}
+}
+
+// noteTemplateManifest reads one manifest that just landed and raises the
+// floor for a frozen one. Returns 1 if it was frozen.
+func (m *Manager) noteTemplateManifest(path string) int {
+	man, err := ReadWallClockManifest(strings.TrimSuffix(path, clockFreezeMarkerSuffix))
+	if err != nil || man == nil || !man.WorkloadFrozen {
+		return 0
+	}
+	noteWakeProtocolEvidence()
+	return 1
+}
+
+var wakeProtocolEvidenceLogged atomic.Bool
+
+// scanTemplateManifests reads every template manifest under the snapshot
+// directory, raises the floor for each frozen one, and returns how many
+// frozen ones it found.
+func (m *Manager) scanTemplateManifests() int {
+	// Templates live at templates/<template>/<build>/; the shallower pattern
+	// is kept so a flattened layout could never hide one.
+	root := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)
+	deep, _ := filepath.Glob(filepath.Join(root, "*", "*", "*"+clockFreezeMarkerSuffix))
+	shallow, _ := filepath.Glob(filepath.Join(root, "*", "*"+clockFreezeMarkerSuffix))
+	n := 0
+	for _, path := range append(deep, shallow...) {
+		man, err := ReadWallClockManifest(strings.TrimSuffix(path, clockFreezeMarkerSuffix))
+		if err != nil || man == nil || !man.WorkloadFrozen {
+			continue
+		}
+		n++
+		noteWakeProtocolEvidence()
+	}
+	return n
 }
