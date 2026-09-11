@@ -66,14 +66,9 @@ resource "google_storage_bucket" "backup" {
   }
 }
 
-# Writers (the vmd host SA) can create objects and nothing else: objectCreator
-# carries storage.objects.create only. No read (a compromised host or API
-# cannot exfiltrate backups, its own cell's or another's, since the runtime
-# identity is currently shared across cells), no delete, and no overwrite
-# (replacing an existing object name also requires storage.objects.delete).
-# Uploader idempotency therefore cannot rely on get/list: uploads use an
-# ifGenerationMatch=0 precondition, and a 412 means the object already exists,
-# which the uploader treats as success.
+# Legacy shared runtimes stay write-only. Dedicated per-cell VMD identities
+# may receive bucket-scoped create/read grants from their environment root
+# for fetch-before-resume. No host receives delete or overwrite permission.
 resource "google_storage_bucket_iam_member" "writer_create" {
   for_each = toset(var.writer_members)
 
@@ -82,8 +77,7 @@ resource "google_storage_bucket_iam_member" "writer_create" {
   member = each.value
 }
 
-# Reads are reserved for a dedicated per-cell restore identity that nothing on
-# the hosts or in the runtime serves as. Restore tooling and drills impersonate
+# Operator restore tooling uses a separate per-cell identity. Restore tooling and drills impersonate
 # it; the impersonation grants are managed out-of-band (admin-held, same
 # pattern as the KMS grants) so the shared runtime identity never gains read.
 resource "google_service_account" "restore" {

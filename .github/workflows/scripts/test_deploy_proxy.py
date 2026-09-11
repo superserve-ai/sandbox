@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import subprocess
 import unittest
@@ -31,7 +32,7 @@ class DeployProxyOrderingTest(unittest.TestCase):
 
 
 class DeployProxyTests(unittest.TestCase):
-    def generate_script(self, peer_addr, identity="spiffe://example.test/peer"):
+    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True):
         scripts = []
 
         def run(args, **kwargs):
@@ -51,6 +52,7 @@ class DeployProxyTests(unittest.TestCase):
             "SHA": "12345678",
             "PROXY_DOMAIN": "sandbox.example.test",
             "PEER_PROXY_LISTEN_ADDR": peer_addr,
+            "PEER_IDENTITY_HOSTS": "example-host" if required_identity else "",
             "PEER_PROXY_SPIFFE_URI": identity,
             "PEER_PROXY_CERT_FILE": "/etc/peer/cert.pem",
             "PEER_PROXY_KEY_FILE": "/etc/peer/key.pem",
@@ -71,6 +73,12 @@ class DeployProxyTests(unittest.TestCase):
                     ["bash", "-n"], input=self.generate_script(peer_addr), capture_output=True, text=True
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_workflow_identity_is_not_authoritative(self):
+        script = self.generate_script("auto", "spiffe://stale.example.test/peer")
+        self.assertNotIn("spiffe://stale.example.test/peer", script)
+        self.assertIn("/etc/superserve/peer/identity.json", script)
+        self.assertLess(script.index("refresh-peer-credentials --check"), script.index("sudo mv /tmp/proxy"))
 
     def test_vmd_readiness_requires_current_invocation(self):
         script = self.generate_script("")
@@ -112,7 +120,8 @@ class DeployProxyTests(unittest.TestCase):
                                           ("192.0.2.2:5010", "tee-dropin"),
                                           ("192.0.2.2:5010", "proxy-always"),
                                           ("192.0.2.2:5010", "none"))]
-        cases += [("", "none", "spiffe://example.test/peer"), ("", "none", ""),
+        cases += [("", "none", "spiffe://example.test/peer"), ("", "none", ""), ("auto", "none", ""),
+                  ("auto", "missing-identity", ""),
                   ("", "missing-cert", "spiffe://example.test/peer")]
         for peer_addr, failed_service, identity in cases:
             with self.subTest(peer_addr=peer_addr, failed_service=failed_service), tempfile.TemporaryDirectory() as tmp:
@@ -123,9 +132,9 @@ class DeployProxyTests(unittest.TestCase):
                     "etc/sandbox/proxy.env": old_env,
                     "etc/sandbox/vmd.env": old_env,
                     "etc/systemd/system/proxy.service.d/peer-credentials.conf": old_credentials,
-                    "etc/peer/cert.pem": "test cert",
-                    "etc/peer/key.pem": "test key",
-                    "etc/peer/ca.pem": "test ca",
+                    "etc/superserve/peer/tls.crt": "test cert",
+                    "etc/superserve/peer/tls.key": "test key",
+                    "etc/superserve/peer/ca.crt": "test ca",
                     "tmp/proxy-12345678": "binary",
                     "tmp/proxy.service": "unit",
                 }
@@ -134,12 +143,21 @@ class DeployProxyTests(unittest.TestCase):
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(contents)
                 (root / "bin").mkdir()
+                (root / "run/lock").mkdir(parents=True)
+                (root / "run/lock/vmd-peer-credentials.lock").touch()
+                check = root / "bin/refresh-peer-credentials"
+                check.write_text("#!/bin/sh\nexit 0\n")
+                check.chmod(0o755)
+                if identity:
+                    (root / "etc/superserve/peer/identity.json").write_text(json.dumps({"spiffe_uri": identity}))
                 if not identity or failed_service == "missing-cert":
-                    (root / "etc/peer/cert.pem").unlink()
-                script = self.generate_script(peer_addr, identity)
+                    (root / "etc/superserve/peer/tls.crt").unlink()
+                script = self.generate_script(peer_addr, identity, bool(identity) or failed_service == "missing-identity")
                 script = script.replace("/etc/", f"{root}/etc/")
                 script = script.replace("/tmp/proxy", f"{root}/tmp/proxy")
                 script = script.replace("/usr/local/bin", f"{root}/bin")
+                script = script.replace("/usr/local/sbin", f"{root}/bin")
+                script = script.replace("/run/lock", f"{root}/run/lock")
                 # A backup suffix makes GNU in-place sed syntax portable to BSD sed.
                 script = script.replace("sed -i ", "sed -i.bak ")
                 functions = f'''
@@ -156,6 +174,7 @@ class DeployProxyTests(unittest.TestCase):
                     "$@"
                 }}
                 sleep() {{ :; }}
+                flock() {{ :; }}
                 systemctl() {{
                     if [ "$1" = show ]; then echo current-invocation; return 0; fi
                     if [ "$1" = restart ]; then
@@ -177,6 +196,13 @@ class DeployProxyTests(unittest.TestCase):
                 if failed_service == "none":
                     self.assertEqual(result.returncode, 0, result.stderr)
                     proxy_env = (root / "etc/sandbox/proxy.env").read_text()
+                    if not identity:
+                        self.assertEqual("".join(line + "\n" for line in proxy_env.splitlines() if line.startswith("PEER_PROXY_")), old_env)
+                        self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_env)
+                        self.assertEqual((root / "etc/systemd/system/proxy.service.d/peer-credentials.conf").read_text(), old_credentials)
+                        self.assertEqual((root / "restarts").read_text().splitlines(), ["proxy"])
+                        self.assertIn("PROXY_DOMAIN=sandbox.example.test", proxy_env)
+                        continue
                     self.assertIn(f"PEER_PROXY_LISTEN_ADDR={peer_addr}\n", proxy_env)
                     if peer_addr:
                         self.assertIn(peer_addr, (root / "etc/sandbox/vmd.env").read_text())
@@ -191,6 +217,11 @@ class DeployProxyTests(unittest.TestCase):
                     self.assertEqual(list((root / "etc/sandbox").glob("proxy-rollback.*")), [])
                     continue
                 self.assertNotEqual(result.returncode, 0)
+                if failed_service == "missing-identity":
+                    self.assertIn("host requires infrastructure identity bootstrap", result.stderr)
+                    self.assertEqual((root / "etc/sandbox/proxy.env").read_text(), old_env)
+                    self.assertFalse((root / "restarts").exists())
+                    continue
                 if failed_service == "missing-cert":
                     self.assertIn("peer credential missing", result.stderr)
                     self.assertEqual((root / "etc/sandbox/proxy.env").read_text(), old_env)
