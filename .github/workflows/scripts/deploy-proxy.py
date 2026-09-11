@@ -73,6 +73,7 @@ def main() -> int:
     if not database_url:
         print("ERROR: DATABASE_URL is required for cross-host routing", file=sys.stderr)
         return 1
+    database_env_line = 'DATABASE_URL="' + database_url.replace('\\', '\\\\').replace('"', '\\"') + '"'
     terminal_origins = os.environ.get("PROXY_ALLOWED_ORIGINS", "")
     if terminal_origins and not re.fullmatch(r"[A-Za-z0-9.,:/*\-]+", terminal_origins):
         print("ERROR: PROXY_ALLOWED_ORIGINS contains disallowed characters", file=sys.stderr)
@@ -381,7 +382,6 @@ def main() -> int:
             SANDBOX_ACCESS_TOKEN_SEED={access_seed}
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
-            DATABASE_URL={shlex.quote(database_url)}
             SENTRY_DSN={sentry_dsn}
             PEER_PROXY_LISTEN_ADDR=$peer_listen_addr
             PEER_PROXY_TARGET_ADDR={peer_env['PEER_PROXY_TARGET_ADDR']}
@@ -398,6 +398,7 @@ def main() -> int:
                     sudo awk '/^PEER_PROXY_/' "$rollback_dir/proxy.env" | sudo tee -a /etc/sandbox/proxy.env > /dev/null
                 fi
             fi
+            printf '%s\\n' {shlex.quote(database_env_line)} | sudo tee -a /etc/sandbox/proxy.env > /dev/null
             sudo chmod 0600 /etc/sandbox/proxy.env
 
             if ! sudo systemctl restart proxy; then
