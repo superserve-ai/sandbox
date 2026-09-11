@@ -71,10 +71,11 @@ func (noopPeerTelemetry) PeerDrain(bool)                      {}
 func (noopPeerTelemetry) PeerHandshake(time.Duration, string) {}
 
 type peerPool struct {
-	mu     sync.Mutex
-	cfg    PeerPoolConfig
-	hosts  map[string]*hostPool
-	closed bool
+	mu        sync.Mutex
+	cfg       PeerPoolConfig
+	hosts     map[string]*hostPool
+	closed    bool
+	closeDone chan struct{}
 }
 
 func NewPeerTransport(cfg PeerPoolConfig) PeerTransport {
@@ -130,10 +131,14 @@ func (p *peerPool) OpenStream(ctx context.Context, host, addr string) (PeerStrea
 func (p *peerPool) Close() error {
 	p.mu.Lock()
 	if p.closed {
+		done := p.closeDone
 		p.mu.Unlock()
+		<-done
 		return nil
 	}
 	p.closed = true
+	p.closeDone = make(chan struct{})
+	defer close(p.closeDone)
 	hs := make([]*hostPool, 0, len(p.hosts))
 	for _, h := range p.hosts {
 		hs = append(hs, h)
@@ -264,31 +269,18 @@ func (h *hostPool) replaceLocked(addr string) {
 	// h.conns would consume the replacement endpoint's connection slots.
 	old := h.conns
 	h.conns = nil
-	var idle []*peerConn
 	for _, c := range old {
 		c.mu.Lock()
 		c.draining = true
 		c.detached = true
-		isIdle := c.active == 0
 		c.mu.Unlock()
 		h.retired++
 		if h.retiredConns == nil {
 			h.retiredConns = make(map[*peerConn]struct{})
 		}
 		h.retiredConns[c] = struct{}{}
-		if isIdle {
-			idle = append(idle, c)
-		} else {
-			h.scheduleDrain(c)
-		}
+		h.scheduleDrain(c)
 	}
-	h.mu.Unlock()
-	for _, c := range idle {
-		c.close()
-		h.remove(c)
-		h.parent.cfg.Telemetry.PeerDrain(false)
-	}
-	h.mu.Lock()
 	h.replacing = false
 	h.mu.Unlock()
 }

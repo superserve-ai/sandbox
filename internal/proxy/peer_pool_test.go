@@ -1333,3 +1333,71 @@ func TestPeerPoolShutdownWaitsForDrainNotification(t *testing.T) {
 		t.Fatal("stream completion did not wake shutdown")
 	}
 }
+
+func TestPeerPoolConcurrentCloseWaitsForShutdown(t *testing.T) {
+	dial, _, _ := testDialer()
+	p := NewPeerTransport(PeerPoolConfig{Dial: dial, DrainTimeout: time.Second}).(*peerPool)
+	s, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := p.hosts["host"]
+	first, second := make(chan struct{}), make(chan struct{})
+	go func() { _ = p.Close(); close(first) }()
+	waitPeerWaiter(t, h)
+	go func() { _ = p.Close(); close(second) }()
+	select {
+	case <-second:
+		t.Fatal("concurrent Close returned before drain completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	_ = s.Close()
+	for _, done := range []chan struct{}{first, second} {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("Close did not finish after drain")
+		}
+	}
+	_ = p.Close()
+}
+
+func TestPeerPoolSlowIdleCloseDoesNotBlockOpens(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	p := NewPeerTransport(PeerPoolConfig{Dial: func(_ context.Context, _, addr string) (PeerClient, io.Closer, error) {
+		if addr == "old" {
+			return &testPeerClient{}, callbackPeerCloser{close: func() { close(started); <-release }}, nil
+		}
+		return &testPeerClient{}, &countingCloser{}, nil
+	}})
+	s, err := p.OpenStream(context.Background(), "host", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	done := make(chan error, 2)
+	open := func(host string) {
+		s, err := p.OpenStream(context.Background(), host, "new")
+		if s != nil {
+			_ = s.Close()
+		}
+		done <- err
+	}
+	go open("host")
+	<-started
+	go open("unrelated")
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("slow retired transport blocked opens")
+		}
+	}
+	once.Do(func() { close(release) })
+	_ = p.Close()
+}
