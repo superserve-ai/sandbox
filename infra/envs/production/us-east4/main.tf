@@ -405,17 +405,18 @@ resource "google_compute_attached_disk" "sandbox_data" {
   mode        = "READ_WRITE"
 }
 
-# Second host for the cell, provisioned as a standby. Same shape and OS
-# lineage as the serving host so snapshots restore across the two. Labeled
-# out of deploy discovery until it is prepared; the first-boot script below
-# does everything a deploy assumes is already on a host, except secrets.
+# Second host for the cell in the primary slot, provisioned as a standby.
+# Same shape and OS lineage as the serving host so snapshots restore across
+# the two. Labeled out of deploy discovery until it is prepared; the
+# first-boot script below does everything a deploy assumes is already on a
+# host, except secrets.
 locals {
-  host_c_artifact_bucket = module.backup_storage.bucket_name
-  host_c_kernel_object   = "vmlinux-4.14-fuse"
+  host_a_artifact_bucket = module.backup_storage.bucket_name
+  host_a_kernel_object   = "vmlinux-4.14-fuse"
 
   # Non-secret vmd.env keys the bootstrap writes once. The deploy upserts
   # its own keys on top; secrets are appended by an operator.
-  host_c_vmd_env = {
+  host_a_vmd_env = {
     HOST_REGION                 = local.region
     VMD_SCHEDULABLE_MEMORY_MIB  = "1500000"
     VMD_SCHEDULABLE_VCPUS       = "192"
@@ -425,17 +426,17 @@ locals {
   }
 }
 
-module "sandbox_host_c" {
+module "sandbox_host" {
   source = "../../../modules/sandbox-host"
 
   project_id    = local.project_id
   environment   = local.environment
   region        = local.region
   zone          = local.zone
-  instance_name = "superserve-vmd-${local.resource_suffix}-3"
+  instance_name = "superserve-vmd-${local.resource_suffix}"
   machine_type  = "z3-highmem-192-highlssd-metal"
   subnet        = module.network.subnetwork_self_link
-  internal_ip   = "10.2.0.4"
+  internal_ip   = "10.2.0.2"
   tags          = ["vmd-use4"]
 
   labels = merge(local.sandbox_host_labels, {
@@ -450,12 +451,12 @@ module "sandbox_host_c" {
   service_account_email = data.google_service_account.api_runner.email
 
   boot_disk_image   = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
-  boot_disk_size_gb = 250
+  boot_disk_size_gb = 200
   boot_disk_type    = var.boot_disk_type
 
   can_ip_forward      = false
   on_host_maintenance = "TERMINATE"
-  reservation_name    = var.host_c_reservation_name
+  reservation_name    = var.primary_reservation_name
 
   # The subnet has no NAT; first boot needs to reach package mirrors and
   # object storage. Ignored after creation, so it can be removed by hand.
@@ -467,11 +468,11 @@ module "sandbox_host_c" {
     startup-script = join("\n\n", [
       templatefile("${path.module}/../../../../deploy/host-bootstrap/sandbox-host-bootstrap.sh.tftpl", {
         localssd_script  = file("${path.module}/../../../../deploy/host-bootstrap/sandbox-localssd.sh")
-        artifact_bucket  = local.host_c_artifact_bucket
-        kernel_object    = local.host_c_kernel_object
+        artifact_bucket  = local.host_a_artifact_bucket
+        kernel_object    = local.host_a_kernel_object
         rootfs_object    = "base.ext4"
         data_disk_device = "superserve-sandbox-data"
-        vmd_env          = local.host_c_vmd_env
+        vmd_env          = local.host_a_vmd_env
       }),
       templatefile("${path.module}/../../../../deploy/unbound/unbound-bootstrap.sh.tftpl", {
         guest_cidr         = "10.11.0.0/16"
@@ -483,9 +484,9 @@ module "sandbox_host_c" {
   }
 }
 
-resource "google_compute_disk" "sandbox_data_c" {
+resource "google_compute_disk" "sandbox_data_a" {
   project = local.project_id
-  name    = "${module.sandbox_host_c.instance_name}-sandbox-data"
+  name    = "${module.sandbox_host.instance_name}-sandbox-data"
   zone    = local.zone
   type    = "hyperdisk-balanced"
   size    = 1024
@@ -500,11 +501,11 @@ resource "google_compute_disk" "sandbox_data_c" {
   }
 }
 
-resource "google_compute_attached_disk" "sandbox_data_c" {
+resource "google_compute_attached_disk" "sandbox_data_a" {
   project     = local.project_id
   zone        = local.zone
-  disk        = google_compute_disk.sandbox_data_c.id
-  instance    = module.sandbox_host_c.instance_self_link
+  disk        = google_compute_disk.sandbox_data_a.id
+  instance    = module.sandbox_host.instance_self_link
   device_name = "superserve-sandbox-data"
   mode        = "READ_WRITE"
 }
@@ -535,10 +536,10 @@ module "observability" {
       instance_name = module.sandbox_host_b.instance_name
       instance_id   = module.sandbox_host_b.instance_id
     }
-    sandbox_host_c = {
-      display_name  = "Infrastructure / ${module.sandbox_host_c.instance_name} / CPU saturation"
-      instance_name = module.sandbox_host_c.instance_name
-      instance_id   = module.sandbox_host_c.instance_id
+    sandbox_host = {
+      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host.instance_name
+      instance_id   = module.sandbox_host.instance_id
     }
   }
   # Backup pipeline alerts scoped to this cell's host via the host_id
@@ -597,10 +598,10 @@ module "observability" {
       instance_name = module.sandbox_host_b.instance_name
       instance_id   = module.sandbox_host_b.instance_id
     }
-    sandbox_host_c = {
-      display_name  = "Infrastructure / ${module.sandbox_host_c.instance_name} / host maintenance event"
-      instance_name = module.sandbox_host_c.instance_name
-      instance_id   = module.sandbox_host_c.instance_id
+    sandbox_host = {
+      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / host maintenance event"
+      instance_name = module.sandbox_host.instance_name
+      instance_id   = module.sandbox_host.instance_id
     }
   }
   labels = local.common_labels
