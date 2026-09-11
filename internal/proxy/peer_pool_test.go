@@ -2186,3 +2186,134 @@ func TestPeerPoolFailedStreamClosesPhysicallyOnce(t *testing.T) {
 		t.Fatalf("physical closes=%d", raw.calls.Load())
 	}
 }
+
+type lateCanceledPeerClient struct {
+	started chan struct{}
+	stream  PeerStream
+}
+
+func (c lateCanceledPeerClient) OpenPeerStream(ctx context.Context) (PeerStream, error) {
+	close(c.started)
+	<-ctx.Done()
+	return c.stream, nil
+}
+
+type heldClosePeerStream struct {
+	testPeerStream
+	started, release, closed chan struct{}
+}
+
+func (s *heldClosePeerStream) Close() error {
+	close(s.started)
+	<-s.release
+	_ = s.testPeerStream.Close()
+	close(s.closed)
+	return nil
+}
+func TestPeerPoolStaleOpenCleanupDoesNotBlockRetry(t *testing.T) {
+	raw := &heldClosePeerStream{started: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
+	started, closing, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var streamOnce, transportOnce sync.Once
+	defer streamOnce.Do(func() { close(raw.release) })
+	defer transportOnce.Do(func() { close(release) })
+	p := NewPeerTransport(PeerPoolConfig{DrainTimeout: time.Second, Dial: func(_ context.Context, _, addr string) (PeerClient, io.Closer, error) {
+		if addr == "old" {
+			return lateCanceledPeerClient{started, raw}, callbackPeerCloser{close: func() { <-raw.closed; close(closing); <-release }}, nil
+		}
+		return &testPeerClient{}, &countingCloser{}, nil
+	}})
+	done := make(chan error, 1)
+	go func() {
+		s, err := p.OpenStream(context.Background(), "host", "old")
+		if s != nil {
+			_ = s.Close()
+		}
+		done <- err
+	}()
+	<-started
+	replacement, err := p.OpenStream(context.Background(), "host", "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = replacement.Close()
+	select {
+	case <-raw.started:
+	case <-time.After(time.Second):
+		t.Fatal("stale stream was not closed before connection cleanup")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale cleanup blocked original request retry")
+	}
+	streamOnce.Do(func() { close(raw.release) })
+	select {
+	case <-closing:
+	case <-time.After(time.Second):
+		t.Fatal("transport closer did not follow stream close")
+	}
+	transportOnce.Do(func() { close(release) })
+	_ = p.Close()
+}
+
+type contextRecordingPeerClient struct{ streams []*contextPoolPeerStream }
+
+func (c *contextRecordingPeerClient) OpenPeerStream(ctx context.Context) (PeerStream, error) {
+	s := &contextPoolPeerStream{ctx: ctx}
+	c.streams = append(c.streams, s)
+	return s, nil
+}
+func TestPeerPoolForcedDrainClosesCustomStreams(t *testing.T) {
+	for _, operation := range []string{"shutdown", "replacement"} {
+		t.Run(operation, func(t *testing.T) {
+			client := &contextRecordingPeerClient{}
+			closer := &countingCloser{}
+			p := NewPeerTransport(PeerPoolConfig{DrainTimeout: 10 * time.Millisecond, Dial: func(_ context.Context, _, addr string) (PeerClient, io.Closer, error) {
+				if addr == "old" {
+					return client, closer, nil
+				}
+				return &testPeerClient{}, &countingCloser{}, nil
+			}})
+			var streams []PeerStream
+			for i := 0; i < 3; i++ {
+				s, err := p.OpenStream(context.Background(), "host", "old")
+				if err != nil {
+					t.Fatal(err)
+				}
+				streams = append(streams, s)
+			}
+			if operation == "shutdown" {
+				_ = p.Close()
+			} else {
+				s, err := p.OpenStream(context.Background(), "host", "new")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer s.Close()
+			}
+			waitPeerCondition(t, func() bool {
+				for _, s := range client.streams {
+					if !s.closed.Load() {
+						return false
+					}
+				}
+				return true
+			})
+			for _, s := range client.streams {
+				if s.ctx.Err() == nil {
+					t.Fatal("forced drain did not cancel stream context")
+				}
+				if _, err := s.Write([]byte("obsolete")); err == nil {
+					t.Fatal("forced stream remains usable")
+				}
+			}
+			c := streams[0].(*countedPeerStream).conn
+			waitPeerCondition(t, func() bool { c.mu.Lock(); defer c.mu.Unlock(); return len(c.streams) == 0 })
+			waitPeerCondition(t, func() bool { return closer.closed.Load() == 1 })
+			_ = p.Close()
+		})
+	}
+}

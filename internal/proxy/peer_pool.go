@@ -370,6 +370,29 @@ func (c *peerConn) close() {
 	})
 }
 
+// Stream and transport closers may wait on each other. Cancel every stream
+// first, then run their physical closes alongside transport cleanup.
+func (c *peerConn) closeWithStreams() {
+	c.mu.Lock()
+	streams := make([]*countedPeerStream, 0, len(c.streams))
+	for s := range c.streams {
+		streams = append(streams, s)
+	}
+	c.mu.Unlock()
+	var closed sync.WaitGroup
+	for _, s := range streams {
+		if s.cancel != nil {
+			s.cancel()
+		}
+	}
+	for _, s := range streams {
+		closed.Add(1)
+		go func() { defer closed.Done(); _ = s.Close() }()
+	}
+	c.close()
+	closed.Wait()
+}
+
 func (h *hostPool) replaceLocked(addr string) {
 	h.mu.Lock()
 	h.replacing = true
@@ -431,10 +454,12 @@ retry:
 					c.mu.Unlock()
 					h.mu.Unlock()
 					cancel()
-					h.releaseOpen(c)
-					if s != nil {
-						_ = s.Close()
-					}
+					go func() {
+						if s != nil {
+							_ = s.Close()
+						}
+						h.releaseOpen(c)
+					}()
 					continue retry
 				}
 				if e == nil {
@@ -781,20 +806,7 @@ func (h *hostPool) detachFailed(c *peerConn) func() {
 	h.mu.Unlock()
 	if found {
 		return func() {
-			c.mu.Lock()
-			streams := make([]*countedPeerStream, 0, len(c.streams))
-			for s := range c.streams {
-				streams = append(streams, s)
-			}
-			c.mu.Unlock()
-			// Close outside the connection lock and exactly once. This is also
-			// safe when read/write failures race with stream-open or drain cleanup.
-			c.close()
-			// Force attached streams to observe the transport failure immediately.
-			// Wrapper cleanup also releases their capacity and telemetry.
-			for _, s := range streams {
-				_ = s.Close()
-			}
+			c.closeWithStreams()
 			h.remove(c)
 			h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "failure"})
 		}
@@ -887,9 +899,7 @@ func (h *hostPool) scheduleDrain(c *peerConn) {
 		c.published = 0
 		c.active = 0
 		c.mu.Unlock()
-		c.close()
-		// Reclaim the slot at the deadline even if attached streams have not
-		// closed yet; their subsequent cleanup is idempotent.
+		c.closeWithStreams()
 		h.remove(c)
 		if emit {
 			c.flushStreamDelta(h.parent.cfg.Telemetry)
@@ -1007,7 +1017,7 @@ draining:
 		c.removed = true
 		c.mu.Unlock()
 		cleanups.Add(1)
-		go func() { defer cleanups.Done(); c.close(); h.remove(c) }()
+		go func() { defer cleanups.Done(); c.closeWithStreams(); h.remove(c) }()
 		if emit {
 			c.flushStreamDelta(h.parent.cfg.Telemetry)
 		}
