@@ -1,23 +1,12 @@
--- Drop three sandbox indexes that newer ones already cover. Every relation a
--- statement locks past its 16 fast-path slots goes through the shared lock
--- table, and sandbox alone (table + 15 indexes) fills all 16, so each insert
--- and status update pays shared-lock traffic for every relation after it.
--- Under a create burst that traffic is the dominant wait. Fewer indexes,
--- fewer shared-table entries per write.
+-- Three sandbox indexes newer ones already cover: idx_sandbox_host is
+-- idx_sandbox_host_reconcile without the included columns, idx_sandbox_host_active
+-- is served by that index's included status column, and idx_sandbox_status only
+-- backs periodic scans that have their own partial index or read most live rows.
+-- Every index is one more relation each write must lock.
 --
---   idx_sandbox_host         same key and predicate as idx_sandbox_host_reconcile,
---                            which also carries id, status, snapshot_id.
---   idx_sandbox_host_active  ListActiveHostsByLoad and ListHostsAdmin; served by
---                            idx_sandbox_host_reconcile's included status column.
---   idx_sandbox_status       the periodic reaper and billing scans; two have their
---                            own partial indexes, the rest read most live rows.
---
--- A plain DROP INDEX takes an exclusive lock on sandbox: it waits for every
--- in-flight statement on the table and queues new ones behind it. On a busy
--- database drop them CONCURRENTLY by hand before merging; the statements
--- below then find nothing and only record the schema. The lock timeout makes
--- a skipped pre-drop fail the push with a bounded stall instead of blocking
--- sandbox writes behind a long-running list query:
+-- A plain DROP INDEX takes an exclusive lock on sandbox. On a populated
+-- database drop them CONCURRENTLY by hand first; the statements below then
+-- only record the schema, and the timeouts bound the stall if that was skipped:
 --
 --   DROP INDEX CONCURRENTLY IF EXISTS idx_sandbox_host;
 --   DROP INDEX CONCURRENTLY IF EXISTS idx_sandbox_host_active;
