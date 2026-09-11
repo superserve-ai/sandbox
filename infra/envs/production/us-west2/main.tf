@@ -109,6 +109,18 @@ module "network" {
   vpc_connector_subnet_ip     = var.connector_subnet_cidr
 
   firewall_rules = {
+    peer_ingress = {
+      name          = "superserve-usw2-allow-peer-ingress"
+      direction     = "INGRESS"
+      source_ranges = ["10.1.0.2/32", "10.1.0.3/32"]
+      target_tags   = ["vmd-usw2"]
+      allow = [{
+        protocol = "tcp"
+        ports    = ["5009"]
+      }]
+      description = "Allow private VMD peer ingress within the cell."
+    }
+
     allow_vmd_grpc = {
       name          = "superserve-usw2-allow-cr-vmd"
       direction     = "INGRESS"
@@ -392,9 +404,11 @@ module "sandbox_host_b" {
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
-  service_account_email = data.google_service_account.api_runner.email
-  boot_disk_image       = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
-  boot_disk_size_gb     = 250
+  service_account_email     = google_service_account.vmd_runtime.email
+  allow_stopping_for_update = true
+  depends_on                = [google_project_iam_member.vmd_telemetry, google_storage_bucket_iam_member.vmd_backup, google_service_account_iam_member.vmd_deploy_act_as]
+  boot_disk_image           = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  boot_disk_size_gb         = 250
   # Metal machine types reject the API-default pd-standard boot disk.
   boot_disk_type      = "hyperdisk-balanced"
   can_ip_forward      = false

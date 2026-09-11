@@ -407,9 +407,11 @@ module "sandbox_host_b" {
     sandbox_role = "vmd"
   })
 
-  service_account_email = module.iam.service_account_emails["superserve_api"]
-  boot_disk_image       = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
-  boot_disk_size_gb     = 200
+  service_account_email     = google_service_account.vmd_runtime.email
+  allow_stopping_for_update = true
+  depends_on                = [google_project_iam_member.vmd_telemetry, google_storage_bucket_iam_member.vmd_backup, google_service_account_iam_member.vmd_deploy_act_as]
+  boot_disk_image           = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
+  boot_disk_size_gb         = 200
   # Declared explicitly so both hosts use the same boot disk type; the
   # module's own default is the API's pd-standard.
   boot_disk_type = "pd-ssd"

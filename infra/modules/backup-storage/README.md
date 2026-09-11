@@ -24,11 +24,12 @@ generation is recorded in the control-plane database.
 
 | Identity | Roles | Can |
 | --- | --- | --- |
-| vmd host SA (`writer_members`) | `objectCreator` only | create new objects, nothing else |
+| legacy shared runtime (`writer_members`) | `objectCreator` only | create new objects, nothing else |
+| dedicated per-cell VMD SA (environment-owned grants) | `objectCreator` + `objectViewer` | create/read/list within its cell only; no delete/overwrite |
 | dedicated restore SA (created by this module) | `objectViewer` | read/list, for restore tooling and drills via impersonation |
 | dedicated GC SA (created by this module) | `objectAdmin` | delete objects past the retention window |
 
-Writers cannot **read** (the runtime identity is currently shared across
+Legacy shared writers cannot **read** (the runtime identity is currently shared across
 cells, so read access on it would let a compromise in any host or API
 exfiltrate every cell's backups), cannot delete, and cannot **overwrite**
 (overwriting an existing object name requires `storage.objects.delete`).
@@ -40,11 +41,10 @@ The restore and GC service accounts are control-plane/tooling-only: no host
 or runtime service may run as them, and impersonation grants are managed
 out-of-band (admin-held, same pattern as the KMS grants).
 
-Known limit: write-side cell isolation. Both cells' hosts currently run as
-the same shared SA, so a compromised host can still create (pollute) objects
-in the other cell's bucket, though it can read or destroy nothing. Full
-isolation needs per-cell host service accounts, which requires a host
-stop/start to change the attached SA; tracked as follow-up work.
+Known limit: write-side cell isolation. Legacy serving hosts still run as
+the shared SA, so a compromised host can still create (pollute) objects
+in the other cell's bucket, though it can read or destroy nothing. New cold-standby hosts use dedicated per-cell service accounts. Legacy
+host migration waits for draining; they must not be stopped for an IAM update.
 
 ## Retention model (layered)
 
