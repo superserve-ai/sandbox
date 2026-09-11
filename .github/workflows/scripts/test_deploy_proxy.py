@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import unittest
 import tempfile
@@ -69,6 +70,19 @@ class DeployProxyTests(unittest.TestCase):
         self.assertEqual(len(scripts), 1)
         self.assertIn("PEER_PROXY_TARGET_ADDR=127.0.0.1:5010\n", scripts[0])
         return scripts[0]
+
+    def test_production_steps_enable_private_ingress(self):
+        workflow = Path(__file__).parents[1].joinpath("deploy-proxy.yml").read_text()
+        production = workflow.split("  deploy-production:", 1)[1]
+        steps = re.split(r"^      - name: ", production, flags=re.MULTILINE)
+        deployments = [step for step in steps if "python3 .github/workflows/scripts/deploy-proxy.py" in step]
+        self.assertEqual(len(deployments), 2)
+        for step in deployments:
+            with self.subTest(step=step.splitlines()[0]):
+                self.assertRegex(step, r"(?m)^          PEER_PROXY_LISTEN_ADDR: auto$")
+                script = self.generate_script("auto")
+                self.assertIn('PEER_PROXY_LISTEN_ADDR=', script)
+                self.assertIn(':5009', script)
 
     def test_generated_shell_parses(self):
         for peer_addr in ("", "auto"):

@@ -128,21 +128,30 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 	// both descriptors so the other copy cannot remain blocked forever.
 	done := make(chan struct{})
 	var once sync.Once
-	closeBoth := func() { once.Do(func() { close(done); _ = conn.Close(); _ = stream.Close() }) }
+	var bridgeErr error
+	closeBoth := func(err error) {
+		once.Do(func() {
+			if r.Context().Err() == nil {
+				bridgeErr = err
+			}
+			close(done)
+			_ = conn.Close()
+			_ = stream.Close()
+		})
+	}
 	go func() {
 		select {
 		case <-r.Context().Done():
-			closeBoth()
+			closeBoth(nil)
 		case <-done:
 		}
 	}()
-	var responseErr error
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
 		if err := request.Write(stream); err != nil {
-			closeBoth()
+			closeBoth(err)
 			return
 		}
 		if upgrade {
@@ -156,16 +165,11 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 	go func() {
 		defer wg.Done()
 		_, err := io.Copy(conn, stream)
-		// Closing the upload or cancelling the request also unblocks this
-		// copy. Only errors observed before our own shutdown are peer failures.
-		select {
-		case <-done:
-		default:
-			responseErr = err
-		}
-		closeBoth()
+		// The first terminal event owns the result; closing either descriptor
+		// can make the other pump fail as a consequence.
+		closeBoth(err)
 	}()
 	wg.Wait()
-	closeBoth()
-	return responseErr
+	closeBoth(nil)
+	return bridgeErr
 }
