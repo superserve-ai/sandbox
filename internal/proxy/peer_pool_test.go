@@ -1265,3 +1265,71 @@ func TestPeerPoolCountsRetiredConnectionsUntilDrainCompletes(t *testing.T) {
 		t.Fatalf("connections after shutdown = %d, want 0", got)
 	}
 }
+
+type selfClosingPeerClient struct {
+	testPeerClient
+	closed atomic.Int32
+}
+
+func (c *selfClosingPeerClient) Close() error { c.closed.Add(1); return nil }
+
+func TestPeerPoolClosesClientWithoutSeparateCloser(t *testing.T) {
+	for _, operation := range []string{"shutdown", "replacement", "failure"} {
+		t.Run(operation, func(t *testing.T) {
+			client := &selfClosingPeerClient{}
+			p := NewPeerTransport(PeerPoolConfig{Dial: func(_ context.Context, _, addr string) (PeerClient, io.Closer, error) {
+				if addr == "old" {
+					return client, nil, nil
+				}
+				return &testPeerClient{}, &countingCloser{}, nil
+			}}).(*peerPool)
+			defer p.Close()
+			s, err := p.OpenStream(context.Background(), "host", "old")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = s.Close()
+			switch operation {
+			case "shutdown":
+				_ = p.Close()
+			case "replacement":
+				next, err := p.OpenStream(context.Background(), "host", "new")
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = next.Close()
+			case "failure":
+				cs := s.(*countedPeerStream)
+				cs.host.markFailed(cs.conn)
+			}
+			_ = p.Close()
+			if got := client.closed.Load(); got != 1 {
+				t.Fatalf("client closed %d times, want 1", got)
+			}
+		})
+	}
+}
+
+func TestPeerPoolShutdownWaitsForDrainNotification(t *testing.T) {
+	dial, _, _ := testDialer()
+	p := NewPeerTransport(PeerPoolConfig{Dial: dial, DrainTimeout: time.Second}).(*peerPool)
+	s, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := p.hosts["host"]
+	done := make(chan struct{})
+	go func() { _ = p.Close(); close(done) }()
+	waitPeerWaiter(t, h)
+	select {
+	case <-done:
+		t.Fatal("shutdown did not wait for active stream")
+	default:
+	}
+	_ = s.Close()
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("stream completion did not wake shutdown")
+	}
+}

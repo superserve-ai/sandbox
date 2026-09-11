@@ -245,11 +245,7 @@ func closeDialResult(client PeerClient, closer io.Closer) {
 }
 
 func (c *peerConn) close() {
-	c.closeOnce.Do(func() {
-		if c.closer != nil {
-			_ = c.closer.Close()
-		}
-	})
+	c.closeOnce.Do(func() { closeDialResult(c.client, c.closer) })
 }
 
 func (h *hostPool) replaceLocked(addr string) {
@@ -738,13 +734,13 @@ func (h *hostPool) close(deadline time.Time) {
 			c.close()
 		}
 	}()
+	timer := time.NewTimer(max(time.Until(deadline), 0))
+	defer timer.Stop()
 	if dialDone != nil {
-		timer := time.NewTimer(max(time.Until(deadline), 0))
 		select {
 		case <-dialDone:
 		case <-timer.C:
 		}
-		timer.Stop()
 	}
 	for _, c := range cs {
 		c.mu.Lock()
@@ -760,10 +756,12 @@ func (h *hostPool) close(deadline time.Time) {
 			h.parent.cfg.Telemetry.PeerDrain(false)
 		}
 	}
-	// Give active streams the configured grace period to close naturally.
-	// Polling is intentionally bounded by the manager deadline; a wedged
-	// stream must never hold process shutdown indefinitely.
+	// Subscribe before checking activity so the last stream cannot finish
+	// between that check and waiting for notification.
+draining:
 	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		changed := h.changedLocked()
 		active := false
 		for _, c := range cs {
 			c.mu.Lock()
@@ -772,10 +770,15 @@ func (h *hostPool) close(deadline time.Time) {
 			}
 			c.mu.Unlock()
 		}
+		h.mu.Unlock()
 		if !active {
 			return
 		}
-		time.Sleep(time.Millisecond)
+		select {
+		case <-changed:
+		case <-timer.C:
+			break draining
+		}
 	}
 	// Deadline exceeded: force-close and reclaim every remaining transport.
 	for _, c := range cs {
