@@ -1474,3 +1474,55 @@ func TestPeerPoolCancelsRetiredPendingStreamOpens(t *testing.T) {
 		})
 	}
 }
+
+type blockedPublicationTelemetry struct {
+	noopPeerTelemetry
+	started, release chan struct{}
+	total            atomic.Int32
+	negative         atomic.Bool
+}
+
+func (t *blockedPublicationTelemetry) PeerStream(delta int) {
+	if delta > 0 {
+		close(t.started)
+		<-t.release
+	}
+	if t.total.Add(int32(delta)) < 0 {
+		t.negative.Store(true)
+	}
+}
+
+func TestPeerPoolBlockedPublicationTelemetryDoesNotBlockShutdown(t *testing.T) {
+	metrics := &blockedPublicationTelemetry{started: make(chan struct{}), release: make(chan struct{})}
+	var once sync.Once
+	defer once.Do(func() { close(metrics.release) })
+	closer := &countingCloser{}
+	p := NewPeerTransport(PeerPoolConfig{Telemetry: metrics, DrainTimeout: 10 * time.Millisecond, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		return &testPeerClient{}, closer, nil
+	}})
+	opened := make(chan PeerStream, 1)
+	go func() { s, _ := p.OpenStream(context.Background(), "host", "addr"); opened <- s }()
+	<-metrics.started
+	closed := make(chan struct{})
+	go func() { _ = p.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("telemetry callback blocked shutdown locks")
+	}
+	if closer.closed.Load() != 1 {
+		t.Fatal("shutdown did not close transport")
+	}
+	once.Do(func() { close(metrics.release) })
+	select {
+	case s := <-opened:
+		if s != nil {
+			_ = s.Close()
+		}
+	case <-time.After(time.Second):
+		t.Fatal("open did not finish after telemetry resumed")
+	}
+	if metrics.total.Load() != 0 || metrics.negative.Load() {
+		t.Fatal("stream telemetry was unbalanced or emitted out of order")
+	}
+}

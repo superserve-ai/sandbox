@@ -35,6 +35,7 @@ type PeerDialer func(context.Context, string, string) (PeerClient, io.Closer, er
 const peerDialTimeout = 5 * time.Second
 
 var errPeerUnavailable = errors.New("peer connection unavailable")
+var errPeerRetired = errors.New("peer connection retiring")
 
 // GRPCPeerDialer returns a dialer backed by the generated peer-proxy client.
 // Successful credentials are cached and refreshed in the background on new
@@ -139,16 +140,17 @@ func dialGRPCPeer(ctx context.Context, addr string, cfg *tls.Config, timeout tim
 func dialGRPCPeerWithCredentials(ctx context.Context, addr string, creds credentials.TransportCredentials, timeout time.Duration) (PeerClient, io.Closer, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	c := &generatedPeerClient{done: make(chan struct{})}
+	c := &generatedPeerClient{done: make(chan struct{}), retiring: make(chan struct{})}
 	var attempted atomic.Bool
 	conn, err := grpc.NewClient("passthrough:///"+addr,
 		grpc.WithTransportCredentials(creds),
 		grpc.WithIdleTimeout(0), grpc.WithDisableRetry(), grpc.WithStatsHandler(c),
 		grpc.WithContextDialer(func(dialCtx context.Context, target string) (net.Conn, error) {
-			// Reconnects must return to the pool for backoff and fresh credentials.
+			// A new dial can follow GOAWAY while accepted RPCs still drain.
+			// Retire this client; ConnEnd remains authoritative for transport loss.
 			if !attempted.CompareAndSwap(false, true) {
-				c.fail()
-				return nil, errPeerUnavailable
+				c.retire()
+				return nil, errPeerRetired
 			}
 			return (&net.Dialer{}).DialContext(dialCtx, "tcp", target)
 		}),
@@ -184,11 +186,16 @@ func dialGRPCPeerWithCredentials(ctx context.Context, addr string, creds credent
 }
 
 type generatedPeerClient struct {
-	client   peerpb.PeerProxyClient
-	conn     *grpc.ClientConn
-	done     chan struct{}
-	failOnce sync.Once
+	client     peerpb.PeerProxyClient
+	conn       *grpc.ClientConn
+	done       chan struct{}
+	failOnce   sync.Once
+	retiring   chan struct{}
+	retireOnce sync.Once
 }
+
+func (c *generatedPeerClient) Retiring() <-chan struct{} { return c.retiring }
+func (c *generatedPeerClient) retire()                   { c.retireOnce.Do(func() { close(c.retiring) }) }
 
 func (c *generatedPeerClient) Done() <-chan struct{} { return c.done }
 func (c *generatedPeerClient) fail()                 { c.failOnce.Do(func() { close(c.done) }) }
@@ -213,10 +220,20 @@ func (c *generatedPeerClient) OpenPeerStream(ctx context.Context) (PeerStream, e
 		return nil, errPeerUnavailable
 	default:
 	}
+	select {
+	case <-c.retiring:
+		return nil, errPeerRetired
+	default:
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	s, err := c.client.Forward(ctx)
 	if err != nil {
 		cancel()
+		select {
+		case <-c.retiring:
+			return nil, errPeerRetired
+		default:
+		}
 		return nil, err
 	}
 	return &generatedPeerStream{BidiStreamingClient: s, cancel: cancel}, nil

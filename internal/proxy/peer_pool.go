@@ -209,7 +209,7 @@ type peerConn struct {
 	closer         io.Closer
 	closeOnce      sync.Once
 	active         int // Includes reserved capacity for pending opens.
-	published      int // Streams whose telemetry increment has been emitted.
+	published      int // Streams committed to telemetry accounting.
 	draining       bool
 	removed        bool
 	drainScheduled bool
@@ -218,6 +218,37 @@ type peerConn struct {
 	max            int
 	streams        map[*countedPeerStream]struct{}
 	pending        map[*pendingPeerOpen]struct{}
+	metricMu       sync.Mutex
+	metricDelta    int
+	metricEmitting bool
+}
+
+// Queue under the connection lock to preserve publication/cleanup ordering.
+// The callback runs without pool locks; concurrent cleanup only queues a delta.
+func (c *peerConn) queueStreamDelta(delta int) bool {
+	c.metricMu.Lock()
+	defer c.metricMu.Unlock()
+	c.metricDelta += delta
+	if c.metricEmitting || c.metricDelta == 0 {
+		return false
+	}
+	c.metricEmitting = true
+	return true
+}
+
+func (c *peerConn) flushStreamDelta(tele PeerPoolTelemetry) {
+	for {
+		c.metricMu.Lock()
+		delta := c.metricDelta
+		c.metricDelta = 0
+		if delta == 0 {
+			c.metricEmitting = false
+			c.metricMu.Unlock()
+			return
+		}
+		c.metricMu.Unlock()
+		tele.PeerStream(delta)
+	}
 }
 
 type pendingPeerOpen struct{ cancel context.CancelFunc }
@@ -235,6 +266,9 @@ func (c *peerConn) cancelPendingLocked() {
 type peerFailureWatcher interface {
 	Done() <-chan struct{}
 }
+
+// Retirement prevents new streams while preserving already accepted RPCs.
+type peerRetirementWatcher interface{ Retiring() <-chan struct{} }
 
 // peerStreamFailureWatcher is implemented by stream adapters that can report
 // an asynchronous terminal transport error (for example, a gRPC recv loop).
@@ -336,9 +370,12 @@ retry:
 					}
 					c.streams[cs] = struct{}{}
 					c.published++
-					h.parent.cfg.Telemetry.PeerStream(1)
+					emit := c.queueStreamDelta(1)
 					c.mu.Unlock()
 					h.mu.Unlock()
+					if emit {
+						c.flushStreamDelta(h.parent.cfg.Telemetry)
+					}
 					if watcher, ok := s.(peerStreamFailureWatcher); ok {
 						go func() {
 							<-watcher.Done()
@@ -353,6 +390,10 @@ retry:
 				h.mu.Unlock()
 				cancel()
 				h.releaseOpen(c)
+				if errors.Is(e, errPeerRetired) {
+					h.retire(c)
+					continue retry
+				}
 				if peerRPCError(e) {
 					return nil, e
 				}
@@ -465,6 +506,15 @@ retry:
 					<-watcher.Done()
 					h.markFailed(c)
 				}()
+				if retirement, ok := client.(peerRetirementWatcher); ok {
+					go func() {
+						select {
+						case <-retirement.Retiring():
+							h.retire(c)
+						case <-watcher.Done():
+						}
+					}()
+				}
 			}
 			h.failures = 0
 			h.retryAt = time.Time{}
@@ -567,6 +617,34 @@ func (h *hostPool) setBackoff() {
 func (h *hostPool) setBackoffLocked() {
 	h.failures++
 	h.retryAt = time.Now().Add(peerReconnectBackoff(h.failures))
+}
+
+func (h *hostPool) retire(c *peerConn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for i, current := range h.conns {
+		if current != c {
+			continue
+		}
+		c.mu.Lock()
+		if c.draining || c.removed {
+			c.mu.Unlock()
+			return
+		}
+		c.draining = true
+		c.detached = true
+		c.cancelPendingLocked()
+		c.mu.Unlock()
+		h.conns = append(h.conns[:i], h.conns[i+1:]...)
+		if h.retiredConns == nil {
+			h.retiredConns = make(map[*peerConn]struct{})
+		}
+		h.retiredConns[c] = struct{}{}
+		h.retired++
+		h.notifyLocked()
+		h.scheduleDrain(c)
+		return
+	}
 }
 
 func (h *hostPool) markFailed(c *peerConn) {
@@ -695,6 +773,7 @@ func (h *hostPool) scheduleDrain(c *peerConn) {
 		// Pending opens reserve capacity without publishing a stream metric.
 		// Balance only published streams; late wrapper cleanup is idempotent.
 		forcedStreams := c.published
+		emit := c.queueStreamDelta(-forcedStreams)
 		c.published = 0
 		c.active = 0
 		c.mu.Unlock()
@@ -702,8 +781,8 @@ func (h *hostPool) scheduleDrain(c *peerConn) {
 		// Reclaim the slot at the deadline even if attached streams have not
 		// closed yet; their subsequent cleanup is idempotent.
 		h.remove(c)
-		if forcedStreams > 0 {
-			h.parent.cfg.Telemetry.PeerStream(-forcedStreams)
+		if emit {
+			c.flushStreamDelta(h.parent.cfg.Telemetry)
 		}
 		h.parent.cfg.Telemetry.PeerDrain(active > 0)
 	}()
@@ -810,14 +889,15 @@ draining:
 		c.draining = true
 		c.cancelPendingLocked()
 		forcedStreams := c.published
+		emit := c.queueStreamDelta(-forcedStreams)
 		c.published = 0
 		c.active = 0
 		c.removed = true
 		c.mu.Unlock()
 		c.close()
 		h.remove(c)
-		if forcedStreams > 0 {
-			h.parent.cfg.Telemetry.PeerStream(-forcedStreams)
+		if emit {
+			c.flushStreamDelta(h.parent.cfg.Telemetry)
 		}
 		h.parent.cfg.Telemetry.PeerDrain(true)
 	}
@@ -865,8 +945,10 @@ func (s *countedPeerStream) Close() error {
 			s.conn.active--
 		}
 		decremented := s.conn.published > 0
+		emit := false
 		if decremented {
 			s.conn.published--
+			emit = s.conn.queueStreamDelta(-1)
 		}
 		reclaim := s.conn.draining && s.conn.active == 0 && !s.conn.removed
 		if reclaim {
@@ -874,8 +956,8 @@ func (s *countedPeerStream) Close() error {
 		}
 		s.conn.mu.Unlock()
 		s.host.notify()
-		if decremented {
-			s.tele.PeerStream(-1)
+		if emit {
+			s.conn.flushStreamDelta(s.tele)
 		}
 		if reclaim {
 			s.conn.close()
