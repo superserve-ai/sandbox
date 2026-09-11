@@ -420,3 +420,75 @@ func TestRoutingHandlerRecordsLookupTiming(t *testing.T) {
 		})
 	}
 }
+
+func TestBridgeUpgradeRequiresSwitchingProtocols(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusSwitchingProtocols} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			client, server := net.Pipe()
+			peer, remote := net.Pipe()
+			defer client.Close()
+			defer remote.Close()
+			_ = client.SetDeadline(time.Now().Add(time.Second))
+			_ = remote.SetDeadline(time.Now().Add(time.Second))
+			req := httptest.NewRequest(http.MethodGet, "http://first.example.com/", nil)
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Upgrade", "websocket")
+			done := make(chan error, 1)
+			go func() { done <- bridgeRequest(hijackWriter{server}, req, pipePeer{peer}) }()
+			downstream := []byte("GET / HTTP/1.1\r\nHost: second.example.com\r\n\r\n")
+			go func() { _, _ = client.Write(downstream) }()
+			upstream := bufio.NewReader(remote)
+			initial, err := http.ReadRequest(upstream)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = initial.Body.Close()
+			responseDone := make(chan error, 1)
+			go func() {
+				if status == http.StatusOK {
+					_, err := io.WriteString(remote, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+					responseDone <- err
+				} else {
+					_, err := io.WriteString(remote, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nhello")
+					responseDone <- err
+				}
+			}()
+			reader := bufio.NewReader(client)
+			response, err := http.ReadResponse(reader, req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != status {
+				t.Fatalf("status=%d", response.StatusCode)
+			}
+			if status == http.StatusOK {
+				body, err := io.ReadAll(response.Body)
+				if err != nil || string(body) != "ok" {
+					t.Fatalf("body=%q err=%v", body, err)
+				}
+				extra, err := io.ReadAll(upstream)
+				if err != nil || len(extra) != 0 {
+					t.Fatalf("forwarded after rejected upgrade: %q, %v", extra, err)
+				}
+			} else {
+				greeting := make([]byte, 5)
+				if _, err := io.ReadFull(reader, greeting); err != nil || string(greeting) != "hello" {
+					t.Fatalf("greeting=%q err=%v", greeting, err)
+				}
+				received := make([]byte, len(downstream))
+				if _, err := io.ReadFull(upstream, received); err != nil || !bytes.Equal(received, downstream) {
+					t.Fatalf("tunnel=%q err=%v", received, err)
+				}
+			}
+			if err := <-responseDone; err != nil {
+				t.Fatal(err)
+			}
+			_ = remote.Close()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("bridge did not finish")
+			}
+		})
+	}
+}

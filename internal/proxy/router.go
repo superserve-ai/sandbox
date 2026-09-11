@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -147,6 +148,7 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 		case <-done:
 		}
 	}()
+	upgraded := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -156,6 +158,11 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 			return
 		}
 		if upgrade {
+			select {
+			case <-upgraded:
+			case <-done:
+				return
+			}
 			// Hijack may have already buffered bytes after the HTTP request.
 			_, _ = io.Copy(stream, buffered.Reader)
 			_ = stream.CloseSend()
@@ -171,7 +178,43 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 	}()
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(conn, stream)
+		var source io.Reader = stream
+		if upgrade {
+			reader := bufio.NewReader(stream)
+			source = reader
+			for {
+				response, err := http.ReadResponse(reader, request)
+				if err != nil {
+					closeBoth(err)
+					return
+				}
+				if response.StatusCode == http.StatusSwitchingProtocols {
+					if _, err = fmt.Fprintf(conn, "%s %s\r\n", response.Proto, response.Status); err == nil {
+						err = response.Header.Write(conn)
+					}
+					if err == nil {
+						_, err = io.WriteString(conn, "\r\n")
+					}
+					if err != nil {
+						closeBoth(err)
+						return
+					}
+					close(upgraded)
+					break
+				}
+				final := response.StatusCode >= 200
+				if final {
+					response.Close = true
+				}
+				err = response.Write(conn)
+				_ = response.Body.Close()
+				if err != nil || final {
+					closeBoth(err)
+					return
+				}
+			}
+		}
+		_, err := io.Copy(conn, source)
 		// The first terminal event owns the result; closing either descriptor
 		// can make the other pump fail as a consequence.
 		closeBoth(err)
