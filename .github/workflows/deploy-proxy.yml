@@ -6,6 +6,14 @@
 
 name: Deploy Proxy
 
+# Serialize with Deploy VMD rather than canceling: both workflows rewrite
+# /etc/sandbox/vmd.env and restart VMD on the same hosts. A queued run starts
+# only after the other deployment has completed its non-atomic update.
+concurrency:
+  group: deploy-vmd
+  cancel-in-progress: false
+  queue: max
+
 on:
   workflow_dispatch:
     inputs:
@@ -86,6 +94,15 @@ jobs:
           OTEL_ENVIRONMENT: staging
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_STAGING }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
+          # Set the identity only after bootstrap provisions every target host.
+          # Inbound ingress is a separate opt-in; outbound clients still need credentials.
+          PEER_PROXY_LISTEN_ADDR: ${{ vars.PEER_PROXY_LISTEN_ADDR_STAGING }}
+          PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
+          PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
+          PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
+          PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_PROXY_SPIFFE_URI: ${{ vars.PEER_PROXY_SPIFFE_URI_STAGING }}
+          PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
         run: |
           python3 .github/workflows/scripts/deploy-proxy.py
 
@@ -141,6 +158,11 @@ jobs:
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
+          PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
+          PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_PROXY_SPIFFE_URI: ${{ vars.PEER_PROXY_SPIFFE_URI_PROD }}
+          PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
           # Fail closed: an empty GCP_REGION makes deploy-proxy.py drop the region
@@ -182,6 +204,11 @@ jobs:
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
+          PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
+          PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_PROXY_SPIFFE_URI: ${{ vars.PEER_PROXY_SPIFFE_URI_USWEST }}
+          PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
           SANDBOX_ACCESS_TOKEN_SEED=$(gcloud secrets versions access latest \

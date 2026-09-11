@@ -114,6 +114,8 @@ type OTelRecorder struct {
 	pausedNetworkReclaimed   metric.Int64Counter
 	pausedNetworkPaused      metric.Int64Counter
 	launcherReady            metric.Int64Gauge
+	peerIngressEvents        metric.Int64Counter
+	peerIngressDuration      metric.Float64Histogram
 }
 
 // NewOTelRecorder constructs an OTLP/HTTP metrics recorder. Call Shutdown on
@@ -182,6 +184,13 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.phaseDuration, err = meter.Float64Histogram("sandbox_phase_duration_seconds",
+		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.peerIngressEvents, err = meter.Int64Counter("peer_ingress_event_total"); err != nil {
+		return nil, err
+	}
+	if r.peerIngressDuration, err = meter.Float64Histogram("peer_ingress_event_duration_seconds",
 		metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
 		return nil, err
 	}
@@ -522,6 +531,27 @@ func (r *OTelRecorder) RecordLatencyPhase(ctx context.Context, p LatencyPhase) {
 		attribute.String("region", safeRegion(p.Region)),
 		attribute.String("host_id", safeHostID(host)),
 	)...))
+}
+
+// RecordPeerIngress emits one bounded listener/authentication/stream event.
+func (r *OTelRecorder) RecordPeerIngress(ctx context.Context, p PeerIngress) {
+	if r == nil {
+		return
+	}
+	hostID := p.HostID
+	if hostID == "" {
+		hostID = r.hostID
+	}
+	opts := metric.WithAttributes(r.attrs(
+		attribute.String("event", safeLabel(p.Event)),
+		attribute.String("result", safeResult(p.Result)),
+		attribute.String("region", safeRegion(p.Region)),
+		attribute.String("host_id", safeHostID(hostID)),
+	)...)
+	r.peerIngressEvents.Add(ctx, 1, opts)
+	if p.Duration > 0 {
+		r.peerIngressDuration.Record(ctx, p.Duration.Seconds(), opts)
+	}
 }
 
 func (r *OTelRecorder) RecordPausedNetworkPressure(ctx context.Context, p PausedNetworkPressure) {

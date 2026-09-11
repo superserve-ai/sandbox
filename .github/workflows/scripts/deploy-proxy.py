@@ -20,6 +20,7 @@ Env vars:
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
   SENTRY_DSN                 optional — Sentry DSN URL for error reporting
+  PEER_PROXY_*               optional — private mTLS peer ingress settings
 """
 
 import os
@@ -34,6 +35,9 @@ def main() -> int:
     project = os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
     label = os.environ.get("VMD_LABEL", "component=vmd")
+    # The installed unit is superserve-vmd.service; retain an override for
+    # environments that use a deliberately different unit name.
+    service = os.environ.get("VMD_SERVICE", "superserve-vmd")
     install_dir = os.environ.get("VMD_INSTALL_DIR", "/usr/local/bin")
     sha = os.environ["SHA"][:8]
 
@@ -67,6 +71,31 @@ def main() -> int:
         print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
         return 1
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
+    peer_env = {
+        key: os.environ.get(key, "") for key in (
+            "PEER_PROXY_LISTEN_ADDR", "PEER_PROXY_TARGET_ADDR",
+            "PEER_PROXY_CERT_FILE", "PEER_PROXY_KEY_FILE",
+            "PEER_PROXY_CA_FILE", "PEER_PROXY_SPIFFE_URI",
+        )
+    }
+    peer_env["PEER_PROXY_TARGET_ADDR"] = peer_env["PEER_PROXY_TARGET_ADDR"] or "127.0.0.1:5010"
+    for key, default in (
+        ("PEER_PROXY_CERT_FILE", "/etc/superserve/peer/tls.crt"),
+        ("PEER_PROXY_KEY_FILE", "/etc/superserve/peer/tls.key"),
+        ("PEER_PROXY_CA_FILE", "/etc/superserve/peer/ca.crt"),
+    ):
+        peer_env[key] = peer_env[key] or default
+    peer_identity = peer_env["PEER_PROXY_SPIFFE_URI"]
+    if peer_env["PEER_PROXY_LISTEN_ADDR"] and not peer_identity:
+        print("ERROR: peer ingress requires PEER_PROXY_SPIFFE_URI", file=sys.stderr)
+        return 1
+    if peer_identity and not re.fullmatch(r"spiffe://[A-Za-z0-9._:/-]+", peer_identity):
+        print("ERROR: PEER_PROXY_SPIFFE_URI must be a SPIFFE URI", file=sys.stderr)
+        return 1
+    peer_max_streams = os.environ.get("PEER_PROXY_MAX_STREAMS", "") or "128"
+    if not peer_max_streams.isascii() or not peer_max_streams.isdecimal() or not 1 <= int(peer_max_streams) <= 2147483647:
+        print("ERROR: PEER_PROXY_MAX_STREAMS must be a positive 32-bit integer", file=sys.stderr)
+        return 1
     # Empty = skip: enabling the proxy's OTLP exporter is a per-environment
     # opt-in, matching the vmd deploy's OTEL_ENVIRONMENT convention.
     otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
@@ -153,6 +182,172 @@ def main() -> int:
             sudo systemctl enable proxy
 
             sudo mkdir -p /etc/sandbox
+            rollback_dir=$(sudo mktemp -d /etc/sandbox/proxy-rollback.XXXXXX)
+            for config in /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
+                if sudo test -f "$config"; then
+                    sudo cp -p "$config" "$rollback_dir/$(basename "$config")"
+                fi
+            done
+
+            peer_listen_addr=""
+            peer_endpoint_changed=0
+            existing_peer_listen_addr=""
+            wait_for_vmd_ready() {{
+                # Type=simple becomes active before VMD can serve requests.
+                # Readiness and endpoint acknowledgement must belong to the
+                # still-current invocation before old routing can be retired.
+                for attempt in $(seq 1 90); do
+                    invocation=$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)
+                    if [ -n "$invocation" ] \
+                       && sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'gRPC serving requests' --no-pager >/dev/null 2>&1 \
+                       && sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'host endpoint heartbeat accepted' --no-pager >/dev/null 2>&1 \
+                       && [ "$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)" = "$invocation" ] \
+                       && sudo systemctl is-active --quiet {service}; then
+                        return 0
+                    fi
+                    sleep 1
+                done
+                echo "ERROR: {service} did not reach application readiness and endpoint acknowledgement within 90s" >&2
+                return 1
+            }}
+            rollback_peer_advertisement() {{
+                # Restore the listener configuration before restoring what VMD
+                # advertises. The failed deployment may already have restarted
+                # the proxy with a different port or credential drop-in.
+                for config in /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
+                    if sudo test -f "$rollback_dir/$(basename "$config")"; then
+                        sudo cp -p "$rollback_dir/$(basename "$config")" "$config" || return 1
+                    else
+                        sudo rm -f "$config" || return 1
+                    fi
+                done
+                sudo systemctl daemon-reload || return 1
+                if ! sudo systemctl restart proxy || ! sudo systemctl is-active --quiet proxy; then
+                    echo "ERROR: proxy restart failed during rollback" >&2
+                    sudo journalctl -u proxy --no-pager -n 40 >&2 || true
+                    return 1
+                fi
+                if [ "$peer_endpoint_changed" -eq 1 ]; then
+                    # VMD reads its environment only at process startup; restart
+                    # it so the running process matches the restored env file.
+                    if ! sudo systemctl restart {service} || ! wait_for_vmd_ready; then
+                        echo "ERROR: {service} restart failed while rolling back peer advertisement" >&2
+                        sudo systemctl status --no-pager {service} >&2 || true
+                        sudo journalctl -u {service} --no-pager -n 40 >&2 || true
+                        return 1
+                    fi
+                fi
+            }}
+            deployment_mutated=0
+            finish_deployment() {{
+                result=$?
+                trap - EXIT
+                if [ "$result" -ne 0 ] && [ "$deployment_mutated" -eq 1 ]; then
+                    if ! rollback_peer_advertisement; then
+                        echo "ERROR: rollback failed; snapshots retained at $rollback_dir" >&2
+                        exit "$result"
+                    fi
+                fi
+                sudo rm -rf "$rollback_dir"
+                exit "$result"
+            }}
+            trap finish_deployment EXIT
+
+            # Both outbound clients and inbound ingress use the host identity.
+            # Configure it only after bootstrap has provisioned all target hosts.
+            if [ -n "{peer_identity}" ]; then
+                sudo install -d -m 0750 /etc/superserve/peer
+                for credential in \
+                    "{peer_env['PEER_PROXY_CERT_FILE']}" \
+                    "{peer_env['PEER_PROXY_KEY_FILE']}" \
+                    "{peer_env['PEER_PROXY_CA_FILE']}"; do
+                    # The SSH deployment account cannot traverse the
+                    # root-owned credential directory; validate with the
+                    # same privileges used to install and load the files.
+                    if ! sudo test -s "$credential"; then
+                        echo "ERROR: peer credential missing: $credential" >&2
+                        exit 1
+                    fi
+                done
+                # DynamicUser cannot traverse the root-owned bootstrap
+                # directory. Let systemd copy credentials into its private
+                # runtime credential directory and point the proxy there.
+                sudo install -d -m 0755 /etc/systemd/system/proxy.service.d
+                deployment_mutated=1
+                sudo tee /etc/systemd/system/proxy.service.d/peer-credentials.conf > /dev/null <<CREDENTIALS
+                [Service]
+                LoadCredential=peer-cert:{peer_env['PEER_PROXY_CERT_FILE']}
+                LoadCredential=peer-key:{peer_env['PEER_PROXY_KEY_FILE']}
+                LoadCredential=peer-ca:{peer_env['PEER_PROXY_CA_FILE']}
+                Environment=PEER_PROXY_CERT_FILE=%d/peer-cert
+                Environment=PEER_PROXY_KEY_FILE=%d/peer-key
+                Environment=PEER_PROXY_CA_FILE=%d/peer-ca
+                CREDENTIALS
+            else
+                deployment_mutated=1
+                sudo rm -f /etc/systemd/system/proxy.service.d/peer-credentials.conf
+            fi
+
+            sudo systemctl daemon-reload
+
+            peer_cert_file={peer_env['PEER_PROXY_CERT_FILE']!r}
+            peer_key_file={peer_env['PEER_PROXY_KEY_FILE']!r}
+            peer_ca_file={peer_env['PEER_PROXY_CA_FILE']!r}
+            if [ -n "{peer_identity}" ]; then
+                peer_cert_file=/run/credentials/proxy.service/peer-cert
+                peer_key_file=/run/credentials/proxy.service/peer-key
+                peer_ca_file=/run/credentials/proxy.service/peer-ca
+            fi
+            if [ -n "{peer_env['PEER_PROXY_LISTEN_ADDR']}" ]; then
+                sudo mkdir -p /etc/sandbox
+                peer_listen_addr={peer_env['PEER_PROXY_LISTEN_ADDR']}
+                if [ "$peer_listen_addr" = "auto" ]; then
+                    peer_ip=$(curl -fsS -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip)
+                    # 5008 is reserved for the wildcard HTTP redirect listener.
+                    # Keep peer ingress on its own private port so the two binds
+                    # cannot collide when the staging shortcut is enabled.
+                    peer_listen_addr="$peer_ip:5009"
+                elif [[ "$peer_listen_addr" == *:5008 ]]; then
+                    # Explicit addresses must obey the same reservation as auto;
+                    # otherwise a private-IP override still collides with the
+                    # wildcard redirect listener on 5008.
+                    peer_listen_addr="${{peer_listen_addr%:5008}}:5009"
+                fi
+                # vmd owns host.proxy_addr advertisement. Keep its environment in
+                # lockstep with the proxy listener so the heartbeat publishes the
+                # private peer endpoint when ingress is enabled.
+                sudo touch /etc/sandbox/vmd.env
+                existing_peer_listen_addr=$(sudo sed -n 's/^PEER_PROXY_LISTEN_ADDR=//p' /etc/sandbox/vmd.env | tail -n1 || true)
+                peer_endpoint_changed=1
+                if [ "$existing_peer_listen_addr" = "$peer_listen_addr" ]; then
+                    peer_endpoint_changed=0
+                else
+                    sudo sed -i '/^PEER_PROXY_LISTEN_ADDR=/d' /etc/sandbox/vmd.env
+                    printf 'PEER_PROXY_LISTEN_ADDR=%s\\n' "$peer_listen_addr" | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                fi
+            else
+                # Remove the prior advertisement when peer ingress is disabled
+                # (including rollback). VMD only reads this environment at
+                # startup, so restart it only when a stale advertisement
+                # actually exists; ordinary deployments must not interrupt it.
+                if sudo grep -q '^PEER_PROXY_LISTEN_ADDR=' /etc/sandbox/vmd.env 2>/dev/null; then
+                    existing_peer_listen_addr=$(sudo sed -n 's/^PEER_PROXY_LISTEN_ADDR=//p' /etc/sandbox/vmd.env | tail -n1 || true)
+                    peer_endpoint_changed=1
+                    sudo sed -i '/^PEER_PROXY_LISTEN_ADDR=/d' /etc/sandbox/vmd.env
+                    if ! sudo systemctl restart {service}; then
+                        echo "ERROR: {service} restart failed" >&2
+                        sudo systemctl status --no-pager {service} >&2 || true
+                        sudo journalctl -u {service} --no-pager -n 40 >&2 || true
+                        exit 1
+                    fi
+                    if ! wait_for_vmd_ready; then
+                        echo "ERROR: {service} failed to become active after restart" >&2
+                        sudo systemctl status --no-pager {service} >&2 || true
+                        sudo journalctl -u {service} --no-pager -n 40 >&2 || true
+                        exit 1
+                    fi
+                fi
+            fi
             # HOST_ID must match vmd's: it is the host's logical identity and
             # is deliberately preserved across deploys (a replacement host
             # keeps its predecessor's row ID), so copy vmd's value and fall
@@ -165,19 +360,50 @@ def main() -> int:
             PROXY_ALLOWED_ORIGINS={terminal_origins}
             REQUIRE_DATA_PLANE={require_data_plane}
             SENTRY_DSN={sentry_dsn}
+            PEER_PROXY_LISTEN_ADDR=$peer_listen_addr
+            PEER_PROXY_TARGET_ADDR={peer_env['PEER_PROXY_TARGET_ADDR']}
+            PEER_PROXY_CERT_FILE=$peer_cert_file
+            PEER_PROXY_KEY_FILE=$peer_key_file
+            PEER_PROXY_CA_FILE=$peer_ca_file
+            PEER_PROXY_SPIFFE_URI={peer_identity}
+            PEER_PROXY_MAX_STREAMS={peer_max_streams}
             HOST_ID=${{host_id:-{name}}}{otel_env_lines}
             PROXYENV
             sudo chmod 0600 /etc/sandbox/proxy.env
 
-            sudo systemctl restart proxy
+            if ! sudo systemctl restart proxy; then
+                echo "ERROR: proxy restart failed" >&2
+                sudo systemctl status --no-pager proxy >&2 || true
+                sudo journalctl -u proxy --no-pager -n 40 >&2 || true
+                exit 1
+            fi
             sleep 3
-            sudo systemctl is-active --quiet proxy || (
+            if ! sudo systemctl is-active --quiet proxy; then
                 echo "ERROR: proxy failed to become active after restart" >&2
                 sudo systemctl status --no-pager proxy >&2 || true
                 sudo journalctl -u proxy --no-pager -n 40 >&2 || true
                 exit 1
-            )
+            fi
+            # Start and verify peer ingress before VMD advertises its endpoint.
+            # This prevents heartbeat routing from switching to a closed port if
+            # proxy configuration or credentials are invalid.
+            if [ -n "$peer_listen_addr" ] && [ "$peer_endpoint_changed" -eq 1 ]; then
+                if ! sudo systemctl restart {service}; then
+                    echo "ERROR: {service} restart failed" >&2
+                    sudo systemctl status --no-pager {service} >&2 || true
+                    sudo journalctl -u {service} --no-pager -n 40 >&2 || true
+                    exit 1
+                fi
+                if ! wait_for_vmd_ready; then
+                    echo "ERROR: {service} failed to become active after restart" >&2
+                    sudo systemctl status --no-pager {service} >&2 || true
+                    sudo journalctl -u {service} --no-pager -n 40 >&2 || true
+                    exit 1
+                fi
+            fi
         """)
+        # Heredoc terminators must begin at column zero in the generated shell.
+        deploy_script = deploy_script.replace("    CREDENTIALS\n", "CREDENTIALS\n")
 
         r = subprocess.run(
             [

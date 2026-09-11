@@ -50,6 +50,7 @@ func TestLoadConfigUsesHeartbeatOverrides(t *testing.T) {
 	t.Setenv("HOST_ID", "host-a")
 	t.Setenv("VMD_ADVERTISE_ADDR", "10.0.0.2:50051")
 	t.Setenv("PROXY_ADVERTISE_ADDR", "10.0.0.2:5007")
+	t.Setenv("PEER_PROXY_LISTEN_ADDR", "10.0.0.2:5008")
 	t.Setenv("HOST_REGION", "region-explicit")
 	t.Setenv("SANDBOX_ID_REGION", "region-fallback")
 
@@ -62,6 +63,9 @@ func TestLoadConfigUsesHeartbeatOverrides(t *testing.T) {
 	}
 	if cfg.ProxyAdvertiseAddr != "10.0.0.2:5007" {
 		t.Fatalf("cfg.ProxyAdvertiseAddr = %q, want explicit override", cfg.ProxyAdvertiseAddr)
+	}
+	if cfg.PeerProxyListenAddr != "10.0.0.2:5008" {
+		t.Fatalf("cfg.PeerProxyListenAddr = %q, want private peer endpoint", cfg.PeerProxyListenAddr)
 	}
 	if cfg.HostRegion != "region-explicit" {
 		t.Fatalf("cfg.HostRegion = %q, want explicit override", cfg.HostRegion)
@@ -94,6 +98,61 @@ func TestAdvertisedAddrsPreferExplicitOverrides(t *testing.T) {
 	}
 	if resolved != 0 {
 		t.Fatalf("host interface resolved %d times, want 0", resolved)
+	}
+}
+
+func TestHeartbeatProxyAdvertiseOverrideUsesPeerEndpoint(t *testing.T) {
+	// The peer endpoint is the value that must flow into HeartbeatConfig.ProxyAddr;
+	// the historical public override is intentionally ignored while peer ingress
+	// is enabled.
+	t.Setenv("KERNEL_PATH", "/tmp/kernel")
+	t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
+	t.Setenv("HOST_ID", "host-a")
+	t.Setenv("PROXY_ADVERTISE_ADDR", "10.0.0.2:5007")
+	t.Setenv("PEER_PROXY_LISTEN_ADDR", "10.0.0.2:5008")
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig() error: %v", err)
+	}
+	advertised, err := advertisedHeartbeatProxyAddr(func() (string, error) {
+		t.Fatal("host lookup must not run for an explicit peer endpoint")
+		return "", nil
+	}, "http://127.0.0.1:5007/health", cfg.ProxyAdvertiseAddr, cfg.PeerProxyListenAddr)
+	if err != nil || advertised != cfg.PeerProxyListenAddr {
+		t.Fatalf("advertised proxy address = %q, %v, want peer endpoint", advertised, err)
+	}
+}
+
+func TestAdvertisedHeartbeatProxyAddrValidatesPeerEndpoint(t *testing.T) {
+	for _, peer := range []string{
+		"10.0.0.2:0", "203.0.113.2:5009", "0.0.0.0:5009",
+		"127.0.0.1:5009", "[::]:5009", "[::1]:5009",
+		"[fe80::1]:5009", "peer.example:5009", "10.0.0.2", "10.0.0.2:65536",
+	} {
+		t.Run(peer, func(t *testing.T) {
+			for _, configured := range []string{"", "10.0.0.2:5007"} {
+				got, err := advertisedHeartbeatProxyAddr(func() (string, error) {
+					t.Fatal("invalid peer endpoint must not fall back to host lookup")
+					return "10.0.0.2", nil
+				}, "http://127.0.0.1:5007/health", configured, peer)
+				if err == nil || got != "" {
+					t.Fatalf("advertised endpoint = %q, %v; want empty address and error", got, err)
+				}
+			}
+		})
+	}
+	for _, peer := range []string{"", "10.0.0.2:5009", "[fd00::2]:5009"} {
+		got, err := advertisedHeartbeatProxyAddr(func() (string, error) {
+			t.Fatal("explicit endpoint must not require host lookup")
+			return "", nil
+		}, "http://127.0.0.1:5007/health", "10.0.0.2:5007", peer)
+		want := peer
+		if want == "" {
+			want = "10.0.0.2:5007"
+		}
+		if err != nil || got != want {
+			t.Fatalf("advertised endpoint = %q, %v; want %q", got, err, want)
+		}
 	}
 }
 

@@ -32,6 +32,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/blocklist"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/proxy"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vm"
@@ -72,9 +73,10 @@ type Config struct {
 
 	// Heartbeat self-description overrides. When unset, the daemon infers
 	// addresses and region from the local interface and deployment defaults.
-	VMDAdvertiseAddr   string
-	ProxyAdvertiseAddr string
-	HostRegion         string
+	VMDAdvertiseAddr    string
+	ProxyAdvertiseAddr  string
+	PeerProxyListenAddr string
+	HostRegion          string
 
 	// SecretsProxySocket is the local secretsproxy daemon's control-RPC unix-socket path.
 	// When empty, broker registration is skipped.
@@ -111,6 +113,7 @@ func loadConfig() (Config, error) {
 		ControlPlaneURL:         os.Getenv("CONTROL_PLANE_URL"),
 		VMDAdvertiseAddr:        os.Getenv("VMD_ADVERTISE_ADDR"),
 		ProxyAdvertiseAddr:      os.Getenv("PROXY_ADVERTISE_ADDR"),
+		PeerProxyListenAddr:     os.Getenv("PEER_PROXY_LISTEN_ADDR"),
 		HostRegion:              envOrDefault("HOST_REGION", os.Getenv("SANDBOX_ID_REGION")),
 		SecretsProxySocket:      os.Getenv("SECRETSPROXY_SOCKET"),
 		SecretsProxySandboxAddr: os.Getenv("SECRETSPROXY_SANDBOX_ADDR"),
@@ -270,6 +273,16 @@ func advertisedProxyAddr(hostIP func() (string, error), proxyHealthURL, explicit
 		return net.JoinHostPort(ip, port), nil
 	}
 	return u.Host, nil
+}
+
+func advertisedHeartbeatProxyAddr(hostIP func() (string, error), proxyHealthURL, configured, peerListen string) (string, error) {
+	if peerListen != "" {
+		if !proxy.PrivateBind(peerListen) {
+			return "", fmt.Errorf("peer proxy listener %q must be a concrete private IP address with a nonzero port", peerListen)
+		}
+		return peerListen, nil
+	}
+	return advertisedProxyAddr(hostIP, proxyHealthURL, configured)
 }
 
 // envInt32Fatal parses an optional non-negative int32 env var. Unset or
@@ -1763,7 +1776,12 @@ func main() {
 					Int("grpc_port", cfg.GRPCPort).
 					Msg("unable to resolve advertised VMD address; heartbeat will omit host self-description")
 			}
-			proxyAddr, err := advertisedProxyAddr(hostIP, proxyHealthURL, cfg.ProxyAdvertiseAddr)
+			// When the private peer ingress is enabled, host.proxy_addr must
+			// advertise that endpoint so peer clients can discover it. This is
+			// an intentional transition from the historical public proxy
+			// address; the existing override remains in effect only when peer
+			// ingress is disabled.
+			proxyAddr, err := advertisedHeartbeatProxyAddr(hostIP, proxyHealthURL, cfg.ProxyAdvertiseAddr, cfg.PeerProxyListenAddr)
 			if err != nil {
 				log.Warn().Err(err).Str("proxy_health_url", proxyHealthURL).
 					Msg("unable to derive advertised proxy address; heartbeat will omit host self-description")

@@ -108,7 +108,13 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	// keeps the storage sampler below off this goroutine.
 	pressureKick := make(chan struct{}, 1)
 	go pressureLoop(ctx, client, cfg, pressureURL, cfg.Token, pressureKick, log)
-	kickPressure := func() {
+	endpointAcknowledged := false
+	heartbeatAccepted := func() {
+		if !endpointAcknowledged && buildHeartbeatRequest(cfg, nil, nil).ProxyAddr != "" {
+			log.Info().Str("host_id", cfg.HostID).Str("proxy_addr", cfg.ProxyAddr).
+				Msg("host endpoint heartbeat accepted")
+			endpointAcknowledged = true
+		}
 		select {
 		case pressureKick <- struct{}{}:
 		default:
@@ -121,7 +127,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	if ok, _ := sendHeartbeat(ctx, client, cfg, url, cfg.Token, proxyHealthURL, nil, log); ok {
-		kickPressure()
+		heartbeatAccepted()
 	}
 	go runOverlayStorageSampler(ctx, runDir, overlayStorageSampleInterval, cache, log)
 	for {
@@ -143,7 +149,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 			// mean an older control plane without the route).
 			ok, accepted := sendHeartbeat(ctx, client, cfg, url, cfg.Token, proxyHealthURL, storage, log)
 			if ok {
-				kickPressure()
+				heartbeatAccepted()
 				if publishStorage && accepted {
 					cache.markSent(version, now)
 				}
