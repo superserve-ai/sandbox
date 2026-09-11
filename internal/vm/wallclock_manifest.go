@@ -364,6 +364,11 @@ func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger
 		// fallback for anything the watch missed; a host that cannot watch
 		// keeps the scan alone.
 		root := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)
+		// The root is created if absent, so the watch has something to
+		// attach to before the first template lands rather than after.
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			log.Warn().Err(err).Str("path", root).Msg("template root cannot be created; frozen templates are witnessed by the periodic scan alone")
+		}
 		var events <-chan fsnotify.Event
 		var errs <-chan error
 		if w, werr := fsnotify.NewWatcher(); werr == nil {

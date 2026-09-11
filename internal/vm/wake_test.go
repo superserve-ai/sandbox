@@ -2903,3 +2903,64 @@ func TestAdHocSnapshotOverAFrozenImageJournalsTheRewrite(t *testing.T) {
 		t.Fatalf("manifest=%+v err=%v; an ad-hoc image is never marked", man, err)
 	}
 }
+
+// A clock demotion written while a destroy takes the VM must not resurrect
+// its record, and the legacy load must not run for a VM that is gone.
+func TestClockDemotionDuringDestroyLeavesNoRecord(t *testing.T) {
+	useTempFloor(t)
+	origDead := vmDeadForRetry
+	t.Cleanup(func() { vmDeadForRetry = origDead })
+	vmDeadForRetry = func(*Manager, string) bool { return true }
+
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vm.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	basePath := filepath.Join(dir, "base.ext4")
+	overlay := filepath.Join(dir, "vm-1", "overlay.ext4")
+	if err := os.MkdirAll(filepath.Dir(overlay), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{snapPath, memPath, basePath, overlay} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedFrozenManifest(t, memPath, "tok")
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	mgr := &Manager{
+		log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir, GuestClockFreezeEnabled: true}, netMgr: &fakeNetMgr{},
+		vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1), state: store,
+	}
+	mgr.clockRealtimeCapable.Store(true)
+	mgr.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		return 4321, SupervisionUnit, nil
+	}
+	loads := 0
+	mgr.restoreSnapshotHook = func(_, _, _ string, clock *bool) error {
+		loads++
+		if clock != nil {
+			// The destroy lands as Firecracker refuses the option: the
+			// demotion that follows must find the VM gone.
+			mgr.mu.Lock()
+			delete(mgr.vms, "vm-1")
+			mgr.mu.Unlock()
+			mgr.deleteState("vm-1")
+			return errors.New(unknownClockFieldMarker)
+		}
+		t.Error("the legacy load ran for a destroyed VM")
+		return nil
+	}
+	if _, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath}, nil, "team", "owner", "", nil, 0); err == nil {
+		t.Fatal("want the restore to fail once the VM is gone")
+	}
+	if loads != 1 {
+		t.Fatalf("loads = %d, want the refused one only", loads)
+	}
+	if rec, gerr := store.Get("vm-1"); gerr == nil && rec != nil {
+		t.Fatalf("record = %+v; the demotion resurrected a destroyed VM", rec)
+	}
+}

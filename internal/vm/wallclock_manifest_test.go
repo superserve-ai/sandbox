@@ -499,3 +499,32 @@ func TestTemplateWatchWitnessesAManifestStreamedIntoPlace(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// A watch started before the templates root exists still witnesses the first
+// template to land: the root is created so the watch attaches to it.
+func TestTemplateWatchAttachesBeforeTheRootExists(t *testing.T) {
+	dir := t.TempDir()
+	isolateEvidence(t, dir)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir, GuestClockFreezeEnabled: true}}
+	stopped := m.WatchTemplateManifests(ctx, zerolog.Nop())
+	defer func() { cancel(); <-stopped }()
+	time.Sleep(50 * time.Millisecond)
+	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
+	if err := os.MkdirAll(tpl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	seedFrozenManifest(t, filepath.Join(tpl, "mem.snap"), "tok")
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a template landing under a root created after the watch started was not witnessed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

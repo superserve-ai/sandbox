@@ -244,8 +244,11 @@ func (m *Manager) freezeGuestForPause(ctx context.Context, ip, token string, log
 	terr := boxdThawGuest(tctx, ip, token)
 	if errors.Is(terr, ErrGuestTokenMismatch) {
 		// The guest holds no freeze under this token, which says nothing about
-		// an earlier one: only a workload confirmed running is unfrozen.
-		terr = boxdGuestRunning(tctx, ip)
+		// an earlier one: only a workload confirmed running is unfrozen. Its
+		// own budget: a thaw that spent this one must not fail the check.
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		terr = boxdGuestRunning(rctx, ip)
+		rcancel()
 	}
 	if terr != nil {
 		return false, fmt.Errorf("guest workload state unknown after failed freeze (%v); thaw not confirmed: %w", ferr, terr)

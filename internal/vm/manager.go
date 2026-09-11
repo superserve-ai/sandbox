@@ -2535,7 +2535,9 @@ func (m *Manager) resumeVMLocked(ctx context.Context, vmID, snapshotPath, memPat
 		inst.mu.Lock()
 		inst.ClockFrozen = false
 		inst.mu.Unlock()
-		if !m.persistState(inst) {
+		// Fenced like the wake-owed write: a destroy landing here must not
+		// be resurrected, and a VM that is gone gets no legacy load.
+		if !m.persistWhileTracked(inst) {
 			return fmt.Errorf("vm %s: clock policy could not be made durable before the legacy restore", vmID)
 		}
 		return nil
@@ -3834,7 +3836,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			inst.mu.Lock()
 			inst.ClockFrozen = false
 			inst.mu.Unlock()
-			if !m.persistState(inst) {
+			// Fenced like the wake-owed write: a destroy landing here must
+			// not be resurrected, and a VM that is gone gets no legacy load.
+			if !m.persistWhileTracked(inst) {
 				return fmt.Errorf("vm %s: clock policy could not be made durable before the legacy restore", vmID)
 			}
 			return nil

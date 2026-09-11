@@ -481,6 +481,28 @@ func TestFreezeGuestForPause(t *testing.T) {
 		}
 	})
 
+	// The running check after a mismatch has its own budget: a thaw that
+	// spent most of the shared one must not make the check fail on time.
+	t.Run("running_check_after_a_slow_thaw_has_its_own_budget", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{}, errors.New("connection reset")
+		}
+		boxdThawGuest = func(ctx context.Context, _, _ string) error {
+			time.Sleep(1500 * time.Millisecond)
+			return fmt.Errorf("%w: status token", ErrGuestTokenMismatch)
+		}
+		boxdGuestRunning = func(ctx context.Context, _ string) error {
+			if dl, ok := ctx.Deadline(); !ok || time.Until(dl) < time.Second {
+				return errors.New("no time left to confirm")
+			}
+			return nil
+		}
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
+		if err != nil || frozen {
+			t.Fatalf("frozen=%v err=%v; want the running workload confirmed with a fresh budget", frozen, err)
+		}
+	})
+
 	// The same mismatch from a guest still frozen under an earlier token must
 	// not be read as running: a snapshot of that guest marked unfrozen would
 	// never be woken. The pause aborts instead.
