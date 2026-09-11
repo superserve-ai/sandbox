@@ -814,3 +814,65 @@ func TestPeerHandshakeUsesCompletedCredentialRefresh(t *testing.T) {
 	}
 	_ = secured.Close()
 }
+
+func TestGRPCPeerGOAWAYRetiresWithoutCancelingActiveStreams(t *testing.T) {
+	cfg := peerTestCredentials(t)
+	server, addr := startPeerEchoServer(t, cfg, "127.0.0.1:0")
+	metrics := &peerShutdownTelemetry{}
+	pool := NewPeerTransport(PeerPoolConfig{Dial: GRPCPeerDialer(cfg.LoadClient), Telemetry: metrics, MaxConnections: 1, DrainTimeout: time.Second}).(*peerPool)
+	defer pool.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	old, err := pool.OpenStream(ctx, "host", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	echo := func(s PeerStream) {
+		t.Helper()
+		if _, err := s.Write([]byte("still active")); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len("still active"))
+		if _, err := io.ReadFull(s, got); err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != "still active" {
+			t.Fatalf("unexpected payload %q", got)
+		}
+	}
+	echo(old)
+	oldConn := old.(*countedPeerStream).conn
+	client := oldConn.client.(*generatedPeerClient)
+	stopped := make(chan struct{})
+	go func() { server.GracefulStop(); close(stopped) }()
+	if !client.conn.WaitForStateChange(ctx, connectivity.Ready) {
+		t.Fatal("GOAWAY was not observed")
+	}
+	_, _ = startPeerEchoServer(t, cfg, addr)
+	next, err := pool.OpenStream(ctx, "host", addr)
+	if err != nil {
+		t.Fatalf("open after GOAWAY: %v", err)
+	}
+	defer next.Close()
+	if next.(*countedPeerStream).conn == oldConn {
+		t.Fatal("new stream used retiring connection")
+	}
+	echo(next)
+	echo(old)
+	select {
+	case <-stopped:
+		t.Fatal("graceful shutdown canceled active stream")
+	default:
+	}
+	if metrics.failures.Load() != 0 {
+		t.Fatal("GOAWAY recorded terminal transport failure")
+	}
+	_ = old.Close()
+	select {
+	case <-stopped:
+	case <-ctx.Done():
+		t.Fatal("graceful shutdown did not complete after stream close")
+	}
+	echo(next)
+}
