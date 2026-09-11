@@ -1526,3 +1526,138 @@ func TestPeerPoolBlockedPublicationTelemetryDoesNotBlockShutdown(t *testing.T) {
 		t.Fatal("stream telemetry was unbalanced or emitted out of order")
 	}
 }
+
+type blockedDialTelemetry struct {
+	noopPeerTelemetry
+	kind             string
+	started, release chan struct{}
+	total            atomic.Int32
+}
+
+func (t *blockedDialTelemetry) block(kind string) {
+	if kind == t.kind {
+		close(t.started)
+		<-t.release
+	}
+}
+func (t *blockedDialTelemetry) PeerHandshake(time.Duration, string) { t.block("handshake") }
+func (t *blockedDialTelemetry) PeerConnection(delta int) {
+	if delta > 0 {
+		t.block("connection")
+	}
+	t.total.Add(int32(delta))
+}
+func (t *blockedDialTelemetry) PeerReconnect(result string) {
+	if result == telemetry.ResultSuccess {
+		t.block("reconnect")
+	}
+}
+
+func TestPeerPoolDialTelemetryDoesNotHoldShutdownLocks(t *testing.T) {
+	for _, kind := range []string{"handshake", "connection", "reconnect"} {
+		t.Run(kind, func(t *testing.T) {
+			metrics := &blockedDialTelemetry{kind: kind, started: make(chan struct{}), release: make(chan struct{})}
+			var once sync.Once
+			defer once.Do(func() { close(metrics.release) })
+			closer := &countingCloser{}
+			p := NewPeerTransport(PeerPoolConfig{Telemetry: metrics, DrainTimeout: 10 * time.Millisecond, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+				return &testPeerClient{}, closer, nil
+			}})
+			opened := make(chan struct{})
+			go func() {
+				s, _ := p.OpenStream(context.Background(), "host", "addr")
+				if s != nil {
+					_ = s.Close()
+				}
+				close(opened)
+			}()
+			<-metrics.started
+			closed := make(chan struct{})
+			go func() { _ = p.Close(); close(closed) }()
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Fatal("dial telemetry held shutdown locks")
+			}
+			if closer.closed.Load() != 1 {
+				t.Fatal("transport not closed")
+			}
+			once.Do(func() { close(metrics.release) })
+			<-opened
+			if metrics.total.Load() != 0 {
+				t.Fatal("connection telemetry unbalanced")
+			}
+		})
+	}
+}
+
+type retiringFailurePeerClient struct {
+	failingTransportClient
+	retiring chan struct{}
+}
+
+func (c *retiringFailurePeerClient) Retiring() <-chan struct{} { return c.retiring }
+
+func TestPeerPoolTerminalFailurePrecedesRetirement(t *testing.T) {
+	client := &retiringFailurePeerClient{failingTransportClient: failingTransportClient{done: make(chan struct{})}, retiring: make(chan struct{})}
+	metrics := &transportFailureTelemetry{failed: make(chan struct{}, 2)}
+	p := NewPeerTransport(PeerPoolConfig{Telemetry: metrics, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		return client, &countingCloser{}, nil
+	}}).(*peerPool)
+	defer p.Close()
+	s, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	cs := s.(*countedPeerStream)
+	cs.host.mu.Lock()
+	close(client.done)
+	close(client.retiring)
+	cs.host.mu.Unlock()
+	cs.host.retire(cs.conn)
+	select {
+	case <-metrics.failed:
+	case <-time.After(time.Second):
+		t.Fatal("terminal failure was treated as graceful retirement")
+	}
+	cs.host.mu.Lock()
+	failures, retryAt := cs.host.failures, cs.host.retryAt
+	cs.host.mu.Unlock()
+	if failures != 1 || retryAt.IsZero() {
+		t.Fatal("terminal failure did not establish reconnect backoff")
+	}
+}
+
+func TestPeerPoolShutdownJoinsFailedConnectionCleanup(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	p := NewPeerTransport(PeerPoolConfig{DrainTimeout: time.Second, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		return &testPeerClient{}, callbackPeerCloser{close: func() { close(started); <-release }}, nil
+	}}).(*peerPool)
+	s, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := s.(*countedPeerStream)
+	failed := make(chan struct{})
+	go func() { cs.host.markFailed(cs.conn); close(failed) }()
+	<-started
+	closed := make(chan struct{})
+	go func() { _ = p.Close(); close(closed) }()
+	select {
+	case <-closed:
+		t.Fatal("shutdown forgot connection whose closer was still running")
+	case <-time.After(20 * time.Millisecond):
+	}
+	once.Do(func() { close(release) })
+	for _, done := range []chan struct{}{failed, closed} {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("cleanup did not finish")
+		}
+	}
+	_ = s.Close()
+}
