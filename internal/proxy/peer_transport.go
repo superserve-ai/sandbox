@@ -101,7 +101,15 @@ func grpcPeerDialer(tlsConfig func() (*tls.Config, error), timeout time.Duration
 			}
 			cfg = load.config
 		}
-		client, closer, err := dialGRPCPeer(attemptCtx, addr, cfg, timeout)
+		creds := &refreshingPeerCredentials{
+			TransportCredentials: credentials.NewTLS(cfg),
+			latest: func() *tls.Config {
+				mu.Lock()
+				defer mu.Unlock()
+				return cached
+			},
+		}
+		client, closer, err := dialGRPCPeerWithCredentials(attemptCtx, addr, creds, timeout)
 		if err != nil && attemptCtx.Err() != nil {
 			err = attemptError()
 		}
@@ -109,13 +117,32 @@ func grpcPeerDialer(tlsConfig func() (*tls.Config, error), timeout time.Duration
 	}
 }
 
+type refreshingPeerCredentials struct {
+	credentials.TransportCredentials
+	latest func() *tls.Config
+}
+
+func (c *refreshingPeerCredentials) ClientHandshake(ctx context.Context, authority string, conn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	// Refresh may have completed during TCP establishment. Use its certificate
+	// and trust roots together, without waiting on a still-running refresh.
+	return credentials.NewTLS(c.latest()).ClientHandshake(ctx, authority, conn)
+}
+
+func (c *refreshingPeerCredentials) Clone() credentials.TransportCredentials {
+	return &refreshingPeerCredentials{TransportCredentials: c.TransportCredentials.Clone(), latest: c.latest}
+}
+
 func dialGRPCPeer(ctx context.Context, addr string, cfg *tls.Config, timeout time.Duration) (PeerClient, io.Closer, error) {
+	return dialGRPCPeerWithCredentials(ctx, addr, credentials.NewTLS(cfg), timeout)
+}
+
+func dialGRPCPeerWithCredentials(ctx context.Context, addr string, creds credentials.TransportCredentials, timeout time.Duration) (PeerClient, io.Closer, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	c := &generatedPeerClient{done: make(chan struct{})}
 	var attempted atomic.Bool
 	conn, err := grpc.NewClient("passthrough:///"+addr,
-		grpc.WithTransportCredentials(credentials.NewTLS(cfg)),
+		grpc.WithTransportCredentials(creds),
 		grpc.WithIdleTimeout(0), grpc.WithDisableRetry(), grpc.WithStatsHandler(c),
 		grpc.WithContextDialer(func(dialCtx context.Context, target string) (net.Conn, error) {
 			// Reconnects must return to the pool for backoff and fresh credentials.
