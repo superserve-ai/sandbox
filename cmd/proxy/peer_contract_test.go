@@ -124,3 +124,23 @@ func TestIngressOnlyRolloutDoesNotRoutePublicRequests(t *testing.T) {
 		}
 	}
 }
+
+func TestOwnershipPoolRespectsRoutingGate(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, url := range []string{"", "not a database URL"} {
+		pool, err := newOwnershipPool(ctx, false, url)
+		if err != nil || pool != nil {
+			t.Fatalf("disabled routing initialized database: pool=%v err=%v", pool, err)
+		}
+	}
+	for _, url := range []string{"", "not a database URL", "postgres://localhost/example"} {
+		pool, err := newOwnershipPool(ctx, true, url)
+		if pool != nil {
+			pool.Close()
+		}
+		if err == nil {
+			t.Fatalf("enabled routing accepted unavailable database %q", url)
+		}
+	}
+}
