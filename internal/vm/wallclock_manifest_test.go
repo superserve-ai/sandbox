@@ -537,3 +537,36 @@ func TestRemovingAnUnreadableManifestIsDurable(t *testing.T) {
 		t.Fatal("removing an unreadable manifest without a durable sync must not report success")
 	}
 }
+
+// A frozen template counts as witnessed only once the floor is durably up:
+// the host guard trusts the evidence file alone, so a raise that fails must
+// not be reported as a template witnessed. The next scan retries.
+func TestTemplateScanDoesNotCountAFloorItCouldNotRaise(t *testing.T) {
+	dir := t.TempDir()
+	isolateEvidence(t, dir)
+	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
+	if err := os.MkdirAll(tpl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seedFrozenManifest(t, filepath.Join(tpl, "mem.snap"), "tok")
+	// The evidence path's parent is a file: the directory exists to a stat,
+	// but nothing can be created beneath it.
+	notADir := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	good := wakeProtocolEvidencePath
+	wakeProtocolEvidencePath = filepath.Join(notADir, "evidence")
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	if n := m.scanTemplateManifests(); n != 0 || wakeProtocolFloorRaised() {
+		t.Fatalf("n=%d raised=%v; a floor that could not be raised must not count the template as witnessed", n, wakeProtocolFloorRaised())
+	}
+	// The next scan, once the path can be written, raises it.
+	wakeProtocolEvidencePath = good
+	if n := m.scanTemplateManifests(); n != 1 {
+		t.Fatalf("n=%d, want the template witnessed once the floor can be raised", n)
+	}
+	if _, err := os.Stat(wakeProtocolEvidencePath); err != nil {
+		t.Fatalf("evidence not written on the retry: %v", err)
+	}
+}

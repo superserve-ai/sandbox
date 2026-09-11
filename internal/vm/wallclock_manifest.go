@@ -126,11 +126,11 @@ func ensureWakeProtocolFloor() error {
 
 // noteWakeProtocolEvidence is the best-effort form, for the template scan: a
 // host without the directory is not a fleet host.
-func noteWakeProtocolEvidence() {
+func noteWakeProtocolEvidence() error {
 	if _, err := os.Stat(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
-		return
+		return nil
 	}
-	_ = ensureWakeProtocolFloor()
+	return ensureWakeProtocolFloor()
 }
 
 // RaiseWakeProtocolFloor durably records that this host holds, or is about to
@@ -458,7 +458,10 @@ func (m *Manager) noteTemplateManifest(path string) int {
 	if err != nil || man == nil || !man.WorkloadFrozen {
 		return 0
 	}
-	noteWakeProtocolEvidence()
+	if err := noteWakeProtocolEvidence(); err != nil {
+		m.log.Error().Err(err).Str("path", path).Msg("frozen template landed but the wake-protocol floor could not be raised; the periodic scan retries")
+		return 0
+	}
 	return 1
 }
 
@@ -479,8 +482,14 @@ func (m *Manager) scanTemplateManifests() int {
 		if err != nil || man == nil || !man.WorkloadFrozen {
 			continue
 		}
+		// Counted only once the floor is durably up: the host guard trusts
+		// the evidence file alone, so a failed raise is a template not yet
+		// witnessed. Logged, and retried by the next scan.
+		if err := noteWakeProtocolEvidence(); err != nil {
+			m.log.Error().Err(err).Str("path", path).Msg("frozen template found but the wake-protocol floor could not be raised; a rollback would not be refused until it is")
+			continue
+		}
 		n++
-		noteWakeProtocolEvidence()
 	}
 	return n
 }
