@@ -217,6 +217,15 @@ type peerConn struct {
 	detached       bool
 	max            int
 	streams        map[*countedPeerStream]struct{}
+	pending        map[*pendingPeerOpen]struct{}
+}
+
+type pendingPeerOpen struct{ cancel context.CancelFunc }
+
+func (c *peerConn) cancelPendingLocked() {
+	for open := range c.pending {
+		open.cancel()
+	}
 }
 
 // peerFailureWatcher is optionally implemented by clients whose underlying
@@ -272,6 +281,7 @@ func (h *hostPool) replaceLocked(addr string) {
 	for _, c := range old {
 		c.mu.Lock()
 		c.draining = true
+		c.cancelPendingLocked()
 		c.detached = true
 		c.mu.Unlock()
 		h.retired++
@@ -296,24 +306,31 @@ retry:
 			c.mu.Lock()
 			if !c.draining && c.active < c.max {
 				c.active++
+				openCtx, cancel := context.WithCancel(ctx)
+				pending := &pendingPeerOpen{cancel: cancel}
+				if c.pending == nil {
+					c.pending = make(map[*pendingPeerOpen]struct{})
+				}
+				c.pending[pending] = struct{}{}
 				c.mu.Unlock()
 				generation := h.endpointGeneration
 				h.mu.Unlock()
-				s, e := c.client.OpenPeerStream(ctx)
-				if e == nil {
-					// Endpoint replacement may have started while the stream
-					// was being opened. Re-check the generation before exposing
-					// it so no new stream can escape on a stale connection.
-					h.mu.Lock()
-					c.mu.Lock()
-					if h.closed || generation != h.endpointGeneration || c.draining || c.removed {
-						c.mu.Unlock()
-						h.mu.Unlock()
-						h.releaseOpen(c)
+				s, e := c.client.OpenPeerStream(openCtx)
+				h.mu.Lock()
+				c.mu.Lock()
+				delete(c.pending, pending)
+				if h.closed || generation != h.endpointGeneration || c.draining || c.removed {
+					c.mu.Unlock()
+					h.mu.Unlock()
+					cancel()
+					h.releaseOpen(c)
+					if s != nil {
 						_ = s.Close()
-						continue retry
 					}
-					cs := &countedPeerStream{PeerStream: s, conn: c, host: h, tele: h.parent.cfg.Telemetry}
+					continue retry
+				}
+				if e == nil {
+					cs := &countedPeerStream{PeerStream: s, conn: c, host: h, tele: h.parent.cfg.Telemetry, cancel: cancel}
 					if c.streams == nil {
 						c.streams = make(map[*countedPeerStream]struct{})
 					}
@@ -332,6 +349,9 @@ retry:
 					}
 					return cs, nil
 				}
+				c.mu.Unlock()
+				h.mu.Unlock()
+				cancel()
 				h.releaseOpen(c)
 				if peerRPCError(e) {
 					return nil, e
@@ -572,6 +592,7 @@ func (h *hostPool) markFailed(c *peerConn) {
 		h.retryAt = time.Now().Add(peerReconnectBackoff(h.failures))
 		c.mu.Lock()
 		c.draining = true
+		c.cancelPendingLocked()
 		c.removed = true
 		c.mu.Unlock()
 		h.notifyLocked()
@@ -669,6 +690,7 @@ func (h *hostPool) scheduleDrain(c *peerConn) {
 		}
 		active := c.active
 		c.draining = true
+		c.cancelPendingLocked()
 		c.removed = true
 		// Pending opens reserve capacity without publishing a stream metric.
 		// Balance only published streams; late wrapper cleanup is idempotent.
@@ -715,6 +737,11 @@ func (h *hostPool) close(deadline time.Time) {
 	for c := range h.retiredConns {
 		cs = append(cs, c)
 	}
+	for _, c := range cs {
+		c.mu.Lock()
+		c.cancelPendingLocked()
+		c.mu.Unlock()
+	}
 	if h.eviction != nil {
 		h.eviction.Stop()
 	}
@@ -737,6 +764,7 @@ func (h *hostPool) close(deadline time.Time) {
 	for _, c := range cs {
 		c.mu.Lock()
 		c.draining = true
+		c.cancelPendingLocked()
 		reclaim := c.active == 0 && !c.removed
 		if reclaim {
 			c.removed = true
@@ -780,6 +808,7 @@ draining:
 			continue
 		}
 		c.draining = true
+		c.cancelPendingLocked()
 		forcedStreams := c.published
 		c.published = 0
 		c.active = 0
@@ -796,10 +825,11 @@ draining:
 
 type countedPeerStream struct {
 	PeerStream
-	host *hostPool
-	conn *peerConn
-	tele PeerPoolTelemetry
-	once sync.Once
+	host   *hostPool
+	conn   *peerConn
+	tele   PeerPoolTelemetry
+	once   sync.Once
+	cancel context.CancelFunc
 }
 
 func (s *countedPeerStream) Read(p []byte) (int, error) {
@@ -824,6 +854,9 @@ func (s *countedPeerStream) Write(p []byte) (int, error) {
 }
 
 func (s *countedPeerStream) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
 	e := s.PeerStream.Close()
 	s.once.Do(func() {
 		s.conn.mu.Lock()

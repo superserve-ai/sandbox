@@ -1401,3 +1401,76 @@ func TestPeerPoolSlowIdleCloseDoesNotBlockOpens(t *testing.T) {
 	once.Do(func() { close(release) })
 	_ = p.Close()
 }
+
+type contextPoolPeerStream struct {
+	testPeerStream
+	ctx context.Context
+}
+type cancelablePendingPeerClient struct {
+	calls   atomic.Int32
+	started chan struct{}
+}
+
+func (c *cancelablePendingPeerClient) OpenPeerStream(ctx context.Context) (PeerStream, error) {
+	if c.calls.Add(1) == 1 {
+		return &contextPoolPeerStream{ctx: ctx}, nil
+	}
+	close(c.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestPeerPoolCancelsRetiredPendingStreamOpens(t *testing.T) {
+	for _, operation := range []string{"replacement", "shutdown"} {
+		t.Run(operation, func(t *testing.T) {
+			client := &cancelablePendingPeerClient{started: make(chan struct{})}
+			p := NewPeerTransport(PeerPoolConfig{DrainTimeout: time.Second, Dial: func(_ context.Context, _, addr string) (PeerClient, io.Closer, error) {
+				if addr == "old" {
+					return client, &countingCloser{}, nil
+				}
+				return &testPeerClient{}, &countingCloser{}, nil
+			}})
+			defer p.Close()
+			established, err := p.OpenStream(context.Background(), "host", "old")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer established.Close()
+			streamCtx := established.(*countedPeerStream).PeerStream.(*contextPoolPeerStream).ctx
+			done := make(chan error, 1)
+			go func() {
+				s, err := p.OpenStream(context.Background(), "host", "old")
+				if s != nil {
+					_ = s.Close()
+				}
+				done <- err
+			}()
+			<-client.started
+			if operation == "replacement" {
+				s, err := p.OpenStream(context.Background(), "host", "new")
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = s.Close()
+				if streamCtx.Err() != nil {
+					t.Fatal("replacement canceled an established stream")
+				}
+			} else {
+				_ = established.Close()
+				_ = p.Close()
+			}
+			select {
+			case err := <-done:
+				if (operation == "shutdown") != (err != nil) {
+					t.Fatalf("unexpected open result: %v", err)
+				}
+			case <-time.After(250 * time.Millisecond):
+				t.Fatal("pending stream open was not canceled")
+			}
+			_ = established.Close()
+			if streamCtx.Err() == nil {
+				t.Fatal("stream close did not cancel its context")
+			}
+		})
+	}
+}
