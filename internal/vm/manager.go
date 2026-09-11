@@ -1707,8 +1707,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		if err := writePauseIntent(snapshotDir, pauseIntent{VMID: vmID, FreezeToken: freezeToken, ArtifactID: artifactID}); err != nil {
 			return "", "", nil, m.handleVMError(vmID, fmt.Errorf("record pause intent: %w", err))
 		}
-	} else if wakeProtocolFloorRaised() && snapshotDir == filepath.Join(m.cfg.SnapshotDir, vmID) && m.frozenManifestAt(overlayPath, fullPath) {
-		// An unfrozen pause overwriting an image whose manifest says frozen:
+	} else if wakeProtocolFloorRaised() && snapshotDir == filepath.Join(m.cfg.SnapshotDir, vmID) && m.mayBeFrozenAt(overlayPath, fullPath) {
+		// An unfrozen pause overwriting an image whose manifest says frozen,
+		// or cannot be read:
 		// the image is rewritten before the manifest is replaced, so the
 		// rewrite is recorded and a restore refuses the image until recovery
 		// removes the stale manifest. Only a host with frozen images holds one.
@@ -3012,7 +3013,7 @@ func (m *Manager) CreateVMSnapshot(ctx context.Context, vmID, snapshotDir string
 	// gone; the journal is cleared with it. Only a host with frozen images
 	// can hold such a manifest.
 	journalled := false
-	if wakeProtocolFloorRaised() && m.frozenManifestAt(memPath) {
+	if wakeProtocolFloorRaised() && m.mayBeFrozenAt(memPath) {
 		if err := writePauseIntent(snapshotDir, pauseIntent{VMID: vmID, ArtifactID: NewArtifactID()}); err != nil {
 			return "", "", fmt.Errorf("record the ad-hoc rewrite of %q: %w", memPath, err)
 		}
@@ -5073,6 +5074,27 @@ var staleUnitStopConfirmed = func(ctx context.Context, unit string) bool {
 // cleanupStale must be false on the request path: the dead-VM check would SIGKILL
 // and delete a live VM whenever systemctl is merely slow. Only the eager GC pass
 // sets it. Concurrent-safe: the map write is double-checked under the lock.
+// interruptedResume reports a record a resume published, owing a wake, and
+// never completed: its paused image is intact.
+func interruptedResume(rec VMRecord) bool {
+	return rec.Status == StatusRunning && rec.Unverified && rec.WakePending && rec.WakeOwedFromPaused
+}
+
+// returnInterruptedResumeToPaused rewrites an interrupted resume's record
+// Paused with nothing owed, once its process is known stopped, and reattaches
+// it; the record is never reaped as a failed create.
+func (m *Manager) returnInterruptedResumeToPaused(ctx context.Context, rec VMRecord, cleanupStale bool, log zerolog.Logger) (*VMInstance, bool) {
+	log.Warn().Msg("resume interrupted before its guest ran — record returns to Paused")
+	rec.Status = StatusPaused
+	rec.WakePending, rec.ClockFrozen, rec.WakeOwedFromPaused, rec.Unverified = false, false, false, false
+	rec.WakeToken, rec.WakeSnapshotPath, rec.WakeMemPath = "", "", ""
+	if wrote, perr := m.state.PutIfPresent(rec); perr != nil || !wrote {
+		log.Warn().Err(perr).Bool("present", wrote).Msg("interrupted resume's record could not be returned to Paused")
+		return nil, false
+	}
+	return m.reattachRecord(ctx, rec, cleanupStale)
+}
+
 func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale bool) (*VMInstance, bool) {
 	if reattachHook != nil {
 		reattachHook(rec.ID)
@@ -5274,19 +5296,8 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			fullyDown = vmUnitFullyDown(rec.ID)
 		}
 		if fullyDown {
-			if rec.Status == StatusRunning && rec.Unverified && rec.WakePending && rec.WakeOwedFromPaused {
-				// A resume that published its wake-owed record and died before
-				// its launch: the paused image is intact, so the record returns
-				// to Paused instead of being reaped, rewritten before it is read.
-				log.Warn().Msg("resume interrupted before its launch — record returns to Paused")
-				rec.Status = StatusPaused
-				rec.WakePending, rec.ClockFrozen, rec.WakeOwedFromPaused, rec.Unverified = false, false, false, false
-				rec.WakeToken, rec.WakeSnapshotPath, rec.WakeMemPath = "", "", ""
-				if wrote, perr := m.state.PutIfPresent(rec); perr != nil || !wrote {
-					log.Warn().Err(perr).Bool("present", wrote).Msg("interrupted resume's record could not be returned to Paused")
-					return nil, false
-				}
-				return m.reattachRecord(ctx, rec, cleanupStale)
+			if interruptedResume(rec) {
+				return m.returnInterruptedResumeToPaused(ctx, rec, cleanupStale, log)
 			}
 			log.Warn().Msg("VM in BoltDB but not running — cleaning up stale record")
 			// Cold-booted VMs (old build path) ran with Setsid and no unit, so
@@ -5360,6 +5371,10 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 							confirmed = killUnitSIGKILL(ctx, systemdUnitName(rec.ID))
 						}
 					}
+				}
+				if confirmed && interruptedResume(rec) {
+					// The launch was interrupted, not the paused image.
+					return m.returnInterruptedResumeToPaused(ctx, rec, cleanupStale, log)
 				}
 				if confirmed {
 					if derr := m.state.Delete(rec.ID); derr == nil {
@@ -8543,15 +8558,19 @@ func (m *Manager) abandonDirtyBaseline(inst *VMInstance) {
 	inst.mu.Unlock()
 }
 
-// frozenManifestAt reports whether any of the paths carries a manifest that
-// says frozen. A stat first: absent manifests, the common case, cost one
-// lookup each and no read.
-func (m *Manager) frozenManifestAt(paths ...string) bool {
+// mayBeFrozenAt reports whether any of the paths carries a manifest that
+// says frozen, or one that cannot be read or looked up: an unknown manifest
+// is journalled like a frozen one, never rewritten over blind. A stat first:
+// absent manifests, the common case, cost one lookup each and no read.
+func (m *Manager) mayBeFrozenAt(paths ...string) bool {
 	for _, p := range paths {
 		if _, err := os.Stat(WallClockMarkerPath(p)); err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return true
 		}
-		if man, err := ReadWallClockManifest(p); err == nil && man != nil && man.WorkloadFrozen {
+		if man, err := ReadWallClockManifest(p); err != nil || (man != nil && man.WorkloadFrozen) {
 			return true
 		}
 	}

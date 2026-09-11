@@ -978,22 +978,27 @@ func TestRequestJoiningADeferredStartupFlightReattachesItself(t *testing.T) {
 }
 
 // A resume publishes its wake-owed record before it launches Firecracker. A
-// crash in that window must not reap the sandbox as a failed create: the
-// paused image is intact, so the record returns to Paused. A create's record
-// in the same state has nowhere to return to and is reaped as before.
+// crash in that window, or after the launch but before the socket exists,
+// must not reap the sandbox as a failed create: the paused image is intact,
+// so the record returns to Paused once the process is known stopped. A
+// create's record in the same state has nowhere to return to and is reaped
+// as before.
 func TestInterruptedResumeReturnsToPaused(t *testing.T) {
-	origDown := vmUnitFullyDown
-	vmUnitFullyDown = func(string) bool { return true }
-	t.Cleanup(func() { vmUnitFullyDown = origDown })
+	origDown, origStop := vmUnitFullyDown, staleUnitStopConfirmed
+	staleUnitStopConfirmed = func(context.Context, string) bool { return true }
+	t.Cleanup(func() { vmUnitFullyDown, staleUnitStopConfirmed = origDown, origStop })
 	for _, tc := range []struct {
 		name       string
 		fromPaused bool
+		unitDown   bool
 		wantKept   bool
 	}{
-		{"resume_returns_to_paused", true, true},
-		{"create_is_reaped", false, false},
+		{"resume_returns_to_paused", true, true, true},
+		{"resume_with_its_unit_up_and_no_socket_returns_to_paused", true, false, true},
+		{"create_is_reaped", false, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			vmUnitFullyDown = func(string) bool { return tc.unitDown }
 			dir := t.TempDir()
 			store, err := OpenStateStore(filepath.Join(dir, "state.db"))
 			if err != nil {
@@ -1010,7 +1015,7 @@ func TestInterruptedResumeReturnsToPaused(t *testing.T) {
 			// What a resume from an override leaves if vmd dies before its
 			// launch: the record's own image and token, and the override's
 			// token in flight.
-			rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "rec", WakeToken: "disk", WakeSnapshotPath: filepath.Join(dir, "other-vm.snap"), WakeMemPath: filepath.Join(dir, "other.snap"), WakeOwedFromPaused: tc.fromPaused, Supervision: SupervisionUnit, SnapshotPath: snapPath, MemFilePath: memPath, PausedAt: pausedAt}
+			rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "rec", WakeToken: "disk", WakeSnapshotPath: filepath.Join(dir, "other-vm.snap"), WakeMemPath: filepath.Join(dir, "other.snap"), WakeOwedFromPaused: tc.fromPaused, Supervision: SupervisionUnit, SocketPath: filepath.Join(dir, "missing.sock"), SnapshotPath: snapPath, MemFilePath: memPath, PausedAt: pausedAt}
 			if err := store.Put(rec); err != nil {
 				t.Fatal(err)
 			}
@@ -2105,10 +2110,9 @@ func TestUnfrozenPauseReplacingAManifestDoesSoDurably(t *testing.T) {
 	}
 }
 
-// An unfrozen pause that overwrites an image whose manifest says frozen
-// records an intent first: a crash between the rewrite and the manifest's
-// replacement then leaves an intent a restore refuses on, and recovery
-// removes the stale manifest before it clears the intent.
+// An unfrozen pause rewriting an image whose manifest says frozen, or cannot
+// be read, records the rewrite first: a crash mid-rewrite leaves an intent
+// that refuses the image until recovery removes the stale manifest.
 func TestUnfrozenOverwriteOfAFrozenImageIsCoveredByAnIntent(t *testing.T) {
 	useTempFloor(t)
 	raiseFloorForTest(t)
@@ -2118,45 +2122,59 @@ func TestUnfrozenOverwriteOfAFrozenImageIsCoveredByAnIntent(t *testing.T) {
 	boxdHealthProbe = func(context.Context, string, time.Duration) error { return nil }
 	t.Cleanup(func() { vmUnitFullyDown, fcUnpauseVM, boxdHealthProbe = origDown, origUnpause, origProbe })
 
-	fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
-		return http.StatusInternalServerError, `{"fault_message":"disk full"}`
-	})
-	dir := t.TempDir()
-	vmDir := filepath.Join(dir, "vm-1")
-	if err := os.MkdirAll(vmDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	memSnap := filepath.Join(vmDir, "mem.snap")
-	if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	seedFrozenManifest(t, memSnap, "A")
-	corrects := false
-	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects, ArtifactID: "current"}
-	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+	for _, tc := range []struct {
+		name string
+		seed func(t *testing.T, memSnap string)
+	}{
+		{"frozen_manifest", func(t *testing.T, memSnap string) { seedFrozenManifest(t, memSnap, "A") }},
+		{"unreadable_manifest", func(t *testing.T, memSnap string) {
+			if err := os.WriteFile(WallClockMarkerPath(memSnap), []byte("{not json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
+				return http.StatusInternalServerError, `{"fault_message":"disk full"}`
+			})
+			dir := t.TempDir()
+			vmDir := filepath.Join(dir, "vm-1")
+			if err := os.MkdirAll(vmDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			memSnap := filepath.Join(vmDir, "mem.snap")
+			if err := os.WriteFile(memSnap, []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			tc.seed(t, memSnap)
+			corrects := false
+			inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath, MemFilePath: memSnap, CorrectsWallClock: &corrects, ArtifactID: "current"}
+			m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
 
-	// The rewrite dies (here: the snapshot fails) with the old manifest
-	// still beside the image, and the intent recorded.
-	if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
-		t.Fatal("want the snapshot failure")
-	}
-	in, err := readPauseIntent(vmDir)
-	if err != nil || in == nil || in.FreezeToken != "" || in.ArtifactID == "" || in.ArtifactID == "current" {
-		t.Fatalf("intent = %+v err=%v; want an intent naming the rewrite, without a token", in, err)
-	}
-	if blocked, _ := pauseIntentBlocks(vmDir, "current"); !blocked {
-		t.Fatal("a restore of the image must be refused while the rewrite's intent stands")
-	}
+			// The rewrite dies (here: the snapshot fails) with the old manifest
+			// still beside the image, and the intent recorded.
+			if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+				t.Fatal("want the snapshot failure")
+			}
+			in, err := readPauseIntent(vmDir)
+			if err != nil || in == nil || in.FreezeToken != "" || in.ArtifactID == "" || in.ArtifactID == "current" {
+				t.Fatalf("intent = %+v err=%v; want an intent naming the rewrite, without a token", in, err)
+			}
+			if blocked, _ := pauseIntentBlocks(vmDir, "current"); !blocked {
+				t.Fatal("a restore of the image must be refused while the rewrite's intent stands")
+			}
 
-	// Recovery after a restart: the stale frozen manifest goes, then the intent.
-	if !m.recoverPauseIntent(context.Background(), inst, zerolog.Nop()) {
-		t.Fatal("recovery must succeed for a rewrite that froze nothing")
-	}
-	if man, err := ReadWallClockManifest(memSnap); err != nil || man != nil {
-		t.Fatalf("manifest=%+v err=%v; the stale frozen manifest must be removed before the intent is cleared", man, err)
-	}
-	if in, _ := readPauseIntent(vmDir); in != nil {
-		t.Fatalf("intent = %+v; want it cleared after recovery", in)
+			// Recovery after a restart: the stale manifest goes, then the intent.
+			if !m.recoverPauseIntent(context.Background(), inst, zerolog.Nop()) {
+				t.Fatal("recovery must succeed for a rewrite that froze nothing")
+			}
+			if man, err := ReadWallClockManifest(memSnap); err != nil || man != nil {
+				t.Fatalf("manifest=%+v err=%v; the stale manifest must be removed before the intent is cleared", man, err)
+			}
+			if in, _ := readPauseIntent(vmDir); in != nil {
+				t.Fatalf("intent = %+v; want it cleared after recovery", in)
+			}
+		})
 	}
 }
 
@@ -2714,44 +2732,58 @@ func TestFrozenRestoreOfAPausedVMFailingBeforeItsWakeReturnsToPaused(t *testing.
 	}
 }
 
-// An ad-hoc snapshot over a frozen image journals the rewrite before the
-// image is replaced: a restore refuses the directory while the old manifest
-// could still govern the new image, and the journal clears with the manifest.
+// An ad-hoc snapshot over an image whose manifest says frozen, or cannot be
+// read, journals the rewrite while the old marker still stands, and clears
+// the journal with the marker once the image is published.
 func TestAdHocSnapshotOverAFrozenImageJournalsTheRewrite(t *testing.T) {
 	useTempFloor(t)
 	raiseFloorForTest(t)
-	dir := t.TempDir()
-	snapDir := filepath.Join(dir, "adhoc")
-	if err := os.MkdirAll(snapDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	memPath := filepath.Join(snapDir, "mem.snap")
-	if err := os.WriteFile(memPath, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	seedFrozenManifest(t, memPath, "A")
-	var journalledAtSnapshot, manifestAtSnapshot, blockedAtSnapshot bool
-	fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
-		in, _ := readPauseIntent(snapDir)
-		journalledAtSnapshot = in != nil && in.FreezeToken == ""
-		man, _ := ReadWallClockManifest(memPath)
-		manifestAtSnapshot = man != nil && man.WorkloadFrozen
-		blockedAtSnapshot, _ = pauseIntentBlocks(snapDir, "")
-		return http.StatusNoContent, ""
-	})
-	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath}
-	m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
-	if _, _, err := m.CreateVMSnapshot(context.Background(), "vm-1", snapDir); err != nil {
-		t.Fatalf("snapshot: %v", err)
-	}
-	if !journalledAtSnapshot || !manifestAtSnapshot || !blockedAtSnapshot {
-		t.Fatalf("at the snapshot: journalled=%v manifest=%v blocked=%v; the rewrite must be journalled while the old manifest still stands, and a restore refused", journalledAtSnapshot, manifestAtSnapshot, blockedAtSnapshot)
-	}
-	if in, _ := readPauseIntent(snapDir); in != nil {
-		t.Fatalf("journal = %+v after success; want it cleared with the manifest", in)
-	}
-	if man, err := ReadWallClockManifest(memPath); err != nil || man != nil {
-		t.Fatalf("manifest=%+v err=%v; an ad-hoc image is never marked", man, err)
+	for _, tc := range []struct {
+		name string
+		seed func(t *testing.T, memPath string)
+	}{
+		{"frozen_manifest", func(t *testing.T, memPath string) { seedFrozenManifest(t, memPath, "A") }},
+		{"unreadable_manifest", func(t *testing.T, memPath string) {
+			if err := os.WriteFile(WallClockMarkerPath(memPath), []byte("{not json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			snapDir := filepath.Join(dir, "adhoc")
+			if err := os.MkdirAll(snapDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			memPath := filepath.Join(snapDir, "mem.snap")
+			if err := os.WriteFile(memPath, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			tc.seed(t, memPath)
+			var journalledAtSnapshot, markerAtSnapshot, blockedAtSnapshot bool
+			fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
+				in, _ := readPauseIntent(snapDir)
+				journalledAtSnapshot = in != nil && in.FreezeToken == ""
+				_, serr := os.Stat(WallClockMarkerPath(memPath))
+				markerAtSnapshot = serr == nil
+				blockedAtSnapshot, _ = pauseIntentBlocks(snapDir, "")
+				return http.StatusNoContent, ""
+			})
+			inst := &VMInstance{ID: "vm-1", Status: StatusRunning, Supervision: SupervisionCgroup, IP: "10.0.0.2", SocketPath: fc.socketPath}
+			m := &Manager{log: zerolog.Nop(), netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{"vm-1": inst}, cfg: ManagerConfig{SnapshotDir: dir, RunDir: dir}}
+			if _, _, err := m.CreateVMSnapshot(context.Background(), "vm-1", snapDir); err != nil {
+				t.Fatalf("snapshot: %v", err)
+			}
+			if !journalledAtSnapshot || !markerAtSnapshot || !blockedAtSnapshot {
+				t.Fatalf("at the snapshot: journalled=%v marker=%v blocked=%v; the rewrite must be journalled while the old marker still stands, and a restore refused", journalledAtSnapshot, markerAtSnapshot, blockedAtSnapshot)
+			}
+			if in, _ := readPauseIntent(snapDir); in != nil {
+				t.Fatalf("journal = %+v after success; want it cleared with the marker", in)
+			}
+			if man, err := ReadWallClockManifest(memPath); err != nil || man != nil {
+				t.Fatalf("manifest=%+v err=%v; an ad-hoc image is never marked", man, err)
+			}
+		})
 	}
 }
 
