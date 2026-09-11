@@ -1,0 +1,1114 @@
+package proxy
+
+import (
+	"context"
+	"errors"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"io"
+	"math/rand"
+	"sync"
+	"time"
+)
+
+type PeerPoolConfig struct {
+	MaxConnections, StreamsPerConnection int
+	DrainTimeout                         time.Duration
+	Dial                                 PeerDialer
+	Telemetry                            PeerPoolTelemetry
+}
+type PeerPoolTelemetry interface {
+	PeerConnection(delta int)
+	PeerStream(delta int)
+	PeerFailure()
+	PeerReconnect(result string)
+	PeerDrain(forced bool)
+	PeerHandshake(time.Duration, string)
+}
+
+// RecorderPeerTelemetry adapts the shared telemetry Recorder to pool events.
+// It is optional so existing callers and test fakes remain source-compatible.
+type RecorderPeerTelemetry struct {
+	Recorder interface {
+		RecordPeerEvent(context.Context, telemetry.PeerEvent)
+	}
+	HostID, Region string
+}
+
+func (t RecorderPeerTelemetry) emit(kind string, delta int64, forced bool) {
+	t.emitResult(kind, delta, forced, telemetry.ResultSuccess)
+}
+func (t RecorderPeerTelemetry) emitResult(kind string, delta int64, forced bool, result string) {
+	if t.Recorder == nil {
+		return
+	}
+	t.Recorder.RecordPeerEvent(context.Background(), telemetry.PeerEvent{Kind: kind, Delta: delta, Forced: forced, HostID: t.HostID, Region: t.Region, Result: result})
+}
+func (t RecorderPeerTelemetry) PeerConnection(d int) { t.emit("connection", int64(d), false) }
+func (t RecorderPeerTelemetry) PeerStream(d int)     { t.emit("stream", int64(d), false) }
+func (t RecorderPeerTelemetry) PeerFailure() {
+	t.emitResult("failure", 0, false, telemetry.ResultError)
+}
+func (t RecorderPeerTelemetry) PeerReconnect(result string) {
+	t.emitResult("reconnect", 0, false, result)
+}
+func (t RecorderPeerTelemetry) PeerDrain(f bool) { t.emit("drain", 0, f) }
+func (t RecorderPeerTelemetry) PeerHandshake(d time.Duration, result string) {
+	if t.Recorder == nil {
+		return
+	}
+	t.Recorder.RecordPeerEvent(context.Background(), telemetry.PeerEvent{Kind: "handshake", Duration: d, HostID: t.HostID, Region: t.Region, Result: result})
+}
+
+type noopPeerTelemetry struct{}
+
+func (noopPeerTelemetry) PeerConnection(int)                  {}
+func (noopPeerTelemetry) PeerStream(int)                      {}
+func (noopPeerTelemetry) PeerFailure()                        {}
+func (noopPeerTelemetry) PeerReconnect(string)                {}
+func (noopPeerTelemetry) PeerDrain(bool)                      {}
+func (noopPeerTelemetry) PeerHandshake(time.Duration, string) {}
+
+type peerPool struct {
+	mu        sync.Mutex
+	cfg       PeerPoolConfig
+	hosts     map[string]*hostPool
+	closed    bool
+	closeDone chan struct{}
+}
+
+func NewPeerTransport(cfg PeerPoolConfig) PeerTransport {
+	if cfg.MaxConnections <= 0 {
+		cfg.MaxConnections = 4
+	}
+	if cfg.StreamsPerConnection <= 0 {
+		cfg.StreamsPerConnection = 100
+	}
+	if cfg.DrainTimeout <= 0 {
+		cfg.DrainTimeout = 30 * time.Second
+	}
+	if cfg.Telemetry == nil {
+		cfg.Telemetry = noopPeerTelemetry{}
+	}
+	return &peerPool{cfg: cfg, hosts: make(map[string]*hostPool)}
+}
+func (p *peerPool) OpenStream(ctx context.Context, host, addr string) (PeerStream, error) {
+	if p.cfg.Dial == nil {
+		return nil, errors.New("peer dialer is required")
+	}
+	if host == "" || addr == "" {
+		return nil, errors.New("peer host and address required")
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, errors.New("peer transport closed")
+	}
+	h := p.hosts[host]
+	if h == nil {
+		h = &hostPool{parent: p, host: host, addr: addr}
+		p.hosts[host] = h
+	}
+	// The endpoint is owned by hostPool and protected by h.mu. Keep the
+	// comparison under that lock as replacement mutates it while holding h.mu.
+	h.mu.Lock()
+	h.openers++
+	endpointChanged := h.addr != addr
+	h.mu.Unlock()
+	if endpointChanged {
+		h.replaceLocked(addr)
+	}
+	p.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		h.openers--
+		h.mu.Unlock()
+		h.evictIfEmpty()
+	}()
+	return h.open(ctx)
+}
+func (p *peerPool) Close() error {
+	p.mu.Lock()
+	if p.closed {
+		done := p.closeDone
+		p.mu.Unlock()
+		<-done
+		return nil
+	}
+	p.closed = true
+	p.closeDone = make(chan struct{})
+	defer close(p.closeDone)
+	hs := make([]*hostPool, 0, len(p.hosts))
+	for _, h := range p.hosts {
+		hs = append(hs, h)
+	}
+	p.mu.Unlock()
+	deadline := time.Now().Add(p.cfg.DrainTimeout)
+	var drains sync.WaitGroup
+	for _, h := range hs {
+		h.mu.Lock()
+		h.closed = true
+		h.notifyLocked()
+		if h.dialCancel != nil {
+			h.dialCancel()
+		}
+		h.mu.Unlock()
+	}
+	for _, h := range hs {
+		drains.Add(1)
+		go func() { defer drains.Done(); h.close(deadline) }()
+	}
+	completed := make(chan struct{})
+	go func() { drains.Wait(); close(completed) }()
+	timer := time.NewTimer(max(time.Until(deadline), 0))
+	defer timer.Stop()
+	select {
+	case <-completed:
+	case <-timer.C:
+	}
+	return nil
+}
+
+type hostPool struct {
+	mu                 sync.Mutex
+	parent             *peerPool
+	host, addr         string
+	conns              []*peerConn
+	dialing            bool
+	dialDone           chan struct{}
+	changed            chan struct{}
+	dialCancel         context.CancelFunc
+	closed             bool
+	endpointGeneration uint64
+	failures           int
+	retryAt            time.Time
+	retired            int
+	replacing          bool
+	openers            int
+	eviction           *time.Timer
+	evictionGeneration uint64
+	retiredConns       map[*peerConn]struct{}
+	observations       peerObservations
+}
+
+const (
+	peerReconnectBaseBackoff = 100 * time.Millisecond
+	peerReconnectMaxBackoff  = 5 * time.Second
+)
+
+// peerReconnectBackoff returns an exponentially increasing, one-sided jittered
+// delay. The lower bound is intentional: failures never cause a tighter retry
+// loop, while the ceiling bounds pressure on an unavailable peer.
+func peerReconnectBackoff(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	d := peerReconnectBaseBackoff * time.Duration(1<<min(failures-1, 5))
+	if d > peerReconnectMaxBackoff {
+		d = peerReconnectMaxBackoff
+	}
+	return d/2 + time.Duration(rand.Int63n(int64(d/2)))
+}
+
+type peerConn struct {
+	mu                sync.Mutex
+	client            PeerClient
+	closer            io.Closer
+	closeOnce         sync.Once
+	closed            chan struct{}
+	active            int // Includes reserved capacity for pending opens.
+	published         int // Streams committed to telemetry accounting.
+	draining          bool
+	removed           bool
+	drainScheduled    bool
+	drainCancel       chan struct{}
+	detached          bool
+	max               int
+	streams           map[*countedPeerStream]struct{}
+	pending           map[*pendingPeerOpen]struct{}
+	streamMetrics     peerMetricDelta
+	connectionMetrics peerMetricDelta
+}
+
+// Queue under the state lock; callbacks run outside it. Concurrent cleanup
+// can queue a decrement without waiting for an earlier callback to finish.
+type peerMetricDelta struct {
+	mu       sync.Mutex
+	delta    int
+	emitting bool
+}
+
+func (m *peerMetricDelta) queue(delta int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.delta += delta
+	if m.emitting || m.delta == 0 {
+		return false
+	}
+	m.emitting = true
+	return true
+}
+func (m *peerMetricDelta) flush(emit func(int)) {
+	for {
+		m.mu.Lock()
+		delta := m.delta
+		m.delta = 0
+		if delta == 0 {
+			m.emitting = false
+			m.mu.Unlock()
+			return
+		}
+		m.mu.Unlock()
+		emit(delta)
+	}
+}
+func (c *peerConn) queueStreamDelta(delta int) bool { return c.streamMetrics.queue(delta) }
+func (c *peerConn) flushStreamDelta(tele PeerPoolTelemetry) {
+	go c.streamMetrics.flush(tele.PeerStream)
+}
+
+// Observations are best effort: a stalled backend retains at most 64
+// pending observations per host and one emitter, without delaying callers.
+type peerObservation struct {
+	kind      string
+	forced    bool
+	duration  time.Duration
+	result    string
+	reconnect bool
+}
+type peerObservations struct {
+	mu       sync.Mutex
+	pending  []peerObservation
+	emitting bool
+}
+
+func (m *peerObservations) record(tele PeerPoolTelemetry, event peerObservation) {
+	m.mu.Lock()
+	if len(m.pending) < 64 {
+		m.pending = append(m.pending, event)
+	}
+	start := !m.emitting
+	m.emitting = true
+	m.mu.Unlock()
+	if start {
+		go m.flush(tele)
+	}
+}
+func (m *peerObservations) flush(tele PeerPoolTelemetry) {
+	for {
+		m.mu.Lock()
+		if len(m.pending) == 0 {
+			m.emitting = false
+			m.mu.Unlock()
+			return
+		}
+		event := m.pending[0]
+		m.pending = m.pending[1:]
+		m.mu.Unlock()
+		switch event.kind {
+		case "drain":
+			tele.PeerDrain(event.forced)
+		case "failure":
+			tele.PeerFailure()
+		default:
+			tele.PeerHandshake(event.duration, event.result)
+			if event.reconnect {
+				tele.PeerReconnect(event.result)
+			}
+		}
+	}
+}
+
+type pendingPeerOpen struct{ cancel context.CancelFunc }
+
+func (c *peerConn) cancelPendingLocked() {
+	for open := range c.pending {
+		open.cancel()
+	}
+}
+
+// peerFailureWatcher is optionally implemented by clients whose underlying
+// transport can report an asynchronous terminal failure.  Watching this
+// signal ensures failures are handled even when callers are not currently
+// reading or writing an attached stream.
+type peerFailureWatcher interface {
+	Done() <-chan struct{}
+}
+
+// Retirement prevents new streams while preserving already accepted RPCs.
+type peerRetirementWatcher interface{ Retiring() <-chan struct{} }
+
+// peerStreamFailureWatcher is implemented by stream adapters that can report
+// an asynchronous terminal transport error (for example, a gRPC recv loop).
+// It complements the connection-level watcher: a stream may terminate while
+// the underlying client connection still appears healthy to grpc-go.
+type peerStreamFailureWatcher interface {
+	Done() <-chan struct{}
+}
+
+// closeDialResult releases a connection returned by a dial that can no
+// longer be published (for example, when its endpoint generation is stale).
+// Dialers normally return the transport closer separately, but accepting a
+// closer client as a fallback keeps discarded transports from leaking.
+func closeDialResult(client PeerClient, closer io.Closer) {
+	if closer != nil {
+		_ = closer.Close()
+		return
+	}
+	if c, ok := client.(io.Closer); ok {
+		_ = c.Close()
+	}
+}
+
+func (c *peerConn) close() {
+	c.closeOnce.Do(func() {
+		closeDialResult(c.client, c.closer)
+		if c.closed != nil {
+			close(c.closed)
+		}
+	})
+}
+
+// Stream and transport closers may wait on each other. Cancel every stream
+// first, then run their physical closes alongside transport cleanup.
+func (c *peerConn) closeWithStreams() {
+	c.mu.Lock()
+	streams := make([]*countedPeerStream, 0, len(c.streams))
+	for s := range c.streams {
+		streams = append(streams, s)
+	}
+	c.mu.Unlock()
+	var closed sync.WaitGroup
+	for _, s := range streams {
+		if s.cancel != nil {
+			s.cancel()
+		}
+	}
+	for _, s := range streams {
+		closed.Add(1)
+		go func() { defer closed.Done(); _ = s.Close() }()
+	}
+	c.close()
+	closed.Wait()
+}
+
+func (h *hostPool) replaceLocked(addr string) {
+	h.mu.Lock()
+	h.replacing = true
+	h.addr = addr
+	h.endpointGeneration++
+	h.notifyLocked()
+	if h.dialCancel != nil {
+		h.dialCancel()
+	}
+	h.failures = 0
+	h.retryAt = time.Time{}
+	// Detach the old endpoint connections from capacity accounting immediately.
+	// They remain alive only to drain their existing streams; retaining them in
+	// h.conns would consume the replacement endpoint's connection slots.
+	old := h.conns
+	h.conns = nil
+	for _, c := range old {
+		c.mu.Lock()
+		c.draining = true
+		c.cancelPendingLocked()
+		c.detached = true
+		c.mu.Unlock()
+		h.retired++
+		if h.retiredConns == nil {
+			h.retiredConns = make(map[*peerConn]struct{})
+		}
+		h.retiredConns[c] = struct{}{}
+		h.scheduleDrain(c)
+	}
+	h.replacing = false
+	h.mu.Unlock()
+}
+func (h *hostPool) open(ctx context.Context) (PeerStream, error) {
+retry:
+	for {
+		h.mu.Lock()
+		if h.closed {
+			h.mu.Unlock()
+			return nil, errors.New("peer host closed")
+		}
+		for _, c := range h.conns {
+			c.mu.Lock()
+			if !c.draining && c.active < c.max {
+				c.active++
+				openCtx, cancel := context.WithCancel(ctx)
+				pending := &pendingPeerOpen{cancel: cancel}
+				if c.pending == nil {
+					c.pending = make(map[*pendingPeerOpen]struct{})
+				}
+				c.pending[pending] = struct{}{}
+				c.mu.Unlock()
+				generation := h.endpointGeneration
+				h.mu.Unlock()
+				s, e := c.client.OpenPeerStream(openCtx)
+				h.mu.Lock()
+				c.mu.Lock()
+				delete(c.pending, pending)
+				if h.closed || generation != h.endpointGeneration || c.draining || c.removed {
+					c.mu.Unlock()
+					h.mu.Unlock()
+					cancel()
+					go func() {
+						if s != nil {
+							_ = s.Close()
+						}
+						h.releaseOpen(c)
+					}()
+					continue retry
+				}
+				if e == nil {
+					cs := &countedPeerStream{PeerStream: s, conn: c, host: h, tele: h.parent.cfg.Telemetry, cancel: cancel}
+					if c.streams == nil {
+						c.streams = make(map[*countedPeerStream]struct{})
+					}
+					c.streams[cs] = struct{}{}
+					c.published++
+					emit := c.queueStreamDelta(1)
+					c.mu.Unlock()
+					h.mu.Unlock()
+					if emit {
+						c.flushStreamDelta(h.parent.cfg.Telemetry)
+					}
+					if watcher, ok := s.(peerStreamFailureWatcher); ok {
+						go func() {
+							<-watcher.Done()
+							// A stream-level terminal signal is transport failure
+							// unless the connection was already removed/draining.
+							h.markFailed(c)
+						}()
+					}
+					return cs, nil
+				}
+				c.mu.Unlock()
+				h.mu.Unlock()
+				cancel()
+				h.releaseOpen(c)
+				if errors.Is(e, errPeerRetired) {
+					h.retire(c)
+					continue retry
+				}
+				if peerRPCError(e) {
+					return nil, e
+				}
+				if cleanup := h.detachFailed(c); cleanup != nil {
+					go cleanup()
+				}
+				h.mu.Lock()
+				break
+			} else {
+				c.mu.Unlock()
+			}
+		}
+		usable := 0
+		for _, c := range h.conns {
+			c.mu.Lock()
+			if !c.draining {
+				usable++
+			}
+			c.mu.Unlock()
+		}
+		if h.dialing {
+			// Coalesce concurrent callers behind the in-flight dial instead of
+			// polling every millisecond while an endpoint is unavailable.
+			done := h.dialDone
+			changed := h.changedLocked()
+			h.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-done:
+			case <-changed:
+			}
+			continue
+		}
+		if usable >= h.parent.cfg.MaxConnections {
+			changed := h.changedLocked()
+			h.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-changed:
+			}
+			continue
+		}
+		if wait := time.Until(h.retryAt); wait > 0 {
+			changed := h.changedLocked()
+			h.mu.Unlock()
+			t := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return nil, ctx.Err()
+			case <-t.C:
+			case <-changed:
+				t.Stop()
+			}
+			continue
+		}
+		h.dialing = true
+		h.dialDone = make(chan struct{})
+		dialDone := h.dialDone
+		dialCtx, dialCancel := context.WithCancel(ctx)
+		h.dialCancel = dialCancel
+		addr := h.addr
+		generation := h.endpointGeneration
+		recovering := h.failures > 0
+		h.mu.Unlock()
+		started := time.Now()
+		client, closer, e := h.parent.cfg.Dial(dialCtx, h.host, addr)
+		dialCancel()
+		duration := time.Since(started)
+		h.mu.Lock()
+		h.dialing = false
+		h.dialCancel = nil
+		result := telemetry.ResultSuccess
+		if e != nil || h.closed || generation != h.endpointGeneration || addr != h.addr {
+			result = telemetry.ResultError
+		}
+		// Shutdown may have started while the dial was out of lock.  A
+		// failed dial must not enter the reconnect/backoff path after the
+		// host has been closed, and a successful one must never be published.
+		if h.closed {
+			h.mu.Unlock()
+			h.observations.record(h.parent.cfg.Telemetry, peerObservation{duration: duration, result: result})
+			closeDialResult(client, closer)
+			h.mu.Lock()
+			close(dialDone)
+			h.dialDone = nil
+			h.mu.Unlock()
+			return nil, errors.New("peer host closed")
+		}
+		// The endpoint may have been replaced while dialing was out of lock.
+		// Never publish a result (including an error) established against that
+		// stale endpoint: otherwise a failed old-endpoint dial would poison the
+		// retry backoff for the new endpoint.
+		stale := generation != h.endpointGeneration || addr != h.addr
+		if stale {
+			close(dialDone)
+			h.dialDone = nil
+			h.mu.Unlock()
+			h.observations.record(h.parent.cfg.Telemetry, peerObservation{duration: duration, result: result})
+			closeDialResult(client, closer)
+			continue
+		}
+		var published *peerConn
+		if e == nil {
+			c := &peerConn{client: client, closer: closer, max: h.parent.cfg.StreamsPerConnection, closed: make(chan struct{})}
+			h.conns = append(h.conns, c)
+			var failed <-chan struct{}
+			if watcher, ok := client.(peerFailureWatcher); ok {
+				failed = watcher.Done()
+				go func() {
+					select {
+					case <-failed:
+						h.markFailed(c)
+					case <-c.closed:
+					}
+				}()
+			}
+			if retirement, ok := client.(peerRetirementWatcher); ok {
+				go func() {
+					select {
+					case <-retirement.Retiring():
+						h.retire(c)
+					case <-failed:
+					case <-c.closed:
+					}
+				}()
+			}
+			h.failures = 0
+			h.retryAt = time.Time{}
+			c.connectionMetrics.queue(1)
+			published = c
+		} else {
+			// Caller cancellation is not a transport failure and must not
+			// poison reconnect backoff for later callers.
+			if !peerCallerCanceled(e) {
+				// Publish the retry deadline before waking coalesced callers so a
+				// failed dial cannot trigger an immediate second attempt.
+				h.setBackoffLocked()
+			}
+		}
+		close(dialDone)
+		h.dialDone = nil
+		h.mu.Unlock()
+		h.observations.record(h.parent.cfg.Telemetry, peerObservation{duration: duration, result: result, reconnect: recovering && !peerCallerCanceled(e)})
+		if published != nil {
+			go published.connectionMetrics.flush(h.parent.cfg.Telemetry.PeerConnection)
+		}
+		if e != nil {
+			h.evictIfEmpty()
+			return nil, e
+		}
+	}
+}
+
+// Waiters subscribe under the host lock so capacity and endpoint changes cannot
+// be lost between checking the state and going to sleep.
+func (h *hostPool) changedLocked() <-chan struct{} {
+	if h.changed == nil {
+		h.changed = make(chan struct{})
+	}
+	return h.changed
+}
+
+func (h *hostPool) notifyLocked() {
+	if h.changed != nil {
+		close(h.changed)
+		h.changed = nil
+	}
+}
+
+func (h *hostPool) notify() {
+	h.mu.Lock()
+	h.notifyLocked()
+	h.mu.Unlock()
+}
+
+func (h *hostPool) evictIfEmpty() {
+	h.parent.mu.Lock()
+	defer h.parent.mu.Unlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.replacing || h.openers != 0 || len(h.conns) != 0 || h.retired != 0 || h.dialing {
+		return
+	}
+	// Retain failed-host retry state for a bounded idle period. Active callers
+	// pin the entry so eviction cannot orphan an in-flight open.
+	if h.failures > 0 {
+		if h.eviction != nil {
+			h.eviction.Stop()
+		}
+		h.evictionGeneration++
+		generation := h.evictionGeneration
+		h.eviction = time.AfterFunc(peerReconnectMaxBackoff, func() { h.evictIdle(generation) })
+		return
+	}
+	if h.parent.hosts[h.host] == h {
+		delete(h.parent.hosts, h.host)
+	}
+}
+
+func (h *hostPool) evictIdle(generation uint64) {
+	h.parent.mu.Lock()
+	defer h.parent.mu.Unlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if generation != h.evictionGeneration || h.closed {
+		return
+	}
+	if h.openers == 0 && !h.dialing && len(h.conns) == 0 && h.retired == 0 && h.parent.hosts[h.host] == h {
+		delete(h.parent.hosts, h.host)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (h *hostPool) setBackoff() {
+	h.mu.Lock()
+	h.setBackoffLocked()
+	h.mu.Unlock()
+}
+
+func (h *hostPool) setBackoffLocked() {
+	h.failures++
+	h.retryAt = time.Now().Add(peerReconnectBackoff(h.failures))
+}
+
+func (h *hostPool) retire(c *peerConn) {
+	h.mu.Lock()
+	if watcher, ok := c.client.(peerFailureWatcher); ok {
+		select {
+		case <-watcher.Done():
+			h.mu.Unlock()
+			h.markFailed(c)
+			return
+		default:
+		}
+	}
+	defer h.mu.Unlock()
+	for i, current := range h.conns {
+		if current != c {
+			continue
+		}
+		c.mu.Lock()
+		if c.draining || c.removed {
+			c.mu.Unlock()
+			return
+		}
+		c.draining = true
+		c.detached = true
+		c.cancelPendingLocked()
+		c.mu.Unlock()
+		h.conns = append(h.conns[:i], h.conns[i+1:]...)
+		if h.retiredConns == nil {
+			h.retiredConns = make(map[*peerConn]struct{})
+		}
+		h.retiredConns[c] = struct{}{}
+		h.retired++
+		h.notifyLocked()
+		h.scheduleDrain(c)
+		return
+	}
+}
+
+func (h *hostPool) markFailed(c *peerConn) {
+	if cleanup := h.detachFailed(c); cleanup != nil {
+		cleanup()
+	}
+}
+
+// Commit failure before external cleanup so callers cannot reuse the transport.
+func (h *hostPool) detachFailed(c *peerConn) func() {
+	h.mu.Lock()
+	c.mu.Lock()
+	intentional := c.draining || c.removed
+	c.mu.Unlock()
+	if intentional {
+		h.mu.Unlock()
+		return nil
+	}
+	found := false
+	for i, x := range h.conns {
+		if x == c {
+			h.conns = append(h.conns[:i], h.conns[i+1:]...)
+			found = true
+			break
+		}
+	}
+	if found {
+		c.detached = true
+		if h.retiredConns == nil {
+			h.retiredConns = make(map[*peerConn]struct{})
+		}
+		h.retiredConns[c] = struct{}{}
+		h.retired++
+		h.failures++
+		h.retryAt = time.Now().Add(peerReconnectBackoff(h.failures))
+		c.mu.Lock()
+		c.draining = true
+		c.cancelPendingLocked()
+		c.removed = true
+		c.mu.Unlock()
+		h.notifyLocked()
+	}
+	h.mu.Unlock()
+	if found {
+		return func() {
+			c.closeWithStreams()
+			h.remove(c)
+			h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "failure"})
+		}
+	}
+	return nil
+}
+
+func (h *hostPool) remove(target *peerConn) {
+	h.mu.Lock()
+	emit := false
+	for i, c := range h.conns {
+		if c == target {
+			h.conns = append(h.conns[:i], h.conns[i+1:]...)
+			emit = target.connectionMetrics.queue(-1)
+			break
+		}
+	}
+	if target.detached {
+		emit = target.connectionMetrics.queue(-1)
+		target.detached = false
+		delete(h.retiredConns, target)
+		if h.retired > 0 {
+			h.retired--
+		}
+	}
+	target.mu.Lock()
+	if target.drainCancel != nil {
+		close(target.drainCancel)
+		target.drainCancel = nil
+	}
+	target.drainScheduled = false
+	target.mu.Unlock()
+	replacing := h.replacing
+	h.notifyLocked()
+	h.mu.Unlock()
+	target.close()
+	if emit {
+		go target.connectionMetrics.flush(h.parent.cfg.Telemetry.PeerConnection)
+	}
+	if !replacing {
+		h.evictIfEmpty()
+	}
+}
+func (h *hostPool) scheduleDrain(c *peerConn) {
+	// A connection can be observed by several endpoint swaps (or by shutdown)
+	// while it is already draining. Keep one bounded timer per connection.
+	c.mu.Lock()
+	if c.drainScheduled || c.removed {
+		c.mu.Unlock()
+		return
+	}
+	c.drainScheduled = true
+	c.drainCancel = make(chan struct{})
+	cancel := c.drainCancel
+	idle := c.active == 0
+	if idle {
+		c.removed = true
+	}
+	c.mu.Unlock()
+	if idle {
+		// The caller may hold h.mu during endpoint replacement.
+		go func() {
+			c.close()
+			h.remove(c)
+			h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "drain", forced: false})
+		}()
+		return
+	}
+	go func() {
+		t := time.NewTimer(h.parent.cfg.DrainTimeout)
+		defer t.Stop()
+		select {
+		case <-t.C:
+		case <-cancel:
+			return
+		}
+		c.mu.Lock()
+		if c.removed {
+			c.mu.Unlock()
+			return
+		}
+		active := c.active
+		c.draining = true
+		c.cancelPendingLocked()
+		c.removed = true
+		// Pending opens reserve capacity without publishing a stream metric.
+		// Balance only published streams; late wrapper cleanup is idempotent.
+		forcedStreams := c.published
+		emit := c.queueStreamDelta(-forcedStreams)
+		c.published = 0
+		c.active = 0
+		c.mu.Unlock()
+		c.closeWithStreams()
+		h.remove(c)
+		if emit {
+			c.flushStreamDelta(h.parent.cfg.Telemetry)
+		}
+		h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "drain", forced: active > 0})
+	}()
+}
+func (h *hostPool) releaseOpen(c *peerConn) {
+	defer h.notify()
+	c.mu.Lock()
+	if c.active > 0 {
+		c.active--
+	}
+	reclaim := c.draining && c.active == 0 && !c.removed
+	if reclaim {
+		c.removed = true
+	}
+	c.mu.Unlock()
+	if reclaim {
+		c.close()
+		h.remove(c)
+		h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "drain", forced: false})
+	}
+}
+
+func (h *hostPool) close(deadline time.Time) {
+	var cleanups sync.WaitGroup
+	defer cleanups.Wait()
+	h.mu.Lock()
+	h.closed = true
+	if h.dialCancel != nil {
+		h.dialCancel()
+	}
+	dialDone := h.dialDone
+	cs := append([]*peerConn(nil), h.conns...)
+	for c := range h.retiredConns {
+		cs = append(cs, c)
+	}
+	for _, c := range cs {
+		c.mu.Lock()
+		c.cancelPendingLocked()
+		c.mu.Unlock()
+	}
+	if h.eviction != nil {
+		h.eviction.Stop()
+	}
+	h.mu.Unlock()
+	// A stream may have claimed removal but still be finishing callbacks.
+	// Shutdown must close its transport even while that cleanup is pending.
+	defer func() {
+		for _, c := range cs {
+			c.close()
+		}
+	}()
+	timer := time.NewTimer(max(time.Until(deadline), 0))
+	defer timer.Stop()
+	if dialDone != nil {
+		select {
+		case <-dialDone:
+		case <-timer.C:
+		}
+	}
+	for _, c := range cs {
+		c.mu.Lock()
+		c.draining = true
+		c.cancelPendingLocked()
+		reclaim := c.active == 0 && !c.removed
+		if reclaim {
+			c.removed = true
+		}
+		c.mu.Unlock()
+		if reclaim {
+			cleanups.Add(1)
+			go func() { defer cleanups.Done(); c.close(); h.remove(c) }()
+			h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "drain", forced: false})
+		}
+	}
+	// Subscribe before checking activity so the last stream cannot finish
+	// between that check and waiting for notification.
+draining:
+	for time.Now().Before(deadline) {
+		h.mu.Lock()
+		changed := h.changedLocked()
+		active := false
+		for _, c := range cs {
+			c.mu.Lock()
+			if c.active > 0 && !c.removed {
+				active = true
+			}
+			c.mu.Unlock()
+		}
+		h.mu.Unlock()
+		if !active {
+			return
+		}
+		select {
+		case <-changed:
+		case <-timer.C:
+			break draining
+		}
+	}
+	// Deadline exceeded: force-close and reclaim every remaining transport.
+	for _, c := range cs {
+		c.mu.Lock()
+		if c.removed {
+			c.mu.Unlock()
+			continue
+		}
+		c.draining = true
+		c.cancelPendingLocked()
+		forcedStreams := c.published
+		emit := c.queueStreamDelta(-forcedStreams)
+		c.published = 0
+		c.active = 0
+		c.removed = true
+		c.mu.Unlock()
+		cleanups.Add(1)
+		go func() { defer cleanups.Done(); c.closeWithStreams(); h.remove(c) }()
+		if emit {
+			c.flushStreamDelta(h.parent.cfg.Telemetry)
+		}
+		h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "drain", forced: true})
+	}
+}
+
+type countedPeerStream struct {
+	PeerStream
+	host     *hostPool
+	conn     *peerConn
+	tele     PeerPoolTelemetry
+	once     sync.Once
+	closeErr error
+	cancel   context.CancelFunc
+}
+
+func (s *countedPeerStream) Read(p []byte) (int, error) {
+	n, e := s.PeerStream.Read(p)
+	if e != nil {
+		if e != io.EOF && !peerRPCError(e) {
+			if cleanup := s.host.detachFailed(s.conn); cleanup != nil {
+				go cleanup()
+			}
+			go s.Close()
+			return n, e
+		}
+		_ = s.Close()
+	}
+	return n, e
+}
+func (s *countedPeerStream) Write(p []byte) (int, error) {
+	n, e := s.PeerStream.Write(p)
+	if e != nil {
+		if e != io.EOF && !peerRPCError(e) {
+			if cleanup := s.host.detachFailed(s.conn); cleanup != nil {
+				go cleanup()
+			}
+			go s.Close()
+			return n, e
+		}
+		_ = s.Close()
+	}
+	return n, e
+}
+
+func (s *countedPeerStream) Close() error {
+	if s.cancel != nil {
+		s.cancel()
+	}
+	s.once.Do(func() {
+		s.closeErr = s.PeerStream.Close()
+		s.conn.mu.Lock()
+		delete(s.conn.streams, s)
+		if s.conn.active > 0 {
+			s.conn.active--
+		}
+		decremented := s.conn.published > 0
+		emit := false
+		if decremented {
+			s.conn.published--
+			emit = s.conn.queueStreamDelta(-1)
+		}
+		reclaim := s.conn.draining && s.conn.active == 0 && !s.conn.removed
+		if reclaim {
+			s.conn.removed = true
+		}
+		s.conn.mu.Unlock()
+		s.host.notify()
+		if emit {
+			s.conn.flushStreamDelta(s.tele)
+		}
+		if reclaim {
+			s.conn.close()
+			s.host.remove(s.conn)
+			s.host.observations.record(s.tele, peerObservation{kind: "drain"})
+		}
+	})
+	return s.closeErr
+}
+
+func peerCallerCanceled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || status.Code(err) == codes.Canceled || status.Code(err) == codes.DeadlineExceeded
+}
+
+// A gRPC status belongs to one RPC. The connection watcher is authoritative
+// for transport failures; application statuses must not retire sibling RPCs.
+func peerRPCError(err error) bool {
+	if peerCallerCanceled(err) {
+		return true
+	}
+	_, ok := status.FromError(err)
+	return ok
+}
