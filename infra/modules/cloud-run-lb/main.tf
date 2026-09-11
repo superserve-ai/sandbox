@@ -93,6 +93,7 @@ resource "google_compute_target_https_proxy" "this" {
   name             = var.https_proxy_name
   url_map          = google_compute_url_map.https.id
   ssl_certificates = local.certificate_self_links
+  ssl_policy       = var.ssl_policy
 }
 
 resource "google_compute_target_http_proxy" "redirect" {

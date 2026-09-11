@@ -259,6 +259,8 @@ module "api" {
 module "api_cert_lb" {
   source = "../../../modules/cloud-run-cert-lb"
 
+  ssl_policy = google_compute_ssl_policy.https.id
+
   project_id        = local.project_id
   region            = local.region
   cloud_run_service = module.api.service_name
