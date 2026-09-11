@@ -106,3 +106,9 @@ variable "reservation_name" {
   type        = string
   default     = null
 }
+
+variable "bootstrap_external_ip" {
+  description = "Attach an ephemeral external IP at creation so the first-boot script can reach package mirrors and object storage. The subnet has no NAT. Ignored after creation; remove the address by hand once the host is prepared."
+  type        = bool
+  default     = false
+}
