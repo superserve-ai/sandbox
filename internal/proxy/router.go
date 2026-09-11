@@ -164,8 +164,13 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 				return
 			}
 			// Hijack may have already buffered bytes after the HTTP request.
-			_, _ = io.Copy(stream, buffered.Reader)
-			_ = stream.CloseSend()
+			if _, err := io.Copy(stream, buffered.Reader); err != nil {
+				closeBoth(err)
+				return
+			}
+			if err := stream.CloseSend(); err != nil {
+				closeBoth(err)
+			}
 		} else {
 			// Hijacking disables net/http's disconnect watcher. Once the body
 			// is consumed, drain without forwarding pipelined requests so EOF

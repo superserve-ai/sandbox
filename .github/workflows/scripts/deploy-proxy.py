@@ -170,6 +170,7 @@ def main() -> int:
 
     def deploy(inst):
         name, zone = inst["name"], inst["zone"]
+        host_region = zone.rsplit("/", 1)[-1].rsplit("-", 1)[0]
         tag = f"{name}/{zone}"
 
         for src, dst in [
@@ -395,7 +396,8 @@ def main() -> int:
             PEER_PROXY_SPIFFE_URI=$peer_identity
             PEER_PROXY_MAX_STREAMS={peer_max_streams}
             PEER_ROUTING_ENABLED={peer_routing}
-            HOST_ID=${{host_id:-{name}}}{otel_env_lines}
+            HOST_ID=${{host_id:-{name}}}
+            HOST_REGION={host_region}{otel_env_lines}
             PROXYENV
             if [ -z "$peer_identity" ]; then
                 sudo sed -i '/^PEER_PROXY_/d' /etc/sandbox/proxy.env
