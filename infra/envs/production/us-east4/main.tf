@@ -413,6 +413,8 @@ resource "google_compute_attached_disk" "sandbox_data" {
 locals {
   host_a_artifact_bucket = module.backup_storage.bucket_name
   host_a_kernel_object   = "vmlinux-4.14-fuse"
+  # The release the fleet runs; the fleet deploy refuses a host on any other.
+  host_a_firecracker_version = "v1.15.3"
 
   # Non-secret vmd.env keys the bootstrap writes once. The deploy upserts
   # its own keys on top; secrets are appended by an operator.
@@ -471,12 +473,13 @@ module "sandbox_host" {
     enable-oslogin  = "TRUE"
     startup-script = join("\n\n", [
       templatefile("${path.module}/../../../../deploy/host-bootstrap/sandbox-host-bootstrap.sh.tftpl", {
-        localssd_script  = file("${path.module}/../../../../deploy/host-bootstrap/sandbox-localssd.sh")
-        artifact_bucket  = local.host_a_artifact_bucket
-        kernel_object    = local.host_a_kernel_object
-        rootfs_object    = "base.ext4"
-        data_disk_device = "superserve-sandbox-data"
-        vmd_env          = local.host_a_vmd_env
+        localssd_script     = file("${path.module}/../../../../deploy/host-bootstrap/sandbox-localssd.sh")
+        artifact_bucket     = local.host_a_artifact_bucket
+        kernel_object       = local.host_a_kernel_object
+        rootfs_object       = "base.ext4"
+        data_disk_device    = "superserve-sandbox-data"
+        vmd_env             = local.host_a_vmd_env
+        firecracker_version = local.host_a_firecracker_version
       }),
       templatefile("${path.module}/../../../../deploy/unbound/unbound-bootstrap.sh.tftpl", {
         guest_cidr         = "10.11.0.0/16"
