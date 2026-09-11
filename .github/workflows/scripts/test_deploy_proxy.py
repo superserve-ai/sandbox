@@ -85,6 +85,10 @@ class DeployProxyTests(unittest.TestCase):
                 self.assertIn('PEER_PROXY_LISTEN_ADDR=', script)
                 self.assertIn(':5009', script)
 
+    def test_database_required_only_for_routing(self):
+        self.generate_script("auto", database_url="", routing="0")
+        self.generate_script("auto", database_url="", routing="1", expected_result=1)
+
     def test_routing_requires_explicit_activation(self):
         self.assertIn("PEER_ROUTING_ENABLED=0\n", self.generate_script("auto"))
         self.assertIn("PEER_ROUTING_ENABLED=1\n", self.generate_script("auto", routing="1"))

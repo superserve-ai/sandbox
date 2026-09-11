@@ -65,26 +65,19 @@ func main() {
 
 	resolver := proxy.NewVMDResolver(vmdAddr)
 	proxyHandler := proxy.NewHandler(domains, resolver, log)
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		log.Fatal().Msg("DATABASE_URL is required for cross-host routing")
+	routingEnabled := os.Getenv("PEER_ROUTING_ENABLED")
+	if routingEnabled != "" && routingEnabled != "0" && routingEnabled != "1" {
+		log.Fatal().Msg("PEER_ROUTING_ENABLED must be empty, 0, or 1")
 	}
-	dbPool, err := pgxpool.New(ctx, dbURL)
+	dbPool, err := newOwnershipPool(ctx, routingEnabled == "1", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal().Err(err).Msg("init ownership database")
 	}
-	defer dbPool.Close()
-	// Cross-host routing must not start in a silently local-only or
-	// unavailable state. Validate the shared persistence connection before
-	// bringing up either listener; later lookups still use their request
-	// contexts for cancellation and bounded work.
-	bootstrapCtx, bootstrapCancel := context.WithTimeout(ctx, 5*time.Second)
-	err = dbPool.Ping(bootstrapCtx)
-	bootstrapCancel()
-	if err != nil {
-		log.Fatal().Err(err).Msg("ownership database unavailable")
+	var ownership proxy.OwnershipResolver
+	if dbPool != nil {
+		defer dbPool.Close()
+		ownership = proxy.NewDBOwnershipResolver(dbPool)
 	}
-	ownership := proxy.NewDBOwnershipResolver(dbPool)
 	var routingRecorder telemetry.RoutingOutcomeRecorder
 	var peerTelemetry proxy.RecorderPeerTelemetry
 	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
@@ -177,10 +170,6 @@ func main() {
 	}
 	defer peers.Close()
 	router := proxy.NewRoutingHandler(domains, os.Getenv("HOST_ID"), ownership, peers, proxyHandler, log, routingRecorder)
-	routingEnabled := os.Getenv("PEER_ROUTING_ENABLED")
-	if routingEnabled != "" && routingEnabled != "0" && routingEnabled != "1" {
-		log.Fatal().Msg("PEER_ROUTING_ENABLED must be empty, 0, or 1")
-	}
 	log.Info().Bool("enabled", routingEnabled == "1").Msg("peer ownership routing configured")
 	mux, localMux := newDataPlaneMuxes(proxyHandler, router, routingEnabled == "1")
 	var localSrv *http.Server
@@ -332,6 +321,27 @@ type proxyHealthResponse struct {
 	Capabilities  []string `json:"capabilities"`
 	FilesEnabled  bool     `json:"files_enabled"`
 	ResolverReady bool     `json:"resolver_ready"`
+}
+
+func newOwnershipPool(ctx context.Context, enabled bool, databaseURL string) (*pgxpool.Pool, error) {
+	if !enabled {
+		return nil, nil
+	}
+	if databaseURL == "" {
+		return nil, fmt.Errorf("DATABASE_URL is required for cross-host routing")
+	}
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	// Validate persistence before accepting routed traffic.
+	bootstrapCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := pool.Ping(bootstrapCtx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return pool, nil
 }
 
 func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {

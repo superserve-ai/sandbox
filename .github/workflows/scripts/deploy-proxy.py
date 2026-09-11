@@ -17,7 +17,7 @@ Env vars:
   PROXY_DOMAINS              optional — comma-separated host suffixes; overrides
                              PROXY_DOMAIN on the proxy when set (DNS transitions)
   SANDBOX_ACCESS_TOKEN_SEED  optional — hex, >=32 bytes (>=64 hex chars)
-  DATABASE_URL               required — shared Postgres connection for ownership routing
+  DATABASE_URL               required when routing is enabled — shared Postgres connection
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
   PEER_PROXY_TARGET_ADDR     optional — loopback address for peer ingress
@@ -69,8 +69,12 @@ def main() -> int:
     if access_seed and not re.fullmatch(r"[0-9a-fA-F]{64,}", access_seed):
         print("ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)", file=sys.stderr)
         return 1
+    peer_routing = os.environ.get("PEER_ROUTING_ENABLED", "") or "0"
+    if peer_routing not in ("0", "1"):
+        print("ERROR: PEER_ROUTING_ENABLED must be 0 or 1", file=sys.stderr)
+        return 1
     database_url = os.environ.get("DATABASE_URL", "")
-    if not database_url:
+    if peer_routing == "1" and not database_url:
         print("ERROR: DATABASE_URL is required for cross-host routing", file=sys.stderr)
         return 1
     database_env_line = 'DATABASE_URL="' + database_url.replace('\\', '\\\\').replace('"', '\\"') + '"'
@@ -81,10 +85,6 @@ def main() -> int:
     require_data_plane = os.environ.get("REQUIRE_DATA_PLANE", "")
     if require_data_plane not in ("", "0", "1"):
         print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
-        return 1
-    peer_routing = os.environ.get("PEER_ROUTING_ENABLED", "") or "0"
-    if peer_routing not in ("0", "1"):
-        print("ERROR: PEER_ROUTING_ENABLED must be 0 or 1", file=sys.stderr)
         return 1
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     peer_identity_hosts = set(filter(None, (host.strip() for host in
