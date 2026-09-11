@@ -1017,11 +1017,12 @@ draining:
 
 type countedPeerStream struct {
 	PeerStream
-	host   *hostPool
-	conn   *peerConn
-	tele   PeerPoolTelemetry
-	once   sync.Once
-	cancel context.CancelFunc
+	host     *hostPool
+	conn     *peerConn
+	tele     PeerPoolTelemetry
+	once     sync.Once
+	closeErr error
+	cancel   context.CancelFunc
 }
 
 func (s *countedPeerStream) Read(p []byte) (int, error) {
@@ -1057,8 +1058,8 @@ func (s *countedPeerStream) Close() error {
 	if s.cancel != nil {
 		s.cancel()
 	}
-	e := s.PeerStream.Close()
 	s.once.Do(func() {
+		s.closeErr = s.PeerStream.Close()
 		s.conn.mu.Lock()
 		delete(s.conn.streams, s)
 		if s.conn.active > 0 {
@@ -1085,7 +1086,7 @@ func (s *countedPeerStream) Close() error {
 			s.host.observations.record(s.tele, peerObservation{kind: "drain"})
 		}
 	})
-	return e
+	return s.closeErr
 }
 
 func peerCallerCanceled(err error) bool {

@@ -2141,3 +2141,48 @@ func TestPeerPoolSaturatedBurstMakesProgress(t *testing.T) {
 		t.Fatalf("dials=%d", got)
 	}
 }
+
+type singleClosePeerStream struct {
+	failingIOPeer
+	calls            atomic.Int32
+	started, release chan struct{}
+	err              error
+}
+
+func (s *singleClosePeerStream) Close() error {
+	if s.calls.Add(1) == 1 {
+		close(s.started)
+	}
+	<-s.release
+	return s.err
+}
+func TestPeerPoolFailedStreamClosesPhysicallyOnce(t *testing.T) {
+	raw := &singleClosePeerStream{started: make(chan struct{}), release: make(chan struct{}), err: errors.New("close result")}
+	var once sync.Once
+	defer once.Do(func() { close(raw.release) })
+	p := NewPeerTransport(PeerPoolConfig{Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		return fixedPeerClient{raw}, &countingCloser{}, nil
+	}})
+	s, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Write([]byte("x")); err == nil {
+		t.Fatal("missing transport error")
+	}
+	<-raw.started
+	results := make(chan error, 16)
+	for i := 0; i < 16; i++ {
+		go func() { results <- s.Close() }()
+	}
+	once.Do(func() { close(raw.release) })
+	for i := 0; i < 16; i++ {
+		if err := <-results; err != raw.err {
+			t.Fatalf("close error=%v", err)
+		}
+	}
+	_ = p.Close()
+	if raw.calls.Load() != 1 {
+		t.Fatalf("physical closes=%d", raw.calls.Load())
+	}
+}
