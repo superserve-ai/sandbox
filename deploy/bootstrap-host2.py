@@ -22,8 +22,9 @@ def bootstrap(config, verify_only=False):
         raise ValueError('Host 2 immutable identity or private IP changed; regenerate Terraform output')
     if instance['serviceAccounts'][0]['email'] != config['runtime_email']:
         raise ValueError('apply the dedicated runtime identity first')
-    if not verify_only and instance.get('labels', {}).get('sandbox_status') == 'ready':
-        raise ValueError('Host 2 must be removed from ready deployment discovery before migration')
+    labels = instance.get('labels', {})
+    if not verify_only and (labels.get('sandbox_status') == 'ready' or labels.get('component') == 'vmd'):
+        raise ValueError('Host 2 must be excluded from sandbox_status=ready and component=vmd deployment discovery before migration')
     if not verify_only and instance.get('status') == 'TERMINATED':
         run('compute', 'instances', 'start', name, *flags)
     def ssh(script):

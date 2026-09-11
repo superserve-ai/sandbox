@@ -200,6 +200,30 @@ class ManagedIdentityTest(unittest.TestCase):
                 self.assertNotEqual(subprocess.run(['bash', '-c', verify]).returncode, 0)
                 credential.write_text('credential')
 
+    def test_deployment_discovery_labels_block_migration_before_mutation(self):
+        for name, host_id in [('superserve-vmd-staging-2', 'superserve-vmd-staging-2'),
+                              ('superserve-vmd-usw2-2', 'usw2-2')]:
+            config = {'instance_name': name, 'host_id': host_id,
+                      'project_id': 'example-project', 'zone': 'us-west2-a',
+                      'instance_id': '1234567890', 'internal_ip': '192.0.2.3',
+                      'runtime_email': 'vmd@example-project.iam.gserviceaccount.com'}
+            for labels in ({'component': 'vmd'},
+                           {'component': 'vmd', 'sandbox_status': 'provisioning'},
+                           {'sandbox_status': 'ready'},
+                           {'component': 'vmd-usw2-standby', 'sandbox_status': 'ready'},
+                           {'component': 'vmd', 'sandbox_status': 'ready'}):
+                with self.subTest(name=name, labels=labels):
+                    instance = {'id': config['instance_id'], 'status': 'TERMINATED',
+                                'labels': labels,
+                                'networkInterfaces': [{'networkIP': config['internal_ip']}],
+                                'serviceAccounts': [{'email': config['runtime_email']}]}
+                    with patch.object(BOOTSTRAP.subprocess, 'run', return_value=
+                                      subprocess.CompletedProcess([], 0, json.dumps(instance), '')) as run:
+                        with self.assertRaisesRegex(ValueError, 'deployment discovery'):
+                            BOOTSTRAP.bootstrap(config)
+                        run.assert_called_once()
+                        self.assertEqual(run.call_args.args[0][1:4], ['compute', 'instances', 'describe'])
+
     def test_serving_host_cannot_enter_bootstrap(self):
         with patch.object(BOOTSTRAP.subprocess, 'run') as run:
             with self.assertRaises(ValueError):

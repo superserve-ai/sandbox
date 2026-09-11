@@ -25,8 +25,12 @@ SPIFFE URI or enable peer ingress/routing. Once enabled, retain it so missing
 bootstrap fails closed on subsequent deployments.
 
 1. Confirm the target owns no sandbox state and remains provisioning in the
-   host directory. Remove its ready label and exclude it from concurrent CD
-   and placement for the maintenance window. Keep peer routing disabled.
+   host directory. Remove `sandbox_status=ready` and remove or change
+   `component=vmd` on Host 2: routine VMD and proxy workflows use the latter
+   selector even when the ready label is absent. Wait for any deployments
+   that already discovered Host 2 to finish before migration. Keep both
+   selectors excluded and placement disabled for the maintenance window;
+   keep peer routing disabled.
 2. Review sanitized plans for the applicable root. Expect only Host 2's
    service account/stop opt-in, its dedicated runtime IAM, the new cell CA
    and managed identity adapter, and us-west2's shared peer firewall rule.
@@ -37,6 +41,8 @@ bootstrap fails closed on subsequent deployments.
    In the applicable root, run `terraform plan -out=host2-migration.tfplan`
    and review that saved plan with `terraform show host2-migration.tfplan`.
    For production, first require the completed staging rehearsal evidence.
+   Ensure the reviewed plan preserves Host 2's discovery exclusion: its
+   Terraform labels must not restore `component=vmd` during maintenance.
 3. Apply the reviewed plan with a current Google Cloud SDK (tested command
    schema: 578.0.0), Python 3.10+, and authenticated Terraform credentials.
    The identity adapter invokes `gcloud` using **its active credential**, so
@@ -114,8 +120,8 @@ ingress, verify the advertised private peer endpoint is `10.0.0.3:5009` or
 
 ### Required pre-admission evidence
 
-Complete every check below while Host 2 is provisioning, its ready label is
-absent, and routing is disabled. A successful `--verify` is not admission
+Complete every check below while Host 2 is provisioning, both deployment
+selectors exclude it, and routing is disabled. A successful `--verify` is not admission
 approval. Any failed or missing check blocks admission and production rollout.
 Save timestamped output with the release SHA, Terraform bootstrap artifact and
 VMD invocation ID in the private rollout evidence; never attach credentials,
@@ -153,8 +159,9 @@ full environment files, or customer data to the public repository.
 2. **Admission gates.** Capture the target's Compute labels with
    `gcloud compute instances describe INSTANCE --project=PROJECT --zone=ZONE --format='json(id,labels)'`,
    using the exact values from the bootstrap artifact. Require
-   `sandbox_status` to be absent or different from `ready`, confirm the ready
-   selectors in `deploy/environments.yaml` exclude this host, and retain the
+   `sandbox_status` to be absent or different from `ready` and `component`
+   to be absent or different from `vmd`. Confirm routine VMD/proxy discovery
+   and the ready selectors in `deploy/environments.yaml` exclude this host, and retain the
    provisioning row from check 1. Check the deployed routing configuration
    still has peer routing disabled. Do not change status or labels as part of
    verification; both database activation and CD enrollment require the
