@@ -204,52 +204,58 @@ func peerReconnectBackoff(failures int) time.Duration {
 }
 
 type peerConn struct {
-	mu             sync.Mutex
-	client         PeerClient
-	closer         io.Closer
-	closeOnce      sync.Once
-	active         int // Includes reserved capacity for pending opens.
-	published      int // Streams committed to telemetry accounting.
-	draining       bool
-	removed        bool
-	drainScheduled bool
-	drainCancel    chan struct{}
-	detached       bool
-	max            int
-	streams        map[*countedPeerStream]struct{}
-	pending        map[*pendingPeerOpen]struct{}
-	metricMu       sync.Mutex
-	metricDelta    int
-	metricEmitting bool
+	mu                sync.Mutex
+	client            PeerClient
+	closer            io.Closer
+	closeOnce         sync.Once
+	active            int // Includes reserved capacity for pending opens.
+	published         int // Streams committed to telemetry accounting.
+	draining          bool
+	removed           bool
+	drainScheduled    bool
+	drainCancel       chan struct{}
+	detached          bool
+	max               int
+	streams           map[*countedPeerStream]struct{}
+	pending           map[*pendingPeerOpen]struct{}
+	streamMetrics     peerMetricDelta
+	connectionMetrics peerMetricDelta
 }
 
-// Queue under the connection lock to preserve publication/cleanup ordering.
-// The callback runs without pool locks; concurrent cleanup only queues a delta.
-func (c *peerConn) queueStreamDelta(delta int) bool {
-	c.metricMu.Lock()
-	defer c.metricMu.Unlock()
-	c.metricDelta += delta
-	if c.metricEmitting || c.metricDelta == 0 {
+// Queue under the state lock; callbacks run outside it. Concurrent cleanup
+// can queue a decrement without waiting for an earlier callback to finish.
+type peerMetricDelta struct {
+	mu       sync.Mutex
+	delta    int
+	emitting bool
+}
+
+func (m *peerMetricDelta) queue(delta int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.delta += delta
+	if m.emitting || m.delta == 0 {
 		return false
 	}
-	c.metricEmitting = true
+	m.emitting = true
 	return true
 }
-
-func (c *peerConn) flushStreamDelta(tele PeerPoolTelemetry) {
+func (m *peerMetricDelta) flush(emit func(int)) {
 	for {
-		c.metricMu.Lock()
-		delta := c.metricDelta
-		c.metricDelta = 0
+		m.mu.Lock()
+		delta := m.delta
+		m.delta = 0
 		if delta == 0 {
-			c.metricEmitting = false
-			c.metricMu.Unlock()
+			m.emitting = false
+			m.mu.Unlock()
 			return
 		}
-		c.metricMu.Unlock()
-		tele.PeerStream(delta)
+		m.mu.Unlock()
+		emit(delta)
 	}
 }
+func (c *peerConn) queueStreamDelta(delta int) bool         { return c.streamMetrics.queue(delta) }
+func (c *peerConn) flushStreamDelta(tele PeerPoolTelemetry) { c.streamMetrics.flush(tele.PeerStream) }
 
 type pendingPeerOpen struct{ cancel context.CancelFunc }
 
@@ -475,7 +481,6 @@ retry:
 		if e != nil || h.closed || generation != h.endpointGeneration || addr != h.addr {
 			result = telemetry.ResultError
 		}
-		h.parent.cfg.Telemetry.PeerHandshake(duration, result)
 		// Shutdown may have started while the dial was out of lock.  A
 		// failed dial must not enter the reconnect/backoff path after the
 		// host has been closed, and a successful one must never be published.
@@ -484,6 +489,7 @@ retry:
 			close(dialDone)
 			h.dialDone = nil
 			h.mu.Unlock()
+			h.parent.cfg.Telemetry.PeerHandshake(duration, result)
 			return nil, errors.New("peer host closed")
 		}
 		// The endpoint may have been replaced while dialing was out of lock.
@@ -496,8 +502,10 @@ retry:
 			close(dialDone)
 			h.dialDone = nil
 			h.mu.Unlock()
+			h.parent.cfg.Telemetry.PeerHandshake(duration, result)
 			continue
 		}
+		var published *peerConn
 		if e == nil {
 			c := &peerConn{client: client, closer: closer, max: h.parent.cfg.StreamsPerConnection}
 			h.conns = append(h.conns, c)
@@ -518,8 +526,8 @@ retry:
 			}
 			h.failures = 0
 			h.retryAt = time.Time{}
-			h.parent.cfg.Telemetry.PeerConnection(1)
-			h.parent.cfg.Telemetry.PeerReconnect(telemetry.ResultSuccess)
+			c.connectionMetrics.queue(1)
+			published = c
 		} else {
 			// Caller cancellation is not a transport failure and must not
 			// poison reconnect backoff for later callers.
@@ -532,6 +540,11 @@ retry:
 		close(dialDone)
 		h.dialDone = nil
 		h.mu.Unlock()
+		h.parent.cfg.Telemetry.PeerHandshake(duration, result)
+		if published != nil {
+			published.connectionMetrics.flush(h.parent.cfg.Telemetry.PeerConnection)
+			h.parent.cfg.Telemetry.PeerReconnect(telemetry.ResultSuccess)
+		}
 		if e != nil {
 			if !peerCallerCanceled(e) {
 				h.parent.cfg.Telemetry.PeerReconnect(telemetry.ResultError)
@@ -621,6 +634,15 @@ func (h *hostPool) setBackoffLocked() {
 
 func (h *hostPool) retire(c *peerConn) {
 	h.mu.Lock()
+	if watcher, ok := c.client.(peerFailureWatcher); ok {
+		select {
+		case <-watcher.Done():
+			h.mu.Unlock()
+			h.markFailed(c)
+			return
+		default:
+		}
+	}
 	defer h.mu.Unlock()
 	for i, current := range h.conns {
 		if current != c {
@@ -665,7 +687,12 @@ func (h *hostPool) markFailed(c *peerConn) {
 		}
 	}
 	if found {
-		h.parent.cfg.Telemetry.PeerConnection(-1)
+		c.detached = true
+		if h.retiredConns == nil {
+			h.retiredConns = make(map[*peerConn]struct{})
+		}
+		h.retiredConns[c] = struct{}{}
+		h.retired++
 		h.failures++
 		h.retryAt = time.Now().Add(peerReconnectBackoff(h.failures))
 		c.mu.Lock()
@@ -691,22 +718,23 @@ func (h *hostPool) markFailed(c *peerConn) {
 		for _, s := range streams {
 			_ = s.Close()
 		}
+		h.remove(c)
 		h.parent.cfg.Telemetry.PeerFailure()
-		h.evictIfEmpty()
 	}
 }
 
 func (h *hostPool) remove(target *peerConn) {
 	h.mu.Lock()
+	emit := false
 	for i, c := range h.conns {
 		if c == target {
 			h.conns = append(h.conns[:i], h.conns[i+1:]...)
-			h.parent.cfg.Telemetry.PeerConnection(-1)
+			emit = target.connectionMetrics.queue(-1)
 			break
 		}
 	}
 	if target.detached {
-		h.parent.cfg.Telemetry.PeerConnection(-1)
+		emit = target.connectionMetrics.queue(-1)
 		target.detached = false
 		delete(h.retiredConns, target)
 		if h.retired > 0 {
@@ -724,6 +752,9 @@ func (h *hostPool) remove(target *peerConn) {
 	h.notifyLocked()
 	h.mu.Unlock()
 	target.close()
+	if emit {
+		target.connectionMetrics.flush(h.parent.cfg.Telemetry.PeerConnection)
+	}
 	if !replacing {
 		h.evictIfEmpty()
 	}
