@@ -32,5 +32,26 @@ class InlineCertificateIssuanceConfigTest(unittest.TestCase):
         )
 
 
+class AttestationPolicyTest(unittest.TestCase):
+    def test_uses_compute_uid_resource_name_for_numeric_instance_id(self):
+        config = {
+            "project_number": "669325949364",
+            "zone": "us-central1-a",
+            "instance_id": "3236376195495648947",
+        }
+
+        self.assertEqual(
+            MODULE.attestation_policy(config),
+            {
+                "attestationRules": [{
+                    "googleCloudResource": (
+                        "//compute.googleapis.com/projects/669325949364"
+                        "/uid/zones/us-central1-a/instances/3236376195495648947"
+                    )
+                }]
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
