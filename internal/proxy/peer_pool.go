@@ -182,7 +182,7 @@ type hostPool struct {
 	eviction           *time.Timer
 	evictionGeneration uint64
 	retiredConns       map[*peerConn]struct{}
-	dialMetrics        peerDialMetrics
+	observations       peerObservations
 }
 
 const (
@@ -261,20 +261,22 @@ func (c *peerConn) flushStreamDelta(tele PeerPoolTelemetry) {
 	go c.streamMetrics.flush(tele.PeerStream)
 }
 
-// Dial observations are best effort: a stalled backend retains at most 64
+// Observations are best effort: a stalled backend retains at most 64
 // pending observations per host and one emitter, without delaying callers.
-type peerDialMetric struct {
+type peerObservation struct {
+	kind      string
+	forced    bool
 	duration  time.Duration
 	result    string
 	reconnect bool
 }
-type peerDialMetrics struct {
+type peerObservations struct {
 	mu       sync.Mutex
-	pending  []peerDialMetric
+	pending  []peerObservation
 	emitting bool
 }
 
-func (m *peerDialMetrics) record(tele PeerPoolTelemetry, event peerDialMetric) {
+func (m *peerObservations) record(tele PeerPoolTelemetry, event peerObservation) {
 	m.mu.Lock()
 	if len(m.pending) < 64 {
 		m.pending = append(m.pending, event)
@@ -286,7 +288,7 @@ func (m *peerDialMetrics) record(tele PeerPoolTelemetry, event peerDialMetric) {
 		go m.flush(tele)
 	}
 }
-func (m *peerDialMetrics) flush(tele PeerPoolTelemetry) {
+func (m *peerObservations) flush(tele PeerPoolTelemetry) {
 	for {
 		m.mu.Lock()
 		if len(m.pending) == 0 {
@@ -297,9 +299,16 @@ func (m *peerDialMetrics) flush(tele PeerPoolTelemetry) {
 		event := m.pending[0]
 		m.pending = m.pending[1:]
 		m.mu.Unlock()
-		tele.PeerHandshake(event.duration, event.result)
-		if event.reconnect {
-			tele.PeerReconnect(event.result)
+		switch event.kind {
+		case "drain":
+			tele.PeerDrain(event.forced)
+		case "failure":
+			tele.PeerFailure()
+		default:
+			tele.PeerHandshake(event.duration, event.result)
+			if event.reconnect {
+				tele.PeerReconnect(event.result)
+			}
 		}
 	}
 }
@@ -455,13 +464,9 @@ retry:
 				if peerRPCError(e) {
 					return nil, e
 				}
-				// Opening a stream can fail before the connection is removed
-				// from the pool. Close the transport at this failure boundary so
-				// a failed open cannot retain its underlying socket or TLS state.
-				c.close()
-				// markFailed acquires the host lock and records bounded reconnect
-				// backoff for subsequent callers.
-				h.markFailed(c)
+				if cleanup := h.detachFailed(c); cleanup != nil {
+					go cleanup()
+				}
 				h.mu.Lock()
 				break
 			} else {
@@ -538,7 +543,7 @@ retry:
 		// host has been closed, and a successful one must never be published.
 		if h.closed {
 			h.mu.Unlock()
-			h.dialMetrics.record(h.parent.cfg.Telemetry, peerDialMetric{duration: duration, result: result})
+			h.observations.record(h.parent.cfg.Telemetry, peerObservation{duration: duration, result: result})
 			closeDialResult(client, closer)
 			h.mu.Lock()
 			close(dialDone)
@@ -555,7 +560,7 @@ retry:
 			close(dialDone)
 			h.dialDone = nil
 			h.mu.Unlock()
-			h.dialMetrics.record(h.parent.cfg.Telemetry, peerDialMetric{duration: duration, result: result})
+			h.observations.record(h.parent.cfg.Telemetry, peerObservation{duration: duration, result: result})
 			closeDialResult(client, closer)
 			continue
 		}
@@ -600,7 +605,7 @@ retry:
 		close(dialDone)
 		h.dialDone = nil
 		h.mu.Unlock()
-		h.dialMetrics.record(h.parent.cfg.Telemetry, peerDialMetric{duration: duration, result: result, reconnect: e == nil || !peerCallerCanceled(e)})
+		h.observations.record(h.parent.cfg.Telemetry, peerObservation{duration: duration, result: result, reconnect: e == nil || !peerCallerCanceled(e)})
 		if published != nil {
 			go published.connectionMetrics.flush(h.parent.cfg.Telemetry.PeerConnection)
 		}
@@ -726,13 +731,20 @@ func (h *hostPool) retire(c *peerConn) {
 }
 
 func (h *hostPool) markFailed(c *peerConn) {
+	if cleanup := h.detachFailed(c); cleanup != nil {
+		cleanup()
+	}
+}
+
+// Commit failure before external cleanup so callers cannot reuse the transport.
+func (h *hostPool) detachFailed(c *peerConn) func() {
 	h.mu.Lock()
 	c.mu.Lock()
 	intentional := c.draining || c.removed
 	c.mu.Unlock()
 	if intentional {
 		h.mu.Unlock()
-		return
+		return nil
 	}
 	found := false
 	for i, x := range h.conns {
@@ -760,23 +772,26 @@ func (h *hostPool) markFailed(c *peerConn) {
 	}
 	h.mu.Unlock()
 	if found {
-		c.mu.Lock()
-		streams := make([]*countedPeerStream, 0, len(c.streams))
-		for s := range c.streams {
-			streams = append(streams, s)
+		return func() {
+			c.mu.Lock()
+			streams := make([]*countedPeerStream, 0, len(c.streams))
+			for s := range c.streams {
+				streams = append(streams, s)
+			}
+			c.mu.Unlock()
+			// Close outside the connection lock and exactly once. This is also
+			// safe when read/write failures race with stream-open or drain cleanup.
+			c.close()
+			// Force attached streams to observe the transport failure immediately.
+			// Wrapper cleanup also releases their capacity and telemetry.
+			for _, s := range streams {
+				_ = s.Close()
+			}
+			h.remove(c)
+			h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "failure"})
 		}
-		c.mu.Unlock()
-		// Close outside the connection lock and exactly once. This is also
-		// safe when read/write failures race with stream-open or drain cleanup.
-		c.close()
-		// Force attached streams to observe the transport failure immediately.
-		// Wrapper cleanup also releases their capacity and telemetry.
-		for _, s := range streams {
-			_ = s.Close()
-		}
-		h.remove(c)
-		h.parent.cfg.Telemetry.PeerFailure()
 	}
+	return nil
 }
 
 func (h *hostPool) remove(target *peerConn) {
@@ -836,7 +851,7 @@ func (h *hostPool) scheduleDrain(c *peerConn) {
 		go func() {
 			c.close()
 			h.remove(c)
-			h.parent.cfg.Telemetry.PeerDrain(false)
+			h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "drain", forced: false})
 		}()
 		return
 	}
@@ -871,7 +886,7 @@ func (h *hostPool) scheduleDrain(c *peerConn) {
 		if emit {
 			c.flushStreamDelta(h.parent.cfg.Telemetry)
 		}
-		h.parent.cfg.Telemetry.PeerDrain(active > 0)
+		h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "drain", forced: active > 0})
 	}()
 }
 func (h *hostPool) releaseOpen(c *peerConn) {
@@ -888,7 +903,7 @@ func (h *hostPool) releaseOpen(c *peerConn) {
 	if reclaim {
 		c.close()
 		h.remove(c)
-		h.parent.cfg.Telemetry.PeerDrain(false)
+		h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "drain", forced: false})
 	}
 }
 
@@ -939,7 +954,7 @@ func (h *hostPool) close(deadline time.Time) {
 		if reclaim {
 			c.close()
 			h.remove(c)
-			h.parent.cfg.Telemetry.PeerDrain(false)
+			h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "drain", forced: false})
 		}
 	}
 	// Subscribe before checking activity so the last stream cannot finish
@@ -986,7 +1001,7 @@ draining:
 		if emit {
 			c.flushStreamDelta(h.parent.cfg.Telemetry)
 		}
-		h.parent.cfg.Telemetry.PeerDrain(true)
+		h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "drain", forced: true})
 	}
 }
 
@@ -1049,7 +1064,7 @@ func (s *countedPeerStream) Close() error {
 		if reclaim {
 			s.conn.close()
 			s.host.remove(s.conn)
-			s.tele.PeerDrain(false)
+			s.host.observations.record(s.tele, peerObservation{kind: "drain"})
 		}
 	})
 	return e
