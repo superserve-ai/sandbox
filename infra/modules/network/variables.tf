@@ -88,6 +88,7 @@ variable "firewall_rules" {
     direction     = string
     priority      = optional(number, 1000)
     source_ranges = optional(list(string), [])
+    source_tags   = optional(list(string), [])
     target_tags   = optional(list(string), [])
     allow = optional(list(object({
       protocol = string
