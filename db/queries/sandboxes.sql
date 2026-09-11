@@ -488,8 +488,16 @@ WITH reverted AS (
   RETURNING id, team_id, vcpu_count, memory_mib
 ),
 opened_active AS (
+  -- The reopened interval keeps the actor of the one the pause closed when
+  -- the revert has none of its own (an automatic pause): actor-level
+  -- activity reporting skips NULL actors.
   INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
-  SELECT r.id, r.team_id, sqlc.arg(actor_id), now()
+  SELECT r.id, r.team_id,
+         COALESCE(sqlc.narg(actor_id)::uuid,
+                  (SELECT i.actor_id FROM sandbox_active_interval i
+                   WHERE i.sandbox_id = r.id AND i.ended_at IS NOT NULL
+                   ORDER BY i.ended_at DESC LIMIT 1)),
+         now()
   FROM reverted r
   ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
   RETURNING sandbox_id

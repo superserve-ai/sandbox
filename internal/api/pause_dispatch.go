@@ -96,9 +96,9 @@ func (h *Handlers) dispatchPause(ctx context.Context, vmd VMDClient, sandbox db.
 	snapshotPath, memPath, manifest, ackedPauseToken, err := h.pauseWithRetry(ctx, vmd, sandbox.HostID, sandboxID.String(), pauseToken, leaseUntil)
 	if err != nil {
 		bg := context.WithoutCancel(ctx)
-		// The resolved host has no such VM: it crashed or was removed
-		// out-of-band, so 'active' was already a lie.
-		if isVMDNotFound(err) {
+		// The resolved host has no such VM, or one it can never pause:
+		// 'active' was already a lie.
+		if isVMDNotFound(err) || isVMDFailedPrecondition(err) {
 			l.Warn().Err(err).Msg("VMD PauseInstance: VM unavailable, marking sandbox failed")
 			h.asyncBookkeeping("fail-pause", func() { h.failPause(bg, sandboxID, sandbox.HostID, lease, l) })
 			return pauseGone

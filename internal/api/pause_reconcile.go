@@ -19,7 +19,8 @@ import (
 
 // A pause whose caller gave up is not undone: an error after dispatch does not
 // prove the VM still runs. The row stays 'pausing' and this loop asks the host
-// again until it answers with a snapshot or NotFound; anything else is retried.
+// again until it answers with a snapshot, NotFound, or a failed precondition;
+// anything else is retried.
 const (
 	pauseReconcileInterval = 30 * time.Second
 	// Claimable only after the caller's whole lease, so its attempt is over.
@@ -134,7 +135,7 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 	snapshotPath, memPath, manifest, ackedToken, err := vmd.PauseInstance(dctx, row.ID.String(), "", uuid.UUID(row.PauseOpID.Bytes).String())
 	if err != nil {
 		RecordSandboxTransition(ctx, "reconcile_pause", telemetry.ResultError, row.HostID, time.Since(started))
-		if isVMDNotFound(err) {
+		if isVMDNotFound(err) || isVMDFailedPrecondition(err) {
 			l.Warn().Err(err).Msg("pause reconcile: VM gone from its host, marking failed")
 			h.failPause(ctx, row.ID, row.HostID, lease, l)
 			return

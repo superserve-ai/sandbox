@@ -32,8 +32,8 @@ var errFinalizeInFlight = errors.New("pause finalization in flight")
 // Bounded so a stranded transition cannot head-of-line-block the host's
 // outbox forever: a fresh transition counts, and so does a durable pause
 // operation whose lease is held or was renewed recently (its workers only
-// move the lease, never updated_at), until it has been flagged for an
-// operator.
+// move the lease, never updated_at); a lease nobody has touched in a while
+// is a stranded one.
 func finalizeInFlight(row db.LockSandboxRowRow) bool {
 	if row.Status != db.SandboxStatusPausing && row.Status != db.SandboxStatusResuming {
 		return false
@@ -41,8 +41,8 @@ func finalizeInFlight(row db.LockSandboxRowRow) bool {
 	if time.Since(row.UpdatedAt) < 10*time.Minute {
 		return true
 	}
-	return row.PauseOpID.Valid && !row.PauseOpAttentionAt.Valid &&
-		row.PauseOpLeaseUntil.Valid && time.Since(row.PauseOpLeaseUntil.Time) < 10*time.Minute
+	return row.PauseOpID.Valid && row.PauseOpLeaseUntil.Valid &&
+		time.Since(row.PauseOpLeaseUntil.Time) < 10*time.Minute
 }
 
 // maxBackupReportFiles bounds a report's manifest jsonb. Sandbox

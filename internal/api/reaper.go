@@ -404,7 +404,7 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxR
 	if err != nil {
 		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		lease := pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}
-		if isVMDNotFound(err) {
+		if isVMDNotFound(err) || isVMDFailedPrecondition(err) {
 			l.Warn().Err(err).Msg("reaper: VM gone from its host, marking failed")
 			h.failPause(ctx, sbx.ID, sbx.HostID, lease, l)
 			return

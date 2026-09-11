@@ -285,3 +285,52 @@ func TestPauseSandbox_NoPausedActivityUntilFinalized(t *testing.T) {
 		})
 	}
 }
+
+// A host that can never pause the VM as it stands (artifacts gone, VM parked
+// in an error state) is a decided answer: the row is failed, not retried.
+func TestReconcilePause_FailedPreconditionIsTerminal(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusPausing,
+		PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1}
+	var finalizes, fails, releases int32
+	mock := pauseMocks(sb, &finalizes)
+	inner := mock.queryRowFn
+	mock.queryRowFn = func(ctx context.Context, sql string, args ...any) pgx.Row {
+		if strings.Contains(sql, "-- name: MarkSandboxFailed :one") {
+			atomic.AddInt32(&fails, 1)
+			return &mockRow{scanFn: func(dest ...any) error {
+				*dest[0].(*int64) = 1
+				return nil
+			}}
+		}
+		return inner(ctx, sql, args...)
+	}
+	mock.execFn = func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+		if strings.Contains(sql, "-- name: ReleasePauseLease ") {
+			atomic.AddInt32(&releases, 1)
+		}
+		return pgconn.NewCommandTag("UPDATE 1"), nil
+	}
+	h := &Handlers{DB: db.New(mock), VMD: &stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+		return "", "", status.Error(codes.FailedPrecondition, "paused VM artifacts missing on host")
+	}}}
+
+	h.reconcilePause(context.Background(), db.ClaimPendingPauseRow{ID: sandboxID, TeamID: teamID, PauseOpID: sb.PauseOpID, PauseOpLeaseVersion: 1},
+		time.Now().Add(time.Minute), zerolog.Nop())
+
+	if atomic.LoadInt32(&fails) != 1 || atomic.LoadInt32(&releases) != 0 {
+		t.Fatalf("fails = %d, releases = %d; want the row failed and no retry", fails, releases)
+	}
+}
+
+func TestPauseWithRetry_FailedPreconditionIsNotRetried(t *testing.T) {
+	calls := 0
+	vmd := &stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+		calls++
+		return "", "", status.Error(codes.FailedPrecondition, "vm is in error state and cannot be paused")
+	}}
+	_, _, _, _, err := (&Handlers{VMD: vmd}).pauseWithRetry(context.Background(), vmd, "host-1", "vm-1", "tok", time.Now().Add(time.Minute))
+	if !isVMDFailedPrecondition(err) || calls != 1 {
+		t.Fatalf("calls = %d, err = %v; want one attempt and the precondition surfaced", calls, err)
+	}
+}

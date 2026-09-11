@@ -526,3 +526,33 @@ func TestIntegration_PauseOperation_CompletedOperationIsNotReclaimedByALegacyPau
 		}
 	}
 }
+
+// An automatic pause that reverts before dispatch reopens the active interval
+// under the actor of the interval it closed, so the sandbox stays in that
+// actor's activity reporting.
+func TestIntegration_PauseOperation_RevertKeepsThePriorActor(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, profileID := seedTeamKeyAndProfile(t)
+	id := seedActiveSandbox(t, teamID, "pause-op-revert-actor")
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id) VALUES ($1, $2, $3)`, id, teamID, profileID); err != nil {
+		t.Fatal(err)
+	}
+	op := uuid.New()
+	row := beginPause(t, id, teamID, op)
+
+	n, err := testQueries.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
+		SandboxID: id, TeamID: teamID, PauseOpID: pauseOpID(op), PauseOpLeaseVersion: leaseVersion(row.PauseOpLeaseVersion),
+	})
+	if err != nil || n != 1 {
+		t.Fatalf("revert = %d, %v; want 1 row", n, err)
+	}
+	var actor uuid.UUID
+	if err := testPool.QueryRow(ctx,
+		`SELECT actor_id FROM sandbox_active_interval WHERE sandbox_id = $1 AND ended_at IS NULL`, id).Scan(&actor); err != nil {
+		t.Fatalf("reopened interval: %v", err)
+	}
+	if actor != profileID {
+		t.Fatalf("reopened interval actor = %s, want the closed interval's %s", actor, profileID)
+	}
+}

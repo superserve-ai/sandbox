@@ -450,8 +450,8 @@ func TestIntegration_BackupReport_DefersDuringTransitionalStatus(t *testing.T) {
 			t.Fatalf("report during stale %q = %d, want 200", status, code)
 		}
 		// A durable pause operation keeps the transition live past that
-		// window while its lease is held or renewed, until an operator has
-		// been flagged; a lease nobody has touched in a long while does not.
+		// window while its lease is held or renewed, flagged for an operator
+		// or not; a lease nobody has touched in a long while does not.
 		if _, err := testPool.Exec(ctx,
 			`UPDATE sandbox SET pause_op_id = gen_random_uuid(), pause_op_lease_until = now() + interval '1 minute',
 			                    pause_op_attention_at = NULL WHERE id = $1`, sandboxID); err != nil {
@@ -464,8 +464,8 @@ func TestIntegration_BackupReport_DefersDuringTransitionalStatus(t *testing.T) {
 			`UPDATE sandbox SET pause_op_attention_at = now() WHERE id = $1`, sandboxID); err != nil {
 			t.Fatalf("flag %s: %v", status, err)
 		}
-		if code := deliver(); code != http.StatusOK {
-			t.Fatalf("report during flagged %q = %d, want 200", status, code)
+		if code := deliver(); code != http.StatusServiceUnavailable {
+			t.Fatalf("report during flagged %q = %d, want 503 (still worked)", status, code)
 		}
 		if _, err := testPool.Exec(ctx,
 			`UPDATE sandbox SET pause_op_attention_at = NULL, pause_op_lease_until = now() - interval '20 minutes' WHERE id = $1`,

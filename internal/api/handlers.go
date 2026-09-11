@@ -3004,7 +3004,7 @@ func (h *Handlers) pauseWithRetry(reqCtx context.Context, vmd VMDClient, hostID,
 	ctx, cancel := context.WithDeadline(reqCtx, deadline)
 	snapshotPath, memPath, manifest, ackedToken, err = vmd.PauseInstance(ctx, id, "", pauseToken)
 	cancel()
-	if err == nil || isVMDNotFound(err) {
+	if err == nil || isVMDNotFound(err) || isVMDFailedPrecondition(err) {
 		return snapshotPath, memPath, manifest, ackedToken, err
 	}
 	if deadline, ok = attemptDeadline(leaseUntil, vmdTimeout); !ok {
