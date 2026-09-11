@@ -60,7 +60,7 @@ func TestDataPlaneListenerRoutingIsolation(t *testing.T) {
 		return proxy.SandboxRoute{}, errors.New("ownership unavailable")
 	})
 	router := proxy.NewRoutingHandler(domains, "host-a", ownership, nil, local, zerolog.Nop())
-	publicMux, localMux := newDataPlaneMuxes(local, router)
+	publicMux, localMux := newDataPlaneMuxes(local, router, true)
 
 	for _, tc := range []struct {
 		name                     string

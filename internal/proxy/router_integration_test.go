@@ -151,3 +151,72 @@ func TestRoutingHandlerUpgradeBufferedBytes(t *testing.T) {
 		t.Fatalf("echo=%q err=%v", got, err)
 	}
 }
+
+func TestRoutingHandlerClientDisconnectCancelsUpstream(t *testing.T) {
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	stop := make(chan struct{})
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		select {
+		case <-r.Context().Done():
+			close(canceled)
+		case <-stop:
+		}
+	}))
+	defer target.Close()
+	defer close(stop)
+	peers, peerAddr, sandboxHost := startRoutingTestOwner(t, target)
+	router := httptest.NewServer(NewRoutingHandler([]string{"sandbox.test"}, "host-a", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+		return SandboxRoute{HostID: "host-b", ProxyAddr: peerAddr}, nil
+	}), peers, http.NotFoundHandler(), zerolog.Nop()))
+	defer router.Close()
+	client, err := net.Dial("tcp", router.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	fmt.Fprintf(client, "GET /wait HTTP/1.1\r\nHost: %s\r\n\r\n", sandboxHost)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream request did not start")
+	}
+	client.Close()
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("client disconnect did not cancel upstream")
+	}
+}
+
+func TestRoutingHandlerLongURIOverProductionIngress(t *testing.T) {
+	path := "/" + strings.Repeat("a", 128*1024)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != path {
+			http.Error(w, "incorrect URI", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	peers, peerAddr, sandboxHost := startRoutingTestOwner(t, target)
+	router := httptest.NewServer(NewRoutingHandler([]string{"sandbox.test"}, "host-a", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+		return SandboxRoute{HostID: "host-b", ProxyAddr: peerAddr}, nil
+	}), peers, http.NotFoundHandler(), zerolog.Nop()))
+	defer router.Close()
+	req, err := http.NewRequest(http.MethodGet, router.URL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = sandboxHost
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}

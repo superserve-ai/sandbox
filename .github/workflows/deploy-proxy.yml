@@ -1,3 +1,9 @@
+# Two-phase rollout: leave the environment variable PEER_ROUTING_ENABLED unset
+# while deploying ingress to every owner in every reachable region. Enable it
+# with value 1 only after all ingress deployments and readiness checks succeed.
+# On partial failure keep routing disabled and complete the ingress rollout.
+# Before removing ingress or rolling back to an older binary, disable routing
+# across the fleet first. Never enable routing in the initial ingress deployment.
 # Deploy Proxy — edge proxy on the VMD hosts.
 #
 # Production NEVER deploys without staging first. Same pattern as Deploy API /
@@ -106,6 +112,7 @@ jobs:
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
         run: |
           python3 .github/workflows/scripts/deploy-proxy.py
@@ -167,6 +174,7 @@ jobs:
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
@@ -216,6 +224,7 @@ jobs:
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |

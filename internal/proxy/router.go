@@ -158,6 +158,12 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 			// Hijack may have already buffered bytes after the HTTP request.
 			_, _ = io.Copy(stream, buffered.Reader)
 			_ = stream.CloseSend()
+		} else {
+			// Hijacking disables net/http's disconnect watcher. Once the body
+			// is consumed, drain without forwarding pipelined requests so EOF
+			// cancels a quiet upstream as well.
+			_, _ = io.Copy(io.Discard, conn)
+			closeBoth(nil)
 		}
 		// HTTP framing ends the body. A TCP half-close at the destination would
 		// cancel net/http's request context before its reverse proxy responds.

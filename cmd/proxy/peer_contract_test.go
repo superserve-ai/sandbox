@@ -84,7 +84,7 @@ func TestLocalListenerCannotReenterOwnershipRouting(t *testing.T) {
 		lookups.Add(1)
 		return proxy.SandboxRoute{HostID: "host-b", ProxyAddr: "192.0.2.2:5009"}, nil
 	}), nil, local, zerolog.Nop())
-	publicMux, localMux := newDataPlaneMuxes(local, router)
+	publicMux, localMux := newDataPlaneMuxes(local, router, true)
 	// The same local mux is attached to the synchronously bound peer target.
 	srv := httptest.NewServer(localMux)
 	defer srv.Close()
@@ -103,6 +103,24 @@ func TestLocalListenerCannotReenterOwnershipRouting(t *testing.T) {
 		publicMux.ServeHTTP(httptest.NewRecorder(), req)
 		if lookups.Load() != 1 {
 			t.Fatalf("%s: public listener bypassed ownership routing", path)
+		}
+	}
+}
+
+func TestIngressOnlyRolloutDoesNotRoutePublicRequests(t *testing.T) {
+	local := proxy.NewHandler([]string{"sandbox.test"}, &listenerResolver{}, zerolog.Nop())
+	router := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("ingress-only rollout entered ownership routing")
+	})
+	public, peer := newDataPlaneMuxes(local, router, false)
+	for _, mux := range []*http.ServeMux{public, peer} {
+		for _, path := range []string{"/", "/health"} {
+			req := httptest.NewRequest(http.MethodGet, "http://8080-12345678-1234-1234-1234-123456789abc.sandbox.test"+path, nil)
+			result := httptest.NewRecorder()
+			mux.ServeHTTP(result, req)
+			if result.Code != http.StatusNotFound {
+				t.Fatalf("local handler status=%d", result.Code)
+			}
 		}
 	}
 }

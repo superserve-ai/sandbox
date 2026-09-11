@@ -33,7 +33,7 @@ class DeployProxyOrderingTest(unittest.TestCase):
 
 
 class DeployProxyTests(unittest.TestCase):
-    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0, database_url="postgres://postgres:postgres@localhost/sandbox_test"):
+    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0, database_url="postgres://postgres:postgres@localhost/sandbox_test", routing=""):
         scripts = []
 
         def run(args, **kwargs):
@@ -52,6 +52,7 @@ class DeployProxyTests(unittest.TestCase):
             "GCP_PROJECT": "example-project",
             "SHA": "12345678",
             "DATABASE_URL": database_url,
+            "PEER_ROUTING_ENABLED": routing,
             "PROXY_DOMAIN": "sandbox.example.test",
             "PEER_PROXY_LISTEN_ADDR": peer_addr,
             "PEER_IDENTITY_HOSTS": "example-host" if required_identity else "",
@@ -83,6 +84,11 @@ class DeployProxyTests(unittest.TestCase):
                 script = self.generate_script("auto")
                 self.assertIn('PEER_PROXY_LISTEN_ADDR=', script)
                 self.assertIn(':5009', script)
+
+    def test_routing_requires_explicit_activation(self):
+        self.assertIn("PEER_ROUTING_ENABLED=0\n", self.generate_script("auto"))
+        self.assertIn("PEER_ROUTING_ENABLED=1\n", self.generate_script("auto", routing="1"))
+        self.generate_script("auto", routing="true", expected_result=1)
 
     def test_generated_shell_parses(self):
         for peer_addr in ("", "auto"):
