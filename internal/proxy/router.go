@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -103,6 +104,47 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.record(r.Context(), "remote", route.HostID)
 }
 
+// Serialize the fallback response with the response pump. A partial response
+// must never be followed by a second HTTP status line.
+type bridgeResponseWriter struct {
+	conn              net.Conn
+	mu                sync.Mutex
+	started, finished bool
+}
+
+func (w *bridgeResponseWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.finished {
+		return 0, net.ErrClosed
+	}
+	n, err := w.conn.Write(p)
+	w.started = w.started || n > 0
+	return n, err
+}
+
+func (w *bridgeResponseWriter) hasStarted() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.started
+}
+
+func (w *bridgeResponseWriter) finish(err error) {
+	if err == nil {
+		_ = w.conn.Close()
+		return
+	}
+	// Bound both an in-flight downstream write and the gateway response.
+	_ = w.conn.SetWriteDeadline(time.Now().Add(time.Second))
+	w.mu.Lock()
+	w.finished = true
+	if !w.started {
+		_, _ = io.WriteString(w.conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 31\r\nConnection: close\r\n\r\nsandbox forwarding unavailable\n")
+	}
+	w.mu.Unlock()
+	_ = w.conn.Close()
+}
+
 func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) error {
 	// A peer stream is a raw connection. Hijacking preserves websocket, upgrade,
 	// streaming, and upload semantics without parsing application payloads.
@@ -115,6 +157,7 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 		return err
 	}
 	defer conn.Close()
+	output := &bridgeResponseWriter{conn: conn}
 	defer stream.Close()
 	// Request.Write owns both headers and transfer framing, including chunked
 	// bodies and trailers. Run it alongside the response pump for early replies.
@@ -137,8 +180,8 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 				bridgeErr = err
 			}
 			close(done)
-			_ = conn.Close()
 			_ = stream.Close()
+			output.finish(bridgeErr)
 		})
 	}
 	go func() {
@@ -194,11 +237,11 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 					return
 				}
 				if response.StatusCode == http.StatusSwitchingProtocols {
-					if _, err = fmt.Fprintf(conn, "%s %s\r\n", response.Proto, response.Status); err == nil {
-						err = response.Header.Write(conn)
+					if _, err = fmt.Fprintf(output, "%s %s\r\n", response.Proto, response.Status); err == nil {
+						err = response.Header.Write(output)
 					}
 					if err == nil {
-						_, err = io.WriteString(conn, "\r\n")
+						_, err = io.WriteString(output, "\r\n")
 					}
 					if err != nil {
 						closeBoth(err)
@@ -211,7 +254,7 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 				if final {
 					response.Close = true
 				}
-				err = response.Write(conn)
+				err = response.Write(output)
 				_ = response.Body.Close()
 				if err != nil || final {
 					closeBoth(err)
@@ -219,7 +262,10 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 				}
 			}
 		}
-		_, err := io.Copy(conn, source)
+		_, err := io.Copy(output, source)
+		if err == nil && !output.hasStarted() {
+			err = io.ErrUnexpectedEOF
+		}
 		// The first terminal event owns the result; closing either descriptor
 		// can make the other pump fail as a consequence.
 		closeBoth(err)

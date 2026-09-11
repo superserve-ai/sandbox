@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -218,5 +219,50 @@ func TestRoutingHandlerLongURIOverProductionIngress(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent {
 		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}
+
+func TestRoutingHandlerUnavailablePeerTargetReturns502(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := listener.Addr().String()
+	listener.Close()
+	peers, peerAddr := startRoutingTestPeer(t, target)
+	var opens atomic.Int32
+	router := httptest.NewServer(NewRoutingHandler([]string{"sandbox.test"}, "host-a", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+		return SandboxRoute{HostID: "host-b", ProxyAddr: peerAddr}, nil
+	}), routePeerFunc(func(ctx context.Context, host, addr string) (PeerStream, error) {
+		opens.Add(1)
+		return peers.OpenStream(ctx, host, addr)
+	}), http.NotFoundHandler(), zerolog.Nop()))
+	defer router.Close()
+	for _, upgrade := range []bool{false, true} {
+		t.Run(fmt.Sprint(upgrade), func(t *testing.T) {
+			before := opens.Load()
+			req, err := http.NewRequest(http.MethodPost, router.URL+"/exec", strings.NewReader("payload"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
+			if upgrade {
+				req.Header.Set("Connection", "Upgrade")
+				req.Header.Set("Upgrade", "echo")
+			}
+			client := &http.Client{Timeout: 5 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("expected HTTP 502, got %v", err)
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(resp.Body)
+			if err != nil || resp.StatusCode != http.StatusBadGateway || string(body) != "sandbox forwarding unavailable\n" {
+				t.Fatalf("status=%d body=%q err=%v", resp.StatusCode, body, err)
+			}
+			if opens.Load()-before != 1 {
+				t.Fatal("failed request was replayed")
+			}
+		})
 	}
 }
