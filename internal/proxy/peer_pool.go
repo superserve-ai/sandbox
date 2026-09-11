@@ -208,6 +208,7 @@ type peerConn struct {
 	client            PeerClient
 	closer            io.Closer
 	closeOnce         sync.Once
+	closed            chan struct{}
 	active            int // Includes reserved capacity for pending opens.
 	published         int // Streams committed to telemetry accounting.
 	draining          bool
@@ -254,8 +255,10 @@ func (m *peerMetricDelta) flush(emit func(int)) {
 		emit(delta)
 	}
 }
-func (c *peerConn) queueStreamDelta(delta int) bool         { return c.streamMetrics.queue(delta) }
-func (c *peerConn) flushStreamDelta(tele PeerPoolTelemetry) { c.streamMetrics.flush(tele.PeerStream) }
+func (c *peerConn) queueStreamDelta(delta int) bool { return c.streamMetrics.queue(delta) }
+func (c *peerConn) flushStreamDelta(tele PeerPoolTelemetry) {
+	go c.streamMetrics.flush(tele.PeerStream)
+}
 
 type pendingPeerOpen struct{ cancel context.CancelFunc }
 
@@ -299,7 +302,12 @@ func closeDialResult(client PeerClient, closer io.Closer) {
 }
 
 func (c *peerConn) close() {
-	c.closeOnce.Do(func() { closeDialResult(c.client, c.closer) })
+	c.closeOnce.Do(func() {
+		closeDialResult(c.client, c.closer)
+		if c.closed != nil {
+			close(c.closed)
+		}
+	})
 }
 
 func (h *hostPool) replaceLocked(addr string) {
@@ -507,22 +515,28 @@ retry:
 		}
 		var published *peerConn
 		if e == nil {
-			c := &peerConn{client: client, closer: closer, max: h.parent.cfg.StreamsPerConnection}
+			c := &peerConn{client: client, closer: closer, max: h.parent.cfg.StreamsPerConnection, closed: make(chan struct{})}
 			h.conns = append(h.conns, c)
+			var failed <-chan struct{}
 			if watcher, ok := client.(peerFailureWatcher); ok {
+				failed = watcher.Done()
 				go func() {
-					<-watcher.Done()
-					h.markFailed(c)
+					select {
+					case <-failed:
+						h.markFailed(c)
+					case <-c.closed:
+					}
 				}()
-				if retirement, ok := client.(peerRetirementWatcher); ok {
-					go func() {
-						select {
-						case <-retirement.Retiring():
-							h.retire(c)
-						case <-watcher.Done():
-						}
-					}()
-				}
+			}
+			if retirement, ok := client.(peerRetirementWatcher); ok {
+				go func() {
+					select {
+					case <-retirement.Retiring():
+						h.retire(c)
+					case <-failed:
+					case <-c.closed:
+					}
+				}()
 			}
 			h.failures = 0
 			h.retryAt = time.Time{}

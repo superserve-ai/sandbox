@@ -806,9 +806,14 @@ func TestPeerPoolWriteEOFReleasesCapacity(t *testing.T) {
 	}
 }
 
-type peerEventRecorder struct{ events []telemetry.PeerEvent }
+type peerEventRecorder struct {
+	mu     sync.Mutex
+	events []telemetry.PeerEvent
+}
 
 func (r *peerEventRecorder) RecordPeerEvent(_ context.Context, e telemetry.PeerEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.events = append(r.events, e)
 }
 func TestPeerPoolHandshakeOutcome(t *testing.T) {
@@ -835,6 +840,8 @@ func TestPeerPoolHandshakeOutcome(t *testing.T) {
 			}
 			_ = p.Close()
 			found := false
+			recorder.mu.Lock()
+			defer recorder.mu.Unlock()
 			for _, e := range recorder.events {
 				if e.Kind == "handshake" {
 					found = true
@@ -900,6 +907,7 @@ func TestPeerPoolForcedDrainCountsOnlyPublishedStreams(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+				waitPeerStreamTelemetry(t, old)
 				done := make(chan PeerStream, 1)
 				go func() { s, _ := p.OpenStream(context.Background(), "host", "old"); done <- s }()
 				<-client.started
@@ -924,6 +932,8 @@ func TestPeerPoolForcedDrainCountsOnlyPublishedStreams(t *testing.T) {
 					t.Fatal("drain did not complete")
 				}
 
+				waitPeerStreamTelemetry(t, old)
+				waitPeerStreamTelemetry(t, replacement)
 				if got := metrics.total.Load(); got != want {
 					t.Fatalf("after drain = %d, want %d", got, want)
 				}
@@ -939,10 +949,13 @@ func TestPeerPoolForcedDrainCountsOnlyPublishedStreams(t *testing.T) {
 				case late := <-done:
 					if late != nil {
 						_ = late.Close()
+						waitPeerStreamTelemetry(t, late)
 					}
 				case <-time.After(time.Second):
 					t.Fatal("pending open did not finish")
 				}
+				waitPeerStreamTelemetry(t, old)
+				waitPeerStreamTelemetry(t, replacement)
 				if got := metrics.total.Load(); got != 0 || metrics.negative.Load() {
 					t.Fatalf("unbalanced stream metric: total=%d, negative=%v", got, metrics.negative.Load())
 				}
@@ -1047,6 +1060,7 @@ func TestPeerPoolAsyncFailureReleasesIdleStreamAccounting(t *testing.T) {
 		}
 		streams = append(streams, s)
 	}
+	waitPeerStreamTelemetry(t, streams[0])
 	client.fail()
 	deadline := time.Now().Add(time.Second)
 	for metrics.total.Load() != 0 && time.Now().Before(deadline) {
@@ -1095,6 +1109,7 @@ func TestPeerPoolLastCloseClaimsDrainBeforeDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitPeerStreamTelemetry(t, s)
 	h := p.hosts["host"]
 	p.mu.Lock()
 	h.replaceLocked("new")
@@ -1160,6 +1175,7 @@ func TestPeerPoolShutdownClosesTransportDuringClaimedCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitPeerStreamTelemetry(t, s)
 	cs := s.(*countedPeerStream)
 	cs.conn.mu.Lock()
 	cs.conn.draining = true
@@ -1503,6 +1519,19 @@ func TestPeerPoolBlockedPublicationTelemetryDoesNotBlockShutdown(t *testing.T) {
 	opened := make(chan PeerStream, 1)
 	go func() { s, _ := p.OpenStream(context.Background(), "host", "addr"); opened <- s }()
 	<-metrics.started
+	var stream PeerStream
+	select {
+	case stream = <-opened:
+	case <-time.After(time.Second):
+		t.Fatal("telemetry blocked stream publication")
+	}
+	for i := 0; i < 20; i++ {
+		next, err := p.OpenStream(context.Background(), "host", "addr")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = next.Close()
+	}
 	closed := make(chan struct{})
 	go func() { _ = p.Close(); close(closed) }()
 	select {
@@ -1514,14 +1543,10 @@ func TestPeerPoolBlockedPublicationTelemetryDoesNotBlockShutdown(t *testing.T) {
 		t.Fatal("shutdown did not close transport")
 	}
 	once.Do(func() { close(metrics.release) })
-	select {
-	case s := <-opened:
-		if s != nil {
-			_ = s.Close()
-		}
-	case <-time.After(time.Second):
-		t.Fatal("open did not finish after telemetry resumed")
+	if stream != nil {
+		_ = stream.Close()
 	}
+	waitPeerStreamTelemetry(t, stream)
 	if metrics.total.Load() != 0 || metrics.negative.Load() {
 		t.Fatal("stream telemetry was unbalanced or emitted out of order")
 	}
@@ -1660,4 +1685,73 @@ func TestPeerPoolShutdownJoinsFailedConnectionCleanup(t *testing.T) {
 		}
 	}
 	_ = s.Close()
+}
+
+func waitPeerStreamTelemetry(t *testing.T, stream PeerStream) {
+	t.Helper()
+	if stream == nil {
+		return
+	}
+	metric := &stream.(*countedPeerStream).conn.streamMetrics
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		metric.mu.Lock()
+		done := !metric.emitting
+		metric.mu.Unlock()
+		if done {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("stream telemetry did not finish")
+}
+
+type retirementOnlyPeerClient struct {
+	testPeerClient
+	retiring chan struct{}
+}
+
+func (c *retirementOnlyPeerClient) Retiring() <-chan struct{} { return c.retiring }
+
+func TestPeerPoolWatchesRetirementWithoutFailureSignal(t *testing.T) {
+	client := &retirementOnlyPeerClient{retiring: make(chan struct{})}
+	var dials atomic.Int32
+	p := NewPeerTransport(PeerPoolConfig{MaxConnections: 1, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		if dials.Add(1) == 1 {
+			return client, &countingCloser{}, nil
+		}
+		return &testPeerClient{}, &countingCloser{}, nil
+	}})
+	defer p.Close()
+	old, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	c := old.(*countedPeerStream).conn
+	close(client.retiring)
+	deadline := time.Now().Add(time.Second)
+	for {
+		c.mu.Lock()
+		draining := c.draining
+		c.mu.Unlock()
+		if draining {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("retirement-only client was not retired")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	next, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer next.Close()
+	if next.(*countedPeerStream).conn == c {
+		t.Fatal("retired connection was reused")
+	}
+	if _, err := old.Write([]byte("draining")); err != nil {
+		t.Fatal("retirement canceled established stream")
+	}
 }
