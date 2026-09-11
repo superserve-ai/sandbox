@@ -128,7 +128,10 @@ func ensureWakeProtocolFloor() error {
 // host without the directory is not a fleet host.
 func noteWakeProtocolEvidence() error {
 	if _, err := os.Stat(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
-		return nil
+		if os.IsNotExist(err) {
+			return nil // not a fleet host
+		}
+		return err // a lookup that failed is not evidence written
 	}
 	return ensureWakeProtocolFloor()
 }

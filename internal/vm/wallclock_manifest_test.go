@@ -589,3 +589,27 @@ func TestUntrustedTemplateManifestRaisesTheFloor(t *testing.T) {
 		t.Fatalf("n=%d raised=%v; an untrusted manifest must raise the floor", n, wakeProtocolFloorRaised())
 	}
 }
+
+// A lookup of the evidence directory that fails for any reason but absence
+// is not "not a fleet host": the template is not counted as witnessed, and
+// the next scan retries.
+func TestTemplateScanDoesNotCountAnEvidenceLookupThatFailed(t *testing.T) {
+	dir := t.TempDir()
+	isolateEvidence(t, dir)
+	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
+	if err := os.MkdirAll(tpl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	seedFrozenManifest(t, filepath.Join(tpl, "mem.snap"), "tok")
+	// The evidence directory's own parent is a file: the lookup fails with
+	// something other than absence.
+	notADir := filepath.Join(dir, "not-a-dir")
+	if err := os.WriteFile(notADir, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wakeProtocolEvidencePath = filepath.Join(notADir, "sub", "evidence")
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	if n := m.scanTemplateManifests(); n != 0 || wakeProtocolFloorRaised() {
+		t.Fatalf("n=%d raised=%v; a failed lookup must not count the template as witnessed", n, wakeProtocolFloorRaised())
+	}
+}
