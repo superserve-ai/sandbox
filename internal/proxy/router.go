@@ -155,7 +155,14 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 	}()
 	go func() {
 		defer wg.Done()
-		_, responseErr = io.Copy(conn, stream)
+		_, err := io.Copy(conn, stream)
+		// Closing the upload or cancelling the request also unblocks this
+		// copy. Only errors observed before our own shutdown are peer failures.
+		select {
+		case <-done:
+		default:
+			responseErr = err
+		}
 		closeBoth()
 	}()
 	wg.Wait()
