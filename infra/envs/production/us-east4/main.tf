@@ -470,7 +470,7 @@ module "sandbox_host_c" {
         artifact_bucket  = local.host_c_artifact_bucket
         kernel_object    = local.host_c_kernel_object
         rootfs_object    = "base.ext4"
-        data_disk_device = ""
+        data_disk_device = "superserve-sandbox-data"
         vmd_env          = local.host_c_vmd_env
       }),
       templatefile("${path.module}/../../../../deploy/unbound/unbound-bootstrap.sh.tftpl", {
@@ -481,6 +481,32 @@ module "sandbox_host_c" {
       }),
     ])
   }
+}
+
+resource "google_compute_disk" "sandbox_data_c" {
+  project = local.project_id
+  name    = "${module.sandbox_host_c.instance_name}-sandbox-data"
+  zone    = local.zone
+  type    = "hyperdisk-balanced"
+  size    = 1024
+
+  labels = merge(local.common_labels, {
+    component = "vmd"
+    purpose   = "sandbox-data"
+  })
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_compute_attached_disk" "sandbox_data_c" {
+  project     = local.project_id
+  zone        = local.zone
+  disk        = google_compute_disk.sandbox_data_c.id
+  instance    = module.sandbox_host_c.instance_self_link
+  device_name = "superserve-sandbox-data"
+  mode        = "READ_WRITE"
 }
 
 # Hosts fetch the guest kernel and base rootfs at first boot from the
