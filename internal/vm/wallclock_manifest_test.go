@@ -570,3 +570,22 @@ func TestTemplateScanDoesNotCountAFloorItCouldNotRaise(t *testing.T) {
 		t.Fatalf("evidence not written on the retry: %v", err)
 	}
 }
+
+// A template manifest this binary cannot trust may still describe a frozen
+// workload: it counts as rollback evidence, so a supervisor without the wake
+// protocol is refused rather than left to restore the image as legacy.
+func TestUntrustedTemplateManifestRaisesTheFloor(t *testing.T) {
+	dir := t.TempDir()
+	isolateEvidence(t, dir)
+	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
+	if err := os.MkdirAll(tpl, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(WallClockMarkerPath(filepath.Join(tpl, "mem.snap")), []byte(`{"version":2}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir}}
+	if n := m.scanTemplateManifests(); n != 1 || !wakeProtocolFloorRaised() {
+		t.Fatalf("n=%d raised=%v; an untrusted manifest must raise the floor", n, wakeProtocolFloorRaised())
+	}
+}

@@ -483,6 +483,19 @@ func TestResumeImageFacts(t *testing.T) {
 	// The guest's capability does not encode the image fact: a record that
 	// carries the first but not the second reads the manifest, and a frozen
 	// one is reported rather than assumed away.
+	// A record that says frozen but lost its token or its capability is
+	// incomplete: the manifest is read, so the wake carries the real token.
+	t.Run("incomplete_frozen_record_reads_the_manifest", func(t *testing.T) {
+		mem := filepath.Join(t.TempDir(), "mem.snap")
+		seed(t, mem, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "disk"})
+		if corrects, frozen, token, err := resumeImageFacts(mem, mem, boolPtr(true), boolPtr(true), ""); !corrects || !frozen || token != "disk" || err != nil {
+			t.Errorf("corrects=%v frozen=%v token=%q err=%v; a frozen record without a token must take the manifest's", corrects, frozen, token, err)
+		}
+		if corrects, frozen, token, err := resumeImageFacts(mem, mem, nil, boolPtr(true), "rec"); !corrects || !frozen || token != "disk" || err != nil {
+			t.Errorf("corrects=%v frozen=%v token=%q err=%v; a frozen record without the capability must read the manifest", corrects, frozen, token, err)
+		}
+	})
+
 	t.Run("same_image_without_the_image_fact_reads_the_manifest", func(t *testing.T) {
 		mem := filepath.Join(t.TempDir(), "mem.snap")
 		seed(t, mem, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "tok"})

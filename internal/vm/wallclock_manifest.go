@@ -455,7 +455,7 @@ func watchTemplateTree(w *fsnotify.Watcher, dir string) {
 // floor for a frozen one. Returns 1 if it was frozen.
 func (m *Manager) noteTemplateManifest(path string) int {
 	man, err := ReadWallClockManifest(strings.TrimSuffix(path, clockFreezeMarkerSuffix))
-	if err != nil || man == nil || !man.WorkloadFrozen {
+	if err == nil && (man == nil || !man.WorkloadFrozen) {
 		return 0
 	}
 	if err := noteWakeProtocolEvidence(); err != nil {
@@ -478,8 +478,11 @@ func (m *Manager) scanTemplateManifests() int {
 	shallow, _ := filepath.Glob(filepath.Join(root, "*", "*"+clockFreezeMarkerSuffix))
 	n := 0
 	for _, path := range append(deep, shallow...) {
+		// A manifest this binary cannot read or trust may still describe a
+		// frozen workload; it counts as evidence, the safe direction. Only an
+		// absent or empty marker, or one that says unfrozen, does not.
 		man, err := ReadWallClockManifest(strings.TrimSuffix(path, clockFreezeMarkerSuffix))
-		if err != nil || man == nil || !man.WorkloadFrozen {
+		if err == nil && (man == nil || !man.WorkloadFrozen) {
 			continue
 		}
 		// Counted only once the floor is durably up: the host guard trusts

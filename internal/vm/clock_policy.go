@@ -222,7 +222,10 @@ const defaultGuestFreezeBudget = 500 * time.Millisecond
 // caller must refuse on.
 func resumeImageFacts(memPath, pausedMemPath string, recordedCorrects, recordedFrozen *bool, recordedToken string) (correctsWallClock, workloadFrozen bool, token string, err error) {
 	if memPath == pausedMemPath {
-		if recordedFrozen != nil {
+		// A recorded frozen fact answers only when the record is complete:
+		// a rewrite by an older binary can keep the flag and drop the token
+		// or the capability, and a wake with an empty token is refused.
+		if recordedFrozen != nil && (!*recordedFrozen || (recordedToken != "" && recordedCorrects != nil)) {
 			return recordedCorrects != nil && *recordedCorrects, *recordedFrozen, recordedToken, nil
 		}
 		if recordedCorrects != nil && !*recordedCorrects {
