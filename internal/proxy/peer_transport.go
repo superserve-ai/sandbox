@@ -37,20 +37,23 @@ const peerDialTimeout = 5 * time.Second
 var errPeerUnavailable = errors.New("peer connection unavailable")
 
 // GRPCPeerDialer returns a dialer backed by the generated peer-proxy client.
-// Credentials are loaded for each new connection and peer identity is checked
-// by the TLS config before the client is published to the pool.
+// Successful credentials are cached and refreshed in the background on new
+// connections. Peer identity is checked before a client is published to the pool.
 func GRPCPeerDialer(tlsConfig func() (*tls.Config, error)) PeerDialer {
 	return grpcPeerDialer(tlsConfig, peerDialTimeout)
 }
 
 func grpcPeerDialer(tlsConfig func() (*tls.Config, error), timeout time.Duration) PeerDialer {
-	// File-backed loaders cannot be interrupted. Limit outstanding loads across
-	// all hosts so canceled attempts cannot accumulate blocked I/O goroutines.
-	loading := make(chan struct{}, 1)
-	type credentialsResult struct {
+	// A stalled refresh must neither block cached credentials nor accumulate
+	// background I/O. Initial callers share one deadline-bound load.
+	type credentialLoad struct {
+		done   chan struct{}
 		config *tls.Config
 		err    error
 	}
+	var mu sync.Mutex
+	var cached *tls.Config
+	var loading *credentialLoad
 	return func(ctx context.Context, _ string, addr string) (PeerClient, io.Closer, error) {
 		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
@@ -63,33 +66,46 @@ func grpcPeerDialer(tlsConfig func() (*tls.Config, error), timeout time.Duration
 		if attemptCtx.Err() != nil {
 			return nil, nil, attemptError()
 		}
-		select {
-		case loading <- struct{}{}:
-		case <-attemptCtx.Done():
-			return nil, nil, attemptError()
+		mu.Lock()
+		cfg := cached
+		if loading == nil {
+			loading = &credentialLoad{done: make(chan struct{})}
+			load := loading
+			go func() {
+				load.config, load.err = tlsConfig()
+				if load.err == nil && load.config == nil {
+					load.err = errors.New("peer credentials are required")
+				}
+				mu.Lock()
+				if load.err == nil {
+					cached = load.config
+				}
+				loading = nil
+				close(load.done)
+				mu.Unlock()
+			}()
 		}
-		result := make(chan credentialsResult, 1)
-		go func() {
-			defer func() { <-loading }()
-			cfg, err := tlsConfig()
-			result <- credentialsResult{config: cfg, err: err}
-		}()
-		select {
-		case <-attemptCtx.Done():
-			return nil, nil, attemptError()
-		case loaded := <-result:
+		load := loading
+		mu.Unlock()
+		if cfg == nil {
+			select {
+			case <-attemptCtx.Done():
+				return nil, nil, attemptError()
+			case <-load.done:
+			}
 			if attemptCtx.Err() != nil {
 				return nil, nil, attemptError()
 			}
-			if loaded.err != nil {
-				return nil, nil, loaded.err
+			if load.err != nil {
+				return nil, nil, load.err
 			}
-			client, closer, err := dialGRPCPeer(attemptCtx, addr, loaded.config, timeout)
-			if err != nil && attemptCtx.Err() != nil {
-				err = attemptError()
-			}
-			return client, closer, err
+			cfg = load.config
 		}
+		client, closer, err := dialGRPCPeer(attemptCtx, addr, cfg, timeout)
+		if err != nil && attemptCtx.Err() != nil {
+			err = attemptError()
+		}
+		return client, closer, err
 	}
 }
 

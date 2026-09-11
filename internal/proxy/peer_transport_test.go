@@ -394,14 +394,14 @@ func startPeerEchoServer(t *testing.T, cfg PeerTLSConfig, addr string) (*grpc.Se
 	return server, listener.Addr().String()
 }
 
-func TestGRPCPeerDisconnectUsesPoolBackoffAndFreshCredentials(t *testing.T) {
+func TestGRPCPeerDisconnectUsesPoolBackoffAndRefreshesCredentials(t *testing.T) {
 	cfg := peerTestCredentials(t)
 	server, addr := startPeerEchoServer(t, cfg, "127.0.0.1:0")
 	var loads atomic.Int32
-	var secondLoad time.Time
+	secondLoad := make(chan time.Time, 1)
 	dial := GRPCPeerDialer(func() (*tls.Config, error) {
 		if loads.Add(1) == 2 {
-			secondLoad = time.Now()
+			secondLoad <- time.Now()
 		}
 		return cfg.LoadClient()
 	})
@@ -448,10 +448,16 @@ func TestGRPCPeerDisconnectUsesPoolBackoffAndFreshCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer recovered.Close()
+	var refreshedAt time.Time
+	select {
+	case refreshedAt = <-secondLoad:
+	case <-ctx.Done():
+		t.Fatal("reconnect did not refresh credentials")
+	}
 	if loads.Load() != 2 {
 		t.Fatalf("credential loads = %d", loads.Load())
 	}
-	if secondLoad.Before(retryAt) {
+	if refreshedAt.Before(retryAt) {
 		t.Fatal("reconnected before pool backoff expired")
 	}
 	if _, err := recovered.Write([]byte("x")); err != nil {
@@ -470,8 +476,8 @@ func TestGRPCPeerUnavailableRecordsBackoff(t *testing.T) {
 	}
 	addr := listener.Addr().String()
 	_ = listener.Close()
-	var loads []time.Time
-	pool := NewPeerTransport(PeerPoolConfig{Dial: GRPCPeerDialer(func() (*tls.Config, error) { loads = append(loads, time.Now()); return cfg.LoadClient() })}).(*peerPool)
+	loads := make(chan time.Time, 2)
+	pool := NewPeerTransport(PeerPoolConfig{Dial: GRPCPeerDialer(func() (*tls.Config, error) { loads <- time.Now(); return cfg.LoadClient() })}).(*peerPool)
 	defer pool.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -495,8 +501,9 @@ func TestGRPCPeerUnavailableRecordsBackoff(t *testing.T) {
 	if !errors.Is(err, errPeerUnavailable) {
 		t.Fatal(err)
 	}
-	if len(loads) != 2 || loads[1].Before(retryAt) {
-		t.Fatalf("retry bypassed backoff: %v", loads)
+	<-loads
+	if second := <-loads; second.Before(retryAt) {
+		t.Fatalf("retry bypassed backoff: %v", second)
 	}
 	h.mu.Lock()
 	failures = h.failures
@@ -709,5 +716,73 @@ func TestPeerPoolShutdownCancelsCredentialLoading(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("shutdown left the open caller waiting on credential I/O")
+	}
+}
+
+func TestGRPCPeerCachedCredentialsIsolateStalledRefresh(t *testing.T) {
+	cfg := peerTestCredentials(t)
+	_, addr := startPeerEchoServer(t, cfg, "127.0.0.1:0")
+	initial, err := cfg.LoadClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := initial.Clone()
+	rotated.VerifyConnection = func(tls.ConnectionState) error { return errors.New("rotated trust rejects peer") }
+	started, release := make(chan struct{}), make(chan struct{})
+	var released atomic.Bool
+	defer func() {
+		if !released.Swap(true) {
+			close(release)
+		}
+	}()
+	var loads atomic.Int32
+	dial := GRPCPeerDialer(func() (*tls.Config, error) {
+		switch loads.Add(1) {
+		case 1:
+			return initial, nil
+		case 2:
+			close(started)
+			<-release
+		}
+		return rotated, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	for _, host := range []string{"first", "refreshing", "unrelated", "another"} {
+		client, closer, err := dial(ctx, host, addr)
+		if err != nil {
+			t.Fatalf("%s blocked by refresh: %v", host, err)
+		}
+		stream, err := client.OpenPeerStream(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := stream.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := stream.Read(make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+		_ = stream.Close()
+		_ = closer.Close()
+		if host == "refreshing" {
+			<-started
+		}
+	}
+	if got := loads.Load(); got != 2 {
+		t.Fatalf("loads while refresh stalled = %d, want 2", got)
+	}
+	released.Store(true)
+	close(release)
+	// A completed refresh replaces the cache for subsequent handshakes.
+	for {
+		_, closer, err := dial(ctx, "rotated", addr)
+		if err != nil {
+			if ctx.Err() != nil {
+				t.Fatal("completed refresh was never used")
+			}
+			break
+		}
+		_ = closer.Close()
 	}
 }
