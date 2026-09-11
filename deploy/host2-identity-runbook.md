@@ -14,6 +14,16 @@ Routine applies can resume once both resources are no-ops. Perform this
 migration with an operator-applied saved plan after the checks below; a merge
 or generic rollout confirmation does not authorize Host 2 maintenance.
 
+Keep the GitHub Actions variable `HOST2_PEER_IDENTITY_READY_STAGING` unset
+until staging Host 2 completes migration and bootstrap verification; keep
+`HOST2_PEER_IDENTITY_READY_USW` unset until the equivalent production checks
+complete. This lets routine proxy deployments continue before migration.
+Set the applicable variable to `true` in the `staging` or `production` GitHub
+environment after verification and before restoring Host 2 to ready deployment
+discovery. The flag requires bootstrap on that host; it does not supply its
+SPIFFE URI or enable peer ingress/routing. Once enabled, retain it so missing
+bootstrap fails closed on subsequent deployments.
+
 1. Confirm the target owns no sandbox state and remains provisioning in the
    host directory. Remove its ready label and exclude it from concurrent CD
    and placement for the maintenance window. Keep peer routing disabled.
@@ -212,7 +222,8 @@ It preserves the prior valid generation on invalid SAN/key/chain/expiry and
 reports failures through `vmd-peer-credentials.service` in the journal. The
 root-only source directory is created by tmpfiles before the guest agent.
 The proxy deploy reads `identity.json` locally and checks credentials before
-changing its unit/config. Missing bootstrap fails closed when ingress is
+changing its unit/config, even before the cell's readiness flag is enabled.
+Missing bootstrap fails closed once that flag is enabled or ingress is
 requested. A file lock coordinates refresh with systemd `LoadCredential`;
 rotation restarts only the proxy to load the new material, retrying failed
 reloads. It never restarts VMD or enters a sandbox startup/resume path.

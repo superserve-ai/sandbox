@@ -96,7 +96,8 @@ jobs:
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
           # Bootstrap owns each host's identity and certificate paths.
           # Host 1 retains its legacy peer configuration.
-          PEER_IDENTITY_HOSTS: superserve-vmd-staging-2
+          # Require bootstrap only after this cell's operator-run migration.
+          PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_STAGING == 'true' && 'superserve-vmd-staging-2' || '' }}
           # Inbound ingress is a separate opt-in; outbound clients still need credentials.
           PEER_PROXY_LISTEN_ADDR: ${{ vars.PEER_PROXY_LISTEN_ADDR_STAGING }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
@@ -201,7 +202,8 @@ jobs:
           SHA: ${{ github.sha }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USW }}
-          PEER_IDENTITY_HOSTS: superserve-vmd-usw2-2
+          # Production opts in separately after its staging-proven migration.
+          PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_USW == 'true' && 'superserve-vmd-usw2-2' || '' }}
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
