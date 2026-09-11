@@ -182,6 +182,7 @@ type hostPool struct {
 	eviction           *time.Timer
 	evictionGeneration uint64
 	retiredConns       map[*peerConn]struct{}
+	dialMetrics        peerDialMetrics
 }
 
 const (
@@ -258,6 +259,49 @@ func (m *peerMetricDelta) flush(emit func(int)) {
 func (c *peerConn) queueStreamDelta(delta int) bool { return c.streamMetrics.queue(delta) }
 func (c *peerConn) flushStreamDelta(tele PeerPoolTelemetry) {
 	go c.streamMetrics.flush(tele.PeerStream)
+}
+
+// Dial observations are best effort: a stalled backend retains at most 64
+// pending observations per host and one emitter, without delaying callers.
+type peerDialMetric struct {
+	duration  time.Duration
+	result    string
+	reconnect bool
+}
+type peerDialMetrics struct {
+	mu       sync.Mutex
+	pending  []peerDialMetric
+	emitting bool
+}
+
+func (m *peerDialMetrics) record(tele PeerPoolTelemetry, event peerDialMetric) {
+	m.mu.Lock()
+	if len(m.pending) < 64 {
+		m.pending = append(m.pending, event)
+	}
+	start := !m.emitting
+	m.emitting = true
+	m.mu.Unlock()
+	if start {
+		go m.flush(tele)
+	}
+}
+func (m *peerDialMetrics) flush(tele PeerPoolTelemetry) {
+	for {
+		m.mu.Lock()
+		if len(m.pending) == 0 {
+			m.emitting = false
+			m.mu.Unlock()
+			return
+		}
+		event := m.pending[0]
+		m.pending = m.pending[1:]
+		m.mu.Unlock()
+		tele.PeerHandshake(event.duration, event.result)
+		if event.reconnect {
+			tele.PeerReconnect(event.result)
+		}
+	}
 }
 
 type pendingPeerOpen struct{ cancel context.CancelFunc }
@@ -493,11 +537,13 @@ retry:
 		// failed dial must not enter the reconnect/backoff path after the
 		// host has been closed, and a successful one must never be published.
 		if h.closed {
+			h.mu.Unlock()
+			h.dialMetrics.record(h.parent.cfg.Telemetry, peerDialMetric{duration: duration, result: result})
 			closeDialResult(client, closer)
+			h.mu.Lock()
 			close(dialDone)
 			h.dialDone = nil
 			h.mu.Unlock()
-			h.parent.cfg.Telemetry.PeerHandshake(duration, result)
 			return nil, errors.New("peer host closed")
 		}
 		// The endpoint may have been replaced while dialing was out of lock.
@@ -506,11 +552,11 @@ retry:
 		// retry backoff for the new endpoint.
 		stale := generation != h.endpointGeneration || addr != h.addr
 		if stale {
-			closeDialResult(client, closer)
 			close(dialDone)
 			h.dialDone = nil
 			h.mu.Unlock()
-			h.parent.cfg.Telemetry.PeerHandshake(duration, result)
+			h.dialMetrics.record(h.parent.cfg.Telemetry, peerDialMetric{duration: duration, result: result})
+			closeDialResult(client, closer)
 			continue
 		}
 		var published *peerConn
@@ -554,15 +600,11 @@ retry:
 		close(dialDone)
 		h.dialDone = nil
 		h.mu.Unlock()
-		h.parent.cfg.Telemetry.PeerHandshake(duration, result)
+		h.dialMetrics.record(h.parent.cfg.Telemetry, peerDialMetric{duration: duration, result: result, reconnect: e == nil || !peerCallerCanceled(e)})
 		if published != nil {
-			published.connectionMetrics.flush(h.parent.cfg.Telemetry.PeerConnection)
-			h.parent.cfg.Telemetry.PeerReconnect(telemetry.ResultSuccess)
+			go published.connectionMetrics.flush(h.parent.cfg.Telemetry.PeerConnection)
 		}
 		if e != nil {
-			if !peerCallerCanceled(e) {
-				h.parent.cfg.Telemetry.PeerReconnect(telemetry.ResultError)
-			}
 			h.evictIfEmpty()
 			return nil, e
 		}
@@ -767,7 +809,7 @@ func (h *hostPool) remove(target *peerConn) {
 	h.mu.Unlock()
 	target.close()
 	if emit {
-		target.connectionMetrics.flush(h.parent.cfg.Telemetry.PeerConnection)
+		go target.connectionMetrics.flush(h.parent.cfg.Telemetry.PeerConnection)
 	}
 	if !replacing {
 		h.evictIfEmpty()

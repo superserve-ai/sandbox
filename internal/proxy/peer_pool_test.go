@@ -839,6 +839,16 @@ func TestPeerPoolHandshakeOutcome(t *testing.T) {
 				_ = s.Close()
 			}
 			_ = p.Close()
+			waitPeerCondition(t, func() bool {
+				recorder.mu.Lock()
+				defer recorder.mu.Unlock()
+				for _, e := range recorder.events {
+					if e.Kind == "handshake" {
+						return true
+					}
+				}
+				return false
+			})
 			found := false
 			recorder.mu.Lock()
 			defer recorder.mu.Unlock()
@@ -1262,6 +1272,8 @@ func TestPeerPoolCountsRetiredConnectionsUntilDrainCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer replacement.Close()
+	waitPeerConnectionTelemetry(t, old)
+	waitPeerConnectionTelemetry(t, replacement)
 	if got := metrics.total.Load(); got != 2 {
 		t.Fatalf("overlapping connections = %d, want 2", got)
 	}
@@ -1269,6 +1281,7 @@ func TestPeerPoolCountsRetiredConnectionsUntilDrainCompletes(t *testing.T) {
 		t.Fatal("old connection closed before drain")
 	}
 	_ = old.Close()
+	waitPeerConnectionTelemetry(t, old)
 	if got := metrics.total.Load(); got != 1 {
 		t.Fatalf("connections after old drain = %d, want 1", got)
 	}
@@ -1277,6 +1290,7 @@ func TestPeerPoolCountsRetiredConnectionsUntilDrainCompletes(t *testing.T) {
 	}
 	_ = replacement.Close()
 	_ = p.Close()
+	waitPeerConnectionTelemetry(t, replacement)
 	if got := metrics.total.Load(); got != 0 {
 		t.Fatalf("connections after shutdown = %d, want 0", got)
 	}
@@ -1557,12 +1571,12 @@ type blockedDialTelemetry struct {
 	kind             string
 	started, release chan struct{}
 	total            atomic.Int32
+	blockOnce        sync.Once
 }
 
 func (t *blockedDialTelemetry) block(kind string) {
 	if kind == t.kind {
-		close(t.started)
-		<-t.release
+		t.blockOnce.Do(func() { close(t.started); <-t.release })
 	}
 }
 func (t *blockedDialTelemetry) PeerHandshake(time.Duration, string) { t.block("handshake") }
@@ -1578,7 +1592,7 @@ func (t *blockedDialTelemetry) PeerReconnect(result string) {
 	}
 }
 
-func TestPeerPoolDialTelemetryDoesNotHoldShutdownLocks(t *testing.T) {
+func TestPeerPoolDialTelemetryDoesNotBlockOpenOrShutdown(t *testing.T) {
 	for _, kind := range []string{"handshake", "connection", "reconnect"} {
 		t.Run(kind, func(t *testing.T) {
 			metrics := &blockedDialTelemetry{kind: kind, started: make(chan struct{}), release: make(chan struct{})}
@@ -1588,15 +1602,24 @@ func TestPeerPoolDialTelemetryDoesNotHoldShutdownLocks(t *testing.T) {
 			p := NewPeerTransport(PeerPoolConfig{Telemetry: metrics, DrainTimeout: 10 * time.Millisecond, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
 				return &testPeerClient{}, closer, nil
 			}})
-			opened := make(chan struct{})
+			opened := make(chan PeerStream, 1)
 			go func() {
 				s, _ := p.OpenStream(context.Background(), "host", "addr")
 				if s != nil {
 					_ = s.Close()
 				}
-				close(opened)
+				opened <- s
 			}()
 			<-metrics.started
+			var stream PeerStream
+			select {
+			case stream = <-opened:
+				if stream == nil {
+					t.Fatal("open failed")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("dial telemetry blocked opening request")
+			}
 			closed := make(chan struct{})
 			go func() { _ = p.Close(); close(closed) }()
 			select {
@@ -1608,7 +1631,7 @@ func TestPeerPoolDialTelemetryDoesNotHoldShutdownLocks(t *testing.T) {
 				t.Fatal("transport not closed")
 			}
 			once.Do(func() { close(metrics.release) })
-			<-opened
+			waitPeerConnectionTelemetry(t, stream)
 			if metrics.total.Load() != 0 {
 				t.Fatal("connection telemetry unbalanced")
 			}
@@ -1754,4 +1777,93 @@ func TestPeerPoolWatchesRetirementWithoutFailureSignal(t *testing.T) {
 	if _, err := old.Write([]byte("draining")); err != nil {
 		t.Fatal("retirement canceled established stream")
 	}
+}
+
+func waitPeerCondition(t *testing.T, done func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if done() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("condition did not complete")
+}
+func waitPeerConnectionTelemetry(t *testing.T, stream PeerStream) {
+	t.Helper()
+	metric := &stream.(*countedPeerStream).conn.connectionMetrics
+	waitPeerCondition(t, func() bool {
+		metric.mu.Lock()
+		defer metric.mu.Unlock()
+		return !metric.emitting
+	})
+}
+
+func TestPeerPoolStaleDialCloserDoesNotBlockReplacement(t *testing.T) {
+	started, closing, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	p := NewPeerTransport(PeerPoolConfig{Dial: func(ctx context.Context, _, addr string) (PeerClient, io.Closer, error) {
+		if addr == "old" {
+			close(started)
+			<-ctx.Done()
+			return &testPeerClient{}, callbackPeerCloser{close: func() { close(closing); <-release }}, nil
+		}
+		return &testPeerClient{}, &countingCloser{}, nil
+	}})
+	done := make(chan error, 2)
+	open := func(addr string) {
+		s, err := p.OpenStream(context.Background(), "host", addr)
+		if s != nil {
+			_ = s.Close()
+		}
+		done <- err
+	}
+	go open("old")
+	<-started
+	go open("new")
+	<-closing
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stale dial cleanup blocked replacement")
+	}
+	once.Do(func() { close(release) })
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("original opener did not complete")
+	}
+	_ = p.Close()
+}
+
+func TestPeerPoolDialTelemetryQueueIsBounded(t *testing.T) {
+	metrics := &blockedDialTelemetry{kind: "handshake", started: make(chan struct{}), release: make(chan struct{})}
+	var once sync.Once
+	defer once.Do(func() { close(metrics.release) })
+	var queue peerDialMetrics
+	queue.record(metrics, peerDialMetric{result: telemetry.ResultSuccess})
+	<-metrics.started
+	for i := 0; i < 1000; i++ {
+		queue.record(metrics, peerDialMetric{})
+	}
+	queue.mu.Lock()
+	pending := len(queue.pending)
+	queue.mu.Unlock()
+	if pending != 64 {
+		t.Fatalf("pending = %d, want 64", pending)
+	}
+	once.Do(func() { close(metrics.release) })
+	waitPeerCondition(t, func() bool {
+		queue.mu.Lock()
+		defer queue.mu.Unlock()
+		return !queue.emitting
+	})
 }
