@@ -40,7 +40,7 @@ if [ "${#SSDS[@]}" -eq 0 ]; then
 fi
 
 # A surviving array may already be assembled under an automatic name.
-MD=$(lsblk -no NAME,TYPE "${SSDS[0]}" | awk '$2 ~ /^raid/ {print "/dev/"$1; exit}')
+MD=$(lsblk -lnpo NAME,TYPE "${SSDS[0]}" | awk '$2 ~ /^raid/ {print $1; exit}')
 if [ -z "$MD" ]; then
   MD=/dev/md0
   if mdadm --examine "${SSDS[0]}" >/dev/null 2>&1; then
