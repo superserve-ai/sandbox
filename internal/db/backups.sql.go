@@ -108,13 +108,17 @@ func (q *Queries) LatestSnapshotManifest(ctx context.Context, sandboxID uuid.UUI
 }
 
 const lockSandboxRow = `-- name: LockSandboxRow :one
-SELECT id, status, updated_at FROM sandbox WHERE id = $1 FOR UPDATE
+SELECT id, status, updated_at, pause_op_id, pause_op_lease_until, pause_op_attention_at
+FROM sandbox WHERE id = $1 FOR UPDATE
 `
 
 type LockSandboxRowRow struct {
-	ID        uuid.UUID     `json:"id"`
-	Status    SandboxStatus `json:"status"`
-	UpdatedAt time.Time     `json:"updated_at"`
+	ID                 uuid.UUID          `json:"id"`
+	Status             SandboxStatus      `json:"status"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+	PauseOpID          pgtype.UUID        `json:"pause_op_id"`
+	PauseOpLeaseUntil  pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpAttentionAt pgtype.Timestamptz `json:"pause_op_attention_at"`
 }
 
 // Serializes the backup report's snapshot-size sync against FinalizePause,
@@ -122,11 +126,19 @@ type LockSandboxRowRow struct {
 // the duration of the transaction or the sync is skipped. Status rides
 // along because 'pausing' marks a finalize that has not committed yet:
 // a fast upload's report arriving in that window must retry rather than
-// silently miss its size sync.
+// silently miss its size sync. The pause operation columns say whether a
+// long transition is still being worked (see finalizeInFlight).
 func (q *Queries) LockSandboxRow(ctx context.Context, id uuid.UUID) (LockSandboxRowRow, error) {
 	row := q.db.QueryRow(ctx, lockSandboxRow, id)
 	var i LockSandboxRowRow
-	err := row.Scan(&i.ID, &i.Status, &i.UpdatedAt)
+	err := row.Scan(
+		&i.ID,
+		&i.Status,
+		&i.UpdatedAt,
+		&i.PauseOpID,
+		&i.PauseOpLeaseUntil,
+		&i.PauseOpAttentionAt,
+	)
 	return i, err
 }
 
