@@ -7,6 +7,13 @@ operation is part of this procedure. Do not allocate another VM or IP.
 
 ## Plan and migrate
 
+Terraform CD and the generic manual rollout workflows reject saved plans that
+change Host 2's Compute instance or managed identity adapter in either cell.
+This includes adapter-only changes, which can restart the VM independently.
+Routine applies can resume once both resources are no-ops. Perform this
+migration with an operator-applied saved plan after the checks below; a merge
+or generic rollout confirmation does not authorize Host 2 maintenance.
+
 1. Confirm the target owns no sandbox state and remains provisioning in the
    host directory. Remove its ready label and exclude it from concurrent CD
    and placement for the maintenance window. Keep peer routing disabled.
@@ -17,6 +24,9 @@ operation is part of this procedure. Do not allocate another VM or IP.
    addresses remain unchanged. `prevent_destroy` and ordinary hosts' default
    stop protection remain enabled. Any proposed VM replacement is a stop
    condition: this implementation uses supported in-place updates.
+   In the applicable root, run `terraform plan -out=host2-migration.tfplan`
+   and review that saved plan with `terraform show host2-migration.tfplan`.
+   For production, first require the completed staging rehearsal evidence.
 3. Apply the reviewed plan with a current Google Cloud SDK (tested command
    schema: 578.0.0), Python 3.10+, and authenticated Terraform credentials.
    The identity adapter invokes `gcloud` using **its active credential**, so
@@ -24,6 +34,9 @@ operation is part of this procedure. Do not allocate another VM or IP.
    provider-only impersonation is insufficient. That principal needs existing
    Compute/IAM deployment rights plus workload identity pool and CA admin
    permissions. Runtime accounts receive none of those admin roles.
+   Run `terraform apply host2-migration.tfplan` in that same root while the
+   maintenance window and discovery exclusion remain in effect. Do not bypass
+   the workflow guard or re-plan between review and apply.
 4. Export the public bootstrap artifact from that exact root:
 
    ```sh
