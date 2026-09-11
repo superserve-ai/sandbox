@@ -282,7 +282,7 @@ func TestGRPCPeerLargeWritePreservesByteStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(maxPeerFrameBytes), grpc.Creds(credentials.NewTLS(serverTLS)))
 	peerpb.RegisterPeerProxyServer(server, echoPeerServer{})
 	go server.Serve(listener)
 	defer server.Stop()

@@ -222,8 +222,8 @@ func (s *generatedPeerStream) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// Leave ample room for protobuf framing below gRPC's receive-message limit.
-const peerFrameDataLimit = 64 * 1024
+// Reserve room for the protobuf tag and length below the ingress message limit.
+const peerFrameDataLimit = maxPeerFrameBytes - 16
 
 func (s *generatedPeerStream) Write(p []byte) (int, error) {
 	written := 0
