@@ -323,6 +323,7 @@ func TestPeerPoolDrainForceClosesActiveStream(t *testing.T) {
 	if time.Since(started) > time.Second {
 		t.Fatal("drain exceeded bounded deadline")
 	}
+	waitPeerCondition(t, func() bool { return closer.closed.Load() == 1 })
 	if closer.closed.Load() != 1 {
 		t.Fatalf("transport close count = %d, want 1", closer.closed.Load())
 	}
@@ -630,6 +631,7 @@ func TestPeerPoolShutdownUsesOneDeadline(t *testing.T) {
 		t.Fatalf("shutdown took %v", elapsed)
 	}
 	for _, conn := range *conns {
+		waitPeerCondition(t, func() bool { return conn.closed.Load() == 1 })
 		if conn.closed.Load() != 1 {
 			t.Fatalf("connection closed %d times", conn.closed.Load())
 		}
@@ -1555,6 +1557,7 @@ func TestPeerPoolBlockedPublicationTelemetryDoesNotBlockShutdown(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("telemetry callback blocked shutdown locks")
 	}
+	waitPeerCondition(t, func() bool { return closer.closed.Load() == 1 })
 	if closer.closed.Load() != 1 {
 		t.Fatal("shutdown did not close transport")
 	}
@@ -1604,6 +1607,10 @@ func TestPeerPoolDialTelemetryDoesNotBlockOpenOrShutdown(t *testing.T) {
 			p := NewPeerTransport(PeerPoolConfig{Telemetry: metrics, DrainTimeout: 10 * time.Millisecond, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
 				return &testPeerClient{}, closer, nil
 			}})
+			if kind == "reconnect" {
+				pool := p.(*peerPool)
+				pool.hosts["host"] = &hostPool{parent: pool, host: "host", addr: "addr", failures: 1}
+			}
 			opened := make(chan PeerStream, 1)
 			go func() {
 				s, _ := p.OpenStream(context.Background(), "host", "addr")
@@ -1972,4 +1979,165 @@ func TestPeerPoolFailedOpenRetiresBeforeSlowClose(t *testing.T) {
 	}
 	once.Do(func() { close(release) })
 	_ = p.Close()
+}
+
+func TestPeerPoolReconnectObservationsExcludeOrdinaryDials(t *testing.T) {
+	recorder := &peerEventRecorder{}
+	var dials atomic.Int32
+	p := NewPeerTransport(PeerPoolConfig{Telemetry: RecorderPeerTelemetry{Recorder: recorder}, StreamsPerConnection: 1, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		if dials.Add(1) <= 2 {
+			return nil, nil, errors.New("offline")
+		}
+		return &testPeerClient{}, &countingCloser{}, nil
+	}}).(*peerPool)
+	defer p.Close()
+	for i := 0; i < 2; i++ {
+		if _, err := p.OpenStream(context.Background(), "host", "addr"); err == nil {
+			t.Fatal("dial succeeded")
+		}
+	}
+	first, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	cold, err := p.OpenStream(context.Background(), "other", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cold.Close()
+	other := cold.(*countedPeerStream).host
+	waitPeerCondition(t, func() bool {
+		other.observations.mu.Lock()
+		defer other.observations.mu.Unlock()
+		return !other.observations.emitting
+	})
+	h := first.(*countedPeerStream).host
+	waitPeerCondition(t, func() bool {
+		h.observations.mu.Lock()
+		defer h.observations.mu.Unlock()
+		return !h.observations.emitting
+	})
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	var results []string
+	for _, e := range recorder.events {
+		if e.Kind == "reconnect" {
+			results = append(results, e.Result)
+		}
+	}
+	if fmt.Sprint(results) != fmt.Sprint([]string{telemetry.ResultError, telemetry.ResultSuccess}) {
+		t.Fatalf("reconnects=%v", results)
+	}
+}
+
+func TestPeerPoolShutdownBoundsBlockedCloser(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	p := NewPeerTransport(PeerPoolConfig{DrainTimeout: 20 * time.Millisecond, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		return &testPeerClient{}, callbackPeerCloser{close: func() { close(started); <-release }}, nil
+	}})
+	s, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = s.Close()
+	done := make(chan struct{})
+	go func() { _ = p.Close(); close(done) }()
+	<-started
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown blocked on closer")
+	}
+}
+
+type failingIOPeer struct{ testPeerStream }
+
+func (*failingIOPeer) Read([]byte) (int, error)  { return 0, errors.New("transport failed") }
+func (*failingIOPeer) Write([]byte) (int, error) { return 0, errors.New("transport failed") }
+
+type fixedPeerClient struct{ stream PeerStream }
+
+func (c fixedPeerClient) OpenPeerStream(context.Context) (PeerStream, error) { return c.stream, nil }
+func TestPeerPoolEstablishedFailureReturnsBeforeCleanup(t *testing.T) {
+	for _, op := range []string{"read", "write"} {
+		t.Run(op, func(t *testing.T) {
+			started, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			defer once.Do(func() { close(release) })
+			p := NewPeerTransport(PeerPoolConfig{Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+				return fixedPeerClient{&failingIOPeer{}}, callbackPeerCloser{close: func() { close(started); <-release }}, nil
+			}})
+			s, err := p.OpenStream(context.Background(), "host", "addr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() {
+				var err error
+				if op == "read" {
+					_, err = s.Read(make([]byte, 1))
+				} else {
+					_, err = s.Write([]byte("x"))
+				}
+				done <- err
+			}()
+			<-started
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("missing error")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("stream operation blocked on cleanup")
+			}
+			cs := s.(*countedPeerStream)
+			cs.host.mu.Lock()
+			remaining := len(cs.host.conns)
+			cs.host.mu.Unlock()
+			if remaining != 0 {
+				t.Fatal("failed connection still selectable")
+			}
+			once.Do(func() { close(release) })
+			_ = p.Close()
+		})
+	}
+}
+func TestPeerPoolSaturatedBurstMakesProgress(t *testing.T) {
+	var dials atomic.Int32
+	p := NewPeerTransport(PeerPoolConfig{MaxConnections: 4, StreamsPerConnection: 8, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		dials.Add(1)
+		return &testPeerClient{}, &countingCloser{}, nil
+	}})
+	defer p.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := make(chan struct{})
+	done := make(chan error, 128)
+	for i := 0; i < 128; i++ {
+		go func() {
+			<-start
+			s, err := p.OpenStream(ctx, "host", "addr")
+			if err == nil {
+				time.Sleep(5 * time.Millisecond)
+				_ = s.Close()
+			}
+			done <- err
+		}()
+	}
+	close(start)
+	for i := 0; i < 128; i++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := dials.Load(); got < 1 || got > 4 {
+		t.Fatalf("dials=%d", got)
+	}
 }

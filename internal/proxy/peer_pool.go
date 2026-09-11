@@ -159,7 +159,14 @@ func (p *peerPool) Close() error {
 		drains.Add(1)
 		go func() { defer drains.Done(); h.close(deadline) }()
 	}
-	drains.Wait()
+	completed := make(chan struct{})
+	go func() { drains.Wait(); close(completed) }()
+	timer := time.NewTimer(max(time.Until(deadline), 0))
+	defer timer.Stop()
+	select {
+	case <-completed:
+	case <-timer.C:
+	}
 	return nil
 }
 
@@ -526,6 +533,7 @@ retry:
 		h.dialCancel = dialCancel
 		addr := h.addr
 		generation := h.endpointGeneration
+		recovering := h.failures > 0
 		h.mu.Unlock()
 		started := time.Now()
 		client, closer, e := h.parent.cfg.Dial(dialCtx, h.host, addr)
@@ -605,7 +613,7 @@ retry:
 		close(dialDone)
 		h.dialDone = nil
 		h.mu.Unlock()
-		h.observations.record(h.parent.cfg.Telemetry, peerObservation{duration: duration, result: result, reconnect: e == nil || !peerCallerCanceled(e)})
+		h.observations.record(h.parent.cfg.Telemetry, peerObservation{duration: duration, result: result, reconnect: recovering && !peerCallerCanceled(e)})
 		if published != nil {
 			go published.connectionMetrics.flush(h.parent.cfg.Telemetry.PeerConnection)
 		}
@@ -908,6 +916,8 @@ func (h *hostPool) releaseOpen(c *peerConn) {
 }
 
 func (h *hostPool) close(deadline time.Time) {
+	var cleanups sync.WaitGroup
+	defer cleanups.Wait()
 	h.mu.Lock()
 	h.closed = true
 	if h.dialCancel != nil {
@@ -952,8 +962,8 @@ func (h *hostPool) close(deadline time.Time) {
 		}
 		c.mu.Unlock()
 		if reclaim {
-			c.close()
-			h.remove(c)
+			cleanups.Add(1)
+			go func() { defer cleanups.Done(); c.close(); h.remove(c) }()
 			h.observations.record(h.parent.cfg.Telemetry, peerObservation{kind: "drain", forced: false})
 		}
 	}
@@ -996,8 +1006,8 @@ draining:
 		c.active = 0
 		c.removed = true
 		c.mu.Unlock()
-		c.close()
-		h.remove(c)
+		cleanups.Add(1)
+		go func() { defer cleanups.Done(); c.close(); h.remove(c) }()
 		if emit {
 			c.flushStreamDelta(h.parent.cfg.Telemetry)
 		}
@@ -1018,7 +1028,11 @@ func (s *countedPeerStream) Read(p []byte) (int, error) {
 	n, e := s.PeerStream.Read(p)
 	if e != nil {
 		if e != io.EOF && !peerRPCError(e) {
-			s.host.markFailed(s.conn)
+			if cleanup := s.host.detachFailed(s.conn); cleanup != nil {
+				go cleanup()
+			}
+			go s.Close()
+			return n, e
 		}
 		_ = s.Close()
 	}
@@ -1028,7 +1042,11 @@ func (s *countedPeerStream) Write(p []byte) (int, error) {
 	n, e := s.PeerStream.Write(p)
 	if e != nil {
 		if e != io.EOF && !peerRPCError(e) {
-			s.host.markFailed(s.conn)
+			if cleanup := s.host.detachFailed(s.conn); cleanup != nil {
+				go cleanup()
+			}
+			go s.Close()
+			return n, e
 		}
 		_ = s.Close()
 	}
