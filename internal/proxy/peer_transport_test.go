@@ -786,3 +786,31 @@ func TestGRPCPeerCachedCredentialsIsolateStalledRefresh(t *testing.T) {
 		_ = closer.Close()
 	}
 }
+
+func TestPeerHandshakeUsesCompletedCredentialRefresh(t *testing.T) {
+	cfg := peerTestCredentials(t)
+	_, addr := startPeerEchoServer(t, cfg, "127.0.0.1:0")
+	fresh, err := cfg.LoadClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := fresh.Clone()
+	stale.VerifyConnection = func(tls.ConnectionState) error { return errors.New("stale trust roots") }
+	var cache atomic.Pointer[tls.Config]
+	cache.Store(stale)
+	creds := (&refreshingPeerCredentials{TransportCredentials: credentials.NewTLS(stale), latest: cache.Load}).Clone()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// Rotation finishes after credentials were selected but before TLS starts.
+	cache.Store(fresh)
+	secured, _, err := creds.ClientHandshake(ctx, addr, conn)
+	if err != nil {
+		t.Fatalf("handshake used stale credential snapshot: %v", err)
+	}
+	_ = secured.Close()
+}
