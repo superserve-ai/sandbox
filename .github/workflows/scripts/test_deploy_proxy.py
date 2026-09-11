@@ -32,7 +32,7 @@ class DeployProxyOrderingTest(unittest.TestCase):
 
 
 class DeployProxyTests(unittest.TestCase):
-    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True):
+    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0):
         scripts = []
 
         def run(args, **kwargs):
@@ -62,7 +62,10 @@ class DeployProxyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as runner_dir, patch.dict(os.environ, env, clear=True), patch.object(
             MODULE.subprocess, "run", side_effect=run
         ), patch.object(MODULE.os.path, "expanduser", return_value=str(Path(runner_dir) / "google_compute_engine")):
-            self.assertEqual(MODULE.main(), 0)
+            self.assertEqual(MODULE.main(), expected_result)
+        if expected_result:
+            self.assertEqual(scripts, [])
+            return ""
         self.assertEqual(len(scripts), 1)
         self.assertIn("PEER_PROXY_TARGET_ADDR=127.0.0.1:5010\n", scripts[0])
         return scripts[0]
@@ -112,22 +115,24 @@ class DeployProxyTests(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, mode == "ready", result.stderr)
 
     def test_rollback_restores_listener_before_advertisement(self):
-        cases = [(addr, failure, "spiffe://example.test/peer") for addr, failure in (("192.0.2.2:5010", "proxy"),
-                                          ("192.0.2.2:5010", "superserve-vmd"),
+        cases = [(addr, failure, "spiffe://example.test/peer") for addr, failure in (("192.0.2.2:5009", "proxy"),
+                                          ("192.0.2.2:5009", "superserve-vmd"),
                                           ("", "proxy"),
-                                          ("192.0.2.2:5010", "tee"),
-                                          ("192.0.2.2:5010", "sed"),
-                                          ("192.0.2.2:5010", "chmod"),
-                                          ("192.0.2.2:5010", "tee-dropin"),
-                                          ("192.0.2.2:5010", "proxy-always"),
-                                          ("192.0.2.2:5010", "none"))]
+                                          ("192.0.2.2:5009", "tee"),
+                                          ("192.0.2.2:5009", "sed"),
+                                          ("192.0.2.2:5009", "chmod"),
+                                          ("192.0.2.2:5009", "tee-dropin"),
+                                          ("192.0.2.2:5009", "binary-install"),
+                                          ("192.0.2.2:5009", "unit-install"),
+                                          ("192.0.2.2:5009", "proxy-always"),
+                                          ("192.0.2.2:5009", "none"))]
         cases += [("", "none", "spiffe://example.test/peer"), ("", "none", ""), ("auto", "none", ""),
                   ("auto", "missing-identity", ""),
                   ("", "missing-cert", "spiffe://example.test/peer")]
         for peer_addr, failed_service, identity in cases:
             with self.subTest(peer_addr=peer_addr, failed_service=failed_service), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                old_env = "PEER_PROXY_LISTEN_ADDR=192.0.2.2:5009\n"
+                old_env = "PEER_PROXY_LISTEN_ADDR=192.0.2.3:5009\n"
                 old_credentials = "[Service]\nLoadCredential=old-cert:/etc/peer/old.pem\n"
                 files = {
                     "etc/sandbox/proxy.env": old_env,
@@ -136,14 +141,16 @@ class DeployProxyTests(unittest.TestCase):
                     "etc/superserve/peer/tls.crt": "test cert",
                     "etc/superserve/peer/tls.key": "test key",
                     "etc/superserve/peer/ca.crt": "test ca",
-                    "tmp/proxy-12345678": "binary",
+                    "tmp/proxy-12345678": "new binary",
+                    "bin/proxy": "old binary",
+                    "etc/systemd/system/proxy.service": "old unit",
                     "tmp/proxy.service": "unit",
                 }
                 for name, contents in files.items():
                     path = root / name
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(contents)
-                (root / "bin").mkdir()
+                (root / "bin").mkdir(exist_ok=True)
                 (root / "run/lock").mkdir(parents=True)
                 (root / "run/lock/vmd-peer-credentials.lock").touch()
                 check = root / "bin/refresh-peer-credentials"
@@ -165,7 +172,7 @@ class DeployProxyTests(unittest.TestCase):
                 sudo() {{
                     if [ ! -f "{root}/failed" ]; then
                         case "{failed_service}:$1:$2" in
-                            tee:tee:*/proxy.env|sed:sed:-i.bak|chmod:chmod:0600|tee-dropin:tee:*/peer-credentials.conf)
+                            tee:tee:*/proxy.env|sed:sed:-i.bak|chmod:chmod:0600|tee-dropin:tee:*/peer-credentials.conf|binary-install:mv:*/tmp/proxy-12345678|unit-install:mv:*/tmp/proxy.service)
                                 "$@"
                                 touch "{root}/failed"
                                 return 1
@@ -189,11 +196,20 @@ class DeployProxyTests(unittest.TestCase):
                             return 1
                         fi
                     fi
+                    if [ "$1" = restart ] && [ "$2" = proxy ]; then
+                        if grep -q 'new binary' "{root}/bin/proxy" && ! grep -q '^DATABASE_URL=' "{root}/etc/sandbox/proxy.env"; then
+                            echo 'new binary cannot start with old environment' >&2
+                            return 1
+                        fi
+                    fi
                     return 0
                 }}
                 journalctl() {{ :; }}
                 '''
                 result = subprocess.run(["bash"], input=functions + script, text=True, capture_output=True)
+                if failed_service != "none":
+                    self.assertEqual((root / "bin/proxy").read_text(), "old binary")
+                    self.assertEqual((root / "etc/systemd/system/proxy.service").read_text(), "old unit")
                 if failed_service == "none":
                     self.assertEqual(result.returncode, 0, result.stderr)
                     proxy_env = (root / "etc/sandbox/proxy.env").read_text()
@@ -234,7 +250,7 @@ class DeployProxyTests(unittest.TestCase):
                 self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_env)
                 self.assertEqual((root / "etc/systemd/system/proxy.service.d/peer-credentials.conf").read_text(), old_credentials)
                 restarts = (root / "restarts").read_text().splitlines()
-                if failed_service == "tee-dropin":
+                if failed_service in ("tee-dropin", "binary-install", "unit-install"):
                     self.assertEqual(restarts, ["proxy"])
                 elif failed_service == "proxy-always":
                     self.assertEqual(restarts, ["proxy", "proxy"])
@@ -244,10 +260,6 @@ class DeployProxyTests(unittest.TestCase):
                 else:
                     self.assertEqual(restarts[-2:], ["proxy", "superserve-vmd"])
                 self.assertEqual(list((root / "etc/sandbox").glob("proxy-rollback.*")), [])
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class CombinedCredentialContractTests(unittest.TestCase):
@@ -260,3 +272,15 @@ class CombinedCredentialContractTests(unittest.TestCase):
         self.assertIn("LoadCredential=peer-key:/etc/peer/key.pem", script)
         self.assertIn("peer_key_file=/run/credentials/proxy.service/peer-key", script)
         self.assertIn("PEER_PROXY_KEY_FILE=$peer_key_file", script)
+
+
+class PeerPortContractTests(unittest.TestCase):
+
+    def test_reject_non_routing_ports_before_deployment(self):
+        for endpoint in ("10.0.0.2:5008", "10.0.0.2:5010", "[fd00::2]:5011"):
+            with self.subTest(endpoint=endpoint):
+                DeployProxyTests().generate_script(endpoint, expected_result=1)
+
+
+if __name__ == "__main__":
+    unittest.main()

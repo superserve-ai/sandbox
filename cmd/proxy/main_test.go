@@ -242,6 +242,7 @@ func TestPeerListenerRejectsPublicAndRedirectPorts(t *testing.T) {
 		peer, public, redirect string
 		wantError              bool
 	}{
+		{"10.0.0.2:5010", ":5007", ":5008", true},
 		{"10.0.0.2:5008", ":5007", ":5008", true},
 		{"10.0.0.2:5007", ":5007", ":5008", true},
 		{"10.0.0.2:5009", ":5007", ":05009", true},
