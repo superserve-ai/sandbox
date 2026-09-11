@@ -64,7 +64,7 @@ func TestLoadConfigUsesHeartbeatOverrides(t *testing.T) {
 	if cfg.ProxyAdvertiseAddr != "10.0.0.2:5007" {
 		t.Fatalf("cfg.ProxyAdvertiseAddr = %q, want explicit override", cfg.ProxyAdvertiseAddr)
 	}
-	if cfg.PeerProxyListenAddr != "10.0.0.2:5008" {
+	if cfg.PeerProxyListenAddr != "10.0.0.2:5009" {
 		t.Fatalf("cfg.PeerProxyListenAddr = %q, want private peer endpoint", cfg.PeerProxyListenAddr)
 	}
 	if cfg.HostRegion != "region-explicit" {
