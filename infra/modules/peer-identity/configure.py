@@ -18,6 +18,17 @@ def inline_certificate_issuance_config(config):
     }
 
 
+def attestation_policy(config):
+    return {
+        "attestationRules": [{
+            "googleCloudResource": (
+                f"//compute.googleapis.com/projects/{config['project_number']}"
+                f"/uid/zones/{config['zone']}/instances/{config['instance_id']}"
+            )
+        }]
+    }
+
+
 def configure(config):
     def gcloud(*args):
         result = subprocess.run(
@@ -48,10 +59,7 @@ def configure(config):
         if not any(i["name"].endswith("/" + config["identity"]) for i in identities):
             gcloud(*pool, "managed-identities", "create", config["identity"], *scoped)
         policy = Path(tmp) / "attestation.json"
-        policy.write_text(json.dumps({"attestationRules": [{
-            "googleCloudResource": f"//compute.googleapis.com/projects/{config['project_number']}"
-            f"/zones/{config['zone']}/instances/{config['instance_id']}"
-        }]}))
+        policy.write_text(json.dumps(attestation_policy(config)))
         gcloud(*pool, "managed-identities", "set-attestation-rules", config["identity"],
                *scoped, f"--policy-file={policy}")
     principal = (f"principalSet://iam.googleapis.com/projects/{config['project_number']}/locations/global/"
