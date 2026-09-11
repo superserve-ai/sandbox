@@ -1135,6 +1135,7 @@ func TestPeerPoolLastCloseClaimsDrainBeforeDeadline(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("stream cleanup stuck")
 	}
+	waitPeerCondition(t, func() bool { return metrics.drains.Load() == 1 })
 	if got := metrics.drains.Load(); got != 1 {
 		t.Fatalf("drain events = %d, want 1", got)
 	}
@@ -1207,6 +1208,7 @@ func TestPeerPoolShutdownClosesTransportDuringClaimedCleanup(t *testing.T) {
 	if closed != 1 {
 		t.Fatalf("transport close count at shutdown return = %d, want 1", closed)
 	}
+	waitPeerCondition(t, func() bool { return metrics.drains.Load() == 1 })
 	if closer.closed.Load() != 1 || metrics.drains.Load() != 1 {
 		t.Fatal("cleanup was performed more than once")
 	}
@@ -1848,11 +1850,11 @@ func TestPeerPoolDialTelemetryQueueIsBounded(t *testing.T) {
 	metrics := &blockedDialTelemetry{kind: "handshake", started: make(chan struct{}), release: make(chan struct{})}
 	var once sync.Once
 	defer once.Do(func() { close(metrics.release) })
-	var queue peerDialMetrics
-	queue.record(metrics, peerDialMetric{result: telemetry.ResultSuccess})
+	var queue peerObservations
+	queue.record(metrics, peerObservation{result: telemetry.ResultSuccess})
 	<-metrics.started
 	for i := 0; i < 1000; i++ {
-		queue.record(metrics, peerDialMetric{})
+		queue.record(metrics, peerObservation{})
 	}
 	queue.mu.Lock()
 	pending := len(queue.pending)
@@ -1866,4 +1868,108 @@ func TestPeerPoolDialTelemetryQueueIsBounded(t *testing.T) {
 		defer queue.mu.Unlock()
 		return !queue.emitting
 	})
+}
+
+type blockedDrainTelemetry struct {
+	noopPeerTelemetry
+	started, release chan struct{}
+}
+
+func (t *blockedDrainTelemetry) PeerDrain(bool) { close(t.started); <-t.release }
+
+func TestPeerPoolBlockedDrainTelemetryDoesNotBlockShutdown(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		t.Run(map[bool]string{false: "idle", true: "active"}[active], func(t *testing.T) {
+			metrics := &blockedDrainTelemetry{started: make(chan struct{}), release: make(chan struct{})}
+			defer close(metrics.release)
+			closer := &countingCloser{}
+			p := NewPeerTransport(PeerPoolConfig{Telemetry: metrics, DrainTimeout: 10 * time.Millisecond, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+				return &testPeerClient{}, closer, nil
+			}})
+			s, err := p.OpenStream(context.Background(), "host", "addr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !active {
+				_ = s.Close()
+			}
+			done := make(chan struct{})
+			go func() { _ = p.Close(); close(done) }()
+			select {
+			case <-metrics.started:
+			case <-time.After(time.Second):
+				t.Fatal("drain callback did not start")
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("drain telemetry blocked shutdown")
+			}
+			if closer.closed.Load() != 1 {
+				t.Fatal("transport was not closed exactly once")
+			}
+			_ = s.Close()
+		})
+	}
+}
+
+type failedOpenPeerClient struct{ calls atomic.Int32 }
+
+func (c *failedOpenPeerClient) OpenPeerStream(context.Context) (PeerStream, error) {
+	c.calls.Add(1)
+	return nil, errors.New("transport failed")
+}
+func TestPeerPoolFailedOpenRetiresBeforeSlowClose(t *testing.T) {
+	closing, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	defer once.Do(func() { close(release) })
+	client := &failedOpenPeerClient{}
+	var dials atomic.Int32
+	p := NewPeerTransport(PeerPoolConfig{MaxConnections: 1, Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		if dials.Add(1) == 1 {
+			return client, callbackPeerCloser{close: func() { close(closing); <-release }}, nil
+		}
+		return &testPeerClient{}, &countingCloser{}, nil
+	}})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	opened := make(chan error, 1)
+	go func() {
+		s, err := p.OpenStream(ctx, "host", "addr")
+		if s != nil {
+			_ = s.Close()
+		}
+		opened <- err
+	}()
+	<-closing
+	cancel()
+	select {
+	case err := <-opened:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("open returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed transport cleanup blocked cancellation")
+	}
+	replacement := make(chan error, 1)
+	go func() {
+		s, err := p.OpenStream(context.Background(), "host", "addr")
+		if s != nil {
+			_ = s.Close()
+		}
+		replacement <- err
+	}()
+	select {
+	case err := <-replacement:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed transport cleanup blocked replacement")
+	}
+	if client.calls.Load() != 1 {
+		t.Fatal("failed connection was reused")
+	}
+	once.Do(func() { close(release) })
+	_ = p.Close()
 }
