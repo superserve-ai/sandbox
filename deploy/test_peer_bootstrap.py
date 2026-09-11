@@ -112,7 +112,7 @@ class ManagedIdentityTest(unittest.TestCase):
             CONFIGURE.configure(config)
         self.assertFalse(any('create' in args for args in calls))
         self.assertEqual(policies, [{'attestationRules': [{'googleCloudResource':
-            '//compute.googleapis.com/projects/123456789012/uid/zones/us-west2-a/instances/1234567890'}]}] * 2)
+            '//compute.googleapis.com/projects/123456789012/zones/us-west2-a/instances/1234567890'}]}] * 2)
         bindings = [c for c in calls if c[1:4] == ['privateca', 'pools', 'add-iam-policy-binding']]
         self.assertEqual(bindings, [
             ['gcloud', 'privateca', 'pools', 'add-iam-policy-binding',
