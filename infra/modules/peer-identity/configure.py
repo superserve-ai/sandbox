@@ -25,10 +25,10 @@ def configure(config):
         raise RuntimeError("peer pool must be an active TRUST_DOMAIN")
     with tempfile.TemporaryDirectory() as tmp:
         issuance = Path(tmp) / "issuance.json"
-        issuance.write_text(json.dumps({"inlineCertificateIssuanceConfig": {
+        issuance.write_text(json.dumps({
             "caPools": {config["region"]: config["ca_pool"]},
             "keyAlgorithm": "ECDSA_P256", "lifetime": "86400s", "rotationWindowPercentage": 50,
-        }}))
+        }))
         gcloud(*pool, "update", config["pool_id"], *location,
                f"--inline-certificate-issuance-config-file={issuance}")
         scoped = [*location, f"--workload-identity-pool={config['pool_id']}"]
