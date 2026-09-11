@@ -32,7 +32,7 @@ class DeployProxyOrderingTest(unittest.TestCase):
 
 
 class DeployProxyTests(unittest.TestCase):
-    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0):
+    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0, database_url="postgres://postgres:postgres@localhost/sandbox_test"):
         scripts = []
 
         def run(args, **kwargs):
@@ -50,7 +50,7 @@ class DeployProxyTests(unittest.TestCase):
         env = {
             "GCP_PROJECT": "example-project",
             "SHA": "12345678",
-            "DATABASE_URL": "postgres://postgres:postgres@localhost/sandbox_test",
+            "DATABASE_URL": database_url,
             "PROXY_DOMAIN": "sandbox.example.test",
             "PEER_PROXY_LISTEN_ADDR": peer_addr,
             "PEER_IDENTITY_HOSTS": "example-host" if required_identity else "",
@@ -269,7 +269,7 @@ class CombinedCredentialContractTests(unittest.TestCase):
 
     def test_client_only_deploy_mounts_runtime_credentials(self):
         script = DeployProxyTests().generate_script("")
-        self.assertIn("LoadCredential=peer-key:/etc/peer/key.pem", script)
+        self.assertIn("LoadCredential=peer-key:/etc/superserve/peer/tls.key", script)
         self.assertIn("peer_key_file=/run/credentials/proxy.service/peer-key", script)
         self.assertIn("PEER_PROXY_KEY_FILE=$peer_key_file", script)
 
@@ -280,6 +280,23 @@ class PeerPortContractTests(unittest.TestCase):
         for endpoint in ("10.0.0.2:5008", "10.0.0.2:5010", "[fd00::2]:5011"):
             with self.subTest(endpoint=endpoint):
                 DeployProxyTests().generate_script(endpoint, expected_result=1)
+
+
+class DatabaseEnvironmentTests(unittest.TestCase):
+    def test_database_url_is_literal_shell_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "substitution-ran"
+            passwords = ["p$PASSWORD", f"p$(touch {marker})", f"p`touch {marker}`", "p'quoted"]
+            for password in passwords:
+                with self.subTest(password=password):
+                    url = f"postgres://user:{password}@db.example.test/database"
+                    script = DeployProxyTests().generate_script("", database_url=url)
+                    command = next(line for line in script.splitlines() if "DATABASE_URL=" in line)
+                    command = command.split(" | sudo tee", 1)[0]
+                    result = subprocess.run(["bash", "-c", command], text=True, capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, f'DATABASE_URL="{url}"\n')
+                    self.assertFalse(marker.exists(), "password executed a shell substitution")
 
 
 if __name__ == "__main__":

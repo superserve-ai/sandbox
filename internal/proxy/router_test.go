@@ -110,6 +110,7 @@ func TestRoutingHandlerPinsFailedStreamAndLooksUpNextRequest(t *testing.T) {
 	var lookups, opens atomic.Int32
 	var stream *lifecyclePeerStream
 	var selected SandboxRoute
+	var peerFailures atomic.Int32
 	h := NewRoutingHandler([]string{"sandbox.test"}, "host-a",
 		RouteLookupFunc(func(_ context.Context, id string) (SandboxRoute, error) {
 			lookups.Add(1)
@@ -121,7 +122,11 @@ func TestRoutingHandlerPinsFailedStreamAndLooksUpNextRequest(t *testing.T) {
 			opens.Add(1)
 			selected = SandboxRoute{HostID: hostID, ProxyAddr: addr}
 			return stream, nil
-		}), http.NotFoundHandler(), zerolog.Nop())
+		}), http.NotFoundHandler(), zerolog.Nop(), routingOutcomeRecorderFunc(func(_ context.Context, outcome telemetry.RoutingOutcome) {
+			if outcome.Outcome == "peer_error" {
+				peerFailures.Add(1)
+			}
+		}))
 
 	for i, wantOwner := range []SandboxRoute{oldOwner, newOwner} {
 		client, server := net.Pipe()
@@ -167,6 +172,9 @@ func TestRoutingHandlerPinsFailedStreamAndLooksUpNextRequest(t *testing.T) {
 		case <-done:
 		case <-time.After(3 * time.Second):
 			t.Fatal("handler did not terminate after established stream failure")
+		}
+		if peerFailures.Load() != int32(i+1) {
+			t.Fatalf("response stream failure was not recorded: %d", peerFailures.Load())
 		}
 		if lookups.Load() != int32(i+1) || opens.Load() != int32(i+1) {
 			t.Fatalf("request %d: lookups=%d opens=%d; stream was retried or lookup was cached", i, lookups.Load(), opens.Load())

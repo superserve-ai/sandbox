@@ -136,6 +136,7 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 		case <-done:
 		}
 	}()
+	var responseErr error
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -154,10 +155,10 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 	}()
 	go func() {
 		defer wg.Done()
-		_, _ = io.Copy(conn, stream)
+		_, responseErr = io.Copy(conn, stream)
 		closeBoth()
 	}()
 	wg.Wait()
 	closeBoth()
-	return nil
+	return responseErr
 }
