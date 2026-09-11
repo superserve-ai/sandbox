@@ -98,6 +98,12 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 SELECT * FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 
+-- name: GetSandboxRoute :one
+SELECT s.host_id, h.vmd_addr
+FROM sandbox s
+JOIN host h ON h.id = s.host_id
+WHERE s.id = $1 AND s.destroyed_at IS NULL;
+
 -- name: CountActiveSandboxesAtBasePath :one
 -- Count of non-destroyed sandboxes still referencing this base_path. Used at
 -- destroy time to decide whether the per-build artifact dir is safe to GC.

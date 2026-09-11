@@ -50,7 +50,7 @@ func TestLoadConfigUsesHeartbeatOverrides(t *testing.T) {
 	t.Setenv("HOST_ID", "host-a")
 	t.Setenv("VMD_ADVERTISE_ADDR", "10.0.0.2:50051")
 	t.Setenv("PROXY_ADVERTISE_ADDR", "10.0.0.2:5007")
-	t.Setenv("PEER_PROXY_LISTEN_ADDR", "10.0.0.2:5008")
+	t.Setenv("PEER_PROXY_LISTEN_ADDR", "10.0.0.2:5009")
 	t.Setenv("HOST_REGION", "region-explicit")
 	t.Setenv("SANDBOX_ID_REGION", "region-fallback")
 
@@ -64,7 +64,7 @@ func TestLoadConfigUsesHeartbeatOverrides(t *testing.T) {
 	if cfg.ProxyAdvertiseAddr != "10.0.0.2:5007" {
 		t.Fatalf("cfg.ProxyAdvertiseAddr = %q, want explicit override", cfg.ProxyAdvertiseAddr)
 	}
-	if cfg.PeerProxyListenAddr != "10.0.0.2:5008" {
+	if cfg.PeerProxyListenAddr != "10.0.0.2:5009" {
 		t.Fatalf("cfg.PeerProxyListenAddr = %q, want private peer endpoint", cfg.PeerProxyListenAddr)
 	}
 	if cfg.HostRegion != "region-explicit" {
@@ -109,7 +109,7 @@ func TestHeartbeatProxyAdvertiseOverrideUsesPeerEndpoint(t *testing.T) {
 	t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
 	t.Setenv("HOST_ID", "host-a")
 	t.Setenv("PROXY_ADVERTISE_ADDR", "10.0.0.2:5007")
-	t.Setenv("PEER_PROXY_LISTEN_ADDR", "10.0.0.2:5008")
+	t.Setenv("PEER_PROXY_LISTEN_ADDR", "10.0.0.2:5009")
 	cfg, err := loadConfig()
 	if err != nil {
 		t.Fatalf("loadConfig() error: %v", err)
@@ -125,7 +125,7 @@ func TestHeartbeatProxyAdvertiseOverrideUsesPeerEndpoint(t *testing.T) {
 
 func TestAdvertisedHeartbeatProxyAddrValidatesPeerEndpoint(t *testing.T) {
 	for _, peer := range []string{
-		"10.0.0.2:0", "203.0.113.2:5009", "0.0.0.0:5009",
+		"10.0.0.2:0", "10.0.0.2:5010", "10.0.0.2:5008", "203.0.113.2:5009", "0.0.0.0:5009",
 		"127.0.0.1:5009", "[::]:5009", "[::1]:5009",
 		"[fe80::1]:5009", "peer.example:5009", "10.0.0.2", "10.0.0.2:65536",
 	} {

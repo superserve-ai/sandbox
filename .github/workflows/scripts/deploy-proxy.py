@@ -17,8 +17,11 @@ Env vars:
   PROXY_DOMAINS              optional — comma-separated host suffixes; overrides
                              PROXY_DOMAIN on the proxy when set (DNS transitions)
   SANDBOX_ACCESS_TOKEN_SEED  optional — hex, >=32 bytes (>=64 hex chars)
+  DATABASE_URL               required when routing is enabled — shared Postgres connection
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
+  PEER_PROXY_TARGET_ADDR     optional — loopback address for peer ingress
+  PEER_PROXY_SPIFFE_URI      required — authorized peer certificate URI
   SENTRY_DSN                 optional — Sentry DSN URL for error reporting
   PEER_IDENTITY_HOSTS        optional — comma-separated hosts requiring identity bootstrap
   PEER_PROXY_LISTEN_ADDR     optional — private mTLS listener (auto or private IP:port)
@@ -28,6 +31,7 @@ Env vars:
 
 import os
 import re
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -65,6 +69,15 @@ def main() -> int:
     if access_seed and not re.fullmatch(r"[0-9a-fA-F]{64,}", access_seed):
         print("ERROR: SANDBOX_ACCESS_TOKEN_SEED must be hex-encoded, >= 32 bytes (64 hex chars)", file=sys.stderr)
         return 1
+    peer_routing = os.environ.get("PEER_ROUTING_ENABLED", "") or "0"
+    if peer_routing not in ("0", "1"):
+        print("ERROR: PEER_ROUTING_ENABLED must be 0 or 1", file=sys.stderr)
+        return 1
+    database_url = os.environ.get("DATABASE_URL", "")
+    if peer_routing == "1" and not database_url:
+        print("ERROR: DATABASE_URL is required for cross-host routing", file=sys.stderr)
+        return 1
+    database_env_line = 'DATABASE_URL="' + database_url.replace('\\', '\\\\').replace('"', '\\"') + '"'
     terminal_origins = os.environ.get("PROXY_ALLOWED_ORIGINS", "")
     if terminal_origins and not re.fullmatch(r"[A-Za-z0-9.,:/*\-]+", terminal_origins):
         print("ERROR: PROXY_ALLOWED_ORIGINS contains disallowed characters", file=sys.stderr)
@@ -90,6 +103,10 @@ def main() -> int:
         ("PEER_PROXY_CA_FILE", "/etc/superserve/peer/ca.crt"),
     ):
         peer_env[key] = default
+    peer_listen = peer_env["PEER_PROXY_LISTEN_ADDR"]
+    if peer_listen not in ("", "auto") and not peer_listen.endswith(":5009"):
+        print("ERROR: PEER_PROXY_LISTEN_ADDR must use port 5009", file=sys.stderr)
+        return 1
     peer_max_streams = os.environ.get("PEER_PROXY_MAX_STREAMS", "") or "128"
     if not peer_max_streams.isascii() or not peer_max_streams.isdecimal() or not 1 <= int(peer_max_streams) <= 2147483647:
         print("ERROR: PEER_PROXY_MAX_STREAMS must be a positive 32-bit integer", file=sys.stderr)
@@ -153,6 +170,7 @@ def main() -> int:
 
     def deploy(inst):
         name, zone = inst["name"], inst["zone"]
+        host_region = zone.rsplit("/", 1)[-1].rsplit("-", 1)[0]
         tag = f"{name}/{zone}"
 
         for src, dst in [
@@ -188,16 +206,9 @@ def main() -> int:
                 exit 1
             fi
 
-            sudo mv /tmp/proxy-{sha} {install_dir}/proxy
-            sudo chmod +x {install_dir}/proxy
-
-            sudo mv /tmp/proxy.service /etc/systemd/system/proxy.service
-            sudo systemctl daemon-reload
-            sudo systemctl enable proxy
-
             sudo mkdir -p /etc/sandbox
             rollback_dir=$(sudo mktemp -d /etc/sandbox/proxy-rollback.XXXXXX)
-            for config in /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
+            for config in {install_dir}/proxy /etc/systemd/system/proxy.service /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
                 if sudo test -f "$config"; then
                     sudo cp -p "$config" "$rollback_dir/$(basename "$config")"
                 fi
@@ -225,18 +236,22 @@ def main() -> int:
                 return 1
             }}
             rollback_peer_advertisement() {{
-                # Restore the listener configuration before restoring what VMD
-                # advertises. The failed deployment may already have restarted
-                # the proxy with a different port or credential drop-in.
-                for config in /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
+                # Restore the executable, unit, and configuration together before
+                # restoring the advertised endpoint. The old environment may not
+                # satisfy the new binary's startup requirements.
+                for config in {install_dir}/proxy /etc/systemd/system/proxy.service /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
                     if sudo test -f "$rollback_dir/$(basename "$config")"; then
-                        sudo cp -p "$rollback_dir/$(basename "$config")" "$config" || return 1
+                        # Rename avoids overwriting a running executable in place.
+                        sudo cp -p "$rollback_dir/$(basename "$config")" "$config.restore-{sha}" || return 1
+                        sudo mv "$config.restore-{sha}" "$config" || return 1
                     else
                         sudo rm -f "$config" || return 1
                     fi
                 done
                 sudo systemctl daemon-reload || return 1
-                if ! sudo systemctl restart proxy || ! sudo systemctl is-active --quiet proxy; then
+                if ! sudo test -f "$rollback_dir/proxy" || ! sudo test -f "$rollback_dir/proxy.service"; then
+                    sudo systemctl stop proxy || return 1
+                elif ! sudo systemctl restart proxy || ! sudo systemctl is-active --quiet proxy; then
                     echo "ERROR: proxy restart failed during rollback" >&2
                     sudo journalctl -u proxy --no-pager -n 40 >&2 || true
                     return 1
@@ -299,7 +314,13 @@ def main() -> int:
                 CREDENTIALS
             fi
 
+            deployment_mutated=1
+            sudo mv /tmp/proxy-{sha} {install_dir}/proxy
+            sudo chmod +x {install_dir}/proxy
+
+            sudo mv /tmp/proxy.service /etc/systemd/system/proxy.service
             sudo systemctl daemon-reload
+            sudo systemctl enable proxy
 
             peer_cert_file={peer_env['PEER_PROXY_CERT_FILE']!r}
             peer_key_file={peer_env['PEER_PROXY_KEY_FILE']!r}
@@ -318,11 +339,6 @@ def main() -> int:
                     # Keep peer ingress on its own private port so the two binds
                     # cannot collide when the staging shortcut is enabled.
                     peer_listen_addr="$peer_ip:5009"
-                elif [[ "$peer_listen_addr" == *:5008 ]]; then
-                    # Explicit addresses must obey the same reservation as auto;
-                    # otherwise a private-IP override still collides with the
-                    # wildcard redirect listener on 5008.
-                    peer_listen_addr="${{peer_listen_addr%:5008}}:5009"
                 fi
                 # vmd owns host.proxy_addr advertisement. Keep its environment in
                 # lockstep with the proxy listener so the heartbeat publishes the
@@ -379,7 +395,9 @@ def main() -> int:
             PEER_PROXY_CA_FILE=$peer_ca_file
             PEER_PROXY_SPIFFE_URI=$peer_identity
             PEER_PROXY_MAX_STREAMS={peer_max_streams}
-            HOST_ID=${{host_id:-{name}}}{otel_env_lines}
+            PEER_ROUTING_ENABLED={peer_routing}
+            HOST_ID=${{host_id:-{name}}}
+            HOST_REGION={host_region}{otel_env_lines}
             PROXYENV
             if [ -z "$peer_identity" ]; then
                 sudo sed -i '/^PEER_PROXY_/d' /etc/sandbox/proxy.env
@@ -387,6 +405,7 @@ def main() -> int:
                     sudo awk '/^PEER_PROXY_/' "$rollback_dir/proxy.env" | sudo tee -a /etc/sandbox/proxy.env > /dev/null
                 fi
             fi
+            printf '%s\\n' {shlex.quote(database_env_line)} | sudo tee -a /etc/sandbox/proxy.env > /dev/null
             sudo chmod 0600 /etc/sandbox/proxy.env
 
             if ! sudo systemctl restart proxy; then

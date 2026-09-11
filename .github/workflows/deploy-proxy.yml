@@ -1,3 +1,9 @@
+# Two-phase rollout: leave the environment variable PEER_ROUTING_ENABLED unset
+# while deploying ingress to every owner in every reachable region. Enable it
+# with value 1 only after all ingress deployments and readiness checks succeed.
+# On partial failure keep routing disabled and complete the ingress rollout.
+# Before removing ingress or rolling back to an older binary, disable routing
+# across the fleet first. Never enable routing in the initial ingress deployment.
 # Deploy Proxy — edge proxy on the VMD hosts.
 #
 # Production NEVER deploys without staging first. Same pattern as Deploy API /
@@ -33,6 +39,7 @@ on:
       - 'cmd/proxy/**'
       - 'internal/analytics/**'
       - 'internal/auth/**'
+      - 'internal/db/**'
       - 'internal/preview/**'
       - 'internal/proxy/**'
       - 'internal/sentrylog/**'
@@ -87,6 +94,7 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_STAGING }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_STAGING }}
           # Enables the proxy's OTLP exporter (host-local collector) so the
@@ -104,6 +112,7 @@ jobs:
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
         run: |
           python3 .github/workflows/scripts/deploy-proxy.py
@@ -155,14 +164,17 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          PEER_PROXY_LISTEN_ADDR: auto
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
@@ -201,15 +213,18 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_USWEST }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USW }}
           # Production opts in separately after its staging-proven migration.
           PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_USW == 'true' && 'superserve-vmd-usw2-2' || '' }}
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          PEER_PROXY_LISTEN_ADDR: auto
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |

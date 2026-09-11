@@ -2317,3 +2317,72 @@ func TestPeerPoolForcedDrainClosesCustomStreams(t *testing.T) {
 		})
 	}
 }
+
+func TestPeerPoolEvictsIdleHostsAndPreservesActiveStreams(t *testing.T) {
+	dial, dials, conns := testDialer()
+	p := NewPeerTransport(PeerPoolConfig{Dial: dial, IdleTimeout: 20 * time.Millisecond}).(*peerPool)
+	defer p.Close()
+	active, err := p.OpenStream(context.Background(), "active", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	for i := 0; i < 5; i++ {
+		s, err := p.OpenStream(context.Background(), fmt.Sprint(i), "addr")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Close()
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		p.mu.Lock()
+		count := len(p.hosts)
+		p.mu.Unlock()
+		closed := 0
+		for _, c := range (*conns)[1:] {
+			closed += int(c.closed.Load())
+		}
+		if count == 1 && closed == 5 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("idle hosts retained: hosts=%d closed=%d", count, closed)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := active.Write([]byte("still active")); err != nil {
+		t.Fatal(err)
+	}
+	s, err := p.OpenStream(context.Background(), "0", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if dials.Load() != 7 {
+		t.Fatalf("expected fresh dial after eviction, got %d", dials.Load())
+	}
+}
+
+func TestPeerPoolReuseCancelsIdleEviction(t *testing.T) {
+	dial, dials, conns := testDialer()
+	p := NewPeerTransport(PeerPoolConfig{Dial: dial, IdleTimeout: 50 * time.Millisecond})
+	defer p.Close()
+	s, err := p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = p.OpenStream(context.Background(), "host", "addr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	time.Sleep(100 * time.Millisecond)
+	if dials.Load() != 1 || (*conns)[0].closed.Load() != 0 {
+		t.Fatal("reuse did not cancel idle eviction")
+	}
+	if _, err := s.Write([]byte("still active")); err != nil {
+		t.Fatal(err)
+	}
+}

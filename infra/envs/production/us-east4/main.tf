@@ -88,6 +88,17 @@ module "network" {
   vpc_connector_subnet_ip     = var.connector_subnet_cidr
 
   firewall_rules = {
+    allow_peer_ingress = {
+      name        = "superserve-use4-allow-peer-ingress"
+      direction   = "INGRESS"
+      source_tags = ["vmd-use4", "vmd-usw2"]
+      target_tags = ["vmd-use4"]
+      allow = [{
+        protocol = "tcp"
+        ports    = ["5009"]
+      }]
+      description = "Allow private mTLS forwarding between production VMD hosts."
+    }
     allow_vmd_grpc = {
       name          = "superserve-use4-allow-cr-vmd"
       direction     = "INGRESS"

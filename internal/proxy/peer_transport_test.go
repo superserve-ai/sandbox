@@ -78,7 +78,7 @@ func TestGRPCPeerURIAuthenticationAndStreamClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(maxPeerFrameBytes), grpc.Creds(credentials.NewTLS(serverTLS)))
 	handler := &waitingPeerServer{halfClosed: make(chan struct{}), canceled: make(chan struct{})}
 	peerpb.RegisterPeerProxyServer(server, handler)
 	go server.Serve(listener)
@@ -176,7 +176,7 @@ func TestPeerPoolClosingStreamDoesNotFailSibling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(maxPeerFrameBytes), grpc.Creds(credentials.NewTLS(serverTLS)))
 	peerpb.RegisterPeerProxyServer(server, echoPeerServer{})
 	go server.Serve(listener)
 	defer server.Stop()
@@ -233,7 +233,7 @@ func TestPeerPoolRPCRejectionDoesNotFailSibling(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			server := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+			server := grpc.NewServer(grpc.MaxRecvMsgSize(maxPeerFrameBytes), grpc.Creds(credentials.NewTLS(serverTLS)))
 			peerpb.RegisterPeerProxyServer(server, echoPeerServer{})
 			go server.Serve(listener)
 			defer server.Stop()
@@ -387,7 +387,7 @@ func startPeerEchoServer(t *testing.T, cfg PeerTLSConfig, addr string) (*grpc.Se
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := grpc.NewServer(grpc.Creds(credentials.NewTLS(serverTLS)))
+	server := grpc.NewServer(grpc.MaxRecvMsgSize(maxPeerFrameBytes), grpc.Creds(credentials.NewTLS(serverTLS)))
 	peerpb.RegisterPeerProxyServer(server, echoPeerServer{})
 	go server.Serve(listener)
 	t.Cleanup(server.Stop)

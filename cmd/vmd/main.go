@@ -277,8 +277,8 @@ func advertisedProxyAddr(hostIP func() (string, error), proxyHealthURL, explicit
 
 func advertisedHeartbeatProxyAddr(hostIP func() (string, error), proxyHealthURL, configured, peerListen string) (string, error) {
 	if peerListen != "" {
-		if !proxy.PrivateBind(peerListen) {
-			return "", fmt.Errorf("peer proxy listener %q must be a concrete private IP address with a nonzero port", peerListen)
+		if err := proxy.ValidatePeerEndpoint(peerListen); err != nil {
+			return "", err
 		}
 		return peerListen, nil
 	}

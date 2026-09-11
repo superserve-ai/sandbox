@@ -79,6 +79,8 @@ type OTelRecorder struct {
 	resumeSettleWaitDuration metric.Float64Histogram
 	resumeSettleWaitReads    metric.Int64Histogram
 	vmdCalls                 metric.Int64Counter
+	routingOutcomes          metric.Int64Counter
+	ownershipLookupDuration  metric.Float64Histogram
 	vmdDuration              metric.Float64Histogram
 	hostResolutionDuration   metric.Float64Histogram
 	capacityShadowDuration   metric.Float64Histogram
@@ -170,6 +172,12 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.vmdCalls, err = meter.Int64Counter("vmd_call_total"); err != nil {
+		return nil, err
+	}
+	if r.ownershipLookupDuration, err = meter.Float64Histogram("proxy_ownership_lookup_duration_seconds", metric.WithUnit("s"), metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.routingOutcomes, err = meter.Int64Counter("proxy_routing_outcome_total"); err != nil {
 		return nil, err
 	}
 	if r.hostResolutionDuration, err = meter.Float64Histogram("host_resolution_duration_seconds",
@@ -372,6 +380,16 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	if c.Duration > 0 {
 		r.vmdDuration.Record(ctx, c.Duration.Seconds(), opt)
 	}
+}
+
+func (r *OTelRecorder) RecordRoutingOutcome(ctx context.Context, o RoutingOutcome) {
+	if r == nil {
+		return
+	}
+	r.routingOutcomes.Add(ctx, 1, metric.WithAttributes(r.attrs(
+		attribute.String("outcome", safeRoutingOutcome(o.Outcome)),
+		attribute.String("host_id", safeHostID(o.HostID)),
+	)...))
 }
 
 // normalizeShadowResult and normalizeShadowAgreement keep metric labels
@@ -663,6 +681,15 @@ func safeResult(v string) string {
 	}
 }
 
+func safeRoutingOutcome(v string) string {
+	switch v {
+	case "local", "remote", "ownership_error", "peer_error":
+		return v
+	default:
+		return "ownership_error"
+	}
+}
+
 func safeSettleResult(v string) string {
 	switch v {
 	case SettleResultSettled, SettleResultTimeout:
@@ -804,4 +831,17 @@ func buildOTelResource(cfg OTelConfig) (*resource.Resource, error) {
 			attribute.String("service.instance.id", cfg.InstanceID),
 		),
 	)
+}
+
+func (r *OTelRecorder) RecordOwnershipLookup(ctx context.Context, lookup OwnershipLookup) {
+	if r == nil {
+		return
+	}
+	result := lookup.Result
+	switch result {
+	case "success", "error", "timeout", "canceled":
+	default:
+		result = "error"
+	}
+	r.ownershipLookupDuration.Record(ctx, lookup.Duration.Seconds(), metric.WithAttributes(r.attrs(attribute.String("result", result), attribute.String("host_id", r.hostID))...))
 }

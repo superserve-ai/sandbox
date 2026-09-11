@@ -1788,6 +1788,25 @@ func (q *Queries) GetSandboxPreviewPolicy(ctx context.Context, arg GetSandboxPre
 	return i, err
 }
 
+const getSandboxRoute = `-- name: GetSandboxRoute :one
+SELECT s.host_id, h.vmd_addr
+FROM sandbox s
+JOIN host h ON h.id = s.host_id
+WHERE s.id = $1 AND s.destroyed_at IS NULL
+`
+
+type GetSandboxRouteRow struct {
+	HostID  string `json:"host_id"`
+	VmdAddr string `json:"vmd_addr"`
+}
+
+func (q *Queries) GetSandboxRoute(ctx context.Context, id uuid.UUID) (GetSandboxRouteRow, error) {
+	row := q.db.QueryRow(ctx, getSandboxRoute, id)
+	var i GetSandboxRouteRow
+	err := row.Scan(&i.HostID, &i.VmdAddr)
+	return i, err
+}
+
 const getSandboxStatusForPreviewMutation = `-- name: GetSandboxStatusForPreviewMutation :one
 SELECT status FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
