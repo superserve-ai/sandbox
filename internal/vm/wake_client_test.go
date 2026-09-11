@@ -154,3 +154,30 @@ func TestFreezeRequestKeepsAPositiveGuestBudget(t *testing.T) {
 		t.Fatalf("guest budget %dms, want positive and below the caller's 100ms", seen)
 	}
 }
+
+// The wait's bound holds even when a guest accepts the connection and never
+// answers: each request is cut off by the wait's deadline, not only by the
+// per-request client timeout.
+func TestWaitForGuestWakeHonoursAShortTimeoutAgainstAHungGuest(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(boxdPort))
+	if err != nil {
+		t.Skipf("port %d busy: %v", boxdPort, err)
+	}
+	release := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release // never answers within the test's budget
+	}))
+	srv.Listener = ln
+	srv.Start()
+	defer func() { close(release); srv.Close() }()
+
+	start := time.Now()
+	err = waitForGuestWake(context.Background(), "127.0.0.1", 300*time.Millisecond, false, "tok")
+	took := time.Since(start)
+	if err == nil {
+		t.Fatal("want an error from a guest that never answers")
+	}
+	if took > time.Second {
+		t.Fatalf("took %v against a 300ms bound; a hung request must not carry the wait past it", took)
+	}
+}

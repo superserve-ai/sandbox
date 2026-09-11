@@ -276,6 +276,12 @@ func waitForGuestWake(ctx context.Context, vmIP string, timeout time.Duration, c
 		Token       string `json:"token"`
 	}{clockFrozen, token})
 	deadline := time.Now().Add(timeout)
+	// Every request is bounded by the wait's own deadline as well as the
+	// caller's context, so a guest that accepts the connection and never
+	// answers cannot carry the wait past its advertised bound; the client
+	// timeout caps a single request within a longer wait.
+	ctx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
 	client := &http.Client{
 		Timeout:   2 * time.Second,
 		Transport: &http.Transport{DisableKeepAlives: true},
