@@ -4890,3 +4890,39 @@ func TestResumeSandbox_ClaimsWithoutReadingTheRow(t *testing.T) {
 		t.Fatalf("row reads before the boot = %d, want none; the claim returns the row", rowReads)
 	}
 }
+
+// A create whose template lookup fails still records its lookup phase, so a
+// slow failed lookup stays visible in the phase series.
+func TestCreateSandbox_TemplateLookupFailureRecordsLookupPhase(t *testing.T) {
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
+	teamID := uuid.New()
+
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			if strings.Contains(sql, "FROM template") {
+				return notFoundRow()
+			}
+			return activityRow()
+		},
+		queryFn: func(context.Context, string, ...any) (pgx.Rows, error) { return emptyRows{}, nil },
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Scheduler: &stubScheduler{hostID: "host-1"}}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"orphan","from_template":"missing/template"}`))
+	h.WaitAsyncBookkeeping()
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404: %s", w.Code, w.Body.String())
+	}
+	for _, p := range rec.phases {
+		if p.Op == "create" && p.Phase == "lookup" {
+			return
+		}
+	}
+	t.Fatalf("no create lookup phase recorded for a failed template lookup; got %+v", rec.phases)
+}

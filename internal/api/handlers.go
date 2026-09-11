@@ -2418,9 +2418,13 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		meta     []SecretBindingMeta
 		err      *AppError
 	}
+	// The context is taken here, not in the goroutine: gin recycles c once
+	// the handler returns, and a template failure can return before the
+	// goroutine has even started.
+	secretsCtx := c.Request.Context()
 	secretsCh := make(chan resolvedSecrets, 1)
 	go func() {
-		bindings, meta, appErr := h.resolveSecretBindingsForCreate(c.Request.Context(), teamID, req.Secrets)
+		bindings, meta, appErr := h.resolveSecretBindingsForCreate(secretsCtx, teamID, req.Secrets)
 		secretsCh <- resolvedSecrets{bindings, meta, appErr}
 	}()
 
@@ -2446,6 +2450,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var fromTemplateName, fromTemplateID string
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
+		// Stamped before the error check so a failed lookup still lands in
+		// the phase series; a successful one is re-stamped after the join.
+		tLookupDone = time.Now()
 		if err != nil {
 			return // error already responded
 		}
