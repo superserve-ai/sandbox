@@ -39,6 +39,11 @@ on:
         required: false
         type: boolean
         default: false
+      template:
+        description: 'Optional single template filename, e.g. superserve-openclaw.json'
+        required: false
+        type: string
+        default: ''
   push:
     branches: [main]
     paths:
@@ -199,7 +204,15 @@ jobs:
 
       - name: Seed production
         run: |
-          go run ./cmd/seed-templates --dir superserve_templates \
+          SEED_DIR="superserve_templates"
+
+          if [ -n "${TEMPLATE}" ]; then
+            mkdir -p /tmp/single-template
+            cp "superserve_templates/${TEMPLATE}" /tmp/single-template/
+            SEED_DIR="/tmp/single-template"
+          fi
+
+          go run ./cmd/seed-templates --dir "${SEED_DIR}" \
             $( [ "${FORCE_REBUILD}" = "true" ] && echo "--force-rebuild" || true )
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL_PROD }}
