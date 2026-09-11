@@ -94,11 +94,12 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.log.Debug().Str("route", "remote").Str("route_outcome", "remote").Str("host_id", route.HostID).Msg("sandbox routed to peer")
 	defer stream.Close()
-	h.record(r.Context(), "remote", route.HostID)
 	if err := bridgeRequest(w, r, stream); err != nil {
 		h.record(r.Context(), "peer_error", route.HostID)
 		h.log.Warn().Str("route_outcome", "peer_stream_error").Err(err).Msg("peer stream failed")
+		return
 	}
+	h.record(r.Context(), "remote", route.HostID)
 }
 
 func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) error {

@@ -110,17 +110,16 @@ module "network" {
 
   firewall_rules = {
     peer_ingress = {
-      name          = "superserve-usw2-allow-peer-ingress"
-      direction     = "INGRESS"
-      source_ranges = ["10.1.0.2/32", "10.1.0.3/32"]
-      target_tags   = ["vmd-usw2"]
+      name        = "superserve-usw2-allow-peer-ingress"
+      direction   = "INGRESS"
+      source_tags = ["vmd-use4", "vmd-usw2"]
+      target_tags = ["vmd-usw2"]
       allow = [{
         protocol = "tcp"
         ports    = ["5009"]
       }]
-      description = "Allow private VMD peer ingress within the cell."
+      description = "Allow private mTLS forwarding between production VMD hosts."
     }
-
     allow_vmd_grpc = {
       name          = "superserve-usw2-allow-cr-vmd"
       direction     = "INGRESS"
