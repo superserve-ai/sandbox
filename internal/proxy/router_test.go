@@ -568,3 +568,30 @@ func TestBridgeAcceptedTunnelReadTermination(t *testing.T) {
 		})
 	}
 }
+
+func TestBridgeRequestEmptyPeerResponseReturns502(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	peer, remote := net.Pipe()
+	defer remote.Close()
+	req := httptest.NewRequest(http.MethodGet, "http://sandbox.test/", nil)
+	done := make(chan error, 1)
+	go func() { done <- bridgeRequest(hijackWriter{conn: server}, req, pipePeer{peer}) }()
+	go func() {
+		_, _ = http.ReadRequest(bufio.NewReader(remote))
+		remote.Close()
+	}()
+	client.SetDeadline(time.Now().Add(3 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(client), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusBadGateway || string(body) != "sandbox forwarding unavailable\n" {
+		t.Fatalf("status=%d body=%q err=%v", resp.StatusCode, body, err)
+	}
+	if err := <-done; !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("bridge error=%v", err)
+	}
+}
