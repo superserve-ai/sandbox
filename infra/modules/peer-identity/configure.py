@@ -7,6 +7,17 @@ import tempfile
 from pathlib import Path
 
 
+def inline_certificate_issuance_config(config):
+    return {
+        "inlineCertificateIssuanceConfig": {
+            "caPools": {config["region"]: config["ca_pool"]},
+            "keyAlgorithm": "ECDSA_P256",
+            "lifetime": "86400s",
+            "rotationWindowPercentage": 50,
+        }
+    }
+
+
 def configure(config):
     def gcloud(*args):
         result = subprocess.run(
@@ -25,10 +36,7 @@ def configure(config):
         raise RuntimeError("peer pool must be an active TRUST_DOMAIN")
     with tempfile.TemporaryDirectory() as tmp:
         issuance = Path(tmp) / "issuance.json"
-        issuance.write_text(json.dumps({
-            "caPools": {config["region"]: config["ca_pool"]},
-            "keyAlgorithm": "ECDSA_P256", "lifetime": "86400s", "rotationWindowPercentage": 50,
-        }))
+        issuance.write_text(json.dumps(inline_certificate_issuance_config(config)))
         gcloud(*pool, "update", config["pool_id"], *location,
                f"--inline-certificate-issuance-config-file={issuance}")
         scoped = [*location, f"--workload-identity-pool={config['pool_id']}"]
