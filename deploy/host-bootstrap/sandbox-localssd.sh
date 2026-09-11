@@ -14,9 +14,13 @@
 set -euo pipefail
 
 BOOT_DEV=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)")
+# Persistent disks get an alias named after their attachment; local SSDs on
+# some images get a google-local-* alias of their own, which must not count.
 declare -A ATTACHED=()
 for link in /dev/disk/by-id/google-*; do
-  [ -e "$link" ] && ATTACHED["$(readlink -f "$link")"]=1
+  [ -e "$link" ] || continue
+  case "$(basename "$link")" in google-local-*) continue ;; esac
+  ATTACHED["$(readlink -f "$link")"]=1
 done
 SSDS=()
 while read -r dev model; do
