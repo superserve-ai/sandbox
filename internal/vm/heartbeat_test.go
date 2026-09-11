@@ -3,12 +3,15 @@ package vm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -487,4 +490,77 @@ func TestSendHeartbeatAdvertisesCapacityPressureWhenPublishing(t *testing.T) {
 	if slices.Contains(unaddressed, capabilityCapacityPressure) {
 		t.Fatalf("capabilities = %v; without an advertised address nothing is published", unaddressed)
 	}
+}
+
+func TestHeartbeatLogsEndpointAcknowledgementOnceAfterAcceptance(t *testing.T) {
+	for _, complete := range []bool{false, true} {
+		t.Run(fmt.Sprintf("complete=%t", complete), func(t *testing.T) {
+			var attempts atomic.Int32
+			third := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/health" {
+					_, _ = w.Write([]byte(`{"capabilities":[]}`))
+					return
+				}
+				n := attempts.Add(1)
+				if n == 1 {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				if n == 3 {
+					close(third)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+			writer := &heartbeatReceiptWriter{attempts: &attempts, events: make(chan heartbeatReceiptEvent, 64)}
+			cfg := HeartbeatConfig{ControlPlaneURL: server.URL, ProxyHealthURL: server.URL + "/health", HostID: "host-a", RunDir: t.TempDir(), Interval: 10 * time.Millisecond}
+			if complete {
+				cfg.VMDAddr, cfg.ProxyAddr, cfg.Region = "192.0.2.1:50051", "192.0.2.1:5009", "test-region"
+				cfg.CapacityMemoryMib, cfg.CapacityVcpus = 1024, 1
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() { StartHeartbeat(ctx, cfg, zerolog.New(writer)); close(done) }()
+			select {
+			case <-third:
+			case <-time.After(3 * time.Second):
+				t.Fatal("heartbeats did not retry")
+			}
+			cancel()
+			<-done
+			count := 0
+			for len(writer.events) > 0 {
+				event := <-writer.events
+				if strings.Contains(event.line, "host endpoint heartbeat accepted") {
+					count++
+					if event.attempt < 2 || !strings.Contains(event.line, cfg.ProxyAddr) {
+						t.Fatalf("invalid acknowledgement: %+v", event)
+					}
+				}
+			}
+			want := 0
+			if complete {
+				want = 1
+			}
+			if count != want {
+				t.Fatalf("acknowledgements = %d, want %d", count, want)
+			}
+		})
+	}
+}
+
+type heartbeatReceiptEvent struct {
+	line    string
+	attempt int32
+}
+type heartbeatReceiptWriter struct {
+	attempts *atomic.Int32
+	events   chan heartbeatReceiptEvent
+}
+
+func (w *heartbeatReceiptWriter) Write(p []byte) (int, error) {
+	w.events <- heartbeatReceiptEvent{line: string(p), attempt: w.attempts.Load()}
+	return len(p), nil
 }

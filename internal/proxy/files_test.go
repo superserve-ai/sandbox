@@ -77,7 +77,7 @@ func newFilesTestEnv(t *testing.T) *filesTestEnv {
 		domain:    "sandbox.test",
 	}
 
-	env.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		bodyBytes, _ := io.ReadAll(r.Body)
 		env.upstreamMu.Lock()
 		env.lastReq = capturedRequest{
@@ -95,7 +95,15 @@ func newFilesTestEnv(t *testing.T) *filesTestEnv {
 
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
-	}))
+	})
+	// Keep the harness usable in sandboxes where IPv6 loopback binds are
+	// restricted; production behavior is unaffected.
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback listener unavailable: %v", err)
+	}
+	env.upstream = &httptest.Server{Listener: ln, Config: &http.Server{Handler: h}}
+	env.upstream.Start()
 	t.Cleanup(env.upstream.Close)
 
 	upURL, _ := url.Parse(env.upstream.URL)

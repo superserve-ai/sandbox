@@ -947,6 +947,24 @@ func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (UpdateHos
 	return i, err
 }
 
+const updateHostProxyAddress = `-- name: UpdateHostProxyAddress :exec
+UPDATE host
+SET proxy_addr = $2, updated_at = now()
+WHERE id = $1
+`
+
+type UpdateHostProxyAddressParams struct {
+	ID        string `json:"id"`
+	ProxyAddr string `json:"proxy_addr"`
+}
+
+// Endpoint advertisement changes for the current holder must not alter
+// lifecycle status; unlike address reclamation, this is not re-provisioning.
+func (q *Queries) UpdateHostProxyAddress(ctx context.Context, arg UpdateHostProxyAddressParams) error {
+	_, err := q.db.Exec(ctx, updateHostProxyAddress, arg.ID, arg.ProxyAddr)
+	return err
+}
+
 const updateHostStatus = `-- name: UpdateHostStatus :one
 UPDATE host
 SET status = $2, updated_at = now()

@@ -40,6 +40,10 @@ locals {
   })
 
   staging_otlp_endpoint = "http://10.0.0.2:4318"
+
+  # Admit only the two staging VMD host addresses to the dedicated peer
+  # listener. Keep these selectors peer-only as additional hosts are added.
+  staging_peer_source_ranges = ["10.0.0.2/32", "10.0.0.3/32"]
 }
 
 module "network" {
@@ -70,7 +74,20 @@ module "network" {
           ports    = ["5007", "5008", "50051"]
         }
       ]
-      description = "Allow private sandbox control traffic only."
+      description = "Allow private sandbox control and HTTP redirect traffic."
+    }
+    peer_ingress = {
+      name          = "superserve-allow-staging-peer-ingress"
+      direction     = "INGRESS"
+      source_ranges = local.staging_peer_source_ranges
+      target_tags   = ["superserve-vmd"]
+      allow = [
+        {
+          protocol = "tcp"
+          ports    = ["5009"]
+        }
+      ]
+      description = "Allow staging VMD peers to reach the private peer proxy ingress."
     }
     api_to_host_otel = {
       name          = "superserve-staging-api-to-host-otel"
