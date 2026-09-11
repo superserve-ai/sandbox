@@ -508,3 +508,32 @@ func TestPrimeWakeProtocolFloor(t *testing.T) {
 	})
 
 }
+
+// A manifest that cannot be read may have described a frozen image, so its
+// removal is made durable like a frozen one's: where the directory cannot be
+// synced, the removal is reported as failed rather than as done.
+func TestRemovingAnUnreadableManifestIsDurable(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("needs a directory the process cannot open for sync; root can")
+	}
+	dir := t.TempDir()
+	isolateEvidence(t, dir)
+	raiseFloorForTest(t)
+	imgDir := filepath.Join(dir, "img")
+	if err := os.MkdirAll(imgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mem := filepath.Join(imgDir, "mem.snap")
+	if err := os.WriteFile(WallClockMarkerPath(mem), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Writable and searchable but not readable: the unlink succeeds, the
+	// directory sync cannot open it.
+	if err := os.Chmod(imgDir, 0o333); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(imgDir, 0o755) })
+	if _, err := removeWallClockManifest(mem); err == nil {
+		t.Fatal("removing an unreadable manifest without a durable sync must not report success")
+	}
+}
