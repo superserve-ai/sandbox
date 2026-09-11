@@ -15,6 +15,7 @@ import (
 type PeerPoolConfig struct {
 	MaxConnections, StreamsPerConnection int
 	DrainTimeout                         time.Duration
+	IdleTimeout                          time.Duration
 	Dial                                 PeerDialer
 	Telemetry                            PeerPoolTelemetry
 }
@@ -88,6 +89,9 @@ func NewPeerTransport(cfg PeerPoolConfig) PeerTransport {
 	if cfg.DrainTimeout <= 0 {
 		cfg.DrainTimeout = 30 * time.Second
 	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = 5 * time.Minute
+	}
 	if cfg.Telemetry == nil {
 		cfg.Telemetry = noopPeerTelemetry{}
 	}
@@ -114,6 +118,10 @@ func (p *peerPool) OpenStream(ctx context.Context, host, addr string) (PeerStrea
 	// comparison under that lock as replacement mutates it while holding h.mu.
 	h.mu.Lock()
 	h.openers++
+	if h.idleEviction != nil {
+		h.idleEviction.Stop()
+		h.idleEviction = nil
+	}
 	endpointChanged := h.addr != addr
 	h.mu.Unlock()
 	if endpointChanged {
@@ -188,6 +196,7 @@ type hostPool struct {
 	openers            int
 	eviction           *time.Timer
 	evictionGeneration uint64
+	idleEviction       *time.Timer
 	retiredConns       map[*peerConn]struct{}
 	observations       peerObservations
 }
@@ -676,8 +685,16 @@ func (h *hostPool) evictIfEmpty() {
 	defer h.parent.mu.Unlock()
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if h.closed || h.replacing || h.openers != 0 || len(h.conns) != 0 || h.retired != 0 || h.dialing {
+	if h.closed || h.replacing || h.openers != 0 || h.retired != 0 || h.dialing {
 		return
+	}
+	if len(h.conns) != 0 {
+		h.scheduleIdleEvictionLocked()
+		return
+	}
+	if h.idleEviction != nil {
+		h.idleEviction.Stop()
+		h.idleEviction = nil
 	}
 	// Retain failed-host retry state for a bounded idle period. Active callers
 	// pin the entry so eviction cannot orphan an in-flight open.
@@ -706,6 +723,47 @@ func (h *hostPool) evictIdle(generation uint64) {
 	if h.openers == 0 && !h.dialing && len(h.conns) == 0 && h.retired == 0 && h.parent.hosts[h.host] == h {
 		delete(h.parent.hosts, h.host)
 	}
+}
+
+// Caller holds parent.mu and h.mu. The timer is invalidated by every new opener.
+func (h *hostPool) scheduleIdleEvictionLocked() {
+	for _, c := range h.conns {
+		c.mu.Lock()
+		active := c.active
+		c.mu.Unlock()
+		if active != 0 {
+			return
+		}
+	}
+	if h.idleEviction != nil {
+		return
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(h.parent.cfg.IdleTimeout, func() {
+		h.parent.mu.Lock()
+		h.mu.Lock()
+		if h.idleEviction != timer || h.closed || h.openers != 0 || h.dialing || h.replacing || h.retired != 0 {
+			h.mu.Unlock()
+			h.parent.mu.Unlock()
+			return
+		}
+		h.idleEviction = nil
+		h.closed = true
+		if h.eviction != nil {
+			h.eviction.Stop()
+		}
+		conns := append([]*peerConn(nil), h.conns...)
+		h.notifyLocked()
+		if h.parent.hosts[h.host] == h {
+			delete(h.parent.hosts, h.host)
+		}
+		h.mu.Unlock()
+		h.parent.mu.Unlock()
+		for _, c := range conns {
+			h.remove(c)
+		}
+	})
+	h.idleEviction = timer
 }
 
 func min(a, b int) int {
@@ -946,6 +1004,10 @@ func (h *hostPool) close(deadline time.Time) {
 	if h.eviction != nil {
 		h.eviction.Stop()
 	}
+	if h.idleEviction != nil {
+		h.idleEviction.Stop()
+		h.idleEviction = nil
+	}
 	h.mu.Unlock()
 	// A stream may have claimed removal but still be finishing callbacks.
 	// Shutdown must close its transport even while that cleanup is pending.
@@ -1087,6 +1149,7 @@ func (s *countedPeerStream) Close() error {
 		}
 		s.conn.mu.Unlock()
 		s.host.notify()
+		defer s.host.evictIfEmpty()
 		if emit {
 			s.conn.flushStreamDelta(s.tele)
 		}
