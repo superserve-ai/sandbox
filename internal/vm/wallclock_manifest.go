@@ -346,7 +346,8 @@ func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger
 	done := make(chan struct{})
 	// Only a host that may act on frozen images watches: with the switch off
 	// this does no filesystem work. A frozen template must not reach such a
-	// host, which is enforced where templates are admitted.
+	// host; that is owed by the paths that admit templates, before the first
+	// frozen image is ever produced, and is not enforced here.
 	if m.cfg.SnapshotDir == "" || !m.cfg.GuestClockFreezeEnabled {
 		close(done)
 		return done
