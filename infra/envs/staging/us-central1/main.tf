@@ -382,8 +382,8 @@ module "sandbox_host" {
 }
 
 # Second vmd host for the staging cell. Same image and shape as the first so
-# the two are interchangeable, and labeled component=vmd from creation so
-# every deploy that discovers hosts by label reaches both.
+# the two are interchangeable. Keep Host 2 excluded from deployment discovery
+# through identity migration and bootstrap verification; enroll it separately.
 #
 # The host self-registers as provisioning and stays invisible to placement
 # until an operator activates it, so creating it changes nothing for the cell
@@ -403,7 +403,7 @@ module "sandbox_host_b" {
   tags        = ["superserve-vmd"]
 
   labels = merge(local.sandbox_host_labels, {
-    component    = "vmd"
+    component    = "vmd-staging-standby"
     sandbox_role = "vmd"
   })
 

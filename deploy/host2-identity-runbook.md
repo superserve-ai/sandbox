@@ -27,13 +27,19 @@ bootstrap fails closed on subsequent deployments.
 1. Confirm the target owns no sandbox state and remains provisioning in the
    host directory. Remove `sandbox_status=ready` and remove or change
    `component=vmd` on Host 2: routine VMD and proxy workflows use the latter
-   selector even when the ready label is absent. Wait for any deployments
+   selector even when the ready label is absent. Staging Terraform declares
+   `component=vmd-staging-standby` for Host 2; use that same value for the
+   pre-migration exclusion. Production must retain `active_sandbox_host=primary`,
+   which declares Host 2 as `component=vmd-usw2-standby`. If production already
+   selects `standby`, stop: this cold-standby migration does not authorize
+   switching the serving host. Wait for any deployments
    that already discovered Host 2 to finish before migration. Keep both
    selectors excluded and placement disabled for the maintenance window;
    keep peer routing disabled.
 2. Review sanitized plans for the applicable root. Expect only Host 2's
-   service account/stop opt-in, its dedicated runtime IAM, the new cell CA
-   and managed identity adapter, and us-west2's shared peer firewall rule.
+   service account/stop opt-in and standby label, its dedicated runtime IAM,
+   the new cell CA and managed identity adapter, and us-west2's shared peer
+   firewall rule.
    Host 1 must have no action. Existing VM, disk and private IP resource
    addresses remain unchanged. `prevent_destroy` and ordinary hosts' default
    stop protection remain enabled. Any proposed VM replacement is a stop
@@ -236,7 +242,11 @@ rotation restarts only the proxy to load the new material, retrying failed
 reloads. It never restarts VMD or enters a sandbox startup/resume path.
 
 After staging Host 2 passes readiness and host-directory checks, use the
-normal rollout to admit it and drain Host 1. Only after the old host is drained
+normal rollout to admit it and drain Host 1. As part of that separate admission,
+change staging `module.sandbox_host_b.labels.component` to `vmd` in Terraform
+and review/apply the label plan through the operator path above before restoring
+the ready label. Do not enroll it with an out-of-band component label change
+that the next Terraform apply would undo. Only after the old host is drained
 may its separate migration occur. Once both hosts are peer-capable, the
 routing rollout may enable ingress/routing and verify bidirectional traffic,
 pause/resume and restore across hosts. Record that evidence before applying
