@@ -99,22 +99,31 @@ systemctl start --no-block sandbox-data.service
 
 # Guest kernel and base rootfs are not shipped by the deploy pipeline; the
 # deploy injects boxd into the rootfs, so it must exist before the first
-# deploy. Fetched with the instance's own identity.
+# deploy. Fetched with the instance's own identity, retrying because the
+# read grant is created alongside the instance and takes time to propagate.
 fetch() {
-  local token
-  token=$(curl -sf -H 'Metadata-Flavor: Google' \
-    http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
-    | python3 -c 'import json, sys; print(json.load(sys.stdin)["access_token"])')
-  curl -sfL -H "Authorization: Bearer $token" \
-    "https://storage.googleapis.com/${artifact_bucket}/hostprep/$1" -o "$2.part"
-  mv "$2.part" "$2"
+  local token attempt
+  for attempt in $(seq 1 40); do
+    token=$(curl -sf -H 'Metadata-Flavor: Google' \
+      http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin)["access_token"])') || token=""
+    if [ -n "$token" ] && curl -sfL -H "Authorization: Bearer $token" \
+        "https://storage.googleapis.com/${artifact_bucket}/hostprep/$1" -o "$2.part"; then
+      mv "$2.part" "$2"
+      return 0
+    fi
+    echo "fetch $1 failed (attempt $attempt); retrying" >&2
+    sleep 15
+  done
+  echo "giving up fetching $1" >&2
+  return 1
 }
 [ -s /var/lib/sandbox/kernel/${kernel_object} ] || fetch ${kernel_object} /var/lib/sandbox/kernel/${kernel_object}
 [ -s /var/lib/sandbox/rootfs/base.ext4 ] || fetch ${rootfs_object} /var/lib/sandbox/rootfs/base.ext4
 
 # vmd.env: written once, only when absent, so an operator's later edits and
-# the deploy's upserts are never overwritten. Mode 644: the deploy reads
-# BASE_ROOTFS_PATH from it without privileges.
+# the deploy's upserts are never overwritten. Root-only from the start, since
+# secrets are appended to this same file later.
 if [ ! -f /etc/sandbox/vmd.env ]; then
   NAME=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/name)
   HOST_IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
@@ -132,7 +141,7 @@ VMD_STATE_PATH=/var/lib/sandbox/vmd.db
 ${key}=${value}
 %{ endfor ~}
 ENV
-  chmod 0644 /etc/sandbox/vmd.env
+  chmod 0600 /etc/sandbox/vmd.env
 fi
 
 touch /var/lib/sandbox/.host-bootstrapped

@@ -462,6 +462,10 @@ module "sandbox_host" {
   # object storage. Ignored after creation, so it can be removed by hand.
   bootstrap_external_ip = true
 
+  # First boot fetches artifacts under the read grant below; create the
+  # grant first so the fetch is not racing it.
+  depends_on = [google_storage_bucket_iam_member.host_bootstrap_artifacts]
+
   metadata = {
     enable-osconfig = "TRUE"
     enable-oslogin  = "TRUE"
