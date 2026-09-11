@@ -1185,3 +1185,41 @@ func TestPeerPoolShutdownClosesTransportDuringClaimedCleanup(t *testing.T) {
 		t.Fatal("cleanup was performed more than once")
 	}
 }
+
+func TestPeerPoolObsoleteEvictionPreservesFreshRetryState(t *testing.T) {
+	p := NewPeerTransport(PeerPoolConfig{Dial: func(context.Context, string, string) (PeerClient, io.Closer, error) {
+		return nil, nil, errors.New("unavailable")
+	}}).(*peerPool)
+	defer p.Close()
+	_, _ = p.OpenStream(context.Background(), "host", "addr")
+	h := p.hosts["host"]
+	h.mu.Lock()
+	oldGeneration := h.evictionGeneration
+	h.eviction.Stop()
+	h.retryAt = time.Now().Add(time.Hour)
+	h.mu.Unlock()
+	// A new failure reschedules eviction while the old callback is queued.
+	h.evictIfEmpty()
+	h.mu.Lock()
+	currentGeneration := h.evictionGeneration
+	h.eviction.Stop()
+	h.mu.Unlock()
+	h.evictIdle(oldGeneration)
+	if p.hosts["host"] != h {
+		t.Fatal("obsolete eviction removed fresh retry state")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if _, err := p.OpenStream(ctx, "host", "addr"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fresh backoff was bypassed: %v", err)
+	}
+	// The open above reschedules again; only its current callback may evict.
+	h.mu.Lock()
+	currentGeneration = h.evictionGeneration
+	h.eviction.Stop()
+	h.mu.Unlock()
+	h.evictIdle(currentGeneration)
+	if p.hosts["host"] != nil {
+		t.Fatal("current idle eviction did not remove host")
+	}
+}

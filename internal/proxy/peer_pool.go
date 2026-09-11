@@ -175,6 +175,7 @@ type hostPool struct {
 	replacing          bool
 	openers            int
 	eviction           *time.Timer
+	evictionGeneration uint64
 	retiredConns       map[*peerConn]struct{}
 }
 
@@ -520,18 +521,25 @@ func (h *hostPool) evictIfEmpty() {
 		if h.eviction != nil {
 			h.eviction.Stop()
 		}
-		h.eviction = time.AfterFunc(peerReconnectMaxBackoff, func() {
-			h.parent.mu.Lock()
-			defer h.parent.mu.Unlock()
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			if h.openers == 0 && !h.dialing && len(h.conns) == 0 && h.retired == 0 && h.parent.hosts[h.host] == h {
-				delete(h.parent.hosts, h.host)
-			}
-		})
+		h.evictionGeneration++
+		generation := h.evictionGeneration
+		h.eviction = time.AfterFunc(peerReconnectMaxBackoff, func() { h.evictIdle(generation) })
 		return
 	}
 	if h.parent.hosts[h.host] == h {
+		delete(h.parent.hosts, h.host)
+	}
+}
+
+func (h *hostPool) evictIdle(generation uint64) {
+	h.parent.mu.Lock()
+	defer h.parent.mu.Unlock()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if generation != h.evictionGeneration || h.closed {
+		return
+	}
+	if h.openers == 0 && !h.dialing && len(h.conns) == 0 && h.retired == 0 && h.parent.hosts[h.host] == h {
 		delete(h.parent.hosts, h.host)
 	}
 }
