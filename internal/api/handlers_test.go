@@ -3654,13 +3654,9 @@ func gatedPause(release <-chan struct{}) *stubVMD {
 	}}
 }
 
-// A client that prefers an asynchronous answer is told 'pausing' once the
-// budget runs out; the host call keeps going and its answer is still recorded.
-func TestPauseSandbox_RespondAsync_AcceptedWhenHostIsSlow(t *testing.T) {
-	prev := pauseAcceptBudget
-	pauseAcceptBudget = 20 * time.Millisecond
-	defer func() { pauseAcceptBudget = prev }()
-
+// A client that prefers an asynchronous answer is told 'pausing' the moment
+// the pause is recorded; the host call carries on and its answer is recorded.
+func TestPauseSandbox_RespondAsync_AcceptedImmediately(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
 	release := make(chan struct{})
@@ -3689,9 +3685,9 @@ func TestPauseSandbox_RespondAsync_AcceptedWhenHostIsSlow(t *testing.T) {
 	}
 }
 
-// Preferring an asynchronous answer costs nothing when the host is quick:
-// the response is the usual 204.
-func TestPauseSandbox_RespondAsync_FastHostStill204(t *testing.T) {
+// Even a host that answers at once is reported as 'pausing' to a client
+// that prefers an asynchronous answer; the finalize still lands.
+func TestPauseSandbox_RespondAsync_FastHostStillAccepted(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
 	var finalizes int32
@@ -3703,21 +3699,16 @@ func TestPauseSandbox_RespondAsync_FastHostStill204(t *testing.T) {
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
 	h.WaitAsyncBookkeeping()
 
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusAccepted, w.Body.String())
 	}
 	if atomic.LoadInt32(&finalizes) != 1 {
 		t.Fatalf("finalize calls = %d, want 1", atomic.LoadInt32(&finalizes))
 	}
 }
 
-// Without the preference the request waits for the host as it always has,
-// however long that takes relative to the async budget.
+// Without the preference the request waits for the host as it always has.
 func TestPauseSandbox_NoPreference_WaitsForHost(t *testing.T) {
-	prev := pauseAcceptBudget
-	pauseAcceptBudget = time.Millisecond
-	defer func() { pauseAcceptBudget = prev }()
-
 	sandboxID, teamID := uuid.New(), uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
 	release := make(chan struct{})

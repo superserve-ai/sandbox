@@ -16,10 +16,6 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-// pauseAcceptBudget is how long a Prefer: respond-async request waits for the
-// host before it is told 'pausing'. A variable so tests can shorten it.
-var pauseAcceptBudget = 20 * time.Second
-
 var errPauseLeaseExpired = errors.New("pause lease expired before the host could be asked")
 
 // leaseDeadline is when a claim stops being its holder's: the expiry the claim
@@ -64,17 +60,14 @@ const (
 	pauseUndecided                     // no answer; row left 'pausing' for the reconciler
 )
 
-// respondPause answers a decided dispatch. An undecided one is still
-// 'pausing' and being reconciled: a client that asked for an asynchronous
-// answer is told so; anyone else keeps today's error.
-func respondPause(c *gin.Context, o pauseOutcome, async bool) {
-	switch {
-	case o == pauseDone:
+// respondPause answers a dispatch the caller waited for. An undecided one is
+// still 'pausing' and being reconciled; the caller keeps today's error.
+func respondPause(c *gin.Context, o pauseOutcome) {
+	switch o {
+	case pauseDone:
 		c.Status(http.StatusNoContent)
-	case o == pauseGone:
+	case pauseGone:
 		respondError(c, ErrSandboxGone)
-	case async:
-		acceptPausing(c)
 	default:
 		respondError(c, ErrInternal)
 	}

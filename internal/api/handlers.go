@@ -3104,23 +3104,15 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	leaseUntil := leaseDeadline(sandbox.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
 
 	if !prefersAsync(c) {
-		respondPause(c, h.dispatchPause(c.Request.Context(), vmd, sandbox, leaseUntil, actorID, l), false)
+		respondPause(c, h.dispatchPause(c.Request.Context(), vmd, sandbox, leaseUntil, actorID, l))
 		return
 	}
 
-	// The caller will poll rather than hold the connection. The dispatch is
-	// detached so a client that stops waiting does not abandon the host call.
-	outcome := make(chan pauseOutcome, 1)
+	// The pause is recorded; the caller is told so at once and the host call
+	// runs detached, its outcome landing on the row for anyone who looks.
 	bg := context.WithoutCancel(c.Request.Context())
-	h.asyncBookkeeping("pause-dispatch", func() { outcome <- h.dispatchPause(bg, vmd, sandbox, leaseUntil, actorID, l) })
-	timer := time.NewTimer(pauseAcceptBudget)
-	defer timer.Stop()
-	select {
-	case o := <-outcome:
-		respondPause(c, o, true)
-	case <-timer.C:
-		acceptPausing(c)
-	}
+	h.asyncBookkeeping("pause-dispatch", func() { h.dispatchPause(bg, vmd, sandbox, leaseUntil, actorID, l) })
+	acceptPausing(c)
 }
 
 // ---------------------------------------------------------------------------
