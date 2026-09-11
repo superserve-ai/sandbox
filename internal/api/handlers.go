@@ -323,26 +323,39 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 }
 
 // revertPause undoes BeginPause's claim when nothing was dispatched, in one
-// fenced statement. Synchronous, failure path only: the row must be back to
-// 'active' before the caller hears "failed". Detached from request cancellation.
+// fenced statement, retried briefly: it runs on the failure path only, and the
+// row must be back to 'active' before the caller hears "failed". If it still
+// cannot be written, the operation stands and the reconciler completes the
+// pause, which is what the already-closed billing interval reflects. Detached
+// from request cancellation.
 func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UUID, lease pauseLease, actorID *uuid.UUID, l zerolog.Logger) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
-	defer cancel()
-	n, err := h.DB.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
-		SandboxID:           sandboxID,
-		TeamID:              teamID,
-		PauseOpID:           lease.id,
-		PauseOpLeaseVersion: &lease.version,
-		ActorID:             actorUUID(actorID),
-	})
-	if err != nil {
-		l.Error().Err(err).Msg("pause revert failed; the row stays 'pausing' for reconciliation")
-		return
-	}
-	if n == 0 {
-		// Another transition (delete, reaper) moved the sandbox out of
-		// 'pausing' first; its state wins over the revert.
-		l.Warn().Msg("pause revert skipped: sandbox no longer pausing")
+	bg := context.WithoutCancel(reqCtx)
+	backoff := 200 * time.Millisecond
+	for attempt := 1; ; attempt++ {
+		ctx, cancel := context.WithTimeout(bg, asyncTimeout)
+		n, err := h.DB.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
+			SandboxID:           sandboxID,
+			TeamID:              teamID,
+			PauseOpID:           lease.id,
+			PauseOpLeaseVersion: &lease.version,
+			ActorID:             actorUUID(actorID),
+		})
+		cancel()
+		if err == nil {
+			if n == 0 {
+				// Another transition (delete, reaper) moved the sandbox out
+				// of 'pausing' first; its state wins over the revert.
+				l.Warn().Msg("pause revert skipped: sandbox no longer pausing")
+			}
+			return
+		}
+		if attempt >= 3 {
+			l.Error().Err(err).Msg("pause revert failed; the row stays 'pausing' and the reconciler will complete the pause")
+			return
+		}
+		l.Warn().Err(err).Int("attempt", attempt).Msg("pause revert failed; retrying")
+		time.Sleep(backoff)
+		backoff *= 2
 	}
 }
 
@@ -3087,31 +3100,20 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// with the status transition; nothing to do here. If the host
 	// cannot be resolved, the revert reopens a new interval.
 
-	// BeginPause already claimed 'pausing', so a host lookup failure must
-	// revert or the row is stuck. This is the only revert after BeginPause:
-	// nothing was dispatched, so the VM is known to be running.
-	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
-	if vmdLookupErr != nil {
-		l.Error().Err(vmdLookupErr).Msg("resolve VMD for pause failed")
-		h.revertPause(c.Request.Context(), sandboxID, teamID, pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}, actorIDFromContext(c), l)
-		respondError(c, ErrInternal)
-		return
-	}
-
 	// Read from the request here: past this point the dispatch may outlive
 	// it, and nothing on another goroutine may touch c.
 	actorID := actorIDFromContext(c)
 	leaseUntil := leaseDeadline(sandbox.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
 
 	if !prefersAsync(c) {
-		respondPause(c, h.dispatchPause(c.Request.Context(), vmd, sandbox, leaseUntil, actorID, l))
+		respondPause(c, h.dispatchPause(c.Request.Context(), sandbox, leaseUntil, actorID, l))
 		return
 	}
 
-	// The pause is recorded; the caller is told so at once and the host call
-	// runs detached, its outcome landing on the row for anyone who looks.
+	// The pause is recorded; the caller is told so at once. Everything else,
+	// host resolution included, runs detached and lands on the row.
 	bg := context.WithoutCancel(c.Request.Context())
-	h.asyncBookkeeping("pause-dispatch", func() { h.dispatchPause(bg, vmd, sandbox, leaseUntil, actorID, l) })
+	h.asyncBookkeeping("pause-dispatch", func() { h.dispatchPause(bg, sandbox, leaseUntil, actorID, l) })
 	acceptPausing(c)
 }
 

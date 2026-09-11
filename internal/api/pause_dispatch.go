@@ -55,9 +55,10 @@ func prefersAsync(c *gin.Context) bool {
 type pauseOutcome int
 
 const (
-	pauseDone      pauseOutcome = iota // snapshot taken; bookkeeping in flight
-	pauseGone                          // host has no such VM; row marked failed
-	pauseUndecided                     // no answer; row left 'pausing' for the reconciler
+	pauseDone       pauseOutcome = iota // snapshot taken; bookkeeping in flight
+	pauseGone                           // host has no such VM; row marked failed
+	pauseUndecided                      // no answer; row left 'pausing' for the reconciler
+	pauseUnresolved                     // host unknown; nothing dispatched, row reverted
 )
 
 // respondPause answers a dispatch the caller waited for. An undecided one is
@@ -80,12 +81,21 @@ func acceptPausing(c *gin.Context) {
 
 // dispatchPause runs the host RPC for a claimed pause and records its answer.
 // It knows nothing of the HTTP request; every write runs detached.
-func (h *Handlers) dispatchPause(ctx context.Context, vmd VMDClient, sandbox db.BeginPauseRow, leaseUntil time.Time, actorID *uuid.UUID, l zerolog.Logger) pauseOutcome {
+func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, leaseUntil time.Time, actorID *uuid.UUID, l zerolog.Logger) pauseOutcome {
 	sandboxID, teamID := sandbox.ID, sandbox.TeamID
+	lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
+	// BeginPause already claimed 'pausing', so a host lookup failure must
+	// revert or the row is stuck. This is the only revert after BeginPause:
+	// nothing was dispatched, so the VM is known to be running.
+	vmd, err := h.vmdForHost(ctx, sandbox.HostID)
+	if err != nil {
+		l.Error().Err(err).Msg("resolve VMD for pause failed")
+		h.revertPause(ctx, sandboxID, teamID, lease, actorID, l)
+		return pauseUnresolved
+	}
 	// The pause's identity rides the RPC into the host's backup pipeline and
 	// returns in the upload report, naming this exact pause.
 	pauseToken := uuid.UUID(sandbox.PauseOpID.Bytes).String()
-	lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
 	snapshotPath, memPath, manifest, ackedPauseToken, err := h.pauseWithRetry(ctx, vmd, sandbox.HostID, sandboxID.String(), pauseToken, leaseUntil)
 	if err != nil {
 		bg := context.WithoutCancel(ctx)
