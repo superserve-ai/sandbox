@@ -1223,3 +1223,45 @@ func TestPeerPoolObsoleteEvictionPreservesFreshRetryState(t *testing.T) {
 		t.Fatal("current idle eviction did not remove host")
 	}
 }
+
+type peerConnectionTelemetry struct {
+	noopPeerTelemetry
+	total atomic.Int32
+}
+
+func (t *peerConnectionTelemetry) PeerConnection(delta int) { t.total.Add(int32(delta)) }
+
+func TestPeerPoolCountsRetiredConnectionsUntilDrainCompletes(t *testing.T) {
+	dial, _, conns := testDialer()
+	metrics := &peerConnectionTelemetry{}
+	p := NewPeerTransport(PeerPoolConfig{Dial: dial, Telemetry: metrics})
+	defer p.Close()
+	old, err := p.OpenStream(context.Background(), "host", "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	replacement, err := p.OpenStream(context.Background(), "host", "new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	if got := metrics.total.Load(); got != 2 {
+		t.Fatalf("overlapping connections = %d, want 2", got)
+	}
+	if (*conns)[0].closed.Load() != 0 {
+		t.Fatal("old connection closed before drain")
+	}
+	_ = old.Close()
+	if got := metrics.total.Load(); got != 1 {
+		t.Fatalf("connections after old drain = %d, want 1", got)
+	}
+	if (*conns)[0].closed.Load() != 1 {
+		t.Fatal("old transport was not closed")
+	}
+	_ = replacement.Close()
+	_ = p.Close()
+	if got := metrics.total.Load(); got != 0 {
+		t.Fatalf("connections after shutdown = %d, want 0", got)
+	}
+}

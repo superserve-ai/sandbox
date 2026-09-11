@@ -280,7 +280,6 @@ func (h *hostPool) replaceLocked(addr string) {
 			h.retiredConns = make(map[*peerConn]struct{})
 		}
 		h.retiredConns[c] = struct{}{}
-		h.parent.cfg.Telemetry.PeerConnection(-1)
 		if isIdle {
 			idle = append(idle, c)
 		} else {
@@ -620,6 +619,7 @@ func (h *hostPool) remove(target *peerConn) {
 		}
 	}
 	if target.detached {
+		h.parent.cfg.Telemetry.PeerConnection(-1)
 		target.detached = false
 		delete(h.retiredConns, target)
 		if h.retired > 0 {
