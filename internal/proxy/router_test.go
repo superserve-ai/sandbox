@@ -68,9 +68,58 @@ func TestBridgeRequestForwardsResponseBeforeUploadCompletes(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d", resp.StatusCode)
 	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != "ok" {
+		t.Fatalf("response body=%q, err=%v", body, err)
+	}
+	// Wait for the peer's EOF to close the downstream connection before
+	// releasing the artificial upload reader, which ignores connection closure.
+	if _, err := client.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("response connection: %v", err)
+	}
 	close(released)
 	if err := <-done; err != nil {
 		t.Fatalf("bridgeRequest: %v", err)
+	}
+}
+
+type failingWritePeer struct {
+	PeerStream
+	err error
+}
+
+func (s failingWritePeer) Write([]byte) (int, error) { return 0, s.err }
+
+func TestBridgeRequestPreservesUploadFailure(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	peer, remote := net.Pipe()
+	defer remote.Close()
+	want := errors.New("peer upload failed")
+	req := httptest.NewRequest(http.MethodPost, "http://sandbox.test/upload", bytes.NewBufferString("payload"))
+	err := bridgeRequest(hijackWriter{conn: server}, req, failingWritePeer{PeerStream: pipePeer{peer}, err: want})
+	if !errors.Is(err, want) {
+		t.Fatalf("bridge error=%v, want %v", err, want)
+	}
+}
+
+func TestBridgeRequestCancellationSuppressesShutdownErrors(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	peer, remote := net.Pipe()
+	defer remote.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "http://sandbox.test/upload", bytes.NewBufferString("payload")).WithContext(ctx)
+	done := make(chan error, 1)
+	go func() { done <- bridgeRequest(hijackWriter{conn: server}, req, pipePeer{peer}) }()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("bridge error after cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bridge did not stop after cancellation")
 	}
 }
 

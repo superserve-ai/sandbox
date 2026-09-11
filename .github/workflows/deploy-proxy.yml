@@ -163,6 +163,7 @@ jobs:
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          PEER_PROXY_LISTEN_ADDR: auto
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
@@ -211,6 +212,7 @@ jobs:
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          PEER_PROXY_LISTEN_ADDR: auto
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
