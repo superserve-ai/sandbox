@@ -88,18 +88,21 @@ func TestLocalListenerCannotReenterOwnershipRouting(t *testing.T) {
 	// The same local mux is attached to the synchronously bound peer target.
 	srv := httptest.NewServer(localMux)
 	defer srv.Close()
-	req, _ := http.NewRequest("GET", srv.URL+"/", nil)
-	req.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
-	resp, err := srv.Client().Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound || lookups.Load() != 0 {
-		t.Fatalf("local status=%d lookups=%d", resp.StatusCode, lookups.Load())
-	}
-	publicMux.ServeHTTP(httptest.NewRecorder(), req)
-	if lookups.Load() != 1 {
-		t.Fatal("public listener bypassed ownership routing")
+	for _, path := range []string{"/", "/health"} {
+		lookups.Store(0)
+		req, _ := http.NewRequest("GET", srv.URL+path, nil)
+		req.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound || lookups.Load() != 0 {
+			t.Fatalf("%s: local status=%d lookups=%d", path, resp.StatusCode, lookups.Load())
+		}
+		publicMux.ServeHTTP(httptest.NewRecorder(), req)
+		if lookups.Load() != 1 {
+			t.Fatalf("%s: public listener bypassed ownership routing", path)
+		}
 	}
 }

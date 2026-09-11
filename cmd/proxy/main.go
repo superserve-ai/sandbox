@@ -291,8 +291,8 @@ func bindLocalPeerTarget(target, publicAddr, redirectAddr string) (net.Listener,
 }
 
 func validatePeerListener(peerAddr, publicAddr, redirectAddr string) error {
-	if !proxy.PrivateBind(peerAddr) {
-		return fmt.Errorf("peer ingress must bind a private interface: %q", peerAddr)
+	if err := proxy.ValidatePeerEndpoint(peerAddr); err != nil {
+		return err
 	}
 	return validateListenerPorts(peerAddr, publicAddr, redirectAddr)
 }

@@ -51,5 +51,5 @@ func routeFromRecordedHost(hostID, vmdAddr string) (SandboxRoute, error) {
 	if err != nil || addr.Port() == 0 || !addr.Addr().IsGlobalUnicast() || addr.Addr().IsLoopback() || addr.Addr().Zone() != "" {
 		return SandboxRoute{}, fmt.Errorf("invalid recorded VMD address")
 	}
-	return NormalizeSandboxRoute(SandboxRoute{HostID: strings.TrimSpace(hostID), ProxyAddr: netip.AddrPortFrom(addr.Addr().Unmap(), 5009).String()})
+	return NormalizeSandboxRoute(SandboxRoute{HostID: strings.TrimSpace(hostID), ProxyAddr: netip.AddrPortFrom(addr.Addr().Unmap(), PeerPort).String()})
 }
