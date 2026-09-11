@@ -177,7 +177,12 @@ func main() {
 	}
 	defer peers.Close()
 	router := proxy.NewRoutingHandler(domains, os.Getenv("HOST_ID"), ownership, peers, proxyHandler, log, routingRecorder)
-	mux, localMux := newDataPlaneMuxes(proxyHandler, router)
+	routingEnabled := os.Getenv("PEER_ROUTING_ENABLED")
+	if routingEnabled != "" && routingEnabled != "0" && routingEnabled != "1" {
+		log.Fatal().Msg("PEER_ROUTING_ENABLED must be empty, 0, or 1")
+	}
+	log.Info().Bool("enabled", routingEnabled == "1").Msg("peer ownership routing configured")
+	mux, localMux := newDataPlaneMuxes(proxyHandler, router, routingEnabled == "1")
 	var localSrv *http.Server
 	var localErr <-chan error
 	if peerAddr := os.Getenv("PEER_PROXY_LISTEN_ADDR"); peerIngressEnabled(peerAddr) {
@@ -333,7 +338,10 @@ func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
 	return newProxyMuxWithHandler(proxyHandler, proxyHandler)
 }
 
-func newDataPlaneMuxes(local *proxy.Handler, router *proxy.RoutingHandler) (publicMux, localMux *http.ServeMux) {
+func newDataPlaneMuxes(local *proxy.Handler, router http.Handler, routingEnabled bool) (publicMux, localMux *http.ServeMux) {
+	if !routingEnabled {
+		return newProxyMux(local), newProxyMux(local)
+	}
 	return newProxyMuxWithHandler(local, router), newProxyMux(local)
 }
 

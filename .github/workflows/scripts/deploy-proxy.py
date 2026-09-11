@@ -82,6 +82,10 @@ def main() -> int:
     if require_data_plane not in ("", "0", "1"):
         print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
         return 1
+    peer_routing = os.environ.get("PEER_ROUTING_ENABLED", "") or "0"
+    if peer_routing not in ("0", "1"):
+        print("ERROR: PEER_ROUTING_ENABLED must be 0 or 1", file=sys.stderr)
+        return 1
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
     peer_identity_hosts = set(filter(None, (host.strip() for host in
         os.environ.get("PEER_IDENTITY_HOSTS", "").split(","))))
@@ -390,6 +394,7 @@ def main() -> int:
             PEER_PROXY_CA_FILE=$peer_ca_file
             PEER_PROXY_SPIFFE_URI=$peer_identity
             PEER_PROXY_MAX_STREAMS={peer_max_streams}
+            PEER_ROUTING_ENABLED={peer_routing}
             HOST_ID=${{host_id:-{name}}}{otel_env_lines}
             PROXYENV
             if [ -z "$peer_identity" ]; then
