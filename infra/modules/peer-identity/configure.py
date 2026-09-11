@@ -42,7 +42,7 @@ def configure(config):
         policy = Path(tmp) / "attestation.json"
         policy.write_text(json.dumps({"attestationRules": [{
             "googleCloudResource": f"//compute.googleapis.com/projects/{config['project_number']}"
-            f"/uid/zones/{config['zone']}/instances/{config['instance_id']}"
+            f"/zones/{config['zone']}/instances/{config['instance_id']}"
         }]}))
         gcloud(*pool, "managed-identities", "set-attestation-rules", config["identity"],
                *scoped, f"--policy-file={policy}")
