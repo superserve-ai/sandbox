@@ -1624,6 +1624,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	if snapshotDir == "" {
 		snapshotDir = filepath.Join(m.cfg.SnapshotDir, vmID)
 	}
+	// One spelling: the checks below compare it to the VM's own directory.
+	snapshotDir = filepath.Clean(snapshotDir)
 	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
 		return "", "", nil, fmt.Errorf("create snapshot dir: %w", err)
 	}
@@ -5075,9 +5077,19 @@ var staleUnitStopConfirmed = func(ctx context.Context, unit string) bool {
 // and delete a live VM whenever systemctl is merely slow. Only the eager GC pass
 // sets it. Concurrent-safe: the map write is double-checked under the lock.
 // interruptedResume reports a record a resume published, owing a wake, and
-// never completed: its paused image is intact.
+// never completed: its paused image is intact. Error counts too: a reattach
+// parks one behind a stop it could not confirm, still owing its return; a
+// terminal park owes nothing (see parkUnservable).
 func interruptedResume(rec VMRecord) bool {
-	return rec.Status == StatusRunning && rec.Unverified && rec.WakePending && rec.WakeOwedFromPaused
+	return (rec.Status == StatusRunning || rec.Status == StatusError) && rec.Unverified && rec.WakePending && rec.WakeOwedFromPaused
+}
+
+// returnToPaused rewrites the record Paused with nothing owed and nothing in
+// flight.
+func (rec *VMRecord) returnToPaused() {
+	rec.Status = StatusPaused
+	rec.WakePending, rec.ClockFrozen, rec.WakeOwedFromPaused, rec.Unverified = false, false, false, false
+	rec.WakeToken, rec.WakeSnapshotPath, rec.WakeMemPath = "", "", ""
 }
 
 // returnInterruptedResumeToPaused rewrites an interrupted resume's record
@@ -5085,9 +5097,7 @@ func interruptedResume(rec VMRecord) bool {
 // it; the record is never reaped as a failed create.
 func (m *Manager) returnInterruptedResumeToPaused(ctx context.Context, rec VMRecord, cleanupStale bool, log zerolog.Logger) (*VMInstance, bool) {
 	log.Warn().Msg("resume interrupted before its guest ran — record returns to Paused")
-	rec.Status = StatusPaused
-	rec.WakePending, rec.ClockFrozen, rec.WakeOwedFromPaused, rec.Unverified = false, false, false, false
-	rec.WakeToken, rec.WakeSnapshotPath, rec.WakeMemPath = "", "", ""
+	rec.returnToPaused()
 	if wrote, perr := m.state.PutIfPresent(rec); perr != nil || !wrote {
 		log.Warn().Err(perr).Bool("present", wrote).Msg("interrupted resume's record could not be returned to Paused")
 		return nil, false
@@ -8915,11 +8925,17 @@ func (m *Manager) publishRecovered(inst *VMInstance) {
 func (m *Manager) parkUnservable(inst *VMInstance, terminal bool) {
 	m.stopUnitDuringRestoreError(inst.ID)
 	inst.mu.Lock()
-	if !terminal && inst.WakePending && inst.WakeOwedFromPaused {
+	switch {
+	case !terminal && inst.WakePending && inst.WakeOwedFromPaused:
 		inst.Status = StatusPaused
 		inst.WakePending, inst.ClockFrozen, inst.WakeOwedFromPaused, inst.Unverified = false, false, false, false
 		inst.dropWakeImage()
-	} else {
+	case terminal:
+		// Owing nothing: no restart returns it to Paused.
+		inst.Status = StatusError
+		inst.WakePending, inst.WakeOwedFromPaused = false, false
+		inst.dropWakeImage()
+	default:
 		inst.Status = StatusError
 	}
 	inst.mu.Unlock()

@@ -1048,6 +1048,56 @@ func TestInterruptedResumeReturnsToPaused(t *testing.T) {
 	}
 }
 
+// An interrupted resume whose unit is up with no socket, and whose stop the
+// reattach cannot confirm, is parked Error still owing its return: once the
+// process is gone, a later reattach returns it to Paused instead of reaping
+// it. A terminal park owes nothing and is reaped as before.
+func TestInterruptedResumeParkedBehindAnUnconfirmedStopReturnsToPausedLater(t *testing.T) {
+	origDown, origStop := vmUnitFullyDown, staleUnitStopConfirmed
+	t.Cleanup(func() { vmUnitFullyDown, staleUnitStopConfirmed = origDown, origStop })
+	dir := t.TempDir()
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "rec", WakeToken: "disk", WakeOwedFromPaused: true, Supervision: SupervisionUnit, SocketPath: filepath.Join(dir, "missing.sock"), MemFilePath: filepath.Join(dir, "mem.snap")}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	newMgr := func() *Manager {
+		return &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+	}
+
+	// First restart: the unit is up, the socket missing, the stop unconfirmed.
+	vmUnitFullyDown = func(string) bool { return false }
+	staleUnitStopConfirmed = func(context.Context, string) bool { return false }
+	newMgr().reattachRecord(context.Background(), rec, true)
+	got, _ := store.Get("vm-1")
+	if got == nil || got.Status != StatusError || !got.WakeOwedFromPaused || !got.Unverified {
+		t.Fatalf("record = %+v; want Error still owing its return to Paused", got)
+	}
+
+	// A later restart finds the process gone.
+	vmUnitFullyDown = func(string) bool { return true }
+	newMgr().reattachRecord(context.Background(), *got, true)
+	got, _ = store.Get("vm-1")
+	if got == nil || got.Status != StatusPaused || got.WakePending || got.WakeOwedFromPaused || got.Unverified || got.WakeToken != "" {
+		t.Fatalf("record = %+v; want Paused with nothing owed", got)
+	}
+
+	// A terminal park leaves nothing owed, so the same later restart reaps it.
+	inst := &VMInstance{ID: "vm-2", Status: StatusRunning, Unverified: true, WakePending: true, WakeOwedFromPaused: true, Supervision: SupervisionUnit}
+	m := newMgr()
+	m.parkUnservable(inst, true)
+	if inst.Status != StatusError || inst.WakePending || inst.WakeOwedFromPaused {
+		t.Fatalf("instance = %+v; a terminal park must be Error owing nothing", inst)
+	}
+	if interruptedResume(toRecord(inst)) {
+		t.Fatal("a terminal park must not read as an interrupted resume")
+	}
+}
+
 // A reattached resume whose guest will not wake goes back to Paused with
 // nothing owed, as the resume's own failure path would. (A create in the
 // same state is parked as Error with its wake still owed; see the lazy-path
@@ -2123,15 +2173,17 @@ func TestUnfrozenOverwriteOfAFrozenImageIsCoveredByAnIntent(t *testing.T) {
 	t.Cleanup(func() { vmUnitFullyDown, fcUnpauseVM, boxdHealthProbe = origDown, origUnpause, origProbe })
 
 	for _, tc := range []struct {
-		name string
-		seed func(t *testing.T, memSnap string)
+		name  string
+		seed  func(t *testing.T, memSnap string)
+		slash bool
 	}{
-		{"frozen_manifest", func(t *testing.T, memSnap string) { seedFrozenManifest(t, memSnap, "A") }},
+		{"frozen_manifest", func(t *testing.T, memSnap string) { seedFrozenManifest(t, memSnap, "A") }, false},
+		{"frozen_manifest_dir_with_trailing_slash", func(t *testing.T, memSnap string) { seedFrozenManifest(t, memSnap, "A") }, true},
 		{"unreadable_manifest", func(t *testing.T, memSnap string) {
 			if err := os.WriteFile(WallClockMarkerPath(memSnap), []byte("{not json"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-		}},
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fc := startSnapshotAPIFake(t, func(_, _ string) (int, string) {
@@ -2153,7 +2205,11 @@ func TestUnfrozenOverwriteOfAFrozenImageIsCoveredByAnIntent(t *testing.T) {
 
 			// The rewrite dies (here: the snapshot fails) with the old manifest
 			// still beside the image, and the intent recorded.
-			if _, _, _, err := m.PauseVM(context.Background(), "vm-1", vmDir, ""); err == nil {
+			pauseDir := vmDir
+			if tc.slash {
+				pauseDir += "/"
+			}
+			if _, _, _, err := m.PauseVM(context.Background(), "vm-1", pauseDir, ""); err == nil {
 				t.Fatal("want the snapshot failure")
 			}
 			in, err := readPauseIntent(vmDir)
