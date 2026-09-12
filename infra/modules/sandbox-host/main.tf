@@ -25,6 +25,11 @@ resource "google_compute_instance" "this" {
   network_interface {
     subnetwork = var.subnet
     network_ip = var.internal_ip
+
+    dynamic "access_config" {
+      for_each = var.bootstrap_external_ip ? [1] : []
+      content {}
+    }
   }
 
   # Prepend the host patching policy to whatever startup script the

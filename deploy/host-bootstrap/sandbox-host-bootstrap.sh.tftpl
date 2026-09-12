@@ -1,0 +1,170 @@
+#!/bin/bash
+# Host startup step: prepare a fresh sandbox host for its first vmd deploy.
+#
+# Covers what the deploy pipeline assumes is already there: packages, guest
+# forwarding, the local-SSD array, the background-data disk, the guest kernel
+# and base rootfs, and a vmd.env with every non-secret key. Secrets, the
+# egress policy, and the cell's secretsproxy CA are copied by an operator
+# afterwards; the deploy then upserts the rest.
+#
+# Idempotent; safe to re-run on boot. The mount units it installs are what
+# run on later boots, this script only has to get them in place once.
+set -euo pipefail
+
+exec >> /var/log/sandbox-host-bootstrap.log 2>&1
+
+echo "=== Superserve sandbox host bootstrap $(date -Is) ==="
+
+export DEBIAN_FRONTEND=noninteractive
+missing=""
+for pkg in mdadm xfsprogs nftables; do
+  dpkg -s "$pkg" >/dev/null 2>&1 || missing="$missing $pkg"
+done
+if [ -n "$missing" ]; then
+  apt-get update -y
+  apt-get install -y $missing
+fi
+
+# Guest egress is routed through the host.
+printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/90-sandbox-forward.conf
+sysctl -q -p /etc/sysctl.d/90-sandbox-forward.conf
+
+install -d -m 0755 /var/lib/sandbox/kernel /var/lib/sandbox/rootfs /etc/sandbox
+install -d -m 0755 /etc/systemd/system/superserve-vmd.service.d
+
+# Local SSD: the script runs every boot, ordered before vmd.
+cat > /usr/local/bin/sandbox-localssd <<'LOCALSSD'
+${localssd_script}
+LOCALSSD
+chmod 0755 /usr/local/bin/sandbox-localssd
+cat > /etc/systemd/system/sandbox-localssd.service <<'UNIT'
+[Unit]
+Description=Stripe and mount the local NVMe under the sandbox paths
+After=local-fs.target
+Before=superserve-vmd.socket superserve-vmd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/sandbox-localssd
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+printf '[Unit]\nRequires=sandbox-localssd.service\nAfter=sandbox-localssd.service\n' \
+  > /etc/systemd/system/superserve-vmd.service.d/sandbox-localssd.conf
+
+%{ if data_disk_device != "" ~}
+# Background-data disk: bound to its device unit so the mount follows the
+# attachment instead of racing it, and vmd waits for the mount.
+DEV=/dev/disk/by-id/google-${data_disk_device}
+DEVUNIT=$(systemd-escape -p --suffix=device "$DEV")
+cat > /usr/local/bin/sandbox-data-mount <<'SH'
+#!/bin/bash
+set -euo pipefail
+DEV=/dev/disk/by-id/google-${data_disk_device}
+if [ "$(blkid -o value -s TYPE "$DEV" 2>/dev/null || true)" != "xfs" ]; then
+  mkfs.xfs -m crc=1,reflink=1 "$DEV"
+fi
+mkdir -p /mnt/sandbox-data
+mountpoint -q /mnt/sandbox-data || mount -t xfs -o noatime,discard "$DEV" /mnt/sandbox-data
+SH
+chmod 0755 /usr/local/bin/sandbox-data-mount
+cat > /etc/systemd/system/sandbox-data.service <<UNIT
+[Unit]
+Description=Mount the sandbox background-data disk
+BindsTo=$DEVUNIT
+After=$DEVUNIT
+Before=superserve-vmd.socket superserve-vmd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/sandbox-data-mount
+
+[Install]
+WantedBy=$DEVUNIT
+UNIT
+printf '[Unit]\nRequires=sandbox-data.service\nAfter=sandbox-data.service\n' \
+  > /etc/systemd/system/superserve-vmd.service.d/sandbox-data.conf
+%{ endif ~}
+
+systemctl daemon-reload
+systemctl enable sandbox-localssd.service
+systemctl start sandbox-localssd.service
+%{ if data_disk_device != "" ~}
+systemctl enable sandbox-data.service
+systemctl start --no-block sandbox-data.service
+%{ endif ~}
+
+# Guest kernel and base rootfs are not shipped by the deploy pipeline; the
+# deploy injects boxd into the rootfs, so it must exist before the first
+# deploy. Fetched with the instance's own identity, retrying because the
+# read grant is created alongside the instance and takes time to propagate.
+fetch() {
+  local token attempt
+  for attempt in $(seq 1 40); do
+    token=$(curl -sf -H 'Metadata-Flavor: Google' \
+      http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
+      | python3 -c 'import json, sys; print(json.load(sys.stdin)["access_token"])') || token=""
+    if [ -n "$token" ] && curl -sfL -H "Authorization: Bearer $token" \
+        "https://storage.googleapis.com/${artifact_bucket}/hostprep/$1" -o "$2.part"; then
+      mv "$2.part" "$2"
+      return 0
+    fi
+    echo "fetch $1 failed (attempt $attempt); retrying" >&2
+    sleep 15
+  done
+  echo "giving up fetching $1" >&2
+  return 1
+}
+[ -s /var/lib/sandbox/kernel/${kernel_object} ] || fetch ${kernel_object} /var/lib/sandbox/kernel/${kernel_object}
+[ -s /var/lib/sandbox/rootfs/base.ext4 ] || fetch ${rootfs_object} /var/lib/sandbox/rootfs/base.ext4
+
+# Firecracker: the same published release the fleet deploy installs, verified
+# against its published checksum, so this host carries the digest the fleet
+# preflight expects. A host prepared before a later fleet rollout is brought
+# current by running that deploy against this host alone before it joins
+# discovery.
+if [ ! -x /usr/local/bin/firecracker ]; then
+  tmp=$(mktemp -d)
+  rel="https://github.com/superserve-ai/firecracker/releases/download/${firecracker_version}"
+  for attempt in $(seq 1 20); do
+    if curl -sfL "$rel/firecracker.tar.gz" -o "$tmp/firecracker.tar.gz" \
+        && curl -sfL "$rel/firecracker.sha256" -o "$tmp/firecracker.sha256"; then
+      break
+    fi
+    echo "firecracker release download failed (attempt $attempt); retrying" >&2
+    sleep 15
+  done
+  tar -xzf "$tmp/firecracker.tar.gz" -C "$tmp" firecracker
+  echo "$(cut -d' ' -f1 "$tmp/firecracker.sha256")  $tmp/firecracker" | sha256sum -c - >/dev/null
+  install -m 0755 "$tmp/firecracker" /usr/local/bin/firecracker
+  rm -rf "$tmp"
+fi
+
+# vmd.env: written once, only when absent, so an operator's later edits and
+# the deploy's upserts are never overwritten. Root-only from the start, since
+# secrets are appended to this same file later.
+if [ ! -f /etc/sandbox/vmd.env ]; then
+  NAME=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/name)
+  HOST_IFACE=$(ip -4 route show default | awk '{print $5}' | head -1)
+  cat > /etc/sandbox/vmd.env <<ENV
+HOST_ID=$NAME
+HOST_INTERFACE=$HOST_IFACE
+GRPC_PORT=50051
+FIRECRACKER_BIN=/usr/local/bin/firecracker
+KERNEL_PATH=/var/lib/sandbox/kernel/${kernel_object}
+BASE_ROOTFS_PATH=/var/lib/sandbox/rootfs/base.ext4
+SNAPSHOT_DIR=/var/lib/sandbox/snapshots
+RUN_DIR=/var/lib/sandbox/rundir
+VMD_STATE_PATH=/var/lib/sandbox/vmd.db
+%{ for key, value in vmd_env ~}
+${key}=${value}
+%{ endfor ~}
+ENV
+  chmod 0600 /etc/sandbox/vmd.env
+fi
+
+touch /var/lib/sandbox/.host-bootstrapped
+echo "=== Superserve sandbox host bootstrap complete ==="
