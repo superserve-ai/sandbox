@@ -13,6 +13,14 @@ on:
         options:
           - staging
           - production
+      target:
+        description: 'Staging host target (production keeps its existing cell selection)'
+        required: true
+        type: choice
+        default: serving
+        options:
+          - serving
+          - standby
   push:
     branches: [main]
     paths:
@@ -20,6 +28,7 @@ on:
       - 'deploy/superserve-otel-collector.service'
       - '.github/workflows/deploy-otel-collector.yml'
       - '.github/workflows/scripts/deploy-otel-collector.py'
+      - '.github/workflows/scripts/select-deploy-target.sh'
 
 jobs:
   deploy-staging:
@@ -44,11 +53,15 @@ jobs:
 
       - name: Deploy OTEL Collector to VMD instances
         env:
+          DEPLOY_EVENT: ${{ github.event_name }}
+          DEPLOY_TARGET: ${{ inputs.target }}
+          DEPLOY_CELL: staging
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
         run: |
+          source .github/workflows/scripts/select-deploy-target.sh
           python3 .github/workflows/scripts/deploy-otel-collector.py
 
   deploy-production:

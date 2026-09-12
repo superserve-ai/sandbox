@@ -82,5 +82,81 @@ class DeployOtelCollectorTests(unittest.TestCase):
         self.assertIn("assertion", self.run_health("no-metric").stderr)
 
 
+
+class OtelTargetSelectionTests(unittest.TestCase):
+    def selected_env(self, event='workflow_dispatch', target='standby'):
+        import os
+        workflow = (SCRIPT.parents[1] / 'deploy-otel-collector.yml').read_text()
+        staging = workflow.split('  deploy-staging:', 1)[1].split('  deploy-production:', 1)[0]
+        self.assertIn('DEPLOY_EVENT: ${{ github.event_name }}', staging)
+        self.assertIn('DEPLOY_TARGET: ${{ inputs.target }}', staging)
+        self.assertIn('DEPLOY_CELL: staging', staging)
+        body = staging.split('        run: |', 1)[1]
+        self.assertLess(body.index('source .github/workflows/scripts/select-deploy-target.sh'), body.index('python3'))
+        result = subprocess.run(
+            ['bash', '-ec', 'source .github/workflows/scripts/select-deploy-target.sh; env -0'],
+            cwd=SCRIPT.parents[3], capture_output=True,
+            env=dict(os.environ, DEPLOY_EVENT=event, DEPLOY_TARGET=target,
+                     DEPLOY_CELL='staging', GCP_PROJECT='example-project',
+                     GCP_REGION='us-central1', VMD_LABEL='component=vmd'),
+            check=True,
+        )
+        return dict(item.split('=', 1) for item in result.stdout.decode().split('\0') if '=' in item)
+
+    def deploy_selection(self, env, rows):
+        from concurrent.futures import Future
+        from unittest.mock import patch
+        selected = []
+
+        class Executor:
+            def __init__(self, **kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def submit(self, fn, instance):
+                selected.append(instance['name'])
+                future = Future()
+                future.set_result(None)
+                return future
+
+        with patch.dict(MODULE.os.environ, env, clear=True), \
+             patch.object(MODULE.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, rows, '')) as run, \
+             patch.object(MODULE, 'prepare_collector_binaries', return_value={}) as prepare, \
+             patch.object(MODULE.os.path, 'exists', return_value=True), \
+             patch.object(MODULE, 'ThreadPoolExecutor', Executor):
+            result = MODULE.main()
+        return result, selected, run.call_args_list, prepare.called
+
+    def test_staging_standby_uses_shared_label_and_never_deploys_serving_host(self):
+        env = self.selected_env()
+        self.assertEqual(env['VMD_LABEL'], 'component=vmd-staging-standby')
+        standby = env['EXPECTED_STANDBY_HOST']
+        result, selected, calls, _ = self.deploy_selection(env, standby + ',us-central1-a\n')
+        self.assertEqual(result, 0)
+        self.assertEqual(selected, [standby])
+        self.assertIn('--filter=labels.component=vmd-staging-standby AND status=RUNNING', calls[0].args[0])
+        for rows in ('', 'serving-host,us-central1-a\n', standby + ',us-central1-a\nserving-host,us-central1-a\n', standby + ',us-west2-a\n'):
+            result, selected, _, prepared = self.deploy_selection(env, rows)
+            self.assertEqual(result, 1)
+            self.assertEqual(selected, [])
+            self.assertFalse(prepared)
+
+    def test_push_and_explicit_serving_preserve_serving_selection(self):
+        for event, target in [('push', 'standby'), ('workflow_dispatch', 'serving')]:
+            env = self.selected_env(event, target)
+            self.assertEqual(env['VMD_LABEL'], 'component=vmd')
+            self.assertNotIn('EXPECTED_STANDBY_HOST', env)
+            result, selected, _, _ = self.deploy_selection(env, 'serving-host,us-central1-a\n')
+            self.assertEqual(result, 0)
+            self.assertEqual(selected, ['serving-host'])
+
+    def test_production_filter_fanout_is_unchanged(self):
+        env = {'GCP_PROJECT': 'example-project', 'GCP_REGION': 'us-west2',
+               'VMD_FILTER': 'labels.sandbox_role=vmd AND labels.environment=production AND labels.region=us-west2'}
+        result, selected, calls, _ = self.deploy_selection(env, 'host-a,us-west2-a\nhost-b,us-west2-b\n')
+        self.assertEqual(result, 0)
+        self.assertEqual(selected, ['host-a', 'host-b'])
+        self.assertIn('--filter=' + env['VMD_FILTER'] + ' AND status=RUNNING', calls[0].args[0])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -178,6 +178,11 @@ def main() -> int:
         print(f"No instances matching {instance_filter} found in {where}", file=sys.stderr)
         return 1
 
+    expected_standby = os.environ.get("EXPECTED_STANDBY_HOST", "")
+    if expected_standby and (not region or len(instances) != 1 or instances[0]["name"] != expected_standby):
+        print("ERROR: standby collector deployment requires exactly the expected host in the selected region", file=sys.stderr)
+        return 1
+
     collector_binaries = prepare_collector_binaries()
     print(f"Deploying OTEL Collector to {len(instances)} instance(s) in {where}")
 

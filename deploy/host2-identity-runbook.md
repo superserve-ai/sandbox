@@ -283,6 +283,27 @@ against the canonical host preparation procedure. Rerun the documented
 `bootstrap-host2.py --provider superserve` baseline with the Terraform artifact
 before requesting the standby deployment. It leaves VMD stopped; do not admit it.
 
+### Provision the standby OTEL collector before final verification
+
+VMD deployment does not install the host-local OTEL collector. After runtime
+provisioning, run **Deploy OTEL Collector** from this migration branch with
+`environment: staging` and `target: standby`. The staging job sources the same
+fixed-label selector as VMD/proxy: `component=vmd-staging-standby`, with exactly
+`superserve-vmd-staging-2` required as the discovered host. Zero matches, a
+serving host, or multiple matches fail before deployment. It does not fall back
+to `component=vmd`.
+
+The OTEL target defaults to `serving` to preserve existing manual behavior;
+select `standby` explicitly. Push runs retain the configured staging label, and
+production keeps its existing cell filters and rollout sequence (the target
+input applies only to staging).
+
+Do not run `bootstrap-host2.py --verify` until the standby collector deployment
+has succeeded. Confirm `superserve-otel-collector.service` is active and its
+health endpoint responds before final verification; the deployment also checks
+collector metrics. An inactive/not-found collector is an incomplete provisioning
+step, not a peer-credential bootstrap failure. This does not admit Host 2.
+
 ### Retiring the legacy VMD during enrollment
 
 Enrollment recognizes a loaded `agentbox-vmd.service`, even if its env files
