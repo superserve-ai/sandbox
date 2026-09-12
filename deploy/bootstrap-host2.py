@@ -76,10 +76,30 @@ def bootstrap(config, verify_only=False):
         if instance.get('status') not in ('RUNNING', 'TERMINATED'):
             raise ValueError('Host 2 must be running or fully stopped before bootstrap')
         return instance
+    def start():
+        try:
+            run('compute', 'instances', 'start', name, *flags, timeout=600)
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr or ''
+            if isinstance(detail, bytes):
+                detail = detail.decode(errors='replace')
+            if ('ZONE_RESOURCE_POOL_EXHAUSTED' in detail
+                    or 'does not have enough resources available' in detail.lower()):
+                try:
+                    stopped = describe()['status'] == 'TERMINATED'
+                except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    stopped = False
+                if stopped:
+                    print('Host 2 is safely stopped, but GCP has no capacity to restart it.\n'
+                          'Retry bootstrap later; do not recreate the host.', file=sys.stderr)
+                else:
+                    print('GCP reported a capacity stockout, but Host 2 could not be confirmed safely stopped.\n'
+                          'Inspect its state before retrying bootstrap; do not recreate the host.', file=sys.stderr)
+            raise
     instance = describe()
     started_from_stopped = not verify_only and instance['status'] == 'TERMINATED'
     if started_from_stopped:
-        run('compute', 'instances', 'start', name, *flags, timeout=600)
+        start()
     def ssh(script, timeout=120):
         return run('compute', 'ssh', name, *flags, '--tunnel-through-iap', '--command', script, timeout=timeout)
     if started_from_stopped:
@@ -214,7 +234,7 @@ sudo systemctl start vmd-peer-credentials.timer
         instance = describe()
         if instance['status'] != 'TERMINATED':
             raise ValueError('Host 2 did not fully stop; refusing activation')
-        run('compute', 'instances', 'start', name, *flags, timeout=600)
+        start()
     wait_for_managed_credentials(ssh)
     describe()
     ssh('''set -eu

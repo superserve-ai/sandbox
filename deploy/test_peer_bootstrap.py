@@ -267,7 +267,8 @@ class BootstrapActivationTest(unittest.TestCase):
                 self.assertEqual(stdout.getvalue(), '')
 
     def exercise(self, active=False, initially_stopped=False, fail_publication=False,
-                 admission_at=None, stop_fails=False, transient_active=False):
+                 admission_at=None, stop_fails=False, transient_active=False, start_error=None,
+                 failed_start_status="TERMINATED"):
         config = {'instance_name': 'superserve-vmd-staging-2', 'host_id': 'superserve-vmd-staging-2',
                   'project_id': 'example-project', 'zone': 'us-central1-a', 'instance_id': '1234567890',
                   'spiffe_uri': 'spiffe://example.test/peer', 'internal_ip': '192.0.2.3',
@@ -297,6 +298,9 @@ class BootstrapActivationTest(unittest.TestCase):
                     raise subprocess.CalledProcessError(1, args)
                 status = 'TERMINATED'
             elif operation == ['compute', 'instances', 'start']:
+                if start_error:
+                    status = failed_start_status
+                    raise subprocess.CalledProcessError(1, args, stderr=start_error)
                 status = 'RUNNING'
                 activated = True
             elif args[1:3] == ['compute', 'ssh']:
@@ -325,6 +329,37 @@ class BootstrapActivationTest(unittest.TestCase):
         for script in scripts:
             subprocess.run(['bash', '-n'], input=script, check=True, text=True, capture_output=True)
         return commands, scripts, output.getvalue(), error
+
+    def test_start_stockout_reports_stopped_host_without_retry(self):
+        for initially_stopped in (False, True):
+            for detail in ('ZONE_RESOURCE_POOL_EXHAUSTED', 'ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS',
+                           'The zone does not have enough resources available to fulfill the request.'):
+                stderr = io.StringIO()
+                with patch('sys.stderr', stderr):
+                    commands, _, output, error = self.exercise(initially_stopped=initially_stopped, start_error=detail)
+                self.assertIsInstance(error, subprocess.CalledProcessError)
+                self.assertIn(detail, stderr.getvalue())
+                self.assertIn('Host 2 is safely stopped, but GCP has no capacity to restart it.', stderr.getvalue())
+                self.assertIn('Retry bootstrap later; do not recreate the host.', stderr.getvalue())
+                self.assertEqual(sum(c[1:4] == ['compute', 'instances', 'start'] for c in commands), 1)
+                self.assertNotIn('Host 2 peer bootstrap installed', output)
+                self.assertFalse(any('create' in c or 'delete' in c for c in commands))
+
+    def test_other_start_errors_are_not_reported_as_stockouts(self):
+        stderr = io.StringIO()
+        with patch('sys.stderr', stderr):
+            _, _, _, error = self.exercise(start_error='PERMISSION_DENIED')
+        self.assertIsInstance(error, subprocess.CalledProcessError)
+        self.assertIn('PERMISSION_DENIED', stderr.getvalue())
+        self.assertNotIn('capacity', stderr.getvalue())
+
+    def test_stockout_does_not_claim_unconfirmed_host_is_stopped(self):
+        stderr = io.StringIO()
+        with patch('sys.stderr', stderr):
+            _, _, _, error = self.exercise(start_error='ZONE_RESOURCE_POOL_EXHAUSTED', failed_start_status='STAGING')
+        self.assertIsInstance(error, subprocess.CalledProcessError)
+        self.assertNotIn('Host 2 is safely stopped', stderr.getvalue())
+        self.assertIn('could not be confirmed safely stopped', stderr.getvalue())
 
     def test_missing_credentials_require_full_stop_start_then_publication(self):
         commands, scripts, output, error = self.exercise()

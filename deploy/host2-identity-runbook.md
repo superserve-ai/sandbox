@@ -90,6 +90,10 @@ bootstrap fails closed on subsequent deployments.
    `/etc/superserve/peer/current`, and validates the published generation before
    reporting success. Timeout or publication failure blocks admission; fix the
    underlying identity/guest-agent configuration and rerun bootstrap.
+   If GCP reports a capacity stockout at start, bootstrap confirms whether the
+   host remains stopped and fails with an operator-visible diagnostic. It does
+   not retry start automatically. Retry bootstrap later; do not recreate the
+   host or change its identity to work around a zonal stockout.
    Staging keeps `superserve-vmd-staging-2`; production keeps `usw2-2`.
    A conflicting existing HOST_ID is an error, not an implicit rename.
 
