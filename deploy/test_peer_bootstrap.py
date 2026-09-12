@@ -1,5 +1,6 @@
 import configparser
 import importlib.util
+import io
 import json
 import os
 import ssl
@@ -246,6 +247,25 @@ class ManagedIdentityTest(unittest.TestCase):
 
 
 class BootstrapActivationTest(unittest.TestCase):
+    def test_gcloud_failures_surface_stderr_and_preserve_exception(self):
+        config = {'instance_name': 'superserve-vmd-staging-2', 'host_id': 'superserve-vmd-staging-2',
+                  'project_id': 'example-project', 'zone': 'us-central1-a'}
+        for error, expected in (
+            (subprocess.CalledProcessError(1, ['gcloud'], output='not diagnostic',
+                                          stderr='ERROR: permission denied\n'), 'ERROR: permission denied\n'),
+            (subprocess.TimeoutExpired(['gcloud'], 120, stderr=b'SSH connection failed'), 'SSH connection failed\n'),
+            (subprocess.CalledProcessError(1, ['gcloud']), ''),
+        ):
+            with self.subTest(error=type(error).__name__, stderr=error.stderr):
+                stderr, stdout = io.StringIO(), io.StringIO()
+                with patch.object(BOOTSTRAP.subprocess, 'run', side_effect=error), \
+                     patch('sys.stderr', stderr), patch('sys.stdout', stdout):
+                    with self.assertRaises(type(error)) as caught:
+                        BOOTSTRAP.bootstrap(config)
+                self.assertIs(caught.exception, error)
+                self.assertEqual(stderr.getvalue(), expected)
+                self.assertEqual(stdout.getvalue(), '')
+
     def exercise(self, active=False, initially_stopped=False, fail_publication=False,
                  admission_at=None, stop_fails=False, transient_active=False):
         config = {'instance_name': 'superserve-vmd-staging-2', 'host_id': 'superserve-vmd-staging-2',
@@ -294,7 +314,6 @@ class BootstrapActivationTest(unittest.TestCase):
                 elif 'start vmd-peer-credentials.service' in script and fail_publication:
                     raise subprocess.CalledProcessError(1, args)
             return subprocess.CompletedProcess(args, 0, output, '')
-        import io
         output = io.StringIO()
         error = None
         with patch.object(BOOTSTRAP.subprocess, 'run', side_effect=run), \

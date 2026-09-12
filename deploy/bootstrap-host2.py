@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -49,7 +50,13 @@ def bootstrap(config, verify_only=False):
     project, zone, name = config['project_id'], config['zone'], config['instance_name']
     flags = [f'--project={project}', f'--zone={zone}', '--quiet']
     def run(*args, timeout=120):
-        return subprocess.run(['gcloud', *args], check=True, capture_output=True, text=True, timeout=timeout).stdout
+        try:
+            return subprocess.run(['gcloud', *args], check=True, capture_output=True, text=True, timeout=timeout).stdout
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            if exc.stderr:
+                stderr = exc.stderr.decode(errors='replace') if isinstance(exc.stderr, bytes) else exc.stderr
+                print(stderr, file=sys.stderr, end='' if stderr.endswith('\n') else '\n')
+            raise
     def describe():
         instance = json.loads(run('compute', 'instances', 'describe', name, *flags, '--format=json'))
         if str(instance['id']) != config['instance_id'] or instance['networkInterfaces'][0]['networkIP'] != config['internal_ip']:
