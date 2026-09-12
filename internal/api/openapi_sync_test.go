@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -80,7 +81,12 @@ func TestOpenAPIPreviewTokenIsDocumentedAsARequestCredential(t *testing.T) {
 	}
 }
 
-// loadSpecOps parses api/openapi.yaml and returns its operations as "METHOD /path".
+// qmSpecTag marks operations served by the qm-api binary (internal/qm);
+// its own sync test holds them to the qm router.
+const qmSpecTag = "qm"
+
+// loadSpecOps parses api/openapi.yaml and returns the control plane's
+// operations as "METHOD /path", leaving out those tagged for qm-api.
 func loadSpecOps(t *testing.T) map[string]bool {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
@@ -101,10 +107,12 @@ func loadSpecOps(t *testing.T) map[string]bool {
 	}
 	ops := map[string]bool{}
 	for path, item := range doc.Paths {
-		for key := range item {
-			if m := strings.ToUpper(key); httpMethods[m] {
-				ops[m+" "+path] = true
+		for key, op := range item {
+			m := strings.ToUpper(key)
+			if !httpMethods[m] || slices.Contains(opTags(op), qmSpecTag) {
+				continue
 			}
+			ops[m+" "+path] = true
 		}
 	}
 	return ops
@@ -119,4 +127,21 @@ func ginPathToOpenAPI(p string) string {
 		}
 	}
 	return strings.Join(segs, "/")
+}
+
+// opTags returns an operation's tags; path-level keys like parameters are
+// not operations and yield none.
+func opTags(op any) []string {
+	m, ok := op.(map[string]any)
+	if !ok {
+		return nil
+	}
+	raw, _ := m["tags"].([]any)
+	tags := make([]string, 0, len(raw))
+	for _, t := range raw {
+		if s, ok := t.(string); ok {
+			tags = append(tags, s)
+		}
+	}
+	return tags
 }
