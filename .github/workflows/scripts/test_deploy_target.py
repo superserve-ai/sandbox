@@ -32,22 +32,33 @@ class DeployTargetTests(unittest.TestCase):
     def test_exact_standby_mappings_and_defaults(self):
         for cell, region, host in (
             ("staging", "us-central1", "superserve-vmd-staging-2"),
-            ("use4", "us-east4", "superserve-vmd-use4-2"),
             ("usw2", "us-west2", "superserve-vmd-usw2-2"),
         ):
             for target in ("", "standby"):
                 with self.subTest(cell=cell, target=target):
                     result = self.select(DEPLOY_CELL=cell, GCP_REGION=region,
-                                         DEPLOY_PRODUCTION_CELL="use4" if cell == "use4" else "",
+                                         DEPLOY_PRODUCTION_CELL="",
                                          DEPLOY_TARGET=target)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout.splitlines(),
                                      [f"component=vmd-{cell}-standby", host, host, "0", "auto"])
 
     def test_serving_preserves_existing_peer_configuration(self):
-        result = self.select(DEPLOY_TARGET="serving")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.splitlines(), ["component=vmd", "legacy-host", "", "0", "auto"])
+        for cell in ("staging", "use4", "usw2"):
+            result = self.select(DEPLOY_TARGET="serving", DEPLOY_CELL=cell,
+                                 DEPLOY_PRODUCTION_CELL="use4" if cell == "use4" else "usw2")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["component=vmd", "legacy-host", "", "0", "auto"])
+
+    def test_use4_standby_is_unconfigured_and_blocks_deployment(self):
+        for target in ("", "standby"):
+            result = self.select(DEPLOY_TARGET=target, DEPLOY_CELL="use4",
+                                 DEPLOY_PRODUCTION_CELL="use4", GCP_REGION="us-east4",
+                                 EXPECTED_STANDBY_HOST="legacy-host")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("No standby identity host configured", result.stderr)
+            # Nothing after sourcing the selector may run, even with a stale host override.
+            self.assertEqual(result.stdout, "")
 
     def test_push_ignores_selectors_and_preserves_environment(self):
         for cell in ("staging", "use4", "usw2"):
