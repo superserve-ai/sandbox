@@ -115,6 +115,10 @@ Env vars:
   VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN optional — minimum time between
                        reclamation passes. When set, upserted into vmd.env.
 
+Fresh or partially configured hosts require CONTROL_PLANE_URL, DATABASE_URL and
+INTERNAL_API_TOKEN from deployment inputs before any host changes. Configured
+hosts may omit inputs to preserve their existing values.
+
 All deploy artifacts (binaries + systemd units + scripts) are packed
 into a single tarball and SCP'd once per host. Each gcloud SCP/SSH
 opens a fresh IAP tunnel (~10-15s setup), so bundling cuts per-host
@@ -134,6 +138,44 @@ import subprocess
 import sys
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def runtime_input_preflight(control_plane_url, database_url, internal_api_token):
+    """Read-only host check; pass only input presence, never secrets, to the probe."""
+    script = textwrap.dedent("""
+        set -euo pipefail
+        SECRETSPROXY_FRESH=0
+        if sudo test -e /etc/sandbox/.runtime-bootstrap-pending \
+           || ! sudo test -s /etc/sandbox/vmd.env \
+           || ! sudo test -s /etc/sandbox/secretsproxy.env \
+           || ! sudo test -s /var/lib/secretsproxy/ca.crt \
+           || ! sudo test -s /var/lib/secretsproxy/ca.key; then
+            SECRETSPROXY_FRESH=1
+        fi
+        # Also detect a partial prior deploy that created env files but omitted inputs.
+        for setting in vmd:CONTROL_PLANE_URL vmd:INTERNAL_API_TOKEN secretsproxy:CONTROL_PLANE_URL secretsproxy:DAEMON_AUTH_TOKEN; do
+            file=${setting%%:*}
+            key=${setting#*:}
+            if ! sudo test -s "/etc/sandbox/$file.env" || ! sudo grep -q "^$key=." "/etc/sandbox/$file.env"; then
+                SECRETSPROXY_FRESH=1
+            fi
+        done
+        if ! sudo test -s /etc/sandbox/secretsproxy.env || { ! sudo grep -q '^DATABASE_URL=.' /etc/sandbox/secretsproxy.env \
+           && ! sudo grep -q '^SECRETSPROXY_AUDIT_DISABLED=true$' /etc/sandbox/secretsproxy.env; }; then
+            SECRETSPROXY_FRESH=1
+        fi
+    """)
+    for name, value in (("CONTROL_PLANE_URL", control_plane_url),
+                        ("DATABASE_URL", database_url),
+                        ("INTERNAL_API_TOKEN", internal_api_token)):
+        if not value.strip():
+            script += f"""
+if [ "$SECRETSPROXY_FRESH" = 1 ]; then
+    echo "ERROR: fresh-host deployment requires {name}; configure the deploy input before retrying (host unchanged)" >&2
+    exit 1
+fi
+"""
+    return script
 
 
 def run_or_die(cmd, context):
@@ -353,6 +395,16 @@ def main() -> int:
         tag = f"{name}/{zone}"
         q_host_id_line = shlex.quote(f"HOST_ID={name}")
 
+        input_preflight = runtime_input_preflight(control_plane_url, database_url, internal_api_token)
+        # Probe before even uploading when missing inputs might require aborting.
+        # Fully supplied deploys need no additional SSH round trip.
+        if not all(value.strip() for value in (control_plane_url, database_url, internal_api_token)):
+            run_or_die([
+                "gcloud", "compute", "ssh", name,
+                f"--zone={zone}", f"--project={project}",
+                "--quiet", "--tunnel-through-iap", "--command", input_preflight,
+            ], f"[{tag}] runtime input preflight")
+
         # Single SCP — one IAP tunnel for the whole bundle.
         run_or_die(
             [
@@ -364,8 +416,7 @@ def main() -> int:
         )
         print(f"[{tag}] bundle uploaded")
 
-        inject_script = textwrap.dedent(f"""
-            set -euo pipefail
+        inject_script = input_preflight + textwrap.dedent(f"""
 
             # Precondition, checked before any host mutation: if
             # BACKUP_JOURNAL_PATH names a path outside a real mount (the
@@ -444,14 +495,6 @@ def main() -> int:
             fi
 
             # Fresh-host env bootstrap: create once, never truncate populated files.
-            SECRETSPROXY_FRESH=0
-            if sudo test -e /etc/sandbox/.runtime-bootstrap-pending \
-               || ! sudo test -s /etc/sandbox/vmd.env \
-               || ! sudo test -s /etc/sandbox/secretsproxy.env \
-               || ! sudo test -s /var/lib/secretsproxy/ca.crt \
-               || ! sudo test -s /var/lib/secretsproxy/ca.key; then
-                SECRETSPROXY_FRESH=1
-            fi
             sudo install -d -o root -g root -m 0755 /etc/sandbox
             for env_file in /etc/sandbox/vmd.env /etc/sandbox/secretsproxy.env; do
                 if ! sudo test -e "$env_file"; then

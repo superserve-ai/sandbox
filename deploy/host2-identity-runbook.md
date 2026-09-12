@@ -283,6 +283,27 @@ against the canonical host preparation procedure. Rerun the documented
 `bootstrap-host2.py --provider superserve` baseline with the Terraform artifact
 before requesting the standby deployment. It leaves VMD stopped; do not admit it.
 
+### Staging workflow runtime configuration
+
+The staging GitHub environment is the canonical source for fresh-host runtime
+configuration. The VMD workflow passes `vars.CONTROL_PLANE_URL_STAGING` as
+`CONTROL_PLANE_URL`, `secrets.DATABASE_URL_STAGING` as `DATABASE_URL`, and
+`secrets.STAGING_INTERNAL_API_TOKEN` as `INTERNAL_API_TOKEN`. These values are
+configured in that environment; the workflow rejects unset values before invoking
+the deploy script. Never copy Host 1's env file to supply them.
+
+The deploy script also validates these inputs for fresh or partially configured
+hosts. If any input is absent, a read-only probe rejects an incomplete host before
+bundle upload, env writes, unit changes, binary replacement or boxd injection.
+The check runs again at the start of remote convergence. Already-configured hosts
+can preserve omitted values when invoked outside the workflow; supplied values
+still intentionally reconcile both env files. Missing inputs leave the host as
+found, including any guard from an earlier attempt.
+
+Once the CA/artifact and baseline checks above pass, rerun the VMD workflow on
+this branch with `environment: staging` and `target: standby`. This configuration
+change does not itself transfer prerequisites, deploy, or admit Host 2.
+
 CD creates env files without truncating existing content, keeps vmd.env root-owned
 0644 and secretsproxy.env 0600, and reconciles deployment-supplied control-plane,
 auth and database values. It requires an explicit approved KERNEL_PATH, defaults

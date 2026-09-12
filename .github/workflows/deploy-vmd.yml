@@ -188,6 +188,9 @@ jobs:
       # fan-out — the cell deploys sequentially after production below.
       - name: Discover and deploy to VMD instances
         env:
+          CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_STAGING }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+          INTERNAL_API_TOKEN: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
           DEPLOY_CELL: staging
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
@@ -240,6 +243,9 @@ jobs:
           MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
           source .github/workflows/scripts/select-deploy-target.sh
+          : "${CONTROL_PLANE_URL:?CONTROL_PLANE_URL_STAGING is unset — refusing to deploy without it}"
+          : "${DATABASE_URL:?DATABASE_URL_STAGING is unset — refusing to deploy without it}"
+          : "${INTERNAL_API_TOKEN:?STAGING_INTERNAL_API_TOKEN is unset — refusing to deploy without it}"
           python3 .github/workflows/scripts/deploy-vmd.py
 
   deploy-production:
@@ -351,7 +357,7 @@ jobs:
           : "${GCP_REGION:?GCP_REGION_USE4 is unset — refusing an unscoped use4 primary fan-out}"
           # deploy-vmd.py treats an empty CONTROL_PLANE_URL/DATABASE_URL/
           # INTERNAL_API_TOKEN as "skip, leave the host's existing value alone" —
-          # the right behavior for staging/unprovisioned hosts, but silently
+          # supported for already-configured hosts, but silently
           # deploying-and-reporting-success while these are unset on a
           # production host is exactly the failure mode this workflow exists
           # to prevent. Fail closed rather than skip.

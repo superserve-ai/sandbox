@@ -1,5 +1,6 @@
 """Execute fresh-host initialization and fail-closed daemon ordering in a fake host."""
 import ast
+import importlib.util
 import os
 from pathlib import Path
 import shlex
@@ -9,6 +10,9 @@ import textwrap
 import unittest
 
 SOURCE = Path(__file__).with_name('deploy-vmd.py').read_text()
+spec = importlib.util.spec_from_file_location('deploy_vmd_fresh', Path(__file__).with_name('deploy-vmd.py'))
+deploy_vmd = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(deploy_vmd)
 
 
 def block(start, end):
@@ -23,7 +27,7 @@ READY = block('# Fresh-host runtime preflight.\n', '# End fresh-host runtime pre
 
 
 class FreshHostTest(unittest.TestCase):
-    def exercise(self, missing=('vmd', 'secretsproxy'), fail_daemon=False, missing_input=False, assets=True, ca_missing=(), custom_paths=False, configure_kernel=True, missing_artifact=None):
+    def exercise(self, missing=('vmd', 'secretsproxy'), fail_daemon=False, missing_input=False, assets=True, ca_missing=(), custom_paths=False, configure_kernel=True, missing_artifact=None, configured=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             envdir = root / 'etc/sandbox'
@@ -31,6 +35,10 @@ class FreshHostTest(unittest.TestCase):
             for name in ('vmd', 'secretsproxy'):
                 if name not in missing:
                     (envdir / (name + '.env')).write_text('HOST_ID=existing-host\nCUSTOM=preserve\n')
+            if configured:
+                for name in ('vmd', 'secretsproxy'):
+                    with (envdir / (name + '.env')).open('a') as env:
+                        env.write('CONTROL_PLANE_URL=https://old.example.test\nDATABASE_URL=postgres://old.example.test/db\nINTERNAL_API_TOKEN=old-token\nDAEMON_AUTH_TOKEN=old-token\n')
             ca_dir = root / 'var/lib/secretsproxy'
             ca_dir.mkdir(parents=True)
             for name in ('ca.crt', 'ca.key'):
@@ -52,16 +60,19 @@ class FreshHostTest(unittest.TestCase):
                     asset = root / name.lstrip('/')
                     asset.parent.mkdir(parents=True, exist_ok=True)
                     asset.write_text('approved artifact')
+            supplied = {}
             values = {'service': 'superserve-vmd.service', 'q_host_id_line': shlex.quote('HOST_ID=example-host')}
             for key, name, value in [('cpu', 'CONTROL_PLANE_URL', 'https://example.test'),
                                      ('token', 'INTERNAL_API_TOKEN', 'example-token'),
                                      ('db', 'DATABASE_URL', 'postgres://example.test/db')]:
-                values['q_' + key] = shlex.quote('' if missing_input and key == 'token' else value)
+                supplied[key] = '' if missing_input in (name, 'all') or (missing_input is True and key == 'token') else value
+                values['q_' + key] = shlex.quote(supplied[key])
                 values['q_' + key + '_line'] = shlex.quote(name + '=' + value)
             values['q_iat_line'] = shlex.quote('INTERNAL_API_TOKEN=example-token')
             values['q_dat_line'] = shlex.quote('DAEMON_AUTH_TOKEN=example-token')
             script = '\n'.join((BOOTSTRAP, HOST_ID, CONTROL, TOKENS, READY))
             script = ast.literal_eval('"""' + script + '"""').format(**values)
+            script = deploy_vmd.runtime_input_preflight(supplied['cpu'], supplied['db'], supplied['token']) + script
             script = script.replace('/etc/systemd', str(root / 'etc/systemd')).replace('/etc/sandbox', str(envdir)).replace('/var/lib/', str(root / 'var/lib') + '/')
             prelude = '''set -eu
 sudo() { if [ "$1" = chown ]; then return; fi; "$@"; }
@@ -81,12 +92,18 @@ journalctl() { :; }
 '''
             # Ownership is exercised by Linux CI (root); avoid changing ownership in local tests.
             script = script.replace('-o root -g root ', '')
+            before = {str(p.relative_to(root)): (p.read_bytes(), p.stat().st_mode) for p in root.rglob('*') if p.is_file()}
             result = subprocess.run(['bash', '-c', prelude + script + '\necho vmd-may-start\n'],
                 text=True, capture_output=True, env=dict(os.environ, CALLS=str(root/'calls'),
                 CA_DIR=str(root/'var/lib/secretsproxy'), FAIL_DAEMON=str(int(fail_daemon))))
+            if missing_input and not configured:
+                after = {str(p.relative_to(root)): (p.read_bytes(), p.stat().st_mode) for p in root.rglob('*') if p.is_file()}
+                self.assertEqual(before, after, 'missing input must not mutate the host')
             for name in ('ca.crt', 'ca.key'):
                 if name not in ca_missing:
                     self.assertEqual((ca_dir / name).read_text(), 'existing-cell-' + name)
+            if configured:
+                self.assertFalse((root / 'calls').exists(), 'configured hosts retain normal restart ordering')
             if ca_missing:
                 self.assertFalse((root / 'calls').exists(), 'must fail before secretsproxy starts')
             if not assets:
@@ -111,7 +128,7 @@ journalctl() { :; }
                 self.assertIn('vmd-may-start', result.stdout)
 
     def test_missing_settings_or_daemon_failure_block_vmd(self):
-        for options, message in [({'missing_input': True}, 'requires DAEMON_AUTH_TOKEN'),
+        for options, message in [({'missing_input': True}, 'requires INTERNAL_API_TOKEN'),
                                  ({'fail_daemon': True}, 'secretsproxy provisioning/readiness failed'),
                                  ({'assets': False}, 'provisioned kernel/base-rootfs')]:
             with self.subTest(options=options):
@@ -119,6 +136,29 @@ journalctl() { :; }
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
                 self.assertNotIn('vmd-may-start', result.stdout)
+
+    def test_each_missing_input_fails_without_host_mutation(self):
+        for name in ('CONTROL_PLANE_URL', 'DATABASE_URL', 'INTERNAL_API_TOKEN'):
+            with self.subTest(name=name):
+                result, _, _ = self.exercise(missing_input=name)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('requires ' + name, result.stderr)
+                self.assertNotIn('vmd-may-start', result.stdout)
+
+    def test_configured_hosts_preserve_omitted_inputs_and_reconcile_supplied_ones(self):
+        for omitted in ('all', False):
+            result, envs, _ = self.exercise(missing=(), configured=True, missing_input=omitted)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = 'https://old.example.test' if omitted else 'https://example.test'
+            self.assertIn('CONTROL_PLANE_URL=' + expected, envs['vmd.env'])
+            self.assertIn('DATABASE_URL=' + ('postgres://old.example.test/db' if omitted else 'postgres://example.test/db'), envs['vmd.env'])
+            self.assertIn('DAEMON_AUTH_TOKEN=' + ('old-token' if omitted else 'example-token'), envs['secretsproxy.env'])
+            self.assertIn('HOST_ID=existing-host', envs['vmd.env'])
+            self.assertNotIn('restart-secretsproxy', result.stdout)
+
+    def test_preflight_precedes_bundle_upload_and_remote_mutations(self):
+        self.assertLess(SOURCE.index('runtime input preflight")'), SOURCE.index('"compute", "scp"'))
+        self.assertLess(SOURCE.index('inject_script = input_preflight +'), SOURCE.index('sudo install -d'))
 
     def test_blank_vmd_env_requires_explicit_kernel_selection(self):
         result, envs, modes = self.exercise(configure_kernel=False)
