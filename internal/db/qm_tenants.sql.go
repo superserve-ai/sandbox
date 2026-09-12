@@ -338,7 +338,7 @@ SET public_url         = COALESCE($3, public_url),
     service_account    = COALESCE($8, service_account),
     sandbox_api_key_id = COALESCE($9, sandbox_api_key_id),
     updated_at         = now()
-WHERE id = $1 AND team_id = $2
+WHERE id = $1 AND team_id = $2 AND status <> 'deleted'
 RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at
 `
 
@@ -396,7 +396,7 @@ func (q *Queries) UpdateQMTenantResources(ctx context.Context, arg UpdateQMTenan
 const updateQMTenantStatus = `-- name: UpdateQMTenantStatus :one
 UPDATE qm.tenants
 SET status = $3, updated_at = now()
-WHERE id = $1 AND team_id = $2
+WHERE id = $1 AND team_id = $2 AND status <> 'deleted'
 RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at
 `
 
@@ -406,6 +406,7 @@ type UpdateQMTenantStatusParams struct {
 	Status string    `json:"status"`
 }
 
+// deleted is terminal: a racing worker must not resurrect a retired tenant.
 func (q *Queries) UpdateQMTenantStatus(ctx context.Context, arg UpdateQMTenantStatusParams) (QmTenant, error) {
 	row := q.db.QueryRow(ctx, updateQMTenantStatus, arg.ID, arg.TeamID, arg.Status)
 	var i QmTenant

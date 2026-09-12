@@ -409,3 +409,31 @@ func TestQMAPI_RejectsAPIKeyOwnedByAnotherTeam(t *testing.T) {
 		t.Fatalf("after key deletion: team=%s (want %s) keyValid=%v (want false)", stillTeam, teamID, released.Valid)
 	}
 }
+
+func TestQMAPI_DeletedTenantStaysDeleted(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedQMTeamAndKey(t)
+	conn := connectAsQMAPI(t)
+	_, q := scopedQMTx(t, conn, teamID)
+
+	tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	if _, err := q.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenant.ID, TeamID: teamID}); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	_, err = q.UpdateQMTenantStatus(ctx, db.UpdateQMTenantStatusParams{ID: tenant.ID, TeamID: teamID, Status: "ready"})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("status update after delete: want no rows, got err=%v", err)
+	}
+	url := "https://resurrected.example.com"
+	_, err = q.UpdateQMTenantResources(ctx, db.UpdateQMTenantResourcesParams{ID: tenant.ID, TeamID: teamID, PublicUrl: &url})
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("resources update after delete: want no rows, got err=%v", err)
+	}
+	got, err := q.GetQMTenant(ctx, db.GetQMTenantParams{ID: tenant.ID, TeamID: teamID})
+	if err != nil || got.Status != "deleted" {
+		t.Fatalf("deleted tenant: status=%q err=%v", got.Status, err)
+	}
+}

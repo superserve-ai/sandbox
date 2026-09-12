@@ -27,9 +27,10 @@ WHERE team_id = $1 AND status <> 'deleted'
 ORDER BY created_at DESC;
 
 -- name: UpdateQMTenantStatus :one
+-- deleted is terminal: a racing worker must not resurrect a retired tenant.
 UPDATE qm.tenants
 SET status = $3, updated_at = now()
-WHERE id = $1 AND team_id = $2
+WHERE id = $1 AND team_id = $2 AND status <> 'deleted'
 RETURNING *;
 
 -- name: UpdateQMTenantResources :one
@@ -44,7 +45,7 @@ SET public_url         = COALESCE(sqlc.narg('public_url'), public_url),
     service_account    = COALESCE(sqlc.narg('service_account'), service_account),
     sandbox_api_key_id = COALESCE(sqlc.narg('sandbox_api_key_id'), sandbox_api_key_id),
     updated_at         = now()
-WHERE id = $1 AND team_id = $2
+WHERE id = $1 AND team_id = $2 AND status <> 'deleted'
 RETURNING *;
 
 -- name: SoftDeleteQMTenant :one
