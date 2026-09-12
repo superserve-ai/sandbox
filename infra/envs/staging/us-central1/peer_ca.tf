@@ -1,6 +1,6 @@
 variable "peer_ca_operator_members" {
   type        = set(string)
-  default     = []
+  default     = ["user:alejandro@superserve.ai"]
   description = "Reviewed user/group IAM principals allowed to impersonate the staging peer issuer. No grant by default."
 }
 
