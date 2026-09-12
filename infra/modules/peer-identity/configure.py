@@ -62,7 +62,7 @@ def configure(config):
         policy.write_text(json.dumps(attestation_policy(config)))
         gcloud(*pool, "managed-identities", "set-attestation-rules", config["identity"],
                *scoped, f"--policy-file={policy}")
-    principal = (f"principalSet://iam.googleapis.com/projects/{config['project_number']}/locations/global/"
+    principal = (f"principalSet://iam.googleapis.com/projects/{config['project_number']}/name/locations/global/"
                  f"workloadIdentityPools/{config['pool_id']}/*")
     for role in ("roles/privateca.workloadCertificateRequester", "roles/privateca.poolReader"):
         gcloud("privateca", "pools", "add-iam-policy-binding", config["ca_pool"],
@@ -77,8 +77,9 @@ def configure(config):
     if current.get('identity') not in (None, '', desired):
         raise RuntimeError('existing managed identity differs; review immutable identity migration')
     if current.get('identity') != desired or not current.get('identityCertificateEnabled'):
-        if instance.get('labels', {}).get('sandbox_status') == 'ready':
-            raise RuntimeError('remove Host 2 from ready discovery before identity enablement')
+        labels = instance.get('labels', {})
+        if labels.get('sandbox_status') == 'ready' or labels.get('component') == 'vmd':
+            raise RuntimeError('remove Host 2 from ready/serving discovery before identity enablement')
         gcloud("compute", "instances", "update", config["instance_name"], f"--zone={config['zone']}",
                f"--identity={desired}", "--identity-certificate", "--most-disruptive-allowed-action=RESTART")
 

@@ -7,6 +7,39 @@ from pathlib import Path
 import shlex
 import subprocess
 import tempfile
+import time
+
+
+MANAGED_CREDENTIALS_CHECK = '''set -eu
+for credential in certificates.pem private_key.pem ca_certificates.pem; do
+    if ! sudo test -s "/run/secrets/workload-spiffe-credentials/$credential"; then
+        echo pending
+        exit 0
+    fi
+done
+echo ready
+'''
+
+
+def wait_for_guest_check(ssh, script, description, timeout=300):
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            if ssh(script,
+                   timeout=min(30, remaining)).strip() == 'ready':
+                return
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # SSH and the guest agent may not be ready immediately after start.
+            pass
+        time.sleep(min(5, max(0, deadline - time.monotonic())))
+    raise TimeoutError(f'{description} did not become available within the bootstrap timeout')
+
+
+def wait_for_managed_credentials(ssh, timeout=300):
+    wait_for_guest_check(ssh, MANAGED_CREDENTIALS_CHECK, 'managed workload credentials', timeout)
 
 
 def bootstrap(config, verify_only=False):
@@ -15,25 +48,36 @@ def bootstrap(config, verify_only=False):
         raise ValueError('bootstrap is restricted to the existing cold-standby Host 2 identities')
     project, zone, name = config['project_id'], config['zone'], config['instance_name']
     flags = [f'--project={project}', f'--zone={zone}', '--quiet']
-    def run(*args):
-        return subprocess.run(['gcloud', *args], check=True, capture_output=True, text=True).stdout
-    instance = json.loads(run('compute', 'instances', 'describe', name, *flags, '--format=json'))
-    if str(instance['id']) != config['instance_id'] or instance['networkInterfaces'][0]['networkIP'] != config['internal_ip']:
-        raise ValueError('Host 2 immutable identity or private IP changed; regenerate Terraform output')
-    if instance['serviceAccounts'][0]['email'] != config['runtime_email']:
-        raise ValueError('apply the dedicated runtime identity first')
-    labels = instance.get('labels', {})
-    if not verify_only and (labels.get('sandbox_status') == 'ready' or labels.get('component') == 'vmd'):
-        raise ValueError('Host 2 must be excluded from sandbox_status=ready and component=vmd deployment discovery before migration')
-    if not verify_only and instance.get('status') == 'TERMINATED':
-        run('compute', 'instances', 'start', name, *flags)
-    def ssh(script):
-        return run('compute', 'ssh', name, *flags, '--tunnel-through-iap', '--command', script)
-    if verify_only:
+    def run(*args, timeout=120):
+        return subprocess.run(['gcloud', *args], check=True, capture_output=True, text=True, timeout=timeout).stdout
+    def describe():
+        instance = json.loads(run('compute', 'instances', 'describe', name, *flags, '--format=json'))
+        if str(instance['id']) != config['instance_id'] or instance['networkInterfaces'][0]['networkIP'] != config['internal_ip']:
+            raise ValueError('Host 2 immutable identity or private IP changed; regenerate Terraform output')
+        if instance['serviceAccounts'][0]['email'] != config['runtime_email']:
+            raise ValueError('apply the dedicated runtime identity first')
+        labels = instance.get('labels', {})
+        if not verify_only:
+            standby_label = ('vmd-staging-standby' if name == 'superserve-vmd-staging-2'
+                             else 'vmd-usw2-standby')
+            if labels.get('sandbox_status') == 'ready' or labels.get('component') != standby_label:
+                raise ValueError('Host 2 must retain its standby label and remain excluded from ready/serving deployment discovery before migration')
         expected = config['spiffe_uri'].removeprefix('spiffe://')
         identity = instance.get('workloadIdentityConfig', {})
         if identity.get('identity') != expected or not identity.get('identityCertificateEnabled'):
             raise ValueError('Compute managed identity configuration is missing or mismatched')
+        if instance.get('status') not in ('RUNNING', 'TERMINATED'):
+            raise ValueError('Host 2 must be running or fully stopped before bootstrap')
+        return instance
+    instance = describe()
+    started_from_stopped = not verify_only and instance['status'] == 'TERMINATED'
+    if started_from_stopped:
+        run('compute', 'instances', 'start', name, *flags, timeout=600)
+    def ssh(script, timeout=120):
+        return run('compute', 'ssh', name, *flags, '--tunnel-through-iap', '--command', script, timeout=timeout)
+    if started_from_stopped:
+        wait_for_guest_check(ssh, 'echo ready', 'guest SSH')
+    if verify_only:
         host_id = shlex.quote(config['host_id'])
         ssh(f'''set -eu
 for credential in certificates.pem private_key.pem ca_certificates.pem; do
@@ -65,6 +109,12 @@ sudo test -c /dev/kvm
 mountpoint -q /mnt/sandbox-data
 sudo systemctl cat google-guest-agent.service >/dev/null
 ''')
+    def managed_credentials_available():
+        state = ssh(MANAGED_CREDENTIALS_CHECK).strip()
+        if state not in ('ready', 'pending'):
+            raise ValueError('unexpected managed credential readiness response')
+        return state == 'ready'
+    credentials_were_active = managed_credentials_available()
     upload_dir = ssh('umask 077; mktemp -d /tmp/vmd-peer.XXXXXXXX').strip()
     if not re.fullmatch(r'/tmp/vmd-peer\.[A-Za-z0-9]+', upload_dir):
         raise ValueError('unexpected upload directory')
@@ -79,6 +129,11 @@ sudo systemctl cat google-guest-agent.service >/dev/null
     ssh(f'''set -eu
 sudo systemctl stop superserve-vmd.socket superserve-vmd.service
 sudo install -d -m 0700 /etc/superserve/peer /run/secrets/workload-spiffe-credentials
+sudo touch /etc/superserve/peer/bootstrap-pending
+for unit in superserve-vmd.socket superserve-vmd.service; do
+    sudo mkdir -p "/etc/systemd/system/$unit.d"
+    printf '[Unit]\\nConditionPathExists=!/etc/superserve/peer/bootstrap-pending\\n' | sudo tee "/etc/systemd/system/$unit.d/90-peer-bootstrap.conf" >/dev/null
+done
 sudo install -m 0600 {upload_dir}/identity.json /etc/superserve/peer/identity.json
 sudo install -m 0755 {upload_dir}/refresh-peer-credentials.py /usr/local/sbin/refresh-peer-credentials
 for env in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
@@ -141,6 +196,28 @@ else
     sudo systemctl restart google-guest-agent.service
 fi
 sudo systemctl start vmd-peer-credentials.timer
+''')
+    if not credentials_were_active and not managed_credentials_available() and not started_from_stopped:
+        # Identity fields can be correct while certificate issuance is inactive.
+        # Only this explicit cold-standby procedure may do a full stop/start.
+        instance = describe()
+        if instance['status'] != 'RUNNING':
+            raise ValueError('Host 2 state changed before activation; retry bootstrap')
+        run('compute', 'instances', 'stop', name, *flags, '--discard-local-ssd=False', timeout=600)
+        instance = describe()
+        if instance['status'] != 'TERMINATED':
+            raise ValueError('Host 2 did not fully stop; refusing activation')
+        run('compute', 'instances', 'start', name, *flags, timeout=600)
+    wait_for_managed_credentials(ssh)
+    describe()
+    ssh('''set -eu
+sudo systemctl stop superserve-vmd.socket superserve-vmd.service
+mountpoint -q /mnt/sandbox-data
+sudo systemctl start vmd-peer-credentials.service
+sudo test -d /etc/superserve/peer/current
+sudo /usr/local/sbin/refresh-peer-credentials --check
+sudo rm -f /etc/superserve/peer/bootstrap-pending /etc/systemd/system/superserve-vmd.socket.d/90-peer-bootstrap.conf /etc/systemd/system/superserve-vmd.service.d/90-peer-bootstrap.conf
+sudo systemctl daemon-reload
 ''')
     print('Host 2 peer bootstrap installed. Deploy and verify the normal runtime before admission.')
 

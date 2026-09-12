@@ -71,9 +71,25 @@ bootstrap fails closed on subsequent deployments.
    preserves the existing host-row ID, installs the refresh worker, and enables
    guest certificate provisioning with `[MWLID] enabled=true` in
    `/etc/default/instance_configs.cfg`. It starts the cold standby if Terraform
-   left it stopped; identity enablement's restart was handled by the adapter.
-   It stops VMD during preparation and leaves it for the controlled runtime
-   deployment to start. Only the guest agent is restarted after installation.
+   left it stopped. If managed credentials are absent on a running standby,
+   this explicit procedure performs a full Compute stop/start: updating the
+   identity fields or restarting the guest agent alone does not activate
+   workload certificates on an existing VM. Before each power operation it
+   rechecks the immutable instance identity, runtime account, managed identity,
+   exact standby label and exclusion from `sandbox_status=ready`. Keep directory
+   placement disabled and do not run admission concurrently with bootstrap.
+   The stop requests local SSD preservation and fails rather than discarding
+   data if preservation is unsupported. VMD is held behind a temporary systemd
+   condition across activation; failed bootstrap retains this guard for retry.
+   It remains stopped after bootstrap for the controlled runtime deployment.
+   Already-active managed credentials skip the VM stop/start, including when
+   a guest-agent refresh temporarily makes source files unavailable.
+   Bootstrap waits up to five minutes for all three nonempty files under
+   `/run/secrets/workload-spiffe-credentials`, tolerating SSH reconnects after
+   start. It then runs `vmd-peer-credentials.service`, requires
+   `/etc/superserve/peer/current`, and validates the published generation before
+   reporting success. Timeout or publication failure blocks admission; fix the
+   underlying identity/guest-agent configuration and rerun bootstrap.
    Staging keeps `superserve-vmd-staging-2`; production keeps `usw2-2`.
    A conflicting existing HOST_ID is an error, not an implicit rename.
 
@@ -81,7 +97,12 @@ The pinned stable production provider lacks the required identity fields.
 `terraform_data.managed_identity` reconciles its Terraform-owned inputs with
 Google's CLI, including exact instance-ID attestation. The Compute update
 explicitly allows `RESTART` (required by the SDK); unchanged identities are
-not updated again. This operation is visible in the adapter's configuration,
+not updated again. This restart is not certificate activation; full stop/start
+belongs only to the guarded bootstrap procedure, never to an unconditional
+Terraform side effect. CA-pool bindings for both workload certificate requester
+and pool reader use `principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/name/locations/global/workloadIdentityPools/POOL_ID/*`;
+the `/name/` segment is required for managed workload identity principals.
+This operation is visible in the adapter's configuration,
 not as a native Compute field in a plan. It must be reviewed with the code.
 For drift repair, replace that adapter resource in a reviewed plan; it reuses
 existing pools/identities and replaces the attestation policy with the exact
