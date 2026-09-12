@@ -67,6 +67,49 @@ func TestNewCAReloadsExistingMaterial(t *testing.T) {
 	}
 }
 
+func TestNewCAFreshHostsHaveIndependentPersistentKeys(t *testing.T) {
+	firstDir, secondDir := t.TempDir(), t.TempDir()
+	certPath, keyPath := filepath.Join(firstDir, "ca.crt"), filepath.Join(firstDir, "ca.key")
+	first, err := NewCA(certPath, keyPath, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyBefore, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewCA(filepath.Join(secondDir, "ca.crt"), filepath.Join(secondDir, "ca.key"), 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first.RootPEM()) == string(second.RootPEM()) {
+		t.Fatal("fresh hosts unexpectedly share a CA")
+	}
+	if _, err := NewCA(certPath, keyPath, 16); err != nil {
+		t.Fatal(err)
+	}
+	keyAfter, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(keyBefore) != string(keyAfter) {
+		t.Fatal("reload replaced existing private key")
+	}
+	if err := os.Remove(certPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewCA(certPath, keyPath, 16); err == nil {
+		t.Fatal("missing cert must not regenerate a surviving key")
+	}
+	keyAfter, err = os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(keyBefore) != string(keyAfter) {
+		t.Fatal("failed initialization replaced existing private key")
+	}
+}
+
 func TestNewCAFailsLoudOnMixedPresence(t *testing.T) {
 	dir := t.TempDir()
 	certPath := filepath.Join(dir, "ca.crt")
@@ -310,7 +353,7 @@ func TestMintLeafRejectsAttackerControlledSNI(t *testing.T) {
 		sni  string
 	}{
 		{"empty", ""},
-		{"too long", strings.Repeat("a.", 200)},                         // 400 bytes
+		{"too long", strings.Repeat("a.", 200)}, // 400 bytes
 		{"control character", "evil.example.com\x00.actual.example.com"}, // null injection
 		{"newline", "host\nhost2"},
 	}

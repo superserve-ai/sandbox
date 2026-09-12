@@ -163,18 +163,82 @@ is ready, retaining the existing authorized instance IDs.
 
 ## Runtime baseline and readiness
 
-These existing cold standbys retain their local SSD, background-data disk,
-secretsproxy CA/configuration, vmd environment, seeded template/rootfs/kernel
-artifacts, host patching policy and agents. Bootstrap checks the mount,
-secretsproxy files, Firecracker/template builder, and KVM before modifying
-services; it never formats disks or invents missing secrets. A failed
-baseline check must be repaired using the normal host preparation and release
-artifacts before retrying. In particular, do not seed production snapshots
-from staging hardware, silently upgrade the kernel, or copy a live Host 1's
-runtime identity. Compare production CPU family, OS/kernel and Firecracker
-build against the approved snapshot-compatible host build before admission.
+A recreated boot disk does not retain the runtime baseline of an existing cold
+standby. The data disk may survive while `/etc/sandbox`, secretsproxy state and
+base kernel/rootfs artifacts are absent. The deploy previously reconciled missing
+env files with unconditional `sed` and deliberately skipped creating
+`secretsproxy.env`, so it could install binaries and then fail before the daemon
+had ever initialized its CA.
 
-After any stop/start, verify the local SSD is mounted at `/var/lib/sandbox`,
+### Authoritative secretsproxy CA lifecycle
+
+`cmd/secretsproxy/main.go` loads required daemon configuration and calls
+`internal/secretsproxy.NewCA`. If **both** configured CA files are absent, it
+creates a host-local ECDSA CA and persists the certificate/key. If both exist it
+loads them unchanged; if either is missing or unreadable it fails, without
+replacing surviving material. The systemd unit uses `DynamicUser=yes` and
+`StateDirectory=secretsproxy` with mode 0700. Default paths are
+`/var/lib/secretsproxy/ca.crt` (0644) and `ca.key` (0600); this state belongs to the
+boot-disk lifecycle, not the independently preserved sandbox-data disk.
+
+Read-only inspection of staging Host 1 confirmed that exact executable, state
+directory and DynamicUser configuration, with no unit drop-ins. Its default CA
+files are owned by `superserve-secretsproxy`, dated June 2, and current logs show
+successful local CA initialization and control-socket startup. The historical
+first-creation log is no longer available, so this does not establish which
+operator originally started the service. No Secret Manager restoration, shared
+CA-key distribution or image CA provisioning is wired into this lifecycle.
+`scripts/gen-secretsproxy-ca` is a separate manual generator, not the deploy path.
+
+Use normal daemon startup on a fresh host, **not Host 1's private key**. A new CA
+is appropriate for the fresh daemon, but it does not magically make old guest
+images trust it. `template-builder` injects the host's public secretsproxy CA into
+new templates. Existing templates/restores containing another host's trust need
+separate validation or rebuilding before rehearsal/admission. Do not equate this
+local outbound-MITM CA with the independent Superserve peer TLS credentials.
+
+### Fresh-host deployment and remaining prerequisites
+
+`deploy-vmd.py` now creates `/etc/sandbox` and both env files before reconciliation
+without truncating existing files. Files are root-owned 0600. Existing `HOST_ID`
+and unrelated settings are preserved; missing host identity gets the instance
+name. Required control-plane URL, daemon token and audit database come from the
+existing deployment inputs, never copied from another host or defaulted to an
+unauthenticated configuration. An explicit pre-existing audit-disable setting
+retains its normal semantics; deployment does not enable it.
+
+A fresh/partial host retains `.runtime-bootstrap-pending` across failed attempts.
+Temporary systemd conditions prevent VMD/socket activation while prerequisites
+are incomplete. Fresh deployment requires provisioned kernel and base-rootfs
+files before binary installation; missing paths are initialized to the documented
+`.env.example` defaults `/var/lib/sandbox/vmlinux` and `/var/lib/sandbox/base.ext4`.
+Existing configured paths are preserved. No kernel/image is downloaded, invented
+or copied from a live host by deployment. Fresh/retried provisioning forces the
+normal boxd rootfs injection even if the preceding failed attempt installed the
+same binary. Provision approved compatible base artifacts at the expected paths
+through the image/bootstrap process before rerunning the standby deploy.
+
+Live inspection of the recreated staging Host 2 found **only `.host-prepared`**
+under `/var/lib/sandbox` (depth 3), with VMD inactive. Therefore an immediate retry
+still cannot fully converge: the approved kernel/base rootfs must be provisioned
+first. Keep hardware/kernel/Firecracker and template trust compatible with the
+migration rehearsal; do not infer production artifacts from staging hardware.
+
+Once env and base artifacts are present, the deploy starts secretsproxy through
+its normal systemd lifecycle. It requires the control-socket `/healthz` endpoint,
+active service and stable current invocation within bounded checks before fresh
+VMD activation. Config, CA, JWKS/control-plane or audit initialization failure
+aborts clearly and retains the retry guard. Existing hosts keep their ordinary
+post-VMD secretsproxy restart order. No peer credentials, labels, placement
+admission or protocol settings are changed.
+
+After runtime provisioning, rerun `bootstrap-host2.py --provider superserve` using
+the fresh Terraform artifact; it still verifies the full cold-standby baseline
+and leaves VMD stopped for the controlled deployment. Follow with the normal
+standby deployment/verification as needed. Credential installation alone is not
+full machine provisioning, and this procedure does not seed application images.
+
+After any stop/start, verify the intended runtime filesystem layout,
 `/mnt/sandbox-data` is mounted, and the configured `KERNEL_PATH` and
 `BASE_ROOTFS_PATH` exist. Reseed the normal release's templates when local SSD
 contents were lost. Deploy the matching normal VMD release to this specific

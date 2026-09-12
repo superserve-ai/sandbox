@@ -443,6 +443,56 @@ def main() -> int:
                 fi
             fi
 
+            # Fresh-host env bootstrap: create once, never truncate populated files.
+            SECRETSPROXY_FRESH=0
+            if sudo test -e /etc/sandbox/.runtime-bootstrap-pending \
+               || ! sudo test -s /etc/sandbox/vmd.env \
+               || ! sudo test -s /etc/sandbox/secretsproxy.env \
+               || ! sudo test -s /var/lib/secretsproxy/ca.crt \
+               || ! sudo test -s /var/lib/secretsproxy/ca.key; then
+                SECRETSPROXY_FRESH=1
+            fi
+            sudo install -d -o root -g root -m 0755 /etc/sandbox
+            for env_file in /etc/sandbox/vmd.env /etc/sandbox/secretsproxy.env; do
+                if ! sudo test -e "$env_file"; then
+                    sudo install -o root -g root -m 0600 /dev/null "$env_file"
+                fi
+                sudo chown root:root "$env_file"
+                sudo chmod 0600 "$env_file"
+            done
+            if [ "$SECRETSPROXY_FRESH" = 1 ]; then
+                sudo touch /etc/sandbox/.runtime-bootstrap-pending
+                sudo chmod 0600 /etc/sandbox/.runtime-bootstrap-pending
+                fresh_units=""
+                for unit in superserve-vmd.socket {service}; do
+                    if [ "$(sudo systemctl show -p LoadState --value "$unit")" = loaded ]; then
+                        fresh_units="$fresh_units $unit"
+                    fi
+                    sudo install -d -m 0755 "/etc/systemd/system/$unit.d"
+                    printf '[Unit]\\nConditionPathExists=!/etc/sandbox/.runtime-bootstrap-pending\\n' | sudo tee "/etc/systemd/system/$unit.d/05-fresh-runtime.conf" >/dev/null
+                done
+                if [ -n "$fresh_units" ]; then
+                    sudo systemctl stop $fresh_units
+                fi
+                sudo systemctl daemon-reload
+            fi
+            # Fresh-host runtime preflight. Match the documented .env.example
+            # paths only when no existing path is configured; never invent assets.
+            if [ "$SECRETSPROXY_FRESH" = 1 ]; then
+                for setting in KERNEL_PATH=/var/lib/sandbox/vmlinux BASE_ROOTFS_PATH=/var/lib/sandbox/base.ext4; do
+                    key="${{setting%%=*}}"
+                    if ! sudo grep -q "^$key=" /etc/sandbox/vmd.env; then
+                        echo "$setting" | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+                    fi
+                    asset=$(sudo sed -n "s/^$key=//p" /etc/sandbox/vmd.env | tail -n 1)
+                    if [ -z "$asset" ] || ! sudo test -s "$asset"; then
+                        echo "ERROR: $key must name a provisioned kernel/base-rootfs artifact; refusing VMD activation" >&2
+                        exit 1
+                    fi
+                done
+            fi
+            # End fresh-host env bootstrap.
+
             # Extract the deploy bundle into a sha-scoped staging dir so
             # parallel deploys (or aborted retries) don't collide.
             sudo rm -rf {extract_dir}
@@ -605,7 +655,7 @@ def main() -> int:
             NEW_HASH=$(sha256sum {extract_dir}/bin/boxd | awk '{{print $1}}')
             CUR_HASH=$(sha256sum {install_dir}/boxd 2>/dev/null | awk '{{print $1}}' || echo none)
 
-            if [ "$NEW_HASH" != "$CUR_HASH" ]; then
+            if [ "$NEW_HASH" != "$CUR_HASH" ] || [ "$SECRETSPROXY_FRESH" = 1 ]; then
                 echo "boxd changed ($CUR_HASH -> $NEW_HASH) — installing + rebuilding rootfs"
                 sudo install -m 0755 {extract_dir}/bin/boxd {install_dir}/boxd
 
@@ -766,11 +816,8 @@ def main() -> int:
                 echo {q_backup_backfill_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
-            # Upsert the control-plane URL. Empty = skip. vmd.env is safe to
-            # create; secretsproxy.env is only UPSERTED when it ALREADY exists —
-            # never create it here, because a partial file (missing
-            # DAEMON_AUTH_TOKEN/DATABASE_URL) makes the daemon exit and fails the
-            # health check below. The host bootstrap owns creating that file.
+            # Reconcile both env files after the fresh-host bootstrap. Missing
+            # required secretsproxy settings fail before VMD activation below.
             if [ -n {q_cpu} ]; then
                 sudo install -d -m 0755 /etc/sandbox
                 sudo touch /etc/sandbox/vmd.env
@@ -874,8 +921,7 @@ def main() -> int:
                 sudo chmod 0600 /etc/sandbox/vmd.env
                 sudo sed -i '/^INTERNAL_API_TOKEN=/d' /etc/sandbox/vmd.env
                 echo {q_iat_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
-                # Upsert DAEMON_AUTH_TOKEN only into an EXISTING secretsproxy.env;
-                # never create it here (same reason as CONTROL_PLANE_URL above).
+                # Both env files were created safely before reconciliation.
                 if [ -f /etc/sandbox/secretsproxy.env ]; then
                     sudo chmod 0600 /etc/sandbox/secretsproxy.env
                     sudo sed -i '/^DAEMON_AUTH_TOKEN=/d' /etc/sandbox/secretsproxy.env
@@ -896,15 +942,55 @@ def main() -> int:
                 echo {q_db_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
                 # secretsproxy reads its own DATABASE_URL from its own env file
                 # (buildAuditSink fails startup without it, unless
-                # SECRETSPROXY_AUDIT_DISABLED=true) — only upsert into an
-                # EXISTING file, same reason as CONTROL_PLANE_URL/DAEMON_AUTH_TOKEN
-                # above: never create a partial secretsproxy.env here.
+                # SECRETSPROXY_AUDIT_DISABLED=true). Fresh files follow the same
+                # reconciliation and mandatory readiness checks as existing ones.
                 if [ -f /etc/sandbox/secretsproxy.env ]; then
                     sudo chmod 0600 /etc/sandbox/secretsproxy.env
                     sudo sed -i '/^DATABASE_URL=/d' /etc/sandbox/secretsproxy.env
                     echo {q_db_line} | sudo tee -a /etc/sandbox/secretsproxy.env > /dev/null
                 fi
             fi
+
+            # Fresh-host runtime preflight.
+            for key in CONTROL_PLANE_URL DAEMON_AUTH_TOKEN; do
+                if ! sudo grep -q "^$key=." /etc/sandbox/secretsproxy.env; then
+                    echo "ERROR: secretsproxy requires $key; configure the deploy input before retrying" >&2
+                    exit 1
+                fi
+            done
+            if ! sudo grep -q '^DATABASE_URL=.' /etc/sandbox/secretsproxy.env \
+               && ! sudo grep -qx 'SECRETSPROXY_AUDIT_DISABLED=true' /etc/sandbox/secretsproxy.env; then
+                echo "ERROR: secretsproxy requires DATABASE_URL; refusing VMD activation" >&2
+                exit 1
+            fi
+
+            restart_secretsproxy() {{
+                if sudo systemctl restart superserve-secretsproxy.service; then
+                    for attempt in $(seq 1 30); do
+                        invocation=$(sudo systemctl show -p InvocationID --value superserve-secretsproxy.service)
+                        if [ -n "$invocation" ] \
+                           && sudo curl --silent --fail --max-time 2 --unix-socket /run/secretsproxy/control.sock http://localhost/healthz >/dev/null \
+                           && sudo systemctl is-active --quiet superserve-secretsproxy.service \
+                           && [ "$invocation" = "$(sudo systemctl show -p InvocationID --value superserve-secretsproxy.service)" ]; then
+                            return 0
+                        fi
+                        sleep 1
+                    done
+                fi
+                echo "ERROR: secretsproxy provisioning/readiness failed; inspect CA state and required configuration" >&2
+                sudo systemctl status --no-pager superserve-secretsproxy.service >&2 || true
+                sudo journalctl -u superserve-secretsproxy.service --no-pager -n 40 >&2 || true
+                return 1
+            }}
+            # NewCA in the daemon is authoritative: generate only when BOTH CA
+            # files are absent, otherwise load them or fail on partial state.
+            # Fresh hosts must complete this before any VMD socket activation.
+            if [ "$SECRETSPROXY_FRESH" = 1 ]; then
+                restart_secretsproxy
+                sudo rm -f /etc/systemd/system/superserve-vmd.socket.d/05-fresh-runtime.conf /etc/systemd/system/{service}.d/05-fresh-runtime.conf
+                sudo systemctl daemon-reload
+            fi
+            # End fresh-host runtime preflight.
 
             # Stop here ONLY in the exceptional cases that need the ports
             # released before the socket unit (re)binds: the one-time migration
@@ -1194,20 +1280,12 @@ def main() -> int:
             # journal and shouldn't restart vmd on failure.
             trap - EXIT
 
-            # Restart secretsproxy; tolerate missing env file on hosts not
-            # yet provisioned (is-active check below is gated on the file).
-            sudo systemctl restart superserve-secretsproxy.service || true
-            if [ -f /etc/sandbox/secretsproxy.env ]; then
-                sleep 2
-                sudo systemctl is-active --quiet superserve-secretsproxy.service || (
-                    echo "ERROR: superserve-secretsproxy failed to become active after restart" >&2
-                    sudo systemctl status --no-pager superserve-secretsproxy.service >&2 || true
-                    sudo journalctl -u superserve-secretsproxy.service --no-pager -n 40 >&2 || true
-                    exit 1
-                )
-            else
-                echo "/etc/sandbox/secretsproxy.env not present; daemon not started (provision env file to enable)"
+            # Existing hosts retain the normal post-VMD restart; a fresh host
+            # already initialized its CA and passed readiness before VMD started.
+            if [ "$SECRETSPROXY_FRESH" != 1 ]; then
+                restart_secretsproxy
             fi
+            sudo rm -f /etc/sandbox/.runtime-bootstrap-pending
         """)
 
         r = subprocess.run(
