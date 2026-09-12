@@ -65,6 +65,14 @@ environments:
           service: superserve-api
           region: us-central1
           image_repository: us-central1-docker.pkg.dev/rayai-dev/superserve/controlplane
+        # Hosted QM: the qm-api service and the provisioner job share one
+        # image and deploy together (deploy-qm-api.yml).
+        qm_api:
+          platform: cloud_run
+          service: superserve-qm-api
+          provisioner_job: qm-provisioner
+          region: us-central1
+          image_repository: us-central1-docker.pkg.dev/rayai-dev/superserve/qm-api
         host_deployments:
           vmd:
             enabled: true
@@ -138,6 +146,12 @@ environments:
           service: superserve-api-use4
           region: us-east4
           image_repository: us-central1-docker.pkg.dev/rayai-prod/superserve/controlplane
+        qm_api:
+          platform: cloud_run
+          service: superserve-qm-api-use4
+          provisioner_job: qm-provisioner
+          region: us-east4
+          image_repository: us-central1-docker.pkg.dev/rayai-prod/superserve/qm-api
         host_deployments:
           vmd:
             enabled: true
