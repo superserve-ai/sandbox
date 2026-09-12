@@ -102,7 +102,7 @@ resource "google_service_account" "issuer" {
 resource "google_privateca_ca_pool_iam_binding" "issuer" {
   project  = var.project_id
   location = var.region
-  ca_pool  = google_privateca_ca_pool.this.name
+  ca_pool  = google_privateca_ca_pool.this.id
   role     = "roles/privateca.certificateRequester"
   members  = ["serviceAccount:${google_service_account.issuer.email}"]
 }
