@@ -93,8 +93,11 @@ CREATE TABLE IF NOT EXISTS qm.tenants (
         CHECK (model_provider IN ('anthropic', 'openai', 'openrouter')),
     CONSTRAINT qm_tenants_status_check
         CHECK (status IN ('provisioning', 'ready', 'failed', 'deprovisioning', 'deleted')),
+    -- Expired keys are hard-deleted by the control plane's sweep; release the
+    -- reference instead of blocking that sweep, leaving the team intact.
     CONSTRAINT qm_tenants_sandbox_api_key_team_fk
         FOREIGN KEY (sandbox_api_key_id, team_id) REFERENCES public.api_key (id, team_id)
+        ON DELETE SET NULL (sandbox_api_key_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_qm_tenants_team ON qm.tenants(team_id);

@@ -378,7 +378,7 @@ func TestQMAPI_RejectsAPIKeyOwnedByAnotherTeam(t *testing.T) {
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatalf("rollback: %v", err)
 	}
-	_, q = scopedQMTx(t, conn, teamID)
+	tx, q = scopedQMTx(t, conn, teamID)
 	tenant, err = q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
 	if err != nil {
 		t.Fatalf("create tenant: %v", err)
@@ -390,5 +390,22 @@ func TestQMAPI_RejectsAPIKeyOwnedByAnotherTeam(t *testing.T) {
 	})
 	if err != nil || !updated.SandboxApiKeyID.Valid || updated.SandboxApiKeyID.Bytes != ownKeyID {
 		t.Fatalf("own key: err=%v valid=%v", err, updated.SandboxApiKeyID.Valid)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// Deleting the key (the expired-key sweep) releases the reference without
+	// touching the tenant or its team.
+	if _, err := testPool.Exec(ctx, `DELETE FROM public.api_key WHERE id = $1`, ownKeyID); err != nil {
+		t.Fatalf("delete api key: %v", err)
+	}
+	var stillTeam uuid.UUID
+	var released pgtype.UUID
+	if err := testPool.QueryRow(ctx, `SELECT team_id, sandbox_api_key_id FROM qm.tenants WHERE id = $1`, tenant.ID).Scan(&stillTeam, &released); err != nil {
+		t.Fatalf("reload tenant: %v", err)
+	}
+	if stillTeam != teamID || released.Valid {
+		t.Fatalf("after key deletion: team=%s (want %s) keyValid=%v (want false)", stillTeam, teamID, released.Valid)
 	}
 }
