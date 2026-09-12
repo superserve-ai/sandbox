@@ -520,6 +520,44 @@ type ProxyAudit struct {
 	ErrorCode      *string     `json:"error_code"`
 }
 
+type QmTenant struct {
+	ID              uuid.UUID   `json:"id"`
+	TeamID          uuid.UUID   `json:"team_id"`
+	Slug            string      `json:"slug"`
+	OrgName         string      `json:"org_name"`
+	AdminEmail      string      `json:"admin_email"`
+	SignIn          string      `json:"sign_in"`
+	ModelProvider   string      `json:"model_provider"`
+	Harness         string      `json:"harness"`
+	Status          string      `json:"status"`
+	PublicUrl       *string     `json:"public_url"`
+	ImageTag        *string     `json:"image_tag"`
+	CloudRunService *string     `json:"cloud_run_service"`
+	DbName          *string     `json:"db_name"`
+	BucketName      *string     `json:"bucket_name"`
+	ServiceAccount  *string     `json:"service_account"`
+	SandboxApiKeyID pgtype.UUID `json:"sandbox_api_key_id"`
+	CreatedBy       pgtype.UUID `json:"created_by"`
+	CreatedAt       time.Time   `json:"created_at"`
+	UpdatedAt       time.Time   `json:"updated_at"`
+}
+
+type QmTenantEvent struct {
+	ID       int64     `json:"id"`
+	TenantID uuid.UUID `json:"tenant_id"`
+	Step     string    `json:"step"`
+	Status   string    `json:"status"`
+	Message  *string   `json:"message"`
+	Detail   []byte    `json:"detail"`
+	At       time.Time `json:"at"`
+}
+
+type QmTenantSecret struct {
+	TenantID  uuid.UUID `json:"tenant_id"`
+	Name      string    `json:"name"`
+	SecretRef string    `json:"secret_ref"`
+}
+
 type QuotaAlertState struct {
 	TeamID    uuid.UUID `json:"team_id"`
 	QuotaType string    `json:"quota_type"`
