@@ -195,6 +195,25 @@ func TestPeerIngressEnabledRequiresExplicitAddress(t *testing.T) {
 	}
 }
 
+func TestPeerTransportRequiredOnlyWhenParticipating(t *testing.T) {
+	for _, tc := range []struct {
+		name, routing, peerAddr string
+		want                    bool
+	}{
+		{"legacy host routing disabled", "0", "", false},
+		{"legacy host routing unset", "", "", false},
+		{"outbound routing enabled", "1", "", true},
+		{"peer ingress enabled", "0", "10.0.0.3:5009", true},
+		{"routing and ingress enabled", "1", "10.0.0.3:5009", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := peerTransportRequired(tc.routing, tc.peerAddr); got != tc.want {
+				t.Fatalf("peerTransportRequired(%q, %q) = %v, want %v", tc.routing, tc.peerAddr, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLocalPeerTargetRejectsPublicAndRedirectListeners(t *testing.T) {
 	for _, target := range []string{"0.0.0.0:5010", "192.0.2.1:5010", "[::]:5010", "127.0.0.1:0", "127.0.0.1:5007", "127.0.0.1:5008"} {
 		t.Run(target, func(t *testing.T) {
