@@ -105,3 +105,14 @@ DELETE FROM qm.tenant_secrets
 WHERE name = sqlc.arg(name) AND tenant_id = (
     SELECT id FROM qm.tenants WHERE id = sqlc.arg(tenant_id) AND status <> 'deleted' FOR SHARE
 );
+
+-- name: TransitionQMTenantStatus :one
+-- Compare-and-set: moves the tenant to a new status only from one of the
+-- expected ones, so two racing requests (delete vs retry) cannot both win.
+-- deleted stays terminal regardless of the expected list.
+UPDATE qm.tenants
+SET status = sqlc.arg(status), updated_at = now()
+WHERE id = $1 AND team_id = $2
+  AND status <> 'deleted'
+  AND status = ANY(sqlc.arg(from_statuses)::text[])
+RETURNING *;

@@ -381,6 +381,57 @@ func (q *Queries) SoftDeleteQMTenant(ctx context.Context, arg SoftDeleteQMTenant
 	return i, err
 }
 
+const transitionQMTenantStatus = `-- name: TransitionQMTenantStatus :one
+UPDATE qm.tenants
+SET status = $3, updated_at = now()
+WHERE id = $1 AND team_id = $2
+  AND status <> 'deleted'
+  AND status = ANY($4::text[])
+RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at
+`
+
+type TransitionQMTenantStatusParams struct {
+	ID           uuid.UUID `json:"id"`
+	TeamID       uuid.UUID `json:"team_id"`
+	Status       string    `json:"status"`
+	FromStatuses []string  `json:"from_statuses"`
+}
+
+// Compare-and-set: moves the tenant to a new status only from one of the
+// expected ones, so two racing requests (delete vs retry) cannot both win.
+// deleted stays terminal regardless of the expected list.
+func (q *Queries) TransitionQMTenantStatus(ctx context.Context, arg TransitionQMTenantStatusParams) (QmTenant, error) {
+	row := q.db.QueryRow(ctx, transitionQMTenantStatus,
+		arg.ID,
+		arg.TeamID,
+		arg.Status,
+		arg.FromStatuses,
+	)
+	var i QmTenant
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Slug,
+		&i.OrgName,
+		&i.AdminEmail,
+		&i.SignIn,
+		&i.ModelProvider,
+		&i.Harness,
+		&i.Status,
+		&i.PublicUrl,
+		&i.ImageTag,
+		&i.CloudRunService,
+		&i.DbName,
+		&i.BucketName,
+		&i.ServiceAccount,
+		&i.SandboxApiKeyID,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const updateQMTenantResources = `-- name: UpdateQMTenantResources :one
 UPDATE qm.tenants
 SET public_url         = COALESCE($3, public_url),
