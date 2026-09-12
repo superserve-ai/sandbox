@@ -15,9 +15,14 @@ import (
 // router instance doesn't leak a cleanup goroutine.
 func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engine {
 	r := gin.New()
+	forwardingRuleIP := ""
+	if h != nil && h.Config != nil {
+		forwardingRuleIP = h.Config.ExternalLBForwardingRuleIP
+	}
 	// Global middleware: security headers, coarse per-IP rate limit
 	// (unauthenticated flood protection), logging, panic recovery.
 	r.Use(
+		verifiedClientIPMiddleware(forwardingRuleIP),
 		SecurityHeaders(),
 		RateLimit(ctx, DefaultIPRateLimitConfig()),
 		RequestLogger(),

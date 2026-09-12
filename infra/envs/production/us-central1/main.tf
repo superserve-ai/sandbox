@@ -160,10 +160,11 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
 module "observability" {
   source = "../../../modules/observability"
 
-  project_id               = local.project_id
-  environment              = local.environment
-  notification_channel_ids = var.notification_channel_ids
-  labels                   = local.common_labels
+  project_id                       = local.project_id
+  environment                      = local.environment
+  notification_channel_ids         = var.notification_channel_ids
+  abuse_enforcement_alerts_enabled = true
+  labels                           = local.common_labels
   dashboards = {
     sandbox_operations = {
       display_name = "Sandbox Telemetry / Production Operations"

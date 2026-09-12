@@ -39,6 +39,9 @@ type Config struct {
 	// EdgeProxyDomain is the public hostname suffix served by the edge
 	// proxy, used to construct URLs in sandbox responses.
 	EdgeProxyDomain string
+	// ExternalLBForwardingRuleIP is the runtime-configured forwarding-rule
+	// address appended by the external Application Load Balancer.
+	ExternalLBForwardingRuleIP string
 
 	// DefaultHostID is the fallback host identifier used when no scheduler
 	// is configured. Set via DEFAULT_HOST_ID; defaults to "default".
@@ -124,6 +127,7 @@ func Load() (*Config, error) {
 		AppAllowedOrigins:             splitCSV(os.Getenv("APP_ALLOWED_ORIGINS")),
 		SandboxAccessTokenSeed:        seed,
 		EdgeProxyDomain:               envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
+		ExternalLBForwardingRuleIP:    strings.TrimSpace(os.Getenv("EXTERNAL_LB_FORWARDING_RULE_IP")),
 		DefaultHostID:                 envOrDefault("DEFAULT_HOST_ID", "default"),
 		SchedulerCapacityShadow:       boolEnv("SCHEDULER_CAPACITY_SHADOW", false),
 		SystemTeamID:                  os.Getenv("SYSTEM_TEAM_ID"),

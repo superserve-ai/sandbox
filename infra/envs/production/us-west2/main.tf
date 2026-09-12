@@ -177,6 +177,7 @@ module "api" {
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
   service_account_email = data.google_service_account.api_runner.email
+  ingress               = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
   cpu_limit    = "2"
@@ -444,9 +445,10 @@ resource "google_compute_attached_disk" "sandbox_data_b" {
 module "observability" {
   source = "../../../modules/observability"
 
-  project_id               = local.project_id
-  environment              = local.environment
-  notification_channel_ids = var.notification_channel_ids
+  project_id                       = local.project_id
+  environment                      = local.environment
+  notification_channel_ids         = var.notification_channel_ids
+  abuse_enforcement_alerts_enabled = false
   compute_instance_cpu_alerts = {
     sandbox_host = {
       display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
