@@ -23,7 +23,7 @@ READY = block('# Fresh-host runtime preflight.\n', '# End fresh-host runtime pre
 
 
 class FreshHostTest(unittest.TestCase):
-    def exercise(self, missing=('vmd', 'secretsproxy'), fail_daemon=False, missing_input=False, assets=True):
+    def exercise(self, missing=('vmd', 'secretsproxy'), fail_daemon=False, missing_input=False, assets=True, ca_missing=(), custom_paths=False, configure_kernel=True, missing_artifact=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             envdir = root / 'etc/sandbox'
@@ -31,10 +31,27 @@ class FreshHostTest(unittest.TestCase):
             for name in ('vmd', 'secretsproxy'):
                 if name not in missing:
                     (envdir / (name + '.env')).write_text('HOST_ID=existing-host\nCUSTOM=preserve\n')
+            ca_dir = root / 'var/lib/secretsproxy'
+            ca_dir.mkdir(parents=True)
+            for name in ('ca.crt', 'ca.key'):
+                if name not in ca_missing:
+                    (ca_dir / name).write_text('existing-cell-' + name)
+            kernel = '/var/lib/sandbox/kernel/approved-kernel'
+            base = '/var/lib/sandbox/rootfs/base.ext4'
+            if custom_paths:
+                kernel, base = '/var/lib/custom/kernel', '/var/lib/custom/rootfs'
+            with (envdir / 'vmd.env').open('a') as env:
+                if configure_kernel:
+                    env.write('KERNEL_PATH=' + str(root) + kernel + '\n')
+                if custom_paths:
+                    env.write('BASE_ROOTFS_PATH=' + str(root) + base + '\n')
             if assets:
-                (root / 'var/lib/sandbox').mkdir(parents=True)
-                for name in ('vmlinux', 'base.ext4'):
-                    (root / 'var/lib/sandbox' / name).write_text('approved artifact')
+                for name in (kernel, base):
+                    if name == (kernel if missing_artifact == 'kernel' else base if missing_artifact == 'rootfs' else None):
+                        continue
+                    asset = root / name.lstrip('/')
+                    asset.parent.mkdir(parents=True, exist_ok=True)
+                    asset.write_text('approved artifact')
             values = {'service': 'superserve-vmd.service', 'q_host_id_line': shlex.quote('HOST_ID=example-host')}
             for key, name, value in [('cpu', 'CONTROL_PLANE_URL', 'https://example.test'),
                                      ('token', 'INTERNAL_API_TOKEN', 'example-token'),
@@ -67,6 +84,11 @@ journalctl() { :; }
             result = subprocess.run(['bash', '-c', prelude + script + '\necho vmd-may-start\n'],
                 text=True, capture_output=True, env=dict(os.environ, CALLS=str(root/'calls'),
                 CA_DIR=str(root/'var/lib/secretsproxy'), FAIL_DAEMON=str(int(fail_daemon))))
+            for name in ('ca.crt', 'ca.key'):
+                if name not in ca_missing:
+                    self.assertEqual((ca_dir / name).read_text(), 'existing-cell-' + name)
+            if ca_missing:
+                self.assertFalse((root / 'calls').exists(), 'must fail before secretsproxy starts')
             if not assets:
                 guard = root / 'etc/systemd/system/superserve-vmd.service.d/05-fresh-runtime.conf'
                 self.assertIn('\nConditionPathExists=!', guard.read_text())
@@ -83,7 +105,7 @@ journalctl() { :; }
                 for name in ('vmd', 'secretsproxy'):
                     if name not in missing:
                         self.assertIn('CUSTOM=preserve', envs[name+'.env'])
-                    self.assertEqual(modes[name+'.env'], 0o600)
+                    self.assertEqual(modes[name+'.env'], 0o644 if name == 'vmd' else 0o600)
                 self.assertIn('DAEMON_AUTH_TOKEN=example-token', envs['secretsproxy.env'])
                 self.assertIn('DATABASE_URL=postgres://example.test/db', envs['secretsproxy.env'])
                 self.assertIn('vmd-may-start', result.stdout)
@@ -98,8 +120,34 @@ journalctl() { :; }
                 self.assertIn(message, result.stderr)
                 self.assertNotIn('vmd-may-start', result.stdout)
 
+    def test_blank_vmd_env_requires_explicit_kernel_selection(self):
+        result, envs, modes = self.exercise(configure_kernel=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('KERNEL_PATH must name a provisioned', result.stderr)
+        self.assertEqual(modes['vmd.env'], 0o644)
+        self.assertEqual(modes['secretsproxy.env'], 0o600)
+        self.assertIn('/var/lib/sandbox/rootfs/base.ext4', envs['vmd.env'])
+
+    def test_each_missing_artifact_blocks_activation(self):
+        for artifact in ('kernel', 'rootfs'):
+            result, _, _ = self.exercise(missing_artifact=artifact)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn('vmd-may-start', result.stdout)
+
+    def test_shared_ca_required_including_partial_pairs(self):
+        for missing in [('ca.crt',), ('ca.key',), ('ca.crt', 'ca.key')]:
+            result, _, _ = self.exercise(ca_missing=missing)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('requires the restored cell secretsproxy CA pair', result.stderr)
+            self.assertNotIn('vmd-may-start', result.stdout)
+
+    def test_explicit_artifact_paths_are_preserved(self):
+        result, envs, _ = self.exercise(custom_paths=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(envs['vmd.env'], r'BASE_ROOTFS_PATH=.*/var/lib/custom/rootfs')
+
     def test_fresh_readiness_precedes_any_vmd_restart_and_no_ca_copy(self):
-        gate = SOURCE.index('# NewCA in the daemon is authoritative')
+        gate = SOURCE.index('# CD targets existing cells:')
         self.assertLess(gate, SOURCE.index('sudo systemctl restart {service}'))
         self.assertLess(SOURCE.index('# Fresh-host env bootstrap:'), SOURCE.index('sudo sed -i'))
         self.assertNotIn('gen-secretsproxy-ca', SOURCE)

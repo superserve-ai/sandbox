@@ -460,6 +460,7 @@ def main() -> int:
                 sudo chown root:root "$env_file"
                 sudo chmod 0600 "$env_file"
             done
+            sudo chmod 0644 /etc/sandbox/vmd.env
             if [ "$SECRETSPROXY_FRESH" = 1 ]; then
                 sudo touch /etc/sandbox/.runtime-bootstrap-pending
                 sudo chmod 0600 /etc/sandbox/.runtime-bootstrap-pending
@@ -476,21 +477,27 @@ def main() -> int:
                 fi
                 sudo systemctl daemon-reload
             fi
-            # Fresh-host runtime preflight. Match the documented .env.example
-            # paths only when no existing path is configured; never invent assets.
-            if [ "$SECRETSPROXY_FRESH" = 1 ]; then
-                for setting in KERNEL_PATH=/var/lib/sandbox/vmlinux BASE_ROOTFS_PATH=/var/lib/sandbox/base.ext4; do
-                    key="${{setting%%=*}}"
-                    if ! sudo grep -q "^$key=" /etc/sandbox/vmd.env; then
-                        echo "$setting" | sudo tee -a /etc/sandbox/vmd.env > /dev/null
-                    fi
-                    asset=$(sudo sed -n "s/^$key=//p" /etc/sandbox/vmd.env | tail -n 1)
-                    if [ -z "$asset" ] || ! sudo test -s "$asset"; then
-                        echo "ERROR: $key must name a provisioned kernel/base-rootfs artifact; refusing VMD activation" >&2
-                        exit 1
-                    fi
-                done
+            # CD targets existing cells: never let missing state mint a new trust root.
+            for setting in SECRETSPROXY_CA_CERT=/var/lib/secretsproxy/ca.crt SECRETSPROXY_CA_KEY=/var/lib/secretsproxy/ca.key; do
+                key="${{setting%%=*}}"
+                ca_path=$(sudo sed -n "s/^$key=//p" /etc/sandbox/secretsproxy.env | tail -n 1)
+                if [ -z "$ca_path" ]; then ca_path="${{setting#*=}}"; fi
+                if ! sudo test -f "$ca_path" || ! sudo test -s "$ca_path"; then
+                    echo "ERROR: existing-cell deployment requires the restored cell secretsproxy CA pair ($key); refusing VMD activation" >&2
+                    exit 1
+                fi
+            done
+            # Kernel selection is cell-specific; require an explicit approved path.
+            if ! sudo grep -q '^BASE_ROOTFS_PATH=' /etc/sandbox/vmd.env; then
+                echo BASE_ROOTFS_PATH=/var/lib/sandbox/rootfs/base.ext4 | sudo tee -a /etc/sandbox/vmd.env >/dev/null
             fi
+            for key in KERNEL_PATH BASE_ROOTFS_PATH; do
+                asset=$(sudo sed -n "s/^$key=//p" /etc/sandbox/vmd.env | tail -n 1)
+                if [ -z "$asset" ] || ! sudo test -f "$asset" || ! sudo test -s "$asset"; then
+                    echo "ERROR: $key must name a provisioned kernel/base-rootfs artifact; refusing VMD activation" >&2
+                    exit 1
+                fi
+            done
             # End fresh-host env bootstrap.
 
             # Extract the deploy bundle into a sha-scoped staging dir so
@@ -917,8 +924,8 @@ def main() -> int:
             if [ -n {q_token} ]; then
                 sudo install -d -m 0755 /etc/sandbox
                 sudo touch /etc/sandbox/vmd.env
-                # vmd.env holds the bearer token — keep it root-only.
-                sudo chmod 0600 /etc/sandbox/vmd.env
+                # Preserve the canonical deployment-readable vmd.env mode.
+                sudo chmod 0644 /etc/sandbox/vmd.env
                 sudo sed -i '/^INTERNAL_API_TOKEN=/d' /etc/sandbox/vmd.env
                 echo {q_iat_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
                 # Both env files were created safely before reconciliation.
@@ -937,7 +944,7 @@ def main() -> int:
             if [ -n {q_db} ]; then
                 sudo install -d -m 0755 /etc/sandbox
                 sudo touch /etc/sandbox/vmd.env
-                sudo chmod 0600 /etc/sandbox/vmd.env
+                sudo chmod 0644 /etc/sandbox/vmd.env
                 sudo sed -i '/^DATABASE_URL=/d' /etc/sandbox/vmd.env
                 echo {q_db_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
                 # secretsproxy reads its own DATABASE_URL from its own env file
@@ -982,8 +989,7 @@ def main() -> int:
                 sudo journalctl -u superserve-secretsproxy.service --no-pager -n 40 >&2 || true
                 return 1
             }}
-            # NewCA in the daemon is authoritative: generate only when BOTH CA
-            # files are absent, otherwise load them or fail on partial state.
+            # The existing cell CA was required before installing any binaries.
             # Fresh hosts must complete this before any VMD socket activation.
             if [ "$SECRETSPROXY_FRESH" = 1 ]; then
                 restart_secretsproxy

@@ -163,80 +163,135 @@ is ready, retaining the existing authorized instance IDs.
 
 ## Runtime baseline and readiness
 
-A recreated boot disk does not retain the runtime baseline of an existing cold
-standby. The data disk may survive while `/etc/sandbox`, secretsproxy state and
-base kernel/rootfs artifacts are absent. The deploy previously reconciled missing
-env files with unconditional `sed` and deliberately skipped creating
-`secretsproxy.env`, so it could install binaries and then fail before the daemon
-had ever initialized its CA.
+Recreating a boot disk exposed a missing provisioning contract: CD installs
+binaries, but does not supply the cell's secretsproxy CA or kernel/rootfs assets.
+The independently preserved sandbox-data disk does not restore these files.
 
-### Authoritative secretsproxy CA lifecycle
+### Existing-cell CA and artifact contract
 
-`cmd/secretsproxy/main.go` loads required daemon configuration and calls
-`internal/secretsproxy.NewCA`. If **both** configured CA files are absent, it
-creates a host-local ECDSA CA and persists the certificate/key. If both exist it
-loads them unchanged; if either is missing or unreadable it fails, without
-replacing surviving material. The systemd unit uses `DynamicUser=yes` and
-`StateDirectory=secretsproxy` with mode 0700. Default paths are
-`/var/lib/secretsproxy/ca.crt` (0644) and `ca.key` (0600); this state belongs to the
-boot-disk lifecycle, not the independently preserved sandbox-data disk.
+Existing templates trust the **cell's existing secretsproxy CA**. An additional
+or replacement host must restore that same certificate and private key before
+activation. This CA is separate from the Superserve peer mTLS credentials;
+leave `/etc/superserve/peer/current` untouched. Missing or partial CA state is a
+hard CD precondition failure, before binary installation or VMD activation.
+CD never generates a CA. A genuinely brand-new cell can explicitly follow the
+new-cell provisioning procedure and allow the daemon to initialize its CA
+before invoking CD; missing files never select that mode automatically.
 
-Read-only inspection of staging Host 1 confirmed that exact executable, state
-directory and DynamicUser configuration, with no unit drop-ins. Its default CA
-files are owned by `superserve-secretsproxy`, dated June 2, and current logs show
-successful local CA initialization and control-socket startup. The historical
-first-creation log is no longer available, so this does not establish which
-operator originally started the service. No Secret Manager restoration, shared
-CA-key distribution or image CA provisioning is wired into this lifecycle.
-`scripts/gen-secretsproxy-ca` is a separate manual generator, not the deploy path.
+The runtime library can generate a CA when both files are absent. That behavior
+is not authority to generate one for an existing cell. The previous fresh-host
+instructions incorrectly inferred the deployment policy from that library.
+There is no secretsproxy CA restore from Secret Manager wired into CD. Use the
+canonical operator-workstation transfer below, never GCS for the private key.
 
-Use normal daemon startup on a fresh host, **not Host 1's private key**. A new CA
-is appropriate for the fresh daemon, but it does not magically make old guest
-images trust it. `template-builder` injects the host's public secretsproxy CA into
-new templates. Existing templates/restores containing another host's trust need
-separate validation or rebuilding before rehearsal/admission. Do not equate this
-local outbound-MITM CA with the independent Superserve peer TLS credentials.
+Read-only staging Host 1 inspection confirmed these configured artifacts:
 
-### Fresh-host deployment and remaining prerequisites
+| Path | SHA-256 before the next boxd injection |
+| --- | --- |
+| `/var/lib/sandbox/kernel/vmlinux-4.14-fuse` | `3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761` |
+| `/var/lib/sandbox/rootfs/base.ext4` | `7494f2288113b40f881575dfa8dfa6e50c4c78114a9d144af36f67fedf720ca0` |
 
-`deploy-vmd.py` now creates `/etc/sandbox` and both env files before reconciliation
-without truncating existing files. Files are root-owned 0600. Existing `HOST_ID`
-and unrelated settings are preserved; missing host identity gets the instance
-name. Required control-plane URL, daemon token and audit database come from the
-existing deployment inputs, never copied from another host or defaulted to an
-unauthenticated configuration. An explicit pre-existing audit-disable setting
-retains its normal semantics; deployment does not enable it.
+The canonical new-host procedure permits non-secret `hostprep/` bucket assets,
+but no exact staging object/version is established here. Use the verified Host 1
+files, not an invented bucket location. Coordinate against concurrent deployments:
+the kernel is a pinned artifact, but CD modifies base.ext4 by injecting boxd.
+Recheck source hashes and target hashes during copying; after CD, the rootfs hash
+can legitimately change. Verify the existing Firecracker binary matches Host 1
+and retain the cell's guest-kernel/snapshot lineage.
 
-A fresh/partial host retains `.runtime-bootstrap-pending` across failed attempts.
-Temporary systemd conditions prevent VMD/socket activation while prerequisites
-are incomplete. Fresh deployment requires provisioned kernel and base-rootfs
-files before binary installation; missing paths are initialized to the documented
-`.env.example` defaults `/var/lib/sandbox/vmlinux` and `/var/lib/sandbox/base.ext4`.
-Existing configured paths are preserved. No kernel/image is downloaded, invented
-or copied from a live host by deployment. Fresh/retried provisioning forces the
-normal boxd rootfs injection even if the preceding failed attempt installed the
-same binary. Provision approved compatible base artifacts at the expected paths
-through the image/bootstrap process before rerunning the standby deploy.
+### Operator preparation (not performed by CD)
 
-Live inspection of the recreated staging Host 2 found **only `.host-prepared`**
-under `/var/lib/sandbox` (depth 3), with VMD inactive. Therefore an immediate retry
-still cannot fully converge: the approved kernel/base rootfs must be provisioned
-first. Keep hardware/kernel/Firecracker and template trust compatible with the
-migration rehearsal; do not infer production artifacts from staging hardware.
+Run on the operator workstation. These commands do not activate VMD or admit
+Host 2. Keep its standby label and non-ready placement state. Do not run while
+another operator is deploying or changing the source artifacts. The commands
+refuse to overwrite an existing destination CA pair; investigate partial or
+unexpected material instead of rotating it.
 
-Once env and base artifacts are present, the deploy starts secretsproxy through
-its normal systemd lifecycle. It requires the control-socket `/healthz` endpoint,
-active service and stable current invocation within bounded checks before fresh
-VMD activation. Config, CA, JWKS/control-plane or audit initialization failure
-aborts clearly and retains the retry guard. Existing hosts keep their ordinary
-post-VMD secretsproxy restart order. No peer credentials, labels, placement
-admission or protocol settings are changed.
+```bash
+set -euo pipefail
+umask 077
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT HUP INT TERM
+ssh1() { gcloud compute ssh superserve-vmd-staging --project=rayai-dev --zone=us-central1-a --tunnel-through-iap --quiet --command="set -eu; $1" -- -T; }
+ssh2() { gcloud compute ssh superserve-vmd-staging-2 --project=rayai-dev --zone=us-central1-a --tunnel-through-iap --quiet --command="set -eu; $1" -- -T; }
 
-After runtime provisioning, rerun `bootstrap-host2.py --provider superserve` using
-the fresh Terraform artifact; it still verifies the full cold-standby baseline
-and leaves VMD stopped for the controlled deployment. Follow with the normal
-standby deployment/verification as needed. Credential installation alone is not
-full machine provisioning, and this procedure does not seed application images.
+# Inspect only selected non-secret settings and artifact hashes.
+ssh1 'sudo grep -E "^(KERNEL_PATH|BASE_ROOTFS_PATH)=" /etc/sandbox/vmd.env; sudo sha256sum /var/lib/sandbox/kernel/vmlinux-4.14-fuse /var/lib/sandbox/rootfs/base.ext4 /usr/local/bin/firecracker'
+ssh1 'sudo cat /var/lib/sandbox/kernel/vmlinux-4.14-fuse' > "$work/vmlinux-4.14-fuse"
+ssh1 'sudo cat /var/lib/sandbox/rootfs/base.ext4' > "$work/base.ext4"
+(cd "$work" && shasum -a 256 -c <<'HASHES'
+3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761  vmlinux-4.14-fuse
+7494f2288113b40f881575dfa8dfa6e50c4c78114a9d144af36f67fedf720ca0  base.ext4
+HASHES
+)
+# Repeat source hashes; stop if they changed during the copy.
+ssh1 'sudo sha256sum /var/lib/sandbox/kernel/vmlinux-4.14-fuse /var/lib/sandbox/rootfs/base.ext4'
+ssh2 'sudo systemctl stop superserve-vmd.socket superserve-vmd.service; sudo install -d -m 0755 /var/lib/sandbox/kernel /var/lib/sandbox/rootfs'
+ssh2 'sudo tee /var/lib/sandbox/kernel/vmlinux-4.14-fuse >/dev/null' < "$work/vmlinux-4.14-fuse"
+ssh2 'sudo tee /var/lib/sandbox/rootfs/base.ext4 >/dev/null' < "$work/base.ext4"
+ssh2 'sudo chown root:root /var/lib/sandbox/kernel/vmlinux-4.14-fuse /var/lib/sandbox/rootfs/base.ext4; sudo chmod 0644 /var/lib/sandbox/kernel/vmlinux-4.14-fuse /var/lib/sandbox/rootfs/base.ext4; sudo sha256sum /var/lib/sandbox/kernel/vmlinux-4.14-fuse /var/lib/sandbox/rootfs/base.ext4'
+
+# Secrets travel host -> private workstation directory -> host, never GCS.
+ssh1 'sudo cat /var/lib/secretsproxy/ca.crt' > "$work/ca.crt"
+ssh1 'sudo cat /var/lib/secretsproxy/ca.key' > "$work/ca.key"
+chmod 0644 "$work/ca.crt"
+chmod 0600 "$work/ca.key"
+openssl x509 -in "$work/ca.crt" -pubkey -noout > "$work/cert.pub"
+openssl pkey -in "$work/ca.key" -pubout > "$work/key.pub"
+cmp "$work/cert.pub" "$work/key.pub"
+# DynamicUser has no passwd entry while the daemon is inactive. Let systemd
+# allocate its actual identity and StateDirectory without starting secretsproxy.
+ssh2 'sudo systemctl stop superserve-secretsproxy.service; sudo test ! -e /var/lib/secretsproxy/ca.crt && sudo test ! -e /var/lib/secretsproxy/ca.key'
+COPYFILE_DISABLE=1 tar -C "$work" -cf - ca.crt ca.key | ssh2 'sudo systemd-run --quiet --wait --pipe --collect --unit=secretsproxy-ca-restore --property=User=superserve-secretsproxy --property=DynamicUser=yes --property=StateDirectory=secretsproxy --property=StateDirectoryMode=0700 /bin/sh -ec "tar --no-same-owner -xf - -C /var/lib/secretsproxy; chmod 0644 /var/lib/secretsproxy/ca.crt; chmod 0600 /var/lib/secretsproxy/ca.key; stat -c \"%a %U %n\" /var/lib/secretsproxy/ca.crt /var/lib/secretsproxy/ca.key"'
+rm -f "$work/ca.key" "$work/ca.crt" "$work/cert.pub" "$work/key.pub"
+```
+
+The transient restore unit owns the files as `superserve-secretsproxy`, with
+certificate 0644/key 0600. While DynamicUser is inactive its UID may display
+numerically; the real service's StateDirectory setup restores ownership to its
+allocated identity at startup. Do not create a conflicting static account.
+The shell trap removes all workstation copies on exit; do not retain them in
+backups or shell output. If transfer fails partway, leave VMD stopped and resolve
+the partial destination pair before retrying. Never start secretsproxy to repair
+a missing CA in this cell.
+
+Configure the approved artifact paths without copying Host 1's env or HOST_ID:
+
+```bash
+ssh2 'sudo install -d -m 0755 /etc/sandbox; sudo touch /etc/sandbox/vmd.env /etc/sandbox/secretsproxy.env; sudo chown root:root /etc/sandbox/*.env; sudo chmod 0644 /etc/sandbox/vmd.env; sudo chmod 0600 /etc/sandbox/secretsproxy.env
+for setting in KERNEL_PATH=/var/lib/sandbox/kernel/vmlinux-4.14-fuse BASE_ROOTFS_PATH=/var/lib/sandbox/rootfs/base.ext4 HOST_ID=superserve-vmd-staging-2; do
+  key=${setting%%=*}
+  if ! sudo grep -q "^$key=" /etc/sandbox/vmd.env; then echo "$setting" | sudo tee -a /etc/sandbox/vmd.env >/dev/null; fi
+done
+sudo grep -E "^(KERNEL_PATH|BASE_ROOTFS_PATH|HOST_ID)=" /etc/sandbox/vmd.env
+sudo test -s /var/lib/secretsproxy/ca.crt
+sudo test -s /var/lib/secretsproxy/ca.key
+sudo test -s /var/lib/sandbox/kernel/vmlinux-4.14-fuse
+sudo test -s /var/lib/sandbox/rootfs/base.ext4
+sudo test -x /usr/local/bin/firecracker
+sudo test -x /usr/local/bin/template-builder
+sudo test -c /dev/kvm
+mountpoint -q /mnt/sandbox-data
+sudo systemctl is-active google-guest-agent.service
+sudo test -d /etc/superserve/peer/current'
+```
+
+Review any already-configured paths instead of overwriting them. Host 2 must
+retain its own instance-name HOST_ID; an existing value is preserved by CD.
+Verify `HOST_INTERFACE` with `ip link`, guest DNS and Firecracker compatibility
+against the canonical host preparation procedure. Rerun the documented
+`bootstrap-host2.py --provider superserve` baseline with the Terraform artifact
+before requesting the standby deployment. It leaves VMD stopped; do not admit it.
+
+CD creates env files without truncating existing content, keeps vmd.env root-owned
+0644 and secretsproxy.env 0600, and reconciles deployment-supplied control-plane,
+auth and database values. It requires an explicit approved KERNEL_PATH, defaults
+only missing BASE_ROOTFS_PATH to `/var/lib/sandbox/rootfs/base.ext4`, and preserves
+configured alternatives. It checks artifacts and the shared CA before installing
+binaries, then requires secretsproxy health before first VMD activation. The
+persistent bootstrap guard survives failed attempts. A retry also injects boxd
+when an earlier partial deploy already installed the same binary. Normal serving
+hosts retain their existing restart order. No peer certificates are changed.
 
 After any stop/start, verify the intended runtime filesystem layout,
 `/mnt/sandbox-data` is mounted, and the configured `KERNEL_PATH` and

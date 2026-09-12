@@ -67,7 +67,7 @@ func TestNewCAReloadsExistingMaterial(t *testing.T) {
 	}
 }
 
-func TestNewCAFreshHostsHaveIndependentPersistentKeys(t *testing.T) {
+func TestNewCABrandNewCellsHaveIndependentPersistentKeys(t *testing.T) {
 	firstDir, secondDir := t.TempDir(), t.TempDir()
 	certPath, keyPath := filepath.Join(firstDir, "ca.crt"), filepath.Join(firstDir, "ca.key")
 	first, err := NewCA(certPath, keyPath, 16)
