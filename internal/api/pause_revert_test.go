@@ -2,40 +2,37 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-// A pause that fails after BeginPause — whether at host resolution or at the
-// daemon — must compensate: status back to 'active' AND the billing interval
-// reopened. The two facts commit as ONE statement (RevertPauseToActive), so
-// this test asserts that single query fires with the sandbox's identity; the
-// atomicity and status-gating live in the SQL and are covered by the
-// integration test.
-func TestRevertPauseAsyncRestoresStatusAndInterval(t *testing.T) {
+// A pause that fails before anything is dispatched compensates in ONE fenced
+// statement (RevertPauseToActive): status back to 'active' and the billing
+// interval reopened, so a failure between the two facts is unrepresentable.
+func TestRevertPause_RestoresStatusAndIntervalUnderTheLease(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
-	var mu sync.Mutex
+	lease := pauseLease{id: pgtype.UUID{Bytes: uuid.New(), Valid: true}, version: 3}
 	var reverted bool
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			if !strings.Contains(sql, "-- name: RevertPauseToActive :one") {
 				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
 			}
-			mu.Lock()
-			defer mu.Unlock()
-			if args[0] != sandboxID || args[1] != teamID {
-				t.Errorf("revert args = %v, %v; want %v, %v", args[0], args[1], sandboxID, teamID)
+			if args[0] != sandboxID || args[1] != teamID || args[2] != lease.id || *(args[3].(*int64)) != lease.version {
+				t.Errorf("revert args = %v; want the sandbox, team, and the lease it holds", args)
 			}
 			reverted = true
 			return &mockRow{scanFn: func(dest ...any) error {
@@ -46,23 +43,200 @@ func TestRevertPauseAsyncRestoresStatusAndInterval(t *testing.T) {
 	}
 	h := &Handlers{DB: db.New(mock)}
 
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	c.Request = httptest.NewRequest("POST", "/sandboxes/x/pause", nil)
+	h.revertPause(context.Background(), sandboxID, teamID, lease, nil, zerolog.Nop())
 
-	h.revertPauseAsync(c, sandboxID, teamID, zerolog.Nop())
+	if !reverted {
+		t.Fatal("revert query never fired")
+	}
+}
 
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		mu.Lock()
-		done := reverted
-		mu.Unlock()
-		if done {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("revert query never fired")
-		}
-		time.Sleep(2 * time.Millisecond)
+// When the host cannot be resolved the operation is undone before the
+// request is answered: the caller hears "failed" about a row that is already
+// 'active' again, and nothing is left for the reconciler to pick up.
+func TestPauseSandbox_UnresolvedHostRevertsBeforeResponding(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-1", Name: "sb", Status: db.SandboxStatusActive,
+		PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1}
+	var reverted bool
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: RevertPauseToActive :one"):
+				if args[2] != sb.PauseOpID || *(args[3].(*int64)) != sb.PauseOpLeaseVersion {
+					t.Errorf("revert args = %v; want the lease BeginPause minted", args)
+				}
+				reverted = true
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*int64) = 1
+					return nil
+				}}
+			case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+	}
+	h := &Handlers{DB: db.New(mock), Hosts: &stubHosts{resolve: func() (vmdclient.Client, error) {
+		return nil, errors.New("host not registered")
+	}}}
+
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+	if !reverted {
+		t.Fatal("responded before the operation was reverted")
+	}
+}
+
+// A client that prefers an asynchronous answer is told 'pausing' before the
+// host is even resolved; when resolution then fails, the revert still lands
+// in the background.
+func TestPauseSandbox_RespondAsync_UnresolvedHostRevertsInTheBackground(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-1", Name: "sb", Status: db.SandboxStatusActive,
+		PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1}
+	var reverted bool
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: RevertPauseToActive :one"):
+				reverted = true
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*int64) = 1
+					return nil
+				}}
+			case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+	}
+	resolved := make(chan struct{})
+	h := &Handlers{DB: db.New(mock), Hosts: &stubHosts{resolve: func() (vmdclient.Client, error) {
+		close(resolved)
+		return nil, errors.New("host not registered")
+	}}}
+
+	req := pauseRequest(sandboxID.String())
+	req.Header.Set("Prefer", "respond-async")
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusAccepted, w.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+	select {
+	case <-resolved:
+	default:
+		t.Fatal("host was never resolved by the detached dispatch")
+	}
+	if !reverted {
+		t.Fatal("unresolved host did not revert the operation")
+	}
+}
+
+// A transient failure of the revert write is retried rather than left as a
+// pending operation for the reconciler to turn into a pause.
+func TestRevertPause_RetriesATransientFailure(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	lease := pauseLease{id: pgtype.UUID{Bytes: uuid.New(), Valid: true}, version: 1}
+	attempts := 0
+	var deadlines []time.Time
+	mock := &mockDBTX{
+		queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
+			if !strings.Contains(sql, "-- name: RevertPauseToActive :one") {
+				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
+			}
+			attempts++
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Error("revert attempt carries no deadline")
+			}
+			deadlines = append(deadlines, deadline)
+			if attempts == 1 {
+				return errorRow(errors.New("connection reset"))
+			}
+			return &mockRow{scanFn: func(dest ...any) error {
+				*dest[0].(*int64) = 1
+				return nil
+			}}
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+
+	if !h.revertPause(context.Background(), sandboxID, teamID, lease, nil, zerolog.Nop()) {
+		t.Fatal("revert reported as not landed after a successful retry")
+	}
+
+	if attempts != 2 {
+		t.Fatalf("revert attempts = %d, want a retry after the transient failure", attempts)
+	}
+	// On the synchronous path the retries run inside the request, so they
+	// share one deadline rather than each starting a fresh one.
+	if !deadlines[1].Equal(deadlines[0]) {
+		t.Fatalf("retry deadline %v differs from the first attempt's %v; want one shared deadline", deadlines[1], deadlines[0])
+	}
+}
+
+// A database that never answers holds the revert for one timeout in total,
+// not one per attempt.
+func TestRevertPause_UnansweredDatabaseHoldsForOneTimeout(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	lease := pauseLease{id: pgtype.UUID{Bytes: uuid.New(), Valid: true}, version: 1}
+	mock := &mockDBTX{
+		queryRowFn: func(ctx context.Context, _ string, _ ...any) pgx.Row {
+			<-ctx.Done()
+			return errorRow(ctx.Err())
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+
+	started := time.Now()
+	if h.revertPause(context.Background(), sandboxID, teamID, lease, nil, zerolog.Nop()) {
+		t.Fatal("revert reported as landed with a database that never answered")
+	}
+	if held := time.Since(started); held > asyncTimeout+time.Second {
+		t.Fatalf("revert held the caller for %v; want about one timeout of %v", held, asyncTimeout)
+	}
+}
+
+// When the revert cannot be written at all the claim stands and the
+// reconciler will pause the VM, so the caller hears 'pausing', not "failed".
+func TestPauseSandbox_UnresolvedHostWithUnwritableRevertAnswersPausing(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-1", Name: "sb", Status: db.SandboxStatusActive,
+		PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1}
+	attempts := 0
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: RevertPauseToActive :one"):
+				attempts++
+				return errorRow(errors.New("connection reset"))
+			case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+	}
+	h := &Handlers{DB: db.New(mock), Hosts: &stubHosts{resolve: func() (vmdclient.Client, error) {
+		return nil, errors.New("host not registered")
+	}}}
+
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusAccepted, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"pausing"`) {
+		t.Fatalf("body = %s, want status pausing", w.Body.String())
+	}
+	if attempts != 3 {
+		t.Fatalf("revert attempts = %d, want 3 before giving up", attempts)
 	}
 }

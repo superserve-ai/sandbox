@@ -2,18 +2,19 @@ package api
 
 import (
 	"context"
-	"net/netip"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
-	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 const defaultSweepInterval = 10 * time.Minute
@@ -228,28 +229,71 @@ dispatch:
 }
 
 func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism int, logger zerolog.Logger) {
-	// Atomically claim expired active sandboxes and mark them 'pausing' in one
-	// CTE+UPDATE. FOR UPDATE SKIP LOCKED inside the query ensures that
-	// concurrent reaper replicas skip rows already being processed.
-	// Use a bounded timeout — if the DB is slow, skip this cycle rather
-	// than block the whole loop.
-	queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
-	expired, err := h.DB.ClaimExpiredSandboxes(queryCtx, batchSize)
-	queryCancel()
-	if err != nil {
-		logger.Error().Err(err).Msg("reaper: ClaimExpiredSandboxes failed")
-		return
-	}
-
-	if len(expired) == 0 {
-		return
-	}
-
-	logger.Info().Int("count", len(expired)).Msg("reaper: pausing expired sandboxes")
-
-	dispatchBounded(ctx, expired, parallelism, func(sbx db.ClaimExpiredSandboxesRow) {
-		h.pauseExpired(ctx, sbx, logger)
+	claimed, err := claimBatch(ctx, parallelism, batchSize, func(ctx context.Context, limit int32) ([]uuid.UUID, error) {
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return h.DB.ListExpiredSandboxes(qctx, limit)
+	}, func(ctx context.Context, id uuid.UUID) (db.ClaimExpiredSandboxRow, error) {
+		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		row, err := h.DB.ClaimExpiredSandbox(cctx, db.ClaimExpiredSandboxParams{ID: id, LeaseSeconds: pauseLeaseSeconds})
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			logger.Error().Err(err).Str("sandbox_id", id.String()).Msg("reaper: ClaimExpiredSandbox failed")
+		}
+		return row, err
+	}, func(sbx db.ClaimExpiredSandboxRow, claimedAt time.Time) {
+		h.pauseExpired(ctx, sbx, claimedAt, logger)
 	})
+	if err != nil {
+		logger.Error().Err(err).Msg("reaper: ListExpiredSandboxes failed")
+	}
+	if claimed > 0 {
+		logger.Info().Int("count", claimed).Msg("reaper: paused expired sandboxes")
+	}
+}
+
+// claimRefillRounds bounds the listings of one claimBatch call: a candidate
+// whose claim keeps failing for a reason other than contention would
+// otherwise be listed again without end.
+const claimRefillRounds = 4
+
+// claimBatch lists and claims until batch rows are claimed or the list runs
+// dry, and reports how many were claimed. Every replica lists the same oldest
+// candidates, so a claim lost to another replica is replaced from the next
+// listing rather than costing this replica its share of the tick.
+func claimBatch[T any](ctx context.Context, workers int, batch int32, list func(ctx context.Context, limit int32) ([]uuid.UUID, error), claim func(ctx context.Context, id uuid.UUID) (T, error), process func(row T, claimedAt time.Time)) (int, error) {
+	claimed := 0
+	for round, remaining := 0, batch; round < claimRefillRounds && remaining > 0; round++ {
+		ids, err := list(ctx, remaining)
+		if err != nil {
+			return claimed, err
+		}
+		n := claimEach(ctx, workers, ids, claim, process)
+		claimed += n
+		if int32(len(ids)) < remaining {
+			break
+		}
+		remaining -= int32(n)
+	}
+	return claimed, nil
+}
+
+// claimEach hands candidate ids to at most workers goroutines; each claims
+// its candidate at dispatch time (re-checked under lock, leased only then), so
+// one scan feeds every worker and no leased row waits. An empty claim is
+// skipped; the count of claimed rows is returned.
+func claimEach[T any](ctx context.Context, workers int, ids []uuid.UUID, claim func(ctx context.Context, id uuid.UUID) (T, error), process func(row T, claimedAt time.Time)) int {
+	var claimed atomic.Int32
+	dispatchBounded(ctx, ids, workers, func(id uuid.UUID) {
+		claimedAt := time.Now()
+		row, err := claim(ctx, id)
+		if err != nil {
+			return
+		}
+		claimed.Add(1)
+		process(row, claimedAt)
+	})
+	return int(claimed.Load())
 }
 
 // sweepOrphanedSnapshotRows deletes snapshot rows for long-destroyed
@@ -326,12 +370,9 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 // pauseExpired pauses one sandbox that was atomically claimed by
 // ClaimExpiredSandboxes (already marked 'pausing' in DB).
 //
-// This is a distributed transaction across two systems (VMD + Postgres) so
-// we use a saga: if any DB step fails after VMD has stopped the VM, we
-// compensate by resuming the VM and reverting DB to 'active' so the reaper
-// can retry cleanly on the next tick. If compensation itself fails, we mark
-// the sandbox as 'failed' to bound the blast radius — operator intervention
-// is required, but we never leak it stuck in 'pausing' or loop forever.
+// Once the pause is dispatched nothing is undone: an error from the host does
+// not prove the VM still runs, so the row stays 'pausing' under its lease for
+// the reconciler (see pause_reconcile.go).
 //
 // Order of operations:
 //  1. VMD PauseInstance — stops the VM, writes snapshot files to disk.
@@ -339,24 +380,31 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 //     and flips status from 'pausing' to 'paused' in a single CTE.
 //
 // Failure handling:
-//   - Step 1 fails → VM is still running → revert DB to 'active'.
-//   - Step 2 fails → VM is stopped → call rollbackPausedVM (resume + revert).
-func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, logger zerolog.Logger) {
-	h.pauseClaimed(ctx, sbx, "timeout", "timeout_pause", "timeout_paused", "reaper: sandbox paused due to timeout", logger)
+//   - Host unresolved → nothing dispatched → revert DB to 'active'.
+//   - Step 1 NotFound → VM is gone → mark 'failed' under the lease.
+//   - Step 1 any other error, or step 2 fails → release the lease; the
+//     reconciler retries (a stopped VM answers from the already-paused guard).
+func (h *Handlers) pauseExpired(ctx context.Context, sbx db.ClaimExpiredSandboxRow, claimedAt time.Time, logger zerolog.Logger) {
+	leaseUntil := leaseDeadline(sbx.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
+	h.pauseClaimed(ctx, sbx, leaseUntil, "timeout", "timeout_pause", "timeout_paused", "reaper: sandbox paused due to timeout", logger)
 }
 
-func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxesRow, logger zerolog.Logger) {
-	h.pauseClaimed(ctx, db.ClaimExpiredSandboxesRow{
-		ID:            sbx.ID,
-		TeamID:        sbx.TeamID,
-		Name:          sbx.Name,
-		SnapshotID:    sbx.SnapshotID,
-		HostID:        sbx.HostID,
-		NetworkConfig: sbx.NetworkConfig,
-	}, "billing_ineligible", "billing_ineligible_pause", "billing_ineligible_paused", "billing: sandbox paused after eligibility loss", logger)
+func (h *Handlers) pauseBillingIneligible(ctx context.Context, sbx db.ClaimBillingIneligibleSandboxRow, claimedAt time.Time, logger zerolog.Logger) {
+	leaseUntil := leaseDeadline(sbx.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
+	h.pauseClaimed(ctx, db.ClaimExpiredSandboxRow{
+		ID:                  sbx.ID,
+		TeamID:              sbx.TeamID,
+		Name:                sbx.Name,
+		SnapshotID:          sbx.SnapshotID,
+		HostID:              sbx.HostID,
+		NetworkConfig:       sbx.NetworkConfig,
+		PauseOpID:           sbx.PauseOpID,
+		PauseOpLeaseVersion: sbx.PauseOpLeaseVersion,
+		PauseOpLeaseUntil:   sbx.PauseOpLeaseUntil,
+	}, leaseUntil, "billing_ineligible", "billing_ineligible_pause", "billing_ineligible_paused", "billing: sandbox paused after eligibility loss", logger)
 }
 
-func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, trigger, transition, activity, successMessage string, logger zerolog.Logger) {
+func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxRow, leaseUntil time.Time, trigger, transition, activity, successMessage string, logger zerolog.Logger) {
 	l := logger.With().
 		Str("sandbox_id", sbx.ID.String()).
 		Str("host_id", sbx.HostID).
@@ -377,16 +425,22 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 		return
 	}
 
-	// Minted per pause; returns in the host's upload report to name this
-	// exact pause for coverage linkage.
-	pauseToken := uuid.NewString()
-	snapshotPath, memPath, manifest, ackedPauseToken, err := pauseWithRetry(ctx, vmd, sbx.ID.String(), pauseToken)
+	// The pause's identity, minted by the claim; returns in the host's upload
+	// report to name this exact pause for coverage linkage.
+	pauseToken := uuid.UUID(sbx.PauseOpID.Bytes).String()
+	snapshotPath, memPath, manifest, ackedPauseToken, err := h.pauseWithRetry(ctx, vmd, sbx.HostID, sbx.ID.String(), pauseToken, leaseUntil)
 	if err != nil {
-		// Retry (see pauseWithRetry) didn't converge — the VM genuinely
-		// didn't pause, so revert to active and let the next tick retry.
-		l.Error().Err(err).Msg("reaper: VMD PauseInstance failed — reverting to active")
 		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
-		h.revertToActiveOrFail(ctx, sbx, err, l)
+		lease := pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}
+		if isVMDNotFound(err) || isVMDFailedPrecondition(err) {
+			l.Warn().Err(err).Msg("reaper: VM gone from its host, marking failed")
+			h.failPause(ctx, sbx.ID, sbx.HostID, lease, l)
+			return
+		}
+		// An error after dispatch does not prove the VM still runs; the
+		// reconciler asks the host again (see pause_reconcile.go).
+		l.Warn().Err(err).Msg("reaper: VMD PauseInstance undecided — left pausing for reconciliation")
+		h.releasePauseLease(ctx, sbx.ID, lease, 0, l)
 		return
 	}
 
@@ -394,20 +448,32 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	defer postCancel()
 
 	params := db.FinalizePauseParams{
-		ID:      sbx.ID,
-		TeamID:  sbx.TeamID,
-		Path:    snapshotPath,
-		MemPath: &memPath,
-		Trigger: trigger,
+		ID:                  sbx.ID,
+		TeamID:              sbx.TeamID,
+		PauseOpID:           sbx.PauseOpID,
+		PauseOpLeaseVersion: &sbx.PauseOpLeaseVersion,
+		Path:                snapshotPath,
+		MemPath:             &memPath,
+		Trigger:             trigger,
 		// Only the daemon's echo may be stored (see PauseSandbox).
 		PauseToken: ackedPauseToken,
 	}
 	applyManifest(&params, manifest)
 	if _, err := h.finalizePause(postCtx, params); err != nil {
-		l.Error().Err(err).Msg("reaper: FinalizePause failed — rolling back VMD pause")
-		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
-		h.rollbackPausedVM(ctx, sbx, snapshotPath, memPath, err, l)
-		return
+		if errors.Is(err, pgx.ErrNoRows) {
+			RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
+			l.Warn().Msg("reaper: row moved on before finalize")
+			return
+		}
+		if !h.pauseLanded(ctx, sbx.ID, sbx.TeamID) {
+			RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
+			// The snapshot exists on the host; a later attempt gets it back from
+			// the host's already-paused guard and finalizes again.
+			l.Error().Err(err).Msg("reaper: FinalizePause failed — left pausing for reconciliation")
+			h.releasePauseLease(ctx, sbx.ID, pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}, 0, l)
+			return
+		}
+		l.Warn().Err(err).Msg("reaper: finalize answer lost after it committed")
 	}
 
 	l.Info().Msg(successMessage)
@@ -417,151 +483,29 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxe
 	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", activity, "success", &sbx.Name, nil, nil)
 }
 
-// rollbackPausedVM is the saga compensation for a failed pause. The VM is
-// already stopped at the VMD layer, so we resume it to bring the system
-// back to a consistent state, then revert DB status to 'active' so the
-// reaper retries cleanly. If resume or the DB revert fails, we mark the
-// sandbox 'failed' so it stops being touched by the reaper.
-//
-// `cause` is the original DB error that triggered the rollback, propagated
-// so the terminal log line tells the operator what actually went wrong.
-func (h *Handlers) rollbackPausedVM(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, snapshotPath, memPath string, cause error, l zerolog.Logger) {
-	rl := l.With().
-		Str("snapshot_path", snapshotPath).
-		Str("mem_path", memPath).
-		AnErr("cause", cause).
-		Logger()
-
-	vmd, vmdLookupErr := h.vmdForHost(ctx, sbx.HostID)
-	if vmdLookupErr != nil {
-		rl.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD for rollback failed")
-		h.markSandboxFailed(ctx, sbx, "resolve VMD failed during rollback", rl)
-		return
-	}
-
-	// Reaper rollback resume: brings the VM back up after a pause-DB-write
-	// failure, before the customer ever sees the transition. Same deadline
-	// retry as the user-facing boots — the background ctx never reads dead,
-	// which is right: a rollback landing late still beats marking the
-	// sandbox failed.
-	// No policy carried: the record keeps the one it has, which this
-	// rollback never changed.
-	var attested vmdclient.ResumeAttestation
-	ipAddr, _, _, _, err := retryTransientBoot(ctx, sbx.ID.String(), sbx.HostID, func(rctx context.Context) (string, uint32, uint32, error) {
-		ip, vcpu, memMiB, att, rerr := vmd.ResumeInstance(rctx, sbx.ID.String(), snapshotPath, memPath, sbx.NetworkConfig, "", nil, 0)
-		attested = att
-		return ip, vcpu, memMiB, rerr
+// revertToActiveOrFail undoes a claim whose host could not be resolved: nothing
+// was dispatched, so 'active' is the truth. Never after a dispatch. The revert
+// is fenced to the claim's lease; if it cannot be written the sandbox is marked
+// 'failed' under the same fence so the reaper does not loop.
+func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpiredSandboxRow, cause error, l zerolog.Logger) {
+	lease := pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}
+	// Detached from cancellation: a shutdown that cut the host lookup short
+	// must not also cut this write short and hand a running VM to the
+	// terminal fallback below.
+	revertCtx, revertCancel := context.WithTimeout(context.WithoutCancel(ctx), asyncTimeout)
+	defer revertCancel()
+	n, err := h.DB.RevertPauseToActive(revertCtx, db.RevertPauseToActiveParams{
+		SandboxID:           sbx.ID,
+		TeamID:              sbx.TeamID,
+		PauseOpID:           lease.id,
+		PauseOpLeaseVersion: &lease.version,
 	})
 	if err != nil {
-		rl.Error().Err(err).Msg("reaper: rollback resume failed")
-		// failed is terminal — nothing will resume this ID again, so a boot
-		// that landed after the deadline would idle against the failed row
-		// until the reconciler sweeps it. Best-effort destroy now (mirrors
-		// the create path). Unlike the resume handler's error branches,
-		// there is no adopt-on-retry self-heal here to preserve.
-		dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), vmdTimeout)
-		_ = vmd.DestroyInstance(dctx, sbx.ID.String(), true)
-		dcancel()
-		h.markSandboxFailed(ctx, sbx, "rollback resume failed after pause DB error", rl)
+		l.Error().Err(err).AnErr("cause", cause).Msg("reaper: revert to active failed, marking failed")
+		h.failPause(ctx, sbx.ID, sbx.HostID, lease, l)
 		return
 	}
-
-	parsedIP, parseErr := netip.ParseAddr(ipAddr)
-	if parseErr != nil {
-		rl.Error().Err(parseErr).Str("ip", ipAddr).Msg("reaper: rollback resume returned invalid IP")
-		h.markSandboxFailed(ctx, sbx, "rollback resume returned invalid IP after pause DB error", rl)
-		return
+	if n == 0 {
+		l.Warn().AnErr("cause", cause).Msg("reaper: revert skipped: lease no longer held")
 	}
-
-	// A rollback that adopts a VM the earlier attempt left running can come
-	// back with only the firewall half of the egress rules in place. Push
-	// them before the row goes active, as the resume handler does.
-	if !attested.NetworkRulesApplied {
-		if err := h.reapplyNetworkConfig(ctx, vmd, sbx.ID.String(), sbx.NetworkConfig); err != nil {
-			rl.Error().Err(err).Msg("reaper: rollback egress rules replay failed")
-			h.markSandboxFailed(ctx, sbx, "rollback egress rules replay failed after pause DB error", rl)
-			return
-		}
-	}
-
-	// VM is running again — revert DB to active so reaper retries cleanly.
-	revertCtx, revertCancel := context.WithTimeout(ctx, asyncTimeout)
-	defer revertCancel()
-	if err := h.DB.UpdateSandboxHost(revertCtx, db.UpdateSandboxHostParams{
-		ID:        sbx.ID,
-		HostID:    sbx.HostID,
-		IpAddress: &parsedIP,
-		Pid:       nil,
-		TeamID:    sbx.TeamID,
-	}); err != nil {
-		rl.Error().Err(err).Msg("reaper: rollback host/IP update failed (VM resumed but row not updated)")
-		h.markSandboxFailed(ctx, sbx, "rollback host/IP update failed after pause DB error", rl)
-		return
-	}
-	if err := h.DB.UpdateSandboxStatus(revertCtx, db.UpdateSandboxStatusParams{
-		ID:     sbx.ID,
-		Status: db.SandboxStatusActive,
-		TeamID: sbx.TeamID,
-	}); err != nil {
-		rl.Error().Err(err).Msg("reaper: rollback DB revert failed (VM resumed but status not updated)")
-		h.markSandboxFailed(ctx, sbx, "rollback DB revert failed after pause DB error", rl)
-		return
-	}
-
-	// Reopen the interval that pauseExpired closed at the top — sandbox
-	// is back to active and should resume being counted as such.
-	// actor_id is nil because this is a system-initiated revert, not a
-	// user action.
-	h.openSandboxIntervalInheritActor(ctx, sbx.ID, sbx.TeamID)
-
-	rl.Warn().Msg("reaper: rolled back failed pause, sandbox is active again — will retry next tick")
-}
-
-// revertToActiveOrFail is the simple revert path used when VMD pause fails
-// before any side effect — the VM is still running, so we just need to
-// undo the 'pausing' status. If the revert itself fails, we mark the
-// sandbox 'failed' so the reaper does not loop on it.
-//
-// `cause` is the original VMD error, propagated for terminal logging.
-func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, cause error, l zerolog.Logger) {
-	revertCtx, revertCancel := context.WithTimeout(ctx, asyncTimeout)
-	defer revertCancel()
-	if err := h.DB.UpdateSandboxStatus(revertCtx, db.UpdateSandboxStatusParams{
-		ID:     sbx.ID,
-		Status: db.SandboxStatusActive,
-		TeamID: sbx.TeamID,
-	}); err != nil {
-		l.Error().Err(err).AnErr("cause", cause).Msg("reaper: revert to active failed (after VMD pause error)")
-		h.markSandboxFailed(ctx, sbx, "revert to active failed after VMD pause error", l.With().AnErr("cause", cause).Logger())
-		return
-	}
-	// Reopen the interval that pauseExpired closed at the top — sandbox
-	// is back to active. System-initiated revert, so actor_id is nil.
-	h.openSandboxIntervalInheritActor(ctx, sbx.ID, sbx.TeamID)
-}
-
-// markSandboxFailed sets the sandbox to 'failed' as a terminal state for
-// reaper-side compensation paths. Emits a single high-signal log line with
-// `reason` and any context already on `l` so on-call has one place to look
-// when alerting fires on `status=failed`.
-//
-// Best-effort: if the DB write itself fails, we log loudly and stop — at
-// that point the sandbox is stuck in 'pausing', but the reaper loop is
-// already bounded because future ticks only claim 'active' sandboxes.
-func (h *Handlers) markSandboxFailed(ctx context.Context, sbx db.ClaimExpiredSandboxesRow, reason string, l zerolog.Logger) {
-	started := time.Now()
-	failCtx, failCancel := context.WithTimeout(ctx, asyncTimeout)
-	defer failCancel()
-	// MarkSandboxFailedInTeam's CTE bundles the active-interval close into
-	// the same statement; no separate close call needed.
-	if err := h.DB.MarkSandboxFailedInTeam(failCtx, db.MarkSandboxFailedInTeamParams{
-		ID:     sbx.ID,
-		TeamID: sbx.TeamID,
-	}); err != nil {
-		RecordSandboxTransition(ctx, "fail", telemetry.ResultError, sbx.HostID, time.Since(started))
-		l.Error().Err(err).Str("reason", reason).Msg("reaper: TERMINAL — sandbox stuck in 'pausing', mark-failed also failed, manual recovery required")
-		return
-	}
-	RecordSandboxTransition(ctx, "fail", telemetry.ResultSuccess, sbx.HostID, time.Since(started))
-	l.Error().Str("reason", reason).Msg("reaper: TERMINAL — sandbox marked 'failed', manual recovery required")
 }

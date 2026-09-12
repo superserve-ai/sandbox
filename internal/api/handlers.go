@@ -322,33 +322,44 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 	return c, nil
 }
 
-// revertPauseAsync undoes BeginPause's claim after a pause that failed
-// before completing — status back to 'active' and the billing interval
-// reopened, in ONE statement (RevertPauseToActive) so a failure between the
-// two facts is unrepresentable. Runs detached from the caller's cancellation
-// (a client disconnect must not orphan the revert) while keeping trace
-// context.
-func (h *Handlers) revertPauseAsync(c *gin.Context, sandboxID, teamID uuid.UUID, l zerolog.Logger) {
-	revertCtx := context.WithoutCancel(c.Request.Context())
-	actorID := actorIDFromContext(c)
-	go func() {
-		ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
-		defer cancel()
+// revertPause undoes BeginPause's claim when nothing was dispatched, in one
+// fenced statement, retried briefly, and reports whether the write landed. A
+// false return means the operation stands and the reconciler completes the
+// pause, which is what the already-closed billing interval reflects; the
+// caller must then hear "pausing", not "failed". Detached from request
+// cancellation, but the attempts share one deadline: on the synchronous path
+// this runs inside the request, so retries must not stack their timeouts.
+func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UUID, lease pauseLease, actorID *uuid.UUID, l zerolog.Logger) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	backoff := 200 * time.Millisecond
+	for attempt := 1; ; attempt++ {
 		n, err := h.DB.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
-			SandboxID: sandboxID,
-			TeamID:    teamID,
-			ActorID:   actorUUID(actorID),
+			SandboxID:           sandboxID,
+			TeamID:              teamID,
+			PauseOpID:           lease.id,
+			PauseOpLeaseVersion: &lease.version,
+			ActorID:             actorUUID(actorID),
 		})
-		if err != nil {
-			l.Error().Err(err).Msg("async pause revert failed")
-			return
+		if err == nil {
+			if n == 0 {
+				// Another transition (delete, reaper) moved the sandbox out
+				// of 'pausing' first; its state wins over the revert.
+				l.Warn().Msg("pause revert skipped: sandbox no longer pausing")
+			}
+			return true
 		}
-		if n == 0 {
-			// Another transition (delete, reaper) moved the sandbox out
-			// of 'pausing' first; its state wins over the revert.
-			l.Warn().Msg("pause revert skipped: sandbox no longer pausing")
+		if attempt >= 3 || ctx.Err() != nil {
+			l.Error().Err(err).Msg("pause revert failed; the row stays 'pausing' and the reconciler will complete the pause")
+			return false
 		}
-	}()
+		l.Warn().Err(err).Int("attempt", attempt).Msg("pause revert failed; retrying")
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+		}
+		backoff *= 2
+	}
 }
 
 // vmdTimeout is the default deadline for VMD gRPC calls.
@@ -617,34 +628,6 @@ func (h *Handlers) openSandboxInterval(reqCtx context.Context, sandboxID, teamID
 		ActorID:   actorUUID(actorID),
 	}); err != nil {
 		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("open sandbox_active_interval failed")
-	}
-}
-
-// openSandboxIntervalInheritActor opens an interval after a system-initiated
-// revert (e.g. reaper's pause-then-rollback) where the original actor was
-// lost. Looks up the most recently closed interval's actor and uses it as
-// the new open's actor_id; this keeps the sandbox contributing to WAU
-// across a brief outage instead of getting dropped by the view's "actor_id
-// IS NOT NULL" filter. Falls back to NULL if no prior closed interval
-// exists.
-//
-// Only the reaper revert paths use this. The user-facing handler paths
-// always have an explicit actor from the request context, so they call
-// openSandboxInterval directly.
-func (h *Handlers) openSandboxIntervalInheritActor(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
-	defer cancel()
-	var actorID *uuid.UUID
-	if prior, err := h.DB.GetMostRecentClosedSandboxIntervalActor(ctx, sandboxID); err == nil && prior.Valid {
-		a := uuid.UUID(prior.Bytes)
-		actorID = &a
-	}
-	if err := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
-		SandboxID: sandboxID,
-		TeamID:    teamID,
-		ActorID:   actorUUID(actorID),
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("open sandbox_active_interval (inherit) failed")
 	}
 }
 
@@ -3069,23 +3052,37 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // Sandbox Pause
 // ---------------------------------------------------------------------------
 
-// pauseWithRetry pauses a VM, retrying once on a non-NotFound failure. A
-// timed-out pause may have actually completed on the host, so reverting the
-// row to active would drift it against a paused VM; PauseVM is idempotent, so
-// the retry returns the recorded snapshot and the row converges to paused.
-// NotFound is terminal — the VM is genuinely gone.
-func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id, pauseToken string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
-	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
+// pauseLeaseSeconds is how long the caller that began a pause owns it before
+// the reconciler may take over: the foreground attempts plus a margin.
+const pauseLeaseSeconds int32 = 90
+
+// pauseWithRetry pauses a VM, retrying once on an undecided failure (PauseVM
+// is idempotent, so a timed-out pause that completed returns its snapshot).
+// Every attempt ends before leaseUntil, and the retry goes only to a freshly
+// resolved host: a stale machine's answer says nothing about the VM.
+func (h *Handlers) pauseWithRetry(reqCtx context.Context, vmd VMDClient, hostID, id, pauseToken string, leaseUntil time.Time) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
+	deadline, ok := attemptDeadline(leaseUntil, vmdTimeout)
+	if !ok {
+		return "", "", nil, "", errPauseLeaseExpired
+	}
+	ctx, cancel := context.WithDeadline(reqCtx, deadline)
 	snapshotPath, memPath, manifest, ackedToken, err = vmd.PauseInstance(ctx, id, "", pauseToken)
 	cancel()
-	if err == nil || isVMDNotFound(err) {
+	if err == nil || isVMDNotFound(err) || isVMDFailedPrecondition(err) {
 		return snapshotPath, memPath, manifest, ackedToken, err
 	}
-	// Detach from the request ctx: the client's deadline may already have
-	// fired, but the reconciliation to a consistent state must still run.
-	rctx, rcancel := context.WithTimeout(context.WithoutCancel(reqCtx), vmdTimeout)
+	if deadline, ok = attemptDeadline(leaseUntil, vmdTimeout); !ok {
+		return "", "", nil, "", err
+	}
+	// Detached from the request: the client's deadline may already have
+	// fired, but the row must still converge.
+	rctx, rcancel := context.WithDeadline(context.WithoutCancel(reqCtx), deadline)
 	defer rcancel()
-	return vmd.PauseInstance(rctx, id, "", pauseToken)
+	fresh, rerr := h.vmdForHost(rctx, hostID)
+	if rerr != nil {
+		return "", "", nil, "", fmt.Errorf("resolve host for pause retry: %w", rerr)
+	}
+	return fresh.PauseInstance(rctx, id, "", pauseToken)
 }
 
 func (h *Handlers) PauseSandbox(c *gin.Context) {
@@ -3115,9 +3112,16 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// path. An empty result means the sandbox either doesn't exist, isn't
 	// ours, or isn't currently active — we do a cheap existence check to
 	// return the right error code (404 vs 409).
+	// The pause's identity is minted before it is claimed, so the same id
+	// names it in the row, in every host call, and as its backup token.
+	claimedAt := time.Now()
+	pauseOp := uuid.New()
 	sandbox, err := h.DB.BeginPause(c.Request.Context(), db.BeginPauseParams{
-		ID:     sandboxID,
-		TeamID: teamID,
+		ID:           sandboxID,
+		TeamID:       teamID,
+		PauseOpID:    pgtype.UUID{Bytes: pauseOp, Valid: true},
+		LeaseSeconds: pauseLeaseSeconds,
+		ActorID:      actorUUID(actorIDFromContext(c)),
 	})
 	if err == nil {
 		pauseHostID = sandbox.HostID // label error outcomes past the claim too
@@ -3149,95 +3153,24 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	l := sandboxLogger(sandboxID.String(), sandbox.HostID)
 
 	// BeginPause's CTE atomically closed the open active interval together
-	// with the status transition; nothing to do here. If the pause
-	// subsequently fails, the revert paths reopen a new interval.
+	// with the status transition; nothing to do here. If the host
+	// cannot be resolved, the revert reopens a new interval.
 
-	// Resolve the VMD client for this sandbox's host. BeginPause has
-	// already claimed 'pausing' and closed the billing interval, so a
-	// lookup failure — now a real path when the host row is missing —
-	// must compensate exactly like a daemon failure, or the sandbox is
-	// stuck in 'pausing' and unbilled even after the registration is
-	// repaired.
-	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
-	if vmdLookupErr != nil {
-		l.Error().Err(vmdLookupErr).Msg("resolve VMD for pause failed")
-		h.revertPauseAsync(c, sandboxID, teamID, l)
-		respondError(c, ErrInternal)
+	// Read from the request here: past this point the dispatch may outlive
+	// it, and nothing on another goroutine may touch c.
+	actorID := actorIDFromContext(c)
+	leaseUntil := leaseDeadline(sandbox.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
+
+	if !prefersAsync(c) {
+		respondPause(c, h.dispatchPause(c.Request.Context(), sandbox, leaseUntil, actorID, l))
 		return
 	}
 
-	// Call VMD to pause and snapshot the VM.
-	// Minted per pause: rides the pause RPC into the host's backup
-	// pipeline and returns in the upload report, naming this exact pause
-	// for coverage linkage.
-	pauseToken := uuid.NewString()
-	snapshotPath, memPath, manifest, ackedPauseToken, err := pauseWithRetry(c.Request.Context(), vmd, sandboxID.String(), pauseToken)
-	if err != nil {
-		// VMD says the VM doesn't exist — it crashed or was removed out-of-band.
-		// Mark the sandbox failed and return 410 Gone. No revert — the VM is
-		// already dead, "active" was a lie.
-		if isVMDNotFound(err) {
-			l.Warn().Err(err).Msg("VMD PauseInstance: VM unavailable, marking sandbox failed")
-			h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID, sandbox.HostID, false)
-			respondError(c, ErrSandboxGone)
-			return
-		}
-
-		l.Error().Err(err).Msg("VMD PauseInstance failed")
-		h.revertPauseAsync(c, sandboxID, teamID, l)
-		respondError(c, ErrInternal)
-		return
-	}
-
-	l.Debug().
-		Str("snapshot_path", snapshotPath).
-		Str("mem_path", memPath).
-		Msg("VMD pause complete")
-
-	// Past this point the snapshot already exists on disk — the pause has
-	// physically happened, so the bookkeeping (snapshot row upsert + status
-	// flip pausing → paused in a single CTE) is fire-and-forget. BeginPause's
-	// gate write owns the row and every other transition is status-gated, so
-	// a racing resume sees 'pausing' and 409s until this lands. Detached from
-	// cancellation so a client disconnect cannot orphan the bookkeeping;
-	// trace/span context preserved. The upsert replaces the old "insert a new
-	// row + delete the previous" flow, so there's no explicit prev-snapshot
-	// cleanup to schedule here.
-	finalizeCtx := context.WithoutCancel(c.Request.Context())
-	h.asyncBookkeeping("finalize-pause", func() {
-		fctx, fcancel := context.WithTimeout(finalizeCtx, asyncTimeout)
-		defer fcancel()
-		params := db.FinalizePauseParams{
-			ID:      sandboxID,
-			TeamID:  teamID,
-			Path:    snapshotPath,
-			MemPath: &memPath,
-			Trigger: "pause",
-			// Store only what the daemon ECHOED: an older daemon drops the
-			// token, and storing it anyway would demand of its reports an
-			// identity they can never carry.
-			PauseToken: ackedPauseToken,
-		}
-		applyManifest(&params, manifest)
-		if _, err := h.finalizePause(fctx, params); err != nil {
-			// ErrNoRows means the sandbox was soft-deleted between BeginPause
-			// and FinalizePause (a rare race with DeleteSandbox). The VM is
-			// already stopped and its snapshot files are on disk — nothing to
-			// finalize for a sandbox that no longer exists.
-			if err == pgx.ErrNoRows {
-				l.Warn().Msg("FinalizePause: sandbox deleted mid-pause")
-				return
-			}
-			l.Error().Err(err).Msg("async DB FinalizePause failed — sandbox may be stuck in 'pausing'")
-			return
-		}
-	})
-
-	// Interval was already closed at BeginPause; FinalizePause is the
-	// end of the VMD pause work, not the moment the sandbox left active.
-	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
-	h.capture(c, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
-	c.Status(http.StatusNoContent)
+	// The pause is recorded; the caller is told so at once. Everything else,
+	// host resolution included, runs detached and lands on the row.
+	bg := context.WithoutCancel(c.Request.Context())
+	h.asyncBookkeeping("pause-dispatch", func() { h.dispatchPause(bg, sandbox, leaseUntil, actorID, l) })
+	acceptPausing(c)
 }
 
 // ---------------------------------------------------------------------------

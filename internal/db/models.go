@@ -597,6 +597,18 @@ type Sandbox struct {
 	SecretEnvInjectedAt pgtype.Timestamptz `json:"secret_env_injected_at"`
 	// Expiry of the injected proxy JWT; a resume re-injects when it is near.
 	SecretEnvExpiresAt pgtype.Timestamptz `json:"secret_env_expires_at"`
+	// Identity of the pause in flight, reused as the pause token across every attempt; NULL when no pause is pending.
+	PauseOpID        pgtype.UUID        `json:"pause_op_id"`
+	PauseOpStartedAt pgtype.Timestamptz `json:"pause_op_started_at"`
+	// Until when the worker holding pause_op_lease_version may act on the pause; expired or NULL means claimable.
+	PauseOpLeaseUntil   pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
+	// When a pause pending past its age threshold was flagged for an operator; set once.
+	PauseOpAttentionAt pgtype.Timestamptz `json:"pause_op_attention_at"`
+	// Why the pause in flight was started (pause, timeout, billing_ineligible); kept so a reconciled pause records its original cause.
+	PauseOpTrigger *string `json:"pause_op_trigger"`
+	// Who asked for the pause in flight; NULL for automatic pauses. Kept so a reconciled pause is attributed to them.
+	PauseOpActorID pgtype.UUID `json:"pause_op_actor_id"`
 }
 
 type SandboxActiveInterval struct {

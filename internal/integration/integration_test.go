@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -296,10 +297,20 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 type stubVMD struct {
 	updatePreviewFn func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
 	updateNetworkFn func(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+	pauseErr        error // when set, every PauseInstance fails with it
+	pauseFn         func(ctx context.Context, id, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error)
+	pauseCalls      atomic.Int32
 }
 
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
-func (s *stubVMD) PauseInstance(_ context.Context, _, _, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
+func (s *stubVMD) PauseInstance(ctx context.Context, id, _, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
+	s.pauseCalls.Add(1)
+	if s.pauseFn != nil {
+		return s.pauseFn(ctx, id, pauseToken)
+	}
+	if s.pauseErr != nil {
+		return "", "", nil, "", s.pauseErr
+	}
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ string, _ map[int32]vmdclient.PortPolicy, _ int64) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {

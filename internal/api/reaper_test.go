@@ -3,8 +3,9 @@ package api
 import (
 	"context"
 	"errors"
-	"net/netip"
+	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,67 +15,114 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/db"
-	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // ---------------------------------------------------------------------------
 // pgx.Rows stub
 // ---------------------------------------------------------------------------
 
-// stubRows implements pgx.Rows backed by a slice of ClaimExpiredSandboxesRow.
-type stubRows struct {
-	items []db.ClaimExpiredSandboxesRow
-	idx   int
-	err   error
+// idRows implements pgx.Rows over candidate ids, as the list queries return.
+type idRows struct {
+	ids []uuid.UUID
+	idx int
 }
 
-func newStubRows(items []db.ClaimExpiredSandboxesRow) *stubRows {
-	return &stubRows{items: items, idx: -1}
-}
+func newIDRows(ids []uuid.UUID) *idRows { return &idRows{ids: ids, idx: -1} }
 
-func (r *stubRows) Next() bool {
+func (r *idRows) Next() bool {
 	r.idx++
-	return r.idx < len(r.items)
+	return r.idx < len(r.ids)
 }
 
-func (r *stubRows) Scan(dest ...any) error {
-	row := r.items[r.idx]
-	*dest[0].(*uuid.UUID) = row.ID
-	*dest[1].(*uuid.UUID) = row.TeamID
-	*dest[2].(*string) = row.Name
-	*dest[3].(*pgtype.UUID) = row.SnapshotID
-	*dest[4].(*string) = row.HostID
+func (r *idRows) Scan(dest ...any) error {
+	*dest[0].(*uuid.UUID) = r.ids[r.idx]
 	return nil
 }
 
-func (r *stubRows) Close()                                       {}
-func (r *stubRows) Err() error                                   { return r.err }
-func (r *stubRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
-func (r *stubRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
-func (r *stubRows) Values() ([]any, error)                       { return nil, nil }
-func (r *stubRows) RawValues() [][]byte                          { return nil }
-func (r *stubRows) Conn() *pgx.Conn                              { return nil }
+func (r *idRows) Close()                                       {}
+func (r *idRows) Err() error                                   { return nil }
+func (r *idRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (r *idRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
+func (r *idRows) Values() ([]any, error)                       { return nil, nil }
+func (r *idRows) RawValues() [][]byte                          { return nil }
+func (r *idRows) Conn() *pgx.Conn                              { return nil }
+
+// claimedRow is what a claim-by-id returns for a candidate.
+func claimedRow(c db.ClaimExpiredSandboxRow) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = c.ID
+		*dest[1].(*uuid.UUID) = c.TeamID
+		*dest[2].(*string) = c.Name
+		*dest[3].(*pgtype.UUID) = c.SnapshotID
+		*dest[4].(*string) = c.HostID
+		*dest[5].(*[]byte) = c.NetworkConfig
+		*dest[6].(*pgtype.UUID) = c.PauseOpID
+		*dest[7].(*int64) = c.PauseOpLeaseVersion
+		*dest[8].(*pgtype.Timestamptz) = c.PauseOpLeaseUntil
+		return nil
+	}}
+}
 
 // ---------------------------------------------------------------------------
 // DBTX mock for reaper tests
 // ---------------------------------------------------------------------------
 
-// reaperMockDBTX backs db.Queries for reaper tests.
-// queryFn handles ClaimExpiredSandboxes; queryRowFn handles CreateSnapshot and
-// CreateActivity (distinguished by SQL content); execFn handles status updates.
+// reaperMockDBTX backs db.Queries for reaper tests. candidates are served to
+// the list queries in order and to the claim-by-id queries once each, the way
+// a real claim is one-shot; queryFn/queryRowFn/execFn override the rest.
 type reaperMockDBTX struct {
 	queryFn    func(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	queryRowFn func(ctx context.Context, sql string, args ...any) pgx.Row
 	execFn     func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	candidates []db.ClaimExpiredSandboxRow
+
+	mu     sync.Mutex
+	taken  map[uuid.UUID]bool
+	lists  atomic.Int32
+	claims atomic.Int32
+}
+
+func isListSQL(sql string) bool {
+	return strings.Contains(sql, "-- name: ListExpiredSandboxes ") || strings.Contains(sql, "-- name: ListBillingIneligibleSandboxes ")
+}
+
+func isClaimSQL(sql string) bool {
+	return strings.Contains(sql, "-- name: ClaimExpiredSandbox ") || strings.Contains(sql, "-- name: ClaimBillingIneligibleSandbox ")
 }
 
 func (m *reaperMockDBTX) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
 	if m.queryFn != nil {
 		return m.queryFn(ctx, sql, args...)
 	}
-	return newStubRows(nil), nil
+	if isListSQL(sql) {
+		m.lists.Add(1)
+		ids := make([]uuid.UUID, 0, len(m.candidates))
+		for _, c := range m.candidates {
+			ids = append(ids, c.ID)
+		}
+		return newIDRows(ids), nil
+	}
+	return newIDRows(nil), nil
+}
+
+func (m *reaperMockDBTX) claim(id uuid.UUID) pgx.Row {
+	m.claims.Add(1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.taken == nil {
+		m.taken = map[uuid.UUID]bool{}
+	}
+	for _, c := range m.candidates {
+		if c.ID == id && !m.taken[id] {
+			m.taken[id] = true
+			return claimedRow(c)
+		}
+	}
+	return notFoundRow()
 }
 
 func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
@@ -88,6 +136,9 @@ func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) 
 			return nil
 		}}
 	}
+	if isClaimSQL(sql) {
+		return m.claim(args[0].(uuid.UUID))
+	}
 	if m.queryRowFn != nil {
 		return m.queryRowFn(ctx, sql, args...)
 	}
@@ -97,9 +148,6 @@ func (m *reaperMockDBTX) QueryRow(ctx context.Context, sql string, args ...any) 
 	case strings.Contains(sql, "INSERT INTO snapshot"):
 		return reaperSnapshotRow()
 	case strings.Contains(sql, "FROM sandbox_active_interval"):
-		// GetMostRecentClosedSandboxIntervalActor — return ErrNoRows so the
-		// inherit-actor lookup falls through to NULL (no prior interval in
-		// these tests).
 		return notFoundRow()
 	}
 	return activityRow()
@@ -139,8 +187,8 @@ func newReaperHandlers(dbtx *reaperMockDBTX, vmd *stubVMD) *Handlers {
 	}
 }
 
-func expiredRow(name string) db.ClaimExpiredSandboxesRow {
-	return db.ClaimExpiredSandboxesRow{
+func expiredRow(name string) db.ClaimExpiredSandboxRow {
+	return db.ClaimExpiredSandboxRow{
 		ID:     uuid.New(),
 		TeamID: uuid.New(),
 		Name:   name,
@@ -179,9 +227,7 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
-				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
-			},
+			candidates: []db.ClaimExpiredSandboxRow{row},
 			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 				if strings.Contains(sql, "upserted AS") {
 					atomic.AddInt32(&finalizeCalls, 1)
@@ -206,47 +252,132 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 	}
 }
 
-// TestReaper_VMDFails verifies that a VMD pause error reverts status to active
-// and does not stop the reaper from processing subsequent sandboxes.
-func TestReaper_VMDFails(t *testing.T) {
-	rows := []db.ClaimExpiredSandboxesRow{expiredRow("sbx-a"), expiredRow("sbx-b")}
-	var pauseCallCount int32
-	var revertCallCount int32
+// A finalize whose reply was lost after it committed: the row already reads
+// paused, so the reaper records the pause rather than handing back a lease
+// that no longer exists.
+func TestReaper_LostFinalizeReplyStillRecordsThePause(t *testing.T) {
+	row := expiredRow("sbx-lost-reply")
+	paused := db.Sandbox{ID: row.ID, TeamID: row.TeamID, Status: db.SandboxStatusPaused}
+	var activities, releases int32
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
-				return newStubRows(rows), nil
-			},
-			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-				// Count revert-to-active calls (UpdateSandboxStatus with 'active').
-				if strings.Contains(sql, "status") {
-					for _, a := range args {
-						if s, ok := a.(db.SandboxStatus); ok && s == db.SandboxStatusActive {
-							atomic.AddInt32(&revertCallCount, 1)
-						}
-					}
+			candidates: []db.ClaimExpiredSandboxRow{row},
+			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+				switch {
+				case strings.Contains(sql, "upserted AS"):
+					return errorRow(errors.New("connection reset"))
+				case strings.Contains(sql, "-- name: GetSandbox :one"):
+					return sandboxRow(paused)
+				case strings.Contains(sql, "-- name: CreateActivity "):
+					atomic.AddInt32(&activities, 1)
 				}
-				return pgconn.CommandTag{}, nil
+				return activityRow()
+			},
+			execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+				if strings.Contains(sql, "-- name: ReleasePauseLease ") {
+					atomic.AddInt32(&releases, 1)
+				}
+				return pgconn.NewCommandTag("UPDATE 1"), nil
 			},
 		},
-		&stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
-			atomic.AddInt32(&pauseCallCount, 1)
-			return "", "", errors.New("vmd: pause failed")
+		&stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
 		}},
 	)
 
 	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
 
-	// Both sandboxes are attempted, and pauseWithRetry retries each failure
-	// once (a timed-out pause may have completed on the host), so 2 sandboxes
-	// × 2 attempts = 4 calls.
-	if got := atomic.LoadInt32(&pauseCallCount); got != 4 {
-		t.Fatalf("expected 4 PauseInstance calls (2 sandboxes × retry), got %d", got)
+	for deadline := time.Now().Add(300 * time.Millisecond); time.Now().Before(deadline) && atomic.LoadInt32(&activities) != 1; {
+		time.Sleep(5 * time.Millisecond)
 	}
-	// A failure that doesn't converge after the retry reverts to active.
-	if got := atomic.LoadInt32(&revertCallCount); got != 2 {
-		t.Fatalf("expected 2 revert-to-active calls, got %d", got)
+	if atomic.LoadInt32(&activities) != 1 || atomic.LoadInt32(&releases) != 0 {
+		t.Fatalf("activities = %d, releases = %d; want the pause recorded once and no lease handed back", activities, releases)
+	}
+}
+
+// A pause the host never answered stays 'pausing' with its lease handed back
+// for the reconciler; nothing reverts the row.
+func TestReaper_VMDFails_ReconcilerLeavesPausing(t *testing.T) {
+	row := expiredRow("sbx-a")
+	row.PauseOpID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	row.PauseOpLeaseVersion = 1
+	var reverts, releases int32
+
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			candidates: []db.ClaimExpiredSandboxRow{row},
+			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+				switch {
+				case strings.Contains(sql, "-- name: ReleasePauseLease :execrows"):
+					atomic.AddInt32(&releases, 1)
+					if args[0].(int32) != 0 || args[2].(pgtype.UUID) != row.PauseOpID || args[3].(int64) != 1 {
+						t.Errorf("release args = %v, want retry 0 fenced to the claimed lease", args)
+					}
+				case strings.Contains(sql, "-- name: UpdateSandboxStatus"):
+					atomic.AddInt32(&reverts, 1)
+				}
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			},
+		},
+		&stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "", "", status.Error(codes.DeadlineExceeded, "pause timed out")
+		}},
+	)
+
+	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
+
+	if got := atomic.LoadInt32(&releases); got != 1 {
+		t.Fatalf("expected 1 lease release, got %d", got)
+	}
+	if got := atomic.LoadInt32(&reverts); got != 0 {
+		t.Fatalf("expected no revert to active, got %d", got)
+	}
+}
+
+// NotFound from the resolved host is the one error that decides the pause:
+// the VM is gone, so the row is failed under the lease's fence, not reverted.
+func TestReaper_VMDNotFound_ReconcilerMarksFailed(t *testing.T) {
+	row := expiredRow("sbx-a")
+	row.PauseOpID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	row.PauseOpLeaseVersion = 1
+	var reverts, fails int32
+
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			candidates: []db.ClaimExpiredSandboxRow{row},
+			queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+				if strings.Contains(sql, "-- name: MarkSandboxFailed :one") {
+					atomic.AddInt32(&fails, 1)
+					if args[1].(db.SandboxStatus) != db.SandboxStatusPausing || args[2].(pgtype.UUID) != row.PauseOpID {
+						t.Errorf("mark-failed args = %v, want observed pausing fenced to the claimed lease", args)
+					}
+					return &mockRow{scanFn: func(dest ...any) error {
+						*dest[0].(*int64) = 1
+						return nil
+					}}
+				}
+				return activityRow()
+			},
+			execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+				if strings.Contains(sql, "-- name: UpdateSandboxStatus") {
+					atomic.AddInt32(&reverts, 1)
+				}
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			},
+		},
+		&stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "", "", status.Error(codes.NotFound, "no such vm")
+		}},
+	)
+
+	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
+
+	if got := atomic.LoadInt32(&fails); got != 1 {
+		t.Fatalf("expected 1 fenced mark-failed, got %d", got)
+	}
+	if got := atomic.LoadInt32(&reverts); got != 0 {
+		t.Fatalf("expected no revert to active, got %d", got)
 	}
 }
 
@@ -277,34 +408,155 @@ func TestReaper_DBError(t *testing.T) {
 // TestReaper_BatchSizeRespected verifies that the batch limit is passed to
 // ClaimExpiredSandboxes (the SQL enforces LIMIT, but we confirm the value
 // reaches the query layer).
-func TestReaper_BatchSizeRespected(t *testing.T) {
-	var capturedLimit int32
+// One candidate scan per tick; each worker then claims its own row at
+// dispatch time: 7 candidates with 3 workers is one list and 7 claims.
+func TestReaper_ScansOnceAndClaimsPerWorker(t *testing.T) {
+	rows := make([]db.ClaimExpiredSandboxRow, 7)
+	for i := range rows {
+		rows[i] = expiredRow("sbx")
+	}
+	var pauses int32
+	mock := &reaperMockDBTX{candidates: rows}
+	h := newReaperHandlers(mock, &stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+		atomic.AddInt32(&pauses, 1)
+		return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+	}})
+
+	h.reapOnce(context.Background(), 7, 3, zerolog.Nop())
+
+	if mock.lists.Load() != 1 || mock.claims.Load() != 7 || atomic.LoadInt32(&pauses) != 7 {
+		t.Fatalf("lists = %d, claims = %d, pauses = %d; want 1, 7, 7", mock.lists.Load(), mock.claims.Load(), pauses)
+	}
+}
+
+// Replicas list the same oldest candidates; a claim lost to another replica
+// is replaced from the next listing rather than shrinking this replica's batch.
+func TestReaper_RefillsAfterLosingClaimsToAnotherReplica(t *testing.T) {
+	rows := make([]db.ClaimExpiredSandboxRow, 4)
+	for i := range rows {
+		rows[i] = expiredRow(fmt.Sprintf("sbx-%d", i))
+	}
+	var pauses int32
+	mock := &reaperMockDBTX{candidates: rows}
+	mock.queryFn = func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+		if !isListSQL(sql) {
+			return newIDRows(nil), nil
+		}
+		// The candidates not yet claimed, oldest first, up to the limit.
+		mock.mu.Lock()
+		defer mock.mu.Unlock()
+		if mock.taken == nil {
+			mock.taken = map[uuid.UUID]bool{}
+		}
+		var ids []uuid.UUID
+		for _, c := range rows {
+			if !mock.taken[c.ID] && len(ids) < int(args[0].(int32)) {
+				ids = append(ids, c.ID)
+			}
+		}
+		// Another replica claims the first listing's rows before this one can.
+		if mock.lists.Add(1) == 1 {
+			for _, id := range ids {
+				mock.taken[id] = true
+			}
+		}
+		return newIDRows(ids), nil
+	}
+	h := newReaperHandlers(mock, &stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+		atomic.AddInt32(&pauses, 1)
+		return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+	}})
+
+	h.reapOnce(context.Background(), 2, 2, zerolog.Nop())
+
+	if mock.lists.Load() != 2 || mock.claims.Load() != 4 || atomic.LoadInt32(&pauses) != 2 {
+		t.Fatalf("lists = %d, claims = %d, pauses = %d; want 2, 4, 2: the lost batch refilled from the next listing",
+			mock.lists.Load(), mock.claims.Load(), pauses)
+	}
+}
+
+// A candidate whose claim keeps failing for a reason other than contention is
+// listed again a bounded number of times, not forever.
+func TestClaimBatch_BoundsRefillRounds(t *testing.T) {
+	id := uuid.New()
+	lists := 0
+	claimed, err := claimBatch(context.Background(), 1, 1, func(context.Context, int32) ([]uuid.UUID, error) {
+		lists++
+		return []uuid.UUID{id}, nil
+	}, func(context.Context, uuid.UUID) (struct{}, error) {
+		return struct{}{}, pgx.ErrNoRows
+	}, func(struct{}, time.Time) {
+		t.Error("processed a row that was never claimed")
+	})
+	if err != nil || claimed != 0 || lists != claimRefillRounds {
+		t.Fatalf("claimed = %d, lists = %d, err = %v; want nothing claimed after %d listings", claimed, lists, err, claimRefillRounds)
+	}
+}
+
+// A worker that finishes claims the next candidate while another is still on
+// a slow pause; one slow host never idles the rest.
+func TestReaper_FreeWorkerStartsTheNextPause(t *testing.T) {
+	rows := []db.ClaimExpiredSandboxRow{expiredRow("slow"), expiredRow("fast"), expiredRow("next")}
+	calls := make(chan string, 3)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
 
 	h := newReaperHandlers(
-		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, args ...any) (pgx.Rows, error) {
-				if len(args) > 0 {
-					if v, ok := args[0].(int32); ok {
-						atomic.StoreInt32(&capturedLimit, v)
-					}
+		&reaperMockDBTX{candidates: rows},
+		&stubVMD{pauseFn: func(ctx context.Context, id, _ string) (string, string, error) {
+			calls <- id
+			if id == rows[0].ID.String() {
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return "", "", ctx.Err()
 				}
-				return newStubRows(nil), nil
-			},
-		},
-		&stubVMD{},
+			}
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		}},
 	)
 
-	h.reapOnce(context.Background(), 7, 1, zerolog.Nop())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.reapOnce(context.Background(), 3, 2, zerolog.Nop())
+	}()
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		<-done
+		h.WaitAsyncBookkeeping()
+	}()
 
-	if got := atomic.LoadInt32(&capturedLimit); got != 7 {
-		t.Fatalf("expected batch size 7 passed to query, got %d", got)
+	// With the first row held, every row must still start.
+	assertAllStart(t, calls, rows, "one slow pause blocked the next sandbox while a worker was idle")
+}
+
+// assertAllStart reads one start per row from calls and fails if any row
+// never starts or an unknown id shows up. Starts arrive in any order.
+func assertAllStart(t *testing.T, calls <-chan string, rows []db.ClaimExpiredSandboxRow, blocked string) {
+	t.Helper()
+	want := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		want[r.ID.String()] = true
+	}
+	for range rows {
+		select {
+		case id := <-calls:
+			if !want[id] {
+				t.Fatalf("unexpected pause %s", id)
+			}
+			delete(want, id)
+		case <-time.After(time.Second):
+			t.Fatalf("%s (%d never started)", blocked, len(want))
+		}
 	}
 }
 
 // TestReaper_ContextCancelledMidBatch verifies that the reaper stops
 // processing the batch when the context is cancelled.
 func TestReaper_ContextCancelledMidBatch(t *testing.T) {
-	rows := make([]db.ClaimExpiredSandboxesRow, 5)
+	rows := make([]db.ClaimExpiredSandboxRow, 5)
 	for i := range rows {
 		rows[i] = expiredRow("sbx")
 	}
@@ -314,9 +566,7 @@ func TestReaper_ContextCancelledMidBatch(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
-				return newStubRows(rows), nil
-			},
+			candidates: rows,
 		},
 		&stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
 			if atomic.AddInt32(&pauseCount, 1) == 2 {
@@ -343,9 +593,7 @@ func TestReaper_LoopRunsImmediately(t *testing.T) {
 
 	h := newReaperHandlers(
 		&reaperMockDBTX{
-			queryFn: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
-				return newStubRows([]db.ClaimExpiredSandboxesRow{row}), nil
-			},
+			candidates: []db.ClaimExpiredSandboxRow{row},
 		},
 		&stubVMD{pauseFn: func(_ context.Context, _ string, _ string) (string, string, error) {
 			atomic.AddInt32(&pauseCalled, 1)
@@ -404,95 +652,85 @@ func TestReaper_SweepsRunOnStartupWithUnsetSweepInterval(t *testing.T) {
 	t.Fatal("snapshot sweep did not run on startup")
 }
 
-// rollbackPausedVM must persist the resumed host/IP before it flips the row
-// back to active, otherwise the DB can keep advertising a recycled slot.
-func TestRollbackPausedVM_PersistsReplacementHostAndIP(t *testing.T) {
-	resumeIP := "10.11.0.99"
-	var callOrder []string
-	var gotHost string
-	var gotIP string
-	var gotPID *int32
-
-	h := &Handlers{
-		VMD: &stubVMD{resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
-			return resumeIP, nil
-		}},
-		DB: db.New(&reaperMockDBTX{
-			execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-				switch {
-				case strings.Contains(sql, "SET host_id = $2, ip_address = $3, pid = COALESCE($4, pid)"):
-					callOrder = append(callOrder, "host")
-					gotHost = args[1].(string)
-					gotIP = args[2].(*netip.Addr).String()
-					gotPID = args[3].(*int32)
-				case strings.Contains(sql, "SET status = $2"):
-					callOrder = append(callOrder, "status")
-				}
-				return pgconn.CommandTag{}, nil
-			},
-		}),
+// The billing pass schedules like the reaper: one list, then a free worker
+// claims the next sandbox while another is still on a slow pause.
+func TestBillingPause_FreeWorkerStartsTheNextPause(t *testing.T) {
+	teamID := uuid.New()
+	rows := make([]db.ClaimExpiredSandboxRow, 11)
+	for i := range rows {
+		rows[i] = expiredRow(fmt.Sprintf("billing-%d", i))
+		rows[i].TeamID = teamID
 	}
+	calls := make(chan string, len(rows))
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
 
-	sbx := db.ClaimExpiredSandboxesRow{
-		ID:            uuid.New(),
-		TeamID:        uuid.New(),
-		HostID:        "host-1",
-		Name:          "sbx",
-		NetworkConfig: []byte(`{"allowed_cidrs":["10.0.0.0/8"]}`),
-	}
+	mock := &reaperMockDBTX{candidates: rows}
+	h := newReaperHandlers(mock, &stubVMD{pauseFn: func(ctx context.Context, id, _ string) (string, string, error) {
+		calls <- id
+		if id == rows[0].ID.String() {
+			select {
+			case <-release:
+			case <-ctx.Done():
+				return "", "", ctx.Err()
+			}
+		}
+		return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+	}})
 
-	h.rollbackPausedVM(context.Background(), sbx, "/snapshots/vmstate.snap", "/snapshots/mem.snap", errors.New("pause write failed"), zerolog.Nop())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.pauseBillingIneligibleTeam(context.Background(), teamID)
+	}()
+	defer func() {
+		releaseOnce.Do(func() { close(release) })
+		<-done
+		h.WaitAsyncBookkeeping()
+	}()
 
-	if gotHost != "host-1" || gotIP != resumeIP {
-		t.Fatalf("replacement host/IP = %q/%q, want host-1/%s", gotHost, gotIP, resumeIP)
-	}
-	if gotPID != nil {
-		t.Fatalf("replacement pid arg = %#v, want nil to preserve the existing PID", gotPID)
-	}
-	if strings.Join(callOrder, ",") != "host,status" {
-		t.Fatalf("rollback write order = %v, want host then status", callOrder)
+	// With the first row held, the eleventh must still start on a free worker.
+	assertAllStart(t, calls, rows, "one slow pause blocked the eleventh sandbox while workers were idle")
+	if mock.lists.Load() != 1 {
+		t.Fatalf("lists = %d, want one candidate scan for the pass", mock.lists.Load())
 	}
 }
 
-// A rollback that adopts a VM left running by the earlier attempt can come
-// back with the daemon reporting the egress rules only partly applied; the
-// rollback must push them itself before the row goes active, and leave
-// them alone when the daemon reports them in place.
-func TestRollbackPausedVM_ReplaysEgressRulesUnlessAcked(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		acked       bool
-		wantReplays int
-	}{
-		{"unacked rules are pushed", false, 1},
-		{"acked rules are left alone", true, 0},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			replays := 0
-			h := &Handlers{
-				VMD: &stubVMD{
-					resumeFn:     func(context.Context, string, string, string, []byte) (string, error) { return "10.11.0.99", nil },
-					resumeAttest: vmdclient.ResumeAttestation{NetworkRulesApplied: tc.acked},
-					updateNetworkFn: func(_ context.Context, _ string, allowed, _, _ []string) error {
-						replays++
-						if len(allowed) != 1 || allowed[0] != "10.0.0.0/8" {
-							t.Errorf("replayed allow list = %v, want the persisted CIDR", allowed)
-						}
-						return nil
-					},
-				},
-				DB: db.New(&reaperMockDBTX{
-					execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) { return pgconn.CommandTag{}, nil },
-				}),
+// A cancelled process context (shutdown) must not turn an undispatched claim
+// into a failed sandbox: the revert runs detached and lands, and the terminal
+// fallback is never reached.
+func TestRevertToActiveOrFail_SurvivesCancellation(t *testing.T) {
+	sbx := expiredRow("sbx")
+	sbx.PauseOpID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	sbx.PauseOpLeaseVersion = 1
+	var reverts, fails int32
+	h := newReaperHandlers(&reaperMockDBTX{queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
+		switch {
+		case strings.Contains(sql, "-- name: RevertPauseToActive :one"):
+			if ctx.Err() != nil {
+				t.Errorf("revert issued on a dead context: %v", ctx.Err())
 			}
-			sbx := db.ClaimExpiredSandboxesRow{
-				ID: uuid.New(), TeamID: uuid.New(), HostID: "host-1", Name: "sbx",
-				NetworkConfig: []byte(`{"egress":{"allowed_cidrs":["10.0.0.0/8"]}}`),
-			}
-			h.rollbackPausedVM(context.Background(), sbx, "/snapshots/vmstate.snap", "/snapshots/mem.snap", errors.New("pause write failed"), zerolog.Nop())
-			if replays != tc.wantReplays {
-				t.Fatalf("rule replays = %d, want %d", replays, tc.wantReplays)
-			}
-		})
+			atomic.AddInt32(&reverts, 1)
+			return &mockRow{scanFn: func(dest ...any) error {
+				*dest[0].(*int64) = 1
+				return nil
+			}}
+		case strings.Contains(sql, "-- name: MarkSandboxFailed :one"):
+			atomic.AddInt32(&fails, 1)
+			return &mockRow{scanFn: func(dest ...any) error {
+				*dest[0].(*int64) = 1
+				return nil
+			}}
+		}
+		return activityRow()
+	}}, &stubVMD{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.revertToActiveOrFail(ctx, sbx, context.Canceled, zerolog.Nop())
+
+	if atomic.LoadInt32(&reverts) != 1 || atomic.LoadInt32(&fails) != 0 {
+		t.Fatalf("reverts = %d, fails = %d; want the revert to land and no terminal fallback", reverts, fails)
 	}
 }
