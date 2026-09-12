@@ -114,14 +114,17 @@ CREATE TABLE IF NOT EXISTS qm.tenant_events (
     status    text NOT NULL,
     message   text,
     detail    jsonb,
-    -- clock_timestamp() so events written in one transaction still order.
+    -- Per-tenant insertion counter assigned by InsertQMTenantEvent; the
+    -- provisioner serializes writes per tenant, so it is the ordering key and
+    -- survives copying between cells unlike a global sequence.
+    seq       bigint NOT NULL,
     at        timestamptz NOT NULL DEFAULT clock_timestamp(),
 
     CONSTRAINT qm_tenant_events_status_check
         CHECK (status IN ('started', 'ok', 'failed', 'skipped'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_qm_tenant_events_tenant_at ON qm.tenant_events(tenant_id, at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_qm_tenant_events_tenant_seq ON qm.tenant_events(tenant_id, seq);
 
 -- secret_ref is a Secret Manager resource name, never a secret value; the
 -- value only ever lives in Secret Manager and is resolved by the tenant's

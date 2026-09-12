@@ -236,10 +236,10 @@ func seedFixture(t *testing.T) *fixture {
 	mustExec(t, srcPool, `INSERT INTO api_key (team_id, key_hash, name, created_by, revoked_at) VALUES ($1, 'hash-'||$2::text, 'ci', $3, now())`, f.team, uuid.New(), f.owner)
 	mustExec(t, srcPool, `INSERT INTO api_key (team_id, key_hash, name, revoked_at) VALUES ($1, 'hash-'||$2::text, 'agent', now())`, f.team, uuid.New())
 	mustExec(t, srcPool, `
-		INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, sandbox_api_key_id)
-		VALUES ($1, $2, 'pilot-team', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic',
+		INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, status, sandbox_api_key_id)
+		VALUES ($1, $2, 'pilot-team', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic', 'deleted',
 		        (SELECT id FROM api_key WHERE team_id = $2 AND name = 'ci'))`, f.qmTenant, f.team)
-	mustExec(t, srcPool, `INSERT INTO qm.tenant_events (tenant_id, step, status, message) VALUES ($1, 'database', 'ok', 'created')`, f.qmTenant)
+	mustExec(t, srcPool, `INSERT INTO qm.tenant_events (tenant_id, step, status, message, seq) VALUES ($1, 'database', 'ok', 'created', 1)`, f.qmTenant)
 	mustExec(t, srcPool, `INSERT INTO qm.tenant_secrets (tenant_id, name, secret_ref) VALUES ($1, 'CORE_SIGNING_SECRET', 'projects/example/secrets/qm-pilot-team-CORE_SIGNING_SECRET')`, f.qmTenant)
 
 	mustExec(t, srcPool, `
@@ -569,6 +569,19 @@ func TestTeamMigration(t *testing.T) {
 		err := run(ctx, f.cfg(phaseCopy))
 		if err == nil || !strings.Contains(err.Error(), buildID.String()) {
 			t.Fatalf("in-flight build must block the copy, got: %v", err)
+		}
+	})
+
+	t.Run("copy refuses live hosted-QM tenants", func(t *testing.T) {
+		live := uuid.New()
+		mustExec(t, srcPool, `
+			INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, status)
+			VALUES ($1, $2, 'still-live', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic', 'ready')`, live, f.team)
+		defer mustExec(t, srcPool, `DELETE FROM qm.tenants WHERE id = $1`, live)
+
+		err := run(ctx, f.cfg(phaseCopy))
+		if err == nil || !strings.Contains(err.Error(), live.String()) {
+			t.Fatalf("live hosted-QM tenant must block the copy, got: %v", err)
 		}
 	})
 

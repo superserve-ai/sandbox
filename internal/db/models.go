@@ -549,6 +549,7 @@ type QmTenantEvent struct {
 	Status   string    `json:"status"`
 	Message  *string   `json:"message"`
 	Detail   []byte    `json:"detail"`
+	Seq      int64     `json:"seq"`
 	At       time.Time `json:"at"`
 }
 

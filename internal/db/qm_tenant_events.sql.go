@@ -12,9 +12,10 @@ import (
 )
 
 const insertQMTenantEvent = `-- name: InsertQMTenantEvent :one
-INSERT INTO qm.tenant_events (tenant_id, step, status, message, detail)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, tenant_id, step, status, message, detail, at
+INSERT INTO qm.tenant_events (tenant_id, step, status, message, detail, seq)
+VALUES ($1, $2, $3, $4, $5,
+        (SELECT coalesce(max(seq), 0) + 1 FROM qm.tenant_events WHERE tenant_id = $1))
+RETURNING id, tenant_id, step, status, message, detail, seq, at
 `
 
 type InsertQMTenantEventParams struct {
@@ -41,15 +42,16 @@ func (q *Queries) InsertQMTenantEvent(ctx context.Context, arg InsertQMTenantEve
 		&i.Status,
 		&i.Message,
 		&i.Detail,
+		&i.Seq,
 		&i.At,
 	)
 	return i, err
 }
 
 const listQMTenantEvents = `-- name: ListQMTenantEvents :many
-SELECT id, tenant_id, step, status, message, detail, at FROM qm.tenant_events
+SELECT id, tenant_id, step, status, message, detail, seq, at FROM qm.tenant_events
 WHERE tenant_id = $1
-ORDER BY at ASC, id ASC
+ORDER BY seq ASC
 `
 
 func (q *Queries) ListQMTenantEvents(ctx context.Context, tenantID uuid.UUID) ([]QmTenantEvent, error) {
@@ -68,6 +70,7 @@ func (q *Queries) ListQMTenantEvents(ctx context.Context, tenantID uuid.UUID) ([
 			&i.Status,
 			&i.Message,
 			&i.Detail,
+			&i.Seq,
 			&i.At,
 		); err != nil {
 			return nil, err

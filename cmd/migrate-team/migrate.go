@@ -209,6 +209,13 @@ func runPlan(ctx context.Context, src *pgxpool.Pool, cfg config) error {
 	for _, k := range liveKeys {
 		log.Warn().Str("api_key", k).Msg("plan: BLOCKER — key not revoked; copy will refuse (freeze rotates keys)")
 	}
+	tenants, err := liveQMTenants(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	for _, q := range tenants {
+		log.Warn().Str("qm_tenant", q).Msg("plan: BLOCKER — live hosted-QM tenant; copy will refuse (its sandbox key is region-bound)")
+	}
 
 	return reportArtifactDirs(ctx, src, cfg)
 }
@@ -263,6 +270,33 @@ func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string,
 			return nil, err
 		}
 		out = append(out, fmt.Sprintf("%s status=%s", id, status))
+	}
+	return out, rows.Err()
+}
+
+// liveQMTenants returns "<id> (<slug>) status=<status>" for every hosted-QM
+// tenant that has not been retired. A live tenant's runtime holds one of the
+// team's API keys, and key strings carry a region prefix that cannot follow
+// the team, so tenants must be retired (or re-provisioned in the dest) before
+// the team moves.
+func liveQMTenants(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
+	rows, err := src.Query(ctx, `
+		SELECT id, slug, status FROM qm.tenants
+		WHERE team_id = $1 AND status <> 'deleted'
+		ORDER BY created_at`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list live hosted-QM tenants: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id uuid.UUID
+		var slug, status string
+		if err := rows.Scan(&id, &slug, &status); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s (%s) status=%s", id, slug, status))
 	}
 	return out, rows.Err()
 }
@@ -397,6 +431,14 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	if len(liveKeys) > 0 {
 		return fmt.Errorf("refusing to copy: %d API key(s) not revoked (freeze step — the region prefix in the key string cannot follow the team):\n  %s",
 			len(liveKeys), strings.Join(liveKeys, "\n  "))
+	}
+	tenants, err := liveQMTenants(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(tenants) > 0 {
+		return fmt.Errorf("refusing to copy: %d live hosted-QM tenant(s) — retire them first; a tenant's sandbox API key is region-bound and cannot follow the team:\n  %s",
+			len(tenants), strings.Join(tenants, "\n  "))
 	}
 
 	// The dest host must exist and live in the dest region before any
@@ -1237,6 +1279,14 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	if len(builds) > 0 {
 		return fmt.Errorf("aborting detach: %d template build(s) in flight:\n  %s",
 			len(builds), strings.Join(builds, "\n  "))
+	}
+	tenants, err := liveQMTenants(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(tenants) > 0 {
+		return fmt.Errorf("aborting detach: %d live hosted-QM tenant(s):\n  %s",
+			len(tenants), strings.Join(tenants, "\n  "))
 	}
 
 	// A validate pass is a precondition in the same invocation — after
