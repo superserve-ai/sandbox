@@ -24,6 +24,7 @@ Env vars:
   PEER_PROXY_SPIFFE_URI      required — authorized peer certificate URI
   SENTRY_DSN                 optional — Sentry DSN URL for error reporting
   PEER_IDENTITY_HOSTS        optional — comma-separated hosts requiring identity bootstrap
+  EXPECTED_STANDBY_HOST      optional — require exactly this bootstrapped deployment host
   PEER_PROXY_LISTEN_ADDR     optional — private mTLS listener (auto or private IP:port)
   PEER_PROXY_TARGET_ADDR     optional — loopback target; defaults to 127.0.0.1:5010
   Peer identity and certificate paths are supplied by host bootstrap.
@@ -155,6 +156,14 @@ def main() -> int:
     where = f"{project} ({region})" if region else project
     if not instances:
         print(f"No instances with label {label} found in {where}", file=sys.stderr)
+        return 1
+
+    expected_standby = os.environ.get("EXPECTED_STANDBY_HOST", "")
+    if expected_standby and (
+        len(instances) != 1 or instances[0]["name"] != expected_standby
+        or expected_standby not in peer_identity_hosts
+    ):
+        print("ERROR: standby deployment requires exactly the expected identity host", file=sys.stderr)
         return 1
 
     print(f"Deploying proxy to {len(instances)} instance(s) in {where}")

@@ -33,7 +33,7 @@ class DeployProxyOrderingTest(unittest.TestCase):
 
 
 class DeployProxyTests(unittest.TestCase):
-    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0, database_url="postgres://postgres:postgres@localhost/sandbox_test", routing="", zone="us-central1-a"):
+    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0, database_url="postgres://postgres:postgres@localhost/sandbox_test", routing="", zone="us-central1-a", expected_standby=""):
         scripts = []
 
         def run(args, **kwargs):
@@ -56,6 +56,7 @@ class DeployProxyTests(unittest.TestCase):
             "PROXY_DOMAIN": "sandbox.example.test",
             "PEER_PROXY_LISTEN_ADDR": peer_addr,
             "PEER_IDENTITY_HOSTS": "example-host" if required_identity else "",
+            "EXPECTED_STANDBY_HOST": expected_standby,
             "PEER_PROXY_SPIFFE_URI": identity,
             "PEER_PROXY_CERT_FILE": "/etc/peer/cert.pem",
             "PEER_PROXY_KEY_FILE": "/etc/peer/key.pem",
@@ -71,6 +72,25 @@ class DeployProxyTests(unittest.TestCase):
         self.assertEqual(len(scripts), 1)
         self.assertIn("PEER_PROXY_TARGET_ADDR=127.0.0.1:5010\n", scripts[0])
         return scripts[0]
+
+    def test_standby_requires_expected_bootstrapped_host(self):
+        script = self.generate_script("", routing="0", expected_standby="example-host")
+        self.assertIn('elif [ "1" -eq 1 ]; then', script)
+        self.generate_script("", expected_standby="other-host", expected_result=1)
+        self.generate_script("", expected_standby="example-host", required_identity=False, expected_result=1)
+
+    def test_standby_rejects_extra_discovered_hosts_before_upload(self):
+        env = {
+            "GCP_PROJECT": "example-project", "SHA": "12345678",
+            "PROXY_DOMAIN": "sandbox.example.test", "GCP_REGION": "us-central1",
+            "VMD_LABEL": "component=example-standby",
+            "PEER_IDENTITY_HOSTS": "example-host", "EXPECTED_STANDBY_HOST": "example-host",
+        }
+        result = subprocess.CompletedProcess([], 0, "example-host,us-central1-a\nother-host,us-central1-b\n", "")
+        with patch.dict(os.environ, env, clear=True), patch.object(MODULE.subprocess, "run", return_value=result) as run:
+            self.assertEqual(MODULE.main(), 1)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][:4], ["gcloud", "compute", "instances", "list"])
 
     def test_production_steps_enable_private_ingress(self):
         workflow = Path(__file__).parents[1].joinpath("deploy-proxy.yml").read_text()
