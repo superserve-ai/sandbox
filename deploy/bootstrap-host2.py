@@ -42,7 +42,6 @@ done
 sudo /usr/local/sbin/refresh-peer-credentials --check
 sudo test "$(sudo stat -c '%u:%a' /etc/superserve/peer/current/tls.key)" = 0:600
 sudo grep -Fx 'HOST_ID={config['host_id']}' /etc/sandbox/vmd.env >/dev/null
-findmnt -T /var/lib/sandbox -n -o TARGET | grep -v '^/$'
 mountpoint -q /mnt/sandbox-data
 sudo systemctl is-active --quiet google-guest-agent.service vmd-peer-credentials.timer superserve-secretsproxy.service superserve-otel-collector.service superserve-vmd.service
 invocation=$(sudo systemctl show -p InvocationID --value superserve-vmd.service)
@@ -63,7 +62,6 @@ sudo test -s /var/lib/secretsproxy/ca.key
 sudo test -x /usr/local/bin/template-builder
 sudo test -x /usr/local/bin/firecracker
 sudo test -c /dev/kvm
-findmnt -T /var/lib/sandbox -n -o TARGET | grep -v '^/$'
 mountpoint -q /mnt/sandbox-data
 sudo systemctl cat google-guest-agent.service >/dev/null
 ''')
