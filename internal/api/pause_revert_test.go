@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -144,12 +145,18 @@ func TestRevertPause_RetriesATransientFailure(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
 	lease := pauseLease{id: pgtype.UUID{Bytes: uuid.New(), Valid: true}, version: 1}
 	attempts := 0
+	var deadlines []time.Time
 	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
 			if !strings.Contains(sql, "-- name: RevertPauseToActive :one") {
 				return errorRow(fmt.Errorf("unexpected QueryRow: %s", sql))
 			}
 			attempts++
+			deadline, ok := ctx.Deadline()
+			if !ok {
+				t.Error("revert attempt carries no deadline")
+			}
+			deadlines = append(deadlines, deadline)
 			if attempts == 1 {
 				return errorRow(errors.New("connection reset"))
 			}
@@ -167,6 +174,33 @@ func TestRevertPause_RetriesATransientFailure(t *testing.T) {
 
 	if attempts != 2 {
 		t.Fatalf("revert attempts = %d, want a retry after the transient failure", attempts)
+	}
+	// On the synchronous path the retries run inside the request, so they
+	// share one deadline rather than each starting a fresh one.
+	if !deadlines[1].Equal(deadlines[0]) {
+		t.Fatalf("retry deadline %v differs from the first attempt's %v; want one shared deadline", deadlines[1], deadlines[0])
+	}
+}
+
+// A database that never answers holds the revert for one timeout in total,
+// not one per attempt.
+func TestRevertPause_UnansweredDatabaseHoldsForOneTimeout(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	lease := pauseLease{id: pgtype.UUID{Bytes: uuid.New(), Valid: true}, version: 1}
+	mock := &mockDBTX{
+		queryRowFn: func(ctx context.Context, _ string, _ ...any) pgx.Row {
+			<-ctx.Done()
+			return errorRow(ctx.Err())
+		},
+	}
+	h := &Handlers{DB: db.New(mock)}
+
+	started := time.Now()
+	if h.revertPause(context.Background(), sandboxID, teamID, lease, nil, zerolog.Nop()) {
+		t.Fatal("revert reported as landed with a database that never answered")
+	}
+	if held := time.Since(started); held > asyncTimeout+time.Second {
+		t.Fatalf("revert held the caller for %v; want about one timeout of %v", held, asyncTimeout)
 	}
 }
 

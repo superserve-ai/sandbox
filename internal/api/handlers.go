@@ -327,12 +327,13 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 // false return means the operation stands and the reconciler completes the
 // pause, which is what the already-closed billing interval reflects; the
 // caller must then hear "pausing", not "failed". Detached from request
-// cancellation.
+// cancellation, but the attempts share one deadline: on the synchronous path
+// this runs inside the request, so retries must not stack their timeouts.
 func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UUID, lease pauseLease, actorID *uuid.UUID, l zerolog.Logger) bool {
-	bg := context.WithoutCancel(reqCtx)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
 	backoff := 200 * time.Millisecond
 	for attempt := 1; ; attempt++ {
-		ctx, cancel := context.WithTimeout(bg, asyncTimeout)
 		n, err := h.DB.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
 			SandboxID:           sandboxID,
 			TeamID:              teamID,
@@ -340,7 +341,6 @@ func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UU
 			PauseOpLeaseVersion: &lease.version,
 			ActorID:             actorUUID(actorID),
 		})
-		cancel()
 		if err == nil {
 			if n == 0 {
 				// Another transition (delete, reaper) moved the sandbox out
@@ -349,12 +349,15 @@ func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UU
 			}
 			return true
 		}
-		if attempt >= 3 {
+		if attempt >= 3 || ctx.Err() != nil {
 			l.Error().Err(err).Msg("pause revert failed; the row stays 'pausing' and the reconciler will complete the pause")
 			return false
 		}
 		l.Warn().Err(err).Int("attempt", attempt).Msg("pause revert failed; retrying")
-		time.Sleep(backoff)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+		}
 		backoff *= 2
 	}
 }
