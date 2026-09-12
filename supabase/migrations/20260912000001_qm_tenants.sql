@@ -102,6 +102,11 @@ CREATE TABLE IF NOT EXISTS qm.tenants (
 
 CREATE INDEX IF NOT EXISTS idx_qm_tenants_team ON qm.tenants(team_id);
 
+-- One live stack per team for now; retired tenants do not count, so a team
+-- can create again after deleting.
+CREATE UNIQUE INDEX IF NOT EXISTS qm_tenants_one_active_per_team
+    ON qm.tenants(team_id) WHERE status <> 'deleted';
+
 CREATE TABLE IF NOT EXISTS qm.tenant_events (
     id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id uuid NOT NULL REFERENCES qm.tenants(id) ON DELETE CASCADE,
@@ -109,7 +114,8 @@ CREATE TABLE IF NOT EXISTS qm.tenant_events (
     status    text NOT NULL,
     message   text,
     detail    jsonb,
-    at        timestamptz NOT NULL DEFAULT now(),
+    -- clock_timestamp() so events written in one transaction still order.
+    at        timestamptz NOT NULL DEFAULT clock_timestamp(),
 
     CONSTRAINT qm_tenant_events_status_check
         CHECK (status IN ('started', 'ok', 'failed', 'skipped'))

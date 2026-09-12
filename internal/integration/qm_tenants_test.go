@@ -23,6 +23,7 @@ const (
 	pgInsufficientPriv    = "42501"
 	pgCheckViolation      = "23514"
 	pgForeignKeyViolation = "23503"
+	pgUniqueViolation     = "23505"
 	qmTenantsMigration    = "20260912000001_qm_tenants.sql"
 )
 
@@ -435,5 +436,62 @@ func TestQMAPI_DeletedTenantStaysDeleted(t *testing.T) {
 	got, err := q.GetQMTenant(ctx, db.GetQMTenantParams{ID: tenant.ID, TeamID: teamID})
 	if err != nil || got.Status != "deleted" {
 		t.Fatalf("deleted tenant: status=%q err=%v", got.Status, err)
+	}
+}
+
+func TestQMAPI_OneActiveTenantPerTeam(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedQMTeamAndKey(t)
+	conn := connectAsQMAPI(t)
+	tx, q := scopedQMTx(t, conn, teamID)
+
+	first, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if err != nil {
+		t.Fatalf("create first tenant: %v", err)
+	}
+	_, err = q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if code := pgErrCode(err); code != pgUniqueViolation {
+		t.Fatalf("second active tenant: want %s, got err=%v", pgUniqueViolation, err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	_, q = scopedQMTx(t, conn, teamID)
+	first, err = q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	if _, err := q.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: first.ID, TeamID: teamID}); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	if _, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8])); err != nil {
+		t.Fatalf("create after delete: %v", err)
+	}
+}
+
+func TestQMAPI_EventsInOneTransactionKeepInsertionOrder(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedQMTeamAndKey(t)
+	conn := connectAsQMAPI(t)
+	_, q := scopedQMTx(t, conn, teamID)
+	tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	steps := []string{"database", "identity", "secrets", "deploy", "edge"}
+	for _, step := range steps {
+		if _, err := q.InsertQMTenantEvent(ctx, db.InsertQMTenantEventParams{TenantID: tenant.ID, Step: step, Status: "ok"}); err != nil {
+			t.Fatalf("insert event %s: %v", step, err)
+		}
+	}
+	events, err := q.ListQMTenantEvents(ctx, tenant.ID)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	for i, ev := range events {
+		if ev.Step != steps[i] {
+			t.Fatalf("event %d: got %q want %q", i, ev.Step, steps[i])
+		}
 	}
 }
