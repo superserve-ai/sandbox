@@ -284,6 +284,37 @@ against the canonical host preparation procedure. Rerun the documented
 `bootstrap-host2.py --provider superserve` baseline with the Terraform artifact
 before requesting the standby deployment. It leaves VMD stopped; do not admit it.
 
+### Explicit schedulable capacity
+
+Named identity-bound hosts must publish positive `VMD_SCHEDULABLE_MEMORY_MIB`
+and `VMD_SCHEDULABLE_VCPUS` from runtime configuration. These are scheduler
+admission budgets, not physical machine totals or values recovered from a host
+row in the database. Missing capacity causes self-description rejection even
+when addresses and region are correct.
+
+The shared deployment/bootstrap policy in `deploy/host_runtime.py` supplies
+staging Host 2 with **110000 MiB / 32 vCPU**. Other hosts have no inferred default.
+The production workflow passes environment variables from these GitHub production
+environment vars:
+
+| Cell | Memory variable | vCPU variable |
+| --- | --- | --- |
+| use4 | `VMD_SCHEDULABLE_MEMORY_MIB_USE4` | `VMD_SCHEDULABLE_VCPUS_USE4` |
+| usw2 | `VMD_SCHEDULABLE_MEMORY_MIB_USW2` | `VMD_SCHEDULABLE_VCPUS_USW2` |
+
+Populate these with the approved cell/host admission budgets before production
+standby provisioning. No production numbers have been invented here. Bootstrap
+accepts the same `VMD_SCHEDULABLE_*` process environment inputs, or explicit
+`capacity_memory_mib` / `capacity_vcpus` fields in its host configuration artifact.
+Use the same approved policy values for deployment and bootstrap.
+
+Both paths preserve existing non-empty runtime values. Zero, negative,
+non-integer, out-of-range or missing values fail closed for named hosts before
+activation; both values are validated before either fallback is written.
+Legacy `HOST_ID=default` keeps its existing capacity/identity behavior. Final
+bootstrap verification now checks that named-host runtime capacity is positive.
+This does not alter admission state, physical-capacity detection or peer TLS.
+
 ### Named-host heartbeat region
 
 An identity-bound host must send a complete self-description. Private endpoints
@@ -303,8 +334,7 @@ No manual HOST_REGION or SANDBOX_ID_REGION setting is needed on a fresh host.
 
 Deployment preserves HOST_ID and does not add, replace or remove region settings
 on the legacy `HOST_ID=default` host. Its description-less heartbeat compatibility
-is not evidence that a named identity-bound host can omit its region. Capacity
-continues to come from VMD's existing logic; this does not admit Host 2 or migrate
+is not evidence that a named identity-bound host can omit its region. Schedulable capacity uses the explicit admission policy above; this does not admit Host 2 or migrate
 legacy identity semantics.
 
 ### Host interface and advertised addresses

@@ -140,6 +140,9 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3] / 'deploy'))
+from host_runtime import capacity_inputs, capacity_script
+
 def deployment_host_region(region, zone):
     zone_name = zone.rsplit('/', 1)[-1]
     match = re.fullmatch(r'([a-z]+-[a-z]+[0-9]+)-[a-z]', zone_name)
@@ -473,6 +476,7 @@ def main() -> int:
     def deploy(inst):
         name, zone = inst["name"], inst["zone"]
         tag = f"{name}/{zone}"
+        host_capacity = capacity_script(*capacity_inputs(name, os.environ))
         q_host_id_line = shlex.quote(f"HOST_ID={name}")
         q_host_region_line = shlex.quote(f"HOST_REGION={deployment_host_region(region, zone)}")
 
@@ -942,6 +946,8 @@ def main() -> int:
                     exit 1 ;;
                 esac
             fi
+
+            {host_capacity}
 
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes
             # its control socket into RuntimeDirectory=/run/secretsproxy under

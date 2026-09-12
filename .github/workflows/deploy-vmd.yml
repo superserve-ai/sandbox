@@ -87,6 +87,7 @@ on:
       # asset changes — leaving that host on stale binaries.
       - '.github/workflows/deploy-vmd.yml'
       - '.github/workflows/scripts/deploy-vmd.py'
+      - 'deploy/host_runtime.py'
       - '.github/workflows/scripts/select-deploy-target.sh'
 
 # Serialize runs rather than canceling: deploy-vmd.py stops vmd, rewrites
@@ -295,6 +296,8 @@ jobs:
       - name: Deploy to use4 cell VMD instances
         if: github.event_name != 'workflow_dispatch' || inputs.cell == 'use4'
         env:
+          VMD_SCHEDULABLE_MEMORY_MIB: ${{ vars.VMD_SCHEDULABLE_MEMORY_MIB_USE4 }}
+          VMD_SCHEDULABLE_VCPUS: ${{ vars.VMD_SCHEDULABLE_VCPUS_USE4 }}
           DEPLOY_CELL: use4
           VMD_STANDBY_HOST_USE4: ${{ vars.VMD_STANDBY_HOST_USE4 }}
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
@@ -376,6 +379,8 @@ jobs:
       - name: Deploy to usw cell VMD instances
         if: (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != '') || (github.event_name == 'workflow_dispatch' && (inputs.cell == 'usw2' || inputs.cell == ''))
         env:
+          VMD_SCHEDULABLE_MEMORY_MIB: ${{ vars.VMD_SCHEDULABLE_MEMORY_MIB_USW2 }}
+          VMD_SCHEDULABLE_VCPUS: ${{ vars.VMD_SCHEDULABLE_VCPUS_USW2 }}
           DEPLOY_CELL: usw2
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USW }}

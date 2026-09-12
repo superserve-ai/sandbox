@@ -203,6 +203,9 @@ class ManagedIdentityTest(unittest.TestCase):
 
             verify = scripts[-1].split('sudo /usr/local/sbin/refresh-peer-credentials --check', 1)[0]
             verify = verify.replace('/run/secrets/workload-spiffe-credentials', tmp).replace('sudo test', 'test')
+            runtime_env = Path(tmp) / 'vmd.env'
+            runtime_env.write_text('HOST_ID=example-host\nVMD_SCHEDULABLE_MEMORY_MIB=110000\nVMD_SCHEDULABLE_VCPUS=32\n')
+            verify = verify.replace('/etc/sandbox/vmd.env', str(runtime_env)).replace('sudo sed', 'sed')
             names = ('certificates.pem', 'private_key.pem', 'ca_certificates.pem')
             for name in names:
                 (Path(tmp) / name).write_text('credential')
@@ -274,7 +277,8 @@ class BootstrapActivationTest(unittest.TestCase):
                   'spiffe_uri': 'spiffe://example.test/peer', 'internal_ip': '192.0.2.3',
                   'runtime_email': 'vmd@example-project.iam.gserviceaccount.com'}
         if production:
-            config.update(instance_name='superserve-vmd-usw2-2', host_id='usw2-2', zone='us-west2-a')
+            config.update(instance_name='superserve-vmd-usw2-2', host_id='usw2-2', zone='us-west2-a',
+                          capacity_memory_mib=123456, capacity_vcpus=64)  # Synthetic admission policy.
         config['identity_at_creation'] = identity_at_creation
         commands, scripts = [], []
         status = 'TERMINATED' if initially_stopped else 'RUNNING'
@@ -419,6 +423,8 @@ class BootstrapActivationTest(unittest.TestCase):
             install = next(s for s in scripts if 'ConditionPathExists=' in s)
             self.assertIn("printf 'HOST_REGION=%s\\n' " + region, install)
             self.assertIn("existing HOST_ID disagrees", install)
+            self.assertIn('capacity=' + ('123456' if production else '110000'), install)
+            self.assertIn('capacity=' + ('64' if production else '32'), install)
 
     def test_bootstrap_region_block_preserves_explicit_region(self):
         _, scripts, _, error = self.exercise(active=True, legacy_activation=False)

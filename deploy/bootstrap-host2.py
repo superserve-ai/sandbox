@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Install peer bootstrap on a cold standby using a Terraform output artifact."""
 import argparse
+import os
 import json
 import re
 from pathlib import Path
@@ -10,6 +11,8 @@ import sys
 import tempfile
 import time
 
+
+from host_runtime import capacity_inputs, capacity_script
 
 MANAGED_CREDENTIALS_CHECK = '''set -eu
 for credential in certificates.pem private_key.pem ca_certificates.pem; do
@@ -54,6 +57,7 @@ def bootstrap(config, verify_only=False, legacy_activation=False, provider='mwi'
     if targets.get(config['instance_name']) != config['host_id']:
         raise ValueError('bootstrap is restricted to the existing cold-standby Host 2 identities')
     project, zone, name = config['project_id'], config['zone'], config['instance_name']
+    host_capacity = capacity_script(*capacity_inputs(name, os.environ, config), verify_only=verify_only)
     zone_match = re.fullmatch(r'([a-z]+-[a-z]+[0-9]+)-[a-z]', zone)
     if not zone_match:
         raise ValueError('bootstrap zone must identify a concrete deployment region')
@@ -125,6 +129,7 @@ done''' if provider == 'mwi' else ''
         host_id = shlex.quote(config['host_id'])
         ssh(f'''set -eu
 {managed_check}
+{host_capacity}
 sudo /usr/local/sbin/refresh-peer-credentials --check
 sudo test "$(sudo stat -c '%u:%a' /etc/superserve/peer/current/tls.key)" = 0:600
 sudo grep -Fx 'HOST_ID={config['host_id']}' /etc/sandbox/vmd.env >/dev/null
@@ -196,6 +201,7 @@ for env in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
         ;;
     esac
 done
+{host_capacity}
 sudo tee /etc/tmpfiles.d/vmd-peer.conf >/dev/null <<'CONF'
 d /run/secrets/workload-spiffe-credentials 0700 root root -
 f /run/lock/vmd-peer-credentials.lock 0644 root root -

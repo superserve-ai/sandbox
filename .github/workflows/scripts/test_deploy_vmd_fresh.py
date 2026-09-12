@@ -64,7 +64,7 @@ class FreshHostTest(unittest.TestCase):
                     asset.parent.mkdir(parents=True, exist_ok=True)
                     asset.write_text('approved artifact')
             supplied = {}
-            values = {'service': 'superserve-vmd.service', 'q_host_id_line': shlex.quote('HOST_ID=example-host'), 'q_host_region_line': shlex.quote('HOST_REGION=' + deploy_vmd.deployment_host_region(region, region + '-a'))}
+            values = {'host_capacity': deploy_vmd.capacity_script('110000', '32'), 'service': 'superserve-vmd.service', 'q_host_id_line': shlex.quote('HOST_ID=example-host'), 'q_host_region_line': shlex.quote('HOST_REGION=' + deploy_vmd.deployment_host_region(region, region + '-a'))}
             for key, name, value in [('cpu', 'CONTROL_PLANE_URL', 'https://example.test'),
                                      ('token', 'INTERNAL_API_TOKEN', 'example-token'),
                                      ('db', 'DATABASE_URL', 'postgres://example.test/db')]:
