@@ -192,6 +192,10 @@ func TestQMAPI_TenantLifecycleWithinTeamScope(t *testing.T) {
 	}
 
 	var teamRows, keyRows int
+	var membershipRows int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM public.team_memberships WHERE team_id = $1`, teamID).Scan(&membershipRows); err != nil {
+		t.Fatalf("select public.team_memberships as qm_api: %v", err)
+	}
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM public.team WHERE id = $1`, teamID).Scan(&teamRows); err != nil {
 		t.Fatalf("select public.team as qm_api: %v", err)
 	}
@@ -280,6 +284,7 @@ func TestQMAPI_HasNoAccessToSandboxTables(t *testing.T) {
 
 	for _, stmt := range []string{
 		`SELECT * FROM public.sandbox`,
+		`SELECT * FROM public.team_member`,
 		`INSERT INTO public.team (name) VALUES ('qm-api-should-not-write')`,
 		`CREATE TABLE qm.scratch (id int)`,
 	} {

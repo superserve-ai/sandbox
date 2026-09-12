@@ -108,7 +108,7 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA qm GRANT USAGE, SELECT ON SEQUENCES TO qm_api
 -- it, and the sandbox API key a tenant was issued. Nothing else in public
 -- is granted, so e.g. SELECT on public.sandbox is a permission error.
 GRANT USAGE ON SCHEMA public TO qm_api;
-GRANT SELECT ON public.team, public.team_member, public.api_key TO qm_api;
+GRANT SELECT ON public.team, public.team_memberships, public.api_key TO qm_api;
 
 -- Team scoping. qm_api has no BYPASSRLS (unlike the control plane's service
 -- role), so it sees rows only for the team it has declared for the current
@@ -171,15 +171,15 @@ CREATE POLICY qm_api_team_scope ON qm.tenant_secrets
 -- Public tables have RLS enabled with no policy for qm_api, so the SELECT
 -- grants above would be silently empty without these. Membership lookups
 -- happen before a team is known (which teams is this user on?), so
--- team_member and team are readable outright; api_key stays team-scoped
+-- team_memberships and team are readable outright; api_key stays team-scoped
 -- because qm-api only ever resolves a key inside a tenant's team.
 DROP POLICY IF EXISTS qm_api_read ON public.team;
 CREATE POLICY qm_api_read ON public.team
     FOR SELECT TO qm_api
     USING (true);
 
-DROP POLICY IF EXISTS qm_api_read ON public.team_member;
-CREATE POLICY qm_api_read ON public.team_member
+DROP POLICY IF EXISTS qm_api_read ON public.team_memberships;
+CREATE POLICY qm_api_read ON public.team_memberships
     FOR SELECT TO qm_api
     USING (true);
 
