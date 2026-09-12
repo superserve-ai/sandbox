@@ -86,3 +86,6 @@ terraform.rc
 
 # Merge-tool backups
 *.orig
+
+# Local peer issuance policy and public request/certificate artifacts
+.peer-credentials/

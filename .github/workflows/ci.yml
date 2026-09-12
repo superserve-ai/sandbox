@@ -25,7 +25,7 @@ jobs:
 
       - name: Run peer identity bootstrap tests
         run: |
-          python3 -m unittest discover -s deploy -p 'test_peer_bootstrap.py'
+          python3 -m unittest discover -s deploy -p 'test_peer*.py'
           python3 -m unittest discover -s infra/modules/peer-identity -p '*test*.py'
           python3 -m unittest discover -s scripts -p 'test_host2_replacement_plan.py'
 

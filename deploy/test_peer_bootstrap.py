@@ -268,7 +268,7 @@ class BootstrapActivationTest(unittest.TestCase):
 
     def exercise(self, active=False, initially_stopped=False, fail_publication=False,
                  admission_at=None, stop_fails=False, transient_active=False, start_error=None,
-                 failed_start_status="TERMINATED", legacy_activation=True, identity_at_creation=False):
+                 failed_start_status="TERMINATED", legacy_activation=True, identity_at_creation=False, provider="mwi", missing_superserve=False):
         config = {'instance_name': 'superserve-vmd-staging-2', 'host_id': 'superserve-vmd-staging-2',
                   'project_id': 'example-project', 'zone': 'us-central1-a', 'instance_id': '1234567890',
                   'spiffe_uri': 'spiffe://example.test/peer', 'internal_ip': '192.0.2.3',
@@ -312,6 +312,8 @@ class BootstrapActivationTest(unittest.TestCase):
                     output = 'ready' if active or (activated and probes >= 3) else 'pending'
                     if transient_active and probes == 2:
                         output = 'pending'
+                elif 'current/mode' in script and missing_superserve:
+                    raise subprocess.CalledProcessError(1, args)
                 elif script == 'echo ready':
                     output = 'ready'
                 elif 'mktemp -d' in script:
@@ -324,7 +326,7 @@ class BootstrapActivationTest(unittest.TestCase):
         with patch.object(BOOTSTRAP.subprocess, 'run', side_effect=run), \
              patch.object(BOOTSTRAP.time, 'sleep'), patch('sys.stdout', output):
             try:
-                BOOTSTRAP.bootstrap(config, legacy_activation=legacy_activation)
+                BOOTSTRAP.bootstrap(config, legacy_activation=legacy_activation, provider=provider)
             except (ValueError, TimeoutError, subprocess.CalledProcessError) as exc:
                 error = exc
         for script in scripts:
@@ -361,6 +363,20 @@ class BootstrapActivationTest(unittest.TestCase):
         self.assertIsInstance(error, subprocess.CalledProcessError)
         self.assertNotIn('Host 2 is safely stopped', stderr.getvalue())
         self.assertIn('could not be confirmed safely stopped', stderr.getvalue())
+
+    def test_superserve_bootstrap_requires_bundle_without_managed_activation(self):
+        with patch.object(BOOTSTRAP, 'wait_for_managed_credentials') as wait:
+            commands, scripts, output, error = self.exercise(provider='superserve', legacy_activation=False)
+        self.assertIsNone(error)
+        wait.assert_not_called()
+        self.assertFalse(any(c[1:4] in (['compute', 'instances', 'stop'], ['compute', 'instances', 'start']) for c in commands))
+        self.assertTrue(any('current/mode' in script for script in scripts))
+        self.assertTrue(any('start vmd-peer-credentials.service' in script for script in scripts))
+        self.assertIn('bootstrap installed', output)
+        _, scripts, output, error = self.exercise(provider='superserve', legacy_activation=False, missing_superserve=True)
+        self.assertIsInstance(error, subprocess.CalledProcessError)
+        self.assertNotIn('bootstrap installed', output)
+        self.assertFalse(any('mktemp -d' in script for script in scripts))
 
     def test_creation_time_bootstrap_waits_without_power_cycling_and_fails_closed(self):
         with patch.object(BOOTSTRAP, 'wait_for_managed_credentials', side_effect=TimeoutError('managed credentials absent')) as wait:
@@ -413,6 +429,7 @@ class BootstrapActivationTest(unittest.TestCase):
         block = publication[publication.index('sudo systemctl start vmd-peer-credentials.service'):publication.index('sudo rm -f')]
         with tempfile.TemporaryDirectory() as tmp:
             script = ('set -eu\n' + block).replace('sudo systemctl start vmd-peer-credentials.service', 'true')
+            script = script.replace('sudo systemctl start vmd-peer-credentials.timer', 'true')
             script = script.replace('sudo test', 'test').replace('/etc/superserve/peer/current', tmp + '/current')
             script = script.replace('sudo /usr/local/sbin/refresh-peer-credentials --check', 'echo validated')
             result = subprocess.run(['bash', '-c', script], capture_output=True, text=True)

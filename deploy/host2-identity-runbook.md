@@ -1,5 +1,10 @@
 # Cold-standby peer identity bootstrap
 
+For the current Compute MWI platform blocker and the explicit Superserve provider,
+see [Peer credential providers](peer-credentials-runbook.md). Creation-time MWI
+alone did not resolve staging issuance. The Superserve path preserves the existing
+SPIFFE contract and supports staging preparation without managed credentials.
+
 Run staging first. The migration targets are `superserve-vmd-staging-2`
 (`10.0.0.3`, `n2-standard-32`) and then `superserve-vmd-usw2-2`
 (`10.1.0.3`, the existing production Z3 configuration). No serving Host 1

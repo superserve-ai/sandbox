@@ -43,7 +43,11 @@ def wait_for_managed_credentials(ssh, timeout=300):
     wait_for_guest_check(ssh, MANAGED_CREDENTIALS_CHECK, 'managed workload credentials', timeout)
 
 
-def bootstrap(config, verify_only=False, legacy_activation=False):
+def bootstrap(config, verify_only=False, legacy_activation=False, provider='mwi'):
+    if provider not in ('mwi', 'superserve'):
+        raise ValueError('unknown peer credential provider')
+    if provider == 'superserve' and legacy_activation:
+        raise ValueError('Superserve credentials do not use legacy MWI activation')
     if legacy_activation and (verify_only or config.get('identity_at_creation', False)):
         raise ValueError('legacy activation is not allowed for creation-time identity or verification')
     targets = {'superserve-vmd-staging-2': 'superserve-vmd-staging-2', 'superserve-vmd-usw2-2': 'usw2-2'}
@@ -73,7 +77,7 @@ def bootstrap(config, verify_only=False, legacy_activation=False):
                 raise ValueError('Host 2 must retain its standby label and remain excluded from ready/serving deployment discovery before migration')
         expected = config['spiffe_uri'].removeprefix('spiffe://')
         identity = instance.get('workloadIdentityConfig', {})
-        if identity.get('identity') != expected or not identity.get('identityCertificateEnabled'):
+        if provider == 'mwi' and (identity.get('identity') != expected or not identity.get('identityCertificateEnabled')):
             raise ValueError('Compute managed identity configuration is missing or mismatched')
         if instance.get('status') not in ('RUNNING', 'TERMINATED'):
             raise ValueError('Host 2 must be running or fully stopped before bootstrap')
@@ -106,12 +110,17 @@ def bootstrap(config, verify_only=False, legacy_activation=False):
         return run('compute', 'ssh', name, *flags, '--tunnel-through-iap', '--command', script, timeout=timeout)
     if started_from_stopped:
         wait_for_guest_check(ssh, 'echo ready', 'guest SSH')
+    if provider == 'superserve':
+        ssh("sudo test \"$(sudo cat /etc/superserve/peer/current/mode)\" = superserve && "
+            "sudo /usr/local/sbin/refresh-peer-credentials --check")
+    managed_check = '''for credential in certificates.pem private_key.pem ca_certificates.pem; do
+    sudo test -s \"/run/secrets/workload-spiffe-credentials/$credential\"
+done''' if provider == 'mwi' else ''
+    provider_args = ' --provider mwi' if provider == 'mwi' else ''
     if verify_only:
         host_id = shlex.quote(config['host_id'])
         ssh(f'''set -eu
-for credential in certificates.pem private_key.pem ca_certificates.pem; do
-    sudo test -s "/run/secrets/workload-spiffe-credentials/$credential"
-done
+{managed_check}
 sudo /usr/local/sbin/refresh-peer-credentials --check
 sudo test "$(sudo stat -c '%u:%a' /etc/superserve/peer/current/tls.key)" = 0:600
 sudo grep -Fx 'HOST_ID={config['host_id']}' /etc/sandbox/vmd.env >/dev/null
@@ -143,7 +152,7 @@ sudo systemctl cat google-guest-agent.service >/dev/null
         if state not in ('ready', 'pending'):
             raise ValueError('unexpected managed credential readiness response')
         return state == 'ready'
-    credentials_were_active = managed_credentials_available()
+    credentials_were_active = provider == 'superserve' or managed_credentials_available()
     upload_dir = ssh('umask 077; mktemp -d /tmp/vmd-peer.XXXXXXXX').strip()
     if not re.fullmatch(r'/tmp/vmd-peer\.[A-Za-z0-9]+', upload_dir):
         raise ValueError('unexpected upload directory')
@@ -186,7 +195,7 @@ After=google-guest-agent.service network-online.target
 [Service]
 Type=oneshot
 UMask=0077
-ExecStart=/usr/local/sbin/refresh-peer-credentials
+ExecStart=/usr/local/sbin/refresh-peer-credentials{provider_args}
 UNIT
 sudo tee /etc/systemd/system/vmd-peer-credentials.timer >/dev/null <<'UNIT'
 [Unit]
@@ -217,7 +226,8 @@ with path.open('w') as destination:
 PY
 rm -rf {upload_dir}
 ''')
-    ssh('''set -eu
+    if provider == 'mwi':
+        ssh('''set -eu
 sudo systemd-tmpfiles --create /etc/tmpfiles.d/vmd-peer.conf
 if command -v ggactl_plugin >/dev/null 2>&1; then
     sudo ggactl_plugin coreplugin restart
@@ -237,7 +247,8 @@ sudo systemctl start vmd-peer-credentials.timer
         if instance['status'] != 'TERMINATED':
             raise ValueError('Host 2 did not fully stop; refusing activation')
         start()
-    wait_for_managed_credentials(ssh)
+    if provider == 'mwi':
+        wait_for_managed_credentials(ssh)
     describe()
     ssh('''set -eu
 sudo systemctl stop superserve-vmd.socket superserve-vmd.service
@@ -245,6 +256,7 @@ mountpoint -q /mnt/sandbox-data
 sudo systemctl start vmd-peer-credentials.service
 sudo test -d /etc/superserve/peer/current
 sudo /usr/local/sbin/refresh-peer-credentials --check
+sudo systemctl start vmd-peer-credentials.timer
 sudo rm -f /etc/superserve/peer/bootstrap-pending /etc/systemd/system/superserve-vmd.socket.d/90-peer-bootstrap.conf /etc/systemd/system/superserve-vmd.service.d/90-peer-bootstrap.conf
 sudo systemctl daemon-reload
 ''')
@@ -253,8 +265,9 @@ sudo systemctl daemon-reload
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--provider', choices=('mwi', 'superserve'), default='mwi', help='explicit credential source; Superserve requires an installed bundle')
     parser.add_argument('--verify', action='store_true', help='read-only local checks; complete the runbook evidence before admission')
     parser.add_argument('--legacy-activate', action='store_true', help='explicit recovery for legacy retrofitted standbys only; never used for creation-time identity')
     parser.add_argument('configuration', type=Path, help='terraform output -json host2_peer_bootstrap')
     args = parser.parse_args()
-    bootstrap(json.loads(args.configuration.read_text()), args.verify, args.legacy_activate)
+    bootstrap(json.loads(args.configuration.read_text()), args.verify, args.legacy_activate, args.provider)
