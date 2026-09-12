@@ -199,7 +199,7 @@ func TestQMAPI_TenantLifecycleWithinTeamScope(t *testing.T) {
 	if err := tx.QueryRow(ctx, `SELECT count(id) FROM public.team WHERE id = $1`, teamID).Scan(&teamRows); err != nil {
 		t.Fatalf("select public.team as qm_api: %v", err)
 	}
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM public.api_key WHERE id = $1`, keyID).Scan(&keyRows); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT count(id) FROM public.api_key WHERE id = $1`, keyID).Scan(&keyRows); err != nil {
 		t.Fatalf("select public.api_key as qm_api: %v", err)
 	}
 	if teamRows != 1 || keyRows != 1 {
@@ -250,7 +250,7 @@ func TestQMAPI_RowsAreInvisibleOutsideTeamScope(t *testing.T) {
 			t.Fatalf("slug taken by another team reported available: available=%v err=%v", available, err)
 		}
 		var keyRows int
-		if err := tx.QueryRow(ctx, `SELECT count(*) FROM public.api_key WHERE team_id = $1`, teamA).Scan(&keyRows); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT count(id) FROM public.api_key WHERE team_id = $1`, teamA).Scan(&keyRows); err != nil {
 			t.Fatalf("select api_key: %v", err)
 		}
 		if keyRows != 0 {

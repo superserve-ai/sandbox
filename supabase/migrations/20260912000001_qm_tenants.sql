@@ -9,11 +9,56 @@
 -- role is guarded, so re-running on a database that already has the schema
 -- is a no-op.
 
+BEGIN;
+
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '10s';
+
 CREATE SCHEMA IF NOT EXISTS qm;
 
 -- Lets qm.tenants reference a key by (id, team_id) so a tenant can only ever
 -- point at a sandbox API key owned by its own team; RLS does not take part in
 -- foreign-key checks, so the constraint has to carry the team itself.
+--
+-- On a populated database this index must be pre-built CONCURRENTLY, by hand:
+-- the migration runner wraps every file in a transaction, where CONCURRENTLY
+-- cannot run, and a plain build blocks api_key writes (including
+-- authentication's last_used_at updates) for the duration of the scan. Run
+-- before merging:
+--
+--   CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS api_key_id_team_unique
+--     ON public.api_key (id, team_id);
+--
+--   -- A failed concurrent build leaves an INVALID index that IF NOT EXISTS
+--   -- would silently keep. Verify, and on false DROP INDEX + retry:
+--   SELECT indisvalid FROM pg_index
+--   WHERE indexrelid = 'api_key_id_team_unique'::regclass;
+--
+-- Pre-built, the statement below is a no-op; on a fresh or small database it
+-- builds instantly. The timeouts above make a skipped pre-build fail the push
+-- loudly with a bounded stall instead of blocking api_key writes.
+DO $$
+DECLARE
+  actual_def text;
+  expected_def text := 'CREATE UNIQUE INDEX api_key_id_team_unique ON public.api_key USING btree (id, team_id)';
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_index
+    WHERE indexrelid = to_regclass('public.api_key_id_team_unique')
+      AND NOT indisvalid
+  ) THEN
+    RAISE EXCEPTION 'api_key_id_team_unique exists but is INVALID (interrupted concurrent build); DROP INDEX api_key_id_team_unique, re-run the concurrent pre-build, then retry this push';
+  END IF;
+
+  SELECT pg_get_indexdef(oid) INTO actual_def
+  FROM pg_class
+  WHERE oid = to_regclass('public.api_key_id_team_unique');
+
+  IF actual_def IS NOT NULL AND actual_def <> expected_def THEN
+    RAISE WARNING 'api_key_id_team_unique exists with an unexpected definition; got %, expected %', actual_def, expected_def;
+  END IF;
+END $$;
+
 CREATE UNIQUE INDEX IF NOT EXISTS api_key_id_team_unique ON public.api_key (id, team_id);
 
 CREATE TABLE IF NOT EXISTS qm.tenants (
@@ -192,3 +237,5 @@ DROP POLICY IF EXISTS qm_api_read ON public.api_key;
 CREATE POLICY qm_api_read ON public.api_key
     FOR SELECT TO qm_api
     USING (team_id = qm.current_team_id());
+
+COMMIT;
