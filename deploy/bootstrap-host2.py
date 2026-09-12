@@ -54,6 +54,10 @@ def bootstrap(config, verify_only=False, legacy_activation=False, provider='mwi'
     if targets.get(config['instance_name']) != config['host_id']:
         raise ValueError('bootstrap is restricted to the existing cold-standby Host 2 identities')
     project, zone, name = config['project_id'], config['zone'], config['instance_name']
+    zone_match = re.fullmatch(r'([a-z]+-[a-z]+[0-9]+)-[a-z]', zone)
+    if not zone_match:
+        raise ValueError('bootstrap zone must identify a concrete deployment region')
+    host_region = shlex.quote(zone_match[1])
     flags = [f'--project={project}', f'--zone={zone}', '--quiet']
     def run(*args, timeout=120):
         try:
@@ -124,6 +128,7 @@ done''' if provider == 'mwi' else ''
 sudo /usr/local/sbin/refresh-peer-credentials --check
 sudo test "$(sudo stat -c '%u:%a' /etc/superserve/peer/current/tls.key)" = 0:600
 sudo grep -Fx 'HOST_ID={config['host_id']}' /etc/sandbox/vmd.env >/dev/null
+sudo grep -Fx HOST_REGION={host_region} /etc/sandbox/vmd.env >/dev/null
 mountpoint -q /mnt/sandbox-data
 sudo systemctl is-active --quiet google-guest-agent.service vmd-peer-credentials.timer superserve-secretsproxy.service superserve-otel-collector.service superserve-vmd.service
 invocation=$(sudo systemctl show -p InvocationID --value superserve-vmd.service)
@@ -183,6 +188,8 @@ for env in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
     fi
     sudo sed -i '/^HOST_ID=/d' "$env"
     printf 'HOST_ID=%s\\n' {host_id} | sudo tee -a "$env" >/dev/null
+    sudo sed -i '/^HOST_REGION=/d' "$env"
+    printf 'HOST_REGION=%s\\n' {host_region} | sudo tee -a "$env" >/dev/null
 done
 sudo tee /etc/tmpfiles.d/vmd-peer.conf >/dev/null <<'CONF'
 d /run/secrets/workload-spiffe-credentials 0700 root root -

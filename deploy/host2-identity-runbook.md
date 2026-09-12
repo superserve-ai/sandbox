@@ -284,6 +284,23 @@ against the canonical host preparation procedure. Rerun the documented
 `bootstrap-host2.py --provider superserve` baseline with the Terraform artifact
 before requesting the standby deployment. It leaves VMD stopped; do not admit it.
 
+### Named-host heartbeat region
+
+An identity-bound host must send a complete self-description. Private endpoints
+alone are insufficient: an empty region causes heartbeat rejection. VMD deploy
+now sets `HOST_REGION` for every non-`default` HOST_ID from `GCP_REGION`, checked
+against the discovered instance zone. If deployment is not region-scoped, the
+instance zone supplies the region. Staging uses `us-central1`; production hosts
+use their actual deployment region, including standby hosts. Bootstrap sets the
+same field from its Terraform-provided zone and final verification checks it.
+No manual HOST_REGION or SANDBOX_ID_REGION setting is needed on a fresh host.
+
+Deployment preserves HOST_ID and does not add, replace or remove region settings
+on the legacy `HOST_ID=default` host. Its description-less heartbeat compatibility
+is not evidence that a named identity-bound host can omit its region. Capacity
+continues to come from VMD's existing logic; this does not admit Host 2 or migrate
+legacy identity semantics.
+
 ### Host interface and advertised addresses
 
 VMD no longer assumes the primary host NIC is `eth0`. With `HOST_INTERFACE`

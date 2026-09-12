@@ -268,11 +268,13 @@ class BootstrapActivationTest(unittest.TestCase):
 
     def exercise(self, active=False, initially_stopped=False, fail_publication=False,
                  admission_at=None, stop_fails=False, transient_active=False, start_error=None,
-                 failed_start_status="TERMINATED", legacy_activation=True, identity_at_creation=False, provider="mwi", missing_superserve=False):
+                 failed_start_status="TERMINATED", legacy_activation=True, identity_at_creation=False, provider="mwi", missing_superserve=False, production=False):
         config = {'instance_name': 'superserve-vmd-staging-2', 'host_id': 'superserve-vmd-staging-2',
                   'project_id': 'example-project', 'zone': 'us-central1-a', 'instance_id': '1234567890',
                   'spiffe_uri': 'spiffe://example.test/peer', 'internal_ip': '192.0.2.3',
                   'runtime_email': 'vmd@example-project.iam.gserviceaccount.com'}
+        if production:
+            config.update(instance_name='superserve-vmd-usw2-2', host_id='usw2-2', zone='us-west2-a')
         config['identity_at_creation'] = identity_at_creation
         commands, scripts = [], []
         status = 'TERMINATED' if initially_stopped else 'RUNNING'
@@ -286,7 +288,7 @@ class BootstrapActivationTest(unittest.TestCase):
             output = ''
             if operation == ['compute', 'instances', 'describe']:
                 describes += 1
-                labels = {'component': 'vmd-staging-standby', 'sandbox_status': 'provisioning'}
+                labels = {'component': 'vmd-usw2-standby' if production else 'vmd-staging-standby', 'sandbox_status': 'provisioning'}
                 if admission_at == describes:
                     labels['sandbox_status'] = 'ready'
                 output = json.dumps({'id': config['instance_id'], 'status': status, 'labels': labels,
@@ -409,6 +411,14 @@ class BootstrapActivationTest(unittest.TestCase):
         install = next(s for s in scripts if 'ConditionPathExists=' in s)
         self.assertIn('bootstrap-pending', install)
         self.assertIn('bootstrap-pending', publication)
+
+    def test_bootstrap_supplies_region_for_named_staging_and_production_hosts(self):
+        for production, region in ((False, 'us-central1'), (True, 'us-west2')):
+            _, scripts, _, error = self.exercise(active=True, legacy_activation=False, production=production)
+            self.assertIsNone(error)
+            install = next(s for s in scripts if 'ConditionPathExists=' in s)
+            self.assertIn("printf 'HOST_REGION=%s\\n' " + region, install)
+            self.assertIn("existing HOST_ID disagrees", install)
 
     def test_active_credentials_avoid_power_cycle(self):
         commands, _, output, error = self.exercise(active=True)

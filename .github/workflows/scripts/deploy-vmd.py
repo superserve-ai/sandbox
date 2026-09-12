@@ -140,6 +140,14 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
+def deployment_host_region(region, zone):
+    zone_name = zone.rsplit('/', 1)[-1]
+    match = re.fullmatch(r'([a-z]+-[a-z]+[0-9]+)-[a-z]', zone_name)
+    if not match or (region and region != match[1]):
+        raise ValueError('deployment region does not match the instance zone')
+    return region or match[1]
+
+
 def runtime_input_preflight(control_plane_url, database_url, internal_api_token):
     """Read-only host check; pass only input presence, never secrets, to the probe."""
     script = textwrap.dedent("""
@@ -466,6 +474,7 @@ def main() -> int:
         name, zone = inst["name"], inst["zone"]
         tag = f"{name}/{zone}"
         q_host_id_line = shlex.quote(f"HOST_ID={name}")
+        q_host_region_line = shlex.quote(f"HOST_REGION={deployment_host_region(region, zone)}")
 
         input_preflight = runtime_input_preflight(control_plane_url, database_url, internal_api_token)
         # Probe before even uploading when missing inputs might require aborting.
@@ -915,6 +924,14 @@ def main() -> int:
             # which is the convention for every row created since.
             if ! sudo grep -q '^HOST_ID=' /etc/sandbox/vmd.env; then
                 echo {q_host_id_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Named hosts need a complete self-description. Never change the
+            # legacy default identity or its optional region semantics.
+            host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/vmd.env | tail -n 1)
+            if [ -n "$host_id" ] && [ "$host_id" != default ]; then
+                sudo sed -i '/^HOST_REGION=/d' /etc/sandbox/vmd.env
+                echo {q_host_region_line} | sudo tee -a /etc/sandbox/vmd.env >/dev/null
             fi
 
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes

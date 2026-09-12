@@ -27,18 +27,21 @@ READY = block('# Fresh-host runtime preflight.\n', '# End fresh-host runtime pre
 
 
 class FreshHostTest(unittest.TestCase):
-    def exercise(self, missing=('vmd', 'secretsproxy'), fail_daemon=False, missing_input=False, assets=True, ca_missing=(), custom_paths=False, configure_kernel=True, missing_artifact=None, configured=False):
+    def exercise(self, missing=('vmd', 'secretsproxy'), fail_daemon=False, missing_input=False, assets=True, ca_missing=(), custom_paths=False, configure_kernel=True, missing_artifact=None, configured=False, host_id="existing-host", region="us-central1", existing_region=None):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             envdir = root / 'etc/sandbox'
             envdir.mkdir(parents=True)
             for name in ('vmd', 'secretsproxy'):
                 if name not in missing:
-                    (envdir / (name + '.env')).write_text('HOST_ID=existing-host\nCUSTOM=preserve\n')
+                    (envdir / (name + '.env')).write_text('HOST_ID=' + host_id + '\nCUSTOM=preserve\n')
             if configured:
                 for name in ('vmd', 'secretsproxy'):
                     with (envdir / (name + '.env')).open('a') as env:
                         env.write('CONTROL_PLANE_URL=https://old.example.test\nDATABASE_URL=postgres://old.example.test/db\nINTERNAL_API_TOKEN=old-token\nDAEMON_AUTH_TOKEN=old-token\n')
+            if existing_region is not None:
+                with (envdir / 'vmd.env').open('a') as env:
+                    env.write('HOST_REGION=' + existing_region + '\nSANDBOX_ID_REGION=legacy-fallback\n')
             ca_dir = root / 'var/lib/secretsproxy'
             ca_dir.mkdir(parents=True)
             for name in ('ca.crt', 'ca.key'):
@@ -61,7 +64,7 @@ class FreshHostTest(unittest.TestCase):
                     asset.parent.mkdir(parents=True, exist_ok=True)
                     asset.write_text('approved artifact')
             supplied = {}
-            values = {'service': 'superserve-vmd.service', 'q_host_id_line': shlex.quote('HOST_ID=example-host')}
+            values = {'service': 'superserve-vmd.service', 'q_host_id_line': shlex.quote('HOST_ID=example-host'), 'q_host_region_line': shlex.quote('HOST_REGION=' + deploy_vmd.deployment_host_region(region, region + '-a'))}
             for key, name, value in [('cpu', 'CONTROL_PLANE_URL', 'https://example.test'),
                                      ('token', 'INTERNAL_API_TOKEN', 'example-token'),
                                      ('db', 'DATABASE_URL', 'postgres://example.test/db')]:
@@ -140,6 +143,29 @@ journalctl() { :; }
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
                 self.assertNotIn('vmd-may-start', result.stdout)
+
+    def test_named_hosts_get_deployment_region_without_manual_setting(self):
+        for region in ('us-central1', 'us-east4', 'us-west2'):
+            for missing in (('vmd', 'secretsproxy'), ()):
+                result, envs, _ = self.exercise(missing=missing, region=region)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('HOST_REGION=' + region + '\n', envs['vmd.env'])
+
+    def test_legacy_default_identity_does_not_gain_region(self):
+        result, envs, _ = self.exercise(missing=(), configured=True, host_id='default')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('HOST_ID=default\n', envs['vmd.env'])
+        self.assertNotIn('HOST_REGION=', envs['vmd.env'])
+        result, envs, _ = self.exercise(missing=(), configured=True, host_id='default', existing_region='legacy-region')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('HOST_REGION=legacy-region\n', envs['vmd.env'])
+        self.assertIn('SANDBOX_ID_REGION=legacy-fallback\n', envs['vmd.env'])
+
+    def test_region_fallback_and_mismatch_validation(self):
+        self.assertEqual(deploy_vmd.deployment_host_region('', 'projects/example/zones/us-west2-a'), 'us-west2')
+        for region, zone in [('us-central1', 'us-west2-a'), ('', 'invalid')]:
+            with self.assertRaises(ValueError):
+                deploy_vmd.deployment_host_region(region, zone)
 
     def test_each_missing_input_fails_without_host_mutation(self):
         for name in ('CONTROL_PLANE_URL', 'DATABASE_URL', 'INTERNAL_API_TOKEN'):
