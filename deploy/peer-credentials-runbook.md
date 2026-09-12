@@ -39,32 +39,67 @@ client/server usages and lifetime. CSR subject and extensions are ignored.
 Leaf keys are generated on the host and remain root-owned mode 0600. Local
 operator artifacts contain only CSRs, certificates and request metadata.
 
-## One-time staging CA setup
+## Terraform custody setup
 
-These are operator commands, not executed by this change. Have an infrastructure
-administrator provision and review the dedicated pool, issuer IAM and key custody
-before issuing. Do not reuse a pool with broad inherited issuance grants. The
-following creates a managed CAS/KMS CA; it incurs ongoing cloud charges:
+`infra/modules/peer-ca` owns the CAS pool/root, managed KMS signing configuration,
+issuer service account, pool issuance IAM and optional operator impersonation.
+Staging instantiates it in `infra/envs/staging/us-central1/peer_ca.tf`; production
+must instantiate distinct pools/roots for its environment/cell trust boundaries.
+The existing MWI pool remains separate and unchanged. Private CA and IAM APIs
+must already be enabled by the environment (staging's MWI setup does this).
+
+The pool permits only config-based leaf issuance, limits lifetime, and enforces
+one exact existing peer URI SAN and the `vmd-peer-proxy` CN. CAS creates the
+non-exportable KMS signing key from `EC_P256_SHA256`; Terraform stores algorithm
+and resource metadata, never key bytes. The root permits no subordinate CAs.
+Pool, CA and issuer have `prevent_destroy`; the CA also has API deletion
+protection. CA/key replacement requires deliberate reviewed lifecycle changes;
+removing a module from configuration also removes its Terraform lifecycle guard,
+so API deletion protection and restricted administrative IAM remain essential.
+No service-account keys, leaf certificates, CSRs or runtime generations are in
+Terraform. The root CA's public certificate is infrastructure metadata.
+
+`peer_ca_operator_members` defaults to an empty set: no operator access is
+inferred. To enable the manual bridge, set explicitly reviewed `user:`/`group:`
+principals in the environment's Terraform inputs. The grant is
+`roles/iam.serviceAccountTokenCreator` on this issuer only. Runtime service-account
+principals are rejected. This is privileged issuance access through impersonation;
+remove a principal from the input to revoke the managed grant. Both the pool role
+binding and a configured operator role binding are authoritative for their role;
+do not manage the same role with separate member resources. Audit inherited IAM.
+
+Review an ordinary plan before any operator apply. No apply is performed by this
+code change. If a matching CA/pool/account was already created manually, import
+those resources at the module addresses before planning; never destroy/recreate
+an active CA to resolve a name conflict. Read-only validation and mocked tests:
 
 ```sh
-gcloud privateca pools create superserve-peer-staging --project=rayai-dev --location=us-central1 --tier=enterprise
-gcloud privateca roots create superserve-peer-staging-root --project=rayai-dev --location=us-central1 --pool=superserve-peer-staging --subject='CN=Superserve staging peer CA' --key-algorithm=ec-p256-sha256 --max-chain-length=0 --key-usages=cert_sign,crl_sign --extended-key-usages=server_auth,client_auth --validity=P5Y --auto-enable
+terraform -chdir=infra/envs/staging/us-central1 init
+terraform -chdir=infra/envs/staging/us-central1 validate
+terraform -chdir=infra/envs/staging/us-central1 plan
+terraform -chdir=infra/modules/peer-ca init
+terraform -chdir=infra/modules/peer-ca test
 ```
 
-Use the same CA for subsequent automated issuance. CA rollover, expiry monitoring
-and deletion protection must be represented in reviewed infrastructure before
-production. Do not delete/recreate the CA on each leaf renewal.
+After the reviewed infrastructure has been applied, export the non-secret policy:
 
-Create `.peer-credentials/policy.json` from this shape, replacing the issuer and
-host account values with reviewed actual principals. The helper rejects live
-account mismatches. Never derive the authorized list automatically from whichever
-principal happens to be running on a host:
+```sh
+mkdir -p .peer-credentials
+terraform -chdir=infra/envs/staging/us-central1 output -json peer_ca_issuance_policy > .peer-credentials/policy.json
+terraform -chdir=infra/envs/staging/us-central1 output -raw peer_ca_pool_resource_name
+terraform -chdir=infra/envs/staging/us-central1 output -raw peer_ca_issuer_service_account_email
+```
+
+Add the reviewed host account allowlist to `policy.json` (the helper rejects live
+account mismatches). The following shape shows the resulting policy; do not infer
+Host 1 authorization from whichever principal happens to be running:
 
 ```json
 {
   "ca_pool": "projects/rayai-dev/locations/us-central1/caPools/superserve-peer-staging",
-  "issuer_service_account": "REVIEWED_ISSUER@rayai-dev.iam.gserviceaccount.com",
+  "issuer_service_account": "vmd-peer-issuer-staging@rayai-dev.iam.gserviceaccount.com",
   "spiffe_uri": "spiffe://vmd-peer-staging-usc1.global.669325949364.workload.id.goog/ns/vmd/sa/vmd-peer-proxy",
+  "credential_policy": {"leaf_lifetime_seconds": 2592000},
   "hosts": {
     "superserve-vmd-staging": {"service_account": "REVIEWED_HOST1_ACCOUNT"},
     "superserve-vmd-staging-2": {"service_account": "vmd-runtime-staging-usc1@rayai-dev.iam.gserviceaccount.com"}
@@ -208,8 +243,9 @@ after successful installation and verification. Retain active trust roots.
    during active streams, bad-generation retention, expired new-handshake failure,
    and provider/trust transition. Systemd credential snapshots plus periodic
    restart are not the production solution. No sandbox lifecycle hot-path I/O.
-3. **Operations and infrastructure.** Codify CAS/KMS custody, narrow issuance and
-   impersonation IAM, CA lifecycle, renewal schedule and low-cardinality alerts.
+3. **Operations and production infrastructure.** Apply the reviewed custody module
+   with distinct production trust domains, audit inherited IAM, and add CA lifecycle
+   monitoring, renewal schedules and low-cardinality alerts.
    Demonstrate renewal failures and recovery before calling this production-ready.
 
 Returning to MWI is an explicit validated publication, e.g. on each host
