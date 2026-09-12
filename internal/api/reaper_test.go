@@ -252,6 +252,50 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 	}
 }
 
+// A finalize whose reply was lost after it committed: the row already reads
+// paused, so the reaper records the pause rather than handing back a lease
+// that no longer exists.
+func TestReaper_LostFinalizeReplyStillRecordsThePause(t *testing.T) {
+	row := expiredRow("sbx-lost-reply")
+	paused := db.Sandbox{ID: row.ID, TeamID: row.TeamID, Status: db.SandboxStatusPaused}
+	var activities, releases int32
+
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			candidates: []db.ClaimExpiredSandboxRow{row},
+			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+				switch {
+				case strings.Contains(sql, "upserted AS"):
+					return errorRow(errors.New("connection reset"))
+				case strings.Contains(sql, "-- name: GetSandbox :one"):
+					return sandboxRow(paused)
+				case strings.Contains(sql, "-- name: CreateActivity "):
+					atomic.AddInt32(&activities, 1)
+				}
+				return activityRow()
+			},
+			execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+				if strings.Contains(sql, "-- name: ReleasePauseLease ") {
+					atomic.AddInt32(&releases, 1)
+				}
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			},
+		},
+		&stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		}},
+	)
+
+	h.reapOnce(context.Background(), 10, 1, zerolog.Nop())
+
+	for deadline := time.Now().Add(300 * time.Millisecond); time.Now().Before(deadline) && atomic.LoadInt32(&activities) != 1; {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&activities) != 1 || atomic.LoadInt32(&releases) != 0 {
+		t.Fatalf("activities = %d, releases = %d; want the pause recorded once and no lease handed back", activities, releases)
+	}
+}
+
 // A pause the host never answered stays 'pausing' with its lease handed back
 // for the reconciler; nothing reverts the row.
 func TestReaper_VMDFails_ReconcilerLeavesPausing(t *testing.T) {

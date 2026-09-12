@@ -235,10 +235,12 @@ func TestPauseSandbox_NoPausedActivityUntilFinalized(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
 		finalizeErr  error
+		landed       bool // the row reads paused despite the error: the reply was lost after commit
 		wantActivity int32
 	}{
 		{name: "finalize succeeds", wantActivity: 1},
 		{name: "finalize fails", finalizeErr: errors.New("db unavailable"), wantActivity: 0},
+		{name: "finalize reply lost after commit", finalizeErr: errors.New("connection reset"), landed: true, wantActivity: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sandboxID, teamID := uuid.New(), uuid.New()
@@ -256,6 +258,11 @@ func TestPauseSandbox_NoPausedActivityUntilFinalized(t *testing.T) {
 							return errorRow(tc.finalizeErr)
 						}
 						return finalizePauseRow(uuid.New())
+					case strings.Contains(sql, "-- name: GetSandbox :one") && tc.landed:
+						paused := sb
+						paused.Status = db.SandboxStatusPaused
+						paused.PauseOpID = pgtype.UUID{}
+						return sandboxRow(paused)
 					case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
 						return sandboxRow(sb)
 					}
@@ -283,6 +290,52 @@ func TestPauseSandbox_NoPausedActivityUntilFinalized(t *testing.T) {
 				t.Fatalf("paused activity entries = %d, want %d", got, tc.wantActivity)
 			}
 		})
+	}
+}
+
+// A finalize whose reply was lost after it committed leaves the row paused
+// with no operation; the reconciler records the pause instead of retrying a
+// lease that no longer exists.
+func TestReconcilePause_LostFinalizeReplyStillRecordsThePause(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusPausing,
+		PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1}
+	paused := sb
+	paused.Status = db.SandboxStatusPaused
+	paused.PauseOpID = pgtype.UUID{}
+	var activities, releases int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: CreateActivity "):
+				atomic.AddInt32(&activities, 1)
+				return activityRow()
+			case strings.Contains(sql, "upserted AS"), strings.Contains(sql, "INSERT INTO snapshot"):
+				return errorRow(errors.New("connection reset"))
+			case strings.Contains(sql, "-- name: GetSandbox :one"):
+				return sandboxRow(paused)
+			case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "-- name: ReleasePauseLease ") {
+				atomic.AddInt32(&releases, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{DB: db.New(mock), VMD: &stubVMD{}}
+
+	h.reconcilePause(context.Background(), db.ClaimPendingPauseRow{ID: sandboxID, TeamID: teamID, Name: sb.Name, PauseOpID: sb.PauseOpID, PauseOpLeaseVersion: 1},
+		time.Now().Add(time.Minute), zerolog.Nop())
+
+	for deadline := time.Now().Add(300 * time.Millisecond); time.Now().Before(deadline) && atomic.LoadInt32(&activities) != 1; {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&activities) != 1 || atomic.LoadInt32(&releases) != 0 {
+		t.Fatalf("activities = %d, releases = %d; want the pause recorded once and no retry", activities, releases)
 	}
 }
 

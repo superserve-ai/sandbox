@@ -153,8 +153,11 @@ func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, 
 				l.Warn().Msg("FinalizePause: sandbox deleted mid-pause")
 				return
 			}
-			l.Error().Err(err).Msg("async DB FinalizePause failed — sandbox stays 'pausing' for reconciliation")
-			return
+			if !h.pauseLanded(finalizeCtx, sandboxID, teamID) {
+				l.Error().Err(err).Msg("async DB FinalizePause failed — sandbox stays 'pausing' for reconciliation")
+				return
+			}
+			l.Warn().Err(err).Msg("FinalizePause answer lost after it committed")
 		}
 		// Recorded once the row says paused: a finalize the reconciler has
 		// to redo must not leave two success entries for one pause.

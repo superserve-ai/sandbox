@@ -164,14 +164,18 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 	}
 	applyManifest(&params, manifest)
 	if _, err := h.finalizePause(fctx, params); err != nil {
-		RecordSandboxTransition(ctx, "reconcile_pause", telemetry.ResultError, row.HostID, time.Since(started))
 		if errors.Is(err, pgx.ErrNoRows) {
+			RecordSandboxTransition(ctx, "reconcile_pause", telemetry.ResultError, row.HostID, time.Since(started))
 			l.Warn().Msg("pause reconcile: row moved on before finalize")
 			return
 		}
-		l.Error().Err(err).Msg("pause reconcile: finalize failed, retrying later")
-		h.releasePauseLease(ctx, row.ID, lease, pauseRetryAfter(), l)
-		return
+		if !h.pauseLanded(ctx, row.ID, row.TeamID) {
+			RecordSandboxTransition(ctx, "reconcile_pause", telemetry.ResultError, row.HostID, time.Since(started))
+			l.Error().Err(err).Msg("pause reconcile: finalize failed, retrying later")
+			h.releasePauseLease(ctx, row.ID, lease, pauseRetryAfter(), l)
+			return
+		}
+		l.Warn().Err(err).Msg("pause reconcile: finalize answer lost after it committed")
 	}
 
 	l.Info().Msg("pause reconcile: sandbox paused")
@@ -187,6 +191,16 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 		// The same product event the request path emits for its own finalize.
 		h.captureFor(actor, row.TeamID, "sandbox_paused", map[string]any{"sandbox_id": row.ID.String()})
 	}
+}
+
+// pauseLanded answers for a finalize whose reply was lost: a row that now
+// reads paused with no operation was finalized by the lease holder, since
+// nothing else moves a leased row out of 'pausing'.
+func (h *Handlers) pauseLanded(ctx context.Context, id, teamID uuid.UUID) bool {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncTimeout)
+	defer cancel()
+	sb, err := h.DB.GetSandbox(rctx, db.GetSandboxParams{ID: id, TeamID: teamID})
+	return err == nil && sb.Status == db.SandboxStatusPaused && !sb.PauseOpID.Valid
 }
 
 // releasePauseLease hands an undecided pause back for a later attempt.

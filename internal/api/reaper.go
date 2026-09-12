@@ -430,16 +430,20 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxR
 	}
 	applyManifest(&params, manifest)
 	if _, err := h.finalizePause(postCtx, params); err != nil {
-		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 		if errors.Is(err, pgx.ErrNoRows) {
+			RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 			l.Warn().Msg("reaper: row moved on before finalize")
 			return
 		}
-		// The snapshot exists on the host; a later attempt gets it back from
-		// the host's already-paused guard and finalizes again.
-		l.Error().Err(err).Msg("reaper: FinalizePause failed — left pausing for reconciliation")
-		h.releasePauseLease(ctx, sbx.ID, pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}, 0, l)
-		return
+		if !h.pauseLanded(ctx, sbx.ID, sbx.TeamID) {
+			RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
+			// The snapshot exists on the host; a later attempt gets it back from
+			// the host's already-paused guard and finalizes again.
+			l.Error().Err(err).Msg("reaper: FinalizePause failed — left pausing for reconciliation")
+			h.releasePauseLease(ctx, sbx.ID, pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}, 0, l)
+			return
+		}
+		l.Warn().Err(err).Msg("reaper: finalize answer lost after it committed")
 	}
 
 	l.Info().Msg(successMessage)
