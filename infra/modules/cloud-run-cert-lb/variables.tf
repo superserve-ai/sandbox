@@ -73,3 +73,14 @@ variable "backend_timeout_sec" {
   type        = number
   default     = 30
 }
+
+variable "ssl_policy" {
+  description = "Shared SSL policy ID enforcing TLS 1.2+ with the MODERN profile."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = length(trimspace(var.ssl_policy)) > 0
+    error_message = "An explicit SSL policy is required for the HTTPS frontend."
+  }
+}
