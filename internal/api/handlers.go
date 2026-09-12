@@ -745,7 +745,7 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			// The route is not a lifecycle op, so PhaseStart silences nothing.
 			tAuth := PhaseStart(c)
 			tResume := time.Now()
-			resumedAccess, ok := h.resumePausedSandbox(c, &sandbox, teamID)
+			resumedAccess, ok := h.resumePausedSandbox(c, &sandbox, teamID, nil)
 			// Emitted for failures too — auto-resume totals must not censor.
 			RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
 				map[string]time.Duration{"total": time.Since(tResume), "lookup": tResume.Sub(tAuth)})
@@ -773,9 +773,13 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 
 // resumePausedSandbox restores the VM, reapplies network config, and flips
 // the sandbox to active. Starts with an atomic paused→resuming DB claim so
-// concurrent resumes don't both call VMD; the loser gets 409. On any failure
+// concurrent resumes don't both call VMD; the loser gets 409. The caller
+// need only know the row's id and team: the claim returns the row. When
+// the claim finds no paused row, a non-nil settled is asked whether to try
+// once more, after it has read the row and either waited out a pause
+// still finalizing or replied with the conflict itself. On any failure
 // after VMD resume succeeds, destroys the VM + reverts to paused.
-func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID) (string, bool) {
+func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID, settled func() bool) (string, bool) {
 	sandboxID := sandbox.ID
 	l := sandboxLogger(sandboxID.String(), sandbox.HostID)
 
@@ -820,18 +824,23 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID, phases)
 	}()
 
-	if !sandbox.SnapshotID.Valid {
-		l.Error().Msg("paused sandbox has no snapshot_id")
-		respondError(c, ErrInternal)
-		return "", false
-	}
-
 	// One statement for the claim and the boot inputs; see ClaimResume.
-	claimed, err := h.DB.ClaimResume(c.Request.Context(), db.ClaimResumeParams{
+	claimParams := db.ClaimResumeParams{
 		ID:      sandboxID,
 		TeamID:  teamID,
 		LockKey: sandboxID.String(),
-	})
+	}
+	claimed, err := h.DB.ClaimResume(c.Request.Context(), claimParams)
+	if err == pgx.ErrNoRows && settled != nil {
+		// The caller's wait is its lookup, not this claim.
+		tWait := time.Now()
+		retry := settled()
+		tStart = tStart.Add(time.Since(tWait))
+		if !retry {
+			return "", false
+		}
+		claimed, err = h.DB.ClaimResume(c.Request.Context(), claimParams)
+	}
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			// Someone else is already resuming, or the sandbox is no longer
@@ -849,6 +858,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return "", false
 	}
 	*sandbox = claimed.Sandbox
+	l = sandboxLogger(sandboxID.String(), sandbox.HostID)
+	SetTelemetryHostID(c, sandbox.HostID)
 
 	revertCtx := context.WithoutCancel(c.Request.Context())
 	revertToPaused := func() {
@@ -860,6 +871,14 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}); err != nil {
 			l.Error().Err(err).Msg("RevertResumeToPaused failed — sandbox may be stuck in 'resuming'")
 		}
+	}
+
+	if !sandbox.SnapshotID.Valid {
+		l.Error().Msg("paused sandbox has no snapshot_id")
+		markRevert()
+		revertToPaused()
+		respondError(c, ErrInternal)
+		return "", false
 	}
 
 	// Strict sandboxes may only resume while their host proves enforcement
@@ -1423,90 +1442,103 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	// PauseSandbox responds as soon as vmd's PauseVM RPC completes, then
-	// flips pausing -> paused via fire-and-forget bookkeeping (deliberately
-	// off the pause hot path — see finalize-pause in PauseSandbox). The
-	// owner's own immediate follow-up resume can therefore read the row
-	// before that write lands; poll through 'pausing' with a backed-off
-	// interval (nextSettlePollInterval) over pausingSettleWindow rather than
-	// 409 an operation the client was just told succeeded. Any other
-	// non-paused status is a real conflict and fails immediately.
-	deadline := time.Now().Add(pausingSettleWindow)
-	waitStart := time.Now()
-	poll := pausingSettlePollStart
-	reads := 0
-	canceled := false
-	for {
-		var err error
-		sandbox, err = h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
-			ID:     sandboxID,
-			TeamID: teamID,
-		})
-		reads++
-		if err != nil {
-			if err == pgx.ErrNoRows {
-				respondError(c, ErrSandboxNotFound)
-				return
-			}
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-			respondError(c, ErrInternal)
-			return
-		}
-		if sandbox.Status == db.SandboxStatusPausing && time.Now().Before(deadline) {
-			// Context-aware wait: a client that disconnects or hits its
-			// deadline mid-backoff releases this goroutine at cancellation
-			// instead of holding it for the rest of the interval — and skips
-			// the re-read, which on a canceled context could only fail and be
-			// misreported as an internal DB error.
-			timer := time.NewTimer(poll)
-			select {
-			case <-timer.C:
-				poll = nextSettlePollInterval(poll)
-				continue
-			case <-c.Request.Context().Done():
-				timer.Stop()
-				canceled = true
-			}
-		}
-		break
-	}
-	// The common case resolves on the first read, so this only fires for the
-	// racing/stuck case — once per affected resume, not once per poll — and
-	// stays off the hot path.
-	if reads > 1 {
-		waited := time.Since(waitStart)
-		// Only pausing→paused counts as settled: a row that left 'pausing'
-		// for any other state (a failed pause reverting to active, a delete
-		// claiming the row) still 409s below, and folding it into "settled"
-		// would contaminate the metric with pause failures.
-		var result string
-		switch {
-		case canceled:
-			result = telemetry.SettleResultCanceled
-		case sandbox.Status == db.SandboxStatusPaused:
-			result = telemetry.SettleResultSettled
-		case sandbox.Status == db.SandboxStatusPausing:
-			result = telemetry.SettleResultTimeout
-		default:
-			result = telemetry.SettleResultDiverged
-		}
-		l := sandboxLogger(sandboxID.String(), sandbox.HostID)
-		l.Warn().
-			Dur("waited", waited).
-			Int("reads", reads).
-			Str("result", result).
-			Msg("resume waited for racing pause finalize to settle")
-		RecordResumeSettleWait(c.Request.Context(), result, sandbox.HostID, waited, reads)
-	}
-	SetTelemetryHostID(c, sandbox.HostID)
-
-	if sandbox.Status != db.SandboxStatusPaused {
-		respondError(c, ErrInvalidState)
-		return
-	}
-
+	// The claim is the first statement to touch the row: a paused sandbox
+	// is the common case, and the claim both proves and takes it in one
+	// round trip. The row is read only when the claim finds no paused row,
+	// to tell a pause still settling from a real conflict or a missing
+	// sandbox. That wait counts as lookup, not as the claim.
 	tLookupDone = time.Now()
-	if _, ok := h.resumePausedSandbox(c, &sandbox, teamID); !ok {
+	sandbox = db.Sandbox{ID: sandboxID, TeamID: teamID}
+	settled := func() bool {
+		// PauseSandbox responds as soon as vmd's PauseVM RPC completes, then
+		// flips pausing -> paused via fire-and-forget bookkeeping (deliberately
+		// off the pause hot path — see finalize-pause in PauseSandbox). The
+		// owner's own immediate follow-up resume can therefore find the row
+		// before that write lands; poll through 'pausing' with a backed-off
+		// interval (nextSettlePollInterval) over pausingSettleWindow rather than
+		// 409 an operation the client was just told succeeded. Any other
+		// non-paused status is a real conflict and fails immediately.
+		deadline := time.Now().Add(pausingSettleWindow)
+		waitStart := time.Now()
+		poll := pausingSettlePollStart
+		reads := 0
+		canceled := false
+		for {
+			var err error
+			sandbox, err = h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+				ID:     sandboxID,
+				TeamID: teamID,
+			})
+			reads++
+			if err != nil {
+				// Ended before any claim could land: the whole request is lookup.
+				tLookupDone = time.Time{}
+				if err == pgx.ErrNoRows {
+					respondError(c, ErrSandboxNotFound)
+					return false
+				}
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+				respondError(c, ErrInternal)
+				return false
+			}
+			if sandbox.Status == db.SandboxStatusPausing && time.Now().Before(deadline) {
+				// Context-aware wait: a client that disconnects or hits its
+				// deadline mid-backoff releases this goroutine at cancellation
+				// instead of holding it for the rest of the interval — and skips
+				// the re-read, which on a canceled context could only fail and be
+				// misreported as an internal DB error.
+				timer := time.NewTimer(poll)
+				select {
+				case <-timer.C:
+					poll = nextSettlePollInterval(poll)
+					continue
+				case <-c.Request.Context().Done():
+					timer.Stop()
+					canceled = true
+				}
+			}
+			break
+		}
+		// A single read means the claim lost to a real state change; the
+		// racing/stuck case polls, and is reported once per affected resume.
+		if reads > 1 {
+			waited := time.Since(waitStart)
+			// Only pausing→paused counts as settled: a row that left 'pausing'
+			// for any other state (a failed pause reverting to active, a delete
+			// claiming the row) still 409s below, and folding it into "settled"
+			// would contaminate the metric with pause failures.
+			var result string
+			switch {
+			case canceled:
+				result = telemetry.SettleResultCanceled
+			case sandbox.Status == db.SandboxStatusPaused:
+				result = telemetry.SettleResultSettled
+			case sandbox.Status == db.SandboxStatusPausing:
+				result = telemetry.SettleResultTimeout
+			default:
+				result = telemetry.SettleResultDiverged
+			}
+			l := sandboxLogger(sandboxID.String(), sandbox.HostID)
+			l.Warn().
+				Dur("waited", waited).
+				Int("reads", reads).
+				Str("result", result).
+				Msg("resume waited for racing pause finalize to settle")
+			RecordResumeSettleWait(c.Request.Context(), result, sandbox.HostID, waited, reads)
+		}
+		SetTelemetryHostID(c, sandbox.HostID)
+
+		if sandbox.Status != db.SandboxStatusPaused {
+			// A settle-window 409 is the slowest lookup there is; it must
+			// land there, not vanish into a claim that never happened.
+			tLookupDone = time.Time{}
+			respondError(c, ErrInvalidState)
+			return false
+		}
+		tLookupDone = time.Now()
+		return true
+	}
+	if _, ok := h.resumePausedSandbox(c, &sandbox, teamID, settled); !ok {
 		return
 	}
 
@@ -2378,12 +2410,23 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Resolve secret references before spinning up the VM so a typo 400s cleanly.
-	secretBindings, secretMeta, appErr := h.resolveSecretBindingsForCreate(c.Request.Context(), teamID, req.Secrets)
-	if appErr != nil {
-		respondError(c, appErr)
-		return
+	// Resolve secret references before spinning up the VM so a typo 400s
+	// cleanly. The template read below needs nothing from this, so the two
+	// round trips overlap; the result is joined once the template is in hand.
+	type resolvedSecrets struct {
+		bindings []db.AddSandboxSecretParams
+		meta     []SecretBindingMeta
+		err      *AppError
 	}
+	// The context is taken here, not in the goroutine: gin recycles c once
+	// the handler returns, and a template failure can return before the
+	// goroutine has even started.
+	secretsCtx := c.Request.Context()
+	secretsCh := make(chan resolvedSecrets, 1)
+	go func() {
+		bindings, meta, appErr := h.resolveSecretBindingsForCreate(secretsCtx, teamID, req.Secrets)
+		secretsCh <- resolvedSecrets{bindings, meta, appErr}
+	}()
 
 	// Default the create to the `superserve/base` template so every sandbox
 	// has a consistent baseline image. Callers can opt out by setting
@@ -2407,6 +2450,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var fromTemplateName, fromTemplateID string
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
+		// Stamped before the error check so a failed lookup still lands in
+		// the phase series; a successful one is re-stamped after the join.
 		tLookupDone = time.Now()
 		if err != nil {
 			return // error already responded
@@ -2437,6 +2482,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		fromTemplateName = tpl.Name
 		fromTemplateID = tpl.ID.String()
 	}
+
+	secrets := <-secretsCh
+	if secrets.err != nil {
+		respondError(c, secrets.err)
+		return
+	}
+	secretBindings, secretMeta := secrets.bindings, secrets.meta
+	tLookupDone = time.Now()
 
 	// Select a host for this sandbox.
 	tSchedStart = time.Now()
