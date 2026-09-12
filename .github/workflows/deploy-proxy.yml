@@ -94,14 +94,16 @@ jobs:
           OTEL_ENVIRONMENT: staging
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_STAGING }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
-          # Set the identity only after bootstrap provisions every target host.
+          # Bootstrap owns each host's identity and certificate paths.
+          # Host 1 retains its legacy peer configuration.
+          # Require bootstrap only after this cell's operator-run migration.
+          PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_STAGING == 'true' && 'superserve-vmd-staging-2' || '' }}
           # Inbound ingress is a separate opt-in; outbound clients still need credentials.
           PEER_PROXY_LISTEN_ADDR: ${{ vars.PEER_PROXY_LISTEN_ADDR_STAGING }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
-          PEER_PROXY_SPIFFE_URI: ${{ vars.PEER_PROXY_SPIFFE_URI_STAGING }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
         run: |
           python3 .github/workflows/scripts/deploy-proxy.py
@@ -161,7 +163,6 @@ jobs:
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
-          PEER_PROXY_SPIFFE_URI: ${{ vars.PEER_PROXY_SPIFFE_URI_PROD }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
@@ -201,13 +202,14 @@ jobs:
           SHA: ${{ github.sha }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USW }}
+          # Production opts in separately after its staging-proven migration.
+          PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_USW == 'true' && 'superserve-vmd-usw2-2' || '' }}
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
-          PEER_PROXY_SPIFFE_URI: ${{ vars.PEER_PROXY_SPIFFE_URI_USWEST }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |

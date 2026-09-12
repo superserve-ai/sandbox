@@ -20,7 +20,10 @@ Env vars:
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
   SENTRY_DSN                 optional — Sentry DSN URL for error reporting
-  PEER_PROXY_*               optional — private mTLS peer ingress settings
+  PEER_IDENTITY_HOSTS        optional — comma-separated hosts requiring identity bootstrap
+  PEER_PROXY_LISTEN_ADDR     optional — private mTLS listener (auto or private IP:port)
+  PEER_PROXY_TARGET_ADDR     optional — loopback target; defaults to 127.0.0.1:5010
+  Peer identity and certificate paths are supplied by host bootstrap.
 """
 
 import os
@@ -71,11 +74,13 @@ def main() -> int:
         print('ERROR: REQUIRE_DATA_PLANE must be empty, "0", or "1"', file=sys.stderr)
         return 1
     sentry_dsn = os.environ.get("SENTRY_DSN", "")
+    peer_identity_hosts = set(filter(None, (host.strip() for host in
+        os.environ.get("PEER_IDENTITY_HOSTS", "").split(","))))
     peer_env = {
         key: os.environ.get(key, "") for key in (
             "PEER_PROXY_LISTEN_ADDR", "PEER_PROXY_TARGET_ADDR",
             "PEER_PROXY_CERT_FILE", "PEER_PROXY_KEY_FILE",
-            "PEER_PROXY_CA_FILE", "PEER_PROXY_SPIFFE_URI",
+            "PEER_PROXY_CA_FILE",
         )
     }
     peer_env["PEER_PROXY_TARGET_ADDR"] = peer_env["PEER_PROXY_TARGET_ADDR"] or "127.0.0.1:5010"
@@ -84,14 +89,7 @@ def main() -> int:
         ("PEER_PROXY_KEY_FILE", "/etc/superserve/peer/tls.key"),
         ("PEER_PROXY_CA_FILE", "/etc/superserve/peer/ca.crt"),
     ):
-        peer_env[key] = peer_env[key] or default
-    peer_identity = peer_env["PEER_PROXY_SPIFFE_URI"]
-    if peer_env["PEER_PROXY_LISTEN_ADDR"] and not peer_identity:
-        print("ERROR: peer ingress requires PEER_PROXY_SPIFFE_URI", file=sys.stderr)
-        return 1
-    if peer_identity and not re.fullmatch(r"spiffe://[A-Za-z0-9._:/-]+", peer_identity):
-        print("ERROR: PEER_PROXY_SPIFFE_URI must be a SPIFFE URI", file=sys.stderr)
-        return 1
+        peer_env[key] = default
     peer_max_streams = os.environ.get("PEER_PROXY_MAX_STREAMS", "") or "128"
     if not peer_max_streams.isascii() or not peer_max_streams.isdecimal() or not 1 <= int(peer_max_streams) <= 2147483647:
         print("ERROR: PEER_PROXY_MAX_STREAMS must be a positive 32-bit integer", file=sys.stderr)
@@ -174,6 +172,22 @@ def main() -> int:
         deploy_script = textwrap.dedent(f"""
             set -euo pipefail
 
+            peer_identity=""
+            if sudo test -f /etc/superserve/peer/identity.json; then
+                # Shared with the refresh worker through systemd credential load.
+                exec 9< /run/lock/vmd-peer-credentials.lock
+                flock -s 9
+                peer_identity=$(sudo python3 -c 'import json; print(json.load(open("/etc/superserve/peer/identity.json"))["spiffe_uri"])')
+                if ! [[ "$peer_identity" =~ ^spiffe://[A-Za-z0-9._:/-]+$ ]]; then
+                    echo 'ERROR: invalid infrastructure peer identity' >&2
+                    exit 1
+                fi
+                sudo /usr/local/sbin/refresh-peer-credentials --check
+            elif [ "{int(name in peer_identity_hosts)}" -eq 1 ]; then
+                echo 'ERROR: host requires infrastructure identity bootstrap' >&2
+                exit 1
+            fi
+
             sudo mv /tmp/proxy-{sha} {install_dir}/proxy
             sudo chmod +x {install_dir}/proxy
 
@@ -254,8 +268,8 @@ def main() -> int:
             trap finish_deployment EXIT
 
             # Both outbound clients and inbound ingress use the host identity.
-            # Configure it only after bootstrap has provisioned all target hosts.
-            if [ -n "{peer_identity}" ]; then
+            # Legacy hosts retain their existing peer configuration.
+            if [ -n "$peer_identity" ]; then
                 sudo install -d -m 0750 /etc/superserve/peer
                 for credential in \
                     "{peer_env['PEER_PROXY_CERT_FILE']}" \
@@ -283,9 +297,6 @@ def main() -> int:
                 Environment=PEER_PROXY_KEY_FILE=%d/peer-key
                 Environment=PEER_PROXY_CA_FILE=%d/peer-ca
                 CREDENTIALS
-            else
-                deployment_mutated=1
-                sudo rm -f /etc/systemd/system/proxy.service.d/peer-credentials.conf
             fi
 
             sudo systemctl daemon-reload
@@ -293,12 +304,12 @@ def main() -> int:
             peer_cert_file={peer_env['PEER_PROXY_CERT_FILE']!r}
             peer_key_file={peer_env['PEER_PROXY_KEY_FILE']!r}
             peer_ca_file={peer_env['PEER_PROXY_CA_FILE']!r}
-            if [ -n "{peer_identity}" ]; then
+            if [ -n "$peer_identity" ]; then
                 peer_cert_file=/run/credentials/proxy.service/peer-cert
                 peer_key_file=/run/credentials/proxy.service/peer-key
                 peer_ca_file=/run/credentials/proxy.service/peer-ca
             fi
-            if [ -n "{peer_env['PEER_PROXY_LISTEN_ADDR']}" ]; then
+            if [ -n "$peer_identity" ] && [ -n "{peer_env['PEER_PROXY_LISTEN_ADDR']}" ]; then
                 sudo mkdir -p /etc/sandbox
                 peer_listen_addr={peer_env['PEER_PROXY_LISTEN_ADDR']}
                 if [ "$peer_listen_addr" = "auto" ]; then
@@ -325,7 +336,7 @@ def main() -> int:
                     sudo sed -i '/^PEER_PROXY_LISTEN_ADDR=/d' /etc/sandbox/vmd.env
                     printf 'PEER_PROXY_LISTEN_ADDR=%s\\n' "$peer_listen_addr" | sudo tee -a /etc/sandbox/vmd.env > /dev/null
                 fi
-            else
+            elif [ -n "$peer_identity" ]; then
                 # Remove the prior advertisement when peer ingress is disabled
                 # (including rollback). VMD only reads this environment at
                 # startup, so restart it only when a stale advertisement
@@ -353,6 +364,7 @@ def main() -> int:
             # keeps its predecessor's row ID), so copy vmd's value and fall
             # back to the instance name only when no vmd env exists yet.
             host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/vmd.env 2>/dev/null | head -n1 || true)
+            deployment_mutated=1
             sudo tee /etc/sandbox/proxy.env > /dev/null <<PROXYENV
             PROXY_DOMAIN={proxy_domain}
             PROXY_DOMAINS={proxy_domains}
@@ -365,10 +377,16 @@ def main() -> int:
             PEER_PROXY_CERT_FILE=$peer_cert_file
             PEER_PROXY_KEY_FILE=$peer_key_file
             PEER_PROXY_CA_FILE=$peer_ca_file
-            PEER_PROXY_SPIFFE_URI={peer_identity}
+            PEER_PROXY_SPIFFE_URI=$peer_identity
             PEER_PROXY_MAX_STREAMS={peer_max_streams}
             HOST_ID=${{host_id:-{name}}}{otel_env_lines}
             PROXYENV
+            if [ -z "$peer_identity" ]; then
+                sudo sed -i '/^PEER_PROXY_/d' /etc/sandbox/proxy.env
+                if sudo test -f "$rollback_dir/proxy.env"; then
+                    sudo awk '/^PEER_PROXY_/' "$rollback_dir/proxy.env" | sudo tee -a /etc/sandbox/proxy.env > /dev/null
+                fi
+            fi
             sudo chmod 0600 /etc/sandbox/proxy.env
 
             if ! sudo systemctl restart proxy; then
