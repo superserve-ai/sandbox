@@ -298,6 +298,15 @@ select `standby` explicitly. Push runs retain the configured staging label, and
 production keeps its existing cell filters and rollout sequence (the target
 input applies only to staging).
 
+Fresh-host collector deployment must install files **and** leave the service
+persistently enabled and active. A staging attempt exposed a shell rendering bug:
+an indented `collector.env` heredoc terminator swallowed the enable/restart and
+health commands into the env file. The deployment now renders that heredoc
+separately from multiline health checks, rewrites the env file cleanly on retry,
+and verifies persistent enablement plus runtime health before reporting success.
+A manual `enable --now` is not a provisioning requirement; rerun the corrected
+collector deployment after reviewing any prior failed attempt.
+
 Do not run `bootstrap-host2.py --verify` until the standby collector deployment
 has succeeded. Confirm `superserve-otel-collector.service` is active and its
 health endpoint responds before final verification; the deployment also checks

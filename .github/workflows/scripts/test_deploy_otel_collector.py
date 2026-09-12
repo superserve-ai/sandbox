@@ -53,6 +53,7 @@ class DeployOtelCollectorTests(unittest.TestCase):
         functions = f'''
         sudo() {{ "$@"; }}
         systemctl() {{
+          if [ "$1" = is-enabled ]; then echo enabled; return 0; fi
           if [ "$1" = is-active ] && [ "{systemd_mode}" != active ]; then
             echo "inactive (dead)"; return 3
           fi
@@ -157,6 +158,71 @@ class OtelTargetSelectionTests(unittest.TestCase):
         self.assertEqual(selected, ['host-a', 'host-b'])
         self.assertIn('--filter=' + env['VMD_FILTER'] + ' AND status=RUNNING', calls[0].args[0])
 
+
+
+class OtelRenderedDeploymentTests(unittest.TestCase):
+    def exercise(self, fail='', existing=False):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staging = root / 'staging'
+            staging.mkdir()
+            binary = '#!/bin/sh\necho otelcol-contrib ' + MODULE.OTEL_COLLECTOR_VERSION + '\n'
+            for name, data in [('otelcol-contrib', binary), ('collector-gmp.yaml', 'receivers: {}\n'),
+                               ('superserve-otel-collector.service', '[Install]\nWantedBy=multi-user.target\n')]:
+                (staging/name).write_text(data)
+            (root/'usr/local/bin').mkdir(parents=True)
+            if existing:
+                (root/'usr/local/bin/otelcol-contrib').write_text(binary)
+                (root/'usr/local/bin/otelcol-contrib').chmod(0o755)
+            script = MODULE._deploy_script(str(staging), 'example-project', 'us-central1-a', 'example-host')
+            script = script.replace('/usr/local/bin', str(root/'usr/local/bin')).replace('/etc/', str(root/'etc') + '/')
+            prelude = '''
+sudo() { "$@"; }
+sleep() { :; }
+systemctl() {
+    echo "$*" >> "$CALLS"
+    if [ "$1" = "$FAIL" ]; then echo "requested failure" >&2; return 1; fi
+    case "$1" in
+      enable) touch "$STATE/enabled" ;;
+      restart) touch "$STATE/active" ;;
+      is-enabled) if [ "$FAIL" = runtime-only ]; then echo enabled-runtime; else test -f "$STATE/enabled" && echo enabled; fi ;;
+      is-active) test -f "$STATE/active" ;;
+    esac
+}
+curl() {
+    if [ "$FAIL" = health ]; then return 1; fi
+    echo otelcol_process_uptime 1
+}
+journalctl() { :; }
+'''
+            result = subprocess.run(['bash', '-c', prelude + script], capture_output=True, text=True,
+                                    env=dict(os.environ, FAIL=fail, STATE=tmp, CALLS=str(root/'calls')))
+            env_file = root/'etc/sandbox/otel/collector.env'
+            self.assertEqual(env_file.read_text(), 'GCP_PROJECT=example-project\nGCP_ZONE=us-central1-a\nHOST_ID=example-host\n')
+            self.assertEqual(env_file.stat().st_mode & 0o777, 0o644)
+            self.assertFalse(staging.exists(), 'staging cleanup must run')
+            calls = (root/'calls').read_text()
+            if result.returncode == 0:
+                self.assertTrue((root/'enabled').exists())
+                self.assertTrue((root/'active').exists())
+                self.assertIn('is-enabled superserve-otel-collector.service', calls)
+                self.assertIn('is-active superserve-otel-collector', calls)
+            return result, calls
+
+    def test_complete_script_enables_and_starts_fresh_and_existing_hosts(self):
+        for existing in (False, True):
+            result, calls = self.exercise(existing=existing)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertLess(calls.index('daemon-reload'), calls.index('enable '))
+            self.assertLess(calls.index('enable '), calls.index('restart '))
+
+    def test_enable_start_or_readiness_failure_cannot_report_success(self):
+        for fail in ('enable', 'restart', 'is-active', 'runtime-only', 'health'):
+            with self.subTest(fail=fail):
+                result, _ = self.exercise(fail=fail)
+                self.assertNotEqual(result.returncode, 0)
 
 if __name__ == "__main__":
     unittest.main()
