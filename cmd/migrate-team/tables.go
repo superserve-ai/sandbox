@@ -33,6 +33,10 @@ const sandboxScope = `sandbox_id IN (SELECT id FROM sandbox WHERE team_id = $1)`
 const manifestScope = `(snapshot_id IN (SELECT id FROM snapshot WHERE team_id = $1)
 	OR template_id IN (SELECT id FROM template WHERE team_id = $1))`
 
+// qmTenantScope covers the hosted-QM tables that hang off qm.tenants (no
+// team_id column of their own).
+const qmTenantScope = `tenant_id IN (SELECT id FROM qm.tenants WHERE team_id = $1)`
+
 // backupGenerationScope covers backup_generation, whose rows hang off
 // exactly one of sandbox or template (no team_id column of their own).
 const backupGenerationScope = `(sandbox_id IN (SELECT id FROM sandbox WHERE team_id = $1)
@@ -85,6 +89,11 @@ var migratedTables = []tableSpec{
 	// grants and are deliberately not part of a team migration.
 	{"user_role_assignments", "team_id = $1 AND scope_type = 'team'"},
 	{"api_key", "team_id = $1"},
+	// Hosted QM: a tenant references the team and one of its API keys, so it
+	// follows api_key; events and secret references hang off the tenant.
+	{"qm.tenants", "team_id = $1"},
+	{"qm.tenant_events", qmTenantScope},
+	{"qm.tenant_secrets", qmTenantScope},
 	// Same KMS KEK in both cells (verified), so ciphertext + wrapped DEK
 	// copy as-is.
 	{"secret", "team_id = $1"},

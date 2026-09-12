@@ -173,6 +173,7 @@ type fixture struct {
 	sysTplSrc, sysTplDst    uuid.UUID
 	snap1, snap2            uuid.UUID
 	secret                  uuid.UUID
+	qmTenant                uuid.UUID
 	expectedCounts          map[string]int64
 	expectedDirs            []string
 }
@@ -197,6 +198,7 @@ func seedFixture(t *testing.T) *fixture {
 		snap1:     uuid.New(),
 		snap2:     uuid.New(),
 		secret:    uuid.New(),
+		qmTenant:  uuid.New(),
 	}
 	base := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
 
@@ -233,6 +235,12 @@ func seedFixture(t *testing.T) *fixture {
 	// rotates keys before copy; live keys block).
 	mustExec(t, srcPool, `INSERT INTO api_key (team_id, key_hash, name, created_by, revoked_at) VALUES ($1, 'hash-'||$2::text, 'ci', $3, now())`, f.team, uuid.New(), f.owner)
 	mustExec(t, srcPool, `INSERT INTO api_key (team_id, key_hash, name, revoked_at) VALUES ($1, 'hash-'||$2::text, 'agent', now())`, f.team, uuid.New())
+	mustExec(t, srcPool, `
+		INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, sandbox_api_key_id)
+		VALUES ($1, $2, 'pilot-team', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic',
+		        (SELECT id FROM api_key WHERE team_id = $2 AND name = 'ci'))`, f.qmTenant, f.team)
+	mustExec(t, srcPool, `INSERT INTO qm.tenant_events (tenant_id, step, status, message) VALUES ($1, 'database', 'ok', 'created')`, f.qmTenant)
+	mustExec(t, srcPool, `INSERT INTO qm.tenant_secrets (tenant_id, name, secret_ref) VALUES ($1, 'CORE_SIGNING_SECRET', 'projects/example/secrets/qm-pilot-team-CORE_SIGNING_SECRET')`, f.qmTenant)
 
 	mustExec(t, srcPool, `
 		INSERT INTO secret (id, team_id, name, auth_type, hosts, ciphertext, encrypted_dek, kek_id)
@@ -432,6 +440,9 @@ func seedFixture(t *testing.T) *fixture {
 		"team_memberships":                   2,
 		"user_role_assignments":              2,
 		"api_key":                            2,
+		"qm.tenants":                         1,
+		"qm.tenant_events":                   1,
+		"qm.tenant_secrets":                  1,
 		"secret":                             1,
 		"template":                           1,
 		"template_build":                     1,
