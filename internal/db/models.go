@@ -919,6 +919,22 @@ type TemplateBuild struct {
 	UpdatedAt     time.Time           `json:"updated_at"`
 }
 
+type TrialCreditWarningDelivery struct {
+	TeamID     uuid.UUID          `json:"team_id"`
+	Recipient  string             `json:"recipient"`
+	SentAt     pgtype.Timestamptz `json:"sent_at"`
+	RejectedAt pgtype.Timestamptz `json:"rejected_at"`
+}
+
+type TrialCreditWarningState struct {
+	TeamID     uuid.UUID          `json:"team_id"`
+	Status     string             `json:"status"`
+	ClaimToken pgtype.UUID        `json:"claim_token"`
+	ClaimedAt  pgtype.Timestamptz `json:"claimed_at"`
+	SentAt     pgtype.Timestamptz `json:"sent_at"`
+	UpdatedAt  time.Time          `json:"updated_at"`
+}
+
 type UserRoleAssignment struct {
 	ID        uuid.UUID          `json:"id"`
 	UserID    uuid.UUID          `json:"user_id"`

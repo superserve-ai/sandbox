@@ -158,12 +158,13 @@ type Handlers struct {
 	// Shadow, when set, receives a sample of creates for capacity
 	// ranking that influences nothing. Offering is a non-blocking
 	// channel send; see ShadowEvaluator.
-	Shadow    *scheduler.ShadowEvaluator
-	Analytics *analytics.Client // when set, emits product-usage events; nil is a no-op
-	Encryptor secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
-	Signer    *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
-	Stripe    StripeBillingClient
-	Now       func() time.Time // when set, returns the current UTC time for testable handlers
+	Shadow             *scheduler.ShadowEvaluator
+	Analytics          *analytics.Client // when set, emits product-usage events; nil is a no-op
+	Encryptor          secrets.Encryptor // KMS envelope used by /secrets endpoints; nil disables them
+	Signer             *SecretsSigner    // signs sandbox JWTs and serves the JWKS; nil disables both
+	Stripe             StripeBillingClient
+	TrialWarningSender TrialCreditWarningSender
+	Now                func() time.Time // when set, returns the current UTC time for testable handlers
 
 	// asyncMu/asyncCond/asyncCount track fire-and-forget bookkeeping goroutines
 	// (ActivateSandbox, FinalizePause) so tests can wait for quiescence;
@@ -173,6 +174,8 @@ type Handlers struct {
 	asyncMu    sync.Mutex
 	asyncCond  *sync.Cond // lazily created by WaitAsyncBookkeeping, guarded by asyncMu
 	asyncCount int
+
+	trialWarningAfter uuid.UUID // guarded by asyncMu
 
 	// activityGate caps how many activity-log inserts may hold DB connections
 	// at once (see writeActivity). Lazily created so struct-literal

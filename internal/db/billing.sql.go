@@ -265,6 +265,47 @@ func (q *Queries) ClaimTeamCommercialBillingAnchor(ctx context.Context, arg Clai
 	return commercial_billing_anchor, err
 }
 
+const claimTrialCreditWarning = `-- name: ClaimTrialCreditWarning :one
+INSERT INTO trial_credit_warning_state (team_id, status, claim_token, claimed_at)
+VALUES ($1, 'claimed', gen_random_uuid(), now())
+ON CONFLICT (team_id) DO UPDATE
+SET status = 'claimed', claim_token = gen_random_uuid(), claimed_at = now(), updated_at = now()
+WHERE trial_credit_warning_state.status = 'pending'
+RETURNING claim_token
+`
+
+// A claimed row is never reclaimed after a timeout: the worker may have
+// crashed after provider acceptance, so retrying could duplicate the email.
+func (q *Queries) ClaimTrialCreditWarning(ctx context.Context, teamID uuid.UUID) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, claimTrialCreditWarning, teamID)
+	var claim_token pgtype.UUID
+	err := row.Scan(&claim_token)
+	return claim_token, err
+}
+
+const completeTrialCreditWarning = `-- name: CompleteTrialCreditWarning :exec
+UPDATE trial_credit_warning_state
+SET status = CASE WHEN EXISTS (
+        SELECT 1 FROM trial_credit_warning_delivery d WHERE d.team_id = $1 AND d.rejected_at IS NOT NULL
+    ) THEN 'suppressed' ELSE 'sent' END,
+    sent_at = CASE WHEN EXISTS (
+        SELECT 1 FROM trial_credit_warning_delivery d WHERE d.team_id = $1 AND d.rejected_at IS NOT NULL
+    ) THEN NULL ELSE now() END,
+    updated_at = now()
+WHERE team_id = $1 AND status = 'claimed' AND claim_token = $2
+`
+
+type CompleteTrialCreditWarningParams struct {
+	TeamID     uuid.UUID   `json:"team_id"`
+	ClaimToken pgtype.UUID `json:"claim_token"`
+}
+
+// A finished recipient loop with rejections is terminal, but not fully sent.
+func (q *Queries) CompleteTrialCreditWarning(ctx context.Context, arg CompleteTrialCreditWarningParams) error {
+	_, err := q.db.Exec(ctx, completeTrialCreditWarning, arg.TeamID, arg.ClaimToken)
+	return err
+}
+
 const createBillingPeriodAnomaly = `-- name: CreateBillingPeriodAnomaly :one
 INSERT INTO billing_period_anomaly (
     team_id, period_start, period_end, severity, kind, sandbox_id, details
@@ -591,6 +632,88 @@ func (q *Queries) GetBillingUsageExportByIdentifier(ctx context.Context, stripeM
 		&i.SentAt,
 		&i.UpdatedAt,
 		&i.StripeIdempotencyKey,
+	)
+	return i, err
+}
+
+const getRecentTrialBurnSample = `-- name: GetRecentTrialBurnSample :one
+WITH selected_plan AS (
+  SELECT COALESCE((SELECT tpp.plan_key FROM team_pricing_plan tpp JOIN pricing_plan pp ON pp.key = tpp.plan_key
+    WHERE tpp.team_id = $1 AND pp.active AND tpp.effective_from <= now()
+      AND (tpp.effective_to IS NULL OR tpp.effective_to > now())
+    ORDER BY tpp.effective_from DESC LIMIT 1), 'payg') AS plan_key
+), ranked_rates AS (
+  SELECT r.resource, r.price_usd,
+         row_number() OVER (PARTITION BY r.resource, r.unit ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC) AS rate_rank
+  FROM pricing_rate r
+  JOIN selected_plan p ON p.plan_key = r.plan_key
+  JOIN pricing_plan pp ON pp.key = r.plan_key AND pp.active
+  WHERE r.unit = 'second' AND r.effective_from <= now() AND (r.effective_to IS NULL OR r.effective_to > now())
+), rates AS (
+  SELECT COALESCE(MAX(price_usd) FILTER (WHERE resource = 'vcpu' AND rate_rank = 1), 0)::numeric AS vcpu,
+         COALESCE(MAX(price_usd) FILTER (WHERE resource = 'memory_gib' AND rate_rank = 1), 0)::numeric AS memory,
+         COALESCE(MAX(price_usd) FILTER (WHERE resource = 'storage_gib' AND rate_rank = 1), 0)::numeric AS storage
+  FROM ranked_rates
+  WHERE rate_rank = 1
+), recent_compute AS MATERIALIZED (
+  SELECT GREATEST(b.started_at, now() - interval '6 hours') AS started_at,
+         b.ended_at, b.vcpu_count, b.memory_mib
+  FROM sandbox_compute_billing_interval b
+  WHERE b.team_id = $1
+    AND b.started_at < now()
+    AND COALESCE(b.ended_at, now()) > now() - interval '6 hours'
+  ORDER BY b.started_at DESC
+  LIMIT 128
+), compute AS (
+  -- Convert each resource's usage to USD before aggregating.  The raw
+  -- interval duration is vCPU-seconds and must never be exposed as spend.
+  SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(b.ended_at, now()), now()) - b.started_at)) * (b.vcpu_count * rates.vcpu + b.memory_mib / 1024.0 * rates.memory)), 0)::numeric AS amount,
+       MIN(b.started_at) AS started_at,
+       MAX(COALESCE(b.ended_at, now())) AS ended_at
+FROM recent_compute b
+ CROSS JOIN rates
+), recent_storage AS MATERIALIZED (
+  SELECT GREATEST(s.started_at, now() - interval '6 hours') AS started_at,
+         s.ended_at, s.disk_mib
+  FROM sandbox_storage_interval s
+  WHERE s.team_id = $1
+    AND feature_enabled('billing_storage_billing_enabled', $1)
+    AND s.started_at < now()
+    AND COALESCE(s.ended_at, now()) > now() - interval '6 hours'
+  ORDER BY s.started_at DESC
+  LIMIT 128
+), sample_bounds AS (
+  SELECT MIN(started_at) AS started_at,
+         MAX(LEAST(ended_at, now())) AS ended_at
+  FROM (
+    SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_compute
+    UNION ALL
+    SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_storage
+  ) intervals
+)
+SELECT round((compute.amount + CASE WHEN feature_enabled('billing_storage_billing_enabled', $1) THEN COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(s.ended_at, now()), now()) - s.started_at)) * s.disk_mib / 1024.0 * rates.storage) FROM recent_storage s CROSS JOIN rates), 0) ELSE 0 END)::numeric, 6) AS spent_usd,
+       sample_bounds.started_at, sample_bounds.ended_at,
+       EXTRACT(EPOCH FROM (sample_bounds.ended_at - sample_bounds.started_at))::numeric AS elapsed_seconds
+FROM compute, rates, sample_bounds
+`
+
+type GetRecentTrialBurnSampleRow struct {
+	SpentUsd       pgtype.Numeric `json:"spent_usd"`
+	StartedAt      interface{}    `json:"started_at"`
+	EndedAt        interface{}    `json:"ended_at"`
+	ElapsedSeconds pgtype.Numeric `json:"elapsed_seconds"`
+}
+
+// Bounded recent sample for the advisory trial warning. The interval bounds
+// keep this out of the reconciliation hot path's historical scan.
+func (q *Queries) GetRecentTrialBurnSample(ctx context.Context, teamID uuid.UUID) (GetRecentTrialBurnSampleRow, error) {
+	row := q.db.QueryRow(ctx, getRecentTrialBurnSample, teamID)
+	var i GetRecentTrialBurnSampleRow
+	err := row.Scan(
+		&i.SpentUsd,
+		&i.StartedAt,
+		&i.EndedAt,
+		&i.ElapsedSeconds,
 	)
 	return i, err
 }
@@ -1782,6 +1905,54 @@ func (q *Queries) ListTeamsWithActiveTrialSandboxes(ctx context.Context, arg Lis
 	return items, nil
 }
 
+const listTrialCreditWarningDeliveries = `-- name: ListTrialCreditWarningDeliveries :many
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = $1 AND sent_at IS NOT NULL
+`
+
+func (q *Queries) ListTrialCreditWarningDeliveries(ctx context.Context, teamID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listTrialCreditWarningDeliveries, teamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var recipient string
+		if err := rows.Scan(&recipient); err != nil {
+			return nil, err
+		}
+		items = append(items, recipient)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTrialCreditWarningRejections = `-- name: ListTrialCreditWarningRejections :many
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = $1 AND rejected_at IS NOT NULL
+`
+
+func (q *Queries) ListTrialCreditWarningRejections(ctx context.Context, teamID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listTrialCreditWarningRejections, teamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var recipient string
+		if err := rows.Scan(&recipient); err != nil {
+			return nil, err
+		}
+		items = append(items, recipient)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUnresolvedBillingPeriodAnomalies = `-- name: ListUnresolvedBillingPeriodAnomalies :many
 SELECT id, team_id, period_start, period_end, severity, kind, sandbox_id, details, detected_at, resolved_at, resolved_by
 FROM billing_period_anomaly
@@ -2086,6 +2257,23 @@ func (q *Queries) MarkTeamBillingPeriodExporting(ctx context.Context, arg MarkTe
 	return i, err
 }
 
+const markTrialCreditWarningUnknown = `-- name: MarkTrialCreditWarningUnknown :exec
+UPDATE trial_credit_warning_state SET status = 'unknown', updated_at = now()
+WHERE team_id = $1 AND status = 'claimed' AND claim_token = $2
+`
+
+type MarkTrialCreditWarningUnknownParams struct {
+	TeamID     uuid.UUID   `json:"team_id"`
+	ClaimToken pgtype.UUID `json:"claim_token"`
+}
+
+// An interrupted provider request may have been accepted. Do not reclaim it,
+// because retrying would violate the one-warning invariant.
+func (q *Queries) MarkTrialCreditWarningUnknown(ctx context.Context, arg MarkTrialCreditWarningUnknownParams) error {
+	_, err := q.db.Exec(ctx, markTrialCreditWarningUnknown, arg.TeamID, arg.ClaimToken)
+	return err
+}
+
 const recordTeamCreditLedgerEntry = `-- name: RecordTeamCreditLedgerEntry :one
 INSERT INTO team_credit_ledger (
     team_id,
@@ -2143,6 +2331,48 @@ func (q *Queries) RecordTeamCreditLedgerEntry(ctx context.Context, arg RecordTea
 	return i, err
 }
 
+const recordTrialCreditWarningDelivery = `-- name: RecordTrialCreditWarningDelivery :execrows
+INSERT INTO trial_credit_warning_delivery (team_id, recipient)
+SELECT s.team_id, $1::text FROM trial_credit_warning_state s
+WHERE s.team_id = $2 AND s.status = 'claimed' AND s.claim_token = $3
+ON CONFLICT (team_id, recipient) DO NOTHING
+`
+
+type RecordTrialCreditWarningDeliveryParams struct {
+	Recipient  string      `json:"recipient"`
+	TeamID     uuid.UUID   `json:"team_id"`
+	ClaimToken pgtype.UUID `json:"claim_token"`
+}
+
+func (q *Queries) RecordTrialCreditWarningDelivery(ctx context.Context, arg RecordTrialCreditWarningDeliveryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordTrialCreditWarningDelivery, arg.Recipient, arg.TeamID, arg.ClaimToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordTrialCreditWarningRejection = `-- name: RecordTrialCreditWarningRejection :execrows
+INSERT INTO trial_credit_warning_delivery (team_id, recipient, sent_at, rejected_at)
+SELECT s.team_id, $1::text, NULL, now() FROM trial_credit_warning_state s
+WHERE s.team_id = $2 AND s.status = 'claimed' AND s.claim_token = $3
+ON CONFLICT (team_id, recipient) DO NOTHING
+`
+
+type RecordTrialCreditWarningRejectionParams struct {
+	Recipient  string      `json:"recipient"`
+	TeamID     uuid.UUID   `json:"team_id"`
+	ClaimToken pgtype.UUID `json:"claim_token"`
+}
+
+func (q *Queries) RecordTrialCreditWarningRejection(ctx context.Context, arg RecordTrialCreditWarningRejectionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordTrialCreditWarningRejection, arg.Recipient, arg.TeamID, arg.ClaimToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const refreshTeamTrialEligibility = `-- name: RefreshTeamTrialEligibility :exec
 INSERT INTO team_trial_eligibility_cache (team_id, eligible, updated_at)
 SELECT $1, refresh_team_trial_eligibility($1), now()
@@ -2153,6 +2383,21 @@ SET eligible = EXCLUDED.eligible,
 
 func (q *Queries) RefreshTeamTrialEligibility(ctx context.Context, teamID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, refreshTeamTrialEligibility, teamID)
+	return err
+}
+
+const releaseTrialCreditWarning = `-- name: ReleaseTrialCreditWarning :exec
+UPDATE trial_credit_warning_state SET status = 'pending', claimed_at = NULL, updated_at = now()
+WHERE team_id = $1 AND status = 'claimed' AND claim_token = $2
+`
+
+type ReleaseTrialCreditWarningParams struct {
+	TeamID     uuid.UUID   `json:"team_id"`
+	ClaimToken pgtype.UUID `json:"claim_token"`
+}
+
+func (q *Queries) ReleaseTrialCreditWarning(ctx context.Context, arg ReleaseTrialCreditWarningParams) error {
+	_, err := q.db.Exec(ctx, releaseTrialCreditWarning, arg.TeamID, arg.ClaimToken)
 	return err
 }
 
