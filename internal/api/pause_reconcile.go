@@ -66,19 +66,13 @@ func (h *Handlers) StartPauseReconciler(ctx context.Context) {
 
 // ReconcilePendingPausesOnce lists abandoned pauses, at most a batch per tick,
 // and drives each toward a decided state; each worker claims its row at
-// dispatch time (see claimEach). Exported so tests can run a tick directly.
+// dispatch time (see claimBatch). Exported so tests can run a tick directly.
 func (h *Handlers) ReconcilePendingPausesOnce(ctx context.Context, logger zerolog.Logger) {
-	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	ids, err := h.DB.ListPendingPauses(qctx, db.ListPendingPausesParams{MinAgeSeconds: pauseReconcileMinAge, MaxRows: pauseReconcileBatch})
-	cancel()
-	if err != nil {
-		logger.Error().Err(err).Msg("pause reconcile: list failed")
-		return
-	}
-	if len(ids) == 0 {
-		return
-	}
-	claimEach(ctx, pauseReconcileWorkers, ids, func(ctx context.Context, id uuid.UUID) (db.ClaimPendingPauseRow, error) {
+	_, err := claimBatch(ctx, pauseReconcileWorkers, pauseReconcileBatch, func(ctx context.Context, limit int32) ([]uuid.UUID, error) {
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return h.DB.ListPendingPauses(qctx, db.ListPendingPausesParams{MinAgeSeconds: pauseReconcileMinAge, MaxRows: limit})
+	}, func(ctx context.Context, id uuid.UUID) (db.ClaimPendingPauseRow, error) {
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		row, err := h.DB.ClaimPendingPause(cctx, db.ClaimPendingPauseParams{ID: id, MinAgeSeconds: pauseReconcileMinAge, LeaseSeconds: pauseReconcileLease})
@@ -89,6 +83,9 @@ func (h *Handlers) ReconcilePendingPausesOnce(ctx context.Context, logger zerolo
 	}, func(row db.ClaimPendingPauseRow, claimedAt time.Time) {
 		h.reconcilePause(ctx, row, leaseDeadline(row.PauseOpLeaseUntil, claimedAt, pauseReconcileLease), logger)
 	})
+	if err != nil {
+		logger.Error().Err(err).Msg("pause reconcile: list failed")
+	}
 }
 
 // reconcilePause makes one attempt on a claimed row. leaseUntil is when the

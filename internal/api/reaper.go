@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -228,18 +229,11 @@ dispatch:
 }
 
 func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism int, logger zerolog.Logger) {
-	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	ids, err := h.DB.ListExpiredSandboxes(qctx, batchSize)
-	cancel()
-	if err != nil {
-		logger.Error().Err(err).Msg("reaper: ListExpiredSandboxes failed")
-		return
-	}
-	if len(ids) == 0 {
-		return
-	}
-	logger.Info().Int("count", len(ids)).Msg("reaper: pausing expired sandboxes")
-	claimEach(ctx, parallelism, ids, func(ctx context.Context, id uuid.UUID) (db.ClaimExpiredSandboxRow, error) {
+	claimed, err := claimBatch(ctx, parallelism, batchSize, func(ctx context.Context, limit int32) ([]uuid.UUID, error) {
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		return h.DB.ListExpiredSandboxes(qctx, limit)
+	}, func(ctx context.Context, id uuid.UUID) (db.ClaimExpiredSandboxRow, error) {
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		row, err := h.DB.ClaimExpiredSandbox(cctx, db.ClaimExpiredSandboxParams{ID: id, LeaseSeconds: pauseLeaseSeconds})
@@ -250,20 +244,56 @@ func (h *Handlers) reapOnce(ctx context.Context, batchSize int32, parallelism in
 	}, func(sbx db.ClaimExpiredSandboxRow, claimedAt time.Time) {
 		h.pauseExpired(ctx, sbx, claimedAt, logger)
 	})
+	if err != nil {
+		logger.Error().Err(err).Msg("reaper: ListExpiredSandboxes failed")
+	}
+	if claimed > 0 {
+		logger.Info().Int("count", claimed).Msg("reaper: paused expired sandboxes")
+	}
+}
+
+// claimRefillRounds bounds the listings of one claimBatch call: a candidate
+// whose claim keeps failing for a reason other than contention would
+// otherwise be listed again without end.
+const claimRefillRounds = 4
+
+// claimBatch lists and claims until batch rows are claimed or the list runs
+// dry, and reports how many were claimed. Every replica lists the same oldest
+// candidates, so a claim lost to another replica is replaced from the next
+// listing rather than costing this replica its share of the tick.
+func claimBatch[T any](ctx context.Context, workers int, batch int32, list func(ctx context.Context, limit int32) ([]uuid.UUID, error), claim func(ctx context.Context, id uuid.UUID) (T, error), process func(row T, claimedAt time.Time)) (int, error) {
+	claimed := 0
+	for round, remaining := 0, batch; round < claimRefillRounds && remaining > 0; round++ {
+		ids, err := list(ctx, remaining)
+		if err != nil {
+			return claimed, err
+		}
+		n := claimEach(ctx, workers, ids, claim, process)
+		claimed += n
+		if int32(len(ids)) < remaining {
+			break
+		}
+		remaining -= int32(n)
+	}
+	return claimed, nil
 }
 
 // claimEach hands candidate ids to at most workers goroutines; each claims
 // its candidate at dispatch time (re-checked under lock, leased only then), so
-// one scan feeds every worker and no leased row waits. An empty claim is skipped.
-func claimEach[T any](ctx context.Context, workers int, ids []uuid.UUID, claim func(ctx context.Context, id uuid.UUID) (T, error), process func(row T, claimedAt time.Time)) {
+// one scan feeds every worker and no leased row waits. An empty claim is
+// skipped; the count of claimed rows is returned.
+func claimEach[T any](ctx context.Context, workers int, ids []uuid.UUID, claim func(ctx context.Context, id uuid.UUID) (T, error), process func(row T, claimedAt time.Time)) int {
+	var claimed atomic.Int32
 	dispatchBounded(ctx, ids, workers, func(id uuid.UUID) {
 		claimedAt := time.Now()
 		row, err := claim(ctx, id)
 		if err != nil {
 			return
 		}
+		claimed.Add(1)
 		process(row, claimedAt)
 	})
+	return int(claimed.Load())
 }
 
 // sweepOrphanedSnapshotRows deletes snapshot rows for long-destroyed

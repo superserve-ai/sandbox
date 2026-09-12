@@ -429,6 +429,70 @@ func TestReaper_ScansOnceAndClaimsPerWorker(t *testing.T) {
 	}
 }
 
+// Replicas list the same oldest candidates; a claim lost to another replica
+// is replaced from the next listing rather than shrinking this replica's batch.
+func TestReaper_RefillsAfterLosingClaimsToAnotherReplica(t *testing.T) {
+	rows := make([]db.ClaimExpiredSandboxRow, 4)
+	for i := range rows {
+		rows[i] = expiredRow(fmt.Sprintf("sbx-%d", i))
+	}
+	var pauses int32
+	mock := &reaperMockDBTX{candidates: rows}
+	mock.queryFn = func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+		if !isListSQL(sql) {
+			return newIDRows(nil), nil
+		}
+		// The candidates not yet claimed, oldest first, up to the limit.
+		mock.mu.Lock()
+		defer mock.mu.Unlock()
+		if mock.taken == nil {
+			mock.taken = map[uuid.UUID]bool{}
+		}
+		var ids []uuid.UUID
+		for _, c := range rows {
+			if !mock.taken[c.ID] && len(ids) < int(args[0].(int32)) {
+				ids = append(ids, c.ID)
+			}
+		}
+		// Another replica claims the first listing's rows before this one can.
+		if mock.lists.Add(1) == 1 {
+			for _, id := range ids {
+				mock.taken[id] = true
+			}
+		}
+		return newIDRows(ids), nil
+	}
+	h := newReaperHandlers(mock, &stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+		atomic.AddInt32(&pauses, 1)
+		return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+	}})
+
+	h.reapOnce(context.Background(), 2, 2, zerolog.Nop())
+
+	if mock.lists.Load() != 2 || mock.claims.Load() != 4 || atomic.LoadInt32(&pauses) != 2 {
+		t.Fatalf("lists = %d, claims = %d, pauses = %d; want 2, 4, 2: the lost batch refilled from the next listing",
+			mock.lists.Load(), mock.claims.Load(), pauses)
+	}
+}
+
+// A candidate whose claim keeps failing for a reason other than contention is
+// listed again a bounded number of times, not forever.
+func TestClaimBatch_BoundsRefillRounds(t *testing.T) {
+	id := uuid.New()
+	lists := 0
+	claimed, err := claimBatch(context.Background(), 1, 1, func(context.Context, int32) ([]uuid.UUID, error) {
+		lists++
+		return []uuid.UUID{id}, nil
+	}, func(context.Context, uuid.UUID) (struct{}, error) {
+		return struct{}{}, pgx.ErrNoRows
+	}, func(struct{}, time.Time) {
+		t.Error("processed a row that was never claimed")
+	})
+	if err != nil || claimed != 0 || lists != claimRefillRounds {
+		t.Fatalf("claimed = %d, lists = %d, err = %v; want nothing claimed after %d listings", claimed, lists, err, claimRefillRounds)
+	}
+}
+
 // A worker that finishes claims the next candidate while another is still on
 // a slow pause; one slow host never idles the rest.
 func TestReaper_FreeWorkerStartsTheNextPause(t *testing.T) {
