@@ -23,6 +23,7 @@ const profileScope = `id IN (
 	UNION SELECT assigned_by FROM team_pricing_plan WHERE team_id = $1 AND assigned_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_grant WHERE team_id = $1 AND created_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_ledger WHERE team_id = $1 AND created_by IS NOT NULL
+	UNION SELECT created_by FROM qm.tenants WHERE team_id = $1 AND created_by IS NOT NULL
 )`
 
 // sandboxScope covers tables keyed by sandbox_id without a team_id column.

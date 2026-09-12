@@ -543,7 +543,7 @@ type QmTenant struct {
 }
 
 type QmTenantEvent struct {
-	ID       int64     `json:"id"`
+	ID       uuid.UUID `json:"id"`
 	TenantID uuid.UUID `json:"tenant_id"`
 	Step     string    `json:"step"`
 	Status   string    `json:"status"`

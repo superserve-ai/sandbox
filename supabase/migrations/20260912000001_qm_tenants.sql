@@ -103,7 +103,7 @@ CREATE TABLE IF NOT EXISTS qm.tenants (
 CREATE INDEX IF NOT EXISTS idx_qm_tenants_team ON qm.tenants(team_id);
 
 CREATE TABLE IF NOT EXISTS qm.tenant_events (
-    id        bigserial PRIMARY KEY,
+    id        uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id uuid NOT NULL REFERENCES qm.tenants(id) ON DELETE CASCADE,
     step      text NOT NULL,
     status    text NOT NULL,
