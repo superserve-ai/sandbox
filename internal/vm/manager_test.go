@@ -2051,7 +2051,7 @@ func TestVerifyBoxdReadyDetachedFromCaller(t *testing.T) {
 	defer func() { adoptionBoxdReady = orig }()
 
 	m := &Manager{log: zerolog.Nop()}
-	if err := m.verifyBoxdReady(callerCtx, "192.0.2.5"); err != nil {
+	if err := m.verifyBoxdReady(callerCtx, "192.0.2.5", &VMInstance{}); err != nil {
 		t.Fatalf("healthy gate must pass, got %v", err)
 	}
 	if gateCtxDone {
@@ -2371,7 +2371,7 @@ func TestVerifyBoxdReadyReachesVerdictUnderShorterCallerDeadline(t *testing.T) {
 	defer cancel()
 
 	m := &Manager{log: zerolog.Nop()}
-	err := m.verifyBoxdReady(callerCtx, "192.0.2.5")
+	err := m.verifyBoxdReady(callerCtx, "192.0.2.5", &VMInstance{})
 	if err == nil {
 		t.Fatal("a silent guest must produce a verdict, not be swallowed")
 	}

@@ -145,7 +145,7 @@ func TestRestoreWithClockFallback(t *testing.T) {
 
 		var sent []*bool
 		freeze := false
-		used, err := m.restoreWithClockFallback(&freeze, func(clock *bool) error {
+		used, err := m.restoreWithClockFallback(&freeze, nil, func(clock *bool) error {
 			sent = append(sent, clock)
 			if clock != nil {
 				return unknownField
@@ -178,7 +178,7 @@ func TestRestoreWithClockFallback(t *testing.T) {
 		boom := errors.New("load snapshot: connection refused")
 		calls := 0
 		freeze := false
-		used, err := m.restoreWithClockFallback(&freeze, func(*bool) error {
+		used, err := m.restoreWithClockFallback(&freeze, nil, func(*bool) error {
 			calls++
 			return boom
 		})
@@ -201,7 +201,7 @@ func TestRestoreWithClockFallback(t *testing.T) {
 		m := &Manager{log: zerolog.Nop()}
 		m.clockRealtimeCapable.Store(true)
 		calls := 0
-		_, err := m.restoreWithClockFallback(nil, func(*bool) error {
+		_, err := m.restoreWithClockFallback(nil, nil, func(*bool) error {
 			calls++
 			return unknownField
 		})
@@ -220,7 +220,7 @@ func TestRestoreWithClockFallbackReportsPolicyUsed(t *testing.T) {
 	m := &Manager{log: zerolog.Nop()}
 	m.clockRealtimeCapable.Store(true)
 	freeze := false
-	used, err := m.restoreWithClockFallback(&freeze, func(*bool) error { return nil })
+	used, err := m.restoreWithClockFallback(&freeze, nil, func(*bool) error { return nil })
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
@@ -691,4 +691,18 @@ func TestFreezeGuestForPause(t *testing.T) {
 			t.Errorf("deadline %v from now, want within (0, 300ms]", seen)
 		}
 	})
+}
+
+// A guest that could not correct its clock latches the host: every later
+// restore takes the unfrozen path until vmd restarts.
+func TestGuestClockUnreadyLatchesHostToLegacy(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{GuestClockFreezeEnabled: true}}
+	m.clockRealtimeCapable.Store(true)
+	if m.clockPolicyFor(true) == nil {
+		t.Fatal("precondition: policy should freeze before the latch")
+	}
+	m.noteGuestClockUnready(zerolog.Nop(), errors.New("no ptp"))
+	if m.clockPolicyFor(true) != nil {
+		t.Error("policy still freezes after the host was latched")
+	}
 }

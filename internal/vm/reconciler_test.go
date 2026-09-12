@@ -455,6 +455,45 @@ func TestUnverifiedOrphanGrace(t *testing.T) {
 	})
 }
 
+// A reconciler rule that proves an interrupted resume's process dead must
+// not delete its record: the paused image is intact, so the record returns
+// to Paused with its slot released, and the instance is dropped for a
+// reattach to reload.
+func TestMarkStaleReturnsAnInterruptedResumeToPaused(t *testing.T) {
+	st, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, WakeOwedFromPaused: true, WakeToken: "disk", FreezeToken: "rec", Supervision: SupervisionUnit, Namespace: "ns-1", IP: "10.0.0.2", MemFilePath: "/snap/mem.snap"}
+	if err := st.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	inst := toInstance(rec)
+	net := &fakeNetMgr{}
+	m := &Manager{log: zerolog.Nop(), state: st, netMgr: net, vms: map[string]*VMInstance{"vm-1": inst}}
+	r := NewReconciler(m, DefaultReconcilerConfig())
+	if err := r.markStale("vm-1"); err != nil {
+		t.Fatalf("markStale: %v", err)
+	}
+	got, _ := st.Get("vm-1")
+	if got == nil || got.Status != StatusPaused || got.WakePending || got.WakeOwedFromPaused || got.Unverified || got.WakeToken != "" {
+		t.Fatalf("record = %+v; want Paused with nothing owed", got)
+	}
+	if got.Namespace != "" || got.IP != "" || got.FreezeToken != "rec" || got.MemFilePath != "/snap/mem.snap" {
+		t.Errorf("record = %+v; want the slot released and the image and token kept", got)
+	}
+	m.mu.RLock()
+	_, tracked := m.vms["vm-1"]
+	m.mu.RUnlock()
+	if tracked {
+		t.Fatal("the stale instance must be dropped for a reattach to reload the Paused record")
+	}
+	if len(net.cleanupCalls) != 1 {
+		t.Fatalf("cleanup calls = %d, want the slot released once", len(net.cleanupCalls))
+	}
+}
+
 // markStale's delete is the gate for the whole cleanup: the map entry and the
 // network slot only go once the record is durably gone. Callers that stop the
 // unit first retire the condition their rule matches on, so a swallowed

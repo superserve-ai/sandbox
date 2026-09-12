@@ -1537,7 +1537,9 @@ func (r *Reconciler) markStale(vmID string) error {
 	// didn't run (e.g. a vmd timeout mid-DELETE) would otherwise leak its slot.
 	var namespace string
 	var supervision Supervision
-	if rec, err := r.mgr.state.Get(vmID); err == nil && rec != nil {
+	var rec *VMRecord
+	if got, err := r.mgr.state.Get(vmID); err == nil && got != nil {
+		rec = got
 		namespace = rec.Namespace
 		supervision = rec.Supervision
 	}
@@ -1561,7 +1563,19 @@ func (r *Reconciler) markStale(vmID string) error {
 	// Delete from BoltDB first. Deleting from the map before BoltDB would
 	// cause ReattachAll to resurrect the stale record on next restart, so a
 	// failure here abandons the whole cleanup rather than half-applying it.
-	if err := r.mgr.state.Delete(vmID); err != nil {
+	// A resume that never ran its guest is not deleted: its paused image is
+	// intact, so the record returns to Paused, its slot released with the
+	// rest.
+	if rec != nil && interruptedResume(*rec) {
+		paused := *rec
+		paused.returnToPaused()
+		paused.Namespace, paused.IP, paused.TAPDevice, paused.MACAddress = "", "", "", ""
+		if _, err := r.mgr.state.PutIfPresent(paused); err != nil {
+			r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: interrupted resume's record could not be returned to Paused")
+			return err
+		}
+		r.mgr.log.Warn().Str("vm_id", vmID).Msg("reconciler: resume interrupted before its guest ran — record returns to Paused")
+	} else if err := r.mgr.state.Delete(vmID); err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state")
 		return err
 	}

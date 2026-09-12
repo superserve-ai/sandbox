@@ -166,7 +166,7 @@ func resumeWallClockProperty(memPath, pausedMemPath string, recordedCorrects, re
 // It never returns true: advancing the guest clock by elapsed wall time is the
 // behaviour being fixed, so nothing here should be able to ask for it.
 func (m *Manager) clockPolicyFor(workloadFrozen bool) *bool {
-	if !m.cfg.GuestClockFreezeEnabled || !workloadFrozen || !m.clockRealtimeCapable.Load() {
+	if !m.cfg.GuestClockFreezeEnabled || !workloadFrozen || !m.clockRealtimeCapable.Load() || m.guestClockUnready.Load() {
 		return nil
 	}
 	freeze := false
@@ -186,11 +186,19 @@ func (m *Manager) clockPolicyFor(workloadFrozen bool) *bool {
 // Reports whether the restore that succeeded actually carried the policy, so a
 // caller logging the outcome describes what happened rather than what was asked
 // for — after a fallback those differ.
-func (m *Manager) restoreWithClockFallback(policy *bool, restore func(clockRealtime *bool) error) (usedPolicy bool, err error) {
+// beforeLegacy, if set, runs before the legacy restore, which is skipped if it
+// fails. The restore path makes the changed policy durable there, so a crash
+// after the legacy load cannot recover the guest as clock-frozen.
+func (m *Manager) restoreWithClockFallback(policy *bool, beforeLegacy func() error, restore func(clockRealtime *bool) error) (usedPolicy bool, err error) {
 	// A refusal seen by any earlier attempt — including this restore's own
 	// session fallback, which re-enters here — already settled the answer;
 	// spend no request rediscovering it.
 	if policy != nil && !m.clockRealtimeCapable.Load() {
+		if beforeLegacy != nil {
+			if err := beforeLegacy(); err != nil {
+				return false, err
+			}
+		}
 		policy = nil
 	}
 	err = restore(policy)
@@ -199,6 +207,11 @@ func (m *Manager) restoreWithClockFallback(policy *bool, restore func(clockRealt
 	}
 	if m.clockRealtimeCapable.CompareAndSwap(true, false) {
 		m.log.Warn().Msg("firecracker rejected the clock option; falling back to legacy clock behaviour for every restore")
+	}
+	if beforeLegacy != nil {
+		if err := beforeLegacy(); err != nil {
+			return false, err
+		}
 	}
 	return false, restore(nil)
 }
