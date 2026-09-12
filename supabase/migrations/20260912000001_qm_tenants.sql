@@ -98,17 +98,22 @@ EXCEPTION WHEN duplicate_object THEN
 END
 $$;
 
+-- Tenants are retired by status, never hard-deleted by the service, and the
+-- event log is append-only; the grants say so rather than trusting the code.
 GRANT USAGE ON SCHEMA qm TO qm_api;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA qm TO qm_api;
+GRANT SELECT, INSERT, UPDATE ON qm.tenants TO qm_api;
+GRANT SELECT, INSERT ON qm.tenant_events TO qm_api;
+GRANT SELECT, INSERT, UPDATE, DELETE ON qm.tenant_secrets TO qm_api;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA qm TO qm_api;
-ALTER DEFAULT PRIVILEGES IN SCHEMA qm GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO qm_api;
 ALTER DEFAULT PRIVILEGES IN SCHEMA qm GRANT USAGE, SELECT ON SEQUENCES TO qm_api;
 
 -- The only public surface qm-api gets: enough to resolve a team, who is on
 -- it, and the sandbox API key a tenant was issued. Nothing else in public
 -- is granted, so e.g. SELECT on public.sandbox is a permission error.
 GRANT USAGE ON SCHEMA public TO qm_api;
-GRANT SELECT ON public.team, public.team_memberships, public.api_key TO qm_api;
+GRANT SELECT (id, name, created_at) ON public.team TO qm_api;
+GRANT SELECT (id, team_id, user_id, status) ON public.team_memberships TO qm_api;
+GRANT SELECT (id, team_id, name, expires_at, revoked_at, created_at) ON public.api_key TO qm_api;
 
 -- Team scoping. qm_api has no BYPASSRLS (unlike the control plane's service
 -- role), so it sees rows only for the team it has declared for the current
