@@ -3615,9 +3615,15 @@ func TestPauseSandbox_VMDError(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	// The host gave no answer, so the row stays 'pausing' for the reconciler
+	// and the caller is told so rather than "failed".
+	if w.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusAccepted, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"pausing"`) {
+		t.Errorf("body = %s, want status pausing", w.Body.String())
 	}
 }
 

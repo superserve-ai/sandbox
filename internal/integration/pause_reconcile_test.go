@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -132,8 +133,8 @@ func TestIntegration_PauseHandler_UndecidedHostLeavesPausing(t *testing.T) {
 	r := api.SetupRouter(t.Context(), h, testPool)
 	id := createActive(t, r, apiKey, "pause-undecided")
 
-	if pw := do(r, "POST", "/sandboxes/"+id.String()+"/pause", apiKey, ""); pw.Code != http.StatusInternalServerError {
-		t.Fatalf("pause: %d %s, want the request's own error", pw.Code, pw.Body.String())
+	if pw := do(r, "POST", "/sandboxes/"+id.String()+"/pause", apiKey, ""); pw.Code != http.StatusAccepted || !strings.Contains(pw.Body.String(), `"pausing"`) {
+		t.Fatalf("pause: %d %s, want accepted as pausing", pw.Code, pw.Body.String())
 	}
 	h.WaitAsyncBookkeeping()
 

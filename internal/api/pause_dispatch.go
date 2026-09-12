@@ -57,18 +57,21 @@ type pauseOutcome int
 const (
 	pauseDone       pauseOutcome = iota // snapshot taken; bookkeeping in flight
 	pauseGone                           // host has no such VM; row marked failed
-	pauseUndecided                      // no answer; row left 'pausing' for the reconciler
-	pauseUnresolved                     // host unknown; nothing dispatched, row reverted
+	pauseUndecided                      // row still 'pausing'; the reconciler finishes it
+	pauseUnresolved                     // host unknown; nothing dispatched, row back to 'active'
 )
 
-// respondPause answers a dispatch the caller waited for. An undecided one is
-// still 'pausing' and being reconciled; the caller keeps today's error.
+// respondPause answers a dispatch the caller waited for. Only a row known to
+// be 'active' again is reported as failed; one still 'pausing' is accepted,
+// since the reconciler will pause it.
 func respondPause(c *gin.Context, o pauseOutcome) {
 	switch o {
 	case pauseDone:
 		c.Status(http.StatusNoContent)
 	case pauseGone:
 		respondError(c, ErrSandboxGone)
+	case pauseUndecided:
+		acceptPausing(c)
 	default:
 		respondError(c, ErrInternal)
 	}
@@ -84,13 +87,16 @@ func acceptPausing(c *gin.Context) {
 func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, leaseUntil time.Time, actorID *uuid.UUID, l zerolog.Logger) pauseOutcome {
 	sandboxID, teamID := sandbox.ID, sandbox.TeamID
 	lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
-	// BeginPause already claimed 'pausing', so a host lookup failure must
-	// revert or the row is stuck. This is the only revert after BeginPause:
-	// nothing was dispatched, so the VM is known to be running.
+	// BeginPause already claimed 'pausing', so a host lookup failure reverts:
+	// nothing was dispatched, so the VM is known to be running. This is the
+	// only revert after BeginPause. If it cannot be written the claim stands
+	// and the reconciler pauses the VM, so the answer is 'pausing'.
 	vmd, err := h.vmdForHost(ctx, sandbox.HostID)
 	if err != nil {
 		l.Error().Err(err).Msg("resolve VMD for pause failed")
-		h.revertPause(ctx, sandboxID, teamID, lease, actorID, l)
+		if !h.revertPause(ctx, sandboxID, teamID, lease, actorID, l) {
+			return pauseUndecided
+		}
 		return pauseUnresolved
 	}
 	// The pause's identity rides the RPC into the host's backup pipeline and

@@ -1159,9 +1159,10 @@ paths:
         and transitions to `paused`. Resume it later to continue exactly where
         it left off — same memory, same running processes, same files.
 
-        The request holds until the pause is decided. Send
-        `Prefer: respond-async` to get `202 Accepted` as soon as the pause is
-        recorded instead; it continues in the background, and
+        The request holds until the pause is decided; if the host has not
+        answered by then, the response is `202 Accepted` and the pause
+        continues in the background. Send `Prefer: respond-async` to get
+        `202` as soon as the pause is recorded instead. Either way
         `GET /sandboxes/{sandbox_id}` reports `paused` once it lands (or
         `failed` if the VM turned out to be gone).
       security:
@@ -1181,7 +1182,9 @@ paths:
         "202":
           description: >
             Pause recorded and in progress; poll the sandbox until it is
-            `paused`. Only with `Prefer: respond-async`.
+            `paused`. Immediate with `Prefer: respond-async`, otherwise
+            returned when the pause is still in progress after the request's
+            wait.
           headers:
             Retry-After:
               schema:

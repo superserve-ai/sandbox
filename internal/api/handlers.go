@@ -323,12 +323,12 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 }
 
 // revertPause undoes BeginPause's claim when nothing was dispatched, in one
-// fenced statement, retried briefly: it runs on the failure path only, and the
-// row must be back to 'active' before the caller hears "failed". If it still
-// cannot be written, the operation stands and the reconciler completes the
-// pause, which is what the already-closed billing interval reflects. Detached
-// from request cancellation.
-func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UUID, lease pauseLease, actorID *uuid.UUID, l zerolog.Logger) {
+// fenced statement, retried briefly, and reports whether the write landed. A
+// false return means the operation stands and the reconciler completes the
+// pause, which is what the already-closed billing interval reflects; the
+// caller must then hear "pausing", not "failed". Detached from request
+// cancellation.
+func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UUID, lease pauseLease, actorID *uuid.UUID, l zerolog.Logger) bool {
 	bg := context.WithoutCancel(reqCtx)
 	backoff := 200 * time.Millisecond
 	for attempt := 1; ; attempt++ {
@@ -347,11 +347,11 @@ func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UU
 				// of 'pausing' first; its state wins over the revert.
 				l.Warn().Msg("pause revert skipped: sandbox no longer pausing")
 			}
-			return
+			return true
 		}
 		if attempt >= 3 {
 			l.Error().Err(err).Msg("pause revert failed; the row stays 'pausing' and the reconciler will complete the pause")
-			return
+			return false
 		}
 		l.Warn().Err(err).Int("attempt", attempt).Msg("pause revert failed; retrying")
 		time.Sleep(backoff)

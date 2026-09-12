@@ -161,9 +161,48 @@ func TestRevertPause_RetriesATransientFailure(t *testing.T) {
 	}
 	h := &Handlers{DB: db.New(mock)}
 
-	h.revertPause(context.Background(), sandboxID, teamID, lease, nil, zerolog.Nop())
+	if !h.revertPause(context.Background(), sandboxID, teamID, lease, nil, zerolog.Nop()) {
+		t.Fatal("revert reported as not landed after a successful retry")
+	}
 
 	if attempts != 2 {
 		t.Fatalf("revert attempts = %d, want a retry after the transient failure", attempts)
+	}
+}
+
+// When the revert cannot be written at all the claim stands and the
+// reconciler will pause the VM, so the caller hears 'pausing', not "failed".
+func TestPauseSandbox_UnresolvedHostWithUnwritableRevertAnswersPausing(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-1", Name: "sb", Status: db.SandboxStatusActive,
+		PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1}
+	attempts := 0
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: RevertPauseToActive :one"):
+				attempts++
+				return errorRow(errors.New("connection reset"))
+			case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+	}
+	h := &Handlers{DB: db.New(mock), Hosts: &stubHosts{resolve: func() (vmdclient.Client, error) {
+		return nil, errors.New("host not registered")
+	}}}
+
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusAccepted, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"pausing"`) {
+		t.Fatalf("body = %s, want status pausing", w.Body.String())
+	}
+	if attempts != 3 {
+		t.Fatalf("revert attempts = %d, want 3 before giving up", attempts)
 	}
 }
