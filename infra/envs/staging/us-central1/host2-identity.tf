@@ -21,16 +21,17 @@ resource "google_storage_bucket_iam_member" "vmd_backup" {
 }
 
 module "peer_identity" {
-  source        = "../../../modules/peer-identity"
-  project_id    = local.project_id
-  region        = local.region
-  cell          = "staging-usc1"
-  instance_name = module.sandbox_host_b.instance_name
-  instance_id   = module.sandbox_host_b.instance_id
-  internal_ip   = module.sandbox_host_b.internal_ip
-  zone          = local.zone
-  host_id       = "superserve-vmd-staging-2"
-  runtime_email = google_service_account.vmd_runtime.email
+  identity_at_creation = true
+  source               = "../../../modules/peer-identity"
+  project_id           = local.project_id
+  region               = local.region
+  cell                 = "staging-usc1"
+  instance_name        = module.sandbox_host_b.instance_name
+  instance_id          = module.sandbox_host_b.instance_id
+  internal_ip          = module.sandbox_host_b.internal_ip
+  zone                 = local.zone
+  host_id              = "superserve-vmd-staging-2"
+  runtime_email        = google_service_account.vmd_runtime.email
 }
 
 output "host2_peer_bootstrap" {

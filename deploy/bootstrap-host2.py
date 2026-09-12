@@ -43,7 +43,9 @@ def wait_for_managed_credentials(ssh, timeout=300):
     wait_for_guest_check(ssh, MANAGED_CREDENTIALS_CHECK, 'managed workload credentials', timeout)
 
 
-def bootstrap(config, verify_only=False):
+def bootstrap(config, verify_only=False, legacy_activation=False):
+    if legacy_activation and (verify_only or config.get('identity_at_creation', False)):
+        raise ValueError('legacy activation is not allowed for creation-time identity or verification')
     targets = {'superserve-vmd-staging-2': 'superserve-vmd-staging-2', 'superserve-vmd-usw2-2': 'usw2-2'}
     if targets.get(config['instance_name']) != config['host_id']:
         raise ValueError('bootstrap is restricted to the existing cold-standby Host 2 identities')
@@ -224,7 +226,7 @@ else
 fi
 sudo systemctl start vmd-peer-credentials.timer
 ''')
-    if not credentials_were_active and not managed_credentials_available() and not started_from_stopped:
+    if legacy_activation and not credentials_were_active and not managed_credentials_available() and not started_from_stopped:
         # Identity fields can be correct while certificate issuance is inactive.
         # Only this explicit cold-standby procedure may do a full stop/start.
         instance = describe()
@@ -252,6 +254,7 @@ sudo systemctl daemon-reload
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--verify', action='store_true', help='read-only local checks; complete the runbook evidence before admission')
+    parser.add_argument('--legacy-activate', action='store_true', help='explicit recovery for legacy retrofitted standbys only; never used for creation-time identity')
     parser.add_argument('configuration', type=Path, help='terraform output -json host2_peer_bootstrap')
     args = parser.parse_args()
-    bootstrap(json.loads(args.configuration.read_text()), args.verify)
+    bootstrap(json.loads(args.configuration.read_text()), args.verify, args.legacy_activate)

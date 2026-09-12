@@ -268,11 +268,12 @@ class BootstrapActivationTest(unittest.TestCase):
 
     def exercise(self, active=False, initially_stopped=False, fail_publication=False,
                  admission_at=None, stop_fails=False, transient_active=False, start_error=None,
-                 failed_start_status="TERMINATED"):
+                 failed_start_status="TERMINATED", legacy_activation=True, identity_at_creation=False):
         config = {'instance_name': 'superserve-vmd-staging-2', 'host_id': 'superserve-vmd-staging-2',
                   'project_id': 'example-project', 'zone': 'us-central1-a', 'instance_id': '1234567890',
                   'spiffe_uri': 'spiffe://example.test/peer', 'internal_ip': '192.0.2.3',
                   'runtime_email': 'vmd@example-project.iam.gserviceaccount.com'}
+        config['identity_at_creation'] = identity_at_creation
         commands, scripts = [], []
         status = 'TERMINATED' if initially_stopped else 'RUNNING'
         describes = 0
@@ -323,8 +324,8 @@ class BootstrapActivationTest(unittest.TestCase):
         with patch.object(BOOTSTRAP.subprocess, 'run', side_effect=run), \
              patch.object(BOOTSTRAP.time, 'sleep'), patch('sys.stdout', output):
             try:
-                BOOTSTRAP.bootstrap(config)
-            except (ValueError, subprocess.CalledProcessError) as exc:
+                BOOTSTRAP.bootstrap(config, legacy_activation=legacy_activation)
+            except (ValueError, TimeoutError, subprocess.CalledProcessError) as exc:
                 error = exc
         for script in scripts:
             subprocess.run(['bash', '-n'], input=script, check=True, text=True, capture_output=True)
@@ -360,6 +361,20 @@ class BootstrapActivationTest(unittest.TestCase):
         self.assertIsInstance(error, subprocess.CalledProcessError)
         self.assertNotIn('Host 2 is safely stopped', stderr.getvalue())
         self.assertIn('could not be confirmed safely stopped', stderr.getvalue())
+
+    def test_creation_time_bootstrap_waits_without_power_cycling_and_fails_closed(self):
+        with patch.object(BOOTSTRAP, 'wait_for_managed_credentials', side_effect=TimeoutError('managed credentials absent')) as wait:
+            commands, scripts, output, error = self.exercise(legacy_activation=False, identity_at_creation=True)
+        self.assertIsInstance(error, TimeoutError)
+        wait.assert_called_once()
+        self.assertFalse(any(c[1:4] in (['compute', 'instances', 'stop'], ['compute', 'instances', 'start']) for c in commands))
+        self.assertFalse(any('start vmd-peer-credentials.service' in script for script in scripts))
+        self.assertNotIn('Host 2 peer bootstrap installed', output)
+
+    def test_creation_time_artifact_rejects_legacy_activation(self):
+        commands, _, _, error = self.exercise(identity_at_creation=True)
+        self.assertIsInstance(error, ValueError)
+        self.assertEqual(commands, [])
 
     def test_missing_credentials_require_full_stop_start_then_publication(self):
         commands, scripts, output, error = self.exercise()

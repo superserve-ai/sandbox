@@ -77,7 +77,7 @@ resource "google_privateca_certificate_authority" "peer" {
 locals {
   pool_id = "vmd-peer-${var.cell}"
   subject = "${local.pool_id}.global.${data.google_project.this.number}.workload.id.goog/ns/vmd/sa/vmd-peer-proxy"
-  configuration = {
+  trust_configuration = {
     project_id     = var.project_id
     project_number = data.google_project.this.number
     region         = var.region
@@ -86,13 +86,31 @@ locals {
     namespace      = "vmd"
     identity       = "vmd-peer-proxy"
     spiffe_uri     = "spiffe://${local.subject}"
-    instance_name  = var.instance_name
-    instance_id    = var.instance_id
-    zone           = var.zone
-    internal_ip    = var.internal_ip
-    host_id        = var.host_id
-    runtime_email  = var.runtime_email
   }
+  configuration = merge(local.trust_configuration, {
+    identity_at_creation = var.identity_at_creation
+    instance_name        = var.instance_name
+    instance_id          = var.instance_id
+    zone                 = var.zone
+    internal_ip          = var.internal_ip
+    host_id              = var.host_id
+    runtime_email        = var.runtime_email
+  })
+}
+
+resource "terraform_data" "trust_domain" {
+  count            = var.identity_at_creation ? 1 : 0
+  triggers_replace = [local.trust_configuration, filesha256("${path.module}/configure.py")]
+  provisioner "local-exec" {
+    command     = "python3 \"${path.module}/configure.py\""
+    environment = { PEER_IDENTITY_CONFIG = jsonencode(merge(local.trust_configuration, { phase = "trust" })) }
+  }
+  depends_on = [google_privateca_certificate_authority.peer]
+}
+
+output "creation_identity" {
+  value      = local.subject
+  depends_on = [terraform_data.trust_domain]
 }
 
 # Stable Google 6.x lacks the trust-domain and Compute identity fields. Keep
@@ -101,7 +119,7 @@ resource "terraform_data" "managed_identity" {
   triggers_replace = [local.configuration, filesha256("${path.module}/configure.py")]
   provisioner "local-exec" {
     command     = "python3 \"${path.module}/configure.py\""
-    environment = { PEER_IDENTITY_CONFIG = jsonencode(local.configuration) }
+    environment = { PEER_IDENTITY_CONFIG = jsonencode(merge(local.configuration, { phase = var.identity_at_creation ? "attestation" : "all" })) }
   }
   depends_on = [google_privateca_certificate_authority.peer]
 }

@@ -3,7 +3,49 @@
 Run staging first. The migration targets are `superserve-vmd-staging-2`
 (`10.0.0.3`, `n2-standard-32`) and then `superserve-vmd-usw2-2`
 (`10.1.0.3`, the existing production Z3 configuration). No serving Host 1
-operation is part of this procedure. Do not allocate another VM or IP.
+operation is part of this procedure. Retain the existing private IP.
+
+## Staging creation-time identity replacement
+
+Staging Host 2 must be recreated with managed workload identity in the actual
+Compute create request. The retrofit exposed Enabled in the control plane but
+never issued certificates, even after full stop/start. The isolated
+`staging-mwi-host` module uses Google Beta 8.2.0 for these fields; ordinary hosts
+keep their existing module/provider and destroy protection.
+
+Review and save the staging plan explicitly:
+
+```sh
+terraform -chdir=infra/envs/staging/us-central1 plan -out=host2-replacement.tfplan -replace=module.sandbox_host_b.google_compute_instance.this
+terraform -chdir=infra/envs/staging/us-central1 show -json host2-replacement.tfplan | python3 scripts/check_host2_replacement_plan.py
+```
+
+Do not apply until the replacement diff and every other plan action have been
+reviewed. This replacement is restricted to the staging standby, never serving
+Host 1. `google_compute_disk.sandbox_data_b` must remain a no-op: preserve the
+existing 500 GB disk and its contents. Terraform forgets the old standalone
+attachment record with `destroy=false` and the replacement VM reattaches that
+same disk in its create request. This avoids attempting to delete an attachment
+whose old state has `deletion_policy=PREVENT`; the data disk's independent
+`prevent_destroy` remains enabled. Only the old 200 GB boot disk
+is disposable. The replacement's mount script refuses to format the data disk.
+The existing reservation must cover the same machine type and zone during the
+replacement; do not recreate the VM manually to bypass a capacity failure.
+
+Trust-domain, namespace, managed identity and CA permissions are reconciled
+before VM creation. The create request enables the identity and certificates.
+Attestation then binds the new numeric instance ID. The creation-time path
+never retrofits identity with a post-create update. `[MWLID] enabled=true` is
+installed through cloud-init, and the host keeps its dedicated runtime account,
+standby component and provisioning status. No step admits it.
+
+After applying the reviewed plan, export a fresh `host2_peer_bootstrap` artifact
+and run normal bootstrap. It waits for first-boot managed credentials and
+publishes a validated generation; missing credentials fail after five minutes.
+It does not power-cycle a running VM by default. `--legacy-activate` is a separate
+explicit recovery option for legacy retrofit artifacts and is rejected for
+`identity_at_creation=true`. It is not a remedy for this staging replacement.
+
 
 ## Plan and migrate
 
@@ -43,7 +85,7 @@ bootstrap fails closed on subsequent deployments.
    Host 1 must have no action. Existing VM, disk and private IP resource
    addresses remain unchanged. `prevent_destroy` and ordinary hosts' default
    stop protection remain enabled. Any proposed VM replacement is a stop
-   condition: this implementation uses supported in-place updates.
+   condition for the legacy production procedure; staging uses the explicit replacement plan above.
    In the applicable root, run `terraform plan -out=host2-migration.tfplan`
    and review that saved plan with `terraform show host2-migration.tfplan`.
    For production, first require the completed staging rehearsal evidence.
@@ -72,9 +114,9 @@ bootstrap fails closed on subsequent deployments.
    guest certificate provisioning with `[MWLID] enabled=true` in
    `/etc/default/instance_configs.cfg`. It starts the cold standby if Terraform
    left it stopped. If managed credentials are absent on a running standby,
-   this explicit procedure performs a full Compute stop/start: updating the
-   identity fields or restarting the guest agent alone does not activate
-   workload certificates on an existing VM. Before each power operation it
+   normal bootstrap waits and fails closed if credentials never appear. Only
+   the explicit `--legacy-activate` recovery mode attempts Compute stop/start
+   for legacy retrofit artifacts; it is not used for the staging replacement. Before each power operation it
    rechecks the immutable instance identity, runtime account, managed identity,
    exact standby label and exclusion from `sandbox_status=ready`. Keep directory
    placement disabled and do not run admission concurrently with bootstrap.

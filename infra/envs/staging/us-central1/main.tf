@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.7.0"
 
   backend "gcs" {
     bucket = "superserve-terraform-state"
@@ -7,11 +7,20 @@ terraform {
   }
 
   required_providers {
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "= 8.2.0"
+    }
     google = {
       source  = "hashicorp/google"
       version = "~> 7.0"
     }
   }
+}
+
+provider "google-beta" {
+  project = local.project_id
+  region  = local.region
 }
 
 provider "google" {
@@ -389,7 +398,9 @@ module "sandbox_host" {
 # until an operator activates it, so creating it changes nothing for the cell
 # until that deliberate step.
 module "sandbox_host_b" {
-  source = "../../../modules/sandbox-host"
+  source                    = "../../../modules/staging-mwi-host"
+  managed_workload_identity = module.peer_identity.creation_identity
+  sandbox_data_disk         = google_compute_disk.sandbox_data_b.id
 
   project_id    = local.project_id
   environment   = local.environment
@@ -403,8 +414,9 @@ module "sandbox_host_b" {
   tags        = ["superserve-vmd"]
 
   labels = merge(local.sandbox_host_labels, {
-    component    = "vmd-staging-standby"
-    sandbox_role = "vmd"
+    component      = "vmd-staging-standby"
+    sandbox_role   = "vmd"
+    sandbox_status = "provisioning"
   })
 
   service_account_email     = google_service_account.vmd_runtime.email
@@ -427,6 +439,18 @@ module "sandbox_host_b" {
       #cloud-config
       bootcmd:
         - |
+          python3 - <<'PYCONFIG'
+          import configparser
+          from pathlib import Path
+          path = Path('/etc/default/instance_configs.cfg')
+          config = configparser.ConfigParser(interpolation=None)
+          config.read(path)
+          if not config.has_section('MWLID'):
+              config.add_section('MWLID')
+          config.set('MWLID', 'enabled', 'true')
+          with path.open('w') as out:
+              config.write(out)
+          PYCONFIG
           NAME=$(curl -sf -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/name) || exit 0
           for f in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
             [ -f "$f" ] || continue
@@ -477,18 +501,18 @@ module "sandbox_host_b" {
       done
 
       # Background-data disk: backup journal and upload staging. The disk is
-      # attached by a separate resource and can appear after this script
-      # runs, so the mount is a device-bound unit rather than a one-shot
-      # wait: it fires when the disk shows up, whenever that is, and again
-      # on every boot. Formats only a blank disk; mounts otherwise.
+      # reattached in the VM create request. The device-bound mount unit
+      # tolerates delayed device discovery and runs again
+      # on every boot. This is a preserved disk: never format it.
       DEV=/dev/disk/by-id/google-superserve-sandbox-data
       DEVUNIT=$(systemd-escape -p --suffix=device "$DEV")
       cat > /usr/local/bin/sandbox-data-mount <<'SH'
       #!/bin/bash
       set -euo pipefail
       DEV=/dev/disk/by-id/google-superserve-sandbox-data
-      if [ -z "$(blkid -s TYPE -o value "$DEV" 2>/dev/null)" ]; then
-        mkfs.xfs -m crc=1,reflink=1 "$DEV"
+      if [ "$(blkid -s TYPE -o value "$DEV")" != xfs ]; then
+        echo 'preserved sandbox-data disk must contain XFS; refusing to format' >&2
+        exit 1
       fi
       mkdir -p /mnt/sandbox-data
       mountpoint -q /mnt/sandbox-data || mount -t xfs -o noatime,discard "$DEV" /mnt/sandbox-data
@@ -559,15 +583,13 @@ resource "google_compute_disk" "sandbox_data_b" {
   }
 }
 
-resource "google_compute_attached_disk" "sandbox_data_b" {
-  project     = local.project_id
-  zone        = local.zone
-  disk        = google_compute_disk.sandbox_data_b.id
-  instance    = module.sandbox_host_b.instance_self_link
-  device_name = "superserve-sandbox-data"
-  mode        = "READ_WRITE"
-
-  deletion_policy = "PREVENT"
+# Transfer attachment ownership to the replacement's create request. Forgetting
+# this record avoids its existing PREVENT policy; it does not detach/delete data.
+removed {
+  from = google_compute_attached_disk.sandbox_data_b
+  lifecycle {
+    destroy = false
+  }
 }
 
 module "observability" {
