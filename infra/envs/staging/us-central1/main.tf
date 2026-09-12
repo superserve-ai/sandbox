@@ -25,6 +25,15 @@ locals {
   region          = var.region
   zone            = var.zone
   resource_suffix = coalesce(var.resource_suffix, var.environment)
+  # Used by the qm module only; the existing staging accounts predate the
+  # suffix convention and keep their imported names.
+  service_account_suffix = coalesce(var.service_account_suffix, local.resource_suffix)
+
+  # deploy-qm-api.yml pushes the qm-api image (service and provisioner job
+  # share it) to the existing superserve repository; the placeholder tags
+  # below are overridden by qm_*_image in terraform.tfvars before the first
+  # apply. Tenant images live in the qm-<suffix> repository the module creates.
+  qm_image_prefix = "${local.region}-docker.pkg.dev/${local.project_id}/superserve"
 
   common_labels = {
     environment = local.environment
@@ -670,5 +679,54 @@ module "backup_storage" {
 
   labels = merge(local.common_labels, {
     component = "backup"
+  })
+}
+
+# Hosted QM shared infrastructure (Cloud SQL, wildcard edge, provisioner and
+# qm-api identities and workloads). Off by default so the standing staging
+# plan is unchanged; enable_qm plus the qm_* values in terraform.tfvars turn
+# it on. The provisioner creates per-tenant resources at runtime; nothing
+# tenant-specific is declared here.
+module "qm" {
+  source = "../../../modules/qm"
+  count  = var.enable_qm ? 1 : 0
+
+  project_id             = local.project_id
+  environment            = local.environment
+  region                 = local.region
+  resource_suffix        = local.resource_suffix
+  service_account_suffix = local.service_account_suffix
+
+  domain        = var.qm_domain
+  marketing_url = var.qm_marketing_url
+
+  # Matches deploy/environments.yaml and the deploy workflow's QM_API_SERVICE
+  # variable; staging's existing services carry no suffix either.
+  api_service_name = "superserve-qm-api"
+
+  # Cloud SQL private IP peers with the staging VPC; qm-api and the
+  # provisioner reach it over Direct VPC egress on the primary subnet (the
+  # staging Cloud Run connector is ip_cidr_range mode and has no subnet of
+  # its own). Tagged so firewall rules can select this traffic separately
+  # from the connector's 10.8.0.0/28 range.
+  network_self_link = module.network.network_self_link
+  vpc_network       = module.network.network_name
+  vpc_subnetwork    = module.network.subnetwork_name
+  vpc_tags          = ["qm-cr"]
+
+  create_private_service_connection = var.qm_create_private_service_connection
+
+  sql_tier          = var.qm_sql_tier
+  api_min_instances = var.qm_api_min_instances
+
+  api_image         = coalesce(var.qm_api_image, "${local.qm_image_prefix}/qm-api:replace-me")
+  provisioner_image = var.qm_provisioner_image
+  redirect_image    = coalesce(var.qm_redirect_image, "${local.qm_image_prefix}/qm-redirect:replace-me")
+  tenant_image      = var.qm_tenant_image
+
+  dns_managed_zone = var.qm_dns_managed_zone
+
+  labels = merge(local.common_labels, {
+    component = "qm"
   })
 }

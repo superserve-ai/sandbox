@@ -26,3 +26,13 @@ output "supabase" {
     database_url_secret_name = coalesce(var.database_url_secret_name, "database-url-${coalesce(var.resource_suffix, var.environment)}")
   }
 }
+
+output "qm_contract" {
+  description = "Rendered QM shared-infrastructure contract; null while enable_qm is false."
+  value       = one(module.qm[*].contract)
+}
+
+output "qm_dns_authorization" {
+  description = "DNS record to publish for the QM wildcard certificate; null while enable_qm is false."
+  value       = one(module.qm[*].dns_authorization)
+}
