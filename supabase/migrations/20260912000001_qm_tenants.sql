@@ -11,6 +11,11 @@
 
 CREATE SCHEMA IF NOT EXISTS qm;
 
+-- Lets qm.tenants reference a key by (id, team_id) so a tenant can only ever
+-- point at a sandbox API key owned by its own team; RLS does not take part in
+-- foreign-key checks, so the constraint has to carry the team itself.
+CREATE UNIQUE INDEX IF NOT EXISTS api_key_id_team_unique ON public.api_key (id, team_id);
+
 CREATE TABLE IF NOT EXISTS qm.tenants (
     id                 uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     team_id            uuid NOT NULL REFERENCES public.team(id),
@@ -27,7 +32,7 @@ CREATE TABLE IF NOT EXISTS qm.tenants (
     db_name            text,
     bucket_name        text,
     service_account    text,
-    sandbox_api_key_id uuid REFERENCES public.api_key(id),
+    sandbox_api_key_id uuid,
     created_by         uuid REFERENCES public.profile(id),
     created_at         timestamptz NOT NULL DEFAULT now(),
     updated_at         timestamptz NOT NULL DEFAULT now(),
@@ -42,7 +47,9 @@ CREATE TABLE IF NOT EXISTS qm.tenants (
     CONSTRAINT qm_tenants_model_provider_check
         CHECK (model_provider IN ('anthropic', 'openai', 'openrouter')),
     CONSTRAINT qm_tenants_status_check
-        CHECK (status IN ('provisioning', 'ready', 'failed', 'deprovisioning', 'deleted'))
+        CHECK (status IN ('provisioning', 'ready', 'failed', 'deprovisioning', 'deleted')),
+    CONSTRAINT qm_tenants_sandbox_api_key_team_fk
+        FOREIGN KEY (sandbox_api_key_id, team_id) REFERENCES public.api_key (id, team_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_qm_tenants_team ON qm.tenants(team_id);

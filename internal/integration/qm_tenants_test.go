@@ -19,10 +19,11 @@ import (
 )
 
 const (
-	qmAPITestPassword  = "qm-api-integration-test"
-	pgInsufficientPriv = "42501"
-	pgCheckViolation   = "23514"
-	qmTenantsMigration = "20260912000001_qm_tenants.sql"
+	qmAPITestPassword     = "qm-api-integration-test"
+	pgInsufficientPriv    = "42501"
+	pgCheckViolation      = "23514"
+	pgForeignKeyViolation = "23503"
+	qmTenantsMigration    = "20260912000001_qm_tenants.sql"
 )
 
 // connectAsQMAPI opens a real login session as qm_api so the assertions run
@@ -337,5 +338,47 @@ func TestQMMigrationIsIdempotent(t *testing.T) {
 	}
 	if strings.Contains(strings.ToLower(string(sql)), "password '") {
 		t.Fatal("migration hardcodes a password literal")
+	}
+}
+
+// A tenant may only ever point at a sandbox API key its own team owns. RLS does
+// not take part in foreign-key checks, so the composite key carries the team.
+func TestQMAPI_RejectsAPIKeyOwnedByAnotherTeam(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownKeyID := seedQMTeamAndKey(t)
+	_, foreignKeyID := seedQMTeamAndKey(t)
+	conn := connectAsQMAPI(t)
+	tx, q := scopedQMTx(t, conn, teamID)
+
+	tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+
+	_, err = q.UpdateQMTenantResources(ctx, db.UpdateQMTenantResourcesParams{
+		ID:              tenant.ID,
+		TeamID:          teamID,
+		SandboxApiKeyID: pgtype.UUID{Bytes: foreignKeyID, Valid: true},
+	})
+	if code := pgErrCode(err); code != pgForeignKeyViolation {
+		t.Fatalf("key from another team: want %s, got err=%v", pgForeignKeyViolation, err)
+	}
+
+	// The failed statement aborted the transaction; start a fresh one.
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	_, q = scopedQMTx(t, conn, teamID)
+	tenant, err = q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	updated, err := q.UpdateQMTenantResources(ctx, db.UpdateQMTenantResourcesParams{
+		ID:              tenant.ID,
+		TeamID:          teamID,
+		SandboxApiKeyID: pgtype.UUID{Bytes: ownKeyID, Valid: true},
+	})
+	if err != nil || !updated.SandboxApiKeyID.Valid || updated.SandboxApiKeyID.Bytes != ownKeyID {
+		t.Fatalf("own key: err=%v valid=%v", err, updated.SandboxApiKeyID.Valid)
 	}
 }
