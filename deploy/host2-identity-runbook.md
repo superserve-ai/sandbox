@@ -278,10 +278,34 @@ sudo test -d /etc/superserve/peer/current'
 
 Review any already-configured paths instead of overwriting them. Host 2 must
 retain its own instance-name HOST_ID; an existing value is preserved by CD.
-Verify `HOST_INTERFACE` with `ip link`, guest DNS and Firecracker compatibility
+Leave `HOST_INTERFACE` unset for automatic default-route discovery, or verify an
+intentional override with `ip link`. Check guest DNS and Firecracker compatibility
 against the canonical host preparation procedure. Rerun the documented
 `bootstrap-host2.py --provider superserve` baseline with the Terraform artifact
 before requesting the standby deployment. It leaves VMD stopped; do not admit it.
+
+### Host interface and advertised addresses
+
+VMD no longer assumes the primary host NIC is `eth0`. With `HOST_INTERFACE`
+unset, it selects the unique lowest-metric IPv4 default route and asks the kernel
+for the private source address used to reach that route's gateway. The resolved
+interface is shared by host firewall/template-builder configuration; the resolved
+address is reused for automatic VMD and proxy advertisement. Queries are local,
+bounded to two seconds, and run once at startup rather than on sandbox requests.
+
+Inspect routing with `ip -j -4 route show default` and
+`ip -j -4 route get <gateway-from-default-route>`. The selected route must have
+one interface and one concrete private IPv4 source. Equal-cost defaults,
+multipath, unavailable interfaces, missing source addresses, or public/link-local
+sources fail closed. More complex routing requires an explicit `HOST_INTERFACE`.
+That interface must provide a unique private IPv4 address for automatic
+advertisement. An explicit override is never silently replaced; remove a stale
+`HOST_INTERFACE=eth0` setting to opt into discovery, or correct it intentionally.
+
+Existing explicit advertisement overrides retain their semantics, including the
+private peer-ingress endpoint validation. Peer mTLS and host admission do not
+change. Do not work around an advertisement acknowledgement failure by disabling
+the gate or publishing a wildcard/loopback address.
 
 ### Provision the standby OTEL collector before final verification
 

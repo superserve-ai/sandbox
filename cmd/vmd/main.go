@@ -105,7 +105,7 @@ func loadConfig() (Config, error) {
 		SnapshotDir:             envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
 		RunDir:                  envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
 		GRPCPort:                port,
-		HostInterface:           envOrDefault("HOST_INTERFACE", "eth0"),
+		HostInterface:           os.Getenv("HOST_INTERFACE"),
 		TemplateBuilderBin:      envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
 		BoxdBinaryPath:          envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
 		HostID:                  requireEnv("HOST_ID"),
@@ -183,22 +183,10 @@ func hostInterfaceAddress(interfaceName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, addr := range addrs {
-		var ip net.IP
-		switch v := addr.(type) {
-		case *net.IPNet:
-			ip = v.IP
-		case *net.IPAddr:
-			ip = v.IP
-		}
-		if ip == nil {
-			continue
-		}
-		if ipv4 := ip.To4(); ipv4 != nil {
-			return ipv4.String(), nil
-		}
+	if iface.Flags&net.FlagUp == 0 {
+		return "", fmt.Errorf("host interface %q is down", interfaceName)
 	}
-	return "", fmt.Errorf("no IPv4 address found on interface %q", interfaceName)
+	return uniquePrivateHostAddress(addrs)
 }
 
 // publishesCapacityPressure reports whether this daemon should publish
@@ -265,12 +253,15 @@ func advertisedProxyAddr(hostIP func() (string, error), proxyHealthURL, explicit
 	if err != nil {
 		return "", err
 	}
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	if host == "localhost" || net.ParseIP(host).IsLoopback() || net.ParseIP(host).IsUnspecified() {
 		ip, err := hostIP()
 		if err != nil {
 			return "", err
 		}
 		return net.JoinHostPort(ip, port), nil
+	}
+	if !privateHostIPv4(net.ParseIP(host)) {
+		return "", fmt.Errorf("proxy health address must resolve to a private host IPv4 address")
 	}
 	return u.Host, nil
 }
@@ -688,6 +679,17 @@ func main() {
 		}
 		netMgrOpts = append(netMgrOpts, network.WithDNSRedirectPort(uint16(port)))
 		log.Info().Uint64("port", port).Msg("guest DNS redirect enabled")
+	}
+
+	// An unset override uses the host route for both networking and advertisement.
+	// Two bounded local queries avoid a fleet-sized interface/address table scan.
+	var automaticHostIP string
+	if cfg.HostInterface == "" {
+		cfg.HostInterface, automaticHostIP, err = discoverHostRoute(ctx)
+		if err != nil {
+			log.Fatal().Err(err).Msg("cannot determine private host interface from default route; configure HOST_INTERFACE")
+		}
+		log.Info().Str("host_interface", cfg.HostInterface).Str("host_ip", automaticHostIP).Msg("resolved host default route")
 	}
 
 	// ---- Network manager + host firewall ----
@@ -1747,12 +1749,14 @@ func main() {
 		if proxyHealthURL == "" {
 			proxyHealthURL = "http://127.0.0.1:5007/health"
 		}
-		// Both endpoints derive from one host-interface lookup, and that
-		// lookup dumps the host's interface and address tables — whose size
-		// grows with the fleet. hostIP resolves at most once, and only if
-		// something actually needs it: two explicit advertise settings
-		// resolve nothing at all.
-		hostIP := hostIPOnce(func() (string, error) { return hostInterfaceAddress(cfg.HostInterface) })
+		// Reuse the route-selected source. An explicit interface needs at most
+		// one address-table lookup, and none if both endpoints are overridden.
+		hostIP := hostIPOnce(func() (string, error) {
+			if automaticHostIP != "" {
+				return automaticHostIP, nil
+			}
+			return hostInterfaceAddress(cfg.HostInterface)
+		})
 		// Pressure publication is wired ONLY on the explicit advertise
 		// setting — never on the resolved vmdAddr, which now falls back
 		// to deriving an address from the host interface. Keying on the
@@ -1766,10 +1770,9 @@ func main() {
 			pressureReady = mgr.PressureReady
 		}
 		lc.start("heartbeat", func() error {
-			// Resolved here rather than on the startup goroutine: the lookup
-			// is fleet-sized, and its only consumer is this heartbeat. A
-			// failure still omits self-description and warns; it has never
-			// been a reason to hold up readiness.
+			// Explicit-interface address enumeration stays off the startup
+			// goroutine. Failure omits self-description rather than advertising
+			// an arbitrary address; automatic routing was checked at startup.
 			vmdAddr, err := advertisedVMDAddr(hostIP, cfg.GRPCPort, cfg.VMDAdvertiseAddr)
 			if err != nil {
 				log.Warn().Err(err).Str("host_interface", cfg.HostInterface).
