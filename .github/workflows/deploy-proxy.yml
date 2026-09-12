@@ -185,6 +185,7 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || inputs.cell == 'use4'
         env:
           DEPLOY_CELL: use4
+          VMD_STANDBY_HOST_USE4: ${{ vars.VMD_STANDBY_HOST_USE4 }}
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}

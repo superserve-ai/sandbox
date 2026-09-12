@@ -15,8 +15,8 @@ esac
 
 case "$DEPLOY_CELL" in
   staging) standby_host=superserve-vmd-staging-2 ;;
-  # The existing use4 host ending in -2 is serving, not a standby.
-  use4) standby_host="" ;;
+  # Populate deployment configuration from Terraform when the replacement exists.
+  use4) standby_host="${VMD_STANDBY_HOST_USE4:-}" ;;
   usw2) standby_host=superserve-vmd-usw2-2 ;;
   *) echo 'Invalid deployment cell' >&2; exit 1 ;;
 esac
@@ -26,7 +26,7 @@ if [ "$DEPLOY_CELL" != staging ] && [ "$DEPLOY_CELL" != "${DEPLOY_PRODUCTION_CEL
 fi
 
 if [ "${DEPLOY_TARGET:-standby}" = standby ]; then
-  # Only the use4 label is reserved; its future identity host is not defined.
+  # Labels are fixed even when the expected identity host is configurable.
   export VMD_LABEL="component=vmd-${DEPLOY_CELL}-standby"
   if [ -z "$standby_host" ]; then
     echo 'No standby identity host configured for this cell; refusing deployment' >&2

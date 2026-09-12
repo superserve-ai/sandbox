@@ -19,6 +19,7 @@ class DeployTargetTests(unittest.TestCase):
                    DEPLOY_PRODUCTION_CELL="", DEPLOY_CELL="staging",
                    GCP_REGION="us-central1", VMD_LABEL="component=legacy",
                    PEER_IDENTITY_HOSTS="legacy-host", EXPECTED_STANDBY_HOST="",
+                   VMD_STANDBY_HOST_USE4="",
                    PEER_ROUTING_ENABLED="0", PEER_PROXY_LISTEN_ADDR="auto")
         env.update(overrides)
         return subprocess.run(
@@ -63,9 +64,18 @@ class DeployTargetTests(unittest.TestCase):
     def test_push_ignores_selectors_and_preserves_environment(self):
         for cell in ("staging", "use4", "usw2"):
             result = self.select(DEPLOY_EVENT="push", DEPLOY_TARGET="invalid", DEPLOY_CELL=cell,
-                                 GCP_REGION="", PEER_ROUTING_ENABLED="1")
+                                 GCP_REGION="", PEER_ROUTING_ENABLED="1",
+                                 VMD_STANDBY_HOST_USE4="example-replacement")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["component=legacy", "legacy-host", "", "1", "auto"])
+
+    def test_use4_standby_uses_deployment_configuration(self):
+        result = self.select(DEPLOY_CELL="use4", DEPLOY_PRODUCTION_CELL="use4",
+                             GCP_REGION="us-east4", VMD_STANDBY_HOST_USE4="example-replacement")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(),
+                         ["component=vmd-use4-standby", "example-replacement",
+                          "example-replacement", "0", "auto"])
 
     def test_manual_rejects_invalid_or_unscoped_selection(self):
         for override in ({"DEPLOY_TARGET": "component=vmd"}, {"DEPLOY_PRODUCTION_CELL": "all"},
@@ -85,6 +95,7 @@ class DeployTargetTests(unittest.TestCase):
             steps = [s for s in re.split(r"^      - name: ", workflow, flags=re.M)
                      if f"python3 .github/workflows/scripts/deploy-{kind}.py" in s]
             self.assertEqual(len(steps), 3)
+            self.assertIn("VMD_STANDBY_HOST_USE4: ${{ vars.VMD_STANDBY_HOST_USE4 }}", steps[1])
             for step in steps:
                 self.assertLess(step.index("source .github/workflows/scripts/select-deploy-target.sh"),
                                 step.index(f"python3 .github/workflows/scripts/deploy-{kind}.py"))
