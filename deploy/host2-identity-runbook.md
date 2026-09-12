@@ -100,7 +100,7 @@ explicitly allows `RESTART` (required by the SDK); unchanged identities are
 not updated again. This restart is not certificate activation; full stop/start
 belongs only to the guarded bootstrap procedure, never to an unconditional
 Terraform side effect. CA-pool bindings for both workload certificate requester
-and pool reader use `principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/name/locations/global/workloadIdentityPools/POOL_ID/*`;
+and pool reader use `principal://iam.googleapis.com/projects/PROJECT_NUMBER/name/locations/global/workloadIdentityPools/POOL_ID`;
 the `/name/` segment is required for managed workload identity principals.
 This operation is visible in the adapter's configuration,
 not as a native Compute field in a plan. It must be reviewed with the code.

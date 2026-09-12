@@ -118,8 +118,8 @@ class ManagedIdentityTest(unittest.TestCase):
         self.assertEqual(bindings, [
             ['gcloud', 'privateca', 'pools', 'add-iam-policy-binding',
              'projects/example-project/locations/us-west2/caPools/peer', '--location=us-west2',
-             '--member=principalSet://iam.googleapis.com/projects/123456789012/name/locations/global/'
-             'workloadIdentityPools/vmd-peer-example/*', f'--role={role}',
+             '--member=principal://iam.googleapis.com/projects/123456789012/name/locations/global/'
+             'workloadIdentityPools/vmd-peer-example', f'--role={role}',
              '--project=example-project', '--quiet', '--format=json']
             for role in ('roles/privateca.workloadCertificateRequester', 'roles/privateca.poolReader')
         ] * 2)

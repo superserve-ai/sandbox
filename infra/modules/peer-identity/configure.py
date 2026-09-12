@@ -62,8 +62,10 @@ def configure(config):
         policy.write_text(json.dumps(attestation_policy(config)))
         gcloud(*pool, "managed-identities", "set-attestation-rules", config["identity"],
                *scoped, f"--policy-file={policy}")
-    principal = (f"principalSet://iam.googleapis.com/projects/{config['project_number']}/name/locations/global/"
-                 f"workloadIdentityPools/{config['pool_id']}/*")
+    principal = (
+        f"principal://iam.googleapis.com/projects/{config['project_number']}"
+        f"/name/locations/global/workloadIdentityPools/{config['pool_id']}"
+    )
     for role in ("roles/privateca.workloadCertificateRequester", "roles/privateca.poolReader"):
         gcloud("privateca", "pools", "add-iam-policy-binding", config["ca_pool"],
                f"--location={config['region']}", f"--member={principal}", f"--role={role}")
