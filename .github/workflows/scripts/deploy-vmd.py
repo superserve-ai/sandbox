@@ -930,8 +930,17 @@ def main() -> int:
             # legacy default identity or its optional region semantics.
             host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/vmd.env | tail -n 1)
             if [ -n "$host_id" ] && [ "$host_id" != default ]; then
-                sudo sed -i '/^HOST_REGION=/d' /etc/sandbox/vmd.env
-                echo {q_host_region_line} | sudo tee -a /etc/sandbox/vmd.env >/dev/null
+                host_region=$(sudo sed -n 's/^HOST_REGION=//p' /etc/sandbox/vmd.env | tail -n 1 | tr -d '[:space:]')
+                case "$host_region" in ''|'""'|"''")
+                    sudo sed -i '/^HOST_REGION=/d' /etc/sandbox/vmd.env
+                    echo {q_host_region_line} | sudo tee -a /etc/sandbox/vmd.env >/dev/null
+                    ;;
+                esac
+                host_region=$(sudo sed -n 's/^HOST_REGION=//p' /etc/sandbox/vmd.env | tail -n 1 | tr -d '[:space:]')
+                case "$host_region" in ''|'""'|"''")
+                    echo 'ERROR: named host requires HOST_REGION before VMD activation' >&2
+                    exit 1 ;;
+                esac
             fi
 
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes

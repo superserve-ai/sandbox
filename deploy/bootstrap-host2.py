@@ -128,7 +128,8 @@ done''' if provider == 'mwi' else ''
 sudo /usr/local/sbin/refresh-peer-credentials --check
 sudo test "$(sudo stat -c '%u:%a' /etc/superserve/peer/current/tls.key)" = 0:600
 sudo grep -Fx 'HOST_ID={config['host_id']}' /etc/sandbox/vmd.env >/dev/null
-sudo grep -Fx HOST_REGION={host_region} /etc/sandbox/vmd.env >/dev/null
+region_value=$(sudo sed -n 's/^HOST_REGION=//p' /etc/sandbox/vmd.env | tail -n 1 | tr -d '[:space:]')
+case "$region_value" in ''|'""'|"''") echo 'HOST_REGION is required for a named host' >&2; exit 1 ;; esac
 mountpoint -q /mnt/sandbox-data
 sudo systemctl is-active --quiet google-guest-agent.service vmd-peer-credentials.timer superserve-secretsproxy.service superserve-otel-collector.service superserve-vmd.service
 invocation=$(sudo systemctl show -p InvocationID --value superserve-vmd.service)
@@ -188,8 +189,12 @@ for env in /etc/sandbox/vmd.env /etc/superserve/vmd.env; do
     fi
     sudo sed -i '/^HOST_ID=/d' "$env"
     printf 'HOST_ID=%s\\n' {host_id} | sudo tee -a "$env" >/dev/null
-    sudo sed -i '/^HOST_REGION=/d' "$env"
-    printf 'HOST_REGION=%s\\n' {host_region} | sudo tee -a "$env" >/dev/null
+    region_value=$(sudo sed -n 's/^HOST_REGION=//p' "$env" | tail -n 1 | tr -d '[:space:]')
+    case "$region_value" in ''|'""'|"''")
+        sudo sed -i '/^HOST_REGION=/d' "$env"
+        printf 'HOST_REGION=%s\\n' {host_region} | sudo tee -a "$env" >/dev/null
+        ;;
+    esac
 done
 sudo tee /etc/tmpfiles.d/vmd-peer.conf >/dev/null <<'CONF'
 d /run/secrets/workload-spiffe-credentials 0700 root root -

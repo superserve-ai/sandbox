@@ -288,11 +288,17 @@ before requesting the standby deployment. It leaves VMD stopped; do not admit it
 
 An identity-bound host must send a complete self-description. Private endpoints
 alone are insufficient: an empty region causes heartbeat rejection. VMD deploy
-now sets `HOST_REGION` for every non-`default` HOST_ID from `GCP_REGION`, checked
+now fills missing or empty `HOST_REGION` for every non-`default` HOST_ID from
+`GCP_REGION`, checked
 against the discovered instance zone. If deployment is not region-scoped, the
 instance zone supplies the region. Staging uses `us-central1`; production hosts
 use their actual deployment region, including standby hosts. Bootstrap sets the
-same field from its Terraform-provided zone and final verification checks it.
+same fallback from its Terraform-provided zone. Both paths preserve a non-empty
+explicit `HOST_REGION`; final verification checks that the runtime region is
+non-empty, rather than requiring it to equal the default. Region/zone ambiguity
+fails deployment before uploads; named-host activation requires a non-empty
+runtime region. A region already stored in the database does not substitute for
+the region in each identity-bound heartbeat.
 No manual HOST_REGION or SANDBOX_ID_REGION setting is needed on a fresh host.
 
 Deployment preserves HOST_ID and does not add, replace or remove region settings

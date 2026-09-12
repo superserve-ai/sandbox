@@ -151,6 +151,15 @@ journalctl() { :; }
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn('HOST_REGION=' + region + '\n', envs['vmd.env'])
 
+    def test_named_host_explicit_region_is_preserved_and_empty_region_is_filled(self):
+        for value in ('explicit-region', 'us-west2', '', '   ', '\"\"', "''"):
+            result, envs, _ = self.exercise(missing=(), configured=True, existing_region=value)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = value if value in ('explicit-region', 'us-west2') else 'us-central1'
+            self.assertIn('HOST_REGION=' + expected + '\n', envs['vmd.env'])
+            self.assertEqual(envs['vmd.env'].count('HOST_REGION='), 1)
+            self.assertIn('HOST_ID=existing-host\n', envs['vmd.env'])
+
     def test_legacy_default_identity_does_not_gain_region(self):
         result, envs, _ = self.exercise(missing=(), configured=True, host_id='default')
         self.assertEqual(result.returncode, 0, result.stderr)

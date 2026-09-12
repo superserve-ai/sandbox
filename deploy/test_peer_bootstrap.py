@@ -420,6 +420,21 @@ class BootstrapActivationTest(unittest.TestCase):
             self.assertIn("printf 'HOST_REGION=%s\\n' " + region, install)
             self.assertIn("existing HOST_ID disagrees", install)
 
+    def test_bootstrap_region_block_preserves_explicit_region(self):
+        _, scripts, _, error = self.exercise(active=True, legacy_activation=False)
+        self.assertIsNone(error)
+        install = next(s for s in scripts if 'ConditionPathExists=' in s)
+        start = install.index('    region_value=')
+        region_block = install[start:install.index('\ndone', start)]
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / 'vmd.env'
+            original = 'HOST_ID=named-host\nHOST_REGION=explicit-region\n'
+            env_file.write_text(original)
+            result = subprocess.run(['bash', '-ec', 'sudo() { "$@"; }; env="$TEST_ENV";\n' + region_block],
+                                    env=dict(os.environ, TEST_ENV=str(env_file)), capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(env_file.read_text(), original)
+
     def test_active_credentials_avoid_power_cycle(self):
         commands, _, output, error = self.exercise(active=True)
         self.assertIsNone(error)
