@@ -152,6 +152,9 @@ def runtime_input_preflight(control_plane_url, database_url, internal_api_token)
            || ! sudo test -s /var/lib/secretsproxy/ca.key; then
             SECRETSPROXY_FRESH=1
         fi
+        if [ "$(sudo systemctl show -p LoadState --value agentbox-vmd.service)" = loaded ]; then
+            SECRETSPROXY_FRESH=1
+        fi
         # Also detect a partial prior deploy that created env files but omitted inputs.
         for setting in vmd:CONTROL_PLANE_URL vmd:INTERNAL_API_TOKEN secretsproxy:CONTROL_PLANE_URL secretsproxy:DAEMON_AUTH_TOKEN; do
             file=${setting%%:*}
@@ -176,6 +179,75 @@ if [ "$SECRETSPROXY_FRESH" = 1 ]; then
 fi
 """
     return script
+
+
+def legacy_vmd_enrollment():
+    """Guard retirement and leave a persistent mask, including locally installed units."""
+    return textwrap.dedent("""
+        require_no_guest_workloads() {
+            # Check both systemd-owned and unmanaged Firecracker guests/builds.
+            guest_units=$(sudo systemctl list-units --all --no-legend --plain 'firecracker@*.service' 'firecracker-netns@*.service') || return 1
+            if printf '%s\n' "$guest_units" | awk 'NF && $3 != "inactive" && $3 != "failed" { found=1 } END { exit !found }'; then
+                echo "ERROR: guest workload units remain; refusing legacy VMD retirement" >&2
+                return 1
+            fi
+            if guest_pids=$(sudo pgrep -f '^([^ ]*/)?(firecracker|template-builder)([[:space:]]|$)'); then
+                echo "ERROR: guest workload processes remain; drain the host before legacy VMD retirement" >&2
+                return 1
+            else
+                status=$?
+                if [ "$status" != 1 ]; then
+                    echo "ERROR: cannot inspect guest processes; refusing legacy VMD retirement" >&2
+                    return 1
+                fi
+            fi
+        }
+        require_vmd_ports_free() {
+            listeners=$(sudo ss -H -ltnp '( sport = :50051 or sport = :9090 )') || return 1
+            if [ -n "$listeners" ]; then
+                echo "ERROR: ports 50051/9090 still have a listener; refusing VMD socket activation (do not kill unmanaged VMD automatically)" >&2
+                printf '%s\n' "$listeners" >&2
+                return 1
+            fi
+        }
+        retire_legacy_vmd() {
+            require_no_guest_workloads
+            legacy_state=$(sudo systemctl show -p LoadState --value agentbox-vmd.service)
+            case "$legacy_state" in loaded|masked|not-found) ;; *)
+                echo "ERROR: cannot determine legacy VMD state; refusing enrollment" >&2; return 1 ;;
+            esac
+            if [ "$legacy_state" != not-found ] || sudo test -e /etc/systemd/system/agentbox-vmd.service.retired; then
+                if [ "$legacy_state" = loaded ]; then
+                    sudo systemctl disable agentbox-vmd.service
+                    sudo systemctl stop agentbox-vmd.service
+                fi
+                state=$(sudo systemctl show -p ActiveState --value agentbox-vmd.service)
+                case "$state" in inactive|failed) ;; *)
+                    echo "ERROR: legacy VMD did not stop; refusing enrollment" >&2; return 1 ;;
+                esac
+                # systemctl mask cannot replace a regular unit in /etc. Preserve it
+                # outside the unit name before installing the persistent /dev/null link.
+                if sudo test -f /etc/systemd/system/agentbox-vmd.service && ! sudo test -L /etc/systemd/system/agentbox-vmd.service; then
+                    if sudo test -e /etc/systemd/system/agentbox-vmd.service.retired; then
+                        echo "ERROR: legacy unit backup already exists; inspect before retirement" >&2
+                        return 1
+                    fi
+                    sudo mv /etc/systemd/system/agentbox-vmd.service /etc/systemd/system/agentbox-vmd.service.retired
+                fi
+                sudo systemctl mask agentbox-vmd.service
+                sudo systemctl daemon-reload
+                if [ "$(sudo systemctl is-enabled agentbox-vmd.service)" != masked ]; then
+                    echo "ERROR: legacy VMD is not persistently masked; refusing enrollment" >&2
+                    return 1
+                fi
+            fi
+            require_no_guest_workloads
+            require_vmd_ports_free
+        }
+        if [ "$SECRETSPROXY_FRESH" = 1 ]; then
+            require_no_guest_workloads
+        fi
+    """)
 
 
 def run_or_die(cmd, context):
@@ -416,7 +488,7 @@ def main() -> int:
         )
         print(f"[{tag}] bundle uploaded")
 
-        inject_script = input_preflight + textwrap.dedent(f"""
+        inject_script = input_preflight + legacy_vmd_enrollment() + textwrap.dedent(f"""
 
             # Precondition, checked before any host mutation: if
             # BACKUP_JOURNAL_PATH names a path outside a real mount (the
@@ -519,6 +591,7 @@ def main() -> int:
                     sudo systemctl stop $fresh_units
                 fi
                 sudo systemctl daemon-reload
+                retire_legacy_vmd
             fi
             # CD targets existing cells: never let missing state mint a new trust root.
             for setting in SECRETSPROXY_CA_CERT=/var/lib/secretsproxy/ca.crt SECRETSPROXY_CA_KEY=/var/lib/secretsproxy/ca.key; do
@@ -1036,6 +1109,8 @@ def main() -> int:
             # Fresh hosts must complete this before any VMD socket activation.
             if [ "$SECRETSPROXY_FRESH" = 1 ]; then
                 restart_secretsproxy
+                require_no_guest_workloads
+                require_vmd_ports_free
                 sudo rm -f /etc/systemd/system/superserve-vmd.socket.d/05-fresh-runtime.conf /etc/systemd/system/{service}.d/05-fresh-runtime.conf
                 sudo systemctl daemon-reload
             fi

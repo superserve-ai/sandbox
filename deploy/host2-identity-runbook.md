@@ -283,6 +283,29 @@ against the canonical host preparation procedure. Rerun the documented
 `bootstrap-host2.py --provider superserve` baseline with the Terraform artifact
 before requesting the standby deployment. It leaves VMD stopped; do not admit it.
 
+### Retiring the legacy VMD during enrollment
+
+Enrollment recognizes a loaded `agentbox-vmd.service`, even if its env files
+look complete. Before service changes it requires no running Firecracker or
+template-builder processes and no active/activating guest units. If workloads
+remain, stop enrollment and drain them through the existing lifecycle procedure;
+do not kill guests or retire their manager as part of fresh-host deployment.
+Inspection failures also abort.
+
+After installing the fresh-host activation guard, deployment stops the new VMD
+units, disables and stops `agentbox-vmd.service`, and persistently masks the
+legacy unit. A locally installed regular unit file is preserved as
+`/etc/systemd/system/agentbox-vmd.service.retired` before masking. The mask
+survives reboot and blocks dependency/manual starts as well as boot enablement.
+Retries preserve the mask; an unexpected existing backup requires inspection.
+
+Ports 50051 and 9090 must have no TCP listeners after retirement and immediately
+before releasing the socket activation guard. A remaining unmanaged VMD or other
+listener causes failure, with listener details for diagnosis; deployment never
+kills it automatically. Leave the host outside placement and resolve the owner
+before retrying. These retirement checks do not run on ordinary configured
+serving hosts without the legacy unit. Peer credentials are unaffected.
+
 ### Staging workflow runtime configuration
 
 The staging GitHub environment is the canonical source for fresh-host runtime

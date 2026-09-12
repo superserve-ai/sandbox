@@ -72,13 +72,17 @@ class FreshHostTest(unittest.TestCase):
             values['q_dat_line'] = shlex.quote('DAEMON_AUTH_TOKEN=example-token')
             script = '\n'.join((BOOTSTRAP, HOST_ID, CONTROL, TOKENS, READY))
             script = ast.literal_eval('"""' + script + '"""').format(**values)
-            script = deploy_vmd.runtime_input_preflight(supplied['cpu'], supplied['db'], supplied['token']) + script
+            script = deploy_vmd.runtime_input_preflight(supplied['cpu'], supplied['db'], supplied['token']) + deploy_vmd.legacy_vmd_enrollment() + script
             script = script.replace('/etc/systemd', str(root / 'etc/systemd')).replace('/etc/sandbox', str(envdir)).replace('/var/lib/', str(root / 'var/lib') + '/')
             prelude = '''set -eu
 sudo() { if [ "$1" = chown ]; then return; fi; "$@"; }
 seq() { echo 1; }
 sleep() { :; }
+pgrep() { return 1; }
+ss() { :; }
 systemctl() {
+    if [ "$1" = list-units ]; then return; fi
+    case "$*" in *agentbox-vmd.service*) echo not-found; return;; esac
     if [ "$1" = restart ]; then
         echo restart-secretsproxy >> "$CALLS"
         if [ "$FAIL_DAEMON" = 1 ]; then return 1; fi
