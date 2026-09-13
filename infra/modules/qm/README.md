@@ -234,22 +234,33 @@ Before `tenant_capacity` approaches that, request an increase for the IAM API
    connection, set `create_private_service_connection = false` and add a
    reserved range for QM to that connection out of band; otherwise the module
    creates both.
-3. **Certificate DNS authorization.** Apply. Publish the CNAME from the
-   `dns_authorization` output (done automatically when `dns_managed_zone` is
-   set) before expecting the certificate to become `ACTIVE`; the load balancer
-   serves nothing until it does. Then point `<domain>` and `*.<domain>` at the
-   `address` output.
-4. **Resend key.** Add a version to `qm-resend-<suffix>` with the platform's
-   Resend API key. Nothing starts without it, but the first tenant
-   provisioned before it exists fails at its Cloud Run deploy.
-5. **`qm_api` role and `DATABASE_URL`.** The role and its grants come from
-   the control-plane schema migrations; its password is set out of band.
-   Add a version to `qm-api-database-url-<suffix>` with the control-plane
-   connection string for that role. Both the qm-api service and the
-   provisioner job mount this secret, and neither will start until the
-   version exists, so on a first apply create the secrets first
-   (`-target=module.qm[0].google_secret_manager_secret.api_database_url`),
-   add the version, then apply the rest.
+3. **Secrets, before the first unqualified apply.** Both Cloud Run
+   workloads mount `DATABASE_URL` at `latest`, so an apply that creates them
+   before that version exists cannot bring up a revision. Create the secrets
+   on their own first:
+
+   ```
+   terraform apply \
+     -target=module.qm[0].google_secret_manager_secret.api_database_url \
+     -target=module.qm[0].google_secret_manager_secret.resend
+   ```
+
+   Then add a version to `qm-api-database-url-<suffix>` with the
+   control-plane connection string for the `qm_api` role (the role and its
+   grants come from the control-plane schema migrations; its password is set
+   out of band), and a version to `qm-resend-<suffix>` with the platform's
+   Resend API key. Nothing here mounts the Resend key, so it can follow —
+   but the first tenant provisioned before it exists fails at its Cloud Run
+   deploy.
+4. **Apply the rest.** Publish the CNAME from the `dns_authorization` output
+   (done automatically when `dns_managed_zone` is set) before expecting the
+   certificate to become `ACTIVE`; the load balancer serves nothing until it
+   does. Then point `<domain>` and `*.<domain>` at the `address` output.
+5. **Tenants left by a stub deploy.** An environment that ever ran with
+   `QM_PROVISIONER_STUB=1` can hold tenants marked ready that have only
+   placeholder resource names and no stack. Clearing the flag changes only
+   what future runs do, and retry refuses a ready tenant, so delete those
+   tenants before the first real deploy.
 6. **Service-account quota** as above, before onboarding tenants at scale.
 
 Later qm-api image rollouts are owned by deploy tooling (`deploy-qm-api.yml`
