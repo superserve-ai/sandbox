@@ -287,6 +287,7 @@ BUNDLE_FILES = [
     "bin/boxd",
     "bin/template-builder",
     "bin/secretsproxy",
+    "deploy/template-storage.py",
     "deploy/superserve-vmd.service",
     "deploy/superserve-vmd.socket",
     "deploy/superserve-vms.service",
@@ -634,6 +635,12 @@ def main() -> int:
             sudo rm -rf {extract_dir}
             mkdir -p {extract_dir}
             tar xzf {bundle_remote} -C {extract_dir}
+            if [ "$SECRETSPROXY_FRESH" = 1 ]; then
+                sudo python3 {extract_dir}/deploy/template-storage.py install
+            elif sudo test -x /usr/local/sbin/sandbox-template-storage; then
+                sudo /usr/local/sbin/sandbox-template-storage check
+            fi
+
 
             # Rollback safety gate. If the incoming vmd lacks cgroup supervision
             # (a downgrade past direct-spawn), an old binary would mishandle any

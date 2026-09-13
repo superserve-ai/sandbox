@@ -136,6 +136,7 @@ sudo grep -Fx 'HOST_ID={config['host_id']}' /etc/sandbox/vmd.env >/dev/null
 region_value=$(sudo sed -n 's/^HOST_REGION=//p' /etc/sandbox/vmd.env | tail -n 1 | tr -d '[:space:]')
 case "$region_value" in ''|'""'|"''") echo 'HOST_REGION is required for a named host' >&2; exit 1 ;; esac
 mountpoint -q /mnt/sandbox-data
+sudo /usr/local/sbin/sandbox-template-storage check
 sudo systemctl is-active --quiet google-guest-agent.service vmd-peer-credentials.timer superserve-secretsproxy.service superserve-otel-collector.service superserve-vmd.service
 invocation=$(sudo systemctl show -p InvocationID --value superserve-vmd.service)
 sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'gRPC serving requests' --no-pager >/dev/null
@@ -172,11 +173,13 @@ sudo systemctl cat google-guest-agent.service >/dev/null
         identity = Path(tmp) / 'identity.json'
         identity.write_text(json.dumps(config))
         for src, dst in [(identity, f'{upload_dir}/identity.json'),
-                         (assets / 'refresh-peer-credentials.py', f'{upload_dir}/refresh-peer-credentials.py')]:
+                         (assets / 'refresh-peer-credentials.py', f'{upload_dir}/refresh-peer-credentials.py'),
+                         (assets / 'template-storage.py', f'{upload_dir}/template-storage.py')]:
             run('compute', 'scp', str(src), f'{name}:{dst}', *flags, '--tunnel-through-iap')
     host_id = shlex.quote(config['host_id'])
     ssh(f'''set -eu
 sudo systemctl stop superserve-vmd.socket superserve-vmd.service
+sudo python3 {upload_dir}/template-storage.py install
 sudo install -d -m 0700 /etc/superserve/peer /run/secrets/workload-spiffe-credentials
 sudo touch /etc/superserve/peer/bootstrap-pending
 for unit in superserve-vmd.socket superserve-vmd.service; do

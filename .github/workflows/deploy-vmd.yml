@@ -88,6 +88,7 @@ on:
       - '.github/workflows/deploy-vmd.yml'
       - '.github/workflows/scripts/deploy-vmd.py'
       - 'deploy/host_runtime.py'
+      - 'deploy/template-storage.py'
       - '.github/workflows/scripts/select-deploy-target.sh'
 
 # Serialize runs rather than canceling: deploy-vmd.py stops vmd, rewrites

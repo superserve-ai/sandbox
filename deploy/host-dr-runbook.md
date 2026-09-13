@@ -36,6 +36,16 @@ prior bring-ups:
   the DEAD host only at the remap step below, never while the old row
   still points at live state elsewhere.
 
+Before copying/restoring templates, enroll the drained replacement with
+`sudo python3 deploy/template-storage.py install` from the checkout. Follow the
+[durable template-storage procedure](host2-identity-runbook.md#durable-template-storage-before-transfer-or-admission)
+for data-mount persistence, exact bind-source checks and source-size/free-space
+budgeting. Both canonical `rundir/templates` and `snapshots/templates` paths must
+resolve to the XFS data disk. The installer never moves populated directories;
+resolve any existing root-backed template data during the planned drain. Do not
+apply this migration to the still-serving host. Recheck mappings after reboot
+and before any template transfer; only the two template trees change backing.
+
 ## 2. Enumerate and dry-run
 
 Run the bulk tool under the cell's restore identity

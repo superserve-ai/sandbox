@@ -284,6 +284,97 @@ against the canonical host preparation procedure. Rerun the documented
 `bootstrap-host2.py --provider superserve` baseline with the Terraform artifact
 before requesting the standby deployment. It leaves VMD stopped; do not admit it.
 
+### Durable template storage before transfer or admission
+
+Both template trees belong on the separate XFS sandbox data disk, not the boot
+disk. Keep the database/runtime paths unchanged:
+
+| Backing directory | Canonical bind mount |
+| --- | --- |
+| `/mnt/sandbox-data/templates/rundir` | `/var/lib/sandbox/rundir/templates` |
+| `/mnt/sandbox-data/templates/snapshots` | `/var/lib/sandbox/snapshots/templates` |
+
+`deploy/template-storage.py install` installs a preparation service, two native
+systemd bind-mount units, and enrollment-only VMD service/socket drop-ins. The
+preparation service requires the existing `sandbox-data.service` when present;
+otherwise the data disk must already have persistent fstab/native mount setup.
+It verifies a separate XFS mount before creating any backing directories. No
+formatting, data copying, deletion or general runtime/snapshot migration occurs.
+The mount units run after preparation and are enabled for boot. Their late
+ordering accommodates the existing data-disk service without holding up the
+early filesystem/socket boot targets. VMD and its socket bind their lifetimes
+to both mounts and run an exact source/inode check before activation. A missing
+or wrong disk/mapping blocks startup; unmounting a required mapping stops them.
+
+Fresh VMD deploys and standby bootstrap install this contract. Later deploys on
+an enrolled host verify it. Ordinary serving hosts without this enrollment are
+not silently converted. Manual bind mounts with exactly the expected sources
+are adopted without unmounting or moving their contents. A non-empty unmounted
+template tree is rejected: hiding old files would conceal data and leave the
+root disk full. Existing source templates are never replaced by installation.
+
+For the currently running Host 2, the manual mounts alone are **not durable**.
+In a controlled standby maintenance window, confirm no guest/build workloads,
+stop its VMD service/socket (and retire any legacy VMD), then install the units.
+The installer refuses an active manager/socket or guest/build processes. It does
+not start VMD or admit the host. Do not run this procedure on serving Host 1.
+
+```bash
+gcloud compute scp deploy/template-storage.py superserve-vmd-staging-2:/tmp/template-storage.py \
+  --project=rayai-dev --zone=us-central1-a --tunnel-through-iap
+gcloud compute ssh superserve-vmd-staging-2 \
+  --project=rayai-dev --zone=us-central1-a --tunnel-through-iap \
+  --command='set -eu
+sudo systemctl stop superserve-vmd.socket superserve-vmd.service
+sudo python3 /tmp/template-storage.py install
+sudo /usr/local/sbin/sandbox-template-storage check
+sudo systemctl is-enabled var-lib-sandbox-rundir-templates.mount var-lib-sandbox-snapshots-templates.mount
+findmnt -T /var/lib/sandbox/rundir/templates
+findmnt -T /var/lib/sandbox/snapshots/templates
+df -h /var/lib/sandbox/rundir/templates /var/lib/sandbox/snapshots/templates /mnt/sandbox-data'
+```
+
+Repeat the checker, `findmnt -T` and `df` after the next controlled reboot and
+before **every template copy**. Both paths must resolve to the data filesystem
+with the expected `/templates/rundir` and `/templates/snapshots` source roots.
+Do not copy if either resolves to `/` or a parent runtime directory. Confirm
+collector/runtime prerequisites and perform final verification before admission.
+
+Before copying, size **both** source trees. On the source host, record:
+
+```bash
+sudo du -sb /var/lib/sandbox/rundir/templates /var/lib/sandbox/snapshots/templates
+```
+
+Sum those byte counts into `REQUIRED_TEMPLATE_BYTES` on the destination. Use a
+conservative apparent-size estimate unless the transfer's sparse/reflink behavior
+has been verified. Allow headroom for existing backups, staging and runtime
+writes on this shared disk; 20 GiB is a minimum reserve, not a capacity promise.
+
+```bash
+sudo /usr/local/sbin/sandbox-template-storage check
+: "${REQUIRED_TEMPLATE_BYTES:?Set the sum of both source-tree byte counts}"
+free_bytes=$(df -B1 --output=avail /mnt/sandbox-data | tail -n 1 | tr -d ' ')
+reserve_bytes=$((20 * 1024 * 1024 * 1024))
+test "$free_bytes" -ge "$((REQUIRED_TEMPLATE_BYTES + reserve_bytes))" || {
+  echo 'Insufficient template-storage capacity; do not begin transfer' >&2
+  exit 1
+}
+```
+
+Read-only inspection found serving Host 1's two template trees on `/dev/sda1`
+(ext4 root, 57 GiB free), while `/mnt/sandbox-data` is separate XFS. It was not
+modified. This installer can later adopt a drained/reprovisioned Host 1, but it
+will not migrate its populated root trees. At that time, provision persistent
+data mounting, copy and verify the two trees during the approved drain, retain
+rollback copies as appropriate, and empty the mountpoint directories before
+installation. General sandbox state and database template paths stay unchanged.
+
+Backport the installer/checker, generated mount/service/drop-in contract, fresh
+deploy and bootstrap integration, workflow bundle/trigger entries, tests and
+these transfer gates into durable new-host provisioning. The temporary branch's
+manual staging recovery is not the reusable provisioning mechanism.
+
 ### Explicit schedulable capacity
 
 Named identity-bound hosts must publish positive `VMD_SCHEDULABLE_MEMORY_MIB`
