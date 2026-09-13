@@ -148,6 +148,26 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 			return
 		}
 	}
+	// A create whose Secret Manager write outlived StaleAfter can have been
+	// reclaimed and torn down while it was in flight. A teardown that got
+	// past its own secrets step before this reference landed will never see
+	// it, and the key would outlive the tenant — so take it back here.
+	retired, rerr := h.tenantRetired(ctx, tenant)
+	if rerr != nil {
+		log.Error().Err(rerr).Msg("confirm the tenant survived its model key")
+	}
+	if retired {
+		dctx, cancel := detached(ctx)
+		if derr := h.Secrets.Delete(dctx, secrets.TenantSecretName(tenant.Slug, keyName)); derr != nil {
+			log.Error().Str("error", provisioner.ScrubString(derr.Error())).Msg("remove the model key of a retired tenant")
+		}
+		if derr := h.Store.DeleteSecretRef(dctx, p.TeamID, tenant.ID, keyName); derr != nil {
+			log.Error().Err(derr).Msg("remove the model key reference of a retired tenant")
+		}
+		cancel()
+		respondError(c, http.StatusConflict, "This tenant was deleted while it was being created. Create it again.")
+		return
+	}
 	stored := h.event(ctx, tenant, stepModelKey, tenantstore.EventOK, keyName+" stored", nil)
 
 	queued, ok := h.queueRun(c, tenant, versionAfter(tenant, stored), []string{tenantstore.StatusProvisioning}, provisioner.ModeProvision)
@@ -416,6 +436,19 @@ func (h *Handlers) reclaimStale(c *gin.Context, tenant tenantstore.Tenant) (tena
 		updated.EventSeq = reclaimed.Seq
 	}
 	return updated, true
+}
+
+// tenantRetired reports whether the tenant has been torn down, or is being
+// torn down, since this request read it.
+func (h *Handlers) tenantRetired(ctx context.Context, tenant tenantstore.Tenant) (bool, error) {
+	current, err := h.Store.GetTenant(ctx, tenant.TeamID, tenant.ID)
+	if errors.Is(err, tenantstore.ErrNotFound) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return current.Status == tenantstore.StatusDeprovisioning || current.Status == tenantstore.StatusDeleted, nil
 }
 
 func (h *Handlers) modelKeyStored(ctx context.Context, tenant tenantstore.Tenant) (bool, error) {

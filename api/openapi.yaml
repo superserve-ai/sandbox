@@ -2413,8 +2413,9 @@ paths:
           $ref: "#/components/responses/QMForbidden"
         "409":
           description: >
-            The team already has a tenant, the slug is taken, or the team is
-            mid-migration to another region
+            The team already has a tenant, the slug is taken, the team is
+            mid-migration to another region, or the tenant was deleted while
+            it was being created
           content:
             application/json:
               schema:

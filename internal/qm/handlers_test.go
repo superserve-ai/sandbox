@@ -1287,3 +1287,45 @@ func (s *ambiguousStore) InsertEvent(ctx context.Context, teamID uuid.UUID, p te
 	}
 	return e, err
 }
+
+// A Secret Manager write slow enough to outlive StaleAfter can finish after
+// a delete has already torn the tenant down. The teardown is past its own
+// secrets step by then and will never see the key, so the create takes it
+// back itself rather than leaving a secret behind for a deleted tenant.
+func TestCreateTenantTakesBackTheKeyOfARetiredTenant(t *testing.T) {
+	f := newFixture(t)
+	store := &retiringStore{Memory: f.store}
+	h := &Handlers{Store: store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
+
+	code, _ := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, validCreate())
+	if code != http.StatusConflict {
+		t.Fatalf("status %d, want 409", code)
+	}
+	if f.secrets.Has("qm-pilot-team-ANTHROPIC_API_KEY") {
+		t.Error("the model key of a deleted tenant was left in Secret Manager")
+	}
+	if len(f.trigger.Calls) != 0 {
+		t.Error("a run was triggered for a deleted tenant")
+	}
+}
+
+// retiringStore tears the tenant down while the create's model-key write is
+// still in flight, as a stale reclaim followed by a delete would.
+type retiringStore struct {
+	*tenantstore.Memory
+	done bool
+}
+
+func (s *retiringStore) SetSecretRef(ctx context.Context, teamID, tenantID uuid.UUID, name, ref string) error {
+	if err := s.Memory.SetSecretRef(ctx, teamID, tenantID, name, ref); err != nil {
+		return err
+	}
+	if !s.done {
+		s.done = true
+		if _, err := s.Memory.SetStatus(ctx, teamID, tenantID, tenantstore.StatusDeprovisioning); err != nil {
+			return err
+		}
+	}
+	return nil
+}
