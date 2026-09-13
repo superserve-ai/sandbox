@@ -86,16 +86,31 @@ func (f *Fake) Owner(_ context.Context, name string) (string, bool, error) {
 	return f.owners[name], true, nil
 }
 
-// checkOwner mirrors the GCP store: a secret that exists under another
-// owner, or under none, is not the caller's to write or remove.
+// checkOwner mirrors the GCP store: a secret under another tenant's owner
+// is not the caller's to write or remove, while an unlabelled one — written
+// before the label existed — is adopted and stamped.
 func (f *Fake) checkOwner(name, owner string) error {
 	if _, exists := f.values[name]; !exists {
 		return nil
 	}
-	if f.owners[name] == owner && owner != "" {
+	have := f.owners[name]
+	if have == "" {
+		f.owners[name] = owner
+		return nil
+	}
+	if have == owner && owner != "" {
 		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrNotOwned, name)
+}
+
+// SetUnlabelled plants a secret with no owner label, as the previous qm-api
+// revision would have written one.
+func (f *Fake) SetUnlabelled(name string, value []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.values[name] = append([]byte(nil), value...)
+	delete(f.owners, name)
 }
 
 // SetOwner plants a secret under another owner, for tests.

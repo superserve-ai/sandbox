@@ -10,10 +10,22 @@
 --
 -- The key inherits the tenant's creator as its actor, because that is how
 -- the control plane resolves what a key may do: api_key.created_by names
--- the member whose team role the request is checked against. A tenant whose
--- creator later leaves the team therefore loses the ability to create
--- sandboxes; giving tenant keys a principal of their own is the follow-up,
--- and it belongs in the control plane's authorization, not here.
+-- the member whose team role the request is checked against.
+--
+-- BLOCKER, and it is not solvable in this function: that makes the key
+-- carry its creator's whole team role. The creator is usually an owner, and
+-- internal/api aliases sandbox permissions onto settings:read/settings:write
+-- (see rbac_phase3.go), so a tenant container whose SUPERSERVE_API_KEY leaks
+-- can reach the team's secrets, templates and management endpoints — not
+-- just the sandboxes it needs. The empty scope array does not help: ordinary
+-- keys are authorized from created_by, not from scopes.
+--
+-- Closing it means giving sandbox endpoints a permission of their own and
+-- enforcing it for the __qm_tenant__ key name, which is a change to the
+-- shared auth path every control-plane request takes and belongs in its own
+-- review. Do not run tenants in production until it lands. A secondary
+-- consequence to fix with it: a tenant whose creator leaves the team loses
+-- the ability to create sandboxes.
 --
 -- The key's name and its (empty) scopes are fixed here rather than passed
 -- in: a definer function that let its caller choose them would hand qm_api

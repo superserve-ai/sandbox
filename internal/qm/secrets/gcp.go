@@ -111,13 +111,24 @@ func (g *GCP) Owner(ctx context.Context, name string) (string, bool, error) {
 	return secret.Labels[OwnerLabel], true, nil
 }
 
-// checkOwner refuses a secret that exists and does not carry owner. One
-// that does not exist passes — the caller is about to create it, or is
-// deleting something already gone.
+// checkOwner refuses a secret that exists and carries another tenant's
+// owner. One that does not exist passes — the caller is about to create it,
+// or is deleting something already gone.
 //
-// A secret with no owner label at all is refused too: these names come from
-// a chosen slug, so an unlabelled one is far likelier to be somebody else's
-// than a half-written one of ours.
+// A secret with no owner label is adopted and stamped rather than refused.
+// That is narrower than it looks and it is deliberate: qm-api and the
+// provisioner job deploy separately (job first), so a tenant created by the
+// previous API revision during that window has an unlabelled model key, and
+// refusing it would consume the slug and then fail the run partway through.
+// A tenant secret's name is qm-<slug>-<NAME> with NAME an upper-case
+// env-var, which is a shape nothing else in the project writes — unlike the
+// database and role names, where an unmarked object really could be
+// somebody else's and is refused.
+//
+// A secret this store writes is claimed on the way through, so the
+// tolerance stops applying to it. One the provisioner only ever reads —
+// the model key, written by qm-api — keeps no label until qm-api next
+// writes it, and stays adoptable meanwhile.
 func (g *GCP) checkOwner(ctx context.Context, name, owner string) error {
 	secret, err := g.svc.Projects.Secrets.Get(g.secretPath(name)).Context(ctx).Do()
 	if err != nil {
@@ -126,10 +137,31 @@ func (g *GCP) checkOwner(ctx context.Context, name, owner string) error {
 		}
 		return fmt.Errorf("get secret %s: %w", name, err)
 	}
-	if secret.Labels[OwnerLabel] == owner && owner != "" {
+	have := secret.Labels[OwnerLabel]
+	if have == "" {
+		// Written before this label existed. Claim it, so the next caller
+		// sees a labelled secret and the tolerance above stops mattering.
+		return g.adopt(ctx, name, secret, owner)
+	}
+	if have == owner && owner != "" {
 		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrNotOwned, name)
+}
+
+// adopt stamps the owner label on a secret that predates it.
+func (g *GCP) adopt(ctx context.Context, name string, secret *secretmanager.Secret, owner string) error {
+	labels := map[string]string{}
+	for k, v := range secret.Labels {
+		labels[k] = v
+	}
+	labels[OwnerLabel] = owner
+	_, err := g.svc.Projects.Secrets.Patch(g.secretPath(name), &secretmanager.Secret{Labels: labels}).
+		UpdateMask("labels").Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("claim secret %s: %w", name, err)
+	}
+	return nil
 }
 
 func isStatus(err error, code int) bool {

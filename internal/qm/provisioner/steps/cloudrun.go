@@ -153,12 +153,8 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 	// tenant's container.
 	for _, secretName := range mountedSecrets(secretEnv) {
 		if secretName != t.Env.ResendSecret {
-			owner, exists, err := s.c.Secrets.Owner(ctx, secretName)
-			if err != nil {
-				return fmt.Errorf("read the owner of %s: %w", secretName, err)
-			}
-			if exists && owner != t.Row.ID.String() {
-				return fmt.Errorf("%w: secret %s", ErrNotOwned, secretName)
+			if err := checkSecretOwner(ctx, s.c, t, secretName); err != nil {
+				return err
 			}
 		}
 		if err := s.c.Accounts.GrantSecretAccess(ctx, secretName, account); err != nil {

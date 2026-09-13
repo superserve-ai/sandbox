@@ -142,14 +142,29 @@ func (s secretsStep) Rollback(ctx context.Context, t *provisioner.Tenant) error 
 // would have done the damage before any later check ran.
 func readTenantSecret(ctx context.Context, c Clients, t *provisioner.Tenant, name string) ([]byte, error) {
 	full := t.SecretName(name)
-	owner, exists, err := c.Secrets.Owner(ctx, full)
-	if err != nil {
-		return nil, fmt.Errorf("read the owner of %s: %w", name, err)
-	}
-	if exists && owner != t.Row.ID.String() {
-		return nil, fmt.Errorf("%w: secret %s", ErrNotOwned, full)
+	if err := checkSecretOwner(ctx, c, t, full); err != nil {
+		return nil, err
 	}
 	return c.Secrets.Get(ctx, full)
+}
+
+// checkSecretOwner refuses a secret that belongs to another tenant. It is
+// the one place the rule lives, so the read, grant and write paths cannot
+// disagree — an unlabelled secret that Put would adopt but Get refused
+// would just be a bug.
+//
+// Unlabelled is adoptable: see secrets.GCP.checkOwner for why the deploy
+// window makes that necessary and why a tenant secret's name shape makes it
+// safe.
+func checkSecretOwner(ctx context.Context, c Clients, t *provisioner.Tenant, fullName string) error {
+	owner, exists, err := c.Secrets.Owner(ctx, fullName)
+	if err != nil {
+		return fmt.Errorf("read the owner of %s: %w", fullName, err)
+	}
+	if exists && owner != "" && owner != t.Row.ID.String() {
+		return fmt.Errorf("%w: secret %s", ErrNotOwned, fullName)
+	}
+	return nil
 }
 
 // putTenantSecret writes one of the tenant's secrets, labelled as its own,

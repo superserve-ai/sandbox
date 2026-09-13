@@ -672,6 +672,38 @@ func TestTeardownContinuesPastForeignResources(t *testing.T) {
 	}
 }
 
+// qm-api and the provisioner job deploy separately, job first, so a tenant
+// created by the previous API revision during that window has a model key
+// with no owner label. Refusing it would consume the slug and then fail the
+// run partway through, so it is adopted and stamped instead.
+func TestProvisionAdoptsAnUnlabelledSecretFromTheDeployWindow(t *testing.T) {
+	f := newFixture(t, false)
+	f.secrets.SetUnlabelled("qm-pilot-team-ANTHROPIC_API_KEY", []byte("sk-ant-fixture"))
+
+	if err := f.provision(t); err != nil {
+		t.Fatalf("an unlabelled model key was refused: %v", err)
+	}
+	if f.current(t).Status != tenantstore.StatusReady {
+		t.Errorf("status = %s", f.current(t).Status)
+	}
+	// A secret the provisioner writes is claimed on the way through, so
+	// the tolerance stops applying to it.
+	owner, exists, err := f.secrets.Owner(context.Background(), "qm-pilot-team-DATABASE_PASSWORD")
+	if err != nil || !exists {
+		t.Fatalf("owner lookup: %v exists=%v", err, exists)
+	}
+	if owner != f.row.ID.String() {
+		t.Errorf("owner = %q, want the tenant id", owner)
+	}
+	// And one labelled for somebody else is still refused, deploy window
+	// or not.
+	other := newFixture(t, false)
+	other.secrets.SetOwner("qm-pilot-team-ANTHROPIC_API_KEY", "somebody else")
+	if err := other.provision(t); !errors.Is(err, ErrNotOwned) {
+		t.Errorf("a secret owned by another tenant: err = %v", err)
+	}
+}
+
 // A tenant that never created a secret under a name its slug derives must
 // still be deletable: teardown skips what is not its own rather than
 // failing on it forever.
