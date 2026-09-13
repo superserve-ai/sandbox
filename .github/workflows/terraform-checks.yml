@@ -41,7 +41,6 @@ jobs:
 
       - name: Test peer CA custody and IAM with mocked providers
         run: |
-          cp infra/envs/staging/us-central1/.terraform.lock.hcl infra/modules/peer-ca/.terraform.lock.hcl
           terraform -chdir=infra/modules/peer-ca init -backend=false -lockfile=readonly -input=false
           terraform -chdir=infra/modules/peer-ca test
 
