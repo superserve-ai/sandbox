@@ -672,6 +672,49 @@ func TestTeardownContinuesPastForeignResources(t *testing.T) {
 	}
 }
 
+// A bucket's name can also collide with one in a different GCP project
+// entirely — the namespace is global — which Cloud Storage reports as a 403
+// rather than as labels this tenant can compare against its own. Teardown
+// must treat that the same as any other resource it does not own: skip past
+// it and keep going, not stop there and strand the tenant's own database,
+// service account and secrets behind it.
+func TestTeardownContinuesPastACrossProjectBucketCollision(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	f.buckets.mu.Lock()
+	f.buckets.crossProject = BucketName("example-project", "pilot-team")
+	f.buckets.mu.Unlock()
+
+	if err := f.deprovision(t); err != nil {
+		t.Fatalf("teardown stopped on a bucket claimed by another project: %v", err)
+	}
+	if f.current(t).Status != tenantstore.StatusDeleted {
+		t.Errorf("status = %s", f.current(t).Status)
+	}
+	if !f.dbs.empty() {
+		t.Error("the tenant's own database survived teardown")
+	}
+	if live := f.accounts.live(); len(live) != 0 {
+		t.Errorf("the tenant's own service account survived teardown: %v", live)
+	}
+	for _, name := range f.secrets.Names() {
+		if strings.HasPrefix(name, "qm-pilot-team-") {
+			t.Errorf("the tenant's own secret survived teardown: %s", name)
+		}
+	}
+	var skipped bool
+	for _, e := range f.events(t) {
+		if e.Step == "bucket" && e.Status == tenantstore.EventSkipped {
+			skipped = true
+		}
+	}
+	if !skipped {
+		t.Errorf("bucket did not report a skip: %v", f.events(t))
+	}
+}
+
 // qm-api and the provisioner job deploy separately, job first, so a tenant
 // created by the previous API revision during that window has a model key
 // with no owner label. Refusing it would consume the slug and then fail the
@@ -701,6 +744,49 @@ func TestProvisionAdoptsAnUnlabelledSecretFromTheDeployWindow(t *testing.T) {
 	other.secrets.SetOwner("qm-pilot-team-ANTHROPIC_API_KEY", "somebody else")
 	if err := other.provision(t); !errors.Is(err, ErrNotOwned) {
 		t.Errorf("a secret owned by another tenant: err = %v", err)
+	}
+}
+
+// The model key is written once by qm-api and after that this layer only
+// ever reads it or grants access to it — it is never Put again. So an
+// unlabelled model key must be claimed the moment it is accepted, not just
+// read past: without that, the tolerance meant for one deploy-window race
+// would apply to it for as long as it exists, and a model key later deleted
+// and recreated unlabelled by something else would keep passing the check
+// forever instead of only across that one window.
+func TestProvisionClaimsAnUnlabelledModelKeyItAccepts(t *testing.T) {
+	f := newFixture(t, false)
+	f.secrets.SetUnlabelled("qm-pilot-team-ANTHROPIC_API_KEY", []byte("sk-ant-fixture"))
+
+	if err := f.provision(t); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	owner, exists, err := f.secrets.Owner(context.Background(), "qm-pilot-team-ANTHROPIC_API_KEY")
+	if err != nil || !exists {
+		t.Fatalf("owner lookup: %v exists=%v", err, exists)
+	}
+	if owner != f.row.ID.String() {
+		t.Fatalf("the model key was accepted unlabelled but never claimed; owner = %q", owner)
+	}
+}
+
+// Claiming an unlabelled secret can itself lose a race against another
+// claim on the same name — the GCP store's patch carries no precondition
+// tying it to the unlabelled state it read, so it reads the secret back to
+// catch that instead of trusting the write blindly. checkSecretOwner must
+// speak the steps layer's own ErrNotOwned for that, not a bare error that
+// stops the run without saying a foreign resource is why.
+func TestProvisionRefusesAModelKeyClaimThatLosesItsRace(t *testing.T) {
+	f := newFixture(t, false)
+	f.secrets.SetUnlabelled("qm-pilot-team-ANTHROPIC_API_KEY", []byte("sk-ant-fixture"))
+	f.secrets.ClaimLosesRaceFor = "qm-pilot-team-ANTHROPIC_API_KEY"
+
+	err := f.provision(t)
+	if !errors.Is(err, ErrNotOwned) {
+		t.Errorf("err = %v, want ErrNotOwned", err)
+	}
+	if f.current(t).Status != tenantstore.StatusFailed {
+		t.Errorf("status = %s", f.current(t).Status)
 	}
 }
 

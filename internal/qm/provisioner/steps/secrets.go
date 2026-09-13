@@ -155,14 +155,35 @@ func readTenantSecret(ctx context.Context, c Clients, t *provisioner.Tenant, nam
 //
 // Unlabelled is adoptable: see secrets.GCP.checkOwner for why the deploy
 // window makes that necessary and why a tenant secret's name shape makes it
-// safe.
+// safe. It is claimed here too, not just read, so the tolerance lasts for
+// one visit rather than for as long as something never calls Put on it
+// again — true of the model key, which qm-api writes once at tenant
+// creation and this layer only ever reads or grants. Left unclaimed, a
+// secret deleted and recreated unlabelled later would pass this check
+// forever instead of only across the deploy window it exists for.
 func checkSecretOwner(ctx context.Context, c Clients, t *provisioner.Tenant, fullName string) error {
 	owner, exists, err := c.Secrets.Owner(ctx, fullName)
 	if err != nil {
 		return fmt.Errorf("read the owner of %s: %w", fullName, err)
 	}
-	if exists && owner != "" && owner != t.Row.ID.String() {
-		return fmt.Errorf("%w: secret %s", ErrNotOwned, fullName)
+	if !exists {
+		return nil
+	}
+	if owner != "" {
+		if owner != t.Row.ID.String() {
+			return fmt.Errorf("%w: secret %s", ErrNotOwned, fullName)
+		}
+		return nil
+	}
+	if err := c.Secrets.Claim(ctx, fullName, t.Row.ID.String()); err != nil {
+		// Claim's own read-back can lose a race against another claim on the
+		// same unlabelled secret and report ErrNotOwned; the steps layer
+		// speaks one sentinel whatever the resource, so that comes back the
+		// same way a labelled mismatch would.
+		if errors.Is(err, secrets.ErrNotOwned) {
+			return fmt.Errorf("%w: secret %s", ErrNotOwned, fullName)
+		}
+		return fmt.Errorf("claim %s: %w", fullName, err)
 	}
 	return nil
 }

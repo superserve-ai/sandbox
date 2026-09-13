@@ -303,12 +303,17 @@ func (s bucket) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	}
 	// As on the way up: emptying and deleting a bucket that is not this
 	// tenant's would destroy whatever is in it. Left alone rather than
-	// reported as an error, so the rest of the teardown still runs.
+	// reported as an error, so the rest of the teardown still runs. That
+	// includes a name claimed by another project entirely — the bucket
+	// namespace is global, so Get reports that collision as ErrNotOwned
+	// too, and treating it as anything else would strand this tenant's
+	// database, service account and secrets behind an error no retry
+	// clears.
 	existing, exists, err := s.c.Buckets.Get(ctx, name)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrNotOwned) {
 		return fmt.Errorf("look up the tenant's bucket: %w", err)
 	}
-	if exists && existing[TenantLabelKey] != t.Row.ID.String() {
+	if errors.Is(err, ErrNotOwned) || (exists && existing[TenantLabelKey] != t.Row.ID.String()) {
 		return provisioner.Skip("the bucket named for this tenant belongs to something else; left alone")
 	}
 	if err := s.c.Buckets.Delete(ctx, name); err != nil {

@@ -20,6 +20,12 @@ type Fake struct {
 	// BeforePut, when set, runs before a value is written; tests use it to
 	// land a concurrent change while a write is in flight.
 	BeforePut func()
+	// ClaimLosesRaceFor, when set to a name, makes Claim on that name behave
+	// as the GCP store does when its post-patch read-back finds a different
+	// owner than the one it just wrote: another claim landed first, so this
+	// one reports ErrNotOwned instead of the success a blind patch would
+	// have reported.
+	ClaimLosesRaceFor string
 }
 
 func NewFake() *Fake {
@@ -102,6 +108,33 @@ func (f *Fake) checkOwner(name, owner string) error {
 		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrNotOwned, name)
+}
+
+// Claim stamps owner on a secret that exists with no owner label, mirroring
+// the GCP store's tolerance for one written before the label existed. A
+// secret found already labelled — its own doing or a race that landed
+// first — is checked against owner rather than treated as a success just
+// because it is not empty.
+func (f *Fake) Claim(_ context.Context, name, owner string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Err != nil {
+		return f.Err
+	}
+	if _, exists := f.values[name]; !exists {
+		return nil
+	}
+	if name == f.ClaimLosesRaceFor {
+		return fmt.Errorf("%w: %s", ErrNotOwned, name)
+	}
+	if have := f.owners[name]; have != "" {
+		if have != owner {
+			return fmt.Errorf("%w: %s", ErrNotOwned, name)
+		}
+		return nil
+	}
+	f.owners[name] = owner
+	return nil
 }
 
 // SetUnlabelled plants a secret with no owner label, as the previous qm-api

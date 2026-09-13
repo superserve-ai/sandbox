@@ -47,6 +47,15 @@ type Store interface {
 	// Delete removes the secret and every version. Idempotent, and
 	// ErrNotOwned when the secret belongs to another tenant.
 	Delete(ctx context.Context, name, owner string) error
+	// Claim stamps owner on a secret that exists with no owner label — one
+	// written before the label existed, or one qm-api writes but the
+	// provisioner only ever reads (the model key). A secret that already
+	// carries an owner, or does not exist, is left untouched: the caller
+	// has already decided elsewhere that reaching this call was safe.
+	// Without it, the tolerance Owner extends to an unlabelled secret would
+	// last for that secret's whole lifetime instead of just its first visit
+	// after the one that left it unlabelled.
+	Claim(ctx context.Context, name, owner string) error
 }
 
 // Names of the per-tenant secrets. The model key is written by qm-api at

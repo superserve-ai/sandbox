@@ -149,17 +149,69 @@ func (g *GCP) checkOwner(ctx context.Context, name, owner string) error {
 	return fmt.Errorf("%w: %s", ErrNotOwned, name)
 }
 
-// adopt stamps the owner label on a secret that predates it.
+// Claim stamps owner on a secret that exists with no owner label. The
+// caller is expected to have checked Owner first and only reach here on the
+// unlabelled case, but this Get is its own read, not a reuse of that
+// caller's — another claim can have landed in between, so a label found
+// here is checked against owner rather than treated as this call's own
+// doing just because it is not empty.
+func (g *GCP) Claim(ctx context.Context, name, owner string) error {
+	if err := ValidName(name); err != nil {
+		return err
+	}
+	secret, err := g.svc.Projects.Secrets.Get(g.secretPath(name)).Context(ctx).Do()
+	if err != nil {
+		if isStatus(err, http.StatusNotFound) {
+			return nil
+		}
+		return fmt.Errorf("get secret %s: %w", name, err)
+	}
+	if have := secret.Labels[OwnerLabel]; have != "" {
+		if have != owner {
+			return fmt.Errorf("%w: %s", ErrNotOwned, name)
+		}
+		return nil
+	}
+	return g.adopt(ctx, name, secret, owner)
+}
+
+// adopt stamps the owner label on a secret that predates it. The patch
+// carries the etag this call's own Get just read as a precondition, so it
+// is not the only writer that could land between that Get and the Patch
+// here: another caller claiming the same unlabelled secret for a different
+// owner moves the etag first, and this one is refused rather than
+// overwriting it. Without that precondition, a read-back after a blind
+// patch cannot close the race either — two concurrent claimants can each
+// read back their own write before the other's lands, and both would
+// report success though only one ends up the label actually stored.
 func (g *GCP) adopt(ctx context.Context, name string, secret *secretmanager.Secret, owner string) error {
 	labels := map[string]string{}
 	for k, v := range secret.Labels {
 		labels[k] = v
 	}
 	labels[OwnerLabel] = owner
-	_, err := g.svc.Projects.Secrets.Patch(g.secretPath(name), &secretmanager.Secret{Labels: labels}).
-		UpdateMask("labels").Context(ctx).Do()
-	if err != nil {
+	_, err := g.svc.Projects.Secrets.Patch(g.secretPath(name), &secretmanager.Secret{
+		Labels: labels,
+		Etag:   secret.Etag,
+	}).UpdateMask("labels").Context(ctx).Do()
+	if err != nil && !isStatus(err, http.StatusConflict) && !isStatus(err, http.StatusPreconditionFailed) {
 		return fmt.Errorf("claim secret %s: %w", name, err)
+	}
+	// A conflict on the etag proves only that something changed the secret
+	// between our Get and this Patch — not that whatever changed it was a
+	// different owner: a concurrent claim for this same owner, or some
+	// other metadata write entirely, moves the etag too. Reading back and
+	// judging the label actually stored is what decides foreign or not,
+	// for a clean patch as much as a conflicted one — this API surface may
+	// not enforce the etag as a precondition here at all, in which case an
+	// apparently clean patch could just as easily have overwritten a
+	// concurrent claim.
+	claimed, exists, err := g.Owner(ctx, name)
+	if err != nil {
+		return fmt.Errorf("confirm the claim on secret %s: %w", name, err)
+	}
+	if exists && claimed != owner {
+		return fmt.Errorf("%w: %s", ErrNotOwned, name)
 	}
 	return nil
 }

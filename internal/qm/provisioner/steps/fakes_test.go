@@ -267,6 +267,10 @@ type fakeBuckets struct {
 	hmac    map[string]string // accessID -> account
 	created int
 	minted  int
+	// crossProject, when set to a bucket name, makes Get report it as
+	// claimed by another GCP project — the real client's ErrNotOwned-
+	// wrapped 403, which an in-memory map has no other way to produce.
+	crossProject string
 }
 
 func newFakeBuckets() *fakeBuckets {
@@ -279,6 +283,9 @@ func (f *fakeBuckets) Get(_ context.Context, name string) (map[string]string, bo
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if name == f.crossProject {
+		return nil, false, fmt.Errorf("%w: bucket %s exists in another project", ErrNotOwned, name)
+	}
 	labels, ok := f.buckets[name]
 	return labels, ok, nil
 }

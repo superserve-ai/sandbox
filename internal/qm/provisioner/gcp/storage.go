@@ -63,8 +63,24 @@ func (b *Buckets) Get(ctx context.Context, name string) (map[string]string, bool
 	case isStatus(err, http.StatusForbidden):
 		// A name taken by another project: the bucket namespace is global,
 		// so this is a naming collision, not a permissions bug, and it is
-		// not something a retry will resolve.
-		return nil, false, fmt.Errorf("bucket %s exists in another project", name)
+		// not something a retry will resolve. The shared sentinel, so
+		// provisioning still fails on it but a teardown treats it as absent
+		// instead of stopping there and stranding the tenant's database,
+		// service account and secrets behind it.
+		//
+		// GCS deliberately answers this way for both causes of a 403 here —
+		// a name genuinely owned elsewhere, or this project's own access to
+		// its own bucket having regressed — so as not to leak whether a
+		// bucket a caller cannot see exists at all. There is nothing further
+		// to inspect in the response that tells the two apart, and the
+		// scenario this sentinel exists for is exactly a recorded bucket
+		// this tenant did once own, deleted, with the name then reclaimed
+		// by another project: narrowing this to "only when never recorded"
+		// would refuse that exact case again. An access regression broad
+		// enough to hit this path would show up the same way across every
+		// tenant's bucket operations, not as a single quiet one; this skip
+		// is also recorded on the tenant's own event log, not silent.
+		return nil, false, fmt.Errorf("%w: bucket %s exists in another project", steps.ErrNotOwned, name)
 	default:
 		return nil, false, fmt.Errorf("get bucket %s: %w", name, err)
 	}
