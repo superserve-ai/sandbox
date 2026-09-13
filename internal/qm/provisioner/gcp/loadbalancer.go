@@ -64,12 +64,6 @@ func NewLoadBalancer(ctx context.Context, project, region, urlMap string, opts .
 // corrects the host rule and path matcher if they point somewhere stale.
 // Every part of it is idempotent, so it is safe on every run.
 func (l *LoadBalancer) EnsureHostRule(ctx context.Context, host, cloudRunService, owner string) error {
-	// A hostname already routed by another workload is not ours to take.
-	// addRoute below would lift it out of whatever rule carries it and
-	// point it at this tenant, which teardown then refuses to undo.
-	if err := l.routeIsOurs(ctx, host, owner); err != nil {
-		return err
-	}
 	// The NEG, the backend service and the path matcher all take the Cloud
 	// Run service's name, so the four read as one set in the console.
 	name := cloudRunService
@@ -80,8 +74,15 @@ func (l *LoadBalancer) EnsureHostRule(ctx context.Context, host, cloudRunService
 	if err != nil {
 		return err
 	}
-	return l.patchURLMap(ctx, func(m *compute.UrlMap) bool {
-		return addRoute(m, host, name, backend)
+	// The ownership check runs inside the compare-and-swap, against the map
+	// each attempt just read: a hostname another workload claims between a
+	// check outside the loop and the patch would otherwise be lifted out of
+	// its rule and pointed at this tenant.
+	return l.patchURLMap(ctx, func(m *compute.UrlMap) (bool, error) {
+		if err := l.routeIsOursIn(ctx, m, host, owner); err != nil {
+			return false, err
+		}
+		return addRoute(m, host, name, backend), nil
 	})
 }
 
@@ -89,21 +90,20 @@ func (l *LoadBalancer) EnsureHostRule(ctx context.Context, host, cloudRunService
 // be deleted while the URL map still references it, and the NEG cannot be
 // deleted while a backend service still points at it.
 func (l *LoadBalancer) RemoveHostRule(ctx context.Context, host, owner string) error {
-	// Before the map is touched at all. A provision that stopped because
-	// the derived NEG or backend belonged to another workload still reaches
-	// teardown, and a patch that ran first would have removed that
-	// workload's hostname from the shared map before the ownership error
-	// came back.
-	if err := l.routeIsOurs(ctx, host, owner); err != nil {
-		return err
-	}
+	// The ownership check is inside the compare-and-swap for the same
+	// reason as on the way up, and it is what keeps a teardown from
+	// removing another workload's hostname: a provision that stopped
+	// because the derived NEG or backend was foreign still reaches here.
 	var name string
 	var shared bool
-	if err := l.patchURLMap(ctx, func(m *compute.UrlMap) bool {
+	if err := l.patchURLMap(ctx, func(m *compute.UrlMap) (bool, error) {
+		if err := l.routeIsOursIn(ctx, m, host, owner); err != nil {
+			return false, err
+		}
 		matcher, changed := removeRoute(m, host)
 		name = matcher
 		shared = changed && matcher == ""
-		return changed
+		return changed, nil
 	}); err != nil {
 		return err
 	}
@@ -127,15 +127,12 @@ func (l *LoadBalancer) RemoveHostRule(ctx context.Context, host, owner string) e
 	return l.deleteNEG(ctx, name, owner)
 }
 
-// routeIsOurs refuses to touch a hostname whose backing resources belong to
-// something else. It resolves the host's path matcher to the backend service
-// behind it and checks that backend's marker; a host with no rule, or a
-// matcher with no backend, is nothing to protect.
-func (l *LoadBalancer) routeIsOurs(ctx context.Context, host, owner string) error {
-	urlMap, err := l.svc.UrlMaps.Get(l.project, l.urlMap).Context(ctx).Do()
-	if err != nil {
-		return fmt.Errorf("read url map %s: %w", l.urlMap, err)
-	}
+// routeIsOursIn refuses to touch a hostname whose backing resources belong
+// to something else, judged against the map the caller is about to mutate.
+// It resolves the host's path matcher to the backend service behind it and
+// checks that backend's marker; a host with no rule, or a matcher with no
+// backend, is nothing to protect.
+func (l *LoadBalancer) routeIsOursIn(ctx context.Context, urlMap *compute.UrlMap, host, owner string) error {
 	var matcher string
 	for _, rule := range urlMap.HostRules {
 		if slices.Contains(rule.Hosts, host) {
@@ -320,14 +317,18 @@ func (l *LoadBalancer) deleteBackendService(ctx context.Context, name, owner str
 // patchURLMap applies mutate to the shared map under its fingerprint, so a
 // concurrent edit is a retry rather than a silently lost route. mutate
 // reports whether it changed anything; when it does not, nothing is sent.
-func (l *LoadBalancer) patchURLMap(ctx context.Context, mutate func(*compute.UrlMap) bool) error {
+func (l *LoadBalancer) patchURLMap(ctx context.Context, mutate func(*compute.UrlMap) (bool, error)) error {
 	var lastErr error
 	for attempt := 0; attempt < urlMapAttempts; attempt++ {
 		current, err := l.svc.UrlMaps.Get(l.project, l.urlMap).Context(ctx).Do()
 		if err != nil {
 			return fmt.Errorf("read url map %s: %w", l.urlMap, err)
 		}
-		if !mutate(current) {
+		changed, err := mutate(current)
+		if err != nil {
+			return err
+		}
+		if !changed {
 			return nil
 		}
 		op, err := l.svc.UrlMaps.Patch(l.project, l.urlMap, &compute.UrlMap{
