@@ -320,6 +320,22 @@ def check_bundle_parity() -> None:
         sys.exit(f"deploy-vmd.py: installed by the remote script but not bundled: {missing}")
 
 
+def drain_configuration(environment):
+    drain_enabled = environment.get("VMD_DRAIN_ENABLED", "")
+    admission_caller = environment.get("VMD_ADMISSION_CALLER_EMAIL", "")
+    if drain_enabled not in ("", "true"):
+        raise SystemExit("VMD_DRAIN_ENABLED may only enroll with true; disabling a persisted fence requires a separate retirement procedure")
+    if drain_enabled and (not admission_caller.endswith(".iam.gserviceaccount.com") or any(c.isspace() for c in admission_caller)):
+        raise SystemExit("VMD_ADMISSION_CALLER_EMAIL must name the authorized control-plane service account")
+    drain_config = ""
+    if drain_enabled:
+        for key, value in (("VMD_DRAIN_ENABLED", drain_enabled), ("VMD_ADMISSION_CALLER_EMAIL", admission_caller)):
+            drain_config += f"sudo sed -i '/^{key}=/d' /etc/sandbox/vmd.env\n"
+            drain_config += f"printf '%s\\n' {shlex.quote(key + '=' + value)} | sudo tee -a /etc/sandbox/vmd.env >/dev/null\n"
+
+    return drain_config
+
+
 def main() -> int:
     check_bundle_parity()
     project = os.environ["GCP_PROJECT"]
@@ -341,18 +357,7 @@ def main() -> int:
     # Empty = skip, so a fleet-wide deploy never writes a redirect to a host
     # whose resolver isn't on this port. Set per host/region to match unbound.
     dns_redirect_port = os.environ.get("VMD_DNS_REDIRECT_PORT", "")
-    drain_enabled = os.environ.get("VMD_DRAIN_ENABLED", "")
-    admission_caller = os.environ.get("VMD_ADMISSION_CALLER_EMAIL", "")
-    if drain_enabled not in ("", "true"):
-        raise SystemExit("VMD_DRAIN_ENABLED may only enroll with true; disabling a persisted fence requires a separate retirement procedure")
-    if drain_enabled and (not admission_caller.endswith(".iam.gserviceaccount.com") or any(c.isspace() for c in admission_caller)):
-        raise SystemExit("VMD_ADMISSION_CALLER_EMAIL must name the authorized control-plane service account")
-    drain_config = ""
-    if drain_enabled:
-        for key, value in (("VMD_DRAIN_ENABLED", drain_enabled), ("VMD_ADMISSION_CALLER_EMAIL", admission_caller)):
-            drain_config += f"sudo sed -i '/^{key}=/d' /etc/sandbox/vmd.env\n"
-            drain_config += f"printf '%s\\n' {shlex.quote(key + '=' + value)} | sudo tee -a /etc/sandbox/vmd.env >/dev/null\n"
-
+    drain_config = drain_configuration(os.environ)
 
     # Pre-quote every value injected into the remote shell script. These come
     # from CI secrets / Secret Manager and must be treated as arbitrary text:

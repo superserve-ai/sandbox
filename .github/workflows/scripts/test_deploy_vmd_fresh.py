@@ -64,7 +64,7 @@ class FreshHostTest(unittest.TestCase):
                     asset.parent.mkdir(parents=True, exist_ok=True)
                     asset.write_text('approved artifact')
             supplied = {}
-            values = {'host_capacity': deploy_vmd.capacity_script('110000', '32'), 'service': 'superserve-vmd.service', 'q_host_id_line': shlex.quote('HOST_ID=example-host'), 'q_host_region_line': shlex.quote('HOST_REGION=' + deploy_vmd.deployment_host_region(region, region + '-a'))}
+            values = {'drain_config': '', 'host_capacity': deploy_vmd.capacity_script('110000', '32'), 'service': 'superserve-vmd.service', 'q_host_id_line': shlex.quote('HOST_ID=example-host'), 'q_host_region_line': shlex.quote('HOST_REGION=' + deploy_vmd.deployment_host_region(region, region + '-a'))}
             for key, name, value in [('cpu', 'CONTROL_PLANE_URL', 'https://example.test'),
                                      ('token', 'INTERNAL_API_TOKEN', 'example-token'),
                                      ('db', 'DATABASE_URL', 'postgres://example.test/db')]:
@@ -228,7 +228,7 @@ journalctl() { :; }
     def test_fresh_readiness_precedes_any_vmd_restart_and_no_ca_copy(self):
         gate = SOURCE.index('# CD targets existing cells:')
         self.assertLess(gate, SOURCE.index('sudo systemctl restart {service}'))
-        self.assertLess(SOURCE.index('# Fresh-host env bootstrap:'), SOURCE.index('sudo sed -i'))
+        self.assertLess(SOURCE.index('# Fresh-host env bootstrap:'), SOURCE.index('sudo sed -i', SOURCE.index('inject_script =')))
         self.assertNotIn('gen-secretsproxy-ca', SOURCE)
         self.assertNotIn('openssl req', SOURCE)
         self.assertIn('SECRETSPROXY_FRESH" = 1', SOURCE)
