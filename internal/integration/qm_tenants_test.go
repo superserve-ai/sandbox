@@ -74,6 +74,17 @@ func seedQMTeamAndKey(t *testing.T) (uuid.UUID, uuid.UUID) {
 	if err != nil {
 		t.Fatalf("create team: %v", err)
 	}
+	userID := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO profile (id, email, provider, provider_id) VALUES ($1, $2, 'google', $3)`,
+		userID, "qm-"+userID.String()[:8]+"@example.com", "qm-"+userID.String()); err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`,
+		team.ID, userID); err != nil {
+		t.Fatalf("create membership: %v", err)
+	}
 	key, err := testQueries.CreateAPIKeyV2(ctx, db.CreateAPIKeyV2Params{
 		TeamID:  team.ID,
 		KeyHash: "qm-" + uuid.NewString(),
