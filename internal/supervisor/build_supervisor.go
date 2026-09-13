@@ -398,6 +398,9 @@ func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBui
 		BuildVMID:  buildVMID,
 	})
 	if err != nil {
+		if s.requeueRefusedBuild(ctx, row.ID, err) {
+			return err
+		}
 		// vmd may have accepted the request; let pollActive reconcile via
 		// GetBuildStatus rather than failing here and orphaning the VM.
 		rowLog.Warn().Err(err).Str("build_vm_id", buildVMID).Msg("vmd.BuildTemplate dispatch errored; next poll will reconcile")
@@ -848,4 +851,18 @@ func buildHostAccepting(status string, err error) bool {
 		return true
 	}
 	return status == "active"
+}
+
+// Only a definitive pre-boot refusal can undo a dispatch claim. Transport
+// uncertainty must remain claimed so polling can discover a running build.
+func (s *BuildSupervisor) requeueRefusedBuild(ctx context.Context, id uuid.UUID, dispatchErr error) bool {
+	if !vmdclient.IsAdmissionRefusal(dispatchErr) {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if _, err := s.q.RequeueBuildDispatch(ctx, id); err != nil {
+		s.log.Error().Err(err).Str("build_id", id.String()).Msg("requeue after admission refusal failed")
+	}
+	return true
 }

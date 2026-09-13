@@ -74,13 +74,27 @@ func (s *LeastLoaded) ttl() time.Duration {
 }
 
 func (s *LeastLoaded) SelectHost(ctx context.Context, requiredCapabilities []string) (string, uint64, error) {
+	return s.SelectHostExcluding(ctx, requiredCapabilities, "")
+}
+
+// Exclusion is request-local and used only after a definitive pre-boot refusal.
+func (s *LeastLoaded) SelectHostExcluding(ctx context.Context, requiredCapabilities []string, excluded string) (string, uint64, error) {
 	entry, err := s.loadHosts(ctx, requiredCapabilities)
 	if err != nil {
 		return "", 0, err
 	}
 	hosts := entry.hosts
+	if excluded != "" {
+		filtered := make([]db.ListActiveHostsByLoadRow, 0, len(hosts))
+		for _, host := range hosts {
+			if host.ID != excluded {
+				filtered = append(filtered, host)
+			}
+		}
+		hosts = filtered
+	}
 	if len(hosts) == 0 {
-		if s.DefaultHostID != "" {
+		if s.DefaultHostID != "" && s.DefaultHostID != excluded {
 			// The legacy fallback exists so creation works before the host
 			// table is populated. It must not route to a row that exists in
 			// a non-active state — a freshly self-registered 'provisioning'

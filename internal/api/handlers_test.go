@@ -44,6 +44,7 @@ type stubVMD struct {
 	// is what the stubbed daemon claims to have applied (zero = old daemon).
 	resumePolicyFn   func(access string, ports map[int32]vmdclient.PortPolicy, revision int64)
 	resumeAttest     vmdclient.ResumeAttestation
+	restoreIntent    vmdclient.AdmissionIntent
 	restoreFn        func(ctx context.Context, id, snapshotPath, memPath string) (string, error)
 	restorePolicyFn  func(access string, ports map[int32]vmdclient.PortPolicy, revision int64)
 	deleteSnapshotFn func(ctx context.Context, id, snapshotPath, memPath string) error
@@ -117,8 +118,9 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, s.resumeAttest, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits, intent vmdclient.AdmissionIntent) (string, uint32, uint32, string, error) {
 	s.restoreLimits = limits
+	s.restoreIntent = intent
 	protocol := preview.HostCapabilityPorts
 	if s.restorePreviewProtocol != nil {
 		protocol = *s.restorePreviewProtocol
@@ -322,6 +324,9 @@ func hostRow(h db.Host) *mockRow {
 		*dest[8].(*time.Time) = h.CreatedAt
 		*dest[9].(*time.Time) = h.UpdatedAt
 		*dest[10].(*bool) = h.IdentityBound
+		if len(dest) > 11 {
+			*dest[11].(*int64) = h.AdmissionRevision
+		}
 		return nil
 	}}
 }
@@ -1204,7 +1209,7 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 				return sandboxRow(sb)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPublic, 8)
-			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+			case (strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one")):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: ClaimResume :one"):
 				return claimResumeRow(sb, &snap, preview.AccessPublic, 7, publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
@@ -1247,6 +1252,15 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 	if _, ok := reconciled.Ports[8080]; !ok || len(reconciled.Ports) != 1 {
 		t.Fatalf("reconciled ports = %#v, want {8080}", reconciled.Ports)
 	}
+	// This path reaches vmd through the CREATE rpc, but it is a resume: the
+	// sandbox exists and is bound to this host. Declaring CREATE here would
+	// charge it a second time on a capacity-enforcing host, and let a full
+	// host refuse a sandbox that has nowhere else to go. The daemon cannot
+	// catch the mistake — it takes this path precisely when it has no
+	// record of the sandbox — so the assertion has to live here.
+	if vmd.restoreIntent != vmdclient.IntentResume {
+		t.Errorf("stateless-resume fallback declared intent %v, want IntentResume", vmd.restoreIntent)
+	}
 }
 
 func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(t *testing.T) {
@@ -1281,7 +1295,7 @@ func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(
 				return sandboxRow(sb)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPrivate, 8)
-			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+			case (strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one")):
 				capabilityRequirements = append(capabilityRequirements, append([]string(nil), args[0].([]string)...))
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
@@ -2323,7 +2337,7 @@ func TestCreateSandbox_Success(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2386,6 +2400,13 @@ func TestCreateSandbox_Success(t *testing.T) {
 	if v := body["memory_mib"].(float64); v == 0 {
 		t.Error("memory_mib is 0 — VMD's reported value was not propagated to the response")
 	}
+	// A create must say so. The same RPC also serves the stateless-resume
+	// fallback, and a host enforcing local capacity refuses a boot whose
+	// intent is unset — so an undeclared create is not a cosmetic omission,
+	// it is a create that cannot land on an enforcing host.
+	if vmd.restoreIntent != vmdclient.IntentCreate {
+		t.Errorf("restore intent = %v, want IntentCreate", vmd.restoreIntent)
+	}
 }
 
 func TestCreateSandbox_PrivateUsesBrowserCapablePlacementAndAttestation(t *testing.T) {
@@ -2411,7 +2432,7 @@ func TestCreateSandbox_PrivateUsesBrowserCapablePlacementAndAttestation(t *testi
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			switch {
-			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+			case (strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one")):
 				checkedCapabilities = append(checkedCapabilities, args[0].([]string)...)
 				return previewCapableHostRow()
 			case strings.Contains(sql, "INSERT INTO sandbox"):
@@ -2473,7 +2494,7 @@ func TestCreateSandbox_RechecksCapabilitiesAfterSchedulerSelection(t *testing.T)
 			switch {
 			case strings.Contains(sql, "FROM template"):
 				return templateRow(defaultReadyTemplate())
-			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+			case (strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one")):
 				checks++
 				return scalarBoolRow(!slices.Contains(args[0].([]string), preview.HostCapabilityPortBrowserAuth))
 			case strings.Contains(sql, "INSERT INTO sandbox"):
@@ -2516,7 +2537,7 @@ func TestPlaceCreateReselectsWhenPreflightRejectsHost(t *testing.T) {
 	scheduler := &stubScheduler{hosts: []string{"host-gone", "host-live"}}
 	var checked []string
 	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-		if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+		if !strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 			return errorRow(fmt.Errorf("unexpected query: %s", sql))
 		}
 		hostID := args[1].(string)
@@ -2587,7 +2608,7 @@ func TestCreateSandbox_PreviewAttestationSkewAndFailClosed(t *testing.T) {
 			mock := &mockDBTX{
 				queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 					switch {
-					case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+					case strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one"):
 						return previewCapableHostRow()
 					case strings.Contains(sql, "INSERT INTO sandbox"):
 						return sandboxRow(db.Sandbox{
@@ -2647,7 +2668,7 @@ func TestCreateSandbox_InjectEnvUnimplementedTolerated(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2701,7 +2722,7 @@ func TestCreateSandbox_InjectEnvErrorFails(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2767,7 +2788,7 @@ func newHostnameStampEnv(t *testing.T, stampErr error) *hostnameStampEnv {
 	}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2920,7 +2941,7 @@ func TestCreateSandbox_QuotaExceeded(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -2981,7 +3002,7 @@ func TestCreateSandbox_TransientVMDErrorCancelsPendingInsert(t *testing.T) {
 
 			mock := &mockDBTX{
 				queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
-					if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+					if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 						return previewCapableHostRow()
 					}
 					if strings.Contains(sql, "-- name: GetSandbox :one") {
@@ -3039,7 +3060,7 @@ func TestCreateSandbox_VMDFileMissingReturnsHostStateMissingEvenIfInsertCancels(
 
 	mock := &mockDBTX{
 		queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "-- name: GetSandbox :one") {
@@ -3096,7 +3117,7 @@ func TestCreateSandbox_PermanentVMDFailureReturnsInternalWithoutWaitingForCleanu
 
 	mock := &mockDBTX{
 		queryRowFn: func(ctx context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "-- name: GetSandbox :one") {
@@ -3179,7 +3200,7 @@ func TestCreateSandbox_TransientDBErrorReturnsRetryableFailure(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -3271,7 +3292,7 @@ func TestCreateSandbox_TransientDBErrorSkipsMissingRowReconcile(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -3338,7 +3359,7 @@ func TestCreateSandbox_VMDTransientFailureRetriesFailedStateWrite(t *testing.T) 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+			case strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one"):
 				return previewCapableHostRow()
 			case strings.Contains(sql, "INSERT INTO sandbox"):
 				return sandboxRow(db.Sandbox{
@@ -3401,7 +3422,7 @@ func TestCreateSandbox_VMDTransientFailureWithoutReconciliationReturnsInternal(t
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+			case strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one"):
 				return previewCapableHostRow()
 			case strings.Contains(sql, "INSERT INTO sandbox"):
 				return sandboxRow(db.Sandbox{
@@ -3456,7 +3477,7 @@ func TestCreateSandbox_VMDError(t *testing.T) {
 
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -3841,7 +3862,7 @@ func TestCreateSandbox_WithMetadata(t *testing.T) {
 	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -3904,7 +3925,7 @@ func TestCreateSandbox_EmptyMetadataIsObjectNotNull(t *testing.T) {
 	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -4197,7 +4218,7 @@ func TestCreateSandbox_InsertCarriesTemplateShape(t *testing.T) {
 	var sawVcpu, sawMem bool
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -4252,7 +4273,7 @@ func TestCreateSandboxDeclaresResourceLimitsToVMD(t *testing.T) {
 	vmd := &stubVMD{}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+			if strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 				return previewCapableHostRow()
 			}
 			if strings.Contains(sql, "INSERT INTO sandbox") {
@@ -4306,7 +4327,7 @@ func TestPlaceCreateChecksCapabilitiesOncePerHost(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var reads int
 			mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-				if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+				if !strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 					return errorRow(fmt.Errorf("unexpected query: %s", sql))
 				}
 				reads++
@@ -4342,7 +4363,7 @@ func TestPlaceCreateDoesNotRecheckAnUnchangedReselection(t *testing.T) {
 	scheduler := &stubScheduler{hostID: "only-host", sameSet: true}
 	reads := 0
 	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-		if strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+		if strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 			reads++
 			return &mockRow{scanFn: func(dest ...any) error {
 				*dest[0].(*bool) = false
@@ -4388,7 +4409,7 @@ func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.
 			switch {
 			case strings.Contains(sql, "-- name: ClaimResume :one"):
 				return claimResumeRow(sb, &snap, preview.AccessPublic, 3)
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+			case strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one"):
 				return scalarBoolRow(false)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
@@ -4433,7 +4454,7 @@ func TestPlaceCreateRechecksTheSameHostAfterAFreshLoad(t *testing.T) {
 	scheduler := &stubScheduler{hostID: "flapping-host"}
 	reads := 0
 	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-		if !strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one") {
+		if !strings.Contains(sql, "HostHasCapabilitiesUnlocked :one") {
 			return errorRow(fmt.Errorf("unexpected query: %s", sql))
 		}
 		reads++
@@ -4515,7 +4536,7 @@ func TestResumeSandbox_AttestationDecidesReapply(t *testing.T) {
 					switch {
 					case strings.Contains(sql, "-- name: ClaimResume :one"):
 						return claimResumeRow(sb, &snap, preview.AccessPublic, 7, publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
-					case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+					case strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one"):
 						return scalarBoolRow(true)
 					case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 						policyReads++
@@ -4739,7 +4760,7 @@ func TestActivateSandbox_ReportsPolicyTheDaemonKept(t *testing.T) {
 			switch {
 			case strings.Contains(sql, "-- name: ClaimResume :one"):
 				return claimResumeRow(sb, &snap, preview.AccessPublic, 7)
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+			case strings.Contains(sql, "HostHasCapabilities :one") || strings.Contains(sql, "HostHasCapabilitiesUnlocked :one"):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPrivate, 9)
@@ -4805,9 +4826,9 @@ func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *test
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+			case strings.Contains(sql, "HostHasCapabilitiesUnlocked :one"):
 				return scalarBoolRow(true)
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+			case strings.Contains(sql, "HostHasCapabilities :one"):
 				lockedChecks++
 				return scalarBoolRow(lockedChecks == 1)
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):

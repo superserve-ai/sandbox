@@ -16,6 +16,7 @@ import (
 // GRPCAdapter wraps a Manager to implement vmdpb.VMDaemonServer.
 type GRPCAdapter struct {
 	vmdpb.UnimplementedVMDaemonServer
+	admissionCaller string
 	mgr             *Manager
 	secrets         *SecretsBrokerClient
 	sandboxProxyURL string // SECRETSPROXY_SANDBOX_ADDR — empty disables HTTPS_PROXY injection
@@ -84,6 +85,16 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 	}
 	defer unlockOp()
 
+	// A resume is never refused on the operator's sandbox limit — it is
+	// bound to this host and has nowhere else to go — but it is still
+	// charged, so the host's own count reflects the load it is carrying.
+	// Inside the op lock, so a resume racing its own retry cannot be
+	// charged by one attempt and released by the other.
+	if err := admissionError(a.mgr.AdmissionGate().BeginBoot(req.GetVmId(), intentFromProto(req.GetAdmissionIntent()))); err != nil {
+		return nil, err
+	}
+	defer a.mgr.AdmissionGate().EndBoot(req.GetVmId())
+
 	var resumeNetworkRules *sandboxNetworkRules
 	if netCfg := req.GetSandboxNetwork(); netCfg != nil {
 		egress := netCfg.GetEgress()
@@ -125,7 +136,10 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 
 	inst, rulesApplied, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
 	if err != nil {
-		return nil, err
+		// A resume reuses its recorded index and should never reach the
+		// operator's slot limit, but it can exhaust the kernel range —
+		// map here so that surfaces as capacity rather than Unknown.
+		return nil, admissionError(err)
 	}
 
 	// Resume is a no-op for secrets: the agent's HTTPS_PROXY (with its JWT) and
@@ -218,9 +232,25 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive preview_policy_revision")
 	}
 
+	// Admission before any launch work: a local gate exists to refuse in
+	// microseconds, before Firecracker, the filesystem or the network have
+	// been touched. The intent is the caller's because this RPC serves both
+	// a genuine create and the caller's stateless-resume fallback, and the
+	// daemon cannot tell those apart — the fallback is taken precisely when
+	// this daemon has no record of the sandbox.
+	if err := admissionError(a.mgr.AdmissionGate().BeginBoot(req.GetVmId(), intentFromProto(req.GetAdmissionIntent()))); err != nil {
+		return nil, err
+	}
+	defer a.mgr.AdmissionGate().EndBoot(req.GetVmId())
+
 	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
 	if err != nil {
-		return nil, err
+		// Mapped on the way out too, not only around the gate above: the
+		// operator's slot limit is enforced inside the allocator, so it
+		// surfaces from deep in the launch rather than from admission.
+		// Returned raw it would reach the caller as Unknown — unretryable,
+		// and indistinguishable from a genuine host fault.
+		return nil, admissionError(err)
 	}
 
 	// Env vars are pushed in a separate InjectSandboxEnv call so the control
@@ -585,6 +615,9 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 		BuildVMID:  req.GetBuildVmId(),
 	})
 	if err != nil {
+		if mapped := admissionError(err); status.Code(mapped) != codes.Unknown {
+			return nil, mapped
+		}
 		return nil, status.Errorf(codes.Internal, "build template: %v", err)
 	}
 

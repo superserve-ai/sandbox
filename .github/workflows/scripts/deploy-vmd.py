@@ -151,7 +151,7 @@ def deployment_host_region(region, zone):
     return region or match[1]
 
 
-def runtime_input_preflight(control_plane_url, database_url, internal_api_token):
+def runtime_input_preflight(control_plane_url, database_url, internal_api_token, service="superserve-vmd"):
     """Read-only host check; pass only input presence, never secrets, to the probe."""
     script = textwrap.dedent("""
         set -euo pipefail
@@ -164,7 +164,14 @@ def runtime_input_preflight(control_plane_url, database_url, internal_api_token)
             SECRETSPROXY_FRESH=1
         fi
         if [ "$(sudo systemctl show -p LoadState --value agentbox-vmd.service)" = loaded ]; then
-            SECRETSPROXY_FRESH=1
+            # An inactive, disabled leftover unit does not make a healthy modern
+            # host fresh. All runtime/CA completeness checks still apply.
+            if [ "$(sudo systemctl show -p ActiveState --value agentbox-vmd.service)" != inactive ] \
+               || [ "$(sudo systemctl show -p UnitFileState --value agentbox-vmd.service)" != disabled ] \
+               || [ "$(sudo systemctl show -p LoadState --value __MODERN_VMD_SERVICE__)" != loaded ] \
+               || [ "$(sudo systemctl show -p ActiveState --value __MODERN_VMD_SERVICE__)" != active ]; then
+                SECRETSPROXY_FRESH=1
+            fi
         fi
         # Also detect a partial prior deploy that created env files but omitted inputs.
         for setting in vmd:CONTROL_PLANE_URL vmd:INTERNAL_API_TOKEN secretsproxy:CONTROL_PLANE_URL secretsproxy:DAEMON_AUTH_TOKEN; do
@@ -179,6 +186,7 @@ def runtime_input_preflight(control_plane_url, database_url, internal_api_token)
             SECRETSPROXY_FRESH=1
         fi
     """)
+    script = script.replace("__MODERN_VMD_SERVICE__", shlex.quote(service))
     for name, value in (("CONTROL_PLANE_URL", control_plane_url),
                         ("DATABASE_URL", database_url),
                         ("INTERNAL_API_TOKEN", internal_api_token)):
@@ -320,6 +328,22 @@ def check_bundle_parity() -> None:
         sys.exit(f"deploy-vmd.py: installed by the remote script but not bundled: {missing}")
 
 
+def drain_configuration(environment):
+    drain_enabled = environment.get("VMD_DRAIN_ENABLED", "")
+    admission_caller = environment.get("VMD_ADMISSION_CALLER_EMAIL", "")
+    if drain_enabled not in ("", "true"):
+        raise SystemExit("VMD_DRAIN_ENABLED may only enroll with true; disabling a persisted fence requires a separate retirement procedure")
+    if drain_enabled and (not admission_caller.endswith(".iam.gserviceaccount.com") or any(c.isspace() for c in admission_caller)):
+        raise SystemExit("VMD_ADMISSION_CALLER_EMAIL must name the authorized control-plane service account")
+    drain_config = ""
+    if drain_enabled:
+        for key, value in (("VMD_DRAIN_ENABLED", drain_enabled), ("VMD_ADMISSION_CALLER_EMAIL", admission_caller)):
+            drain_config += f"sudo sed -i '/^{key}=/d' /etc/sandbox/vmd.env\n"
+            drain_config += f"printf '%s\\n' {shlex.quote(key + '=' + value)} | sudo tee -a /etc/sandbox/vmd.env >/dev/null\n"
+
+    return drain_config
+
+
 def main() -> int:
     check_bundle_parity()
     project = os.environ["GCP_PROJECT"]
@@ -341,6 +365,7 @@ def main() -> int:
     # Empty = skip, so a fleet-wide deploy never writes a redirect to a host
     # whose resolver isn't on this port. Set per host/region to match unbound.
     dns_redirect_port = os.environ.get("VMD_DNS_REDIRECT_PORT", "")
+    drain_config = drain_configuration(os.environ)
 
     # Pre-quote every value injected into the remote shell script. These come
     # from CI secrets / Secret Manager and must be treated as arbitrary text:
@@ -481,7 +506,7 @@ def main() -> int:
         q_host_id_line = shlex.quote(f"HOST_ID={name}")
         q_host_region_line = shlex.quote(f"HOST_REGION={deployment_host_region(region, zone)}")
 
-        input_preflight = runtime_input_preflight(control_plane_url, database_url, internal_api_token)
+        input_preflight = runtime_input_preflight(control_plane_url, database_url, internal_api_token, service)
         # Probe before even uploading when missing inputs might require aborting.
         # Fully supplied deploys need no additional SSH round trip.
         if not all(value.strip() for value in (control_plane_url, database_url, internal_api_token)):
@@ -955,6 +980,7 @@ def main() -> int:
             fi
 
             {host_capacity}
+            {drain_config}
 
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes
             # its control socket into RuntimeDirectory=/run/secretsproxy under

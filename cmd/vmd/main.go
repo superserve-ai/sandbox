@@ -691,6 +691,15 @@ func main() {
 		}
 		log.Info().Str("host_interface", cfg.HostInterface).Str("host_ip", automaticHostIP).Msg("resolved host default route")
 	}
+	// Host-local capacity admission. Read once and shared by the three
+	// places that must agree: the gate itself, the slot allocator policy,
+	// and the capability this host advertises. Its own setting, never
+	// inferred from VMD_MAX_SANDBOXES or VMD_MAX_NETWORK_SLOTS being set —
+	// those are already configured on production hosts to feed pressure
+	// publication, so deriving enablement from them would switch
+	// enforcement on fleet-wide the moment this ships.
+	durableDrain := envOrDefault("VMD_DRAIN_ENABLED", "false") == "true"
+	localAdmission := envOrDefault("VMD_LOCAL_ADMISSION_ENABLED", "false") == "true"
 
 	// ---- Network manager + host firewall ----
 	// preliminary: sentry init, config parse, tool lookups, dir creation, and
@@ -699,6 +708,15 @@ func main() {
 	netMgrOpts = append(netMgrOpts,
 		network.WithHostID(cfg.HostID),
 		network.WithSecretsProxyAddr(cfg.SecretsProxySandboxDst, cfg.SecretsProxySandboxPort))
+	// Slot policy travels with local admission, not on its own: the two are
+	// halves of one limit, and a host that enforces sandbox counts while
+	// minting slots without bound is enforcing neither. Left unset — and so
+	// unlimited — on any host that has not opted in, whatever
+	// VMD_MAX_NETWORK_SLOTS happens to say for pressure publication.
+	if localAdmission {
+		netMgrOpts = append(netMgrOpts,
+			network.WithOperatorSlotLimit(int(envInt32Fatal(log, "VMD_MAX_NETWORK_SLOTS"))))
+	}
 	netMgr, err := network.NewManager(ctx, cfg.HostInterface, log, netMgrOpts...)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize network manager")
@@ -913,6 +931,13 @@ func main() {
 		LauncherNSPath:                      os.Getenv("VMD_LAUNCHER_NS_PATH"),
 		DirectSpawn:                         envOrDefault("VMD_DIRECT_SPAWN", "false") == "true",
 		PressureAccounting:                  publishesPressure,
+		// Host-local capacity admission. Its own setting, deliberately not
+		// derived from VMD_MAX_SANDBOXES being set: that value is already
+		// configured on production hosts to feed pressure publication, so
+		// inferring enablement from it would switch enforcement on across
+		// the whole fleet the moment this ships.
+		LocalAdmission: localAdmission,
+		MaxSandboxes:   int(envInt32Fatal(log, "VMD_MAX_SANDBOXES")),
 	}, netMgr, log)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
@@ -958,6 +983,16 @@ func main() {
 
 	// ---- BoltDB state store ----
 	statePath := envOrDefault("VMD_STATE_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "vmd.db"))
+	if _, err := os.Stat(statePath + ".admission.json"); err == nil {
+		durableDrain = true
+	} else if !os.IsNotExist(err) {
+		log.Fatal().Err(err).Msg("cannot inspect durable admission state")
+	}
+	if durableDrain {
+		if err := mgr.AdmissionGate().ConfigureDrain(statePath + ".admission.json"); err != nil {
+			log.Fatal().Err(err).Msg("cannot load durable host admission state")
+		}
+	}
 	stateStore, err := vm.OpenStateStore(statePath)
 	if err != nil {
 		log.Fatal().Err(err).Str("path", statePath).Msg("failed to open state store")
@@ -1429,7 +1464,7 @@ func main() {
 			return handler(srv, ss)
 		}),
 	)
-	adapter := vm.NewGRPCAdapter(mgr).
+	adapter := vm.NewGRPCAdapter(mgr).WithHostAdmissionCaller(os.Getenv("VMD_ADMISSION_CALLER_EMAIL")).
 		WithSecretsBroker(cfg.SecretsProxySocket, cfg.SecretsProxySandboxAddr)
 	vmdpb.RegisterVMDaemonServer(grpcServer, adapter)
 	if cfg.SecretsProxySocket != "" {
@@ -1606,6 +1641,12 @@ func main() {
 		if reattached > 0 || stale > 0 {
 			log.Info().Int("reattached", reattached).Int("stale", stale).Msg("startup reattach complete")
 		}
+		// Opens host-local admission once the daemon knows what this host
+		// is already carrying. Started here rather than before serving
+		// begins because the listening socket survives a restart: calls
+		// can already be queued on it, and the gate refuses them until
+		// this completes rather than admitting against an empty ledger.
+		mgr.StartAdmission(ctx)
 		// After the instance map is rebuilt: pauses that still owed their
 		// backup enqueue when the previous process exited get their
 		// rehash re-run, and completed template builds whose generation
@@ -1739,10 +1780,14 @@ func main() {
 		// Builders orphaned by the previous daemon (deploy restarts kill
 		// only the main process) hold unsizable build-VM memory; the
 		// pressure gate stays closed until the async discovery completes
-		// and every survivor exits. Skipped when pressure publication is
-		// not configured: the /proc walk buys nothing for a host that
-		// never publishes.
-		if publishesPressure {
+		// and every survivor exits.
+		//
+		// Needed by local admission as well as by publication, and for a
+		// sharper reason: admission reconstruction counts builders from
+		// the live registry, which a survivor is absent from until this
+		// scan finds it. Skipping the walk on a host that enforces limits
+		// would open the gate blind to work already running.
+		if publishesPressure || localAdmission || durableDrain {
 			mgr.ScanSurvivingBuildersAsync(cfg.TemplateBuilderBin)
 		}
 		proxyHealthURL := os.Getenv("PROXY_HEALTH_URL")
@@ -1804,8 +1849,11 @@ func main() {
 				// endpoint after each successful heartbeat; in-memory
 				// counters only. The limits are operator admission knobs;
 				// 0 (unset) means no cap.
-				Pressure:        pressureSample,
-				PressureReady:   pressureReady,
+				Pressure:      pressureSample,
+				PressureReady: pressureReady,
+				// Advertised so placement can tell a host that enforces its
+				// own limits from one that only reports its load.
+				LocalAdmission:  localAdmission,
 				MaxSandboxes:    envInt32Fatal(log, "VMD_MAX_SANDBOXES"),
 				MaxNetworkSlots: envInt32Fatal(log, "VMD_MAX_NETWORK_SLOTS"),
 				LifecycleReady:  startupReady.Load,

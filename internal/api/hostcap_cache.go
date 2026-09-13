@@ -128,11 +128,11 @@ func (c *hostCapCache) refreshFailed(key string) {
 // detached, bounded context (it may outlive the caller), stores the outcome,
 // and every waiter shares the result — but each waiter still selects on its
 // own ctx, so a hung-up client returns immediately.
-func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.HostHasCapabilitiesUnlockedParams) (bool, error) {
+func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.HostHasCapabilitiesUnlockedParams, owner bool) (bool, error) {
 	c := &h.hostCaps
 	ch := c.group.DoChan(key, func() (interface{}, error) {
 		start := time.Now()
-		has, err := h.readHostCaps(context.WithoutCancel(ctx), params)
+		has, err := h.readHostCaps(context.WithoutCancel(ctx), params, owner)
 		switch {
 		case err != nil:
 		case has:
@@ -158,13 +158,20 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 // registry under the registry's own bound, so a read that used most of its
 // budget cannot starve the resolution wait. A resolution failure fails the
 // pre-flight, so the create does not repeat that lookup at dispatch.
-func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabilitiesUnlockedParams) (bool, error) {
+func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabilitiesUnlockedParams, owner bool) (bool, error) {
 	var gen uint64
 	if h.Hosts != nil {
 		gen = h.Hosts.Generation(params.HostID) // before the read, so a reclaim during it is caught
 	}
 	qctx, cancel := context.WithTimeout(ctx, hostCapQueryTimeout)
-	row, err := h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+	var row db.HostHasCapabilitiesUnlockedRow
+	var err error
+	if owner {
+		result, readErr := h.DB.OwnerHostHasCapabilitiesUnlocked(qctx, db.OwnerHostHasCapabilitiesUnlockedParams(params))
+		row.HasCapabilities, row.VmdAddr, err = result.HasCapabilities, result.VmdAddr, readErr
+	} else {
+		row, err = h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+	}
 	cancel()
 	if err != nil {
 		return false, err
@@ -180,20 +187,27 @@ func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabiliti
 }
 
 func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string, capabilities []string) (bool, error) {
+	return h.hostCapabilitiesCached(ctx, hostID, capabilities, false)
+}
+
+func (h *Handlers) hostCapabilitiesCached(ctx context.Context, hostID string, capabilities []string, owner bool) (bool, error) {
 	c := &h.hostCaps
 	c.init()
 	params := db.HostHasCapabilitiesUnlockedParams{HostID: hostID, RequiredCapabilities: capabilities}
 	if c.ttl <= 0 {
-		return h.readHostCaps(ctx, params)
+		return h.readHostCaps(ctx, params, owner)
 	}
 	sorted := append([]string(nil), capabilities...)
 	sort.Strings(sorted)
 	key := hostID + "\x00" + strings.Join(sorted, "\x00")
+	if owner {
+		key = "owner\x00" + key
+	}
 	refresh, ok := c.get(key, time.Now())
 	if ok {
 		if refresh {
 			go func() {
-				_, err := h.fetchHostCaps(context.Background(), key, params)
+				_, err := h.fetchHostCaps(context.Background(), key, params, owner)
 				if err != nil {
 					log.Warn().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).
 						Msg("host capability refresh failed; serving stale until the grace window expires")
@@ -203,5 +217,5 @@ func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string,
 		}
 		return true, nil
 	}
-	return h.fetchHostCaps(ctx, key, params)
+	return h.fetchHostCaps(ctx, key, params, owner)
 }

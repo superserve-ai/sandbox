@@ -294,6 +294,8 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // stubVMD satisfies VMDClient without a real VM daemon. Stubs return plausible
 // values so that HTTP handlers can complete and write to the DB.
 type stubVMD struct {
+	admissionMu     sync.Mutex
+	admissionState  vmdclient.HostAdmissionState
 	updatePreviewFn func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
 	updateNetworkFn func(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 }
@@ -305,7 +307,7 @@ func (s *stubVMD) PauseInstance(_ context.Context, _, _, pauseToken string) (str
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ string, _ map[int32]vmdclient.PortPolicy, _ int64) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
 	return "10.0.0.1", 1, 1024, vmdclient.ResumeAttestation{}, nil
 }
-func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string, _ vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string, _ vmdclient.ResourceLimits, _ vmdclient.AdmissionIntent) (string, uint32, uint32, string, error) {
 	return "10.0.0.1", 1, 1024, preview.HostCapabilityPorts, nil
 }
 func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
@@ -6607,4 +6609,18 @@ func routedFinalize(ctx context.Context, t *testing.T, params db.FinalizePausePa
 		ManifestDigests:   params.ManifestDigests,
 		ManifestBasePaths: params.ManifestBasePaths,
 	})
+}
+
+func (s *stubVMD) HostAdmission(_ context.Context, revision int64, closed bool) (vmdclient.HostAdmissionState, error) {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if revision > 0 {
+		if revision < s.admissionState.Revision {
+			return vmdclient.HostAdmissionState{}, fmt.Errorf("stale admission command")
+		}
+		s.admissionState.Revision = revision
+		s.admissionState.Closed = closed
+	}
+	s.admissionState.Ready = true
+	return s.admissionState, nil
 }

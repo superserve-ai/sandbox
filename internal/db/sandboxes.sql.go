@@ -2524,6 +2524,35 @@ func (q *Queries) PublishPort(ctx context.Context, arg PublishPortParams) (Publi
 	return i, err
 }
 
+const reassignRejectedCreateHost = `-- name: ReassignRejectedCreateHost :execrows
+UPDATE sandbox SET host_id = $1, updated_at = now()
+WHERE id = $2 AND team_id = $3 AND host_id = $4
+  AND status = 'starting' AND destroyed_at IS NULL
+  AND ip_address IS NULL AND pid IS NULL AND snapshot_id IS NULL
+`
+
+type ReassignRejectedCreateHostParams struct {
+	NewHostID string    `json:"new_host_id"`
+	ID        uuid.UUID `json:"id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	OldHostID string    `json:"old_host_id"`
+}
+
+// Only the synchronous create caller may use this after an explicit pre-boot
+// refusal. It is not a paused-sandbox migration operation.
+func (q *Queries) ReassignRejectedCreateHost(ctx context.Context, arg ReassignRejectedCreateHostParams) (int64, error) {
+	result, err := q.db.Exec(ctx, reassignRejectedCreateHost,
+		arg.NewHostID,
+		arg.ID,
+		arg.TeamID,
+		arg.OldHostID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const recordSandboxSecretEnv = `-- name: RecordSandboxSecretEnv :exec
 UPDATE sandbox
 SET secret_env_fingerprint = $2,

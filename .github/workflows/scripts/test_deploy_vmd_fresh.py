@@ -27,7 +27,7 @@ READY = block('# Fresh-host runtime preflight.\n', '# End fresh-host runtime pre
 
 
 class FreshHostTest(unittest.TestCase):
-    def exercise(self, missing=('vmd', 'secretsproxy'), fail_daemon=False, missing_input=False, assets=True, ca_missing=(), custom_paths=False, configure_kernel=True, missing_artifact=None, configured=False, host_id="existing-host", region="us-central1", existing_region=None):
+    def exercise(self, missing=('vmd', 'secretsproxy'), fail_daemon=False, missing_input=False, assets=True, ca_missing=(), custom_paths=False, configure_kernel=True, missing_artifact=None, configured=False, host_id="existing-host", region="us-central1", existing_region=None, legacy_state="not-found", legacy_active="inactive", legacy_enabled="disabled", modern_active="active"):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             envdir = root / 'etc/sandbox'
@@ -64,7 +64,7 @@ class FreshHostTest(unittest.TestCase):
                     asset.parent.mkdir(parents=True, exist_ok=True)
                     asset.write_text('approved artifact')
             supplied = {}
-            values = {'host_capacity': deploy_vmd.capacity_script('110000', '32'), 'service': 'superserve-vmd.service', 'q_host_id_line': shlex.quote('HOST_ID=example-host'), 'q_host_region_line': shlex.quote('HOST_REGION=' + deploy_vmd.deployment_host_region(region, region + '-a'))}
+            values = {'drain_config': '', 'host_capacity': deploy_vmd.capacity_script('110000', '32'), 'service': 'superserve-vmd.service', 'q_host_id_line': shlex.quote('HOST_ID=example-host'), 'q_host_region_line': shlex.quote('HOST_REGION=' + deploy_vmd.deployment_host_region(region, region + '-a'))}
             for key, name, value in [('cpu', 'CONTROL_PLANE_URL', 'https://example.test'),
                                      ('token', 'INTERNAL_API_TOKEN', 'example-token'),
                                      ('db', 'DATABASE_URL', 'postgres://example.test/db')]:
@@ -85,7 +85,13 @@ pgrep() { return 1; }
 ss() { :; }
 systemctl() {
     if [ "$1" = list-units ]; then return; fi
-    case "$*" in *agentbox-vmd.service*) echo not-found; return;; esac
+    case "$*" in
+    *agentbox-vmd.service*)
+      case "$*" in *LoadState*) echo "$LEGACY_STATE";; *ActiveState*) echo "$LEGACY_ACTIVE";; *UnitFileState*) echo "$LEGACY_ENABLED";; esac; return;;
+    esac
+    if [ "$1" = show ]; then
+      case "$*" in *LoadState*) echo loaded; return;; *ActiveState*) echo "$MODERN_ACTIVE"; return;; esac
+    fi
     if [ "$1" = restart ]; then
         echo restart-secretsproxy >> "$CALLS"
         if [ "$FAIL_DAEMON" = 1 ]; then return 1; fi
@@ -102,8 +108,8 @@ journalctl() { :; }
             before = {str(p.relative_to(root)): (p.read_bytes(), p.stat().st_mode) for p in root.rglob('*') if p.is_file()}
             result = subprocess.run(['bash', '-c', prelude + script + '\necho vmd-may-start\n'],
                 text=True, capture_output=True, env=dict(os.environ, CALLS=str(root/'calls'),
-                CA_DIR=str(root/'var/lib/secretsproxy'), FAIL_DAEMON=str(int(fail_daemon))))
-            if missing_input and not configured:
+                CA_DIR=str(root/'var/lib/secretsproxy'), FAIL_DAEMON=str(int(fail_daemon)), LEGACY_STATE=legacy_state, LEGACY_ACTIVE=legacy_active, LEGACY_ENABLED=legacy_enabled, MODERN_ACTIVE=modern_active))
+            if missing_input and result.returncode != 0:
                 after = {str(p.relative_to(root)): (p.read_bytes(), p.stat().st_mode) for p in root.rglob('*') if p.is_file()}
                 self.assertEqual(before, after, 'missing input must not mutate the host')
             for name in ('ca.crt', 'ca.key'):
@@ -228,10 +234,23 @@ journalctl() { :; }
     def test_fresh_readiness_precedes_any_vmd_restart_and_no_ca_copy(self):
         gate = SOURCE.index('# CD targets existing cells:')
         self.assertLess(gate, SOURCE.index('sudo systemctl restart {service}'))
-        self.assertLess(SOURCE.index('# Fresh-host env bootstrap:'), SOURCE.index('sudo sed -i'))
+        self.assertLess(SOURCE.index('# Fresh-host env bootstrap:'), SOURCE.index('sudo sed -i', SOURCE.index('inject_script =')))
         self.assertNotIn('gen-secretsproxy-ca', SOURCE)
         self.assertNotIn('openssl req', SOURCE)
         self.assertIn('SECRETSPROXY_FRESH" = 1', SOURCE)
+
+    def test_disabled_legacy_leftover_preserves_existing_inputs(self):
+        result, envs, _ = self.exercise(missing=(), configured=True, missing_input='all', host_id='default', legacy_state='loaded')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('HOST_ID=default', envs['vmd.env'])
+        self.assertIn('DATABASE_URL=postgres://old.example.test/db', envs['secretsproxy.env'])
+
+    def test_legacy_or_incomplete_hosts_still_require_inputs(self):
+        for options in ({'legacy_active':'active'}, {'legacy_enabled':'enabled'}, {'modern_active':'inactive'}, {'ca_missing':('ca.key',)}):
+            with self.subTest(options=options):
+                result, _, _ = self.exercise(missing=(), configured=True, missing_input='all', legacy_state='loaded', **options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('fresh-host deployment requires', result.stderr)
 
 
 if __name__ == '__main__':
