@@ -223,6 +223,8 @@ type fakeTenantServer struct {
 	// failure the reference tenant shipped.
 	authorizeStatus int
 	healthStatus    int
+	// rootStatus is what the portal answers at /.
+	rootStatus int
 	// modelKeyStatus answers the provider's key check. The fixture's HTTP
 	// client sends every request here, the provider's included, so this is
 	// what stands in for Anthropic saying yes or no.
@@ -232,11 +234,14 @@ type fakeTenantServer struct {
 
 func newFakeTenantServer(t *testing.T) *fakeTenantServer {
 	t.Helper()
-	f := &fakeTenantServer{authorizeStatus: http.StatusOK, healthStatus: http.StatusOK, modelKeyStatus: http.StatusOK}
+	f := &fakeTenantServer{
+		authorizeStatus: http.StatusOK, healthStatus: http.StatusOK,
+		modelKeyStatus: http.StatusOK, rootStatus: http.StatusOK,
+	}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.paths = append(f.paths, r.URL.Path)
-		authorize, health, modelKey := f.authorizeStatus, f.healthStatus, f.modelKeyStatus
+		authorize, health, modelKey, root := f.authorizeStatus, f.healthStatus, f.modelKeyStatus, f.rootStatus
 		f.mu.Unlock()
 		switch {
 		case r.URL.Path == "/v1/models":
@@ -250,7 +255,7 @@ func newFakeTenantServer(t *testing.T) *fakeTenantServer {
 				_, _ = w.Write([]byte("<html><body><h1>Email delivery isn't configured</h1></body></html>"))
 			}
 		default:
-			w.WriteHeader(http.StatusOK)
+			w.WriteHeader(root)
 		}
 	}))
 	t.Cleanup(f.srv.Close)
@@ -261,6 +266,12 @@ func (f *fakeTenantServer) setAuthorizeStatus(status int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.authorizeStatus = status
+}
+
+func (f *fakeTenantServer) setRootStatus(status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rootStatus = status
 }
 
 func (f *fakeTenantServer) setModelKeyStatus(status int) {
@@ -862,6 +873,30 @@ func TestSmokeAcceptsOnlyTheBrokersOwnAnswer(t *testing.T) {
 		if !strings.Contains(err.Error(), "sign-in fails closed") {
 			t.Errorf("status %d: err = %v", status, err)
 		}
+	}
+}
+
+// A portal that does not answer its own front door is not a usable tenant,
+// even with a green health check: a 404 is a route that is not there and a
+// 401 is a front door turning visitors away.
+func TestSmokeFailsWhenThePortalDoesNotAnswer(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusUnauthorized, http.StatusInternalServerError} {
+		f := newFixture(t, false)
+		f.tenant.setRootStatus(status)
+		err := f.provision(t)
+		if err == nil {
+			t.Errorf("a tenant whose portal answered %d was reported ready", status)
+			continue
+		}
+		if !strings.Contains(err.Error(), "portal returned") {
+			t.Errorf("status %d: err = %v", status, err)
+		}
+	}
+	// A redirect to sign-in is the portal answering.
+	f := newFixture(t, false)
+	f.tenant.setRootStatus(http.StatusFound)
+	if err := f.provision(t); err != nil {
+		t.Fatalf("a portal that redirects to sign-in: %v", err)
 	}
 }
 

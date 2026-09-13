@@ -88,11 +88,16 @@ func (s smoke) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if err != nil {
 		return err
 	}
-	if err := waitFor(ctx, s.c, s.c.SmokeTimeout, base+"/", func(status int, _ string) error {
-		if status < 500 {
+	if err := waitFor(ctx, s.c, s.c.SmokeTimeout, base+"/", func(status int, body string) error {
+		// The portal answers the root with its own page or a redirect to
+		// sign-in. A 4xx is not "still starting" — it is a route that is
+		// not there or a front door that turns visitors away — and a
+		// tenant whose portal does not answer is not a usable tenant even
+		// if its health check is green.
+		if ok := okOrRedirect(status); ok {
 			return nil
 		}
-		return fmt.Errorf("GET / returned %d", status)
+		return fmt.Errorf("the tenant's portal returned %d for GET /%s", status, detailSuffix(body))
 	}); err != nil {
 		return err
 	}
@@ -110,23 +115,32 @@ func (s smoke) Run(ctx context.Context, t *provisioner.Tenant) error {
 		// was never mounted, a 4xx is one that rejected a request it
 		// should accept, and a 5xx is the one the reference tenant
 		// shipped — an auth broker with no email transport.
-		if status == http.StatusOK || (status >= 300 && status < 400) {
+		if okOrRedirect(status) {
 			return nil
 		}
-		detail := ""
-		if body != "" {
-			// The broker renders its "email delivery isn't configured"
-			// page as HTML, so the first line of it is worth carrying into
-			// the event: it is the difference between "the tenant is still
-			// starting" and "this tenant can never be signed into".
-			detail = " — " + body
-		}
-		return fmt.Errorf("sign-in fails closed: GET /idp/authorize returned %d%s", status, detail)
+		// The broker renders its "email delivery isn't configured" page as
+		// HTML, so the first line of it is worth carrying into the event:
+		// it is the difference between "the tenant is still starting" and
+		// "this tenant can never be signed into".
+		return fmt.Errorf("sign-in fails closed: GET /idp/authorize returned %d%s", status, detailSuffix(body))
 	})
 }
 
 func (smoke) Rollback(context.Context, *provisioner.Tenant) error {
 	return provisioner.Skip("nothing to undo")
+}
+
+// okOrRedirect is what a working tenant answers a probe with: its own page,
+// or a redirect to one.
+func okOrRedirect(status int) bool {
+	return status == http.StatusOK || (status >= 300 && status < 400)
+}
+
+func detailSuffix(body string) string {
+	if body == "" {
+		return ""
+	}
+	return " — " + body
 }
 
 // authorizeURL is a well-formed authorization request: the broker rejects a

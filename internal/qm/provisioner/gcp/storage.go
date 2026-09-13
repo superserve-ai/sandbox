@@ -118,8 +118,12 @@ func (b *Buckets) empty(ctx context.Context, name string) error {
 	// seen is deleted before the next list, so the next page is whatever is
 	// left. A delete that cannot proceed returns an error and ends the
 	// loop, so this cannot spin.
+	// The budget is checked after a listing comes back empty, not before
+	// the next pass: a bucket holding exactly the budget is empty by the
+	// time it is reached, and failing a teardown that in fact finished
+	// would cost a retry for nothing.
 	deleted := 0
-	for deleted < emptyBucketMaxObjects {
+	for {
 		resp, err := b.svc.Objects.List(name).Versions(true).MaxResults(emptyBucketPage).Context(ctx).Do()
 		if err != nil {
 			if notFound(err) {
@@ -130,12 +134,14 @@ func (b *Buckets) empty(ctx context.Context, name string) error {
 		if len(resp.Items) == 0 {
 			return nil
 		}
+		if deleted >= emptyBucketMaxObjects {
+			return fmt.Errorf("bucket %s still holds objects after deleting %d: retry the teardown to continue", name, deleted)
+		}
 		if err := b.deleteObjects(ctx, name, resp.Items); err != nil {
 			return err
 		}
 		deleted += len(resp.Items)
 	}
-	return fmt.Errorf("bucket %s still holds objects after deleting %d: retry the teardown to continue", name, deleted)
 }
 
 // deleteObjects removes one listing page with a bounded number of requests
