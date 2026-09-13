@@ -56,6 +56,27 @@ resources, slug validation on the Go side must reserve at least `api`,
 module names `qm-<word>`), or a tenant could collide with `qm-api-*`,
 `qm-sql-admin-*`, or `qm-tenants-<suffix>`.
 
+## Deletion safety
+
+Every tenant's database is on the one `qm-tenants-<suffix>` instance, so it
+carries three independent guards: `deletion_protection` (Terraform refuses the
+delete call), `settings.deletion_protection_enabled` (the API refuses it from
+the console and `gcloud` too), and `prevent_destroy` (the plan fails before an
+apply starts, which is also what catches a *replacement* — a changed
+`resource_suffix`, `region`, or `private_network` plans destroy-then-create and
+the other two flags do not make that obvious). Removing the instance is
+deliberately three changes: drop `prevent_destroy`, set both
+`deletion_protection` flags to false and apply, then remove the resource.
+
+Backups are on by default: daily automated backups at `sql_backup_start_time`
+with `sql_backup_retained_count` (14) retained, plus point-in-time recovery
+with `sql_transaction_log_retention_days` (7) of write-ahead log.
+
+Note that `prevent_destroy` also applies to turning the module off again:
+once `enable_qm` has been applied as true, flipping it back to false fails at
+plan time. That is intentional for an instance holding tenant data, and the
+teardown above is the way through it.
+
 ## Connection sizing
 
 `max_connections` on the instance is

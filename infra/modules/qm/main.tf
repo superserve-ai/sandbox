@@ -188,6 +188,18 @@ resource "google_sql_database_instance" "tenants" {
     user_labels = var.labels
   }
 
+  # Every tenant's database lives on this one instance, so the two API-side
+  # guards above are backed by a plan-time one: prevent_destroy rejects the
+  # plan rather than failing partway through an apply. It also catches the
+  # replacement case the deletion_protection flags do not make obvious, where
+  # a changed name, region, or private_network plans destroy-then-create.
+  # Tearing the instance down is deliberately a three-step change: drop
+  # prevent_destroy, set both deletion_protection flags to false and apply,
+  # then remove the resource.
+  lifecycle {
+    prevent_destroy = true
+  }
+
   depends_on = [
     google_project_service.required,
     google_service_networking_connection.private_service_access,
