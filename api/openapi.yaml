@@ -2346,6 +2346,8 @@ paths:
                       $ref: "#/components/schemas/QMTenant"
         "401":
           $ref: "#/components/responses/QMUnauthorized"
+        "403":
+          $ref: "#/components/responses/QMForbidden"
         "500":
           $ref: "#/components/responses/QMInternalError"
 
@@ -2463,6 +2465,8 @@ paths:
                       $ref: "#/components/schemas/QMTenantEvent"
         "401":
           $ref: "#/components/responses/QMUnauthorized"
+        "403":
+          $ref: "#/components/responses/QMForbidden"
         "404":
           $ref: "#/components/responses/QMNotFound"
         "500":
@@ -2606,6 +2610,8 @@ paths:
                 $ref: "#/components/schemas/QMSlugAvailability"
         "401":
           $ref: "#/components/responses/QMUnauthorized"
+        "403":
+          $ref: "#/components/responses/QMForbidden"
         "500":
           $ref: "#/components/responses/QMInternalError"
 
