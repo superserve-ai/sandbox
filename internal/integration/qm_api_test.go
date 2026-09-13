@@ -241,6 +241,19 @@ func TestQMAPI_PostgresStoreRules(t *testing.T) {
 	if _, err := store.Lock(ctx, teamA, tenant.ID); !errors.Is(err, tenantstore.ErrLocked) {
 		t.Errorf("second lock: err = %v", err)
 	}
+	// Another tenant's lock is a different key: a run must never exit
+	// because an unrelated tenant happens to be provisioning.
+	bCreate := create
+	bCreate.Slug = "pilot-team-" + uuid.NewString()[:8]
+	bTenant, err := store.CreateTenant(ctx, teamB, bCreate)
+	if err != nil {
+		t.Fatalf("create tenant for team B: %v", err)
+	}
+	bRelease, err := store.Lock(ctx, teamB, bTenant.ID)
+	if err != nil {
+		t.Fatalf("lock a second tenant while the first is held: %v", err)
+	}
+	bRelease()
 	release()
 	release2, err := store.Lock(ctx, teamA, tenant.ID)
 	if err != nil {
