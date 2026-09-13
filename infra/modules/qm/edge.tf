@@ -14,6 +14,18 @@ resource "google_certificate_manager_dns_authorization" "this" {
   domain   = var.domain
   labels   = var.labels
 
+  # The first resource to consume var.domain, so an unset domain stops here
+  # with a readable message instead of a null interpolation failure inside the
+  # certificate. A precondition rather than a variable validation because the
+  # root's qm_domain is legitimately null while enable_qm is false, and
+  # preconditions are only evaluated for module instances that exist.
+  lifecycle {
+    precondition {
+      condition     = var.domain != null && var.domain != ""
+      error_message = "domain must be set when the qm module is enabled: tenant hostnames, the wildcard certificate, and the redirect service are all derived from it."
+    }
+  }
+
   depends_on = [google_project_service.required]
 }
 

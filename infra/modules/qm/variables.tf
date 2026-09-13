@@ -29,12 +29,8 @@ variable "service_account_suffix" {
 }
 
 variable "domain" {
-  description = "Base hostname for tenant stacks: each tenant is served at https://<slug>.<domain>, so pass qm.<env-domain>. The wildcard certificate, certificate map, and DNS authorization are all derived from it."
+  description = "Base hostname for tenant stacks: each tenant is served at https://<slug>.<domain>, so pass qm.<env-domain>. The wildcard certificate, certificate map, and DNS authorization are all derived from it. Required, but may be passed as null by a root whose enable_qm flag is off."
   type        = string
-  # Rejected at the module boundary rather than as an interpolation error
-  # several resources deep: the root's qm_domain defaults to null, so enabling
-  # the module without setting it is the likely mistake.
-  nullable = false
 }
 
 variable "marketing_url" {
