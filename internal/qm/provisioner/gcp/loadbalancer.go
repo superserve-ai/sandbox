@@ -94,8 +94,14 @@ func (l *LoadBalancer) RemoveHostRule(ctx context.Context, host, owner string) e
 	// reason as on the way up, and it is what keeps a teardown from
 	// removing another workload's hostname: a provision that stopped
 	// because the derived NEG or backend was foreign still reaches here.
+	//
+	// A foreign route does not end the teardown, though. EnsureHostRule
+	// creates this tenant's NEG and backend *before* it rejects the route,
+	// so returning here would leak both — the steps layer reads
+	// ErrNotOwned as a skip. The route is left alone; everything below
+	// that carries this tenant's own marker still comes down.
 	var name string
-	var shared bool
+	var shared, foreign bool
 	if err := l.patchURLMap(ctx, func(m *compute.UrlMap) (bool, error) {
 		if err := l.routeIsOursIn(ctx, m, host, owner); err != nil {
 			return false, err
@@ -105,26 +111,44 @@ func (l *LoadBalancer) RemoveHostRule(ctx context.Context, host, owner string) e
 		shared = changed && matcher == ""
 		return changed, nil
 	}); err != nil {
-		return err
+		if !errors.Is(err, steps.ErrNotOwned) {
+			return err
+		}
+		foreign = true
 	}
 	if name == "" {
-		// Either nothing referenced the host, or its rule carried other
-		// hosts too. In the first case a run may still have created the
-		// NEG and the backend before it failed, so the names are derived
-		// from the hostname — whose first label is the tenant's slug — and
-		// the deletes below are no-ops if they were never made. In the
-		// second the matcher is still in use; deriving the same name and
-		// deleting it would break the tenants sharing it, so nothing else
-		// happens.
+		// Either nothing referenced the host, its rule carried other hosts
+		// too, or the route is somebody else's. In the first and last
+		// cases a run may still have created the NEG and the backend
+		// before it stopped, so the names are derived from the hostname —
+		// whose first label is the tenant's slug — and the deletes below
+		// touch them only if they carry this tenant's marker. In the
+		// second the matcher is still in use; deleting the backend behind
+		// it would break the hosts sharing it.
 		if shared {
 			return nil
 		}
 		name = steps.ServiceName(strings.Split(host, ".")[0])
 	}
+	// Both tolerate a resource that is not this tenant's for the same
+	// reason the route does: it is not ours to remove, and stopping would
+	// strand the rest.
 	if err := l.deleteBackendService(ctx, name, owner); err != nil {
-		return err
+		if !errors.Is(err, steps.ErrNotOwned) {
+			return err
+		}
+		foreign = true
 	}
-	return l.deleteNEG(ctx, name, owner)
+	if err := l.deleteNEG(ctx, name, owner); err != nil {
+		if !errors.Is(err, steps.ErrNotOwned) {
+			return err
+		}
+		foreign = true
+	}
+	if foreign {
+		return fmt.Errorf("%w: route %s", steps.ErrNotOwned, host)
+	}
+	return nil
 }
 
 // routeIsOursIn refuses to touch a hostname whose backing resources belong
