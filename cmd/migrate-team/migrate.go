@@ -1478,6 +1478,30 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	}
 	defer tx.Rollback(ctx)
 
+	// Build admission serializes on the app's per-TEAM advisory lock
+	// (CountInFlightBuildsForTeam's caller contract) — take it so a
+	// CreateTemplateBuild that would slip a pending row past the earlier
+	// check blocks behind this transaction, then recheck under the lock.
+	// It comes before the team row lock because CreateQMTenant takes the
+	// advisory lock and then touches the team row through its FK; the same
+	// order on both sides is what keeps the two from deadlocking.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, cfg.teamID.String()); err != nil {
+		return fmt.Errorf("advisory-lock team builds: %w", err)
+	}
+	if builds, err := activeBuilds(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(builds) > 0 {
+		return fmt.Errorf("aborting purge: template build slipped in before the locks:\n  %s", strings.Join(builds, "\n  "))
+	}
+	// Hosted-QM tenant admission takes the same per-team lock (see
+	// CreateQMTenant); a tenant created after validation was never copied,
+	// so purging its row would orphan whatever the provisioner built.
+	if tenants, err := liveQMTenants(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(tenants) > 0 {
+		return fmt.Errorf("aborting purge: hosted-QM tenant slipped in before the locks:\n  %s", strings.Join(tenants, "\n  "))
+	}
+
 	// Lock the team's rows first: the auto-delete worker claims paused
 	// sandboxes past their deadline with an UPDATE, which now blocks behind
 	// these locks instead of racing the deletes (its claim matches zero
@@ -1497,26 +1521,6 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	// transaction rather than racing the deletes.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(id::text)::bigint) FROM sandbox WHERE team_id = $1`, cfg.teamID); err != nil {
 		return fmt.Errorf("advisory-lock sandboxes: %w", err)
-	}
-	// Build admission serializes on the app's per-TEAM advisory lock
-	// (CountInFlightBuildsForTeam's caller contract) — take it so a
-	// CreateTemplateBuild that would slip a pending row past the earlier
-	// check blocks behind this transaction, then recheck under the lock.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, cfg.teamID.String()); err != nil {
-		return fmt.Errorf("advisory-lock team builds: %w", err)
-	}
-	if builds, err := activeBuilds(ctx, tx, cfg.teamID); err != nil {
-		return err
-	} else if len(builds) > 0 {
-		return fmt.Errorf("aborting purge: template build slipped in before the locks:\n  %s", strings.Join(builds, "\n  "))
-	}
-	// Hosted-QM tenant admission takes the same per-team lock (see
-	// CreateQMTenant); a tenant created after validation was never copied,
-	// so purging its row would orphan whatever the provisioner built.
-	if tenants, err := liveQMTenants(ctx, tx, cfg.teamID); err != nil {
-		return err
-	} else if len(tenants) > 0 {
-		return fmt.Errorf("aborting purge: hosted-QM tenant slipped in before the locks:\n  %s", strings.Join(tenants, "\n  "))
 	}
 	// The source rows die below, so capture the rollup-flag state now and
 	// restore it into the dest after the deletes commit — purged
