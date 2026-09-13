@@ -36,6 +36,60 @@ upgrade. Enroll one explicitly selected host during a reviewed rollout:
 
 No production rollout or host transition is performed by this change.
 
+## Existing staging primary: deploy only this host
+
+An omitted runtime input preserves the stored value only when the host passes
+all existing-host checks. A loaded legacy unit alone is not fresh enrollment:
+an inactive, disabled `agentbox-vmd.service` alongside the loaded, active modern
+VMD is an existing-host upgrade when both env files, required settings and the
+cell CA pair are complete and no bootstrap-pending marker exists. Active/enabled
+legacy units, an unavailable modern VMD, or incomplete runtime state still take
+the guarded fresh-host path. Do not bypass that path with an upgrade-mode flag.
+
+The earlier preflight classified a disabled legacy leftover as fresh. Supplying
+secrets did not correct that classification and could lead to the guest-workload
+retirement gate. Use the corrected script from this branch. It preserves
+`HOST_ID=default` and the installed credentials; it does not retire or mask the
+inactive legacy leftover during an existing-host upgrade.
+
+After the database and control-plane prerequisites above are complete, run this
+from the reviewed branch checkout. This command builds and **deploys**; it is
+not a preflight. The name clause intersects the serving label and region, so the
+second staging host cannot be selected. Do not replace it with the serving label
+alone after both hosts are admitted.
+
+```sh
+(
+  set -eu
+  export GCP_PROJECT=rayai-dev GCP_REGION=us-central1
+  export VMD_LABEL='component=vmd AND name=superserve-vmd-staging'
+  export VMD_SERVICE=superserve-vmd VMD_INSTALL_DIR=/usr/local/bin
+  export SHA="$(git rev-parse HEAD)"
+  export CONTROL_PLANE_URL= DATABASE_URL= INTERNAL_API_TOKEN=
+  export VMD_DRAIN_ENABLED=true
+  export VMD_ADMISSION_CALLER_EMAIL="$(gh variable get VMD_ADMISSION_CALLER_EMAIL_STAGING \
+    --repo superserve-ai/sandbox --env staging)"
+  : "${VMD_ADMISSION_CALLER_EMAIL:?Configure the verified staging control-plane runtime service-account email first}"
+  # Match the staging workflow; omission otherwise removes the backfill flag.
+  export BACKUP_BACKFILL=1
+  mkdir -p bin
+  for binary in vmd boxd template-builder secretsproxy; do
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+      -ldflags '-s -w' -trimpath -o "bin/$binary" "./cmd/$binary"
+  done
+  python3 .github/workflows/scripts/deploy-vmd.py
+)
+```
+
+No secret retrieval is needed for this verified existing-host path. If runtime
+state is incomplete, stop and investigate rather than filling secrets manually.
+The staging workflow's canonical inputs are `vars.CONTROL_PLANE_URL_STAGING`,
+`secrets.DATABASE_URL_STAGING`, and `secrets.STAGING_INTERNAL_API_TOKEN`, injected
+by the GitHub `staging` environment. GitHub secret values are not downloadable
+with `gh secret`; do not invent a local extraction or distribution mechanism.
+The workflow's `target=serving` currently selects all matching serving hosts, so
+it is **not** a substitute for this one-host command.
+
 ## Operator sequence
 
 Use the same cell's control-plane URL and operator token already required by

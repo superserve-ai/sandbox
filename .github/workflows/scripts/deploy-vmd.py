@@ -151,7 +151,7 @@ def deployment_host_region(region, zone):
     return region or match[1]
 
 
-def runtime_input_preflight(control_plane_url, database_url, internal_api_token):
+def runtime_input_preflight(control_plane_url, database_url, internal_api_token, service="superserve-vmd"):
     """Read-only host check; pass only input presence, never secrets, to the probe."""
     script = textwrap.dedent("""
         set -euo pipefail
@@ -164,7 +164,14 @@ def runtime_input_preflight(control_plane_url, database_url, internal_api_token)
             SECRETSPROXY_FRESH=1
         fi
         if [ "$(sudo systemctl show -p LoadState --value agentbox-vmd.service)" = loaded ]; then
-            SECRETSPROXY_FRESH=1
+            # An inactive, disabled leftover unit does not make a healthy modern
+            # host fresh. All runtime/CA completeness checks still apply.
+            if [ "$(sudo systemctl show -p ActiveState --value agentbox-vmd.service)" != inactive ] \
+               || [ "$(sudo systemctl show -p UnitFileState --value agentbox-vmd.service)" != disabled ] \
+               || [ "$(sudo systemctl show -p LoadState --value __MODERN_VMD_SERVICE__)" != loaded ] \
+               || [ "$(sudo systemctl show -p ActiveState --value __MODERN_VMD_SERVICE__)" != active ]; then
+                SECRETSPROXY_FRESH=1
+            fi
         fi
         # Also detect a partial prior deploy that created env files but omitted inputs.
         for setting in vmd:CONTROL_PLANE_URL vmd:INTERNAL_API_TOKEN secretsproxy:CONTROL_PLANE_URL secretsproxy:DAEMON_AUTH_TOKEN; do
@@ -179,6 +186,7 @@ def runtime_input_preflight(control_plane_url, database_url, internal_api_token)
             SECRETSPROXY_FRESH=1
         fi
     """)
+    script = script.replace("__MODERN_VMD_SERVICE__", shlex.quote(service))
     for name, value in (("CONTROL_PLANE_URL", control_plane_url),
                         ("DATABASE_URL", database_url),
                         ("INTERNAL_API_TOKEN", internal_api_token)):
@@ -498,7 +506,7 @@ def main() -> int:
         q_host_id_line = shlex.quote(f"HOST_ID={name}")
         q_host_region_line = shlex.quote(f"HOST_REGION={deployment_host_region(region, zone)}")
 
-        input_preflight = runtime_input_preflight(control_plane_url, database_url, internal_api_token)
+        input_preflight = runtime_input_preflight(control_plane_url, database_url, internal_api_token, service)
         # Probe before even uploading when missing inputs might require aborting.
         # Fully supplied deploys need no additional SSH round trip.
         if not all(value.strip() for value in (control_plane_url, database_url, internal_api_token)):
