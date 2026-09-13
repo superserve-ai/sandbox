@@ -927,13 +927,21 @@ func TestCreateTenantMarksFailedWhenQueueingAborts(t *testing.T) {
 	}
 }
 
-// lockFailingStore reports a database error from Lock.
+// lockFailingStore reports a database error from Lock (not ErrLocked,
+// which is a conflict the caller simply retries). failNext bounds how many
+// calls fail; zero fails every one.
 type lockFailingStore struct {
 	*tenantstore.Memory
+	failNext int
+	failed   int
 }
 
-func (lockFailingStore) Lock(context.Context, uuid.UUID, uuid.UUID) (func(), error) {
-	return nil, errors.New("database unavailable")
+func (s *lockFailingStore) Lock(ctx context.Context, teamID, tenantID uuid.UUID) (func(), error) {
+	if s.failNext == 0 || s.failed < s.failNext {
+		s.failed++
+		return nil, errors.New("database unavailable")
+	}
+	return s.Memory.Lock(ctx, teamID, tenantID)
 }
 
 // An oversized body is refused before it is decoded, so a caller cannot
@@ -970,5 +978,39 @@ func TestCreateTenantRejectsOversizedBody(t *testing.T) {
 	}
 	if tenants, _ := f.store.ListTenants(context.Background(), f.teamA); len(tenants) != 0 {
 		t.Errorf("a malformed body created a tenant: %+v", tenants)
+	}
+}
+
+// The same rule applies to a delete that fails before it even transitions:
+// a tenant marked failed without a durable deprovision intent reads as a
+// failed provision, and a retry would rebuild the stack the caller asked to
+// tear down. The delete is undone and reported instead.
+func TestDeleteFailingBeforeItsIntentIsNotMarkedFailed(t *testing.T) {
+	f := newFixture(t)
+	id := f.create(t)
+	tid := uuid.MustParse(id)
+	ctx := context.Background()
+	f.store.SetStatus(ctx, f.teamA, tid, tenantstore.StatusReady)
+
+	broken := &lockFailingStore{Memory: f.store, failNext: 1}
+	h := &Handlers{Store: broken, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
+	calls := len(f.trigger.Calls)
+	if code, _ := f.do(t, http.MethodDelete, "/v1/qm/tenants/"+id, keyTeamA, nil); code != http.StatusInternalServerError {
+		t.Fatalf("delete with a failing lock probe: %d, want 500", code)
+	}
+	if len(f.trigger.Calls) != calls {
+		t.Error("a run was triggered after the lock probe failed")
+	}
+	row, _ := f.store.GetTenant(ctx, f.teamA, tid)
+	if row.Status != tenantstore.StatusReady {
+		t.Fatalf("status = %s, want ready (a delete must not leave the tenant failed)", row.Status)
+	}
+	code, body := f.do(t, http.MethodDelete, "/v1/qm/tenants/"+id, keyTeamA, nil)
+	if code != http.StatusAccepted || body["tenant"].(map[string]any)["status"] != "deprovisioning" {
+		t.Fatalf("delete again: %d %v", code, body)
+	}
+	if last := f.trigger.Calls[len(f.trigger.Calls)-1]; last.Mode != provisioner.ModeDeprovision {
+		t.Errorf("mode = %s", last.Mode)
 	}
 }

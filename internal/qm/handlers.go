@@ -458,9 +458,10 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, from []st
 	if mode == provisioner.ModeDeprovision {
 		inFlight = tenantstore.StatusDeprovisioning
 	}
-	// Errors that are neither a conflict nor absence mark the tenant
-	// failed (mode included): a just-created tenant otherwise sits in
-	// provisioning with no run behind it until the stale reclaim.
+	// Errors that are neither a conflict nor absence leave a provision
+	// marked failed (mode included): a just-created tenant otherwise sits
+	// in provisioning with no run behind it until the stale reclaim. A
+	// delete instead gets abandonDelete — see there.
 	release, err := h.Store.Lock(ctx, tenant.TeamID, tenant.ID)
 	switch {
 	case errors.Is(err, tenantstore.ErrLocked):
@@ -471,8 +472,7 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, from []st
 		return tenantstore.Tenant{}, false
 	case err != nil:
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("probe tenant lock")
-		h.failTenant(ctx, tenant, stepTrigger, "The "+string(mode)+" run could not be queued. Retry the tenant.", err, map[string]any{"mode": string(mode)})
-		respondError(c, http.StatusInternalServerError, internalErrorMsg)
+		h.abortQueue(c, tenant, mode, inFlight, err)
 		return tenantstore.Tenant{}, false
 	}
 	// Released before the trigger: the run it starts must be able to take
@@ -488,8 +488,7 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, from []st
 		return tenantstore.Tenant{}, false
 	case err != nil:
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("transition tenant status")
-		h.failTenant(ctx, tenant, stepTrigger, "The "+string(mode)+" run could not be queued. Retry the tenant.", err, map[string]any{"mode": string(mode)})
-		respondError(c, http.StatusInternalServerError, internalErrorMsg)
+		h.abortQueue(c, tenant, mode, inFlight, err)
 		return tenantstore.Tenant{}, false
 	}
 	detail := map[string]any{"mode": string(mode)}
@@ -497,22 +496,7 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, from []st
 		TenantID: updated.ID, Step: stepTrigger, Status: tenantstore.EventStarted, Message: string(mode) + " run requested", Detail: provisioner.ScrubDetail(detail),
 	}); err != nil {
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("record run intent")
-		if mode == provisioner.ModeDeprovision {
-			// The delete has not happened: put the tenant back where it
-			// was so the caller simply issues it again. Marking it failed
-			// would rely on a failed-event write (the very thing that just
-			// broke) to carry the mode, and a retry without it would
-			// provision instead of deleting.
-			dctx, cancel := detached(ctx)
-			if _, rerr := h.Store.TransitionStatus(dctx, updated.TeamID, updated.ID, []string{inFlight}, tenant.Status); rerr != nil {
-				h.Log.Error().Err(rerr).Str("tenant_id", tenant.ID.String()).Msg("revert delete transition")
-			}
-			cancel()
-			respondError(c, http.StatusInternalServerError, "The delete could not be recorded. Try again.")
-			return tenantstore.Tenant{}, false
-		}
-		h.failTenant(ctx, updated, stepTrigger, "The "+string(mode)+" request could not be recorded. Retry the tenant.", err, map[string]any{"mode": string(mode)})
-		respondError(c, http.StatusInternalServerError, internalErrorMsg)
+		h.abortQueue(c, tenant, mode, inFlight, err)
 		return tenantstore.Tenant{}, false
 	}
 	if err := h.Trigger.Trigger(ctx, updated.TeamID, updated.ID, mode); err != nil {
@@ -534,6 +518,34 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, from []st
 	}
 	h.event(ctx, updated, stepTrigger, tenantstore.EventOK, string(mode)+" run queued", detail)
 	return updated, true
+}
+
+// abortQueue handles a queue attempt that failed before the run's intent
+// event was durable.
+//
+// A provision is marked failed so it can be retried. A delete is not: the
+// mode lives only in that intent event, so a tenant marked failed without
+// one reads as a failed provision, and a retry would rebuild the stack the
+// caller asked to tear down. Marking it failed would also lean on a
+// failed-event write to carry the mode — the very thing that just broke.
+// The delete simply has not happened, so the tenant goes back where it was
+// and the caller issues it again.
+func (h *Handlers) abortQueue(c *gin.Context, tenant tenantstore.Tenant, mode provisioner.Mode, inFlight string, cause error) {
+	ctx := c.Request.Context()
+	if mode != provisioner.ModeDeprovision {
+		h.failTenant(ctx, tenant, stepTrigger, "The "+string(mode)+" run could not be queued. Retry the tenant.", cause, map[string]any{"mode": string(mode)})
+		respondError(c, http.StatusInternalServerError, internalErrorMsg)
+		return
+	}
+	// The transition may not have happened at all (the failure can precede
+	// it), in which case this finds a status it was not told to move from
+	// and changes nothing — which is the desired end state either way.
+	dctx, cancel := detached(ctx)
+	if _, rerr := h.Store.TransitionStatus(dctx, tenant.TeamID, tenant.ID, []string{inFlight}, tenant.Status); rerr != nil && !errors.Is(rerr, tenantstore.ErrStatusConflict) {
+		h.Log.Error().Err(rerr).Str("tenant_id", tenant.ID.String()).Msg("revert delete transition")
+	}
+	cancel()
+	respondError(c, http.StatusInternalServerError, "The delete could not be recorded. Try again.")
 }
 
 // failTenant records why and moves the tenant to failed so it can be
