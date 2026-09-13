@@ -3315,8 +3315,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			if netErr != nil {
 				tFailBoundary = time.Now()
 				cleanupAfterRestoreFailure()
-				m.setStatus(vmID, StatusError)
-				return nil, fmt.Errorf("setup network: %w", netErr)
+				return nil, m.networkRestoreRefusal(vmID, netErr, freshUnit, attempt)
 			}
 			tapDevice = netInfo.TAPDevice
 			macAddr = netInfo.MACAddress

@@ -2,6 +2,9 @@ package vm
 
 import (
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -63,4 +66,21 @@ func admissionError(err error) error {
 	default:
 		return err
 	}
+}
+
+// Called only after failed network setup cleanup and before launching the
+// first Firecracker attempt. Prior-life/retry uncertainty never carries proof.
+func (m *Manager) networkRestoreRefusal(vmID string, err error, fresh bool, attempt int) error {
+	if fresh && attempt == 1 && errors.Is(err, network.ErrOperatorSlotLimit) {
+		if _, statErr := os.Stat(filepath.Join(m.cfg.RunDir, vmID)); errors.Is(statErr, os.ErrNotExist) {
+			m.mu.Lock()
+			delete(m.vms, vmID)
+			m.unindexVM(vmID)
+			m.mu.Unlock()
+			m.admission.Release(vmID)
+			return vmdclient.AdmissionRefused(codes.ResourceExhausted, err.Error())
+		}
+	}
+	m.setStatus(vmID, StatusError)
+	return fmt.Errorf("setup network: %w", err)
 }

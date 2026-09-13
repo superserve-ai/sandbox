@@ -29,6 +29,14 @@ func (h *Handlers) hostAdmissionClient(ctx context.Context, hostID string) (vmdc
 func (h *Handlers) transitionHostAdmission(c *gin.Context, hostID, desired string) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
+	if _, err := h.DB.GetHost(ctx, hostID); err != nil {
+		if err == pgx.ErrNoRows {
+			respondErrorMsg(c, "not_found", "host not found", http.StatusNotFound)
+		} else {
+			respondError(c, ErrInternal)
+		}
+		return
+	}
 	client, err := h.hostAdmissionClient(ctx, hostID)
 	if err != nil {
 		respondErrorMsg(c, "conflict", err.Error(), http.StatusConflict)

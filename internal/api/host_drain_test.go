@@ -35,7 +35,7 @@ func TestHostDrainRequiresAcknowledgedOrderedFence(t *testing.T) {
 					prepared = true
 					return hostRow(row)
 				}
-				if failure == "superseded" {
+				if failure == "superseded" && prepared {
 					row.AdmissionRevision++
 				}
 				return hostRow(row)
@@ -90,5 +90,18 @@ func TestOwnerCapabilityCacheCannotAuthorizePlacement(t *testing.T) {
 	}
 	if queries != 2 {
 		t.Fatal("operation cache keys overlap", queries)
+	}
+}
+
+func TestUnknownHostFailsBeforeResolvingAdmissionClient(t *testing.T) {
+	for _, desired := range []string{"active", "draining"} {
+		h := &Handlers{DB: db.New(&mockDBTX{queryRowFn: func(_ context.Context, q string, args ...any) pgx.Row { return errorRow(pgx.ErrNoRows) }})}
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("POST", "/", nil)
+		h.transitionHostAdmission(c, "missing", desired)
+		if w.Code != 404 {
+			t.Fatalf("%s returned %d: %s", desired, w.Code, w.Body.String())
+		}
 	}
 }
