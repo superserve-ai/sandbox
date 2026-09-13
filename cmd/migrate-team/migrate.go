@@ -248,6 +248,37 @@ func unrevokedKeys(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]
 	return out, rows.Err()
 }
 
+// unrevokedQMTenantKeys returns the live API keys the team's hosted-QM
+// tenants still point at ("<id> (<name>)"). Copy refuses the team's live
+// keys outright (see unrevokedKeys), but a tenant admitted after that check
+// can be issued one and retired before the cutover lock, and the cutover
+// sweep carries the keys its tenant rows reference — so the same
+// region-bound credential would reach the dest through a later door.
+func unrevokedQMTenantKeys(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
+	rows, err := src.Query(ctx, `
+		SELECT id, name FROM api_key
+		WHERE team_id = $1 AND revoked_at IS NULL AND id IN (
+			SELECT sandbox_api_key_id FROM qm.tenants
+			WHERE team_id = $1 AND sandbox_api_key_id IS NOT NULL
+		)
+		ORDER BY created_at`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list unrevoked hosted-QM keys: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id uuid.UUID
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s (%s)", id, name))
+	}
+	return out, rows.Err()
+}
+
 // activeBuilds returns in-flight template builds ("<id> status=<status>")
 // for the team. The freeze must wait these out (or cancel them): copying
 // mid-build template rows would strand half-written artifacts, and the
@@ -1343,6 +1374,14 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	} else if len(tenants) > 0 {
 		return fmt.Errorf("aborting detach: hosted-QM tenant slipped in before the lock:\n  %s", strings.Join(tenants, "\n  "))
 	}
+	// Those tenants are retired, but their sandbox keys need not be, and the
+	// sweep below carries them.
+	if keys, err := unrevokedQMTenantKeys(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(keys) > 0 {
+		return fmt.Errorf("aborting detach: %d hosted-QM tenant key(s) not revoked; revoke them and re-run (the sweep must not carry a live source-region key):\n  %s",
+			len(keys), strings.Join(keys, "\n  "))
+	}
 
 	// Detach is the last moment the dest is guaranteed un-diverged, so the
 	// straggler sweep happens HERE, not at purge: async writers (activity,
@@ -1562,6 +1601,15 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	// frozen source's — post-detach source stragglers are byproducts of a
 	// dead cell, not customer data.
 	if !detached {
+		// The sweep carries the keys hosted-QM tenant rows reference, so the
+		// same live-key rule detach applies holds here (a detached purge
+		// never sweeps, so it has nothing to check).
+		if keys, err := unrevokedQMTenantKeys(ctx, tx, cfg.teamID); err != nil {
+			return err
+		} else if len(keys) > 0 {
+			return fmt.Errorf("aborting purge: %d hosted-QM tenant key(s) not revoked; revoke them and re-run (the sweep must not carry a live source-region key):\n  %s",
+				len(keys), strings.Join(keys, "\n  "))
+		}
 		for _, name := range cutoverSweepTables {
 			spec, ok := sweepSpec(name)
 			if !ok {

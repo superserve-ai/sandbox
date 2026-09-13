@@ -1039,6 +1039,41 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("detach refuses a retired tenant's unrevoked sandbox key", func(t *testing.T) {
+		// The cutover sweep carries the keys tenant rows reference, so a key
+		// issued to a tenant admitted after the freeze has to be revoked
+		// before it can follow the team — copy's live-key refusal ran too
+		// early to have seen it. Both cells get the rows so validate, which
+		// runs first, has nothing to report.
+		lateKey, lateTenant := uuid.New(), uuid.New()
+		for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+			mustExec(t, pool, `
+				INSERT INTO api_key (id, team_id, key_hash, name, created_at)
+				VALUES ($1, $2, 'hash-live-late', 'qm-live-late', '2026-01-01T00:00:00Z')`, lateKey, f.team)
+			mustExec(t, pool, `
+				INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, status, sandbox_api_key_id, created_at, updated_at)
+				VALUES ($1, $2, 'live-key-late', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic', 'deleted', $3,
+				        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+				lateTenant, f.team, lateKey)
+		}
+		defer func() {
+			for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+				mustExec(t, pool, `DELETE FROM qm.tenants WHERE id = $1`, lateTenant)
+				mustExec(t, pool, `DELETE FROM api_key WHERE id = $1`, lateKey)
+			}
+		}()
+
+		cfg := f.cfg(phaseDetach)
+		cfg.confirmTeamName = "migration-drill"
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), lateKey.String()) {
+			t.Fatalf("unrevoked hosted-QM key must block detach, got: %v", err)
+		}
+		if got := countScoped(t, srcPool, tableSpec{"team_memberships", "team_id = $1"}, f.team); got != 2 {
+			t.Fatal("refused detach must not delete anything")
+		}
+	})
+
 	t.Run("detach requires the exact team name", func(t *testing.T) {
 		cfg := f.cfg(phaseDetach)
 		cfg.confirmTeamName = "migration-dril" // one letter off
