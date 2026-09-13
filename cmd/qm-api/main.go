@@ -282,13 +282,29 @@ func runProvision(args []string) error {
 	}
 	defer sentry.Flush(2 * time.Second)
 
-	err = d.runner.Run(ctx, teamID, tenantID, mode, *attemptArg)
+	// A locked tenant is retried rather than accepted as done: the holder
+	// may be a superseded execution that started a moment earlier and is
+	// about to exit on its own attempt check. Giving up on the first
+	// ErrLocked would leave the intent this execution was started for with
+	// nothing behind it until the stale reclaim.
+	for attempt := 0; ; attempt++ {
+		err = d.runner.Run(ctx, teamID, tenantID, mode, *attemptArg)
+		if !errors.Is(err, tenantstore.ErrLocked) || attempt == lockedRunRetries {
+			break
+		}
+		log.Info().Str("tenant_id", tenantID.String()).Int("attempt", attempt+1).Msg("tenant is locked; waiting for the holder to release it")
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(lockedRunBackoff):
+		}
+	}
 	switch {
 	case err == nil:
 		log.Info().Str("tenant_id", tenantID.String()).Str("mode", string(mode)).Msg("run complete")
 		return nil
 	case errors.Is(err, tenantstore.ErrLocked):
-		log.Info().Str("tenant_id", tenantID.String()).Msg("another run holds this tenant; exiting")
+		log.Info().Str("tenant_id", tenantID.String()).Msg("another run still holds this tenant; exiting")
 		return nil
 	case errors.Is(err, provisioner.ErrStaleRun):
 		log.Info().Str("tenant_id", tenantID.String()).Msg("tenant is no longer queued for this mode; exiting")
@@ -297,3 +313,11 @@ func runProvision(args []string) error {
 		return err
 	}
 }
+
+// How long a job waits out a tenant lock before accepting that a live run
+// holds it. A superseded execution releases within a query or two; a real
+// run holds it for its whole life, which no wait here would outlast.
+const (
+	lockedRunRetries = 5
+	lockedRunBackoff = 2 * time.Second
+)

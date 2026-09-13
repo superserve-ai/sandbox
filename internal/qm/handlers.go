@@ -172,16 +172,22 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 	if retired {
 		dctx, cancel := detached(ctx)
 		if derr := h.Secrets.Delete(dctx, secrets.TenantSecretName(tenant.Slug, keyName)); derr != nil {
+			// The reference stays: it is the only record that this key
+			// exists, and a teardown re-run is what will find it again.
 			log.Error().Str("error", provisioner.ScrubString(derr.Error())).Msg("remove the model key of a retired tenant")
-		}
-		if derr := h.Store.DeleteSecretRef(dctx, p.TeamID, tenant.ID, keyName); derr != nil {
+		} else if derr := h.Store.DeleteSecretRef(dctx, p.TeamID, tenant.ID, keyName); derr != nil {
 			log.Error().Err(derr).Msg("remove the model key reference of a retired tenant")
 		}
 		cancel()
 		respondError(c, http.StatusConflict, "This tenant was deleted while it was being created. Create it again.")
 		return
 	}
-	stored := h.event(ctx, tenant, stepModelKey, tenantstore.EventOK, keyName+" stored", nil)
+	// Guarded like the trigger's outcome: the retirement check above can
+	// observe a live tenant just before something else reclaims it, and an
+	// unconditional event would then move the row past the version the
+	// replacement holds. A dropped event leaves the version where it was,
+	// and the queue below conflicts, which is the right answer.
+	stored := h.eventIfMine(ctx, tenant, tenantstore.VersionOf(tenant), stepModelKey, tenantstore.EventOK, keyName+" stored", nil)
 
 	queued, ok := h.queueRun(c, tenant, versionAfter(tenant, stored), []string{tenantstore.StatusProvisioning}, provisioner.ModeProvision)
 	if !ok {
@@ -618,22 +624,23 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 // version past the one the replacement holds, and the replacement's own
 // bookkeeping would then decline to touch the tenant it owns. The check is
 // part of the insert, so nothing can land between the two.
-func (h *Handlers) eventIfMine(ctx context.Context, tenant tenantstore.Tenant, at tenantstore.Version, step, status, message string, detail map[string]any) {
+func (h *Handlers) eventIfMine(ctx context.Context, tenant tenantstore.Tenant, at tenantstore.Version, step, status, message string, detail map[string]any) tenantstore.Event {
 	p := tenantstore.EventParams{TenantID: tenant.ID, Step: step, Status: status, Message: message}
 	if detail != nil {
 		p.Detail = provisioner.ScrubDetail(detail)
 	}
 	dctx, cancel := detached(ctx)
 	defer cancel()
-	_, err := h.Store.InsertEventIfUnchanged(dctx, tenant.TeamID, p, at)
+	e, err := h.Store.InsertEventIfUnchanged(dctx, tenant.TeamID, p, at)
 	switch {
 	case err == nil:
 	case errors.Is(err, tenantstore.ErrStatusConflict), errors.Is(err, tenantstore.ErrNotFound):
 		h.Log.Warn().Str("tenant_id", tenant.ID.String()).Str("step", step).
-			Msg("a later attempt owns this tenant; dropping this outcome event")
+			Msg("a later attempt owns this tenant; dropping this event")
 	default:
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Str("step", step).Msg("record tenant event")
 	}
+	return e
 }
 
 // abortQueue handles a queue attempt that failed before the run's intent
