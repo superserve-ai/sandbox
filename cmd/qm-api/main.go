@@ -62,9 +62,15 @@ type deps struct {
 	closeStore func()
 	secrets    secrets.Store
 	runner     *provisioner.Runner
+	// closeClients releases the provisioner's cloud clients; nil in stub
+	// mode, where none were built.
+	closeClients func()
 }
 
 func (d *deps) close() {
+	if d.closeClients != nil {
+		d.closeClients()
+	}
 	d.closeStore()
 	d.pool.Close()
 }
@@ -141,10 +147,20 @@ func setup(ctx context.Context) (*deps, error) {
 	if env.Stub {
 		log.Warn().Msg("QM_PROVISIONER_STUB=1: cloud-touching steps record placeholders instead of creating resources")
 	}
+	clients := provisionerClients{clients: steps.Clients{Secrets: secretStore}}
+	if !env.Stub {
+		// Built only outside stub mode: each constructor dials Google, and
+		// a local run has no credentials to do it with.
+		clients, err = cloudClients(ctx, cfg, env, secretStore)
+		if err != nil {
+			return d, err
+		}
+		d.closeClients = clients.Close
+	}
 	d.runner = &provisioner.Runner{
 		Store: d.store,
 		Env:   env,
-		Steps: steps.All(steps.Clients{Secrets: secretStore}),
+		Steps: steps.All(clients.Steps()),
 		Log:   log.Logger,
 	}
 	// Refuse a configuration whose plan would stop partway: by the time a

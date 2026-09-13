@@ -24,8 +24,8 @@ import (
 )
 
 // Clients is every external dependency the plan needs. A nil field is fine
-// in stub mode; outside it the step that needs the client returns
-// NotImplemented until the client (and the step body) exists.
+// in stub mode, where no step calls out; outside it, the step that needs a
+// client says so from Ready and the binary refuses to start.
 type Clients struct {
 	Secrets      secrets.Store
 	Databases    DatabaseAdmin
