@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -74,14 +75,7 @@ func (h *Handlers) newJTI() (string, error) {
 func (h *Handlers) CreateTenant(c *gin.Context) {
 	p := principalFrom(c)
 	var req CreateTenantRequest
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxCreateBodyBytes)
-	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			respondError(c, http.StatusRequestEntityTooLarge, "Request body is too large.")
-			return
-		}
-		respondError(c, http.StatusBadRequest, "Request body must be a JSON object.")
+	if !decodeBody(c, &req) {
 		return
 	}
 	req.normalize()
@@ -159,6 +153,35 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"tenant": toTenantResponse(queued)})
+}
+
+// decodeBody reads exactly one JSON value of at most maxCreateBodyBytes
+// into out, writing the response and returning false otherwise. The
+// trailing-data check is what makes the size limit meaningful: the reader
+// only counts bytes the decoder pulls, so a body that is one valid object
+// followed by megabytes of anything would otherwise pass unread.
+func decodeBody(c *gin.Context, out any) bool {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxCreateBodyBytes)
+	dec := json.NewDecoder(c.Request.Body)
+	err := dec.Decode(out)
+	if err == nil {
+		if rest := dec.Decode(new(json.RawMessage)); !errors.Is(rest, io.EOF) {
+			err = rest
+			if err == nil {
+				err = errors.New("unexpected data after the JSON object")
+			}
+		}
+	}
+	if err == nil {
+		return true
+	}
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		respondError(c, http.StatusRequestEntityTooLarge, "Request body is too large.")
+		return false
+	}
+	respondError(c, http.StatusBadRequest, "Request body must be a single JSON object.")
+	return false
 }
 
 func (h *Handlers) ListTenants(c *gin.Context) {

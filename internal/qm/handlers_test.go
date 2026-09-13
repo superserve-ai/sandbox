@@ -132,7 +132,13 @@ func (f *fixture) do(t *testing.T, method, path, key string, body any) (int, map
 			t.Fatal(err)
 		}
 	}
-	req := httptest.NewRequest(method, path, &buf)
+	return f.doRaw(t, method, path, key, buf.Bytes())
+}
+
+// doRaw sends body verbatim, for the shapes an encoder would not produce.
+func (f *fixture) doRaw(t *testing.T, method, path, key string, body []byte) (int, map[string]any) {
+	t.Helper()
+	req := httptest.NewRequest(method, path, bytes.NewReader(body))
 	if key != "" {
 		req.Header.Set("X-API-Key", key)
 	}
@@ -940,10 +946,29 @@ func TestCreateTenantRejectsOversizedBody(t *testing.T) {
 	if code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status %d body %v, want 413", code, resp)
 	}
+
+	// A valid object followed by padding is the same attempt with the
+	// decoder stopping early, so the limit has to hold past the object.
+	valid, err := json.Marshal(validCreate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	padded := append(valid, bytes.Repeat([]byte(" "), maxCreateBodyBytes)...)
+	if code, resp := f.doRaw(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, padded); code != http.StatusRequestEntityTooLarge {
+		t.Errorf("padded body: status %d body %v, want 413", code, resp)
+	}
+	// Two objects in one body is a malformed request, not two creates.
+	if code, resp := f.doRaw(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, append(valid, valid...)); code != http.StatusBadRequest {
+		t.Errorf("two objects: status %d body %v, want 400", code, resp)
+	}
+	if code, resp := f.doRaw(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, append(valid, []byte(" garbage")...)); code != http.StatusBadRequest {
+		t.Errorf("trailing garbage: status %d body %v, want 400", code, resp)
+	}
+
 	if len(f.secrets.Puts) != 0 || len(f.trigger.Calls) != 0 {
-		t.Error("an oversized body reached the secret store or the trigger")
+		t.Error("a malformed body reached the secret store or the trigger")
 	}
 	if tenants, _ := f.store.ListTenants(context.Background(), f.teamA); len(tenants) != 0 {
-		t.Errorf("an oversized body created a tenant: %+v", tenants)
+		t.Errorf("a malformed body created a tenant: %+v", tenants)
 	}
 }

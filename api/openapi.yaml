@@ -2398,7 +2398,9 @@ paths:
                   tenant:
                     $ref: "#/components/schemas/QMTenant"
         "400":
-          description: One or more fields are invalid
+          description: >
+            The body is not a single JSON object, or one or more fields are
+            invalid. Field-level problems carry a `fields` map.
           content:
             application/json:
               schema:
