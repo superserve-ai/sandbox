@@ -74,6 +74,18 @@ func (f *Fake) Delete(_ context.Context, name, owner string) error {
 	return nil
 }
 
+func (f *Fake) Owner(_ context.Context, name string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Err != nil {
+		return "", false, f.Err
+	}
+	if _, exists := f.values[name]; !exists {
+		return "", false, nil
+	}
+	return f.owners[name], true, nil
+}
+
 // checkOwner mirrors the GCP store: a secret that exists under another
 // owner, or under none, is not the caller's to write or remove.
 func (f *Fake) checkOwner(name, owner string) error {

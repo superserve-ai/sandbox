@@ -123,8 +123,8 @@ func (s secretsStep) Rollback(ctx context.Context, t *provisioner.Tenant) error 
 		names[ref.Name] = true
 	}
 	for name := range names {
-		if err := s.c.Secrets.Delete(ctx, t.SecretName(name), t.Row.ID.String()); err != nil {
-			return fmt.Errorf("delete %s: %w", name, err)
+		if err := deleteTenantSecret(ctx, s.c, t, name); err != nil {
+			return err
 		}
 	}
 	for _, ref := range refs {
@@ -133,4 +133,19 @@ func (s secretsStep) Rollback(ctx context.Context, t *provisioner.Tenant) error 
 		}
 	}
 	return nil
+}
+
+// deleteTenantSecret removes one of the tenant's secrets, and treats a
+// secret that is not this tenant's as nothing to remove.
+//
+// Skipping rather than failing is the point: the name is derived from a
+// slug, so a secret under that name may belong to something else — and a
+// teardown that stopped there would leave the tenant undeletable forever
+// over a secret it never created.
+func deleteTenantSecret(ctx context.Context, c Clients, t *provisioner.Tenant, name string) error {
+	err := c.Secrets.Delete(ctx, t.SecretName(name), t.Row.ID.String())
+	if err == nil || errors.Is(err, secrets.ErrNotOwned) {
+		return nil
+	}
+	return fmt.Errorf("delete %s: %w", name, err)
 }

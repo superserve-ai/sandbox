@@ -80,8 +80,8 @@ func (s sandboxKey) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if err != nil {
 		return err
 	}
-	if err := s.c.Secrets.Delete(ctx, t.SecretName(secretSandboxAPIKey), t.Row.ID.String()); err != nil {
-		return fmt.Errorf("delete the tenant's sandbox key: %w", err)
+	if err := deleteTenantSecret(ctx, s.c, t, secretSandboxAPIKey); err != nil {
+		return err
 	}
 	if err := t.DeleteSecretRef(ctx, secretSandboxAPIKey); err != nil {
 		return err

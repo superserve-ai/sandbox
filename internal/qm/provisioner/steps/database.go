@@ -155,8 +155,8 @@ func (s database) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if err := s.c.Databases.DropUser(ctx, RoleName(t.Row.Slug), marker); err != nil {
 		return fmt.Errorf("drop the tenant's database role: %w", err)
 	}
-	if err := s.c.Secrets.Delete(ctx, t.SecretName(secretDatabaseURL), t.Row.ID.String()); err != nil {
-		return fmt.Errorf("delete the tenant's database url: %w", err)
+	if err := deleteTenantSecret(ctx, s.c, t, secretDatabaseURL); err != nil {
+		return err
 	}
 	if err := t.DeleteSecretRef(ctx, secretDatabaseURL); err != nil {
 		return err

@@ -40,6 +40,10 @@ type Store interface {
 	Put(ctx context.Context, name string, value []byte, owner string) (ref string, err error)
 	// Get reads the latest version.
 	Get(ctx context.Context, name string) ([]byte, error)
+	// Owner reports the tenant a secret belongs to, for a caller that is
+	// about to do something to it other than write it — granting a tenant
+	// read on one, say. exists is false when there is no such secret.
+	Owner(ctx context.Context, name string) (owner string, exists bool, err error)
 	// Delete removes the secret and every version. Idempotent, and
 	// ErrNotOwned when the secret belongs to another tenant.
 	Delete(ctx context.Context, name, owner string) error

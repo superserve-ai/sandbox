@@ -81,6 +81,9 @@ func (s cloudRun) Ready(env provisioner.Env) error {
 	if env.Stub {
 		return nil
 	}
+	if s.c.Secrets == nil {
+		return errNoSecretStore
+	}
 	if env.ExecutesPlan {
 		if s.c.Services == nil {
 			return errNoCloudRunAdmin
@@ -117,6 +120,9 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if s.c.Accounts == nil {
 		return errNoServiceAccountAdmin
 	}
+	if s.c.Secrets == nil {
+		return errNoSecretStore
+	}
 	if t.Row.ServiceAccount == nil {
 		return fmt.Errorf("cloud_run: the tenant has no service account recorded")
 	}
@@ -139,7 +145,22 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if err := s.reconcileSharedGrant(ctx, t, account); err != nil {
 		return err
 	}
+	// Ownership is checked here rather than only where the secrets are
+	// written: the secrets step skips a secret whose reference is already
+	// recorded, so a recorded secret that has since been deleted and
+	// recreated by something else is never re-checked on the write path.
+	// Granting on it would mount another workload's credential in this
+	// tenant's container.
 	for _, secretName := range mountedSecrets(secretEnv) {
+		if secretName != t.Env.ResendSecret {
+			owner, exists, err := s.c.Secrets.Owner(ctx, secretName)
+			if err != nil {
+				return fmt.Errorf("read the owner of %s: %w", secretName, err)
+			}
+			if exists && owner != t.Row.ID.String() {
+				return fmt.Errorf("secret %s does not belong to this tenant", secretName)
+			}
+		}
 		if err := s.c.Accounts.GrantSecretAccess(ctx, secretName, account); err != nil {
 			return fmt.Errorf("grant the tenant access to %s: %w", secretName, err)
 		}

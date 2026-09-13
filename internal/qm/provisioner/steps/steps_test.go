@@ -535,6 +535,18 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 			"another tenant",
 		},
 		{
+			// The secrets step skips a secret whose reference is already
+			// recorded, so a recorded one replaced by something else is
+			// never re-checked where it is written. The grant is where it
+			// is caught, because granting on it would mount another
+			// workload's credential in this tenant's container.
+			"a recorded secret replaced under another owner",
+			func(f *tenantFixture) {
+				f.secrets.SetOwner("qm-pilot-team-ANTHROPIC_API_KEY", "somebody else")
+			},
+			"does not belong to this tenant",
+		},
+		{
 			"a database with the name the slug derives",
 			func(f *tenantFixture) {
 				f.dbs.mu.Lock()
@@ -604,6 +616,28 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 				t.Errorf("status = %s", f.current(t).Status)
 			}
 		})
+	}
+}
+
+// A tenant that never created a secret under a name its slug derives must
+// still be deletable: teardown skips what is not its own rather than
+// failing on it forever.
+func TestTeardownSkipsASecretItDoesNotOwn(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	// Something else takes the name between provision and teardown.
+	f.secrets.SetOwner("qm-pilot-team-CORE_SIGNING_SECRET", "somebody else")
+
+	if err := f.deprovision(t); err != nil {
+		t.Fatalf("teardown: %v", err)
+	}
+	if f.current(t).Status != tenantstore.StatusDeleted {
+		t.Errorf("status = %s", f.current(t).Status)
+	}
+	if !f.secrets.Has("qm-pilot-team-CORE_SIGNING_SECRET") {
+		t.Error("the secret that did not belong to this tenant was deleted")
 	}
 }
 

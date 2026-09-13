@@ -244,8 +244,8 @@ func (s bucket) hmacStored(ctx context.Context, t *provisioner.Tenant) (bool, er
 // so what is written next is a matched pair or nothing.
 func (s bucket) forgetHMACSecrets(ctx context.Context, t *provisioner.Tenant) error {
 	for _, name := range []string{secretAccessKeyID, secretSecretAccessKey} {
-		if err := s.c.Secrets.Delete(ctx, t.SecretName(name), t.Row.ID.String()); err != nil {
-			return fmt.Errorf("delete %s: %w", name, err)
+		if err := deleteTenantSecret(ctx, s.c, t, name); err != nil {
+			return err
 		}
 		if err := t.DeleteSecretRef(ctx, name); err != nil {
 			return err

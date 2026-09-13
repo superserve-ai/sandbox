@@ -97,6 +97,20 @@ func (g *GCP) Delete(ctx context.Context, name, owner string) error {
 	return nil
 }
 
+func (g *GCP) Owner(ctx context.Context, name string) (string, bool, error) {
+	if err := ValidName(name); err != nil {
+		return "", false, err
+	}
+	secret, err := g.svc.Projects.Secrets.Get(g.secretPath(name)).Context(ctx).Do()
+	if err != nil {
+		if isStatus(err, http.StatusNotFound) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("get secret %s: %w", name, err)
+	}
+	return secret.Labels[OwnerLabel], true, nil
+}
+
 // checkOwner refuses a secret that exists and does not carry owner. One
 // that does not exist passes — the caller is about to create it, or is
 // deleting something already gone.
