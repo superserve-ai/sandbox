@@ -126,6 +126,12 @@ resource "google_compute_global_address" "private_service_range" {
   address       = var.private_service_range_address
   network       = var.network_self_link
   labels        = var.labels
+
+  # Abandoned for the same reason as the peering below: the peering keeps
+  # holding this range after it is abandoned, and GCP refuses to delete a
+  # range an active peering still references, so a DELETE policy would wedge
+  # the destroy partway through.
+  deletion_policy = "ABANDON"
 }
 
 resource "google_service_networking_connection" "private_service_access" {
