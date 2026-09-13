@@ -245,28 +245,28 @@ jobs:
           # tenant a working sign-in; without them the binary refuses to
           # start rather than building tenants nobody can log in to.
           #
-          # A variable that has been cleared is *removed*, not omitted: an
-          # update that simply leaves a key out keeps the resource's
-          # previous value, so clearing one would silently go on deploying
-          # the old email or sandbox configuration and the startup check
-          # would never see it missing.
-          REMOVE=""
+          # Every one is written on every deploy, including as an empty
+          # value: an update that simply leaves a key out keeps the
+          # resource's previous value, so a variable cleared in GitHub would
+          # otherwise go on deploying the old configuration and the startup
+          # check would never see it missing.
+          #
+          # QM_PROVISIONER_STUB is pinned off for the same reason. An
+          # environment deployed while the cloud steps were stubs still
+          # carries it, and left alone the real provisioner would go on
+          # recording placeholder resources and marking tenants ready.
+          ENV="$ENV,QM_PROVISIONER_STUB=0"
           for pair in \
             "QM_RESEND_SECRET=${{ vars.QM_RESEND_SECRET }}" \
             "QM_EMAIL_FROM=${{ vars.QM_EMAIL_FROM }}" \
             "QM_SANDBOX_API_URL=${{ vars.QM_SANDBOX_API_URL }}" \
             "QM_SANDBOX_TEMPLATE=${{ vars.QM_SANDBOX_TEMPLATE }}"; do
-            if [ "${pair#*=}" = "" ]; then
-              REMOVE="${REMOVE:+$REMOVE,}${pair%%=*}"
-            else
-              ENV="$ENV,$pair"
-            fi
+            ENV="$ENV,$pair"
           done
           # An array, because QM_EMAIL_FROM is a display-name address —
           # "QM <no-reply@...>" — and word splitting on an unquoted
           # expansion would hand gcloud three arguments it does not know.
           SET=(--update-env-vars "$ENV")
-          [ -z "$REMOVE" ] || SET+=(--remove-env-vars "$REMOVE")
           gcloud run jobs update "$JOB" --image "$IMAGE" "${SET[@]}" $ARGS
           gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" "${SET[@]}" $ARGS
 
@@ -375,28 +375,28 @@ jobs:
           # tenant a working sign-in; without them the binary refuses to
           # start rather than building tenants nobody can log in to.
           #
-          # A variable that has been cleared is *removed*, not omitted: an
-          # update that simply leaves a key out keeps the resource's
-          # previous value, so clearing one would silently go on deploying
-          # the old email or sandbox configuration and the startup check
-          # would never see it missing.
-          REMOVE=""
+          # Every one is written on every deploy, including as an empty
+          # value: an update that simply leaves a key out keeps the
+          # resource's previous value, so a variable cleared in GitHub would
+          # otherwise go on deploying the old configuration and the startup
+          # check would never see it missing.
+          #
+          # QM_PROVISIONER_STUB is pinned off for the same reason. An
+          # environment deployed while the cloud steps were stubs still
+          # carries it, and left alone the real provisioner would go on
+          # recording placeholder resources and marking tenants ready.
+          ENV="$ENV,QM_PROVISIONER_STUB=0"
           for pair in \
             "QM_RESEND_SECRET=${{ vars.QM_RESEND_SECRET }}" \
             "QM_EMAIL_FROM=${{ vars.QM_EMAIL_FROM }}" \
             "QM_SANDBOX_API_URL=${{ vars.QM_SANDBOX_API_URL }}" \
             "QM_SANDBOX_TEMPLATE=${{ vars.QM_SANDBOX_TEMPLATE }}"; do
-            if [ "${pair#*=}" = "" ]; then
-              REMOVE="${REMOVE:+$REMOVE,}${pair%%=*}"
-            else
-              ENV="$ENV,$pair"
-            fi
+            ENV="$ENV,$pair"
           done
           # An array, because QM_EMAIL_FROM is a display-name address —
           # "QM <no-reply@...>" — and word splitting on an unquoted
           # expansion would hand gcloud three arguments it does not know.
           SET=(--update-env-vars "$ENV")
-          [ -z "$REMOVE" ] || SET+=(--remove-env-vars "$REMOVE")
           gcloud run jobs update "$JOB" --image "$IMAGE" "${SET[@]}" $ARGS
           gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" "${SET[@]}" $ARGS
 

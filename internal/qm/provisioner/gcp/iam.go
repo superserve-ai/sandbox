@@ -99,18 +99,22 @@ func (a *Accounts) Delete(ctx context.Context, email string) error {
 // read-modify-write carries the etag, so a concurrent change to the same
 // policy is retried rather than silently overwritten.
 func (a *Accounts) GrantSecretAccess(ctx context.Context, secretName, email string) error {
-	return a.editSecretPolicy(ctx, secretName, email, addMember)
+	return a.editSecretPolicy(ctx, secretName, email, addMember, false)
 }
 
 // RevokeSecretAccess removes the binding again, and does nothing when it is
 // not there.
 func (a *Accounts) RevokeSecretAccess(ctx context.Context, secretName, email string) error {
-	return a.editSecretPolicy(ctx, secretName, email, removeMember)
+	// A secret that is gone grants nobody anything, which is the outcome a
+	// revoke was after. A grant cannot say the same: it would report
+	// success having bound nothing, and the run would go on to deploy a
+	// service mounting a secret that does not exist.
+	return a.editSecretPolicy(ctx, secretName, email, removeMember, true)
 }
 
 // editSecretPolicy applies edit to the secret's policy under its etag. edit
 // reports whether it changed anything; when it does not, nothing is sent.
-func (a *Accounts) editSecretPolicy(ctx context.Context, secretName, email string, edit func(*secretmanager.Policy, string) bool) error {
+func (a *Accounts) editSecretPolicy(ctx context.Context, secretName, email string, edit func(*secretmanager.Policy, string) bool, missingIsFine bool) error {
 	resource := "projects/" + a.project + "/secrets/" + secretName
 	member := "serviceAccount:" + email
 	var lastErr error
@@ -118,9 +122,7 @@ func (a *Accounts) editSecretPolicy(ctx context.Context, secretName, email strin
 		policy, err := a.secrets.Projects.Secrets.GetIamPolicy(resource).
 			OptionsRequestedPolicyVersion(iamPolicyVersion).Context(ctx).Do()
 		if err != nil {
-			if notFound(err) {
-				// A secret that is gone grants nobody anything, which is
-				// the same outcome either edit was after.
+			if notFound(err) && missingIsFine {
 				return nil
 			}
 			return fmt.Errorf("read the iam policy of %s: %w", secretName, err)

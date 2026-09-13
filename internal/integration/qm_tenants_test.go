@@ -117,6 +117,28 @@ func newTenantParams(teamID uuid.UUID, slug string) db.CreateQMTenantParams {
 	}
 }
 
+// qmTeamMember returns the id of an active member of the team, which is the
+// actor a tenant created through the API would carry.
+func qmTeamMember(t *testing.T, teamID uuid.UUID) uuid.UUID {
+	t.Helper()
+	var userID uuid.UUID
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT user_id FROM team_memberships WHERE team_id = $1 AND status = 'active' LIMIT 1`, teamID,
+	).Scan(&userID); err != nil {
+		t.Fatalf("find a team member: %v", err)
+	}
+	return userID
+}
+
+// withCreator is newTenantParams for the tests that need the tenant to have
+// one: the sandbox key a tenant is issued inherits its creator as the actor
+// its permissions resolve through, so a tenant without one cannot be issued
+// a usable key at all.
+func withCreator(p db.CreateQMTenantParams, actor uuid.UUID) db.CreateQMTenantParams {
+	p.CreatedBy = pgtype.UUID{Bytes: actor, Valid: true}
+	return p
+}
+
 func TestQMAPI_TenantLifecycleWithinTeamScope(t *testing.T) {
 	ctx := context.Background()
 	teamID, keyID := seedQMTeamAndKey(t)
@@ -904,10 +926,11 @@ func TestQMAPI_IssueTenantSandboxKey(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedQMTeamAndKey(t)
 	otherTeam, _ := seedQMTeamAndKey(t)
+	actor := qmTeamMember(t, teamID)
 	conn := connectAsQMAPI(t)
 
 	tx, q := scopedQMTx(t, conn, teamID)
-	tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	tenant, err := q.CreateQMTenant(ctx, withCreator(newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]), actor))
 	if err != nil {
 		t.Fatalf("create tenant: %v", err)
 	}
@@ -943,14 +966,21 @@ func TestQMAPI_IssueTenantSandboxKey(t *testing.T) {
 	var keyTeam uuid.UUID
 	var keyHash, keyName string
 	var revoked *time.Time
+	var keyActor pgtype.UUID
 	var count int
 	if err := testPool.QueryRow(ctx,
-		`SELECT team_id, key_hash, name, revoked_at FROM public.api_key WHERE id = $1`, keyID,
-	).Scan(&keyTeam, &keyHash, &keyName, &revoked); err != nil {
+		`SELECT team_id, key_hash, name, revoked_at, created_by FROM public.api_key WHERE id = $1`, keyID,
+	).Scan(&keyTeam, &keyHash, &keyName, &revoked, &keyActor); err != nil {
 		t.Fatalf("reload api key: %v", err)
 	}
 	if keyTeam != teamID || keyHash != hash || keyName != "__qm_tenant__" || revoked != nil {
 		t.Fatalf("issued key: team=%s hash=%s name=%s revoked=%v", keyTeam, keyHash, keyName, revoked)
+	}
+	// The key inherits the tenant's creator: that is the actor the control
+	// plane resolves its permissions through, and without one the tenant
+	// could not create a single sandbox with it.
+	if !keyActor.Valid || uuid.UUID(keyActor.Bytes) != actor {
+		t.Fatalf("issued key actor = %v, want %s", keyActor, actor)
 	}
 	if err := testPool.QueryRow(ctx,
 		`SELECT count(*) FROM public.api_key WHERE team_id = $1 AND name = '__qm_tenant__'`, teamID,
@@ -973,16 +1003,33 @@ func TestQMAPI_IssueTenantSandboxKey(t *testing.T) {
 
 	// A retired tenant is not issuable either: teardown revokes what the
 	// row points at, so a key minted after it would never be revoked.
-	tx3, q3 := scopedQMTx(t, conn, teamID)
-	if _, err := q3.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenant.ID, TeamID: teamID}); err != nil {
-		t.Fatalf("soft delete: %v", err)
+	// A tenant with no creator has no actor to inherit, so a key for it
+	// would authorize nothing; the function refuses rather than issuing one
+	// that silently cannot create sandboxes. Its own team, because a team
+	// may only have one live tenant.
+	orphanTeam, _ := seedQMTeamAndKey(t)
+	tx3, q3 := scopedQMTx(t, conn, orphanTeam)
+	orphan, err := q3.CreateQMTenant(ctx, newTenantParams(orphanTeam, "orphan-"+uuid.NewString()[:8]))
+	if err != nil {
+		t.Fatalf("create tenant without a creator: %v", err)
 	}
 	if _, err := q3.IssueQMTenantSandboxKey(ctx, db.IssueQMTenantSandboxKeyParams{
+		TenantID: orphan.ID, KeyHash: "qm-orphan-" + uuid.NewString(), KeyName: "__qm_tenant__", KeyScopes: []string{},
+	}); err == nil {
+		t.Fatal("a tenant with no creator was issued a key")
+	}
+	_ = tx3.Rollback(ctx)
+
+	tx4, q4 := scopedQMTx(t, conn, teamID)
+	if _, err := q4.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenant.ID, TeamID: teamID}); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	if _, err := q4.IssueQMTenantSandboxKey(ctx, db.IssueQMTenantSandboxKeyParams{
 		TenantID: tenant.ID, KeyHash: "qm-late-" + uuid.NewString(), KeyName: "__qm_tenant__", KeyScopes: []string{},
 	}); err == nil {
 		t.Fatal("a deleted tenant issued a key")
 	}
-	_ = tx3.Rollback(ctx)
+	_ = tx4.Rollback(ctx)
 }
 
 // qm_api reaches api_key only through the definer functions; the direct

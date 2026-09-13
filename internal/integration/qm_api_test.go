@@ -336,7 +336,12 @@ func TestQMAPI_StubRunnerAgainstPostgres(t *testing.T) {
 	store := qmAPIStore(t, qmAPIPool(t))
 	fake := secrets.NewFake()
 	slug := "pilot-team-" + uuid.NewString()[:8]
-	tenant, err := store.CreateTenant(ctx, teamID, tenantstore.CreateParams{Slug: slug, OrgName: "Pilot Team", AdminEmail: "admin@example.com", SignIn: "magic_link", ModelProvider: "openai"})
+	// With a creator, as the API always records: the tenant's sandbox key
+	// inherits it as the actor its permissions resolve through, and that
+	// step is real in stub mode too — it mints a control-plane credential,
+	// not a cloud resource.
+	actor := qmTeamMember(t, teamID)
+	tenant, err := store.CreateTenant(ctx, teamID, tenantstore.CreateParams{Slug: slug, OrgName: "Pilot Team", AdminEmail: "admin@example.com", SignIn: "magic_link", ModelProvider: "openai", CreatedBy: &actor})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,6 +357,9 @@ func TestQMAPI_StubRunnerAgainstPostgres(t *testing.T) {
 	row, err := store.GetTenant(ctx, teamID, tenant.ID)
 	if err != nil || row.Status != tenantstore.StatusReady || row.PublicUrl == nil || *row.PublicUrl != "https://"+slug+".qm.example.com" || row.DbName == nil {
 		t.Fatalf("after provision: %+v err=%v", row, err)
+	}
+	if !row.SandboxApiKeyID.Valid {
+		t.Error("the tenant was not issued a sandbox key")
 	}
 	events, _ := store.ListEvents(ctx, teamID, tenant.ID)
 	if len(events) == 0 || events[len(events)-1].Step != provisioner.RunStep || events[len(events)-1].Status != tenantstore.EventOK {
