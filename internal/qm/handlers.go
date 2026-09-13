@@ -176,10 +176,15 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 	}
 	if retired {
 		dctx, cancel := detached(ctx)
-		if derr := h.Secrets.Delete(dctx, secrets.TenantSecretName(tenant.Slug, keyName)); derr != nil {
-			// The reference stays: it is the only record that this key
-			// exists, and a teardown re-run is what will find it again.
-			log.Error().Str("error", provisioner.ScrubString(derr.Error())).Msg("remove the model key of a retired tenant")
+		name := secrets.TenantSecretName(tenant.Slug, keyName)
+		if derr := h.deleteSecret(dctx, name); derr != nil {
+			// Nothing downstream will pick this up: the tenant is on its
+			// way out, and once it is deleted the API no longer shows it
+			// and its references are frozen. Say so loudly, with the name
+			// (derived from the slug, not itself a secret) so it can be
+			// removed by hand.
+			log.Error().Str("error", provisioner.ScrubString(derr.Error())).Str("secret", name).
+				Msg("model key of a retired tenant could not be removed; delete it manually")
 		} else if derr := h.Store.DeleteSecretRef(dctx, p.TeamID, tenant.ID, keyName); derr != nil {
 			log.Error().Err(derr).Msg("remove the model key reference of a retired tenant")
 		}
@@ -484,6 +489,20 @@ func (h *Handlers) reclaimStale(c *gin.Context, tenant tenantstore.Tenant) (tena
 		updated.EventSeq = reclaimed.Seq
 	}
 	return updated, true
+}
+
+// secretDeleteAttempts bounds the retries on the one cleanup nothing else
+// will ever repeat: a key whose tenant is already being torn down.
+const secretDeleteAttempts = 3
+
+func (h *Handlers) deleteSecret(ctx context.Context, name string) error {
+	var err error
+	for attempt := 0; attempt < secretDeleteAttempts; attempt++ {
+		if err = h.Secrets.Delete(ctx, name); err == nil || ctx.Err() != nil {
+			return err
+		}
+	}
+	return err
 }
 
 // tenantRetired reports whether the tenant has been torn down, or is being
