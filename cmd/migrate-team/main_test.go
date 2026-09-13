@@ -173,6 +173,7 @@ type fixture struct {
 	sysTplSrc, sysTplDst    uuid.UUID
 	snap1, snap2            uuid.UUID
 	secret                  uuid.UUID
+	qmTenant                uuid.UUID
 	expectedCounts          map[string]int64
 	expectedDirs            []string
 }
@@ -197,6 +198,7 @@ func seedFixture(t *testing.T) *fixture {
 		snap1:     uuid.New(),
 		snap2:     uuid.New(),
 		secret:    uuid.New(),
+		qmTenant:  uuid.New(),
 	}
 	base := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
 
@@ -233,6 +235,12 @@ func seedFixture(t *testing.T) *fixture {
 	// rotates keys before copy; live keys block).
 	mustExec(t, srcPool, `INSERT INTO api_key (team_id, key_hash, name, created_by, revoked_at) VALUES ($1, 'hash-'||$2::text, 'ci', $3, now())`, f.team, uuid.New(), f.owner)
 	mustExec(t, srcPool, `INSERT INTO api_key (team_id, key_hash, name, revoked_at) VALUES ($1, 'hash-'||$2::text, 'agent', now())`, f.team, uuid.New())
+	mustExec(t, srcPool, `
+		INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, status, sandbox_api_key_id)
+		VALUES ($1, $2, 'pilot-team', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic', 'deleted',
+		        (SELECT id FROM api_key WHERE team_id = $2 AND name = 'ci'))`, f.qmTenant, f.team)
+	mustExec(t, srcPool, `INSERT INTO qm.tenant_events (tenant_id, step, status, message, seq) VALUES ($1, 'database', 'ok', 'created', 1)`, f.qmTenant)
+	mustExec(t, srcPool, `INSERT INTO qm.tenant_secrets (tenant_id, name, secret_ref) VALUES ($1, 'CORE_SIGNING_SECRET', 'projects/example/secrets/qm-pilot-team-CORE_SIGNING_SECRET')`, f.qmTenant)
 
 	mustExec(t, srcPool, `
 		INSERT INTO secret (id, team_id, name, auth_type, hosts, ciphertext, encrypted_dek, kek_id)
@@ -432,6 +440,9 @@ func seedFixture(t *testing.T) *fixture {
 		"team_memberships":                   2,
 		"user_role_assignments":              2,
 		"api_key":                            2,
+		"qm.tenants":                         1,
+		"qm.tenant_events":                   1,
+		"qm.tenant_secrets":                  1,
 		"secret":                             1,
 		"template":                           1,
 		"template_build":                     1,
@@ -558,6 +569,19 @@ func TestTeamMigration(t *testing.T) {
 		err := run(ctx, f.cfg(phaseCopy))
 		if err == nil || !strings.Contains(err.Error(), buildID.String()) {
 			t.Fatalf("in-flight build must block the copy, got: %v", err)
+		}
+	})
+
+	t.Run("copy refuses live hosted-QM tenants", func(t *testing.T) {
+		live := uuid.New()
+		mustExec(t, srcPool, `
+			INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, status)
+			VALUES ($1, $2, 'still-live', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic', 'ready')`, live, f.team)
+		defer mustExec(t, srcPool, `DELETE FROM qm.tenants WHERE id = $1`, live)
+
+		err := run(ctx, f.cfg(phaseCopy))
+		if err == nil || !strings.Contains(err.Error(), live.String()) {
+			t.Fatalf("live hosted-QM tenant must block the copy, got: %v", err)
 		}
 	})
 
@@ -883,6 +907,81 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("straggler sweep carries a tenant retired after validate", func(t *testing.T) {
+		// A hosted-QM tenant admitted after validate and retired before the
+		// cutover lock passes the live-tenant recheck, so the sweep is the
+		// only thing that gets it into the dest. Its own parents have to land
+		// first — the sandbox key it was issued, which was minted after
+		// validate too — and its events and secret references after it.
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		late, lateKey := uuid.New(), uuid.New()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO api_key (id, team_id, key_hash, name, revoked_at)
+			VALUES ($1, $2, 'hash-'||gen_random_uuid()::text, 'qm-retired-late', now())`, lateKey, f.team); err != nil {
+			t.Fatalf("late key insert: %v", err)
+		}
+		defer mustExec(t, dstPool, `DELETE FROM api_key WHERE id = $1`, lateKey)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, status, sandbox_api_key_id)
+			VALUES ($1, $2, 'retired-late', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic', 'deleted', $3)`, late, f.team, lateKey); err != nil {
+			t.Fatalf("late tenant insert: %v", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO qm.tenant_events (tenant_id, step, status, seq) VALUES ($1, 'database', 'failed', 1)`, late); err != nil {
+			t.Fatalf("late event insert: %v", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO qm.tenant_secrets (tenant_id, name, secret_ref) VALUES ($1, 'db', 'projects/example/secrets/retired-late-db')`, late); err != nil {
+			t.Fatalf("late secret insert: %v", err)
+		}
+		defer mustExec(t, dstPool, `DELETE FROM qm.tenants WHERE id = $1`, late)
+
+		for _, name := range cutoverSweepTables {
+			spec, ok := sweepSpec(name)
+			if !ok {
+				t.Fatalf("%s spec missing", name)
+			}
+			if _, _, err := copyTable(ctx, tx, dstPool, spec, f.team, nil); err != nil {
+				t.Fatalf("sweep %s: %v", name, err)
+			}
+		}
+		var status string
+		var keyID uuid.UUID
+		var events, secrets int
+		if err := dstPool.QueryRow(ctx, `
+			SELECT t.status, t.sandbox_api_key_id,
+			       (SELECT count(*) FROM qm.tenant_events WHERE tenant_id = t.id),
+			       (SELECT count(*) FROM qm.tenant_secrets WHERE tenant_id = t.id)
+			FROM qm.tenants t WHERE t.id = $1`, late).Scan(&status, &keyID, &events, &secrets); err != nil {
+			t.Fatalf("late tenant not swept to dest: %v", err)
+		}
+		if status != "deleted" || keyID != lateKey || events != 1 || secrets != 1 {
+			t.Fatalf("late tenant swept incompletely: status=%s key=%s events=%d secrets=%d", status, keyID, events, secrets)
+		}
+
+		// The sweep is an FK fixup for the tenants it carries, not a second
+		// copy of the team's keys: a key no tenant points at stays behind.
+		unreferenced := uuid.New()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO api_key (id, team_id, key_hash, name, revoked_at)
+			VALUES ($1, $2, 'hash-'||gen_random_uuid()::text, 'unreferenced-late', now())`, unreferenced, f.team); err != nil {
+			t.Fatalf("unreferenced key insert: %v", err)
+		}
+		keySpec, ok := sweepSpec("api_key")
+		if !ok {
+			t.Fatal("api_key spec missing")
+		}
+		if _, _, err := copyTable(ctx, tx, dstPool, keySpec, f.team, nil); err != nil {
+			t.Fatalf("sweep api_key: %v", err)
+		}
+		var n int
+		if err := dstPool.QueryRow(ctx, `SELECT count(*) FROM api_key WHERE id = $1`, unreferenced).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("unreferenced key swept to dest (n=%d, err=%v)", n, err)
+		}
+	})
+
 	t.Run("purge refuses when a build starts during validate", func(t *testing.T) {
 		buildID := uuid.New()
 		mustExec(t, srcPool, `
@@ -934,6 +1033,41 @@ func TestTeamMigration(t *testing.T) {
 		err := run(ctx, cfg)
 		if err == nil || !strings.Contains(err.Error(), buildID.String()) {
 			t.Fatalf("in-flight build must block detach, got: %v", err)
+		}
+		if got := countScoped(t, srcPool, tableSpec{"team_memberships", "team_id = $1"}, f.team); got != 2 {
+			t.Fatal("refused detach must not delete anything")
+		}
+	})
+
+	t.Run("detach refuses a retired tenant's unrevoked sandbox key", func(t *testing.T) {
+		// The cutover sweep carries the keys tenant rows reference, so a key
+		// issued to a tenant admitted after the freeze has to be revoked
+		// before it can follow the team — copy's live-key refusal ran too
+		// early to have seen it. Both cells get the rows so validate, which
+		// runs first, has nothing to report.
+		lateKey, lateTenant := uuid.New(), uuid.New()
+		for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+			mustExec(t, pool, `
+				INSERT INTO api_key (id, team_id, key_hash, name, created_at)
+				VALUES ($1, $2, 'hash-live-late', 'qm-live-late', '2026-01-01T00:00:00Z')`, lateKey, f.team)
+			mustExec(t, pool, `
+				INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, status, sandbox_api_key_id, created_at, updated_at)
+				VALUES ($1, $2, 'live-key-late', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic', 'deleted', $3,
+				        '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+				lateTenant, f.team, lateKey)
+		}
+		defer func() {
+			for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+				mustExec(t, pool, `DELETE FROM qm.tenants WHERE id = $1`, lateTenant)
+				mustExec(t, pool, `DELETE FROM api_key WHERE id = $1`, lateKey)
+			}
+		}()
+
+		cfg := f.cfg(phaseDetach)
+		cfg.confirmTeamName = "migration-drill"
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), lateKey.String()) {
+			t.Fatalf("unrevoked hosted-QM key must block detach, got: %v", err)
 		}
 		if got := countScoped(t, srcPool, tableSpec{"team_memberships", "team_id = $1"}, f.team); got != 2 {
 			t.Fatal("refused detach must not delete anything")

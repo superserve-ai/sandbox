@@ -50,10 +50,7 @@ var (
 func TestMain(m *testing.M) {
 	gin.SetMode(gin.TestMode)
 
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" {
-		dbURL = "postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable"
-	}
+	dbURL := testDatabaseURL()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -95,8 +92,18 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func testDatabaseURL() string {
+	if dbURL := os.Getenv("DATABASE_URL"); dbURL != "" {
+		return dbURL
+	}
+	return "postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable"
+}
+
+// Schemas outside public (qm) are dropped explicitly: their migrations are
+// idempotent, so without this a stale table from the previous run would
+// survive with its foreign keys into public cascaded away.
 func resetTestSchema(ctx context.Context, pool *pgxpool.Pool) error {
-	_, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
+	_, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS qm CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
 	return err
 }
 
@@ -255,21 +262,28 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 // applyMigrations reads SQL files from supabase/migrations/ and executes them
 // in order against the test database. Uses IF NOT EXISTS / OR REPLACE so it is
 // safe to run repeatedly against the same database.
-func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	// Walk up from the test file to the repo root (contains supabase/).
+// migrationsDir walks up from the test file to the repo root (contains supabase/).
+func migrationsDir() (string, error) {
 	dir, _ := os.Getwd()
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "supabase", "migrations")); err == nil {
-			break
+			return filepath.Join(dir, "supabase", "migrations"), nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return fmt.Errorf("could not find supabase/migrations from %s", dir)
+			return "", fmt.Errorf("could not find supabase/migrations from %s", dir)
 		}
 		dir = parent
 	}
+}
 
-	entries, err := os.ReadDir(filepath.Join(dir, "supabase", "migrations"))
+func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
+	dir, err := migrationsDir()
+	if err != nil {
+		return err
+	}
+
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("read migrations dir: %w", err)
 	}
@@ -280,7 +294,7 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		if !strings.HasSuffix(e.Name(), ".sql") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, "supabase", "migrations", e.Name()))
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			return fmt.Errorf("read %s: %w", e.Name(), err)
 		}

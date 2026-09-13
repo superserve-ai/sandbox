@@ -23,6 +23,7 @@ const profileScope = `id IN (
 	UNION SELECT assigned_by FROM team_pricing_plan WHERE team_id = $1 AND assigned_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_grant WHERE team_id = $1 AND created_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_ledger WHERE team_id = $1 AND created_by IS NOT NULL
+	UNION SELECT created_by FROM qm.tenants WHERE team_id = $1 AND created_by IS NOT NULL
 )`
 
 // sandboxScope covers tables keyed by sandbox_id without a team_id column.
@@ -32,6 +33,10 @@ const sandboxScope = `sandbox_id IN (SELECT id FROM sandbox WHERE team_id = $1)`
 // snapshot or template (no team_id column of their own).
 const manifestScope = `(snapshot_id IN (SELECT id FROM snapshot WHERE team_id = $1)
 	OR template_id IN (SELECT id FROM template WHERE team_id = $1))`
+
+// qmTenantScope covers the hosted-QM tables that hang off qm.tenants (no
+// team_id column of their own).
+const qmTenantScope = `tenant_id IN (SELECT id FROM qm.tenants WHERE team_id = $1)`
 
 // backupGenerationScope covers backup_generation, whose rows hang off
 // exactly one of sandbox or template (no team_id column of their own).
@@ -70,6 +75,47 @@ var membershipTables = map[string]bool{
 	"user_role_assignments": true,
 }
 
+// cutoverSweepTables are re-copied from the cutover transaction's own view
+// right before detach severs the source (and before a non-detached purge
+// deletes it): rows that async writers landed after validate, which no
+// earlier pass could see. Parents precede children so the upserts satisfy
+// the dest's foreign keys. qm.tenants is here for the tenant that was
+// admitted after validate and retired before the cutover lock: it is invisible
+// to the live-tenant recheck by then, yet its row (and the slug it reserves)
+// still has to reach the dest ahead of its events and secret references.
+// api_key precedes it because such a tenant's sandbox key was minted after
+// validate too, and the tenant row carries a foreign key to it.
+var cutoverSweepTables = []string{
+	"activity", "sandbox_revocation", "revoked_proxy_token",
+	"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
+	"api_key", "qm.tenants", "qm.tenant_events", "qm.tenant_secrets",
+}
+
+// sweepScopes narrows a table for the cutover sweep, whose job is smaller
+// than the full copy's: carry the stragglers, and the parents they need, and
+// nothing else. api_key is narrowed to the keys hosted-QM tenants point at so
+// the sweep stays a foreign-key fixup rather than a second path for copying
+// the team's keys — copy already decides which of those may cross cells.
+var sweepScopes = map[string]string{
+	"api_key": `team_id = $1 AND id IN (
+		SELECT sandbox_api_key_id FROM qm.tenants
+		WHERE team_id = $1 AND sandbox_api_key_id IS NOT NULL
+	)`,
+}
+
+// sweepSpec resolves a cutoverSweepTables entry to the spec the sweep copies
+// with. Sweep-only; purge still deletes by the table's full scope.
+func sweepSpec(name string) (tableSpec, bool) {
+	t, ok := tableByName(name)
+	if !ok {
+		return tableSpec{}, false
+	}
+	if scope, ok := sweepScopes[name]; ok {
+		t.scope = scope
+	}
+	return t, true
+}
+
 var migratedTables = []tableSpec{
 	{"profile", profileScope},
 	{"team", "id = $1"},
@@ -85,6 +131,11 @@ var migratedTables = []tableSpec{
 	// grants and are deliberately not part of a team migration.
 	{"user_role_assignments", "team_id = $1 AND scope_type = 'team'"},
 	{"api_key", "team_id = $1"},
+	// Hosted QM: a tenant references the team and one of its API keys, so it
+	// follows api_key; events and secret references hang off the tenant.
+	{"qm.tenants", "team_id = $1"},
+	{"qm.tenant_events", qmTenantScope},
+	{"qm.tenant_secrets", qmTenantScope},
 	// Same KMS KEK in both cells (verified), so ciphertext + wrapped DEK
 	// copy as-is.
 	{"secret", "team_id = $1"},
