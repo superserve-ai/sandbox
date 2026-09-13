@@ -161,24 +161,42 @@ func (s *Postgres) TransitionStatus(ctx context.Context, teamID, tenantID uuid.U
 	err := s.withTeamTx(ctx, teamID, func(q *db.Queries) error {
 		var err error
 		t, err = q.TransitionQMTenantStatus(ctx, db.TransitionQMTenantStatusParams{ID: tenantID, TeamID: teamID, Status: to, FromStatuses: from})
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-		// No row matched: missing (or deleted) tenant, or a status the
-		// caller did not expect. The follow-up read tells them apart; a
-		// database error on that read is reported as such, not as absence.
-		current, gerr := q.GetQMTenant(ctx, db.GetQMTenantParams{ID: tenantID, TeamID: teamID})
-		switch {
-		case errors.Is(gerr, pgx.ErrNoRows):
-			return ErrNotFound
-		case gerr != nil:
-			return fmt.Errorf("re-read tenant after transition: %w", gerr)
-		case current.Status == StatusDeleted:
-			return ErrNotFound
-		}
-		return ErrStatusConflict
+		return transitionOutcome(ctx, q, teamID, tenantID, err)
 	})
 	return t, err
+}
+
+func (s *Postgres) TransitionStatusIfUnchanged(ctx context.Context, teamID, tenantID uuid.UUID, from []string, to string, at Version) (Tenant, error) {
+	var t Tenant
+	err := s.withTeamTx(ctx, teamID, func(q *db.Queries) error {
+		var err error
+		t, err = q.TransitionQMTenantStatusIfUnchanged(ctx, db.TransitionQMTenantStatusIfUnchangedParams{
+			ID: tenantID, TeamID: teamID, Status: to, FromStatuses: from,
+			ExpectedUpdatedAt: at.UpdatedAt, ExpectedEventSeq: at.EventSeq,
+		})
+		return transitionOutcome(ctx, q, teamID, tenantID, err)
+	})
+	return t, err
+}
+
+// transitionOutcome turns a transition's "no row matched" into the reason:
+// a missing (or deleted) tenant, or a row the caller's expectations no
+// longer describe. A database error on the follow-up read is reported as
+// such, not as absence.
+func transitionOutcome(ctx context.Context, q *db.Queries, teamID, tenantID uuid.UUID, err error) error {
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	current, gerr := q.GetQMTenant(ctx, db.GetQMTenantParams{ID: tenantID, TeamID: teamID})
+	switch {
+	case errors.Is(gerr, pgx.ErrNoRows):
+		return ErrNotFound
+	case gerr != nil:
+		return fmt.Errorf("re-read tenant after transition: %w", gerr)
+	case current.Status == StatusDeleted:
+		return ErrNotFound
+	}
+	return ErrStatusConflict
 }
 
 func (s *Postgres) UpdateResources(ctx context.Context, teamID, tenantID uuid.UUID, r Resources) (Tenant, error) {

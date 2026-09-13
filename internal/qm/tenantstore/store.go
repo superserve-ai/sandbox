@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -52,6 +53,19 @@ var (
 	// other than the ones it was told to move from.
 	ErrStatusConflict = errors.New("tenant status changed")
 )
+
+// Version identifies one generation of a tenant row: the status writes it
+// has taken (UpdatedAt) and the events recorded against it (EventSeq). Two
+// attempts at the same operation share a status, so callers whose writes
+// must not clobber a newer attempt key on this instead.
+type Version struct {
+	UpdatedAt time.Time
+	EventSeq  int64
+}
+
+func VersionOf(t Tenant) Version {
+	return Version{UpdatedAt: t.UpdatedAt, EventSeq: t.EventSeq}
+}
 
 type CreateParams struct {
 	Slug          string
@@ -103,6 +117,10 @@ type Store interface {
 	// from (ErrStatusConflict otherwise), for request paths where two
 	// callers may race for the same tenant.
 	TransitionStatus(ctx context.Context, teamID, tenantID uuid.UUID, from []string, to string) (Tenant, error)
+	// TransitionStatusIfUnchanged is TransitionStatus with an additional
+	// check that the row is still the version the caller observed;
+	// ErrStatusConflict when anything has written it since.
+	TransitionStatusIfUnchanged(ctx context.Context, teamID, tenantID uuid.UUID, from []string, to string, at Version) (Tenant, error)
 	UpdateResources(ctx context.Context, teamID, tenantID uuid.UUID, r Resources) (Tenant, error)
 	SoftDelete(ctx context.Context, teamID, tenantID uuid.UUID) (Tenant, error)
 

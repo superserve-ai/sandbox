@@ -176,6 +176,19 @@ func (m *Memory) TransitionStatus(_ context.Context, teamID, tenantID uuid.UUID,
 	return *t, nil
 }
 
+func (m *Memory) TransitionStatusIfUnchanged(ctx context.Context, teamID, tenantID uuid.UUID, from []string, to string, at Version) (Tenant, error) {
+	m.mu.Lock()
+	if m.Fail == nil {
+		t, err := m.scoped(teamID, tenantID)
+		if err == nil && (!t.UpdatedAt.Equal(at.UpdatedAt) || t.EventSeq != at.EventSeq) {
+			m.mu.Unlock()
+			return Tenant{}, ErrStatusConflict
+		}
+	}
+	m.mu.Unlock()
+	return m.TransitionStatus(ctx, teamID, tenantID, from, to)
+}
+
 func (m *Memory) UpdateResources(_ context.Context, teamID, tenantID uuid.UUID, r Resources) (Tenant, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -231,10 +244,14 @@ func (m *Memory) InsertEvent(_ context.Context, teamID uuid.UUID, p EventParams)
 	if m.Fail != nil {
 		return Event{}, m.Fail
 	}
-	if _, err := m.live(teamID, p.TenantID); err != nil {
+	t, err := m.live(teamID, p.TenantID)
+	if err != nil {
 		return Event{}, err
 	}
-	e := Event{ID: uuid.New(), TenantID: p.TenantID, Step: p.Step, Status: p.Status, Seq: int64(len(m.events[p.TenantID]) + 1), At: m.Now()}
+	// Postgres takes seq from the tenant's own counter, bumped in the same
+	// statement; the row's version moves with it either way.
+	t.EventSeq++
+	e := Event{ID: uuid.New(), TenantID: p.TenantID, Step: p.Step, Status: p.Status, Seq: t.EventSeq, At: m.Now()}
 	if p.Message != "" {
 		msg := p.Message
 		e.Message = &msg

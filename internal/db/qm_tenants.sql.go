@@ -7,6 +7,7 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -420,6 +421,67 @@ func (q *Queries) TransitionQMTenantStatus(ctx context.Context, arg TransitionQM
 		arg.TeamID,
 		arg.Status,
 		arg.FromStatuses,
+	)
+	var i QmTenant
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Slug,
+		&i.OrgName,
+		&i.AdminEmail,
+		&i.SignIn,
+		&i.ModelProvider,
+		&i.Harness,
+		&i.Status,
+		&i.PublicUrl,
+		&i.ImageTag,
+		&i.CloudRunService,
+		&i.DbName,
+		&i.BucketName,
+		&i.ServiceAccount,
+		&i.SandboxApiKeyID,
+		&i.EventSeq,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const transitionQMTenantStatusIfUnchanged = `-- name: TransitionQMTenantStatusIfUnchanged :one
+UPDATE qm.tenants
+SET status = $3, updated_at = now()
+WHERE id = $1 AND team_id = $2
+  AND status <> 'deleted'
+  AND status = ANY($4::text[])
+  AND updated_at = $5
+  AND event_seq = $6
+RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, event_seq, created_by, created_at, updated_at
+`
+
+type TransitionQMTenantStatusIfUnchangedParams struct {
+	ID                uuid.UUID `json:"id"`
+	TeamID            uuid.UUID `json:"team_id"`
+	Status            string    `json:"status"`
+	FromStatuses      []string  `json:"from_statuses"`
+	ExpectedUpdatedAt time.Time `json:"expected_updated_at"`
+	ExpectedEventSeq  int64     `json:"expected_event_seq"`
+}
+
+// TransitionQMTenantStatus with an optimistic check on the row's version.
+// Two generations of the same operation share a status — a provision whose
+// trigger went quiet and the retry that replaced it are both
+// 'provisioning' — so bookkeeping that must not clobber a newer attempt
+// keys on the writes the row has taken instead: updated_at moves on every
+// status write and event_seq on every event.
+func (q *Queries) TransitionQMTenantStatusIfUnchanged(ctx context.Context, arg TransitionQMTenantStatusIfUnchangedParams) (QmTenant, error) {
+	row := q.db.QueryRow(ctx, transitionQMTenantStatusIfUnchanged,
+		arg.ID,
+		arg.TeamID,
+		arg.Status,
+		arg.FromStatuses,
+		arg.ExpectedUpdatedAt,
+		arg.ExpectedEventSeq,
 	)
 	var i QmTenant
 	err := row.Scan(

@@ -122,3 +122,19 @@ RETURNING *;
 -- stands in for the api_key UPDATE qm_api does not have. Returns whether
 -- the tenant referenced a key; already-revoked keys are a no-op.
 SELECT qm.revoke_tenant_api_key(sqlc.arg(tenant_id)) AS revoked;
+
+-- name: TransitionQMTenantStatusIfUnchanged :one
+-- TransitionQMTenantStatus with an optimistic check on the row's version.
+-- Two generations of the same operation share a status — a provision whose
+-- trigger went quiet and the retry that replaced it are both
+-- 'provisioning' — so bookkeeping that must not clobber a newer attempt
+-- keys on the writes the row has taken instead: updated_at moves on every
+-- status write and event_seq on every event.
+UPDATE qm.tenants
+SET status = sqlc.arg(status), updated_at = now()
+WHERE id = $1 AND team_id = $2
+  AND status <> 'deleted'
+  AND status = ANY(sqlc.arg(from_statuses)::text[])
+  AND updated_at = sqlc.arg(expected_updated_at)
+  AND event_seq = sqlc.arg(expected_event_seq)
+RETURNING *;

@@ -576,7 +576,7 @@ func TestFailTenantSurvivesCancelledRequest(t *testing.T) {
 	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	h.failTenant(ctx, row, []string{tenantstore.StatusProvisioning}, stepTrigger, "run could not be started", errors.New("client went away"), map[string]any{"mode": "provision"})
+	h.failTenant(ctx, row, tenantstore.VersionOf(row), []string{tenantstore.StatusProvisioning}, stepTrigger, "run could not be started", errors.New("client went away"), map[string]any{"mode": "provision"})
 
 	row, _ = f.store.GetTenant(context.Background(), f.teamA, tid)
 	if row.Status != tenantstore.StatusFailed {
@@ -1032,7 +1032,7 @@ func TestFailTenantLeavesAnOvertakenTenantAlone(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
-	h.failTenant(ctx, row, []string{tenantstore.StatusProvisioning}, stepTrigger,
+	h.failTenant(ctx, row, tenantstore.VersionOf(row), []string{tenantstore.StatusProvisioning}, stepTrigger,
 		"run could not be started", errors.New("cloud run refused"), map[string]any{"mode": "provision"})
 
 	row, _ = f.store.GetTenant(ctx, f.teamA, tid)
@@ -1043,4 +1043,93 @@ func TestFailTenantLeavesAnOvertakenTenantAlone(t *testing.T) {
 	if len(after) != len(before) {
 		t.Errorf("an overtaken request recorded %d event(s)", len(after)-len(before))
 	}
+}
+
+// The overtaking request need not change the status to own the tenant: a
+// stale reclaim followed by a fresh retry leaves it back in provisioning,
+// and the older request's failure must not be applied to the new attempt.
+func TestFailTenantLeavesASecondAttemptAlone(t *testing.T) {
+	f := newFixture(t)
+	id := f.create(t)
+	tid := uuid.MustParse(id)
+	ctx := context.Background()
+	row, _ := f.store.GetTenant(ctx, f.teamA, tid)
+
+	// The reclaim-and-retry the old request slept through: same status,
+	// a different generation of it.
+	if _, err := f.store.SetStatus(ctx, f.teamA, tid, tenantstore.StatusFailed); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.SetStatus(ctx, f.teamA, tid, tenantstore.StatusProvisioning); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.InsertEvent(ctx, f.teamA, tenantstore.EventParams{
+		TenantID: tid, Step: stepTrigger, Status: tenantstore.EventStarted, Message: "provision run requested",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := f.store.ListEvents(ctx, f.teamA, tid)
+
+	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h.failTenant(ctx, row, tenantstore.VersionOf(row), []string{tenantstore.StatusProvisioning}, stepTrigger,
+		"run could not be started", errors.New("cloud run refused"), map[string]any{"mode": "provision"})
+
+	row, _ = f.store.GetTenant(ctx, f.teamA, tid)
+	if row.Status != tenantstore.StatusProvisioning {
+		t.Errorf("status = %s, want the newer attempt left in flight", row.Status)
+	}
+	after, _ := f.store.ListEvents(ctx, f.teamA, tid)
+	if len(after) != len(before) {
+		t.Errorf("an overtaken request recorded %d event(s)", len(after)-len(before))
+	}
+}
+
+// Two deletes can race: the loser's lock probe fails after the winner has
+// already moved the tenant into deprovisioning and queued its run. The
+// loser must not revert a status it does not own — that would silently
+// cancel a delete the caller was told had been accepted.
+func TestAbortedDeleteDoesNotCancelTheWinner(t *testing.T) {
+	f := newFixture(t)
+	id := f.create(t)
+	tid := uuid.MustParse(id)
+	ctx := context.Background()
+	f.store.SetStatus(ctx, f.teamA, tid, tenantstore.StatusReady)
+
+	// The competing delete lands between this request's read and its lock
+	// probe, and takes the tenant with it.
+	overtaken := &overtakingStore{Memory: f.store, teamID: f.teamA, tenantID: tid}
+	h := &Handlers{Store: overtaken, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
+	if code, _ := f.do(t, http.MethodDelete, "/v1/qm/tenants/"+id, keyTeamA, nil); code != http.StatusInternalServerError {
+		t.Fatalf("overtaken delete: %d, want 500", code)
+	}
+	row, _ := f.store.GetTenant(ctx, f.teamA, tid)
+	if row.Status != tenantstore.StatusDeprovisioning {
+		t.Errorf("status = %s, want the winning delete left in place", row.Status)
+	}
+}
+
+// overtakingStore lets a competing delete win the tenant just before this
+// request's lock probe, which then fails.
+type overtakingStore struct {
+	*tenantstore.Memory
+	teamID   uuid.UUID
+	tenantID uuid.UUID
+	done     bool
+}
+
+func (s *overtakingStore) Lock(ctx context.Context, teamID, tenantID uuid.UUID) (func(), error) {
+	if !s.done {
+		s.done = true
+		if _, err := s.Memory.SetStatus(ctx, s.teamID, s.tenantID, tenantstore.StatusDeprovisioning); err != nil {
+			return nil, err
+		}
+		if _, err := s.Memory.InsertEvent(ctx, s.teamID, tenantstore.EventParams{
+			TenantID: s.tenantID, Step: stepTrigger, Status: tenantstore.EventStarted, Message: "deprovision run requested",
+		}); err != nil {
+			return nil, err
+		}
+		return nil, errors.New("database unavailable")
+	}
+	return s.Memory.Lock(ctx, teamID, tenantID)
 }

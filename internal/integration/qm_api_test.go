@@ -268,6 +268,24 @@ func TestQMAPI_PostgresStoreRules(t *testing.T) {
 	if err != nil || len(events) != 1 || events[0].ID == uuid.Nil {
 		t.Fatalf("events = %+v err=%v", events, err)
 	}
+	// The versioned transition: the event just recorded moved the row past
+	// the version the tenant was read at, so a superseded attempt finds a
+	// conflict instead of clobbering the newer one. Both halves of the
+	// token count — the event bumped event_seq without touching status.
+	if _, err := store.TransitionStatusIfUnchanged(ctx, teamA, tenant.ID, []string{tenantstore.StatusProvisioning}, tenantstore.StatusFailed, tenantstore.VersionOf(tenant)); !errors.Is(err, tenantstore.ErrStatusConflict) {
+		t.Errorf("stale version: err = %v, want a conflict", err)
+	}
+	current, err := store.GetTenant(ctx, teamA, tenant.ID)
+	if err != nil || current.Status != tenantstore.StatusProvisioning {
+		t.Fatalf("a superseded attempt moved the tenant: %+v err=%v", current, err)
+	}
+	if moved, err := store.TransitionStatusIfUnchanged(ctx, teamA, tenant.ID, []string{tenantstore.StatusProvisioning}, tenantstore.StatusFailed, tenantstore.VersionOf(current)); err != nil || moved.Status != tenantstore.StatusFailed {
+		t.Errorf("current version: %+v err=%v", moved, err)
+	}
+	if _, err := store.SetStatus(ctx, teamA, tenant.ID, tenantstore.StatusProvisioning); err != nil {
+		t.Fatal(err)
+	}
+
 	if _, err := store.TransitionStatus(ctx, teamA, tenant.ID, []string{tenantstore.StatusReady}, tenantstore.StatusDeprovisioning); !errors.Is(err, tenantstore.ErrStatusConflict) {
 		t.Errorf("transition from a status the tenant is not in: err = %v", err)
 	}
