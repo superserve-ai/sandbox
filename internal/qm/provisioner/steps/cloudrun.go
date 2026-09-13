@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/superserve-ai/sandbox/internal/qm/provisioner"
@@ -137,7 +138,7 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 	// tenant, and if its configured name is rotated to a different
 	// resource between now and teardown, the name in the environment is no
 	// longer the binding that was made.
-	if err := s.recordSharedGrant(ctx, t, t.Env.ResendSecret); err != nil {
+	if err := s.reconcileSharedGrant(ctx, t, account); err != nil {
 		return err
 	}
 
@@ -165,44 +166,53 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 	return t.Record(ctx, tenantstore.Resources{CloudRunService: &name, ImageTag: &image, PublicURL: &public})
 }
 
-// recordSharedGrant notes which platform secret this tenant's identity was
-// granted access to. Nothing is stored under the tenant's own name for it;
-// the reference is a record of the binding, not of a secret the tenant owns.
-func (s cloudRun) recordSharedGrant(ctx context.Context, t *provisioner.Tenant, secretName string) error {
-	if secretName == "" {
+// reconcileSharedGrant records which platform secret this tenant's identity
+// was granted access to, and gives up the previous one if the configured
+// secret has been rotated to a different resource since. Only one name is
+// ever recorded, so the old binding has to be released here — after
+// teardown there would be nothing left to say it existed.
+//
+// Nothing is stored under the tenant's own name for it; the reference is a
+// record of the binding, not of a secret the tenant owns.
+func (s cloudRun) reconcileSharedGrant(ctx context.Context, t *provisioner.Tenant, account string) error {
+	if t.Env.ResendSecret == "" {
 		return nil
 	}
-	if err := t.SetSecretRef(ctx, sharedSecretRef, secretName); err != nil {
+	previous, err := s.sharedGrants(ctx, t)
+	if err != nil {
+		return err
+	}
+	for _, secretName := range previous {
+		if secretName == t.Env.ResendSecret {
+			continue
+		}
+		if err := s.c.Accounts.RevokeSecretAccess(ctx, secretName, account); err != nil {
+			return fmt.Errorf("revoke the tenant's access to the previous shared email key: %w", err)
+		}
+	}
+	if err := t.SetSecretRef(ctx, sharedSecretRef, t.Env.ResendSecret); err != nil {
 		return fmt.Errorf("record the shared email key grant: %w", err)
 	}
 	return nil
 }
 
-// sharedGrants is every platform secret this tenant may hold a binding on:
-// the one recorded when it was built and the one configured now.
-func (s cloudRun) sharedGrants(ctx context.Context, t *provisioner.Tenant) []string {
-	seen := map[string]bool{}
+// sharedGrants is every platform secret this tenant holds a recorded
+// binding on. The read is not allowed to fail quietly: the reference is the
+// only record of a binding made against a name that is no longer
+// configured, and teardown deletes it.
+func (s cloudRun) sharedGrants(ctx context.Context, t *provisioner.Tenant) ([]string, error) {
+	refs, err := t.SecretRefs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read the tenant's recorded shared grants: %w", err)
+	}
 	var out []string
-	add := func(name string) {
-		if name == "" || seen[name] {
-			return
-		}
-		seen[name] = true
-		out = append(out, name)
-	}
-	// A failure to read the references is not fatal: the configured name is
-	// still revoked, and the rest is bookkeeping for a rotation that may
-	// never have happened.
-	if refs, err := t.SecretRefs(ctx); err == nil {
-		for _, ref := range refs {
-			if ref.Name == sharedSecretRef {
-				add(ref.SecretRef)
-			}
+	for _, ref := range refs {
+		if ref.Name == sharedSecretRef && ref.SecretRef != "" {
+			out = append(out, ref.SecretRef)
 		}
 	}
-	add(t.Env.ResendSecret)
 	sort.Strings(out)
-	return out
+	return out, nil
 }
 
 // mountedSecrets is the Secret Manager names a spec mounts, in a stable
@@ -253,8 +263,17 @@ func (s cloudRun) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	// Both the name the grant was recorded under and the one configured
 	// now: they differ when the platform key has been rotated to a
 	// different resource since this tenant was built, and the recorded one
-	// is the binding that actually exists.
-	for _, secretName := range s.sharedGrants(ctx, t) {
+	// is the binding that actually exists. The read is not allowed to fail
+	// quietly — the reference is deleted below, and losing it would strand
+	// the binding for good.
+	granted, err := s.sharedGrants(ctx, t)
+	if err != nil {
+		return err
+	}
+	if t.Env.ResendSecret != "" && !slices.Contains(granted, t.Env.ResendSecret) {
+		granted = append(granted, t.Env.ResendSecret)
+	}
+	for _, secretName := range granted {
 		if err := s.c.Accounts.RevokeSecretAccess(ctx, secretName, account); err != nil {
 			return fmt.Errorf("revoke the tenant's access to the shared email key: %w", err)
 		}

@@ -56,6 +56,9 @@ func TestVerifyToleratesEverythingElse(t *testing.T) {
 	for _, status := range []int{
 		http.StatusOK, http.StatusNotFound, http.StatusTooManyRequests,
 		http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable,
+		// A key that is authentic but not permitted to make this
+		// particular call — a restricted project key — is usable.
+		http.StatusForbidden,
 	} {
 		if err := Verify(ctx, &http.Client{Transport: &answer{status: status}}, "anthropic", "a-key"); err != nil {
 			t.Errorf("status %d: %v", status, err)

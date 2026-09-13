@@ -633,11 +633,24 @@ func TestDeprovisionRevokesTheSharedGrantItActuallyMade(t *testing.T) {
 	env.ResendSecret = "qm-resend-api-key-v2"
 	f.runner.Env = env
 
-	if err := f.deprovision(t); err != nil {
+	// A retry after the rotation moves the grant rather than accumulating
+	// one on each: only one name is ever recorded, so the old binding has
+	// to be given up while it is still known.
+	if err := f.reprovision(t); err != nil {
 		t.Fatal(err)
 	}
 	if members := f.accounts.grants["qm-resend-api-key"]; len(members) != 0 {
-		t.Errorf("the grant made at build time survived teardown: %v", members)
+		t.Errorf("the grant on the rotated-away key survived a retry: %v", members)
+	}
+	if !slices.Contains(f.accounts.grants["qm-resend-api-key-v2"], account) {
+		t.Errorf("the tenant was not granted the rotated key: %v", f.accounts.grants)
+	}
+
+	if err := f.deprovision(t); err != nil {
+		t.Fatal(err)
+	}
+	if members := f.accounts.grants["qm-resend-api-key-v2"]; len(members) != 0 {
+		t.Errorf("the grant survived teardown: %v", members)
 	}
 	// And the platform's secrets themselves are untouched: they belong to
 	// no tenant.

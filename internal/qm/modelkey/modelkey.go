@@ -87,7 +87,12 @@ func Verify(ctx context.Context, client *http.Client, provider, key string) erro
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, bodyLimit))
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+	// 401 only. A 403 says the key is authentic but not allowed to make
+	// this particular call, which a restricted key legitimately can be:
+	// an OpenAI project key scoped to responses answers 403 to
+	// GET /v1/models while working perfectly for everything the tenant
+	// does. Rejecting on that would turn a usable key into a 400.
+	if resp.StatusCode == http.StatusUnauthorized {
 		return ErrRejected
 	}
 	return nil
