@@ -1329,3 +1329,37 @@ func (s *retiringStore) SetSecretRef(ctx context.Context, teamID, tenantID uuid.
 	}
 	return nil
 }
+
+// A superseded provision's outcome event lands whenever its trigger call
+// finally returns — possibly long after a delete took the tenant over. Only
+// an attempt's opening event names the plan, so a failed teardown is still
+// retried as a teardown rather than rebuilding what the caller deleted.
+func TestRetryReadsTheModeFromTheOpeningEventOnly(t *testing.T) {
+	f := newFixture(t)
+	id := f.create(t)
+	tid := uuid.MustParse(id)
+	ctx := context.Background()
+	f.store.SetStatus(ctx, f.teamA, tid, tenantstore.StatusReady)
+	if code, _ := f.do(t, http.MethodDelete, "/v1/qm/tenants/"+id, keyTeamA, nil); code != http.StatusAccepted {
+		t.Fatal("delete not accepted")
+	}
+	// The old provision request's trigger finally comes back.
+	if _, err := f.store.InsertEvent(ctx, f.teamA, tenantstore.EventParams{
+		TenantID: tid, Step: stepTrigger, Status: tenantstore.EventFailed,
+		Message: "provision run could not be started", Detail: []byte(`{"mode":"provision"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.store.SetStatus(ctx, f.teamA, tid, tenantstore.StatusFailed)
+
+	calls := len(f.trigger.Calls)
+	if code, _ := f.do(t, http.MethodPost, "/v1/qm/tenants/"+id+"/retry", keyTeamA, nil); code != http.StatusAccepted {
+		t.Fatal("retry not accepted")
+	}
+	if len(f.trigger.Calls) != calls+1 {
+		t.Fatalf("trigger calls = %d", len(f.trigger.Calls))
+	}
+	if last := f.trigger.Calls[len(f.trigger.Calls)-1]; last.Mode != provisioner.ModeDeprovision {
+		t.Errorf("retry mode = %s, want deprovision", last.Mode)
+	}
+}

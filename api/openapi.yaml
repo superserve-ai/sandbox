@@ -2350,6 +2350,8 @@ paths:
           $ref: "#/components/responses/QMForbidden"
         "500":
           $ref: "#/components/responses/QMInternalError"
+        "503":
+          $ref: "#/components/responses/QMUnavailable"
 
     post:
       operationId: createQMTenant
@@ -2439,6 +2441,8 @@ paths:
                 $ref: "#/components/schemas/QMError"
         "500":
           $ref: "#/components/responses/QMInternalError"
+        "503":
+          $ref: "#/components/responses/QMUnavailable"
 
   /v1/qm/tenants/{id}:
     parameters:
@@ -2472,6 +2476,8 @@ paths:
           $ref: "#/components/responses/QMNotFound"
         "500":
           $ref: "#/components/responses/QMInternalError"
+        "503":
+          $ref: "#/components/responses/QMUnavailable"
 
     delete:
       operationId: deleteQMTenant
@@ -2506,6 +2512,8 @@ paths:
           $ref: "#/components/responses/QMRunNotStarted"
         "500":
           $ref: "#/components/responses/QMInternalError"
+        "503":
+          $ref: "#/components/responses/QMUnavailable"
 
   /v1/qm/tenants/{id}/retry:
     parameters:
@@ -2545,6 +2553,8 @@ paths:
           $ref: "#/components/responses/QMRunNotStarted"
         "500":
           $ref: "#/components/responses/QMInternalError"
+        "503":
+          $ref: "#/components/responses/QMUnavailable"
 
   /v1/qm/tenants/{id}/admin-link:
     parameters:
@@ -2584,6 +2594,8 @@ paths:
                 $ref: "#/components/schemas/QMError"
         "500":
           $ref: "#/components/responses/QMInternalError"
+        "503":
+          $ref: "#/components/responses/QMUnavailable"
 
   /v1/qm/slugs/{slug}/availability:
     get:
@@ -2615,6 +2627,8 @@ paths:
           $ref: "#/components/responses/QMForbidden"
         "500":
           $ref: "#/components/responses/QMInternalError"
+        "503":
+          $ref: "#/components/responses/QMUnavailable"
 
 
 components:
@@ -4976,6 +4990,14 @@ components:
             $ref: "#/components/schemas/QMError"
     QMInternalError:
       description: Unexpected failure
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/QMError"
+    QMUnavailable:
+      description: >
+        Authentication or authorization could not be resolved because its
+        database is unreachable. The request was not acted on; retry it.
       content:
         application/json:
           schema:

@@ -720,14 +720,23 @@ func detached(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
 }
 
-// lastRunMode reads the mode of the most recent run or trigger event so a
-// retry resumes the plan that was last requested; a tenant with no run yet
+// lastRunMode reads the mode of the most recently requested run so a retry
+// resumes the plan that was last asked for; a tenant with no run yet
 // provisions. queueRun writes the trigger event synchronously after winning
-// the status transition, so the newest mode-bearing event is the winner's.
+// the status transition, so the newest one is the winner's.
+//
+// Only an attempt's opening event counts. A superseded request's outcome
+// events land whenever its trigger call finally returns, which can be long
+// after a delete has taken the tenant over; treating one of those as the
+// latest intent would retry a teardown as a provision and rebuild what the
+// caller deleted.
 func lastRunMode(events []tenantstore.Event) provisioner.Mode {
 	for i := len(events) - 1; i >= 0; i-- {
 		e := events[i]
-		if (e.Step != provisioner.RunStep && e.Step != stepTrigger) || len(e.Detail) == 0 {
+		if e.Status != tenantstore.EventStarted || len(e.Detail) == 0 {
+			continue
+		}
+		if e.Step != provisioner.RunStep && e.Step != stepTrigger {
 			continue
 		}
 		var detail struct {
