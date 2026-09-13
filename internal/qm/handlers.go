@@ -131,6 +131,19 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 		switch {
 		case lerr != nil:
 			log.Error().Err(lerr).Msg("re-read model key ref")
+			// The reference cannot be confirmed, so the tenant is left for
+			// a retry or a delete to sort out — but if it has already been
+			// retired, no teardown will ever look for this key: it ran its
+			// secrets step before the key existed. Take it back here, and
+			// only here, since a key removed on a guess could belong to a
+			// tenant that is in fact fine.
+			if retired, rerr := h.tenantRetired(dctx, tenant); rerr != nil {
+				log.Error().Err(rerr).Msg("confirm the tenant survived its model key")
+			} else if retired {
+				if derr := h.Secrets.Delete(dctx, secrets.TenantSecretName(tenant.Slug, keyName)); derr != nil {
+					log.Error().Str("error", provisioner.ScrubString(derr.Error())).Msg("remove the model key of a retired tenant")
+				}
+			}
 			cancel()
 			h.failTenant(ctx, tenant, tenantstore.VersionOf(tenant), []string{tenantstore.StatusProvisioning}, stepModelKey, "The model key reference could not be confirmed. Retry the tenant, or delete it and create it again.", err, nil)
 			respondError(c, http.StatusInternalServerError, internalErrorMsg)

@@ -126,7 +126,7 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode,
 			// remaining life before the write that actually matters, and a
 			// killed job would leave the tenant in flight.
 			dctx, cancel := detached(ctx)
-			r.setFailed(dctx, tenant)
+			r.setFailed(dctx, tenant, inFlight)
 			r.recordIn(dctx, tenant, step.Name(), tenantstore.EventFailed, step.Name()+" failed", map[string]any{"error": err.Error()})
 			for _, rest := range plan.Steps[i+1:] {
 				r.recordIn(dctx, tenant, rest.Name(), tenantstore.EventSkipped, "not run: "+step.Name()+" failed", nil)
@@ -149,14 +149,14 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode,
 		r.record(dctx, tenant, RunStep, tenantstore.EventOK, "deprovision complete; tenant deleted", nil)
 		if _, err := r.Store.SoftDelete(dctx, teamID, tenantID); err != nil && !r.settled(dctx, teamID, tenantID, tenantstore.StatusDeleted) {
 			log.Error().Err(err).Msg("record tenant deleted")
-			r.fail(dctx, tenant, "Deprovisioning finished but the tenant could not be marked deleted. Retry to record it.")
+			r.fail(dctx, tenant, tenantstore.StatusDeprovisioning, "Deprovisioning finished but the tenant could not be marked deleted. Retry to record it.")
 			return fmt.Errorf("mark tenant deleted: %w", err)
 		}
 		return nil
 	}
 	if _, err := r.Store.SetStatus(dctx, teamID, tenantID, tenantstore.StatusReady); err != nil && !r.settled(dctx, teamID, tenantID, tenantstore.StatusReady) {
 		log.Error().Err(err).Msg("record tenant ready")
-		r.fail(dctx, tenant, "Provisioning finished but the tenant could not be marked ready. Retry to record it.")
+		r.fail(dctx, tenant, tenantstore.StatusProvisioning, "Provisioning finished but the tenant could not be marked ready. Retry to record it.")
 		return fmt.Errorf("mark tenant ready: %w", err)
 	}
 	r.record(dctx, tenant, RunStep, tenantstore.EventOK, "provision complete; tenant ready", nil)
@@ -202,17 +202,32 @@ func failureMessage(mode Mode, step string) string {
 // fail marks the tenant failed with a user-safe run event, both under one
 // bookkeeping deadline. A failure to write even that is logged; the run's
 // error is what the caller returns.
-func (r *Runner) fail(ctx context.Context, t *Tenant, message string) {
+func (r *Runner) fail(ctx context.Context, t *Tenant, from, message string) {
 	dctx, cancel := detached(ctx)
 	defer cancel()
-	r.setFailed(dctx, t)
+	if !r.setFailed(dctx, t, from) {
+		return
+	}
 	r.recordIn(dctx, t, RunStep, tenantstore.EventFailed, message, nil)
 }
 
-func (r *Runner) setFailed(ctx context.Context, t *Tenant) {
-	if _, err := r.Store.SetStatus(ctx, t.Row.TeamID, t.Row.ID, tenantstore.StatusFailed); err != nil {
-		r.Log.Error().Err(err).Str("tenant_id", t.Row.ID.String()).Msg("mark tenant failed")
+// setFailed moves the tenant from the status this run owns to failed and
+// reports whether it did. A compare-and-set, not a plain write: a terminal
+// transition can commit and still report an error, and an unconditional
+// write would turn a run that in fact succeeded into a failure. When it
+// does not move, nothing is recorded either — an event would restart the
+// stale-run clock for a tenant this run no longer owns.
+func (r *Runner) setFailed(ctx context.Context, t *Tenant, from string) bool {
+	_, err := r.Store.TransitionStatus(ctx, t.Row.TeamID, t.Row.ID, []string{from}, tenantstore.StatusFailed)
+	if err == nil {
+		return true
 	}
+	if errors.Is(err, tenantstore.ErrStatusConflict) || errors.Is(err, tenantstore.ErrNotFound) {
+		r.Log.Warn().Str("tenant_id", t.Row.ID.String()).Msg("tenant is no longer this run's to fail")
+		return false
+	}
+	r.Log.Error().Err(err).Str("tenant_id", t.Row.ID.String()).Msg("mark tenant failed")
+	return false
 }
 
 // record appends an event on its own bookkeeping deadline, for the writes

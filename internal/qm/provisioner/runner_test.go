@@ -665,3 +665,44 @@ func (s *ambiguousTerminalStore) SoftDelete(ctx context.Context, teamID, tenantI
 	}
 	return t, err
 }
+
+// If the terminal write commits, reports an error, and the reconciling read
+// also fails, the fallback must still not undo it: it moves the tenant only
+// from the status this run owns, which a committed terminal write has
+// already left behind.
+func TestRunnerFallbackCannotUndoACommittedTerminalWrite(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	store := &blindAmbiguousStore{Memory: h.store}
+	r := &Runner{Store: store, Env: Env{BaseDomain: "qm.example.com", Stub: true}, Steps: []Step{&fakeStep{name: "a"}}, Log: zerolog.Nop()}
+	h.queue(t, ModeProvision)
+	if err := r.Run(ctx, h.teamID, h.tenant.ID, ModeProvision, 0); err == nil {
+		t.Fatal("run reported success")
+	}
+	if got := h.status(t); got != tenantstore.StatusReady {
+		t.Errorf("status = %s, want the committed ready kept", got)
+	}
+}
+
+// blindAmbiguousStore commits the ready transition, reports an error for
+// it, and then fails the reconciling read too.
+type blindAmbiguousStore struct {
+	*tenantstore.Memory
+	blind bool
+}
+
+func (s *blindAmbiguousStore) SetStatus(ctx context.Context, teamID, tenantID uuid.UUID, status string) (tenantstore.Tenant, error) {
+	t, err := s.Memory.SetStatus(ctx, teamID, tenantID, status)
+	if err == nil && !s.blind && status == tenantstore.StatusReady {
+		s.blind = true
+		return tenantstore.Tenant{}, errors.New("connection reset")
+	}
+	return t, err
+}
+
+func (s *blindAmbiguousStore) GetTenant(ctx context.Context, teamID, tenantID uuid.UUID) (tenantstore.Tenant, error) {
+	if s.blind {
+		return tenantstore.Tenant{}, errors.New("database unavailable")
+	}
+	return s.Memory.GetTenant(ctx, teamID, tenantID)
+}
