@@ -35,6 +35,17 @@ prior bring-ups:
 - Deploy vmd via the normal workflow. Set `HOST_ID` to the DB row id of
   the DEAD host only at the remap step below, never while the old row
   still points at live state elsewhere.
+- Before deploying proxy, restore the host's saved `/etc/sandbox/proxy.env`
+  and its peer credentials/drop-in, or bootstrap the replacement's peer
+  identity. A host with neither bootstrap identity nor a nonempty saved proxy
+  configuration fails deployment before the installed binary or services
+  change, so a rebuild cannot silently drop the legacy peer configuration.
+
+Before copying/restoring templates, preserve the cell's existing storage layout.
+Keep production templates on the fast runtime storage, verify capacity and
+reseed both rootfs and snapshot artifacts after disk loss. See the
+[template rollout checks](host2-identity-runbook.md#template-storage-before-transfer-or-admission)
+before admission. Identity bootstrap does not migrate template storage.
 
 ## 2. Enumerate and dry-run
 

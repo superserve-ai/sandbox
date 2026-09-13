@@ -12,6 +12,8 @@ Env vars:
                        the cell host into the primary fan-out. Empty = no
                        region scoping (previous behavior).
   VMD_LABEL            required — gcloud instances list label filter (e.g. component=vmd)
+  EXPECTED_STANDBY_HOST optional — require exactly this host and a nonempty
+                       GCP_REGION before deploying to a standby
   VMD_SERVICE          required — systemd unit name for vmd (e.g. superserve-vmd)
   VMD_INSTALL_DIR      required — bin install dir on the host (e.g. /usr/local/bin)
   SHA                  required — commit SHA (only first 8 chars used)
@@ -115,6 +117,10 @@ Env vars:
   VMD_PAUSED_NETWORK_RECLAIM_COOLDOWN optional — minimum time between
                        reclamation passes. When set, upserted into vmd.env.
 
+Fresh or partially configured hosts require CONTROL_PLANE_URL, DATABASE_URL and
+INTERNAL_API_TOKEN from deployment inputs before any host changes. Configured
+hosts may omit inputs to preserve their existing values.
+
 All deploy artifacts (binaries + systemd units + scripts) are packed
 into a single tarball and SCP'd once per host. Each gcloud SCP/SSH
 opens a fresh IAP tunnel (~10-15s setup), so bundling cuts per-host
@@ -134,6 +140,124 @@ import subprocess
 import sys
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def deployment_host_region(region, zone):
+    zone_name = zone.rsplit('/', 1)[-1]
+    match = re.fullmatch(r'([a-z]+-[a-z]+[0-9]+)-[a-z]', zone_name)
+    if not match or (region and region != match[1]):
+        raise ValueError('deployment region does not match the instance zone')
+    return region or match[1]
+
+
+def runtime_input_preflight(control_plane_url, database_url, internal_api_token):
+    """Read-only host check; pass only input presence, never secrets, to the probe."""
+    script = textwrap.dedent("""
+        set -euo pipefail
+        SECRETSPROXY_FRESH=0
+        if sudo test -e /etc/sandbox/.runtime-bootstrap-pending \
+           || ! sudo test -s /etc/sandbox/vmd.env \
+           || ! sudo test -s /etc/sandbox/secretsproxy.env \
+           || ! sudo test -s /var/lib/secretsproxy/ca.crt \
+           || ! sudo test -s /var/lib/secretsproxy/ca.key; then
+            SECRETSPROXY_FRESH=1
+        fi
+        if [ "$(sudo systemctl show -p LoadState --value agentbox-vmd.service)" = loaded ]; then
+            SECRETSPROXY_FRESH=1
+        fi
+        # Also detect a partial prior deploy that created env files but omitted inputs.
+        for setting in vmd:CONTROL_PLANE_URL vmd:INTERNAL_API_TOKEN secretsproxy:CONTROL_PLANE_URL secretsproxy:DAEMON_AUTH_TOKEN; do
+            file=${setting%%:*}
+            key=${setting#*:}
+            if ! sudo test -s "/etc/sandbox/$file.env" || ! sudo grep -q "^$key=." "/etc/sandbox/$file.env"; then
+                SECRETSPROXY_FRESH=1
+            fi
+        done
+        if ! sudo test -s /etc/sandbox/secretsproxy.env || { ! sudo grep -q '^DATABASE_URL=.' /etc/sandbox/secretsproxy.env \
+           && ! sudo grep -q '^SECRETSPROXY_AUDIT_DISABLED=true$' /etc/sandbox/secretsproxy.env; }; then
+            SECRETSPROXY_FRESH=1
+        fi
+    """)
+    for name, value in (("CONTROL_PLANE_URL", control_plane_url),
+                        ("DATABASE_URL", database_url),
+                        ("INTERNAL_API_TOKEN", internal_api_token)):
+        if not value.strip():
+            script += f"""
+if [ "$SECRETSPROXY_FRESH" = 1 ]; then
+    echo "ERROR: fresh-host deployment requires {name}; configure the deploy input before retrying (host unchanged)" >&2
+    exit 1
+fi
+"""
+    return script
+
+
+def legacy_vmd_enrollment():
+    """Guard retirement and leave a persistent mask, including locally installed units."""
+    return textwrap.dedent("""
+        require_no_guest_workloads() {
+            # Check both systemd-owned and unmanaged Firecracker guests/builds.
+            guest_units=$(sudo systemctl list-units --all --no-legend --plain 'firecracker@*.service' 'firecracker-netns@*.service') || return 1
+            if printf '%s\n' "$guest_units" | awk 'NF && $3 != "inactive" && $3 != "failed" { found=1 } END { exit !found }'; then
+                echo "ERROR: guest workload units remain; refusing legacy VMD retirement" >&2
+                return 1
+            fi
+            if guest_pids=$(sudo pgrep -f '^([^ ]*/)?(firecracker|template-builder)([[:space:]]|$)'); then
+                echo "ERROR: guest workload processes remain; drain the host before legacy VMD retirement" >&2
+                return 1
+            else
+                status=$?
+                if [ "$status" != 1 ]; then
+                    echo "ERROR: cannot inspect guest processes; refusing legacy VMD retirement" >&2
+                    return 1
+                fi
+            fi
+        }
+        require_vmd_ports_free() {
+            listeners=$(sudo ss -H -ltnp '( sport = :50051 or sport = :9090 )') || return 1
+            if [ -n "$listeners" ]; then
+                echo "ERROR: ports 50051/9090 still have a listener; refusing VMD socket activation (do not kill unmanaged VMD automatically)" >&2
+                printf '%s\n' "$listeners" >&2
+                return 1
+            fi
+        }
+        retire_legacy_vmd() {
+            require_no_guest_workloads
+            legacy_state=$(sudo systemctl show -p LoadState --value agentbox-vmd.service)
+            case "$legacy_state" in loaded|masked|not-found) ;; *)
+                echo "ERROR: cannot determine legacy VMD state; refusing enrollment" >&2; return 1 ;;
+            esac
+            if [ "$legacy_state" != not-found ] || sudo test -e /etc/systemd/system/agentbox-vmd.service.retired; then
+                if [ "$legacy_state" = loaded ]; then
+                    sudo systemctl disable agentbox-vmd.service
+                    sudo systemctl stop agentbox-vmd.service
+                fi
+                state=$(sudo systemctl show -p ActiveState --value agentbox-vmd.service)
+                case "$state" in inactive|failed) ;; *)
+                    echo "ERROR: legacy VMD did not stop; refusing enrollment" >&2; return 1 ;;
+                esac
+                # systemctl mask cannot replace a regular unit in /etc. Preserve it
+                # outside the unit name before installing the persistent /dev/null link.
+                if sudo test -f /etc/systemd/system/agentbox-vmd.service && ! sudo test -L /etc/systemd/system/agentbox-vmd.service; then
+                    if sudo test -e /etc/systemd/system/agentbox-vmd.service.retired; then
+                        echo "ERROR: legacy unit backup already exists; inspect before retirement" >&2
+                        return 1
+                    fi
+                    sudo mv /etc/systemd/system/agentbox-vmd.service /etc/systemd/system/agentbox-vmd.service.retired
+                fi
+                sudo systemctl mask agentbox-vmd.service
+                sudo systemctl daemon-reload
+                if [ "$(sudo systemctl is-enabled agentbox-vmd.service)" != masked ]; then
+                    echo "ERROR: legacy VMD is not persistently masked; refusing enrollment" >&2
+                    return 1
+                fi
+            fi
+            require_no_guest_workloads
+            require_vmd_ports_free
+        }
+        if [ "$SECRETSPROXY_FRESH" = 1 ]; then
+            require_no_guest_workloads
+        fi
+    """)
 
 
 def run_or_die(cmd, context):
@@ -331,6 +455,11 @@ def main() -> int:
         print(f"No instances with label {label} found in {where}", file=sys.stderr)
         return 1
 
+    expected_standby = os.environ.get("EXPECTED_STANDBY_HOST", "")
+    if expected_standby and (not region or len(instances) != 1 or instances[0]["name"] != expected_standby):
+        print(f"Standby deployment requires exactly {expected_standby} in the selected region", file=sys.stderr)
+        return 1
+
     print(f"Deploying VMD to {len(instances)} instance(s) in {where}")
 
     # Create the runner's gcloud SSH key up front if it is missing. gcloud
@@ -352,6 +481,17 @@ def main() -> int:
         name, zone = inst["name"], inst["zone"]
         tag = f"{name}/{zone}"
         q_host_id_line = shlex.quote(f"HOST_ID={name}")
+        q_host_region_line = shlex.quote(f"HOST_REGION={deployment_host_region(region, zone)}")
+
+        input_preflight = runtime_input_preflight(control_plane_url, database_url, internal_api_token)
+        # Probe before even uploading when missing inputs might require aborting.
+        # Fully supplied deploys need no additional SSH round trip.
+        if not all(value.strip() for value in (control_plane_url, database_url, internal_api_token)):
+            run_or_die([
+                "gcloud", "compute", "ssh", name,
+                f"--zone={zone}", f"--project={project}",
+                "--quiet", "--tunnel-through-iap", "--command", input_preflight,
+            ], f"[{tag}] runtime input preflight")
 
         # Single SCP — one IAP tunnel for the whole bundle.
         run_or_die(
@@ -364,8 +504,7 @@ def main() -> int:
         )
         print(f"[{tag}] bundle uploaded")
 
-        inject_script = textwrap.dedent(f"""
-            set -euo pipefail
+        inject_script = input_preflight + legacy_vmd_enrollment() + textwrap.dedent(f"""
 
             # Precondition, checked before any host mutation: if
             # BACKUP_JOURNAL_PATH names a path outside a real mount (the
@@ -443,12 +582,60 @@ def main() -> int:
                 fi
             fi
 
+            # Fresh-host env bootstrap: create once, never truncate populated files.
+            sudo install -d -o root -g root -m 0755 /etc/sandbox
+            for env_file in /etc/sandbox/vmd.env /etc/sandbox/secretsproxy.env; do
+                if ! sudo test -e "$env_file"; then
+                    sudo install -o root -g root -m 0600 /dev/null "$env_file"
+                fi
+                sudo chown root:root "$env_file"
+                sudo chmod 0600 "$env_file"
+            done
+            if [ "$SECRETSPROXY_FRESH" = 1 ]; then
+                sudo touch /etc/sandbox/.runtime-bootstrap-pending
+                sudo chmod 0600 /etc/sandbox/.runtime-bootstrap-pending
+                fresh_units=""
+                for unit in superserve-vmd.socket {service}; do
+                    if [ "$(sudo systemctl show -p LoadState --value "$unit")" = loaded ]; then
+                        fresh_units="$fresh_units $unit"
+                    fi
+                    sudo install -d -m 0755 "/etc/systemd/system/$unit.d"
+                    printf '[Unit]\\nConditionPathExists=!/etc/sandbox/.runtime-bootstrap-pending\\n' | sudo tee "/etc/systemd/system/$unit.d/05-fresh-runtime.conf" >/dev/null
+                done
+                if [ -n "$fresh_units" ]; then
+                    sudo systemctl stop $fresh_units
+                fi
+                sudo systemctl daemon-reload
+                retire_legacy_vmd
+            fi
+            # CD targets existing cells: never let missing state mint a new trust root.
+            for setting in SECRETSPROXY_CA_CERT=/var/lib/secretsproxy/ca.crt SECRETSPROXY_CA_KEY=/var/lib/secretsproxy/ca.key; do
+                key="${{setting%%=*}}"
+                ca_path=$(sudo sed -n "s/^$key=//p" /etc/sandbox/secretsproxy.env | tail -n 1)
+                if [ -z "$ca_path" ]; then ca_path="${{setting#*=}}"; fi
+                if ! sudo test -f "$ca_path" || ! sudo test -s "$ca_path"; then
+                    echo "ERROR: existing-cell deployment requires the restored cell secretsproxy CA pair ($key); refusing VMD activation" >&2
+                    exit 1
+                fi
+            done
+            # Kernel selection is cell-specific; require an explicit approved path.
+            if ! sudo grep -q '^BASE_ROOTFS_PATH=' /etc/sandbox/vmd.env; then
+                echo BASE_ROOTFS_PATH=/var/lib/sandbox/rootfs/base.ext4 | sudo tee -a /etc/sandbox/vmd.env >/dev/null
+            fi
+            for key in KERNEL_PATH BASE_ROOTFS_PATH; do
+                asset=$(sudo sed -n "s/^$key=//p" /etc/sandbox/vmd.env | tail -n 1)
+                if [ -z "$asset" ] || ! sudo test -f "$asset" || ! sudo test -s "$asset"; then
+                    echo "ERROR: $key must name a provisioned kernel/base-rootfs artifact; refusing VMD activation" >&2
+                    exit 1
+                fi
+            done
+            # End fresh-host env bootstrap.
+
             # Extract the deploy bundle into a sha-scoped staging dir so
             # parallel deploys (or aborted retries) don't collide.
             sudo rm -rf {extract_dir}
             mkdir -p {extract_dir}
             tar xzf {bundle_remote} -C {extract_dir}
-
             # Rollback safety gate. If the incoming vmd lacks cgroup supervision
             # (a downgrade past direct-spawn), an old binary would mishandle any
             # live or PAUSED cgroup VMs on this host — deleting records/networking
@@ -605,7 +792,7 @@ def main() -> int:
             NEW_HASH=$(sha256sum {extract_dir}/bin/boxd | awk '{{print $1}}')
             CUR_HASH=$(sha256sum {install_dir}/boxd 2>/dev/null | awk '{{print $1}}' || echo none)
 
-            if [ "$NEW_HASH" != "$CUR_HASH" ]; then
+            if [ "$NEW_HASH" != "$CUR_HASH" ] || [ "$SECRETSPROXY_FRESH" = 1 ]; then
                 echo "boxd changed ($CUR_HASH -> $NEW_HASH) — installing + rebuilding rootfs"
                 sudo install -m 0755 {extract_dir}/bin/boxd {install_dir}/boxd
 
@@ -744,6 +931,24 @@ def main() -> int:
                 echo {q_host_id_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
+            # Named hosts need a complete self-description. Never change the
+            # legacy default identity or its optional region semantics.
+            host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/vmd.env | tail -n 1)
+            if [ -n "$host_id" ] && [ "$host_id" != default ]; then
+                host_region=$(sudo sed -n 's/^HOST_REGION=//p' /etc/sandbox/vmd.env | tail -n 1 | tr -d '[:space:]')
+                case "$host_region" in ''|'""'|"''")
+                    sudo sed -i '/^HOST_REGION=/d' /etc/sandbox/vmd.env
+                    echo {q_host_region_line} | sudo tee -a /etc/sandbox/vmd.env >/dev/null
+                    ;;
+                esac
+                host_region=$(sudo sed -n 's/^HOST_REGION=//p' /etc/sandbox/vmd.env | tail -n 1 | tr -d '[:space:]')
+                case "$host_region" in ''|'""'|"''")
+                    echo 'ERROR: named host requires HOST_REGION before VMD activation' >&2
+                    exit 1 ;;
+                esac
+            fi
+
+
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes
             # its control socket into RuntimeDirectory=/run/secretsproxy under
             # DynamicUser; vmd connects to the same path.
@@ -766,11 +971,8 @@ def main() -> int:
                 echo {q_backup_backfill_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
-            # Upsert the control-plane URL. Empty = skip. vmd.env is safe to
-            # create; secretsproxy.env is only UPSERTED when it ALREADY exists —
-            # never create it here, because a partial file (missing
-            # DAEMON_AUTH_TOKEN/DATABASE_URL) makes the daemon exit and fails the
-            # health check below. The host bootstrap owns creating that file.
+            # Reconcile both env files after the fresh-host bootstrap. Missing
+            # required secretsproxy settings fail before VMD activation below.
             if [ -n {q_cpu} ]; then
                 sudo install -d -m 0755 /etc/sandbox
                 sudo touch /etc/sandbox/vmd.env
@@ -870,12 +1072,10 @@ def main() -> int:
             if [ -n {q_token} ]; then
                 sudo install -d -m 0755 /etc/sandbox
                 sudo touch /etc/sandbox/vmd.env
-                # vmd.env holds the bearer token — keep it root-only.
                 sudo chmod 0600 /etc/sandbox/vmd.env
                 sudo sed -i '/^INTERNAL_API_TOKEN=/d' /etc/sandbox/vmd.env
                 echo {q_iat_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
-                # Upsert DAEMON_AUTH_TOKEN only into an EXISTING secretsproxy.env;
-                # never create it here (same reason as CONTROL_PLANE_URL above).
+                # Both env files were created safely before reconciliation.
                 if [ -f /etc/sandbox/secretsproxy.env ]; then
                     sudo chmod 0600 /etc/sandbox/secretsproxy.env
                     sudo sed -i '/^DAEMON_AUTH_TOKEN=/d' /etc/sandbox/secretsproxy.env
@@ -896,15 +1096,56 @@ def main() -> int:
                 echo {q_db_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
                 # secretsproxy reads its own DATABASE_URL from its own env file
                 # (buildAuditSink fails startup without it, unless
-                # SECRETSPROXY_AUDIT_DISABLED=true) — only upsert into an
-                # EXISTING file, same reason as CONTROL_PLANE_URL/DAEMON_AUTH_TOKEN
-                # above: never create a partial secretsproxy.env here.
+                # SECRETSPROXY_AUDIT_DISABLED=true). Fresh files follow the same
+                # reconciliation and mandatory readiness checks as existing ones.
                 if [ -f /etc/sandbox/secretsproxy.env ]; then
                     sudo chmod 0600 /etc/sandbox/secretsproxy.env
                     sudo sed -i '/^DATABASE_URL=/d' /etc/sandbox/secretsproxy.env
                     echo {q_db_line} | sudo tee -a /etc/sandbox/secretsproxy.env > /dev/null
                 fi
             fi
+
+            # Fresh-host runtime preflight.
+            for key in CONTROL_PLANE_URL DAEMON_AUTH_TOKEN; do
+                if ! sudo grep -q "^$key=." /etc/sandbox/secretsproxy.env; then
+                    echo "ERROR: secretsproxy requires $key; configure the deploy input before retrying" >&2
+                    exit 1
+                fi
+            done
+            if ! sudo grep -q '^DATABASE_URL=.' /etc/sandbox/secretsproxy.env \
+               && ! sudo grep -qx 'SECRETSPROXY_AUDIT_DISABLED=true' /etc/sandbox/secretsproxy.env; then
+                echo "ERROR: secretsproxy requires DATABASE_URL; refusing VMD activation" >&2
+                exit 1
+            fi
+
+            restart_secretsproxy() {{
+                if sudo systemctl restart superserve-secretsproxy.service; then
+                    for attempt in $(seq 1 30); do
+                        invocation=$(sudo systemctl show -p InvocationID --value superserve-secretsproxy.service)
+                        if [ -n "$invocation" ] \
+                           && sudo curl --silent --fail --max-time 2 --unix-socket /run/secretsproxy/control.sock http://localhost/healthz >/dev/null \
+                           && sudo systemctl is-active --quiet superserve-secretsproxy.service \
+                           && [ "$invocation" = "$(sudo systemctl show -p InvocationID --value superserve-secretsproxy.service)" ]; then
+                            return 0
+                        fi
+                        sleep 1
+                    done
+                fi
+                echo "ERROR: secretsproxy provisioning/readiness failed; inspect CA state and required configuration" >&2
+                sudo systemctl status --no-pager superserve-secretsproxy.service >&2 || true
+                sudo journalctl -u superserve-secretsproxy.service --no-pager -n 40 >&2 || true
+                return 1
+            }}
+            # The existing cell CA was required before installing any binaries.
+            # Fresh hosts must complete this before any VMD socket activation.
+            if [ "$SECRETSPROXY_FRESH" = 1 ]; then
+                restart_secretsproxy
+                require_no_guest_workloads
+                require_vmd_ports_free
+                sudo rm -f /etc/systemd/system/superserve-vmd.socket.d/05-fresh-runtime.conf /etc/systemd/system/{service}.d/05-fresh-runtime.conf
+                sudo systemctl daemon-reload
+            fi
+            # End fresh-host runtime preflight.
 
             # Stop here ONLY in the exceptional cases that need the ports
             # released before the socket unit (re)binds: the one-time migration
@@ -1194,20 +1435,12 @@ def main() -> int:
             # journal and shouldn't restart vmd on failure.
             trap - EXIT
 
-            # Restart secretsproxy; tolerate missing env file on hosts not
-            # yet provisioned (is-active check below is gated on the file).
-            sudo systemctl restart superserve-secretsproxy.service || true
-            if [ -f /etc/sandbox/secretsproxy.env ]; then
-                sleep 2
-                sudo systemctl is-active --quiet superserve-secretsproxy.service || (
-                    echo "ERROR: superserve-secretsproxy failed to become active after restart" >&2
-                    sudo systemctl status --no-pager superserve-secretsproxy.service >&2 || true
-                    sudo journalctl -u superserve-secretsproxy.service --no-pager -n 40 >&2 || true
-                    exit 1
-                )
-            else
-                echo "/etc/sandbox/secretsproxy.env not present; daemon not started (provision env file to enable)"
+            # Existing hosts retain the normal post-VMD restart; a fresh host
+            # already initialized its CA and passed readiness before VMD started.
+            if [ "$SECRETSPROXY_FRESH" != 1 ]; then
+                restart_secretsproxy
             fi
+            sudo rm -f /etc/sandbox/.runtime-bootstrap-pending
         """)
 
         r = subprocess.run(
