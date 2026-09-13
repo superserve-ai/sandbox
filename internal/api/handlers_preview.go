@@ -294,7 +294,10 @@ func validateHostPreviewCapabilities(ctx context.Context, q *db.Queries, hostID 
 // Owner resume preserves lifecycle continuity while placement and mutations
 // retain the active-only capability rule.
 func validateOwnerResumeBrowserCapabilities(ctx context.Context, q *db.Queries, hostID string) error {
-	capabilities := previewBrowserCapabilities()
+	return validateOwnerResumeCapabilities(ctx, q, hostID, previewBrowserCapabilities()...)
+}
+
+func validateOwnerResumeCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
 	ok, err := q.OwnerHasResumeCapabilities(ctx, db.OwnerHasResumeCapabilitiesParams{
 		HostID: hostID, RequiredCapabilities: capabilities,
 		HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},
@@ -304,6 +307,16 @@ func validateOwnerResumeBrowserCapabilities(ctx context.Context, q *db.Queries, 
 	}
 	if !ok {
 		return &missingHostPreviewCapabilityError{capability: strings.Join(capabilities, `", "`)}
+	}
+	return nil
+}
+
+func validateOwnerResumePolicyCapabilities(ctx context.Context, q *db.Queries, hostID string, policy previewPolicySnapshot) error {
+	if policy.requiresBrowserCapability() {
+		return validateOwnerResumeBrowserCapabilities(ctx, q, hostID)
+	}
+	if policy.Access != preview.AccessLegacyPublic {
+		return validateOwnerResumeCapabilities(ctx, q, hostID, preview.HostCapabilityPorts)
 	}
 	return nil
 }

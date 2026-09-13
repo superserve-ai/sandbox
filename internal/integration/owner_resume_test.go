@@ -12,6 +12,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 func TestIntegration_OwnerResumeCapabilities(t *testing.T) {
@@ -177,5 +178,89 @@ func setOwnerHeartbeat(t *testing.T, hostID string, heartbeat time.Time) {
 	}
 	if _, err := testPool.Exec(ctx, `UPDATE host_capability SET heartbeat_at=$2 WHERE host_id=$1`, hostID, heartbeat); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestIntegration_ResumeSandbox_PortOnlyOwnerChanges(t *testing.T) {
+	t.Setenv("HOST_CAPABILITY_CACHE_TTL", "1m")
+	for _, phase := range []string{"attested", "reapply"} {
+		for _, change := range []string{"unchanged", "provisioning", "null-heartbeat", "stale-capability"} {
+			t.Run(phase+"/"+change, func(t *testing.T) {
+				ctx := context.Background()
+				teamID, key := seedTeamAndKey(t)
+				owner := seedActivePreviewHost(t, preview.HostCapabilityPorts)
+				sid := seedPrivatePreviewSandbox(t, teamID, owner, "port-owner-resume")
+				if _, err := testPool.Exec(ctx, `UPDATE sandbox_preview_policy SET access='public', default_access='public' WHERE sandbox_id=$1`, sid); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := testPool.Exec(ctx, `UPDATE sandbox_published_port SET access='public' WHERE sandbox_id=$1`, sid); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := testPool.Exec(ctx, `UPDATE host SET status='draining' WHERE id=$1`, owner); err != nil {
+					t.Fatal(err)
+				}
+				var revision int64
+				if err := testPool.QueryRow(ctx, `SELECT revision FROM sandbox_preview_policy WHERE sandbox_id=$1`, sid).Scan(&revision); err != nil {
+					t.Fatal(err)
+				}
+				vmd := &stubVMD{resumeAttestation: vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: revision, NetworkRulesApplied: true}}
+				r := previewTokenIntegrationRouter(t, vmd, []byte("integration-preview-seed-32-bytes!!"))
+				base := "/sandboxes/" + sid.String()
+				pause := func() {
+					t.Helper()
+					if w := do(r, http.MethodPost, base+"/pause", key, ""); w.Code != http.StatusNoContent {
+						t.Fatalf("pause=%d %s", w.Code, w.Body.String())
+					}
+				}
+				mutate := func() {
+					t.Helper()
+					var sql string
+					switch change {
+					case "unchanged":
+						return
+					case "provisioning":
+						sql = `UPDATE host SET status='provisioning' WHERE id=$1`
+					case "null-heartbeat":
+						sql = `UPDATE host SET last_heartbeat_at=NULL WHERE id=$1`
+					case "stale-capability":
+						sql = `UPDATE host SET last_heartbeat_at=last_heartbeat_at+interval '1 second' WHERE id=$1`
+					}
+					if _, err := testPool.Exec(ctx, sql, owner); err != nil {
+						t.Fatal(err)
+					}
+				}
+				pause()
+				vmd.resumeFn = mutate
+				if phase == "reapply" {
+					vmd.resumeAttestation = vmdclient.ResumeAttestation{}
+				}
+				beforeResume, beforePause := vmd.resumeCalls.Load(), vmd.pauseCalls.Load()
+				w := do(r, http.MethodPost, base+"/resume", key, "")
+				wantCode, wantStatus := http.StatusConflict, db.SandboxStatusPaused
+				wantResume, wantPause := int32(1), int32(1)
+				if change == "unchanged" {
+					wantCode, wantStatus, wantPause = http.StatusOK, db.SandboxStatusActive, 0
+				}
+				if w.Code != wantCode {
+					t.Fatalf("resume=%d %s, want %d", w.Code, w.Body.String(), wantCode)
+				}
+				if got := vmd.resumeCalls.Load() - beforeResume; got != wantResume {
+					t.Fatalf("resume calls=%d, want %d", got, wantResume)
+				}
+				if got := vmd.pauseCalls.Load() - beforePause; got != wantPause {
+					t.Fatalf("compensating pause calls=%d, want %d", got, wantPause)
+				}
+				if vmd.restoreCalls.Load() != 0 {
+					t.Fatal("unexpected restore")
+				}
+				sb, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: sid, TeamID: teamID})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if sb.HostID != owner || sb.Status != wantStatus {
+					t.Fatalf("owner/status=%s/%s, want %s/%s", sb.HostID, sb.Status, owner, wantStatus)
+				}
+			})
+		}
 	}
 }

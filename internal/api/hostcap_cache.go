@@ -206,7 +206,8 @@ func (h *Handlers) hostHasCapabilitiesCachedForScope(ctx context.Context, hostID
 	c := &h.hostCaps
 	c.init()
 	params := db.HostHasCapabilitiesUnlockedParams{HostID: hostID, RequiredCapabilities: capabilities}
-	if c.ttl <= 0 {
+	// Owner resume must recheck lifecycle status and heartbeat generation on every call.
+	if scope == ownerResumeCapabilities || c.ttl <= 0 {
 		return h.readHostCaps(ctx, params, scope)
 	}
 	sorted := append([]string(nil), capabilities...)

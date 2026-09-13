@@ -913,10 +913,18 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 				return "", false
 			}
 		}
-	} else if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireOwnerResumeCapabilities(c, sandbox.HostID, preview.HostCapabilityPorts) {
-		markRevert()
-		revertToPaused()
-		return "", false
+	} else if resumePolicy.Access != preview.AccessLegacyPublic {
+		if !h.requireOwnerResumeCapabilities(c, sandbox.HostID, preview.HostCapabilityPorts) {
+			markRevert()
+			revertToPaused()
+			return "", false
+		}
+		if capabilityErr := validateOwnerResumePolicyCapabilities(c.Request.Context(), h.DB, sandbox.HostID, resumePolicy); capabilityErr != nil {
+			markRevert()
+			revertToPaused()
+			h.handlePreviewMutationResult(c, sandboxID, "ValidatePreviewCapabilitiesForResume", capabilityErr)
+			return "", false
+		}
 	}
 	resumeVMDAccess := resumePolicy.vmdAccess()
 
@@ -1107,17 +1115,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			return false
 		}
 		effectivePolicy = currentPolicy
-		// A private publication may have changed while the VM was restoring.
-		// Gate the reapply against the host's current browser heartbeat too;
-		// otherwise a resume that began public could activate a
-		// concurrently-added browser policy on a downgraded host.
-		if currentPolicy.requiresBrowserCapability() {
-			if capabilityErr := validateOwnerResumeBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
-				markRevert()
-				pauseAndRevert()
-				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
-				return false
-			}
+		// Policy requirements and owner capabilities may change during restore.
+		if capabilityErr := validateOwnerResumePolicyCapabilities(postCtx, h.DB, sandbox.HostID, currentPolicy); capabilityErr != nil {
+			markRevert()
+			pauseAndRevert()
+			h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewCapabilitiesAfterResume", capabilityErr)
+			return false
 		}
 		if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.vmdAccess(), currentPolicy.vmdPorts(), currentPolicy.Revision); policyErr != nil {
 			if currentPolicy.vmdAccess() == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
@@ -1156,15 +1159,13 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			if !reapplyPolicy() {
 				return "", false
 			}
-		case resumePolicy.requiresBrowserCapability():
-			// The policy is the claim's. The host's browser heartbeat can
-			// lapse during the boot, so re-check it before activation the
-			// way the reapply does; otherwise a resume could activate a
-			// browser policy on a downgraded host.
-			if capabilityErr := validateOwnerResumeBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
+		default:
+			// The attested policy is current, but the owner's capabilities
+			// can lapse during boot and must be rechecked before activation.
+			if capabilityErr := validateOwnerResumePolicyCapabilities(postCtx, h.DB, sandbox.HostID, resumePolicy); capabilityErr != nil {
 				markRevert()
 				pauseAndRevert()
-				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
+				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewCapabilitiesAfterResume", capabilityErr)
 				return "", false
 			}
 		}

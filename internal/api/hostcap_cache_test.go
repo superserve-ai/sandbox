@@ -339,10 +339,10 @@ func TestHostCapCacheSeparatesOwnerResumeEligibility(t *testing.T) {
 			t.Fatalf("active-only=%v err=%v", got, err)
 		}
 	}
-	if ownerReads != 1 || activeReads != 2 {
+	if ownerReads != 2 || activeReads != 2 {
 		t.Fatalf("owner/active reads=%d/%d", ownerReads, activeReads)
 	}
-	if len(registry.verified) != 1 || registry.verified[0] != "owner=192.0.2.1:50051" {
+	if want := []string{"owner=192.0.2.1:50051", "owner=192.0.2.1:50051"}; !reflect.DeepEqual(registry.verified, want) {
 		t.Fatalf("address verification=%v", registry.verified)
 	}
 }
@@ -382,5 +382,42 @@ func TestOwnerResumeCapabilityHeartbeatCutoff(t *testing.T) {
 				t.Fatalf("reads=%d, address verifications=%v", reads, registry.verified)
 			}
 		})
+	}
+}
+
+func TestOwnerResumeCapabilitiesRechecksAfterSuccess(t *testing.T) {
+	t.Setenv("HOST_CAPABILITY_CACHE_TTL", "10s")
+	var reads atomic.Int64
+	var answer atomic.Bool
+	answer.Store(true)
+	h := capMockHandlers(&reads, &answer)
+	registry := &verifyRecorder{}
+	h.Hosts = registry
+	ctx := context.Background()
+	caps := []string{"preview_ports_v1"}
+
+	// A placement cache hit must not hide a later owner eligibility change.
+	if ok, err := h.hostHasCapabilitiesCached(ctx, "owner", caps); err != nil || !ok {
+		t.Fatalf("active: ok=%v err=%v", ok, err)
+	}
+	if ok, err := h.hostHasCapabilitiesCachedForScope(ctx, "owner", caps, ownerResumeCapabilities); err != nil || !ok {
+		t.Fatalf("initial resume: ok=%v err=%v", ok, err)
+	}
+	// The query rejects when status or heartbeat attestations become ineligible.
+	answer.Store(false)
+	if ok, err := h.hostHasCapabilitiesCachedForScope(ctx, "owner", caps, ownerResumeCapabilities); err != nil || ok {
+		t.Fatalf("after eligibility loss: ok=%v err=%v, want false,nil", ok, err)
+	}
+	if got := reads.Load(); got != 3 {
+		t.Fatalf("DB reads=%d, want 3", got)
+	}
+	if len(registry.verified) != 2 {
+		t.Fatalf("address verifications=%v, want only the two successful reads", registry.verified)
+	}
+
+	answer.Store(true)
+	registry.err = fmt.Errorf("registry resolution failed")
+	if ok, err := h.hostHasCapabilitiesCachedForScope(ctx, "owner", caps, ownerResumeCapabilities); err == nil || ok {
+		t.Fatalf("registry failure: ok=%v err=%v, want rejection", ok, err)
 	}
 }
