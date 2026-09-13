@@ -42,3 +42,9 @@ variable "runtime_email" {
   description = "Dedicated per-cell VMD runtime service account."
   type        = string
 }
+
+variable "identity_at_creation" {
+  description = "Create the trust domain before the VM and only attest/verify afterward."
+  type        = bool
+  default     = false
+}

@@ -8,7 +8,7 @@ from configure import configure
 
 
 class IssuanceConfigTest(unittest.TestCase):
-    def test_gcloud_receives_unwrapped_issuance_config(self):
+    def test_gcloud_receives_wrapped_issuance_config(self):
         for existing in (False, True):
             with self.subTest(existing_pool=existing):
                 config = {
@@ -35,12 +35,12 @@ class IssuanceConfigTest(unittest.TestCase):
                 with patch("configure.subprocess.run", side_effect=run):
                     with self.assertRaises(IssuanceCaptured):
                         configure(config)
-                self.assertEqual(captured, [{
+                self.assertEqual(captured, [{"inlineCertificateIssuanceConfig": {
                     "caPools": {"us-central1": config["ca_pool"]},
                     "keyAlgorithm": "ECDSA_P256",
                     "lifetime": "86400s",
                     "rotationWindowPercentage": 50,
-                }])
+                }}])
 
 
 class IssuanceCaptured(Exception):
