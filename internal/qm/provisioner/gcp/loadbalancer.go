@@ -64,6 +64,12 @@ func NewLoadBalancer(ctx context.Context, project, region, urlMap string, opts .
 // corrects the host rule and path matcher if they point somewhere stale.
 // Every part of it is idempotent, so it is safe on every run.
 func (l *LoadBalancer) EnsureHostRule(ctx context.Context, host, cloudRunService, owner string) error {
+	// A hostname already routed by another workload is not ours to take.
+	// addRoute below would lift it out of whatever rule carries it and
+	// point it at this tenant, which teardown then refuses to undo.
+	if err := l.routeIsOurs(ctx, host, owner); err != nil {
+		return err
+	}
 	// The NEG, the backend service and the path matcher all take the Cloud
 	// Run service's name, so the four read as one set in the console.
 	name := cloudRunService

@@ -161,8 +161,16 @@ func (d *Databases) EnsureDatabase(ctx context.Context, name, owner, marker stri
 		return err
 	}
 	_, err = pool.Exec(ctx, `CREATE DATABASE `+dbIdent+` ALLOW_CONNECTIONS false`)
-	if err != nil && !isPGCode(err, pgDuplicateDatabase) {
-		return fmt.Errorf("create database %s: %w", name, err)
+	if err != nil {
+		if !isPGCode(err, pgDuplicateDatabase) {
+			return fmt.Errorf("create database %s: %w", name, err)
+		}
+		// Something created it between the check above and here. Check
+		// again before the statements below stamp it, close it and take
+		// its ownership.
+		if err := d.checkMarker(ctx, pool, databaseMarkerSQL, name, marker, "database"); err != nil {
+			return err
+		}
 	}
 	// Stamped while the admin still owns it, and before the marker could be
 	// read by anything else: a database created by a run that died here
