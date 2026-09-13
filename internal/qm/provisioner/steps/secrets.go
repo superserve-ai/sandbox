@@ -2,8 +2,6 @@ package steps
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -15,15 +13,24 @@ import (
 // store was wired in; they have no placeholder mode to fall back to.
 var errNoSecretStore = errors.New("no secret store configured")
 
-// Generated per tenant. The model provider key is not in this list: qm-api
-// writes it at create time, before the run is triggered.
-var generatedSecrets = []struct {
-	name  string
-	bytes int
-}{
-	{secrets.PortalSessionSecret, 32},
-	{"DATABASE_PASSWORD", 24},
-	{"CORE_SESSION_SECRET", 32},
+// Generated per tenant, in plan order of nothing in particular: the step
+// writes whichever are missing. See generated.go for what is deliberately
+// absent.
+var generatedSecrets = []generatedSecret{
+	{name: secrets.PortalSessionSecret, value: randomSecret(32)},
+	{name: secretDatabasePassword, value: randomSecret(24)},
+	// QM's production boot check requires all five, each distinct.
+	{name: "CORE_SIGNING_SECRET", value: randomSecret(32)},
+	{name: "CAPABILITY_SECRET", value: randomSecret(32)},
+	{name: "PORTAL_IDENTITY_SECRET", value: randomSecret(32)},
+	{name: "CONNECTOR_SECRET_KEY", value: randomSecret(32)},
+	{name: "SKILL_SIGNING_SECRET", value: randomSecret(32)},
+	// The embedded sign-in broker's own credentials. AUTH_CLIENT_SECRET
+	// must differ from AUTH_TOKEN_SECRET, which independent generation
+	// gives us.
+	{name: "AUTH_TOKEN_SECRET", value: randomSecret(32)},
+	{name: "AUTH_CLIENT_SECRET", value: randomSecret(32)},
+	{name: "AUTH_SIGNING_JWK", value: newSigningJWK},
 }
 
 // secretsStep generates the tenant's runtime secrets into Secret Manager
@@ -63,15 +70,11 @@ func (s secretsStep) Run(ctx context.Context, t *provisioner.Tenant) error {
 		if have[spec.name] {
 			continue
 		}
-		value, err := randomHex(spec.bytes)
+		value, err := spec.value()
 		if err != nil {
-			return err
+			return fmt.Errorf("generate %s: %w", spec.name, err)
 		}
-		ref, err := s.c.Secrets.Put(ctx, t.SecretName(spec.name), []byte(value))
-		if err != nil {
-			return fmt.Errorf("write %s: %w", spec.name, err)
-		}
-		if err := t.SetSecretRef(ctx, spec.name, ref); err != nil {
+		if err := putTenantSecret(ctx, s.c, t, spec.name, value); err != nil {
 			return err
 		}
 		generated++
@@ -99,12 +102,25 @@ func (s secretsStep) Rollback(ctx context.Context, t *provisioner.Tenant) error 
 	for _, spec := range generatedSecrets {
 		names[spec.name] = true
 	}
+	// The secrets later steps derive rather than generate. Their own
+	// rollbacks remove them, but this step runs last on teardown and is the
+	// backstop for one that failed before it got there: a leaked
+	// DATABASE_URL or sandbox key is a live credential.
+	for _, name := range derivedSecrets {
+		names[name] = true
+	}
 	for _, ref := range refs {
+		if ref.Name == sharedSecretRef {
+			// A reference to a secret the platform owns and every other
+			// tenant shares. Deleting it here would take the whole fleet's
+			// email transport with it.
+			continue
+		}
 		names[ref.Name] = true
 	}
 	for name := range names {
-		if err := s.c.Secrets.Delete(ctx, t.SecretName(name)); err != nil {
-			return fmt.Errorf("delete %s: %w", name, err)
+		if err := deleteTenantSecret(ctx, s.c, t, name); err != nil {
+			return err
 		}
 	}
 	for _, ref := range refs {
@@ -115,10 +131,68 @@ func (s secretsStep) Rollback(ctx context.Context, t *provisioner.Tenant) error 
 	return nil
 }
 
-func randomHex(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
+// readTenantSecret reads one of the tenant's own secrets, having first
+// confirmed it is the tenant's.
+//
+// The check is here and not only where secrets are written because the
+// secrets step skips a secret whose reference is already recorded: a
+// recorded secret deleted and recreated by something else is never
+// re-verified on the write path, and a step that then consumed its value —
+// setting the tenant's database password to one that workload knows, say —
+// would have done the damage before any later check ran.
+func readTenantSecret(ctx context.Context, c Clients, t *provisioner.Tenant, name string) ([]byte, error) {
+	full := t.SecretName(name)
+	if err := checkSecretOwner(ctx, c, t, full); err != nil {
+		return nil, err
 	}
-	return hex.EncodeToString(b), nil
+	return c.Secrets.Get(ctx, full)
+}
+
+// checkSecretOwner refuses a secret that belongs to another tenant. It is
+// the one place the rule lives, so the read, grant and write paths cannot
+// disagree — an unlabelled secret that Put would adopt but Get refused
+// would just be a bug.
+//
+// Unlabelled is adoptable: see secrets.GCP.checkOwner for why the deploy
+// window makes that necessary and why a tenant secret's name shape makes it
+// safe.
+func checkSecretOwner(ctx context.Context, c Clients, t *provisioner.Tenant, fullName string) error {
+	owner, exists, err := c.Secrets.Owner(ctx, fullName)
+	if err != nil {
+		return fmt.Errorf("read the owner of %s: %w", fullName, err)
+	}
+	if exists && owner != "" && owner != t.Row.ID.String() {
+		return fmt.Errorf("%w: secret %s", ErrNotOwned, fullName)
+	}
+	return nil
+}
+
+// putTenantSecret writes one of the tenant's secrets, labelled as its own,
+// and records the reference. A secret of that name belonging to something
+// else comes back as ErrNotOwned so the steps layer speaks one sentinel
+// whatever the resource is.
+func putTenantSecret(ctx context.Context, c Clients, t *provisioner.Tenant, name, value string) error {
+	ref, err := c.Secrets.Put(ctx, t.SecretName(name), []byte(value), t.Row.ID.String())
+	if errors.Is(err, secrets.ErrNotOwned) {
+		return fmt.Errorf("%w: secret %s", ErrNotOwned, t.SecretName(name))
+	}
+	if err != nil {
+		return fmt.Errorf("write %s: %w", name, err)
+	}
+	return t.SetSecretRef(ctx, name, ref)
+}
+
+// deleteTenantSecret removes one of the tenant's secrets, and treats a
+// secret that is not this tenant's as nothing to remove.
+//
+// Skipping rather than failing is the point: the name is derived from a
+// slug, so a secret under that name may belong to something else — and a
+// teardown that stopped there would leave the tenant undeletable forever
+// over a secret it never created.
+func deleteTenantSecret(ctx context.Context, c Clients, t *provisioner.Tenant, name string) error {
+	err := c.Secrets.Delete(ctx, t.SecretName(name), t.Row.ID.String())
+	if err == nil || errors.Is(err, secrets.ErrNotOwned) {
+		return nil
+	}
+	return fmt.Errorf("delete %s: %w", name, err)
 }

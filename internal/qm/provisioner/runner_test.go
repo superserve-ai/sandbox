@@ -199,22 +199,6 @@ func TestRunnerResumesAfterFailure(t *testing.T) {
 	}
 }
 
-func TestRunnerNotImplementedIsTyped(t *testing.T) {
-	h := newHarness(t)
-	s := &fakeStep{name: "database", run: func(context.Context, *Tenant, int) error { return NotImplemented("database") }}
-	err := h.run(t, h.runner(s), ModeProvision)
-	if !errors.Is(err, ErrNotImplemented) {
-		t.Fatalf("err = %v, want ErrNotImplemented", err)
-	}
-	var nie *NotImplementedError
-	if !errors.As(err, &nie) || nie.Step != "database" {
-		t.Errorf("err = %#v", err)
-	}
-	if got := h.status(t); got != tenantstore.StatusFailed {
-		t.Errorf("status = %s", got)
-	}
-}
-
 func TestRunnerConcurrentRunExitsImmediately(t *testing.T) {
 	h := newHarness(t)
 	entered := make(chan struct{})

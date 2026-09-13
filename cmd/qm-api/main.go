@@ -26,6 +26,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/qm"
+	"github.com/superserve-ai/sandbox/internal/qm/modelkey"
 	"github.com/superserve-ai/sandbox/internal/qm/provisioner"
 	"github.com/superserve-ai/sandbox/internal/qm/provisioner/steps"
 	"github.com/superserve-ai/sandbox/internal/qm/secrets"
@@ -42,7 +43,7 @@ func main() {
 	log.Logger = zerolog.New(multi).With().Timestamp().Caller().Logger()
 
 	var err error
-	if len(os.Args) > 1 && os.Args[1] == "provision" {
+	if len(os.Args) > 1 && os.Args[1] == provisionCommand {
 		err = runProvision(os.Args[2:])
 	} else {
 		err = runServe()
@@ -54,6 +55,10 @@ func main() {
 	}
 }
 
+// provisionCommand is the argument that selects the Cloud Run Job
+// entrypoint; the same binary serves the API without it.
+const provisionCommand = "provision"
+
 // deps is everything both modes share once configured.
 type deps struct {
 	cfg        qm.Config
@@ -62,9 +67,15 @@ type deps struct {
 	closeStore func()
 	secrets    secrets.Store
 	runner     *provisioner.Runner
+	// closeClients releases the provisioner's cloud clients; nil in stub
+	// mode, where none were built.
+	closeClients func()
 }
 
 func (d *deps) close() {
+	if d.closeClients != nil {
+		d.closeClients()
+	}
 	d.closeStore()
 	d.pool.Close()
 }
@@ -75,7 +86,13 @@ func (d *deps) close() {
 // includes a config error: an unusable config usually still names the
 // database, and the tenant the job was started for is better told than left
 // in flight until the stale reclaim.
-func setup(ctx context.Context) (*deps, error) {
+// executesPlan says whether this process runs provisioning plans itself.
+// The job always does; the API does only when it was told to run them
+// in-process. A process that does not run them holds no cloud clients, so
+// an outage in any of them cannot keep the control API from starting —
+// but it still validates every piece of configuration the plan needs,
+// because that configuration is what it hands the job.
+func setup(ctx context.Context, command string) (*deps, error) {
 	cfg, cfgErr := qm.LoadConfig()
 	if cfg.DatabaseURL == "" {
 		return nil, fmt.Errorf("load config: %w", cfgErr)
@@ -115,20 +132,52 @@ func setup(ctx context.Context) (*deps, error) {
 	}
 	d.secrets = secretStore
 
+	executesPlan := command == provisionCommand || cfg.ProvisionerMode == qm.ProvisionerModeInProcess
 	env := provisioner.Env{
 		Project:    cfg.GCPProject,
 		Region:     cfg.ProvisionerRegion,
 		BaseDomain: cfg.BaseDomain,
 		Image:      cfg.TenantImage,
 		Stub:       cfg.ProvisionerStub,
+
+		ExecutesPlan: executesPlan,
+
+		SQLInstance:         cfg.SQLInstance,
+		SQLConnectionName:   cfg.SQLConnectionName,
+		SQLPrivateIP:        cfg.SQLPrivateIP,
+		SQLAdminUser:        cfg.SQLAdminUser,
+		SQLAdminSecret:      cfg.SQLAdminSecret,
+		URLMap:              cfg.LBURLMap,
+		VPCNetwork:          cfg.VPCNetwork,
+		VPCSubnetwork:       cfg.VPCSubnetwork,
+		BucketLocation:      cfg.BucketLocation,
+		BucketLifecycleJSON: cfg.BucketLifecycleJSON,
+
+		ResendSecret:     cfg.ResendSecret,
+		EmailFrom:        cfg.EmailFrom,
+		SandboxAPIURL:    cfg.SandboxAPIURL,
+		SandboxTemplate:  cfg.SandboxTemplate,
+		SandboxKeyRegion: cfg.SandboxKeyRegion,
 	}
 	if env.Stub {
 		log.Warn().Msg("QM_PROVISIONER_STUB=1: cloud-touching steps record placeholders instead of creating resources")
 	}
+	clients := provisionerClients{clients: steps.Clients{Secrets: secretStore}}
+	if executesPlan && !env.Stub {
+		// Built only where the plan actually runs, and not under the stub:
+		// each constructor reaches for credentials, and neither a local
+		// run nor the API service in its default mode has any use for
+		// them.
+		clients, err = cloudClients(ctx, cfg, env, secretStore)
+		if err != nil {
+			return d, err
+		}
+		d.closeClients = clients.Close
+	}
 	d.runner = &provisioner.Runner{
 		Store: d.store,
 		Env:   env,
-		Steps: steps.All(steps.Clients{Secrets: secretStore}),
+		Steps: steps.All(clients.Steps()),
 		Log:   log.Logger,
 	}
 	// Refuse a configuration whose plan would stop partway: by the time a
@@ -167,7 +216,7 @@ func runServe() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d, err := setup(ctx)
+	d, err := setup(ctx, "")
 	if d != nil {
 		defer d.close()
 	}
@@ -190,7 +239,13 @@ func runServe() error {
 		}
 	}
 
-	h := &qm.Handlers{Store: d.store, Secrets: d.secrets, Trigger: trigger, Log: log.Logger, StaleAfter: d.cfg.RunStaleAfter}
+	h := &qm.Handlers{
+		Store: d.store, Secrets: d.secrets, Trigger: trigger, Log: log.Logger,
+		StaleAfter: d.cfg.RunStaleAfter,
+		// A tenant slug is consumed for good once its row exists, so the
+		// model key is checked with its provider before the create.
+		ModelKeys: &http.Client{Timeout: modelkey.Timeout},
+	}
 	router := qm.SetupRouter(h, qm.NewPostgresKeyResolver(d.pool), log.Logger)
 
 	srv := &http.Server{
@@ -266,7 +321,7 @@ func runProvision(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	d, err := setup(ctx)
+	d, err := setup(ctx, provisionCommand)
 	if d != nil {
 		defer d.close()
 	}

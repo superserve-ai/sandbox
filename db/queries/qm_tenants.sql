@@ -138,3 +138,11 @@ WHERE id = $1 AND team_id = $2
   AND updated_at = sqlc.arg(expected_updated_at)
   AND event_seq = sqlc.arg(expected_event_seq)
 RETURNING *;
+
+-- name: IssueQMTenantSandboxKey :one
+-- Mints the tenant's Superserve API key through the definer function that
+-- stands in for the api_key INSERT qm_api does not have, and points the
+-- tenant row at it in the same statement so a live key can never end up
+-- unreferenced. Returns the key and whether this call created it; a tenant
+-- that already has one gets that one back, so a retried provision is safe.
+SELECT qm.issue_tenant_api_key(sqlc.arg(tenant_id), sqlc.arg(key_hash)) AS key_id;

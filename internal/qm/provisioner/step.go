@@ -28,11 +28,14 @@ type ReadyChecker interface {
 	Ready(env Env) error
 }
 
-// PlanReady reports every step that cannot run in env. Binaries call it
-// once at startup and refuse to serve when it fails: a run that would stop
-// at an unimplemented step must never be accepted, because by then the
-// tenant already has a model key in Secret Manager and a half-built stack
-// behind it.
+// PlanReady reports every step that cannot run in env: a piece of shared
+// infrastructure the deploy never configured, or — in a process that runs
+// plans itself (Env.ExecutesPlan) — a client that was not wired. Binaries
+// call it once at startup and refuse to serve when it fails. A run that
+// would stop partway must never be accepted, because by the time it reaches
+// the step that cannot run the tenant already has a model key in Secret
+// Manager and a half-built stack behind it — and in the case of the email
+// transport, a stack nobody could ever sign in to.
 func PlanReady(steps []Step, env Env) error {
 	var notReady []string
 	for _, s := range steps {
@@ -48,30 +51,6 @@ func PlanReady(steps []Step, env Env) error {
 		return nil
 	}
 	return fmt.Errorf("provisioning plan cannot run (%s)", strings.Join(notReady, "; "))
-}
-
-// NotImplementedError is returned by a step whose real implementation has
-// not landed yet when the runner is not in stub mode. It is a typed error
-// so callers can tell "engine works, step missing" from a step failure.
-type NotImplementedError struct {
-	Step string
-}
-
-func (e *NotImplementedError) Error() string {
-	return fmt.Sprintf("step %s is not implemented (set QM_PROVISIONER_STUB=1 to stub it)", e.Step)
-}
-
-// ErrNotImplemented matches any NotImplementedError via errors.Is.
-var ErrNotImplemented = &NotImplementedError{}
-
-func (e *NotImplementedError) Is(target error) bool {
-	_, ok := target.(*NotImplementedError)
-	return ok
-}
-
-// NotImplemented builds the typed error for step.
-func NotImplemented(step string) error {
-	return &NotImplementedError{Step: step}
 }
 
 // SkipError tells the runner a step had nothing to do (its resource already

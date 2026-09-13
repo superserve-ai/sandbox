@@ -315,6 +315,27 @@ func (s *Postgres) DeleteSecretRef(ctx context.Context, teamID, tenantID uuid.UU
 	})
 }
 
+// pgNoDataFound is the errcode qm.issue_tenant_api_key raises when the
+// tenant is gone.
+const pgNoDataFound = "P0002"
+
+func (s *Postgres) IssueSandboxKey(ctx context.Context, teamID, tenantID uuid.UUID, keyHash string) (uuid.UUID, error) {
+	var keyID uuid.UUID
+	err := s.withTeamTx(ctx, teamID, func(q *db.Queries) error {
+		var err error
+		keyID, err = q.IssueQMTenantSandboxKey(ctx, db.IssueQMTenantSandboxKeyParams{
+			TenantID: tenantID,
+			KeyHash:  keyHash,
+		})
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgNoDataFound {
+			return ErrNotFound
+		}
+		return err
+	})
+	return keyID, err
+}
+
 func (s *Postgres) RevokeSandboxKey(ctx context.Context, teamID, tenantID uuid.UUID) (bool, error) {
 	var had bool
 	err := s.withTeamTx(ctx, teamID, func(q *db.Queries) error {

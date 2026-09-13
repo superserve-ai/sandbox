@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/qm/adminlink"
+	"github.com/superserve-ai/sandbox/internal/qm/modelkey"
 	"github.com/superserve-ai/sandbox/internal/qm/provisioner"
 	"github.com/superserve-ai/sandbox/internal/qm/secrets"
 	"github.com/superserve-ai/sandbox/internal/qm/tenantstore"
@@ -48,6 +49,11 @@ type Handlers struct {
 	// before it could record a failure) and becomes retryable/deletable.
 	// Zero disables the reclaim.
 	StaleAfter time.Duration
+
+	// ModelKeys is the HTTP client the model provider key is checked with
+	// before a tenant is created. Nil takes a default; a test supplies one
+	// that answers without leaving the process.
+	ModelKeys *http.Client
 
 	// Now and NewJTI are seams for deterministic admin-link tests.
 	Now    func() time.Time
@@ -87,6 +93,17 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+	// Before the row, because the row consumes the slug for good: slugs are
+	// globally unique across deleted tenants too, so a key the provider
+	// rejects has to come back as a 400 the caller can fix rather than as a
+	// tenant that can never be provisioned under that name. Only an
+	// outright rejection stops the create; being unable to ask does not,
+	// and the provisioner's smoke step asks again before the tenant is
+	// called ready.
+	if err := modelkey.Verify(ctx, h.ModelKeys, req.ModelProvider, req.ModelKey); errors.Is(err, modelkey.ErrRejected) {
+		respondFieldErrors(c, map[string]string{"modelKey": "This key was rejected by " + req.ModelProvider + ". Check it and try again."})
+		return
+	}
 	tenant, err := h.Store.CreateTenant(ctx, p.TeamID, tenantstore.CreateParams{
 		Slug: req.Slug, OrgName: req.OrgName, AdminEmail: req.AdminEmail, SignIn: req.SignIn,
 		ModelProvider: req.ModelProvider, Harness: req.Harness, CreatedBy: p.ActorID,
@@ -109,7 +126,7 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 	log := h.Log.With().Str("tenant_id", tenant.ID.String()).Logger()
 
 	keyName := secrets.ModelKeyName(req.ModelProvider)
-	ref, err := h.Secrets.Put(ctx, secrets.TenantSecretName(tenant.Slug, keyName), []byte(req.ModelKey))
+	ref, err := h.Secrets.Put(ctx, secrets.TenantSecretName(tenant.Slug, keyName), []byte(req.ModelKey), tenant.ID.String())
 	if err != nil {
 		log.Error().Str("error", provisioner.ScrubString(err.Error())).Msg("store model key")
 		h.failTenant(ctx, tenant, tenantstore.VersionOf(tenant), []string{tenantstore.StatusProvisioning}, stepModelKey, "The model key could not be stored. Delete this tenant and create it again.", err, nil)
@@ -140,7 +157,7 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 			if retired, rerr := h.tenantRetired(dctx, tenant); rerr != nil {
 				log.Error().Err(rerr).Msg("confirm the tenant survived its model key")
 			} else if retired {
-				if derr := h.Secrets.Delete(dctx, secrets.TenantSecretName(tenant.Slug, keyName)); derr != nil {
+				if derr := h.Secrets.Delete(dctx, secrets.TenantSecretName(tenant.Slug, keyName), tenant.ID.String()); derr != nil {
 					log.Error().Str("error", provisioner.ScrubString(derr.Error())).Msg("remove the model key of a retired tenant")
 				}
 			}
@@ -152,7 +169,7 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 			cancel()
 			log.Warn().Msg("model key reference was recorded despite the error; continuing")
 		default:
-			if derr := h.Secrets.Delete(dctx, secrets.TenantSecretName(tenant.Slug, keyName)); derr != nil {
+			if derr := h.Secrets.Delete(dctx, secrets.TenantSecretName(tenant.Slug, keyName), tenant.ID.String()); derr != nil {
 				log.Error().Str("error", provisioner.ScrubString(derr.Error())).Msg("remove unreferenced model key")
 			}
 			cancel()
@@ -177,7 +194,7 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 	if retired {
 		dctx, cancel := detached(ctx)
 		name := secrets.TenantSecretName(tenant.Slug, keyName)
-		if derr := h.deleteSecret(dctx, name); derr != nil {
+		if derr := h.deleteSecret(dctx, name, tenant.ID.String()); derr != nil {
 			// Nothing downstream will pick this up: the tenant is on its
 			// way out, and once it is deleted the API no longer shows it
 			// and its references are frozen. Say so loudly, with the name
@@ -495,10 +512,10 @@ func (h *Handlers) reclaimStale(c *gin.Context, tenant tenantstore.Tenant) (tena
 // will ever repeat: a key whose tenant is already being torn down.
 const secretDeleteAttempts = 3
 
-func (h *Handlers) deleteSecret(ctx context.Context, name string) error {
+func (h *Handlers) deleteSecret(ctx context.Context, name, owner string) error {
 	var err error
 	for attempt := 0; attempt < secretDeleteAttempts; attempt++ {
-		if err = h.Secrets.Delete(ctx, name); err == nil || ctx.Err() != nil {
+		if err = h.Secrets.Delete(ctx, name, owner); err == nil || ctx.Err() != nil {
 			return err
 		}
 	}

@@ -1,9 +1,15 @@
 // Package steps holds the provisioning steps in plan order. Each cloud-
 // touching step is its own file with the client interface it needs; the
-// implementations behind those interfaces are wired in cmd/qm-api. Until a
-// real implementation lands, a step succeeds only in stub mode (Env.Stub,
-// from QM_PROVISIONER_STUB=1), where it records placeholder resource names
-// so the rest of the engine, the API and the console can be exercised.
+// implementations behind those interfaces live in the gcp subpackage and
+// are wired in cmd/qm-api.
+//
+// Under stub mode (Env.Stub, from QM_PROVISIONER_STUB=1) the cloud-touching
+// steps record placeholder resource names instead of calling GCP, so the
+// engine, the API and the console can be exercised without a project. Every
+// step declares what it cannot run without through Ready, which
+// provisioner.PlanReady checks once at startup: a run must never stop at a
+// step that was never going to work, because by then the tenant already has
+// a model key in Secret Manager and a half-built stack behind it.
 package steps
 
 import (
@@ -19,8 +25,8 @@ import (
 )
 
 // Clients is every external dependency the plan needs. A nil field is fine
-// in stub mode; outside it the step that needs the client returns
-// NotImplemented until the client (and the step body) exists.
+// in stub mode, where no step calls out; outside it, the step that needs a
+// client says so from Ready and the binary refuses to start.
 type Clients struct {
 	Secrets      secrets.Store
 	Databases    DatabaseAdmin
@@ -30,21 +36,12 @@ type Clients struct {
 	LoadBalancer LoadBalancerAdmin
 	// HTTP performs the health and smoke probes against the public URL.
 	HTTP *http.Client
-}
-
-// stubOnly is embedded by the steps whose cloud implementations have not
-// landed. They can only record placeholders, so provisioner.PlanReady
-// refuses a non-stub binary rather than letting it accept tenants it would
-// abandon halfway through building.
-type stubOnly struct{}
-
-var errStubOnly = errors.New("not implemented; set QM_PROVISIONER_STUB=1 to run the plan with placeholders")
-
-func (stubOnly) Ready(env provisioner.Env) error {
-	if env.Stub {
-		return nil
-	}
-	return errStubOnly
+	// HealthTimeout, SmokeTimeout and ProbeInterval bound those probes.
+	// Zero takes the defaults; they are settable so a test does not have
+	// to wait out a ten-minute budget to watch one fail.
+	HealthTimeout time.Duration
+	SmokeTimeout  time.Duration
+	ProbeInterval time.Duration
 }
 
 // All returns the plan in provision order; the deprovision plan is the
@@ -55,7 +52,16 @@ func (stubOnly) Ready(env provisioner.Env) error {
 // with, then the service and its route, then the probes.
 func All(c Clients) []provisioner.Step {
 	if c.HTTP == nil {
-		c.HTTP = &http.Client{Timeout: 15 * time.Second}
+		c.HTTP = defaultProbeClient()
+	}
+	if c.HealthTimeout <= 0 {
+		c.HealthTimeout = defaultHealthTimeout
+	}
+	if c.SmokeTimeout <= 0 {
+		c.SmokeTimeout = defaultSmokeTimeout
+	}
+	if c.ProbeInterval <= 0 {
+		c.ProbeInterval = defaultProbeInterval
 	}
 	return []provisioner.Step{
 		secretsStep{c: c},
@@ -78,6 +84,42 @@ func All(c Clients) []provisioner.Step {
 // DatabaseName is the tenant's database on the shared Cloud SQL instance.
 func DatabaseName(slug string) string {
 	return "qm_" + strings.ReplaceAll(slug, "-", "_")
+}
+
+// ErrNotOwned means a resource with the name this tenant's slug derives
+// exists and belongs to something else. Provisioning fails on it — building
+// a tenant around somebody else's resource is the thing the markers exist to
+// stop — but teardown treats it as absent and carries on, because there is
+// nothing of this tenant's there to remove and stopping would strand every
+// resource that really is its own.
+var ErrNotOwned = errors.New("resource belongs to another tenant")
+
+// TenantLabelKey carries the tenant a runtime-created resource belongs to.
+// The value is the tenant's id rather than its slug: the slug is chosen by
+// whoever created the tenant, and this is the marker that decides whether an
+// existing resource may be adopted.
+const TenantLabelKey = "qm-tenant-id"
+
+// TenantLabels are the labels every per-tenant resource carries. The slug is
+// there for whoever is reading the console; the id is what is checked.
+func TenantLabels(tenantID, slug string) map[string]string {
+	return map[string]string{TenantLabelKey: tenantID, "qm-tenant": slug}
+}
+
+// TenantDescription is the marker for the per-tenant resources that take a
+// description but no labels: service accounts, serverless NEGs and backend
+// services. Same purpose as TenantLabels — it is what tells this tenant's
+// resource apart from one that merely happens to have the name a slug
+// derives.
+func TenantDescription(tenantID, slug string) string {
+	return "QM tenant " + slug + " (" + tenantID + ")"
+}
+
+// RoleName is the tenant's Postgres role on the shared instance. It shares
+// the database's name: one role, one database, and nothing else on the
+// instance the role may connect to.
+func RoleName(slug string) string {
+	return DatabaseName(slug)
 }
 
 // ServiceName is the tenant's Cloud Run service.

@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,12 +83,42 @@ func ownerResolver(keys map[string]Principal) fakeResolver {
 }
 
 type fixture struct {
-	router  *gin.Engine
-	store   *tenantstore.Memory
-	secrets *secrets.Fake
-	trigger *provisioner.Recorder
-	teamA   uuid.UUID
-	teamB   uuid.UUID
+	router    *gin.Engine
+	store     *tenantstore.Memory
+	secrets   *secrets.Fake
+	trigger   *provisioner.Recorder
+	modelKeys fakeModelProvider
+	teamA     uuid.UUID
+	teamB     uuid.UUID
+}
+
+// modelKeyClient is the HTTP client every Handlers in this file checks
+// model keys with: the suite must never reach a real provider.
+func (f *fixture) modelKeyClient() *http.Client {
+	return &http.Client{Transport: &f.modelKeys}
+}
+
+// fakeModelProvider stands in for Anthropic, OpenAI and OpenRouter. Zero
+// value accepts every key.
+type fakeModelProvider struct {
+	mu     sync.Mutex
+	status int
+}
+
+func (p *fakeModelProvider) reject() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.status = http.StatusUnauthorized
+}
+
+func (p *fakeModelProvider) RoundTrip(*http.Request) (*http.Response, error) {
+	p.mu.Lock()
+	status := p.status
+	p.mu.Unlock()
+	if status == 0 {
+		status = http.StatusOK
+	}
+	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader("{}")), Header: http.Header{}}, nil
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -102,8 +134,12 @@ func newFixture(t *testing.T) *fixture {
 	owner, viewer, teamBOwner := uuid.New(), uuid.New(), uuid.New()
 	h := &Handlers{
 		Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(),
-		Now:    func() time.Time { return fixedNow },
-		NewJTI: func() (string, error) { return fixedJTI, nil },
+		// Model keys are checked against the provider before a tenant is
+		// created; the fixture answers for it so the suite never leaves
+		// the process.
+		ModelKeys: f.modelKeyClient(),
+		Now:       func() time.Time { return fixedNow },
+		NewJTI:    func() (string, error) { return fixedJTI, nil },
 	}
 	resolver := fakeResolver{
 		keys: map[string]Principal{
@@ -242,6 +278,10 @@ func TestCreateTenantValidation(t *testing.T) {
 		{"long org", map[string]any{"orgName": strings.Repeat("é", 101)}, "orgName"},
 		{"bad email", map[string]any{"adminEmail": "nope"}, "adminEmail"},
 		{"bad sign-in", map[string]any{"signIn": "password"}, "signIn"},
+		// Accepted by the schema, but the provisioner renders one sign-in
+		// flow; a tenant reported as Slack while serving magic links is
+		// worse than refusing it.
+		{"slack sign-in", map[string]any{"signIn": "slack"}, "signIn"},
 		{"bad provider", map[string]any{"modelProvider": "mistral"}, "modelProvider"},
 		{"empty model key", map[string]any{"modelKey": ""}, "modelKey"},
 		{"model key with spaces", map[string]any{"modelKey": "sk-ant one two"}, "modelKey"},
@@ -276,6 +316,45 @@ func TestCreateTenantValidation(t *testing.T) {
 	multibyte["orgName"] = strings.Repeat("é", 100)
 	if code, body := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, multibyte); code != http.StatusAccepted {
 		t.Errorf("100-character multibyte org name: %d %v", code, body)
+	}
+}
+
+// A model key is written under a name derived from the tenant's slug, and
+// slugs are chosen by whoever creates the tenant. A secret already there
+// under another owner is not this tenant's to add a version to.
+func TestCreateTenantRefusesASecretItDoesNotOwn(t *testing.T) {
+	f := newFixture(t)
+	f.secrets.SetOwner("qm-pilot-team-ANTHROPIC_API_KEY", "somebody else")
+	code, body := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, validCreate())
+	if code == http.StatusAccepted {
+		t.Fatalf("the create wrote to a secret it does not own: %v", body)
+	}
+	if v, _ := f.secrets.Get(context.Background(), "qm-pilot-team-ANTHROPIC_API_KEY"); string(v) != "someone else's" {
+		t.Errorf("the secret was overwritten: %q", v)
+	}
+}
+
+// A key the provider rejects is refused before the tenant exists. Slugs
+// are globally unique across deleted tenants too, so creating the row first
+// would consume the name for a tenant that can never be provisioned.
+func TestCreateTenantRejectsAModelKeyTheProviderRefuses(t *testing.T) {
+	f := newFixture(t)
+	f.modelKeys.reject()
+	code, resp := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, validCreate())
+	if code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400: %v", code, resp)
+	}
+	fields, _ := resp["fields"].(map[string]any)
+	if _, ok := fields["modelKey"]; !ok {
+		t.Errorf("fields = %v", fields)
+	}
+	if len(f.secrets.Puts) != 0 || len(f.trigger.Calls) != 0 {
+		t.Error("a rejected key reached the secret store or the trigger")
+	}
+	// Nothing was created, so the slug is still free.
+	code, avail := f.do(t, http.MethodGet, "/v1/qm/slugs/pilot-team/availability", keyTeamA, nil)
+	if code != http.StatusOK || avail["available"] != true {
+		t.Errorf("slug availability after a rejected key: %d %v", code, avail)
 	}
 }
 
@@ -469,7 +548,7 @@ func TestAdminLink(t *testing.T) {
 	if code, _ := f.do(t, http.MethodPost, path, keyTeamA, nil); code != http.StatusBadGateway {
 		t.Errorf("admin link without portal secret: %d, want 502", code)
 	}
-	f.secrets.Put(ctx, "qm-pilot-team-PORTAL_SESSION_SECRET", []byte(fixedSecret))
+	f.secrets.Put(ctx, "qm-pilot-team-PORTAL_SESSION_SECRET", []byte(fixedSecret), id)
 
 	code, body := f.do(t, http.MethodPost, path, keyTeamA, nil)
 	if code != http.StatusOK {
@@ -579,7 +658,7 @@ func TestFailTenantSurvivesCancelledRequest(t *testing.T) {
 	tid := uuid.MustParse(id)
 	row, _ := f.store.GetTenant(context.Background(), f.teamA, tid)
 
-	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	h.failTenant(ctx, row, tenantstore.VersionOf(row), []string{tenantstore.StatusProvisioning}, stepTrigger, "run could not be started", errors.New("client went away"), map[string]any{"mode": "provision"})
@@ -598,7 +677,7 @@ func TestCreateTenantCleansUpUnreferencedModelKey(t *testing.T) {
 	f := newFixture(t)
 	// A store that accepts the tenant but cannot record the secret reference.
 	f.store.Fail = nil
-	h := &Handlers{Store: refFailingStore{f.store}, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: refFailingStore{f.store}, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 	code, _ := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, validCreate())
 	if code != http.StatusInternalServerError {
@@ -688,7 +767,7 @@ func TestQueueRunRequiresIntentEvent(t *testing.T) {
 	f.store.SetStatus(ctx, f.teamA, tid, tenantstore.StatusReady)
 
 	failing := &eventFailingStore{Memory: f.store, failNext: 1}
-	h := &Handlers{Store: failing, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: failing, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 	calls := len(f.trigger.Calls)
 	if code, _ := f.do(t, http.MethodDelete, "/v1/qm/tenants/"+id, keyTeamA, nil); code != http.StatusInternalServerError {
@@ -737,7 +816,7 @@ func TestStaleRunIsReclaimed(t *testing.T) {
 	tid := uuid.MustParse(id)
 	ctx := context.Background()
 
-	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), StaleAfter: 30 * time.Minute, Now: func() time.Time { return now }}
+	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient(), StaleAfter: 30 * time.Minute, Now: func() time.Time { return now }}
 	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 
 	// Fresh: still provisioning, nothing to reclaim.
@@ -851,7 +930,7 @@ func TestQueueRunWaitsForPreviousRunToRelease(t *testing.T) {
 // cost the tenant its model key.
 func TestCreateTenantKeepsModelKeyWhenRefWriteCommittedDespiteError(t *testing.T) {
 	f := newFixture(t)
-	h := &Handlers{Store: ambiguousRefStore{f.store}, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: ambiguousRefStore{f.store}, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 	code, body := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, validCreate())
 	if code != http.StatusAccepted {
@@ -882,7 +961,7 @@ func (s ambiguousRefStore) SetSecretRef(ctx context.Context, teamID, tenantID uu
 // deletion is unrecoverable, a kept key is cleaned up by teardown.
 func TestCreateTenantKeepsModelKeyWhenRefReadFails(t *testing.T) {
 	f := newFixture(t)
-	h := &Handlers{Store: &refUnreadableStore{Memory: f.store}, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: &refUnreadableStore{Memory: f.store}, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 	if code, _ := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, validCreate()); code != http.StatusInternalServerError {
 		t.Fatalf("status %d", code)
@@ -919,7 +998,7 @@ func (s *refUnreadableStore) ListSecretRefs(ctx context.Context, teamID, tenantI
 // and retryable, not provisioning with nothing behind it.
 func TestCreateTenantMarksFailedWhenQueueingAborts(t *testing.T) {
 	f := newFixture(t)
-	h := &Handlers{Store: &lockFailingStore{Memory: f.store}, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: &lockFailingStore{Memory: f.store}, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 	if code, _ := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, validCreate()); code != http.StatusInternalServerError {
 		t.Fatalf("status %d", code)
@@ -999,7 +1078,7 @@ func TestDeleteFailingBeforeItsIntentIsNotMarkedFailed(t *testing.T) {
 	f.store.SetStatus(ctx, f.teamA, tid, tenantstore.StatusReady)
 
 	broken := &lockFailingStore{Memory: f.store, failNext: 1}
-	h := &Handlers{Store: broken, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: broken, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 	calls := len(f.trigger.Calls)
 	if code, _ := f.do(t, http.MethodDelete, "/v1/qm/tenants/"+id, keyTeamA, nil); code != http.StatusInternalServerError {
@@ -1037,7 +1116,7 @@ func TestFailTenantLeavesAnOvertakenTenantAlone(t *testing.T) {
 	if _, err := f.store.SetStatus(ctx, f.teamA, tid, tenantstore.StatusDeprovisioning); err != nil {
 		t.Fatal(err)
 	}
-	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	h.failTenant(ctx, row, tenantstore.VersionOf(row), []string{tenantstore.StatusProvisioning}, stepTrigger,
 		"run could not be started", errors.New("cloud run refused"), map[string]any{"mode": "provision"})
 
@@ -1076,7 +1155,7 @@ func TestFailTenantLeavesASecondAttemptAlone(t *testing.T) {
 	}
 	before, _ := f.store.ListEvents(ctx, f.teamA, tid)
 
-	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	h.failTenant(ctx, row, tenantstore.VersionOf(row), []string{tenantstore.StatusProvisioning}, stepTrigger,
 		"run could not be started", errors.New("cloud run refused"), map[string]any{"mode": "provision"})
 
@@ -1104,7 +1183,7 @@ func TestAbortedDeleteDoesNotCancelTheWinner(t *testing.T) {
 	// The competing delete lands between this request's read and its lock
 	// probe, and takes the tenant with it.
 	overtaken := &overtakingStore{Memory: f.store, teamID: f.teamA, tenantID: tid}
-	h := &Handlers{Store: overtaken, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: overtaken, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 	if code, _ := f.do(t, http.MethodDelete, "/v1/qm/tenants/"+id, keyTeamA, nil); code != http.StatusInternalServerError {
 		t.Fatalf("overtaken delete: %d, want 500", code)
@@ -1171,7 +1250,7 @@ func TestStaleReclaimDoesNotFailAReplacementAttempt(t *testing.T) {
 	// The winning retry lands while this request is between reading the
 	// events and taking the lock.
 	racing := &reclaimRacingStore{Memory: f.store, teamID: f.teamA, tenantID: tid}
-	h := &Handlers{Store: racing, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), StaleAfter: 30 * time.Minute, Now: func() time.Time { return now }}
+	h := &Handlers{Store: racing, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient(), StaleAfter: 30 * time.Minute, Now: func() time.Time { return now }}
 	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 
 	// The loser finds a tenant already in flight for the winner's attempt.
@@ -1245,7 +1324,7 @@ func TestQueueRunReconcilesAnAmbiguousWrite(t *testing.T) {
 
 			store := &ambiguousStore{Memory: f.store}
 			tc.commit(store)
-			h := &Handlers{Store: store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+			h := &Handlers{Store: store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 			f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 			calls := len(f.trigger.Calls)
 			if code, _ := f.do(t, tc.method, "/v1/qm/tenants/"+id+tc.path, keyTeamA, nil); code != http.StatusInternalServerError {
@@ -1295,7 +1374,7 @@ func (s *ambiguousStore) InsertEvent(ctx context.Context, teamID uuid.UUID, p te
 func TestCreateTenantTakesBackTheKeyOfARetiredTenant(t *testing.T) {
 	f := newFixture(t)
 	store := &retiringStore{Memory: f.store}
-	h := &Handlers{Store: store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 
 	code, _ := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, validCreate())
@@ -1430,7 +1509,7 @@ func TestFailTenantRecordsNothingWhenTheStatusWriteFails(t *testing.T) {
 	before, _ := f.store.ListEvents(ctx, f.teamA, tid)
 
 	broken := &transitionFailingStore{Memory: f.store}
-	h := &Handlers{Store: broken, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: broken, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	h.failTenant(ctx, row, tenantstore.VersionOf(row), []string{tenantstore.StatusProvisioning}, stepTrigger,
 		"run could not be started", errors.New("cloud run refused"), map[string]any{"mode": "provision"})
 
@@ -1457,7 +1536,7 @@ func (transitionFailingStore) TransitionStatusIfUnchanged(context.Context, uuid.
 // top of the replacement, whose job would then exit as superseded.
 func TestQueueRunRefusesToQueueOnTopOfAReplacement(t *testing.T) {
 	f := newFixture(t)
-	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), ModelKeys: f.modelKeyClient()}
 	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
 	// The replacement lands while the create's model key is being written.
 	f.secrets.BeforePut = func() {

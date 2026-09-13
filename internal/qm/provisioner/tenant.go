@@ -2,7 +2,11 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
 
 	"github.com/superserve-ai/sandbox/internal/qm/secrets"
 	"github.com/superserve-ai/sandbox/internal/qm/tenantstore"
@@ -22,6 +26,54 @@ type Env struct {
 	// Stub makes the cloud-touching steps succeed without touching GCP,
 	// recording placeholder resource names; for tests and local runs.
 	Stub bool
+	// ExecutesPlan says this process runs plans itself, rather than queuing
+	// them for one that does. The qm-api service in its default mode only
+	// triggers the provisioner job, so it holds no cloud clients — and must
+	// not refuse to start for the want of them. It still validates every
+	// piece of configuration the plan needs, because that is what it hands
+	// the job.
+	ExecutesPlan bool
+
+	// Shared infrastructure each tenant is attached to. See qm.Config for
+	// where these come from and why an empty one is fatal at startup
+	// rather than at the step that needed it.
+	SQLInstance       string
+	SQLConnectionName string
+	SQLPrivateIP      string
+	SQLAdminUser      string
+	// SQLAdminSecret is the Secret Manager name of the instance admin's
+	// password. The steps never read it — the client the provisioner builds
+	// does — but it is checked with the rest of the plan's configuration so
+	// an API that would accept tenants every job then fails to provision
+	// refuses to start instead.
+	SQLAdminSecret      string
+	URLMap              string
+	VPCNetwork          string
+	VPCSubnetwork       string
+	BucketLocation      string
+	BucketLifecycleJSON string
+
+	// Tenant runtime configuration. ResendSecret is platform-level: one
+	// Secret Manager secret shared by every tenant, whose service account
+	// is granted read access to it.
+	ResendSecret     string
+	EmailFrom        string
+	SandboxAPIURL    string
+	SandboxTemplate  string
+	SandboxKeyRegion string
+}
+
+// Require reports the first of fields (name → value) that is empty, as an
+// error naming it. Steps call it from Ready so a missing shared-
+// infrastructure value stops the binary at startup rather than a tenant
+// halfway through its plan.
+func (e Env) Require(fields ...string) error {
+	for i := 0; i+1 < len(fields); i += 2 {
+		if strings.TrimSpace(fields[i+1]) == "" {
+			return errors.New(fields[i] + " is required")
+		}
+	}
+	return nil
 }
 
 // Tenant is the unit of work a step receives: the current row plus the
@@ -67,6 +119,12 @@ func (t *Tenant) Record(ctx context.Context, r tenantstore.Resources) error {
 // SetSecretRef records where one of the tenant's secrets lives.
 func (t *Tenant) SetSecretRef(ctx context.Context, name, ref string) error {
 	return t.store.SetSecretRef(ctx, t.Row.TeamID, t.Row.ID, name, ref)
+}
+
+// IssueSandboxKey mints the tenant's Superserve API key and points the row
+// at it, returning the key's id.
+func (t *Tenant) IssueSandboxKey(ctx context.Context, keyHash string) (uuid.UUID, error) {
+	return t.store.IssueSandboxKey(ctx, t.Row.TeamID, t.Row.ID, keyHash)
 }
 
 // RevokeSandboxKey revokes the API key the tenant was issued, reporting

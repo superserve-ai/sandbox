@@ -7,6 +7,7 @@ package qm
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -43,6 +44,52 @@ type Config struct {
 	SecretsBackend string
 	TenantImage    string
 	SentryDSN      string
+
+	// Shared infrastructure the provisioner attaches each tenant to. These
+	// mirror the QM Terraform module's contract one-for-one (it exports the
+	// same QM_* names), so a value that differs here from what was applied
+	// there points a tenant at something that does not exist. Empty is
+	// tolerated only under QM_PROVISIONER_STUB, where no step calls GCP;
+	// otherwise the plan's readiness check refuses the binary at startup.
+	SQLInstance       string
+	SQLConnectionName string
+	SQLPrivateIP      string
+	// SQLAdminUser and SQLAdminSecret are the instance-level role the
+	// provisioner connects as to create tenant databases and roles, and the
+	// Secret Manager name holding its password.
+	SQLAdminUser   string
+	SQLAdminSecret string
+	LBURLMap       string
+	VPCNetwork     string
+	VPCSubnetwork  string
+	BucketLocation string
+	// BucketLifecycleJSON is the lifecycle policy applied to every tenant
+	// bucket, in the Cloud Storage JSON API's shape. Empty applies none.
+	BucketLifecycleJSON string
+
+	// Tenant runtime configuration, rendered into each tenant's service.
+	//
+	// ResendSecret is the Secret Manager name of the *platform's* one
+	// Resend API key: hosted QM has a single Resend account and a single
+	// verified sending domain, so the key is shared and each tenant's
+	// service account is granted read access to it. It is deliberately not
+	// a generated per-tenant secret. Without it a tenant's embedded auth
+	// broker fails closed on /idp/authorize and nobody can sign in, so the
+	// provisioner treats it as required, not optional.
+	ResendSecret string
+	// EmailFrom is the sender magic links are sent from, at the verified
+	// domain, optionally as "Name <sender@example.com>".
+	EmailFrom string
+	// SandboxAPIURL and SandboxTemplate configure the tenant's sandbox
+	// backend: the Superserve API its QM creates sandboxes against, and the
+	// template it launches them from.
+	SandboxAPIURL   string
+	SandboxTemplate string
+	// SandboxKeyRegion tags the API keys the provisioner issues with this
+	// cell's region (ss_live_<region>_<random>), as the control plane's own
+	// keys are; an untagged key gets the generic 401 when it reaches the
+	// wrong cell instead of the redirect hint.
+	SandboxKeyRegion string
 	// RunStaleAfter is how long an in-flight tenant may go without a new
 	// event before the API treats its run as lost and lets it be retried
 	// or deleted.
@@ -50,6 +97,10 @@ type Config struct {
 }
 
 const defaultRunStaleAfter = 30 * time.Minute
+
+// regionTokenRe mirrors the control plane's own region-token shape (see
+// internal/api's apiKeyRegion): 1-17 lowercase alphanumerics.
+var regionTokenRe = regexp.MustCompile(`^[a-z0-9]{1,17}$`)
 
 // LoadConfig reads the environment. Required: DATABASE_URL, QM_BASE_DOMAIN,
 // and GCP_PROJECT unless every GCP-backed component is switched to its
@@ -68,6 +119,32 @@ func LoadConfig() (Config, error) {
 		TenantImage:       os.Getenv("QM_TENANT_IMAGE"),
 		SentryDSN:         os.Getenv("SENTRY_DSN"),
 		RunStaleAfter:     defaultRunStaleAfter,
+
+		SQLInstance:       os.Getenv("QM_SQL_INSTANCE"),
+		SQLConnectionName: os.Getenv("QM_SQL_CONNECTION_NAME"),
+		SQLPrivateIP:      os.Getenv("QM_SQL_PRIVATE_IP"),
+		SQLAdminUser:      os.Getenv("QM_SQL_ADMIN_USER"),
+		SQLAdminSecret:    os.Getenv("QM_SQL_ADMIN_SECRET"),
+		LBURLMap:          os.Getenv("QM_LB_URL_MAP"),
+		VPCNetwork:        os.Getenv("QM_VPC_NETWORK"),
+		VPCSubnetwork:     os.Getenv("QM_VPC_SUBNETWORK"),
+		BucketLocation:    os.Getenv("QM_TENANT_BUCKET_LOCATION"),
+		// Trimmed here so the readiness check and the bucket client cannot
+		// disagree about whether a whitespace-only value is "no policy":
+		// one of them accepting it and the other trying to parse it is a
+		// plan that starts and then stops every tenant at the bucket step.
+		BucketLifecycleJSON: strings.TrimSpace(os.Getenv("QM_TENANT_BUCKET_LIFECYCLE_JSON")),
+
+		ResendSecret:     os.Getenv("QM_RESEND_SECRET"),
+		EmailFrom:        os.Getenv("QM_EMAIL_FROM"),
+		SandboxAPIURL:    strings.TrimSuffix(os.Getenv("QM_SANDBOX_API_URL"), "/"),
+		SandboxTemplate:  os.Getenv("QM_SANDBOX_TEMPLATE"),
+		SandboxKeyRegion: strings.TrimSpace(envOr("QM_SANDBOX_KEY_REGION", os.Getenv("SANDBOX_ID_REGION"))),
+	}
+	// Buckets default to the provisioner's own region rather than failing:
+	// the Terraform module's tenant_bucket_location does the same.
+	if cfg.BucketLocation == "" {
+		cfg.BucketLocation = cfg.ProvisionerRegion
 	}
 	if raw := os.Getenv("QM_RUN_STALE_AFTER"); raw != "" {
 		d, err := time.ParseDuration(raw)
@@ -78,6 +155,14 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
+	}
+	// The region rides in the key as plaintext and the control plane parses
+	// it back with this shape. Anything else is not rejected there, it is
+	// read as "no region" — so every key a misconfigured cell issued would
+	// silently lose the wrong-endpoint diagnostic, which is the only reason
+	// the tag exists.
+	if cfg.SandboxKeyRegion != "" && !regionTokenRe.MatchString(cfg.SandboxKeyRegion) {
+		return cfg, fmt.Errorf("QM_SANDBOX_KEY_REGION must be 1-17 lowercase letters or digits")
 	}
 	if cfg.BaseDomain == "" {
 		return cfg, fmt.Errorf("QM_BASE_DOMAIN is required")
@@ -96,6 +181,16 @@ func LoadConfig() (Config, error) {
 	// memory would never reach it, so that pairing is refused outright.
 	if cfg.ProvisionerMode == ProvisionerModeCloudRun && cfg.SecretsBackend == SecretsBackendMemory {
 		return cfg, fmt.Errorf("QM_SECRETS_BACKEND=memory requires QM_PROVISIONER_MODE=inprocess")
+	}
+	// And in-process is not enough on its own. The memory store is for
+	// local runs where nothing must persist; a plan that really calls GCP
+	// creates a service account, a database, a bucket and an HMAC key, and
+	// then asks Cloud Run to mount secrets that were never written
+	// anywhere. A restart makes it worse rather than better: the tenant's
+	// recorded references survive, so the next run skips generating the
+	// values that are now gone.
+	if cfg.SecretsBackend == SecretsBackendMemory && !cfg.ProvisionerStub {
+		return cfg, fmt.Errorf("QM_SECRETS_BACKEND=memory requires QM_PROVISIONER_STUB=1: the cloud steps would build a tenant around secrets that do not outlive this process")
 	}
 	needsGCP := cfg.ProvisionerMode == ProvisionerModeCloudRun || cfg.SecretsBackend == SecretsBackendGCP
 	if needsGCP && cfg.GCPProject == "" {

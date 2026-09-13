@@ -2,6 +2,8 @@ package secrets
 
 import (
 	"context"
+	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -9,6 +11,7 @@ import (
 type Fake struct {
 	mu     sync.Mutex
 	values map[string][]byte
+	owners map[string]string
 	// Puts counts Put calls per name so tests can assert a secret was
 	// written exactly once.
 	Puts map[string]int
@@ -20,10 +23,10 @@ type Fake struct {
 }
 
 func NewFake() *Fake {
-	return &Fake{values: map[string][]byte{}, Puts: map[string]int{}}
+	return &Fake{values: map[string][]byte{}, owners: map[string]string{}, Puts: map[string]int{}}
 }
 
-func (f *Fake) Put(_ context.Context, name string, value []byte) (string, error) {
+func (f *Fake) Put(_ context.Context, name string, value []byte, owner string) (string, error) {
 	if f.BeforePut != nil {
 		f.BeforePut()
 	}
@@ -35,6 +38,10 @@ func (f *Fake) Put(_ context.Context, name string, value []byte) (string, error)
 	if err := ValidName(name); err != nil {
 		return "", err
 	}
+	if err := f.checkOwner(name, owner); err != nil {
+		return "", err
+	}
+	f.owners[name] = owner
 	f.values[name] = append([]byte(nil), value...)
 	f.Puts[name]++
 	return "projects/fake/secrets/" + name + "/versions/latest", nil
@@ -53,14 +60,77 @@ func (f *Fake) Get(_ context.Context, name string) ([]byte, error) {
 	return append([]byte(nil), v...), nil
 }
 
-func (f *Fake) Delete(_ context.Context, name string) error {
+func (f *Fake) Delete(_ context.Context, name, owner string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.Err != nil {
 		return f.Err
 	}
+	if err := f.checkOwner(name, owner); err != nil {
+		return err
+	}
 	delete(f.values, name)
+	delete(f.owners, name)
 	return nil
+}
+
+func (f *Fake) Owner(_ context.Context, name string) (string, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.Err != nil {
+		return "", false, f.Err
+	}
+	if _, exists := f.values[name]; !exists {
+		return "", false, nil
+	}
+	return f.owners[name], true, nil
+}
+
+// checkOwner mirrors the GCP store: a secret under another tenant's owner
+// is not the caller's to write or remove, while an unlabelled one — written
+// before the label existed — is adopted and stamped.
+func (f *Fake) checkOwner(name, owner string) error {
+	if _, exists := f.values[name]; !exists {
+		return nil
+	}
+	have := f.owners[name]
+	if have == "" {
+		f.owners[name] = owner
+		return nil
+	}
+	if have == owner && owner != "" {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrNotOwned, name)
+}
+
+// SetUnlabelled plants a secret with no owner label, as the previous qm-api
+// revision would have written one.
+func (f *Fake) SetUnlabelled(name string, value []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.values[name] = append([]byte(nil), value...)
+	delete(f.owners, name)
+}
+
+// SetOwner plants a secret under another owner, for tests.
+func (f *Fake) SetOwner(name, owner string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.values[name] = []byte("someone else's")
+	f.owners[name] = owner
+}
+
+// Names lists the secrets that currently hold a value, sorted.
+func (f *Fake) Names() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.values))
+	for name := range f.values {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Has reports whether name currently holds a value.
