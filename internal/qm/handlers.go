@@ -110,7 +110,7 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 	ref, err := h.Secrets.Put(ctx, secrets.TenantSecretName(tenant.Slug, keyName), []byte(req.ModelKey))
 	if err != nil {
 		log.Error().Str("error", provisioner.ScrubString(err.Error())).Msg("store model key")
-		h.failTenant(ctx, tenant, stepModelKey, "The model key could not be stored. Delete this tenant and create it again.", err, nil)
+		h.failTenant(ctx, tenant, []string{tenantstore.StatusProvisioning}, stepModelKey, "The model key could not be stored. Delete this tenant and create it again.", err, nil)
 		respondError(c, http.StatusBadGateway, "The tenant was created but its model key could not be stored. Delete it and try again.")
 		return
 	}
@@ -130,7 +130,7 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 		case lerr != nil:
 			log.Error().Err(lerr).Msg("re-read model key ref")
 			cancel()
-			h.failTenant(ctx, tenant, stepModelKey, "The model key reference could not be confirmed. Retry the tenant, or delete it and create it again.", err, nil)
+			h.failTenant(ctx, tenant, []string{tenantstore.StatusProvisioning}, stepModelKey, "The model key reference could not be confirmed. Retry the tenant, or delete it and create it again.", err, nil)
 			respondError(c, http.StatusInternalServerError, internalErrorMsg)
 			return
 		case stored:
@@ -141,7 +141,7 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 				log.Error().Str("error", provisioner.ScrubString(derr.Error())).Msg("remove unreferenced model key")
 			}
 			cancel()
-			h.failTenant(ctx, tenant, stepModelKey, "The model key reference could not be recorded. Delete this tenant and create it again.", err, nil)
+			h.failTenant(ctx, tenant, []string{tenantstore.StatusProvisioning}, stepModelKey, "The model key reference could not be recorded. Delete this tenant and create it again.", err, nil)
 			respondError(c, http.StatusInternalServerError, internalErrorMsg)
 			return
 		}
@@ -472,7 +472,7 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, from []st
 		return tenantstore.Tenant{}, false
 	case err != nil:
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("probe tenant lock")
-		h.abortQueue(c, tenant, mode, inFlight, err)
+		h.abortQueue(c, tenant, mode, from, inFlight, err)
 		return tenantstore.Tenant{}, false
 	}
 	// Released before the trigger: the run it starts must be able to take
@@ -488,7 +488,7 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, from []st
 		return tenantstore.Tenant{}, false
 	case err != nil:
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("transition tenant status")
-		h.abortQueue(c, tenant, mode, inFlight, err)
+		h.abortQueue(c, tenant, mode, from, inFlight, err)
 		return tenantstore.Tenant{}, false
 	}
 	detail := map[string]any{"mode": string(mode)}
@@ -496,13 +496,13 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, from []st
 		TenantID: updated.ID, Step: stepTrigger, Status: tenantstore.EventStarted, Message: string(mode) + " run requested", Detail: provisioner.ScrubDetail(detail),
 	}); err != nil {
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("record run intent")
-		h.abortQueue(c, tenant, mode, inFlight, err)
+		h.abortQueue(c, tenant, mode, from, inFlight, err)
 		return tenantstore.Tenant{}, false
 	}
 	if err := h.Trigger.Trigger(ctx, updated.TeamID, updated.ID, mode); err != nil {
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Str("mode", string(mode)).Msg("trigger provisioner run")
 		if errors.Is(err, provisioner.ErrTriggerRejected) {
-			h.failTenant(ctx, updated, stepTrigger, "The "+string(mode)+" run could not be started. Retry the tenant.", err, map[string]any{"mode": string(mode)})
+			h.failTenant(ctx, updated, []string{inFlight}, stepTrigger, "The "+string(mode)+" run could not be started. Retry the tenant.", err, map[string]any{"mode": string(mode)})
 			respondError(c, http.StatusBadGateway, "The "+string(mode)+" run could not be started. Retry from the tenant page.")
 			return tenantstore.Tenant{}, false
 		}
@@ -530,10 +530,13 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, from []st
 // failed-event write to carry the mode — the very thing that just broke.
 // The delete simply has not happened, so the tenant goes back where it was
 // and the caller issues it again.
-func (h *Handlers) abortQueue(c *gin.Context, tenant tenantstore.Tenant, mode provisioner.Mode, inFlight string, cause error) {
+func (h *Handlers) abortQueue(c *gin.Context, tenant tenantstore.Tenant, mode provisioner.Mode, from []string, inFlight string, cause error) {
 	ctx := c.Request.Context()
 	if mode != provisioner.ModeDeprovision {
-		h.failTenant(ctx, tenant, stepTrigger, "The "+string(mode)+" run could not be queued. Retry the tenant.", cause, map[string]any{"mode": string(mode)})
+		// The transition may or may not have landed, so either side of it
+		// is a status this request owns.
+		owned := append(append([]string{}, from...), inFlight)
+		h.failTenant(ctx, tenant, owned, stepTrigger, "The "+string(mode)+" run could not be queued. Retry the tenant.", cause, map[string]any{"mode": string(mode)})
 		respondError(c, http.StatusInternalServerError, internalErrorMsg)
 		return
 	}
@@ -552,27 +555,49 @@ func (h *Handlers) abortQueue(c *gin.Context, tenant tenantstore.Tenant, mode pr
 // retried. Both writes run detached from the request: the failure being
 // recorded may be the caller having gone away, and a tenant left in an
 // in-flight status with no run behind it could never be retried.
-func (h *Handlers) failTenant(ctx context.Context, tenant tenantstore.Tenant, step, message string, cause error, detail map[string]any) {
+//
+// The status write is a compare-and-set on the statuses this request still
+// owns, and it comes first. A slow trigger call can outlive StaleAfter, by
+// which point a delete may have reclaimed the tenant and queued a teardown:
+// overwriting deprovisioning with failed would strand that teardown, and the
+// mode-bearing event would then send the next retry down the provision plan
+// for a tenant the caller asked to delete. A request that has been overtaken
+// records nothing.
+func (h *Handlers) failTenant(ctx context.Context, tenant tenantstore.Tenant, from []string, step, message string, cause error, detail map[string]any) {
+	dctx, cancel := detached(ctx)
+	defer cancel()
+	updated, err := h.Store.TransitionStatus(dctx, tenant.TeamID, tenant.ID, from, tenantstore.StatusFailed)
+	switch {
+	case errors.Is(err, tenantstore.ErrStatusConflict), errors.Is(err, tenantstore.ErrNotFound):
+		h.Log.Warn().Str("tenant_id", tenant.ID.String()).Str("step", step).
+			Msg("tenant moved on while this request was failing; leaving it to its current owner")
+		return
+	case err != nil:
+		// The status could not be read or written at all; record the
+		// failure anyway so the event log says what happened.
+		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("mark tenant failed")
+		updated = tenant
+	}
 	if detail == nil {
 		detail = map[string]any{}
 	}
 	detail["error"] = cause.Error()
-	h.event(ctx, tenant, step, tenantstore.EventFailed, message, detail)
-	dctx, cancel := detached(ctx)
-	defer cancel()
-	if _, err := h.Store.SetStatus(dctx, tenant.TeamID, tenant.ID, tenantstore.StatusFailed); err != nil {
-		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("mark tenant failed")
-	}
+	h.eventIn(dctx, updated, step, tenantstore.EventFailed, message, detail)
 }
 
 func (h *Handlers) event(ctx context.Context, tenant tenantstore.Tenant, step, status, message string, detail map[string]any) {
+	dctx, cancel := detached(ctx)
+	defer cancel()
+	h.eventIn(dctx, tenant, step, status, message, detail)
+}
+
+// eventIn appends an event under a deadline the caller owns.
+func (h *Handlers) eventIn(ctx context.Context, tenant tenantstore.Tenant, step, status, message string, detail map[string]any) {
 	p := tenantstore.EventParams{TenantID: tenant.ID, Step: step, Status: status, Message: message}
 	if detail != nil {
 		p.Detail = provisioner.ScrubDetail(detail)
 	}
-	dctx, cancel := detached(ctx)
-	defer cancel()
-	if _, err := h.Store.InsertEvent(dctx, tenant.TeamID, p); err != nil {
+	if _, err := h.Store.InsertEvent(ctx, tenant.TeamID, p); err != nil {
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Str("step", step).Msg("record tenant event")
 	}
 }

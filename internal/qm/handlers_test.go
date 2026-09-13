@@ -576,7 +576,7 @@ func TestFailTenantSurvivesCancelledRequest(t *testing.T) {
 	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	h.failTenant(ctx, row, stepTrigger, "run could not be started", errors.New("client went away"), map[string]any{"mode": "provision"})
+	h.failTenant(ctx, row, []string{tenantstore.StatusProvisioning}, stepTrigger, "run could not be started", errors.New("client went away"), map[string]any{"mode": "provision"})
 
 	row, _ = f.store.GetTenant(context.Background(), f.teamA, tid)
 	if row.Status != tenantstore.StatusFailed {
@@ -1012,5 +1012,35 @@ func TestDeleteFailingBeforeItsIntentIsNotMarkedFailed(t *testing.T) {
 	}
 	if last := f.trigger.Calls[len(f.trigger.Calls)-1]; last.Mode != provisioner.ModeDeprovision {
 		t.Errorf("mode = %s", last.Mode)
+	}
+}
+
+// A trigger call slow enough to outlive StaleAfter can come back after a
+// delete has reclaimed the tenant. Its failure must not overwrite the
+// teardown's status, nor leave a provision-mode event that would send the
+// next retry down the wrong plan.
+func TestFailTenantLeavesAnOvertakenTenantAlone(t *testing.T) {
+	f := newFixture(t)
+	id := f.create(t)
+	tid := uuid.MustParse(id)
+	ctx := context.Background()
+	row, _ := f.store.GetTenant(ctx, f.teamA, tid)
+	before, _ := f.store.ListEvents(ctx, f.teamA, tid)
+
+	// A delete overtook this request: the tenant is queued for teardown.
+	if _, err := f.store.SetStatus(ctx, f.teamA, tid, tenantstore.StatusDeprovisioning); err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h.failTenant(ctx, row, []string{tenantstore.StatusProvisioning}, stepTrigger,
+		"run could not be started", errors.New("cloud run refused"), map[string]any{"mode": "provision"})
+
+	row, _ = f.store.GetTenant(ctx, f.teamA, tid)
+	if row.Status != tenantstore.StatusDeprovisioning {
+		t.Errorf("status = %s, want the teardown left in place", row.Status)
+	}
+	after, _ := f.store.ListEvents(ctx, f.teamA, tid)
+	if len(after) != len(before) {
+		t.Errorf("an overtaken request recorded %d event(s)", len(after)-len(before))
 	}
 }

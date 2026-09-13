@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -32,6 +33,9 @@ type Postgres struct {
 // lockPoolSize bounds concurrently held run locks per process; the job runs
 // one, the service's in-process mode a handful.
 const lockPoolSize = 4
+
+// lockReleaseTimeout bounds the rollback that drops a run lock.
+const lockReleaseTimeout = 5 * time.Second
 
 // NewPostgres builds the store on pool and a lock pool with the same
 // connection settings.
@@ -303,8 +307,15 @@ func (s *Postgres) Lock(ctx context.Context, teamID, tenantID uuid.UUID) (func()
 		return nil, fmt.Errorf("begin: %w", err)
 	}
 	release := func() {
-		_ = tx.Rollback(context.WithoutCancel(ctx))
-		conn.Release()
+		// Detached from ctx (a cancelled request must still drop the lock)
+		// but bounded, and the connection is released either way: an
+		// unbounded rollback against a stalled database would pin one of
+		// the few lock-pool connections forever, and a run whose release
+		// never returns would keep its job alive.
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), lockReleaseTimeout)
+		defer conn.Release()
+		defer rcancel()
+		_ = tx.Rollback(rctx)
 	}
 	q := db.New(tx)
 	if err := q.SetQMTeamScope(ctx, teamID.String()); err != nil {
