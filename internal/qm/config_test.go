@@ -24,7 +24,7 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.BaseDomain != "qm.example.com" || cfg.Port != "8080" || !cfg.ProvisionerStub || cfg.ProvisionerRegion != "us-central1" {
+	if cfg.BaseDomain != "qm.example.com" || cfg.Port != "8080" || !cfg.ProvisionerStub {
 		t.Errorf("cfg = %+v", cfg)
 	}
 
@@ -33,6 +33,18 @@ func TestLoadConfig(t *testing.T) {
 	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "inprocess") {
 		t.Errorf("memory secrets with the cloud run job: err = %v", err)
 	}
+	// The job is addressed by region, so triggering one is refused until
+	// the deploy says which region it was placed in.
+	t.Setenv("QM_SECRETS_BACKEND", "gcp")
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "QM_PROVISIONER_REGION") {
+		t.Errorf("cloud run job without a region: err = %v", err)
+	}
+	t.Setenv("QM_PROVISIONER_REGION", "us-east4")
+	if cfg, err := LoadConfig(); err != nil || cfg.ProvisionerRegion != "us-east4" {
+		t.Errorf("cfg = %+v err = %v", cfg, err)
+	}
+	t.Setenv("QM_SECRETS_BACKEND", "memory")
+	t.Setenv("QM_PROVISIONER_REGION", "")
 	t.Setenv("QM_PROVISIONER_MODE", "sometimes")
 	if _, err := LoadConfig(); err == nil {
 		t.Error("bad provisioner mode accepted")

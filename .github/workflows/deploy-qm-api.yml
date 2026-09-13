@@ -221,9 +221,16 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         run: |
           IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/qm-api:${{ github.sha }}"
-          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
-          gcloud run jobs update ${{ vars.QM_PROVISIONER_JOB || 'qm-provisioner' }} --image "$IMAGE" $ARGS
-          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" $ARGS
+          REGION="${{ vars.QM_API_REGION || vars.GCP_REGION }}"
+          ARGS="--region $REGION --project ${{ vars.GCP_PROJECT }}"
+          JOB=${{ vars.QM_PROVISIONER_JOB || 'qm-provisioner' }}
+          # The region is set on both resources from the one the deploy is
+          # targeting: the service resolves the job by project, region and
+          # name, so a default that drifts from where the job actually lives
+          # makes every create and retry fail at the trigger.
+          ENV="QM_PROVISIONER_JOB=$JOB,QM_PROVISIONER_REGION=$REGION"
+          gcloud run jobs update "$JOB" --image "$IMAGE" --update-env-vars "$ENV" $ARGS
+          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" --update-env-vars "$ENV" $ARGS
 
       - name: Route traffic to the new revision
         if: steps.gate.outputs.enabled == 'true'
@@ -317,9 +324,16 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         run: |
           IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/qm-api:${{ github.sha }}"
-          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }}"
-          gcloud run jobs update ${{ vars.QM_PROVISIONER_JOB || 'qm-provisioner' }} --image "$IMAGE" $ARGS
-          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" $ARGS
+          REGION="${{ vars.QM_API_REGION || vars.GCP_REGION_USE4 }}"
+          ARGS="--region $REGION --project ${{ vars.GCP_PROJECT }}"
+          JOB=${{ vars.QM_PROVISIONER_JOB || 'qm-provisioner' }}
+          # The region is set on both resources from the one the deploy is
+          # targeting: the service resolves the job by project, region and
+          # name, so a default that drifts from where the job actually lives
+          # makes every create and retry fail at the trigger.
+          ENV="QM_PROVISIONER_JOB=$JOB,QM_PROVISIONER_REGION=$REGION"
+          gcloud run jobs update "$JOB" --image "$IMAGE" --update-env-vars "$ENV" $ARGS
+          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" --update-env-vars "$ENV" $ARGS
 
       - name: Route traffic to the new revision
         if: steps.gate.outputs.enabled == 'true'

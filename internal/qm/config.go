@@ -61,7 +61,7 @@ func LoadConfig() (Config, error) {
 		GCPProject:        os.Getenv("GCP_PROJECT"),
 		BaseDomain:        strings.TrimSuffix(strings.ToLower(os.Getenv("QM_BASE_DOMAIN")), "."),
 		ProvisionerJob:    envOr("QM_PROVISIONER_JOB", "qm-provisioner"),
-		ProvisionerRegion: envOr("QM_PROVISIONER_REGION", "us-central1"),
+		ProvisionerRegion: os.Getenv("QM_PROVISIONER_REGION"),
 		ProvisionerMode:   envOr("QM_PROVISIONER_MODE", ProvisionerModeCloudRun),
 		ProvisionerStub:   isTruthy(os.Getenv("QM_PROVISIONER_STUB")),
 		SecretsBackend:    envOr("QM_SECRETS_BACKEND", SecretsBackendGCP),
@@ -100,6 +100,12 @@ func LoadConfig() (Config, error) {
 	needsGCP := cfg.ProvisionerMode == ProvisionerModeCloudRun || cfg.SecretsBackend == SecretsBackendGCP
 	if needsGCP && cfg.GCPProject == "" {
 		return cfg, fmt.Errorf("GCP_PROJECT is required unless QM_PROVISIONER_MODE=inprocess and QM_SECRETS_BACKEND=memory")
+	}
+	// No default: the job is resolved by project, region and name, and a
+	// region guessed here that differs from where the job was deployed
+	// fails every trigger. The deploy sets it from the region it targets.
+	if cfg.ProvisionerMode == ProvisionerModeCloudRun && cfg.ProvisionerRegion == "" {
+		return cfg, fmt.Errorf("QM_PROVISIONER_REGION is required when QM_PROVISIONER_MODE=%s", ProvisionerModeCloudRun)
 	}
 	return cfg, nil
 }
