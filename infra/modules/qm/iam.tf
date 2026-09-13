@@ -58,11 +58,25 @@ locals {
       for prefix in local.platform_secret_prefixes :
       "!resource.name.startsWith(\"projects/${local.project_number}/secrets/${prefix}\")"
     ],
-    [
-      for name in local.platform_secret_names :
-      "resource.name != \"projects/${local.project_number}/secrets/${name}\""
-    ],
+    local.shared_secret_exclusions,
   )
+
+  # The shared Resend secret, and everything beneath it. Two predicates per
+  # secret, not one: a version's access check is evaluated against
+  # projects/.../secrets/<id>/versions/<n>, so an inequality on the secret's
+  # own name is true for exactly the operation that reads the key. The
+  # trailing slash holds the second to that secret's own children rather
+  # than to every secret whose name begins with it.
+  #
+  # By exact name rather than by prefix because this name is a caller's to
+  # choose: a prefix would miss an overridden one, and a "qm-resend-" prefix
+  # would swallow the secrets of a tenant whose slug is "resend".
+  shared_secret_exclusions = flatten([
+    for name in local.platform_secret_names : [
+      "resource.name != \"projects/${local.project_number}/secrets/${name}\"",
+      "!resource.name.startsWith(\"projects/${local.project_number}/secrets/${name}/\")",
+    ]
+  ])
 
   # Shared by every qm-api secret grant that IAM evaluates against the secret
   # itself, so accessor, version-adder and delete cannot drift apart.
@@ -74,16 +88,13 @@ locals {
   # The provisioner's admin over qm-* deliberately still reaches the instance
   # admin password and the control-plane DATABASE_URL — it reads both. The
   # Resend key is different: it never reads it, only grants tenants access to
-  # it, and admin carries delete. One provisioner run wrongly deleting it
-  # would take sign-in away from every tenant in the fleet, so it is excluded
-  # here — by exact name, so an overridden one is excluded too — and reached
-  # through the two-permission role below instead.
+  # it, and admin carries delete. One provisioner run wrongly deleting it, or
+  # reading it, would reach the credential the whole fleet's sign-in depends
+  # on — so it is excluded here and reached through the narrow secret-level
+  # role below instead.
   provisioner_secret_condition = join(" && ", concat(
     ["resource.name.startsWith(\"${local.secret_name_prefix}\")"],
-    [
-      for name in local.platform_secret_names :
-      "resource.name != \"projects/${local.project_number}/secrets/${name}\""
-    ],
+    local.shared_secret_exclusions,
   ))
 }
 
