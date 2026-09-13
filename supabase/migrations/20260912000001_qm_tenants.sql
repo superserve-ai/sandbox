@@ -114,9 +114,9 @@ CREATE TABLE IF NOT EXISTS qm.tenant_events (
     status    text NOT NULL,
     message   text,
     detail    jsonb,
-    -- Per-tenant insertion counter assigned by InsertQMTenantEvent; the
-    -- provisioner serializes writes per tenant, so it is the ordering key and
-    -- survives copying between cells unlike a global sequence.
+    -- Per-tenant insertion counter assigned by InsertQMTenantEvent under the
+    -- tenant's row lock; it is the ordering key and survives copying between
+    -- cells unlike a global sequence.
     seq       bigint NOT NULL,
     at        timestamptz NOT NULL DEFAULT clock_timestamp(),
 
@@ -199,7 +199,12 @@ GRANT EXECUTE ON FUNCTION qm.slug_available(text) TO qm_api;
 ALTER TABLE qm.tenants        ENABLE ROW LEVEL SECURITY;
 -- Child rows are append-only while a tenant is live; a retired tenant
 -- accepts no further events or secret references, which is what lets team
--- migration treat its cutover sweep of these tables as final.
+-- migration treat its cutover sweep of these tables as final. The status
+-- predicate below is a backstop only: a policy reads the tenant on the
+-- statement's snapshot, so a write that overlaps retirement could still pass
+-- it. The queries close that window by locking the tenant row before they
+-- write (see InsertQMTenantEvent), which makes retirement wait for in-flight
+-- child writes and later ones re-read the retired row.
 ALTER TABLE qm.tenant_events  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE qm.tenant_secrets ENABLE ROW LEVEL SECURITY;
 

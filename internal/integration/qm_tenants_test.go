@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -189,7 +190,7 @@ func TestQMAPI_TenantLifecycleWithinTeamScope(t *testing.T) {
 	}
 
 	secretRef := "projects/example/secrets/" + slug + "-db/versions/latest"
-	if err := q.SetQMTenantSecretRef(ctx, db.SetQMTenantSecretRefParams{
+	if _, err := q.SetQMTenantSecretRef(ctx, db.SetQMTenantSecretRefParams{
 		TenantID: tenant.ID, Name: "database_url", SecretRef: secretRef,
 	}); err != nil {
 		t.Fatalf("set secret ref: %v", err)
@@ -548,7 +549,7 @@ func TestQMAPI_RetiredTenantRefusesChildWrites(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedQMTeamAndKey(t)
 	conn := connectAsQMAPI(t)
-	tx, q := scopedQMTx(t, conn, teamID)
+	_, q := scopedQMTx(t, conn, teamID)
 	tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
 	if err != nil {
 		t.Fatalf("create tenant: %v", err)
@@ -556,24 +557,245 @@ func TestQMAPI_RetiredTenantRefusesChildWrites(t *testing.T) {
 	if _, err := q.InsertQMTenantEvent(ctx, db.InsertQMTenantEventParams{TenantID: tenant.ID, Step: "database", Status: "ok"}); err != nil {
 		t.Fatalf("event on a live tenant: %v", err)
 	}
+	if _, err := q.SetQMTenantSecretRef(ctx, db.SetQMTenantSecretRefParams{TenantID: tenant.ID, Name: "database_url", SecretRef: "projects/p/secrets/db"}); err != nil {
+		t.Fatalf("secret ref on a live tenant: %v", err)
+	}
 	if _, err := q.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenant.ID, TeamID: teamID}); err != nil {
 		t.Fatalf("soft delete: %v", err)
 	}
-	if _, err := q.InsertQMTenantEvent(ctx, db.InsertQMTenantEventParams{TenantID: tenant.ID, Step: "database", Status: "ok"}); pgErrCode(err) != pgInsufficientPriv {
-		t.Fatalf("event on a retired tenant: want %s, got err=%v", pgInsufficientPriv, err)
+	if _, err := q.InsertQMTenantEvent(ctx, db.InsertQMTenantEventParams{TenantID: tenant.ID, Step: "database", Status: "ok"}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("event on a retired tenant: want no rows, got err=%v", err)
 	}
-	if err := tx.Rollback(ctx); err != nil {
-		t.Fatalf("rollback: %v", err)
+	if _, err := q.SetQMTenantSecretRef(ctx, db.SetQMTenantSecretRefParams{TenantID: tenant.ID, Name: "late", SecretRef: "projects/p/secrets/late"}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("secret ref on a retired tenant: want no rows, got err=%v", err)
 	}
-	tx, q = scopedQMTx(t, conn, teamID)
-	tenant, err = q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if _, err := q.SetQMTenantSecretRef(ctx, db.SetQMTenantSecretRefParams{TenantID: tenant.ID, Name: "database_url", SecretRef: "projects/p/secrets/rotated"}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("secret ref rotation on a retired tenant: want no rows, got err=%v", err)
+	}
+	n, err := q.DeleteQMTenantSecretRef(ctx, db.DeleteQMTenantSecretRefParams{TenantID: tenant.ID, Name: "database_url"})
+	if err != nil || n != 0 {
+		t.Fatalf("secret ref delete on a retired tenant: want 0 rows, got n=%d err=%v", n, err)
+	}
+	events, err := q.ListQMTenantEvents(ctx, tenant.ID)
+	if err != nil || len(events) != 1 {
+		t.Fatalf("events after retirement: n=%d err=%v", len(events), err)
+	}
+	refs, err := q.ListQMTenantSecretRefs(ctx, tenant.ID)
+	if err != nil || len(refs) != 1 || refs[0].SecretRef != "projects/p/secrets/db" {
+		t.Fatalf("secret refs after retirement: %+v err=%v", refs, err)
+	}
+}
+
+// A retired tenant refuses child writes, but the policy that says so reads
+// the tenant on the statement's snapshot, so a write that overlaps
+// SoftDeleteQMTenant could pass it and commit after retirement, past team
+// migration's cutover sweep. The child-write queries close that window by
+// locking the tenant row: retirement waits for a write that got there first,
+// and a write that arrives during retirement waits and then finds the
+// tenant retired. Both orderings run here against two real qm_api sessions.
+func TestQMAPI_ChildWritesSerializeWithRetirement(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedQMTeamAndKey(t)
+	retirer := connectAsQMAPI(t)
+	writer := connectAsQMAPI(t)
+
+	// Each write is one of the paths a retired tenant must refuse; the
+	// delete needs a ref to delete, so every tenant starts with one.
+	childWrites := []struct {
+		name  string
+		write func(q *db.Queries, tenantID uuid.UUID) error
+		// landed reports whether the write is visible to q, which must be
+		// able to see the tenant's rows (a scoped qm_api tx or testPool).
+		landed func(q rowQuerier, tenantID uuid.UUID) (bool, error)
+	}{
+		{
+			name: "event insert",
+			write: func(q *db.Queries, tenantID uuid.UUID) error {
+				_, err := q.InsertQMTenantEvent(ctx, db.InsertQMTenantEventParams{TenantID: tenantID, Step: "deploy", Status: "ok"})
+				return err
+			},
+			landed: func(q rowQuerier, tenantID uuid.UUID) (bool, error) {
+				var n int
+				err := q.QueryRow(ctx, `SELECT count(*) FROM qm.tenant_events WHERE tenant_id = $1`, tenantID).Scan(&n)
+				return n == 1, err
+			},
+		},
+		{
+			name: "secret ref upsert",
+			write: func(q *db.Queries, tenantID uuid.UUID) error {
+				_, err := q.SetQMTenantSecretRef(ctx, db.SetQMTenantSecretRefParams{TenantID: tenantID, Name: "database_url", SecretRef: "projects/p/secrets/rotated"})
+				return err
+			},
+			landed: func(q rowQuerier, tenantID uuid.UUID) (bool, error) {
+				var ref string
+				err := q.QueryRow(ctx, `SELECT secret_ref FROM qm.tenant_secrets WHERE tenant_id = $1 AND name = 'database_url'`, tenantID).Scan(&ref)
+				return ref == "projects/p/secrets/rotated", err
+			},
+		},
+		{
+			name: "secret ref delete",
+			write: func(q *db.Queries, tenantID uuid.UUID) error {
+				n, err := q.DeleteQMTenantSecretRef(ctx, db.DeleteQMTenantSecretRefParams{TenantID: tenantID, Name: "database_url"})
+				if err == nil && n == 0 {
+					return pgx.ErrNoRows
+				}
+				return err
+			},
+			landed: func(q rowQuerier, tenantID uuid.UUID) (bool, error) {
+				var n int
+				err := q.QueryRow(ctx, `SELECT count(*) FROM qm.tenant_secrets WHERE tenant_id = $1 AND name = 'database_url'`, tenantID).Scan(&n)
+				return n == 0, err
+			},
+		},
+	}
+
+	newLiveTenant := func(t *testing.T) uuid.UUID {
+		t.Helper()
+		tx, q := scopedQMTx(t, retirer, teamID)
+		tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+		if err != nil {
+			t.Fatalf("create tenant: %v", err)
+		}
+		if _, err := q.SetQMTenantSecretRef(ctx, db.SetQMTenantSecretRefParams{TenantID: tenant.ID, Name: "database_url", SecretRef: "projects/p/secrets/db"}); err != nil {
+			t.Fatalf("seed secret ref: %v", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+		return tenant.ID
+	}
+
+	for _, cw := range childWrites {
+		t.Run(cw.name+" during retirement finds the tenant retired", func(t *testing.T) {
+			tenantID := newLiveTenant(t)
+			rtx, rq := scopedQMTx(t, retirer, teamID)
+			if _, err := rq.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenantID, TeamID: teamID}); err != nil {
+				t.Fatalf("soft delete: %v", err)
+			}
+
+			// Retirement holds the row lock uncommitted; the write must queue
+			// behind it rather than pass on its pre-retirement snapshot.
+			done := make(chan error, 1)
+			go func() {
+				tx, q, err := beginScopedQMTx(ctx, writer, teamID)
+				if err != nil {
+					done <- err
+					return
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				done <- cw.write(q, tenantID)
+			}()
+			waitForQMAPILockWait(t)
+			select {
+			case err := <-done:
+				t.Fatalf("write returned while retirement was uncommitted: err=%v", err)
+			default:
+			}
+
+			if err := rtx.Commit(ctx); err != nil {
+				t.Fatalf("commit retirement: %v", err)
+			}
+			if err := <-done; !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("write after retirement committed: want no rows, got err=%v", err)
+			}
+			if landed, err := cw.landed(testPool, tenantID); err != nil || landed {
+				t.Fatalf("write landed on a retired tenant: landed=%v err=%v", landed, err)
+			}
+		})
+
+		t.Run(cw.name+" before retirement commits first", func(t *testing.T) {
+			tenantID := newLiveTenant(t)
+			wtx, wq := scopedQMTx(t, writer, teamID)
+			if err := cw.write(wq, tenantID); err != nil {
+				t.Fatalf("write on a live tenant: %v", err)
+			}
+
+			// The write holds the row lock uncommitted; retirement must wait
+			// for it, so that any snapshot taken after the tenant reads as
+			// deleted (the cutover sweep's, in particular) includes the write.
+			type retired struct {
+				landed bool
+				err    error
+			}
+			done := make(chan retired, 1)
+			go func() {
+				tx, q, err := beginScopedQMTx(ctx, retirer, teamID)
+				if err != nil {
+					done <- retired{err: err}
+					return
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				if _, err := q.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenantID, TeamID: teamID}); err != nil {
+					done <- retired{err: err}
+					return
+				}
+				landed, err := cw.landed(tx, tenantID)
+				if err != nil {
+					done <- retired{err: err}
+					return
+				}
+				done <- retired{landed: landed, err: tx.Commit(ctx)}
+			}()
+			waitForQMAPILockWait(t)
+			select {
+			case r := <-done:
+				t.Fatalf("retirement returned while the write was uncommitted: %+v", r)
+			default:
+			}
+
+			if err := wtx.Commit(ctx); err != nil {
+				t.Fatalf("commit write: %v", err)
+			}
+			r := <-done
+			if r.err != nil {
+				t.Fatalf("retirement after the write committed: %v", r.err)
+			}
+			if !r.landed {
+				t.Fatalf("retirement's own transaction did not see the write it waited for")
+			}
+			var status string
+			if err := testPool.QueryRow(ctx, `SELECT status FROM qm.tenants WHERE id = $1`, tenantID).Scan(&status); err != nil || status != "deleted" {
+				t.Fatalf("tenant after both commits: status=%q err=%v", status, err)
+			}
+		})
+	}
+}
+
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// beginScopedQMTx is scopedQMTx for goroutines, which cannot fail the test
+// themselves.
+func beginScopedQMTx(ctx context.Context, conn *pgx.Conn, teamID uuid.UUID) (pgx.Tx, *db.Queries, error) {
+	tx, err := conn.Begin(ctx)
 	if err != nil {
-		t.Fatalf("create tenant again: %v", err)
+		return nil, nil, err
 	}
-	if _, err := q.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenant.ID, TeamID: teamID}); err != nil {
-		t.Fatalf("soft delete again: %v", err)
+	q := db.New(tx)
+	if err := q.SetQMTeamScope(ctx, teamID.String()); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, nil, err
 	}
-	if err := q.SetQMTenantSecretRef(ctx, db.SetQMTenantSecretRefParams{TenantID: tenant.ID, Name: "late", SecretRef: "projects/p/secrets/late"}); pgErrCode(err) != pgInsufficientPriv {
-		t.Fatalf("secret ref on a retired tenant: want %s, got err=%v", pgInsufficientPriv, err)
+	return tx, q, nil
+}
+
+// waitForQMAPILockWait returns once a qm_api backend is waiting on a
+// heavyweight lock, so a test can assert on ordering without a sleep.
+func waitForQMAPILockWait(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting int
+		if err := testPool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_stat_activity WHERE usename = 'qm_api' AND wait_event_type = 'Lock'`).Scan(&waiting); err != nil {
+			t.Fatalf("poll pg_stat_activity: %v", err)
+		}
+		if waiting > 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatal("no qm_api session blocked on a lock within the deadline")
 }

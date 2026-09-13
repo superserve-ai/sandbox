@@ -69,19 +69,27 @@ func (q *Queries) CreateQMTenant(ctx context.Context, arg CreateQMTenantParams) 
 	return i, err
 }
 
-const deleteQMTenantSecretRef = `-- name: DeleteQMTenantSecretRef :exec
+const deleteQMTenantSecretRef = `-- name: DeleteQMTenantSecretRef :execrows
 DELETE FROM qm.tenant_secrets
-WHERE tenant_id = $1 AND name = $2
+WHERE name = $1 AND tenant_id = (
+    SELECT id FROM qm.tenants WHERE id = $2 AND status <> 'deleted' FOR SHARE
+)
 `
 
 type DeleteQMTenantSecretRefParams struct {
-	TenantID uuid.UUID `json:"tenant_id"`
 	Name     string    `json:"name"`
+	TenantID uuid.UUID `json:"tenant_id"`
 }
 
-func (q *Queries) DeleteQMTenantSecretRef(ctx context.Context, arg DeleteQMTenantSecretRefParams) error {
-	_, err := q.db.Exec(ctx, deleteQMTenantSecretRef, arg.TenantID, arg.Name)
-	return err
+// Same share lock as SetQMTenantSecretRef: a retired tenant's secret
+// references are frozen, so team migration can treat its sweep of the
+// table as final. Zero rows means the tenant is retired or had no such ref.
+func (q *Queries) DeleteQMTenantSecretRef(ctx context.Context, arg DeleteQMTenantSecretRefParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteQMTenantSecretRef, arg.Name, arg.TenantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getQMTenant = `-- name: GetQMTenant :one
@@ -299,21 +307,30 @@ func (q *Queries) SetQMTeamScope(ctx context.Context, teamID string) error {
 	return err
 }
 
-const setQMTenantSecretRef = `-- name: SetQMTenantSecretRef :exec
+const setQMTenantSecretRef = `-- name: SetQMTenantSecretRef :one
 INSERT INTO qm.tenant_secrets (tenant_id, name, secret_ref)
-VALUES ($1, $2, $3)
+SELECT t.id, $1::text, $2::text
+FROM qm.tenants t
+WHERE t.id = $3 AND t.status <> 'deleted'
+FOR SHARE OF t
 ON CONFLICT (tenant_id, name) DO UPDATE SET secret_ref = EXCLUDED.secret_ref
+RETURNING tenant_id, name, secret_ref
 `
 
 type SetQMTenantSecretRefParams struct {
-	TenantID  uuid.UUID `json:"tenant_id"`
 	Name      string    `json:"name"`
 	SecretRef string    `json:"secret_ref"`
+	TenantID  uuid.UUID `json:"tenant_id"`
 }
 
-func (q *Queries) SetQMTenantSecretRef(ctx context.Context, arg SetQMTenantSecretRefParams) error {
-	_, err := q.db.Exec(ctx, setQMTenantSecretRef, arg.TenantID, arg.Name, arg.SecretRef)
-	return err
+// Holds a share lock on the tenant row so the upsert cannot commit after
+// SoftDeleteQMTenant (see InsertQMTenantEvent). No row means the tenant is
+// retired.
+func (q *Queries) SetQMTenantSecretRef(ctx context.Context, arg SetQMTenantSecretRefParams) (QmTenantSecret, error) {
+	row := q.db.QueryRow(ctx, setQMTenantSecretRef, arg.Name, arg.SecretRef, arg.TenantID)
+	var i QmTenantSecret
+	err := row.Scan(&i.TenantID, &i.Name, &i.SecretRef)
+	return i, err
 }
 
 const softDeleteQMTenant = `-- name: SoftDeleteQMTenant :one
@@ -328,6 +345,10 @@ type SoftDeleteQMTenantParams struct {
 	TeamID uuid.UUID `json:"team_id"`
 }
 
+// The UPDATE's row lock is what serializes retirement with the child-table
+// writes (InsertQMTenantEvent, SetQMTenantSecretRef, DeleteQMTenantSecretRef),
+// which each lock the tenant row before touching its children: once this
+// commits, no child write that saw the tenant live can still be in flight.
 func (q *Queries) SoftDeleteQMTenant(ctx context.Context, arg SoftDeleteQMTenantParams) (QmTenant, error) {
 	row := q.db.QueryRow(ctx, softDeleteQMTenant, arg.ID, arg.TeamID)
 	var i QmTenant
