@@ -187,6 +187,7 @@ WITH target_host AS MATERIALIZED (
   WHERE id = sqlc.arg('host_id')
     AND status IN ('active', 'draining')
     AND last_heartbeat_at IS NOT NULL
+    AND last_heartbeat_at > sqlc.arg('heartbeat_after')
   FOR SHARE
 )
 SELECT EXISTS (
@@ -219,6 +220,7 @@ WITH target_host AS MATERIALIZED (
   WHERE id = sqlc.arg('host_id')
     AND status IN ('active', 'draining')
     AND last_heartbeat_at IS NOT NULL
+    AND last_heartbeat_at > sqlc.arg('heartbeat_after')
 )
 SELECT
   EXISTS (

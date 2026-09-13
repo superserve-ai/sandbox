@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/singleflight"
 
@@ -167,7 +168,10 @@ func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabiliti
 	var row db.HostHasCapabilitiesUnlockedRow
 	var err error
 	if scope == ownerResumeCapabilities {
-		owner, ownerErr := h.DB.OwnerHasResumeCapabilitiesUnlocked(qctx, db.OwnerHasResumeCapabilitiesUnlockedParams(params))
+		owner, ownerErr := h.DB.OwnerHasResumeCapabilitiesUnlocked(qctx, db.OwnerHasResumeCapabilitiesUnlockedParams{
+			HostID: params.HostID, RequiredCapabilities: params.RequiredCapabilities,
+			HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},
+		})
 		row = db.HostHasCapabilitiesUnlockedRow(owner)
 		err = ownerErr
 	} else {

@@ -783,6 +783,7 @@ WITH target_host AS MATERIALIZED (
   WHERE id = $2
     AND status IN ('active', 'draining')
     AND last_heartbeat_at IS NOT NULL
+    AND last_heartbeat_at > $3
   FOR SHARE
 )
 SELECT EXISTS (
@@ -803,8 +804,9 @@ SELECT EXISTS (
 `
 
 type OwnerHasResumeCapabilitiesParams struct {
-	RequiredCapabilities []string `json:"required_capabilities"`
-	HostID               string   `json:"host_id"`
+	RequiredCapabilities []string           `json:"required_capabilities"`
+	HostID               string             `json:"host_id"`
+	HeartbeatAfter       pgtype.Timestamptz `json:"heartbeat_after"`
 }
 
 // Lock the recorded serving owner row whose heartbeat anchors this capability set.
@@ -812,7 +814,7 @@ type OwnerHasResumeCapabilitiesParams struct {
 // VMD delivery and commit, while the relational division below proves that
 // every requested capability belongs to that exact heartbeat.
 func (q *Queries) OwnerHasResumeCapabilities(ctx context.Context, arg OwnerHasResumeCapabilitiesParams) (bool, error) {
-	row := q.db.QueryRow(ctx, ownerHasResumeCapabilities, arg.RequiredCapabilities, arg.HostID)
+	row := q.db.QueryRow(ctx, ownerHasResumeCapabilities, arg.RequiredCapabilities, arg.HostID, arg.HeartbeatAfter)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -825,6 +827,7 @@ WITH target_host AS MATERIALIZED (
   WHERE id = $2
     AND status IN ('active', 'draining')
     AND last_heartbeat_at IS NOT NULL
+    AND last_heartbeat_at > $3
 )
 SELECT
   EXISTS (
@@ -846,8 +849,9 @@ SELECT
 `
 
 type OwnerHasResumeCapabilitiesUnlockedParams struct {
-	RequiredCapabilities []string `json:"required_capabilities"`
-	HostID               string   `json:"host_id"`
+	RequiredCapabilities []string           `json:"required_capabilities"`
+	HostID               string             `json:"host_id"`
+	HeartbeatAfter       pgtype.Timestamptz `json:"heartbeat_after"`
 }
 
 type OwnerHasResumeCapabilitiesUnlockedRow struct {
@@ -863,7 +867,7 @@ type OwnerHasResumeCapabilitiesUnlockedRow struct {
 // Also returns the host's VMD address (empty when the owner is not serving),
 // so the caller can record this read as the registry's address verification.
 func (q *Queries) OwnerHasResumeCapabilitiesUnlocked(ctx context.Context, arg OwnerHasResumeCapabilitiesUnlockedParams) (OwnerHasResumeCapabilitiesUnlockedRow, error) {
-	row := q.db.QueryRow(ctx, ownerHasResumeCapabilitiesUnlocked, arg.RequiredCapabilities, arg.HostID)
+	row := q.db.QueryRow(ctx, ownerHasResumeCapabilitiesUnlocked, arg.RequiredCapabilities, arg.HostID, arg.HeartbeatAfter)
 	var i OwnerHasResumeCapabilitiesUnlockedRow
 	err := row.Scan(&i.HasCapabilities, &i.VmdAddr)
 	return i, err

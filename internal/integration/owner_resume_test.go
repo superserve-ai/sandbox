@@ -6,6 +6,9 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -15,9 +18,10 @@ func TestIntegration_OwnerResumeCapabilities(t *testing.T) {
 	ctx := context.Background()
 	required := []string{preview.HostCapabilityPorts, preview.HostCapabilityPortAccess, preview.HostCapabilityPortTokens, preview.HostCapabilityPortBrowserAuth}
 	for _, state := range []string{"active", "draining", "provisioning", "unhealthy"} {
-		for _, freshness := range []string{"current", "missing", "stale", "one-stale", "null-heartbeat"} {
+		for _, freshness := range []string{"current", "missing", "stale", "one-stale", "null-heartbeat", "expired", "at-cutoff", "fresh-near-cutoff"} {
 			t.Run(state+"/"+freshness, func(t *testing.T) {
 				hostID := seedActivePreviewHost(t, required...)
+				cutoff := pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute).Truncate(time.Microsecond), Valid: true}
 				exec := func(sql string) {
 					t.Helper()
 					if _, err := testPool.Exec(ctx, sql, hostID); err != nil {
@@ -38,15 +42,23 @@ func TestIntegration_OwnerResumeCapabilities(t *testing.T) {
 					if _, err := testPool.Exec(ctx, `UPDATE host_capability SET heartbeat_at=heartbeat_at-interval '1 second' WHERE host_id=$1 AND capability=$2`, hostID, required[3]); err != nil {
 						t.Fatal(err)
 					}
+				case "expired", "at-cutoff", "fresh-near-cutoff":
+					heartbeat := cutoff.Time
+					if freshness == "expired" {
+						heartbeat = heartbeat.Add(-time.Second)
+					} else if freshness == "fresh-near-cutoff" {
+						heartbeat = heartbeat.Add(time.Second)
+					}
+					setOwnerHeartbeat(t, hostID, heartbeat)
 				case "null-heartbeat":
 					exec(`UPDATE host SET last_heartbeat_at=NULL WHERE id=$1`)
 				}
-				want := (state == "active" || state == "draining") && freshness == "current"
-				locked, err := testQueries.OwnerHasResumeCapabilities(ctx, db.OwnerHasResumeCapabilitiesParams{HostID: hostID, RequiredCapabilities: required})
+				want := (state == "active" || state == "draining") && (freshness == "current" || freshness == "fresh-near-cutoff")
+				locked, err := testQueries.OwnerHasResumeCapabilities(ctx, db.OwnerHasResumeCapabilitiesParams{HostID: hostID, RequiredCapabilities: required, HeartbeatAfter: cutoff})
 				if err != nil || locked != want {
 					t.Fatalf("locked=%v, err=%v, want %v", locked, err, want)
 				}
-				unlocked, err := testQueries.OwnerHasResumeCapabilitiesUnlocked(ctx, db.OwnerHasResumeCapabilitiesUnlockedParams{HostID: hostID, RequiredCapabilities: required})
+				unlocked, err := testQueries.OwnerHasResumeCapabilitiesUnlocked(ctx, db.OwnerHasResumeCapabilitiesUnlockedParams{HostID: hostID, RequiredCapabilities: required, HeartbeatAfter: cutoff})
 				if err != nil || unlocked.HasCapabilities != want {
 					t.Fatalf("unlocked=%+v, err=%v, want %v", unlocked, err, want)
 				}
@@ -54,7 +66,7 @@ func TestIntegration_OwnerResumeCapabilities(t *testing.T) {
 					t.Fatalf("owner address=%q", unlocked.VmdAddr)
 				}
 				active, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{HostID: hostID, RequiredCapabilities: required})
-				if err != nil || active != (state == "active" && freshness == "current") {
+				if err != nil || active != (state == "active" && (freshness == "current" || freshness == "expired" || freshness == "at-cutoff" || freshness == "fresh-near-cutoff")) {
 					t.Fatalf("active-only=%v, err=%v", active, err)
 				}
 				hosts, err := testQueries.ListActiveHosts(ctx)
@@ -76,13 +88,13 @@ func TestIntegration_OwnerResumeCapabilities(t *testing.T) {
 				for _, host := range loaded {
 					found = found || host.ID == hostID
 				}
-				if found != (state == "active" && freshness == "current") {
+				if found != (state == "active" && (freshness == "current" || freshness == "expired" || freshness == "at-cutoff" || freshness == "fresh-near-cutoff")) {
 					t.Fatalf("capability-gated placement includes owner=%v, status=%s, freshness=%s", found, state, freshness)
 				}
 			})
 		}
 	}
-	missing, err := testQueries.OwnerHasResumeCapabilities(ctx, db.OwnerHasResumeCapabilitiesParams{HostID: "missing-owner", RequiredCapabilities: required})
+	missing, err := testQueries.OwnerHasResumeCapabilities(ctx, db.OwnerHasResumeCapabilitiesParams{HostID: "missing-owner", RequiredCapabilities: required, HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true}})
 	if err != nil || missing {
 		t.Fatalf("missing owner=%v, err=%v", missing, err)
 	}
@@ -90,7 +102,7 @@ func TestIntegration_OwnerResumeCapabilities(t *testing.T) {
 
 func TestIntegration_ResumeSandbox_OwnerEligibility(t *testing.T) {
 	t.Setenv("HOST_CAPABILITY_CACHE_TTL", "0")
-	for _, state := range []string{"active", "draining", "provisioning", "unhealthy", "missing", "stale", "null-heartbeat"} {
+	for _, state := range []string{"active", "draining", "provisioning", "unhealthy", "missing", "stale", "null-heartbeat", "expired-active", "expired-draining"} {
 		t.Run(state, func(t *testing.T) {
 			ctx := context.Background()
 			teamID, key := seedTeamAndKey(t)
@@ -104,8 +116,14 @@ func TestIntegration_ResumeSandbox_OwnerEligibility(t *testing.T) {
 				t.Fatalf("pause=%d %s", w.Code, w.Body.String())
 			}
 			hostStatus := state
-			if state == "missing" || state == "stale" || state == "null-heartbeat" {
+			if state == "missing" || state == "stale" || state == "null-heartbeat" || state == "expired-draining" {
 				hostStatus = "draining"
+			}
+			if state == "expired-active" {
+				hostStatus = "active"
+			}
+			if state == "expired-active" || state == "expired-draining" {
+				setOwnerHeartbeat(t, owner, time.Now().Add(-3*time.Minute))
 			}
 			if _, err := testPool.Exec(ctx, `UPDATE host SET status=$2 WHERE id=$1`, owner, hostStatus); err != nil {
 				t.Fatal(err)
@@ -148,5 +166,16 @@ func TestIntegration_ResumeSandbox_OwnerEligibility(t *testing.T) {
 				t.Fatalf("owner/status=%s/%s, want %s/%s", sb.HostID, sb.Status, owner, wantStatus)
 			}
 		})
+	}
+}
+
+func setOwnerHeartbeat(t *testing.T, hostID string, heartbeat time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := testPool.Exec(ctx, `UPDATE host SET last_heartbeat_at=$2 WHERE id=$1`, hostID, heartbeat); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE host_capability SET heartbeat_at=$2 WHERE host_id=$1`, hostID, heartbeat); err != nil {
+		t.Fatal(err)
 	}
 }

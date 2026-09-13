@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
@@ -343,5 +344,43 @@ func TestHostCapCacheSeparatesOwnerResumeEligibility(t *testing.T) {
 	}
 	if len(registry.verified) != 1 || registry.verified[0] != "owner=192.0.2.1:50051" {
 		t.Fatalf("address verification=%v", registry.verified)
+	}
+}
+
+func TestOwnerResumeCapabilityHeartbeatCutoff(t *testing.T) {
+	for _, unlocked := range []bool{false, true} {
+		t.Run(fmt.Sprintf("unlocked=%v", unlocked), func(t *testing.T) {
+			before := time.Now().Add(-heartbeatTimeout)
+			reads := 0
+			h := &Handlers{DB: db.New(&mockDBTX{queryRowFn: func(_ context.Context, _ string, args ...any) pgx.Row {
+				reads++
+				cutoff, ok := args[2].(pgtype.Timestamptz)
+				if !ok || !cutoff.Valid || cutoff.Time.Before(before) || cutoff.Time.After(time.Now().Add(-heartbeatTimeout)) {
+					t.Fatalf("heartbeat cutoff=%+v, want current heartbeat timeout", args[2])
+				}
+				return &mockRow{scanFn: func(dest ...any) error {
+					*(dest[0].(*bool)) = false
+					if unlocked {
+						*(dest[1].(*string)) = ""
+					}
+					return nil
+				}}
+			}})}
+			registry := &verifyRecorder{}
+			h.Hosts = registry
+			if unlocked {
+				has, err := h.readHostCaps(context.Background(), db.HostHasCapabilitiesUnlockedParams{
+					HostID: "owner", RequiredCapabilities: previewBrowserCapabilities(),
+				}, ownerResumeCapabilities)
+				if err != nil || has {
+					t.Fatalf("capabilities=%v, err=%v, want rejection", has, err)
+				}
+			} else if err := validateOwnerResumeBrowserCapabilities(context.Background(), h.DB, "owner"); err == nil {
+				t.Fatal("expected owner capability rejection")
+			}
+			if reads != 1 || len(registry.verified) != 0 {
+				t.Fatalf("reads=%d, address verifications=%v", reads, registry.verified)
+			}
+		})
 	}
 }

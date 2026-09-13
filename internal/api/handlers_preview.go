@@ -297,6 +297,7 @@ func validateOwnerResumeBrowserCapabilities(ctx context.Context, q *db.Queries, 
 	capabilities := previewBrowserCapabilities()
 	ok, err := q.OwnerHasResumeCapabilities(ctx, db.OwnerHasResumeCapabilitiesParams{
 		HostID: hostID, RequiredCapabilities: capabilities,
+		HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},
 	})
 	if err != nil {
 		return err
