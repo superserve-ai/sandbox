@@ -20,12 +20,29 @@
 -- just the sandboxes it needs. The empty scope array does not help: ordinary
 -- keys are authorized from created_by, not from scopes.
 --
+-- The same root cause bites from the other direction too: because authority
+-- resolves through created_by, the key dies when its creator leaves the
+-- team. A stack that has run for months breaks over an offboarding weeks
+-- earlier, with nothing in the tenant to explain it. One fix answers both —
+-- a team-owned service principal rather than a member's.
+--
 -- Closing it means giving sandbox endpoints a permission of their own and
 -- enforcing it for the __qm_tenant__ key name, which is a change to the
 -- shared auth path every control-plane request takes and belongs in its own
--- review. Do not run tenants in production until it lands. A secondary
--- consequence to fix with it: a tenant whose creator leaves the team loses
--- the ability to create sandboxes.
+-- review. Do not issue a tenant key in production until it lands.
+--
+-- The hard part is not the enforcement, it is knowing what to enforce: the
+-- set of control-plane endpoints a tenant's QM actually calls has to be
+-- established by watching a live tenant, not inferred by reading either
+-- codebase. QM reaches sandboxes through several paths that are not obvious
+-- from the handlers here — create, connect, exec, pause and resume, the
+-- object store, the cron and webhook surfaces — and the two move
+-- independently. An allowlist read off the code is wrong in one of two
+-- ways: too narrow and every tenant breaks the first time a QM feature
+-- calls something nobody anticipated, which surfaces as a tenant outage
+-- long after the change; too broad and it is the appearance of a control
+-- without the control. Neither is better than this gap with a gate in front
+-- of it, which is why the work waits for a tenant to observe.
 --
 -- The key's name and its (empty) scopes are fixed here rather than passed
 -- in: a definer function that let its caller choose them would hand qm_api
