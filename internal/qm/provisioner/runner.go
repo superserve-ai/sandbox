@@ -31,13 +31,17 @@ type Runner struct {
 }
 
 // Run executes mode's plan for the tenant and returns the first step error,
-// ErrLocked when another run holds the tenant, or ErrTenantDeleted. The
-// tenant ends up ready (provision), deleted (deprovision) or failed.
+// ErrLocked when another run holds the tenant, ErrStaleRun when the tenant
+// has moved on, or ErrTenantDeleted.  The tenant ends up ready (provision),
+// deleted (deprovision) or failed.
+//
+// attempt is the seq of the intent event that queued this run; zero skips
+// the check, for an operator running the job by hand.
 //
 // A failed provision is left as-is for a retry to converge rather than
 // rolled back: every step is idempotent, and rolling back a half-built
 // stack on a transient error would turn one retry into a full rebuild.
-func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode) error {
+func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode, attempt int64) error {
 	log := r.Log.With().Str("tenant_id", tenantID.String()).Str("mode", string(mode)).Logger()
 
 	release, err := r.Store.Lock(ctx, teamID, tenantID)
@@ -79,6 +83,22 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode)
 	}
 	if err != nil {
 		return err
+	}
+	// Status alone cannot tell two attempts apart — a provision whose
+	// execution was delayed past the stale reclaim and the retry that
+	// replaced it are both 'provisioning' — so the run also has to be the
+	// one the newest intent event queued. An execution that arrives for a
+	// superseded attempt exits without taking the tenant away from the one
+	// that replaced it.
+	if attempt > 0 {
+		events, lerr := r.Store.ListEvents(ctx, teamID, tenantID)
+		if lerr != nil {
+			return lerr
+		}
+		if newest := newestAttempt(events); newest != attempt {
+			log.Info().Int64("attempt", attempt).Int64("newest", newest).Msg("a later attempt owns this tenant; exiting")
+			return fmt.Errorf("%w: queued as attempt %d, newest is %d", ErrStaleRun, attempt, newest)
+		}
 	}
 	tenant := NewTenant(row, r.Env, r.Store)
 
@@ -138,6 +158,21 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode)
 	}
 	r.record(dctx, tenant, RunStep, tenantstore.EventOK, "provision complete; tenant ready", nil)
 	return nil
+}
+
+// TriggerStep is the event step qm-api records a run's intent under; its
+// seq is the attempt identifier the job is started with.
+const TriggerStep = "trigger"
+
+// newestAttempt is the seq of the newest intent event, or 0 if there is none.
+func newestAttempt(events []tenantstore.Event) int64 {
+	var newest int64
+	for _, e := range events {
+		if e.Step == TriggerStep && e.Status == tenantstore.EventStarted && e.Seq > newest {
+			newest = e.Seq
+		}
+	}
+	return newest
 }
 
 func failureMessage(mode Mode, step string) string {

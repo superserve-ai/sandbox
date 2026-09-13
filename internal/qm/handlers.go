@@ -22,7 +22,9 @@ import (
 const (
 	// Event steps the API itself records, alongside the runner's.
 	stepModelKey = "model_key"
-	stepTrigger  = "trigger"
+	// stepTrigger is the provisioner's, since a run's intent event is what
+	// identifies the attempt the job is started for.
+	stepTrigger = provisioner.TriggerStep
 
 	// maxCreateBodyBytes caps the create body before it is decoded: every
 	// field is small (the model key, the largest, is capped at 4 KiB), so
@@ -509,7 +511,7 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 	// intent event it just recorded. Anything else writing the tenant
 	// (a stale reclaim and the retry behind it, say) moves the row past it.
 	mine := tenantstore.Version{UpdatedAt: updated.UpdatedAt, EventSeq: intent.Seq}
-	if err := h.Trigger.Trigger(ctx, updated.TeamID, updated.ID, mode); err != nil {
+	if err := h.Trigger.Trigger(ctx, updated.TeamID, updated.ID, mode, intent.Seq); err != nil {
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Str("mode", string(mode)).Msg("trigger provisioner run")
 		if errors.Is(err, provisioner.ErrTriggerRejected) {
 			h.failTenant(ctx, updated, mine, []string{inFlight}, stepTrigger, "The "+string(mode)+" run could not be started. Retry the tenant.", err, map[string]any{"mode": string(mode)})

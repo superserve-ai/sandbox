@@ -333,7 +333,7 @@ func TestQMAPI_StubRunnerAgainstPostgres(t *testing.T) {
 		Steps: steps.All(steps.Clients{Secrets: fake}),
 		Log:   zerolog.Nop(),
 	}
-	if err := runner.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision); err != nil {
+	if err := runner.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision, 0); err != nil {
 		t.Fatalf("provision: %v", err)
 	}
 	row, err := store.GetTenant(ctx, teamID, tenant.ID)
@@ -347,7 +347,7 @@ func TestQMAPI_StubRunnerAgainstPostgres(t *testing.T) {
 	if _, err := store.SetStatus(ctx, teamID, tenant.ID, tenantstore.StatusDeprovisioning); err != nil {
 		t.Fatal(err)
 	}
-	if err := runner.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision); err != nil {
+	if err := runner.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision, 0); err != nil {
 		t.Fatalf("deprovision: %v", err)
 	}
 	row, _ = store.GetTenant(ctx, teamID, tenant.ID)

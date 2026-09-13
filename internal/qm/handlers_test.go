@@ -309,8 +309,14 @@ func TestCreateTenant(t *testing.T) {
 	if len(refs) != 1 || refs[0].Name != "ANTHROPIC_API_KEY" {
 		t.Errorf("secret refs = %+v", refs)
 	}
-	if len(f.trigger.Calls) != 1 || f.trigger.Calls[0] != (provisioner.TriggerCall{TeamID: f.teamA, TenantID: id, Mode: provisioner.ModeProvision}) {
+	// The attempt is the seq of the intent event this run was queued by, so
+	// the job can refuse a tenant a later attempt has taken over.
+	if len(f.trigger.Calls) != 1 || f.trigger.Calls[0] != (provisioner.TriggerCall{TeamID: f.teamA, TenantID: id, Mode: provisioner.ModeProvision, Attempt: 2}) {
 		t.Errorf("trigger calls = %+v", f.trigger.Calls)
+	}
+	intent := eventsOfStep(t, f, id, stepTrigger, tenantstore.EventStarted)
+	if len(intent) != 1 || intent[0].Seq != f.trigger.Calls[0].Attempt {
+		t.Errorf("attempt %d does not name the intent event %+v", f.trigger.Calls[0].Attempt, intent)
 	}
 	events, _ := f.store.ListEvents(context.Background(), f.teamA, id)
 	var steps []string
@@ -1132,4 +1138,19 @@ func (s *overtakingStore) Lock(ctx context.Context, teamID, tenantID uuid.UUID) 
 		return nil, errors.New("database unavailable")
 	}
 	return s.Memory.Lock(ctx, teamID, tenantID)
+}
+
+func eventsOfStep(t *testing.T, f *fixture, tenantID uuid.UUID, step, status string) []tenantstore.Event {
+	t.Helper()
+	all, err := f.store.ListEvents(context.Background(), f.teamA, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []tenantstore.Event
+	for _, e := range all {
+		if e.Step == step && e.Status == status {
+			out = append(out, e)
+		}
+	}
+	return out
 }

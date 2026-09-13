@@ -159,6 +159,10 @@ func (m *Memory) TransitionStatus(_ context.Context, teamID, tenantID uuid.UUID,
 	if m.Fail != nil {
 		return Tenant{}, m.Fail
 	}
+	return m.transitionLocked(teamID, tenantID, from, to)
+}
+
+func (m *Memory) transitionLocked(teamID, tenantID uuid.UUID, from []string, to string) (Tenant, error) {
 	if m.BeforeSetStatus != nil {
 		if err := m.BeforeSetStatus(to); err != nil {
 			return Tenant{}, err
@@ -176,17 +180,19 @@ func (m *Memory) TransitionStatus(_ context.Context, teamID, tenantID uuid.UUID,
 	return *t, nil
 }
 
-func (m *Memory) TransitionStatusIfUnchanged(ctx context.Context, teamID, tenantID uuid.UUID, from []string, to string, at Version) (Tenant, error) {
+func (m *Memory) TransitionStatusIfUnchanged(_ context.Context, teamID, tenantID uuid.UUID, from []string, to string, at Version) (Tenant, error) {
 	m.mu.Lock()
-	if m.Fail == nil {
-		t, err := m.scoped(teamID, tenantID)
-		if err == nil && (!t.UpdatedAt.Equal(at.UpdatedAt) || t.EventSeq != at.EventSeq) {
-			m.mu.Unlock()
-			return Tenant{}, ErrStatusConflict
-		}
+	defer m.mu.Unlock()
+	// One critical section, as the Postgres statement is one: a check that
+	// released the lock before the write would let a concurrent write slip
+	// between them and pass on the status alone.
+	if m.Fail != nil {
+		return Tenant{}, m.Fail
 	}
-	m.mu.Unlock()
-	return m.TransitionStatus(ctx, teamID, tenantID, from, to)
+	if t, err := m.scoped(teamID, tenantID); err == nil && (!t.UpdatedAt.Equal(at.UpdatedAt) || t.EventSeq != at.EventSeq) {
+		return Tenant{}, ErrStatusConflict
+	}
+	return m.transitionLocked(teamID, tenantID, from, to)
 }
 
 func (m *Memory) UpdateResources(_ context.Context, teamID, tenantID uuid.UUID, r Resources) (Tenant, error) {

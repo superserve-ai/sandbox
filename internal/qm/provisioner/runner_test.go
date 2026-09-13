@@ -94,7 +94,7 @@ func (h *harness) queue(t *testing.T, mode Mode) {
 func (h *harness) run(t *testing.T, r *Runner, mode Mode) error {
 	t.Helper()
 	h.queue(t, mode)
-	return r.Run(context.Background(), h.teamID, h.tenant.ID, mode)
+	return r.Run(context.Background(), h.teamID, h.tenant.ID, mode, 0)
 }
 
 func (h *harness) status(t *testing.T) string {
@@ -227,11 +227,11 @@ func TestRunnerConcurrentRunExitsImmediately(t *testing.T) {
 	r := h.runner(blocking)
 
 	first := make(chan error, 1)
-	go func() { first <- r.Run(context.Background(), h.teamID, h.tenant.ID, ModeProvision) }()
+	go func() { first <- r.Run(context.Background(), h.teamID, h.tenant.ID, ModeProvision, 0) }()
 	<-entered
 
 	done := make(chan error, 1)
-	go func() { done <- r.Run(context.Background(), h.teamID, h.tenant.ID, ModeProvision) }()
+	go func() { done <- r.Run(context.Background(), h.teamID, h.tenant.ID, ModeProvision, 0) }()
 	select {
 	case err := <-done:
 		if !errors.Is(err, tenantstore.ErrLocked) {
@@ -310,7 +310,7 @@ func TestRunnerDeprovisionRunsRollbacksInReverse(t *testing.T) {
 	if a.count() != 1 || a.rollbacks != 1 {
 		t.Errorf("a runs=%d rollbacks=%d", a.count(), a.rollbacks)
 	}
-	if err := r.Run(context.Background(), h.teamID, h.tenant.ID, ModeProvision); !errors.Is(err, ErrTenantDeleted) {
+	if err := r.Run(context.Background(), h.teamID, h.tenant.ID, ModeProvision, 0); !errors.Is(err, ErrTenantDeleted) {
 		t.Errorf("run on deleted tenant err = %v", err)
 	}
 	if _, err := h.store.ListTenants(context.Background(), h.teamID); err != nil {
@@ -432,7 +432,7 @@ func TestRunnerRecordsUnderCancelledContext(t *testing.T) {
 		cancel()
 		return ctx.Err()
 	}}
-	if err := h.runner(step).Run(ctx, h.teamID, h.tenant.ID, ModeProvision); !errors.Is(err, context.Canceled) {
+	if err := h.runner(step).Run(ctx, h.teamID, h.tenant.ID, ModeProvision, 0); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v", err)
 	}
 	if got := h.status(t); got != tenantstore.StatusFailed {
@@ -452,7 +452,7 @@ func TestRunnerRejectsStaleExecution(t *testing.T) {
 	r := h.runner(step)
 	// Delete requested while a provision execution was still queued.
 	h.queue(t, ModeDeprovision)
-	err := r.Run(context.Background(), h.teamID, h.tenant.ID, ModeProvision)
+	err := r.Run(context.Background(), h.teamID, h.tenant.ID, ModeProvision, 0)
 	if !errors.Is(err, ErrStaleRun) {
 		t.Fatalf("err = %v, want ErrStaleRun", err)
 	}
@@ -466,7 +466,7 @@ func TestRunnerRejectsStaleExecution(t *testing.T) {
 	if _, err := h.store.SetStatus(context.Background(), h.teamID, h.tenant.ID, tenantstore.StatusFailed); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Run(context.Background(), h.teamID, h.tenant.ID, ModeDeprovision); !errors.Is(err, ErrStaleRun) {
+	if err := r.Run(context.Background(), h.teamID, h.tenant.ID, ModeDeprovision, 0); !errors.Is(err, ErrStaleRun) {
 		t.Errorf("run from failed without re-queue: err = %v", err)
 	}
 }
@@ -516,7 +516,7 @@ func TestRunnerMarksFailedEvenWhenEventsCannotBeWritten(t *testing.T) {
 	r := &Runner{Store: store, Env: Env{BaseDomain: "qm.example.com", Stub: true}, Steps: []Step{a, b}, Log: zerolog.Nop()}
 	h.queue(t, ModeProvision)
 	store.refuse = true
-	if err := r.Run(context.Background(), h.teamID, h.tenant.ID, ModeProvision); err == nil {
+	if err := r.Run(context.Background(), h.teamID, h.tenant.ID, ModeProvision, 0); err == nil {
 		t.Fatal("run reported success")
 	}
 	if got := h.status(t); got != tenantstore.StatusFailed {
@@ -539,4 +539,50 @@ func (s *eventRefusingStore) InsertEvent(ctx context.Context, teamID uuid.UUID, 
 		return tenantstore.Event{}, errors.New("database unavailable")
 	}
 	return s.Memory.InsertEvent(ctx, teamID, p)
+}
+
+// An execution delayed past the stale reclaim can arrive after a retry has
+// queued a fresh attempt in the same mode. Status alone cannot tell the two
+// apart, so the run is bound to the intent event that queued it and the
+// superseded execution exits without taking the tenant from its successor.
+func TestRunnerRefusesASupersededAttempt(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	queue := func() int64 {
+		t.Helper()
+		e, err := h.store.InsertEvent(ctx, h.teamID, tenantstore.EventParams{
+			TenantID: h.tenant.ID, Step: TriggerStep, Status: tenantstore.EventStarted, Message: "provision run requested",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e.Seq
+	}
+	first := queue()
+	second := queue()
+
+	a := &fakeStep{name: "a"}
+	r := h.runner(a)
+	h.queue(t, ModeProvision)
+	if err := r.Run(ctx, h.teamID, h.tenant.ID, ModeProvision, first); !errors.Is(err, ErrStaleRun) {
+		t.Fatalf("superseded attempt: err = %v, want a stale run", err)
+	}
+	if a.count() != 0 {
+		t.Error("a superseded execution ran the plan")
+	}
+	if got := h.status(t); got != tenantstore.StatusProvisioning {
+		t.Errorf("status = %s, want the successor left queued", got)
+	}
+
+	if err := r.Run(ctx, h.teamID, h.tenant.ID, ModeProvision, second); err != nil {
+		t.Fatalf("newest attempt: %v", err)
+	}
+	if got := h.status(t); got != tenantstore.StatusReady {
+		t.Errorf("status = %s", got)
+	}
+	// Zero is an operator running the job by hand: no attempt to check.
+	h.queue(t, ModeProvision)
+	if err := r.Run(ctx, h.teamID, h.tenant.ID, ModeProvision, 0); err != nil {
+		t.Fatalf("unchecked attempt: %v", err)
+	}
 }

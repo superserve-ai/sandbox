@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/google/uuid"
 	"google.golang.org/api/googleapi"
@@ -35,14 +36,17 @@ func NewCloudRunJob(ctx context.Context, project, region, job string, opts ...op
 
 // JobArgs is the argument vector the job runs with; the provision
 // subcommand in cmd/qm-api parses exactly this.
-func JobArgs(teamID, tenantID uuid.UUID, mode Mode) []string {
-	return []string{"provision", "--team", teamID.String(), "--tenant", tenantID.String(), "--mode", string(mode)}
+func JobArgs(teamID, tenantID uuid.UUID, mode Mode, attempt int64) []string {
+	return []string{
+		"provision", "--team", teamID.String(), "--tenant", tenantID.String(),
+		"--mode", string(mode), "--attempt", strconv.FormatInt(attempt, 10),
+	}
 }
 
-func (c *CloudRunJob) Trigger(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode) error {
+func (c *CloudRunJob) Trigger(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode, attempt int64) error {
 	req := &run.GoogleCloudRunV2RunJobRequest{
 		Overrides: &run.GoogleCloudRunV2Overrides{
-			ContainerOverrides: []*run.GoogleCloudRunV2ContainerOverride{{Args: JobArgs(teamID, tenantID, mode)}},
+			ContainerOverrides: []*run.GoogleCloudRunV2ContainerOverride{{Args: JobArgs(teamID, tenantID, mode, attempt)}},
 		},
 	}
 	if _, err := c.svc.Projects.Locations.Jobs.Run(c.name, req).Context(ctx).Do(); err != nil {

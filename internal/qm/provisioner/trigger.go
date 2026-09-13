@@ -11,13 +11,15 @@ import (
 
 // Trigger starts a provisioner run for a tenant without doing the work in
 // the caller's request. Only identifiers travel: the model key is already
-// in Secret Manager by the time a run is triggered.
+// in Secret Manager by the time a run is triggered. attempt is the seq of
+// the intent event that queued the run, which the runner checks so an
+// execution cannot pick up a tenant a later attempt now owns.
 //
 // An error wrapping ErrTriggerRejected means the run was definitely not
 // started; any other error is ambiguous (a timeout after the request was
 // accepted, say) and callers must assume a run may be under way.
 type Trigger interface {
-	Trigger(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode) error
+	Trigger(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode, attempt int64) error
 }
 
 // ErrTriggerRejected marks a definitive refusal to start a run.
@@ -31,12 +33,12 @@ type InProcess struct {
 	wg     sync.WaitGroup
 }
 
-func (p *InProcess) Trigger(_ context.Context, teamID, tenantID uuid.UUID, mode Mode) error {
+func (p *InProcess) Trigger(_ context.Context, teamID, tenantID uuid.UUID, mode Mode, attempt int64) error {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
 		// Detached from the request: the run outlives the HTTP response.
-		if err := p.Runner.Run(context.Background(), teamID, tenantID, mode); err != nil {
+		if err := p.Runner.Run(context.Background(), teamID, tenantID, mode, attempt); err != nil {
 			p.Log.Warn().Str("error", ScrubString(err.Error())).Str("tenant_id", tenantID.String()).Str("mode", string(mode)).Msg("in-process run ended with error")
 		}
 	}()
@@ -61,14 +63,15 @@ type TriggerCall struct {
 	TeamID   uuid.UUID
 	TenantID uuid.UUID
 	Mode     Mode
+	Attempt  int64
 }
 
-func (r *Recorder) Trigger(_ context.Context, teamID, tenantID uuid.UUID, mode Mode) error {
+func (r *Recorder) Trigger(_ context.Context, teamID, tenantID uuid.UUID, mode Mode, attempt int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.Err != nil {
 		return r.Err
 	}
-	r.Calls = append(r.Calls, TriggerCall{TeamID: teamID, TenantID: tenantID, Mode: mode})
+	r.Calls = append(r.Calls, TriggerCall{TeamID: teamID, TenantID: tenantID, Mode: mode, Attempt: attempt})
 	return nil
 }

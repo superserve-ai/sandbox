@@ -68,7 +68,7 @@ func TestStubPlanProvisionsAndDeprovisions(t *testing.T) {
 	ctx := context.Background()
 	r, store, fake, teamID, tenant := newRunner(t, true)
 
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision); err != nil {
+	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision, 0); err != nil {
 		t.Fatal(err)
 	}
 	row, _ := store.GetTenant(ctx, teamID, tenant.ID)
@@ -99,7 +99,7 @@ func TestStubPlanProvisionsAndDeprovisions(t *testing.T) {
 	}
 
 	// A second provision run converges without re-creating anything.
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision); err != nil {
+	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision, 0); err != nil {
 		t.Fatal(err)
 	}
 	events, _ := store.ListEvents(ctx, teamID, tenant.ID)
@@ -121,7 +121,7 @@ func TestStubPlanProvisionsAndDeprovisions(t *testing.T) {
 	}
 
 	store.SetStatus(ctx, teamID, tenant.ID, tenantstore.StatusDeprovisioning)
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision); err != nil {
+	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision, 0); err != nil {
 		t.Fatal(err)
 	}
 	row, _ = store.GetTenant(ctx, teamID, tenant.ID)
@@ -139,7 +139,7 @@ func TestStubPlanProvisionsAndDeprovisions(t *testing.T) {
 func TestRealModeStopsAtFirstUnimplementedStep(t *testing.T) {
 	ctx := context.Background()
 	r, store, _, teamID, tenant := newRunner(t, false)
-	err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision)
+	err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision, 0)
 	if !errors.Is(err, provisioner.ErrNotImplemented) {
 		t.Fatalf("err = %v", err)
 	}
@@ -166,7 +166,7 @@ func TestDeprovisionDeletesUnreferencedModelKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.SetStatus(ctx, teamID, tenant.ID, tenantstore.StatusDeprovisioning)
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision); err != nil {
+	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision, 0); err != nil {
 		t.Fatal(err)
 	}
 	if fake.Has("qm-pilot-team-ANTHROPIC_API_KEY") {
@@ -210,7 +210,7 @@ func TestDeprovisionRevokesTheSandboxKey(t *testing.T) {
 	if _, err := store.UpdateResources(ctx, teamID, tenant.ID, tenantstore.Resources{SandboxAPIKeyID: &keyID}); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision); err != nil {
+	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision, 0); err != nil {
 		t.Fatal(err)
 	}
 	if store.RevokedKeys[keyID] {
@@ -220,7 +220,7 @@ func TestDeprovisionRevokesTheSandboxKey(t *testing.T) {
 	if _, err := store.SetStatus(ctx, teamID, tenant.ID, tenantstore.StatusDeprovisioning); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision); err != nil {
+	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision, 0); err != nil {
 		t.Fatal(err)
 	}
 	if !store.RevokedKeys[keyID] {
@@ -232,7 +232,7 @@ func TestDeprovisionRevokesTheSandboxKey(t *testing.T) {
 	if _, err := store2.SetStatus(ctx, team2, tenant2.ID, tenantstore.StatusDeprovisioning); err != nil {
 		t.Fatal(err)
 	}
-	if err := r2.Run(ctx, team2, tenant2.ID, provisioner.ModeDeprovision); err != nil {
+	if err := r2.Run(ctx, team2, tenant2.ID, provisioner.ModeDeprovision, 0); err != nil {
 		t.Fatal(err)
 	}
 	events, _ := store2.ListEvents(ctx, team2, tenant2.ID)

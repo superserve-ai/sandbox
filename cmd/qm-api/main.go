@@ -2,7 +2,7 @@
 // runs the tenant provisioner:
 //
 //	qm-api                       serve /v1/qm (default)
-//	qm-api provision --team T --tenant ID --mode provision|deprovision
+//	qm-api provision --team T --tenant ID --mode provision|deprovision [--attempt N]
 //
 // Both modes read the same environment; see internal/qm.LoadConfig.
 package main
@@ -236,6 +236,9 @@ func runProvision(args []string) error {
 	teamArg := fs.String("team", "", "team id the tenant belongs to")
 	tenantArg := fs.String("tenant", "", "tenant id")
 	modeArg := fs.String("mode", string(provisioner.ModeProvision), "provision or deprovision")
+	// The seq of the intent event that queued this run. qm-api always sends
+	// it; 0 (the default) skips the check, for running the job by hand.
+	attemptArg := fs.Int64("attempt", 0, "seq of the intent event this run was queued by")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -273,7 +276,7 @@ func runProvision(args []string) error {
 	}
 	defer sentry.Flush(2 * time.Second)
 
-	err = d.runner.Run(ctx, teamID, tenantID, mode)
+	err = d.runner.Run(ctx, teamID, tenantID, mode, *attemptArg)
 	switch {
 	case err == nil:
 		log.Info().Str("tenant_id", tenantID.String()).Str("mode", string(mode)).Msg("run complete")
