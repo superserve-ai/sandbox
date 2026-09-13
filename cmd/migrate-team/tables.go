@@ -79,17 +79,33 @@ var membershipTables = map[string]bool{
 // right before detach severs the source (and before a non-detached purge
 // deletes it): rows that async writers landed after validate, which no
 // earlier pass could see. Parents precede children so the upserts satisfy
-// the dest's foreign keys. qm.tenants is here for the tenant that was
-// admitted after validate and retired before the cutover lock: it is invisible
-// to the live-tenant recheck by then, yet its row (and the slug it reserves)
-// still has to reach the dest ahead of its events and secret references.
-// api_key precedes it because such a tenant's sandbox key was minted after
-// validate too, and the tenant row carries a foreign key to it.
+// the dest's foreign keys. profile is first: the initial copy's profileScope
+// was evaluated at copy time, so a straggler activity row, API key, or QM
+// tenant created by a profile that was not yet a scoped actor back then
+// would otherwise hit a missing-parent FK when its own row sweeps in. qm.
+// tenants follows api_key for the tenant that was admitted after validate
+// and retired before the cutover lock: it is invisible to the live-tenant
+// recheck by then, yet its row (and the slug it reserves) still has to reach
+// the dest ahead of its events and secret references. api_key precedes it
+// because such a tenant's sandbox key was minted after validate too, and the
+// tenant row carries a foreign key to it.
 var cutoverSweepTables = []string{
+	"profile",
 	"activity", "sandbox_revocation", "revoked_proxy_token",
 	"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
 	"api_key", "qm.tenants", "qm.tenant_events", "qm.tenant_secrets",
 }
+
+// cutoverProfileScope is profile's cutover-sweep scope: every profile a
+// straggler row in this transaction's own view of the sweep's other tables
+// references, re-evaluated fresh rather than reused from the copy-time
+// profileScope. Over-sweeping an already-copied profile is a harmless
+// ON CONFLICT DO NOTHING; the failure mode this closes is under-sweeping one.
+const cutoverProfileScope = `id IN (
+	SELECT actor_id FROM activity WHERE team_id = $1 AND actor_id IS NOT NULL
+	UNION SELECT created_by FROM api_key WHERE team_id = $1 AND created_by IS NOT NULL
+	UNION SELECT created_by FROM qm.tenants WHERE team_id = $1 AND created_by IS NOT NULL
+)`
 
 // sweepScopes narrows a table for the cutover sweep, whose job is smaller
 // than the full copy's: carry the stragglers, and the parents they need, and
@@ -97,6 +113,7 @@ var cutoverSweepTables = []string{
 // the sweep stays a foreign-key fixup rather than a second path for copying
 // the team's keys — copy already decides which of those may cross cells.
 var sweepScopes = map[string]string{
+	"profile": cutoverProfileScope,
 	"api_key": `team_id = $1 AND id IN (
 		SELECT sandbox_api_key_id FROM qm.tenants
 		WHERE team_id = $1 AND sandbox_api_key_id IS NOT NULL

@@ -982,6 +982,61 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("straggler sweep carries the creator profile of a late tenant and key", func(t *testing.T) {
+		// A profile that joined the team after the copy-time profileScope ran
+		// is invisible to the initial profile copy. If that profile then
+		// creates an API key and a hosted-QM tenant before the cutover lock,
+		// the api_key/qm.tenants rows the sweep carries reference a profile
+		// the dest has never seen; profile must sweep first or the FK on
+		// either row fails.
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		lateProfile, lateKey, lateTenant := uuid.New(), uuid.New(), uuid.New()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO profile (id, email, provider, provider_id)
+			VALUES ($1, 'late-joiner@example.com', 'google', 'google-late-joiner')`, lateProfile); err != nil {
+			t.Fatalf("late profile insert: %v", err)
+		}
+		defer mustExec(t, dstPool, `DELETE FROM profile WHERE id = $1`, lateProfile)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO api_key (id, team_id, key_hash, name, created_by)
+			VALUES ($1, $2, 'hash-'||gen_random_uuid()::text, 'qm-late-joiner', $3)`, lateKey, f.team, lateProfile); err != nil {
+			t.Fatalf("late key insert: %v", err)
+		}
+		defer mustExec(t, dstPool, `DELETE FROM api_key WHERE id = $1`, lateKey)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, sandbox_api_key_id, created_by)
+			VALUES ($1, $2, 'late-joiner', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic', $3, $4)`,
+			lateTenant, f.team, lateKey, lateProfile); err != nil {
+			t.Fatalf("late tenant insert: %v", err)
+		}
+		defer mustExec(t, dstPool, `DELETE FROM qm.tenants WHERE id = $1`, lateTenant)
+
+		for _, name := range cutoverSweepTables {
+			spec, ok := sweepSpec(name)
+			if !ok {
+				t.Fatalf("%s spec missing", name)
+			}
+			if _, _, err := copyTable(ctx, tx, dstPool, spec, f.team, nil); err != nil {
+				t.Fatalf("sweep %s: %v", name, err)
+			}
+		}
+		var profileRows int
+		if err := dstPool.QueryRow(ctx, `SELECT count(*) FROM profile WHERE id = $1`, lateProfile).Scan(&profileRows); err != nil || profileRows != 1 {
+			t.Fatalf("late joiner's profile not swept to dest (n=%d, err=%v)", profileRows, err)
+		}
+		var keyCreator, tenantCreator uuid.UUID
+		if err := dstPool.QueryRow(ctx, `SELECT created_by FROM api_key WHERE id = $1`, lateKey).Scan(&keyCreator); err != nil || keyCreator != lateProfile {
+			t.Fatalf("late key's creator not preserved: creator=%s err=%v", keyCreator, err)
+		}
+		if err := dstPool.QueryRow(ctx, `SELECT created_by FROM qm.tenants WHERE id = $1`, lateTenant).Scan(&tenantCreator); err != nil || tenantCreator != lateProfile {
+			t.Fatalf("late tenant's creator not preserved: creator=%s err=%v", tenantCreator, err)
+		}
+	})
+
 	t.Run("purge refuses when a build starts during validate", func(t *testing.T) {
 		buildID := uuid.New()
 		mustExec(t, srcPool, `
