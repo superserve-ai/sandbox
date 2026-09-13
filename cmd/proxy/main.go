@@ -161,20 +161,25 @@ func main() {
 		}
 	}
 
-	// Health check for the GCP LB and VMD's end-to-end capability probe.
-	// It only responds on non-sandbox hosts so the boxd-label lockdown isn't
-	// bypassed.
-	peerTLS, peers, err := newOutboundPeerTransport(log, peerTelemetry)
-	if err != nil {
-		log.Fatal().Err(err).Msg("invalid peer client credentials")
+	// Legacy hosts can keep serving local traffic during the staged peer rollout.
+	// Credentials become mandatory as soon as this host either accepts peer ingress
+	// or participates in outbound ownership routing.
+	peerAddr := os.Getenv("PEER_PROXY_LISTEN_ADDR")
+	var peerTLS proxy.PeerTLSConfig
+	var peers proxy.PeerTransport
+	if peerTransportRequired(routingEnabled, peerAddr) {
+		peerTLS, peers, err = newOutboundPeerTransport(log, peerTelemetry)
+		if err != nil {
+			log.Fatal().Err(err).Msg("invalid peer client credentials")
+		}
+		defer peers.Close()
 	}
-	defer peers.Close()
 	router := proxy.NewRoutingHandler(domains, os.Getenv("HOST_ID"), ownership, peers, proxyHandler, log, routingRecorder)
 	log.Info().Bool("enabled", routingEnabled == "1").Msg("peer ownership routing configured")
 	mux, localMux := newDataPlaneMuxes(proxyHandler, router, routingEnabled == "1")
 	var localSrv *http.Server
 	var localErr <-chan error
-	if peerAddr := os.Getenv("PEER_PROXY_LISTEN_ADDR"); peerIngressEnabled(peerAddr) {
+	if peerIngressEnabled(peerAddr) {
 		if err := validatePeerListener(peerAddr, addr, redirectAddr); err != nil {
 			log.Fatal().Err(err).Msg("invalid PEER_PROXY_LISTEN_ADDR")
 		}
@@ -313,9 +318,12 @@ func validateListenerPorts(peerAddr, publicAddr, redirectAddr string) error {
 	return nil
 }
 
-// peerIngressEnabled keeps the optional listener gated solely by its explicit
-// address. Outbound client credentials remain mandatory when ingress is disabled.
+// peerIngressEnabled keeps the optional listener gated solely by its explicit address.
 func peerIngressEnabled(addr string) bool { return addr != "" }
+
+func peerTransportRequired(routingEnabled, peerAddr string) bool {
+	return routingEnabled == "1" || peerIngressEnabled(peerAddr)
+}
 
 type proxyHealthResponse struct {
 	Capabilities  []string `json:"capabilities"`

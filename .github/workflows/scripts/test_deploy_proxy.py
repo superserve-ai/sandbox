@@ -33,7 +33,7 @@ class DeployProxyOrderingTest(unittest.TestCase):
 
 
 class DeployProxyTests(unittest.TestCase):
-    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0, database_url="postgres://postgres:postgres@localhost/sandbox_test", routing="", zone="us-central1-a"):
+    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0, database_url="postgres://postgres:postgres@localhost/sandbox_test", routing="", zone="us-central1-a", expected_standby=""):
         scripts = []
 
         def run(args, **kwargs):
@@ -56,6 +56,7 @@ class DeployProxyTests(unittest.TestCase):
             "PROXY_DOMAIN": "sandbox.example.test",
             "PEER_PROXY_LISTEN_ADDR": peer_addr,
             "PEER_IDENTITY_HOSTS": "example-host" if required_identity else "",
+            "EXPECTED_STANDBY_HOST": expected_standby,
             "PEER_PROXY_SPIFFE_URI": identity,
             "PEER_PROXY_CERT_FILE": "/etc/peer/cert.pem",
             "PEER_PROXY_KEY_FILE": "/etc/peer/key.pem",
@@ -71,6 +72,25 @@ class DeployProxyTests(unittest.TestCase):
         self.assertEqual(len(scripts), 1)
         self.assertIn("PEER_PROXY_TARGET_ADDR=127.0.0.1:5010\n", scripts[0])
         return scripts[0]
+
+    def test_standby_requires_expected_bootstrapped_host(self):
+        script = self.generate_script("", routing="0", expected_standby="example-host")
+        self.assertIn('elif [ "1" -eq 1 ]; then', script)
+        self.generate_script("", expected_standby="other-host", expected_result=1)
+        self.generate_script("", expected_standby="example-host", required_identity=False, expected_result=1)
+
+    def test_standby_rejects_extra_discovered_hosts_before_upload(self):
+        env = {
+            "GCP_PROJECT": "example-project", "SHA": "12345678",
+            "PROXY_DOMAIN": "sandbox.example.test", "GCP_REGION": "us-central1",
+            "VMD_LABEL": "component=example-standby",
+            "PEER_IDENTITY_HOSTS": "example-host", "EXPECTED_STANDBY_HOST": "example-host",
+        }
+        result = subprocess.CompletedProcess([], 0, "example-host,us-central1-a\nother-host,us-central1-b\n", "")
+        with patch.dict(os.environ, env, clear=True), patch.object(MODULE.subprocess, "run", return_value=result) as run:
+            self.assertEqual(MODULE.main(), 1)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][:4], ["gcloud", "compute", "instances", "list"])
 
     def test_production_steps_enable_private_ingress(self):
         workflow = Path(__file__).parents[1].joinpath("deploy-proxy.yml").read_text()
@@ -144,6 +164,31 @@ class DeployProxyTests(unittest.TestCase):
                 result = subprocess.run(["bash"], input=functions + readiness + "wait_for_vmd_ready", text=True, capture_output=True)
                 self.assertEqual(result.returncode == 0, mode == "ready", result.stderr)
 
+    def test_legacy_default_uses_fresh_db_receipt_without_endpoint_log(self):
+        script = self.generate_script("auto")
+        readiness = script[script.index("wait_for_vmd_ready() {"):script.index("rollback_peer_advertisement() {")]
+        for host in ("default", "named-host"):
+            for receipt in (True, False):
+                for restarted in (True, False):
+                    with self.subTest(host=host, receipt=receipt, restarted=restarted), tempfile.TemporaryDirectory() as tmp:
+                        functions = f'''
+                        sleep() {{ :; }}
+                        sudo() {{ "$@"; }}
+                        sed() {{ echo {host}; }}
+                        legacy_heartbeat_ready() {{ return {0 if receipt else 1}; }}
+                        systemctl() {{
+                            if [ "$1" = show ]; then
+                                if [ "{restarted}" = True ]; then
+                                    echo x >> "{tmp}/invocations"
+                                    wc -l < "{tmp}/invocations"
+                                else echo current; fi
+                            fi
+                        }}
+                        journalctl() {{ [[ "$*" != *"host endpoint heartbeat accepted"* ]]; }}
+                        '''
+                        result = subprocess.run(["bash"], input=functions + readiness + "wait_for_vmd_ready", text=True, capture_output=True)
+                        self.assertEqual(result.returncode == 0, host == "default" and receipt and not restarted, result.stderr)
+
     def test_rollback_restores_listener_before_advertisement(self):
         cases = [(addr, failure, "spiffe://example.test/peer") for addr, failure in (("192.0.2.2:5009", "proxy"),
                                           ("192.0.2.2:5009", "superserve-vmd"),
@@ -159,19 +204,24 @@ class DeployProxyTests(unittest.TestCase):
         cases += [("", "none", "spiffe://example.test/peer"), ("", "none", ""), ("auto", "none", ""),
                   ("auto", "missing-identity", ""),
                   ("", "missing-cert", "spiffe://example.test/peer")]
-        for peer_addr, failed_service, identity in cases:
+        cases = [(*case, False) for case in cases] + [
+            ("192.0.2.2:5009", failure, "spiffe://example.test/peer", True)
+            for failure in ("none", "proxy", "superserve-vmd")]
+        for peer_addr, failed_service, identity, legacy in cases:
             with self.subTest(peer_addr=peer_addr, failed_service=failed_service), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 old_env = "PEER_PROXY_LISTEN_ADDR=192.0.2.3:5009\n"
+                old_vmd_env = old_env + ("HOST_ID=default\n" if legacy else "")
                 old_credentials = "[Service]\nLoadCredential=old-cert:/etc/peer/old.pem\n"
                 files = {
                     "etc/sandbox/proxy.env": old_env,
-                    "etc/sandbox/vmd.env": old_env,
+                    "etc/sandbox/vmd.env": old_vmd_env,
                     "etc/systemd/system/proxy.service.d/peer-credentials.conf": old_credentials,
                     "etc/superserve/peer/tls.crt": "test cert",
                     "etc/superserve/peer/tls.key": "test key",
                     "etc/superserve/peer/ca.crt": "test ca",
                     "tmp/proxy-12345678": "new binary",
+                    "tmp/check-legacy-heartbeat-12345678": "#!/bin/sh\nexit 0\n",
                     "bin/proxy": "old binary",
                     "etc/systemd/system/proxy.service": "old unit",
                     "tmp/proxy.service": "unit",
@@ -193,6 +243,7 @@ class DeployProxyTests(unittest.TestCase):
                 script = self.generate_script(peer_addr, identity, bool(identity) or failed_service == "missing-identity")
                 script = script.replace("/etc/", f"{root}/etc/")
                 script = script.replace("/tmp/proxy", f"{root}/tmp/proxy")
+                script = script.replace("/tmp/check-legacy-heartbeat", f"{root}/tmp/check-legacy-heartbeat")
                 script = script.replace("/usr/local/bin", f"{root}/bin")
                 script = script.replace("/usr/local/sbin", f"{root}/bin")
                 script = script.replace("/run/lock", f"{root}/run/lock")
@@ -213,8 +264,13 @@ class DeployProxyTests(unittest.TestCase):
                 }}
                 sleep() {{ :; }}
                 flock() {{ :; }}
+                date() {{ echo 1; }}
+                curl() {{ echo 192.0.2.2; }}
                 systemctl() {{
-                    if [ "$1" = show ]; then echo current-invocation; return 0; fi
+                    if [ "$1" = show ]; then
+                        if [ "$3" = MainPID ]; then echo 123; else echo current-invocation; fi
+                        return 0
+                    fi
                     if [ "$1" = restart ]; then
                         echo "$2" >> "{root}/restarts"
                         if [ "{failed_service}" = proxy-always ] && [ "$2" = proxy ]; then
@@ -234,7 +290,10 @@ class DeployProxyTests(unittest.TestCase):
                     fi
                     return 0
                 }}
-                journalctl() {{ :; }}
+                journalctl() {{
+                    if [ "{legacy}" = True ] && [[ "$*" == *"host endpoint heartbeat accepted"* ]]; then return 1; fi
+                    return 0
+                }}
                 '''
                 result = subprocess.run(["bash"], input=functions + script, text=True, capture_output=True)
                 if failed_service != "none":
@@ -245,7 +304,7 @@ class DeployProxyTests(unittest.TestCase):
                     proxy_env = (root / "etc/sandbox/proxy.env").read_text()
                     if not identity:
                         self.assertEqual("".join(line + "\n" for line in proxy_env.splitlines() if line.startswith("PEER_PROXY_")), old_env)
-                        self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_env)
+                        self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_vmd_env)
                         self.assertEqual((root / "etc/systemd/system/proxy.service.d/peer-credentials.conf").read_text(), old_credentials)
                         self.assertEqual((root / "restarts").read_text().splitlines(), ["proxy"])
                         self.assertIn("PROXY_DOMAIN=sandbox.example.test", proxy_env)
@@ -277,7 +336,7 @@ class DeployProxyTests(unittest.TestCase):
                     continue
                 self.assertTrue((root / "failed").exists(), result.stderr)
                 self.assertEqual((root / "etc/sandbox/proxy.env").read_text(), old_env)
-                self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_env)
+                self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_vmd_env)
                 self.assertEqual((root / "etc/systemd/system/proxy.service.d/peer-credentials.conf").read_text(), old_credentials)
                 restarts = (root / "restarts").read_text().splitlines()
                 if failed_service in ("tee-dropin", "binary-install", "unit-install"):

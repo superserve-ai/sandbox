@@ -87,7 +87,7 @@ class DeployTargetTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
 
     def test_workflow_cell_guards_and_staging_dependency(self):
-        for kind in ("vmd",):
+        for kind in ("vmd", "proxy"):
             workflow = (SCRIPTS.parent / f"deploy-{kind}.yml").read_text()
             production = workflow.split("  deploy-production:\n", 1)[1]
             self.assertIn("    needs: [deploy-staging]\n", production)
@@ -115,7 +115,7 @@ class DeployTargetTests(unittest.TestCase):
                         self.assertEqual(selected, expected, (kind, event, cell, enabled))
 
     def test_zero_matches_never_retry_serving_or_upload(self):
-        for kind in ("vmd",):
+        for kind in ("vmd", "proxy"):
             spec = importlib.util.spec_from_file_location("deploy_under_test", SCRIPTS / f"deploy-{kind}.py")
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
