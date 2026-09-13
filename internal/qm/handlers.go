@@ -584,14 +584,35 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 		// now would let a retry or delete race a run that is about to
 		// start, so it stays in flight; if no run ever reports progress
 		// the stale reclaim makes it retryable.
-		h.event(ctx, updated, stepTrigger, tenantstore.EventFailed,
+		h.eventIfMine(ctx, updated, mine, stepTrigger, tenantstore.EventFailed,
 			"The "+string(mode)+" run's start could not be confirmed. If no progress follows, it becomes retryable after "+h.StaleAfter.String()+".",
 			map[string]any{"mode": string(mode), "error": err.Error(), "ambiguous": true})
 		respondError(c, http.StatusBadGateway, "The "+string(mode)+" run's start could not be confirmed; the tenant stays in progress. Check back shortly.")
 		return tenantstore.Tenant{}, false
 	}
-	h.event(ctx, updated, stepTrigger, tenantstore.EventOK, string(mode)+" run queued", detail)
+	h.eventIfMine(ctx, updated, mine, stepTrigger, tenantstore.EventOK, string(mode)+" run queued", detail)
 	return updated, true
+}
+
+// eventIfMine records a trigger's outcome only while this attempt still
+// owns the tenant. A trigger call that outlived StaleAfter comes back to a
+// tenant something else has re-queued; appending to it would move the row's
+// version past the one the replacement holds, and the replacement's own
+// bookkeeping would then decline to touch the tenant it owns.
+func (h *Handlers) eventIfMine(ctx context.Context, tenant tenantstore.Tenant, at tenantstore.Version, step, status, message string, detail map[string]any) {
+	dctx, cancel := detached(ctx)
+	defer cancel()
+	current, err := h.Store.GetTenant(dctx, tenant.TeamID, tenant.ID)
+	if err != nil {
+		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("confirm this attempt still owns the tenant")
+		return
+	}
+	if tenantstore.VersionOf(current) != at {
+		h.Log.Warn().Str("tenant_id", tenant.ID.String()).Str("step", step).
+			Msg("a later attempt owns this tenant; dropping this outcome event")
+		return
+	}
+	h.eventIn(dctx, tenant, step, status, message, detail)
 }
 
 // abortQueue handles a queue attempt that failed before the run's intent

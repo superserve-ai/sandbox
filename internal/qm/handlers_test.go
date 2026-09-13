@@ -1363,3 +1363,56 @@ func TestRetryReadsTheModeFromTheOpeningEventOnly(t *testing.T) {
 		t.Errorf("retry mode = %s, want deprovision", last.Mode)
 	}
 }
+
+// A trigger call that outlived StaleAfter comes back to a tenant something
+// else has re-queued. Its outcome event must not land: appending to the row
+// would move it past the version the replacement holds, and the
+// replacement's own bookkeeping would then leave the tenant alone.
+func TestLateTriggerOutcomeIsDroppedWhenOvertaken(t *testing.T) {
+	f := newFixture(t)
+	id := f.create(t)
+	tid := uuid.MustParse(id)
+	ctx := context.Background()
+	f.store.SetStatus(ctx, f.teamA, tid, tenantstore.StatusFailed)
+
+	overtaking := &overtakingTrigger{store: f.store, teamID: f.teamA, tenantID: tid}
+	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: overtaking, Log: zerolog.Nop()}
+	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
+
+	before, _ := f.store.ListEvents(ctx, f.teamA, tid)
+	if code, _ := f.do(t, http.MethodPost, "/v1/qm/tenants/"+id+"/retry", keyTeamA, nil); code != http.StatusAccepted {
+		t.Fatalf("retry not accepted")
+	}
+	after, _ := f.store.ListEvents(ctx, f.teamA, tid)
+	// This attempt's intent and the replacement's — and no outcome from the
+	// request that was overtaken.
+	if len(after) != len(before)+2 {
+		for _, e := range after[len(before):] {
+			t.Logf("%s:%s", e.Step, e.Status)
+		}
+		t.Errorf("recorded %d events, want 2", len(after)-len(before))
+	}
+	for _, e := range after[len(before):] {
+		if e.Step == stepTrigger && e.Status == tenantstore.EventOK {
+			t.Error("an overtaken request recorded its trigger outcome")
+		}
+	}
+}
+
+// overtakingTrigger re-queues the tenant while the trigger call is still in
+// flight, as a stale reclaim and a fresh retry would.
+type overtakingTrigger struct {
+	store    *tenantstore.Memory
+	teamID   uuid.UUID
+	tenantID uuid.UUID
+}
+
+func (o *overtakingTrigger) Trigger(ctx context.Context, _, _ uuid.UUID, _ provisioner.Mode, _ int64) error {
+	if _, err := o.store.SetStatus(ctx, o.teamID, o.tenantID, tenantstore.StatusProvisioning); err != nil {
+		return err
+	}
+	_, err := o.store.InsertEvent(ctx, o.teamID, tenantstore.EventParams{
+		TenantID: o.tenantID, Step: stepTrigger, Status: tenantstore.EventStarted, Message: "provision run requested",
+	})
+	return err
+}

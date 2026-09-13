@@ -71,11 +71,14 @@ func (d *deps) close() {
 
 // setup connects to the database first and everything else after, and
 // returns the partially built deps alongside a later error so the job can
-// still record a failure against the tenant it was started for.
+// still record a failure against the tenant it was started for. That
+// includes a config error: an unusable config usually still names the
+// database, and the tenant the job was started for is better told than left
+// in flight until the stale reclaim.
 func setup(ctx context.Context) (*deps, error) {
-	cfg, err := qm.LoadConfig()
-	if err != nil {
-		return nil, fmt.Errorf("load config: %w", err)
+	cfg, cfgErr := qm.LoadConfig()
+	if cfg.DatabaseURL == "" {
+		return nil, fmt.Errorf("load config: %w", cfgErr)
 	}
 	pool, err := connectDB(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -87,6 +90,9 @@ func setup(ctx context.Context) (*deps, error) {
 		return nil, err
 	}
 	d := &deps{cfg: cfg, pool: pool, store: store, closeStore: store.Close}
+	if cfgErr != nil {
+		return d, fmt.Errorf("load config: %w", cfgErr)
+	}
 
 	// After the store, so that every later setup failure is one the job can
 	// still record against the tenant it was started for.
