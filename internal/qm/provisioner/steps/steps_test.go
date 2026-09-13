@@ -222,18 +222,24 @@ type fakeTenantServer struct {
 	// failure the reference tenant shipped.
 	authorizeStatus int
 	healthStatus    int
-	paths           []string
+	// modelKeyStatus answers the provider's key check. The fixture's HTTP
+	// client sends every request here, the provider's included, so this is
+	// what stands in for Anthropic saying yes or no.
+	modelKeyStatus int
+	paths          []string
 }
 
 func newFakeTenantServer(t *testing.T) *fakeTenantServer {
 	t.Helper()
-	f := &fakeTenantServer{authorizeStatus: http.StatusOK, healthStatus: http.StatusOK}
+	f := &fakeTenantServer{authorizeStatus: http.StatusOK, healthStatus: http.StatusOK, modelKeyStatus: http.StatusOK}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.paths = append(f.paths, r.URL.Path)
-		authorize, health := f.authorizeStatus, f.healthStatus
+		authorize, health, modelKey := f.authorizeStatus, f.healthStatus, f.modelKeyStatus
 		f.mu.Unlock()
 		switch {
+		case r.URL.Path == "/v1/models":
+			w.WriteHeader(modelKey)
 		case r.URL.Path == "/healthz":
 			w.WriteHeader(health)
 			_, _ = w.Write([]byte(`{"ok":true}`))
@@ -254,6 +260,12 @@ func (f *fakeTenantServer) setAuthorizeStatus(status int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.authorizeStatus = status
+}
+
+func (f *fakeTenantServer) setModelKeyStatus(status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.modelKeyStatus = status
 }
 
 func (f *fakeTenantServer) requested(path string) bool {
@@ -759,6 +771,40 @@ func TestSmokeAcceptsOnlyTheBrokersOwnAnswer(t *testing.T) {
 	}
 }
 
+// A model key the provider rejects outright fails the provision: a tenant
+// whose agent cannot call a model is not a working tenant, and finding out
+// at the first message instead is far worse.
+func TestSmokeFailsOnARejectedModelKey(t *testing.T) {
+	f := newFixture(t, false)
+	f.tenant.setModelKeyStatus(http.StatusUnauthorized)
+	err := f.provision(t)
+	if err == nil {
+		t.Fatal("a tenant whose model key was rejected was reported ready")
+	}
+	if !strings.Contains(err.Error(), "rejected the tenant's model key") {
+		t.Errorf("err = %v", err)
+	}
+	// The key itself never reaches the event log.
+	for _, e := range f.events(t) {
+		if strings.Contains(string(e.Detail)+deref(e.Message), "sk-ant-fixture") {
+			t.Errorf("the model key leaked into %s/%s", e.Step, e.Status)
+		}
+	}
+}
+
+// Not being able to ask the provider is not the same as being told no: a
+// rate limit, an outage or an egress policy in the way must not fail a
+// provision.
+func TestSmokeToleratesAnUnreachableProvider(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusBadGateway, http.StatusNotFound} {
+		f := newFixture(t, false)
+		f.tenant.setModelKeyStatus(status)
+		if err := f.provision(t); err != nil {
+			t.Errorf("provider answered %d: %v", status, err)
+		}
+	}
+}
+
 // ── Sign-in policy ───────────────────────────────────────────────────────
 
 // Sign-in opens to the admin's address and nothing else. Deriving a domain
@@ -1036,6 +1082,11 @@ func TestDatabaseURL(t *testing.T) {
 	}
 	if u.Host != "10.0.0.3:5432" || u.Path != "/qm_pilot_team" {
 		t.Errorf("url = %s", got)
+	}
+	// The shared instance refuses unencrypted connections, so a DSN that
+	// disabled TLS would fail to connect at all.
+	if u.Query().Get("sslmode") != "require" {
+		t.Errorf("sslmode = %q", u.Query().Get("sslmode"))
 	}
 	// The password is escaped rather than breaking the URL apart.
 	pw, _ := u.User.Password()

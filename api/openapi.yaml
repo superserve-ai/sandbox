@@ -2870,7 +2870,10 @@ components:
           description: The organization admin; admin sign-in links are minted for this address.
         signIn:
           type: string
-          enum: [magic_link, slack]
+          enum: [magic_link]
+          description: >-
+            Only magic_link can be provisioned today. Slack sign-in is a
+            planned mode and is rejected until a tenant can be built with it.
         modelProvider:
           type: string
           enum: [anthropic, openai, openrouter]

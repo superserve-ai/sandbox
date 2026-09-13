@@ -61,7 +61,9 @@ func (healthCheck) Rollback(context.Context, *provisioner.Tenant) error {
 	return provisioner.Skip("nothing to undo")
 }
 
-// smoke exercises the deployed stack end to end. Read-only.
+// smoke exercises the deployed stack end to end: it answers, its model
+// provider accepts the key it was given, and it can be signed into.
+// Read-only.
 //
 // The sign-in check is the reason this step exists as something separate
 // from the health check. A tenant whose auth broker has no email transport
@@ -92,6 +94,9 @@ func (s smoke) Run(ctx context.Context, t *provisioner.Tenant) error {
 		}
 		return fmt.Errorf("GET / returned %d", status)
 	}); err != nil {
+		return err
+	}
+	if err := checkModelKey(ctx, s.c, t); err != nil {
 		return err
 	}
 	target, err := authorizeURL(base)

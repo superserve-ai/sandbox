@@ -19,7 +19,13 @@ var (
 		"app": true, "console": true, "docs": true, "status": true,
 	}
 
-	signInOptions        = map[string]bool{"magic_link": true, "slack": true}
+	// The schema allows slack as well, and the column keeps it so the
+	// option can be turned on without a migration — but the provisioner
+	// renders one sign-in flow, the embedded magic-link broker, and a
+	// tenant created as "slack" would be reported as Slack while serving
+	// magic links. Accepting it only once a tenant can actually be built
+	// that way.
+	signInOptions        = map[string]bool{"magic_link": true}
 	modelProviderOptions = map[string]bool{"anthropic": true, "openai": true, "openrouter": true}
 	harnessOptions       = map[string]bool{"pi": true, "claude": true, "codex": true, "opencode": true}
 )
@@ -86,7 +92,7 @@ func (r *CreateTenantRequest) validate() map[string]string {
 		fields["adminEmail"] = "Enter a valid email address."
 	}
 	if !signInOptions[r.SignIn] {
-		fields["signIn"] = "Sign-in must be magic_link or slack."
+		fields["signIn"] = "Sign-in must be magic_link. Slack sign-in is not available yet."
 	}
 	if !modelProviderOptions[r.ModelProvider] {
 		fields["modelProvider"] = "Model provider must be anthropic, openai or openrouter."

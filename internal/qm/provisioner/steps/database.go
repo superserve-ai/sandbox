@@ -161,11 +161,13 @@ func (s database) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 
 // DatabaseURL is the connection string the tenant's container reads.
 //
-// sslmode is disabled deliberately: the only route to the instance is its
-// private IP over the VPC the tenant service egresses RFC 1918 traffic
-// through, and Cloud SQL presents a self-signed server certificate that the
-// tenant's Postgres driver rejects under sslmode=require. Reaching the
-// instance at all requires already being inside the VPC.
+// sslmode=require, which is "encrypt, do not verify": the shared instance
+// is configured to refuse unencrypted connections, and its server
+// certificate is self-signed, so verification would need its CA
+// distributed to every tenant for no gain — the only route to the instance
+// is its private IP over the VPC, and reaching it at all means already
+// being inside. Both the drivers involved (pgx for the provisioner, node's
+// pg for the tenant) read require as TLS without certificate verification.
 func DatabaseURL(env provisioner.Env, role, password, dbName string) string {
 	host := env.SQLPrivateIP
 	// SplitHostPort is how an already-qualified host is told from a bare
@@ -178,7 +180,7 @@ func DatabaseURL(env provisioner.Env, role, password, dbName string) string {
 		User:     url.UserPassword(role, password),
 		Host:     host,
 		Path:     "/" + dbName,
-		RawQuery: "sslmode=disable",
+		RawQuery: "sslmode=require",
 	}
 	return u.String()
 }
