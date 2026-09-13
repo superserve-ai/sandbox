@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.7.0"
 
   backend "gcs" {
     bucket = "superserve-terraform-state"
@@ -7,11 +7,20 @@ terraform {
   }
 
   required_providers {
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "= 8.2.0"
+    }
     google = {
       source  = "hashicorp/google"
       version = "~> 7.0"
     }
   }
+}
+
+provider "google-beta" {
+  project = local.project_id
+  region  = local.region
 }
 
 provider "google" {
@@ -389,7 +398,9 @@ module "sandbox_host" {
 # until an operator activates it, so creating it changes nothing for the cell
 # until that deliberate step.
 module "sandbox_host_b" {
-  source = "../../../modules/sandbox-host"
+  source                    = "../../../modules/managed-identity-host"
+  managed_workload_identity = module.peer_identity.creation_identity
+  sandbox_data_disk         = google_compute_disk.sandbox_data_b.id
 
   project_id    = local.project_id
   environment   = local.environment
@@ -559,15 +570,11 @@ resource "google_compute_disk" "sandbox_data_b" {
   }
 }
 
-resource "google_compute_attached_disk" "sandbox_data_b" {
-  project     = local.project_id
-  zone        = local.zone
-  disk        = google_compute_disk.sandbox_data_b.id
-  instance    = module.sandbox_host_b.instance_self_link
-  device_name = "superserve-sandbox-data"
-  mode        = "READ_WRITE"
-
-  deletion_policy = "PREVENT"
+# Attachment is now owned by the VM create request. Forget the standalone
+# record without detaching or deleting the independently protected data disk.
+removed {
+  from = google_compute_attached_disk.sandbox_data_b
+  lifecycle { destroy = false }
 }
 
 module "observability" {

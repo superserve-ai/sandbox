@@ -1,7 +1,7 @@
 # Creation-time managed identity host
 
 Opt-in host module for new VMs requiring Managed Workload Identity certificates
-in the Compute create request. Existing host modules are unchanged. This module
+in the Compute create request. Staging uses this module for its already-created identity host; other host modules are unchanged. This module
 pins Google Beta 8.2.0; use a separately reviewed root/provider upgrade when
 adopting it. Do not change an existing module address without reviewing state
 migration and replacement consequences.
