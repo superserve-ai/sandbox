@@ -193,6 +193,12 @@ variable "tenant_bucket_lifecycle_rules" {
   ]
 }
 
+variable "tenant_slug_min_length" {
+  description = "Shortest tenant-slug budget the derived per-tenant names must still allow. Only used by the tenant_slug_budget_is_usable check, which catches naming prefixes or a project ID long enough to leave no usable slug."
+  type        = number
+  default     = 16
+}
+
 variable "tenant_image" {
   description = "Tagged image the provisioner deploys for every new tenant service (QM_TENANT_IMAGE). Null uses <tenant_image_repository>/qm:latest. Per-tenant pinning is the provisioner's concern; this is the fleet default."
   type        = string
@@ -220,6 +226,12 @@ variable "redirect_service_name" {
 variable "api_image" {
   description = "qm-api container image. Must exist before the first apply: Cloud Run rejects a revision whose image cannot be pulled. Later image rollouts are owned by deploy tooling and ignored by Terraform."
   type        = string
+}
+
+variable "api_deletion_protection" {
+  description = "Cloud Run deletion protection on qm-api. On by default; set false as the first step of tearing an environment down, otherwise removing the module (or setting enable_qm back to false) fails on the service delete."
+  type        = bool
+  default     = true
 }
 
 variable "api_min_instances" {

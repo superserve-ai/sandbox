@@ -43,6 +43,24 @@ locals {
   tenant_bucket_location        = coalesce(var.tenant_bucket_location, var.region)
   qm_secret_prefix              = "qm-"
 
+  # Longest slug every per-tenant name derived from the prefixes above still
+  # fits in. Terraform never fills {slug} itself, so this is exported (as an
+  # output and as QM_TENANT_SLUG_MAX_LENGTH) for the Go-side slug validator:
+  # the limits move when a prefix or the project ID does, and the provisioner
+  # should not carry its own copy of the arithmetic.
+  #   bucket           <project>-qm-<slug>  <= 63
+  #   service account  qm-<slug>            <= 30
+  #   Cloud Run        qm-<slug>            <= 49
+  #   database         qm_<slug>            <= 63
+  # The service account is usually the binding one; a long project ID makes it
+  # the bucket.
+  tenant_slug_max_length = min(
+    63 - length(local.tenant_bucket_prefix),
+    30 - length(local.tenant_service_account_prefix),
+    49 - length(local.tenant_service_account_prefix),
+    63 - length("qm_"),
+  )
+
   sql_admin_secret_id        = "qm-sql-admin-${var.resource_suffix}"
   api_database_url_secret_id = "qm-api-database-url-${var.resource_suffix}"
 
@@ -122,6 +140,16 @@ resource "google_service_networking_connection" "private_service_access" {
   deletion_policy = "ABANDON"
 
   depends_on = [google_project_service.required]
+}
+
+# A project ID long enough to squeeze the bucket prefix leaves no room for a
+# usable tenant slug, and the failure would otherwise surface as a rejected
+# bucket name during a tenant provision rather than here.
+check "tenant_slug_budget_is_usable" {
+  assert {
+    condition     = local.tenant_slug_max_length >= var.tenant_slug_min_length
+    error_message = "Per-tenant names derived from project ${var.project_id} leave only ${local.tenant_slug_max_length} characters for a tenant slug, below tenant_slug_min_length (${var.tenant_slug_min_length}). Shorten the naming prefixes or use a shorter project."
+  }
 }
 
 check "sql_max_connections_covers_tenant_capacity" {

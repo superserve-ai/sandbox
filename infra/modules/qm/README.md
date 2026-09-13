@@ -56,6 +56,15 @@ resources, slug validation on the Go side must reserve at least `api`,
 module names `qm-<word>`), or a tenant could collide with `qm-api-*`,
 `qm-sql-admin-*`, or `qm-tenants-<suffix>`.
 
+It must also bound slug length. Terraform never fills `{slug}`, so the module
+computes the budget from its own prefixes and exports it as the
+`tenant_slug_max_length` output and `QM_TENANT_SLUG_MAX_LENGTH`: the smallest
+of the bucket (`<project>-qm-<slug>`, 63), service account (`qm-<slug>`, 30),
+Cloud Run service (`qm-<slug>`, 49) and database (`qm_<slug>`, 63) limits. The
+service account is normally the binding one; a long project ID makes it the
+bucket. Enforce that value rather than recomputing it, or a long slug fails
+partway through a provision with some resources already created.
+
 ## Deletion safety
 
 Every tenant's database is on the one `qm-tenants-<suffix>` instance, so it
@@ -67,6 +76,10 @@ apply starts, which is also what catches a *replacement* — a changed
 the other two flags do not make that obvious). Removing the instance is
 deliberately three changes: drop `prevent_destroy`, set both
 `deletion_protection` flags to false and apply, then remove the resource.
+
+The qm-api Cloud Run service carries Cloud Run deletion protection as well, so
+set `api_deletion_protection = false` and apply before removing the module or
+setting `enable_qm` back to false; otherwise the destroy fails on the service.
 
 Backups are on by default: daily automated backups at `sql_backup_start_time`
 with `sql_backup_retained_count` (14) retained, plus point-in-time recovery

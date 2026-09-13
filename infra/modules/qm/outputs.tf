@@ -111,6 +111,11 @@ output "tenant_bucket_name_pattern" {
   value       = local.tenant_bucket_name_pattern
 }
 
+output "tenant_slug_max_length" {
+  description = "Longest tenant slug every per-tenant name derived from this module's prefixes still fits in. The Go-side slug validator should enforce it rather than recompute it."
+  value       = local.tenant_slug_max_length
+}
+
 output "tenant_bucket_location" {
   description = "Location the provisioner creates tenant buckets in."
   value       = local.tenant_bucket_location
@@ -152,6 +157,7 @@ locals {
     tenant_image                  = local.tenant_image
     tenant_service_account_prefix = local.tenant_service_account_prefix
     tenant_bucket_name_pattern    = local.tenant_bucket_name_pattern
+    tenant_slug_max_length        = local.tenant_slug_max_length
     tenant_bucket_location        = local.tenant_bucket_location
     tenant_bucket_lifecycle_rules = var.tenant_bucket_lifecycle_rules
     labels                        = var.labels

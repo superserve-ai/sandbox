@@ -37,6 +37,7 @@ locals {
     QM_PROVISIONER_SERVICE_ACCOUNT   = google_service_account.provisioner.email
     QM_TENANT_SERVICE_ACCOUNT_PREFIX = local.tenant_service_account_prefix
     QM_TENANT_BUCKET_NAME_PATTERN    = local.tenant_bucket_name_pattern
+    QM_TENANT_SLUG_MAX_LENGTH        = tostring(local.tenant_slug_max_length)
     QM_TENANT_BUCKET_LOCATION        = local.tenant_bucket_location
     QM_TENANT_BUCKET_LIFECYCLE_JSON  = jsonencode(local.tenant_bucket_lifecycle_policy)
     QM_TENANT_IMAGE_REPOSITORY       = local.tenant_image_repository
@@ -65,7 +66,7 @@ resource "google_cloud_run_v2_service" "api" {
   name                = local.api_service_name
   location            = var.region
   ingress             = var.api_ingress
-  deletion_protection = true
+  deletion_protection = var.api_deletion_protection
 
   template {
     service_account = google_service_account.api.email
