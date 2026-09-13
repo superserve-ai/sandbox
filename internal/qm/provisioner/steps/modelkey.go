@@ -22,7 +22,7 @@ func checkModelKey(ctx context.Context, c Clients, t *provisioner.Tenant) error 
 	if c.Secrets == nil {
 		return errNoSecretStore
 	}
-	key, err := c.Secrets.Get(ctx, t.SecretName(secrets.ModelKeyName(t.Row.ModelProvider)))
+	key, err := readTenantSecret(ctx, c, t, secrets.ModelKeyName(t.Row.ModelProvider))
 	if err != nil {
 		if errors.Is(err, secrets.ErrNotFound) {
 			// qm-api writes this before the run is triggered, so its

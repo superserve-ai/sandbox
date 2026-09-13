@@ -315,7 +315,7 @@ func (s adminLink) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if t.Row.PublicUrl == nil {
 		return provisioner.Skip("no public URL recorded yet")
 	}
-	secret, err := s.c.Secrets.Get(ctx, t.SecretName(secrets.PortalSessionSecret))
+	secret, err := readTenantSecret(ctx, s.c, t, secrets.PortalSessionSecret)
 	if err != nil {
 		return err
 	}

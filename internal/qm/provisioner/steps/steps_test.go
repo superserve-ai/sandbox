@@ -3,6 +3,7 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -507,7 +508,9 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		plant func(*tenantFixture)
-		wants string
+		// sentinel says the refusal must come back as ErrNotOwned rather
+		// than as some other failure that happens to stop the run.
+		sentinel bool
 	}{
 		{
 			"a service account with the name the slug derives",
@@ -516,7 +519,7 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 				f.accounts.accounts["qm-pilot-team@example-project.iam.gserviceaccount.com"] = "the platform's provisioner"
 				f.accounts.mu.Unlock()
 			},
-			"does not belong to this tenant",
+			true,
 		},
 		{
 			"a bucket with the name the slug derives",
@@ -525,14 +528,14 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 				f.buckets.buckets["example-project-qm-pilot-team"] = map[string]string{"owner": "somebody else"}
 				f.buckets.mu.Unlock()
 			},
-			"does not belong to this tenant",
+			true,
 		},
 		{
 			"a secret with the name the slug derives",
 			func(f *tenantFixture) {
 				f.secrets.SetOwner("qm-pilot-team-CORE_SIGNING_SECRET", "somebody else")
 			},
-			"another tenant",
+			true,
 		},
 		{
 			// The secrets step skips a secret whose reference is already
@@ -544,7 +547,7 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 			func(f *tenantFixture) {
 				f.secrets.SetOwner("qm-pilot-team-ANTHROPIC_API_KEY", "somebody else")
 			},
-			"does not belong to this tenant",
+			true,
 		},
 		{
 			"a database with the name the slug derives",
@@ -553,7 +556,7 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 				f.dbs.markers["database:qm_pilot_team"] = "somebody else"
 				f.dbs.mu.Unlock()
 			},
-			"does not belong to this tenant",
+			true,
 		},
 		{
 			"a role with the name the slug derives",
@@ -562,7 +565,7 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 				f.dbs.markers["role:qm_pilot_team"] = "somebody else"
 				f.dbs.mu.Unlock()
 			},
-			"does not belong to this tenant",
+			true,
 		},
 		{
 			"an unmarked database with the name the slug derives",
@@ -571,7 +574,7 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 				f.dbs.databases["qm_pilot_team"] = "somebody_else"
 				f.dbs.mu.Unlock()
 			},
-			"does not belong to this tenant",
+			true,
 		},
 		{
 			"a backend service with the name the slug derives",
@@ -580,7 +583,7 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 				f.lb.owners["qm-pilot-team"] = "somebody else"
 				f.lb.mu.Unlock()
 			},
-			"does not belong to this tenant",
+			true,
 		},
 		{
 			"a bucket somebody else creates in the gap after the look-up",
@@ -590,7 +593,7 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 				f.buckets.buckets["example-project-qm-pilot-team"] = map[string]string{"owner": "somebody else"}
 				f.buckets.mu.Unlock()
 			},
-			"",
+			false,
 		},
 		{
 			"a cloud run service with the name the slug derives",
@@ -599,7 +602,7 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 				f.services.services["qm-pilot-team"] = ServiceSpec{Name: "qm-pilot-team", Labels: map[string]string{"qm-tenant-id": "somebody-else"}}
 				f.services.mu.Unlock()
 			},
-			"does not belong to this tenant",
+			true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -609,13 +612,63 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 			if err == nil {
 				t.Fatal("the provision adopted a resource it does not own")
 			}
-			if tc.wants != "" && !strings.Contains(err.Error(), tc.wants) {
-				t.Errorf("err = %v", err)
+			if tc.sentinel && !errors.Is(err, ErrNotOwned) {
+				t.Errorf("err = %v, want ErrNotOwned", err)
 			}
 			if f.current(t).Status != tenantstore.StatusFailed {
 				t.Errorf("status = %s", f.current(t).Status)
 			}
 		})
+	}
+}
+
+// Teardown never stops on a resource that is not this tenant's. The runner
+// stops a deprovision at its first failing step, so refusing over a name the
+// tenant never created would strand everything that really is its own —
+// database, bucket, identity, secrets and the shared-secret binding — with
+// no way to retry past it.
+func TestTeardownContinuesPastForeignResources(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	// Everything named for this tenant is taken over between provision and
+	// teardown, at the front of the rollback order.
+	f.services.mu.Lock()
+	f.services.services["qm-pilot-team"] = ServiceSpec{Name: "qm-pilot-team", Labels: map[string]string{TenantLabelKey: "somebody else"}}
+	f.services.mu.Unlock()
+	f.lb.mu.Lock()
+	f.lb.owners["qm-pilot-team"] = "somebody else"
+	f.lb.mu.Unlock()
+	f.buckets.mu.Lock()
+	f.buckets.buckets["example-project-qm-pilot-team"] = map[string]string{TenantLabelKey: "somebody else"}
+	f.buckets.mu.Unlock()
+	f.dbs.mu.Lock()
+	f.dbs.markers["database:qm_pilot_team"] = "somebody else"
+	f.dbs.markers["role:qm_pilot_team"] = "somebody else"
+	f.dbs.mu.Unlock()
+
+	if err := f.deprovision(t); err != nil {
+		t.Fatalf("teardown stopped on a resource that was not this tenant's: %v", err)
+	}
+	if f.current(t).Status != tenantstore.StatusDeleted {
+		t.Errorf("status = %s", f.current(t).Status)
+	}
+	// None of them was touched.
+	if f.services.services["qm-pilot-team"].Labels[TenantLabelKey] != "somebody else" {
+		t.Error("the foreign service was deleted")
+	}
+	if f.buckets.buckets["example-project-qm-pilot-team"][TenantLabelKey] != "somebody else" {
+		t.Error("the foreign bucket was deleted")
+	}
+	if _, ok := f.dbs.databases["qm_pilot_team"]; !ok {
+		t.Error("the foreign database was dropped")
+	}
+	// And the tenant's own secrets still went.
+	for _, name := range f.secrets.Names() {
+		if strings.HasPrefix(name, "qm-pilot-team-") {
+			t.Errorf("the tenant's own secret survived: %s", name)
+		}
 	}
 }
 

@@ -158,7 +158,7 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 				return fmt.Errorf("read the owner of %s: %w", secretName, err)
 			}
 			if exists && owner != t.Row.ID.String() {
-				return fmt.Errorf("secret %s does not belong to this tenant", secretName)
+				return fmt.Errorf("%w: secret %s", ErrNotOwned, secretName)
 			}
 		}
 		if err := s.c.Accounts.GrantSecretAccess(ctx, secretName, account); err != nil {
@@ -271,17 +271,24 @@ func (s cloudRun) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if t.Row.CloudRunService != nil {
 		name = *t.Row.CloudRunService
 	}
+	var foreign bool
 	// As on the way up: a service that carries somebody else's marker, or
-	// none, is not this tenant's to delete.
+	// none, is not this tenant's to delete. Unlike on the way up this is
+	// not an error — there is nothing of this tenant's there, and the
+	// runner stops a teardown at its first failing step, so refusing here
+	// would strand the tenant's database, bucket, identity and secrets
+	// behind a service that was never its own.
 	status, exists, err := s.c.Services.Get(ctx, name)
 	if err != nil {
 		return fmt.Errorf("look up the tenant's service: %w", err)
 	}
 	if exists && status.Labels[TenantLabelKey] != t.Row.ID.String() {
-		return fmt.Errorf("cloud run service %s does not belong to this tenant; not deleting it", name)
+		foreign = true
 	}
-	if err := s.c.Services.Delete(ctx, name); err != nil {
-		return fmt.Errorf("delete the tenant's service: %w", err)
+	if !foreign {
+		if err := s.c.Services.Delete(ctx, name); err != nil {
+			return fmt.Errorf("delete the tenant's service: %w", err)
+		}
 	}
 	// The tenant's own secrets are deleted outright by the secrets step, so
 	// their policies go with them. The platform's shared Resend secret does
@@ -323,7 +330,10 @@ func (s cloudRun) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if err := t.DeleteSecretRef(ctx, sharedSecretRef); err != nil {
 		return err
 	}
-	if t.Row.CloudRunService == nil {
+	switch {
+	case foreign:
+		return provisioner.Skip("the service named for this tenant belongs to something else; left alone")
+	case t.Row.CloudRunService == nil:
 		return provisioner.Skip("no service recorded")
 	}
 	return nil

@@ -15,6 +15,7 @@ package steps
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -84,6 +85,14 @@ func All(c Clients) []provisioner.Step {
 func DatabaseName(slug string) string {
 	return "qm_" + strings.ReplaceAll(slug, "-", "_")
 }
+
+// ErrNotOwned means a resource with the name this tenant's slug derives
+// exists and belongs to something else. Provisioning fails on it — building
+// a tenant around somebody else's resource is the thing the markers exist to
+// stop — but teardown treats it as absent and carries on, because there is
+// nothing of this tenant's there to remove and stopping would strand every
+// resource that really is its own.
+var ErrNotOwned = errors.New("resource belongs to another tenant")
 
 // TenantLabelKey carries the tenant a runtime-created resource belongs to.
 // The value is the tenant's id rather than its slug: the slug is chosen by

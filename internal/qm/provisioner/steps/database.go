@@ -93,7 +93,9 @@ func (s database) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if s.c.Secrets == nil {
 		return errNoSecretStore
 	}
-	password, err := s.c.Secrets.Get(ctx, t.SecretName(secretDatabasePassword))
+	// Checked, not just read: applying a password from a secret that is not
+	// this tenant's would hand its database to whoever wrote that secret.
+	password, err := readTenantSecret(ctx, s.c, t, secretDatabasePassword)
 	if err != nil {
 		return fmt.Errorf("read the tenant's database password: %w", err)
 	}
@@ -112,11 +114,7 @@ func (s database) Run(ctx context.Context, t *provisioner.Tenant) error {
 	// Written every run, not only on the run that created the database: it
 	// is derived from the password above, so a rotation has to reach the
 	// secret the service mounts or the tenant stops being able to connect.
-	ref, err := s.c.Secrets.Put(ctx, t.SecretName(secretDatabaseURL), []byte(DatabaseURL(t.Env, role, string(password), name)), t.Row.ID.String())
-	if err != nil {
-		return fmt.Errorf("write the tenant's database url: %w", err)
-	}
-	if err := t.SetSecretRef(ctx, secretDatabaseURL, ref); err != nil {
+	if err := putTenantSecret(ctx, s.c, t, secretDatabaseURL, DatabaseURL(t.Env, role, string(password), name)); err != nil {
 		return err
 	}
 	if t.Row.DbName != nil && *t.Row.DbName == name {
@@ -149,11 +147,23 @@ func (s database) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	marker := TenantDescription(t.Row.ID.String(), t.Row.Slug)
 	// The database before the role: Postgres refuses to drop a role that
 	// still owns objects.
+	//
+	// One that is not this tenant's is left where it is and is not an
+	// error: the runner stops a teardown at its first failing step, so
+	// refusing over a name this tenant never created would strand
+	// everything that really is its own.
+	foreign := false
 	if err := s.c.Databases.DropDatabase(ctx, name, marker); err != nil {
-		return fmt.Errorf("drop the tenant's database: %w", err)
+		if !errors.Is(err, ErrNotOwned) {
+			return fmt.Errorf("drop the tenant's database: %w", err)
+		}
+		foreign = true
 	}
 	if err := s.c.Databases.DropUser(ctx, RoleName(t.Row.Slug), marker); err != nil {
-		return fmt.Errorf("drop the tenant's database role: %w", err)
+		if !errors.Is(err, ErrNotOwned) {
+			return fmt.Errorf("drop the tenant's database role: %w", err)
+		}
+		foreign = true
 	}
 	if err := deleteTenantSecret(ctx, s.c, t, secretDatabaseURL); err != nil {
 		return err
@@ -161,7 +171,10 @@ func (s database) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if err := t.DeleteSecretRef(ctx, secretDatabaseURL); err != nil {
 		return err
 	}
-	if t.Row.DbName == nil {
+	switch {
+	case foreign:
+		return provisioner.Skip("the database or role named for this tenant belongs to something else; left alone")
+	case t.Row.DbName == nil:
 		return provisioner.Skip("no database recorded")
 	}
 	return nil

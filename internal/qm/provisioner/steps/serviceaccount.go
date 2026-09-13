@@ -97,7 +97,7 @@ func (s serviceAccount) Run(ctx context.Context, t *provisioner.Tenant) error {
 		// name too — and teardown would then delete it. Slug validation
 		// reserves the names we know; this is the check that does not
 		// depend on knowing them.
-		return fmt.Errorf("service account %s already exists and does not belong to this tenant", email)
+		return fmt.Errorf("%w: service account %s", ErrNotOwned, email)
 	}
 	if t.Row.ServiceAccount != nil && *t.Row.ServiceAccount == email {
 		return provisioner.Skip("service account " + email + " already recorded")
@@ -157,7 +157,7 @@ func (s serviceAccount) Rollback(ctx context.Context, t *provisioner.Tenant) err
 		return err
 	}
 	if !ok {
-		return provisioner.Skip("no service account of this tenant's")
+		return provisioner.Skip("no service account of this tenant's; anything under that name is left alone")
 	}
 	if err := s.c.Accounts.Delete(ctx, email); err != nil {
 		return fmt.Errorf("delete service account: %w", err)

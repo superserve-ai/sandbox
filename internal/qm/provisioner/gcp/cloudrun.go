@@ -112,7 +112,7 @@ func (s *Services) Deploy(ctx context.Context, spec steps.ServiceSpec) (steps.Se
 	// hand it to that tenant's teardown to delete.
 	if exists {
 		if want := spec.Labels[steps.TenantLabelKey]; want == "" || current.Labels[steps.TenantLabelKey] != want {
-			return steps.ServiceStatus{}, fmt.Errorf("service %s already exists and does not belong to this tenant", spec.Name)
+			return steps.ServiceStatus{}, fmt.Errorf("%w: service %s", steps.ErrNotOwned, spec.Name)
 		}
 	}
 	var op *run.GoogleLongrunningOperation
@@ -133,7 +133,7 @@ func (s *Services) Deploy(ctx context.Context, spec steps.ServiceSpec) (steps.Se
 				return steps.ServiceStatus{}, gerr
 			}
 			if exists && raced.Labels[steps.TenantLabelKey] != spec.Labels[steps.TenantLabelKey] {
-				return steps.ServiceStatus{}, fmt.Errorf("service %s already exists and does not belong to this tenant", spec.Name)
+				return steps.ServiceStatus{}, fmt.Errorf("%w: service %s", steps.ErrNotOwned, spec.Name)
 			}
 			op, err = s.patch(ctx, spec.Name, desired)
 		}

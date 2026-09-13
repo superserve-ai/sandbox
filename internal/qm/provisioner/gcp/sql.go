@@ -362,9 +362,9 @@ func (d *Databases) checkMarker(ctx context.Context, q querier, query, name, mar
 		return nil
 	}
 	if have == nil {
-		return fmt.Errorf("%s %s already exists and carries no tenant marker; drop it by hand if it was left by an interrupted run", kind, name)
+		return fmt.Errorf("%w: %s %s carries no tenant marker; drop it by hand if it was left by an interrupted run", steps.ErrNotOwned, kind, name)
 	}
-	return fmt.Errorf("%s %s already exists and does not belong to this tenant", kind, name)
+	return fmt.Errorf("%w: %s %s", steps.ErrNotOwned, kind, name)
 }
 
 // quoteMarker quotes a marker as a SQL literal. COMMENT takes no parameters,

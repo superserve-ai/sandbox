@@ -74,11 +74,7 @@ func (s secretsStep) Run(ctx context.Context, t *provisioner.Tenant) error {
 		if err != nil {
 			return fmt.Errorf("generate %s: %w", spec.name, err)
 		}
-		ref, err := s.c.Secrets.Put(ctx, t.SecretName(spec.name), []byte(value), t.Row.ID.String())
-		if err != nil {
-			return fmt.Errorf("write %s: %w", spec.name, err)
-		}
-		if err := t.SetSecretRef(ctx, spec.name, ref); err != nil {
+		if err := putTenantSecret(ctx, s.c, t, spec.name, value); err != nil {
 			return err
 		}
 		generated++
@@ -133,6 +129,42 @@ func (s secretsStep) Rollback(ctx context.Context, t *provisioner.Tenant) error 
 		}
 	}
 	return nil
+}
+
+// readTenantSecret reads one of the tenant's own secrets, having first
+// confirmed it is the tenant's.
+//
+// The check is here and not only where secrets are written because the
+// secrets step skips a secret whose reference is already recorded: a
+// recorded secret deleted and recreated by something else is never
+// re-verified on the write path, and a step that then consumed its value —
+// setting the tenant's database password to one that workload knows, say —
+// would have done the damage before any later check ran.
+func readTenantSecret(ctx context.Context, c Clients, t *provisioner.Tenant, name string) ([]byte, error) {
+	full := t.SecretName(name)
+	owner, exists, err := c.Secrets.Owner(ctx, full)
+	if err != nil {
+		return nil, fmt.Errorf("read the owner of %s: %w", name, err)
+	}
+	if exists && owner != t.Row.ID.String() {
+		return nil, fmt.Errorf("%w: secret %s", ErrNotOwned, full)
+	}
+	return c.Secrets.Get(ctx, full)
+}
+
+// putTenantSecret writes one of the tenant's secrets, labelled as its own,
+// and records the reference. A secret of that name belonging to something
+// else comes back as ErrNotOwned so the steps layer speaks one sentinel
+// whatever the resource is.
+func putTenantSecret(ctx context.Context, c Clients, t *provisioner.Tenant, name, value string) error {
+	ref, err := c.Secrets.Put(ctx, t.SecretName(name), []byte(value), t.Row.ID.String())
+	if errors.Is(err, secrets.ErrNotOwned) {
+		return fmt.Errorf("%w: secret %s", ErrNotOwned, t.SecretName(name))
+	}
+	if err != nil {
+		return fmt.Errorf("write %s: %w", name, err)
+	}
+	return t.SetSecretRef(ctx, name, ref)
 }
 
 // deleteTenantSecret removes one of the tenant's secrets, and treats a

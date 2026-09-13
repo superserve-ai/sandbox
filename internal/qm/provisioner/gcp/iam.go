@@ -89,7 +89,7 @@ func (a *Accounts) Create(ctx context.Context, accountID, displayName, descripti
 		return "", fmt.Errorf("service account %s reported as existing but cannot be read", accountID)
 	}
 	if existing.Description != description {
-		return "", fmt.Errorf("service account %s already exists and does not belong to this tenant", email)
+		return "", fmt.Errorf("%w: service account %s", steps.ErrNotOwned, email)
 	}
 	return existing.Email, nil
 }

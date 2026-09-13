@@ -175,7 +175,7 @@ func (f *fakeDatabases) checkMarker(kind, name, marker string) error {
 	}
 	have, marked := f.markers[kind+":"+name]
 	if (exists || marked) && have != marker {
-		return fmt.Errorf("fake: %s %s does not belong to this tenant", kind, name)
+		return fmt.Errorf("%w: fake %s %s", ErrNotOwned, kind, name)
 	}
 	return nil
 }
@@ -398,7 +398,7 @@ func (f *fakeServices) Deploy(_ context.Context, spec ServiceSpec) (ServiceStatu
 	// retry state, and patching it would take over whatever it is.
 	if existing, ok := f.services[spec.Name]; ok {
 		if want := spec.Labels[TenantLabelKey]; want == "" || existing.Labels[TenantLabelKey] != want {
-			return ServiceStatus{}, fmt.Errorf("fake: service %s does not belong to this tenant", spec.Name)
+			return ServiceStatus{}, fmt.Errorf("%w: fake service %s", ErrNotOwned, spec.Name)
 		}
 	}
 	f.services[spec.Name] = spec
@@ -452,7 +452,7 @@ func (f *fakeLoadBalancer) EnsureHostRule(_ context.Context, host, service, owne
 	// Mirrors the real client: the NEG and backend service are named after
 	// the slug, so one carrying a different owner is not this tenant's.
 	if have, ok := f.owners[service]; ok && have != owner {
-		return fmt.Errorf("fake: backend %s does not belong to this tenant", service)
+		return fmt.Errorf("%w: fake backend %s", ErrNotOwned, service)
 	}
 	f.owners[service] = owner
 	if f.hosts[host] != service {
@@ -470,7 +470,7 @@ func (f *fakeLoadBalancer) RemoveHostRule(_ context.Context, host, owner string)
 	defer f.mu.Unlock()
 	if service, ok := f.hosts[host]; ok {
 		if have, owned := f.owners[service]; owned && have != owner {
-			return fmt.Errorf("fake: backend %s does not belong to this tenant", service)
+			return fmt.Errorf("%w: fake backend %s", ErrNotOwned, service)
 		}
 		delete(f.owners, service)
 	}

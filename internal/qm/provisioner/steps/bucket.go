@@ -156,7 +156,7 @@ func (s bucket) Run(ctx context.Context, t *provisioner.Tenant) error {
 		fallthrough
 	default:
 		if existing[TenantLabelKey] != t.Row.ID.String() {
-			return fmt.Errorf("bucket %s already exists and does not belong to this tenant", name)
+			return fmt.Errorf("%w: bucket %s", ErrNotOwned, name)
 		}
 	}
 	if err := s.c.Buckets.GrantAccess(ctx, name, account); err != nil {
@@ -213,11 +213,7 @@ func (s bucket) ensureHMACKey(ctx context.Context, t *provisioner.Tenant, accoun
 		{secretSecretAccessKey, key.Secret},
 		{secretAccessKeyID, key.AccessID},
 	} {
-		ref, err := s.c.Secrets.Put(ctx, t.SecretName(half.name), []byte(half.value), t.Row.ID.String())
-		if err != nil {
-			return fmt.Errorf("write %s: %w", half.name, err)
-		}
-		if err := t.SetSecretRef(ctx, half.name, ref); err != nil {
+		if err := putTenantSecret(ctx, s.c, t, half.name, half.value); err != nil {
 			return err
 		}
 	}
@@ -230,7 +226,7 @@ func (s bucket) ensureHMACKey(ctx context.Context, t *provisioner.Tenant, accoun
 // to the same key.
 func (s bucket) hmacStored(ctx context.Context, t *provisioner.Tenant) (bool, error) {
 	for _, name := range []string{secretAccessKeyID, secretSecretAccessKey} {
-		if _, err := s.c.Secrets.Get(ctx, t.SecretName(name)); err != nil {
+		if _, err := readTenantSecret(ctx, s.c, t, name); err != nil {
 			if errors.Is(err, secrets.ErrNotFound) {
 				return false, nil
 			}
@@ -306,13 +302,14 @@ func (s bucket) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 		name = *t.Row.BucketName
 	}
 	// As on the way up: emptying and deleting a bucket that is not this
-	// tenant's would destroy whatever is in it.
+	// tenant's would destroy whatever is in it. Left alone rather than
+	// reported as an error, so the rest of the teardown still runs.
 	existing, exists, err := s.c.Buckets.Get(ctx, name)
 	if err != nil {
 		return fmt.Errorf("look up the tenant's bucket: %w", err)
 	}
 	if exists && existing[TenantLabelKey] != t.Row.ID.String() {
-		return fmt.Errorf("bucket %s does not belong to this tenant; not deleting it", name)
+		return provisioner.Skip("the bucket named for this tenant belongs to something else; left alone")
 	}
 	if err := s.c.Buckets.Delete(ctx, name); err != nil {
 		return fmt.Errorf("delete the tenant's bucket: %w", err)

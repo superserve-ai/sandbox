@@ -53,11 +53,7 @@ func (s sandboxKey) Run(ctx context.Context, t *provisioner.Tenant) error {
 	// revokes from, so a key that exists in Postgres and nowhere else is a
 	// live credential the tenant cannot use; a secret holding a key that
 	// was never issued is inert, and the next attempt overwrites it.
-	ref, err := s.c.Secrets.Put(ctx, t.SecretName(secretSandboxAPIKey), []byte(raw), t.Row.ID.String())
-	if err != nil {
-		return fmt.Errorf("write the tenant's sandbox key: %w", err)
-	}
-	if err := t.SetSecretRef(ctx, secretSandboxAPIKey, ref); err != nil {
+	if err := putTenantSecret(ctx, s.c, t, secretSandboxAPIKey, raw); err != nil {
 		return err
 	}
 	keyID, err := t.IssueSandboxKey(ctx, qm.HashAPIKey(raw))

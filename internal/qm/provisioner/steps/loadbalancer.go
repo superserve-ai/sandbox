@@ -90,10 +90,20 @@ func (s loadBalancer) Rollback(ctx context.Context, t *provisioner.Tenant) error
 		return errNoLoadBalancerAdmin
 	}
 	owner := TenantDescription(t.Row.ID.String(), t.Row.Slug)
+	foreign := false
 	for _, host := range routedHosts(t) {
 		if err := s.c.LoadBalancer.RemoveHostRule(ctx, host, owner); err != nil {
-			return fmt.Errorf("remove the tenant's route: %w", err)
+			// Another workload's route, left where it is. Not an error:
+			// the runner stops a teardown at its first failing step, and
+			// this tenant's own resources still have to come down.
+			if !errors.Is(err, ErrNotOwned) {
+				return fmt.Errorf("remove the tenant's route: %w", err)
+			}
+			foreign = true
 		}
+	}
+	if foreign {
+		return provisioner.Skip("the route named for this tenant belongs to something else; left alone")
 	}
 	return nil
 }

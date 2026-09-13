@@ -555,7 +555,7 @@ func ownedBy(description, owner, kind, name string) error {
 	if description == owner {
 		return nil
 	}
-	return fmt.Errorf("%s %s already exists and does not belong to this tenant", kind, name)
+	return fmt.Errorf("%w: %s %s", steps.ErrNotOwned, kind, name)
 }
 
 func computeOperationError(op *compute.Operation) error {
