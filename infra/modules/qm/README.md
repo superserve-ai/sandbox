@@ -88,8 +88,9 @@ tenant `<slug>` (names from `internal/qm/provisioner/steps`):
 - a database `qm_<slug>` and role on the shared instance, through the SQL
   Admin API
 - a bucket `<project>-qm-<slug>` in `tenant_bucket_location`, with the
-  lifecycle policy from `tenant_bucket_lifecycle_policy_json` and bucket IAM
-  for the tenant account
+  lifecycle policy from `tenant_bucket_lifecycle_policy_json`, bucket IAM for
+  the tenant account, and an HMAC key for that account (QM reaches its bucket
+  through an S3 client, which authenticates with an access key)
 - `qm-<slug>-<name>` secrets (qm-api itself writes the model key a tenant
   hands it before the run starts)
 - a serverless NEG, backend service, and host rule on the shared URL map so
@@ -197,6 +198,10 @@ Before `tenant_capacity` approaches that, request an increase for the IAM API
 - Buckets: a custom role with bucket-level permissions plus object
   list/delete for teardown (no object read), conditioned on the
   `<project>-qm-` name prefix.
+- Storage HMAC keys: a second custom role, unconditional, for the
+  interoperability credential each tenant's S3 client authenticates with.
+  These belong to the project and the service account rather than to a
+  bucket, so there is no resource name to condition on.
 - Create permissions (`storage.buckets.create`, `secretmanager.secrets.create`)
   are evaluated against the project, so they cannot be conditioned on the
   eventual name; they sit in separate unconditional custom roles (one for

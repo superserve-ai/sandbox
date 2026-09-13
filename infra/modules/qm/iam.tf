@@ -246,6 +246,38 @@ resource "google_project_iam_member" "provisioner_tenant_bucket_admin" {
   }
 }
 
+# The interoperability credential each tenant's QM authenticates to Cloud
+# Storage with. QM talks to its bucket through an S3 client, which needs an
+# access key rather than the Google credentials Cloud Run injects, so the
+# provisioner mints one HMAC key per tenant service account and deletes it on
+# teardown (deactivate, then delete — Cloud Storage refuses to delete an
+# active key). List is how a retry finds the keys an interrupted attempt left
+# behind, which matters: an account is capped at five.
+#
+# HMAC keys belong to the project and the service account rather than to a
+# bucket, so resource.name carries no tenant prefix to condition on. Creating
+# one for an account also checks iam.serviceAccounts.actAs on that account,
+# which the project-level serviceAccountUser grant above already covers.
+resource "google_project_iam_custom_role" "tenant_storage_keys" {
+  project     = var.project_id
+  role_id     = "qmTenantStorageKeys_${local.custom_role_suffix}"
+  title       = "QM tenant storage keys (${var.environment})"
+  description = "Mint, list and remove the HMAC keys tenant service accounts reach their buckets with."
+  permissions = [
+    "storage.hmacKeys.create",
+    "storage.hmacKeys.get",
+    "storage.hmacKeys.list",
+    "storage.hmacKeys.update",
+    "storage.hmacKeys.delete",
+  ]
+}
+
+resource "google_project_iam_member" "provisioner_tenant_storage_keys" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.tenant_storage_keys.id
+  member  = local.provisioner_member
+}
+
 # Create permissions are evaluated against the project, so they cannot be
 # conditioned on the eventual resource name. Kept in their own role so the
 # unconditional grant carries nothing else.
