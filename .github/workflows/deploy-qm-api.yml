@@ -307,7 +307,9 @@ jobs:
           docker push ${IMAGE}:${{ github.sha }}
 
       # Single cell: hosted QM runs alongside the primary control-plane cell
-      # and pulls the image cross-region from the shared Artifact Registry.
+      # and pulls the image cross-region from the shared Artifact Registry —
+      # so the region the service lives in is GCP_REGION_USE4 (as in
+      # deploy-api.yml), not the GCP_REGION the registry is addressed by.
       # Job first, then service: a run the new service triggers must never
       # land on an older provisioner, while the old service triggering the
       # new job is fine (the job's argument contract only grows).
@@ -315,7 +317,7 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         run: |
           IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/qm-api:${{ github.sha }}"
-          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
+          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }}"
           gcloud run jobs update ${{ vars.QM_PROVISIONER_JOB || 'qm-provisioner' }} --image "$IMAGE" $ARGS
           gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" $ARGS
 
@@ -323,7 +325,7 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         run: |
           SVC=${{ vars.QM_API_SERVICE }}
-          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
+          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }}"
           DESC=$(gcloud run services describe $SVC $ARGS --format=json)
           LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
           SERVING=$(echo "$DESC" | jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // "none"')
@@ -336,7 +338,7 @@ jobs:
         if: steps.gate.outputs.enabled == 'true'
         run: |
           SVC=${{ vars.QM_API_SERVICE }}
-          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
+          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }}"
           DESC=$(gcloud run services describe $SVC $ARGS --format=json)
           LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
           PCT=$(echo "$DESC" | jq --arg r "$LATEST" '[.status.traffic[]? | select(.revisionName == $r or .latestRevision == true) | .percent] | add // 0')
