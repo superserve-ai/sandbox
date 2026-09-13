@@ -87,4 +87,37 @@ $$;
 REVOKE ALL ON FUNCTION qm.touch_api_key(uuid) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION qm.touch_api_key(uuid) TO qm_api;
 
+-- Deprovisioning has to leave the tenant's sandbox key revoked, not merely
+-- forgotten: the key is bound to this cell, and team migration refuses a
+-- cutover while a tenant still references a live one. qm_api has no UPDATE
+-- on api_key and should not get one — that would let it revoke any of the
+-- team's keys — so the revoke goes through a definer function that can
+-- only reach the key the caller's own tenant points at. Returns whether
+-- the tenant referenced a key at all; a key already revoked is a no-op, so
+-- a retried teardown is safe.
+DROP FUNCTION IF EXISTS qm.revoke_tenant_api_key(uuid);
+CREATE FUNCTION qm.revoke_tenant_api_key(tenant uuid)
+RETURNS boolean
+LANGUAGE sql SECURITY DEFINER
+SET search_path = pg_catalog
+AS $$
+    WITH target AS (
+        SELECT t.sandbox_api_key_id AS key_id
+        FROM qm.tenants t
+        WHERE t.id = tenant
+          AND t.team_id = qm.current_team_id()
+          AND t.sandbox_api_key_id IS NOT NULL
+    ), revoked AS (
+        UPDATE public.api_key k
+        SET revoked_at = now()
+        FROM target
+        WHERE k.id = target.key_id AND k.revoked_at IS NULL
+        RETURNING k.id
+    )
+    SELECT EXISTS (SELECT 1 FROM target)
+$$;
+
+REVOKE ALL ON FUNCTION qm.revoke_tenant_api_key(uuid) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION qm.revoke_tenant_api_key(uuid) TO qm_api;
+
 COMMIT;

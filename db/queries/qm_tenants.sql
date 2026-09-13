@@ -116,3 +116,9 @@ WHERE id = $1 AND team_id = $2
   AND status <> 'deleted'
   AND status = ANY(sqlc.arg(from_statuses)::text[])
 RETURNING *;
+
+-- name: RevokeQMTenantSandboxKey :one
+-- Revokes the tenant's sandbox API key through the definer function that
+-- stands in for the api_key UPDATE qm_api does not have. Returns whether
+-- the tenant referenced a key; already-revoked keys are a no-op.
+SELECT qm.revoke_tenant_api_key(sqlc.arg(tenant_id)) AS revoked;

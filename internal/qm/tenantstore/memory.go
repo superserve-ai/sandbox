@@ -32,6 +32,8 @@ type Memory struct {
 	BeforeSoftDelete func() error
 	// Detached lists teams migrated away from this cell.
 	Detached map[uuid.UUID]bool
+	// RevokedKeys are the sandbox API keys RevokeSandboxKey has revoked.
+	RevokedKeys map[uuid.UUID]bool
 }
 
 func NewMemory() *Memory {
@@ -41,6 +43,8 @@ func NewMemory() *Memory {
 		secrets: map[uuid.UUID]map[string]string{},
 		locked:  map[uuid.UUID]bool{},
 		Now:     time.Now,
+
+		RevokedKeys: map[uuid.UUID]bool{},
 	}
 }
 
@@ -298,6 +302,26 @@ func (m *Memory) DeleteSecretRef(_ context.Context, teamID, tenantID uuid.UUID, 
 	}
 	delete(m.secrets[tenantID], name)
 	return nil
+}
+
+// RevokeSandboxKey records the revocation the definer function performs in
+// Postgres; RevokedKeys is what tests assert on.
+func (m *Memory) RevokeSandboxKey(_ context.Context, teamID, tenantID uuid.UUID) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.Fail != nil {
+		return false, m.Fail
+	}
+	// Scoped, not live: a tenant is retired before its teardown finishes.
+	t, err := m.scoped(teamID, tenantID)
+	if err != nil {
+		return false, err
+	}
+	if !t.SandboxApiKeyID.Valid {
+		return false, nil
+	}
+	m.RevokedKeys[uuid.UUID(t.SandboxApiKeyID.Bytes)] = true
+	return true, nil
 }
 
 func (m *Memory) SlugAvailable(_ context.Context, _ uuid.UUID, slug string) (bool, error) {

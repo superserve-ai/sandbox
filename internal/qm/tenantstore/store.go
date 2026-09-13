@@ -116,6 +116,12 @@ type Store interface {
 	ListSecretRefs(ctx context.Context, teamID, tenantID uuid.UUID) ([]SecretRef, error)
 	DeleteSecretRef(ctx context.Context, teamID, tenantID uuid.UUID, name string) error
 
+	// RevokeSandboxKey revokes the API key the tenant was issued, reporting
+	// whether it had one. Teardown must do this rather than just forget the
+	// reference: the key is bound to this cell, and team migration refuses
+	// a cutover while a tenant still points at a live one. Idempotent.
+	RevokeSandboxKey(ctx context.Context, teamID, tenantID uuid.UUID) (bool, error)
+
 	// SlugAvailable answers across every team.
 	SlugAvailable(ctx context.Context, teamID uuid.UUID, slug string) (bool, error)
 

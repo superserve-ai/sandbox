@@ -69,6 +69,12 @@ func (t *Tenant) SetSecretRef(ctx context.Context, name, ref string) error {
 	return t.store.SetSecretRef(ctx, t.Row.TeamID, t.Row.ID, name, ref)
 }
 
+// RevokeSandboxKey revokes the API key the tenant was issued, reporting
+// whether it had one.
+func (t *Tenant) RevokeSandboxKey(ctx context.Context) (bool, error) {
+	return t.store.RevokeSandboxKey(ctx, t.Row.TeamID, t.Row.ID)
+}
+
 // SecretRefs lists the tenant's recorded secrets.
 func (t *Tenant) SecretRefs(ctx context.Context) ([]tenantstore.SecretRef, error) {
 	return t.store.ListSecretRefs(ctx, t.Row.TeamID, t.Row.ID)

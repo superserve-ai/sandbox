@@ -186,7 +186,7 @@ func TestPlanReadyGatesUnimplementedSteps(t *testing.T) {
 	if err == nil {
 		t.Fatal("real mode reported a runnable plan")
 	}
-	for _, want := range []string{"service_account", "database", "bucket", "cloud_run", "load_balancer", "health_check", "smoke"} {
+	for _, want := range []string{"service_account", "database", "bucket", "sandbox_key", "cloud_run", "load_balancer", "health_check", "smoke"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("%q missing from %v", want, err)
 		}
@@ -196,5 +196,53 @@ func TestPlanReadyGatesUnimplementedSteps(t *testing.T) {
 	err = provisioner.PlanReady(All(Clients{}), provisioner.Env{Stub: true})
 	if err == nil || !strings.Contains(err.Error(), "secrets") || !strings.Contains(err.Error(), "admin_link") {
 		t.Errorf("no secret store: %v", err)
+	}
+}
+
+// Teardown revokes the tenant's sandbox API key rather than merely
+// forgetting the reference: the key is bound to this cell, and team
+// migration refuses a region cutover while a tenant still points at a live
+// one. This half of the step is real even in stub mode.
+func TestDeprovisionRevokesTheSandboxKey(t *testing.T) {
+	ctx := context.Background()
+	r, store, _, teamID, tenant := newRunner(t, true)
+	keyID := uuid.New()
+	if _, err := store.UpdateResources(ctx, teamID, tenant.ID, tenantstore.Resources{SandboxAPIKeyID: &keyID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision); err != nil {
+		t.Fatal(err)
+	}
+	if store.RevokedKeys[keyID] {
+		t.Error("provisioning revoked the tenant's sandbox key")
+	}
+
+	if _, err := store.SetStatus(ctx, teamID, tenant.ID, tenantstore.StatusDeprovisioning); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision); err != nil {
+		t.Fatal(err)
+	}
+	if !store.RevokedKeys[keyID] {
+		t.Error("deprovisioning left the tenant's sandbox key live")
+	}
+
+	// A tenant that never got a key tears down without one.
+	r2, store2, _, team2, tenant2 := newRunner(t, true)
+	if _, err := store2.SetStatus(ctx, team2, tenant2.ID, tenantstore.StatusDeprovisioning); err != nil {
+		t.Fatal(err)
+	}
+	if err := r2.Run(ctx, team2, tenant2.ID, provisioner.ModeDeprovision); err != nil {
+		t.Fatal(err)
+	}
+	events, _ := store2.ListEvents(ctx, team2, tenant2.ID)
+	var found bool
+	for _, e := range events {
+		if e.Step == "sandbox_key" && e.Status == tenantstore.EventSkipped {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("teardown without a key did not skip sandbox_key")
 	}
 }

@@ -38,7 +38,7 @@ type Clients struct {
 // abandon halfway through building.
 type stubOnly struct{}
 
-var errStubOnly = errors.New("not implemented; set QM_PROVISIONER_STUB=1 to record a placeholder instead")
+var errStubOnly = errors.New("not implemented; set QM_PROVISIONER_STUB=1 to run the plan with placeholders")
 
 func (stubOnly) Ready(env provisioner.Env) error {
 	if env.Stub {
@@ -51,7 +51,8 @@ func (stubOnly) Ready(env provisioner.Env) error {
 // reverse, running each step's Rollback. Order follows the dependencies:
 // generated secrets first (the database step reads DATABASE_PASSWORD, the
 // service account is granted access to them), then the identity, then the
-// resources bound to it, then the service and its route, then the probes.
+// resources bound to it, then the sandbox key the service is configured
+// with, then the service and its route, then the probes.
 func All(c Clients) []provisioner.Step {
 	if c.HTTP == nil {
 		c.HTTP = &http.Client{Timeout: 15 * time.Second}
@@ -61,6 +62,7 @@ func All(c Clients) []provisioner.Step {
 		serviceAccount{c: c},
 		database{c: c},
 		bucket{c: c},
+		sandboxKey{c: c},
 		cloudRun{c: c},
 		loadBalancer{c: c},
 		healthCheck{c: c},

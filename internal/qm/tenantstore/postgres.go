@@ -269,6 +269,16 @@ func (s *Postgres) DeleteSecretRef(ctx context.Context, teamID, tenantID uuid.UU
 	})
 }
 
+func (s *Postgres) RevokeSandboxKey(ctx context.Context, teamID, tenantID uuid.UUID) (bool, error) {
+	var had bool
+	err := s.withTeamTx(ctx, teamID, func(q *db.Queries) error {
+		var err error
+		had, err = q.RevokeQMTenantSandboxKey(ctx, tenantID)
+		return err
+	})
+	return had, err
+}
+
 func (s *Postgres) SlugAvailable(ctx context.Context, teamID uuid.UUID, slug string) (bool, error) {
 	var ok bool
 	err := s.withTeamTx(ctx, teamID, func(q *db.Queries) error {

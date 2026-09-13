@@ -431,3 +431,71 @@ func TestQMAPI_HTTPEndToEndInProcess(t *testing.T) {
 		t.Errorf("list after deprovision: %d %v", code, body)
 	}
 }
+
+// The definer function is what lets teardown revoke the tenant's sandbox
+// key: qm_api has no UPDATE on api_key, and team migration refuses a region
+// cutover while a retired tenant still points at a live one.
+func TestQMAPI_RevokesOnlyItsOwnTenantSandboxKey(t *testing.T) {
+	ctx := context.Background()
+	teamA, _ := seedQMTeamAndKey(t)
+	teamB, _ := seedQMTeamAndKey(t)
+	store := qmAPIStore(t, qmAPIPool(t))
+
+	_, keyID := seedQMKey(t, teamA, "tenant-sandbox-key", nil)
+	tenant, err := store.CreateTenant(ctx, teamA, tenantstore.CreateParams{
+		Slug: "pilot-team-" + uuid.NewString()[:8], OrgName: "Pilot Team",
+		AdminEmail: "admin@example.com", SignIn: "magic_link", ModelProvider: "anthropic",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateResources(ctx, teamA, tenant.ID, tenantstore.Resources{SandboxAPIKeyID: &keyID}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Another team cannot reach the key through the function.
+	if had, err := store.RevokeSandboxKey(ctx, teamB, tenant.ID); err != nil || had {
+		t.Errorf("cross-team revoke: had=%v err=%v", had, err)
+	}
+	if revoked := keyRevoked(t, keyID); revoked {
+		t.Fatal("a key was revoked for a team that does not own the tenant")
+	}
+
+	had, err := store.RevokeSandboxKey(ctx, teamA, tenant.ID)
+	if err != nil || !had {
+		t.Fatalf("revoke: had=%v err=%v", had, err)
+	}
+	if !keyRevoked(t, keyID) {
+		t.Error("the tenant's sandbox key is still live")
+	}
+	// Idempotent: teardown is retried, and a retired tenant keeps the
+	// reference so the revoke stays answerable.
+	if _, err := store.SoftDelete(ctx, teamA, tenant.ID); err != nil {
+		t.Fatal(err)
+	}
+	if had, err := store.RevokeSandboxKey(ctx, teamA, tenant.ID); err != nil || !had {
+		t.Errorf("second revoke: had=%v err=%v", had, err)
+	}
+
+	// A tenant that never got one reports so rather than failing.
+	bare, err := store.CreateTenant(ctx, teamB, tenantstore.CreateParams{
+		Slug: "pilot-team-" + uuid.NewString()[:8], OrgName: "Pilot Team",
+		AdminEmail: "admin@example.com", SignIn: "magic_link", ModelProvider: "anthropic",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if had, err := store.RevokeSandboxKey(ctx, teamB, bare.ID); err != nil || had {
+		t.Errorf("tenant without a key: had=%v err=%v", had, err)
+	}
+}
+
+func keyRevoked(t *testing.T, keyID uuid.UUID) bool {
+	t.Helper()
+	var revoked bool
+	if err := testPool.QueryRow(context.Background(),
+		`SELECT revoked_at IS NOT NULL FROM api_key WHERE id = $1`, keyID).Scan(&revoked); err != nil {
+		t.Fatalf("read api key: %v", err)
+	}
+	return revoked
+}

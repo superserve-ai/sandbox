@@ -299,6 +299,20 @@ func (q *Queries) QMTeamHomedHere(ctx context.Context, teamID uuid.UUID) (bool, 
 	return homed, err
 }
 
+const revokeQMTenantSandboxKey = `-- name: RevokeQMTenantSandboxKey :one
+SELECT qm.revoke_tenant_api_key($1) AS revoked
+`
+
+// Revokes the tenant's sandbox API key through the definer function that
+// stands in for the api_key UPDATE qm_api does not have. Returns whether
+// the tenant referenced a key; already-revoked keys are a no-op.
+func (q *Queries) RevokeQMTenantSandboxKey(ctx context.Context, tenantID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, revokeQMTenantSandboxKey, tenantID)
+	var revoked bool
+	err := row.Scan(&revoked)
+	return revoked, err
+}
+
 const setQMTeamScope = `-- name: SetQMTeamScope :exec
 SELECT set_config('qm.team_id', $1::text, true)
 `
