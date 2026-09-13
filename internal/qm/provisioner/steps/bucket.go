@@ -76,24 +76,36 @@ func (s bucket) Ready(env provisioner.Env) error {
 	// Parsed here rather than at the bucket call: a malformed policy would
 	// otherwise be discovered after the tenant's secrets, sandbox key,
 	// identity and database already exist, on every tenant, forever.
-	return validLifecyclePolicy(env.BucketLifecycleJSON)
+	_, err := ParseLifecyclePolicy(env.BucketLifecycleJSON)
+	return err
 }
 
-// validLifecyclePolicy checks the shape of QM_TENANT_BUCKET_LIFECYCLE_JSON.
-// Only the outline is checked — the rules themselves are Cloud Storage's to
-// accept — but that is enough to catch a value that was mangled on its way
-// through a deploy.
-func validLifecyclePolicy(policy string) error {
-	if strings.TrimSpace(policy) == "" {
-		return nil
+// ParseLifecyclePolicy checks the shape of QM_TENANT_BUCKET_LIFECYCLE_JSON
+// and reports whether there is a policy to apply. Only the outline is
+// checked — the rules themselves are Cloud Storage's to accept — but the
+// outline is what a deploy can mangle.
+//
+// Strict about the outline on purpose. A permissive parse turns `{}`,
+// `null` or a misspelled `{"rules": ...}` into "no rules", which is not an
+// error anywhere: the plan starts, every bucket is created, and the policy
+// nobody notices is missing is the one that reaps abandoned uploads.
+func ParseLifecyclePolicy(policy string) (string, error) {
+	policy = strings.TrimSpace(policy)
+	if policy == "" {
+		return "", nil
 	}
 	var parsed struct {
-		Rule []json.RawMessage `json:"rule"`
+		Rule *[]json.RawMessage `json:"rule"`
 	}
-	if err := json.Unmarshal([]byte(policy), &parsed); err != nil {
-		return fmt.Errorf("QM_TENANT_BUCKET_LIFECYCLE_JSON is not a lifecycle policy: %w", err)
+	decoder := json.NewDecoder(strings.NewReader(policy))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&parsed); err != nil {
+		return "", fmt.Errorf("QM_TENANT_BUCKET_LIFECYCLE_JSON is not a lifecycle policy: %w", err)
 	}
-	return nil
+	if parsed.Rule == nil {
+		return "", errors.New(`QM_TENANT_BUCKET_LIFECYCLE_JSON is not a lifecycle policy: no "rule" list`)
+	}
+	return policy, nil
 }
 
 func (s bucket) Run(ctx context.Context, t *provisioner.Tenant) error {

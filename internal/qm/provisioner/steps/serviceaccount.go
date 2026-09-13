@@ -114,13 +114,16 @@ func (s serviceAccount) Run(ctx context.Context, t *provisioner.Tenant) error {
 // ok is false when there is nothing this tenant owns, which is the signal
 // for the account-scoped parts of teardown to do nothing at all.
 func tenantAccount(ctx context.Context, c Clients, t *provisioner.Tenant) (string, bool, error) {
-	if t.Row.ServiceAccount != nil {
-		return *t.Row.ServiceAccount, true, nil
-	}
 	if c.Accounts == nil {
 		return "", false, errNoServiceAccountAdmin
 	}
 	email := ServiceAccountEmail(t.Env.Project, t.Row.Slug)
+	if t.Row.ServiceAccount != nil {
+		email = *t.Row.ServiceAccount
+	}
+	// The marker is checked even for a recorded account: an account can be
+	// deleted and recreated under the same email by something else, and the
+	// row would still name it.
 	existing, exists, err := c.Accounts.Get(ctx, email)
 	if err != nil {
 		return "", false, fmt.Errorf("look up service account: %w", err)
@@ -155,15 +158,6 @@ func (s serviceAccount) Rollback(ctx context.Context, t *provisioner.Tenant) err
 	}
 	if !ok {
 		return provisioner.Skip("no service account of this tenant's")
-	}
-	if t.Row.ServiceAccount != nil {
-		existing, exists, err := s.c.Accounts.Get(ctx, email)
-		if err != nil {
-			return fmt.Errorf("look up service account: %w", err)
-		}
-		if exists && existing.Description != TenantDescription(t.Row.ID.String(), t.Row.Slug) {
-			return fmt.Errorf("service account %s does not belong to this tenant; not deleting it", email)
-		}
 	}
 	if err := s.c.Accounts.Delete(ctx, email); err != nil {
 		return fmt.Errorf("delete service account: %w", err)

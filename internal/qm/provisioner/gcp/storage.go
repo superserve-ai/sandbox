@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
-	"strings"
 
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/option"
@@ -83,16 +82,20 @@ func (b *Buckets) Create(ctx context.Context, name, location, lifecycleJSON stri
 		},
 		Labels: labels,
 	}
-	// Trimmed, matching the step's readiness check: a value of nothing but
-	// whitespace is no policy, not a policy that fails to parse.
-	if strings.TrimSpace(lifecycleJSON) != "" {
+	// The same parser the readiness check used, so the two cannot disagree
+	// about whether a value is a policy at all.
+	policy, err := steps.ParseLifecyclePolicy(lifecycleJSON)
+	if err != nil {
+		return err
+	}
+	if policy != "" {
 		var lifecycle storage.BucketLifecycle
-		if err := json.Unmarshal([]byte(strings.TrimSpace(lifecycleJSON)), &lifecycle); err != nil {
+		if err := json.Unmarshal([]byte(policy), &lifecycle); err != nil {
 			return fmt.Errorf("parse the tenant bucket lifecycle policy: %w", err)
 		}
 		spec.Lifecycle = &lifecycle
 	}
-	_, err := b.svc.Buckets.Insert(b.project, spec).Context(ctx).Do()
+	_, err = b.svc.Buckets.Insert(b.project, spec).Context(ctx).Do()
 	if err != nil && !alreadyExists(err) {
 		return fmt.Errorf("create bucket %s: %w", name, err)
 	}

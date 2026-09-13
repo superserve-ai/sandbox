@@ -585,23 +585,40 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 	}
 }
 
-// And teardown will not delete one either: a tenant whose slug collided must
-// not take the resource it collided with down with it.
-func TestTeardownRefusesResourcesItDoesNotOwn(t *testing.T) {
+// And teardown will not delete one either. An account that carries somebody
+// else's marker is not this tenant's, whatever the row says — it can have
+// been deleted and recreated under the same email — so there is nothing of
+// this tenant's there to remove. Teardown skips it and finishes: refusing
+// instead would leave the tenant undeletable forever over a resource that
+// was never its.
+func TestTeardownSkipsResourcesItDoesNotOwn(t *testing.T) {
+	const email = "qm-pilot-team@example-project.iam.gserviceaccount.com"
 	f := newFixture(t, false)
 	if err := f.provision(t); err != nil {
 		t.Fatal(err)
 	}
-	// Something else takes over the names between provision and teardown.
+	// Something else takes over the name between provision and teardown.
 	f.accounts.mu.Lock()
-	f.accounts.accounts["qm-pilot-team@example-project.iam.gserviceaccount.com"] = "the platform's provisioner"
+	f.accounts.accounts[email] = "somebody else"
 	f.accounts.mu.Unlock()
 
-	if err := f.deprovision(t); err == nil {
-		t.Fatal("teardown deleted a resource it does not own")
+	if err := f.deprovision(t); err != nil {
+		t.Fatalf("teardown: %v", err)
 	}
-	if _, ok := f.accounts.accounts["qm-pilot-team@example-project.iam.gserviceaccount.com"]; !ok {
+	if f.current(t).Status != tenantstore.StatusDeleted {
+		t.Errorf("status = %s", f.current(t).Status)
+	}
+	if f.accounts.accounts[email] != "somebody else" {
 		t.Error("the account that did not belong to this tenant was deleted")
+	}
+	var skipped bool
+	for _, e := range f.events(t) {
+		if e.Step == "service_account" && e.Status == tenantstore.EventSkipped {
+			skipped = true
+		}
+	}
+	if !skipped {
+		t.Errorf("service_account did not report a skip: %v", f.events(t))
 	}
 }
 

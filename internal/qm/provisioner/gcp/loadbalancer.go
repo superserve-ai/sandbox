@@ -83,6 +83,14 @@ func (l *LoadBalancer) EnsureHostRule(ctx context.Context, host, cloudRunService
 // be deleted while the URL map still references it, and the NEG cannot be
 // deleted while a backend service still points at it.
 func (l *LoadBalancer) RemoveHostRule(ctx context.Context, host, owner string) error {
+	// Before the map is touched at all. A provision that stopped because
+	// the derived NEG or backend belonged to another workload still reaches
+	// teardown, and a patch that ran first would have removed that
+	// workload's hostname from the shared map before the ownership error
+	// came back.
+	if err := l.routeIsOurs(ctx, host, owner); err != nil {
+		return err
+	}
 	var name string
 	var shared bool
 	if err := l.patchURLMap(ctx, func(m *compute.UrlMap) bool {
@@ -113,12 +121,47 @@ func (l *LoadBalancer) RemoveHostRule(ctx context.Context, host, owner string) e
 	return l.deleteNEG(ctx, name, owner)
 }
 
-// ensureNEG creates the serverless NEG if it is missing, and refuses to
-// carry on if one of that name already points at a different Cloud Run
-// service. A NEG's target is fixed at creation, so this is not something
-// the provisioner can repair — and quietly accepting it would route a
-// tenant's hostname at somebody else's service, which the health and
-// sign-in probes would both happily pass.
+// routeIsOurs refuses to touch a hostname whose backing resources belong to
+// something else. It resolves the host's path matcher to the backend service
+// behind it and checks that backend's marker; a host with no rule, or a
+// matcher with no backend, is nothing to protect.
+func (l *LoadBalancer) routeIsOurs(ctx context.Context, host, owner string) error {
+	urlMap, err := l.svc.UrlMaps.Get(l.project, l.urlMap).Context(ctx).Do()
+	if err != nil {
+		return fmt.Errorf("read url map %s: %w", l.urlMap, err)
+	}
+	var matcher string
+	for _, rule := range urlMap.HostRules {
+		if slices.Contains(rule.Hosts, host) {
+			matcher = rule.PathMatcher
+			break
+		}
+	}
+	if matcher == "" {
+		return nil
+	}
+	var backend string
+	for _, pm := range urlMap.PathMatchers {
+		if pm.Name == matcher {
+			backend = pm.DefaultService
+			break
+		}
+	}
+	if backend == "" {
+		return nil
+	}
+	// DefaultService is a URL; the backend's own name is its last segment.
+	name := backend[strings.LastIndex(backend, "/")+1:]
+	existing, err := l.svc.BackendServices.Get(l.project, name).Context(ctx).Do()
+	if err != nil {
+		if notFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get the backend service %s behind %s: %w", name, host, err)
+	}
+	return ownedBy(existing.Description, owner, "backend service", name)
+}
+
 func (l *LoadBalancer) ensureNEG(ctx context.Context, name, cloudRunService, owner string) error {
 	existing, err := l.svc.RegionNetworkEndpointGroups.Get(l.project, l.region, name).Context(ctx).Do()
 	if err == nil {
