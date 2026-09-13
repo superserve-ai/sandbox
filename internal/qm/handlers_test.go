@@ -1213,3 +1213,77 @@ func (s *reclaimRacingStore) Lock(ctx context.Context, teamID, tenantID uuid.UUI
 	}
 	return release, nil
 }
+
+// A write can commit and still report an error — a connection dropped on
+// the way back. The queue attempt has the run lock at that point, so it
+// re-reads the row instead of trusting what it thinks it wrote: a create is
+// left failed and retryable, and a delete is undone, rather than either
+// sitting in flight with no run behind it until the stale reclaim.
+func TestQueueRunReconcilesAnAmbiguousWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		commit     func(*ambiguousStore)
+		method     string
+		path       string
+		wantStatus string
+	}{
+		{"transition", func(s *ambiguousStore) { s.failTransition = true }, http.MethodPost, "/retry", tenantstore.StatusFailed},
+		{"intent event", func(s *ambiguousStore) { s.failEvent = true }, http.MethodPost, "/retry", tenantstore.StatusFailed},
+		{"delete transition", func(s *ambiguousStore) { s.failTransition = true }, http.MethodDelete, "", tenantstore.StatusReady},
+		{"delete intent event", func(s *ambiguousStore) { s.failEvent = true }, http.MethodDelete, "", tenantstore.StatusReady},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			id := f.create(t)
+			tid := uuid.MustParse(id)
+			ctx := context.Background()
+			start := tenantstore.StatusFailed
+			if tc.method == http.MethodDelete {
+				start = tenantstore.StatusReady
+			}
+			f.store.SetStatus(ctx, f.teamA, tid, start)
+
+			store := &ambiguousStore{Memory: f.store}
+			tc.commit(store)
+			h := &Handlers{Store: store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+			f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
+			calls := len(f.trigger.Calls)
+			if code, _ := f.do(t, tc.method, "/v1/qm/tenants/"+id+tc.path, keyTeamA, nil); code != http.StatusInternalServerError {
+				t.Fatalf("status %d, want 500", code)
+			}
+			if len(f.trigger.Calls) != calls {
+				t.Error("a run was triggered")
+			}
+			row, _ := f.store.GetTenant(ctx, f.teamA, tid)
+			if row.Status != tc.wantStatus {
+				t.Errorf("status = %s, want %s", row.Status, tc.wantStatus)
+			}
+		})
+	}
+}
+
+// ambiguousStore commits the next transition or event and then reports a
+// transport error for it, as a connection dropped after COMMIT would.
+type ambiguousStore struct {
+	*tenantstore.Memory
+	failTransition bool
+	failEvent      bool
+}
+
+func (s *ambiguousStore) TransitionStatus(ctx context.Context, teamID, tenantID uuid.UUID, from []string, to string) (tenantstore.Tenant, error) {
+	t, err := s.Memory.TransitionStatus(ctx, teamID, tenantID, from, to)
+	if err == nil && s.failTransition {
+		s.failTransition = false
+		return tenantstore.Tenant{}, errors.New("connection reset")
+	}
+	return t, err
+}
+
+func (s *ambiguousStore) InsertEvent(ctx context.Context, teamID uuid.UUID, p tenantstore.EventParams) (tenantstore.Event, error) {
+	e, err := s.Memory.InsertEvent(ctx, teamID, p)
+	if err == nil && s.failEvent && p.Step == stepTrigger {
+		s.failEvent = false
+		return tenantstore.Event{}, errors.New("connection reset")
+	}
+	return e, err
+}

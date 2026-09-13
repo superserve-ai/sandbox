@@ -490,7 +490,9 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 		return tenantstore.Tenant{}, false
 	case err != nil:
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("probe tenant lock")
-		h.abortQueue(c, tenant, at, mode, from, inFlight, err)
+		// No lock: nothing of this request's has been written, and the row
+		// cannot be trusted to be this request's doing.
+		h.abortQueue(c, tenant, &at, mode, from, inFlight, err)
 		return tenantstore.Tenant{}, false
 	}
 	// Held through the transition and the intent write, not just the probe:
@@ -517,7 +519,9 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 		return tenantstore.Tenant{}, false
 	case err != nil:
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("transition tenant status")
-		h.abortQueue(c, tenant, at, mode, from, inFlight, err)
+		// The transition may have committed before the error surfaced;
+		// the lock is still held, so the row is authoritative.
+		h.abortQueue(c, tenant, nil, mode, from, inFlight, err)
 		return tenantstore.Tenant{}, false
 	}
 	detail := map[string]any{"mode": string(mode)}
@@ -526,9 +530,9 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 	})
 	if err != nil {
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("record run intent")
-		// The event did not land, so the row's version is still the one
-		// this request's own transition produced.
-		h.abortQueue(c, tenant, tenantstore.VersionOf(updated), mode, from, inFlight, err)
+		// Same again: the event may have landed, which moves the row's
+		// version past the one this request's transition produced.
+		h.abortQueue(c, tenant, nil, mode, from, inFlight, err)
 		return tenantstore.Tenant{}, false
 	}
 	// The version this attempt owns from here on: its transition, plus the
@@ -567,13 +571,35 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 // failed-event write to carry the mode — the very thing that just broke.
 // The delete simply has not happened, so the tenant goes back where it was
 // and the caller issues it again.
-func (h *Handlers) abortQueue(c *gin.Context, tenant tenantstore.Tenant, at tenantstore.Version, mode provisioner.Mode, from []string, inFlight string, cause error) {
+// at is the row version this request owns. A nil at means the caller still
+// holds the tenant's run lock and the failing write may have committed
+// anyway — a connection dropped on the way back — so the row itself decides
+// what to undo rather than what the request believed it wrote. Without the
+// lock that re-read is unsafe: a concurrent request may have put the tenant
+// in the same status for its own reasons, and this one would undo its work.
+func (h *Handlers) abortQueue(c *gin.Context, tenant tenantstore.Tenant, at *tenantstore.Version, mode provisioner.Mode, from []string, inFlight string, cause error) {
 	ctx := c.Request.Context()
+	dctx, cancel := detached(ctx)
+	defer cancel()
+
+	row, version := tenant, tenantstore.Version{}
+	switch {
+	case at != nil:
+		version = *at
+	default:
+		current, gerr := h.Store.GetTenant(dctx, tenant.TeamID, tenant.ID)
+		if gerr != nil {
+			h.Log.Error().Err(gerr).Str("tenant_id", tenant.ID.String()).Msg("re-read tenant to undo a queue attempt")
+			current = tenant
+		}
+		row, version = current, tenantstore.VersionOf(current)
+	}
+
 	if mode != provisioner.ModeDeprovision {
 		// The transition may or may not have landed, so either side of it
 		// is a status this request owns; the version pins which attempt.
 		owned := append(append([]string{}, from...), inFlight)
-		h.failTenant(ctx, tenant, at, owned, stepTrigger, "The "+string(mode)+" run could not be queued. Retry the tenant.", cause, map[string]any{"mode": string(mode)})
+		h.failTenant(ctx, row, version, owned, stepTrigger, "The "+string(mode)+" run could not be queued. Retry the tenant.", cause, map[string]any{"mode": string(mode)})
 		respondError(c, http.StatusInternalServerError, internalErrorMsg)
 		return
 	}
@@ -582,11 +608,9 @@ func (h *Handlers) abortQueue(c *gin.Context, tenant tenantstore.Tenant, at tena
 	// now, and reverting would silently cancel a delete that was accepted.
 	// When this request's own transition never happened, nothing matches
 	// and nothing changes, which is the desired end state either way.
-	dctx, cancel := detached(ctx)
-	if _, rerr := h.Store.TransitionStatusIfUnchanged(dctx, tenant.TeamID, tenant.ID, []string{inFlight}, tenant.Status, at); rerr != nil && !errors.Is(rerr, tenantstore.ErrStatusConflict) && !errors.Is(rerr, tenantstore.ErrNotFound) {
+	if _, rerr := h.Store.TransitionStatusIfUnchanged(dctx, tenant.TeamID, tenant.ID, []string{inFlight}, tenant.Status, version); rerr != nil && !errors.Is(rerr, tenantstore.ErrStatusConflict) && !errors.Is(rerr, tenantstore.ErrNotFound) {
 		h.Log.Error().Err(rerr).Str("tenant_id", tenant.ID.String()).Msg("revert delete transition")
 	}
-	cancel()
 	respondError(c, http.StatusInternalServerError, "The delete could not be recorded. Try again.")
 }
 
