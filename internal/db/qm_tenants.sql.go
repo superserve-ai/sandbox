@@ -299,6 +299,20 @@ func (q *Queries) QMTeamHomedHere(ctx context.Context, teamID uuid.UUID) (bool, 
 	return homed, err
 }
 
+const revokeQMTenantSandboxKey = `-- name: RevokeQMTenantSandboxKey :one
+SELECT qm.revoke_tenant_api_key($1) AS revoked
+`
+
+// Revokes the tenant's sandbox API key through the definer function that
+// stands in for the api_key UPDATE qm_api does not have. Returns whether
+// the tenant referenced a key; already-revoked keys are a no-op.
+func (q *Queries) RevokeQMTenantSandboxKey(ctx context.Context, tenantID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, revokeQMTenantSandboxKey, tenantID)
+	var revoked bool
+	err := row.Scan(&revoked)
+	return revoked, err
+}
+
 const setQMTeamScope = `-- name: SetQMTeamScope :exec
 SELECT set_config('qm.team_id', $1::text, true)
 `
@@ -355,6 +369,58 @@ type SoftDeleteQMTenantParams struct {
 // commits, no child write that saw the tenant live can still be in flight.
 func (q *Queries) SoftDeleteQMTenant(ctx context.Context, arg SoftDeleteQMTenantParams) (QmTenant, error) {
 	row := q.db.QueryRow(ctx, softDeleteQMTenant, arg.ID, arg.TeamID)
+	var i QmTenant
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Slug,
+		&i.OrgName,
+		&i.AdminEmail,
+		&i.SignIn,
+		&i.ModelProvider,
+		&i.Harness,
+		&i.Status,
+		&i.PublicUrl,
+		&i.ImageTag,
+		&i.CloudRunService,
+		&i.DbName,
+		&i.BucketName,
+		&i.ServiceAccount,
+		&i.SandboxApiKeyID,
+		&i.EventSeq,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const transitionQMTenantStatus = `-- name: TransitionQMTenantStatus :one
+UPDATE qm.tenants
+SET status = $3, updated_at = now()
+WHERE id = $1 AND team_id = $2
+  AND status <> 'deleted'
+  AND status = ANY($4::text[])
+RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, event_seq, created_by, created_at, updated_at
+`
+
+type TransitionQMTenantStatusParams struct {
+	ID           uuid.UUID `json:"id"`
+	TeamID       uuid.UUID `json:"team_id"`
+	Status       string    `json:"status"`
+	FromStatuses []string  `json:"from_statuses"`
+}
+
+// Compare-and-set: moves the tenant to a new status only from one of the
+// expected ones, so two racing requests (delete vs retry) cannot both win.
+// deleted stays terminal regardless of the expected list.
+func (q *Queries) TransitionQMTenantStatus(ctx context.Context, arg TransitionQMTenantStatusParams) (QmTenant, error) {
+	row := q.db.QueryRow(ctx, transitionQMTenantStatus,
+		arg.ID,
+		arg.TeamID,
+		arg.Status,
+		arg.FromStatuses,
+	)
 	var i QmTenant
 	err := row.Scan(
 		&i.ID,

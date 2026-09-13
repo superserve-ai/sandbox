@@ -1,0 +1,12 @@
+# syntax=docker/dockerfile:1
+#
+# qm-api runtime image. The binary is built by the deploy workflow
+# (deploy-qm-api.yml) with CGO disabled and copied in, so the image is the
+# same alpine base as the control plane's with nothing else on it.
+FROM alpine:3.21
+
+RUN apk add --no-cache ca-certificates tzdata
+COPY bin/qm-api /usr/local/bin/qm-api
+
+EXPOSE 8080
+ENTRYPOINT ["qm-api"]
