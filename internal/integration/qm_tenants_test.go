@@ -682,8 +682,11 @@ func TestQMAPI_ChildWritesSerializeWithRetirement(t *testing.T) {
 					done <- err
 					return
 				}
-				defer func() { _ = tx.Rollback(ctx) }()
-				done <- cw.write(q, tenantID)
+				// Signal only after the connection is free: the next subtest
+				// reuses it, and a pgx connection takes one caller at a time.
+				writeErr := cw.write(q, tenantID)
+				_ = tx.Rollback(ctx)
+				done <- writeErr
 			}()
 			waitForQMAPILockWait(t)
 			select {
@@ -724,17 +727,19 @@ func TestQMAPI_ChildWritesSerializeWithRetirement(t *testing.T) {
 					done <- retired{err: err}
 					return
 				}
-				defer func() { _ = tx.Rollback(ctx) }()
-				if _, err := q.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenantID, TeamID: teamID}); err != nil {
-					done <- retired{err: err}
-					return
-				}
-				landed, err := cw.landed(tx, tenantID)
-				if err != nil {
-					done <- retired{err: err}
-					return
-				}
-				done <- retired{landed: landed, err: tx.Commit(ctx)}
+				r := func() retired {
+					if _, err := q.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenantID, TeamID: teamID}); err != nil {
+						return retired{err: err}
+					}
+					landed, err := cw.landed(tx, tenantID)
+					if err != nil {
+						return retired{err: err}
+					}
+					return retired{landed: landed, err: tx.Commit(ctx)}
+				}()
+				// As above: release the connection before signalling.
+				_ = tx.Rollback(ctx)
+				done <- r
 			}()
 			waitForQMAPILockWait(t)
 			select {
