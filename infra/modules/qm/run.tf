@@ -42,6 +42,15 @@ locals {
     QM_TENANT_BUCKET_LIFECYCLE_JSON  = jsonencode(local.tenant_bucket_lifecycle_policy)
     QM_TENANT_IMAGE_REPOSITORY       = local.tenant_image_repository
     QM_TENANT_IMAGE                  = local.tenant_image
+
+    # Tenant runtime configuration. QM_RESEND_SECRET and QM_EMAIL_FROM are
+    # what make a provisioned tenant signinable: qm-api refuses to start
+    # without them rather than building tenants whose sign-in fails closed,
+    # which is how the reference tenant shipped.
+    QM_RESEND_SECRET    = local.resend_secret_id
+    QM_EMAIL_FROM       = var.tenant_email_from
+    QM_SANDBOX_API_URL  = var.sandbox_api_url
+    QM_SANDBOX_TEMPLATE = var.sandbox_template
   }
 
   api_env         = merge(local.runtime_env, var.api_env)

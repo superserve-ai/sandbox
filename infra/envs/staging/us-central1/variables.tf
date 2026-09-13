@@ -136,6 +136,30 @@ variable "qm_create_private_service_connection" {
   default     = true
 }
 
+variable "qm_resend_secret_id" {
+  description = "Secret Manager secret holding the platform's Resend API key. Null creates qm-resend-<resource_suffix> here; the key itself is added out of band."
+  type        = string
+  default     = null
+}
+
+variable "qm_email_from" {
+  description = "Sender tenant magic links come from. The Resend account's verified sending domain is platform-wide, so staging uses the same address as production."
+  type        = string
+  default     = "QM <no-reply@mail.qm.superserve.ai>"
+}
+
+variable "qm_sandbox_api_url" {
+  description = "Superserve API staging tenants create sandboxes against. Staging's own API: the sandbox key the provisioner issues is bound to this cell, and a key presented to another one is refused."
+  type        = string
+  default     = "https://api-staging.superserve.ai"
+}
+
+variable "qm_sandbox_template" {
+  description = "Superserve template tenants launch their sandboxes from."
+  type        = string
+  default     = "qm-agent-0.1.0"
+}
+
 variable "qm_dns_managed_zone" {
   description = "Cloud DNS managed zone (in this project) owning qm_domain, if Terraform should write the certificate authorization and load balancer records. Null leaves DNS to the zone owner."
   type        = string

@@ -68,6 +68,12 @@ locals {
   sql_admin_secret_id            = "${local.sql_admin_secret_prefix}${var.resource_suffix}"
   api_database_url_secret_prefix = "qm-api-database-url-"
   api_database_url_secret_id     = "${local.api_database_url_secret_prefix}${var.resource_suffix}"
+  resend_secret_prefix           = "qm-resend-"
+  # Created here when the caller names no existing secret. Either way this is
+  # the name the provisioner is handed and the name it grants every tenant
+  # read on, so the two can never disagree.
+  resend_secret_id     = coalesce(var.resend_secret_id, "${local.resend_secret_prefix}${var.resource_suffix}")
+  create_resend_secret = var.resend_secret_id == null
 
   # Platform secrets, as opposed to the qm-<slug>-<name> tenant secrets the
   # broad prefix grants in iam.tf are for. Every environment's, not just this
@@ -76,6 +82,7 @@ locals {
   platform_secret_prefixes = [
     local.sql_admin_secret_prefix,
     local.api_database_url_secret_prefix,
+    local.resend_secret_prefix,
   ]
 
   tenant_image_repository_id = local.name
@@ -296,6 +303,32 @@ resource "google_secret_manager_secret_version" "sql_admin" {
 resource "google_secret_manager_secret" "api_database_url" {
   project   = var.project_id
   secret_id = local.api_database_url_secret_id
+
+  replication {
+    auto {}
+  }
+
+  labels = var.labels
+
+  depends_on = [google_project_service.required]
+}
+
+# The platform's Resend API key, which every tenant's embedded sign-in broker
+# sends magic links with. One account and one verified sending domain for the
+# whole fleet, so this is a shared secret each tenant's service account is
+# granted read on at provision time — not a per-tenant credential.
+#
+# As with api_database_url, only the secret is managed here and the version is
+# added out of band; unlike it, nothing this module deploys mounts the key, so
+# an environment can stand up complete and empty. The first tenant provisioned
+# without a version fails at its Cloud Run deploy, which is the loud failure
+# we want — a tenant that shipped without email would answer its health check
+# and 503 the moment anybody tried to sign in.
+resource "google_secret_manager_secret" "resend" {
+  count = local.create_resend_secret ? 1 : 0
+
+  project   = var.project_id
+  secret_id = local.resend_secret_id
 
   replication {
     auto {}

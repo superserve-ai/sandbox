@@ -28,6 +28,26 @@ output "sql_admin_secret_id" {
   value       = google_secret_manager_secret.sql_admin.secret_id
 }
 
+output "resend_secret_id" {
+  description = "Secret Manager secret the whole fleet's tenant sign-in sends mail with. Its version is added out of band; until it is, a provisioned tenant fails at its Cloud Run deploy."
+  value       = local.resend_secret_id
+}
+
+output "tenant_email_from" {
+  description = "Sender address tenant magic links come from."
+  value       = var.tenant_email_from
+}
+
+output "sandbox_api_url" {
+  description = "Superserve API tenants create sandboxes against."
+  value       = var.sandbox_api_url
+}
+
+output "sandbox_template" {
+  description = "Superserve template tenants launch sandboxes from."
+  value       = var.sandbox_template
+}
+
 output "api_database_url_secret_id" {
   description = "Secret Manager secret qm-api and the provisioner read DATABASE_URL (control-plane Postgres, qm_api role) from. Its version is added out of band."
   value       = google_secret_manager_secret.api_database_url.secret_id
@@ -141,6 +161,10 @@ locals {
     tenant_capacity               = var.tenant_capacity
     sql_admin_secret_id           = google_secret_manager_secret.sql_admin.secret_id
     api_database_url_secret_id    = google_secret_manager_secret.api_database_url.secret_id
+    resend_secret_id              = local.resend_secret_id
+    tenant_email_from             = var.tenant_email_from
+    sandbox_api_url               = var.sandbox_api_url
+    sandbox_template              = var.sandbox_template
     address                       = google_compute_global_address.edge.address
     url_map_name                  = google_compute_url_map.https.name
     https_proxy_name              = google_compute_target_https_proxy.this.name

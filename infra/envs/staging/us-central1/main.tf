@@ -724,6 +724,15 @@ module "qm" {
   redirect_image    = coalesce(var.qm_redirect_image, "${local.qm_image_prefix}/qm-redirect:replace-me")
   tenant_image      = var.qm_tenant_image
 
+  # Tenant runtime configuration. The Resend key and the sender address are
+  # platform-level (one account, one verified sending domain for the whole
+  # fleet); the sandbox API is this cell's, because the key the provisioner
+  # issues a tenant is bound to it.
+  resend_secret_id  = var.qm_resend_secret_id
+  tenant_email_from = var.qm_email_from
+  sandbox_api_url   = var.qm_sandbox_api_url
+  sandbox_template  = var.qm_sandbox_template
+
   dns_managed_zone = var.qm_dns_managed_zone
 
   labels = merge(local.common_labels, {

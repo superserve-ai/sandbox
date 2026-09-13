@@ -199,6 +199,44 @@ variable "tenant_slug_min_length" {
   default     = 16
 }
 
+# Tenant runtime configuration. These are what a provisioned tenant is
+# configured with, as opposed to the shared infrastructure above: the
+# provisioner reads them from its QM_* environment and renders them into
+# every tenant's Cloud Run service.
+
+variable "resend_secret_id" {
+  description = "Secret Manager secret holding the platform's Resend API key, which every tenant's sign-in broker sends magic links with. Null creates qm-resend-<resource_suffix> in this project; set it to point at a secret that already exists instead. Only the secret is managed either way — the key itself is added out of band, and a tenant provisioned before that fails at its Cloud Run deploy rather than silently shipping without email."
+  type        = string
+  default     = null
+}
+
+variable "tenant_email_from" {
+  description = "Sender address tenant magic links come from, optionally as \"Name <sender@example.com>\". It must be at the Resend account's verified sending domain, which is a property of that account rather than of this environment — so it is deliberately not derived from var.domain, and staging and production share it."
+  type        = string
+  default     = "QM <no-reply@mail.qm.superserve.ai>"
+
+  validation {
+    condition     = can(regex("^[^<>]*<[^<>@\\s]+@[^<>@\\s]+\\.[^<>@\\s]+>$|^[^<>@\\s]+@[^<>@\\s]+\\.[^<>@\\s]+$", var.tenant_email_from))
+    error_message = "tenant_email_from must be an email address, optionally as \"Name <sender@example.com>\"."
+  }
+}
+
+variable "sandbox_api_url" {
+  description = "Superserve API a tenant's QM creates sandboxes against (SUPERSERVE_BASE_URL). Per environment: staging tenants must reach the staging API, because the sandbox key the provisioner issues is bound to this cell and a key presented to another one is refused. No default — a wrong one points a whole environment's tenants at the wrong cell and nothing fails until a tenant tries to run something."
+  type        = string
+
+  validation {
+    condition     = var.sandbox_api_url == null || can(regex("^https://[^/]+$", var.sandbox_api_url))
+    error_message = "sandbox_api_url must be an https origin with no path or trailing slash."
+  }
+}
+
+variable "sandbox_template" {
+  description = "Superserve template tenants launch their sandboxes from (SUPERSERVE_TEMPLATE). The same name in every environment; each cell seeds its own copy."
+  type        = string
+  default     = "qm-agent-0.1.0"
+}
+
 variable "tenant_image" {
   description = "Tagged image the provisioner deploys for every new tenant service (QM_TENANT_IMAGE). Null uses <tenant_image_repository>/qm:latest. Per-tenant pinning is the provisioner's concern; this is the fleet default."
   type        = string

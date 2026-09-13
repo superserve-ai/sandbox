@@ -25,8 +25,49 @@ Terraform (this module) owns:
 - the `qm-<suffix>` Artifact Registry repository tenant images are pulled
   from, and the fleet-default tenant image (`tenant_image`, exported as
   `QM_TENANT_IMAGE`)
+- the empty `qm-resend-<suffix>` secret every tenant's sign-in broker sends
+  magic links with, and the tenant runtime configuration the provisioner
+  renders into each tenant's service: `tenant_email_from`, `sandbox_api_url`
+  and `sandbox_template` (exported as `QM_RESEND_SECRET`, `QM_EMAIL_FROM`,
+  `QM_SANDBOX_API_URL` and `QM_SANDBOX_TEMPLATE`)
 - Cloud DNS records for the authorization, apex and wildcard, only when
   `dns_managed_zone` is set
+
+`cmd/qm-api` refuses to start when any of those four is unset, so an
+environment cannot accept tenants it would build without a working sign-in.
+That is also why the deploy workflow sets none of them: this module does not
+ignore environment drift on the service or the job, so a second owner would
+flap, and `QM_API_SERVICE` is only set for an environment whose module has
+already been applied.
+
+## Tenant sign-in
+
+Hosted QM has one Resend account and one verified sending domain for the
+whole fleet, so the API key is a single shared secret rather than a
+per-tenant one: the provisioner grants each tenant's service account read on
+it and the tenant's own container mounts it. The provisioner is deliberately
+excluded from its broad `secretmanager.admin` grant over `qm-*` for this one
+secret and holds a two-permission role on it instead — it only ever reads and
+writes the secret's IAM policy, and one run wrongly deleting it would take
+sign-in away from every tenant at once.
+
+`tenant_email_from` must be at that account's verified domain. It is a
+property of the Resend account rather than of an environment, which is why it
+is not derived from `var.domain` and why staging and production share it.
+
+Only the secret is created here; the key itself is added out of band, as with
+`qm-api-database-url-<suffix>`. Nothing this module deploys mounts it, so an
+environment stands up complete and empty — the first *tenant* provisioned
+without a version fails at its Cloud Run deploy. That is the loud failure we
+want: the reference tenant shipped with no email transport, answered its
+health check, and 503'd the moment anybody tried to sign in.
+
+`sandbox_api_url` is the one of the four that genuinely differs per
+environment. The sandbox key the provisioner issues a tenant is bound to the
+cell that issued it, and a key presented to another cell is refused, so
+staging tenants must point at the staging API. It has no default for that
+reason: a wrong one points a whole environment's tenants at the wrong cell
+and nothing fails until a tenant tries to run something.
 
 The tenant registry (tenants, runs, secret refs) is a set of tables in the
 control-plane Postgres, reached as the `qm_api` role; it is not on the Cloud
@@ -177,7 +218,10 @@ Before `tenant_capacity` approaches that, request an increase for the IAM API
    set) before expecting the certificate to become `ACTIVE`; the load balancer
    serves nothing until it does. Then point `<domain>` and `*.<domain>` at the
    `address` output.
-4. **`qm_api` role and `DATABASE_URL`.** The role and its grants come from
+4. **Resend key.** Add a version to `qm-resend-<suffix>` with the platform's
+   Resend API key. Nothing starts without it, but the first tenant
+   provisioned before it exists fails at its Cloud Run deploy.
+5. **`qm_api` role and `DATABASE_URL`.** The role and its grants come from
    the control-plane schema migrations; its password is set out of band.
    Add a version to `qm-api-database-url-<suffix>` with the control-plane
    connection string for that role. Both the qm-api service and the
@@ -185,7 +229,7 @@ Before `tenant_capacity` approaches that, request an increase for the IAM API
    version exists, so on a first apply create the secrets first
    (`-target=module.qm[0].google_secret_manager_secret.api_database_url`),
    add the version, then apply the rest.
-5. **Service-account quota** as above, before onboarding tenants at scale.
+6. **Service-account quota** as above, before onboarding tenants at scale.
 
 Later qm-api image rollouts are owned by deploy tooling (`deploy-qm-api.yml`
 updates the service and the job to the same SHA), so Terraform ignores image

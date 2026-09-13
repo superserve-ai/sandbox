@@ -64,6 +64,17 @@ locals {
     ["resource.name.startsWith(\"${local.secret_name_prefix}\")"],
     local.platform_secret_exclusions,
   ))
+
+  # The provisioner's admin over qm-* deliberately still reaches the instance
+  # admin password and the control-plane DATABASE_URL — it reads both. The
+  # Resend key is different: it never reads it, only grants tenants access to
+  # it, and admin carries delete. One provisioner run wrongly deleting it
+  # would take sign-in away from every tenant in the fleet, so it is excluded
+  # here and reached through the two-permission role below instead.
+  provisioner_secret_condition = join(" && ", [
+    "resource.name.startsWith(\"${local.secret_name_prefix}\")",
+    "!resource.name.startsWith(\"projects/${local.project_number}/secrets/${local.resend_secret_prefix}\")",
+  ])
 }
 
 # Project-level roles the provisioner needs and that cannot be narrowed by
@@ -142,17 +153,47 @@ resource "google_compute_subnetwork_iam_member" "provisioner_network_user" {
 
 # Full Secret Manager control, but only over qm-* secrets: tenant secrets
 # (create versions, grant the tenant account accessor, delete on teardown)
-# and the shared qm-sql-admin secret.
+# and the shared qm-sql-admin secret. The Resend key is excluded; see the
+# condition local and the role below it.
 resource "google_project_iam_member" "provisioner_secret_admin" {
   project = var.project_id
   role    = "roles/secretmanager.admin"
   member  = local.provisioner_member
 
   condition {
-    title       = "qm secrets only"
-    description = "Limits Secret Manager admin to secrets named qm-*."
-    expression  = "resource.name.startsWith(\"${local.secret_name_prefix}\")"
+    title       = "qm secrets except the shared email key"
+    description = "Limits Secret Manager admin to secrets named qm-*, other than the platform's Resend key."
+    expression  = local.provisioner_secret_condition
   }
+}
+
+# What the provisioner does to the shared Resend key, and all it does: read
+# the secret's IAM policy and write it back, to add a tenant's service account
+# when the tenant is built and remove it when the tenant is torn down. It
+# never reads the key — the tenant's own container mounts it — so there is no
+# accessor here either.
+resource "google_project_iam_custom_role" "shared_secret_granter" {
+  project     = var.project_id
+  role_id     = "qmSharedSecretGranter_${local.custom_role_suffix}"
+  title       = "QM shared secret granter (${var.environment})"
+  description = "Grant and revoke tenant access to a shared platform secret, without reading or deleting it."
+  permissions = [
+    "secretmanager.secrets.get",
+    "secretmanager.secrets.getIamPolicy",
+    "secretmanager.secrets.setIamPolicy",
+  ]
+}
+
+# Bound on the secret itself rather than by name condition, so it holds
+# whether the secret is the one this module created or one the caller pointed
+# at, and so a first apply orders the grant before any tenant needs it.
+resource "google_secret_manager_secret_iam_member" "provisioner_resend" {
+  project   = var.project_id
+  secret_id = local.resend_secret_id
+  role      = google_project_iam_custom_role.shared_secret_granter.id
+  member    = local.provisioner_member
+
+  depends_on = [google_secret_manager_secret.resend]
 }
 
 # Bucket lifecycle for tenant buckets only: create, configure (lifecycle,
