@@ -29,3 +29,4 @@ secrets_signing_key_secret_name       = "secretsproxy-signing-key-staging"
 # qm_email_from                        = "QM <no-reply@mail.qm.superserve.ai>"
 # qm_sandbox_api_url                   = "https://api-staging.superserve.ai"
 # qm_sandbox_template                  = "qm-agent-0.1.0"
+# qm_sandbox_key_region                = null

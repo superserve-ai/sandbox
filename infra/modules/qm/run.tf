@@ -53,8 +53,15 @@ locals {
     QM_SANDBOX_TEMPLATE = var.sandbox_template
   }
 
-  api_env         = merge(local.runtime_env, var.api_env)
-  provisioner_env = merge(local.runtime_env, var.provisioner_env)
+  # Only when set: an empty QM_SANDBOX_KEY_REGION and an absent one mean the
+  # same thing to qm-api, and not stamping it keeps the service's
+  # environment free of a variable that carries nothing.
+  key_region_env = var.sandbox_key_region == null ? {} : {
+    QM_SANDBOX_KEY_REGION = var.sandbox_key_region
+  }
+
+  api_env         = merge(local.runtime_env, local.key_region_env, var.api_env)
+  provisioner_env = merge(local.runtime_env, local.key_region_env, var.provisioner_env)
 
   # The tenant registry lives in the control-plane Postgres, and both the
   # API and the provisioner (which records what it created) connect to it as

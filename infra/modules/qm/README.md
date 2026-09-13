@@ -27,9 +27,10 @@ Terraform (this module) owns:
   `QM_TENANT_IMAGE`)
 - the empty `qm-resend-<suffix>` secret every tenant's sign-in broker sends
   magic links with, and the tenant runtime configuration the provisioner
-  renders into each tenant's service: `tenant_email_from`, `sandbox_api_url`
-  and `sandbox_template` (exported as `QM_RESEND_SECRET`, `QM_EMAIL_FROM`,
-  `QM_SANDBOX_API_URL` and `QM_SANDBOX_TEMPLATE`)
+  renders into each tenant's service: `tenant_email_from`, `sandbox_api_url`,
+  `sandbox_template` and the optional `sandbox_key_region` (exported as
+  `QM_RESEND_SECRET`, `QM_EMAIL_FROM`, `QM_SANDBOX_API_URL`,
+  `QM_SANDBOX_TEMPLATE` and `QM_SANDBOX_KEY_REGION`)
 - Cloud DNS records for the authorization, apex and wildcard, only when
   `dns_managed_zone` is set
 

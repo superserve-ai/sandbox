@@ -148,6 +148,12 @@ variable "qm_sandbox_api_url" {
   default     = "https://api-staging.superserve.ai"
 }
 
+variable "qm_sandbox_key_region" {
+  description = "Cell region token issued sandbox keys are tagged with, matching this cell's SANDBOX_ID_REGION. Null leaves them untagged."
+  type        = string
+  default     = null
+}
+
 variable "qm_sandbox_template" {
   description = "Superserve template tenants launch their sandboxes from."
   type        = string

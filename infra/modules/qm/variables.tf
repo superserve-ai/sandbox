@@ -241,6 +241,17 @@ variable "sandbox_template" {
   }
 }
 
+variable "sandbox_key_region" {
+  description = "Cell region token the sandbox API keys the provisioner issues are tagged with (ss_live_<region>_<random>), matching this cell's SANDBOX_ID_REGION. Null leaves keys untagged, which authenticates identically and only costs the wrong-endpoint hint a key presented to another cell would otherwise get. Set rather than left to a hand-edit: this module owns the service's environment and would revert one on the next apply."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.sandbox_key_region == null || can(regex("^[a-z0-9]{1,17}$", var.sandbox_key_region))
+    error_message = "sandbox_key_region must be 1-17 lowercase letters or digits, as the control plane parses it. Anything else is read as no region at all."
+  }
+}
+
 variable "tenant_image" {
   description = "Tagged image the provisioner deploys for every new tenant service (QM_TENANT_IMAGE). Null uses <tenant_image_repository>/qm:latest. Per-tenant pinning is the provisioner's concern; this is the fleet default."
   type        = string

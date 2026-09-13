@@ -165,6 +165,7 @@ locals {
     tenant_email_from             = var.tenant_email_from
     sandbox_api_url               = var.sandbox_api_url
     sandbox_template              = var.sandbox_template
+    sandbox_key_region            = var.sandbox_key_region
     address                       = google_compute_global_address.edge.address
     url_map_name                  = google_compute_url_map.https.name
     https_proxy_name              = google_compute_target_https_proxy.this.name

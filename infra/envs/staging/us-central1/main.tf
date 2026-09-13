@@ -729,9 +729,10 @@ module "qm" {
   # sandbox API is this cell's, because the key the provisioner issues a
   # tenant is bound to it. The Resend secret itself is the module's, named
   # after the resource suffix.
-  tenant_email_from = var.qm_email_from
-  sandbox_api_url   = var.qm_sandbox_api_url
-  sandbox_template  = var.qm_sandbox_template
+  tenant_email_from  = var.qm_email_from
+  sandbox_api_url    = var.qm_sandbox_api_url
+  sandbox_template   = var.qm_sandbox_template
+  sandbox_key_region = var.qm_sandbox_key_region
 
   dns_managed_zone = var.qm_dns_managed_zone
 
