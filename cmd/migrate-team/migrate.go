@@ -1510,6 +1510,14 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	} else if len(builds) > 0 {
 		return fmt.Errorf("aborting purge: template build slipped in before the locks:\n  %s", strings.Join(builds, "\n  "))
 	}
+	// Hosted-QM tenant admission takes the same per-team lock (see
+	// CreateQMTenant); a tenant created after validation was never copied,
+	// so purging its row would orphan whatever the provisioner built.
+	if tenants, err := liveQMTenants(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(tenants) > 0 {
+		return fmt.Errorf("aborting purge: hosted-QM tenant slipped in before the locks:\n  %s", strings.Join(tenants, "\n  "))
+	}
 	// The source rows die below, so capture the rollup-flag state now and
 	// restore it into the dest after the deletes commit — purged
 	// migrations must not depend on a later release-rollups run that would
