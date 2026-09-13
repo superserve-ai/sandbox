@@ -25,8 +25,7 @@ secrets_signing_key_secret_name       = "secretsproxy-signing-key-staging"
 #
 # Tenant runtime configuration. The defaults in variables.tf are the staging
 # ones; these are here to show what a tenant is configured with. The Resend
-# key's value is added out of band once the secret exists.
-# qm_resend_secret_id                  = null
+# key's value is added out of band once the module has created its secret.
 # qm_email_from                        = "QM <no-reply@mail.qm.superserve.ai>"
 # qm_sandbox_api_url                   = "https://api-staging.superserve.ai"
 # qm_sandbox_template                  = "qm-agent-0.1.0"

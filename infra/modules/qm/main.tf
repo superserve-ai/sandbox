@@ -68,13 +68,7 @@ locals {
   sql_admin_secret_id            = "${local.sql_admin_secret_prefix}${var.resource_suffix}"
   api_database_url_secret_prefix = "qm-api-database-url-"
   api_database_url_secret_id     = "${local.api_database_url_secret_prefix}${var.resource_suffix}"
-  # Created here when the caller names no existing secret. One expression
-  # decides both, so a caller cannot end up with the generated name bound but
-  # never created. The variable's own validation already rejects an empty
-  # string; the trim is what keeps that true if it is ever relaxed.
-  resend_secret_override = var.resend_secret_id == null ? "" : trimspace(var.resend_secret_id)
-  create_resend_secret   = local.resend_secret_override == ""
-  resend_secret_id       = local.create_resend_secret ? "qm-resend-${var.resource_suffix}" : local.resend_secret_override
+  resend_secret_id               = "qm-resend-${var.resource_suffix}"
 
   # Platform secrets, as opposed to the qm-<slug>-<name> tenant secrets the
   # broad prefix grants in iam.tf are for. Every environment's, not just this
@@ -86,10 +80,8 @@ locals {
   ]
 
   # The shared Resend secret is excluded by its exact name rather than by a
-  # prefix, because unlike the two above its name is a caller's to choose: a
-  # prefix would miss it entirely when it is overridden, and a "qm-resend-"
-  # prefix would also swallow the tenant secrets of any tenant whose slug is
-  # "resend".
+  # prefix: a "qm-resend-" prefix would also swallow the tenant secrets of
+  # any tenant whose slug happens to be "resend", and nothing reserves it.
   platform_secret_names = [
     local.resend_secret_id,
   ]
@@ -333,9 +325,14 @@ resource "google_secret_manager_secret" "api_database_url" {
 # without a version fails at its Cloud Run deploy, which is the loud failure
 # we want — a tenant that shipped without email would answer its health check
 # and 503 the moment anybody tried to sign in.
+#
+# There is deliberately no way to point the module at a secret somewhere else.
+# Every provisioned tenant mounts this one by name, so a second supported
+# location would mean an apply that moves the name can delete a secret the
+# fleet is still reading, or strand the tenant grants the provisioner has to
+# revoke on the one it left behind. Rotating the Resend key is adding a
+# version here: tenants mount :latest and pick it up on their next revision.
 resource "google_secret_manager_secret" "resend" {
-  count = local.create_resend_secret ? 1 : 0
-
   project   = var.project_id
   secret_id = local.resend_secret_id
 

@@ -204,17 +204,6 @@ variable "tenant_slug_min_length" {
 # provisioner reads them from its QM_* environment and renders them into
 # every tenant's Cloud Run service.
 
-variable "resend_secret_id" {
-  description = "Secret Manager secret holding the platform's Resend API key, which every tenant's sign-in broker sends magic links with. Null creates qm-resend-<resource_suffix> in this project; set it to point at a secret that already exists instead. Only the secret is managed either way — the key itself is added out of band, and a tenant provisioned before that fails at its Cloud Run deploy rather than silently shipping without email."
-  type        = string
-  default     = null
-
-  validation {
-    condition     = var.resend_secret_id == null || can(regex("^[A-Za-z0-9_-]{1,255}$", var.resend_secret_id))
-    error_message = "resend_secret_id must be null or a Secret Manager secret ID. An empty string is neither: it would name the generated secret without creating it."
-  }
-}
-
 variable "tenant_email_from" {
   description = "Sender address tenant magic links come from, optionally as \"Name <sender@example.com>\". It must be at the Resend account's verified sending domain, which is a property of that account rather than of this environment — so it is deliberately not derived from var.domain, and staging and production share it."
   type        = string

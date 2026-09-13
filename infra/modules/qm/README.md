@@ -62,6 +62,13 @@ without a version fails at its Cloud Run deploy. That is the loud failure we
 want: the reference tenant shipped with no email transport, answered its
 health check, and 503'd the moment anybody tried to sign in.
 
+The module deliberately offers no way to point at a secret somewhere else.
+Every provisioned tenant mounts this one by name, so a second supported
+location would mean an apply that moves the name can delete a secret the
+fleet is still reading, or strand the tenant grants the provisioner has to
+revoke on the one it left behind. Rotating the Resend key is adding a version
+here; tenants mount `:latest` and pick it up on their next revision.
+
 `sandbox_api_url` is the one of the four that genuinely differs per
 environment. The sandbox key the provisioner issues a tenant is bound to the
 cell that issued it, and a key presented to another cell is refused, so

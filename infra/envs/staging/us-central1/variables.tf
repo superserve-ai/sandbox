@@ -136,12 +136,6 @@ variable "qm_create_private_service_connection" {
   default     = true
 }
 
-variable "qm_resend_secret_id" {
-  description = "Secret Manager secret holding the platform's Resend API key. Null creates qm-resend-<resource_suffix> here; the key itself is added out of band."
-  type        = string
-  default     = null
-}
-
 variable "qm_email_from" {
   description = "Sender tenant magic links come from. The Resend account's verified sending domain is platform-wide, so staging uses the same address as production."
   type        = string

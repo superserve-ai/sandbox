@@ -205,16 +205,13 @@ resource "google_project_iam_custom_role" "shared_secret_granter" {
   ]
 }
 
-# Bound on the secret itself rather than by name condition, so it holds
-# whether the secret is the one this module created or one the caller pointed
-# at, and so a first apply orders the grant before any tenant needs it.
+# Bound on the secret itself rather than by a name condition, so a first
+# apply orders the grant before any tenant needs it.
 resource "google_secret_manager_secret_iam_member" "provisioner_resend" {
   project   = var.project_id
-  secret_id = local.resend_secret_id
+  secret_id = google_secret_manager_secret.resend.secret_id
   role      = google_project_iam_custom_role.shared_secret_granter.id
   member    = local.provisioner_member
-
-  depends_on = [google_secret_manager_secret.resend]
 }
 
 # Bucket lifecycle for tenant buckets only: create, configure (lifecycle,
