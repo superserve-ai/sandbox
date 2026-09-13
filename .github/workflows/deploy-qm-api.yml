@@ -7,13 +7,12 @@
 #
 # The cloud provisioning steps are real, so qm-api no longer needs
 # QM_PROVISIONER_STUB to start — but it does refuse to start when the shared
-# infrastructure it would attach tenants to is not fully configured. Most of
-# that set comes from the QM Terraform module, which stamps its QM_* contract
-# onto the service and the job. The four below are the tenant-runtime values
-# the module does not own; they are set here from environment variables so a
-# deploy can carry them. An environment missing any of them fails at
-# startup, by design: a tenant provisioned without an email transport cannot
-# be signed into.
+# infrastructure it would attach tenants to is not fully configured. All of
+# that configuration is the QM Terraform module's, which stamps its QM_*
+# contract onto the service and the job; this workflow sets only the job's
+# own coordinates and the image. An environment whose module has not been
+# applied fails at startup, by design: a tenant provisioned without an email
+# transport cannot be signed into.
 #
 # Triggers mirror deploy-api.yml: a push to main on qm-api paths runs
 # staging, then production; a dispatch for production still runs staging
@@ -230,15 +229,6 @@ jobs:
       # new job is fine (the job's argument contract only grows).
       - name: Deploy provisioner job, then service
         if: steps.gate.outputs.enabled == 'true'
-        # Through env rather than interpolated into the script: these are
-        # free-form operator-set values, and a display-name sender like
-        # '"QM, Inc" <no-reply@...>' pasted into a shell line is parsed as
-        # shell before any of it runs.
-        env:
-          QM_RESEND_SECRET: ${{ vars.QM_RESEND_SECRET }}
-          QM_EMAIL_FROM: ${{ vars.QM_EMAIL_FROM }}
-          QM_SANDBOX_API_URL: ${{ vars.QM_SANDBOX_API_URL }}
-          QM_SANDBOX_TEMPLATE: ${{ vars.QM_SANDBOX_TEMPLATE }}
         run: |
           IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/qm-api:${{ github.sha }}"
           REGION="${{ vars.QM_API_REGION || vars.GCP_REGION }}"
@@ -248,46 +238,21 @@ jobs:
           # targeting: the service resolves the job by project, region and
           # name, so a default that drifts from where the job actually lives
           # makes every create and retry fail at the trigger.
-          # Semicolon-delimited, declared to gcloud with its ^;^ prefix: a
-          # comma would split a display-name sender like "QM, Inc
-          # <no-reply@...>" into two bogus assignments, and no value here
-          # can contain a semicolon (the guard below makes sure of it).
-          ENV="QM_PROVISIONER_JOB=$JOB;QM_PROVISIONER_REGION=$REGION"
-          # The tenant-runtime settings the Terraform module does not own.
-          # QM_RESEND_SECRET and QM_EMAIL_FROM are what give a provisioned
-          # tenant a working sign-in; without them the binary refuses to
-          # start rather than building tenants nobody can log in to.
+          # Everything else a tenant is provisioned with — the Cloud SQL
+          # instance, the load balancer, the shared Resend secret, the
+          # sender address, the sandbox API and template — is the QM
+          # Terraform module's, stamped onto both resources from its own
+          # state. Setting any of it here too would fight the next apply.
           #
-          # Every one is written on every deploy, including as an empty
-          # value: an update that simply leaves a key out keeps the
-          # resource's previous value, so a variable cleared in GitHub would
-          # otherwise go on deploying the old configuration and the startup
-          # check would never see it missing.
-          #
-          # QM_PROVISIONER_STUB is pinned off for the same reason. An
-          # environment deployed while the cloud steps were stubs still
-          # carries it, and left alone the real provisioner would go on
-          # recording placeholder resources and marking tenants ready.
-          ENV="$ENV;QM_PROVISIONER_STUB=0"
-          for pair in \
-            "QM_RESEND_SECRET=$QM_RESEND_SECRET" \
-            "QM_EMAIL_FROM=$QM_EMAIL_FROM" \
-            "QM_SANDBOX_API_URL=$QM_SANDBOX_API_URL" \
-            "QM_SANDBOX_TEMPLATE=$QM_SANDBOX_TEMPLATE"; do
-            case "${pair#*=}" in
-              *\;*)
-                echo "::error::${pair%%=*} contains a semicolon, which is the delimiter these variables are passed with."
-                exit 1
-                ;;
-            esac
-            ENV="$ENV;$pair"
-          done
-          # An array, because QM_EMAIL_FROM is a display-name address —
-          # "QM <no-reply@...>" — and word splitting on an unquoted
-          # expansion would hand gcloud three arguments it does not know.
-          SET=(--update-env-vars "^;^$ENV")
-          gcloud run jobs update "$JOB" --image "$IMAGE" "${SET[@]}" $ARGS
-          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" "${SET[@]}" $ARGS
+          # QM_PROVISIONER_STUB is the exception, and it is pinned off
+          # rather than left alone: an environment deployed while the cloud
+          # steps were stubs still carries it, an update that does not
+          # mention a variable keeps it, and the real provisioner would
+          # otherwise go on recording placeholder resources and marking
+          # tenants ready.
+          ENV="QM_PROVISIONER_JOB=$JOB,QM_PROVISIONER_REGION=$REGION,QM_PROVISIONER_STUB=0"
+          gcloud run jobs update "$JOB" --image "$IMAGE" --update-env-vars "$ENV" $ARGS
+          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" --update-env-vars "$ENV" $ARGS
 
       - name: Route traffic to the new revision
         if: steps.gate.outputs.enabled == 'true'
@@ -379,15 +344,6 @@ jobs:
       # new job is fine (the job's argument contract only grows).
       - name: Deploy provisioner job, then service
         if: steps.gate.outputs.enabled == 'true'
-        # Through env rather than interpolated into the script: these are
-        # free-form operator-set values, and a display-name sender like
-        # '"QM, Inc" <no-reply@...>' pasted into a shell line is parsed as
-        # shell before any of it runs.
-        env:
-          QM_RESEND_SECRET: ${{ vars.QM_RESEND_SECRET }}
-          QM_EMAIL_FROM: ${{ vars.QM_EMAIL_FROM }}
-          QM_SANDBOX_API_URL: ${{ vars.QM_SANDBOX_API_URL }}
-          QM_SANDBOX_TEMPLATE: ${{ vars.QM_SANDBOX_TEMPLATE }}
         run: |
           IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/qm-api:${{ github.sha }}"
           REGION="${{ vars.QM_API_REGION || vars.GCP_REGION_USE4 }}"
@@ -397,46 +353,21 @@ jobs:
           # targeting: the service resolves the job by project, region and
           # name, so a default that drifts from where the job actually lives
           # makes every create and retry fail at the trigger.
-          # Semicolon-delimited, declared to gcloud with its ^;^ prefix: a
-          # comma would split a display-name sender like "QM, Inc
-          # <no-reply@...>" into two bogus assignments, and no value here
-          # can contain a semicolon (the guard below makes sure of it).
-          ENV="QM_PROVISIONER_JOB=$JOB;QM_PROVISIONER_REGION=$REGION"
-          # The tenant-runtime settings the Terraform module does not own.
-          # QM_RESEND_SECRET and QM_EMAIL_FROM are what give a provisioned
-          # tenant a working sign-in; without them the binary refuses to
-          # start rather than building tenants nobody can log in to.
+          # Everything else a tenant is provisioned with — the Cloud SQL
+          # instance, the load balancer, the shared Resend secret, the
+          # sender address, the sandbox API and template — is the QM
+          # Terraform module's, stamped onto both resources from its own
+          # state. Setting any of it here too would fight the next apply.
           #
-          # Every one is written on every deploy, including as an empty
-          # value: an update that simply leaves a key out keeps the
-          # resource's previous value, so a variable cleared in GitHub would
-          # otherwise go on deploying the old configuration and the startup
-          # check would never see it missing.
-          #
-          # QM_PROVISIONER_STUB is pinned off for the same reason. An
-          # environment deployed while the cloud steps were stubs still
-          # carries it, and left alone the real provisioner would go on
-          # recording placeholder resources and marking tenants ready.
-          ENV="$ENV;QM_PROVISIONER_STUB=0"
-          for pair in \
-            "QM_RESEND_SECRET=$QM_RESEND_SECRET" \
-            "QM_EMAIL_FROM=$QM_EMAIL_FROM" \
-            "QM_SANDBOX_API_URL=$QM_SANDBOX_API_URL" \
-            "QM_SANDBOX_TEMPLATE=$QM_SANDBOX_TEMPLATE"; do
-            case "${pair#*=}" in
-              *\;*)
-                echo "::error::${pair%%=*} contains a semicolon, which is the delimiter these variables are passed with."
-                exit 1
-                ;;
-            esac
-            ENV="$ENV;$pair"
-          done
-          # An array, because QM_EMAIL_FROM is a display-name address —
-          # "QM <no-reply@...>" — and word splitting on an unquoted
-          # expansion would hand gcloud three arguments it does not know.
-          SET=(--update-env-vars "^;^$ENV")
-          gcloud run jobs update "$JOB" --image "$IMAGE" "${SET[@]}" $ARGS
-          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" "${SET[@]}" $ARGS
+          # QM_PROVISIONER_STUB is the exception, and it is pinned off
+          # rather than left alone: an environment deployed while the cloud
+          # steps were stubs still carries it, an update that does not
+          # mention a variable keeps it, and the real provisioner would
+          # otherwise go on recording placeholder resources and marking
+          # tenants ready.
+          ENV="QM_PROVISIONER_JOB=$JOB,QM_PROVISIONER_REGION=$REGION,QM_PROVISIONER_STUB=0"
+          gcloud run jobs update "$JOB" --image "$IMAGE" --update-env-vars "$ENV" $ARGS
+          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" --update-env-vars "$ENV" $ARGS
 
       - name: Route traffic to the new revision
         if: steps.gate.outputs.enabled == 'true'

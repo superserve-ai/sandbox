@@ -72,7 +72,7 @@ func TestLoadConfigSharedInfrastructure(t *testing.T) {
 	t.Setenv("QM_LB_URL_MAP", "qm-https-staging")
 	t.Setenv("QM_VPC_NETWORK", "example-network")
 	t.Setenv("QM_VPC_SUBNETWORK", "example-subnet")
-	t.Setenv("QM_TENANT_BUCKET_LIFECYCLE_JSON", `{"rule":[]}`)
+	t.Setenv("QM_TENANT_BUCKET_LIFECYCLE_JSON", ` {"rule":[]} `)
 	t.Setenv("QM_RESEND_SECRET", "qm-resend-api-key")
 	t.Setenv("QM_EMAIL_FROM", "QM <no-reply@mail.qm.example.com>")
 	t.Setenv("QM_SANDBOX_API_URL", "https://api.example.com/")
@@ -105,6 +105,17 @@ func TestLoadConfigSharedInfrastructure(t *testing.T) {
 	if cfg.SandboxAPIURL != "https://api.example.com" {
 		t.Errorf("sandbox api url = %q", cfg.SandboxAPIURL)
 	}
+	// Normalized once, here: the readiness check and the bucket client must
+	// not disagree about whether a value is a policy at all.
+	if cfg.BucketLifecycleJSON != `{"rule":[]}` {
+		t.Errorf("bucket lifecycle = %q", cfg.BucketLifecycleJSON)
+	}
+	t.Setenv("QM_TENANT_BUCKET_LIFECYCLE_JSON", "   ")
+	if trimmed, err := LoadConfig(); err != nil || trimmed.BucketLifecycleJSON != "" {
+		t.Errorf("whitespace-only lifecycle = %q err = %v", trimmed.BucketLifecycleJSON, err)
+	}
+	t.Setenv("QM_TENANT_BUCKET_LIFECYCLE_JSON", `{"rule":[]}`)
+
 	// An unset bucket location follows the provisioner's region, as the
 	// Terraform default does.
 	if cfg.BucketLocation != "us-central1" {

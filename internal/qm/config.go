@@ -115,16 +115,20 @@ func LoadConfig() (Config, error) {
 		SentryDSN:         os.Getenv("SENTRY_DSN"),
 		RunStaleAfter:     defaultRunStaleAfter,
 
-		SQLInstance:         os.Getenv("QM_SQL_INSTANCE"),
-		SQLConnectionName:   os.Getenv("QM_SQL_CONNECTION_NAME"),
-		SQLPrivateIP:        os.Getenv("QM_SQL_PRIVATE_IP"),
-		SQLAdminUser:        os.Getenv("QM_SQL_ADMIN_USER"),
-		SQLAdminSecret:      os.Getenv("QM_SQL_ADMIN_SECRET"),
-		LBURLMap:            os.Getenv("QM_LB_URL_MAP"),
-		VPCNetwork:          os.Getenv("QM_VPC_NETWORK"),
-		VPCSubnetwork:       os.Getenv("QM_VPC_SUBNETWORK"),
-		BucketLocation:      os.Getenv("QM_TENANT_BUCKET_LOCATION"),
-		BucketLifecycleJSON: os.Getenv("QM_TENANT_BUCKET_LIFECYCLE_JSON"),
+		SQLInstance:       os.Getenv("QM_SQL_INSTANCE"),
+		SQLConnectionName: os.Getenv("QM_SQL_CONNECTION_NAME"),
+		SQLPrivateIP:      os.Getenv("QM_SQL_PRIVATE_IP"),
+		SQLAdminUser:      os.Getenv("QM_SQL_ADMIN_USER"),
+		SQLAdminSecret:    os.Getenv("QM_SQL_ADMIN_SECRET"),
+		LBURLMap:          os.Getenv("QM_LB_URL_MAP"),
+		VPCNetwork:        os.Getenv("QM_VPC_NETWORK"),
+		VPCSubnetwork:     os.Getenv("QM_VPC_SUBNETWORK"),
+		BucketLocation:    os.Getenv("QM_TENANT_BUCKET_LOCATION"),
+		// Trimmed here so the readiness check and the bucket client cannot
+		// disagree about whether a whitespace-only value is "no policy":
+		// one of them accepting it and the other trying to parse it is a
+		// plan that starts and then stops every tenant at the bucket step.
+		BucketLifecycleJSON: strings.TrimSpace(os.Getenv("QM_TENANT_BUCKET_LIFECYCLE_JSON")),
 
 		ResendSecret:     os.Getenv("QM_RESEND_SECRET"),
 		EmailFrom:        os.Getenv("QM_EMAIL_FROM"),

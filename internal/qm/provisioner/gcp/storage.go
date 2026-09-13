@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"strings"
 
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/option"
@@ -82,9 +83,11 @@ func (b *Buckets) Create(ctx context.Context, name, location, lifecycleJSON stri
 		},
 		Labels: map[string]string{"managed-by": "qm-api"},
 	}
-	if lifecycleJSON != "" {
+	// Trimmed, matching the step's readiness check: a value of nothing but
+	// whitespace is no policy, not a policy that fails to parse.
+	if strings.TrimSpace(lifecycleJSON) != "" {
 		var lifecycle storage.BucketLifecycle
-		if err := json.Unmarshal([]byte(lifecycleJSON), &lifecycle); err != nil {
+		if err := json.Unmarshal([]byte(strings.TrimSpace(lifecycleJSON)), &lifecycle); err != nil {
 			return fmt.Errorf("parse the tenant bucket lifecycle policy: %w", err)
 		}
 		spec.Lifecycle = &lifecycle

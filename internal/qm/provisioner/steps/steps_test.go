@@ -1042,11 +1042,22 @@ func TestPlanReadyRefusesAnIncompleteConfiguration(t *testing.T) {
 		{"no sandbox template", func(e *provisioner.Env) { e.SandboxTemplate = "" }, "QM_SANDBOX_TEMPLATE"},
 		{"no sql admin secret", func(e *provisioner.Env) { e.SQLAdminSecret = "" }, "QM_SQL_ADMIN_SECRET"},
 		{"a mangled bucket lifecycle policy", func(e *provisioner.Env) { e.BucketLifecycleJSON = "{not json" }, "QM_TENANT_BUCKET_LIFECYCLE_JSON"},
+		{"a lifecycle policy that is only whitespace", func(e *provisioner.Env) { e.BucketLifecycleJSON = "  \n " }, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := testEnv(false)
 			tc.mut(&env)
 			err := provisioner.PlanReady(All(full), env)
+			if tc.wants == "" {
+				// Nothing but whitespace is no policy, and the bucket
+				// client has to read it the same way — a plan that starts
+				// here and then fails to parse it stops every tenant after
+				// its secrets, identity and database already exist.
+				if err != nil {
+					t.Errorf("err = %v, want the plan accepted", err)
+				}
+				return
+			}
 			if err == nil || !strings.Contains(err.Error(), tc.wants) {
 				t.Errorf("err = %v, want %s named", err, tc.wants)
 			}
