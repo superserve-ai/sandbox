@@ -120,10 +120,25 @@ func quoteIdentifier(name string) (string, error) {
 // reasserts its isolation: owned by the tenant's role, and closed to
 // everyone else on the shared instance.
 //
-// Reasserting every time is deliberate. CREATE DATABASE cannot run inside a
-// transaction, so the owner and the revoke are separate statements from it;
-// a run that died in between would otherwise leave a database every other
-// tenant's role could connect to, and no later run would notice.
+// The order is what makes it safe on a shared instance, and none of it is
+// interchangeable:
+//
+//  1. CREATE DATABASE with connections disallowed, owned by the admin. A
+//     database created owned by the tenant cannot then have CONNECT
+//     revoked from PUBLIC by the admin — the revoke is a no-op with a
+//     warning — and a database created connectable is one every other
+//     tenant's role can reach for as long as the gap lasts. A session
+//     opened in that gap survives the later revoke.
+//  2. Revoke CONNECT from PUBLIC while the admin still owns it.
+//  3. Hand ownership to the tenant. The database owner is what gives the
+//     tenant rights on its public schema, which from Postgres 15 is owned
+//     by pg_database_owner rather than granted to PUBLIC.
+//  4. Allow connections.
+//
+// Reasserting the last three on every call is deliberate: CREATE DATABASE
+// cannot run inside a transaction, so a run that died between any two of
+// them would otherwise leave a database either unreachable by its own
+// tenant or reachable by every other one, and no later run would notice.
 func (d *Databases) EnsureDatabase(ctx context.Context, name, owner string) error {
 	pool, err := d.connect(ctx)
 	if err != nil {
@@ -137,17 +152,20 @@ func (d *Databases) EnsureDatabase(ctx context.Context, name, owner string) erro
 	if err != nil {
 		return err
 	}
-	_, err = pool.Exec(ctx, `CREATE DATABASE `+dbIdent+` OWNER `+ownerIdent)
+	_, err = pool.Exec(ctx, `CREATE DATABASE `+dbIdent+` ALLOW_CONNECTIONS false`)
 	if err != nil && !isPGCode(err, pgDuplicateDatabase) {
 		return fmt.Errorf("create database %s: %w", name, err)
-	}
-	if _, err := pool.Exec(ctx, `ALTER DATABASE `+dbIdent+` OWNER TO `+ownerIdent); err != nil {
-		return fmt.Errorf("set the owner of database %s: %w", name, err)
 	}
 	// Without this every role on the shared instance — that is, every other
 	// tenant — could connect to this database.
 	if _, err := pool.Exec(ctx, `REVOKE CONNECT ON DATABASE `+dbIdent+` FROM PUBLIC`); err != nil {
 		return fmt.Errorf("close database %s to other roles: %w", name, err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER DATABASE `+dbIdent+` OWNER TO `+ownerIdent); err != nil {
+		return fmt.Errorf("set the owner of database %s: %w", name, err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER DATABASE `+dbIdent+` WITH ALLOW_CONNECTIONS true`); err != nil {
+		return fmt.Errorf("open database %s to its tenant: %w", name, err)
 	}
 	return nil
 }
@@ -196,6 +214,13 @@ func (d *Databases) DropDatabase(ctx context.Context, name string) error {
 // current one, so a retry converges on the password DATABASE_URL carries.
 // The role gets LOGIN and nothing else: it owns its own database and has no
 // standing rights anywhere on the instance.
+//
+// It also grants the role to the admin. That is not a convenience: from
+// Postgres 16 a CREATEROLE administrator is not automatically able to SET
+// ROLE to the roles it creates, and without that it cannot hand a database
+// over to one — ALTER DATABASE ... OWNER TO fails with "must be able to SET
+// ROLE". The admin is already the more privileged of the two, so it gives
+// away nothing.
 func (d *Databases) EnsureUser(ctx context.Context, name, password string) error {
 	pool, err := d.connect(ctx)
 	if err != nil {
@@ -206,7 +231,7 @@ func (d *Databases) EnsureUser(ctx context.Context, name, password string) error
 		return err
 	}
 	// The password is a literal, not an identifier, so it goes through
-	// pgx's quoting rather than string concatenation.
+	// Postgres's own quoting rather than string concatenation.
 	quoted, err := quoteLiteral(ctx, pool, password)
 	if err != nil {
 		return err
@@ -217,6 +242,11 @@ func (d *Databases) EnsureUser(ctx context.Context, name, password string) error
 	}
 	if _, err := pool.Exec(ctx, `ALTER ROLE `+ident+` WITH LOGIN PASSWORD `+quoted); err != nil {
 		return fmt.Errorf("set the password of role %s: %w", name, err)
+	}
+	// INHERIT as well as SET: the ownership checks on ALTER DATABASE read
+	// the privileges the admin holds, not the ones it could assume.
+	if _, err := pool.Exec(ctx, `GRANT `+ident+` TO CURRENT_USER WITH SET TRUE, INHERIT TRUE`); err != nil {
+		return fmt.Errorf("let the admin act for role %s: %w", name, err)
 	}
 	return nil
 }

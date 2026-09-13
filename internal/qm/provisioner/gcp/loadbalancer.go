@@ -137,11 +137,22 @@ func (l *LoadBalancer) ensureNEG(ctx context.Context, name, cloudRunService stri
 		CloudRun:            &compute.NetworkEndpointGroupCloudRun{Service: cloudRunService},
 	}).Context(ctx).Do()
 	if err != nil {
-		if alreadyExists(err) {
-			// Raced with another attempt; the next run's Get compares it.
-			return nil
+		if !alreadyExists(err) {
+			return fmt.Errorf("create the network endpoint group for %s: %w", name, err)
 		}
-		return fmt.Errorf("create the network endpoint group for %s: %w", name, err)
+		// Raced with another attempt, or the first Get was stale. Either
+		// way the group now exists and has to be checked like any other:
+		// attaching a backend to one that targets a different service
+		// would route this tenant's hostname at that service, and both
+		// probes would pass.
+		existing, err := l.svc.RegionNetworkEndpointGroups.Get(l.project, l.region, name).Context(ctx).Do()
+		if err != nil {
+			return fmt.Errorf("get the network endpoint group %s after it was already created: %w", name, err)
+		}
+		if target := negTarget(existing); target != cloudRunService {
+			return fmt.Errorf("network endpoint group %s points at %q, not %q; delete it and retry", name, target, cloudRunService)
+		}
+		return nil
 	}
 	return l.waitRegion(ctx, op)
 }
@@ -268,23 +279,37 @@ func (l *LoadBalancer) patchURLMap(ctx context.Context, mutate func(*compute.Url
 	return fmt.Errorf("update url map %s: %w", l.urlMap, lastErr)
 }
 
-// addRoute adds the host rule and its path matcher, reporting whether the
-// map changed. A host already routed to this matcher is left alone.
+// addRoute points host at matcher and matcher at backend, reporting whether
+// the map changed. It never edits a rule that carries other hosts: a URL
+// map's host rules are shared state, and repointing one to reconcile this
+// tenant would silently reroute every other hostname on it.
 func addRoute(m *compute.UrlMap, host, matcher, backend string) bool {
 	changed := false
-	var rule *compute.HostRule
-	for _, existing := range m.HostRules {
-		if slices.Contains(existing.Hosts, host) {
-			rule = existing
-			break
+	var own *compute.HostRule
+	kept := make([]*compute.HostRule, 0, len(m.HostRules)+1)
+	for _, rule := range m.HostRules {
+		if !slices.Contains(rule.Hosts, host) {
+			kept = append(kept, rule)
+			continue
 		}
+		if len(rule.Hosts) == 1 {
+			own = rule
+			kept = append(kept, rule)
+			continue
+		}
+		// Shared with other hostnames. Take this one out and give it a
+		// rule of its own rather than changing where the others point.
+		rule.Hosts = without(rule.Hosts, host)
+		kept = append(kept, rule)
+		changed = true
 	}
+	m.HostRules = kept
 	switch {
-	case rule == nil:
+	case own == nil:
 		m.HostRules = append(m.HostRules, &compute.HostRule{Hosts: []string{host}, PathMatcher: matcher})
 		changed = true
-	case rule.PathMatcher != matcher:
-		rule.PathMatcher = matcher
+	case own.PathMatcher != matcher:
+		own.PathMatcher = matcher
 		changed = true
 	}
 	for _, pm := range m.PathMatchers {

@@ -159,3 +159,37 @@ func TestNEGTarget(t *testing.T) {
 		t.Errorf("target of nothing = %q", got)
 	}
 }
+
+// A URL map's host rules are shared state. Reconciling one tenant must
+// never repoint a rule that other hostnames ride on: the tenant gets a rule
+// of its own and the others are left where they were.
+func TestAddRouteSplitsASharedRule(t *testing.T) {
+	m := &compute.UrlMap{
+		HostRules: []*compute.HostRule{
+			{Hosts: []string{"pilot-team.qm.example.com", "other.qm.example.com"}, PathMatcher: "qm-legacy"},
+		},
+		PathMatchers: []*compute.PathMatcher{{Name: "qm-legacy", DefaultService: "legacy-backend"}},
+	}
+	if !addRoute(m, "pilot-team.qm.example.com", "qm-pilot-team", "pilot-backend") {
+		t.Fatal("splitting a shared rule reported no change")
+	}
+	if matcher, ok := routed(m, "pilot-team.qm.example.com"); !ok || matcher != "qm-pilot-team" {
+		t.Errorf("the tenant's route = %q %v", matcher, ok)
+	}
+	// The hostname that shared the rule is untouched, and still points at
+	// the backend it did before.
+	if matcher, ok := routed(m, "other.qm.example.com"); !ok || matcher != "qm-legacy" {
+		t.Errorf("a hostname that shared the rule was rerouted: %q %v", matcher, ok)
+	}
+	if svc, _ := matcherService(m, "qm-legacy"); svc != "legacy-backend" {
+		t.Errorf("the shared matcher's backend changed to %q", svc)
+	}
+	if svc, ok := matcherService(m, "qm-pilot-team"); !ok || svc != "pilot-backend" {
+		t.Errorf("the tenant's matcher = %q %v", svc, ok)
+	}
+
+	// And it is idempotent from there.
+	if addRoute(m, "pilot-team.qm.example.com", "qm-pilot-team", "pilot-backend") {
+		t.Error("re-adding the split route reported a change")
+	}
+}
