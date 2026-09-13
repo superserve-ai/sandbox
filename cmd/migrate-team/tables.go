@@ -83,10 +83,37 @@ var membershipTables = map[string]bool{
 // admitted after validate and retired before the cutover lock: it is invisible
 // to the live-tenant recheck by then, yet its row (and the slug it reserves)
 // still has to reach the dest ahead of its events and secret references.
+// api_key precedes it because such a tenant's sandbox key was minted after
+// validate too, and the tenant row carries a foreign key to it.
 var cutoverSweepTables = []string{
 	"activity", "sandbox_revocation", "revoked_proxy_token",
 	"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
-	"qm.tenants", "qm.tenant_events", "qm.tenant_secrets",
+	"api_key", "qm.tenants", "qm.tenant_events", "qm.tenant_secrets",
+}
+
+// sweepScopes narrows a table for the cutover sweep, whose job is smaller
+// than the full copy's: carry the stragglers, and the parents they need, and
+// nothing else. api_key is narrowed to the keys hosted-QM tenants point at so
+// the sweep stays a foreign-key fixup rather than a second path for copying
+// the team's keys — copy already decides which of those may cross cells.
+var sweepScopes = map[string]string{
+	"api_key": `team_id = $1 AND id IN (
+		SELECT sandbox_api_key_id FROM qm.tenants
+		WHERE team_id = $1 AND sandbox_api_key_id IS NOT NULL
+	)`,
+}
+
+// sweepSpec resolves a cutoverSweepTables entry to the spec the sweep copies
+// with. Sweep-only; purge still deletes by the table's full scope.
+func sweepSpec(name string) (tableSpec, bool) {
+	t, ok := tableByName(name)
+	if !ok {
+		return tableSpec{}, false
+	}
+	if scope, ok := sweepScopes[name]; ok {
+		t.scope = scope
+	}
+	return t, true
 }
 
 var migratedTables = []tableSpec{

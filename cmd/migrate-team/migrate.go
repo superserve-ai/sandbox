@@ -1353,7 +1353,7 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	// authoritative and a sweep would overwrite its live rows (e.g. the
 	// rollup backfill cursor) with the frozen source's.
 	for _, name := range cutoverSweepTables {
-		spec, ok := tableByName(name)
+		spec, ok := sweepSpec(name)
 		if !ok {
 			return fmt.Errorf("sweep: unknown table %s", name)
 		}
@@ -1563,7 +1563,7 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	// dead cell, not customer data.
 	if !detached {
 		for _, name := range cutoverSweepTables {
-			spec, ok := tableByName(name)
+			spec, ok := sweepSpec(name)
 			if !ok {
 				return fmt.Errorf("sweep: unknown table %s", name)
 			}

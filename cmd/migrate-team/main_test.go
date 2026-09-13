@@ -910,17 +910,24 @@ func TestTeamMigration(t *testing.T) {
 	t.Run("straggler sweep carries a tenant retired after validate", func(t *testing.T) {
 		// A hosted-QM tenant admitted after validate and retired before the
 		// cutover lock passes the live-tenant recheck, so the sweep is the
-		// only thing that gets it into the dest. Its parent row has to land
-		// before its events and secret references or their FKs fail.
+		// only thing that gets it into the dest. Its own parents have to land
+		// first — the sandbox key it was issued, which was minted after
+		// validate too — and its events and secret references after it.
 		tx, err := srcPool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer tx.Rollback(ctx)
-		late := uuid.New()
+		late, lateKey := uuid.New(), uuid.New()
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, status)
-			VALUES ($1, $2, 'retired-late', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic', 'deleted')`, late, f.team); err != nil {
+			INSERT INTO api_key (id, team_id, key_hash, name, revoked_at)
+			VALUES ($1, $2, 'hash-'||gen_random_uuid()::text, 'qm-retired-late', now())`, lateKey, f.team); err != nil {
+			t.Fatalf("late key insert: %v", err)
+		}
+		defer mustExec(t, dstPool, `DELETE FROM api_key WHERE id = $1`, lateKey)
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, status, sandbox_api_key_id)
+			VALUES ($1, $2, 'retired-late', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic', 'deleted', $3)`, late, f.team, lateKey); err != nil {
 			t.Fatalf("late tenant insert: %v", err)
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO qm.tenant_events (tenant_id, step, status, seq) VALUES ($1, 'database', 'failed', 1)`, late); err != nil {
@@ -932,7 +939,7 @@ func TestTeamMigration(t *testing.T) {
 		defer mustExec(t, dstPool, `DELETE FROM qm.tenants WHERE id = $1`, late)
 
 		for _, name := range cutoverSweepTables {
-			spec, ok := tableByName(name)
+			spec, ok := sweepSpec(name)
 			if !ok {
 				t.Fatalf("%s spec missing", name)
 			}
@@ -941,16 +948,37 @@ func TestTeamMigration(t *testing.T) {
 			}
 		}
 		var status string
+		var keyID uuid.UUID
 		var events, secrets int
 		if err := dstPool.QueryRow(ctx, `
-			SELECT t.status,
+			SELECT t.status, t.sandbox_api_key_id,
 			       (SELECT count(*) FROM qm.tenant_events WHERE tenant_id = t.id),
 			       (SELECT count(*) FROM qm.tenant_secrets WHERE tenant_id = t.id)
-			FROM qm.tenants t WHERE t.id = $1`, late).Scan(&status, &events, &secrets); err != nil {
+			FROM qm.tenants t WHERE t.id = $1`, late).Scan(&status, &keyID, &events, &secrets); err != nil {
 			t.Fatalf("late tenant not swept to dest: %v", err)
 		}
-		if status != "deleted" || events != 1 || secrets != 1 {
-			t.Fatalf("late tenant swept incompletely: status=%s events=%d secrets=%d", status, events, secrets)
+		if status != "deleted" || keyID != lateKey || events != 1 || secrets != 1 {
+			t.Fatalf("late tenant swept incompletely: status=%s key=%s events=%d secrets=%d", status, keyID, events, secrets)
+		}
+
+		// The sweep is an FK fixup for the tenants it carries, not a second
+		// copy of the team's keys: a key no tenant points at stays behind.
+		unreferenced := uuid.New()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO api_key (id, team_id, key_hash, name, revoked_at)
+			VALUES ($1, $2, 'hash-'||gen_random_uuid()::text, 'unreferenced-late', now())`, unreferenced, f.team); err != nil {
+			t.Fatalf("unreferenced key insert: %v", err)
+		}
+		keySpec, ok := sweepSpec("api_key")
+		if !ok {
+			t.Fatal("api_key spec missing")
+		}
+		if _, _, err := copyTable(ctx, tx, dstPool, keySpec, f.team, nil); err != nil {
+			t.Fatalf("sweep api_key: %v", err)
+		}
+		var n int
+		if err := dstPool.QueryRow(ctx, `SELECT count(*) FROM api_key WHERE id = $1`, unreferenced).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("unreferenced key swept to dest (n=%d, err=%v)", n, err)
 		}
 	})
 
