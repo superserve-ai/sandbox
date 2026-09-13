@@ -26,13 +26,19 @@ type DatabaseAdmin interface {
 	// safe — those are separate statements, CREATE DATABASE cannot run in a
 	// transaction, and a database left readable by every other tenant's
 	// role is exactly the failure this step exists to prevent.
-	EnsureDatabase(ctx context.Context, name, owner string) error
-	DropDatabase(ctx context.Context, name string) error
+	//
+	// marker is this tenant's ownership marker, stored as the object's
+	// comment. A database or role of that name carrying a different one
+	// belongs to something else, and every method here must refuse it:
+	// these names come from a user-chosen slug, and reconciling a stranger
+	// resets its password, takes its ownership, and drops it on teardown.
+	EnsureDatabase(ctx context.Context, name, owner, marker string) error
+	DropDatabase(ctx context.Context, name, marker string) error
 	// EnsureUser creates the tenant's role or resets its password; the
 	// password comes from the tenant's DATABASE_PASSWORD secret, which the
 	// secrets step generated before this step runs.
-	EnsureUser(ctx context.Context, name, password string) error
-	DropUser(ctx context.Context, name string) error
+	EnsureUser(ctx context.Context, name, password, marker string) error
+	DropUser(ctx context.Context, name, marker string) error
 }
 
 var errNoDatabaseAdmin = errors.New("no database client configured")
@@ -92,14 +98,15 @@ func (s database) Run(ctx context.Context, t *provisioner.Tenant) error {
 		return fmt.Errorf("read the tenant's database password: %w", err)
 	}
 	role := RoleName(t.Row.Slug)
+	marker := TenantDescription(t.Row.ID.String(), t.Row.Slug)
 	// EnsureUser before the database: the database is created owned by the
 	// role, so the role has to exist first. Re-running it resets the
 	// password to the one DATABASE_URL is about to be composed from, which
 	// is what makes a half-finished attempt converge.
-	if err := s.c.Databases.EnsureUser(ctx, role, string(password)); err != nil {
+	if err := s.c.Databases.EnsureUser(ctx, role, string(password), marker); err != nil {
 		return fmt.Errorf("create the tenant's database role: %w", err)
 	}
-	if err := s.c.Databases.EnsureDatabase(ctx, name, role); err != nil {
+	if err := s.c.Databases.EnsureDatabase(ctx, name, role, marker); err != nil {
 		return fmt.Errorf("create the tenant's database: %w", err)
 	}
 	// Written every run, not only on the run that created the database: it
@@ -139,12 +146,13 @@ func (s database) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if t.Row.DbName != nil {
 		name = *t.Row.DbName
 	}
+	marker := TenantDescription(t.Row.ID.String(), t.Row.Slug)
 	// The database before the role: Postgres refuses to drop a role that
 	// still owns objects.
-	if err := s.c.Databases.DropDatabase(ctx, name); err != nil {
+	if err := s.c.Databases.DropDatabase(ctx, name, marker); err != nil {
 		return fmt.Errorf("drop the tenant's database: %w", err)
 	}
-	if err := s.c.Databases.DropUser(ctx, RoleName(t.Row.Slug)); err != nil {
+	if err := s.c.Databases.DropUser(ctx, RoleName(t.Row.Slug), marker); err != nil {
 		return fmt.Errorf("drop the tenant's database role: %w", err)
 	}
 	if err := s.c.Secrets.Delete(ctx, t.SecretName(secretDatabaseURL)); err != nil {

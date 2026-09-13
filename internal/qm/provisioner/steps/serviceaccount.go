@@ -105,6 +105,32 @@ func (s serviceAccount) Run(ctx context.Context, t *provisioner.Tenant) error {
 	return t.Record(ctx, tenantstore.Resources{ServiceAccount: &email})
 }
 
+// tenantAccount is the service account this tenant owns, if any: the one
+// recorded on the row, or the one its slug derives when that account exists
+// and carries this tenant's marker. The derived fallback is what recovers a
+// run that created the account and died before recording it; the marker is
+// what keeps it from reaching an account that merely shares the name.
+//
+// ok is false when there is nothing this tenant owns, which is the signal
+// for the account-scoped parts of teardown to do nothing at all.
+func tenantAccount(ctx context.Context, c Clients, t *provisioner.Tenant) (string, bool, error) {
+	if t.Row.ServiceAccount != nil {
+		return *t.Row.ServiceAccount, true, nil
+	}
+	if c.Accounts == nil {
+		return "", false, errNoServiceAccountAdmin
+	}
+	email := ServiceAccountEmail(t.Env.Project, t.Row.Slug)
+	existing, exists, err := c.Accounts.Get(ctx, email)
+	if err != nil {
+		return "", false, fmt.Errorf("look up service account: %w", err)
+	}
+	if !exists || existing.Description != TenantDescription(t.Row.ID.String(), t.Row.Slug) {
+		return "", false, nil
+	}
+	return email, true, nil
+}
+
 // Rollback deletes the identity. It works from the name the slug derives
 // rather than only from the recorded one, so an account created by a run
 // that died before Record is still removed: a leaked service account is a
@@ -120,25 +146,27 @@ func (s serviceAccount) Rollback(ctx context.Context, t *provisioner.Tenant) err
 	if s.c.Accounts == nil {
 		return errNoServiceAccountAdmin
 	}
-	email := ServiceAccountEmail(t.Env.Project, t.Row.Slug)
-	if t.Row.ServiceAccount != nil {
-		email = *t.Row.ServiceAccount
-	}
 	// Same check on the way down, and for the same reason: a teardown that
 	// deleted an account merely because its name matched would take the
 	// platform's own identity with it.
-	existing, exists, err := s.c.Accounts.Get(ctx, email)
+	email, ok, err := tenantAccount(ctx, s.c, t)
 	if err != nil {
-		return fmt.Errorf("look up service account: %w", err)
+		return err
 	}
-	if exists && existing.Description != TenantDescription(t.Row.ID.String(), t.Row.Slug) {
-		return fmt.Errorf("service account %s does not belong to this tenant; not deleting it", email)
+	if !ok {
+		return provisioner.Skip("no service account of this tenant's")
+	}
+	if t.Row.ServiceAccount != nil {
+		existing, exists, err := s.c.Accounts.Get(ctx, email)
+		if err != nil {
+			return fmt.Errorf("look up service account: %w", err)
+		}
+		if exists && existing.Description != TenantDescription(t.Row.ID.String(), t.Row.Slug) {
+			return fmt.Errorf("service account %s does not belong to this tenant; not deleting it", email)
+		}
 	}
 	if err := s.c.Accounts.Delete(ctx, email); err != nil {
 		return fmt.Errorf("delete service account: %w", err)
-	}
-	if t.Row.ServiceAccount == nil {
-		return provisioner.Skip("no service account recorded")
 	}
 	return nil
 }

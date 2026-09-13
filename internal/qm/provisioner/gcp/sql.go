@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -139,7 +141,7 @@ func quoteIdentifier(name string) (string, error) {
 // cannot run inside a transaction, so a run that died between any two of
 // them would otherwise leave a database either unreachable by its own
 // tenant or reachable by every other one, and no later run would notice.
-func (d *Databases) EnsureDatabase(ctx context.Context, name, owner string) error {
+func (d *Databases) EnsureDatabase(ctx context.Context, name, owner, marker string) error {
 	pool, err := d.connect(ctx)
 	if err != nil {
 		return err
@@ -152,9 +154,22 @@ func (d *Databases) EnsureDatabase(ctx context.Context, name, owner string) erro
 	if err != nil {
 		return err
 	}
+	// Before anything is changed: the name comes from a user-chosen slug,
+	// and reconciling a database that is not this tenant's would take its
+	// ownership and close it to whoever was using it.
+	if err := d.checkMarker(ctx, pool, databaseMarkerSQL, name, marker, "database"); err != nil {
+		return err
+	}
 	_, err = pool.Exec(ctx, `CREATE DATABASE `+dbIdent+` ALLOW_CONNECTIONS false`)
 	if err != nil && !isPGCode(err, pgDuplicateDatabase) {
 		return fmt.Errorf("create database %s: %w", name, err)
+	}
+	// Stamped while the admin still owns it, and before the marker could be
+	// read by anything else: a database created by a run that died here
+	// carries no marker and is adopted by the retry, which is the same
+	// database the same tenant asked for.
+	if _, err := pool.Exec(ctx, `COMMENT ON DATABASE `+dbIdent+` IS `+quoteMarker(marker)); err != nil {
+		return fmt.Errorf("mark database %s: %w", name, err)
 	}
 	// Without this every role on the shared instance — that is, every other
 	// tenant — could connect to this database.
@@ -173,13 +188,16 @@ func (d *Databases) EnsureDatabase(ctx context.Context, name, owner string) erro
 // DropDatabase removes the database, waiting out sessions still attached to
 // it: the tenant's own container may not have finished shutting down when
 // teardown reaches this step.
-func (d *Databases) DropDatabase(ctx context.Context, name string) error {
+func (d *Databases) DropDatabase(ctx context.Context, name, marker string) error {
 	pool, err := d.connect(ctx)
 	if err != nil {
 		return err
 	}
 	ident, err := quoteIdentifier(name)
 	if err != nil {
+		return err
+	}
+	if err := d.checkMarker(ctx, pool, databaseMarkerSQL, name, marker, "database"); err != nil {
 		return err
 	}
 	var lastErr error
@@ -221,13 +239,19 @@ func (d *Databases) DropDatabase(ctx context.Context, name string) error {
 // over to one — ALTER DATABASE ... OWNER TO fails with "must be able to SET
 // ROLE". The admin is already the more privileged of the two, so it gives
 // away nothing.
-func (d *Databases) EnsureUser(ctx context.Context, name, password string) error {
+func (d *Databases) EnsureUser(ctx context.Context, name, password, marker string) error {
 	pool, err := d.connect(ctx)
 	if err != nil {
 		return err
 	}
 	ident, err := quoteIdentifier(name)
 	if err != nil {
+		return err
+	}
+	// Before the password is reset: a role of this name that is not this
+	// tenant's belongs to something else, and resetting it would lock that
+	// something else out.
+	if err := d.checkMarker(ctx, pool, roleMarkerSQL, name, marker, "role"); err != nil {
 		return err
 	}
 	// The password is a literal, not an identifier, so it goes through
@@ -248,16 +272,22 @@ func (d *Databases) EnsureUser(ctx context.Context, name, password string) error
 	if _, err := pool.Exec(ctx, `GRANT `+ident+` TO CURRENT_USER WITH SET TRUE, INHERIT TRUE`); err != nil {
 		return fmt.Errorf("let the admin act for role %s: %w", name, err)
 	}
+	if _, err := pool.Exec(ctx, `COMMENT ON ROLE `+ident+` IS `+quoteMarker(marker)); err != nil {
+		return fmt.Errorf("mark role %s: %w", name, err)
+	}
 	return nil
 }
 
-func (d *Databases) DropUser(ctx context.Context, name string) error {
+func (d *Databases) DropUser(ctx context.Context, name, marker string) error {
 	pool, err := d.connect(ctx)
 	if err != nil {
 		return err
 	}
 	ident, err := quoteIdentifier(name)
 	if err != nil {
+		return err
+	}
+	if err := d.checkMarker(ctx, pool, roleMarkerSQL, name, marker, "role"); err != nil {
 		return err
 	}
 	// The tenant's database is dropped first, so by here the role owns
@@ -267,6 +297,39 @@ func (d *Databases) DropUser(ctx context.Context, name string) error {
 		return fmt.Errorf("drop role %s: %w", name, err)
 	}
 	return nil
+}
+
+// Where each object's ownership marker is kept. Shared-object comments are
+// the only per-object text a database or a role carries.
+const (
+	databaseMarkerSQL = `SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = $1`
+	roleMarkerSQL     = `SELECT shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname = $1`
+)
+
+// checkMarker refuses an object that exists and carries somebody else's
+// marker. An object that does not exist, or that exists with no marker at
+// all, passes: the second is a run that died between creating it and
+// stamping it, and that run was this tenant's.
+func (d *Databases) checkMarker(ctx context.Context, pool *pgxpool.Pool, query, name, marker, kind string) error {
+	var have *string
+	err := pool.QueryRow(ctx, query, name).Scan(&have)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read the marker on %s %s: %w", kind, name, err)
+	}
+	if have == nil || *have == marker {
+		return nil
+	}
+	return fmt.Errorf("%s %s already exists and does not belong to this tenant", kind, name)
+}
+
+// quoteMarker quotes a marker as a SQL literal. COMMENT takes no parameters,
+// and the marker is assembled from a tenant id and a slug that has already
+// been through the slug rules, but it is quoted rather than trusted.
+func quoteMarker(marker string) string {
+	return "'" + strings.ReplaceAll(marker, "'", "''") + "'"
 }
 
 // quoteLiteral asks Postgres to quote the value, so no escaping rule is

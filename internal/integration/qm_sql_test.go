@@ -60,13 +60,16 @@ func TestQMProvisionerDatabaseIsolation(t *testing.T) {
 	dbName, role := steps.DatabaseName(slug), steps.RoleName(slug)
 	otherRole := steps.RoleName(other)
 
-	if err := client.EnsureUser(ctx, role, "pw-one"); err != nil {
+	marker := steps.TenantDescription(uuid.NewString(), slug)
+	otherMarker := steps.TenantDescription(uuid.NewString(), other)
+
+	if err := client.EnsureUser(ctx, role, "pw-one", marker); err != nil {
 		t.Fatalf("create the tenant role: %v", err)
 	}
-	if err := client.EnsureUser(ctx, otherRole, "pw-two"); err != nil {
+	if err := client.EnsureUser(ctx, otherRole, "pw-two", otherMarker); err != nil {
 		t.Fatalf("create another tenant's role: %v", err)
 	}
-	if err := client.EnsureDatabase(ctx, dbName, role); err != nil {
+	if err := client.EnsureDatabase(ctx, dbName, role, marker); err != nil {
 		t.Fatalf("create the tenant database: %v", err)
 	}
 
@@ -86,10 +89,10 @@ func TestQMProvisionerDatabaseIsolation(t *testing.T) {
 	assertConnect(t, otherRole, dbName, false)
 
 	// A re-run converges, and leaves the isolation exactly as it was.
-	if err := client.EnsureUser(ctx, role, "pw-three"); err != nil {
+	if err := client.EnsureUser(ctx, role, "pw-three", marker); err != nil {
 		t.Fatalf("re-run the role: %v", err)
 	}
-	if err := client.EnsureDatabase(ctx, dbName, role); err != nil {
+	if err := client.EnsureDatabase(ctx, dbName, role, marker); err != nil {
 		t.Fatalf("re-run the database: %v", err)
 	}
 	assertConnect(t, role, dbName, true)
@@ -101,24 +104,42 @@ func TestQMProvisionerDatabaseIsolation(t *testing.T) {
 		t.Fatalf("open the database by hand: %v", err)
 	}
 	assertConnect(t, otherRole, dbName, true)
-	if err := client.EnsureDatabase(ctx, dbName, role); err != nil {
+	if err := client.EnsureDatabase(ctx, dbName, role, marker); err != nil {
 		t.Fatalf("repair the database: %v", err)
 	}
 	assertConnect(t, otherRole, dbName, false)
 
 	// Teardown removes both, in that order — Postgres refuses to drop a
 	// role that still owns a database.
-	if err := client.DropDatabase(ctx, dbName); err != nil {
+	// Nothing belonging to another tenant can be reconciled or dropped:
+	// these names come from a user-chosen slug, and taking over a database
+	// that merely matched would reset its password and delete its data.
+	if err := client.EnsureUser(ctx, role, "pw-four", otherMarker); err == nil {
+		t.Error("another tenant's marker reset this role's password")
+	}
+	if err := client.EnsureDatabase(ctx, dbName, role, otherMarker); err == nil {
+		t.Error("another tenant's marker reconciled this database")
+	}
+	if err := client.DropDatabase(ctx, dbName, otherMarker); err == nil {
+		t.Error("another tenant's marker dropped this database")
+	}
+	if err := client.DropUser(ctx, role, otherMarker); err == nil {
+		t.Error("another tenant's marker dropped this role")
+	}
+	// The refusals left everything as it was.
+	assertLogin(t, role, "pw-three", dbName, true)
+
+	if err := client.DropDatabase(ctx, dbName, marker); err != nil {
 		t.Fatalf("drop the database: %v", err)
 	}
-	if err := client.DropUser(ctx, role); err != nil {
+	if err := client.DropUser(ctx, role, marker); err != nil {
 		t.Fatalf("drop the role: %v", err)
 	}
 	// And both are safe to repeat: a teardown is retried.
-	if err := client.DropDatabase(ctx, dbName); err != nil {
+	if err := client.DropDatabase(ctx, dbName, marker); err != nil {
 		t.Fatalf("re-drop the database: %v", err)
 	}
-	if err := client.DropUser(ctx, role); err != nil {
+	if err := client.DropUser(ctx, role, marker); err != nil {
 		t.Fatalf("re-drop the role: %v", err)
 	}
 	var exists bool
@@ -144,15 +165,16 @@ func TestQMProvisionerDatabaseRolePasswordIsReset(t *testing.T) {
 	client := qmSQLAdmin(t, slug)
 	role, dbName := steps.RoleName(slug), steps.DatabaseName(slug)
 
-	if err := client.EnsureUser(ctx, role, "first-password"); err != nil {
+	marker := steps.TenantDescription(uuid.NewString(), slug)
+	if err := client.EnsureUser(ctx, role, "first-password", marker); err != nil {
 		t.Fatal(err)
 	}
-	if err := client.EnsureDatabase(ctx, dbName, role); err != nil {
+	if err := client.EnsureDatabase(ctx, dbName, role, marker); err != nil {
 		t.Fatal(err)
 	}
 	assertLogin(t, role, "first-password", dbName, true)
 
-	if err := client.EnsureUser(ctx, role, "second-password"); err != nil {
+	if err := client.EnsureUser(ctx, role, "second-password", marker); err != nil {
 		t.Fatal(err)
 	}
 	assertLogin(t, role, "second-password", dbName, true)
@@ -164,14 +186,15 @@ func TestQMProvisionerDatabaseRolePasswordIsReset(t *testing.T) {
 func TestQMProvisionerDatabaseRefusesOddIdentifiers(t *testing.T) {
 	ctx := context.Background()
 	client := qmSQLAdmin(t)
+	marker := steps.TenantDescription(uuid.NewString(), "pilot")
 	for _, name := range []string{`qm_x"; DROP DATABASE postgres; --`, "QM_X", "qm-x", ""} {
-		if err := client.EnsureDatabase(ctx, name, "qm_x"); err == nil {
+		if err := client.EnsureDatabase(ctx, name, "qm_x", marker); err == nil {
 			t.Errorf("EnsureDatabase accepted %q", name)
 		}
-		if err := client.EnsureUser(ctx, name, "pw"); err == nil {
+		if err := client.EnsureUser(ctx, name, "pw", marker); err == nil {
 			t.Errorf("EnsureUser accepted %q", name)
 		}
-		if err := client.DropDatabase(ctx, name); err == nil {
+		if err := client.DropDatabase(ctx, name, marker); err == nil {
 			t.Errorf("DropDatabase accepted %q", name)
 		}
 	}

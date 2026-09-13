@@ -271,26 +271,32 @@ func (s cloudRun) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if s.c.Accounts == nil {
 		return errNoServiceAccountAdmin
 	}
-	account := ServiceAccountEmail(t.Env.Project, t.Row.Slug)
-	if t.Row.ServiceAccount != nil {
-		account = *t.Row.ServiceAccount
-	}
-	// Both the name the grant was recorded under and the one configured
-	// now: they differ when the platform key has been rotated to a
-	// different resource since this tenant was built, and the recorded one
-	// is the binding that actually exists. The read is not allowed to fail
-	// quietly — the reference is deleted below, and losing it would strand
-	// the binding for good.
-	granted, err := s.sharedGrants(ctx, t)
+	// Only an account this tenant owns: revoking on one that merely shares
+	// the derived name would take away somebody else's access. With none,
+	// there is no binding to release — but the reference below is still
+	// this tenant's bookkeeping to clear.
+	account, ok, err := tenantAccount(ctx, s.c, t)
 	if err != nil {
 		return err
 	}
-	if t.Env.ResendSecret != "" && !slices.Contains(granted, t.Env.ResendSecret) {
-		granted = append(granted, t.Env.ResendSecret)
-	}
-	for _, secretName := range granted {
-		if err := s.c.Accounts.RevokeSecretAccess(ctx, secretName, account); err != nil {
-			return fmt.Errorf("revoke the tenant's access to the shared email key: %w", err)
+	if ok {
+		// Both the name the grant was recorded under and the one configured
+		// now: they differ when the platform key has been rotated to a
+		// different resource since this tenant was built, and the recorded
+		// one is the binding that actually exists. The read is not allowed
+		// to fail quietly — the reference is deleted below, and losing it
+		// would strand the binding for good.
+		granted, err := s.sharedGrants(ctx, t)
+		if err != nil {
+			return err
+		}
+		if t.Env.ResendSecret != "" && !slices.Contains(granted, t.Env.ResendSecret) {
+			granted = append(granted, t.Env.ResendSecret)
+		}
+		for _, secretName := range granted {
+			if err := s.c.Accounts.RevokeSecretAccess(ctx, secretName, account); err != nil {
+				return fmt.Errorf("revoke the tenant's access to the shared email key: %w", err)
+			}
 		}
 	}
 	if err := t.DeleteSecretRef(ctx, sharedSecretRef); err != nil {

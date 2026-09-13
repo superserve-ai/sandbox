@@ -126,4 +126,19 @@ func TestLoadConfigSharedInfrastructure(t *testing.T) {
 	if cfg.SandboxKeyRegion != "use" {
 		t.Errorf("sandbox key region = %q", cfg.SandboxKeyRegion)
 	}
+
+	// The region rides in the key as plaintext and the control plane reads
+	// anything malformed as "no region", silently losing the
+	// wrong-endpoint diagnostic the tag exists for. So it is refused here.
+	for _, bad := range []string{"us-east-1", "USE", "a-very-long-region-token"} {
+		t.Setenv("QM_SANDBOX_KEY_REGION", bad)
+		if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "QM_SANDBOX_KEY_REGION") {
+			t.Errorf("region %q: err = %v", bad, err)
+		}
+	}
+	// Whitespace is trimmed rather than refused.
+	t.Setenv("QM_SANDBOX_KEY_REGION", "  usw  ")
+	if trimmed, err := LoadConfig(); err != nil || trimmed.SandboxKeyRegion != "usw" {
+		t.Errorf("padded region = %q err = %v", trimmed.SandboxKeyRegion, err)
+	}
 }

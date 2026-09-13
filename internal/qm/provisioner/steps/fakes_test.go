@@ -148,25 +148,44 @@ type fakeDatabases struct {
 	databases map[string]string // name -> owner
 	closed    map[string]bool   // name -> CONNECT taken from PUBLIC
 	users     map[string]string // name -> password
-	created   int
+	// markers is the ownership comment on a database or role, keyed by
+	// "database:<name>" or "role:<name>".
+	markers map[string]string
+	created int
 }
 
 func newFakeDatabases() *fakeDatabases {
-	return &fakeDatabases{databases: map[string]string{}, closed: map[string]bool{}, users: map[string]string{}}
+	return &fakeDatabases{
+		databases: map[string]string{}, closed: map[string]bool{},
+		users: map[string]string{}, markers: map[string]string{},
+	}
 }
 
-func (f *fakeDatabases) EnsureDatabase(_ context.Context, name, owner string) error {
+// checkMarker mirrors the real client: an object carrying somebody else's
+// marker is refused; one with none is a run that died before stamping it.
+func (f *fakeDatabases) checkMarker(kind, name, marker string) error {
+	if have, ok := f.markers[kind+":"+name]; ok && have != marker {
+		return fmt.Errorf("fake: %s %s does not belong to this tenant", kind, name)
+	}
+	return nil
+}
+
+func (f *fakeDatabases) EnsureDatabase(_ context.Context, name, owner, marker string) error {
 	if err := f.check("databases.EnsureDatabase"); err != nil {
 		return err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.checkMarker("database", name, marker); err != nil {
+		return err
+	}
 	if _, ok := f.users[owner]; !ok {
 		return fmt.Errorf("fake: database %s owned by a role that does not exist", name)
 	}
 	if _, ok := f.databases[name]; !ok {
 		f.created++
 	}
+	f.markers["database:"+name] = marker
 	// The real client reasserts the owner and the revoke on every call;
 	// recording the owner each time is the fake's equivalent.
 	f.databases[name] = owner
@@ -174,33 +193,45 @@ func (f *fakeDatabases) EnsureDatabase(_ context.Context, name, owner string) er
 	return nil
 }
 
-func (f *fakeDatabases) DropDatabase(_ context.Context, name string) error {
+func (f *fakeDatabases) DropDatabase(_ context.Context, name, marker string) error {
 	if err := f.check("databases.DropDatabase"); err != nil {
 		return err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.checkMarker("database", name, marker); err != nil {
+		return err
+	}
 	delete(f.databases, name)
 	delete(f.closed, name)
+	delete(f.markers, "database:"+name)
 	return nil
 }
 
-func (f *fakeDatabases) EnsureUser(_ context.Context, name, password string) error {
+func (f *fakeDatabases) EnsureUser(_ context.Context, name, password, marker string) error {
 	if err := f.check("databases.EnsureUser"); err != nil {
 		return err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.checkMarker("role", name, marker); err != nil {
+		return err
+	}
 	f.users[name] = password
+	f.markers["role:"+name] = marker
 	return nil
 }
 
-func (f *fakeDatabases) DropUser(_ context.Context, name string) error {
+func (f *fakeDatabases) DropUser(_ context.Context, name, marker string) error {
 	if err := f.check("databases.DropUser"); err != nil {
 		return err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.checkMarker("role", name, marker); err != nil {
+		return err
+	}
+	delete(f.markers, "role:"+name)
 	// Postgres refuses to drop a role that still owns a database, and the
 	// step's ordering is what keeps that from happening.
 	for db, owner := range f.databases {

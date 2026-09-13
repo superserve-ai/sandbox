@@ -7,6 +7,7 @@ package qm
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -97,6 +98,10 @@ type Config struct {
 
 const defaultRunStaleAfter = 30 * time.Minute
 
+// regionTokenRe mirrors the control plane's own region-token shape (see
+// internal/api's apiKeyRegion): 1-17 lowercase alphanumerics.
+var regionTokenRe = regexp.MustCompile(`^[a-z0-9]{1,17}$`)
+
 // LoadConfig reads the environment. Required: DATABASE_URL, QM_BASE_DOMAIN,
 // and GCP_PROJECT unless every GCP-backed component is switched to its
 // local implementation.
@@ -134,7 +139,7 @@ func LoadConfig() (Config, error) {
 		EmailFrom:        os.Getenv("QM_EMAIL_FROM"),
 		SandboxAPIURL:    strings.TrimSuffix(os.Getenv("QM_SANDBOX_API_URL"), "/"),
 		SandboxTemplate:  os.Getenv("QM_SANDBOX_TEMPLATE"),
-		SandboxKeyRegion: envOr("QM_SANDBOX_KEY_REGION", os.Getenv("SANDBOX_ID_REGION")),
+		SandboxKeyRegion: strings.TrimSpace(envOr("QM_SANDBOX_KEY_REGION", os.Getenv("SANDBOX_ID_REGION"))),
 	}
 	// Buckets default to the provisioner's own region rather than failing:
 	// the Terraform module's tenant_bucket_location does the same.
@@ -150,6 +155,14 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.DatabaseURL == "" {
 		return cfg, fmt.Errorf("DATABASE_URL is required")
+	}
+	// The region rides in the key as plaintext and the control plane parses
+	// it back with this shape. Anything else is not rejected there, it is
+	// read as "no region" — so every key a misconfigured cell issued would
+	// silently lose the wrong-endpoint diagnostic, which is the only reason
+	// the tag exists.
+	if cfg.SandboxKeyRegion != "" && !regionTokenRe.MatchString(cfg.SandboxKeyRegion) {
+		return cfg, fmt.Errorf("QM_SANDBOX_KEY_REGION must be 1-17 lowercase letters or digits")
 	}
 	if cfg.BaseDomain == "" {
 		return cfg, fmt.Errorf("QM_BASE_DOMAIN is required")

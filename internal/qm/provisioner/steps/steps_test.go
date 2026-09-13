@@ -522,6 +522,24 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 			"does not belong to this tenant",
 		},
 		{
+			"a database with the name the slug derives",
+			func(f *tenantFixture) {
+				f.dbs.mu.Lock()
+				f.dbs.markers["database:qm_pilot_team"] = "somebody else"
+				f.dbs.mu.Unlock()
+			},
+			"does not belong to this tenant",
+		},
+		{
+			"a role with the name the slug derives",
+			func(f *tenantFixture) {
+				f.dbs.mu.Lock()
+				f.dbs.markers["role:qm_pilot_team"] = "somebody else"
+				f.dbs.mu.Unlock()
+			},
+			"does not belong to this tenant",
+		},
+		{
 			"a backend service with the name the slug derives",
 			func(f *tenantFixture) {
 				f.lb.mu.Lock()

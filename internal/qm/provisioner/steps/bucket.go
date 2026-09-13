@@ -264,15 +264,19 @@ func (s bucket) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if s.c.Secrets == nil {
 		return errNoSecretStore
 	}
-	// Derived when nothing was recorded, so credentials minted by a run
-	// that died before Record are still swept: an HMAC key authenticates as
-	// the service account, so one left behind is a live credential.
-	account := ServiceAccountEmail(t.Env.Project, t.Row.Slug)
-	if t.Row.ServiceAccount != nil {
-		account = *t.Row.ServiceAccount
-	}
-	if err := s.deleteHMACKeys(ctx, account); err != nil {
+	// Credentials minted by a run that died before Record are still swept —
+	// an HMAC key authenticates as the service account, so one left behind
+	// is a live credential — but only from an account this tenant owns.
+	// Sweeping an account that merely shares the derived name would delete
+	// somebody else's storage credentials.
+	account, ok, err := tenantAccount(ctx, s.c, t)
+	if err != nil {
 		return err
+	}
+	if ok {
+		if err := s.deleteHMACKeys(ctx, account); err != nil {
+			return err
+		}
 	}
 	if err := s.forgetHMACSecrets(ctx, t); err != nil {
 		return err
