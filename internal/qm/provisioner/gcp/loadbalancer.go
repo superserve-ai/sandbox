@@ -113,9 +113,18 @@ func (l *LoadBalancer) RemoveHostRule(ctx context.Context, host string) error {
 	return l.deleteNEG(ctx, name)
 }
 
+// ensureNEG creates the serverless NEG if it is missing, and refuses to
+// carry on if one of that name already points at a different Cloud Run
+// service. A NEG's target is fixed at creation, so this is not something
+// the provisioner can repair — and quietly accepting it would route a
+// tenant's hostname at somebody else's service, which the health and
+// sign-in probes would both happily pass.
 func (l *LoadBalancer) ensureNEG(ctx context.Context, name, cloudRunService string) error {
-	_, err := l.svc.RegionNetworkEndpointGroups.Get(l.project, l.region, name).Context(ctx).Do()
+	existing, err := l.svc.RegionNetworkEndpointGroups.Get(l.project, l.region, name).Context(ctx).Do()
 	if err == nil {
+		if target := negTarget(existing); target != cloudRunService {
+			return fmt.Errorf("network endpoint group %s points at %q, not %q; delete it and retry", name, target, cloudRunService)
+		}
 		return nil
 	}
 	if !notFound(err) {
@@ -129,11 +138,19 @@ func (l *LoadBalancer) ensureNEG(ctx context.Context, name, cloudRunService stri
 	}).Context(ctx).Do()
 	if err != nil {
 		if alreadyExists(err) {
+			// Raced with another attempt; the next run's Get compares it.
 			return nil
 		}
 		return fmt.Errorf("create the network endpoint group for %s: %w", name, err)
 	}
 	return l.waitRegion(ctx, op)
+}
+
+func negTarget(neg *compute.NetworkEndpointGroup) string {
+	if neg == nil || neg.CloudRun == nil {
+		return ""
+	}
+	return neg.CloudRun.Service
 }
 
 func (l *LoadBalancer) deleteNEG(ctx context.Context, name string) error {
@@ -148,17 +165,34 @@ func (l *LoadBalancer) deleteNEG(ctx context.Context, name string) error {
 }
 
 // ensureBackendService returns the backend service's self link, creating it
-// if needed. External managed is the scheme the shared HTTPS load balancer
-// uses; a serverless NEG carries no health check.
+// if needed and repointing it at this tenant's NEG if it drifted. External
+// managed is the scheme the shared HTTPS load balancer uses; a serverless
+// NEG carries no health check.
 func (l *LoadBalancer) ensureBackendService(ctx context.Context, name string) (string, error) {
+	negLink := fmt.Sprintf("projects/%s/regions/%s/networkEndpointGroups/%s", l.project, l.region, name)
 	existing, err := l.svc.BackendServices.Get(l.project, name).Context(ctx).Do()
 	if err == nil {
+		if backsNEG(existing, negLink) {
+			return existing.SelfLink, nil
+		}
+		// Unlike the NEG's target, a backend service's backends are
+		// mutable, so a drifted one is repaired rather than reported.
+		op, err := l.svc.BackendServices.Patch(l.project, name, &compute.BackendService{
+			Fingerprint:     existing.Fingerprint,
+			Backends:        []*compute.Backend{{Group: negLink}},
+			ForceSendFields: []string{"Backends"},
+		}).Context(ctx).Do()
+		if err != nil {
+			return "", fmt.Errorf("repoint the backend service %s at %s: %w", name, negLink, err)
+		}
+		if err := l.waitGlobal(ctx, op); err != nil {
+			return "", err
+		}
 		return existing.SelfLink, nil
 	}
 	if !notFound(err) {
 		return "", fmt.Errorf("get the backend service %s: %w", name, err)
 	}
-	negLink := fmt.Sprintf("projects/%s/regions/%s/networkEndpointGroups/%s", l.project, l.region, name)
 	op, err := l.svc.BackendServices.Insert(l.project, &compute.BackendService{
 		Name:                name,
 		LoadBalancingScheme: "EXTERNAL_MANAGED",
@@ -179,6 +213,16 @@ func (l *LoadBalancer) ensureBackendService(ctx context.Context, name string) (s
 		return "", fmt.Errorf("get the backend service %s after creating it: %w", name, err)
 	}
 	return created.SelfLink, nil
+}
+
+// backsNEG reports whether the backend service's only backend is this
+// tenant's NEG. Compared by suffix because the API returns a fully
+// qualified URL where the create sends a relative path.
+func backsNEG(svc *compute.BackendService, negLink string) bool {
+	if len(svc.Backends) != 1 {
+		return false
+	}
+	return strings.HasSuffix(svc.Backends[0].Group, negLink)
 }
 
 func (l *LoadBalancer) deleteBackendService(ctx context.Context, name string) error {

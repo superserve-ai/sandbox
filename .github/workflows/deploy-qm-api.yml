@@ -239,7 +239,11 @@ jobs:
           # targeting: the service resolves the job by project, region and
           # name, so a default that drifts from where the job actually lives
           # makes every create and retry fail at the trigger.
-          ENV="QM_PROVISIONER_JOB=$JOB,QM_PROVISIONER_REGION=$REGION"
+          # Semicolon-delimited, declared to gcloud with its ^;^ prefix: a
+          # comma would split a display-name sender like "QM, Inc
+          # <no-reply@...>" into two bogus assignments, and no value here
+          # can contain a semicolon (the guard below makes sure of it).
+          ENV="QM_PROVISIONER_JOB=$JOB;QM_PROVISIONER_REGION=$REGION"
           # The tenant-runtime settings the Terraform module does not own.
           # QM_RESEND_SECRET and QM_EMAIL_FROM are what give a provisioned
           # tenant a working sign-in; without them the binary refuses to
@@ -255,18 +259,24 @@ jobs:
           # environment deployed while the cloud steps were stubs still
           # carries it, and left alone the real provisioner would go on
           # recording placeholder resources and marking tenants ready.
-          ENV="$ENV,QM_PROVISIONER_STUB=0"
+          ENV="$ENV;QM_PROVISIONER_STUB=0"
           for pair in \
             "QM_RESEND_SECRET=${{ vars.QM_RESEND_SECRET }}" \
             "QM_EMAIL_FROM=${{ vars.QM_EMAIL_FROM }}" \
             "QM_SANDBOX_API_URL=${{ vars.QM_SANDBOX_API_URL }}" \
             "QM_SANDBOX_TEMPLATE=${{ vars.QM_SANDBOX_TEMPLATE }}"; do
-            ENV="$ENV,$pair"
+            case "${pair#*=}" in
+              *\;*)
+                echo "::error::${pair%%=*} contains a semicolon, which is the delimiter these variables are passed with."
+                exit 1
+                ;;
+            esac
+            ENV="$ENV;$pair"
           done
           # An array, because QM_EMAIL_FROM is a display-name address —
           # "QM <no-reply@...>" — and word splitting on an unquoted
           # expansion would hand gcloud three arguments it does not know.
-          SET=(--update-env-vars "$ENV")
+          SET=(--update-env-vars "^;^$ENV")
           gcloud run jobs update "$JOB" --image "$IMAGE" "${SET[@]}" $ARGS
           gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" "${SET[@]}" $ARGS
 
@@ -369,7 +379,11 @@ jobs:
           # targeting: the service resolves the job by project, region and
           # name, so a default that drifts from where the job actually lives
           # makes every create and retry fail at the trigger.
-          ENV="QM_PROVISIONER_JOB=$JOB,QM_PROVISIONER_REGION=$REGION"
+          # Semicolon-delimited, declared to gcloud with its ^;^ prefix: a
+          # comma would split a display-name sender like "QM, Inc
+          # <no-reply@...>" into two bogus assignments, and no value here
+          # can contain a semicolon (the guard below makes sure of it).
+          ENV="QM_PROVISIONER_JOB=$JOB;QM_PROVISIONER_REGION=$REGION"
           # The tenant-runtime settings the Terraform module does not own.
           # QM_RESEND_SECRET and QM_EMAIL_FROM are what give a provisioned
           # tenant a working sign-in; without them the binary refuses to
@@ -385,18 +399,24 @@ jobs:
           # environment deployed while the cloud steps were stubs still
           # carries it, and left alone the real provisioner would go on
           # recording placeholder resources and marking tenants ready.
-          ENV="$ENV,QM_PROVISIONER_STUB=0"
+          ENV="$ENV;QM_PROVISIONER_STUB=0"
           for pair in \
             "QM_RESEND_SECRET=${{ vars.QM_RESEND_SECRET }}" \
             "QM_EMAIL_FROM=${{ vars.QM_EMAIL_FROM }}" \
             "QM_SANDBOX_API_URL=${{ vars.QM_SANDBOX_API_URL }}" \
             "QM_SANDBOX_TEMPLATE=${{ vars.QM_SANDBOX_TEMPLATE }}"; do
-            ENV="$ENV,$pair"
+            case "${pair#*=}" in
+              *\;*)
+                echo "::error::${pair%%=*} contains a semicolon, which is the delimiter these variables are passed with."
+                exit 1
+                ;;
+            esac
+            ENV="$ENV;$pair"
           done
           # An array, because QM_EMAIL_FROM is a display-name address —
           # "QM <no-reply@...>" — and word splitting on an unquoted
           # expansion would hand gcloud three arguments it does not know.
-          SET=(--update-env-vars "$ENV")
+          SET=(--update-env-vars "^;^$ENV")
           gcloud run jobs update "$JOB" --image "$IMAGE" "${SET[@]}" $ARGS
           gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" "${SET[@]}" $ARGS
 

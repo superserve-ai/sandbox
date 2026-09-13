@@ -123,3 +123,39 @@ func TestRemoveRouteFromASharedRule(t *testing.T) {
 		t.Error("a path matcher still in use was removed")
 	}
 }
+
+// A backend service that drifted off this tenant's NEG is repaired; one
+// already pointing at it is left alone. The comparison is by suffix because
+// the API answers with a fully qualified URL where the create sends a
+// relative path.
+func TestBacksNEG(t *testing.T) {
+	const negLink = "projects/example-project/regions/us-central1/networkEndpointGroups/qm-pilot-team"
+	for name, tc := range map[string]struct {
+		backends []*compute.Backend
+		want     bool
+	}{
+		"relative path":        {[]*compute.Backend{{Group: negLink}}, true},
+		"fully qualified":      {[]*compute.Backend{{Group: "https://www.googleapis.com/compute/v1/" + negLink}}, true},
+		"another tenant's neg": {[]*compute.Backend{{Group: "projects/example-project/regions/us-central1/networkEndpointGroups/qm-other"}}, false},
+		"no backends":          {nil, false},
+		"more than one":        {[]*compute.Backend{{Group: negLink}, {Group: "other"}}, false},
+	} {
+		if got := backsNEG(&compute.BackendService{Backends: tc.backends}, negLink); got != tc.want {
+			t.Errorf("%s: backsNEG = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestNEGTarget(t *testing.T) {
+	if got := negTarget(&compute.NetworkEndpointGroup{CloudRun: &compute.NetworkEndpointGroupCloudRun{Service: "qm-pilot-team"}}); got != "qm-pilot-team" {
+		t.Errorf("target = %q", got)
+	}
+	// A group that is not a Cloud Run NEG at all targets nothing this can
+	// use, which is a mismatch rather than a match.
+	if got := negTarget(&compute.NetworkEndpointGroup{}); got != "" {
+		t.Errorf("target of a non-cloud-run group = %q", got)
+	}
+	if got := negTarget(nil); got != "" {
+		t.Errorf("target of nothing = %q", got)
+	}
+}
