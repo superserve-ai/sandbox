@@ -1355,6 +1355,7 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	for _, name := range []string{
 		"activity", "sandbox_revocation", "revoked_proxy_token",
 		"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
+		"qm.tenant_events", "qm.tenant_secrets",
 	} {
 		spec, ok := tableByName(name)
 		if !ok {
@@ -1568,6 +1569,7 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		for _, name := range []string{
 			"activity", "sandbox_revocation", "revoked_proxy_token",
 			"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
+			"qm.tenant_events", "qm.tenant_secrets",
 		} {
 			spec, ok := tableByName(name)
 			if !ok {
