@@ -74,7 +74,7 @@ func (s secretsStep) Run(ctx context.Context, t *provisioner.Tenant) error {
 		if err != nil {
 			return fmt.Errorf("generate %s: %w", spec.name, err)
 		}
-		ref, err := s.c.Secrets.Put(ctx, t.SecretName(spec.name), []byte(value))
+		ref, err := s.c.Secrets.Put(ctx, t.SecretName(spec.name), []byte(value), t.Row.ID.String())
 		if err != nil {
 			return fmt.Errorf("write %s: %w", spec.name, err)
 		}
@@ -123,7 +123,7 @@ func (s secretsStep) Rollback(ctx context.Context, t *provisioner.Tenant) error 
 		names[ref.Name] = true
 	}
 	for name := range names {
-		if err := s.c.Secrets.Delete(ctx, t.SecretName(name)); err != nil {
+		if err := s.c.Secrets.Delete(ctx, t.SecretName(name), t.Row.ID.String()); err != nil {
 			return fmt.Errorf("delete %s: %w", name, err)
 		}
 	}

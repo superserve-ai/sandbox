@@ -20,6 +20,10 @@ import (
 	"github.com/superserve-ai/sandbox/internal/qm/tenantstore"
 )
 
+// platformSecretOwner stands in for whoever owns the secrets Terraform
+// creates: not a tenant, and not something a tenant may write or delete.
+const platformSecretOwner = "platform"
+
 func TestResourceNames(t *testing.T) {
 	if got := DatabaseName("pilot-team"); got != "qm_pilot_team" {
 		t.Errorf("database = %s", got)
@@ -155,14 +159,16 @@ func newFixture(t *testing.T, stub bool) *tenantFixture {
 	}
 	// The model key qm-api writes before triggering a run, and the
 	// platform's shared Resend key, which Terraform owns.
-	ref, err := fake.Put(ctx, "qm-pilot-team-ANTHROPIC_API_KEY", []byte("sk-ant-fixture"))
+	ref, err := fake.Put(ctx, "qm-pilot-team-ANTHROPIC_API_KEY", []byte("sk-ant-fixture"), row.ID.String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SetSecretRef(ctx, teamID, row.ID, "ANTHROPIC_API_KEY", ref); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fake.Put(ctx, "qm-resend-api-key", []byte("re_fixture")); err != nil {
+	// The platform's, not a tenant's: Terraform owns it and no tenant may
+	// write or delete it.
+	if _, err := fake.Put(ctx, "qm-resend-api-key", []byte("re_fixture"), platformSecretOwner); err != nil {
 		t.Fatal(err)
 	}
 
@@ -522,6 +528,13 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 			"does not belong to this tenant",
 		},
 		{
+			"a secret with the name the slug derives",
+			func(f *tenantFixture) {
+				f.secrets.SetOwner("qm-pilot-team-CORE_SIGNING_SECRET", "somebody else")
+			},
+			"another tenant",
+		},
+		{
 			"a database with the name the slug derives",
 			func(f *tenantFixture) {
 				f.dbs.mu.Lock()
@@ -797,7 +810,7 @@ func TestDeprovisionRevokesTheSharedGrantItActuallyMade(t *testing.T) {
 	}
 
 	// The platform rotates to a new resource.
-	if _, err := f.secrets.Put(ctx, "qm-resend-api-key-v2", []byte("re_rotated")); err != nil {
+	if _, err := f.secrets.Put(ctx, "qm-resend-api-key-v2", []byte("re_rotated"), platformSecretOwner); err != nil {
 		t.Fatal(err)
 	}
 	env := f.runner.Env

@@ -213,7 +213,7 @@ func (s bucket) ensureHMACKey(ctx context.Context, t *provisioner.Tenant, accoun
 		{secretSecretAccessKey, key.Secret},
 		{secretAccessKeyID, key.AccessID},
 	} {
-		ref, err := s.c.Secrets.Put(ctx, t.SecretName(half.name), []byte(half.value))
+		ref, err := s.c.Secrets.Put(ctx, t.SecretName(half.name), []byte(half.value), t.Row.ID.String())
 		if err != nil {
 			return fmt.Errorf("write %s: %w", half.name, err)
 		}
@@ -244,7 +244,7 @@ func (s bucket) hmacStored(ctx context.Context, t *provisioner.Tenant) (bool, er
 // so what is written next is a matched pair or nothing.
 func (s bucket) forgetHMACSecrets(ctx context.Context, t *provisioner.Tenant) error {
 	for _, name := range []string{secretAccessKeyID, secretSecretAccessKey} {
-		if err := s.c.Secrets.Delete(ctx, t.SecretName(name)); err != nil {
+		if err := s.c.Secrets.Delete(ctx, t.SecretName(name), t.Row.ID.String()); err != nil {
 			return fmt.Errorf("delete %s: %w", name, err)
 		}
 		if err := t.DeleteSecretRef(ctx, name); err != nil {

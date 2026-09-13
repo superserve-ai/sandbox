@@ -319,6 +319,21 @@ func TestCreateTenantValidation(t *testing.T) {
 	}
 }
 
+// A model key is written under a name derived from the tenant's slug, and
+// slugs are chosen by whoever creates the tenant. A secret already there
+// under another owner is not this tenant's to add a version to.
+func TestCreateTenantRefusesASecretItDoesNotOwn(t *testing.T) {
+	f := newFixture(t)
+	f.secrets.SetOwner("qm-pilot-team-ANTHROPIC_API_KEY", "somebody else")
+	code, body := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, validCreate())
+	if code == http.StatusAccepted {
+		t.Fatalf("the create wrote to a secret it does not own: %v", body)
+	}
+	if v, _ := f.secrets.Get(context.Background(), "qm-pilot-team-ANTHROPIC_API_KEY"); string(v) != "someone else's" {
+		t.Errorf("the secret was overwritten: %q", v)
+	}
+}
+
 // A key the provider rejects is refused before the tenant exists. Slugs
 // are globally unique across deleted tenants too, so creating the row first
 // would consume the name for a tenant that can never be provisioned.
@@ -533,7 +548,7 @@ func TestAdminLink(t *testing.T) {
 	if code, _ := f.do(t, http.MethodPost, path, keyTeamA, nil); code != http.StatusBadGateway {
 		t.Errorf("admin link without portal secret: %d, want 502", code)
 	}
-	f.secrets.Put(ctx, "qm-pilot-team-PORTAL_SESSION_SECRET", []byte(fixedSecret))
+	f.secrets.Put(ctx, "qm-pilot-team-PORTAL_SESSION_SECRET", []byte(fixedSecret), id)
 
 	code, body := f.do(t, http.MethodPost, path, keyTeamA, nil)
 	if code != http.StatusOK {

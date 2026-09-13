@@ -259,13 +259,11 @@ jobs:
           # otherwise go on recording placeholder resources and marking
           # tenants ready.
           #
-          # Clearing it only changes what future runs do. A tenant that was
-          # already marked ready under the stub holds placeholder resource
-          # names and no stack, and nothing requeues it — retry refuses a
-          # ready tenant. Delete any such tenant before the first real
-          # deploy of an environment that ran with the stub. No environment
-          # has, today: this workflow does nothing until QM_API_SERVICE is
-          # set, which happens only once the module has been applied.
+          # Clearing it only changes what future runs do. A tenant already
+          # marked ready under the stub holds placeholder resource names and
+          # no stack, and nothing requeues it — retry refuses a ready
+          # tenant. An environment that ran with the stub must have those
+          # tenants deleted before its first real deploy.
           ENV="QM_PROVISIONER_JOB=$JOB,QM_PROVISIONER_REGION=$REGION,QM_PROVISIONER_STUB=0"
           gcloud run jobs update "$JOB" --image "$IMAGE" --update-env-vars "$ENV" $ARGS
           gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" --update-env-vars "$ENV" $ARGS
@@ -390,13 +388,11 @@ jobs:
           # otherwise go on recording placeholder resources and marking
           # tenants ready.
           #
-          # Clearing it only changes what future runs do. A tenant that was
-          # already marked ready under the stub holds placeholder resource
-          # names and no stack, and nothing requeues it — retry refuses a
-          # ready tenant. Delete any such tenant before the first real
-          # deploy of an environment that ran with the stub. No environment
-          # has, today: this workflow does nothing until QM_API_SERVICE is
-          # set, which happens only once the module has been applied.
+          # Clearing it only changes what future runs do. A tenant already
+          # marked ready under the stub holds placeholder resource names and
+          # no stack, and nothing requeues it — retry refuses a ready
+          # tenant. An environment that ran with the stub must have those
+          # tenants deleted before its first real deploy.
           ENV="QM_PROVISIONER_JOB=$JOB,QM_PROVISIONER_REGION=$REGION,QM_PROVISIONER_STUB=0"
           gcloud run jobs update "$JOB" --image "$IMAGE" --update-env-vars "$ENV" $ARGS
           gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" --update-env-vars "$ENV" $ARGS

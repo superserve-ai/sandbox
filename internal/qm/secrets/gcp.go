@@ -35,16 +35,23 @@ func (g *GCP) secretPath(name string) string {
 	return "projects/" + g.project + "/secrets/" + name
 }
 
-func (g *GCP) Put(ctx context.Context, name string, value []byte) (string, error) {
+func (g *GCP) Put(ctx context.Context, name string, value []byte, owner string) (string, error) {
 	if err := ValidName(name); err != nil {
 		return "", err
 	}
 	_, err := g.svc.Projects.Secrets.Create("projects/"+g.project, &secretmanager.Secret{
 		Replication: &secretmanager.Replication{Automatic: &secretmanager.Automatic{}},
-		Labels:      map[string]string{"managed-by": "qm-api"},
+		Labels:      map[string]string{"managed-by": "qm-api", OwnerLabel: owner},
 	}).SecretId(name).Context(ctx).Do()
-	if err != nil && !isStatus(err, http.StatusConflict) {
-		return "", fmt.Errorf("create secret %s: %w", name, err)
+	if err != nil {
+		if !isStatus(err, http.StatusConflict) {
+			return "", fmt.Errorf("create secret %s: %w", name, err)
+		}
+		// It was already there. Whose it is decides whether a version may
+		// be added to it — the name alone is derived from a chosen slug.
+		if err := g.checkOwner(ctx, name, owner); err != nil {
+			return "", err
+		}
 	}
 	_, err = g.svc.Projects.Secrets.AddVersion(g.secretPath(name), &secretmanager.AddSecretVersionRequest{
 		Payload: &secretmanager.SecretPayload{Data: base64.StdEncoding.EncodeToString(value)},
@@ -76,8 +83,11 @@ func (g *GCP) Get(ctx context.Context, name string) ([]byte, error) {
 	return data, nil
 }
 
-func (g *GCP) Delete(ctx context.Context, name string) error {
+func (g *GCP) Delete(ctx context.Context, name, owner string) error {
 	if err := ValidName(name); err != nil {
+		return err
+	}
+	if err := g.checkOwner(ctx, name, owner); err != nil {
 		return err
 	}
 	_, err := g.svc.Projects.Secrets.Delete(g.secretPath(name)).Context(ctx).Do()
@@ -85,6 +95,27 @@ func (g *GCP) Delete(ctx context.Context, name string) error {
 		return fmt.Errorf("delete secret %s: %w", name, err)
 	}
 	return nil
+}
+
+// checkOwner refuses a secret that exists and does not carry owner. One
+// that does not exist passes — the caller is about to create it, or is
+// deleting something already gone.
+//
+// A secret with no owner label at all is refused too: these names come from
+// a chosen slug, so an unlabelled one is far likelier to be somebody else's
+// than a half-written one of ours.
+func (g *GCP) checkOwner(ctx context.Context, name, owner string) error {
+	secret, err := g.svc.Projects.Secrets.Get(g.secretPath(name)).Context(ctx).Do()
+	if err != nil {
+		if isStatus(err, http.StatusNotFound) {
+			return nil
+		}
+		return fmt.Errorf("get secret %s: %w", name, err)
+	}
+	if secret.Labels[OwnerLabel] == owner && owner != "" {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrNotOwned, name)
 }
 
 func isStatus(err error, code int) bool {

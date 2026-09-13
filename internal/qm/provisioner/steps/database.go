@@ -112,7 +112,7 @@ func (s database) Run(ctx context.Context, t *provisioner.Tenant) error {
 	// Written every run, not only on the run that created the database: it
 	// is derived from the password above, so a rotation has to reach the
 	// secret the service mounts or the tenant stops being able to connect.
-	ref, err := s.c.Secrets.Put(ctx, t.SecretName(secretDatabaseURL), []byte(DatabaseURL(t.Env, role, string(password), name)))
+	ref, err := s.c.Secrets.Put(ctx, t.SecretName(secretDatabaseURL), []byte(DatabaseURL(t.Env, role, string(password), name)), t.Row.ID.String())
 	if err != nil {
 		return fmt.Errorf("write the tenant's database url: %w", err)
 	}
@@ -155,7 +155,7 @@ func (s database) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if err := s.c.Databases.DropUser(ctx, RoleName(t.Row.Slug), marker); err != nil {
 		return fmt.Errorf("drop the tenant's database role: %w", err)
 	}
-	if err := s.c.Secrets.Delete(ctx, t.SecretName(secretDatabaseURL)); err != nil {
+	if err := s.c.Secrets.Delete(ctx, t.SecretName(secretDatabaseURL), t.Row.ID.String()); err != nil {
 		return fmt.Errorf("delete the tenant's database url: %w", err)
 	}
 	if err := t.DeleteSecretRef(ctx, secretDatabaseURL); err != nil {

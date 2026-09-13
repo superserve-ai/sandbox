@@ -16,15 +16,33 @@ import (
 // does not exist. Delete on a missing secret is a no-op, not an error.
 var ErrNotFound = errors.New("secret not found")
 
+// ErrNotOwned is returned by Put and Delete when the secret exists and does
+// not belong to the tenant the caller named.
+var ErrNotOwned = errors.New("secret belongs to another tenant")
+
+// OwnerLabel carries the tenant a secret belongs to.
+const OwnerLabel = "qm-tenant-id"
+
 // Store is the narrow Secret Manager surface qm-api and the provisioner use.
+//
+// Every tenant secret is addressed by a name derived from the tenant's slug,
+// and slugs are chosen by whoever creates the tenant — so a name existing is
+// not evidence that it is this tenant's. Put and Delete therefore take the
+// tenant's id, write it as a label on create, and refuse a secret carrying a
+// different one: without that, a tenant slugged to collide could have a
+// version added to somebody else's secret, be granted read on it, and see it
+// deleted on teardown.
 type Store interface {
-	// Put creates the secret if needed and adds value as its newest version.
-	// It returns the resource reference to record in qm.tenant_secrets.
-	Put(ctx context.Context, name string, value []byte) (ref string, err error)
+	// Put creates the secret if needed, labelled with owner, and adds value
+	// as its newest version. It returns the resource reference to record in
+	// qm.tenant_secrets. ErrNotOwned when the secret exists under another
+	// owner.
+	Put(ctx context.Context, name string, value []byte, owner string) (ref string, err error)
 	// Get reads the latest version.
 	Get(ctx context.Context, name string) ([]byte, error)
-	// Delete removes the secret and every version. Idempotent.
-	Delete(ctx context.Context, name string) error
+	// Delete removes the secret and every version. Idempotent, and
+	// ErrNotOwned when the secret belongs to another tenant.
+	Delete(ctx context.Context, name, owner string) error
 }
 
 // Names of the per-tenant secrets. The model key is written by qm-api at
