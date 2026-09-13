@@ -165,7 +165,12 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 	// reclaimed and torn down while it was in flight. A teardown that got
 	// past its own secrets step before this reference landed will never see
 	// it, and the key would outlive the tenant — so take it back here.
-	retired, rerr := h.tenantRetired(ctx, tenant)
+	// Detached: a caller that has gone away must not stop this from
+	// running, since it is the only thing that will notice a key written
+	// after its tenant's teardown had already passed its secrets step.
+	rctx, rcancel := detached(ctx)
+	retired, rerr := h.tenantRetired(rctx, tenant)
+	rcancel()
 	if rerr != nil {
 		log.Error().Err(rerr).Msg("confirm the tenant survived its model key")
 	}
@@ -197,7 +202,17 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 		// The run is not queued on a version that cannot be trusted: the
 		// tenant is left failed, which a retry resumes from — the key is
 		// stored and referenced, so the retry has everything it needs.
-		h.failTenant(ctx, tenant, tenantstore.VersionOf(tenant), []string{tenantstore.StatusProvisioning}, stepModelKey,
+		// The event may have committed before the error surfaced, which
+		// moves the version, so the row is re-read: at most this request's
+		// own event can have landed, and anything beyond that is somebody
+		// else's tenant to fail.
+		at := tenantstore.VersionOf(tenant)
+		fctx, fcancel := detached(ctx)
+		if current, gerr := h.Store.GetTenant(fctx, tenant.TeamID, tenant.ID); gerr == nil && current.EventSeq == tenant.EventSeq+1 {
+			at = tenantstore.VersionOf(current)
+		}
+		fcancel()
+		h.failTenant(ctx, tenant, at, []string{tenantstore.StatusProvisioning}, stepModelKey,
 			"The tenant could not be queued for provisioning. Retry it.", serr, nil)
 		respondError(c, http.StatusInternalServerError, internalErrorMsg)
 		return

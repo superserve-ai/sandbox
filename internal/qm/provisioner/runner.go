@@ -101,6 +101,17 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode,
 		return fmt.Errorf("%w: tenant is not %s", ErrStaleRun, inFlight)
 	}
 	if err != nil {
+		// The job has no automatic retry, so exiting here would leave a
+		// tenant the API already moved in flight with nothing behind it
+		// until the stale reclaim. The lock is still held, so the row is
+		// authoritative: mark it failed and let the caller retry at once.
+		log.Error().Str("error", ScrubString(err.Error())).Msg("claim the tenant for this run")
+		dctx, cancel := detached(ctx)
+		t := NewTenant(tenantstore.Tenant{ID: tenantID, TeamID: teamID}, r.Env, r.Store)
+		if r.setFailed(dctx, t, inFlight) {
+			r.recordIn(dctx, t, RunStep, tenantstore.EventFailed, failureMessage(mode, "startup"), map[string]any{"mode": string(mode)})
+		}
+		cancel()
 		return err
 	}
 	tenant := NewTenant(row, r.Env, r.Store)

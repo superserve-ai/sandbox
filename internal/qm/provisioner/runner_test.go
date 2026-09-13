@@ -706,3 +706,38 @@ func (s *blindAmbiguousStore) GetTenant(ctx context.Context, teamID, tenantID uu
 	}
 	return s.Memory.GetTenant(ctx, teamID, tenantID)
 }
+
+// A transient error claiming the tenant would otherwise leave it in flight
+// with nothing behind it: the job has no automatic retry, so the run marks
+// it failed itself and the caller can retry at once.
+func TestRunnerFailsATenantItCouldNotClaim(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	store := &claimFailingStore{Memory: h.store}
+	a := &fakeStep{name: "a"}
+	r := &Runner{Store: store, Env: Env{BaseDomain: "qm.example.com", Stub: true}, Steps: []Step{a}, Log: zerolog.Nop()}
+	h.queue(t, ModeProvision)
+	if err := r.Run(ctx, h.teamID, h.tenant.ID, ModeProvision, 0); err == nil {
+		t.Fatal("run reported success")
+	}
+	if a.count() != 0 {
+		t.Error("the plan ran without claiming the tenant")
+	}
+	if got := h.status(t); got != tenantstore.StatusFailed {
+		t.Errorf("status = %s, want failed", got)
+	}
+}
+
+// claimFailingStore reports a database error from the run's self-transition.
+type claimFailingStore struct {
+	*tenantstore.Memory
+	done bool
+}
+
+func (s *claimFailingStore) TransitionStatus(ctx context.Context, teamID, tenantID uuid.UUID, from []string, to string) (tenantstore.Tenant, error) {
+	if !s.done && len(from) == 1 && from[0] == to {
+		s.done = true
+		return tenantstore.Tenant{}, errors.New("database unavailable")
+	}
+	return s.Memory.TransitionStatus(ctx, teamID, tenantID, from, to)
+}
