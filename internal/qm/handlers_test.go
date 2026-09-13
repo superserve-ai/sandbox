@@ -1270,8 +1270,8 @@ type ambiguousStore struct {
 	failEvent      bool
 }
 
-func (s *ambiguousStore) TransitionStatus(ctx context.Context, teamID, tenantID uuid.UUID, from []string, to string) (tenantstore.Tenant, error) {
-	t, err := s.Memory.TransitionStatus(ctx, teamID, tenantID, from, to)
+func (s *ambiguousStore) TransitionStatusIfUnchanged(ctx context.Context, teamID, tenantID uuid.UUID, from []string, to string, at tenantstore.Version) (tenantstore.Tenant, error) {
+	t, err := s.Memory.TransitionStatusIfUnchanged(ctx, teamID, tenantID, from, to, at)
 	if err == nil && s.failTransition {
 		s.failTransition = false
 		return tenantstore.Tenant{}, errors.New("connection reset")
@@ -1448,4 +1448,43 @@ type transitionFailingStore struct {
 
 func (transitionFailingStore) TransitionStatusIfUnchanged(context.Context, uuid.UUID, uuid.UUID, []string, string, tenantstore.Version) (tenantstore.Tenant, error) {
 	return tenantstore.Tenant{}, errors.New("database unavailable")
+}
+
+// A create whose Secret Manager work outlived StaleAfter can find that a
+// retry has already reclaimed the tenant and queued a replacement. Both
+// attempts end in provisioning, so the queue transition is keyed on the row
+// version: the overtaken create is told to reload rather than queuing on
+// top of the replacement, whose job would then exit as superseded.
+func TestQueueRunRefusesToQueueOnTopOfAReplacement(t *testing.T) {
+	f := newFixture(t)
+	h := &Handlers{Store: f.store, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
+	// The replacement lands while the create's model key is being written.
+	f.secrets.BeforePut = func() {
+		f.secrets.BeforePut = nil
+		tenants, _ := f.store.ListTenants(context.Background(), f.teamA)
+		if len(tenants) != 1 {
+			t.Errorf("tenants = %+v", tenants)
+			return
+		}
+		// A stale reclaim and the retry behind it, which leave the tenant
+		// back in provisioning for an attempt this create knows nothing of.
+		for _, status := range []string{tenantstore.StatusFailed, tenantstore.StatusProvisioning} {
+			if _, err := f.store.SetStatus(context.Background(), f.teamA, tenants[0].ID, status); err != nil {
+				t.Error(err)
+				return
+			}
+		}
+		if _, err := f.store.InsertEvent(context.Background(), f.teamA, tenantstore.EventParams{
+			TenantID: tenants[0].ID, Step: stepTrigger, Status: tenantstore.EventStarted, Message: "provision run requested",
+		}); err != nil {
+			t.Error(err)
+		}
+	}
+	if code, _ := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, validCreate()); code != http.StatusConflict {
+		t.Fatalf("overtaken create: %d, want 409", code)
+	}
+	if len(f.trigger.Calls) != 0 {
+		t.Error("an overtaken create queued a run on top of the replacement")
+	}
 }

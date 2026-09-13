@@ -542,7 +542,12 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 		}
 	}
 	defer releaseOnce()
-	updated, err := h.Store.TransitionStatus(ctx, tenant.TeamID, tenant.ID, from, inFlight)
+	// Versioned, not status-only: two attempts at the same operation end in
+	// the same in-flight status, so a create or retry whose Secret Manager
+	// work outlived StaleAfter could otherwise queue on top of the
+	// replacement that reclaimed it, and the replacement's own job would
+	// then exit as superseded.
+	updated, err := h.Store.TransitionStatusIfUnchanged(ctx, tenant.TeamID, tenant.ID, from, inFlight, at)
 	switch {
 	case errors.Is(err, tenantstore.ErrStatusConflict):
 		respondError(c, http.StatusConflict, "The tenant's status changed; reload and try again.")

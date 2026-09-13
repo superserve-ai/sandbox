@@ -14,6 +14,9 @@ type Fake struct {
 	Puts map[string]int
 	// Err, when set, is returned by every operation.
 	Err error
+	// BeforePut, when set, runs before a value is written; tests use it to
+	// land a concurrent change while a write is in flight.
+	BeforePut func()
 }
 
 func NewFake() *Fake {
@@ -21,6 +24,9 @@ func NewFake() *Fake {
 }
 
 func (f *Fake) Put(_ context.Context, name string, value []byte) (string, error) {
+	if f.BeforePut != nil {
+		f.BeforePut()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.Err != nil {
