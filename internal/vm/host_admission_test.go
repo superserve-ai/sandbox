@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"github.com/superserve-ai/sandbox/internal/admission"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 	"google.golang.org/api/idtoken"
 	"google.golang.org/grpc/codes"
@@ -34,5 +35,22 @@ func TestAdmissionPrincipalMustBeExactVerifiedControlPlane(t *testing.T) {
 		if authorizedAdmissionPrincipal(p, email) {
 			t.Fatal("unauthorized principal accepted", p)
 		}
+	}
+}
+
+func TestAdmissionReadinessIncludesLedgerReconstruction(t *testing.T) {
+	m := newTestManager()
+	m.admission = admission.NewGate(true, 1)
+	m.reattachComplete.Store(true)
+	if !m.PressureReady() {
+		t.Fatal("test must isolate admission readiness")
+	}
+	if m.hostAdmissionReady() {
+		t.Fatal("pressure readiness incorrectly opened admission")
+	}
+	m.admission.Reconstruct(m.admission.BeginReconstruct(), nil, nil)
+	m.admission.Open()
+	if !m.hostAdmissionReady() {
+		t.Fatal("reconstructed host not ready")
 	}
 }

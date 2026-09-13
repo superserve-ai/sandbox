@@ -60,6 +60,9 @@ func (g *Gate) TransitionDrain(revision int64, closed bool) error {
 	if g.drainPath == "" {
 		return fmt.Errorf("durable host drain is not configured")
 	}
+	if !closed && g.state == StateReconstructing {
+		return fmt.Errorf("admission reconstruction is incomplete")
+	}
 	if revision <= 0 || revision < g.drainState.Revision {
 		return fmt.Errorf("stale drain revision")
 	}

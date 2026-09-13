@@ -16,6 +16,7 @@ func TestDurableDrainSurvivesRestartAndRejectsStaleOpen(t *testing.T) {
 	if err := gate.Admit("fresh", IntentCreate); err != ErrNotReady {
 		t.Fatalf("fresh enrollment admitted: %v", err)
 	}
+	gate.Open()
 	if err := gate.TransitionDrain(1, false); err != nil {
 		t.Fatal(err)
 	}
@@ -61,6 +62,7 @@ func TestDrainLinearizesWithAdmissions(t *testing.T) {
 	if err := gate.ConfigureDrain(filepath.Join(t.TempDir(), "state")); err != nil {
 		t.Fatal(err)
 	}
+	gate.Open()
 	if err := gate.TransitionDrain(1, false); err != nil {
 		t.Fatal(err)
 	}
@@ -87,6 +89,7 @@ func TestDrainPersistenceFailureStaysClosed(t *testing.T) {
 	if err := gate.ConfigureDrain(path); err != nil {
 		t.Fatal(err)
 	}
+	gate.Open()
 	if err := gate.TransitionDrain(1, false); err != nil {
 		t.Fatal(err)
 	}
@@ -140,5 +143,45 @@ func TestDrainRejectsIncompleteState(t *testing.T) {
 		if err := NewGate(false, 0).ConfigureDrain(path); err == nil {
 			t.Fatal("incomplete state accepted", data)
 		}
+	}
+}
+
+func TestBootCompletionDuringSnapshotRetainsCharge(t *testing.T) {
+	gate := NewGate(true, 1)
+	if err := gate.BeginBoot("boot", IntentCreate); err != nil {
+		t.Fatal(err)
+	}
+	since := gate.BeginReconstruct()
+	// Store read completed without the new record; boot commits before merge.
+	gate.EndBoot("boot")
+	gate.Reconstruct(since, nil, nil)
+	gate.Open()
+	if !gate.Holds("boot") || gate.PendingBoots() != 0 {
+		t.Fatal("completed boot disappeared")
+	}
+	if err := gate.Admit("another", IntentCreate); err != ErrHostAtCapacity {
+		t.Fatal("capacity undercount", err)
+	}
+	gate.Reconstruct(gate.BeginReconstruct(), nil, nil)
+	if gate.Holds("boot") {
+		t.Fatal("subsequent authoritative empty snapshot cannot release charge")
+	}
+}
+func TestActivationRequiresAdmissionReconstruction(t *testing.T) {
+	gate := NewGate(false, 0)
+	if err := gate.ConfigureDrain(filepath.Join(t.TempDir(), "state")); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.TransitionDrain(1, false); err == nil {
+		t.Fatal("opened before reconstruction")
+	}
+	state, _ := gate.DrainStatus()
+	if !state.Closed {
+		t.Fatal("failed activation reopened fence")
+	}
+	gate.Reconstruct(gate.BeginReconstruct(), nil, nil)
+	gate.Open()
+	if err := gate.TransitionDrain(2, false); err != nil {
+		t.Fatal(err)
 	}
 }

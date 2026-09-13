@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"github.com/superserve-ai/sandbox/internal/admission"
 	"google.golang.org/api/idtoken"
 	"strings"
 
@@ -36,7 +37,7 @@ func (a *GRPCAdapter) HostAdmission(ctx context.Context, req *vmdpb.HostAdmissio
 		return nil, status.Error(codes.InvalidArgument, "invalid revision")
 	}
 	if req.Revision > 0 {
-		if !req.Closed && !a.mgr.PressureReady() {
+		if !req.Closed && !a.mgr.hostAdmissionReady() {
 			return nil, status.Error(codes.FailedPrecondition, "host reconciliation is incomplete")
 		}
 		if err := gate.TransitionDrain(req.Revision, req.Closed); err != nil {
@@ -44,7 +45,7 @@ func (a *GRPCAdapter) HostAdmission(ctx context.Context, req *vmdpb.HostAdmissio
 		}
 		state, _ = gate.DrainStatus()
 	}
-	return &vmdpb.HostAdmissionResponse{PendingBoots: int64(gate.PendingBoots()), Revision: state.Revision, Closed: state.Closed, Ready: a.mgr.PressureReady(), Charged: int64(gate.Charged())}, nil
+	return &vmdpb.HostAdmissionResponse{PendingBoots: int64(gate.PendingBoots()), Revision: state.Revision, Closed: state.Closed, Ready: a.mgr.hostAdmissionReady(), Charged: int64(gate.Charged())}, nil
 }
 
 func authorizedAdmissionPrincipal(payload *idtoken.Payload, email string) bool {
@@ -52,4 +53,9 @@ func authorizedAdmissionPrincipal(payload *idtoken.Payload, email string) bool {
 		(payload.Issuer == "https://accounts.google.com" || payload.Issuer == "accounts.google.com") &&
 		payload.Audience == "superserve-vmd-host-admission" &&
 		payload.Claims["email"] == email && payload.Claims["email_verified"] == true
+}
+
+func (m *Manager) hostAdmissionReady() bool {
+	state := m.AdmissionGate().State()
+	return state != admission.StateReconstructing && state != admission.StateDisabled && m.PressureReady()
 }

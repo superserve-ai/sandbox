@@ -478,6 +478,13 @@ func (g *Gate) EndBoot(id string) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	// Completion after BeginReconstruct must survive a store snapshot that
+	// preceded the boot's final persistence, even when it is no longer pending.
+	if tok, ok := g.tokens[id]; ok {
+		g.gen++
+		tok.gen = g.gen
+		g.tokens[id] = tok
+	}
 	g.pending[id]--
 	if g.pending[id] <= 0 {
 		delete(g.pending, id)
