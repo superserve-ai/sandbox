@@ -1204,7 +1204,7 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 				return sandboxRow(sb)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPublic, 8)
-			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+			case (strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one") || strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one")):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: ClaimResume :one"):
 				return claimResumeRow(sb, &snap, preview.AccessPublic, 7, publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
@@ -1281,7 +1281,7 @@ func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(
 				return sandboxRow(sb)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPrivate, 8)
-			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+			case (strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one") || strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one")):
 				capabilityRequirements = append(capabilityRequirements, append([]string(nil), args[0].([]string)...))
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
@@ -4388,7 +4388,7 @@ func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.
 			switch {
 			case strings.Contains(sql, "-- name: ClaimResume :one"):
 				return claimResumeRow(sb, &snap, preview.AccessPublic, 3)
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+			case strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one") || strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one"):
 				return scalarBoolRow(false)
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
@@ -4515,7 +4515,7 @@ func TestResumeSandbox_AttestationDecidesReapply(t *testing.T) {
 					switch {
 					case strings.Contains(sql, "-- name: ClaimResume :one"):
 						return claimResumeRow(sb, &snap, preview.AccessPublic, 7, publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
-					case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+					case strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one") || strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one"):
 						return scalarBoolRow(true)
 					case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 						policyReads++
@@ -4739,7 +4739,7 @@ func TestActivateSandbox_ReportsPolicyTheDaemonKept(t *testing.T) {
 			switch {
 			case strings.Contains(sql, "-- name: ClaimResume :one"):
 				return claimResumeRow(sb, &snap, preview.AccessPublic, 7)
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+			case strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one") || strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one"):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPrivate, 9)
@@ -4805,9 +4805,9 @@ func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *test
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+			case strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one"):
 				return scalarBoolRow(true)
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+			case strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one"):
 				lockedChecks++
 				return scalarBoolRow(lockedChecks == 1)
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):

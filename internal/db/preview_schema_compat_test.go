@@ -219,7 +219,7 @@ func TestHostCapabilityBatchGateLocksExactActiveHeartbeat(t *testing.T) {
 	}
 }
 
-// The unlocked variant used on the create/resume pre-flight paths must run the
+// The unlocked variant used on active-only pre-flight paths must run the
 // same relational division against the same active-heartbeat host, but WITHOUT
 // the row lock — that is the whole point of the second query (a burst of
 // pre-flight checks must not serialize behind the host's heartbeat writer).
@@ -234,7 +234,7 @@ func TestHostHasCapabilitiesUnlockedRunsSameDivisionWithoutRowLock(t *testing.T)
 	if start < 0 {
 		t.Fatal("HostHasCapabilitiesUnlocked query block is missing")
 	}
-	end := strings.Index(queries[start:], "-- name: MarkHostUnhealthy :exec")
+	end := strings.Index(queries[start:], ";")
 	if end < 0 {
 		t.Fatal("HostHasCapabilitiesUnlocked query terminator is missing")
 	}

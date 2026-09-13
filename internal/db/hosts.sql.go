@@ -776,6 +776,99 @@ func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
 	return err
 }
 
+const ownerHasResumeCapabilities = `-- name: OwnerHasResumeCapabilities :one
+WITH target_host AS MATERIALIZED (
+  SELECT id, last_heartbeat_at
+  FROM host
+  WHERE id = $2
+    AND status IN ('active', 'draining')
+    AND last_heartbeat_at IS NOT NULL
+  FOR SHARE
+)
+SELECT EXISTS (
+  SELECT 1
+  FROM target_host h
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM unnest($1::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
+)
+`
+
+type OwnerHasResumeCapabilitiesParams struct {
+	RequiredCapabilities []string `json:"required_capabilities"`
+	HostID               string   `json:"host_id"`
+}
+
+// Lock the recorded serving owner row whose heartbeat anchors this capability set.
+// Callers that run this in a mutation transaction keep the host stable until
+// VMD delivery and commit, while the relational division below proves that
+// every requested capability belongs to that exact heartbeat.
+func (q *Queries) OwnerHasResumeCapabilities(ctx context.Context, arg OwnerHasResumeCapabilitiesParams) (bool, error) {
+	row := q.db.QueryRow(ctx, ownerHasResumeCapabilities, arg.RequiredCapabilities, arg.HostID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
+const ownerHasResumeCapabilitiesUnlocked = `-- name: OwnerHasResumeCapabilitiesUnlocked :one
+WITH target_host AS MATERIALIZED (
+  SELECT id, vmd_addr, last_heartbeat_at
+  FROM host
+  WHERE id = $2
+    AND status IN ('active', 'draining')
+    AND last_heartbeat_at IS NOT NULL
+)
+SELECT
+  EXISTS (
+    SELECT 1
+    FROM target_host h
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM unnest($1::text[]) AS required(capability)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM host_capability hc
+        WHERE hc.host_id = h.id
+          AND hc.capability = required.capability
+          AND hc.heartbeat_at = h.last_heartbeat_at
+      )
+    )
+  ) AS has_capabilities,
+  COALESCE((SELECT vmd_addr FROM target_host), '')::text AS vmd_addr
+`
+
+type OwnerHasResumeCapabilitiesUnlockedParams struct {
+	RequiredCapabilities []string `json:"required_capabilities"`
+	HostID               string   `json:"host_id"`
+}
+
+type OwnerHasResumeCapabilitiesUnlockedRow struct {
+	HasCapabilities bool   `json:"has_capabilities"`
+	VmdAddr         string `json:"vmd_addr"`
+}
+
+// OwnerHasResumeCapabilities without the row lock, for standalone pre-flight reads
+// outside a mutation transaction: omitting the lock keeps concurrent checks
+// from serializing behind the host's heartbeat writer. Transactional callers
+// that must pin the host across a commit use OwnerHasResumeCapabilities.
+//
+// Also returns the host's VMD address (empty when the owner is not serving),
+// so the caller can record this read as the registry's address verification.
+func (q *Queries) OwnerHasResumeCapabilitiesUnlocked(ctx context.Context, arg OwnerHasResumeCapabilitiesUnlockedParams) (OwnerHasResumeCapabilitiesUnlockedRow, error) {
+	row := q.db.QueryRow(ctx, ownerHasResumeCapabilitiesUnlocked, arg.RequiredCapabilities, arg.HostID)
+	var i OwnerHasResumeCapabilitiesUnlockedRow
+	err := row.Scan(&i.HasCapabilities, &i.VmdAddr)
+	return i, err
+}
+
 const registerHost = `-- name: RegisterHost :one
 INSERT INTO host (id, vmd_addr, proxy_addr, region, status,
                   capacity_memory_mib, capacity_vcpus, last_heartbeat_at,

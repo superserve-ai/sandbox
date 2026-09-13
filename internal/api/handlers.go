@@ -892,7 +892,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		Ports:      claimedPortPolicies(claimed.PortNumbers, claimed.PortAccesses, claimed.PortTokenVersions),
 	}
 	if resumePolicy.requiresBrowserCapability() {
-		if !h.requireHostPreviewPortBrowserAuth(c, sandbox.HostID) {
+		if !h.requireOwnerResumeCapabilities(c, sandbox.HostID, previewBrowserCapabilities()...) {
 			markRevert()
 			revertToPaused()
 			return "", false
@@ -904,7 +904,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		resumePolicy, err = h.applyPreviewMutationValidated(c.Request.Context(), sandboxID, teamID, func(*db.Queries) error {
 			return nil
 		}, func(q *db.Queries, _ previewPolicySnapshot) error {
-			return validateHostPreviewBrowserCapabilities(c.Request.Context(), q, sandbox.HostID)
+			return validateOwnerResumeBrowserCapabilities(c.Request.Context(), q, sandbox.HostID)
 		})
 		if err != nil {
 			if !h.handlePreviewMutationResult(c, sandboxID, "ActivatePreviewBrowserAuthForResume", err) {
@@ -913,7 +913,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 				return "", false
 			}
 		}
-	} else if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
+	} else if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireOwnerResumeCapabilities(c, sandbox.HostID, preview.HostCapabilityPorts) {
 		markRevert()
 		revertToPaused()
 		return "", false
@@ -1112,7 +1112,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		// otherwise a resume that began public could activate a
 		// concurrently-added browser policy on a downgraded host.
 		if currentPolicy.requiresBrowserCapability() {
-			if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
+			if capabilityErr := validateOwnerResumeBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
 				markRevert()
 				pauseAndRevert()
 				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
@@ -1161,7 +1161,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			// lapse during the boot, so re-check it before activation the
 			// way the reapply does; otherwise a resume could activate a
 			// browser policy on a downgraded host.
-			if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
+			if capabilityErr := validateOwnerResumeBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
 				markRevert()
 				pauseAndRevert()
 				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)

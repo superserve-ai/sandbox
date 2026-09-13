@@ -308,3 +308,40 @@ func TestHostCapCacheTTLClamped(t *testing.T) {
 		}
 	}
 }
+
+func TestHostCapCacheSeparatesOwnerResumeEligibility(t *testing.T) {
+	t.Setenv("HOST_CAPABILITY_CACHE_TTL", "10s")
+	var ownerReads, activeReads int
+	h := &Handlers{DB: db.New(&mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+		owner := strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one")
+		if owner {
+			ownerReads++
+		} else {
+			activeReads++
+		}
+		return &mockRow{scanFn: func(dest ...any) error {
+			*(dest[0].(*bool)) = owner
+			*(dest[1].(*string)) = "192.0.2.1:50051"
+			return nil
+		}}
+	}})}
+	registry := &verifyRecorder{}
+	h.Hosts = registry
+	caps := []string{"cap-a", "cap-b"}
+	for i := 0; i < 2; i++ {
+		got, err := h.hostHasCapabilitiesCachedForScope(context.Background(), "owner", caps, ownerResumeCapabilities)
+		if err != nil || !got {
+			t.Fatalf("resume=%v err=%v", got, err)
+		}
+		got, err = h.hostHasCapabilitiesCached(context.Background(), "owner", caps)
+		if err != nil || got {
+			t.Fatalf("active-only=%v err=%v", got, err)
+		}
+	}
+	if ownerReads != 1 || activeReads != 2 {
+		t.Fatalf("owner/active reads=%d/%d", ownerReads, activeReads)
+	}
+	if len(registry.verified) != 1 || registry.verified[0] != "owner=192.0.2.1:50051" {
+		t.Fatalf("address verification=%v", registry.verified)
+	}
+}
