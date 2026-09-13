@@ -190,3 +190,21 @@ Record measured RTO (incident start to scheduling reopened), attach the
 ledger, and file follow-ups for every uncovered sandbox class the
 backlog explains (for example, generations queued behind an uploader
 backlog at the moment of death).
+
+
+## Relationship to validated multi-host rollout and planned evacuation
+
+See the [dated staging evidence and provisioning requirements](host2-identity-runbook.md#staging-multi-host-validation-record--2026-09-13)
+for the successful canary, 10/5 and 100/10 multi-host exercises, persistent
+pre-transfer template mounts, exact runtime build/capability parity, legacy
+heartbeat verification, and ingress-before-routing sequence. That evidence
+supports staging multi-host operation; it does not authorize production changes
+or draining the existing host.
+
+This disaster-recovery procedure remains **filesystem-only cold recovery**.
+Do not treat its disk/base backup coverage as a complete memory-resume bundle.
+Planned paused-sandbox evacuation requires the reviewed
+[ownership and full restore-bundle protocol](design/paused-sandbox-evacuation.md).
+The [drain packet](design/host-drain.md) separately defines placement fencing,
+continued owner routing and the conservative power-off predicate. Neither
+packet has been implemented by this documentation update.

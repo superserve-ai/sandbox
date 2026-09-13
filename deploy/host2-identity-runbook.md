@@ -655,8 +655,9 @@ full environment files, or customer data to the public repository.
 
 Record one row per check with expected value, observed value, UTC observation
 time, evidence location and PASS/FAIL/PENDING. Include local `--verify` output
-as its own row. The initial staging evidence status is **PENDING: not executed**;
-this runbook and local tests are not staging execution evidence. All rows must
+as its own row. The original checklist started **PENDING: not executed**. See the dated staging
+validation record below for subsequent operator-reported results; local tests
+alone are not staging execution evidence. All rows must
 be PASS before admission, and the separate staging drain/peer rehearsal must
 also pass before the production plan is applied.
 
@@ -788,3 +789,53 @@ not require mutating `proxy_addr` or binding the legacy identity. Enabling the
 private listener still requires valid peer credentials and bidirectional TLS
 verification. Keep `PEER_ROUTING_ENABLED=0` through ingress rollout; enabling
 routing remains a separate, deliberate deployment after ingress checks pass.
+
+
+## Staging multi-host validation record — 2026-09-13
+
+The operator reported the following completed staging results during the two-host
+rollout. These are recorded observations, not tests rerun while writing this
+update. Raw load-test outputs/run IDs, per-request traces and exact artifact
+hashes were not supplied with this report; retain those with the rollout evidence
+before using it as production approval. No new drain or migration was executed.
+
+| Exercise | Reported result |
+| --- | --- |
+| Canary | Passed |
+| 10 operations / concurrency 5 | Passed |
+| 100 operations / concurrency 10 | Passed, with placement on both hosts |
+| Functional scope | Scheduler placement, template restore/VM start, Host 2 heartbeat/capabilities, active lifecycle and cross-host data-plane operation validated |
+
+Preserve these provisioning and rollout requirements for every replacement:
+
+1. Install/adopt persistent template mounts **before** artifact transfer. Both
+   `/var/lib/sandbox/rundir/templates` and
+   `/var/lib/sandbox/snapshots/templates` must resolve to the sandbox data disk,
+   survive reboot, and have capacity for the copy. Copying templates to the boot
+   disk previously filled it; matching path strings alone is not a mount check.
+2. Verify actual Firecracker binary digest/build and required API capabilities,
+   guest-kernel/base digests and snapshot-format compatibility. Nominal version
+   strings alone missed a staging incompatibility. Record the exact approved
+   identities with test results; this evidence does not establish portability
+   for every older flat/layered/frozen paused-sandbox generation.
+3. Preserve legacy `HOST_ID=default`. Its successful description-less heartbeat
+   does not emit the named-host endpoint acknowledgement; use the legacy
+   verifier's fresh DB receipt/current-invocation check. Do not fabricate capacity
+   or bind that identity merely to make a deploy gate pass.
+4. Deploy private peer ingress on **both** proxies with routing disabled, load
+   the existing credentials/identity, then pass bidirectional TLS 1.3, exact
+   SPIFFE and HTTP/2/certificate-fingerprint preflight before enabling routing.
+   With both hosts admitted as `component=vmd`, manual `target=serving` reaches
+   both; `target=standby` does not select admitted Host 2. Enabling routing is a
+   separate deployment; rollback disables routing on both before removing ingress.
+5. The current `peer-cas.py verify` CLI still applies a standby-only guard to
+   admitted Host 2. Do not change its labels to satisfy the verifier: use its
+   read-only transport verifier independently, as in the operator preflight.
+   Fixing that CLI guard is separate from drain or evacuation implementation.
+
+Functional multi-host validation is **not** a power-off gate. The next steps are
+[drain design](design/host-drain.md), then review of the
+[paused ownership-transition design](design/paused-sandbox-evacuation.md).
+Until that protocol exists, paused sandboxes remain dependent on their owner,
+even if filesystem backup coverage is present. Do not drain or migrate serving
+Host 1 merely because this validation record is complete.
