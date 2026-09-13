@@ -255,6 +255,30 @@ func (s *Postgres) InsertEvent(ctx context.Context, teamID uuid.UUID, p EventPar
 	return e, err
 }
 
+func (s *Postgres) InsertEventIfUnchanged(ctx context.Context, teamID uuid.UUID, p EventParams, at Version) (Event, error) {
+	var e Event
+	err := s.withTeamTx(ctx, teamID, func(q *db.Queries) error {
+		params := db.InsertQMTenantEventIfUnchangedParams{
+			TenantID: p.TenantID, Step: p.Step, Status: p.Status,
+			ExpectedUpdatedAt: at.UpdatedAt, ExpectedEventSeq: at.EventSeq,
+		}
+		if p.Message != "" {
+			params.Message = &p.Message
+		}
+		if len(p.Detail) > 0 {
+			params.Detail = []byte(p.Detail)
+		}
+		var err error
+		e, err = q.InsertQMTenantEventIfUnchanged(ctx, params)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Retired or moved on; the caller treats both the same way.
+			return ErrStatusConflict
+		}
+		return err
+	})
+	return e, err
+}
+
 func (s *Postgres) ListEvents(ctx context.Context, teamID, tenantID uuid.UUID) ([]Event, error) {
 	var es []Event
 	err := s.withTeamTx(ctx, teamID, func(q *db.Queries) error {

@@ -250,6 +250,10 @@ func (m *Memory) InsertEvent(_ context.Context, teamID uuid.UUID, p EventParams)
 	if m.Fail != nil {
 		return Event{}, m.Fail
 	}
+	return m.insertEventLocked(teamID, p)
+}
+
+func (m *Memory) insertEventLocked(teamID uuid.UUID, p EventParams) (Event, error) {
 	t, err := m.live(teamID, p.TenantID)
 	if err != nil {
 		return Event{}, err
@@ -267,6 +271,23 @@ func (m *Memory) InsertEvent(_ context.Context, teamID uuid.UUID, p EventParams)
 	}
 	m.events[p.TenantID] = append(m.events[p.TenantID], e)
 	return e, nil
+}
+
+func (m *Memory) InsertEventIfUnchanged(_ context.Context, teamID uuid.UUID, p EventParams, at Version) (Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// One critical section, as the Postgres statement is one.
+	if m.Fail != nil {
+		return Event{}, m.Fail
+	}
+	t, err := m.scoped(teamID, p.TenantID)
+	if err != nil {
+		return Event{}, err
+	}
+	if !t.UpdatedAt.Equal(at.UpdatedAt) || t.EventSeq != at.EventSeq {
+		return Event{}, ErrStatusConflict
+	}
+	return m.insertEventLocked(teamID, p)
 }
 
 func (m *Memory) ListEvents(_ context.Context, teamID, tenantID uuid.UUID) ([]Event, error) {

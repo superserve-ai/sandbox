@@ -1416,3 +1416,36 @@ func (o *overtakingTrigger) Trigger(ctx context.Context, _, _ uuid.UUID, _ provi
 	})
 	return err
 }
+
+// A failure that could not be written to the tenant's status must not leave
+// an event behind either: the stale reclaim judges a run by when it last
+// wrote, so recording one would push recovery a full StaleAfter away for a
+// tenant that has no run behind it at all.
+func TestFailTenantRecordsNothingWhenTheStatusWriteFails(t *testing.T) {
+	f := newFixture(t)
+	id := f.create(t)
+	tid := uuid.MustParse(id)
+	ctx := context.Background()
+	row, _ := f.store.GetTenant(ctx, f.teamA, tid)
+	before, _ := f.store.ListEvents(ctx, f.teamA, tid)
+
+	broken := &transitionFailingStore{Memory: f.store}
+	h := &Handlers{Store: broken, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop()}
+	h.failTenant(ctx, row, tenantstore.VersionOf(row), []string{tenantstore.StatusProvisioning}, stepTrigger,
+		"run could not be started", errors.New("cloud run refused"), map[string]any{"mode": "provision"})
+
+	after, _ := f.store.ListEvents(ctx, f.teamA, tid)
+	if len(after) != len(before) {
+		t.Errorf("recorded %d event(s) without marking the tenant failed", len(after)-len(before))
+	}
+}
+
+// transitionFailingStore reports a database error from the versioned
+// transition, without committing it.
+type transitionFailingStore struct {
+	*tenantstore.Memory
+}
+
+func (transitionFailingStore) TransitionStatusIfUnchanged(context.Context, uuid.UUID, uuid.UUID, []string, string, tenantstore.Version) (tenantstore.Tenant, error) {
+	return tenantstore.Tenant{}, errors.New("database unavailable")
+}

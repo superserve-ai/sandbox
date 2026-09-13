@@ -285,6 +285,19 @@ func TestQMAPI_PostgresStoreRules(t *testing.T) {
 	if _, err := store.SetStatus(ctx, teamA, tenant.ID, tenantstore.StatusProvisioning); err != nil {
 		t.Fatal(err)
 	}
+	// The event insert carries the same check in its own statement, so a
+	// superseded request cannot advance the counter its replacement holds.
+	fresh, err := store.GetTenant(ctx, teamA, tenant.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := tenantstore.Version{UpdatedAt: fresh.UpdatedAt, EventSeq: fresh.EventSeq - 1}
+	if _, err := store.InsertEventIfUnchanged(ctx, teamA, tenantstore.EventParams{TenantID: tenant.ID, Step: "run", Status: "ok"}, stale); !errors.Is(err, tenantstore.ErrStatusConflict) {
+		t.Errorf("event insert on a stale version: err = %v, want a conflict", err)
+	}
+	if got, err := store.GetTenant(ctx, teamA, tenant.ID); err != nil || got.EventSeq != fresh.EventSeq {
+		t.Errorf("a refused event moved event_seq to %d (was %d) err=%v", got.EventSeq, fresh.EventSeq, err)
+	}
 
 	if _, err := store.TransitionStatus(ctx, teamA, tenant.ID, []string{tenantstore.StatusReady}, tenantstore.StatusDeprovisioning); !errors.Is(err, tenantstore.ErrStatusConflict) {
 		t.Errorf("transition from a status the tenant is not in: err = %v", err)

@@ -128,6 +128,9 @@ type Store interface {
 	// deleted tenant (its child rows are frozen); write last words before
 	// the soft delete.
 	InsertEvent(ctx context.Context, teamID uuid.UUID, p EventParams) (Event, error)
+	// InsertEventIfUnchanged is InsertEvent with the row-version check in
+	// the same statement; ErrStatusConflict when the tenant has moved on.
+	InsertEventIfUnchanged(ctx context.Context, teamID uuid.UUID, p EventParams, at Version) (Event, error)
 	ListEvents(ctx context.Context, teamID, tenantID uuid.UUID) ([]Event, error)
 
 	SetSecretRef(ctx context.Context, teamID, tenantID uuid.UUID, name, ref string) error

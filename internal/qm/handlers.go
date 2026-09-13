@@ -598,21 +598,24 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 // owns the tenant. A trigger call that outlived StaleAfter comes back to a
 // tenant something else has re-queued; appending to it would move the row's
 // version past the one the replacement holds, and the replacement's own
-// bookkeeping would then decline to touch the tenant it owns.
+// bookkeeping would then decline to touch the tenant it owns. The check is
+// part of the insert, so nothing can land between the two.
 func (h *Handlers) eventIfMine(ctx context.Context, tenant tenantstore.Tenant, at tenantstore.Version, step, status, message string, detail map[string]any) {
+	p := tenantstore.EventParams{TenantID: tenant.ID, Step: step, Status: status, Message: message}
+	if detail != nil {
+		p.Detail = provisioner.ScrubDetail(detail)
+	}
 	dctx, cancel := detached(ctx)
 	defer cancel()
-	current, err := h.Store.GetTenant(dctx, tenant.TeamID, tenant.ID)
-	if err != nil {
-		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("confirm this attempt still owns the tenant")
-		return
-	}
-	if tenantstore.VersionOf(current) != at {
+	_, err := h.Store.InsertEventIfUnchanged(dctx, tenant.TeamID, p, at)
+	switch {
+	case err == nil:
+	case errors.Is(err, tenantstore.ErrStatusConflict), errors.Is(err, tenantstore.ErrNotFound):
 		h.Log.Warn().Str("tenant_id", tenant.ID.String()).Str("step", step).
 			Msg("a later attempt owns this tenant; dropping this outcome event")
-		return
+	default:
+		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Str("step", step).Msg("record tenant event")
 	}
-	h.eventIn(dctx, tenant, step, status, message, detail)
 }
 
 // abortQueue handles a queue attempt that failed before the run's intent
@@ -690,10 +693,12 @@ func (h *Handlers) failTenant(ctx context.Context, tenant tenantstore.Tenant, at
 			Msg("tenant moved on while this request was failing; leaving it to its current owner")
 		return
 	case err != nil:
-		// The status could not be read or written at all; record the
-		// failure anyway so the event log says what happened.
+		// The tenant is still in flight, and an event now would be worse
+		// than none: the stale reclaim judges a run by when it last wrote,
+		// so recording this would push recovery a full StaleAfter away for
+		// a tenant that has no run behind it at all.
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Msg("mark tenant failed")
-		updated = tenant
+		return
 	}
 	if detail == nil {
 		detail = map[string]any{}
