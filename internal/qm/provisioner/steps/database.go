@@ -66,7 +66,11 @@ func (s database) Ready(env provisioner.Env) error {
 	if s.c.Secrets == nil {
 		return errNoSecretStore
 	}
-	return env.Require("QM_SQL_PRIVATE_IP", env.SQLPrivateIP, "QM_SQL_ADMIN_USER", env.SQLAdminUser)
+	return env.Require(
+		"QM_SQL_PRIVATE_IP", env.SQLPrivateIP,
+		"QM_SQL_ADMIN_USER", env.SQLAdminUser,
+		"QM_SQL_ADMIN_SECRET", env.SQLAdminSecret,
+	)
 }
 
 func (s database) Run(ctx context.Context, t *provisioner.Tenant) error {

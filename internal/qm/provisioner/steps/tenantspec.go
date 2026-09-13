@@ -14,31 +14,17 @@ import (
 // what the provisioner renders is deliberately small: identity, the stores,
 // the sandbox backend, and the sign-in policy.
 
-// publicMailDomains are the domains a tenant's admin address must not widen
-// sign-in to. AUTH_ALLOWED_EMAIL_DOMAIN is a useful default for a team on
-// its own domain and a hole for one on a consumer mailbox: setting
-// AUTH_ALLOWED_EMAIL_DOMAIN=gmail.com would let anyone with a Gmail address
-// sign in to the tenant. For those, only the admin's own address is
-// allowed, and the tenant's operator widens it from the admin surface.
-var publicMailDomains = map[string]bool{
-	"aol.com": true, "duck.com": true, "fastmail.com": true, "gmail.com": true,
-	"googlemail.com": true, "gmx.com": true, "gmx.de": true, "hey.com": true,
-	"hotmail.co.uk": true, "hotmail.com": true, "icloud.com": true, "live.com": true,
-	"mail.com": true, "mail.ru": true, "me.com": true, "msn.com": true,
-	"outlook.com": true, "pm.me": true, "proton.me": true, "protonmail.com": true,
-	"qq.com": true, "yahoo.co.uk": true, "yahoo.com": true, "yandex.com": true,
-	"zoho.com": true, "163.com": true, "126.com": true, "naver.com": true,
-}
-
-// AllowedEmailDomain is the domain sign-in is opened to, or "" when the
-// admin's address is on a public mailbox provider.
-func AllowedEmailDomain(adminEmail string) string {
-	_, domain, ok := strings.Cut(strings.ToLower(strings.TrimSpace(adminEmail)), "@")
-	if !ok || domain == "" || publicMailDomains[domain] {
-		return ""
-	}
-	return domain
-}
+// Sign-in is opened to the tenant's admin address and nothing else.
+//
+// Deriving AUTH_ALLOWED_EMAIL_DOMAIN from that address is tempting — it is
+// what lets the rest of a team sign in without another deploy — but there
+// is no sound way to tell a company's domain from a mailbox provider's
+// from the address alone. A list of the providers to exclude is incomplete
+// by construction (there is always another regional Yahoo or Outlook
+// domain), and one miss opens a tenant holding the team's model key and
+// sandbox credentials to anybody with an account at that provider. So the
+// default fails closed, and widening it is a deliberate act by whoever
+// operates the tenant rather than a guess made here.
 
 // TenantEnv is the plain configuration of a tenant's service. Nothing
 // secret-shaped belongs here: Cloud Run shows a service's environment to
@@ -82,15 +68,11 @@ func TenantEnv(t *provisioner.Tenant) (map[string]string, error) {
 		// tenant that reached here can actually be signed into — the whole
 		// point of the step, and the thing the reference tenant shipped
 		// without.
-		"AUTH_EMBEDDED":             "1",
-		"AUTH_EMAIL_TRANSPORT":      "resend",
-		"AUTH_EMAIL_FROM":           t.Env.EmailFrom,
-		"AUTH_ALLOWED_EMAILS":       t.Row.AdminEmail,
-		"AUTH_BRAND_NAME":           t.Row.OrgName,
-		"AUTH_ALLOWED_EMAIL_DOMAIN": AllowedEmailDomain(t.Row.AdminEmail),
-	}
-	if env["AUTH_ALLOWED_EMAIL_DOMAIN"] == "" {
-		delete(env, "AUTH_ALLOWED_EMAIL_DOMAIN")
+		"AUTH_EMBEDDED":        "1",
+		"AUTH_EMAIL_TRANSPORT": "resend",
+		"AUTH_EMAIL_FROM":      t.Env.EmailFrom,
+		"AUTH_ALLOWED_EMAILS":  t.Row.AdminEmail,
+		"AUTH_BRAND_NAME":      t.Row.OrgName,
 	}
 	return env, nil
 }

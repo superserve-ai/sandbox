@@ -2,8 +2,10 @@ package steps
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/superserve-ai/sandbox/internal/qm/provisioner"
 	"github.com/superserve-ai/sandbox/internal/qm/secrets"
@@ -64,7 +66,30 @@ func (s bucket) Ready(env provisioner.Env) error {
 	if s.c.Secrets == nil {
 		return errNoSecretStore
 	}
-	return env.Require("QM_TENANT_BUCKET_LOCATION", env.BucketLocation)
+	if err := env.Require("QM_TENANT_BUCKET_LOCATION", env.BucketLocation); err != nil {
+		return err
+	}
+	// Parsed here rather than at the bucket call: a malformed policy would
+	// otherwise be discovered after the tenant's secrets, sandbox key,
+	// identity and database already exist, on every tenant, forever.
+	return validLifecyclePolicy(env.BucketLifecycleJSON)
+}
+
+// validLifecyclePolicy checks the shape of QM_TENANT_BUCKET_LIFECYCLE_JSON.
+// Only the outline is checked — the rules themselves are Cloud Storage's to
+// accept — but that is enough to catch a value that was mangled on its way
+// through a deploy.
+func validLifecyclePolicy(policy string) error {
+	if strings.TrimSpace(policy) == "" {
+		return nil
+	}
+	var parsed struct {
+		Rule []json.RawMessage `json:"rule"`
+	}
+	if err := json.Unmarshal([]byte(policy), &parsed); err != nil {
+		return fmt.Errorf("QM_TENANT_BUCKET_LIFECYCLE_JSON is not a lifecycle policy: %w", err)
+	}
+	return nil
 }
 
 func (s bucket) Run(ctx context.Context, t *provisioner.Tenant) error {
@@ -131,16 +156,20 @@ func (s bucket) ensureHMACKey(ctx context.Context, t *provisioner.Tenant, accoun
 	if err != nil {
 		return fmt.Errorf("create the tenant's storage credentials: %w", err)
 	}
-	// The secret before the access ID: the secret is the half that cannot
-	// be recovered, and a run that stored only the access ID would look
-	// half-configured in exactly the way the check above treats as "mint a
-	// new one".
-	for name, value := range map[string]string{secretSecretAccessKey: key.Secret, secretAccessKeyID: key.AccessID} {
-		ref, err := s.c.Secrets.Put(ctx, t.SecretName(name), []byte(value))
+	// The secret first, then the access ID, and a slice rather than a map
+	// because the order is the point: hmacStored treats "both halves
+	// present" as a usable credential, so the half it keys on has to be the
+	// one written last. An interrupted run then leaves at worst an orphan
+	// secret with no access ID beside it, which the next attempt replaces.
+	for _, half := range []struct{ name, value string }{
+		{secretSecretAccessKey, key.Secret},
+		{secretAccessKeyID, key.AccessID},
+	} {
+		ref, err := s.c.Secrets.Put(ctx, t.SecretName(half.name), []byte(half.value))
 		if err != nil {
-			return fmt.Errorf("write %s: %w", name, err)
+			return fmt.Errorf("write %s: %w", half.name, err)
 		}
-		if err := t.SetSecretRef(ctx, name, ref); err != nil {
+		if err := t.SetSecretRef(ctx, half.name, ref); err != nil {
 			return err
 		}
 	}
@@ -148,7 +177,9 @@ func (s bucket) ensureHMACKey(ctx context.Context, t *provisioner.Tenant, accoun
 }
 
 // hmacStored reports whether both halves of a usable credential are in
-// Secret Manager. Both, because either one alone is unusable.
+// Secret Manager. The access ID is checked first because it is the half
+// ensureHMACKey writes last: if it is there, the secret beside it belongs
+// to the same key.
 func (s bucket) hmacStored(ctx context.Context, t *provisioner.Tenant) (bool, error) {
 	for _, name := range []string{secretAccessKeyID, secretSecretAccessKey} {
 		if _, err := s.c.Secrets.Get(ctx, t.SecretName(name)); err != nil {

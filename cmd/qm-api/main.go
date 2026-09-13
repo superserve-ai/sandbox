@@ -145,6 +145,7 @@ func setup(ctx context.Context, command string) (*deps, error) {
 		SQLConnectionName:   cfg.SQLConnectionName,
 		SQLPrivateIP:        cfg.SQLPrivateIP,
 		SQLAdminUser:        cfg.SQLAdminUser,
+		SQLAdminSecret:      cfg.SQLAdminSecret,
 		URLMap:              cfg.LBURLMap,
 		VPCNetwork:          cfg.VPCNetwork,
 		VPCSubnetwork:       cfg.VPCSubnetwork,

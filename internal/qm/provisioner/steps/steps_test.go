@@ -197,6 +197,7 @@ func testEnv(stub bool) provisioner.Env {
 		SQLConnectionName: "example-project:us-central1:qm-tenants",
 		SQLPrivateIP:      "10.0.0.3",
 		SQLAdminUser:      "qm_admin",
+		SQLAdminSecret:    "qm-sql-admin",
 		URLMap:            "qm-https",
 		VPCNetwork:        "example-network",
 		VPCSubnetwork:     "example-subnet",
@@ -386,20 +387,19 @@ func assertTenantSpec(t *testing.T, spec ServiceSpec) {
 	// The email transport, which is the whole reason a provisioned tenant
 	// can be signed into.
 	for key, want := range map[string]string{
-		"AUTH_EMBEDDED":             "1",
-		"AUTH_EMAIL_TRANSPORT":      "resend",
-		"AUTH_EMAIL_FROM":           "QM <no-reply@mail.qm.example.com>",
-		"AUTH_ALLOWED_EMAILS":       "admin@example.com",
-		"AUTH_ALLOWED_EMAIL_DOMAIN": "example.com",
-		"ADMIN_GRANTS":              "admin@example.com:org_admin",
-		"PUBLIC_WEB_URL":            "https://pilot-team.qm.example.com",
-		"ORG_ID":                    "pilot-team",
-		"S3_BUCKET":                 "example-project-qm-pilot-team",
-		"SANDBOX_BACKEND":           "superserve",
-		"SUPERSERVE_BASE_URL":       "https://api.example.com",
-		"SUPERSERVE_TEMPLATE":       "qm-agent-0.1.0",
-		"HARNESS":                   "pi",
-		"MODEL_PROVIDER":            "anthropic",
+		"AUTH_EMBEDDED":        "1",
+		"AUTH_EMAIL_TRANSPORT": "resend",
+		"AUTH_EMAIL_FROM":      "QM <no-reply@mail.qm.example.com>",
+		"AUTH_ALLOWED_EMAILS":  "admin@example.com",
+		"ADMIN_GRANTS":         "admin@example.com:org_admin",
+		"PUBLIC_WEB_URL":       "https://pilot-team.qm.example.com",
+		"ORG_ID":               "pilot-team",
+		"S3_BUCKET":            "example-project-qm-pilot-team",
+		"SANDBOX_BACKEND":      "superserve",
+		"SUPERSERVE_BASE_URL":  "https://api.example.com",
+		"SUPERSERVE_TEMPLATE":  "qm-agent-0.1.0",
+		"HARNESS":              "pi",
+		"MODEL_PROVIDER":       "anthropic",
 	} {
 		if spec.Env[key] != want {
 			t.Errorf("env %s = %q, want %q", key, spec.Env[key], want)
@@ -761,43 +761,31 @@ func TestSmokeAcceptsOnlyTheBrokersOwnAnswer(t *testing.T) {
 
 // ── Sign-in policy ───────────────────────────────────────────────────────
 
-func TestAllowedEmailDomain(t *testing.T) {
-	if got := AllowedEmailDomain("admin@Pilot-Team.com"); got != "pilot-team.com" {
-		t.Errorf("corporate domain = %q", got)
-	}
-	// A consumer mailbox must not widen sign-in to every account at that
-	// provider; only the admin's own address is allowed.
-	for _, email := range []string{"someone@gmail.com", "someone@outlook.com", "someone@icloud.com", "not-an-email"} {
-		if got := AllowedEmailDomain(email); got != "" {
-			t.Errorf("AllowedEmailDomain(%q) = %q, want empty", email, got)
+// Sign-in opens to the admin's address and nothing else. Deriving a domain
+// from that address would be convenient and is not sound: nothing in an
+// address distinguishes a company's domain from a mailbox provider's, and
+// one wrong guess opens the tenant — with the team's model key and sandbox
+// credentials in it — to every account at that provider.
+func TestTenantEnvDoesNotWidenSignInToADomain(t *testing.T) {
+	for _, admin := range []string{"founder@gmail.com", "admin@pilot-team.com", "someone@yahoo.fr"} {
+		f := newFixture(t, false)
+		if err := f.provision(t); err != nil {
+			t.Fatal(err)
+		}
+		row := f.current(t)
+		row.AdminEmail = admin
+		env, err := TenantEnv(provisioner.NewTenant(row, testEnv(false), f.store))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := env["AUTH_ALLOWED_EMAIL_DOMAIN"]; ok {
+			t.Errorf("%s widened sign-in to %q", admin, got)
+		}
+		if env["AUTH_ALLOWED_EMAILS"] != admin {
+			t.Errorf("AUTH_ALLOWED_EMAILS = %q, want %q", env["AUTH_ALLOWED_EMAILS"], admin)
 		}
 	}
 }
-
-func TestTenantEnvOmitsPublicMailDomains(t *testing.T) {
-	f := newFixture(t, false)
-	ctx := context.Background()
-	if _, err := f.store.UpdateResources(ctx, f.teamID, f.row.ID, tenantstore.Resources{
-		BucketName: strptr("example-project-qm-pilot-team"),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	row := f.current(t)
-	row.AdminEmail = "founder@gmail.com"
-	tenant := provisioner.NewTenant(row, testEnv(false), f.store)
-	env, err := TenantEnv(tenant)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := env["AUTH_ALLOWED_EMAIL_DOMAIN"]; ok {
-		t.Errorf("a consumer mailbox widened sign-in: %q", env["AUTH_ALLOWED_EMAIL_DOMAIN"])
-	}
-	if env["AUTH_ALLOWED_EMAILS"] != "founder@gmail.com" {
-		t.Errorf("AUTH_ALLOWED_EMAILS = %q", env["AUTH_ALLOWED_EMAILS"])
-	}
-}
-
-func strptr(s string) *string { return &s }
 
 // ── Readiness ────────────────────────────────────────────────────────────
 
@@ -877,6 +865,8 @@ func TestPlanReadyRefusesAnIncompleteConfiguration(t *testing.T) {
 		{"no tenant image", func(e *provisioner.Env) { e.Image = "" }, "QM_TENANT_IMAGE"},
 		{"no bucket location", func(e *provisioner.Env) { e.BucketLocation = "" }, "QM_TENANT_BUCKET_LOCATION"},
 		{"no sandbox template", func(e *provisioner.Env) { e.SandboxTemplate = "" }, "QM_SANDBOX_TEMPLATE"},
+		{"no sql admin secret", func(e *provisioner.Env) { e.SQLAdminSecret = "" }, "QM_SQL_ADMIN_SECRET"},
+		{"a mangled bucket lifecycle policy", func(e *provisioner.Env) { e.BucketLifecycleJSON = "{not json" }, "QM_TENANT_BUCKET_LIFECYCLE_JSON"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := testEnv(false)

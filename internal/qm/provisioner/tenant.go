@@ -37,10 +37,16 @@ type Env struct {
 	// Shared infrastructure each tenant is attached to. See qm.Config for
 	// where these come from and why an empty one is fatal at startup
 	// rather than at the step that needed it.
-	SQLInstance         string
-	SQLConnectionName   string
-	SQLPrivateIP        string
-	SQLAdminUser        string
+	SQLInstance       string
+	SQLConnectionName string
+	SQLPrivateIP      string
+	SQLAdminUser      string
+	// SQLAdminSecret is the Secret Manager name of the instance admin's
+	// password. The steps never read it — the client the provisioner builds
+	// does — but it is checked with the rest of the plan's configuration so
+	// an API that would accept tenants every job then fails to provision
+	// refuses to start instead.
+	SQLAdminSecret      string
 	URLMap              string
 	VPCNetwork          string
 	VPCSubnetwork       string
@@ -49,8 +55,7 @@ type Env struct {
 
 	// Tenant runtime configuration. ResendSecret is platform-level: one
 	// Secret Manager secret shared by every tenant, whose service account
-	// is granted read access to it. AllowedEmailDomain is derived per
-	// tenant from its admin address, not from here.
+	// is granted read access to it.
 	ResendSecret     string
 	EmailFrom        string
 	SandboxAPIURL    string

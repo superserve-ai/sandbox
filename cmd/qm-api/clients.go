@@ -44,9 +44,6 @@ func cloudClients(ctx context.Context, cfg qm.Config, env provisioner.Env, store
 		"GCP_PROJECT", cfg.GCPProject,
 		"QM_PROVISIONER_REGION", cfg.ProvisionerRegion,
 		"QM_LB_URL_MAP", cfg.LBURLMap,
-		"QM_SQL_ADMIN_USER", cfg.SQLAdminUser,
-		"QM_SQL_ADMIN_SECRET", cfg.SQLAdminSecret,
-		"QM_SQL_PRIVATE_IP", cfg.SQLPrivateIP,
 	); err != nil {
 		return out, err
 	}
