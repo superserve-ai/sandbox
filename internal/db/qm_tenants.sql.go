@@ -387,7 +387,7 @@ SET status = $3, updated_at = now()
 WHERE id = $1 AND team_id = $2
   AND status <> 'deleted'
   AND status = ANY($4::text[])
-RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at
+RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, event_seq, created_by, created_at, updated_at
 `
 
 type TransitionQMTenantStatusParams struct {
@@ -425,6 +425,7 @@ func (q *Queries) TransitionQMTenantStatus(ctx context.Context, arg TransitionQM
 		&i.BucketName,
 		&i.ServiceAccount,
 		&i.SandboxApiKeyID,
+		&i.EventSeq,
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,

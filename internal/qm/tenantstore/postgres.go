@@ -14,11 +14,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-const (
-	pgUniqueViolation = "23505"
-
-	eventInsertAttempts = 5
-)
+const pgUniqueViolation = "23505"
 
 // Postgres is the Store backed by the qm_api role. The pool must connect as
 // qm_api (or a role with the same grants): the scope call in every
@@ -214,23 +210,11 @@ func (s *Postgres) SoftDelete(ctx context.Context, teamID, tenantID uuid.UUID) (
 	return t, err
 }
 
-// InsertEvent assigns the next per-tenant seq inside the insert; two
-// writers (qm-api recording the trigger while the run it started records
-// its first step) can pick the same number, which the unique index rejects,
-// so a collision is simply retried.
+// InsertEvent takes its seq from the tenant's own counter, bumped in the
+// same statement, so two writers (qm-api recording the trigger while the
+// run it started records its first step) serialize on the tenant row
+// rather than racing for a number.
 func (s *Postgres) InsertEvent(ctx context.Context, teamID uuid.UUID, p EventParams) (Event, error) {
-	var e Event
-	var err error
-	for attempt := 0; attempt < eventInsertAttempts; attempt++ {
-		e, err = s.insertEvent(ctx, teamID, p)
-		if pgCode(err) != pgUniqueViolation {
-			break
-		}
-	}
-	return e, err
-}
-
-func (s *Postgres) insertEvent(ctx context.Context, teamID uuid.UUID, p EventParams) (Event, error) {
 	var e Event
 	err := s.withTeamTx(ctx, teamID, func(q *db.Queries) error {
 		params := db.InsertQMTenantEventParams{TenantID: p.TenantID, Step: p.Step, Status: p.Status}
