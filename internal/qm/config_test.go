@@ -93,3 +93,47 @@ func TestLoadConfigBaseDomainShape(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadConfigBaseDomainLength guards against a base domain that is
+// individually well-formed (every label under 63 characters) but, once a
+// valid 40-character slug is prefixed onto it, would exceed DNS's overall
+// 253-character name limit — surfacing only later, in the provisioner's
+// DNS/TLS steps, exactly the delayed failure the shape check exists to
+// avoid.
+func TestLoadConfigBaseDomainLength(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://qm_api:x@localhost/db")
+	t.Setenv("GCP_PROJECT", "")
+	t.Setenv("QM_PROVISIONER_MODE", "inprocess")
+	t.Setenv("QM_SECRETS_BACKEND", "memory")
+	t.Setenv("QM_PROVISIONER_STUB", "1")
+
+	label := strings.Repeat("a", 10)
+	longDomain := func(n int) string {
+		labels := make([]string, n)
+		for i := range labels {
+			labels[i] = label
+		}
+		return strings.Join(labels, ".")
+	}
+
+	atLimit := longDomain(maxBaseDomainLen / 11)
+	for len(atLimit) > maxBaseDomainLen {
+		atLimit = atLimit[:strings.LastIndexByte(atLimit, '.')]
+	}
+	if len(atLimit) == 0 || len(atLimit) > maxBaseDomainLen {
+		t.Fatalf("test setup produced an unusable domain of length %d", len(atLimit))
+	}
+	t.Setenv("QM_BASE_DOMAIN", atLimit)
+	if _, err := LoadConfig(); err != nil {
+		t.Errorf("QM_BASE_DOMAIN of length %d (at the limit) rejected: %v", len(atLimit), err)
+	}
+
+	tooLong := atLimit + ".xxxxxxxxxxxxxxxxxxxxxxxxxx"
+	if len(tooLong) <= maxBaseDomainLen {
+		t.Fatalf("test setup did not exceed the limit: len=%d", len(tooLong))
+	}
+	t.Setenv("QM_BASE_DOMAIN", tooLong)
+	if _, err := LoadConfig(); err == nil {
+		t.Errorf("QM_BASE_DOMAIN of length %d (over the limit) accepted", len(tooLong))
+	}
+}

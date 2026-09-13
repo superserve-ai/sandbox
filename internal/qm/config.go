@@ -20,6 +20,13 @@ import (
 // tenant's model key and run the rest of the provisioning plan.
 var baseDomainRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
 
+// maxBaseDomainLen leaves room for the longest accepted slug (40 characters,
+// see ValidateSlug) plus the joining dot under DNS's 253-character name
+// limit, so a valid base domain can never combine with a valid slug to
+// produce a hostname the resolver or the provisioner's TLS/DNS steps would
+// reject.
+const maxBaseDomainLen = 253 - 1 - 40
+
 // Provisioner trigger modes, from QM_PROVISIONER_MODE.
 const (
 	ProvisionerModeCloudRun  = "cloudrun"
@@ -93,6 +100,9 @@ func LoadConfig() (Config, error) {
 	}
 	if !baseDomainRe.MatchString(cfg.BaseDomain) {
 		return cfg, fmt.Errorf("QM_BASE_DOMAIN must be a bare domain, e.g. qm.example.com (no scheme, path or whitespace): %q", cfg.BaseDomain)
+	}
+	if len(cfg.BaseDomain) > maxBaseDomainLen {
+		return cfg, fmt.Errorf("QM_BASE_DOMAIN must be %d characters or fewer to leave room for a tenant slug", maxBaseDomainLen)
 	}
 	switch cfg.ProvisionerMode {
 	case ProvisionerModeCloudRun, ProvisionerModeInProcess:
