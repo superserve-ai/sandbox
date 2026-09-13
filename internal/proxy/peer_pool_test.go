@@ -767,6 +767,10 @@ func TestPeerPoolReclaimsStalePendingOpen(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("pending open stuck")
 	}
+	deadline := time.Now().Add(time.Second)
+	for oldCloser.closed.Load() != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
 	if oldCloser.closed.Load() != 1 {
 		t.Fatal("idle retired connection was not reclaimed")
 	}
