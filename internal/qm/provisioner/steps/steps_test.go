@@ -784,6 +784,30 @@ func assertFailureEvent(t *testing.T, events []tenantstore.Event) {
 	t.Error("no step reported a failure")
 }
 
+// QM_BASE_DOMAIN is deployment configuration and can change after a tenant
+// is built. The rule on the shared URL map is still the hostname the tenant
+// was routed under, so teardown has to look for that one — otherwise the
+// route survives and the backend delete behind it fails on every retry.
+func TestTeardownRemovesTheRouteTheTenantWasBuiltWith(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.lb.hosts["pilot-team.qm.example.com"]; !ok {
+		t.Fatalf("routes = %v", f.lb.hosts)
+	}
+	env := f.runner.Env
+	env.BaseDomain = "qm2.example.com"
+	f.runner.Env = env
+
+	if err := f.deprovision(t); err != nil {
+		t.Fatal(err)
+	}
+	if !f.lb.empty() {
+		t.Errorf("the route the tenant was built with survived teardown: %v", f.lb.hosts)
+	}
+}
+
 // ── Sign-in ──────────────────────────────────────────────────────────────
 
 // The defect this whole step set exists to prevent: a stack whose health

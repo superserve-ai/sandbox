@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 
 	"github.com/superserve-ai/sandbox/internal/qm/provisioner"
 )
@@ -69,6 +70,13 @@ func (s loadBalancer) Run(ctx context.Context, t *provisioner.Tenant) error {
 // Rollback removes the route. It does not check first: RemoveHostRule is
 // idempotent, and the check would only add a call that can itself fail
 // between the answer and the delete.
+//
+// Both the hostname recorded on the row and the one the current base domain
+// derives, because they are not always the same one. QM_BASE_DOMAIN is
+// deployment configuration; if it changes after a tenant is built, the rule
+// on the URL map is still the old hostname, and a teardown that only looked
+// for the new one would leave the route in place and then fail trying to
+// delete the backend it still points at — on every retry, for good.
 func (s loadBalancer) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if t.Env.Stub {
 		return nil
@@ -76,8 +84,36 @@ func (s loadBalancer) Rollback(ctx context.Context, t *provisioner.Tenant) error
 	if s.c.LoadBalancer == nil {
 		return errNoLoadBalancerAdmin
 	}
-	if err := s.c.LoadBalancer.RemoveHostRule(ctx, t.Hostname()); err != nil {
-		return fmt.Errorf("remove the tenant's route: %w", err)
+	for _, host := range routedHosts(t) {
+		if err := s.c.LoadBalancer.RemoveHostRule(ctx, host); err != nil {
+			return fmt.Errorf("remove the tenant's route: %w", err)
+		}
 	}
 	return nil
+}
+
+// routedHosts is every hostname this tenant may be routed under: the one
+// its recorded public URL names, first, and the one the current base domain
+// derives. The recorded one goes first because the derived one's cleanup
+// deletes the backend the recorded rule may still reference.
+func routedHosts(t *provisioner.Tenant) []string {
+	derived := t.Hostname()
+	recorded := recordedHost(t)
+	if recorded == "" || recorded == derived {
+		return []string{derived}
+	}
+	return []string{recorded, derived}
+}
+
+// recordedHost is the hostname in the tenant's public URL, or "" when it
+// has none or it cannot be parsed.
+func recordedHost(t *provisioner.Tenant) string {
+	if t.Row.PublicUrl == nil {
+		return ""
+	}
+	u, err := url.Parse(*t.Row.PublicUrl)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
