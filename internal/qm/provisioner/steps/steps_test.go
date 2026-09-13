@@ -173,3 +173,28 @@ func TestDeprovisionDeletesUnreferencedModelKey(t *testing.T) {
 		t.Error("unreferenced model key survived deprovision")
 	}
 }
+
+// The startup gate: outside stub mode the plan reports the steps whose
+// cloud implementations have not landed, so the binary refuses to serve
+// rather than accepting tenants it would abandon halfway through.
+func TestPlanReadyGatesUnimplementedSteps(t *testing.T) {
+	clients := Clients{Secrets: secrets.NewFake()}
+	if err := provisioner.PlanReady(All(clients), provisioner.Env{Stub: true}); err != nil {
+		t.Errorf("stub mode: %v", err)
+	}
+	err := provisioner.PlanReady(All(clients), provisioner.Env{})
+	if err == nil {
+		t.Fatal("real mode reported a runnable plan")
+	}
+	for _, want := range []string{"service_account", "database", "bucket", "cloud_run", "load_balancer", "health_check", "smoke"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("%q missing from %v", want, err)
+		}
+	}
+	// The Secret Manager-backed steps have no placeholder mode: without a
+	// store they are unrunnable even under the stub.
+	err = provisioner.PlanReady(All(Clients{}), provisioner.Env{Stub: true})
+	if err == nil || !strings.Contains(err.Error(), "secrets") || !strings.Contains(err.Error(), "admin_link") {
+		t.Errorf("no secret store: %v", err)
+	}
+}

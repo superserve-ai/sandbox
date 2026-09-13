@@ -23,6 +23,12 @@ const (
 	stepModelKey = "model_key"
 	stepTrigger  = "trigger"
 
+	// maxCreateBodyBytes caps the create body before it is decoded: every
+	// field is small (the model key, the largest, is capped at 4 KiB), so
+	// an authenticated caller has no reason to send more and should not be
+	// able to make the service allocate it.
+	maxCreateBodyBytes = 32 << 10
+
 	internalErrorMsg = "A problem occurred. Please try again, or contact the team if it persists."
 )
 
@@ -68,7 +74,13 @@ func (h *Handlers) newJTI() (string, error) {
 func (h *Handlers) CreateTenant(c *gin.Context) {
 	p := principalFrom(c)
 	var req CreateTenantRequest
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxCreateBodyBytes)
 	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			respondError(c, http.StatusRequestEntityTooLarge, "Request body is too large.")
+			return
+		}
 		respondError(c, http.StatusBadRequest, "Request body must be a JSON object.")
 		return
 	}

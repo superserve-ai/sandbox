@@ -20,6 +20,7 @@ type LoadBalancerAdmin interface {
 // loadBalancer routes the tenant hostname. No row output: the hostname is
 // derived from the slug and base domain.
 type loadBalancer struct {
+	stubOnly
 	c Clients
 }
 

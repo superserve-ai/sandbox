@@ -20,6 +20,7 @@ type BucketAdmin interface {
 
 // bucket creates the tenant's bucket. Output: Row.BucketName.
 type bucket struct {
+	stubOnly
 	c Clients
 }
 

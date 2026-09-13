@@ -11,6 +11,10 @@ import (
 	"github.com/superserve-ai/sandbox/internal/qm/secrets"
 )
 
+// errNoSecretStore is what the Secret Manager-backed steps report when no
+// store was wired in; they have no placeholder mode to fall back to.
+var errNoSecretStore = errors.New("no secret store configured")
+
 // Generated per tenant. The model provider key is not in this list: qm-api
 // writes it at create time, before the run is triggered.
 var generatedSecrets = []struct {
@@ -33,9 +37,18 @@ type secretsStep struct {
 
 func (secretsStep) Name() string { return "secrets" }
 
+// Ready: this step is real in every mode, so it needs a store even under
+// QM_PROVISIONER_STUB.
+func (s secretsStep) Ready(provisioner.Env) error {
+	if s.c.Secrets == nil {
+		return errNoSecretStore
+	}
+	return nil
+}
+
 func (s secretsStep) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if s.c.Secrets == nil {
-		return errors.New("secrets: no store configured")
+		return errNoSecretStore
 	}
 	existing, err := t.SecretRefs(ctx)
 	if err != nil {
@@ -76,7 +89,7 @@ func (s secretsStep) Run(ctx context.Context, t *provisioner.Tenant) error {
 // so names that were never written cost one no-op call each.
 func (s secretsStep) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if s.c.Secrets == nil {
-		return errors.New("secrets: no store configured")
+		return errNoSecretStore
 	}
 	refs, err := t.SecretRefs(ctx)
 	if err != nil {

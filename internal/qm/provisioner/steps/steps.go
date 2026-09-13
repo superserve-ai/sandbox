@@ -9,6 +9,7 @@ package steps
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -31,6 +32,21 @@ type Clients struct {
 	HTTP *http.Client
 }
 
+// stubOnly is embedded by the steps whose cloud implementations have not
+// landed. They can only record placeholders, so provisioner.PlanReady
+// refuses a non-stub binary rather than letting it accept tenants it would
+// abandon halfway through building.
+type stubOnly struct{}
+
+var errStubOnly = errors.New("not implemented; set QM_PROVISIONER_STUB=1 to record a placeholder instead")
+
+func (stubOnly) Ready(env provisioner.Env) error {
+	if env.Stub {
+		return nil
+	}
+	return errStubOnly
+}
+
 // All returns the plan in provision order; the deprovision plan is the
 // reverse, running each step's Rollback. Order follows the dependencies:
 // generated secrets first (the database step reads DATABASE_PASSWORD, the
@@ -41,15 +57,15 @@ func All(c Clients) []provisioner.Step {
 		c.HTTP = &http.Client{Timeout: 15 * time.Second}
 	}
 	return []provisioner.Step{
-		secretsStep{c},
-		serviceAccount{c},
-		database{c},
-		bucket{c},
-		cloudRun{c},
-		loadBalancer{c},
-		healthCheck{c},
-		smoke{c},
-		adminLink{c},
+		secretsStep{c: c},
+		serviceAccount{c: c},
+		database{c: c},
+		bucket{c: c},
+		cloudRun{c: c},
+		loadBalancer{c: c},
+		healthCheck{c: c},
+		smoke{c: c},
+		adminLink{c: c},
 	}
 }
 

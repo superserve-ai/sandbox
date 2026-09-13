@@ -11,6 +11,7 @@ import (
 // healthCheck waits for the tenant to answer on its public URL through the
 // load balancer (Clients.HTTP). Read-only, so Rollback has nothing to do.
 type healthCheck struct {
+	stubOnly
 	c Clients
 }
 
@@ -30,6 +31,7 @@ func (healthCheck) Rollback(context.Context, *provisioner.Tenant) error {
 // smoke exercises the deployed stack end to end (sign-in page renders, the
 // admin API answers with the tenant's credentials). Read-only.
 type smoke struct {
+	stubOnly
 	c Clients
 }
 
@@ -55,9 +57,18 @@ type adminLink struct {
 
 func (adminLink) Name() string { return "admin_link" }
 
+// Ready: minting a link needs the tenant's portal session secret, so this
+// step needs a store in every mode.
+func (s adminLink) Ready(provisioner.Env) error {
+	if s.c.Secrets == nil {
+		return errNoSecretStore
+	}
+	return nil
+}
+
 func (s adminLink) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if s.c.Secrets == nil {
-		return provisioner.NotImplemented(s.Name())
+		return errNoSecretStore
 	}
 	if t.Row.PublicUrl == nil {
 		return provisioner.Skip("no public URL recorded yet")

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // Step is one unit of a plan. Run and Rollback must both be idempotent: a
@@ -19,6 +20,34 @@ type Step interface {
 	Name() string
 	Run(ctx context.Context, t *Tenant) error
 	Rollback(ctx context.Context, t *Tenant) error
+}
+
+// ReadyChecker is an optional Step interface: a step that cannot run in the
+// current environment says so here rather than at Run time.
+type ReadyChecker interface {
+	Ready(env Env) error
+}
+
+// PlanReady reports every step that cannot run in env. Binaries call it
+// once at startup and refuse to serve when it fails: a run that would stop
+// at an unimplemented step must never be accepted, because by then the
+// tenant already has a model key in Secret Manager and a half-built stack
+// behind it.
+func PlanReady(steps []Step, env Env) error {
+	var notReady []string
+	for _, s := range steps {
+		rc, ok := s.(ReadyChecker)
+		if !ok {
+			continue
+		}
+		if err := rc.Ready(env); err != nil {
+			notReady = append(notReady, s.Name()+": "+err.Error())
+		}
+	}
+	if len(notReady) == 0 {
+		return nil
+	}
+	return fmt.Errorf("provisioning plan cannot run (%s)", strings.Join(notReady, "; "))
 }
 
 // NotImplementedError is returned by a step whose real implementation has

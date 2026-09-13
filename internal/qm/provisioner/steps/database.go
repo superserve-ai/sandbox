@@ -23,6 +23,7 @@ type DatabaseAdmin interface {
 
 // database creates the tenant's database and role. Output: Row.DbName.
 type database struct {
+	stubOnly
 	c Clients
 }
 

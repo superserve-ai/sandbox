@@ -929,3 +929,21 @@ type lockFailingStore struct {
 func (lockFailingStore) Lock(context.Context, uuid.UUID, uuid.UUID) (func(), error) {
 	return nil, errors.New("database unavailable")
 }
+
+// An oversized body is refused before it is decoded, so a caller cannot
+// make the service allocate a payload none of the fields could hold.
+func TestCreateTenantRejectsOversizedBody(t *testing.T) {
+	f := newFixture(t)
+	body := validCreate()
+	body["modelKey"] = "sk-ant-" + strings.Repeat("a", maxCreateBodyBytes)
+	code, resp := f.do(t, http.MethodPost, "/v1/qm/tenants", keyTeamA, body)
+	if code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d body %v, want 413", code, resp)
+	}
+	if len(f.secrets.Puts) != 0 || len(f.trigger.Calls) != 0 {
+		t.Error("an oversized body reached the secret store or the trigger")
+	}
+	if tenants, _ := f.store.ListTenants(context.Background(), f.teamA); len(tenants) != 0 {
+		t.Errorf("an oversized body created a tenant: %+v", tenants)
+	}
+}

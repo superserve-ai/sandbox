@@ -22,6 +22,7 @@ type ServiceAccountAdmin interface {
 
 // serviceAccount creates the tenant's identity. Output: Row.ServiceAccount.
 type serviceAccount struct {
+	stubOnly
 	c Clients
 }
 

@@ -123,6 +123,13 @@ func setup(ctx context.Context) (*deps, error) {
 		Steps: steps.All(steps.Clients{Secrets: secretStore}),
 		Log:   log.Logger,
 	}
+	// Refuse a configuration whose plan would stop partway: by the time a
+	// run reaches an unimplemented step the tenant already has a model key
+	// in Secret Manager and a half-built stack behind it, so the failure
+	// belongs at startup, where it blocks the deploy instead.
+	if err := provisioner.PlanReady(d.runner.Steps, env); err != nil {
+		return d, err
+	}
 	return d, nil
 }
 

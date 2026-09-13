@@ -5,6 +5,11 @@
 # job is updated before the service so a run triggered by the new service
 # never executes an older provisioner.
 #
+# The cloud provisioning steps (service account, database, bucket, service,
+# route, probes) are not implemented yet, and qm-api refuses to start
+# without QM_PROVISIONER_STUB=1 while that is true — so the environment
+# that first sets QM_API_SERVICE has to set the stub flag with it.
+#
 # Triggers mirror deploy-api.yml: a push to main on qm-api paths runs
 # staging, then production; a dispatch for production still runs staging
 # first. Each environment's deploy steps skip until its QM_API_SERVICE

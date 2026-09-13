@@ -40,6 +40,7 @@ type CloudRunAdmin interface {
 // Row.ImageTag, Row.PublicUrl (the public hostname, not the run.app URI;
 // the load balancer step routes it).
 type cloudRun struct {
+	stubOnly
 	c Clients
 }
 

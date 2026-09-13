@@ -2415,6 +2415,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/QMError"
+        "413":
+          description: The request body exceeds 32 KiB
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QMError"
         "502":
           description: >
             The tenant was created but its model key could not be stored or
