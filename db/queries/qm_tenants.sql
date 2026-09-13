@@ -145,6 +145,4 @@ RETURNING *;
 -- tenant row at it in the same statement so a live key can never end up
 -- unreferenced. Returns the key and whether this call created it; a tenant
 -- that already has one gets that one back, so a retried provision is safe.
-SELECT qm.issue_tenant_api_key(
-    sqlc.arg(tenant_id), sqlc.arg(key_hash), sqlc.arg(key_name), sqlc.arg(key_scopes)::text[]
-) AS key_id;
+SELECT qm.issue_tenant_api_key(sqlc.arg(tenant_id), sqlc.arg(key_hash)) AS key_id;

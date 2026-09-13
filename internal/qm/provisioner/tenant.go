@@ -123,8 +123,8 @@ func (t *Tenant) SetSecretRef(ctx context.Context, name, ref string) error {
 
 // IssueSandboxKey mints the tenant's Superserve API key and points the row
 // at it, returning the key's id.
-func (t *Tenant) IssueSandboxKey(ctx context.Context, p tenantstore.SandboxKeyParams) (uuid.UUID, error) {
-	return t.store.IssueSandboxKey(ctx, t.Row.TeamID, t.Row.ID, p)
+func (t *Tenant) IssueSandboxKey(ctx context.Context, keyHash string) (uuid.UUID, error) {
+	return t.store.IssueSandboxKey(ctx, t.Row.TeamID, t.Row.ID, keyHash)
 }
 
 // RevokeSandboxKey revokes the API key the tenant was issued, reporting

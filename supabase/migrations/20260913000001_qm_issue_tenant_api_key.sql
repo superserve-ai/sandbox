@@ -15,6 +15,11 @@
 -- sandboxes; giving tenant keys a principal of their own is the follow-up,
 -- and it belongs in the control plane's authorization, not here.
 --
+-- The key's name and its (empty) scopes are fixed here rather than passed
+-- in: a definer function that let its caller choose them would hand qm_api
+-- the ability to mint a key under any name with any scopes, which is a
+-- larger privilege than the INSERT it is standing in for.
+--
 -- The atomicity is the point. A provisioner that inserted the key and then
 -- recorded the reference separately could die in between and leave a live,
 -- unreferenced credential on the team — one nothing would ever revoke,
@@ -30,11 +35,10 @@ SET LOCAL lock_timeout = '5s';
 SET LOCAL statement_timeout = '10s';
 
 DROP FUNCTION IF EXISTS qm.issue_tenant_api_key(uuid, text, text, text[]);
+DROP FUNCTION IF EXISTS qm.issue_tenant_api_key(uuid, text);
 CREATE FUNCTION qm.issue_tenant_api_key(
     tenant uuid,
-    key_hash text,
-    key_name text,
-    key_scopes text[]
+    key_hash text
 )
 RETURNS uuid
 LANGUAGE plpgsql SECURITY DEFINER
@@ -78,8 +82,13 @@ BEGIN
             USING ERRCODE = 'not_null_violation';
     END IF;
 
+    -- The name and the scopes are the function's, not the caller's. A
+    -- definer function that took them would let qm_api mint a key under a
+    -- reserved name (the console's impersonation key, say) carrying
+    -- whatever platform scopes it asked for — which is exactly the
+    -- privilege this function exists to avoid granting.
     INSERT INTO public.api_key (team_id, key_hash, name, scopes, created_by)
-    VALUES (target_team, key_hash, key_name, COALESCE(key_scopes, '{}'::text[]), target_actor)
+    VALUES (target_team, key_hash, '__qm_tenant__', '{}'::text[], target_actor)
     RETURNING id INTO created;
 
     UPDATE qm.tenants SET sandbox_api_key_id = created, updated_at = now()
@@ -89,7 +98,7 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION qm.issue_tenant_api_key(uuid, text, text, text[]) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION qm.issue_tenant_api_key(uuid, text, text, text[]) TO qm_api;
+REVOKE ALL ON FUNCTION qm.issue_tenant_api_key(uuid, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION qm.issue_tenant_api_key(uuid, text) TO qm_api;
 
 COMMIT;

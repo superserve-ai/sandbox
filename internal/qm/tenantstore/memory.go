@@ -34,8 +34,9 @@ type Memory struct {
 	Detached map[uuid.UUID]bool
 	// RevokedKeys are the sandbox API keys RevokeSandboxKey has revoked.
 	RevokedKeys map[uuid.UUID]bool
-	// IssuedKeys are the sandbox API keys IssueSandboxKey has minted, by id.
-	IssuedKeys map[uuid.UUID]SandboxKeyParams
+	// IssuedKeys are the hashes of the sandbox API keys IssueSandboxKey has
+	// minted, by key id.
+	IssuedKeys map[uuid.UUID]string
 }
 
 func NewMemory() *Memory {
@@ -47,7 +48,7 @@ func NewMemory() *Memory {
 		Now:     time.Now,
 
 		RevokedKeys: map[uuid.UUID]bool{},
-		IssuedKeys:  map[uuid.UUID]SandboxKeyParams{},
+		IssuedKeys:  map[uuid.UUID]string{},
 	}
 }
 
@@ -354,7 +355,7 @@ func (m *Memory) DeleteSecretRef(_ context.Context, teamID, tenantID uuid.UUID, 
 // IssueSandboxKey mirrors the definer function: it records the key against
 // the tenant in one step, and hands back the existing one when the tenant
 // already has a key. IssuedKeys is what tests assert on.
-func (m *Memory) IssueSandboxKey(_ context.Context, teamID, tenantID uuid.UUID, p SandboxKeyParams) (uuid.UUID, error) {
+func (m *Memory) IssueSandboxKey(_ context.Context, teamID, tenantID uuid.UUID, keyHash string) (uuid.UUID, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.Fail != nil {
@@ -370,7 +371,7 @@ func (m *Memory) IssueSandboxKey(_ context.Context, teamID, tenantID uuid.UUID, 
 	id := uuid.New()
 	t.SandboxApiKeyID = pgtype.UUID{Bytes: id, Valid: true}
 	t.UpdatedAt = m.Now()
-	m.IssuedKeys[id] = p
+	m.IssuedKeys[id] = keyHash
 	return id, nil
 }
 

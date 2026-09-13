@@ -11,12 +11,6 @@ import (
 	"github.com/superserve-ai/sandbox/internal/qm/tenantstore"
 )
 
-// sandboxKeyName is the api_key name every tenant's key is issued under. It
-// follows the control plane's convention for keys a human never sees, so
-// the console hides it from the team's key list the way it hides its own
-// proxy key; the tenant it belongs to is the one whose row points at it.
-const sandboxKeyName = "__qm_tenant__"
-
 // sandboxKeyBytes of entropy in the random half of an issued key.
 const sandboxKeyBytes = 24
 
@@ -66,11 +60,7 @@ func (s sandboxKey) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if err := t.SetSecretRef(ctx, secretSandboxAPIKey, ref); err != nil {
 		return err
 	}
-	keyID, err := t.IssueSandboxKey(ctx, tenantstore.SandboxKeyParams{
-		KeyHash: qm.HashAPIKey(raw),
-		Name:    sandboxKeyName,
-		Scopes:  []string{},
-	})
+	keyID, err := t.IssueSandboxKey(ctx, qm.HashAPIKey(raw))
 	if err != nil {
 		return fmt.Errorf("issue the tenant's sandbox key: %w", err)
 	}

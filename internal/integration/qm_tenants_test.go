@@ -935,9 +935,7 @@ func TestQMAPI_IssueTenantSandboxKey(t *testing.T) {
 		t.Fatalf("create tenant: %v", err)
 	}
 	hash := "qm-issued-" + uuid.NewString()
-	keyID, err := q.IssueQMTenantSandboxKey(ctx, db.IssueQMTenantSandboxKeyParams{
-		TenantID: tenant.ID, KeyHash: hash, KeyName: "__qm_tenant__", KeyScopes: []string{},
-	})
+	keyID, err := q.IssueQMTenantSandboxKey(ctx, db.IssueQMTenantSandboxKeyParams{TenantID: tenant.ID, KeyHash: hash})
 	if err != nil {
 		t.Fatalf("issue sandbox key: %v", err)
 	}
@@ -952,7 +950,7 @@ func TestQMAPI_IssueTenantSandboxKey(t *testing.T) {
 
 	// A retried provision gets the same key back rather than a second one.
 	again, err := q.IssueQMTenantSandboxKey(ctx, db.IssueQMTenantSandboxKeyParams{
-		TenantID: tenant.ID, KeyHash: "qm-issued-" + uuid.NewString(), KeyName: "__qm_tenant__", KeyScopes: []string{},
+		TenantID: tenant.ID, KeyHash: "qm-issued-" + uuid.NewString(),
 	})
 	if err != nil || again != keyID {
 		t.Fatalf("re-issue: key=%s want=%s err=%v", again, keyID, err)
@@ -965,16 +963,23 @@ func TestQMAPI_IssueTenantSandboxKey(t *testing.T) {
 	// and name it was given.
 	var keyTeam uuid.UUID
 	var keyHash, keyName string
+	var scopes []string
 	var revoked *time.Time
 	var keyActor pgtype.UUID
 	var count int
 	if err := testPool.QueryRow(ctx,
-		`SELECT team_id, key_hash, name, revoked_at, created_by FROM public.api_key WHERE id = $1`, keyID,
-	).Scan(&keyTeam, &keyHash, &keyName, &revoked, &keyActor); err != nil {
+		`SELECT team_id, key_hash, name, scopes, revoked_at, created_by FROM public.api_key WHERE id = $1`, keyID,
+	).Scan(&keyTeam, &keyHash, &keyName, &scopes, &revoked, &keyActor); err != nil {
 		t.Fatalf("reload api key: %v", err)
 	}
-	if keyTeam != teamID || keyHash != hash || keyName != "__qm_tenant__" || revoked != nil {
-		t.Fatalf("issued key: team=%s hash=%s name=%s revoked=%v", keyTeam, keyHash, keyName, revoked)
+	if keyTeam != teamID || keyHash != hash || revoked != nil {
+		t.Fatalf("issued key: team=%s hash=%s revoked=%v", keyTeam, keyHash, revoked)
+	}
+	// The name and the scopes come from the function, not from the caller:
+	// a definer function that took them would let qm_api mint a key under
+	// a reserved name carrying whatever platform scopes it asked for.
+	if keyName != "__qm_tenant__" || len(scopes) != 0 {
+		t.Fatalf("issued key: name=%s scopes=%v", keyName, scopes)
 	}
 	// The key inherits the tenant's creator: that is the actor the control
 	// plane resolves its permissions through, and without one the tenant
@@ -995,7 +1000,7 @@ func TestQMAPI_IssueTenantSandboxKey(t *testing.T) {
 	// else is not issuable, and no key is created for the attempt.
 	tx2, q2 := scopedQMTx(t, conn, otherTeam)
 	if _, err := q2.IssueQMTenantSandboxKey(ctx, db.IssueQMTenantSandboxKeyParams{
-		TenantID: tenant.ID, KeyHash: "qm-foreign-" + uuid.NewString(), KeyName: "__qm_tenant__", KeyScopes: []string{},
+		TenantID: tenant.ID, KeyHash: "qm-foreign-" + uuid.NewString(),
 	}); err == nil {
 		t.Fatal("another team issued a key for this tenant")
 	}
@@ -1014,7 +1019,7 @@ func TestQMAPI_IssueTenantSandboxKey(t *testing.T) {
 		t.Fatalf("create tenant without a creator: %v", err)
 	}
 	if _, err := q3.IssueQMTenantSandboxKey(ctx, db.IssueQMTenantSandboxKeyParams{
-		TenantID: orphan.ID, KeyHash: "qm-orphan-" + uuid.NewString(), KeyName: "__qm_tenant__", KeyScopes: []string{},
+		TenantID: orphan.ID, KeyHash: "qm-orphan-" + uuid.NewString(),
 	}); err == nil {
 		t.Fatal("a tenant with no creator was issued a key")
 	}
@@ -1025,7 +1030,7 @@ func TestQMAPI_IssueTenantSandboxKey(t *testing.T) {
 		t.Fatalf("soft delete: %v", err)
 	}
 	if _, err := q4.IssueQMTenantSandboxKey(ctx, db.IssueQMTenantSandboxKeyParams{
-		TenantID: tenant.ID, KeyHash: "qm-late-" + uuid.NewString(), KeyName: "__qm_tenant__", KeyScopes: []string{},
+		TenantID: tenant.ID, KeyHash: "qm-late-" + uuid.NewString(),
 	}); err == nil {
 		t.Fatal("a deleted tenant issued a key")
 	}

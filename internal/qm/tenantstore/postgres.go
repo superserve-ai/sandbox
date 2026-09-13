@@ -319,15 +319,13 @@ func (s *Postgres) DeleteSecretRef(ctx context.Context, teamID, tenantID uuid.UU
 // tenant is gone.
 const pgNoDataFound = "P0002"
 
-func (s *Postgres) IssueSandboxKey(ctx context.Context, teamID, tenantID uuid.UUID, p SandboxKeyParams) (uuid.UUID, error) {
+func (s *Postgres) IssueSandboxKey(ctx context.Context, teamID, tenantID uuid.UUID, keyHash string) (uuid.UUID, error) {
 	var keyID uuid.UUID
 	err := s.withTeamTx(ctx, teamID, func(q *db.Queries) error {
 		var err error
 		keyID, err = q.IssueQMTenantSandboxKey(ctx, db.IssueQMTenantSandboxKeyParams{
-			TenantID:  tenantID,
-			KeyHash:   p.KeyHash,
-			KeyName:   p.Name,
-			KeyScopes: p.Scopes,
+			TenantID: tenantID,
+			KeyHash:  keyHash,
 		})
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == pgNoDataFound {

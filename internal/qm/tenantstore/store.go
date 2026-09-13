@@ -98,15 +98,6 @@ type Resources struct {
 	SandboxAPIKeyID *uuid.UUID
 }
 
-// SandboxKeyParams is the api_key row IssueSandboxKey inserts. The raw key
-// is never passed: only its hash reaches the database, as for every other
-// key the control plane issues.
-type SandboxKeyParams struct {
-	KeyHash string
-	Name    string
-	Scopes  []string
-}
-
 // Store is everything qm-api and the provisioner need from Postgres. Each
 // call is its own transaction so a crash between calls loses nothing that
 // was already recorded.
@@ -148,15 +139,18 @@ type Store interface {
 
 	// IssueSandboxKey mints the tenant's Superserve API key — the
 	// credential its QM creates sandboxes with — and points the tenant row
-	// at it in one statement, returning the key's id. Idempotent: a tenant
-	// that already has a key gets that key's id back and no second key is
-	// created. ErrNotFound when the tenant is gone.
+	// at it in one statement, returning the key's id. Only the hash is
+	// passed, as for every other key the control plane issues; the key's
+	// name and scopes are fixed by the definer function behind this, not
+	// chosen here. Idempotent: a tenant that already has a key gets that
+	// key's id back and no second key is created. ErrNotFound when the
+	// tenant is gone.
 	//
 	// One statement matters more here than usual: an insert whose reference
 	// was recorded separately could be interrupted in between and leave a
 	// live credential on the team that nothing would ever revoke, because
 	// teardown revokes only what the tenant row points at.
-	IssueSandboxKey(ctx context.Context, teamID, tenantID uuid.UUID, p SandboxKeyParams) (uuid.UUID, error)
+	IssueSandboxKey(ctx context.Context, teamID, tenantID uuid.UUID, keyHash string) (uuid.UUID, error)
 
 	// RevokeSandboxKey revokes the API key the tenant was issued, reporting
 	// whether it had one. Teardown must do this rather than just forget the
