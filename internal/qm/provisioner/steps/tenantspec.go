@@ -134,10 +134,11 @@ func TenantSecretEnv(t *provisioner.Tenant) (map[string]string, error) {
 // is a sandbox name component, so it keeps to lowercase alphanumerics and
 // stays short.
 func sandboxNamePrefix(slug string) string {
+	const maxPrefix = 12
 	var b strings.Builder
 	b.WriteString("qm")
 	for _, r := range slug {
-		if len(b.String()) >= 12 {
+		if b.Len() >= maxPrefix {
 			break
 		}
 		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
