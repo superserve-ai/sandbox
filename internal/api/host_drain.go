@@ -41,7 +41,11 @@ func (h *Handlers) transitionHostAdmission(c *gin.Context, hostID, desired strin
 	}
 	host, err := h.DB.PrepareHostAdmission(ctx, db.PrepareHostAdmissionParams{ID: hostID, Status: desired, HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true}})
 	if err == pgx.ErrNoRows {
-		respondErrorMsg(c, "conflict", "host missing or heartbeat stale", http.StatusConflict)
+		if _, lookupErr := h.DB.GetHost(ctx, hostID); lookupErr == pgx.ErrNoRows {
+			respondErrorMsg(c, "not_found", "host not found", http.StatusNotFound)
+			return
+		}
+		respondErrorMsg(c, "conflict", "host heartbeat stale", http.StatusConflict)
 		return
 	}
 	if err != nil {

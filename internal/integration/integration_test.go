@@ -294,6 +294,8 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // stubVMD satisfies VMDClient without a real VM daemon. Stubs return plausible
 // values so that HTTP handlers can complete and write to the DB.
 type stubVMD struct {
+	admissionMu     sync.Mutex
+	admissionState  vmdclient.HostAdmissionState
 	updatePreviewFn func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
 	updateNetworkFn func(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
 }
@@ -6607,4 +6609,18 @@ func routedFinalize(ctx context.Context, t *testing.T, params db.FinalizePausePa
 		ManifestDigests:   params.ManifestDigests,
 		ManifestBasePaths: params.ManifestBasePaths,
 	})
+}
+
+func (s *stubVMD) HostAdmission(_ context.Context, revision int64, closed bool) (vmdclient.HostAdmissionState, error) {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	if revision > 0 {
+		if revision < s.admissionState.Revision {
+			return vmdclient.HostAdmissionState{}, fmt.Errorf("stale admission command")
+		}
+		s.admissionState.Revision = revision
+		s.admissionState.Closed = closed
+	}
+	s.admissionState.Ready = true
+	return s.admissionState, nil
 }
