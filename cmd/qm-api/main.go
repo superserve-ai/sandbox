@@ -270,7 +270,7 @@ func runProvision(args []string) error {
 		// the database itself down nothing can be recorded, and the API's
 		// stale-run reclaim covers that case.)
 		if d != nil {
-			provisioner.RecordSetupFailure(ctx, d.store, log.Logger, teamID, tenantID, mode, err)
+			provisioner.RecordSetupFailure(ctx, d.store, log.Logger, teamID, tenantID, mode, *attemptArg, err)
 		}
 		return err
 	}

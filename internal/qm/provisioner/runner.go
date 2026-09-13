@@ -71,6 +71,25 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode,
 	default:
 		return fmt.Errorf("unknown mode %q", mode)
 	}
+	// Status alone cannot tell two attempts apart — a provision whose
+	// execution was delayed past the stale reclaim and the retry that
+	// replaced it are both 'provisioning' — so the run also has to be the
+	// one the newest intent event queued. An execution that arrives for a
+	// superseded attempt exits without taking the tenant away from the one
+	// that replaced it. Checked before the transition below, so a
+	// superseded execution writes nothing at all: a status write would
+	// bump the row's version out from under the request that owns it, and
+	// restart its stale-run timer.
+	if attempt > 0 {
+		events, lerr := r.Store.ListEvents(ctx, teamID, tenantID)
+		if lerr != nil {
+			return lerr
+		}
+		if newest := newestAttempt(events); newest != attempt {
+			log.Info().Int64("attempt", attempt).Int64("newest", newest).Msg("a later attempt owns this tenant; exiting")
+			return fmt.Errorf("%w: queued as attempt %d, newest is %d", ErrStaleRun, attempt, newest)
+		}
+	}
 	// The API moves the tenant into the mode's in-flight status before it
 	// queues the run, so that is the only status a run may start from. A
 	// queued execution that arrives after the intent changed (a delete
@@ -83,22 +102,6 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode,
 	}
 	if err != nil {
 		return err
-	}
-	// Status alone cannot tell two attempts apart — a provision whose
-	// execution was delayed past the stale reclaim and the retry that
-	// replaced it are both 'provisioning' — so the run also has to be the
-	// one the newest intent event queued. An execution that arrives for a
-	// superseded attempt exits without taking the tenant away from the one
-	// that replaced it.
-	if attempt > 0 {
-		events, lerr := r.Store.ListEvents(ctx, teamID, tenantID)
-		if lerr != nil {
-			return lerr
-		}
-		if newest := newestAttempt(events); newest != attempt {
-			log.Info().Int64("attempt", attempt).Int64("newest", newest).Msg("a later attempt owns this tenant; exiting")
-			return fmt.Errorf("%w: queued as attempt %d, newest is %d", ErrStaleRun, attempt, newest)
-		}
 	}
 	tenant := NewTenant(row, r.Env, r.Store)
 
@@ -229,7 +232,7 @@ func detached(ctx context.Context) (context.Context, context.CancelFunc) {
 // RecordSetupFailure is for the job entrypoint: the run never started
 // because a dependency could not be built, so the tenant the API queued is
 // moved back to failed (with the mode, so a retry resumes the same plan).
-func RecordSetupFailure(ctx context.Context, store tenantstore.Store, log zerolog.Logger, teamID, tenantID uuid.UUID, mode Mode, cause error) {
+func RecordSetupFailure(ctx context.Context, store tenantstore.Store, log zerolog.Logger, teamID, tenantID uuid.UUID, mode Mode, attempt int64, cause error) {
 	dctx, cancel := detached(ctx)
 	defer cancel()
 	// Under the tenant lock, like a run: if a replacement run already holds
@@ -242,6 +245,19 @@ func RecordSetupFailure(ctx context.Context, store tenantstore.Store, log zerolo
 		return
 	}
 	defer release()
+	// As in Run: an execution whose attempt has been superseded owns
+	// nothing, and must not mark the replacement failed.
+	if attempt > 0 {
+		events, lerr := store.ListEvents(dctx, teamID, tenantID)
+		if lerr != nil {
+			log.Error().Str("error", ScrubString(lerr.Error())).Str("tenant_id", tenantID.String()).Msg("read events to record setup failure")
+			return
+		}
+		if newest := newestAttempt(events); newest != attempt {
+			log.Info().Int64("attempt", attempt).Int64("newest", newest).Msg("a later attempt owns this tenant; not recording this setup failure")
+			return
+		}
+	}
 	inFlight := tenantstore.StatusProvisioning
 	if mode == ModeDeprovision {
 		inFlight = tenantstore.StatusDeprovisioning

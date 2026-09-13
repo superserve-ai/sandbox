@@ -480,9 +480,20 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 		h.abortQueue(c, tenant, at, mode, from, inFlight, err)
 		return tenantstore.Tenant{}, false
 	}
-	// Released before the trigger: the run it starts must be able to take
-	// the lock itself.
-	release()
+	// Held through the transition and the intent write, not just the probe:
+	// a delayed execution that took the lock in between would see the new
+	// in-flight status while its own intent was still the newest, pass the
+	// runner's attempt check, and run in place of the attempt being queued
+	// here. Released before the trigger, since the run it starts has to be
+	// able to take the lock itself.
+	released := false
+	releaseOnce := func() {
+		if !released {
+			released = true
+			release()
+		}
+	}
+	defer releaseOnce()
 	updated, err := h.Store.TransitionStatus(ctx, tenant.TeamID, tenant.ID, from, inFlight)
 	switch {
 	case errors.Is(err, tenantstore.ErrStatusConflict):
@@ -511,6 +522,7 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 	// intent event it just recorded. Anything else writing the tenant
 	// (a stale reclaim and the retry behind it, say) moves the row past it.
 	mine := tenantstore.Version{UpdatedAt: updated.UpdatedAt, EventSeq: intent.Seq}
+	releaseOnce()
 	if err := h.Trigger.Trigger(ctx, updated.TeamID, updated.ID, mode, intent.Seq); err != nil {
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Str("mode", string(mode)).Msg("trigger provisioner run")
 		if errors.Is(err, provisioner.ErrTriggerRejected) {

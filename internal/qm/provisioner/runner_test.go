@@ -474,7 +474,7 @@ func TestRunnerRejectsStaleExecution(t *testing.T) {
 func TestRecordSetupFailure(t *testing.T) {
 	h := newHarness(t)
 	h.queue(t, ModeDeprovision)
-	RecordSetupFailure(context.Background(), h.store, zerolog.Nop(), h.teamID, h.tenant.ID, ModeDeprovision, errors.New("secret manager client: permission denied"))
+	RecordSetupFailure(context.Background(), h.store, zerolog.Nop(), h.teamID, h.tenant.ID, ModeDeprovision, 0, errors.New("secret manager client: permission denied"))
 	if got := h.status(t); got != tenantstore.StatusFailed {
 		t.Fatalf("status = %s, want failed", got)
 	}
@@ -483,7 +483,7 @@ func TestRecordSetupFailure(t *testing.T) {
 		t.Errorf("detail = %s", ev.Detail)
 	}
 	// Not in flight (already reclaimed by someone else): nothing happens.
-	RecordSetupFailure(context.Background(), h.store, zerolog.Nop(), h.teamID, h.tenant.ID, ModeDeprovision, errors.New("again"))
+	RecordSetupFailure(context.Background(), h.store, zerolog.Nop(), h.teamID, h.tenant.ID, ModeDeprovision, 0, errors.New("again"))
 	if n := len(h.events(t)); n != 1 {
 		t.Errorf("events = %v", h.events(t))
 	}
@@ -494,7 +494,7 @@ func TestRecordSetupFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	RecordSetupFailure(context.Background(), h.store, zerolog.Nop(), h.teamID, h.tenant.ID, ModeDeprovision, errors.New("late"))
+	RecordSetupFailure(context.Background(), h.store, zerolog.Nop(), h.teamID, h.tenant.ID, ModeDeprovision, 0, errors.New("late"))
 	release()
 	if got := h.status(t); got != tenantstore.StatusDeprovisioning {
 		t.Errorf("status = %s, want deprovisioning kept", got)
@@ -584,5 +584,30 @@ func TestRunnerRefusesASupersededAttempt(t *testing.T) {
 	h.queue(t, ModeProvision)
 	if err := r.Run(ctx, h.teamID, h.tenant.ID, ModeProvision, 0); err != nil {
 		t.Fatalf("unchecked attempt: %v", err)
+	}
+}
+
+// The same rule covers a setup failure: an execution whose attempt was
+// superseded owns nothing and must not mark its replacement failed.
+func TestRecordSetupFailureIgnoresASupersededAttempt(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	queue := func() int64 {
+		t.Helper()
+		e, err := h.store.InsertEvent(ctx, h.teamID, tenantstore.EventParams{
+			TenantID: h.tenant.ID, Step: TriggerStep, Status: tenantstore.EventStarted, Message: "provision run requested",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e.Seq
+	}
+	first := queue()
+	queue()
+	h.queue(t, ModeProvision)
+
+	RecordSetupFailure(ctx, h.store, zerolog.Nop(), h.teamID, h.tenant.ID, ModeProvision, first, errors.New("no database"))
+	if got := h.status(t); got != tenantstore.StatusProvisioning {
+		t.Errorf("status = %s, want the successor left queued", got)
 	}
 }
