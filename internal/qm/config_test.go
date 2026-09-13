@@ -1,0 +1,139 @@
+package qm
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestLoadConfig(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://qm_api:x@localhost/db")
+	t.Setenv("QM_BASE_DOMAIN", "QM.Example.com.")
+	t.Setenv("GCP_PROJECT", "")
+	t.Setenv("QM_PROVISIONER_MODE", "")
+	t.Setenv("QM_SECRETS_BACKEND", "")
+	t.Setenv("QM_PROVISIONER_STUB", "")
+
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "GCP_PROJECT") {
+		t.Errorf("cloud run mode without a project: err = %v", err)
+	}
+
+	t.Setenv("QM_PROVISIONER_MODE", "inprocess")
+	t.Setenv("QM_SECRETS_BACKEND", "memory")
+	t.Setenv("QM_PROVISIONER_STUB", "1")
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BaseDomain != "qm.example.com" || cfg.Port != "8080" || !cfg.ProvisionerStub {
+		t.Errorf("cfg = %+v", cfg)
+	}
+
+	t.Setenv("QM_PROVISIONER_MODE", "cloudrun")
+	t.Setenv("GCP_PROJECT", "example-project")
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "inprocess") {
+		t.Errorf("memory secrets with the cloud run job: err = %v", err)
+	}
+	// The job is addressed by region, so triggering one is refused until
+	// the deploy says which region it was placed in.
+	t.Setenv("QM_SECRETS_BACKEND", "gcp")
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "QM_PROVISIONER_REGION") {
+		t.Errorf("cloud run job without a region: err = %v", err)
+	}
+	t.Setenv("QM_PROVISIONER_REGION", "us-east4")
+	if cfg, err := LoadConfig(); err != nil || cfg.ProvisionerRegion != "us-east4" {
+		t.Errorf("cfg = %+v err = %v", cfg, err)
+	}
+	t.Setenv("QM_SECRETS_BACKEND", "memory")
+	t.Setenv("QM_PROVISIONER_REGION", "")
+	t.Setenv("QM_PROVISIONER_MODE", "sometimes")
+	if _, err := LoadConfig(); err == nil {
+		t.Error("bad provisioner mode accepted")
+	}
+	t.Setenv("QM_PROVISIONER_MODE", "inprocess")
+	t.Setenv("QM_BASE_DOMAIN", "")
+	if _, err := LoadConfig(); err == nil {
+		t.Error("missing base domain accepted")
+	}
+}
+
+func TestLoadConfigBaseDomainShape(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://qm_api:x@localhost/db")
+	t.Setenv("GCP_PROJECT", "")
+	t.Setenv("QM_PROVISIONER_MODE", "inprocess")
+	t.Setenv("QM_SECRETS_BACKEND", "memory")
+	t.Setenv("QM_PROVISIONER_STUB", "1")
+
+	// A malformed base domain must fail at startup: tenant URLs are formed
+	// by concatenating a slug onto it, and a bad value here would otherwise
+	// only surface once the admin_link step tries to mint a URL against it,
+	// after a create has already run the rest of the provisioning plan.
+	bad := []string{
+		"https://qm.example.com",
+		"qm.example.com/path",
+		"qm example.com",
+		"qm.example.com:8080",
+		"qm.example.com ",
+		" ",
+		"-qm.example.com",
+		"qm.example.com-",
+		"justonelabel",
+	}
+	for _, v := range bad {
+		t.Setenv("QM_BASE_DOMAIN", v)
+		if _, err := LoadConfig(); err == nil {
+			t.Errorf("QM_BASE_DOMAIN=%q accepted", v)
+		}
+	}
+
+	good := []string{"qm.example.com", "QM.Example.COM", "a.b.c.example.com", "qm-staging.example.com"}
+	for _, v := range good {
+		t.Setenv("QM_BASE_DOMAIN", v)
+		if _, err := LoadConfig(); err != nil {
+			t.Errorf("QM_BASE_DOMAIN=%q rejected: %v", v, err)
+		}
+	}
+}
+
+// TestLoadConfigBaseDomainLength guards against a base domain that is
+// individually well-formed (every label under 63 characters) but, once a
+// valid 40-character slug is prefixed onto it, would exceed DNS's overall
+// 253-character name limit — surfacing only later, in the provisioner's
+// DNS/TLS steps, exactly the delayed failure the shape check exists to
+// avoid.
+func TestLoadConfigBaseDomainLength(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://qm_api:x@localhost/db")
+	t.Setenv("GCP_PROJECT", "")
+	t.Setenv("QM_PROVISIONER_MODE", "inprocess")
+	t.Setenv("QM_SECRETS_BACKEND", "memory")
+	t.Setenv("QM_PROVISIONER_STUB", "1")
+
+	label := strings.Repeat("a", 10)
+	longDomain := func(n int) string {
+		labels := make([]string, n)
+		for i := range labels {
+			labels[i] = label
+		}
+		return strings.Join(labels, ".")
+	}
+
+	atLimit := longDomain(maxBaseDomainLen / 11)
+	for len(atLimit) > maxBaseDomainLen {
+		atLimit = atLimit[:strings.LastIndexByte(atLimit, '.')]
+	}
+	if len(atLimit) == 0 || len(atLimit) > maxBaseDomainLen {
+		t.Fatalf("test setup produced an unusable domain of length %d", len(atLimit))
+	}
+	t.Setenv("QM_BASE_DOMAIN", atLimit)
+	if _, err := LoadConfig(); err != nil {
+		t.Errorf("QM_BASE_DOMAIN of length %d (at the limit) rejected: %v", len(atLimit), err)
+	}
+
+	tooLong := atLimit + ".xxxxxxxxxxxxxxxxxxxxxxxxxx"
+	if len(tooLong) <= maxBaseDomainLen {
+		t.Fatalf("test setup did not exceed the limit: len=%d", len(tooLong))
+	}
+	t.Setenv("QM_BASE_DOMAIN", tooLong)
+	if _, err := LoadConfig(); err == nil {
+		t.Errorf("QM_BASE_DOMAIN of length %d (over the limit) accepted", len(tooLong))
+	}
+}

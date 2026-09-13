@@ -21,6 +21,26 @@ SELECT live.id, sqlc.arg(step)::text, sqlc.arg(status)::text, sqlc.narg(message)
 FROM live
 RETURNING *;
 
+-- name: InsertQMTenantEventIfUnchanged :one
+-- InsertQMTenantEvent with the row's version in the same statement, so the
+-- check and the write cannot be separated. An outcome event from a request
+-- that has been superseded would otherwise advance event_seq past the
+-- version its replacement holds, and the replacement's own bookkeeping
+-- would then decline to touch the tenant it owns. No row means the tenant
+-- is retired, or has moved on.
+WITH live AS (
+    UPDATE qm.tenants t
+    SET event_seq = t.event_seq + 1
+    WHERE t.id = sqlc.arg(tenant_id) AND t.status <> 'deleted'
+      AND t.updated_at = sqlc.arg(expected_updated_at)
+      AND t.event_seq = sqlc.arg(expected_event_seq)
+    RETURNING t.id, t.event_seq
+)
+INSERT INTO qm.tenant_events (tenant_id, step, status, message, detail, seq)
+SELECT live.id, sqlc.arg(step)::text, sqlc.arg(status)::text, sqlc.narg(message)::text, sqlc.narg(detail)::jsonb, live.event_seq
+FROM live
+RETURNING *;
+
 -- name: ListQMTenantEvents :many
 SELECT * FROM qm.tenant_events
 WHERE tenant_id = $1

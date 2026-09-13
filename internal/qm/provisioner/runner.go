@@ -1,0 +1,320 @@
+package provisioner
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/qm/tenantstore"
+)
+
+// RunStep is the pseudo-step under which a whole run is recorded, so the
+// event log shows where each attempt began and how it ended.
+const RunStep = "run"
+
+// bookkeepingTimeout bounds the status and event writes that must land
+// even when the run's own context has been cancelled (job SIGTERM, or a
+// step that failed by timing out).
+const bookkeepingTimeout = 30 * time.Second
+
+// Runner executes a plan against one tenant with exclusive access.
+type Runner struct {
+	Store tenantstore.Store
+	Env   Env
+	// Steps in provision order; the deprovision plan is derived from them.
+	Steps []Step
+	Log   zerolog.Logger
+}
+
+// Run executes mode's plan for the tenant and returns the first step error,
+// ErrLocked when another run holds the tenant, ErrStaleRun when the tenant
+// has moved on, or ErrTenantDeleted.  The tenant ends up ready (provision),
+// deleted (deprovision) or failed.
+//
+// attempt is the seq of the intent event that queued this run; zero skips
+// the check, for an operator running the job by hand.
+//
+// A failed provision is left as-is for a retry to converge rather than
+// rolled back: every step is idempotent, and rolling back a half-built
+// stack on a transient error would turn one retry into a full rebuild.
+func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode, attempt int64) error {
+	log := r.Log.With().Str("tenant_id", tenantID.String()).Str("mode", string(mode)).Logger()
+
+	release, err := r.Store.Lock(ctx, teamID, tenantID)
+	if err != nil {
+		if errors.Is(err, tenantstore.ErrLocked) {
+			log.Info().Msg("another run holds the tenant lock; exiting")
+		}
+		return err
+	}
+	defer release()
+
+	row, err := r.Store.GetTenant(ctx, teamID, tenantID)
+	if err != nil {
+		return err
+	}
+	if row.Status == tenantstore.StatusDeleted {
+		return ErrTenantDeleted
+	}
+
+	var plan Plan
+	var inFlight string
+	switch mode {
+	case ModeProvision:
+		plan, inFlight = ProvisionPlan(r.Steps), tenantstore.StatusProvisioning
+	case ModeDeprovision:
+		plan, inFlight = DeprovisionPlan(r.Steps), tenantstore.StatusDeprovisioning
+	default:
+		return fmt.Errorf("unknown mode %q", mode)
+	}
+	// Status alone cannot tell two attempts apart — a provision whose
+	// execution was delayed past the stale reclaim and the retry that
+	// replaced it are both 'provisioning' — so the run also has to be the
+	// one the newest intent event queued. An execution that arrives for a
+	// superseded attempt exits without taking the tenant away from the one
+	// that replaced it. Checked before the transition below, so a
+	// superseded execution writes nothing at all: a status write would
+	// bump the row's version out from under the request that owns it, and
+	// restart its stale-run timer.
+	if attempt > 0 {
+		events, lerr := r.Store.ListEvents(ctx, teamID, tenantID)
+		if lerr != nil {
+			return lerr
+		}
+		if newest := newestAttempt(events); newest != attempt {
+			log.Info().Int64("attempt", attempt).Int64("newest", newest).Msg("a later attempt owns this tenant; exiting")
+			return fmt.Errorf("%w: queued as attempt %d, newest is %d", ErrStaleRun, attempt, newest)
+		}
+	}
+	// The API moves the tenant into the mode's in-flight status before it
+	// queues the run, so that is the only status a run may start from. A
+	// queued execution that arrives after the intent changed (a delete
+	// requested while a provision was still queued) finds a different
+	// status and exits without touching anything.
+	row, err = r.Store.TransitionStatus(ctx, teamID, tenantID, []string{inFlight}, inFlight)
+	if errors.Is(err, tenantstore.ErrStatusConflict) {
+		log.Info().Str("status", row.Status).Msg("tenant is no longer queued for this mode; exiting")
+		return fmt.Errorf("%w: tenant is not %s", ErrStaleRun, inFlight)
+	}
+	if err != nil {
+		// The job has no automatic retry, so exiting here would leave a
+		// tenant the API already moved in flight with nothing behind it
+		// until the stale reclaim. The lock is still held, so the row is
+		// authoritative: mark it failed and let the caller retry at once.
+		log.Error().Str("error", ScrubString(err.Error())).Msg("claim the tenant for this run")
+		dctx, cancel := detached(ctx)
+		t := NewTenant(tenantstore.Tenant{ID: tenantID, TeamID: teamID}, r.Env, r.Store)
+		if r.setFailed(dctx, t, inFlight) {
+			r.recordIn(dctx, t, RunStep, tenantstore.EventFailed, failureMessage(mode, "startup"), map[string]any{"mode": string(mode)})
+		}
+		cancel()
+		return err
+	}
+	tenant := NewTenant(row, r.Env, r.Store)
+
+	r.record(ctx, tenant, RunStep, tenantstore.EventStarted, string(mode)+" started", map[string]any{"mode": string(mode)})
+
+	for i, step := range plan.Steps {
+		r.record(ctx, tenant, step.Name(), tenantstore.EventStarted, "", nil)
+		err := step.Run(ctx, tenant)
+		var skip *SkipError
+		switch {
+		case err == nil:
+			r.record(ctx, tenant, step.Name(), tenantstore.EventOK, "", nil)
+		case errors.As(err, &skip):
+			r.record(ctx, tenant, step.Name(), tenantstore.EventSkipped, skip.Reason, nil)
+		default:
+			// Logged scrubbed, like the event: a cloud error can echo a
+			// connection string or key it was handed.
+			log.Warn().Str("error", ScrubString(err.Error())).Str("step", step.Name()).Msg("step failed")
+			// One deadline for the whole failure sequence, and the status
+			// first: with a slow database, a per-write timeout for each of
+			// the remaining steps' skipped events would spend the job's
+			// remaining life before the write that actually matters, and a
+			// killed job would leave the tenant in flight.
+			dctx, cancel := detached(ctx)
+			// Nothing is recorded unless the tenant actually moved to
+			// failed: with it still in flight, these events would only
+			// postpone the stale reclaim that is now the one thing left to
+			// recover it.
+			if r.setFailed(dctx, tenant, inFlight) {
+				r.recordIn(dctx, tenant, step.Name(), tenantstore.EventFailed, step.Name()+" failed", map[string]any{"error": err.Error()})
+				for _, rest := range plan.Steps[i+1:] {
+					r.recordIn(dctx, tenant, rest.Name(), tenantstore.EventSkipped, "not run: "+step.Name()+" failed", nil)
+				}
+				r.recordIn(dctx, tenant, RunStep, tenantstore.EventFailed, failureMessage(mode, step.Name()), nil)
+			}
+			cancel()
+			return err
+		}
+	}
+
+	// The terminal transition is written detached from ctx: every step
+	// succeeded, and a cancellation now must not strand the tenant in an
+	// in-flight status. If the write still fails, fall back to failed so a
+	// retry (which re-runs the now-idempotent plan) can record it. One
+	// deadline covers the whole sequence, so a slow event write cannot
+	// leave no time for the status that follows it.
+	dctx, cancel := detached(ctx)
+	defer cancel()
+	if mode == ModeDeprovision {
+		// Last words first: a deleted tenant's event log is frozen, so the
+		// completion event has to land before the status flips.
+		r.recordIn(dctx, tenant, RunStep, tenantstore.EventOK, "deprovision complete; tenant deleted", nil)
+		if _, err := r.Store.SoftDelete(dctx, teamID, tenantID); err != nil && !r.settled(dctx, teamID, tenantID, tenantstore.StatusDeleted) {
+			log.Error().Err(err).Msg("record tenant deleted")
+			r.fail(dctx, tenant, tenantstore.StatusDeprovisioning, "Deprovisioning finished but the tenant could not be marked deleted. Retry to record it.")
+			return fmt.Errorf("mark tenant deleted: %w", err)
+		}
+		return nil
+	}
+	if _, err := r.Store.SetStatus(dctx, teamID, tenantID, tenantstore.StatusReady); err != nil && !r.settled(dctx, teamID, tenantID, tenantstore.StatusReady) {
+		log.Error().Err(err).Msg("record tenant ready")
+		r.fail(dctx, tenant, tenantstore.StatusProvisioning, "Provisioning finished but the tenant could not be marked ready. Retry to record it.")
+		return fmt.Errorf("mark tenant ready: %w", err)
+	}
+	r.recordIn(dctx, tenant, RunStep, tenantstore.EventOK, "provision complete; tenant ready", nil)
+	return nil
+}
+
+// settled reports whether the tenant already reads as want. A terminal
+// write can commit and still report an error — a connection dropped on the
+// way back — and the fallback for that error marks the tenant failed, which
+// on a run that in fact succeeded would undo it. The run still holds the
+// tenant lock here, so the row is authoritative.
+func (r *Runner) settled(ctx context.Context, teamID, tenantID uuid.UUID, want string) bool {
+	row, err := r.Store.GetTenant(ctx, teamID, tenantID)
+	if err != nil || row.Status != want {
+		return false
+	}
+	r.Log.Warn().Str("tenant_id", tenantID.String()).Str("status", want).Msg("tenant was recorded despite the error")
+	return true
+}
+
+// TriggerStep is the event step qm-api records a run's intent under; its
+// seq is the attempt identifier the job is started with.
+const TriggerStep = "trigger"
+
+// newestAttempt is the seq of the newest intent event, or 0 if there is none.
+func newestAttempt(events []tenantstore.Event) int64 {
+	var newest int64
+	for _, e := range events {
+		if e.Step == TriggerStep && e.Status == tenantstore.EventStarted && e.Seq > newest {
+			newest = e.Seq
+		}
+	}
+	return newest
+}
+
+func failureMessage(mode Mode, step string) string {
+	if mode == ModeDeprovision {
+		return "Deprovisioning stopped at " + step + ". Retry to continue the teardown."
+	}
+	return "Provisioning stopped at " + step + ". Retry to continue from where it left off, or delete the tenant."
+}
+
+// fail marks the tenant failed with a user-safe run event, both under one
+// bookkeeping deadline. A failure to write even that is logged; the run's
+// error is what the caller returns.
+func (r *Runner) fail(ctx context.Context, t *Tenant, from, message string) {
+	dctx, cancel := detached(ctx)
+	defer cancel()
+	if !r.setFailed(dctx, t, from) {
+		return
+	}
+	r.recordIn(dctx, t, RunStep, tenantstore.EventFailed, message, nil)
+}
+
+// setFailed moves the tenant from the status this run owns to failed and
+// reports whether it did. A compare-and-set, not a plain write: a terminal
+// transition can commit and still report an error, and an unconditional
+// write would turn a run that in fact succeeded into a failure. When it
+// does not move, nothing is recorded either — an event would restart the
+// stale-run clock for a tenant this run no longer owns.
+func (r *Runner) setFailed(ctx context.Context, t *Tenant, from string) bool {
+	_, err := r.Store.TransitionStatus(ctx, t.Row.TeamID, t.Row.ID, []string{from}, tenantstore.StatusFailed)
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, tenantstore.ErrStatusConflict) || errors.Is(err, tenantstore.ErrNotFound) {
+		r.Log.Warn().Str("tenant_id", t.Row.ID.String()).Msg("tenant is no longer this run's to fail")
+		return false
+	}
+	r.Log.Error().Err(err).Str("tenant_id", t.Row.ID.String()).Msg("mark tenant failed")
+	return false
+}
+
+// record appends an event on its own bookkeeping deadline, for the writes
+// that stand alone.
+func (r *Runner) record(ctx context.Context, t *Tenant, step, status, message string, detail map[string]any) {
+	dctx, cancel := detached(ctx)
+	defer cancel()
+	r.recordIn(dctx, t, step, status, message, detail)
+}
+
+// recordIn appends an event under a deadline the caller owns; detail is
+// scrubbed before it is stored. A failure to write bookkeeping is logged,
+// not fatal: the step outcome has already happened and a retry will
+// re-derive it.
+func (r *Runner) recordIn(ctx context.Context, t *Tenant, step, status, message string, detail map[string]any) {
+	p := tenantstore.EventParams{TenantID: t.Row.ID, Step: step, Status: status, Message: message}
+	if detail != nil {
+		p.Detail = ScrubDetail(detail)
+	}
+	if _, err := r.Store.InsertEvent(ctx, t.Row.TeamID, p); err != nil {
+		r.Log.Error().Err(err).Str("tenant_id", t.Row.ID.String()).Str("step", step).Str("status", status).Msg("record tenant event")
+	}
+}
+
+// detached keeps ctx's values but not its cancellation, bounded so a dead
+// database cannot hang a run forever.
+func detached(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), bookkeepingTimeout)
+}
+
+// RecordSetupFailure is for the job entrypoint: the run never started
+// because a dependency could not be built, so the tenant the API queued is
+// moved back to failed (with the mode, so a retry resumes the same plan).
+func RecordSetupFailure(ctx context.Context, store tenantstore.Store, log zerolog.Logger, teamID, tenantID uuid.UUID, mode Mode, attempt int64, cause error) {
+	dctx, cancel := detached(ctx)
+	defer cancel()
+	// Under the tenant lock, like a run: if a replacement run already holds
+	// it, it owns the status now and this failure is moot.
+	release, err := store.Lock(dctx, teamID, tenantID)
+	if err != nil {
+		if !errors.Is(err, tenantstore.ErrLocked) {
+			log.Error().Str("error", ScrubString(err.Error())).Str("tenant_id", tenantID.String()).Msg("lock tenant to record setup failure")
+		}
+		return
+	}
+	defer release()
+	// As in Run: an execution whose attempt has been superseded owns
+	// nothing, and must not mark the replacement failed.
+	if attempt > 0 {
+		events, lerr := store.ListEvents(dctx, teamID, tenantID)
+		if lerr != nil {
+			log.Error().Str("error", ScrubString(lerr.Error())).Str("tenant_id", tenantID.String()).Msg("read events to record setup failure")
+			return
+		}
+		if newest := newestAttempt(events); newest != attempt {
+			log.Info().Int64("attempt", attempt).Int64("newest", newest).Msg("a later attempt owns this tenant; not recording this setup failure")
+			return
+		}
+	}
+	inFlight := tenantstore.StatusProvisioning
+	if mode == ModeDeprovision {
+		inFlight = tenantstore.StatusDeprovisioning
+	}
+	row, err := store.TransitionStatus(dctx, teamID, tenantID, []string{inFlight}, tenantstore.StatusFailed)
+	if err != nil {
+		log.Error().Str("error", ScrubString(err.Error())).Str("tenant_id", tenantID.String()).Msg("record setup failure")
+		return
+	}
+	t := NewTenant(row, Env{}, store)
+	r := &Runner{Store: store, Log: log}
+	r.record(dctx, t, RunStep, tenantstore.EventFailed, failureMessage(mode, "startup"), map[string]any{"mode": string(mode), "error": cause.Error()})
+}

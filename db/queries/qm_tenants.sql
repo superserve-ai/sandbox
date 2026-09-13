@@ -105,3 +105,36 @@ DELETE FROM qm.tenant_secrets
 WHERE name = sqlc.arg(name) AND tenant_id = (
     SELECT id FROM qm.tenants WHERE id = sqlc.arg(tenant_id) AND status <> 'deleted' FOR SHARE
 );
+
+-- name: TransitionQMTenantStatus :one
+-- Compare-and-set: moves the tenant to a new status only from one of the
+-- expected ones, so two racing requests (delete vs retry) cannot both win.
+-- deleted stays terminal regardless of the expected list.
+UPDATE qm.tenants
+SET status = sqlc.arg(status), updated_at = now()
+WHERE id = $1 AND team_id = $2
+  AND status <> 'deleted'
+  AND status = ANY(sqlc.arg(from_statuses)::text[])
+RETURNING *;
+
+-- name: RevokeQMTenantSandboxKey :one
+-- Revokes the tenant's sandbox API key through the definer function that
+-- stands in for the api_key UPDATE qm_api does not have. Returns whether
+-- the tenant referenced a key; already-revoked keys are a no-op.
+SELECT qm.revoke_tenant_api_key(sqlc.arg(tenant_id)) AS revoked;
+
+-- name: TransitionQMTenantStatusIfUnchanged :one
+-- TransitionQMTenantStatus with an optimistic check on the row's version.
+-- Two generations of the same operation share a status — a provision whose
+-- trigger went quiet and the retry that replaced it are both
+-- 'provisioning' — so bookkeeping that must not clobber a newer attempt
+-- keys on the writes the row has taken instead: updated_at moves on every
+-- status write and event_seq on every event.
+UPDATE qm.tenants
+SET status = sqlc.arg(status), updated_at = now()
+WHERE id = $1 AND team_id = $2
+  AND status <> 'deleted'
+  AND status = ANY(sqlc.arg(from_statuses)::text[])
+  AND updated_at = sqlc.arg(expected_updated_at)
+  AND event_seq = sqlc.arg(expected_event_seq)
+RETURNING *;

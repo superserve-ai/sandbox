@@ -7,6 +7,7 @@ package db
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -50,6 +51,61 @@ func (q *Queries) InsertQMTenantEvent(ctx context.Context, arg InsertQMTenantEve
 		arg.Message,
 		arg.Detail,
 		arg.TenantID,
+	)
+	var i QmTenantEvent
+	err := row.Scan(
+		&i.ID,
+		&i.TenantID,
+		&i.Step,
+		&i.Status,
+		&i.Message,
+		&i.Detail,
+		&i.Seq,
+		&i.At,
+	)
+	return i, err
+}
+
+const insertQMTenantEventIfUnchanged = `-- name: InsertQMTenantEventIfUnchanged :one
+WITH live AS (
+    UPDATE qm.tenants t
+    SET event_seq = t.event_seq + 1
+    WHERE t.id = $5 AND t.status <> 'deleted'
+      AND t.updated_at = $6
+      AND t.event_seq = $7
+    RETURNING t.id, t.event_seq
+)
+INSERT INTO qm.tenant_events (tenant_id, step, status, message, detail, seq)
+SELECT live.id, $1::text, $2::text, $3::text, $4::jsonb, live.event_seq
+FROM live
+RETURNING id, tenant_id, step, status, message, detail, seq, at
+`
+
+type InsertQMTenantEventIfUnchangedParams struct {
+	Step              string    `json:"step"`
+	Status            string    `json:"status"`
+	Message           *string   `json:"message"`
+	Detail            []byte    `json:"detail"`
+	TenantID          uuid.UUID `json:"tenant_id"`
+	ExpectedUpdatedAt time.Time `json:"expected_updated_at"`
+	ExpectedEventSeq  int64     `json:"expected_event_seq"`
+}
+
+// InsertQMTenantEvent with the row's version in the same statement, so the
+// check and the write cannot be separated. An outcome event from a request
+// that has been superseded would otherwise advance event_seq past the
+// version its replacement holds, and the replacement's own bookkeeping
+// would then decline to touch the tenant it owns. No row means the tenant
+// is retired, or has moved on.
+func (q *Queries) InsertQMTenantEventIfUnchanged(ctx context.Context, arg InsertQMTenantEventIfUnchangedParams) (QmTenantEvent, error) {
+	row := q.db.QueryRow(ctx, insertQMTenantEventIfUnchanged,
+		arg.Step,
+		arg.Status,
+		arg.Message,
+		arg.Detail,
+		arg.TenantID,
+		arg.ExpectedUpdatedAt,
+		arg.ExpectedEventSeq,
 	)
 	var i QmTenantEvent
 	err := row.Scan(

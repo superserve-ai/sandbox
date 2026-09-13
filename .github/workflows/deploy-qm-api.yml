@@ -1,0 +1,369 @@
+# Deploy qm-api — hosted-QM control service and provisioner job (Cloud Run).
+#
+# One image serves both: the Cloud Run *service* answers /v1/qm, and the
+# Cloud Run *job* runs `qm-api provision` for one tenant per execution. The
+# job is updated before the service so a run triggered by the new service
+# never executes an older provisioner.
+#
+# The cloud provisioning steps (service account, database, bucket, service,
+# route, probes) are not implemented yet, and qm-api refuses to start
+# without QM_PROVISIONER_STUB=1 while that is true — so the environment
+# that first sets QM_API_SERVICE has to set the stub flag with it.
+#
+# Triggers mirror deploy-api.yml: a push to main on qm-api paths runs
+# staging, then production; a dispatch for production still runs staging
+# first. Each environment's deploy steps skip until its QM_API_SERVICE
+# variable is set, so this workflow can merge ahead of the Terraform that
+# creates the service and job. The check is a step, not a job-level `if`:
+# environment-scoped variables are only resolved once the job has entered
+# its environment.
+
+name: Deploy QM API
+
+# One deploy at a time, never cancelled mid-rollout: with runs serialized
+# GitHub keeps only the newest pending run, so an older push cannot overtake
+# a newer one while it waits on the migration gate and roll the service back.
+concurrency:
+  group: deploy-qm-api
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (staging always runs first)'
+        required: false
+        type: choice
+        options:
+          - staging
+          - production
+
+  push:
+    branches: [main]
+    paths:
+      # Every internal package the qm-api binary imports must be listed;
+      # the deploy-trigger-coverage CI check enforces this against
+      # `go list -deps ./cmd/qm-api`.
+      - 'cmd/qm-api/**'
+      - 'internal/db/**'
+      - 'internal/qm/**'
+      - 'internal/sentrylog/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile.qm-api'
+      - '.github/workflows/deploy-qm-api.yml'
+
+jobs:
+  # Deliberately identical to deploy-api.yml's gate, down to its limits (it
+  # inspects the pushed range, so it does not re-check a migration an
+  # earlier push left failing): the two services deploy against the same
+  # database, and a gate that differs between them is worse than one that
+  # is uniformly conservative. Change both together.
+  #
+  # A push that changes both migrations and code triggers CD — Migrate and
+  # this workflow with no ordering: if the new binary reaches Cloud Run
+  # before the migration applies, its queries (and the qm.resolve_api_key
+  # function every request authenticates through) do not exist yet and
+  # every call 500s until migrate-prod finishes. Gate the
+  # deploy on the same-SHA migrate run. Pushes that touch no migrations
+  # (the common case) pass through after one git diff.
+  wait-for-migrations:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Wait for same-SHA CD Migrate to succeed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "Manual dispatch — operator owns migration ordering; skipping gate."
+            exit 0
+          fi
+
+          # Diff the WHOLE pushed range, not just the tip commit — a
+          # multi-commit push can carry migrations in an earlier commit.
+          # An endpoint diff (before vs sha) is exactly "what changed on
+          # main since the last deployed tip", and works even for a force
+          # push where `before` is no longer an ancestor.
+          BEFORE="${{ github.event.before }}"
+          MIGRATIONS_CHANGED=unknown
+          if [ "$BEFORE" != "0000000000000000000000000000000000000000" ] &&
+             git fetch --quiet --depth=1 origin "$BEFORE" 2>/dev/null; then
+            if git diff --name-only "$BEFORE" HEAD | grep -q '^supabase/migrations/'; then
+              MIGRATIONS_CHANGED=yes
+            else
+              MIGRATIONS_CHANGED=no
+            fi
+          fi
+
+          if [ "$MIGRATIONS_CHANGED" = "no" ]; then
+            echo "No migration changes in ${BEFORE}..${{ github.sha }}; skipping gate."
+            exit 0
+          fi
+
+          # If the range couldn't be computed (unfetchable `before`), fall
+          # through to run-detection: CD Migrate triggers off this same
+          # push, so its run appears within seconds when migrations
+          # changed. A short grace window distinguishes "no run will ever
+          # exist" from "run pending" without blind-failing the deploy.
+          echo "migrations_changed=$MIGRATIONS_CHANGED — checking CD Migrate for ${{ github.sha }}"
+          # ~20 min budget (60 × 20s), then fail closed: a deploy against a
+          # missing column is worse than a late deploy.
+          for i in $(seq 1 60); do
+            run=$(gh api "repos/${{ github.repository }}/actions/workflows/cd.yml/runs?head_sha=${{ github.sha }}&event=push" \
+              --jq '.workflow_runs[0] | if . == null then "absent absent" else "\(.status) \(.conclusion // "pending")" end')
+            status=${run% *}; conclusion=${run#* }
+            echo "attempt $i: status=$status conclusion=$conclusion"
+            if [ "$status" = "absent" ] && [ "$MIGRATIONS_CHANGED" = "unknown" ] && [ "$i" -ge 6 ]; then
+              echo "No CD Migrate run appeared in ~2 min — push touched no migrations; proceeding."
+              exit 0
+            fi
+            if [ "$status" = "completed" ]; then
+              if [ "$conclusion" = "success" ]; then
+                echo "CD Migrate succeeded; proceeding."
+                exit 0
+              fi
+              echo "CD Migrate concluded '$conclusion' — refusing to deploy against an unmigrated schema."
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "Timed out waiting for CD Migrate; refusing to deploy."
+          exit 1
+
+  build-qm-api-image:
+    runs-on: ubuntu-latest
+    needs: [wait-for-migrations]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build qm-api binary
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/qm-api ./cmd/qm-api
+
+      - name: Build qm-api image
+        run: |
+          docker build --platform linux/amd64 -f Dockerfile.qm-api -t qm-api:${{ github.sha }} .
+          docker save qm-api:${{ github.sha }} | gzip > /tmp/qm-api-image.tar.gz
+
+      - name: Upload qm-api image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qm-api-image-${{ github.sha }}
+          path: /tmp/qm-api-image.tar.gz
+          if-no-files-found: error
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    needs: [build-qm-api-image]
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check the environment is configured for qm-api
+        id: gate
+        run: |
+          if [ -z "${{ vars.QM_API_SERVICE }}" ]; then
+            echo "::notice::QM_API_SERVICE is not set for this environment; skipping qm-api deploy."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.enabled == 'true'
+
+      - name: Authenticate to GCP
+        if: steps.gate.outputs.enabled == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: steps.gate.outputs.enabled == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Download prebuilt qm-api image
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: qm-api-image-${{ github.sha }}
+          path: /tmp
+
+      - name: Configure Docker
+        if: steps.gate.outputs.enabled == 'true'
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Load and push image
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          gzip -dc /tmp/qm-api-image.tar.gz | docker load
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/qm-api"
+          docker tag qm-api:${{ github.sha }} ${IMAGE}:latest
+          docker tag qm-api:${{ github.sha }} ${IMAGE}:${{ github.sha }}
+          docker push ${IMAGE}:latest
+          docker push ${IMAGE}:${{ github.sha }}
+
+      # Job first, then service: a run the new service triggers must never
+      # land on an older provisioner, while the old service triggering the
+      # new job is fine (the job's argument contract only grows).
+      - name: Deploy provisioner job, then service
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/qm-api:${{ github.sha }}"
+          REGION="${{ vars.QM_API_REGION || vars.GCP_REGION }}"
+          ARGS="--region $REGION --project ${{ vars.GCP_PROJECT }}"
+          JOB=${{ vars.QM_PROVISIONER_JOB || 'qm-provisioner' }}
+          # The region is set on both resources from the one the deploy is
+          # targeting: the service resolves the job by project, region and
+          # name, so a default that drifts from where the job actually lives
+          # makes every create and retry fail at the trigger.
+          ENV="QM_PROVISIONER_JOB=$JOB,QM_PROVISIONER_REGION=$REGION"
+          gcloud run jobs update "$JOB" --image "$IMAGE" --update-env-vars "$ENV" $ARGS
+          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" --update-env-vars "$ENV" $ARGS
+
+      - name: Route traffic to the new revision
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          SVC=${{ vars.QM_API_SERVICE }}
+          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          SERVING=$(echo "$DESC" | jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // "none"')
+          if [ "$SERVING" != "$LATEST" ]; then
+            echo "::warning::$SVC traffic was pinned to $SERVING (latest is $LATEST); auto-routing to latest — investigate the pin."
+          fi
+          gcloud run services update-traffic $SVC --to-latest $ARGS
+
+      - name: Verify latest revision serves traffic
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          SVC=${{ vars.QM_API_SERVICE }}
+          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          PCT=$(echo "$DESC" | jq --arg r "$LATEST" '[.status.traffic[]? | select(.revisionName == $r or .latestRevision == true) | .percent] | add // 0')
+          if [ "$PCT" != "100" ]; then
+            echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
+            exit 1
+          fi
+          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
+
+  deploy-production:
+    needs: [build-qm-api-image, deploy-staging]
+    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check the environment is configured for qm-api
+        id: gate
+        run: |
+          if [ -z "${{ vars.QM_API_SERVICE }}" ]; then
+            echo "::notice::QM_API_SERVICE is not set for this environment; skipping qm-api deploy."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.enabled == 'true'
+
+      - name: Authenticate to GCP
+        if: steps.gate.outputs.enabled == 'true'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        if: steps.gate.outputs.enabled == 'true'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Download prebuilt qm-api image
+        if: steps.gate.outputs.enabled == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: qm-api-image-${{ github.sha }}
+          path: /tmp
+
+      - name: Configure Docker
+        if: steps.gate.outputs.enabled == 'true'
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Load and push image
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          gzip -dc /tmp/qm-api-image.tar.gz | docker load
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/qm-api"
+          docker tag qm-api:${{ github.sha }} ${IMAGE}:latest
+          docker tag qm-api:${{ github.sha }} ${IMAGE}:${{ github.sha }}
+          docker push ${IMAGE}:latest
+          docker push ${IMAGE}:${{ github.sha }}
+
+      # Single cell: hosted QM runs alongside the primary control-plane cell
+      # and pulls the image cross-region from the shared Artifact Registry —
+      # so the region the service lives in is GCP_REGION_USE4 (as in
+      # deploy-api.yml), not the GCP_REGION the registry is addressed by.
+      # Job first, then service: a run the new service triggers must never
+      # land on an older provisioner, while the old service triggering the
+      # new job is fine (the job's argument contract only grows).
+      - name: Deploy provisioner job, then service
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/qm-api:${{ github.sha }}"
+          REGION="${{ vars.QM_API_REGION || vars.GCP_REGION_USE4 }}"
+          ARGS="--region $REGION --project ${{ vars.GCP_PROJECT }}"
+          JOB=${{ vars.QM_PROVISIONER_JOB || 'qm-provisioner' }}
+          # The region is set on both resources from the one the deploy is
+          # targeting: the service resolves the job by project, region and
+          # name, so a default that drifts from where the job actually lives
+          # makes every create and retry fail at the trigger.
+          ENV="QM_PROVISIONER_JOB=$JOB,QM_PROVISIONER_REGION=$REGION"
+          gcloud run jobs update "$JOB" --image "$IMAGE" --update-env-vars "$ENV" $ARGS
+          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" --update-env-vars "$ENV" $ARGS
+
+      - name: Route traffic to the new revision
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          SVC=${{ vars.QM_API_SERVICE }}
+          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          SERVING=$(echo "$DESC" | jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // "none"')
+          if [ "$SERVING" != "$LATEST" ]; then
+            echo "::warning::$SVC traffic was pinned to $SERVING (latest is $LATEST); auto-routing to latest — investigate the pin."
+          fi
+          gcloud run services update-traffic $SVC --to-latest $ARGS
+
+      - name: Verify latest revision serves traffic
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          SVC=${{ vars.QM_API_SERVICE }}
+          ARGS="--region ${{ vars.QM_API_REGION || vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }}"
+          DESC=$(gcloud run services describe $SVC $ARGS --format=json)
+          LATEST=$(echo "$DESC" | jq -r '.status.latestReadyRevisionName')
+          PCT=$(echo "$DESC" | jq --arg r "$LATEST" '[.status.traffic[]? | select(.revisionName == $r or .latestRevision == true) | .percent] | add // 0')
+          if [ "$PCT" != "100" ]; then
+            echo "::error::$SVC: latest revision $LATEST serving ${PCT}% (want 100); deploy is not live."
+            exit 1
+          fi
+          curl -sf "$(echo "$DESC" | jq -r '.status.url')/health"
