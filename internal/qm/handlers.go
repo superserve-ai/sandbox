@@ -185,9 +185,23 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 	// Guarded like the trigger's outcome: the retirement check above can
 	// observe a live tenant just before something else reclaims it, and an
 	// unconditional event would then move the row past the version the
-	// replacement holds. A dropped event leaves the version where it was,
-	// and the queue below conflicts, which is the right answer.
-	stored := h.eventIfMine(ctx, tenant, tenantstore.VersionOf(tenant), stepModelKey, tenantstore.EventOK, keyName+" stored", nil)
+	// replacement holds.
+	stored, serr := h.eventIfMine(ctx, tenant, tenantstore.VersionOf(tenant), stepModelKey, tenantstore.EventOK, keyName+" stored", nil)
+	switch {
+	case serr == nil:
+	case errors.Is(serr, tenantstore.ErrStatusConflict), errors.Is(serr, tenantstore.ErrNotFound):
+		// Something else took the tenant over; it owns what happens next.
+		respondError(c, http.StatusConflict, "The tenant's status changed; reload and try again.")
+		return
+	default:
+		// The run is not queued on a version that cannot be trusted: the
+		// tenant is left failed, which a retry resumes from — the key is
+		// stored and referenced, so the retry has everything it needs.
+		h.failTenant(ctx, tenant, tenantstore.VersionOf(tenant), []string{tenantstore.StatusProvisioning}, stepModelKey,
+			"The tenant could not be queued for provisioning. Retry it.", serr, nil)
+		respondError(c, http.StatusInternalServerError, internalErrorMsg)
+		return
+	}
 
 	queued, ok := h.queueRun(c, tenant, versionAfter(tenant, stored), []string{tenantstore.StatusProvisioning}, provisioner.ModeProvision)
 	if !ok {
@@ -608,13 +622,13 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 		// now would let a retry or delete race a run that is about to
 		// start, so it stays in flight; if no run ever reports progress
 		// the stale reclaim makes it retryable.
-		h.eventIfMine(ctx, updated, mine, stepTrigger, tenantstore.EventFailed,
+		_, _ = h.eventIfMine(ctx, updated, mine, stepTrigger, tenantstore.EventFailed,
 			"The "+string(mode)+" run's start could not be confirmed. If no progress follows, it becomes retryable after "+h.StaleAfter.String()+".",
 			map[string]any{"mode": string(mode), "error": err.Error(), "ambiguous": true})
 		respondError(c, http.StatusBadGateway, "The "+string(mode)+" run's start could not be confirmed; the tenant stays in progress. Check back shortly.")
 		return tenantstore.Tenant{}, false
 	}
-	h.eventIfMine(ctx, updated, mine, stepTrigger, tenantstore.EventOK, string(mode)+" run queued", detail)
+	_, _ = h.eventIfMine(ctx, updated, mine, stepTrigger, tenantstore.EventOK, string(mode)+" run queued", detail)
 	return updated, true
 }
 
@@ -624,7 +638,7 @@ func (h *Handlers) queueRun(c *gin.Context, tenant tenantstore.Tenant, at tenant
 // version past the one the replacement holds, and the replacement's own
 // bookkeeping would then decline to touch the tenant it owns. The check is
 // part of the insert, so nothing can land between the two.
-func (h *Handlers) eventIfMine(ctx context.Context, tenant tenantstore.Tenant, at tenantstore.Version, step, status, message string, detail map[string]any) tenantstore.Event {
+func (h *Handlers) eventIfMine(ctx context.Context, tenant tenantstore.Tenant, at tenantstore.Version, step, status, message string, detail map[string]any) (tenantstore.Event, error) {
 	p := tenantstore.EventParams{TenantID: tenant.ID, Step: step, Status: status, Message: message}
 	if detail != nil {
 		p.Detail = provisioner.ScrubDetail(detail)
@@ -634,13 +648,16 @@ func (h *Handlers) eventIfMine(ctx context.Context, tenant tenantstore.Tenant, a
 	e, err := h.Store.InsertEventIfUnchanged(dctx, tenant.TeamID, p, at)
 	switch {
 	case err == nil:
+		return e, nil
 	case errors.Is(err, tenantstore.ErrStatusConflict), errors.Is(err, tenantstore.ErrNotFound):
 		h.Log.Warn().Str("tenant_id", tenant.ID.String()).Str("step", step).
 			Msg("a later attempt owns this tenant; dropping this event")
 	default:
 		h.Log.Error().Err(err).Str("tenant_id", tenant.ID.String()).Str("step", step).Msg("record tenant event")
 	}
-	return e
+	// The zero event on any error: a commit that reported one may still
+	// have landed, and a seq the caller cannot verify is worse than none.
+	return tenantstore.Event{}, err
 }
 
 // abortQueue handles a queue attempt that failed before the run's intent

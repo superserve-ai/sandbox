@@ -126,12 +126,17 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode,
 			// remaining life before the write that actually matters, and a
 			// killed job would leave the tenant in flight.
 			dctx, cancel := detached(ctx)
-			r.setFailed(dctx, tenant, inFlight)
-			r.recordIn(dctx, tenant, step.Name(), tenantstore.EventFailed, step.Name()+" failed", map[string]any{"error": err.Error()})
-			for _, rest := range plan.Steps[i+1:] {
-				r.recordIn(dctx, tenant, rest.Name(), tenantstore.EventSkipped, "not run: "+step.Name()+" failed", nil)
+			// Nothing is recorded unless the tenant actually moved to
+			// failed: with it still in flight, these events would only
+			// postpone the stale reclaim that is now the one thing left to
+			// recover it.
+			if r.setFailed(dctx, tenant, inFlight) {
+				r.recordIn(dctx, tenant, step.Name(), tenantstore.EventFailed, step.Name()+" failed", map[string]any{"error": err.Error()})
+				for _, rest := range plan.Steps[i+1:] {
+					r.recordIn(dctx, tenant, rest.Name(), tenantstore.EventSkipped, "not run: "+step.Name()+" failed", nil)
+				}
+				r.recordIn(dctx, tenant, RunStep, tenantstore.EventFailed, failureMessage(mode, step.Name()), nil)
 			}
-			r.recordIn(dctx, tenant, RunStep, tenantstore.EventFailed, failureMessage(mode, step.Name()), nil)
 			cancel()
 			return err
 		}
@@ -140,13 +145,15 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode,
 	// The terminal transition is written detached from ctx: every step
 	// succeeded, and a cancellation now must not strand the tenant in an
 	// in-flight status. If the write still fails, fall back to failed so a
-	// retry (which re-runs the now-idempotent plan) can record it.
+	// retry (which re-runs the now-idempotent plan) can record it. One
+	// deadline covers the whole sequence, so a slow event write cannot
+	// leave no time for the status that follows it.
 	dctx, cancel := detached(ctx)
 	defer cancel()
 	if mode == ModeDeprovision {
 		// Last words first: a deleted tenant's event log is frozen, so the
 		// completion event has to land before the status flips.
-		r.record(dctx, tenant, RunStep, tenantstore.EventOK, "deprovision complete; tenant deleted", nil)
+		r.recordIn(dctx, tenant, RunStep, tenantstore.EventOK, "deprovision complete; tenant deleted", nil)
 		if _, err := r.Store.SoftDelete(dctx, teamID, tenantID); err != nil && !r.settled(dctx, teamID, tenantID, tenantstore.StatusDeleted) {
 			log.Error().Err(err).Msg("record tenant deleted")
 			r.fail(dctx, tenant, tenantstore.StatusDeprovisioning, "Deprovisioning finished but the tenant could not be marked deleted. Retry to record it.")
@@ -159,7 +166,7 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode,
 		r.fail(dctx, tenant, tenantstore.StatusProvisioning, "Provisioning finished but the tenant could not be marked ready. Retry to record it.")
 		return fmt.Errorf("mark tenant ready: %w", err)
 	}
-	r.record(dctx, tenant, RunStep, tenantstore.EventOK, "provision complete; tenant ready", nil)
+	r.recordIn(dctx, tenant, RunStep, tenantstore.EventOK, "provision complete; tenant ready", nil)
 	return nil
 }
 
