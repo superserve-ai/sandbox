@@ -200,6 +200,36 @@ func (q *Queries) IsQMSlugAvailable(ctx context.Context, candidate string) (bool
 	return available, err
 }
 
+const issueQMTenantSandboxKey = `-- name: IssueQMTenantSandboxKey :one
+SELECT qm.issue_tenant_api_key(
+    $1, $2, $3, $4::text[]
+) AS key_id
+`
+
+type IssueQMTenantSandboxKeyParams struct {
+	TenantID  uuid.UUID `json:"tenant_id"`
+	KeyHash   string    `json:"key_hash"`
+	KeyName   string    `json:"key_name"`
+	KeyScopes []string  `json:"key_scopes"`
+}
+
+// Mints the tenant's Superserve API key through the definer function that
+// stands in for the api_key INSERT qm_api does not have, and points the
+// tenant row at it in the same statement so a live key can never end up
+// unreferenced. Returns the key and whether this call created it; a tenant
+// that already has one gets that one back, so a retried provision is safe.
+func (q *Queries) IssueQMTenantSandboxKey(ctx context.Context, arg IssueQMTenantSandboxKeyParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, issueQMTenantSandboxKey,
+		arg.TenantID,
+		arg.KeyHash,
+		arg.KeyName,
+		arg.KeyScopes,
+	)
+	var key_id uuid.UUID
+	err := row.Scan(&key_id)
+	return key_id, err
+}
+
 const listQMTenantSecretRefs = `-- name: ListQMTenantSecretRefs :many
 SELECT tenant_id, name, secret_ref FROM qm.tenant_secrets
 WHERE tenant_id = $1
