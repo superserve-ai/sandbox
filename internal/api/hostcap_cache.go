@@ -165,18 +165,13 @@ func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabiliti
 		gen = h.Hosts.Generation(params.HostID) // before the read, so a reclaim during it is caught
 	}
 	qctx, cancel := context.WithTimeout(ctx, hostCapQueryTimeout)
-	var row db.HostHasCapabilitiesUnlockedRow
-	var err error
+	params.AllowedStatuses = []string{"active"}
+	params.HeartbeatAfter = pgtype.Timestamptz{}
 	if scope == ownerResumeCapabilities {
-		owner, ownerErr := h.DB.OwnerHasResumeCapabilitiesUnlocked(qctx, db.OwnerHasResumeCapabilitiesUnlockedParams{
-			HostID: params.HostID, RequiredCapabilities: params.RequiredCapabilities,
-			HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},
-		})
-		row = db.HostHasCapabilitiesUnlockedRow(owner)
-		err = ownerErr
-	} else {
-		row, err = h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+		params.AllowedStatuses = []string{"active", "draining"}
+		params.HeartbeatAfter = pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true}
 	}
+	row, err := h.DB.HostHasCapabilitiesUnlocked(qctx, params)
 	cancel()
 	if err != nil {
 		return false, err

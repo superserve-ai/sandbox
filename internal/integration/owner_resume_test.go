@@ -55,20 +55,26 @@ func TestIntegration_OwnerResumeCapabilities(t *testing.T) {
 					exec(`UPDATE host SET last_heartbeat_at=NULL WHERE id=$1`)
 				}
 				want := (state == "active" || state == "draining") && (freshness == "current" || freshness == "fresh-near-cutoff")
-				locked, err := testQueries.OwnerHasResumeCapabilities(ctx, db.OwnerHasResumeCapabilitiesParams{HostID: hostID, RequiredCapabilities: required, HeartbeatAfter: cutoff})
+				locked, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{AllowedStatuses: []string{"active", "draining"}, HostID: hostID, RequiredCapabilities: required, HeartbeatAfter: cutoff})
 				if err != nil || locked != want {
 					t.Fatalf("locked=%v, err=%v, want %v", locked, err, want)
 				}
-				unlocked, err := testQueries.OwnerHasResumeCapabilitiesUnlocked(ctx, db.OwnerHasResumeCapabilitiesUnlockedParams{HostID: hostID, RequiredCapabilities: required, HeartbeatAfter: cutoff})
+				unlocked, err := testQueries.HostHasCapabilitiesUnlocked(ctx, db.HostHasCapabilitiesUnlockedParams{AllowedStatuses: []string{"active", "draining"}, HostID: hostID, RequiredCapabilities: required, HeartbeatAfter: cutoff})
 				if err != nil || unlocked.HasCapabilities != want {
 					t.Fatalf("unlocked=%+v, err=%v, want %v", unlocked, err, want)
 				}
 				if want && unlocked.VmdAddr != "localhost:0" {
 					t.Fatalf("owner address=%q", unlocked.VmdAddr)
 				}
-				active, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{HostID: hostID, RequiredCapabilities: required})
+				active, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{AllowedStatuses: []string{"active"}, HostID: hostID, RequiredCapabilities: required})
 				if err != nil || active != (state == "active" && (freshness == "current" || freshness == "expired" || freshness == "at-cutoff" || freshness == "fresh-near-cutoff")) {
 					t.Fatalf("active-only=%v, err=%v", active, err)
+				}
+				activeUnlocked, err := testQueries.HostHasCapabilitiesUnlocked(ctx, db.HostHasCapabilitiesUnlockedParams{
+					AllowedStatuses: []string{"active"}, HostID: hostID, RequiredCapabilities: required,
+				})
+				if err != nil || activeUnlocked.HasCapabilities != active {
+					t.Fatalf("active-only unlocked=%+v, err=%v, want %v", activeUnlocked, err, active)
 				}
 				hosts, err := testQueries.ListActiveHosts(ctx)
 				if err != nil {
@@ -95,7 +101,7 @@ func TestIntegration_OwnerResumeCapabilities(t *testing.T) {
 			})
 		}
 	}
-	missing, err := testQueries.OwnerHasResumeCapabilities(ctx, db.OwnerHasResumeCapabilitiesParams{HostID: "missing-owner", RequiredCapabilities: required, HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true}})
+	missing, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{AllowedStatuses: []string{"active", "draining"}, HostID: "missing-owner", RequiredCapabilities: required, HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-2 * time.Minute), Valid: true}})
 	if err != nil || missing {
 		t.Fatalf("missing owner=%v, err=%v", missing, err)
 	}

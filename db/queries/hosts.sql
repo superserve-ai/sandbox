@@ -115,7 +115,7 @@ WHERE hc.host_id = sqlc.arg(host_id)
   AND NOT (hc.capability = ANY(COALESCE(sqlc.arg(capabilities)::text[], ARRAY[]::text[])));
 
 -- name: HostHasCapabilities :one
--- Lock the one active host row whose heartbeat anchors this capability set.
+-- Lock the one eligible host row whose heartbeat anchors this capability set.
 -- Callers that run this in a mutation transaction keep the host stable until
 -- VMD delivery and commit, while the relational division below proves that
 -- every requested capability belongs to that exact heartbeat.
@@ -123,8 +123,10 @@ WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
   FROM host
   WHERE id = sqlc.arg('host_id')
-    AND status = 'active'
+    AND status = ANY(sqlc.arg('allowed_statuses')::text[])
     AND last_heartbeat_at IS NOT NULL
+    AND (sqlc.narg('heartbeat_after')::timestamptz IS NULL
+         OR last_heartbeat_at > sqlc.narg('heartbeat_after'))
   FOR SHARE
 )
 SELECT EXISTS (
@@ -149,78 +151,16 @@ SELECT EXISTS (
 -- from serializing behind the host's heartbeat writer. Transactional callers
 -- that must pin the host across a commit use HostHasCapabilities.
 --
--- Also returns the host's VMD address (empty when the host is not active),
+-- Also returns the host's VMD address (empty when the host is ineligible),
 -- so the caller can record this read as the registry's address verification.
 WITH target_host AS MATERIALIZED (
   SELECT id, vmd_addr, last_heartbeat_at
   FROM host
   WHERE id = sqlc.arg('host_id')
-    AND status = 'active'
+    AND status = ANY(sqlc.arg('allowed_statuses')::text[])
     AND last_heartbeat_at IS NOT NULL
-)
-SELECT
-  EXISTS (
-    SELECT 1
-    FROM target_host h
-    WHERE NOT EXISTS (
-      SELECT 1
-      FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
-      WHERE NOT EXISTS (
-        SELECT 1
-        FROM host_capability hc
-        WHERE hc.host_id = h.id
-          AND hc.capability = required.capability
-          AND hc.heartbeat_at = h.last_heartbeat_at
-      )
-    )
-  ) AS has_capabilities,
-  COALESCE((SELECT vmd_addr FROM target_host), '')::text AS vmd_addr;
-
--- name: OwnerHasResumeCapabilities :one
--- Lock the recorded serving owner row whose heartbeat anchors this capability set.
--- Callers that run this in a mutation transaction keep the host stable until
--- VMD delivery and commit, while the relational division below proves that
--- every requested capability belongs to that exact heartbeat.
-WITH target_host AS MATERIALIZED (
-  SELECT id, last_heartbeat_at
-  FROM host
-  WHERE id = sqlc.arg('host_id')
-    AND status IN ('active', 'draining')
-    AND last_heartbeat_at IS NOT NULL
-    AND last_heartbeat_at > sqlc.arg('heartbeat_after')
-  FOR SHARE
-)
-SELECT EXISTS (
-  SELECT 1
-  FROM target_host h
-  WHERE NOT EXISTS (
-    SELECT 1
-    FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
-    WHERE NOT EXISTS (
-      SELECT 1
-      FROM host_capability hc
-      WHERE hc.host_id = h.id
-        AND hc.capability = required.capability
-        AND hc.heartbeat_at = h.last_heartbeat_at
-    )
-  )
-);
-
--- name: OwnerHasResumeCapabilitiesUnlocked :one
--- OwnerHasResumeCapabilities without the row lock, for standalone pre-flight reads
--- outside a mutation transaction: omitting the lock keeps concurrent checks
--- from serializing behind the host's heartbeat writer. Transactional callers
--- that must pin the host across a commit use OwnerHasResumeCapabilities.
---
--- Also returns the host's VMD address (empty when the owner is not serving),
--- so the caller can record this read as the registry's address verification.
-WITH target_host AS MATERIALIZED (
-  SELECT id, vmd_addr, last_heartbeat_at
-  FROM host
-  WHERE id = sqlc.arg('host_id')
-    AND status IN ('active', 'draining')
-    AND last_heartbeat_at IS NOT NULL
-    AND last_heartbeat_at > sqlc.arg('heartbeat_after')
+    AND (sqlc.narg('heartbeat_after')::timestamptz IS NULL
+         OR last_heartbeat_at > sqlc.narg('heartbeat_after'))
 )
 SELECT
   EXISTS (

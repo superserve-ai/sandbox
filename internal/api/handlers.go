@@ -919,12 +919,6 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			revertToPaused()
 			return "", false
 		}
-		if capabilityErr := validateOwnerResumePolicyCapabilities(c.Request.Context(), h.DB, sandbox.HostID, resumePolicy); capabilityErr != nil {
-			markRevert()
-			revertToPaused()
-			h.handlePreviewMutationResult(c, sandboxID, "ValidatePreviewCapabilitiesForResume", capabilityErr)
-			return "", false
-		}
 	}
 	resumeVMDAccess := resumePolicy.vmdAccess()
 

@@ -1204,7 +1204,7 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 				return sandboxRow(sb)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPublic, 8)
-			case (strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one") || strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one")):
+			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: ClaimResume :one"):
 				return claimResumeRow(sb, &snap, preview.AccessPublic, 7, publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
@@ -1281,7 +1281,7 @@ func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(
 				return sandboxRow(sb)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPrivate, 8)
-			case (strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one") || strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one")):
+			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
 				capabilityRequirements = append(capabilityRequirements, append([]string(nil), args[0].([]string)...))
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
@@ -4368,10 +4368,9 @@ func TestPlaceCreateDoesNotRecheckAnUnchangedReselection(t *testing.T) {
 	}
 }
 
-// A resume the host capability gate refuses never reaches the daemon and
-// reverts the claim; the revert carries no deadline because the claim leaves
-// it on the row, so retrying the refused resume cannot postpone auto-delete.
-func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.T) {
+// Preflight refusal avoids dispatch without postponing auto-delete;
+// capability loss during boot re-pauses the VM before activation.
+func TestResumeSandbox_CapabilityRefusalRevertsBeforeActivation(t *testing.T) {
 	for _, preflightPasses := range []bool{false, true} {
 		t.Run(fmt.Sprintf("preflight-passes=%v", preflightPasses), func(t *testing.T) {
 			sandboxID := uuid.New()
@@ -4385,17 +4384,23 @@ func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.
 			}
 
 			lockedChecks := 0
+			finalizedPause := false
 			var reverted []any
 			mock := &mockDBTX{
 				queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 					switch {
 					case strings.Contains(sql, "-- name: ClaimResume :one"):
 						return claimResumeRow(sb, &snap, preview.AccessPublic, 3)
-					case strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one"):
+					case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
 						return scalarBoolRow(preflightPasses)
-					case strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one"):
+					case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
 						lockedChecks++
 						return scalarBoolRow(false)
+					case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+						return previewPolicyRow(preview.AccessPublic, 3)
+					case strings.Contains(sql, "FinalizePause"):
+						finalizedPause = true
+						return uuidRow(snapshotID)
 					case strings.Contains(sql, "FROM sandbox"):
 						return sandboxRow(sb)
 					default:
@@ -4413,10 +4418,20 @@ func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.
 				},
 			}
 			reached := false
-			vmd := &stubVMD{resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
-				reached = true
-				return "10.0.0.2", nil
-			}}
+			paused := false
+			vmd := &stubVMD{
+				resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
+					if lockedChecks != 0 {
+						t.Fatalf("locked capability checks before dispatch = %d, want 0", lockedChecks)
+					}
+					reached = true
+					return "192.0.2.2", nil
+				},
+				pauseFn: func(context.Context, string, string) (string, string, error) {
+					paused = true
+					return snap.Path, "/snapshots/test/mem.snap", nil
+				},
+			}
 			h := &Handlers{VMD: vmd, DB: db.New(mock)}
 			w := httptest.NewRecorder()
 			setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
@@ -4424,10 +4439,13 @@ func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.
 			if w.Code != http.StatusConflict {
 				t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusConflict, w.Body.String())
 			}
-			if reached {
-				t.Fatal("refused resume reached the daemon")
+			if reached != preflightPasses || paused != preflightPasses {
+				t.Fatalf("reached=%v paused=%v, want both %v", reached, paused, preflightPasses)
 			}
-			if len(reverted) != 2 {
+			if finalizedPause != preflightPasses {
+				t.Fatalf("finalized pause = %v, want %v", finalizedPause, preflightPasses)
+			}
+			if !preflightPasses && len(reverted) != 2 {
 				t.Fatalf("revert args = %v, want id and team only", reverted)
 			}
 			wantLockedChecks := 0
@@ -4530,7 +4548,7 @@ func TestResumeSandbox_AttestationDecidesReapply(t *testing.T) {
 					switch {
 					case strings.Contains(sql, "-- name: ClaimResume :one"):
 						return claimResumeRow(sb, &snap, preview.AccessPublic, 7, publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
-					case strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one") || strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one"):
+					case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
 						return scalarBoolRow(true)
 					case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 						policyReads++
@@ -4754,7 +4772,7 @@ func TestActivateSandbox_ReportsPolicyTheDaemonKept(t *testing.T) {
 			switch {
 			case strings.Contains(sql, "-- name: ClaimResume :one"):
 				return claimResumeRow(sb, &snap, preview.AccessPublic, 7)
-			case strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one") || strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one"):
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPrivate, 9)
@@ -4820,9 +4838,9 @@ func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *test
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
-			case strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one"):
+			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
 				return scalarBoolRow(true)
-			case strings.Contains(sql, "-- name: OwnerHasResumeCapabilities :one"):
+			case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
 				lockedChecks++
 				return scalarBoolRow(lockedChecks == 1)
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):

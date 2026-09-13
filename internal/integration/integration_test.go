@@ -170,7 +170,8 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 	}
 
 	capable, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: testDefaultHostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
+		AllowedStatuses: []string{"active"},
+		HostID:          testDefaultHostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
 	})
 	if err != nil {
 		return fmt.Errorf("verify preview capability: %w", err)
@@ -184,7 +185,8 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) {
 	ctx := context.Background()
 	missing, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: "missing-host-" + uuid.New().String()[:8],
+		AllowedStatuses: []string{"active"},
+		HostID:          "missing-host-" + uuid.New().String()[:8],
 		RequiredCapabilities: []string{
 			preview.HostCapabilityPorts,
 		},
@@ -216,7 +218,8 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 	}
 	hasCapability := func() bool {
 		got, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-			HostID: hostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
+			AllowedStatuses: []string{"active"},
+			HostID:          hostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
 		})
 		if err != nil {
 			t.Fatalf("check capability: %v", err)
@@ -227,7 +230,8 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 		t.Fatal("current capability on active host was not recognized")
 	}
 	batch, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: hostID,
+		AllowedStatuses: []string{"active"},
+		HostID:          hostID,
 		RequiredCapabilities: []string{
 			preview.HostCapabilityPorts,
 			preview.HostCapabilityPortAccess,

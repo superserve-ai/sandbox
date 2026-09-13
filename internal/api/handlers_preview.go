@@ -280,7 +280,8 @@ func (h *Handlers) applyPreviewMutationValidated(ctx context.Context, sandboxID,
 
 func validateHostPreviewCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
 	ok, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: hostID, RequiredCapabilities: capabilities,
+		AllowedStatuses: []string{"active"},
+		HostID:          hostID, RequiredCapabilities: capabilities,
 	})
 	if err != nil {
 		return err
@@ -298,8 +299,9 @@ func validateOwnerResumeBrowserCapabilities(ctx context.Context, q *db.Queries, 
 }
 
 func validateOwnerResumeCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
-	ok, err := q.OwnerHasResumeCapabilities(ctx, db.OwnerHasResumeCapabilitiesParams{
-		HostID: hostID, RequiredCapabilities: capabilities,
+	ok, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+		AllowedStatuses: []string{"active", "draining"},
+		HostID:          hostID, RequiredCapabilities: capabilities,
 		HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},
 	})
 	if err != nil {

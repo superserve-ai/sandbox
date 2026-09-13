@@ -314,7 +314,7 @@ func TestHostCapCacheSeparatesOwnerResumeEligibility(t *testing.T) {
 	t.Setenv("HOST_CAPABILITY_CACHE_TTL", "10s")
 	var ownerReads, activeReads int
 	h := &Handlers{DB: db.New(&mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-		owner := strings.Contains(sql, "-- name: OwnerHasResumeCapabilitiesUnlocked :one")
+		owner := reflect.DeepEqual(args[2], []string{"active", "draining"})
 		if owner {
 			ownerReads++
 		} else {
@@ -347,41 +347,60 @@ func TestHostCapCacheSeparatesOwnerResumeEligibility(t *testing.T) {
 	}
 }
 
-func TestOwnerResumeCapabilityHeartbeatCutoff(t *testing.T) {
-	for _, unlocked := range []bool{false, true} {
-		t.Run(fmt.Sprintf("unlocked=%v", unlocked), func(t *testing.T) {
-			before := time.Now().Add(-heartbeatTimeout)
-			reads := 0
-			h := &Handlers{DB: db.New(&mockDBTX{queryRowFn: func(_ context.Context, _ string, args ...any) pgx.Row {
-				reads++
-				cutoff, ok := args[2].(pgtype.Timestamptz)
-				if !ok || !cutoff.Valid || cutoff.Time.Before(before) || cutoff.Time.After(time.Now().Add(-heartbeatTimeout)) {
-					t.Fatalf("heartbeat cutoff=%+v, want current heartbeat timeout", args[2])
-				}
-				return &mockRow{scanFn: func(dest ...any) error {
-					*(dest[0].(*bool)) = false
-					if unlocked {
-						*(dest[1].(*string)) = ""
+func TestHostCapabilityScopeParameters(t *testing.T) {
+	for _, owner := range []bool{false, true} {
+		for _, unlocked := range []bool{false, true} {
+			t.Run(fmt.Sprintf("owner=%v/unlocked=%v", owner, unlocked), func(t *testing.T) {
+				before := time.Now().Add(-heartbeatTimeout)
+				reads := 0
+				h := &Handlers{DB: db.New(&mockDBTX{queryRowFn: func(_ context.Context, _ string, args ...any) pgx.Row {
+					reads++
+					statuses := []string{"active"}
+					if owner {
+						statuses = append(statuses, "draining")
 					}
-					return nil
-				}}
-			}})}
-			registry := &verifyRecorder{}
-			h.Hosts = registry
-			if unlocked {
-				has, err := h.readHostCaps(context.Background(), db.HostHasCapabilitiesUnlockedParams{
-					HostID: "owner", RequiredCapabilities: previewBrowserCapabilities(),
-				}, ownerResumeCapabilities)
-				if err != nil || has {
-					t.Fatalf("capabilities=%v, err=%v, want rejection", has, err)
+					if !reflect.DeepEqual(args[2], statuses) {
+						t.Fatalf("allowed statuses=%v, want %v", args[2], statuses)
+					}
+					cutoff, ok := args[3].(pgtype.Timestamptz)
+					if !ok || cutoff.Valid != owner || (owner && (cutoff.Time.Before(before) || cutoff.Time.After(time.Now().Add(-heartbeatTimeout)))) {
+						t.Fatalf("heartbeat cutoff=%+v, owner=%v", args[3], owner)
+					}
+					return &mockRow{scanFn: func(dest ...any) error {
+						*(dest[0].(*bool)) = false
+						if unlocked {
+							*(dest[1].(*string)) = ""
+						}
+						return nil
+					}}
+				}})}
+				registry := &verifyRecorder{}
+				h.Hosts = registry
+				scope := activeHostCapabilities
+				if owner {
+					scope = ownerResumeCapabilities
 				}
-			} else if err := validateOwnerResumeBrowserCapabilities(context.Background(), h.DB, "owner"); err == nil {
-				t.Fatal("expected owner capability rejection")
-			}
-			if reads != 1 || len(registry.verified) != 0 {
-				t.Fatalf("reads=%d, address verifications=%v", reads, registry.verified)
-			}
-		})
+				if unlocked {
+					has, err := h.readHostCaps(context.Background(), db.HostHasCapabilitiesUnlockedParams{
+						HostID: "owner", RequiredCapabilities: previewBrowserCapabilities(),
+					}, scope)
+					if err != nil || has {
+						t.Fatalf("capabilities=%v, err=%v, want rejection", has, err)
+					}
+				} else {
+					validate := validateHostPreviewCapabilities
+					if owner {
+						validate = validateOwnerResumeCapabilities
+					}
+					if err := validate(context.Background(), h.DB, "owner", previewBrowserCapabilities()...); err == nil {
+						t.Fatal("expected capability rejection")
+					}
+				}
+				if reads != 1 || len(registry.verified) != 0 {
+					t.Fatalf("reads=%d, address verifications=%v", reads, registry.verified)
+				}
+			})
+		}
 	}
 }
 
