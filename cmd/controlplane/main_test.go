@@ -194,3 +194,35 @@ func TestStreamBuildLogs_NoRetryOnOtherCodes(t *testing.T) {
 		t.Fatalf("expected 1 open, got %d", fake.opens)
 	}
 }
+
+func TestAdmissionRefusalDoesNotRetryOrInvalidateHealthyHost(t *testing.T) {
+	calls := 0
+	dead := 0
+	refusal := vmdclient.AdmissionRefused(grpccodes.Unavailable, "draining")
+	invoker := func(context.Context, string, any, any, *grpc.ClientConn, ...grpc.CallOption) error {
+		calls++
+		return refusal
+	}
+	retry := retryUnavailableUnaryInterceptor(time.Second)
+	err := deadHostUnaryInterceptor(func() { dead++ })(context.Background(), "restore", nil, nil, nil, func(ctx context.Context, m string, req, reply any, cc *grpc.ClientConn, opts ...grpc.CallOption) error {
+		return retry(ctx, m, req, reply, cc, invoker, opts...)
+	})
+	if !vmdclient.IsAdmissionRefusal(err) || calls != 1 || dead != 0 {
+		t.Fatal("admission treated as transport outage", err, calls, dead)
+	}
+}
+
+func TestPriorTransportRetryRemovesPreBootProof(t *testing.T) {
+	calls := 0
+	invoker := func(context.Context, string, any, any, *grpc.ClientConn, ...grpc.CallOption) error {
+		calls++
+		if calls == 1 {
+			return grpcstatus.Error(grpccodes.Unavailable, "lost reply")
+		}
+		return vmdclient.AdmissionRefused(grpccodes.Unavailable, "closed")
+	}
+	err := retryUnavailableUnaryInterceptor(time.Second)(context.Background(), "restore", nil, nil, nil, invoker)
+	if err == nil || vmdclient.IsAdmissionRefusal(err) || calls != 2 {
+		t.Fatal("ambiguous history authorized another host", err, calls)
+	}
+}

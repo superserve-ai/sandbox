@@ -1,8 +1,12 @@
 package vm
 
 import (
+	"context"
+	"fmt"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -48,5 +52,25 @@ func TestReconstructAdmissionSucceedsWithNoStore(t *testing.T) {
 	m := &Manager{log: zerolog.Nop(), admission: admission.NewGate(true, 10)}
 	if err := m.reconstructAdmission(); err != nil {
 		t.Fatalf("reconstruction failed with no store configured: %v", err)
+	}
+}
+
+func TestAdmissionStartupRetriesTransientReconstruction(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &Manager{log: zerolog.Nop(), admission: admission.NewGate(true, 10)}
+	var attempts atomic.Int32
+	m.startAdmission(ctx, func() bool { return true }, func() error {
+		if attempts.Add(1) == 1 {
+			return fmt.Errorf("transient store error")
+		}
+		return nil
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for m.admission.State() != admission.StateOpen && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if m.admission.State() != admission.StateOpen || attempts.Load() < 2 {
+		t.Fatal("startup did not retry reconstruction", attempts.Load())
 	}
 }

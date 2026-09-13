@@ -53,7 +53,10 @@ hostctl activate <host-id>
 A successful drain response acknowledges the persisted host fence. Cached
 scheduler decisions cannot create a new charge after that acknowledgement.
 Work admitted before the fence may finish; the ledger retains its charge.
-Creates retrying an already-held identity are not a new admission. Template
+Creates retrying an already-held identity are not a new admission. A definitive
+pre-boot refusal permits one attempt on a different eligible host, guarded by
+a compare-and-set on an unactivated starting row. Plain transport errors, generic
+resource exhaustion, or any earlier ambiguous retry never authorize that switch. Template
 builds are refused while closed. Resume remains pinned to its existing owner.
 
 Each transition first records a monotonically ordered revision and desired

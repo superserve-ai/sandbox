@@ -8,6 +8,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/admission"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -49,9 +50,9 @@ func admissionError(err error) error {
 	case err == nil:
 		return nil
 	case errors.Is(err, admission.ErrHostAtCapacity):
-		return status.Error(codes.ResourceExhausted, err.Error())
+		return vmdclient.AdmissionRefused(codes.ResourceExhausted, err.Error())
 	case errors.Is(err, admission.ErrNotReady):
-		return status.Error(codes.Unavailable, err.Error())
+		return vmdclient.AdmissionRefused(codes.Unavailable, err.Error())
 	case errors.Is(err, admission.ErrIntentRequired):
 		return status.Error(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, network.ErrOperatorSlotLimit):

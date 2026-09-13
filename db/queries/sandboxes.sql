@@ -1088,3 +1088,11 @@ closed_storage AS (
 )
 SELECT d.id, d.team_id, d.name, d.host_id, d.base_path, d.template_id
 FROM destroyed d;
+
+-- name: ReassignRejectedCreateHost :execrows
+-- Only the synchronous create caller may use this after an explicit pre-boot
+-- refusal. It is not a paused-sandbox migration operation.
+UPDATE sandbox SET host_id = @new_host_id, updated_at = now()
+WHERE id = @id AND team_id = @team_id AND host_id = @old_host_id
+  AND status = 'starting' AND destroyed_at IS NULL
+  AND ip_address IS NULL AND pid IS NULL AND snapshot_id IS NULL;

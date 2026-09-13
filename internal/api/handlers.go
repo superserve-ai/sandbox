@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"io"
 	"net/http"
 	"net/netip"
@@ -392,7 +394,7 @@ func retryTransientBoot(parent context.Context, sandboxID, hostID string, boot f
 		return boot(ctx)
 	}
 	ip, vcpu, memMiB, err = attempt()
-	if err == nil || !(isVMDDeadline(err) || isVMDUnavailable(err)) || parent.Err() != nil {
+	if err == nil || vmdclient.IsAdmissionRefusal(err) || !(isVMDDeadline(err) || isVMDUnavailable(err)) || parent.Err() != nil {
 		return ip, vcpu, memMiB, false, err
 	}
 	l := sandboxLogger(sandboxID, hostID)
@@ -2688,7 +2690,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// The closure runs synchronously inside retryTransientBoot; a retry
 	// overwrites the capture with the attempt that produced the returned VM.
 	var previewProtocol string
-	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), hostID, func(ctx context.Context) (string, uint32, uint32, error) {
+	bootCreate := func(ctx context.Context) (string, uint32, uint32, error) {
 		ip, vcpu, memMiB, protocol, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars,
 			// Same shape the sandbox row is being inserted with (the
 			// template's, or the defaults) — declared so the daemon
@@ -2701,7 +2703,27 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			vmdclient.IntentCreate)
 		previewProtocol = protocol
 		return ip, vcpu, memMiB, err
-	})
+	}
+	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), hostID, bootCreate)
+	// One bounded alternate attempt, after joining the insert so its host field
+	// cannot race with reassignment. The common successful path remains parallel.
+	if vmdclient.IsAdmissionRefusal(vmdErr) && !vmdRetried && h.Scheduler != nil {
+		inserted := <-insertCh
+		if inserted.err == nil {
+			nextHost, nextClient, placementErr := h.reassignRefusedCreate(c.Request.Context(), inserted.sandbox, requiredCapabilities, vmdErr, vmdRetried)
+			if placementErr == nil {
+				hostID, vmd = nextHost, nextClient
+				l = sandboxLogger(sandboxID.String(), hostID)
+				inserted.sandbox.HostID = hostID
+				SetTelemetryHostID(c, hostID)
+				ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr = retryTransientBoot(c.Request.Context(), sandboxID.String(), hostID, bootCreate)
+			} else {
+				vmdErr = status.Error(codes.Unavailable, placementErr.Error())
+			}
+		}
+		insertCh <- inserted
+	}
+
 	tVmdEnd = time.Now()
 	if vmdErr != nil {
 		// A failed boot should stop the detached insert from materializing a row
@@ -2721,8 +2743,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.
 	quotaExceeded := isSandboxQuotaErr(dbErr)
-	vmdTransientFailure := isVMDDeadline(vmdErr) || isVMDUnavailable(vmdErr)
-	transientCreateFailure := isTransientCreateDBErr(dbErr) || isVMDDeadline(vmdErr) || isVMDUnavailable(vmdErr)
+	vmdTransientFailure := isVMDDeadline(vmdErr) || isVMDUnavailable(vmdErr) || vmdclient.IsAdmissionRefusal(vmdErr)
+	transientCreateFailure := isTransientCreateDBErr(dbErr) || isVMDDeadline(vmdErr) || isVMDUnavailable(vmdErr) || vmdclient.IsAdmissionRefusal(vmdErr)
 	transientReason := createSandboxTransientFailureReason(dbErr, vmdErr)
 
 	if dbErr != nil || vmdErr != nil {

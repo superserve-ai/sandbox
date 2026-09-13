@@ -27,6 +27,10 @@ func (m *Manager) AdmissionGate() *admission.Gate { return m.admission }
 // without enforcing, so the wait costs correctness of the limit rather than
 // availability of the host.
 func (m *Manager) StartAdmission(ctx context.Context) {
+	m.startAdmission(ctx, m.PressureReady, m.reconstructAdmission)
+}
+
+func (m *Manager) startAdmission(ctx context.Context, ready func() bool, reconstruct func() error) {
 	if !m.admission.Enabled() {
 		return
 	}
@@ -39,8 +43,8 @@ func (m *Manager) StartAdmission(ctx context.Context) {
 			// leftover build cgroup or unit still possibly alive. Reused
 			// rather than duplicated — a second readiness rule would be
 			// one more thing to keep in agreement with the first.
-			if m.PressureReady() {
-				if err := m.reconstructAdmission(); err != nil {
+			if ready() {
+				if err := reconstruct(); err != nil {
 					// Stay in the permissive rebuild state and retry on the
 					// next tick. Not enforcing for another interval is
 					// recoverable; opening against a ledger known to be
@@ -48,13 +52,13 @@ func (m *Manager) StartAdmission(ctx context.Context) {
 					// and refuse creates this host has room for.
 					m.log.Error().Err(err).
 						Msg("admission reconstruction failed; not yet enforcing, retrying")
-					break
+				} else {
+					m.admission.Open()
+					m.log.Info().Int("charged", m.admission.Charged()).
+						Msg("host-local admission open")
+					go m.auditAdmissionLoop(ctx)
+					return
 				}
-				m.admission.Open()
-				m.log.Info().Int("charged", m.admission.Charged()).
-					Msg("host-local admission open")
-				go m.auditAdmissionLoop(ctx)
-				return
 			}
 			select {
 			case <-ctx.Done():

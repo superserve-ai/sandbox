@@ -615,6 +615,9 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 		BuildVMID:  req.GetBuildVmId(),
 	})
 	if err != nil {
+		if mapped := admissionError(err); status.Code(mapped) != codes.Unknown {
+			return nil, mapped
+		}
 		return nil, status.Errorf(codes.Internal, "build template: %v", err)
 	}
 

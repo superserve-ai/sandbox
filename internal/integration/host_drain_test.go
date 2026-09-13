@@ -68,3 +68,28 @@ func TestIntegration_DrainCountsPausedAndFailedOwnership(t *testing.T) {
 		}
 	}
 }
+
+func TestIntegration_OnlyUnactivatedCreateCanBeReassigned(t *testing.T) {
+	ctx := context.Background()
+	source := seedActivePreviewHost(t, preview.HostCapabilityPorts)
+	destination := seedActivePreviewHost(t, preview.HostCapabilityPorts)
+	sandbox := seedPrivatePreviewSandbox(t, testSystemTeamID, source, "refused-create")
+	args := db.ReassignRejectedCreateHostParams{ID: sandbox, TeamID: testSystemTeamID, OldHostID: source, NewHostID: destination}
+	for _, state := range []string{"paused", "active", "failed"} {
+		if _, err := testPool.Exec(ctx, "UPDATE sandbox SET status=$2 WHERE id=$1", sandbox, state); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := testQueries.ReassignRejectedCreateHost(ctx, args); err != nil || n != 0 {
+			t.Fatal("existing owner reassigned", state, n, err)
+		}
+	}
+	if _, err := testPool.Exec(ctx, "UPDATE sandbox SET status='starting',ip_address=NULL,pid=NULL,snapshot_id=NULL WHERE id=$1", sandbox); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := testQueries.ReassignRejectedCreateHost(ctx, args); err != nil || n != 1 {
+		t.Fatal("refused create not reassigned", n, err)
+	}
+	if n, err := testQueries.ReassignRejectedCreateHost(ctx, args); err != nil || n != 0 {
+		t.Fatal("source CAS did not fence retry", n, err)
+	}
+}

@@ -886,6 +886,14 @@ func retryUnavailableUnaryInterceptor(window time.Duration) grpc.UnaryClientInte
 		for {
 			attempts++
 			err := invoker(ctx, method, req, reply, cc, opts...)
+			if vmdclient.IsAdmissionRefusal(err) {
+				if attempts > 1 {
+					// An earlier transport failure may have hidden a boot.
+					// Drop the pre-boot proof rather than permit re-placement.
+					return grpcstatus.Error(grpcstatus.Code(err), "admission refusal after ambiguous transport retry")
+				}
+				return err
+			}
 			if err == nil || grpcstatus.Code(err) != grpccodes.Unavailable || !time.Now().Before(deadline) {
 				if err != nil && attempts > 1 {
 					log.Warn().Err(err).Str("method", method).Int("attempts", attempts).
@@ -916,7 +924,7 @@ func retryUnavailableUnaryInterceptor(window time.Duration) grpc.UnaryClientInte
 func deadHostUnaryInterceptor(onDead func()) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 		err := invoker(ctx, method, req, reply, cc, opts...)
-		if err != nil && grpcstatus.Code(err) == grpccodes.Unavailable && onDead != nil {
+		if err != nil && !vmdclient.IsAdmissionRefusal(err) && grpcstatus.Code(err) == grpccodes.Unavailable && onDead != nil {
 			onDead()
 		}
 		return err
