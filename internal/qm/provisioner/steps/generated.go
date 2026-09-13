@@ -35,6 +35,13 @@ const (
 	secretResendAPIKey     = "RESEND_API_KEY"
 )
 
+// sharedSecretRef is the name a tenant's row records the *platform* secret
+// it was granted access to under. It is not a tenant secret: nothing is
+// stored at qm-<slug>-RESEND_API_KEY, and the reference exists only so a
+// teardown can revoke the grant it actually made, even after the
+// configured name has been rotated to a different resource.
+const sharedSecretRef = secretResendAPIKey
+
 // derivedSecrets are the per-tenant secrets a later step computes from the
 // resource it just created. The secrets step's rollback sweeps them too, so
 // a teardown that reaches it leaves nothing behind even if the step that

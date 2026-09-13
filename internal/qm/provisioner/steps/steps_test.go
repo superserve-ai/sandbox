@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -606,6 +607,42 @@ func TestDeprovisionLeavesNothingBehind(t *testing.T) {
 	}
 	if members := f.accounts.grants["qm-resend-api-key"]; len(members) != 0 {
 		t.Errorf("the deleted tenant is still on the shared secret's policy: %v", members)
+	}
+}
+
+// The platform's email key can be rotated to a different Secret Manager
+// resource between a tenant being built and being torn down. The binding
+// that exists is the one made at build time, so that is the name the
+// tenant's row records and the one teardown has to revoke.
+func TestDeprovisionRevokesTheSharedGrantItActuallyMade(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	account := *f.current(t).ServiceAccount
+	if !slices.Contains(f.accounts.grants["qm-resend-api-key"], account) {
+		t.Fatalf("the tenant was not granted the shared key: %v", f.accounts.grants)
+	}
+
+	// The platform rotates to a new resource.
+	if _, err := f.secrets.Put(ctx, "qm-resend-api-key-v2", []byte("re_rotated")); err != nil {
+		t.Fatal(err)
+	}
+	env := f.runner.Env
+	env.ResendSecret = "qm-resend-api-key-v2"
+	f.runner.Env = env
+
+	if err := f.deprovision(t); err != nil {
+		t.Fatal(err)
+	}
+	if members := f.accounts.grants["qm-resend-api-key"]; len(members) != 0 {
+		t.Errorf("the grant made at build time survived teardown: %v", members)
+	}
+	// And the platform's secrets themselves are untouched: they belong to
+	// no tenant.
+	if !f.secrets.Has("qm-resend-api-key") || !f.secrets.Has("qm-resend-api-key-v2") {
+		t.Error("teardown deleted a platform secret")
 	}
 }
 

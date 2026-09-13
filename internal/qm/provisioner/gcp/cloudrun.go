@@ -109,7 +109,7 @@ func (s *Services) Deploy(ctx context.Context, spec steps.ServiceSpec) (steps.Se
 	}
 	var op *run.GoogleLongrunningOperation
 	if exists {
-		op, err = s.svc.Projects.Locations.Services.Patch(s.servicePath(spec.Name), desired).Context(ctx).Do()
+		op, err = s.patch(ctx, spec.Name, desired)
 		if err != nil {
 			return steps.ServiceStatus{}, fmt.Errorf("update service %s: %w", spec.Name, err)
 		}
@@ -117,7 +117,7 @@ func (s *Services) Deploy(ctx context.Context, spec steps.ServiceSpec) (steps.Se
 		op, err = s.svc.Projects.Locations.Services.Create(s.parent(), desired).ServiceId(spec.Name).Context(ctx).Do()
 		if alreadyExists(err) {
 			// Raced with another attempt; the update path converges.
-			op, err = s.svc.Projects.Locations.Services.Patch(s.servicePath(spec.Name), desired).Context(ctx).Do()
+			op, err = s.patch(ctx, spec.Name, desired)
 		}
 		if err != nil {
 			return steps.ServiceStatus{}, fmt.Errorf("create service %s: %w", spec.Name, err)
@@ -154,6 +154,19 @@ func (s *Services) Delete(ctx context.Context, name string) error {
 		return fmt.Errorf("delete service %s: %w", name, err)
 	}
 	return nil
+}
+
+// patch replaces the service's desired state, always as a new revision.
+//
+// Forcing the revision matters because the tenant image is configured by
+// tag, and the fleet default is a moving one. Without it a retry that sends
+// an identical template — which is the common case, since the template is
+// rendered from the same row — can be satisfied by the revision already
+// running, so a tenant that failed on a broken image would go on running
+// that image no matter how many times the fix was pushed.
+func (s *Services) patch(ctx context.Context, name string, desired *run.GoogleCloudRunV2Service) (*run.GoogleLongrunningOperation, error) {
+	return s.svc.Projects.Locations.Services.Patch(s.servicePath(name), desired).
+		ForceNewRevision(true).Context(ctx).Do()
 }
 
 // allowPublicInvoke adds the unauthenticated-invoker binding if it is not

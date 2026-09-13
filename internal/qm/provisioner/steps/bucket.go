@@ -145,6 +145,15 @@ func (s bucket) ensureHMACKey(ctx context.Context, t *provisioner.Tenant, accoun
 	if stored {
 		return nil
 	}
+	// Clear whatever half an earlier attempt left behind before minting a
+	// replacement. Without this, a run that failed having written only the
+	// access ID and a second that fails having written only the secret
+	// leave two halves of different keys in place — which hmacStored reads
+	// as a usable credential, and the tenant becomes ready with object
+	// storage it cannot reach.
+	if err := s.forgetHMACSecrets(ctx, t); err != nil {
+		return err
+	}
 	// Nothing usable is recorded, so any key the account already has came
 	// from an attempt that died before it could store one. Clear them out
 	// rather than accumulating orphans across retries: an account is capped
@@ -192,6 +201,20 @@ func (s bucket) hmacStored(ctx context.Context, t *provisioner.Tenant) (bool, er
 	return true, nil
 }
 
+// forgetHMACSecrets removes both halves of whatever credential is stored,
+// so what is written next is a matched pair or nothing.
+func (s bucket) forgetHMACSecrets(ctx context.Context, t *provisioner.Tenant) error {
+	for _, name := range []string{secretAccessKeyID, secretSecretAccessKey} {
+		if err := s.c.Secrets.Delete(ctx, t.SecretName(name)); err != nil {
+			return fmt.Errorf("delete %s: %w", name, err)
+		}
+		if err := t.DeleteSecretRef(ctx, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s bucket) deleteHMACKeys(ctx context.Context, account string) error {
 	ids, err := s.c.Buckets.ListHMACKeys(ctx, account)
 	if err != nil {
@@ -232,13 +255,8 @@ func (s bucket) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	if err := s.deleteHMACKeys(ctx, account); err != nil {
 		return err
 	}
-	for _, name := range []string{secretAccessKeyID, secretSecretAccessKey} {
-		if err := s.c.Secrets.Delete(ctx, t.SecretName(name)); err != nil {
-			return fmt.Errorf("delete %s: %w", name, err)
-		}
-		if err := t.DeleteSecretRef(ctx, name); err != nil {
-			return err
-		}
+	if err := s.forgetHMACSecrets(ctx, t); err != nil {
+		return err
 	}
 	name := BucketName(t.Env.Project, t.Row.Slug)
 	if t.Row.BucketName != nil {

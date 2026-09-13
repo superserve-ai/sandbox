@@ -114,6 +114,12 @@ func (s secretsStep) Rollback(ctx context.Context, t *provisioner.Tenant) error 
 		names[name] = true
 	}
 	for _, ref := range refs {
+		if ref.Name == sharedSecretRef {
+			// A reference to a secret the platform owns and every other
+			// tenant shares. Deleting it here would take the whole fleet's
+			// email transport with it.
+			continue
+		}
 		names[ref.Name] = true
 	}
 	for name := range names {

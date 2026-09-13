@@ -131,6 +131,15 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 			return fmt.Errorf("grant the tenant access to %s: %w", secretName, err)
 		}
 	}
+	// Which shared secret this tenant was granted, recorded on the row.
+	// The tenant's own secrets are deleted outright on teardown, so their
+	// policies go with them; the platform's shared one outlives every
+	// tenant, and if its configured name is rotated to a different
+	// resource between now and teardown, the name in the environment is no
+	// longer the binding that was made.
+	if err := s.recordSharedGrant(ctx, t, t.Env.ResendSecret); err != nil {
+		return err
+	}
 
 	status, err := s.c.Services.Deploy(ctx, ServiceSpec{
 		Name:           name,
@@ -154,6 +163,46 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 	// and the admin link both point at it.
 	public := t.PublicURL()
 	return t.Record(ctx, tenantstore.Resources{CloudRunService: &name, ImageTag: &image, PublicURL: &public})
+}
+
+// recordSharedGrant notes which platform secret this tenant's identity was
+// granted access to. Nothing is stored under the tenant's own name for it;
+// the reference is a record of the binding, not of a secret the tenant owns.
+func (s cloudRun) recordSharedGrant(ctx context.Context, t *provisioner.Tenant, secretName string) error {
+	if secretName == "" {
+		return nil
+	}
+	if err := t.SetSecretRef(ctx, sharedSecretRef, secretName); err != nil {
+		return fmt.Errorf("record the shared email key grant: %w", err)
+	}
+	return nil
+}
+
+// sharedGrants is every platform secret this tenant may hold a binding on:
+// the one recorded when it was built and the one configured now.
+func (s cloudRun) sharedGrants(ctx context.Context, t *provisioner.Tenant) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(name string) {
+		if name == "" || seen[name] {
+			return
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	// A failure to read the references is not fatal: the configured name is
+	// still revoked, and the rest is bookkeeping for a rotation that may
+	// never have happened.
+	if refs, err := t.SecretRefs(ctx); err == nil {
+		for _, ref := range refs {
+			if ref.Name == sharedSecretRef {
+				add(ref.SecretRef)
+			}
+		}
+	}
+	add(t.Env.ResendSecret)
+	sort.Strings(out)
+	return out
 }
 
 // mountedSecrets is the Secret Manager names a spec mounts, in a stable
@@ -194,14 +243,24 @@ func (s cloudRun) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	// deleted principal, so without this every tenant that ever existed
 	// accumulates on that one policy until its size limit stops new ones
 	// being granted at all.
-	if t.Env.ResendSecret != "" && s.c.Accounts != nil {
-		account := ServiceAccountEmail(t.Env.Project, t.Row.Slug)
-		if t.Row.ServiceAccount != nil {
-			account = *t.Row.ServiceAccount
-		}
-		if err := s.c.Accounts.RevokeSecretAccess(ctx, t.Env.ResendSecret, account); err != nil {
+	if s.c.Accounts == nil {
+		return errNoServiceAccountAdmin
+	}
+	account := ServiceAccountEmail(t.Env.Project, t.Row.Slug)
+	if t.Row.ServiceAccount != nil {
+		account = *t.Row.ServiceAccount
+	}
+	// Both the name the grant was recorded under and the one configured
+	// now: they differ when the platform key has been rotated to a
+	// different resource since this tenant was built, and the recorded one
+	// is the binding that actually exists.
+	for _, secretName := range s.sharedGrants(ctx, t) {
+		if err := s.c.Accounts.RevokeSecretAccess(ctx, secretName, account); err != nil {
 			return fmt.Errorf("revoke the tenant's access to the shared email key: %w", err)
 		}
+	}
+	if err := t.DeleteSecretRef(ctx, sharedSecretRef); err != nil {
+		return err
 	}
 	if t.Row.CloudRunService == nil {
 		return provisioner.Skip("no service recorded")
