@@ -230,6 +230,15 @@ jobs:
       # new job is fine (the job's argument contract only grows).
       - name: Deploy provisioner job, then service
         if: steps.gate.outputs.enabled == 'true'
+        # Through env rather than interpolated into the script: these are
+        # free-form operator-set values, and a display-name sender like
+        # '"QM, Inc" <no-reply@...>' pasted into a shell line is parsed as
+        # shell before any of it runs.
+        env:
+          QM_RESEND_SECRET: ${{ vars.QM_RESEND_SECRET }}
+          QM_EMAIL_FROM: ${{ vars.QM_EMAIL_FROM }}
+          QM_SANDBOX_API_URL: ${{ vars.QM_SANDBOX_API_URL }}
+          QM_SANDBOX_TEMPLATE: ${{ vars.QM_SANDBOX_TEMPLATE }}
         run: |
           IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/qm-api:${{ github.sha }}"
           REGION="${{ vars.QM_API_REGION || vars.GCP_REGION }}"
@@ -261,10 +270,10 @@ jobs:
           # recording placeholder resources and marking tenants ready.
           ENV="$ENV;QM_PROVISIONER_STUB=0"
           for pair in \
-            "QM_RESEND_SECRET=${{ vars.QM_RESEND_SECRET }}" \
-            "QM_EMAIL_FROM=${{ vars.QM_EMAIL_FROM }}" \
-            "QM_SANDBOX_API_URL=${{ vars.QM_SANDBOX_API_URL }}" \
-            "QM_SANDBOX_TEMPLATE=${{ vars.QM_SANDBOX_TEMPLATE }}"; do
+            "QM_RESEND_SECRET=$QM_RESEND_SECRET" \
+            "QM_EMAIL_FROM=$QM_EMAIL_FROM" \
+            "QM_SANDBOX_API_URL=$QM_SANDBOX_API_URL" \
+            "QM_SANDBOX_TEMPLATE=$QM_SANDBOX_TEMPLATE"; do
             case "${pair#*=}" in
               *\;*)
                 echo "::error::${pair%%=*} contains a semicolon, which is the delimiter these variables are passed with."
@@ -370,6 +379,15 @@ jobs:
       # new job is fine (the job's argument contract only grows).
       - name: Deploy provisioner job, then service
         if: steps.gate.outputs.enabled == 'true'
+        # Through env rather than interpolated into the script: these are
+        # free-form operator-set values, and a display-name sender like
+        # '"QM, Inc" <no-reply@...>' pasted into a shell line is parsed as
+        # shell before any of it runs.
+        env:
+          QM_RESEND_SECRET: ${{ vars.QM_RESEND_SECRET }}
+          QM_EMAIL_FROM: ${{ vars.QM_EMAIL_FROM }}
+          QM_SANDBOX_API_URL: ${{ vars.QM_SANDBOX_API_URL }}
+          QM_SANDBOX_TEMPLATE: ${{ vars.QM_SANDBOX_TEMPLATE }}
         run: |
           IMAGE="${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/qm-api:${{ github.sha }}"
           REGION="${{ vars.QM_API_REGION || vars.GCP_REGION_USE4 }}"
@@ -401,10 +419,10 @@ jobs:
           # recording placeholder resources and marking tenants ready.
           ENV="$ENV;QM_PROVISIONER_STUB=0"
           for pair in \
-            "QM_RESEND_SECRET=${{ vars.QM_RESEND_SECRET }}" \
-            "QM_EMAIL_FROM=${{ vars.QM_EMAIL_FROM }}" \
-            "QM_SANDBOX_API_URL=${{ vars.QM_SANDBOX_API_URL }}" \
-            "QM_SANDBOX_TEMPLATE=${{ vars.QM_SANDBOX_TEMPLATE }}"; do
+            "QM_RESEND_SECRET=$QM_RESEND_SECRET" \
+            "QM_EMAIL_FROM=$QM_EMAIL_FROM" \
+            "QM_SANDBOX_API_URL=$QM_SANDBOX_API_URL" \
+            "QM_SANDBOX_TEMPLATE=$QM_SANDBOX_TEMPLATE"; do
             case "${pair#*=}" in
               *\;*)
                 echo "::error::${pair%%=*} contains a semicolon, which is the delimiter these variables are passed with."
