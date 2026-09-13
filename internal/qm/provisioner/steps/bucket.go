@@ -58,7 +58,7 @@ func (s bucket) Ready(env provisioner.Env) error {
 	if env.Stub {
 		return nil
 	}
-	if s.c.Buckets == nil {
+	if env.ExecutesPlan && s.c.Buckets == nil {
 		return errNoBucketAdmin
 	}
 	if s.c.Secrets == nil {

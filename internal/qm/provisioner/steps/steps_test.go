@@ -191,7 +191,7 @@ func newFixture(t *testing.T, stub bool) *tenantFixture {
 func testEnv(stub bool) provisioner.Env {
 	return provisioner.Env{
 		Project: "example-project", Region: "us-central1", BaseDomain: "qm.example.com",
-		Image: "qm:fixture", Stub: stub,
+		Image: "qm:fixture", Stub: stub, ExecutesPlan: true,
 
 		SQLInstance:       "qm-tenants",
 		SQLConnectionName: "example-project:us-central1:qm-tenants",
@@ -826,7 +826,8 @@ func TestPlanReadyRefusesAnIncompleteConfiguration(t *testing.T) {
 			t.Errorf("%q missing from %v", want, err)
 		}
 	}
-	// No clients at all, outside stub mode: every cloud step says so.
+	// No clients at all, in a process that runs plans: every cloud step
+	// says so.
 	err = provisioner.PlanReady(All(Clients{Secrets: secrets.NewFake()}), testEnv(false))
 	if err == nil {
 		t.Fatal("a plan with no cloud clients was accepted")
@@ -835,6 +836,20 @@ func TestPlanReadyRefusesAnIncompleteConfiguration(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("%q missing from %v", want, err)
 		}
+	}
+
+	// The qm-api service in its default mode only queues the job that runs
+	// the plan, so it holds no cloud clients and must not refuse to start
+	// for the want of them — while still checking the configuration it
+	// hands that job.
+	queues := testEnv(false)
+	queues.ExecutesPlan = false
+	if err := provisioner.PlanReady(All(Clients{Secrets: secrets.NewFake()}), queues); err != nil {
+		t.Errorf("a process that only queues runs was refused: %v", err)
+	}
+	queues.ResendSecret = ""
+	if err := provisioner.PlanReady(All(Clients{Secrets: secrets.NewFake()}), queues); err == nil || !strings.Contains(err.Error(), "QM_RESEND_SECRET") {
+		t.Errorf("a process that only queues runs skipped the configuration check: %v", err)
 	}
 
 	// A tenant with no email transport can never be signed into, so the

@@ -60,7 +60,7 @@ func (s database) Ready(env provisioner.Env) error {
 	if env.Stub {
 		return nil
 	}
-	if s.c.Databases == nil {
+	if env.ExecutesPlan && s.c.Databases == nil {
 		return errNoDatabaseAdmin
 	}
 	if s.c.Secrets == nil {

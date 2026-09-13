@@ -28,8 +28,9 @@ type ReadyChecker interface {
 	Ready(env Env) error
 }
 
-// PlanReady reports every step that cannot run in env: a missing client, or
-// a piece of shared infrastructure the deploy never configured. Binaries
+// PlanReady reports every step that cannot run in env: a piece of shared
+// infrastructure the deploy never configured, or — in a process that runs
+// plans itself (Env.ExecutesPlan) — a client that was not wired. Binaries
 // call it once at startup and refuse to serve when it fails. A run that
 // would stop partway must never be accepted, because by the time it reaches
 // the step that cannot run the tenant already has a model key in Secret

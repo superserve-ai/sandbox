@@ -50,7 +50,7 @@ func (s serviceAccount) Ready(env provisioner.Env) error {
 	if env.Stub {
 		return nil
 	}
-	if s.c.Accounts == nil {
+	if env.ExecutesPlan && s.c.Accounts == nil {
 		return errNoServiceAccountAdmin
 	}
 	return env.Require("GCP_PROJECT", env.Project)

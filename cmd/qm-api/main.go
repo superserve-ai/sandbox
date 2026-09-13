@@ -42,7 +42,7 @@ func main() {
 	log.Logger = zerolog.New(multi).With().Timestamp().Caller().Logger()
 
 	var err error
-	if len(os.Args) > 1 && os.Args[1] == "provision" {
+	if len(os.Args) > 1 && os.Args[1] == provisionCommand {
 		err = runProvision(os.Args[2:])
 	} else {
 		err = runServe()
@@ -53,6 +53,10 @@ func main() {
 		log.Fatal().Str("error", provisioner.ScrubString(err.Error())).Msg("qm-api exited with error")
 	}
 }
+
+// provisionCommand is the argument that selects the Cloud Run Job
+// entrypoint; the same binary serves the API without it.
+const provisionCommand = "provision"
 
 // deps is everything both modes share once configured.
 type deps struct {
@@ -81,7 +85,13 @@ func (d *deps) close() {
 // includes a config error: an unusable config usually still names the
 // database, and the tenant the job was started for is better told than left
 // in flight until the stale reclaim.
-func setup(ctx context.Context) (*deps, error) {
+// executesPlan says whether this process runs provisioning plans itself.
+// The job always does; the API does only when it was told to run them
+// in-process. A process that does not run them holds no cloud clients, so
+// an outage in any of them cannot keep the control API from starting —
+// but it still validates every piece of configuration the plan needs,
+// because that configuration is what it hands the job.
+func setup(ctx context.Context, command string) (*deps, error) {
 	cfg, cfgErr := qm.LoadConfig()
 	if cfg.DatabaseURL == "" {
 		return nil, fmt.Errorf("load config: %w", cfgErr)
@@ -121,12 +131,15 @@ func setup(ctx context.Context) (*deps, error) {
 	}
 	d.secrets = secretStore
 
+	executesPlan := command == provisionCommand || cfg.ProvisionerMode == qm.ProvisionerModeInProcess
 	env := provisioner.Env{
 		Project:    cfg.GCPProject,
 		Region:     cfg.ProvisionerRegion,
 		BaseDomain: cfg.BaseDomain,
 		Image:      cfg.TenantImage,
 		Stub:       cfg.ProvisionerStub,
+
+		ExecutesPlan: executesPlan,
 
 		SQLInstance:         cfg.SQLInstance,
 		SQLConnectionName:   cfg.SQLConnectionName,
@@ -148,9 +161,11 @@ func setup(ctx context.Context) (*deps, error) {
 		log.Warn().Msg("QM_PROVISIONER_STUB=1: cloud-touching steps record placeholders instead of creating resources")
 	}
 	clients := provisionerClients{clients: steps.Clients{Secrets: secretStore}}
-	if !env.Stub {
-		// Built only outside stub mode: each constructor dials Google, and
-		// a local run has no credentials to do it with.
+	if executesPlan && !env.Stub {
+		// Built only where the plan actually runs, and not under the stub:
+		// each constructor reaches for credentials, and neither a local
+		// run nor the API service in its default mode has any use for
+		// them.
 		clients, err = cloudClients(ctx, cfg, env, secretStore)
 		if err != nil {
 			return d, err
@@ -199,7 +214,7 @@ func runServe() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	d, err := setup(ctx)
+	d, err := setup(ctx, "")
 	if d != nil {
 		defer d.close()
 	}
@@ -298,7 +313,7 @@ func runProvision(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	d, err := setup(ctx)
+	d, err := setup(ctx, provisionCommand)
 	if d != nil {
 		defer d.close()
 	}

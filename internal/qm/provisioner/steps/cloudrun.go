@@ -73,11 +73,13 @@ func (s cloudRun) Ready(env provisioner.Env) error {
 	if env.Stub {
 		return nil
 	}
-	if s.c.Services == nil {
-		return errNoCloudRunAdmin
-	}
-	if s.c.Accounts == nil {
-		return errNoServiceAccountAdmin
+	if env.ExecutesPlan {
+		if s.c.Services == nil {
+			return errNoCloudRunAdmin
+		}
+		if s.c.Accounts == nil {
+			return errNoServiceAccountAdmin
+		}
 	}
 	return env.Require(
 		"QM_TENANT_IMAGE", env.Image,

@@ -37,7 +37,7 @@ func (s loadBalancer) Ready(env provisioner.Env) error {
 	if env.Stub {
 		return nil
 	}
-	if s.c.LoadBalancer == nil {
+	if env.ExecutesPlan && s.c.LoadBalancer == nil {
 		return errNoLoadBalancerAdmin
 	}
 	return env.Require("QM_LB_URL_MAP", env.URLMap, "QM_BASE_DOMAIN", env.BaseDomain)

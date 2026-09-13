@@ -26,6 +26,13 @@ type Env struct {
 	// Stub makes the cloud-touching steps succeed without touching GCP,
 	// recording placeholder resource names; for tests and local runs.
 	Stub bool
+	// ExecutesPlan says this process runs plans itself, rather than queuing
+	// them for one that does. The qm-api service in its default mode only
+	// triggers the provisioner job, so it holds no cloud clients — and must
+	// not refuse to start for the want of them. It still validates every
+	// piece of configuration the plan needs, because that is what it hands
+	// the job.
+	ExecutesPlan bool
 
 	// Shared infrastructure each tenant is attached to. See qm.Config for
 	// where these come from and why an empty one is fatal at startup
