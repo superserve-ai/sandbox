@@ -13,12 +13,15 @@ import (
 )
 
 const createQMTenant = `-- name: CreateQMTenant :one
+WITH admission AS (
+    SELECT pg_advisory_xact_lock(hashtext($1::uuid::text))
+)
 INSERT INTO qm.tenants (
     team_id, slug, org_name, admin_email, sign_in, model_provider, harness, created_by
 )
-VALUES (
+SELECT
     $1, $2, $3, $4, $5, $6, COALESCE($7::text, 'pi'), $8
-)
+FROM admission
 RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at
 `
 
@@ -33,6 +36,9 @@ type CreateQMTenantParams struct {
 	CreatedBy     pgtype.UUID `json:"created_by"`
 }
 
+// Tenant admission serializes on the team's advisory lock, the same lock
+// team migration holds while it detaches a team, so a tenant can never be
+// created in a cell the team is being cut over from.
 func (q *Queries) CreateQMTenant(ctx context.Context, arg CreateQMTenantParams) (QmTenant, error) {
 	row := q.db.QueryRow(ctx, createQMTenant,
 		arg.TeamID,

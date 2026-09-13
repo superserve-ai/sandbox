@@ -1336,6 +1336,13 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	} else if len(builds) > 0 {
 		return fmt.Errorf("aborting detach: template build slipped in before the lock:\n  %s", strings.Join(builds, "\n  "))
 	}
+	// Hosted-QM tenant admission takes the same per-team lock (see
+	// CreateQMTenant), so this recheck is authoritative, not advisory.
+	if tenants, err := liveQMTenants(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(tenants) > 0 {
+		return fmt.Errorf("aborting detach: hosted-QM tenant slipped in before the lock:\n  %s", strings.Join(tenants, "\n  "))
+	}
 
 	// Detach is the last moment the dest is guaranteed un-diverged, so the
 	// straggler sweep happens HERE, not at purge: async writers (activity,
