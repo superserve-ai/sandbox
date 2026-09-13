@@ -168,6 +168,8 @@ Before `tenant_capacity` approaches that, request an increase for the IAM API
    add the version, then apply the rest.
 5. **Service-account quota** as above, before onboarding tenants at scale.
 
-Later image rollouts are owned by deploy tooling (`deploy-qm-api.yml` updates
-the service and the job to the same SHA): Terraform ignores image drift on
-all three workloads, matching the `api` module.
+Later qm-api image rollouts are owned by deploy tooling (`deploy-qm-api.yml`
+updates the service and the job to the same SHA), so Terraform ignores image
+drift on those two, matching the `api` module. The redirect service has no
+deploy-tooling path, so Terraform owns its image: change `redirect_image` and
+apply to roll it.

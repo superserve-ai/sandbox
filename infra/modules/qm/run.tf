@@ -208,12 +208,14 @@ resource "google_cloud_run_v2_service" "redirect" {
 
   labels = var.labels
 
+  # Unlike qm-api and the provisioner job, nothing in deploy tooling updates
+  # the redirect service, so Terraform owns its image: ignoring image drift
+  # here would pin the first revision forever with no way to roll a fix out.
   lifecycle {
     ignore_changes = [
       client,
       client_version,
       labels,
-      template[0].containers[0].image,
       traffic,
     ]
   }

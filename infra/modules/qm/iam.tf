@@ -47,6 +47,10 @@ locals {
   secret_name_prefix           = "projects/${local.project_number}/secrets/${local.qm_secret_prefix}"
   sql_admin_secret_name_prefix = "projects/${local.project_number}/secrets/${local.sql_admin_secret_id}"
   tenant_bucket_name_prefix    = "projects/_/buckets/${local.tenant_bucket_prefix}"
+
+  # Shared by every qm-api secret grant that IAM evaluates against the secret
+  # itself, so accessor, version-adder and delete cannot drift apart.
+  api_secret_condition = "resource.name.startsWith(\"${local.secret_name_prefix}\") && !resource.name.startsWith(\"${local.sql_admin_secret_name_prefix}\")"
 }
 
 # Project-level roles the provisioner needs and that cannot be narrowed by
@@ -238,7 +242,7 @@ resource "google_project_iam_member" "api_secrets" {
   condition {
     title       = "qm secrets except sql admin"
     description = "qm-* secrets only; the instance admin password stays with the provisioner."
-    expression  = "resource.name.startsWith(\"${local.secret_name_prefix}\") && !resource.name.startsWith(\"${local.sql_admin_secret_name_prefix}\")"
+    expression  = local.api_secret_condition
   }
 }
 
@@ -256,6 +260,33 @@ resource "google_project_iam_member" "api_secret_create" {
   project = var.project_id
   role    = google_project_iam_custom_role.api_secret_create.id
   member  = local.api_member
+}
+
+# qm-api stores a tenant's model key before the run starts and deletes it again
+# when it cannot record the reference (internal/qm handlers roll the Put back
+# on a failed SetSecretRef). secrets.delete is carried by neither
+# secretAccessor nor secretVersionAdder, and without it that rollback fails
+# with PERMISSION_DENIED and leaves an unreferenced credential in the project.
+# Unlike create, delete is evaluated against the secret, so it takes the same
+# condition as the grants above rather than an unconditional role.
+resource "google_project_iam_custom_role" "api_secret_delete" {
+  project     = var.project_id
+  role_id     = "qmApiSecretDelete_${local.custom_role_suffix}"
+  title       = "QM API secret delete (${var.environment})"
+  description = "Delete a qm-* tenant secret qm-api created but could not record."
+  permissions = ["secretmanager.secrets.delete"]
+}
+
+resource "google_project_iam_member" "api_secret_delete" {
+  project = var.project_id
+  role    = google_project_iam_custom_role.api_secret_delete.id
+  member  = local.api_member
+
+  condition {
+    title       = "qm secrets except sql admin"
+    description = "qm-* secrets only; the instance admin password stays with the provisioner."
+    expression  = local.api_secret_condition
+  }
 }
 
 # Explicit secret-level grant for DATABASE_URL in addition to the conditional
