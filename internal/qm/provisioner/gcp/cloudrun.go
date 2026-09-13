@@ -163,7 +163,8 @@ func (s *Services) allowPublicInvoke(ctx context.Context, name string) error {
 	resource := s.servicePath(name)
 	var lastErr error
 	for attempt := 0; attempt < setIAMPolicyAttempts; attempt++ {
-		policy, err := s.svc.Projects.Locations.Services.GetIamPolicy(resource).Context(ctx).Do()
+		policy, err := s.svc.Projects.Locations.Services.GetIamPolicy(resource).
+			OptionsRequestedPolicyVersion(iamPolicyVersion).Context(ctx).Do()
 		if err != nil {
 			return fmt.Errorf("read the iam policy of service %s: %w", name, err)
 		}
@@ -173,6 +174,7 @@ func (s *Services) allowPublicInvoke(ctx context.Context, name string) error {
 			}
 		}
 		policy.Bindings = append(policy.Bindings, &run.GoogleIamV1Binding{Role: invokerRole, Members: []string{invokerMember}})
+		policy.Version = iamPolicyVersion
 		_, err = s.svc.Projects.Locations.Services.SetIamPolicy(resource, &run.GoogleIamV1SetIamPolicyRequest{Policy: policy}).Context(ctx).Do()
 		if err == nil {
 			return nil

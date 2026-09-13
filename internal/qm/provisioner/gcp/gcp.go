@@ -28,3 +28,9 @@ func alreadyExists(err error) bool { return isStatus(err, http.StatusConflict) }
 
 // notFound is the delete-side "this is fine".
 func notFound(err error) bool { return isStatus(err, http.StatusNotFound) }
+
+// iamPolicyVersion is the version every policy read here asks for.
+// Anything below 3 either refuses a policy that carries a conditional
+// binding or silently returns it without one — and a read-modify-write of
+// that shortened policy would delete the condition on the way back.
+const iamPolicyVersion = 3

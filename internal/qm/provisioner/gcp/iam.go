@@ -115,7 +115,8 @@ func (a *Accounts) editSecretPolicy(ctx context.Context, secretName, email strin
 	member := "serviceAccount:" + email
 	var lastErr error
 	for attempt := 0; attempt < setIAMPolicyAttempts; attempt++ {
-		policy, err := a.secrets.Projects.Secrets.GetIamPolicy(resource).Context(ctx).Do()
+		policy, err := a.secrets.Projects.Secrets.GetIamPolicy(resource).
+			OptionsRequestedPolicyVersion(iamPolicyVersion).Context(ctx).Do()
 		if err != nil {
 			if notFound(err) {
 				// A secret that is gone grants nobody anything, which is
@@ -127,6 +128,9 @@ func (a *Accounts) editSecretPolicy(ctx context.Context, secretName, email strin
 		if !edit(policy, member) {
 			return nil
 		}
+		// A policy read at version 3 has to be written back at version 3,
+		// or IAM treats the conditional bindings it carries as unknown.
+		policy.Version = iamPolicyVersion
 		_, err = a.secrets.Projects.Secrets.SetIamPolicy(resource, &secretmanager.SetIamPolicyRequest{Policy: policy}).Context(ctx).Do()
 		if err == nil {
 			return nil

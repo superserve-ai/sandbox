@@ -262,9 +262,13 @@ jobs:
               ENV="$ENV,$pair"
             fi
           done
-          SET="--update-env-vars $ENV${REMOVE:+ --remove-env-vars $REMOVE}"
-          gcloud run jobs update "$JOB" --image "$IMAGE" $SET $ARGS
-          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" $SET $ARGS
+          # An array, because QM_EMAIL_FROM is a display-name address —
+          # "QM <no-reply@...>" — and word splitting on an unquoted
+          # expansion would hand gcloud three arguments it does not know.
+          SET=(--update-env-vars "$ENV")
+          [ -z "$REMOVE" ] || SET+=(--remove-env-vars "$REMOVE")
+          gcloud run jobs update "$JOB" --image "$IMAGE" "${SET[@]}" $ARGS
+          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" "${SET[@]}" $ARGS
 
       - name: Route traffic to the new revision
         if: steps.gate.outputs.enabled == 'true'
@@ -388,9 +392,13 @@ jobs:
               ENV="$ENV,$pair"
             fi
           done
-          SET="--update-env-vars $ENV${REMOVE:+ --remove-env-vars $REMOVE}"
-          gcloud run jobs update "$JOB" --image "$IMAGE" $SET $ARGS
-          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" $SET $ARGS
+          # An array, because QM_EMAIL_FROM is a display-name address —
+          # "QM <no-reply@...>" — and word splitting on an unquoted
+          # expansion would hand gcloud three arguments it does not know.
+          SET=(--update-env-vars "$ENV")
+          [ -z "$REMOVE" ] || SET+=(--remove-env-vars "$REMOVE")
+          gcloud run jobs update "$JOB" --image "$IMAGE" "${SET[@]}" $ARGS
+          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" "${SET[@]}" $ARGS
 
       - name: Route traffic to the new revision
         if: steps.gate.outputs.enabled == 'true'

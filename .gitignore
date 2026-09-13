@@ -1,5 +1,8 @@
 # Binaries
 bin/
+# Root-level `go build ./cmd/...` output, which lands in the working
+# directory rather than bin/.
+/qm-api
 *.exe
 *.dll
 *.so

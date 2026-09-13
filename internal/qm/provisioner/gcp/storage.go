@@ -166,7 +166,8 @@ func (b *Buckets) GrantAccess(ctx context.Context, name, email string) error {
 	member := "serviceAccount:" + email
 	var lastErr error
 	for attempt := 0; attempt < setIAMPolicyAttempts; attempt++ {
-		policy, err := b.svc.Buckets.GetIamPolicy(name).Context(ctx).Do()
+		policy, err := b.svc.Buckets.GetIamPolicy(name).
+			OptionsRequestedPolicyVersion(iamPolicyVersion).Context(ctx).Do()
 		if err != nil {
 			return fmt.Errorf("read the iam policy of bucket %s: %w", name, err)
 		}
@@ -176,6 +177,7 @@ func (b *Buckets) GrantAccess(ctx context.Context, name, email string) error {
 			}
 		}
 		policy.Bindings = append(policy.Bindings, &storage.PolicyBindings{Role: objectAdminRole, Members: []string{member}})
+		policy.Version = iamPolicyVersion
 		_, err = b.svc.Buckets.SetIamPolicy(name, policy).Context(ctx).Do()
 		if err == nil {
 			return nil
