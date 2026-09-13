@@ -383,24 +383,16 @@ func newFakeLoadBalancer() *fakeLoadBalancer {
 	return &fakeLoadBalancer{hosts: map[string]string{}}
 }
 
-func (f *fakeLoadBalancer) HostRuleExists(_ context.Context, host string) (bool, error) {
-	if err := f.check("lb.HostRuleExists"); err != nil {
-		return false, err
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, ok := f.hosts[host]
-	return ok, nil
-}
-
-func (f *fakeLoadBalancer) AddHostRule(_ context.Context, host, service string) error {
-	if err := f.check("lb.AddHostRule"); err != nil {
+func (f *fakeLoadBalancer) EnsureHostRule(_ context.Context, host, service string) error {
+	if err := f.check("lb.EnsureHostRule"); err != nil {
 		return err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.hosts[host] != service {
+		f.adds++
+	}
 	f.hosts[host] = service
-	f.adds++
 	return nil
 }
 

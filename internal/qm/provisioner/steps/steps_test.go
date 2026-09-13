@@ -527,6 +527,26 @@ func TestProvisionIsIdempotent(t *testing.T) {
 	}
 }
 
+// A route left pointing at a stale backend is repaired by the next run
+// rather than reported as already done — otherwise a half-built route
+// would survive every retry while the probes after it went on failing.
+func TestProvisionRepairsAStaleRoute(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	f.lb.mu.Lock()
+	f.lb.hosts["pilot-team.qm.example.com"] = "qm-stale"
+	f.lb.mu.Unlock()
+
+	if err := f.reprovision(t); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.lb.hosts["pilot-team.qm.example.com"]; got != "qm-pilot-team" {
+		t.Errorf("a stale route survived a re-run: %q", got)
+	}
+}
+
 // The isolation of a tenant's database is two statements apart from the
 // CREATE that cannot share its transaction, so a run interrupted between
 // them would leave a database every other tenant could connect to. The
@@ -599,7 +619,7 @@ func TestTeardownAfterAPartialProvision(t *testing.T) {
 		call string
 	}{
 		{"the deploy fails", "services.Deploy"},
-		{"the route fails", "lb.AddHostRule"},
+		{"the route fails", "lb.EnsureHostRule"},
 		{"the bucket grant fails", "buckets.GrantAccess"},
 		{"recording the service account fails", "accounts.Create"},
 		{"the database create fails", "databases.EnsureDatabase"},

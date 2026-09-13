@@ -60,20 +60,10 @@ func NewLoadBalancer(ctx context.Context, project, region, urlMap string, opts .
 	return &LoadBalancer{svc: svc, project: project, region: region, urlMap: urlMap}, nil
 }
 
-func (l *LoadBalancer) HostRuleExists(ctx context.Context, host string) (bool, error) {
-	urlMap, err := l.svc.UrlMaps.Get(l.project, l.urlMap).Context(ctx).Do()
-	if err != nil {
-		return false, fmt.Errorf("read url map %s: %w", l.urlMap, err)
-	}
-	for _, rule := range urlMap.HostRules {
-		if slices.Contains(rule.Hosts, host) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (l *LoadBalancer) AddHostRule(ctx context.Context, host, cloudRunService string) error {
+// EnsureHostRule creates the three resources if they are missing and
+// corrects the host rule and path matcher if they point somewhere stale.
+// Every part of it is idempotent, so it is safe on every run.
+func (l *LoadBalancer) EnsureHostRule(ctx context.Context, host, cloudRunService string) error {
 	// The NEG, the backend service and the path matcher all take the Cloud
 	// Run service's name, so the four read as one set in the console.
 	name := cloudRunService

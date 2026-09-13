@@ -14,6 +14,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/qm/adminlink"
+	"github.com/superserve-ai/sandbox/internal/qm/modelkey"
 	"github.com/superserve-ai/sandbox/internal/qm/provisioner"
 	"github.com/superserve-ai/sandbox/internal/qm/secrets"
 	"github.com/superserve-ai/sandbox/internal/qm/tenantstore"
@@ -48,6 +49,11 @@ type Handlers struct {
 	// before it could record a failure) and becomes retryable/deletable.
 	// Zero disables the reclaim.
 	StaleAfter time.Duration
+
+	// ModelKeys is the HTTP client the model provider key is checked with
+	// before a tenant is created. Nil takes a default; a test supplies one
+	// that answers without leaving the process.
+	ModelKeys *http.Client
 
 	// Now and NewJTI are seams for deterministic admin-link tests.
 	Now    func() time.Time
@@ -87,6 +93,17 @@ func (h *Handlers) CreateTenant(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
+	// Before the row, because the row consumes the slug for good: slugs are
+	// globally unique across deleted tenants too, so a key the provider
+	// rejects has to come back as a 400 the caller can fix rather than as a
+	// tenant that can never be provisioned under that name. Only an
+	// outright rejection stops the create; being unable to ask does not,
+	// and the provisioner's smoke step asks again before the tenant is
+	// called ready.
+	if err := modelkey.Verify(ctx, h.ModelKeys, req.ModelProvider, req.ModelKey); errors.Is(err, modelkey.ErrRejected) {
+		respondFieldErrors(c, map[string]string{"modelKey": "This key was rejected by " + req.ModelProvider + ". Check it and try again."})
+		return
+	}
 	tenant, err := h.Store.CreateTenant(ctx, p.TeamID, tenantstore.CreateParams{
 		Slug: req.Slug, OrgName: req.OrgName, AdminEmail: req.AdminEmail, SignIn: req.SignIn,
 		ModelProvider: req.ModelProvider, Harness: req.Harness, CreatedBy: p.ActorID,

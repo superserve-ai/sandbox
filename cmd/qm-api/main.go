@@ -26,6 +26,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/qm"
+	"github.com/superserve-ai/sandbox/internal/qm/modelkey"
 	"github.com/superserve-ai/sandbox/internal/qm/provisioner"
 	"github.com/superserve-ai/sandbox/internal/qm/provisioner/steps"
 	"github.com/superserve-ai/sandbox/internal/qm/secrets"
@@ -238,7 +239,13 @@ func runServe() error {
 		}
 	}
 
-	h := &qm.Handlers{Store: d.store, Secrets: d.secrets, Trigger: trigger, Log: log.Logger, StaleAfter: d.cfg.RunStaleAfter}
+	h := &qm.Handlers{
+		Store: d.store, Secrets: d.secrets, Trigger: trigger, Log: log.Logger,
+		StaleAfter: d.cfg.RunStaleAfter,
+		// A tenant slug is consumed for good once its row exists, so the
+		// model key is checked with its provider before the create.
+		ModelKeys: &http.Client{Timeout: modelkey.Timeout},
+	}
 	router := qm.SetupRouter(h, qm.NewPostgresKeyResolver(d.pool), log.Logger)
 
 	srv := &http.Server{

@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -383,6 +385,13 @@ func TestQMAPI_StubRunnerAgainstPostgres(t *testing.T) {
 	}
 }
 
+// acceptAnyModelKey stands in for the model providers.
+type acceptAnyModelKey struct{}
+
+func (acceptAnyModelKey) RoundTrip(*http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("{}")), Header: http.Header{}}, nil
+}
+
 func TestQMAPI_HTTPEndToEndInProcess(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()
@@ -400,7 +409,12 @@ func TestQMAPI_HTTPEndToEndInProcess(t *testing.T) {
 		Log:   zerolog.Nop(),
 	}
 	trigger := &provisioner.InProcess{Runner: runner, Log: zerolog.Nop()}
-	h := &qm.Handlers{Store: store, Secrets: fake, Trigger: trigger, Log: zerolog.Nop()}
+	h := &qm.Handlers{
+		Store: store, Secrets: fake, Trigger: trigger, Log: zerolog.Nop(),
+		// The create path checks the model key with its provider; this
+		// suite answers for it rather than reaching Anthropic.
+		ModelKeys: &http.Client{Transport: acceptAnyModelKey{}},
+	}
 	router := qm.SetupRouter(h, qm.NewPostgresKeyResolver(pool), zerolog.Nop())
 
 	do := func(method, path string, body any) (int, map[string]any) {

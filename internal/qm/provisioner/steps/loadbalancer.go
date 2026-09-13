@@ -18,8 +18,11 @@ import (
 // resources — a leaked backend service pins the NEG, and a leaked NEG pins
 // nothing but accumulates against the project's quota.
 type LoadBalancerAdmin interface {
-	HostRuleExists(ctx context.Context, host string) (bool, error)
-	AddHostRule(ctx context.Context, host, cloudRunService string) error
+	// EnsureHostRule points host at the tenant's service, creating what is
+	// missing and correcting what is stale. Reconciling rather than
+	// creating once is what lets a retry repair a route left half-built or
+	// pointing at a service that has since been redeployed.
+	EnsureHostRule(ctx context.Context, host, cloudRunService string) error
 	RemoveHostRule(ctx context.Context, host string) error
 }
 
@@ -53,15 +56,11 @@ func (s loadBalancer) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if t.Row.CloudRunService == nil {
 		return fmt.Errorf("load_balancer: the tenant has no service recorded")
 	}
-	host := t.Hostname()
-	exists, err := s.c.LoadBalancer.HostRuleExists(ctx, host)
-	if err != nil {
-		return fmt.Errorf("look up the tenant's host rule: %w", err)
-	}
-	if exists {
-		return provisioner.Skip("the load balancer already routes " + host)
-	}
-	if err := s.c.LoadBalancer.AddHostRule(ctx, host, *t.Row.CloudRunService); err != nil {
+	// No check first: EnsureHostRule reconciles, and a check that reported
+	// "already routed" would make the repair unreachable — a route left
+	// pointing at a stale backend would then survive every retry while the
+	// probes after it went on failing.
+	if err := s.c.LoadBalancer.EnsureHostRule(ctx, t.Hostname(), *t.Row.CloudRunService); err != nil {
 		return fmt.Errorf("route the tenant's hostname: %w", err)
 	}
 	return nil
