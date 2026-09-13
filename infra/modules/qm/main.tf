@@ -64,9 +64,19 @@ locals {
   # The prefix is shared with the IAM exclusion in iam.tf, which has to match
   # every environment's admin secret rather than just this one's: several
   # environments of this module can live in one project.
-  sql_admin_secret_prefix    = "qm-sql-admin-"
-  sql_admin_secret_id        = "${local.sql_admin_secret_prefix}${var.resource_suffix}"
-  api_database_url_secret_id = "qm-api-database-url-${var.resource_suffix}"
+  sql_admin_secret_prefix        = "qm-sql-admin-"
+  sql_admin_secret_id            = "${local.sql_admin_secret_prefix}${var.resource_suffix}"
+  api_database_url_secret_prefix = "qm-api-database-url-"
+  api_database_url_secret_id     = "${local.api_database_url_secret_prefix}${var.resource_suffix}"
+
+  # Platform secrets, as opposed to the qm-<slug>-<name> tenant secrets the
+  # broad prefix grants in iam.tf are for. Every environment's, not just this
+  # one's: both identities reach their own through an explicit secret-level
+  # binding, so the prefix grants can exclude the whole family.
+  platform_secret_prefixes = [
+    local.sql_admin_secret_prefix,
+    local.api_database_url_secret_prefix,
+  ]
 
   tenant_image_repository_id = local.name
   tenant_image_repository    = "${var.region}-docker.pkg.dev/${var.project_id}/${local.tenant_image_repository_id}"

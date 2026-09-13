@@ -65,6 +65,25 @@ service account is normally the binding one; a long project ID makes it the
 bucket. Enforce that value rather than recomputing it, or a long slug fails
 partway through a provision with some resources already created.
 
+## One environment per project
+
+The per-tenant names the provisioner derives — `qm-<slug>` service account and
+Cloud Run service, `<project>-qm-<slug>` bucket, `qm-<slug>-<name>` secrets —
+carry no `resource_suffix`, and service accounts, buckets and secrets are all
+project-global. Two instances of this module in one project would therefore
+collide on any slug they both provision, and the prefix-conditioned IAM grants
+would let each environment's qm-api read the other's tenant secrets. Platform
+secrets (`qm-sql-admin-*`, `qm-api-database-url-*`) are excluded from those
+grants for exactly that reason, but tenant secrets cannot be without a suffix
+in the name.
+
+So: one enabled QM environment per GCP project. Staging is in `rayai-dev` and
+production in `rayai-prod`, which satisfies that today. Putting a second one
+in either project means adding `resource_suffix` to the tenant naming in
+`internal/qm/provisioner/steps` and `internal/qm/secrets` first, then to the
+prefixes in `main.tf` and the IAM conditions in `iam.tf` together — the Go
+side and this module have to agree on those names.
+
 ## Deletion safety
 
 Every tenant's database is on the one `qm-tenants-<suffix>` instance, so it
@@ -170,6 +189,8 @@ Before `tenant_capacity` approaches that, request an increase for the IAM API
 
 Later qm-api image rollouts are owned by deploy tooling (`deploy-qm-api.yml`
 updates the service and the job to the same SHA), so Terraform ignores image
-drift on those two, matching the `api` module. The redirect service has no
+drift on those two, matching the `api` module. That workflow lands with the
+qm-api change, not with this module; until it does there is nothing to enable
+`enable_qm` for, which is why the flag ships off. The redirect service has no
 deploy-tooling path, so Terraform owns its image: change `redirect_image` and
 apply to roll it.

@@ -44,16 +44,26 @@ locals {
   # to the tenant prefixes. Project-level create permissions are checked
   # against the project itself, where a name prefix cannot match, so those
   # live in an unconditional custom role that carries nothing else.
-  secret_name_prefix = "projects/${local.project_number}/secrets/${local.qm_secret_prefix}"
-  # Every environment's admin secret, not just this one's: two environments of
-  # this module in one project would otherwise leave each qm-api able to read
-  # the other's instance admin password, since the qm-* allow is project wide.
-  sql_admin_secret_name_prefix = "projects/${local.project_number}/secrets/${local.sql_admin_secret_prefix}"
-  tenant_bucket_name_prefix    = "projects/_/buckets/${local.tenant_bucket_prefix}"
+  secret_name_prefix        = "projects/${local.project_number}/secrets/${local.qm_secret_prefix}"
+  tenant_bucket_name_prefix = "projects/_/buckets/${local.tenant_bucket_prefix}"
+
+  # The qm-* allow below is project wide, so it would otherwise reach the
+  # platform secrets of every environment of this module in the project, not
+  # just this one's: another environment's instance admin password and
+  # control-plane DATABASE_URL. qm-api holds an explicit secret-level accessor
+  # binding on its own DATABASE_URL, so excluding the whole family costs it
+  # nothing.
+  platform_secret_exclusions = [
+    for prefix in local.platform_secret_prefixes :
+    "!resource.name.startsWith(\"projects/${local.project_number}/secrets/${prefix}\")"
+  ]
 
   # Shared by every qm-api secret grant that IAM evaluates against the secret
   # itself, so accessor, version-adder and delete cannot drift apart.
-  api_secret_condition = "resource.name.startsWith(\"${local.secret_name_prefix}\") && !resource.name.startsWith(\"${local.sql_admin_secret_name_prefix}\")"
+  api_secret_condition = join(" && ", concat(
+    ["resource.name.startsWith(\"${local.secret_name_prefix}\")"],
+    local.platform_secret_exclusions,
+  ))
 }
 
 # Project-level roles the provisioner needs and that cannot be narrowed by
@@ -243,8 +253,8 @@ resource "google_project_iam_member" "api_secrets" {
   member  = local.api_member
 
   condition {
-    title       = "qm secrets except sql admin"
-    description = "qm-* secrets only; instance admin passwords stay with the provisioner."
+    title       = "qm tenant secrets only"
+    description = "qm-* secrets except the platform ones; qm-api reaches its own DATABASE_URL through a secret-level binding instead."
     expression  = local.api_secret_condition
   }
 }
@@ -286,8 +296,8 @@ resource "google_project_iam_member" "api_secret_delete" {
   member  = local.api_member
 
   condition {
-    title       = "qm secrets except sql admin"
-    description = "qm-* secrets only; instance admin passwords stay with the provisioner."
+    title       = "qm tenant secrets only"
+    description = "qm-* secrets except the platform ones; qm-api reaches its own DATABASE_URL through a secret-level binding instead."
     expression  = local.api_secret_condition
   }
 }
