@@ -184,6 +184,7 @@ def main() -> int:
 
         for src, dst in [
             ("bin/proxy", f"/tmp/proxy-{sha}"),
+            ("bin/check-legacy-heartbeat", f"/tmp/check-legacy-heartbeat-{sha}"),
             ("deploy/proxy.service", "/tmp/proxy.service"),
         ]:
             subprocess.run(
@@ -199,6 +200,7 @@ def main() -> int:
         deploy_script = textwrap.dedent(f"""
             set -euo pipefail
 
+            chmod 0755 /tmp/check-legacy-heartbeat-{sha}
             peer_identity=""
             if sudo test -f /etc/superserve/peer/identity.json; then
                 # Shared with the refresh worker through systemd credential load.
@@ -226,22 +228,35 @@ def main() -> int:
             peer_listen_addr=""
             peer_endpoint_changed=0
             existing_peer_listen_addr=""
+            legacy_heartbeat_ready() {{
+                pid=$(systemctl show -p MainPID --value {service})
+                started=$(systemctl show -p ExecMainStartTimestamp --value {service})
+                # Round up to exclude a heartbeat just before this process started.
+                started=$(date -d "$started" +%s) || return 1
+                started=$((started + 1))
+                host_ip=$(curl -fsS --max-time 2 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip) || return 1
+                sudo /tmp/check-legacy-heartbeat-{sha} --pid "$pid" --started "$started" --address "$host_ip:50051"
+            }}
             wait_for_vmd_ready() {{
                 # Type=simple becomes active before VMD can serve requests.
                 # Readiness and endpoint acknowledgement must belong to the
                 # still-current invocation before old routing can be retired.
+                local deadline=$((SECONDS + 90))
+                local verification_host_id
+                verification_host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/vmd.env | head -n1)
                 for attempt in $(seq 1 90); do
+                    [ "$SECONDS" -lt "$deadline" ] || break
                     invocation=$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)
                     if [ -n "$invocation" ] \
                        && sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'gRPC serving requests' --no-pager >/dev/null 2>&1 \
-                       && sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'host endpoint heartbeat accepted' --no-pager >/dev/null 2>&1 \
+                       && {{ if [ "$verification_host_id" = default ]; then legacy_heartbeat_ready; else sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'host endpoint heartbeat accepted' --no-pager >/dev/null 2>&1; fi; }} \
                        && [ "$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)" = "$invocation" ] \
                        && sudo systemctl is-active --quiet {service}; then
                         return 0
                     fi
                     sleep 1
                 done
-                echo "ERROR: {service} did not reach application readiness and endpoint acknowledgement within 90s" >&2
+                echo "ERROR: {service} did not reach application readiness and endpoint acknowledgement within 90s (legacy default requires a fresh DB heartbeat)" >&2
                 return 1
             }}
             rollback_peer_advertisement() {{
@@ -287,6 +302,7 @@ def main() -> int:
                     fi
                 fi
                 sudo rm -rf "$rollback_dir"
+                rm -f /tmp/check-legacy-heartbeat-{sha}
                 exit "$result"
             }}
             trap finish_deployment EXIT

@@ -759,3 +759,32 @@ they can contain sensitive state.
 
 Review unrelated monitoring drift separately after admission; a targeted plan
 is not evidence that the whole staging configuration has converged.
+
+
+## Legacy serving-host peer ingress verification
+
+The `default` host can send accepted, description-less heartbeats. It does not
+emit `host endpoint heartbeat accepted` unless it supplies the complete named
+host description; absence of that log alone is not a heartbeat failure.
+Do not add region/capacity/address claims merely to satisfy the deploy gate:
+that can bind the legacy identity and changes its migration semantics.
+
+Proxy deployment builds and uploads `check-legacy-heartbeat` with the proxy.
+For an explicit `HOST_ID=default`, the readiness gate requires gRPC readiness
+from the current systemd invocation and a read-only database receipt. The helper
+reads the running VMD's existing `DATABASE_URL` without printing it and accepts
+only an unbound `default` row whose registered VMD address matches this host's
+metadata IP on port 50051. Its heartbeat must be newer than the VMD start and
+less than 60 seconds old. Missing credentials, database failures, stale receipts,
+identity binding, address mismatch, or a changed service invocation fail closed.
+Host/DB clock disagreement can also fail this conservative timestamp check;
+check clock synchronization rather than bypassing it. Named hosts retain the
+endpoint acknowledgement requirement. Rollback uses the same gate against the
+new rollback invocation; failed rollback retains its snapshots.
+
+The legacy directory `proxy_addr` may remain its existing hostname. Ownership
+routing deliberately uses the registered `vmd_addr` IP plus port 5009 and does
+not require mutating `proxy_addr` or binding the legacy identity. Enabling the
+private listener still requires valid peer credentials and bidirectional TLS
+verification. Keep `PEER_ROUTING_ENABLED=0` through ingress rollout; enabling
+routing remains a separate, deliberate deployment after ingress checks pass.
