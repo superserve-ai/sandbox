@@ -39,33 +39,37 @@ func (f *fakeFailures) check(call string) error {
 type fakeAccounts struct {
 	fakeFailures
 	mu       sync.Mutex
-	accounts map[string]bool
+	accounts map[string]string   // email -> description (the ownership marker)
 	grants   map[string][]string // secret name -> accounts
 	creates  int
 	deletes  int
 }
 
 func newFakeAccounts() *fakeAccounts {
-	return &fakeAccounts{accounts: map[string]bool{}, grants: map[string][]string{}}
+	return &fakeAccounts{accounts: map[string]string{}, grants: map[string][]string{}}
 }
 
-func (f *fakeAccounts) Exists(_ context.Context, email string) (bool, error) {
-	if err := f.check("accounts.Exists"); err != nil {
-		return false, err
+func (f *fakeAccounts) Get(_ context.Context, email string) (ServiceAccount, bool, error) {
+	if err := f.check("accounts.Get"); err != nil {
+		return ServiceAccount{}, false, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.accounts[email], nil
+	description, ok := f.accounts[email]
+	if !ok {
+		return ServiceAccount{}, false, nil
+	}
+	return ServiceAccount{Email: email, Description: description}, true, nil
 }
 
-func (f *fakeAccounts) Create(_ context.Context, accountID, _ string) (string, error) {
+func (f *fakeAccounts) Create(_ context.Context, accountID, _, description string) (string, error) {
 	if err := f.check("accounts.Create"); err != nil {
 		return "", err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	email := accountID + "@example-project.iam.gserviceaccount.com"
-	f.accounts[email] = true
+	f.accounts[email] = description
 	f.creates++
 	return email, nil
 }
@@ -217,7 +221,7 @@ func (f *fakeDatabases) empty() bool {
 type fakeBuckets struct {
 	fakeFailures
 	mu      sync.Mutex
-	buckets map[string]string // name -> location
+	buckets map[string]map[string]string // name -> labels
 	access  map[string][]string
 	hmac    map[string]string // accessID -> account
 	created int
@@ -225,26 +229,26 @@ type fakeBuckets struct {
 }
 
 func newFakeBuckets() *fakeBuckets {
-	return &fakeBuckets{buckets: map[string]string{}, access: map[string][]string{}, hmac: map[string]string{}}
+	return &fakeBuckets{buckets: map[string]map[string]string{}, access: map[string][]string{}, hmac: map[string]string{}}
 }
 
-func (f *fakeBuckets) Exists(_ context.Context, name string) (bool, error) {
-	if err := f.check("buckets.Exists"); err != nil {
-		return false, err
+func (f *fakeBuckets) Get(_ context.Context, name string) (map[string]string, bool, error) {
+	if err := f.check("buckets.Get"); err != nil {
+		return nil, false, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	_, ok := f.buckets[name]
-	return ok, nil
+	labels, ok := f.buckets[name]
+	return labels, ok, nil
 }
 
-func (f *fakeBuckets) Create(_ context.Context, name, location, _ string) error {
+func (f *fakeBuckets) Create(_ context.Context, name, _, _ string, labels map[string]string) error {
 	if err := f.check("buckets.Create"); err != nil {
 		return err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.buckets[name] = location
+	f.buckets[name] = labels
 	f.created++
 	return nil
 }
@@ -335,7 +339,7 @@ func (f *fakeServices) Get(_ context.Context, name string) (ServiceStatus, bool,
 	if !ok {
 		return ServiceStatus{}, false, nil
 	}
-	return ServiceStatus{URI: "https://" + name + ".run.app", Revision: name + "-0001", ImageTag: spec.Image}, true, nil
+	return ServiceStatus{URI: "https://" + name + ".run.app", Revision: name + "-0001", ImageTag: spec.Image, Labels: spec.Labels}, true, nil
 }
 
 func (f *fakeServices) Deploy(_ context.Context, spec ServiceSpec) (ServiceStatus, error) {
@@ -344,6 +348,13 @@ func (f *fakeServices) Deploy(_ context.Context, spec ServiceSpec) (ServiceStatu
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Mirrors the real client: a service that is not this tenant's is not
+	// retry state, and patching it would take over whatever it is.
+	if existing, ok := f.services[spec.Name]; ok {
+		if want := spec.Labels[TenantLabelKey]; want == "" || existing.Labels[TenantLabelKey] != want {
+			return ServiceStatus{}, fmt.Errorf("fake: service %s does not belong to this tenant", spec.Name)
+		}
+	}
 	f.services[spec.Name] = spec
 	f.deploys++
 	return ServiceStatus{URI: "https://" + spec.Name + ".run.app", Revision: spec.Name + "-0001", ImageTag: spec.Image}, nil

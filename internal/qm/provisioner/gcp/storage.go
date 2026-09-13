@@ -54,34 +54,34 @@ func NewBuckets(ctx context.Context, project string, opts ...option.ClientOption
 	return &Buckets{svc: svc, project: project}, nil
 }
 
-func (b *Buckets) Exists(ctx context.Context, name string) (bool, error) {
-	_, err := b.svc.Buckets.Get(name).Context(ctx).Do()
+func (b *Buckets) Get(ctx context.Context, name string) (map[string]string, bool, error) {
+	bucket, err := b.svc.Buckets.Get(name).Context(ctx).Do()
 	switch {
 	case err == nil:
-		return true, nil
+		return bucket.Labels, true, nil
 	case notFound(err):
-		return false, nil
+		return nil, false, nil
 	case isStatus(err, http.StatusForbidden):
 		// A name taken by another project: the bucket namespace is global,
 		// so this is a naming collision, not a permissions bug, and it is
 		// not something a retry will resolve.
-		return false, fmt.Errorf("bucket %s exists in another project", name)
+		return nil, false, fmt.Errorf("bucket %s exists in another project", name)
 	default:
-		return false, fmt.Errorf("get bucket %s: %w", name, err)
+		return nil, false, fmt.Errorf("get bucket %s: %w", name, err)
 	}
 }
 
 // Create makes the bucket with uniform bucket-level access — the only way
 // the IAM binding GrantAccess adds is authoritative, since object ACLs
 // would otherwise be a second, invisible grant path.
-func (b *Buckets) Create(ctx context.Context, name, location, lifecycleJSON string) error {
+func (b *Buckets) Create(ctx context.Context, name, location, lifecycleJSON string, labels map[string]string) error {
 	spec := &storage.Bucket{
 		Name:     name,
 		Location: location,
 		IamConfiguration: &storage.BucketIamConfiguration{
 			UniformBucketLevelAccess: &storage.BucketIamConfigurationUniformBucketLevelAccess{Enabled: true},
 		},
-		Labels: map[string]string{"managed-by": "qm-api"},
+		Labels: labels,
 	}
 	// Trimmed, matching the step's readiness check: a value of nothing but
 	// whitespace is no policy, not a policy that fails to parse.

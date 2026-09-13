@@ -29,10 +29,14 @@ type HMACKey struct {
 // it, so a teardown that did not would fail forever on any tenant that had
 // used its storage.
 type BucketAdmin interface {
-	Exists(ctx context.Context, name string) (bool, error)
-	// Create makes the bucket in location with uniform bucket-level access
-	// and, when lifecycleJSON is non-empty, that lifecycle policy.
-	Create(ctx context.Context, name, location, lifecycleJSON string) error
+	// Get returns the bucket's labels, or exists=false when there is none.
+	// The labels are what tell a bucket this tenant owns from one that
+	// merely has the name its slug derives.
+	Get(ctx context.Context, name string) (labels map[string]string, exists bool, err error)
+	// Create makes the bucket in location with uniform bucket-level access,
+	// the given labels, and — when lifecycleJSON is non-empty — that
+	// lifecycle policy.
+	Create(ctx context.Context, name, location, lifecycleJSON string, labels map[string]string) error
 	Delete(ctx context.Context, name string) error
 	// GrantAccess binds roles/storage.objectAdmin on the bucket to the
 	// tenant's service account.
@@ -111,14 +115,17 @@ func (s bucket) Run(ctx context.Context, t *provisioner.Tenant) error {
 	}
 	account := *t.Row.ServiceAccount
 
-	exists, err := s.c.Buckets.Exists(ctx, name)
-	if err != nil {
+	labels := TenantLabels(t.Row.ID.String(), t.Row.Slug)
+	existing, exists, err := s.c.Buckets.Get(ctx, name)
+	switch {
+	case err != nil:
 		return fmt.Errorf("look up the tenant's bucket: %w", err)
-	}
-	if !exists {
-		if err := s.c.Buckets.Create(ctx, name, t.Env.BucketLocation, t.Env.BucketLifecycleJSON); err != nil {
+	case !exists:
+		if err := s.c.Buckets.Create(ctx, name, t.Env.BucketLocation, t.Env.BucketLifecycleJSON, labels); err != nil {
 			return fmt.Errorf("create the tenant's bucket: %w", err)
 		}
+	case existing[TenantLabelKey] != t.Row.ID.String():
+		return fmt.Errorf("bucket %s already exists and does not belong to this tenant", name)
 	}
 	if err := s.c.Buckets.GrantAccess(ctx, name, account); err != nil {
 		return fmt.Errorf("grant the tenant access to its bucket: %w", err)
@@ -261,6 +268,15 @@ func (s bucket) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	name := BucketName(t.Env.Project, t.Row.Slug)
 	if t.Row.BucketName != nil {
 		name = *t.Row.BucketName
+	}
+	// As on the way up: emptying and deleting a bucket that is not this
+	// tenant's would destroy whatever is in it.
+	existing, exists, err := s.c.Buckets.Get(ctx, name)
+	if err != nil {
+		return fmt.Errorf("look up the tenant's bucket: %w", err)
+	}
+	if exists && existing[TenantLabelKey] != t.Row.ID.String() {
+		return fmt.Errorf("bucket %s does not belong to this tenant; not deleting it", name)
 	}
 	if err := s.c.Buckets.Delete(ctx, name); err != nil {
 		return fmt.Errorf("delete the tenant's bucket: %w", err)

@@ -103,9 +103,17 @@ func (s *Services) Get(ctx context.Context, name string) (steps.ServiceStatus, b
 func (s *Services) Deploy(ctx context.Context, spec steps.ServiceSpec) (steps.ServiceStatus, error) {
 	desired := s.desiredService(spec)
 
-	_, exists, err := s.Get(ctx, spec.Name)
+	current, exists, err := s.Get(ctx, spec.Name)
 	if err != nil {
 		return steps.ServiceStatus{}, err
+	}
+	// A service named qm-<slug> that is not this tenant's is not retry
+	// state: patching it would replace whatever it is with tenant code and
+	// hand it to that tenant's teardown to delete.
+	if exists {
+		if want := spec.Labels[steps.TenantLabelKey]; want == "" || current.Labels[steps.TenantLabelKey] != want {
+			return steps.ServiceStatus{}, fmt.Errorf("service %s already exists and does not belong to this tenant", spec.Name)
+		}
 	}
 	var op *run.GoogleLongrunningOperation
 	if exists {
@@ -116,7 +124,17 @@ func (s *Services) Deploy(ctx context.Context, spec steps.ServiceSpec) (steps.Se
 	} else {
 		op, err = s.svc.Projects.Locations.Services.Create(s.parent(), desired).ServiceId(spec.Name).Context(ctx).Do()
 		if alreadyExists(err) {
-			// Raced with another attempt; the update path converges.
+			// Raced with another attempt, or the Get above was stale. The
+			// update path converges, but only after the same ownership
+			// check — a service that appeared in between is no more this
+			// tenant's than one that was there all along.
+			raced, exists, gerr := s.Get(ctx, spec.Name)
+			if gerr != nil {
+				return steps.ServiceStatus{}, gerr
+			}
+			if exists && raced.Labels[steps.TenantLabelKey] != spec.Labels[steps.TenantLabelKey] {
+				return steps.ServiceStatus{}, fmt.Errorf("service %s already exists and does not belong to this tenant", spec.Name)
+			}
 			op, err = s.patch(ctx, spec.Name, desired)
 		}
 		if err != nil {
@@ -300,7 +318,7 @@ func operationError(op *run.GoogleLongrunningOperation) error {
 }
 
 func statusOf(svc *run.GoogleCloudRunV2Service) steps.ServiceStatus {
-	status := steps.ServiceStatus{URI: svc.Uri, Revision: svc.LatestReadyRevision}
+	status := steps.ServiceStatus{URI: svc.Uri, Revision: svc.LatestReadyRevision, Labels: svc.Labels}
 	if svc.Template != nil && len(svc.Template.Containers) > 0 {
 		status.ImageTag = svc.Template.Containers[0].Image
 	}

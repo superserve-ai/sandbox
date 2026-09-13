@@ -10,13 +10,28 @@ import (
 )
 
 // Slug rules mirror the qm_tenants_slug_dns_label check constraint: an RFC
-// 1123 label of 3–40 characters. Reserved names are the hostnames the
-// platform itself may need under the base domain.
+// 1123 label of 3–40 characters.
+//
+// Reserved names are the hostnames the platform may need under the base
+// domain, plus the words the QM Terraform module builds its own resource
+// names from. The latter matter because a tenant's service account, Cloud
+// Run service and bucket are all named after its slug: a tenant slugged
+// "provisioner-stg-usc1" derives the account name the provisioner itself
+// runs as. Reserved as a first label too, not only whole — the platform's
+// names are "<word>-<suffix>" and the suffix is not known here.
+//
+// This is defence in depth rather than the guarantee. Every step also
+// refuses to adopt a resource that does not carry this tenant's own marker,
+// which is what covers the names nobody thought to list.
 var (
 	slugRe        = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$`)
 	reservedSlugs = map[string]bool{
 		"www": true, "api": true, "admin": true, "mail": true, "qm": true,
 		"app": true, "console": true, "docs": true, "status": true,
+		// Named by the Terraform module: qm-api-*, qm-provisioner-*,
+		// qm-redirect-*, qm-sql-admin-*, qm-tenants-*, qm-resend-*.
+		"provisioner": true, "redirect": true, "sql": true,
+		"tenants": true, "resend": true,
 	}
 
 	// The schema allows slack as well, and the column keeps it so the
@@ -44,10 +59,19 @@ func ValidateSlug(slug string) string {
 		return "Slug must be 3–40 characters."
 	case !slugRe.MatchString(slug):
 		return "Slug may contain only lowercase letters, digits and hyphens, and must start and end with a letter or digit."
-	case reservedSlugs[slug]:
+	case reservedSlugs[slug], reservedSlugs[firstLabel(slug)]:
 		return "This slug is reserved."
 	}
 	return slugAvailableMsg
+}
+
+// firstLabel is the slug up to its first hyphen, which is what a reserved
+// word has to be checked against: the platform's resources are named
+// "qm-<word>-<suffix>", so "provisioner-stg-usc1" collides just as
+// "provisioner" does.
+func firstLabel(slug string) string {
+	first, _, _ := strings.Cut(slug, "-")
+	return first
 }
 
 // CreateTenantRequest is the POST /v1/qm/tenants body.

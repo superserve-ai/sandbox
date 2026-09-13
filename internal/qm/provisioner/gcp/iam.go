@@ -52,22 +52,24 @@ func (a *Accounts) accountPath(email string) string {
 	return "projects/" + a.project + "/serviceAccounts/" + email
 }
 
-func (a *Accounts) Exists(ctx context.Context, email string) (bool, error) {
-	_, err := a.iam.Projects.ServiceAccounts.Get(a.accountPath(email)).Context(ctx).Do()
+func (a *Accounts) Get(ctx context.Context, email string) (steps.ServiceAccount, bool, error) {
+	account, err := a.iam.Projects.ServiceAccounts.Get(a.accountPath(email)).Context(ctx).Do()
 	switch {
 	case err == nil:
-		return true, nil
+		return steps.ServiceAccount{Email: account.Email, Description: account.Description}, true, nil
 	case notFound(err):
-		return false, nil
+		return steps.ServiceAccount{}, false, nil
 	default:
-		return false, fmt.Errorf("get service account %s: %w", email, err)
+		return steps.ServiceAccount{}, false, fmt.Errorf("get service account %s: %w", email, err)
 	}
 }
 
-func (a *Accounts) Create(ctx context.Context, accountID, displayName string) (string, error) {
+// Create makes the account carrying description, which is the marker the
+// caller checks before it will adopt an account that already exists.
+func (a *Accounts) Create(ctx context.Context, accountID, displayName, description string) (string, error) {
 	account, err := a.iam.Projects.ServiceAccounts.Create("projects/"+a.project, &iam.CreateServiceAccountRequest{
 		AccountId:      accountID,
-		ServiceAccount: &iam.ServiceAccount{DisplayName: displayName},
+		ServiceAccount: &iam.ServiceAccount{DisplayName: displayName, Description: description},
 	}).Context(ctx).Do()
 	if err == nil {
 		return account.Email, nil
@@ -75,13 +77,19 @@ func (a *Accounts) Create(ctx context.Context, accountID, displayName string) (s
 	if !alreadyExists(err) {
 		return "", fmt.Errorf("create service account %s: %w", accountID, err)
 	}
-	// Raced with another attempt, or adopting one a previous run left
-	// behind. Either way the account the caller asked for now exists, and
-	// its email is derived from the id it was created with.
+	// Raced with another attempt, or the caller's Get was stale. The
+	// account now exists, so it goes through the same ownership check
+	// rather than being adopted on the strength of its name.
 	email := accountID + "@" + a.project + ".iam.gserviceaccount.com"
-	existing, err := a.iam.Projects.ServiceAccounts.Get(a.accountPath(email)).Context(ctx).Do()
+	existing, exists, err := a.Get(ctx, email)
 	if err != nil {
 		return "", fmt.Errorf("get the existing service account %s: %w", accountID, err)
+	}
+	if !exists {
+		return "", fmt.Errorf("service account %s reported as existing but cannot be read", accountID)
+	}
+	if existing.Description != description {
+		return "", fmt.Errorf("service account %s already exists and does not belong to this tenant", email)
 	}
 	return existing.Email, nil
 }

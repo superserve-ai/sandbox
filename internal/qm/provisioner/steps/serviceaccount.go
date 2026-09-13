@@ -18,8 +18,11 @@ import (
 // a no-op; GrantSecretAccess adds a binding that is already there without
 // complaint.
 type ServiceAccountAdmin interface {
-	Exists(ctx context.Context, email string) (bool, error)
-	Create(ctx context.Context, accountID, displayName string) (email string, err error)
+	// Get returns the account, or exists=false when there is none by that
+	// name. The description comes back because it is the only field a
+	// service account has to carry an ownership marker in.
+	Get(ctx context.Context, email string) (account ServiceAccount, exists bool, err error)
+	Create(ctx context.Context, accountID, displayName, description string) (email string, err error)
 	Delete(ctx context.Context, email string) error
 	// GrantSecretAccess binds roles/secretmanager.secretAccessor on one
 	// secret to the account.
@@ -29,6 +32,12 @@ type ServiceAccountAdmin interface {
 	// with it, but the platform's shared ones outlive every tenant, and
 	// deleting a service account does not remove the bindings naming it.
 	RevokeSecretAccess(ctx context.Context, secretName, email string) error
+}
+
+// ServiceAccount is what Get reports about an existing identity.
+type ServiceAccount struct {
+	Email       string
+	Description string
 }
 
 var errNoServiceAccountAdmin = errors.New("no service account client configured")
@@ -67,19 +76,28 @@ func (s serviceAccount) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if s.c.Accounts == nil {
 		return errNoServiceAccountAdmin
 	}
+	want := ServiceAccountDescription(t.Row.ID.String(), t.Row.Slug)
 	// Check-then-create against the cloud, not against the row: a run that
 	// created the account and died before recording it must converge, not
 	// fail on a name that is already taken.
-	exists, err := s.c.Accounts.Exists(ctx, email)
-	if err != nil {
+	existing, exists, err := s.c.Accounts.Get(ctx, email)
+	switch {
+	case err != nil:
 		return fmt.Errorf("look up service account: %w", err)
-	}
-	if !exists {
-		created, err := s.c.Accounts.Create(ctx, ServiceAccountID(t.Row.Slug), "QM tenant "+t.Row.Slug)
+	case !exists:
+		created, err := s.c.Accounts.Create(ctx, ServiceAccountID(t.Row.Slug), "QM tenant "+t.Row.Slug, want)
 		if err != nil {
 			return fmt.Errorf("create service account: %w", err)
 		}
 		email = created
+	case existing.Description != want:
+		// An account with the name this slug derives, that is not this
+		// tenant's. Adopting it would run tenant code as whatever identity
+		// it is — the platform's own provisioner account is a qm-<word>
+		// name too — and teardown would then delete it. Slug validation
+		// reserves the names we know; this is the check that does not
+		// depend on knowing them.
+		return fmt.Errorf("service account %s already exists and does not belong to this tenant", email)
 	}
 	if t.Row.ServiceAccount != nil && *t.Row.ServiceAccount == email {
 		return provisioner.Skip("service account " + email + " already recorded")
@@ -105,6 +123,16 @@ func (s serviceAccount) Rollback(ctx context.Context, t *provisioner.Tenant) err
 	email := ServiceAccountEmail(t.Env.Project, t.Row.Slug)
 	if t.Row.ServiceAccount != nil {
 		email = *t.Row.ServiceAccount
+	}
+	// Same check on the way down, and for the same reason: a teardown that
+	// deleted an account merely because its name matched would take the
+	// platform's own identity with it.
+	existing, exists, err := s.c.Accounts.Get(ctx, email)
+	if err != nil {
+		return fmt.Errorf("look up service account: %w", err)
+	}
+	if exists && existing.Description != ServiceAccountDescription(t.Row.ID.String(), t.Row.Slug) {
+		return fmt.Errorf("service account %s does not belong to this tenant; not deleting it", email)
 	}
 	if err := s.c.Accounts.Delete(ctx, email); err != nil {
 		return fmt.Errorf("delete service account: %w", err)

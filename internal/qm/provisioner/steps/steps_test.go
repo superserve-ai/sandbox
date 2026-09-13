@@ -491,6 +491,103 @@ func TestGeneratedSecretsSatisfyTheTenantImage(t *testing.T) {
 	}
 }
 
+// A tenant's service account, Cloud Run service and bucket are all named
+// after its slug, so a slug can be chosen to land on a name that already
+// exists. Adopting one would run tenant code as whatever identity it is —
+// the platform's own provisioner account is a qm-<word> name too — replace
+// whatever that service was, and hand all of it to teardown to delete. So
+// each step adopts only what carries this tenant's own marker.
+func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		plant func(*tenantFixture)
+		wants string
+	}{
+		{
+			"a service account with the name the slug derives",
+			func(f *tenantFixture) {
+				f.accounts.mu.Lock()
+				f.accounts.accounts["qm-pilot-team@example-project.iam.gserviceaccount.com"] = "the platform's provisioner"
+				f.accounts.mu.Unlock()
+			},
+			"does not belong to this tenant",
+		},
+		{
+			"a bucket with the name the slug derives",
+			func(f *tenantFixture) {
+				f.buckets.mu.Lock()
+				f.buckets.buckets["example-project-qm-pilot-team"] = map[string]string{"owner": "somebody else"}
+				f.buckets.mu.Unlock()
+			},
+			"does not belong to this tenant",
+		},
+		{
+			"a cloud run service with the name the slug derives",
+			func(f *tenantFixture) {
+				f.services.mu.Lock()
+				f.services.services["qm-pilot-team"] = ServiceSpec{Name: "qm-pilot-team", Labels: map[string]string{"qm-tenant-id": "somebody-else"}}
+				f.services.mu.Unlock()
+			},
+			"does not belong to this tenant",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, false)
+			tc.plant(f)
+			err := f.provision(t)
+			if err == nil {
+				t.Fatal("the provision adopted a resource it does not own")
+			}
+			if !strings.Contains(err.Error(), tc.wants) {
+				t.Errorf("err = %v", err)
+			}
+			if f.current(t).Status != tenantstore.StatusFailed {
+				t.Errorf("status = %s", f.current(t).Status)
+			}
+		})
+	}
+}
+
+// And teardown will not delete one either: a tenant whose slug collided must
+// not take the resource it collided with down with it.
+func TestTeardownRefusesResourcesItDoesNotOwn(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	// Something else takes over the names between provision and teardown.
+	f.accounts.mu.Lock()
+	f.accounts.accounts["qm-pilot-team@example-project.iam.gserviceaccount.com"] = "the platform's provisioner"
+	f.accounts.mu.Unlock()
+
+	if err := f.deprovision(t); err == nil {
+		t.Fatal("teardown deleted a resource it does not own")
+	}
+	if _, ok := f.accounts.accounts["qm-pilot-team@example-project.iam.gserviceaccount.com"]; !ok {
+		t.Error("the account that did not belong to this tenant was deleted")
+	}
+}
+
+// The marker every step keys on is the tenant's id, not its slug: the slug
+// is chosen by whoever created the tenant.
+func TestTenantMarkersKeyOnTheTenantID(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	id := f.row.ID.String()
+	spec, _ := f.services.spec("qm-pilot-team")
+	if spec.Labels[TenantLabelKey] != id {
+		t.Errorf("service labels = %v", spec.Labels)
+	}
+	if f.buckets.buckets["example-project-qm-pilot-team"][TenantLabelKey] != id {
+		t.Errorf("bucket labels = %v", f.buckets.buckets["example-project-qm-pilot-team"])
+	}
+	if got := f.accounts.accounts["qm-pilot-team@example-project.iam.gserviceaccount.com"]; !strings.Contains(got, id) {
+		t.Errorf("service account description = %q", got)
+	}
+}
+
 // ── Idempotence ──────────────────────────────────────────────────────────
 
 func TestProvisionIsIdempotent(t *testing.T) {

@@ -28,7 +28,11 @@ type ServiceSpec struct {
 	// route to the shared Cloud SQL instance's private IP.
 	Network    string
 	Subnetwork string
-	// Labels tag the service with the tenant it belongs to.
+	// Labels tag the service with the tenant it belongs to. Deploy must
+	// refuse to update an existing service that does not already carry the
+	// tenant marker among them: the service name is derived from a slug,
+	// and taking over a service that merely shares that name would break
+	// whatever it was and hand it to teardown to delete.
 	Labels map[string]string
 }
 
@@ -37,6 +41,9 @@ type ServiceStatus struct {
 	URI      string
 	Revision string
 	ImageTag string
+	// Labels is what an existing service carries, so a caller can tell one
+	// this tenant owns from one that merely has the name its slug derives.
+	Labels map[string]string
 }
 
 // CloudRunAdmin deploys the tenant service (Cloud Run Admin API, run/v2
@@ -146,7 +153,7 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 		SecretEnv:      secretEnv,
 		Network:        t.Env.VPCNetwork,
 		Subnetwork:     t.Env.VPCSubnetwork,
-		Labels:         map[string]string{"qm-tenant": t.Row.Slug},
+		Labels:         TenantLabels(t.Row.ID.String(), t.Row.Slug),
 	})
 	if err != nil {
 		return fmt.Errorf("deploy the tenant's service: %w", err)
@@ -242,6 +249,15 @@ func (s cloudRun) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	name := ServiceName(t.Row.Slug)
 	if t.Row.CloudRunService != nil {
 		name = *t.Row.CloudRunService
+	}
+	// As on the way up: a service that carries somebody else's marker, or
+	// none, is not this tenant's to delete.
+	status, exists, err := s.c.Services.Get(ctx, name)
+	if err != nil {
+		return fmt.Errorf("look up the tenant's service: %w", err)
+	}
+	if exists && status.Labels[TenantLabelKey] != t.Row.ID.String() {
+		return fmt.Errorf("cloud run service %s does not belong to this tenant; not deleting it", name)
 	}
 	if err := s.c.Services.Delete(ctx, name); err != nil {
 		return fmt.Errorf("delete the tenant's service: %w", err)

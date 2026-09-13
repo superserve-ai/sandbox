@@ -85,6 +85,26 @@ func DatabaseName(slug string) string {
 	return "qm_" + strings.ReplaceAll(slug, "-", "_")
 }
 
+// TenantLabelKey carries the tenant a runtime-created resource belongs to.
+// The value is the tenant's id rather than its slug: the slug is chosen by
+// whoever created the tenant, and this is the marker that decides whether an
+// existing resource may be adopted.
+const TenantLabelKey = "qm-tenant-id"
+
+// TenantLabels are the labels every per-tenant resource carries. The slug is
+// there for whoever is reading the console; the id is what is checked.
+func TenantLabels(tenantID, slug string) map[string]string {
+	return map[string]string{TenantLabelKey: tenantID, "qm-tenant": slug}
+}
+
+// ServiceAccountDescription is the marker a tenant's service account carries,
+// since service accounts take no labels. Same purpose as TenantLabels: it is
+// what tells this tenant's account apart from an account that merely happens
+// to have the name a slug derives.
+func ServiceAccountDescription(tenantID, slug string) string {
+	return "QM tenant " + slug + " (" + tenantID + ")"
+}
+
 // RoleName is the tenant's Postgres role on the shared instance. It shares
 // the database's name: one role, one database, and nothing else on the
 // instance the role may connect to.
