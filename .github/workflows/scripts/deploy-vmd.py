@@ -341,6 +341,18 @@ def main() -> int:
     # Empty = skip, so a fleet-wide deploy never writes a redirect to a host
     # whose resolver isn't on this port. Set per host/region to match unbound.
     dns_redirect_port = os.environ.get("VMD_DNS_REDIRECT_PORT", "")
+    drain_enabled = os.environ.get("VMD_DRAIN_ENABLED", "")
+    admission_caller = os.environ.get("VMD_ADMISSION_CALLER_EMAIL", "")
+    if drain_enabled not in ("", "true"):
+        raise SystemExit("VMD_DRAIN_ENABLED may only enroll with true; disabling a persisted fence requires a separate retirement procedure")
+    if drain_enabled and (not admission_caller.endswith(".iam.gserviceaccount.com") or any(c.isspace() for c in admission_caller)):
+        raise SystemExit("VMD_ADMISSION_CALLER_EMAIL must name the authorized control-plane service account")
+    drain_config = ""
+    if drain_enabled:
+        for key, value in (("VMD_DRAIN_ENABLED", drain_enabled), ("VMD_ADMISSION_CALLER_EMAIL", admission_caller)):
+            drain_config += f"sudo sed -i '/^{key}=/d' /etc/sandbox/vmd.env\n"
+            drain_config += f"printf '%s\\n' {shlex.quote(key + '=' + value)} | sudo tee -a /etc/sandbox/vmd.env >/dev/null\n"
+
 
     # Pre-quote every value injected into the remote shell script. These come
     # from CI secrets / Secret Manager and must be treated as arbitrary text:
@@ -955,6 +967,7 @@ def main() -> int:
             fi
 
             {host_capacity}
+            {drain_config}
 
             # Upsert SECRETSPROXY_SOCKET on both env files. The daemon writes
             # its control socket into RuntimeDirectory=/run/secretsproxy under

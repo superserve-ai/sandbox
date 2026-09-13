@@ -61,6 +61,7 @@ on:
       - 'internal/shellquote/**'
       - 'internal/telemetry/**'
       - 'internal/vm/**'
+      - 'internal/admission/**'
       - 'internal/vmdclient/**'
       - 'deploy/superserve-vmd.service'
       - 'deploy/superserve-vmd.socket'
@@ -194,6 +195,8 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
           INTERNAL_API_TOKEN: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
           DEPLOY_CELL: staging
+          VMD_DRAIN_ENABLED: ${{ vars.VMD_DRAIN_ENABLED_STAGING }}
+          VMD_ADMISSION_CALLER_EMAIL: ${{ vars.VMD_ADMISSION_CALLER_EMAIL_STAGING }}
           VMD_SCHEDULABLE_MEMORY_MIB: ${{ vars.VMD_SCHEDULABLE_MEMORY_MIB_STAGING }}
           VMD_SCHEDULABLE_VCPUS: ${{ vars.VMD_SCHEDULABLE_VCPUS_STAGING }}
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
@@ -302,6 +305,8 @@ jobs:
           VMD_SCHEDULABLE_MEMORY_MIB: ${{ vars.VMD_SCHEDULABLE_MEMORY_MIB_USE4 }}
           VMD_SCHEDULABLE_VCPUS: ${{ vars.VMD_SCHEDULABLE_VCPUS_USE4 }}
           DEPLOY_CELL: use4
+          VMD_DRAIN_ENABLED: ${{ vars.VMD_DRAIN_ENABLED_USE4 }}
+          VMD_ADMISSION_CALLER_EMAIL: ${{ vars.VMD_ADMISSION_CALLER_EMAIL_USE4 }}
           VMD_STANDBY_HOST_USE4: ${{ vars.VMD_STANDBY_HOST_USE4 }}
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
@@ -385,6 +390,8 @@ jobs:
           VMD_SCHEDULABLE_MEMORY_MIB: ${{ vars.VMD_SCHEDULABLE_MEMORY_MIB_USW2 }}
           VMD_SCHEDULABLE_VCPUS: ${{ vars.VMD_SCHEDULABLE_VCPUS_USW2 }}
           DEPLOY_CELL: usw2
+          VMD_DRAIN_ENABLED: ${{ vars.VMD_DRAIN_ENABLED_USW2 }}
+          VMD_ADMISSION_CALLER_EMAIL: ${{ vars.VMD_ADMISSION_CALLER_EMAIL_USW2 }}
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USW }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}

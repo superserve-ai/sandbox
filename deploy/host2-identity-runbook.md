@@ -673,3 +673,9 @@ change its identity just to satisfy a named-host deployment gate.
 
 Staging replacement plans, admission checks and execution evidence remain in
 the migration branch's runbook. They are not production bootstrap operations.
+
+## Drain after admission
+
+Use [the drain runbook](host-drain-runbook.md) after the control-plane and daemon
+protocol upgrades. Drain preserves peer ingress and owner routing. Never remove
+serving labels or stop the proxy to prevent new placement.

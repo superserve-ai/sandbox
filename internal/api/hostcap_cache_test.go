@@ -256,7 +256,7 @@ func TestCapabilityQueryRouting(t *testing.T) {
 	mu.Lock()
 	first := sqls[0]
 	mu.Unlock()
-	if !strings.Contains(first, "-- name: HostHasCapabilities :one") || !strings.Contains(first, "FOR SHARE") {
+	if !strings.Contains(first, "HostHasCapabilities :one") || !strings.Contains(first, "FOR SHARE") {
 		t.Fatalf("transactional validate must use the locked query, got: %.60s", first)
 	}
 
@@ -267,7 +267,7 @@ func TestCapabilityQueryRouting(t *testing.T) {
 	mu.Lock()
 	last := sqls[len(sqls)-1]
 	mu.Unlock()
-	if !strings.Contains(last, "-- name: HostHasCapabilitiesUnlocked :one") || strings.Contains(last, "FOR SHARE") {
+	if !strings.Contains(last, "HostHasCapabilitiesUnlocked :one") || strings.Contains(last, "FOR SHARE") {
 		t.Fatalf("pre-flight must use the unlocked query, got: %.60s", last)
 	}
 }

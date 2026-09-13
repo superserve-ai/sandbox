@@ -19,6 +19,7 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	VMDaemon_HostAdmission_FullMethodName              = "/superserve.vmd.v1.VMDaemon/HostAdmission"
 	VMDaemon_DestroyVM_FullMethodName                  = "/superserve.vmd.v1.VMDaemon/DestroyVM"
 	VMDaemon_PauseVM_FullMethodName                    = "/superserve.vmd.v1.VMDaemon/PauseVM"
 	VMDaemon_ResumeVM_FullMethodName                   = "/superserve.vmd.v1.VMDaemon/ResumeVM"
@@ -51,6 +52,7 @@ const (
 //
 // VMDaemon manages Firecracker microVM lifecycles for the AgentBox platform.
 type VMDaemonClient interface {
+	HostAdmission(ctx context.Context, in *HostAdmissionRequest, opts ...grpc.CallOption) (*HostAdmissionResponse, error)
 	// DestroyVM terminates a running microVM and cleans up all associated resources.
 	DestroyVM(ctx context.Context, in *DestroyVMRequest, opts ...grpc.CallOption) (*DestroyVMResponse, error)
 	// PauseVM snapshots a running VM's state and suspends it (sleep).
@@ -141,6 +143,16 @@ type vMDaemonClient struct {
 
 func NewVMDaemonClient(cc grpc.ClientConnInterface) VMDaemonClient {
 	return &vMDaemonClient{cc}
+}
+
+func (c *vMDaemonClient) HostAdmission(ctx context.Context, in *HostAdmissionRequest, opts ...grpc.CallOption) (*HostAdmissionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(HostAdmissionResponse)
+	err := c.cc.Invoke(ctx, VMDaemon_HostAdmission_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (c *vMDaemonClient) DestroyVM(ctx context.Context, in *DestroyVMRequest, opts ...grpc.CallOption) (*DestroyVMResponse, error) {
@@ -398,6 +410,7 @@ type VMDaemon_StreamBuildLogsClient = grpc.ServerStreamingClient[BuildLogEvent]
 //
 // VMDaemon manages Firecracker microVM lifecycles for the AgentBox platform.
 type VMDaemonServer interface {
+	HostAdmission(context.Context, *HostAdmissionRequest) (*HostAdmissionResponse, error)
 	// DestroyVM terminates a running microVM and cleans up all associated resources.
 	DestroyVM(context.Context, *DestroyVMRequest) (*DestroyVMResponse, error)
 	// PauseVM snapshots a running VM's state and suspends it (sleep).
@@ -490,6 +503,9 @@ type VMDaemonServer interface {
 // pointer dereference when methods are called.
 type UnimplementedVMDaemonServer struct{}
 
+func (UnimplementedVMDaemonServer) HostAdmission(context.Context, *HostAdmissionRequest) (*HostAdmissionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method HostAdmission not implemented")
+}
 func (UnimplementedVMDaemonServer) DestroyVM(context.Context, *DestroyVMRequest) (*DestroyVMResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DestroyVM not implemented")
 }
@@ -581,6 +597,24 @@ func RegisterVMDaemonServer(s grpc.ServiceRegistrar, srv VMDaemonServer) {
 		t.testEmbeddedByValue()
 	}
 	s.RegisterService(&VMDaemon_ServiceDesc, srv)
+}
+
+func _VMDaemon_HostAdmission_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(HostAdmissionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VMDaemonServer).HostAdmission(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VMDaemon_HostAdmission_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VMDaemonServer).HostAdmission(ctx, req.(*HostAdmissionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
 }
 
 func _VMDaemon_DestroyVM_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
@@ -1015,6 +1049,10 @@ var VMDaemon_ServiceDesc = grpc.ServiceDesc{
 	ServiceName: "superserve.vmd.v1.VMDaemon",
 	HandlerType: (*VMDaemonServer)(nil),
 	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "HostAdmission",
+			Handler:    _VMDaemon_HostAdmission_Handler,
+		},
 		{
 			MethodName: "DestroyVM",
 			Handler:    _VMDaemon_DestroyVM_Handler,

@@ -30,7 +30,7 @@ func main() {
 	token := flag.String("token", os.Getenv("OPERATOR_API_TOKEN"), "operator API token (env OPERATOR_API_TOKEN)")
 	wait := flag.Bool("wait", false, "drain only: block until placement has converged and counts read stably zero")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "usage: hostctl [flags] <list|activate|drain> [host-id]\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: hostctl [flags] <list|activate|drain|drain-status|retire-check> [host-id]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -43,6 +43,10 @@ func main() {
 
 	var err error
 	switch cmd, arg := flag.Arg(0), flag.Arg(1); {
+	case cmd == "drain-status" && arg != "":
+		err = cli.drainStatus(arg, false)
+	case cmd == "retire-check" && arg != "":
+		err = cli.drainStatus(arg, true)
 	case cmd == "list" && arg == "":
 		err = cli.list()
 	case cmd == "activate" && arg != "":
@@ -52,10 +56,7 @@ func main() {
 			if *wait {
 				err = cli.waitDrained(arg)
 			} else {
-				fmt.Printf("note: other control-plane replicas may still place work for up to %s\n"+
-					"(scheduler cache TTL + stale grace); do not trust zero counts before that.\n"+
-					"Re-run with --wait, or poll `hostctl list` until counts read stably zero.\n",
-					drainConvergence)
+				fmt.Println("placement fence acknowledged; existing owners remain routable. Run hostctl drain-status for blockers; this is not power-off approval.")
 			}
 		}
 	default:
@@ -292,5 +293,29 @@ func (c client) setStatus(hostID, status string) error {
 	}
 	defer resp.Body.Close()
 	fmt.Printf("%s -> %s\n", hostID, status)
+	return nil
+}
+
+func (c client) drainStatus(hostID string, retirement bool) error {
+	response, err := c.do(http.MethodGet, "/internal/hosts/"+url.PathEscape(hostID)+"/drain", nil)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	var report struct {
+		Safe     bool     `json:"safe_to_power_off"`
+		Blockers []string `json:"blockers"`
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if err = json.Unmarshal(data, &report); err != nil {
+		return err
+	}
+	fmt.Println(string(data))
+	if retirement && !report.Safe {
+		return fmt.Errorf("not safe to power off: %s", strings.Join(report.Blockers, "; "))
+	}
 	return nil
 }

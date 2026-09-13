@@ -698,6 +698,7 @@ func main() {
 	// those are already configured on production hosts to feed pressure
 	// publication, so deriving enablement from them would switch
 	// enforcement on fleet-wide the moment this ships.
+	durableDrain := envOrDefault("VMD_DRAIN_ENABLED", "false") == "true"
 	localAdmission := envOrDefault("VMD_LOCAL_ADMISSION_ENABLED", "false") == "true"
 
 	// ---- Network manager + host firewall ----
@@ -982,6 +983,16 @@ func main() {
 
 	// ---- BoltDB state store ----
 	statePath := envOrDefault("VMD_STATE_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "vmd.db"))
+	if _, err := os.Stat(statePath + ".admission.json"); err == nil {
+		durableDrain = true
+	} else if !os.IsNotExist(err) {
+		log.Fatal().Err(err).Msg("cannot inspect durable admission state")
+	}
+	if durableDrain {
+		if err := mgr.AdmissionGate().ConfigureDrain(statePath + ".admission.json"); err != nil {
+			log.Fatal().Err(err).Msg("cannot load durable host admission state")
+		}
+	}
 	stateStore, err := vm.OpenStateStore(statePath)
 	if err != nil {
 		log.Fatal().Err(err).Str("path", statePath).Msg("failed to open state store")
@@ -1453,7 +1464,7 @@ func main() {
 			return handler(srv, ss)
 		}),
 	)
-	adapter := vm.NewGRPCAdapter(mgr).
+	adapter := vm.NewGRPCAdapter(mgr).WithHostAdmissionCaller(os.Getenv("VMD_ADMISSION_CALLER_EMAIL")).
 		WithSecretsBroker(cfg.SecretsProxySocket, cfg.SecretsProxySandboxAddr)
 	vmdpb.RegisterVMDaemonServer(grpcServer, adapter)
 	if cfg.SecretsProxySocket != "" {
@@ -1776,7 +1787,7 @@ func main() {
 		// the live registry, which a survivor is absent from until this
 		// scan finds it. Skipping the walk on a host that enforces limits
 		// would open the gate blind to work already running.
-		if publishesPressure || localAdmission {
+		if publishesPressure || localAdmission || durableDrain {
 			mgr.ScanSurvivingBuildersAsync(cfg.TemplateBuilderBin)
 		}
 		proxyHealthURL := os.Getenv("PROXY_HEALTH_URL")

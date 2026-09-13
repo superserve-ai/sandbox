@@ -443,3 +443,78 @@ WHERE h.status = 'active'
         AND hc.heartbeat_at = h.last_heartbeat_at
     )
   );
+
+-- name: PrepareHostAdmission :one
+-- Commit the desired directory status before sending the ordered host command.
+-- A failed close remains excluded from placement; a failed open stays fenced.
+UPDATE host SET status = @status, admission_revision = nextval('host_admission_revision_seq'), updated_at = now()
+WHERE id = @id
+  AND (@status <> 'active' OR last_heartbeat_at > @heartbeat_after)
+RETURNING *;
+
+-- name: HostOwnershipCounts :many
+SELECT status::text AS status, count(*)::bigint AS count
+FROM sandbox WHERE host_id = @host_id AND destroyed_at IS NULL
+GROUP BY status;
+
+-- name: OwnerHostHasCapabilities :one
+-- Lock the one active host row whose heartbeat anchors this capability set.
+-- Callers that run this in a mutation transaction keep the host stable until
+-- VMD delivery and commit, while the relational division below proves that
+-- every requested capability belongs to that exact heartbeat.
+WITH target_host AS MATERIALIZED (
+  SELECT id, last_heartbeat_at
+  FROM host
+  WHERE id = sqlc.arg('host_id')
+    AND status IN ('active', 'draining')
+    AND last_heartbeat_at IS NOT NULL
+  FOR SHARE
+)
+SELECT EXISTS (
+  SELECT 1
+  FROM target_host h
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM host_capability hc
+      WHERE hc.host_id = h.id
+        AND hc.capability = required.capability
+        AND hc.heartbeat_at = h.last_heartbeat_at
+    )
+  )
+);
+
+-- name: OwnerHostHasCapabilitiesUnlocked :one
+-- OwnerHostHasCapabilities without the row lock, for standalone pre-flight reads
+-- outside a mutation transaction: omitting the lock keeps concurrent checks
+-- from serializing behind the host's heartbeat writer. Transactional callers
+-- that must pin the host across a commit use OwnerHostHasCapabilities.
+--
+-- Also returns the host's VMD address (empty when the host is not active),
+-- so the caller can record this read as the registry's address verification.
+WITH target_host AS MATERIALIZED (
+  SELECT id, vmd_addr, last_heartbeat_at
+  FROM host
+  WHERE id = sqlc.arg('host_id')
+    AND status IN ('active', 'draining')
+    AND last_heartbeat_at IS NOT NULL
+)
+SELECT
+  EXISTS (
+    SELECT 1
+    FROM target_host h
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM host_capability hc
+        WHERE hc.host_id = h.id
+          AND hc.capability = required.capability
+          AND hc.heartbeat_at = h.last_heartbeat_at
+      )
+    )
+  ) AS has_capabilities,
+  COALESCE((SELECT vmd_addr FROM target_host), '')::text AS vmd_addr;

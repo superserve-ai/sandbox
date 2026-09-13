@@ -6,6 +6,8 @@ option go_package = "github.com/superserve-ai/sandbox/proto/vmdpb";
 
 // VMDaemon manages Firecracker microVM lifecycles for the AgentBox platform.
 service VMDaemon {
+  rpc HostAdmission(HostAdmissionRequest) returns (HostAdmissionResponse);
+
   // DestroyVM terminates a running microVM and cleans up all associated resources.
   rpc DestroyVM(DestroyVMRequest) returns (DestroyVMResponse);
 
@@ -708,3 +710,16 @@ message InvalidateSandboxRulesRequest {
   string sandbox_id = 1;
 }
 message InvalidateSandboxRulesResponse {}
+
+// Revision zero is a read-only preflight. Positive revisions change admission.
+message HostAdmissionRequest {
+ int64 revision = 1;
+ bool closed = 2;
+}
+message HostAdmissionResponse {
+ int64 revision = 1;
+ bool closed = 2;
+ bool ready = 3;
+ int64 charged = 4;
+ int64 pending_boots = 5;
+}

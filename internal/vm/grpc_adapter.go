@@ -16,6 +16,7 @@ import (
 // GRPCAdapter wraps a Manager to implement vmdpb.VMDaemonServer.
 type GRPCAdapter struct {
 	vmdpb.UnimplementedVMDaemonServer
+	admissionCaller string
 	mgr             *Manager
 	secrets         *SecretsBrokerClient
 	sandboxProxyURL string // SECRETSPROXY_SANDBOX_ADDR — empty disables HTTPS_PROXY injection
@@ -89,9 +90,10 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 	// charged, so the host's own count reflects the load it is carrying.
 	// Inside the op lock, so a resume racing its own retry cannot be
 	// charged by one attempt and released by the other.
-	if err := admissionError(a.mgr.AdmissionGate().Admit(req.GetVmId(), intentFromProto(req.GetAdmissionIntent()))); err != nil {
+	if err := admissionError(a.mgr.AdmissionGate().BeginBoot(req.GetVmId(), intentFromProto(req.GetAdmissionIntent()))); err != nil {
 		return nil, err
 	}
+	defer a.mgr.AdmissionGate().EndBoot(req.GetVmId())
 
 	var resumeNetworkRules *sandboxNetworkRules
 	if netCfg := req.GetSandboxNetwork(); netCfg != nil {
@@ -236,9 +238,10 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	// a genuine create and the caller's stateless-resume fallback, and the
 	// daemon cannot tell those apart — the fallback is taken precisely when
 	// this daemon has no record of the sandbox.
-	if err := admissionError(a.mgr.AdmissionGate().Admit(req.GetVmId(), intentFromProto(req.GetAdmissionIntent()))); err != nil {
+	if err := admissionError(a.mgr.AdmissionGate().BeginBoot(req.GetVmId(), intentFromProto(req.GetAdmissionIntent()))); err != nil {
 		return nil, err
 	}
+	defer a.mgr.AdmissionGate().EndBoot(req.GetVmId())
 
 	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
 	if err != nil {

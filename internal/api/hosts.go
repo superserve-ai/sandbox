@@ -317,39 +317,8 @@ func (h *Handlers) HostUpdateStatus(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
-	host, err := h.DB.UpdateHostStatus(ctx, db.UpdateHostStatusParams{
-		ID: hostID, Status: req.Status,
-		// Activation demands a heartbeat fresher than the unhealthy
-		// threshold; the predicate lives in the UPDATE so there is no
-		// check-then-act window.
-		ActiveHeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},
-	})
-	if err == pgx.ErrNoRows {
-		// Zero rows is either an unknown host or an activation refused for
-		// heartbeat staleness — disambiguate for the operator.
-		if _, gerr := h.DB.GetHost(ctx, hostID); gerr == pgx.ErrNoRows {
-			respondErrorMsg(c, "not_found", "host not found", http.StatusNotFound)
-			return
-		}
-		log.Warn().Str("host_id", hostID).Msg("activation refused: heartbeat stale or absent")
-		respondErrorMsg(c, "conflict",
-			"host has no live heartbeat; refusing to activate a host the fleet cannot see",
-			http.StatusConflict)
-		return
-	}
-	if err != nil {
-		log.Error().Err(err).Str("host_id", hostID).Msg("UpdateHostStatus failed")
-		respondError(c, ErrInternal)
-		return
-	}
+	h.transitionHostAdmission(c, hostID, req.Status)
 
-	log.Info().Str("host_id", hostID).Str("status", host.Status).
-		Msg("host status changed by operator")
-	if h.Scheduler != nil {
-		h.Scheduler.Invalidate()
-	}
-	c.JSON(http.StatusOK, gin.H{"id": host.ID, "status": host.Status})
 }
 
 // HostList handles GET /internal/hosts — the operator view behind

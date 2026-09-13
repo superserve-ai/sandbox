@@ -120,9 +120,12 @@ type admissionToken struct {
 // undercounting closes the gate for reconstruction rather than quietly
 // correcting it.
 type Gate struct {
-	mu     sync.Mutex
-	state  State
-	tokens map[string]admissionToken
+	pending    map[string]int
+	drainPath  string
+	drainState DrainState
+	mu         sync.Mutex
+	state      State
+	tokens     map[string]admissionToken
 	// maxSandboxes is the operator's limit. Zero means unlimited, matching
 	// how the pressure publisher already reads VMD_MAX_SANDBOXES.
 	maxSandboxes int
@@ -230,7 +233,7 @@ func (g *Gate) Reconstruct(since uint64, sandboxIDs, buildIDs []string) {
 	// keeps the newer token when both sides have the id: the live charge
 	// knows its owner, the reconstructed one does not.
 	for id, tok := range g.tokens {
-		if tok.gen > since {
+		if tok.gen > since || g.pending[id] > 0 {
 			tokens[id] = tok
 		}
 	}
@@ -280,6 +283,15 @@ func (g *Gate) Admit(id string, intent Intent) error {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	return g.admitLocked(id, intent)
+}
+
+func (g *Gate) admitLocked(id string, intent Intent) error {
+	if g.drainPath != "" && g.drainState.Closed && intent != IntentResume {
+		if _, held := g.tokens[id]; !held {
+			return ErrNotReady
+		}
+	}
 	if g.state == StateDisabled {
 		return nil
 	}
@@ -345,6 +357,9 @@ func (g *Gate) AdmitBuild(id string, owner any) error {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.drainPath != "" && g.drainState.Closed {
+		return ErrNotReady
+	}
 	if g.state == StateDisabled {
 		return nil
 	}
@@ -438,4 +453,45 @@ func (g *Gate) AuditUndercount(observedSandboxes int) bool {
 		return false
 	}
 	return observedSandboxes > len(g.tokens)
+}
+
+// BeginBoot pins the charge through boot and cleanup, including reconstructions
+// whose store snapshot started after admission but before the record existed.
+func (g *Gate) BeginBoot(id string, intent Intent) error {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if err := g.admitLocked(id, intent); err != nil {
+		return err
+	}
+	if g.pending == nil {
+		g.pending = make(map[string]int)
+	}
+	g.pending[id]++
+	return nil
+}
+func (g *Gate) EndBoot(id string) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.pending[id]--
+	if g.pending[id] <= 0 {
+		delete(g.pending, id)
+	}
+}
+func (g *Gate) PendingBoots() int {
+	if g == nil {
+		return 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	total := 0
+	for _, n := range g.pending {
+		total += n
+	}
+	return total
 }

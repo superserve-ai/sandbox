@@ -279,7 +279,7 @@ func (h *Handlers) applyPreviewMutationValidated(ctx context.Context, sandboxID,
 }
 
 func validateHostPreviewCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
-	ok, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+	ok, err := q.OwnerHostHasCapabilities(ctx, db.OwnerHostHasCapabilitiesParams{
 		HostID: hostID, RequiredCapabilities: capabilities,
 	})
 	if err != nil {
@@ -355,7 +355,7 @@ func (h *Handlers) pushPreviewCredentialPolicy(ctx context.Context, sandbox db.S
 // Authoritative enforcement stays with VMD's post-boot attestation and the
 // transactional validateHostPreviewCapabilities on mutations.
 func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string, capabilities ...string) bool {
-	hasCapabilities, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, capabilities)
+	hasCapabilities, err := h.hostCapabilitiesCached(c.Request.Context(), hostID, capabilities, true)
 	return h.respondHostCapabilityResult(c, hostID, capabilities, hasCapabilities, err)
 }
 
