@@ -68,7 +68,8 @@ func (healthCheck) Rollback(context.Context, *provisioner.Tenant) error {
 // answers /healthz perfectly and 503s the first time anybody tries to sign
 // in — which is exactly how the reference tenant shipped, unnoticed,
 // because the signed admin link bypasses the broker. So the assertion here
-// is on /idp/authorize specifically, and a 5xx from it fails the provision.
+// is on /idp/authorize specifically, and anything but the broker's own
+// answer to a well-formed request fails the provision.
 type smoke struct {
 	c Clients
 }
@@ -98,17 +99,24 @@ func (s smoke) Run(ctx context.Context, t *provisioner.Tenant) error {
 		return err
 	}
 	return waitFor(ctx, s.c, s.c.SmokeTimeout, target, func(status int, body string) error {
-		if status < 500 {
+		// Only the broker's own answers count. A well-formed authorization
+		// request either renders the sign-in page or redirects, so
+		// anything else means sign-in does not work: a 404 is a broker that
+		// was never mounted, a 4xx is one that rejected a request it
+		// should accept, and a 5xx is the one the reference tenant
+		// shipped — an auth broker with no email transport.
+		if status == http.StatusOK || (status >= 300 && status < 400) {
 			return nil
 		}
-		// The broker renders its "email delivery isn't configured" page as
-		// HTML, so the first line of it is worth carrying into the event:
-		// it is the difference between "the tenant is still starting" and
-		// "this tenant can never be signed into".
+		detail := ""
 		if body != "" {
-			return fmt.Errorf("sign-in fails closed: GET /idp/authorize returned %d — %s", status, body)
+			// The broker renders its "email delivery isn't configured"
+			// page as HTML, so the first line of it is worth carrying into
+			// the event: it is the difference between "the tenant is still
+			// starting" and "this tenant can never be signed into".
+			detail = " — " + body
 		}
-		return fmt.Errorf("sign-in fails closed: GET /idp/authorize returned %d", status)
+		return fmt.Errorf("sign-in fails closed: GET /idp/authorize returned %d%s", status, detail)
 	})
 }
 

@@ -733,14 +733,29 @@ func TestSmokeFailsWhenSignInFailsClosed(t *testing.T) {
 	}
 }
 
-// A 4xx is a perfectly good answer from the broker: it means the endpoint
-// is alive and rejecting a request it does not like, not that the tenant
-// cannot send email.
-func TestSmokeAcceptsAClientErrorFromTheBroker(t *testing.T) {
+// A redirect is the broker's own answer to a well-formed request, so it
+// passes; anything that is not the broker answering does not. A 404 is an
+// image with no broker mounted and a 401 is the load balancer's request
+// being turned away before it ever reaches one — both are tenants nobody
+// could sign in to, and neither is a 5xx.
+func TestSmokeAcceptsOnlyTheBrokersOwnAnswer(t *testing.T) {
 	f := newFixture(t, false)
-	f.tenant.setAuthorizeStatus(http.StatusBadRequest)
+	f.tenant.setAuthorizeStatus(http.StatusFound)
 	if err := f.provision(t); err != nil {
 		t.Fatal(err)
+	}
+
+	for _, status := range []int{http.StatusNotFound, http.StatusUnauthorized, http.StatusBadRequest} {
+		other := newFixture(t, false)
+		other.tenant.setAuthorizeStatus(status)
+		err := other.provision(t)
+		if err == nil {
+			t.Errorf("a tenant whose sign-in answered %d was reported ready", status)
+			continue
+		}
+		if !strings.Contains(err.Error(), "sign-in fails closed") {
+			t.Errorf("status %d: err = %v", status, err)
+		}
 	}
 }
 

@@ -244,15 +244,27 @@ jobs:
           # QM_RESEND_SECRET and QM_EMAIL_FROM are what give a provisioned
           # tenant a working sign-in; without them the binary refuses to
           # start rather than building tenants nobody can log in to.
+          #
+          # A variable that has been cleared is *removed*, not omitted: an
+          # update that simply leaves a key out keeps the resource's
+          # previous value, so clearing one would silently go on deploying
+          # the old email or sandbox configuration and the startup check
+          # would never see it missing.
+          REMOVE=""
           for pair in \
             "QM_RESEND_SECRET=${{ vars.QM_RESEND_SECRET }}" \
             "QM_EMAIL_FROM=${{ vars.QM_EMAIL_FROM }}" \
             "QM_SANDBOX_API_URL=${{ vars.QM_SANDBOX_API_URL }}" \
             "QM_SANDBOX_TEMPLATE=${{ vars.QM_SANDBOX_TEMPLATE }}"; do
-            [ "${pair#*=}" = "" ] || ENV="$ENV,$pair"
+            if [ "${pair#*=}" = "" ]; then
+              REMOVE="${REMOVE:+$REMOVE,}${pair%%=*}"
+            else
+              ENV="$ENV,$pair"
+            fi
           done
-          gcloud run jobs update "$JOB" --image "$IMAGE" --update-env-vars "$ENV" $ARGS
-          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" --update-env-vars "$ENV" $ARGS
+          SET="--update-env-vars $ENV${REMOVE:+ --remove-env-vars $REMOVE}"
+          gcloud run jobs update "$JOB" --image "$IMAGE" $SET $ARGS
+          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" $SET $ARGS
 
       - name: Route traffic to the new revision
         if: steps.gate.outputs.enabled == 'true'
@@ -358,15 +370,27 @@ jobs:
           # QM_RESEND_SECRET and QM_EMAIL_FROM are what give a provisioned
           # tenant a working sign-in; without them the binary refuses to
           # start rather than building tenants nobody can log in to.
+          #
+          # A variable that has been cleared is *removed*, not omitted: an
+          # update that simply leaves a key out keeps the resource's
+          # previous value, so clearing one would silently go on deploying
+          # the old email or sandbox configuration and the startup check
+          # would never see it missing.
+          REMOVE=""
           for pair in \
             "QM_RESEND_SECRET=${{ vars.QM_RESEND_SECRET }}" \
             "QM_EMAIL_FROM=${{ vars.QM_EMAIL_FROM }}" \
             "QM_SANDBOX_API_URL=${{ vars.QM_SANDBOX_API_URL }}" \
             "QM_SANDBOX_TEMPLATE=${{ vars.QM_SANDBOX_TEMPLATE }}"; do
-            [ "${pair#*=}" = "" ] || ENV="$ENV,$pair"
+            if [ "${pair#*=}" = "" ]; then
+              REMOVE="${REMOVE:+$REMOVE,}${pair%%=*}"
+            else
+              ENV="$ENV,$pair"
+            fi
           done
-          gcloud run jobs update "$JOB" --image "$IMAGE" --update-env-vars "$ENV" $ARGS
-          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" --update-env-vars "$ENV" $ARGS
+          SET="--update-env-vars $ENV${REMOVE:+ --remove-env-vars $REMOVE}"
+          gcloud run jobs update "$JOB" --image "$IMAGE" $SET $ARGS
+          gcloud run services update ${{ vars.QM_API_SERVICE }} --image "$IMAGE" $SET $ARGS
 
       - name: Route traffic to the new revision
         if: steps.gate.outputs.enabled == 'true'

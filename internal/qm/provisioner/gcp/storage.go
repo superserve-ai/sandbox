@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"slices"
 
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/option"
 	storage "google.golang.org/api/storage/v1"
 
@@ -21,9 +22,17 @@ const objectAdminRole = "roles/storage.objectAdmin"
 // hmacInactive is the state a key must be in before it can be deleted.
 const hmacInactive = "INACTIVE"
 
-// emptyBucketPage bounds how many objects are deleted per listing pass on
-// teardown.
-const emptyBucketPage = 1000
+// Emptying a tenant's bucket on teardown. The page size bounds one listing
+// pass, the worker count bounds the deletes in flight, and the object
+// budget bounds the whole call: a bucket too large to clear inside one job
+// stops with an error rather than running the job out of time somewhere
+// less obvious, and the teardown — which is idempotent and retried —
+// carries on from what is left.
+const (
+	emptyBucketPage       = 1000
+	emptyBucketWorkers    = 16
+	emptyBucketMaxObjects = 200_000
+)
 
 // Buckets is the Cloud Storage-backed steps.BucketAdmin.
 type Buckets struct {
@@ -109,7 +118,8 @@ func (b *Buckets) empty(ctx context.Context, name string) error {
 	// seen is deleted before the next list, so the next page is whatever is
 	// left. A delete that cannot proceed returns an error and ends the
 	// loop, so this cannot spin.
-	for {
+	deleted := 0
+	for deleted < emptyBucketMaxObjects {
 		resp, err := b.svc.Objects.List(name).Versions(true).MaxResults(emptyBucketPage).Context(ctx).Do()
 		if err != nil {
 			if notFound(err) {
@@ -120,16 +130,34 @@ func (b *Buckets) empty(ctx context.Context, name string) error {
 		if len(resp.Items) == 0 {
 			return nil
 		}
-		for _, obj := range resp.Items {
-			del := b.svc.Objects.Delete(name, obj.Name).Context(ctx)
+		if err := b.deleteObjects(ctx, name, resp.Items); err != nil {
+			return err
+		}
+		deleted += len(resp.Items)
+	}
+	return fmt.Errorf("bucket %s still holds objects after deleting %d: retry the teardown to continue", name, deleted)
+}
+
+// deleteObjects removes one listing page with a bounded number of requests
+// in flight, and returns the first failure.
+func (b *Buckets) deleteObjects(ctx context.Context, bucket string, objects []*storage.Object) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var group errgroup.Group
+	group.SetLimit(emptyBucketWorkers)
+	for _, obj := range objects {
+		group.Go(func() error {
+			del := b.svc.Objects.Delete(bucket, obj.Name).Context(ctx)
 			if obj.Generation != 0 {
 				del = del.Generation(obj.Generation)
 			}
 			if err := del.Do(); err != nil && !notFound(err) {
-				return fmt.Errorf("delete %s from bucket %s: %w", obj.Name, name, err)
+				return fmt.Errorf("delete %s from bucket %s: %w", obj.Name, bucket, err)
 			}
-		}
+			return nil
+		})
 	}
+	return group.Wait()
 }
 
 // GrantAccess adds the tenant's identity to the bucket's object-admin

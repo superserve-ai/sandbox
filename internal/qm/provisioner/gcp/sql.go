@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -22,6 +23,9 @@ import (
 // other tenant's data on the shared instance. Ownership and the revoke are
 // the isolation, so they have to be in the same place the database is made.
 type Databases struct {
+	dsn func(context.Context) (string, error)
+
+	mu   sync.Mutex
 	pool *pgxpool.Pool
 }
 
@@ -41,12 +45,32 @@ const (
 	dropBackoff = 2 * time.Second
 )
 
-// NewDatabases connects to the instance's maintenance database as the admin
-// role. adminDSN reaches the instance's private IP; the caller composes it
-// from the Terraform-owned admin credentials.
-func NewDatabases(ctx context.Context, adminDSN string) (*Databases, error) {
-	if adminDSN == "" {
-		return nil, errors.New("cloud sql: an admin connection string is required")
+// NewDatabases prepares the client without connecting. dsn is resolved on
+// first use, because it needs the instance's admin password out of Secret
+// Manager and the qm-api *service* never calls any of these methods — it
+// only queues the job that does. Dialing the tenant instance at startup
+// would put an outage there (or in Secret Manager) in front of the control
+// API, which has nothing to do with either.
+func NewDatabases(dsn func(context.Context) (string, error)) *Databases {
+	return &Databases{dsn: dsn}
+}
+
+// connect returns the pool, dialing on the first call. A failed attempt is
+// not cached: the next call retries, so a run started while the instance
+// was briefly unreachable converges instead of failing for the life of the
+// process.
+func (d *Databases) connect(ctx context.Context) (*pgxpool.Pool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.pool != nil {
+		return d.pool, nil
+	}
+	if d.dsn == nil {
+		return nil, errors.New("cloud sql: no admin connection string")
+	}
+	adminDSN, err := d.dsn(ctx)
+	if err != nil {
+		return nil, err
 	}
 	cfg, err := pgxpool.ParseConfig(adminDSN)
 	if err != nil {
@@ -64,11 +88,18 @@ func NewDatabases(ctx context.Context, adminDSN string) (*Databases, error) {
 		pool.Close()
 		return nil, fmt.Errorf("cloud sql: ping the instance: %w", err)
 	}
-	return &Databases{pool: pool}, nil
+	d.pool = pool
+	return pool, nil
 }
 
+// Close releases the pool if one was ever opened.
 func (d *Databases) Close() {
-	d.pool.Close()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.pool != nil {
+		d.pool.Close()
+		d.pool = nil
+	}
 }
 
 // identifierRe bounds what may be interpolated into DDL. Database and role
@@ -94,6 +125,10 @@ func quoteIdentifier(name string) (string, error) {
 // a run that died in between would otherwise leave a database every other
 // tenant's role could connect to, and no later run would notice.
 func (d *Databases) EnsureDatabase(ctx context.Context, name, owner string) error {
+	pool, err := d.connect(ctx)
+	if err != nil {
+		return err
+	}
 	dbIdent, err := quoteIdentifier(name)
 	if err != nil {
 		return err
@@ -102,16 +137,16 @@ func (d *Databases) EnsureDatabase(ctx context.Context, name, owner string) erro
 	if err != nil {
 		return err
 	}
-	_, err = d.pool.Exec(ctx, `CREATE DATABASE `+dbIdent+` OWNER `+ownerIdent)
+	_, err = pool.Exec(ctx, `CREATE DATABASE `+dbIdent+` OWNER `+ownerIdent)
 	if err != nil && !isPGCode(err, pgDuplicateDatabase) {
 		return fmt.Errorf("create database %s: %w", name, err)
 	}
-	if _, err := d.pool.Exec(ctx, `ALTER DATABASE `+dbIdent+` OWNER TO `+ownerIdent); err != nil {
+	if _, err := pool.Exec(ctx, `ALTER DATABASE `+dbIdent+` OWNER TO `+ownerIdent); err != nil {
 		return fmt.Errorf("set the owner of database %s: %w", name, err)
 	}
 	// Without this every role on the shared instance — that is, every other
 	// tenant — could connect to this database.
-	if _, err := d.pool.Exec(ctx, `REVOKE CONNECT ON DATABASE `+dbIdent+` FROM PUBLIC`); err != nil {
+	if _, err := pool.Exec(ctx, `REVOKE CONNECT ON DATABASE `+dbIdent+` FROM PUBLIC`); err != nil {
 		return fmt.Errorf("close database %s to other roles: %w", name, err)
 	}
 	return nil
@@ -121,6 +156,10 @@ func (d *Databases) EnsureDatabase(ctx context.Context, name, owner string) erro
 // it: the tenant's own container may not have finished shutting down when
 // teardown reaches this step.
 func (d *Databases) DropDatabase(ctx context.Context, name string) error {
+	pool, err := d.connect(ctx)
+	if err != nil {
+		return err
+	}
 	ident, err := quoteIdentifier(name)
 	if err != nil {
 		return err
@@ -130,13 +169,13 @@ func (d *Databases) DropDatabase(ctx context.Context, name string) error {
 		if attempt > 0 {
 			// Terminate what is still attached, then try again. Sessions
 			// can reconnect, which is why this is a loop and not one call.
-			if _, err := d.pool.Exec(ctx,
+			if _, err := pool.Exec(ctx,
 				`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`,
 				name); err != nil {
 				return fmt.Errorf("disconnect sessions from %s: %w", name, err)
 			}
 		}
-		_, err := d.pool.Exec(ctx, `DROP DATABASE IF EXISTS `+ident)
+		_, err := pool.Exec(ctx, `DROP DATABASE IF EXISTS `+ident)
 		if err == nil {
 			return nil
 		}
@@ -158,27 +197,35 @@ func (d *Databases) DropDatabase(ctx context.Context, name string) error {
 // The role gets LOGIN and nothing else: it owns its own database and has no
 // standing rights anywhere on the instance.
 func (d *Databases) EnsureUser(ctx context.Context, name, password string) error {
+	pool, err := d.connect(ctx)
+	if err != nil {
+		return err
+	}
 	ident, err := quoteIdentifier(name)
 	if err != nil {
 		return err
 	}
 	// The password is a literal, not an identifier, so it goes through
 	// pgx's quoting rather than string concatenation.
-	quoted, err := quoteLiteral(ctx, d.pool, password)
+	quoted, err := quoteLiteral(ctx, pool, password)
 	if err != nil {
 		return err
 	}
-	_, err = d.pool.Exec(ctx, `CREATE ROLE `+ident+` WITH LOGIN PASSWORD `+quoted)
+	_, err = pool.Exec(ctx, `CREATE ROLE `+ident+` WITH LOGIN PASSWORD `+quoted)
 	if err != nil && !isPGCode(err, pgDuplicateObject) {
 		return fmt.Errorf("create role %s: %w", name, err)
 	}
-	if _, err := d.pool.Exec(ctx, `ALTER ROLE `+ident+` WITH LOGIN PASSWORD `+quoted); err != nil {
+	if _, err := pool.Exec(ctx, `ALTER ROLE `+ident+` WITH LOGIN PASSWORD `+quoted); err != nil {
 		return fmt.Errorf("set the password of role %s: %w", name, err)
 	}
 	return nil
 }
 
 func (d *Databases) DropUser(ctx context.Context, name string) error {
+	pool, err := d.connect(ctx)
+	if err != nil {
+		return err
+	}
 	ident, err := quoteIdentifier(name)
 	if err != nil {
 		return err
@@ -186,7 +233,7 @@ func (d *Databases) DropUser(ctx context.Context, name string) error {
 	// The tenant's database is dropped first, so by here the role owns
 	// nothing; DROP ROLE still fails loudly if that ever stops being true,
 	// which is the behaviour we want rather than a silent leak.
-	if _, err := d.pool.Exec(ctx, `DROP ROLE IF EXISTS `+ident); err != nil {
+	if _, err := pool.Exec(ctx, `DROP ROLE IF EXISTS `+ident); err != nil {
 		return fmt.Errorf("drop role %s: %w", name, err)
 	}
 	return nil

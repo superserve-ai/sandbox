@@ -68,17 +68,19 @@ func cloudClients(ctx context.Context, cfg qm.Config, env provisioner.Env, store
 		return out, err
 	}
 
-	adminPassword, err := store.Get(ctx, cfg.SQLAdminSecret)
-	if err != nil {
-		return out, fmt.Errorf("read the cloud sql admin password from %s: %w", cfg.SQLAdminSecret, err)
-	}
-	// The maintenance database, not a tenant's: this connection exists only
-	// to create and drop the others.
-	adminDSN := steps.DatabaseURL(env, cfg.SQLAdminUser, string(adminPassword), "postgres")
-	dbs, err := gcp.NewDatabases(ctx, adminDSN)
-	if err != nil {
-		return out, err
-	}
+	// Resolved on first use, not here: reading the instance's admin
+	// password and dialing the instance are the provisioner's business, and
+	// the qm-api service — which only queues the job that does the work —
+	// should not fail to start because either is briefly unavailable.
+	dbs := gcp.NewDatabases(func(ctx context.Context) (string, error) {
+		password, err := store.Get(ctx, cfg.SQLAdminSecret)
+		if err != nil {
+			return "", fmt.Errorf("read the cloud sql admin password from %s: %w", cfg.SQLAdminSecret, err)
+		}
+		// The maintenance database, not a tenant's: this connection exists
+		// only to create and drop the others.
+		return steps.DatabaseURL(env, cfg.SQLAdminUser, string(password), "postgres"), nil
+	})
 
 	out.dbs = dbs
 	out.clients = steps.Clients{
