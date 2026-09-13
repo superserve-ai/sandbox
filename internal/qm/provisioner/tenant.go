@@ -2,7 +2,9 @@ package provisioner
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/superserve-ai/sandbox/internal/qm/secrets"
 	"github.com/superserve-ai/sandbox/internal/qm/tenantstore"
@@ -22,6 +24,41 @@ type Env struct {
 	// Stub makes the cloud-touching steps succeed without touching GCP,
 	// recording placeholder resource names; for tests and local runs.
 	Stub bool
+
+	// Shared infrastructure each tenant is attached to. See qm.Config for
+	// where these come from and why an empty one is fatal at startup
+	// rather than at the step that needed it.
+	SQLInstance         string
+	SQLConnectionName   string
+	SQLPrivateIP        string
+	URLMap              string
+	VPCNetwork          string
+	VPCSubnetwork       string
+	BucketLocation      string
+	BucketLifecycleJSON string
+
+	// Tenant runtime configuration. ResendSecret is platform-level: one
+	// Secret Manager secret shared by every tenant, whose service account
+	// is granted read access to it. AllowedEmailDomain is derived per
+	// tenant from its admin address, not from here.
+	ResendSecret     string
+	EmailFrom        string
+	SandboxAPIURL    string
+	SandboxTemplate  string
+	SandboxKeyRegion string
+}
+
+// Require reports the first of fields (name → value) that is empty, as an
+// error naming it. Steps call it from Ready so a missing shared-
+// infrastructure value stops the binary at startup rather than a tenant
+// halfway through its plan.
+func (e Env) Require(fields ...string) error {
+	for i := 0; i+1 < len(fields); i += 2 {
+		if strings.TrimSpace(fields[i+1]) == "" {
+			return errors.New(fields[i] + " is required")
+		}
+	}
+	return nil
 }
 
 // Tenant is the unit of work a step receives: the current row plus the

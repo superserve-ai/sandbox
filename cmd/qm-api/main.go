@@ -121,6 +121,21 @@ func setup(ctx context.Context) (*deps, error) {
 		BaseDomain: cfg.BaseDomain,
 		Image:      cfg.TenantImage,
 		Stub:       cfg.ProvisionerStub,
+
+		SQLInstance:         cfg.SQLInstance,
+		SQLConnectionName:   cfg.SQLConnectionName,
+		SQLPrivateIP:        cfg.SQLPrivateIP,
+		URLMap:              cfg.LBURLMap,
+		VPCNetwork:          cfg.VPCNetwork,
+		VPCSubnetwork:       cfg.VPCSubnetwork,
+		BucketLocation:      cfg.BucketLocation,
+		BucketLifecycleJSON: cfg.BucketLifecycleJSON,
+
+		ResendSecret:     cfg.ResendSecret,
+		EmailFrom:        cfg.EmailFrom,
+		SandboxAPIURL:    cfg.SandboxAPIURL,
+		SandboxTemplate:  cfg.SandboxTemplate,
+		SandboxKeyRegion: cfg.SandboxKeyRegion,
 	}
 	if env.Stub {
 		log.Warn().Msg("QM_PROVISIONER_STUB=1: cloud-touching steps record placeholders instead of creating resources")

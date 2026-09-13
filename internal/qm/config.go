@@ -43,6 +43,47 @@ type Config struct {
 	SecretsBackend string
 	TenantImage    string
 	SentryDSN      string
+
+	// Shared infrastructure the provisioner attaches each tenant to. These
+	// mirror the QM Terraform module's contract one-for-one (it exports the
+	// same QM_* names), so a value that differs here from what was applied
+	// there points a tenant at something that does not exist. Empty is
+	// tolerated only under QM_PROVISIONER_STUB, where no step calls GCP;
+	// otherwise the plan's readiness check refuses the binary at startup.
+	SQLInstance       string
+	SQLConnectionName string
+	SQLPrivateIP      string
+	LBURLMap          string
+	VPCNetwork        string
+	VPCSubnetwork     string
+	BucketLocation    string
+	// BucketLifecycleJSON is the lifecycle policy applied to every tenant
+	// bucket, in the Cloud Storage JSON API's shape. Empty applies none.
+	BucketLifecycleJSON string
+
+	// Tenant runtime configuration, rendered into each tenant's service.
+	//
+	// ResendSecret is the Secret Manager name of the *platform's* one
+	// Resend API key: hosted QM has a single Resend account and a single
+	// verified sending domain, so the key is shared and each tenant's
+	// service account is granted read access to it. It is deliberately not
+	// a generated per-tenant secret. Without it a tenant's embedded auth
+	// broker fails closed on /idp/authorize and nobody can sign in, so the
+	// provisioner treats it as required, not optional.
+	ResendSecret string
+	// EmailFrom is the sender magic links are sent from, at the verified
+	// domain, optionally as "Name <sender@example.com>".
+	EmailFrom string
+	// SandboxAPIURL and SandboxTemplate configure the tenant's sandbox
+	// backend: the Superserve API its QM creates sandboxes against, and the
+	// template it launches them from.
+	SandboxAPIURL   string
+	SandboxTemplate string
+	// SandboxKeyRegion tags the API keys the provisioner issues with this
+	// cell's region (ss_live_<region>_<random>), as the control plane's own
+	// keys are; an untagged key gets the generic 401 when it reaches the
+	// wrong cell instead of the redirect hint.
+	SandboxKeyRegion string
 	// RunStaleAfter is how long an in-flight tenant may go without a new
 	// event before the API treats its run as lost and lets it be retried
 	// or deleted.
@@ -68,6 +109,26 @@ func LoadConfig() (Config, error) {
 		TenantImage:       os.Getenv("QM_TENANT_IMAGE"),
 		SentryDSN:         os.Getenv("SENTRY_DSN"),
 		RunStaleAfter:     defaultRunStaleAfter,
+
+		SQLInstance:         os.Getenv("QM_SQL_INSTANCE"),
+		SQLConnectionName:   os.Getenv("QM_SQL_CONNECTION_NAME"),
+		SQLPrivateIP:        os.Getenv("QM_SQL_PRIVATE_IP"),
+		LBURLMap:            os.Getenv("QM_LB_URL_MAP"),
+		VPCNetwork:          os.Getenv("QM_VPC_NETWORK"),
+		VPCSubnetwork:       os.Getenv("QM_VPC_SUBNETWORK"),
+		BucketLocation:      os.Getenv("QM_TENANT_BUCKET_LOCATION"),
+		BucketLifecycleJSON: os.Getenv("QM_TENANT_BUCKET_LIFECYCLE_JSON"),
+
+		ResendSecret:     os.Getenv("QM_RESEND_SECRET"),
+		EmailFrom:        os.Getenv("QM_EMAIL_FROM"),
+		SandboxAPIURL:    strings.TrimSuffix(os.Getenv("QM_SANDBOX_API_URL"), "/"),
+		SandboxTemplate:  os.Getenv("QM_SANDBOX_TEMPLATE"),
+		SandboxKeyRegion: envOr("QM_SANDBOX_KEY_REGION", os.Getenv("SANDBOX_ID_REGION")),
+	}
+	// Buckets default to the provisioner's own region rather than failing:
+	// the Terraform module's tenant_bucket_location does the same.
+	if cfg.BucketLocation == "" {
+		cfg.BucketLocation = cfg.ProvisionerRegion
 	}
 	if raw := os.Getenv("QM_RUN_STALE_AFTER"); raw != "" {
 		d, err := time.ParseDuration(raw)
