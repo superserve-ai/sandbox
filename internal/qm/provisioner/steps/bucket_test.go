@@ -29,6 +29,8 @@ func TestParseLifecyclePolicy(t *testing.T) {
 		`{"rules":[]}`,      // misspelled
 		`{"rule":[],"x":1}`, // unknown field
 		`[]`,
+		`{"rule":[]} {}`,   // trailing value
+		`{"rule":[]} junk`, // trailing anything
 	} {
 		if _, err := ParseLifecyclePolicy(policy); err == nil {
 			t.Errorf("ParseLifecyclePolicy(%q) was accepted", policy)

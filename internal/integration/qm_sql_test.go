@@ -129,6 +129,23 @@ func TestQMProvisionerDatabaseIsolation(t *testing.T) {
 	// The refusals left everything as it was.
 	assertLogin(t, role, "pw-three", dbName, true)
 
+	// An unmarked object is refused too. These names come from a
+	// user-chosen slug, so a database that carries no marker is far more
+	// likely to be somebody else's than a half-built one of ours, and
+	// adopting it would reset its password and drop its data.
+	if _, err := testPool.Exec(ctx, fmt.Sprintf(`COMMENT ON DATABASE %q IS NULL`, dbName)); err != nil {
+		t.Fatalf("clear the database marker: %v", err)
+	}
+	if err := client.EnsureDatabase(ctx, dbName, role, marker); err == nil {
+		t.Error("an unmarked database was adopted")
+	}
+	if err := client.DropDatabase(ctx, dbName, marker); err == nil {
+		t.Error("an unmarked database was dropped")
+	}
+	if _, err := testPool.Exec(ctx, fmt.Sprintf(`COMMENT ON DATABASE %q IS %s`, dbName, quoteSQL(marker))); err != nil {
+		t.Fatalf("restore the database marker: %v", err)
+	}
+
 	if err := client.DropDatabase(ctx, dbName, marker); err != nil {
 		t.Fatalf("drop the database: %v", err)
 	}
@@ -198,6 +215,12 @@ func TestQMProvisionerDatabaseRefusesOddIdentifiers(t *testing.T) {
 			t.Errorf("DropDatabase accepted %q", name)
 		}
 	}
+}
+
+// quoteSQL is the test's own literal quoting, for the statements it issues
+// directly to set up the cases above.
+func quoteSQL(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func assertConnect(t *testing.T, role, dbName string, want bool) {

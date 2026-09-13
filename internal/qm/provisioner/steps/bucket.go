@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/superserve-ai/sandbox/internal/qm/provisioner"
@@ -101,6 +102,13 @@ func ParseLifecyclePolicy(policy string) (string, error) {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&parsed); err != nil {
 		return "", fmt.Errorf("QM_TENANT_BUCKET_LIFECYCLE_JSON is not a lifecycle policy: %w", err)
+	}
+	// A decoder stops at the end of the first value, so anything after it
+	// would pass here and be rejected later by the bucket client's whole-
+	// input unmarshal — after the tenant's secrets, identity and database
+	// already exist.
+	if err := decoder.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		return "", errors.New("QM_TENANT_BUCKET_LIFECYCLE_JSON is not a lifecycle policy: trailing data after the object")
 	}
 	if parsed.Rule == nil {
 		return "", errors.New(`QM_TENANT_BUCKET_LIFECYCLE_JSON is not a lifecycle policy: no "rule" list`)

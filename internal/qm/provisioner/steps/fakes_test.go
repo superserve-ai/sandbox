@@ -161,10 +161,20 @@ func newFakeDatabases() *fakeDatabases {
 	}
 }
 
-// checkMarker mirrors the real client: an object carrying somebody else's
-// marker is refused; one with none is a run that died before stamping it.
+// checkMarker mirrors the real client: only an object carrying this
+// tenant's own marker may be touched. An unmarked one is refused too —
+// these names come from a user-chosen slug, so "no marker" is far more
+// likely to be somebody else's database than a half-built one of ours.
 func (f *fakeDatabases) checkMarker(kind, name, marker string) error {
-	if have, ok := f.markers[kind+":"+name]; ok && have != marker {
+	exists := false
+	switch kind {
+	case "database":
+		_, exists = f.databases[name]
+	case "role":
+		_, exists = f.users[name]
+	}
+	have, marked := f.markers[kind+":"+name]
+	if (exists || marked) && have != marker {
 		return fmt.Errorf("fake: %s %s does not belong to this tenant", kind, name)
 	}
 	return nil

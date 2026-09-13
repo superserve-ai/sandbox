@@ -248,32 +248,50 @@ func (d *Databases) EnsureUser(ctx context.Context, name, password, marker strin
 	if err != nil {
 		return err
 	}
-	// Before the password is reset: a role of this name that is not this
-	// tenant's belongs to something else, and resetting it would lock that
-	// something else out.
-	if err := d.checkMarker(ctx, pool, roleMarkerSQL, name, marker, "role"); err != nil {
-		return err
-	}
 	// The password is a literal, not an identifier, so it goes through
 	// Postgres's own quoting rather than string concatenation.
 	quoted, err := quoteLiteral(ctx, pool, password)
 	if err != nil {
 		return err
 	}
-	_, err = pool.Exec(ctx, `CREATE ROLE `+ident+` WITH LOGIN PASSWORD `+quoted)
-	if err != nil && !isPGCode(err, pgDuplicateObject) {
+	// Role DDL is transactional, so the role and its marker land together
+	// or not at all: unlike a database, a role of ours can never be left
+	// unmarked for the next run to refuse.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
 		return fmt.Errorf("create role %s: %w", name, err)
 	}
-	if _, err := pool.Exec(ctx, `ALTER ROLE `+ident+` WITH LOGIN PASSWORD `+quoted); err != nil {
+	defer func() { _ = tx.Rollback(ctx) }()
+	// The marker inside the transaction that acts on it, so the check and
+	// the write cannot be separated.
+	if err := d.checkMarker(ctx, tx, roleMarkerSQL, name, marker, "role"); err != nil {
+		return err
+	}
+	// Existence first rather than tolerating a duplicate error: a failed
+	// statement aborts the transaction, and everything after it would come
+	// back as "current transaction is aborted".
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)`, name).Scan(&exists); err != nil {
+		return fmt.Errorf("look up role %s: %w", name, err)
+	}
+	if !exists {
+		if _, err := tx.Exec(ctx, `CREATE ROLE `+ident+` WITH LOGIN PASSWORD `+quoted); err != nil {
+			return fmt.Errorf("create role %s: %w", name, err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `ALTER ROLE `+ident+` WITH LOGIN PASSWORD `+quoted); err != nil {
 		return fmt.Errorf("set the password of role %s: %w", name, err)
 	}
 	// INHERIT as well as SET: the ownership checks on ALTER DATABASE read
 	// the privileges the admin holds, not the ones it could assume.
-	if _, err := pool.Exec(ctx, `GRANT `+ident+` TO CURRENT_USER WITH SET TRUE, INHERIT TRUE`); err != nil {
+	if _, err := tx.Exec(ctx, `GRANT `+ident+` TO CURRENT_USER WITH SET TRUE, INHERIT TRUE`); err != nil {
 		return fmt.Errorf("let the admin act for role %s: %w", name, err)
 	}
-	if _, err := pool.Exec(ctx, `COMMENT ON ROLE `+ident+` IS `+quoteMarker(marker)); err != nil {
+	if _, err := tx.Exec(ctx, `COMMENT ON ROLE `+ident+` IS `+quoteMarker(marker)); err != nil {
 		return fmt.Errorf("mark role %s: %w", name, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("create role %s: %w", name, err)
 	}
 	return nil
 }
@@ -299,6 +317,12 @@ func (d *Databases) DropUser(ctx context.Context, name, marker string) error {
 	return nil
 }
 
+// querier is the part of a pool or a transaction checkMarker needs, so the
+// check can run inside the transaction that acts on what it checked.
+type querier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
 // Where each object's ownership marker is kept. Shared-object comments are
 // the only per-object text a database or a role carries.
 const (
@@ -306,21 +330,31 @@ const (
 	roleMarkerSQL     = `SELECT shobj_description(oid, 'pg_authid') FROM pg_roles WHERE rolname = $1`
 )
 
-// checkMarker refuses an object that exists and carries somebody else's
-// marker. An object that does not exist, or that exists with no marker at
-// all, passes: the second is a run that died between creating it and
-// stamping it, and that run was this tenant's.
-func (d *Databases) checkMarker(ctx context.Context, pool *pgxpool.Pool, query, name, marker, kind string) error {
+// checkMarker refuses an object that exists and does not carry this
+// tenant's marker. Only a missing object passes.
+//
+// An object with no marker at all is refused too, and that is the whole
+// point: these names come from a user-chosen slug, so an unmarked database
+// is far more likely to be somebody else's than to be a half-built one of
+// ours. The cost is a run that died in the two statements between CREATE
+// DATABASE — which cannot join a transaction — and its COMMENT: that leaves
+// an empty, connection-less database this refuses to adopt, and an operator
+// has to drop it. Refusing to reset a stranger's password and drop their
+// data is worth that.
+func (d *Databases) checkMarker(ctx context.Context, q querier, query, name, marker, kind string) error {
 	var have *string
-	err := pool.QueryRow(ctx, query, name).Scan(&have)
+	err := q.QueryRow(ctx, query, name).Scan(&have)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("read the marker on %s %s: %w", kind, name, err)
 	}
-	if have == nil || *have == marker {
+	if have != nil && *have == marker {
 		return nil
+	}
+	if have == nil {
+		return fmt.Errorf("%s %s already exists and carries no tenant marker; drop it by hand if it was left by an interrupted run", kind, name)
 	}
 	return fmt.Errorf("%s %s already exists and does not belong to this tenant", kind, name)
 }
