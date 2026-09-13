@@ -147,20 +147,34 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode,
 		// Last words first: a deleted tenant's event log is frozen, so the
 		// completion event has to land before the status flips.
 		r.record(dctx, tenant, RunStep, tenantstore.EventOK, "deprovision complete; tenant deleted", nil)
-		if _, err := r.Store.SoftDelete(dctx, teamID, tenantID); err != nil {
+		if _, err := r.Store.SoftDelete(dctx, teamID, tenantID); err != nil && !r.settled(dctx, teamID, tenantID, tenantstore.StatusDeleted) {
 			log.Error().Err(err).Msg("record tenant deleted")
 			r.fail(dctx, tenant, "Deprovisioning finished but the tenant could not be marked deleted. Retry to record it.")
 			return fmt.Errorf("mark tenant deleted: %w", err)
 		}
 		return nil
 	}
-	if _, err := r.Store.SetStatus(dctx, teamID, tenantID, tenantstore.StatusReady); err != nil {
+	if _, err := r.Store.SetStatus(dctx, teamID, tenantID, tenantstore.StatusReady); err != nil && !r.settled(dctx, teamID, tenantID, tenantstore.StatusReady) {
 		log.Error().Err(err).Msg("record tenant ready")
 		r.fail(dctx, tenant, "Provisioning finished but the tenant could not be marked ready. Retry to record it.")
 		return fmt.Errorf("mark tenant ready: %w", err)
 	}
 	r.record(dctx, tenant, RunStep, tenantstore.EventOK, "provision complete; tenant ready", nil)
 	return nil
+}
+
+// settled reports whether the tenant already reads as want. A terminal
+// write can commit and still report an error — a connection dropped on the
+// way back — and the fallback for that error marks the tenant failed, which
+// on a run that in fact succeeded would undo it. The run still holds the
+// tenant lock here, so the row is authoritative.
+func (r *Runner) settled(ctx context.Context, teamID, tenantID uuid.UUID, want string) bool {
+	row, err := r.Store.GetTenant(ctx, teamID, tenantID)
+	if err != nil || row.Status != want {
+		return false
+	}
+	r.Log.Warn().Str("tenant_id", tenantID.String()).Str("status", want).Msg("tenant was recorded despite the error")
+	return true
 }
 
 // TriggerStep is the event step qm-api records a run's intent under; its

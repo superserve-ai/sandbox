@@ -611,3 +611,57 @@ func TestRecordSetupFailureIgnoresASupersededAttempt(t *testing.T) {
 		t.Errorf("status = %s, want the successor left queued", got)
 	}
 }
+
+// A terminal write can commit and still report an error. The fallback for
+// that error marks the tenant failed, which on a run that in fact succeeded
+// would undo it, so the row is consulted before the fallback runs.
+func TestRunnerKeepsATerminalWriteThatCommitted(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		mode Mode
+		want string
+	}{
+		{"provision", ModeProvision, tenantstore.StatusReady},
+		{"deprovision", ModeDeprovision, tenantstore.StatusDeleted},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t)
+			store := &ambiguousTerminalStore{Memory: h.store, want: tc.want}
+			r := &Runner{Store: store, Env: Env{BaseDomain: "qm.example.com", Stub: true}, Steps: []Step{&fakeStep{name: "a"}}, Log: zerolog.Nop()}
+			h.queue(t, tc.mode)
+			if err := r.Run(ctx, h.teamID, h.tenant.ID, tc.mode, 0); err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if got := h.status(t); got != tc.want {
+				t.Errorf("status = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// ambiguousTerminalStore commits the terminal write and then reports a
+// transport error for it.
+type ambiguousTerminalStore struct {
+	*tenantstore.Memory
+	want string
+	done bool
+}
+
+func (s *ambiguousTerminalStore) SetStatus(ctx context.Context, teamID, tenantID uuid.UUID, status string) (tenantstore.Tenant, error) {
+	t, err := s.Memory.SetStatus(ctx, teamID, tenantID, status)
+	if err == nil && !s.done && status == s.want {
+		s.done = true
+		return tenantstore.Tenant{}, errors.New("connection reset")
+	}
+	return t, err
+}
+
+func (s *ambiguousTerminalStore) SoftDelete(ctx context.Context, teamID, tenantID uuid.UUID) (tenantstore.Tenant, error) {
+	t, err := s.Memory.SoftDelete(ctx, teamID, tenantID)
+	if err == nil && !s.done && s.want == tenantstore.StatusDeleted {
+		s.done = true
+		return tenantstore.Tenant{}, errors.New("connection reset")
+	}
+	return t, err
+}
