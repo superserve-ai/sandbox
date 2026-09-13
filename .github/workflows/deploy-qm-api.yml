@@ -242,7 +242,15 @@ jobs:
           # instance, the load balancer, the shared Resend secret, the
           # sender address, the sandbox API and template — is the QM
           # Terraform module's, stamped onto both resources from its own
-          # state. Setting any of it here too would fight the next apply.
+          # state. Setting any of it here too would fight the next apply:
+          # the module does not ignore env drift, so whichever ran last
+          # would win and the two would flap.
+          #
+          # That leaves nothing for this workflow to supply on a fresh
+          # environment, which is safe for the same reason the gate above
+          # exists: QM_API_SERVICE is only set once the module has been
+          # applied for that environment, so there is no deploy that can
+          # reach a service the module has not already configured.
           #
           # QM_PROVISIONER_STUB is the exception, and it is pinned off
           # rather than left alone: an environment deployed while the cloud
@@ -357,7 +365,15 @@ jobs:
           # instance, the load balancer, the shared Resend secret, the
           # sender address, the sandbox API and template — is the QM
           # Terraform module's, stamped onto both resources from its own
-          # state. Setting any of it here too would fight the next apply.
+          # state. Setting any of it here too would fight the next apply:
+          # the module does not ignore env drift, so whichever ran last
+          # would win and the two would flap.
+          #
+          # That leaves nothing for this workflow to supply on a fresh
+          # environment, which is safe for the same reason the gate above
+          # exists: QM_API_SERVICE is only set once the module has been
+          # applied for that environment, so there is no deploy that can
+          # reach a service the module has not already configured.
           #
           # QM_PROVISIONER_STUB is the exception, and it is pinned off
           # rather than left alone: an environment deployed while the cloud
