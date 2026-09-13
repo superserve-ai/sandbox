@@ -193,3 +193,64 @@ func TestAddRouteSplitsASharedRule(t *testing.T) {
 		t.Error("re-adding the split route reported a change")
 	}
 }
+
+// The base domain is deployment configuration. When it changes, the rule
+// left on the map is the hostname the tenant used to answer at, and only
+// the matcher name — derived from the slug, which does not move —
+// identifies it. Leaving it would keep the old hostname live and pin the
+// backend service behind it forever.
+func TestAddRouteMovesATenantToANewHostname(t *testing.T) {
+	m := &compute.UrlMap{
+		HostRules: []*compute.HostRule{
+			{Hosts: []string{"pilot-team.qm.example.com"}, PathMatcher: "qm-pilot-team"},
+			{Hosts: []string{"other.qm.example.com"}, PathMatcher: "qm-other"},
+		},
+		PathMatchers: []*compute.PathMatcher{
+			{Name: "qm-pilot-team", DefaultService: "pilot-backend"},
+			{Name: "qm-other", DefaultService: "other-backend"},
+		},
+	}
+	if !addRoute(m, "pilot-team.qm2.example.com", "qm-pilot-team", "pilot-backend") {
+		t.Fatal("moving a tenant reported no change")
+	}
+	if _, ok := routed(m, "pilot-team.qm.example.com"); ok {
+		t.Error("the hostname the tenant outgrew is still routed")
+	}
+	if matcher, ok := routed(m, "pilot-team.qm2.example.com"); !ok || matcher != "qm-pilot-team" {
+		t.Errorf("the new hostname = %q %v", matcher, ok)
+	}
+	if matcher, ok := routed(m, "other.qm.example.com"); !ok || matcher != "qm-other" {
+		t.Errorf("another tenant was disturbed: %q %v", matcher, ok)
+	}
+	if addRoute(m, "pilot-team.qm2.example.com", "qm-pilot-team", "pilot-backend") {
+		t.Error("re-adding the moved route reported a change")
+	}
+}
+
+// A path matcher may legitimately be named by more than one host rule, and
+// a URL map carrying a rule whose matcher is missing is rejected outright.
+// So removing one tenant's hostname must leave a matcher another rule still
+// names — and must not report it for deletion, because the caller deletes
+// the backend service behind it next.
+func TestRemoveRouteKeepsAMatcherAnotherRuleNames(t *testing.T) {
+	m := &compute.UrlMap{
+		HostRules: []*compute.HostRule{
+			{Hosts: []string{"pilot-team.qm.example.com"}, PathMatcher: "qm-pilot-team"},
+			{Hosts: []string{"alias.qm.example.com"}, PathMatcher: "qm-pilot-team"},
+		},
+		PathMatchers: []*compute.PathMatcher{{Name: "qm-pilot-team", DefaultService: "pilot-backend"}},
+	}
+	matcher, changed := removeRoute(m, "pilot-team.qm.example.com")
+	if !changed {
+		t.Fatal("removing one of two rules reported no change")
+	}
+	if matcher != "" {
+		t.Errorf("a matcher another rule still names was reported for deletion: %q", matcher)
+	}
+	if _, ok := matcherService(m, "qm-pilot-team"); !ok {
+		t.Error("the matcher was removed while a rule still named it")
+	}
+	if _, ok := routed(m, "alias.qm.example.com"); !ok {
+		t.Error("the other rule lost its route")
+	}
+}

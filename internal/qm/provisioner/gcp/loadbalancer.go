@@ -280,28 +280,52 @@ func (l *LoadBalancer) patchURLMap(ctx context.Context, mutate func(*compute.Url
 }
 
 // addRoute points host at matcher and matcher at backend, reporting whether
-// the map changed. It never edits a rule that carries other hosts: a URL
-// map's host rules are shared state, and repointing one to reconcile this
-// tenant would silently reroute every other hostname on it.
+// the map changed.
+//
+// It also takes this tenant's matcher away from any other hostname. Host
+// rules are shared state and QM_BASE_DOMAIN is deployment configuration:
+// when it changes, the rule left on the map is the hostname the tenant used
+// to answer at, and only its matcher name — which is derived from the slug
+// and does not move — identifies it. Leaving it would keep the old hostname
+// live and pin the backend service it points at, so teardown could never
+// remove either.
+//
+// It never edits a rule that carries other hosts beyond changing which
+// hosts are on it: repointing one to reconcile this tenant would silently
+// reroute every other hostname riding on it.
 func addRoute(m *compute.UrlMap, host, matcher, backend string) bool {
 	changed := false
 	var own *compute.HostRule
 	kept := make([]*compute.HostRule, 0, len(m.HostRules)+1)
 	for _, rule := range m.HostRules {
-		if !slices.Contains(rule.Hosts, host) {
+		mine := rule.PathMatcher == matcher
+		if !mine && !slices.Contains(rule.Hosts, host) {
 			kept = append(kept, rule)
 			continue
 		}
-		if len(rule.Hosts) == 1 {
+		// Everything on this rule that is not the hostname we want here:
+		// other hosts on our own matcher are hostnames this tenant has
+		// outgrown, and our host on somebody else's matcher has to move to
+		// a rule of its own.
+		var hosts []string
+		for _, h := range rule.Hosts {
+			if (mine && h != host) || (!mine && h == host) {
+				changed = true
+				continue
+			}
+			hosts = append(hosts, h)
+		}
+		switch {
+		case len(hosts) == 0:
+			// Nothing left on it.
+		case mine && slices.Contains(hosts, host):
+			rule.Hosts = hosts
 			own = rule
 			kept = append(kept, rule)
-			continue
+		default:
+			rule.Hosts = hosts
+			kept = append(kept, rule)
 		}
-		// Shared with other hostnames. Take this one out and give it a
-		// rule of its own rather than changing where the others point.
-		rule.Hosts = without(rule.Hosts, host)
-		kept = append(kept, rule)
-		changed = true
 	}
 	m.HostRules = kept
 	switch {
@@ -356,6 +380,16 @@ func removeRoute(m *compute.UrlMap, host string) (string, bool) {
 	m.HostRules = rules
 	if matcher == "" {
 		return "", true
+	}
+	// Nothing says a path matcher may only be named by one host rule, and
+	// a URL map with a rule pointing at a matcher that is not there is
+	// rejected outright. So the matcher — and the backend service behind
+	// it, which the caller deletes next — only goes when nothing else
+	// still names it.
+	for _, rule := range rules {
+		if rule.PathMatcher == matcher {
+			return "", true
+		}
 	}
 	matchers := make([]*compute.PathMatcher, 0, len(m.PathMatchers))
 	for _, pm := range m.PathMatchers {

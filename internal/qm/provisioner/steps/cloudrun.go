@@ -127,19 +127,15 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 	// up with the first attempt's. Granting is idempotent, so this runs on
 	// every attempt rather than only on the one that creates the service:
 	// a secret rotated into the spec later still gets its binding.
+	// The shared grant is settled before any of them, not after: it is the
+	// only one whose record has to survive the grant itself.
+	if err := s.reconcileSharedGrant(ctx, t, account); err != nil {
+		return err
+	}
 	for _, secretName := range mountedSecrets(secretEnv) {
 		if err := s.c.Accounts.GrantSecretAccess(ctx, secretName, account); err != nil {
 			return fmt.Errorf("grant the tenant access to %s: %w", secretName, err)
 		}
-	}
-	// Which shared secret this tenant was granted, recorded on the row.
-	// The tenant's own secrets are deleted outright on teardown, so their
-	// policies go with them; the platform's shared one outlives every
-	// tenant, and if its configured name is rotated to a different
-	// resource between now and teardown, the name in the environment is no
-	// longer the binding that was made.
-	if err := s.reconcileSharedGrant(ctx, t, account); err != nil {
-		return err
 	}
 
 	status, err := s.c.Services.Deploy(ctx, ServiceSpec{
@@ -166,14 +162,17 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 	return t.Record(ctx, tenantstore.Resources{CloudRunService: &name, ImageTag: &image, PublicURL: &public})
 }
 
-// reconcileSharedGrant records which platform secret this tenant's identity
-// was granted access to, and gives up the previous one if the configured
-// secret has been rotated to a different resource since. Only one name is
-// ever recorded, so the old binding has to be released here — after
-// teardown there would be nothing left to say it existed.
+// reconcileSharedGrant settles which platform secret this tenant's identity
+// holds a binding on: it gives up any previously recorded one that is no
+// longer configured, then records the configured one — before the grant is
+// made, so a run that dies at the wrong moment leaves a record of a binding
+// that does not exist (a later revoke of which is a no-op) rather than a
+// binding with no record (which nothing would ever release).
 //
-// Nothing is stored under the tenant's own name for it; the reference is a
-// record of the binding, not of a secret the tenant owns.
+// Only one name is ever recorded, which is why the old one has to go here
+// while it is still known; after teardown there would be nothing left to
+// say it existed. Nothing is stored under the tenant's own name for it —
+// the reference is a record of the binding, not of a secret the tenant owns.
 func (s cloudRun) reconcileSharedGrant(ctx context.Context, t *provisioner.Tenant, account string) error {
 	if t.Env.ResendSecret == "" {
 		return nil
