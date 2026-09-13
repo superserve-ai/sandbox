@@ -77,12 +77,6 @@ func setup(ctx context.Context) (*deps, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
-	if cfg.SentryDSN != "" {
-		if err := sentry.Init(sentry.ClientOptions{Dsn: cfg.SentryDSN, EnableLogs: true}); err != nil {
-			return nil, fmt.Errorf("sentry init: %w", err)
-		}
-	}
-
 	pool, err := connectDB(ctx, cfg.DatabaseURL)
 	if err != nil {
 		return nil, err
@@ -93,6 +87,14 @@ func setup(ctx context.Context) (*deps, error) {
 		return nil, err
 	}
 	d := &deps{cfg: cfg, pool: pool, store: store, closeStore: store.Close}
+
+	// After the store, so that every later setup failure is one the job can
+	// still record against the tenant it was started for.
+	if cfg.SentryDSN != "" {
+		if err := sentry.Init(sentry.ClientOptions{Dsn: cfg.SentryDSN, EnableLogs: true}); err != nil {
+			return d, fmt.Errorf("sentry init: %w", err)
+		}
+	}
 
 	var secretStore secrets.Store
 	switch cfg.SecretsBackend {

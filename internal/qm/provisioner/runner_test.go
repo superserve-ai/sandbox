@@ -503,3 +503,40 @@ func TestRecordSetupFailure(t *testing.T) {
 		t.Errorf("events = %v", h.events(t))
 	}
 }
+
+// Failure bookkeeping is ordered and bounded: the tenant is marked failed
+// before the optional events, so a database that cannot take the events (or
+// a job killed while it tries) still leaves the tenant retryable rather
+// than in flight.
+func TestRunnerMarksFailedEvenWhenEventsCannotBeWritten(t *testing.T) {
+	h := newHarness(t)
+	store := &eventRefusingStore{Memory: h.store}
+	a := &fakeStep{name: "a", run: func(context.Context, *Tenant, int) error { return errors.New("boom") }}
+	b := &fakeStep{name: "b"}
+	r := &Runner{Store: store, Env: Env{BaseDomain: "qm.example.com", Stub: true}, Steps: []Step{a, b}, Log: zerolog.Nop()}
+	h.queue(t, ModeProvision)
+	store.refuse = true
+	if err := r.Run(context.Background(), h.teamID, h.tenant.ID, ModeProvision); err == nil {
+		t.Fatal("run reported success")
+	}
+	if got := h.status(t); got != tenantstore.StatusFailed {
+		t.Errorf("status = %s, want failed", got)
+	}
+	if b.count() != 0 {
+		t.Error("the step after the failure ran")
+	}
+}
+
+// eventRefusingStore rejects every event write while refuse is set, as a
+// database that is gone would.
+type eventRefusingStore struct {
+	*tenantstore.Memory
+	refuse bool
+}
+
+func (s *eventRefusingStore) InsertEvent(ctx context.Context, teamID uuid.UUID, p tenantstore.EventParams) (tenantstore.Event, error) {
+	if s.refuse {
+		return tenantstore.Event{}, errors.New("database unavailable")
+	}
+	return s.Memory.InsertEvent(ctx, teamID, p)
+}

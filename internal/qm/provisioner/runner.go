@@ -97,11 +97,19 @@ func (r *Runner) Run(ctx context.Context, teamID, tenantID uuid.UUID, mode Mode)
 			// Logged scrubbed, like the event: a cloud error can echo a
 			// connection string or key it was handed.
 			log.Warn().Str("error", ScrubString(err.Error())).Str("step", step.Name()).Msg("step failed")
-			r.record(ctx, tenant, step.Name(), tenantstore.EventFailed, step.Name()+" failed", map[string]any{"error": err.Error()})
+			// One deadline for the whole failure sequence, and the status
+			// first: with a slow database, a per-write timeout for each of
+			// the remaining steps' skipped events would spend the job's
+			// remaining life before the write that actually matters, and a
+			// killed job would leave the tenant in flight.
+			dctx, cancel := detached(ctx)
+			r.setFailed(dctx, tenant)
+			r.recordIn(dctx, tenant, step.Name(), tenantstore.EventFailed, step.Name()+" failed", map[string]any{"error": err.Error()})
 			for _, rest := range plan.Steps[i+1:] {
-				r.record(ctx, tenant, rest.Name(), tenantstore.EventSkipped, "not run: "+step.Name()+" failed", nil)
+				r.recordIn(dctx, tenant, rest.Name(), tenantstore.EventSkipped, "not run: "+step.Name()+" failed", nil)
 			}
-			r.fail(ctx, tenant, failureMessage(mode, step.Name()))
+			r.recordIn(dctx, tenant, RunStep, tenantstore.EventFailed, failureMessage(mode, step.Name()), nil)
+			cancel()
 			return err
 		}
 	}
@@ -139,28 +147,40 @@ func failureMessage(mode Mode, step string) string {
 	return "Provisioning stopped at " + step + ". Retry to continue from where it left off, or delete the tenant."
 }
 
-// fail marks the tenant failed with a user-safe run event. A failure to
-// write even that is logged; the run's error is what the caller returns.
+// fail marks the tenant failed with a user-safe run event, both under one
+// bookkeeping deadline. A failure to write even that is logged; the run's
+// error is what the caller returns.
 func (r *Runner) fail(ctx context.Context, t *Tenant, message string) {
 	dctx, cancel := detached(ctx)
 	defer cancel()
-	if _, err := r.Store.SetStatus(dctx, t.Row.TeamID, t.Row.ID, tenantstore.StatusFailed); err != nil {
-		r.Log.Error().Err(err).Str("tenant_id", t.Row.ID.String()).Msg("mark tenant failed")
-	}
-	r.record(dctx, t, RunStep, tenantstore.EventFailed, message, nil)
+	r.setFailed(dctx, t)
+	r.recordIn(dctx, t, RunStep, tenantstore.EventFailed, message, nil)
 }
 
-// record appends an event; detail is scrubbed before it is stored. A
-// failure to write bookkeeping is logged, not fatal: the step outcome has
-// already happened and a retry will re-derive it.
+func (r *Runner) setFailed(ctx context.Context, t *Tenant) {
+	if _, err := r.Store.SetStatus(ctx, t.Row.TeamID, t.Row.ID, tenantstore.StatusFailed); err != nil {
+		r.Log.Error().Err(err).Str("tenant_id", t.Row.ID.String()).Msg("mark tenant failed")
+	}
+}
+
+// record appends an event on its own bookkeeping deadline, for the writes
+// that stand alone.
 func (r *Runner) record(ctx context.Context, t *Tenant, step, status, message string, detail map[string]any) {
+	dctx, cancel := detached(ctx)
+	defer cancel()
+	r.recordIn(dctx, t, step, status, message, detail)
+}
+
+// recordIn appends an event under a deadline the caller owns; detail is
+// scrubbed before it is stored. A failure to write bookkeeping is logged,
+// not fatal: the step outcome has already happened and a retry will
+// re-derive it.
+func (r *Runner) recordIn(ctx context.Context, t *Tenant, step, status, message string, detail map[string]any) {
 	p := tenantstore.EventParams{TenantID: t.Row.ID, Step: step, Status: status, Message: message}
 	if detail != nil {
 		p.Detail = ScrubDetail(detail)
 	}
-	dctx, cancel := detached(ctx)
-	defer cancel()
-	if _, err := r.Store.InsertEvent(dctx, t.Row.TeamID, p); err != nil {
+	if _, err := r.Store.InsertEvent(ctx, t.Row.TeamID, p); err != nil {
 		r.Log.Error().Err(err).Str("tenant_id", t.Row.ID.String()).Str("step", step).Str("status", status).Msg("record tenant event")
 	}
 }

@@ -54,6 +54,12 @@ on:
       - '.github/workflows/deploy-qm-api.yml'
 
 jobs:
+  # Deliberately identical to deploy-api.yml's gate, down to its limits (it
+  # inspects the pushed range, so it does not re-check a migration an
+  # earlier push left failing): the two services deploy against the same
+  # database, and a gate that differs between them is worse than one that
+  # is uniformly conservative. Change both together.
+  #
   # A push that changes both migrations and code triggers CD — Migrate and
   # this workflow with no ordering: if the new binary reaches Cloud Run
   # before the migration applies, its queries (and the qm.resolve_api_key
