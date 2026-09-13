@@ -208,6 +208,11 @@ variable "resend_secret_id" {
   description = "Secret Manager secret holding the platform's Resend API key, which every tenant's sign-in broker sends magic links with. Null creates qm-resend-<resource_suffix> in this project; set it to point at a secret that already exists instead. Only the secret is managed either way — the key itself is added out of band, and a tenant provisioned before that fails at its Cloud Run deploy rather than silently shipping without email."
   type        = string
   default     = null
+
+  validation {
+    condition     = var.resend_secret_id == null || can(regex("^[A-Za-z0-9_-]{1,255}$", var.resend_secret_id))
+    error_message = "resend_secret_id must be null or a Secret Manager secret ID. An empty string is neither: it would name the generated secret without creating it."
+  }
 }
 
 variable "tenant_email_from" {
@@ -226,7 +231,10 @@ variable "sandbox_api_url" {
   type        = string
 
   validation {
-    condition     = var.sandbox_api_url == null || can(regex("^https://[^/]+$", var.sandbox_api_url))
+    # Not null-tolerant, unlike var.domain: a root with enable_qm off never
+    # evaluates this module at all, and a null that reached the service
+    # would deploy an empty QM_SANDBOX_API_URL that only fails later.
+    condition     = var.sandbox_api_url != null && can(regex("^https://[^/]+$", var.sandbox_api_url))
     error_message = "sandbox_api_url must be an https origin with no path or trailing slash."
   }
 }

@@ -68,12 +68,13 @@ locals {
   sql_admin_secret_id            = "${local.sql_admin_secret_prefix}${var.resource_suffix}"
   api_database_url_secret_prefix = "qm-api-database-url-"
   api_database_url_secret_id     = "${local.api_database_url_secret_prefix}${var.resource_suffix}"
-  resend_secret_prefix           = "qm-resend-"
-  # Created here when the caller names no existing secret. Either way this is
-  # the name the provisioner is handed and the name it grants every tenant
-  # read on, so the two can never disagree.
-  resend_secret_id     = coalesce(var.resend_secret_id, "${local.resend_secret_prefix}${var.resource_suffix}")
-  create_resend_secret = var.resend_secret_id == null
+  # Created here when the caller names no existing secret. One expression
+  # decides both, so a caller cannot end up with the generated name bound but
+  # never created. The variable's own validation already rejects an empty
+  # string; the trim is what keeps that true if it is ever relaxed.
+  resend_secret_override = var.resend_secret_id == null ? "" : trimspace(var.resend_secret_id)
+  create_resend_secret   = local.resend_secret_override == ""
+  resend_secret_id       = local.create_resend_secret ? "qm-resend-${var.resource_suffix}" : local.resend_secret_override
 
   # Platform secrets, as opposed to the qm-<slug>-<name> tenant secrets the
   # broad prefix grants in iam.tf are for. Every environment's, not just this
@@ -82,7 +83,15 @@ locals {
   platform_secret_prefixes = [
     local.sql_admin_secret_prefix,
     local.api_database_url_secret_prefix,
-    local.resend_secret_prefix,
+  ]
+
+  # The shared Resend secret is excluded by its exact name rather than by a
+  # prefix, because unlike the two above its name is a caller's to choose: a
+  # prefix would miss it entirely when it is overridden, and a "qm-resend-"
+  # prefix would also swallow the tenant secrets of any tenant whose slug is
+  # "resend".
+  platform_secret_names = [
+    local.resend_secret_id,
   ]
 
   tenant_image_repository_id = local.name

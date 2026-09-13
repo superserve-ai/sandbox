@@ -53,10 +53,16 @@ locals {
   # control-plane DATABASE_URL. qm-api holds an explicit secret-level accessor
   # binding on its own DATABASE_URL, so excluding the whole family costs it
   # nothing.
-  platform_secret_exclusions = [
-    for prefix in local.platform_secret_prefixes :
-    "!resource.name.startsWith(\"projects/${local.project_number}/secrets/${prefix}\")"
-  ]
+  platform_secret_exclusions = concat(
+    [
+      for prefix in local.platform_secret_prefixes :
+      "!resource.name.startsWith(\"projects/${local.project_number}/secrets/${prefix}\")"
+    ],
+    [
+      for name in local.platform_secret_names :
+      "resource.name != \"projects/${local.project_number}/secrets/${name}\""
+    ],
+  )
 
   # Shared by every qm-api secret grant that IAM evaluates against the secret
   # itself, so accessor, version-adder and delete cannot drift apart.
@@ -70,11 +76,15 @@ locals {
   # Resend key is different: it never reads it, only grants tenants access to
   # it, and admin carries delete. One provisioner run wrongly deleting it
   # would take sign-in away from every tenant in the fleet, so it is excluded
-  # here and reached through the two-permission role below instead.
-  provisioner_secret_condition = join(" && ", [
-    "resource.name.startsWith(\"${local.secret_name_prefix}\")",
-    "!resource.name.startsWith(\"projects/${local.project_number}/secrets/${local.resend_secret_prefix}\")",
-  ])
+  # here — by exact name, so an overridden one is excluded too — and reached
+  # through the two-permission role below instead.
+  provisioner_secret_condition = join(" && ", concat(
+    ["resource.name.startsWith(\"${local.secret_name_prefix}\")"],
+    [
+      for name in local.platform_secret_names :
+      "resource.name != \"projects/${local.project_number}/secrets/${name}\""
+    ],
+  ))
 }
 
 # Project-level roles the provisioner needs and that cannot be narrowed by

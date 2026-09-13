@@ -178,7 +178,15 @@ Before `tenant_capacity` approaches that, request an increase for the IAM API
 - Secret Manager: `roles/secretmanager.admin` (provisioner) and
   `roles/secretmanager.secretAccessor` + `secretVersionAdder` (qm-api) are
   project-level bindings with a `resource.name` condition limited to `qm-*`
-  secrets; qm-api's conditions additionally exclude `qm-sql-admin-*`.
+  secrets; qm-api's conditions additionally exclude `qm-sql-admin-*` and
+  `qm-api-database-url-*`. Both conditions also exclude the shared Resend
+  secret, and that one by exact name rather than by prefix: its name is a
+  caller's to choose, so a prefix would miss an overridden one — and a
+  `qm-resend-` prefix would swallow the secrets of a tenant whose slug is
+  `resend`. The provisioner reaches it through a three-permission custom
+  role (`secrets.get`, `getIamPolicy`, `setIamPolicy`) bound on the secret
+  itself: enough to grant and revoke tenant access, not enough to read the
+  key or delete it.
 - Buckets: a custom role with bucket-level permissions plus object
   list/delete for teardown (no object read), conditioned on the
   `<project>-qm-` name prefix.
