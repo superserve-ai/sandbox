@@ -44,8 +44,11 @@ locals {
   # to the tenant prefixes. Project-level create permissions are checked
   # against the project itself, where a name prefix cannot match, so those
   # live in an unconditional custom role that carries nothing else.
-  secret_name_prefix           = "projects/${local.project_number}/secrets/${local.qm_secret_prefix}"
-  sql_admin_secret_name_prefix = "projects/${local.project_number}/secrets/${local.sql_admin_secret_id}"
+  secret_name_prefix = "projects/${local.project_number}/secrets/${local.qm_secret_prefix}"
+  # Every environment's admin secret, not just this one's: two environments of
+  # this module in one project would otherwise leave each qm-api able to read
+  # the other's instance admin password, since the qm-* allow is project wide.
+  sql_admin_secret_name_prefix = "projects/${local.project_number}/secrets/${local.sql_admin_secret_prefix}"
   tenant_bucket_name_prefix    = "projects/_/buckets/${local.tenant_bucket_prefix}"
 
   # Shared by every qm-api secret grant that IAM evaluates against the secret
@@ -241,7 +244,7 @@ resource "google_project_iam_member" "api_secrets" {
 
   condition {
     title       = "qm secrets except sql admin"
-    description = "qm-* secrets only; the instance admin password stays with the provisioner."
+    description = "qm-* secrets only; instance admin passwords stay with the provisioner."
     expression  = local.api_secret_condition
   }
 }
@@ -284,7 +287,7 @@ resource "google_project_iam_member" "api_secret_delete" {
 
   condition {
     title       = "qm secrets except sql admin"
-    description = "qm-* secrets only; the instance admin password stays with the provisioner."
+    description = "qm-* secrets only; instance admin passwords stay with the provisioner."
     expression  = local.api_secret_condition
   }
 }

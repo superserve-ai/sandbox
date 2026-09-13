@@ -61,7 +61,11 @@ locals {
     63 - length("qm_"),
   )
 
-  sql_admin_secret_id        = "qm-sql-admin-${var.resource_suffix}"
+  # The prefix is shared with the IAM exclusion in iam.tf, which has to match
+  # every environment's admin secret rather than just this one's: several
+  # environments of this module can live in one project.
+  sql_admin_secret_prefix    = "qm-sql-admin-"
+  sql_admin_secret_id        = "${local.sql_admin_secret_prefix}${var.resource_suffix}"
   api_database_url_secret_id = "qm-api-database-url-${var.resource_suffix}"
 
   tenant_image_repository_id = local.name
