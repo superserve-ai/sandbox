@@ -232,6 +232,13 @@ variable "sandbox_template" {
   description = "Superserve template tenants launch their sandboxes from (SUPERSERVE_TEMPLATE). The same name in every environment; each cell seeds its own copy."
   type        = string
   default     = "qm-agent-0.1.0"
+
+  validation {
+    # qm-api refuses to start without it, so an empty one turns a typo in
+    # tfvars into a failed Cloud Run rollout rather than a failed plan.
+    condition     = var.sandbox_template != null && trimspace(var.sandbox_template) != ""
+    error_message = "sandbox_template must name a template."
+  }
 }
 
 variable "tenant_image" {
