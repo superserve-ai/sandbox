@@ -894,3 +894,20 @@ func TestLateFillServesWhatAnEarlierFlightPublished(t *testing.T) {
 		t.Fatalf("DB fills = %d, want 3 (an expired empty set is reloaded)", got)
 	}
 }
+
+func TestAdmissionRefusalExcludesHostWithoutChangingSharedCandidates(t *testing.T) {
+	s := &LeastLoaded{DefaultHostID: "a", cache: map[string]hostCacheEntry{"": {
+		hosts: []db.ListActiveHostsByLoadRow{{ID: "a"}, {ID: "b"}}, cachedAt: time.Now(), gen: 1,
+	}}}
+	id, _, err := s.SelectHostExcluding(context.Background(), nil, "a")
+	if err != nil || id != "b" {
+		t.Fatalf("alternate=%q err=%v", id, err)
+	}
+	if len(s.cache[""].hosts) != 2 {
+		t.Fatal("request exclusion mutated shared candidates")
+	}
+	s.cache[""] = hostCacheEntry{cachedAt: time.Now(), defaultStatus: "active"}
+	if id, _, err := s.SelectHostExcluding(context.Background(), nil, "a"); err == nil || id != "" {
+		t.Fatalf("refused default reused: %q %v", id, err)
+	}
+}
