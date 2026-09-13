@@ -7,9 +7,18 @@ package qm
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// baseDomainRe accepts a bare DNS name: RFC 1123 labels joined by dots, no
+// scheme, port, path or whitespace. Tenant URLs are formed by concatenating
+// a slug onto this value (see provisioner.Tenant.PublicURL), so a value
+// that slips through here would only be caught once the admin_link step
+// tries to mint a URL against it — after a create has already stored the
+// tenant's model key and run the rest of the provisioning plan.
+var baseDomainRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$`)
 
 // Provisioner trigger modes, from QM_PROVISIONER_MODE.
 const (
@@ -81,6 +90,9 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.BaseDomain == "" {
 		return cfg, fmt.Errorf("QM_BASE_DOMAIN is required")
+	}
+	if !baseDomainRe.MatchString(cfg.BaseDomain) {
+		return cfg, fmt.Errorf("QM_BASE_DOMAIN must be a bare domain, e.g. qm.example.com (no scheme, path or whitespace): %q", cfg.BaseDomain)
 	}
 	switch cfg.ProvisionerMode {
 	case ProvisionerModeCloudRun, ProvisionerModeInProcess:

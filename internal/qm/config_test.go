@@ -55,3 +55,41 @@ func TestLoadConfig(t *testing.T) {
 		t.Error("missing base domain accepted")
 	}
 }
+
+func TestLoadConfigBaseDomainShape(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://qm_api:x@localhost/db")
+	t.Setenv("GCP_PROJECT", "")
+	t.Setenv("QM_PROVISIONER_MODE", "inprocess")
+	t.Setenv("QM_SECRETS_BACKEND", "memory")
+	t.Setenv("QM_PROVISIONER_STUB", "1")
+
+	// A malformed base domain must fail at startup: tenant URLs are formed
+	// by concatenating a slug onto it, and a bad value here would otherwise
+	// only surface once the admin_link step tries to mint a URL against it,
+	// after a create has already run the rest of the provisioning plan.
+	bad := []string{
+		"https://qm.example.com",
+		"qm.example.com/path",
+		"qm example.com",
+		"qm.example.com:8080",
+		"qm.example.com ",
+		" ",
+		"-qm.example.com",
+		"qm.example.com-",
+		"justonelabel",
+	}
+	for _, v := range bad {
+		t.Setenv("QM_BASE_DOMAIN", v)
+		if _, err := LoadConfig(); err == nil {
+			t.Errorf("QM_BASE_DOMAIN=%q accepted", v)
+		}
+	}
+
+	good := []string{"qm.example.com", "QM.Example.COM", "a.b.c.example.com", "qm-staging.example.com"}
+	for _, v := range good {
+		t.Setenv("QM_BASE_DOMAIN", v)
+		if _, err := LoadConfig(); err != nil {
+			t.Errorf("QM_BASE_DOMAIN=%q rejected: %v", v, err)
+		}
+	}
+}
