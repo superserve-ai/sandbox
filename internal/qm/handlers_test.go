@@ -1154,3 +1154,62 @@ func eventsOfStep(t *testing.T, f *fixture, tenantID uuid.UUID, step, status str
 	}
 	return out
 }
+
+// Two retries can reach a stale tenant together. The loser takes the lock
+// only after the winner has reclaimed the run and queued a replacement —
+// which wears the same in-flight status — and must not fail the attempt the
+// winner was already told had been accepted.
+func TestStaleReclaimDoesNotFailAReplacementAttempt(t *testing.T) {
+	f := newFixture(t)
+	now := fixedNow
+	f.store.Now = func() time.Time { return now }
+	id := f.create(t)
+	tid := uuid.MustParse(id)
+	ctx := context.Background()
+	now = fixedNow.Add(31 * time.Minute)
+
+	// The winning retry lands while this request is between reading the
+	// events and taking the lock.
+	racing := &reclaimRacingStore{Memory: f.store, teamID: f.teamA, tenantID: tid}
+	h := &Handlers{Store: racing, Secrets: f.secrets, Trigger: f.trigger, Log: zerolog.Nop(), StaleAfter: 30 * time.Minute, Now: func() time.Time { return now }}
+	f.router = SetupRouter(h, ownerResolver(map[string]Principal{HashAPIKey(keyTeamA): {TeamID: f.teamA}}), zerolog.Nop())
+
+	// The loser finds a tenant already in flight for the winner's attempt.
+	if code, _ := f.do(t, http.MethodPost, "/v1/qm/tenants/"+id+"/retry", keyTeamA, nil); code != http.StatusConflict {
+		t.Fatalf("losing retry: %d, want 409", code)
+	}
+	row, _ := f.store.GetTenant(ctx, f.teamA, tid)
+	if row.Status != tenantstore.StatusProvisioning {
+		t.Errorf("status = %s, want the winner's attempt left in flight", row.Status)
+	}
+}
+
+// reclaimRacingStore performs the winning retry's reclaim-and-requeue just
+// before this request's lock probe returns.
+type reclaimRacingStore struct {
+	*tenantstore.Memory
+	teamID   uuid.UUID
+	tenantID uuid.UUID
+	done     bool
+}
+
+func (s *reclaimRacingStore) Lock(ctx context.Context, teamID, tenantID uuid.UUID) (func(), error) {
+	release, err := s.Memory.Lock(ctx, teamID, tenantID)
+	if err != nil || s.done {
+		return release, err
+	}
+	s.done = true
+	for _, status := range []string{tenantstore.StatusFailed, tenantstore.StatusProvisioning} {
+		if _, serr := s.Memory.SetStatus(ctx, s.teamID, s.tenantID, status); serr != nil {
+			release()
+			return nil, serr
+		}
+	}
+	if _, ierr := s.Memory.InsertEvent(ctx, s.teamID, tenantstore.EventParams{
+		TenantID: s.tenantID, Step: stepTrigger, Status: tenantstore.EventStarted, Message: "provision run requested",
+	}); ierr != nil {
+		release()
+		return nil, ierr
+	}
+	return release, nil
+}

@@ -380,10 +380,23 @@ func (h *Handlers) reclaimStale(c *gin.Context, tenant tenantstore.Tenant) (tena
 	if tenant.Status == tenantstore.StatusDeprovisioning {
 		mode = provisioner.ModeDeprovision
 	}
-	updated, err := h.Store.TransitionStatus(ctx, tenant.TeamID, tenant.ID, []string{tenant.Status}, tenantstore.StatusFailed)
-	if errors.Is(err, tenantstore.ErrStatusConflict) {
+	// Keyed on the row version the staleness was judged on, not just the
+	// status: another request can reclaim this run and queue a replacement
+	// between the event read above and the lock, and the replacement wears
+	// the same in-flight status. Failing it would strand a run the caller
+	// was already told had been accepted.
+	at := tenantstore.VersionOf(tenant)
+	if n := len(events); n > 0 && events[n-1].Seq > at.EventSeq {
+		at.EventSeq = events[n-1].Seq
+	}
+	updated, err := h.Store.TransitionStatusIfUnchanged(ctx, tenant.TeamID, tenant.ID, []string{tenant.Status}, tenantstore.StatusFailed, at)
+	if errors.Is(err, tenantstore.ErrStatusConflict) || errors.Is(err, tenantstore.ErrNotFound) {
 		// Something else moved it in the meantime; proceed with what it is now.
 		current, gerr := h.Store.GetTenant(ctx, tenant.TeamID, tenant.ID)
+		if errors.Is(gerr, tenantstore.ErrNotFound) {
+			respondError(c, http.StatusNotFound, "Tenant not found.")
+			return tenantstore.Tenant{}, false
+		}
 		if gerr != nil {
 			respondError(c, http.StatusInternalServerError, internalErrorMsg)
 			return tenantstore.Tenant{}, false
