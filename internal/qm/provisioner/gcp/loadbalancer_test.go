@@ -254,3 +254,46 @@ func TestRemoveRouteKeepsAMatcherAnotherRuleNames(t *testing.T) {
 		t.Error("the other rule lost its route")
 	}
 }
+
+// Every route resource is created carrying the tenant marker its own
+// readback then checks for. A spec that forgets the field creates something
+// the next line rejects as not belonging to the tenant, and provisioning
+// stops there forever — so the specs are built by pure functions and this
+// is what holds them to it.
+func TestRouteSpecsCarryTheOwnerMarker(t *testing.T) {
+	const owner = "QM tenant pilot-team (5c4ac55d-1d1b-4d35-9f31-7d1a4c0f6c11)"
+
+	neg := negSpec("qm-pilot-team", "us-central1", "qm-pilot-team", owner)
+	if neg.Description != owner {
+		t.Errorf("neg description = %q", neg.Description)
+	}
+	if err := ownedBy(neg.Description, owner, "network endpoint group", neg.Name); err != nil {
+		t.Errorf("a freshly built neg fails its own ownership check: %v", err)
+	}
+	if negTarget(neg) != "qm-pilot-team" {
+		t.Errorf("neg target = %q", negTarget(neg))
+	}
+
+	const negLink = "projects/example-project/regions/us-central1/networkEndpointGroups/qm-pilot-team"
+	backend := backendServiceSpec("qm-pilot-team", negLink, owner)
+	if backend.Description != owner {
+		t.Errorf("backend description = %q", backend.Description)
+	}
+	if err := ownedBy(backend.Description, owner, "backend service", backend.Name); err != nil {
+		t.Errorf("a freshly built backend fails its own ownership check: %v", err)
+	}
+	if !backsNEG(backend, negLink) {
+		t.Errorf("backend does not point at its neg: %+v", backend.Backends)
+	}
+	if backend.LoadBalancingScheme != "EXTERNAL_MANAGED" {
+		t.Errorf("backend scheme = %q", backend.LoadBalancingScheme)
+	}
+
+	// And a resource somebody else made is refused.
+	if err := ownedBy("something else", owner, "backend service", "qm-pilot-team"); err == nil {
+		t.Error("a backend with another owner was accepted")
+	}
+	if err := ownedBy("", owner, "backend service", "qm-pilot-team"); err == nil {
+		t.Error("a backend with no owner was accepted")
+	}
+}

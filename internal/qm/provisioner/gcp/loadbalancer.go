@@ -133,13 +133,7 @@ func (l *LoadBalancer) ensureNEG(ctx context.Context, name, cloudRunService, own
 	if !notFound(err) {
 		return fmt.Errorf("get the network endpoint group for %s: %w", name, err)
 	}
-	op, err := l.svc.RegionNetworkEndpointGroups.Insert(l.project, l.region, &compute.NetworkEndpointGroup{
-		Name:                name,
-		NetworkEndpointType: "SERVERLESS",
-		Region:              l.region,
-		Description:         owner,
-		CloudRun:            &compute.NetworkEndpointGroupCloudRun{Service: cloudRunService},
-	}).Context(ctx).Do()
+	op, err := l.svc.RegionNetworkEndpointGroups.Insert(l.project, l.region, negSpec(name, l.region, cloudRunService, owner)).Context(ctx).Do()
 	if err != nil {
 		if !alreadyExists(err) {
 			return fmt.Errorf("create the network endpoint group for %s: %w", name, err)
@@ -223,13 +217,7 @@ func (l *LoadBalancer) ensureBackendService(ctx context.Context, name, owner str
 	if !notFound(err) {
 		return "", fmt.Errorf("get the backend service %s: %w", name, err)
 	}
-	op, err := l.svc.BackendServices.Insert(l.project, &compute.BackendService{
-		Name:                name,
-		LoadBalancingScheme: "EXTERNAL_MANAGED",
-		Protocol:            "HTTPS",
-		TimeoutSec:          backendTimeoutSec,
-		Backends:            []*compute.Backend{{Group: negLink}},
-	}).Context(ctx).Do()
+	op, err := l.svc.BackendServices.Insert(l.project, backendServiceSpec(name, negLink, owner)).Context(ctx).Do()
 	if err != nil && !alreadyExists(err) {
 		return "", fmt.Errorf("create the backend service %s: %w", name, err)
 	}
@@ -482,6 +470,31 @@ func (l *LoadBalancer) waitOperation(ctx context.Context, op *compute.Operation,
 			return fmt.Errorf("timed out waiting for compute operation %s: %w", op.Name, ctx.Err())
 		case <-time.After(operationWait):
 		}
+	}
+}
+
+// negSpec and backendServiceSpec build what is sent to Compute. They are
+// separate and pure because the ownership marker rides in a single field of
+// each: a spec that forgets it creates a resource its own readback then
+// rejects, and no fake of the steps above can see that.
+func negSpec(name, region, cloudRunService, owner string) *compute.NetworkEndpointGroup {
+	return &compute.NetworkEndpointGroup{
+		Name:                name,
+		NetworkEndpointType: "SERVERLESS",
+		Region:              region,
+		Description:         owner,
+		CloudRun:            &compute.NetworkEndpointGroupCloudRun{Service: cloudRunService},
+	}
+}
+
+func backendServiceSpec(name, negLink, owner string) *compute.BackendService {
+	return &compute.BackendService{
+		Name:                name,
+		Description:         owner,
+		LoadBalancingScheme: "EXTERNAL_MANAGED",
+		Protocol:            "HTTPS",
+		TimeoutSec:          backendTimeoutSec,
+		Backends:            []*compute.Backend{{Group: negLink}},
 	}
 }
 
