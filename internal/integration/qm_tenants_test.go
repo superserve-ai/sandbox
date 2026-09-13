@@ -495,3 +495,17 @@ func TestQMAPI_EventsInOneTransactionKeepInsertionOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestQMAPI_NoTenantForATeamDetachedFromThisCell(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedQMTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `DELETE FROM public.team_memberships WHERE team_id = $1`, teamID); err != nil {
+		t.Fatalf("detach team memberships: %v", err)
+	}
+	conn := connectAsQMAPI(t)
+	_, q := scopedQMTx(t, conn, teamID)
+	_, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("tenant admission for a detached team: want no rows, got err=%v", err)
+	}
+}

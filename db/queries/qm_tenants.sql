@@ -6,17 +6,23 @@ SELECT set_config('qm.team_id', sqlc.arg(team_id)::text, true);
 
 -- name: CreateQMTenant :one
 -- Tenant admission serializes on the team's advisory lock, the same lock
--- team migration holds while it detaches a team, so a tenant can never be
--- created in a cell the team is being cut over from.
+-- team migration holds while it detaches a team. Once the lock is held the
+-- team must still be homed in this cell (detach deletes its memberships
+-- here), otherwise no row is inserted and the caller sees no rows.
 WITH admission AS (
     SELECT pg_advisory_xact_lock(hashtext($1::uuid::text))
+),
+homed AS (
+    SELECT 1 AS ok
+    FROM admission
+    WHERE EXISTS (SELECT 1 FROM public.team_memberships WHERE team_id = $1)
 )
 INSERT INTO qm.tenants (
     team_id, slug, org_name, admin_email, sign_in, model_provider, harness, created_by
 )
 SELECT
     $1, $2, $3, $4, $5, $6, COALESCE(sqlc.narg('harness')::text, 'pi'), sqlc.narg('created_by')
-FROM admission
+FROM homed
 RETURNING *;
 
 -- name: GetQMTenant :one
