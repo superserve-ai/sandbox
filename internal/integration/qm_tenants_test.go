@@ -346,6 +346,48 @@ func TestQMAPI_RejectsInvalidSlugs(t *testing.T) {
 	}
 }
 
+// secret_ref must look like a Secret Manager resource name; the CHECK
+// constraint is what stops a provisioning bug from persisting a raw
+// credential (model key, DATABASE_URL, sandbox API key) in plaintext
+// Postgres instead of a reference to one.
+func TestQMAPI_RejectsNonSecretManagerRefs(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedQMTeamAndKey(t)
+	conn := connectAsQMAPI(t)
+
+	for _, ref := range []string{
+		"sk-ant-api03-raw-model-key",
+		"postgresql://user:pass@host:5432/db",
+		"ss_live_use1_rawsandboxkey",
+		"projects/p/secrets",
+		"projects/p/secrets/db/versions/",
+		"projects/p/secrets/db/versions/abc",
+	} {
+		tx, q := scopedQMTx(t, conn, teamID)
+		tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+		if err != nil {
+			t.Fatalf("create tenant: %v", err)
+		}
+		_, err = q.SetQMTenantSecretRef(ctx, db.SetQMTenantSecretRefParams{TenantID: tenant.ID, Name: "database_url", SecretRef: ref})
+		if pgErrCode(err) != pgCheckViolation {
+			t.Errorf("secret ref %q: want check violation, got %v", ref, err)
+		}
+		_ = tx.Rollback(ctx)
+	}
+
+	for _, ref := range []string{"projects/p/secrets/db", "projects/p/secrets/db/versions/latest", "projects/p/secrets/db/versions/3"} {
+		tx, q := scopedQMTx(t, conn, teamID)
+		tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+		if err != nil {
+			t.Fatalf("create tenant: %v", err)
+		}
+		if _, err := q.SetQMTenantSecretRef(ctx, db.SetQMTenantSecretRefParams{TenantID: tenant.ID, Name: "database_url", SecretRef: ref}); err != nil {
+			t.Errorf("secret ref %q: want accept, got %v", ref, err)
+		}
+		_ = tx.Rollback(ctx)
+	}
+}
+
 func TestQMMigrationIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	dir, err := migrationsDir()

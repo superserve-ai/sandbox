@@ -134,12 +134,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_qm_tenant_events_tenant_seq ON qm.tenant_e
 
 -- secret_ref is a Secret Manager resource name, never a secret value; the
 -- value only ever lives in Secret Manager and is resolved by the tenant's
--- own runtime identity.
+-- own runtime identity. The CHECK below holds that invariant at the DB
+-- boundary rather than trusting caller discipline: a provisioning bug
+-- passing a raw model key, DATABASE_URL, or Superserve API key through
+-- SetQMTenantSecretRef is rejected instead of persisted in plaintext
+-- Postgres. The pattern accepts a secret's resource name with an optional
+-- explicit version (`.../versions/latest` or `.../versions/<n>`); it says
+-- nothing about whether the reference resolves, only that it has the shape
+-- of one.
 CREATE TABLE IF NOT EXISTS qm.tenant_secrets (
     tenant_id  uuid NOT NULL REFERENCES qm.tenants(id) ON DELETE CASCADE,
     name       text NOT NULL,
     secret_ref text NOT NULL,
-    PRIMARY KEY (tenant_id, name)
+    PRIMARY KEY (tenant_id, name),
+
+    CONSTRAINT qm_tenant_secrets_ref_shape
+        CHECK (secret_ref ~ '^projects/[^/]+/secrets/[^/]+(/versions/(latest|[0-9]+))?$')
 );
 
 -- Application role for the qm-api service. Like grafana_readonly, it is
