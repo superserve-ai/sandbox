@@ -24,6 +24,11 @@ type ServiceAccountAdmin interface {
 	// GrantSecretAccess binds roles/secretmanager.secretAccessor on one
 	// secret to the account.
 	GrantSecretAccess(ctx context.Context, secretName, email string) error
+	// RevokeSecretAccess removes that binding. Needed only for secrets the
+	// tenant does not own: deleting a tenant's own secret takes its policy
+	// with it, but the platform's shared ones outlive every tenant, and
+	// deleting a service account does not remove the bindings naming it.
+	RevokeSecretAccess(ctx context.Context, secretName, email string) error
 }
 
 var errNoServiceAccountAdmin = errors.New("no service account client configured")

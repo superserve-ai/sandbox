@@ -19,10 +19,14 @@ import (
 // is a no-op, DropDatabase and DropUser on ones that do not are no-ops, and
 // EnsureUser either creates the role or resets its password.
 type DatabaseAdmin interface {
-	DatabaseExists(ctx context.Context, name string) (bool, error)
-	// CreateDatabase creates the database owned by owner, and takes CONNECT
-	// away from PUBLIC so no other tenant's role can reach it.
-	CreateDatabase(ctx context.Context, name, owner string) error
+	// EnsureDatabase creates the database owned by owner if it is not
+	// there, and either way reasserts the two things that isolate it: the
+	// owner, and CONNECT taken away from PUBLIC. Reasserting rather than
+	// only setting on create is what makes an interrupted first attempt
+	// safe — those are separate statements, CREATE DATABASE cannot run in a
+	// transaction, and a database left readable by every other tenant's
+	// role is exactly the failure this step exists to prevent.
+	EnsureDatabase(ctx context.Context, name, owner string) error
 	DropDatabase(ctx context.Context, name string) error
 	// EnsureUser creates the tenant's role or resets its password; the
 	// password comes from the tenant's DATABASE_PASSWORD secret, which the
@@ -36,7 +40,13 @@ var errNoDatabaseAdmin = errors.New("no database client configured")
 // database creates the tenant's role, its database, and the DATABASE_URL
 // secret its service mounts. Output: Row.DbName.
 //
-// Order within the step matters on a retry: the role is created before the
+// Every call reconciles rather than creating once: the role's password is
+// reset to the current secret, the database's owner and its closure to
+// other roles are reasserted, and DATABASE_URL is rewritten. That is what
+// makes a run interrupted between any two of those statements converge on
+// a retry instead of leaving a database another tenant could connect to.
+//
+// Order within the step matters too: the role is created before the
 // database that will be owned by it, and DATABASE_URL is written last, so
 // an interrupted run leaves at worst a database with no reference to it,
 // which the next run adopts.
@@ -85,14 +95,8 @@ func (s database) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if err := s.c.Databases.EnsureUser(ctx, role, string(password)); err != nil {
 		return fmt.Errorf("create the tenant's database role: %w", err)
 	}
-	exists, err := s.c.Databases.DatabaseExists(ctx, name)
-	if err != nil {
-		return fmt.Errorf("look up the tenant's database: %w", err)
-	}
-	if !exists {
-		if err := s.c.Databases.CreateDatabase(ctx, name, role); err != nil {
-			return fmt.Errorf("create the tenant's database: %w", err)
-		}
+	if err := s.c.Databases.EnsureDatabase(ctx, name, role); err != nil {
+		return fmt.Errorf("create the tenant's database: %w", err)
 	}
 	// Written every run, not only on the run that created the database: it
 	// is derived from the password above, so a rotation has to reach the

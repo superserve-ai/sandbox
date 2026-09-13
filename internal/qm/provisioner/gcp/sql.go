@@ -85,21 +85,15 @@ func quoteIdentifier(name string) (string, error) {
 	return `"` + name + `"`, nil
 }
 
-func (d *Databases) DatabaseExists(ctx context.Context, name string) (bool, error) {
-	var exists bool
-	err := d.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)`, name).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("look up database %s: %w", name, err)
-	}
-	return exists, nil
-}
-
-// CreateDatabase makes the database owned by the tenant's role and closes it
-// to everyone else. CREATE DATABASE cannot run inside a transaction, so the
-// two statements are separate and the revoke is repeated by the next run if
-// this one dies between them — which is why Run calls this only after
-// DatabaseExists says no, and why the revoke is idempotent.
-func (d *Databases) CreateDatabase(ctx context.Context, name, owner string) error {
+// EnsureDatabase creates the database if it is not there and, either way,
+// reasserts its isolation: owned by the tenant's role, and closed to
+// everyone else on the shared instance.
+//
+// Reasserting every time is deliberate. CREATE DATABASE cannot run inside a
+// transaction, so the owner and the revoke are separate statements from it;
+// a run that died in between would otherwise leave a database every other
+// tenant's role could connect to, and no later run would notice.
+func (d *Databases) EnsureDatabase(ctx context.Context, name, owner string) error {
 	dbIdent, err := quoteIdentifier(name)
 	if err != nil {
 		return err
@@ -111,6 +105,9 @@ func (d *Databases) CreateDatabase(ctx context.Context, name, owner string) erro
 	_, err = d.pool.Exec(ctx, `CREATE DATABASE `+dbIdent+` OWNER `+ownerIdent)
 	if err != nil && !isPGCode(err, pgDuplicateDatabase) {
 		return fmt.Errorf("create database %s: %w", name, err)
+	}
+	if _, err := d.pool.Exec(ctx, `ALTER DATABASE `+dbIdent+` OWNER TO `+ownerIdent); err != nil {
+		return fmt.Errorf("set the owner of database %s: %w", name, err)
 	}
 	// Without this every role on the shared instance — that is, every other
 	// tenant — could connect to this database.

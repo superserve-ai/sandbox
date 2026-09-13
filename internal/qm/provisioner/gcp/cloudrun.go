@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"slices"
 	"sort"
 	"time"
 
@@ -29,9 +31,17 @@ const (
 	// Only RFC 1918 traffic goes through the VPC — the Cloud SQL private
 	// IP. Google APIs and the model providers stay on the public path.
 	tenantVPCEgress = "PRIVATE_RANGES_ONLY"
-	// The service is reached through the shared load balancer, which needs
-	// the service to accept traffic from it. Invoker IAM still applies.
+	// The service is reached through the shared load balancer, whose
+	// serverless NEG sends requests with no identity of its own.
 	tenantIngress = "INGRESS_TRAFFIC_ALL"
+	// So the invoker check has to let unauthenticated requests through, or
+	// every public request — including the health probe — is a 403 and no
+	// tenant ever becomes ready. Authentication is the tenant's own: the
+	// portal serves nothing without a session, and the admin surfaces sit
+	// behind it. Narrowing this to "only through the load balancer" needs a
+	// shared header or IAP and is a change to the edge, not to this call.
+	invokerRole   = "roles/run.invoker"
+	invokerMember = "allUsers"
 )
 
 // deployTimeout bounds how long a create or update waits for the new
@@ -116,6 +126,9 @@ func (s *Services) Deploy(ctx context.Context, spec steps.ServiceSpec) (steps.Se
 	if err := s.wait(ctx, op); err != nil {
 		return steps.ServiceStatus{}, fmt.Errorf("deploy service %s: %w", spec.Name, err)
 	}
+	if err := s.allowPublicInvoke(ctx, spec.Name); err != nil {
+		return steps.ServiceStatus{}, err
+	}
 	status, ok, err := s.Get(ctx, spec.Name)
 	if err != nil {
 		return steps.ServiceStatus{}, err
@@ -141,6 +154,35 @@ func (s *Services) Delete(ctx context.Context, name string) error {
 		return fmt.Errorf("delete service %s: %w", name, err)
 	}
 	return nil
+}
+
+// allowPublicInvoke adds the unauthenticated-invoker binding if it is not
+// already there. Read-modify-write under the policy's etag, and idempotent,
+// so a redeploy does not duplicate it.
+func (s *Services) allowPublicInvoke(ctx context.Context, name string) error {
+	resource := s.servicePath(name)
+	var lastErr error
+	for attempt := 0; attempt < setIAMPolicyAttempts; attempt++ {
+		policy, err := s.svc.Projects.Locations.Services.GetIamPolicy(resource).Context(ctx).Do()
+		if err != nil {
+			return fmt.Errorf("read the iam policy of service %s: %w", name, err)
+		}
+		for _, binding := range policy.Bindings {
+			if binding.Role == invokerRole && binding.Condition == nil && slices.Contains(binding.Members, invokerMember) {
+				return nil
+			}
+		}
+		policy.Bindings = append(policy.Bindings, &run.GoogleIamV1Binding{Role: invokerRole, Members: []string{invokerMember}})
+		_, err = s.svc.Projects.Locations.Services.SetIamPolicy(resource, &run.GoogleIamV1SetIamPolicyRequest{Policy: policy}).Context(ctx).Do()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if !isStatus(err, http.StatusConflict) && !isStatus(err, http.StatusPreconditionFailed) {
+			break
+		}
+	}
+	return fmt.Errorf("allow public requests to service %s: %w", name, lastErr)
 }
 
 func (s *Services) desiredService(spec steps.ServiceSpec) *run.GoogleCloudRunV2Service {

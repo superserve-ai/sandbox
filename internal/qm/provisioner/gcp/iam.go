@@ -99,25 +99,34 @@ func (a *Accounts) Delete(ctx context.Context, email string) error {
 // read-modify-write carries the etag, so a concurrent change to the same
 // policy is retried rather than silently overwritten.
 func (a *Accounts) GrantSecretAccess(ctx context.Context, secretName, email string) error {
+	return a.editSecretPolicy(ctx, secretName, email, addMember)
+}
+
+// RevokeSecretAccess removes the binding again, and does nothing when it is
+// not there.
+func (a *Accounts) RevokeSecretAccess(ctx context.Context, secretName, email string) error {
+	return a.editSecretPolicy(ctx, secretName, email, removeMember)
+}
+
+// editSecretPolicy applies edit to the secret's policy under its etag. edit
+// reports whether it changed anything; when it does not, nothing is sent.
+func (a *Accounts) editSecretPolicy(ctx context.Context, secretName, email string, edit func(*secretmanager.Policy, string) bool) error {
 	resource := "projects/" + a.project + "/secrets/" + secretName
 	member := "serviceAccount:" + email
 	var lastErr error
 	for attempt := 0; attempt < setIAMPolicyAttempts; attempt++ {
 		policy, err := a.secrets.Projects.Secrets.GetIamPolicy(resource).Context(ctx).Do()
 		if err != nil {
-			return fmt.Errorf("read the iam policy of %s: %w", secretName, err)
-		}
-		for _, binding := range policy.Bindings {
-			// Only unconditional bindings count: a conditional one might
-			// not apply at the moment the tenant reads the secret.
-			if binding.Role == secretAccessorRole && binding.Condition == nil && slices.Contains(binding.Members, member) {
+			if notFound(err) {
+				// A secret that is gone grants nobody anything, which is
+				// the same outcome either edit was after.
 				return nil
 			}
+			return fmt.Errorf("read the iam policy of %s: %w", secretName, err)
 		}
-		policy.Bindings = append(policy.Bindings, &secretmanager.Binding{
-			Role:    secretAccessorRole,
-			Members: []string{member},
-		})
+		if !edit(policy, member) {
+			return nil
+		}
 		_, err = a.secrets.Projects.Secrets.SetIamPolicy(resource, &secretmanager.SetIamPolicyRequest{Policy: policy}).Context(ctx).Do()
 		if err == nil {
 			return nil
@@ -127,5 +136,59 @@ func (a *Accounts) GrantSecretAccess(ctx context.Context, secretName, email stri
 			break
 		}
 	}
-	return fmt.Errorf("grant %s access to %s: %w", email, secretName, lastErr)
+	return fmt.Errorf("update the iam policy of %s for %s: %w", secretName, email, lastErr)
+}
+
+// addMember puts member in the unconditional accessor binding. Only
+// unconditional bindings count: a conditional one might not apply at the
+// moment the tenant reads the secret.
+func addMember(policy *secretmanager.Policy, member string) bool {
+	for _, binding := range policy.Bindings {
+		if !isAccessorBinding(binding) {
+			continue
+		}
+		if slices.Contains(binding.Members, member) {
+			return false
+		}
+		binding.Members = append(binding.Members, member)
+		return true
+	}
+	policy.Bindings = append(policy.Bindings, &secretmanager.Binding{
+		Role:    secretAccessorRole,
+		Members: []string{member},
+	})
+	return true
+}
+
+// removeMember takes member out of every accessor binding, and drops a
+// binding left with no principals — IAM rejects one.
+func removeMember(policy *secretmanager.Policy, member string) bool {
+	changed := false
+	kept := make([]*secretmanager.Binding, 0, len(policy.Bindings))
+	for _, binding := range policy.Bindings {
+		if !isAccessorBinding(binding) || !slices.Contains(binding.Members, member) {
+			kept = append(kept, binding)
+			continue
+		}
+		changed = true
+		members := make([]string, 0, len(binding.Members))
+		for _, have := range binding.Members {
+			if have != member {
+				members = append(members, have)
+			}
+		}
+		if len(members) == 0 {
+			continue
+		}
+		binding.Members = members
+		kept = append(kept, binding)
+	}
+	if changed {
+		policy.Bindings = kept
+	}
+	return changed
+}
+
+func isAccessorBinding(b *secretmanager.Binding) bool {
+	return b.Role == secretAccessorRole && b.Condition == nil
 }

@@ -312,9 +312,13 @@ func TestProvisionBuildsTheWholeStack(t *testing.T) {
 		t.Error("no sandbox key issued")
 	}
 	// The database is owned by the tenant's own role, not by the instance
-	// admin the provisioner connected as.
+	// admin the provisioner connected as, and it is closed to every other
+	// role on the shared instance.
 	if owner := f.dbs.databases["qm_pilot_team"]; owner != "qm_pilot_team" {
 		t.Errorf("database owner = %q", owner)
+	}
+	if !f.dbs.closed["qm_pilot_team"] {
+		t.Error("the tenant's database is still reachable by other roles")
 	}
 	if _, ok := f.buckets.buckets["example-project-qm-pilot-team"]; !ok {
 		t.Error("bucket not created")
@@ -511,6 +515,37 @@ func TestProvisionIsIdempotent(t *testing.T) {
 	}
 }
 
+// The isolation of a tenant's database is two statements apart from the
+// CREATE that cannot share its transaction, so a run interrupted between
+// them would leave a database every other tenant could connect to. The
+// step reasserts both on every run rather than only on the one that
+// created it.
+func TestProvisionReassertsDatabaseIsolation(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	// Stand in for a first attempt that created the database and died
+	// before it could close it or set its owner.
+	f.dbs.mu.Lock()
+	f.dbs.closed["qm_pilot_team"] = false
+	f.dbs.databases["qm_pilot_team"] = "qm_admin"
+	f.dbs.mu.Unlock()
+
+	if err := f.reprovision(t); err != nil {
+		t.Fatal(err)
+	}
+	if !f.dbs.closed["qm_pilot_team"] {
+		t.Error("a re-run left the database open to other roles")
+	}
+	if owner := f.dbs.databases["qm_pilot_team"]; owner != "qm_pilot_team" {
+		t.Errorf("a re-run left the database owned by %q", owner)
+	}
+	if f.dbs.created != 1 {
+		t.Errorf("databases created = %d", f.dbs.created)
+	}
+}
+
 // ── Rollback ─────────────────────────────────────────────────────────────
 
 func TestDeprovisionLeavesNothingBehind(t *testing.T) {
@@ -529,6 +564,17 @@ func TestDeprovisionLeavesNothingBehind(t *testing.T) {
 		t.Error("the tenant's sandbox key was not revoked")
 	}
 	f.nothingLeaked(t)
+
+	// The platform's shared Resend secret survives, but the deleted
+	// tenant's identity does not stay on its policy: IAM keeps a binding
+	// naming a deleted principal, so every tenant that ever existed would
+	// otherwise pile up on the one policy every future tenant needs.
+	if !f.secrets.Has("qm-resend-api-key") {
+		t.Error("teardown deleted the platform's shared Resend key")
+	}
+	if members := f.accounts.grants["qm-resend-api-key"]; len(members) != 0 {
+		t.Errorf("the deleted tenant is still on the shared secret's policy: %v", members)
+	}
 }
 
 // A provision that fails partway leaves resources behind on purpose — the
@@ -544,6 +590,9 @@ func TestTeardownAfterAPartialProvision(t *testing.T) {
 		{"the route fails", "lb.AddHostRule"},
 		{"the bucket grant fails", "buckets.GrantAccess"},
 		{"recording the service account fails", "accounts.Create"},
+		{"the database create fails", "databases.EnsureDatabase"},
+		{"minting storage credentials fails", "buckets.CreateHMACKey"},
+		{"a secret grant fails", "accounts.GrantSecretAccess"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t, false)

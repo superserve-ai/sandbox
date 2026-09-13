@@ -96,6 +96,26 @@ func (f *fakeAccounts) GrantSecretAccess(_ context.Context, secretName, email st
 	return nil
 }
 
+func (f *fakeAccounts) RevokeSecretAccess(_ context.Context, secretName, email string) error {
+	if err := f.check("accounts.RevokeSecretAccess"); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	members := f.grants[secretName][:0]
+	for _, have := range f.grants[secretName] {
+		if have != email {
+			members = append(members, have)
+		}
+	}
+	if len(members) == 0 {
+		delete(f.grants, secretName)
+		return nil
+	}
+	f.grants[secretName] = members
+	return nil
+}
+
 func (f *fakeAccounts) live() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -122,26 +142,17 @@ type fakeDatabases struct {
 	fakeFailures
 	mu        sync.Mutex
 	databases map[string]string // name -> owner
+	closed    map[string]bool   // name -> CONNECT taken from PUBLIC
 	users     map[string]string // name -> password
 	created   int
 }
 
 func newFakeDatabases() *fakeDatabases {
-	return &fakeDatabases{databases: map[string]string{}, users: map[string]string{}}
+	return &fakeDatabases{databases: map[string]string{}, closed: map[string]bool{}, users: map[string]string{}}
 }
 
-func (f *fakeDatabases) DatabaseExists(_ context.Context, name string) (bool, error) {
-	if err := f.check("databases.DatabaseExists"); err != nil {
-		return false, err
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	_, ok := f.databases[name]
-	return ok, nil
-}
-
-func (f *fakeDatabases) CreateDatabase(_ context.Context, name, owner string) error {
-	if err := f.check("databases.CreateDatabase"); err != nil {
+func (f *fakeDatabases) EnsureDatabase(_ context.Context, name, owner string) error {
+	if err := f.check("databases.EnsureDatabase"); err != nil {
 		return err
 	}
 	f.mu.Lock()
@@ -149,8 +160,13 @@ func (f *fakeDatabases) CreateDatabase(_ context.Context, name, owner string) er
 	if _, ok := f.users[owner]; !ok {
 		return fmt.Errorf("fake: database %s owned by a role that does not exist", name)
 	}
+	if _, ok := f.databases[name]; !ok {
+		f.created++
+	}
+	// The real client reasserts the owner and the revoke on every call;
+	// recording the owner each time is the fake's equivalent.
 	f.databases[name] = owner
-	f.created++
+	f.closed[name] = true
 	return nil
 }
 
@@ -161,6 +177,7 @@ func (f *fakeDatabases) DropDatabase(_ context.Context, name string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.databases, name)
+	delete(f.closed, name)
 	return nil
 }
 

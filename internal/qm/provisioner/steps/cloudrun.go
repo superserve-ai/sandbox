@@ -124,12 +124,7 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 	// up with the first attempt's. Granting is idempotent, so this runs on
 	// every attempt rather than only on the one that creates the service:
 	// a secret rotated into the spec later still gets its binding.
-	names := make([]string, 0, len(secretEnv))
-	for _, secretName := range secretEnv {
-		names = append(names, secretName)
-	}
-	sort.Strings(names)
-	for _, secretName := range names {
+	for _, secretName := range mountedSecrets(secretEnv) {
 		if err := s.c.Accounts.GrantSecretAccess(ctx, secretName, account); err != nil {
 			return fmt.Errorf("grant the tenant access to %s: %w", secretName, err)
 		}
@@ -159,6 +154,17 @@ func (s cloudRun) Run(ctx context.Context, t *provisioner.Tenant) error {
 	return t.Record(ctx, tenantstore.Resources{CloudRunService: &name, ImageTag: &image, PublicURL: &public})
 }
 
+// mountedSecrets is the Secret Manager names a spec mounts, in a stable
+// order so a retry's calls line up with the first attempt's.
+func mountedSecrets(secretEnv map[string]string) []string {
+	names := make([]string, 0, len(secretEnv))
+	for _, secretName := range secretEnv {
+		names = append(names, secretName)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // Rollback deletes the service. Derived name as well as recorded, so a
 // deploy that succeeded and died before Record still gets torn down: a
 // leaked tenant service is a container running at min-instance one, billed
@@ -179,6 +185,21 @@ func (s cloudRun) Rollback(ctx context.Context, t *provisioner.Tenant) error {
 	}
 	if err := s.c.Services.Delete(ctx, name); err != nil {
 		return fmt.Errorf("delete the tenant's service: %w", err)
+	}
+	// The tenant's own secrets are deleted outright by the secrets step, so
+	// their policies go with them. The platform's shared Resend secret does
+	// not: it outlives every tenant, and IAM keeps a binding naming a
+	// deleted principal, so without this every tenant that ever existed
+	// accumulates on that one policy until its size limit stops new ones
+	// being granted at all.
+	if t.Env.ResendSecret != "" && s.c.Accounts != nil {
+		account := ServiceAccountEmail(t.Env.Project, t.Row.Slug)
+		if t.Row.ServiceAccount != nil {
+			account = *t.Row.ServiceAccount
+		}
+		if err := s.c.Accounts.RevokeSecretAccess(ctx, t.Env.ResendSecret, account); err != nil {
+			return fmt.Errorf("revoke the tenant's access to the shared email key: %w", err)
+		}
 	}
 	if t.Row.CloudRunService == nil {
 		return provisioner.Skip("no service recorded")
