@@ -1,15 +1,20 @@
 // Package steps holds the provisioning steps in plan order. Each cloud-
 // touching step is its own file with the client interface it needs; the
-// implementations behind those interfaces are wired in cmd/qm-api. Until a
-// real implementation lands, a step succeeds only in stub mode (Env.Stub,
-// from QM_PROVISIONER_STUB=1), where it records placeholder resource names
-// so the rest of the engine, the API and the console can be exercised.
+// implementations behind those interfaces live in the gcp subpackage and
+// are wired in cmd/qm-api.
+//
+// Under stub mode (Env.Stub, from QM_PROVISIONER_STUB=1) the cloud-touching
+// steps record placeholder resource names instead of calling GCP, so the
+// engine, the API and the console can be exercised without a project. Every
+// step declares what it cannot run without through Ready, which
+// provisioner.PlanReady checks once at startup: a run must never stop at a
+// step that was never going to work, because by then the tenant already has
+// a model key in Secret Manager and a half-built stack behind it.
 package steps
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"net/http"
 	"strings"
 	"time"
@@ -30,21 +35,12 @@ type Clients struct {
 	LoadBalancer LoadBalancerAdmin
 	// HTTP performs the health and smoke probes against the public URL.
 	HTTP *http.Client
-}
-
-// stubOnly is embedded by the steps whose cloud implementations have not
-// landed. They can only record placeholders, so provisioner.PlanReady
-// refuses a non-stub binary rather than letting it accept tenants it would
-// abandon halfway through building.
-type stubOnly struct{}
-
-var errStubOnly = errors.New("not implemented; set QM_PROVISIONER_STUB=1 to run the plan with placeholders")
-
-func (stubOnly) Ready(env provisioner.Env) error {
-	if env.Stub {
-		return nil
-	}
-	return errStubOnly
+	// HealthTimeout, SmokeTimeout and ProbeInterval bound those probes.
+	// Zero takes the defaults; they are settable so a test does not have
+	// to wait out a ten-minute budget to watch one fail.
+	HealthTimeout time.Duration
+	SmokeTimeout  time.Duration
+	ProbeInterval time.Duration
 }
 
 // All returns the plan in provision order; the deprovision plan is the
@@ -55,7 +51,16 @@ func (stubOnly) Ready(env provisioner.Env) error {
 // with, then the service and its route, then the probes.
 func All(c Clients) []provisioner.Step {
 	if c.HTTP == nil {
-		c.HTTP = &http.Client{Timeout: 15 * time.Second}
+		c.HTTP = defaultProbeClient()
+	}
+	if c.HealthTimeout <= 0 {
+		c.HealthTimeout = defaultHealthTimeout
+	}
+	if c.SmokeTimeout <= 0 {
+		c.SmokeTimeout = defaultSmokeTimeout
+	}
+	if c.ProbeInterval <= 0 {
+		c.ProbeInterval = defaultProbeInterval
 	}
 	return []provisioner.Step{
 		secretsStep{c: c},
@@ -78,6 +83,13 @@ func All(c Clients) []provisioner.Step {
 // DatabaseName is the tenant's database on the shared Cloud SQL instance.
 func DatabaseName(slug string) string {
 	return "qm_" + strings.ReplaceAll(slug, "-", "_")
+}
+
+// RoleName is the tenant's Postgres role on the shared instance. It shares
+// the database's name: one role, one database, and nothing else on the
+// instance the role may connect to.
+func RoleName(slug string) string {
+	return DatabaseName(slug)
 }
 
 // ServiceName is the tenant's Cloud Run service.

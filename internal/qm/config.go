@@ -53,10 +53,15 @@ type Config struct {
 	SQLInstance       string
 	SQLConnectionName string
 	SQLPrivateIP      string
-	LBURLMap          string
-	VPCNetwork        string
-	VPCSubnetwork     string
-	BucketLocation    string
+	// SQLAdminUser and SQLAdminSecret are the instance-level role the
+	// provisioner connects as to create tenant databases and roles, and the
+	// Secret Manager name holding its password.
+	SQLAdminUser   string
+	SQLAdminSecret string
+	LBURLMap       string
+	VPCNetwork     string
+	VPCSubnetwork  string
+	BucketLocation string
 	// BucketLifecycleJSON is the lifecycle policy applied to every tenant
 	// bucket, in the Cloud Storage JSON API's shape. Empty applies none.
 	BucketLifecycleJSON string
@@ -113,6 +118,8 @@ func LoadConfig() (Config, error) {
 		SQLInstance:         os.Getenv("QM_SQL_INSTANCE"),
 		SQLConnectionName:   os.Getenv("QM_SQL_CONNECTION_NAME"),
 		SQLPrivateIP:        os.Getenv("QM_SQL_PRIVATE_IP"),
+		SQLAdminUser:        os.Getenv("QM_SQL_ADMIN_USER"),
+		SQLAdminSecret:      os.Getenv("QM_SQL_ADMIN_SECRET"),
 		LBURLMap:            os.Getenv("QM_LB_URL_MAP"),
 		VPCNetwork:          os.Getenv("QM_VPC_NETWORK"),
 		VPCSubnetwork:       os.Getenv("QM_VPC_SUBNETWORK"),

@@ -2,9 +2,14 @@ package steps
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
@@ -17,6 +22,9 @@ import (
 func TestResourceNames(t *testing.T) {
 	if got := DatabaseName("pilot-team"); got != "qm_pilot_team" {
 		t.Errorf("database = %s", got)
+	}
+	if got := RoleName("pilot-team"); got != "qm_pilot_team" {
+		t.Errorf("role = %s", got)
 	}
 	if got := BucketName("example-project", "pilot-team"); got != "example-project-qm-pilot-team" {
 		t.Errorf("bucket = %s", got)
@@ -41,41 +49,779 @@ func TestResourceNames(t *testing.T) {
 	}
 }
 
-func newRunner(t *testing.T, stub bool) (*provisioner.Runner, *tenantstore.Memory, *secrets.Fake, uuid.UUID, tenantstore.Tenant) {
+// tenantFixture is one tenant plus every fake the plan runs against.
+type tenantFixture struct {
+	runner   *provisioner.Runner
+	store    *tenantstore.Memory
+	secrets  *secrets.Fake
+	accounts *fakeAccounts
+	dbs      *fakeDatabases
+	buckets  *fakeBuckets
+	services *fakeServices
+	lb       *fakeLoadBalancer
+	tenant   *fakeTenantServer
+	teamID   uuid.UUID
+	row      tenantstore.Tenant
+}
+
+func (f *tenantFixture) provision(t *testing.T) error {
 	t.Helper()
+	return f.runner.Run(context.Background(), f.teamID, f.row.ID, provisioner.ModeProvision, 0)
+}
+
+func (f *tenantFixture) deprovision(t *testing.T) error {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := f.store.SetStatus(ctx, f.teamID, f.row.ID, tenantstore.StatusDeprovisioning); err != nil {
+		t.Fatal(err)
+	}
+	return f.runner.Run(ctx, f.teamID, f.row.ID, provisioner.ModeDeprovision, 0)
+}
+
+func (f *tenantFixture) reprovision(t *testing.T) error {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := f.store.SetStatus(ctx, f.teamID, f.row.ID, tenantstore.StatusProvisioning); err != nil {
+		t.Fatal(err)
+	}
+	return f.runner.Run(ctx, f.teamID, f.row.ID, provisioner.ModeProvision, 0)
+}
+
+func (f *tenantFixture) current(t *testing.T) tenantstore.Tenant {
+	t.Helper()
+	row, err := f.store.GetTenant(context.Background(), f.teamID, f.row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func (f *tenantFixture) events(t *testing.T) []tenantstore.Event {
+	t.Helper()
+	events, err := f.store.ListEvents(context.Background(), f.teamID, f.row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return events
+}
+
+// nothingLeaked is the assertion every teardown test ends on: no identity,
+// no database, no bucket, no HMAC credential, no service, no route, and no
+// secret belonging to the tenant.
+func (f *tenantFixture) nothingLeaked(t *testing.T) {
+	t.Helper()
+	if live := f.accounts.live(); len(live) != 0 {
+		t.Errorf("service accounts survived teardown: %v", live)
+	}
+	if !f.dbs.empty() {
+		t.Error("a database or role survived teardown")
+	}
+	if !f.buckets.empty() {
+		t.Error("a bucket or storage credential survived teardown")
+	}
+	if !f.services.empty() {
+		t.Error("a cloud run service survived teardown")
+	}
+	if !f.lb.empty() {
+		t.Error("a load balancer host rule survived teardown")
+	}
+	for _, name := range f.secrets.Names() {
+		if strings.HasPrefix(name, "qm-pilot-team-") {
+			t.Errorf("secret survived teardown: %s", name)
+		}
+	}
+	refs, err := f.store.ListSecretRefs(context.Background(), f.teamID, f.row.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 0 {
+		t.Errorf("secret refs survived teardown: %+v", refs)
+	}
+}
+
+func newFixture(t *testing.T, stub bool) *tenantFixture {
+	t.Helper()
+	ctx := context.Background()
 	store := tenantstore.NewMemory()
 	fake := secrets.NewFake()
 	teamID := uuid.New()
-	tenant, err := store.CreateTenant(context.Background(), teamID, tenantstore.CreateParams{
-		Slug: "pilot-team", OrgName: "Pilot Team", AdminEmail: "admin@example.com", SignIn: "magic_link", ModelProvider: "anthropic",
+	row, err := store.CreateTenant(ctx, teamID, tenantstore.CreateParams{
+		Slug: "pilot-team", OrgName: "Pilot Team", AdminEmail: "admin@example.com",
+		SignIn: "magic_link", ModelProvider: "anthropic", Harness: "pi",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The model key qm-api writes before triggering a run.
-	ref, _ := fake.Put(context.Background(), "qm-pilot-team-ANTHROPIC_API_KEY", []byte("sk-ant-fixture"))
-	store.SetSecretRef(context.Background(), teamID, tenant.ID, "ANTHROPIC_API_KEY", ref)
-	r := &provisioner.Runner{
-		Store: store,
-		Env:   provisioner.Env{Project: "example-project", Region: "us-central1", BaseDomain: "qm.example.com", Image: "qm:fixture", Stub: stub},
-		Steps: All(Clients{Secrets: fake}),
-		Log:   zerolog.Nop(),
-	}
-	return r, store, fake, teamID, tenant
-}
-
-func TestStubPlanProvisionsAndDeprovisions(t *testing.T) {
-	ctx := context.Background()
-	r, store, fake, teamID, tenant := newRunner(t, true)
-
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision, 0); err != nil {
+	// The model key qm-api writes before triggering a run, and the
+	// platform's shared Resend key, which Terraform owns.
+	ref, err := fake.Put(ctx, "qm-pilot-team-ANTHROPIC_API_KEY", []byte("sk-ant-fixture"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	row, _ := store.GetTenant(ctx, teamID, tenant.ID)
+	if err := store.SetSecretRef(ctx, teamID, row.ID, "ANTHROPIC_API_KEY", ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.Put(ctx, "qm-resend-api-key", []byte("re_fixture")); err != nil {
+		t.Fatal(err)
+	}
+
+	f := &tenantFixture{
+		store: store, secrets: fake, teamID: teamID, row: row,
+		accounts: newFakeAccounts(), dbs: newFakeDatabases(), buckets: newFakeBuckets(),
+		services: newFakeServices(), lb: newFakeLoadBalancer(), tenant: newFakeTenantServer(t),
+	}
+	clients := Clients{
+		Secrets: fake, Accounts: f.accounts, Databases: f.dbs, Buckets: f.buckets,
+		Services: f.services, LoadBalancer: f.lb, HTTP: f.tenant.client(),
+		// The real budgets are minutes; a test that watches a probe fail
+		// should not spend them.
+		HealthTimeout: 200 * time.Millisecond,
+		SmokeTimeout:  200 * time.Millisecond,
+		ProbeInterval: 20 * time.Millisecond,
+	}
+	f.runner = &provisioner.Runner{
+		Store: store,
+		Env:   testEnv(stub),
+		Steps: All(clients),
+		Log:   zerolog.Nop(),
+	}
+	return f
+}
+
+func testEnv(stub bool) provisioner.Env {
+	return provisioner.Env{
+		Project: "example-project", Region: "us-central1", BaseDomain: "qm.example.com",
+		Image: "qm:fixture", Stub: stub,
+
+		SQLInstance:       "qm-tenants",
+		SQLConnectionName: "example-project:us-central1:qm-tenants",
+		SQLPrivateIP:      "10.0.0.3",
+		SQLAdminUser:      "qm_admin",
+		URLMap:            "qm-https",
+		VPCNetwork:        "example-network",
+		VPCSubnetwork:     "example-subnet",
+		BucketLocation:    "us-central1",
+
+		ResendSecret:     "qm-resend-api-key",
+		EmailFrom:        "QM <no-reply@mail.qm.example.com>",
+		SandboxAPIURL:    "https://api.example.com",
+		SandboxTemplate:  "qm-agent-0.1.0",
+		SandboxKeyRegion: "use",
+	}
+}
+
+// fakeTenantServer stands in for the deployed tenant. Its client rewrites
+// every request at the tenant's public hostname to the test server, so the
+// probes exercise the URLs they will really build.
+type fakeTenantServer struct {
+	srv *httptest.Server
+
+	mu sync.Mutex
+	// authorizeStatus is what GET /idp/authorize answers with; 503 is the
+	// failure the reference tenant shipped.
+	authorizeStatus int
+	healthStatus    int
+	paths           []string
+}
+
+func newFakeTenantServer(t *testing.T) *fakeTenantServer {
+	t.Helper()
+	f := &fakeTenantServer{authorizeStatus: http.StatusOK, healthStatus: http.StatusOK}
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.paths = append(f.paths, r.URL.Path)
+		authorize, health := f.authorizeStatus, f.healthStatus
+		f.mu.Unlock()
+		switch {
+		case r.URL.Path == "/healthz":
+			w.WriteHeader(health)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case r.URL.Path == "/idp/authorize":
+			w.WriteHeader(authorize)
+			if authorize >= 500 {
+				_, _ = w.Write([]byte("<html><body><h1>Email delivery isn't configured</h1></body></html>"))
+			}
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *fakeTenantServer) setAuthorizeStatus(status int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.authorizeStatus = status
+}
+
+func (f *fakeTenantServer) requested(path string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.paths {
+		if p == path {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeTenantServer) client() *http.Client {
+	target, _ := url.Parse(f.srv.URL)
+	return &http.Client{
+		Transport: rewriteTransport{host: target.Host},
+		// Same as the real probe client: a redirect is an answer, not
+		// something to follow.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
+type rewriteTransport struct{ host string }
+
+func (rt rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	clone.URL.Scheme = "http"
+	clone.URL.Host = rt.host
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+// ── The happy path ───────────────────────────────────────────────────────
+
+func TestProvisionBuildsTheWholeStack(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	row := f.current(t)
 	if row.Status != tenantstore.StatusReady {
 		t.Fatalf("status = %s", row.Status)
 	}
-	store.SetStatus(ctx, teamID, tenant.ID, tenantstore.StatusProvisioning)
+	for name, got := range map[string]*string{
+		"db_name": row.DbName, "bucket": row.BucketName, "service_account": row.ServiceAccount,
+		"cloud_run_service": row.CloudRunService, "image_tag": row.ImageTag, "public_url": row.PublicUrl,
+	} {
+		if got == nil {
+			t.Fatalf("%s not recorded", name)
+		}
+	}
+	if *row.PublicUrl != "https://pilot-team.qm.example.com" {
+		t.Errorf("public url = %s", *row.PublicUrl)
+	}
+	if !row.SandboxApiKeyID.Valid {
+		t.Error("no sandbox key issued")
+	}
+	// The database is owned by the tenant's own role, not by the instance
+	// admin the provisioner connected as.
+	if owner := f.dbs.databases["qm_pilot_team"]; owner != "qm_pilot_team" {
+		t.Errorf("database owner = %q", owner)
+	}
+	if _, ok := f.buckets.buckets["example-project-qm-pilot-team"]; !ok {
+		t.Error("bucket not created")
+	}
+	if len(f.buckets.hmac) != 1 {
+		t.Errorf("storage credentials = %v", f.buckets.hmac)
+	}
+	if f.lb.hosts["pilot-team.qm.example.com"] != "qm-pilot-team" {
+		t.Errorf("host rule = %v", f.lb.hosts)
+	}
+	// Both probes ran against the tenant's own hostname.
+	if !f.tenant.requested("/healthz") || !f.tenant.requested("/idp/authorize") {
+		t.Errorf("probes did not run: %v", f.tenant.paths)
+	}
+
+	spec, ok := f.services.spec("qm-pilot-team")
+	if !ok {
+		t.Fatal("no service deployed")
+	}
+	assertTenantSpec(t, spec)
+
+	// The identity can read every secret its service mounts — the grant and
+	// the spec are rendered from one list, and this is what proves it.
+	granted := map[string]bool{}
+	for _, name := range f.accounts.grantedSecrets() {
+		granted[name] = true
+	}
+	for env, secretName := range spec.SecretEnv {
+		if !granted[secretName] {
+			t.Errorf("%s mounts %s with no grant to the tenant", env, secretName)
+		}
+	}
+
+	// Nothing secret-shaped reached the event log.
+	for _, e := range f.events(t) {
+		var detail map[string]any
+		if len(e.Detail) > 0 {
+			_ = json.Unmarshal(e.Detail, &detail)
+		}
+		raw := string(e.Detail) + e.Step + deref(e.Message)
+		for _, needle := range []string{"sk-ant-", "ss_live_", "re_fixture", "hmac-secret"} {
+			if strings.Contains(raw, needle) {
+				t.Errorf("event %s/%s leaked %q: %s", e.Step, e.Status, needle, raw)
+			}
+		}
+	}
+	_ = ctx
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
+
+func assertTenantSpec(t *testing.T, spec ServiceSpec) {
+	t.Helper()
+	if spec.Image != "qm:fixture" || spec.ServiceAccount == "" {
+		t.Errorf("spec = %+v", spec)
+	}
+	if spec.Network != "example-network" || spec.Subnetwork != "example-subnet" {
+		t.Errorf("the service is not on the VPC: %+v", spec)
+	}
+	// The email transport, which is the whole reason a provisioned tenant
+	// can be signed into.
+	for key, want := range map[string]string{
+		"AUTH_EMBEDDED":             "1",
+		"AUTH_EMAIL_TRANSPORT":      "resend",
+		"AUTH_EMAIL_FROM":           "QM <no-reply@mail.qm.example.com>",
+		"AUTH_ALLOWED_EMAILS":       "admin@example.com",
+		"AUTH_ALLOWED_EMAIL_DOMAIN": "example.com",
+		"ADMIN_GRANTS":              "admin@example.com:org_admin",
+		"PUBLIC_WEB_URL":            "https://pilot-team.qm.example.com",
+		"ORG_ID":                    "pilot-team",
+		"S3_BUCKET":                 "example-project-qm-pilot-team",
+		"SANDBOX_BACKEND":           "superserve",
+		"SUPERSERVE_BASE_URL":       "https://api.example.com",
+		"SUPERSERVE_TEMPLATE":       "qm-agent-0.1.0",
+		"HARNESS":                   "pi",
+		"MODEL_PROVIDER":            "anthropic",
+	} {
+		if spec.Env[key] != want {
+			t.Errorf("env %s = %q, want %q", key, spec.Env[key], want)
+		}
+	}
+	// The Resend key is the platform's, not a per-tenant secret.
+	if spec.SecretEnv["RESEND_API_KEY"] != "qm-resend-api-key" {
+		t.Errorf("RESEND_API_KEY mounts %q", spec.SecretEnv["RESEND_API_KEY"])
+	}
+	for _, name := range []string{
+		"DATABASE_URL", "CORE_SIGNING_SECRET", "CAPABILITY_SECRET", "PORTAL_IDENTITY_SECRET",
+		"CONNECTOR_SECRET_KEY", "SKILL_SIGNING_SECRET", "PORTAL_SESSION_SECRET",
+		"AUTH_TOKEN_SECRET", "AUTH_CLIENT_SECRET", "AUTH_SIGNING_JWK",
+		"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "SUPERSERVE_API_KEY", "ANTHROPIC_API_KEY",
+	} {
+		if spec.SecretEnv[name] != "qm-pilot-team-"+name {
+			t.Errorf("%s mounts %q", name, spec.SecretEnv[name])
+		}
+	}
+	// Nothing secret-shaped is in the plain environment, which Cloud Run
+	// shows to anyone who can describe the service.
+	for key, value := range spec.Env {
+		if strings.HasPrefix(value, "sk-") || strings.HasPrefix(value, "ss_live_") || strings.HasPrefix(value, "re_") {
+			t.Errorf("plain env %s carries a credential", key)
+		}
+	}
+}
+
+// A tenant's runtime secrets are all distinct and long enough for QM's own
+// boot check, and the signing key is a P-256 private JWK.
+func TestGeneratedSecretsSatisfyTheTenantImage(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]string{}
+	for _, name := range []string{
+		"CORE_SIGNING_SECRET", "CAPABILITY_SECRET", "PORTAL_IDENTITY_SECRET",
+		"CONNECTOR_SECRET_KEY", "SKILL_SIGNING_SECRET", "PORTAL_SESSION_SECRET",
+		"AUTH_TOKEN_SECRET", "AUTH_CLIENT_SECRET",
+	} {
+		value, err := f.secrets.Get(ctx, "qm-pilot-team-"+name)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(value) < 32 {
+			t.Errorf("%s is %d characters; QM requires at least 32", name, len(value))
+		}
+		if prev, dup := seen[string(value)]; dup {
+			t.Errorf("%s reuses %s's value", name, prev)
+		}
+		seen[string(value)] = name
+	}
+	raw, err := f.secrets.Get(ctx, "qm-pilot-team-AUTH_SIGNING_JWK")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var jwk map[string]string
+	if err := json.Unmarshal(raw, &jwk); err != nil {
+		t.Fatalf("signing key is not JSON: %v", err)
+	}
+	if jwk["kty"] != "EC" || jwk["crv"] != "P-256" || jwk["d"] == "" || jwk["x"] == "" || jwk["y"] == "" {
+		t.Errorf("signing key is not a P-256 private JWK: %v", jwk)
+	}
+}
+
+// ── Idempotence ──────────────────────────────────────────────────────────
+
+func TestProvisionIsIdempotent(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	before := f.current(t)
+	sessionSecret := f.secrets.Puts["qm-pilot-team-PORTAL_SESSION_SECRET"]
+
+	if err := f.reprovision(t); err != nil {
+		t.Fatal(err)
+	}
+	after := f.current(t)
+	if after.Status != tenantstore.StatusReady {
+		t.Fatalf("status = %s", after.Status)
+	}
+	if f.accounts.creates != 1 {
+		t.Errorf("service accounts created = %d", f.accounts.creates)
+	}
+	if f.dbs.created != 1 {
+		t.Errorf("databases created = %d", f.dbs.created)
+	}
+	if f.buckets.created != 1 {
+		t.Errorf("buckets created = %d", f.buckets.created)
+	}
+	if f.buckets.minted != 1 {
+		t.Errorf("storage credentials minted = %d", f.buckets.minted)
+	}
+	if f.lb.adds != 1 {
+		t.Errorf("host rules added = %d", f.lb.adds)
+	}
+	if f.secrets.Puts["qm-pilot-team-PORTAL_SESSION_SECRET"] != sessionSecret {
+		t.Error("a re-run rewrote the portal session secret")
+	}
+	if before.SandboxApiKeyID != after.SandboxApiKeyID {
+		t.Error("a re-run reissued the sandbox key")
+	}
+	if len(f.store.IssuedKeys) != 1 {
+		t.Errorf("sandbox keys issued = %d", len(f.store.IssuedKeys))
+	}
+	// The service is redeployed every run, deliberately: that is how a
+	// rotated secret or a new image reaches a tenant.
+	if f.services.deploys != 2 {
+		t.Errorf("deploys = %d", f.services.deploys)
+	}
+}
+
+// ── Rollback ─────────────────────────────────────────────────────────────
+
+func TestDeprovisionLeavesNothingBehind(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	keyID := uuid.UUID(f.current(t).SandboxApiKeyID.Bytes)
+	if err := f.deprovision(t); err != nil {
+		t.Fatal(err)
+	}
+	if f.current(t).Status != tenantstore.StatusDeleted {
+		t.Errorf("status = %s", f.current(t).Status)
+	}
+	if !f.store.RevokedKeys[keyID] {
+		t.Error("the tenant's sandbox key was not revoked")
+	}
+	f.nothingLeaked(t)
+}
+
+// A provision that fails partway leaves resources behind on purpose — the
+// retry is meant to converge — but the teardown that follows must still
+// clear every one of them, including the ones created by a step that never
+// got to record what it made.
+func TestTeardownAfterAPartialProvision(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call string
+	}{
+		{"the deploy fails", "services.Deploy"},
+		{"the route fails", "lb.AddHostRule"},
+		{"the bucket grant fails", "buckets.GrantAccess"},
+		{"recording the service account fails", "accounts.Create"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, false)
+			f.failOn(tc.call)
+			if err := f.provision(t); err == nil {
+				t.Fatal("the provision reported success")
+			}
+			if f.current(t).Status != tenantstore.StatusFailed {
+				t.Fatalf("status = %s", f.current(t).Status)
+			}
+			// The failure names the step an operator has to look at, and
+			// carries the reason.
+			assertFailureEvent(t, f.events(t))
+
+			if err := f.deprovision(t); err != nil {
+				t.Fatalf("teardown after a failed provision: %v", err)
+			}
+			f.nothingLeaked(t)
+		})
+	}
+}
+
+// Teardown of a tenant whose provision never ran at all: every step's
+// Rollback has to be safe when its Run never was.
+func TestTeardownWithoutAProvision(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.deprovision(t); err != nil {
+		t.Fatal(err)
+	}
+	if f.current(t).Status != tenantstore.StatusDeleted {
+		t.Errorf("status = %s", f.current(t).Status)
+	}
+	f.nothingLeaked(t)
+	// Every step reported a terminal status rather than erroring out.
+	terminal := map[string]string{}
+	for _, e := range f.events(t) {
+		if e.Status != tenantstore.EventStarted {
+			terminal[e.Step] = e.Status
+		}
+	}
+	for _, step := range []string{
+		"secrets", "service_account", "database", "bucket", "sandbox_key",
+		"cloud_run", "load_balancer", "health_check", "smoke", "admin_link",
+	} {
+		if terminal[step] == "" {
+			t.Errorf("%s never reached a terminal status", step)
+		}
+		if terminal[step] == tenantstore.EventFailed {
+			t.Errorf("%s failed on a tenant that was never provisioned", step)
+		}
+	}
+}
+
+// A teardown that fails partway is retried, and the retry has to converge
+// rather than trip over what the first attempt already removed.
+func TestTeardownIsRetryable(t *testing.T) {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	f.failOn("databases.DropDatabase")
+	if err := f.deprovision(t); err == nil {
+		t.Fatal("the teardown reported success")
+	}
+	if f.current(t).Status != tenantstore.StatusFailed {
+		t.Fatalf("status = %s", f.current(t).Status)
+	}
+	if err := f.deprovision(t); err != nil {
+		t.Fatalf("retried teardown: %v", err)
+	}
+	f.nothingLeaked(t)
+}
+
+func (f *tenantFixture) failOn(call string) {
+	switch {
+	case strings.HasPrefix(call, "accounts."):
+		f.accounts.failNext(call, 1)
+	case strings.HasPrefix(call, "databases."):
+		f.dbs.failNext(call, 1)
+	case strings.HasPrefix(call, "buckets."):
+		f.buckets.failNext(call, 1)
+	case strings.HasPrefix(call, "services."):
+		f.services.failNext(call, 1)
+	case strings.HasPrefix(call, "lb."):
+		f.lb.failNext(call, 1)
+	}
+}
+
+func assertFailureEvent(t *testing.T, events []tenantstore.Event) {
+	t.Helper()
+	for _, e := range events {
+		if e.Status != tenantstore.EventFailed || e.Step == provisioner.RunStep {
+			continue
+		}
+		if len(e.Detail) == 0 {
+			t.Errorf("%s failed with no detail to act on", e.Step)
+		}
+		var detail map[string]any
+		if err := json.Unmarshal(e.Detail, &detail); err != nil {
+			t.Errorf("%s detail is not JSON: %v", e.Step, err)
+		}
+		if msg, _ := detail["error"].(string); msg == "" {
+			t.Errorf("%s detail carries no error: %s", e.Step, e.Detail)
+		}
+		return
+	}
+	t.Error("no step reported a failure")
+}
+
+// ── Sign-in ──────────────────────────────────────────────────────────────
+
+// The defect this whole step set exists to prevent: a stack whose health
+// check is green and whose sign-in path fails closed. A healthy service
+// that 503s on /idp/authorize must fail the provision, not pass it.
+func TestSmokeFailsWhenSignInFailsClosed(t *testing.T) {
+	f := newFixture(t, false)
+	f.tenant.setAuthorizeStatus(http.StatusServiceUnavailable)
+	err := f.provision(t)
+	if err == nil {
+		t.Fatal("a tenant nobody can sign in to was reported ready")
+	}
+	if !strings.Contains(err.Error(), "sign-in fails closed") {
+		t.Errorf("err = %v", err)
+	}
+	if f.current(t).Status != tenantstore.StatusFailed {
+		t.Errorf("status = %s", f.current(t).Status)
+	}
+	// The operator is told what the tenant said, not just that a probe
+	// failed.
+	var found bool
+	for _, e := range f.events(t) {
+		if e.Step == "smoke" && e.Status == tenantstore.EventFailed && strings.Contains(string(e.Detail), "Email delivery") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the smoke failure did not carry the tenant's own reason: %v", f.events(t))
+	}
+}
+
+// A 4xx is a perfectly good answer from the broker: it means the endpoint
+// is alive and rejecting a request it does not like, not that the tenant
+// cannot send email.
+func TestSmokeAcceptsAClientErrorFromTheBroker(t *testing.T) {
+	f := newFixture(t, false)
+	f.tenant.setAuthorizeStatus(http.StatusBadRequest)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ── Sign-in policy ───────────────────────────────────────────────────────
+
+func TestAllowedEmailDomain(t *testing.T) {
+	if got := AllowedEmailDomain("admin@Pilot-Team.com"); got != "pilot-team.com" {
+		t.Errorf("corporate domain = %q", got)
+	}
+	// A consumer mailbox must not widen sign-in to every account at that
+	// provider; only the admin's own address is allowed.
+	for _, email := range []string{"someone@gmail.com", "someone@outlook.com", "someone@icloud.com", "not-an-email"} {
+		if got := AllowedEmailDomain(email); got != "" {
+			t.Errorf("AllowedEmailDomain(%q) = %q, want empty", email, got)
+		}
+	}
+}
+
+func TestTenantEnvOmitsPublicMailDomains(t *testing.T) {
+	f := newFixture(t, false)
+	ctx := context.Background()
+	if _, err := f.store.UpdateResources(ctx, f.teamID, f.row.ID, tenantstore.Resources{
+		BucketName: strptr("example-project-qm-pilot-team"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	row := f.current(t)
+	row.AdminEmail = "founder@gmail.com"
+	tenant := provisioner.NewTenant(row, testEnv(false), f.store)
+	env, err := TenantEnv(tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := env["AUTH_ALLOWED_EMAIL_DOMAIN"]; ok {
+		t.Errorf("a consumer mailbox widened sign-in: %q", env["AUTH_ALLOWED_EMAIL_DOMAIN"])
+	}
+	if env["AUTH_ALLOWED_EMAILS"] != "founder@gmail.com" {
+		t.Errorf("AUTH_ALLOWED_EMAILS = %q", env["AUTH_ALLOWED_EMAILS"])
+	}
+}
+
+func strptr(s string) *string { return &s }
+
+// ── Readiness ────────────────────────────────────────────────────────────
+
+// The startup gate. It no longer reports unimplemented steps — there are
+// none — but it still refuses a binary whose plan could not run: a missing
+// client, or a shared-infrastructure value the deploy never set.
+func TestPlanReadyRefusesAnIncompleteConfiguration(t *testing.T) {
+	full := Clients{
+		Secrets: secrets.NewFake(), Accounts: newFakeAccounts(), Databases: newFakeDatabases(),
+		Buckets: newFakeBuckets(), Services: newFakeServices(), LoadBalancer: newFakeLoadBalancer(),
+	}
+	if err := provisioner.PlanReady(All(full), testEnv(false)); err != nil {
+		t.Errorf("a fully configured plan was refused: %v", err)
+	}
+	// Stub mode needs no cloud clients and no shared infrastructure.
+	if err := provisioner.PlanReady(All(Clients{Secrets: secrets.NewFake()}), provisioner.Env{Stub: true}); err != nil {
+		t.Errorf("stub mode: %v", err)
+	}
+	// The Secret Manager-backed steps have no placeholder mode.
+	err := provisioner.PlanReady(All(Clients{}), provisioner.Env{Stub: true})
+	if err == nil {
+		t.Fatal("a plan with no secret store was accepted")
+	}
+	for _, want := range []string{"secrets", "sandbox_key", "admin_link"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("%q missing from %v", want, err)
+		}
+	}
+	// No clients at all, outside stub mode: every cloud step says so.
+	err = provisioner.PlanReady(All(Clients{Secrets: secrets.NewFake()}), testEnv(false))
+	if err == nil {
+		t.Fatal("a plan with no cloud clients was accepted")
+	}
+	for _, want := range []string{"service_account", "database", "bucket", "cloud_run", "load_balancer"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("%q missing from %v", want, err)
+		}
+	}
+
+	// A tenant with no email transport can never be signed into, so the
+	// plan refuses to start rather than building one.
+	noEmail := testEnv(false)
+	noEmail.ResendSecret = ""
+	err = provisioner.PlanReady(All(full), noEmail)
+	if err == nil || !strings.Contains(err.Error(), "QM_RESEND_SECRET") {
+		t.Errorf("a plan with no email transport: %v", err)
+	}
+	noSender := testEnv(false)
+	noSender.EmailFrom = ""
+	if err := provisioner.PlanReady(All(full), noSender); err == nil || !strings.Contains(err.Error(), "QM_EMAIL_FROM") {
+		t.Errorf("a plan with no sender address: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		mut   func(*provisioner.Env)
+		wants string
+	}{
+		{"no sql host", func(e *provisioner.Env) { e.SQLPrivateIP = "" }, "QM_SQL_PRIVATE_IP"},
+		{"no url map", func(e *provisioner.Env) { e.URLMap = "" }, "QM_LB_URL_MAP"},
+		{"no vpc", func(e *provisioner.Env) { e.VPCSubnetwork = "" }, "QM_VPC_SUBNETWORK"},
+		{"no tenant image", func(e *provisioner.Env) { e.Image = "" }, "QM_TENANT_IMAGE"},
+		{"no bucket location", func(e *provisioner.Env) { e.BucketLocation = "" }, "QM_TENANT_BUCKET_LOCATION"},
+		{"no sandbox template", func(e *provisioner.Env) { e.SandboxTemplate = "" }, "QM_SANDBOX_TEMPLATE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testEnv(false)
+			tc.mut(&env)
+			err := provisioner.PlanReady(All(full), env)
+			if err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Errorf("err = %v, want %s named", err, tc.wants)
+			}
+		})
+	}
+}
+
+// ── Stub mode ────────────────────────────────────────────────────────────
+
+func TestStubPlanProvisionsAndDeprovisions(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, true)
+	if err := f.provision(t); err != nil {
+		t.Fatal(err)
+	}
+	row := f.current(t)
+	if row.Status != tenantstore.StatusReady {
+		t.Fatalf("status = %s", row.Status)
+	}
 	for name, got := range map[string]*string{
 		"db_name": row.DbName, "bucket": row.BucketName, "service_account": row.ServiceAccount,
 		"cloud_run_service": row.CloudRunService, "image_tag": row.ImageTag, "public_url": row.PublicUrl,
@@ -84,31 +830,24 @@ func TestStubPlanProvisionsAndDeprovisions(t *testing.T) {
 			t.Errorf("%s not recorded", name)
 		}
 	}
-	if row.PublicUrl != nil && *row.PublicUrl != "https://pilot-team.qm.example.com" {
-		t.Errorf("public url = %s", *row.PublicUrl)
+	// Nothing was asked of the cloud.
+	if f.accounts.creates != 0 || f.dbs.created != 0 || f.buckets.created != 0 || f.services.deploys != 0 || f.lb.adds != 0 {
+		t.Error("stub mode called a cloud client")
 	}
-	refs, _ := store.ListSecretRefs(ctx, teamID, tenant.ID)
-	if len(refs) != 1+len(generatedSecrets) {
-		t.Errorf("secret refs = %+v", refs)
-	}
-	if !fake.Has("qm-pilot-team-PORTAL_SESSION_SECRET") {
-		t.Error("portal session secret not generated")
-	}
-	if v, _ := fake.Get(ctx, "qm-pilot-team-PORTAL_SESSION_SECRET"); len(v) < 32 {
+	if v, _ := f.secrets.Get(ctx, "qm-pilot-team-PORTAL_SESSION_SECRET"); len(v) < 32 {
 		t.Errorf("portal session secret too short for the portal: %d chars", len(v))
 	}
 
-	// A second provision run converges without re-creating anything.
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision, 0); err != nil {
+	if err := f.reprovision(t); err != nil {
 		t.Fatal(err)
 	}
-	events, _ := store.ListEvents(ctx, teamID, tenant.ID)
-	var second []string
+	events := f.events(t)
+	var statuses []string
 	for _, e := range events {
-		second = append(second, e.Step+":"+e.Status)
+		statuses = append(statuses, e.Step+":"+e.Status)
 	}
-	rerun := strings.Join(second[len(second)/2:], ",")
-	for _, step := range []string{"database", "service_account", "bucket", "secrets", "cloud_run"} {
+	rerun := strings.Join(statuses[len(statuses)/2:], ",")
+	for _, step := range []string{"database", "service_account", "bucket", "secrets", "cloud_run", "sandbox_key"} {
 		if !strings.Contains(rerun, step+":skipped") {
 			t.Errorf("re-run did not skip %s: %s", step, rerun)
 		}
@@ -116,133 +855,126 @@ func TestStubPlanProvisionsAndDeprovisions(t *testing.T) {
 	if strings.Contains(rerun, ":failed") {
 		t.Errorf("re-run failed: %s", rerun)
 	}
-	if fake.Puts["qm-pilot-team-PORTAL_SESSION_SECRET"] != 1 {
-		t.Errorf("portal secret rewritten on re-run: %d puts", fake.Puts["qm-pilot-team-PORTAL_SESSION_SECRET"])
-	}
 
-	store.SetStatus(ctx, teamID, tenant.ID, tenantstore.StatusDeprovisioning)
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision, 0); err != nil {
+	if err := f.deprovision(t); err != nil {
 		t.Fatal(err)
 	}
-	row, _ = store.GetTenant(ctx, teamID, tenant.ID)
-	if row.Status != tenantstore.StatusDeleted {
-		t.Errorf("status after deprovision = %s", row.Status)
+	if f.current(t).Status != tenantstore.StatusDeleted {
+		t.Errorf("status after deprovision = %s", f.current(t).Status)
 	}
-	if fake.Has("qm-pilot-team-PORTAL_SESSION_SECRET") || fake.Has("qm-pilot-team-ANTHROPIC_API_KEY") {
+	if f.secrets.Has("qm-pilot-team-PORTAL_SESSION_SECRET") || f.secrets.Has("qm-pilot-team-ANTHROPIC_API_KEY") {
 		t.Error("secrets survived deprovision")
 	}
-	if refs, _ := store.ListSecretRefs(ctx, teamID, tenant.ID); len(refs) != 0 {
+	// The platform's shared Resend key belongs to no tenant and must
+	// survive every teardown.
+	if !f.secrets.Has("qm-resend-api-key") {
+		t.Error("teardown deleted the platform's shared Resend key")
+	}
+	if refs, _ := f.store.ListSecretRefs(ctx, f.teamID, f.row.ID); len(refs) != 0 {
 		t.Errorf("secret refs survived deprovision: %+v", refs)
-	}
-}
-
-func TestRealModeStopsAtFirstUnimplementedStep(t *testing.T) {
-	ctx := context.Background()
-	r, store, _, teamID, tenant := newRunner(t, false)
-	err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision, 0)
-	if !errors.Is(err, provisioner.ErrNotImplemented) {
-		t.Fatalf("err = %v", err)
-	}
-	// The secrets step is real and runs first; the identity step is the
-	// first cloud-touching one.
-	var nie *provisioner.NotImplementedError
-	if !errors.As(err, &nie) || nie.Step != "service_account" {
-		t.Errorf("stopped at %v, want service_account", err)
-	}
-	if refs, _ := store.ListSecretRefs(ctx, teamID, tenant.ID); len(refs) != 1+len(generatedSecrets) {
-		t.Errorf("secrets not generated before the first cloud step: %+v", refs)
-	}
-	row, _ := store.GetTenant(ctx, teamID, tenant.ID)
-	if row.Status != tenantstore.StatusFailed {
-		t.Errorf("status = %s", row.Status)
 	}
 }
 
 // A model key whose reference never landed is still removed on teardown.
 func TestDeprovisionDeletesUnreferencedModelKey(t *testing.T) {
 	ctx := context.Background()
-	r, store, fake, teamID, tenant := newRunner(t, true)
-	if err := store.DeleteSecretRef(ctx, teamID, tenant.ID, "ANTHROPIC_API_KEY"); err != nil {
+	f := newFixture(t, true)
+	if err := f.store.DeleteSecretRef(ctx, f.teamID, f.row.ID, "ANTHROPIC_API_KEY"); err != nil {
 		t.Fatal(err)
 	}
-	store.SetStatus(ctx, teamID, tenant.ID, tenantstore.StatusDeprovisioning)
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision, 0); err != nil {
+	if err := f.deprovision(t); err != nil {
 		t.Fatal(err)
 	}
-	if fake.Has("qm-pilot-team-ANTHROPIC_API_KEY") {
+	if f.secrets.Has("qm-pilot-team-ANTHROPIC_API_KEY") {
 		t.Error("unreferenced model key survived deprovision")
-	}
-}
-
-// The startup gate: outside stub mode the plan reports the steps whose
-// cloud implementations have not landed, so the binary refuses to serve
-// rather than accepting tenants it would abandon halfway through.
-func TestPlanReadyGatesUnimplementedSteps(t *testing.T) {
-	clients := Clients{Secrets: secrets.NewFake()}
-	if err := provisioner.PlanReady(All(clients), provisioner.Env{Stub: true}); err != nil {
-		t.Errorf("stub mode: %v", err)
-	}
-	err := provisioner.PlanReady(All(clients), provisioner.Env{})
-	if err == nil {
-		t.Fatal("real mode reported a runnable plan")
-	}
-	for _, want := range []string{"service_account", "database", "bucket", "sandbox_key", "cloud_run", "load_balancer", "health_check", "smoke"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("%q missing from %v", want, err)
-		}
-	}
-	// The Secret Manager-backed steps have no placeholder mode: without a
-	// store they are unrunnable even under the stub.
-	err = provisioner.PlanReady(All(Clients{}), provisioner.Env{Stub: true})
-	if err == nil || !strings.Contains(err.Error(), "secrets") || !strings.Contains(err.Error(), "admin_link") {
-		t.Errorf("no secret store: %v", err)
 	}
 }
 
 // Teardown revokes the tenant's sandbox API key rather than merely
 // forgetting the reference: the key is bound to this cell, and team
 // migration refuses a region cutover while a tenant still points at a live
-// one. This half of the step is real even in stub mode.
+// one.
 func TestDeprovisionRevokesTheSandboxKey(t *testing.T) {
 	ctx := context.Background()
-	r, store, _, teamID, tenant := newRunner(t, true)
-	keyID := uuid.New()
-	if _, err := store.UpdateResources(ctx, teamID, tenant.ID, tenantstore.Resources{SandboxAPIKeyID: &keyID}); err != nil {
+	f := newFixture(t, false)
+	if err := f.provision(t); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeProvision, 0); err != nil {
-		t.Fatal(err)
-	}
-	if store.RevokedKeys[keyID] {
+	keyID := uuid.UUID(f.current(t).SandboxApiKeyID.Bytes)
+	if f.store.RevokedKeys[keyID] {
 		t.Error("provisioning revoked the tenant's sandbox key")
 	}
+	// The key the tenant's service mounts is the one that was issued.
+	raw, err := f.secrets.Get(ctx, "qm-pilot-team-SUPERSERVE_API_KEY")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(raw), "ss_live_use_") {
+		t.Errorf("the issued key is not tagged with the cell's region: %d characters", len(raw))
+	}
 
-	if _, err := store.SetStatus(ctx, teamID, tenant.ID, tenantstore.StatusDeprovisioning); err != nil {
+	if err := f.deprovision(t); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Run(ctx, teamID, tenant.ID, provisioner.ModeDeprovision, 0); err != nil {
-		t.Fatal(err)
-	}
-	if !store.RevokedKeys[keyID] {
+	if !f.store.RevokedKeys[keyID] {
 		t.Error("deprovisioning left the tenant's sandbox key live")
 	}
 
 	// A tenant that never got a key tears down without one.
-	r2, store2, _, team2, tenant2 := newRunner(t, true)
-	if _, err := store2.SetStatus(ctx, team2, tenant2.ID, tenantstore.StatusDeprovisioning); err != nil {
+	other := newFixture(t, false)
+	if err := other.deprovision(t); err != nil {
 		t.Fatal(err)
 	}
-	if err := r2.Run(ctx, team2, tenant2.ID, provisioner.ModeDeprovision, 0); err != nil {
-		t.Fatal(err)
-	}
-	events, _ := store2.ListEvents(ctx, team2, tenant2.ID)
 	var found bool
-	for _, e := range events {
+	for _, e := range other.events(t) {
 		if e.Step == "sandbox_key" && e.Status == tenantstore.EventSkipped {
 			found = true
 		}
 	}
 	if !found {
 		t.Error("teardown without a key did not skip sandbox_key")
+	}
+}
+
+func TestNewSandboxKeyShape(t *testing.T) {
+	tagged, err := NewSandboxKey("use")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(tagged, "ss_live_use_") {
+		t.Errorf("key = %q", tagged)
+	}
+	untagged, err := NewSandboxKey("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The random half is base64url, so it may contain underscores of its
+	// own; what matters is that no region token was inserted.
+	if !strings.HasPrefix(untagged, "ss_live_") || strings.HasPrefix(untagged, "ss_live_use_") {
+		t.Errorf("untagged key = %q", untagged)
+	}
+	if tagged == untagged {
+		t.Error("two keys came out the same")
+	}
+}
+
+func TestDatabaseURL(t *testing.T) {
+	env := testEnv(false)
+	got := DatabaseURL(env, "qm_pilot_team", "p@ss word/1", "qm_pilot_team")
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("%q: %v", got, err)
+	}
+	if u.Host != "10.0.0.3:5432" || u.Path != "/qm_pilot_team" {
+		t.Errorf("url = %s", got)
+	}
+	// The password is escaped rather than breaking the URL apart.
+	pw, _ := u.User.Password()
+	if pw != "p@ss word/1" {
+		t.Errorf("password = %q", pw)
+	}
+	env.SQLPrivateIP = "10.0.0.3:6432"
+	if u, _ := url.Parse(DatabaseURL(env, "r", "p", "d")); u.Host != "10.0.0.3:6432" {
+		t.Errorf("an explicit port was overridden: %s", u.Host)
 	}
 }

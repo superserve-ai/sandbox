@@ -2,8 +2,6 @@ package steps
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -15,15 +13,24 @@ import (
 // store was wired in; they have no placeholder mode to fall back to.
 var errNoSecretStore = errors.New("no secret store configured")
 
-// Generated per tenant. The model provider key is not in this list: qm-api
-// writes it at create time, before the run is triggered.
-var generatedSecrets = []struct {
-	name  string
-	bytes int
-}{
-	{secrets.PortalSessionSecret, 32},
-	{"DATABASE_PASSWORD", 24},
-	{"CORE_SESSION_SECRET", 32},
+// Generated per tenant, in plan order of nothing in particular: the step
+// writes whichever are missing. See generated.go for what is deliberately
+// absent.
+var generatedSecrets = []generatedSecret{
+	{name: secrets.PortalSessionSecret, value: randomSecret(32)},
+	{name: secretDatabasePassword, value: randomSecret(24)},
+	// QM's production boot check requires all five, each distinct.
+	{name: "CORE_SIGNING_SECRET", value: randomSecret(32)},
+	{name: "CAPABILITY_SECRET", value: randomSecret(32)},
+	{name: "PORTAL_IDENTITY_SECRET", value: randomSecret(32)},
+	{name: "CONNECTOR_SECRET_KEY", value: randomSecret(32)},
+	{name: "SKILL_SIGNING_SECRET", value: randomSecret(32)},
+	// The embedded sign-in broker's own credentials. AUTH_CLIENT_SECRET
+	// must differ from AUTH_TOKEN_SECRET, which independent generation
+	// gives us.
+	{name: "AUTH_TOKEN_SECRET", value: randomSecret(32)},
+	{name: "AUTH_CLIENT_SECRET", value: randomSecret(32)},
+	{name: "AUTH_SIGNING_JWK", value: newSigningJWK},
 }
 
 // secretsStep generates the tenant's runtime secrets into Secret Manager
@@ -63,9 +70,9 @@ func (s secretsStep) Run(ctx context.Context, t *provisioner.Tenant) error {
 		if have[spec.name] {
 			continue
 		}
-		value, err := randomHex(spec.bytes)
+		value, err := spec.value()
 		if err != nil {
-			return err
+			return fmt.Errorf("generate %s: %w", spec.name, err)
 		}
 		ref, err := s.c.Secrets.Put(ctx, t.SecretName(spec.name), []byte(value))
 		if err != nil {
@@ -99,6 +106,13 @@ func (s secretsStep) Rollback(ctx context.Context, t *provisioner.Tenant) error 
 	for _, spec := range generatedSecrets {
 		names[spec.name] = true
 	}
+	// The secrets later steps derive rather than generate. Their own
+	// rollbacks remove them, but this step runs last on teardown and is the
+	// backstop for one that failed before it got there: a leaked
+	// DATABASE_URL or sandbox key is a live credential.
+	for _, name := range derivedSecrets {
+		names[name] = true
+	}
 	for _, ref := range refs {
 		names[ref.Name] = true
 	}
@@ -113,12 +127,4 @@ func (s secretsStep) Rollback(ctx context.Context, t *provisioner.Tenant) error 
 		}
 	}
 	return nil
-}
-
-func randomHex(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
 }

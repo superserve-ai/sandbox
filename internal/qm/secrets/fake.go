@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"context"
+	"sort"
 	"sync"
 )
 
@@ -61,6 +62,18 @@ func (f *Fake) Delete(_ context.Context, name string) error {
 	}
 	delete(f.values, name)
 	return nil
+}
+
+// Names lists the secrets that currently hold a value, sorted.
+func (f *Fake) Names() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.values))
+	for name := range f.values {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // Has reports whether name currently holds a value.
