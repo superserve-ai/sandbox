@@ -515,8 +515,65 @@ func TestQMAPI_NoTenantForATeamDetachedFromThisCell(t *testing.T) {
 	}
 	conn := connectAsQMAPI(t)
 	_, q := scopedQMTx(t, conn, teamID)
-	_, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
-	if !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("tenant admission for a detached team: want no rows, got err=%v", err)
+	if err := q.LockQMTenantAdmission(ctx, teamID); err != nil {
+		t.Fatalf("lock admission: %v", err)
+	}
+	homed, err := q.QMTeamHomedHere(ctx, teamID)
+	if err != nil {
+		t.Fatalf("homed check: %v", err)
+	}
+	if homed {
+		t.Fatalf("a team whose memberships left this cell must not be homed here")
+	}
+}
+
+func TestQMAPI_HomedTeamAdmitsATenantUnderTheLock(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedQMTeamAndKey(t)
+	conn := connectAsQMAPI(t)
+	_, q := scopedQMTx(t, conn, teamID)
+	if err := q.LockQMTenantAdmission(ctx, teamID); err != nil {
+		t.Fatalf("lock admission: %v", err)
+	}
+	homed, err := q.QMTeamHomedHere(ctx, teamID)
+	if err != nil || !homed {
+		t.Fatalf("homed check: homed=%v err=%v", homed, err)
+	}
+	if _, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8])); err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+}
+
+func TestQMAPI_RetiredTenantRefusesChildWrites(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedQMTeamAndKey(t)
+	conn := connectAsQMAPI(t)
+	tx, q := scopedQMTx(t, conn, teamID)
+	tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	if _, err := q.InsertQMTenantEvent(ctx, db.InsertQMTenantEventParams{TenantID: tenant.ID, Step: "database", Status: "ok"}); err != nil {
+		t.Fatalf("event on a live tenant: %v", err)
+	}
+	if _, err := q.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenant.ID, TeamID: teamID}); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	if _, err := q.InsertQMTenantEvent(ctx, db.InsertQMTenantEventParams{TenantID: tenant.ID, Step: "database", Status: "ok"}); pgErrCode(err) != pgInsufficientPriv {
+		t.Fatalf("event on a retired tenant: want %s, got err=%v", pgInsufficientPriv, err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	tx, q = scopedQMTx(t, conn, teamID)
+	tenant, err = q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if err != nil {
+		t.Fatalf("create tenant again: %v", err)
+	}
+	if _, err := q.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenant.ID, TeamID: teamID}); err != nil {
+		t.Fatalf("soft delete again: %v", err)
+	}
+	if err := q.SetQMTenantSecretRef(ctx, db.SetQMTenantSecretRefParams{TenantID: tenant.ID, Name: "late", SecretRef: "projects/p/secrets/late"}); pgErrCode(err) != pgInsufficientPriv {
+		t.Fatalf("secret ref on a retired tenant: want %s, got err=%v", pgInsufficientPriv, err)
 	}
 }

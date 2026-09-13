@@ -4,25 +4,26 @@
 -- it transaction-local so it cannot leak across pooled connections.
 SELECT set_config('qm.team_id', sqlc.arg(team_id)::text, true);
 
--- name: CreateQMTenant :one
+-- name: LockQMTenantAdmission :exec
 -- Tenant admission serializes on the team's advisory lock, the same lock
--- team migration holds while it detaches a team. Once the lock is held the
--- team must still be homed in this cell (detach deletes its memberships
--- here), otherwise no row is inserted and the caller sees no rows.
-WITH admission AS (
-    SELECT pg_advisory_xact_lock(hashtext($1::uuid::text))
-),
-homed AS (
-    SELECT 1 AS ok
-    FROM admission
-    WHERE EXISTS (SELECT 1 FROM public.team_memberships WHERE team_id = $1)
-)
+-- team migration holds while it detaches or purges a team. Callers run
+-- LockQMTenantAdmission, then QMTeamHomedHere, then CreateQMTenant as
+-- three statements in one transaction: the homing check must be its own
+-- statement so its snapshot is taken after the lock is granted.
+SELECT pg_advisory_xact_lock(hashtext($1::uuid::text));
+
+-- name: QMTeamHomedHere :one
+-- False once team migration has detached the team from this cell (detach
+-- deletes its memberships here while the team row lingers for the soak).
+SELECT EXISTS (SELECT 1 FROM public.team_memberships WHERE team_id = $1) AS homed;
+
+-- name: CreateQMTenant :one
 INSERT INTO qm.tenants (
     team_id, slug, org_name, admin_email, sign_in, model_provider, harness, created_by
 )
-SELECT
+VALUES (
     $1, $2, $3, $4, $5, $6, COALESCE(sqlc.narg('harness')::text, 'pi'), sqlc.narg('created_by')
-FROM homed
+)
 RETURNING *;
 
 -- name: GetQMTenant :one

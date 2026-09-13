@@ -197,6 +197,9 @@ REVOKE ALL ON FUNCTION qm.slug_available(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION qm.slug_available(text) TO qm_api;
 
 ALTER TABLE qm.tenants        ENABLE ROW LEVEL SECURITY;
+-- Child rows are append-only while a tenant is live; a retired tenant
+-- accepts no further events or secret references, which is what lets team
+-- migration treat its cutover sweep of these tables as final.
 ALTER TABLE qm.tenant_events  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE qm.tenant_secrets ENABLE ROW LEVEL SECURITY;
 
@@ -215,7 +218,7 @@ CREATE POLICY qm_api_team_scope ON qm.tenant_events
     ))
     WITH CHECK (EXISTS (
         SELECT 1 FROM qm.tenants t
-        WHERE t.id = tenant_id AND t.team_id = qm.current_team_id()
+        WHERE t.id = tenant_id AND t.team_id = qm.current_team_id() AND t.status <> 'deleted'
     ));
 
 DROP POLICY IF EXISTS qm_api_team_scope ON qm.tenant_secrets;
@@ -227,7 +230,7 @@ CREATE POLICY qm_api_team_scope ON qm.tenant_secrets
     ))
     WITH CHECK (EXISTS (
         SELECT 1 FROM qm.tenants t
-        WHERE t.id = tenant_id AND t.team_id = qm.current_team_id()
+        WHERE t.id = tenant_id AND t.team_id = qm.current_team_id() AND t.status <> 'deleted'
     ));
 
 -- Public tables have RLS enabled with no policy for qm_api, so the SELECT
