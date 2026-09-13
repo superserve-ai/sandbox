@@ -63,14 +63,14 @@ func NewLoadBalancer(ctx context.Context, project, region, urlMap string, opts .
 // EnsureHostRule creates the three resources if they are missing and
 // corrects the host rule and path matcher if they point somewhere stale.
 // Every part of it is idempotent, so it is safe on every run.
-func (l *LoadBalancer) EnsureHostRule(ctx context.Context, host, cloudRunService string) error {
+func (l *LoadBalancer) EnsureHostRule(ctx context.Context, host, cloudRunService, owner string) error {
 	// The NEG, the backend service and the path matcher all take the Cloud
 	// Run service's name, so the four read as one set in the console.
 	name := cloudRunService
-	if err := l.ensureNEG(ctx, name, cloudRunService); err != nil {
+	if err := l.ensureNEG(ctx, name, cloudRunService, owner); err != nil {
 		return err
 	}
-	backend, err := l.ensureBackendService(ctx, name)
+	backend, err := l.ensureBackendService(ctx, name, owner)
 	if err != nil {
 		return err
 	}
@@ -82,7 +82,7 @@ func (l *LoadBalancer) EnsureHostRule(ctx context.Context, host, cloudRunService
 // RemoveHostRule unwinds all three, route first: the backend service cannot
 // be deleted while the URL map still references it, and the NEG cannot be
 // deleted while a backend service still points at it.
-func (l *LoadBalancer) RemoveHostRule(ctx context.Context, host string) error {
+func (l *LoadBalancer) RemoveHostRule(ctx context.Context, host, owner string) error {
 	var name string
 	var shared bool
 	if err := l.patchURLMap(ctx, func(m *compute.UrlMap) bool {
@@ -107,10 +107,10 @@ func (l *LoadBalancer) RemoveHostRule(ctx context.Context, host string) error {
 		}
 		name = steps.ServiceName(strings.Split(host, ".")[0])
 	}
-	if err := l.deleteBackendService(ctx, name); err != nil {
+	if err := l.deleteBackendService(ctx, name, owner); err != nil {
 		return err
 	}
-	return l.deleteNEG(ctx, name)
+	return l.deleteNEG(ctx, name, owner)
 }
 
 // ensureNEG creates the serverless NEG if it is missing, and refuses to
@@ -119,9 +119,12 @@ func (l *LoadBalancer) RemoveHostRule(ctx context.Context, host string) error {
 // the provisioner can repair — and quietly accepting it would route a
 // tenant's hostname at somebody else's service, which the health and
 // sign-in probes would both happily pass.
-func (l *LoadBalancer) ensureNEG(ctx context.Context, name, cloudRunService string) error {
+func (l *LoadBalancer) ensureNEG(ctx context.Context, name, cloudRunService, owner string) error {
 	existing, err := l.svc.RegionNetworkEndpointGroups.Get(l.project, l.region, name).Context(ctx).Do()
 	if err == nil {
+		if err := ownedBy(existing.Description, owner, "network endpoint group", name); err != nil {
+			return err
+		}
 		if target := negTarget(existing); target != cloudRunService {
 			return fmt.Errorf("network endpoint group %s points at %q, not %q; delete it and retry", name, target, cloudRunService)
 		}
@@ -134,6 +137,7 @@ func (l *LoadBalancer) ensureNEG(ctx context.Context, name, cloudRunService stri
 		Name:                name,
 		NetworkEndpointType: "SERVERLESS",
 		Region:              l.region,
+		Description:         owner,
 		CloudRun:            &compute.NetworkEndpointGroupCloudRun{Service: cloudRunService},
 	}).Context(ctx).Do()
 	if err != nil {
@@ -148,6 +152,9 @@ func (l *LoadBalancer) ensureNEG(ctx context.Context, name, cloudRunService stri
 		existing, err := l.svc.RegionNetworkEndpointGroups.Get(l.project, l.region, name).Context(ctx).Do()
 		if err != nil {
 			return fmt.Errorf("get the network endpoint group %s after it was already created: %w", name, err)
+		}
+		if err := ownedBy(existing.Description, owner, "network endpoint group", name); err != nil {
+			return err
 		}
 		if target := negTarget(existing); target != cloudRunService {
 			return fmt.Errorf("network endpoint group %s points at %q, not %q; delete it and retry", name, target, cloudRunService)
@@ -164,7 +171,15 @@ func negTarget(neg *compute.NetworkEndpointGroup) string {
 	return neg.CloudRun.Service
 }
 
-func (l *LoadBalancer) deleteNEG(ctx context.Context, name string) error {
+func (l *LoadBalancer) deleteNEG(ctx context.Context, name, owner string) error {
+	existing, err := l.svc.RegionNetworkEndpointGroups.Get(l.project, l.region, name).Context(ctx).Do()
+	if err == nil {
+		if err := ownedBy(existing.Description, owner, "network endpoint group", name); err != nil {
+			return err
+		}
+	} else if !notFound(err) {
+		return fmt.Errorf("get the network endpoint group %s: %w", name, err)
+	}
 	op, err := l.svc.RegionNetworkEndpointGroups.Delete(l.project, l.region, name).Context(ctx).Do()
 	if err != nil {
 		if notFound(err) {
@@ -179,10 +194,13 @@ func (l *LoadBalancer) deleteNEG(ctx context.Context, name string) error {
 // if needed and repointing it at this tenant's NEG if it drifted. External
 // managed is the scheme the shared HTTPS load balancer uses; a serverless
 // NEG carries no health check.
-func (l *LoadBalancer) ensureBackendService(ctx context.Context, name string) (string, error) {
+func (l *LoadBalancer) ensureBackendService(ctx context.Context, name, owner string) (string, error) {
 	negLink := fmt.Sprintf("projects/%s/regions/%s/networkEndpointGroups/%s", l.project, l.region, name)
 	existing, err := l.svc.BackendServices.Get(l.project, name).Context(ctx).Do()
 	if err == nil {
+		if err := ownedBy(existing.Description, owner, "backend service", name); err != nil {
+			return "", err
+		}
 		if backsNEG(existing, negLink) {
 			return existing.SelfLink, nil
 		}
@@ -190,6 +208,7 @@ func (l *LoadBalancer) ensureBackendService(ctx context.Context, name string) (s
 		// mutable, so a drifted one is repaired rather than reported.
 		op, err := l.svc.BackendServices.Patch(l.project, name, &compute.BackendService{
 			Fingerprint:     existing.Fingerprint,
+			Description:     owner,
 			Backends:        []*compute.Backend{{Group: negLink}},
 			ForceSendFields: []string{"Backends"},
 		}).Context(ctx).Do()
@@ -223,6 +242,12 @@ func (l *LoadBalancer) ensureBackendService(ctx context.Context, name string) (s
 	if err != nil {
 		return "", fmt.Errorf("get the backend service %s after creating it: %w", name, err)
 	}
+	// Read back rather than trusting the insert: it tolerates an
+	// already-exists, which is how a backend somebody else made in the gap
+	// since the look-up above would otherwise be adopted.
+	if err := ownedBy(created.Description, owner, "backend service", name); err != nil {
+		return "", err
+	}
 	return created.SelfLink, nil
 }
 
@@ -236,7 +261,15 @@ func backsNEG(svc *compute.BackendService, negLink string) bool {
 	return strings.HasSuffix(svc.Backends[0].Group, negLink)
 }
 
-func (l *LoadBalancer) deleteBackendService(ctx context.Context, name string) error {
+func (l *LoadBalancer) deleteBackendService(ctx context.Context, name, owner string) error {
+	existing, err := l.svc.BackendServices.Get(l.project, name).Context(ctx).Do()
+	if err == nil {
+		if err := ownedBy(existing.Description, owner, "backend service", name); err != nil {
+			return err
+		}
+	} else if !notFound(err) {
+		return fmt.Errorf("get the backend service %s: %w", name, err)
+	}
 	op, err := l.svc.BackendServices.Delete(l.project, name).Context(ctx).Do()
 	if err != nil {
 		if notFound(err) {
@@ -450,6 +483,17 @@ func (l *LoadBalancer) waitOperation(ctx context.Context, op *compute.Operation,
 		case <-time.After(operationWait):
 		}
 	}
+}
+
+// ownedBy refuses a resource whose description is not this tenant's marker.
+// Compute resources take no labels, so the description is where the marker
+// lives — and these names are all derived from a user-chosen slug, so
+// "it has the right name" is not evidence of anything.
+func ownedBy(description, owner, kind, name string) error {
+	if description == owner {
+		return nil
+	}
+	return fmt.Errorf("%s %s already exists and does not belong to this tenant", kind, name)
 }
 
 func computeOperationError(op *compute.Operation) error {

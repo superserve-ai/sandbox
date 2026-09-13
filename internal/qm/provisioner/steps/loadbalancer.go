@@ -23,8 +23,12 @@ type LoadBalancerAdmin interface {
 	// missing and correcting what is stale. Reconciling rather than
 	// creating once is what lets a retry repair a route left half-built or
 	// pointing at a service that has since been redeployed.
-	EnsureHostRule(ctx context.Context, host, cloudRunService string) error
-	RemoveHostRule(ctx context.Context, host string) error
+	//
+	// owner is this tenant's marker. The NEG and backend service are named
+	// after the slug, so both must refuse to adopt — or delete — one that
+	// carries a different owner.
+	EnsureHostRule(ctx context.Context, host, cloudRunService, owner string) error
+	RemoveHostRule(ctx context.Context, host, owner string) error
 }
 
 var errNoLoadBalancerAdmin = errors.New("no load balancer client configured")
@@ -61,7 +65,8 @@ func (s loadBalancer) Run(ctx context.Context, t *provisioner.Tenant) error {
 	// "already routed" would make the repair unreachable — a route left
 	// pointing at a stale backend would then survive every retry while the
 	// probes after it went on failing.
-	if err := s.c.LoadBalancer.EnsureHostRule(ctx, t.Hostname(), *t.Row.CloudRunService); err != nil {
+	owner := TenantDescription(t.Row.ID.String(), t.Row.Slug)
+	if err := s.c.LoadBalancer.EnsureHostRule(ctx, t.Hostname(), *t.Row.CloudRunService, owner); err != nil {
 		return fmt.Errorf("route the tenant's hostname: %w", err)
 	}
 	return nil
@@ -84,8 +89,9 @@ func (s loadBalancer) Rollback(ctx context.Context, t *provisioner.Tenant) error
 	if s.c.LoadBalancer == nil {
 		return errNoLoadBalancerAdmin
 	}
+	owner := TenantDescription(t.Row.ID.String(), t.Row.Slug)
 	for _, host := range routedHosts(t) {
-		if err := s.c.LoadBalancer.RemoveHostRule(ctx, host); err != nil {
+		if err := s.c.LoadBalancer.RemoveHostRule(ctx, host, owner); err != nil {
 			return fmt.Errorf("remove the tenant's route: %w", err)
 		}
 	}

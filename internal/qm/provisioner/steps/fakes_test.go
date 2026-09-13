@@ -248,6 +248,11 @@ func (f *fakeBuckets) Create(_ context.Context, name, _, _ string, labels map[st
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Mirrors the real client, which tolerates an already-exists: a bucket
+	// somebody else made in the gap keeps its own labels.
+	if _, ok := f.buckets[name]; ok {
+		return nil
+	}
 	f.buckets[name] = labels
 	f.created++
 	return nil
@@ -385,21 +390,30 @@ func (f *fakeServices) empty() bool {
 
 type fakeLoadBalancer struct {
 	fakeFailures
-	mu    sync.Mutex
-	hosts map[string]string
-	adds  int
+	mu sync.Mutex
+	// hosts is hostname -> backend name; owners is backend name -> the
+	// tenant marker it was created with.
+	hosts  map[string]string
+	owners map[string]string
+	adds   int
 }
 
 func newFakeLoadBalancer() *fakeLoadBalancer {
-	return &fakeLoadBalancer{hosts: map[string]string{}}
+	return &fakeLoadBalancer{hosts: map[string]string{}, owners: map[string]string{}}
 }
 
-func (f *fakeLoadBalancer) EnsureHostRule(_ context.Context, host, service string) error {
+func (f *fakeLoadBalancer) EnsureHostRule(_ context.Context, host, service, owner string) error {
 	if err := f.check("lb.EnsureHostRule"); err != nil {
 		return err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Mirrors the real client: the NEG and backend service are named after
+	// the slug, so one carrying a different owner is not this tenant's.
+	if have, ok := f.owners[service]; ok && have != owner {
+		return fmt.Errorf("fake: backend %s does not belong to this tenant", service)
+	}
+	f.owners[service] = owner
 	if f.hosts[host] != service {
 		f.adds++
 	}
@@ -407,12 +421,18 @@ func (f *fakeLoadBalancer) EnsureHostRule(_ context.Context, host, service strin
 	return nil
 }
 
-func (f *fakeLoadBalancer) RemoveHostRule(_ context.Context, host string) error {
+func (f *fakeLoadBalancer) RemoveHostRule(_ context.Context, host, owner string) error {
 	if err := f.check("lb.RemoveHostRule"); err != nil {
 		return err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if service, ok := f.hosts[host]; ok {
+		if have, owned := f.owners[service]; owned && have != owner {
+			return fmt.Errorf("fake: backend %s does not belong to this tenant", service)
+		}
+		delete(f.owners, service)
+	}
 	delete(f.hosts, host)
 	return nil
 }

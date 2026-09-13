@@ -76,7 +76,7 @@ func (s serviceAccount) Run(ctx context.Context, t *provisioner.Tenant) error {
 	if s.c.Accounts == nil {
 		return errNoServiceAccountAdmin
 	}
-	want := ServiceAccountDescription(t.Row.ID.String(), t.Row.Slug)
+	want := TenantDescription(t.Row.ID.String(), t.Row.Slug)
 	// Check-then-create against the cloud, not against the row: a run that
 	// created the account and died before recording it must converge, not
 	// fail on a name that is already taken.
@@ -131,7 +131,7 @@ func (s serviceAccount) Rollback(ctx context.Context, t *provisioner.Tenant) err
 	if err != nil {
 		return fmt.Errorf("look up service account: %w", err)
 	}
-	if exists && existing.Description != ServiceAccountDescription(t.Row.ID.String(), t.Row.Slug) {
+	if exists && existing.Description != TenantDescription(t.Row.ID.String(), t.Row.Slug) {
 		return fmt.Errorf("service account %s does not belong to this tenant; not deleting it", email)
 	}
 	if err := s.c.Accounts.Delete(ctx, email); err != nil {

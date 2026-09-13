@@ -97,11 +97,12 @@ func TenantLabels(tenantID, slug string) map[string]string {
 	return map[string]string{TenantLabelKey: tenantID, "qm-tenant": slug}
 }
 
-// ServiceAccountDescription is the marker a tenant's service account carries,
-// since service accounts take no labels. Same purpose as TenantLabels: it is
-// what tells this tenant's account apart from an account that merely happens
-// to have the name a slug derives.
-func ServiceAccountDescription(tenantID, slug string) string {
+// TenantDescription is the marker for the per-tenant resources that take a
+// description but no labels: service accounts, serverless NEGs and backend
+// services. Same purpose as TenantLabels — it is what tells this tenant's
+// resource apart from one that merely happens to have the name a slug
+// derives.
+func TenantDescription(tenantID, slug string) string {
 	return "QM tenant " + slug + " (" + tenantID + ")"
 }
 

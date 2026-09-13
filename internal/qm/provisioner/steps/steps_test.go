@@ -522,6 +522,25 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 			"does not belong to this tenant",
 		},
 		{
+			"a backend service with the name the slug derives",
+			func(f *tenantFixture) {
+				f.lb.mu.Lock()
+				f.lb.owners["qm-pilot-team"] = "somebody else"
+				f.lb.mu.Unlock()
+			},
+			"does not belong to this tenant",
+		},
+		{
+			"a bucket somebody else creates in the gap after the look-up",
+			func(f *tenantFixture) {
+				f.buckets.failNext("buckets.Get", 1)
+				f.buckets.mu.Lock()
+				f.buckets.buckets["example-project-qm-pilot-team"] = map[string]string{"owner": "somebody else"}
+				f.buckets.mu.Unlock()
+			},
+			"",
+		},
+		{
 			"a cloud run service with the name the slug derives",
 			func(f *tenantFixture) {
 				f.services.mu.Lock()
@@ -538,7 +557,7 @@ func TestProvisionRefusesResourcesItDoesNotOwn(t *testing.T) {
 			if err == nil {
 				t.Fatal("the provision adopted a resource it does not own")
 			}
-			if !strings.Contains(err.Error(), tc.wants) {
+			if tc.wants != "" && !strings.Contains(err.Error(), tc.wants) {
 				t.Errorf("err = %v", err)
 			}
 			if f.current(t).Status != tenantstore.StatusFailed {

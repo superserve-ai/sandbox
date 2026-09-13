@@ -124,8 +124,20 @@ func (s bucket) Run(ctx context.Context, t *provisioner.Tenant) error {
 		if err := s.c.Buckets.Create(ctx, name, t.Env.BucketLocation, t.Env.BucketLifecycleJSON, labels); err != nil {
 			return fmt.Errorf("create the tenant's bucket: %w", err)
 		}
-	case existing[TenantLabelKey] != t.Row.ID.String():
-		return fmt.Errorf("bucket %s already exists and does not belong to this tenant", name)
+		// Read back rather than trusting the create: it tolerates an
+		// already-exists, which is how a bucket somebody else made in the
+		// gap between the look-up above and here would otherwise be
+		// adopted — and granted to this tenant on the next line.
+		if existing, exists, err = s.c.Buckets.Get(ctx, name); err != nil {
+			return fmt.Errorf("look up the tenant's bucket: %w", err)
+		} else if !exists {
+			return fmt.Errorf("bucket %s was created but cannot be read", name)
+		}
+		fallthrough
+	default:
+		if existing[TenantLabelKey] != t.Row.ID.String() {
+			return fmt.Errorf("bucket %s already exists and does not belong to this tenant", name)
+		}
 	}
 	if err := s.c.Buckets.GrantAccess(ctx, name, account); err != nil {
 		return fmt.Errorf("grant the tenant access to its bucket: %w", err)
