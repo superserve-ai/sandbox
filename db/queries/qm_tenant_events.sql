@@ -1,18 +1,24 @@
 -- name: InsertQMTenantEvent :one
--- Locks the tenant row for the rest of the transaction. Retirement
--- (SoftDeleteQMTenant) updates that same row, so the two serialize: an
--- insert that starts first commits before the tenant can become deleted, and
--- one that arrives during retirement waits, re-reads the row, and inserts
--- nothing. The row-level policy alone cannot give that guarantee, since it
--- evaluates the tenant's status on a snapshot. The lock also makes the seq
--- assignment safe against a concurrent insert for the same tenant. No row
--- means the tenant is retired.
+-- Bumps the tenant's event counter in the same statement that writes the
+-- event, which does three things at once. It locks the tenant row for the
+-- rest of the transaction, so retirement (SoftDeleteQMTenant) and this
+-- insert serialize: an insert that starts first commits before the tenant
+-- can become deleted, and one that arrives during retirement waits, re-reads
+-- the row, and inserts nothing. The row-level policy alone cannot give that
+-- guarantee, since it evaluates the tenant's status on a snapshot. And it
+-- assigns seq from a value the UPDATE re-reads after any lock wait, unlike
+-- max(seq) over qm.tenant_events, which would be read on the snapshot the
+-- statement took before waiting and so collide with the insert it waited
+-- for. No row means the tenant is retired.
+WITH live AS (
+    UPDATE qm.tenants t
+    SET event_seq = t.event_seq + 1
+    WHERE t.id = sqlc.arg(tenant_id) AND t.status <> 'deleted'
+    RETURNING t.id, t.event_seq
+)
 INSERT INTO qm.tenant_events (tenant_id, step, status, message, detail, seq)
-SELECT t.id, sqlc.arg(step)::text, sqlc.arg(status)::text, sqlc.narg(message)::text, sqlc.narg(detail)::jsonb,
-       (SELECT coalesce(max(seq), 0) + 1 FROM qm.tenant_events WHERE tenant_id = t.id)
-FROM qm.tenants t
-WHERE t.id = sqlc.arg(tenant_id) AND t.status <> 'deleted'
-FOR NO KEY UPDATE OF t
+SELECT live.id, sqlc.arg(step)::text, sqlc.arg(status)::text, sqlc.narg(message)::text, sqlc.narg(detail)::jsonb, live.event_seq
+FROM live
 RETURNING *;
 
 -- name: ListQMTenantEvents :many

@@ -19,7 +19,7 @@ INSERT INTO qm.tenants (
 VALUES (
     $1, $2, $3, $4, $5, $6, COALESCE($7::text, 'pi'), $8
 )
-RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at
+RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, event_seq, created_by, created_at, updated_at
 `
 
 type CreateQMTenantParams struct {
@@ -62,6 +62,7 @@ func (q *Queries) CreateQMTenant(ctx context.Context, arg CreateQMTenantParams) 
 		&i.BucketName,
 		&i.ServiceAccount,
 		&i.SandboxApiKeyID,
+		&i.EventSeq,
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -93,7 +94,7 @@ func (q *Queries) DeleteQMTenantSecretRef(ctx context.Context, arg DeleteQMTenan
 }
 
 const getQMTenant = `-- name: GetQMTenant :one
-SELECT id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at FROM qm.tenants
+SELECT id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, event_seq, created_by, created_at, updated_at FROM qm.tenants
 WHERE id = $1 AND team_id = $2
 `
 
@@ -122,6 +123,7 @@ func (q *Queries) GetQMTenant(ctx context.Context, arg GetQMTenantParams) (QmTen
 		&i.BucketName,
 		&i.ServiceAccount,
 		&i.SandboxApiKeyID,
+		&i.EventSeq,
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -130,7 +132,7 @@ func (q *Queries) GetQMTenant(ctx context.Context, arg GetQMTenantParams) (QmTen
 }
 
 const getQMTenantBySlug = `-- name: GetQMTenantBySlug :one
-SELECT id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at FROM qm.tenants
+SELECT id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, event_seq, created_by, created_at, updated_at FROM qm.tenants
 WHERE slug = $1 AND team_id = $2
 `
 
@@ -159,6 +161,7 @@ func (q *Queries) GetQMTenantBySlug(ctx context.Context, arg GetQMTenantBySlugPa
 		&i.BucketName,
 		&i.ServiceAccount,
 		&i.SandboxApiKeyID,
+		&i.EventSeq,
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -223,7 +226,7 @@ func (q *Queries) ListQMTenantSecretRefs(ctx context.Context, tenantID uuid.UUID
 }
 
 const listQMTenantsByTeam = `-- name: ListQMTenantsByTeam :many
-SELECT id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at FROM qm.tenants
+SELECT id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, event_seq, created_by, created_at, updated_at FROM qm.tenants
 WHERE team_id = $1 AND status <> 'deleted'
 ORDER BY created_at DESC
 `
@@ -254,6 +257,7 @@ func (q *Queries) ListQMTenantsByTeam(ctx context.Context, teamID uuid.UUID) ([]
 			&i.BucketName,
 			&i.ServiceAccount,
 			&i.SandboxApiKeyID,
+			&i.EventSeq,
 			&i.CreatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
@@ -337,7 +341,7 @@ const softDeleteQMTenant = `-- name: SoftDeleteQMTenant :one
 UPDATE qm.tenants
 SET status = 'deleted', updated_at = now()
 WHERE id = $1 AND team_id = $2 AND status <> 'deleted'
-RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at
+RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, event_seq, created_by, created_at, updated_at
 `
 
 type SoftDeleteQMTenantParams struct {
@@ -369,6 +373,7 @@ func (q *Queries) SoftDeleteQMTenant(ctx context.Context, arg SoftDeleteQMTenant
 		&i.BucketName,
 		&i.ServiceAccount,
 		&i.SandboxApiKeyID,
+		&i.EventSeq,
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -387,7 +392,7 @@ SET public_url         = COALESCE($3, public_url),
     sandbox_api_key_id = COALESCE($9, sandbox_api_key_id),
     updated_at         = now()
 WHERE id = $1 AND team_id = $2 AND status <> 'deleted'
-RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at
+RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, event_seq, created_by, created_at, updated_at
 `
 
 type UpdateQMTenantResourcesParams struct {
@@ -434,6 +439,7 @@ func (q *Queries) UpdateQMTenantResources(ctx context.Context, arg UpdateQMTenan
 		&i.BucketName,
 		&i.ServiceAccount,
 		&i.SandboxApiKeyID,
+		&i.EventSeq,
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
@@ -445,7 +451,7 @@ const updateQMTenantStatus = `-- name: UpdateQMTenantStatus :one
 UPDATE qm.tenants
 SET status = $3, updated_at = now()
 WHERE id = $1 AND team_id = $2 AND status <> 'deleted'
-RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, created_by, created_at, updated_at
+RETURNING id, team_id, slug, org_name, admin_email, sign_in, model_provider, harness, status, public_url, image_tag, cloud_run_service, db_name, bucket_name, service_account, sandbox_api_key_id, event_seq, created_by, created_at, updated_at
 `
 
 type UpdateQMTenantStatusParams struct {
@@ -475,6 +481,7 @@ func (q *Queries) UpdateQMTenantStatus(ctx context.Context, arg UpdateQMTenantSt
 		&i.BucketName,
 		&i.ServiceAccount,
 		&i.SandboxApiKeyID,
+		&i.EventSeq,
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,

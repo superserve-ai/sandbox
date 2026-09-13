@@ -78,6 +78,12 @@ CREATE TABLE IF NOT EXISTS qm.tenants (
     bucket_name        text,
     service_account    text,
     sandbox_api_key_id uuid,
+    -- Per-tenant event counter, bumped by InsertQMTenantEvent in the same
+    -- statement that writes the event. An UPDATE re-reads the row after a
+    -- lock wait, so two concurrent inserts get distinct sequences; deriving
+    -- the next sequence from max(seq) over qm.tenant_events would instead
+    -- read the snapshot the statement took before the wait and collide.
+    event_seq          bigint NOT NULL DEFAULT 0,
     created_by         uuid REFERENCES public.profile(id),
     created_at         timestamptz NOT NULL DEFAULT now(),
     updated_at         timestamptz NOT NULL DEFAULT now(),
@@ -114,9 +120,9 @@ CREATE TABLE IF NOT EXISTS qm.tenant_events (
     status    text NOT NULL,
     message   text,
     detail    jsonb,
-    -- Per-tenant insertion counter assigned by InsertQMTenantEvent under the
-    -- tenant's row lock; it is the ordering key and survives copying between
-    -- cells unlike a global sequence.
+    -- Per-tenant insertion counter taken from qm.tenants.event_seq; it is
+    -- the ordering key and survives copying between cells unlike a global
+    -- sequence.
     seq       bigint NOT NULL,
     at        timestamptz NOT NULL DEFAULT clock_timestamp(),
 
@@ -200,7 +206,7 @@ ALTER TABLE qm.tenants        ENABLE ROW LEVEL SECURITY;
 -- Child rows are append-only while a tenant is live; a retired tenant
 -- accepts no further events or secret references, which is what lets team
 -- migration treat its cutover sweep of these tables as final. The status
--- predicate below is a backstop only: a policy reads the tenant on the
+-- predicates below are a backstop only: a policy reads the tenant on the
 -- statement's snapshot, so a write that overlaps retirement could still pass
 -- it. The queries close that window by locking the tenant row before they
 -- write (see InsertQMTenantEvent), which makes retirement wait for in-flight
@@ -208,12 +214,30 @@ ALTER TABLE qm.tenants        ENABLE ROW LEVEL SECURITY;
 ALTER TABLE qm.tenant_events  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE qm.tenant_secrets ENABLE ROW LEVEL SECURITY;
 
+-- Split by command rather than FOR ALL: a single USING clause would let an
+-- ad-hoc UPDATE resurrect a retired tenant, because USING is read against the
+-- old row and WITH CHECK cannot tell a fresh 'ready' from a restored one.
+-- Retirement itself passes, since the row it reads is still live.
 DROP POLICY IF EXISTS qm_api_team_scope ON qm.tenants;
-CREATE POLICY qm_api_team_scope ON qm.tenants
-    FOR ALL TO qm_api
-    USING (team_id = qm.current_team_id())
+DROP POLICY IF EXISTS qm_api_team_read ON qm.tenants;
+CREATE POLICY qm_api_team_read ON qm.tenants
+    FOR SELECT TO qm_api
+    USING (team_id = qm.current_team_id());
+
+DROP POLICY IF EXISTS qm_api_team_insert ON qm.tenants;
+CREATE POLICY qm_api_team_insert ON qm.tenants
+    FOR INSERT TO qm_api
     WITH CHECK (team_id = qm.current_team_id());
 
+DROP POLICY IF EXISTS qm_api_team_update ON qm.tenants;
+CREATE POLICY qm_api_team_update ON qm.tenants
+    FOR UPDATE TO qm_api
+    USING (team_id = qm.current_team_id() AND status <> 'deleted')
+    WITH CHECK (team_id = qm.current_team_id());
+
+-- FOR ALL is safe here, unlike on the two tables around it: qm_api holds only
+-- SELECT and INSERT on the event log, so the policy is never consulted for an
+-- UPDATE or DELETE whose command-specific clause would have to differ.
 DROP POLICY IF EXISTS qm_api_team_scope ON qm.tenant_events;
 CREATE POLICY qm_api_team_scope ON qm.tenant_events
     FOR ALL TO qm_api
@@ -226,14 +250,44 @@ CREATE POLICY qm_api_team_scope ON qm.tenant_events
         WHERE t.id = tenant_id AND t.team_id = qm.current_team_id() AND t.status <> 'deleted'
     ));
 
+-- Split by command for the same reason, plus one specific to this table: it
+-- is the only qm table qm_api may UPDATE and DELETE rows of, and DELETE
+-- consults USING alone, so a live-tenant condition in WITH CHECK would leave
+-- an ad-hoc DELETE free to unfreeze a retired tenant's references. Reads stay
+-- team-scoped only, so a retired tenant's references remain visible.
 DROP POLICY IF EXISTS qm_api_team_scope ON qm.tenant_secrets;
-CREATE POLICY qm_api_team_scope ON qm.tenant_secrets
-    FOR ALL TO qm_api
+DROP POLICY IF EXISTS qm_api_secret_read ON qm.tenant_secrets;
+CREATE POLICY qm_api_secret_read ON qm.tenant_secrets
+    FOR SELECT TO qm_api
     USING (EXISTS (
         SELECT 1 FROM qm.tenants t
         WHERE t.id = tenant_id AND t.team_id = qm.current_team_id()
+    ));
+
+DROP POLICY IF EXISTS qm_api_secret_insert ON qm.tenant_secrets;
+CREATE POLICY qm_api_secret_insert ON qm.tenant_secrets
+    FOR INSERT TO qm_api
+    WITH CHECK (EXISTS (
+        SELECT 1 FROM qm.tenants t
+        WHERE t.id = tenant_id AND t.team_id = qm.current_team_id() AND t.status <> 'deleted'
+    ));
+
+DROP POLICY IF EXISTS qm_api_secret_update ON qm.tenant_secrets;
+CREATE POLICY qm_api_secret_update ON qm.tenant_secrets
+    FOR UPDATE TO qm_api
+    USING (EXISTS (
+        SELECT 1 FROM qm.tenants t
+        WHERE t.id = tenant_id AND t.team_id = qm.current_team_id() AND t.status <> 'deleted'
     ))
     WITH CHECK (EXISTS (
+        SELECT 1 FROM qm.tenants t
+        WHERE t.id = tenant_id AND t.team_id = qm.current_team_id() AND t.status <> 'deleted'
+    ));
+
+DROP POLICY IF EXISTS qm_api_secret_delete ON qm.tenant_secrets;
+CREATE POLICY qm_api_secret_delete ON qm.tenant_secrets
+    FOR DELETE TO qm_api
+    USING (EXISTS (
         SELECT 1 FROM qm.tenants t
         WHERE t.id = tenant_id AND t.team_id = qm.current_team_id() AND t.status <> 'deleted'
     ));

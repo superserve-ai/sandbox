@@ -537,6 +537,7 @@ type QmTenant struct {
 	BucketName      *string     `json:"bucket_name"`
 	ServiceAccount  *string     `json:"service_account"`
 	SandboxApiKeyID pgtype.UUID `json:"sandbox_api_key_id"`
+	EventSeq        int64       `json:"event_seq"`
 	CreatedBy       pgtype.UUID `json:"created_by"`
 	CreatedAt       time.Time   `json:"created_at"`
 	UpdatedAt       time.Time   `json:"updated_at"`

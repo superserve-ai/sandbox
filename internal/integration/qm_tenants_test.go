@@ -427,7 +427,7 @@ func TestQMAPI_DeletedTenantStaysDeleted(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedQMTeamAndKey(t)
 	conn := connectAsQMAPI(t)
-	_, q := scopedQMTx(t, conn, teamID)
+	tx, q := scopedQMTx(t, conn, teamID)
 
 	tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
 	if err != nil {
@@ -435,6 +435,13 @@ func TestQMAPI_DeletedTenantStaysDeleted(t *testing.T) {
 	}
 	if _, err := q.SoftDeleteQMTenant(ctx, db.SoftDeleteQMTenantParams{ID: tenant.ID, TeamID: teamID}); err != nil {
 		t.Fatalf("soft delete: %v", err)
+	}
+	// The generated queries are not the only way to reach the row; what
+	// refuses an ad-hoc resurrection is the UPDATE policy, which reads the
+	// tenant's status from the row as it stands before the update.
+	tag, err := tx.Exec(ctx, `UPDATE qm.tenants SET status = 'ready' WHERE id = $1`, tenant.ID)
+	if err != nil || tag.RowsAffected() != 0 {
+		t.Fatalf("ad-hoc resurrect: want 0 rows, got n=%d err=%v", tag.RowsAffected(), err)
 	}
 	_, err = q.UpdateQMTenantStatus(ctx, db.UpdateQMTenantStatusParams{ID: tenant.ID, TeamID: teamID, Status: "ready"})
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -549,7 +556,7 @@ func TestQMAPI_RetiredTenantRefusesChildWrites(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedQMTeamAndKey(t)
 	conn := connectAsQMAPI(t)
-	_, q := scopedQMTx(t, conn, teamID)
+	tx, q := scopedQMTx(t, conn, teamID)
 	tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
 	if err != nil {
 		t.Fatalf("create tenant: %v", err)
@@ -583,6 +590,21 @@ func TestQMAPI_RetiredTenantRefusesChildWrites(t *testing.T) {
 	refs, err := q.ListQMTenantSecretRefs(ctx, tenant.ID)
 	if err != nil || len(refs) != 1 || refs[0].SecretRef != "projects/p/secrets/db" {
 		t.Fatalf("secret refs after retirement: %+v err=%v", refs, err)
+	}
+	// tenant_secrets is the one qm table qm_api may UPDATE and DELETE rows
+	// of, so its per-command policies — not the queries above — are what keep
+	// a retired tenant's references frozen for the cutover sweep.
+	for _, adhoc := range []struct {
+		name string
+		sql  string
+	}{
+		{"delete", `DELETE FROM qm.tenant_secrets WHERE tenant_id = $1`},
+		{"update", `UPDATE qm.tenant_secrets SET secret_ref = 'projects/p/secrets/rotated' WHERE tenant_id = $1`},
+	} {
+		tag, err := tx.Exec(ctx, adhoc.sql, tenant.ID)
+		if err != nil || tag.RowsAffected() != 0 {
+			t.Fatalf("ad-hoc secret ref %s on a retired tenant: want 0 rows, got n=%d err=%v", adhoc.name, tag.RowsAffected(), err)
+		}
 	}
 }
 
@@ -763,6 +785,74 @@ func TestQMAPI_ChildWritesSerializeWithRetirement(t *testing.T) {
 				t.Fatalf("tenant after both commits: status=%q err=%v", status, err)
 			}
 		})
+	}
+}
+
+// Two writes of a tenant's event log can overlap — a retried provisioning
+// step racing the attempt it retried, say. They serialize on the tenant row,
+// and the second has to take its sequence from the counter the first left
+// behind: a sequence derived from the event log instead would be read on the
+// snapshot the statement took before it waited, and collide.
+func TestQMAPI_ConcurrentEventInsertsTakeDistinctSeqs(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedQMTeamAndKey(t)
+	first := connectAsQMAPI(t)
+	second := connectAsQMAPI(t)
+
+	tx, q := scopedQMTx(t, first, teamID)
+	tenant, err := q.CreateQMTenant(ctx, newTenantParams(teamID, "pilot-team-"+uuid.NewString()[:8]))
+	if err != nil {
+		t.Fatalf("create tenant: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit tenant: %v", err)
+	}
+
+	tx, q = scopedQMTx(t, first, teamID)
+	early, err := q.InsertQMTenantEvent(ctx, db.InsertQMTenantEventParams{TenantID: tenant.ID, Step: "database", Status: "started"})
+	if err != nil {
+		t.Fatalf("first event: %v", err)
+	}
+
+	type result struct {
+		seq int64
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		wtx, wq, err := beginScopedQMTx(ctx, second, teamID)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		r := func() result {
+			event, err := wq.InsertQMTenantEvent(ctx, db.InsertQMTenantEventParams{TenantID: tenant.ID, Step: "database", Status: "ok"})
+			if err != nil {
+				return result{err: err}
+			}
+			return result{seq: event.Seq, err: wtx.Commit(ctx)}
+		}()
+		// Release the connection before signalling, as the serialization
+		// tests above do.
+		_ = wtx.Rollback(ctx)
+		done <- r
+	}()
+	waitForQMAPILockWait(t)
+	select {
+	case r := <-done:
+		t.Fatalf("second event returned while the first was uncommitted: %+v", r)
+	default:
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit first event: %v", err)
+	}
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("second event after the first committed: %v", r.err)
+	}
+	if early.Seq != 1 || r.seq != 2 {
+		t.Fatalf("event sequences: first=%d second=%d, want 1 and 2", early.Seq, r.seq)
 	}
 }
 
