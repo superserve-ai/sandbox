@@ -75,6 +75,20 @@ var membershipTables = map[string]bool{
 	"user_role_assignments": true,
 }
 
+// cutoverSweepTables are re-copied from the cutover transaction's own view
+// right before detach severs the source (and before a non-detached purge
+// deletes it): rows that async writers landed after validate, which no
+// earlier pass could see. Parents precede children so the upserts satisfy
+// the dest's foreign keys. qm.tenants is here for the tenant that was
+// admitted after validate and retired before the cutover lock: it is invisible
+// to the live-tenant recheck by then, yet its row (and the slug it reserves)
+// still has to reach the dest ahead of its events and secret references.
+var cutoverSweepTables = []string{
+	"activity", "sandbox_revocation", "revoked_proxy_token",
+	"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
+	"qm.tenants", "qm.tenant_events", "qm.tenant_secrets",
+}
+
 var migratedTables = []tableSpec{
 	{"profile", profileScope},
 	{"team", "id = $1"},

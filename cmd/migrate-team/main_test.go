@@ -907,6 +907,53 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("straggler sweep carries a tenant retired after validate", func(t *testing.T) {
+		// A hosted-QM tenant admitted after validate and retired before the
+		// cutover lock passes the live-tenant recheck, so the sweep is the
+		// only thing that gets it into the dest. Its parent row has to land
+		// before its events and secret references or their FKs fail.
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		late := uuid.New()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO qm.tenants (id, team_id, slug, org_name, admin_email, sign_in, model_provider, status)
+			VALUES ($1, $2, 'retired-late', 'Pilot Team', 'admin@example.com', 'magic_link', 'anthropic', 'deleted')`, late, f.team); err != nil {
+			t.Fatalf("late tenant insert: %v", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO qm.tenant_events (tenant_id, step, status, seq) VALUES ($1, 'database', 'failed', 1)`, late); err != nil {
+			t.Fatalf("late event insert: %v", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO qm.tenant_secrets (tenant_id, name, secret_ref) VALUES ($1, 'db', 'projects/example/secrets/retired-late-db')`, late); err != nil {
+			t.Fatalf("late secret insert: %v", err)
+		}
+		defer mustExec(t, dstPool, `DELETE FROM qm.tenants WHERE id = $1`, late)
+
+		for _, name := range cutoverSweepTables {
+			spec, ok := tableByName(name)
+			if !ok {
+				t.Fatalf("%s spec missing", name)
+			}
+			if _, _, err := copyTable(ctx, tx, dstPool, spec, f.team, nil); err != nil {
+				t.Fatalf("sweep %s: %v", name, err)
+			}
+		}
+		var status string
+		var events, secrets int
+		if err := dstPool.QueryRow(ctx, `
+			SELECT t.status,
+			       (SELECT count(*) FROM qm.tenant_events WHERE tenant_id = t.id),
+			       (SELECT count(*) FROM qm.tenant_secrets WHERE tenant_id = t.id)
+			FROM qm.tenants t WHERE t.id = $1`, late).Scan(&status, &events, &secrets); err != nil {
+			t.Fatalf("late tenant not swept to dest: %v", err)
+		}
+		if status != "deleted" || events != 1 || secrets != 1 {
+			t.Fatalf("late tenant swept incompletely: status=%s events=%d secrets=%d", status, events, secrets)
+		}
+	})
+
 	t.Run("purge refuses when a build starts during validate", func(t *testing.T) {
 		buildID := uuid.New()
 		mustExec(t, srcPool, `

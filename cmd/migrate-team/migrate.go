@@ -1352,11 +1352,7 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	// A detached purge deliberately never sweeps — by then the dest is
 	// authoritative and a sweep would overwrite its live rows (e.g. the
 	// rollup backfill cursor) with the frozen source's.
-	for _, name := range []string{
-		"activity", "sandbox_revocation", "revoked_proxy_token",
-		"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
-		"qm.tenant_events", "qm.tenant_secrets",
-	} {
+	for _, name := range cutoverSweepTables {
 		spec, ok := tableByName(name)
 		if !ok {
 			return fmt.Errorf("sweep: unknown table %s", name)
@@ -1566,11 +1562,7 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	// frozen source's — post-detach source stragglers are byproducts of a
 	// dead cell, not customer data.
 	if !detached {
-		for _, name := range []string{
-			"activity", "sandbox_revocation", "revoked_proxy_token",
-			"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
-			"qm.tenant_events", "qm.tenant_secrets",
-		} {
+		for _, name := range cutoverSweepTables {
 			spec, ok := tableByName(name)
 			if !ok {
 				return fmt.Errorf("sweep: unknown table %s", name)
