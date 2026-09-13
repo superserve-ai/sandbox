@@ -182,6 +182,16 @@ func LoadConfig() (Config, error) {
 	if cfg.ProvisionerMode == ProvisionerModeCloudRun && cfg.SecretsBackend == SecretsBackendMemory {
 		return cfg, fmt.Errorf("QM_SECRETS_BACKEND=memory requires QM_PROVISIONER_MODE=inprocess")
 	}
+	// And in-process is not enough on its own. The memory store is for
+	// local runs where nothing must persist; a plan that really calls GCP
+	// creates a service account, a database, a bucket and an HMAC key, and
+	// then asks Cloud Run to mount secrets that were never written
+	// anywhere. A restart makes it worse rather than better: the tenant's
+	// recorded references survive, so the next run skips generating the
+	// values that are now gone.
+	if cfg.SecretsBackend == SecretsBackendMemory && !cfg.ProvisionerStub {
+		return cfg, fmt.Errorf("QM_SECRETS_BACKEND=memory requires QM_PROVISIONER_STUB=1: the cloud steps would build a tenant around secrets that do not outlive this process")
+	}
 	needsGCP := cfg.ProvisionerMode == ProvisionerModeCloudRun || cfg.SecretsBackend == SecretsBackendGCP
 	if needsGCP && cfg.GCPProject == "" {
 		return cfg, fmt.Errorf("GCP_PROJECT is required unless QM_PROVISIONER_MODE=inprocess and QM_SECRETS_BACKEND=memory")

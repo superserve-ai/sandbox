@@ -33,6 +33,16 @@ func TestLoadConfig(t *testing.T) {
 	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "inprocess") {
 		t.Errorf("memory secrets with the cloud run job: err = %v", err)
 	}
+	// In-process is not enough on its own: the memory store is for local
+	// runs, and the real cloud steps would build a tenant around secrets
+	// that do not outlive the process.
+	t.Setenv("QM_PROVISIONER_MODE", "inprocess")
+	t.Setenv("QM_PROVISIONER_STUB", "")
+	if _, err := LoadConfig(); err == nil || !strings.Contains(err.Error(), "QM_PROVISIONER_STUB") {
+		t.Errorf("memory secrets without the stub: err = %v", err)
+	}
+	t.Setenv("QM_PROVISIONER_STUB", "1")
+	t.Setenv("QM_PROVISIONER_MODE", "cloudrun")
 	// The job is addressed by region, so triggering one is refused until
 	// the deploy says which region it was placed in.
 	t.Setenv("QM_SECRETS_BACKEND", "gcp")
@@ -65,6 +75,8 @@ func TestLoadConfigSharedInfrastructure(t *testing.T) {
 	t.Setenv("QM_BASE_DOMAIN", "qm.example.com")
 	t.Setenv("QM_PROVISIONER_MODE", "inprocess")
 	t.Setenv("QM_SECRETS_BACKEND", "memory")
+	// The memory store is only allowed alongside the stub.
+	t.Setenv("QM_PROVISIONER_STUB", "1")
 	t.Setenv("QM_PROVISIONER_REGION", "us-central1")
 	t.Setenv("QM_SQL_INSTANCE", "qm-tenants-staging")
 	t.Setenv("QM_SQL_CONNECTION_NAME", "example-project:us-central1:qm-tenants-staging")
