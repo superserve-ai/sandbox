@@ -12,13 +12,22 @@ operation is part of this procedure. Retain the existing private IP.
 
 ## Staging creation-time identity replacement
 
-Staging Host 2 must be recreated with managed workload identity in the actual
+Staging Host 2 was recreated with managed workload identity in the actual
 Compute create request. The retrofit exposed Enabled in the control plane but
 never issued certificates, even after full stop/start. The isolated
 `staging-mwi-host` module uses Google Beta 8.2.0 for these fields; ordinary hosts
 keep their existing module/provider and destroy protection.
 
-Review and save the staging plan explicitly:
+The one-shot replacement authorization is now retired: this module has
+`prevent_destroy = true`, including while its labels are standby/provisioning.
+Normal admission changes labels in place; it never authorizes replacement.
+Any future replacement requires a separate reviewed change temporarily opening
+that lifecycle guard, with both the current and proposed host still standby and
+non-ready. The replacement checker rejects a serving/ready **before** state even
+if the proposed labels revert to standby. Restore destroy protection immediately
+after the separately authorized replacement. Never relax it for admission.
+
+Historical replacement plan procedure (blocked by the restored guard):
 
 ```sh
 terraform -chdir=infra/envs/staging/us-central1 plan -out=host2-replacement.tfplan -replace=module.sandbox_host_b.google_compute_instance.this
@@ -54,8 +63,11 @@ explicit recovery option for legacy retrofit artifacts and is rejected for
 
 ## Plan and migrate
 
-Terraform CD and the generic manual rollout workflows reject saved plans that
-change Host 2's Compute instance or managed identity adapter in either cell.
+The migration plan checker rejects saved plans that change Host 2's Compute
+instance or managed identity adapter in either cell. The temporary branch's
+staging rollout currently bypasses that checker and performs a broad apply;
+do not use that workflow for admission. Use the restricted saved-plan procedure
+below to exclude unrelated dashboard and infrastructure changes.
 This includes adapter-only changes, which can restart the VM independently.
 Routine applies can resume once both resources are no-ops. Perform this
 migration with an operator-applied saved plan after the checks below; a merge
@@ -675,7 +687,7 @@ rotation restarts only the proxy to load the new material, retrying failed
 reloads. It never restarts VMD or enters a sandbox startup/resume path.
 
 After staging Host 2 passes readiness and host-directory checks, use the
-normal rollout to admit it and drain Host 1. As part of that separate admission,
+label-only admission procedure below. As part of that separate admission,
 change staging `module.sandbox_host_b.labels.component` to `vmd` in Terraform
 and review/apply the label plan through the operator path above before restoring
 the ready label. Do not enroll it with an out-of-band component label change
@@ -687,3 +699,63 @@ the production Host 2 plan. Production admission remains a separate step.
 
 References: [managed identity setup](https://docs.cloud.google.com/iam/docs/create-managed-workload-identities),
 [Compute credential lifecycle](https://docs.cloud.google.com/compute/docs/access/authenticate-workloads-over-mtls).
+
+
+## Label-only staging admission after replacement
+
+Keep `prevent_destroy = true`. The module remains restricted to the exact
+staging Host 2 name; labels no longer gate every operation on the resource.
+No boot disk, data disk, VM identity, service account or Host 1 action is part
+of admission. Host 1 draining/migration remains a separate operation.
+
+Use Terraform **1.16.2**, matching the state writer observed during admission.
+Terraform 1.15.8 cannot decode the built-in `terraform_data` resource's `store`
+attribute written by 1.16.2. This is Terraform core schema skew, not Google
+provider skew. Reinitialize with the existing lockfile; do not remove attributes,
+remove/import resources, or run state repair. Discard plans generated with the
+older CLI and regenerate with the compatible version. Keep saved plans private:
+they can contain sensitive state.
+
+1. In `infra/envs/staging/us-central1/main.tf`, change only Host 2's
+   `component` from `vmd-staging-standby` to `vmd`; retain
+   `sandbox_status = "provisioning"`. This enables normal deployment discovery,
+   so coordinate any concurrent deployment before changing it.
+2. From the repository root, with Terraform 1.16.2 on PATH:
+
+   ```sh
+   set -euo pipefail
+   umask 077
+   terraform version
+   terraform -chdir=infra/envs/staging/us-central1 init -input=false -lockfile=readonly
+   terraform -chdir=infra/envs/staging/us-central1 plan -input=false \
+     -target=module.sandbox_host_b.google_compute_instance.this \
+     -out=host2-admission.tfplan
+   terraform -chdir=infra/envs/staging/us-central1 show -json host2-admission.tfplan \
+     | python3 scripts/check_host2_admission_plan.py
+   terraform -chdir=infra/envs/staging/us-central1 show -no-color host2-admission.tfplan
+   ```
+
+   Targeting is appropriate only for this exceptional, isolated admission. It
+   includes dependencies and is **not** by itself a label-only guarantee. The
+   checker requires exactly one in-place Host 2 update, only the admission
+   labels (and computed fingerprint), and no other resource actions. It rejects
+   dashboard updates, disk actions, replacement, identity/attestation changes,
+   service-account changes and unknown non-label results. Expect
+   `Plan: 0 to add, 1 to change, 0 to destroy.` Do not use `-replace`,
+   `-refresh=false`, the generic rollout, or an old broad plan for admission.
+3. After reviewing the passing saved plan, the authorized operator applies
+   **that exact plan**, without replanning:
+
+   ```sh
+   terraform -chdir=infra/envs/staging/us-central1 apply host2-admission.tfplan
+   ```
+
+4. Verify Host 2 heartbeat/readiness again. Change only its Terraform
+   `sandbox_status` from `provisioning` to `ready`, leaving `component = "vmd"`.
+   Repeat steps 2–3 with a newly generated saved plan. The checker permits
+   `vmd/provisioning -> vmd/ready` and rejects skipping directly from standby
+   to ready. Preserve both label changes in the authoritative configuration
+   so a later apply cannot revert admission.
+
+Review unrelated monitoring drift separately after admission; a targeted plan
+is not evidence that the whole staging configuration has converged.

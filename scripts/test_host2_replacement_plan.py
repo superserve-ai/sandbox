@@ -27,11 +27,13 @@ class ReplacementPlanTest(unittest.TestCase):
         validate(self.plan())
 
     def test_rejects_disk_replacement_admission_missing_mwi_and_stale_attestation(self):
-        for case in ('disk', 'ready', 'serving', 'mwi', 'stale-id', 'host1', 'attachment', 'unrelated-destroy'):
+        for case in ('disk', 'ready', 'serving', 'mwi', 'stale-id', 'host1', 'attachment', 'unrelated-destroy', 'before-serving', 'before-ready'):
             with self.subTest(case=case):
                 plan = self.plan()
                 changes = {r['address']: r['change'] for r in plan['resource_changes']}
                 if case == 'disk': changes[DISK]['actions'] = ['delete', 'create']
+                if case == 'before-serving': changes[HOST]['before']['labels']['component'] = 'vmd'
+                if case == 'before-ready': changes[HOST]['before']['labels']['sandbox_status'] = 'ready'
                 if case == 'ready': changes[HOST]['after']['labels']['sandbox_status'] = 'ready'
                 if case == 'serving': changes[HOST]['after']['labels']['component'] = 'vmd'
                 if case == 'mwi': changes[HOST]['after']['workload_identity_config'][0]['identity_certificate_enabled'] = False

@@ -8,7 +8,7 @@ terraform {
   }
 }
 
-# Isolated replacement module: ordinary hosts retain prevent_destroy and Google 6/7.
+# Creation-time MWI module, restricted to the staging replacement host.
 resource "google_compute_instance" "this" {
   provider = google-beta
 
@@ -94,11 +94,11 @@ resource "google_compute_instance" "this" {
   }
 
   lifecycle {
-    # Replacement is only authorized through an explicit saved -replace plan.
-    prevent_destroy = false
+    # Replacement authorization was retired after recreation. Admission is label-only.
+    prevent_destroy = true
     precondition {
-      condition     = var.environment == "staging" && var.instance_name == "superserve-vmd-staging-2" && lookup(var.labels, "component", "") == "vmd-staging-standby" && lookup(var.labels, "sandbox_status", "") != "ready"
-      error_message = "This module may only replace the non-ready staging standby."
+      condition     = var.environment == "staging" && var.instance_name == "superserve-vmd-staging-2"
+      error_message = "This module is restricted to staging Host 2."
     }
 
     ignore_changes = [

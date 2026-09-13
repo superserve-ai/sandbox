@@ -1,7 +1,7 @@
 mock_provider "google-beta" {}
 
 variables {
-  sandbox_data_disk = "projects/example-project/zones/us-central1-a/disks/example-data"
+  sandbox_data_disk         = "projects/example-project/zones/us-central1-a/disks/example-data"
   project_id                = "example-project"
   environment               = "staging"
   region                    = "us-central1"
@@ -37,13 +37,29 @@ run "creation_request" {
 run "preserved_disk_attachment" {
   command = plan
   assert {
-    condition = google_compute_instance.this.attached_disk[0].source == var.sandbox_data_disk && google_compute_instance.this.attached_disk[0].device_name == "superserve-sandbox-data"
+    condition     = google_compute_instance.this.attached_disk[0].source == var.sandbox_data_disk && google_compute_instance.this.attached_disk[0].device_name == "superserve-sandbox-data"
     error_message = "VM creation must reattach the existing independent data disk."
   }
 }
 
-run "reject_serving" {
+run "admission_provisioning" {
+  command = plan
+  variables { labels = { component = "vmd", sandbox_status = "provisioning" } }
+}
+
+run "admission_ready" {
   command = plan
   variables { labels = { component = "vmd", sandbox_status = "ready" } }
+}
+
+run "reject_other_host" {
+  command = plan
+  variables { instance_name = "other-host" }
+  expect_failures = [google_compute_instance.this]
+}
+
+run "reject_other_environment" {
+  command = plan
+  variables { environment = "production" }
   expect_failures = [google_compute_instance.this]
 }
