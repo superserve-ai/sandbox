@@ -118,6 +118,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
           terraform apply -input=false -auto-approve tfplan
 
   staging-us-central1-api:
@@ -284,6 +285,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
           terraform apply -input=false -auto-approve tfplan
 
   production-us-west2-api:
