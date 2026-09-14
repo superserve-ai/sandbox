@@ -152,6 +152,30 @@ operator principals explicitly, audit inherited IAM, and import existing custody
 resources rather than recreating an active CA. Keep host private keys root-owned
 at mode `0600`; never put leaf keys or certificates in Terraform.
 
+For the east standby, export the manual provider identity contract from
+`infra/envs/production/us-east4` after applying the reviewed CA configuration:
+
+```sh
+terraform output -json peer_identity_artifact > east-peer-identity.json
+terraform output -json peer_ca_issuance_policy > east-peer-policy.json
+jq -e --slurpfile policy east-peer-policy.json \
+  '.spiffe_uri == $policy[0].spiffe_uri and .credential_policy == $policy[0].credential_policy' \
+  east-peer-identity.json
+```
+
+Use this artifact unchanged as `/etc/superserve/peer/identity.json` on the
+reviewed east standby when preparing its manual credential installation. The
+issuer policy and the host validator must use the same exact URI; do not copy
+west's identity or infer it from the instance name. This file contains no keys
+and does not authorize a host: review the immutable instance identity and issuer
+host allowlist separately. The serving east host's existing identity and trust
+remain unchanged until a separate reviewed trust rollout.
+
+`bootstrap-host2.py` currently accepts only staging and west Host 2. Do not use
+it for the east standby or bypass its target checks. East runtime preparation,
+credential installation, trust distribution, and admission remain separate
+operator steps; the outputs here are not a complete east bootstrap payload.
+
 Install a supplied bundle on the host using:
 
 ```sh
