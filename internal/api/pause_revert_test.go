@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 
@@ -238,5 +240,77 @@ func TestPauseSandbox_UnresolvedHostWithUnwritableRevertAnswersPausing(t *testin
 	}
 	if attempts != 3 {
 		t.Fatalf("revert attempts = %d, want 3 before giving up", attempts)
+	}
+}
+
+// A BeginPause whose reply was lost after it committed has still claimed the
+// row under this request's operation id: the pause goes on to the host, not
+// to a 500 that the reconciler later contradicts. A claim that did not land
+// is a plain failure.
+func TestPauseSandbox_LostClaimReplyIsConfirmedFromTheRow(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		landed     bool
+		wantCode   int
+		wantPauses int32
+	}{
+		{name: "claim committed", landed: true, wantCode: http.StatusNoContent, wantPauses: 1},
+		{name: "claim did not land", landed: false, wantCode: http.StatusInternalServerError, wantPauses: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sandboxID, teamID := uuid.New(), uuid.New()
+			active := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+			var minted pgtype.UUID
+			var pauses, finalizes int32
+			mock := &mockDBTX{
+				queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+					switch {
+					case strings.Contains(sql, "upserted AS"), strings.Contains(sql, "INSERT INTO snapshot"):
+						atomic.AddInt32(&finalizes, 1)
+						return finalizePauseRow(uuid.New())
+					case strings.Contains(sql, "-- name: GetSandbox :one"):
+						if !tc.landed {
+							return sandboxRow(active)
+						}
+						claimed := active
+						claimed.Status = db.SandboxStatusPausing
+						claimed.PauseOpID = minted
+						claimed.PauseOpLeaseVersion = 1
+						return sandboxRow(claimed)
+					case strings.Contains(sql, "'pausing'"):
+						for _, a := range args {
+							if id, ok := a.(pgtype.UUID); ok && id.Valid {
+								minted = id
+							}
+						}
+						return errorRow(errors.New("connection reset"))
+					case strings.Contains(sql, "FROM sandbox"):
+						return sandboxRow(active)
+					}
+					return activityRow()
+				},
+				execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+					return pgconn.NewCommandTag("UPDATE 1"), nil
+				},
+			}
+			h := &Handlers{DB: db.New(mock), VMD: &stubVMD{pauseFn: func(context.Context, string, string) (string, string, error) {
+				atomic.AddInt32(&pauses, 1)
+				return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+			}}}
+
+			w := httptest.NewRecorder()
+			setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+			h.WaitAsyncBookkeeping()
+
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.wantCode, w.Body.String())
+			}
+			if atomic.LoadInt32(&pauses) != tc.wantPauses {
+				t.Fatalf("host pauses = %d, want %d", pauses, tc.wantPauses)
+			}
+			if tc.landed && atomic.LoadInt32(&finalizes) != 1 {
+				t.Fatalf("finalizes = %d, want the confirmed claim finalized", finalizes)
+			}
+		})
 	}
 }

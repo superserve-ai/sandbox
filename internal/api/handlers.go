@@ -322,6 +322,19 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 	return c, nil
 }
 
+// claimedPause answers for a BeginPause whose reply was lost: the row was
+// claimed by this request if it is 'pausing' under the operation id the
+// request minted.
+func (h *Handlers) claimedPause(ctx context.Context, id, teamID, op uuid.UUID) (db.BeginPauseRow, bool) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncTimeout)
+	defer cancel()
+	sb, err := h.DB.GetSandbox(rctx, db.GetSandboxParams{ID: id, TeamID: teamID})
+	if err != nil || sb.Status != db.SandboxStatusPausing || !sb.PauseOpID.Valid || uuid.UUID(sb.PauseOpID.Bytes) != op {
+		return db.BeginPauseRow{}, false
+	}
+	return db.BeginPauseRow(sb), true
+}
+
 // revertPause undoes BeginPause's claim when nothing was dispatched, in one
 // fenced statement, retried briefly, and reports whether the write landed. A
 // false return means the operation stands and the reconciler completes the
@@ -3114,6 +3127,16 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		LeaseSeconds: pauseLeaseSeconds,
 		ActorID:      actorUUID(actorIDFromContext(c)),
 	})
+	if err != nil && err != pgx.ErrNoRows {
+		// The reply may have been lost after the claim committed. The row then
+		// carries the operation this request minted, which nothing else can
+		// produce; a claim confirmed that way proceeds, or the reconciler
+		// would pause the VM behind a caller told "failed".
+		if claimed, ok := h.claimedPause(c.Request.Context(), sandboxID, teamID, pauseOp); ok {
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("BeginPause reply lost after the claim committed")
+			sandbox, err = claimed, nil
+		}
+	}
 	if err == nil {
 		pauseHostID = sandbox.HostID // label error outcomes past the claim too
 	}
