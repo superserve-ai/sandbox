@@ -170,7 +170,8 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 	}
 
 	capable, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: testDefaultHostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
+		AllowedStatuses: []string{"active"},
+		HostID:          testDefaultHostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
 	})
 	if err != nil {
 		return fmt.Errorf("verify preview capability: %w", err)
@@ -184,7 +185,8 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) {
 	ctx := context.Background()
 	missing, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: "missing-host-" + uuid.New().String()[:8],
+		AllowedStatuses: []string{"active"},
+		HostID:          "missing-host-" + uuid.New().String()[:8],
 		RequiredCapabilities: []string{
 			preview.HostCapabilityPorts,
 		},
@@ -216,7 +218,8 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 	}
 	hasCapability := func() bool {
 		got, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-			HostID: hostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
+			AllowedStatuses: []string{"active"},
+			HostID:          hostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
 		})
 		if err != nil {
 			t.Fatalf("check capability: %v", err)
@@ -227,7 +230,8 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 		t.Fatal("current capability on active host was not recognized")
 	}
 	batch, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: hostID,
+		AllowedStatuses: []string{"active"},
+		HostID:          hostID,
 		RequiredCapabilities: []string{
 			preview.HostCapabilityPorts,
 			preview.HostCapabilityPortAccess,
@@ -295,11 +299,15 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // stubVMD satisfies VMDClient without a real VM daemon. Stubs return plausible
 // values so that HTTP handlers can complete and write to the DB.
 type stubVMD struct {
-	updatePreviewFn func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
-	updateNetworkFn func(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
-	pauseErr        error // when set, every PauseInstance fails with it
-	pauseFn         func(ctx context.Context, id, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error)
-	pauseCalls      atomic.Int32
+	resumeFn          func()
+	resumeAttestation vmdclient.ResumeAttestation
+	pauseCalls        atomic.Int32
+	resumeCalls       atomic.Int32
+	restoreCalls      atomic.Int32
+	updatePreviewFn   func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
+	updateNetworkFn   func(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+	pauseErr          error // when set, every PauseInstance fails with it
+	pauseFn           func(ctx context.Context, id, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error)
 }
 
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
@@ -314,9 +322,14 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, _, pauseToken string) (
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
 func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ string, _ map[int32]vmdclient.PortPolicy, _ int64) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
-	return "10.0.0.1", 1, 1024, vmdclient.ResumeAttestation{}, nil
+	s.resumeCalls.Add(1)
+	if s.resumeFn != nil {
+		s.resumeFn()
+	}
+	return "10.0.0.1", 1, 1024, s.resumeAttestation, nil
 }
 func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string, _ vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
+	s.restoreCalls.Add(1)
 	return "10.0.0.1", 1, 1024, preview.HostCapabilityPorts, nil
 }
 func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {

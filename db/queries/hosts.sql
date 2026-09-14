@@ -115,7 +115,7 @@ WHERE hc.host_id = sqlc.arg(host_id)
   AND NOT (hc.capability = ANY(COALESCE(sqlc.arg(capabilities)::text[], ARRAY[]::text[])));
 
 -- name: HostHasCapabilities :one
--- Lock the one active host row whose heartbeat anchors this capability set.
+-- Lock the one eligible host row whose heartbeat anchors this capability set.
 -- Callers that run this in a mutation transaction keep the host stable until
 -- VMD delivery and commit, while the relational division below proves that
 -- every requested capability belongs to that exact heartbeat.
@@ -123,8 +123,10 @@ WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
   FROM host
   WHERE id = sqlc.arg('host_id')
-    AND status = 'active'
+    AND status = ANY(sqlc.arg('allowed_statuses')::text[])
     AND last_heartbeat_at IS NOT NULL
+    AND (sqlc.narg('heartbeat_after')::timestamptz IS NULL
+         OR last_heartbeat_at > sqlc.narg('heartbeat_after'))
   FOR SHARE
 )
 SELECT EXISTS (
@@ -149,14 +151,16 @@ SELECT EXISTS (
 -- from serializing behind the host's heartbeat writer. Transactional callers
 -- that must pin the host across a commit use HostHasCapabilities.
 --
--- Also returns the host's VMD address (empty when the host is not active),
+-- Also returns the host's VMD address (empty when the host is ineligible),
 -- so the caller can record this read as the registry's address verification.
 WITH target_host AS MATERIALIZED (
   SELECT id, vmd_addr, last_heartbeat_at
   FROM host
   WHERE id = sqlc.arg('host_id')
-    AND status = 'active'
+    AND status = ANY(sqlc.arg('allowed_statuses')::text[])
     AND last_heartbeat_at IS NOT NULL
+    AND (sqlc.narg('heartbeat_after')::timestamptz IS NULL
+         OR last_heartbeat_at > sqlc.narg('heartbeat_after'))
 )
 SELECT
   EXISTS (
