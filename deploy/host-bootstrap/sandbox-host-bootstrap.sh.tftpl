@@ -131,23 +131,23 @@ fetch() {
 [ -s /var/lib/sandbox/rootfs/base.ext4 ] || fetch ${rootfs_object} /var/lib/sandbox/rootfs/base.ext4 ${rootfs_md5}
 
 # Firecracker: the same published release the fleet deploy installs, verified
-# against its published checksum, so this host carries the digest the fleet
-# preflight expects. A host prepared before a later fleet rollout is brought
-# current by running that deploy against this host alone before it joins
-# discovery.
+# against the digest the fleet approved rather than the checksum published
+# beside the asset, since release assets can be replaced. A host prepared
+# before a later fleet rollout is brought current by running that deploy
+# against this host alone before it joins discovery.
 if [ ! -x /usr/local/bin/firecracker ]; then
   tmp=$(mktemp -d)
   rel="https://github.com/superserve-ai/firecracker/releases/download/${firecracker_version}"
   for attempt in $(seq 1 20); do
-    if curl -sfL "$rel/firecracker.tar.gz" -o "$tmp/firecracker.tar.gz" \
-        && curl -sfL "$rel/firecracker.sha256" -o "$tmp/firecracker.sha256"; then
+    if curl -sfL "$rel/firecracker.tar.gz" -o "$tmp/firecracker.tar.gz"; then
       break
     fi
     echo "firecracker release download failed (attempt $attempt); retrying" >&2
     sleep 15
   done
   tar -xzf "$tmp/firecracker.tar.gz" -C "$tmp" firecracker
-  echo "$(cut -d' ' -f1 "$tmp/firecracker.sha256")  $tmp/firecracker" | sha256sum -c - >/dev/null
+  echo "${firecracker_sha256}  $tmp/firecracker" | sha256sum -c - >/dev/null \
+    || { echo "firecracker release does not match the pinned digest" >&2; exit 1; }
   install -m 0755 "$tmp/firecracker" /usr/local/bin/firecracker
   rm -rf "$tmp"
 fi

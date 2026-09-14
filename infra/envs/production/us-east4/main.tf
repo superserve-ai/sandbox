@@ -422,8 +422,10 @@ locals {
   # the bootstrap refuses a download that does not match.
   host_c_kernel_md5 = "e897201a3ba4d45f3f0e5aac78288d92"
   host_c_rootfs_md5 = "121426943f2dc7c0d6b0227063b1a482"
-  # The release the fleet runs; the fleet deploy refuses a host on any other.
+  # The release the fleet runs and the digest it verified; the fleet deploy
+  # refuses a host on any other.
   host_c_firecracker_version = "v1.15.3"
+  host_c_firecracker_sha256  = "a771380d8707a7026949c8ec9dbd2b393893238fe77ab03ba25fb026920079e0"
 
   # Non-secret vmd.env keys the bootstrap writes once. The deploy upserts
   # its own keys on top; secrets are appended by an operator.
@@ -496,6 +498,7 @@ module "sandbox_host_c" {
         data_disk_device    = "superserve-sandbox-data"
         vmd_env             = local.host_c_vmd_env
         firecracker_version = local.host_c_firecracker_version
+        firecracker_sha256  = local.host_c_firecracker_sha256
       }),
       templatefile("${path.module}/../../../../deploy/unbound/unbound-bootstrap.sh.tftpl", {
         guest_cidr         = "10.11.0.0/16"
