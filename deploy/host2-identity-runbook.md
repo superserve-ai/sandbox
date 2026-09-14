@@ -152,6 +152,11 @@ operator principals explicitly, audit inherited IAM, and import existing custody
 resources rather than recreating an active CA. Keep host private keys root-owned
 at mode `0600`; never put leaf keys or certificates in Terraform.
 
+Production Private CA API enablement has one Terraform owner:
+`module.peer_identity.google_project_service.privateca` in the `us-west2`
+state. Ensure that prerequisite is applied before provisioning the east CA;
+do not declare or import the same project service into the east state.
+
 For the east standby, export the manual provider identity contract from
 `infra/envs/production/us-east4` after applying the reviewed CA configuration:
 

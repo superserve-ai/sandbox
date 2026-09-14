@@ -15,12 +15,8 @@ variable "peer_ca_operator_members" {
   description = "Reviewed user/group IAM principals allowed to impersonate the production us-east4 peer issuer. No grant by default."
 }
 
-resource "google_project_service" "peer_privateca" {
-  project            = local.project_id
-  service            = "privateca.googleapis.com"
-  disable_on_destroy = false
-}
-
+# The production us-west2 state owns project-wide Private CA API enablement
+# through module.peer_identity.google_project_service.privateca.
 module "peer_ca" {
   source            = "../../../modules/peer-ca"
   project_id        = local.project_id
@@ -29,7 +25,6 @@ module "peer_ca" {
   issuer_account_id = "vmd-peer-issuer-prod-use4"
   spiffe_uri        = local.peer_spiffe_uri
   operator_members  = var.peer_ca_operator_members
-  depends_on        = [google_project_service.peer_privateca]
 }
 
 output "peer_ca_pool_resource_name" {
