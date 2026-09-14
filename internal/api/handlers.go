@@ -336,12 +336,14 @@ func (h *Handlers) claimedPause(ctx context.Context, id, teamID, op uuid.UUID) (
 }
 
 // revertPause undoes BeginPause's claim when nothing was dispatched, in one
-// fenced statement, retried briefly, and reports whether the write landed. A
-// false return means the operation stands and the reconciler completes the
-// pause, which is what the already-closed billing interval reflects; the
-// caller must then hear "pausing", not "failed". Detached from request
-// cancellation, but the attempts share one deadline: on the synchronous path
-// this runs inside the request, so retries must not stack their timeouts.
+// fenced statement, retried briefly, and reports whether the row is known to
+// be 'active' again. A false return means the caller must hear "pausing",
+// not "failed": either the write could not be made and the operation stands
+// for the reconciler, or the fence matched nothing because another worker
+// already took the operation over, and its pause goes on. Detached from
+// request cancellation, but the attempts share one deadline: on the
+// synchronous path this runs inside the request, so retries must not stack
+// their timeouts.
 func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UUID, lease pauseLease, actorID *uuid.UUID, l zerolog.Logger) bool {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
 	defer cancel()
@@ -356,9 +358,10 @@ func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UU
 		})
 		if err == nil {
 			if n == 0 {
-				// Another transition (delete, reaper) moved the sandbox out
-				// of 'pausing' first; its state wins over the revert.
-				l.Warn().Msg("pause revert skipped: sandbox no longer pausing")
+				// The lease was reclaimed or the row moved on (delete) first;
+				// whatever holds it now decides, so nothing here is 'active'.
+				l.Warn().Msg("pause revert skipped: operation no longer held under this lease")
+				return false
 			}
 			return true
 		}

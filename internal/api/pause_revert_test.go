@@ -322,3 +322,36 @@ func TestPauseSandbox_LostClaimReplyIsConfirmedFromTheRow(t *testing.T) {
 		})
 	}
 }
+
+// A revert that matches nothing means another worker already holds the
+// operation (the request outlasted its lease) and its pause goes on: the
+// caller hears 'pausing', not a failure the reconciler would soon contradict.
+func TestPauseSandbox_UnresolvedHostWithReclaimedLeaseAnswersPausing(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-1", Name: "sb", Status: db.SandboxStatusActive,
+		PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: RevertPauseToActive :one"):
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*int64) = 0
+					return nil
+				}}
+			case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+	}
+	h := &Handlers{DB: db.New(mock), Hosts: &stubHosts{resolve: func() (vmdclient.Client, error) {
+		return nil, errors.New("host not registered")
+	}}}
+
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+
+	if w.Code != http.StatusAccepted || !strings.Contains(w.Body.String(), `"pausing"`) {
+		t.Fatalf("status = %d body = %s; want accepted as pausing", w.Code, w.Body.String())
+	}
+}
