@@ -1,8 +1,11 @@
 package proxy
 
 import (
+	"crypto/tls"
+	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPeerTLSConfigLoadRequiresExpectedSPIFFE(t *testing.T) {
@@ -43,5 +46,26 @@ func TestPrivateBindRequiresPrivateNumericAddress(t *testing.T) {
 		if got := PrivateBind(tt.addr); got != tt.want {
 			t.Errorf("PrivateBind(%q) = %v, want %v", tt.addr, got, tt.want)
 		}
+	}
+}
+
+func TestPeerTLSRejectsPlaintext(t *testing.T) {
+	cfg := peerTestCredentials(t)
+	serverConfig, err := cfg.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	_ = server.SetDeadline(time.Now().Add(time.Second))
+	_ = client.SetDeadline(time.Now().Add(time.Second))
+	result := make(chan error, 1)
+	go func() { result <- tls.Server(server, serverConfig).Handshake() }()
+	if _, err := client.Write([]byte("GET / HTTP/1.1\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err == nil {
+		t.Fatal("peer accepted plaintext")
 	}
 }
