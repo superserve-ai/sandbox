@@ -15,6 +15,37 @@ type PeerTLSConfig struct {
 	Log                                       zerolog.Logger
 }
 
+// LoadClient constructs client credentials with server authentication enabled.
+func (c PeerTLSConfig) LoadClient() (*tls.Config, error) {
+	base, err := c.Load()
+	if err != nil {
+		return nil, err
+	}
+	// SPIFFE authenticates the URI rather than the dial target. Verify the
+	// chain explicitly because gRPC fills ServerName from that target.
+	return &tls.Config{Certificates: base.Certificates, RootCAs: base.ClientCAs, MinVersion: tls.VersionTLS13,
+		InsecureSkipVerify: true, // Chain and URI verification are mandatory below.
+		VerifyConnection: func(state tls.ConnectionState) error {
+			if len(state.PeerCertificates) == 0 {
+				return fmt.Errorf("missing peer certificate")
+			}
+			intermediates := x509.NewCertPool()
+			for _, cert := range state.PeerCertificates[1:] {
+				intermediates.AddCert(cert)
+			}
+			if _, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{Roots: base.ClientCAs, Intermediates: intermediates, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+				return fmt.Errorf("verify peer certificate chain: %w", err)
+			}
+			for _, u := range state.PeerCertificates[0].URIs {
+				if u.String() == c.ExpectedSPIFFE {
+					return nil
+				}
+			}
+			return fmt.Errorf("unauthorized peer identity")
+		},
+	}, nil
+}
+
 func (c PeerTLSConfig) Load() (*tls.Config, error) {
 	if strings.TrimSpace(c.ExpectedSPIFFE) == "" {
 		return nil, fmt.Errorf("expected peer SPIFFE URI is required")

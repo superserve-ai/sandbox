@@ -23,6 +23,19 @@ func TestSafeResultBoundsValues(t *testing.T) {
 	}
 }
 
+func TestPeerLabelsAreBounded(t *testing.T) {
+	long := "ひ" + "x" // ensure rune-aware truncation
+	for len([]rune(long)) <= 64 {
+		long += "x"
+	}
+	if got := safeHostID(long); len([]rune(got)) != 64 {
+		t.Fatalf("host label length = %d, want 64", len([]rune(got)))
+	}
+	if safeRegion("") != "unknown" {
+		t.Fatal("empty region should map to unknown")
+	}
+}
+
 func TestSafeOperationBoundsValues(t *testing.T) {
 	for _, op := range []string{"create", "pause", "resume", "delete", "fail", "timeout_pause"} {
 		if got := safeOperation(op); got != op {
@@ -562,6 +575,85 @@ func TestRecordPausedNetworkPressureEmitsControllerMetrics(t *testing.T) {
 	} {
 		if !seen[name] {
 			t.Fatalf("metric %q not found", name)
+		}
+	}
+}
+
+func TestRecordPeerEventEmitsLifecycleMetricsWithBoundedAttributes(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(ctx) })
+	meter := provider.Meter(instrumentationName)
+	gauge := func(name string) metric.Int64UpDownCounter {
+		v, err := meter.Int64UpDownCounter(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	counter := func(name string) metric.Int64Counter {
+		v, err := meter.Int64Counter(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	hist, err := meter.Float64Histogram("peer_handshake_duration_seconds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &OTelRecorder{provider: provider, serviceName: "proxy", environment: "test", peerConnections: gauge("peer_connections"), peerStreams: gauge("peer_active_streams"), peerEvents: counter("peer_events_total"), peerHandshakeDuration: hist}
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "connection", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: 1})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "stream", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: 1})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "handshake", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Duration: 250 * time.Millisecond})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "drain", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Forced: true})
+	for _, kind := range []string{"connection", "stream"} {
+		for _, delta := range []int64{1, 1, -1} {
+			r.RecordPeerEvent(ctx, PeerEvent{Kind: kind, Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: delta})
+		}
+	}
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	allowed := map[string]bool{"service.name": true, "environment": true, "kind": true, "result": true, "region": true, "host_id": true, "forced": true}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			seen[m.Name] = true
+			var attrs []attribute.Set
+			switch d := m.Data.(type) {
+			case metricdata.Gauge[int64]:
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			case metricdata.Sum[int64]:
+				if m.Name == "peer_connections" || m.Name == "peer_active_streams" {
+					if d.IsMonotonic || len(d.DataPoints) != 1 || d.DataPoints[0].Value != 2 {
+						t.Fatalf("incorrect active total: %+v", d)
+					}
+				}
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			case metricdata.Histogram[float64]:
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			}
+			for _, set := range attrs {
+				for _, kv := range set.ToSlice() {
+					if !allowed[string(kv.Key)] {
+						t.Fatalf("metric %q has unapproved attribute %q", m.Name, kv.Key)
+					}
+				}
+			}
+		}
+	}
+	for _, name := range []string{"peer_connections", "peer_active_streams", "peer_handshake_duration_seconds", "peer_events_total"} {
+		if !seen[name] {
+			t.Fatalf("metric %q not emitted", name)
 		}
 	}
 }
