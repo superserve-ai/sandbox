@@ -27,7 +27,7 @@ resource "google_compute_instance" "this" {
     network_ip = var.internal_ip
 
     dynamic "access_config" {
-      for_each = var.bootstrap_external_ip ? [1] : []
+      for_each = var.external_ip ? [1] : []
       content {}
     }
   }

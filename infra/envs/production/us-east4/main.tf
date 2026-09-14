@@ -471,9 +471,10 @@ module "sandbox_host_c" {
   on_host_maintenance = "TERMINATE"
   reservation_name    = var.host_c_reservation_name
 
-  # The subnet has no NAT; first boot needs to reach package mirrors and
-  # object storage. Ignored after creation, so it can be removed by hand.
-  bootstrap_external_ip = true
+  # The subnet has no NAT, so this address is the host's path to the
+  # internet: first-boot downloads, guest egress, and the guest DNS
+  # forwarder all go through it. Every serving host in the cell carries one.
+  external_ip = true
 
   # First boot fetches artifacts and writes logs and metrics under the
   # runtime identity's grants below; create those first so the boot is not
