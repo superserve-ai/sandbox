@@ -137,12 +137,14 @@ func TestPauseSandbox_NoPausedActivityUntilFinalized(t *testing.T) {
 		finalizeErr  error
 		landed       bool // the reply was lost after commit: the row no longer carries the operation
 		resumed      bool // and a resume already moved it on before the check
+		reclaimed    bool // or another worker took the operation over: its outcome is theirs to record
 		wantActivity int32
 	}{
 		{name: "finalize succeeds", wantActivity: 1},
 		{name: "finalize fails", finalizeErr: errors.New("db unavailable"), wantActivity: 0},
 		{name: "finalize reply lost after commit", finalizeErr: errors.New("connection reset"), landed: true, wantActivity: 1},
 		{name: "finalize reply lost and sandbox already resumed", finalizeErr: errors.New("connection reset"), landed: true, resumed: true, wantActivity: 1},
+		{name: "finalize reply lost and operation reclaimed by another worker", finalizeErr: errors.New("connection reset"), landed: true, reclaimed: true, wantActivity: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sandboxID, teamID := uuid.New(), uuid.New()
@@ -165,6 +167,10 @@ func TestPauseSandbox_NoPausedActivityUntilFinalized(t *testing.T) {
 						paused.Status = db.SandboxStatusPaused
 						if tc.resumed {
 							paused.Status = db.SandboxStatusActive
+						}
+						if tc.reclaimed {
+							paused.Status = db.SandboxStatusFailed
+							paused.PauseOpLeaseVersion++
 						}
 						paused.PauseOpID = pgtype.UUID{}
 						return sandboxRow(paused)

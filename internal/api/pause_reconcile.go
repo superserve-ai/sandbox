@@ -167,7 +167,7 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 			l.Warn().Msg("pause reconcile: row moved on before finalize")
 			return
 		}
-		if !h.pauseLanded(ctx, row.ID, row.TeamID, lease.id) {
+		if !h.pauseLanded(ctx, row.ID, row.TeamID, lease) {
 			RecordSandboxTransition(ctx, "reconcile_pause", telemetry.ResultError, row.HostID, time.Since(started))
 			l.Error().Err(err).Msg("pause reconcile: finalize failed, retrying later")
 			h.releasePauseLease(ctx, row.ID, lease, pauseRetryAfter(), l)
@@ -191,18 +191,20 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 	}
 }
 
-// pauseLanded answers for a finalize whose reply was lost. Under a held lease
-// only the holder's finalize, or a delete, moves the row on and clears the
-// operation, so a row that no longer carries op and was not deleted was
-// finalized by this holder, whatever it has been moved to since.
-func (h *Handlers) pauseLanded(ctx context.Context, id, teamID uuid.UUID, op pgtype.UUID) bool {
+// pauseLanded answers for a finalize whose reply was lost. The lease version
+// only moves when a worker claims the operation or a new pause begins, so a
+// row still at this lease's version that no longer carries the operation, and
+// was not deleted, was finalized by this holder, whatever it has been moved
+// to since. A moved version means another worker took the operation over and
+// its outcome, success or failed, is that worker's to record.
+func (h *Handlers) pauseLanded(ctx context.Context, id, teamID uuid.UUID, lease pauseLease) bool {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncTimeout)
 	defer cancel()
 	sb, err := h.DB.GetSandbox(rctx, db.GetSandboxParams{ID: id, TeamID: teamID})
-	if err != nil || sb.Status == db.SandboxStatusDeleted {
+	if err != nil || sb.Status == db.SandboxStatusDeleted || sb.PauseOpLeaseVersion != lease.version {
 		return false
 	}
-	return !sb.PauseOpID.Valid || sb.PauseOpID.Bytes != op.Bytes
+	return !sb.PauseOpID.Valid || sb.PauseOpID.Bytes != lease.id.Bytes
 }
 
 // releasePauseLease hands an undecided pause back for a later attempt.

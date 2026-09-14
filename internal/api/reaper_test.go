@@ -257,7 +257,7 @@ func TestReaper_VMDSucceeds(t *testing.T) {
 // that no longer exists.
 func TestReaper_LostFinalizeReplyStillRecordsThePause(t *testing.T) {
 	row := expiredRow("sbx-lost-reply")
-	paused := db.Sandbox{ID: row.ID, TeamID: row.TeamID, Status: db.SandboxStatusPaused}
+	paused := db.Sandbox{ID: row.ID, TeamID: row.TeamID, Status: db.SandboxStatusPaused, PauseOpLeaseVersion: row.PauseOpLeaseVersion}
 	var activities, releases int32
 
 	h := newReaperHandlers(

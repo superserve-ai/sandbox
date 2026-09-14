@@ -139,7 +139,7 @@ func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, 
 				l.Warn().Msg("FinalizePause: sandbox deleted mid-pause")
 				return
 			}
-			if !h.pauseLanded(finalizeCtx, sandboxID, teamID, lease.id) {
+			if !h.pauseLanded(finalizeCtx, sandboxID, teamID, lease) {
 				l.Error().Err(err).Msg("async DB FinalizePause failed — sandbox stays 'pausing' for reconciliation")
 				return
 			}
