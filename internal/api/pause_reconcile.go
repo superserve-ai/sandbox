@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math/rand/v2"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -272,4 +273,85 @@ func pauseActivity(trigger string) string {
 		return "paused"
 	}
 	return trigger + "_paused"
+}
+
+// pauseLeaseSeconds is how long the caller that began a pause owns it before
+// the reconciler may take over: the foreground attempts plus a margin.
+const pauseLeaseSeconds int32 = 90
+
+// leaseDeadline is when a claim stops being its holder's: the expiry the claim
+// returned, or the nominal lease from when it was taken.
+func leaseDeadline(stored pgtype.Timestamptz, claimedAt time.Time, leaseSeconds int32) time.Time {
+	if stored.Valid {
+		return stored.Time
+	}
+	return claimedAt.Add(time.Duration(leaseSeconds) * time.Second)
+}
+
+// attemptDeadline bounds one host attempt: budget from now, or what is left of
+// the lease after room for the finalize write and clock skew, whichever comes
+// first. ok is false when nothing is left.
+func attemptDeadline(leaseUntil time.Time, budget time.Duration) (time.Time, bool) {
+	now := time.Now()
+	d := now.Add(budget)
+	if lease := leaseUntil.Add(-asyncTimeout - pauseLeaseSkew); lease.Before(d) {
+		d = lease
+	}
+	return d, d.After(now)
+}
+
+// captureFor is capture for code that no longer holds the request.
+func (h *Handlers) captureFor(actorID *uuid.UUID, teamID uuid.UUID, event string, props map[string]any) {
+	if h.Analytics == nil {
+		return
+	}
+	var actor string
+	if actorID != nil {
+		actor = actorID.String()
+	}
+	h.Analytics.Capture(actor, teamID.String(), event, props)
+}
+
+// claimRefillRounds bounds the listings of one claimBatch call: a candidate
+// whose claim keeps failing for a reason other than contention would
+// otherwise be listed again without end.
+const claimRefillRounds = 4
+
+// claimBatch lists and claims until batch rows are claimed or the list runs
+// dry, and reports how many were claimed. Every replica lists the same oldest
+// candidates, so a claim lost to another replica is replaced from the next
+// listing rather than costing this replica its share of the tick.
+func claimBatch[T any](ctx context.Context, workers int, batch int32, list func(ctx context.Context, limit int32) ([]uuid.UUID, error), claim func(ctx context.Context, id uuid.UUID) (T, error), process func(row T, claimedAt time.Time)) (int, error) {
+	claimed := 0
+	for round, remaining := 0, batch; round < claimRefillRounds && remaining > 0; round++ {
+		ids, err := list(ctx, remaining)
+		if err != nil {
+			return claimed, err
+		}
+		n := claimEach(ctx, workers, ids, claim, process)
+		claimed += n
+		if int32(len(ids)) < remaining {
+			break
+		}
+		remaining -= int32(n)
+	}
+	return claimed, nil
+}
+
+// claimEach hands candidate ids to at most workers goroutines; each claims
+// its candidate at dispatch time (re-checked under lock, leased only then), so
+// one scan feeds every worker and no leased row waits. An empty claim is
+// skipped; the count of claimed rows is returned.
+func claimEach[T any](ctx context.Context, workers int, ids []uuid.UUID, claim func(ctx context.Context, id uuid.UUID) (T, error), process func(row T, claimedAt time.Time)) int {
+	var claimed atomic.Int32
+	dispatchBounded(ctx, ids, workers, func(id uuid.UUID) {
+		claimedAt := time.Now()
+		row, err := claim(ctx, id)
+		if err != nil {
+			return
+		}
+		claimed.Add(1)
+		process(row, claimedAt)
+	})
+	return int(claimed.Load())
 }

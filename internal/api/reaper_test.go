@@ -475,24 +475,6 @@ func TestReaper_RefillsAfterLosingClaimsToAnotherReplica(t *testing.T) {
 	}
 }
 
-// A candidate whose claim keeps failing for a reason other than contention is
-// listed again a bounded number of times, not forever.
-func TestClaimBatch_BoundsRefillRounds(t *testing.T) {
-	id := uuid.New()
-	lists := 0
-	claimed, err := claimBatch(context.Background(), 1, 1, func(context.Context, int32) ([]uuid.UUID, error) {
-		lists++
-		return []uuid.UUID{id}, nil
-	}, func(context.Context, uuid.UUID) (struct{}, error) {
-		return struct{}{}, pgx.ErrNoRows
-	}, func(struct{}, time.Time) {
-		t.Error("processed a row that was never claimed")
-	})
-	if err != nil || claimed != 0 || lists != claimRefillRounds {
-		t.Fatalf("claimed = %d, lists = %d, err = %v; want nothing claimed after %d listings", claimed, lists, err, claimRefillRounds)
-	}
-}
-
 // A worker that finishes claims the next candidate while another is still on
 // a slow pause; one slow host never idles the rest.
 func TestReaper_FreeWorkerStartsTheNextPause(t *testing.T) {

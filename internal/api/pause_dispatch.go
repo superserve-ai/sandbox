@@ -10,34 +10,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 var errPauseLeaseExpired = errors.New("pause lease expired before the host could be asked")
-
-// leaseDeadline is when a claim stops being its holder's: the expiry the claim
-// returned, or the nominal lease from when it was taken.
-func leaseDeadline(stored pgtype.Timestamptz, claimedAt time.Time, leaseSeconds int32) time.Time {
-	if stored.Valid {
-		return stored.Time
-	}
-	return claimedAt.Add(time.Duration(leaseSeconds) * time.Second)
-}
-
-// attemptDeadline bounds one host attempt: budget from now, or what is left of
-// the lease after room for the finalize write and clock skew, whichever comes
-// first. ok is false when nothing is left.
-func attemptDeadline(leaseUntil time.Time, budget time.Duration) (time.Time, bool) {
-	now := time.Now()
-	d := now.Add(budget)
-	if lease := leaseUntil.Add(-asyncTimeout - pauseLeaseSkew); lease.Before(d) {
-		d = lease
-	}
-	return d, d.After(now)
-}
 
 // prefersAsync reports whether the client asked for a 202 over a held
 // connection (RFC 7240 Prefer: respond-async).
@@ -165,16 +143,4 @@ func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, 
 		h.captureFor(actorID, teamID, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
 	})
 	return pauseDone
-}
-
-// captureFor is capture for code that no longer holds the request.
-func (h *Handlers) captureFor(actorID *uuid.UUID, teamID uuid.UUID, event string, props map[string]any) {
-	if h.Analytics == nil {
-		return
-	}
-	var actor string
-	if actorID != nil {
-		actor = actorID.String()
-	}
-	h.Analytics.Capture(actor, teamID.String(), event, props)
 }

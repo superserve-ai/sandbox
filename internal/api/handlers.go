@@ -3047,10 +3047,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // Sandbox Pause
 // ---------------------------------------------------------------------------
 
-// pauseLeaseSeconds is how long the caller that began a pause owns it before
-// the reconciler may take over: the foreground attempts plus a margin.
-const pauseLeaseSeconds int32 = 90
-
 // pauseWithRetry pauses a VM, retrying once on an undecided failure (PauseVM
 // is idempotent, so a timed-out pause that completed returns its snapshot).
 // Every attempt ends before leaseUntil, and the retry goes only to a freshly

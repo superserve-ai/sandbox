@@ -3644,27 +3644,6 @@ func TestPauseSandbox_VMDError(t *testing.T) {
 	}
 }
 
-// pauseMocks is the DB script shared by the async-answer tests: BeginPause
-// and reads return the sandbox, finalize is counted, everything else is inert.
-func pauseMocks(sb db.Sandbox, finalizes *int32) *mockDBTX {
-	return &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			switch {
-			// Finalize first: its fence also mentions 'pausing'.
-			case strings.Contains(sql, "upserted AS"), strings.Contains(sql, "INSERT INTO snapshot"):
-				atomic.AddInt32(finalizes, 1)
-				return finalizePauseRow(uuid.New())
-			case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
-				return sandboxRow(sb)
-			}
-			return activityRow()
-		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		},
-	}
-}
-
 // gatedPause is a host that answers only once release is closed.
 func gatedPause(release <-chan struct{}) *stubVMD {
 	return &stubVMD{pauseFn: func(ctx context.Context, _, _ string) (string, string, error) {
@@ -5081,4 +5060,25 @@ func TestCreateSandbox_TemplateLookupFailureRecordsLookupPhase(t *testing.T) {
 		}
 	}
 	t.Fatalf("no create lookup phase recorded for a failed template lookup; got %+v", rec.phases)
+}
+
+// pauseMocks is the DB script shared by the async-answer tests: BeginPause
+// and reads return the sandbox, finalize is counted, everything else is inert.
+func pauseMocks(sb db.Sandbox, finalizes *int32) *mockDBTX {
+	return &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			// Finalize first: its fence also mentions 'pausing'.
+			case strings.Contains(sql, "upserted AS"), strings.Contains(sql, "INSERT INTO snapshot"):
+				atomic.AddInt32(finalizes, 1)
+				return finalizePauseRow(uuid.New())
+			case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
 }

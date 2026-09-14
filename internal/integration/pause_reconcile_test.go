@@ -13,13 +13,13 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
-	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -43,13 +43,70 @@ func abandonedPause(t *testing.T, teamID uuid.UUID, name string) (uuid.UUID, uui
 	t.Helper()
 	id := seedActiveSandbox(t, teamID, name)
 	op := uuid.New()
-	beginPause(t, id, teamID, op)
+	beginPause(t, id, op, "pause", nil)
 	expireLease(t, id)
 	return id, op
 }
 
 func undecidedHost() *stubVMD {
 	return &stubVMD{pauseErr: status.Error(codes.DeadlineExceeded, "pause timed out")}
+}
+
+type pauseOpState struct {
+	status       string
+	opID         pgtype.UUID
+	leaseVersion int64
+	leased       bool
+	attention    bool
+}
+
+func readPauseOp(t *testing.T, id uuid.UUID) pauseOpState {
+	t.Helper()
+	var s pauseOpState
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT status::text, pause_op_id, pause_op_lease_version,
+		       pause_op_lease_until IS NOT NULL AND pause_op_lease_until > now(),
+		       pause_op_attention_at IS NOT NULL
+		FROM sandbox WHERE id = $1`, id).
+		Scan(&s.status, &s.opID, &s.leaseVersion, &s.leased, &s.attention); err != nil {
+		t.Fatalf("read sandbox: %v", err)
+	}
+	return s
+}
+
+func seedActiveSandbox(t *testing.T, teamID uuid.UUID, name string) uuid.UUID {
+	t.Helper()
+	var id uuid.UUID
+	if err := testPool.QueryRow(context.Background(), `
+		INSERT INTO sandbox (team_id, name, status, host_id)
+		VALUES ($1, $2, 'active', $3) RETURNING id`, teamID, name, testDefaultHostID).Scan(&id); err != nil {
+		t.Fatalf("seed sandbox: %v", err)
+	}
+	return id
+}
+
+func expireLease(t *testing.T, id uuid.UUID) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE sandbox SET pause_op_lease_until = now() - interval '1 second',
+		                    pause_op_started_at = now() - interval '5 minutes'
+		 WHERE id = $1`, id); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+}
+
+// beginPause records a pause operation on an active sandbox the way a claim
+// does, without going through a claim: the reconciler only ever sees the row.
+func beginPause(t *testing.T, id, op uuid.UUID, trigger string, actor *uuid.UUID) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(), `
+		UPDATE sandbox SET status = 'pausing', pause_op_id = $2, pause_op_started_at = now(),
+		       pause_op_lease_until = now() + interval '90 seconds',
+		       pause_op_lease_version = pause_op_lease_version + 1,
+		       pause_op_trigger = $3, pause_op_actor_id = $4
+		WHERE id = $1`, id, op, trigger, actor); err != nil {
+		t.Fatalf("begin pause: %v", err)
+	}
 }
 
 func TestIntegration_PauseReconcile_FinishesAnAbandonedPause(t *testing.T) {
@@ -117,6 +174,135 @@ func TestIntegration_PauseReconcile_FlagsAttentionPastThreshold(t *testing.T) {
 	}
 }
 
+// A tick claims only what its workers can start at once. Rows it has not
+// claimed can be finished and resumed elsewhere meanwhile; none of them may
+// then receive a pause RPC from this tick.
+func TestIntegration_PauseReconcile_ClaimsOnlyWhatItCanDispatch(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	for i := 0; i < 20; i++ {
+		abandonedPause(t, teamID, fmt.Sprintf("reconcile-wave-%d", i))
+	}
+	started := make(chan uuid.UUID, 4)
+	release := make(chan struct{})
+	var calls, stale atomic.Int32
+	vmd := &stubVMD{pauseFn: func(ctx context.Context, id, token string) (string, string, []vmdclient.ManifestEntry, string, error) {
+		if calls.Add(1) <= 4 {
+			started <- uuid.MustParse(id)
+			<-release
+		} else {
+			var st string
+			if err := testPool.QueryRow(ctx, `SELECT status::text FROM sandbox WHERE id = $1`, id).Scan(&st); err != nil {
+				t.Error(err)
+			}
+			if st == "active" {
+				stale.Add(1)
+			}
+		}
+		return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, token, nil
+	}}
+	h := pauseHandlers(t, vmd)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.ReconcilePendingPausesOnce(ctx, zerolog.Nop())
+	}()
+
+	var running []uuid.UUID
+	for i := 0; i < 4; i++ {
+		select {
+		case id := <-started:
+			running = append(running, id)
+		case <-time.After(5 * time.Second):
+			close(release)
+			t.Fatal("workers did not start")
+		}
+	}
+	// Everything not in flight is finished elsewhere and resumed.
+	_, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', pause_op_id = NULL, pause_op_lease_until = NULL
+		WHERE team_id = $1 AND NOT (id = ANY($2::uuid[]))`, teamID, running)
+	close(release)
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := stale.Load(); n != 0 {
+		t.Fatalf("%d pause RPCs went to sandboxes that were already running again", n)
+	}
+}
+
+// A pause the reaper started and the reconciler finished is still recorded
+// as a timeout pause: the snapshot's trigger and the activity action carry
+// the original cause, not the fact that reconciliation did the last step.
+func TestIntegration_PauseReconcile_KeepsTheOriginalCause(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	var id uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO sandbox (team_id, name, status, host_id, timeout_seconds, created_at)
+		VALUES ($1, 'reconcile-cause', 'active', $2, 60, now() - interval '10 minutes') RETURNING id`,
+		teamID, testDefaultHostID).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	beginPause(t, id, uuid.New(), "timeout", nil)
+	expireLease(t, id)
+
+	h := pauseHandlers(t, &stubVMD{})
+	h.ReconcilePendingPausesOnce(ctx, zerolog.Nop())
+	h.WaitAsyncBookkeeping()
+
+	var trigger string
+	if err := testPool.QueryRow(ctx, `SELECT trigger FROM snapshot WHERE sandbox_id = $1`, id).Scan(&trigger); err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	if trigger != "timeout" {
+		t.Fatalf("snapshot trigger = %q, want the reaper's timeout", trigger)
+	}
+	var logged int
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		if err := testPool.QueryRow(ctx,
+			`SELECT count(*) FROM activity WHERE sandbox_id = $1 AND action = 'timeout_paused'`, id).Scan(&logged); err != nil {
+			t.Fatal(err)
+		}
+		if logged > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("no timeout_paused activity was recorded for the reconciled pause")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A pause a user asked for that the reconciler had to finish is still
+// attributed to that user, not recorded as system-initiated.
+func TestIntegration_PauseReconcile_KeepsTheRequestingActor(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, profileID := seedTeamKeyAndProfile(t)
+	id := seedActiveSandbox(t, teamID, "reconcile-actor")
+	beginPause(t, id, uuid.New(), "pause", &profileID)
+	expireLease(t, id)
+
+	h := pauseHandlers(t, &stubVMD{})
+	h.ReconcilePendingPausesOnce(ctx, zerolog.Nop())
+	h.WaitAsyncBookkeeping()
+
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		var n int
+		if err := testPool.QueryRow(ctx,
+			`SELECT count(*) FROM activity WHERE sandbox_id = $1 AND action = 'paused' AND actor_id = $2`, id, profileID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n == 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("paused activity attributed to the requester = %d rows, want 1", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func createActive(t *testing.T, r *gin.Engine, apiKey, name string) uuid.UUID {
 	t.Helper()
 	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"`+name+`"}`)
@@ -125,7 +311,6 @@ func createActive(t *testing.T, r *gin.Engine, apiKey, name string) uuid.UUID {
 	}
 	return uuid.MustParse(mustJSON(t, cw)["id"].(string))
 }
-
 func TestIntegration_PauseHandler_UndecidedHostLeavesPausing(t *testing.T) {
 	_, apiKey := seedTeamAndKey(t)
 	vmd := undecidedHost()
@@ -204,140 +389,5 @@ func TestIntegration_PauseHandler_GenerationFinalizeCannotUndoAResume(t *testing
 
 	if got := readPauseOp(t, id); got.status != "resuming" {
 		t.Fatalf("late finalize changed resuming to %s", got.status)
-	}
-}
-
-// A tick claims only what its workers can start at once. Rows it has not
-// claimed can be finished and resumed elsewhere meanwhile; none of them may
-// then receive a pause RPC from this tick.
-func TestIntegration_PauseReconcile_ClaimsOnlyWhatItCanDispatch(t *testing.T) {
-	ctx := context.Background()
-	teamID, _ := seedTeamAndKey(t)
-	for i := 0; i < 20; i++ {
-		abandonedPause(t, teamID, fmt.Sprintf("reconcile-wave-%d", i))
-	}
-	started := make(chan uuid.UUID, 4)
-	release := make(chan struct{})
-	var calls, stale atomic.Int32
-	vmd := &stubVMD{pauseFn: func(ctx context.Context, id, token string) (string, string, []vmdclient.ManifestEntry, string, error) {
-		if calls.Add(1) <= 4 {
-			started <- uuid.MustParse(id)
-			<-release
-		} else {
-			var st string
-			if err := testPool.QueryRow(ctx, `SELECT status::text FROM sandbox WHERE id = $1`, id).Scan(&st); err != nil {
-				t.Error(err)
-			}
-			if st == "active" {
-				stale.Add(1)
-			}
-		}
-		return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, token, nil
-	}}
-	h := pauseHandlers(t, vmd)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		h.ReconcilePendingPausesOnce(ctx, zerolog.Nop())
-	}()
-
-	var running []uuid.UUID
-	for i := 0; i < 4; i++ {
-		select {
-		case id := <-started:
-			running = append(running, id)
-		case <-time.After(5 * time.Second):
-			close(release)
-			t.Fatal("workers did not start")
-		}
-	}
-	// Everything not in flight is finished elsewhere and resumed.
-	_, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', pause_op_id = NULL, pause_op_lease_until = NULL
-		WHERE team_id = $1 AND NOT (id = ANY($2::uuid[]))`, teamID, running)
-	close(release)
-	<-done
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n := stale.Load(); n != 0 {
-		t.Fatalf("%d pause RPCs went to sandboxes that were already running again", n)
-	}
-}
-
-// A pause the reaper started and the reconciler finished is still recorded
-// as a timeout pause: the snapshot's trigger and the activity action carry
-// the original cause, not the fact that reconciliation did the last step.
-func TestIntegration_PauseReconcile_KeepsTheOriginalCause(t *testing.T) {
-	ctx := context.Background()
-	teamID, _ := seedTeamAndKey(t)
-	var id uuid.UUID
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO sandbox (team_id, name, status, host_id, timeout_seconds, created_at)
-		VALUES ($1, 'reconcile-cause', 'active', $2, 60, now() - interval '10 minutes') RETURNING id`,
-		teamID, testDefaultHostID).Scan(&id); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := testQueries.ClaimExpiredSandbox(ctx, db.ClaimExpiredSandboxParams{ID: id, LeaseSeconds: 90}); err != nil {
-		t.Fatalf("reaper claim: %v", err)
-	}
-	expireLease(t, id)
-
-	h := pauseHandlers(t, &stubVMD{})
-	h.ReconcilePendingPausesOnce(ctx, zerolog.Nop())
-	h.WaitAsyncBookkeeping()
-
-	var trigger string
-	if err := testPool.QueryRow(ctx, `SELECT trigger FROM snapshot WHERE sandbox_id = $1`, id).Scan(&trigger); err != nil {
-		t.Fatalf("read snapshot: %v", err)
-	}
-	if trigger != "timeout" {
-		t.Fatalf("snapshot trigger = %q, want the reaper's timeout", trigger)
-	}
-	var logged int
-	for deadline := time.Now().Add(2 * time.Second); ; {
-		if err := testPool.QueryRow(ctx,
-			`SELECT count(*) FROM activity WHERE sandbox_id = $1 AND action = 'timeout_paused'`, id).Scan(&logged); err != nil {
-			t.Fatal(err)
-		}
-		if logged > 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("no timeout_paused activity was recorded for the reconciled pause")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// A pause a user asked for that the reconciler had to finish is still
-// attributed to that user, not recorded as system-initiated.
-func TestIntegration_PauseReconcile_KeepsTheRequestingActor(t *testing.T) {
-	ctx := context.Background()
-	teamID, _, profileID := seedTeamKeyAndProfile(t)
-	id := seedActiveSandbox(t, teamID, "reconcile-actor")
-	if _, err := testQueries.BeginPause(ctx, db.BeginPauseParams{
-		ID: id, TeamID: teamID, PauseOpID: pauseOpID(uuid.New()), LeaseSeconds: 90, ActorID: pauseOpID(profileID),
-	}); err != nil {
-		t.Fatalf("BeginPause: %v", err)
-	}
-	expireLease(t, id)
-
-	h := pauseHandlers(t, &stubVMD{})
-	h.ReconcilePendingPausesOnce(ctx, zerolog.Nop())
-	h.WaitAsyncBookkeeping()
-
-	for deadline := time.Now().Add(2 * time.Second); ; {
-		var n int
-		if err := testPool.QueryRow(ctx,
-			`SELECT count(*) FROM activity WHERE sandbox_id = $1 AND action = 'paused' AND actor_id = $2`, id, profileID).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		if n == 1 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("paused activity attributed to the requester = %d rows, want 1", n)
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }

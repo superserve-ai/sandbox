@@ -25,40 +25,7 @@ func pauseOpID(id uuid.UUID) pgtype.UUID { return pgtype.UUID{Bytes: id, Valid: 
 
 func leaseVersion(v int64) *int64 { return &v }
 
-type pauseOpState struct {
-	status       string
-	opID         pgtype.UUID
-	leaseVersion int64
-	leased       bool
-	attention    bool
-}
-
-func readPauseOp(t *testing.T, id uuid.UUID) pauseOpState {
-	t.Helper()
-	var s pauseOpState
-	if err := testPool.QueryRow(context.Background(), `
-		SELECT status::text, pause_op_id, pause_op_lease_version,
-		       pause_op_lease_until IS NOT NULL AND pause_op_lease_until > now(),
-		       pause_op_attention_at IS NOT NULL
-		FROM sandbox WHERE id = $1`, id).
-		Scan(&s.status, &s.opID, &s.leaseVersion, &s.leased, &s.attention); err != nil {
-		t.Fatalf("read sandbox: %v", err)
-	}
-	return s
-}
-
-func seedActiveSandbox(t *testing.T, teamID uuid.UUID, name string) uuid.UUID {
-	t.Helper()
-	var id uuid.UUID
-	if err := testPool.QueryRow(context.Background(), `
-		INSERT INTO sandbox (team_id, name, status, host_id)
-		VALUES ($1, $2, 'active', $3) RETURNING id`, teamID, name, testDefaultHostID).Scan(&id); err != nil {
-		t.Fatalf("seed sandbox: %v", err)
-	}
-	return id
-}
-
-func beginPause(t *testing.T, id, teamID, op uuid.UUID) db.BeginPauseRow {
+func claimPauseOp(t *testing.T, id, teamID, op uuid.UUID) db.BeginPauseRow {
 	t.Helper()
 	row, err := testQueries.BeginPause(context.Background(), db.BeginPauseParams{
 		ID: id, TeamID: teamID, PauseOpID: pauseOpID(op), LeaseSeconds: 90,
@@ -67,16 +34,6 @@ func beginPause(t *testing.T, id, teamID, op uuid.UUID) db.BeginPauseRow {
 		t.Fatalf("BeginPause: %v", err)
 	}
 	return row
-}
-
-func expireLease(t *testing.T, id uuid.UUID) {
-	t.Helper()
-	if _, err := testPool.Exec(context.Background(),
-		`UPDATE sandbox SET pause_op_lease_until = now() - interval '1 second',
-		                    pause_op_started_at = now() - interval '5 minutes'
-		 WHERE id = $1`, id); err != nil {
-		t.Fatalf("expire lease: %v", err)
-	}
 }
 
 // claimPending does what a reconciler tick does: list the eligible rows,
@@ -119,7 +76,7 @@ func TestIntegration_PauseOperation_BeginPauseLeasesTheOperation(t *testing.T) {
 	id := seedActiveSandbox(t, teamID, "pause-op-lease")
 	op := uuid.New()
 
-	row := beginPause(t, id, teamID, op)
+	row := claimPauseOp(t, id, teamID, op)
 	if !row.PauseOpID.Valid || row.PauseOpID.Bytes != op || row.PauseOpLeaseVersion != 1 || !row.PauseOpStartedAt.Valid {
 		t.Fatalf("BeginPause did not record the operation: %+v", row)
 	}
@@ -151,7 +108,7 @@ func TestIntegration_PauseOperation_FinalizeIsFencedToTheCurrentLease(t *testing
 	teamID, _ := seedTeamAndKey(t)
 	id := seedActiveSandbox(t, teamID, "pause-op-fence")
 	op := uuid.New()
-	beginPause(t, id, teamID, op)
+	claimPauseOp(t, id, teamID, op)
 	expireLease(t, id)
 	if rows := claimPending(t); len(rows) != 1 {
 		t.Fatalf("claim = %d rows, want 1", len(rows))
@@ -179,7 +136,7 @@ func TestIntegration_PauseOperation_LateResultCannotTouchALaterPause(t *testing.
 	teamID, _ := seedTeamAndKey(t)
 	id := seedActiveSandbox(t, teamID, "pause-op-late")
 	first := uuid.New()
-	beginPause(t, id, teamID, first)
+	claimPauseOp(t, id, teamID, first)
 	if err := finalize(id, teamID, first, 1); err != nil {
 		t.Fatalf("first finalize: %v", err)
 	}
@@ -189,7 +146,7 @@ func TestIntegration_PauseOperation_LateResultCannotTouchALaterPause(t *testing.
 		t.Fatal(err)
 	}
 	second := uuid.New()
-	beginPause(t, id, teamID, second)
+	claimPauseOp(t, id, teamID, second)
 
 	// Everything the first operation could still say is refused.
 	if err := finalize(id, teamID, first, 1); !errors.Is(err, pgx.ErrNoRows) {
@@ -216,7 +173,7 @@ func TestIntegration_PauseOperation_DecidedOutcomesAreFencedToo(t *testing.T) {
 	teamID, _ := seedTeamAndKey(t)
 	id := seedActiveSandbox(t, teamID, "pause-op-decided")
 	op := uuid.New()
-	beginPause(t, id, teamID, op)
+	claimPauseOp(t, id, teamID, op)
 	expireLease(t, id)
 	claimPending(t) // version 2
 
@@ -251,7 +208,7 @@ func TestIntegration_PauseOperation_RevertClearsTheOperation(t *testing.T) {
 	teamID, _ := seedTeamAndKey(t)
 	id := seedActiveSandbox(t, teamID, "pause-op-revert")
 	op := uuid.New()
-	beginPause(t, id, teamID, op)
+	claimPauseOp(t, id, teamID, op)
 
 	n, err := testQueries.RevertPauseToActive(context.Background(), db.RevertPauseToActiveParams{
 		SandboxID: id, TeamID: teamID, PauseOpID: pauseOpID(op), PauseOpLeaseVersion: leaseVersion(1),
@@ -274,7 +231,7 @@ func TestIntegration_PauseOperation_DeletedAndLegacyRowsAreLeftAlone(t *testing.
 
 	deleted := seedActiveSandbox(t, teamID, "pause-op-deleted")
 	op := uuid.New()
-	beginPause(t, deleted, teamID, op)
+	claimPauseOp(t, deleted, teamID, op)
 	expireLease(t, deleted)
 	if _, err := testPool.Exec(context.Background(), `UPDATE sandbox SET destroyed_at = now() WHERE id = $1`, deleted); err != nil {
 		t.Fatal(err)
@@ -303,7 +260,7 @@ func TestIntegration_PauseOperation_ReleaseAndAttentionAreFenced(t *testing.T) {
 	teamID, _ := seedTeamAndKey(t)
 	id := seedActiveSandbox(t, teamID, "pause-op-release")
 	op := uuid.New()
-	beginPause(t, id, teamID, op)
+	claimPauseOp(t, id, teamID, op)
 	expireLease(t, id)
 	claimPending(t) // version 2
 
@@ -358,7 +315,7 @@ func TestIntegration_PauseOperation_ReleaseAndAttentionAreFenced(t *testing.T) {
 func TestIntegration_PauseOperation_ClaimIsExclusiveAcrossReplicas(t *testing.T) {
 	teamID, _ := seedTeamAndKey(t)
 	id := seedActiveSandbox(t, teamID, "pause-op-replicas")
-	beginPause(t, id, teamID, uuid.New())
+	claimPauseOp(t, id, teamID, uuid.New())
 	expireLease(t, id)
 	ctx := context.Background()
 
@@ -440,7 +397,7 @@ func TestIntegration_PauseOperation_RetryOrderDoesNotStarveNewerRows(t *testing.
 	teamID, _ := seedTeamAndKey(t)
 	for i := 0; i < 8; i++ {
 		id := seedActiveSandbox(t, teamID, fmt.Sprintf("pause-op-slow-%d", i))
-		beginPause(t, id, teamID, uuid.New())
+		claimPauseOp(t, id, teamID, uuid.New())
 		expireLease(t, id)
 		if _, err := testPool.Exec(ctx,
 			`UPDATE sandbox SET pause_op_started_at = now() - interval '1 hour' WHERE id = $1`, id); err != nil {
@@ -448,7 +405,7 @@ func TestIntegration_PauseOperation_RetryOrderDoesNotStarveNewerRows(t *testing.
 		}
 	}
 	healthy := seedActiveSandbox(t, teamID, "pause-op-healthy")
-	beginPause(t, healthy, teamID, uuid.New())
+	claimPauseOp(t, healthy, teamID, uuid.New())
 	expireLease(t, healthy)
 
 	for wave := 0; wave < 12; wave++ {
@@ -496,7 +453,7 @@ func TestIntegration_PauseOperation_CompletedOperationIsNotReclaimedByALegacyPau
 	teamID, _ := seedTeamAndKey(t)
 	id := seedActiveSandbox(t, teamID, "pause-op-legacy-writer")
 	op := uuid.New()
-	beginPause(t, id, teamID, op)
+	claimPauseOp(t, id, teamID, op)
 	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET pause_op_started_at = now() - interval '5 minutes' WHERE id = $1`, id); err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +496,7 @@ func TestIntegration_PauseOperation_RevertKeepsThePriorActor(t *testing.T) {
 		t.Fatal(err)
 	}
 	op := uuid.New()
-	row := beginPause(t, id, teamID, op)
+	row := claimPauseOp(t, id, teamID, op)
 
 	n, err := testQueries.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
 		SandboxID: id, TeamID: teamID, PauseOpID: pauseOpID(op), PauseOpLeaseVersion: leaseVersion(row.PauseOpLeaseVersion),
