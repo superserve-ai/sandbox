@@ -543,3 +543,44 @@ func TestIntegration_PauseOperation_ReleasedLeaseIsClaimableAtOnce(t *testing.T)
 		t.Fatalf("claim of a released lease: %v", err)
 	}
 }
+
+// The billing pass lists and claims like the reaper: only an ineligible
+// team's active sandboxes are listed, and a claim mints the operation with
+// its own cause; a second claim finds nothing.
+func TestIntegration_PauseOperation_BillingClaimMintsTheOperation(t *testing.T) {
+	ctx := context.Background()
+	ineligible, _ := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, expires_at)
+		VALUES ($1, 5.000000, 5.000000, 'signup trial credit', now() - interval '1 second')`, ineligible); err != nil {
+		t.Fatalf("seed expired signup trial credit: %v", err)
+	}
+	id := seedActiveSandbox(t, ineligible, "pause-op-billing")
+	eligible, _ := seedTeamAndKey(t)
+	other := seedActiveSandbox(t, eligible, "pause-op-billing-eligible")
+
+	ids, err := testQueries.ListBillingIneligibleSandboxes(ctx, db.ListBillingIneligibleSandboxesParams{TeamID: ineligible, Limit: 10})
+	if err != nil {
+		t.Fatalf("ListBillingIneligibleSandboxes: %v", err)
+	}
+	if !slices.Contains(ids, id) {
+		t.Fatalf("ineligible list %v does not include the sandbox", ids)
+	}
+	if listed, err := testQueries.ListBillingIneligibleSandboxes(ctx, db.ListBillingIneligibleSandboxesParams{TeamID: eligible, Limit: 10}); err != nil || slices.Contains(listed, other) {
+		t.Fatalf("eligible team's list = %v (err %v), want its sandbox left alone", listed, err)
+	}
+	claimed, err := testQueries.ClaimBillingIneligibleSandbox(ctx, db.ClaimBillingIneligibleSandboxParams{ID: id, TeamID: ineligible, LeaseSeconds: 90})
+	if err != nil || !claimed.PauseOpID.Valid || claimed.PauseOpLeaseVersion != 1 {
+		t.Fatalf("billing claim = %+v, %v; want the row with a minted operation at version 1", claimed, err)
+	}
+	if _, err := testQueries.ClaimBillingIneligibleSandbox(ctx, db.ClaimBillingIneligibleSandboxParams{ID: id, TeamID: ineligible, LeaseSeconds: 90}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("second claim of a claimed row = %v, want no rows", err)
+	}
+	var trigger string
+	if err := testPool.QueryRow(ctx, `SELECT pause_op_trigger FROM sandbox WHERE id = $1`, id).Scan(&trigger); err != nil || trigger != "billing_ineligible" {
+		t.Fatalf("pause_op_trigger = %q (err %v), want billing_ineligible", trigger, err)
+	}
+	if got := readPauseOp(t, id); got.status != "pausing" || !got.leased || got.opID.Bytes != claimed.PauseOpID.Bytes {
+		t.Fatalf("after billing claim: %+v", got)
+	}
+}

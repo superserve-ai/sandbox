@@ -460,6 +460,12 @@ const notifyFlushBatch = 32
 // signals and confirms each only after the callback returns nil.
 // Failures to deliver, load, or clear are logged and retried on a later
 // flush (spaced by notifyRetryDelay), never dropped.
+// ErrNotificationDeferred marks a delivery the control plane declined for
+// this entry alone and will take later. The flush keeps the entry and goes
+// on to the next one, rather than stopping the batch as it does when the
+// control plane itself is unreachable.
+var ErrNotificationDeferred = errors.New("backup notification deferred")
+
 func (u *Uploader) flushNotifications() {
 	if u.OnVerified == nil {
 		return
@@ -485,6 +491,13 @@ func (u *Uploader) flushNotifications() {
 	}
 	for _, t := range pending {
 		if err := u.OnVerified(t); err != nil {
+			if errors.Is(err, ErrNotificationDeferred) {
+				// Only this entry is not ready; nothing behind it waits.
+				t.logOwner(u.Log.Info().Err(err)).
+					Str("generation", t.Generation).
+					Msg("backup notification deferred; will redeliver")
+				continue
+			}
 			// Stop the batch: a control plane that failed this delivery
 			// will fail the rest too, and each attempt can hold the
 			// drain goroutine for the full request timeout. The retained

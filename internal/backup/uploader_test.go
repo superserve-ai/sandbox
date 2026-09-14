@@ -3326,3 +3326,47 @@ func TestSeedRefreshesUndeliveredEntryOnReack(t *testing.T) {
 		t.Fatalf("refresh lost the entry's file manifest: %+v", refreshed[0])
 	}
 }
+
+// A delivery the control plane deferred for one entry keeps that entry
+// outboxed and lets the rest of the batch through, with no retry window
+// armed: the deferral is about that sandbox, not the control plane.
+func TestDeferredNotificationDoesNotStallTheBatch(t *testing.T) {
+	j, _ := testJournal(t)
+	waiting := Task{SandboxID: "a-waiting", Generation: "gen", EnqueuedAt: time.Unix(1, 0)}
+	ready := Task{SandboxID: "b-ready", Generation: "gen", EnqueuedAt: time.Unix(2, 0)}
+	for _, task := range []Task{waiting, ready} {
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Ack(task, "test-bucket", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var delivered []string
+	defer_ := true
+	u := &Uploader{Journal: j, OnVerified: func(t Task) error {
+		if t.SandboxID == waiting.SandboxID && defer_ {
+			return fmt.Errorf("503: %w", ErrNotificationDeferred)
+		}
+		delivered = append(delivered, t.SandboxID)
+		return nil
+	}}
+	u.flushNotifications()
+	if len(delivered) != 1 || delivered[0] != ready.SandboxID {
+		t.Fatalf("delivered = %v, want only the ready entry", delivered)
+	}
+	pending, err := j.PendingNotifications(0)
+	if err != nil || len(pending) != 1 || pending[0].SandboxID != waiting.SandboxID {
+		t.Fatalf("outbox = %+v (err %v), want only the deferred entry retained", pending, err)
+	}
+	if !u.notifyRetryAt.IsZero() {
+		t.Fatal("a deferral armed the control-plane retry window")
+	}
+
+	defer_ = false
+	u.flushNotifications()
+	if len(delivered) != 2 || delivered[1] != waiting.SandboxID {
+		t.Fatalf("delivered = %v, want the deferred entry on the next flush", delivered)
+	}
+}

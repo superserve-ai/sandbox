@@ -236,3 +236,28 @@ func TestSandboxLoggerIncludesSandboxAndHostID(t *testing.T) {
 }
 
 var _ telemetry.Recorder = (*captureTelemetryRecorder)(nil)
+
+func TestSandboxLifecycleTelemetryHonorsTheHandlersResult(t *testing.T) {
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() {
+		SetTelemetryRecorder(nil)
+	})
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(SandboxLifecycleTelemetry())
+	r.POST("/sandboxes/:sandbox_id/pause", func(c *gin.Context) {
+		respondPause(c, pauseUndecided)
+	})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil))
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusAccepted)
+	}
+	if len(rec.transitions) != 1 || rec.transitions[0].Operation != "pause" || rec.transitions[0].Result != telemetry.ResultTimeout {
+		t.Fatalf("transitions = %+v, want one pause recorded as a timeout despite the 202", rec.transitions)
+	}
+}

@@ -121,9 +121,9 @@ LIMIT 1;
 -- the duration of the transaction or the sync is skipped. Status rides
 -- along because 'pausing' marks a finalize that has not committed yet:
 -- a fast upload's report arriving in that window must retry rather than
--- silently miss its size sync. The pause operation columns say whether a
--- long transition is still being worked (see finalizeInFlight).
-SELECT id, status, updated_at, pause_op_id, pause_op_lease_until, pause_op_attention_at
+-- silently miss its size sync. A pause operation on the row says the
+-- transition is still being worked (see finalizeInFlight).
+SELECT id, status, updated_at, pause_op_id
 FROM sandbox WHERE id = $1 FOR UPDATE;
 
 -- name: LatestSnapshotManifest :many

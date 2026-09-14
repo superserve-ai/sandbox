@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 var errPauseLeaseExpired = errors.New("pause lease expired before the host could be asked")
@@ -41,7 +42,8 @@ const (
 
 // respondPause answers a dispatch the caller waited for. Only a row known to
 // be 'active' again is reported as failed; one still 'pausing' is accepted,
-// since the reconciler will pause it.
+// since the reconciler will pause it. That answer still counts as a timeout
+// on the pause metric: the host did not answer within the request.
 func respondPause(c *gin.Context, o pauseOutcome) {
 	switch o {
 	case pauseDone:
@@ -49,6 +51,7 @@ func respondPause(c *gin.Context, o pauseOutcome) {
 	case pauseGone:
 		respondError(c, ErrSandboxGone)
 	case pauseUndecided:
+		SetTelemetryResult(c, telemetry.ResultTimeout)
 		acceptPausing(c)
 	default:
 		respondError(c, ErrInternal)
