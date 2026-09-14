@@ -1,8 +1,8 @@
 # Deploy Proxy — edge proxy on the VMD hosts.
 #
-# Production NEVER deploys without staging first. Same pattern as Deploy API /
-# Deploy VMD. The us-west2 cell host deploys as a final production step,
-# after the primary region succeeds — same shape as Deploy API's usw steps.
+# Staging runs first; production standby deploys may skip an absent staging
+# standby, matching Deploy VMD. Normal deployments run west after the primary
+# region succeeds — same shape as Deploy API's usw steps.
 
 name: Deploy Proxy
 
@@ -24,6 +24,22 @@ on:
         options:
           - staging
           - production
+      target:
+        description: 'Host target'
+        required: true
+        type: choice
+        default: serving
+        options:
+          - serving
+          - standby
+      production_cell:
+        description: 'Production cell for standby deployments'
+        required: true
+        type: choice
+        default: usw2
+        options:
+          - usw2
+          - use4
   push:
     branches: [main]
     paths:
@@ -44,6 +60,13 @@ on:
       - 'deploy/proxy.service'
       - '.github/workflows/deploy-proxy.yml'
       - '.github/workflows/scripts/deploy-proxy.py'
+      - '.github/workflows/scripts/select-deploy-target.sh'
+
+env:
+  DEPLOY_EVENT: ${{ github.event_name }}
+  DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+  DEPLOY_TARGET: ${{ inputs.target || 'serving' }}
+  DEPLOY_PRODUCTION_CELL: ${{ inputs.production_cell || 'usw2' }}
 
 jobs:
   migration-gate:
@@ -95,6 +118,7 @@ jobs:
       # fan-out — the cell deploys sequentially after production below.
       - name: Discover and deploy proxy to VMD instances
         env:
+          DEPLOY_CELL: staging
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
@@ -120,6 +144,13 @@ jobs:
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
         run: |
+          if [ "$DEPLOY_EVENT" = workflow_dispatch ] && [ "$DEPLOY_TARGET" = standby ]; then
+            source .github/workflows/scripts/select-deploy-target.sh
+          elif [ "$DEPLOY_TARGET" != serving ] && [ "$DEPLOY_EVENT" = workflow_dispatch ]; then
+            echo 'Invalid deploy target' >&2
+            exit 1
+          fi
+          : "${GCP_REGION:?Refusing an unscoped proxy deployment}"
           python3 .github/workflows/scripts/deploy-proxy.py
 
   deploy-production:
@@ -157,12 +188,15 @@ jobs:
       # us-east4 is the "use" cell's primary host (api.superserve.ai routes to
       # the use-cell control plane there). It deploys FIRST so a usw-cell failure
       # below can't leave the primary host on a stale proxy. Reuses the primary
-      # proxy env (domain + seed) since it is the same cell. Unguarded: use4 is
+      # proxy env (domain + seed) since it is the same cell. For normal deploys, use4 is
       # the permanent primary, so a missing GCP_REGION_USE4 must fail the deploy
       # rather than silently skip the only primary-host proxy rollout
       # (deploy-proxy.py fails on zero VMD_LABEL matches).
       - name: Deploy proxy to us-east4 use-cell VMD instance
+        if: github.event_name != 'workflow_dispatch' || inputs.target != 'standby' || inputs.production_cell == 'use4'
         env:
+          DEPLOY_CELL: use4
+          VMD_STANDBY_HOST_USE4: ${{ vars.VMD_STANDBY_HOST_USE4 }}
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
@@ -180,11 +214,13 @@ jobs:
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
-          # Fail closed: an empty GCP_REGION makes deploy-proxy.py drop the region
-          # filter and apply the primary proxy env (prod domain + seed) to every
-          # VMD_LABEL match. use4 is the permanent primary, so a missing
-          # GCP_REGION_USE4 must abort, not run unscoped.
-          : "${GCP_REGION:?GCP_REGION_USE4 is unset — refusing an unscoped use4 primary proxy fan-out}"
+          if [ "$DEPLOY_EVENT" = workflow_dispatch ] && [ "$DEPLOY_TARGET" = standby ]; then
+            source .github/workflows/scripts/select-deploy-target.sh
+          elif [ "$DEPLOY_TARGET" != serving ] && [ "$DEPLOY_EVENT" = workflow_dispatch ]; then
+            echo 'Invalid deploy target' >&2
+            exit 1
+          fi
+          : "${GCP_REGION:?Refusing an unscoped proxy deployment}"
           python3 .github/workflows/scripts/deploy-proxy.py
 
       # The usw cell deploys as a step in this job — not a separate job —
@@ -207,8 +243,9 @@ jobs:
       # would break every access token in the cell. The seed is fetched at
       # deploy time so Secret Manager stays the single source of truth.
       - name: Deploy proxy to usw cell VMD instances
-        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        if: (github.event_name == 'workflow_dispatch' && inputs.target == 'standby' && (inputs.production_cell == 'usw2' || inputs.production_cell == '')) || ((github.event_name != 'workflow_dispatch' || inputs.target != 'standby') && vars.CLOUD_RUN_SERVICE_USW != '')
         env:
+          DEPLOY_CELL: usw2
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USW }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
@@ -227,6 +264,13 @@ jobs:
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
+          if [ "$DEPLOY_EVENT" = workflow_dispatch ] && [ "$DEPLOY_TARGET" = standby ]; then
+            source .github/workflows/scripts/select-deploy-target.sh
+          elif [ "$DEPLOY_TARGET" != serving ] && [ "$DEPLOY_EVENT" = workflow_dispatch ]; then
+            echo 'Invalid deploy target' >&2
+            exit 1
+          fi
+          : "${GCP_REGION:?Refusing an unscoped proxy deployment}"
           SANDBOX_ACCESS_TOKEN_SEED=$(gcloud secrets versions access latest \
             --secret=sandbox-access-token-seed --project "$GCP_PROJECT")
           export SANDBOX_ACCESS_TOKEN_SEED

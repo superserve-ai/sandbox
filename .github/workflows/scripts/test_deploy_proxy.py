@@ -32,13 +32,13 @@ class DeployProxyOrderingTest(unittest.TestCase):
 
 
 class DeployProxyTests(unittest.TestCase):
-    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True):
+    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, standby=False):
         scripts = []
 
         def run(args, **kwargs):
             output = ""
             if args[:4] == ["gcloud", "compute", "instances", "list"]:
-                output = "example-host,us-central1-a\n"
+                output = "example-host,us-central1-a" + (",RUNNING" if standby else "") + "\n"
             elif args[:3] == ["gcloud", "compute", "ssh"]:
                 scripts.append(args[args.index("--command") + 1])
             elif args[:2] == ["ssh-keygen", "-q"]:
@@ -49,6 +49,7 @@ class DeployProxyTests(unittest.TestCase):
 
         env = {
             "GCP_PROJECT": "example-project",
+            "GCP_REGION": "us-central1",
             "SHA": "12345678",
             "PROXY_DOMAIN": "sandbox.example.test",
             "PEER_PROXY_LISTEN_ADDR": peer_addr,
@@ -58,6 +59,8 @@ class DeployProxyTests(unittest.TestCase):
             "PEER_PROXY_KEY_FILE": "/etc/peer/key.pem",
             "PEER_PROXY_CA_FILE": "/etc/peer/ca.pem",
         }
+        if standby:
+            env["EXPECTED_STANDBY_HOST"] = "example-host"
         with tempfile.TemporaryDirectory() as runner_dir, patch.dict(os.environ, env, clear=True), patch.object(
             MODULE.subprocess, "run", side_effect=run
         ), patch.object(MODULE.os.path, "expanduser", return_value=str(Path(runner_dir) / "google_compute_engine")):
@@ -65,6 +68,9 @@ class DeployProxyTests(unittest.TestCase):
         self.assertEqual(len(scripts), 1)
         self.assertIn("PEER_PROXY_TARGET_ADDR=127.0.0.1:5010\n", scripts[0])
         return scripts[0]
+
+    def test_standby_uses_identical_install_and_peer_configuration(self):
+        self.assertEqual(self.generate_script("", standby=True), self.generate_script(""))
 
     def test_generated_shell_parses(self):
         for peer_addr in ("", "auto"):
