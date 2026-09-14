@@ -477,7 +477,7 @@ module "sandbox_host_c" {
   # runtime identity's grants below; create those first so the boot is not
   # racing them.
   depends_on = [
-    google_storage_bucket_iam_member.host_bootstrap_artifacts,
+    google_storage_bucket_iam_member.vmd_backup,
     google_project_iam_member.vmd_telemetry,
     google_service_account_iam_member.vmd_deploy_act_as,
   ]
@@ -554,18 +554,14 @@ resource "google_service_account_iam_member" "vmd_deploy_act_as" {
   member             = "serviceAccount:${data.google_service_account.github_actions.email}"
 }
 
-# Hosts fetch the guest kernel and base rootfs at first boot from the
-# hostprep prefix. Scoped to that prefix: hosts stay write-only for
-# everything else in the bucket.
-resource "google_storage_bucket_iam_member" "host_bootstrap_artifacts" {
-  bucket = module.backup_storage.bucket_name
-  role   = "roles/storage.objectViewer"
-  member = "serviceAccount:${google_service_account.vmd_runtime.email}"
-
-  condition {
-    title      = "hostprep-artifacts-only"
-    expression = "resource.name.startsWith(\"projects/_/buckets/${module.backup_storage.bucket_name}/objects/hostprep/\")"
-  }
+# The dedicated runtime identity creates and reads backup objects within
+# its cell, never deletes or overwrites: pause uploads, the hostprep
+# artifacts at first boot, and cross-host restores all run under it.
+resource "google_storage_bucket_iam_member" "vmd_backup" {
+  for_each = toset(["roles/storage.objectCreator", "roles/storage.objectViewer"])
+  bucket   = module.backup_storage.bucket_name
+  role     = each.value
+  member   = "serviceAccount:${google_service_account.vmd_runtime.email}"
 }
 
 module "observability" {
@@ -669,7 +665,6 @@ module "backup_storage" {
 
   writer_members = [
     "serviceAccount:${data.google_service_account.api_runner.email}",
-    "serviceAccount:${google_service_account.vmd_runtime.email}",
   ]
 
   labels = merge(local.common_labels, {
