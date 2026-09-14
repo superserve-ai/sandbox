@@ -124,6 +124,15 @@ def main() -> int:
         for r in [line.strip().split(",")]
     ]
 
+    # A misplaced standby must not become an optional staging absence.
+    if expected_standby and any(
+        inst["name"] == expected_standby
+        and not inst["zone"].split("/")[-1].startswith(f"{region}-")
+        for inst in instances
+    ):
+        print(f"ERROR: standby {expected_standby} found outside expected region {region}", file=sys.stderr)
+        return 1
+
     # Region scoping happens here rather than in the gcloud filter: matching
     # on the zone basename is unambiguous, while gcloud filter matching
     # against zone URIs is easy to get subtly wrong. Zero matches is a hard

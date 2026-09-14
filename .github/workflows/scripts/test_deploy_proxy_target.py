@@ -91,6 +91,16 @@ class ProxyTargetTests(unittest.TestCase):
         with self.assertRaises(subprocess.CalledProcessError):
             self.select(None, DEPLOY_CELL="staging", GCP_REGION="us-central1")
 
+    def test_wrong_region_staging_standby_fails_before_absence_skip(self):
+        for zone in ("us-east4-a", "projects/example-project/zones/us-east4-a"):
+            with self.subTest(zone=zone):
+                self.assertEqual(self.select(f"superserve-vmd-staging-2,{zone},RUNNING\n",
+                                            DEPLOY_CELL="staging", GCP_REGION="us-central1"), (1, []))
+
+    def test_unrelated_host_in_another_region_does_not_block_staging_skip(self):
+        self.assertEqual(self.select("example-other-host,us-east4-a,RUNNING\n",
+                                    DEPLOY_CELL="staging", GCP_REGION="us-central1"), (0, []))
+
     def test_region_required_for_every_target(self):
         for event in ("push", "workflow_dispatch"):
             for target in ("serving", "standby"):
