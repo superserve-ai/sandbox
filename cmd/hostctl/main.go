@@ -30,7 +30,7 @@ func main() {
 	token := flag.String("token", os.Getenv("OPERATOR_API_TOKEN"), "operator API token (env OPERATOR_API_TOKEN)")
 	wait := flag.Bool("wait", false, "drain only: block until placement has converged and counts read stably zero")
 	flag.Usage = func() {
-		fmt.Fprintf(flag.CommandLine.Output(), "usage: hostctl [flags] <list|activate|drain> [host-id]\n")
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: hostctl [flags] <list|activate|drain> [host-id]\n       hostctl [flags] rebind <host-id> <expected-incarnation> <new-incarnation>\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -43,6 +43,14 @@ func main() {
 
 	var err error
 	switch cmd, arg := flag.Arg(0), flag.Arg(1); {
+	case cmd == "rebind" && arg != "" && flag.NArg() == 4:
+		body, _ := json.Marshal(map[string]string{"expected_incarnation": flag.Arg(2), "new_incarnation": flag.Arg(3)})
+		var resp *http.Response
+		resp, err = cli.do(http.MethodPost, "/internal/hosts/"+escapeHostID(arg)+"/incarnation", strings.NewReader(string(body)))
+		if err == nil {
+			defer resp.Body.Close()
+			_, err = io.Copy(os.Stdout, resp.Body)
+		}
 	case cmd == "list" && arg == "":
 		err = cli.list()
 	case cmd == "activate" && arg != "":
@@ -294,3 +302,5 @@ func (c client) setStatus(hostID, status string) error {
 	fmt.Printf("%s -> %s\n", hostID, status)
 	return nil
 }
+
+func escapeHostID(id string) string { return url.PathEscape(id) }

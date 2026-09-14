@@ -329,6 +329,8 @@ func hostRow(h db.Host) *mockRow {
 		*dest[8].(*time.Time) = h.CreatedAt
 		*dest[9].(*time.Time) = h.UpdatedAt
 		*dest[10].(*bool) = h.IdentityBound
+		*dest[11].(*pgtype.UUID) = h.IncarnationID
+		*dest[12].(**int64) = h.PeerGeneration
 		return nil
 	}}
 }

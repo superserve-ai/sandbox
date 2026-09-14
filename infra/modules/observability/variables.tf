@@ -98,13 +98,15 @@ variable "backup_alerts" {
     metrics, scoped to one cell's vmd host via the host_id metric label.
     host_id is vmd's HOST_ID runtime env, which is its identity in the host
     table — NOT necessarily the instance name, and not the host_id the
-    collector stamps on its own host-level series. Pass the value read from
-    the host's /etc/sandbox/vmd.env; a guess selects no series and the
-    policies stay silent. Null disables the whole set.
+    collector stamps on its own host-level series. collector_host_id is the
+    stable instance name stamped by the host-local collector; when supplied,
+    either label matches so generated host IDs remain covered and older
+    collectors stay covered during rollout. Null disables the whole set.
   EOT
   type = object({
-    host_id        = string
-    display_prefix = string
+    host_id           = string
+    display_prefix    = string
+    collector_host_id = optional(string)
     # Sustained failed upload attempts per hour. The retry backoff caps at
     # 10 minutes, so a single permanently failing generation produces ~6
     # attempts/hour; the default catches one stuck task on any cell while
@@ -253,14 +255,16 @@ variable "launch_path_alerts" {
     namespaces accumulating, both of which degrade latency silently.
 
     host_id is vmd's HOST_ID runtime env (the same label the backup metrics
-    carry), NOT the instance name and NOT the collector's own host_id — read
-    it from the host's /etc/sandbox/vmd.env. A guess selects no series, and
-    a policy watching nothing is indistinguishable from a healthy host.
+    carry), NOT the instance name and NOT the collector's own host_id.
+    collector_host_id optionally selects the stable instance name stamped by
+    the host-local collector as well, covering generated host IDs while the
+    legacy host_id filter keeps older collectors covered during rollout.
     Null disables the set.
   EOT
   type = object({
-    host_id        = string
-    display_prefix = string
+    host_id           = string
+    display_prefix    = string
+    collector_host_id = optional(string)
     # How long launches may run on the legacy path before paging. Pin
     # rebuilds retry every 5 minutes, so this must exceed one retry cycle
     # or a transient failure that self-heals would page; 15 minutes gives

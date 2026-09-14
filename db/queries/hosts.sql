@@ -354,6 +354,7 @@ SELECT h.id, @running_sandboxes, @provisioning_sandboxes, @paused_sandboxes,
        now()
 FROM host h
 WHERE h.id = @host_id AND h.vmd_addr = @vmd_addr
+  AND (h.incarnation_id IS NULL OR h.incarnation_id::text = sqlc.arg(incarnation_id)::text)
 -- FOR SHARE serializes the address check against an identity reclaim
 -- (which takes the row FOR UPDATE): without it this statement could
 -- evaluate the old address from its snapshot and insert stale pressure
@@ -447,3 +448,14 @@ WHERE h.status = 'active'
         AND hc.heartbeat_at = h.last_heartbeat_at
     )
   );
+
+-- name: PrepareHostHeartbeat :exec
+SELECT prepare_host_heartbeat(sqlc.arg(host_id)::text, sqlc.arg(incarnation_id)::text);
+
+-- name: BindHostIncarnation :exec
+UPDATE host SET incarnation_id = sqlc.arg(incarnation_id)::uuid
+WHERE id = sqlc.arg(host_id) AND incarnation_id IS NULL;
+
+-- name: RebindHostIncarnation :one
+SELECT rebind_host_incarnation(sqlc.arg(host_id)::text,
+    sqlc.arg(expected_incarnation)::uuid, sqlc.arg(new_incarnation)::uuid)::bigint AS peer_generation;

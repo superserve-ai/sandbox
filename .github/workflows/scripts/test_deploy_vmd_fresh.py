@@ -9,6 +9,8 @@ import tempfile
 import textwrap
 import unittest
 
+from shell_test_support import linux_shell_prelude
+
 SOURCE = Path(__file__).with_name('deploy-vmd.py').read_text()
 spec = importlib.util.spec_from_file_location('deploy_vmd_fresh', Path(__file__).with_name('deploy-vmd.py'))
 deploy_vmd = importlib.util.module_from_spec(spec)
@@ -103,7 +105,7 @@ journalctl() { :; }
             # Ownership is exercised by Linux CI (root); avoid changing ownership in local tests.
             script = script.replace('-o root -g root ', '')
             before = {str(p.relative_to(root)): (p.read_bytes(), p.stat().st_mode) for p in root.rglob('*') if p.is_file()}
-            result = subprocess.run(['bash', '-c', prelude + script + '\necho vmd-may-start\n'],
+            result = subprocess.run(['bash', '-c', linux_shell_prelude() + prelude + script + '\necho vmd-may-start\n'],
                 text=True, capture_output=True, env=dict(os.environ, CALLS=str(root/'calls'),
                 CA_DIR=str(root/'var/lib/secretsproxy'), FAIL_DAEMON=str(int(fail_daemon))))
             if missing_input and not configured:

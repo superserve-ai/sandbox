@@ -164,6 +164,7 @@ class OtelRenderedDeploymentTests(unittest.TestCase):
     def exercise(self, fail='', existing=False):
         import os
         import tempfile
+        from shell_test_support import linux_shell_prelude
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             staging = root / 'staging'
@@ -197,7 +198,7 @@ curl() {
 }
 journalctl() { :; }
 '''
-            result = subprocess.run(['bash', '-c', prelude + script], capture_output=True, text=True,
+            result = subprocess.run(['bash', '-c', linux_shell_prelude() + prelude + script], capture_output=True, text=True,
                                     env=dict(os.environ, FAIL=fail, STATE=tmp, CALLS=str(root/'calls')))
             env_file = root/'etc/sandbox/otel/collector.env'
             self.assertEqual(env_file.read_text(), 'GCP_PROJECT=example-project\nGCP_ZONE=us-central1-a\nHOST_ID=example-host\n')

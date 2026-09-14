@@ -120,6 +120,8 @@ Env vars:
 Fresh or partially configured hosts require CONTROL_PLANE_URL, DATABASE_URL and
 INTERNAL_API_TOKEN from deployment inputs before any host changes. Configured
 hosts may omit inputs to preserve their existing values.
+Every host requires operator-installed host-identity.json and host-identity.env
+before deployment; this workflow never creates or repairs installation identity.
 
 All deploy artifacts (binaries + systemd units + scripts) are packed
 into a single tarball and SCP'd once per host. Each gcloud SCP/SSH
@@ -148,6 +150,40 @@ def deployment_host_region(region, zone):
     if not match or (region and region != match[1]):
         raise ValueError('deployment region does not match the instance zone')
     return region or match[1]
+
+
+def host_identity_preflight():
+    """Verify the installer-owned file pair without sourcing shell input."""
+    return textwrap.dedent("""
+        set -euo pipefail
+        if ! sudo python3 - <<'PY'
+        import json
+        from pathlib import Path
+        import re
+        import sys
+        import uuid
+
+        try:
+            state = json.loads(Path('/etc/sandbox/host-identity.json').read_text())
+            for key in ('host_id', 'incarnation_id', 'project_id', 'instance_id'):
+                if not isinstance(state[key], str) or not state[key].strip():
+                    raise ValueError('invalid identity field')
+            if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,255}', state['host_id']):
+                raise ValueError('invalid host ID')
+            if uuid.UUID(state['incarnation_id']).int == 0:
+                raise ValueError('empty incarnation')
+            expected = ['HOST_ID=' + state['host_id'],
+                        'HOST_IDENTITY_FILE=/etc/sandbox/host-identity.json']
+            if Path('/etc/sandbox/host-identity.env').read_text().splitlines() != expected:
+                raise ValueError('identity environment does not match installation')
+        except (OSError, ValueError, KeyError, TypeError):
+            sys.exit(1)
+        PY
+        then
+            echo "ERROR: missing or invalid host identity; complete deploy/host-generation-rollout.md identity installation before retrying (host unchanged)" >&2
+            exit 1
+        fi
+    """)
 
 
 def runtime_input_preflight(control_plane_url, database_url, internal_api_token):
@@ -483,15 +519,13 @@ def main() -> int:
         q_host_id_line = shlex.quote(f"HOST_ID={name}")
         q_host_region_line = shlex.quote(f"HOST_REGION={deployment_host_region(region, zone)}")
 
-        input_preflight = runtime_input_preflight(control_plane_url, database_url, internal_api_token)
-        # Probe before even uploading when missing inputs might require aborting.
-        # Fully supplied deploys need no additional SSH round trip.
-        if not all(value.strip() for value in (control_plane_url, database_url, internal_api_token)):
-            run_or_die([
-                "gcloud", "compute", "ssh", name,
-                f"--zone={zone}", f"--project={project}",
-                "--quiet", "--tunnel-through-iap", "--command", input_preflight,
-            ], f"[{tag}] runtime input preflight")
+        input_preflight = host_identity_preflight() + runtime_input_preflight(control_plane_url, database_url, internal_api_token)
+        # Identity is mandatory even when all runtime inputs are supplied.
+        run_or_die([
+            "gcloud", "compute", "ssh", name,
+            f"--zone={zone}", f"--project={project}",
+            "--quiet", "--tunnel-through-iap", "--command", input_preflight,
+        ], f"[{tag}] runtime input preflight")
 
         # Single SCP — one IAP tunnel for the whole bundle.
         run_or_die(

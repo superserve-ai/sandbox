@@ -1,8 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,6 +44,77 @@ func TestLoadConfigRequiresExplicitHostID(t *testing.T) {
 			}
 			if cfg.HostID != tc.hostID {
 				t.Fatalf("cfg.HostID = %q, want %q", cfg.HostID, tc.hostID)
+			}
+		})
+	}
+}
+
+func TestLoadConfigIdentityPrerequisite(t *testing.T) {
+	t.Setenv("KERNEL_PATH", "/tmp/kernel")
+	t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
+	t.Setenv("HOST_ID", "example-region-2")
+	t.Setenv("GRPC_PORT", "50051")
+	t.Setenv("HOST_REGION", "example-region")
+	t.Setenv("VMD_SCHEDULABLE_MEMORY_MIB", "1024")
+	t.Setenv("VMD_SCHEDULABLE_VCPUS", "2")
+	t.Setenv("SECRETSPROXY_SANDBOX_ADDR", "")
+	missing := filepath.Join(t.TempDir(), "missing.json")
+	corrupt := filepath.Join(t.TempDir(), "corrupt.json")
+	if err := os.WriteFile(corrupt, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name     string
+		required string
+		path     string
+		wantErr  string
+	}{
+		{"legacy unbound host", "", "", ""},
+		{"new host without identity path", "1", "", "HOST_IDENTITY_FILE is required"},
+		{"new host with missing identity", "1", missing, "host identity missing"},
+		{"new host with corrupt identity", "1", corrupt, "invalid or mismatched host identity"},
+		{"installed legacy host with missing identity", "", missing, "host identity missing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOST_IDENTITY_REQUIRED", tc.required)
+			t.Setenv("HOST_IDENTITY_FILE", tc.path)
+			cfg, err := loadConfig()
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("loadConfig() error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || cfg.HostID != "example-region-2" || cfg.IncarnationID != "" {
+				t.Fatalf("legacy config = %+v, %v", cfg, err)
+			}
+		})
+	}
+}
+
+func TestIdentityRequiresHeartbeatDescriptionBeforeStartup(t *testing.T) {
+	t.Setenv("KERNEL_PATH", "/tmp/kernel")
+	t.Setenv("BASE_ROOTFS_PATH", "/tmp/rootfs")
+	t.Setenv("HOST_ID", "default")
+	t.Setenv("HOST_IDENTITY_FILE", filepath.Join(t.TempDir(), "missing.json"))
+	t.Setenv("SANDBOX_ID_REGION", "")
+	for _, tc := range []struct {
+		key, value string
+	}{
+		{"HOST_REGION", ""}, {"HOST_REGION", " "}, {"HOST_REGION", strings.Repeat("x", 257)},
+		{"VMD_SCHEDULABLE_MEMORY_MIB", ""}, {"VMD_SCHEDULABLE_MEMORY_MIB", "0"},
+		{"VMD_SCHEDULABLE_MEMORY_MIB", "-1"}, {"VMD_SCHEDULABLE_MEMORY_MIB", "2147483648"},
+		{"VMD_SCHEDULABLE_VCPUS", ""}, {"VMD_SCHEDULABLE_VCPUS", "0"},
+		{"VMD_SCHEDULABLE_VCPUS", "-1"}, {"VMD_SCHEDULABLE_VCPUS", "invalid"},
+	} {
+		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+			t.Setenv("HOST_REGION", "example-region")
+			t.Setenv("VMD_SCHEDULABLE_MEMORY_MIB", "1024")
+			t.Setenv("VMD_SCHEDULABLE_VCPUS", "2")
+			t.Setenv(tc.key, tc.value)
+			_, err := loadConfig()
+			if err == nil || !strings.Contains(err.Error(), "identity-bound VMD requires "+tc.key) {
+				t.Fatalf("loadConfig error = %v; want explicit %s prerequisite before identity verification", err, tc.key)
 			}
 		})
 	}
@@ -182,6 +258,44 @@ func TestAdvertisedAddrsShareOneHostLookup(t *testing.T) {
 	}
 	if resolved != 1 {
 		t.Fatalf("host interface resolved %d times, want 1", resolved)
+	}
+}
+
+func TestResolveHeartbeatAddressesRecovers(t *testing.T) {
+	for _, failedEndpoint := range []string{"vmd", "proxy"} {
+		t.Run(failedEndpoint, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			attempts := 0
+			resolve := func() (string, string, error) {
+				attempts++
+				if attempts == 1 {
+					if failedEndpoint == "proxy" {
+						return "192.0.2.3:50051", "", fmt.Errorf("temporary proxy address failure")
+					}
+					return "", "", fmt.Errorf("temporary interface failure")
+				}
+				return "192.0.2.3:50051", "192.0.2.3:5009", nil
+			}
+			vmdAddr, proxyAddr, err := resolveHeartbeatAddresses(ctx, time.Millisecond, resolve, zerolog.Nop())
+			if err != nil || vmdAddr != "192.0.2.3:50051" || proxyAddr != "192.0.2.3:5009" || attempts != 2 {
+				t.Fatalf("resolution = %q, %q, %v after %d attempts", vmdAddr, proxyAddr, err, attempts)
+			}
+		})
+	}
+}
+
+func TestResolveHeartbeatAddressesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	attempts := 0
+	vmdAddr, proxyAddr, err := resolveHeartbeatAddresses(ctx, time.Hour, func() (string, string, error) {
+		attempts++
+		cancel()
+		return "192.0.2.3:50051", "", fmt.Errorf("address unavailable")
+	}, zerolog.Nop())
+	if err != context.Canceled || vmdAddr != "" || proxyAddr != "" || attempts != 1 {
+		t.Fatalf("canceled resolution = %q, %q, %v after %d attempts", vmdAddr, proxyAddr, err, attempts)
 	}
 }
 
@@ -384,5 +498,42 @@ func TestPublishesCapacityPressureRequiresBothHalves(t *testing.T) {
 					tc.advertiseAddr, tc.controlPlaneURL, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestIdentityVerificationTiming(t *testing.T) {
+	for _, verificationErr := range []error{nil, context.DeadlineExceeded} {
+		var output bytes.Buffer
+		st := &startupTimer{log: zerolog.New(&output), ch: make(chan func(), 1)}
+		st.identityVerification(25*time.Millisecond, verificationErr)
+		if output.Len() != 0 {
+			t.Fatal("identity timing wrote synchronously")
+		}
+		if verificationErr != nil {
+			if len(st.ch) != 0 {
+				t.Fatal("failure timing depends on the asynchronous queue")
+			}
+			// Use the configuration-failure logger without exiting this test process.
+			st.log.Error().Err(verificationErr).Msg("failed to load configuration")
+		} else {
+			select {
+			case write := <-st.ch:
+				write()
+			default:
+				t.Fatal("identity timing was not queued")
+			}
+		}
+		var record struct {
+			Component string  `json:"startup_component"`
+			Duration  float64 `json:"duration_ms"`
+			Budget    float64 `json:"budget_ms"`
+			Success   bool    `json:"success"`
+		}
+		if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Component != "identity_verification" || record.Duration != 25 || record.Budget != 3000 || record.Success != (verificationErr == nil) {
+			t.Fatalf("unexpected timing: %s", output.String())
+		}
 	}
 }

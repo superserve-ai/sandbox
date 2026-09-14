@@ -9,6 +9,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
@@ -25,10 +26,25 @@ func (q *Queries) BindHostIdentity(ctx context.Context, id string) error {
 	return err
 }
 
+const bindHostIncarnation = `-- name: BindHostIncarnation :exec
+UPDATE host SET incarnation_id = $1::uuid
+WHERE id = $2 AND incarnation_id IS NULL
+`
+
+type BindHostIncarnationParams struct {
+	IncarnationID uuid.UUID `json:"incarnation_id"`
+	HostID        string    `json:"host_id"`
+}
+
+func (q *Queries) BindHostIncarnation(ctx context.Context, arg BindHostIncarnationParams) error {
+	_, err := q.db.Exec(ctx, bindHostIncarnation, arg.IncarnationID, arg.HostID)
+	return err
+}
+
 const createHost = `-- name: CreateHost :one
 INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation
 `
 
 type CreateHostParams struct {
@@ -62,6 +78,8 @@ func (q *Queries) CreateHost(ctx context.Context, arg CreateHostParams) (Host, e
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
 	)
 	return i, err
 }
@@ -79,7 +97,7 @@ func (q *Queries) DeleteHostPressure(ctx context.Context, hostID string) error {
 }
 
 const getHost = `-- name: GetHost :one
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host WHERE id = $1
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation FROM host WHERE id = $1
 `
 
 func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
@@ -97,6 +115,8 @@ func (q *Queries) GetHost(ctx context.Context, id string) (Host, error) {
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
 	)
 	return i, err
 }
@@ -176,7 +196,7 @@ func (q *Queries) GetHostCapabilityDiagnostics(ctx context.Context, arg GetHostC
 }
 
 const getHostForUpdate = `-- name: GetHostForUpdate :one
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host WHERE id = $1 FOR UPDATE
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation FROM host WHERE id = $1 FOR UPDATE
 `
 
 // Row-locked read for the heartbeat's identity check, so the guard and the
@@ -196,6 +216,8 @@ func (q *Queries) GetHostForUpdate(ctx context.Context, id string) (Host, error)
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
 	)
 	return i, err
 }
@@ -312,7 +334,7 @@ func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCa
 }
 
 const listActiveHosts = `-- name: ListActiveHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation FROM host
 WHERE status = 'active'
 ORDER BY created_at ASC
 `
@@ -338,6 +360,8 @@ func (q *Queries) ListActiveHosts(ctx context.Context) ([]Host, error) {
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.IdentityBound,
+			&i.IncarnationID,
+			&i.PeerGeneration,
 		); err != nil {
 			return nil, err
 		}
@@ -557,7 +581,7 @@ func (q *Queries) ListCapacityCandidates(ctx context.Context, arg ListCapacityCa
 }
 
 const listHosts = `-- name: ListHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation FROM host
 ORDER BY created_at ASC
 `
 
@@ -582,6 +606,8 @@ func (q *Queries) ListHosts(ctx context.Context) ([]Host, error) {
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.IdentityBound,
+			&i.IncarnationID,
+			&i.PeerGeneration,
 		); err != nil {
 			return nil, err
 		}
@@ -742,7 +768,7 @@ func (q *Queries) ListHostsAdmin(ctx context.Context, id *string) ([]ListHostsAd
 }
 
 const listStaleHosts = `-- name: ListStaleHosts :many
-SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound FROM host
+SELECT id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation FROM host
 WHERE status = 'active'
   AND last_heartbeat_at IS NOT NULL
   AND last_heartbeat_at < $1
@@ -772,6 +798,8 @@ func (q *Queries) ListStaleHosts(ctx context.Context, lastHeartbeatAt pgtype.Tim
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.IdentityBound,
+			&i.IncarnationID,
+			&i.PeerGeneration,
 		); err != nil {
 			return nil, err
 		}
@@ -794,12 +822,44 @@ func (q *Queries) MarkHostUnhealthy(ctx context.Context, id string) error {
 	return err
 }
 
+const prepareHostHeartbeat = `-- name: PrepareHostHeartbeat :exec
+SELECT prepare_host_heartbeat($1::text, $2::text)
+`
+
+type PrepareHostHeartbeatParams struct {
+	HostID        string `json:"host_id"`
+	IncarnationID string `json:"incarnation_id"`
+}
+
+func (q *Queries) PrepareHostHeartbeat(ctx context.Context, arg PrepareHostHeartbeatParams) error {
+	_, err := q.db.Exec(ctx, prepareHostHeartbeat, arg.HostID, arg.IncarnationID)
+	return err
+}
+
+const rebindHostIncarnation = `-- name: RebindHostIncarnation :one
+SELECT rebind_host_incarnation($1::text,
+    $2::uuid, $3::uuid)::bigint AS peer_generation
+`
+
+type RebindHostIncarnationParams struct {
+	HostID              string    `json:"host_id"`
+	ExpectedIncarnation uuid.UUID `json:"expected_incarnation"`
+	NewIncarnation      uuid.UUID `json:"new_incarnation"`
+}
+
+func (q *Queries) RebindHostIncarnation(ctx context.Context, arg RebindHostIncarnationParams) (int64, error) {
+	row := q.db.QueryRow(ctx, rebindHostIncarnation, arg.HostID, arg.ExpectedIncarnation, arg.NewIncarnation)
+	var peer_generation int64
+	err := row.Scan(&peer_generation)
+	return peer_generation, err
+}
+
 const registerHost = `-- name: RegisterHost :one
 INSERT INTO host (id, vmd_addr, proxy_addr, region, status,
                   capacity_memory_mib, capacity_vcpus, last_heartbeat_at,
                   identity_bound)
 VALUES ($1, $2, $3, $4, 'provisioning', $5, $6, now(), true)
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation
 `
 
 type RegisterHostParams struct {
@@ -837,6 +897,8 @@ func (q *Queries) RegisterHost(ctx context.Context, arg RegisterHostParams) (Hos
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
 	)
 	return i, err
 }
@@ -919,7 +981,7 @@ SET last_heartbeat_at = now(),
     updated_at = now()
 FROM prev
 WHERE host.id = prev.id
-RETURNING host.id, host.vmd_addr, host.proxy_addr, host.region, host.status, host.capacity_memory_mib, host.capacity_vcpus, host.last_heartbeat_at, host.created_at, host.updated_at, host.identity_bound, prev.status AS prev_status
+RETURNING host.id, host.vmd_addr, host.proxy_addr, host.region, host.status, host.capacity_memory_mib, host.capacity_vcpus, host.last_heartbeat_at, host.created_at, host.updated_at, host.identity_bound, host.incarnation_id, host.peer_generation, prev.status AS prev_status
 `
 
 type UpdateHostHeartbeatRow struct {
@@ -934,6 +996,8 @@ type UpdateHostHeartbeatRow struct {
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
 	IdentityBound     bool               `json:"identity_bound"`
+	IncarnationID     pgtype.UUID        `json:"incarnation_id"`
+	PeerGeneration    *int64             `json:"peer_generation"`
 	PrevStatus        string             `json:"prev_status"`
 }
 
@@ -960,6 +1024,8 @@ func (q *Queries) UpdateHostHeartbeat(ctx context.Context, id string) (UpdateHos
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
 		&i.PrevStatus,
 	)
 	return i, err
@@ -990,7 +1056,7 @@ WHERE id = $1
   AND ($2 <> 'active'
        OR (last_heartbeat_at IS NOT NULL
            AND last_heartbeat_at > $3))
-RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound
+RETURNING id, vmd_addr, proxy_addr, region, status, capacity_memory_mib, capacity_vcpus, last_heartbeat_at, created_at, updated_at, identity_bound, incarnation_id, peer_generation
 `
 
 type UpdateHostStatusParams struct {
@@ -1019,6 +1085,8 @@ func (q *Queries) UpdateHostStatus(ctx context.Context, arg UpdateHostStatusPara
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.IdentityBound,
+		&i.IncarnationID,
+		&i.PeerGeneration,
 	)
 	return i, err
 }
@@ -1038,6 +1106,7 @@ SELECT h.id, $1, $2, $3,
        now()
 FROM host h
 WHERE h.id = $13 AND h.vmd_addr = $14
+  AND (h.incarnation_id IS NULL OR h.incarnation_id::text = $15::text)
 FOR SHARE
 ON CONFLICT (host_id) DO UPDATE SET
     running_sandboxes = EXCLUDED.running_sandboxes,
@@ -1070,6 +1139,7 @@ type UpsertHostPressureParams struct {
 	UnknownAllocationVms  int32  `json:"unknown_allocation_vms"`
 	HostID                string `json:"host_id"`
 	VmdAddr               string `json:"vmd_addr"`
+	IncarnationID         string `json:"incarnation_id"`
 }
 
 // Records a host's live pressure report, identity-fenced: the write
@@ -1102,6 +1172,7 @@ func (q *Queries) UpsertHostPressure(ctx context.Context, arg UpsertHostPressure
 		arg.UnknownAllocationVms,
 		arg.HostID,
 		arg.VmdAddr,
+		arg.IncarnationID,
 	)
 	if err != nil {
 		return 0, err

@@ -586,15 +586,15 @@ module "observability" {
       instance_id   = module.sandbox_host_c.instance_id
     }
   }
-  # Backup pipeline alerts scoped to this cell's host via the host_id
-  # metric label (vmd's HOST_ID — see metrics_host_id, which is not the
-  # instance name on this cell). Module
+  # Scope through the stable collector identity, retaining the legacy host_id
+  # selector until older collectors have rolled forward. Module
   # defaults hold regardless of the cell's traffic: the failure-rate
   # threshold keys on retry pressure (one stuck generation retries ~6
   # times/hour under the capped backoff), not on pause volume.
   backup_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Backup / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Backup / ${local.active_host_name}"
   }
   # Backup coverage: paused sandboxes with no verified backup at all,
   # sampled by the control plane from this cell's database. Created
@@ -624,8 +624,9 @@ module "observability" {
   # they mean "the controller engaged and still lost", not "the controller is
   # doing its job" — move them together with the ceiling or not at all.
   launch_path_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Launch path / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Launch path / ${local.active_host_name}"
   }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
   # the same host_id label the backup metrics use. Module defaults: warn at

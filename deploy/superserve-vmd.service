@@ -14,6 +14,7 @@ Wants=superserve-vms.service
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/test -s /etc/sandbox/host-identity.json
 ExecStart=/usr/local/bin/vmd
 
 # Reload the egress blocklist config (domains + CIDRs) without bouncing the
@@ -46,6 +47,9 @@ TimeoutStopSec=45s
 
 # Environment
 EnvironmentFile=/etc/sandbox/vmd.env
+# Bake this gate into provisioning images: socket activation can precede cloud-init.
+Environment=HOST_IDENTITY_REQUIRED=1
+EnvironmentFile=/etc/sandbox/host-identity.env
 
 LimitNOFILE=65536
 

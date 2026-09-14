@@ -1,3 +1,9 @@
+> For authoritative peer generation binding, in-place reinstall, or VM
+> replacement, follow [the host identity rollout](host-generation-rollout.md).
+> Replacement VMs receive new full host IDs; only same-VM rebuilds keep their ID
+> and use operator-authorized incarnation rebind. This standby bootstrap keeps
+> its legacy identity restrictions and does not provision replacement identity.
+
 # Cold-standby peer identity bootstrap
 
 Run staging first. The migration targets are `superserve-vmd-staging-2`
@@ -31,10 +37,13 @@ or generic rollout confirmation does not authorize Host 2 maintenance.
 For a future migration, set the repository variable
 `HOST_IDENTITY_ROLLOUT_READY=false` to pause automatic VMD and proxy deployments,
 and wait for in-flight deployments to finish. Use manual dispatch for the
-coordinated runtime rollout. Set it to `true` or remove it only after the
+coordinated runtime rollout. Set it to `true` only after the
 operator-applied plans succeed and Host 2 instance/identity changes are no-ops
-in both cells. An unset variable permits normal deployment; no migration or
-workflow pause is required merely to merge this change.
+in both cells and the [host identity rollout](host-generation-rollout.md)
+prerequisites are complete for all automatic VMD deployment targets. Retain
+`true` after rollout: automatic VMD deployments require that exact value;
+removing or unsetting the variable blocks them. An unset variable permits
+automatic proxy deployments only.
 
 Keep the GitHub Actions variable `HOST2_PEER_IDENTITY_READY_STAGING` unset
 until staging Host 2 completes migration and bootstrap verification; keep

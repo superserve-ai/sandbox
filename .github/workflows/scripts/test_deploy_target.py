@@ -15,7 +15,7 @@ SCRIPTS = Path(__file__).parent
 
 
 class DeployTargetTests(unittest.TestCase):
-    def test_automatic_rollouts_respect_explicit_maintenance_pause(self):
+    def test_automatic_rollouts_enforce_identity_gates(self):
         for kind in ('vmd', 'proxy'):
             workflow = (SCRIPTS.parent / f'deploy-{kind}.yml').read_text()
             # Read the gate up to the next job, preserving its nested steps.
@@ -24,8 +24,12 @@ class DeployTargetTests(unittest.TestCase):
             script = gate.split('        run: |\n', 1)[1]
             staging = workflow.split('  deploy-staging:\n', 1)[1].split('    steps:', 1)[0]
             self.assertRegex(staging, r'needs: \[[^\]]*migration-gate[^\]]*\]')
-            for event, ready, expected in (('push', '', 0), ('push', 'false', 1),
-                                            ('push', 'true', 0), ('workflow_dispatch', 'false', 0)):
+            cases = [('push', '', 1 if kind == 'vmd' else 0), ('push', 'false', 1),
+                     ('push', 'true', 0), ('workflow_dispatch', 'false', 0)]
+            if kind == 'vmd':
+                cases.extend([('push', 'TRUE', 1), ('push', '1', 1), ('push', ' true ', 1),
+                              ('workflow_dispatch', '', 0), ('workflow_dispatch', 'true', 0)])
+            for event, ready, expected in cases:
                 with self.subTest(kind=kind, event=event, ready=ready):
                     result = subprocess.run(['bash', '-eu', '-c', script], capture_output=True,
                                             env=dict(os.environ, DEPLOY_EVENT=event, ROLLOUT_READY=ready))

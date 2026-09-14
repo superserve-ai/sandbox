@@ -53,6 +53,7 @@ on:
       - 'internal/builder/**'
       - 'internal/db/**'
       - 'internal/egresspolicy/**'
+      - 'internal/hostidentity/**'
       - 'internal/network/**'
       - 'internal/presence/**'
       - 'internal/preview/**'
@@ -113,12 +114,12 @@ jobs:
   migration-gate:
     runs-on: ubuntu-latest
     steps:
-      - name: Respect explicit host identity maintenance pause
+      - name: Require host identity rollout readiness for push deployments
         env:
           DEPLOY_EVENT: ${{ github.event_name }}
           ROLLOUT_READY: ${{ vars.HOST_IDENTITY_ROLLOUT_READY }}
         run: |
-          if [ "$DEPLOY_EVENT" = push ] && [ "$ROLLOUT_READY" = false ]; then
+          if [ "$DEPLOY_EVENT" = push ] && [ "$ROLLOUT_READY" != true ]; then
             echo 'Host identity migration is not complete; use the coordinated manual rollout procedure.' >&2
             exit 1
           fi
