@@ -58,6 +58,21 @@ func respondPause(c *gin.Context, o pauseOutcome) {
 	}
 }
 
+// pauseResult scores a dispatch outcome as the synchronous answer to it would
+// have been scored, so a detached dispatch lands on the same series.
+func pauseResult(o pauseOutcome) string {
+	switch o {
+	case pauseDone:
+		return telemetry.ResultSuccess
+	case pauseGone:
+		return lifecycleResult(ErrSandboxGone.HTTPStatus)
+	case pauseUndecided:
+		return telemetry.ResultTimeout
+	default:
+		return lifecycleResult(ErrInternal.HTTPStatus)
+	}
+}
+
 func acceptPausing(c *gin.Context) {
 	c.Header("Retry-After", "1")
 	c.JSON(http.StatusAccepted, gin.H{"status": db.SandboxStatusPausing})

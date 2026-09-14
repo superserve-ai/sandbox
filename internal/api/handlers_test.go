@@ -3664,6 +3664,9 @@ func TestPauseSandbox_RespondAsync_AcceptedImmediately(t *testing.T) {
 	release := make(chan struct{})
 	var finalizes int32
 	h := &Handlers{VMD: gatedPause(release), DB: db.New(pauseMocks(sb, &finalizes))}
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
 
 	req := pauseRequest(sandboxID.String())
 	req.Header.Set("Prefer", "respond-async")
@@ -3679,9 +3682,15 @@ func TestPauseSandbox_RespondAsync_AcceptedImmediately(t *testing.T) {
 	if atomic.LoadInt32(&finalizes) != 0 {
 		t.Fatal("finalized before the host answered")
 	}
+	if len(rec.transitions) != 0 {
+		t.Fatalf("transitions = %+v at acceptance, want none: the 202 is not the pause's outcome", rec.transitions)
+	}
 
 	close(release)
 	h.WaitAsyncBookkeeping()
+	if len(rec.transitions) != 1 || rec.transitions[0].Operation != "pause" || rec.transitions[0].Result != telemetry.ResultSuccess || rec.transitions[0].Duration <= 0 {
+		t.Fatalf("transitions = %+v, want one pause success with the dispatch's duration", rec.transitions)
+	}
 	if atomic.LoadInt32(&finalizes) != 1 {
 		t.Fatalf("finalize calls after the host answered = %d, want 1", atomic.LoadInt32(&finalizes))
 	}

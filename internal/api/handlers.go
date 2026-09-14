@@ -3199,8 +3199,15 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 
 	// The pause is recorded; the caller is told so at once. Everything else,
 	// host resolution included, runs detached and lands on the row.
+	// The 202 only accepts the pause; the lifecycle metric gets the
+	// dispatch's own outcome and duration once it has decided.
+	DeferTelemetry(c)
 	bg := context.WithoutCancel(c.Request.Context())
-	h.asyncBookkeeping("pause-dispatch", func() { h.dispatchPause(bg, sandbox, leaseUntil, actorID, true, l) })
+	hostID := sandbox.HostID
+	h.asyncBookkeeping("pause-dispatch", func() {
+		outcome := h.dispatchPause(bg, sandbox, leaseUntil, actorID, true, l)
+		RecordSandboxTransition(bg, "pause", pauseResult(outcome), hostID, time.Since(tPause))
+	})
 	acceptPausing(c)
 }
 

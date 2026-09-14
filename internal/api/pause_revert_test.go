@@ -18,6 +18,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -129,6 +130,9 @@ func TestPauseSandbox_RespondAsync_UnresolvedHostLeavesPausing(t *testing.T) {
 		close(resolved)
 		return nil, errors.New("host not registered")
 	}}}
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
 
 	req := pauseRequest(sandboxID.String())
 	req.Header.Set("Prefer", "respond-async")
@@ -146,6 +150,9 @@ func TestPauseSandbox_RespondAsync_UnresolvedHostLeavesPausing(t *testing.T) {
 	}
 	if reverted || atomic.LoadInt32(&releases) != 1 {
 		t.Fatalf("reverted = %v, releases = %d; want the accepted claim kept and its lease handed back", reverted, releases)
+	}
+	if len(rec.transitions) != 1 || rec.transitions[0].Operation != "pause" || rec.transitions[0].Result != telemetry.ResultTimeout {
+		t.Fatalf("transitions = %+v, want the detached dispatch recorded as a pause timeout", rec.transitions)
 	}
 }
 

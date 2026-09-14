@@ -19,6 +19,11 @@ const telemetryHostIDKey = "telemetry_host_id"
 // status code alone would misreport it.
 const telemetryResultKey = "telemetry_result"
 
+// telemetryDeferredKey marks a request whose lifecycle transition the handler
+// records itself, once the work it detached has decided: the answer it sent
+// only accepted the operation.
+const telemetryDeferredKey = "telemetry_deferred"
+
 // phaseSeriesOwnedKey marks that a handler's deferred phase emission owns
 // this request's samples (set by PhaseStart, read by APIKeyAuth's fallback).
 const phaseSeriesOwnedKey = "phase_series_owned"
@@ -71,6 +76,21 @@ func SetTelemetryResult(c *gin.Context, result string) {
 	if c != nil && result != "" {
 		c.Set(telemetryResultKey, result)
 	}
+}
+
+// DeferTelemetry keeps the route-level lifecycle metric from scoring this
+// request: the handler records the transition itself when its detached work
+// has an outcome and a duration worth the name.
+func DeferTelemetry(c *gin.Context) {
+	if c != nil {
+		c.Set(telemetryDeferredKey, true)
+	}
+}
+
+func telemetryDeferred(c *gin.Context) bool {
+	v, ok := c.Get(telemetryDeferredKey)
+	deferred, _ := v.(bool)
+	return ok && deferred
 }
 
 func telemetryResult(c *gin.Context) string {
@@ -180,6 +200,9 @@ func SandboxLifecycleTelemetry() gin.HandlerFunc {
 		started := time.Now()
 		c.Next()
 
+		if telemetryDeferred(c) {
+			return
+		}
 		RecordSandboxTransition(
 			c.Request.Context(),
 			operation,

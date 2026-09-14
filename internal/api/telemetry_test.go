@@ -263,3 +263,26 @@ func TestSandboxLifecycleTelemetryHonorsTheHandlersResult(t *testing.T) {
 		t.Fatalf("transitions = %+v, want one pause recorded as a timeout despite the 202", rec.transitions)
 	}
 }
+
+func TestSandboxLifecycleTelemetrySkipsADeferredRequest(t *testing.T) {
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() {
+		SetTelemetryRecorder(nil)
+	})
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(SandboxLifecycleTelemetry())
+	r.POST("/sandboxes/:sandbox_id/pause", func(c *gin.Context) {
+		DeferTelemetry(c)
+		acceptPausing(c)
+	})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil))
+
+	if w.Code != http.StatusAccepted || len(rec.transitions) != 0 {
+		t.Fatalf("status = %d, transitions = %+v; want a 202 that records nothing itself", w.Code, rec.transitions)
+	}
+}
