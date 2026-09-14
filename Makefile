@@ -62,6 +62,8 @@ generate-proto:
 	protoc --go_out=. --go_opt=module=github.com/superserve-ai/sandbox \
 		--go-grpc_out=. --go-grpc_opt=module=github.com/superserve-ai/sandbox \
 		proto/*.proto
+	protoc --connect-go_out=. --connect-go_opt=module=github.com/superserve-ai/sandbox \
+		proto/boxd.proto
 
 ## Database
 
