@@ -129,10 +129,20 @@ type VMInstance struct {
 	ArtifactID string
 	// SnapshotWorkloadFrozen: see VMRecord.
 	SnapshotWorkloadFrozen *bool
-	CreatedAt              time.Time
-	Metadata               map[string]string
-	TeamID                 string // owning team; carried for data-plane usage attribution
-	OwnerID                string // creating user; empty when unknown
+	// WakePending / ClockFrozen / WakeOwedFromPaused: see VMRecord.
+	WakePending        bool
+	ClockFrozen        bool
+	WakeOwedFromPaused bool
+	// FreezeToken is the token the image's freeze carries; a wake must present it.
+	FreezeToken string
+	// WakeToken, WakeSnapshotPath, WakeMemPath: see VMRecord.
+	WakeToken        string
+	WakeSnapshotPath string
+	WakeMemPath      string
+	CreatedAt        time.Time
+	Metadata         map[string]string
+	TeamID           string // owning team; carried for data-plane usage attribution
+	OwnerID          string // creating user; empty when unknown
 	// PausedAt records when this VM last entered the paused state. It drives
 	// oldest-first pressure reclamation. Zero means the field is unset on a
 	// legacy record; callers fall back to CreatedAt and then place any fully
@@ -363,6 +373,9 @@ type ManagerConfig struct {
 	// its own wall clock on wake; everything else stays on legacy behaviour whatever
 	// this says. Default false.
 	GuestClockFreezeEnabled bool
+	// GuestFreezeBudget bounds the pause-side wait for a guest to stop its
+	// workload before a frozen snapshot; only paid when a pause freezes.
+	GuestFreezeBudget time.Duration
 
 	// RequirePresenceSidecar controls refusing a layered UFFD restore whose
 	// overlay has no .presence side-car next to it. Without the side-car,
@@ -705,6 +718,9 @@ type Manager struct {
 	// older Firecracker under a running daemon, and the first restore it refuses
 	// clears this for good.
 	clockRealtimeCapable atomic.Bool
+	// guestClockUnready latches once a guest reported it cannot correct its
+	// clock: every later restore takes the unfrozen path until vmd restarts.
+	guestClockUnready atomic.Bool
 	// dirtyTrackingSessionCapable is the same probe for the guarded-session
 	// fields, demoted on the first refusal exactly like the clock flag.
 	dirtyTrackingSessionCapable atomic.Bool
