@@ -124,3 +124,14 @@ variable "notification_channel_ids" {
   type        = list(string)
   default     = []
 }
+
+variable "cloud_ids_runbook_base_url" {
+  description = "Shared HTTPS runbook base URL supplied through the RUNBOOK_BASE_URL repository Actions variable."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>?#()\\[\\]]*)?$", var.cloud_ids_runbook_base_url))
+    error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
+  }
+}
