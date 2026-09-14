@@ -49,6 +49,11 @@ jobs:
           terraform -chdir=infra/modules/managed-identity-host init -backend=false -input=false
           terraform -chdir=infra/modules/managed-identity-host test
 
+      - name: Test Cloud IDS triage alerts with mocked provider
+        run: |
+          terraform -chdir=infra/modules/cloud-ids init -backend=false -input=false
+          terraform -chdir=infra/modules/cloud-ids test
+
   terraform-plan-summary:
     name: Terraform Plan Summary
     runs-on: ubuntu-latest
