@@ -3371,8 +3371,9 @@ func TestDeferredNotificationDoesNotStallTheBatch(t *testing.T) {
 	}
 }
 
-// A full page of deferred entries does not hide what sorts behind it: the
-// flush pages on and delivers the ready entry in the same pass.
+// A full page of deferred entries does not hide what sorts behind it: each
+// flush still reads one page, but the next flush starts past a deferred
+// page, reaches the ready entry, and then returns to the top.
 func TestDeferredPageDoesNotHideLaterNotifications(t *testing.T) {
 	j, _ := testJournal(t)
 	for i := 0; i < notifyFlushBatch; i++ {
@@ -3401,8 +3402,18 @@ func TestDeferredPageDoesNotHideLaterNotifications(t *testing.T) {
 		return nil
 	}}
 	u.flushNotifications()
+	if len(delivered) != 0 {
+		t.Fatalf("delivered = %v on the first flush, want none: one page per flush", delivered)
+	}
+	if u.notifyCursor == nil {
+		t.Fatal("a full deferred page did not move the cursor past itself")
+	}
+	u.flushNotifications()
 	if len(delivered) != 1 || delivered[0] != ready.SandboxID {
-		t.Fatalf("delivered = %v, want the ready entry behind a full deferred page", delivered)
+		t.Fatalf("delivered = %v on the second flush, want the ready entry behind the deferred page", delivered)
+	}
+	if u.notifyCursor != nil {
+		t.Fatal("the end of the outbox did not return the cursor to the top")
 	}
 	pending, err := j.PendingNotifications(0)
 	if err != nil || len(pending) != notifyFlushBatch {
