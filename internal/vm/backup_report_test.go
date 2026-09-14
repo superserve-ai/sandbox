@@ -2,6 +2,7 @@ package vm
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -273,5 +274,20 @@ func TestBackupReporterStripsPauseTokenForOldControlPlane(t *testing.T) {
 		strings.Contains(bodies[1], `"pause_token"`) || !strings.Contains(bodies[1], `"object"`) ||
 		strings.Contains(bodies[2], `"pause_token"`) || strings.Contains(bodies[2], `"object"`) {
 		t.Fatalf("bodies = %q, want token stripped first, then object paths", bodies)
+	}
+}
+
+// A 503 naming an in-flight finalize is a deferral for this report alone,
+// surfaced as such so the outbox flush can carry on past it.
+func TestBackupReporterDefersAnInFlightFinalize(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":{"code":"finalize_in_flight","message":"pause finalization in progress; retry"}}`))
+	}))
+	defer srv.Close()
+	r := &BackupReporter{ControlPlaneURL: srv.URL, HostID: "h", Token: "t", Bucket: "b", Log: zerolog.Nop()}
+	err := r.Deliver(backup.Task{SandboxID: "sb", Generation: "g"})
+	if !errors.Is(err, backup.ErrNotificationDeferred) {
+		t.Fatalf("Deliver = %v, want the deferral sentinel", err)
 	}
 }

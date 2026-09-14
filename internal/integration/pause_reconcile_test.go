@@ -5,10 +5,13 @@ package integration
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
@@ -297,5 +300,94 @@ func TestIntegration_PauseReconcile_KeepsTheRequestingActor(t *testing.T) {
 			t.Fatalf("paused activity attributed to the requester = %d rows, want 1", n)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func createActive(t *testing.T, r *gin.Engine, apiKey, name string) uuid.UUID {
+	t.Helper()
+	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"`+name+`"}`)
+	if cw.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
+	}
+	return uuid.MustParse(mustJSON(t, cw)["id"].(string))
+}
+func TestIntegration_PauseHandler_UndecidedHostLeavesPausing(t *testing.T) {
+	_, apiKey := seedTeamAndKey(t)
+	vmd := undecidedHost()
+	h := pauseHandlers(t, vmd)
+	r := api.SetupRouter(t.Context(), h, testPool)
+	id := createActive(t, r, apiKey, "pause-undecided")
+
+	if pw := do(r, "POST", "/sandboxes/"+id.String()+"/pause", apiKey, ""); pw.Code != http.StatusAccepted || !strings.Contains(pw.Body.String(), `"pausing"`) {
+		t.Fatalf("pause: %d %s, want accepted as pausing", pw.Code, pw.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+
+	if got := readPauseOp(t, id); got.status != "pausing" || !got.opID.Valid || got.leased {
+		t.Fatalf("after undecided pause: %+v, want pausing with the operation kept and its lease released", got)
+	}
+	if n := vmd.pauseCalls.Load(); n != 2 {
+		t.Fatalf("host attempts = %d, want the foreground's two", n)
+	}
+}
+
+// The host's answer lands after the row has moved on to a newer run: a
+// NotFound then must not fail what is now an active sandbox.
+func TestIntegration_PauseHandler_LateNotFoundCannotFailANewerState(t *testing.T) {
+	teamID, apiKey := seedTeamAndKey(t)
+	id := seedActiveSandbox(t, teamID, "late-notfound")
+	vmd := &stubVMD{pauseFn: func(ctx context.Context, _, _ string) (string, string, []vmdclient.ManifestEntry, string, error) {
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET status = 'active', pause_op_lease_version = pause_op_lease_version + 1 WHERE id = $1`, id); err != nil {
+			t.Error(err)
+		}
+		return "", "", nil, "", status.Error(codes.NotFound, "no such vm")
+	}}
+	h := pauseHandlers(t, vmd)
+	r := api.SetupRouter(t.Context(), h, testPool)
+
+	if pw := do(r, "POST", "/sandboxes/"+id.String()+"/pause", apiKey, ""); pw.Code != http.StatusGone {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+
+	if got := readPauseOp(t, id); got.status != "active" {
+		t.Fatalf("late NotFound changed the newer state to %s", got.status)
+	}
+}
+
+// Same race through the generation finalize path (no legacy unique index):
+// a snapshot that arrives after the row started resuming must not turn it
+// back into paused.
+func TestIntegration_PauseHandler_GenerationFinalizeCannotUndoAResume(t *testing.T) {
+	ctx := context.Background()
+	if _, err := testPool.Exec(ctx, `DROP INDEX IF EXISTS snapshot_sandbox_unique`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(ctx,
+			`CREATE UNIQUE INDEX IF NOT EXISTS snapshot_sandbox_unique ON snapshot (sandbox_id)`); err != nil {
+			t.Error(err)
+		}
+	})
+	teamID, apiKey := seedTeamAndKey(t)
+	id := seedActiveSandbox(t, teamID, "late-finalize")
+	vmd := &stubVMD{pauseFn: func(ctx context.Context, _, token string) (string, string, []vmdclient.ManifestEntry, string, error) {
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET status = 'resuming', pause_op_lease_version = pause_op_lease_version + 1 WHERE id = $1`, id); err != nil {
+			t.Error(err)
+		}
+		return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, token, nil
+	}}
+	h := pauseHandlers(t, vmd)
+	r := api.SetupRouter(t.Context(), h, testPool)
+
+	if pw := do(r, "POST", "/sandboxes/"+id.String()+"/pause", apiKey, ""); pw.Code != http.StatusNoContent {
+		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
+	}
+	h.WaitAsyncBookkeeping()
+
+	if got := readPauseOp(t, id); got.status != "resuming" {
+		t.Fatalf("late finalize changed resuming to %s", got.status)
 	}
 }

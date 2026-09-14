@@ -24,7 +24,8 @@ import (
 // anything else is retried.
 const (
 	pauseReconcileInterval = 30 * time.Second
-	// Claimable only after the caller's whole lease, so its attempt is over.
+	// Age gate for a row with no lease recorded; a leased row is claimable
+	// the moment its lease expires or is released.
 	pauseReconcileMinAge       = pauseLeaseSeconds
 	pauseReconcileLease  int32 = 75
 	// Must end before the lease does, leaving room for the finalize write.
@@ -167,7 +168,7 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 			l.Warn().Msg("pause reconcile: row moved on before finalize")
 			return
 		}
-		if !h.pauseLanded(ctx, row.ID, row.TeamID) {
+		if !h.pauseLanded(ctx, row.ID, row.TeamID, lease) {
 			RecordSandboxTransition(ctx, "reconcile_pause", telemetry.ResultError, row.HostID, time.Since(started))
 			l.Error().Err(err).Msg("pause reconcile: finalize failed, retrying later")
 			h.releasePauseLease(ctx, row.ID, lease, pauseRetryAfter(), l)
@@ -191,14 +192,20 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 	}
 }
 
-// pauseLanded answers for a finalize whose reply was lost: a row that now
-// reads paused with no operation was finalized by the lease holder, since
-// nothing else moves a leased row out of 'pausing'.
-func (h *Handlers) pauseLanded(ctx context.Context, id, teamID uuid.UUID) bool {
+// pauseLanded answers for a finalize whose reply was lost. The lease version
+// only moves when a worker claims the operation or a new pause begins, so a
+// row still at this lease's version that no longer carries the operation, and
+// was not deleted, was finalized by this holder, whatever it has been moved
+// to since. A moved version means another worker took the operation over and
+// its outcome, success or failed, is that worker's to record.
+func (h *Handlers) pauseLanded(ctx context.Context, id, teamID uuid.UUID, lease pauseLease) bool {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncTimeout)
 	defer cancel()
 	sb, err := h.DB.GetSandbox(rctx, db.GetSandboxParams{ID: id, TeamID: teamID})
-	return err == nil && sb.Status == db.SandboxStatusPaused && !sb.PauseOpID.Valid
+	if err != nil || sb.Status == db.SandboxStatusDeleted || sb.PauseOpLeaseVersion != lease.version {
+		return false
+	}
+	return !sb.PauseOpID.Valid || sb.PauseOpID.Bytes != lease.id.Bytes
 }
 
 // releasePauseLease hands an undecided pause back for a later attempt.

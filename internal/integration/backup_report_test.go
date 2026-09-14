@@ -449,5 +449,38 @@ func TestIntegration_BackupReport_DefersDuringTransitionalStatus(t *testing.T) {
 		if code := deliver(); code != http.StatusOK {
 			t.Fatalf("report during stale %q = %d, want 200", status, code)
 		}
+		// A durable pause operation keeps the transition live past that
+		// window until it is resolved: lease held, flagged for an operator,
+		// or lease long expired and waiting for the reconciler.
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET pause_op_id = gen_random_uuid(), pause_op_lease_until = now() + interval '1 minute',
+			                    pause_op_attention_at = NULL WHERE id = $1`, sandboxID); err != nil {
+			t.Fatalf("lease %s: %v", status, err)
+		}
+		if code := deliver(); code != http.StatusServiceUnavailable {
+			t.Fatalf("report during worked %q = %d, want 503 (deferred)", status, code)
+		}
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET pause_op_attention_at = now() WHERE id = $1`, sandboxID); err != nil {
+			t.Fatalf("flag %s: %v", status, err)
+		}
+		if code := deliver(); code != http.StatusServiceUnavailable {
+			t.Fatalf("report during flagged %q = %d, want 503 (still worked)", status, code)
+		}
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET pause_op_attention_at = NULL, pause_op_lease_until = now() - interval '20 minutes' WHERE id = $1`,
+			sandboxID); err != nil {
+			t.Fatalf("abandon %s: %v", status, err)
+		}
+		if code := deliver(); code != http.StatusServiceUnavailable {
+			t.Fatalf("report during abandoned %q = %d, want 503 (unresolved operation)", status, code)
+		}
+		if _, err := testPool.Exec(ctx,
+			`UPDATE sandbox SET pause_op_id = NULL, pause_op_lease_until = NULL WHERE id = $1`, sandboxID); err != nil {
+			t.Fatalf("clear %s: %v", status, err)
+		}
+		if code := deliver(); code != http.StatusOK {
+			t.Fatalf("report after the operation resolved on a stale %q = %d, want 200", status, code)
+		}
 	}
 }

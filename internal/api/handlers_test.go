@@ -3632,9 +3632,113 @@ func TestPauseSandbox_VMDError(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	// The host gave no answer, so the row stays 'pausing' for the reconciler
+	// and the caller is told so rather than "failed".
+	if w.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusAccepted, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"pausing"`) {
+		t.Errorf("body = %s, want status pausing", w.Body.String())
+	}
+}
+
+// gatedPause is a host that answers only once release is closed.
+func gatedPause(release <-chan struct{}) *stubVMD {
+	return &stubVMD{pauseFn: func(ctx context.Context, _, _ string) (string, string, error) {
+		select {
+		case <-release:
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		}
+	}}
+}
+
+// A client that prefers an asynchronous answer is told 'pausing' the moment
+// the pause is recorded; the host call carries on and its answer is recorded.
+func TestPauseSandbox_RespondAsync_AcceptedImmediately(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+	release := make(chan struct{})
+	var finalizes int32
+	h := &Handlers{VMD: gatedPause(release), DB: db.New(pauseMocks(sb, &finalizes))}
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
+
+	req := pauseRequest(sandboxID.String())
+	req.Header.Set("Prefer", "respond-async")
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusAccepted, w.Body.String())
+	}
+	if w.Header().Get("Retry-After") != "1" || !strings.Contains(w.Body.String(), `"status":"pausing"`) {
+		t.Fatalf("202 response = %v %s, want Retry-After: 1 and a pausing status", w.Header(), w.Body.String())
+	}
+	if atomic.LoadInt32(&finalizes) != 0 {
+		t.Fatal("finalized before the host answered")
+	}
+	if len(rec.transitions) != 0 {
+		t.Fatalf("transitions = %+v at acceptance, want none: the 202 is not the pause's outcome", rec.transitions)
+	}
+
+	close(release)
+	h.WaitAsyncBookkeeping()
+	if len(rec.transitions) != 1 || rec.transitions[0].Operation != "pause" || rec.transitions[0].Result != telemetry.ResultSuccess || rec.transitions[0].Duration <= 0 {
+		t.Fatalf("transitions = %+v, want one pause success with the dispatch's duration", rec.transitions)
+	}
+	if atomic.LoadInt32(&finalizes) != 1 {
+		t.Fatalf("finalize calls after the host answered = %d, want 1", atomic.LoadInt32(&finalizes))
+	}
+}
+
+// Even a host that answers at once is reported as 'pausing' to a client
+// that prefers an asynchronous answer; the finalize still lands.
+func TestPauseSandbox_RespondAsync_FastHostStillAccepted(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+	var finalizes int32
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(pauseMocks(sb, &finalizes))}
+
+	req := pauseRequest(sandboxID.String())
+	req.Header.Set("Prefer", "respond-async")
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+	h.WaitAsyncBookkeeping()
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusAccepted, w.Body.String())
+	}
+	if atomic.LoadInt32(&finalizes) != 1 {
+		t.Fatalf("finalize calls = %d, want 1", atomic.LoadInt32(&finalizes))
+	}
+}
+
+// Without the preference the request waits for the host as it always has.
+func TestPauseSandbox_NoPreference_WaitsForHost(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+	release := make(chan struct{})
+	var finalizes int32
+	h := &Handlers{VMD: gatedPause(release), DB: db.New(pauseMocks(sb, &finalizes))}
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		close(release)
+	}()
+
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if atomic.LoadInt32(&finalizes) != 1 {
+		t.Fatalf("finalize calls = %d, want 1", atomic.LoadInt32(&finalizes))
 	}
 }
 
@@ -4162,7 +4266,7 @@ func TestPauseWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
 		}
 		return "/snap/vmstate.snap", "/snap/mem.snap", nil
 	}}
-	snap, mem, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
+	snap, mem, _, _, err := (&Handlers{VMD: vmd}).pauseWithRetry(context.Background(), vmd, "host-1", "vm-1", "tok-test", time.Now().Add(time.Minute))
 	if err != nil {
 		t.Fatalf("retry should recover a transient failure, got %v", err)
 	}
@@ -4181,7 +4285,7 @@ func TestPauseWithRetry_NotFoundIsTerminal(t *testing.T) {
 		calls++
 		return "", "", notFound
 	}}
-	_, _, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
+	_, _, _, _, err := (&Handlers{VMD: vmd}).pauseWithRetry(context.Background(), vmd, "host-1", "vm-1", "tok-test", time.Now().Add(time.Minute))
 	if !isVMDNotFound(err) {
 		t.Fatalf("expected NotFound to surface, got %v", err)
 	}
