@@ -27,8 +27,8 @@ func TestFinalizeInFlight(t *testing.T) {
 			PauseOpID: op, PauseOpLeaseUntil: at(now.Add(-2 * time.Minute))}, true},
 		{"flagged for an operator but still worked", db.LockSandboxRowRow{Status: db.SandboxStatusPausing, UpdatedAt: now.Add(-20 * time.Minute),
 			PauseOpID: op, PauseOpLeaseUntil: at(now.Add(time.Minute)), PauseOpAttentionAt: at(now)}, true},
-		{"lease nobody has touched", db.LockSandboxRowRow{Status: db.SandboxStatusPausing, UpdatedAt: now.Add(-20 * time.Minute),
-			PauseOpID: op, PauseOpLeaseUntil: at(now.Add(-20 * time.Minute))}, false},
+		{"lease long expired, operation unresolved", db.LockSandboxRowRow{Status: db.SandboxStatusPausing, UpdatedAt: now.Add(-20 * time.Minute),
+			PauseOpID: op, PauseOpLeaseUntil: at(now.Add(-20 * time.Minute))}, true},
 		{"not transitional", db.LockSandboxRowRow{Status: db.SandboxStatusActive, UpdatedAt: now, PauseOpID: op, PauseOpLeaseUntil: at(now.Add(time.Minute))}, false},
 	} {
 		if got := finalizeInFlight(tc.row); got != tc.want {

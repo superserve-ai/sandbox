@@ -29,18 +29,16 @@ var errFinalizeInFlight = errors.New("pause finalization in flight")
 // finalizeInFlight reports whether a FinalizePause may be about to commit
 // for this sandbox: 'pausing' on the normal pause path, 'resuming' on the
 // resume-revert path (pauseAndRevert finalizes a pause from that status).
-// Bounded so a stranded transition cannot head-of-line-block the host's
-// outbox: a fresh transition counts, as does a pause operation whose lease
-// was held or renewed recently (its workers move the lease, never updated_at).
+// A transition without a pause operation is bounded so a stranded one cannot
+// head-of-line-block the host's outbox. One carrying an operation stays in
+// flight until the operation is resolved, however old its lease: the
+// reconciler finishes it, and only then can a report be matched to the
+// snapshot it describes.
 func finalizeInFlight(row db.LockSandboxRowRow) bool {
 	if row.Status != db.SandboxStatusPausing && row.Status != db.SandboxStatusResuming {
 		return false
 	}
-	if time.Since(row.UpdatedAt) < 10*time.Minute {
-		return true
-	}
-	return row.PauseOpID.Valid && row.PauseOpLeaseUntil.Valid &&
-		time.Since(row.PauseOpLeaseUntil.Time) < 10*time.Minute
+	return row.PauseOpID.Valid || time.Since(row.UpdatedAt) < 10*time.Minute
 }
 
 // maxBackupReportFiles bounds a report's manifest jsonb. Sandbox
