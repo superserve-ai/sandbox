@@ -682,7 +682,7 @@ func TestBillingPause_FreeWorkerStartsTheNextPause(t *testing.T) {
 // A cancelled process context (shutdown) must not turn an undispatched claim
 // into a failed sandbox: the revert runs detached and lands, and the terminal
 // fallback is never reached.
-func TestRevertToActiveOrFail_SurvivesCancellation(t *testing.T) {
+func TestRevertToActive_SurvivesCancellation(t *testing.T) {
 	sbx := expiredRow("sbx")
 	sbx.PauseOpID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
 	sbx.PauseOpLeaseVersion = 1
@@ -710,9 +710,46 @@ func TestRevertToActiveOrFail_SurvivesCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	h.revertToActiveOrFail(ctx, sbx, context.Canceled, zerolog.Nop())
+	h.revertToActive(ctx, sbx, context.Canceled, zerolog.Nop())
 
 	if atomic.LoadInt32(&reverts) != 1 || atomic.LoadInt32(&fails) != 0 {
 		t.Fatalf("reverts = %d, fails = %d; want the revert to land and no terminal fallback", reverts, fails)
+	}
+}
+
+// A revert the database refuses must not turn a VM nothing was sent to into a
+// 'failed' row: the claim stays 'pausing' with its lease handed back, and the
+// reconciler decides from the host.
+func TestRevertToActive_UnwritableRevertLeavesPausing(t *testing.T) {
+	sbx := expiredRow("sbx")
+	sbx.PauseOpID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	sbx.PauseOpLeaseVersion = 1
+	var fails, releases int32
+	h := newReaperHandlers(&reaperMockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: RevertPauseToActive :one"):
+				return errorRow(errors.New("connection reset"))
+			case strings.Contains(sql, "-- name: MarkSandboxFailed :one"):
+				atomic.AddInt32(&fails, 1)
+				return &mockRow{scanFn: func(dest ...any) error {
+					*dest[0].(*int64) = 1
+					return nil
+				}}
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "-- name: ReleasePauseLease ") {
+				atomic.AddInt32(&releases, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}, &stubVMD{})
+
+	h.revertToActive(context.Background(), sbx, errors.New("host not registered"), zerolog.Nop())
+
+	if atomic.LoadInt32(&fails) != 0 || atomic.LoadInt32(&releases) != 1 {
+		t.Fatalf("fails = %d, releases = %d; want no terminal write and the lease handed back", fails, releases)
 	}
 }

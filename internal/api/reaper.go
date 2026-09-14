@@ -376,7 +376,7 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxR
 	if vmdLookupErr != nil {
 		l.Error().Err(vmdLookupErr).Msg("reaper: resolve VMD failed — reverting to active")
 		RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
-		h.revertToActiveOrFail(ctx, sbx, vmdLookupErr, l)
+		h.revertToActive(ctx, sbx, vmdLookupErr, l)
 		return
 	}
 
@@ -438,11 +438,13 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxR
 	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", activity, "success", &sbx.Name, nil, nil)
 }
 
-// revertToActiveOrFail undoes a claim whose host could not be resolved: nothing
+// revertToActive undoes a claim whose host could not be resolved: nothing
 // was dispatched, so 'active' is the truth. Never after a dispatch. The revert
-// is fenced to the claim's lease; if it cannot be written the sandbox is marked
-// 'failed' under the same fence so the reaper does not loop.
-func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpiredSandboxRow, cause error, l zerolog.Logger) {
+// is fenced to the claim's lease. If it cannot be written, the VM is still
+// running and the row stays 'pausing' with its lease released: the reconciler
+// resolves the host again and decides, rather than a failed write turning a
+// running VM into a 'failed' row.
+func (h *Handlers) revertToActive(ctx context.Context, sbx db.ClaimExpiredSandboxRow, cause error, l zerolog.Logger) {
 	lease := pauseLease{id: sbx.PauseOpID, version: sbx.PauseOpLeaseVersion}
 	// Detached from cancellation: a shutdown that cut the host lookup short
 	// must not also cut this write short and hand a running VM to the
@@ -456,8 +458,8 @@ func (h *Handlers) revertToActiveOrFail(ctx context.Context, sbx db.ClaimExpired
 		PauseOpLeaseVersion: &lease.version,
 	})
 	if err != nil {
-		l.Error().Err(err).AnErr("cause", cause).Msg("reaper: revert to active failed, marking failed")
-		h.failPause(ctx, sbx.ID, sbx.HostID, lease, l)
+		l.Error().Err(err).AnErr("cause", cause).Msg("reaper: revert to active failed; left pausing for reconciliation")
+		h.releasePauseLease(ctx, sbx.ID, lease, 0, l)
 		return
 	}
 	if n == 0 {
