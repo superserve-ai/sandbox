@@ -3189,12 +3189,14 @@ components:
           type: string
         status:
           type: string
-          enum: [active, paused, resuming]
+          enum: [active, pausing, paused, resuming, failed]
           description: >
             Current state of the sandbox. `active` means running; `paused`
-            means paused and awaiting resume. `resuming` is a transient
-            state observed while the platform restores a paused sandbox
-            (e.g. via auto-resume on `/exec`); clients should retry shortly.
+            means paused and awaiting resume. `pausing` and `resuming` are
+            transient states observed while the platform pauses or restores
+            a sandbox (e.g. after a `202` from `/pause`, or auto-resume on
+            `/exec`); clients should poll or retry shortly. `failed` means
+            the sandbox can no longer be resumed.
         vcpu_count:
           type: integer
         memory_mib:
@@ -4215,7 +4217,7 @@ components:
           description: Env-var name the secret resolves to inside the sandbox.
         status:
           type: string
-          enum: [active, paused, resuming, failed]
+          enum: [active, pausing, paused, resuming, failed]
 
     ProviderShortcut:
       type: object
