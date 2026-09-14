@@ -4,12 +4,8 @@ configured label, in parallel.
 
 Env vars:
   GCP_PROJECT                required — project containing vmd hosts
-  GCP_REGION                 optional — only deploy to instances whose zone is
-                             in this region (e.g. us-central1). The prod
-                             project holds hosts for more than one cell, and
-                             the workflow deploys them sequentially, so an
-                             unscoped label filter would fold the cell host
-                             into the primary fan-out. Empty = no scoping.
+  GCP_REGION                 required — restrict discovery to this region
+  EXPECTED_STANDBY_HOST      optional — exact identity from select-deploy-target.sh
   VMD_LABEL                  required — gcloud instances list label filter
   VMD_INSTALL_DIR            required — bin install dir on the host
   SHA                        required — commit SHA (only first 8 chars used)
@@ -37,6 +33,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 def main() -> int:
     project = os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
+    if not region.strip():
+        print("ERROR: GCP_REGION is required; refusing unscoped deployment", file=sys.stderr)
+        return 1
+    expected_standby = os.environ.get("EXPECTED_STANDBY_HOST", "")
     label = os.environ.get("VMD_LABEL", "component=vmd")
     # The installed unit is superserve-vmd.service; retain an override for
     # environments that use a deliberately different unit name.
@@ -111,14 +111,14 @@ def main() -> int:
         [
             "gcloud", "compute", "instances", "list",
             f"--project={project}",
-            f"--filter=labels.{label} AND status=RUNNING",
-            "--format=csv[no-heading](name,zone)",
+            f"--filter=labels.{label}" + ("" if expected_standby else " AND status=RUNNING"),
+            "--format=csv[no-heading](name,zone,status)" if expected_standby else "--format=csv[no-heading](name,zone)",
         ],
         capture_output=True, text=True, check=True,
     )
 
     instances = [
-        {"name": r[0], "zone": r[1]}
+        {"name": r[0], "zone": r[1], "status": r[2] if len(r) > 2 else ""}
         for line in result.stdout.strip().splitlines()
         if line.strip()
         for r in [line.strip().split(",")]
@@ -129,13 +129,24 @@ def main() -> int:
     # against zone URIs is easy to get subtly wrong. Zero matches is a hard
     # failure either way — a deploy that silently skips a host is exactly
     # the drift this script exists to prevent.
-    if region:
-        instances = [
-            inst for inst in instances
-            if inst["zone"].split("/")[-1].startswith(f"{region}-")
-        ]
+    instances = [
+        inst for inst in instances
+        if inst["zone"].split("/")[-1].startswith(f"{region}-")
+    ]
 
-    where = f"{project} ({region})" if region else project
+    if expected_standby:
+        if (not instances and os.environ.get("DEPLOY_EVENT") == "workflow_dispatch"
+                and os.environ.get("DEPLOY_ENVIRONMENT") == "production"
+                and os.environ.get("DEPLOY_TARGET") == "standby"
+                and os.environ.get("DEPLOY_CELL") == "staging"):
+            print("No staging standby found; continuing to the selected production standby.")
+            return 0
+        if (len(instances) != 1 or instances[0]["name"] != expected_standby
+                or instances[0]["status"] != "RUNNING"):
+            print(f"ERROR: expected exactly one running standby {expected_standby} in {region}", file=sys.stderr)
+            return 1
+
+    where = f"{project} ({region})"
     if not instances:
         print(f"No instances with label {label} found in {where}", file=sys.stderr)
         return 1
