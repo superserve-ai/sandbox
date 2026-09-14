@@ -219,6 +219,28 @@ type VMRecord struct {
 	// cannot leave an older answer for the next resume to act on. Tri-state
 	// for the same reason as CorrectsWallClock; nil means "ask the disk".
 	SnapshotWorkloadFrozen *bool `json:"snapshot_workload_frozen,omitempty"`
+	// WakePending: restored, the guest not yet told to correct its clock and
+	// release its workload; written with the Running record so a crash between
+	// the two completes the wake on recovery. ClockFrozen is the policy the
+	// restore used; FreezeToken the token the image's freeze carries.
+	WakePending bool   `json:"wake_pending,omitempty"`
+	ClockFrozen bool   `json:"clock_frozen,omitempty"`
+	FreezeToken string `json:"freeze_token,omitempty"`
+	// WakeToken is the token the owed wake must present: that of the image
+	// being loaded, kept apart from FreezeToken, which describes the image the
+	// record names, until the commit. A resume from an override that dies
+	// between the two returns to Paused with its own image and token intact.
+	WakeToken string `json:"wake_token,omitempty"`
+	// WakeSnapshotPath / WakeMemPath name the image an owed wake is for when
+	// it is not the record's own: a resume from an override. A wake completed
+	// by recovery commits them as the record's image; a failed one drops them.
+	WakeSnapshotPath string `json:"wake_snapshot_path,omitempty"`
+	WakeMemPath      string `json:"wake_mem_path,omitempty"`
+	// WakeOwedFromPaused: the record owing the wake was Paused before this
+	// resume began, so its image is intact. A crash before the launch, or a
+	// wake that never completes, returns it to Paused; a create in the same
+	// state is a failed create and is reaped.
+	WakeOwedFromPaused bool `json:"wake_owed_from_paused,omitempty"`
 	// ArtifactID names the manifest beside the image this VM was last paused
 	// into; see VMInstance.
 	ArtifactID string            `json:"artifact_id,omitempty"`
@@ -915,6 +937,13 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		CorrectsWallClock:          inst.CorrectsWallClock,
 		ArtifactID:                 inst.ArtifactID,
 		SnapshotWorkloadFrozen:     inst.SnapshotWorkloadFrozen,
+		WakePending:                inst.WakePending,
+		ClockFrozen:                inst.ClockFrozen,
+		FreezeToken:                inst.FreezeToken,
+		WakeToken:                  inst.WakeToken,
+		WakeSnapshotPath:           inst.WakeSnapshotPath,
+		WakeMemPath:                inst.WakeMemPath,
+		WakeOwedFromPaused:         inst.WakeOwedFromPaused,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
@@ -1018,6 +1047,13 @@ func toInstance(rec VMRecord) *VMInstance {
 		CorrectsWallClock:          rec.CorrectsWallClock,
 		ArtifactID:                 rec.ArtifactID,
 		SnapshotWorkloadFrozen:     rec.SnapshotWorkloadFrozen,
+		WakePending:                rec.WakePending,
+		ClockFrozen:                rec.ClockFrozen,
+		FreezeToken:                rec.FreezeToken,
+		WakeToken:                  rec.WakeToken,
+		WakeSnapshotPath:           rec.WakeSnapshotPath,
+		WakeMemPath:                rec.WakeMemPath,
+		WakeOwedFromPaused:         rec.WakeOwedFromPaused,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,

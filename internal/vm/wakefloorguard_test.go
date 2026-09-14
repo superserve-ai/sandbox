@@ -14,8 +14,9 @@ import (
 // into a temp dir.
 
 // wakeProtocolMarker is the literal the guard greps a vmd binary for. A vmd
-// that can wake a frozen image carries it; this one does not, on purpose.
-const wakeProtocolMarker = "wake-protocol-1"
+// that can wake a frozen image carries it (see the daemon's capabilities
+// command); that a binary built from that package does is shown there.
+const wakeProtocolMarker = WakeProtocolCapability
 
 type wakeGuardWorld struct {
 	t        *testing.T
