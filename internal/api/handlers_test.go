@@ -301,9 +301,16 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[27].(**string) = s.SecretEnvIp
 		*dest[28].(*pgtype.Timestamptz) = s.SecretEnvInjectedAt
 		*dest[29].(*pgtype.Timestamptz) = s.SecretEnvExpiresAt
-		if len(dest) == 31 {
+		*dest[30].(*pgtype.UUID) = s.PauseOpID
+		*dest[31].(*pgtype.Timestamptz) = s.PauseOpStartedAt
+		*dest[32].(*pgtype.Timestamptz) = s.PauseOpLeaseUntil
+		*dest[33].(*int64) = s.PauseOpLeaseVersion
+		*dest[34].(*pgtype.Timestamptz) = s.PauseOpAttentionAt
+		*dest[35].(**string) = s.PauseOpTrigger
+		*dest[36].(*pgtype.UUID) = s.PauseOpActorID
+		if len(dest) == 38 {
 			// GetSandboxWithPreviewPolicy: trailing COALESCE'd effective access.
-			*dest[30].(*string) = "legacy_public"
+			*dest[37].(*string) = "legacy_public"
 		}
 		return nil
 	}}
@@ -1019,7 +1026,7 @@ func snapshotRow(s db.Snapshot) *mockRow {
 // missing snapshot row.
 func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, ports ...publishedPortResponse) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
-		if err := sandboxRow(sb).scanFn(dest[:30]...); err != nil {
+		if err := sandboxRow(sb).scanFn(dest[:37]...); err != nil {
 			return err
 		}
 		var snapPath, snapMemPath *string
@@ -1029,15 +1036,15 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			snapPath, snapMemPath = &p, snap.MemPath
 			snapCreatedAt = pgtype.Timestamptz{Time: snap.CreatedAt, Valid: true}
 		}
-		*dest[30].(**string) = snapPath
-		*dest[31].(**string) = snapMemPath
-		*dest[32].(*pgtype.Timestamptz) = snapCreatedAt
+		*dest[37].(**string) = snapPath
+		*dest[38].(**string) = snapMemPath
+		*dest[39].(*pgtype.Timestamptz) = snapCreatedAt
 		if access == "" {
 			access = preview.AccessLegacyPublic
 		}
-		*dest[33].(*string) = access
-		*dest[34].(*string) = access
-		*dest[35].(*int64) = revision
+		*dest[40].(*string) = access
+		*dest[41].(*string) = access
+		*dest[42].(*int64) = revision
 		numbers, accesses, versions := []int32{}, []string{}, []int64{}
 		for _, port := range ports {
 			version := port.TokenVersion
@@ -1048,10 +1055,10 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			accesses = append(accesses, port.Access)
 			versions = append(versions, version)
 		}
-		*dest[36].(*[]int32) = numbers
-		*dest[37].(*[]string) = accesses
-		*dest[38].(*[]int64) = versions
-		*dest[39].(**string) = nil
+		*dest[43].(*[]int32) = numbers
+		*dest[44].(*[]string) = accesses
+		*dest[45].(*[]int64) = versions
+		*dest[46].(**string) = nil
 		return nil
 	}}
 }
@@ -4958,4 +4965,25 @@ func TestCreateSandbox_TemplateLookupFailureRecordsLookupPhase(t *testing.T) {
 		}
 	}
 	t.Fatalf("no create lookup phase recorded for a failed template lookup; got %+v", rec.phases)
+}
+
+// pauseMocks is the DB script shared by the async-answer tests: BeginPause
+// and reads return the sandbox, finalize is counted, everything else is inert.
+func pauseMocks(sb db.Sandbox, finalizes *int32) *mockDBTX {
+	return &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			// Finalize first: its fence also mentions 'pausing'.
+			case strings.Contains(sql, "upserted AS"), strings.Contains(sql, "INSERT INTO snapshot"):
+				atomic.AddInt32(finalizes, 1)
+				return finalizePauseRow(uuid.New())
+			case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
 }
