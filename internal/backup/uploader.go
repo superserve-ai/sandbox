@@ -483,39 +483,51 @@ func (u *Uploader) flushNotifications() {
 	if !u.notifyRetryAt.IsZero() && time.Now().Before(u.notifyRetryAt) {
 		return
 	}
-	pending, err := u.Journal.PendingNotifications(notifyFlushBatch)
-	if err != nil {
-		u.Metrics.AddNotifyFailure(context.Background())
-		u.Log.Warn().Err(err).Msg("backup notification outbox read failed")
-		return
-	}
-	for _, t := range pending {
-		if err := u.OnVerified(t); err != nil {
-			if errors.Is(err, ErrNotificationDeferred) {
-				// Only this entry is not ready; nothing behind it waits.
-				t.logOwner(u.Log.Info().Err(err)).
-					Str("generation", t.Generation).
-					Msg("backup notification deferred; will redeliver")
-				continue
-			}
-			// Stop the batch: a control plane that failed this delivery
-			// will fail the rest too, and each attempt can hold the
-			// drain goroutine for the full request timeout. The retained
-			// entries redeliver together after the retry window.
+	// One page per flush, except that deferred entries stay in the outbox
+	// and would fill the page again next time: a page that held any goes
+	// on to the next, so entries sorted behind them remain reachable.
+	var after []byte
+	for {
+		pending, last, err := u.Journal.PendingNotificationsAfter(after, notifyFlushBatch)
+		if err != nil {
 			u.Metrics.AddNotifyFailure(context.Background())
-			t.logOwner(u.Log.Warn().Err(err)).
-				Str("generation", t.Generation).
-				Msg("backup notification delivery failed; will redeliver")
-			u.notifyRetryAt = time.Now().Add(notifyRetryDelay)
+			u.Log.Warn().Err(err).Msg("backup notification outbox read failed")
 			return
 		}
-		u.notifyRetryAt = time.Time{}
-		if err := u.Journal.ClearNotification(t); err != nil {
-			u.Metrics.AddNotifyFailure(context.Background())
-			t.logOwner(u.Log.Warn().Err(err)).
-				Str("generation", t.Generation).
-				Msg("backup notification clear failed; will redeliver")
+		deferred := 0
+		for _, t := range pending {
+			if err := u.OnVerified(t); err != nil {
+				if errors.Is(err, ErrNotificationDeferred) {
+					// Only this entry is not ready; nothing behind it waits.
+					deferred++
+					t.logOwner(u.Log.Info().Err(err)).
+						Str("generation", t.Generation).
+						Msg("backup notification deferred; will redeliver")
+					continue
+				}
+				// Stop the batch: a control plane that failed this delivery
+				// will fail the rest too, and each attempt can hold the
+				// drain goroutine for the full request timeout. The retained
+				// entries redeliver together after the retry window.
+				u.Metrics.AddNotifyFailure(context.Background())
+				t.logOwner(u.Log.Warn().Err(err)).
+					Str("generation", t.Generation).
+					Msg("backup notification delivery failed; will redeliver")
+				u.notifyRetryAt = time.Now().Add(notifyRetryDelay)
+				return
+			}
+			u.notifyRetryAt = time.Time{}
+			if err := u.Journal.ClearNotification(t); err != nil {
+				u.Metrics.AddNotifyFailure(context.Background())
+				t.logOwner(u.Log.Warn().Err(err)).
+					Str("generation", t.Generation).
+					Msg("backup notification clear failed; will redeliver")
+			}
 		}
+		if deferred == 0 || len(pending) < notifyFlushBatch {
+			return
+		}
+		after = last
 	}
 }
 

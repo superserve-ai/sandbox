@@ -259,13 +259,20 @@ func TestPauseSandbox_LostClaimReplyIsConfirmedFromTheRow(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		landed     bool
+		late       bool // the reply came back only after the minted lease could have expired
 		wantCode   int
 		wantPauses int32
 	}{
 		{name: "claim committed", landed: true, wantCode: http.StatusNoContent, wantPauses: 1},
 		{name: "claim did not land", landed: false, wantCode: http.StatusInternalServerError, wantPauses: 0},
+		{name: "claim committed but the reply outlived the lease", landed: true, late: true, wantCode: http.StatusAccepted, wantPauses: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.late {
+				window := pauseClaimConfirmWindow
+				pauseClaimConfirmWindow = time.Millisecond
+				t.Cleanup(func() { pauseClaimConfirmWindow = window })
+			}
 			sandboxID, teamID := uuid.New(), uuid.New()
 			active := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
 			var minted pgtype.UUID
@@ -291,6 +298,9 @@ func TestPauseSandbox_LostClaimReplyIsConfirmedFromTheRow(t *testing.T) {
 								minted = id
 							}
 						}
+						if tc.late {
+							time.Sleep(5 * time.Millisecond)
+						}
 						return errorRow(errors.New("connection reset"))
 					case strings.Contains(sql, "FROM sandbox"):
 						return sandboxRow(active)
@@ -313,10 +323,13 @@ func TestPauseSandbox_LostClaimReplyIsConfirmedFromTheRow(t *testing.T) {
 			if w.Code != tc.wantCode {
 				t.Fatalf("status = %d, want %d; body: %s", w.Code, tc.wantCode, w.Body.String())
 			}
+			if tc.late && !strings.Contains(w.Body.String(), `"pausing"`) {
+				t.Fatalf("body = %s, want the pause left in progress", w.Body.String())
+			}
 			if atomic.LoadInt32(&pauses) != tc.wantPauses {
 				t.Fatalf("host pauses = %d, want %d", pauses, tc.wantPauses)
 			}
-			if tc.landed && atomic.LoadInt32(&finalizes) != 1 {
+			if tc.landed && !tc.late && atomic.LoadInt32(&finalizes) != 1 {
 				t.Fatalf("finalizes = %d, want the confirmed claim finalized", finalizes)
 			}
 		})

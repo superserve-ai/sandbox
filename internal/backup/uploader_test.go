@@ -3370,3 +3370,42 @@ func TestDeferredNotificationDoesNotStallTheBatch(t *testing.T) {
 		t.Fatalf("delivered = %v, want the deferred entry on the next flush", delivered)
 	}
 }
+
+// A full page of deferred entries does not hide what sorts behind it: the
+// flush pages on and delivers the ready entry in the same pass.
+func TestDeferredPageDoesNotHideLaterNotifications(t *testing.T) {
+	j, _ := testJournal(t)
+	for i := 0; i < notifyFlushBatch; i++ {
+		task := Task{SandboxID: fmt.Sprintf("a-waiting-%02d", i), Generation: "gen", EnqueuedAt: time.Unix(int64(i+1), 0)}
+		if err := j.Enqueue(task); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.Ack(task, "test-bucket", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ready := Task{SandboxID: "b-ready", Generation: "gen", EnqueuedAt: time.Unix(99, 0)}
+	if err := j.Enqueue(ready); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Ack(ready, "test-bucket", true); err != nil {
+		t.Fatal(err)
+	}
+
+	var delivered []string
+	u := &Uploader{Journal: j, OnVerified: func(t Task) error {
+		if t.SandboxID != ready.SandboxID {
+			return fmt.Errorf("503: %w", ErrNotificationDeferred)
+		}
+		delivered = append(delivered, t.SandboxID)
+		return nil
+	}}
+	u.flushNotifications()
+	if len(delivered) != 1 || delivered[0] != ready.SandboxID {
+		t.Fatalf("delivered = %v, want the ready entry behind a full deferred page", delivered)
+	}
+	pending, err := j.PendingNotifications(0)
+	if err != nil || len(pending) != notifyFlushBatch {
+		t.Fatalf("outbox = %d entries (err %v), want the %d deferred ones retained", len(pending), err, notifyFlushBatch)
+	}
+}

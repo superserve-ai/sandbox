@@ -322,6 +322,12 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 	return c, nil
 }
 
+// pauseClaimConfirmWindow bounds how long after BeginPause a lost reply may
+// still be confirmed as this request's claim: within it the minted lease is
+// live and nothing else can have claimed the operation. A variable so tests
+// can shorten it.
+var pauseClaimConfirmWindow = time.Duration(pauseLeaseSeconds)*time.Second - pauseLeaseSkew
+
 // claimedPause answers for a BeginPause whose reply was lost: the row was
 // claimed by this request if it is 'pausing' under the operation id the
 // request minted.
@@ -3134,8 +3140,16 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 		// The reply may have been lost after the claim committed. The row then
 		// carries the operation this request minted, which nothing else can
 		// produce; a claim confirmed that way proceeds, or the reconciler
-		// would pause the VM behind a caller told "failed".
+		// would pause the VM behind a caller told "failed". Only while the
+		// lease it minted cannot have expired, though: past that another
+		// worker may hold the operation, and its lease is not this request's
+		// to adopt, so the pause is left to whoever holds it.
 		if claimed, ok := h.claimedPause(c.Request.Context(), sandboxID, teamID, pauseOp); ok {
+			if time.Since(claimedAt) >= pauseClaimConfirmWindow {
+				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("BeginPause reply outlived its lease; the pause is left to the reconciler")
+				respondPause(c, pauseUndecided)
+				return
+			}
 			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("BeginPause reply lost after the claim committed")
 			sandbox, err = claimed, nil
 		}
