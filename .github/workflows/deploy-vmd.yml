@@ -1,6 +1,7 @@
 # Deploy VMD — control plane VMs.
 #
-# Production NEVER deploys without staging first — same discipline as Deploy API.
+# Staging runs first; manual production standby deploys may skip an absent
+# staging standby. Serving deployments still require staging to succeed.
 # The deploy-production job reuses the same step body as deploy-staging; env vars
 # like GCP_PROJECT resolve per-environment from GitHub environment vars.
 # The us-west2 cell host deploys as a final production step, after the
@@ -104,6 +105,7 @@ concurrency:
 # Push runs ignore manual selectors and retain the environment's serving label.
 env:
   DEPLOY_EVENT: ${{ github.event_name }}
+  DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
   DEPLOY_TARGET: ${{ inputs.target }}
   DEPLOY_PRODUCTION_CELL: ${{ inputs.cell }}
 
@@ -256,6 +258,26 @@ jobs:
           MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
           source .github/workflows/scripts/select-deploy-target.sh
+          # Only an absent staging standby is optional. Discovery errors and
+          # existing but stopped/misconfigured hosts must still fail closed.
+          if [ "${DEPLOY_EVENT:-}" = workflow_dispatch ] && \
+             [ "${DEPLOY_ENVIRONMENT:-}" = production ] && \
+             [ "${DEPLOY_TARGET:-standby}" = standby ] && [ "$DEPLOY_CELL" = staging ]; then
+            : "${GCP_PROJECT:?Refusing standby discovery without a project}"
+            standby_zones=$(gcloud compute instances list \
+              --project="$GCP_PROJECT" --filter="labels.${VMD_LABEL}" \
+              --format='value(zone)')
+            staging_standby_present=false
+            while IFS= read -r zone; do
+              case "${zone##*/}" in
+                "$GCP_REGION"-*) staging_standby_present=true ;;
+              esac
+            done <<< "$standby_zones"
+            if [ "$staging_standby_present" = false ]; then
+              echo 'No staging standby found; continuing to the selected production standby.'
+              exit 0
+            fi
+          fi
           : "${CONTROL_PLANE_URL:?CONTROL_PLANE_URL_STAGING is unset — refusing to deploy without it}"
           : "${DATABASE_URL:?DATABASE_URL_STAGING is unset — refusing to deploy without it}"
           : "${INTERNAL_API_TOKEN:?STAGING_INTERNAL_API_TOKEN is unset — refusing to deploy without it}"
