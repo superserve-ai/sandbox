@@ -7,9 +7,61 @@ on:
         description: 'Type apply to apply staging Terraform and run smoke validation'
         required: true
         type: string
+      privateca_bootstrap:
+        description: 'Apply only the deployer Private CA read grant; skip rollout and smoke tests'
+        type: boolean
+        default: false
 
 jobs:
+  privateca-bootstrap:
+    if: ${{ inputs.privateca_bootstrap }}
+    name: Bootstrap staging Private CA read access
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: 'true'
+      CONFIRM: ${{ inputs.confirm }}
+    steps:
+      - name: Confirm bootstrap
+        run: test "$CONFIRM" = apply
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Apply only the Private CA read grant
+        working-directory: infra/envs/staging/us-central1
+        run: |
+          set -euo pipefail
+          target='module.iam.google_project_iam_member.project_bindings["cd_privateca_auditor"]'
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -lock-timeout=5m -target="$target" -out=tfplan
+          terraform show -json tfplan | jq -e --arg target "$target" '
+            all(.resource_changes[]?;
+              .change.actions == ["no-op"] or
+              .change.actions == ["read"] or
+              (.address == $target and
+               .change.actions == ["create"] and
+               .change.after.project == "rayai-dev" and
+               .change.after.role == "roles/privateca.auditor" and
+               .change.after.member == "serviceAccount:superserve-github-actions@rayai-dev.iam.gserviceaccount.com"))
+          '
+          terraform apply -input=false -lock-timeout=5m tfplan
+
   staging:
+    if: ${{ !inputs.privateca_bootstrap }}
     name: Apply staging us-central1
     runs-on: ubuntu-latest
     permissions:

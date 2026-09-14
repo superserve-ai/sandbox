@@ -151,6 +151,11 @@ module "iam" {
       role    = "roles/compute.networkAdmin"
       members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
     }
+    # Bootstrap this grant before a full plan can refresh existing CA resources.
+    cd_privateca_auditor = {
+      role    = "roles/privateca.auditor"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
     grafana_monitoring_viewer = {
       role = "roles/monitoring.viewer"
       members = [
