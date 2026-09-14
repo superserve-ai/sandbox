@@ -3176,14 +3176,14 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	leaseUntil := leaseDeadline(sandbox.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
 
 	if !prefersAsync(c) {
-		respondPause(c, h.dispatchPause(c.Request.Context(), sandbox, leaseUntil, actorID, l))
+		respondPause(c, h.dispatchPause(c.Request.Context(), sandbox, leaseUntil, actorID, false, l))
 		return
 	}
 
 	// The pause is recorded; the caller is told so at once. Everything else,
 	// host resolution included, runs detached and lands on the row.
 	bg := context.WithoutCancel(c.Request.Context())
-	h.asyncBookkeeping("pause-dispatch", func() { h.dispatchPause(bg, sandbox, leaseUntil, actorID, l) })
+	h.asyncBookkeeping("pause-dispatch", func() { h.dispatchPause(bg, sandbox, leaseUntil, actorID, true, l) })
 	acceptPausing(c)
 }
 

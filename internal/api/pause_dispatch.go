@@ -61,17 +61,25 @@ func acceptPausing(c *gin.Context) {
 }
 
 // dispatchPause runs the host RPC for a claimed pause and records its answer.
-// It knows nothing of the HTTP request; every write runs detached.
-func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, leaseUntil time.Time, actorID *uuid.UUID, l zerolog.Logger) pauseOutcome {
+// It knows nothing of the HTTP request; every write runs detached. accepted
+// says the caller already holds a 202 for this pause.
+func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, leaseUntil time.Time, actorID *uuid.UUID, accepted bool, l zerolog.Logger) pauseOutcome {
 	sandboxID, teamID := sandbox.ID, sandbox.TeamID
 	lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
-	// BeginPause already claimed 'pausing', so a host lookup failure reverts:
-	// nothing was dispatched, so the VM is known to be running. This is the
-	// only revert after BeginPause. If it cannot be written the claim stands
-	// and the reconciler pauses the VM, so the answer is 'pausing'.
+	// BeginPause already claimed 'pausing'. A host lookup failure dispatched
+	// nothing, so the VM is known to be running: a caller still waiting is
+	// told so, with the claim reverted first. A caller already told
+	// 'pausing' was promised paused or failed, so for them the claim stands
+	// and the reconciler resolves the host again. If a revert cannot be
+	// written the claim stands as well. This is the only revert after
+	// BeginPause.
 	vmd, err := h.vmdForHost(ctx, sandbox.HostID)
 	if err != nil {
 		l.Error().Err(err).Msg("resolve VMD for pause failed")
+		if accepted {
+			h.releasePauseLease(ctx, sandboxID, lease, 0, l)
+			return pauseUndecided
+		}
 		if !h.revertPause(ctx, sandboxID, teamID, lease, actorID, l) {
 			return pauseUndecided
 		}
@@ -131,7 +139,7 @@ func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, 
 				l.Warn().Msg("FinalizePause: sandbox deleted mid-pause")
 				return
 			}
-			if !h.pauseLanded(finalizeCtx, sandboxID, teamID) {
+			if !h.pauseLanded(finalizeCtx, sandboxID, teamID, lease.id) {
 				l.Error().Err(err).Msg("async DB FinalizePause failed — sandbox stays 'pausing' for reconciliation")
 				return
 			}

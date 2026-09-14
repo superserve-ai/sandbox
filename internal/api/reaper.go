@@ -420,7 +420,7 @@ func (h *Handlers) pauseClaimed(ctx context.Context, sbx db.ClaimExpiredSandboxR
 			l.Warn().Msg("reaper: row moved on before finalize")
 			return
 		}
-		if !h.pauseLanded(ctx, sbx.ID, sbx.TeamID) {
+		if !h.pauseLanded(ctx, sbx.ID, sbx.TeamID, sbx.PauseOpID) {
 			RecordSandboxTransition(ctx, transition, telemetry.ResultError, sbx.HostID, time.Since(started))
 			// The snapshot exists on the host; a later attempt gets it back from
 			// the host's already-paused guard and finalizes again.

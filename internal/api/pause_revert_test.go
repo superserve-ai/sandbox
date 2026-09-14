@@ -94,13 +94,15 @@ func TestPauseSandbox_UnresolvedHostRevertsBeforeResponding(t *testing.T) {
 }
 
 // A client that prefers an asynchronous answer is told 'pausing' before the
-// host is even resolved; when resolution then fails, the revert still lands
-// in the background.
-func TestPauseSandbox_RespondAsync_UnresolvedHostRevertsInTheBackground(t *testing.T) {
+// host is even resolved. It was promised paused or failed, so when resolution
+// then fails the claim is not reverted: its lease is handed back and the
+// reconciler resolves the host again.
+func TestPauseSandbox_RespondAsync_UnresolvedHostLeavesPausing(t *testing.T) {
 	sandboxID, teamID := uuid.New(), uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, HostID: "host-1", Name: "sb", Status: db.SandboxStatusActive,
 		PauseOpID: pgtype.UUID{Bytes: uuid.New(), Valid: true}, PauseOpLeaseVersion: 1}
 	var reverted bool
+	var releases int32
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
@@ -114,6 +116,12 @@ func TestPauseSandbox_RespondAsync_UnresolvedHostRevertsInTheBackground(t *testi
 				return sandboxRow(sb)
 			}
 			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "-- name: ReleasePauseLease ") {
+				atomic.AddInt32(&releases, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
 	resolved := make(chan struct{})
@@ -136,8 +144,8 @@ func TestPauseSandbox_RespondAsync_UnresolvedHostRevertsInTheBackground(t *testi
 	default:
 		t.Fatal("host was never resolved by the detached dispatch")
 	}
-	if !reverted {
-		t.Fatal("unresolved host did not revert the operation")
+	if reverted || atomic.LoadInt32(&releases) != 1 {
+		t.Fatalf("reverted = %v, releases = %d; want the accepted claim kept and its lease handed back", reverted, releases)
 	}
 }
 
