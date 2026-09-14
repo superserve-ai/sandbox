@@ -86,6 +86,27 @@ class DeployProxyTests(unittest.TestCase):
         self.assertIn("/etc/superserve/peer/identity.json", script)
         self.assertLess(script.index("refresh-peer-credentials --check"), script.index("sudo mv /tmp/proxy"))
 
+    def test_host_identity_precedence(self):
+        script = self.generate_script("")
+        preflight = script[:script.index('peer_identity=""')]
+        cases = [(None, 'legacy-host'), ('HOST_ID=example-region-2-generated\n', 'example-region-2-generated'),
+                 ('', None), ('HOST_ID=\n', None), ('HOST_ID=one\nHOST_ID=two\n', None)]
+        for installed, expected in cases:
+            with self.subTest(installed=installed), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / 'vmd.env').write_text('HOST_ID=legacy-host\n')
+                if installed is not None:
+                    (root / 'host-identity.env').write_text(installed)
+                command = preflight.replace('/etc/sandbox', tmp)
+                result = subprocess.run(['bash'], input='sudo() { "$@"; }\n' + command +
+                                        'printf "%s" "$host_id"', text=True, capture_output=True)
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('invalid installed host identity environment', result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected)
+
     def test_vmd_readiness_requires_current_invocation(self):
         script = self.generate_script("")
         readiness = script[script.index("wait_for_vmd_ready() {"):script.index("rollback_peer_advertisement() {")]
@@ -139,6 +160,7 @@ class DeployProxyTests(unittest.TestCase):
                 files = {
                     "etc/sandbox/proxy.env": old_env,
                     "etc/sandbox/vmd.env": old_env,
+                    "etc/sandbox/host-identity.env": "HOST_ID=example-region-2-generated\n",
                     "etc/systemd/system/proxy.service.d/peer-credentials.conf": old_credentials,
                     "etc/superserve/peer/tls.crt": "test cert",
                     "etc/superserve/peer/tls.key": "test key",
@@ -208,6 +230,7 @@ class DeployProxyTests(unittest.TestCase):
                 if failed_service == "none":
                     self.assertEqual(result.returncode, 0, result.stderr)
                     proxy_env = (root / "etc/sandbox/proxy.env").read_text()
+                    self.assertIn('HOST_ID=example-region-2-generated\n', proxy_env)
                     if not identity:
                         self.assertEqual("".join(line + "\n" for line in proxy_env.splitlines() if line.startswith("PEER_PROXY_")), old_env)
                         self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_env)

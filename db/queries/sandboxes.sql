@@ -1245,3 +1245,9 @@ WHERE id = sqlc.arg(id) AND destroyed_at IS NULL AND status = 'pausing'
   AND pause_op_id = sqlc.arg(pause_op_id)
   AND pause_op_lease_version = sqlc.arg(pause_op_lease_version)
   AND pause_op_attention_at IS NULL;
+
+-- name: GetSandboxPeerEndpoint :one
+-- A missing owner or unbound host remains distinguishable from a valid route.
+SELECT s.host_id, h.vmd_addr, h.proxy_addr, h.incarnation_id, h.peer_generation
+FROM sandbox s LEFT JOIN host h ON h.id = s.host_id AND h.last_heartbeat_at IS NOT NULL
+WHERE s.id = $1 AND s.destroyed_at IS NULL;

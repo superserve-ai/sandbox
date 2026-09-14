@@ -1965,6 +1965,34 @@ func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNet
 	return network_config, err
 }
 
+const getSandboxPeerEndpoint = `-- name: GetSandboxPeerEndpoint :one
+SELECT s.host_id, h.vmd_addr, h.proxy_addr, h.incarnation_id, h.peer_generation
+FROM sandbox s LEFT JOIN host h ON h.id = s.host_id AND h.last_heartbeat_at IS NOT NULL
+WHERE s.id = $1 AND s.destroyed_at IS NULL
+`
+
+type GetSandboxPeerEndpointRow struct {
+	HostID         string      `json:"host_id"`
+	VmdAddr        *string     `json:"vmd_addr"`
+	ProxyAddr      *string     `json:"proxy_addr"`
+	IncarnationID  pgtype.UUID `json:"incarnation_id"`
+	PeerGeneration *int64      `json:"peer_generation"`
+}
+
+// A missing owner or unbound host remains distinguishable from a valid route.
+func (q *Queries) GetSandboxPeerEndpoint(ctx context.Context, id uuid.UUID) (GetSandboxPeerEndpointRow, error) {
+	row := q.db.QueryRow(ctx, getSandboxPeerEndpoint, id)
+	var i GetSandboxPeerEndpointRow
+	err := row.Scan(
+		&i.HostID,
+		&i.VmdAddr,
+		&i.ProxyAddr,
+		&i.IncarnationID,
+		&i.PeerGeneration,
+	)
+	return i, err
+}
+
 const getSandboxPreviewPolicy = `-- name: GetSandboxPreviewPolicy :one
 SELECT
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,

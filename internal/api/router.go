@@ -117,6 +117,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	{
 		operator.GET("/hosts", h.HostList)
 		operator.POST("/hosts/:host_id/status", h.HostUpdateStatus)
+		operator.POST("/hosts/:host_id/incarnation", h.HostRebindIncarnation)
 		// Abuse controls require the operator credential; the host-shared
 		// internal token must not be sufficient to grant or remove trust.
 		operator.GET("/abuse/teams/:team_id/trust", h.GetPlatformAbuseTeamTrust)

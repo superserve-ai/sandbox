@@ -421,6 +421,8 @@ type Host struct {
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
 	IdentityBound     bool               `json:"identity_bound"`
+	IncarnationID     pgtype.UUID        `json:"incarnation_id"`
+	PeerGeneration    *int64             `json:"peer_generation"`
 }
 
 // Data-plane capabilities jointly advertised by the currently running host services. heartbeat_at must match host.last_heartbeat_at, so an old control-plane heartbeat automatically invalidates an attestation it cannot replace.
@@ -429,6 +431,11 @@ type HostCapability struct {
 	Capability  string    `json:"capability"`
 	HeartbeatAt time.Time `json:"heartbeat_at"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+type HostIdentityRegistry struct {
+	HostID  string `json:"host_id"`
+	Retired bool   `json:"retired"`
 }
 
 type HostPressure struct {
@@ -446,6 +453,18 @@ type HostPressure struct {
 	MaxSandboxes          int32     `json:"max_sandboxes"`
 	UnknownAllocationVms  int32     `json:"unknown_allocation_vms"`
 	ReportedAt            time.Time `json:"reported_at"`
+}
+
+type HostRetiredAddress struct {
+	HostID        string    `json:"host_id"`
+	IncarnationID uuid.UUID `json:"incarnation_id"`
+	VmdAddr       string    `json:"vmd_addr"`
+}
+
+type HostRetiredIncarnation struct {
+	HostID                 string    `json:"host_id"`
+	IncarnationID          uuid.UUID `json:"incarnation_id"`
+	SuccessorIncarnationID uuid.UUID `json:"successor_incarnation_id"`
 }
 
 type NetFlow struct {

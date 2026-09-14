@@ -481,15 +481,16 @@ module "observability" {
       instance_id   = module.sandbox_host.instance_id
     }
   }
-  # Backup pipeline alerts scoped to this cell's host via the host_id
-  # metric label (HOST_ID on the host matches the instance name). Follows
+  # Backup alerts use the stable collector identity plus the legacy host_id
+  # selector while older collectors roll forward. Follows
   # active_sandbox_host so a standby promotion keeps the filter on whichever
   # host is actually emitting.
   # Thresholds are the module defaults except oldest_pending_age_duration;
   # the rationale for each default sits on the module's variables.
   backup_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Backup / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Backup / ${local.active_host_name}"
     # A share of this cell's traffic pauses in scheduled batches rather
     # than steadily, confirmed via backup_journal_pending{priority="pause"}
     # and the control plane's pause-endpoint request log. The module
@@ -524,8 +525,9 @@ module "observability" {
   # they mean "the controller engaged and still lost", not "the controller is
   # doing its job" — move them together with the ceiling or not at all.
   launch_path_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Launch path / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Launch path / ${local.active_host_name}"
   }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
   # the same host_id label the backup metrics use, and following

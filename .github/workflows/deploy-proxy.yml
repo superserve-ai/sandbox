@@ -51,6 +51,7 @@ on:
       - 'internal/auth/**'
       - 'internal/preview/**'
       - 'internal/proxy/**'
+      - 'internal/db/**'
       - 'internal/sentrylog/**'
       - 'internal/telemetry/**'
       - 'internal/vmdclient/**'

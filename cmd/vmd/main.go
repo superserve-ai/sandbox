@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -31,6 +32,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/blocklist"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/hostidentity"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/proxy"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
@@ -45,6 +47,7 @@ const localHTTPPort = 9090
 
 // Config holds the daemon configuration sourced from environment variables.
 type Config struct {
+	IncarnationID      string
 	FirecrackerBin     string
 	JailerBin          string
 	KernelPath         string
@@ -92,6 +95,10 @@ type Config struct {
 }
 
 func loadConfig() (Config, error) {
+	return loadConfigWithStartupTimer(nil)
+}
+
+func loadConfigWithStartupTimer(st *startupTimer) (Config, error) {
 	port, err := strconv.Atoi(envOrDefault("GRPC_PORT", "50051"))
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid GRPC_PORT: %w", err)
@@ -134,6 +141,24 @@ func loadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("HOST_ID environment variable is required and must be this host's unique identity")
 	}
 
+	identityPath := os.Getenv("HOST_IDENTITY_FILE")
+	if os.Getenv("HOST_IDENTITY_REQUIRED") == "1" && identityPath == "" {
+		return Config{}, fmt.Errorf("HOST_IDENTITY_FILE is required; install host identity before starting VMD")
+	}
+	if identityPath != "" {
+		if err := validateIdentityHeartbeatConfig(cfg); err != nil {
+			return Config{}, err
+		}
+		started := time.Now()
+		identity, err := hostidentity.Load(identityPath, cfg.HostID, hostidentity.Metadata)
+		if st != nil {
+			st.identityVerification(time.Since(started), err)
+		}
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.IncarnationID = identity.IncarnationID
+	}
 	if cfg.SecretsProxySandboxAddr != "" {
 		host, port, err := parseSecretsProxyAddr(cfg.SecretsProxySandboxAddr)
 		if err != nil {
@@ -144,6 +169,20 @@ func loadConfig() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// Bound heartbeats require a complete description even for previously registered hosts.
+func validateIdentityHeartbeatConfig(cfg Config) error {
+	if strings.TrimSpace(cfg.HostRegion) == "" || len(cfg.HostRegion) > 256 {
+		return fmt.Errorf("identity-bound VMD requires HOST_REGION to be nonempty and at most 256 bytes")
+	}
+	for _, key := range []string{"VMD_SCHEDULABLE_MEMORY_MIB", "VMD_SCHEDULABLE_VCPUS"} {
+		value, err := strconv.ParseInt(os.Getenv(key), 10, 32)
+		if err != nil || value <= 0 {
+			return fmt.Errorf("identity-bound VMD requires %s to be a positive int32 schedulable capacity", key)
+		}
+	}
+	return nil
 }
 
 // parseSecretsProxyAddr parses host:port; host must be an IPv4 literal because
@@ -207,7 +246,7 @@ func publishesCapacityPressure(advertiseAddr, controlPlaneURL string) bool {
 // hostIPOnce memoizes a host-address resolver. Both advertised endpoints
 // derive from the same interface, and the lookup dumps the host's interface
 // and address tables — tables that grow with every VM and pooled slot on the
-// box — so it runs at most once per process, and not at all when both
+// box — so it runs at most once per resolution attempt, and not at all when both
 // endpoints are configured explicitly.
 func hostIPOnce(resolve func() (string, error)) func() (string, error) {
 	var (
@@ -218,6 +257,25 @@ func hostIPOnce(resolve func() (string, error)) func() (string, error) {
 	return func() (string, error) {
 		once.Do(func() { ip, err = resolve() })
 		return ip, err
+	}
+}
+
+// resolveHeartbeatAddresses keeps incarnation-bearing heartbeats from starting
+// with an incomplete description after a transient address lookup failure.
+func resolveHeartbeatAddresses(ctx context.Context, interval time.Duration, resolve func() (string, string, error), log zerolog.Logger) (string, string, error) {
+	for {
+		vmdAddr, proxyAddr, err := resolve()
+		if err == nil {
+			return vmdAddr, proxyAddr, nil
+		}
+		log.Warn().Err(err).Msg("unable to resolve heartbeat addresses; retrying before advertising host")
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", "", ctx.Err()
+		case <-timer.C:
+		}
 	}
 }
 
@@ -558,6 +616,25 @@ func (s *startupTimer) mark(phase string, enabled bool, count int) {
 	s.last = now
 }
 
+// Identity verification is a breakdown of preliminary, not a phase boundary.
+func (s *startupTimer) identityVerification(elapsed time.Duration, err error) {
+	if err != nil {
+		// Configuration failure exits immediately, so carry timing on its fatal record.
+		s.log = s.log.With().Str("startup_component", "identity_verification").
+			Dur("duration_ms", elapsed).
+			Dur("budget_ms", hostidentity.VerificationTimeout).
+			Bool("success", false).Logger()
+		return
+	}
+	s.emit(func() {
+		s.log.Info().Str("startup_component", "identity_verification").
+			Dur("duration_ms", elapsed).
+			Dur("budget_ms", hostidentity.VerificationTimeout).
+			Bool("success", err == nil).Err(err).
+			Msg("startup identity verification timing")
+	})
+}
+
 func main() {
 	// Maintenance subcommands run before any daemon setup and exit. They must
 	// not open the state store in write mode or start services.
@@ -598,9 +675,9 @@ func main() {
 		}
 	}
 
-	cfg, err := loadConfig()
+	cfg, err := loadConfigWithStartupTimer(st)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to load configuration")
+		st.log.Fatal().Err(err).Msg("failed to load configuration")
 	}
 
 	log.Info().
@@ -1749,14 +1826,6 @@ func main() {
 		if proxyHealthURL == "" {
 			proxyHealthURL = "http://127.0.0.1:5007/health"
 		}
-		// Reuse the route-selected source. An explicit interface needs at most
-		// one address-table lookup, and none if both endpoints are overridden.
-		hostIP := hostIPOnce(func() (string, error) {
-			if automaticHostIP != "" {
-				return automaticHostIP, nil
-			}
-			return hostInterfaceAddress(cfg.HostInterface)
-		})
 		// Pressure publication is wired ONLY on the explicit advertise
 		// setting — never on the resolved vmdAddr, which now falls back
 		// to deriving an address from the host interface. Keying on the
@@ -1770,26 +1839,39 @@ func main() {
 			pressureReady = mgr.PressureReady
 		}
 		lc.start("heartbeat", func() error {
-			// Explicit-interface address enumeration stays off the startup
-			// goroutine. Failure omits self-description rather than advertising
-			// an arbitrary address; automatic routing was checked at startup.
-			vmdAddr, err := advertisedVMDAddr(hostIP, cfg.GRPCPort, cfg.VMDAdvertiseAddr)
-			if err != nil {
-				log.Warn().Err(err).Str("host_interface", cfg.HostInterface).
-					Int("grpc_port", cfg.GRPCPort).
-					Msg("unable to resolve advertised VMD address; heartbeat will omit host self-description")
+			// Address enumeration and retries stay off the startup goroutine.
+			resolve := func() (string, string, error) {
+				// Share one lookup per attempt, including its error. A later
+				// attempt must retry rather than retain a transient failure.
+				hostIP := hostIPOnce(func() (string, error) {
+					if automaticHostIP != "" {
+						return automaticHostIP, nil
+					}
+					return hostInterfaceAddress(cfg.HostInterface)
+				})
+				vmdAddr, err := advertisedVMDAddr(hostIP, cfg.GRPCPort, cfg.VMDAdvertiseAddr)
+				if err != nil {
+					return "", "", err
+				}
+				// Private peer ingress takes precedence over the public proxy override.
+				proxyAddr, err := advertisedHeartbeatProxyAddr(hostIP, proxyHealthURL, cfg.ProxyAdvertiseAddr, cfg.PeerProxyListenAddr)
+				return vmdAddr, proxyAddr, err
 			}
-			// When the private peer ingress is enabled, host.proxy_addr must
-			// advertise that endpoint so peer clients can discover it. This is
-			// an intentional transition from the historical public proxy
-			// address; the existing override remains in effect only when peer
-			// ingress is disabled.
-			proxyAddr, err := advertisedHeartbeatProxyAddr(hostIP, proxyHealthURL, cfg.ProxyAdvertiseAddr, cfg.PeerProxyListenAddr)
-			if err != nil {
-				log.Warn().Err(err).Str("proxy_health_url", proxyHealthURL).
-					Msg("unable to derive advertised proxy address; heartbeat will omit host self-description")
+			var vmdAddr, proxyAddr string
+			var err error
+			if cfg.IncarnationID != "" {
+				vmdAddr, proxyAddr, err = resolveHeartbeatAddresses(ctx, 5*time.Second, resolve, log)
+				if err != nil {
+					return nil
+				}
+			} else {
+				vmdAddr, proxyAddr, err = resolve()
+				if err != nil {
+					log.Warn().Err(err).Msg("unable to resolve heartbeat addresses; heartbeat will omit host self-description")
+				}
 			}
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
+				IncarnationID:     cfg.IncarnationID,
 				ControlPlaneURL:   cfg.ControlPlaneURL,
 				HostID:            cfg.HostID,
 				Token:             os.Getenv("INTERNAL_API_TOKEN"),

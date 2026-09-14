@@ -192,6 +192,18 @@ def main() -> int:
         deploy_script = textwrap.dedent(f"""
             set -euo pipefail
 
+            # Match VMD's environment precedence. Only legacy hosts without an
+            # installed identity may fall back to vmd.env or the instance name.
+            if sudo test -e /etc/sandbox/host-identity.env; then
+                host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/host-identity.env)
+                if ! [[ "$host_id" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{{0,255}}$ ]]; then
+                    echo 'ERROR: invalid installed host identity environment' >&2
+                    exit 1
+                fi
+            else
+                host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -n1 || true)
+            fi
+
             peer_identity=""
             if sudo test -f /etc/superserve/peer/identity.json; then
                 # Shared with the refresh worker through systemd credential load.
@@ -384,11 +396,6 @@ def main() -> int:
                     fi
                 fi
             fi
-            # HOST_ID must match vmd's: it is the host's logical identity and
-            # is deliberately preserved across deploys (a replacement host
-            # keeps its predecessor's row ID), so copy vmd's value and fall
-            # back to the instance name only when no vmd env exists yet.
-            host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/vmd.env 2>/dev/null | head -n1 || true)
             deployment_mutated=1
             sudo tee /etc/sandbox/proxy.env > /dev/null <<PROXYENV
             PROXY_DOMAIN={proxy_domain}

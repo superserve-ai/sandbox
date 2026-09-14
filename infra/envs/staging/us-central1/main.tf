@@ -591,6 +591,7 @@ module "observability" {
   # validates the queries before they matter. The disabled-host alert
   # stays off here: staging toggles BACKUP_BUCKET deliberately.
   backup_alerts = {
+    collector_host_id   = module.sandbox_host.instance_name
     host_id             = module.sandbox_host.instance_name
     display_prefix      = "Backup / ${module.sandbox_host.instance_name}"
     alert_disabled_host = false

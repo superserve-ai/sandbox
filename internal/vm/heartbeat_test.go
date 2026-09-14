@@ -564,3 +564,33 @@ func (w *heartbeatReceiptWriter) Write(p []byte) (int, error) {
 	w.events <- heartbeatReceiptEvent{line: string(p), attempt: w.attempts.Load()}
 	return len(p), nil
 }
+
+func TestHeartbeatPreservesInstalledIncarnation(t *testing.T) {
+	cfg := HeartbeatConfig{IncarnationID: "54ab780a-cd77-4aef-8cd0-c2dd9c5032ef", VMDAddr: "192.0.2.10:50051", ProxyAddr: "192.0.2.10:5009", Region: "example-region", CapacityMemoryMib: 1024, CapacityVcpus: 2}
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req heartbeatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode heartbeat: %v", err)
+		}
+		if req.IncarnationID != cfg.IncarnationID || req.VMDAddr != cfg.VMDAddr || req.ProxyAddr != cfg.ProxyAddr ||
+			req.Region != cfg.Region || req.CapacityMemoryMib != cfg.CapacityMemoryMib || req.CapacityVcpus != cfg.CapacityVcpus {
+			t.Errorf("heartbeat lost installation identity or description: %+v", req)
+		}
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	for i := range 2 {
+		ok, _ := postHeartbeat(context.Background(), server.Client(), cfg, server.URL, "", nil, nil, zerolog.Nop(), time.Now())
+		if ok != (i == 1) {
+			t.Fatalf("heartbeat %d accepted = %t", i, ok)
+		}
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("requests = %d, want 2 without an identity-less fallback", attempts.Load())
+	}
+}
