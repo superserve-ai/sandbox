@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/hostreg"
@@ -306,5 +307,136 @@ func TestHostCapCacheTTLClamped(t *testing.T) {
 		if got := hostCapCacheTTLFromEnv(); got != want {
 			t.Fatalf("HOST_CAPABILITY_CACHE_TTL=%q: ttl = %v, want %v", raw, got, want)
 		}
+	}
+}
+
+func TestHostCapCacheSeparatesOwnerResumeEligibility(t *testing.T) {
+	t.Setenv("HOST_CAPABILITY_CACHE_TTL", "10s")
+	var ownerReads, activeReads int
+	h := &Handlers{DB: db.New(&mockDBTX{queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+		owner := reflect.DeepEqual(args[2], []string{"active", "draining"})
+		if owner {
+			ownerReads++
+		} else {
+			activeReads++
+		}
+		return &mockRow{scanFn: func(dest ...any) error {
+			*(dest[0].(*bool)) = owner
+			*(dest[1].(*string)) = "192.0.2.1:50051"
+			return nil
+		}}
+	}})}
+	registry := &verifyRecorder{}
+	h.Hosts = registry
+	caps := []string{"cap-a", "cap-b"}
+	for i := 0; i < 2; i++ {
+		got, err := h.hostHasCapabilitiesCachedForScope(context.Background(), "owner", caps, ownerResumeCapabilities)
+		if err != nil || !got {
+			t.Fatalf("resume=%v err=%v", got, err)
+		}
+		got, err = h.hostHasCapabilitiesCached(context.Background(), "owner", caps)
+		if err != nil || got {
+			t.Fatalf("active-only=%v err=%v", got, err)
+		}
+	}
+	if ownerReads != 2 || activeReads != 2 {
+		t.Fatalf("owner/active reads=%d/%d", ownerReads, activeReads)
+	}
+	if want := []string{"owner=192.0.2.1:50051", "owner=192.0.2.1:50051"}; !reflect.DeepEqual(registry.verified, want) {
+		t.Fatalf("address verification=%v", registry.verified)
+	}
+}
+
+func TestHostCapabilityScopeParameters(t *testing.T) {
+	for _, owner := range []bool{false, true} {
+		for _, unlocked := range []bool{false, true} {
+			t.Run(fmt.Sprintf("owner=%v/unlocked=%v", owner, unlocked), func(t *testing.T) {
+				before := time.Now().Add(-heartbeatTimeout)
+				reads := 0
+				h := &Handlers{DB: db.New(&mockDBTX{queryRowFn: func(_ context.Context, _ string, args ...any) pgx.Row {
+					reads++
+					statuses := []string{"active"}
+					if owner {
+						statuses = append(statuses, "draining")
+					}
+					if !reflect.DeepEqual(args[2], statuses) {
+						t.Fatalf("allowed statuses=%v, want %v", args[2], statuses)
+					}
+					cutoff, ok := args[3].(pgtype.Timestamptz)
+					if !ok || cutoff.Valid != owner || (owner && (cutoff.Time.Before(before) || cutoff.Time.After(time.Now().Add(-heartbeatTimeout)))) {
+						t.Fatalf("heartbeat cutoff=%+v, owner=%v", args[3], owner)
+					}
+					return &mockRow{scanFn: func(dest ...any) error {
+						*(dest[0].(*bool)) = false
+						if unlocked {
+							*(dest[1].(*string)) = ""
+						}
+						return nil
+					}}
+				}})}
+				registry := &verifyRecorder{}
+				h.Hosts = registry
+				scope := activeHostCapabilities
+				if owner {
+					scope = ownerResumeCapabilities
+				}
+				if unlocked {
+					has, err := h.readHostCaps(context.Background(), db.HostHasCapabilitiesUnlockedParams{
+						HostID: "owner", RequiredCapabilities: previewBrowserCapabilities(),
+					}, scope)
+					if err != nil || has {
+						t.Fatalf("capabilities=%v, err=%v, want rejection", has, err)
+					}
+				} else {
+					validate := validateHostPreviewCapabilities
+					if owner {
+						validate = validateOwnerResumeCapabilities
+					}
+					if err := validate(context.Background(), h.DB, "owner", previewBrowserCapabilities()...); err == nil {
+						t.Fatal("expected capability rejection")
+					}
+				}
+				if reads != 1 || len(registry.verified) != 0 {
+					t.Fatalf("reads=%d, address verifications=%v", reads, registry.verified)
+				}
+			})
+		}
+	}
+}
+
+func TestOwnerResumeCapabilitiesRechecksAfterSuccess(t *testing.T) {
+	t.Setenv("HOST_CAPABILITY_CACHE_TTL", "10s")
+	var reads atomic.Int64
+	var answer atomic.Bool
+	answer.Store(true)
+	h := capMockHandlers(&reads, &answer)
+	registry := &verifyRecorder{}
+	h.Hosts = registry
+	ctx := context.Background()
+	caps := []string{"preview_ports_v1"}
+
+	// A placement cache hit must not hide a later owner eligibility change.
+	if ok, err := h.hostHasCapabilitiesCached(ctx, "owner", caps); err != nil || !ok {
+		t.Fatalf("active: ok=%v err=%v", ok, err)
+	}
+	if ok, err := h.hostHasCapabilitiesCachedForScope(ctx, "owner", caps, ownerResumeCapabilities); err != nil || !ok {
+		t.Fatalf("initial resume: ok=%v err=%v", ok, err)
+	}
+	// The query rejects when status or heartbeat attestations become ineligible.
+	answer.Store(false)
+	if ok, err := h.hostHasCapabilitiesCachedForScope(ctx, "owner", caps, ownerResumeCapabilities); err != nil || ok {
+		t.Fatalf("after eligibility loss: ok=%v err=%v, want false,nil", ok, err)
+	}
+	if got := reads.Load(); got != 3 {
+		t.Fatalf("DB reads=%d, want 3", got)
+	}
+	if len(registry.verified) != 2 {
+		t.Fatalf("address verifications=%v, want only the two successful reads", registry.verified)
+	}
+
+	answer.Store(true)
+	registry.err = fmt.Errorf("registry resolution failed")
+	if ok, err := h.hostHasCapabilitiesCachedForScope(ctx, "owner", caps, ownerResumeCapabilities); err == nil || ok {
+		t.Fatalf("registry failure: ok=%v err=%v, want rejection", ok, err)
 	}
 }

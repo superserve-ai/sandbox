@@ -205,8 +205,10 @@ WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
   FROM host
   WHERE id = $2
-    AND status = 'active'
+    AND status = ANY($3::text[])
     AND last_heartbeat_at IS NOT NULL
+    AND ($4::timestamptz IS NULL
+         OR last_heartbeat_at > $4)
   FOR SHARE
 )
 SELECT EXISTS (
@@ -227,16 +229,23 @@ SELECT EXISTS (
 `
 
 type HostHasCapabilitiesParams struct {
-	RequiredCapabilities []string `json:"required_capabilities"`
-	HostID               string   `json:"host_id"`
+	RequiredCapabilities []string           `json:"required_capabilities"`
+	HostID               string             `json:"host_id"`
+	AllowedStatuses      []string           `json:"allowed_statuses"`
+	HeartbeatAfter       pgtype.Timestamptz `json:"heartbeat_after"`
 }
 
-// Lock the one active host row whose heartbeat anchors this capability set.
+// Lock the one eligible host row whose heartbeat anchors this capability set.
 // Callers that run this in a mutation transaction keep the host stable until
 // VMD delivery and commit, while the relational division below proves that
 // every requested capability belongs to that exact heartbeat.
 func (q *Queries) HostHasCapabilities(ctx context.Context, arg HostHasCapabilitiesParams) (bool, error) {
-	row := q.db.QueryRow(ctx, hostHasCapabilities, arg.RequiredCapabilities, arg.HostID)
+	row := q.db.QueryRow(ctx, hostHasCapabilities,
+		arg.RequiredCapabilities,
+		arg.HostID,
+		arg.AllowedStatuses,
+		arg.HeartbeatAfter,
+	)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
@@ -247,8 +256,10 @@ WITH target_host AS MATERIALIZED (
   SELECT id, vmd_addr, last_heartbeat_at
   FROM host
   WHERE id = $2
-    AND status = 'active'
+    AND status = ANY($3::text[])
     AND last_heartbeat_at IS NOT NULL
+    AND ($4::timestamptz IS NULL
+         OR last_heartbeat_at > $4)
 )
 SELECT
   EXISTS (
@@ -270,8 +281,10 @@ SELECT
 `
 
 type HostHasCapabilitiesUnlockedParams struct {
-	RequiredCapabilities []string `json:"required_capabilities"`
-	HostID               string   `json:"host_id"`
+	RequiredCapabilities []string           `json:"required_capabilities"`
+	HostID               string             `json:"host_id"`
+	AllowedStatuses      []string           `json:"allowed_statuses"`
+	HeartbeatAfter       pgtype.Timestamptz `json:"heartbeat_after"`
 }
 
 type HostHasCapabilitiesUnlockedRow struct {
@@ -284,10 +297,15 @@ type HostHasCapabilitiesUnlockedRow struct {
 // from serializing behind the host's heartbeat writer. Transactional callers
 // that must pin the host across a commit use HostHasCapabilities.
 //
-// Also returns the host's VMD address (empty when the host is not active),
+// Also returns the host's VMD address (empty when the host is ineligible),
 // so the caller can record this read as the registry's address verification.
 func (q *Queries) HostHasCapabilitiesUnlocked(ctx context.Context, arg HostHasCapabilitiesUnlockedParams) (HostHasCapabilitiesUnlockedRow, error) {
-	row := q.db.QueryRow(ctx, hostHasCapabilitiesUnlocked, arg.RequiredCapabilities, arg.HostID)
+	row := q.db.QueryRow(ctx, hostHasCapabilitiesUnlocked,
+		arg.RequiredCapabilities,
+		arg.HostID,
+		arg.AllowedStatuses,
+		arg.HeartbeatAfter,
+	)
 	var i HostHasCapabilitiesUnlockedRow
 	err := row.Scan(&i.HasCapabilities, &i.VmdAddr)
 	return i, err
