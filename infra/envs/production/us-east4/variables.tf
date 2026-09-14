@@ -58,8 +58,8 @@ variable "standby_reservation_name" {
   default     = null
 }
 
-variable "primary_reservation_name" {
-  description = "z3 reservation the primary-slot sandbox host targets; null uses default affinity."
+variable "host_c_reservation_name" {
+  description = "z3 reservation the standby sandbox host targets; null uses default affinity."
   type        = string
   default     = null
 }

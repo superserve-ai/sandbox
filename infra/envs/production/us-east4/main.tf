@@ -120,6 +120,11 @@ data "google_service_account" "api_runner" {
   account_id = "superserve-api-runner"
 }
 
+data "google_service_account" "github_actions" {
+  project    = local.project_id
+  account_id = "superserve-github-actions"
+}
+
 # The CD service account needs Certificate Manager access to read/manage the
 # api.superserve.ai cert map + DNS authorization this cell owns (the plan's
 # import 403'd without it). Granted out-of-band to unblock; imported (see
@@ -405,20 +410,24 @@ resource "google_compute_attached_disk" "sandbox_data" {
   mode        = "READ_WRITE"
 }
 
-# Second host for the cell in the primary slot, provisioned as a standby.
+# Second host for the cell, provisioned as a standby under a new identity.
 # Same shape and OS lineage as the serving host so snapshots restore across
 # the two. Labeled out of deploy discovery until it is prepared; the
 # first-boot script below does everything a deploy assumes is already on a
 # host, except secrets.
 locals {
-  host_a_artifact_bucket = module.backup_storage.bucket_name
-  host_a_kernel_object   = "vmlinux-4.14-fuse"
+  host_c_artifact_bucket = module.backup_storage.bucket_name
+  host_c_kernel_object   = "vmlinux-4.14-fuse"
+  # Expected MD5 of each hostprep object, as the object store attests it;
+  # the bootstrap refuses a download that does not match.
+  host_c_kernel_md5 = "e897201a3ba4d45f3f0e5aac78288d92"
+  host_c_rootfs_md5 = "121426943f2dc7c0d6b0227063b1a482"
   # The release the fleet runs; the fleet deploy refuses a host on any other.
-  host_a_firecracker_version = "v1.15.3"
+  host_c_firecracker_version = "v1.15.3"
 
   # Non-secret vmd.env keys the bootstrap writes once. The deploy upserts
   # its own keys on top; secrets are appended by an operator.
-  host_a_vmd_env = {
+  host_c_vmd_env = {
     HOST_REGION                 = local.region
     VMD_SCHEDULABLE_MEMORY_MIB  = "1500000"
     VMD_SCHEDULABLE_VCPUS       = "192"
@@ -428,17 +437,17 @@ locals {
   }
 }
 
-module "sandbox_host" {
+module "sandbox_host_c" {
   source = "../../../modules/sandbox-host"
 
   project_id    = local.project_id
   environment   = local.environment
   region        = local.region
   zone          = local.zone
-  instance_name = "superserve-vmd-${local.resource_suffix}"
+  instance_name = "superserve-vmd-${local.resource_suffix}-3"
   machine_type  = "z3-highmem-192-highlssd-metal"
   subnet        = module.network.subnetwork_self_link
-  internal_ip   = "10.2.0.2"
+  internal_ip   = "10.2.0.4"
   tags          = ["vmd-use4"]
 
   labels = merge(local.sandbox_host_labels, {
@@ -450,7 +459,7 @@ module "sandbox_host" {
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
-  service_account_email = data.google_service_account.api_runner.email
+  service_account_email = google_service_account.vmd_runtime.email
 
   boot_disk_image   = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
   boot_disk_size_gb = 200
@@ -458,15 +467,20 @@ module "sandbox_host" {
 
   can_ip_forward      = false
   on_host_maintenance = "TERMINATE"
-  reservation_name    = var.primary_reservation_name
+  reservation_name    = var.host_c_reservation_name
 
   # The subnet has no NAT; first boot needs to reach package mirrors and
   # object storage. Ignored after creation, so it can be removed by hand.
   bootstrap_external_ip = true
 
-  # First boot fetches artifacts under the read grant below; create the
-  # grant first so the fetch is not racing it.
-  depends_on = [google_storage_bucket_iam_member.host_bootstrap_artifacts]
+  # First boot fetches artifacts and writes logs and metrics under the
+  # runtime identity's grants below; create those first so the boot is not
+  # racing them.
+  depends_on = [
+    google_storage_bucket_iam_member.host_bootstrap_artifacts,
+    google_project_iam_member.vmd_telemetry,
+    google_service_account_iam_member.vmd_deploy_act_as,
+  ]
 
   metadata = {
     enable-osconfig = "TRUE"
@@ -474,12 +488,14 @@ module "sandbox_host" {
     startup-script = join("\n\n", [
       templatefile("${path.module}/../../../../deploy/host-bootstrap/sandbox-host-bootstrap.sh.tftpl", {
         localssd_script     = file("${path.module}/../../../../deploy/host-bootstrap/sandbox-localssd.sh")
-        artifact_bucket     = local.host_a_artifact_bucket
-        kernel_object       = local.host_a_kernel_object
+        artifact_bucket     = local.host_c_artifact_bucket
+        kernel_object       = local.host_c_kernel_object
+        kernel_md5          = local.host_c_kernel_md5
         rootfs_object       = "base.ext4"
+        rootfs_md5          = local.host_c_rootfs_md5
         data_disk_device    = "superserve-sandbox-data"
-        vmd_env             = local.host_a_vmd_env
-        firecracker_version = local.host_a_firecracker_version
+        vmd_env             = local.host_c_vmd_env
+        firecracker_version = local.host_c_firecracker_version
       }),
       templatefile("${path.module}/../../../../deploy/unbound/unbound-bootstrap.sh.tftpl", {
         guest_cidr         = "10.11.0.0/16"
@@ -491,13 +507,12 @@ module "sandbox_host" {
   }
 }
 
-resource "google_compute_disk" "sandbox_data_a" {
+resource "google_compute_disk" "sandbox_data_c" {
   project = local.project_id
-  # Suffixed: the serving host's disk already carries the unsuffixed name.
-  name = "${module.sandbox_host.instance_name}-sandbox-data-a"
-  zone = local.zone
-  type = "hyperdisk-balanced"
-  size = 1024
+  name    = "${module.sandbox_host_c.instance_name}-sandbox-data"
+  zone    = local.zone
+  type    = "hyperdisk-balanced"
+  size    = 1024
 
   labels = merge(local.common_labels, {
     component = "vmd"
@@ -509,13 +524,34 @@ resource "google_compute_disk" "sandbox_data_a" {
   }
 }
 
-resource "google_compute_attached_disk" "sandbox_data_a" {
+resource "google_compute_attached_disk" "sandbox_data_c" {
   project     = local.project_id
   zone        = local.zone
-  disk        = google_compute_disk.sandbox_data_a.id
-  instance    = module.sandbox_host.instance_self_link
+  disk        = google_compute_disk.sandbox_data_c.id
+  instance    = module.sandbox_host_c.instance_self_link
   device_name = "superserve-sandbox-data"
   mode        = "READ_WRITE"
+}
+
+# Dedicated runtime identity for the standby: logs and metrics, write-only
+# backup uploads, and the deploy pipeline may attach it to the instance.
+resource "google_service_account" "vmd_runtime" {
+  project      = local.project_id
+  account_id   = "vmd-runtime-production-use4"
+  display_name = "VMD runtime production-use4"
+}
+
+resource "google_project_iam_member" "vmd_telemetry" {
+  for_each = toset(["roles/logging.logWriter", "roles/monitoring.metricWriter"])
+  project  = local.project_id
+  role     = each.value
+  member   = "serviceAccount:${google_service_account.vmd_runtime.email}"
+}
+
+resource "google_service_account_iam_member" "vmd_deploy_act_as" {
+  service_account_id = google_service_account.vmd_runtime.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${data.google_service_account.github_actions.email}"
 }
 
 # Hosts fetch the guest kernel and base rootfs at first boot from the
@@ -524,7 +560,7 @@ resource "google_compute_attached_disk" "sandbox_data_a" {
 resource "google_storage_bucket_iam_member" "host_bootstrap_artifacts" {
   bucket = module.backup_storage.bucket_name
   role   = "roles/storage.objectViewer"
-  member = "serviceAccount:${data.google_service_account.api_runner.email}"
+  member = "serviceAccount:${google_service_account.vmd_runtime.email}"
 
   condition {
     title      = "hostprep-artifacts-only"
@@ -544,10 +580,10 @@ module "observability" {
       instance_name = module.sandbox_host_b.instance_name
       instance_id   = module.sandbox_host_b.instance_id
     }
-    sandbox_host = {
-      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
-      instance_name = module.sandbox_host.instance_name
-      instance_id   = module.sandbox_host.instance_id
+    sandbox_host_c = {
+      display_name  = "Infrastructure / ${module.sandbox_host_c.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host_c.instance_name
+      instance_id   = module.sandbox_host_c.instance_id
     }
   }
   # Backup pipeline alerts scoped to this cell's host via the host_id
@@ -606,10 +642,10 @@ module "observability" {
       instance_name = module.sandbox_host_b.instance_name
       instance_id   = module.sandbox_host_b.instance_id
     }
-    sandbox_host = {
-      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / host maintenance event"
-      instance_name = module.sandbox_host.instance_name
-      instance_id   = module.sandbox_host.instance_id
+    sandbox_host_c = {
+      display_name  = "Infrastructure / ${module.sandbox_host_c.instance_name} / host maintenance event"
+      instance_name = module.sandbox_host_c.instance_name
+      instance_id   = module.sandbox_host_c.instance_id
     }
   }
   labels = local.common_labels
@@ -633,6 +669,7 @@ module "backup_storage" {
 
   writer_members = [
     "serviceAccount:${data.google_service_account.api_runner.email}",
+    "serviceAccount:${google_service_account.vmd_runtime.email}",
   ]
 
   labels = merge(local.common_labels, {
