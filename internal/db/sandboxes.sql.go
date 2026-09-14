@@ -598,8 +598,9 @@ WITH due AS (
   WHERE s.id = $2::uuid
     AND s.status = 'pausing' AND s.destroyed_at IS NULL
     AND s.pause_op_id IS NOT NULL
-    AND (s.pause_op_lease_until IS NULL OR s.pause_op_lease_until < now())
-    AND s.pause_op_started_at < now() - make_interval(secs => $3::int)
+    AND (s.pause_op_lease_until < now()
+         OR (s.pause_op_lease_until IS NULL
+             AND s.pause_op_started_at < now() - make_interval(secs => $3::int)))
   FOR UPDATE OF s SKIP LOCKED
 )
 UPDATE sandbox
@@ -2214,8 +2215,9 @@ const listPendingPauses = `-- name: ListPendingPauses :many
 SELECT id FROM sandbox
 WHERE status = 'pausing' AND destroyed_at IS NULL
   AND pause_op_id IS NOT NULL
-  AND (pause_op_lease_until IS NULL OR pause_op_lease_until < now())
-  AND pause_op_started_at < now() - make_interval(secs => $1::int)
+  AND (pause_op_lease_until < now()
+       OR (pause_op_lease_until IS NULL
+           AND pause_op_started_at < now() - make_interval(secs => $1::int)))
 ORDER BY pause_op_lease_until ASC NULLS FIRST, pause_op_started_at ASC
 LIMIT $2
 `
@@ -2225,8 +2227,10 @@ type ListPendingPausesParams struct {
 	MaxRows       int32 `json:"max_rows"`
 }
 
-// Pauses whose caller has given up: still 'pausing', lease expired or absent,
-// old enough that the caller's own attempt is over. Longest-eligible first so
+// Pauses whose caller has given up: still 'pausing' with an expired lease.
+// Every holder's attempt ends before its lease does, and a holder that stops
+// early releases the lease, so an expired lease is claimable at once. A row
+// with no lease recorded falls back to an age gate. Longest-eligible first so
 // a row that keeps failing cannot cycle ahead of newer ones. Unlocked; rows
 // without an operation predate this contract and are skipped.
 func (q *Queries) ListPendingPauses(ctx context.Context, arg ListPendingPausesParams) ([]uuid.UUID, error) {

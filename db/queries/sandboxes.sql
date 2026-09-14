@@ -1187,15 +1187,18 @@ SELECT d.id, d.team_id, d.name, d.host_id, d.base_path, d.template_id
 FROM destroyed d;
 
 -- name: ListPendingPauses :many
--- Pauses whose caller has given up: still 'pausing', lease expired or absent,
--- old enough that the caller's own attempt is over. Longest-eligible first so
+-- Pauses whose caller has given up: still 'pausing' with an expired lease.
+-- Every holder's attempt ends before its lease does, and a holder that stops
+-- early releases the lease, so an expired lease is claimable at once. A row
+-- with no lease recorded falls back to an age gate. Longest-eligible first so
 -- a row that keeps failing cannot cycle ahead of newer ones. Unlocked; rows
 -- without an operation predate this contract and are skipped.
 SELECT id FROM sandbox
 WHERE status = 'pausing' AND destroyed_at IS NULL
   AND pause_op_id IS NOT NULL
-  AND (pause_op_lease_until IS NULL OR pause_op_lease_until < now())
-  AND pause_op_started_at < now() - make_interval(secs => sqlc.arg(min_age_seconds)::int)
+  AND (pause_op_lease_until < now()
+       OR (pause_op_lease_until IS NULL
+           AND pause_op_started_at < now() - make_interval(secs => sqlc.arg(min_age_seconds)::int)))
 ORDER BY pause_op_lease_until ASC NULLS FIRST, pause_op_started_at ASC
 LIMIT sqlc.arg(max_rows);
 
@@ -1208,8 +1211,9 @@ WITH due AS (
   WHERE s.id = sqlc.arg(id)::uuid
     AND s.status = 'pausing' AND s.destroyed_at IS NULL
     AND s.pause_op_id IS NOT NULL
-    AND (s.pause_op_lease_until IS NULL OR s.pause_op_lease_until < now())
-    AND s.pause_op_started_at < now() - make_interval(secs => sqlc.arg(min_age_seconds)::int)
+    AND (s.pause_op_lease_until < now()
+         OR (s.pause_op_lease_until IS NULL
+             AND s.pause_op_started_at < now() - make_interval(secs => sqlc.arg(min_age_seconds)::int)))
   FOR UPDATE OF s SKIP LOCKED
 )
 UPDATE sandbox

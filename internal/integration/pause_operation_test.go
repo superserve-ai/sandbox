@@ -513,3 +513,33 @@ func TestIntegration_PauseOperation_RevertKeepsThePriorActor(t *testing.T) {
 		t.Fatalf("reopened interval actor = %s, want the closed interval's %s", actor, profileID)
 	}
 }
+
+// A worker that stops early releases its lease, and the row is claimable on
+// the next tick, not after an age gate; a lease still held is not.
+func TestIntegration_PauseOperation_ReleasedLeaseIsClaimableAtOnce(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	released := seedActiveSandbox(t, teamID, "pause-op-released")
+	row := claimPauseOp(t, released, teamID, uuid.New())
+	if _, err := testQueries.ReleasePauseLease(ctx, db.ReleasePauseLeaseParams{
+		ID: released, PauseOpID: row.PauseOpID, PauseOpLeaseVersion: row.PauseOpLeaseVersion, RetryAfterSeconds: 0,
+	}); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	held := seedActiveSandbox(t, teamID, "pause-op-held")
+	claimPauseOp(t, held, teamID, uuid.New())
+
+	ids, err := testQueries.ListPendingPauses(ctx, db.ListPendingPausesParams{MinAgeSeconds: 90, MaxRows: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(ids, released) {
+		t.Fatal("a released lease was not listed until an age gate passed")
+	}
+	if slices.Contains(ids, held) {
+		t.Fatal("a lease still held was listed")
+	}
+	if _, err := testQueries.ClaimPendingPause(ctx, db.ClaimPendingPauseParams{ID: released, MinAgeSeconds: 90, LeaseSeconds: 60}); err != nil {
+		t.Fatalf("claim of a released lease: %v", err)
+	}
+}

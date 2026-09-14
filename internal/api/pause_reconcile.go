@@ -24,7 +24,8 @@ import (
 // anything else is retried.
 const (
 	pauseReconcileInterval = 30 * time.Second
-	// Claimable only after the caller's whole lease, so its attempt is over.
+	// Age gate for a row with no lease recorded; a leased row is claimable
+	// the moment its lease expires or is released.
 	pauseReconcileMinAge       = pauseLeaseSeconds
 	pauseReconcileLease  int32 = 75
 	// Must end before the lease does, leaving room for the finalize write.
