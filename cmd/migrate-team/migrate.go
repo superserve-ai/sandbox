@@ -209,6 +209,13 @@ func runPlan(ctx context.Context, src *pgxpool.Pool, cfg config) error {
 	for _, k := range liveKeys {
 		log.Warn().Str("api_key", k).Msg("plan: BLOCKER — key not revoked; copy will refuse (freeze rotates keys)")
 	}
+	tenants, err := liveQMTenants(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	for _, q := range tenants {
+		log.Warn().Str("qm_tenant", q).Msg("plan: BLOCKER — live hosted-QM tenant; copy will refuse (its sandbox key is region-bound)")
+	}
 
 	return reportArtifactDirs(ctx, src, cfg)
 }
@@ -226,6 +233,37 @@ func unrevokedKeys(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]
 		ORDER BY created_at`, teamID)
 	if err != nil {
 		return nil, fmt.Errorf("list unrevoked keys: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id uuid.UUID
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s (%s)", id, name))
+	}
+	return out, rows.Err()
+}
+
+// unrevokedQMTenantKeys returns the live API keys the team's hosted-QM
+// tenants still point at ("<id> (<name>)"). Copy refuses the team's live
+// keys outright (see unrevokedKeys), but a tenant admitted after that check
+// can be issued one and retired before the cutover lock, and the cutover
+// sweep carries the keys its tenant rows reference — so the same
+// region-bound credential would reach the dest through a later door.
+func unrevokedQMTenantKeys(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
+	rows, err := src.Query(ctx, `
+		SELECT id, name FROM api_key
+		WHERE team_id = $1 AND revoked_at IS NULL AND id IN (
+			SELECT sandbox_api_key_id FROM qm.tenants
+			WHERE team_id = $1 AND sandbox_api_key_id IS NOT NULL
+		)
+		ORDER BY created_at`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list unrevoked hosted-QM keys: %w", err)
 	}
 	defer rows.Close()
 
@@ -263,6 +301,33 @@ func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string,
 			return nil, err
 		}
 		out = append(out, fmt.Sprintf("%s status=%s", id, status))
+	}
+	return out, rows.Err()
+}
+
+// liveQMTenants returns "<id> (<slug>) status=<status>" for every hosted-QM
+// tenant that has not been retired. A live tenant's runtime holds one of the
+// team's API keys, and key strings carry a region prefix that cannot follow
+// the team, so tenants must be retired (or re-provisioned in the dest) before
+// the team moves.
+func liveQMTenants(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
+	rows, err := src.Query(ctx, `
+		SELECT id, slug, status FROM qm.tenants
+		WHERE team_id = $1 AND status <> 'deleted'
+		ORDER BY created_at`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list live hosted-QM tenants: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id uuid.UUID
+		var slug, status string
+		if err := rows.Scan(&id, &slug, &status); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s (%s) status=%s", id, slug, status))
 	}
 	return out, rows.Err()
 }
@@ -397,6 +462,14 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	if len(liveKeys) > 0 {
 		return fmt.Errorf("refusing to copy: %d API key(s) not revoked (freeze step — the region prefix in the key string cannot follow the team):\n  %s",
 			len(liveKeys), strings.Join(liveKeys, "\n  "))
+	}
+	tenants, err := liveQMTenants(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(tenants) > 0 {
+		return fmt.Errorf("refusing to copy: %d live hosted-QM tenant(s) — retire them first; a tenant's sandbox API key is region-bound and cannot follow the team:\n  %s",
+			len(tenants), strings.Join(tenants, "\n  "))
 	}
 
 	// The dest host must exist and live in the dest region before any
@@ -1238,6 +1311,14 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 		return fmt.Errorf("aborting detach: %d template build(s) in flight:\n  %s",
 			len(builds), strings.Join(builds, "\n  "))
 	}
+	tenants, err := liveQMTenants(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(tenants) > 0 {
+		return fmt.Errorf("aborting detach: %d live hosted-QM tenant(s):\n  %s",
+			len(tenants), strings.Join(tenants, "\n  "))
+	}
 
 	// A validate pass is a precondition in the same invocation — after
 	// detach the dest is the only copy anyone can reach, so never sever
@@ -1286,6 +1367,21 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	} else if len(builds) > 0 {
 		return fmt.Errorf("aborting detach: template build slipped in before the lock:\n  %s", strings.Join(builds, "\n  "))
 	}
+	// Hosted-QM tenant admission takes the same per-team lock (see
+	// CreateQMTenant), so this recheck is authoritative, not advisory.
+	if tenants, err := liveQMTenants(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(tenants) > 0 {
+		return fmt.Errorf("aborting detach: hosted-QM tenant slipped in before the lock:\n  %s", strings.Join(tenants, "\n  "))
+	}
+	// Those tenants are retired, but their sandbox keys need not be, and the
+	// sweep below carries them.
+	if keys, err := unrevokedQMTenantKeys(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(keys) > 0 {
+		return fmt.Errorf("aborting detach: %d hosted-QM tenant key(s) not revoked; revoke them and re-run (the sweep must not carry a live source-region key):\n  %s",
+			len(keys), strings.Join(keys, "\n  "))
+	}
 
 	// Detach is the last moment the dest is guaranteed un-diverged, so the
 	// straggler sweep happens HERE, not at purge: async writers (activity,
@@ -1295,11 +1391,8 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 	// A detached purge deliberately never sweeps — by then the dest is
 	// authoritative and a sweep would overwrite its live rows (e.g. the
 	// rollup backfill cursor) with the frozen source's.
-	for _, name := range []string{
-		"activity", "sandbox_revocation", "revoked_proxy_token",
-		"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
-	} {
-		spec, ok := tableByName(name)
+	for _, name := range cutoverSweepTables {
+		spec, ok := sweepSpec(name)
 		if !ok {
 			return fmt.Errorf("sweep: unknown table %s", name)
 		}
@@ -1421,6 +1514,30 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	}
 	defer tx.Rollback(ctx)
 
+	// Build admission serializes on the app's per-TEAM advisory lock
+	// (CountInFlightBuildsForTeam's caller contract) — take it so a
+	// CreateTemplateBuild that would slip a pending row past the earlier
+	// check blocks behind this transaction, then recheck under the lock.
+	// It comes before the team row lock because CreateQMTenant takes the
+	// advisory lock and then touches the team row through its FK; the same
+	// order on both sides is what keeps the two from deadlocking.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, cfg.teamID.String()); err != nil {
+		return fmt.Errorf("advisory-lock team builds: %w", err)
+	}
+	if builds, err := activeBuilds(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(builds) > 0 {
+		return fmt.Errorf("aborting purge: template build slipped in before the locks:\n  %s", strings.Join(builds, "\n  "))
+	}
+	// Hosted-QM tenant admission takes the same per-team lock (see
+	// CreateQMTenant); a tenant created after validation was never copied,
+	// so purging its row would orphan whatever the provisioner built.
+	if tenants, err := liveQMTenants(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(tenants) > 0 {
+		return fmt.Errorf("aborting purge: hosted-QM tenant slipped in before the locks:\n  %s", strings.Join(tenants, "\n  "))
+	}
+
 	// Lock the team's rows first: the auto-delete worker claims paused
 	// sandboxes past their deadline with an UPDATE, which now blocks behind
 	// these locks instead of racing the deletes (its claim matches zero
@@ -1440,18 +1557,6 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	// transaction rather than racing the deletes.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(id::text)::bigint) FROM sandbox WHERE team_id = $1`, cfg.teamID); err != nil {
 		return fmt.Errorf("advisory-lock sandboxes: %w", err)
-	}
-	// Build admission serializes on the app's per-TEAM advisory lock
-	// (CountInFlightBuildsForTeam's caller contract) — take it so a
-	// CreateTemplateBuild that would slip a pending row past the earlier
-	// check blocks behind this transaction, then recheck under the lock.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, cfg.teamID.String()); err != nil {
-		return fmt.Errorf("advisory-lock team builds: %w", err)
-	}
-	if builds, err := activeBuilds(ctx, tx, cfg.teamID); err != nil {
-		return err
-	} else if len(builds) > 0 {
-		return fmt.Errorf("aborting purge: template build slipped in before the locks:\n  %s", strings.Join(builds, "\n  "))
 	}
 	// The source rows die below, so capture the rollup-flag state now and
 	// restore it into the dest after the deletes commit — purged
@@ -1496,11 +1601,17 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	// frozen source's — post-detach source stragglers are byproducts of a
 	// dead cell, not customer data.
 	if !detached {
-		for _, name := range []string{
-			"activity", "sandbox_revocation", "revoked_proxy_token",
-			"billing_rollup_job", "billing_rollup_team_backfill_state", "team_billing_usage_hourly",
-		} {
-			spec, ok := tableByName(name)
+		// The sweep carries the keys hosted-QM tenant rows reference, so the
+		// same live-key rule detach applies holds here (a detached purge
+		// never sweeps, so it has nothing to check).
+		if keys, err := unrevokedQMTenantKeys(ctx, tx, cfg.teamID); err != nil {
+			return err
+		} else if len(keys) > 0 {
+			return fmt.Errorf("aborting purge: %d hosted-QM tenant key(s) not revoked; revoke them and re-run (the sweep must not carry a live source-region key):\n  %s",
+				len(keys), strings.Join(keys, "\n  "))
+		}
+		for _, name := range cutoverSweepTables {
+			spec, ok := sweepSpec(name)
 			if !ok {
 				return fmt.Errorf("sweep: unknown table %s", name)
 			}
