@@ -209,6 +209,9 @@ jobs:
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          # Enable ingress only for standby selection, which requires peer bootstrap.
+          PEER_PROXY_LISTEN_ADDR: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'standby' && 'auto' || '' }}
+          PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
@@ -259,6 +262,9 @@ jobs:
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          # Enable ingress only for standby selection, which requires peer bootstrap.
+          PEER_PROXY_LISTEN_ADDR: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'standby' && 'auto' || '' }}
+          PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"

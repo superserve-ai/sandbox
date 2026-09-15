@@ -29,6 +29,14 @@ class ProxyTargetTests(unittest.TestCase):
                    DEPLOY_PRODUCTION_CELL="usw2", DEPLOY_CELL="usw2")
         env.update(overrides)
         step = next(s for s in STEPS if f'DEPLOY_CELL: {env["DEPLOY_CELL"]}' in s)
+        if env["DEPLOY_CELL"] != "staging":
+            expression = re.search(r"PEER_PROXY_LISTEN_ADDR: \$\{\{ (.+) \}\}", step)[1]
+            context = dict(github=SimpleNamespace(event_name=env["DEPLOY_EVENT"]),
+                           inputs=SimpleNamespace(target=env["DEPLOY_TARGET"]))
+            env["PEER_PROXY_LISTEN_ADDR"] = eval(
+                expression.replace("&&", " and ").replace("||", " or "),
+                {"__builtins__": {}}, context)
+            self.assertIn('PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"', step)
         # Execute the workflow's actual selection prefix, without secret access or deployment.
         prefix = step.split("        run: |\n")[1].split('          : "${GCP_REGION:?', 1)[0]
         result = subprocess.run(["bash", "-eu", "-c", prefix + '\npython3 -c "import json, os; print(json.dumps(dict(os.environ)))"'],
@@ -38,6 +46,10 @@ class ProxyTargetTests(unittest.TestCase):
         env = json.loads(result.stdout)
         standby = env["DEPLOY_EVENT"] == "workflow_dispatch" and env["DEPLOY_TARGET"] == "standby"
         self.assertEqual(env["VMD_LABEL"], f'component=vmd-{env["DEPLOY_CELL"]}-standby' if standby else "component=vmd")
+        if env["DEPLOY_CELL"] != "staging":
+            self.assertEqual(env["PEER_PROXY_LISTEN_ADDR"], "auto" if standby else "")
+            if standby:
+                self.assertEqual(env["PEER_IDENTITY_HOSTS"], env["EXPECTED_STANDBY_HOST"])
         selected = []
 
         class Executor:
@@ -63,8 +75,11 @@ class ProxyTargetTests(unittest.TestCase):
 
     def test_serving_and_push_keep_normal_fanout(self):
         for event, target in (("workflow_dispatch", "serving"), ("push", "serving"), ("push", "")):
-            self.assertEqual(self.select("example-serving,us-west2-a\nexample-east,us-east4-a\n",
-                                         DEPLOY_EVENT=event, DEPLOY_TARGET=target), (0, ["example-serving"]))
+            for cell, region in (("usw2", "us-west2"), ("use4", "us-east4")):
+                self.assertEqual(self.select(f"example-serving,{region}-a\nexample-other,europe-west1-b\n",
+                                             DEPLOY_EVENT=event, DEPLOY_TARGET=target,
+                                             DEPLOY_CELL=cell, GCP_REGION=region),
+                                 (0, ["example-serving"]))
 
     def test_west_and_configured_east_standby(self):
         self.assertEqual(self.select("superserve-vmd-usw2-2,us-west2-a,RUNNING\n"),
