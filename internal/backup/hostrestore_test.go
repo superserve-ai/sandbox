@@ -316,7 +316,7 @@ func TestMaterializeBaseFallsBackWhenCloneFails(t *testing.T) {
 	probe.Close()
 	// A stale candidate someone else left behind: a destination that did
 	// not clone from it has no say over it, whatever its own verdict.
-	stale := filepath.Join(cache.Dir, ".candidate-"+digestOf(baseData))
+	stale := filepath.Join(cache.Dir, ".candidate-"+digestOf(baseData)+"-stale")
 	if err := os.MkdirAll(cache.Dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -411,9 +411,10 @@ func TestMaterializeBaseRejectsUnverifiedMaster(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "verify") {
 		t.Fatalf("err = %v, want verification failure", err)
 	}
-	for _, name := range []string{".unpacked-", ".candidate-"} {
-		if _, err := os.Stat(filepath.Join(cache.Dir, name+digestOf(baseData))); err == nil {
-			t.Fatalf("%s copy survived a failed verification", name)
-		}
+	if _, err := os.Stat(filepath.Join(cache.Dir, ".unpacked-"+digestOf(baseData))); err == nil {
+		t.Fatal("unverified master was published")
+	}
+	if left, _ := filepath.Glob(filepath.Join(cache.Dir, ".candidate-"+digestOf(baseData)+"-*")); len(left) != 0 {
+		t.Fatalf("candidate survived a failed verification: %v", left)
 	}
 }

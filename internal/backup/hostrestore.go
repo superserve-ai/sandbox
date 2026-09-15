@@ -560,16 +560,20 @@ func (c *CachingBaseReader) canCloneInto(dst *os.File) bool {
 		return false
 	}
 	dev, ok := deviceOf(dst)
-	if ok {
-		if v, hit := c.cloneable.Load(dev); hit {
-			return v.(bool)
-		}
+	if !ok {
+		return c.probeClone(dst)
 	}
-	res := c.probeClone(dst)
-	if ok {
+	if v, hit := c.cloneable.Load(dev); hit {
+		return v.(bool)
+	}
+	// A wave of first requests on one filesystem probes once; the rest
+	// share the answer. Each caller's dst is only touched by its own probe.
+	v, _, _ := c.group.Do(fmt.Sprintf("probe/%d", dev), func() (any, error) {
+		res := c.probeClone(dst)
 		c.cloneable.Store(dev, res)
-	}
-	return res
+		return res, nil
+	})
+	return v.(bool)
 }
 
 func (c *CachingBaseReader) probeClone(dst *os.File) bool {
@@ -643,56 +647,65 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 		defer rc.Close()
 		return nil, unpackExtents(ctx, rc, mf, dst)
 	}
-	master, candidate := c.basePaths(mf.SHA256)
+	master := c.masterPath(mf.SHA256)
 	if src, err := os.Open(master); err == nil {
 		defer src.Close()
 		return nil, cloneFile(dst, src)
 	}
-	_, err, _ := c.group.Do(candidate, func() (any, error) {
-		for _, p := range []string{master, candidate} {
-			if _, err := os.Stat(p); err == nil {
-				return nil, nil
-			}
+	// Candidates carry a unique suffix: a name is never reused after a
+	// failed verification removed it, so a callback bound to it can only
+	// ever act on the bytes this destination was cloned from.
+	pattern := filepath.Join(c.Dir, ".candidate-"+mf.SHA256+"-*")
+	v, err, _ := c.group.Do(pattern, func() (any, error) {
+		if _, err := os.Stat(master); err == nil {
+			return master, nil
+		}
+		if existing, _ := filepath.Glob(pattern); len(existing) > 0 {
+			return existing[0], nil
 		}
 		rc, err := c.NewReader(ctx, object)
 		if err != nil {
 			return nil, err
 		}
 		defer rc.Close()
-		tmp, err := os.CreateTemp(c.Dir, ".unpack-*")
+		tmp, err := os.CreateTemp(c.Dir, ".candidate-"+mf.SHA256+"-*")
 		if err != nil {
 			return nil, err
 		}
-		defer os.Remove(tmp.Name())
 		if err := unpackExtents(ctx, rc, mf, tmp); err != nil {
 			tmp.Close()
+			os.Remove(tmp.Name())
 			return nil, err
 		}
 		if err := tmp.Sync(); err != nil {
 			tmp.Close()
+			os.Remove(tmp.Name())
 			return nil, err
 		}
 		if err := tmp.Close(); err != nil {
+			os.Remove(tmp.Name())
 			return nil, err
 		}
-		return nil, os.Rename(tmp.Name(), candidate)
+		return tmp.Name(), nil
 	})
 	if err != nil {
 		return nil, err
 	}
+	candidate := v.(string)
 	src, err := os.Open(candidate)
-	if errors.Is(err, fs.ErrNotExist) {
-		// Published between the coalesced unpack and this open.
-		if src, err = os.Open(master); err != nil {
-			return nil, err
-		}
-		defer src.Close()
-		return nil, cloneFile(dst, src)
+	if errors.Is(err, fs.ErrNotExist) && candidate != master {
+		// Published or discarded between the coalesced unpack and this
+		// open; the master is the only remaining verified source.
+		candidate = master
+		src, err = os.Open(master)
 	}
 	if err != nil {
 		return nil, err
 	}
 	defer src.Close()
+	if candidate == master {
+		return nil, cloneFile(dst, src)
+	}
 	cloned, err := src.Stat()
 	if err != nil {
 		return nil, err
@@ -700,18 +713,18 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 	if err := cloneFile(dst, src); err != nil {
 		return nil, err
 	}
-	return func(verified bool) error { return c.publishCandidate(mf.SHA256, cloned, verified) }, nil
+	return func(verified bool) error { return c.publishCandidate(candidate, master, cloned, verified) }, nil
 }
 
 // publishCandidate promotes the candidate a destination was cloned from
 // to the master every later restore clones from, once that destination
 // passed the restorer's full verification: the two are the same bytes,
 // so the master is verified without a second read. A failed verification
-// discards the candidate so the next request unpacks afresh. Either way
-// only the identical file is touched; a candidate that has since been
-// replaced belongs to another restore's verdict.
-func (c *CachingBaseReader) publishCandidate(sha string, cloned os.FileInfo, verified bool) error {
-	master, candidate := c.basePaths(sha)
+// discards the candidate so the next request unpacks afresh. The
+// candidate's name is unique to its unpack, and the file is still checked
+// to be the one that was cloned, so a callback can neither publish nor
+// remove another restore's bytes.
+func (c *CachingBaseReader) publishCandidate(candidate, master string, cloned os.FileInfo, verified bool) error {
 	current, err := os.Stat(candidate)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -735,6 +748,6 @@ func (c *CachingBaseReader) publishCandidate(sha string, cloned os.FileInfo, ver
 	return nil
 }
 
-func (c *CachingBaseReader) basePaths(sha string) (master, candidate string) {
-	return filepath.Join(c.Dir, ".unpacked-"+sha), filepath.Join(c.Dir, ".candidate-"+sha)
+func (c *CachingBaseReader) masterPath(sha string) string {
+	return filepath.Join(c.Dir, ".unpacked-"+sha)
 }
