@@ -295,7 +295,21 @@ func run() error {
 	// Launch the timeout reaper. This goroutine destroys sandboxes whose
 	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped
 	// to ctx so it exits on shutdown.
-	handlers.StartTimeoutReaper(ctx, api.DefaultReaperConfig())
+	reaperCfg := api.DefaultReaperConfig()
+	// Both bound how much the reaper pauses per tick; the defaults suit
+	// steady-state expirations, and an operator raises them for a planned
+	// wave (a whole host's worth of sandboxes brought back to paused).
+	if v := os.Getenv("REAPER_BATCH_SIZE"); v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
+			reaperCfg.BatchSize = int32(n)
+		}
+	}
+	if v := os.Getenv("REAPER_PARALLELISM"); v != "" {
+		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
+			reaperCfg.Parallelism = n
+		}
+	}
+	handlers.StartTimeoutReaper(ctx, reaperCfg)
 	handlers.StartPauseReconciler(ctx)
 
 	// Launch the template build supervisor. Drives template_build rows
