@@ -262,6 +262,7 @@ func runMigrate(args []string) int {
 		origTimeout *int32 // written back after the pause; nil = none
 		generation  int64  // the pause generation at the claim; a higher one means the migration pause completed
 		restores    int    // write-back attempts so far
+		reported    bool   // already reported as stuck; stays counted against -inflight
 	}
 	active := map[string]live{} // booted here, waiting for the reaper
 	moved, failed, stuck, stale, unanchored, retried := 0, 0, 0, 0, 0, 0
@@ -573,8 +574,9 @@ func runMigrate(args []string) int {
 			break
 		}
 		// Settle what the reaper finished: paused rows are done (their
-		// temporary timeout cleared); failed rows and rows still in flight
-		// past the wait are reported and left for a human.
+		// temporary timeout cleared); failed rows are left for a human, and
+		// rows still in flight past the wait are reported but keep their
+		// slot until they settle.
 		mu.Lock()
 		if len(active) > 0 {
 			ids := make([]string, 0, len(active))
@@ -698,8 +700,12 @@ func runMigrate(args []string) int {
 				if l.restores > 0 {
 					continue // paused; only the write-back is outstanding
 				}
-				if time.Since(l.since) > *pauseWait {
-					delete(active, id)
+				if !l.reported && time.Since(l.since) > *pauseWait {
+					// Reported once, but it keeps its slot: the guest is still
+					// running here, so it still counts against -inflight, and
+					// it is settled like any other row if the reaper catches up.
+					l.reported = true
+					active[id] = l
 					stuck++
 					fmt.Printf("STUCK %s: not paused after %s; pause it by hand\n", id, pauseWait)
 				}
