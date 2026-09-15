@@ -72,6 +72,11 @@ class DeployProxyTests(unittest.TestCase):
     def test_standby_uses_identical_install_and_peer_configuration(self):
         self.assertEqual(self.generate_script("", standby=True), self.generate_script(""))
 
+    def test_normal_and_redirect_ports_remain_reserved(self):
+        service = (Path(__file__).parents[3] / "deploy/proxy.service").read_text()
+        self.assertIn("Environment=PROXY_ADDR=:5007\n", service)
+        self.assertIn("Environment=PROXY_REDIRECT_ADDR=:5008\n", service)
+
     def test_generated_shell_parses(self):
         for peer_addr in ("", "auto"):
             with self.subTest(peer_addr=peer_addr):
@@ -147,6 +152,9 @@ class DeployProxyTests(unittest.TestCase):
                                           ("192.0.2.2:5010", "tee-dropin"),
                                           ("192.0.2.2:5010", "proxy-always"),
                                           ("192.0.2.2:5010", "none"))]
+        cases += [(addr, failure, "spiffe://example.test/peer")
+                  for addr in ("auto", "192.0.2.3:5008")
+                  for failure in ("none", "vmd-readiness", "vmd-heartbeat")]
         cases += [("", "none", "spiffe://example.test/peer"), ("", "none", ""), ("auto", "none", ""),
                   ("auto", "missing-identity", ""),
                   ("", "missing-cert", "spiffe://example.test/peer")]
@@ -224,7 +232,21 @@ class DeployProxyTests(unittest.TestCase):
                     fi
                     return 0
                 }}
-                journalctl() {{ :; }}
+                curl() {{
+                    [ "$*" = "-fsS -H Metadata-Flavor: Google http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip" ] || return 1
+                    echo 192.0.2.3
+                }}
+                journalctl() {{
+                    if [ "$(grep -c '^superserve-vmd$' "{root}/restarts")" = 1 ]; then
+                        case "{failed_service}:$*" in
+                            vmd-readiness:*gRPC*|vmd-heartbeat:*heartbeat*)
+                                touch "{root}/failed"
+                                return 1
+                                ;;
+                        esac
+                    fi
+                    return 0
+                }}
                 '''
                 result = subprocess.run(["bash"], input=functions + script, text=True, capture_output=True)
                 if failed_service == "none":
@@ -238,9 +260,12 @@ class DeployProxyTests(unittest.TestCase):
                         self.assertEqual((root / "restarts").read_text().splitlines(), ["proxy"])
                         self.assertIn("PROXY_DOMAIN=sandbox.example.test", proxy_env)
                         continue
-                    self.assertIn(f"PEER_PROXY_LISTEN_ADDR={peer_addr}\n", proxy_env)
+                    resolved_addr = "192.0.2.3:5009" if peer_addr in ("auto", "192.0.2.3:5008") else peer_addr
+                    self.assertIn(f"PEER_PROXY_LISTEN_ADDR={resolved_addr}\n", proxy_env)
+                    self.assertIn(f"PEER_PROXY_SPIFFE_URI={identity}\n", proxy_env)
                     if peer_addr:
-                        self.assertIn(peer_addr, (root / "etc/sandbox/vmd.env").read_text())
+                        self.assertIn(f"PEER_PROXY_LISTEN_ADDR={resolved_addr}\n", (root / "etc/sandbox/vmd.env").read_text())
+                        self.assertEqual((root / "restarts").read_text().splitlines(), ["proxy", "superserve-vmd"])
                     else:
                         self.assertNotIn("PEER_PROXY_LISTEN_ADDR", (root / "etc/sandbox/vmd.env").read_text())
                     dropin = root / "etc/systemd/system/proxy.service.d/peer-credentials.conf"
