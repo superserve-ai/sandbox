@@ -1,6 +1,5 @@
--- Run as the database administrator before enabling proxy routing.
+-- Canonical non-secret proxy routing authorization contract.
 -- Credentials are provisioned separately; no password belongs in this file.
-BEGIN;
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'sandbox_proxy_router') THEN
@@ -21,4 +20,3 @@ CREATE POLICY proxy_routing_read ON public.sandbox FOR SELECT
 DROP POLICY IF EXISTS proxy_routing_read ON public.host;
 CREATE POLICY proxy_routing_read ON public.host FOR SELECT
     TO sandbox_proxy_router USING (true);
-COMMIT;
