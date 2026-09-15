@@ -128,6 +128,12 @@ func TestDBOwnershipRejectsAlteredProxyAddress(t *testing.T) {
 }
 
 func TestDBOwnershipLegacyLocalAndFencedRemote(t *testing.T) {
+	for _, localHostID := range []string{"usw2", "use4", "default", "example-region-2-generated"} {
+		t.Run(localHostID, func(t *testing.T) { testDBOwnershipLocalAndRemote(t, localHostID) })
+	}
+}
+
+func testDBOwnershipLocalAndRemote(t *testing.T, localHostID string) {
 	databaseURL := os.Getenv("PEER_ROUTING_TEST_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("set PEER_ROUTING_TEST_DATABASE_URL for PostgreSQL contract test")
@@ -148,16 +154,16 @@ CREATE TEMP TABLE sandbox (id uuid PRIMARY KEY, host_id text, destroyed_at times
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolver := NewDBOwnershipResolver(pool, " usw2 ")
+	resolver := NewDBOwnershipResolver(pool, " "+localHostID+" ")
 	for _, tc := range []struct {
 		owner        string
 		bound, local bool
 	}{
-		{"usw2", false, true},
-		{"usw2-2-generated", true, false},
+		{localHostID, false, true},
+		{localHostID + "-2-generated", true, false},
 		{"some-other-host", false, false},
-		{"usw2-2", false, false},
-		{"usw2-2-random", false, false},
+		{localHostID + "-2", false, false},
+		{localHostID + "-2-random", false, false},
 	} {
 		t.Run(tc.owner, func(t *testing.T) {
 			id := uuid.NewString()
@@ -177,7 +183,7 @@ CREATE TEMP TABLE sandbox (id uuid PRIMARY KEY, host_id text, destroyed_at times
 			route, err := resolver.ResolveSandbox(ctx, id)
 			switch {
 			case tc.local:
-				if err != nil || route != (SandboxRoute{HostID: "usw2"}) {
+				if err != nil || route != (SandboxRoute{HostID: localHostID}) {
 					t.Fatalf("local route=%+v err=%v", route, err)
 				}
 			case tc.bound:
@@ -190,7 +196,7 @@ CREATE TEMP TABLE sandbox (id uuid PRIMARY KEY, host_id text, destroyed_at times
 				}
 			}
 			localCalls, peerCalls := 0, 0
-			router := NewRoutingHandler([]string{"sandbox.test"}, "usw2", resolver, routePeerFunc(func(_ context.Context, host string, endpoint PeerEndpoint) (PeerStream, error) {
+			router := NewRoutingHandler([]string{"sandbox.test"}, localHostID, resolver, routePeerFunc(func(_ context.Context, host string, endpoint PeerEndpoint) (PeerStream, error) {
 				peerCalls++
 				if host != tc.owner || endpoint != (PeerEndpoint{Address: "192.0.2.3:5009", Generation: 1}) {
 					t.Errorf("host=%s endpoint=%+v", host, endpoint)

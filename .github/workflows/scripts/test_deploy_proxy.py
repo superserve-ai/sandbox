@@ -282,22 +282,26 @@ class DeployProxyTests(unittest.TestCase):
             for failure in ("none", "proxy", "superserve-vmd")]
         self.run_peer_deploy_cases(cases)
 
-    def test_west_serving_outbound_only_does_not_advertise_or_restart_vmd(self):
+    def test_production_serving_outbound_only_does_not_advertise_or_restart_vmd(self):
         workflow = Path(__file__).parents[1].joinpath("deploy-proxy.yml").read_text()
-        west = workflow.split("DEPLOY_CELL: usw2", 1)[1]
-        context = dict(vars=SimpleNamespace(PEER_ROUTING_ENABLED_USW="1", PEER_INGRESS_ENABLED_USW=""),
-                       github=SimpleNamespace(event_name="workflow_dispatch"),
-                       inputs=SimpleNamespace(target="serving"))
-        config = {}
-        for key in ("PEER_ROUTING_ENABLED", "PEER_PROXY_LISTEN_ADDR"):
-            expression = re.search(key + r": \$\{\{ (.+) \}\}", west)[1]
-            config[key] = eval(expression.replace("&&", " and ").replace("||", " or "),
-                               {"__builtins__": {}}, context)
-        self.assertEqual(config, dict(PEER_ROUTING_ENABLED="1", PEER_PROXY_LISTEN_ADDR=""))
-        self.run_peer_deploy_cases(
-            [(config["PEER_PROXY_LISTEN_ADDR"], "none", "spiffe://example.test/peer", False)],
-            routing=config["PEER_ROUTING_ENABLED"], initial_listener=False,
-            host_id="usw2", zone="us-west2-a")
+        for cell, host_id, zone, routing_var, ingress_var in (
+                ("usw2", "usw2", "us-west2-a", "PEER_ROUTING_ENABLED_USW", "PEER_INGRESS_ENABLED_USW"),
+                ("use4", "default", "us-east4-a", "PEER_ROUTING_ENABLED_USE4", "PEER_INGRESS_ENABLED_PROD")):
+            with self.subTest(cell=cell, host_id=host_id):
+                step = workflow.split(f"DEPLOY_CELL: {cell}", 1)[1]
+                context = dict(vars=SimpleNamespace(**{routing_var: "1", ingress_var: ""}),
+                               github=SimpleNamespace(event_name="workflow_dispatch"),
+                               inputs=SimpleNamespace(target="serving"))
+                config = {}
+                for key in ("PEER_ROUTING_ENABLED", "PEER_PROXY_LISTEN_ADDR"):
+                    expression = re.search(key + r": \$\{\{ (.+) \}\}", step)[1]
+                    config[key] = eval(expression.replace("&&", " and ").replace("||", " or "),
+                                       {"__builtins__": {}}, context)
+                self.assertEqual(config, dict(PEER_ROUTING_ENABLED="1", PEER_PROXY_LISTEN_ADDR=""))
+                self.run_peer_deploy_cases(
+                    [(config["PEER_PROXY_LISTEN_ADDR"], "none", "spiffe://example.test/peer", False)],
+                    routing=config["PEER_ROUTING_ENABLED"], initial_listener=False,
+                    host_id=host_id, zone=zone)
 
     def run_peer_deploy_cases(self, cases, routing="", initial_listener=True,
                              host_id=None, zone="us-central1-a"):

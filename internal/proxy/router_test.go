@@ -841,10 +841,16 @@ func TestRequestAfterHijackRejectsTruncatedBody(t *testing.T) {
 }
 
 func TestRoutingLocalOwnerBeforePeerNormalization(t *testing.T) {
-	for _, owner := range []string{"usw2", " usw2 ", "usw2-2", "usw2-2-random", ""} {
+	for _, localHostID := range []string{"usw2", "use4", "default", "example-region-2-generated"} {
+		t.Run(localHostID, func(t *testing.T) { testRoutingLocalOwnerBeforePeerNormalization(t, localHostID) })
+	}
+}
+
+func testRoutingLocalOwnerBeforePeerNormalization(t *testing.T, localHostID string) {
+	for _, owner := range []string{localHostID, " " + localHostID + " ", localHostID + "-2", localHostID + "-2-random", ""} {
 		t.Run(owner, func(t *testing.T) {
 			localCalls := 0
-			router := NewRoutingHandler([]string{"sandbox.test"}, " usw2 ", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+			router := NewRoutingHandler([]string{"sandbox.test"}, " "+localHostID+" ", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
 				return SandboxRoute{HostID: owner}, nil
 			}), routePeerFunc(func(context.Context, string, PeerEndpoint) (PeerStream, error) {
 				t.Error("incomplete route attempted peer dial")
@@ -853,7 +859,7 @@ func TestRoutingLocalOwnerBeforePeerNormalization(t *testing.T) {
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://8080-22222222-2222-4222-8222-222222222222.sandbox.test/", nil))
 			wantStatus, wantLocal := http.StatusBadGateway, 0
-			if strings.TrimSpace(owner) == "usw2" {
+			if strings.TrimSpace(owner) == localHostID {
 				wantStatus, wantLocal = http.StatusNoContent, 1
 			}
 			if response.Code != wantStatus || localCalls != wantLocal {
