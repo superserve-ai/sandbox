@@ -21,6 +21,14 @@ locals {
     : " AND (metric.labels.host_id = \"${var.backup_alerts.host_id}\" OR metric.labels.collector_host_id = \"${var.backup_alerts.collector_host_id}\")"
   )
 
+  # Monitoring forbids mixing AND and OR within metric.labels restrictions.
+  # Split filters with result/priority constraints into OR-combined conditions;
+  # keep a single union for unconstrained metrics so percentile reduction is unchanged.
+  backup_host_filters = var.backup_alerts == null ? [] : concat(
+    [" AND metric.labels.host_id = \"${var.backup_alerts.host_id}\""],
+    var.backup_alerts.collector_host_id == null ? [] : [" AND metric.labels.collector_host_id = \"${var.backup_alerts.collector_host_id}\""]
+  )
+
   backup_alert_conditions = var.backup_alerts == null ? {} : merge({
     upload_failures = {
       display_name = "${var.backup_alerts.display_prefix} / upload failures sustained"
@@ -148,22 +156,25 @@ resource "google_monitoring_alert_policy" "backup" {
   enabled               = true
   notification_channels = var.notification_channel_ids
 
-  conditions {
-    display_name = each.value.display_name
+  dynamic "conditions" {
+    for_each = each.value.extra_filter == "" ? [local.backup_filter_suffix] : local.backup_host_filters
+    content {
+      display_name = conditions.key == 0 ? each.value.display_name : "${each.value.display_name} / collector identity"
 
-    condition_threshold {
-      filter          = "metric.type = \"${each.value.metric_type}\" AND resource.type = \"prometheus_target\"${each.value.extra_filter}${local.backup_filter_suffix}"
-      comparison      = each.value.comparison
-      threshold_value = each.value.threshold
-      duration        = each.value.duration
-      aggregations {
-        alignment_period     = "60s"
-        per_series_aligner   = each.value.aligner
-        cross_series_reducer = try(each.value.reducer, null)
-        group_by_fields      = try(each.value.reducer, null) == null ? null : ["metric.label.host_id"]
-      }
-      trigger {
-        count = 1
+      condition_threshold {
+        filter          = "metric.type = \"${each.value.metric_type}\" AND resource.type = \"prometheus_target\"${each.value.extra_filter}${conditions.value}"
+        comparison      = each.value.comparison
+        threshold_value = each.value.threshold
+        duration        = each.value.duration
+        aggregations {
+          alignment_period     = "60s"
+          per_series_aligner   = each.value.aligner
+          cross_series_reducer = try(each.value.reducer, null)
+          group_by_fields      = try(each.value.reducer, null) == null ? null : ["metric.label.host_id"]
+        }
+        trigger {
+          count = 1
+        }
       }
     }
   }
