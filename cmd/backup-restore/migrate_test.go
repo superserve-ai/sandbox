@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/superserve-ai/sandbox/internal/backup"
 )
@@ -28,25 +29,25 @@ func TestRestoredDiskFollowsTheRestoreMarker(t *testing.T) {
 			}
 		}
 	}
-	if _, _, _, err := restoredDisk(root, "none"); err == nil {
+	if _, err := restoredDisk(root, "none"); err == nil {
 		t.Fatal("missing restore accepted")
 	}
 	write("overlay", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "rootfs.ext4", BaseSHA256: sha}}}, "rootfs.ext4")
-	if _, _, _, err := restoredDisk(root, "overlay"); err == nil {
+	if _, err := restoredDisk(root, "overlay"); err == nil {
 		t.Fatal("overlay without its base accepted")
 	}
 	write("overlay", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "rootfs.ext4", BaseSHA256: sha}}}, "rootfs.ext4", backup.SharedBaseName(sha))
-	disk, base, standalone, err := restoredDisk(root, "overlay")
-	if err != nil || standalone || filepath.Base(disk) != "rootfs.ext4" || filepath.Base(base) != backup.SharedBaseName(sha) {
-		t.Fatalf("overlay: %q %q %v %v", disk, base, standalone, err)
+	r, err := restoredDisk(root, "overlay")
+	if err != nil || r.standalone || filepath.Base(r.disk) != "rootfs.ext4" || filepath.Base(r.base) != backup.SharedBaseName(sha) {
+		t.Fatalf("overlay: %+v %v", r, err)
 	}
 	write("full", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "rootfs.ext4"}}}, "rootfs.ext4")
-	disk, base, standalone, err = restoredDisk(root, "full")
-	if err != nil || !standalone || base != "" || filepath.Base(disk) != "rootfs.ext4" {
-		t.Fatalf("full image: %q %q %v %v", disk, base, standalone, err)
+	r, err = restoredDisk(root, "full")
+	if err != nil || !r.standalone || r.base != "" || filepath.Base(r.disk) != "rootfs.ext4" {
+		t.Fatalf("full image: %+v %v", r, err)
 	}
 	write("norootfs", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "vmstate.snap"}}}, "vmstate.snap")
-	if _, _, _, err := restoredDisk(root, "norootfs"); err == nil {
+	if _, err := restoredDisk(root, "norootfs"); err == nil {
 		t.Fatal("marker without a rootfs accepted")
 	}
 }
@@ -76,5 +77,30 @@ func TestParseEgressRulesMirrorsPersistedShape(t *testing.T) {
 	}
 	if _, err := parseEgressRules([]byte(`{`)); err == nil {
 		t.Fatal("malformed config accepted")
+	}
+}
+
+func TestRestoredCurrentMatchesRecordedDigestsOrAge(t *testing.T) {
+	now := time.Now()
+	r := restored{restoredAt: now, manifest: backup.GenerationManifest{Files: []backup.ManifestFile{
+		{Name: "vmstate.snap", SHA256: "aa"}, {Name: "rootfs.ext4", SHA256: "bb"},
+	}}}
+	if !r.current(map[string]string{"vmstate.snap": "aa"}, time.Time{}) {
+		t.Fatal("recorded digest present, rejected")
+	}
+	if !r.current(map[string]string{"vmstate.snap": "aa", "rootfs.ext4": "bb"}, time.Time{}) {
+		t.Fatal("full digest set present, rejected")
+	}
+	if r.current(map[string]string{"vmstate.snap": "cc"}, time.Time{}) {
+		t.Fatal("newer pause accepted by digest")
+	}
+	if !r.current(nil, now.Add(-time.Hour)) {
+		t.Fatal("older snapshot with no digests rejected")
+	}
+	if r.current(nil, now.Add(time.Hour)) {
+		t.Fatal("newer snapshot with no digests accepted")
+	}
+	if r.current(nil, time.Time{}) {
+		t.Fatal("unknown snapshot time accepted")
 	}
 }

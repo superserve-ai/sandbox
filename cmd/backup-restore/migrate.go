@@ -43,6 +43,12 @@ import (
 // and without one the reaper treats the row as long expired and pauses
 // it on its next tick, which is the intent.
 //
+// A restored copy is only booted when it is the sandbox's current pause:
+// the digests the control plane recorded for the row's snapshot must all
+// appear in the restored generation (or, for a snapshot with no recorded
+// digests, the snapshot must predate the restore). A sandbox its owner
+// resumed and paused again since the restore is skipped for a fresh one.
+//
 // Egress rules are re-read from the row and applied at boot, as vmd does
 // not persist them. Secret bindings are re-minted by the control plane on
 // the owner's next resume (the guest's address changed, so the recorded
@@ -132,7 +138,7 @@ func runMigrate(args []string) int {
 		if skip[id] {
 			continue
 		}
-		if _, _, _, err := restoredDisk(*root, id); err != nil {
+		if _, err := restoredDisk(*root, id); err != nil {
 			notRestored++
 			continue
 		}
@@ -167,7 +173,7 @@ func runMigrate(args []string) int {
 		restores    int    // write-back attempts so far
 	}
 	active := map[string]live{} // booted here, waiting for the reaper
-	moved, failed, stuck := 0, 0, 0
+	moved, failed, stuck, stale := 0, 0, 0, 0
 	failFile, _ := os.OpenFile(filepath.Join(*root, "migrate-failed.txt"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if failFile != nil {
 		defer failFile.Close()
@@ -272,19 +278,24 @@ func runMigrate(args []string) int {
 				team        string
 				origTimeout *int32
 				rules       egressRules
+				recorded    map[string]string
+				snapshotAt  time.Time
 			}
 			shapes := map[string]shape{}
-			sq, err := conn.Query(ctx, `SELECT id::text, vcpu_count, memory_mib, team_id::text, timeout_seconds, network_config
-				FROM sandbox WHERE id = ANY($1::uuid[]) AND host_id = $2 AND status = 'paused' AND destroyed_at IS NULL`, batch, *fromHost)
+			sq, err := conn.Query(ctx, `SELECT s.id::text, s.vcpu_count, s.memory_mib, s.team_id::text, s.timeout_seconds, s.network_config,
+					COALESCE((SELECT json_object_agg(am.file_name, am.sha256) FROM artifact_manifest am WHERE am.snapshot_id = s.snapshot_id), '{}')::text,
+					(SELECT sn.created_at FROM snapshot sn WHERE sn.id = s.snapshot_id)
+				FROM sandbox s WHERE s.id = ANY($1::uuid[]) AND s.host_id = $2 AND s.status = 'paused' AND s.destroyed_at IS NULL`, batch, *fromHost)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
 				return 1
 			}
 			for sq.Next() {
-				var id string
+				var id, recorded string
 				var s shape
 				var raw []byte
-				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw); err != nil {
+				var snapshotAt *time.Time
+				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &snapshotAt); err != nil {
 					sq.Close()
 					fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
 					return 1
@@ -292,6 +303,13 @@ func runMigrate(args []string) int {
 				if s.rules, err = parseEgressRules(raw); err != nil {
 					recordFailure(id, "network_config: "+err.Error())
 					continue
+				}
+				if err := json.Unmarshal([]byte(recorded), &s.recorded); err != nil {
+					recordFailure(id, "recorded digests: "+err.Error())
+					continue
+				}
+				if snapshotAt != nil {
+					s.snapshotAt = *snapshotAt
 				}
 				shapes[id] = s
 			}
@@ -311,13 +329,28 @@ func runMigrate(args []string) int {
 			sem := make(chan struct{}, *concurrency)
 			booted := 0
 			for id, s := range shapes {
-				disk, base, standalone, err := restoredDisk(*root, id)
+				rd, err := restoredDisk(*root, id)
+				if err == nil && !rd.current(s.recorded, s.snapshotAt) {
+					// Not a failure of the sandbox: the copy is behind its
+					// owner's latest pause. Clear it so the next host restore
+					// materializes the current one, and leave the id eligible.
+					mu.Lock()
+					stale++
+					if rerr := os.RemoveAll(filepath.Join(*root, id)); rerr != nil {
+						fmt.Printf("STALE %s: restored copy predates the current pause and could not be removed: %v\n", id, rerr)
+					} else {
+						fmt.Printf("STALE %s: restored copy predates the current pause; removed, restore it again\n", id)
+					}
+					mu.Unlock()
+					continue
+				}
 				if err != nil {
 					mu.Lock()
 					recordFailure(id, err.Error())
 					mu.Unlock()
 					continue
 				}
+				disk, base, standalone := rd.disk, rd.base, rd.standalone
 				wg.Add(1)
 				sem <- struct{}{}
 				go func(id string, s shape) {
@@ -371,8 +404,8 @@ func runMigrate(args []string) int {
 			time.Sleep(10 * time.Second)
 		}
 	}
-	fmt.Printf("migrate complete: moved=%d failed=%d stuck=%d in %s\n", moved, failed, stuck, time.Since(started).Round(time.Second))
-	if failed+stuck > 0 {
+	fmt.Printf("migrate complete: moved=%d failed=%d stuck=%d stale=%d in %s\n", moved, failed, stuck, stale, time.Since(started).Round(time.Second))
+	if failed+stuck+stale > 0 {
 		return 1
 	}
 	return 0
@@ -407,34 +440,67 @@ func parseEgressRules(raw []byte) (egressRules, error) {
 // and locates what ReviveVM needs: the rootfs, and either the base it was
 // materialized against or the fact that it stands alone (a generation
 // uploaded as a full image has no base dependency).
-func restoredDisk(root, id string) (disk, base string, standalone bool, err error) {
+type restored struct {
+	disk, base string
+	standalone bool
+	manifest   backup.GenerationManifest
+	restoredAt time.Time // the completion marker's write time
+}
+
+func restoredDisk(root, id string) (restored, error) {
+	var r restored
 	dir := filepath.Join(root, id)
-	raw, err := os.ReadFile(filepath.Join(dir, backup.ManifestObject))
+	marker := filepath.Join(dir, backup.ManifestObject)
+	raw, err := os.ReadFile(marker)
 	if err != nil {
-		return "", "", false, fmt.Errorf("not restored")
+		return r, fmt.Errorf("not restored")
 	}
-	var manifest backup.GenerationManifest
-	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return "", "", false, fmt.Errorf("restore marker: %w", err)
+	if err := json.Unmarshal(raw, &r.manifest); err != nil {
+		return r, fmt.Errorf("restore marker: %w", err)
 	}
-	for _, f := range manifest.Files {
+	if fi, err := os.Stat(marker); err == nil {
+		r.restoredAt = fi.ModTime()
+	}
+	for _, f := range r.manifest.Files {
 		if f.Name != "rootfs.ext4" {
 			continue
 		}
-		disk = filepath.Join(dir, f.Name)
-		if _, err := os.Stat(disk); err != nil {
-			return "", "", false, fmt.Errorf("restored without a rootfs")
+		r.disk = filepath.Join(dir, f.Name)
+		if _, err := os.Stat(r.disk); err != nil {
+			return r, fmt.Errorf("restored without a rootfs")
 		}
 		if f.BaseSHA256 == "" {
-			return disk, "", true, nil
+			r.standalone = true
+			return r, nil
 		}
-		base = filepath.Join(dir, backup.SharedBaseName(f.BaseSHA256))
-		if _, err := os.Stat(base); err != nil {
-			return "", "", false, fmt.Errorf("restored without its base %s", f.BaseSHA256)
+		r.base = filepath.Join(dir, backup.SharedBaseName(f.BaseSHA256))
+		if _, err := os.Stat(r.base); err != nil {
+			return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
 		}
-		return disk, base, false, nil
+		return r, nil
 	}
-	return "", "", false, fmt.Errorf("restore marker lists no rootfs")
+	return r, fmt.Errorf("restore marker lists no rootfs")
+}
+
+// current reports whether the restored generation is the sandbox's
+// current pause: every digest the control plane recorded for the row's
+// snapshot appears in it, or, when nothing was recorded, the snapshot was
+// taken before the restore completed. A stale copy is removed so the
+// next host restore replaces it; the sandbox itself stays eligible.
+func (r restored) current(recorded map[string]string, snapshotAt time.Time) bool {
+	if len(recorded) == 0 {
+		return !snapshotAt.IsZero() && snapshotAt.Before(r.restoredAt)
+	}
+	have := map[string]string{}
+	for _, f := range r.manifest.Files {
+		have[f.Name] = f.SHA256
+	}
+	for name, sha := range recorded {
+		if have[name] != sha {
+			return false
+		}
+	}
+	return true
 }
 
 func loadSkipSet(path string) map[string]bool {
