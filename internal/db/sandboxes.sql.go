@@ -3306,7 +3306,7 @@ const updateSandboxTimeout = `-- name: UpdateSandboxTimeout :execrows
 UPDATE sandbox
 SET timeout_seconds = $2,
     updated_at = now()
-WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL
+WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL AND status <> 'migrating'
 `
 
 type UpdateSandboxTimeoutParams struct {
@@ -3319,7 +3319,9 @@ type UpdateSandboxTimeoutParams struct {
 // next tick: the window is evaluated against the current active session
 // start, so lowering it below already-elapsed session time pauses the
 // sandbox on the next sweep. On a paused sandbox it applies to the next
-// active session after resume.
+// active session after resume. Not while migrating: the timeout is the
+// operator's arm on that boot, and the owner's value is put back with the
+// row; the caller reports the conflict and the owner retries in a minute.
 func (q *Queries) UpdateSandboxTimeout(ctx context.Context, arg UpdateSandboxTimeoutParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateSandboxTimeout, arg.ID, arg.TimeoutSeconds, arg.TeamID)
 	if err != nil {

@@ -595,7 +595,11 @@ func runMigrate(args []string) int {
 				// The write-back is keyed on the temporary value alone: a row
 				// the owner resumed between the poll and this statement still
 				// gets its timeout back. Rows the statement did not reach stay
-				// pending and are polled again.
+				// pending and are polled again. Timeouts cannot be changed
+				// while a row is migrating, so the value can only be the
+				// tool's own, except for an owner who sets exactly this value
+				// in the seconds between the pause and this poll and gets
+				// their earlier one back instead.
 				written := map[string]bool{}
 				wr, err := conn.Query(ctx, `UPDATE sandbox s SET timeout_seconds = v.orig, updated_at = now()
 					FROM unnest($1::uuid[], $2::int[]) AS v(id, orig)

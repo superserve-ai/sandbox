@@ -1129,11 +1129,13 @@ WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL;
 -- next tick: the window is evaluated against the current active session
 -- start, so lowering it below already-elapsed session time pauses the
 -- sandbox on the next sweep. On a paused sandbox it applies to the next
--- active session after resume.
+-- active session after resume. Not while migrating: the timeout is the
+-- operator's arm on that boot, and the owner's value is put back with the
+-- row; the caller reports the conflict and the owner retries in a minute.
 UPDATE sandbox
 SET timeout_seconds = sqlc.narg(timeout_seconds),
     updated_at = now()
-WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL;
+WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL AND status <> 'migrating';
 
 -- name: ClaimAutoDeleteSandboxes :many
 -- Atomically soft-deletes paused sandboxes whose auto-delete deadline has

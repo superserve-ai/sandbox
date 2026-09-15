@@ -3515,6 +3515,12 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	}
 
 	if body.TimeoutSeconds.Set {
+		if sandbox.Status == db.SandboxStatusMigrating {
+			// The update below is gated the same way; answering here names
+			// the reason instead of a not-found.
+			respondError(c, ErrInvalidState)
+			return
+		}
 		if !h.applyRowsAffectedPatch(c, sandbox, teamID, "timeout_updated", func() (int64, error) {
 			return h.DB.UpdateSandboxTimeout(c.Request.Context(), db.UpdateSandboxTimeoutParams{
 				ID:             sandboxID,
