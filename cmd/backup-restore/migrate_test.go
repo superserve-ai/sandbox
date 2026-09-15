@@ -161,3 +161,21 @@ func TestPreviewPolicyRequestMirrorsResumeWire(t *testing.T) {
 		}
 	}
 }
+
+func TestEndpointIsHostBindsLoopbackToLocalAddresses(t *testing.T) {
+	if err := endpointIsHost("10.9.9.9:50051", "10.9.9.9:50051"); err != nil {
+		t.Fatalf("matching remote endpoint rejected: %v", err)
+	}
+	if err := endpointIsHost("10.9.9.9:50051", "10.8.8.8:50051"); err == nil {
+		t.Fatal("mismatched remote endpoint accepted")
+	}
+	if err := endpointIsHost("127.0.0.1:50051", "127.0.0.1:50051"); err != nil {
+		t.Fatalf("loopback row on this machine rejected: %v", err)
+	}
+	if err := endpointIsHost("127.0.0.1:50051", "192.0.2.1:50051"); err == nil {
+		t.Fatal("loopback endpoint accepted for an address this machine does not hold")
+	}
+	if err := endpointIsHost("nonsense", "10.9.9.9:50051"); err == nil {
+		t.Fatal("malformed endpoint accepted")
+	}
+}

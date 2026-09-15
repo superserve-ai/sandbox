@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -116,13 +118,23 @@ func runMigrate(args []string) int {
 	// exists but is silent (a retired slot name, a typo) would have every
 	// boot killed as an orphan by the reconciler of the real host.
 	var age float64
-	err = conn.QueryRow(ctx, `SELECT EXTRACT(EPOCH FROM now() - last_heartbeat_at) FROM host WHERE id = $1`, *toHost).Scan(&age)
+	var rowVMD string
+	err = conn.QueryRow(ctx, `SELECT EXTRACT(EPOCH FROM now() - last_heartbeat_at), vmd_addr FROM host WHERE id = $1`, *toHost).Scan(&age, &rowVMD)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "migrate: destination host %q: %v\n", *toHost, err)
 		return 1
 	}
 	if age > 120 {
 		fmt.Fprintf(os.Stderr, "migrate: destination host %q has no heartbeat for %.0fs; use the id vmd registers under\n", *toHost, age)
+		return 1
+	}
+	// The daemon the boots go to must be the one that row describes: a
+	// loopback endpoint has to be on the machine the row's address names,
+	// any other endpoint has to be that address. Otherwise the guest would
+	// run on one host while the row points at another, and both
+	// reconcilers would undo it.
+	if err := endpointIsHost(*vmdAddr, rowVMD); err != nil {
+		fmt.Fprintf(os.Stderr, "migrate: -vmd %s is not host %q (%s): %v\n", *vmdAddr, *toHost, rowVMD, err)
 		return 1
 	}
 	var srcStatus string
@@ -138,6 +150,13 @@ func runMigrate(args []string) int {
 		return 1
 	}
 	defer journal.Close()
+	// One run per restore root: the journal's entries are retired by
+	// sandbox id, so two runs claiming the same rows could retire each
+	// other's. The lock is released with the descriptor.
+	if err := unix.Flock(int(journal.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		fmt.Fprintf(os.Stderr, "migrate: another run holds %s: %v\n", journal.Name(), err)
+		return 1
+	}
 	pending, err := pendingJournal(journal)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "migrate: timeout journal: %v\n", err)
@@ -317,6 +336,7 @@ func runMigrate(args []string) int {
 				return 1
 			}
 			var paused, gone, deleted []string
+			pausedSeen := time.Now()
 			for st.Next() {
 				var id, status string
 				var gen int64
@@ -386,7 +406,7 @@ func runMigrate(args []string) int {
 						err = nil
 						continue
 					}
-					if secs, ierr := billedDuring(ctx, conn, id, active[id].since); ierr != nil {
+					if secs, ierr := billedDuring(ctx, conn, id, active[id].since, pausedSeen); ierr != nil {
 						fmt.Printf("WARN %s: could not check for intervals opened during migration: %v\n", id, ierr)
 					} else if secs > 0 {
 						fmt.Printf("BILLED %s: %.0fs of intervals opened while migrating; credit the owner\n", id, secs)
@@ -753,14 +773,47 @@ func pendingJournal(journal *os.File) (map[string]journaled, error) {
 	return pending, nil
 }
 
-// billedDuring sums the compute billing intervals opened on a sandbox
-// since it was flipped here; nonzero means the reaper's retry path
-// reopened billing on an operator-owned boot.
-func billedDuring(ctx context.Context, conn *pgxpool.Pool, id string, since time.Time) (float64, error) {
+// billedDuring sums the compute billing intervals that opened on a
+// sandbox after it was claimed here and had closed by the time its pause
+// was observed; nonzero means the reaper's retry path reopened billing on
+// an operator-owned boot. An owner's own session after that pause is
+// still open, or closed later, and is not counted.
+func billedDuring(ctx context.Context, conn *pgxpool.Pool, id string, since, until time.Time) (float64, error) {
 	var secs float64
-	err := conn.QueryRow(ctx, `SELECT COALESCE(SUM(EXTRACT(EPOCH FROM COALESCE(ended_at, now()) - started_at)), 0)
-		FROM sandbox_compute_billing_interval WHERE sandbox_id = $1 AND started_at >= $2`, id, since).Scan(&secs)
+	err := conn.QueryRow(ctx, `SELECT COALESCE(SUM(EXTRACT(EPOCH FROM ended_at - started_at)), 0)
+		FROM sandbox_compute_billing_interval
+		WHERE sandbox_id = $1 AND started_at >= $2 AND ended_at IS NOT NULL AND ended_at <= $3`, id, since, until).Scan(&secs)
 	return secs, err
+}
+
+// endpointIsHost checks that a vmd endpoint is the host a row describes:
+// a loopback or unspecified endpoint must be on a machine that holds the
+// row's address, any other endpoint must be that address.
+func endpointIsHost(endpoint, rowAddr string) error {
+	rowHost, _, err := net.SplitHostPort(rowAddr)
+	if err != nil {
+		return fmt.Errorf("host row address: %w", err)
+	}
+	epHost, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return fmt.Errorf("endpoint: %w", err)
+	}
+	if ip := net.ParseIP(epHost); epHost == "" || epHost == "localhost" || (ip != nil && (ip.IsLoopback() || ip.IsUnspecified())) {
+		addrs, err := net.InterfaceAddrs()
+		if err != nil {
+			return err
+		}
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.String() == rowHost {
+				return nil
+			}
+		}
+		return fmt.Errorf("this machine does not hold %s", rowHost)
+	}
+	if epHost != rowHost {
+		return fmt.Errorf("endpoint names %s", epHost)
+	}
+	return nil
 }
 
 // previewPolicy is the row's stored preview access and published ports in
