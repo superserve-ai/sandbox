@@ -256,7 +256,7 @@ ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
 
 -- name: DestroySandbox :one
 -- Atomic, guarded soft-delete. Claims the sandbox from a quiescent state
--- (active/paused/failed) or from a transitional state (starting/resuming/pausing)
+-- (active/paused/failed) or from a transitional state (starting/resuming/pausing/migrating)
 -- whose owning worker is provably gone — updated_at older than
 -- stale_transitional_before. It never claims a live transition, so it serializes
 -- against a concurrent resume/pause (this CAS and BeginResume target the same row,
@@ -275,7 +275,7 @@ WITH destroyed AS (
     AND sandbox.destroyed_at IS NULL
     AND (
       sandbox.status IN ('active', 'paused', 'failed')
-      OR (sandbox.status IN ('starting', 'resuming', 'pausing')
+      OR (sandbox.status IN ('starting', 'resuming', 'pausing', 'migrating')
           AND sandbox.updated_at < sqlc.arg(stale_transitional_before))
     )
   RETURNING id, had_secret_bindings
@@ -472,7 +472,10 @@ LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id;
 -- (delete, reaper failover), their transition wins and this returns 0.
 WITH reverted AS (
   UPDATE sandbox
-  SET status = 'active', updated_at = now(),
+  -- A migration pause goes back to 'migrating': that boot is not the
+  -- owner's session and must not become reachable or billed.
+  SET status = (CASE WHEN sandbox.pause_op_trigger = 'migration' THEN 'migrating' ELSE 'active' END)::sandbox_status,
+      updated_at = now(),
       -- The pause is over: drop its identity so a result that arrives late
       -- for it can no longer match this row.
       pause_op_id = NULL, pause_op_started_at = NULL,
@@ -485,7 +488,7 @@ WITH reverted AS (
     AND (sqlc.narg(pause_op_id)::uuid IS NULL
          OR (sandbox.pause_op_id = sqlc.narg(pause_op_id)::uuid
              AND sandbox.pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
-  RETURNING id, team_id, vcpu_count, memory_mib
+  RETURNING id, team_id, vcpu_count, memory_mib, status
 ),
 opened_active AS (
   -- The reopened interval keeps the actor of the one the pause closed when
@@ -499,6 +502,7 @@ opened_active AS (
                    ORDER BY i.ended_at DESC LIMIT 1)),
          now()
   FROM reverted r
+  WHERE r.status = 'active'
   ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
   RETURNING sandbox_id
 ),
@@ -962,6 +966,9 @@ WHERE s.id = $1 AND s.destroyed_at IS NULL;
 -- timeout_seconds bounds the current session (its open interval, reopened on
 -- resume), falling back to created_at when no interval is open; the 60s grace
 -- floor spares freshly started or resumed sandboxes with very short timeouts.
+-- 'migrating' rows are an operator's boot on another host that must be
+-- paused again without ever being exposed as active; they carry a short
+-- timeout for exactly this scan.
 WITH open_sessions AS (
   SELECT sandbox_id, max(started_at) AS session_start
   FROM sandbox_active_interval
@@ -973,7 +980,7 @@ FROM sandbox s
 LEFT JOIN open_sessions os ON os.sandbox_id = s.id
 WHERE s.destroyed_at IS NULL
   AND s.timeout_seconds IS NOT NULL
-  AND s.status = 'active'
+  AND s.status IN ('active', 'migrating')
   AND COALESCE(os.session_start, s.created_at) + (s.timeout_seconds || ' seconds')::interval < now()
   AND COALESCE(os.session_start, s.created_at) < now() - interval '60 seconds'
 ORDER BY s.created_at ASC
@@ -990,12 +997,12 @@ WITH open_session AS (
   WHERE i.sandbox_id = sqlc.arg(id)::uuid AND i.ended_at IS NULL
 ),
 expired AS (
-  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id, s.status
   FROM sandbox s, open_session os
   WHERE s.id = sqlc.arg(id)::uuid
     AND s.destroyed_at IS NULL
     AND s.timeout_seconds IS NOT NULL
-    AND s.status = 'active'
+    AND s.status IN ('active', 'migrating')
     AND COALESCE(os.session_start, s.created_at) + (s.timeout_seconds || ' seconds')::interval < now()
     AND COALESCE(os.session_start, s.created_at) < now() - interval '60 seconds'
   FOR UPDATE OF s SKIP LOCKED
@@ -1010,7 +1017,10 @@ paused AS (
       pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
       pause_op_lease_version = sandbox.pause_op_lease_version + 1,
       pause_op_attention_at = NULL,
-      pause_op_trigger = 'timeout',
+      -- A migrating row is an operator's boot being put back to paused;
+      -- the trigger remembers that so a failed attempt reverts to
+      -- migrating, never to active.
+      pause_op_trigger = CASE WHEN expired.status = 'migrating' THEN 'migration' ELSE 'timeout' END,
       pause_op_actor_id = NULL
   FROM expired
   WHERE sandbox.id = expired.id
@@ -1119,11 +1129,13 @@ WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL;
 -- next tick: the window is evaluated against the current active session
 -- start, so lowering it below already-elapsed session time pauses the
 -- sandbox on the next sweep. On a paused sandbox it applies to the next
--- active session after resume.
+-- active session after resume. Not while migrating: the timeout is the
+-- operator's arm on that boot, and the owner's value is put back with the
+-- row; the caller reports the conflict and the owner retries in a minute.
 UPDATE sandbox
 SET timeout_seconds = sqlc.narg(timeout_seconds),
     updated_at = now()
-WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL;
+WHERE id = $1 AND team_id = sqlc.arg(team_id) AND destroyed_at IS NULL AND status <> 'migrating';
 
 -- name: ClaimAutoDeleteSandboxes :many
 -- Atomically soft-deletes paused sandboxes whose auto-delete deadline has
