@@ -479,9 +479,9 @@ found, including any guard from an earlier attempt.
 Once the CA/artifact and baseline checks above pass, rerun the VMD workflow on
 this branch with `environment: staging` and `target: standby`. This configuration
 change does not itself transfer prerequisites, deploy, or admit Host 2.
-For a manual east-cell standby deployment, first set `VMD_STANDBY_HOST_USE4`
-to the provisioned standby instance name. Serving and push deployments do not
-require that variable.
+Manual production standby deployments resolve the single instance carrying
+`component=vmd-<cell>-standby` in the selected region. Promotion and rollback
+swap that role label; deployment selection follows the applied labels.
 
 CD creates env files without truncating existing content, keeps vmd.env root-owned
 0600 and secretsproxy.env 0600, and reconciles deployment-supplied control-plane,

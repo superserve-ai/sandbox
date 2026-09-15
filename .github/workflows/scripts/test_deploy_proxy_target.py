@@ -28,6 +28,7 @@ class ProxyTargetTests(unittest.TestCase):
                    VMD_LABEL="component=vmd", DEPLOY_EVENT="workflow_dispatch",
                    DEPLOY_TARGET="standby", DEPLOY_ENVIRONMENT="production",
                    DEPLOY_PRODUCTION_CELL="usw2", DEPLOY_CELL="usw2")
+        env["MOCK_ROLE_ROWS"] = rows or ""
         env.update(overrides)
         step = next(s for s in STEPS if f'DEPLOY_CELL: {env["DEPLOY_CELL"]}' in s)
         if env["DEPLOY_CELL"] != "staging":
@@ -44,7 +45,7 @@ class ProxyTargetTests(unittest.TestCase):
             self.assertIn('PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"', step)
         # Execute the workflow's actual selection prefix, without secret access or deployment.
         prefix = step.split("        run: |\n")[1].split('          : "${GCP_REGION:?', 1)[0]
-        result = subprocess.run(["bash", "-eu", "-c", prefix + '\npython3 -c "import json, os; print(json.dumps(dict(os.environ)))"'],
+        result = subprocess.run(["bash", "-eu", "-c", 'gcloud() { printf "%s" "$MOCK_ROLE_ROWS"; };\n' + prefix + '\npython3 -c "import json, os; print(json.dumps(dict(os.environ)))"'],
                                 cwd=SCRIPTS.parents[2], env=env, capture_output=True, text=True)
         if result.returncode:
             return 1, []
@@ -139,15 +140,14 @@ class ProxyTargetTests(unittest.TestCase):
                                                  PROXY_DATABASE_URL="postgres://routing:example@db.example.test/db"),
                                      (0, ["example-serving"]))
 
-    def test_west_and_configured_east_standby(self):
+    def test_west_and_east_standby_follow_role_labels(self):
         self.assertEqual(self.select("superserve-vmd-usw2-2,us-west2-a,RUNNING\n"),
                          (0, ["superserve-vmd-usw2-2"]))
         self.assertEqual(self.select("superserve-vmd-use4-3,us-east4-a,RUNNING\n",
-                                    DEPLOY_CELL="use4", DEPLOY_PRODUCTION_CELL="use4", GCP_REGION="us-east4",
-                                    VMD_STANDBY_HOST_USE4="superserve-vmd-use4-3"), (0, ["superserve-vmd-use4-3"]))
+                                    DEPLOY_CELL="use4", DEPLOY_PRODUCTION_CELL="use4", GCP_REGION="us-east4"), (0, ["superserve-vmd-use4-3"]))
 
     def test_missing_unconfigured_wrong_or_stopped_production_standby_fails(self):
-        for rows in ("", "other-host,us-west2-a,RUNNING\n", "superserve-vmd-usw2-2,us-east4-a,RUNNING\n",
+        for rows in ("", "superserve-vmd-usw2-2,us-east4-a,RUNNING\n",
                      "superserve-vmd-usw2-2,us-west2-a,TERMINATED\n",
                      "superserve-vmd-usw2-2,us-west2-a,RUNNING\nother-host,us-west2-b,RUNNING\n"):
             self.assertEqual(self.select(rows), (1, []))
@@ -182,7 +182,6 @@ class ProxyTargetTests(unittest.TestCase):
 
     def test_workflow_guards_select_requested_manual_cell_and_preserve_push(self):
         self.assertIn("DEPLOY_TARGET: ${{ inputs.target || 'serving' }}", WORKFLOW)
-        self.assertIn("VMD_STANDBY_HOST_USE4: ${{ vars.VMD_STANDBY_HOST_USE4 }}", WORKFLOW)
         self.assertIn("needs: [deploy-staging]", WORKFLOW)
         for event in ("push", "workflow_dispatch"):
             for target in ("", "serving", "standby"):
