@@ -423,15 +423,13 @@ module "sandbox_host_b" {
 
 # The standby's own background-data disk — see sandbox_data above for
 # why every host carrying the "vmd" deploy label needs one, and for why
-# hyperdisk-balanced (this is a Z3 metal host too). Sized the same as
-# the primary's: on promotion this host takes over the same traffic, so
-# the same headroom math applies.
+# hyperdisk-balanced (this is a Z3 metal host too). Hyperdisks only grow.
 resource "google_compute_disk" "sandbox_data_b" {
   project = local.project_id
   name    = "superserve-vmd-usw2-2-sandbox-data"
   zone    = local.zone
   type    = "hyperdisk-balanced"
-  size    = 1024
+  size    = 4096
 
   labels = merge(local.common_labels, {
     component = "vmd"
