@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
@@ -46,6 +47,14 @@ func (h *RoutingHandler) record(ctx context.Context, outcome, hostID string) {
 func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	port, id, err := ParseRequest(r.Host, r.Header, h.domains)
 	if err != nil {
+		http.Error(w, "invalid sandbox URL", http.StatusBadRequest)
+		return
+	}
+	if port < minProxiedPort {
+		http.Error(w, "port not allowed", http.StatusForbidden)
+		return
+	}
+	if _, err := uuid.Parse(id); err != nil {
 		http.Error(w, "invalid sandbox URL", http.StatusBadRequest)
 		return
 	}
