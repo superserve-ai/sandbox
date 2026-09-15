@@ -276,3 +276,33 @@ func TestMaterializeBaseRejectsNonHexDigest(t *testing.T) {
 		t.Fatalf("cache dir touched: %v", entries)
 	}
 }
+
+// A destination the cache cannot clone into (here: a different directory
+// tree that may be another filesystem) still restores byte-exact via the
+// direct unpack, rather than failing the sandbox.
+func TestMaterializeBaseFallsBackWhenCloneFails(t *testing.T) {
+	store := newMemBlobs()
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "base-image.ext4")
+	baseData := bytes.Repeat([]byte{0x22}, 96<<10)
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writeRestoreFixture(t, dir)
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+	cache := &CachingBaseReader{Inner: store, Dir: filepath.Join(t.TempDir(), "cache")}
+	dest := filepath.Join(t.TempDir(), "elsewhere")
+	if _, err := RestoreGeneration(context.Background(), cache, task.SandboxID, task.Generation, dest, nil); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dest, SharedBaseName(digestOf(baseData))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, baseData) {
+		t.Fatal("restored base differs from original")
+	}
+}

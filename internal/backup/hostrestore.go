@@ -657,5 +657,16 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 		return err
 	}
 	defer src.Close()
-	return cloneFile(dst, src)
+	if err := cloneFile(dst, src); err == nil {
+		return nil
+	}
+	// The cache can reflink but this destination cannot share with it
+	// (another filesystem, or one without reflink): unpack the object
+	// straight into dst, the same single pass as the no-reflink case.
+	rc, err := c.NewReader(ctx, object)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	return unpackExtents(ctx, rc, mf, dst)
 }
