@@ -1,5 +1,6 @@
-# Two-phase rollout: leave the environment variable PEER_ROUTING_ENABLED unset
-# while deploying ingress to every owner in every reachable region. Enable it
+# Two-phase rollout: leave PEER_ROUTING_ENABLED (staging) and production variables
+# PEER_ROUTING_ENABLED_USE4 / PEER_ROUTING_ENABLED_USW unset while deploying ingress
+# to every owner in every reachable region. Enable each cell independently
 # with value 1 only after all ingress deployments and readiness checks succeed.
 # On partial failure keep routing disabled and complete the ingress rollout.
 # Before removing ingress or rolling back to an older binary, disable routing
@@ -39,7 +40,7 @@ on:
           - serving
           - standby
       production_cell:
-        description: 'Production cell for standby deployments'
+        description: 'Production cell for manual deployments'
         required: true
         type: choice
         default: usw2
@@ -205,7 +206,7 @@ jobs:
       # rather than silently skip the only primary-host proxy rollout
       # (deploy-proxy.py fails on zero VMD_LABEL matches).
       - name: Deploy proxy to us-east4 use-cell VMD instance
-        if: github.event_name != 'workflow_dispatch' || inputs.target != 'standby' || inputs.production_cell == 'use4'
+        if: github.event_name != 'workflow_dispatch' || inputs.production_cell == 'use4'
         env:
           DEPLOY_CELL: use4
           VMD_STANDBY_HOST_USE4: ${{ vars.VMD_STANDBY_HOST_USE4 }}
@@ -222,12 +223,12 @@ jobs:
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
           # Keep ingress enabled independently through routing enable/disable rollout.
-          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED == '1' || vars.PEER_INGRESS_ENABLED_PROD == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
+          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED_USE4 == '1' || vars.PEER_INGRESS_ENABLED_PROD == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
-          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED_USE4 }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
@@ -260,7 +261,7 @@ jobs:
       # would break every access token in the cell. The seed is fetched at
       # deploy time so Secret Manager stays the single source of truth.
       - name: Deploy proxy to usw cell VMD instances
-        if: (github.event_name == 'workflow_dispatch' && inputs.target == 'standby' && (inputs.production_cell == 'usw2' || inputs.production_cell == '')) || ((github.event_name != 'workflow_dispatch' || inputs.target != 'standby') && vars.CLOUD_RUN_SERVICE_USW != '')
+        if: (github.event_name == 'workflow_dispatch' && (inputs.production_cell == 'usw2' || inputs.production_cell == '')) || (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != '')
         env:
           DEPLOY_CELL: usw2
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
@@ -277,12 +278,12 @@ jobs:
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
           # Keep ingress enabled independently through routing enable/disable rollout.
-          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED == '1' || vars.PEER_INGRESS_ENABLED_USW == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
+          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED_USW == '1' || vars.PEER_INGRESS_ENABLED_USW == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
-          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED_USW }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
