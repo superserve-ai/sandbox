@@ -13,7 +13,7 @@ Env vars:
   PROXY_DOMAINS              optional — comma-separated host suffixes; overrides
                              PROXY_DOMAIN on the proxy when set (DNS transitions)
   SANDBOX_ACCESS_TOKEN_SEED  optional — hex, >=32 bytes (>=64 hex chars)
-  DATABASE_URL               required when routing is enabled — shared Postgres connection
+  PROXY_DATABASE_URL        required when routing is enabled — dedicated read-only connection
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
   PEER_PROXY_TARGET_ADDR     optional — loopback address for peer ingress
@@ -74,11 +74,12 @@ def main() -> int:
     if peer_routing not in ("0", "1"):
         print("ERROR: PEER_ROUTING_ENABLED must be 0 or 1", file=sys.stderr)
         return 1
-    database_url = os.environ.get("DATABASE_URL", "")
+    database_url = os.environ.get("PROXY_DATABASE_URL", "")
     if peer_routing == "1" and not database_url:
-        print("ERROR: DATABASE_URL is required for cross-host routing", file=sys.stderr)
+        print("ERROR: PROXY_DATABASE_URL is required for cross-host routing", file=sys.stderr)
         return 1
-    database_env_line = 'DATABASE_URL="' + database_url.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    database_env_line = ('PROXY_DATABASE_URL="' + database_url.replace('\\', '\\\\').replace('"', '\\"') + '"') if peer_routing == "1" else ""
+    database_env_command = ("printf '%s\\n' " + shlex.quote(database_env_line) + " | sudo tee -a /etc/sandbox/proxy.env > /dev/null") if database_env_line else ":"
     terminal_origins = os.environ.get("PROXY_ALLOWED_ORIGINS", "")
     if terminal_origins and not re.fullmatch(r"[A-Za-z0-9.,:/*\-]+", terminal_origins):
         print("ERROR: PROXY_ALLOWED_ORIGINS contains disallowed characters", file=sys.stderr)
@@ -467,7 +468,7 @@ def main() -> int:
                     sudo awk '/^PEER_PROXY_/' "$rollback_dir/proxy.env" | sudo tee -a /etc/sandbox/proxy.env > /dev/null
                 fi
             fi
-            printf '%s\\n' {shlex.quote(database_env_line)} | sudo tee -a /etc/sandbox/proxy.env > /dev/null
+            {database_env_command}
             sudo chmod 0600 /etc/sandbox/proxy.env
 
             if ! sudo systemctl restart proxy; then

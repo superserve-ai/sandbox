@@ -72,7 +72,7 @@ class DeployProxyTests(unittest.TestCase):
             "GCP_PROJECT": "example-project",
             "GCP_REGION": zone.rsplit("/", 1)[-1].rsplit("-", 1)[0],
             "SHA": "12345678",
-            "DATABASE_URL": database_url,
+            "PROXY_DATABASE_URL": database_url,
             "PEER_ROUTING_ENABLED": routing,
             "PROXY_DOMAIN": "sandbox.example.test",
             "PEER_PROXY_LISTEN_ADDR": peer_addr,
@@ -135,6 +135,13 @@ class DeployProxyTests(unittest.TestCase):
                 script = self.generate_script("auto")
                 self.assertIn('PEER_PROXY_LISTEN_ADDR=', script)
                 self.assertIn(':5009', script)
+
+    def test_disabled_routing_omits_database_credential(self):
+        script = self.generate_script("auto", routing="0", database_url="postgres://routing:secret@db.example.test/db")
+        self.assertNotIn("PROXY_DATABASE_URL=", script)
+        self.assertNotIn("routing:secret", script)
+        enabled = self.generate_script("auto", routing="1")
+        self.assertIn("PROXY_DATABASE_URL=", enabled)
 
     def test_database_required_only_for_routing(self):
         self.generate_script("auto", database_url="", routing="0")
@@ -344,7 +351,7 @@ class DeployProxyTests(unittest.TestCase):
                         fi
                     fi
                     if [ "$1" = restart ] && [ "$2" = proxy ]; then
-                        if grep -q 'new binary' "{root}/bin/proxy" && ! grep -q '^DATABASE_URL=' "{root}/etc/sandbox/proxy.env"; then
+                        if grep -q 'new binary' "{root}/bin/proxy" && ! grep -q '^PEER_ROUTING_ENABLED=' "{root}/etc/sandbox/proxy.env"; then
                             echo 'new binary cannot start with old environment' >&2
                             return 1
                         fi
@@ -473,12 +480,12 @@ class DatabaseEnvironmentTests(unittest.TestCase):
             for password in passwords:
                 with self.subTest(password=password):
                     url = f"postgres://user:{password}@db.example.test/database"
-                    script = DeployProxyTests().generate_script("", database_url=url)
-                    command = next(line for line in script.splitlines() if "DATABASE_URL=" in line)
+                    script = DeployProxyTests().generate_script("auto", database_url=url, routing="1")
+                    command = next(line for line in script.splitlines() if "PROXY_DATABASE_URL=" in line)
                     command = command.split(" | sudo tee", 1)[0]
                     result = subprocess.run(["bash", "-c", command], text=True, capture_output=True)
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, f'DATABASE_URL="{url}"\n')
+                    self.assertEqual(result.stdout, f'PROXY_DATABASE_URL="{url}"\n')
                     self.assertFalse(marker.exists(), "password executed a shell substitution")
 
 
