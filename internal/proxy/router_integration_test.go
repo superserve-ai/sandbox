@@ -17,7 +17,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-func startRoutingTestPeer(t *testing.T, target string) (PeerTransport, string) {
+func startRoutingTestPeer(t *testing.T, target string, limits ...int64) (PeerTransport, string) {
 	t.Helper()
 	cfg := peerTestCredentials(t)
 	tlsConfig, err := cfg.Load()
@@ -30,7 +30,13 @@ func startRoutingTestPeer(t *testing.T, target string) (PeerTransport, string) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- ServePeerListener(ctx, listener, tlsConfig, target, zerolog.Nop()) }()
+	limit := int64(maxPeerStreams)
+	if len(limits) > 0 {
+		limit = limits[0]
+	}
+	go func() {
+		done <- ServePeerListenerWithRecorder(ctx, listener, tlsConfig, target, zerolog.Nop(), nil, limit)
+	}()
 	peers := NewPeerTransport(PeerPoolConfig{Dial: GRPCPeerDialer(cfg.LoadClient)})
 	t.Cleanup(func() {
 		peers.Close()
@@ -331,6 +337,93 @@ func TestRoutingHandlerHTTPHalfClosePreservesResponse(t *testing.T) {
 				t.Fatalf("status=%d body=%q err=%v", response.StatusCode, body, err)
 			}
 
+		})
+	}
+}
+
+func TestRoutingHandlerBackpressureAcrossPeerConnections(t *testing.T) {
+	for _, expire := range []bool{false, true} {
+		t.Run(fmt.Sprintf("expire=%t", expire), func(t *testing.T) {
+			firstStarted, release := make(chan struct{}), make(chan struct{})
+			var requests atomic.Int32
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				if r.URL.Path == "/first" {
+					close(firstStarted)
+					select {
+					case <-release:
+					case <-r.Context().Done():
+						return
+					}
+				}
+				fmt.Fprint(w, "complete")
+			}))
+			defer target.Close()
+			peers, addr := startRoutingTestPeer(t, target.Listener.Addr().String(), 1)
+			// Separate pools create independent HTTP/2 connections to the same ingress.
+			otherPeers := NewPeerTransport(PeerPoolConfig{Dial: peers.(*peerPool).cfg.Dial})
+			defer otherPeers.Close()
+			owner := RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+				return SandboxRoute{HostID: "owner", ProxyAddr: addr, Generation: 1}, nil
+			})
+			firstRouter := httptest.NewServer(NewRoutingHandler([]string{"sandbox.test"}, "edge-a", owner, peers, http.NotFoundHandler(), zerolog.Nop()))
+			defer firstRouter.Close()
+			secondRouter := httptest.NewServer(NewRoutingHandler([]string{"sandbox.test"}, "edge-b", owner, otherPeers, http.NotFoundHandler(), zerolog.Nop()))
+			defer secondRouter.Close()
+			request := func(url string) int {
+				req, _ := http.NewRequest(http.MethodGet, url, nil)
+				req.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
+				client := http.Client{Timeout: 3 * time.Second}
+				response, err := client.Do(req)
+				if err != nil {
+					t.Error(err)
+					return 0
+				}
+				defer response.Body.Close()
+				if _, err := io.Copy(io.Discard, response.Body); err != nil {
+					t.Error(err)
+				}
+				return response.StatusCode
+			}
+			firstResult := make(chan int, 1)
+			go func() { firstResult <- request(firstRouter.URL + "/first") }()
+			select {
+			case <-firstStarted:
+			case <-time.After(3 * time.Second):
+				t.Fatal("first request never reached target")
+			}
+			secondResult := make(chan int, 1)
+			go func() { secondResult <- request(secondRouter.URL + "/second") }()
+			if expire {
+				if code := <-secondResult; code != http.StatusBadGateway {
+					t.Errorf("saturated ingress status=%d", code)
+				}
+				if requests.Load() != 1 {
+					t.Error("timed-out admission reached target")
+				}
+				close(release)
+			} else {
+				select {
+				case code := <-secondResult:
+					t.Errorf("request completed before capacity release: %d", code)
+				case <-time.After(100 * time.Millisecond):
+				}
+				close(release)
+				select {
+				case code := <-secondResult:
+					if code != http.StatusOK {
+						t.Errorf("queued request status=%d", code)
+					}
+				case <-time.After(3 * time.Second):
+					t.Error("queued request did not complete")
+				}
+				if requests.Load() != 2 {
+					t.Errorf("request count=%d", requests.Load())
+				}
+			}
+			if code := <-firstResult; code != http.StatusOK {
+				t.Errorf("first request status=%d", code)
+			}
 		})
 	}
 }

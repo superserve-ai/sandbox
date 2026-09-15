@@ -144,3 +144,16 @@ func TestOwnershipPoolRespectsRoutingGate(t *testing.T) {
 		}
 	}
 }
+
+func TestOwnershipPoolHasFixedBudgetAndReadOnlySessions(t *testing.T) {
+	config, err := ownershipPoolConfig("postgres://example:example@localhost/example?pool_max_conns=192&pool_min_conns=100&pool_min_idle_conns=90&default_transaction_read_only=off&statement_timeout=0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.MaxConns != 4 || config.MinConns != 0 || config.MinIdleConns != 0 {
+		t.Fatalf("unexpected pool budget: %+v", config)
+	}
+	if config.ConnConfig.RuntimeParams["default_transaction_read_only"] != "on" || config.ConnConfig.RuntimeParams["statement_timeout"] != "500" {
+		t.Fatal("URL disabled read-only session limits")
+	}
+}

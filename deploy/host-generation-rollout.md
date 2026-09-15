@@ -145,3 +145,6 @@ through `SandboxRoute`, and pass it unchanged into `PeerEndpoint`. Do not add a
 second lookup per request. Router-to-peer integration testing belongs to that
 consumer change. The pool's generation comparisons and retained high-water marks
 remain unchanged.
+
+Before enabling public cross-host routing, also complete the database credential
+and capacity prerequisites in [proxy-routing-capacity.md](proxy-routing-capacity.md).

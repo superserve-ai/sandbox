@@ -69,14 +69,14 @@ func main() {
 	if routingEnabled != "" && routingEnabled != "0" && routingEnabled != "1" {
 		log.Fatal().Msg("PEER_ROUTING_ENABLED must be empty, 0, or 1")
 	}
-	dbPool, err := newOwnershipPool(ctx, routingEnabled == "1", os.Getenv("DATABASE_URL"))
+	dbPool, err := newOwnershipPool(ctx, routingEnabled == "1", os.Getenv("PROXY_DATABASE_URL"))
 	if err != nil {
 		log.Fatal().Err(err).Msg("init ownership database")
 	}
 	var ownership proxy.OwnershipResolver
 	if dbPool != nil {
 		defer dbPool.Close()
-		ownership = proxy.NewDBOwnershipResolver(dbPool)
+		ownership = proxy.NewCachedOwnershipResolver(ctx, proxy.NewDBOwnershipResolver(dbPool))
 	}
 	var routingRecorder telemetry.RoutingOutcomeRecorder
 	var peerTelemetry proxy.RecorderPeerTelemetry
@@ -336,9 +336,13 @@ func newOwnershipPool(ctx context.Context, enabled bool, databaseURL string) (*p
 		return nil, nil
 	}
 	if databaseURL == "" {
-		return nil, fmt.Errorf("DATABASE_URL is required for cross-host routing")
+		return nil, fmt.Errorf("PROXY_DATABASE_URL is required for cross-host routing")
 	}
-	pool, err := pgxpool.New(ctx, databaseURL)
+	config, err := ownershipPoolConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +353,35 @@ func newOwnershipPool(ctx context.Context, enabled bool, databaseURL string) (*p
 		pool.Close()
 		return nil, err
 	}
+	var restricted bool
+	err = pool.QueryRow(bootstrapCtx, `SELECT current_user = 'sandbox_proxy_router'
+		AND NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb AND NOT rolreplication AND NOT rolbypassrls
+		AND NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member = pg_roles.oid)
+		AND NOT has_table_privilege(current_user, 'public.sandbox', 'INSERT,UPDATE,DELETE,TRUNCATE')
+		AND NOT has_any_column_privilege(current_user, 'public.sandbox', 'INSERT,UPDATE')
+		AND NOT has_table_privilege(current_user, 'public.host', 'INSERT,UPDATE,DELETE,TRUNCATE')
+		AND NOT has_any_column_privilege(current_user, 'public.host', 'INSERT,UPDATE')
+		FROM pg_roles WHERE rolname = current_user`).Scan(&restricted)
+	if err != nil || !restricted {
+		pool.Close()
+		return nil, fmt.Errorf("ownership database requires the restricted sandbox_proxy_router role")
+	}
 	return pool, nil
+}
+
+func ownershipPoolConfig(databaseURL string) (*pgxpool.Config, error) {
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	// Fixed per-process budget: independent of host CPU count and URL options.
+	config.MaxConns = 4
+	config.MinConns = 0
+	config.MinIdleConns = 0
+	config.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	config.ConnConfig.RuntimeParams["statement_timeout"] = "500"
+	config.ConnConfig.RuntimeParams["search_path"] = "public,pg_catalog"
+	return config, nil
 }
 
 func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
@@ -415,5 +447,5 @@ func newOutboundPeerTransport(log zerolog.Logger, recorder proxy.PeerPoolTelemet
 	if _, err := cfg.LoadClient(); err != nil {
 		return cfg, nil, err
 	}
-	return cfg, proxy.NewPeerTransport(proxy.PeerPoolConfig{Dial: proxy.GRPCPeerDialer(cfg.LoadClient), Telemetry: recorder}), nil
+	return cfg, proxy.NewPeerTransport(proxy.PeerPoolConfig{Dial: proxy.GRPCPeerDialer(cfg.LoadClient), Telemetry: recorder, MaxConnections: 4, StreamsPerConnection: 32}), nil
 }
