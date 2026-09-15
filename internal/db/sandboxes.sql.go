@@ -507,7 +507,7 @@ expired AS (
   WHERE s.id = $1::uuid
     AND s.destroyed_at IS NULL
     AND s.timeout_seconds IS NOT NULL
-    AND s.status = 'active'
+    AND s.status IN ('active', 'migrating')
     AND COALESCE(os.session_start, s.created_at) + (s.timeout_seconds || ' seconds')::interval < now()
     AND COALESCE(os.session_start, s.created_at) < now() - interval '60 seconds'
   FOR UPDATE OF s SKIP LOCKED
@@ -2205,7 +2205,7 @@ FROM sandbox s
 LEFT JOIN open_sessions os ON os.sandbox_id = s.id
 WHERE s.destroyed_at IS NULL
   AND s.timeout_seconds IS NOT NULL
-  AND s.status = 'active'
+  AND s.status IN ('active', 'migrating')
   AND COALESCE(os.session_start, s.created_at) + (s.timeout_seconds || ' seconds')::interval < now()
   AND COALESCE(os.session_start, s.created_at) < now() - interval '60 seconds'
 ORDER BY s.created_at ASC
@@ -2219,6 +2219,9 @@ LIMIT $1
 // timeout_seconds bounds the current session (its open interval, reopened on
 // resume), falling back to created_at when no interval is open; the 60s grace
 // floor spares freshly started or resumed sandboxes with very short timeouts.
+// 'migrating' rows are an operator's boot on another host that must be
+// paused again without ever being exposed as active; they carry a short
+// timeout for exactly this scan.
 func (q *Queries) ListExpiredSandboxes(ctx context.Context, limit int32) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, listExpiredSandboxes, limit)
 	if err != nil {

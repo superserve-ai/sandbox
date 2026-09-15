@@ -36,11 +36,13 @@ import (
 // Each sandbox goes through three steps. The row is claimed first: it
 // moves here as 'migrating', fenced on the snapshot whose digests were
 // checked and on the timeout read with it. Resume claims only paused rows,
-// so the owner cannot start a second copy beside the boot; a request of
-// theirs waits for the flip. The restored disk is then booted, and the row
-// is activated with the fresh address as soon as the RPC returns, inside
-// the grace vmd's reconciler gives a running VM without an active row. A
-// boot that fails hands the claim back to the source, paused as it was.
+// so the owner cannot start a second copy beside the boot, and no request
+// of theirs is served by it: the row is never active. The restored disk is
+// then booted, and the row is armed with the fresh address and a short
+// timeout as soon as the RPC returns; the reaper pauses migrating rows as
+// it does active ones, so the sandbox goes straight from the operator's
+// boot to paused here. A boot that fails hands the claim back to the
+// source, paused as it was.
 //
 // Nothing on the host pauses an idle VM by itself: the reaper pauses
 // active rows whose timeout has elapsed, and most rows carry no timeout.
@@ -260,9 +262,12 @@ func runMigrate(args []string) int {
 				// window keeps the journaled claim time so nothing billed
 				// meanwhile is missed.
 				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, generation: pending[id].generation}
+			case host == *toHost && status == "migrating" && timeout != nil && *timeout == int32(*tmpTimeout):
+				// Booted and armed; the reaper will pause it. Adopt it.
+				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, generation: pending[id].generation}
 			case host == *toHost && status == "migrating":
-				// Claimed but never activated. The earlier run may have got
-				// as far as booting, so the guest is stopped here first; only
+				// Claimed but never armed. The earlier run may have got as
+				// far as booting, so the guest is stopped here first; only
 				// then is the row resumable on the source again.
 				dctx, dcancel := context.WithTimeout(ctx, time.Minute)
 				_, derr := vmd.DestroyVM(dctx, &vmdpb.DestroyVMRequest{VmId: id, Force: true})
@@ -439,29 +444,35 @@ func runMigrate(args []string) int {
 					if err == nil {
 						var ip netip.Addr
 						if ip, err = netip.ParseAddr(resp.GetHostIp()); err == nil {
-							// Fenced on the journaled timeout as well: a PATCH
-							// the owner made during the boot is theirs to keep.
-							// The secret-injection markers are cleared with it:
-							// the cold boot holds no secrets, and a same address
-							// on this host would otherwise let the next resume
+							// The row stays 'migrating': it is never exposed as
+							// active, so no owner request reaches a guest that
+							// holds no secrets. The short timeout arms the reaper,
+							// which pauses migrating rows like active ones.
+							// Fenced on the journaled timeout: a PATCH the owner
+							// made during the boot is theirs to keep. The
+							// secret-injection markers are cleared with it: the
+							// cold boot holds no secrets, and a same address on
+							// this host would otherwise let the next resume
 							// believe the guest still does.
-							tag, err = conn.Exec(ctx, `UPDATE sandbox SET status = 'active', timeout_seconds = $1, ip_address = $2,
+							tag, err = conn.Exec(ctx, `UPDATE sandbox SET timeout_seconds = $1, ip_address = $2,
 									secret_env_fingerprint = NULL, secret_env_ip = NULL, secret_env_injected_at = NULL, secret_env_expires_at = NULL,
 									updated_at = now()
 								WHERE id = $3 AND host_id = $4 AND status = 'migrating' AND destroyed_at IS NULL
 									AND timeout_seconds IS NOT DISTINCT FROM $5`,
 								int32(*tmpTimeout), ip, id, *toHost, s.origTimeout)
 							if err != nil {
-								// Outcome unknown: the row decides. Active here
-								// means the write landed and the boot stands.
-								var status string
-								if qerr := conn.QueryRow(ctx, `SELECT status::text FROM sandbox WHERE id = $1 AND host_id = $2`, id, *toHost).Scan(&status); qerr == nil && status == "active" {
+								// Outcome unknown: the row decides. The temporary
+								// timeout is only ever set here, so seeing it means
+								// the write landed and the boot stands.
+								var armed bool
+								if qerr := conn.QueryRow(ctx, `SELECT timeout_seconds = $3 FROM sandbox WHERE id = $1 AND host_id = $2 AND status IN ('migrating', 'pausing', 'paused')`,
+									id, *toHost, int32(*tmpTimeout)).Scan(&armed); qerr == nil && armed {
 									err = nil
 								} else {
-									err = errRetry{fmt.Errorf("activation: %w", err)}
+									err = errRetry{fmt.Errorf("arming the pause: %w", err)}
 								}
 							} else if tag.RowsAffected() == 0 {
-								err = errRetry{fmt.Errorf("claim on %s changed before activation", *toHost)}
+								err = errRetry{fmt.Errorf("claim on %s changed before the boot finished", *toHost)}
 							}
 						}
 					}
@@ -524,8 +535,8 @@ func runMigrate(args []string) int {
 			break
 		}
 		// Settle what the reaper finished: paused rows are done (their
-		// temporary timeout cleared); failed rows and rows active past the
-		// wait are reported and left for a human.
+		// temporary timeout cleared); failed rows and rows still in flight
+		// past the wait are reported and left for a human.
 		mu.Lock()
 		if len(active) > 0 {
 			ids := make([]string, 0, len(active))
@@ -648,7 +659,7 @@ func runMigrate(args []string) int {
 				if time.Since(l.since) > *pauseWait {
 					delete(active, id)
 					stuck++
-					fmt.Printf("STUCK %s: still active after %s; pause it by hand\n", id, pauseWait)
+					fmt.Printf("STUCK %s: not paused after %s; pause it by hand\n", id, pauseWait)
 				}
 			}
 		}
