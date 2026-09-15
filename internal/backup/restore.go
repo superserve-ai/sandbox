@@ -187,6 +187,7 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 		}
 		return nil, err
 	}
+	publishers := map[string]func(bool) error{}
 	for _, mf := range manifest.Files {
 		// The bucket is shared across the cell; never let a manifest name
 		// escape destDir.
@@ -194,12 +195,15 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 			return fail(fmt.Errorf("manifest file name: %w", err))
 		}
 		report("restoring %s (%d bytes packed, %d apparent)", mf.Name, mf.PackedSize, mf.Size)
-		madeFile, err := restoreFile(ctx, r, sandboxID, generation, mf, root)
+		madeFile, publish, err := restoreFile(ctx, r, sandboxID, generation, mf, root)
 		if madeFile {
 			created = append(created, mf.Name)
 		}
 		if err != nil {
 			return fail(fmt.Errorf("restore %s: %w", mf.Name, err))
+		}
+		if publish != nil {
+			publishers[mf.Name] = publish
 		}
 	}
 	// Verify after every file has materialized so an error part way through
@@ -207,10 +211,11 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	// the whole set passes or the whole set is gone.
 	for _, mf := range manifest.Files {
 		err := verifyFile(ctx, root, mf)
-		if bp, ok := r.(BasePublisher); ok && isSharedEntry(mf) {
-			// This verification is the one that blesses the reader's
-			// shared copy; a failure here must also stop it being reused.
-			if perr := bp.PublishBase(mf.SHA256, err == nil); perr != nil {
+		if publish := publishers[mf.Name]; publish != nil {
+			// This verification is the one that blesses the copy the
+			// reader materialized from; a failure here must also stop it
+			// being reused.
+			if perr := publish(err == nil); perr != nil {
 				report("shared base %s not cached: %v", mf.SHA256, perr)
 			}
 		}
@@ -458,17 +463,13 @@ const maxApparentSize = int64(16) << 40
 // BaseMaterializer is an optional BlobReader capability: produce the
 // unpacked bytes of a shared base object into dst, typically by cloning a
 // copy the reader already holds. The caller verifies dst afterwards, so an
-// implementation only has to be byte-exact, not trusted.
+// implementation only has to be byte-exact, not trusted. The returned
+// publish callback, when non-nil, is bound to the exact copy dst was
+// materialized from: the restorer calls it with its verification result
+// so the reader may keep that copy for reuse or must discard it. The
+// reader never hashes a base itself.
 type BaseMaterializer interface {
-	MaterializeBase(ctx context.Context, object string, mf ManifestFile, dst *os.File) error
-}
-
-// BasePublisher is the second half of BaseMaterializer: the restorer
-// reports whether the destination it materialized verified, so the reader
-// may keep (or must discard) whatever it materialized from. Verification
-// is the restorer's, so the reader never hashes a base itself.
-type BasePublisher interface {
-	PublishBase(sha string, verified bool) error
+	MaterializeBase(ctx context.Context, object string, mf ManifestFile, dst *os.File) (publish func(verified bool) error, err error)
 }
 
 // unpackExtents writes a packed object's extents into dst at their apparent
@@ -517,12 +518,12 @@ func isSharedEntry(mf ManifestFile) bool {
 // (or a symlink planted in between) is never opened, truncated, or
 // followed. madeFile reports whether this call created the file, and only
 // then may the caller's failure cleanup remove it.
-func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string, mf ManifestFile, root *os.Root) (madeFile bool, _ error) {
+func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string, mf ManifestFile, root *os.Root) (madeFile bool, publish func(bool) error, _ error) {
 	if mf.Object == "" {
-		return false, fmt.Errorf("manifest entry records no object name")
+		return false, nil, fmt.Errorf("manifest entry records no object name")
 	}
 	if err := validExtents(mf); err != nil {
-		return false, err
+		return false, nil, err
 	}
 	var object string
 	if isSharedEntry(mf) {
@@ -533,17 +534,17 @@ func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string
 		// arbitrary bucket object.
 		fp, ok := strings.CutPrefix(mf.Object, SharedBaseObject(mf.SHA256, ""))
 		if !ok || fp == "" || strings.ContainsAny(fp, "/\\") {
-			return false, fmt.Errorf("shared object name %q is not bound to digest %s", mf.Object, mf.SHA256)
+			return false, nil, fmt.Errorf("shared object name %q is not bound to digest %s", mf.Object, mf.SHA256)
 		}
 		object = mf.Object
 	} else {
 		if err := validSegment(mf.Object); err != nil {
-			return false, fmt.Errorf("manifest object name: %w", err)
+			return false, nil, fmt.Errorf("manifest object name: %w", err)
 		}
 		var err error
 		object, err = SandboxObject(sandboxID, generation, mf.Object)
 		if err != nil {
-			return false, err
+			return false, nil, err
 		}
 	}
 	// A shared base is the same bytes for every sandbox that layers on it.
@@ -555,35 +556,36 @@ func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string
 	if bm, ok := r.(BaseMaterializer); ok && isSharedEntry(mf) {
 		f, err := root.OpenFile(mf.Name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err != nil {
-			return false, err
+			return false, nil, err
 		}
 		madeFile = true
 		defer f.Close()
-		if err := bm.MaterializeBase(ctx, object, mf, f); err != nil {
-			return madeFile, err
+		publish, err := bm.MaterializeBase(ctx, object, mf, f)
+		if err != nil {
+			return madeFile, nil, err
 		}
 		if err := f.Sync(); err != nil {
-			return madeFile, err
+			return madeFile, nil, err
 		}
-		return madeFile, f.Close()
+		return madeFile, publish, f.Close()
 	}
 	rc, err := r.NewReader(ctx, object)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	defer rc.Close()
 	f, err := root.OpenFile(mf.Name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	madeFile = true
 	defer f.Close()
 	for _, e := range mf.Extents {
 		if err := ctx.Err(); err != nil {
-			return madeFile, err
+			return madeFile, nil, err
 		}
 		if _, err := io.CopyN(io.NewOffsetWriter(f, e.Offset), rc, e.Length); err != nil {
-			return madeFile, fmt.Errorf("extent at %d: %w", e.Offset, err)
+			return madeFile, nil, fmt.Errorf("extent at %d: %w", e.Offset, err)
 		}
 	}
 	// The packed object must hold exactly the extent table's bytes;
@@ -592,20 +594,20 @@ func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string
 	switch n, err := io.CopyN(io.Discard, rc, 1); {
 	case n != 0:
 		extra, _ := io.Copy(io.Discard, rc)
-		return madeFile, fmt.Errorf("packed object is %d bytes, extent table describes %d", PackedSize(mf.Extents)+1+extra, PackedSize(mf.Extents))
+		return madeFile, nil, fmt.Errorf("packed object is %d bytes, extent table describes %d", PackedSize(mf.Extents)+1+extra, PackedSize(mf.Extents))
 	case err != nil && !errors.Is(err, io.EOF):
-		return madeFile, fmt.Errorf("read past extents: %w", err)
+		return madeFile, nil, fmt.Errorf("read past extents: %w", err)
 	}
 	if err := f.Truncate(mf.Size); err != nil {
-		return madeFile, err
+		return madeFile, nil, err
 	}
 	// Contents must be on disk before the caller can report a verified
 	// restore; page-cache-only bytes would vanish in a power loss behind a
 	// complete-looking directory.
 	if err := f.Sync(); err != nil {
-		return madeFile, err
+		return madeFile, nil, err
 	}
-	return madeFile, f.Close()
+	return madeFile, nil, f.Close()
 }
 
 // validExtents rejects extent tables that could not have come from the

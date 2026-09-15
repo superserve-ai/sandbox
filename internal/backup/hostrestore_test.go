@@ -280,7 +280,7 @@ func TestMaterializeBaseRejectsNonHexDigest(t *testing.T) {
 	}
 	defer dst.Close()
 	for _, bad := range []string{"../../etc/x", "abc", strings.Repeat("Z", 64), strings.Repeat("a", 63) + "/"} {
-		err := cache.MaterializeBase(context.Background(), "bases/x", ManifestFile{SHA256: bad}, dst)
+		_, err := cache.MaterializeBase(context.Background(), "bases/x", ManifestFile{SHA256: bad}, dst)
 		if err == nil || !strings.Contains(err.Error(), "not a sha256") {
 			t.Fatalf("digest %q: err = %v, want rejection", bad, err)
 		}
@@ -308,15 +308,45 @@ func TestMaterializeBaseFallsBackWhenCloneFails(t *testing.T) {
 	uploadFixture(t, store, task)
 	cache := &CachingBaseReader{Inner: store, Dir: filepath.Join(t.TempDir(), "cache")}
 	dest := filepath.Join(t.TempDir(), "elsewhere")
-	if _, err := RestoreGeneration(context.Background(), cache, task.SandboxID, task.Generation, dest, nil); err != nil {
-		t.Fatalf("restore: %v", err)
-	}
-	got, err := os.ReadFile(filepath.Join(dest, SharedBaseName(digestOf(baseData))))
+	probe, err := os.Create(filepath.Join(t.TempDir(), "probe"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got, baseData) {
-		t.Fatal("restored base differs from original")
+	direct := !cache.canCloneInto(probe)
+	probe.Close()
+	// A stale candidate someone else left behind: a destination that did
+	// not clone from it has no say over it, whatever its own verdict.
+	stale := filepath.Join(cache.Dir, ".candidate-"+digestOf(baseData))
+	if err := os.MkdirAll(cache.Dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte("not the base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = RestoreGeneration(context.Background(), cache, task.SandboxID, task.Generation, dest, nil)
+	if direct {
+		if err != nil {
+			t.Fatalf("restore: %v", err)
+		}
+		got, err := os.ReadFile(filepath.Join(dest, SharedBaseName(digestOf(baseData))))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, baseData) {
+			t.Fatal("restored base differs from original")
+		}
+		if _, err := os.Stat(stale); err != nil {
+			t.Fatal("direct restore touched a candidate it never cloned")
+		}
+	} else if err == nil {
+		// Cloned from the stale candidate: verification must reject it
+		// and discard it, and it must not have become the master.
+		t.Fatal("clone of a stale candidate verified")
+	} else if _, err := os.Stat(stale); err == nil {
+		t.Fatal("stale candidate survived a failed verification")
+	}
+	if _, err := os.Stat(filepath.Join(cache.Dir, ".unpacked-"+digestOf(baseData))); err == nil {
+		t.Fatal("unverified bytes were published as the master")
 	}
 }
 

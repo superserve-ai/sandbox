@@ -610,23 +610,27 @@ func isHexDigest(s string) bool {
 // digest unpacks the cached object once into a ".candidate-<sha>" sibling
 // of the spool; every request clones that file (or the published
 // ".unpacked-<sha>" master) into dst. Nothing here hashes: the caller
-// verifies every destination anyway, and PublishBase promotes the
-// candidate to a master only after such a verification has passed, so
-// the cache never holds a trusted copy nobody checked and the base is
-// read exactly once per destination. cloneFile fails on filesystems
-// without reflink, and the fallback is a plain copy, so the result is the
-// same bytes everywhere and only the disk cost differs. Concurrent first
-// requests coalesce.
-func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, mf ManifestFile, dst *os.File) error {
+// verifies every destination anyway, and the returned callback promotes
+// the candidate to a master only after such a verification has passed,
+// so the cache never holds a trusted copy nobody checked and the base is
+// read exactly once per destination. The callback is bound to the very
+// file that was cloned: a candidate replaced or removed in the meantime
+// (a concurrent restore, an interrupted one) is neither published nor
+// discarded on this destination's account. Destinations unpacked
+// directly, and clones of an already published master, return no
+// callback. cloneFile fails on filesystems without reflink, and the
+// fallback is a plain copy, so the result is the same bytes everywhere
+// and only the disk cost differs. Concurrent first requests coalesce.
+func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, mf ManifestFile, dst *os.File) (func(bool) error, error) {
 	if !strings.HasPrefix(object, "bases/") {
-		return fmt.Errorf("materialize: %q is not a shared base object", object)
+		return nil, fmt.Errorf("materialize: %q is not a shared base object", object)
 	}
 	// The digest becomes a path component; a manifest is bucket content,
 	// so it must be exactly a lowercase hex sha256 before it touches the
 	// filesystem, or a crafted entry could steer the master copy outside
 	// the cache.
 	if !isHexDigest(mf.SHA256) {
-		return fmt.Errorf("materialize: manifest digest %q is not a sha256", mf.SHA256)
+		return nil, fmt.Errorf("materialize: manifest digest %q is not a sha256", mf.SHA256)
 	}
 	if !c.canCloneInto(dst) {
 		// Nothing to share with this destination: unpack straight into it,
@@ -634,15 +638,15 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 		// master nobody could clone.
 		rc, err := c.NewReader(ctx, object)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		defer rc.Close()
-		return unpackExtents(ctx, rc, mf, dst)
+		return nil, unpackExtents(ctx, rc, mf, dst)
 	}
 	master, candidate := c.basePaths(mf.SHA256)
 	if src, err := os.Open(master); err == nil {
 		defer src.Close()
-		return cloneFile(dst, src)
+		return nil, cloneFile(dst, src)
 	}
 	_, err, _ := c.group.Do(candidate, func() (any, error) {
 		for _, p := range []string{master, candidate} {
@@ -674,49 +678,61 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 		return nil, os.Rename(tmp.Name(), candidate)
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	src, err := os.Open(candidate)
 	if errors.Is(err, fs.ErrNotExist) {
 		// Published between the coalesced unpack and this open.
-		src, err = os.Open(master)
+		if src, err = os.Open(master); err != nil {
+			return nil, err
+		}
+		defer src.Close()
+		return nil, cloneFile(dst, src)
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer src.Close()
-	return cloneFile(dst, src)
+	cloned, err := src.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if err := cloneFile(dst, src); err != nil {
+		return nil, err
+	}
+	return func(verified bool) error { return c.publishCandidate(mf.SHA256, cloned, verified) }, nil
 }
 
-// PublishBase implements BasePublisher: once a destination cloned from
-// the candidate has passed the restorer's full verification, the
-// candidate is the verified bytes and becomes the master every later
-// restore clones from. A failed verification discards the candidate so
-// the next request unpacks afresh rather than cloning a bad copy again.
-func (c *CachingBaseReader) PublishBase(sha string, verified bool) error {
-	if !isHexDigest(sha) {
-		return fmt.Errorf("publish: %q is not a sha256", sha)
-	}
+// publishCandidate promotes the candidate a destination was cloned from
+// to the master every later restore clones from, once that destination
+// passed the restorer's full verification: the two are the same bytes,
+// so the master is verified without a second read. A failed verification
+// discards the candidate so the next request unpacks afresh. Either way
+// only the identical file is touched; a candidate that has since been
+// replaced belongs to another restore's verdict.
+func (c *CachingBaseReader) publishCandidate(sha string, cloned os.FileInfo, verified bool) error {
 	master, candidate := c.basePaths(sha)
-	ignoreMissing := func(err error) error {
+	current, err := os.Stat(candidate)
+	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
 		return err
 	}
-	if !verified {
-		return ignoreMissing(os.Remove(candidate))
-	}
-	if _, err := os.Stat(master); err == nil {
-		return ignoreMissing(os.Remove(candidate))
-	}
-	err := os.Rename(candidate, master)
-	if errors.Is(err, fs.ErrNotExist) {
-		// No candidate: the destination was unpacked directly, or another
-		// verified restore published first.
+	if !os.SameFile(cloned, current) {
 		return nil
 	}
-	return err
+	if !verified {
+		return os.Remove(candidate)
+	}
+	if _, err := os.Stat(master); err == nil {
+		// Another verified restore published first; the bytes are equal.
+		return os.Remove(candidate)
+	}
+	if err := os.Rename(candidate, master); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func (c *CachingBaseReader) basePaths(sha string) (master, candidate string) {
