@@ -71,3 +71,17 @@ JOIN profile p ON p.id = tm.profile_id
 WHERE tm.team_id = $1 AND tm.role = 'owner'
 ORDER BY tm.joined_at ASC
 LIMIT 1;
+
+-- Active members with an active team-scoped assignment granting billing:write.
+-- DISTINCT prevents duplicate sends when a user has multiple matching roles.
+-- name: ListTrialCreditWarningRecipients :many
+SELECT DISTINCT p.email
+FROM team_memberships m
+JOIN profile p ON p.id = m.user_id
+JOIN user_role_assignments a ON a.user_id = m.user_id AND a.team_id = m.team_id
+JOIN roles r ON r.id = a.role_id AND r.scope_type = 'team'
+JOIN role_permissions rp ON rp.role_id = r.id
+JOIN permissions perm ON perm.id = rp.permission_id AND perm.name = 'billing:write'
+WHERE m.team_id = sqlc.arg(team_id)
+  AND m.status = 'active' AND a.scope_type = 'team' AND a.revoked_at IS NULL
+  AND p.email IS NOT NULL AND p.email <> '';
