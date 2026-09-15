@@ -104,3 +104,22 @@ func TestRestoredCurrentMatchesRecordedDigestsOrAge(t *testing.T) {
 		t.Fatal("unknown snapshot time accepted")
 	}
 }
+
+func TestJournalTimeoutRoundTrip(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "journal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	v := int32(300)
+	if err := journalTimeout(f, "a", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := journalTimeout(f, "b", &v); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(f.Name())
+	if string(data) != "a none\nb 300\n" {
+		t.Fatalf("journal = %q", data)
+	}
+}

@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -38,10 +41,15 @@ import (
 // A short temporary timeout replaces whatever the row had on the flip
 // (a long one would not elapse either) and the original value, timeout
 // or none, is written back once the row is paused again; a row stays
-// pending until that write-back succeeds. No active interval
+// pending until that write-back succeeds. The original is journaled
+// under the restore root before it is replaced, and a rerun finishes the
+// write-back for rows an interrupted run left paused here. No active interval
 // is opened for the boot: it is not the owner's usage and must not bill,
 // and without one the reaper treats the row as long expired and pauses
-// it on its next tick, which is the intent.
+// it on its next tick, which is the intent. The reaper's own retry after
+// a failed pause attempt does reopen intervals; the tool does not touch
+// billing tables, so any interval opened on a row during its migration is
+// reported and written to the ledger for a credit.
 //
 // A restored copy is only booted when it is the sandbox's current pause:
 // the digests the control plane recorded for the row's snapshot must all
@@ -118,6 +126,18 @@ func runMigrate(args []string) int {
 	}
 
 	skip := loadSkipSet(filepath.Join(*root, "migrate-failed.txt"))
+	journal, err := os.OpenFile(filepath.Join(*root, "migrate-timeouts.txt"), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "migrate: timeout journal: %v\n", err)
+		return 1
+	}
+	defer journal.Close()
+	if n, err := finishWriteBacks(ctx, conn, journal, *toHost, int32(*tmpTimeout)); err != nil {
+		fmt.Fprintf(os.Stderr, "migrate: finishing an earlier run's timeout write-backs: %v\n", err)
+		return 1
+	} else if n > 0 {
+		fmt.Printf("migrate: restored the original timeout on %d rows an earlier run left paused here\n", n)
+	}
 	// One inventory up front; the flip re-checks each row under its own
 	// WHERE clause, so a sandbox the owner resumed meanwhile is skipped
 	// rather than moved out from under them.
@@ -240,6 +260,14 @@ func runMigrate(args []string) int {
 							recordFailure(id, fmt.Sprintf("paused here but its timeout could not be written back after %d attempts: %v", l.restores, err))
 						}
 						continue
+					}
+					if secs, ierr := billedDuring(ctx, conn, id, active[id].since); ierr != nil {
+						fmt.Printf("WARN %s: could not check for intervals opened during migration: %v\n", id, ierr)
+					} else if secs > 0 {
+						fmt.Printf("BILLED %s: %.0fs of intervals opened while migrating; credit the owner\n", id, secs)
+						if failFile != nil {
+							fmt.Fprintf(failFile, "%s billed %.0fs during migration\n", id, secs)
+						}
 					}
 					delete(active, id)
 					moved++
@@ -372,11 +400,20 @@ func runMigrate(args []string) int {
 					// The VM is up; pin the row here before the reconciler's
 					// grace on an unclaimed VM runs out. A row that is no
 					// longer paused on the source was resumed by its owner
-					// meanwhile: leave it, and take the boot back down.
-					tag, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'active',
-							timeout_seconds = $2, updated_at = now()
-						WHERE id = $3 AND host_id = $4 AND status = 'paused' AND destroyed_at IS NULL`,
-						*toHost, int32(*tmpTimeout), id, *fromHost)
+					// meanwhile: leave it, and take the boot back down. The
+					// original timeout reaches the journal first, so a run
+					// that dies after the flip can still put it back.
+					mu.Lock()
+					err = journalTimeout(journal, id, s.origTimeout)
+					mu.Unlock()
+					var tag pgconn.CommandTag
+					flippedAt := time.Now()
+					if err == nil {
+						tag, err = conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'active',
+								timeout_seconds = $2, updated_at = now()
+							WHERE id = $3 AND host_id = $4 AND status = 'paused' AND destroyed_at IS NULL`,
+							*toHost, int32(*tmpTimeout), id, *fromHost)
+					}
 					mu.Lock()
 					defer mu.Unlock()
 					if err == nil && tag.RowsAffected() == 0 {
@@ -393,7 +430,7 @@ func runMigrate(args []string) int {
 						return
 					}
 					booted++
-					active[id] = live{since: time.Now(), origTimeout: s.origTimeout}
+					active[id] = live{since: flippedAt, origTimeout: s.origTimeout}
 				}(id, s)
 			}
 			wg.Wait()
@@ -409,6 +446,72 @@ func runMigrate(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// journalTimeout records a row's timeout before the migration replaces
+// it: `<id> <seconds>` or `<id> none`, fsynced, so the value survives the
+// process.
+func journalTimeout(journal *os.File, id string, orig *int32) error {
+	line := id + " none\n"
+	if orig != nil {
+		line = fmt.Sprintf("%s %d\n", id, *orig)
+	}
+	if _, err := journal.WriteString(line); err != nil {
+		return err
+	}
+	return journal.Sync()
+}
+
+// finishWriteBacks restores the journaled timeout on rows an earlier run
+// flipped here and left paused with the temporary value. Every other row
+// in the journal is either already written back or still on its way.
+func finishWriteBacks(ctx context.Context, conn *pgxpool.Pool, journal *os.File, toHost string, tmp int32) (int64, error) {
+	if _, err := journal.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+	data, err := io.ReadAll(journal)
+	if err != nil {
+		return 0, err
+	}
+	var ids []string
+	var origs []*int32
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			continue
+		}
+		var orig *int32
+		if f[1] != "none" {
+			n, err := strconv.ParseInt(f[1], 10, 32)
+			if err != nil {
+				continue
+			}
+			v := int32(n)
+			orig = &v
+		}
+		ids = append(ids, f[0])
+		origs = append(origs, orig)
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	tag, err := conn.Exec(ctx, `UPDATE sandbox s SET timeout_seconds = v.orig, updated_at = now()
+		FROM unnest($1::uuid[], $2::int[]) AS v(id, orig)
+		WHERE s.id = v.id AND s.host_id = $3 AND s.status = 'paused' AND s.timeout_seconds = $4`, ids, origs, toHost, tmp)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// billedDuring sums the compute billing intervals opened on a sandbox
+// since it was flipped here; nonzero means the reaper's retry path
+// reopened billing on an operator-owned boot.
+func billedDuring(ctx context.Context, conn *pgxpool.Pool, id string, since time.Time) (float64, error) {
+	var secs float64
+	err := conn.QueryRow(ctx, `SELECT COALESCE(SUM(EXTRACT(EPOCH FROM COALESCE(ended_at, now()) - started_at)), 0)
+		FROM sandbox_compute_billing_interval WHERE sandbox_id = $1 AND started_at >= $2`, id, since).Scan(&secs)
+	return secs, err
 }
 
 // egressRules is the row's persisted network_config, in the shape vmd
