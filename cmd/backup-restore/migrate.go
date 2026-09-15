@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -199,10 +200,10 @@ func runMigrate(args []string) int {
 	if failFile != nil {
 		defer failFile.Close()
 	}
-	// Rows an earlier run flipped here but never finished: still active
-	// ones join the live set and complete through the same pause and
-	// write-back below; paused ones with the temporary timeout get the
-	// write-back now; anything else is retired from the journal.
+	// Rows an earlier run flipped here but never finished: ones still on
+	// their way to paused join the live set and complete through the same
+	// pause and write-back below; ones already paused with the temporary
+	// timeout get the write-back now; anything else is retired.
 	if len(pending) > 0 {
 		ids := make([]string, 0, len(pending))
 		for id := range pending {
@@ -224,10 +225,12 @@ func runMigrate(args []string) int {
 			}
 			seen[id] = true
 			switch {
-			case host == *toHost && status == "active":
-				active[id] = live{since: time.Now(), origTimeout: pending[id]}
-			case host == *toHost && status == "paused" && timeout != nil && *timeout == int32(*tmpTimeout):
-				active[id] = live{since: time.Now(), origTimeout: pending[id], restores: 1}
+			case host == *toHost && (status == "active" || status == "pausing"):
+				// Still on its way to paused; the audit window keeps the
+				// journaled flip time so nothing billed meanwhile is missed.
+				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig}
+			case host == *toHost && timeout != nil && *timeout == int32(*tmpTimeout):
+				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, restores: 1}
 			default:
 				if err := journalDone(journal, id); err != nil {
 					fmt.Fprintf(os.Stderr, "migrate: journal: %v\n", err)
@@ -299,10 +302,32 @@ func runMigrate(args []string) int {
 				for i, id := range paused {
 					origs[i] = active[id].origTimeout
 				}
-				_, err := conn.Exec(ctx, `UPDATE sandbox s SET timeout_seconds = v.orig, updated_at = now()
+				// The write-back is keyed on the temporary value alone: a row
+				// the owner resumed between the poll and this statement still
+				// gets its timeout back. Rows the statement did not reach stay
+				// pending and are polled again.
+				written := map[string]bool{}
+				wr, err := conn.Query(ctx, `UPDATE sandbox s SET timeout_seconds = v.orig, updated_at = now()
 					FROM unnest($1::uuid[], $2::int[]) AS v(id, orig)
-					WHERE s.id = v.id AND s.status = 'paused' AND s.timeout_seconds = $3`, paused, origs, int32(*tmpTimeout))
+					WHERE s.id = v.id AND s.host_id = $3 AND s.timeout_seconds = $4
+					RETURNING s.id::text`, paused, origs, *toHost, int32(*tmpTimeout))
+				if err == nil {
+					for wr.Next() {
+						var id string
+						if err = wr.Scan(&id); err != nil {
+							break
+						}
+						written[id] = true
+					}
+					wr.Close()
+					if err == nil {
+						err = wr.Err()
+					}
+				}
 				for _, id := range paused {
+					if err == nil && !written[id] {
+						err = fmt.Errorf("row changed before the write-back reached it")
+					}
 					if err != nil {
 						l := active[id]
 						l.restores++
@@ -311,6 +336,7 @@ func runMigrate(args []string) int {
 							delete(active, id)
 							recordFailure(id, fmt.Sprintf("paused here but its timeout could not be written back after %d attempts: %v", l.restores, err))
 						}
+						err = nil
 						continue
 					}
 					if secs, ierr := billedDuring(ctx, conn, id, active[id].since); ierr != nil {
@@ -328,9 +354,7 @@ func runMigrate(args []string) int {
 					moved++
 					fmt.Printf("MOVED %s\n", id)
 				}
-				if err != nil {
-					fmt.Printf("WARN writing back the timeout on %d rows failed, retrying: %v\n", len(paused), err)
-				}
+
 			}
 			for _, id := range gone {
 				delete(active, id)
@@ -443,7 +467,7 @@ func runMigrate(args []string) int {
 					defer wg.Done()
 					defer func() { <-sem }()
 					rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-					_, err := vmd.ReviveVM(rctx, &vmdpb.ReviveVMRequest{
+					resp, err := vmd.ReviveVM(rctx, &vmdpb.ReviveVMRequest{
 						VmId: id, DiskPath: disk, BasePath: base, StandaloneDisk: standalone, AllowRecordless: true,
 						TeamId: s.team, Vcpu: uint32(s.vcpu), MemMib: uint32(s.mem),
 						AllowedCidrs: s.rules.allowedCIDRs, DeniedCidrs: s.rules.deniedCIDRs, AllowedDomains: s.rules.allowedDomains,
@@ -461,21 +485,27 @@ func runMigrate(args []string) int {
 					// meanwhile: leave it, and take the boot back down. The
 					// original timeout reaches the journal first, so a run
 					// that dies after the flip can still put it back.
+					flippedAt := time.Now()
 					mu.Lock()
-					err = journalTimeout(journal, id, s.origTimeout)
+					err = journalTimeout(journal, id, s.origTimeout, flippedAt)
 					mu.Unlock()
 					var tag pgconn.CommandTag
-					flippedAt := time.Now()
 					if err == nil {
-						// Fenced on the snapshot whose digests were checked and
-						// on the timeout that was journaled: a pause the owner
-						// completed or a timeout they set during the boot must
-						// not be replaced.
-						tag, err = conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'active',
-								timeout_seconds = $2, updated_at = now()
-							WHERE id = $3 AND host_id = $4 AND status = 'paused' AND destroyed_at IS NULL AND snapshot_id = $5
-								AND timeout_seconds IS NOT DISTINCT FROM $6`,
-							*toHost, int32(*tmpTimeout), id, *fromHost, *s.snapshotID, s.origTimeout)
+						ip, perr := netip.ParseAddr(resp.GetHostIp())
+						if perr != nil {
+							err = fmt.Errorf("revive returned address %q: %w", resp.GetHostIp(), perr)
+						} else {
+							// Fenced on the snapshot whose digests were checked
+							// and on the timeout that was journaled: a pause the
+							// owner completed or a timeout they set during the
+							// boot must not be replaced. The fresh address lands
+							// with the flip so nothing routes to the old slot.
+							tag, err = conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'active',
+									timeout_seconds = $2, ip_address = $7, updated_at = now()
+								WHERE id = $3 AND host_id = $4 AND status = 'paused' AND destroyed_at IS NULL AND snapshot_id = $5
+									AND timeout_seconds IS NOT DISTINCT FROM $6`,
+								*toHost, int32(*tmpTimeout), id, *fromHost, *s.snapshotID, s.origTimeout, ip)
+						}
 					}
 					if err == nil && tag.RowsAffected() == 0 {
 						err = fmt.Errorf("changed on %s since it was read", *fromHost)
@@ -519,13 +549,13 @@ func runMigrate(args []string) int {
 	return 0
 }
 
-// journalTimeout records a row's timeout before the migration replaces
-// it: `<id> <seconds>` or `<id> none`, fsynced, so the value survives the
-// process.
-func journalTimeout(journal *os.File, id string, orig *int32) error {
-	line := id + " none\n"
+// journalTimeout records a row's timeout and the flip time before the
+// migration replaces it: `<id> <seconds>|none <unix>`, fsynced, so both
+// survive the process.
+func journalTimeout(journal *os.File, id string, orig *int32, at time.Time) error {
+	line := fmt.Sprintf("%s none %d\n", id, at.Unix())
 	if orig != nil {
-		line = fmt.Sprintf("%s %d\n", id, *orig)
+		line = fmt.Sprintf("%s %d %d\n", id, *orig, at.Unix())
 	}
 	if _, err := journal.WriteString(line); err != nil {
 		return err
@@ -542,9 +572,16 @@ func journalDone(journal *os.File, id string) error {
 	return journal.Sync()
 }
 
+// journaled is one un-retired journal entry: the timeout to put back and
+// when the row was flipped.
+type journaled struct {
+	orig  *int32
+	since time.Time
+}
+
 // pendingJournal returns the rows whose journaled timeout has not been
 // retired: a run that ended after flipping them owes them a write-back.
-func pendingJournal(journal *os.File) (map[string]*int32, error) {
+func pendingJournal(journal *os.File) (map[string]journaled, error) {
 	if _, err := journal.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -552,25 +589,30 @@ func pendingJournal(journal *os.File) (map[string]*int32, error) {
 	if err != nil {
 		return nil, err
 	}
-	pending := map[string]*int32{}
+	pending := map[string]journaled{}
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
-		if len(f) != 2 {
+		if len(f) == 2 && f[1] == "done" {
+			delete(pending, f[0])
 			continue
 		}
-		switch f[1] {
-		case "done":
-			delete(pending, f[0])
-		case "none":
-			pending[f[0]] = nil
-		default:
+		if len(f) != 3 {
+			continue
+		}
+		at, err := strconv.ParseInt(f[2], 10, 64)
+		if err != nil {
+			continue
+		}
+		entry := journaled{since: time.Unix(at, 0)}
+		if f[1] != "none" {
 			n, err := strconv.ParseInt(f[1], 10, 32)
 			if err != nil {
 				continue
 			}
 			v := int32(n)
-			pending[f[0]] = &v
+			entry.orig = &v
 		}
+		pending[f[0]] = entry
 	}
 	return pending, nil
 }

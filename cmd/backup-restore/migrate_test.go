@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/superserve-ai/sandbox/internal/backup"
 )
@@ -107,10 +108,11 @@ func TestJournalPendingUntilDone(t *testing.T) {
 	}
 	defer f.Close()
 	v := int32(300)
+	at := time.Unix(1700000000, 0)
 	for _, step := range []func() error{
-		func() error { return journalTimeout(f, "a", nil) },
-		func() error { return journalTimeout(f, "b", &v) },
-		func() error { return journalTimeout(f, "c", nil) },
+		func() error { return journalTimeout(f, "a", nil, at) },
+		func() error { return journalTimeout(f, "b", &v, at) },
+		func() error { return journalTimeout(f, "c", nil, at.Add(time.Hour)) },
 		func() error { return journalDone(f, "b") },
 	} {
 		if err := step(); err != nil {
@@ -121,22 +123,22 @@ func TestJournalPendingUntilDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 2 || pending["b"] != nil || pending["a"] != nil {
-		t.Fatalf("pending = %v", pending)
+	if len(pending) != 2 || pending["a"].orig != nil || !pending["a"].since.Equal(at) {
+		t.Fatalf("pending = %+v", pending)
 	}
-	if _, ok := pending["c"]; !ok {
-		t.Fatal("c missing")
+	if c, ok := pending["c"]; !ok || !c.since.Equal(at.Add(time.Hour)) {
+		t.Fatalf("c = %+v", c)
 	}
-	if err := journalTimeout(f, "b", &v); err != nil {
+	if err := journalTimeout(f, "b", &v, at); err != nil {
 		t.Fatal(err)
 	}
 	pending, _ = pendingJournal(f)
-	if got := pending["b"]; got == nil || *got != 300 {
+	if got := pending["b"].orig; got == nil || *got != 300 {
 		t.Fatalf("re-journaled b = %v", got)
 	}
 	// Appends still land at the end after the read.
 	data, _ := os.ReadFile(f.Name())
-	if !strings.HasSuffix(string(data), "b 300\n") {
+	if !strings.HasSuffix(string(data), "b 300 1700000000\n") {
 		t.Fatalf("journal tail = %q", data)
 	}
 }
