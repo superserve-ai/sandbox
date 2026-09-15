@@ -1941,12 +1941,23 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 // uuid[] parameter and one very large result set.
 const snapshotPathBatchSize = 10000
 
-// resolvePausedSnapshotPaths batch-fetches on-disk snapshot paths for the
+// pausedSnapshotInfo is one paused sandbox's on-disk artifact state as of
+// the last resolvePausedSnapshotPaths pass: the vmstate.snap path Drift 4
+// checks, and enough to tell a fetchable partial miss (mem.snap still
+// local, and a durable backup generation verified to cover this exact
+// snapshot) from a real loss — see failMissingSnapshots.
+type pausedSnapshotInfo struct {
+	Path    string
+	MemPath string
+	Covered bool
+}
+
+// resolvePausedSnapshotPaths batch-fetches on-disk snapshot state for the
 // paused sandboxes on this host in chunked PK lookups, replacing the per-
 // inventory LEFT JOIN that ListSandboxesByHost used to carry. Returns nil when
 // the DB is unset, there are no paused candidates, or any chunk lookup fails —
 // Drift 4 then safely no-ops for this pass rather than acting on a partial map.
-func (r *Reconciler) resolvePausedSnapshotPaths(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow) map[uuid.UUID]string {
+func (r *Reconciler) resolvePausedSnapshotPaths(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow) map[uuid.UUID]pausedSnapshotInfo {
 	if r.cfg.DB == nil {
 		return nil
 	}
@@ -1959,7 +1970,7 @@ func (r *Reconciler) resolvePausedSnapshotPaths(ctx context.Context, log zerolog
 	if len(snapIDs) == 0 {
 		return nil
 	}
-	pathByID := make(map[uuid.UUID]string, len(snapIDs))
+	infoByID := make(map[uuid.UUID]pausedSnapshotInfo, len(snapIDs))
 	for start := 0; start < len(snapIDs); start += snapshotPathBatchSize {
 		end := start + snapshotPathBatchSize
 		if end > len(snapIDs) {
@@ -1973,13 +1984,17 @@ func (r *Reconciler) resolvePausedSnapshotPaths(ctx context.Context, log zerolog
 			return nil
 		}
 		for _, row := range rows {
-			pathByID[row.ID] = row.Path
+			info := pausedSnapshotInfo{Path: row.Path, Covered: row.Covered}
+			if row.MemPath != nil {
+				info.MemPath = *row.MemPath
+			}
+			infoByID[row.ID] = info
 		}
 	}
-	return pathByID
+	return infoByID
 }
 
-func (r *Reconciler) failMissingSnapshots(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, pathByID map[uuid.UUID]string, now time.Time) {
+func (r *Reconciler) failMissingSnapshots(ctx context.Context, log zerolog.Logger, dbSandboxes map[string]db.ListSandboxesByHostRow, infoByID map[uuid.UUID]pausedSnapshotInfo, now time.Time) {
 	for id, sb := range dbSandboxes {
 		if ctx.Err() != nil {
 			return
@@ -1987,9 +2002,10 @@ func (r *Reconciler) failMissingSnapshots(ctx context.Context, log zerolog.Logge
 		if sb.Status != db.SandboxStatusPaused || !sb.SnapshotID.Valid {
 			continue
 		}
-		// Path from resolvePausedSnapshotPaths' batched lookup. Empty means the
-		// snapshot row was deleted (rare race) or has no path — skip.
-		snapPath := pathByID[uuid.UUID(sb.SnapshotID.Bytes)]
+		// Info from resolvePausedSnapshotPaths' batched lookup. Empty path
+		// means the snapshot row was deleted (rare race) or has no path — skip.
+		info := infoByID[uuid.UUID(sb.SnapshotID.Bytes)]
+		snapPath := info.Path
 		if snapPath == "" {
 			continue
 		}
@@ -2016,6 +2032,16 @@ func (r *Reconciler) failMissingSnapshots(ctx context.Context, log zerolog.Logge
 			continue
 		}
 		if !confirmedMissing {
+			unlockOp()
+			continue
+		}
+		// vmstate.snap is gone but mem.snap is still here and a backup
+		// generation verified to cover this exact snapshot exists: this is
+		// the fetchable partial miss resume_fetch.go's fetch-on-resume
+		// trigger restores from (see manager.go's resumeVMLocked), not a
+		// real loss. Defer instead of failing a sandbox the next resume
+		// can still bring back; the next pass re-checks both conditions.
+		if info.Covered && info.MemPath != "" && fileExists(info.MemPath) {
 			unlockOp()
 			continue
 		}

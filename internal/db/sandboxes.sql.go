@@ -676,7 +676,13 @@ FROM (
          COALESCE(pp.ports, '{}')::int[] AS port_numbers,
          COALESCE(pp.accesses, '{}')::text[] AS port_accesses,
          COALESCE(pp.token_versions, '{}')::bigint[] AS port_token_versions,
-         t.base_path AS template_base_path
+         t.base_path AS template_base_path,
+         COALESCE((SELECT bg.generation FROM backup_generation bg
+          WHERE bg.sandbox_id = s.sandbox_id
+            AND bg.covered_snapshot_id = s.id
+            AND bg.covered_snapshot_generation = s.generation
+          ORDER BY bg.reported_at DESC
+          LIMIT 1), ''::text)::text AS covered_backup_generation
   FROM sandbox sb
   LEFT JOIN snapshot s ON s.id = sb.snapshot_id AND s.team_id = sb.team_id
   LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = sb.id
@@ -698,7 +704,7 @@ RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcp
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path
+          x.template_base_path, x.covered_backup_generation
 `
 
 type ClaimResumeParams struct {
@@ -708,17 +714,18 @@ type ClaimResumeParams struct {
 }
 
 type ClaimResumeRow struct {
-	Sandbox           Sandbox            `json:"sandbox"`
-	SnapPath          *string            `json:"snap_path"`
-	SnapMemPath       *string            `json:"snap_mem_path"`
-	SnapCreatedAt     pgtype.Timestamptz `json:"snap_created_at"`
-	Access            string             `json:"access"`
-	WireAccess        string             `json:"wire_access"`
-	Revision          int64              `json:"revision"`
-	PortNumbers       []int32            `json:"port_numbers"`
-	PortAccesses      []string           `json:"port_accesses"`
-	PortTokenVersions []int64            `json:"port_token_versions"`
-	TemplateBasePath  *string            `json:"template_base_path"`
+	Sandbox                 Sandbox            `json:"sandbox"`
+	SnapPath                *string            `json:"snap_path"`
+	SnapMemPath             *string            `json:"snap_mem_path"`
+	SnapCreatedAt           pgtype.Timestamptz `json:"snap_created_at"`
+	Access                  string             `json:"access"`
+	WireAccess              string             `json:"wire_access"`
+	Revision                int64              `json:"revision"`
+	PortNumbers             []int32            `json:"port_numbers"`
+	PortAccesses            []string           `json:"port_accesses"`
+	PortTokenVersions       []int64            `json:"port_token_versions"`
+	TemplateBasePath        *string            `json:"template_base_path"`
+	CoveredBackupGeneration string             `json:"covered_backup_generation"`
 }
 
 // The paused→resuming claim plus the boot inputs in one round trip:
@@ -733,6 +740,16 @@ type ClaimResumeRow struct {
 // only, a failed resume returns the row to paused with the deadline it had,
 // and activation clears it.
 // 0 rows: not paused, or another resume claimed it.
+//
+// covered_backup_generation names the generation VERIFIED to cover this
+// exact snapshot (not "the sandbox's latest backup" — see
+// paused_unbacked_count's identical join in hosts.sql for why that
+// distinction matters), so a fetch-before-resume-enabled host knows what
+// to restore if its local disk is missing the snapshot. Folded in here
+// rather than a second query so the hot resume path stays a single round
+// trip even though most resumes have no use for the value. ” — the
+// common case, no report has verified coverage of this pause yet — means
+// fetch-before-resume has nothing to offer, not an error.
 func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (ClaimResumeRow, error) {
 	row := q.db.QueryRow(ctx, claimResume, arg.ID, arg.LockKey, arg.TeamID)
 	var i ClaimResumeRow
@@ -784,6 +801,7 @@ func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (Claim
 		&i.PortAccesses,
 		&i.PortTokenVersions,
 		&i.TemplateBasePath,
+		&i.CoveredBackupGeneration,
 	)
 	return i, err
 }
@@ -2112,17 +2130,30 @@ func (q *Queries) GetSandboxWithPreviewPolicy(ctx context.Context, arg GetSandbo
 }
 
 const getSnapshotPathsByIDs = `-- name: GetSnapshotPathsByIDs :many
-SELECT id, path FROM snapshot WHERE id = ANY($1::uuid[])
+SELECT s.id, s.path, s.mem_path,
+       EXISTS (
+         SELECT 1 FROM backup_generation bg
+         WHERE bg.covered_snapshot_id = s.id
+           AND bg.covered_snapshot_generation = s.generation
+       ) AS covered
+FROM snapshot s WHERE s.id = ANY($1::uuid[])
 `
 
 type GetSnapshotPathsByIDsRow struct {
-	ID   uuid.UUID `json:"id"`
-	Path string    `json:"path"`
+	ID      uuid.UUID `json:"id"`
+	Path    string    `json:"path"`
+	MemPath *string   `json:"mem_path"`
+	Covered bool      `json:"covered"`
 }
 
 // Batched snapshot-path lookup for the reconciler's paused-snapshot drift
 // check. Replaces the old per-inventory join with a PK lookup over just the
-// snapshot IDs of paused sandboxes.
+// snapshot IDs of paused sandboxes. mem_path and covered let the drift check
+// tell a fetchable partial miss — vmstate.snap gone, mem.snap still local,
+// and a verified backup generation covers this exact snapshot (identical
+// join to ClaimResume's covered_backup_generation and paused_unbacked_count
+// in hosts.sql; served by idx_backup_generation_covered_snapshot) — from a
+// real loss that fetch-on-resume cannot recover from either.
 func (q *Queries) GetSnapshotPathsByIDs(ctx context.Context, ids []uuid.UUID) ([]GetSnapshotPathsByIDsRow, error) {
 	rows, err := q.db.Query(ctx, getSnapshotPathsByIDs, ids)
 	if err != nil {
@@ -2132,7 +2163,12 @@ func (q *Queries) GetSnapshotPathsByIDs(ctx context.Context, ids []uuid.UUID) ([
 	items := []GetSnapshotPathsByIDsRow{}
 	for rows.Next() {
 		var i GetSnapshotPathsByIDsRow
-		if err := rows.Scan(&i.ID, &i.Path); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.Path,
+			&i.MemPath,
+			&i.Covered,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

@@ -938,7 +938,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return "", false
 	}
 	snapshotPath := *claimed.SnapPath
-	memPath := resolveMemPath(db.Snapshot{Path: snapshotPath, MemPath: claimed.SnapMemPath})
+	memPath := resolveMemPath(snapshotPath, claimed.SnapMemPath)
+
+	// "" (the common case: no report has verified a backup against this
+	// exact pause yet) tells a fetch-before-resume-enabled vmd host there
+	// is nothing to fetch, identical to today's behavior.
+	resumeGeneration := claimed.CoveredBackupGeneration
 
 	// Overlay-mode sandboxes need basePath for the mount-namespace symlink.
 	// Read sandbox.base_path first (pinned at create) so a template rebuild
@@ -976,7 +981,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	var attested vmdclient.ResumeAttestation
 	statelessFallback := false
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), sandbox.HostID, func(ctx context.Context) (string, uint32, uint32, error) {
-		ip, vcpu, memMiB, att, rerr := vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig, resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision)
+		ip, vcpu, memMiB, att, rerr := vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig, resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, resumeGeneration)
 		attested = att
 		return ip, vcpu, memMiB, rerr
 	})
@@ -1257,14 +1262,17 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	return effectivePolicy.Access, true
 }
 
-// resolveMemPath returns the memory snapshot path from a Snapshot record.
-// Uses the stored mem_path column if set, otherwise falls back to the
-// convention of placing mem.snap alongside the vmstate snapshot.
-func resolveMemPath(snap db.Snapshot) string {
-	if snap.MemPath != nil && *snap.MemPath != "" {
-		return *snap.MemPath
+// resolveMemPath returns the memory snapshot path given a snapshot row's
+// path and mem_path column (GetSnapshot and ClaimResume each carry these
+// under different row types, hence the plain-value signature instead of
+// a Snapshot record). Uses the stored mem_path column if set, otherwise
+// falls back to the convention of placing mem.snap alongside the
+// vmstate snapshot.
+func resolveMemPath(path string, memPath *string) string {
+	if memPath != nil && *memPath != "" {
+		return *memPath
 	}
-	return filepath.Join(filepath.Dir(snap.Path), "mem.snap")
+	return filepath.Join(filepath.Dir(path), "mem.snap")
 }
 
 // persistedEgressConfig mirrors the jsonb shape stored in sandbox.network_config.

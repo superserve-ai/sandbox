@@ -68,7 +68,14 @@ type Client interface {
 	// ResumeInstance restores a paused VM. The preview policy rides along so
 	// the daemon stamps it before the guest runs; the attestation reports
 	// what the daemon applied, with empty fields for a daemon from before it.
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64) (ipAddress string, actualVcpu, actualMemMiB uint32, attested ResumeAttestation, err error)
+	// generation is the backup generation VERIFIED to cover the sandbox's
+	// current snapshot, if any (e.g. from db.ClaimResumeRow's
+	// covered_backup_generation) — it lets a vmd host with
+	// fetch-before-resume enabled restore artifacts missing from local
+	// disk instead of hard-failing; "" is always safe to pass and matches
+	// pre-fetch behavior exactly (a vmd host with the feature off ignores
+	// it).
+	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, generation string) (ipAddress string, actualVcpu, actualMemMiB uint32, attested ResumeAttestation, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk). basePath +
