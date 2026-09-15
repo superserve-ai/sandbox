@@ -44,7 +44,6 @@ func (h *RoutingHandler) record(ctx context.Context, outcome, hostID string) {
 func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	port, id, err := ParseRequest(r.Host, r.Header, h.domains)
 	if err != nil {
-		h.record(r.Context(), "ownership_error", "")
 		http.Error(w, "invalid sandbox URL", http.StatusBadRequest)
 		return
 	}

@@ -396,11 +396,14 @@ func (*routePeerArgsStub) Close() error { return nil }
 func (*trackingPeerStub) Close() error  { return nil }
 
 type lookupRecorder struct {
-	lookup telemetry.OwnershipLookup
-	count  int
+	lookup   telemetry.OwnershipLookup
+	count    int
+	outcomes int
 }
 
-func (*lookupRecorder) RecordRoutingOutcome(context.Context, telemetry.RoutingOutcome) {}
+func (r *lookupRecorder) RecordRoutingOutcome(context.Context, telemetry.RoutingOutcome) {
+	r.outcomes++
+}
 func (r *lookupRecorder) RecordOwnershipLookup(_ context.Context, lookup telemetry.OwnershipLookup) {
 	r.lookup = lookup
 	r.count++
@@ -699,5 +702,28 @@ func TestRoutingHandlerRejectsMissingGenerationBeforeOpenStream(t *testing.T) {
 	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://8080-sandbox-1.sandbox.test/", nil))
 	if w.Code != http.StatusBadGateway || peers.called {
 		t.Fatalf("status=%d peers=%+v", w.Code, peers)
+	}
+}
+
+func TestRoutingHandlerMalformedHostDoesNotRecordOwnershipFailure(t *testing.T) {
+	for _, host := range []string{"scanner.example", "70000-sandbox-1.sandbox.test"} {
+		t.Run(host, func(t *testing.T) {
+			recorder := &lookupRecorder{}
+			var lookups int
+			peers := &trackingPeerStub{}
+			router := NewRoutingHandler([]string{"sandbox.test"}, "host-a", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+				lookups++
+				return SandboxRoute{}, errors.New("unexpected lookup")
+			}), peers, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("unexpected local handler") }), zerolog.Nop(), recorder)
+			request := httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil)
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status=%d", response.Code)
+			}
+			if lookups != 0 || peers.called || recorder.count != 0 || recorder.outcomes != 0 {
+				t.Fatalf("lookups=%d peer=%v lookup metrics=%d routing metrics=%d", lookups, peers.called, recorder.count, recorder.outcomes)
+			}
+		})
 	}
 }
