@@ -479,6 +479,11 @@ type CachingBaseReader struct {
 	Inner BlobReader
 	Dir   string
 	group singleflight.Group
+
+	// cloneable caches canCloneInto's answer per destination filesystem
+	// (st_dev): a fleet restores onto one or two filesystems, so the probe
+	// runs once per filesystem rather than once per base per sandbox.
+	cloneable sync.Map // uint64 -> bool
 }
 
 func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.ReadCloser, error) {
@@ -544,11 +549,25 @@ func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.Re
 	return os.Open(cached)
 }
 
-// canCloneInto reports whether a file in c.Dir can be reflinked into dst,
-// probed with a one-byte file: the two must share a filesystem that
-// supports cloning, which a probe of the cache directory alone cannot
-// prove. dst is left with its length unchanged.
+// canCloneInto reports whether a file in c.Dir can be reflinked into dst:
+// the two must share a filesystem that supports cloning, which a probe of
+// the cache directory alone cannot prove. Probed once per destination
+// filesystem with a one-byte file; dst is left with its length unchanged.
 func (c *CachingBaseReader) canCloneInto(dst *os.File) bool {
+	dev, ok := deviceOf(dst)
+	if ok {
+		if v, hit := c.cloneable.Load(dev); hit {
+			return v.(bool)
+		}
+	}
+	res := c.probeClone(dst)
+	if ok {
+		c.cloneable.Store(dev, res)
+	}
+	return res
+}
+
+func (c *CachingBaseReader) probeClone(dst *os.File) bool {
 	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
 		return false
 	}

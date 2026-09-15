@@ -14,3 +14,7 @@ func cloneFile(dst, src *os.File) error {
 func cloneRange(dst, src *os.File, srcOff, length, dstOff int64) error {
 	return errors.ErrUnsupported
 }
+
+func deviceOf(f *os.File) (uint64, bool) {
+	return 0, false
+}

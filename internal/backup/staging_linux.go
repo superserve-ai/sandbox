@@ -22,3 +22,13 @@ func cloneRange(dst, src *os.File, srcOff, length, dstOff int64) error {
 		Src_fd: int64(src.Fd()), Src_offset: uint64(srcOff), Src_length: uint64(length), Dest_offset: uint64(dstOff),
 	})
 }
+
+// deviceOf returns the filesystem device id of f, for caching per-filesystem
+// answers such as reflink support.
+func deviceOf(f *os.File) (uint64, bool) {
+	var st unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+		return 0, false
+	}
+	return uint64(st.Dev), true
+}
