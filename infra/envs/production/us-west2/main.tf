@@ -71,6 +71,8 @@ locals {
   # looks identical to a healthy host.
   #
   # Verify against the host before changing: grep '^HOST_ID=' /etc/sandbox/vmd.env
+  # The standby's id is the installed host identity (slot name plus a
+  # generated suffix), set in tfvars from that same grep.
   #
   # Deliberately NOT the same as active_host_name, and the two must not be
   # merged: the host-local collector stamps its own HOST_ID (the instance name,
@@ -78,7 +80,7 @@ locals {
   # host-level series like filesystem utilization carry the instance name while
   # vmd's own OTLP series carry vmd's HOST_ID. One machine, two host_id values,
   # depending on which process emitted the metric.
-  metrics_host_id = var.active_sandbox_host == "standby" ? "usw2-2" : "usw2"
+  metrics_host_id = var.active_sandbox_host == "standby" ? var.standby_host_id : "usw2"
 
   # Exactly one host carries component=vmd, the label the shared deploy
   # pipeline discovers; the other is parked under a cell-scoped label so
