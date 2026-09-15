@@ -134,11 +134,10 @@ func runMigrate(args []string) int {
 		return 1
 	}
 	defer journal.Close()
-	if n, err := finishWriteBacks(ctx, conn, journal, *toHost, int32(*tmpTimeout)); err != nil {
-		fmt.Fprintf(os.Stderr, "migrate: finishing an earlier run's timeout write-backs: %v\n", err)
+	pending, err := pendingJournal(journal)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "migrate: timeout journal: %v\n", err)
 		return 1
-	} else if n > 0 {
-		fmt.Printf("migrate: restored the original timeout on %d rows an earlier run left paused here\n", n)
 	}
 	// One inventory up front; the flip re-checks each row under its own
 	// WHERE clause, so a sandbox the owner resumed meanwhile is skipped
@@ -175,9 +174,9 @@ func runMigrate(args []string) int {
 	if *limit > 0 && len(queue) > *limit {
 		queue = queue[:*limit]
 	}
-	fmt.Printf("migrate: %d paused on %s (%s); %d restored here and queued, %d not restored, %d skipped from earlier failures\n",
-		len(queue)+notRestored+len(skip), *fromHost, srcStatus, len(queue), notRestored, len(skip))
-	if *dryRun || len(queue) == 0 {
+	fmt.Printf("migrate: %d paused on %s (%s); %d restored here and queued, %d not restored, %d skipped from earlier failures, %d left mid-flight by an earlier run\n",
+		len(queue)+notRestored+len(skip), *fromHost, srcStatus, len(queue), notRestored, len(skip), len(pending))
+	if *dryRun || len(queue)+len(pending) == 0 {
 		return 0
 	}
 
@@ -199,6 +198,57 @@ func runMigrate(args []string) int {
 	failFile, _ := os.OpenFile(filepath.Join(*root, "migrate-failed.txt"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if failFile != nil {
 		defer failFile.Close()
+	}
+	// Rows an earlier run flipped here but never finished: still active
+	// ones join the live set and complete through the same pause and
+	// write-back below; paused ones with the temporary timeout get the
+	// write-back now; anything else is retired from the journal.
+	if len(pending) > 0 {
+		ids := make([]string, 0, len(pending))
+		for id := range pending {
+			ids = append(ids, id)
+		}
+		pr, err := conn.Query(ctx, `SELECT id::text, status::text, host_id, timeout_seconds FROM sandbox WHERE id = ANY($1::uuid[])`, ids)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "migrate: journal recovery: %v\n", err)
+			return 1
+		}
+		seen := map[string]bool{}
+		for pr.Next() {
+			var id, status, host string
+			var timeout *int32
+			if err := pr.Scan(&id, &status, &host, &timeout); err != nil {
+				pr.Close()
+				fmt.Fprintf(os.Stderr, "migrate: journal recovery: %v\n", err)
+				return 1
+			}
+			seen[id] = true
+			switch {
+			case host == *toHost && status == "active":
+				active[id] = live{since: time.Now(), origTimeout: pending[id]}
+			case host == *toHost && status == "paused" && timeout != nil && *timeout == int32(*tmpTimeout):
+				active[id] = live{since: time.Now(), origTimeout: pending[id], restores: 1}
+			default:
+				if err := journalDone(journal, id); err != nil {
+					fmt.Fprintf(os.Stderr, "migrate: journal: %v\n", err)
+					return 1
+				}
+			}
+		}
+		pr.Close()
+		if err := pr.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "migrate: journal recovery: %v\n", err)
+			return 1
+		}
+		for _, id := range ids {
+			if !seen[id] {
+				if err := journalDone(journal, id); err != nil {
+					fmt.Fprintf(os.Stderr, "migrate: journal: %v\n", err)
+					return 1
+				}
+			}
+		}
+		fmt.Printf("migrate: adopted %d rows left mid-flight by an earlier run\n", len(active))
 	}
 	recordFailure := func(id, why string) {
 		failed++
@@ -270,6 +320,9 @@ func runMigrate(args []string) int {
 						if failFile != nil {
 							fmt.Fprintf(failFile, "%s billed %.0fs during migration\n", id, secs)
 						}
+					}
+					if jerr := journalDone(journal, id); jerr != nil {
+						fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
 					}
 					delete(active, id)
 					moved++
@@ -414,16 +467,18 @@ func runMigrate(args []string) int {
 					var tag pgconn.CommandTag
 					flippedAt := time.Now()
 					if err == nil {
-						// Fenced on the snapshot whose digests were checked: a
-						// pause the owner completed during the boot changes it,
-						// and that newer state must not be replaced.
+						// Fenced on the snapshot whose digests were checked and
+						// on the timeout that was journaled: a pause the owner
+						// completed or a timeout they set during the boot must
+						// not be replaced.
 						tag, err = conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'active',
 								timeout_seconds = $2, updated_at = now()
-							WHERE id = $3 AND host_id = $4 AND status = 'paused' AND destroyed_at IS NULL AND snapshot_id = $5`,
-							*toHost, int32(*tmpTimeout), id, *fromHost, *s.snapshotID)
+							WHERE id = $3 AND host_id = $4 AND status = 'paused' AND destroyed_at IS NULL AND snapshot_id = $5
+								AND timeout_seconds IS NOT DISTINCT FROM $6`,
+							*toHost, int32(*tmpTimeout), id, *fromHost, *s.snapshotID, s.origTimeout)
 					}
 					if err == nil && tag.RowsAffected() == 0 {
-						err = fmt.Errorf("no longer paused on %s at the snapshot that was checked", *fromHost)
+						err = fmt.Errorf("changed on %s since it was read", *fromHost)
 					}
 					if err != nil {
 						// Take the boot back down without holding the batch
@@ -437,6 +492,9 @@ func runMigrate(args []string) int {
 						}
 						mu.Lock()
 						recordFailure(id, err.Error())
+						if jerr := journalDone(journal, id); jerr != nil {
+							fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
+						}
 						mu.Unlock()
 						return
 					}
@@ -475,46 +533,46 @@ func journalTimeout(journal *os.File, id string, orig *int32) error {
 	return journal.Sync()
 }
 
-// finishWriteBacks restores the journaled timeout on rows an earlier run
-// flipped here and left paused with the temporary value. Every other row
-// in the journal is either already written back or still on its way.
-func finishWriteBacks(ctx context.Context, conn *pgxpool.Pool, journal *os.File, toHost string, tmp int32) (int64, error) {
+// journalDone retires a journal entry once its write-back happened (or
+// nothing is left to write back), so a rerun does not replay it.
+func journalDone(journal *os.File, id string) error {
+	if _, err := journal.WriteString(id + " done\n"); err != nil {
+		return err
+	}
+	return journal.Sync()
+}
+
+// pendingJournal returns the rows whose journaled timeout has not been
+// retired: a run that ended after flipping them owes them a write-back.
+func pendingJournal(journal *os.File) (map[string]*int32, error) {
 	if _, err := journal.Seek(0, io.SeekStart); err != nil {
-		return 0, err
+		return nil, err
 	}
 	data, err := io.ReadAll(journal)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	var ids []string
-	var origs []*int32
+	pending := map[string]*int32{}
 	for _, line := range strings.Split(string(data), "\n") {
 		f := strings.Fields(line)
 		if len(f) != 2 {
 			continue
 		}
-		var orig *int32
-		if f[1] != "none" {
+		switch f[1] {
+		case "done":
+			delete(pending, f[0])
+		case "none":
+			pending[f[0]] = nil
+		default:
 			n, err := strconv.ParseInt(f[1], 10, 32)
 			if err != nil {
 				continue
 			}
 			v := int32(n)
-			orig = &v
+			pending[f[0]] = &v
 		}
-		ids = append(ids, f[0])
-		origs = append(origs, orig)
 	}
-	if len(ids) == 0 {
-		return 0, nil
-	}
-	tag, err := conn.Exec(ctx, `UPDATE sandbox s SET timeout_seconds = v.orig, updated_at = now()
-		FROM unnest($1::uuid[], $2::int[]) AS v(id, orig)
-		WHERE s.id = v.id AND s.host_id = $3 AND s.status = 'paused' AND s.timeout_seconds = $4`, ids, origs, toHost, tmp)
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
+	return pending, nil
 }
 
 // billedDuring sums the compute billing intervals opened on a sandbox

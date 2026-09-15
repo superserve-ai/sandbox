@@ -100,21 +100,43 @@ func TestRestoredCurrentRequiresRecordedDigests(t *testing.T) {
 	}
 }
 
-func TestJournalTimeoutRoundTrip(t *testing.T) {
-	f, err := os.CreateTemp(t.TempDir(), "journal")
+func TestJournalPendingUntilDone(t *testing.T) {
+	f, err := os.OpenFile(filepath.Join(t.TempDir(), "journal"), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer f.Close()
 	v := int32(300)
-	if err := journalTimeout(f, "a", nil); err != nil {
+	for _, step := range []func() error{
+		func() error { return journalTimeout(f, "a", nil) },
+		func() error { return journalTimeout(f, "b", &v) },
+		func() error { return journalTimeout(f, "c", nil) },
+		func() error { return journalDone(f, "b") },
+	} {
+		if err := step(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending, err := pendingJournal(f)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if len(pending) != 2 || pending["b"] != nil || pending["a"] != nil {
+		t.Fatalf("pending = %v", pending)
+	}
+	if _, ok := pending["c"]; !ok {
+		t.Fatal("c missing")
 	}
 	if err := journalTimeout(f, "b", &v); err != nil {
 		t.Fatal(err)
 	}
+	pending, _ = pendingJournal(f)
+	if got := pending["b"]; got == nil || *got != 300 {
+		t.Fatalf("re-journaled b = %v", got)
+	}
+	// Appends still land at the end after the read.
 	data, _ := os.ReadFile(f.Name())
-	if string(data) != "a none\nb 300\n" {
-		t.Fatalf("journal = %q", data)
+	if !strings.HasSuffix(string(data), "b 300\n") {
+		t.Fatalf("journal tail = %q", data)
 	}
 }
