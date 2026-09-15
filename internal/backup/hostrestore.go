@@ -543,3 +543,88 @@ func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.Re
 	}
 	return os.Open(cached)
 }
+
+// MaterializeBase implements BaseMaterializer. The first request for a
+// digest unpacks the cached object once into an ".unpacked-<sha>" sibling
+// of the spool and verifies it; every request then clones that file into
+// dst. cloneFile fails on filesystems without reflink, and the fallback
+// is a plain copy, so the result is the same bytes everywhere and only
+// the disk cost differs. Concurrent first requests coalesce.
+func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, mf ManifestFile, dst *os.File) error {
+	if !strings.HasPrefix(object, "bases/") {
+		return fmt.Errorf("materialize: %q is not a shared base object", object)
+	}
+	unpacked := filepath.Join(c.Dir, ".unpacked-"+mf.SHA256)
+	_, err, _ := c.group.Do(unpacked, func() (any, error) {
+		if _, err := os.Stat(unpacked); err == nil {
+			return nil, nil
+		}
+		rc, err := c.NewReader(ctx, object)
+		if err != nil {
+			return nil, err
+		}
+		defer rc.Close()
+		tmp, err := os.CreateTemp(c.Dir, ".unpack-*")
+		if err != nil {
+			return nil, err
+		}
+		defer os.Remove(tmp.Name())
+		if err := unpackExtents(ctx, rc, mf, tmp); err != nil {
+			tmp.Close()
+			return nil, err
+		}
+		// Verify the master copy once; every clone of it is byte-identical,
+		// and the per-sandbox verification below still runs on each clone.
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+			tmp.Close()
+			return nil, err
+		}
+		extents, apparent, err := Extents(tmp)
+		if err != nil {
+			tmp.Close()
+			return nil, err
+		}
+		sum, err := hashApparent(ctx, tmp, extents, apparent)
+		if err != nil {
+			tmp.Close()
+			return nil, err
+		}
+		if apparent != mf.Size || sum != mf.SHA256 {
+			tmp.Close()
+			return nil, fmt.Errorf("unpacked base %s does not match its manifest (size %d/%d, sha256 %s)", mf.SHA256, apparent, mf.Size, sum)
+		}
+		if err := tmp.Sync(); err != nil {
+			tmp.Close()
+			return nil, err
+		}
+		if err := tmp.Close(); err != nil {
+			return nil, err
+		}
+		return nil, os.Rename(tmp.Name(), unpacked)
+	})
+	if err != nil {
+		return err
+	}
+	src, err := os.Open(unpacked)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	if err := cloneFile(dst, src); err == nil {
+		return nil
+	}
+	// No reflink on this filesystem: copy the bytes, holes preserved.
+	extents, apparent, err := Extents(src)
+	if err != nil {
+		return err
+	}
+	for _, e := range extents {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(io.NewOffsetWriter(dst, e.Offset), io.NewSectionReader(src, e.Offset, e.Length), e.Length); err != nil {
+			return fmt.Errorf("copy extent at %d: %w", e.Offset, err)
+		}
+	}
+	return dst.Truncate(apparent)
+}

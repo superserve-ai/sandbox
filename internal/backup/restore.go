@@ -447,6 +447,36 @@ const maxManifestBytes = 64 << 20
 // maxApparentSize bounds a single restored artifact; see validExtents.
 const maxApparentSize = int64(16) << 40
 
+// BaseMaterializer is an optional BlobReader capability: produce the
+// unpacked bytes of a shared base object into dst, typically by cloning a
+// copy the reader already holds. The caller verifies dst afterwards, so an
+// implementation only has to be byte-exact, not trusted.
+type BaseMaterializer interface {
+	MaterializeBase(ctx context.Context, object string, mf ManifestFile, dst *os.File) error
+}
+
+// unpackExtents writes a packed object's extents into dst at their apparent
+// offsets and truncates to the apparent size; the streaming core of
+// restoreFile, shared with base materialization.
+func unpackExtents(ctx context.Context, rc io.Reader, mf ManifestFile, dst *os.File) error {
+	for _, e := range mf.Extents {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(io.NewOffsetWriter(dst, e.Offset), rc, e.Length); err != nil {
+			return fmt.Errorf("extent at %d: %w", e.Offset, err)
+		}
+	}
+	switch n, err := io.CopyN(io.Discard, rc, 1); {
+	case n != 0:
+		extra, _ := io.Copy(io.Discard, rc)
+		return fmt.Errorf("packed object is %d bytes, extent table describes %d", PackedSize(mf.Extents)+1+extra, PackedSize(mf.Extents))
+	case err != nil && !errors.Is(err, io.EOF):
+		return fmt.Errorf("read past extents: %w", err)
+	}
+	return dst.Truncate(mf.Size)
+}
+
 // isSharedEntry reports whether a manifest entry points at a bucket-wide
 // shared object rather than one inside the generation prefix: shared
 // entries record the full object path, generation-local entries a single
@@ -499,6 +529,27 @@ func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string
 		if err != nil {
 			return false, err
 		}
+	}
+	// A shared base is the same bytes for every sandbox that layers on it.
+	// When the reader can hand out a materialized copy, clone that into
+	// place instead of unpacking the object again: on a reflink filesystem
+	// the clone shares blocks, so a fleet's worth of restores costs one
+	// base on disk rather than one per sandbox. The clone is still verified
+	// below like any other file.
+	if bm, ok := r.(BaseMaterializer); ok && isSharedEntry(mf) {
+		f, err := root.OpenFile(mf.Name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			return false, err
+		}
+		madeFile = true
+		defer f.Close()
+		if err := bm.MaterializeBase(ctx, object, mf, f); err != nil {
+			return madeFile, err
+		}
+		if err := f.Sync(); err != nil {
+			return madeFile, err
+		}
+		return madeFile, f.Close()
 	}
 	rc, err := r.NewReader(ctx, object)
 	if err != nil {

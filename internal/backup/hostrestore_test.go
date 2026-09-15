@@ -190,3 +190,65 @@ func refreshFixtureDigests(t *testing.T, task Task) Task {
 	task.Generation = GenerationKey(task.Files)
 	return task
 }
+
+// Two sandboxes sharing one base restore through the materializer: the
+// packed object streams once, the unpacked master is produced once, and
+// both destinations verify against the manifest byte for byte. On a
+// reflink filesystem the copies share blocks; elsewhere they are plain
+// copies, and either way the verified bytes are identical.
+func TestHostRestoreMaterializesSharedBaseOnce(t *testing.T) {
+	store := newMemBlobs()
+	root := t.TempDir()
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "base-image.ext4")
+	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writeRestoreFixture(t, dir)
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+	// One generation restored into two destinations: the shape of a fleet
+	// of sandboxes sharing a template, without a second upload that the
+	// uploader's base dedupe would refuse to complete in this harness.
+	items := []HostRestoreItem{
+		{SandboxID: task.SandboxID, Dest: filepath.Join(root, "a")},
+		{SandboxID: task.SandboxID, Dest: filepath.Join(root, "b")},
+	}
+	counter := &countingReader{inner: store}
+	cache := &CachingBaseReader{Inner: counter, Dir: filepath.Join(root, ".base-cache")}
+	r := &HostRestorer{Reader: cache, Lister: store, Concurrency: 2}
+	report := r.Run(context.Background(), items)
+	if report.Restored != 2 {
+		t.Fatalf("run = %+v", report)
+	}
+	for object, n := range counter.reads {
+		if strings.HasPrefix(object, "bases/") && n != 1 {
+			t.Fatalf("shared base %s streamed %d times, want once", object, n)
+		}
+	}
+	entries, err := os.ReadDir(filepath.Join(root, ".base-cache"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unpacked := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".unpacked-") {
+			unpacked++
+		}
+	}
+	if unpacked == 0 {
+		t.Fatal("no unpacked master base in the cache; materializer did not run")
+	}
+	for _, d := range []string{"a", "b"} {
+		got, err := os.ReadFile(filepath.Join(root, d, SharedBaseName(digestOf(baseData))))
+		if err != nil {
+			t.Fatalf("restored base in %s: %v", d, err)
+		}
+		if !bytes.Equal(got, baseData) {
+			t.Fatalf("restored base in %s differs from original", d)
+		}
+	}
+}
