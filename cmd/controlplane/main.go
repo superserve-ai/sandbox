@@ -298,15 +298,21 @@ func run() error {
 	reaperCfg := api.DefaultReaperConfig()
 	// Both bound how much the reaper pauses per tick; the defaults suit
 	// steady-state expirations, and an operator raises them for a planned
-	// wave (a whole host's worth of sandboxes brought back to paused).
+	// wave (a whole host's worth of sandboxes brought back to paused). The
+	// ceilings keep one tick from turning into a fleet-sized query; a value
+	// outside them is ignored, not clamped, so a typo changes nothing.
 	if v := os.Getenv("REAPER_BATCH_SIZE"); v != "" {
-		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
+		if n, perr := strconv.ParseInt(v, 10, 32); perr == nil && n > 0 && n <= 2000 {
 			reaperCfg.BatchSize = int32(n)
+		} else {
+			log.Warn().Str("value", v).Msg("REAPER_BATCH_SIZE ignored; want 1..2000")
 		}
 	}
 	if v := os.Getenv("REAPER_PARALLELISM"); v != "" {
-		if n, perr := strconv.Atoi(v); perr == nil && n > 0 {
-			reaperCfg.Parallelism = n
+		if n, perr := strconv.ParseInt(v, 10, 32); perr == nil && n > 0 && n <= 200 {
+			reaperCfg.Parallelism = int(n)
+		} else {
+			log.Warn().Str("value", v).Msg("REAPER_PARALLELISM ignored; want 1..200")
 		}
 	}
 	handlers.StartTimeoutReaper(ctx, reaperCfg)
