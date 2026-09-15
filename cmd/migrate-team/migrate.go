@@ -274,12 +274,13 @@ func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string,
 // a failed sandbox may still hold a VM, rundir, and snapshot dir that the
 // destroy path tears down; migrating the row and then deleting it from the
 // source with raw SQL would strand those host resources. Destroy failed
-// sandboxes before the window.
+// sandboxes before the window. 'migrating' is an operator's claim on a
+// paused sandbox mid-move between hosts; its artifacts are in flight too.
 func activeSandboxes(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
 		SELECT id, name, status FROM sandbox
 		WHERE team_id = $1 AND destroyed_at IS NULL
-		  AND status IN ('active', 'starting', 'resuming', 'pausing', 'failed')
+		  AND status IN ('active', 'starting', 'resuming', 'pausing', 'migrating', 'failed')
 		ORDER BY created_at`, teamID)
 	if err != nil {
 		return nil, fmt.Errorf("list active sandboxes: %w", err)

@@ -19,7 +19,7 @@ FROM host h
 LEFT JOIN sandbox s
   ON s.host_id = h.id
  AND s.destroyed_at IS NULL
- AND s.status IN ('starting', 'active', 'resuming', 'pausing')
+ AND s.status IN ('starting', 'active', 'resuming', 'pausing', 'migrating')
 WHERE h.status = 'active'
 GROUP BY h.id, h.region
 ORDER BY h.id

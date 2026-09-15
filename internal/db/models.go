@@ -17,13 +17,14 @@ import (
 type SandboxStatus string
 
 const (
-	SandboxStatusStarting SandboxStatus = "starting"
-	SandboxStatusActive   SandboxStatus = "active"
-	SandboxStatusPausing  SandboxStatus = "pausing"
-	SandboxStatusPaused   SandboxStatus = "paused"
-	SandboxStatusDeleted  SandboxStatus = "deleted"
-	SandboxStatusFailed   SandboxStatus = "failed"
-	SandboxStatusResuming SandboxStatus = "resuming"
+	SandboxStatusStarting  SandboxStatus = "starting"
+	SandboxStatusActive    SandboxStatus = "active"
+	SandboxStatusPausing   SandboxStatus = "pausing"
+	SandboxStatusPaused    SandboxStatus = "paused"
+	SandboxStatusDeleted   SandboxStatus = "deleted"
+	SandboxStatusFailed    SandboxStatus = "failed"
+	SandboxStatusResuming  SandboxStatus = "resuming"
+	SandboxStatusMigrating SandboxStatus = "migrating"
 )
 
 func (e *SandboxStatus) Scan(src interface{}) error {

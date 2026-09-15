@@ -734,7 +734,7 @@ paths:
           schema:
             type: string
             enum:
-              [starting, active, pausing, paused, resuming, failed, deleted]
+              [starting, active, pausing, paused, resuming, migrating, failed, deleted]
         - name: sort
           in: query
           required: false
@@ -3189,14 +3189,15 @@ components:
           type: string
         status:
           type: string
-          enum: [active, pausing, paused, resuming, failed]
+          enum: [active, pausing, paused, resuming, migrating, failed]
           description: >
             Current state of the sandbox. `active` means running; `paused`
-            means paused and awaiting resume. `pausing` and `resuming` are
-            transient states observed while the platform pauses or restores
-            a sandbox (e.g. after a `202` from `/pause`, or auto-resume on
-            `/exec`); clients should poll or retry shortly. `failed` means
-            the sandbox can no longer be resumed.
+            means paused and awaiting resume. `pausing`, `resuming` and
+            `migrating` are transient states observed while the platform
+            pauses, restores, or relocates a sandbox (e.g. after a `202`
+            from `/pause`, or auto-resume on `/exec`); clients should poll
+            or retry shortly. `failed` means the sandbox can no longer be
+            resumed.
         vcpu_count:
           type: integer
         memory_mib:
@@ -4217,7 +4218,7 @@ components:
           description: Env-var name the secret resolves to inside the sandbox.
         status:
           type: string
-          enum: [active, pausing, paused, resuming, failed]
+          enum: [active, pausing, paused, resuming, migrating, failed]
 
     ProviderShortcut:
       type: object

@@ -762,7 +762,9 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		case db.SandboxStatusStarting, db.SandboxStatusResuming:
 			// Likely the fire-and-forget activate write in flight (or a
 			// concurrent create/resume finishing); wait for the flip
-			// rather than 409 the owner's own follow-up.
+			// rather than 409 the owner's own follow-up. 'migrating' (an
+			// operator's boot elsewhere, minutes at worst) is not settled
+			// here: it takes the conflict below and the client retries.
 			if time.Now().Before(deadline) {
 				time.Sleep(activateSettlePoll)
 				continue
@@ -1970,6 +1972,7 @@ var sandboxStatusFilterValues = []string{
 	string(db.SandboxStatusPausing),
 	string(db.SandboxStatusPaused),
 	string(db.SandboxStatusResuming),
+	string(db.SandboxStatusMigrating),
 	string(db.SandboxStatusFailed),
 	string(db.SandboxStatusDeleted),
 }
@@ -3520,6 +3523,12 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	}
 
 	if body.TimeoutSeconds.Set {
+		if sandbox.Status == db.SandboxStatusMigrating {
+			// The update below is gated the same way; answering here names
+			// the reason instead of a not-found.
+			respondError(c, ErrInvalidState)
+			return
+		}
 		if !h.applyRowsAffectedPatch(c, sandbox, teamID, "timeout_updated", func() (int64, error) {
 			return h.DB.UpdateSandboxTimeout(c.Request.Context(), db.UpdateSandboxTimeoutParams{
 				ID:             sandboxID,
