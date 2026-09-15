@@ -186,6 +186,9 @@ func RateLimit(ctx context.Context, cfg RateLimitConfig) gin.HandlerFunc {
 	limiter.startCleanup(ctx, cfg)
 
 	return func(c *gin.Context) {
+		// Preserve the limiter's existing Gin identity behavior. Verified
+		// client-IP attribution is an abuse-enforcement concern; changing this
+		// pre-auth bucket is outside this middleware's scope.
 		key := c.ClientIP()
 		if enforceLimit(c, limiter.get(key), cfg) {
 			c.Next()
