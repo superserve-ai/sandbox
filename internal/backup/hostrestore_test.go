@@ -239,12 +239,19 @@ func TestHostRestoreMaterializesSharedBaseOnce(t *testing.T) {
 			unpacked++
 		}
 	}
-	// The master copy exists only where it can be shared; elsewhere the
-	// materializer unpacks straight into each sandbox.
-	if cache.supportsClone() && unpacked == 0 {
+	// The master copy exists only where the destinations can share it;
+	// elsewhere the materializer unpacks straight into each sandbox. Both
+	// modes must yield the same bytes, checked below.
+	probe, err := os.CreateTemp(root, "probe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared := cache.canCloneInto(probe)
+	probe.Close()
+	if shared && unpacked == 0 {
 		t.Fatal("reflink filesystem but no unpacked master base in the cache")
 	}
-	if !cache.supportsClone() && unpacked != 0 {
+	if !shared && unpacked != 0 {
 		t.Fatal("no reflink support but an unpacked master base was written")
 	}
 	for _, d := range []string{"a", "b"} {
@@ -304,5 +311,50 @@ func TestMaterializeBaseFallsBackWhenCloneFails(t *testing.T) {
 	}
 	if !bytes.Equal(got, baseData) {
 		t.Fatal("restored base differs from original")
+	}
+}
+
+// A shared entry whose digest is right but whose packing geometry is
+// wrong must fail without publishing a master under that digest, so a
+// later legitimate generation on the same base is not poisoned.
+func TestMaterializeBaseRejectsUnverifiedMaster(t *testing.T) {
+	store := newMemBlobs()
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "base-image.ext4")
+	baseData := bytes.Repeat([]byte{0x33}, 64<<10)
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writeRestoreFixture(t, dir)
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+	cache := &CachingBaseReader{Inner: store, Dir: filepath.Join(t.TempDir(), "cache")}
+	dst, err := os.CreateTemp(t.TempDir(), "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	if !cache.canCloneInto(dst) {
+		t.Skip("destination cannot reflink from the cache on this filesystem")
+	}
+	object := SharedBaseObject(digestOf(baseData), "")
+	infos, err := store.List(context.Background(), object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mf ManifestFile
+	for _, o := range infos {
+		mf = ManifestFile{Name: SharedBaseName(digestOf(baseData)), Object: o.Name, SHA256: digestOf(baseData), Size: int64(len(baseData)) + 4096, Extents: []Extent{{Offset: 0, Length: int64(len(baseData))}}}
+	}
+	if mf.Object == "" {
+		t.Fatal("shared base object not found in store")
+	}
+	if err := cache.MaterializeBase(context.Background(), mf.Object, mf, dst); err == nil {
+		t.Fatal("altered geometry accepted")
+	}
+	if _, err := os.Stat(filepath.Join(cache.Dir, ".unpacked-"+digestOf(baseData))); err == nil {
+		t.Fatal("unverified master was published")
 	}
 }

@@ -479,39 +479,6 @@ type CachingBaseReader struct {
 	Inner BlobReader
 	Dir   string
 	group singleflight.Group
-
-	// cloneProbe caches whether Dir's filesystem can reflink. Without
-	// reflink a master copy buys nothing, so MaterializeBase falls back to
-	// the direct per-sandbox unpack instead of paying for a copy nobody
-	// shares.
-	cloneProbe sync.Once
-	canClone   bool
-}
-
-// supportsClone reports once whether files under c.Dir can be reflinked.
-func (c *CachingBaseReader) supportsClone() bool {
-	c.cloneProbe.Do(func() {
-		if err := os.MkdirAll(c.Dir, 0o700); err != nil {
-			return
-		}
-		src, err := os.CreateTemp(c.Dir, ".probe-src-*")
-		if err != nil {
-			return
-		}
-		defer os.Remove(src.Name())
-		defer src.Close()
-		dst, err := os.CreateTemp(c.Dir, ".probe-dst-*")
-		if err != nil {
-			return
-		}
-		defer os.Remove(dst.Name())
-		defer dst.Close()
-		if _, err := src.Write([]byte{0}); err != nil {
-			return
-		}
-		c.canClone = cloneFile(dst, src) == nil
-	})
-	return c.canClone
 }
 
 func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.ReadCloser, error) {
@@ -577,6 +544,31 @@ func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.Re
 	return os.Open(cached)
 }
 
+// canCloneInto reports whether a file in c.Dir can be reflinked into dst,
+// probed with a one-byte file: the two must share a filesystem that
+// supports cloning, which a probe of the cache directory alone cannot
+// prove. dst is left with its length unchanged.
+func (c *CachingBaseReader) canCloneInto(dst *os.File) bool {
+	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
+		return false
+	}
+	src, err := os.CreateTemp(c.Dir, ".probe-*")
+	if err != nil {
+		return false
+	}
+	defer os.Remove(src.Name())
+	defer src.Close()
+	if _, err := src.Write([]byte{0}); err != nil {
+		return false
+	}
+	// Clone one byte at offset 0 of dst, then restore dst to empty; dst is
+	// freshly created by the caller, so nothing is lost.
+	if err := cloneRange(dst, src, 0, 1, 0); err != nil {
+		return false
+	}
+	return dst.Truncate(0) == nil
+}
+
 // isHexDigest reports whether s is a lowercase hex sha256 (64 chars).
 func isHexDigest(s string) bool {
 	if len(s) != 64 {
@@ -607,9 +599,10 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 	if !isHexDigest(mf.SHA256) {
 		return fmt.Errorf("materialize: manifest digest %q is not a sha256", mf.SHA256)
 	}
-	if !c.supportsClone() {
-		// No block sharing to gain: unpack straight into the sandbox, the
-		// same single pass the streaming path always did.
+	if !c.canCloneInto(dst) {
+		// Nothing to share with this destination: unpack straight into it,
+		// the same single pass the streaming path always did, and build no
+		// master nobody could clone.
 		rc, err := c.NewReader(ctx, object)
 		if err != nil {
 			return err
@@ -636,10 +629,29 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 			tmp.Close()
 			return nil, err
 		}
-		// The master is not hashed here: every clone of it is verified by
-		// the caller against the manifest digest, so a bad master fails the
-		// first sandbox that uses it instead of stalling every waiter behind
-		// a second full read of a multi-gigabyte file.
+		// The master is named by digest and reused across runs, so it is
+		// verified before it is published: a manifest whose shared entry
+		// carries the right digest but altered packing geometry would
+		// otherwise poison the cache for every later generation on that
+		// base. One read per base, not per sandbox.
+		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+			tmp.Close()
+			return nil, err
+		}
+		extents, apparent, err := Extents(tmp)
+		if err != nil {
+			tmp.Close()
+			return nil, err
+		}
+		sum, err := hashApparent(ctx, tmp, extents, apparent)
+		if err != nil {
+			tmp.Close()
+			return nil, err
+		}
+		if apparent != mf.Size || sum != mf.SHA256 {
+			tmp.Close()
+			return nil, fmt.Errorf("unpacked base does not match its manifest digest %s", mf.SHA256)
+		}
 		if err := tmp.Sync(); err != nil {
 			tmp.Close()
 			return nil, err
@@ -657,16 +669,5 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 		return err
 	}
 	defer src.Close()
-	if err := cloneFile(dst, src); err == nil {
-		return nil
-	}
-	// The cache can reflink but this destination cannot share with it
-	// (another filesystem, or one without reflink): unpack the object
-	// straight into dst, the same single pass as the no-reflink case.
-	rc, err := c.NewReader(ctx, object)
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
-	return unpackExtents(ctx, rc, mf, dst)
+	return cloneFile(dst, src)
 }
