@@ -1907,6 +1907,19 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		m.reclaimStrandedOverlays(inst, log)
 	}
 
+	// A stale fetch-pending marker at this path is now provably obsolete:
+	// this pause just durably wrote a fresh, definitely-consistent
+	// vmstate.snap/mem.snap pair here, superseding whatever interrupted
+	// fetch attempt left the marker behind. Without this, resumeVMLocked's
+	// unconditional markerPending check would keep refusing to resume a
+	// perfectly good, freshly-paused VM. Best-effort, same as the marker's
+	// clear-on-successful-fetch counterpart (see fetchGenerationForResume).
+	if rerr := os.Remove(resumeFetchMarkerPath(snapshotPath)); rerr != nil && !os.IsNotExist(rerr) {
+		log.Warn().Err(rerr).Msg("pause: clear stale fetch marker failed")
+	} else if rerr := syncDir(snapshotDir); rerr != nil {
+		log.Warn().Err(rerr).Msg("pause: sync marker dir after clear failed")
+	}
+
 	// Hash the durable artifacts once the unit is stopped and the files are
 	// at rest. Runs under its own budget derived from the RPC deadline (see
 	// collectPauseManifest): large disks must not pin this handler past the
