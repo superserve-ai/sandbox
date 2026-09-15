@@ -343,7 +343,7 @@ func copyAcrossDevices(src, destDir, dest string) error {
 			os.Remove(tmpPath)
 		}
 	}()
-	if _, err := io.Copy(tmp, in); err != nil {
+	if err := copySparse(tmp, in); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -359,4 +359,60 @@ func copyAcrossDevices(src, destDir, dest string) error {
 	}
 	renamed = true
 	return nil
+}
+
+// seekData and seekHole are lseek(2)'s SEEK_DATA/SEEK_HOLE whence values —
+// not exposed by the syscall package's portable Seek wrapper, but valid to
+// pass through it on Linux, which is the only OS this daemon runs on.
+const (
+	seekData = 3
+	seekHole = 4
+)
+
+// copySparse copies in to dst preserving in's holes, so a disk image with a
+// large unallocated region copies in the time and space its allocated
+// extents actually take rather than its full apparent size — the same
+// property the EXDEV fallback's same-filesystem sibling (a plain rename)
+// gets for free. Without this, io.Copy would write real zero bytes for
+// every hole, and a sparse rootfs many times its allocated size could
+// exhaust the destination or blow the resume deadline on an artifact whose
+// fetch from the backup bucket just completed quickly.
+//
+// ENXIO from the first SEEK_DATA (no data at all, i.e. an entirely-hole
+// file) is not an error — falls through to the size-only Truncate below,
+// same as a normal EOF from the loop.
+func copySparse(dst, in *os.File) error {
+	size, err := in.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
+	srcFd := int(in.Fd())
+	offset := int64(0)
+	for offset < size {
+		dataStart, serr := syscall.Seek(srcFd, offset, seekData)
+		if serr != nil {
+			if errors.Is(serr, syscall.ENXIO) {
+				break
+			}
+			return serr
+		}
+		holeStart, serr := syscall.Seek(srcFd, dataStart, seekHole)
+		if serr != nil {
+			return serr
+		}
+		if holeStart > size {
+			holeStart = size
+		}
+		if _, err := in.Seek(dataStart, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := dst.Seek(dataStart, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(dst, in, holeStart-dataStart); err != nil {
+			return err
+		}
+		offset = holeStart
+	}
+	return dst.Truncate(size)
 }
