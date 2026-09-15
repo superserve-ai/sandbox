@@ -110,9 +110,9 @@ func TestJournalPendingUntilDone(t *testing.T) {
 	v := int32(300)
 	at := time.Unix(1700000000, 0)
 	for _, step := range []func() error{
-		func() error { return journalTimeout(f, "a", nil, at, "src", "h", 60) },
-		func() error { return journalTimeout(f, "b", &v, at, "src", "h", 60) },
-		func() error { return journalTimeout(f, "c", nil, at.Add(time.Hour), "src", "h", 60) },
+		func() error { return journalTimeout(f, "a", nil, at, "src", "h", 60, "snap-a") },
+		func() error { return journalTimeout(f, "b", &v, at, "src", "h", 60, "snap-b") },
+		func() error { return journalTimeout(f, "c", nil, at.Add(time.Hour), "src", "h", 60, "snap-c") },
 		func() error { return journalDone(f, "b") },
 	} {
 		if err := step(); err != nil {
@@ -123,13 +123,13 @@ func TestJournalPendingUntilDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 2 || pending["a"].orig != nil || !pending["a"].since.Equal(at) || pending["a"].fromHost != "src" || pending["a"].toHost != "h" || pending["a"].tmp != 60 {
+	if len(pending) != 2 || pending["a"].orig != nil || !pending["a"].since.Equal(at) || pending["a"].fromHost != "src" || pending["a"].toHost != "h" || pending["a"].tmp != 60 || pending["a"].snapshotID != "snap-a" {
 		t.Fatalf("pending = %+v", pending)
 	}
 	if c, ok := pending["c"]; !ok || !c.since.Equal(at.Add(time.Hour)) {
 		t.Fatalf("c = %+v", c)
 	}
-	if err := journalTimeout(f, "b", &v, at, "src", "h", 60); err != nil {
+	if err := journalTimeout(f, "b", &v, at, "src", "h", 60, "snap-b"); err != nil {
 		t.Fatal(err)
 	}
 	pending, _ = pendingJournal(f)
@@ -138,7 +138,26 @@ func TestJournalPendingUntilDone(t *testing.T) {
 	}
 	// Appends still land at the end after the read.
 	data, _ := os.ReadFile(f.Name())
-	if !strings.HasSuffix(string(data), "b 300 1700000000 src h 60\n") {
+	if !strings.HasSuffix(string(data), "b 300 1700000000 src h 60 snap-b\n") {
 		t.Fatalf("journal tail = %q", data)
+	}
+}
+
+func TestPreviewPolicyRequestMirrorsResumeWire(t *testing.T) {
+	var p previewPolicy
+	p.access, p.revision = "public", 7
+	if err := json.Unmarshal([]byte(`[{"port":8080,"access":"private","token_version":3},{"port":9090,"access":"public","token_version":2},{"port":7070,"access":"private_token_v1","token_version":5}]`), &p.ports); err != nil {
+		t.Fatal(err)
+	}
+	req := p.request("vm")
+	if req.VmId != "vm" || req.PreviewAccess != "public" || req.PolicyRevision != 7 || len(req.PreviewPorts) != 3 {
+		t.Fatalf("request = %+v", req)
+	}
+	want := map[int32][2]any{8080: {"private_browser_v1", int64(3)}, 9090: {"public", int64(0)}, 7070: {"private_token_v1", int64(5)}}
+	for _, port := range req.PreviewPorts {
+		w := want[port.Port]
+		if port.Access != w[0] || port.TokenVersion != w[1] {
+			t.Fatalf("port %d = %s/%d, want %v", port.Port, port.Access, port.TokenVersion, w)
+		}
 	}
 }

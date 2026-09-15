@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/superserve-ai/sandbox/internal/backup"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -218,16 +219,16 @@ func runMigrate(args []string) int {
 				return 2
 			}
 		}
-		pr, err := conn.Query(ctx, `SELECT id::text, status::text, host_id, timeout_seconds, COALESCE(snapshot_id::text, '') FROM sandbox WHERE id = ANY($1::uuid[])`, ids)
+		pr, err := conn.Query(ctx, `SELECT id::text, status::text, host_id, timeout_seconds FROM sandbox WHERE id = ANY($1::uuid[])`, ids)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "migrate: journal recovery: %v\n", err)
 			return 1
 		}
 		seen := map[string]bool{}
 		for pr.Next() {
-			var id, status, host, snap string
+			var id, status, host string
 			var timeout *int32
-			if err := pr.Scan(&id, &status, &host, &timeout, &snap); err != nil {
+			if err := pr.Scan(&id, &status, &host, &timeout); err != nil {
 				pr.Close()
 				fmt.Fprintf(os.Stderr, "migrate: journal recovery: %v\n", err)
 				return 1
@@ -235,11 +236,12 @@ func runMigrate(args []string) int {
 			seen[id] = true
 			switch {
 			case host == *toHost && (status == "active" || status == "pausing"):
-				// Still on its way to paused; the audit window keeps the
-				// journaled claim time so nothing billed meanwhile is missed.
-				// The snapshot seen now may already be the migration pause,
-				// so the status alone decides for adopted rows.
-				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, snapshotID: snap}
+				// Still on its way to paused, or paused and resumed by the
+				// owner already: the poll tells the two apart by comparing
+				// against the journaled pre-migration snapshot. The audit
+				// window keeps the journaled claim time so nothing billed
+				// meanwhile is missed.
+				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, snapshotID: pending[id].snapshotID}
 			case host == *toHost && status == "migrating":
 				// Claimed but never activated: hand it back to the source. A
 				// VM the earlier run did boot has no active row here and is
@@ -254,7 +256,7 @@ func runMigrate(args []string) int {
 					return 1
 				}
 			case host == *toHost && timeout != nil && *timeout == int32(*tmpTimeout):
-				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, snapshotID: snap, restores: 1}
+				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, snapshotID: pending[id].snapshotID, restores: 1}
 			default:
 				if err := journalDone(journal, id); err != nil {
 					fmt.Fprintf(os.Stderr, "migrate: journal: %v\n", err)
@@ -421,21 +423,29 @@ func runMigrate(args []string) int {
 				rules       egressRules
 				recorded    map[string]string
 				snapshotID  *string
+				preview     previewPolicy
 			}
 			shapes := map[string]shape{}
 			sq, err := conn.Query(ctx, `SELECT s.id::text, s.vcpu_count, s.memory_mib, s.team_id::text, s.timeout_seconds, s.network_config,
 					COALESCE((SELECT json_object_agg(am.file_name, am.sha256) FROM artifact_manifest am WHERE am.snapshot_id = s.snapshot_id), '{}')::text,
-					s.snapshot_id::text
-				FROM sandbox s WHERE s.id = ANY($1::uuid[]) AND s.host_id = $2 AND s.status = 'paused' AND s.destroyed_at IS NULL`, batch, *fromHost)
+					s.snapshot_id::text,
+					COALESCE(p.access, 'legacy_public')::text, COALESCE(p.revision, 0)::bigint,
+					COALESCE((SELECT json_agg(json_build_object('port', pp.port, 'access', pp.access, 'token_version', g.token_version))
+						FROM sandbox_published_port pp
+						JOIN sandbox_preview_port_token_generation g ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
+						WHERE pp.sandbox_id = s.id AND g.token_version > 0), '[]')::text
+				FROM sandbox s LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+				WHERE s.id = ANY($1::uuid[]) AND s.host_id = $2 AND s.status = 'paused' AND s.destroyed_at IS NULL`, batch, *fromHost)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
 				return 1
 			}
 			for sq.Next() {
-				var id, recorded string
+				var id, recorded, ports string
 				var s shape
 				var raw []byte
-				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &s.snapshotID); err != nil {
+				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &s.snapshotID,
+					&s.preview.access, &s.preview.revision, &ports); err != nil {
 					sq.Close()
 					fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
 					return 1
@@ -446,6 +456,10 @@ func runMigrate(args []string) int {
 				}
 				if err := json.Unmarshal([]byte(recorded), &s.recorded); err != nil {
 					recordFailure(id, "recorded digests: "+err.Error())
+					continue
+				}
+				if err := json.Unmarshal([]byte(ports), &s.preview.ports); err != nil {
+					recordFailure(id, "published ports: "+err.Error())
 					continue
 				}
 				shapes[id] = s
@@ -510,7 +524,7 @@ func runMigrate(args []string) int {
 					// back.
 					claimedAt := time.Now()
 					mu.Lock()
-					err := journalTimeout(journal, id, s.origTimeout, claimedAt, *fromHost, *toHost, int32(*tmpTimeout))
+					err := journalTimeout(journal, id, s.origTimeout, claimedAt, *fromHost, *toHost, int32(*tmpTimeout), *s.snapshotID)
 					mu.Unlock()
 					if err != nil {
 						mu.Lock()
@@ -548,11 +562,29 @@ func runMigrate(args []string) int {
 					})
 					cancel()
 					if err == nil {
+						// vmd does not persist the preview policy either; a
+						// recordless boot starts private with no published
+						// ports. The stored policy is pushed before the row
+						// is exposed, exactly as a resume does.
+						pctx, pcancel := context.WithTimeout(ctx, time.Minute)
+						_, err = vmd.UpdateSandboxPreviewPolicy(pctx, s.preview.request(id))
+						pcancel()
+						if err != nil {
+							err = fmt.Errorf("apply preview policy: %w", err)
+						}
+					}
+					if err == nil {
 						var ip netip.Addr
 						if ip, err = netip.ParseAddr(resp.GetHostIp()); err == nil {
 							// Fenced on the journaled timeout as well: a PATCH
 							// the owner made during the boot is theirs to keep.
-							tag, err = conn.Exec(ctx, `UPDATE sandbox SET status = 'active', timeout_seconds = $1, ip_address = $2, updated_at = now()
+							// The secret-injection markers are cleared with it:
+							// the cold boot holds no secrets, and a same address
+							// on this host would otherwise let the next resume
+							// believe the guest still does.
+							tag, err = conn.Exec(ctx, `UPDATE sandbox SET status = 'active', timeout_seconds = $1, ip_address = $2,
+									secret_env_fingerprint = NULL, secret_env_ip = NULL, secret_env_injected_at = NULL, secret_env_expires_at = NULL,
+									updated_at = now()
 								WHERE id = $3 AND host_id = $4 AND status = 'migrating' AND destroyed_at IS NULL
 									AND timeout_seconds IS NOT DISTINCT FROM $5`,
 								int32(*tmpTimeout), ip, id, *toHost, s.origTimeout)
@@ -560,13 +592,14 @@ func runMigrate(args []string) int {
 								err = errRetry{fmt.Errorf("claim on %s changed before activation", *toHost)}
 							}
 						}
-						if err != nil {
-							dctx, dcancel := context.WithTimeout(ctx, time.Minute)
-							if _, derr := vmd.DestroyVM(dctx, &vmdpb.DestroyVMRequest{VmId: id, Force: true}); derr != nil {
-								err = fmt.Errorf("%v; and the booted VM could not be destroyed: %v", err, derr)
-							}
-							dcancel()
+					}
+					if err != nil && resp != nil {
+						// Booted but not activated: take the VM back down.
+						dctx, dcancel := context.WithTimeout(ctx, time.Minute)
+						if _, derr := vmd.DestroyVM(dctx, &vmdpb.DestroyVMRequest{VmId: id, Force: true}); derr != nil {
+							err = fmt.Errorf("%v; and the booted VM could not be destroyed: %v", err, derr)
 						}
+						dcancel()
 					}
 					if err != nil {
 						if _, rerr := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused', updated_at = now()
@@ -610,16 +643,18 @@ func runMigrate(args []string) int {
 // errRetry marks a failure a later run may not see again.
 type errRetry struct{ error }
 
-// journalTimeout records a row's timeout, the claim time, and the run's
-// hosts and temporary timeout before the migration replaces it:
-// `<id> <seconds>|none <unix> <from-host> <to-host> <tmp>`, fsynced, so a
-// rerun can finish the row and refuses to do so under different parameters.
-func journalTimeout(journal *os.File, id string, orig *int32, at time.Time, fromHost, toHost string, tmp int32) error {
+// journalTimeout records a row's timeout, the claim time, the run's hosts
+// and temporary timeout, and the snapshot the row had, before the
+// migration replaces any of it: `<id> <seconds>|none <unix> <from-host>
+// <to-host> <tmp> <snapshot>`, fsynced, so a rerun can finish the row (and
+// tell whether its pause already happened) and refuses to do so under
+// different parameters.
+func journalTimeout(journal *os.File, id string, orig *int32, at time.Time, fromHost, toHost string, tmp int32, snapshotID string) error {
 	value := "none"
 	if orig != nil {
 		value = strconv.FormatInt(int64(*orig), 10)
 	}
-	line := fmt.Sprintf("%s %s %d %s %s %d\n", id, value, at.Unix(), fromHost, toHost, tmp)
+	line := fmt.Sprintf("%s %s %d %s %s %d %s\n", id, value, at.Unix(), fromHost, toHost, tmp, snapshotID)
 	if _, err := journal.WriteString(line); err != nil {
 		return err
 	}
@@ -642,6 +677,7 @@ type journaled struct {
 	since            time.Time
 	fromHost, toHost string
 	tmp              int32
+	snapshotID       string
 }
 
 // pendingJournal returns the rows whose journaled timeout has not been
@@ -661,7 +697,7 @@ func pendingJournal(journal *os.File) (map[string]journaled, error) {
 			delete(pending, f[0])
 			continue
 		}
-		if len(f) != 6 {
+		if len(f) != 7 {
 			continue
 		}
 		at, err := strconv.ParseInt(f[2], 10, 64)
@@ -672,7 +708,7 @@ func pendingJournal(journal *os.File) (map[string]journaled, error) {
 		if err != nil {
 			continue
 		}
-		entry := journaled{since: time.Unix(at, 0), fromHost: f[3], toHost: f[4], tmp: int32(tmp)}
+		entry := journaled{since: time.Unix(at, 0), fromHost: f[3], toHost: f[4], tmp: int32(tmp), snapshotID: f[6]}
 		if f[1] != "none" {
 			n, err := strconv.ParseInt(f[1], 10, 32)
 			if err != nil {
@@ -694,6 +730,35 @@ func billedDuring(ctx context.Context, conn *pgxpool.Pool, id string, since time
 	err := conn.QueryRow(ctx, `SELECT COALESCE(SUM(EXTRACT(EPOCH FROM COALESCE(ended_at, now()) - started_at)), 0)
 		FROM sandbox_compute_billing_interval WHERE sandbox_id = $1 AND started_at >= $2`, id, since).Scan(&secs)
 	return secs, err
+}
+
+// previewPolicy is the row's stored preview access and published ports in
+// the shape vmd applies: private ports go on the wire as the browser mode,
+// and only tokenized modes carry a generation.
+type previewPolicy struct {
+	access   string
+	revision int64
+	ports    []struct {
+		Port         int32  `json:"port"`
+		Access       string `json:"access"`
+		TokenVersion int64  `json:"token_version"`
+	}
+}
+
+func (p previewPolicy) request(id string) *vmdpb.UpdateSandboxPreviewPolicyRequest {
+	req := &vmdpb.UpdateSandboxPreviewPolicyRequest{VmId: id, PreviewAccess: p.access, PolicyRevision: p.revision}
+	for _, port := range p.ports {
+		access := port.Access
+		if access == preview.AccessPrivate {
+			access = preview.AccessPrivateBrowserV1
+		}
+		version := port.TokenVersion
+		if !preview.IsTokenizedAccess(access) {
+			version = 0
+		}
+		req.PreviewPorts = append(req.PreviewPorts, &vmdpb.PreviewPort{Port: port.Port, Access: access, TokenVersion: version})
+	}
+	return req
 }
 
 // egressRules is the row's persisted network_config, in the shape vmd
