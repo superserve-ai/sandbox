@@ -276,8 +276,9 @@ func runMigrate(args []string) int {
 					fmt.Fprintf(os.Stderr, "migrate: journal recovery: %s: stopping the booted guest: %v\n", id, derr)
 					return 1
 				}
-				if _, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused', updated_at = now()
-					WHERE id = $2 AND host_id = $3 AND status = 'migrating'`, *fromHost, id, *toHost); err != nil {
+				if _, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused',
+						timeout_seconds = CASE WHEN timeout_seconds IS NULL THEN $4 ELSE timeout_seconds END, updated_at = now()
+					WHERE id = $2 AND host_id = $3 AND status = 'migrating'`, *fromHost, id, *toHost, pending[id].orig); err != nil {
 					fmt.Fprintf(os.Stderr, "migrate: journal recovery: %v\n", err)
 					return 1
 				}
@@ -388,7 +389,11 @@ func runMigrate(args []string) int {
 						mu.Unlock()
 						return
 					}
-					tag, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'migrating', updated_at = now()
+					// The timeout is cleared with the claim: an elapsed one
+					// would let the reaper pause the row while the boot is
+					// still running. It is journaled, and set again on arming
+					// or put back on hand-back.
+					tag, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'migrating', timeout_seconds = NULL, updated_at = now()
 						WHERE id = $2 AND host_id = $3 AND status = 'paused' AND destroyed_at IS NULL AND snapshot_id = $4
 							AND timeout_seconds IS NOT DISTINCT FROM $5
 							AND (SELECT sn.generation FROM snapshot sn WHERE sn.id = sandbox.snapshot_id) = $6`,
@@ -448,8 +453,8 @@ func runMigrate(args []string) int {
 							// active, so no owner request reaches a guest that
 							// holds no secrets. The short timeout arms the reaper,
 							// which pauses migrating rows like active ones.
-							// Fenced on the journaled timeout: a PATCH the owner
-							// made during the boot is theirs to keep. The
+							// Fenced on the timeout still being cleared: a PATCH
+							// the owner made during the boot is theirs to keep. The
 							// secret-injection markers are cleared with it: the
 							// cold boot holds no secrets, and a same address on
 							// this host would otherwise let the next resume
@@ -458,8 +463,8 @@ func runMigrate(args []string) int {
 									secret_env_fingerprint = NULL, secret_env_ip = NULL, secret_env_injected_at = NULL, secret_env_expires_at = NULL,
 									updated_at = now()
 								WHERE id = $3 AND host_id = $4 AND status = 'migrating' AND destroyed_at IS NULL
-									AND timeout_seconds IS NOT DISTINCT FROM $5`,
-								int32(*tmpTimeout), ip, id, *toHost, s.origTimeout)
+									AND timeout_seconds IS NULL`,
+								int32(*tmpTimeout), ip, id, *toHost)
 							if err != nil {
 								// Outcome unknown: the row decides. The temporary
 								// timeout is only ever set here, so seeing it means
@@ -498,8 +503,9 @@ func runMigrate(args []string) int {
 						// The guest is down; give the row back. Until that write
 						// is confirmed the journal entry stays, so a rerun's
 						// recovery finishes the hand-back.
-						_, rerr := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused', updated_at = now()
-							WHERE id = $2 AND host_id = $3 AND status = 'migrating'`, *fromHost, id, *toHost)
+						_, rerr := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused',
+								timeout_seconds = CASE WHEN timeout_seconds IS NULL THEN $4 ELSE timeout_seconds END, updated_at = now()
+							WHERE id = $2 AND host_id = $3 AND status = 'migrating'`, *fromHost, id, *toHost, s.origTimeout)
 						mu.Lock()
 						var retry errRetry
 						switch {

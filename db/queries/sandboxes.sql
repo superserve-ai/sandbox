@@ -472,7 +472,10 @@ LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id;
 -- (delete, reaper failover), their transition wins and this returns 0.
 WITH reverted AS (
   UPDATE sandbox
-  SET status = 'active', updated_at = now(),
+  -- A migration pause goes back to 'migrating': that boot is not the
+  -- owner's session and must not become reachable or billed.
+  SET status = CASE WHEN sandbox.pause_op_trigger = 'migration' THEN 'migrating' ELSE 'active' END,
+      updated_at = now(),
       -- The pause is over: drop its identity so a result that arrives late
       -- for it can no longer match this row.
       pause_op_id = NULL, pause_op_started_at = NULL,
@@ -485,7 +488,7 @@ WITH reverted AS (
     AND (sqlc.narg(pause_op_id)::uuid IS NULL
          OR (sandbox.pause_op_id = sqlc.narg(pause_op_id)::uuid
              AND sandbox.pause_op_lease_version = sqlc.narg(pause_op_lease_version)::bigint))
-  RETURNING id, team_id, vcpu_count, memory_mib
+  RETURNING id, team_id, vcpu_count, memory_mib, status
 ),
 opened_active AS (
   -- The reopened interval keeps the actor of the one the pause closed when
@@ -499,6 +502,7 @@ opened_active AS (
                    ORDER BY i.ended_at DESC LIMIT 1)),
          now()
   FROM reverted r
+  WHERE r.status = 'active'
   ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
   RETURNING sandbox_id
 ),
@@ -993,7 +997,7 @@ WITH open_session AS (
   WHERE i.sandbox_id = sqlc.arg(id)::uuid AND i.ended_at IS NULL
 ),
 expired AS (
-  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id, s.status
   FROM sandbox s, open_session os
   WHERE s.id = sqlc.arg(id)::uuid
     AND s.destroyed_at IS NULL
@@ -1013,7 +1017,10 @@ paused AS (
       pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
       pause_op_lease_version = sandbox.pause_op_lease_version + 1,
       pause_op_attention_at = NULL,
-      pause_op_trigger = 'timeout',
+      -- A migrating row is an operator's boot being put back to paused;
+      -- the trigger remembers that so a failed attempt reverts to
+      -- migrating, never to active.
+      pause_op_trigger = CASE WHEN expired.status = 'migrating' THEN 'migration' ELSE 'timeout' END,
       pause_op_actor_id = NULL
   FROM expired
   WHERE sandbox.id = expired.id
