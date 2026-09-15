@@ -194,7 +194,7 @@ func runMigrate(args []string) int {
 	type live struct {
 		since       time.Time
 		origTimeout *int32 // written back after the pause; nil = none
-		snapshotID  string // the pause the row had at the claim; a new one means the migration pause completed
+		generation  int64  // the pause generation at the claim; a higher one means the migration pause completed
 		restores    int    // write-back attempts so far
 	}
 	active := map[string]live{} // booted here, waiting for the reaper
@@ -218,7 +218,7 @@ func runMigrate(args []string) int {
 				return 2
 			}
 		}
-		pr, err := conn.Query(ctx, `SELECT id::text, status::text, host_id, timeout_seconds FROM sandbox WHERE id = ANY($1::uuid[])`, ids)
+		pr, err := conn.Query(ctx, `SELECT id::text, status::text, host_id, timeout_seconds FROM sandbox WHERE id = ANY($1::uuid[]) AND destroyed_at IS NULL`, ids)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "migrate: journal recovery: %v\n", err)
 			return 1
@@ -240,7 +240,7 @@ func runMigrate(args []string) int {
 				// against the journaled pre-migration snapshot. The audit
 				// window keeps the journaled claim time so nothing billed
 				// meanwhile is missed.
-				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, snapshotID: pending[id].snapshotID}
+				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, generation: pending[id].generation}
 			case host == *toHost && status == "migrating":
 				// Claimed but never activated. The earlier run may have got
 				// as far as booting, so the guest is stopped here first; only
@@ -261,8 +261,8 @@ func runMigrate(args []string) int {
 					fmt.Fprintf(os.Stderr, "migrate: journal: %v\n", err)
 					return 1
 				}
-			case host == *toHost && timeout != nil && *timeout == int32(*tmpTimeout):
-				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, snapshotID: pending[id].snapshotID, restores: 1}
+			case host == *toHost && status == "paused" && timeout != nil && *timeout == int32(*tmpTimeout):
+				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, generation: pending[id].generation, restores: 1}
 			default:
 				if err := journalDone(journal, id); err != nil {
 					fmt.Fprintf(os.Stderr, "migrate: journal: %v\n", err)
@@ -276,6 +276,7 @@ func runMigrate(args []string) int {
 			return 1
 		}
 		for _, id := range ids {
+			// Not returned: destroyed since, or gone. Nothing is owed.
 			if !seen[id] {
 				if err := journalDone(journal, id); err != nil {
 					fmt.Fprintf(os.Stderr, "migrate: journal: %v\n", err)
@@ -309,15 +310,17 @@ func runMigrate(args []string) int {
 			for id := range active {
 				ids = append(ids, id)
 			}
-			st, err := conn.Query(ctx, `SELECT id::text, status::text, COALESCE(snapshot_id::text, '') FROM sandbox WHERE id = ANY($1::uuid[])`, ids)
+			st, err := conn.Query(ctx, `SELECT s.id::text, s.status::text, COALESCE((SELECT sn.generation FROM snapshot sn WHERE sn.id = s.snapshot_id), 0)::bigint
+				FROM sandbox s WHERE s.id = ANY($1::uuid[])`, ids)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "migrate: poll: %v\n", err)
 				return 1
 			}
-			var paused, gone []string
+			var paused, gone, deleted []string
 			for st.Next() {
-				var id, status, snap string
-				if err := st.Scan(&id, &status, &snap); err != nil {
+				var id, status string
+				var gen int64
+				if err := st.Scan(&id, &status, &gen); err != nil {
 					st.Close()
 					fmt.Fprintf(os.Stderr, "migrate: poll: %v\n", err)
 					return 1
@@ -325,7 +328,9 @@ func runMigrate(args []string) int {
 				switch {
 				case status == "failed":
 					gone = append(gone, id)
-				case status == "paused", snap != "" && snap != active[id].snapshotID:
+				case status == "deleted":
+					deleted = append(deleted, id)
+				case status == "paused", gen > active[id].generation:
 					// Paused here, or paused and already resumed by the
 					// owner between polls: the migration pause completed
 					// either way and the timeout goes back now.
@@ -402,6 +407,14 @@ func runMigrate(args []string) int {
 				delete(active, id)
 				recordFailure(id, "row failed after boot and stays failed on "+*toHost+"; needs an operator")
 			}
+			for _, id := range deleted {
+				// The owner deleted it meanwhile; nothing is owed.
+				delete(active, id)
+				fmt.Printf("DELETED %s: removed by its owner during the move\n", id)
+				if jerr := journalDone(journal, id); jerr != nil {
+					fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
+				}
+			}
 			for id, l := range active {
 				if l.restores > 0 {
 					continue // paused; only the write-back is outstanding
@@ -429,11 +442,13 @@ func runMigrate(args []string) int {
 				rules       egressRules
 				recorded    map[string]string
 				snapshotID  *string
+				generation  int64 // the snapshot row is reused across pauses; its generation is what moves
 			}
 			shapes := map[string]shape{}
 			sq, err := conn.Query(ctx, `SELECT s.id::text, s.vcpu_count, s.memory_mib, s.team_id::text, s.timeout_seconds, s.network_config,
 					COALESCE((SELECT json_object_agg(am.file_name, am.sha256) FROM artifact_manifest am WHERE am.snapshot_id = s.snapshot_id), '{}')::text,
-					s.snapshot_id::text
+					s.snapshot_id::text,
+					COALESCE((SELECT sn.generation FROM snapshot sn WHERE sn.id = s.snapshot_id), 0)::bigint
 				FROM sandbox s WHERE s.id = ANY($1::uuid[]) AND s.host_id = $2 AND s.status = 'paused' AND s.destroyed_at IS NULL`, batch, *fromHost)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
@@ -443,7 +458,7 @@ func runMigrate(args []string) int {
 				var id, recorded string
 				var s shape
 				var raw []byte
-				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &s.snapshotID); err != nil {
+				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &s.snapshotID, &s.generation); err != nil {
 					sq.Close()
 					fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
 					return 1
@@ -509,8 +524,9 @@ func runMigrate(args []string) int {
 					defer wg.Done()
 					defer func() { <-sem }()
 					// Claim first: the row moves to this host as 'migrating',
-					// fenced on the snapshot whose digests were checked and on
-					// the timeout that was journaled. Resume takes only paused
+					// fenced on the snapshot whose digests were checked (id and
+					// generation: a pause reuses the row and bumps the latter)
+					// and on the timeout that was journaled. Resume takes only paused
 					// rows, so from here the owner cannot start a second copy
 					// next to the boot; their request waits for the flip.
 					// The original timeout reaches the journal before the
@@ -518,7 +534,7 @@ func runMigrate(args []string) int {
 					// back.
 					claimedAt := time.Now()
 					mu.Lock()
-					err := journalTimeout(journal, id, s.origTimeout, claimedAt, *fromHost, *toHost, int32(*tmpTimeout), *s.snapshotID)
+					err := journalTimeout(journal, id, s.origTimeout, claimedAt, *fromHost, *toHost, int32(*tmpTimeout), s.generation)
 					mu.Unlock()
 					if err != nil {
 						mu.Lock()
@@ -528,8 +544,9 @@ func runMigrate(args []string) int {
 					}
 					tag, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'migrating', updated_at = now()
 						WHERE id = $2 AND host_id = $3 AND status = 'paused' AND destroyed_at IS NULL AND snapshot_id = $4
-							AND timeout_seconds IS NOT DISTINCT FROM $5`,
-						*toHost, id, *fromHost, *s.snapshotID, s.origTimeout)
+							AND timeout_seconds IS NOT DISTINCT FROM $5
+							AND (SELECT sn.generation FROM snapshot sn WHERE sn.id = sandbox.snapshot_id) = $6`,
+						*toHost, id, *fromHost, *s.snapshotID, s.origTimeout, s.generation)
 					if err == nil && tag.RowsAffected() == 0 {
 						err = fmt.Errorf("changed on %s since it was read", *fromHost)
 					}
@@ -597,12 +614,19 @@ func runMigrate(args []string) int {
 						// Not activated: take the VM back down before the row is
 						// handed back. Unconditional, because a lost reply looks
 						// like a failed RPC while the VM is up; destroying a VM
-						// that never started is a no-op.
+						// that never started is a no-op. If even that fails the
+						// claim stays here, with its journal entry, so nothing
+						// can resume beside a guest that may still be running;
+						// a rerun retries the stop.
 						dctx, dcancel := context.WithTimeout(ctx, time.Minute)
-						if _, derr := vmd.DestroyVM(dctx, &vmdpb.DestroyVMRequest{VmId: id, Force: true}); derr != nil {
-							err = fmt.Errorf("%v; and the booted VM could not be destroyed: %v", err, derr)
-						}
+						_, derr := vmd.DestroyVM(dctx, &vmdpb.DestroyVMRequest{VmId: id, Force: true})
 						dcancel()
+						if derr != nil {
+							mu.Lock()
+							recordFailure(id, fmt.Sprintf("%v; and the booted VM could not be destroyed, claim kept: %v", err, derr))
+							mu.Unlock()
+							return
+						}
 					}
 					if err != nil {
 						if _, rerr := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused', updated_at = now()
@@ -624,7 +648,7 @@ func runMigrate(args []string) int {
 					}
 					mu.Lock()
 					booted++
-					active[id] = live{since: claimedAt, origTimeout: s.origTimeout, snapshotID: *s.snapshotID}
+					active[id] = live{since: claimedAt, origTimeout: s.origTimeout, generation: s.generation}
 					mu.Unlock()
 				}(id, s)
 			}
@@ -647,17 +671,17 @@ func runMigrate(args []string) int {
 type errRetry struct{ error }
 
 // journalTimeout records a row's timeout, the claim time, the run's hosts
-// and temporary timeout, and the snapshot the row had, before the
+// and temporary timeout, and the pause generation the row had, before the
 // migration replaces any of it: `<id> <seconds>|none <unix> <from-host>
-// <to-host> <tmp> <snapshot>`, fsynced, so a rerun can finish the row (and
-// tell whether its pause already happened) and refuses to do so under
+// <to-host> <tmp> <generation>`, fsynced, so a rerun can finish the row
+// (and tell whether its pause already happened) and refuses to do so under
 // different parameters.
-func journalTimeout(journal *os.File, id string, orig *int32, at time.Time, fromHost, toHost string, tmp int32, snapshotID string) error {
+func journalTimeout(journal *os.File, id string, orig *int32, at time.Time, fromHost, toHost string, tmp int32, generation int64) error {
 	value := "none"
 	if orig != nil {
 		value = strconv.FormatInt(int64(*orig), 10)
 	}
-	line := fmt.Sprintf("%s %s %d %s %s %d %s\n", id, value, at.Unix(), fromHost, toHost, tmp, snapshotID)
+	line := fmt.Sprintf("%s %s %d %s %s %d %d\n", id, value, at.Unix(), fromHost, toHost, tmp, generation)
 	if _, err := journal.WriteString(line); err != nil {
 		return err
 	}
@@ -680,7 +704,7 @@ type journaled struct {
 	since            time.Time
 	fromHost, toHost string
 	tmp              int32
-	snapshotID       string
+	generation       int64
 }
 
 // pendingJournal returns the rows whose journaled timeout has not been
@@ -711,7 +735,11 @@ func pendingJournal(journal *os.File) (map[string]journaled, error) {
 		if err != nil {
 			continue
 		}
-		entry := journaled{since: time.Unix(at, 0), fromHost: f[3], toHost: f[4], tmp: int32(tmp), snapshotID: f[6]}
+		gen, err := strconv.ParseInt(f[6], 10, 64)
+		if err != nil {
+			continue
+		}
+		entry := journaled{since: time.Unix(at, 0), fromHost: f[3], toHost: f[4], tmp: int32(tmp), generation: gen}
 		if f[1] != "none" {
 			n, err := strconv.ParseInt(f[1], 10, 32)
 			if err != nil {
