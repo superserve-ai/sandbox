@@ -175,7 +175,19 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	}
 	defer root.Close()
 	var created []string
+	// publishers holds, per shared base materialized into this destination,
+	// the reader's callback awaiting that file's verdict. Every entry is
+	// consumed exactly once: with the file's own verification result, or
+	// with false when the restore fails for any reason first, so nothing
+	// this restore materialized from can outlive it unverified.
+	publishers := map[string]func(bool) error{}
 	fail := func(err error) (*GenerationManifest, error) {
+		for name, publish := range publishers {
+			if perr := publish(false); perr != nil {
+				report("shared base for %s not discarded: %v", name, perr)
+			}
+			delete(publishers, name)
+		}
 		var cleanupErrs []string
 		for _, name := range created {
 			if rerr := root.Remove(name); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
@@ -187,7 +199,6 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 		}
 		return nil, err
 	}
-	publishers := map[string]func(bool) error{}
 	for _, mf := range manifest.Files {
 		// The bucket is shared across the cell; never let a manifest name
 		// escape destDir.
@@ -215,6 +226,7 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 			// This verification is the one that blesses the copy the
 			// reader materialized from; a failure here must also stop it
 			// being reused.
+			delete(publishers, mf.Name)
 			if perr := publish(err == nil); perr != nil {
 				report("shared base %s not cached: %v", mf.SHA256, perr)
 			}

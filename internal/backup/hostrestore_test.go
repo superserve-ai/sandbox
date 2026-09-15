@@ -418,3 +418,67 @@ func TestMaterializeBaseRejectsUnverifiedMaster(t *testing.T) {
 		t.Fatalf("candidate survived a failed verification: %v", left)
 	}
 }
+
+// A restore that fails before its shared base is verified must still
+// discard the candidate that base was cloned from: nothing this restore
+// materialized may be reused by a later one unverified. The corrupted
+// file sorts before the base in manifest order, so the base's callback is
+// pending when verification stops.
+func TestEarlyVerificationFailureDiscardsPendingCandidates(t *testing.T) {
+	store := newMemBlobs()
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "base-image.ext4")
+	baseData := bytes.Repeat([]byte{0x55}, 64<<10)
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writeRestoreFixture(t, dir)
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+	// Corrupt a packed non-base object in place; its manifest entry and
+	// digest stay as recorded, so materialization succeeds and only
+	// verification notices.
+	manifestObject := genObject(task, ManifestObject)
+	var manifest GenerationManifest
+	if err := json.Unmarshal(store.objects[manifestObject], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	var victim, baseIndex = -1, -1
+	for i, f := range manifest.Files {
+		if isSharedEntry(f) {
+			baseIndex = i
+		} else if victim < 0 {
+			victim = i
+		}
+	}
+	if victim < 0 || baseIndex < 0 || victim > baseIndex {
+		t.Fatalf("fixture order: victim %d, base %d; need a non-base entry before the base", victim, baseIndex)
+	}
+	object := genObject(task, manifest.Files[victim].Object)
+	corrupted := bytes.Clone(store.objects[object])
+	corrupted[0] ^= 0xff
+	store.objects[object] = corrupted
+
+	cache := &CachingBaseReader{Inner: store, Dir: filepath.Join(t.TempDir(), "cache")}
+	probe, err := os.Create(filepath.Join(t.TempDir(), "probe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloneable := cache.canCloneInto(probe)
+	probe.Close()
+	_, err = RestoreGeneration(context.Background(), cache, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"), nil)
+	if err == nil || !strings.Contains(err.Error(), "verify "+manifest.Files[victim].Name) {
+		t.Fatalf("err = %v, want verification failure on %s", err, manifest.Files[victim].Name)
+	}
+	if !cloneable {
+		return // direct unpack: no candidate to strand
+	}
+	if left, _ := filepath.Glob(filepath.Join(cache.Dir, ".candidate-"+digestOf(baseData)+"-*")); len(left) != 0 {
+		t.Fatalf("candidate stranded by an early failure: %v", left)
+	}
+	if _, err := os.Stat(filepath.Join(cache.Dir, ".unpacked-"+digestOf(baseData))); err == nil {
+		t.Fatal("unverified base was published")
+	}
+}
