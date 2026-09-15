@@ -423,29 +423,21 @@ func runMigrate(args []string) int {
 				rules       egressRules
 				recorded    map[string]string
 				snapshotID  *string
-				preview     previewPolicy
 			}
 			shapes := map[string]shape{}
 			sq, err := conn.Query(ctx, `SELECT s.id::text, s.vcpu_count, s.memory_mib, s.team_id::text, s.timeout_seconds, s.network_config,
 					COALESCE((SELECT json_object_agg(am.file_name, am.sha256) FROM artifact_manifest am WHERE am.snapshot_id = s.snapshot_id), '{}')::text,
-					s.snapshot_id::text,
-					COALESCE(p.access, 'legacy_public')::text, COALESCE(p.revision, 0)::bigint,
-					COALESCE((SELECT json_agg(json_build_object('port', pp.port, 'access', pp.access, 'token_version', g.token_version))
-						FROM sandbox_published_port pp
-						JOIN sandbox_preview_port_token_generation g ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
-						WHERE pp.sandbox_id = s.id AND g.token_version > 0), '[]')::text
-				FROM sandbox s LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
-				WHERE s.id = ANY($1::uuid[]) AND s.host_id = $2 AND s.status = 'paused' AND s.destroyed_at IS NULL`, batch, *fromHost)
+					s.snapshot_id::text
+				FROM sandbox s WHERE s.id = ANY($1::uuid[]) AND s.host_id = $2 AND s.status = 'paused' AND s.destroyed_at IS NULL`, batch, *fromHost)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
 				return 1
 			}
 			for sq.Next() {
-				var id, recorded, ports string
+				var id, recorded string
 				var s shape
 				var raw []byte
-				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &s.snapshotID,
-					&s.preview.access, &s.preview.revision, &ports); err != nil {
+				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &s.snapshotID); err != nil {
 					sq.Close()
 					fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
 					return 1
@@ -456,10 +448,6 @@ func runMigrate(args []string) int {
 				}
 				if err := json.Unmarshal([]byte(recorded), &s.recorded); err != nil {
 					recordFailure(id, "recorded digests: "+err.Error())
-					continue
-				}
-				if err := json.Unmarshal([]byte(ports), &s.preview.ports); err != nil {
-					recordFailure(id, "published ports: "+err.Error())
 					continue
 				}
 				shapes[id] = s
@@ -564,11 +552,17 @@ func runMigrate(args []string) int {
 					if err == nil {
 						// vmd does not persist the preview policy either; a
 						// recordless boot starts private with no published
-						// ports. The stored policy is pushed before the row
-						// is exposed, exactly as a resume does.
-						pctx, pcancel := context.WithTimeout(ctx, time.Minute)
-						_, err = vmd.UpdateSandboxPreviewPolicy(pctx, s.preview.request(id))
-						pcancel()
+						// ports. The policy is read again now, after the record
+						// exists, so an owner's change during the boot (whose
+						// push found no record here) is what gets installed;
+						// then it is pushed before the row is exposed, exactly
+						// as a resume does.
+						var policy previewPolicy
+						if policy, err = loadPreviewPolicy(ctx, conn, id); err == nil {
+							pctx, pcancel := context.WithTimeout(ctx, time.Minute)
+							_, err = vmd.UpdateSandboxPreviewPolicy(pctx, policy.request(id))
+							pcancel()
+						}
 						if err != nil {
 							err = fmt.Errorf("apply preview policy: %w", err)
 						}
@@ -593,8 +587,11 @@ func runMigrate(args []string) int {
 							}
 						}
 					}
-					if err != nil && resp != nil {
-						// Booted but not activated: take the VM back down.
+					if err != nil {
+						// Not activated: take the VM back down before the row is
+						// handed back. Unconditional, because a lost reply looks
+						// like a failed RPC while the VM is up; destroying a VM
+						// that never started is a no-op.
 						dctx, dcancel := context.WithTimeout(ctx, time.Minute)
 						if _, derr := vmd.DestroyVM(dctx, &vmdpb.DestroyVMRequest{VmId: id, Force: true}); derr != nil {
 							err = fmt.Errorf("%v; and the booted VM could not be destroyed: %v", err, derr)
@@ -743,6 +740,24 @@ type previewPolicy struct {
 		Access       string `json:"access"`
 		TokenVersion int64  `json:"token_version"`
 	}
+}
+
+// loadPreviewPolicy reads the row's current preview policy: the stored
+// access and revision (absent side-table row = the pre-publication
+// default) and the published ports that carry a positive generation.
+func loadPreviewPolicy(ctx context.Context, conn *pgxpool.Pool, id string) (previewPolicy, error) {
+	var p previewPolicy
+	var ports string
+	err := conn.QueryRow(ctx, `SELECT COALESCE(p.access, 'legacy_public')::text, COALESCE(p.revision, 0)::bigint,
+			COALESCE((SELECT json_agg(json_build_object('port', pp.port, 'access', pp.access, 'token_version', g.token_version))
+				FROM sandbox_published_port pp
+				JOIN sandbox_preview_port_token_generation g ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
+				WHERE pp.sandbox_id = s.id AND g.token_version > 0), '[]')::text
+		FROM sandbox s LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id WHERE s.id = $1`, id).Scan(&p.access, &p.revision, &ports)
+	if err != nil {
+		return p, err
+	}
+	return p, json.Unmarshal([]byte(ports), &p.ports)
 }
 
 func (p previewPolicy) request(id string) *vmdpb.UpdateSandboxPreviewPolicyRequest {

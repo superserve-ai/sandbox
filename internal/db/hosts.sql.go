@@ -625,7 +625,7 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        h.last_heartbeat_at, h.created_at, h.updated_at,
        COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('active', 'starting')
                                       AND s.destroyed_at IS NULL), 0)::int AS running_count,
-       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('pausing', 'resuming')
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('pausing', 'resuming', 'migrating')
                                       AND s.destroyed_at IS NULL), 0)::int AS transitional_count,
        COALESCE(COUNT(s.id) FILTER (WHERE s.status = 'paused'
                                       AND s.destroyed_at IS NULL), 0)::int AS paused_count,
@@ -717,8 +717,9 @@ type ListHostsAdminRow struct {
 
 // Operator view (hostctl): every host regardless of status, with live
 // sandbox counts for drain progress. transitional counts pausing/resuming
-// sandboxes whose lifecycle RPC is still using the host — a host is not
-// drained while any exist, even when running and paused both read zero.
+// sandboxes whose lifecycle RPC is still using the host, and migrating
+// ones an operator has claimed here — a host is not drained while any
+// exist, even when running and paused both read zero.
 // The optional id filter exists for drain polling: `hostctl drain --wait`
 // re-reads one host every few seconds, and the per-host counts (the
 // backup-coverage probe especially) must not be recomputed for the whole
