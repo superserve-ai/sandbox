@@ -380,7 +380,7 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        COALESCE(COUNT(s.id), 0)::int AS active_sandbox_count
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
-  AND s.status IN ('active', 'starting', 'migrating')
+  AND s.status IN ('active', 'starting')
   AND s.destroyed_at IS NULL
 WHERE h.status = 'active'
   AND NOT EXISTS (
@@ -411,6 +411,9 @@ type ListActiveHostsByLoadRow struct {
 	ActiveSandboxCount int32              `json:"active_sandbox_count"`
 }
 
+// 'migrating' rows (an operator's boots being put back to paused) are not
+// counted: they are bounded and short-lived, and the partial index behind
+// this JOIN is keyed to exactly this predicate.
 // Returns active hosts sorted by current sandbox count (ascending).
 // The scheduler picks the first row (least loaded host). One query
 // replaces N per-host lookups.

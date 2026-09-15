@@ -74,6 +74,10 @@ import (
 // in the guest's memory, which a cold boot does not carry over; that is
 // the filesystem-only contract of a host restore.
 //
+// The scheduler's load ranking does not count migrating rows, so a
+// destination that is already taking placements sees the wave's boots
+// only once they are paused; keep -inflight modest there.
+//
 // Operator tool, run on the destination host next to vmd with the same
 // database credentials vmd uses. Sandboxes that fail to boot are recorded
 // so a rerun does not retry them. A row the control plane failed after
