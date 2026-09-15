@@ -1,7 +1,17 @@
 # Proxy routing production prerequisites
 
-Keep `PEER_ROUTING_ENABLED=0` until these steps and the host-generation rollout
-are complete. No routing credential is installed while routing is disabled.
+Keep each cell's GitHub routing variable unset or `0` until these steps and the
+host-generation rollout are complete for that cell. No routing credential is
+installed while routing is disabled.
+
+| GitHub Environment | Cell | Routing variable | Routing database secret |
+| --- | --- | --- | --- |
+| staging | staging | `PEER_ROUTING_ENABLED` | `PROXY_DATABASE_URL_STAGING` |
+| production | use4 | `PEER_ROUTING_ENABLED_USE4` | `PROXY_DATABASE_URL_PROD` |
+| production | usw2 | `PEER_ROUTING_ENABLED_USW` | `PROXY_DATABASE_URL_USWEST` |
+
+The workflow maps each cell's variable to the runtime `PEER_ROUTING_ENABLED`.
+The generic GitHub variable `PEER_ROUTING_ENABLED` only controls staging.
 
 ## Database access
 
@@ -64,14 +74,24 @@ stream capacity, so size ingress for both terminals and ordinary requests.
 
 ## Independent ingress rollout
 
-Set `PEER_INGRESS_ENABLED_PROD=1` and `PEER_INGRESS_ENABLED_USW=1` before
-production serving-host ingress deployment. Staging uses
+Set `PEER_INGRESS_ENABLED_PROD=1` for use4 or `PEER_INGRESS_ENABLED_USW=1` for
+usw2 before deploying ingress to that cell's production serving hosts. Staging uses
 `PEER_PROXY_LISTEN_ADDR_STAGING=auto`. Leave outbound routing disabled while
 verifying listeners, firewall access, and accepted endpoint heartbeats across
-all destination hosts. Then enable `PEER_ROUTING_ENABLED=1`.
+all destination hosts reachable from that cell. Then set that cell's routing
+variable from the table above to `1` and redeploy.
 
-To disable routing, keep the ingress settings enabled while the routing-disabled
-version reaches every source host and existing streams drain. Only then clear
+For a west-only production rollout, leave `PEER_ROUTING_ENABLED_USE4` unset or
+`0`, set `PEER_ROUTING_ENABLED_USW=1`, and manually run Deploy Proxy with
+`environment=production`, `target=serving`, and `production_cell=usw2`. Staging
+deploys first using its independent configuration, then only west deploys in
+production. Selecting `production_cell=use4` instead deploys only east after
+staging. Production serving deployments still require staging to succeed;
+staging routing does not need to be enabled.
+
+To disable routing, set the affected cell's routing variable to `0` and redeploy
+that cell. Keep its ingress setting enabled while the routing-disabled
+configuration reaches every source host and existing streams drain. Only then clear
 the independent ingress settings and deploy again. Routing being enabled always
 forces ingress on; turning routing off does not remove an independently enabled
 listener. Manual standby deployment continues enabling ingress automatically.
