@@ -92,13 +92,16 @@ class DeployTargetTests(unittest.TestCase):
     def select(self, **overrides):
         env = dict(os.environ, DEPLOY_EVENT="workflow_dispatch", DEPLOY_TARGET="",
                    DEPLOY_PRODUCTION_CELL="", DEPLOY_CELL="staging",
-                   GCP_REGION="us-central1", VMD_LABEL="component=legacy",
+                   GCP_PROJECT="example-project", MOCK_ROLE_ROWS="", GCP_REGION="us-central1",
+                   VMD_LABEL="component=legacy",
                    PEER_IDENTITY_HOSTS="legacy-host", EXPECTED_STANDBY_HOST="",
-                   VMD_STANDBY_HOST_USE4="",
                    PEER_ROUTING_ENABLED="0", PEER_PROXY_LISTEN_ADDR="auto")
         env.update(overrides)
         return subprocess.run(
-            ["bash", "-ec", 'source "$1"; printf "%s\\n" "$VMD_LABEL" '
+            ["bash", "-ec", 'gcloud() { '
+             '[ "$*" = "compute instances list --project=$GCP_PROJECT --filter=labels.component=vmd-$DEPLOY_CELL-standby --format=csv[no-heading](name,zone)" ] || return 2; '
+             'printf "%s" "$MOCK_ROLE_ROWS"; return ${MOCK_ROLE_STATUS:-0}; }; '
+             'source "$1"; printf "%s\\n" "$VMD_LABEL" '
              '"$PEER_IDENTITY_HOSTS" "$EXPECTED_STANDBY_HOST" '
              '"$PEER_ROUTING_ENABLED" "$PEER_PROXY_LISTEN_ADDR"',
              "select", str(SCRIPTS / "select-deploy-target.sh")],
@@ -114,7 +117,7 @@ class DeployTargetTests(unittest.TestCase):
                 with self.subTest(cell=cell, target=target):
                     result = self.select(DEPLOY_CELL=cell, GCP_REGION=region,
                                          DEPLOY_PRODUCTION_CELL="",
-                                         DEPLOY_TARGET=target)
+                                         DEPLOY_TARGET=target, MOCK_ROLE_ROWS=f"{host},{region}-a\n")
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout.splitlines(),
                                      [f"component=vmd-{cell}-standby", host, host, "0", "auto"])
@@ -126,13 +129,13 @@ class DeployTargetTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["component=vmd", "legacy-host", "", "0", "auto"])
 
-    def test_use4_standby_is_unconfigured_and_blocks_deployment(self):
+    def test_missing_standby_role_blocks_deployment(self):
         for target in ("", "standby"):
             result = self.select(DEPLOY_TARGET=target, DEPLOY_CELL="use4",
                                  DEPLOY_PRODUCTION_CELL="use4", GCP_REGION="us-east4",
                                  EXPECTED_STANDBY_HOST="legacy-host")
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("No standby identity host configured", result.stderr)
+            self.assertIn("Standby role requires exactly one host", result.stderr)
             # Nothing after sourcing the selector may run, even with a stale host override.
             self.assertEqual(result.stdout, "")
 
@@ -140,17 +143,43 @@ class DeployTargetTests(unittest.TestCase):
         for cell in ("staging", "use4", "usw2"):
             result = self.select(DEPLOY_EVENT="push", DEPLOY_TARGET="invalid", DEPLOY_CELL=cell,
                                  GCP_REGION="", PEER_ROUTING_ENABLED="1",
-                                 VMD_STANDBY_HOST_USE4="example-replacement")
+                                 MOCK_ROLE_ROWS="example-replacement,us-east4-a\n")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["component=legacy", "legacy-host", "", "1", "auto"])
 
-    def test_use4_standby_uses_deployment_configuration(self):
+    def test_use4_standby_uses_live_role(self):
         result = self.select(DEPLOY_CELL="use4", DEPLOY_PRODUCTION_CELL="use4",
-                             GCP_REGION="us-east4", VMD_STANDBY_HOST_USE4="example-replacement")
+                             GCP_REGION="us-east4", MOCK_ROLE_ROWS="example-replacement,us-east4-a\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(),
                          ["component=vmd-use4-standby", "example-replacement",
                           "example-replacement", "0", "auto"])
+
+    def test_promotion_and_rollback_follow_roles_in_both_cells(self):
+        for cell, region in (("usw2", "us-west2"), ("use4", "us-east4")):
+            for serving, inactive in (("example-host-1", "example-host-2"),
+                                      ("example-host-2", "example-host-1")):
+                with self.subTest(cell=cell, serving=serving):
+                    result = self.select(DEPLOY_CELL=cell, DEPLOY_PRODUCTION_CELL=cell,
+                                         GCP_REGION=region, MOCK_ROLE_ROWS=f"{inactive},{region}-a\n")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines()[1:3], [inactive, inactive])
+                    self.assertEqual(self.deploy_selection(f"{inactive},{region}-a\n", region, inactive),
+                                     (0, [inactive]))
+                    # A role change between selection and discovery must fail closed.
+                    self.assertEqual(self.deploy_selection(f"{serving},{region}-a\n", region, inactive), (1, []))
+                    result = self.select(DEPLOY_TARGET="serving", DEPLOY_CELL=cell,
+                                         DEPLOY_PRODUCTION_CELL=cell, GCP_REGION=region)
+                    self.assertEqual(result.stdout.splitlines()[0], "component=vmd")
+                    self.assertEqual(self.deploy_selection(f"{serving},{region}-a\n", region, ""), (0, [serving]))
+
+    def test_role_discovery_rejects_ambiguous_wrong_region_and_failed_queries(self):
+        for rows, status in (("", "0"), ("example-a,us-west2-a\nexample-b,us-west2-b\n", "0"),
+                             ("example-a,us-east4-a\n", "0"), ("example-a,us-west2-a\n", "1")):
+            result = self.select(DEPLOY_CELL="usw2", GCP_REGION="us-west2",
+                                 MOCK_ROLE_ROWS=rows, MOCK_ROLE_STATUS=status)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
 
     def test_manual_rejects_invalid_or_unscoped_selection(self):
         for override in ({"DEPLOY_TARGET": "component=vmd"}, {"DEPLOY_PRODUCTION_CELL": "all"},
@@ -170,7 +199,6 @@ class DeployTargetTests(unittest.TestCase):
             steps = [s for s in re.split(r"^      - name: ", workflow, flags=re.M)
                      if f"python3 .github/workflows/scripts/deploy-{kind}.py" in s]
             self.assertEqual(len(steps), 3)
-            self.assertIn("VMD_STANDBY_HOST_USE4: ${{ vars.VMD_STANDBY_HOST_USE4 }}", steps[1])
             for step in steps:
                 self.assertLess(step.index("source .github/workflows/scripts/select-deploy-target.sh"),
                                 step.index(f"python3 .github/workflows/scripts/deploy-{kind}.py"))
