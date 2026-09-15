@@ -126,3 +126,9 @@ variable "standby_host_id" {
   type        = string
   default     = "usw2-2"
 }
+
+variable "primary_host_running" {
+  description = "Whether the primary host is kept running; false parks it stopped (its local SSD is empty once stopped)."
+  type        = bool
+  default     = true
+}

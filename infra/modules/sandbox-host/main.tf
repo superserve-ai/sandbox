@@ -9,6 +9,7 @@ resource "google_compute_instance" "this" {
   machine_type              = var.machine_type
   can_ip_forward            = var.can_ip_forward
   allow_stopping_for_update = var.allow_stopping_for_update
+  desired_status            = var.desired_status
   tags                      = var.tags
   labels                    = local.instance_labels
 

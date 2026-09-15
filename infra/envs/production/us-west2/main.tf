@@ -292,15 +292,16 @@ module "api" {
 module "sandbox_host" {
   source = "../../../modules/sandbox-host"
 
-  project_id    = local.project_id
-  environment   = local.environment
-  region        = local.region
-  zone          = local.zone
-  instance_name = "superserve-vmd-${local.resource_suffix}"
-  machine_type  = var.machine_type
-  subnet        = module.network.subnetwork_self_link
-  internal_ip   = "10.1.0.2"
-  tags          = ["vmd-usw2"]
+  project_id     = local.project_id
+  environment    = local.environment
+  region         = local.region
+  zone           = local.zone
+  instance_name  = "superserve-vmd-${local.resource_suffix}"
+  machine_type   = var.machine_type
+  desired_status = var.primary_host_running ? "RUNNING" : "TERMINATED"
+  subnet         = module.network.subnetwork_self_link
+  internal_ip    = "10.1.0.2"
+  tags           = ["vmd-usw2"]
   labels = merge(local.sandbox_host_labels, {
     component                  = local.primary_component
     sandbox_role               = "vmd"

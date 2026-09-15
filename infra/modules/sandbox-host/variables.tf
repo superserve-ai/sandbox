@@ -79,6 +79,17 @@ variable "metadata" {
   default     = {}
 }
 
+variable "desired_status" {
+  description = "RUNNING or TERMINATED; a parked host stays stopped across applies."
+  type        = string
+  default     = "RUNNING"
+
+  validation {
+    condition     = contains(["RUNNING", "TERMINATED"], var.desired_status)
+    error_message = "desired_status must be RUNNING or TERMINATED."
+  }
+}
+
 variable "allow_stopping_for_update" {
   description = "Whether Terraform may stop the instance to apply in-place updates."
   type        = bool
