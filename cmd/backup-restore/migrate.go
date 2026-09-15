@@ -319,230 +319,51 @@ func runMigrate(args []string) int {
 		retried++
 		fmt.Printf("RETRY %s: %s\n", id, why)
 	}
-	started := time.Now()
-	for len(queue) > 0 || len(active) > 0 {
-		// Settle what the reaper finished: paused rows are done (their
-		// temporary timeout cleared); failed rows and rows active past the
-		// wait are reported and left for a human.
-		if len(active) > 0 {
-			ids := make([]string, 0, len(active))
-			for id := range active {
-				ids = append(ids, id)
+	type shape struct {
+		vcpu, mem   int32
+		team        string
+		origTimeout *int32
+		rules       egressRules
+		recorded    map[string]string
+		snapshotID  *string
+		generation  int64 // the snapshot row is reused across pauses; its generation is what moves
+	}
+	type job struct {
+		id         string
+		s          shape
+		disk, base string
+		standalone bool
+	}
+	// Boots run on a fixed pool fed a little at a time, so the poll below
+	// never waits on a whole batch: a sandbox the reaper has paused gets
+	// its timeout back on the next tick whatever the other boots are doing.
+	// mu guards active, booting, and the counters and ledger the workers
+	// touch.
+	var mu sync.Mutex
+	booting := 0 // handed to a worker, not yet settled into active or failed
+	jobs := make(chan job, *inflight)
+	var run func(j job)
+	var wg sync.WaitGroup
+	for i := 0; i < *concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				run(j)
+				mu.Lock()
+				booting--
+				mu.Unlock()
 			}
-			st, err := conn.Query(ctx, `SELECT s.id::text, s.status::text, COALESCE((SELECT sn.generation FROM snapshot sn WHERE sn.id = s.snapshot_id), 0)::bigint
-				FROM sandbox s WHERE s.id = ANY($1::uuid[])`, ids)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "migrate: poll: %v\n", err)
-				return 1
-			}
-			var paused, gone, deleted []string
-			pausedSeen := time.Now()
-			for st.Next() {
-				var id, status string
-				var gen int64
-				if err := st.Scan(&id, &status, &gen); err != nil {
-					st.Close()
-					fmt.Fprintf(os.Stderr, "migrate: poll: %v\n", err)
-					return 1
-				}
-				switch {
-				case status == "failed":
-					gone = append(gone, id)
-				case status == "deleted":
-					deleted = append(deleted, id)
-				case status == "paused", gen > active[id].generation:
-					// Paused here, or paused and already resumed by the
-					// owner between polls: the migration pause completed
-					// either way and the timeout goes back now.
-					paused = append(paused, id)
-				}
-			}
-			st.Close()
-			if err := st.Err(); err != nil {
-				fmt.Fprintf(os.Stderr, "migrate: poll: %v\n", err)
-				return 1
-			}
-			// A paused row is moved only once its original timeout is back;
-			// until then it stays pending and the write-back is retried.
-			if len(paused) > 0 {
-				origs := make([]*int32, len(paused))
-				for i, id := range paused {
-					origs[i] = active[id].origTimeout
-				}
-				// The write-back is keyed on the temporary value alone: a row
-				// the owner resumed between the poll and this statement still
-				// gets its timeout back. Rows the statement did not reach stay
-				// pending and are polled again.
-				written := map[string]bool{}
-				wr, err := conn.Query(ctx, `UPDATE sandbox s SET timeout_seconds = v.orig, updated_at = now()
-					FROM unnest($1::uuid[], $2::int[]) AS v(id, orig)
-					WHERE s.id = v.id AND s.host_id = $3 AND s.timeout_seconds = $4
-					RETURNING s.id::text`, paused, origs, *toHost, int32(*tmpTimeout))
-				if err == nil {
-					for wr.Next() {
-						var id string
-						if err = wr.Scan(&id); err != nil {
-							break
-						}
-						written[id] = true
-					}
-					wr.Close()
-					if err == nil {
-						err = wr.Err()
-					}
-				}
-				for _, id := range paused {
-					if err == nil && !written[id] {
-						err = fmt.Errorf("row changed before the write-back reached it")
-					}
-					if err != nil {
-						l := active[id]
-						l.restores++
-						active[id] = l
-						if l.restores >= 5 {
-							delete(active, id)
-							recordFailure(id, fmt.Sprintf("paused here but its timeout could not be written back after %d attempts: %v", l.restores, err))
-						}
-						err = nil
-						continue
-					}
-					if secs, ierr := billedDuring(ctx, conn, id, active[id].since, pausedSeen); ierr != nil {
-						fmt.Printf("WARN %s: could not check for intervals opened during migration: %v\n", id, ierr)
-					} else if secs > 0 {
-						fmt.Printf("BILLED %s: %.0fs of intervals opened while migrating; credit the owner\n", id, secs)
-						if failFile != nil {
-							fmt.Fprintf(failFile, "%s billed %.0fs during migration\n", id, secs)
-						}
-					}
-					if jerr := journalDone(journal, id); jerr != nil {
-						fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
-					}
-					delete(active, id)
-					moved++
-					fmt.Printf("MOVED %s\n", id)
-				}
+		}()
+	}
+	defer wg.Wait()
+	defer close(jobs)
 
-			}
-			for _, id := range gone {
-				delete(active, id)
-				recordFailure(id, "row failed after boot and stays failed on "+*toHost+"; needs an operator")
-			}
-			for _, id := range deleted {
-				// The owner deleted it meanwhile; nothing is owed.
-				delete(active, id)
-				fmt.Printf("DELETED %s: removed by its owner during the move\n", id)
-				if jerr := journalDone(journal, id); jerr != nil {
-					fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
-				}
-			}
-			for id, l := range active {
-				if l.restores > 0 {
-					continue // paused; only the write-back is outstanding
-				}
-				if time.Since(l.since) > *pauseWait {
-					delete(active, id)
-					stuck++
-					fmt.Printf("STUCK %s: still active after %s; pause it by hand\n", id, pauseWait)
-				}
-			}
-		}
-
-		// Fill up to the in-flight bound: read each row's shape and egress
-		// rules, boot, and flip the row the moment its VM is up.
-		if n := *inflight - len(active); n > 0 && len(queue) > 0 {
-			if n > len(queue) {
-				n = len(queue)
-			}
-			batch := queue[:n]
-			queue = queue[n:]
-			type shape struct {
-				vcpu, mem   int32
-				team        string
-				origTimeout *int32
-				rules       egressRules
-				recorded    map[string]string
-				snapshotID  *string
-				generation  int64 // the snapshot row is reused across pauses; its generation is what moves
-			}
-			shapes := map[string]shape{}
-			sq, err := conn.Query(ctx, `SELECT s.id::text, s.vcpu_count, s.memory_mib, s.team_id::text, s.timeout_seconds, s.network_config,
-					COALESCE((SELECT json_object_agg(am.file_name, am.sha256) FROM artifact_manifest am WHERE am.snapshot_id = s.snapshot_id), '{}')::text,
-					s.snapshot_id::text,
-					COALESCE((SELECT sn.generation FROM snapshot sn WHERE sn.id = s.snapshot_id), 0)::bigint
-				FROM sandbox s WHERE s.id = ANY($1::uuid[]) AND s.host_id = $2 AND s.status = 'paused' AND s.destroyed_at IS NULL`, batch, *fromHost)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
-				return 1
-			}
-			for sq.Next() {
-				var id, recorded string
-				var s shape
-				var raw []byte
-				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &s.snapshotID, &s.generation); err != nil {
-					sq.Close()
-					fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
-					return 1
-				}
-				if s.rules, err = parseEgressRules(raw); err != nil {
-					recordFailure(id, "network_config: "+err.Error())
-					continue
-				}
-				if err := json.Unmarshal([]byte(recorded), &s.recorded); err != nil {
-					recordFailure(id, "recorded digests: "+err.Error())
-					continue
-				}
-				shapes[id] = s
-			}
-			sq.Close()
-			if err := sq.Err(); err != nil {
-				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
-				return 1
-			}
-			for _, id := range batch {
-				if _, ok := shapes[id]; !ok && !skip[id] {
-					fmt.Printf("SKIP %s: no longer paused on %s\n", id, *fromHost)
-				}
-			}
-
-			var mu sync.Mutex
-			var wg sync.WaitGroup
-			sem := make(chan struct{}, *concurrency)
-			booted := 0
-			for id, s := range shapes {
-				rd, err := restoredDisk(*root, id)
-				if err == nil && (len(s.recorded) == 0 || s.snapshotID == nil) {
-					mu.Lock()
-					unanchored++
-					fmt.Printf("SKIP %s: its current snapshot has no recorded digests, so no restored copy can be shown to match it\n", id)
-					mu.Unlock()
-					continue
-				}
-				if err == nil && !rd.current(s.recorded) {
-					// Not a failure of the sandbox: the copy is behind its
-					// owner's latest pause. Clear it so the next host restore
-					// materializes the current one, and leave the id eligible.
-					mu.Lock()
-					stale++
-					if rerr := os.RemoveAll(filepath.Join(*root, id)); rerr != nil {
-						fmt.Printf("STALE %s: restored copy predates the current pause and could not be removed: %v\n", id, rerr)
-					} else {
-						fmt.Printf("STALE %s: restored copy predates the current pause; removed, restore it again\n", id)
-					}
-					mu.Unlock()
-					continue
-				}
-				if err != nil {
-					mu.Lock()
-					recordFailure(id, err.Error())
-					mu.Unlock()
-					continue
-				}
-				disk, base, standalone := rd.disk, rd.base, rd.standalone
-				wg.Add(1)
-				sem <- struct{}{}
-				go func(id string, s shape) {
-					defer wg.Done()
-					defer func() { <-sem }()
+	run = func(j job) {
+		id, s, disk, base, standalone := j.id, j.s, j.disk, j.base, j.standalone
+		{
+			{
+				{
 					// Claim first: the row moves to this host as 'migrating',
 					// fenced on the snapshot whose digests were checked (id and
 					// generation: a pause reuses the row and bumps the latter)
@@ -667,16 +488,247 @@ func runMigrate(args []string) int {
 						return
 					}
 					mu.Lock()
-					booted++
 					active[id] = live{since: claimedAt, origTimeout: s.origTimeout, generation: s.generation}
 					mu.Unlock()
-				}(id, s)
+				}
 			}
-			wg.Wait()
-			fmt.Printf("booted %d, in flight %d, queued %d, moved %d, failed %d, %s elapsed\n",
-				booted, len(active), len(queue), moved, failed, time.Since(started).Round(time.Second))
 		}
+	}
+
+	started := time.Now()
+	for {
+		mu.Lock()
+		more := len(queue) > 0 || len(active) > 0 || booting > 0
+		mu.Unlock()
+		if !more {
+			break
+		}
+		// Settle what the reaper finished: paused rows are done (their
+		// temporary timeout cleared); failed rows and rows active past the
+		// wait are reported and left for a human.
+		mu.Lock()
 		if len(active) > 0 {
+			ids := make([]string, 0, len(active))
+			for id := range active {
+				ids = append(ids, id)
+			}
+			st, err := conn.Query(ctx, `SELECT s.id::text, s.status::text, COALESCE((SELECT sn.generation FROM snapshot sn WHERE sn.id = s.snapshot_id), 0)::bigint
+				FROM sandbox s WHERE s.id = ANY($1::uuid[])`, ids)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "migrate: poll: %v\n", err)
+				mu.Unlock()
+				return 1
+			}
+			var paused, gone, deleted []string
+			pausedSeen := time.Now()
+			for st.Next() {
+				var id, status string
+				var gen int64
+				if err := st.Scan(&id, &status, &gen); err != nil {
+					st.Close()
+					fmt.Fprintf(os.Stderr, "migrate: poll: %v\n", err)
+					mu.Unlock()
+					return 1
+				}
+				switch {
+				case status == "failed":
+					gone = append(gone, id)
+				case status == "deleted":
+					deleted = append(deleted, id)
+				case status == "paused", gen > active[id].generation:
+					// Paused here, or paused and already resumed by the
+					// owner between polls: the migration pause completed
+					// either way and the timeout goes back now.
+					paused = append(paused, id)
+				}
+			}
+			st.Close()
+			if err := st.Err(); err != nil {
+				fmt.Fprintf(os.Stderr, "migrate: poll: %v\n", err)
+				mu.Unlock()
+				return 1
+			}
+			// A paused row is moved only once its original timeout is back;
+			// until then it stays pending and the write-back is retried.
+			if len(paused) > 0 {
+				origs := make([]*int32, len(paused))
+				for i, id := range paused {
+					origs[i] = active[id].origTimeout
+				}
+				// The write-back is keyed on the temporary value alone: a row
+				// the owner resumed between the poll and this statement still
+				// gets its timeout back. Rows the statement did not reach stay
+				// pending and are polled again.
+				written := map[string]bool{}
+				wr, err := conn.Query(ctx, `UPDATE sandbox s SET timeout_seconds = v.orig, updated_at = now()
+					FROM unnest($1::uuid[], $2::int[]) AS v(id, orig)
+					WHERE s.id = v.id AND s.host_id = $3 AND s.timeout_seconds = $4
+					RETURNING s.id::text`, paused, origs, *toHost, int32(*tmpTimeout))
+				if err == nil {
+					for wr.Next() {
+						var id string
+						if err = wr.Scan(&id); err != nil {
+							break
+						}
+						written[id] = true
+					}
+					wr.Close()
+					if err == nil {
+						err = wr.Err()
+					}
+				}
+				for _, id := range paused {
+					if err == nil && !written[id] {
+						err = fmt.Errorf("row changed before the write-back reached it")
+					}
+					if err != nil {
+						l := active[id]
+						l.restores++
+						active[id] = l
+						if l.restores >= 5 {
+							delete(active, id)
+							recordFailure(id, fmt.Sprintf("paused here but its timeout could not be written back after %d attempts: %v", l.restores, err))
+						}
+						err = nil
+						continue
+					}
+					if secs, ierr := billedDuring(ctx, conn, id, active[id].since, pausedSeen); ierr != nil {
+						fmt.Printf("WARN %s: could not check for intervals opened during migration: %v\n", id, ierr)
+					} else if secs > 0 {
+						fmt.Printf("BILLED %s: %.0fs of intervals opened while migrating; credit the owner\n", id, secs)
+						if failFile != nil {
+							fmt.Fprintf(failFile, "%s billed %.0fs during migration\n", id, secs)
+						}
+					}
+					if jerr := journalDone(journal, id); jerr != nil {
+						fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
+					}
+					delete(active, id)
+					moved++
+					fmt.Printf("MOVED %s\n", id)
+				}
+
+			}
+			for _, id := range gone {
+				delete(active, id)
+				recordFailure(id, "row failed after boot and stays failed on "+*toHost+"; needs an operator")
+			}
+			for _, id := range deleted {
+				// The owner deleted it meanwhile; nothing is owed.
+				delete(active, id)
+				fmt.Printf("DELETED %s: removed by its owner during the move\n", id)
+				if jerr := journalDone(journal, id); jerr != nil {
+					fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
+				}
+			}
+			for id, l := range active {
+				if l.restores > 0 {
+					continue // paused; only the write-back is outstanding
+				}
+				if time.Since(l.since) > *pauseWait {
+					delete(active, id)
+					stuck++
+					fmt.Printf("STUCK %s: still active after %s; pause it by hand\n", id, pauseWait)
+				}
+			}
+		}
+		room := *inflight - len(active) - booting
+		mu.Unlock()
+
+		// Fill up to the in-flight bound: read each row's shape and egress
+		// rules, then hand it to the pool, which boots and flips the row
+		// the moment its VM is up.
+		if n := room; n > 0 && len(queue) > 0 {
+			if n > len(queue) {
+				n = len(queue)
+			}
+			batch := queue[:n]
+			queue = queue[n:]
+			shapes := map[string]shape{}
+			sq, err := conn.Query(ctx, `SELECT s.id::text, s.vcpu_count, s.memory_mib, s.team_id::text, s.timeout_seconds, s.network_config,
+					COALESCE((SELECT json_object_agg(am.file_name, am.sha256) FROM artifact_manifest am WHERE am.snapshot_id = s.snapshot_id), '{}')::text,
+					s.snapshot_id::text,
+					COALESCE((SELECT sn.generation FROM snapshot sn WHERE sn.id = s.snapshot_id), 0)::bigint
+				FROM sandbox s WHERE s.id = ANY($1::uuid[]) AND s.host_id = $2 AND s.status = 'paused' AND s.destroyed_at IS NULL`, batch, *fromHost)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
+				return 1
+			}
+			for sq.Next() {
+				var id, recorded string
+				var s shape
+				var raw []byte
+				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &s.snapshotID, &s.generation); err != nil {
+					sq.Close()
+					fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
+					return 1
+				}
+				if s.rules, err = parseEgressRules(raw); err != nil {
+					recordFailure(id, "network_config: "+err.Error())
+					continue
+				}
+				if err := json.Unmarshal([]byte(recorded), &s.recorded); err != nil {
+					recordFailure(id, "recorded digests: "+err.Error())
+					continue
+				}
+				shapes[id] = s
+			}
+			sq.Close()
+			if err := sq.Err(); err != nil {
+				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
+				return 1
+			}
+			for _, id := range batch {
+				if _, ok := shapes[id]; !ok && !skip[id] {
+					fmt.Printf("SKIP %s: no longer paused on %s\n", id, *fromHost)
+				}
+			}
+
+			handed := 0
+			for id, s := range shapes {
+				rd, err := restoredDisk(*root, id)
+				if err == nil && (len(s.recorded) == 0 || s.snapshotID == nil) {
+					mu.Lock()
+					unanchored++
+					fmt.Printf("SKIP %s: its current snapshot has no recorded digests, so no restored copy can be shown to match it\n", id)
+					mu.Unlock()
+					continue
+				}
+				if err == nil && !rd.current(s.recorded) {
+					// Not a failure of the sandbox: the copy is behind its
+					// owner's latest pause. Clear it so the next host restore
+					// materializes the current one, and leave the id eligible.
+					mu.Lock()
+					stale++
+					if rerr := os.RemoveAll(filepath.Join(*root, id)); rerr != nil {
+						fmt.Printf("STALE %s: restored copy predates the current pause and could not be removed: %v\n", id, rerr)
+					} else {
+						fmt.Printf("STALE %s: restored copy predates the current pause; removed, restore it again\n", id)
+					}
+					mu.Unlock()
+					continue
+				}
+				if err != nil {
+					mu.Lock()
+					recordFailure(id, err.Error())
+					mu.Unlock()
+					continue
+				}
+				mu.Lock()
+				booting++
+				mu.Unlock()
+				handed++
+				jobs <- job{id: id, s: s, disk: rd.disk, base: rd.base, standalone: rd.standalone}
+			}
+			mu.Lock()
+			fmt.Printf("handed %d, booting %d, in flight %d, queued %d, moved %d, failed %d, %s elapsed\n",
+				handed, booting, len(active), len(queue), moved, failed, time.Since(started).Round(time.Second))
+			mu.Unlock()
+		}
+		mu.Lock()
+		wait := len(active) > 0 || booting > 0
+		mu.Unlock()
+		if wait {
 			time.Sleep(10 * time.Second)
 		}
 	}
