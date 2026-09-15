@@ -110,9 +110,9 @@ func TestJournalPendingUntilDone(t *testing.T) {
 	v := int32(300)
 	at := time.Unix(1700000000, 0)
 	for _, step := range []func() error{
-		func() error { return journalTimeout(f, "a", nil, at, "h", 60) },
-		func() error { return journalTimeout(f, "b", &v, at, "h", 60) },
-		func() error { return journalTimeout(f, "c", nil, at.Add(time.Hour), "h", 60) },
+		func() error { return journalTimeout(f, "a", nil, at, "src", "h", 60) },
+		func() error { return journalTimeout(f, "b", &v, at, "src", "h", 60) },
+		func() error { return journalTimeout(f, "c", nil, at.Add(time.Hour), "src", "h", 60) },
 		func() error { return journalDone(f, "b") },
 	} {
 		if err := step(); err != nil {
@@ -123,13 +123,13 @@ func TestJournalPendingUntilDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(pending) != 2 || pending["a"].orig != nil || !pending["a"].since.Equal(at) || pending["a"].toHost != "h" || pending["a"].tmp != 60 {
+	if len(pending) != 2 || pending["a"].orig != nil || !pending["a"].since.Equal(at) || pending["a"].fromHost != "src" || pending["a"].toHost != "h" || pending["a"].tmp != 60 {
 		t.Fatalf("pending = %+v", pending)
 	}
 	if c, ok := pending["c"]; !ok || !c.since.Equal(at.Add(time.Hour)) {
 		t.Fatalf("c = %+v", c)
 	}
-	if err := journalTimeout(f, "b", &v, at, "h", 60); err != nil {
+	if err := journalTimeout(f, "b", &v, at, "src", "h", 60); err != nil {
 		t.Fatal(err)
 	}
 	pending, _ = pendingJournal(f)
@@ -138,7 +138,7 @@ func TestJournalPendingUntilDone(t *testing.T) {
 	}
 	// Appends still land at the end after the read.
 	data, _ := os.ReadFile(f.Name())
-	if !strings.HasSuffix(string(data), "b 300 1700000000 h 60\n") {
+	if !strings.HasSuffix(string(data), "b 300 1700000000 src h 60\n") {
 		t.Fatalf("journal tail = %q", data)
 	}
 }

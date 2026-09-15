@@ -1464,7 +1464,7 @@ WITH destroyed AS (
     AND sandbox.destroyed_at IS NULL
     AND (
       sandbox.status IN ('active', 'paused', 'failed')
-      OR (sandbox.status IN ('starting', 'resuming', 'pausing')
+      OR (sandbox.status IN ('starting', 'resuming', 'pausing', 'migrating')
           AND sandbox.updated_at < $3)
     )
   RETURNING id, had_secret_bindings
@@ -1510,7 +1510,7 @@ type DestroySandboxParams struct {
 }
 
 // Atomic, guarded soft-delete. Claims the sandbox from a quiescent state
-// (active/paused/failed) or from a transitional state (starting/resuming/pausing)
+// (active/paused/failed) or from a transitional state (starting/resuming/pausing/migrating)
 // whose owning worker is provably gone — updated_at older than
 // stale_transitional_before. It never claims a live transition, so it serializes
 // against a concurrent resume/pause (this CAS and BeginResume target the same row,

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -197,7 +198,7 @@ func runMigrate(args []string) int {
 		restores    int    // write-back attempts so far
 	}
 	active := map[string]live{} // booted here, waiting for the reaper
-	moved, failed, stuck, stale, unanchored := 0, 0, 0, 0, 0
+	moved, failed, stuck, stale, unanchored, retried := 0, 0, 0, 0, 0, 0
 	failFile, _ := os.OpenFile(filepath.Join(*root, "migrate-failed.txt"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if failFile != nil {
 		defer failFile.Close()
@@ -212,8 +213,8 @@ func runMigrate(args []string) int {
 			ids = append(ids, id)
 		}
 		for id, j := range pending {
-			if j.toHost != *toHost || j.tmp != int32(*tmpTimeout) {
-				fmt.Fprintf(os.Stderr, "migrate: %s was left mid-flight by a run with -to-host %s -pause-timeout-seconds %d; rerun with those to finish it\n", id, j.toHost, j.tmp)
+			if j.fromHost != *fromHost || j.toHost != *toHost || j.tmp != int32(*tmpTimeout) {
+				fmt.Fprintf(os.Stderr, "migrate: %s was left mid-flight by a run with -from-host %s -to-host %s -pause-timeout-seconds %d; rerun with those to finish it\n", id, j.fromHost, j.toHost, j.tmp)
 				return 2
 			}
 		}
@@ -282,6 +283,13 @@ func runMigrate(args []string) int {
 		if failFile != nil {
 			fmt.Fprintf(failFile, "%s %s\n", id, why)
 		}
+	}
+	// A retryable miss (the row moved on, a transient database error) is
+	// reported but not written to the skip file: a later run picks the
+	// sandbox up again once it is paused with a current restore.
+	recordRetry := func(id, why string) {
+		retried++
+		fmt.Printf("RETRY %s: %s\n", id, why)
 	}
 	started := time.Now()
 	for len(queue) > 0 || len(active) > 0 {
@@ -502,7 +510,7 @@ func runMigrate(args []string) int {
 					// back.
 					claimedAt := time.Now()
 					mu.Lock()
-					err := journalTimeout(journal, id, s.origTimeout, claimedAt, *toHost, int32(*tmpTimeout))
+					err := journalTimeout(journal, id, s.origTimeout, claimedAt, *fromHost, *toHost, int32(*tmpTimeout))
 					mu.Unlock()
 					if err != nil {
 						mu.Lock()
@@ -518,8 +526,11 @@ func runMigrate(args []string) int {
 						err = fmt.Errorf("changed on %s since it was read", *fromHost)
 					}
 					if err != nil {
+						// Nothing was claimed: the row moved on or the database
+						// hiccuped. Either way a later run may succeed, so this
+						// is not written to the skip file.
 						mu.Lock()
-						recordFailure(id, err.Error())
+						recordRetry(id, err.Error())
 						if jerr := journalDone(journal, id); jerr != nil {
 							fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
 						}
@@ -539,11 +550,14 @@ func runMigrate(args []string) int {
 					if err == nil {
 						var ip netip.Addr
 						if ip, err = netip.ParseAddr(resp.GetHostIp()); err == nil {
+							// Fenced on the journaled timeout as well: a PATCH
+							// the owner made during the boot is theirs to keep.
 							tag, err = conn.Exec(ctx, `UPDATE sandbox SET status = 'active', timeout_seconds = $1, ip_address = $2, updated_at = now()
-								WHERE id = $3 AND host_id = $4 AND status = 'migrating' AND destroyed_at IS NULL`,
-								int32(*tmpTimeout), ip, id, *toHost)
+								WHERE id = $3 AND host_id = $4 AND status = 'migrating' AND destroyed_at IS NULL
+									AND timeout_seconds IS NOT DISTINCT FROM $5`,
+								int32(*tmpTimeout), ip, id, *toHost, s.origTimeout)
 							if err == nil && tag.RowsAffected() == 0 {
-								err = fmt.Errorf("claim on %s was lost before activation", *toHost)
+								err = errRetry{fmt.Errorf("claim on %s changed before activation", *toHost)}
 							}
 						}
 						if err != nil {
@@ -560,7 +574,12 @@ func runMigrate(args []string) int {
 							err = fmt.Errorf("%v; and the claim could not be handed back: %v", err, rerr)
 						}
 						mu.Lock()
-						recordFailure(id, err.Error())
+						var retry errRetry
+						if errors.As(err, &retry) {
+							recordRetry(id, err.Error())
+						} else {
+							recordFailure(id, err.Error())
+						}
 						if jerr := journalDone(journal, id); jerr != nil {
 							fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
 						}
@@ -581,23 +600,26 @@ func runMigrate(args []string) int {
 			time.Sleep(10 * time.Second)
 		}
 	}
-	fmt.Printf("migrate complete: moved=%d failed=%d stuck=%d stale=%d unverifiable=%d in %s\n", moved, failed, stuck, stale, unanchored, time.Since(started).Round(time.Second))
-	if failed+stuck+stale+unanchored > 0 {
+	fmt.Printf("migrate complete: moved=%d failed=%d stuck=%d stale=%d unverifiable=%d retry=%d in %s\n", moved, failed, stuck, stale, unanchored, retried, time.Since(started).Round(time.Second))
+	if failed+stuck+stale+unanchored+retried > 0 {
 		return 1
 	}
 	return 0
 }
 
+// errRetry marks a failure a later run may not see again.
+type errRetry struct{ error }
+
 // journalTimeout records a row's timeout, the claim time, and the run's
-// destination and temporary timeout before the migration replaces it:
-// `<id> <seconds>|none <unix> <to-host> <tmp>`, fsynced, so a rerun can
-// finish the row and refuse to do so under different parameters.
-func journalTimeout(journal *os.File, id string, orig *int32, at time.Time, toHost string, tmp int32) error {
+// hosts and temporary timeout before the migration replaces it:
+// `<id> <seconds>|none <unix> <from-host> <to-host> <tmp>`, fsynced, so a
+// rerun can finish the row and refuses to do so under different parameters.
+func journalTimeout(journal *os.File, id string, orig *int32, at time.Time, fromHost, toHost string, tmp int32) error {
 	value := "none"
 	if orig != nil {
 		value = strconv.FormatInt(int64(*orig), 10)
 	}
-	line := fmt.Sprintf("%s %s %d %s %d\n", id, value, at.Unix(), toHost, tmp)
+	line := fmt.Sprintf("%s %s %d %s %s %d\n", id, value, at.Unix(), fromHost, toHost, tmp)
 	if _, err := journal.WriteString(line); err != nil {
 		return err
 	}
@@ -616,10 +638,10 @@ func journalDone(journal *os.File, id string) error {
 // journaled is one un-retired journal entry: the timeout to put back and
 // when the row was flipped.
 type journaled struct {
-	orig   *int32
-	since  time.Time
-	toHost string
-	tmp    int32
+	orig             *int32
+	since            time.Time
+	fromHost, toHost string
+	tmp              int32
 }
 
 // pendingJournal returns the rows whose journaled timeout has not been
@@ -639,18 +661,18 @@ func pendingJournal(journal *os.File) (map[string]journaled, error) {
 			delete(pending, f[0])
 			continue
 		}
-		if len(f) != 5 {
+		if len(f) != 6 {
 			continue
 		}
 		at, err := strconv.ParseInt(f[2], 10, 64)
 		if err != nil {
 			continue
 		}
-		tmp, err := strconv.ParseInt(f[4], 10, 32)
+		tmp, err := strconv.ParseInt(f[5], 10, 32)
 		if err != nil {
 			continue
 		}
-		entry := journaled{since: time.Unix(at, 0), toHost: f[3], tmp: int32(tmp)}
+		entry := journaled{since: time.Unix(at, 0), fromHost: f[3], toHost: f[4], tmp: int32(tmp)}
 		if f[1] != "none" {
 			n, err := strconv.ParseInt(f[1], 10, 32)
 			if err != nil {

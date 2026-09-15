@@ -256,7 +256,7 @@ ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
 
 -- name: DestroySandbox :one
 -- Atomic, guarded soft-delete. Claims the sandbox from a quiescent state
--- (active/paused/failed) or from a transitional state (starting/resuming/pausing)
+-- (active/paused/failed) or from a transitional state (starting/resuming/pausing/migrating)
 -- whose owning worker is provably gone — updated_at older than
 -- stale_transitional_before. It never claims a live transition, so it serializes
 -- against a concurrent resume/pause (this CAS and BeginResume target the same row,
@@ -275,7 +275,7 @@ WITH destroyed AS (
     AND sandbox.destroyed_at IS NULL
     AND (
       sandbox.status IN ('active', 'paused', 'failed')
-      OR (sandbox.status IN ('starting', 'resuming', 'pausing')
+      OR (sandbox.status IN ('starting', 'resuming', 'pausing', 'migrating')
           AND sandbox.updated_at < sqlc.arg(stale_transitional_before))
     )
   RETURNING id, had_secret_bindings
