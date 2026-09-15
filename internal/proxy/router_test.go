@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,14 +21,32 @@ import (
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
-type hijackWriter struct{ conn net.Conn }
+type hijackWriter struct {
+	conn  net.Conn
+	input io.Reader
+}
 
 func (w hijackWriter) Header() http.Header       { return make(http.Header) }
 func (w hijackWriter) Write([]byte) (int, error) { return 0, errors.New("unexpected HTTP write") }
 func (w hijackWriter) WriteHeader(int)           {}
 func (w hijackWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
-	return w.conn, bufio.NewReadWriter(bufio.NewReader(w.conn), bufio.NewWriter(w.conn)), nil
+	input := w.input
+	if input == nil {
+		input = w.conn
+	}
+	conn := w.conn
+	if w.input != nil {
+		conn = readerConn{Conn: conn, Reader: input}
+	}
+	return conn, bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn)), nil
 }
+
+type readerConn struct {
+	net.Conn
+	io.Reader
+}
+
+func (c readerConn) Read(p []byte) (int, error) { return c.Reader.Read(p) }
 
 type blockingReader struct{ released chan struct{} }
 
@@ -43,9 +62,14 @@ func TestBridgeRequestForwardsResponseBeforeUploadCompletes(t *testing.T) {
 	peerConn, peerRemote := net.Pipe()
 	peer := pipePeer{Conn: peerConn}
 	released := make(chan struct{})
-	r := httptest.NewRequest(http.MethodPost, "http://sandbox.test/upload", blockingReader{released: released})
+	r := httptest.NewRequest(http.MethodPost, "http://sandbox.test/upload", nil)
+	r.TransferEncoding = []string{"chunked"}
+	r.ContentLength = -1
+	r.Body = forbiddenRequestBody{}
 	done := make(chan error, 1)
-	go func() { done <- bridgeRequest(hijackWriter{conn: server}, r, peer) }()
+	go func() {
+		done <- bridgeRequest(hijackWriter{conn: server, input: io.MultiReader(blockingReader{released: released}, strings.NewReader("0\r\n\r\n"), server)}, r, peer)
+	}()
 	go func() {
 		defer peerRemote.Close()
 		br := bufio.NewReader(peerRemote)
@@ -190,7 +214,10 @@ func TestRoutingHandlerPinsFailedStreamAndLooksUpNextRequest(t *testing.T) {
 		r.Header.Set(headerSandboxID, "12345678-1234-1234-1234-123456789abc")
 		r.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
 		done := make(chan struct{})
-		go func() { h.ServeHTTP(hijackWriter{conn: server}, r); close(done) }()
+		go func() {
+			h.ServeHTTP(hijackWriter{conn: server, input: io.MultiReader(bytes.NewReader(upload), server)}, r)
+			close(done)
+		}()
 		select {
 		case <-stream.sent:
 		case <-time.After(3 * time.Second):
@@ -446,7 +473,7 @@ func TestBridgeUpgradeRequiresSwitchingProtocols(t *testing.T) {
 			req.Header.Set("Connection", "Upgrade")
 			req.Header.Set("Upgrade", "websocket")
 			done := make(chan error, 1)
-			go func() { done <- bridgeRequest(hijackWriter{server}, req, pipePeer{peer}) }()
+			go func() { done <- bridgeRequest(hijackWriter{conn: server}, req, pipePeer{peer}) }()
 			downstream := []byte("GET / HTTP/1.1\r\nHost: second.example.com\r\n\r\n")
 			go func() { _, _ = client.Write(downstream) }()
 			upstream := bufio.NewReader(remote)
@@ -539,7 +566,7 @@ func TestBridgeAcceptedTunnelReadTermination(t *testing.T) {
 			request.Header.Set("Upgrade", "websocket")
 			done := make(chan error, 1)
 			go func() {
-				done <- bridgeRequest(hijackWriter{tunnelReadResultConn{server, ready, readErr}}, request, tunnelHalfClosePeer{peer, halfClosed})
+				done <- bridgeRequest(hijackWriter{conn: tunnelReadResultConn{server, ready, readErr}}, request, tunnelHalfClosePeer{peer, halfClosed})
 			}()
 			go func() {
 				_, err := http.ReadRequest(bufio.NewReader(remote))
@@ -735,6 +762,79 @@ func TestRoutingHandlerInvalidInputDoesNotResolveOwnership(t *testing.T) {
 			}
 			if lookups != 0 || peers.called || recorder.count != 0 || recorder.outcomes != 0 {
 				t.Fatalf("lookups=%d peer=%v lookup metrics=%d routing metrics=%d", lookups, peers.called, recorder.count, recorder.outcomes)
+			}
+		})
+	}
+}
+
+// The server-owned body must never be touched once a connection is hijacked.
+type forbiddenRequestBody struct{}
+
+func (forbiddenRequestBody) Read([]byte) (int, error) { panic("read original body after hijack") }
+func (forbiddenRequestBody) Close() error             { panic("close original body after hijack") }
+
+func TestRequestAfterHijackPreservesBufferedBodyAndFollowingBytes(t *testing.T) {
+	for _, chunked := range []bool{false, true} {
+		t.Run(fmt.Sprint(chunked), func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://sandbox.test/upload", nil)
+			request.Body = forbiddenRequestBody{}
+			request.ContentLength = 7
+			wire := "payload"
+			if chunked {
+				request.ContentLength = -1
+				request.TransferEncoding = []string{"chunked"}
+				request.Trailer = http.Header{"X-Checksum": nil}
+				wire = "7\r\npayload\r\n0\r\nX-Checksum: complete\r\n\r\n"
+			}
+			original := bufio.NewReader(strings.NewReader(wire + "following-upgrade-bytes"))
+			if _, err := original.Peek(3); err != nil {
+				t.Fatal(err)
+			}
+			forwarded, remaining, err := requestAfterHijack(request, original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var serialized bytes.Buffer
+			if err := forwarded.Write(&serialized); err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := http.ReadRequest(bufio.NewReader(&serialized))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(parsed.Body)
+			if err != nil || string(body) != "payload" {
+				t.Fatalf("body=%q err=%v", body, err)
+			}
+			if chunked && parsed.Trailer.Get("X-Checksum") != "complete" {
+				t.Fatal("trailer lost")
+			}
+			rest, err := io.ReadAll(remaining)
+			if err != nil || string(rest) != "following-upgrade-bytes" {
+				t.Fatalf("following bytes=%q err=%v", rest, err)
+			}
+		})
+	}
+}
+
+func TestRequestAfterHijackRejectsTruncatedBody(t *testing.T) {
+	for _, chunked := range []bool{false, true} {
+		t.Run(fmt.Sprint(chunked), func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://sandbox.test/", nil)
+			request.Body = forbiddenRequestBody{}
+			request.ContentLength = 7
+			wire := "pay"
+			if chunked {
+				request.ContentLength = -1
+				request.TransferEncoding = []string{"chunked"}
+				wire = "7\r\npay"
+			}
+			forwarded, _, err := requestAfterHijack(request, bufio.NewReader(strings.NewReader(wire)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := forwarded.Write(io.Discard); err == nil {
+				t.Fatal("truncated body accepted")
 			}
 		})
 	}

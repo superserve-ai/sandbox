@@ -3,7 +3,6 @@ package vm
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -493,8 +492,9 @@ func TestSendHeartbeatAdvertisesCapacityPressureWhenPublishing(t *testing.T) {
 }
 
 func TestHeartbeatLogsEndpointAcknowledgementOnceAfterAcceptance(t *testing.T) {
-	for _, complete := range []bool{false, true} {
-		t.Run(fmt.Sprintf("complete=%t", complete), func(t *testing.T) {
+	for _, mode := range []string{"incomplete", "complete", "bound-default", "bound-cleared"} {
+		complete := mode != "incomplete"
+		t.Run(mode, func(t *testing.T) {
 			var attempts atomic.Int32
 			third := make(chan struct{})
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -518,6 +518,13 @@ func TestHeartbeatLogsEndpointAcknowledgementOnceAfterAcceptance(t *testing.T) {
 			if complete {
 				cfg.VMDAddr, cfg.ProxyAddr, cfg.Region = "192.0.2.1:50051", "192.0.2.1:5009", "test-region"
 				cfg.CapacityMemoryMib, cfg.CapacityVcpus = 1024, 1
+			}
+			if strings.HasPrefix(mode, "bound-") {
+				cfg.IncarnationID = "11111111-1111-4111-8111-111111111111"
+				cfg.HostID = "default"
+				if mode == "bound-cleared" {
+					cfg.ProxyAddr = ""
+				}
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()

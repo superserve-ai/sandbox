@@ -2,12 +2,14 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -176,6 +178,38 @@ func (w *bridgeResponseWriter) finish(err error) {
 // Bound silent upstream retention while allowing a half-closed client to read.
 const httpHalfCloseIdleTimeout = 30 * time.Second
 
+// Hijack transfers ownership of unread wire bytes to its buffered reader. The
+// original server Request.Body is no longer usable. Reconstruct only its HTTP
+// framing so net/http still decodes chunked bodies and populates trailers.
+func requestAfterHijack(r *http.Request, reader *bufio.Reader) (*http.Request, *bufio.Reader, error) {
+	request := r.Clone(r.Context())
+	request.Body = http.NoBody
+	if len(r.TransferEncoding) == 0 && r.ContentLength <= 0 {
+		return request, reader, nil
+	}
+	var framing strings.Builder
+	framing.WriteString("POST / HTTP/1.1\r\nHost: proxy\r\n")
+	if len(r.TransferEncoding) != 0 {
+		fmt.Fprintf(&framing, "Transfer-Encoding: %s\r\n", strings.Join(r.TransferEncoding, ","))
+	} else {
+		fmt.Fprintf(&framing, "Content-Length: %d\r\n", r.ContentLength)
+	}
+	for key := range r.Trailer {
+		fmt.Fprintf(&framing, "Trailer: %s\r\n", key)
+	}
+	framing.WriteString("\r\n")
+	input := bufio.NewReader(io.MultiReader(strings.NewReader(framing.String()), reader))
+	parsed, err := http.ReadRequest(input)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Request.Write closes Body even on write failure. The parsed body's Close
+	// drains unread input, which would prevent the bridge from canceling a stalled
+	// upload. The bridge owns and closes the underlying connection instead.
+	request.Body, request.Trailer = io.NopCloser(parsed.Body), parsed.Trailer
+	return request, input, nil
+}
+
 func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) error {
 	return bridgeRequestWithIdleTimeout(w, r, stream, httpHalfCloseIdleTimeout)
 }
@@ -196,9 +230,19 @@ func bridgeRequestWithIdleTimeout(w http.ResponseWriter, r *http.Request, stream
 	defer stream.Close()
 	// Request.Write owns both headers and transfer framing, including chunked
 	// bodies and trailers. Run it alongside the response pump for early replies.
-	request := new(http.Request)
-	*request = *r
-	request.Header = r.Header.Clone()
+	// Preserve read-ahead bytes, then read the raw connection. Continuing through
+	// net/http's reader would cancel the request context on a clean send-side EOF.
+	pending := make([]byte, buffered.Reader.Buffered())
+	if _, err := io.ReadFull(buffered.Reader, pending); err != nil {
+		output.finish(err)
+		return err
+	}
+	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(pending), conn))
+	request, input, err := requestAfterHijack(r, reader)
+	if err != nil {
+		output.finish(err)
+		return err
+	}
 	upgrade := r.Header.Get("Upgrade") != ""
 	if !upgrade {
 		request.Close = true
@@ -242,7 +286,7 @@ func bridgeRequestWithIdleTimeout(w http.ResponseWriter, r *http.Request, stream
 				return
 			}
 			// Hijack may have already buffered bytes after the HTTP request.
-			if _, err := io.Copy(stream, buffered.Reader); err != nil {
+			if _, err := io.Copy(stream, input); err != nil {
 				closeBoth(err)
 				return
 			}
@@ -252,7 +296,7 @@ func bridgeRequestWithIdleTimeout(w http.ResponseWriter, r *http.Request, stream
 		} else {
 			// Drain without forwarding pipelined requests. A clean EOF only
 			// closes the sending direction; keep delivering response bytes.
-			if _, err := io.Copy(io.Discard, conn); err != nil {
+			if _, err := io.Copy(io.Discard, input); err != nil {
 				closeBoth(err)
 				return
 			}

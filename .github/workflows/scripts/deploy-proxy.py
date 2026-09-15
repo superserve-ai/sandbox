@@ -285,14 +285,14 @@ def main() -> int:
                 # Readiness and endpoint acknowledgement must belong to the
                 # still-current invocation before old routing can be retired.
                 local deadline=$((SECONDS + 90))
-                local verification_host_id
-                verification_host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/vmd.env | head -n1)
+                # Bound hosts can retain HOST_ID=default. The DB fallback
+                # independently requires an unbound default-host record.
                 for attempt in $(seq 1 90); do
                     [ "$SECONDS" -lt "$deadline" ] || break
                     invocation=$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)
                     if [ -n "$invocation" ] \
                        && sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'gRPC serving requests' --no-pager >/dev/null 2>&1 \
-                       && {{ if [ "$verification_host_id" = default ]; then legacy_heartbeat_ready; else sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'host endpoint heartbeat accepted' --no-pager >/dev/null 2>&1; fi; }} \
+                       && {{ sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'host endpoint heartbeat accepted' --no-pager >/dev/null 2>&1 || legacy_heartbeat_ready; }} \
                        && [ "$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)" = "$invocation" ] \
                        && sudo systemctl is-active --quiet {service}; then
                         return 0
