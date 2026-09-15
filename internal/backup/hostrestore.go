@@ -544,6 +544,19 @@ func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.Re
 	return os.Open(cached)
 }
 
+// isHexDigest reports whether s is a lowercase hex sha256 (64 chars).
+func isHexDigest(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // MaterializeBase implements BaseMaterializer. The first request for a
 // digest unpacks the cached object once into an ".unpacked-<sha>" sibling
 // of the spool and verifies it; every request then clones that file into
@@ -553,6 +566,13 @@ func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.Re
 func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, mf ManifestFile, dst *os.File) error {
 	if !strings.HasPrefix(object, "bases/") {
 		return fmt.Errorf("materialize: %q is not a shared base object", object)
+	}
+	// The digest becomes a path component; a manifest is bucket content,
+	// so it must be exactly a lowercase hex sha256 before it touches the
+	// filesystem, or a crafted entry could steer the master copy outside
+	// the cache.
+	if !isHexDigest(mf.SHA256) {
+		return fmt.Errorf("materialize: manifest digest %q is not a sha256", mf.SHA256)
 	}
 	unpacked := filepath.Join(c.Dir, ".unpacked-"+mf.SHA256)
 	_, err, _ := c.group.Do(unpacked, func() (any, error) {
@@ -573,26 +593,10 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 			tmp.Close()
 			return nil, err
 		}
-		// Verify the master copy once; every clone of it is byte-identical,
-		// and the per-sandbox verification below still runs on each clone.
-		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-			tmp.Close()
-			return nil, err
-		}
-		extents, apparent, err := Extents(tmp)
-		if err != nil {
-			tmp.Close()
-			return nil, err
-		}
-		sum, err := hashApparent(ctx, tmp, extents, apparent)
-		if err != nil {
-			tmp.Close()
-			return nil, err
-		}
-		if apparent != mf.Size || sum != mf.SHA256 {
-			tmp.Close()
-			return nil, fmt.Errorf("unpacked base %s does not match its manifest (size %d/%d, sha256 %s)", mf.SHA256, apparent, mf.Size, sum)
-		}
+		// The master is not hashed here: every clone of it is verified by
+		// the caller against the manifest digest, so a bad master fails the
+		// first sandbox that uses it instead of stalling every waiter behind
+		// a second full read of a multi-gigabyte file.
 		if err := tmp.Sync(); err != nil {
 			tmp.Close()
 			return nil, err

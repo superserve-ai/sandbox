@@ -252,3 +252,22 @@ func TestHostRestoreMaterializesSharedBaseOnce(t *testing.T) {
 		}
 	}
 }
+
+// A manifest digest that is not a sha256 must never become a cache path.
+func TestMaterializeBaseRejectsNonHexDigest(t *testing.T) {
+	cache := &CachingBaseReader{Inner: newMemBlobs(), Dir: t.TempDir()}
+	dst, err := os.CreateTemp(t.TempDir(), "dst")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	for _, bad := range []string{"../../etc/x", "abc", strings.Repeat("Z", 64), strings.Repeat("a", 63) + "/"} {
+		err := cache.MaterializeBase(context.Background(), "bases/x", ManifestFile{SHA256: bad}, dst)
+		if err == nil || !strings.Contains(err.Error(), "not a sha256") {
+			t.Fatalf("digest %q: err = %v, want rejection", bad, err)
+		}
+	}
+	if entries, _ := os.ReadDir(cache.Dir); len(entries) != 0 {
+		t.Fatalf("cache dir touched: %v", entries)
+	}
+}
