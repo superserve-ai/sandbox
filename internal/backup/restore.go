@@ -206,7 +206,15 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	// verification cannot leave earlier files implicitly blessed: either
 	// the whole set passes or the whole set is gone.
 	for _, mf := range manifest.Files {
-		if err := verifyFile(ctx, root, mf); err != nil {
+		err := verifyFile(ctx, root, mf)
+		if bp, ok := r.(BasePublisher); ok && isSharedEntry(mf) {
+			// This verification is the one that blesses the reader's
+			// shared copy; a failure here must also stop it being reused.
+			if perr := bp.PublishBase(mf.SHA256, err == nil); perr != nil {
+				report("shared base %s not cached: %v", mf.SHA256, perr)
+			}
+		}
+		if err != nil {
 			return fail(fmt.Errorf("verify %s: %w", mf.Name, err))
 		}
 		report("verified %s sha256 %s", mf.Name, mf.SHA256)
@@ -453,6 +461,14 @@ const maxApparentSize = int64(16) << 40
 // implementation only has to be byte-exact, not trusted.
 type BaseMaterializer interface {
 	MaterializeBase(ctx context.Context, object string, mf ManifestFile, dst *os.File) error
+}
+
+// BasePublisher is the second half of BaseMaterializer: the restorer
+// reports whether the destination it materialized verified, so the reader
+// may keep (or must discard) whatever it materialized from. Verification
+// is the restorer's, so the reader never hashes a base itself.
+type BasePublisher interface {
+	PublishBase(sha string, verified bool) error
 }
 
 // unpackExtents writes a packed object's extents into dst at their apparent

@@ -3,8 +3,10 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -602,11 +604,16 @@ func isHexDigest(s string) bool {
 }
 
 // MaterializeBase implements BaseMaterializer. The first request for a
-// digest unpacks the cached object once into an ".unpacked-<sha>" sibling
-// of the spool and verifies it; every request then clones that file into
-// dst. cloneFile fails on filesystems without reflink, and the fallback
-// is a plain copy, so the result is the same bytes everywhere and only
-// the disk cost differs. Concurrent first requests coalesce.
+// digest unpacks the cached object once into a ".candidate-<sha>" sibling
+// of the spool; every request clones that file (or the published
+// ".unpacked-<sha>" master) into dst. Nothing here hashes: the caller
+// verifies every destination anyway, and PublishBase promotes the
+// candidate to a master only after such a verification has passed, so
+// the cache never holds a trusted copy nobody checked and the base is
+// read exactly once per destination. cloneFile fails on filesystems
+// without reflink, and the fallback is a plain copy, so the result is the
+// same bytes everywhere and only the disk cost differs. Concurrent first
+// requests coalesce.
 func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, mf ManifestFile, dst *os.File) error {
 	if !strings.HasPrefix(object, "bases/") {
 		return fmt.Errorf("materialize: %q is not a shared base object", object)
@@ -629,10 +636,16 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 		defer rc.Close()
 		return unpackExtents(ctx, rc, mf, dst)
 	}
-	unpacked := filepath.Join(c.Dir, ".unpacked-"+mf.SHA256)
-	_, err, _ := c.group.Do(unpacked, func() (any, error) {
-		if _, err := os.Stat(unpacked); err == nil {
-			return nil, nil
+	master, candidate := c.basePaths(mf.SHA256)
+	if src, err := os.Open(master); err == nil {
+		defer src.Close()
+		return cloneFile(dst, src)
+	}
+	_, err, _ := c.group.Do(candidate, func() (any, error) {
+		for _, p := range []string{master, candidate} {
+			if _, err := os.Stat(p); err == nil {
+				return nil, nil
+			}
 		}
 		rc, err := c.NewReader(ctx, object)
 		if err != nil {
@@ -648,29 +661,6 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 			tmp.Close()
 			return nil, err
 		}
-		// The master is named by digest and reused across runs, so it is
-		// verified before it is published: a manifest whose shared entry
-		// carries the right digest but altered packing geometry would
-		// otherwise poison the cache for every later generation on that
-		// base. One read per base, not per sandbox.
-		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-			tmp.Close()
-			return nil, err
-		}
-		extents, apparent, err := Extents(tmp)
-		if err != nil {
-			tmp.Close()
-			return nil, err
-		}
-		sum, err := hashApparent(ctx, tmp, extents, apparent)
-		if err != nil {
-			tmp.Close()
-			return nil, err
-		}
-		if apparent != mf.Size || sum != mf.SHA256 {
-			tmp.Close()
-			return nil, fmt.Errorf("unpacked base does not match its manifest digest %s", mf.SHA256)
-		}
 		if err := tmp.Sync(); err != nil {
 			tmp.Close()
 			return nil, err
@@ -678,15 +668,54 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 		if err := tmp.Close(); err != nil {
 			return nil, err
 		}
-		return nil, os.Rename(tmp.Name(), unpacked)
+		return nil, os.Rename(tmp.Name(), candidate)
 	})
 	if err != nil {
 		return err
 	}
-	src, err := os.Open(unpacked)
+	src, err := os.Open(candidate)
+	if errors.Is(err, fs.ErrNotExist) {
+		// Published between the coalesced unpack and this open.
+		src, err = os.Open(master)
+	}
 	if err != nil {
 		return err
 	}
 	defer src.Close()
 	return cloneFile(dst, src)
+}
+
+// PublishBase implements BasePublisher: once a destination cloned from
+// the candidate has passed the restorer's full verification, the
+// candidate is the verified bytes and becomes the master every later
+// restore clones from. A failed verification discards the candidate so
+// the next request unpacks afresh rather than cloning a bad copy again.
+func (c *CachingBaseReader) PublishBase(sha string, verified bool) error {
+	if !isHexDigest(sha) {
+		return fmt.Errorf("publish: %q is not a sha256", sha)
+	}
+	master, candidate := c.basePaths(sha)
+	ignoreMissing := func(err error) error {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !verified {
+		return ignoreMissing(os.Remove(candidate))
+	}
+	if _, err := os.Stat(master); err == nil {
+		return ignoreMissing(os.Remove(candidate))
+	}
+	err := os.Rename(candidate, master)
+	if errors.Is(err, fs.ErrNotExist) {
+		// No candidate: the destination was unpacked directly, or another
+		// verified restore published first.
+		return nil
+	}
+	return err
+}
+
+func (c *CachingBaseReader) basePaths(sha string) (master, candidate string) {
+	return filepath.Join(c.Dir, ".unpacked-"+sha), filepath.Join(c.Dir, ".candidate-"+sha)
 }

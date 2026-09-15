@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -251,6 +252,11 @@ func TestHostRestoreMaterializesSharedBaseOnce(t *testing.T) {
 	if shared && unpacked == 0 {
 		t.Fatal("reflink filesystem but no unpacked master base in the cache")
 	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".candidate-") {
+			t.Fatalf("candidate %s left behind after a verified restore", e.Name())
+		}
+	}
 	if !shared && unpacked != 0 {
 		t.Fatal("no reflink support but an unpacked master base was written")
 	}
@@ -315,14 +321,29 @@ func TestMaterializeBaseFallsBackWhenCloneFails(t *testing.T) {
 }
 
 // A shared entry whose digest is right but whose packing geometry is
-// wrong must fail without publishing a master under that digest, so a
-// later legitimate generation on the same base is not poisoned.
+// wrong must fail the restore without leaving a master or a candidate
+// under that digest, so a later legitimate generation on the same base
+// is neither poisoned nor served a bad copy.
 func TestMaterializeBaseRejectsUnverifiedMaster(t *testing.T) {
 	store := newMemBlobs()
 	dir := t.TempDir()
 	basePath := filepath.Join(dir, "base-image.ext4")
-	baseData := bytes.Repeat([]byte{0x33}, 64<<10)
-	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+	// Two data runs around a hole, so the packed object has two extents
+	// whose placement the manifest alone decides.
+	baseData := make([]byte, 192<<10)
+	copy(baseData[:64<<10], bytes.Repeat([]byte{0x33}, 64<<10))
+	copy(baseData[128<<10:], bytes.Repeat([]byte{0x44}, 64<<10))
+	bf, err := os.Create(basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bf.Write(baseData[:64<<10]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bf.WriteAt(baseData[128<<10:], 128<<10); err != nil {
+		t.Fatal(err)
+	}
+	if err := bf.Close(); err != nil {
 		t.Fatal(err)
 	}
 	task := writeRestoreFixture(t, dir)
@@ -330,31 +351,39 @@ func TestMaterializeBaseRejectsUnverifiedMaster(t *testing.T) {
 	task.Files[0].BaseSHA256 = digestOf(baseData)
 	task.Generation = GenerationKey(task.Files)
 	uploadFixture(t, store, task)
+	// Slide the second run down into the hole: same digest, same size,
+	// same generation key, same packed length, wrong bytes at the wrong
+	// offsets.
+	manifestObject := genObject(task, ManifestObject)
+	var manifest GenerationManifest
+	if err := json.Unmarshal(store.objects[manifestObject], &manifest); err != nil {
+		t.Fatal(err)
+	}
+	shifted := false
+	for i := range manifest.Files {
+		ext := manifest.Files[i].Extents
+		if isSharedEntry(manifest.Files[i]) && len(ext) == 2 {
+			ext[1].Offset = ext[0].Offset + ext[0].Length
+			shifted = true
+		}
+	}
+	if !shifted {
+		t.Skip("filesystem did not report the hole; the two-extent fixture needs it")
+	}
+	mutated, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.objects[manifestObject] = mutated
+
 	cache := &CachingBaseReader{Inner: store, Dir: filepath.Join(t.TempDir(), "cache")}
-	dst, err := os.CreateTemp(t.TempDir(), "dst")
-	if err != nil {
-		t.Fatal(err)
+	_, err = RestoreGeneration(context.Background(), cache, task.SandboxID, task.Generation, filepath.Join(t.TempDir(), "restored"), nil)
+	if err == nil || !strings.Contains(err.Error(), "verify") {
+		t.Fatalf("err = %v, want verification failure", err)
 	}
-	defer dst.Close()
-	if !cache.canCloneInto(dst) {
-		t.Skip("destination cannot reflink from the cache on this filesystem")
-	}
-	object := SharedBaseObject(digestOf(baseData), "")
-	infos, err := store.List(context.Background(), object)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var mf ManifestFile
-	for _, o := range infos {
-		mf = ManifestFile{Name: SharedBaseName(digestOf(baseData)), Object: o.Name, SHA256: digestOf(baseData), Size: int64(len(baseData)) + 4096, Extents: []Extent{{Offset: 0, Length: int64(len(baseData))}}}
-	}
-	if mf.Object == "" {
-		t.Fatal("shared base object not found in store")
-	}
-	if err := cache.MaterializeBase(context.Background(), mf.Object, mf, dst); err == nil {
-		t.Fatal("altered geometry accepted")
-	}
-	if _, err := os.Stat(filepath.Join(cache.Dir, ".unpacked-"+digestOf(baseData))); err == nil {
-		t.Fatal("unverified master was published")
+	for _, name := range []string{".unpacked-", ".candidate-"} {
+		if _, err := os.Stat(filepath.Join(cache.Dir, name+digestOf(baseData))); err == nil {
+			t.Fatalf("%s copy survived a failed verification", name)
+		}
 	}
 }
