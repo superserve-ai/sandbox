@@ -380,7 +380,7 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        COALESCE(COUNT(s.id), 0)::int AS active_sandbox_count
 FROM host h
 LEFT JOIN sandbox s ON s.host_id = h.id
-  AND s.status IN ('active', 'starting')
+  AND s.status IN ('active', 'starting', 'migrating')
   AND s.destroyed_at IS NULL
 WHERE h.status = 'active'
   AND NOT EXISTS (

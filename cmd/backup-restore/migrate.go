@@ -388,15 +388,20 @@ func runMigrate(args []string) int {
 							AND timeout_seconds IS NOT DISTINCT FROM $5
 							AND (SELECT sn.generation FROM snapshot sn WHERE sn.id = sandbox.snapshot_id) = $6`,
 						*toHost, id, *fromHost, *s.snapshotID, s.origTimeout, s.generation)
-					if err == nil && tag.RowsAffected() == 0 {
-						err = fmt.Errorf("changed on %s since it was read", *fromHost)
-					}
 					if err != nil {
-						// Nothing was claimed: the row moved on or the database
-						// hiccuped. Either way a later run may succeed, so this
-						// is not written to the skip file.
+						// The write's outcome is unknown (a lost reply may have
+						// committed it): the journal entry stays, and a rerun's
+						// recovery hands back whatever was claimed.
 						mu.Lock()
 						recordRetry(id, err.Error())
+						mu.Unlock()
+						return
+					}
+					if tag.RowsAffected() == 0 {
+						// Nothing was claimed: the row moved on. A later run may
+						// find it paused again.
+						mu.Lock()
+						recordRetry(id, "changed on "+*fromHost+" since it was read")
 						if jerr := journalDone(journal, id); jerr != nil {
 							fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
 						}
@@ -428,7 +433,7 @@ func runMigrate(args []string) int {
 							pcancel()
 						}
 						if err != nil {
-							err = fmt.Errorf("apply preview policy: %w", err)
+							err = errRetry{fmt.Errorf("apply preview policy: %w", err)}
 						}
 					}
 					if err == nil {
@@ -446,7 +451,16 @@ func runMigrate(args []string) int {
 								WHERE id = $3 AND host_id = $4 AND status = 'migrating' AND destroyed_at IS NULL
 									AND timeout_seconds IS NOT DISTINCT FROM $5`,
 								int32(*tmpTimeout), ip, id, *toHost, s.origTimeout)
-							if err == nil && tag.RowsAffected() == 0 {
+							if err != nil {
+								// Outcome unknown: the row decides. Active here
+								// means the write landed and the boot stands.
+								var status string
+								if qerr := conn.QueryRow(ctx, `SELECT status::text FROM sandbox WHERE id = $1 AND host_id = $2`, id, *toHost).Scan(&status); qerr == nil && status == "active" {
+									err = nil
+								} else {
+									err = errRetry{fmt.Errorf("activation: %w", err)}
+								}
+							} else if tag.RowsAffected() == 0 {
 								err = errRetry{fmt.Errorf("claim on %s changed before activation", *toHost)}
 							}
 						}
@@ -470,19 +484,25 @@ func runMigrate(args []string) int {
 						}
 					}
 					if err != nil {
-						if _, rerr := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused', updated_at = now()
-							WHERE id = $2 AND host_id = $3 AND status = 'migrating'`, *fromHost, id, *toHost); rerr != nil {
-							err = fmt.Errorf("%v; and the claim could not be handed back: %v", err, rerr)
-						}
+						// The guest is down; give the row back. Until that write
+						// is confirmed the journal entry stays, so a rerun's
+						// recovery finishes the hand-back.
+						_, rerr := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused', updated_at = now()
+							WHERE id = $2 AND host_id = $3 AND status = 'migrating'`, *fromHost, id, *toHost)
 						mu.Lock()
 						var retry errRetry
-						if errors.As(err, &retry) {
+						switch {
+						case rerr != nil:
+							recordRetry(id, fmt.Sprintf("%v; and the claim could not be handed back yet: %v", err, rerr))
+						case errors.As(err, &retry):
 							recordRetry(id, err.Error())
-						} else {
+						default:
 							recordFailure(id, err.Error())
 						}
-						if jerr := journalDone(journal, id); jerr != nil {
-							fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
+						if rerr == nil {
+							if jerr := journalDone(journal, id); jerr != nil {
+								fmt.Printf("WARN %s: journal not updated: %v\n", id, jerr)
+							}
 						}
 						mu.Unlock()
 						return
