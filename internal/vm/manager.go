@@ -6865,10 +6865,23 @@ func (m *Manager) abortResumeLocked(vmID string) {
 	}
 	m.stopUnitDuringRestoreError(vmID)
 	inst.mu.Lock()
+	memPath := inst.MemFilePath
+	inst.mu.Unlock()
+	// PausedAt anchors the memory-staleness check a later resume runs
+	// against mem.snap's mtime (see resumeVMLocked); this abort never
+	// rewrote that file, so time.Now() here would make an untouched,
+	// still-good image look stale purely because of how long the failed
+	// attempt took. The file's own mtime is the honest answer — zero
+	// (unverifiable, not stale) if it is gone.
+	var pausedAt time.Time
+	if fi, statErr := os.Stat(memPath); statErr == nil {
+		pausedAt = fi.ModTime()
+	}
+	inst.mu.Lock()
 	inst.Status = StatusPaused
 	inst.DirtyTracked = false // FC process stopped; a fresh resume re-arms tracking.
 	inst.DirtyTrackingSessionID = ""
-	inst.PausedAt = time.Now()
+	inst.PausedAt = pausedAt
 	inst.mu.Unlock()
 	// Durable convergence is deferred: the write is unbounded fsync work
 	// and this runs on reply paths whose deadline reserve covers only the

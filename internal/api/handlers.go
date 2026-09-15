@@ -938,24 +938,10 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	snapshotPath := *claimed.SnapPath
 	memPath := resolveMemPath(snapshotPath, claimed.SnapMemPath)
 
-	// A second, narrow lookup rather than folding this into ClaimResume:
-	// that query is shared/security-sensitive claim/lease logic, and this
-	// only ever needs one column. GetSnapshotForResume's own path/mem
-	// fields are intentionally unused here — claimed.SnapPath/SnapMemPath
-	// above are already authoritative for those.
-	//
 	// "" (the common case: no report has verified a backup against this
 	// exact pause yet) tells a fetch-before-resume-enabled vmd host there
 	// is nothing to fetch, identical to today's behavior.
-	var resumeGeneration string
-	if snapshotForResume, sferr := h.DB.GetSnapshotForResume(c.Request.Context(), db.GetSnapshotForResumeParams{
-		ID:     sandbox.SnapshotID.Bytes,
-		TeamID: teamID,
-	}); sferr != nil {
-		l.Warn().Err(sferr).Msg("DB GetSnapshotForResume failed; resuming without fetch-before-resume for this attempt")
-	} else {
-		resumeGeneration = snapshotForResume.CoveredBackupGeneration
-	}
+	resumeGeneration := claimed.CoveredBackupGeneration
 
 	// Overlay-mode sandboxes need basePath for the mount-namespace symlink.
 	// Read sandbox.base_path first (pinned at create) so a template rebuild
@@ -1275,11 +1261,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 }
 
 // resolveMemPath returns the memory snapshot path given a snapshot row's
-// path and mem_path column (both GetSnapshot and GetSnapshotForResume
-// carry these, under different row types, hence the plain-value
-// signature instead of a Snapshot record). Uses the stored mem_path
-// column if set, otherwise falls back to the convention of placing
-// mem.snap alongside the vmstate snapshot.
+// path and mem_path column (GetSnapshot and ClaimResume each carry these
+// under different row types, hence the plain-value signature instead of
+// a Snapshot record). Uses the stored mem_path column if set, otherwise
+// falls back to the convention of placing mem.snap alongside the
+// vmstate snapshot.
 func resolveMemPath(path string, memPath *string) string {
 	if memPath != nil && *memPath != "" {
 		return *memPath

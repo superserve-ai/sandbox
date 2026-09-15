@@ -69,7 +69,7 @@ type Client interface {
 	// the daemon stamps it before the guest runs; the attestation reports
 	// what the daemon applied, with empty fields for a daemon from before it.
 	// generation is the backup generation VERIFIED to cover the sandbox's
-	// current snapshot, if any (e.g. from db.GetSnapshotForResume's
+	// current snapshot, if any (e.g. from db.ClaimResumeRow's
 	// covered_backup_generation) — it lets a vmd host with
 	// fetch-before-resume enabled restore artifacts missing from local
 	// disk instead of hard-failing; "" is always safe to pass and matches

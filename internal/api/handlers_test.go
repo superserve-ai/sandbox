@@ -402,26 +402,6 @@ func idRow(id uuid.UUID) *mockRow {
 	}}
 }
 
-// snapshotForResumeRow returns a mockRow matching GetSnapshotForResumeRow's
-// Scan order: the same 8 leading columns snapshotRow fills (id, sandbox_id,
-// team_id, path, size_bytes, trigger, created_at, mem_path), then
-// generation/name/pause_token (left unset, as snapshotRow also leaves
-// them), then the covered-backup-generation column this query adds.
-func snapshotForResumeRow(s db.Snapshot, coveredGeneration string) *mockRow {
-	return &mockRow{scanFn: func(dest ...any) error {
-		*dest[0].(*uuid.UUID) = s.ID
-		*dest[1].(*uuid.UUID) = s.SandboxID
-		*dest[2].(*uuid.UUID) = s.TeamID
-		*dest[3].(*string) = s.Path
-		*dest[4].(*int64) = s.SizeBytes
-		*dest[5].(*string) = s.Trigger
-		*dest[6].(*time.Time) = s.CreatedAt
-		*dest[7].(**string) = s.MemPath
-		*dest[11].(*string) = coveredGeneration
-		return nil
-	}}
-}
-
 func errorRow(err error) *mockRow {
 	return &mockRow{scanFn: func(...any) error { return err }}
 }
@@ -1051,6 +1031,15 @@ func snapshotRow(s db.Snapshot) *mockRow {
 // claimResumeRow mocks ClaimResume's RETURNING; a nil snap models a
 // missing snapshot row.
 func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, ports ...publishedPortResponse) *mockRow {
+	return claimResumeRowWithGeneration(sb, snap, access, revision, "", ports...)
+}
+
+// claimResumeRowWithGeneration is claimResumeRow plus the covered-generation
+// column, for the one test that asserts it flows into VMD.ResumeInstance —
+// every other caller has nothing to verify from it, hence the default "" on
+// the plain helper above (also production's own value when no report has
+// verified coverage of this pause).
+func claimResumeRowWithGeneration(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, coveredGeneration string, ports ...publishedPortResponse) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		if err := sandboxRow(sb).scanFn(dest[:37]...); err != nil {
 			return err
@@ -1085,6 +1074,7 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 		*dest[44].(*[]string) = accesses
 		*dest[45].(*[]int64) = versions
 		*dest[46].(**string) = nil
+		*dest[47].(*string) = coveredGeneration
 		return nil
 	}}
 }
@@ -1230,9 +1220,7 @@ func TestResumeSandbox_NamesLatestBackupGeneration(t *testing.T) {
 			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: ClaimResume :one"):
-				return claimResumeRow(sb, &snap, preview.AccessPublic, 8, publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
-			case strings.Contains(sql, "-- name: GetSnapshotForResume :one"):
-				return snapshotForResumeRow(snap, "gen-xyz")
+				return claimResumeRowWithGeneration(sb, &snap, preview.AccessPublic, 8, "gen-xyz", publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
 			default:
 				return activityRow()
 			}
@@ -1300,8 +1288,6 @@ func TestResumeSandbox_NotFoundRestoreReceivesPolicyAndReconcilesLatest(t *testi
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: ClaimResume :one"):
 				return claimResumeRow(sb, &snap, preview.AccessPublic, 7, publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
-			case strings.Contains(sql, "-- name: GetSnapshotForResume :one"):
-				return snapshotForResumeRow(snap, "")
 			default:
 				return activityRow()
 			}
@@ -1387,8 +1373,6 @@ func TestResumeSandbox_PrivatePolicyRequiresBrowserChainAndRestoresBrowserPorts(
 				return claimResumeRow(sb, &snap, preview.AccessPrivate, 8, publishedPortResponse{
 					Port: 3000, Access: preview.AccessPrivate, TokenVersion: 12,
 				})
-			case strings.Contains(sql, "-- name: GetSnapshotForResume :one"):
-				return snapshotForResumeRow(snap, "")
 			default:
 				return activityRow()
 			}
@@ -4598,8 +4582,6 @@ func TestResumeSandbox_CapabilityRefusalRevertsBeforeActivation(t *testing.T) {
 						return scalarBoolRow(false)
 					case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 						return previewPolicyRow(preview.AccessPublic, 3)
-					case strings.Contains(sql, "-- name: GetSnapshotForResume :one"):
-						return snapshotForResumeRow(snap, "")
 					case strings.Contains(sql, "FinalizePause"):
 						finalizedPause = true
 						return uuidRow(snapshotID)
@@ -4755,8 +4737,6 @@ func TestResumeSandbox_AttestationDecidesReapply(t *testing.T) {
 					case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 						policyReads++
 						return previewPolicyRow(preview.AccessPublic, tc.dbRevision)
-					case strings.Contains(sql, "-- name: GetSnapshotForResume :one"):
-						return snapshotForResumeRow(snap, "")
 					case strings.Contains(sql, "FinalizePause"):
 						return uuidRow(snapshotID)
 					case strings.Contains(sql, "FROM sandbox"):
@@ -4863,8 +4843,6 @@ func TestResumeSandbox_GuestHoldsSecretEnvSkipsInjection(t *testing.T) {
 					switch {
 					case strings.Contains(sql, "-- name: ClaimResume :one"):
 						return claimResumeRow(sb, &snap, "", 0)
-					case strings.Contains(sql, "-- name: GetSnapshotForResume :one"):
-						return snapshotForResumeRow(snap, "")
 					case strings.Contains(sql, "FROM sandbox"):
 						return sandboxRow(sb)
 					default:
@@ -4982,8 +4960,6 @@ func TestActivateSandbox_ReportsPolicyTheDaemonKept(t *testing.T) {
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessPrivate, 9)
-			case strings.Contains(sql, "-- name: GetSnapshotForResume :one"):
-				return snapshotForResumeRow(snap, "")
 			case strings.Contains(sql, "FROM sandbox"):
 				return sandboxRow(sb)
 			default:
@@ -5057,8 +5033,6 @@ func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *test
 				return previewPolicyRow(preview.AccessPrivate, 8)
 			case strings.Contains(sql, "-- name: ClaimResume :one"):
 				return claimResumeRow(sb, &snap, preview.AccessPrivate, 8, port)
-			case strings.Contains(sql, "-- name: GetSnapshotForResume :one"):
-				return snapshotForResumeRow(snap, "")
 			case strings.Contains(sql, "FinalizePause"):
 				return uuidRow(snapshotID)
 			case strings.Contains(sql, "FROM sandbox"):
@@ -5112,8 +5086,6 @@ func TestResumeSandbox_ClaimsWithoutReadingTheRow(t *testing.T) {
 				return sandboxRow(sb)
 			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
 				return previewPolicyRow(preview.AccessLegacyPublic, 0)
-			case strings.Contains(sql, "-- name: GetSnapshotForResume :one"):
-				return snapshotForResumeRow(snap, "")
 			default:
 				return activityRow()
 			}
