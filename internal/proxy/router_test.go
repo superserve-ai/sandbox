@@ -164,7 +164,7 @@ func TestRoutingHandlerPinsFailedStreamAndLooksUpNextRequest(t *testing.T) {
 	h := NewRoutingHandler([]string{"sandbox.test"}, "host-a",
 		RouteLookupFunc(func(_ context.Context, id string) (SandboxRoute, error) {
 			lookups.Add(1)
-			if id != "sandbox-1" {
+			if id != "12345678-1234-1234-1234-123456789abc" {
 				return SandboxRoute{}, errors.New("unexpected sandbox ID")
 			}
 			return owner.Load().(SandboxRoute), nil
@@ -187,8 +187,8 @@ func TestRoutingHandlerPinsFailedStreamAndLooksUpNextRequest(t *testing.T) {
 		stream = &lifecyclePeerStream{PipeReader: reader, sent: make(chan struct{})}
 		upload := []byte{byte(i), 0xff, '\r', '\n', 0x80, 0x00}
 		r := httptest.NewRequest(http.MethodPost, "http://sandbox.test/exec", bytes.NewReader(upload))
-		r.Header.Set(headerSandboxID, "sandbox-1")
-		r.Host = "8080-sandbox-1.sandbox.test"
+		r.Header.Set(headerSandboxID, "12345678-1234-1234-1234-123456789abc")
+		r.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
 		done := make(chan struct{})
 		go func() { h.ServeHTTP(hijackWriter{conn: server}, r); close(done) }()
 		select {
@@ -272,14 +272,14 @@ func TestRoutingHandlerLocalDelegatesWithoutPeer(t *testing.T) {
 			recorded = outcome.Outcome
 		}))
 	r := httptest.NewRequest(http.MethodGet, "http://sandbox.test", nil)
-	r.Header.Set(headerSandboxID, "sandbox-1")
-	r.Host = "8080-sandbox-1.sandbox.test"
+	r.Header.Set(headerSandboxID, "12345678-1234-1234-1234-123456789abc")
+	r.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	if !called || w.Code != http.StatusNoContent {
 		t.Fatalf("local route: called=%v status=%d", called, w.Code)
 	}
-	if lookupID != "sandbox-1" {
+	if lookupID != "12345678-1234-1234-1234-123456789abc" {
 		t.Fatalf("lookup sandbox ID=%q", lookupID)
 	}
 	if recorded != "local" {
@@ -297,8 +297,8 @@ func TestRoutingHandlerPeerFailureIsVisible(t *testing.T) {
 			recorded = outcome.Outcome
 		}))
 	r := httptest.NewRequest(http.MethodGet, "http://sandbox.test", nil)
-	r.Header.Set(headerSandboxID, "sandbox-1")
-	r.Host = "8080-sandbox-1.sandbox.test"
+	r.Header.Set(headerSandboxID, "12345678-1234-1234-1234-123456789abc")
+	r.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusBadGateway {
@@ -331,8 +331,8 @@ func TestRoutingHandlerLookupFailureIsVisible(t *testing.T) {
 		recorded = outcome.Outcome
 	})
 	r := httptest.NewRequest(http.MethodGet, "http://sandbox.test", nil)
-	r.Header.Set(headerSandboxID, "sandbox-1")
-	r.Host = "8080-sandbox-1.sandbox.test"
+	r.Header.Set(headerSandboxID, "12345678-1234-1234-1234-123456789abc")
+	r.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusBadGateway {
@@ -349,8 +349,8 @@ func TestRoutingHandlerLookupFailureDoesNotInvokeLocalHandler(t *testing.T) {
 		RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) { return SandboxRoute{}, errors.New("missing") }), nil,
 		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true }), zerolog.Nop())
 	r := httptest.NewRequest(http.MethodGet, "http://sandbox.test", nil)
-	r.Header.Set(headerSandboxID, "sandbox-1")
-	r.Host = "8080-sandbox-1.sandbox.test"
+	r.Header.Set(headerSandboxID, "12345678-1234-1234-1234-123456789abc")
+	r.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	if called {
@@ -365,8 +365,8 @@ func TestRoutingHandlerRejectsInvalidPeerEndpointBeforeOpenStream(t *testing.T) 
 			return SandboxRoute{Generation: 42, HostID: "host-b", ProxyAddr: "   "}, nil
 		}), peers, http.NotFoundHandler(), zerolog.Nop())
 	r := httptest.NewRequest(http.MethodGet, "http://sandbox.test", nil)
-	r.Header.Set(headerSandboxID, "sandbox-1")
-	r.Host = "8080-sandbox-1.sandbox.test"
+	r.Header.Set(headerSandboxID, "12345678-1234-1234-1234-123456789abc")
+	r.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusBadGateway {
@@ -423,8 +423,8 @@ func TestRoutingHandlerRecordsLookupTiming(t *testing.T) {
 				return SandboxRoute{Generation: 42, HostID: "host-a", ProxyAddr: "127.0.0.1:5009"}, tc.err
 			}), nil, http.NotFoundHandler(), zerolog.Nop(), recorder)
 			req := httptest.NewRequest("GET", "http://sandbox.test/", nil)
-			req.Header.Set(headerSandboxID, "sandbox-1")
-			req.Host = "8080-sandbox-1.sandbox.test"
+			req.Header.Set(headerSandboxID, "12345678-1234-1234-1234-123456789abc")
+			req.Host = "8080-12345678-1234-1234-1234-123456789abc.sandbox.test"
 			router.ServeHTTP(httptest.NewRecorder(), req)
 			if recorder.count != 1 || recorder.lookup.Duration <= 0 || recorder.lookup.Result != tc.result {
 				t.Fatalf("lookup=%+v count=%d", recorder.lookup, recorder.count)
@@ -699,15 +699,27 @@ func TestRoutingHandlerRejectsMissingGenerationBeforeOpenStream(t *testing.T) {
 		return SandboxRoute{HostID: "host-b", ProxyAddr: "192.0.2.2:5009"}, nil
 	}), peers, http.NotFoundHandler(), zerolog.Nop())
 	w := httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://8080-sandbox-1.sandbox.test/", nil))
+	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "http://8080-12345678-1234-1234-1234-123456789abc.sandbox.test/", nil))
 	if w.Code != http.StatusBadGateway || peers.called {
 		t.Fatalf("status=%d peers=%+v", w.Code, peers)
 	}
 }
 
-func TestRoutingHandlerMalformedHostDoesNotRecordOwnershipFailure(t *testing.T) {
-	for _, host := range []string{"scanner.example", "70000-sandbox-1.sandbox.test"} {
-		t.Run(host, func(t *testing.T) {
+func TestRoutingHandlerInvalidInputDoesNotResolveOwnership(t *testing.T) {
+	for _, tc := range []struct {
+		host   string
+		status int
+	}{
+		{"scanner.example", http.StatusBadRequest},
+		{"70000-12345678-1234-1234-1234-123456789abc.sandbox.test", http.StatusBadRequest},
+		{"8080-not-a-uuid.sandbox.test", http.StatusBadRequest},
+		{"boxd-not-a-uuid.sandbox.test", http.StatusBadRequest},
+		{"1-12345678-1234-1234-1234-123456789abc.sandbox.test", http.StatusForbidden},
+		{"22-12345678-1234-1234-1234-123456789abc.sandbox.test", http.StatusForbidden},
+		{"1023-12345678-1234-1234-1234-123456789abc.sandbox.test", http.StatusForbidden},
+		{"22-not-a-uuid.sandbox.test", http.StatusForbidden},
+	} {
+		t.Run(tc.host, func(t *testing.T) {
 			recorder := &lookupRecorder{}
 			var lookups int
 			peers := &trackingPeerStub{}
@@ -715,10 +727,10 @@ func TestRoutingHandlerMalformedHostDoesNotRecordOwnershipFailure(t *testing.T) 
 				lookups++
 				return SandboxRoute{}, errors.New("unexpected lookup")
 			}), peers, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("unexpected local handler") }), zerolog.Nop(), recorder)
-			request := httptest.NewRequest(http.MethodGet, "http://"+host+"/", nil)
+			request := httptest.NewRequest(http.MethodGet, "http://"+tc.host+"/", nil)
 			response := httptest.NewRecorder()
 			router.ServeHTTP(response, request)
-			if response.Code != http.StatusBadRequest {
+			if response.Code != tc.status {
 				t.Fatalf("status=%d", response.Code)
 			}
 			if lookups != 0 || peers.called || recorder.count != 0 || recorder.outcomes != 0 {
