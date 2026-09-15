@@ -1,38 +1,53 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/superserve-ai/sandbox/internal/backup"
 )
 
-func TestRestoredDiskRequiresOverlayAndOneBase(t *testing.T) {
+func TestRestoredDiskFollowsTheRestoreMarker(t *testing.T) {
 	root := t.TempDir()
-	touch := func(parts ...string) {
-		p := filepath.Join(append([]string{root}, parts...)...)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+	sha := strings.Repeat("a", 64)
+	write := func(id string, manifest backup.GenerationManifest, files ...string) {
+		dir := filepath.Join(root, id)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(p, nil, 0o644); err != nil {
+		raw, _ := json.Marshal(manifest)
+		if err := os.WriteFile(filepath.Join(dir, backup.ManifestObject), raw, 0o644); err != nil {
 			t.Fatal(err)
+		}
+		for _, f := range files {
+			if err := os.WriteFile(filepath.Join(dir, f), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
-	if _, _, err := restoredDisk(root, "a"); err == nil {
+	if _, _, _, err := restoredDisk(root, "none"); err == nil {
 		t.Fatal("missing restore accepted")
 	}
-	touch("a", "manifest.json")
-	touch("a", "rootfs.ext4")
-	if _, _, err := restoredDisk(root, "a"); err == nil {
-		t.Fatal("overlay without base accepted")
+	write("overlay", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "rootfs.ext4", BaseSHA256: sha}}}, "rootfs.ext4")
+	if _, _, _, err := restoredDisk(root, "overlay"); err == nil {
+		t.Fatal("overlay without its base accepted")
 	}
-	touch("a", "base-1111.ext4")
-	disk, base, err := restoredDisk(root, "a")
-	if err != nil || filepath.Base(disk) != "rootfs.ext4" || filepath.Base(base) != "base-1111.ext4" {
-		t.Fatalf("got %q %q %v", disk, base, err)
+	write("overlay", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "rootfs.ext4", BaseSHA256: sha}}}, "rootfs.ext4", backup.SharedBaseName(sha))
+	disk, base, standalone, err := restoredDisk(root, "overlay")
+	if err != nil || standalone || filepath.Base(disk) != "rootfs.ext4" || filepath.Base(base) != backup.SharedBaseName(sha) {
+		t.Fatalf("overlay: %q %q %v %v", disk, base, standalone, err)
 	}
-	touch("a", "base-2222.ext4")
-	if _, _, err := restoredDisk(root, "a"); err == nil {
-		t.Fatal("ambiguous base accepted")
+	write("full", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "rootfs.ext4"}}}, "rootfs.ext4")
+	disk, base, standalone, err = restoredDisk(root, "full")
+	if err != nil || !standalone || base != "" || filepath.Base(disk) != "rootfs.ext4" {
+		t.Fatalf("full image: %q %q %v %v", disk, base, standalone, err)
+	}
+	write("norootfs", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "vmstate.snap"}}}, "vmstate.snap")
+	if _, _, _, err := restoredDisk(root, "norootfs"); err == nil {
+		t.Fatal("marker without a rootfs accepted")
 	}
 }
 

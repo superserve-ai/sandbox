@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -49,8 +50,10 @@ import (
 //
 // Operator tool, run on the destination host next to vmd with the same
 // database credentials vmd uses. Sandboxes that fail to boot are recorded
-// so a rerun does not retry them; rows the reconciler failed after a boot
-// are reverted to the source host.
+// so a rerun does not retry them. A row the control plane failed after
+// the boot is left failed and reported: that transition already dropped
+// the sandbox's secret bindings and auto-delete, so putting it back to
+// paused would hide a loss.
 func runMigrate(args []string) int {
 	fs := flag.NewFlagSet("migrate", flag.ExitOnError)
 	dbURL := fs.String("db-url", os.Getenv("DATABASE_URL"), "control-plane DB URL (default $DATABASE_URL)")
@@ -71,6 +74,10 @@ func runMigrate(args []string) int {
 	}
 	if *fromHost == *toHost {
 		fmt.Fprintln(os.Stderr, "migrate: -from-host and -to-host are the same host")
+		return 2
+	}
+	if *inflight <= 0 || *concurrency <= 0 || *tmpTimeout <= 0 {
+		fmt.Fprintln(os.Stderr, "migrate: -inflight, -concurrency and -pause-timeout-seconds must be positive")
 		return 2
 	}
 	ctx := context.Background()
@@ -123,7 +130,7 @@ func runMigrate(args []string) int {
 		if skip[id] {
 			continue
 		}
-		if _, _, err := restoredDisk(*root, id); err != nil {
+		if _, _, _, err := restoredDisk(*root, id); err != nil {
 			notRestored++
 			continue
 		}
@@ -164,24 +171,11 @@ func runMigrate(args []string) int {
 			fmt.Fprintf(failFile, "%s %s\n", id, why)
 		}
 	}
-	// Rows flipped here whose VM the reconciler then failed go back where
-	// they were, including the timeout they had (none, for most).
-	revert := func(ids, hadNoTimeout []string) {
-		if len(ids) == 0 {
-			return
-		}
-		if _, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused',
-				timeout_seconds = CASE WHEN id = ANY($4::uuid[]) THEN NULL ELSE timeout_seconds END, updated_at = now()
-			WHERE id = ANY($2::uuid[]) AND host_id = $3 AND status IN ('active', 'failed')`, *fromHost, ids, *toHost, hadNoTimeout); err != nil {
-			fmt.Printf("WARN revert of %d rows failed: %v; they are pinned to %s\n", len(ids), err, *toHost)
-		}
-	}
-
 	started := time.Now()
 	for len(queue) > 0 || len(active) > 0 {
 		// Settle what the reaper finished: paused rows are done (their
-		// temporary timeout cleared), failed rows are reverted, and a row
-		// active past the wait is reported and left alone for a human.
+		// temporary timeout cleared); failed rows and rows active past the
+		// wait are reported and left for a human.
 		if len(active) > 0 {
 			ids := make([]string, 0, len(active))
 			for id := range active {
@@ -223,15 +217,10 @@ func runMigrate(args []string) int {
 					fmt.Printf("WARN clearing the temporary timeout on %d rows failed: %v\n", len(clear), err)
 				}
 			}
-			var goneNoTimeout []string
 			for _, id := range gone {
-				if !active[id].hadTimeout {
-					goneNoTimeout = append(goneNoTimeout, id)
-				}
 				delete(active, id)
-				recordFailure(id, "row failed after boot; reverted to the source host")
+				recordFailure(id, "row failed after boot and stays failed on "+*toHost+"; needs an operator")
 			}
-			revert(gone, goneNoTimeout)
 			for id, l := range active {
 				if time.Since(l.since) > *pauseWait {
 					delete(active, id)
@@ -289,7 +278,7 @@ func runMigrate(args []string) int {
 			sem := make(chan struct{}, *concurrency)
 			booted := 0
 			for id, s := range shapes {
-				disk, base, err := restoredDisk(*root, id)
+				disk, base, standalone, err := restoredDisk(*root, id)
 				if err != nil {
 					mu.Lock()
 					recordFailure(id, err.Error())
@@ -303,7 +292,7 @@ func runMigrate(args []string) int {
 					defer func() { <-sem }()
 					rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 					_, err := vmd.ReviveVM(rctx, &vmdpb.ReviveVMRequest{
-						VmId: id, DiskPath: disk, BasePath: base, AllowRecordless: true,
+						VmId: id, DiskPath: disk, BasePath: base, StandaloneDisk: standalone, AllowRecordless: true,
 						TeamId: s.team, Vcpu: uint32(s.vcpu), MemMib: uint32(s.mem),
 						AllowedCidrs: s.rules.allowedCIDRs, DeniedCidrs: s.rules.deniedCIDRs, AllowedDomains: s.rules.allowedDomains,
 					})
@@ -381,23 +370,38 @@ func parseEgressRules(raw []byte) (egressRules, error) {
 	return r, nil
 }
 
-// restoredDisk locates a host restore's output for one sandbox: the
-// overlay and the base it was materialized against. Both must be present;
-// an overlay without its base boots a filesystem full of holes.
-func restoredDisk(root, id string) (disk, base string, err error) {
+// restoredDisk reads a host restore's completion marker for one sandbox
+// and locates what ReviveVM needs: the rootfs, and either the base it was
+// materialized against or the fact that it stands alone (a generation
+// uploaded as a full image has no base dependency).
+func restoredDisk(root, id string) (disk, base string, standalone bool, err error) {
 	dir := filepath.Join(root, id)
-	if _, err := os.Stat(filepath.Join(dir, "manifest.json")); err != nil {
-		return "", "", fmt.Errorf("not restored")
+	raw, err := os.ReadFile(filepath.Join(dir, backup.ManifestObject))
+	if err != nil {
+		return "", "", false, fmt.Errorf("not restored")
 	}
-	disk = filepath.Join(dir, "rootfs.ext4")
-	if _, err := os.Stat(disk); err != nil {
-		return "", "", fmt.Errorf("restored without a rootfs")
+	var manifest backup.GenerationManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return "", "", false, fmt.Errorf("restore marker: %w", err)
 	}
-	bases, _ := filepath.Glob(filepath.Join(dir, "base-*.ext4"))
-	if len(bases) != 1 {
-		return "", "", fmt.Errorf("expected one base image, found %d", len(bases))
+	for _, f := range manifest.Files {
+		if f.Name != "rootfs.ext4" {
+			continue
+		}
+		disk = filepath.Join(dir, f.Name)
+		if _, err := os.Stat(disk); err != nil {
+			return "", "", false, fmt.Errorf("restored without a rootfs")
+		}
+		if f.BaseSHA256 == "" {
+			return disk, "", true, nil
+		}
+		base = filepath.Join(dir, backup.SharedBaseName(f.BaseSHA256))
+		if _, err := os.Stat(base); err != nil {
+			return "", "", false, fmt.Errorf("restored without its base %s", f.BaseSHA256)
+		}
+		return disk, base, false, nil
 	}
-	return disk, bases[0], nil
+	return "", "", false, fmt.Errorf("restore marker lists no rootfs")
 }
 
 func loadSkipSet(path string) map[string]bool {
