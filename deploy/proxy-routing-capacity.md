@@ -1,8 +1,8 @@
 # Proxy routing production prerequisites
 
 Keep each cell's GitHub routing variable unset or `0` until these steps and the
-host-generation rollout are complete for that cell. No routing credential is
-installed while routing is disabled.
+host-generation rollout are complete for its remote destinations. No routing
+credential is installed while routing is disabled.
 
 | GitHub Environment | Cell | Routing variable | Routing database secret |
 | --- | --- | --- | --- |
@@ -89,12 +89,22 @@ production. Selecting `production_cell=use4` instead deploys only east after
 staging. Production serving deployments still require staging to succeed;
 staging routing does not need to be enabled.
 
-To disable routing, set the affected cell's routing variable to `0` and redeploy
-that cell. Keep its ingress setting enabled while the routing-disabled
-configuration reaches every source host and existing streams drain. Only then clear
-the independent ingress settings and deploy again. Routing being enabled always
-forces ingress on; turning routing off does not remove an independently enabled
-listener. Manual standby deployment continues enabling ingress automatically.
+Production outbound routing and serving ingress are independent. To deploy an
+outbound-only source in either production cell, set its routing variable to `1`
+and leave its ingress variable unset or `0`. Its peer listener stays empty and
+client credentials are loaded. Local ownership is recognized using the proxy's
+configured `HOST_ID`, including legacy IDs; every remote destination still needs
+an authoritative peer endpoint. Manual standby deployment enables ingress even
+when routing is disabled. Staging retains its existing behavior: routing enabled
+forces `auto`; otherwise `PEER_PROXY_LISTEN_ADDR_STAGING` selects ingress.
+
+To disable outbound routing, set the source cell's routing variable to `0` and
+redeploy that cell. This does not disable independently configured ingress.
+Before removing ingress from a destination or rolling it back to an older binary,
+disable routing on every source that can reach that destination and let existing
+streams drain. Then clear the destination's serving ingress setting and redeploy.
+An outbound-only source does not need its own listener for rollback or routing;
+keep ingress on destinations that other sources still use.
 
 Readiness accepts an acknowledged heartbeat from the current VMD invocation,
 including identity-bound hosts retaining the legacy `default` ID. Bound hosts
