@@ -120,3 +120,9 @@ variable "active_sandbox_host" {
     error_message = "active_sandbox_host must be primary or standby."
   }
 }
+
+variable "standby_host_id" {
+  description = "The standby's HOST_ID as vmd registers it (the installed host identity, not the slot name); DEFAULT_HOST_ID and alert filters follow it when active_sandbox_host is standby."
+  type        = string
+  default     = "usw2-2"
+}
