@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -18,13 +19,14 @@ import (
 // RoutingHandler selects an owner once, then delegates locally or bridges one
 // opaque stream to the owner's private peer ingress.
 type RoutingHandler struct {
-	domains     []string
-	localHostID string
-	ownership   OwnershipResolver
-	peers       PeerTransport
-	local       http.Handler
-	log         zerolog.Logger
-	recorder    telemetry.RoutingOutcomeRecorder
+	domains              []string
+	localHostID          string
+	ownership            OwnershipResolver
+	peers                PeerTransport
+	local                http.Handler
+	log                  zerolog.Logger
+	recorder             telemetry.RoutingOutcomeRecorder
+	halfCloseIdleTimeout time.Duration
 }
 
 func NewRoutingHandler(domains []string, localHostID string, ownership OwnershipResolver, peers PeerTransport, local http.Handler, log zerolog.Logger, recorders ...telemetry.RoutingOutcomeRecorder) *RoutingHandler {
@@ -32,7 +34,7 @@ func NewRoutingHandler(domains []string, localHostID string, ownership Ownership
 	if len(recorders) > 0 {
 		recorder = recorders[0]
 	}
-	return &RoutingHandler{domains: domains, localHostID: localHostID, ownership: ownership, peers: peers, local: local, log: log, recorder: recorder}
+	return &RoutingHandler{domains: domains, localHostID: localHostID, ownership: ownership, peers: peers, local: local, log: log, recorder: recorder, halfCloseIdleTimeout: httpHalfCloseIdleTimeout}
 }
 
 func (h *RoutingHandler) record(ctx context.Context, outcome, hostID string) {
@@ -107,7 +109,7 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	h.log.Debug().Str("route", "remote").Str("route_outcome", "remote").Str("host_id", route.HostID).Msg("sandbox routed to peer")
 	defer stream.Close()
-	if err := bridgeRequest(w, r, stream); err != nil {
+	if err := bridgeRequestWithIdleTimeout(w, r, stream, h.halfCloseIdleTimeout); err != nil {
 		h.record(r.Context(), "peer_error", route.HostID)
 		h.log.Warn().Str("route_outcome", "peer_stream_error").Err(err).Msg("peer stream failed")
 		return
@@ -121,6 +123,8 @@ type bridgeResponseWriter struct {
 	conn              net.Conn
 	mu                sync.Mutex
 	started, finished bool
+	lastProgress      atomic.Int64
+	progressEpoch     time.Time
 }
 
 func (w *bridgeResponseWriter) Write(p []byte) (int, error) {
@@ -131,6 +135,9 @@ func (w *bridgeResponseWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.conn.Write(p)
 	w.started = w.started || n > 0
+	if n > 0 {
+		w.lastProgress.Store(int64(time.Since(w.progressEpoch)))
+	}
 	return n, err
 }
 
@@ -156,7 +163,15 @@ func (w *bridgeResponseWriter) finish(err error) {
 	_ = w.conn.Close()
 }
 
+// A clean TCP EOF does not distinguish a half-close from an abandoned client.
+// Bound silent upstream retention while allowing a half-closed client to read.
+const httpHalfCloseIdleTimeout = 30 * time.Second
+
 func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) error {
+	return bridgeRequestWithIdleTimeout(w, r, stream, httpHalfCloseIdleTimeout)
+}
+
+func bridgeRequestWithIdleTimeout(w http.ResponseWriter, r *http.Request, stream PeerStream, idleTimeout time.Duration) error {
 	// A peer stream is a raw connection. Hijacking preserves websocket, upgrade,
 	// streaming, and upload semantics without parsing application payloads.
 	hj, ok := w.(http.Hijacker)
@@ -168,7 +183,7 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 		return err
 	}
 	defer conn.Close()
-	output := &bridgeResponseWriter{conn: conn}
+	output := &bridgeResponseWriter{conn: conn, progressEpoch: time.Now()}
 	defer stream.Close()
 	// Request.Write owns both headers and transfer framing, including chunked
 	// bodies and trailers. Run it alongside the response pump for early replies.
@@ -226,11 +241,31 @@ func bridgeRequest(w http.ResponseWriter, r *http.Request, stream PeerStream) er
 				closeBoth(err)
 			}
 		} else {
-			// Hijacking disables net/http's disconnect watcher. Once the body
-			// is consumed, drain without forwarding pipelined requests so EOF
-			// cancels a quiet upstream as well.
-			_, _ = io.Copy(io.Discard, conn)
-			closeBoth(nil)
+			// Drain without forwarding pipelined requests. A clean EOF only
+			// closes the sending direction; keep delivering response bytes.
+			if _, err := io.Copy(io.Discard, conn); err != nil {
+				closeBoth(err)
+				return
+			}
+			baseline := time.Since(output.progressEpoch)
+			timer := time.NewTimer(idleTimeout)
+			defer timer.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-timer.C:
+					if progress := time.Duration(output.lastProgress.Load()); progress > baseline {
+						baseline = progress
+					}
+					remaining := idleTimeout - (time.Since(output.progressEpoch) - baseline)
+					if remaining <= 0 {
+						closeBoth(fmt.Errorf("half-closed HTTP response idle timeout"))
+						return
+					}
+					timer.Reset(remaining)
+				}
+			}
 		}
 		// HTTP framing ends the body. A TCP half-close at the destination would
 		// cancel net/http's request context before its reverse proxy responds.

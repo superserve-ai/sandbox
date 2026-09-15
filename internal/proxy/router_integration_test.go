@@ -168,9 +168,11 @@ func TestRoutingHandlerClientDisconnectCancelsUpstream(t *testing.T) {
 	defer target.Close()
 	defer close(stop)
 	peers, peerAddr, sandboxHost := startRoutingTestOwner(t, target)
-	router := httptest.NewServer(NewRoutingHandler([]string{"sandbox.test"}, "host-a", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+	handler := NewRoutingHandler([]string{"sandbox.test"}, "host-a", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
 		return SandboxRoute{Generation: 42, HostID: "host-b", ProxyAddr: peerAddr}, nil
-	}), peers, http.NotFoundHandler(), zerolog.Nop()))
+	}), peers, http.NotFoundHandler(), zerolog.Nop())
+	handler.halfCloseIdleTimeout = 100 * time.Millisecond
+	router := httptest.NewServer(handler)
 	defer router.Close()
 	client, err := net.Dial("tcp", router.Listener.Addr().String())
 	if err != nil {
@@ -263,6 +265,72 @@ func TestRoutingHandlerUnavailablePeerTargetReturns502(t *testing.T) {
 			if opens.Load()-before != 1 {
 				t.Fatal("failed request was replayed")
 			}
+		})
+	}
+}
+
+func TestRoutingHandlerHTTPHalfClosePreservesResponse(t *testing.T) {
+	for _, streaming := range []bool{false, true} {
+		t.Run(fmt.Sprint("streaming=", streaming), func(t *testing.T) {
+			started := make(chan struct{})
+			release := make(chan struct{})
+			target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				close(started)
+				select {
+				case <-release:
+				case <-r.Context().Done():
+					return
+				}
+				if streaming {
+					for i := 0; i < 5; i++ {
+						io.WriteString(w, "chunk")
+						w.(http.Flusher).Flush()
+						time.Sleep(300 * time.Millisecond)
+					}
+				} else {
+					io.WriteString(w, "response after half-close")
+				}
+			}))
+			defer target.Close()
+			peers, peerAddr, sandboxHost := startRoutingTestOwner(t, target)
+			handler := NewRoutingHandler([]string{"sandbox.test"}, "host-a", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+				return SandboxRoute{Generation: 42, HostID: "host-b", ProxyAddr: peerAddr}, nil
+			}), peers, http.NotFoundHandler(), zerolog.Nop())
+			handler.halfCloseIdleTimeout = time.Second
+			router := httptest.NewServer(handler)
+			defer router.Close()
+			client, err := net.Dial("tcp", router.Listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			client.SetDeadline(time.Now().Add(5 * time.Second))
+			fmt.Fprintf(client, "GET /wait HTTP/1.1\r\nHost: %s\r\n\r\n", sandboxHost)
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatal("upstream did not start")
+			}
+			if err := client.(*net.TCPConn).CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			// Leave the owner quiet long enough for the edge to observe the FIN.
+			time.Sleep(100 * time.Millisecond)
+			close(release)
+			response, err := http.ReadResponse(bufio.NewReader(client), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			body, err := io.ReadAll(response.Body)
+			want := "response after half-close"
+			if streaming {
+				want = strings.Repeat("chunk", 5)
+			}
+			if err != nil || response.StatusCode != http.StatusOK || string(body) != want {
+				t.Fatalf("status=%d body=%q err=%v", response.StatusCode, body, err)
+			}
+
 		})
 	}
 }
