@@ -53,9 +53,11 @@ import (
 //
 // A restored copy is only booted when it is the sandbox's current pause:
 // the digests the control plane recorded for the row's snapshot must all
-// appear in the restored generation (or, for a snapshot with no recorded
-// digests, the snapshot must predate the restore). A sandbox its owner
-// resumed and paused again since the restore is skipped for a fresh one.
+// appear in the restored generation, and the flip is fenced on that same
+// snapshot so a pause completed during the boot is never overwritten. A
+// sandbox its owner resumed and paused again since the restore is skipped
+// for a fresh one; one whose snapshot has no recorded digests is skipped
+// as unverifiable.
 //
 // Egress rules are re-read from the row and applied at boot, as vmd does
 // not persist them. Secret bindings are re-minted by the control plane on
@@ -193,7 +195,7 @@ func runMigrate(args []string) int {
 		restores    int    // write-back attempts so far
 	}
 	active := map[string]live{} // booted here, waiting for the reaper
-	moved, failed, stuck, stale := 0, 0, 0, 0
+	moved, failed, stuck, stale, unanchored := 0, 0, 0, 0, 0
 	failFile, _ := os.OpenFile(filepath.Join(*root, "migrate-failed.txt"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if failFile != nil {
 		defer failFile.Close()
@@ -307,12 +309,12 @@ func runMigrate(args []string) int {
 				origTimeout *int32
 				rules       egressRules
 				recorded    map[string]string
-				snapshotAt  time.Time
+				snapshotID  *string
 			}
 			shapes := map[string]shape{}
 			sq, err := conn.Query(ctx, `SELECT s.id::text, s.vcpu_count, s.memory_mib, s.team_id::text, s.timeout_seconds, s.network_config,
 					COALESCE((SELECT json_object_agg(am.file_name, am.sha256) FROM artifact_manifest am WHERE am.snapshot_id = s.snapshot_id), '{}')::text,
-					(SELECT sn.created_at FROM snapshot sn WHERE sn.id = s.snapshot_id)
+					s.snapshot_id::text
 				FROM sandbox s WHERE s.id = ANY($1::uuid[]) AND s.host_id = $2 AND s.status = 'paused' AND s.destroyed_at IS NULL`, batch, *fromHost)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
@@ -322,8 +324,7 @@ func runMigrate(args []string) int {
 				var id, recorded string
 				var s shape
 				var raw []byte
-				var snapshotAt *time.Time
-				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &snapshotAt); err != nil {
+				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw, &recorded, &s.snapshotID); err != nil {
 					sq.Close()
 					fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
 					return 1
@@ -335,9 +336,6 @@ func runMigrate(args []string) int {
 				if err := json.Unmarshal([]byte(recorded), &s.recorded); err != nil {
 					recordFailure(id, "recorded digests: "+err.Error())
 					continue
-				}
-				if snapshotAt != nil {
-					s.snapshotAt = *snapshotAt
 				}
 				shapes[id] = s
 			}
@@ -358,7 +356,14 @@ func runMigrate(args []string) int {
 			booted := 0
 			for id, s := range shapes {
 				rd, err := restoredDisk(*root, id)
-				if err == nil && !rd.current(s.recorded, s.snapshotAt) {
+				if err == nil && (len(s.recorded) == 0 || s.snapshotID == nil) {
+					mu.Lock()
+					unanchored++
+					fmt.Printf("SKIP %s: its current snapshot has no recorded digests, so no restored copy can be shown to match it\n", id)
+					mu.Unlock()
+					continue
+				}
+				if err == nil && !rd.current(s.recorded) {
 					// Not a failure of the sandbox: the copy is behind its
 					// owner's latest pause. Clear it so the next host restore
 					// materializes the current one, and leave the id eligible.
@@ -409,28 +414,36 @@ func runMigrate(args []string) int {
 					var tag pgconn.CommandTag
 					flippedAt := time.Now()
 					if err == nil {
+						// Fenced on the snapshot whose digests were checked: a
+						// pause the owner completed during the boot changes it,
+						// and that newer state must not be replaced.
 						tag, err = conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'active',
 								timeout_seconds = $2, updated_at = now()
-							WHERE id = $3 AND host_id = $4 AND status = 'paused' AND destroyed_at IS NULL`,
-							*toHost, int32(*tmpTimeout), id, *fromHost)
+							WHERE id = $3 AND host_id = $4 AND status = 'paused' AND destroyed_at IS NULL AND snapshot_id = $5`,
+							*toHost, int32(*tmpTimeout), id, *fromHost, *s.snapshotID)
 					}
-					mu.Lock()
-					defer mu.Unlock()
 					if err == nil && tag.RowsAffected() == 0 {
-						err = fmt.Errorf("no longer paused on %s", *fromHost)
+						err = fmt.Errorf("no longer paused on %s at the snapshot that was checked", *fromHost)
 					}
 					if err != nil {
+						// Take the boot back down without holding the batch
+						// lock: other workers are waiting to flip rows whose
+						// VMs are already running.
 						dctx, dcancel := context.WithTimeout(ctx, time.Minute)
 						_, derr := vmd.DestroyVM(dctx, &vmdpb.DestroyVMRequest{VmId: id, Force: true})
 						dcancel()
 						if derr != nil {
 							err = fmt.Errorf("%v; and the booted VM could not be destroyed: %v", err, derr)
 						}
+						mu.Lock()
 						recordFailure(id, err.Error())
+						mu.Unlock()
 						return
 					}
+					mu.Lock()
 					booted++
 					active[id] = live{since: flippedAt, origTimeout: s.origTimeout}
+					mu.Unlock()
 				}(id, s)
 			}
 			wg.Wait()
@@ -441,8 +454,8 @@ func runMigrate(args []string) int {
 			time.Sleep(10 * time.Second)
 		}
 	}
-	fmt.Printf("migrate complete: moved=%d failed=%d stuck=%d stale=%d in %s\n", moved, failed, stuck, stale, time.Since(started).Round(time.Second))
-	if failed+stuck+stale > 0 {
+	fmt.Printf("migrate complete: moved=%d failed=%d stuck=%d stale=%d unverifiable=%d in %s\n", moved, failed, stuck, stale, unanchored, time.Since(started).Round(time.Second))
+	if failed+stuck+stale+unanchored > 0 {
 		return 1
 	}
 	return 0
@@ -547,7 +560,6 @@ type restored struct {
 	disk, base string
 	standalone bool
 	manifest   backup.GenerationManifest
-	restoredAt time.Time // the completion marker's write time
 }
 
 func restoredDisk(root, id string) (restored, error) {
@@ -560,9 +572,6 @@ func restoredDisk(root, id string) (restored, error) {
 	}
 	if err := json.Unmarshal(raw, &r.manifest); err != nil {
 		return r, fmt.Errorf("restore marker: %w", err)
-	}
-	if fi, err := os.Stat(marker); err == nil {
-		r.restoredAt = fi.ModTime()
 	}
 	for _, f := range r.manifest.Files {
 		if f.Name != "rootfs.ext4" {
@@ -587,12 +596,14 @@ func restoredDisk(root, id string) (restored, error) {
 
 // current reports whether the restored generation is the sandbox's
 // current pause: every digest the control plane recorded for the row's
-// snapshot appears in it, or, when nothing was recorded, the snapshot was
-// taken before the restore completed. A stale copy is removed so the
-// next host restore replaces it; the sandbox itself stays eligible.
-func (r restored) current(recorded map[string]string, snapshotAt time.Time) bool {
+// snapshot appears in it. A snapshot with no recorded digests cannot be
+// matched to a generation at all (manifests carry no capture time, and
+// the local marker's time says only when the copy landed), so such a
+// sandbox is not booted. A stale copy is removed so the next host restore
+// replaces it; the sandbox itself stays eligible.
+func (r restored) current(recorded map[string]string) bool {
 	if len(recorded) == 0 {
-		return !snapshotAt.IsZero() && snapshotAt.Before(r.restoredAt)
+		return false
 	}
 	have := map[string]string{}
 	for _, f := range r.manifest.Files {
