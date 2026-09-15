@@ -24,16 +24,21 @@ class DeployTargetTests(unittest.TestCase):
             script = gate.split('        run: |\n', 1)[1]
             staging = workflow.split('  deploy-staging:\n', 1)[1].split('    steps:', 1)[0]
             self.assertRegex(staging, r'needs: \[[^\]]*migration-gate[^\]]*\]')
-            cases = [('push', '', 1 if kind == 'vmd' else 0), ('push', 'false', 1),
-                     ('push', 'true', 0), ('workflow_dispatch', 'false', 0)]
-            if kind == 'vmd':
-                cases.extend([('push', 'TRUE', 1), ('push', '1', 1), ('push', ' true ', 1),
-                              ('workflow_dispatch', '', 0), ('workflow_dispatch', 'true', 0)])
+            cases = [(event, ready, int(event == 'push' and ready != 'true'))
+                     for event in ('push', 'workflow_dispatch')
+                     for ready in (None, '', 'false', 'true', 'TRUE', '1', 'tru', ' true ')]
             for event, ready, expected in cases:
                 with self.subTest(kind=kind, event=event, ready=ready):
+                    env = dict(os.environ, DEPLOY_EVENT=event)
+                    env.pop('ROLLOUT_READY', None)
+                    if ready is not None:
+                        env['ROLLOUT_READY'] = ready
                     result = subprocess.run(['bash', '-eu', '-c', script], capture_output=True,
-                                            env=dict(os.environ, DEPLOY_EVENT=event, ROLLOUT_READY=ready))
-                    self.assertEqual(result.returncode, expected)
+                                            env=env, text=True)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    if expected:
+                        if kind == 'proxy' or ready is not None:
+                            self.assertIn('use the coordinated manual rollout procedure', result.stderr)
 
     def deploy_selection(self, rows, region="us-central1", expected="example-standby"):
         spec = importlib.util.spec_from_file_location("deploy_selection", SCRIPTS / "deploy-vmd.py")
@@ -157,7 +162,7 @@ class DeployTargetTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
 
     def test_workflow_cell_guards_and_staging_dependency(self):
-        for kind in ("vmd",):
+        for kind in ("vmd", "proxy"):
             workflow = (SCRIPTS.parent / f"deploy-{kind}.yml").read_text()
             production = workflow.split("  deploy-production:\n", 1)[1]
             self.assertIn("    needs: [deploy-staging]\n", production)
@@ -170,22 +175,24 @@ class DeployTargetTests(unittest.TestCase):
                 self.assertLess(step.index("source .github/workflows/scripts/select-deploy-target.sh"),
                                 step.index(f"python3 .github/workflows/scripts/deploy-{kind}.py"))
             for event in ("push", "workflow_dispatch"):
-                for cell in ("", "use4", "usw2"):
-                    for enabled in ("", "configured"):
-                        selected = []
-                        for step in steps[1:]:
-                            condition = re.search(r"^        if: (.+)$", step, re.M)[1]
-                            context = dict(github=SimpleNamespace(event_name=event),
-                                           inputs=SimpleNamespace(cell=cell),
-                                           vars=SimpleNamespace(CLOUD_RUN_SERVICE_USW=enabled))
-                            if eval(condition.replace("&&", " and ").replace("||", " or "),
-                                    {"__builtins__": {}}, context):
-                                selected.append(re.search(r"DEPLOY_CELL: (\w+)", step)[1])
-                        expected = (["use4", "usw2"] if enabled else ["use4"]) if event == "push" else [cell or "usw2"]
-                        self.assertEqual(selected, expected, (kind, event, cell, enabled))
+                for target in ("serving", "standby"):
+                    for cell in ("", "use4", "usw2"):
+                        for enabled in ("", "configured"):
+                            selected = []
+                            for step in steps[1:]:
+                                condition = re.search(r"^        if: (.+)$", step, re.M)[1]
+                                context = dict(github=SimpleNamespace(event_name=event),
+                                               inputs=SimpleNamespace(production_cell=cell, cell=cell, target=target),
+                                               vars=SimpleNamespace(CLOUD_RUN_SERVICE_USW=enabled))
+                                if eval(condition.replace("&&", " and ").replace("||", " or "),
+                                        {"__builtins__": {}}, context):
+                                    selected.append(re.search(r"DEPLOY_CELL: (\w+)", step)[1])
+                            expected = ([cell or "usw2"] if event == "workflow_dispatch"
+                                        else (["use4", "usw2"] if enabled else ["use4"]))
+                            self.assertEqual(selected, expected, (kind, event, target, cell, enabled))
 
     def test_zero_matches_never_retry_serving_or_upload(self):
-        for kind in ("vmd",):
+        for kind in ("vmd", "proxy"):
             spec = importlib.util.spec_from_file_location("deploy_under_test", SCRIPTS / f"deploy-{kind}.py")
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)

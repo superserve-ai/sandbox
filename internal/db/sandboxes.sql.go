@@ -2127,17 +2127,30 @@ func (q *Queries) GetSandboxWithPreviewPolicy(ctx context.Context, arg GetSandbo
 }
 
 const getSnapshotPathsByIDs = `-- name: GetSnapshotPathsByIDs :many
-SELECT id, path FROM snapshot WHERE id = ANY($1::uuid[])
+SELECT s.id, s.path, s.mem_path,
+       EXISTS (
+         SELECT 1 FROM backup_generation bg
+         WHERE bg.covered_snapshot_id = s.id
+           AND bg.covered_snapshot_generation = s.generation
+       ) AS covered
+FROM snapshot s WHERE s.id = ANY($1::uuid[])
 `
 
 type GetSnapshotPathsByIDsRow struct {
-	ID   uuid.UUID `json:"id"`
-	Path string    `json:"path"`
+	ID      uuid.UUID `json:"id"`
+	Path    string    `json:"path"`
+	MemPath *string   `json:"mem_path"`
+	Covered bool      `json:"covered"`
 }
 
 // Batched snapshot-path lookup for the reconciler's paused-snapshot drift
 // check. Replaces the old per-inventory join with a PK lookup over just the
-// snapshot IDs of paused sandboxes.
+// snapshot IDs of paused sandboxes. mem_path and covered let the drift check
+// tell a fetchable partial miss — vmstate.snap gone, mem.snap still local,
+// and a verified backup generation covers this exact snapshot (identical
+// join to ClaimResume's covered_backup_generation and paused_unbacked_count
+// in hosts.sql; served by idx_backup_generation_covered_snapshot) — from a
+// real loss that fetch-on-resume cannot recover from either.
 func (q *Queries) GetSnapshotPathsByIDs(ctx context.Context, ids []uuid.UUID) ([]GetSnapshotPathsByIDsRow, error) {
 	rows, err := q.db.Query(ctx, getSnapshotPathsByIDs, ids)
 	if err != nil {
@@ -2147,7 +2160,12 @@ func (q *Queries) GetSnapshotPathsByIDs(ctx context.Context, ids []uuid.UUID) ([
 	items := []GetSnapshotPathsByIDsRow{}
 	for rows.Next() {
 		var i GetSnapshotPathsByIDsRow
-		if err := rows.Scan(&i.ID, &i.Path); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.Path,
+			&i.MemPath,
+			&i.Covered,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

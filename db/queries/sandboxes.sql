@@ -329,8 +329,19 @@ WHERE s.host_id = $1 AND s.destroyed_at IS NULL;
 -- name: GetSnapshotPathsByIDs :many
 -- Batched snapshot-path lookup for the reconciler's paused-snapshot drift
 -- check. Replaces the old per-inventory join with a PK lookup over just the
--- snapshot IDs of paused sandboxes.
-SELECT id, path FROM snapshot WHERE id = ANY(@ids::uuid[]);
+-- snapshot IDs of paused sandboxes. mem_path and covered let the drift check
+-- tell a fetchable partial miss — vmstate.snap gone, mem.snap still local,
+-- and a verified backup generation covers this exact snapshot (identical
+-- join to ClaimResume's covered_backup_generation and paused_unbacked_count
+-- in hosts.sql; served by idx_backup_generation_covered_snapshot) — from a
+-- real loss that fetch-on-resume cannot recover from either.
+SELECT s.id, s.path, s.mem_path,
+       EXISTS (
+         SELECT 1 FROM backup_generation bg
+         WHERE bg.covered_snapshot_id = s.id
+           AND bg.covered_snapshot_generation = s.generation
+       ) AS covered
+FROM snapshot s WHERE s.id = ANY(@ids::uuid[]);
 
 -- name: ListRecentlyDestroyedSandboxIDsByHost :many
 -- Used by the VMD disk reconciler so a sandbox destroyed within the grace

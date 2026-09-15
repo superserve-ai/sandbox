@@ -40,10 +40,45 @@ run "generated_host_ids_use_stable_collector_identity" {
   }
   assert {
     condition = alltrue([
-      for policy in concat(values(google_monitoring_alert_policy.backup), values(google_monitoring_alert_policy.launch_path)) :
+      for key, expected in {
+        upload_failures = { metric = "backup_upload_total/counter", label = "result", value = "failed", threshold = 4 / 3600, duration = "1800s", aligner = "ALIGN_RATE" }
+        backlog_age     = { metric = "backup_oldest_pending_age_seconds/gauge", label = "priority", value = "pause", threshold = 1800, duration = "900s", aligner = "ALIGN_MAX" }
+        } : (
+        google_monitoring_alert_policy.backup[key].combiner == "OR" &&
+        toset([for condition in google_monitoring_alert_policy.backup[key].conditions : one(condition.condition_threshold).filter]) == toset([
+          for label, value in { host_id = "legacy-host", collector_host_id = "example-host" } :
+          "metric.type = \"prometheus.googleapis.com/${expected.metric}\" AND resource.type = \"prometheus_target\" AND metric.labels.${expected.label} = \"${expected.value}\" AND metric.labels.${label} = \"${value}\""
+        ]) &&
+        length(google_monitoring_alert_policy.backup[key].conditions) == 2 &&
+        alltrue([for condition in google_monitoring_alert_policy.backup[key].conditions : (
+          one(condition.condition_threshold).comparison == "COMPARISON_GT" &&
+          one(condition.condition_threshold).threshold_value == expected.threshold &&
+          one(condition.condition_threshold).duration == expected.duration &&
+          one(one(condition.condition_threshold).aggregations).alignment_period == "60s" &&
+          one(one(condition.condition_threshold).aggregations).per_series_aligner == expected.aligner &&
+          one(one(condition.condition_threshold).trigger).count == 1
+        )])
+      )
+    ])
+    error_message = "Both identity conditions must retain exact host and result/priority restrictions, thresholds, windows, and OR semantics."
+  }
+  assert {
+    condition = alltrue(flatten([
+      for policy in concat(values(google_monitoring_alert_policy.backup), values(google_monitoring_alert_policy.launch_path)) : [
+        for condition in policy.conditions : !(
+          strcontains(one(condition.condition_threshold).filter, " OR ") &&
+          length(regexall("metric[.]labels[.]", one(condition.condition_threshold).filter)) > 2
+        )
+      ]
+    ]))
+    error_message = "Monitoring rejects a host-label OR combined with additional AND metric-label restrictions."
+  }
+  assert {
+    condition = alltrue([
+      for policy in concat([for key, policy in google_monitoring_alert_policy.backup : policy if !contains(["upload_failures", "backlog_age"], key)], values(google_monitoring_alert_policy.launch_path)) :
       endswith(one(one(policy.conditions).condition_threshold).filter, " AND (metric.labels.host_id = \"legacy-host\" OR metric.labels.collector_host_id = \"example-host\")")
     ])
-    error_message = "All backup and launch alerts must select generated IDs through the collector and preserve legacy coverage."
+    error_message = "Unconstrained backup and launch alerts must keep one host-label union, preserving aggregation semantics."
   }
   assert {
     condition     = one(one(one(google_monitoring_alert_policy.backup["pause_hook_p99"].conditions).condition_threshold).aggregations).group_by_fields == tolist(["metric.label.host_id"])
@@ -51,7 +86,7 @@ run "generated_host_ids_use_stable_collector_identity" {
   }
   assert {
     condition = (
-      strcontains(one(one(google_monitoring_alert_policy.backup["upload_failures"].conditions).condition_threshold).filter, "metric.labels.collector_host_id") &&
+      anytrue([for condition in google_monitoring_alert_policy.backup["upload_failures"].conditions : strcontains(one(condition.condition_threshold).filter, "metric.labels.collector_host_id")]) &&
       contains(yamldecode(file("../../../deploy/otel/collector-gmp.yaml")).service.pipelines.metrics.processors, "attributes/collector_host_id") &&
       yamldecode(file("../../../deploy/otel/collector-gmp.yaml")).processors["attributes/collector_host_id"].actions == [
         { key = "collector_host_id", value = "$${env:HOST_ID}", action = "upsert" }
@@ -59,5 +94,17 @@ run "generated_host_ids_use_stable_collector_identity" {
       !contains(yamldecode(file("../../../deploy/otel/collector-gmp.yaml")).service.pipelines.metrics.processors, "attributes/host_id")
     )
     error_message = "The OTLP pipeline must stamp the stable collector identity without overwriting the sender's authoritative host_id."
+  }
+}
+
+run "disabled_alerts_create_no_policies" {
+  command = plan
+  variables {
+    backup_alerts      = null
+    launch_path_alerts = null
+  }
+  assert {
+    condition     = length(google_monitoring_alert_policy.backup) == 0 && length(google_monitoring_alert_policy.launch_path) == 0
+    error_message = "Null configurations must continue disabling the policy sets."
   }
 }

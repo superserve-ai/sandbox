@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+from itertools import product
 import os
 from pathlib import Path
 import re
@@ -29,6 +30,18 @@ class ProxyTargetTests(unittest.TestCase):
                    DEPLOY_PRODUCTION_CELL="usw2", DEPLOY_CELL="usw2")
         env.update(overrides)
         step = next(s for s in STEPS if f'DEPLOY_CELL: {env["DEPLOY_CELL"]}' in s)
+        if env["DEPLOY_CELL"] != "staging":
+            expression = re.search(r"PEER_PROXY_LISTEN_ADDR: \$\{\{ (.+) \}\}", step)[1]
+            context = dict(github=SimpleNamespace(event_name=env["DEPLOY_EVENT"]),
+                           inputs=SimpleNamespace(target=env["DEPLOY_TARGET"]),
+                           vars=SimpleNamespace(PEER_ROUTING_ENABLED_USE4=env.get("PEER_ROUTING_ENABLED", ""),
+                                                PEER_ROUTING_ENABLED_USW=env.get("PEER_ROUTING_ENABLED", ""),
+                                                PEER_INGRESS_ENABLED_PROD=env.get("PEER_INGRESS_ENABLED", ""),
+                                                PEER_INGRESS_ENABLED_USW=env.get("PEER_INGRESS_ENABLED", "")))
+            env["PEER_PROXY_LISTEN_ADDR"] = eval(
+                expression.replace("&&", " and ").replace("||", " or "),
+                {"__builtins__": {}}, context)
+            self.assertIn('PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"', step)
         # Execute the workflow's actual selection prefix, without secret access or deployment.
         prefix = step.split("        run: |\n")[1].split('          : "${GCP_REGION:?', 1)[0]
         result = subprocess.run(["bash", "-eu", "-c", prefix + '\npython3 -c "import json, os; print(json.dumps(dict(os.environ)))"'],
@@ -38,6 +51,10 @@ class ProxyTargetTests(unittest.TestCase):
         env = json.loads(result.stdout)
         standby = env["DEPLOY_EVENT"] == "workflow_dispatch" and env["DEPLOY_TARGET"] == "standby"
         self.assertEqual(env["VMD_LABEL"], f'component=vmd-{env["DEPLOY_CELL"]}-standby' if standby else "component=vmd")
+        if env["DEPLOY_CELL"] != "staging":
+            self.assertEqual(env["PEER_PROXY_LISTEN_ADDR"], "auto" if standby or env.get("PEER_ROUTING_ENABLED") == "1" or env.get("PEER_INGRESS_ENABLED") == "1" else "")
+            if standby:
+                self.assertEqual(env["PEER_IDENTITY_HOSTS"], env["EXPECTED_STANDBY_HOST"])
         selected = []
 
         class Executor:
@@ -63,8 +80,64 @@ class ProxyTargetTests(unittest.TestCase):
 
     def test_serving_and_push_keep_normal_fanout(self):
         for event, target in (("workflow_dispatch", "serving"), ("push", "serving"), ("push", "")):
-            self.assertEqual(self.select("example-serving,us-west2-a\nexample-east,us-east4-a\n",
-                                         DEPLOY_EVENT=event, DEPLOY_TARGET=target), (0, ["example-serving"]))
+            for cell, region in (("usw2", "us-west2"), ("use4", "us-east4")):
+                self.assertEqual(self.select(f"example-serving,{region}-a\nexample-other,europe-west1-b\n",
+                                             DEPLOY_EVENT=event, DEPLOY_TARGET=target,
+                                             DEPLOY_CELL=cell, GCP_REGION=region),
+                                 (0, ["example-serving"]))
+
+    def test_routing_enabled_push_preserves_serving_ingress(self):
+        for cell, region in (("usw2", "us-west2"), ("use4", "us-east4")):
+            self.assertEqual(self.select(f"example-serving,{region}-a\n",
+                                         DEPLOY_EVENT="push", DEPLOY_TARGET="serving",
+                                         DEPLOY_CELL=cell, GCP_REGION=region,
+                                         PEER_ROUTING_ENABLED="1",
+                                         PROXY_DATABASE_URL="postgres://routing:example@db.example.test/db"),
+                             (0, ["example-serving"]))
+
+    def test_cell_routing_and_ingress_are_independent(self):
+        routing_vars = dict(staging="PEER_ROUTING_ENABLED", use4="PEER_ROUTING_ENABLED_USE4",
+                            usw2="PEER_ROUTING_ENABLED_USW")
+        database_secrets = dict(staging="PROXY_DATABASE_URL_STAGING", use4="PROXY_DATABASE_URL_PROD",
+                                usw2="PROXY_DATABASE_URL_USWEST")
+        for step in STEPS:
+            cell = re.search(r"DEPLOY_CELL: (\w+)", step)[1]
+            routing_expression = re.search(r"PEER_ROUTING_ENABLED: \$\{\{ (.+) \}\}", step)[1]
+            listener_expression = re.search(r"PEER_PROXY_LISTEN_ADDR: \$\{\{ (.+) \}\}", step)[1]
+            self.assertEqual(routing_expression, f"vars.{routing_vars[cell]}")
+            self.assertIn("PROXY_DATABASE_URL: ${{ secrets." + database_secrets[cell] + " }}", step)
+            for staging, east, west, east_ingress, west_ingress, staging_listener, event, target in product(
+                    ("", "0", "1"), ("", "0", "1"), ("", "0", "1"), ("", "1"), ("", "1"),
+                    ("", "auto"), ("push", "workflow_dispatch"), ("serving", "standby")):
+                variables = dict(PEER_ROUTING_ENABLED=staging, PEER_ROUTING_ENABLED_USE4=east,
+                                 PEER_ROUTING_ENABLED_USW=west, PEER_INGRESS_ENABLED_PROD=east_ingress,
+                                 PEER_INGRESS_ENABLED_USW=west_ingress,
+                                 PEER_PROXY_LISTEN_ADDR_STAGING=staging_listener)
+                context = dict(github=SimpleNamespace(event_name=event),
+                               inputs=SimpleNamespace(target=target), vars=SimpleNamespace(**variables))
+                with self.subTest(cell=cell, variables=variables, event=event, target=target):
+                    routing = eval(routing_expression, {"__builtins__": {}}, context)
+                    self.assertEqual(routing, dict(staging=staging, use4=east, usw2=west)[cell])
+                    listener = eval(listener_expression.replace("&&", " and ").replace("||", " or "),
+                                    {"__builtins__": {}}, context)
+                    if cell == "staging":
+                        expected = "auto" if staging == "1" else staging_listener
+                    else:
+                        ingress = east_ingress if cell == "use4" else west_ingress
+                        expected = "auto" if routing == "1" or ingress == "1" or (
+                            event == "workflow_dispatch" and target == "standby") else ""
+                    self.assertEqual(listener, expected)
+
+    def test_ingress_first_and_routing_disable_preserve_listener(self):
+        for cell, region in (("use4", "us-east4"), ("usw2", "us-west2")):
+            for routing in ("0", "1", "0"):
+                for event in ("push", "workflow_dispatch"):
+                    self.assertEqual(self.select(f"example-serving,{region}-a\n",
+                                                 DEPLOY_EVENT=event, DEPLOY_TARGET="serving",
+                                                 DEPLOY_CELL=cell, GCP_REGION=region,
+                                                 PEER_INGRESS_ENABLED="1", PEER_ROUTING_ENABLED=routing,
+                                                 PROXY_DATABASE_URL="postgres://routing:example@db.example.test/db"),
+                                     (0, ["example-serving"]))
 
     def test_west_and_configured_east_standby(self):
         self.assertEqual(self.select("superserve-vmd-usw2-2,us-west2-a,RUNNING\n"),
@@ -107,7 +180,7 @@ class ProxyTargetTests(unittest.TestCase):
                 for region in ("", " "):
                     self.assertEqual(self.select(GCP_REGION=region, DEPLOY_EVENT=event, DEPLOY_TARGET=target), (1, []))
 
-    def test_workflow_guards_preserve_defaults_and_only_select_requested_standby_cell(self):
+    def test_workflow_guards_select_requested_manual_cell_and_preserve_push(self):
         self.assertIn("DEPLOY_TARGET: ${{ inputs.target || 'serving' }}", WORKFLOW)
         self.assertIn("VMD_STANDBY_HOST_USE4: ${{ vars.VMD_STANDBY_HOST_USE4 }}", WORKFLOW)
         self.assertIn("needs: [deploy-staging]", WORKFLOW)
@@ -123,7 +196,7 @@ class ProxyTargetTests(unittest.TestCase):
                             condition = re.search(r"^        if: (.+)$", step, re.M)[1]
                             if eval(condition.replace("&&", " and ").replace("||", " or "), {"__builtins__": {}}, context):
                                 selected.append(re.search(r"DEPLOY_CELL: (\w+)", step)[1])
-                        expected = [cell or "usw2"] if event == "workflow_dispatch" and target == "standby" else (["use4", "usw2"] if enabled else ["use4"])
+                        expected = [cell or "usw2"] if event == "workflow_dispatch" else (["use4", "usw2"] if enabled else ["use4"])
                         self.assertEqual(selected, expected)
 
 
