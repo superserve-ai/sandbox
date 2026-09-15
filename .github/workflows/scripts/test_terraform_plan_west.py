@@ -63,11 +63,14 @@ elif args[0] == 'show':
                                     env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ['PATH'], DEFAULT_ROLE=default),
                                     capture_output=True, text=True)
             roles = (env_dir / 'planned-roles').read_text().splitlines()
+            declared = (env_dir / (default + '.json')).read_text()
+            self.assertEqual((env_dir / 'tfplan').read_text(), declared)
+            self.assertEqual((env_dir / 'plan.txt').read_text().strip(), declared)
             return result.returncode, roles
 
     def test_both_roles_are_checked_independently_of_default(self):
         for default in ('primary', 'standby'):
-            self.assertEqual(self.verify(default), (0, ['primary', 'standby']))
+            self.assertEqual(self.verify(default), (0, [default, 'primary', 'standby']))
 
     def test_wrong_generated_identity_is_rejected(self):
         self.assertNotEqual(self.verify('standby', broken_identity=True)[0], 0)
