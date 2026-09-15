@@ -55,7 +55,7 @@ class ProxyTargetTests(unittest.TestCase):
         if env["DEPLOY_CELL"] != "staging":
             self.assertEqual(env["PEER_PROXY_LISTEN_ADDR"], "auto" if standby or env.get("PEER_ROUTING_ENABLED") == "1" or env.get("PEER_INGRESS_ENABLED") == "1" else "")
             if standby:
-                self.assertEqual(env["PEER_IDENTITY_HOSTS"], env["EXPECTED_STANDBY_HOST"])
+                self.assertEqual(env.get("PEER_IDENTITY_HOSTS", ""), overrides.get("PEER_IDENTITY_HOSTS", ""))
         selected = []
 
         class Executor:

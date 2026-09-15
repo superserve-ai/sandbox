@@ -40,7 +40,10 @@ if not region or len(rows) != 1:
 print(rows[0][0])
 ') || exit 1
   fi
-  export PEER_IDENTITY_HOSTS="$standby_host"
+  # Production bootstrap policy belongs to the host, not its serving role.
+  if [ "$DEPLOY_CELL" = staging ]; then
+    export PEER_IDENTITY_HOSTS="$standby_host"
+  fi
   export EXPECTED_STANDBY_HOST="$standby_host"
 else
   export VMD_LABEL=component=vmd
