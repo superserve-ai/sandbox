@@ -143,25 +143,6 @@ func TestJournalPendingUntilDone(t *testing.T) {
 	}
 }
 
-func TestPreviewPolicyRequestMirrorsResumeWire(t *testing.T) {
-	var p previewPolicy
-	p.access, p.revision = "public", 7
-	if err := json.Unmarshal([]byte(`[{"port":8080,"access":"private","token_version":3},{"port":9090,"access":"public","token_version":2},{"port":7070,"access":"private_token_v1","token_version":5}]`), &p.ports); err != nil {
-		t.Fatal(err)
-	}
-	req := p.request("vm")
-	if req.VmId != "vm" || req.PreviewAccess != "public" || req.PolicyRevision != 7 || len(req.PreviewPorts) != 3 {
-		t.Fatalf("request = %+v", req)
-	}
-	want := map[int32][2]any{8080: {"private_browser_v1", int64(3)}, 9090: {"public", int64(0)}, 7070: {"private_token_v1", int64(5)}}
-	for _, port := range req.PreviewPorts {
-		w := want[port.Port]
-		if port.Access != w[0] || port.TokenVersion != w[1] {
-			t.Fatalf("port %d = %s/%d, want %v", port.Port, port.Access, port.TokenVersion, w)
-		}
-	}
-}
-
 func TestEndpointIsHostBindsLoopbackToLocalAddresses(t *testing.T) {
 	if err := endpointIsHost("10.9.9.9:50051", "10.9.9.9:50051"); err != nil {
 		t.Fatalf("matching remote endpoint rejected: %v", err)

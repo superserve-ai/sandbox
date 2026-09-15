@@ -22,7 +22,6 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/superserve-ai/sandbox/internal/backup"
-	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -148,25 +147,67 @@ func runMigrate(args []string) int {
 		fmt.Fprintf(os.Stderr, "migrate: source host %q: %v\n", *fromHost, err)
 		return 1
 	}
+	// Resume is gated on the host advertising every capability a sandbox's
+	// preview policy needs. The source served these sandboxes, so its
+	// current capability set is what they may need; the destination must
+	// advertise all of it or their resumes would be refused there.
+	var missing []string
+	mr, err := conn.Query(ctx, `SELECT src.capability FROM host_capability src
+		JOIN host sh ON sh.id = src.host_id AND src.heartbeat_at = sh.last_heartbeat_at
+		WHERE src.host_id = $1 AND NOT EXISTS (
+			SELECT 1 FROM host_capability dst JOIN host dh ON dh.id = dst.host_id AND dst.heartbeat_at = dh.last_heartbeat_at
+			WHERE dst.host_id = $2 AND dst.capability = src.capability)`, *fromHost, *toHost)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "migrate: host capabilities: %v\n", err)
+		return 1
+	}
+	for mr.Next() {
+		var c string
+		if err := mr.Scan(&c); err != nil {
+			mr.Close()
+			fmt.Fprintf(os.Stderr, "migrate: host capabilities: %v\n", err)
+			return 1
+		}
+		missing = append(missing, c)
+	}
+	mr.Close()
+	if err := mr.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "migrate: host capabilities: %v\n", err)
+		return 1
+	}
+	if len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "migrate: destination %q does not advertise %v, which %q does; sandboxes needing them could not resume there\n", *toHost, missing, *fromHost)
+		return 1
+	}
 
 	skip := loadSkipSet(filepath.Join(*root, "migrate-failed.txt"))
-	journal, err := os.OpenFile(filepath.Join(*root, "migrate-timeouts.txt"), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
+	// A dry run only reads the journal, and only if there is one; a real
+	// run creates it and holds it: one run per restore root, since entries
+	// are retired by sandbox id and two runs claiming the same rows could
+	// retire each other's. The lock is released with the descriptor.
+	journalPath := filepath.Join(*root, "migrate-timeouts.txt")
+	flags := os.O_APPEND | os.O_CREATE | os.O_RDWR
+	if *dryRun {
+		flags = os.O_RDONLY
+	}
+	journal, err := os.OpenFile(journalPath, flags, 0o644)
+	if err != nil && !(*dryRun && errors.Is(err, os.ErrNotExist)) {
 		fmt.Fprintf(os.Stderr, "migrate: timeout journal: %v\n", err)
 		return 1
 	}
-	defer journal.Close()
-	// One run per restore root: the journal's entries are retired by
-	// sandbox id, so two runs claiming the same rows could retire each
-	// other's. The lock is released with the descriptor.
-	if err := unix.Flock(int(journal.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		fmt.Fprintf(os.Stderr, "migrate: another run holds %s: %v\n", journal.Name(), err)
-		return 1
-	}
-	pending, err := pendingJournal(journal)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "migrate: timeout journal: %v\n", err)
-		return 1
+	pending := map[string]journaled{}
+	if journal != nil {
+		defer journal.Close()
+		if !*dryRun {
+			if err := unix.Flock(int(journal.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+				fmt.Fprintf(os.Stderr, "migrate: another run holds %s: %v\n", journalPath, err)
+				return 1
+			}
+		}
+		if pending, err = pendingJournal(journal); err != nil {
+			fmt.Fprintf(os.Stderr, "migrate: timeout journal: %v\n", err)
+			return 1
+		}
 	}
 	// One inventory up front; the flip re-checks each row under its own
 	// WHERE clause, so a sandbox the owner resumed meanwhile is skipped
@@ -432,24 +473,11 @@ func runMigrate(args []string) int {
 						AllowedCidrs: s.rules.allowedCIDRs, DeniedCidrs: s.rules.deniedCIDRs, AllowedDomains: s.rules.allowedDomains,
 					})
 					cancel()
-					if err == nil {
-						// vmd does not persist the preview policy either; a
-						// recordless boot starts private with no published
-						// ports. The policy is read again now, after the record
-						// exists, so an owner's change during the boot (whose
-						// push found no record here) is what gets installed;
-						// then it is pushed before the row is exposed, exactly
-						// as a resume does.
-						var policy previewPolicy
-						if policy, err = loadPreviewPolicy(ctx, conn, id); err == nil {
-							pctx, pcancel := context.WithTimeout(ctx, time.Minute)
-							_, err = vmd.UpdateSandboxPreviewPolicy(pctx, policy.request(id))
-							pcancel()
-						}
-						if err != nil {
-							err = errRetry{fmt.Errorf("apply preview policy: %w", err)}
-						}
-					}
+					// vmd does not persist the preview policy; a recordless
+					// boot starts private with no published ports, and it
+					// stays that way here so nothing routes to a guest that
+					// holds no environment. The owner's next resume applies
+					// the stored policy as it always does.
 					if err == nil {
 						var ip netip.Addr
 						if ip, err = netip.ParseAddr(resp.GetHostIp()); err == nil {
@@ -911,53 +939,6 @@ func endpointIsHost(endpoint, rowAddr string) error {
 		return fmt.Errorf("endpoint names %s", epHost)
 	}
 	return nil
-}
-
-// previewPolicy is the row's stored preview access and published ports in
-// the shape vmd applies: private ports go on the wire as the browser mode,
-// and only tokenized modes carry a generation.
-type previewPolicy struct {
-	access   string
-	revision int64
-	ports    []struct {
-		Port         int32  `json:"port"`
-		Access       string `json:"access"`
-		TokenVersion int64  `json:"token_version"`
-	}
-}
-
-// loadPreviewPolicy reads the row's current preview policy: the stored
-// access and revision (absent side-table row = the pre-publication
-// default) and the published ports that carry a positive generation.
-func loadPreviewPolicy(ctx context.Context, conn *pgxpool.Pool, id string) (previewPolicy, error) {
-	var p previewPolicy
-	var ports string
-	err := conn.QueryRow(ctx, `SELECT COALESCE(p.access, 'legacy_public')::text, COALESCE(p.revision, 0)::bigint,
-			COALESCE((SELECT json_agg(json_build_object('port', pp.port, 'access', pp.access, 'token_version', g.token_version))
-				FROM sandbox_published_port pp
-				JOIN sandbox_preview_port_token_generation g ON g.sandbox_id = pp.sandbox_id AND g.port = pp.port
-				WHERE pp.sandbox_id = s.id AND g.token_version > 0), '[]')::text
-		FROM sandbox s LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id WHERE s.id = $1`, id).Scan(&p.access, &p.revision, &ports)
-	if err != nil {
-		return p, err
-	}
-	return p, json.Unmarshal([]byte(ports), &p.ports)
-}
-
-func (p previewPolicy) request(id string) *vmdpb.UpdateSandboxPreviewPolicyRequest {
-	req := &vmdpb.UpdateSandboxPreviewPolicyRequest{VmId: id, PreviewAccess: p.access, PolicyRevision: p.revision}
-	for _, port := range p.ports {
-		access := port.Access
-		if access == preview.AccessPrivate {
-			access = preview.AccessPrivateBrowserV1
-		}
-		version := port.TokenVersion
-		if !preview.IsTokenizedAccess(access) {
-			version = 0
-		}
-		req.PreviewPorts = append(req.PreviewPorts, &vmdpb.PreviewPort{Port: port.Port, Access: access, TokenVersion: version})
-	}
-	return req
 }
 
 // egressRules is the row's persisted network_config, in the shape vmd
