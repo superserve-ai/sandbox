@@ -479,6 +479,11 @@ module "observability" {
       instance_name = module.sandbox_host.instance_name
       instance_id   = module.sandbox_host.instance_id
     }
+    sandbox_host_b = {
+      display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / host maintenance event"
+      instance_name = module.sandbox_host_b.instance_name
+      instance_id   = module.sandbox_host_b.instance_id
+    }
   }
   # Backup alerts use the stable collector identity plus the legacy host_id
   # selector while older collectors roll forward. Follows
