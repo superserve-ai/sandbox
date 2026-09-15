@@ -183,7 +183,6 @@ func runMigrate(args []string) int {
 	if *dryRun || len(queue)+len(pending) == 0 {
 		return 0
 	}
-
 	gconn, err := grpc.NewClient(*vmdAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "migrate: dial vmd: %v\n", err)
@@ -243,9 +242,16 @@ func runMigrate(args []string) int {
 				// meanwhile is missed.
 				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, snapshotID: pending[id].snapshotID}
 			case host == *toHost && status == "migrating":
-				// Claimed but never activated: hand it back to the source. A
-				// VM the earlier run did boot has no active row here and is
-				// stopped by the reconciler.
+				// Claimed but never activated. The earlier run may have got
+				// as far as booting, so the guest is stopped here first; only
+				// then is the row resumable on the source again.
+				dctx, dcancel := context.WithTimeout(ctx, time.Minute)
+				_, derr := vmd.DestroyVM(dctx, &vmdpb.DestroyVMRequest{VmId: id, Force: true})
+				dcancel()
+				if derr != nil {
+					fmt.Fprintf(os.Stderr, "migrate: journal recovery: %s: stopping the booted guest: %v\n", id, derr)
+					return 1
+				}
 				if _, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused', updated_at = now()
 					WHERE id = $2 AND host_id = $3 AND status = 'migrating'`, *fromHost, id, *toHost); err != nil {
 					fmt.Fprintf(os.Stderr, "migrate: journal recovery: %v\n", err)

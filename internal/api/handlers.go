@@ -759,11 +759,12 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			}
 			sandbox.Status = db.SandboxStatusActive
 			return &sandbox, resumedAccess
-		case db.SandboxStatusStarting, db.SandboxStatusResuming, db.SandboxStatusMigrating:
+		case db.SandboxStatusStarting, db.SandboxStatusResuming:
 			// Likely the fire-and-forget activate write in flight (or a
-			// concurrent create/resume finishing, or an operator's boot on
-			// another host); wait for the flip rather than 409 the owner's
-			// own follow-up.
+			// concurrent create/resume finishing); wait for the flip
+			// rather than 409 the owner's own follow-up. 'migrating' (an
+			// operator's boot elsewhere, minutes at worst) is not settled
+			// here: it takes the conflict below and the client retries.
 			if time.Now().Before(deadline) {
 				time.Sleep(activateSettlePoll)
 				continue
