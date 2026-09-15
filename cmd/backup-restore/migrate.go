@@ -29,15 +29,14 @@ import (
 // through the ordinary pause path, so the sandbox ends up paused on this
 // host with a fresh snapshot and backup generation.
 //
-// Each sandbox goes through three steps. The row is claimed first: its
-// host moves here while it stays paused, fenced on the snapshot whose
-// digests were checked and on the timeout read with it, so an owner's
-// resume from then on routes here and fails rather than starting a second
-// copy beside the boot. The restored disk is then booted, and the row is
-// activated with the fresh address as soon as the RPC returns, inside the
-// grace vmd's reconciler gives a paused row here without a snapshot or a
-// running VM without an active row. A boot that fails hands the claim
-// back to the source unchanged.
+// Each sandbox goes through three steps. The row is claimed first: it
+// moves here as 'migrating', fenced on the snapshot whose digests were
+// checked and on the timeout read with it. Resume claims only paused rows,
+// so the owner cannot start a second copy beside the boot; a request of
+// theirs waits for the flip. The restored disk is then booted, and the row
+// is activated with the fresh address as soon as the RPC returns, inside
+// the grace vmd's reconciler gives a running VM without an active row. A
+// boot that fails hands the claim back to the source, paused as it was.
 //
 // Nothing on the host pauses an idle VM by itself: the reaper pauses
 // active rows whose timeout has elapsed, and most rows carry no timeout.
@@ -240,10 +239,12 @@ func runMigrate(args []string) int {
 				// The snapshot seen now may already be the migration pause,
 				// so the status alone decides for adopted rows.
 				active[id] = live{since: pending[id].since, origTimeout: pending[id].orig, snapshotID: snap}
-			case host == *toHost && status == "paused" && timeout == nil:
-				// Claimed but never activated: hand it back to the source.
-				if _, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, updated_at = now()
-					WHERE id = $2 AND host_id = $3 AND status = 'paused' AND timeout_seconds IS NULL`, *fromHost, id, *toHost); err != nil {
+			case host == *toHost && status == "migrating":
+				// Claimed but never activated: hand it back to the source. A
+				// VM the earlier run did boot has no active row here and is
+				// stopped by the reconciler.
+				if _, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused', updated_at = now()
+					WHERE id = $2 AND host_id = $3 AND status = 'migrating'`, *fromHost, id, *toHost); err != nil {
 					fmt.Fprintf(os.Stderr, "migrate: journal recovery: %v\n", err)
 					return 1
 				}
@@ -491,11 +492,11 @@ func runMigrate(args []string) int {
 				go func(id string, s shape) {
 					defer wg.Done()
 					defer func() { <-sem }()
-					// Claim first: the row moves to this host while still
-					// paused, fenced on the snapshot whose digests were checked
-					// and on the timeout that was journaled. From here an
-					// owner's resume routes to this host and fails cleanly
-					// instead of starting a second copy next to the boot.
+					// Claim first: the row moves to this host as 'migrating',
+					// fenced on the snapshot whose digests were checked and on
+					// the timeout that was journaled. Resume takes only paused
+					// rows, so from here the owner cannot start a second copy
+					// next to the boot; their request waits for the flip.
 					// The original timeout reaches the journal before the
 					// claim so a run that dies afterwards can still put it
 					// back.
@@ -509,7 +510,7 @@ func runMigrate(args []string) int {
 						mu.Unlock()
 						return
 					}
-					tag, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, updated_at = now()
+					tag, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'migrating', updated_at = now()
 						WHERE id = $2 AND host_id = $3 AND status = 'paused' AND destroyed_at IS NULL AND snapshot_id = $4
 							AND timeout_seconds IS NOT DISTINCT FROM $5`,
 						*toHost, id, *fromHost, *s.snapshotID, s.origTimeout)
@@ -539,7 +540,7 @@ func runMigrate(args []string) int {
 						var ip netip.Addr
 						if ip, err = netip.ParseAddr(resp.GetHostIp()); err == nil {
 							tag, err = conn.Exec(ctx, `UPDATE sandbox SET status = 'active', timeout_seconds = $1, ip_address = $2, updated_at = now()
-								WHERE id = $3 AND host_id = $4 AND status = 'paused' AND destroyed_at IS NULL`,
+								WHERE id = $3 AND host_id = $4 AND status = 'migrating' AND destroyed_at IS NULL`,
 								int32(*tmpTimeout), ip, id, *toHost)
 							if err == nil && tag.RowsAffected() == 0 {
 								err = fmt.Errorf("claim on %s was lost before activation", *toHost)
@@ -554,8 +555,8 @@ func runMigrate(args []string) int {
 						}
 					}
 					if err != nil {
-						if _, rerr := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, updated_at = now()
-							WHERE id = $2 AND host_id = $3 AND status = 'paused'`, *fromHost, id, *toHost); rerr != nil {
+						if _, rerr := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'paused', updated_at = now()
+							WHERE id = $2 AND host_id = $3 AND status = 'migrating'`, *fromHost, id, *toHost); rerr != nil {
 							err = fmt.Errorf("%v; and the claim could not be handed back: %v", err, rerr)
 						}
 						mu.Lock()

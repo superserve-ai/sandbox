@@ -759,10 +759,11 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			}
 			sandbox.Status = db.SandboxStatusActive
 			return &sandbox, resumedAccess
-		case db.SandboxStatusStarting, db.SandboxStatusResuming:
+		case db.SandboxStatusStarting, db.SandboxStatusResuming, db.SandboxStatusMigrating:
 			// Likely the fire-and-forget activate write in flight (or a
-			// concurrent create/resume finishing); wait for the flip
-			// rather than 409 the owner's own follow-up.
+			// concurrent create/resume finishing, or an operator's boot on
+			// another host); wait for the flip rather than 409 the owner's
+			// own follow-up.
 			if time.Now().Before(deadline) {
 				time.Sleep(activateSettlePoll)
 				continue
@@ -1962,6 +1963,7 @@ var sandboxStatusFilterValues = []string{
 	string(db.SandboxStatusPausing),
 	string(db.SandboxStatusPaused),
 	string(db.SandboxStatusResuming),
+	string(db.SandboxStatusMigrating),
 	string(db.SandboxStatusFailed),
 	string(db.SandboxStatusDeleted),
 }
