@@ -61,3 +61,23 @@ bursts; sustained overload is deliberately rejected rather than retained forever
 Validate burst latency, lookup latency, and ingress rejection metrics on a small
 enabled cohort before expanding it. Long-lived terminals count against active
 stream capacity, so size ingress for both terminals and ordinary requests.
+
+## Independent ingress rollout
+
+Set `PEER_INGRESS_ENABLED_PROD=1` and `PEER_INGRESS_ENABLED_USW=1` before
+production serving-host ingress deployment. Staging uses
+`PEER_PROXY_LISTEN_ADDR_STAGING=auto`. Leave outbound routing disabled while
+verifying listeners, firewall access, and accepted endpoint heartbeats across
+all destination hosts. Then enable `PEER_ROUTING_ENABLED=1`.
+
+To disable routing, keep the ingress settings enabled while the routing-disabled
+version reaches every source host and existing streams drain. Only then clear
+the independent ingress settings and deploy again. Routing being enabled always
+forces ingress on; turning routing off does not remove an independently enabled
+listener. Manual standby deployment continues enabling ingress automatically.
+
+Readiness accepts an acknowledged heartbeat from the current VMD invocation,
+including identity-bound hosts retaining the legacy `default` ID. Bound hosts
+also acknowledge removal of an endpoint. The database fallback accepts only a
+fresh, matching heartbeat from a genuinely unbound `default` host; it cannot
+substitute for a missing acknowledgement on a bound host.

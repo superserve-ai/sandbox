@@ -427,3 +427,48 @@ func TestRoutingHandlerBackpressureAcrossPeerConnections(t *testing.T) {
 		})
 	}
 }
+
+func TestRoutingHandlerExpectContinueUsesHijackedBody(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil || string(body) != "payload" {
+			http.Error(w, "invalid body", 400)
+			return
+		}
+		fmt.Fprint(w, "complete")
+	}))
+	defer target.Close()
+	peers, addr := startRoutingTestPeer(t, target.Listener.Addr().String())
+	handler := NewRoutingHandler([]string{"sandbox.test"}, "edge", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+		return SandboxRoute{HostID: "owner", ProxyAddr: addr, Generation: 1}, nil
+	}), peers, http.NotFoundHandler(), zerolog.Nop())
+	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = forbiddenRequestBody{}
+		handler.ServeHTTP(w, r)
+	}))
+	defer router.Close()
+	client, err := net.Dial("tcp", router.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	client.SetDeadline(time.Now().Add(3 * time.Second))
+	fmt.Fprint(client, "POST / HTTP/1.1\r\nHost: 8080-12345678-1234-1234-1234-123456789abc.sandbox.test\r\nContent-Length: 7\r\nExpect: 100-continue\r\n\r\n")
+	reader := bufio.NewReader(client)
+	response, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusContinue {
+		t.Fatalf("interim status=%d", response.StatusCode)
+	}
+	fmt.Fprint(client, "payload")
+	response, err = http.ReadResponse(reader, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil || response.StatusCode != http.StatusOK || string(body) != "complete" {
+		t.Fatalf("response=%d body=%q err=%v", response.StatusCode, body, err)
+	}
+}

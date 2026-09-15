@@ -111,7 +111,8 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	go pressureLoop(ctx, client, cfg, pressureURL, cfg.Token, pressureKick, log)
 	endpointAcknowledged := false
 	heartbeatAccepted := func() {
-		if !endpointAcknowledged && buildHeartbeatRequest(cfg, nil, nil).ProxyAddr != "" {
+		// A bound host also needs an acknowledgement when clearing its endpoint.
+		if !endpointAcknowledged && (cfg.IncarnationID != "" || buildHeartbeatRequest(cfg, nil, nil).ProxyAddr != "") {
 			log.Info().Str("host_id", cfg.HostID).Str("proxy_addr", cfg.ProxyAddr).
 				Msg("host endpoint heartbeat accepted")
 			endpointAcknowledged = true

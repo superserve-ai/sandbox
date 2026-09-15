@@ -131,7 +131,7 @@ class DeployProxyTests(unittest.TestCase):
         self.assertEqual(len(deployments), 2)
         for step in deployments:
             with self.subTest(step=step.splitlines()[0]):
-                self.assertIn("PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}", step)
+                self.assertIn("vars.PEER_INGRESS_ENABLED_", step)
                 script = self.generate_script("auto")
                 self.assertIn('PEER_PROXY_LISTEN_ADDR=', script)
                 self.assertIn(':5009', script)
@@ -200,6 +200,7 @@ class DeployProxyTests(unittest.TestCase):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
                 functions = f'''
                 sleep() {{ :; }}
+                legacy_heartbeat_ready() {{ return 1; }}
                 sudo() {{ "$@"; }}
                 systemctl() {{
                     if [ "$1" = show ]; then
@@ -223,30 +224,36 @@ class DeployProxyTests(unittest.TestCase):
                 result = subprocess.run(["bash"], input=functions + readiness + "wait_for_vmd_ready", text=True, capture_output=True)
                 self.assertEqual(result.returncode == 0, mode == "ready", result.stderr)
 
-    def test_legacy_default_uses_fresh_db_receipt_without_endpoint_log(self):
+    def test_readiness_uses_acknowledged_binding_not_host_name(self):
         script = self.generate_script("auto")
         readiness = script[script.index("wait_for_vmd_ready() {"):script.index("rollback_peer_advertisement() {")]
         for host in ("default", "named-host"):
-            for receipt in (True, False):
-                for restarted in (True, False):
-                    with self.subTest(host=host, receipt=receipt, restarted=restarted), tempfile.TemporaryDirectory() as tmp:
-                        functions = f'''
-                        sleep() {{ :; }}
-                        sudo() {{ "$@"; }}
-                        sed() {{ echo {host}; }}
-                        legacy_heartbeat_ready() {{ return {0 if receipt else 1}; }}
-                        systemctl() {{
-                            if [ "$1" = show ]; then
-                                if [ "{restarted}" = True ]; then
-                                    echo x >> "{tmp}/invocations"
-                                    wc -l < "{tmp}/invocations"
-                                else echo current; fi
-                            fi
-                        }}
-                        journalctl() {{ [[ "$*" != *"host endpoint heartbeat accepted"* ]]; }}
-                        '''
-                        result = subprocess.run(["bash"], input=functions + readiness + "wait_for_vmd_ready", text=True, capture_output=True)
-                        self.assertEqual(result.returncode == 0, host == "default" and receipt and not restarted, result.stderr)
+            for bound in (True, False):
+                for receipt in (True, False):
+                    for restarted in (True, False):
+                        with self.subTest(host=host, bound=bound, receipt=receipt, restarted=restarted), tempfile.TemporaryDirectory() as tmp:
+                            functions = f'''
+                            sleep() {{ :; }}
+                            sudo() {{ "$@"; }}
+                            sed() {{ echo {host}; }}
+                            legacy_heartbeat_ready() {{ return {0 if receipt and not bound and host == "default" else 1}; }}
+                            systemctl() {{
+                                if [ "$1" = show ]; then
+                                    if [ "{restarted}" = True ]; then
+                                        echo x >> "{tmp}/invocations"
+                                        wc -l < "{tmp}/invocations"
+                                    else echo current; fi
+                                fi
+                            }}
+                            journalctl() {{
+                                if [[ "$*" == *"host endpoint heartbeat accepted"* ]]; then
+                                    return {0 if bound and receipt else 1}
+                                fi
+                                return 0
+                            }}
+                            '''
+                            result = subprocess.run(["bash"], input=functions + readiness + "wait_for_vmd_ready", text=True, capture_output=True)
+                            self.assertEqual(result.returncode == 0, (bound or host == "default") and receipt and not restarted, result.stderr)
 
     def test_rollback_restores_listener_before_advertisement(self):
         cases = [(addr, failure, "spiffe://example.test/peer") for addr, failure in (("192.0.2.2:5009", "proxy"),
@@ -286,7 +293,7 @@ class DeployProxyTests(unittest.TestCase):
                     "etc/superserve/peer/tls.key": "test key",
                     "etc/superserve/peer/ca.crt": "test ca",
                     "tmp/proxy-12345678": "new binary",
-                    "tmp/check-legacy-heartbeat-12345678": "#!/bin/sh\nexit 0\n",
+                    "tmp/check-legacy-heartbeat-12345678": f"#!/bin/sh\nexit {0 if legacy else 1}\n",
                     "bin/proxy": "old binary",
                     "etc/systemd/system/proxy.service": "old unit",
                     "tmp/proxy.service": "unit",
