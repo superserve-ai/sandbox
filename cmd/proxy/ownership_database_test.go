@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/superserve-ai/sandbox/internal/proxy"
 )
 
@@ -17,6 +19,31 @@ func TestRoutingDatabaseCredentialContract(t *testing.T) {
 	if url == "" {
 		t.Skip("set PEER_ROUTING_TEST_DATABASE_URL for PostgreSQL role contract")
 	}
+	t.Run("administrator", func(t *testing.T) { testRoutingDatabaseCredentialContract(t, url) })
+	t.Run("role_administrator", func(t *testing.T) {
+		ctx := context.Background()
+		admin, err := pgx.Connect(ctx, url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer admin.Close(ctx)
+		name, password := "example_migrator_"+uuid.NewString()[:8], uuid.NewString()
+		if _, err := admin.Exec(ctx, fmt.Sprintf("CREATE ROLE %s LOGIN NOINHERIT CREATEROLE CREATEDB PASSWORD '%s'", pgx.Identifier{name}.Sanitize(), password)); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if _, err := admin.Exec(ctx, "DROP ROLE "+pgx.Identifier{name}.Sanitize()); err != nil {
+				t.Error(err)
+			}
+		}()
+		cfg := admin.Config()
+		adminURL := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable", cfg.Host, cfg.Port, cfg.Database, name, password)
+		testRoutingDatabaseCredentialContract(t, adminURL)
+	})
+}
+
+func testRoutingDatabaseCredentialContract(t *testing.T, url string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	admin, err := pgx.Connect(ctx, url)
@@ -62,14 +89,10 @@ func TestRoutingDatabaseCredentialContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sql, err := os.ReadFile("../../deploy/proxy-routing-role.sql")
+	sql, err := os.ReadFile("../../supabase/migrations/20260923000010_sandbox_proxy_router.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(ctx, string(sql)); err != nil {
-		t.Fatal(err)
-	}
-	// Provisioning must be safe to rerun without broadening grants.
 	if _, err := db.Exec(ctx, string(sql)); err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +100,33 @@ func TestRoutingDatabaseCredentialContract(t *testing.T) {
 	if _, err := db.Exec(ctx, fmt.Sprintf("ALTER ROLE sandbox_proxy_router PASSWORD '%s'", password)); err != nil {
 		t.Fatal(err)
 	}
+	// Exercise attribute repair as both a superuser and an ordinary role admin.
+	if _, err := db.Exec(ctx, `ALTER ROLE sandbox_proxy_router NOLOGIN INHERIT
+        CREATEDB CREATEROLE CONNECTION LIMIT 64`); err != nil {
+		t.Fatal(err)
+	}
+	// Reapplying must repair login/security flags without changing credentials
+	// or an operator-adjusted connection limit.
+	if _, err := db.Exec(ctx, string(sql)); err != nil {
+		t.Fatal(err)
+	}
+	var repaired bool
+	if err := db.QueryRow(ctx, `SELECT rolcanlogin AND NOT rolinherit AND NOT rolsuper
+        AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication AND NOT rolbypassrls
+        AND rolconnlimit = 64 FROM pg_roles WHERE rolname = 'sandbox_proxy_router'`).Scan(&repaired); err != nil || !repaired {
+		t.Fatalf("role repair: %v, %v", repaired, err)
+	}
 	cfg.User = "sandbox_proxy_router"
+	// Ensure the test server actually checks passwords before testing preservation.
+	cfg.Password = uuid.NewString()
+	wrong, err := pgx.ConnectConfig(ctx, cfg)
+	if wrong != nil {
+		wrong.Close(ctx)
+	}
+	var authErr *pgconn.PgError
+	if !errors.As(err, &authErr) || authErr.Code != "28P01" {
+		t.Fatalf("test database must require password authentication: %v", err)
+	}
 	cfg.Password = password
 	// ConnString retains the original URL; build the test DSN from explicit fields.
 	routingURL := fmt.Sprintf("host=%s port=%d dbname=%s user=sandbox_proxy_router password=%s sslmode=disable", cfg.Host, cfg.Port, name, password)
@@ -105,9 +154,11 @@ func TestRoutingDatabaseCredentialContract(t *testing.T) {
 	if _, err := conn.Exec(ctx, "SET default_transaction_read_only=off"); err != nil {
 		t.Fatal(err)
 	}
-	for _, query := range []string{"SELECT secret_token FROM public.sandbox", "UPDATE public.sandbox SET host_id='other'", "DELETE FROM public.host", "INSERT INTO public.host(id) VALUES('other')"} {
-		if _, err := conn.Exec(ctx, query); err == nil {
-			t.Errorf("restricted role accepted %s", query)
+	for _, query := range []string{"SELECT secret_token FROM public.sandbox", "UPDATE public.sandbox SET host_id='other'", "UPDATE public.host SET proxy_addr='192.0.2.2:5009'", "DELETE FROM public.host", "INSERT INTO public.host(id) VALUES('other')"} {
+		_, err := conn.Exec(ctx, query)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+			t.Errorf("expected permission denial for %s: %v", query, err)
 		}
 	}
 	conn.Release()
