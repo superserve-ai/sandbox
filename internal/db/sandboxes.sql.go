@@ -3005,7 +3005,7 @@ WITH reverted AS (
   UPDATE sandbox
   -- A migration pause goes back to 'migrating': that boot is not the
   -- owner's session and must not become reachable or billed.
-  SET status = CASE WHEN sandbox.pause_op_trigger = 'migration' THEN 'migrating' ELSE 'active' END,
+  SET status = (CASE WHEN sandbox.pause_op_trigger = 'migration' THEN 'migrating' ELSE 'active' END)::sandbox_status,
       updated_at = now(),
       -- The pause is over: drop its identity so a result that arrives late
       -- for it can no longer match this row.
