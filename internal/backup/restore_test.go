@@ -402,7 +402,7 @@ func TestRestoreRootPinsDirAcrossSwap(t *testing.T) {
 	if err := os.Symlink(elsewhere, destDir); err != nil {
 		t.Fatal(err)
 	}
-	madeFile, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[1], root)
+	madeFile, _, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[1], root)
 	if err != nil || !madeFile {
 		t.Fatalf("restoreFile after dir swap: made=%v err=%v", madeFile, err)
 	}
@@ -507,7 +507,7 @@ func TestRestoreFileNeverOpensExistingDest(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer root.Close()
-	madeFile, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[0], root)
+	madeFile, _, err := restoreFile(context.Background(), store, task.SandboxID, task.Generation, manifest.Files[0], root)
 	if err == nil || !errors.Is(err, os.ErrExist) {
 		t.Fatalf("err = %v, want ErrExist", err)
 	}

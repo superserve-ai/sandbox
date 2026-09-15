@@ -187,7 +187,7 @@ class DeployTargetTests(unittest.TestCase):
                                 if eval(condition.replace("&&", " and ").replace("||", " or "),
                                         {"__builtins__": {}}, context):
                                     selected.append(re.search(r"DEPLOY_CELL: (\w+)", step)[1])
-                            expected = ([cell or "usw2"] if event == "workflow_dispatch" and (kind == "vmd" or target == "standby")
+                            expected = ([cell or "usw2"] if event == "workflow_dispatch"
                                         else (["use4", "usw2"] if enabled else ["use4"]))
                             self.assertEqual(selected, expected, (kind, event, target, cell, enabled))
 
