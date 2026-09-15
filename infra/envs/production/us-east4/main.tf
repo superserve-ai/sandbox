@@ -88,6 +88,18 @@ module "network" {
   vpc_connector_subnet_ip     = var.connector_subnet_cidr
 
   firewall_rules = {
+    peer_ingress = {
+      name          = "superserve-use4-allow-peer-ingress"
+      direction     = "INGRESS"
+      source_ranges = ["10.2.0.3/32", "10.2.0.4/32"]
+      target_tags   = ["vmd-use4"]
+      allow = [{
+        protocol = "tcp"
+        ports    = ["5009"]
+      }]
+      description = "Allow private VMD peer ingress within the cell."
+    }
+
     allow_vmd_grpc = {
       name          = "superserve-use4-allow-cr-vmd"
       direction     = "INGRESS"
