@@ -1,3 +1,9 @@
+# Two-phase rollout: leave the environment variable PEER_ROUTING_ENABLED unset
+# while deploying ingress to every owner in every reachable region. Enable it
+# with value 1 only after all ingress deployments and readiness checks succeed.
+# On partial failure keep routing disabled and complete the ingress rollout.
+# Before removing ingress or rolling back to an older binary, disable routing
+# across the fleet first. Never enable routing in the initial ingress deployment.
 # Deploy Proxy — edge proxy on the VMD hosts.
 #
 # Staging runs first; production standby deploys may skip an absent staging
@@ -47,6 +53,7 @@ on:
       # it merges without deploying. Enforced by the deploy-trigger-coverage CI
       # check against `go list -deps`.
       - 'cmd/proxy/**'
+      - 'cmd/check-legacy-heartbeat/**'
       - 'internal/analytics/**'
       - 'internal/auth/**'
       - 'internal/preview/**'
@@ -73,12 +80,12 @@ jobs:
   migration-gate:
     runs-on: ubuntu-latest
     steps:
-      - name: Respect explicit host identity maintenance pause
+      - name: Require host identity readiness for automatic rollout
         env:
           DEPLOY_EVENT: ${{ github.event_name }}
           ROLLOUT_READY: ${{ vars.HOST_IDENTITY_ROLLOUT_READY }}
         run: |
-          if [ "$DEPLOY_EVENT" = push ] && [ "$ROLLOUT_READY" = false ]; then
+          if [ "$DEPLOY_EVENT" = push ] && [ "${ROLLOUT_READY:-}" != true ]; then
             echo 'Host identity migration is not complete; use the coordinated manual rollout procedure.' >&2
             exit 1
           fi
@@ -104,6 +111,7 @@ jobs:
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/proxy ./cmd/proxy
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/check-legacy-heartbeat ./cmd/check-legacy-heartbeat
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -126,6 +134,7 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
+          PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_STAGING }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_STAGING }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_STAGING }}
           # Enables the proxy's OTLP exporter (host-local collector) so the
@@ -137,12 +146,13 @@ jobs:
           # Host 1 retains its legacy peer configuration.
           # Require bootstrap only after this cell's operator-run migration.
           PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_STAGING == 'true' && 'superserve-vmd-staging-2' || '' }}
-          # Inbound ingress is a separate opt-in; outbound clients still need credentials.
-          PEER_PROXY_LISTEN_ADDR: ${{ vars.PEER_PROXY_LISTEN_ADDR_STAGING }}
+          # Routing-enabled hosts must remain reachable by their peers.
+          PEER_PROXY_LISTEN_ADDR: ${{ vars.PEER_ROUTING_ENABLED == '1' && 'auto' || vars.PEER_PROXY_LISTEN_ADDR_STAGING }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
         run: |
           if [ "$DEPLOY_EVENT" = workflow_dispatch ] && [ "$DEPLOY_TARGET" = standby ]; then
@@ -176,6 +186,7 @@ jobs:
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/proxy ./cmd/proxy
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/check-legacy-heartbeat ./cmd/check-legacy-heartbeat
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -204,17 +215,19 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
+          PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_PROD }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
-          # Enable ingress only for standby selection, which requires peer bootstrap.
-          PEER_PROXY_LISTEN_ADDR: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'standby' && 'auto' || '' }}
+          # Keep ingress enabled independently through routing enable/disable rollout.
+          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED == '1' || vars.PEER_INGRESS_ENABLED_PROD == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
@@ -232,7 +245,7 @@ jobs:
       # this way: a second job referencing the production environment would
       # double any approval gate. Running after the primary step means a bad
       # rollout stops at the primary, and the step reuses the binary built
-      # above (build once, deploy per region). Skipped until
+      # above (build once, deploy per region). On push, skipped until
       # CLOUD_RUN_SERVICE_USW (the repo-level cell-exists flag) is set.
       # Discovery is the same VMD_LABEL filter scoped to GCP_REGION_USW, so
       # the cell host must carry the label; zero matches fails the deploy
@@ -256,18 +269,20 @@ jobs:
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
+          PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_USWEST }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USW }}
           # Production opts in separately after its staging-proven migration.
           PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_USW == 'true' && 'superserve-vmd-usw2-2' || '' }}
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
-          # Enable ingress only for standby selection, which requires peer bootstrap.
-          PEER_PROXY_LISTEN_ADDR: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'standby' && 'auto' || '' }}
+          # Keep ingress enabled independently through routing enable/disable rollout.
+          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED == '1' || vars.PEER_INGRESS_ENABLED_USW == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |

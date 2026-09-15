@@ -60,3 +60,35 @@ func (h *Handler) authorizeSandboxRequest(
 
 	return info, nil
 }
+
+// Routing must authenticate before consulting shared ownership. Keep token
+// carriers intact so the destination performs its normal authorization too.
+func (h *Handler) canRouteBoxdRequest(r *http.Request, sandboxID string) bool {
+	if r.Method == http.MethodOptions {
+		return false
+	}
+	token := r.Header.Get(accessTokenHeader)
+	switch r.URL.Path {
+	case filesPath:
+		if !h.filesEnabled {
+			return false
+		}
+	case execPath, execStreamPath:
+		if !h.execEnabled {
+			return false
+		}
+	case terminalPath:
+		if h.terminal == nil {
+			return false
+		}
+		token = extractTerminalToken(r)
+	case execConnectPath:
+		if !h.execEnabled {
+			return false
+		}
+		token = extractTerminalToken(r)
+	default:
+		return false
+	}
+	return h.seedKey != nil && auth.VerifyAccessToken(h.seedKey, sandboxID, token)
+}

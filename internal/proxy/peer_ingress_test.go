@@ -533,7 +533,7 @@ func (r *peerCompletionRecorder) RecordPeerIngress(_ context.Context, event tele
 func TestPeerIngressAdmissionLimitBeforeDial(t *testing.T) {
 	p := &PeerIngress{Target: "invalid", Log: zerolog.Nop()}
 	p.activeStreams.Store(maxPeerStreams)
-	if err := p.Forward(nil); status.Code(err) != codes.ResourceExhausted {
+	if err := p.Forward(&contextPeerStream{ctx: context.Background()}); status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("saturated ingress returned %v", err)
 	}
 	if got := p.activeStreams.Load(); got != maxPeerStreams {
@@ -684,4 +684,76 @@ func (l *countedPeerListener) Accept() (net.Conn, error) {
 		l.accepted <- struct{}{}
 	}
 	return conn, err
+}
+
+func TestPeerAdmissionWaitsForSharedCapacity(t *testing.T) {
+	p := &PeerIngress{MaxStreams: 1}
+	if err := p.acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() { result <- p.acquire(context.Background()) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		p.admissionMu.Lock()
+		waiting := p.waiters
+		p.admissionMu.Unlock()
+		if waiting == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("second connection never queued")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if p.activeStreams.Load() != 1 {
+		t.Fatal("queued stream consumed active capacity")
+	}
+	p.release()
+	if err := <-result; err != nil {
+		t.Fatalf("released capacity did not admit waiter: %v", err)
+	}
+	p.release()
+	if p.activeStreams.Load() != 0 || p.waiters != 0 {
+		t.Fatal("admission leaked capacity")
+	}
+}
+
+func TestPeerAdmissionCancellationAndQueueBound(t *testing.T) {
+	p := &PeerIngress{MaxStreams: 1}
+	p.activeStreams.Store(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- p.acquire(ctx) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		p.admissionMu.Lock()
+		waiting := p.waiters
+		p.admissionMu.Unlock()
+		if waiting == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("waiter not registered")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	if err := <-result; status.Code(err) != codes.Canceled {
+		t.Fatalf("cancel=%v", err)
+	}
+	if p.waiters != 0 || p.activeStreams.Load() != 1 {
+		t.Fatal("cancellation leaked admission")
+	}
+	p.waiters = maxPeerWaiters
+	started := time.Now()
+	if err := p.acquire(context.Background()); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("queue bound=%v", err)
+	}
+	if time.Since(started) >= peerAdmissionTimeout {
+		t.Fatal("full queue waited instead of rejecting")
+	}
+	if p.waiters != maxPeerWaiters {
+		t.Fatal("rejection changed queued count")
+	}
 }
