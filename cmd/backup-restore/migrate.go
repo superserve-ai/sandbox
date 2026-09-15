@@ -35,8 +35,10 @@ import (
 //
 // Nothing on the host pauses an idle VM by itself: the reaper pauses
 // active rows whose timeout has elapsed, and most rows carry no timeout.
-// A short temporary timeout is set on the flip and cleared once the row
-// is paused again; rows that already had one keep it. No active interval
+// A short temporary timeout replaces whatever the row had on the flip
+// (a long one would not elapse either) and the original value, timeout
+// or none, is written back once the row is paused again; a row stays
+// pending until that write-back succeeds. No active interval
 // is opened for the boot: it is not the owner's usage and must not bill,
 // and without one the reaper treats the row as long expired and pauses
 // it on its next tick, which is the intent.
@@ -137,6 +139,11 @@ func runMigrate(args []string) int {
 		queue = append(queue, id)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		// A partial inventory would migrate a subset and report it whole.
+		fmt.Fprintf(os.Stderr, "migrate: inventory: %v\n", err)
+		return 1
+	}
 	if *limit > 0 && len(queue) > *limit {
 		queue = queue[:*limit]
 	}
@@ -155,8 +162,9 @@ func runMigrate(args []string) int {
 	vmd := vmdpb.NewVMDaemonClient(gconn)
 
 	type live struct {
-		since      time.Time
-		hadTimeout bool
+		since       time.Time
+		origTimeout *int32 // written back after the pause; nil = none
+		restores    int    // write-back attempts so far
 	}
 	active := map[string]live{} // booted here, waiting for the reaper
 	moved, failed, stuck := 0, 0, 0
@@ -202,19 +210,37 @@ func runMigrate(args []string) int {
 				}
 			}
 			st.Close()
-			var clear []string
-			for _, id := range paused {
-				if !active[id].hadTimeout {
-					clear = append(clear, id)
-				}
-				delete(active, id)
-				moved++
-				fmt.Printf("MOVED %s\n", id)
+			if err := st.Err(); err != nil {
+				fmt.Fprintf(os.Stderr, "migrate: poll: %v\n", err)
+				return 1
 			}
-			if len(clear) > 0 {
-				if _, err := conn.Exec(ctx, `UPDATE sandbox SET timeout_seconds = NULL, updated_at = now()
-					WHERE id = ANY($1::uuid[]) AND status = 'paused' AND timeout_seconds = $2`, clear, int32(*tmpTimeout)); err != nil {
-					fmt.Printf("WARN clearing the temporary timeout on %d rows failed: %v\n", len(clear), err)
+			// A paused row is moved only once its original timeout is back;
+			// until then it stays pending and the write-back is retried.
+			if len(paused) > 0 {
+				origs := make([]*int32, len(paused))
+				for i, id := range paused {
+					origs[i] = active[id].origTimeout
+				}
+				_, err := conn.Exec(ctx, `UPDATE sandbox s SET timeout_seconds = v.orig, updated_at = now()
+					FROM unnest($1::uuid[], $2::int[]) AS v(id, orig)
+					WHERE s.id = v.id AND s.status = 'paused' AND s.timeout_seconds = $3`, paused, origs, int32(*tmpTimeout))
+				for _, id := range paused {
+					if err != nil {
+						l := active[id]
+						l.restores++
+						active[id] = l
+						if l.restores >= 5 {
+							delete(active, id)
+							recordFailure(id, fmt.Sprintf("paused here but its timeout could not be written back after %d attempts: %v", l.restores, err))
+						}
+						continue
+					}
+					delete(active, id)
+					moved++
+					fmt.Printf("MOVED %s\n", id)
+				}
+				if err != nil {
+					fmt.Printf("WARN writing back the timeout on %d rows failed, retrying: %v\n", len(paused), err)
 				}
 			}
 			for _, id := range gone {
@@ -222,6 +248,9 @@ func runMigrate(args []string) int {
 				recordFailure(id, "row failed after boot and stays failed on "+*toHost+"; needs an operator")
 			}
 			for id, l := range active {
+				if l.restores > 0 {
+					continue // paused; only the write-back is outstanding
+				}
 				if time.Since(l.since) > *pauseWait {
 					delete(active, id)
 					stuck++
@@ -239,13 +268,13 @@ func runMigrate(args []string) int {
 			batch := queue[:n]
 			queue = queue[n:]
 			type shape struct {
-				vcpu, mem  int32
-				team       string
-				hadTimeout bool
-				rules      egressRules
+				vcpu, mem   int32
+				team        string
+				origTimeout *int32
+				rules       egressRules
 			}
 			shapes := map[string]shape{}
-			sq, err := conn.Query(ctx, `SELECT id::text, vcpu_count, memory_mib, team_id::text, timeout_seconds IS NOT NULL, network_config
+			sq, err := conn.Query(ctx, `SELECT id::text, vcpu_count, memory_mib, team_id::text, timeout_seconds, network_config
 				FROM sandbox WHERE id = ANY($1::uuid[]) AND host_id = $2 AND status = 'paused' AND destroyed_at IS NULL`, batch, *fromHost)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
@@ -255,7 +284,7 @@ func runMigrate(args []string) int {
 				var id string
 				var s shape
 				var raw []byte
-				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.hadTimeout, &raw); err != nil {
+				if err := sq.Scan(&id, &s.vcpu, &s.mem, &s.team, &s.origTimeout, &raw); err != nil {
 					sq.Close()
 					fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
 					return 1
@@ -267,6 +296,10 @@ func runMigrate(args []string) int {
 				shapes[id] = s
 			}
 			sq.Close()
+			if err := sq.Err(); err != nil {
+				fmt.Fprintf(os.Stderr, "migrate: shapes: %v\n", err)
+				return 1
+			}
 			for _, id := range batch {
 				if _, ok := shapes[id]; !ok && !skip[id] {
 					fmt.Printf("SKIP %s: no longer paused on %s\n", id, *fromHost)
@@ -308,7 +341,7 @@ func runMigrate(args []string) int {
 					// longer paused on the source was resumed by its owner
 					// meanwhile: leave it, and take the boot back down.
 					tag, err := conn.Exec(ctx, `UPDATE sandbox SET host_id = $1, status = 'active',
-							timeout_seconds = COALESCE(timeout_seconds, $2), updated_at = now()
+							timeout_seconds = $2, updated_at = now()
 						WHERE id = $3 AND host_id = $4 AND status = 'paused' AND destroyed_at IS NULL`,
 						*toHost, int32(*tmpTimeout), id, *fromHost)
 					mu.Lock()
@@ -327,7 +360,7 @@ func runMigrate(args []string) int {
 						return
 					}
 					booted++
-					active[id] = live{since: time.Now(), hadTimeout: s.hadTimeout}
+					active[id] = live{since: time.Now(), origTimeout: s.origTimeout}
 				}(id, s)
 			}
 			wg.Wait()
