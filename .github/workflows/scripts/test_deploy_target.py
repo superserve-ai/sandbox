@@ -120,7 +120,8 @@ class DeployTargetTests(unittest.TestCase):
                                          DEPLOY_TARGET=target, MOCK_ROLE_ROWS=f"{host},{region}-a\n")
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout.splitlines(),
-                                     [f"component=vmd-{cell}-standby", host, host, "0", "auto"])
+                                     [f"component=vmd-{cell}-standby",
+                                      host if cell == "staging" else "legacy-host", host, "0", "auto"])
 
     def test_serving_preserves_existing_peer_configuration(self):
         for cell in ("staging", "use4", "usw2"):
@@ -152,7 +153,7 @@ class DeployTargetTests(unittest.TestCase):
                              GCP_REGION="us-east4", MOCK_ROLE_ROWS="example-replacement,us-east4-a\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(),
-                         ["component=vmd-use4-standby", "example-replacement",
+                         ["component=vmd-use4-standby", "legacy-host",
                           "example-replacement", "0", "auto"])
 
     def test_promotion_and_rollback_follow_roles_in_both_cells(self):
@@ -161,9 +162,10 @@ class DeployTargetTests(unittest.TestCase):
                                       ("example-host-2", "example-host-1")):
                 with self.subTest(cell=cell, serving=serving):
                     result = self.select(DEPLOY_CELL=cell, DEPLOY_PRODUCTION_CELL=cell,
-                                         GCP_REGION=region, MOCK_ROLE_ROWS=f"{inactive},{region}-a\n")
+                                         GCP_REGION=region, MOCK_ROLE_ROWS=f"{inactive},{region}-a\n",
+                                         PEER_IDENTITY_HOSTS="example-host-2")
                     self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout.splitlines()[1:3], [inactive, inactive])
+                    self.assertEqual(result.stdout.splitlines()[1:3], ["example-host-2", inactive])
                     self.assertEqual(self.deploy_selection(f"{inactive},{region}-a\n", region, inactive),
                                      (0, [inactive]))
                     # A role change between selection and discovery must fail closed.
