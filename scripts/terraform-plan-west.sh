@@ -7,7 +7,7 @@ ENV_DIR="${ROOT_DIR}/infra/envs/production/us-west2"
 cd "${ENV_DIR}"
 terraform init
 terraform validate
-terraform plan -var='active_sandbox_host=primary' -out=tfplan
+terraform plan -out=tfplan
 terraform show -no-color tfplan > plan.txt
 
 verify_plan() {
@@ -46,7 +46,8 @@ verify_plan() {
 
 # Check both active-host selections so exporter and gRPC routing cannot regress
 # for either the primary rollback or promoted standby path.
-verify_plan tfplan 'module.sandbox_host.google_compute_instance.this' primary
+terraform plan -var='active_sandbox_host=primary' -out=tfplan-primary
+verify_plan tfplan-primary 'module.sandbox_host.google_compute_instance.this' primary
 terraform plan -var='active_sandbox_host=standby' -out=tfplan-standby
 verify_plan tfplan-standby 'module.sandbox_host_b.google_compute_instance.this' standby
 
