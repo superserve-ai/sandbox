@@ -239,8 +239,13 @@ func TestHostRestoreMaterializesSharedBaseOnce(t *testing.T) {
 			unpacked++
 		}
 	}
-	if unpacked == 0 {
-		t.Fatal("no unpacked master base in the cache; materializer did not run")
+	// The master copy exists only where it can be shared; elsewhere the
+	// materializer unpacks straight into each sandbox.
+	if cache.supportsClone() && unpacked == 0 {
+		t.Fatal("reflink filesystem but no unpacked master base in the cache")
+	}
+	if !cache.supportsClone() && unpacked != 0 {
+		t.Fatal("no reflink support but an unpacked master base was written")
 	}
 	for _, d := range []string{"a", "b"} {
 		got, err := os.ReadFile(filepath.Join(root, d, SharedBaseName(digestOf(baseData))))

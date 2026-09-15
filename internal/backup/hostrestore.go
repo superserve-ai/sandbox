@@ -479,6 +479,39 @@ type CachingBaseReader struct {
 	Inner BlobReader
 	Dir   string
 	group singleflight.Group
+
+	// cloneProbe caches whether Dir's filesystem can reflink. Without
+	// reflink a master copy buys nothing, so MaterializeBase falls back to
+	// the direct per-sandbox unpack instead of paying for a copy nobody
+	// shares.
+	cloneProbe sync.Once
+	canClone   bool
+}
+
+// supportsClone reports once whether files under c.Dir can be reflinked.
+func (c *CachingBaseReader) supportsClone() bool {
+	c.cloneProbe.Do(func() {
+		if err := os.MkdirAll(c.Dir, 0o700); err != nil {
+			return
+		}
+		src, err := os.CreateTemp(c.Dir, ".probe-src-*")
+		if err != nil {
+			return
+		}
+		defer os.Remove(src.Name())
+		defer src.Close()
+		dst, err := os.CreateTemp(c.Dir, ".probe-dst-*")
+		if err != nil {
+			return
+		}
+		defer os.Remove(dst.Name())
+		defer dst.Close()
+		if _, err := src.Write([]byte{0}); err != nil {
+			return
+		}
+		c.canClone = cloneFile(dst, src) == nil
+	})
+	return c.canClone
 }
 
 func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.ReadCloser, error) {
@@ -574,6 +607,16 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 	if !isHexDigest(mf.SHA256) {
 		return fmt.Errorf("materialize: manifest digest %q is not a sha256", mf.SHA256)
 	}
+	if !c.supportsClone() {
+		// No block sharing to gain: unpack straight into the sandbox, the
+		// same single pass the streaming path always did.
+		rc, err := c.NewReader(ctx, object)
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+		return unpackExtents(ctx, rc, mf, dst)
+	}
 	unpacked := filepath.Join(c.Dir, ".unpacked-"+mf.SHA256)
 	_, err, _ := c.group.Do(unpacked, func() (any, error) {
 		if _, err := os.Stat(unpacked); err == nil {
@@ -614,21 +657,5 @@ func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, 
 		return err
 	}
 	defer src.Close()
-	if err := cloneFile(dst, src); err == nil {
-		return nil
-	}
-	// No reflink on this filesystem: copy the bytes, holes preserved.
-	extents, apparent, err := Extents(src)
-	if err != nil {
-		return err
-	}
-	for _, e := range extents {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if _, err := io.CopyN(io.NewOffsetWriter(dst, e.Offset), io.NewSectionReader(src, e.Offset, e.Length), e.Length); err != nil {
-			return fmt.Errorf("copy extent at %d: %w", e.Offset, err)
-		}
-	}
-	return dst.Truncate(apparent)
+	return cloneFile(dst, src)
 }
