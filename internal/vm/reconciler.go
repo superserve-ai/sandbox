@@ -859,6 +859,17 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 			log.Warn().Str("vm_id", id).Str("drift", "systemd_active_db_paused").
 				Msg("live unit for paused sandbox — stopping")
 			err := r.mgr.stopVM(ctx, id, supervisionOf[id])
+			// A nil stop can still leave a unit deactivating (an expired stop
+			// wait settles as success), so only the at-rest probe proves the
+			// process gone — the proof an overlay deferred by a Full fallback
+			// waits for on hosts with no backup worker to supply it. A
+			// transitional unit is left for the next pass.
+			if err == nil && r.mgr.vmConfirmedAtRest(ctx, id) {
+				r.mgr.vmStopUnconfirmed.Delete(id)
+				if inst := r.mgr.trackedInstance(id); inst != nil {
+					r.mgr.reclaimStrandedOverlays(inst, log)
+				}
+			}
 			unlockOp()
 			if err != nil {
 				log.Error().Err(err).Str("vm_id", id).Msg("failed to stop paused sandbox's unit")
@@ -872,6 +883,11 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 	}
 
 	r.reapUnverifiedOrphans(ctx, log, dbSandboxes, active, supervisionOf, now)
+
+	// Overlays a Full fallback deferred whose VM has since come to rest with
+	// no lifecycle op or backup worker left to notice (see Drift 7 for the
+	// still-active case).
+	r.mgr.sweepStrandedOverlays(ctx, log)
 
 	// Rollback drain: with direct spawn disarmed, paused cgroup records are
 	// demoted back to unit supervision so the fleet converges to a state an

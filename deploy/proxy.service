@@ -11,6 +11,15 @@ RestartSec=2
 
 Environment=PROXY_ADDR=:5007
 Environment=PROXY_REDIRECT_ADDR=:5008
+# Optional private peer ingress. Credentials are provisioned by the host
+# identity bootstrap. Outbound clients use credentials even without ingress.
+Environment=PEER_PROXY_LISTEN_ADDR=
+Environment=PEER_PROXY_TARGET_ADDR=127.0.0.1:5010
+Environment=PEER_PROXY_MAX_STREAMS=128
+Environment=PEER_PROXY_CERT_FILE=/etc/superserve/peer/tls.crt
+Environment=PEER_PROXY_KEY_FILE=/etc/superserve/peer/tls.key
+Environment=PEER_PROXY_CA_FILE=/etc/superserve/peer/ca.crt
+Environment=PEER_PROXY_SPIFFE_URI=
 Environment=VMD_ADDR=http://127.0.0.1:9090
 # Load host-local overrides (SANDBOX_ACCESS_TOKEN_SEED, PROXY_ALLOWED_ORIGINS,
 # REQUIRE_DATA_PLANE) from an env file. Leading `-` makes the file optional —

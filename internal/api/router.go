@@ -85,6 +85,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/sandboxes/:sandbox_id/network", h.GetSandboxNetwork)
 
 		api.GET("/billing/summary", h.GetBillingSummary)
+		api.GET("/billing/usage-series", h.GetBillingUsageSeries)
 		api.GET("/billing/pricing", h.GetBillingPricing)
 		api.GET("/teams/:team_id/billing/usage", h.GetTeamBillingUsage)
 		api.GET("/teams/:team_id/billing/periods", h.ListTeamBillingPeriods)
@@ -116,6 +117,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	{
 		operator.GET("/hosts", h.HostList)
 		operator.POST("/hosts/:host_id/status", h.HostUpdateStatus)
+		operator.POST("/hosts/:host_id/incarnation", h.HostRebindIncarnation)
 		// Abuse controls require the operator credential; the host-shared
 		// internal token must not be sufficient to grant or remove trust.
 		operator.GET("/abuse/teams/:team_id/trust", h.GetPlatformAbuseTeamTrust)
@@ -149,6 +151,8 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/billing", h.ListPlatformBilling)
 		internal.GET("/teams/:team_id/billing/usage", h.GetPlatformTeamBillingUsage)
 		internal.GET("/teams/:team_id/billing/periods", h.ListPlatformTeamBillingPeriods)
+		internal.POST("/billing/cutover", h.EstablishBillingCutover)
+		internal.POST("/teams/:team_id/billing/anchor", h.EstablishCommercialBillingAnchor)
 		internal.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetPlatformTeamBillingExportPreview)
 		internal.POST("/teams/:team_id/billing/periods/:period_id/approve", h.ApproveTeamBillingPeriod)
 		internal.POST("/teams/:team_id/billing/periods/:period_id/export", h.ExportTeamBillingPeriod)

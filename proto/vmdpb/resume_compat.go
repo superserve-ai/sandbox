@@ -8,10 +8,13 @@ import "google.golang.org/protobuf/encoding/protowire"
 // shim build_status_compat.go uses for GetBuildStatusResponse's
 // allocation fields, needed here because vmd.pb.go already lags
 // vmd.proto by several other messages' fields and a full regeneration
-// would fold in unrelated, still-in-flight changes.
+// would fold in unrelated, still-in-flight changes. Numbered 10/11:
+// fields 7-9 are ResumeVMRequest's real, already-generated preview
+// fields (PreviewAccess/PreviewPorts/PreviewPolicyRevision), not
+// available for a second, unknown-field-only meaning.
 const (
-	resumeGenerationField protowire.Number = 7
-	resumeFcSha256Field   protowire.Number = 8
+	resumeGenerationField protowire.Number = 10
+	resumeFcSha256Field   protowire.Number = 11
 )
 
 // GetGeneration returns the backup generation the caller wants

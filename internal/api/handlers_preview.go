@@ -122,6 +122,19 @@ func publishedPortPolicies(ports []db.ListPublishedPortsRow) map[int32]vmdclient
 	return out
 }
 
+// claimedPortPolicies is publishedPortPolicies over the parallel arrays the
+// resume claim aggregates its ports into.
+func claimedPortPolicies(ports []int32, accesses []string, tokenVersions []int64) map[int32]vmdclient.PortPolicy {
+	rows := make([]db.ListPublishedPortsRow, 0, len(ports))
+	for i, port := range ports {
+		if i >= len(accesses) || i >= len(tokenVersions) {
+			break
+		}
+		rows = append(rows, db.ListPublishedPortsRow{Port: port, Access: accesses[i], TokenVersion: tokenVersions[i]})
+	}
+	return publishedPortPolicies(rows)
+}
+
 // vmdPorts strips credential generations from non-tokenized modes. The
 // control-plane snapshot retains them so API publication responses can report
 // the durable generation for public ports too, but public wire records have no
@@ -267,7 +280,8 @@ func (h *Handlers) applyPreviewMutationValidated(ctx context.Context, sandboxID,
 
 func validateHostPreviewCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
 	ok, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: hostID, RequiredCapabilities: capabilities,
+		AllowedStatuses: []string{"active"},
+		HostID:          hostID, RequiredCapabilities: capabilities,
 	})
 	if err != nil {
 		return err
@@ -276,6 +290,51 @@ func validateHostPreviewCapabilities(ctx context.Context, q *db.Queries, hostID 
 		return &missingHostPreviewCapabilityError{capability: strings.Join(capabilities, `", "`)}
 	}
 	return nil
+}
+
+// Owner resume preserves lifecycle continuity while placement and mutations
+// retain the active-only capability rule.
+func validateOwnerResumeBrowserCapabilities(ctx context.Context, q *db.Queries, hostID string) error {
+	return validateOwnerResumeCapabilities(ctx, q, hostID, previewBrowserCapabilities()...)
+}
+
+func validateOwnerResumeCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
+	ok, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+		AllowedStatuses: []string{"active", "draining"},
+		HostID:          hostID, RequiredCapabilities: capabilities,
+		HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},
+	})
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return &missingHostPreviewCapabilityError{capability: strings.Join(capabilities, `", "`)}
+	}
+	return nil
+}
+
+func validateOwnerResumePolicyCapabilities(ctx context.Context, q *db.Queries, hostID string, policy previewPolicySnapshot) error {
+	if policy.requiresBrowserCapability() {
+		return validateOwnerResumeBrowserCapabilities(ctx, q, hostID)
+	}
+	if policy.Access != preview.AccessLegacyPublic {
+		return validateOwnerResumeCapabilities(ctx, q, hostID, preview.HostCapabilityPorts)
+	}
+	return nil
+}
+
+func (h *Handlers) requireOwnerResumeCapabilities(c *gin.Context, hostID string, capabilities ...string) bool {
+	hasCapabilities, err := h.hostHasCapabilitiesCachedForScope(c.Request.Context(), hostID, capabilities, ownerResumeCapabilities)
+	if err != nil || hasCapabilities {
+		return h.respondHostCapabilityResult(c, hostID, capabilities, hasCapabilities, err)
+	}
+	// Active-only diagnostics cannot explain the owner-resume eligibility rule.
+	log.Warn().Str("host_id", hostID).Str("sandbox_id", c.Param("sandbox_id")).
+		Strs("required_capabilities", capabilities).Msg("owner resume capability enforcement rejected request")
+	respondErrorMsg(c, "conflict",
+		fmt.Sprintf("The sandbox's host does not enforce all required capabilities (%s); retry after the fleet is upgraded", strings.Join(capabilities, ", ")),
+		http.StatusConflict)
+	return false
 }
 
 func previewBrowserCapabilities() []string {
@@ -343,8 +402,15 @@ func (h *Handlers) pushPreviewCredentialPolicy(ctx context.Context, sandbox db.S
 // transactional validateHostPreviewCapabilities on mutations.
 func (h *Handlers) requireHostPreviewCapabilities(c *gin.Context, hostID string, capabilities ...string) bool {
 	hasCapabilities, err := h.hostHasCapabilitiesCached(c.Request.Context(), hostID, capabilities)
+	return h.respondHostCapabilityResult(c, hostID, capabilities, hasCapabilities, err)
+}
+
+// respondHostCapabilityResult turns a pre-flight outcome into the response
+// (error → 500, rejection → 409 with diagnostics gathered off the request)
+// and returns true when the host passed.
+func (h *Handlers) respondHostCapabilityResult(c *gin.Context, hostID string, capabilities []string, hasCapabilities bool, err error) bool {
 	if err != nil {
-		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("DB HostHasCapabilities failed")
+		log.Error().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).Msg("host pre-flight failed")
 		respondError(c, ErrInternal)
 		return false
 	}

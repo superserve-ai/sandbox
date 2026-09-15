@@ -23,6 +23,16 @@ type SnapshotCreateParams struct {
 	// Directory for block device delta files. When set, overlay block devices write delta files (containing only dirty blocks) into this directory, named {drive_id}.delta.
 	BlockDeltaDir string `json:"block_delta_dir,omitempty"`
 
+	// Expected dirty-bitmap generation accompanying expected_session_id. The generation starts at 0 when tracking is armed and increments on every snapshot attempt (any type consumes or resets the bitmap, including attempts that fail midway).
+	// Minimum: 0
+	ExpectedGeneration *int64 `json:"expected_generation,omitempty"`
+
+	// Expected dirty-tracking session id for a guarded snapshot. When set (together with expected_generation), the snapshot is created only if the token matches the session installed at snapshot-load time; a mismatch is rejected with error_kind DirtyTrackingSessionMismatch before the dirty bitmap or any output file is touched. Must be supplied together with expected_generation; a value that violates the shape constraints, or either field on its own, is rejected as a plain bad request, not a mismatch.
+	// Max Length: 128
+	// Min Length: 1
+	// Pattern: ^[A-Za-z0-9_-]+$
+	ExpectedSessionID string `json:"expected_session_id,omitempty"`
+
 	// If true, each overlay block device's dirty blocks are baked into its base.ext4 in place and the side-car bitmap is born zero. Restores create an empty per-VM overlay (no apply_delta replay). Only safe at template-creation time — mutates base.ext4, would corrupt any other live VM reading the same base. Must be paired with block_delta_dir; requests with flatten=true and an unset block_delta_dir are rejected.
 	Flatten *bool `json:"flatten,omitempty"`
 
@@ -43,6 +53,14 @@ type SnapshotCreateParams struct {
 func (m *SnapshotCreateParams) Validate(formats strfmt.Registry) error {
 	var res []error
 
+	if err := m.validateExpectedGeneration(formats); err != nil {
+		res = append(res, err)
+	}
+
+	if err := m.validateExpectedSessionID(formats); err != nil {
+		res = append(res, err)
+	}
+
 	if err := m.validateMemFilePath(formats); err != nil {
 		res = append(res, err)
 	}
@@ -58,6 +76,38 @@ func (m *SnapshotCreateParams) Validate(formats strfmt.Registry) error {
 	if len(res) > 0 {
 		return errors.CompositeValidationError(res...)
 	}
+	return nil
+}
+
+func (m *SnapshotCreateParams) validateExpectedGeneration(formats strfmt.Registry) error {
+	if swag.IsZero(m.ExpectedGeneration) { // not required
+		return nil
+	}
+
+	if err := validate.MinimumInt("expected_generation", "body", *m.ExpectedGeneration, 0, false); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *SnapshotCreateParams) validateExpectedSessionID(formats strfmt.Registry) error {
+	if swag.IsZero(m.ExpectedSessionID) { // not required
+		return nil
+	}
+
+	if err := validate.MinLength("expected_session_id", "body", m.ExpectedSessionID, 1); err != nil {
+		return err
+	}
+
+	if err := validate.MaxLength("expected_session_id", "body", m.ExpectedSessionID, 128); err != nil {
+		return err
+	}
+
+	if err := validate.Pattern("expected_session_id", "body", m.ExpectedSessionID, `^[A-Za-z0-9_-]+$`); err != nil {
+		return err
+	}
+
 	return nil
 }
 

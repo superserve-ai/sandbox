@@ -421,6 +421,8 @@ type Host struct {
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
 	IdentityBound     bool               `json:"identity_bound"`
+	IncarnationID     pgtype.UUID        `json:"incarnation_id"`
+	PeerGeneration    *int64             `json:"peer_generation"`
 }
 
 // Data-plane capabilities jointly advertised by the currently running host services. heartbeat_at must match host.last_heartbeat_at, so an old control-plane heartbeat automatically invalidates an attestation it cannot replace.
@@ -429,6 +431,11 @@ type HostCapability struct {
 	Capability  string    `json:"capability"`
 	HeartbeatAt time.Time `json:"heartbeat_at"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+type HostIdentityRegistry struct {
+	HostID  string `json:"host_id"`
+	Retired bool   `json:"retired"`
 }
 
 type HostPressure struct {
@@ -446,6 +453,18 @@ type HostPressure struct {
 	MaxSandboxes          int32     `json:"max_sandboxes"`
 	UnknownAllocationVms  int32     `json:"unknown_allocation_vms"`
 	ReportedAt            time.Time `json:"reported_at"`
+}
+
+type HostRetiredAddress struct {
+	HostID        string    `json:"host_id"`
+	IncarnationID uuid.UUID `json:"incarnation_id"`
+	VmdAddr       string    `json:"vmd_addr"`
+}
+
+type HostRetiredIncarnation struct {
+	HostID                 string    `json:"host_id"`
+	IncarnationID          uuid.UUID `json:"incarnation_id"`
+	SuccessorIncarnationID uuid.UUID `json:"successor_incarnation_id"`
 }
 
 type NetFlow struct {
@@ -589,6 +608,26 @@ type Sandbox struct {
 	FailedAt          pgtype.Timestamptz `json:"failed_at"`
 	// True once any secret binding has existed for this sandbox; false when the sandbox was created without one; NULL for rows predating the column. Never cleared — a detached or failure-cleared binding may still have had a JWT minted against it. Destroy revokes unless this is false.
 	HadSecretBindings *bool `json:"had_secret_bindings"`
+	// Digest of the binding set last injected into the guest; a resume re-injects when the current set differs.
+	SecretEnvFingerprint *string `json:"secret_env_fingerprint"`
+	// Guest IP the injected proxy JWT is bound to; a resume re-injects when the guest comes back on another.
+	SecretEnvIp *string `json:"secret_env_ip"`
+	// When the last injection landed; only a snapshot taken after it holds the injected environment.
+	SecretEnvInjectedAt pgtype.Timestamptz `json:"secret_env_injected_at"`
+	// Expiry of the injected proxy JWT; a resume re-injects when it is near.
+	SecretEnvExpiresAt pgtype.Timestamptz `json:"secret_env_expires_at"`
+	// Identity of the pause in flight, reused as the pause token across every attempt; NULL when no pause is pending.
+	PauseOpID        pgtype.UUID        `json:"pause_op_id"`
+	PauseOpStartedAt pgtype.Timestamptz `json:"pause_op_started_at"`
+	// Until when the worker holding pause_op_lease_version may act on the pause; expired or NULL means claimable.
+	PauseOpLeaseUntil   pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
+	// When a pause pending past its age threshold was flagged for an operator; set once.
+	PauseOpAttentionAt pgtype.Timestamptz `json:"pause_op_attention_at"`
+	// Why the pause in flight was started (pause, timeout, billing_ineligible); kept so a reconciled pause records its original cause.
+	PauseOpTrigger *string `json:"pause_op_trigger"`
+	// Who asked for the pause in flight; NULL for automatic pauses. Kept so a reconciled pause is attributed to them.
+	PauseOpActorID pgtype.UUID `json:"pause_op_actor_id"`
 }
 
 type SandboxActiveInterval struct {
@@ -750,6 +789,11 @@ type TeamBillingAccount struct {
 	TrialEndedAt                    pgtype.Timestamptz `json:"trial_ended_at"`
 	StripeActivationCreditGrantedAt pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
 	StripeActivationCreditGrantID   *string            `json:"stripe_activation_credit_grant_id"`
+	// Authoritative Superserve commercial billing start. May predate Stripe subscription creation and must not be overwritten by Checkout time.
+	CommercialBillingAnchor pgtype.Timestamptz `json:"commercial_billing_anchor"`
+	CheckoutInitializingAt  pgtype.Timestamptz `json:"checkout_initializing_at"`
+	CheckoutAnchorSnapshot  pgtype.Timestamptz `json:"checkout_anchor_snapshot"`
+	CheckoutSessionID       *string            `json:"checkout_session_id"`
 }
 
 type TeamBillingPeriod struct {

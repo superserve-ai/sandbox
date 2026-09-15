@@ -29,7 +29,8 @@ func newExecTestEnv(t *testing.T) *filesTestEnv {
 		domain:    "sandbox.test",
 	}
 
-	env.upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// The sandbox may deny IPv6 loopback binds; use an explicit IPv4 listener.
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		env.upstreamMu.Lock()
 		env.lastReq = capturedRequest{
 			method:             r.Method,
@@ -43,7 +44,14 @@ func newExecTestEnv(t *testing.T) *filesTestEnv {
 		env.upstreamMu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"stdout":"","stderr":"","exit_code":0}`))
-	}))
+	})
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("loopback listener unavailable: %v", err)
+	}
+	server := &httptest.Server{Listener: ln, Config: &http.Server{Handler: handler}}
+	server.Start()
+	env.upstream = server
 	t.Cleanup(env.upstream.Close)
 
 	upURL, _ := url.Parse(env.upstream.URL)

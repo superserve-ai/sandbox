@@ -252,19 +252,6 @@ func (m *Manager) fetchGenerationForResume(ctx context.Context, vmID, generation
 	return bytesRestored, nil
 }
 
-// syncDir opens dir and fsyncs it, the standard way to make a prior
-// rename or unlink's directory-entry change durable — content fsyncs on
-// the files themselves cover their bytes, not the name that makes them
-// visible after a crash.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
-}
-
 // writeFetchPendingMarker creates or overwrites the marker with the
 // generation being fetched, fsynced so its presence is crash-durable —
 // the property fetchGenerationForResume's interrupted-attempt detection

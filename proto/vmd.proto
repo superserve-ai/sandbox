@@ -198,6 +198,7 @@ message GetBuildStatusResponse {
   int64 rootfs_allocated_bytes = 13;
   int64 base_allocated_bytes = 14;
   int64 delta_allocated_bytes = 15;
+  bool allocated_bytes_supported = 16;
 }
 
 message CancelBuildRequest {
@@ -382,11 +383,21 @@ message ResumeVMRequest {
   map<string, string> env_vars = 5;          // Re-inject env vars after resume.
   reserved 6;                                 // was secrets_broker (SecretsBrokerConfig)
   reserved "secrets_broker";
+  // Preview policy stamped on the record before the guest runs, with the
+  // same fields and rules as RestoreSnapshotRequest. Empty preview_access
+  // means a sender from before these fields: the record keeps its policy
+  // and the response carries no attestation.
+  string preview_access = 7;
+  repeated PreviewPort preview_ports = 8;
+  int64 preview_policy_revision = 9;
   // Generation and FcSha256 below ride proto/vmdpb's unknown-field
   // compatibility shim (see resume_compat.go, the same pattern
   // build_status_compat.go uses for GetBuildStatusResponse) rather than
   // a full protoc regeneration, so this change doesn't collide with
   // other already-declared-but-not-yet-regenerated fields in this file.
+  // Numbered 10/11, past the preview fields above: those are already
+  // real generated struct fields (7-9), so anything riding the unknown-
+  // field shim must start clear of them.
   //
   // Generation is the backup generation the control plane's coverage
   // record believes is durable for this sandbox, e.g. from a
@@ -395,13 +406,13 @@ message ResumeVMRequest {
   // disk, fail the normal way if it's missing". Naming the exact
   // generation up front means a host with fetch-before-resume enabled
   // never has to list the bucket to guess one on the resume hot path.
-  string generation = 7;
+  string generation = 10;
   // FcSha256 would let a fetching host verify a generation was captured
   // with a Firecracker build compatible with its own before trusting a
   // cross-host restore. Left empty: nothing in this system attests a
   // host's build today, so a fetching host cannot yet act on this field
   // and treats it as absent rather than refusing every fetch.
-  string fc_sha256 = 8;
+  string fc_sha256 = 11;
 }
 
 message ResumeVMResponse {
@@ -410,6 +421,18 @@ message ResumeVMResponse {
   string ip_address = 3;
   uint32 pid = 4;
   ResourceLimits resource_limits = 5;
+  // Attests that the request's preview policy fields were applied; same
+  // value and rules as RestoreSnapshotResponse.preview_protocol. Empty
+  // means the request carried no policy or the vmd predates this field.
+  string preview_protocol = 6;
+  // True when the request's egress rules are fully in place on the VM,
+  // including one adopted from an earlier attempt. False means the caller
+  // must push them itself.
+  bool network_rules_applied = 7;
+  // The policy revision the record holds after the stamp: the request's
+  // when it was applied, higher when the record already held a newer
+  // policy and kept it. Set only with preview_protocol.
+  int64 preview_policy_revision = 8;
 }
 
 // ---------------------------------------------------------------------------

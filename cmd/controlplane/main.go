@@ -25,7 +25,6 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
@@ -265,12 +264,39 @@ func run() error {
 	sched := &scheduler.LeastLoaded{DB: queries, DefaultHostID: cfg.DefaultHostID}
 	handlers.Scheduler = sched
 
+	// Capacity ranking, measurement only. Placement stays exactly as it
+	// was: this observes a sample of creates and reports what ranking
+	// WOULD have chosen, so the scoring can be judged against real
+	// traffic before anything is allowed to depend on it. Enforcement
+	// needs a host-side admission gate that does not exist yet, so there
+	// is deliberately no flag here that makes ranking decide anything.
+	if cfg.SchedulerCapacityShadow {
+		ranker := &scheduler.CapacityRanker{DB: queries, Region: api.SandboxIDRegion()}
+		shadow := scheduler.NewShadowEvaluator(ranker, func(obs scheduler.ShadowObservation) {
+			recorder.RecordCapacityShadow(context.Background(), telemetry.CapacityShadow{
+				Result:         obs.Result,
+				Agreement:      obs.Agreement,
+				Profile:        obs.Profile,
+				Described:      obs.Described,
+				UnderDescribed: obs.UnderDescribed,
+				Legacy:         obs.Legacy,
+				Stale:          obs.Stale,
+				Duration:       obs.Duration,
+				Refresh:        obs.Refresh,
+			})
+		})
+		handlers.Shadow = shadow
+		go shadow.Run(ctx)
+		log.Info().Msg("capacity ranking shadow evaluation enabled (measurement only; placement unchanged)")
+	}
+
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
 	// Launch the timeout reaper. This goroutine destroys sandboxes whose
 	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped
 	// to ctx so it exits on shutdown.
 	handlers.StartTimeoutReaper(ctx, api.DefaultReaperConfig())
+	handlers.StartPauseReconciler(ctx)
 
 	// Launch the template build supervisor. Drives template_build rows
 	// through pending → building → snapshotting → ready/failed by calling
@@ -458,7 +484,7 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir, pa
 			SizeBytes:      e.GetSizeBytes(),
 			SHA256:         e.GetSha256(),
 			BasePath:       e.GetBasePath(),
-			AllocatedBytes: artifactManifestAllocatedBytes(e),
+			AllocatedBytes: e.GetAllocatedBytes(),
 		})
 	}
 	acked := ""
@@ -468,11 +494,14 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir, pa
 	return resp.SnapshotPath, resp.MemFilePath, manifest, acked, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, networkConfig []byte, generation string) (string, uint32, uint32, error) {
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, generation string) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
 	req := &vmdpb.ResumeVMRequest{
-		VmId:         vmID,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
+		VmId:                  vmID,
+		SnapshotPath:          snapshotPath,
+		MemFilePath:           memPath,
+		PreviewAccess:         previewAccess,
+		PreviewPorts:          previewPortsToProto(previewPorts),
+		PreviewPolicyRevision: previewPolicyRevision,
 	}
 	// Rides the unknown-field compatibility shim (see
 	// proto/vmdpb/resume_compat.go); "" is the common case (fetch-before-resume
@@ -487,7 +516,7 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 			} `json:"egress"`
 		}
 		if err := json.Unmarshal(networkConfig, &persisted); err != nil {
-			return "", 0, 0, fmt.Errorf("parse persisted network_config: %w", err)
+			return "", 0, 0, vmdclient.ResumeAttestation{}, fmt.Errorf("parse persisted network_config: %w", err)
 		}
 		if len(persisted.Egress.AllowedCIDRs) != 0 || len(persisted.Egress.DeniedCIDRs) != 0 || len(persisted.Egress.AllowedDomains) != 0 {
 			req.SandboxNetwork = &vmdpb.SandboxNetworkConfig{
@@ -501,14 +530,18 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 	}
 	resp, err := c.client.ResumeVM(ctx, req)
 	if err != nil {
-		return "", 0, 0, fmt.Errorf("gRPC ResumeVM: %w", err)
+		return "", 0, 0, vmdclient.ResumeAttestation{}, fmt.Errorf("gRPC ResumeVM: %w", err)
 	}
 	var actualVcpu, actualMemMiB uint32
 	if rl := resp.GetResourceLimits(); rl != nil {
 		actualVcpu = rl.GetVcpuCount()
 		actualMemMiB = rl.GetMemoryMib()
 	}
-	return resp.IpAddress, actualVcpu, actualMemMiB, nil
+	return resp.IpAddress, actualVcpu, actualMemMiB, vmdclient.ResumeAttestation{
+		PreviewProtocol:       resp.GetPreviewProtocol(),
+		PreviewPolicyRevision: resp.GetPreviewPolicyRevision(),
+		NetworkRulesApplied:   resp.GetNetworkRulesApplied(),
+	}, nil
 }
 
 // RestoreSnapshot is the stateless restore path — VMD creates a fresh VM
@@ -773,29 +806,6 @@ func (c *grpcVMDClient) GetBuildStatus(ctx context.Context, buildVMID string) (v
 		StartedAtUnix:           resp.GetStartedAtUnix(),
 		EndedAtUnix:             resp.GetEndedAtUnix(),
 	}, nil
-}
-
-func artifactManifestAllocatedBytes(entry *vmdpb.ArtifactManifestEntry) int64 {
-	if entry == nil {
-		return -1
-	}
-	unknown := entry.ProtoReflect().GetUnknown()
-	for len(unknown) > 0 {
-		num, typ, n := protowire.ConsumeTag(unknown)
-		if n < 0 {
-			break
-		}
-		unknown = unknown[n:]
-		value, n := protowire.ConsumeVarint(unknown)
-		if n < 0 {
-			break
-		}
-		unknown = unknown[n:]
-		if num == 6 && typ == protowire.VarintType {
-			return int64(value)
-		}
-	}
-	return -1
 }
 
 func (c *grpcVMDClient) CancelBuild(ctx context.Context, buildVMID string) error {

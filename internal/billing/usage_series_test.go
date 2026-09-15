@@ -1,0 +1,149 @@
+package billing
+
+import (
+	"testing"
+	"time"
+)
+
+func TestUsageSeriesBucketsDST(t *testing.T) {
+	loc, _ := time.LoadLocation("America/Chicago")
+	s := time.Date(2024, 3, 10, 0, 0, 0, 0, loc)
+	e := time.Date(2024, 3, 11, 0, 0, 0, 0, loc)
+	b, err := UsageSeriesBuckets(s, e, "hour", loc)
+	if err != nil || len(b) != 23 {
+		t.Fatalf("got %d buckets err=%v", len(b), err)
+	}
+	s = time.Date(2024, 11, 3, 0, 0, 0, 0, loc)
+	e = time.Date(2024, 11, 4, 0, 0, 0, 0, loc)
+	b, err = UsageSeriesBuckets(s, e, "hour", loc)
+	if err != nil || len(b) != 25 {
+		t.Fatalf("fall back got %d", len(b))
+	}
+}
+func TestUsageSeriesBucketsWeek(t *testing.T) {
+	loc := time.UTC
+	s := time.Date(2024, 1, 3, 0, 0, 0, 0, loc)
+	e := s.AddDate(0, 0, 10)
+	b, _ := UsageSeriesBuckets(s, e, "week", loc)
+	if len(b) != 2 || b[0].Start.Weekday() != time.Wednesday {
+		t.Fatalf("unexpected %#v", b)
+	}
+}
+
+func TestUsageSeriesBucketsSkippedCivilDate(t *testing.T) {
+	loc, err := time.LoadLocation("Pacific/Apia")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := time.Date(2011, 12, 29, 12, 0, 0, 0, loc)
+	e := time.Date(2012, 1, 1, 0, 0, 0, 0, loc)
+	b, err := UsageSeriesBuckets(s, e, "day", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) != 2 {
+		t.Fatalf("got %d buckets, want 2", len(b))
+	}
+	if !b[0].Start.Before(b[0].End) || !b[1].Start.Before(b[1].End) {
+		t.Fatalf("non-progressing bucket: %#v", b)
+	}
+}
+
+func TestUsageSeriesBucketsFractionalDST(t *testing.T) {
+	loc, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := time.Date(2024, 10, 6, 0, 0, 0, 0, loc)
+	e := time.Date(2024, 10, 7, 0, 0, 0, 0, loc)
+	b, err := UsageSeriesBuckets(s, e, "hour", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []int{0, 1, 2, 3, 4} {
+		got := b[i].Start.In(loc).Hour()
+		if got != want {
+			t.Fatalf("bucket %d starts at local hour %d, want %d", i, got, want)
+		}
+	}
+}
+
+func TestUsageSeriesBucketsFractionalFallBack(t *testing.T) {
+	loc, err := time.LoadLocation("Australia/Lord_Howe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The 30-minute fall-back occurs between 01:00 DST and 01:30 standard
+	// time. Both wall-clock intervals must remain represented.
+	s := time.Date(2024, 4, 7, 0, 0, 0, 0, loc)
+	e := time.Date(2024, 4, 7, 3, 0, 0, 0, loc)
+	b, err := UsageSeriesBuckets(s, e, "hour", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) != 4 {
+		t.Fatalf("got %d buckets, want 4", len(b))
+	}
+	if got := b[1].End.Sub(b[1].Start); got != time.Hour {
+		t.Fatalf("repeated-hour bucket duration %s, want 1h", got)
+	}
+	if b[2].Start.Equal(b[1].Start) || b[2].Start.In(loc).Format("15:04") != "01:30" {
+		t.Fatalf("next bucket starts at %s, want distinct 01:30", b[2].Start.In(loc))
+	}
+}
+
+func TestUsageSeriesBucketsRepeatedHourStartPreservesOccurrence(t *testing.T) {
+	loc, err := time.LoadLocation("Europe/Paris")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Start during the first occurrence of the repeated 02:00 hour.
+	s := time.Date(2026, 10, 25, 0, 30, 0, 0, time.UTC)
+	e := s.Add(2 * time.Hour)
+	b, err := UsageSeriesBuckets(s, e, "hour", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) == 0 || !b[0].Start.Equal(s) {
+		t.Fatalf("first bucket starts at %s, want %s", b[0].Start, s)
+	}
+	if got := b[0].End.Sub(b[0].Start); got != 30*time.Minute {
+		t.Fatalf("first bucket duration %s, want 30m", got)
+	}
+}
+
+func TestUsageSeriesBucketsRepeatedMidnightPreservesOccurrence(t *testing.T) {
+	loc, err := time.LoadLocation("Antarctica/Vostok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first local midnight on this rollback occurs at 17:00Z; time.Date
+	// otherwise resolves it to the later 19:00Z occurrence.
+	start := time.Date(2023, 12, 17, 17, 30, 0, 0, time.UTC)
+	end := time.Date(2023, 12, 17, 19, 0, 0, 0, time.UTC)
+	for _, granularity := range []string{"day", "week"} {
+		b, err := UsageSeriesBuckets(start, end, granularity, loc)
+		if err != nil {
+			t.Fatalf("%s: %v", granularity, err)
+		}
+		if len(b) == 0 || !b[0].Start.Equal(start) || !b[0].End.Equal(end) {
+			t.Fatalf("%s: got %#v, want first bucket clipped to first midnight occurrence", granularity, b)
+		}
+	}
+}
+
+func TestUsageSeriesBucketsMultiHourForwardJump(t *testing.T) {
+	loc, err := time.LoadLocation("Antarctica/Casey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Date(2020, 10, 3, 16, 30, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	b, err := UsageSeriesBuckets(start, end, "hour", loc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(b) == 0 || !b[0].Start.Equal(start) {
+		t.Fatalf("got %#v, want a clipped bucket for the partially present local hour", b)
+	}
+}

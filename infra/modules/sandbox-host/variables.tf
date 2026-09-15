@@ -106,3 +106,9 @@ variable "reservation_name" {
   type        = string
   default     = null
 }
+
+variable "external_ip" {
+  description = "Attach an ephemeral external IP at creation. Cells without NAT depend on it for everything that leaves the host: first-boot downloads, guest egress, and the guest DNS forwarder. Ignored after creation, matching hosts whose address was added by hand."
+  type        = bool
+  default     = false
+}

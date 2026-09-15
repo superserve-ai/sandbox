@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.7.0"
 
   backend "gcs" {
     bucket = "superserve-terraform-state-prod"
@@ -109,6 +109,18 @@ module "network" {
   vpc_connector_subnet_ip     = var.connector_subnet_cidr
 
   firewall_rules = {
+    peer_ingress = {
+      name          = "superserve-usw2-allow-peer-ingress"
+      direction     = "INGRESS"
+      source_ranges = ["10.1.0.2/32", "10.1.0.3/32"]
+      target_tags   = ["vmd-usw2"]
+      allow = [{
+        protocol = "tcp"
+        ports    = ["5009"]
+      }]
+      description = "Allow private VMD peer ingress within the cell."
+    }
+
     allow_vmd_grpc = {
       name          = "superserve-usw2-allow-cr-vmd"
       direction     = "INGRESS"
@@ -392,9 +404,11 @@ module "sandbox_host_b" {
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
-  service_account_email = data.google_service_account.api_runner.email
-  boot_disk_image       = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
-  boot_disk_size_gb     = 250
+  service_account_email     = google_service_account.vmd_runtime.email
+  allow_stopping_for_update = true
+  depends_on                = [google_project_iam_member.vmd_telemetry, google_storage_bucket_iam_member.vmd_backup, google_service_account_iam_member.vmd_deploy_act_as]
+  boot_disk_image           = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  boot_disk_size_gb         = 250
   # Metal machine types reject the API-default pd-standard boot disk.
   boot_disk_type      = "hyperdisk-balanced"
   can_ip_forward      = false
@@ -467,15 +481,16 @@ module "observability" {
       instance_id   = module.sandbox_host.instance_id
     }
   }
-  # Backup pipeline alerts scoped to this cell's host via the host_id
-  # metric label (HOST_ID on the host matches the instance name). Follows
+  # Backup alerts use the stable collector identity plus the legacy host_id
+  # selector while older collectors roll forward. Follows
   # active_sandbox_host so a standby promotion keeps the filter on whichever
   # host is actually emitting.
   # Thresholds are the module defaults except oldest_pending_age_duration;
   # the rationale for each default sits on the module's variables.
   backup_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Backup / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Backup / ${local.active_host_name}"
     # A share of this cell's traffic pauses in scheduled batches rather
     # than steadily, confirmed via backup_journal_pending{priority="pause"}
     # and the control plane's pause-endpoint request log. The module
@@ -510,8 +525,9 @@ module "observability" {
   # they mean "the controller engaged and still lost", not "the controller is
   # doing its job" — move them together with the ceiling or not at all.
   launch_path_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Launch path / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Launch path / ${local.active_host_name}"
   }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
   # the same host_id label the backup metrics use, and following

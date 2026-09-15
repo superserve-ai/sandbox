@@ -8,10 +8,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/hostreg"
 )
 
 // hostCapQueryTimeout bounds every capability lookup, cached-miss and
@@ -21,26 +23,23 @@ import (
 const hostCapQueryTimeout = 5 * time.Second
 
 // hostCapCache is an in-process, TTL-bounded, positive-only cache of host
-// capability attestations, fronting HostHasCapabilitiesUnlocked on the
-// standalone pre-flight paths. Same shape as apiKeyCache: only affirmative
-// results are cached (a missing capability or an error always re-reads, so a
-// capability 409 is always fresh), an expired entry is served for a short
-// grace while one background flight refreshes it, and concurrent misses
-// coalesce. The fail-closed gates (transactional validation, VMD's post-boot
-// attestation) do not go through this cache. Cardinality is hosts ×
-// capability sets; puts sweep expired entries, so memory tracks the active
-// fleet.
+// capability attestations fronting HostHasCapabilitiesUnlocked on the
+// pre-flight paths; the read behind it also hands the host's address to the
+// registry as its verification. Same shape as apiKeyCache: only affirmative
+// results are cached, an expired entry is served for a short grace while one
+// flight refreshes it, and concurrent misses coalesce. Puts sweep expired
+// entries, so memory tracks the active fleet.
 const (
-	// The TTL also bounds how long a just-fenced host or dropped capability
-	// can keep passing this pre-flight (the create path already tolerates the
-	// scheduler cache's 30s for placement).
+	// The TTL bounds how long a fenced host can keep passing this pre-flight
+	// and feeds hostctl's drain convergence, hence the cap.
 	defaultHostCapCacheTTL = 10 * time.Second
+	maxHostCapCacheTTL     = 30 * time.Second
 	hostCapCacheStaleGrace = 2 * time.Second
 )
 
-// hostCapCacheTTLFromEnv reads HOST_CAPABILITY_CACHE_TTL (a Go duration,
-// e.g. "30s"). Unset or unparsable falls back to the default; a non-positive
-// duration disables caching.
+// hostCapCacheTTLFromEnv reads HOST_CAPABILITY_CACHE_TTL (a Go duration).
+// Unset or unparsable falls back to the default, non-positive disables
+// caching, and anything above maxHostCapCacheTTL is clamped to it.
 func hostCapCacheTTLFromEnv() time.Duration {
 	raw := os.Getenv("HOST_CAPABILITY_CACHE_TTL")
 	if raw == "" {
@@ -50,7 +49,7 @@ func hostCapCacheTTLFromEnv() time.Duration {
 	if err != nil {
 		return defaultHostCapCacheTTL
 	}
-	return d
+	return min(d, maxHostCapCacheTTL)
 }
 
 type hostCapEntry struct {
@@ -130,13 +129,11 @@ func (c *hostCapCache) refreshFailed(key string) {
 // detached, bounded context (it may outlive the caller), stores the outcome,
 // and every waiter shares the result — but each waiter still selects on its
 // own ctx, so a hung-up client returns immediately.
-func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.HostHasCapabilitiesUnlockedParams) (bool, error) {
+func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.HostHasCapabilitiesUnlockedParams, scope hostCapabilityScope) (bool, error) {
 	c := &h.hostCaps
 	ch := c.group.DoChan(key, func() (interface{}, error) {
 		start := time.Now()
-		qctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostCapQueryTimeout)
-		defer cancel()
-		has, err := h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+		has, err := h.readHostCaps(context.WithoutCancel(ctx), params, scope)
 		switch {
 		case err != nil:
 		case has:
@@ -157,27 +154,65 @@ func (h *Handlers) fetchHostCaps(ctx context.Context, key string, params db.Host
 	}
 }
 
+// readHostCaps performs the pre-flight read under hostCapQueryTimeout and,
+// on an affirmative answer, records the address it returned with the host
+// registry under the registry's own bound, so a read that used most of its
+// budget cannot starve the resolution wait. A resolution failure fails the
+// pre-flight, so the create does not repeat that lookup at dispatch.
+func (h *Handlers) readHostCaps(ctx context.Context, params db.HostHasCapabilitiesUnlockedParams, scope hostCapabilityScope) (bool, error) {
+	var gen uint64
+	if h.Hosts != nil {
+		gen = h.Hosts.Generation(params.HostID) // before the read, so a reclaim during it is caught
+	}
+	qctx, cancel := context.WithTimeout(ctx, hostCapQueryTimeout)
+	params.AllowedStatuses = []string{"active"}
+	params.HeartbeatAfter = pgtype.Timestamptz{}
+	if scope == ownerResumeCapabilities {
+		params.AllowedStatuses = []string{"active", "draining"}
+		params.HeartbeatAfter = pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true}
+	}
+	row, err := h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+	cancel()
+	if err != nil {
+		return false, err
+	}
+	if row.HasCapabilities && h.Hosts != nil {
+		rctx, cancel := context.WithTimeout(ctx, hostreg.ResolveTimeout)
+		defer cancel()
+		if err := h.Hosts.MarkVerified(rctx, params.HostID, row.VmdAddr, gen); err != nil {
+			return false, err
+		}
+	}
+	return row.HasCapabilities, nil
+}
+
+type hostCapabilityScope string
+
+const (
+	activeHostCapabilities  hostCapabilityScope = "active"
+	ownerResumeCapabilities hostCapabilityScope = "owner-resume"
+)
+
 func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string, capabilities []string) (bool, error) {
+	return h.hostHasCapabilitiesCachedForScope(ctx, hostID, capabilities, activeHostCapabilities)
+}
+
+func (h *Handlers) hostHasCapabilitiesCachedForScope(ctx context.Context, hostID string, capabilities []string, scope hostCapabilityScope) (bool, error) {
 	c := &h.hostCaps
 	c.init()
 	params := db.HostHasCapabilitiesUnlockedParams{HostID: hostID, RequiredCapabilities: capabilities}
-	if c.ttl <= 0 {
-		// Same bound as the cached fetch: this lookup sits between scheduler
-		// admission and the bounded boot work, and ops tooling (hostctl
-		// --wait) budgets a fixed post-admission margin for it — an
-		// unbounded read here would silently break that arithmetic.
-		qctx, cancel := context.WithTimeout(ctx, hostCapQueryTimeout)
-		defer cancel()
-		return h.DB.HostHasCapabilitiesUnlocked(qctx, params)
+	// Owner resume must recheck lifecycle status and heartbeat generation on every call.
+	if scope == ownerResumeCapabilities || c.ttl <= 0 {
+		return h.readHostCaps(ctx, params, scope)
 	}
 	sorted := append([]string(nil), capabilities...)
 	sort.Strings(sorted)
-	key := hostID + "\x00" + strings.Join(sorted, "\x00")
+	key := string(scope) + "\x00" + hostID + "\x00" + strings.Join(sorted, "\x00")
 	refresh, ok := c.get(key, time.Now())
 	if ok {
 		if refresh {
 			go func() {
-				_, err := h.fetchHostCaps(context.Background(), key, params)
+				_, err := h.fetchHostCaps(context.Background(), key, params, scope)
 				if err != nil {
 					log.Warn().Err(err).Str("host_id", hostID).Strs("capabilities", capabilities).
 						Msg("host capability refresh failed; serving stale until the grace window expires")
@@ -187,5 +222,5 @@ func (h *Handlers) hostHasCapabilitiesCached(ctx context.Context, hostID string,
 		}
 		return true, nil
 	}
-	return h.fetchHostCaps(ctx, key, params)
+	return h.fetchHostCaps(ctx, key, params, scope)
 }

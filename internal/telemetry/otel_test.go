@@ -23,6 +23,19 @@ func TestSafeResultBoundsValues(t *testing.T) {
 	}
 }
 
+func TestPeerLabelsAreBounded(t *testing.T) {
+	long := "ひ" + "x" // ensure rune-aware truncation
+	for len([]rune(long)) <= 64 {
+		long += "x"
+	}
+	if got := safeHostID(long); len([]rune(got)) != 64 {
+		t.Fatalf("host label length = %d, want 64", len([]rune(got)))
+	}
+	if safeRegion("") != "unknown" {
+		t.Fatal("empty region should map to unknown")
+	}
+}
+
 func TestSafeOperationBoundsValues(t *testing.T) {
 	for _, op := range []string{"create", "pause", "resume", "delete", "fail", "timeout_pause"} {
 		if got := safeOperation(op); got != op {
@@ -566,6 +579,85 @@ func TestRecordPausedNetworkPressureEmitsControllerMetrics(t *testing.T) {
 	}
 }
 
+func TestRecordPeerEventEmitsLifecycleMetricsWithBoundedAttributes(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(ctx) })
+	meter := provider.Meter(instrumentationName)
+	gauge := func(name string) metric.Int64UpDownCounter {
+		v, err := meter.Int64UpDownCounter(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	counter := func(name string) metric.Int64Counter {
+		v, err := meter.Int64Counter(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	hist, err := meter.Float64Histogram("peer_handshake_duration_seconds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &OTelRecorder{provider: provider, serviceName: "proxy", environment: "test", peerConnections: gauge("peer_connections"), peerStreams: gauge("peer_active_streams"), peerEvents: counter("peer_events_total"), peerHandshakeDuration: hist}
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "connection", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: 1})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "stream", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: 1})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "handshake", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Duration: 250 * time.Millisecond})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "drain", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Forced: true})
+	for _, kind := range []string{"connection", "stream"} {
+		for _, delta := range []int64{1, 1, -1} {
+			r.RecordPeerEvent(ctx, PeerEvent{Kind: kind, Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: delta})
+		}
+	}
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	allowed := map[string]bool{"service.name": true, "environment": true, "kind": true, "result": true, "region": true, "host_id": true, "forced": true}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			seen[m.Name] = true
+			var attrs []attribute.Set
+			switch d := m.Data.(type) {
+			case metricdata.Gauge[int64]:
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			case metricdata.Sum[int64]:
+				if m.Name == "peer_connections" || m.Name == "peer_active_streams" {
+					if d.IsMonotonic || len(d.DataPoints) != 1 || d.DataPoints[0].Value != 2 {
+						t.Fatalf("incorrect active total: %+v", d)
+					}
+				}
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			case metricdata.Histogram[float64]:
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			}
+			for _, set := range attrs {
+				for _, kv := range set.ToSlice() {
+					if !allowed[string(kv.Key)] {
+						t.Fatalf("metric %q has unapproved attribute %q", m.Name, kv.Key)
+					}
+				}
+			}
+		}
+	}
+	for _, name := range []string{"peer_connections", "peer_active_streams", "peer_handshake_duration_seconds", "peer_events_total"} {
+		if !seen[name] {
+			t.Fatalf("metric %q not emitted", name)
+		}
+	}
+}
+
 // RecordLatencyPhase must label every sample with the bounded phase enums,
 // fold empties to addressable values, and fall back to the recorder's own
 // host identity when the caller has none (vmd/proxy).
@@ -652,5 +744,44 @@ func BenchmarkRecordLatencyPhase(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		r.RecordLatencyPhase(ctx, p)
+	}
+}
+
+// The metric's accepted labels must match what the scheduler emits.
+// These drifted once — the evaluator moved to in_band/out_of_band while
+// the recorder still accepted same/different — and every meaningful
+// result was exported as "other", so the metric looked healthy while
+// measuring nothing. The constants live in different packages, so this
+// pins the contract from the recorder's side.
+func TestShadowLabelsAcceptWhatTheSchedulerEmits(t *testing.T) {
+	for _, v := range []string{"ranked", "no_candidates", "error"} {
+		if got := normalizeShadowResult(v); got != v {
+			t.Errorf("result %q normalized to %q; the emitter's value must survive", v, got)
+		}
+	}
+	for _, v := range []string{"in_band", "out_of_band", "unknown"} {
+		if got := normalizeShadowAgreement(v); got != v {
+			t.Errorf("agreement %q normalized to %q; the emitter's value must survive", v, got)
+		}
+	}
+	// Anything unrecognized is still collapsed, so cardinality stays bounded.
+	if got := normalizeShadowAgreement("something-new"); got != "other" {
+		t.Errorf("unknown agreement normalized to %q, want other", got)
+	}
+}
+
+// A failed ranking counted nothing, and composition is a last-value
+// gauge — so publishing its zeros would report an empty fleet until the
+// next successful sample. A database blip must not look like a fleet
+// that vanished.
+func TestCapacityShadowSkipsCompositionOnError(t *testing.T) {
+	if !shadowPublishesComposition("ranked") {
+		t.Error("a successful ranking must publish composition")
+	}
+	if !shadowPublishesComposition("no_candidates") {
+		t.Error("an empty-but-successful ranking must publish composition: zero hosts is a real answer")
+	}
+	if shadowPublishesComposition("error") {
+		t.Error("a failed ranking must not publish composition; its zeros would erase readiness")
 	}
 }

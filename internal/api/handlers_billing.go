@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -55,15 +56,30 @@ type billingSummaryResponse struct {
 	PortalAvailable          bool                              `json:"portal_available"`
 	PaymentSetupRequired     bool                              `json:"payment_setup_required"`
 	CurrentChargesUSD        float64                           `json:"current_charges_usd"`
-	CreditsAppliedUSD        float64                           `json:"credits_applied_usd"`
-	CreditsRemainingUSD      float64                           `json:"credits_remaining_usd"`
-	ExpectedInvoiceAmountUSD float64                           `json:"expected_invoice_amount_usd"`
+	CreditsAppliedUSD        *float64                          `json:"credits_applied_usd"`
+	CreditsRemainingUSD      *float64                          `json:"credits_remaining_usd"`
+	ExpectedInvoiceAmountUSD *float64                          `json:"expected_invoice_amount_usd"`
+	StripeCreditBalanceUSD   *float64                          `json:"stripe_credit_balance_usd,omitempty"`
+	StripeCreditsAppliedUSD  *float64                          `json:"stripe_credits_applied_usd,omitempty"`
+	StripeRemainingCreditUSD *float64                          `json:"stripe_remaining_credit_usd,omitempty"`
+	CreditSource             string                            `json:"credit_source"`
+	CreditStatus             string                            `json:"credit_status"`
+	CreditObservedAt         *time.Time                        `json:"credit_observed_at,omitempty"`
 	CostBreakdownUSD         billingSummaryCostBreakdown       `json:"cost_breakdown_usd"`
 	Resources                []billingSummaryResource          `json:"resources"`
 	ResourcesByKey           map[string]billingSummaryResource `json:"resources_by_key,omitempty"`
 	BillingPeriod            billingSummaryPeriod              `json:"billing_period"`
 	PricingTier              billingSummaryPricingTier         `json:"pricing_tier"`
+	Trial                    *billingTrialBalance              `json:"trial,omitempty"`
 	CalculatedAt             time.Time                         `json:"calculated_at"`
+}
+
+type billingTrialBalance struct {
+	GrantUSD     float64 `json:"grant_usd"`
+	ConsumedUSD  float64 `json:"consumed_usd"`
+	RemainingUSD float64 `json:"remaining_usd"`
+	State        string  `json:"state"`
+	Eligible     bool    `json:"eligible"`
 }
 
 type billingSummaryCostBreakdown struct {
@@ -161,6 +177,17 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 
 	now := time.Now().UTC()
 	periodStart, periodEnd := billing.CurrentBillingPeriod(now)
+	account, accountErr := h.DB.GetTeamBillingAccount(c.Request.Context(), teamID)
+	if accountErr != nil && !errors.Is(accountErr, pgx.ErrNoRows) {
+		log.Error().Err(accountErr).Str("team_id", teamID.String()).Msg("load billing account failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if accountErr == nil && account.CommercialBillingAnchor.Valid {
+		if start, end, anchored := billing.AnniversaryPeriod(account.CommercialBillingAnchor.Time, now); anchored {
+			periodStart, periodEnd = start, end
+		}
+	}
 	period, err := h.DB.GetActiveTeamBillingPeriod(c.Request.Context(), teamID)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
@@ -168,7 +195,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-	} else {
+	} else if !(accountErr == nil && account.CommercialBillingAnchor.Valid) {
 		periodStart = period.PeriodStart
 		periodEnd = period.PeriodEnd
 	}
@@ -177,10 +204,19 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		usage         db.GetTeamBillingUsageRow
 		pricingRows   []db.ListActivePricingRatesForTeamCurrentRow
 		creditBalance pgtype.Numeric
-		account       db.GetTeamBillingAccountRow
+		trialBalance  db.GetTeamTrialBalanceRow
 	)
 	g, ctx := errgroup.WithContext(c.Request.Context())
+	hasEstablishedSubscription := billingAccountHasEstablishedSubscription(account)
+	// Stripe remains authoritative for credit state after activation, including
+	// when the subscription has since been canceled. Keep this separate from
+	// the active-subscription predicate so canceled accounts can still use
+	// checkout/portal semantics based on their current status.
+	hasStripeCreditState := billingAccountHasStripeCreditState(account)
 	g.Go(func() error {
+		// Usage remains required for every account: Stripe owns credit state after
+		// activation, but current charges and the resource breakdown still come
+		// from the live Superserve usage rollup.
 		var err error
 		usage, err = h.DB.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{
 			TeamID:      teamID,
@@ -189,6 +225,14 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		})
 		if err != nil {
 			return fmt.Errorf("get team billing usage: %w", err)
+		}
+		return nil
+	})
+	g.Go(func() error {
+		var err error
+		trialBalance, err = h.DB.GetTeamTrialBalance(ctx, teamID)
+		if err != nil {
+			return fmt.Errorf("get team trial balance: %w", err)
 		}
 		return nil
 	})
@@ -204,25 +248,43 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		}
 		return nil
 	})
-	g.Go(func() error {
-		var err error
-		creditBalance, err = h.DB.GetTeamCreditBalance(ctx, teamID)
-		if err != nil {
-			return fmt.Errorf("get team credit balance: %w", err)
-		}
-		return nil
-	})
+	if !hasStripeCreditState {
+		g.Go(func() error {
+			var err error
+			creditBalance, err = h.DB.GetTeamCreditBalance(ctx, teamID)
+			if err != nil {
+				return fmt.Errorf("get team credit balance: %w", err)
+			}
+			return nil
+		})
+	}
 	if err := g.Wait(); err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing summary dependency fetch failed")
 		respondError(c, ErrInternal)
 		return
 	}
-
-	account, err = h.DB.GetTeamBillingAccount(c.Request.Context(), teamID)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("load billing account failed")
+	grantUSD, err := numericFloat64(trialBalance.GrantUsd)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert trial grant failed")
 		respondError(c, ErrInternal)
 		return
+	}
+	consumedUSD, err := numericFloat64(trialBalance.ConsumedUsd)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert trial consumption failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	remainingUSD, err := numericFloat64(trialBalance.RemainingUsd)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert trial remaining failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if (trialBalance.State == "active" && remainingUSD <= 0) ||
+		(trialBalance.State == "exhausted" && remainingUSD > 0) {
+		log.Error().Str("team_id", teamID.String()).Str("state", trialBalance.State).
+			Float64("remaining_usd", remainingUSD).Msg("billing trial balance inconsistent")
 	}
 
 	storageBillingEnabled, err := h.billingStorageBillingEnabled(c.Request.Context(), teamID)
@@ -287,12 +349,14 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	}
 
 	creditsAvailable, err := numericFloat64(creditBalance)
-	if err != nil {
+	if err != nil && !hasStripeCreditState {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert credit balance failed")
 		respondError(c, ErrInternal)
 		return
 	}
-	hasEstablishedSubscription := billingAccountHasEstablishedSubscription(account)
+	if hasStripeCreditState {
+		creditsAvailable = 0
+	}
 	checkoutAvailable := false
 	if canManageBilling && mode == billingModeLive && h.Stripe != nil && !hasEstablishedSubscription {
 		if _, err := billingCheckoutPriceIDs(resourceStates); err == nil {
@@ -309,10 +373,68 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		creditsAvailable,
 		storageBillingEnabled,
 	)
-	paymentSetupRequired := mode == billingModeLive &&
-		!hasEstablishedSubscription &&
-		charges.CreditsRemainingUSD <= 0
 	summaryResources := billingSummaryResourcesFromState(resourceStates, vcpuSeconds, memoryGibSeconds, storageGibSeconds, charges)
+	creditSource, creditStatus := "local_trial", "available"
+	var stripeBalance, stripeApplied, stripeRemaining *float64
+	var creditsApplied, creditsRemaining, expectedInvoice *float64
+	var observed *time.Time
+	if hasStripeCreditState {
+		creditSource, creditStatus = "stripe", "unavailable"
+		// Keep every credit-derived estimate unavailable until Stripe's
+		// authoritative balance has been read successfully. In particular, do
+		// not expose the local zero-credit arithmetic as a payable estimate when
+		// the Stripe dependency is unavailable.
+		if reader, ok := h.Stripe.(stripeCreditBalanceReader); ok && account.StripeCustomerID != nil {
+			cb, e := reader.GetCustomerCreditBalance(c.Request.Context(), *account.StripeCustomerID)
+			if e == nil {
+				v := cb.AvailableUSD
+				stripeBalance = &v
+				// Keep the applied amount clamped to both the current charges and
+				// the available balance. This is the same amount used for the
+				// derived remaining/payable values below.
+				available := math.Max(v, 0)
+				applied := math.Min(math.Max(charges.CurrentChargesUSD, 0), available)
+				// This endpoint returns Stripe's post-application balance. Keep
+				// estimates in that same accounting view; subtracting local gross
+				// usage here would charge the period twice.
+				if cb.IncludesCurrentPeriodUsage {
+					applied = 0
+					remaining := available
+					stripeApplied, stripeRemaining = &applied, &remaining
+				} else {
+					remaining := math.Max(v-applied, 0)
+					stripeApplied, stripeRemaining = &applied, &remaining
+					payable := stripeExpectedInvoiceAmount(charges.CurrentChargesUSD, applied)
+					expectedInvoice = &payable
+				}
+				creditStatus = "available"
+				observed = &cb.ObservedAt
+			} else {
+				// Stripe is the source of truth after activation. Never fall back to
+				// the local pre-Stripe calculation when its balance read fails.
+				creditsApplied, creditsRemaining, expectedInvoice = nil, nil, nil
+				log.Warn().Err(e).Str("team_id", teamID.String()).Msg("stripe credit balance unavailable")
+			}
+		}
+	}
+	if !hasStripeCreditState {
+		creditsApplied = &charges.CreditsAppliedUSD
+		creditsRemaining = &charges.CreditsRemainingUSD
+		expectedInvoice = &charges.ExpectedInvoiceAmountUSD
+	}
+	// Stripe is authoritative for activated accounts, so determine whether
+	// payment setup is required only after its remaining balance has been read.
+	paymentSetupRequired := false
+	if hasStripeCreditState {
+		// An unavailable Stripe balance cannot establish whether setup is
+		// required; specifically, do not fall back to the local zero-credit
+		// arithmetic used while Stripe is authoritative.
+		paymentSetupRequired = stripeRemaining != nil && *stripeRemaining <= 0 &&
+			mode == billingModeLive && !hasEstablishedSubscription
+	} else {
+		paymentSetupRequired = mode == billingModeLive &&
+			!hasEstablishedSubscription && charges.CreditsRemainingUSD <= 0
+	}
 
 	setPrivateBillingCacheHeaders(c)
 	c.JSON(http.StatusOK, billingSummaryResponse{
@@ -323,9 +445,10 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		PortalAvailable:          canManageBilling && mode == billingModeLive && h.Stripe != nil && hasEstablishedSubscription,
 		PaymentSetupRequired:     paymentSetupRequired,
 		CurrentChargesUSD:        charges.CurrentChargesUSD,
-		CreditsAppliedUSD:        charges.CreditsAppliedUSD,
-		CreditsRemainingUSD:      charges.CreditsRemainingUSD,
-		ExpectedInvoiceAmountUSD: charges.ExpectedInvoiceAmountUSD,
+		CreditsAppliedUSD:        creditsApplied,
+		CreditsRemainingUSD:      creditsRemaining,
+		ExpectedInvoiceAmountUSD: expectedInvoice,
+		StripeCreditBalanceUSD:   stripeBalance, StripeCreditsAppliedUSD: stripeApplied, StripeRemainingCreditUSD: stripeRemaining, CreditSource: creditSource, CreditStatus: creditStatus, CreditObservedAt: observed,
 		CostBreakdownUSD: billingSummaryCostBreakdown{
 			Compute: charges.Breakdown.ComputeUSD,
 			Memory:  charges.Breakdown.MemoryUSD,
@@ -339,8 +462,165 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 			PlanName: pricingCatalog.PlanName,
 			Currency: pricingCatalog.Currency,
 		},
+		// Always include the structured trial result so clients can distinguish
+		// an account with no applicable signup grant from an omitted/unknown
+		// billing field. The no_grant state carries zero monetary values.
+		Trial: &billingTrialBalance{
+			GrantUSD:     grantUSD,
+			ConsumedUSD:  consumedUSD,
+			RemainingUSD: remainingUSD,
+			State:        trialBalance.State,
+			Eligible:     trialBalance.Eligible,
+		},
 		CalculatedAt: now,
 	})
+}
+
+func stripeExpectedInvoiceAmount(currentChargesUSD, appliedCreditUSD float64) float64 {
+	return math.Max(currentChargesUSD-appliedCreditUSD, 0)
+}
+
+func billingAccountHasStripeCreditState(account db.GetTeamBillingAccountRow) bool {
+	if billingAccountHasEstablishedSubscription(account) {
+		return true
+	}
+	if account.StripeCustomerID == nil || strings.TrimSpace(*account.StripeCustomerID) == "" {
+		return false
+	}
+	if account.StripeActivationCreditGrantID != nil && strings.TrimSpace(*account.StripeActivationCreditGrantID) != "" {
+		return true
+	}
+	return account.TrialEndedAt.Valid
+}
+
+type billingUsageSeriesResource struct {
+	Usage    float64 `json:"usage"`
+	CostUSD  float64 `json:"cost_usd"`
+	Tracked  bool    `json:"tracked"`
+	Billable bool    `json:"billable"`
+}
+type billingUsageSeriesBucket struct {
+	Start          time.Time                  `json:"start"`
+	End            time.Time                  `json:"end"`
+	CPU            billingUsageSeriesResource `json:"cpu"`
+	Memory         billingUsageSeriesResource `json:"memory"`
+	Storage        billingUsageSeriesResource `json:"storage"`
+	BilledTotalUSD float64                    `json:"billed_total_usd"`
+}
+
+func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
+	teamID, ok := h.requireBillingRead(c)
+	if !ok {
+		return
+	}
+	start, err := time.Parse(time.RFC3339Nano, c.Query("start"))
+	if err != nil {
+		respondErrorMsg(c, "invalid_request", "invalid start timestamp", http.StatusBadRequest)
+		return
+	}
+	end, err := time.Parse(time.RFC3339Nano, c.Query("end"))
+	if err != nil {
+		respondErrorMsg(c, "invalid_request", "invalid end timestamp", http.StatusBadRequest)
+		return
+	}
+	timezone, err := billingUsageSeriesTimezone(c.Query("timezone"))
+	if err != nil {
+		if strings.TrimSpace(c.Query("timezone")) == "" {
+			respondErrorMsg(c, "invalid_request", "timezone is required", http.StatusBadRequest)
+		} else {
+			respondErrorMsg(c, "invalid_request", "invalid timezone", http.StatusBadRequest)
+		}
+		return
+	}
+	loc := timezone
+	buckets, err := billing.UsageSeriesBuckets(start, end, c.Query("granularity"), loc)
+	if err != nil {
+		respondErrorMsg(c, "invalid_request", err.Error(), http.StatusBadRequest)
+		return
+	}
+	rates, err := h.DB.ListActivePricingRatesForTeamCurrent(c.Request.Context(), teamID)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	storageEnabled, err := h.billingStorageBillingEnabled(c.Request.Context(), teamID)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	states := h.billingResourceStates(storageEnabled)
+	catalog, ok := h.billingRateCatalog(pricingRatesFromTeamCurrentRows(rates), teamID.String(), states)
+	if !ok {
+		respondPricingUnavailable(c)
+		return
+	}
+	rate := func(key string) float64 {
+		v, e := numericFloat64(catalog.RateByResource[key].PriceUsd)
+		if e != nil {
+			return 0
+		}
+		return v
+	}
+	vcpuRate, memRate, storageRate := rate("vcpu"), rate("memory_gib"), rate("storage_gib")
+	resourceState := make(map[string]billingResourceState, len(states))
+	for _, state := range states {
+		resourceState[state.ResourceKey] = state
+	}
+	result := make([]billingUsageSeriesBucket, 0, len(buckets))
+	ctx := c.Request.Context()
+	starts, ends := make([]time.Time, len(buckets)), make([]time.Time, len(buckets))
+	for i, b := range buckets {
+		starts[i], ends[i] = b.Start, b.End
+	}
+	// Aggregate all buckets in one bounded set-oriented query; do not invoke the
+	// full-team usage scan independently for each bucket.
+	usageRows, e := h.DB.GetTeamBillingUsageSeries(ctx, db.GetTeamBillingUsageSeriesParams{TeamID: teamID, PeriodStarts: starts, PeriodEnds: ends})
+	if e != nil || len(usageRows) != len(buckets) {
+		respondError(c, ErrInternal)
+		return
+	}
+	for i, b := range buckets {
+		u := usageRows[i]
+		cpu, _ := numericFloat64(u.VcpuSeconds)
+		mem, _ := numericFloat64(u.MemoryGibSeconds)
+		storage, _ := numericFloat64(u.StorageGibSeconds)
+		cpuState, cpuOK := resourceState["vcpu"]
+		memoryState, memoryOK := resourceState["memory_gib"]
+		storageState, storageOK := resourceState["storage_gib"]
+		if !cpuOK || !memoryOK || !storageOK {
+			respondError(c, ErrInternal)
+			return
+		}
+		cc, mc, sc := cpu*vcpuRate, mem*memRate, storage*storageRate
+		// Resource costs remain informational even when a resource is tracked but
+		// excluded from billing. Apply billability only to the billed total.
+		billedTotal := 0.0
+		if cpuState.Billable {
+			billedTotal += cc
+		}
+		if memoryState.Billable {
+			billedTotal += mc
+		}
+		if storageState.Billable {
+			billedTotal += sc
+		}
+		result = append(result, billingUsageSeriesBucket{Start: b.Start, End: b.End, CPU: billingUsageSeriesResource{cpu, cc, cpuState.Tracked, cpuState.Billable}, Memory: billingUsageSeriesResource{mem, mc, memoryState.Tracked, memoryState.Billable}, Storage: billingUsageSeriesResource{storage, sc, storageState.Tracked, storageState.Billable}, BilledTotalUSD: billedTotal})
+	}
+	setPrivateBillingCacheHeaders(c)
+	c.JSON(http.StatusOK, gin.H{"start": start, "end": end, "granularity": c.Query("granularity"), "timezone": c.Query("timezone"), "buckets": result})
+}
+
+func billingUsageSeriesTimezone(raw string) (*time.Location, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, errors.New("timezone is required")
+	}
+	// Local is a process-dependent alias, not an IANA timezone name. Accepting
+	// it would make bucket boundaries vary with the server's TZ configuration.
+	if raw == "Local" {
+		return nil, errors.New("invalid timezone")
+	}
+	return time.LoadLocation(raw)
 }
 
 func (h *Handlers) requireBillingRead(c *gin.Context) (uuid.UUID, bool) {

@@ -16,6 +16,7 @@ import (
 
 type captureTelemetryRecorder struct {
 	transitions []telemetry.SandboxTransition
+	phases      []telemetry.LatencyPhase
 }
 
 func (r *captureTelemetryRecorder) RecordSandboxTransition(_ context.Context, t telemetry.SandboxTransition) {
@@ -24,9 +25,13 @@ func (r *captureTelemetryRecorder) RecordSandboxTransition(_ context.Context, t 
 
 func (r *captureTelemetryRecorder) RecordSandboxResumeSettleWait(context.Context, telemetry.SandboxResumeSettleWait) {
 }
-func (r *captureTelemetryRecorder) RecordVMDCall(context.Context, telemetry.VMDCall)           {}
-func (r *captureTelemetryRecorder) RecordLatencyPhase(context.Context, telemetry.LatencyPhase) {}
+func (r *captureTelemetryRecorder) RecordVMDCall(context.Context, telemetry.VMDCall) {}
+func (r *captureTelemetryRecorder) RecordLatencyPhase(_ context.Context, p telemetry.LatencyPhase) {
+	r.phases = append(r.phases, p)
+}
 func (r *captureTelemetryRecorder) RecordHostResolution(context.Context, telemetry.HostResolution) {
+}
+func (r *captureTelemetryRecorder) RecordCapacityShadow(context.Context, telemetry.CapacityShadow) {
 }
 func (r *captureTelemetryRecorder) RecordHostCapacity(context.Context, telemetry.HostCapacity) {
 }
@@ -36,6 +41,7 @@ func (r *captureTelemetryRecorder) RecordDBPoolStats(context.Context, telemetry.
 func (r *captureTelemetryRecorder) RecordPausedNetworkPressure(context.Context, telemetry.PausedNetworkPressure) {
 }
 func (r *captureTelemetryRecorder) RecordLauncherState(context.Context, telemetry.LauncherState) {}
+func (r *captureTelemetryRecorder) RecordPeerIngress(context.Context, telemetry.PeerIngress)     {}
 
 func TestSandboxLifecycleTelemetryUsesHostID(t *testing.T) {
 	rec := &captureTelemetryRecorder{}
@@ -230,3 +236,53 @@ func TestSandboxLoggerIncludesSandboxAndHostID(t *testing.T) {
 }
 
 var _ telemetry.Recorder = (*captureTelemetryRecorder)(nil)
+
+func (*captureTelemetryRecorder) RecordPeerEvent(context.Context, telemetry.PeerEvent) {}
+
+func TestSandboxLifecycleTelemetryHonorsTheHandlersResult(t *testing.T) {
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() {
+		SetTelemetryRecorder(nil)
+	})
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(SandboxLifecycleTelemetry())
+	r.POST("/sandboxes/:sandbox_id/pause", func(c *gin.Context) {
+		respondPause(c, pauseUndecided)
+	})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil))
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusAccepted)
+	}
+	if len(rec.transitions) != 1 || rec.transitions[0].Operation != "pause" || rec.transitions[0].Result != telemetry.ResultTimeout {
+		t.Fatalf("transitions = %+v, want one pause recorded as a timeout despite the 202", rec.transitions)
+	}
+}
+
+func TestSandboxLifecycleTelemetrySkipsADeferredRequest(t *testing.T) {
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() {
+		SetTelemetryRecorder(nil)
+	})
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(SandboxLifecycleTelemetry())
+	r.POST("/sandboxes/:sandbox_id/pause", func(c *gin.Context) {
+		DeferTelemetry(c)
+		acceptPausing(c)
+	})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil))
+
+	if w.Code != http.StatusAccepted || len(rec.transitions) != 0 {
+		t.Fatalf("status = %d, transitions = %+v; want a 202 that records nothing itself", w.Code, rec.transitions)
+	}
+}

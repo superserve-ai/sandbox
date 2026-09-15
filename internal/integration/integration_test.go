@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -169,7 +170,8 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 	}
 
 	capable, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: testDefaultHostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
+		AllowedStatuses: []string{"active"},
+		HostID:          testDefaultHostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
 	})
 	if err != nil {
 		return fmt.Errorf("verify preview capability: %w", err)
@@ -183,7 +185,8 @@ func seedPreviewCapableHost(ctx context.Context, q *db.Queries) error {
 func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) {
 	ctx := context.Background()
 	missing, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: "missing-host-" + uuid.New().String()[:8],
+		AllowedStatuses: []string{"active"},
+		HostID:          "missing-host-" + uuid.New().String()[:8],
 		RequiredCapabilities: []string{
 			preview.HostCapabilityPorts,
 		},
@@ -215,7 +218,8 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 	}
 	hasCapability := func() bool {
 		got, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-			HostID: hostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
+			AllowedStatuses: []string{"active"},
+			HostID:          hostID, RequiredCapabilities: []string{preview.HostCapabilityPorts},
 		})
 		if err != nil {
 			t.Fatalf("check capability: %v", err)
@@ -226,7 +230,8 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 		t.Fatal("current capability on active host was not recognized")
 	}
 	batch, err := testQueries.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: hostID,
+		AllowedStatuses: []string{"active"},
+		HostID:          hostID,
 		RequiredCapabilities: []string{
 			preview.HostCapabilityPorts,
 			preview.HostCapabilityPortAccess,
@@ -294,17 +299,37 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // stubVMD satisfies VMDClient without a real VM daemon. Stubs return plausible
 // values so that HTTP handlers can complete and write to the DB.
 type stubVMD struct {
-	updatePreviewFn func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
+	resumeFn          func()
+	resumeAttestation vmdclient.ResumeAttestation
+	pauseCalls        atomic.Int32
+	resumeCalls       atomic.Int32
+	restoreCalls      atomic.Int32
+	updatePreviewFn   func(context.Context, string, string, map[int32]vmdclient.PortPolicy, int64) error
+	updateNetworkFn   func(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error
+	pauseErr          error // when set, every PauseInstance fails with it
+	pauseFn           func(ctx context.Context, id, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error)
 }
 
 func (s *stubVMD) DestroyInstance(_ context.Context, _ string, _ bool) error { return nil }
-func (s *stubVMD) PauseInstance(_ context.Context, _, _, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
+func (s *stubVMD) PauseInstance(ctx context.Context, id, _, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
+	s.pauseCalls.Add(1)
+	if s.pauseFn != nil {
+		return s.pauseFn(ctx, id, pauseToken)
+	}
+	if s.pauseErr != nil {
+		return "", "", nil, "", s.pauseErr
+	}
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
-func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ string) (string, uint32, uint32, error) {
-	return "10.0.0.1", 1, 1024, nil
+func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ string) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
+	s.resumeCalls.Add(1)
+	if s.resumeFn != nil {
+		s.resumeFn()
+	}
+	return "10.0.0.1", 1, 1024, s.resumeAttestation, nil
 }
 func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string, _ vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
+	s.restoreCalls.Add(1)
 	return "10.0.0.1", 1, 1024, preview.HostCapabilityPorts, nil
 }
 func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
@@ -313,7 +338,10 @@ func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]str
 func (s *stubVMD) ListDir(_ context.Context, _, _ string) ([]vmdclient.DirEntry, error) {
 	return nil, nil
 }
-func (s *stubVMD) UpdateSandboxNetwork(_ context.Context, _ string, _, _, _ []string) error {
+func (s *stubVMD) UpdateSandboxNetwork(ctx context.Context, instanceID string, allowedCIDRs, deniedCIDRs, allowedDomains []string) error {
+	if s.updateNetworkFn != nil {
+		return s.updateNetworkFn(ctx, instanceID, allowedCIDRs, deniedCIDRs, allowedDomains)
+	}
 	return nil
 }
 
@@ -1488,6 +1516,18 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 		t.Fatalf("test clock is too close to the billing period start: start=%s end=%s", start, end)
 	}
 	seconds := end.Sub(start).Seconds()
+	// Billable usage is clamped to the current period, so the seeded window
+	// collapses to minutes just after a period rolls over. Size the credit
+	// from the closed intervals rather than hardcoding an amount: a fixed
+	// credit only stays below the charges for most of the month, and exceeds
+	// them at the start of one, leaving credit unspent and flipping every
+	// assertion that expects it fully consumed.
+	closedCompute := 2 * seconds * 0.000014
+	closedMemory := 2 * seconds * 0.0000045
+	creditUSD := math.Round((closedCompute+closedMemory)/2*1e6) / 1e6
+	if creditUSD <= 0 {
+		t.Fatalf("seeded window is too short to bill against: seconds=%v", seconds)
+	}
 	openStart := now.Add(-15 * time.Minute)
 	if openStart.Before(periodStart) {
 		openStart = periodStart
@@ -1530,8 +1570,8 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	}
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
-		VALUES ($1, 0.100000, 0.100000, 'integration test credit')
-	`, teamID); err != nil {
+		VALUES ($1, $2, $2, 'integration test credit')
+	`, teamID, creditUSD); err != nil {
 		t.Fatalf("seed billing credit: %v", err)
 	}
 
@@ -1552,12 +1592,56 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	if got := body["mode"].(string); got != "shadow" {
 		t.Fatalf("mode = %q, want shadow", got)
 	}
+	trial, ok := body["trial"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("trial = %v, want object", body["trial"])
+	}
+	for _, key := range []string{"grant_usd", "consumed_usd", "remaining_usd", "state", "eligible"} {
+		if _, present := trial[key]; !present {
+			t.Fatalf("trial missing %q: %v", key, trial)
+		}
+	}
+	state, ok := trial["state"].(string)
+	if !ok || (state != "no_grant" && state != "active" && state != "exhausted" && state != "expired" && state != "ended_by_billing_activation") {
+		t.Fatalf("trial state = %v, want a recognized lifecycle state", trial["state"])
+	}
+	if state == "no_grant" && (trial["grant_usd"] != float64(0) || trial["consumed_usd"] != float64(0) || trial["remaining_usd"] != float64(0)) {
+		t.Fatalf("no-grant trial = %v, want zero monetary values", trial)
+	}
+	// An expired signup grant is terminal and ineligible, distinct from a team
+	// that never received a signup grant.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, expires_at)
+		VALUES ($1, 1, 1, 'signup trial credit', now() + interval '1 hour')
+	`, teamID); err != nil {
+		t.Fatalf("seed signup trial grant for expiry: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_credit_grant
+		SET expires_at = now() - interval '1 second'
+		WHERE team_id = $1 AND reason = 'signup trial credit' AND expires_at IS NOT NULL
+	`, teamID); err != nil {
+		t.Fatalf("expire signup trial grant: %v", err)
+	}
+	expired := do(r, "GET", "/billing/summary", viewerKey, "")
+	if expired.Code != http.StatusOK {
+		t.Fatalf("expired trial summary: expected 200, got %d: %s", expired.Code, expired.Body.String())
+	}
+	expiredTrial, ok := mustJSON(t, expired)["trial"].(map[string]interface{})
+	if !ok || expiredTrial["state"] != "expired" || expiredTrial["eligible"] != false || expiredTrial["remaining_usd"] != float64(0) {
+		t.Fatalf("expired trial = %v, want expired, ineligible, and zero remaining", expiredTrial)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_credit_grant
+		SET expires_at = NULL, remaining_usd = 0
+		WHERE team_id = $1 AND reason = 'signup trial credit' AND expires_at IS NOT NULL
+	`, teamID); err != nil {
+		t.Fatalf("restore signup trial grant expiry: %v", err)
+	}
 	breakdown, ok := body["cost_breakdown_usd"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("cost_breakdown_usd not an object: %v", body["cost_breakdown_usd"])
 	}
-	closedCompute := 2 * seconds * 0.000014
-	closedMemory := 2 * seconds * 0.0000045
 	minOpenSeconds := requestStarted.Sub(openStart).Seconds()
 	maxOpenSeconds := requestFinished.Sub(openStart).Seconds()
 	if minOpenSeconds < 0 {
@@ -1574,10 +1658,16 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	assertFloatNear(t, storage, 0)
 
 	currentCharges := body["current_charges_usd"].(float64)
-	creditsApplied := math.Min(currentCharges, 0.1)
+	// Everything below assumes the credit is fully consumed — including the
+	// later payment_setup_required check, which only holds once no credit
+	// remains. Fail here with the reason rather than there with a bare false.
+	if currentCharges <= creditUSD {
+		t.Fatalf("charges %v do not exceed the seeded credit %v, so it cannot be fully consumed", currentCharges, creditUSD)
+	}
+	creditsApplied := math.Min(currentCharges, creditUSD)
 	assertFloatNear(t, currentCharges, compute+memory)
 	assertFloatNear(t, body["credits_applied_usd"].(float64), creditsApplied)
-	assertFloatNear(t, body["credits_remaining_usd"].(float64), 0.1-creditsApplied)
+	assertFloatNear(t, body["credits_remaining_usd"].(float64), creditUSD-creditsApplied)
 	assertFloatNear(t, body["expected_invoice_amount_usd"].(float64), currentCharges-creditsApplied)
 
 	resources, ok := body["resources"].([]interface{})
@@ -1625,6 +1715,21 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	if got := liveBody["portal_available"].(bool); got {
 		t.Fatal("portal_available should be false before subscription is established")
 	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_billing_account
+		SET trial_ended_at = now(), stripe_subscription_status = 'active'
+		WHERE team_id = $1
+	`, teamID); err != nil {
+		t.Fatalf("mark subscription active: %v", err)
+	}
+	activated := do(liveRouter, "GET", "/billing/summary", ownerKey, "")
+	if activated.Code != http.StatusOK {
+		t.Fatalf("activated billing summary: expected 200, got %d: %s", activated.Code, activated.Body.String())
+	}
+	activatedTrial, ok := mustJSON(t, activated)["trial"].(map[string]interface{})
+	if !ok || activatedTrial["state"] != "ended_by_billing_activation" || activatedTrial["eligible"] != true || activatedTrial["remaining_usd"] != float64(0) {
+		t.Fatalf("activated trial = %v, want ended_by_billing_activation, eligible, and zero remaining", activatedTrial)
+	}
 
 	period, ok := body["billing_period"].(map[string]interface{})
 	if !ok {
@@ -1655,6 +1760,13 @@ func TestIntegration_NewTeamReceivesSignupTrialCredit(t *testing.T) {
 		t.Fatalf("create team: %v", err)
 	}
 	teamID := team.ID
+	profileID := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO profile (id, email) VALUES ($1, $2)`, profileID, profileID.String()+"@example.com"); err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, teamID, profileID); err != nil {
+		t.Fatalf("create membership: %v", err)
+	}
 
 	var amount, remaining float64
 	if err := testPool.QueryRow(ctx, `
@@ -1666,6 +1778,42 @@ func TestIntegration_NewTeamReceivesSignupTrialCredit(t *testing.T) {
 	}
 	if amount != 5 || remaining != 5 {
 		t.Fatalf("signup trial credit = (%v, %v), want (5, 5)", amount, remaining)
+	}
+}
+
+func TestIntegration_ExpiredSignupTrialIsBillingIneligible(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, expires_at)
+		VALUES ($1, 5.000000, 5.000000, 'signup trial credit', now() - interval '1 second')
+	`, teamID); err != nil {
+		t.Fatalf("seed expired signup trial credit: %v", err)
+	}
+	eligible, err := testQueries.IsTeamSandboxBillingEligible(ctx, teamID)
+	if err != nil {
+		t.Fatalf("check expired signup trial eligibility: %v", err)
+	}
+	if eligible {
+		t.Fatal("expired signup trial should be billing-ineligible")
+	}
+}
+
+func TestIntegration_IncompleteStripeSubscriptionIsNotTrialEligible(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+	`, teamID, "cus_"+teamID.String(), "sub_"+teamID.String()); err != nil {
+		t.Fatalf("seed incomplete subscription: %v", err)
+	}
+	balance, err := testQueries.GetTeamTrialBalance(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load trial balance: %v", err)
+	}
+	if balance.Eligible {
+		t.Fatal("incomplete Stripe subscription should not be trial-eligible")
 	}
 }
 
@@ -1828,6 +1976,179 @@ func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
 	}
 	if !gotEnd.Equal(periodEnd) {
 		t.Fatalf("period end = %s, want %s", gotEnd, periodEnd)
+	}
+}
+
+func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) {
+	ctx := context.Background()
+	teamID, ownerKey := seedTeamAndKey(t)
+	r := newRouter(t)
+
+	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+	reportingStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	reportingEnd := reportingStart.AddDate(0, 1, 0)
+	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	}); err != nil {
+		t.Fatalf("claim commercial billing anchor: %v", err)
+	}
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: reportingStart,
+		PeriodEnd:   reportingEnd,
+		Status:      "open",
+	}); err != nil {
+		t.Fatalf("upsert reporting billing period: %v", err)
+	}
+
+	w := do(r, "GET", "/billing/summary", ownerKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("billing summary with commercial anchor: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	body := mustJSON(t, w)
+	period, ok := body["billing_period"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("billing_period not an object: %v", body["billing_period"])
+	}
+	gotStart, err := time.Parse(time.RFC3339, period["start"].(string))
+	if err != nil {
+		t.Fatalf("parse billing period start: %v", err)
+	}
+	if !gotStart.Equal(anchor) {
+		t.Fatalf("billing summary period start = %s, want %s", gotStart, anchor)
+	}
+	gotEnd, err := time.Parse(time.RFC3339, period["end"].(string))
+	if err != nil {
+		t.Fatalf("parse billing period end: %v", err)
+	}
+	if !gotEnd.Equal(anchor.AddDate(0, 1, 0)) {
+		t.Fatalf("billing summary period end = %s, want %s", gotEnd, anchor.AddDate(0, 1, 0))
+	}
+}
+
+func TestIntegration_ClaimTeamCommercialBillingAnchorIsIdempotentAndConflictSafe(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _ := seedTeamAndKeyWithRole(t, "viewer")
+	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+
+	got, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	})
+	if err != nil {
+		t.Fatalf("first commercial billing anchor claim: %v", err)
+	}
+	if !got.Equal(anchor) {
+		t.Fatalf("first commercial billing anchor claim = %s, want %s", got, anchor)
+	}
+
+	retry, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	})
+	if err != nil {
+		t.Fatalf("idempotent commercial billing anchor claim: %v", err)
+	}
+	if !retry.Equal(anchor) {
+		t.Fatalf("idempotent commercial billing anchor claim = %s, want %s", retry, anchor)
+	}
+
+	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor.Add(time.Hour),
+	}); err == nil {
+		t.Fatal("conflicting commercial billing anchor claim succeeded, want failure")
+	}
+
+	account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load team billing account: %v", err)
+	}
+	if !account.CommercialBillingAnchor.Valid {
+		t.Fatal("commercial billing anchor was not persisted")
+	}
+	if !account.CommercialBillingAnchor.Time.Equal(anchor) {
+		t.Fatalf("commercial billing anchor = %s, want %s", account.CommercialBillingAnchor.Time, anchor)
+	}
+}
+
+func TestIntegration_ClaimTeamCommercialBillingAnchorPreservesLegacyPeriod(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _ := seedTeamAndKeyWithRole(t, "viewer")
+	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+	legacyStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	legacyEnd := legacyStart.AddDate(0, 1, 0)
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: legacyStart,
+		PeriodEnd:   legacyEnd,
+		Status:      "open",
+	}); err != nil {
+		t.Fatalf("seed legacy billing period: %v", err)
+	}
+
+	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	}); err != nil {
+		t.Fatalf("claim commercial billing anchor: %v", err)
+	}
+
+	var status string
+	var finalizedAt *time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT status, finalized_at
+		FROM team_billing_period
+		WHERE team_id = $1 AND period_start = $2 AND period_end = $3
+	`, teamID, legacyStart, legacyEnd).Scan(&status, &finalizedAt); err != nil {
+		t.Fatalf("load reconciled legacy billing period: %v", err)
+	}
+	if status != "open" || finalizedAt != nil {
+		t.Fatalf("legacy billing period status/finalized_at = %q/%v, want open/null", status, finalizedAt)
+	}
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: anchor,
+		PeriodEnd:   anchor.AddDate(0, 1, 0),
+		Status:      "open",
+	}); err == nil {
+		t.Fatal("overlapping anniversary billing period insert succeeded, want failure")
+	}
+}
+
+func TestIntegration_UpsertTeamBillingPeriodRejectsOverlap(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, _ := seedTeamAndKeyWithRole(t, "viewer")
+	firstStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	firstEnd := firstStart.AddDate(0, 1, 0)
+	secondStart := firstStart.Add(20 * 24 * time.Hour)
+	secondEnd := secondStart.AddDate(0, 1, 0)
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: firstStart,
+		PeriodEnd:   firstEnd,
+		Status:      "open",
+	}); err != nil {
+		t.Fatalf("seed first billing period: %v", err)
+	}
+
+	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: secondStart,
+		PeriodEnd:   secondEnd,
+		Status:      "open",
+	}); err == nil {
+		t.Fatal("overlapping billing period insert succeeded, want failure")
+	} else {
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23P01" {
+			t.Fatalf("overlapping billing period error = %v, want PostgreSQL 23P01", err)
+		}
 	}
 }
 

@@ -1190,13 +1190,30 @@ func (j *Journal) MigrateVerificationScope(scope string) error {
 // their key is next written); NUL-prefixed keys are internal markers,
 // not notifications.
 func (j *Journal) PendingNotifications(limit int) ([]Task, error) {
+	tasks, _, err := j.PendingNotificationsAfter(nil, limit)
+	return tasks, err
+}
+
+// PendingNotificationsAfter is PendingNotifications starting past the given
+// outbox key, and also returns the key of the last entry read so a caller
+// can page on. A nil after starts from the top.
+func (j *Journal) PendingNotificationsAfter(after []byte, limit int) ([]Task, []byte, error) {
 	var tasks []Task
+	var last []byte
 	err := j.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(outboxBucket).Cursor()
-		for k, v := c.First(); k != nil; k, v = c.Next() {
+		k, v := c.First()
+		if after != nil {
+			k, v = c.Seek(after)
+			if k != nil && bytes.Equal(k, after) {
+				k, v = c.Next()
+			}
+		}
+		for ; k != nil; k, v = c.Next() {
 			if len(k) > 0 && k[0] == 0 {
 				continue
 			}
+			last = append(last[:0], k...)
 			var t Task
 			if json.Unmarshal(v, &t) == nil {
 				tasks = append(tasks, t)
@@ -1207,7 +1224,7 @@ func (j *Journal) PendingNotifications(limit int) ([]Task, error) {
 		}
 		return nil
 	})
-	return tasks, err
+	return tasks, last, err
 }
 
 // seedChunkLimit bounds completions examined per seed transaction

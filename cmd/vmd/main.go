@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -31,7 +32,9 @@ import (
 	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/blocklist"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/hostidentity"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/proxy"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vm"
@@ -44,6 +47,7 @@ const localHTTPPort = 9090
 
 // Config holds the daemon configuration sourced from environment variables.
 type Config struct {
+	IncarnationID      string
 	FirecrackerBin     string
 	JailerBin          string
 	KernelPath         string
@@ -72,9 +76,10 @@ type Config struct {
 
 	// Heartbeat self-description overrides. When unset, the daemon infers
 	// addresses and region from the local interface and deployment defaults.
-	VMDAdvertiseAddr   string
-	ProxyAdvertiseAddr string
-	HostRegion         string
+	VMDAdvertiseAddr    string
+	ProxyAdvertiseAddr  string
+	PeerProxyListenAddr string
+	HostRegion          string
 
 	// SecretsProxySocket is the local secretsproxy daemon's control-RPC unix-socket path.
 	// When empty, broker registration is skipped.
@@ -90,6 +95,10 @@ type Config struct {
 }
 
 func loadConfig() (Config, error) {
+	return loadConfigWithStartupTimer(nil)
+}
+
+func loadConfigWithStartupTimer(st *startupTimer) (Config, error) {
 	port, err := strconv.Atoi(envOrDefault("GRPC_PORT", "50051"))
 	if err != nil {
 		return Config{}, fmt.Errorf("invalid GRPC_PORT: %w", err)
@@ -103,7 +112,7 @@ func loadConfig() (Config, error) {
 		SnapshotDir:             envOrDefault("SNAPSHOT_DIR", "/var/lib/sandbox/snapshots"),
 		RunDir:                  envOrDefault("RUN_DIR", "/var/lib/sandbox/rundir"),
 		GRPCPort:                port,
-		HostInterface:           envOrDefault("HOST_INTERFACE", "eth0"),
+		HostInterface:           os.Getenv("HOST_INTERFACE"),
 		TemplateBuilderBin:      envOrDefault("TEMPLATE_BUILDER_BIN", "/usr/local/bin/template-builder"),
 		BoxdBinaryPath:          envOrDefault("BOXD_BINARY_PATH", "/usr/local/bin/boxd"),
 		HostID:                  requireEnv("HOST_ID"),
@@ -111,6 +120,7 @@ func loadConfig() (Config, error) {
 		ControlPlaneURL:         os.Getenv("CONTROL_PLANE_URL"),
 		VMDAdvertiseAddr:        os.Getenv("VMD_ADVERTISE_ADDR"),
 		ProxyAdvertiseAddr:      os.Getenv("PROXY_ADVERTISE_ADDR"),
+		PeerProxyListenAddr:     os.Getenv("PEER_PROXY_LISTEN_ADDR"),
 		HostRegion:              envOrDefault("HOST_REGION", os.Getenv("SANDBOX_ID_REGION")),
 		SecretsProxySocket:      os.Getenv("SECRETSPROXY_SOCKET"),
 		SecretsProxySandboxAddr: os.Getenv("SECRETSPROXY_SANDBOX_ADDR"),
@@ -131,6 +141,24 @@ func loadConfig() (Config, error) {
 		return Config{}, fmt.Errorf("HOST_ID environment variable is required and must be this host's unique identity")
 	}
 
+	identityPath := os.Getenv("HOST_IDENTITY_FILE")
+	if os.Getenv("HOST_IDENTITY_REQUIRED") == "1" && identityPath == "" {
+		return Config{}, fmt.Errorf("HOST_IDENTITY_FILE is required; install host identity before starting VMD")
+	}
+	if identityPath != "" {
+		if err := validateIdentityHeartbeatConfig(cfg); err != nil {
+			return Config{}, err
+		}
+		started := time.Now()
+		identity, err := hostidentity.Load(identityPath, cfg.HostID, hostidentity.Metadata)
+		if st != nil {
+			st.identityVerification(time.Since(started), err)
+		}
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.IncarnationID = identity.IncarnationID
+	}
 	if cfg.SecretsProxySandboxAddr != "" {
 		host, port, err := parseSecretsProxyAddr(cfg.SecretsProxySandboxAddr)
 		if err != nil {
@@ -141,6 +169,20 @@ func loadConfig() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// Bound heartbeats require a complete description even for previously registered hosts.
+func validateIdentityHeartbeatConfig(cfg Config) error {
+	if strings.TrimSpace(cfg.HostRegion) == "" || len(cfg.HostRegion) > 256 {
+		return fmt.Errorf("identity-bound VMD requires HOST_REGION to be nonempty and at most 256 bytes")
+	}
+	for _, key := range []string{"VMD_SCHEDULABLE_MEMORY_MIB", "VMD_SCHEDULABLE_VCPUS"} {
+		value, err := strconv.ParseInt(os.Getenv(key), 10, 32)
+		if err != nil || value <= 0 {
+			return fmt.Errorf("identity-bound VMD requires %s to be a positive int32 schedulable capacity", key)
+		}
+	}
+	return nil
 }
 
 // parseSecretsProxyAddr parses host:port; host must be an IPv4 literal because
@@ -180,22 +222,10 @@ func hostInterfaceAddress(interfaceName string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	for _, addr := range addrs {
-		var ip net.IP
-		switch v := addr.(type) {
-		case *net.IPNet:
-			ip = v.IP
-		case *net.IPAddr:
-			ip = v.IP
-		}
-		if ip == nil {
-			continue
-		}
-		if ipv4 := ip.To4(); ipv4 != nil {
-			return ipv4.String(), nil
-		}
+	if iface.Flags&net.FlagUp == 0 {
+		return "", fmt.Errorf("host interface %q is down", interfaceName)
 	}
-	return "", fmt.Errorf("no IPv4 address found on interface %q", interfaceName)
+	return uniquePrivateHostAddress(addrs)
 }
 
 // publishesCapacityPressure reports whether this daemon should publish
@@ -216,7 +246,7 @@ func publishesCapacityPressure(advertiseAddr, controlPlaneURL string) bool {
 // hostIPOnce memoizes a host-address resolver. Both advertised endpoints
 // derive from the same interface, and the lookup dumps the host's interface
 // and address tables — tables that grow with every VM and pooled slot on the
-// box — so it runs at most once per process, and not at all when both
+// box — so it runs at most once per resolution attempt, and not at all when both
 // endpoints are configured explicitly.
 func hostIPOnce(resolve func() (string, error)) func() (string, error) {
 	var (
@@ -227,6 +257,25 @@ func hostIPOnce(resolve func() (string, error)) func() (string, error) {
 	return func() (string, error) {
 		once.Do(func() { ip, err = resolve() })
 		return ip, err
+	}
+}
+
+// resolveHeartbeatAddresses keeps incarnation-bearing heartbeats from starting
+// with an incomplete description after a transient address lookup failure.
+func resolveHeartbeatAddresses(ctx context.Context, interval time.Duration, resolve func() (string, string, error), log zerolog.Logger) (string, string, error) {
+	for {
+		vmdAddr, proxyAddr, err := resolve()
+		if err == nil {
+			return vmdAddr, proxyAddr, nil
+		}
+		log.Warn().Err(err).Msg("unable to resolve heartbeat addresses; retrying before advertising host")
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", "", ctx.Err()
+		case <-timer.C:
+		}
 	}
 }
 
@@ -262,14 +311,27 @@ func advertisedProxyAddr(hostIP func() (string, error), proxyHealthURL, explicit
 	if err != nil {
 		return "", err
 	}
-	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	if host == "localhost" || net.ParseIP(host).IsLoopback() || net.ParseIP(host).IsUnspecified() {
 		ip, err := hostIP()
 		if err != nil {
 			return "", err
 		}
 		return net.JoinHostPort(ip, port), nil
 	}
+	if !privateHostIPv4(net.ParseIP(host)) {
+		return "", fmt.Errorf("proxy health address must resolve to a private host IPv4 address")
+	}
 	return u.Host, nil
+}
+
+func advertisedHeartbeatProxyAddr(hostIP func() (string, error), proxyHealthURL, configured, peerListen string) (string, error) {
+	if peerListen != "" {
+		if !proxy.PrivateBind(peerListen) {
+			return "", fmt.Errorf("peer proxy listener %q must be a concrete private IP address with a nonzero port", peerListen)
+		}
+		return peerListen, nil
+	}
+	return advertisedProxyAddr(hostIP, proxyHealthURL, configured)
 }
 
 // envInt32Fatal parses an optional non-negative int32 env var. Unset or
@@ -554,6 +616,25 @@ func (s *startupTimer) mark(phase string, enabled bool, count int) {
 	s.last = now
 }
 
+// Identity verification is a breakdown of preliminary, not a phase boundary.
+func (s *startupTimer) identityVerification(elapsed time.Duration, err error) {
+	if err != nil {
+		// Configuration failure exits immediately, so carry timing on its fatal record.
+		s.log = s.log.With().Str("startup_component", "identity_verification").
+			Dur("duration_ms", elapsed).
+			Dur("budget_ms", hostidentity.VerificationTimeout).
+			Bool("success", false).Logger()
+		return
+	}
+	s.emit(func() {
+		s.log.Info().Str("startup_component", "identity_verification").
+			Dur("duration_ms", elapsed).
+			Dur("budget_ms", hostidentity.VerificationTimeout).
+			Bool("success", err == nil).Err(err).
+			Msg("startup identity verification timing")
+	})
+}
+
 func main() {
 	// Maintenance subcommands run before any daemon setup and exit. They must
 	// not open the state store in write mode or start services.
@@ -594,9 +675,9 @@ func main() {
 		}
 	}
 
-	cfg, err := loadConfig()
+	cfg, err := loadConfigWithStartupTimer(st)
 	if err != nil {
-		log.Fatal().Err(err).Msg("failed to load configuration")
+		st.log.Fatal().Err(err).Msg("failed to load configuration")
 	}
 
 	log.Info().
@@ -677,6 +758,17 @@ func main() {
 		log.Info().Uint64("port", port).Msg("guest DNS redirect enabled")
 	}
 
+	// An unset override uses the host route for both networking and advertisement.
+	// Two bounded local queries avoid a fleet-sized interface/address table scan.
+	var automaticHostIP string
+	if cfg.HostInterface == "" {
+		cfg.HostInterface, automaticHostIP, err = discoverHostRoute(ctx)
+		if err != nil {
+			log.Fatal().Err(err).Msg("cannot determine private host interface from default route; configure HOST_INTERFACE")
+		}
+		log.Info().Str("host_interface", cfg.HostInterface).Str("host_ip", automaticHostIP).Msg("resolved host default route")
+	}
+
 	// ---- Network manager + host firewall ----
 	// preliminary: sentry init, config parse, tool lookups, dir creation, and
 	// egress/DNS option wiring — everything before the network manager builds.
@@ -699,7 +791,14 @@ func main() {
 	resumeUffdEnabled := envOrDefault("VMD_RESUME_UFFD", "false") == "true"
 	verifySnapshotEnabled := envOrDefault("VMD_VERIFY_SNAPSHOT_ENABLED", "false") == "true"
 	incrementalSnapshotEnabled := envOrDefault("VMD_INCREMENTAL_SNAPSHOT", "false") == "true"
+	// Safe to enable ahead of the Firecracker rollout: sessions are armed only
+	// once the binary advertises the capability, and a rollback degrades to
+	// the unguarded behavior. Off is exactly today's behavior.
+	dirtyTrackingSessionEnabled := envOrDefault("VMD_DIRTY_TRACKING_SESSION", "false") == "true"
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
+	// Off by default: it only does anything for a snapshot whose guest corrects
+	// its own wall clock, and forcing legacy is the way back if one misbehaves.
+	guestClockFreezeEnabled := envOrDefault("VMD_GUEST_CLOCK_FREEZE", "false") == "true"
 	// Tri-state: "auto" (default) lets vmd enforce only after its convergence
 	// sweep proves every layered overlay has a presence side-car; "always"
 	// forces enforcement (fresh migration-target hosts); "never" is the
@@ -871,7 +970,9 @@ func main() {
 		ResumeUffdEnabled:                   resumeUffdEnabled,
 		VerifySnapshotEnabled:               verifySnapshotEnabled,
 		IncrementalSnapshotEnabled:          incrementalSnapshotEnabled,
+		DirtyTrackingSessionEnabled:         dirtyTrackingSessionEnabled,
 		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
+		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
 		RequirePresenceSidecar:              requirePresenceSidecar,
 		PausedNetworkReclaimEnabled:         pausedNetworkReclaimEnabled,
 		PausedNetworkSlotHeadroomPercent:    pausedNetworkSlotHeadroomPercent,
@@ -1538,16 +1639,21 @@ func main() {
 	// below isn't held for the fill; creates fall back to on-demand until warm.
 	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "256"))
 	netPoolRecycle, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_RECYCLE_SIZE", "256"))
+	// One predicate decides both the plan and the call: PlanStartupAdoption
+	// parks refill behind a pass the caller promises to start, so the two
+	// must never diverge.
+	adoptionPlanned := adoptNetPool && slotsReserved && sweepSafe
 	netPool := netMgr.StartPool(ctx, network.PoolConfig{
-		NewSize:           netPoolFresh,
-		RecycleSize:       netPoolRecycle,
-		StartGate:         postReady,
-		ResetTapOnRecycle: envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
-		AbandonOnStop:     adoptNetPool,
+		NewSize:             netPoolFresh,
+		RecycleSize:         netPoolRecycle,
+		StartGate:           postReady,
+		PlanStartupAdoption: adoptionPlanned,
+		ResetTapOnRecycle:   envOrDefault("VMD_RECYCLE_TAP_RESET", "false") == "true",
+		AbandonOnStop:       adoptNetPool,
 	})
 	lc.addCloser("network pool", func(_ context.Context) error { netPool.Stop(); return nil })
 	switch {
-	case adoptNetPool && slotsReserved && sweepSafe:
+	case adoptionPlanned:
 		// Adopt the slots the previous run abandoned (or crashed out of):
 		// the pool starts warm within seconds instead of refilling from
 		// scratch. StartAdoption marks the pass underway before returning,
@@ -1565,6 +1671,22 @@ func main() {
 
 	// pool_start: StartPool (async fill), adoption wiring, launcher-ns setup.
 	st.mark("pool_start", true, -1)
+
+	// Keeps the Firecracker clock-option capability in step with the binary on
+	// disk: the deploy replaces it in place without restarting this daemon, so an
+	// answer read once would go stale on the next rollout in either direction.
+	//
+	// One exec, then one every few minutes — bounded, touches no fleet-sized
+	// collection and no allocator lock, so it does not belong behind the
+	// readiness barrier below. Started early so it has normally answered long
+	// before the first request, but nothing orders the two: a restore that beats
+	// the first probe reads false and takes legacy behaviour — slower, never
+	// wrong, and corrected by the next probe. Blocking readiness on an exec to
+	// close that window would cost every restart more than it saves.
+	mgr.WatchFirecrackerCapability(ctx, log)
+	// Evidence a previous process made durable is recognised; starting a vmd
+	// creates none.
+	vm.RecognizeWakeProtocolFloor()
 
 	// ---- Background full reattach ----
 	// Off the critical path (requests load their VM on demand); proactively
@@ -1735,12 +1857,6 @@ func main() {
 		if proxyHealthURL == "" {
 			proxyHealthURL = "http://127.0.0.1:5007/health"
 		}
-		// Both endpoints derive from one host-interface lookup, and that
-		// lookup dumps the host's interface and address tables — whose size
-		// grows with the fleet. hostIP resolves at most once, and only if
-		// something actually needs it: two explicit advertise settings
-		// resolve nothing at all.
-		hostIP := hostIPOnce(func() (string, error) { return hostInterfaceAddress(cfg.HostInterface) })
 		// Pressure publication is wired ONLY on the explicit advertise
 		// setting — never on the resolved vmdAddr, which now falls back
 		// to deriving an address from the host interface. Keying on the
@@ -1754,22 +1870,39 @@ func main() {
 			pressureReady = mgr.PressureReady
 		}
 		lc.start("heartbeat", func() error {
-			// Resolved here rather than on the startup goroutine: the lookup
-			// is fleet-sized, and its only consumer is this heartbeat. A
-			// failure still omits self-description and warns; it has never
-			// been a reason to hold up readiness.
-			vmdAddr, err := advertisedVMDAddr(hostIP, cfg.GRPCPort, cfg.VMDAdvertiseAddr)
-			if err != nil {
-				log.Warn().Err(err).Str("host_interface", cfg.HostInterface).
-					Int("grpc_port", cfg.GRPCPort).
-					Msg("unable to resolve advertised VMD address; heartbeat will omit host self-description")
+			// Address enumeration and retries stay off the startup goroutine.
+			resolve := func() (string, string, error) {
+				// Share one lookup per attempt, including its error. A later
+				// attempt must retry rather than retain a transient failure.
+				hostIP := hostIPOnce(func() (string, error) {
+					if automaticHostIP != "" {
+						return automaticHostIP, nil
+					}
+					return hostInterfaceAddress(cfg.HostInterface)
+				})
+				vmdAddr, err := advertisedVMDAddr(hostIP, cfg.GRPCPort, cfg.VMDAdvertiseAddr)
+				if err != nil {
+					return "", "", err
+				}
+				// Private peer ingress takes precedence over the public proxy override.
+				proxyAddr, err := advertisedHeartbeatProxyAddr(hostIP, proxyHealthURL, cfg.ProxyAdvertiseAddr, cfg.PeerProxyListenAddr)
+				return vmdAddr, proxyAddr, err
 			}
-			proxyAddr, err := advertisedProxyAddr(hostIP, proxyHealthURL, cfg.ProxyAdvertiseAddr)
-			if err != nil {
-				log.Warn().Err(err).Str("proxy_health_url", proxyHealthURL).
-					Msg("unable to derive advertised proxy address; heartbeat will omit host self-description")
+			var vmdAddr, proxyAddr string
+			var err error
+			if cfg.IncarnationID != "" {
+				vmdAddr, proxyAddr, err = resolveHeartbeatAddresses(ctx, 5*time.Second, resolve, log)
+				if err != nil {
+					return nil
+				}
+			} else {
+				vmdAddr, proxyAddr, err = resolve()
+				if err != nil {
+					log.Warn().Err(err).Msg("unable to resolve heartbeat addresses; heartbeat will omit host self-description")
+				}
 			}
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
+				IncarnationID:     cfg.IncarnationID,
 				ControlPlaneURL:   cfg.ControlPlaneURL,
 				HostID:            cfg.HostID,
 				Token:             os.Getenv("INTERNAL_API_TOKEN"),

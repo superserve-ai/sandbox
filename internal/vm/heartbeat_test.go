@@ -3,11 +3,15 @@ package vm
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -427,5 +431,166 @@ func TestHeartbeatStorageCacheRetriesUnchangedSamplesAfterInterval(t *testing.T)
 	}
 	if !cache.shouldSend(version, now.Add(overlayStorageSampleInterval)) {
 		t.Fatal("unchanged measurements must be retried after the retry interval")
+	}
+}
+
+// A publishing host must SAY so on its heartbeat. The control plane's
+// three-state classification keys on this capability: without it, a host
+// that publishes pressure is indistinguishable from a daemon that never
+// will, so its reports are never consulted and capacity ranking sees an
+// empty fleet.
+//
+// The consumer-side constant lives in internal/scheduler, which this
+// package cannot import — hence the literal, and hence a test on each
+// side of the contract.
+func TestSendHeartbeatAdvertisesCapacityPressureWhenPublishing(t *testing.T) {
+	capabilitiesFor := func(cfg HeartbeatConfig) []string {
+		t.Helper()
+		var got heartbeatRequest
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/health":
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(proxyHealthResponse{})
+			default:
+				if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+					t.Errorf("decode heartbeat: %v", err)
+				}
+				w.WriteHeader(http.StatusOK)
+			}
+		}))
+		defer server.Close()
+
+		cfg.HostID = "host-a"
+		sendHeartbeat(context.Background(), server.Client(), cfg,
+			server.URL+"/internal/hosts/host-a/heartbeat", "shared", server.URL+"/health", nil, zerolog.Nop())
+		return got.Capabilities
+	}
+
+	publishing := capabilitiesFor(HeartbeatConfig{
+		VMDAddr:  "10.0.0.2:50051",
+		Pressure: func() HostPressure { return HostPressure{} },
+	})
+	if !slices.Contains(publishing, capabilityCapacityPressure) {
+		t.Fatalf("capabilities = %v, missing %q; every publishing host would read as legacy",
+			publishing, capabilityCapacityPressure)
+	}
+
+	// Not publishing: no advertisement, so the control plane keeps
+	// treating it as a daemon that does not report.
+	silent := capabilitiesFor(HeartbeatConfig{VMDAddr: "10.0.0.2:50051"})
+	if slices.Contains(silent, capabilityCapacityPressure) {
+		t.Fatalf("capabilities = %v; a host that publishes nothing must not claim to", silent)
+	}
+
+	// Configured to publish but with no advertised address: the report
+	// has no identity to fence on, so publication never happens and the
+	// capability must not be claimed either.
+	unaddressed := capabilitiesFor(HeartbeatConfig{Pressure: func() HostPressure { return HostPressure{} }})
+	if slices.Contains(unaddressed, capabilityCapacityPressure) {
+		t.Fatalf("capabilities = %v; without an advertised address nothing is published", unaddressed)
+	}
+}
+
+func TestHeartbeatLogsEndpointAcknowledgementOnceAfterAcceptance(t *testing.T) {
+	for _, complete := range []bool{false, true} {
+		t.Run(fmt.Sprintf("complete=%t", complete), func(t *testing.T) {
+			var attempts atomic.Int32
+			third := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/health" {
+					_, _ = w.Write([]byte(`{"capabilities":[]}`))
+					return
+				}
+				n := attempts.Add(1)
+				if n == 1 {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				if n == 3 {
+					close(third)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+			writer := &heartbeatReceiptWriter{attempts: &attempts, events: make(chan heartbeatReceiptEvent, 64)}
+			cfg := HeartbeatConfig{ControlPlaneURL: server.URL, ProxyHealthURL: server.URL + "/health", HostID: "host-a", RunDir: t.TempDir(), Interval: 10 * time.Millisecond}
+			if complete {
+				cfg.VMDAddr, cfg.ProxyAddr, cfg.Region = "192.0.2.1:50051", "192.0.2.1:5009", "test-region"
+				cfg.CapacityMemoryMib, cfg.CapacityVcpus = 1024, 1
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() { StartHeartbeat(ctx, cfg, zerolog.New(writer)); close(done) }()
+			select {
+			case <-third:
+			case <-time.After(3 * time.Second):
+				t.Fatal("heartbeats did not retry")
+			}
+			cancel()
+			<-done
+			count := 0
+			for len(writer.events) > 0 {
+				event := <-writer.events
+				if strings.Contains(event.line, "host endpoint heartbeat accepted") {
+					count++
+					if event.attempt < 2 || !strings.Contains(event.line, cfg.ProxyAddr) {
+						t.Fatalf("invalid acknowledgement: %+v", event)
+					}
+				}
+			}
+			want := 0
+			if complete {
+				want = 1
+			}
+			if count != want {
+				t.Fatalf("acknowledgements = %d, want %d", count, want)
+			}
+		})
+	}
+}
+
+type heartbeatReceiptEvent struct {
+	line    string
+	attempt int32
+}
+type heartbeatReceiptWriter struct {
+	attempts *atomic.Int32
+	events   chan heartbeatReceiptEvent
+}
+
+func (w *heartbeatReceiptWriter) Write(p []byte) (int, error) {
+	w.events <- heartbeatReceiptEvent{line: string(p), attempt: w.attempts.Load()}
+	return len(p), nil
+}
+
+func TestHeartbeatPreservesInstalledIncarnation(t *testing.T) {
+	cfg := HeartbeatConfig{IncarnationID: "54ab780a-cd77-4aef-8cd0-c2dd9c5032ef", VMDAddr: "192.0.2.10:50051", ProxyAddr: "192.0.2.10:5009", Region: "example-region", CapacityMemoryMib: 1024, CapacityVcpus: 2}
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req heartbeatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode heartbeat: %v", err)
+		}
+		if req.IncarnationID != cfg.IncarnationID || req.VMDAddr != cfg.VMDAddr || req.ProxyAddr != cfg.ProxyAddr ||
+			req.Region != cfg.Region || req.CapacityMemoryMib != cfg.CapacityMemoryMib || req.CapacityVcpus != cfg.CapacityVcpus {
+			t.Errorf("heartbeat lost installation identity or description: %+v", req)
+		}
+		if attempts.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	for i := range 2 {
+		ok, _ := postHeartbeat(context.Background(), server.Client(), cfg, server.URL, "", nil, nil, zerolog.Nop(), time.Now())
+		if ok != (i == 1) {
+			t.Fatalf("heartbeat %d accepted = %t", i, ok)
+		}
+	}
+	if attempts.Load() != 2 {
+		t.Fatalf("requests = %d, want 2 without an identity-less fallback", attempts.Load())
 	}
 }

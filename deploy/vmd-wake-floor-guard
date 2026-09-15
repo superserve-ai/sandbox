@@ -1,0 +1,43 @@
+#!/bin/sh
+# Host-resident wake-protocol floor for superserve-vmd, invoked from its own
+# systemd drop-in at every service start. It lives in a file and a drop-in of
+# its own, which deploy scripts from before it never install or overwrite:
+# rolling back to such a revision replaces the other guard with that
+# revision's copy, but leaves this one exactly as it is.
+#
+# An image whose workload was frozen for its snapshot owes a wake that only a
+# vmd speaking the protocol can give; any other vmd restores it and leaves it
+# stopped. The one witness is the evidence file, which whatever puts such an
+# image on this host writes first: the template builder before it publishes
+# a frozen template, the daemon before it freezes or restores one, and any
+# import of one from elsewhere. Nothing here walks the snapshot trees: a host
+# holds far too many images for a walk at every start, so the witness has to
+# be there before the image is.
+set -u
+LC_ALL=C
+export LC_ALL
+BIN="${1:-/usr/local/bin/vmd}"
+WAKE_EVIDENCE=/var/lib/sandbox/wake-protocol-evidence
+
+# One lookup. Only a lookup that says the file does not exist admits any vmd:
+# no frozen image has ever been about to exist here. A lookup that fails any
+# other way — an ancestor that cannot be traversed, a symlink loop — is not
+# absence, and is treated as presence: only a binary that can wake such
+# images may start. (A test for existence alone cannot tell the two apart.)
+lookup=$(stat -L "$WAKE_EVIDENCE" 2>&1 >/dev/null)
+if [ $? -ne 0 ]; then
+    case "$lookup" in
+        *"No such file or directory"*) exit 0 ;;
+        *) echo "vmd-wake-floor-guard: cannot look up ${WAKE_EVIDENCE} (${lookup}); only a wake-capable vmd may start" >&2 ;;
+    esac
+fi
+
+# Evidence present, or unknowable: only a binary carrying the capability may
+# start. One pass over the binary, bounded by its size; a grep that cannot
+# run refuses.
+if grep -qa wake-protocol-1 "$BIN" 2>/dev/null; then
+    exit 0
+fi
+echo "vmd-wake-floor-guard: REFUSING to start a vmd without the wake protocol: this host holds images that owe a wake (${WAKE_EVIDENCE})" >&2
+echo "vmd-wake-floor-guard: deploy a wake-capable build; the floor comes down only once no frozen image can be restored here" >&2
+exit 1

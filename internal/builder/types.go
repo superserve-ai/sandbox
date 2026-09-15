@@ -87,6 +87,8 @@ type Config struct {
 
 	// Path to the secretsproxy CA cert. Empty disables CA install.
 	ProxyCACertPath string
+	// FreezeWorkload builds the image with the workload freezer mounted.
+	FreezeWorkload bool
 }
 
 // ApplyDefaults fills in zero-valued fields with sensible defaults.

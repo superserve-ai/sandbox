@@ -44,6 +44,18 @@ type Config struct {
 	// is configured. Set via DEFAULT_HOST_ID; defaults to "default".
 	DefaultHostID string
 
+	// SchedulerCapacityShadow runs capacity ranking alongside real
+	// placement and reports what it WOULD have chosen, without
+	// influencing any create. Opt-in via SCHEDULER_CAPACITY_SHADOW=1.
+	//
+	// Shadow only, deliberately: ranking without a host-side admission
+	// gate cannot enforce a limit — two API replicas can still exceed a
+	// host's cap between reports — so there is no configuration in which
+	// this decides placement. Enforcement will require its own
+	// control-plane flag AND the host advertising that it admits
+	// locally.
+	SchedulerCapacityShadow bool
+
 	// SystemTeamID owns curated templates that are visible to every team
 	// (python-3.11, node-22, etc.). Set via SYSTEM_TEAM_ID; empty means
 	// "no system team configured" and users see only their own templates.
@@ -113,6 +125,7 @@ func Load() (*Config, error) {
 		SandboxAccessTokenSeed:        seed,
 		EdgeProxyDomain:               envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
 		DefaultHostID:                 envOrDefault("DEFAULT_HOST_ID", "default"),
+		SchedulerCapacityShadow:       boolEnv("SCHEDULER_CAPACITY_SHADOW", false),
 		SystemTeamID:                  os.Getenv("SYSTEM_TEAM_ID"),
 		SentryDSN:                     os.Getenv("SENTRY_DSN"),
 		KMSKeyResource:                os.Getenv("KMS_KEY_RESOURCE"),

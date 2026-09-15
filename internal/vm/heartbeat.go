@@ -28,6 +28,7 @@ import (
 const overlayStorageSampleInterval = 5 * time.Minute
 
 type HeartbeatConfig struct {
+	IncarnationID     string
 	ControlPlaneURL   string
 	HostID            string
 	Token             string
@@ -108,7 +109,13 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	// keeps the storage sampler below off this goroutine.
 	pressureKick := make(chan struct{}, 1)
 	go pressureLoop(ctx, client, cfg, pressureURL, cfg.Token, pressureKick, log)
-	kickPressure := func() {
+	endpointAcknowledged := false
+	heartbeatAccepted := func() {
+		if !endpointAcknowledged && buildHeartbeatRequest(cfg, nil, nil).ProxyAddr != "" {
+			log.Info().Str("host_id", cfg.HostID).Str("proxy_addr", cfg.ProxyAddr).
+				Msg("host endpoint heartbeat accepted")
+			endpointAcknowledged = true
+		}
 		select {
 		case pressureKick <- struct{}{}:
 		default:
@@ -121,7 +128,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	if ok, _ := sendHeartbeat(ctx, client, cfg, url, cfg.Token, proxyHealthURL, nil, log); ok {
-		kickPressure()
+		heartbeatAccepted()
 	}
 	go runOverlayStorageSampler(ctx, runDir, overlayStorageSampleInterval, cache, log)
 	for {
@@ -143,7 +150,7 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 			// mean an older control plane without the route).
 			ok, accepted := sendHeartbeat(ctx, client, cfg, url, cfg.Token, proxyHealthURL, storage, log)
 			if ok {
-				kickPressure()
+				heartbeatAccepted()
 				if publishStorage && accepted {
 					cache.markSent(version, now)
 				}
@@ -176,6 +183,7 @@ func pressureLoop(ctx context.Context, client *http.Client, cfg HeartbeatConfig,
 // not match the host row, so a reclaimed-away daemon cannot overwrite
 // the new holder's numbers.
 type pressureRequest struct {
+	IncarnationID         string `json:"incarnation_id,omitempty"`
 	VMDAddr               string `json:"vmd_addr"`
 	RunningSandboxes      int32  `json:"running_sandboxes"`
 	ProvisioningSandboxes int32  `json:"provisioning_sandboxes"`
@@ -217,6 +225,7 @@ func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig,
 	}
 	p := cfg.Pressure()
 	body, err := json.Marshal(pressureRequest{
+		IncarnationID:         cfg.IncarnationID,
 		VMDAddr:               cfg.VMDAddr,
 		RunningSandboxes:      p.RunningSandboxes,
 		ProvisioningSandboxes: p.ProvisioningSandboxes,
@@ -267,6 +276,7 @@ func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig,
 }
 
 type heartbeatRequest struct {
+	IncarnationID     string                        `json:"incarnation_id,omitempty"`
 	Capabilities      []string                      `json:"capabilities"`
 	Storage           []heartbeatStorageMeasurement `json:"storage,omitempty"`
 	VMDAddr           string                        `json:"vmd_addr,omitempty"`
@@ -296,6 +306,22 @@ const (
 	capabilityCanProxyTraffic = preview.HostCapabilityCanProxyTraffic
 	capabilityCanReadFiles    = preview.HostCapabilityCanReadFiles
 	capabilityCanWriteFiles   = preview.HostCapabilityCanWriteFiles
+
+	// capabilityCapacityPressure marks a heartbeat from a daemon that
+	// publishes capacity pressure for this host.
+	//
+	// It is the wire contract the control plane keys its three-state
+	// classification on: a host that advertises this but has no fresh
+	// report is treated as one whose publisher broke or is still
+	// converging, while a host that never advertises it is simply a
+	// daemon that does not publish. Without it every publishing host is
+	// indistinguishable from a legacy one.
+	//
+	// Must match the consumer-side constant
+	// (internal/scheduler.HostCapabilityCapacityPressure); the two live
+	// in different packages because the daemon does not import the
+	// control plane.
+	capabilityCapacityPressure = "capacity_pressure_v1"
 )
 
 type heartbeatStorageCache struct {
@@ -380,6 +406,15 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 		}
 		capabilities = append(capabilities, proxyState.PreviewCapabilities...)
 	}
+	if cfg.Pressure != nil && cfg.VMDAddr != "" {
+		// Advertised under exactly the condition sendPressure publishes
+		// — deliberately NOT gated on PressureReady, which is the
+		// transient startup gate. "Capable, but no fresh report yet" is
+		// precisely how a host whose accounting is still converging
+		// should read to a consumer: not describable, and not silently
+		// mistaken for a daemon that never publishes.
+		capabilities = append(capabilities, capabilityCapacityPressure)
+	}
 	return postHeartbeat(ctx, client, cfg, url, token, capabilities, storage, log, started)
 }
 
@@ -428,8 +463,9 @@ func isStorageFieldUnsupported(body []byte) bool {
 
 func buildHeartbeatRequest(cfg HeartbeatConfig, capabilities []string, storage []heartbeatStorageMeasurement) heartbeatRequest {
 	req := heartbeatRequest{
-		Capabilities: capabilities,
-		Storage:      storage,
+		IncarnationID: cfg.IncarnationID,
+		Capabilities:  capabilities,
+		Storage:       storage,
 	}
 	if cfg.VMDAddr != "" && cfg.ProxyAddr != "" && cfg.Region != "" &&
 		cfg.CapacityMemoryMib > 0 && cfg.CapacityVcpus > 0 {

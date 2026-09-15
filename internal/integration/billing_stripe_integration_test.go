@@ -40,11 +40,22 @@ type fakeStripeClient struct {
 	portalCalls      []api.StripeCreateCustomerPortalSessionParams
 	customerCalls    []api.StripeCreateCustomerParams
 	creditGrantCalls []api.StripeCreateBillingCreditGrantParams
+	creditBalance    api.StripeCreditBalance
+	creditBalanceErr error
 	reportErr        error
 	reportErrAt      int
 	nextCustomerID   string
 	nextCheckoutURL  string
 	nextPortalURL    string
+}
+
+func (f *fakeStripeClient) GetCustomerCreditBalance(_ context.Context, _ string) (api.StripeCreditBalance, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.creditBalanceErr != nil {
+		return api.StripeCreditBalance{}, f.creditBalanceErr
+	}
+	return f.creditBalance, nil
 }
 
 type thinEventStripeClient struct {
@@ -72,7 +83,9 @@ func (f *fakeStripeClient) CreateCustomer(_ context.Context, params api.StripeCr
 	f.customerCalls = append(f.customerCalls, params)
 	id := f.nextCustomerID
 	if id == "" {
-		id = "cus_test_default"
+		// Keep the fixture's Stripe customer IDs unique across integration tests;
+		// the database enforces uniqueness globally, while each test uses its own team.
+		id = "cus_test_" + params.TeamID.String()
 	}
 	return api.StripeCustomer{ID: id}, nil
 }
@@ -215,6 +228,106 @@ func apiPeriodID(start, end time.Time) string {
 	return start.Format(time.RFC3339) + "," + end.Format(time.RFC3339)
 }
 
+// TestIntegration_GetBillingSummaryStripeCredits exercises the Stripe-authoritative
+// branch with aggregate balances that differ from any local audit grant.
+func TestIntegration_GetBillingSummaryStripeCredits(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stripe float64
+		local  float64
+	}{
+		{name: "zero", stripe: 0, local: 95},
+		{name: "partial", stripe: 20.5, local: 95},
+		{name: "full", stripe: 95, local: 1},
+		{name: "multiple grants aggregate", stripe: 145, local: 95},
+		{name: "large grant", stripe: 12000, local: 95},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+			viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+			if _, err := testPool.Exec(ctx, `
+				INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason)
+				VALUES ($1, $2, $2, 'audit-only local fixture')`, teamID, tc.local); err != nil {
+				t.Fatalf("seed local audit credit: %v", err)
+			}
+			stripe := &fakeStripeClient{creditBalance: api.StripeCreditBalance{AvailableUSD: tc.stripe, ObservedAt: time.Now().UTC(), IncludesCurrentPeriodUsage: false}}
+			w := do(newBillingRouter(t, stripe), "GET", "/billing/summary", viewerKey, "")
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			body := mustJSON(t, w)
+			if body["credit_source"] != "stripe" || body["credit_status"] != "available" {
+				t.Fatalf("credit state = %v/%v, want stripe/available", body["credit_source"], body["credit_status"])
+			}
+			if got := body["stripe_credit_balance_usd"].(float64); math.Abs(got-tc.stripe) > 1e-9 {
+				t.Fatalf("stripe balance = %v, want %v", got, tc.stripe)
+			}
+			charges := body["current_charges_usd"].(float64)
+			wantApplied := math.Min(math.Max(charges, 0), math.Max(tc.stripe, 0))
+			wantRemaining := math.Max(tc.stripe-wantApplied, 0)
+			if got := body["stripe_credits_applied_usd"].(float64); math.Abs(got-wantApplied) > 1e-9 {
+				t.Fatalf("stripe applied = %v, want %v", got, wantApplied)
+			}
+			if got := body["stripe_remaining_credit_usd"].(float64); math.Abs(got-wantRemaining) > 1e-9 {
+				t.Fatalf("stripe remaining = %v, want %v", got, wantRemaining)
+			}
+			if _, ok := body["credits_remaining_usd"]; ok && body["credits_remaining_usd"] != nil {
+				t.Fatalf("post-activation local estimate should remain unavailable: %v", body["credits_remaining_usd"])
+			}
+		})
+	}
+}
+
+func TestIntegration_GetBillingSummaryStripeCreditReaderFailureDegrades(t *testing.T) {
+	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+	stripe := &fakeStripeClient{creditBalanceErr: errors.New("credit balance unavailable")}
+	w := do(newBillingRouter(t, stripe), "GET", "/billing/summary", viewerKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	body := mustJSON(t, w)
+	if body["current_charges_usd"] == nil {
+		t.Fatal("expected non-Stripe charges when Stripe credit read fails")
+	}
+	for _, field := range []string{"stripe_credit_balance_usd", "credits_applied_usd", "credits_remaining_usd", "expected_invoice_amount_usd"} {
+		if value, ok := body[field]; ok && value != nil {
+			t.Fatalf("%s = %v, want null when Stripe credit is unavailable", field, value)
+		}
+	}
+	if body["credit_status"] != "unavailable" {
+		t.Fatalf("credit_status = %v, want unavailable", body["credit_status"])
+	}
+}
+
+func TestIntegration_GetBillingSummaryStripeCreditAlreadyReflectsCurrentPeriod(t *testing.T) {
+	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
+	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
+	stripe := &fakeStripeClient{creditBalance: api.StripeCreditBalance{AvailableUSD: 20, ObservedAt: time.Now().UTC(), IncludesCurrentPeriodUsage: true}}
+	w := do(newBillingRouter(t, stripe), "GET", "/billing/summary", viewerKey, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	body := mustJSON(t, w)
+	if body["stripe_credit_balance_usd"] != float64(20) {
+		t.Fatalf("stripe balance = %v, want 20", body["stripe_credit_balance_usd"])
+	}
+	if got := body["stripe_credits_applied_usd"].(float64); got != 0 {
+		t.Fatalf("stripe applied = %v, want 0", got)
+	}
+	if got := body["stripe_remaining_credit_usd"].(float64); got != 20 {
+		t.Fatalf("stripe remaining = %v, want 20", got)
+	}
+	// Stripe's available balance already reflects current-period usage; do not
+	// subtract it again in a local payable estimate.
+	for _, field := range []string{"credits_applied_usd", "credits_remaining_usd", "expected_invoice_amount_usd"} {
+		if value, ok := body[field]; ok && value != nil {
+			t.Fatalf("%s = %v, want null for Stripe-authoritative accounting", field, value)
+		}
+	}
+}
+
 func stripeSignature(t *testing.T, payload []byte, ts time.Time, secret ...string) string {
 	t.Helper()
 	signingSecret := testStripeWebhookSecret
@@ -270,7 +383,7 @@ func stripeCheckoutWebhookPayload(t *testing.T, eventID, clientReferenceID, cust
 		"created": created.Unix(),
 		"data": map[string]any{
 			"object": map[string]any{
-				"id":                  "cs_" + eventID,
+				"id":                  "cs_test_123",
 				"customer":            customerID,
 				"subscription":        subscriptionID,
 				"client_reference_id": clientReferenceID,
@@ -428,6 +541,35 @@ func TestIntegration_ShadowBillingSkipsStripeCalls(t *testing.T) {
 	}
 }
 
+func TestIntegration_ExportTeamBillingPeriodClaimsCommercialAnchor(t *testing.T) {
+	ctx := context.Background()
+	teamID, periodID, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, false)
+	adminID := seedPlatformAdminProfile(t)
+	stripe := &fakeStripeClient{}
+	r := newBillingRouter(t, stripe)
+
+	w := doInternal(r, "POST", "/internal/teams/"+teamID.String()+"/billing/periods/"+periodID+"/export", adminID.String(), "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("shadow export with anchor claim: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := len(stripe.reportCalls); got != 0 {
+		t.Fatalf("stripe report calls = %d, want 0 in shadow mode", got)
+	}
+	account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load billing account after export: %v", err)
+	}
+	if !account.CommercialBillingAnchor.Valid {
+		t.Fatal("commercial billing anchor was not claimed during export")
+	}
+	if !account.CommercialBillingAnchor.Time.Equal(periodStart) {
+		t.Fatalf("commercial billing anchor = %s, want %s", account.CommercialBillingAnchor.Time, periodStart)
+	}
+	if got := billingPeriodStatus(t, teamID, periodStart, periodEnd); got != "exported" {
+		t.Fatalf("period status after shadow export = %q, want exported", got)
+	}
+}
+
 func TestIntegration_LiveBillingSendsStripeEventsAndIsIdempotent(t *testing.T) {
 	teamID, periodID, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, true)
 	adminID := seedPlatformAdminProfile(t)
@@ -577,6 +719,78 @@ func TestIntegration_CreateStripeCheckoutSessionUsesConfiguredPrice(t *testing.T
 	}
 	if got := stripe.checkoutCalls[0].IdempotencyKey; got == "" {
 		t.Fatal("checkout idempotency key was not set")
+	}
+}
+
+func TestIntegration_CreateStripeCheckoutSessionWithCommercialAnchorUsesCurrentActivation(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', true)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("enable billing export: %v", err)
+	}
+	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
+		TeamID: teamID,
+		Anchor: anchor,
+	}); err != nil {
+		t.Fatalf("claim commercial billing anchor: %v", err)
+	}
+
+	stripe := &fakeStripeClient{nextCheckoutURL: "https://checkout.stripe.test/session"}
+	r := newBillingRouter(t, stripe)
+
+	w := do(r, "POST", "/stripe/checkout-session", apiKey, `{"success_url":"https://app.superserve.test/billing/success","cancel_url":"https://app.superserve.test/billing/cancel"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("checkout session with commercial anchor: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := len(stripe.checkoutCalls); got != 1 {
+		t.Fatalf("checkout calls = %d, want 1", got)
+	}
+	if stripe.checkoutCalls[0].BackdateStartDate != nil {
+		t.Fatalf("checkout backdate_start_date = %v, want nil for normal activation", stripe.checkoutCalls[0].BackdateStartDate)
+	}
+
+	customerID := "cus_test_" + teamID.String()
+	subscriptionID := "sub_" + teamID.String()
+	checkoutCreatedAt := anchor.Add(2 * time.Hour)
+	checkoutPayload := stripeCheckoutWebhookPayload(t, "evt_checkout_completed", teamID.String(), customerID, subscriptionID, checkoutCreatedAt)
+	checkoutReq := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(checkoutPayload)))
+	checkoutReq.Header.Set("Content-Type", "application/json")
+	checkoutReq.Header.Set("Stripe-Signature", stripeSignature(t, checkoutPayload, time.Now().UTC()))
+	if checkoutResp := doRequest(r, checkoutReq); checkoutResp.Code != http.StatusOK {
+		t.Fatalf("checkout webhook: expected 200, got %d: %s", checkoutResp.Code, checkoutResp.Body.String())
+	}
+
+	periodStart := anchor
+	periodEnd := anchor.AddDate(0, 1, 0)
+	subscriptionCreatedAt := checkoutCreatedAt.Add(time.Minute)
+	subscriptionPayload := stripeSubscriptionWebhookPayload(t, "evt_subscription_created", "customer.subscription.created", subscriptionID, customerID, "active", subscriptionCreatedAt, periodStart, periodEnd)
+	subscriptionReq := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(subscriptionPayload)))
+	subscriptionReq.Header.Set("Content-Type", "application/json")
+	subscriptionReq.Header.Set("Stripe-Signature", stripeSignature(t, subscriptionPayload, time.Now().UTC()))
+	if subscriptionResp := doRequest(r, subscriptionReq); subscriptionResp.Code != http.StatusOK {
+		t.Fatalf("subscription created webhook: expected 200, got %d: %s", subscriptionResp.Code, subscriptionResp.Body.String())
+	}
+
+	account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+	if err != nil {
+		t.Fatalf("load billing account after subscription activation: %v", err)
+	}
+	if !account.CommercialBillingAnchor.Valid || !account.CommercialBillingAnchor.Time.Equal(anchor) {
+		t.Fatalf("commercial billing anchor = %v, want %s", account.CommercialBillingAnchor, anchor)
+	}
+	if account.StripeSubscriptionID == nil || *account.StripeSubscriptionID != subscriptionID {
+		t.Fatalf("stripe subscription id = %q, want %q", derefString(account.StripeSubscriptionID), subscriptionID)
+	}
+	if !account.CurrentPeriodStart.Valid || !account.CurrentPeriodStart.Time.Equal(periodStart) {
+		t.Fatalf("current period start = %v, want %s", account.CurrentPeriodStart, periodStart)
+	}
+	if !account.CurrentPeriodEnd.Valid || !account.CurrentPeriodEnd.Time.Equal(periodEnd) {
+		t.Fatalf("current period end = %v, want %s", account.CurrentPeriodEnd, periodEnd)
 	}
 }
 

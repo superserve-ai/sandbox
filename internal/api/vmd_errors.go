@@ -67,6 +67,16 @@ func isVMDDeadline(err error) bool {
 // isVMDUnavailable returns true when the daemon was unreachable for the
 // whole of the dial-site interceptor's retry window — the shape a vmd
 // restart longer than that window surfaces as.
+// isVMDFailedPrecondition: the host can never pause this VM as it stands
+// (a paused VM whose artifacts are gone, or one parked in an error state).
+// Terminal, like NotFound, unlike a timeout.
+func isVMDFailedPrecondition(err error) bool {
+	if err == nil {
+		return false
+	}
+	return status.Code(err) == codes.FailedPrecondition
+}
+
 func isVMDUnavailable(err error) bool {
 	if err == nil {
 		return false

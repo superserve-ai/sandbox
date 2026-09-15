@@ -6,7 +6,6 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/network"
@@ -54,16 +53,13 @@ func (a *GRPCAdapter) PauseVM(ctx context.Context, req *vmdpb.PauseVMRequest) (*
 	entries := make([]*vmdpb.ArtifactManifestEntry, 0, len(manifest))
 	for _, e := range manifest {
 		entry := &vmdpb.ArtifactManifestEntry{
-			FileName:  e.FileName,
-			Path:      e.Path,
-			SizeBytes: e.SizeBytes,
-			Sha256:    e.SHA256,
-			BasePath:  e.BasePath,
+			FileName:       e.FileName,
+			Path:           e.Path,
+			SizeBytes:      e.SizeBytes,
+			Sha256:         e.SHA256,
+			BasePath:       e.BasePath,
+			AllocatedBytes: e.AllocatedBytes,
 		}
-		unknown := entry.ProtoReflect().GetUnknown()
-		unknown = protowire.AppendTag(unknown, 6, protowire.VarintType)
-		unknown = protowire.AppendVarint(unknown, uint64(e.AllocatedBytes))
-		entry.ProtoReflect().SetUnknown(unknown)
 		entries = append(entries, entry)
 	}
 	return &vmdpb.PauseVMResponse{
@@ -99,7 +95,35 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			}
 		}
 	}
-	inst, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules, req.GetGeneration())
+	// The preview policy rides the request (see vmd.proto). Stamped before the
+	// guest runs, through the same monotonic check a policy push takes, so a
+	// revision behind the record leaves the newer policy in place.
+	previewAccess := req.GetPreviewAccess()
+	if previewAccess != "" {
+		if previewAccess != preview.AccessLegacyPublic && previewAccess != preview.AccessPublic && previewAccess != preview.AccessPrivate {
+			return nil, status.Errorf(codes.InvalidArgument, "preview_access must be empty, %q, %q or %q, got %q", preview.AccessLegacyPublic, preview.AccessPublic, preview.AccessPrivate, previewAccess)
+		}
+		previewPorts, perr := previewPortsFromProto(req.GetPreviewPorts())
+		if perr != nil {
+			return nil, perr
+		}
+		if previewPortsContainTokenizedAccess(previewPorts) && req.GetPreviewPolicyRevision() <= 0 {
+			return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive preview_policy_revision")
+		}
+		if err := a.mgr.UpdateSandboxPreviewPolicy(req.GetVmId(), previewAccess, previewPorts, req.GetPreviewPolicyRevision()); err != nil {
+			if status.Code(err) != codes.FailedPrecondition {
+				return nil, err
+			}
+			// Same revision, different content: the record keeps what it
+			// enforces at that revision, as a restore would. Not fatal, since
+			// a resume refused here would be refused the same way on every
+			// retry; the attestation reports the record's revision.
+			a.mgr.log.Warn().Err(err).Str("vm_id", req.GetVmId()).
+				Msg("resume: preview policy differs from the record's at the same revision; keeping the record's")
+		}
+	}
+
+	inst, rulesApplied, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules, req.GetGeneration())
 	if err != nil {
 		return nil, err
 	}
@@ -126,7 +150,7 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
-	return &vmdpb.ResumeVMResponse{
+	resp := &vmdpb.ResumeVMResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,
 		IpAddress:  inst.IP,
@@ -135,7 +159,17 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			VcpuCount: inst.Config.VCPU,
 			MemoryMib: inst.Config.MemoryMiB,
 		},
-	}, nil
+		NetworkRulesApplied: rulesApplied,
+	}
+	if previewAccess != "" {
+		// Attests the request's policy fields were applied, and which
+		// revision the record holds now (see vmd.proto).
+		resp.PreviewProtocol = preview.HostCapabilityPorts
+		inst.mu.RLock()
+		resp.PreviewPolicyRevision = inst.PreviewPolicyRevision
+		inst.mu.RUnlock()
+	}
+	return resp, nil
 }
 
 func (a *GRPCAdapter) CreateSnapshot(ctx context.Context, req *vmdpb.CreateSnapshotRequest) (*vmdpb.CreateSnapshotResponse, error) {
@@ -581,10 +615,10 @@ func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildSta
 		resp.DeltaPath = snap.Result.DeltaPath
 		resp.ResolvedDigest = snap.Result.ResolvedDigest
 		resp.SizeBytes = snap.Result.SizeBytes
-		resp.SetAllocatedBytesSupported(true)
-		resp.SetRootfsAllocatedBytes(snap.Result.RootfsAllocatedBytes)
-		resp.SetBaseAllocatedBytes(snap.Result.BaseAllocatedBytes)
-		resp.SetDeltaAllocatedBytes(snap.Result.DeltaAllocatedBytes)
+		resp.AllocatedBytesSupported = true
+		resp.RootfsAllocatedBytes = snap.Result.RootfsAllocatedBytes
+		resp.BaseAllocatedBytes = snap.Result.BaseAllocatedBytes
+		resp.DeltaAllocatedBytes = snap.Result.DeltaAllocatedBytes
 	}
 	return resp, nil
 }

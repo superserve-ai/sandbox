@@ -118,6 +118,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
           terraform apply -input=false -auto-approve tfplan
 
   staging-us-central1-api:
@@ -130,7 +131,7 @@ jobs:
       id-token: write
     env:
       API_BASE_URL: https://api-staging.superserve.ai
-      API_KEY: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
+      API_KEY: ${{ secrets.SS_TEST_API_KEY_STAGING }}
       SANDBOX_BASE_URL: https://staging-sandbox.superserve.ai
     steps:
       - uses: actions/checkout@v4
@@ -243,6 +244,7 @@ jobs:
             -target=google_project_service.compute \
             -target=google_project_service.logging \
             -target=google_project_service.monitoring \
+            -target='module.iam.google_project_iam_member.project_bindings["cd_privateca_auditor"]' \
             -out=tfplan
           terraform apply -input=false -auto-approve tfplan
 
@@ -284,6 +286,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
           terraform apply -input=false -auto-approve tfplan
 
   production-us-west2-api:

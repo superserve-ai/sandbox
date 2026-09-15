@@ -28,15 +28,17 @@ AS $$
         FROM team_billing_account
         WHERE team_id = p_team_id
     ), grant_balance AS (
-        SELECT COALESCE(SUM(remaining_usd), 0)::numeric AS remaining_usd,
-               COUNT(*)::int AS grant_count
+        SELECT COALESCE(SUM(amount_usd), 0)::numeric AS grant_amount_usd,
+               COUNT(*)::int AS grant_count,
+               MIN(created_at) AS grant_started_at
         FROM team_credit_grant
         WHERE team_id = p_team_id
           AND reason = 'signup trial credit'
           AND (expires_at IS NULL OR expires_at > now())
     ), period AS (
-        SELECT date_trunc('month', now()) AS period_start,
-               date_trunc('month', now()) + interval '1 month' AS period_end
+        SELECT COALESCE(grant_balance.grant_started_at, now()) AS period_start,
+               now() AS period_end
+        FROM grant_balance
     ), compute AS (
         SELECT
             COALESCE(SUM(EXTRACT(EPOCH FROM (
@@ -109,7 +111,7 @@ AS $$
     SELECT CASE
         WHEN COALESCE(account.trial_ended_at, NULL) IS NULL THEN
             grant_balance.grant_count = 0
-            OR grant_balance.remaining_usd - charges.amount_usd > 0
+            OR grant_balance.grant_amount_usd - charges.amount_usd > 0
         ELSE lower(coalesce(account.stripe_subscription_status, '')) IN ('active', 'trialing', 'past_due')
     END
     FROM (SELECT 1) one

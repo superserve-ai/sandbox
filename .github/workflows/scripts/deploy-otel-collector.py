@@ -61,6 +61,10 @@ def _parse_remote_probe(stdout: str, stderr: str) -> tuple[str, str]:
 def _health_check_script() -> str:
     return textwrap.dedent(
         """
+        if ! enabled_state=$(sudo systemctl is-enabled superserve-otel-collector.service 2>&1) || [ "$enabled_state" != enabled ]; then
+          echo "ERROR: collector is not persistently enabled: $enabled_state" >&2
+          exit 1
+        fi
         if ! systemd_status=$(sudo systemctl is-active superserve-otel-collector 2>&1); then
           echo "ERROR: systemd active check failed: $systemd_status" >&2
           sudo systemctl status --no-pager --full superserve-otel-collector >&2 || true
@@ -82,6 +86,51 @@ def _health_check_script() -> str:
           exit 1
         fi
         """).strip()
+
+
+def _deploy_script(staging_dir: str, collector_project: str, zone_name: str, name: str) -> str:
+    # Append multiline checks after dedenting so heredoc terminators stay at column zero.
+    return textwrap.dedent(
+        f"""
+        set -euo pipefail
+
+        OTEL_VERSION="{OTEL_COLLECTOR_VERSION}"
+        OTEL_BINARY="/usr/local/bin/otelcol-contrib"
+        STAGING_DIR={shlex.quote(staging_dir)}
+        trap 'rm -rf -- "$STAGING_DIR"' EXIT
+
+        if [ ! -x "$OTEL_BINARY" ] || \
+           ! "$OTEL_BINARY" --version 2>/dev/null | grep -Fq "$OTEL_VERSION"; then
+          echo "Installing otelcol-contrib v$OTEL_VERSION from uploaded artifact"
+          sudo install -m 0755 "$STAGING_DIR/otelcol-contrib" "$OTEL_BINARY"
+        else
+          echo "otelcol-contrib v$OTEL_VERSION is already installed"
+        fi
+
+        sudo install -D -m 0644 \
+          "$STAGING_DIR/collector-gmp.yaml" \
+          /etc/sandbox/otel/collector-gmp.yaml
+
+        sudo install -D -m 0644 \
+          "$STAGING_DIR/superserve-otel-collector.service" \
+          /etc/systemd/system/superserve-otel-collector.service
+
+        sudo mkdir -p /etc/sandbox/otel
+        sudo tee /etc/sandbox/otel/collector.env >/dev/null <<'OTELENV'
+        GCP_PROJECT={collector_project}
+        GCP_ZONE={zone_name}
+        HOST_ID={name}
+        OTELENV
+        sudo chmod 0644 /etc/sandbox/otel/collector.env
+
+        sudo systemctl daemon-reload
+        sudo systemctl enable superserve-otel-collector.service
+        sudo systemctl restart superserve-otel-collector.service
+
+        sleep 5
+
+        """
+    ) + "\n" + _health_check_script() + "\n"
 
 
 def prepare_collector_binaries() -> dict[str, str]:
@@ -178,8 +227,22 @@ def main() -> int:
         print(f"No instances matching {instance_filter} found in {where}", file=sys.stderr)
         return 1
 
+    expected_standby = os.environ.get("EXPECTED_STANDBY_HOST", "")
+    if expected_standby and (not region or len(instances) != 1 or instances[0]["name"] != expected_standby):
+        print("ERROR: standby collector deployment requires exactly the expected host in the selected region", file=sys.stderr)
+        return 1
+
     collector_binaries = prepare_collector_binaries()
     print(f"Deploying OTEL Collector to {len(instances)} instance(s) in {where}")
+
+    # gcloud generates the runner's SSH key on first use. With per-host deploys
+    # running in parallel, two hosts can both find it missing and both run
+    # ssh-keygen; the loser fails with "already exists". Create it up front,
+    # locally, so no single host's reachability gates the others.
+    key = os.path.expanduser("~/.ssh/google_compute_engine")
+    if not os.path.exists(key):
+        os.makedirs(os.path.dirname(key), mode=0o700, exist_ok=True)
+        subprocess.run(["ssh-keygen", "-q", "-t", "rsa", "-N", "", "-f", key], check=True)
 
     def deploy(instance: dict[str, str]) -> None:
         name = instance["name"]
@@ -258,48 +321,7 @@ def main() -> int:
 
         print(f"[{tag}] collector files uploaded")
 
-        deploy_script = textwrap.dedent(
-            f"""
-            set -euo pipefail
-
-            OTEL_VERSION="{OTEL_COLLECTOR_VERSION}"
-            OTEL_BINARY="/usr/local/bin/otelcol-contrib"
-            STAGING_DIR={shlex.quote(staging_dir)}
-            trap 'rm -rf -- "$STAGING_DIR"' EXIT
-
-            if [ ! -x "$OTEL_BINARY" ] || \
-               ! "$OTEL_BINARY" --version 2>/dev/null | grep -Fq "$OTEL_VERSION"; then
-              echo "Installing otelcol-contrib v$OTEL_VERSION from uploaded artifact"
-              sudo install -m 0755 "$STAGING_DIR/otelcol-contrib" "$OTEL_BINARY"
-            else
-              echo "otelcol-contrib v$OTEL_VERSION is already installed"
-            fi
-
-            sudo install -D -m 0644 \
-              "$STAGING_DIR/collector-gmp.yaml" \
-              /etc/sandbox/otel/collector-gmp.yaml
-
-            sudo install -D -m 0644 \
-              "$STAGING_DIR/superserve-otel-collector.service" \
-              /etc/systemd/system/superserve-otel-collector.service
-
-            sudo mkdir -p /etc/sandbox/otel
-            sudo tee /etc/sandbox/otel/collector.env >/dev/null <<'OTELENV'
-            GCP_PROJECT={collector_project}
-            GCP_ZONE={zone_name}
-            HOST_ID={name}
-            OTELENV
-            sudo chmod 0644 /etc/sandbox/otel/collector.env
-
-            sudo systemctl daemon-reload
-            sudo systemctl enable superserve-otel-collector
-            sudo systemctl restart superserve-otel-collector
-
-            sleep 5
-
-            {_health_check_script()}
-            """
-        )
+        deploy_script = _deploy_script(staging_dir, collector_project, zone_name, name)
 
         deploy_command = [
                 "gcloud", "compute", "ssh", name,

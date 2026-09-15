@@ -121,7 +121,11 @@ func TestApplySecretBindings_InjectsJWTAndEnv(t *testing.T) {
 		gotEnv, gotJWT = env, jwt
 		return nil
 	}}
-	h := &Handlers{VMD: vmd, Signer: newTestSigner(t, "v1")}
+	// The injection records what the guest holds, off the response path.
+	mock := &mockDBTX{execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+		return pgconn.NewCommandTag("UPDATE 1"), nil
+	}}
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Signer: newTestSigner(t, "v1")}
 
 	ip := netip.MustParseAddr("10.0.0.5")
 	sb := db.Sandbox{ID: uuid.New(), TeamID: uuid.New(), HostID: "host-1", IpAddress: &ip}

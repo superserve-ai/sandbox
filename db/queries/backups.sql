@@ -121,8 +121,10 @@ LIMIT 1;
 -- the duration of the transaction or the sync is skipped. Status rides
 -- along because 'pausing' marks a finalize that has not committed yet:
 -- a fast upload's report arriving in that window must retry rather than
--- silently miss its size sync.
-SELECT id, status, updated_at FROM sandbox WHERE id = $1 FOR UPDATE;
+-- silently miss its size sync. A pause operation on the row says the
+-- transition is still being worked (see finalizeInFlight).
+SELECT id, status, updated_at, pause_op_id
+FROM sandbox WHERE id = $1 FOR UPDATE;
 
 -- name: LatestSnapshotManifest :many
 -- The sandbox's newest snapshot row with every digest its pause-time

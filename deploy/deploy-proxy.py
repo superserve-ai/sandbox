@@ -13,7 +13,7 @@ import os, sys, subprocess, textwrap, shlex, re
 # ---------------------------------------------------------------------------
 project     = os.environ['GCP_PROJECT']
 label       = os.environ.get('VMD_LABEL', 'component=vmd')
-service     = os.environ.get('VMD_SERVICE', 'vmd')
+service     = os.environ.get('VMD_SERVICE', 'superserve-vmd')
 install_dir = os.environ.get('VMD_INSTALL_DIR', '/usr/local/bin')
 sha         = os.environ['SHA'][:8]
 

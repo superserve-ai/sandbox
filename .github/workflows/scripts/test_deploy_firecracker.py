@@ -69,9 +69,9 @@ class InstallScriptSafetyTest(unittest.TestCase):
         # `--update=none` needs coreutils >= 9.3 and fails on the older hosts.
         self.assertNotIn("--update=none", self.commands)
 
-    def test_refuses_without_the_stock_backup(self):
-        self.assertIn(deploy_firecracker.STOCK_BACKUP, self.script)
-        self.assertRegex(self.script, r'test -f "\$stock" \|\|')
+    def test_the_staged_copy_is_cleared_however_the_run_exits(self):
+        # An aborted run must not leave the binary it uploaded on the host.
+        self.assertRegex(self.commands, r"""trap 'rm -f "\$staged"' EXIT""")
 
     def test_verifies_digest_before_and_after_install(self):
         # Before: the bytes that arrived are the bytes that were built.

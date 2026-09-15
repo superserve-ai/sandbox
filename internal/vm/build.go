@@ -4,10 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -81,14 +86,22 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 
 	buildVMID := req.BuildVMID
 	if buildVMID == "" {
-		buildVMID = "build-" + req.TemplateID
+		buildVMID = defaultBuildVMID(req.TemplateID)
 	}
-
 	// Fresh context so the build survives the caller's HTTP request
 	// ending. CancelBuild is what stops it.
 	buildCtx, cancel := context.WithCancel(context.Background())
 
-	rec, err := m.registerBuild(buildVMID, req.TemplateID, req.VCPU, req.MemoryMiB, cancel)
+	// A published template is immutable: its directory is what every sandbox
+	// created from it, and every paused overlay layered on it, refers to. A
+	// build never lands on one; a rebuild is a new build id and a new
+	// directory, which is how the control plane names its builds anyway. The
+	// directory is prepared under the registry's lock, once the id is known
+	// to be free: a retry of an id still in flight is refused there, before
+	// it could remove the running build's files.
+	rec, err := m.registerBuild(buildVMID, req.TemplateID, req.VCPU, req.MemoryMiB, cancel, func() error {
+		return m.prepareBuildDir(req.TemplateID, buildVMID)
+	})
 	if err != nil {
 		cancel()
 		return "", err
@@ -97,6 +110,59 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 	go func() { defer sentrylog.Recover("build-worker"); m.buildTemplateWorker(buildCtx, buildVMID, req, rec) }()
 
 	return buildVMID, nil
+}
+
+// defaultBuildVMID names a build whose caller supplied no id: unique, so it
+// can never land where a published template already is.
+func defaultBuildVMID(templateID string) string {
+	return "build-" + templateID + "-" + randomHex()[:8]
+}
+
+// validBuildPathSegment reports whether an id names exactly one directory
+// level: no separators, no "." or "..", nothing that could point the build
+// directory, or its cleanup, anywhere but templates/<template>/<build>.
+func validBuildPathSegment(id string) bool {
+	return id != "" && id != "." && id != ".." && len(id) <= 255 &&
+		!strings.ContainsAny(id, "/\\\x00") && filepath.Base(id) == id
+}
+
+// prepareBuildDir refuses a build into a directory that holds a published
+// template, and clears one a crashed build left unpublished: its files —
+// a snapshot, a wall-clock manifest — must not survive beside the new
+// build's. Published means the builder's metadata reads whole; a torn or
+// empty file from an interrupted write is leftovers, not a template. Any
+// other failure to read it blocks the build rather than deciding either way.
+func (m *Manager) prepareBuildDir(templateID, buildVMID string) error {
+	if !validBuildPathSegment(templateID) || !validBuildPathSegment(buildVMID) {
+		return status.Errorf(codes.InvalidArgument, "template %q build %q: ids must name a single directory each", templateID, buildVMID)
+	}
+	root := filepath.Clean(filepath.Join(m.cfg.SnapshotDir, TemplatesDirName))
+	dir := filepath.Join(root, templateID, buildVMID)
+	if filepath.Dir(filepath.Dir(dir)) != root {
+		return status.Errorf(codes.InvalidArgument, "template %q build %q: not a build directory", templateID, buildVMID)
+	}
+	_, merr := readBuildMetaJSON(dir)
+	var syntax *json.SyntaxError
+	var typed *json.UnmarshalTypeError
+	switch {
+	case merr == nil:
+		return status.Errorf(codes.AlreadyExists, "template %s build %s is already published at %s; a rebuild needs a new build id", templateID, buildVMID, dir)
+	case errors.Is(merr, fs.ErrNotExist), errors.As(merr, &syntax), errors.As(merr, &typed):
+		// Nothing published here: no metadata, or metadata a crash tore.
+	default:
+		return fmt.Errorf("read build metadata in %s: %w", dir, merr)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stat build directory %s: %w", dir, err)
+	}
+	m.log.Warn().Str("dir", dir).Msg("build: clearing the leftovers of an unpublished build")
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("clear unpublished build directory %s: %w", dir, err)
+	}
+	return nil
 }
 
 // buildTemplateWorker is the goroutine body. Runs one build end-to-end and
@@ -110,6 +176,9 @@ func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req
 	// safety net for early error returns. Releasing allocation at worker
 	// return would publish a full VM's memory during a hash-only interval
 	// that can run for minutes.
+	// Last to run: the id stays reserved until this worker, and the
+	// subprocess it waited for, are gone.
+	defer close(rec.workerDone)
 	defer m.buildPressureCount.Add(-1)
 	defer m.releaseBuildAlloc(rec, req.VCPU, req.MemoryMiB)
 	result, err := m.buildTemplateSync(ctx, buildVMID, req, rec)
@@ -185,10 +254,10 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 30 * time.Second
 
-	// Build VM's working dir. template-builder names it "build-<templateID>"
-	// (not vmd's buildVMID), so we clean that exact path. Done here because
-	// template-builder's own defer can't run on SIGKILL.
-	defer os.RemoveAll(filepath.Join(m.cfg.RunDir, "build-"+req.TemplateID))
+	// Build VM's working dir, named by this build's id so it is this
+	// build's alone. Cleaned here because template-builder's own defer
+	// cannot run on SIGKILL.
+	defer os.RemoveAll(filepath.Join(m.cfg.RunDir, buildVMID))
 
 	if err := cmd.Run(); err != nil {
 		// Prefer the structured reason the subprocess emitted on its way

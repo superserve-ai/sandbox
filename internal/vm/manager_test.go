@@ -1625,7 +1625,7 @@ func TestResumeVM_AlreadyRunningHealthy_ReturnsExisting(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
 
-	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil, "")
+	inst, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil, "")
 	if err != nil {
 		t.Fatalf("retried resume of a healthy running VM should succeed, got %v", err)
 	}
@@ -1656,7 +1656,7 @@ func TestResumeVM_UnverifiedRecord_NotAdopted(t *testing.T) {
 
 	// The fallthrough fails on the missing snapshot files — the assertion is
 	// only that the corpse was not returned as a healthy VM.
-	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil, "")
+	inst, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil, "")
 	if err == nil && inst == existing {
 		t.Fatal("an unverified record that fails verification must not be adopted")
 	}
@@ -1732,7 +1732,7 @@ func TestResumeVM_RebuildsNetworkSlotWhenNamespaceMissingAndCleansUpOnLaunchFail
 	}
 	defer unlock()
 
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", resumeRules, ""); err == nil {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", resumeRules, ""); err == nil {
 		t.Fatal("expected launch failure")
 	}
 	if got := fake.setupCalls; len(got) != 1 || got[0] != "vm-1" {
@@ -2087,7 +2087,7 @@ func TestResumeVM_UnverifiedTarget_VerifiedAndAdopted(t *testing.T) {
 	}
 	mgr := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
 
-	inst, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil, "")
+	inst, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil, "")
 	if err != nil {
 		t.Fatalf("verified adoption must succeed, got %v", err)
 	}
@@ -2166,8 +2166,8 @@ func TestResumeVM_UnverifiedRelaunchVerifiesReplacementIP(t *testing.T) {
 		}
 		return 4321, SupervisionUnit, nil
 	}
-	mgr.restoreForResumeHook = func(_ string, _ string, _ string, _ string, _ *network.VMNetInfo) (bool, error) {
-		return true, nil
+	mgr.restoreForResumeHook = func(_ string, _ string, _ string, _ string, _ *network.VMNetInfo) (bool, string, error) {
+		return true, "", nil
 	}
 	adoptionBoxdReady = func(_ context.Context, _ *Manager, ip string) error {
 		verifiedIP = ip
@@ -2180,7 +2180,7 @@ func TestResumeVM_UnverifiedRelaunchVerifiesReplacementIP(t *testing.T) {
 	}
 	defer unlock()
 
-	if _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil, ""); err != nil {
+	if _, _, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil, ""); err != nil {
 		t.Fatalf("resumeVMLocked: %v", err)
 	}
 	if verifiedIP != "10.11.0.99" {
@@ -2412,7 +2412,7 @@ func TestResumeVM_CorpseVerdict_ClearsRunningBeforeRelaunch(t *testing.T) {
 	}
 	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
 
-	if _, err := m.resumeVMLocked(context.Background(), "vm-1", "", "", nil, ""); err == nil {
+	if _, _, err := m.resumeVMLocked(context.Background(), "vm-1", "", "", nil, ""); err == nil {
 		t.Fatal("a relaunch with missing artifacts must fail")
 	}
 	existing.mu.RLock()
@@ -2452,6 +2452,84 @@ func TestToRecordIgnoresDirtyTracked(t *testing.T) {
 	}
 	if !bytes.Equal(a, b) {
 		t.Fatalf("DirtyTracked is now persisted — CreateVMSnapshot must take the vm-op lock before persisting:\n %s\n %s", a, b)
+	}
+}
+
+// The dirty-tracking session id IS persisted (unlike DirtyTracked): the
+// pause-time token check makes a stale value safe, and reattach uses it to
+// keep a post-restart pause incremental — but only for RUNNING records, and
+// only when a session was actually armed.
+func TestDirtyTrackingSessionRoundTripAndRearm(t *testing.T) {
+	inst := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.5", DirtyTrackingSessionID: "abc123"}
+	rec := toRecord(inst)
+	if rec.DirtyTrackingSessionID != "abc123" {
+		t.Fatalf("session id not persisted: %+v", rec)
+	}
+	back := toInstance(rec)
+	if back.DirtyTrackingSessionID != "abc123" {
+		t.Fatalf("session id lost on fromRecord: %+v", back)
+	}
+	if !back.DirtyTracked {
+		t.Fatal("running record with a session must re-arm DirtyTracked optimistically")
+	}
+	// No session → no optimistic re-arm (flag off / pre-flag records).
+	rec.DirtyTrackingSessionID = ""
+	if toInstance(rec).DirtyTracked {
+		t.Fatal("running record without a session must not re-arm")
+	}
+	// Paused records never re-arm: the FC run the session named is gone.
+	rec.DirtyTrackingSessionID = "abc123"
+	rec.Status = StatusPaused
+	if toInstance(rec).DirtyTracked {
+		t.Fatal("paused record must not re-arm DirtyTracked")
+	}
+}
+
+// The session flag is the feature's circuit breaker, so it must also govern
+// the optimistic re-arm on reattach: toInstance re-arms from the record alone
+// (it is pure), and a host restarted with the flag OFF must not keep sending
+// guarded pauses — against a rolled-back Firecracker the unknown field would
+// fail the pause outright instead of degrading to Full.
+func TestReattachRecord_SessionRearmHonorsFeatureGate(t *testing.T) {
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return false } // unit alive: not stale
+	defer func() { vmUnitFullyDown = origDown }()
+
+	reattach := func(t *testing.T, flagOn bool) *VMInstance {
+		t.Helper()
+		store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close()
+		rec := VMRecord{
+			ID: "vm-1", Status: StatusRunning, Supervision: SupervisionUnit,
+			DirtyTrackingSessionID: "session-a",
+		}
+		if err := store.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+		m := &Manager{
+			log: zerolog.Nop(), state: store, netMgr: &network.Manager{},
+			vms: map[string]*VMInstance{},
+			cfg: ManagerConfig{DirtyTrackingSessionEnabled: flagOn},
+		}
+		inst, ok := m.reattachRecord(context.Background(), rec, true)
+		if inst == nil || !ok {
+			t.Fatalf("a live unit must be adopted, got inst=%+v ok=%v", inst, ok)
+		}
+		return inst
+	}
+
+	on := reattach(t, true)
+	if !on.DirtyTracked || on.DirtyTrackingSessionID != "session-a" {
+		t.Fatalf("flag on: the persisted session must re-arm tracking, got tracked=%v id=%q",
+			on.DirtyTracked, on.DirtyTrackingSessionID)
+	}
+	off := reattach(t, false)
+	if off.DirtyTracked || off.DirtyTrackingSessionID != "" {
+		t.Fatalf("flag off: the persisted session must be ignored, got tracked=%v id=%q",
+			off.DirtyTracked, off.DirtyTrackingSessionID)
 	}
 }
 
@@ -2503,7 +2581,7 @@ func TestResumeVM_CorpseVerdictUnrecordable_RefusesRelaunch(t *testing.T) {
 	store.Close() // every later write fails — the store is broken
 
 	m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{"vm-1": existing}}
-	_, err = m.resumeVMLocked(context.Background(), "vm-1", "", "", nil, "")
+	_, _, err = m.resumeVMLocked(context.Background(), "vm-1", "", "", nil, "")
 	if err == nil {
 		t.Fatal("an unrecordable verdict must fail the resume")
 	}

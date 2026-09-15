@@ -188,11 +188,44 @@ type VMRecord struct {
 	// restart: non-empty means MemFilePath is an overlay to be served over this
 	// base. Without it, resume would load the overlay standalone and read the
 	// base's pages as zero holes.
-	BaseMemPath string            `json:"base_mem_path,omitempty"`
-	CreatedAt   time.Time         `json:"created_at"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	VCPU        uint32            `json:"vcpu"`
-	MemoryMiB   uint32            `json:"memory_mib"`
+	BaseMemPath string `json:"base_mem_path,omitempty"`
+	// Overlays a layered→Full fallback left unreferenced while the process
+	// that still served pages from them could not be confirmed stopped.
+	// Persisted so each is reclaimed once a later step proves the VM at rest,
+	// instead of leaking a guest-sized file for the sandbox's lifetime. A
+	// list: a second fallback before the first resolves must not forget it.
+	StrandedOverlays []string `json:"stranded_overlays,omitempty"`
+	// The random token the running FC's dirty tracking was armed with (guarded
+	// pause flag on). Persisted so reattach after a vmd restart can keep the
+	// next pause incremental: the pause's Diff request carries the token back
+	// and Firecracker rejects it unless the bitmap is still the armed,
+	// unconsumed baseline — that atomic check, not this field, is the
+	// correctness boundary, so a stale value costs one rejected RPC and a Full
+	// pause, never a corrupt overlay.
+	DirtyTrackingSessionID string `json:"dirty_tracking_session_id,omitempty"`
+	// CorrectsWallClock records whether this guest fixes its own wall clock on
+	// wake. Persisted because it is a property of the running guest, not of this
+	// daemon: without it a reattached VM would look incapable after a restart and
+	// its next pause would strip a marker that was valid, demoting every later
+	// resume.
+	//
+	// Tri-state on purpose. A binary that predates this field drops it when it
+	// rewrites a record, so after a rollback and re-upgrade the field is absent
+	// again — decoding that silence as false would ignore a marker still on disk
+	// and delete it at the next pause. Nil means "ask the disk".
+	CorrectsWallClock *bool `json:"corrects_wall_clock,omitempty"`
+	// SnapshotWorkloadFrozen: the image this VM was last paused into holds a
+	// frozen workload. Set by every pause, so a pause that froze nothing
+	// cannot leave an older answer for the next resume to act on. Tri-state
+	// for the same reason as CorrectsWallClock; nil means "ask the disk".
+	SnapshotWorkloadFrozen *bool `json:"snapshot_workload_frozen,omitempty"`
+	// ArtifactID names the manifest beside the image this VM was last paused
+	// into; see VMInstance.
+	ArtifactID string            `json:"artifact_id,omitempty"`
+	CreatedAt  time.Time         `json:"created_at"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	VCPU       uint32            `json:"vcpu"`
+	MemoryMiB  uint32            `json:"memory_mib"`
 	// Persisted so overlay-mode sandboxes can be resumed correctly after a
 	// vmd restart (the start script needs basePath to wire up the
 	// dual-symlink mount namespace). DeltaDir is intentionally NOT
@@ -877,6 +910,11 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		SnapshotPath:               inst.SnapshotPath,
 		MemFilePath:                inst.MemFilePath,
 		BaseMemPath:                inst.BaseMemPath,
+		StrandedOverlays:           append([]string(nil), inst.StrandedOverlays...),
+		DirtyTrackingSessionID:     inst.DirtyTrackingSessionID,
+		CorrectsWallClock:          inst.CorrectsWallClock,
+		ArtifactID:                 inst.ArtifactID,
+		SnapshotWorkloadFrozen:     inst.SnapshotWorkloadFrozen,
 		CreatedAt:                  inst.CreatedAt,
 		Metadata:                   inst.Metadata,
 		VCPU:                       inst.Config.VCPU,
@@ -950,24 +988,36 @@ func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
 	return &VMInstance{
-		ID:                         rec.ID,
-		PID:                        rec.PID,
-		SocketPath:                 rec.SocketPath,
-		VsockPath:                  rec.VsockPath,
-		IP:                         rec.IP,
-		TAPDevice:                  rec.TAPDevice,
-		MACAddress:                 rec.MACAddress,
-		Status:                     rec.Status,
-		Unverified:                 rec.Unverified,
-		RevivalPending:             rec.RevivalPending,
-		RevivedDisk:                rec.RevivedDisk,
-		TeardownPending:            rec.TeardownPending,
-		RunDirID:                   rec.RunDirID,
-		Namespace:                  rec.Namespace,
-		DiskPath:                   rec.DiskPath,
-		SnapshotPath:               rec.SnapshotPath,
-		MemFilePath:                rec.MemFilePath,
-		BaseMemPath:                rec.BaseMemPath,
+		ID:                     rec.ID,
+		PID:                    rec.PID,
+		SocketPath:             rec.SocketPath,
+		VsockPath:              rec.VsockPath,
+		IP:                     rec.IP,
+		TAPDevice:              rec.TAPDevice,
+		MACAddress:             rec.MACAddress,
+		Status:                 rec.Status,
+		Unverified:             rec.Unverified,
+		RevivalPending:         rec.RevivalPending,
+		RevivedDisk:            rec.RevivedDisk,
+		TeardownPending:        rec.TeardownPending,
+		RunDirID:               rec.RunDirID,
+		Namespace:              rec.Namespace,
+		DiskPath:               rec.DiskPath,
+		SnapshotPath:           rec.SnapshotPath,
+		MemFilePath:            rec.MemFilePath,
+		BaseMemPath:            rec.BaseMemPath,
+		StrandedOverlays:       append([]string(nil), rec.StrandedOverlays...),
+		DirtyTrackingSessionID: rec.DirtyTrackingSessionID,
+		// Optimistic re-arm for an adopted running VM: the surviving FC's
+		// bitmap is intact, and the pause-time token check is the correctness
+		// boundary — if anything consumed the bitmap since the session was
+		// armed, the guarded Diff is rejected and that pause degrades to Full.
+		// Records without a session (flag off, or armed pre-flag) stay
+		// untracked and pause Full, exactly as before.
+		DirtyTracked:               rec.Status == StatusRunning && rec.DirtyTrackingSessionID != "",
+		CorrectsWallClock:          rec.CorrectsWallClock,
+		ArtifactID:                 rec.ArtifactID,
+		SnapshotWorkloadFrozen:     rec.SnapshotWorkloadFrozen,
 		CreatedAt:                  rec.CreatedAt,
 		Metadata:                   rec.Metadata,
 		TeamID:                     rec.TeamID,
