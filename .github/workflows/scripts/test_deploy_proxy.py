@@ -131,7 +131,7 @@ class DeployProxyTests(unittest.TestCase):
         self.assertEqual(len(deployments), 2)
         for step in deployments:
             with self.subTest(step=step.splitlines()[0]):
-                self.assertIn("PEER_PROXY_LISTEN_ADDR: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'standby' && 'auto' || '' }}", step)
+                self.assertIn("PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}", step)
                 script = self.generate_script("auto")
                 self.assertIn('PEER_PROXY_LISTEN_ADDR=', script)
                 self.assertIn(':5009', script)
