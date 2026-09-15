@@ -49,3 +49,17 @@ func TestLoadSkipSetReadsFirstField(t *testing.T) {
 		t.Fatal("missing file should be empty")
 	}
 }
+
+func TestParseEgressRulesMirrorsPersistedShape(t *testing.T) {
+	r, err := parseEgressRules(nil)
+	if err != nil || len(r.allowedCIDRs)+len(r.deniedCIDRs)+len(r.allowedDomains) != 0 {
+		t.Fatalf("empty config: %+v %v", r, err)
+	}
+	r, err = parseEgressRules([]byte(`{"egress":{"allowed_cidrs":["10.0.0.0/8"],"denied_cidrs":["10.1.0.0/16"],"allowed_domains":["example.com"]}}`))
+	if err != nil || r.allowedCIDRs[0] != "10.0.0.0/8" || r.deniedCIDRs[0] != "10.1.0.0/16" || r.allowedDomains[0] != "example.com" {
+		t.Fatalf("got %+v %v", r, err)
+	}
+	if _, err := parseEgressRules([]byte(`{`)); err == nil {
+		t.Fatal("malformed config accepted")
+	}
+}
