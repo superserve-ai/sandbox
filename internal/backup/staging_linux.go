@@ -11,6 +11,10 @@ import (
 // cloneFile reflinks src into dst (FICLONE): an immutable snapshot that
 // costs no data copy. Filesystems without reflink return an error and
 // the caller falls back to a sparse copy.
+// cloneSupported gates the per-filesystem clone probe; whether a given
+// filesystem honours the ioctl is still learned by probing.
+const cloneSupported = true
+
 func cloneFile(dst, src *os.File) error {
 	return unix.IoctlFileClone(int(dst.Fd()), int(src.Fd()))
 }

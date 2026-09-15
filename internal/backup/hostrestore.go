@@ -556,6 +556,9 @@ func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.Re
 // the cache directory alone cannot prove. Probed once per destination
 // filesystem with a one-byte file; dst is left with its length unchanged.
 func (c *CachingBaseReader) canCloneInto(dst *os.File) bool {
+	if !cloneSupported {
+		return false
+	}
 	dev, ok := deviceOf(dst)
 	if ok {
 		if v, hit := c.cloneable.Load(dev); hit {
