@@ -15,15 +15,18 @@ import (
 )
 
 // DBOwnershipResolver performs the authoritative edge lookup in one round trip.
-type DBOwnershipResolver struct{ pool *pgxpool.Pool }
+type DBOwnershipResolver struct {
+	pool        *pgxpool.Pool
+	localHostID string
+}
 
 // ownershipLookupTimeout bounds the synchronous database work performed
 // before a new connection can be routed. The caller's cancellation and
 // deadline remain effective through the derived context.
 const ownershipLookupTimeout = 500 * time.Millisecond
 
-func NewDBOwnershipResolver(pool *pgxpool.Pool) *DBOwnershipResolver {
-	return &DBOwnershipResolver{pool: pool}
+func NewDBOwnershipResolver(pool *pgxpool.Pool, localHostID string) *DBOwnershipResolver {
+	return &DBOwnershipResolver{pool: pool, localHostID: strings.TrimSpace(localHostID)}
 }
 func (r *DBOwnershipResolver) ResolveSandbox(ctx context.Context, id string) (SandboxRoute, error) {
 	sandboxID, err := uuid.Parse(id)
@@ -41,6 +44,10 @@ func (r *DBOwnershipResolver) ResolveSandbox(ctx context.Context, id string) (Sa
 			err = lookupCtx.Err()
 		}
 		return SandboxRoute{}, fmt.Errorf("resolve sandbox ownership: %w", err)
+	}
+	// Local legacy owners do not need an authoritative remote peer endpoint.
+	if r.localHostID != "" && strings.TrimSpace(row.HostID) == r.localHostID {
+		return SandboxRoute{HostID: r.localHostID}, nil
 	}
 	endpoint, err := PeerEndpointFromDiscovery(row)
 	if err != nil {

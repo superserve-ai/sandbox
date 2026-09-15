@@ -839,3 +839,26 @@ func TestRequestAfterHijackRejectsTruncatedBody(t *testing.T) {
 		})
 	}
 }
+
+func TestRoutingLocalOwnerBeforePeerNormalization(t *testing.T) {
+	for _, owner := range []string{"usw2", " usw2 ", "usw2-2", "usw2-2-random", ""} {
+		t.Run(owner, func(t *testing.T) {
+			localCalls := 0
+			router := NewRoutingHandler([]string{"sandbox.test"}, " usw2 ", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
+				return SandboxRoute{HostID: owner}, nil
+			}), routePeerFunc(func(context.Context, string, PeerEndpoint) (PeerStream, error) {
+				t.Error("incomplete route attempted peer dial")
+				return nil, errors.New("unexpected dial")
+			}), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { localCalls++; w.WriteHeader(http.StatusNoContent) }), zerolog.Nop())
+			response := httptest.NewRecorder()
+			router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://8080-22222222-2222-4222-8222-222222222222.sandbox.test/", nil))
+			wantStatus, wantLocal := http.StatusBadGateway, 0
+			if strings.TrimSpace(owner) == "usw2" {
+				wantStatus, wantLocal = http.StatusNoContent, 1
+			}
+			if response.Code != wantStatus || localCalls != wantLocal {
+				t.Fatalf("status=%d local=%d", response.Code, localCalls)
+			}
+		})
+	}
+}
