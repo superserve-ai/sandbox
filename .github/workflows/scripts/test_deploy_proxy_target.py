@@ -32,7 +32,10 @@ class ProxyTargetTests(unittest.TestCase):
         if env["DEPLOY_CELL"] != "staging":
             expression = re.search(r"PEER_PROXY_LISTEN_ADDR: \$\{\{ (.+) \}\}", step)[1]
             context = dict(github=SimpleNamespace(event_name=env["DEPLOY_EVENT"]),
-                           inputs=SimpleNamespace(target=env["DEPLOY_TARGET"]))
+                           inputs=SimpleNamespace(target=env["DEPLOY_TARGET"]),
+                           vars=SimpleNamespace(PEER_ROUTING_ENABLED=env.get("PEER_ROUTING_ENABLED", ""),
+                                                PEER_INGRESS_ENABLED_PROD=env.get("PEER_INGRESS_ENABLED", ""),
+                                                PEER_INGRESS_ENABLED_USW=env.get("PEER_INGRESS_ENABLED", "")))
             env["PEER_PROXY_LISTEN_ADDR"] = eval(
                 expression.replace("&&", " and ").replace("||", " or "),
                 {"__builtins__": {}}, context)
@@ -47,7 +50,7 @@ class ProxyTargetTests(unittest.TestCase):
         standby = env["DEPLOY_EVENT"] == "workflow_dispatch" and env["DEPLOY_TARGET"] == "standby"
         self.assertEqual(env["VMD_LABEL"], f'component=vmd-{env["DEPLOY_CELL"]}-standby' if standby else "component=vmd")
         if env["DEPLOY_CELL"] != "staging":
-            self.assertEqual(env["PEER_PROXY_LISTEN_ADDR"], "auto" if standby else "")
+            self.assertEqual(env["PEER_PROXY_LISTEN_ADDR"], "auto" if standby or env.get("PEER_ROUTING_ENABLED") == "1" or env.get("PEER_INGRESS_ENABLED") == "1" else "")
             if standby:
                 self.assertEqual(env["PEER_IDENTITY_HOSTS"], env["EXPECTED_STANDBY_HOST"])
         selected = []
@@ -80,6 +83,45 @@ class ProxyTargetTests(unittest.TestCase):
                                              DEPLOY_EVENT=event, DEPLOY_TARGET=target,
                                              DEPLOY_CELL=cell, GCP_REGION=region),
                                  (0, ["example-serving"]))
+
+    def test_routing_enabled_push_preserves_serving_ingress(self):
+        for cell, region in (("usw2", "us-west2"), ("use4", "us-east4")):
+            self.assertEqual(self.select(f"example-serving,{region}-a\n",
+                                         DEPLOY_EVENT="push", DEPLOY_TARGET="serving",
+                                         DEPLOY_CELL=cell, GCP_REGION=region,
+                                         PEER_ROUTING_ENABLED="1",
+                                         PROXY_DATABASE_URL="postgres://routing:example@db.example.test/db"),
+                             (0, ["example-serving"]))
+
+    def test_listener_expression_preserves_routing_and_manual_rollout(self):
+        for step in STEPS:
+            cell = re.search(r"DEPLOY_CELL: (\w+)", step)[1]
+            expression = re.search(r"PEER_PROXY_LISTEN_ADDR: \$\{\{ (.+) \}\}", step)[1]
+            for routing in ("", "0", "1"):
+                for event in ("push", "workflow_dispatch"):
+                    for target in ("serving", "standby"):
+                        for staging_listener in ("", "auto"):
+                            with self.subTest(cell=cell, routing=routing, event=event, target=target, listener=staging_listener):
+                                context = dict(github=SimpleNamespace(event_name=event),
+                                               inputs=SimpleNamespace(target=target),
+                                               vars=SimpleNamespace(PEER_ROUTING_ENABLED=routing, PEER_INGRESS_ENABLED_PROD="", PEER_INGRESS_ENABLED_USW="",
+                                                                    PEER_PROXY_LISTEN_ADDR_STAGING=staging_listener))
+                                actual = eval(expression.replace("&&", " and ").replace("||", " or "),
+                                              {"__builtins__": {}}, context)
+                                expected = ("auto" if routing == "1" else staging_listener) if cell == "staging" else (
+                                    "auto" if routing == "1" or (event == "workflow_dispatch" and target == "standby") else "")
+                                self.assertEqual(actual, expected)
+
+    def test_ingress_first_and_routing_disable_preserve_listener(self):
+        for cell, region in (("use4", "us-east4"), ("usw2", "us-west2")):
+            for routing in ("0", "1", "0"):
+                for event in ("push", "workflow_dispatch"):
+                    self.assertEqual(self.select(f"example-serving,{region}-a\n",
+                                                 DEPLOY_EVENT=event, DEPLOY_TARGET="serving",
+                                                 DEPLOY_CELL=cell, GCP_REGION=region,
+                                                 PEER_INGRESS_ENABLED="1", PEER_ROUTING_ENABLED=routing,
+                                                 PROXY_DATABASE_URL="postgres://routing:example@db.example.test/db"),
+                                     (0, ["example-serving"]))
 
     def test_west_and_configured_east_standby(self):
         self.assertEqual(self.select("superserve-vmd-usw2-2,us-west2-a,RUNNING\n"),

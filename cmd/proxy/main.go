@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/getsentry/sentry-go"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
@@ -64,6 +65,21 @@ func main() {
 
 	resolver := proxy.NewVMDResolver(vmdAddr)
 	proxyHandler := proxy.NewHandler(domains, resolver, log)
+	routingEnabled := os.Getenv("PEER_ROUTING_ENABLED")
+	if routingEnabled != "" && routingEnabled != "0" && routingEnabled != "1" {
+		log.Fatal().Msg("PEER_ROUTING_ENABLED must be empty, 0, or 1")
+	}
+	dbPool, err := newOwnershipPool(ctx, routingEnabled == "1", os.Getenv("PROXY_DATABASE_URL"))
+	if err != nil {
+		log.Fatal().Err(err).Msg("init ownership database")
+	}
+	var ownership proxy.OwnershipResolver
+	if dbPool != nil {
+		defer dbPool.Close()
+		ownership = proxy.NewCachedOwnershipResolver(ctx, proxy.NewDBOwnershipResolver(dbPool))
+	}
+	var routingRecorder telemetry.RoutingOutcomeRecorder
+	var peerTelemetry proxy.RecorderPeerTelemetry
 	if envOrDefault("OTEL_METRICS_ENABLED", "false") == "true" {
 		interval, ierr := time.ParseDuration(envOrDefault("OTEL_EXPORT_INTERVAL", "15s"))
 		if ierr != nil {
@@ -83,6 +99,8 @@ func main() {
 		} else {
 			peerRecorder = rec
 			proxyHandler.WithTelemetry(rec)
+			routingRecorder = rec
+			peerTelemetry = proxy.RecorderPeerTelemetry{Recorder: rec, HostID: os.Getenv("HOST_ID"), Region: os.Getenv("HOST_REGION")}
 			defer func() {
 				// Bounded: a stalled collector must not hang proxy restarts
 				// on the final flush.
@@ -143,17 +161,29 @@ func main() {
 		}
 	}
 
-	// Health check for the GCP LB and VMD's end-to-end capability probe.
-	// It only responds on non-sandbox hosts so the boxd-label lockdown isn't
-	// bypassed.
-	mux := newProxyMux(proxyHandler)
+	// Legacy hosts can keep serving local traffic during the staged peer rollout.
+	// Credentials become mandatory as soon as this host either accepts peer ingress
+	// or participates in outbound ownership routing.
+	peerAddr := os.Getenv("PEER_PROXY_LISTEN_ADDR")
+	var peerTLS proxy.PeerTLSConfig
+	var peers proxy.PeerTransport
+	if peerTransportRequired(routingEnabled, peerAddr) {
+		peerTLS, peers, err = newOutboundPeerTransport(log, peerTelemetry)
+		if err != nil {
+			log.Fatal().Err(err).Msg("invalid peer client credentials")
+		}
+		defer peers.Close()
+	}
+	router := proxy.NewRoutingHandler(domains, os.Getenv("HOST_ID"), ownership, peers, proxyHandler, log, routingRecorder)
+	log.Info().Bool("enabled", routingEnabled == "1").Msg("peer ownership routing configured")
+	mux, localMux := newDataPlaneMuxes(proxyHandler, router, routingEnabled == "1")
 	var localSrv *http.Server
 	var localErr <-chan error
-	if peerAddr := os.Getenv("PEER_PROXY_LISTEN_ADDR"); peerIngressEnabled(peerAddr) {
+	if peerIngressEnabled(peerAddr) {
 		if err := validatePeerListener(peerAddr, addr, redirectAddr); err != nil {
 			log.Fatal().Err(err).Msg("invalid PEER_PROXY_LISTEN_ADDR")
 		}
-		cfg, err := (proxy.PeerTLSConfig{CertFile: os.Getenv("PEER_PROXY_CERT_FILE"), KeyFile: os.Getenv("PEER_PROXY_KEY_FILE"), CAFile: os.Getenv("PEER_PROXY_CA_FILE"), ExpectedSPIFFE: os.Getenv("PEER_PROXY_SPIFFE_URI"), Log: log}).Load()
+		cfg, err := peerTLS.Load()
 		if err != nil {
 			log.Fatal().Err(err).Msg("peer TLS setup failed")
 		}
@@ -162,12 +192,15 @@ func main() {
 			log.Fatal().Msg("PEER_PROXY_MAX_STREAMS must be a positive 32-bit integer")
 		}
 		target := envOrDefault("PEER_PROXY_TARGET_ADDR", "127.0.0.1:5010")
+		if err := validateListenerPorts(target, peerAddr, redirectAddr); err != nil {
+			log.Fatal().Err(err).Msg("peer target shares an ingress port")
+		}
 		localListener, err := bindLocalPeerTarget(target, addr, redirectAddr)
 		if err != nil {
 			log.Fatal().Err(err).Msg("local peer target bind failed")
 		}
 		// Peer traffic terminates at the local handler, never the public router.
-		localSrv = proxy.NewServer(target, newProxyMux(proxyHandler))
+		localSrv = proxy.NewServer(target, localMux)
 		localErrCh := make(chan error, 1)
 		localErr = localErrCh
 		go func() {
@@ -257,8 +290,8 @@ func bindLocalPeerTarget(target, publicAddr, redirectAddr string) (net.Listener,
 }
 
 func validatePeerListener(peerAddr, publicAddr, redirectAddr string) error {
-	if !proxy.PrivateBind(peerAddr) {
-		return fmt.Errorf("peer ingress must bind a private interface: %q", peerAddr)
+	if err := proxy.ValidatePeerEndpoint(peerAddr); err != nil {
+		return err
 	}
 	return validateListenerPorts(peerAddr, publicAddr, redirectAddr)
 }
@@ -285,9 +318,12 @@ func validateListenerPorts(peerAddr, publicAddr, redirectAddr string) error {
 	return nil
 }
 
-// peerIngressEnabled keeps the optional listener gated solely by its explicit
-// address. Disabled proxy hosts must not attempt to load peer credentials.
+// peerIngressEnabled keeps the optional listener gated solely by its explicit address.
 func peerIngressEnabled(addr string) bool { return addr != "" }
+
+func peerTransportRequired(routingEnabled, peerAddr string) bool {
+	return routingEnabled == "1" || peerIngressEnabled(peerAddr)
+}
 
 type proxyHealthResponse struct {
 	Capabilities  []string `json:"capabilities"`
@@ -295,11 +331,75 @@ type proxyHealthResponse struct {
 	ResolverReady bool     `json:"resolver_ready"`
 }
 
+func newOwnershipPool(ctx context.Context, enabled bool, databaseURL string) (*pgxpool.Pool, error) {
+	if !enabled {
+		return nil, nil
+	}
+	if databaseURL == "" {
+		return nil, fmt.Errorf("PROXY_DATABASE_URL is required for cross-host routing")
+	}
+	config, err := ownershipPoolConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	// Validate persistence before accepting routed traffic.
+	bootstrapCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if err := pool.Ping(bootstrapCtx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	var restricted bool
+	err = pool.QueryRow(bootstrapCtx, `SELECT current_user = 'sandbox_proxy_router'
+		AND NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb AND NOT rolreplication AND NOT rolbypassrls
+		AND NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member = pg_roles.oid)
+		AND NOT has_table_privilege(current_user, 'public.sandbox', 'INSERT,UPDATE,DELETE,TRUNCATE')
+		AND NOT has_any_column_privilege(current_user, 'public.sandbox', 'INSERT,UPDATE')
+		AND NOT has_table_privilege(current_user, 'public.host', 'INSERT,UPDATE,DELETE,TRUNCATE')
+		AND NOT has_any_column_privilege(current_user, 'public.host', 'INSERT,UPDATE')
+		FROM pg_roles WHERE rolname = current_user`).Scan(&restricted)
+	if err != nil || !restricted {
+		pool.Close()
+		return nil, fmt.Errorf("ownership database requires the restricted sandbox_proxy_router role")
+	}
+	return pool, nil
+}
+
+func ownershipPoolConfig(databaseURL string) (*pgxpool.Config, error) {
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	// Fixed per-process budget: independent of host CPU count and URL options.
+	config.MaxConns = 4
+	config.MinConns = 0
+	config.MinIdleConns = 0
+	config.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	config.ConnConfig.RuntimeParams["statement_timeout"] = "500"
+	config.ConnConfig.RuntimeParams["search_path"] = "public,pg_catalog"
+	return config, nil
+}
+
 func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
+	return newProxyMuxWithHandler(proxyHandler, proxyHandler)
+}
+
+func newDataPlaneMuxes(local *proxy.Handler, router http.Handler, routingEnabled bool) (publicMux, localMux *http.ServeMux) {
+	if !routingEnabled {
+		return newProxyMux(local), newProxyMux(local)
+	}
+	return newProxyMuxWithHandler(local, router), newProxyMux(local)
+}
+
+func newProxyMuxWithHandler(proxyHandler *proxy.Handler, dataPlane http.Handler) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if proxyHandler.ServesHost(r.Host) {
-			proxyHandler.ServeHTTP(w, r)
+			dataPlane.ServeHTTP(w, r)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -309,7 +409,7 @@ func newProxyMux(proxyHandler *proxy.Handler) *http.ServeMux {
 			ResolverReady: proxyHandler.ResolverReady(r.Context()),
 		})
 	})
-	mux.Handle("/", proxyHandler)
+	mux.Handle("/", dataPlane)
 	return mux
 }
 
@@ -340,4 +440,12 @@ func splitCSV(v string) []string {
 		}
 	}
 	return out
+}
+
+func newOutboundPeerTransport(log zerolog.Logger, recorder proxy.PeerPoolTelemetry) (proxy.PeerTLSConfig, proxy.PeerTransport, error) {
+	cfg := proxy.PeerTLSConfig{CertFile: os.Getenv("PEER_PROXY_CERT_FILE"), KeyFile: os.Getenv("PEER_PROXY_KEY_FILE"), CAFile: os.Getenv("PEER_PROXY_CA_FILE"), ExpectedSPIFFE: os.Getenv("PEER_PROXY_SPIFFE_URI"), Log: log}
+	if _, err := cfg.LoadClient(); err != nil {
+		return cfg, nil, err
+	}
+	return cfg, proxy.NewPeerTransport(proxy.PeerPoolConfig{Dial: proxy.GRPCPeerDialer(cfg.LoadClient), Telemetry: recorder, MaxConnections: 4, StreamsPerConnection: 32}), nil
 }
