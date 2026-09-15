@@ -13,9 +13,12 @@ terraform show -no-color tfplan > plan.txt
 verify_plan() {
   local plan_file="$1"
   local host_address="$2"
+  local host_role="$3"
 
-  terraform show -json "${plan_file}" | jq -e --arg host_address "${host_address}" '
-  def resources: .. | objects | select(has("address") and has("values"));
+  terraform show -json "${plan_file}" | jq -e --arg host_address "${host_address}" --arg host_role "${host_role}" '
+  .variables.standby_host_id.value as $standby_host_id
+  | .planned_values
+  | def resources: .. | objects | select(has("address") and has("values"));
   ([resources | select(.address == "module.api.google_cloud_run_v2_service.this")][0].values.template[0].containers[0].env
     | map({key: .name, value: .value}) | from_entries) as $env
   | ([resources | select(.address == $host_address)][0].values.network_interface[0].network_ip) as $host_ip
@@ -25,6 +28,7 @@ verify_plan() {
   | ([resources | select(.address == "module.network.google_compute_firewall.rules[\"allow_otel_ingress\"]")][0].values) as $otel_firewall
   | select($host_tags == ["vmd-usw2"])
   | select($env.VMD_GRPC_ADDRESS == ($host_ip + ":50051"))
+  | select($env.DEFAULT_HOST_ID == (if $host_role == "standby" then $standby_host_id else "usw2" end))
   | select($env.DB_MAX_CONNS == "15")
   | select($env.OTEL_ENVIRONMENT == "production")
   | select($env.OTEL_EXPORTER_OTLP_ENDPOINT == ("http://" + $host_ip + ":4318"))
@@ -41,10 +45,11 @@ verify_plan() {
 }
 
 # Check both active-host selections so exporter and gRPC routing cannot regress
-# for either the default primary or promoted standby path.
-verify_plan tfplan 'module.sandbox_host.google_compute_instance.this'
+# for either the primary rollback or promoted standby path.
+terraform plan -var='active_sandbox_host=primary' -out=tfplan-primary
+verify_plan tfplan-primary 'module.sandbox_host.google_compute_instance.this' primary
 terraform plan -var='active_sandbox_host=standby' -out=tfplan-standby
-verify_plan tfplan-standby 'module.sandbox_host_b.google_compute_instance.this'
+verify_plan tfplan-standby 'module.sandbox_host_b.google_compute_instance.this' standby
 
 echo "Wrote ${ENV_DIR}/plan.txt"
 echo "Verified primary and standby VMD and OTLP endpoints in ${ENV_DIR}"

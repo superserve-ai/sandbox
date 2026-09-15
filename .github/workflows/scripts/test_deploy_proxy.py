@@ -104,11 +104,13 @@ class DeployProxyTests(unittest.TestCase):
         self.assertIn("Environment=PROXY_ADDR=:5007\n", service)
         self.assertIn("Environment=PROXY_REDIRECT_ADDR=:5008\n", service)
 
-    def test_standby_requires_expected_bootstrapped_host(self):
+    def test_standby_pins_host_without_overriding_bootstrap_policy(self):
         script = self.generate_script("", routing="0", expected_standby="example-host")
         self.assertIn('elif [ "1" -eq 1 ]; then', script)
         self.generate_script("", expected_standby="other-host", expected_result=1)
-        self.generate_script("", expected_standby="example-host", required_identity=False, expected_result=1)
+        legacy = self.generate_script("", expected_standby="example-host", required_identity=False)
+        self.assertIn('elif [ "0" -eq 1 ]; then', legacy)
+        self.assertIn("restore the legacy proxy.env or bootstrap host identity", legacy)
 
     def test_standby_rejects_extra_discovered_hosts_before_upload(self):
         env = {
@@ -316,7 +318,7 @@ class DeployProxyTests(unittest.TestCase):
                     (root / "etc/superserve/peer/identity.json").write_text(json.dumps({"spiffe_uri": identity}))
                 if not identity or failed_service == "missing-cert":
                     (root / "etc/superserve/peer/tls.crt").unlink()
-                script = self.generate_script(peer_addr, identity, bool(identity) or failed_service == "missing-identity")
+                script = self.generate_script(peer_addr, identity, bool(identity) or failed_service == "missing-identity", standby=True)
                 script = script.replace("/etc/", f"{root}/etc/")
                 script = script.replace("/tmp/proxy", f"{root}/tmp/proxy")
                 script = script.replace("/tmp/check-legacy-heartbeat", f"{root}/tmp/check-legacy-heartbeat")
