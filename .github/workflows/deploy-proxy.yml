@@ -146,8 +146,8 @@ jobs:
           # Host 1 retains its legacy peer configuration.
           # Require bootstrap only after this cell's operator-run migration.
           PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_STAGING == 'true' && 'superserve-vmd-staging-2' || '' }}
-          # Inbound ingress is a separate opt-in; outbound clients still need credentials.
-          PEER_PROXY_LISTEN_ADDR: ${{ vars.PEER_PROXY_LISTEN_ADDR_STAGING }}
+          # Routing-enabled hosts must remain reachable by their peers.
+          PEER_PROXY_LISTEN_ADDR: ${{ vars.PEER_ROUTING_ENABLED == '1' && 'auto' || vars.PEER_PROXY_LISTEN_ADDR_STAGING }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
@@ -221,8 +221,8 @@ jobs:
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
-          # Enable ingress only for standby selection, which requires peer bootstrap.
-          PEER_PROXY_LISTEN_ADDR: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'standby' && 'auto' || '' }}
+          # Preserve ingress on ordinary deployments after routing is enabled.
+          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
@@ -276,8 +276,8 @@ jobs:
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
-          # Enable ingress only for standby selection, which requires peer bootstrap.
-          PEER_PROXY_LISTEN_ADDR: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'standby' && 'auto' || '' }}
+          # Preserve ingress on ordinary deployments after routing is enabled.
+          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
