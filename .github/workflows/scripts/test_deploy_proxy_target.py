@@ -197,7 +197,7 @@ class ProxyTargetTests(unittest.TestCase):
 
     def test_workflow_guards_select_requested_manual_cell_and_preserve_push(self):
         self.assertIn("DEPLOY_TARGET: ${{ inputs.target || 'serving' }}", WORKFLOW)
-        self.assertIn("needs: [deploy-staging]", WORKFLOW)
+        self.assertIn("needs: [deploy-staging, migration-gate]", WORKFLOW)
         for event in ("push", "workflow_dispatch"):
             for target in ("", "serving", "standby"):
                 for cell in ("", "use4", "usw2"):

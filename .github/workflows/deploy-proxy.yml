@@ -7,9 +7,9 @@
 # across the fleet first. Never enable routing in the initial ingress deployment.
 # Deploy Proxy — edge proxy on the VMD hosts.
 #
-# Staging runs first; production standby deploys may skip an absent staging
-# standby, matching Deploy VMD. Normal deployments run west after the primary
-# region succeeds — same shape as Deploy API's usw steps.
+# Manual production standby deploys bypass staging, matching Deploy VMD.
+# Serving deployments still require staging to succeed. Normal deployments
+# run west after the primary region succeeds — same shape as Deploy API's usw steps.
 
 name: Deploy Proxy
 
@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Target environment (staging always runs first)'
+        description: 'Target environment (production standby bypasses staging)'
         required: false
         type: choice
         options:
@@ -92,6 +92,7 @@ jobs:
           fi
 
   deploy-staging:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.environment == 'production' && inputs.target == 'standby') }}
     needs: [migration-gate]
     runs-on: ubuntu-latest
     environment: staging
@@ -166,8 +167,15 @@ jobs:
           python3 .github/workflows/scripts/deploy-proxy.py
 
   deploy-production:
-    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
-    needs: [deploy-staging]
+    # A status function permits the intentional staging skip; the readiness
+    # gate must still succeed, and cancellation must never start a deployment.
+    if: >-
+      !cancelled() &&
+      needs.migration-gate.result == 'success' &&
+      (github.event_name == 'push' || inputs.environment == 'production') &&
+      (needs.deploy-staging.result == 'success' ||
+       (github.event_name == 'workflow_dispatch' && inputs.environment == 'production' && inputs.target == 'standby'))
+    needs: [deploy-staging, migration-gate]
     runs-on: ubuntu-latest
     environment: production
     permissions:

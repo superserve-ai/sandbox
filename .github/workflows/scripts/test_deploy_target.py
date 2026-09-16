@@ -197,8 +197,7 @@ class DeployTargetTests(unittest.TestCase):
             workflow = (SCRIPTS.parent / f"deploy-{kind}.yml").read_text()
             production = workflow.split("  deploy-production:\n", 1)[1]
             if kind == "proxy":
-                self.assertIn("    needs: [deploy-staging]\n", production)
-                self.assertIn("if: github.event_name == 'push' || github.event.inputs.environment == 'production'", production)
+                self.assertIn("    needs: [deploy-staging, migration-gate]\n", production)
             else:
                 self.assertIn("    needs: [deploy-staging, wait-for-ci, migration-gate]\n", production)
             steps = [s for s in re.split(r"^      - name: ", workflow, flags=re.M)
@@ -225,9 +224,15 @@ class DeployTargetTests(unittest.TestCase):
                             self.assertEqual(selected, expected, (kind, event, target, cell, enabled))
 
     def test_vmd_staging_bypass_is_only_manual_production_standby(self):
+        self.check_staging_bypass('vmd')
+
+    def test_proxy_staging_bypass_is_only_manual_production_standby(self):
+        self.check_staging_bypass('proxy')
+
+    def check_staging_bypass(self, kind):
         from itertools import product
 
-        workflow = (SCRIPTS.parent / 'deploy-vmd.yml').read_text()
+        workflow = (SCRIPTS.parent / f'deploy-{kind}.yml').read_text()
         staging = workflow.split('  deploy-staging:\n', 1)[1].split('    runs-on:', 1)[0]
         production = workflow.split('  deploy-production:\n', 1)[1]
         staging_condition = re.search(r'if: \$\{\{ (.+) \}\}', staging)[1]
@@ -252,7 +257,8 @@ class DeployTargetTests(unittest.TestCase):
             with self.subTest(event=event, environment=environment, target=target,
                               staging=result, ci=ci, migration=migration, cancelled=cancelled):
                 self.assertEqual(evaluate(staging_condition, context), not bypass)
-                expected = (not cancelled and ci == migration == 'success'
+                expected = (not cancelled and migration == 'success'
+                            and (kind != 'vmd' or ci == 'success')
                             and (event == 'push' or environment == 'production')
                             and (result == 'success' or bypass))
                 self.assertEqual(evaluate(production_condition, context), expected)
