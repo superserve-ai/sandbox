@@ -37,7 +37,7 @@ func TestPeerLabelsAreBounded(t *testing.T) {
 }
 
 func TestSafeTeardownLabelsBoundValues(t *testing.T) {
-	for _, v := range []string{"delete", "auto_delete", "sweep"} {
+	for _, v := range []string{"delete", "sweep"} {
 		if got := safeTeardownPath(v); got != v {
 			t.Fatalf("safeTeardownPath(%q) = %q", v, got)
 		}

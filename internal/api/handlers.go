@@ -1765,8 +1765,8 @@ func (h *Handlers) attemptTeardown(runCtx, settleCtx context.Context, rec teardo
 // soft-delete has already committed: the VM (with its run dir and netns),
 // pause snapshots, and the per-build artifact dir. Every step is idempotent
 // and NotFound from the host means done, so a retry runs the whole sequence
-// again. The auto-delete reaper and user-initiated deletes both come through
-// here, so the two paths cannot diverge in what they reclaim.
+// again. Inline attempts and the sweeper both come through here, so the two
+// cannot diverge in what they reclaim.
 func (h *Handlers) reclaimSandbox(ctx context.Context, rec teardownRecord) error {
 	if err := h.teardownVM(ctx, rec.SandboxID, rec.HostID); err != nil {
 		return err

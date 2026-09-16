@@ -135,7 +135,7 @@ type LauncherState struct {
 }
 
 // TeardownAttempt is one attempt at a deleted sandbox's host-side reclaim.
-// Path is where it ran (delete, auto_delete, sweep); Result is completed,
+// Path is where it ran (delete, sweep); Result is completed,
 // deferred, timeout, permanent, or skipped. Both are fixed vocabularies
 // owned by the call sites.
 type TeardownAttempt struct {

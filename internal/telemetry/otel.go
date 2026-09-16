@@ -719,7 +719,7 @@ func safeResult(v string) string {
 
 func safeTeardownPath(v string) string {
 	switch v {
-	case "delete", "auto_delete", "sweep":
+	case "delete", "sweep":
 		return v
 	default:
 		return "unknown"
