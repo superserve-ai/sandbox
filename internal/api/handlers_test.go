@@ -5540,3 +5540,67 @@ func TestTeardownBackoff(t *testing.T) {
 		}
 	}
 }
+
+// A snapshot row that could not be deleted keeps the reclaim pending: the
+// record is deferred, not completed, so a retry clears the row.
+func TestDeleteSandbox_SnapshotRowDeleteFailureDefersTheReclaim(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+	vmd := &stubVMD{
+		destroyFn:     func(context.Context, string, bool) error { return nil },
+		deleteSnapsFn: func(context.Context, string) error { return nil },
+	}
+	var deferred, completed int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "FROM snapshot") {
+				return &scanRows{rows: []func(...any) error{func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = snapID
+					*dest[1].(*uuid.UUID) = sandboxID
+					*dest[2].(*uuid.UUID) = teamID
+					*dest[3].(*string) = "/snapshots/x/vmstate.snap"
+					*dest[4].(*int64) = 0
+					*dest[5].(*string) = "pause"
+					*dest[6].(*time.Time) = time.Unix(0, 0)
+					mp := "/snapshots/x/mem.snap"
+					*dest[7].(**string) = &mp
+					return nil
+				}}}, nil
+			}
+			return &scanRows{}, nil
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			switch {
+			case strings.Contains(sql, "DELETE FROM snapshot"):
+				return pgconn.CommandTag{}, errors.New("db down")
+			case strings.Contains(sql, "DELETE FROM sandbox_teardown"):
+				atomic.AddInt32(&completed, 1)
+			case strings.Contains(sql, "WHERE sandbox_id") && strings.Contains(sql, "permanent"):
+				atomic.AddInt32(&deferred, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
+	}
+	if deferred != 1 || completed != 0 {
+		t.Fatalf("deferred = %d, completed = %d; want 1, 0", deferred, completed)
+	}
+}

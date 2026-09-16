@@ -2064,7 +2064,7 @@ func (h *Handlers) cleanupSandboxSnapshots(reqCtx context.Context, sandboxID uui
 	// Clear the snapshot DB rows (their files are gone above).
 	for _, s := range snaps {
 		if delErr := h.DB.DeleteSnapshot(reqCtx, s.ID); delErr != nil {
-			log.Warn().Err(delErr).Str("snapshot_id", s.ID.String()).Msg("DB DeleteSnapshot failed")
+			return fmt.Errorf("delete snapshot row %s: %w", s.ID, delErr)
 		}
 	}
 	return nil
