@@ -276,11 +276,8 @@ func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string,
 // source with raw SQL would strand those host resources. Destroy failed
 // sandboxes before the window. 'migrating' is an operator's claim on a
 // paused sandbox mid-move between hosts; its artifacts are in flight too.
-// A destroyed sandbox whose host-side reclaim is still recorded in
-// sandbox_teardown blocks as well: purge hard-deletes the sandbox row and
-// the teardown cascades with it, so the sweeper could never finish the VM,
-// snapshots, and artifacts still on the source host. Wait for the sweeper
-// (or resolve a permanent teardown by hand) before the window.
+// A pending sandbox_teardown blocks too: purge would cascade it away with
+// the row and strand the reclaim on the source host.
 func activeSandboxes(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
 		SELECT s.id, s.name, s.status, t.sandbox_id IS NOT NULL

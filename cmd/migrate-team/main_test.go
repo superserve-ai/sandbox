@@ -911,9 +911,6 @@ func TestTeamMigration(t *testing.T) {
 	})
 
 	t.Run("purge refuses while a destroyed sandbox still owes its host reclaim", func(t *testing.T) {
-		// The teardown row cascades off the sandbox row; purging it would
-		// lose the sweeper's only record of the VM and artifacts left on
-		// the source host.
 		mustExec(t, srcPool, `INSERT INTO sandbox_teardown (sandbox_id, host_id) VALUES ($1, $2)`, f.sb3, sourceHostID)
 		defer mustExec(t, srcPool, `DELETE FROM sandbox_teardown WHERE sandbox_id = $1`, f.sb3)
 
