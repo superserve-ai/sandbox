@@ -62,7 +62,10 @@ bootstrap fails closed on subsequent deployments.
    `component=vmd`; explicitly change it to `vmd-staging-standby` in the
    reviewed maintenance configuration before migration. Keep that configuration
    through bootstrap so a Terraform apply cannot restore discovery prematurely.
-   Wait for any deployments
+   In production west, Host 2 is the cell's only serving host: this
+   procedure does not apply there. Stop. A production host change requires
+   a drained replacement host serving first, per the host maintenance
+   runbook. Wait for any deployments
    that already discovered Host 2 to finish before migration. Keep both
    selectors excluded and placement disabled for the maintenance window;
    keep peer routing disabled.
