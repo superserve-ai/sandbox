@@ -278,7 +278,7 @@ func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string,
 // paused sandbox mid-move between hosts; its artifacts are in flight too.
 // A pending sandbox_teardown blocks too: purge would cascade it away with
 // the row and strand the reclaim on the source host.
-func activeSandboxes(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
+func activeSandboxes(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
 		SELECT s.id, s.name, s.status, t.sandbox_id IS NOT NULL
 		FROM sandbox s LEFT JOIN sandbox_teardown t ON t.sandbox_id = s.id
@@ -1462,6 +1462,13 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		return err
 	} else if len(builds) > 0 {
 		return fmt.Errorf("aborting purge: template build slipped in before the locks:\n  %s", strings.Join(builds, "\n  "))
+	}
+	// Rows locked: an auto-delete that committed after the checks above is
+	// visible now and its teardown would cascade with the row below.
+	if blockers, err := activeSandboxes(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(blockers) > 0 {
+		return fmt.Errorf("aborting purge: sandbox changed before the locks:\n  %s", strings.Join(blockers, "\n  "))
 	}
 	// The source rows die below, so capture the rollup-flag state now and
 	// restore it into the dest after the deletes commit — purged
