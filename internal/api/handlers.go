@@ -1751,13 +1751,6 @@ func (h *Handlers) teardownInline(ctx context.Context, rec teardownRecord, path 
 	defer cancel()
 	runCtx, cancelRun := context.WithTimeout(settleCtx, budget-min(teardownSettleReserveMax, budget/10))
 	defer cancelRun()
-	h.attemptTeardown(runCtx, settleCtx, rec, path)
-}
-
-// attemptTeardown runs the whole reclaim under runCtx and settles the record
-// under settleCtx: removed when every step succeeded, deferred with a
-// backoff otherwise.
-func (h *Handlers) attemptTeardown(runCtx, settleCtx context.Context, rec teardownRecord, path string) {
 	h.settleTeardown(settleCtx, rec, path, h.reclaimSandbox(runCtx, rec))
 }
 
@@ -1878,9 +1871,11 @@ func (h *Handlers) SweepTeardowns(ctx context.Context) {
 					return
 				}
 				runCtx, cancelRun := context.WithTimeout(ctx, teardownSweepBudget)
-				settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-				h.attemptTeardown(runCtx, settleCtx, rec, "sweep")
+				err := h.reclaimSandbox(runCtx, rec)
 				cancelRun()
+				// The settle clock starts after the reclaim: a slow host must not eat it.
+				settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+				h.settleTeardown(settleCtx, rec, "sweep", err)
 				cancelSettle()
 				h.releaseTeardownHost(ctx, rec)
 			}
