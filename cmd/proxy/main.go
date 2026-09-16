@@ -74,10 +74,11 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("init ownership database")
 	}
+	localHostID := os.Getenv("HOST_ID")
 	var ownership proxy.OwnershipResolver
 	if dbPool != nil {
 		defer dbPool.Close()
-		ownership = proxy.NewCachedOwnershipResolver(ctx, proxy.NewDBOwnershipResolver(dbPool))
+		ownership = proxy.NewCachedOwnershipResolver(ctx, proxy.NewDBOwnershipResolver(dbPool, localHostID))
 	}
 	var routingRecorder telemetry.RoutingOutcomeRecorder
 	var peerTelemetry proxy.RecorderPeerTelemetry
@@ -175,7 +176,7 @@ func main() {
 		}
 		defer peers.Close()
 	}
-	router := proxy.NewRoutingHandler(domains, os.Getenv("HOST_ID"), ownership, peers, proxyHandler, log, routingRecorder)
+	router := proxy.NewRoutingHandler(domains, localHostID, ownership, peers, proxyHandler, log, routingRecorder)
 	log.Info().Bool("enabled", routingEnabled == "1").Msg("peer ownership routing configured")
 	mux, localMux := newDataPlaneMuxes(proxyHandler, router, routingEnabled == "1")
 	var localSrv *http.Server

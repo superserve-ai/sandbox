@@ -86,9 +86,16 @@ func TestRoutingDatabaseCredentialContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pool.Close()
-	route, err := proxy.NewDBOwnershipResolver(pool).ResolveSandbox(ctx, "22222222-2222-4222-8222-222222222222")
+	route, err := proxy.NewDBOwnershipResolver(pool, "edge").ResolveSandbox(ctx, "22222222-2222-4222-8222-222222222222")
 	if err != nil || route.HostID != "owner" || route.Generation != 7 {
 		t.Fatalf("restricted discovery: %+v %v", route, err)
+	}
+	if _, err := db.Exec(ctx, "UPDATE public.host SET incarnation_id=NULL, peer_generation=NULL, proxy_addr='192.0.2.1:5007'"); err != nil {
+		t.Fatal(err)
+	}
+	route, err = proxy.NewDBOwnershipResolver(pool, "owner").ResolveSandbox(ctx, "22222222-2222-4222-8222-222222222222")
+	if err != nil || route != (proxy.SandboxRoute{HostID: "owner"}) {
+		t.Fatalf("restricted local discovery: %+v %v", route, err)
 	}
 	conn, err := pool.Acquire(ctx)
 	if err != nil {

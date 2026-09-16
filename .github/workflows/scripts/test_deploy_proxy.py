@@ -7,6 +7,7 @@ import subprocess
 import unittest
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -305,17 +306,44 @@ class DeployProxyTests(unittest.TestCase):
                   for failure in ("none", "vmd-readiness", "vmd-heartbeat")]
         cases += [("", "none", "spiffe://example.test/peer"), ("", "none", ""), ("auto", "none", ""),
                   ("auto", "missing-identity", ""),
-                  ("", "missing-cert", "spiffe://example.test/peer")]
+                  ("", "missing-cert", "spiffe://example.test/peer"),
+                  ("auto", "missing-cert", "spiffe://example.test/peer")]
         cases += [(addr, failure, "") for addr in ("", "auto")
                   for failure in ("missing-legacy-env", "empty-legacy-env")]
         cases = [(*case, False) for case in cases] + [
             ("192.0.2.2:5009", failure, "spiffe://example.test/peer", True)
             for failure in ("none", "proxy", "superserve-vmd")]
+        self.run_peer_deploy_cases(cases)
+
+    def test_production_serving_outbound_only_does_not_advertise_or_restart_vmd(self):
+        workflow = Path(__file__).parents[1].joinpath("deploy-proxy.yml").read_text()
+        for cell, host_id, zone, routing_var, ingress_var in (
+                ("usw2", "usw2", "us-west2-a", "PEER_ROUTING_ENABLED_USW", "PEER_INGRESS_ENABLED_USW"),
+                ("use4", "default", "us-east4-a", "PEER_ROUTING_ENABLED_USE4", "PEER_INGRESS_ENABLED_PROD")):
+            with self.subTest(cell=cell, host_id=host_id):
+                step = workflow.split(f"DEPLOY_CELL: {cell}", 1)[1]
+                context = dict(vars=SimpleNamespace(**{routing_var: "1", ingress_var: ""}),
+                               github=SimpleNamespace(event_name="workflow_dispatch"),
+                               inputs=SimpleNamespace(target="serving"))
+                config = {}
+                for key in ("PEER_ROUTING_ENABLED", "PEER_PROXY_LISTEN_ADDR"):
+                    expression = re.search(key + r": \$\{\{ (.+) \}\}", step)[1]
+                    config[key] = eval(expression.replace("&&", " and ").replace("||", " or "),
+                                       {"__builtins__": {}}, context)
+                self.assertEqual(config, dict(PEER_ROUTING_ENABLED="1", PEER_PROXY_LISTEN_ADDR=""))
+                self.run_peer_deploy_cases(
+                    [(config["PEER_PROXY_LISTEN_ADDR"], "none", "spiffe://example.test/peer", False)],
+                    routing=config["PEER_ROUTING_ENABLED"], initial_listener=False,
+                    host_id=host_id, zone=zone)
+
+    def run_peer_deploy_cases(self, cases, routing="", initial_listener=True,
+                             host_id=None, zone="us-central1-a"):
         for peer_addr, failed_service, identity, legacy in cases:
             with self.subTest(peer_addr=peer_addr, failed_service=failed_service), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
-                old_env = "PEER_PROXY_LISTEN_ADDR=192.0.2.4:5009\n"
-                old_vmd_env = old_env + ("HOST_ID=default\n" if legacy else "")
+                old_env = "PEER_PROXY_LISTEN_ADDR=192.0.2.4:5009\n" if initial_listener else "PEER_PROXY_LISTEN_ADDR=\n"
+                old_vmd_env = (old_env + ("HOST_ID=default\n" if legacy else "")
+                               if initial_listener else f"HOST_ID={host_id}\n")
                 old_credentials = "[Service]\nLoadCredential=old-cert:/etc/peer/old.pem\n"
                 files = {
                     "etc/sandbox/proxy.env": old_env,
@@ -336,6 +364,8 @@ class DeployProxyTests(unittest.TestCase):
                     path = root / name
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text(contents)
+                if host_id:
+                    (root / "etc/sandbox/host-identity.env").unlink()
                 if failed_service == "missing-legacy-env":
                     (root / "etc/sandbox/proxy.env").unlink()
                 elif failed_service == "empty-legacy-env":
@@ -350,7 +380,9 @@ class DeployProxyTests(unittest.TestCase):
                     (root / "etc/superserve/peer/identity.json").write_text(json.dumps({"spiffe_uri": identity}))
                 if not identity or failed_service == "missing-cert":
                     (root / "etc/superserve/peer/tls.crt").unlink()
-                script = self.generate_script(peer_addr, identity, bool(identity) or failed_service == "missing-identity", standby=True)
+                script = self.generate_script(
+                    peer_addr, identity, (bool(identity) and not host_id) or failed_service == "missing-identity",
+                    routing=routing, zone=zone, standby=host_id is None)
                 script = script.replace("/etc/", f"{root}/etc/")
                 script = script.replace("/tmp/proxy", f"{root}/tmp/proxy")
                 script = script.replace("/tmp/check-legacy-heartbeat", f"{root}/tmp/check-legacy-heartbeat")
@@ -428,7 +460,14 @@ class DeployProxyTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual((root / "etc/systemd/system/proxy.socket").read_text(), "socket unit")
                     proxy_env = (root / "etc/sandbox/proxy.env").read_text()
-                    self.assertIn('HOST_ID=default\n' if legacy else 'HOST_ID=example-region-2-generated\n', proxy_env)
+                    expected_host = host_id or ("default" if legacy else "example-region-2-generated")
+                    self.assertIn(f"HOST_ID={expected_host}\n", proxy_env)
+                    self.assertIn(f"PEER_ROUTING_ENABLED={routing or '0'}\n", proxy_env)
+                    if not initial_listener:
+                        self.assertIn("PEER_PROXY_LISTEN_ADDR=\n", proxy_env)
+                        self.assertNotIn(":5009", proxy_env)
+                        self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_vmd_env)
+                        self.assertEqual((root / "restarts").read_text().splitlines(), ["proxy"])
                     if not identity:
                         self.assertEqual("".join(line + "\n" for line in proxy_env.splitlines() if line.startswith("PEER_PROXY_")), old_env)
                         self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_vmd_env)

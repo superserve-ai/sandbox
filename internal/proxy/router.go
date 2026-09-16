@@ -37,7 +37,7 @@ func NewRoutingHandler(domains []string, localHostID string, ownership Ownership
 	if len(recorders) > 0 {
 		recorder = recorders[0]
 	}
-	return &RoutingHandler{domains: domains, localHostID: localHostID, ownership: ownership, peers: peers, local: local, log: log, recorder: recorder, halfCloseIdleTimeout: httpHalfCloseIdleTimeout}
+	return &RoutingHandler{domains: domains, localHostID: strings.TrimSpace(localHostID), ownership: ownership, peers: peers, local: local, log: log, recorder: recorder, halfCloseIdleTimeout: httpHalfCloseIdleTimeout}
 }
 
 func (h *RoutingHandler) record(ctx context.Context, outcome, hostID string) {
@@ -92,17 +92,18 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "sandbox routing unavailable", http.StatusBadGateway)
 		return
 	}
+	route.HostID = strings.TrimSpace(route.HostID)
+	if h.localHostID != "" && route.HostID == h.localHostID {
+		h.record(r.Context(), "local", route.HostID)
+		h.log.Debug().Str("route", "local").Str("route_outcome", "local").Str("host_id", route.HostID).Msg("sandbox routed locally")
+		h.local.ServeHTTP(w, r)
+		return
+	}
 	route, err = NormalizeSandboxRoute(route)
 	if err != nil {
 		h.record(r.Context(), "ownership_error", route.HostID)
 		h.log.Warn().Str("route_outcome", "ownership_invalid").Err(err).Msg("sandbox ownership route invalid")
 		http.Error(w, "sandbox routing unavailable", http.StatusBadGateway)
-		return
-	}
-	if route.HostID == h.localHostID {
-		h.record(r.Context(), "local", route.HostID)
-		h.log.Debug().Str("route", "local").Str("route_outcome", "local").Str("host_id", route.HostID).Msg("sandbox routed locally")
-		h.local.ServeHTTP(w, r)
 		return
 	}
 	if h.peers == nil {
