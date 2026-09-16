@@ -316,7 +316,7 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 
 	tctx, cancel := context.WithTimeout(ctx, autoDeleteTeardownTimeout)
 	defer cancel()
-	h.teardownDestroyedSandbox(tctx, sbx.ID, sbx.HostID, sbx.BasePath, sbx.TemplateID, nil)
+	h.teardownDestroyedSandbox(tctx, sbx.ID, sbx.HostID, sbx.BasePath, sbx.TemplateID)
 
 	l.Info().Msg("reaper: sandbox auto-deleted after paused window elapsed")
 	h.logSandboxActivity(tctx, sbx.ID, sbx.TeamID, nil, "sandbox", "auto_deleted", "success", &sbx.Name, nil, nil)

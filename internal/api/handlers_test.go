@@ -5190,7 +5190,7 @@ func TestDeleteSandbox_StalledHostDoesNotStarveOthers(t *testing.T) {
 	// the handler is reassigned while earlier requests' async work still
 	// runs.
 	byID := map[string]db.Sandbox{}
-	healthyID := uuid.New()
+	healthyID := uuid.MustParse("11111111-1111-4111-8111-111111111111")
 	byID[healthyID.String()] = db.Sandbox{ID: healthyID, TeamID: teamID, Name: "healthy", Status: db.SandboxStatusActive, HostID: "host-healthy"}
 	var stalledIDs []uuid.UUID
 	for i := 0; i < maxTeardownsPerHost+4; i++ {
@@ -5246,4 +5246,70 @@ func TestDeleteSandbox_StalledHostDoesNotStarveOthers(t *testing.T) {
 	}
 	close(release)
 	h.WaitAsyncBookkeeping()
+}
+
+// Admission is bounded too: once a host's workers and queue are full,
+// further deletes still return 204 but their teardown is dropped to the
+// reconciler rather than parked as a waiter.
+func TestDeleteSandbox_FullQueueDropsToReconciler(t *testing.T) {
+	prev := deleteTeardownInlineBudget
+	deleteTeardownInlineBudget = 20 * time.Millisecond
+	defer func() { deleteTeardownInlineBudget = prev }()
+
+	teamID := uuid.New()
+	release := make(chan struct{})
+	var destroyCalls int32
+	vmd := &stubVMD{destroyFn: func(ctx context.Context, _ string, _ bool) error {
+		atomic.AddInt32(&destroyCalls, 1)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil
+	}}
+	byID := map[string]db.Sandbox{}
+	total := maxTeardownsPerHost + teardownQueueDepth + 5
+	ids := make([]uuid.UUID, 0, total)
+	for i := 0; i < total; i++ {
+		id := uuid.MustParse(fmt.Sprintf("0000%04d-0000-4000-8000-%012d", i, i))
+		ids = append(ids, id)
+		byID[id.String()] = db.Sandbox{ID: id, TeamID: teamID, Name: "stalled", Status: db.SandboxStatusActive, HostID: "host-stalled"}
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			var id uuid.UUID
+			for _, a := range args {
+				if v, ok := a.(uuid.UUID); ok {
+					id = v
+					break
+				}
+			}
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(id)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(byID[id.String()])
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	router := setupTestRouter(h, teamID.String())
+	for i, id := range ids {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, deleteRequest(id.String()))
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("delete %d: status = %d; body: %s", i, w.Code, w.Body.String())
+		}
+	}
+	close(release)
+	h.WaitAsyncBookkeeping()
+	// Workers plus queue depth ran; the surplus was dropped, never queued.
+	if got := atomic.LoadInt32(&destroyCalls); got != int32(maxTeardownsPerHost+teardownQueueDepth) {
+		t.Fatalf("teardowns run = %d, want %d (workers + queue depth)", got, maxTeardownsPerHost+teardownQueueDepth)
+	}
 }
