@@ -31,6 +31,9 @@ class ProxyTargetTests(unittest.TestCase):
         env["MOCK_ROLE_ROWS"] = rows or ""
         env.update(overrides)
         step = next(s for s in STEPS if f'DEPLOY_CELL: {env["DEPLOY_CELL"]}' in s)
+        if env["DEPLOY_CELL"] == "use4":
+            env["PEER_IDENTITY_HOSTS"] = re.search(r"PEER_IDENTITY_HOSTS: ([^\n]+)", step)[1]
+        identity_policy = env.get("PEER_IDENTITY_HOSTS", "")
         if env["DEPLOY_CELL"] != "staging":
             expression = re.search(r"PEER_PROXY_LISTEN_ADDR: \$\{\{ (.+) \}\}", step)[1]
             context = dict(github=SimpleNamespace(event_name=env["DEPLOY_EVENT"]),
@@ -50,12 +53,13 @@ class ProxyTargetTests(unittest.TestCase):
         if result.returncode:
             return 1, []
         env = json.loads(result.stdout)
+        self.selected_identity_policy = env.get("PEER_IDENTITY_HOSTS", "")
         standby = env["DEPLOY_EVENT"] == "workflow_dispatch" and env["DEPLOY_TARGET"] == "standby"
         self.assertEqual(env["VMD_LABEL"], f'component=vmd-{env["DEPLOY_CELL"]}-standby' if standby else "component=vmd")
         if env["DEPLOY_CELL"] != "staging":
             self.assertEqual(env["PEER_PROXY_LISTEN_ADDR"], "auto" if standby or env.get("PEER_ROUTING_ENABLED") == "1" or env.get("PEER_INGRESS_ENABLED") == "1" else "")
             if standby:
-                self.assertEqual(env.get("PEER_IDENTITY_HOSTS", ""), overrides.get("PEER_IDENTITY_HOSTS", ""))
+                self.assertEqual(env.get("PEER_IDENTITY_HOSTS", ""), identity_policy)
         selected = []
 
         class Executor:
@@ -145,6 +149,17 @@ class ProxyTargetTests(unittest.TestCase):
                          (0, ["superserve-vmd-usw2-2"]))
         self.assertEqual(self.select("superserve-vmd-use4-3,us-east4-a,RUNNING\n",
                                     DEPLOY_CELL="use4", DEPLOY_PRODUCTION_CELL="use4", GCP_REGION="us-east4"), (0, ["superserve-vmd-use4-3"]))
+
+    def test_east_identity_policy_stays_with_host_three_across_role_swaps(self):
+        for target in ("serving", "standby"):
+            for host in ("superserve-vmd-use4-2", "superserve-vmd-use4-3"):
+                with self.subTest(target=target, host=host):
+                    self.assertEqual(self.select(f"{host},us-east4-a,RUNNING\n",
+                                                 DEPLOY_CELL="use4", DEPLOY_PRODUCTION_CELL="use4",
+                                                 GCP_REGION="us-east4", DEPLOY_TARGET=target), (0, [host]))
+                    self.assertEqual(self.selected_identity_policy, "superserve-vmd-use4-3")
+                    self.assertEqual(host in self.selected_identity_policy.split(","),
+                                     host == "superserve-vmd-use4-3")
 
     def test_missing_unconfigured_wrong_or_stopped_production_standby_fails(self):
         for rows in ("", "superserve-vmd-usw2-2,us-east4-a,RUNNING\n",

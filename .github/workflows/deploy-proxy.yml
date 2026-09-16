@@ -209,6 +209,8 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || inputs.production_cell == 'use4'
         env:
           DEPLOY_CELL: use4
+          # Host 3 requires managed identity regardless of its serving role.
+          PEER_IDENTITY_HOSTS: superserve-vmd-use4-3
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
