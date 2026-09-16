@@ -309,6 +309,7 @@ module "cloud_ids" {
   endpoint_name              = "superserve-ids-${local.resource_suffix}"
   mirrored_subnet_self_links = local.cloud_ids_mirrored_subnet_self_links
   notification_channel_ids   = var.notification_channel_ids
+  runbook_base_url           = var.cloud_ids_runbook_base_url
   labels                     = local.common_labels
 }
 
