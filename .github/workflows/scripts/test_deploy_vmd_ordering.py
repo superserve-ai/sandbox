@@ -8,15 +8,49 @@ one property whose violation reintroduces the incident.
 
 import os
 import re
+import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from shell_test_support import linux_shell_prelude
-
 SOURCE = Path(__file__).with_name("deploy-vmd.py").read_text()
 
+
+def _gnu_sed_env(tmp_dir):
+    # The rendered blocks below run through `sh -c` for real, and this
+    # script's `sed -i PATTERN FILE` (no backup-suffix argument) is GNU
+    # syntax — correct on the Linux deploy targets and the CI runner, but
+    # BSD sed (stock on macOS) parses the pattern as a mandatory backup
+    # suffix instead and silently no-ops. Shim `sed` to GNU sed (`gsed`
+    # via Homebrew) when running locally on macOS so these tests validate
+    # the same behavior contributors will see in CI, not a platform quirk.
+    gnu_sed = shutil.which("sed")
+    if gnu_sed:
+        version = subprocess.run([gnu_sed, "--version"], capture_output=True, text=True)
+        if "GNU sed" not in version.stdout:
+            gnu_sed = shutil.which("gsed")
+    if not gnu_sed and sys.platform == "darwin":
+        # BSD sed needs an explicit empty backup suffix for these -i calls.
+        sed = shlex.quote(shutil.which("sed"))
+        shim_dir = Path(tmp_dir) / "gnu-sed-shim"
+        shim_dir.mkdir()
+        shim = shim_dir / "sed"
+        shim.write_text(
+            '#!/bin/sh\nif [ "$1" = "-i" ]; then\n'
+            f'  shift\n  exec {sed} -i \'\' "$@"\nfi\n'
+            f'exec {sed} "$@"\n'
+        )
+        shim.chmod(0o755)
+        return dict(os.environ, PATH="%s:%s" % (shim_dir, os.environ["PATH"]))
+    if not gnu_sed or gnu_sed == shutil.which("sed"):
+        return dict(os.environ)
+    shim_dir = Path(tmp_dir) / "gnu-sed-shim"
+    shim_dir.mkdir()
+    (shim_dir / "sed").symlink_to(gnu_sed)
+    return dict(os.environ, PATH="%s:%s" % (shim_dir, os.environ["PATH"]))
 
 
 class DeployVmdOrderingTests(unittest.TestCase):
@@ -157,7 +191,7 @@ class BackupStagingDirRollbackTests(unittest.TestCase):
             env_file.write_text("BACKUP_STAGING_DIR=/mnt/localssd/backup-staging\nOTHER=1\n")
             script = rendered.replace("/etc/sandbox/vmd.env", str(env_file))
             result = subprocess.run(
-                ["sh", "-c", linux_shell_prelude() + script], capture_output=True, text=True
+                ["sh", "-c", script], capture_output=True, text=True, env=_gnu_sed_env(d)
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("BACKUP_STAGING_DIR", env_file.read_text())
@@ -207,7 +241,7 @@ class BackupStagingDirRollbackTests(unittest.TestCase):
             env_file.write_text("BACKUP_STAGING_DIR=/mnt/localssd/backup-staging\nOTHER=1\n")
             script = rendered.replace("/etc/sandbox/vmd.env", str(env_file))
             result = subprocess.run(
-                ["sh", "-c", linux_shell_prelude() + script], capture_output=True, text=True
+                ["sh", "-c", script], capture_output=True, text=True, env=_gnu_sed_env(d)
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             content = env_file.read_text()
