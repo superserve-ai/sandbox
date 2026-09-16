@@ -5108,3 +5108,58 @@ func pauseMocks(sb db.Sandbox, finalizes *int32) *mockDBTX {
 		},
 	}
 }
+
+// A teardown that outlives the inline budget must not hold the response:
+// the row is already deleted and the reconciler backstops the host side.
+func TestDeleteSandbox_SlowTeardownDoesNotHoldTheResponse(t *testing.T) {
+	prev := deleteTeardownInlineBudget
+	deleteTeardownInlineBudget = 50 * time.Millisecond
+	defer func() { deleteTeardownInlineBudget = prev }()
+
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+	release := make(chan struct{})
+	var destroyed int32
+	vmd := &stubVMD{destroyFn: func(ctx context.Context, _ string, _ bool) error {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		atomic.StoreInt32(&destroyed, 1)
+		return nil
+	}}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	start := time.Now()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("response took %s while teardown was blocked", took)
+	}
+	if atomic.LoadInt32(&destroyed) != 0 {
+		t.Fatal("teardown finished before it was released")
+	}
+	close(release)
+	h.WaitAsyncBookkeeping()
+	if atomic.LoadInt32(&destroyed) != 1 {
+		t.Error("teardown did not complete in the background")
+	}
+}

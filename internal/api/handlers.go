@@ -174,6 +174,12 @@ type Handlers struct {
 	asyncCond  *sync.Cond // lazily created by WaitAsyncBookkeeping, guarded by asyncMu
 	asyncCount int
 
+	// teardownSem bounds how many delete teardowns run at once once they
+	// have left the request path (see DeleteSandbox). Lazily created so
+	// struct-literal construction in tests needs nothing.
+	teardownSem     chan struct{}
+	teardownSemOnce sync.Once
+
 	// activityGate caps how many activity-log inserts may hold DB connections
 	// at once (see writeActivity). Lazily created so struct-literal
 	// construction keeps working.
@@ -1636,15 +1642,31 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
-	// The row is deleted; host-side reclaim is best-effort and backstopped by
-	// the vm reconciler, so it runs after the response. A host that has gone
-	// away otherwise holds the caller through the RPC timeout and its retry.
+	// The row is deleted. Host-side reclaim normally completes in well under
+	// the inline budget, and a caller that deletes and re-creates then finds
+	// the VM's memory, cores and network slot already released. A host that
+	// is unreachable would instead hold the caller through the RPC timeout
+	// and its retry, so past the budget the response goes out and the
+	// reclaim finishes in the background: it is best-effort and backstopped
+	// by the vm reconciler either way. The base context is captured here,
+	// before the response: gin recycles its context between requests.
 	hostID, basePath, templateID := sandbox.HostID, sandbox.BasePath, sandbox.TemplateID
+	base := context.WithoutCancel(c.Request.Context())
+	done := make(chan struct{})
 	h.asyncBookkeeping("delete-teardown", func() {
-		tctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), autoDeleteTeardownTimeout)
+		defer close(done)
+		h.acquireTeardownSlot()
+		defer h.releaseTeardownSlot()
+		tctx, cancel := context.WithTimeout(base, autoDeleteTeardownTimeout)
 		defer cancel()
 		h.teardownDestroyedSandbox(tctx, sandboxID, hostID, basePath, templateID)
 	})
+	select {
+	case <-done:
+	case <-time.After(deleteTeardownInlineBudget):
+		l := sandboxLogger(sandboxID.String(), hostID)
+		l.Warn().Msg("delete teardown still running past the inline budget; continuing in the background")
+	}
 
 	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
@@ -1652,6 +1674,23 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 
 	c.Status(http.StatusNoContent)
 }
+
+// deleteTeardownInlineBudget is how long DeleteSandbox waits for the host
+// reclaim before answering; a reachable host is done in a fraction of it.
+// A var so tests can shorten it.
+var deleteTeardownInlineBudget = 5 * time.Second
+
+// maxConcurrentTeardowns caps delete teardowns that have left the request
+// path, so a burst of deletes against an unreachable host cannot pile up
+// thousands of two-minute RPC waits.
+const maxConcurrentTeardowns = 32
+
+func (h *Handlers) acquireTeardownSlot() {
+	h.teardownSemOnce.Do(func() { h.teardownSem = make(chan struct{}, maxConcurrentTeardowns) })
+	h.teardownSem <- struct{}{}
+}
+
+func (h *Handlers) releaseTeardownSlot() { <-h.teardownSem }
 
 // teardownDestroyedSandbox reclaims host-side state for a sandbox whose
 // guarded soft-delete has already committed: the VM (with its run dir and
