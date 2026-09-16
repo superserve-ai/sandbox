@@ -1895,7 +1895,7 @@ func (h *Handlers) claimNextTeardown(ctx context.Context) (teardownRecord, bool)
 func (h *Handlers) releaseTeardownHost(ctx context.Context, rec teardownRecord) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	if err := h.DB.ReleaseTeardownHost(rctx, db.ReleaseTeardownHostParams{HostID: rec.HostID, SandboxID: rec.SandboxID}); err != nil {
+	if err := h.DB.ReleaseTeardownHost(rctx, db.ReleaseTeardownHostParams{HostID: rec.HostID, SandboxID: rec.SandboxID, Attempt: rec.Attempts}); err != nil {
 		l := sandboxLogger(rec.SandboxID.String(), rec.HostID)
 		l.Warn().Err(err).Msg("teardown sweep: host release failed; the host waits out the lease")
 	}

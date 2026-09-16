@@ -602,7 +602,7 @@ func (q *Queries) ClaimExpiredSandbox(ctx context.Context, arg ClaimExpiredSandb
 
 const claimNextTeardown = `-- name: ClaimNextTeardown :one
 WITH candidate AS (
-  SELECT t.sandbox_id, t.host_id
+  SELECT t.sandbox_id, t.host_id, t.attempts + 1 AS attempt
   FROM sandbox_teardown t
   WHERE t.lease_until <= now()
     AND t.retry_at <= now()
@@ -615,17 +615,17 @@ WITH candidate AS (
   FOR UPDATE SKIP LOCKED
 ),
 host_lease AS (
-  INSERT INTO sandbox_teardown_host (host_id, sandbox_id, lease_until)
-  SELECT host_id, sandbox_id, now() + make_interval(secs => $1::int)
+  INSERT INTO sandbox_teardown_host (host_id, sandbox_id, attempt, lease_until)
+  SELECT host_id, sandbox_id, attempt, now() + make_interval(secs => $1::int)
   FROM candidate
   ON CONFLICT (host_id) DO UPDATE
-    SET sandbox_id = EXCLUDED.sandbox_id, lease_until = EXCLUDED.lease_until
+    SET sandbox_id = EXCLUDED.sandbox_id, attempt = EXCLUDED.attempt, lease_until = EXCLUDED.lease_until
     WHERE sandbox_teardown_host.lease_until <= now()
   RETURNING host_id
 )
 UPDATE sandbox_teardown t
 SET lease_until = now() + make_interval(secs => $1::int),
-    attempts = t.attempts + 1
+    attempts = c.attempt
 FROM candidate c
 JOIN host_lease h ON h.host_id = c.host_id
 WHERE t.sandbox_id = c.sandbox_id
@@ -1544,7 +1544,7 @@ func (q *Queries) CreateSandboxWithSecrets(ctx context.Context, arg CreateSandbo
 
 const deferHostTeardowns = `-- name: DeferHostTeardowns :execrows
 UPDATE sandbox_teardown
-SET retry_at = now() + make_interval(secs => $1::int),
+SET retry_at = GREATEST(retry_at, now() + make_interval(secs => $1::int)),
     last_error = $2
 WHERE host_id = $3 AND lease_until <= now()
 `
@@ -1557,7 +1557,8 @@ type DeferHostTeardownsParams struct {
 
 // The host did not answer: hold every reclaim on it that nobody is working
 // on, so the sweeper does not try them one by one. Reclaims in flight are
-// left to their workers.
+// left to their workers, and a reclaim already waiting longer keeps its
+// own backoff.
 func (q *Queries) DeferHostTeardowns(ctx context.Context, arg DeferHostTeardownsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deferHostTeardowns, arg.RetryAfterSeconds, arg.LastError, arg.HostID)
 	if err != nil {
@@ -3175,18 +3176,20 @@ func (q *Queries) ReleaseTeardown(ctx context.Context, sandboxID uuid.UUID) erro
 const releaseTeardownHost = `-- name: ReleaseTeardownHost :exec
 UPDATE sandbox_teardown_host
 SET lease_until = now()
-WHERE host_id = $1 AND sandbox_id = $2
+WHERE host_id = $1 AND sandbox_id = $2 AND attempt = $3
 `
 
 type ReleaseTeardownHostParams struct {
 	HostID    string    `json:"host_id"`
 	SandboxID uuid.UUID `json:"sandbox_id"`
+	Attempt   int32     `json:"attempt"`
 }
 
-// The sweeper's attempt on this host is over; fenced on the reclaim it was
-// working so a worker whose lease ran out cannot release a newer holder.
+// The sweeper's attempt on this host is over; fenced on the reclaim attempt
+// it was working so a worker whose lease ran out cannot release a newer
+// holder, even one working the same reclaim.
 func (q *Queries) ReleaseTeardownHost(ctx context.Context, arg ReleaseTeardownHostParams) error {
-	_, err := q.db.Exec(ctx, releaseTeardownHost, arg.HostID, arg.SandboxID)
+	_, err := q.db.Exec(ctx, releaseTeardownHost, arg.HostID, arg.SandboxID, arg.Attempt)
 	return err
 }
 

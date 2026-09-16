@@ -5434,7 +5434,9 @@ func TestSweepTeardowns_RunsWhatItClaimsAndCompletes(t *testing.T) {
 					atomic.AddInt32(&fenced, 1)
 				}
 			case strings.Contains(sql, "UPDATE sandbox_teardown_host"):
-				atomic.AddInt32(&hostReleases, 1)
+				if a, _ := args[2].(int32); a == 2 {
+					atomic.AddInt32(&hostReleases, 1)
+				}
 			}
 			return pgconn.NewCommandTag("DELETE 1"), nil
 		},

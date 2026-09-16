@@ -31,11 +31,14 @@ ALTER TABLE sandbox_teardown ENABLE ROW LEVEL SECURITY;
 
 -- One sweeper attempt per host at a time, fleet-wide: the claim takes the
 -- host's row here in the same statement, so replicas racing for the same
--- host serialize on it and only one wins. sandbox_id is the reclaim the
--- holder is working on; the release is fenced on it.
+-- host serialize on it and only one wins. sandbox_id and attempt identify
+-- the reclaim attempt the holder is working on; the release is fenced on
+-- both, so a worker that outlived its lease cannot release a newer holder
+-- of the same reclaim.
 CREATE TABLE IF NOT EXISTS sandbox_teardown_host (
     host_id     text PRIMARY KEY,
     sandbox_id  uuid NOT NULL,
+    attempt     integer NOT NULL,
     lease_until timestamptz NOT NULL
 );
 

@@ -1283,7 +1283,7 @@ WHERE s.id = $1 AND s.destroyed_at IS NULL;
 -- sandbox_teardown_host; the one that finds the lease already taken claims
 -- nothing. So a host that does not answer occupies one worker fleet-wide.
 WITH candidate AS (
-  SELECT t.sandbox_id, t.host_id
+  SELECT t.sandbox_id, t.host_id, t.attempts + 1 AS attempt
   FROM sandbox_teardown t
   WHERE t.lease_until <= now()
     AND t.retry_at <= now()
@@ -1296,28 +1296,29 @@ WITH candidate AS (
   FOR UPDATE SKIP LOCKED
 ),
 host_lease AS (
-  INSERT INTO sandbox_teardown_host (host_id, sandbox_id, lease_until)
-  SELECT host_id, sandbox_id, now() + make_interval(secs => sqlc.arg(lease_seconds)::int)
+  INSERT INTO sandbox_teardown_host (host_id, sandbox_id, attempt, lease_until)
+  SELECT host_id, sandbox_id, attempt, now() + make_interval(secs => sqlc.arg(lease_seconds)::int)
   FROM candidate
   ON CONFLICT (host_id) DO UPDATE
-    SET sandbox_id = EXCLUDED.sandbox_id, lease_until = EXCLUDED.lease_until
+    SET sandbox_id = EXCLUDED.sandbox_id, attempt = EXCLUDED.attempt, lease_until = EXCLUDED.lease_until
     WHERE sandbox_teardown_host.lease_until <= now()
   RETURNING host_id
 )
 UPDATE sandbox_teardown t
 SET lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
-    attempts = t.attempts + 1
+    attempts = c.attempt
 FROM candidate c
 JOIN host_lease h ON h.host_id = c.host_id
 WHERE t.sandbox_id = c.sandbox_id
 RETURNING t.sandbox_id, t.host_id, t.base_path, t.template_id, t.attempts;
 
 -- name: ReleaseTeardownHost :exec
--- The sweeper's attempt on this host is over; fenced on the reclaim it was
--- working so a worker whose lease ran out cannot release a newer holder.
+-- The sweeper's attempt on this host is over; fenced on the reclaim attempt
+-- it was working so a worker whose lease ran out cannot release a newer
+-- holder, even one working the same reclaim.
 UPDATE sandbox_teardown_host
 SET lease_until = now()
-WHERE host_id = sqlc.arg(host_id) AND sandbox_id = sqlc.arg(sandbox_id);
+WHERE host_id = sqlc.arg(host_id) AND sandbox_id = sqlc.arg(sandbox_id) AND attempt = sqlc.arg(attempt);
 
 -- name: ReleaseTeardown :exec
 -- The inline attempt did not run: hand the reclaim to the sweeper now
@@ -1345,9 +1346,10 @@ WHERE sandbox_id = sqlc.arg(sandbox_id) AND attempts = sqlc.arg(attempts);
 -- name: DeferHostTeardowns :execrows
 -- The host did not answer: hold every reclaim on it that nobody is working
 -- on, so the sweeper does not try them one by one. Reclaims in flight are
--- left to their workers.
+-- left to their workers, and a reclaim already waiting longer keeps its
+-- own backoff.
 UPDATE sandbox_teardown
-SET retry_at = now() + make_interval(secs => sqlc.arg(retry_after_seconds)::int),
+SET retry_at = GREATEST(retry_at, now() + make_interval(secs => sqlc.arg(retry_after_seconds)::int)),
     last_error = sqlc.narg(last_error)
 WHERE host_id = sqlc.arg(host_id) AND lease_until <= now();
 

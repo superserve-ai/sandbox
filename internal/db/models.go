@@ -729,6 +729,7 @@ type SandboxTeardown struct {
 type SandboxTeardownHost struct {
 	HostID     string    `json:"host_id"`
 	SandboxID  uuid.UUID `json:"sandbox_id"`
+	Attempt    int32     `json:"attempt"`
 	LeaseUntil time.Time `json:"lease_until"`
 }
 
