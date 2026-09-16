@@ -196,8 +196,11 @@ class DeployTargetTests(unittest.TestCase):
         for kind in ("vmd", "proxy"):
             workflow = (SCRIPTS.parent / f"deploy-{kind}.yml").read_text()
             production = workflow.split("  deploy-production:\n", 1)[1]
-            self.assertIn("    needs: [deploy-staging]\n", production)
-            self.assertIn("if: github.event_name == 'push' || github.event.inputs.environment == 'production'", production)
+            if kind == "proxy":
+                self.assertIn("    needs: [deploy-staging]\n", production)
+                self.assertIn("if: github.event_name == 'push' || github.event.inputs.environment == 'production'", production)
+            else:
+                self.assertIn("    needs: [deploy-staging, wait-for-ci, migration-gate]\n", production)
             steps = [s for s in re.split(r"^      - name: ", workflow, flags=re.M)
                      if f"python3 .github/workflows/scripts/deploy-{kind}.py" in s]
             self.assertEqual(len(steps), 3)
@@ -220,6 +223,39 @@ class DeployTargetTests(unittest.TestCase):
                             expected = ([cell or "usw2"] if event == "workflow_dispatch"
                                         else (["use4", "usw2"] if enabled else ["use4"]))
                             self.assertEqual(selected, expected, (kind, event, target, cell, enabled))
+
+    def test_vmd_staging_bypass_is_only_manual_production_standby(self):
+        from itertools import product
+
+        workflow = (SCRIPTS.parent / 'deploy-vmd.yml').read_text()
+        staging = workflow.split('  deploy-staging:\n', 1)[1].split('    runs-on:', 1)[0]
+        production = workflow.split('  deploy-production:\n', 1)[1]
+        staging_condition = re.search(r'if: \$\{\{ (.+) \}\}', staging)[1]
+        production_condition = production.split('    if: >-\n', 1)[1].split('    needs:', 1)[0]
+
+        def evaluate(expression, context):
+            expression = expression.replace('&&', ' and ').replace('||', ' or ')
+            expression = re.sub(r'!(?!=)', ' not ', expression)
+            expression = re.sub(r'needs\.([a-z-]+)\.result', r'needs["\1"]', expression)
+            return eval(' '.join(expression.split()), {"__builtins__": {}}, context)
+
+        for event, environment, target, result, ci, migration, cancelled in product(
+                ('push', 'workflow_dispatch'), ('', 'staging', 'production'),
+                ('', 'standby', 'serving'), ('success', 'skipped', 'failure', 'cancelled'),
+                ('success', 'failure', 'skipped', 'cancelled'),
+                ('success', 'failure', 'skipped', 'cancelled'), (False, True)):
+            bypass = event == 'workflow_dispatch' and environment == 'production' and target == 'standby'
+            context = dict(github=SimpleNamespace(event_name=event),
+                           inputs=SimpleNamespace(environment=environment, target=target),
+                           needs={'deploy-staging': result, 'wait-for-ci': ci, 'migration-gate': migration},
+                           cancelled=lambda: cancelled)
+            with self.subTest(event=event, environment=environment, target=target,
+                              staging=result, ci=ci, migration=migration, cancelled=cancelled):
+                self.assertEqual(evaluate(staging_condition, context), not bypass)
+                expected = (not cancelled and ci == migration == 'success'
+                            and (event == 'push' or environment == 'production')
+                            and (result == 'success' or bypass))
+                self.assertEqual(evaluate(production_condition, context), expected)
 
     def test_zero_matches_never_retry_serving_or_upload(self):
         for kind in ("vmd", "proxy"):

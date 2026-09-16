@@ -1,7 +1,7 @@
 # Deploy VMD — control plane VMs.
 #
-# Staging runs first; manual production standby deploys may skip an absent
-# staging standby. Serving deployments still require staging to succeed.
+# Manual production standby deploys bypass staging for bootstrap/recovery.
+# Serving deployments still require staging to succeed.
 # The deploy-production job reuses the same step body as deploy-staging; env vars
 # like GCP_PROJECT resolve per-environment from GitHub environment vars.
 # The us-west2 cell host deploys as a final production step, after the
@@ -13,14 +13,14 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Target environment (staging always runs first)'
+        description: 'Target environment (production standby bypasses staging)'
         required: false
         type: choice
         options:
           - staging
           - production
       target:
-        description: 'Host target (applies to staging first, then the selected production cell)'
+        description: 'Host target (production standby deploys only to the selected cell)'
         required: true
         type: choice
         default: standby
@@ -28,7 +28,7 @@ on:
           - standby
           - serving
       cell:
-        description: 'Production cell (ignored for staging; use4 standby is not provisioned yet)'
+        description: 'Production cell (ignored for staging)'
         required: true
         type: choice
         default: usw2
@@ -164,6 +164,7 @@ jobs:
           exit 1
 
   deploy-staging:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.environment == 'production' && inputs.target == 'standby') }}
     runs-on: ubuntu-latest
     needs: [wait-for-ci, migration-gate]
     environment: staging
@@ -285,8 +286,16 @@ jobs:
           python3 .github/workflows/scripts/deploy-vmd.py
 
   deploy-production:
-    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
-    needs: [deploy-staging]
+    # A status function permits the intentional staging skip; readiness gates
+    # must still succeed, and cancellation must never start a deployment.
+    if: >-
+      !cancelled() &&
+      needs.wait-for-ci.result == 'success' &&
+      needs.migration-gate.result == 'success' &&
+      (github.event_name == 'push' || inputs.environment == 'production') &&
+      (needs.deploy-staging.result == 'success' ||
+       (github.event_name == 'workflow_dispatch' && inputs.environment == 'production' && inputs.target == 'standby'))
+    needs: [deploy-staging, wait-for-ci, migration-gate]
     runs-on: ubuntu-latest
     environment: production
     permissions:
