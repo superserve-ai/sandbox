@@ -13,8 +13,9 @@ CREATE TABLE IF NOT EXISTS sandbox_teardown (
     template_id uuid,
     created_at  timestamptz NOT NULL DEFAULT now(),
     -- Owned by a worker until this passes. Born owned by the deleting
-    -- request's inline attempt; the sweeper takes its own lease per attempt.
-    lease_until timestamptz NOT NULL DEFAULT now() + interval '60 seconds',
+    -- request for the length of its inline attempt; the sweeper takes its
+    -- own lease per attempt.
+    lease_until timestamptz NOT NULL DEFAULT now(),
     -- Not retried before this: the backoff after a failed attempt.
     retry_at    timestamptz NOT NULL DEFAULT now(),
     attempts    integer NOT NULL DEFAULT 1,

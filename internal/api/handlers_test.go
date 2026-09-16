@@ -5208,13 +5208,14 @@ func TestDeleteSandbox_SlowHostCostsOnlyTheBudget(t *testing.T) {
 	}
 }
 
-// With the replica's inline limiter full, a delete still answers at once and
-// leaves its reclaim to the sweeper rather than waiting for a slot.
+// With the replica's inline limiter full, a delete answers at once, touching
+// neither the host nor the record: the sweeper takes the reclaim when its
+// birth lease ends.
 func TestDeleteSandbox_FullInlineLimiterLeavesTheReclaimToTheSweeper(t *testing.T) {
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
-	var destroyed, released int32
+	var destroyed, recordWrites int32
 	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error {
 		atomic.AddInt32(&destroyed, 1)
 		return nil
@@ -5231,8 +5232,8 @@ func TestDeleteSandbox_FullInlineLimiterLeavesTheReclaimToTheSweeper(t *testing.
 			}
 		},
 		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-			if strings.Contains(sql, "attempts = 0") {
-				atomic.AddInt32(&released, 1)
+			if strings.Contains(sql, "sandbox_teardown") {
+				atomic.AddInt32(&recordWrites, 1)
 			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
@@ -5243,13 +5244,56 @@ func TestDeleteSandbox_FullInlineLimiterLeavesTheReclaimToTheSweeper(t *testing.
 		h.inlineTeardowns <- struct{}{}
 	}
 	w := httptest.NewRecorder()
+	start := time.Now()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
 	h.WaitAsyncBookkeeping()
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
 	}
-	if destroyed != 0 || released != 1 {
-		t.Fatalf("destroy calls = %d, releases = %d; want 0, 1", destroyed, released)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("response took %s with the limiter full", took)
+	}
+	if destroyed != 0 || recordWrites != 0 {
+		t.Fatalf("destroy calls = %d, record writes = %d; want none", destroyed, recordWrites)
+	}
+}
+
+// The inline budget covers the settle as well: a database that stalls on the
+// record write cannot hold the response past the budget.
+func TestDeleteSandbox_StalledSettleCannotExceedTheBudget(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error { return errors.New("host unreachable") }}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(ctx context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "sandbox_teardown") {
+				<-ctx.Done()
+				return pgconn.CommandTag{}, ctx.Err()
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock), TeardownInlineBudget: 100 * time.Millisecond}
+	w := httptest.NewRecorder()
+	start := time.Now()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("response took %s while the settle was stalled", took)
 	}
 }
 

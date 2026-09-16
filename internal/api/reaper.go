@@ -280,6 +280,7 @@ func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, para
 	due, err := h.DB.ClaimAutoDeleteSandboxes(queryCtx, db.ClaimAutoDeleteSandboxesParams{
 		BatchSize:           batchSize,
 		RevocationExpiresAt: time.Now().Add(SecretsJWTLifetime),
+		LeaseSeconds:        h.birthLeaseSeconds(),
 	})
 	queryCancel()
 	if err != nil {

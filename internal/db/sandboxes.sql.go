@@ -339,8 +339,9 @@ revoked AS (
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 owed AS (
-  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id)
-  SELECT id, host_id, base_path, template_id FROM destroyed
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until)
+  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => $3::int)
+  FROM destroyed
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -371,6 +372,7 @@ FROM destroyed d
 type ClaimAutoDeleteSandboxesParams struct {
 	BatchSize           int32     `json:"batch_size"`
 	RevocationExpiresAt time.Time `json:"revocation_expires_at"`
+	LeaseSeconds        int32     `json:"lease_seconds"`
 }
 
 type ClaimAutoDeleteSandboxesRow struct {
@@ -394,7 +396,7 @@ type ClaimAutoDeleteSandboxesRow struct {
 // after the claim can't strand a deleted sandbox with a live JWT or an open
 // interval. Returns the columns the caller needs for VM/artifact teardown.
 func (q *Queries) ClaimAutoDeleteSandboxes(ctx context.Context, arg ClaimAutoDeleteSandboxesParams) ([]ClaimAutoDeleteSandboxesRow, error) {
-	rows, err := q.db.Query(ctx, claimAutoDeleteSandboxes, arg.BatchSize, arg.RevocationExpiresAt)
+	rows, err := q.db.Query(ctx, claimAutoDeleteSandboxes, arg.BatchSize, arg.RevocationExpiresAt, arg.LeaseSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -1625,8 +1627,10 @@ revoked AS (
 owed AS (
   -- The host-side reclaim is recorded with the delete, so neither a slow
   -- host nor a control-plane restart can lose it (see sandbox_teardown).
-  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id)
-  SELECT id, host_id, base_path, template_id FROM destroyed
+  -- Owned by the caller for its inline attempt; the sweeper takes it after.
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until)
+  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => $5::int)
+  FROM destroyed
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -1658,6 +1662,7 @@ type DestroySandboxParams struct {
 	TeamID                  uuid.UUID `json:"team_id"`
 	StaleTransitionalBefore time.Time `json:"stale_transitional_before"`
 	RevocationExpiresAt     time.Time `json:"revocation_expires_at"`
+	LeaseSeconds            int32     `json:"lease_seconds"`
 }
 
 type DestroySandboxRow struct {
@@ -1686,6 +1691,7 @@ func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) 
 		arg.TeamID,
 		arg.StaleTransitionalBefore,
 		arg.RevocationExpiresAt,
+		arg.LeaseSeconds,
 	)
 	var i DestroySandboxRow
 	err := row.Scan(
@@ -3158,19 +3164,6 @@ func (q *Queries) ReleasePauseLease(ctx context.Context, arg ReleasePauseLeasePa
 		return 0, err
 	}
 	return result.RowsAffected(), nil
-}
-
-const releaseTeardown = `-- name: ReleaseTeardown :exec
-UPDATE sandbox_teardown
-SET lease_until = now(), attempts = 0
-WHERE sandbox_id = $1 AND attempts = 1
-`
-
-// The inline attempt did not run: hand the reclaim to the sweeper now
-// rather than when the birth lease ends.
-func (q *Queries) ReleaseTeardown(ctx context.Context, sandboxID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, releaseTeardown, sandboxID)
-	return err
 }
 
 const releaseTeardownHost = `-- name: ReleaseTeardownHost :exec

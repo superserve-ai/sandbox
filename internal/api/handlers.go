@@ -1633,6 +1633,7 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		TeamID:                  teamID,
 		RevocationExpiresAt:     time.Now().Add(SecretsJWTLifetime),
 		StaleTransitionalBefore: time.Now().Add(-staleTransitionGrace),
+		LeaseSeconds:            h.birthLeaseSeconds(),
 	})
 	if err != nil {
 		if err == pgx.ErrNoRows {
@@ -1677,16 +1678,20 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// Reclaim timing. The inline budget is what a delete spends on its own
-// reclaim before answering. teardownLease is how long one attempt owns the
-// record (the table's birth lease for the inline attempt, the sweeper's for
-// its own) and outlasts the longest attempt: the inline ceiling and the
-// sweep budget both stay under it. Retries back off from teardownRetryMin,
-// doubling per attempt, up to teardownRetryMax, which permanent failures
-// use from the start.
+// Reclaim timing. The inline budget is the whole of what a delete spends on
+// its own reclaim before answering, settlement included: the reclaim runs
+// under the budget less a reserve kept for the settle. The record is born
+// owned for the budget plus teardownBirthLeaseMargin, so the sweeper takes
+// over shortly after an inline attempt that did not finish, was skipped, or
+// died with the process. teardownLease is the sweeper's own lease per
+// attempt and outlasts the sweep budget plus its settle. Retries back off
+// from teardownRetryMin, doubling per attempt, up to teardownRetryMax,
+// which permanent failures use from the start.
 const (
 	defaultTeardownInlineBudget = 5 * time.Second
 	maxTeardownInlineBudget     = 30 * time.Second
+	teardownSettleReserveMax    = 500 * time.Millisecond
+	teardownBirthLeaseMargin    = 5 * time.Second
 	teardownSweepBudget         = 30 * time.Second
 	teardownLease               = 60 * time.Second
 	teardownSweepInterval       = 30 * time.Second
@@ -1719,35 +1724,41 @@ func (h *Handlers) inlineBudget() time.Duration {
 	return min(h.TeardownInlineBudget, maxTeardownInlineBudget)
 }
 
-// teardownInline runs the attempt the record was born owning, bounded by the
-// inline budget. When this replica already has its fill of inline reclaims
-// on the wire the record is released to the sweeper instead of waiting, so
-// a burst of deletes cannot pile RPCs onto a host.
+// birthLeaseSeconds is how long a delete owns its record: its inline budget
+// and a margin for the response.
+func (h *Handlers) birthLeaseSeconds() int32 {
+	return int32((h.inlineBudget() + teardownBirthLeaseMargin) / time.Second)
+}
+
+// teardownInline runs the attempt the record was born owning, bounded as a
+// whole by the inline budget. When this replica already has its fill of
+// inline reclaims on the wire the attempt is skipped outright, with no
+// database call on the way out: the sweeper takes the record when its
+// birth lease ends.
 func (h *Handlers) teardownInline(ctx context.Context, rec teardownRecord, path string) {
 	h.inlineTeardownsOnce.Do(func() { h.inlineTeardowns = make(chan struct{}, maxInlineTeardowns) })
 	select {
 	case h.inlineTeardowns <- struct{}{}:
 	default:
 		l := sandboxLogger(rec.SandboxID.String(), rec.HostID)
-		rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		if err := h.DB.ReleaseTeardown(rctx, rec.SandboxID); err != nil {
-			l.Warn().Err(err).Msg("teardown: release after a full inline limiter failed; the sweeper takes it when the lease ends")
-		}
 		l.Info().Msg("teardown: inline limiter full; left to the sweeper")
 		recordTeardownAttempt(ctx, path, "skipped")
 		return
 	}
 	defer func() { <-h.inlineTeardowns }()
-	actx, cancel := context.WithTimeout(ctx, h.inlineBudget())
+	budget := h.inlineBudget()
+	settleCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	h.attemptTeardown(actx, rec, path)
+	runCtx, cancelRun := context.WithTimeout(settleCtx, budget-min(teardownSettleReserveMax, budget/10))
+	defer cancelRun()
+	h.attemptTeardown(runCtx, settleCtx, rec, path)
 }
 
-// attemptTeardown runs the whole reclaim and settles the record: removed
-// when every step succeeded, deferred with a backoff otherwise.
-func (h *Handlers) attemptTeardown(ctx context.Context, rec teardownRecord, path string) {
-	h.settleTeardown(ctx, rec, path, h.reclaimSandbox(ctx, rec))
+// attemptTeardown runs the whole reclaim under runCtx and settles the record
+// under settleCtx: removed when every step succeeded, deferred with a
+// backoff otherwise.
+func (h *Handlers) attemptTeardown(runCtx, settleCtx context.Context, rec teardownRecord, path string) {
+	h.settleTeardown(settleCtx, rec, path, h.reclaimSandbox(runCtx, rec))
 }
 
 // reclaimSandbox reclaims host-side state for a sandbox whose guarded
@@ -1766,12 +1777,19 @@ func (h *Handlers) reclaimSandbox(ctx context.Context, rec teardownRecord) error
 	return h.gcOldBuildArtifacts(ctx, rec.HostID, rec.BasePath, rec.TemplateID)
 }
 
-// settleTeardown writes the attempt's outcome. A host that did not answer
-// holds the host's other pending reclaims too, so the sweeper does not try
-// them one by one; reclaims in flight elsewhere are not touched.
+// settleTeardown writes the attempt's outcome within ctx. A host that did
+// not answer holds the host's other pending reclaims too, so the sweeper
+// does not try them one by one; reclaims in flight elsewhere are not
+// touched. With ctx already spent nothing is written: the record's lease
+// runs out and the sweeper recovers it.
 func (h *Handlers) settleTeardown(ctx context.Context, rec teardownRecord, path string, err error) {
 	l := sandboxLogger(rec.SandboxID.String(), rec.HostID)
-	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	if ctx.Err() != nil {
+		l.Warn().AnErr("attempt", err).Msg("teardown: budget spent before settling; the lease recovers it")
+		recordTeardownAttempt(ctx, path, "timeout")
+		return
+	}
+	sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if err == nil {
 		if _, cerr := h.DB.CompleteTeardown(sctx, db.CompleteTeardownParams{SandboxID: rec.SandboxID, Attempts: rec.Attempts}); cerr != nil {
@@ -1859,9 +1877,11 @@ func (h *Handlers) SweepTeardowns(ctx context.Context) {
 				if !ok {
 					return
 				}
-				actx, cancel := context.WithTimeout(ctx, teardownSweepBudget)
-				h.attemptTeardown(actx, rec, "sweep")
-				cancel()
+				runCtx, cancelRun := context.WithTimeout(ctx, teardownSweepBudget)
+				settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+				h.attemptTeardown(runCtx, settleCtx, rec, "sweep")
+				cancelRun()
+				cancelSettle()
 				h.releaseTeardownHost(ctx, rec)
 			}
 		}()

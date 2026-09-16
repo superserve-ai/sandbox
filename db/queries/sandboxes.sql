@@ -292,8 +292,10 @@ revoked AS (
 owed AS (
   -- The host-side reclaim is recorded with the delete, so neither a slow
   -- host nor a control-plane restart can lose it (see sandbox_teardown).
-  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id)
-  SELECT id, host_id, base_path, template_id FROM destroyed
+  -- Owned by the caller for its inline attempt; the sweeper takes it after.
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until)
+  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => sqlc.arg(lease_seconds)::int)
+  FROM destroyed
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -1182,8 +1184,9 @@ revoked AS (
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 owed AS (
-  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id)
-  SELECT id, host_id, base_path, template_id FROM destroyed
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until)
+  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => sqlc.arg(lease_seconds)::int)
+  FROM destroyed
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -1319,13 +1322,6 @@ RETURNING t.sandbox_id, t.host_id, t.base_path, t.template_id, t.attempts;
 UPDATE sandbox_teardown_host
 SET lease_until = now()
 WHERE host_id = sqlc.arg(host_id) AND sandbox_id = sqlc.arg(sandbox_id) AND attempt = sqlc.arg(attempt);
-
--- name: ReleaseTeardown :exec
--- The inline attempt did not run: hand the reclaim to the sweeper now
--- rather than when the birth lease ends.
-UPDATE sandbox_teardown
-SET lease_until = now(), attempts = 0
-WHERE sandbox_id = $1 AND attempts = 1;
 
 -- name: CompleteTeardown :execrows
 -- Fenced on the attempt: a worker whose lease ran out cannot remove a
