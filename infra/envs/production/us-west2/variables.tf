@@ -128,7 +128,7 @@ variable "standby_host_id" {
 }
 
 variable "primary_host_running" {
-  description = "Whether the primary host is kept running; false parks it stopped (its local SSD is empty once stopped)."
+  description = "Whether the primary host is kept running; false parks it stopped (its local SSD is empty once stopped). Flip it in a separate apply after a promotion has applied, never in the same one."
   type        = bool
   default     = true
 }

@@ -292,12 +292,15 @@ module "api" {
 module "sandbox_host" {
   source = "../../../modules/sandbox-host"
 
-  project_id     = local.project_id
-  environment    = local.environment
-  region         = local.region
-  zone           = local.zone
-  instance_name  = "superserve-vmd-${local.resource_suffix}"
-  machine_type   = var.machine_type
+  project_id    = local.project_id
+  environment   = local.environment
+  region        = local.region
+  zone          = local.zone
+  instance_name = "superserve-vmd-${local.resource_suffix}"
+  machine_type  = var.machine_type
+  # Held by Terraform only for this host. Park it in an apply of its own,
+  # after the promotion has applied: the control plane's address switch
+  # and this stop have no ordering in one apply.
   desired_status = var.primary_host_running ? "RUNNING" : "TERMINATED"
   subnet         = module.network.subnetwork_self_link
   internal_ip    = "10.1.0.2"

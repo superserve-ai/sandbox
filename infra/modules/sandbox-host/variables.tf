@@ -80,13 +80,14 @@ variable "metadata" {
 }
 
 variable "desired_status" {
-  description = "RUNNING or TERMINATED; a parked host stays stopped across applies."
+  description = "RUNNING or TERMINATED to have Terraform hold the instance's power state; null (the default) leaves it to operators."
   type        = string
-  default     = "RUNNING"
+  default     = null
+  nullable    = true
 
   validation {
-    condition     = contains(["RUNNING", "TERMINATED"], var.desired_status)
-    error_message = "desired_status must be RUNNING or TERMINATED."
+    condition     = var.desired_status == null || contains(["RUNNING", "TERMINATED"], var.desired_status)
+    error_message = "desired_status must be RUNNING, TERMINATED, or null."
   }
 }
 
