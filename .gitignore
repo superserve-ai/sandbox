@@ -67,6 +67,7 @@ docs/
 *:Zone.Identifier
 
 # Terraform local state/cache
+*.local.auto.tfvars.json
 **/.terraform/
 *.tfstate
 *.tfstate.*

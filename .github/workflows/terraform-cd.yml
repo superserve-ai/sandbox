@@ -259,6 +259,7 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -430,6 +431,7 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
