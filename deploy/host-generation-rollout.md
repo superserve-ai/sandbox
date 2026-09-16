@@ -77,10 +77,13 @@ Migrations leave existing hosts with both incarnation and generation NULL.
    `peer_generation`, `vmd_addr`, and `last_heartbeat_at`. Binding establishes
    generation 1 atomically. Verify two subsequent heartbeats keep the generation
    unchanged. Activation still requires a fresh heartbeat and operator token.
-6. Enable forwarding only for discovery results with a bound incarnation and a
-   positive generation and a registered `proxy_addr` matching the VMD IP on
-   port 5009. Other listener addresses or ports are ineligible. Legacy hosts remain supported for non-forwarding use;
-   missing generation is an explicit routing failure, never a local default.
+6. Enable remote forwarding only for discovery results with a bound incarnation,
+   positive generation, and registered `proxy_addr` matching the VMD IP on port
+   5009. Other listener addresses or ports are ineligible for remote forwarding.
+   Exact local ownership is handled before peer validation: when the sandbox's
+   `host_id` equals the proxy's configured `HOST_ID`, it routes locally without
+   requiring incarnation, generation, or a peer listener. A missing generation
+   on any remote owner remains an explicit routing failure, never a local fallback.
 
 The installation file is `/etc/sandbox/host-identity.json`, paired with provider
 metadata keyed `sandbox-host-identity`. A systemd drop-in loads the dedicated
@@ -133,18 +136,20 @@ a new VM. Same-VM rebuild and VM replacement are distinct operations.
 `GetSandboxPeerEndpoint` joins sandbox ownership and registered host state in one
 query. `host_id` is a string; nullable `vmd_addr` and `proxy_addr` are `*string`;
 nullable `peer_generation` is `*int64`; nullable `incarnation_id` is `pgtype.UUID`.
-`PeerEndpointFromDiscovery` requires bound positive state and derives IP:5009
-solely from `vmd_addr`. The registered `proxy_addr` must match that IP and port;
-a missing or mismatched advertisement fails discovery instead of redirecting it.
-Configure `PEER_PROXY_LISTEN_ADDR` to that endpoint before enabling forwarding.
-Custom listener IPs or ports remain supported for non-forwarding use only.
-An incarnation with no
-heartbeat after rebind is unavailable. The later forwarding change should fold
-these fields into its existing ownership query, carry the validated generation
-through `SandboxRoute`, and pass it unchanged into `PeerEndpoint`. Do not add a
-second lookup per request. Router-to-peer integration testing belongs to that
-consumer change. The pool's generation comparisons and retained high-water marks
-remain unchanged.
+The ownership resolver first recognizes exact local ownership using the proxy's
+configured `HOST_ID`, returning a local route without peer endpoint metadata.
+For remote owners, `PeerEndpointFromDiscovery` requires bound positive state and
+derives IP:5009 solely from `vmd_addr`. The registered `proxy_addr` must match that
+IP and port; a missing or mismatched advertisement fails discovery instead of
+redirecting it. Configure `PEER_PROXY_LISTEN_ADDR` on each remote destination
+before enabling forwarding from its sources. Custom listener IPs or ports remain
+supported for non-forwarding use only. An incarnation with no heartbeat after
+rebind is unavailable for remote forwarding.
+
+The resolver carries the validated remote generation through `SandboxRoute`, and
+the router passes it unchanged into `PeerEndpoint` without a second lookup. Local
+routes bypass remote-route normalization and never open a peer stream. The pool's
+generation comparisons and retained high-water marks remain unchanged.
 
 Before enabling public cross-host routing, also complete the database credential
 and capacity prerequisites in [proxy-routing-capacity.md](proxy-routing-capacity.md).

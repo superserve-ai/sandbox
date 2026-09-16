@@ -56,6 +56,11 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Run proxy ownership database contracts
+        env:
+          PEER_ROUTING_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
+        run: go test -v -count=1 -race ./internal/proxy/... ./cmd/proxy/...
+
       - name: Run integration tests
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
