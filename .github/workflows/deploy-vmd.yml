@@ -1,6 +1,7 @@
 # Deploy VMD — control plane VMs.
 #
-# Production NEVER deploys without staging first — same discipline as Deploy API.
+# Staging runs first; manual production standby deploys may skip an absent
+# staging standby. Serving deployments still require staging to succeed.
 # The deploy-production job reuses the same step body as deploy-staging; env vars
 # like GCP_PROJECT resolve per-environment from GitHub environment vars.
 # The us-west2 cell host deploys as a final production step, after the
@@ -18,6 +19,22 @@ on:
         options:
           - staging
           - production
+      target:
+        description: 'Host target (applies to staging first, then the selected production cell)'
+        required: true
+        type: choice
+        default: standby
+        options:
+          - standby
+          - serving
+      cell:
+        description: 'Production cell (ignored for staging; use4 standby is not provisioned yet)'
+        required: true
+        type: choice
+        default: usw2
+        options:
+          - usw2
+          - use4
   push:
     branches: [main]
     paths:
@@ -36,6 +53,7 @@ on:
       - 'internal/builder/**'
       - 'internal/db/**'
       - 'internal/egresspolicy/**'
+      - 'internal/hostidentity/**'
       - 'internal/network/**'
       - 'internal/presence/**'
       - 'internal/preview/**'
@@ -71,6 +89,7 @@ on:
       # asset changes — leaving that host on stale binaries.
       - '.github/workflows/deploy-vmd.yml'
       - '.github/workflows/scripts/deploy-vmd.py'
+      - '.github/workflows/scripts/select-deploy-target.sh'
 
 # Serialize runs rather than canceling: deploy-vmd.py stops vmd, rewrites
 # /etc/sandbox/vmd.env, and restarts it non-atomically across several steps
@@ -84,7 +103,27 @@ concurrency:
   cancel-in-progress: false
   queue: max
 
+# Push runs ignore manual selectors and retain the environment's serving label.
+env:
+  DEPLOY_EVENT: ${{ github.event_name }}
+  DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+  DEPLOY_TARGET: ${{ inputs.target }}
+  DEPLOY_PRODUCTION_CELL: ${{ inputs.cell }}
+
 jobs:
+  migration-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require host identity rollout readiness for push deployments
+        env:
+          DEPLOY_EVENT: ${{ github.event_name }}
+          ROLLOUT_READY: ${{ vars.HOST_IDENTITY_ROLLOUT_READY }}
+        run: |
+          if [ "$DEPLOY_EVENT" = push ] && [ "$ROLLOUT_READY" != true ]; then
+            echo 'Host identity migration is not complete; use the coordinated manual rollout procedure.' >&2
+            exit 1
+          fi
+
   # Failing CI must not reach production control-plane hosts. CI is a
   # separate workflow, so `needs:` can't reach it directly — poll the
   # same-SHA run instead, same pattern as Deploy API's wait-for-migrations.
@@ -126,7 +165,7 @@ jobs:
 
   deploy-staging:
     runs-on: ubuntu-latest
-    needs: [wait-for-ci]
+    needs: [wait-for-ci, migration-gate]
     environment: staging
     permissions:
       contents: read
@@ -165,6 +204,10 @@ jobs:
       # fan-out — the cell deploys sequentially after production below.
       - name: Discover and deploy to VMD instances
         env:
+          CONTROL_PLANE_URL: ${{ vars.CONTROL_PLANE_URL_STAGING }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL_STAGING }}
+          INTERNAL_API_TOKEN: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
+          DEPLOY_CELL: staging
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
@@ -215,6 +258,30 @@ jobs:
           OTEL_ENVIRONMENT: staging
           MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
+          source .github/workflows/scripts/select-deploy-target.sh
+          # Only an absent staging standby is optional. Discovery errors and
+          # existing but stopped/misconfigured hosts must still fail closed.
+          if [ "${DEPLOY_EVENT:-}" = workflow_dispatch ] && \
+             [ "${DEPLOY_ENVIRONMENT:-}" = production ] && \
+             [ "${DEPLOY_TARGET:-standby}" = standby ] && [ "$DEPLOY_CELL" = staging ]; then
+            : "${GCP_PROJECT:?Refusing standby discovery without a project}"
+            standby_zones=$(gcloud compute instances list \
+              --project="$GCP_PROJECT" --filter="labels.${VMD_LABEL}" \
+              --format='value(zone)')
+            staging_standby_present=false
+            while IFS= read -r zone; do
+              case "${zone##*/}" in
+                "$GCP_REGION"-*) staging_standby_present=true ;;
+              esac
+            done <<< "$standby_zones"
+            if [ "$staging_standby_present" = false ]; then
+              echo 'No staging standby found; continuing to the selected production standby.'
+              exit 0
+            fi
+          fi
+          : "${CONTROL_PLANE_URL:?CONTROL_PLANE_URL_STAGING is unset — refusing to deploy without it}"
+          : "${DATABASE_URL:?DATABASE_URL_STAGING is unset — refusing to deploy without it}"
+          : "${INTERNAL_API_TOKEN:?STAGING_INTERNAL_API_TOKEN is unset — refusing to deploy without it}"
           python3 .github/workflows/scripts/deploy-vmd.py
 
   deploy-production:
@@ -257,12 +324,14 @@ jobs:
       # routes there — so it deploys FIRST, before the usw secondary cell. A
       # failure or zero-match in usw must not stop the job and leave the public
       # host on old vmd/boxd/secretsproxy binaries. Reuses the binaries built
-      # above. Unguarded: use4 is the permanent primary, so a missing
+      # above. On push, use4 is the permanent primary, so a missing
       # CLOUD_RUN_SERVICE_USE4/GCP_REGION_USE4 must fail the deploy rather than
       # silently skip the only primary-host rollout. Discovery is the VMD_LABEL
       # filter scoped to GCP_REGION_USE4 (deploy-vmd.py fails on zero matches).
       - name: Deploy to use4 cell VMD instances
+        if: github.event_name != 'workflow_dispatch' || inputs.cell == 'use4'
         env:
+          DEPLOY_CELL: use4
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
@@ -316,13 +385,14 @@ jobs:
           INTERNAL_API_TOKEN: ${{ secrets.PROD_INTERNAL_API_TOKEN }}
           MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
+          source .github/workflows/scripts/select-deploy-target.sh
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match. use4 is the permanent
           # primary, so a missing GCP_REGION_USE4 must abort, not run unscoped.
           : "${GCP_REGION:?GCP_REGION_USE4 is unset — refusing an unscoped use4 primary fan-out}"
           # deploy-vmd.py treats an empty CONTROL_PLANE_URL/DATABASE_URL/
           # INTERNAL_API_TOKEN as "skip, leave the host's existing value alone" —
-          # the right behavior for staging/unprovisioned hosts, but silently
+          # supported for already-configured hosts, but silently
           # deploying-and-reporting-success while these are unset on a
           # production host is exactly the failure mode this workflow exists
           # to prevent. Fail closed rather than skip.
@@ -339,8 +409,9 @@ jobs:
       # scoped to GCP_REGION_USW, so the cell host must carry the label; zero
       # matches fails the deploy rather than silently skipping the cell.
       - name: Deploy to usw cell VMD instances
-        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        if: (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != '') || (github.event_name == 'workflow_dispatch' && (inputs.cell == 'usw2' || inputs.cell == ''))
         env:
+          DEPLOY_CELL: usw2
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USW }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
@@ -420,6 +491,7 @@ jobs:
           OTEL_ENVIRONMENT: production
           MAINTENANCE_ALERT_WEBHOOK: ${{ secrets.MAINTENANCE_ALERT_WEBHOOK }}
         run: |
+          source .github/workflows/scripts/select-deploy-target.sh
           # Fail closed: an empty GCP_REGION makes deploy-vmd.py drop the region
           # filter and fan out to every VMD_LABEL match — which would push
           # usw's DATABASE_URL/CONTROL_PLANE_URL/INTERNAL_API_TOKEN onto the

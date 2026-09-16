@@ -1,8 +1,15 @@
+# Two-phase rollout: leave PEER_ROUTING_ENABLED (staging) and production variables
+# PEER_ROUTING_ENABLED_USE4 / PEER_ROUTING_ENABLED_USW unset while deploying ingress
+# to every owner in every reachable region. Enable each cell independently
+# with value 1 only after all ingress deployments and readiness checks succeed.
+# On partial failure keep routing disabled and complete the ingress rollout.
+# Before removing ingress or rolling back to an older binary, disable routing
+# across the fleet first. Never enable routing in the initial ingress deployment.
 # Deploy Proxy — edge proxy on the VMD hosts.
 #
-# Production NEVER deploys without staging first. Same pattern as Deploy API /
-# Deploy VMD. The us-west2 cell host deploys as a final production step,
-# after the primary region succeeds — same shape as Deploy API's usw steps.
+# Staging runs first; production standby deploys may skip an absent staging
+# standby, matching Deploy VMD. Normal deployments run west after the primary
+# region succeeds — same shape as Deploy API's usw steps.
 
 name: Deploy Proxy
 
@@ -24,6 +31,22 @@ on:
         options:
           - staging
           - production
+      target:
+        description: 'Host target'
+        required: true
+        type: choice
+        default: serving
+        options:
+          - serving
+          - standby
+      production_cell:
+        description: 'Production cell for manual deployments'
+        required: true
+        type: choice
+        default: usw2
+        options:
+          - usw2
+          - use4
   push:
     branches: [main]
     paths:
@@ -31,10 +54,12 @@ on:
       # it merges without deploying. Enforced by the deploy-trigger-coverage CI
       # check against `go list -deps`.
       - 'cmd/proxy/**'
+      - 'cmd/check-legacy-heartbeat/**'
       - 'internal/analytics/**'
       - 'internal/auth/**'
       - 'internal/preview/**'
       - 'internal/proxy/**'
+      - 'internal/db/**'
       - 'internal/sentrylog/**'
       - 'internal/telemetry/**'
       - 'internal/vmdclient/**'
@@ -44,9 +69,30 @@ on:
       - 'deploy/proxy.service'
       - '.github/workflows/deploy-proxy.yml'
       - '.github/workflows/scripts/deploy-proxy.py'
+      - '.github/workflows/scripts/select-deploy-target.sh'
+
+env:
+  DEPLOY_EVENT: ${{ github.event_name }}
+  DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+  DEPLOY_TARGET: ${{ inputs.target || 'serving' }}
+  DEPLOY_PRODUCTION_CELL: ${{ inputs.production_cell || 'usw2' }}
 
 jobs:
+  migration-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require host identity readiness for automatic rollout
+        env:
+          DEPLOY_EVENT: ${{ github.event_name }}
+          ROLLOUT_READY: ${{ vars.HOST_IDENTITY_ROLLOUT_READY }}
+        run: |
+          if [ "$DEPLOY_EVENT" = push ] && [ "${ROLLOUT_READY:-}" != true ]; then
+            echo 'Host identity migration is not complete; use the coordinated manual rollout procedure.' >&2
+            exit 1
+          fi
+
   deploy-staging:
+    needs: [migration-gate]
     runs-on: ubuntu-latest
     environment: staging
     permissions:
@@ -66,6 +112,7 @@ jobs:
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/proxy ./cmd/proxy
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/check-legacy-heartbeat ./cmd/check-legacy-heartbeat
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -81,12 +128,14 @@ jobs:
       # fan-out — the cell deploys sequentially after production below.
       - name: Discover and deploy proxy to VMD instances
         env:
+          DEPLOY_CELL: staging
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
+          PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_STAGING }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_STAGING }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_STAGING }}
           # Enables the proxy's OTLP exporter (host-local collector) so the
@@ -94,16 +143,26 @@ jobs:
           OTEL_ENVIRONMENT: staging
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_STAGING }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_STAGING }}
-          # Set the identity only after bootstrap provisions every target host.
-          # Inbound ingress is a separate opt-in; outbound clients still need credentials.
-          PEER_PROXY_LISTEN_ADDR: ${{ vars.PEER_PROXY_LISTEN_ADDR_STAGING }}
+          # Bootstrap owns each host's identity and certificate paths.
+          # Host 1 retains its legacy peer configuration.
+          # Require bootstrap only after this cell's operator-run migration.
+          PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_STAGING == 'true' && 'superserve-vmd-staging-2' || '' }}
+          # Routing-enabled hosts must remain reachable by their peers.
+          PEER_PROXY_LISTEN_ADDR: ${{ vars.PEER_ROUTING_ENABLED == '1' && 'auto' || vars.PEER_PROXY_LISTEN_ADDR_STAGING }}
           PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
-          PEER_PROXY_SPIFFE_URI: ${{ vars.PEER_PROXY_SPIFFE_URI_STAGING }}
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
         run: |
+          if [ "$DEPLOY_EVENT" = workflow_dispatch ] && [ "$DEPLOY_TARGET" = standby ]; then
+            source .github/workflows/scripts/select-deploy-target.sh
+          elif [ "$DEPLOY_TARGET" != serving ] && [ "$DEPLOY_EVENT" = workflow_dispatch ]; then
+            echo 'Invalid deploy target' >&2
+            exit 1
+          fi
+          : "${GCP_REGION:?Refusing an unscoped proxy deployment}"
           python3 .github/workflows/scripts/deploy-proxy.py
 
   deploy-production:
@@ -128,6 +187,7 @@ jobs:
         run: |
           mkdir -p bin
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o bin/proxy ./cmd/proxy
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/check-legacy-heartbeat ./cmd/check-legacy-heartbeat
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -141,35 +201,45 @@ jobs:
       # us-east4 is the "use" cell's primary host (api.superserve.ai routes to
       # the use-cell control plane there). It deploys FIRST so a usw-cell failure
       # below can't leave the primary host on a stale proxy. Reuses the primary
-      # proxy env (domain + seed) since it is the same cell. Unguarded: use4 is
+      # proxy env (domain + seed) since it is the same cell. For normal deploys, use4 is
       # the permanent primary, so a missing GCP_REGION_USE4 must fail the deploy
       # rather than silently skip the only primary-host proxy rollout
       # (deploy-proxy.py fails on zero VMD_LABEL matches).
       - name: Deploy proxy to us-east4 use-cell VMD instance
+        if: github.event_name != 'workflow_dispatch' || inputs.production_cell == 'use4'
         env:
+          DEPLOY_CELL: use4
+          # Host 3 requires managed identity regardless of its serving role.
+          PEER_IDENTITY_HOSTS: superserve-vmd-use4-3
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
+          PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_PROD }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_PROD }}
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_PROD }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          # Keep ingress enabled independently through routing enable/disable rollout.
+          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED_USE4 == '1' || vars.PEER_INGRESS_ENABLED_PROD == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
+          PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
-          PEER_PROXY_SPIFFE_URI: ${{ vars.PEER_PROXY_SPIFFE_URI_PROD }}
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED_USE4 }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
-          # Fail closed: an empty GCP_REGION makes deploy-proxy.py drop the region
-          # filter and apply the primary proxy env (prod domain + seed) to every
-          # VMD_LABEL match. use4 is the permanent primary, so a missing
-          # GCP_REGION_USE4 must abort, not run unscoped.
-          : "${GCP_REGION:?GCP_REGION_USE4 is unset — refusing an unscoped use4 primary proxy fan-out}"
+          if [ "$DEPLOY_EVENT" = workflow_dispatch ] && [ "$DEPLOY_TARGET" = standby ]; then
+            source .github/workflows/scripts/select-deploy-target.sh
+          elif [ "$DEPLOY_TARGET" != serving ] && [ "$DEPLOY_EVENT" = workflow_dispatch ]; then
+            echo 'Invalid deploy target' >&2
+            exit 1
+          fi
+          : "${GCP_REGION:?Refusing an unscoped proxy deployment}"
           python3 .github/workflows/scripts/deploy-proxy.py
 
       # The usw cell deploys as a step in this job — not a separate job —
@@ -177,7 +247,7 @@ jobs:
       # this way: a second job referencing the production environment would
       # double any approval gate. Running after the primary step means a bad
       # rollout stops at the primary, and the step reuses the binary built
-      # above (build once, deploy per region). Skipped until
+      # above (build once, deploy per region). On push, skipped until
       # CLOUD_RUN_SERVICE_USW (the repo-level cell-exists flag) is set.
       # Discovery is the same VMD_LABEL filter scoped to GCP_REGION_USW, so
       # the cell host must carry the label; zero matches fails the deploy
@@ -192,25 +262,39 @@ jobs:
       # would break every access token in the cell. The seed is fetched at
       # deploy time so Secret Manager stays the single source of truth.
       - name: Deploy proxy to usw cell VMD instances
-        if: vars.CLOUD_RUN_SERVICE_USW != ''
+        if: (github.event_name == 'workflow_dispatch' && (inputs.production_cell == 'usw2' || inputs.production_cell == '')) || (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != '')
         env:
+          DEPLOY_CELL: usw2
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION_USW }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
           SHA: ${{ github.sha }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
+          PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_USWEST }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USW }}
+          # Production opts in separately after its staging-proven migration.
+          PEER_IDENTITY_HOSTS: ${{ vars.HOST2_PEER_IDENTITY_READY_USW == 'true' && 'superserve-vmd-usw2-2' || '' }}
           OTEL_ENVIRONMENT: production
           PROXY_DOMAINS: ${{ vars.PROXY_DOMAINS_USW }}
           REQUIRE_DATA_PLANE: ${{ vars.REQUIRE_DATA_PLANE_PROD }}
+          # Keep ingress enabled independently through routing enable/disable rollout.
+          PEER_PROXY_LISTEN_ADDR: ${{ (vars.PEER_ROUTING_ENABLED_USW == '1' || vars.PEER_INGRESS_ENABLED_USW == '1' || (github.event_name == 'workflow_dispatch' && inputs.target == 'standby')) && 'auto' || '' }}
+          PEER_PROXY_TARGET_ADDR: "127.0.0.1:5010"
           PEER_PROXY_CERT_FILE: "/etc/superserve/peer/tls.crt"
           PEER_PROXY_KEY_FILE: "/etc/superserve/peer/tls.key"
           PEER_PROXY_CA_FILE: "/etc/superserve/peer/ca.crt"
-          PEER_PROXY_SPIFFE_URI: ${{ vars.PEER_PROXY_SPIFFE_URI_USWEST }}
+          PEER_ROUTING_ENABLED: ${{ vars.PEER_ROUTING_ENABLED_USW }}
           PEER_PROXY_MAX_STREAMS: ${{ vars.PEER_PROXY_MAX_STREAMS }}
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
+          if [ "$DEPLOY_EVENT" = workflow_dispatch ] && [ "$DEPLOY_TARGET" = standby ]; then
+            source .github/workflows/scripts/select-deploy-target.sh
+          elif [ "$DEPLOY_TARGET" != serving ] && [ "$DEPLOY_EVENT" = workflow_dispatch ]; then
+            echo 'Invalid deploy target' >&2
+            exit 1
+          fi
+          : "${GCP_REGION:?Refusing an unscoped proxy deployment}"
           SANDBOX_ACCESS_TOKEN_SEED=$(gcloud secrets versions access latest \
             --secret=sandbox-access-token-seed --project "$GCP_PROJECT")
           export SANDBOX_ACCESS_TOKEN_SEED

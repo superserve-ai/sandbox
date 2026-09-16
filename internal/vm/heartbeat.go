@@ -28,6 +28,7 @@ import (
 const overlayStorageSampleInterval = 5 * time.Minute
 
 type HeartbeatConfig struct {
+	IncarnationID     string
 	ControlPlaneURL   string
 	HostID            string
 	Token             string
@@ -110,7 +111,8 @@ func StartHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger
 	go pressureLoop(ctx, client, cfg, pressureURL, cfg.Token, pressureKick, log)
 	endpointAcknowledged := false
 	heartbeatAccepted := func() {
-		if !endpointAcknowledged && buildHeartbeatRequest(cfg, nil, nil).ProxyAddr != "" {
+		// A bound host also needs an acknowledgement when clearing its endpoint.
+		if !endpointAcknowledged && (cfg.IncarnationID != "" || buildHeartbeatRequest(cfg, nil, nil).ProxyAddr != "") {
 			log.Info().Str("host_id", cfg.HostID).Str("proxy_addr", cfg.ProxyAddr).
 				Msg("host endpoint heartbeat accepted")
 			endpointAcknowledged = true
@@ -182,6 +184,7 @@ func pressureLoop(ctx context.Context, client *http.Client, cfg HeartbeatConfig,
 // not match the host row, so a reclaimed-away daemon cannot overwrite
 // the new holder's numbers.
 type pressureRequest struct {
+	IncarnationID         string `json:"incarnation_id,omitempty"`
 	VMDAddr               string `json:"vmd_addr"`
 	RunningSandboxes      int32  `json:"running_sandboxes"`
 	ProvisioningSandboxes int32  `json:"provisioning_sandboxes"`
@@ -223,6 +226,7 @@ func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig,
 	}
 	p := cfg.Pressure()
 	body, err := json.Marshal(pressureRequest{
+		IncarnationID:         cfg.IncarnationID,
 		VMDAddr:               cfg.VMDAddr,
 		RunningSandboxes:      p.RunningSandboxes,
 		ProvisioningSandboxes: p.ProvisioningSandboxes,
@@ -273,6 +277,7 @@ func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig,
 }
 
 type heartbeatRequest struct {
+	IncarnationID     string                        `json:"incarnation_id,omitempty"`
 	Capabilities      []string                      `json:"capabilities"`
 	Storage           []heartbeatStorageMeasurement `json:"storage,omitempty"`
 	VMDAddr           string                        `json:"vmd_addr,omitempty"`
@@ -459,8 +464,9 @@ func isStorageFieldUnsupported(body []byte) bool {
 
 func buildHeartbeatRequest(cfg HeartbeatConfig, capabilities []string, storage []heartbeatStorageMeasurement) heartbeatRequest {
 	req := heartbeatRequest{
-		Capabilities: capabilities,
-		Storage:      storage,
+		IncarnationID: cfg.IncarnationID,
+		Capabilities:  capabilities,
+		Storage:       storage,
 	}
 	if cfg.VMDAddr != "" && cfg.ProxyAddr != "" && cfg.Region != "" &&
 		cfg.CapacityMemoryMib > 0 && cfg.CapacityVcpus > 0 {

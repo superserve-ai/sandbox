@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.7.0"
 
   backend "gcs" {
     bucket = "superserve-terraform-state"
@@ -7,11 +7,20 @@ terraform {
   }
 
   required_providers {
+    google-beta = {
+      source  = "hashicorp/google-beta"
+      version = "= 8.2.0"
+    }
     google = {
       source  = "hashicorp/google"
       version = "~> 7.0"
     }
   }
+}
+
+provider "google-beta" {
+  project = local.project_id
+  region  = local.region
 }
 
 provider "google" {
@@ -140,6 +149,11 @@ module "iam" {
     # Prod's CD SA already carries networkAdmin.
     cd_network_admin = {
       role    = "roles/compute.networkAdmin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    # Bootstrap this grant before a full plan can refresh existing CA resources.
+    cd_privateca_auditor = {
+      role    = "roles/privateca.auditor"
       members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
     }
     grafana_monitoring_viewer = {
@@ -382,14 +396,16 @@ module "sandbox_host" {
 }
 
 # Second vmd host for the staging cell. Same image and shape as the first so
-# the two are interchangeable, and labeled component=vmd from creation so
-# every deploy that discovers hosts by label reaches both.
+# the two are interchangeable and receive routine deployments. Exclude Host 2
+# explicitly in a reviewed maintenance plan before any identity migration.
 #
 # The host self-registers as provisioning and stays invisible to placement
 # until an operator activates it, so creating it changes nothing for the cell
 # until that deliberate step.
 module "sandbox_host_b" {
-  source = "../../../modules/sandbox-host"
+  source                    = "../../../modules/managed-identity-host"
+  managed_workload_identity = module.peer_identity.creation_identity
+  sandbox_data_disk         = google_compute_disk.sandbox_data_b.id
 
   project_id    = local.project_id
   environment   = local.environment
@@ -407,9 +423,11 @@ module "sandbox_host_b" {
     sandbox_role = "vmd"
   })
 
-  service_account_email = module.iam.service_account_emails["superserve_api"]
-  boot_disk_image       = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
-  boot_disk_size_gb     = 200
+  service_account_email     = google_service_account.vmd_runtime.email
+  allow_stopping_for_update = true
+  depends_on                = [google_project_iam_member.vmd_telemetry, google_storage_bucket_iam_member.vmd_backup, google_service_account_iam_member.vmd_deploy_act_as]
+  boot_disk_image           = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
+  boot_disk_size_gb         = 200
   # Declared explicitly so both hosts use the same boot disk type; the
   # module's own default is the API's pd-standard.
   boot_disk_type = "pd-ssd"
@@ -557,15 +575,11 @@ resource "google_compute_disk" "sandbox_data_b" {
   }
 }
 
-resource "google_compute_attached_disk" "sandbox_data_b" {
-  project     = local.project_id
-  zone        = local.zone
-  disk        = google_compute_disk.sandbox_data_b.id
-  instance    = module.sandbox_host_b.instance_self_link
-  device_name = "superserve-sandbox-data"
-  mode        = "READ_WRITE"
-
-  deletion_policy = "PREVENT"
+# Attachment is now owned by the VM create request. Forget the standalone
+# record without detaching or deleting the independently protected data disk.
+removed {
+  from = google_compute_attached_disk.sandbox_data_b
+  lifecycle { destroy = false }
 }
 
 module "observability" {
@@ -577,6 +591,7 @@ module "observability" {
   # validates the queries before they matter. The disabled-host alert
   # stays off here: staging toggles BACKUP_BUCKET deliberately.
   backup_alerts = {
+    collector_host_id   = module.sandbox_host.instance_name
     host_id             = module.sandbox_host.instance_name
     display_prefix      = "Backup / ${module.sandbox_host.instance_name}"
     alert_disabled_host = false

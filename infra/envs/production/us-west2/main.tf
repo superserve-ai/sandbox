@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.7.0"
 
   backend "gcs" {
     bucket = "superserve-terraform-state-prod"
@@ -71,6 +71,8 @@ locals {
   # looks identical to a healthy host.
   #
   # Verify against the host before changing: grep '^HOST_ID=' /etc/sandbox/vmd.env
+  # The standby's id is the installed host identity (slot name plus a
+  # generated suffix), set in tfvars from that same grep.
   #
   # Deliberately NOT the same as active_host_name, and the two must not be
   # merged: the host-local collector stamps its own HOST_ID (the instance name,
@@ -78,7 +80,7 @@ locals {
   # host-level series like filesystem utilization carry the instance name while
   # vmd's own OTLP series carry vmd's HOST_ID. One machine, two host_id values,
   # depending on which process emitted the metric.
-  metrics_host_id = var.active_sandbox_host == "standby" ? "usw2-2" : "usw2"
+  metrics_host_id = var.active_sandbox_host == "standby" ? var.standby_host_id : "usw2"
 
   # Exactly one host carries component=vmd, the label the shared deploy
   # pipeline discovers; the other is parked under a cell-scoped label so
@@ -109,6 +111,17 @@ module "network" {
   vpc_connector_subnet_ip     = var.connector_subnet_cidr
 
   firewall_rules = {
+    peer_ingress = {
+      name        = "superserve-usw2-allow-peer-ingress"
+      direction   = "INGRESS"
+      source_tags = ["vmd-use4", "vmd-usw2"]
+      target_tags = ["vmd-usw2"]
+      allow = [{
+        protocol = "tcp"
+        ports    = ["5009"]
+      }]
+      description = "Allow private mTLS forwarding between production VMD hosts."
+    }
     allow_vmd_grpc = {
       name          = "superserve-usw2-allow-cr-vmd"
       direction     = "INGRESS"
@@ -285,9 +298,13 @@ module "sandbox_host" {
   zone          = local.zone
   instance_name = "superserve-vmd-${local.resource_suffix}"
   machine_type  = var.machine_type
-  subnet        = module.network.subnetwork_self_link
-  internal_ip   = "10.1.0.2"
-  tags          = ["vmd-usw2"]
+  # Held by Terraform only for this host. Park it in an apply of its own,
+  # after the promotion has applied: the control plane's address switch
+  # and this stop have no ordering in one apply.
+  desired_status = var.primary_host_running ? "RUNNING" : "TERMINATED"
+  subnet         = module.network.subnetwork_self_link
+  internal_ip    = "10.1.0.2"
+  tags           = ["vmd-usw2"]
   labels = merge(local.sandbox_host_labels, {
     component                  = local.primary_component
     sandbox_role               = "vmd"
@@ -392,9 +409,11 @@ module "sandbox_host_b" {
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
-  service_account_email = data.google_service_account.api_runner.email
-  boot_disk_image       = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
-  boot_disk_size_gb     = 250
+  service_account_email     = google_service_account.vmd_runtime.email
+  allow_stopping_for_update = true
+  depends_on                = [google_project_iam_member.vmd_telemetry, google_storage_bucket_iam_member.vmd_backup, google_service_account_iam_member.vmd_deploy_act_as]
+  boot_disk_image           = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  boot_disk_size_gb         = 250
   # Metal machine types reject the API-default pd-standard boot disk.
   boot_disk_type      = "hyperdisk-balanced"
   can_ip_forward      = false
@@ -408,15 +427,13 @@ module "sandbox_host_b" {
 
 # The standby's own background-data disk — see sandbox_data above for
 # why every host carrying the "vmd" deploy label needs one, and for why
-# hyperdisk-balanced (this is a Z3 metal host too). Sized the same as
-# the primary's: on promotion this host takes over the same traffic, so
-# the same headroom math applies.
+# hyperdisk-balanced (this is a Z3 metal host too). Hyperdisks only grow.
 resource "google_compute_disk" "sandbox_data_b" {
   project = local.project_id
   name    = "superserve-vmd-usw2-2-sandbox-data"
   zone    = local.zone
   type    = "hyperdisk-balanced"
-  size    = 1024
+  size    = 4096
 
   labels = merge(local.common_labels, {
     component = "vmd"
@@ -466,16 +483,22 @@ module "observability" {
       instance_name = module.sandbox_host.instance_name
       instance_id   = module.sandbox_host.instance_id
     }
+    sandbox_host_b = {
+      display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / host maintenance event"
+      instance_name = module.sandbox_host_b.instance_name
+      instance_id   = module.sandbox_host_b.instance_id
+    }
   }
-  # Backup pipeline alerts scoped to this cell's host via the host_id
-  # metric label (HOST_ID on the host matches the instance name). Follows
+  # Backup alerts use the stable collector identity plus the legacy host_id
+  # selector while older collectors roll forward. Follows
   # active_sandbox_host so a standby promotion keeps the filter on whichever
   # host is actually emitting.
   # Thresholds are the module defaults except oldest_pending_age_duration;
   # the rationale for each default sits on the module's variables.
   backup_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Backup / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Backup / ${local.active_host_name}"
     # A share of this cell's traffic pauses in scheduled batches rather
     # than steadily, confirmed via backup_journal_pending{priority="pause"}
     # and the control plane's pause-endpoint request log. The module
@@ -510,8 +533,9 @@ module "observability" {
   # they mean "the controller engaged and still lost", not "the controller is
   # doing its job" — move them together with the ceiling or not at all.
   launch_path_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Launch path / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Launch path / ${local.active_host_name}"
   }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
   # the same host_id label the backup metrics use, and following

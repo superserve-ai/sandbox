@@ -79,6 +79,8 @@ type OTelRecorder struct {
 	resumeSettleWaitDuration metric.Float64Histogram
 	resumeSettleWaitReads    metric.Int64Histogram
 	vmdCalls                 metric.Int64Counter
+	routingOutcomes          metric.Int64Counter
+	ownershipLookupDuration  metric.Float64Histogram
 	vmdDuration              metric.Float64Histogram
 	hostResolutionDuration   metric.Float64Histogram
 	capacityShadowDuration   metric.Float64Histogram
@@ -116,6 +118,10 @@ type OTelRecorder struct {
 	launcherReady            metric.Int64Gauge
 	peerIngressEvents        metric.Int64Counter
 	peerIngressDuration      metric.Float64Histogram
+	peerConnections          metric.Int64UpDownCounter
+	peerStreams              metric.Int64UpDownCounter
+	peerEvents               metric.Int64Counter
+	peerHandshakeDuration    metric.Float64Histogram
 }
 
 // NewOTelRecorder constructs an OTLP/HTTP metrics recorder. Call Shutdown on
@@ -166,6 +172,12 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.vmdCalls, err = meter.Int64Counter("vmd_call_total"); err != nil {
+		return nil, err
+	}
+	if r.ownershipLookupDuration, err = meter.Float64Histogram("proxy_ownership_lookup_duration_seconds", metric.WithUnit("s"), metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if r.routingOutcomes, err = meter.Int64Counter("proxy_routing_outcome_total"); err != nil {
 		return nil, err
 	}
 	if r.hostResolutionDuration, err = meter.Float64Histogram("host_resolution_duration_seconds",
@@ -263,7 +275,48 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	if r.launcherReady, err = meter.Int64Gauge("vmd_launcher_ready"); err != nil {
 		return nil, err
 	}
+	if r.peerConnections, err = meter.Int64UpDownCounter("peer_connections"); err != nil {
+		return nil, err
+	}
+	if r.peerStreams, err = meter.Int64UpDownCounter("peer_active_streams"); err != nil {
+		return nil, err
+	}
+	if r.peerEvents, err = meter.Int64Counter("peer_events_total"); err != nil {
+		return nil, err
+	}
+	if r.peerHandshakeDuration, err = meter.Float64Histogram("peer_handshake_duration_seconds", metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
 	return r, nil
+}
+
+// RecordPeerEvent emits peer lifecycle observations with bounded enum labels.
+func (r *OTelRecorder) RecordPeerEvent(ctx context.Context, e PeerEvent) {
+	if r == nil {
+		return
+	}
+	attrs := metric.WithAttributes(r.attrs(attribute.String("kind", safePeerKind(e.Kind)), attribute.String("result", safeResult(e.Result)), attribute.String("region", safeRegion(e.Region)), attribute.String("host_id", safeHostID(e.HostID)), attribute.Bool("forced", e.Forced))...)
+	switch e.Kind {
+	case "connection":
+		r.peerConnections.Add(ctx, e.Delta, attrs)
+	case "stream":
+		r.peerStreams.Add(ctx, e.Delta, attrs)
+	case "handshake":
+		if e.Duration > 0 {
+			r.peerHandshakeDuration.Record(ctx, e.Duration.Seconds(), attrs)
+		}
+	default:
+		r.peerEvents.Add(ctx, 1, attrs)
+	}
+}
+
+func safePeerKind(v string) string {
+	switch v {
+	case "connection", "stream", "handshake", "reconnect", "failure", "drain":
+		return v
+	default:
+		return "unknown"
+	}
 }
 
 func (r *OTelRecorder) Shutdown(ctx context.Context) error {
@@ -327,6 +380,16 @@ func (r *OTelRecorder) RecordVMDCall(ctx context.Context, c VMDCall) {
 	if c.Duration > 0 {
 		r.vmdDuration.Record(ctx, c.Duration.Seconds(), opt)
 	}
+}
+
+func (r *OTelRecorder) RecordRoutingOutcome(ctx context.Context, o RoutingOutcome) {
+	if r == nil {
+		return
+	}
+	r.routingOutcomes.Add(ctx, 1, metric.WithAttributes(r.attrs(
+		attribute.String("outcome", safeRoutingOutcome(o.Outcome)),
+		attribute.String("host_id", safeHostID(o.HostID)),
+	)...))
 }
 
 // normalizeShadowResult and normalizeShadowAgreement keep metric labels
@@ -618,6 +681,15 @@ func safeResult(v string) string {
 	}
 }
 
+func safeRoutingOutcome(v string) string {
+	switch v {
+	case "local", "remote", "ownership_error", "peer_error", "not_found":
+		return v
+	default:
+		return "ownership_error"
+	}
+}
+
 func safeSettleResult(v string) string {
 	switch v {
 	case SettleResultSettled, SettleResultTimeout:
@@ -660,7 +732,7 @@ func safeRegion(v string) string {
 	if v == "" {
 		return "unknown"
 	}
-	return v
+	return boundedPeerLabel(v)
 }
 
 // safeLabel bounds a metric label: empty records as "unknown" rather than an
@@ -676,7 +748,19 @@ func safeHostID(v string) string {
 	if v == "" {
 		return "unknown"
 	}
-	return v
+	return boundedPeerLabel(v)
+}
+
+// Peer labels are caller-supplied identifiers; cap their size before they
+// cross the metrics boundary so malformed values cannot create oversized or
+// effectively unbounded series attributes.
+func boundedPeerLabel(v string) string {
+	const max = 64
+	r := []rune(v)
+	if len(r) > max {
+		r = r[:max]
+	}
+	return string(r)
 }
 
 // newOTLPMeterProvider builds the OTLP/HTTP exporter, resource, and
@@ -747,4 +831,17 @@ func buildOTelResource(cfg OTelConfig) (*resource.Resource, error) {
 			attribute.String("service.instance.id", cfg.InstanceID),
 		),
 	)
+}
+
+func (r *OTelRecorder) RecordOwnershipLookup(ctx context.Context, lookup OwnershipLookup) {
+	if r == nil {
+		return
+	}
+	result := lookup.Result
+	switch result {
+	case "success", "error", "timeout", "canceled":
+	default:
+		result = "error"
+	}
+	r.ownershipLookupDuration.Record(ctx, lookup.Duration.Seconds(), metric.WithAttributes(r.attrs(attribute.String("result", result), attribute.String("host_id", r.hostID))...))
 }

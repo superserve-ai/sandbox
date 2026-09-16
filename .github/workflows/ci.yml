@@ -23,6 +23,14 @@ jobs:
       - name: Run deploy-script tests
         run: python3 -m unittest discover -s .github/workflows/scripts -p 'test_*.py'
 
+      - name: Run host identity provisioning tests
+        run: python3 -m unittest discover -v -s deploy -p 'test_host_identity.py'
+
+      - name: Run peer identity bootstrap tests
+        run: |
+          python3 -m unittest discover -s deploy -p 'test_peer*.py'
+          python3 -m unittest discover -s infra/modules/peer-identity -p '*test*.py'
+
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest

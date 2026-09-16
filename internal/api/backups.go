@@ -29,11 +29,16 @@ var errFinalizeInFlight = errors.New("pause finalization in flight")
 // finalizeInFlight reports whether a FinalizePause may be about to commit
 // for this sandbox: 'pausing' on the normal pause path, 'resuming' on the
 // resume-revert path (pauseAndRevert finalizes a pause from that status).
-// Bounded by recency so a permanently stranded transition cannot
-// head-of-line-block the host's outbox forever.
-func finalizeInFlight(status string, updatedAt time.Time) bool {
-	return (status == "pausing" || status == "resuming") &&
-		time.Since(updatedAt) < 10*time.Minute
+// A transition without a pause operation is bounded so a stranded one cannot
+// head-of-line-block the host's outbox. One carrying an operation stays in
+// flight until the operation is resolved, however old its lease: the
+// reconciler finishes it, and only then can a report be matched to the
+// snapshot it describes.
+func finalizeInFlight(row db.LockSandboxRowRow) bool {
+	if row.Status != db.SandboxStatusPausing && row.Status != db.SandboxStatusResuming {
+		return false
+	}
+	return row.PauseOpID.Valid || time.Since(row.UpdatedAt) < 10*time.Minute
 }
 
 // maxBackupReportFiles bounds a report's manifest jsonb. Sandbox
@@ -242,7 +247,7 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 				return err
 			}
 			haveSandbox = err == nil
-			if haveSandbox && finalizeInFlight(string(sbRow.Status), sbRow.UpdatedAt) {
+			if haveSandbox && finalizeInFlight(sbRow) {
 				return errFinalizeInFlight
 			}
 		}
@@ -295,13 +300,10 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		// as retryable instead; redelivery re-records coverage
 		// idempotently and the link and size sync land once the finalize
 		// has committed.
-		// Time-bounded: a finalize that failed permanently leaves the
-		// sandbox stranded in a transitional status with no retry
-		// scheduled, and an unconditional 503 would head-of-line-block
-		// the host's outbox forever. A fresh transition retries; a stale
-		// one proceeds, and the identity checks below refuse exactly as
-		// for any other settled mismatch.
-		if finalizeInFlight(string(row.Status), row.UpdatedAt) {
+		// Bounded (see finalizeInFlight): a transition still being worked
+		// retries; a stranded one proceeds and the identity checks below
+		// refuse it like any other settled mismatch.
+		if finalizeInFlight(row) {
 			return errFinalizeInFlight
 		}
 		manifest, err := q.LatestSnapshotManifest(ctx, sandboxID)

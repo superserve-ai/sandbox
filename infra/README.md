@@ -10,8 +10,9 @@ The current Terraform-managed Compute Engine inventory for Vanta is:
 | Environment | Region | Instance | Status |
 | --- | --- | --- | --- |
 | staging | us-central1 | `superserve-vmd-staging` | Managed by Terraform |
-| production | us-west2 | `superserve-vmd-usw2` | Managed by Terraform |
-| production | us-west2 | `superserve-vmd-usw2-2` | Managed by Terraform (cold standby, normally stopped) |
+| production | us-west2 | `superserve-vmd-usw2` | Managed by Terraform (rollback host, kept running during promotion) |
+| production | us-west2 | `superserve-vmd-usw2-2` | Managed by Terraform (serving host after promotion) |
+| production | us-east4 | `superserve-vmd-use4-3` | Managed by Terraform (standby, provisioning) |
 | production | us-east4 | `superserve-vmd-use4-2` | Managed by Terraform |
 | production | us-central1 | none | Decommissioned, no Terraform-managed instance remains |
 

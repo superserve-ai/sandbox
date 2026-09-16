@@ -160,6 +160,31 @@ type PeerIngress struct {
 	Duration time.Duration
 }
 
+// PeerEvent records bounded peer-transport lifecycle telemetry. HostID and
+// Region are fleet-scoped; no endpoint, sandbox, user, or raw error values
+// belong here.
+type PeerEvent struct {
+	Kind     string
+	Result   string
+	Region   string
+	HostID   string
+	Delta    int64
+	Forced   bool
+	Duration time.Duration
+}
+
+// RoutingOutcome records one bounded public data-plane routing decision.
+// Callers must not attach sandbox, team, or user identifiers.
+type RoutingOutcome struct {
+	Outcome string // local | remote | ownership_error | peer_error
+	HostID  string
+}
+
+// RoutingOutcomeRecorder is optional so existing recorder fakes remain source-compatible.
+type RoutingOutcomeRecorder interface {
+	RecordRoutingOutcome(context.Context, RoutingOutcome)
+}
+
 // CapacityShadow is one shadow ranking evaluation: what capacity-based
 // placement WOULD have chosen, measured against what the live scheduler
 // actually did, plus how much of the fleet is describable at all.
@@ -206,6 +231,7 @@ type Recorder interface {
 	RecordLauncherState(context.Context, LauncherState)
 	RecordLatencyPhase(context.Context, LatencyPhase)
 	RecordPeerIngress(context.Context, PeerIngress)
+	RecordPeerEvent(context.Context, PeerEvent)
 }
 
 type noopRecorder struct{}
@@ -234,3 +260,16 @@ func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPr
 func (noopRecorder) RecordLauncherState(context.Context, LauncherState)                     {}
 func (noopRecorder) RecordLatencyPhase(context.Context, LatencyPhase)                       {}
 func (noopRecorder) RecordPeerIngress(context.Context, PeerIngress)                         {}
+func (noopRecorder) RecordPeerEvent(context.Context, PeerEvent)                             {}
+
+func (noopRecorder) RecordRoutingOutcome(context.Context, RoutingOutcome) {}
+
+// OwnershipLookup measures the synchronous routing lookup without per-sandbox labels.
+type OwnershipLookup struct {
+	Duration time.Duration
+	Result   string
+}
+
+type OwnershipLookupRecorder interface {
+	RecordOwnershipLookup(context.Context, OwnershipLookup)
+}

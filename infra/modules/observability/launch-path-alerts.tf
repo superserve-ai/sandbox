@@ -17,7 +17,12 @@ locals {
   # in the same change as its policy, so PromQL validation can never pass on
   # first apply. Threshold conditions skip that validation entirely and are
   # already the pattern the module's CPU policies use.
-  launch_path_filter_suffix = var.launch_path_alerts == null ? "" : " AND metric.labels.host_id = \"${var.launch_path_alerts.host_id}\""
+  launch_path_host_label = var.launch_path_alerts == null ? "" : coalesce(var.launch_path_alerts.collector_host_id, var.launch_path_alerts.host_id)
+  launch_path_filter_suffix = var.launch_path_alerts == null ? "" : (
+    var.launch_path_alerts.collector_host_id == null
+    ? " AND metric.labels.host_id = \"${var.launch_path_alerts.host_id}\""
+    : " AND (metric.labels.host_id = \"${var.launch_path_alerts.host_id}\" OR metric.labels.collector_host_id = \"${var.launch_path_alerts.collector_host_id}\")"
+  )
 
   launch_path_alert_conditions = var.launch_path_alerts == null ? {} : {
     launcher_not_ready = {
@@ -34,7 +39,7 @@ locals {
       aligner       = "ALIGN_MIN"
       duration      = var.launch_path_alerts.launcher_not_ready_duration
       documentation = <<-EOT
-        Firecracker launches on ${var.launch_path_alerts.host_id} are running on the legacy path (vmd_launcher_ready=0), so every VM start walks the host's full mount table instead of the pruned launcher namespace. Expect VM start latency in the hundreds of milliseconds to seconds, growing with the host's mount table, while creates still succeed and nothing errors.
+        Firecracker launches on ${local.launch_path_host_label} are running on the legacy path (vmd_launcher_ready=0), so every VM start walks the host's full mount table instead of the pruned launcher namespace. Expect VM start latency in the hundreds of milliseconds to seconds, growing with the host's mount table, while creates still succeed and nothing errors.
 
         Owner: Infrastructure Operations. Response: check vmd logs for "launcher pin rebuild failed" and "launcher pin not built" to see why the build is failing. Rebuilds retry every 5 minutes, so a policy that stays firing means the build fails repeatedly rather than transiently. Host mount-table size (vmd_network_mounts_total) is the usual aggravating factor; a vmd restart rebuilds the pin against the current table.
       EOT
@@ -54,7 +59,7 @@ locals {
       aligner       = "ALIGN_MAX"
       duration      = var.launch_path_alerts.netns_total_duration
       documentation = <<-EOT
-        ${var.launch_path_alerts.host_id} is carrying more than ${var.launch_path_alerts.netns_total_threshold} live network namespaces. Each contributes roughly two host mount-table entries, and that table is walked on every process start, every systemctl daemon-reload, and every ssh login — so deploys slow down, the host gets harder to reach, and the launcher pin build (which protects VM start latency) becomes more likely to fail.
+        ${local.launch_path_host_label} is carrying more than ${var.launch_path_alerts.netns_total_threshold} live network namespaces. Each contributes roughly two host mount-table entries, and that table is walked on every process start, every systemctl daemon-reload, and every ssh login — so deploys slow down, the host gets harder to reach, and the launcher pin build (which protects VM start latency) becomes more likely to fail.
 
         Owner: Infrastructure Operations. Response: confirm the paused-network reclaim controller is enabled and draining (vmd_network_slots_reclaimed_paused_total should be rising, vmd_network_netns_total falling). If the count is flat or rising while the controller is engaged, the per-pass reclaim cap is at or below the rate at which new namespaces are being created.
       EOT
@@ -74,7 +79,7 @@ locals {
       aligner       = "ALIGN_MAX"
       duration      = var.launch_path_alerts.netns_critical_duration
       documentation = <<-EOT
-        ${var.launch_path_alerts.host_id} has passed ${var.launch_path_alerts.netns_critical_threshold} live network namespaces. Unlike the sustained-growth policy, this fires quickly: at this level the reclaim controller has engaged and is losing to inflow, and the count typically keeps climbing rather than levelling off. Deploys, ssh logins, and the launcher pin build all degrade as the mount table grows, and a vmd restart in this state is likely to fail its pin build and leave every VM start on the slow path.
+        ${local.launch_path_host_label} has passed ${var.launch_path_alerts.netns_critical_threshold} live network namespaces. Unlike the sustained-growth policy, this fires quickly: at this level the reclaim controller has engaged and is losing to inflow, and the count typically keeps climbing rather than levelling off. Deploys, ssh logins, and the launcher pin build all degrade as the mount table grows, and a vmd restart in this state is likely to fail its pin build and leave every VM start on the slow path.
 
         Owner: Infrastructure Operations. Response: check whether the reclaim controller is draining at all (vmd_network_slots_reclaimed_paused_total rate) and compare it against the rate new namespaces are appearing. If the drain is running at its per-pass cap and still not winning, the cap (VMD_PAUSED_NETWORK_MAX_RECLAIMS) is the constraint. Confirm vmd_launcher_ready is still 1 before considering a restart.
       EOT

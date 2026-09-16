@@ -23,6 +23,96 @@ func TestSafeResultBoundsValues(t *testing.T) {
 	}
 }
 
+func TestPeerLabelsAreBounded(t *testing.T) {
+	long := "ひ" + "x" // ensure rune-aware truncation
+	for len([]rune(long)) <= 64 {
+		long += "x"
+	}
+	if got := safeHostID(long); len([]rune(got)) != 64 {
+		t.Fatalf("host label length = %d, want 64", len([]rune(got)))
+	}
+	if safeRegion("") != "unknown" {
+		t.Fatal("empty region should map to unknown")
+	}
+}
+
+func TestSafeRoutingOutcomeBoundsValues(t *testing.T) {
+	for _, outcome := range []string{"local", "remote", "ownership_error", "peer_error"} {
+		if got := safeRoutingOutcome(outcome); got != outcome {
+			t.Fatalf("safeRoutingOutcome(%q) = %q", outcome, got)
+		}
+	}
+	if got := safeRoutingOutcome("sandbox_id=secret"); got != "ownership_error" {
+		t.Fatalf("unexpected fallback outcome: %q", got)
+	}
+}
+
+func TestRecordRoutingOutcomeEmitsBoundedAttributes(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		if err := provider.Shutdown(ctx); err != nil {
+			t.Errorf("shutdown meter provider: %v", err)
+		}
+	})
+	counter, err := provider.Meter(instrumentationName).Int64Counter("proxy_routing_outcome_total")
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &OTelRecorder{
+		provider:        provider,
+		serviceName:     "sandbox-proxy",
+		environment:     "test",
+		routingOutcomes: counter,
+	}
+	for _, outcome := range []string{"local", "remote", "ownership_error", "peer_error",
+		"sandbox_id=12345678-1234-1234-1234-123456789abc", "team_id=example-team", "user_id=example-user"} {
+		recorder.RecordRoutingOutcome(ctx, RoutingOutcome{Outcome: outcome, HostID: "host-a"})
+	}
+	var collected metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &collected); err != nil {
+		t.Fatal(err)
+	}
+	wantCounts := map[string]int64{"local": 1, "remote": 1, "ownership_error": 4, "peer_error": 1}
+	found := false
+	for _, scope := range collected.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			if m.Name != "proxy_routing_outcome_total" {
+				continue
+			}
+			found = true
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("routing metric data = %T, want Sum[int64]", m.Data)
+			}
+			if len(sum.DataPoints) != len(wantCounts) {
+				t.Fatalf("routing series = %d, want %d", len(sum.DataPoints), len(wantCounts))
+			}
+			for _, dp := range sum.DataPoints {
+				outcome, _ := dp.Attributes.Value("outcome")
+				want, ok := wantCounts[outcome.AsString()]
+				if !ok || dp.Value != want {
+					t.Fatalf("outcome %q count = %d, want %d (known=%v)", outcome.AsString(), dp.Value, want, ok)
+				}
+				wantAttrs := attribute.NewSet(
+					attribute.String("service.name", "sandbox-proxy"),
+					attribute.String("environment", "test"),
+					attribute.String("host_id", "host-a"),
+					attribute.String("outcome", outcome.AsString()),
+				)
+				if !dp.Attributes.Equals(&wantAttrs) {
+					t.Fatalf("routing attributes = %v, want only %v", dp.Attributes.ToSlice(), wantAttrs.ToSlice())
+				}
+				delete(wantCounts, outcome.AsString())
+			}
+		}
+	}
+	if !found || len(wantCounts) != 0 {
+		t.Fatalf("missing routing outcomes: %v", wantCounts)
+	}
+}
+
 func TestSafeOperationBoundsValues(t *testing.T) {
 	for _, op := range []string{"create", "pause", "resume", "delete", "fail", "timeout_pause"} {
 		if got := safeOperation(op); got != op {
@@ -566,6 +656,85 @@ func TestRecordPausedNetworkPressureEmitsControllerMetrics(t *testing.T) {
 	}
 }
 
+func TestRecordPeerEventEmitsLifecycleMetricsWithBoundedAttributes(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = provider.Shutdown(ctx) })
+	meter := provider.Meter(instrumentationName)
+	gauge := func(name string) metric.Int64UpDownCounter {
+		v, err := meter.Int64UpDownCounter(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	counter := func(name string) metric.Int64Counter {
+		v, err := meter.Int64Counter(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	hist, err := meter.Float64Histogram("peer_handshake_duration_seconds")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &OTelRecorder{provider: provider, serviceName: "proxy", environment: "test", peerConnections: gauge("peer_connections"), peerStreams: gauge("peer_active_streams"), peerEvents: counter("peer_events_total"), peerHandshakeDuration: hist}
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "connection", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: 1})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "stream", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: 1})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "handshake", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Duration: 250 * time.Millisecond})
+	r.RecordPeerEvent(ctx, PeerEvent{Kind: "drain", Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Forced: true})
+	for _, kind := range []string{"connection", "stream"} {
+		for _, delta := range []int64{1, 1, -1} {
+			r.RecordPeerEvent(ctx, PeerEvent{Kind: kind, Result: ResultSuccess, Region: "us-central1", HostID: "host-a", Delta: delta})
+		}
+	}
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &rm); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	allowed := map[string]bool{"service.name": true, "environment": true, "kind": true, "result": true, "region": true, "host_id": true, "forced": true}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			seen[m.Name] = true
+			var attrs []attribute.Set
+			switch d := m.Data.(type) {
+			case metricdata.Gauge[int64]:
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			case metricdata.Sum[int64]:
+				if m.Name == "peer_connections" || m.Name == "peer_active_streams" {
+					if d.IsMonotonic || len(d.DataPoints) != 1 || d.DataPoints[0].Value != 2 {
+						t.Fatalf("incorrect active total: %+v", d)
+					}
+				}
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			case metricdata.Histogram[float64]:
+				for _, p := range d.DataPoints {
+					attrs = append(attrs, p.Attributes)
+				}
+			}
+			for _, set := range attrs {
+				for _, kv := range set.ToSlice() {
+					if !allowed[string(kv.Key)] {
+						t.Fatalf("metric %q has unapproved attribute %q", m.Name, kv.Key)
+					}
+				}
+			}
+		}
+	}
+	for _, name := range []string{"peer_connections", "peer_active_streams", "peer_handshake_duration_seconds", "peer_events_total"} {
+		if !seen[name] {
+			t.Fatalf("metric %q not emitted", name)
+		}
+	}
+}
+
 // RecordLatencyPhase must label every sample with the bounded phase enums,
 // fold empties to addressable values, and fall back to the recorder's own
 // host identity when the caller has none (vmd/proxy).
@@ -691,5 +860,43 @@ func TestCapacityShadowSkipsCompositionOnError(t *testing.T) {
 	}
 	if shadowPublishesComposition("error") {
 		t.Error("a failed ranking must not publish composition; its zeros would erase readiness")
+	}
+}
+
+func TestOwnershipLookupHistogram(t *testing.T) {
+	ctx := context.Background()
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer provider.Shutdown(ctx)
+	histogram, err := provider.Meter(instrumentationName).Float64Histogram("proxy_ownership_lookup_duration_seconds", metric.WithExplicitBucketBoundaries(latencyBuckets...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := &OTelRecorder{ownershipLookupDuration: histogram, hostID: "host-a"}
+	for _, result := range []string{"success", "timeout", "canceled", "raw-error"} {
+		recorder.RecordOwnershipLookup(ctx, OwnershipLookup{Result: result, Duration: 100 * time.Millisecond})
+	}
+	var collected metricdata.ResourceMetrics
+	if err := reader.Collect(ctx, &collected); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"success": true, "timeout": true, "canceled": true, "error": true}
+	for _, scope := range collected.ScopeMetrics {
+		for _, m := range scope.Metrics {
+			data, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("metric type=%T", m.Data)
+			}
+			for _, point := range data.DataPoints {
+				result, _ := point.Attributes.Value("result")
+				if !want[result.AsString()] || point.Count != 1 || point.Sum != 0.1 {
+					t.Fatalf("unexpected point: %+v", point)
+				}
+				delete(want, result.AsString())
+			}
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing results: %v", want)
 	}
 }

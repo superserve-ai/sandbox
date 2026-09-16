@@ -301,9 +301,16 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[27].(**string) = s.SecretEnvIp
 		*dest[28].(*pgtype.Timestamptz) = s.SecretEnvInjectedAt
 		*dest[29].(*pgtype.Timestamptz) = s.SecretEnvExpiresAt
-		if len(dest) == 31 {
+		*dest[30].(*pgtype.UUID) = s.PauseOpID
+		*dest[31].(*pgtype.Timestamptz) = s.PauseOpStartedAt
+		*dest[32].(*pgtype.Timestamptz) = s.PauseOpLeaseUntil
+		*dest[33].(*int64) = s.PauseOpLeaseVersion
+		*dest[34].(*pgtype.Timestamptz) = s.PauseOpAttentionAt
+		*dest[35].(**string) = s.PauseOpTrigger
+		*dest[36].(*pgtype.UUID) = s.PauseOpActorID
+		if len(dest) == 38 {
 			// GetSandboxWithPreviewPolicy: trailing COALESCE'd effective access.
-			*dest[30].(*string) = "legacy_public"
+			*dest[37].(*string) = "legacy_public"
 		}
 		return nil
 	}}
@@ -322,6 +329,8 @@ func hostRow(h db.Host) *mockRow {
 		*dest[8].(*time.Time) = h.CreatedAt
 		*dest[9].(*time.Time) = h.UpdatedAt
 		*dest[10].(*bool) = h.IdentityBound
+		*dest[11].(*pgtype.UUID) = h.IncarnationID
+		*dest[12].(**int64) = h.PeerGeneration
 		return nil
 	}}
 }
@@ -1019,7 +1028,7 @@ func snapshotRow(s db.Snapshot) *mockRow {
 // missing snapshot row.
 func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, ports ...publishedPortResponse) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
-		if err := sandboxRow(sb).scanFn(dest[:30]...); err != nil {
+		if err := sandboxRow(sb).scanFn(dest[:37]...); err != nil {
 			return err
 		}
 		var snapPath, snapMemPath *string
@@ -1029,15 +1038,15 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			snapPath, snapMemPath = &p, snap.MemPath
 			snapCreatedAt = pgtype.Timestamptz{Time: snap.CreatedAt, Valid: true}
 		}
-		*dest[30].(**string) = snapPath
-		*dest[31].(**string) = snapMemPath
-		*dest[32].(*pgtype.Timestamptz) = snapCreatedAt
+		*dest[37].(**string) = snapPath
+		*dest[38].(**string) = snapMemPath
+		*dest[39].(*pgtype.Timestamptz) = snapCreatedAt
 		if access == "" {
 			access = preview.AccessLegacyPublic
 		}
-		*dest[33].(*string) = access
-		*dest[34].(*string) = access
-		*dest[35].(*int64) = revision
+		*dest[40].(*string) = access
+		*dest[41].(*string) = access
+		*dest[42].(*int64) = revision
 		numbers, accesses, versions := []int32{}, []string{}, []int64{}
 		for _, port := range ports {
 			version := port.TokenVersion
@@ -1048,10 +1057,10 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			accesses = append(accesses, port.Access)
 			versions = append(versions, version)
 		}
-		*dest[36].(*[]int32) = numbers
-		*dest[37].(*[]string) = accesses
-		*dest[38].(*[]int64) = versions
-		*dest[39].(**string) = nil
+		*dest[43].(*[]int32) = numbers
+		*dest[44].(*[]string) = accesses
+		*dest[45].(*[]int64) = versions
+		*dest[46].(**string) = nil
 		return nil
 	}}
 }
@@ -3625,9 +3634,113 @@ func TestPauseSandbox_VMDError(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
-	if w.Code != http.StatusInternalServerError {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
+	// The host gave no answer, so the row stays 'pausing' for the reconciler
+	// and the caller is told so rather than "failed".
+	if w.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusAccepted, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"pausing"`) {
+		t.Errorf("body = %s, want status pausing", w.Body.String())
+	}
+}
+
+// gatedPause is a host that answers only once release is closed.
+func gatedPause(release <-chan struct{}) *stubVMD {
+	return &stubVMD{pauseFn: func(ctx context.Context, _, _ string) (string, string, error) {
+		select {
+		case <-release:
+			return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		}
+	}}
+}
+
+// A client that prefers an asynchronous answer is told 'pausing' the moment
+// the pause is recorded; the host call carries on and its answer is recorded.
+func TestPauseSandbox_RespondAsync_AcceptedImmediately(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+	release := make(chan struct{})
+	var finalizes int32
+	h := &Handlers{VMD: gatedPause(release), DB: db.New(pauseMocks(sb, &finalizes))}
+	rec := &captureTelemetryRecorder{}
+	SetTelemetryRecorder(rec)
+	t.Cleanup(func() { SetTelemetryRecorder(nil) })
+
+	req := pauseRequest(sandboxID.String())
+	req.Header.Set("Prefer", "respond-async")
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusAccepted, w.Body.String())
+	}
+	if w.Header().Get("Retry-After") != "1" || !strings.Contains(w.Body.String(), `"status":"pausing"`) {
+		t.Fatalf("202 response = %v %s, want Retry-After: 1 and a pausing status", w.Header(), w.Body.String())
+	}
+	if atomic.LoadInt32(&finalizes) != 0 {
+		t.Fatal("finalized before the host answered")
+	}
+	if len(rec.transitions) != 0 {
+		t.Fatalf("transitions = %+v at acceptance, want none: the 202 is not the pause's outcome", rec.transitions)
+	}
+
+	close(release)
+	h.WaitAsyncBookkeeping()
+	if len(rec.transitions) != 1 || rec.transitions[0].Operation != "pause" || rec.transitions[0].Result != telemetry.ResultSuccess || rec.transitions[0].Duration <= 0 {
+		t.Fatalf("transitions = %+v, want one pause success with the dispatch's duration", rec.transitions)
+	}
+	if atomic.LoadInt32(&finalizes) != 1 {
+		t.Fatalf("finalize calls after the host answered = %d, want 1", atomic.LoadInt32(&finalizes))
+	}
+}
+
+// Even a host that answers at once is reported as 'pausing' to a client
+// that prefers an asynchronous answer; the finalize still lands.
+func TestPauseSandbox_RespondAsync_FastHostStillAccepted(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+	var finalizes int32
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(pauseMocks(sb, &finalizes))}
+
+	req := pauseRequest(sandboxID.String())
+	req.Header.Set("Prefer", "respond-async")
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, req)
+	h.WaitAsyncBookkeeping()
+
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusAccepted, w.Body.String())
+	}
+	if atomic.LoadInt32(&finalizes) != 1 {
+		t.Fatalf("finalize calls = %d, want 1", atomic.LoadInt32(&finalizes))
+	}
+}
+
+// Without the preference the request waits for the host as it always has.
+func TestPauseSandbox_NoPreference_WaitsForHost(t *testing.T) {
+	sandboxID, teamID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive}
+	release := make(chan struct{})
+	var finalizes int32
+	h := &Handlers{VMD: gatedPause(release), DB: db.New(pauseMocks(sb, &finalizes))}
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		close(release)
+	}()
+
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, pauseRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if atomic.LoadInt32(&finalizes) != 1 {
+		t.Fatalf("finalize calls = %d, want 1", atomic.LoadInt32(&finalizes))
 	}
 }
 
@@ -4155,7 +4268,7 @@ func TestPauseWithRetry_RetriesTransientThenSucceeds(t *testing.T) {
 		}
 		return "/snap/vmstate.snap", "/snap/mem.snap", nil
 	}}
-	snap, mem, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
+	snap, mem, _, _, err := (&Handlers{VMD: vmd}).pauseWithRetry(context.Background(), vmd, "host-1", "vm-1", "tok-test", time.Now().Add(time.Minute))
 	if err != nil {
 		t.Fatalf("retry should recover a transient failure, got %v", err)
 	}
@@ -4174,7 +4287,7 @@ func TestPauseWithRetry_NotFoundIsTerminal(t *testing.T) {
 		calls++
 		return "", "", notFound
 	}}
-	_, _, _, _, err := pauseWithRetry(context.Background(), vmd, "vm-1", "tok-test")
+	_, _, _, _, err := (&Handlers{VMD: vmd}).pauseWithRetry(context.Background(), vmd, "host-1", "vm-1", "tok-test", time.Now().Add(time.Minute))
 	if !isVMDNotFound(err) {
 		t.Fatalf("expected NotFound to surface, got %v", err)
 	}
@@ -4368,61 +4481,94 @@ func TestPlaceCreateDoesNotRecheckAnUnchangedReselection(t *testing.T) {
 	}
 }
 
-// A resume the host capability gate refuses never reaches the daemon and
-// reverts the claim; the revert carries no deadline because the claim leaves
-// it on the row, so retrying the refused resume cannot postpone auto-delete.
-func TestResumeSandbox_CapabilityRefusalRevertsWithoutReachingDaemon(t *testing.T) {
-	sandboxID := uuid.New()
-	teamID := uuid.New()
-	snapshotID := uuid.New()
-	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
-	sb.HostID = "host-without-ports-" + uuid.NewString()
-	snap := db.Snapshot{
-		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
-		Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
-	}
-
-	var reverted []any
-	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			switch {
-			case strings.Contains(sql, "-- name: ClaimResume :one"):
-				return claimResumeRow(sb, &snap, preview.AccessPublic, 3)
-			case strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
-				return scalarBoolRow(false)
-			case strings.Contains(sql, "FROM sandbox"):
-				return sandboxRow(sb)
-			default:
-				return activityRow()
+// Preflight refusal avoids dispatch without postponing auto-delete;
+// capability loss during boot re-pauses the VM before activation.
+func TestResumeSandbox_CapabilityRefusalRevertsBeforeActivation(t *testing.T) {
+	for _, preflightPasses := range []bool{false, true} {
+		t.Run(fmt.Sprintf("preflight-passes=%v", preflightPasses), func(t *testing.T) {
+			sandboxID := uuid.New()
+			teamID := uuid.New()
+			snapshotID := uuid.New()
+			sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+			sb.HostID = "host-without-ports-" + uuid.NewString()
+			snap := db.Snapshot{
+				ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+				Path: "/snapshots/test/vmstate.snap", Trigger: "pause",
 			}
-		},
-		queryFn: func(context.Context, string, ...any) (pgx.Rows, error) {
-			return emptyRows{}, nil
-		},
-		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-			if strings.Contains(sql, "-- name: RevertResumeToPaused :exec") {
-				reverted = args
-			}
-			return pgconn.NewCommandTag(""), nil
-		},
-	}
-	reached := false
-	vmd := &stubVMD{resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
-		reached = true
-		return "10.0.0.2", nil
-	}}
-	h := &Handlers{VMD: vmd, DB: db.New(mock)}
-	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
 
-	if w.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusConflict, w.Body.String())
-	}
-	if reached {
-		t.Fatal("refused resume reached the daemon")
-	}
-	if len(reverted) != 2 {
-		t.Fatalf("revert args = %v, want id and team only", reverted)
+			lockedChecks := 0
+			finalizedPause := false
+			var reverted []any
+			mock := &mockDBTX{
+				queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+					switch {
+					case strings.Contains(sql, "-- name: ClaimResume :one"):
+						return claimResumeRow(sb, &snap, preview.AccessPublic, 3)
+					case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+						return scalarBoolRow(preflightPasses)
+					case strings.Contains(sql, "-- name: HostHasCapabilities :one"):
+						lockedChecks++
+						return scalarBoolRow(false)
+					case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+						return previewPolicyRow(preview.AccessPublic, 3)
+					case strings.Contains(sql, "FinalizePause"):
+						finalizedPause = true
+						return uuidRow(snapshotID)
+					case strings.Contains(sql, "FROM sandbox"):
+						return sandboxRow(sb)
+					default:
+						return activityRow()
+					}
+				},
+				queryFn: func(context.Context, string, ...any) (pgx.Rows, error) {
+					return emptyRows{}, nil
+				},
+				execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+					if strings.Contains(sql, "-- name: RevertResumeToPaused :exec") {
+						reverted = args
+					}
+					return pgconn.NewCommandTag(""), nil
+				},
+			}
+			reached := false
+			paused := false
+			vmd := &stubVMD{
+				resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
+					if lockedChecks != 0 {
+						t.Fatalf("locked capability checks before dispatch = %d, want 0", lockedChecks)
+					}
+					reached = true
+					return "192.0.2.2", nil
+				},
+				pauseFn: func(context.Context, string, string) (string, string, error) {
+					paused = true
+					return snap.Path, "/snapshots/test/mem.snap", nil
+				},
+			}
+			h := &Handlers{VMD: vmd, DB: db.New(mock)}
+			w := httptest.NewRecorder()
+			setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+			if w.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusConflict, w.Body.String())
+			}
+			if reached != preflightPasses || paused != preflightPasses {
+				t.Fatalf("reached=%v paused=%v, want both %v", reached, paused, preflightPasses)
+			}
+			if finalizedPause != preflightPasses {
+				t.Fatalf("finalized pause = %v, want %v", finalizedPause, preflightPasses)
+			}
+			if !preflightPasses && len(reverted) != 2 {
+				t.Fatalf("revert args = %v, want id and team only", reverted)
+			}
+			wantLockedChecks := 0
+			if preflightPasses {
+				wantLockedChecks = 1
+			}
+			if lockedChecks != wantLockedChecks {
+				t.Fatalf("locked checks = %d, want %d", lockedChecks, wantLockedChecks)
+			}
+		})
 	}
 }
 
@@ -4925,4 +5071,25 @@ func TestCreateSandbox_TemplateLookupFailureRecordsLookupPhase(t *testing.T) {
 		}
 	}
 	t.Fatalf("no create lookup phase recorded for a failed template lookup; got %+v", rec.phases)
+}
+
+// pauseMocks is the DB script shared by the async-answer tests: BeginPause
+// and reads return the sandbox, finalize is counted, everything else is inert.
+func pauseMocks(sb db.Sandbox, finalizes *int32) *mockDBTX {
+	return &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			// Finalize first: its fence also mentions 'pausing'.
+			case strings.Contains(sql, "upserted AS"), strings.Contains(sql, "INSERT INTO snapshot"):
+				atomic.AddInt32(finalizes, 1)
+				return finalizePauseRow(uuid.New())
+			case strings.Contains(sql, "'pausing'"), strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
 }
