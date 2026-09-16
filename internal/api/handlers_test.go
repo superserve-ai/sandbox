@@ -505,6 +505,7 @@ func TestDeleteSandbox_Success(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusNoContent {
 		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
@@ -553,6 +554,7 @@ func TestDeleteSandbox_RevocationAtomicWithClaim(t *testing.T) {
 	h := &Handlers{VMD: &stubVMD{destroyFn: func(context.Context, string, bool) error { return nil }}, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
@@ -599,6 +601,7 @@ func TestDeleteSandbox_Failed_StillCleansUp(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
@@ -640,6 +643,7 @@ func TestDeleteSandbox_FailedSandbox_DestroyError_StillDeletes(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusNoContent {
 		t.Errorf("status = %d, want %d (teardown is best-effort); body: %s", w.Code, http.StatusNoContent, w.Body.String())
@@ -696,6 +700,7 @@ func TestDeleteSandbox_SnapshotCleanup_FallsBackOnUnimplemented(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want 204; body: %s", w.Code, w.Body.String())
@@ -715,6 +720,7 @@ func TestDeleteSandbox_InvalidUUID(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, deleteRequest("not-a-uuid"))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusBadRequest)
@@ -735,6 +741,7 @@ func TestDeleteSandbox_MissingTeamID(t *testing.T) {
 	w := httptest.NewRecorder()
 	// Empty teamID — context won't have "team_id".
 	setupTestRouter(h, "").ServeHTTP(w, deleteRequest(uuid.New().String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want %d; body: %s", w.Code, http.StatusUnauthorized, w.Body.String())
@@ -751,6 +758,7 @@ func TestDeleteSandbox_NotFound(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, deleteRequest(uuid.New().String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusNotFound)
@@ -772,6 +780,7 @@ func TestDeleteSandbox_DBGetError(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, uuid.New().String()).ServeHTTP(w, deleteRequest(uuid.New().String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
@@ -805,6 +814,7 @@ func TestDeleteSandbox_TeardownError_StillCommits(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusNoContent {
 		t.Errorf("status = %d, want %d (teardown is best-effort after the claim); body: %s", w.Code, http.StatusNoContent, w.Body.String())
@@ -861,6 +871,7 @@ func TestDeleteSandbox_TeardownError_RecordsTelemetryAndHostAwareLog(t *testing.
 
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
@@ -905,6 +916,7 @@ func TestDeleteSandbox_DBDestroyError(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want %d", w.Code, http.StatusInternalServerError)
@@ -937,6 +949,7 @@ func TestDeleteSandbox_ActivityLogFailure_StillReturns204(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
 	// Activity logging failure is non-fatal — should still return 204.
 	if w.Code != http.StatusNoContent {
@@ -967,6 +980,7 @@ func TestDeleteSandbox_Resuming_Returns409(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusConflict {
 		t.Errorf("status = %d, want 409 (delete must defer while resuming); body: %s", w.Code, w.Body.String())
@@ -1002,6 +1016,7 @@ func TestDeleteSandbox_ConcurrentlyDeleted_Idempotent(t *testing.T) {
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
 
 	if w.Code != http.StatusNoContent {
 		t.Errorf("status = %d, want 204 (already-deleted is idempotent); body: %s", w.Code, w.Body.String())

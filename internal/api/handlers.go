@@ -1636,7 +1636,15 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
-	h.teardownDestroyedSandbox(c.Request.Context(), sandboxID, sandbox.HostID, sandbox.BasePath, sandbox.TemplateID)
+	// The row is deleted; host-side reclaim is best-effort and backstopped by
+	// the vm reconciler, so it runs after the response. A host that has gone
+	// away otherwise holds the caller through the RPC timeout and its retry.
+	hostID, basePath, templateID := sandbox.HostID, sandbox.BasePath, sandbox.TemplateID
+	h.asyncBookkeeping("delete-teardown", func() {
+		tctx, cancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), autoDeleteTeardownTimeout)
+		defer cancel()
+		h.teardownDestroyedSandbox(tctx, sandboxID, hostID, basePath, templateID)
+	})
 
 	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
