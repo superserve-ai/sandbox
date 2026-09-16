@@ -276,12 +276,20 @@ func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string,
 // source with raw SQL would strand those host resources. Destroy failed
 // sandboxes before the window. 'migrating' is an operator's claim on a
 // paused sandbox mid-move between hosts; its artifacts are in flight too.
+// A destroyed sandbox whose host-side reclaim is still recorded in
+// sandbox_teardown blocks as well: purge hard-deletes the sandbox row and
+// the teardown cascades with it, so the sweeper could never finish the VM,
+// snapshots, and artifacts still on the source host. Wait for the sweeper
+// (or resolve a permanent teardown by hand) before the window.
 func activeSandboxes(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
-		SELECT id, name, status FROM sandbox
-		WHERE team_id = $1 AND destroyed_at IS NULL
-		  AND status IN ('active', 'starting', 'resuming', 'pausing', 'migrating', 'failed')
-		ORDER BY created_at`, teamID)
+		SELECT s.id, s.name, s.status, t.sandbox_id IS NOT NULL
+		FROM sandbox s LEFT JOIN sandbox_teardown t ON t.sandbox_id = s.id
+		WHERE s.team_id = $1
+		  AND ((s.destroyed_at IS NULL
+		        AND s.status IN ('active', 'starting', 'resuming', 'pausing', 'migrating', 'failed'))
+		       OR t.sandbox_id IS NOT NULL)
+		ORDER BY s.created_at`, teamID)
 	if err != nil {
 		return nil, fmt.Errorf("list active sandboxes: %w", err)
 	}
@@ -291,8 +299,12 @@ func activeSandboxes(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) (
 	for rows.Next() {
 		var id uuid.UUID
 		var name, status string
-		if err := rows.Scan(&id, &name, &status); err != nil {
+		var reclaimPending bool
+		if err := rows.Scan(&id, &name, &status, &reclaimPending); err != nil {
 			return nil, err
+		}
+		if reclaimPending {
+			status += " (host reclaim pending)"
 		}
 		out = append(out, fmt.Sprintf("%s (%s) status=%s", id, name, status))
 	}
