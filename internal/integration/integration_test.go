@@ -6898,3 +6898,66 @@ func TestIntegration_AutoDeleteTeardownStartsAtAttemptZero(t *testing.T) {
 		t.Fatalf("first claim = %s attempt %d, want %s attempt 1", row.SandboxID, row.Attempts, id)
 	}
 }
+
+// A claim still in flight on one host does not draw the next worker onto
+// that host's other records: it takes another host's instead of waiting.
+func TestIntegration_TeardownClaimsSpreadAcrossHostsWhileOneIsInFlight(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	hostA := "teardown-spread-a-" + uuid.NewString()
+	hostB := "teardown-spread-b-" + uuid.NewString()
+	for _, hostID := range []string{hostA, hostB} {
+		if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+			ID: hostID, VmdAddr: "127.0.0.1:1", ProxyAddr: "127.0.0.1:2", Region: "test",
+			CapacityMemoryMib: 1024, CapacityVcpus: 1,
+		}); err != nil {
+			t.Fatalf("create host: %v", err)
+		}
+	}
+	for _, table := range []string{"sandbox_teardown", "sandbox_teardown_host"} {
+		if _, err := testPool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
+	destroy := func(hostID string) uuid.UUID {
+		t.Helper()
+		id := uuid.New()
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,'teardown-spread','active',$3)`,
+			id, teamID, hostID,
+		); err != nil {
+			t.Fatalf("insert sandbox: %v", err)
+		}
+		if _, err := testQueries.DestroySandbox(ctx, db.DestroySandboxParams{
+			ID: id, TeamID: teamID, LeaseSeconds: 0,
+			StaleTransitionalBefore: time.Now().Add(-time.Hour), RevocationExpiresAt: time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("destroy sandbox: %v", err)
+		}
+		return id
+	}
+	a1 := destroy(hostA)
+	destroy(hostA)
+	b1 := destroy(hostB)
+
+	// Host A's claim stays uncommitted: its row lock and host lease are in flight.
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	rec, err := db.New(tx).ClaimNextTeardown(ctx, 60)
+	if err != nil || rec.SandboxID != a1 {
+		t.Fatalf("in-flight claim = %+v (%v), want %s", rec, err, a1)
+	}
+
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	rec, err = testQueries.ClaimNextTeardown(cctx, 60)
+	if err != nil {
+		t.Fatalf("claim while host A's is in flight: %v (waited on host A instead of taking host B)", err)
+	}
+	if rec.SandboxID != b1 || rec.HostID != hostB {
+		t.Fatalf("claim while host A's is in flight = %+v, want %s on %s", rec, b1, hostB)
+	}
+}

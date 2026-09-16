@@ -607,12 +607,21 @@ const claimNextTeardown = `-- name: ClaimNextTeardown :one
 WITH candidate AS (
   SELECT t.sandbox_id, t.host_id, t.attempts + 1 AS attempt
   FROM sandbox_teardown t
-  WHERE t.lease_until <= now()
+  WHERE t.sandbox_id IN (
+    -- One row per host, so racing workers lock rows of different hosts
+    -- rather than piling onto the oldest host and losing its lease.
+    SELECT DISTINCT ON (host_id) sandbox_id
+    FROM sandbox_teardown
+    WHERE lease_until <= now()
+      AND retry_at <= now()
+      AND NOT EXISTS (
+        SELECT 1 FROM sandbox_teardown_host h
+        WHERE h.host_id = sandbox_teardown.host_id AND h.lease_until > now()
+      )
+    ORDER BY host_id, created_at
+  )
+    AND t.lease_until <= now()
     AND t.retry_at <= now()
-    AND NOT EXISTS (
-      SELECT 1 FROM sandbox_teardown_host h
-      WHERE h.host_id = t.host_id AND h.lease_until > now()
-    )
   ORDER BY t.created_at
   LIMIT 1
   FOR UPDATE SKIP LOCKED
