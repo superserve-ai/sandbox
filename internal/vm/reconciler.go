@@ -1564,12 +1564,15 @@ func (r *Reconciler) markStale(vmID string) error {
 	// cause ReattachAll to resurrect the stale record on next restart, so a
 	// failure here abandons the whole cleanup rather than half-applying it.
 	// A resume that never ran its guest is not deleted: its paused image is
-	// intact, so the record returns to Paused, its slot released with the
-	// rest.
+	// intact, so the record returns to Paused. It keeps its slot, as a paused
+	// VM may: a reattach that read the older record publishes over this
+	// write, re-tracking the same slot, so the slot is never handed on under
+	// it. Pressure or a destroy releases it.
+	returned := false
 	if rec != nil && interruptedResume(*rec) {
 		paused := *rec
 		paused.returnToPaused()
-		paused.Namespace, paused.IP, paused.TAPDevice, paused.MACAddress = "", "", "", ""
+		returned = true
 		if _, err := r.mgr.state.PutIfPresent(paused); err != nil {
 			r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: interrupted resume's record could not be returned to Paused")
 			return err
@@ -1585,7 +1588,7 @@ func (r *Reconciler) markStale(vmID string) error {
 	r.mgr.mu.Unlock()
 
 	// Free the slot too. netMgr is always set in prod; the nil check is defensive.
-	if r.mgr.netMgr != nil {
+	if r.mgr.netMgr != nil && !returned {
 		r.mgr.netMgr.CleanupVMOrNamespace(vmID, namespace)
 	}
 

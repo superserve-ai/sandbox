@@ -457,8 +457,10 @@ func TestUnverifiedOrphanGrace(t *testing.T) {
 
 // A reconciler rule that proves an interrupted resume's process dead must
 // not delete its record: the paused image is intact, so the record returns
-// to Paused with its slot released, and the instance is dropped for a
-// reattach to reload.
+// to Paused keeping its slot, and the instance is dropped for a reattach to
+// reload. The slot is not released: a reattach that read the older record
+// re-tracks it when it publishes, and a released slot could be another VM's
+// by then.
 func TestMarkStaleReturnsAnInterruptedResumeToPaused(t *testing.T) {
 	st, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
 	if err != nil {
@@ -480,8 +482,8 @@ func TestMarkStaleReturnsAnInterruptedResumeToPaused(t *testing.T) {
 	if got == nil || got.Status != StatusPaused || got.WakePending || got.WakeOwedFromPaused || got.Unverified || got.WakeToken != "" {
 		t.Fatalf("record = %+v; want Paused with nothing owed", got)
 	}
-	if got.Namespace != "" || got.IP != "" || got.FreezeToken != "rec" || got.MemFilePath != "/snap/mem.snap" {
-		t.Errorf("record = %+v; want the slot released and the image and token kept", got)
+	if got.Namespace != "ns-1" || got.IP != "10.0.0.2" || got.FreezeToken != "rec" || got.MemFilePath != "/snap/mem.snap" {
+		t.Errorf("record = %+v; want the slot, image and token kept", got)
 	}
 	m.mu.RLock()
 	_, tracked := m.vms["vm-1"]
@@ -489,8 +491,25 @@ func TestMarkStaleReturnsAnInterruptedResumeToPaused(t *testing.T) {
 	if tracked {
 		t.Fatal("the stale instance must be dropped for a reattach to reload the Paused record")
 	}
-	if len(net.cleanupCalls) != 1 {
-		t.Fatalf("cleanup calls = %d, want the slot released once", len(net.cleanupCalls))
+	if len(net.cleanupCalls) != 0 {
+		t.Fatalf("cleanup calls = %+v; the slot must stay with the paused record", net.cleanupCalls)
+	}
+
+	// The reattach that read the older record publishes after the rewrite:
+	// it resolves the owed wake first, so it lands Paused on the same slot.
+	origDown, origWake := vmUnitFullyDown, boxdWakeGuest
+	vmUnitFullyDown = func(string) bool { return true }
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return errors.New("no answer") }
+	t.Cleanup(func() { vmUnitFullyDown, boxdWakeGuest = origDown, origWake })
+	if _, ok := m.reattachRecord(context.Background(), rec, false); !ok {
+		t.Fatal("the stale reattach must still publish")
+	}
+	got, _ = st.Get("vm-1")
+	if got == nil || got.Status != StatusPaused || got.WakePending || got.Namespace != "ns-1" {
+		t.Fatalf("record = %+v after the stale publish; want Paused on the same slot", got)
+	}
+	if len(net.cleanupCalls) != 0 {
+		t.Fatalf("cleanup calls = %+v; nothing may be released under the stale publish", net.cleanupCalls)
 	}
 }
 
