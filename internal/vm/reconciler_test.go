@@ -503,22 +503,52 @@ func TestMarkStaleReturnsAnInterruptedResumeToPaused(t *testing.T) {
 		}
 	})
 
-	// A record the flight cannot converge (here: an instance already tracked,
-	// parked behind an unconfirmed stop) is reported, so the rule does not
-	// count it reaped; the sweep returns it to Paused later.
-	t.Run("unconverged_record_is_reported_not_reaped", func(t *testing.T) {
-		r, m, st, rec, _ := newCase(t)
+	// An instance already tracked (parked Error behind a stop that could not
+	// be confirmed at startup) is rewritten in place once its process is
+	// gone: the flight cannot reach it, the instance owns its record.
+	t.Run("tracked_record_is_returned_to_paused_in_place", func(t *testing.T) {
+		r, m, st, rec, net := newCase(t)
 		rec.Status = StatusError
 		if err := st.Put(rec); err != nil {
 			t.Fatal(err)
 		}
-		m.vms["vm-1"] = toInstance(rec)
-		if err := r.markStale("vm-1"); err == nil {
-			t.Fatal("markStale must report an interrupted resume it could not return to Paused")
+		inst := toInstance(rec)
+		m.vms["vm-1"] = inst
+		if err := r.markStale("vm-1"); err != nil {
+			t.Fatalf("markStale: %v", err)
+		}
+		if inst.Status != StatusPaused || inst.WakePending || inst.WakeOwedFromPaused || inst.Unverified || inst.WakeToken != "" {
+			t.Fatalf("instance = %+v; want Paused with nothing owed", inst)
 		}
 		got, _ := st.Get("vm-1")
-		if got == nil || !interruptedResume(*got) {
-			t.Fatalf("record = %+v; want it kept for the sweep", got)
+		if got == nil || got.Status != StatusPaused || got.WakePending || got.Namespace != "ns-1" {
+			t.Fatalf("record = %+v; want Paused on its slot", got)
+		}
+		if m.vms["vm-1"] != inst || len(net.cleanupCalls) != 0 {
+			t.Fatal("the instance must stay tracked with its slot")
+		}
+	})
+
+	// A sandbox the control plane has forgotten is deleted whatever its
+	// record says: paused, or a resume that never ran its guest.
+	t.Run("orphans_are_deleted_regardless", func(t *testing.T) {
+		for _, paused := range []bool{false, true} {
+			r, m, st, rec, net := newCase(t)
+			if paused {
+				rec.returnToPaused()
+				if err := st.Put(rec); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := r.reapOrphan("vm-1"); err != nil {
+				t.Fatalf("reapOrphan(paused=%v): %v", paused, err)
+			}
+			if got, _ := st.Get("vm-1"); got != nil {
+				t.Fatalf("record = %+v after reapOrphan(paused=%v); want it deleted", got, paused)
+			}
+			if len(net.cleanupCalls) != 1 || m.vms["vm-1"] != nil {
+				t.Fatalf("paused=%v: cleanup calls = %+v; want the slot released once and nothing tracked", paused, net.cleanupCalls)
+			}
 		}
 	})
 

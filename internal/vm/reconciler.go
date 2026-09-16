@@ -635,7 +635,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				continue
 			}
 			removeUnitDropIn(id)
-			r.markStale(id)
+			r.reapOrphan(id)
 			r.writeAudit(ctx, id, "orphan_stop", reason, kind)
 			r.clearDrift("orphan:" + id)
 		}
@@ -947,7 +947,7 @@ func (r *Reconciler) runOnce(ctx context.Context) {
 				}
 				removeUnitDropIn(id)
 			}
-			r.markStale(id)
+			r.reapOrphan(id)
 			r.writeAudit(ctx, id, "stale_cleanup", "BoltDB entry with no DB row", "boltdb_present_db_missing")
 			r.clearDrift("bolt-orphan:" + id)
 		}
@@ -1524,15 +1524,23 @@ func (r *Reconciler) finalizeErrorReap(ctx context.Context, vmID, marker, action
 	r.clearDrift(marker)
 }
 
-// markStale deletes the stale BoltDB entry and drops the VM from the
-// in-memory map. The VM is already gone in reality; this just cleans up
-// VMD's cache.
+// markStale releases a record whose process the calling rule proved dead:
+// the BoltDB entry goes and the VM is dropped from the in-memory map. Two
+// records are whole rather than stale and are not deleted: a resume that
+// never ran its guest is returned to Paused, and a record that reads Paused
+// now was converged after the rule's snapshot.
 //
 // A non-nil error means nothing was cleaned up. Rules that stop the unit
 // before calling this must not report success on one: stopping the unit
 // retires the very condition their next pass matches on, so the record is
 // left for the startup reattach sweep rather than another pass.
-func (r *Reconciler) markStale(vmID string) error {
+func (r *Reconciler) markStale(vmID string) error { return r.release(vmID, false) }
+
+// reapOrphan releases a record the control plane has forgotten, whatever its
+// status: nothing will ever resume it.
+func (r *Reconciler) reapOrphan(vmID string) error { return r.release(vmID, true) }
+
+func (r *Reconciler) release(vmID string, orphan bool) error {
 	// Capture the namespace before deleting the record: a VM whose teardown
 	// didn't run (e.g. a vmd timeout mid-DELETE) would otherwise leak its slot.
 	var namespace string
@@ -1560,29 +1568,24 @@ func (r *Reconciler) markStale(vmID string) error {
 		_ = r.mgr.cgroups.removeVMCgroup(context.Background(), vmID)
 	}
 
-	// A resume that never ran its guest is not deleted: its paused image is
-	// intact. Its record is rewritten only inside the reattach flight, which
-	// serializes with lazy loads, so no reattach that read the older record
-	// can publish over the recovery. The flight returns it to Paused once the
-	// process is known gone; anything short of that is reported, not reaped.
-	if rec != nil && interruptedResume(*rec) {
-		r.mgr.reattachByID(vmID, true)
-		again, err := r.mgr.state.Get(vmID)
-		if err != nil || (again != nil && interruptedResume(*again)) {
-			return fmt.Errorf("vm %s: interrupted resume not returned to Paused; left for the reattach sweep", vmID)
+	if !orphan && rec != nil {
+		// A resume that never ran its guest is whole: its paused image is
+		// intact, so the record returns to Paused instead of going. Anything
+		// short of that is reported, not reaped.
+		if interruptedResume(*rec) {
+			if !r.mgr.recoverInterruptedResume(vmID) {
+				return fmt.Errorf("vm %s: interrupted resume not returned to Paused", vmID)
+			}
+			r.mu.Lock()
+			delete(r.driftSeen, vmID)
+			r.mu.Unlock()
+			r.mgr.log.Warn().Str("component", "reconciler").Str("vm_id", vmID).
+				Msg("reconciler: resume interrupted before its guest ran — record returned to Paused")
+			return nil
 		}
-		r.mu.Lock()
-		delete(r.driftSeen, vmID)
-		r.mu.Unlock()
-		r.mgr.log.Warn().Str("component", "reconciler").Str("vm_id", vmID).
-			Msg("reconciler: resume interrupted before its guest ran — record returned to Paused")
-		return nil
-	}
-	// No rule matches a paused record: one that reads Paused now was
-	// converged after the rule's snapshot, and deleting it would lose a
-	// sandbox that is whole.
-	if rec != nil && rec.Status == StatusPaused {
-		return fmt.Errorf("vm %s: record is paused; not stale", vmID)
+		if rec.Status == StatusPaused {
+			return fmt.Errorf("vm %s: record is paused; not stale", vmID)
+		}
 	}
 
 	// Delete from BoltDB first. Deleting from the map before BoltDB would

@@ -5105,6 +5105,32 @@ func (m *Manager) returnInterruptedResumeToPaused(ctx context.Context, rec VMRec
 	return m.reattachRecord(ctx, rec, cleanupStale)
 }
 
+// recoverInterruptedResume returns an interrupted resume's record to Paused,
+// its slot and image kept, once the caller has proven its process gone.
+// Untracked, the record is loaded through the reattach flight, which
+// serializes with lazy loads, so no reattach that read an older record can
+// publish over it; tracked, the instance owns its record and is rewritten
+// in place. Reports whether the record no longer owes its return.
+func (m *Manager) recoverInterruptedResume(vmID string) bool {
+	m.mu.RLock()
+	inst := m.vms[vmID]
+	m.mu.RUnlock()
+	if inst == nil {
+		m.reattachByID(vmID, true)
+		rec, err := m.state.Get(vmID)
+		return err == nil && (rec == nil || !interruptedResume(*rec))
+	}
+	inst.mu.Lock()
+	if interruptedResume(toRecordLocked(inst)) {
+		inst.Status = StatusPaused
+		inst.WakePending, inst.ClockFrozen, inst.WakeOwedFromPaused, inst.Unverified = false, false, false, false
+		inst.dropWakeImage()
+	}
+	inst.mu.Unlock()
+	_, err := m.persistStateIfPresent(inst)
+	return err == nil
+}
+
 func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale bool) (*VMInstance, bool) {
 	if reattachHook != nil {
 		reattachHook(rec.ID)
