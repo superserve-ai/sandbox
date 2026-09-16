@@ -107,6 +107,9 @@ type OTelRecorder struct {
 	dbAcquireDurationSeconds metric.Float64Counter
 	phaseDuration            metric.Float64Histogram
 	pausedNetworkSlotsTotal  metric.Int64Gauge
+	teardownAttempts         metric.Int64Counter
+	teardownBacklog          metric.Int64Gauge
+	teardownOldestAge        metric.Float64Gauge
 	pausedNetworkSlotsUsed   metric.Int64Gauge
 	pausedNetworkSlotsAvail  metric.Int64Gauge
 	pausedNetworkPoolSlots   metric.Int64Gauge
@@ -225,6 +228,15 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.dbAcquiredConns, err = meter.Int64Gauge("db_pool_acquired_conns"); err != nil {
+		return nil, err
+	}
+	if r.teardownAttempts, err = meter.Int64Counter("sandbox_teardown_attempt_total"); err != nil {
+		return nil, err
+	}
+	if r.teardownBacklog, err = meter.Int64Gauge("sandbox_teardown_backlog"); err != nil {
+		return nil, err
+	}
+	if r.teardownOldestAge, err = meter.Float64Gauge("sandbox_teardown_oldest_age_seconds"); err != nil {
 		return nil, err
 	}
 	if r.dbIdleConns, err = meter.Int64Gauge("db_pool_idle_conns"); err != nil {
@@ -553,6 +565,30 @@ func (r *OTelRecorder) RecordDBPoolStats(ctx context.Context, s DBPoolStats) {
 	if s.AcquireDurationSecondsDelta > 0 {
 		r.dbAcquireDurationSeconds.Add(ctx, s.AcquireDurationSecondsDelta, opt)
 	}
+}
+
+// RecordTeardownAttempt counts one reclaim attempt by where it ran and how
+// it ended.
+func (r *OTelRecorder) RecordTeardownAttempt(ctx context.Context, a TeardownAttempt) {
+	if r == nil {
+		return
+	}
+	r.teardownAttempts.Add(ctx, 1, metric.WithAttributes(r.attrs(
+		attribute.String("path", safeResult(a.Path)),
+		attribute.String("result", safeResult(a.Result)),
+	)...))
+}
+
+// RecordTeardownBacklog publishes the reclaims still owed: all of them, the
+// ones being retried, the ones no retry can fix, and the age of the oldest.
+func (r *OTelRecorder) RecordTeardownBacklog(ctx context.Context, b TeardownBacklog) {
+	if r == nil {
+		return
+	}
+	for state, n := range map[string]int64{"total": b.Total, "retrying": b.Retrying, "permanent": b.Permanent} {
+		r.teardownBacklog.Record(ctx, n, metric.WithAttributes(r.selfAttrs(attribute.String("state", state))...))
+	}
+	r.teardownOldestAge.Record(ctx, max(b.OldestAgeSeconds, 0), metric.WithAttributes(r.selfAttrs()...))
 }
 
 // RecordLauncherState emits vmd_launcher_ready as 1/0. Alert on it: a sustained

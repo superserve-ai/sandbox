@@ -6633,87 +6633,130 @@ func routedFinalize(ctx context.Context, t *testing.T, params db.FinalizePausePa
 	})
 }
 
-// A delete records the host-side reclaim it owes; the record is leased to
-// one worker at a time, deferred when an attempt fails, and gone once the
-// reclaim completes.
+// A delete records the host-side reclaim it owes, owned by the deleting
+// request first; the sweeper then claims one record per host at a time,
+// every settle is fenced on the attempt, and holding a host leaves the
+// reclaim in flight on it alone.
 func TestIntegration_DeleteRecordsTheTeardownUntilItCompletes(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedTeamAndKey(t)
-	hostID := "teardown-" + uuid.NewString()
-	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
-		ID: hostID, VmdAddr: "127.0.0.1:1", ProxyAddr: "127.0.0.1:2", Region: "test",
-		CapacityMemoryMib: 1024, CapacityVcpus: 1,
-	}); err != nil {
-		t.Fatalf("create host: %v", err)
+	hostA := "teardown-a-" + uuid.NewString()
+	hostB := "teardown-b-" + uuid.NewString()
+	for _, hostID := range []string{hostA, hostB} {
+		if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+			ID: hostID, VmdAddr: "127.0.0.1:1", ProxyAddr: "127.0.0.1:2", Region: "test",
+			CapacityMemoryMib: 1024, CapacityVcpus: 1,
+		}); err != nil {
+			t.Fatalf("create host: %v", err)
+		}
 	}
-	sandboxID := uuid.New()
-	if _, err := testPool.Exec(ctx,
-		`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,$3,'active',$4)`,
-		sandboxID, teamID, "teardown", hostID,
-	); err != nil {
-		t.Fatalf("insert sandbox: %v", err)
-	}
-	if _, err := testQueries.DestroySandbox(ctx, db.DestroySandboxParams{
-		ID: sandboxID, TeamID: teamID,
-		StaleTransitionalBefore: time.Now().Add(-time.Hour), RevocationExpiresAt: time.Now().Add(time.Hour),
-	}); err != nil {
-		t.Fatalf("destroy sandbox: %v", err)
-	}
-
-	listed := func(minAge int32) bool {
+	destroy := func(hostID string) uuid.UUID {
 		t.Helper()
-		rows, err := testQueries.ListClaimableTeardowns(ctx, db.ListClaimableTeardownsParams{MinAgeSeconds: minAge, MaxRows: 1000})
+		id := uuid.New()
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,$3,'active',$4)`,
+			id, teamID, "teardown", hostID,
+		); err != nil {
+			t.Fatalf("insert sandbox: %v", err)
+		}
+		row, err := testQueries.DestroySandbox(ctx, db.DestroySandboxParams{
+			ID: id, TeamID: teamID,
+			StaleTransitionalBefore: time.Now().Add(-time.Hour), RevocationExpiresAt: time.Now().Add(time.Hour),
+		})
 		if err != nil {
-			t.Fatalf("list claimable: %v", err)
+			t.Fatalf("destroy sandbox: %v", err)
 		}
-		for _, r := range rows {
-			if r.SandboxID == sandboxID {
-				if r.HostID != hostID {
-					t.Fatalf("listed host = %q, want %q", r.HostID, hostID)
-				}
-				return true
-			}
+		if row.HostID != hostID {
+			t.Fatalf("destroyed host = %q, want %q", row.HostID, hostID)
 		}
-		return false
+		return id
 	}
-	if listed(60) {
-		t.Fatal("a fresh record is listed before the sweeper's minimum age")
+	claim := func() (db.ClaimNextTeardownRow, bool) {
+		t.Helper()
+		row, err := testQueries.ClaimNextTeardown(ctx, 60)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return row, false
+		}
+		if err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		return row, true
 	}
-	if !listed(-1) {
-		t.Fatal("the delete did not record the reclaim")
+	// Other tests' deletes leave records too; release them so only this
+	// test's records are claimable in the assertions below.
+	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_teardown`); err != nil {
+		t.Fatalf("clear records: %v", err)
 	}
 
-	claimed, err := testQueries.ClaimTeardown(ctx, db.ClaimTeardownParams{LeaseSeconds: 60, SandboxID: sandboxID})
-	if err != nil {
-		t.Fatalf("claim: %v", err)
+	// Born owned by the deleting request, so the sweeper does not take it.
+	a1 := destroy(hostA)
+	var owned bool
+	var attempts int32
+	if err := testPool.QueryRow(ctx, `SELECT lease_until > now(), attempts FROM sandbox_teardown WHERE sandbox_id = $1`, a1).Scan(&owned, &attempts); err != nil {
+		t.Fatalf("read record: %v", err)
 	}
-	if claimed.HostID != hostID || claimed.Attempts != 1 {
-		t.Fatalf("claim = %+v, want host %q attempt 1", claimed, hostID)
+	if !owned || attempts != 1 {
+		t.Fatalf("born owned = %v, attempts = %d; want true, 1", owned, attempts)
 	}
-	if _, err := testQueries.ClaimTeardown(ctx, db.ClaimTeardownParams{LeaseSeconds: 60, SandboxID: sandboxID}); !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("second claim under the lease: err = %v, want no rows", err)
+	if _, ok := claim(); ok {
+		t.Fatal("the sweeper claimed a record the deleting request still owns")
 	}
-	if listed(-1) {
-		t.Fatal("a leased record is listed as claimable")
+	// Released, it is the sweeper's.
+	if err := testQueries.ReleaseTeardown(ctx, a1); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	rec, ok := claim()
+	if !ok || rec.SandboxID != a1 || rec.HostID != hostA || rec.Attempts != 1 {
+		t.Fatalf("claim after release = %+v (%v), want %s on %s at attempt 1", rec, ok, a1, hostA)
 	}
 
+	// One record per host in flight: with a1 held on host A, the next claim
+	// skips A's other record for B's, then finds nothing.
+	a2, b1 := destroy(hostA), destroy(hostB)
+	for _, id := range []uuid.UUID{a2, b1} {
+		if err := testQueries.ReleaseTeardown(ctx, id); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+	}
+	if rec, ok = claim(); !ok || rec.SandboxID != b1 {
+		t.Fatalf("claim with host A busy = %+v (%v), want %s", rec, ok, b1)
+	}
+	if rec, ok = claim(); ok {
+		t.Fatalf("claim with both hosts busy = %+v, want none", rec)
+	}
+
+	// Settles are fenced on the attempt.
+	if n, err := testQueries.CompleteTeardown(ctx, db.CompleteTeardownParams{SandboxID: a1, Attempts: 99}); err != nil || n != 0 {
+		t.Fatalf("complete under a stale attempt: rows = %d, err = %v; want 0", n, err)
+	}
+	if n, err := testQueries.CompleteTeardown(ctx, db.CompleteTeardownParams{SandboxID: a1, Attempts: 1}); err != nil || n != 1 {
+		t.Fatalf("complete: rows = %d, err = %v; want 1", n, err)
+	}
+	if rec, ok = claim(); !ok || rec.SandboxID != a2 {
+		t.Fatalf("claim once host A is free = %+v (%v), want %s", rec, ok, a2)
+	}
+
+	// A deferred record waits out its backoff; holding a host leaves its
+	// record in flight alone.
 	msg := "host unreachable"
-	if err := testQueries.DeferTeardown(ctx, db.DeferTeardownParams{RetryAfterSeconds: -1, LastError: &msg, SandboxID: sandboxID}); err != nil {
-		t.Fatalf("defer: %v", err)
+	if n, err := testQueries.DeferTeardown(ctx, db.DeferTeardownParams{RetryAfterSeconds: 3600, LastError: &msg, SandboxID: a2, Attempts: 1}); err != nil || n != 1 {
+		t.Fatalf("defer: rows = %d, err = %v", n, err)
 	}
-	claimed, err = testQueries.ClaimTeardown(ctx, db.ClaimTeardownParams{LeaseSeconds: 60, SandboxID: sandboxID})
-	if err != nil {
-		t.Fatalf("claim after the backoff: %v", err)
+	if n, err := testQueries.DeferHostTeardowns(ctx, db.DeferHostTeardownsParams{RetryAfterSeconds: 3600, LastError: &msg, HostID: hostB}); err != nil || n != 0 {
+		t.Fatalf("hold host with its record in flight: rows = %d, err = %v; want 0", n, err)
 	}
-	if claimed.Attempts != 2 {
-		t.Fatalf("attempts after a deferral = %d, want 2", claimed.Attempts)
+	if rec, ok = claim(); ok {
+		t.Fatalf("claim with a2 waiting and b1 in flight = %+v, want none", rec)
+	}
+	if n, err := testQueries.DeferTeardown(ctx, db.DeferTeardownParams{RetryAfterSeconds: -1, LastError: &msg, SandboxID: b1, Attempts: 1}); err != nil || n != 1 {
+		t.Fatalf("defer with the backoff passed: rows = %d, err = %v", n, err)
+	}
+	if rec, ok = claim(); !ok || rec.SandboxID != b1 || rec.Attempts != 2 {
+		t.Fatalf("claim after the backoff = %+v (%v), want %s at attempt 2", rec, ok, b1)
 	}
 
-	n, err := testQueries.CompleteTeardown(ctx, sandboxID)
-	if err != nil || n != 1 {
-		t.Fatalf("complete: rows = %d, err = %v", n, err)
-	}
-	if listed(-1) {
-		t.Fatal("a completed reclaim is still recorded")
+	backlog, err := testQueries.TeardownBacklog(ctx)
+	if err != nil || backlog.Total != 2 || backlog.Retrying != 1 || backlog.OldestAgeSeconds < 0 {
+		t.Fatalf("backlog = %+v, err = %v; want 2 total, 1 retrying", backlog, err)
 	}
 }

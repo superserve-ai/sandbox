@@ -41,7 +41,11 @@ func (r *captureTelemetryRecorder) RecordDBPoolStats(context.Context, telemetry.
 func (r *captureTelemetryRecorder) RecordPausedNetworkPressure(context.Context, telemetry.PausedNetworkPressure) {
 }
 func (r *captureTelemetryRecorder) RecordLauncherState(context.Context, telemetry.LauncherState) {}
-func (r *captureTelemetryRecorder) RecordPeerIngress(context.Context, telemetry.PeerIngress)     {}
+func (r *captureTelemetryRecorder) RecordTeardownAttempt(context.Context, telemetry.TeardownAttempt) {
+}
+func (r *captureTelemetryRecorder) RecordTeardownBacklog(context.Context, telemetry.TeardownBacklog) {
+}
+func (r *captureTelemetryRecorder) RecordPeerIngress(context.Context, telemetry.PeerIngress) {}
 
 func TestSandboxLifecycleTelemetryUsesHostID(t *testing.T) {
 	rec := &captureTelemetryRecorder{}

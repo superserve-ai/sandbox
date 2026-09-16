@@ -298,12 +298,6 @@ func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, para
 	})
 }
 
-// autoDeleteTeardownTimeout bounds one sandbox's teardown in the reaper.
-// The VMD calls inside carry their own timeouts, but the snapshot DB calls
-// do not — without this umbrella a hung query would pin a dispatch slot and
-// wedge the reaper loop on wg.Wait.
-const autoDeleteTeardownTimeout = 2 * time.Minute
-
 // teardownAutoDeleted reclaims VM state for one sandbox already soft-deleted
 // by ClaimAutoDeleteSandboxes, via the same teardown path as DeleteSandbox.
 func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDeleteSandboxesRow, logger zerolog.Logger) {
@@ -314,18 +308,12 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 		Str("name", sbx.Name).
 		Logger()
 
-	tctx, cancel := context.WithTimeout(ctx, autoDeleteTeardownTimeout)
-	defer cancel()
-	// The reclaim was recorded with the claim; run it inline and settle the
-	// record, so an incomplete one is retried by the sweeper like any other.
-	job := &teardownJob{ctx: tctx, sandboxID: sbx.ID, hostID: sbx.HostID, basePath: sbx.BasePath, templateID: sbx.TemplateID}
-	if claimed, ok := h.claimTeardown(job); ok {
-		err := h.teardownDestroyedSandbox(tctx, sbx.ID, sbx.HostID, claimed.BasePath, claimed.TemplateID)
-		h.settleTeardown(tctx, sbx.ID, sbx.HostID, claimed.Attempts, err)
-	}
+	h.teardownInline(ctx, teardownRecord{
+		SandboxID: sbx.ID, HostID: sbx.HostID, BasePath: sbx.BasePath, TemplateID: sbx.TemplateID, Attempts: 1,
+	}, "auto_delete")
 
 	l.Info().Msg("reaper: sandbox auto-deleted after paused window elapsed")
-	h.logSandboxActivity(tctx, sbx.ID, sbx.TeamID, nil, "sandbox", "auto_deleted", "success", &sbx.Name, nil, nil)
+	h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", "auto_deleted", "success", &sbx.Name, nil, nil)
 }
 
 // pauseExpired pauses one sandbox that was atomically claimed by

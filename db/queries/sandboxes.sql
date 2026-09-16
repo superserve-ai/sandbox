@@ -317,7 +317,7 @@ closed_storage AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT id FROM destroyed;
+SELECT id, host_id, base_path, template_id FROM destroyed;
 
 -- name: SandboxExists :one
 SELECT EXISTS(SELECT 1 FROM sandbox WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL);
@@ -1276,33 +1276,63 @@ SELECT s.host_id, h.vmd_addr, h.proxy_addr, h.incarnation_id, h.peer_generation
 FROM sandbox s LEFT JOIN host h ON h.id = s.host_id AND h.last_heartbeat_at IS NOT NULL
 WHERE s.id = $1 AND s.destroyed_at IS NULL;
 
--- name: ListClaimableTeardowns :many
--- Oldest reclaims nobody holds a lease on, for the teardown sweeper. The
--- min age keeps the sweeper off rows the deleting request's own worker is
--- about to take.
-SELECT sandbox_id, host_id
-FROM sandbox_teardown
-WHERE (lease_until IS NULL OR lease_until < now())
-  AND created_at < now() - make_interval(secs => sqlc.arg(min_age_seconds)::int)
-ORDER BY created_at ASC
-LIMIT sqlc.arg(max_rows);
-
--- name: ClaimTeardown :one
--- Takes the lease on one reclaim; 0 rows means another worker holds it or
--- it is already done.
+-- name: ClaimNextTeardown :one
+-- The sweeper's claim: the oldest reclaim nobody owns whose backoff has
+-- passed, on a host with no reclaim in flight, so a host that does not
+-- answer occupies one worker at most.
 UPDATE sandbox_teardown
 SET lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
     attempts = attempts + 1
-WHERE sandbox_id = sqlc.arg(sandbox_id)
-  AND (lease_until IS NULL OR lease_until < now())
+WHERE sandbox_id = (
+  SELECT t.sandbox_id
+  FROM sandbox_teardown t
+  WHERE t.lease_until <= now()
+    AND t.retry_at <= now()
+    AND NOT EXISTS (
+      SELECT 1 FROM sandbox_teardown l
+      WHERE l.host_id = t.host_id AND l.lease_until > now()
+    )
+  ORDER BY t.created_at
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+)
 RETURNING sandbox_id, host_id, base_path, template_id, attempts;
 
--- name: CompleteTeardown :execrows
-DELETE FROM sandbox_teardown WHERE sandbox_id = $1;
-
--- name: DeferTeardown :exec
--- The reclaim did not finish; hold it off for the backoff and keep why.
+-- name: ReleaseTeardown :exec
+-- The inline attempt did not run: hand the reclaim to the sweeper now
+-- rather than when the birth lease ends.
 UPDATE sandbox_teardown
-SET lease_until = now() + make_interval(secs => sqlc.arg(retry_after_seconds)::int),
+SET lease_until = now(), attempts = 0
+WHERE sandbox_id = $1 AND attempts = 1;
+
+-- name: CompleteTeardown :execrows
+-- Fenced on the attempt: a worker whose lease ran out cannot remove a
+-- reclaim a newer attempt is still working on.
+DELETE FROM sandbox_teardown
+WHERE sandbox_id = sqlc.arg(sandbox_id) AND attempts = sqlc.arg(attempts);
+
+-- name: DeferTeardown :execrows
+-- The attempt did not finish: release the lease, hold the reclaim for the
+-- backoff, keep why. Fenced on the attempt like CompleteTeardown.
+UPDATE sandbox_teardown
+SET lease_until = now(),
+    retry_at = now() + make_interval(secs => sqlc.arg(retry_after_seconds)::int),
+    permanent = sqlc.arg(permanent),
     last_error = sqlc.narg(last_error)
-WHERE sandbox_id = sqlc.arg(sandbox_id);
+WHERE sandbox_id = sqlc.arg(sandbox_id) AND attempts = sqlc.arg(attempts);
+
+-- name: DeferHostTeardowns :execrows
+-- The host did not answer: hold every reclaim on it that nobody is working
+-- on, so the sweeper does not try them one by one. Reclaims in flight are
+-- left to their workers.
+UPDATE sandbox_teardown
+SET retry_at = now() + make_interval(secs => sqlc.arg(retry_after_seconds)::int),
+    last_error = sqlc.narg(last_error)
+WHERE host_id = sqlc.arg(host_id) AND lease_until <= now();
+
+-- name: TeardownBacklog :one
+SELECT count(*)::bigint AS total,
+       count(*) FILTER (WHERE permanent)::bigint AS permanent,
+       count(*) FILTER (WHERE attempts > 1 AND NOT permanent)::bigint AS retrying,
+       coalesce(extract(epoch FROM now() - min(created_at)), 0)::float8 AS oldest_age_seconds
+FROM sandbox_teardown;

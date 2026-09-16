@@ -1,10 +1,10 @@
 -- A deleted sandbox's host-side reclaim (its VM, pause snapshots, and the
 -- per-build artifact dir) outlives the request that deleted it: the host may
 -- be slow or unreachable, and the control plane may restart. The reclaim is
--- therefore recorded in the same statement that deletes the row, worked by
--- bounded pools, retried under a lease until it completes, and removed only
--- once it has. Nothing here is reachable by clients; the row's lifecycle is
--- the control plane's alone.
+-- therefore recorded in the same statement that deletes the row and removed
+-- only once every step has completed. The deleting request owns the row for
+-- one bounded inline attempt; after that the sweeper retries it under leases
+-- of its own until it is done. Nothing here is reachable by clients.
 
 CREATE TABLE IF NOT EXISTS sandbox_teardown (
     sandbox_id  uuid PRIMARY KEY REFERENCES sandbox(id) ON DELETE CASCADE,
@@ -12,18 +12,25 @@ CREATE TABLE IF NOT EXISTS sandbox_teardown (
     base_path   text,
     template_id uuid,
     created_at  timestamptz NOT NULL DEFAULT now(),
-    attempts    integer NOT NULL DEFAULT 0,
-    lease_until timestamptz,
+    -- Owned by a worker until this passes. Born owned by the deleting
+    -- request's inline attempt; the sweeper takes its own lease per attempt.
+    lease_until timestamptz NOT NULL DEFAULT now() + interval '60 seconds',
+    -- Not retried before this: the backoff after a failed attempt.
+    retry_at    timestamptz NOT NULL DEFAULT now(),
+    attempts    integer NOT NULL DEFAULT 1,
+    -- The last attempt failed for a reason retrying cannot fix (the host is
+    -- no longer registered); kept for an operator, retried slowly.
+    permanent   boolean NOT NULL DEFAULT false,
     last_error  text
 );
 
--- The sweeper takes the oldest rows whose lease is absent or expired.
-CREATE INDEX IF NOT EXISTS idx_sandbox_teardown_created
-    ON sandbox_teardown (created_at);
+CREATE INDEX IF NOT EXISTS idx_sandbox_teardown_created ON sandbox_teardown (created_at);
 
 ALTER TABLE sandbox_teardown ENABLE ROW LEVEL SECURITY;
 
 COMMENT ON TABLE sandbox_teardown IS
   'Host-side reclaim still owed for a deleted sandbox; removed when the VM and its artifacts are gone.';
 COMMENT ON COLUMN sandbox_teardown.lease_until IS
-  'Until when the worker that claimed this reclaim may act on it; expired or NULL means claimable.';
+  'Until when the worker on this reclaim owns it; passed means no one is working on it.';
+COMMENT ON COLUMN sandbox_teardown.retry_at IS
+  'Not attempted again before this; the backoff after a failed attempt.';

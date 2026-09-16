@@ -317,6 +317,16 @@ func run() error {
 	}
 	handlers.StartTimeoutReaper(ctx, reaperCfg)
 	handlers.StartPauseReconciler(ctx)
+	// How long a delete spends reclaiming the host side before it answers;
+	// the sweeper finishes anything that did not fit. Bounded so a value
+	// cannot turn deletes into long waits.
+	if v := os.Getenv("TEARDOWN_INLINE_BUDGET"); v != "" {
+		if d, perr := time.ParseDuration(v); perr == nil && d >= time.Second && d <= 30*time.Second {
+			handlers.TeardownInlineBudget = d
+		} else {
+			log.Warn().Str("value", v).Msg("TEARDOWN_INLINE_BUDGET ignored; want 1s..30s")
+		}
+	}
 	handlers.StartTeardownSweeper(ctx)
 
 	// Launch the template build supervisor. Drives template_build rows

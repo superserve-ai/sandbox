@@ -717,10 +717,13 @@ type SandboxTeardown struct {
 	BasePath   *string     `json:"base_path"`
 	TemplateID pgtype.UUID `json:"template_id"`
 	CreatedAt  time.Time   `json:"created_at"`
-	Attempts   int32       `json:"attempts"`
-	// Until when the worker that claimed this reclaim may act on it; expired or NULL means claimable.
-	LeaseUntil pgtype.Timestamptz `json:"lease_until"`
-	LastError  *string            `json:"last_error"`
+	// Until when the worker on this reclaim owns it; passed means no one is working on it.
+	LeaseUntil time.Time `json:"lease_until"`
+	// Not attempted again before this; the backoff after a failed attempt.
+	RetryAt   time.Time `json:"retry_at"`
+	Attempts  int32     `json:"attempts"`
+	Permanent bool      `json:"permanent"`
+	LastError *string   `json:"last_error"`
 }
 
 type Secret struct {
