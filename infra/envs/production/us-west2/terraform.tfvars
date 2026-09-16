@@ -18,7 +18,8 @@ system_team_id_secret_name            = "system-team-id-production"
 notification_channel_ids              = ["projects/rayai-prod/notificationChannels/7690949645937454026"]
 active_sandbox_host                   = "standby"
 standby_host_id                       = "usw2-2-74d81d76d23344479f2b8c99de6cb42f"
-# Park the primary in a separate reviewed change after promotion succeeds.
-primary_host_running = true
+# The promotion has applied; the primary is parked stopped. Its local SSD is
+# empty, so a start only brings up a host with nothing to serve.
+primary_host_running = false
 # Preserve the existing issuer impersonation grant during promotion.
 peer_ca_operator_members = ["user:alejandro@superserve.ai"]
