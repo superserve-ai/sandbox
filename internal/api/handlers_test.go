@@ -203,6 +203,9 @@ type mockDBTX struct {
 	execFn     func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	// queryFn is optional; nil falls back to an empty rows iterator.
 	queryFn func(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	// claimTeardownFn is optional; nil answers ClaimTeardown with a fresh
+	// first-attempt lease on the sandbox being torn down.
+	claimTeardownFn func(args ...any) pgx.Row
 }
 
 func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
@@ -217,7 +220,40 @@ func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Ro
 			return nil
 		}}
 	}
+	// Every delete's teardown claims its recorded reclaim first; answer that
+	// centrally too so lifecycle tests script only what they assert on.
+	if strings.Contains(sql, "UPDATE sandbox_teardown") {
+		if m.claimTeardownFn != nil {
+			return m.claimTeardownFn(args...)
+		}
+		return claimTeardownRow(args[1].(uuid.UUID), 1)
+	}
 	return m.queryRowFn(ctx, sql, args...)
+}
+
+// claimTeardownRow returns a mockRow for ClaimTeardown's Scan.
+func claimTeardownRow(id uuid.UUID, attempts int32) *mockRow {
+	return &mockRow{scanFn: func(dest ...any) error {
+		*dest[0].(*uuid.UUID) = id
+		*dest[1].(*string) = ""
+		*dest[2].(**string) = nil
+		*dest[3].(*pgtype.UUID) = pgtype.UUID{}
+		*dest[4].(*int32) = attempts
+		return nil
+	}}
+}
+
+// claimableTeardownRows returns ListClaimableTeardowns' rows for the sweeper.
+func claimableTeardownRows(hostID string, ids ...uuid.UUID) pgx.Rows {
+	rows := &scanRows{}
+	for _, id := range ids {
+		rows.rows = append(rows.rows, func(dest ...any) error {
+			*dest[0].(*uuid.UUID) = id
+			*dest[1].(*string) = hostID
+			return nil
+		})
+	}
+	return rows
 }
 
 func (m *mockDBTX) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -486,6 +522,7 @@ func TestDeleteSandbox_Success(t *testing.T) {
 		return nil
 	}}
 
+	var completed int32
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
@@ -497,7 +534,10 @@ func TestDeleteSandbox_Success(t *testing.T) {
 				return activityRow()
 			}
 		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "DELETE FROM sandbox_teardown") {
+				atomic.AddInt32(&completed, 1)
+			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
@@ -512,6 +552,9 @@ func TestDeleteSandbox_Success(t *testing.T) {
 	}
 	if !destroyCalled {
 		t.Error("VMD.DestroyInstance was not called")
+	}
+	if atomic.LoadInt32(&completed) != 1 {
+		t.Error("the recorded teardown was not completed once the host reclaim finished")
 	}
 }
 
@@ -5110,7 +5153,7 @@ func pauseMocks(sb db.Sandbox, finalizes *int32) *mockDBTX {
 }
 
 // A teardown that outlives the inline budget must not hold the response:
-// the row is already deleted and the reconciler backstops the host side.
+// the row is already deleted and the recorded reclaim finishes on its own.
 func TestDeleteSandbox_SlowTeardownDoesNotHoldTheResponse(t *testing.T) {
 	prev := deleteTeardownInlineBudget
 	deleteTeardownInlineBudget = 50 * time.Millisecond
@@ -5249,9 +5292,9 @@ func TestDeleteSandbox_StalledHostDoesNotStarveOthers(t *testing.T) {
 }
 
 // Admission is bounded too: once a host's workers and queue are full,
-// further deletes still return 204 but their teardown is dropped to the
-// reconciler rather than parked as a waiter.
-func TestDeleteSandbox_FullQueueDropsToReconciler(t *testing.T) {
+// further deletes still return 204 but their teardown is not parked as a
+// waiter; the reclaim stays recorded and the sweeper runs it later.
+func TestDeleteSandbox_FullQueueLeavesTheRecordForTheSweeper(t *testing.T) {
 	prev := deleteTeardownInlineBudget
 	deleteTeardownInlineBudget = 20 * time.Millisecond
 	defer func() { deleteTeardownInlineBudget = prev }()
@@ -5275,6 +5318,169 @@ func TestDeleteSandbox_FullQueueDropsToReconciler(t *testing.T) {
 		ids = append(ids, id)
 		byID[id.String()] = db.Sandbox{ID: id, TeamID: teamID, Name: "stalled", Status: db.SandboxStatusActive, HostID: "host-stalled"}
 	}
+	admitted := maxTeardownsPerHost + teardownQueueDepth
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			var id uuid.UUID
+			for _, a := range args {
+				if v, ok := a.(uuid.UUID); ok {
+					id = v
+					break
+				}
+			}
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(id)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(byID[id.String()])
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+		// The records the full queue left behind are what the sweeper lists.
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "FROM sandbox_teardown") {
+				return claimableTeardownRows("host-stalled", ids[admitted:]...), nil
+			}
+			return emptyRows{}, nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	router := setupTestRouter(h, teamID.String())
+	for i, id := range ids {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, deleteRequest(id.String()))
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("delete %d: status = %d; body: %s", i, w.Code, w.Body.String())
+		}
+	}
+	close(release)
+	h.WaitAsyncBookkeeping()
+	// Workers plus queue depth ran; the surplus was never queued.
+	if got := atomic.LoadInt32(&destroyCalls); got != int32(admitted) {
+		t.Fatalf("teardowns run = %d, want %d (workers + queue depth)", got, admitted)
+	}
+	// A sweep tick runs the rest.
+	h.SweepTeardownsOnce(context.Background(), zerolog.Nop())
+	h.WaitAsyncBookkeeping()
+	if got := atomic.LoadInt32(&destroyCalls); got != int32(total) {
+		t.Fatalf("teardowns run after the sweep = %d, want %d", got, total)
+	}
+}
+
+// A reclaim another worker already holds (or has finished) is not run
+// again; the delete still answers 204.
+func TestDeleteSandbox_ClaimHeldElsewhereSkipsTeardown(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+	var destroyCalls, completed int32
+	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error {
+		atomic.AddInt32(&destroyCalls, 1)
+		return nil
+	}}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "sandbox_teardown") {
+				atomic.AddInt32(&completed, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+		claimTeardownFn: func(...any) pgx.Row { return errorRow(pgx.ErrNoRows) },
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if atomic.LoadInt32(&destroyCalls) != 0 || atomic.LoadInt32(&completed) != 0 {
+		t.Fatalf("destroy calls = %d, record writes = %d; want none for a reclaim held elsewhere", destroyCalls, completed)
+	}
+}
+
+// A host that does not answer leaves the reclaim recorded, deferred with
+// its error, rather than completed.
+func TestDeleteSandbox_FailedTeardownIsDeferred(t *testing.T) {
+	prev := deleteTeardownInlineBudget
+	deleteTeardownInlineBudget = 50 * time.Millisecond
+	defer func() { deleteTeardownInlineBudget = prev }()
+
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error { return errors.New("host unreachable") }}
+	var deferred, completed int32
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(sandboxID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			switch {
+			case strings.Contains(sql, "DELETE FROM sandbox_teardown"):
+				atomic.AddInt32(&completed, 1)
+			case strings.Contains(sql, "UPDATE sandbox_teardown"):
+				atomic.AddInt32(&deferred, 1)
+				if got, _ := args[1].(*string); got == nil || !strings.Contains(*got, "host unreachable") {
+					t.Errorf("deferred without the host's error: %v", args[1])
+				}
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if atomic.LoadInt32(&deferred) != 1 || atomic.LoadInt32(&completed) != 0 {
+		t.Fatalf("deferred = %d, completed = %d; want the reclaim deferred, not completed", deferred, completed)
+	}
+}
+
+// A panic inside one reclaim is confined to that job: the host's workers
+// keep serving, and the job's waiter is released.
+func TestDeleteSandbox_PanicInOneTeardownDoesNotStopTheWorkers(t *testing.T) {
+	teamID := uuid.New()
+	byID := map[string]db.Sandbox{}
+	ids := make([]uuid.UUID, 0, maxTeardownsPerHost+1)
+	for i := 0; i <= maxTeardownsPerHost; i++ {
+		id := uuid.MustParse(fmt.Sprintf("0000%04d-0000-4000-8000-%012d", i, i))
+		ids = append(ids, id)
+		byID[id.String()] = db.Sandbox{ID: id, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive, HostID: "host-a"}
+	}
+	last := ids[maxTeardownsPerHost]
+	lastDone := make(chan struct{})
+	vmd := &stubVMD{destroyFn: func(_ context.Context, id string, _ bool) error {
+		if id == last.String() {
+			close(lastDone)
+			return nil
+		}
+		panic("teardown exploded")
+	}}
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 			var id uuid.UUID
@@ -5299,17 +5505,19 @@ func TestDeleteSandbox_FullQueueDropsToReconciler(t *testing.T) {
 	}
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	router := setupTestRouter(h, teamID.String())
+	// One panic per worker, then a delete that must still be served.
 	for i, id := range ids {
 		w := httptest.NewRecorder()
+		start := time.Now()
 		router.ServeHTTP(w, deleteRequest(id.String()))
-		if w.Code != http.StatusNoContent {
-			t.Fatalf("delete %d: status = %d; body: %s", i, w.Code, w.Body.String())
+		if w.Code != http.StatusNoContent || time.Since(start) > deleteTeardownInlineBudget {
+			t.Fatalf("delete %d: status = %d after %s", i, w.Code, time.Since(start))
 		}
 	}
-	close(release)
-	h.WaitAsyncBookkeeping()
-	// Workers plus queue depth ran; the surplus was dropped, never queued.
-	if got := atomic.LoadInt32(&destroyCalls); got != int32(maxTeardownsPerHost+teardownQueueDepth) {
-		t.Fatalf("teardowns run = %d, want %d (workers + queue depth)", got, maxTeardownsPerHost+teardownQueueDepth)
+	select {
+	case <-lastDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the workers stopped serving after the panics")
 	}
+	h.WaitAsyncBookkeeping()
 }

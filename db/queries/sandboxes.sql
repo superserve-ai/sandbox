@@ -278,7 +278,7 @@ WITH destroyed AS (
       OR (sandbox.status IN ('starting', 'resuming', 'pausing', 'migrating')
           AND sandbox.updated_at < sqlc.arg(stale_transitional_before))
     )
-  RETURNING id, had_secret_bindings
+  RETURNING id, had_secret_bindings, host_id, base_path, template_id
 ),
 revoked AS (
   -- Only sandboxes that ever had a binding: the proxy consults this set only
@@ -287,6 +287,13 @@ revoked AS (
   -- revoke.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
   SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed WHERE had_secret_bindings IS NOT FALSE
+  ON CONFLICT (sandbox_id) DO NOTHING
+),
+owed AS (
+  -- The host-side reclaim is recorded with the delete, so neither a slow
+  -- host nor a control-plane restart can lose it (see sandbox_teardown).
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id)
+  SELECT id, host_id, base_path, template_id FROM destroyed
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -1174,6 +1181,11 @@ revoked AS (
   SELECT id, sqlc.arg(revocation_expires_at) FROM destroyed WHERE had_secret_bindings IS NOT FALSE
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
+owed AS (
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id)
+  SELECT id, host_id, base_path, template_id FROM destroyed
+  ON CONFLICT (sandbox_id) DO NOTHING
+),
 closed_compute AS (
   UPDATE sandbox_active_interval
   SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
@@ -1263,3 +1275,34 @@ WHERE id = sqlc.arg(id) AND destroyed_at IS NULL AND status = 'pausing'
 SELECT s.host_id, h.vmd_addr, h.proxy_addr, h.incarnation_id, h.peer_generation
 FROM sandbox s LEFT JOIN host h ON h.id = s.host_id AND h.last_heartbeat_at IS NOT NULL
 WHERE s.id = $1 AND s.destroyed_at IS NULL;
+
+-- name: ListClaimableTeardowns :many
+-- Oldest reclaims nobody holds a lease on, for the teardown sweeper. The
+-- min age keeps the sweeper off rows the deleting request's own worker is
+-- about to take.
+SELECT sandbox_id, host_id
+FROM sandbox_teardown
+WHERE (lease_until IS NULL OR lease_until < now())
+  AND created_at < now() - make_interval(secs => sqlc.arg(min_age_seconds)::int)
+ORDER BY created_at ASC
+LIMIT sqlc.arg(max_rows);
+
+-- name: ClaimTeardown :one
+-- Takes the lease on one reclaim; 0 rows means another worker holds it or
+-- it is already done.
+UPDATE sandbox_teardown
+SET lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
+    attempts = attempts + 1
+WHERE sandbox_id = sqlc.arg(sandbox_id)
+  AND (lease_until IS NULL OR lease_until < now())
+RETURNING sandbox_id, host_id, base_path, template_id, attempts;
+
+-- name: CompleteTeardown :execrows
+DELETE FROM sandbox_teardown WHERE sandbox_id = $1;
+
+-- name: DeferTeardown :exec
+-- The reclaim did not finish; hold it off for the backoff and keep why.
+UPDATE sandbox_teardown
+SET lease_until = now() + make_interval(secs => sqlc.arg(retry_after_seconds)::int),
+    last_error = sqlc.narg(last_error)
+WHERE sandbox_id = sqlc.arg(sandbox_id);

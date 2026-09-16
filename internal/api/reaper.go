@@ -271,10 +271,10 @@ func (h *Handlers) sweepOrphanedSnapshotRows(ctx context.Context, logger zerolog
 
 // reapAutoDeleteOnce deletes paused sandboxes whose auto-delete deadline has
 // passed. ClaimAutoDeleteSandboxes soft-deletes the rows (revocation written,
-// intervals closed) in one guarded statement, so everything after the claim is
-// best-effort teardown of VM state and artifacts — same contract as the
-// user-initiated DeleteSandbox, where the vm reconciler backstops any teardown
-// step that fails.
+// intervals closed, reclaim recorded) in one guarded statement, so everything
+// after the claim is the teardown of VM state and artifacts — same contract
+// as the user-initiated DeleteSandbox, with the sweeper retrying any step
+// that fails.
 func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, parallelism int, logger zerolog.Logger) {
 	queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
 	due, err := h.DB.ClaimAutoDeleteSandboxes(queryCtx, db.ClaimAutoDeleteSandboxesParams{
@@ -316,7 +316,13 @@ func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDele
 
 	tctx, cancel := context.WithTimeout(ctx, autoDeleteTeardownTimeout)
 	defer cancel()
-	h.teardownDestroyedSandbox(tctx, sbx.ID, sbx.HostID, sbx.BasePath, sbx.TemplateID)
+	// The reclaim was recorded with the claim; run it inline and settle the
+	// record, so an incomplete one is retried by the sweeper like any other.
+	job := &teardownJob{ctx: tctx, sandboxID: sbx.ID, hostID: sbx.HostID, basePath: sbx.BasePath, templateID: sbx.TemplateID}
+	if claimed, ok := h.claimTeardown(job); ok {
+		err := h.teardownDestroyedSandbox(tctx, sbx.ID, sbx.HostID, claimed.BasePath, claimed.TemplateID)
+		h.settleTeardown(tctx, sbx.ID, sbx.HostID, claimed.Attempts, err)
+	}
 
 	l.Info().Msg("reaper: sandbox auto-deleted after paused window elapsed")
 	h.logSandboxActivity(tctx, sbx.ID, sbx.TeamID, nil, "sandbox", "auto_deleted", "success", &sbx.Name, nil, nil)

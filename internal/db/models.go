@@ -710,6 +710,19 @@ type SandboxStorageInterval struct {
 	EndReason *string            `json:"end_reason"`
 }
 
+// Host-side reclaim still owed for a deleted sandbox; removed when the VM and its artifacts are gone.
+type SandboxTeardown struct {
+	SandboxID  uuid.UUID   `json:"sandbox_id"`
+	HostID     string      `json:"host_id"`
+	BasePath   *string     `json:"base_path"`
+	TemplateID pgtype.UUID `json:"template_id"`
+	CreatedAt  time.Time   `json:"created_at"`
+	Attempts   int32       `json:"attempts"`
+	// Until when the worker that claimed this reclaim may act on it; expired or NULL means claimable.
+	LeaseUntil pgtype.Timestamptz `json:"lease_until"`
+	LastError  *string            `json:"last_error"`
+}
+
 type Secret struct {
 	ID               uuid.UUID          `json:"id"`
 	TeamID           uuid.UUID          `json:"team_id"`

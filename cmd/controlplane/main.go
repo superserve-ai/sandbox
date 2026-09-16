@@ -317,6 +317,7 @@ func run() error {
 	}
 	handlers.StartTimeoutReaper(ctx, reaperCfg)
 	handlers.StartPauseReconciler(ctx)
+	handlers.StartTeardownSweeper(ctx)
 
 	// Launch the template build supervisor. Drives template_build rows
 	// through pending → building → snapshotting → ready/failed by calling
