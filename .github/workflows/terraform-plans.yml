@@ -148,7 +148,7 @@ jobs:
           } > "$summary_file"
           exit "$plan_status"
 
-      - name: Verify west promotion and OTLP ingress
+      - name: Verify west VMD and OTLP ingress
         if: env.HAS_GCP_AUTH == 'true' && matrix.name == 'production-us-west2'
         shell: bash
         run: bash "${GITHUB_WORKSPACE}/scripts/terraform-plan-west.sh"
