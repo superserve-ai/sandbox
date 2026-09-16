@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -456,61 +457,123 @@ func TestUnverifiedOrphanGrace(t *testing.T) {
 }
 
 // A reconciler rule that proves an interrupted resume's process dead must
-// not delete its record: the paused image is intact, so the record returns
-// to Paused keeping its slot, and the instance is dropped for a reattach to
-// reload. The slot is not released: a reattach that read the older record
-// re-tracks it when it publishes, and a released slot could be another VM's
-// by then.
+// not delete its record: the paused image is intact. The record is returned
+// to Paused by the reattach flight, which serializes with lazy loads, so a
+// reattach that read the older record can never publish over the recovery.
 func TestMarkStaleReturnsAnInterruptedResumeToPaused(t *testing.T) {
-	st, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, WakeOwedFromPaused: true, WakeToken: "disk", FreezeToken: "rec", Supervision: SupervisionUnit, Namespace: "ns-1", IP: "10.0.0.2", MemFilePath: "/snap/mem.snap"}
-	if err := st.Put(rec); err != nil {
-		t.Fatal(err)
-	}
-	inst := toInstance(rec)
-	net := &fakeNetMgr{}
-	m := &Manager{log: zerolog.Nop(), state: st, netMgr: net, vms: map[string]*VMInstance{"vm-1": inst}}
-	r := NewReconciler(m, DefaultReconcilerConfig())
-	if err := r.markStale("vm-1"); err != nil {
-		t.Fatalf("markStale: %v", err)
-	}
-	got, _ := st.Get("vm-1")
-	if got == nil || got.Status != StatusPaused || got.WakePending || got.WakeOwedFromPaused || got.Unverified || got.WakeToken != "" {
-		t.Fatalf("record = %+v; want Paused with nothing owed", got)
-	}
-	if got.Namespace != "ns-1" || got.IP != "10.0.0.2" || got.FreezeToken != "rec" || got.MemFilePath != "/snap/mem.snap" {
-		t.Errorf("record = %+v; want the slot, image and token kept", got)
-	}
-	m.mu.RLock()
-	_, tracked := m.vms["vm-1"]
-	m.mu.RUnlock()
-	if tracked {
-		t.Fatal("the stale instance must be dropped for a reattach to reload the Paused record")
-	}
-	if len(net.cleanupCalls) != 0 {
-		t.Fatalf("cleanup calls = %+v; the slot must stay with the paused record", net.cleanupCalls)
+	origDown := vmUnitFullyDown
+	vmUnitFullyDown = func(string) bool { return true }
+	t.Cleanup(func() { vmUnitFullyDown = origDown })
+	newCase := func(t *testing.T) (*Reconciler, *Manager, *StateStore, VMRecord, *fakeNetMgr) {
+		t.Helper()
+		st, err := OpenStateStore(filepath.Join(t.TempDir(), "vmd.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = st.Close() })
+		rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, WakeOwedFromPaused: true, WakeToken: "disk", FreezeToken: "rec", Supervision: SupervisionUnit, Namespace: "ns-1", IP: "10.0.0.2", MemFilePath: "/snap/mem.snap"}
+		if err := st.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+		net := &fakeNetMgr{}
+		m := &Manager{log: zerolog.Nop(), state: st, netMgr: net, vms: map[string]*VMInstance{}}
+		return NewReconciler(m, DefaultReconcilerConfig()), m, st, rec, net
 	}
 
-	// The reattach that read the older record publishes after the rewrite:
-	// it resolves the owed wake first, so it lands Paused on the same slot.
-	origDown, origWake := vmUnitFullyDown, boxdWakeGuest
-	vmUnitFullyDown = func(string) bool { return true }
-	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return errors.New("no answer") }
-	t.Cleanup(func() { vmUnitFullyDown, boxdWakeGuest = origDown, origWake })
-	if _, ok := m.reattachRecord(context.Background(), rec, false); !ok {
-		t.Fatal("the stale reattach must still publish")
-	}
-	got, _ = st.Get("vm-1")
-	if got == nil || got.Status != StatusPaused || got.WakePending || got.Namespace != "ns-1" {
-		t.Fatalf("record = %+v after the stale publish; want Paused on the same slot", got)
-	}
-	if len(net.cleanupCalls) != 0 {
-		t.Fatalf("cleanup calls = %+v; nothing may be released under the stale publish", net.cleanupCalls)
-	}
+	t.Run("untracked_record_returns_to_paused", func(t *testing.T) {
+		r, m, st, _, net := newCase(t)
+		if err := r.markStale("vm-1"); err != nil {
+			t.Fatalf("markStale: %v", err)
+		}
+		got, _ := st.Get("vm-1")
+		if got == nil || got.Status != StatusPaused || got.WakePending || got.WakeOwedFromPaused || got.Unverified || got.WakeToken != "" {
+			t.Fatalf("record = %+v; want Paused with nothing owed", got)
+		}
+		if got.Namespace != "ns-1" || got.FreezeToken != "rec" || got.MemFilePath != "/snap/mem.snap" {
+			t.Errorf("record = %+v; want the slot, image and token kept", got)
+		}
+		m.mu.RLock()
+		inst := m.vms["vm-1"]
+		m.mu.RUnlock()
+		if inst == nil || inst.Status != StatusPaused {
+			t.Fatalf("instance = %+v; want the flight to publish it Paused", inst)
+		}
+		if len(net.cleanupCalls) != 0 {
+			t.Fatalf("cleanup calls = %+v; the slot stays with the paused record", net.cleanupCalls)
+		}
+	})
+
+	// A record the flight cannot converge (here: an instance already tracked,
+	// parked behind an unconfirmed stop) is reported, so the rule does not
+	// count it reaped; the sweep returns it to Paused later.
+	t.Run("unconverged_record_is_reported_not_reaped", func(t *testing.T) {
+		r, m, st, rec, _ := newCase(t)
+		rec.Status = StatusError
+		if err := st.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+		m.vms["vm-1"] = toInstance(rec)
+		if err := r.markStale("vm-1"); err == nil {
+			t.Fatal("markStale must report an interrupted resume it could not return to Paused")
+		}
+		got, _ := st.Get("vm-1")
+		if got == nil || !interruptedResume(*got) {
+			t.Fatalf("record = %+v; want it kept for the sweep", got)
+		}
+	})
+
+	// The reconciler's recovery joins a reattach already in flight for the VM
+	// rather than writing beside it: it returns only after that flight.
+	t.Run("recovery_joins_an_in_flight_reattach", func(t *testing.T) {
+		r, m, st, _, _ := newCase(t)
+		origHook, origWake := reattachHook, boxdWakeGuest
+		boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return errors.New("no answer") }
+		t.Cleanup(func() { reattachHook, boxdWakeGuest = origHook, origWake })
+		release := make(chan struct{})
+		staleDone := make(chan error, 1)
+		var once sync.Once
+		reattachHook = func(string) {
+			once.Do(func() {
+				go func() { staleDone <- r.markStale("vm-1") }()
+				select {
+				case err := <-staleDone:
+					t.Errorf("markStale returned (%v) while a reattach was in flight", err)
+				case <-time.After(100 * time.Millisecond):
+				}
+				close(release)
+			})
+		}
+		if inst := m.reattachByID("vm-1", false); inst == nil || inst.Status != StatusPaused {
+			t.Fatalf("lazy reattach = %+v; want it to return the record to Paused itself", inst)
+		}
+		<-release
+		if err := <-staleDone; err != nil {
+			t.Fatalf("markStale after the flight: %v", err)
+		}
+		got, _ := st.Get("vm-1")
+		if got == nil || got.Status != StatusPaused || got.Namespace != "ns-1" {
+			t.Fatalf("record = %+v; want Paused on its slot", got)
+		}
+	})
+
+	// A record converged to Paused between a rule's snapshot and its
+	// markStale is whole, not stale: it is refused, not deleted.
+	t.Run("a_record_paused_meanwhile_is_refused", func(t *testing.T) {
+		r, _, st, rec, net := newCase(t)
+		rec.returnToPaused()
+		if err := st.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.markStale("vm-1"); err == nil {
+			t.Fatal("markStale must refuse a paused record")
+		}
+		if got, _ := st.Get("vm-1"); got == nil || got.Status != StatusPaused {
+			t.Fatalf("record = %+v; want it kept", got)
+		}
+		if len(net.cleanupCalls) != 0 {
+			t.Fatalf("cleanup calls = %+v; nothing may be released", net.cleanupCalls)
+		}
+	})
 }
 
 // markStale's delete is the gate for the whole cleanup: the map entry and the

@@ -1560,25 +1560,35 @@ func (r *Reconciler) markStale(vmID string) error {
 		_ = r.mgr.cgroups.removeVMCgroup(context.Background(), vmID)
 	}
 
+	// A resume that never ran its guest is not deleted: its paused image is
+	// intact. Its record is rewritten only inside the reattach flight, which
+	// serializes with lazy loads, so no reattach that read the older record
+	// can publish over the recovery. The flight returns it to Paused once the
+	// process is known gone; anything short of that is reported, not reaped.
+	if rec != nil && interruptedResume(*rec) {
+		r.mgr.reattachByID(vmID, true)
+		again, err := r.mgr.state.Get(vmID)
+		if err != nil || (again != nil && interruptedResume(*again)) {
+			return fmt.Errorf("vm %s: interrupted resume not returned to Paused; left for the reattach sweep", vmID)
+		}
+		r.mu.Lock()
+		delete(r.driftSeen, vmID)
+		r.mu.Unlock()
+		r.mgr.log.Warn().Str("component", "reconciler").Str("vm_id", vmID).
+			Msg("reconciler: resume interrupted before its guest ran — record returned to Paused")
+		return nil
+	}
+	// No rule matches a paused record: one that reads Paused now was
+	// converged after the rule's snapshot, and deleting it would lose a
+	// sandbox that is whole.
+	if rec != nil && rec.Status == StatusPaused {
+		return fmt.Errorf("vm %s: record is paused; not stale", vmID)
+	}
+
 	// Delete from BoltDB first. Deleting from the map before BoltDB would
 	// cause ReattachAll to resurrect the stale record on next restart, so a
 	// failure here abandons the whole cleanup rather than half-applying it.
-	// A resume that never ran its guest is not deleted: its paused image is
-	// intact, so the record returns to Paused. It keeps its slot, as a paused
-	// VM may: a reattach that read the older record publishes over this
-	// write, re-tracking the same slot, so the slot is never handed on under
-	// it. Pressure or a destroy releases it.
-	returned := false
-	if rec != nil && interruptedResume(*rec) {
-		paused := *rec
-		paused.returnToPaused()
-		returned = true
-		if _, err := r.mgr.state.PutIfPresent(paused); err != nil {
-			r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: interrupted resume's record could not be returned to Paused")
-			return err
-		}
-		r.mgr.log.Warn().Str("vm_id", vmID).Msg("reconciler: resume interrupted before its guest ran — record returns to Paused")
-	} else if err := r.mgr.state.Delete(vmID); err != nil {
+	if err := r.mgr.state.Delete(vmID); err != nil {
 		r.mgr.log.Error().Err(err).Str("vm_id", vmID).Msg("reconciler: failed to delete stale state")
 		return err
 	}
@@ -1588,7 +1598,7 @@ func (r *Reconciler) markStale(vmID string) error {
 	r.mgr.mu.Unlock()
 
 	// Free the slot too. netMgr is always set in prod; the nil check is defensive.
-	if r.mgr.netMgr != nil && !returned {
+	if r.mgr.netMgr != nil {
 		r.mgr.netMgr.CleanupVMOrNamespace(vmID, namespace)
 	}
 
