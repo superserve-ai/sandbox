@@ -1362,6 +1362,6 @@ WHERE host_id = sqlc.arg(host_id) AND lease_until <= now();
 -- name: TeardownBacklog :one
 SELECT count(*)::bigint AS total,
        count(*) FILTER (WHERE permanent)::bigint AS permanent,
-       count(*) FILTER (WHERE attempts > 1 AND NOT permanent)::bigint AS retrying,
+       count(*) FILTER (WHERE last_error IS NOT NULL AND NOT permanent)::bigint AS retrying,
        coalesce(extract(epoch FROM now() - min(created_at)), 0)::float8 AS oldest_age_seconds
 FROM sandbox_teardown;

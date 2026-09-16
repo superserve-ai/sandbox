@@ -6897,6 +6897,14 @@ func TestIntegration_AutoDeleteTeardownStartsAtAttemptZero(t *testing.T) {
 	if row.SandboxID != id || row.Attempts != 1 {
 		t.Fatalf("first claim = %s attempt %d, want %s attempt 1", row.SandboxID, row.Attempts, id)
 	}
+	// A first attempt that fails is already a retry in waiting.
+	msg := "host unreachable"
+	if n, err := testQueries.DeferTeardown(ctx, db.DeferTeardownParams{RetryAfterSeconds: 30, LastError: &msg, SandboxID: id, Attempts: 1}); err != nil || n != 1 {
+		t.Fatalf("defer: rows = %d, err = %v", n, err)
+	}
+	if b, err := testQueries.TeardownBacklog(ctx); err != nil || b.Retrying != 1 {
+		t.Fatalf("backlog after a failed first attempt = %+v, err = %v; want 1 retrying", b, err)
+	}
 }
 
 // A claim still in flight on one host does not draw the next worker onto
