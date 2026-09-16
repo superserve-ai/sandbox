@@ -339,8 +339,9 @@ revoked AS (
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 owed AS (
-  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until)
-  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => $3::int)
+  -- No inline attempt here: born at zero so the sweeper's first claim is attempt 1.
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until, attempts)
+  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => $3::int), 0
   FROM destroyed
   ON CONFLICT (sandbox_id) DO NOTHING
 ),

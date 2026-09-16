@@ -6853,3 +6853,48 @@ func TestIntegration_TeardownClaimsForOneHostSerializeAcrossConnections(t *testi
 		t.Fatalf("%d concurrent claims took host %s, want exactly 1", won, hostID)
 	}
 }
+
+// An auto-deleted sandbox makes no inline attempt, so its record starts at
+// zero and the sweeper's first claim is attempt 1.
+func TestIntegration_AutoDeleteTeardownStartsAtAttemptZero(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	hostID := "teardown-auto-" + uuid.NewString()
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID: hostID, VmdAddr: "127.0.0.1:1", ProxyAddr: "127.0.0.1:2", Region: "test",
+		CapacityMemoryMib: 1024, CapacityVcpus: 1,
+	}); err != nil {
+		t.Fatalf("create host: %v", err)
+	}
+	for _, table := range []string{"sandbox_teardown", "sandbox_teardown_host"} {
+		if _, err := testPool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
+	id := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO sandbox (id, team_id, name, status, host_id, auto_delete_at) VALUES ($1,$2,'teardown-auto','paused',$3, now() - interval '1 minute')`,
+		id, teamID, hostID,
+	); err != nil {
+		t.Fatalf("insert sandbox: %v", err)
+	}
+	if _, err := testQueries.ClaimAutoDeleteSandboxes(ctx, db.ClaimAutoDeleteSandboxesParams{
+		BatchSize: 100, RevocationExpiresAt: time.Now().Add(time.Hour), LeaseSeconds: 0,
+	}); err != nil {
+		t.Fatalf("claim auto-delete: %v", err)
+	}
+	var attempts int32
+	if err := testPool.QueryRow(ctx, `SELECT attempts FROM sandbox_teardown WHERE sandbox_id = $1`, id).Scan(&attempts); err != nil {
+		t.Fatalf("teardown row: %v", err)
+	}
+	if attempts != 0 {
+		t.Fatalf("born attempts = %d, want 0", attempts)
+	}
+	row, err := testQueries.ClaimNextTeardown(ctx, 60)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if row.SandboxID != id || row.Attempts != 1 {
+		t.Fatalf("first claim = %s attempt %d, want %s attempt 1", row.SandboxID, row.Attempts, id)
+	}
+}
