@@ -23,10 +23,12 @@ verify_plan() {
     | map({key: .name, value: .value}) | from_entries) as $env
   | ([resources | select(.address == $host_address)][0].values.network_interface[0].network_ip) as $host_ip
   | ([resources | select(.address == $host_address)][0].values.tags) as $host_tags
+  | ([resources | select(.address == $host_address)][0].values.desired_status) as $host_status
   | ([resources | select(.address == "module.network.google_compute_subnetwork.connector[0]")][0].values.ip_cidr_range) as $connector_cidr
   | ([resources | select(.address == "module.network.google_compute_firewall.rules[\"allow_vmd_grpc\"]")][0].values) as $grpc_firewall
   | ([resources | select(.address == "module.network.google_compute_firewall.rules[\"allow_otel_ingress\"]")][0].values) as $otel_firewall
   | select($host_tags == ["vmd-usw2"])
+  | select($host_role != "primary" or $host_status == "RUNNING")
   | select($env.VMD_GRPC_ADDRESS == ($host_ip + ":50051"))
   | select($env.DEFAULT_HOST_ID == (if $host_role == "standby" then $standby_host_id else "usw2" end))
   | select($env.DB_MAX_CONNS == "15")
@@ -46,7 +48,7 @@ verify_plan() {
 
 # Check both active-host selections so exporter and gRPC routing cannot regress
 # for either the primary rollback or promoted standby path.
-terraform plan -var='active_sandbox_host=primary' -out=tfplan-primary
+terraform plan -var='active_sandbox_host=primary' -var='primary_host_running=true' -out=tfplan-primary
 verify_plan tfplan-primary 'module.sandbox_host.google_compute_instance.this' primary
 terraform plan -var='active_sandbox_host=standby' -out=tfplan-standby
 verify_plan tfplan-standby 'module.sandbox_host_b.google_compute_instance.this' standby
