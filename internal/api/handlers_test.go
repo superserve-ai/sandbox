@@ -5163,3 +5163,87 @@ func TestDeleteSandbox_SlowTeardownDoesNotHoldTheResponse(t *testing.T) {
 		t.Error("teardown did not complete in the background")
 	}
 }
+
+// Teardowns are bounded per host: a host whose teardowns all stall holds
+// only its own slots, and a delete on another host still reclaims inline.
+func TestDeleteSandbox_StalledHostDoesNotStarveOthers(t *testing.T) {
+	prev := deleteTeardownInlineBudget
+	deleteTeardownInlineBudget = 50 * time.Millisecond
+	defer func() { deleteTeardownInlineBudget = prev }()
+
+	teamID := uuid.New()
+	release := make(chan struct{})
+	var stalledStarted, healthyDone int32
+	vmd := &stubVMD{destroyFn: func(ctx context.Context, id string, _ bool) error {
+		if strings.HasPrefix(id, "0000") {
+			atomic.AddInt32(&stalledStarted, 1)
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return nil
+		}
+		atomic.AddInt32(&healthyDone, 1)
+		return nil
+	}}
+	// One mock serving every sandbox by the id in the request, so nothing on
+	// the handler is reassigned while earlier requests' async work still
+	// runs.
+	byID := map[string]db.Sandbox{}
+	healthyID := uuid.New()
+	byID[healthyID.String()] = db.Sandbox{ID: healthyID, TeamID: teamID, Name: "healthy", Status: db.SandboxStatusActive, HostID: "host-healthy"}
+	var stalledIDs []uuid.UUID
+	for i := 0; i < maxTeardownsPerHost+4; i++ {
+		id := uuid.MustParse(fmt.Sprintf("0000%04d-0000-4000-8000-%012d", i, i))
+		stalledIDs = append(stalledIDs, id)
+		byID[id.String()] = db.Sandbox{ID: id, TeamID: teamID, Name: "stalled", Status: db.SandboxStatusActive, HostID: "host-stalled"}
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			var id uuid.UUID
+			for _, a := range args {
+				if v, ok := a.(uuid.UUID); ok {
+					id = v
+					break
+				}
+			}
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return idRow(id)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(byID[id.String()])
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	router := setupTestRouter(h, teamID.String())
+
+	// More deletes on the stalled host than it has slots; the surplus waits.
+	for i, id := range stalledIDs {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, deleteRequest(id.String()))
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("stalled delete %d: status = %d; body: %s", i, w.Code, w.Body.String())
+		}
+	}
+	if got := atomic.LoadInt32(&stalledStarted); got != maxTeardownsPerHost {
+		t.Fatalf("teardowns started on the stalled host = %d, want %d (the rest wait for a slot)", got, maxTeardownsPerHost)
+	}
+	// A delete on a healthy host is not queued behind them.
+	w := httptest.NewRecorder()
+	start := time.Now()
+	router.ServeHTTP(w, deleteRequest(healthyID.String()))
+	if w.Code != http.StatusNoContent || time.Since(start) > deleteTeardownInlineBudget {
+		t.Fatalf("healthy delete: status = %d after %s", w.Code, time.Since(start))
+	}
+	if atomic.LoadInt32(&healthyDone) != 1 {
+		t.Fatal("healthy host teardown did not run inline")
+	}
+	close(release)
+	h.WaitAsyncBookkeeping()
+}

@@ -174,11 +174,12 @@ type Handlers struct {
 	asyncCond  *sync.Cond // lazily created by WaitAsyncBookkeeping, guarded by asyncMu
 	asyncCount int
 
-	// teardownSem bounds how many delete teardowns run at once once they
-	// have left the request path (see DeleteSandbox). Lazily created so
-	// struct-literal construction in tests needs nothing.
-	teardownSem     chan struct{}
-	teardownSemOnce sync.Once
+	// teardownSems bounds delete teardowns per host (see DeleteSandbox):
+	// host id -> chan struct{} of maxTeardownsPerHost. Per host, so one
+	// unreachable host's stalled teardowns cannot hold the slots of the
+	// others. Lazily populated so struct-literal construction in tests
+	// needs nothing.
+	teardownSems sync.Map
 
 	// activityGate caps how many activity-log inserts may hold DB connections
 	// at once (see writeActivity). Lazily created so struct-literal
@@ -1652,17 +1653,27 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// before the response: gin recycles its context between requests.
 	hostID, basePath, templateID := sandbox.HostID, sandbox.BasePath, sandbox.TemplateID
 	base := context.WithoutCancel(c.Request.Context())
-	done := make(chan struct{})
+	// Closed once the VM itself is reclaimed; the snapshot and artifact
+	// cleanup that follow are not what a re-create waits for.
+	vmDone := make(chan struct{})
 	h.asyncBookkeeping("delete-teardown", func() {
-		defer close(done)
-		h.acquireTeardownSlot()
-		defer h.releaseTeardownSlot()
+		// The bound covers the wait for a slot too: a host whose teardowns
+		// all stall cannot accumulate waiters beyond it.
 		tctx, cancel := context.WithTimeout(base, autoDeleteTeardownTimeout)
 		defer cancel()
-		h.teardownDestroyedSandbox(tctx, sandboxID, hostID, basePath, templateID)
+		sem := h.teardownSlots(hostID)
+		select {
+		case sem <- struct{}{}:
+			defer func() { <-sem }()
+		case <-tctx.Done():
+			l := sandboxLogger(sandboxID.String(), hostID)
+			l.Warn().Msg("delete teardown never got a slot; reconciler will reclaim")
+			return
+		}
+		h.teardownDestroyedSandbox(tctx, sandboxID, hostID, basePath, templateID, func() { close(vmDone) })
 	})
 	select {
-	case <-done:
+	case <-vmDone:
 	case <-time.After(deleteTeardownInlineBudget):
 		l := sandboxLogger(sandboxID.String(), hostID)
 		l.Warn().Msg("delete teardown still running past the inline budget; continuing in the background")
@@ -1680,17 +1691,15 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 // A var so tests can shorten it.
 var deleteTeardownInlineBudget = 5 * time.Second
 
-// maxConcurrentTeardowns caps delete teardowns that have left the request
-// path, so a burst of deletes against an unreachable host cannot pile up
-// thousands of two-minute RPC waits.
-const maxConcurrentTeardowns = 32
+// maxTeardownsPerHost caps delete teardowns in flight against one host, so
+// a burst of deletes against an unreachable host cannot pile up thousands
+// of RPC waits, and cannot touch the other hosts' slots.
+const maxTeardownsPerHost = 8
 
-func (h *Handlers) acquireTeardownSlot() {
-	h.teardownSemOnce.Do(func() { h.teardownSem = make(chan struct{}, maxConcurrentTeardowns) })
-	h.teardownSem <- struct{}{}
+func (h *Handlers) teardownSlots(hostID string) chan struct{} {
+	sem, _ := h.teardownSems.LoadOrStore(hostID, make(chan struct{}, maxTeardownsPerHost))
+	return sem.(chan struct{})
 }
-
-func (h *Handlers) releaseTeardownSlot() { <-h.teardownSem }
 
 // teardownDestroyedSandbox reclaims host-side state for a sandbox whose
 // guarded soft-delete has already committed: the VM (with its run dir and
@@ -1698,7 +1707,12 @@ func (h *Handlers) releaseTeardownSlot() { <-h.teardownSem }
 // throughout — the vm reconciler backstops anything missed here. Shared by
 // user-initiated deletes and the auto-delete reaper so the two paths cannot
 // diverge.
-func (h *Handlers) teardownDestroyedSandbox(ctx context.Context, sandboxID uuid.UUID, hostID string, basePath *string, templateID pgtype.UUID) {
+//
+// vmReclaimed, when non-nil, is called once the VM teardown itself has
+// returned, before the snapshot and artifact cleanup: that is the point a
+// caller waiting to reuse the host's memory, cores and network slot cares
+// about.
+func (h *Handlers) teardownDestroyedSandbox(ctx context.Context, sandboxID uuid.UUID, hostID string, basePath *string, templateID pgtype.UUID, vmReclaimed func()) {
 	l := sandboxLogger(sandboxID.String(), hostID)
 	// The revocation row is committed with the delete claim; fan it out to the
 	// host so the daemon refuses the JWT now. Best-effort — bootstrap re-fans
@@ -1718,6 +1732,9 @@ func (h *Handlers) teardownDestroyedSandbox(ctx context.Context, sandboxID uuid.
 			l.Warn().Err(derr).Msg("VMD DestroyInstance for delete teardown; reconciler will reclaim")
 		}
 		vmdCancel()
+	}
+	if vmReclaimed != nil {
+		vmReclaimed()
 	}
 
 	// Best-effort cleanup of pause snapshots. Failures are logged but
