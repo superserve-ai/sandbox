@@ -351,6 +351,13 @@ func seedFixture(t *testing.T) *fixture {
 		VALUES ($1, $2, -60.000000, 'usage draw-down', $3)`, f.team, grantID, f.owner)
 
 	mustExec(t, srcPool, `INSERT INTO quota_alert_state (team_id, quota_type) VALUES ($1, 'sandbox')`, f.team)
+	mustExec(t, srcPool, `
+		INSERT INTO trial_credit_warning_state (team_id, lifecycle_key, status, sent_at)
+		VALUES ($1, trial_credit_warning_lifecycle($1), 'sent', $2)`, f.team, base)
+	mustExec(t, srcPool, `
+		INSERT INTO trial_credit_warning_delivery (team_id, lifecycle_key, recipient, sent_at, rejected_at)
+		VALUES ($1, trial_credit_warning_lifecycle($1), 'owner@example.com', $2, NULL),
+		       ($1, trial_credit_warning_lifecycle($1), 'rejected@example.com', NULL, $2)`, f.team, base)
 
 	mustExec(t, srcPool, `
 		INSERT INTO activity (sandbox_id, team_id, actor_id, category, action, resource_type, sandbox_name)
@@ -456,6 +463,8 @@ func seedFixture(t *testing.T) *fixture {
 		"team_credit_grant":                  1,
 		"team_credit_ledger":                 1,
 		"quota_alert_state":                  1,
+		"trial_credit_warning_state":         1,
+		"trial_credit_warning_delivery":      2,
 		"activity":                           3,
 		"sandbox_revocation":                 1,
 		"revoked_proxy_token":                1,
@@ -767,6 +776,29 @@ func TestTeamMigration(t *testing.T) {
 		}
 		if err := run(ctx, f.cfg(phaseValidate)); err != nil {
 			t.Fatalf("validate after converging re-copy: %v", err)
+		}
+	})
+
+	t.Run("copy preserves unknown warning state", func(t *testing.T) {
+		var sentAt time.Time
+		if err := srcPool.QueryRow(ctx, `SELECT sent_at FROM trial_credit_warning_state WHERE team_id = $1`, f.team).Scan(&sentAt); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, srcPool, `UPDATE trial_credit_warning_state SET status = 'unknown', sent_at = NULL WHERE team_id = $1`, f.team)
+		defer mustExec(t, srcPool, `UPDATE trial_credit_warning_state SET status = 'sent', sent_at = $2 WHERE team_id = $1`, f.team, sentAt)
+		defer mustExec(t, dstPool, `UPDATE trial_credit_warning_state SET status = 'sent', sent_at = $2 WHERE team_id = $1`, f.team, sentAt)
+
+		if err := run(ctx, f.cfg(phaseValidate)); err == nil || !strings.Contains(err.Error(), "trial_credit_warning_state") {
+			t.Fatalf("validate must detect changed warning state: %v", err)
+		}
+		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
+			t.Fatalf("copy unknown warning state: %v", err)
+		}
+		if got := scanString(t, dstPool, `SELECT status FROM trial_credit_warning_state WHERE team_id = $1`, f.team); got != "unknown" {
+			t.Fatalf("dest warning status = %q, want unknown", got)
+		}
+		if err := run(ctx, f.cfg(phaseValidate)); err != nil {
+			t.Fatalf("validate unknown warning state: %v", err)
 		}
 	})
 

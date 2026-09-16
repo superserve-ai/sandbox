@@ -75,11 +75,13 @@ type billingSummaryResponse struct {
 }
 
 type billingTrialBalance struct {
-	GrantUSD     float64 `json:"grant_usd"`
-	ConsumedUSD  float64 `json:"consumed_usd"`
-	RemainingUSD float64 `json:"remaining_usd"`
-	State        string  `json:"state"`
-	Eligible     bool    `json:"eligible"`
+	GrantUSD         float64    `json:"grant_usd"`
+	ConsumedUSD      float64    `json:"consumed_usd"`
+	RemainingUSD     float64    `json:"remaining_usd"`
+	State            string     `json:"state"`
+	Eligible         bool       `json:"eligible"`
+	RunwayState      string     `json:"runway_state"`
+	RunwayObservedAt *time.Time `json:"runway_observed_at"`
 }
 
 type billingSummaryCostBreakdown struct {
@@ -205,6 +207,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		pricingRows   []db.ListActivePricingRatesForTeamCurrentRow
 		creditBalance pgtype.Numeric
 		trialBalance  db.GetTeamTrialBalanceRow
+		trialRunway   db.GetTeamTrialRunwayRow
 	)
 	g, ctx := errgroup.WithContext(c.Request.Context())
 	hasEstablishedSubscription := billingAccountHasEstablishedSubscription(account)
@@ -263,6 +266,11 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	trialRunway, err = h.DB.GetTeamTrialRunway(c.Request.Context(), teamID)
+	if err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing trial runway read failed")
+	}
+	runwayState, runwayObservedAt := billingTrialRunway(trialRunway, trialBalance.Eligible, trialBalance.State, now)
 	grantUSD, err := numericFloat64(trialBalance.GrantUsd)
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert trial grant failed")
@@ -466,11 +474,13 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		// an account with no applicable signup grant from an omitted/unknown
 		// billing field. The no_grant state carries zero monetary values.
 		Trial: &billingTrialBalance{
-			GrantUSD:     grantUSD,
-			ConsumedUSD:  consumedUSD,
-			RemainingUSD: remainingUSD,
-			State:        trialBalance.State,
-			Eligible:     trialBalance.Eligible,
+			GrantUSD:         grantUSD,
+			ConsumedUSD:      consumedUSD,
+			RemainingUSD:     remainingUSD,
+			State:            trialBalance.State,
+			Eligible:         trialBalance.Eligible,
+			RunwayState:      runwayState,
+			RunwayObservedAt: runwayObservedAt,
 		},
 		CalculatedAt: now,
 	})
@@ -1036,4 +1046,21 @@ func numericFloat64(n pgtype.Numeric) (float64, error) {
 		return 0, fmt.Errorf("numeric value is null")
 	}
 	return v.Float64, nil
+}
+
+// The timestamp describes the advisory observation, not this API response.
+func billingTrialRunway(row db.GetTeamTrialRunwayRow, eligible bool, state string, now time.Time) (string, *time.Time) {
+	if !row.ObservedAt.Valid {
+		return "unknown", nil
+	}
+	observed := row.ObservedAt.Time
+	if !trialCreditWarningLifecycleEligible(eligible, state) || !observed.After(now.Add(-15*time.Minute)) || observed.After(now) {
+		return "unknown", &observed
+	}
+	switch row.State {
+	case "over_24h", "under_24h":
+		return row.State, &observed
+	default:
+		return "unknown", &observed
+	}
 }
