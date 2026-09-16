@@ -110,27 +110,10 @@ variable "network_name" {
   default = "superserve-production-vpc"
 }
 
-variable "active_sandbox_host" {
-  description = "Which sandbox host serves the cell: primary or standby."
-  type        = string
-  default     = "primary"
-
-  validation {
-    condition     = contains(["primary", "standby"], var.active_sandbox_host)
-    error_message = "active_sandbox_host must be primary or standby."
-  }
-}
-
 variable "standby_host_id" {
-  description = "The standby's HOST_ID as vmd registers it (the installed host identity, not the slot name); DEFAULT_HOST_ID and alert filters follow it when active_sandbox_host is standby."
+  description = "The host's HOST_ID as vmd registers it (the installed host identity, not the slot name); DEFAULT_HOST_ID and alert filters follow it."
   type        = string
   default     = "usw2-2"
-}
-
-variable "primary_host_running" {
-  description = "Whether the primary host is kept running; false parks it stopped (its local SSD is empty once stopped). Flip it in a separate apply after a promotion has applied, never in the same one."
-  type        = bool
-  default     = true
 }
 
 variable "cloud_ids_runbook_base_url" {
