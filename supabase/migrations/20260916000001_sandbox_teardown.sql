@@ -25,8 +25,21 @@ CREATE TABLE IF NOT EXISTS sandbox_teardown (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sandbox_teardown_created ON sandbox_teardown (created_at);
+CREATE INDEX IF NOT EXISTS idx_sandbox_teardown_host_lease ON sandbox_teardown (host_id, lease_until);
 
 ALTER TABLE sandbox_teardown ENABLE ROW LEVEL SECURITY;
+
+-- One sweeper attempt per host at a time, fleet-wide: the claim takes the
+-- host's row here in the same statement, so replicas racing for the same
+-- host serialize on it and only one wins. sandbox_id is the reclaim the
+-- holder is working on; the release is fenced on it.
+CREATE TABLE IF NOT EXISTS sandbox_teardown_host (
+    host_id     text PRIMARY KEY,
+    sandbox_id  uuid NOT NULL,
+    lease_until timestamptz NOT NULL
+);
+
+ALTER TABLE sandbox_teardown_host ENABLE ROW LEVEL SECURITY;
 
 COMMENT ON TABLE sandbox_teardown IS
   'Host-side reclaim still owed for a deleted sandbox; removed when the VM and its artifacts are gone.';

@@ -574,8 +574,8 @@ func (r *OTelRecorder) RecordTeardownAttempt(ctx context.Context, a TeardownAtte
 		return
 	}
 	r.teardownAttempts.Add(ctx, 1, metric.WithAttributes(r.attrs(
-		attribute.String("path", safeResult(a.Path)),
-		attribute.String("result", safeResult(a.Result)),
+		attribute.String("path", safeTeardownPath(a.Path)),
+		attribute.String("result", safeTeardownResult(a.Result)),
 	)...))
 }
 
@@ -714,6 +714,24 @@ func safeResult(v string) string {
 		return v
 	default:
 		return ResultError
+	}
+}
+
+func safeTeardownPath(v string) string {
+	switch v {
+	case "delete", "auto_delete", "sweep":
+		return v
+	default:
+		return "unknown"
+	}
+}
+
+func safeTeardownResult(v string) string {
+	switch v {
+	case "completed", "deferred", "timeout", "permanent", "skipped":
+		return v
+	default:
+		return "unknown"
 	}
 }
 

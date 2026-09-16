@@ -6634,9 +6634,10 @@ func routedFinalize(ctx context.Context, t *testing.T, params db.FinalizePausePa
 }
 
 // A delete records the host-side reclaim it owes, owned by the deleting
-// request first; the sweeper then claims one record per host at a time,
-// every settle is fenced on the attempt, and holding a host leaves the
-// reclaim in flight on it alone.
+// request first. The sweeper then claims one record per host at a time
+// fleet-wide, taking the host's lease with the record; every settle is
+// fenced on the attempt; holding a host leaves the reclaim in flight on it
+// alone.
 func TestIntegration_DeleteRecordsTheTeardownUntilItCompletes(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedTeamAndKey(t)
@@ -6671,6 +6672,14 @@ func TestIntegration_DeleteRecordsTheTeardownUntilItCompletes(t *testing.T) {
 		}
 		return id
 	}
+	release := func(ids ...uuid.UUID) {
+		t.Helper()
+		for _, id := range ids {
+			if err := testQueries.ReleaseTeardown(ctx, id); err != nil {
+				t.Fatalf("release: %v", err)
+			}
+		}
+	}
 	claim := func() (db.ClaimNextTeardownRow, bool) {
 		t.Helper()
 		row, err := testQueries.ClaimNextTeardown(ctx, 60)
@@ -6682,10 +6691,18 @@ func TestIntegration_DeleteRecordsTheTeardownUntilItCompletes(t *testing.T) {
 		}
 		return row, true
 	}
-	// Other tests' deletes leave records too; release them so only this
+	releaseHost := func(hostID string, id uuid.UUID) {
+		t.Helper()
+		if err := testQueries.ReleaseTeardownHost(ctx, db.ReleaseTeardownHostParams{HostID: hostID, SandboxID: id}); err != nil {
+			t.Fatalf("release host: %v", err)
+		}
+	}
+	// Other tests' deletes leave records too; clear them so only this
 	// test's records are claimable in the assertions below.
-	if _, err := testPool.Exec(ctx, `DELETE FROM sandbox_teardown`); err != nil {
-		t.Fatalf("clear records: %v", err)
+	for _, table := range []string{"sandbox_teardown", "sandbox_teardown_host"} {
+		if _, err := testPool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
 	}
 
 	// Born owned by the deleting request, so the sweeper does not take it.
@@ -6701,39 +6718,42 @@ func TestIntegration_DeleteRecordsTheTeardownUntilItCompletes(t *testing.T) {
 	if _, ok := claim(); ok {
 		t.Fatal("the sweeper claimed a record the deleting request still owns")
 	}
-	// Released, it is the sweeper's.
-	if err := testQueries.ReleaseTeardown(ctx, a1); err != nil {
-		t.Fatalf("release: %v", err)
-	}
+	// Released, it is the sweeper's, and the claim takes host A with it.
+	release(a1)
 	rec, ok := claim()
 	if !ok || rec.SandboxID != a1 || rec.HostID != hostA || rec.Attempts != 1 {
 		t.Fatalf("claim after release = %+v (%v), want %s on %s at attempt 1", rec, ok, a1, hostA)
 	}
 
-	// One record per host in flight: with a1 held on host A, the next claim
-	// skips A's other record for B's, then finds nothing.
+	// One attempt per host: with host A held, the next claim skips A's other
+	// record for B's, then finds nothing.
 	a2, b1 := destroy(hostA), destroy(hostB)
-	for _, id := range []uuid.UUID{a2, b1} {
-		if err := testQueries.ReleaseTeardown(ctx, id); err != nil {
-			t.Fatalf("release: %v", err)
-		}
-	}
+	release(a2, b1)
 	if rec, ok = claim(); !ok || rec.SandboxID != b1 {
-		t.Fatalf("claim with host A busy = %+v (%v), want %s", rec, ok, b1)
+		t.Fatalf("claim with host A held = %+v (%v), want %s", rec, ok, b1)
 	}
 	if rec, ok = claim(); ok {
-		t.Fatalf("claim with both hosts busy = %+v, want none", rec)
+		t.Fatalf("claim with both hosts held = %+v, want none", rec)
 	}
 
-	// Settles are fenced on the attempt.
+	// Settles are fenced on the attempt, and the host stays held until the
+	// worker releases it, fenced on the record it was working.
 	if n, err := testQueries.CompleteTeardown(ctx, db.CompleteTeardownParams{SandboxID: a1, Attempts: 99}); err != nil || n != 0 {
 		t.Fatalf("complete under a stale attempt: rows = %d, err = %v; want 0", n, err)
 	}
 	if n, err := testQueries.CompleteTeardown(ctx, db.CompleteTeardownParams{SandboxID: a1, Attempts: 1}); err != nil || n != 1 {
 		t.Fatalf("complete: rows = %d, err = %v; want 1", n, err)
 	}
+	if rec, ok = claim(); ok {
+		t.Fatalf("claim with host A still held = %+v, want none", rec)
+	}
+	releaseHost(hostA, a2)
+	if rec, ok = claim(); ok {
+		t.Fatalf("claim after a release fenced on the wrong record = %+v, want none", rec)
+	}
+	releaseHost(hostA, a1)
 	if rec, ok = claim(); !ok || rec.SandboxID != a2 {
-		t.Fatalf("claim once host A is free = %+v (%v), want %s", rec, ok, a2)
+		t.Fatalf("claim once host A is released = %+v (%v), want %s", rec, ok, a2)
 	}
 
 	// A deferred record waits out its backoff; holding a host leaves its
@@ -6742,6 +6762,7 @@ func TestIntegration_DeleteRecordsTheTeardownUntilItCompletes(t *testing.T) {
 	if n, err := testQueries.DeferTeardown(ctx, db.DeferTeardownParams{RetryAfterSeconds: 3600, LastError: &msg, SandboxID: a2, Attempts: 1}); err != nil || n != 1 {
 		t.Fatalf("defer: rows = %d, err = %v", n, err)
 	}
+	releaseHost(hostA, a2)
 	if n, err := testQueries.DeferHostTeardowns(ctx, db.DeferHostTeardownsParams{RetryAfterSeconds: 3600, LastError: &msg, HostID: hostB}); err != nil || n != 0 {
 		t.Fatalf("hold host with its record in flight: rows = %d, err = %v; want 0", n, err)
 	}
@@ -6751,6 +6772,7 @@ func TestIntegration_DeleteRecordsTheTeardownUntilItCompletes(t *testing.T) {
 	if n, err := testQueries.DeferTeardown(ctx, db.DeferTeardownParams{RetryAfterSeconds: -1, LastError: &msg, SandboxID: b1, Attempts: 1}); err != nil || n != 1 {
 		t.Fatalf("defer with the backoff passed: rows = %d, err = %v", n, err)
 	}
+	releaseHost(hostB, b1)
 	if rec, ok = claim(); !ok || rec.SandboxID != b1 || rec.Attempts != 2 {
 		t.Fatalf("claim after the backoff = %+v (%v), want %s at attempt 2", rec, ok, b1)
 	}
@@ -6758,5 +6780,67 @@ func TestIntegration_DeleteRecordsTheTeardownUntilItCompletes(t *testing.T) {
 	backlog, err := testQueries.TeardownBacklog(ctx)
 	if err != nil || backlog.Total != 2 || backlog.Retrying != 1 || backlog.OldestAgeSeconds < 0 {
 		t.Fatalf("backlog = %+v, err = %v; want 2 total, 1 retrying", backlog, err)
+	}
+}
+
+// Claims racing for one host from many connections at once, as replicas
+// do: exactly one takes the host, the rest get nothing.
+func TestIntegration_TeardownClaimsForOneHostSerializeAcrossConnections(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	hostID := "teardown-race-" + uuid.NewString()
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID: hostID, VmdAddr: "127.0.0.1:1", ProxyAddr: "127.0.0.1:2", Region: "test",
+		CapacityMemoryMib: 1024, CapacityVcpus: 1,
+	}); err != nil {
+		t.Fatalf("create host: %v", err)
+	}
+	for _, table := range []string{"sandbox_teardown", "sandbox_teardown_host"} {
+		if _, err := testPool.Exec(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clear %s: %v", table, err)
+		}
+	}
+	const records = 8
+	for i := 0; i < records; i++ {
+		id := uuid.New()
+		if _, err := testPool.Exec(ctx,
+			`INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,$3,'active',$4)`,
+			id, teamID, "teardown-race", hostID,
+		); err != nil {
+			t.Fatalf("insert sandbox: %v", err)
+		}
+		if _, err := testQueries.DestroySandbox(ctx, db.DestroySandboxParams{
+			ID: id, TeamID: teamID,
+			StaleTransitionalBefore: time.Now().Add(-time.Hour), RevocationExpiresAt: time.Now().Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("destroy sandbox: %v", err)
+		}
+		if err := testQueries.ReleaseTeardown(ctx, id); err != nil {
+			t.Fatalf("release: %v", err)
+		}
+	}
+
+	var won int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < records; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, err := testQueries.ClaimNextTeardown(ctx, 60)
+			switch {
+			case err == nil:
+				atomic.AddInt32(&won, 1)
+			case errors.Is(err, pgx.ErrNoRows):
+			default:
+				t.Errorf("claim: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	if won != 1 {
+		t.Fatalf("%d concurrent claims took host %s, want exactly 1", won, hostID)
 	}
 }

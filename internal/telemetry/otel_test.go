@@ -36,6 +36,25 @@ func TestPeerLabelsAreBounded(t *testing.T) {
 	}
 }
 
+func TestSafeTeardownLabelsBoundValues(t *testing.T) {
+	for _, v := range []string{"delete", "auto_delete", "sweep"} {
+		if got := safeTeardownPath(v); got != v {
+			t.Fatalf("safeTeardownPath(%q) = %q", v, got)
+		}
+	}
+	for _, v := range []string{"completed", "deferred", "timeout", "permanent", "skipped"} {
+		if got := safeTeardownResult(v); got != v {
+			t.Fatalf("safeTeardownResult(%q) = %q", v, got)
+		}
+	}
+	if got := safeTeardownPath("sandbox 123"); got != "unknown" {
+		t.Fatalf("safeTeardownPath(free text) = %q", got)
+	}
+	if got := safeTeardownResult("host down: 10.0.0.1"); got != "unknown" {
+		t.Fatalf("safeTeardownResult(free text) = %q", got)
+	}
+}
+
 func TestSafeRoutingOutcomeBoundsValues(t *testing.T) {
 	for _, outcome := range []string{"local", "remote", "ownership_error", "peer_error"} {
 		if got := safeRoutingOutcome(outcome); got != outcome {

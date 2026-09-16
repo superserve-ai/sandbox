@@ -5349,11 +5349,64 @@ func TestDeleteSandbox_ArtifactCleanupFailureDefersTheReclaim(t *testing.T) {
 	}
 }
 
+// A template that has been deleted does not vouch for its artifacts: with
+// no other reference left, the host-side delete still runs.
+func TestDeleteSandbox_DeletedTemplateStillRemovesBuildArtifacts(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	base := "/builds/tpl/b1/rootfs.ext4"
+	tpl := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive}
+	var artifactDeletes, completed int32
+	vmd := &stubVMD{
+		destroyFn: func(context.Context, string, bool) error { return nil },
+		deleteBuildArtifactsFn: func(_ context.Context, templateID, buildID string) error {
+			if templateID != uuid.UUID(tpl.Bytes).String() || buildID != "b1" {
+				t.Errorf("DeleteBuildArtifacts(%q, %q), want template %s build b1", templateID, buildID, uuid.UUID(tpl.Bytes))
+			}
+			atomic.AddInt32(&artifactDeletes, 1)
+			return nil
+		},
+	}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "FROM destroyed"):
+				return destroyedRow(sandboxID, "", &base, tpl)
+			case strings.Contains(sql, "COUNT(*)::bigint FROM sandbox"):
+				return &mockRow{scanFn: func(dest ...any) error { *dest[0].(*int64) = 0; return nil }}
+			case strings.Contains(sql, "SELECT base_path FROM template"):
+				return errorRow(pgx.ErrNoRows)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "DELETE FROM sandbox_teardown") {
+				atomic.AddInt32(&completed, 1)
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+	if artifactDeletes != 1 || completed != 1 {
+		t.Fatalf("artifact deletes = %d, completed = %d; want 1, 1", artifactDeletes, completed)
+	}
+}
+
 // A sweep runs every record it can claim and completes each under its
 // attempt fence.
 func TestSweepTeardowns_RunsWhatItClaimsAndCompletes(t *testing.T) {
 	ids := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
-	var next, destroyed, completed, fenced int32
+	var next, destroyed, completed, fenced, hostReleases int32
 	vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error {
 		atomic.AddInt32(&destroyed, 1)
 		return nil
@@ -5374,19 +5427,22 @@ func TestSweepTeardowns_RunsWhatItClaimsAndCompletes(t *testing.T) {
 			}
 		},
 		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-			if strings.Contains(sql, "DELETE FROM sandbox_teardown") {
+			switch {
+			case strings.Contains(sql, "DELETE FROM sandbox_teardown"):
 				atomic.AddInt32(&completed, 1)
 				if a, _ := args[1].(int32); a == 2 {
 					atomic.AddInt32(&fenced, 1)
 				}
+			case strings.Contains(sql, "UPDATE sandbox_teardown_host"):
+				atomic.AddInt32(&hostReleases, 1)
 			}
 			return pgconn.NewCommandTag("DELETE 1"), nil
 		},
 	}
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	h.SweepTeardowns(context.Background())
-	if destroyed != 3 || completed != 3 || fenced != 3 {
-		t.Fatalf("destroyed = %d, completed = %d, fenced = %d; want 3, 3, 3", destroyed, completed, fenced)
+	if destroyed != 3 || completed != 3 || fenced != 3 || hostReleases != 3 {
+		t.Fatalf("destroyed = %d, completed = %d, fenced = %d, host releases = %d; want 3 each", destroyed, completed, fenced, hostReleases)
 	}
 }
 
@@ -5415,6 +5471,7 @@ func TestSweepTeardowns_UnreachableHostHoldsItsOtherRecords(t *testing.T) {
 			switch {
 			case strings.Contains(sql, "DELETE FROM sandbox_teardown"):
 				atomic.AddInt32(&completed, 1)
+			case strings.Contains(sql, "UPDATE sandbox_teardown_host"):
 			case strings.Contains(sql, "WHERE host_id"):
 				atomic.AddInt32(&heldHost, 1)
 			case strings.Contains(sql, "UPDATE sandbox_teardown"):

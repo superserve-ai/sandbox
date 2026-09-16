@@ -726,6 +726,12 @@ type SandboxTeardown struct {
 	LastError *string   `json:"last_error"`
 }
 
+type SandboxTeardownHost struct {
+	HostID     string    `json:"host_id"`
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	LeaseUntil time.Time `json:"lease_until"`
+}
+
 type Secret struct {
 	ID               uuid.UUID          `json:"id"`
 	TeamID           uuid.UUID          `json:"team_id"`

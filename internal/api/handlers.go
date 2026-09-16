@@ -180,11 +180,10 @@ type Handlers struct {
 	TeardownInlineBudget time.Duration
 	// inlineTeardowns caps how many inline reclaims may hold a vmd RPC at
 	// once on this replica; a delete that finds it full leaves its reclaim
-	// to the sweeper. teardownClaimMu serializes the sweeper's claims. Both
-	// lazily set up so struct-literal construction in tests needs nothing.
+	// to the sweeper. Lazily set up so struct-literal construction in tests
+	// needs nothing.
 	inlineTeardownsOnce sync.Once
 	inlineTeardowns     chan struct{}
-	teardownClaimMu     sync.Mutex
 
 	// activityGate caps how many activity-log inserts may hold DB connections
 	// at once (see writeActivity). Lazily created so struct-literal
@@ -1827,7 +1826,8 @@ func recordTeardownAttempt(ctx context.Context, path, result string) {
 // StartTeardownSweeper retries recorded reclaims nobody owns: inline
 // attempts that ran out of budget, were skipped, or died with the process,
 // and deferred ones whose backoff has passed. Every replica sweeps; the
-// claim is atomic, so no two workers ever share a record.
+// claim is atomic and takes the host's lease with the record, so no two
+// workers anywhere share a record or work the same host at once.
 func (h *Handlers) StartTeardownSweeper(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(teardownSweepInterval)
@@ -1862,6 +1862,7 @@ func (h *Handlers) SweepTeardowns(ctx context.Context) {
 				actx, cancel := context.WithTimeout(ctx, teardownSweepBudget)
 				h.attemptTeardown(actx, rec, "sweep")
 				cancel()
+				h.releaseTeardownHost(ctx, rec)
 			}
 		}()
 	}
@@ -1869,22 +1870,35 @@ func (h *Handlers) SweepTeardowns(ctx context.Context) {
 	h.recordTeardownBacklog(ctx)
 }
 
-// claimNextTeardown takes the sweeper's next record. Claims are serialized
-// within the replica so its workers cannot each take a reclaim on the same
-// host between one claim's read and its commit.
+// claimNextTeardown takes the sweeper's next record and its host's lease.
+// The database serializes claims for one host across replicas; a claim
+// that loses that race comes back empty although other hosts may have
+// work, so an empty claim is asked once more before the worker stops.
 func (h *Handlers) claimNextTeardown(ctx context.Context) (teardownRecord, bool) {
-	h.teardownClaimMu.Lock()
-	defer h.teardownClaimMu.Unlock()
-	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	row, err := h.DB.ClaimNextTeardown(qctx, int32(teardownLease/time.Second))
-	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) {
+	for try := 0; try < 2; try++ {
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		row, err := h.DB.ClaimNextTeardown(qctx, int32(teardownLease/time.Second))
+		cancel()
+		switch {
+		case err == nil:
+			return teardownRecord{SandboxID: row.SandboxID, HostID: row.HostID, BasePath: row.BasePath, TemplateID: row.TemplateID, Attempts: row.Attempts}, true
+		case errors.Is(err, pgx.ErrNoRows):
+			continue
+		default:
 			log.Warn().Err(err).Msg("teardown sweep: claim failed")
+			return teardownRecord{}, false
 		}
-		return teardownRecord{}, false
 	}
-	return teardownRecord{SandboxID: row.SandboxID, HostID: row.HostID, BasePath: row.BasePath, TemplateID: row.TemplateID, Attempts: row.Attempts}, true
+	return teardownRecord{}, false
+}
+
+func (h *Handlers) releaseTeardownHost(ctx context.Context, rec teardownRecord) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := h.DB.ReleaseTeardownHost(rctx, db.ReleaseTeardownHostParams{HostID: rec.HostID, SandboxID: rec.SandboxID}); err != nil {
+		l := sandboxLogger(rec.SandboxID.String(), rec.HostID)
+		l.Warn().Err(err).Msg("teardown sweep: host release failed; the host waits out the lease")
+	}
 }
 
 func (h *Handlers) recordTeardownBacklog(ctx context.Context) {
@@ -1970,15 +1984,13 @@ func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sa
 	}
 	// Team-blind: sandbox's team may not own the template (system templates),
 	// so GetTemplateForOwner would falsely report "not in use" → over-delete.
+	// A template that is gone has no current build to protect, and its own
+	// cleanup may not have reached this host, so the delete still runs.
 	tplBase, err := h.DB.GetTemplateBasePath(gcCtx, sandboxTemplateID.Bytes)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// The template is gone; its artifacts went with it.
-			return nil
-		}
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("gc: template base path: %w", err)
 	}
-	if tplBase != nil && *tplBase == basePath {
+	if err == nil && tplBase != nil && *tplBase == basePath {
 		return nil
 	}
 

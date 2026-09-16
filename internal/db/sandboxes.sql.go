@@ -601,23 +601,35 @@ func (q *Queries) ClaimExpiredSandbox(ctx context.Context, arg ClaimExpiredSandb
 }
 
 const claimNextTeardown = `-- name: ClaimNextTeardown :one
-UPDATE sandbox_teardown
-SET lease_until = now() + make_interval(secs => $1::int),
-    attempts = attempts + 1
-WHERE sandbox_id = (
-  SELECT t.sandbox_id
+WITH candidate AS (
+  SELECT t.sandbox_id, t.host_id
   FROM sandbox_teardown t
   WHERE t.lease_until <= now()
     AND t.retry_at <= now()
     AND NOT EXISTS (
-      SELECT 1 FROM sandbox_teardown l
-      WHERE l.host_id = t.host_id AND l.lease_until > now()
+      SELECT 1 FROM sandbox_teardown_host h
+      WHERE h.host_id = t.host_id AND h.lease_until > now()
     )
   ORDER BY t.created_at
   LIMIT 1
   FOR UPDATE SKIP LOCKED
+),
+host_lease AS (
+  INSERT INTO sandbox_teardown_host (host_id, sandbox_id, lease_until)
+  SELECT host_id, sandbox_id, now() + make_interval(secs => $1::int)
+  FROM candidate
+  ON CONFLICT (host_id) DO UPDATE
+    SET sandbox_id = EXCLUDED.sandbox_id, lease_until = EXCLUDED.lease_until
+    WHERE sandbox_teardown_host.lease_until <= now()
+  RETURNING host_id
 )
-RETURNING sandbox_id, host_id, base_path, template_id, attempts
+UPDATE sandbox_teardown t
+SET lease_until = now() + make_interval(secs => $1::int),
+    attempts = t.attempts + 1
+FROM candidate c
+JOIN host_lease h ON h.host_id = c.host_id
+WHERE t.sandbox_id = c.sandbox_id
+RETURNING t.sandbox_id, t.host_id, t.base_path, t.template_id, t.attempts
 `
 
 type ClaimNextTeardownRow struct {
@@ -629,8 +641,10 @@ type ClaimNextTeardownRow struct {
 }
 
 // The sweeper's claim: the oldest reclaim nobody owns whose backoff has
-// passed, on a host with no reclaim in flight, so a host that does not
-// answer occupies one worker at most.
+// passed, on a host no sweeper is working, taking the host's lease in the
+// same statement. Two claims racing for one host serialize on its row in
+// sandbox_teardown_host; the one that finds the lease already taken claims
+// nothing. So a host that does not answer occupies one worker fleet-wide.
 func (q *Queries) ClaimNextTeardown(ctx context.Context, leaseSeconds int32) (ClaimNextTeardownRow, error) {
 	row := q.db.QueryRow(ctx, claimNextTeardown, leaseSeconds)
 	var i ClaimNextTeardownRow
@@ -3155,6 +3169,24 @@ WHERE sandbox_id = $1 AND attempts = 1
 // rather than when the birth lease ends.
 func (q *Queries) ReleaseTeardown(ctx context.Context, sandboxID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, releaseTeardown, sandboxID)
+	return err
+}
+
+const releaseTeardownHost = `-- name: ReleaseTeardownHost :exec
+UPDATE sandbox_teardown_host
+SET lease_until = now()
+WHERE host_id = $1 AND sandbox_id = $2
+`
+
+type ReleaseTeardownHostParams struct {
+	HostID    string    `json:"host_id"`
+	SandboxID uuid.UUID `json:"sandbox_id"`
+}
+
+// The sweeper's attempt on this host is over; fenced on the reclaim it was
+// working so a worker whose lease ran out cannot release a newer holder.
+func (q *Queries) ReleaseTeardownHost(ctx context.Context, arg ReleaseTeardownHostParams) error {
+	_, err := q.db.Exec(ctx, releaseTeardownHost, arg.HostID, arg.SandboxID)
 	return err
 }
 
