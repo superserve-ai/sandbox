@@ -113,6 +113,9 @@ class DeployProxyTests(unittest.TestCase):
         script = self.generate_script("")
         self.assertIn("sudo mv /tmp/proxy.socket /etc/systemd/system/proxy.socket", script)
         self.assertIn("sudo systemctl enable proxy proxy.socket", script)
+        # A changed unit is bound again, not just reloaded.
+        self.assertIn("sudo cmp -s /tmp/proxy.socket /etc/systemd/system/proxy.socket", script)
+        self.assertIn('if [ "$socket_changed" -eq 1 ] || ! sudo systemctl is-active --quiet proxy.socket; then', script)
         bind = script.index("sudo systemctl start proxy.socket")
         restart = script.index("if ! sudo systemctl restart proxy; then", bind)
         self.assertLess(bind, restart)

@@ -384,6 +384,12 @@ def main() -> int:
             sudo chmod +x {install_dir}/proxy
 
             sudo mv /tmp/proxy.service /etc/systemd/system/proxy.service
+            # An open socket keeps the options it was bound with; a changed
+            # unit means it must be bound again.
+            socket_changed=0
+            if ! sudo cmp -s /tmp/proxy.socket /etc/systemd/system/proxy.socket; then
+                socket_changed=1
+            fi
             sudo mv /tmp/proxy.socket /etc/systemd/system/proxy.socket
             sudo systemctl daemon-reload
             sudo systemctl enable proxy proxy.socket
@@ -469,10 +475,11 @@ def main() -> int:
             {database_env_command}
             sudo chmod 0600 /etc/sandbox/proxy.env
 
-            # A proxy that still binds the ports itself must stop before the
-            # socket unit can take them: one gap on the first rollout only.
-            if ! sudo systemctl is-active --quiet proxy.socket; then
-                sudo systemctl stop proxy || true
+            # Binding the socket needs the ports free: a proxy that still binds
+            # them itself, or a socket bound with an older unit, stops first.
+            # One gap, only on those rollouts.
+            if [ "$socket_changed" -eq 1 ] || ! sudo systemctl is-active --quiet proxy.socket; then
+                sudo systemctl stop proxy proxy.socket 2>/dev/null || true
                 if ! sudo systemctl start proxy.socket; then
                     echo "ERROR: proxy.socket failed to bind the public ports" >&2
                     sudo systemctl status --no-pager proxy.socket >&2 || true
