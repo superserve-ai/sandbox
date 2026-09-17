@@ -135,3 +135,8 @@ variable "cloud_ids_runbook_base_url" {
     error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
   }
 }
+
+variable "host_c_host_id" {
+  description = "The serving host's HOST_ID as vmd registers it (the installed host identity, not the slot name); DEFAULT_HOST_ID and alert filters follow it."
+  type        = string
+}
