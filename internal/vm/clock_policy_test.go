@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -442,4 +443,252 @@ func TestResumeWallClockPropertyUnresolvedRecordConsultsTheManifest(t *testing.T
 	if corrects, _, err := resumeWallClockProperty(bare, bare, nil, nil); corrects || err != nil {
 		t.Errorf("corrects=%v err=%v; unresolved with no manifest must still be false", corrects, err)
 	}
+}
+
+// Resume latency is a critical path, so the ordinary case must answer from the
+// durable record rather than the filesystem. Each case seeds a marker that
+// contradicts the record: if the record is used, the marker is irrelevant, which
+// is what proves the lookup was skipped.
+func TestResumeImageFacts(t *testing.T) {
+	seed := func(t *testing.T, mem string, m WallClockManifest) {
+		t.Helper()
+		m.Version = WallClockManifestVersion
+		if m.ArtifactID == "" {
+			m.ArtifactID = "a"
+		}
+		if err := WriteWallClockManifest(mem, m); err != nil {
+			t.Fatalf("seed manifest: %v", err)
+		}
+	}
+	t.Run("same_image_trusts_a_record_that_carries_the_image_fact", func(t *testing.T) {
+		mem := filepath.Join(t.TempDir(), "mem.snap")
+		seed(t, mem, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "disk"})
+		// Manifest says frozen, record says not. The record wins ⇒ no read happened.
+		corrects, frozen, token, err := resumeImageFacts(mem, mem, boolPtr(false), boolPtr(false), "")
+		if corrects || frozen || token != "" || err != nil {
+			t.Errorf("corrects=%v frozen=%v token=%q err=%v; want the recorded facts, a manifest on disk means the record was not used", corrects, frozen, token, err)
+		}
+		// A guest that cannot correct its clock is never frozen: no read either.
+		if corrects, frozen, token, err := resumeImageFacts(mem, mem, boolPtr(false), nil, ""); corrects || frozen || token != "" || err != nil {
+			t.Errorf("corrects=%v frozen=%v token=%q err=%v; want the record's no without a read", corrects, frozen, token, err)
+		}
+		// And the inverse: no manifest on disk, record says frozen under a token.
+		bare := filepath.Join(t.TempDir(), "mem.snap")
+		corrects, frozen, token, err = resumeImageFacts(bare, bare, boolPtr(true), boolPtr(true), "rec")
+		if !corrects || !frozen || token != "rec" || err != nil {
+			t.Errorf("corrects=%v frozen=%v token=%q err=%v; want the recorded facts even with no manifest beside the image", corrects, frozen, token, err)
+		}
+	})
+
+	// The guest's capability does not encode the image fact: a record that
+	// carries the first but not the second reads the manifest, and a frozen
+	// one is reported rather than assumed away.
+	// A record that says frozen but lost its token or its capability is
+	// incomplete: the manifest is read, so the wake carries the real token.
+	t.Run("incomplete_frozen_record_reads_the_manifest", func(t *testing.T) {
+		mem := filepath.Join(t.TempDir(), "mem.snap")
+		seed(t, mem, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "disk"})
+		if corrects, frozen, token, err := resumeImageFacts(mem, mem, boolPtr(true), boolPtr(true), ""); !corrects || !frozen || token != "disk" || err != nil {
+			t.Errorf("corrects=%v frozen=%v token=%q err=%v; a frozen record without a token must take the manifest's", corrects, frozen, token, err)
+		}
+		if corrects, frozen, token, err := resumeImageFacts(mem, mem, nil, boolPtr(true), "rec"); !corrects || !frozen || token != "disk" || err != nil {
+			t.Errorf("corrects=%v frozen=%v token=%q err=%v; a frozen record without the capability must read the manifest", corrects, frozen, token, err)
+		}
+	})
+
+	t.Run("same_image_without_the_image_fact_reads_the_manifest", func(t *testing.T) {
+		mem := filepath.Join(t.TempDir(), "mem.snap")
+		seed(t, mem, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "tok"})
+		if corrects, frozen, token, err := resumeImageFacts(mem, mem, boolPtr(true), nil, ""); !corrects || !frozen || token != "tok" || err != nil {
+			t.Errorf("corrects=%v frozen=%v token=%q err=%v; want the frozen workload seen", corrects, frozen, token, err)
+		}
+	})
+
+	// An override supplies an image this VM was never paused into, so the record
+	// describes a different artifact and the manifest is the only evidence.
+	t.Run("override_image_reads_the_manifest", func(t *testing.T) {
+		dir := t.TempDir()
+		override := filepath.Join(dir, "restored.snap")
+		seed(t, override, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "disk"})
+		corrects, frozen, token, err := resumeImageFacts(override, filepath.Join(dir, "mem.snap"), boolPtr(false), boolPtr(false), "rec")
+		if !corrects || !frozen || token != "disk" || err != nil {
+			t.Errorf("corrects=%v frozen=%v token=%q err=%v; want the manifest consulted when the image is not the paused one", corrects, frozen, token, err)
+		}
+	})
+
+	// An overlay without a manifest of its own holds no frozen workload, but
+	// its guest came from the template beneath it: the capability is read
+	// from there, never the frozen fact.
+	t.Run("override_overlay_takes_the_capability_from_its_base_only", func(t *testing.T) {
+		dir := t.TempDir()
+		base := filepath.Join(dir, "template.snap")
+		seed(t, base, WallClockManifest{GuestCorrectsClock: true, WorkloadFrozen: true, FreezeToken: "tok"})
+		overlay := filepath.Join(dir, "restored.diff")
+		if err := os.WriteFile(layeredBaseSidecarPath(overlay), []byte(base+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		corrects, frozen, token, err := resumeImageFacts(overlay, filepath.Join(dir, "mem.diff"), nil, nil, "")
+		if !corrects || frozen || token != "" || err != nil {
+			t.Errorf("corrects=%v frozen=%v token=%q err=%v; want the base's capability and no inherited freeze", corrects, frozen, token, err)
+		}
+	})
+
+	t.Run("override_without_a_manifest_stays_legacy", func(t *testing.T) {
+		dir := t.TempDir()
+		corrects, frozen, token, err := resumeImageFacts(filepath.Join(dir, "restored.snap"), filepath.Join(dir, "mem.snap"), boolPtr(true), boolPtr(true), "rec")
+		if corrects || frozen || token != "" || err != nil {
+			t.Errorf("corrects=%v frozen=%v token=%q err=%v; a stale record must not carry over to a different image", corrects, frozen, token, err)
+		}
+	})
+
+	// A record that lost the image fact goes to the disk, even for the same
+	// image: a rollback to a binary without the field drops it on rewrite.
+	t.Run("unresolved_record_consults_the_manifest", func(t *testing.T) {
+		mem := filepath.Join(t.TempDir(), "mem.snap")
+		seed(t, mem, WallClockManifest{GuestCorrectsClock: true})
+		corrects, frozen, _, err := resumeImageFacts(mem, mem, nil, nil, "")
+		if !corrects || frozen || err != nil {
+			t.Errorf("corrects=%v frozen=%v err=%v; an unresolved record must fall back to the manifest", corrects, frozen, err)
+		}
+		bare := filepath.Join(t.TempDir(), "mem.snap")
+		if corrects, frozen, _, err := resumeImageFacts(bare, bare, nil, nil, ""); corrects || frozen || err != nil {
+			t.Errorf("corrects=%v frozen=%v err=%v; unresolved with no manifest must still be legacy", corrects, frozen, err)
+		}
+	})
+
+	t.Run("override_with_an_untrusted_manifest_is_an_error", func(t *testing.T) {
+		dir := t.TempDir()
+		override := filepath.Join(dir, "restored.snap")
+		if err := os.WriteFile(WallClockMarkerPath(override), []byte(`{"version":2}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, _, err := resumeImageFacts(override, filepath.Join(dir, "mem.snap"), nil, nil, ""); !errors.Is(err, ErrWallClockManifest) {
+			t.Errorf("err=%v, want ErrWallClockManifest", err)
+		}
+	})
+}
+func TestFreezeGuestForPause(t *testing.T) {
+	origF, origT, origR := boxdFreezeGuest, boxdThawGuest, boxdGuestRunning
+	t.Cleanup(func() { boxdFreezeGuest, boxdThawGuest, boxdGuestRunning = origF, origT, origR })
+	m := &Manager{log: zerolog.Nop()}
+
+	t.Run("frozen", func(t *testing.T) {
+		boxdFreezeGuest = func(_ context.Context, _, token string) (freezeEcho, error) {
+			return freezeEcho{Version: 1, Token: token}, nil
+		}
+		thawed := false
+		boxdThawGuest = func(context.Context, string, string) error { thawed = true; return nil }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
+		if err != nil || !frozen || thawed {
+			t.Fatalf("frozen=%v err=%v thawed=%v; want frozen, no error, no thaw", frozen, err, thawed)
+		}
+	})
+
+	t.Run("refused_then_thaw_confirmed_demotes", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{}, errors.New("504: budget")
+		}
+		thawed := false
+		boxdThawGuest = func(context.Context, string, string) error { thawed = true; return nil }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
+		if err != nil || frozen || !thawed {
+			t.Fatalf("frozen=%v err=%v thawed=%v; want unfrozen, no error, thaw issued", frozen, err, thawed)
+		}
+	})
+
+	// A freeze the guest never took answers the follow-up thaw with a token
+	// mismatch: once the workload is confirmed running there is nothing to
+	// release, and the pause goes on unfrozen.
+	t.Run("never_frozen_demotes", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{}, errors.New("connection reset")
+		}
+		boxdThawGuest = func(context.Context, string, string) error {
+			return fmt.Errorf("%w: status token", ErrGuestTokenMismatch)
+		}
+		boxdGuestRunning = func(context.Context, string) error { return nil }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
+		if err != nil || frozen {
+			t.Fatalf("frozen=%v err=%v; want unfrozen and no error", frozen, err)
+		}
+	})
+
+	// The running check after a mismatch has its own budget: a thaw that
+	// spent most of the shared one must not make the check fail on time.
+	t.Run("running_check_after_a_slow_thaw_has_its_own_budget", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{}, errors.New("connection reset")
+		}
+		boxdThawGuest = func(ctx context.Context, _, _ string) error {
+			time.Sleep(1500 * time.Millisecond)
+			return fmt.Errorf("%w: status token", ErrGuestTokenMismatch)
+		}
+		boxdGuestRunning = func(ctx context.Context, _ string) error {
+			if dl, ok := ctx.Deadline(); !ok || time.Until(dl) < time.Second {
+				return errors.New("no time left to confirm")
+			}
+			return nil
+		}
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
+		if err != nil || frozen {
+			t.Fatalf("frozen=%v err=%v; want the running workload confirmed with a fresh budget", frozen, err)
+		}
+	})
+
+	// The same mismatch from a guest still frozen under an earlier token must
+	// not be read as running: a snapshot of that guest marked unfrozen would
+	// never be woken. The pause aborts instead.
+	t.Run("mismatch_without_a_running_workload_aborts_the_pause", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{}, errors.New("connection reset")
+		}
+		boxdThawGuest = func(context.Context, string, string) error {
+			return fmt.Errorf("%w: status token", ErrGuestTokenMismatch)
+		}
+		boxdGuestRunning = func(context.Context, string) error { return errors.New(`guest workload status "frozen"`) }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
+		if err == nil || frozen {
+			t.Fatalf("frozen=%v err=%v; want an error that aborts the pause", frozen, err)
+		}
+	})
+
+	t.Run("echo_naming_another_protocol_or_token_demotes", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{Version: 1, Token: "other"}, nil
+		}
+		thawed := false
+		boxdThawGuest = func(_ context.Context, _, token string) error { thawed = token == "tok"; return nil }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
+		if err != nil || frozen || !thawed {
+			t.Fatalf("frozen=%v err=%v thawed=%v; a guest that froze under another token must be released with ours", frozen, err, thawed)
+		}
+	})
+
+	t.Run("thaw_unconfirmed_aborts_the_pause", func(t *testing.T) {
+		boxdFreezeGuest = func(context.Context, string, string) (freezeEcho, error) {
+			return freezeEcho{}, errors.New("connection reset")
+		}
+		boxdThawGuest = func(context.Context, string, string) error { return errors.New("500: thaw not confirmed") }
+		frozen, err := m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
+		if err == nil || frozen {
+			t.Fatalf("frozen=%v err=%v; want an error that aborts the pause", frozen, err)
+		}
+	})
+
+	t.Run("call_is_bounded_by_the_budget", func(t *testing.T) {
+		m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{GuestFreezeBudget: 300 * time.Millisecond}}
+		var seen time.Duration
+		boxdFreezeGuest = func(ctx context.Context, _, token string) (freezeEcho, error) {
+			dl, ok := ctx.Deadline()
+			if !ok {
+				t.Fatal("freeze must carry a deadline; it sits on the pause path")
+			}
+			seen = time.Until(dl)
+			return freezeEcho{Version: 1, Token: token}, nil
+		}
+		m.freezeGuestForPause(context.Background(), "10.0.0.2", "tok", zerolog.Nop())
+		if seen <= 0 || seen > 300*time.Millisecond {
+			t.Errorf("deadline %v from now, want within (0, 300ms]", seen)
+		}
+	})
 }
