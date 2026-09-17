@@ -108,10 +108,14 @@ class AlertRolloutGateTests(unittest.TestCase):
         self.assertNotIn('if:', gate)  # Manual production dispatches must pass the same gate.
         terraform = (SCRIPT.parents[1] / 'terraform-cd.yml').read_text()
         self.assertNotIn('group: otel-collector-production', terraform)
-        collector_paths = workflow.split('    paths:', 1)[1].split('jobs:', 1)[0]
-        for line in collector_paths.splitlines():
-            if line.strip().startswith('- '):
-                self.assertIn(line.strip(), terraform.split('jobs:', 1)[0])
+        def push_paths(source):
+            paths = source.split('    paths:', 1)[1].split('jobs:', 1)[0]
+            return {line.strip() for line in paths.splitlines() if line.strip().startswith('- ')}
+
+        self.assertEqual(push_paths(workflow), push_paths(terraform),
+                         'Every superseding Terraform push must also start a replacement collector rollout')
+        self.assertIn("- 'infra/**'", push_paths(workflow))
+        self.assertIn("- '.github/workflows/terraform-cd.yml'", push_paths(workflow))
 
 
 if __name__ == '__main__':
