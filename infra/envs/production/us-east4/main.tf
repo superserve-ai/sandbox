@@ -360,7 +360,8 @@ module "sandbox_host_c" {
 
   service_account_email = google_service_account.vmd_runtime.email
 
-  boot_disk_image   = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
+  boot_disk_image   = lookup(var.host_image_overrides, "sandbox_host_c", var.boot_disk_image)
+  provisioning      = contains(var.provisioning_hosts, "sandbox_host_c")
   boot_disk_size_gb = 200
   boot_disk_type    = var.boot_disk_type
 

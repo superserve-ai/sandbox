@@ -356,15 +356,16 @@ module "sandbox_host" {
   })
 
   service_account_email = module.iam.service_account_emails["superserve_api"]
-  boot_disk_image       = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
+  boot_disk_image       = lookup(var.host_image_overrides, "sandbox_host", var.boot_disk_image)
+  provisioning          = contains(var.provisioning_hosts, "sandbox_host")
   boot_disk_size_gb     = 200
   can_ip_forward        = true
 
   metadata = {
     startup-script = <<-EOT
       #!/bin/bash
-      # Minimal startup script — the Packer image has everything pre-installed.
-      # This just detects the host network interface and starts VMD.
+      # Restore runtime and private configuration before admission.
+      # Identity-gated units prevent activation until identity is installed.
       set -euo pipefail
       exec > /var/log/startup-script.log 2>&1
 
@@ -426,7 +427,8 @@ module "sandbox_host_b" {
   service_account_email     = google_service_account.vmd_runtime.email
   allow_stopping_for_update = true
   depends_on                = [google_project_iam_member.vmd_telemetry, google_storage_bucket_iam_member.vmd_backup, google_service_account_iam_member.vmd_deploy_act_as]
-  boot_disk_image           = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
+  boot_disk_image           = lookup(var.host_image_overrides, "sandbox_host_b", var.boot_disk_image)
+  provisioning              = contains(var.provisioning_hosts, "sandbox_host_b")
   boot_disk_size_gb         = 200
   # Declared explicitly so both hosts use the same boot disk type; the
   # module's own default is the API's pd-standard.

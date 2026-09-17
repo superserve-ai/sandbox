@@ -12,6 +12,47 @@ variables {
   boot_disk_image       = "projects/example-project/global/images/example"
 }
 
+run "operator_managed_power_state" {
+  command = plan
+  variables {
+    desired_status = null
+  }
+  assert {
+    condition     = var.desired_status == null
+    error_message = "Null must remain valid for operator-managed power state."
+  }
+}
+
+run "running_power_state" {
+  command = plan
+  variables {
+    desired_status = "RUNNING"
+  }
+  assert {
+    condition     = google_compute_instance.this.desired_status == "RUNNING"
+    error_message = "The requested running state must reach the VM request."
+  }
+}
+
+run "terminated_power_state" {
+  command = plan
+  variables {
+    desired_status = "TERMINATED"
+  }
+  assert {
+    condition     = google_compute_instance.this.desired_status == "TERMINATED"
+    error_message = "The requested terminated state must reach the VM request."
+  }
+}
+
+run "invalid_power_state" {
+  command = plan
+  variables {
+    desired_status = "INVALID"
+  }
+  expect_failures = [var.desired_status]
+}
+
 run "reassert_identity_before_caller_boot_commands" {
   command = plan
   assert {
@@ -54,5 +95,62 @@ run "preserve_caller_cloud_config" {
       endswith(google_compute_instance.this.metadata["startup-script"], "echo caller-startup")
     )
     error_message = "Require identity before caller boot commands while preserving cloud-config and startup settings."
+  }
+}
+
+run "forward_boot_image_unchanged" {
+  command = plan
+  assert {
+    condition     = google_compute_instance.this.boot_disk[0].initialize_params[0].image == var.boot_disk_image
+    error_message = "The VM request must use the CI/CD image reference unchanged."
+  }
+}
+
+run "provisioning_hold" {
+  command = plan
+  variables {
+    provisioning = true
+    labels       = { component = "vmd", sandbox_status = "ready" }
+    metadata = {
+      user-data      = "#cloud-config\nbootcmd:\n  - echo unsafe-caller\n"
+      startup-script = "echo unsafe-startup"
+    }
+  }
+  assert {
+    condition = (
+      google_compute_instance.this.labels["component"] == "vmd-provisioning" &&
+      google_compute_instance.this.labels["sandbox_status"] == "provisioning" &&
+      strcontains(google_compute_instance.this.metadata["user-data"], "provisioning-hold") &&
+      strcontains(google_compute_instance.this.metadata["user-data"], "unsafe-caller") &&
+      strcontains(google_compute_instance.this.metadata["startup-script"], "unsafe-startup") &&
+      strcontains(google_compute_instance.this.metadata["startup-script"], "if [ -f /etc/sandbox/provisioning-complete ]; then") &&
+      strcontains(google_compute_instance.this.metadata["startup-script"], "ConditionPathExists=!/etc/sandbox/provisioning-hold")
+    )
+    error_message = "Provisioning must exclude the host and hold both service and socket before runtime handoff."
+  }
+}
+
+run "restore_boot_preparation_after_release" {
+  command = plan
+  variables {
+    provisioning = true
+    metadata = {
+      user-data = "#cloud-config\nbootcmd:\n  - echo caller-bootstrap\n  - [echo, 'two words']\n"
+    }
+  }
+  assert {
+    condition = (
+      length(yamldecode(google_compute_instance.this.metadata["user-data"]).bootcmd) == 4 &&
+      strcontains(yamldecode(google_compute_instance.this.metadata["user-data"]).bootcmd[0], "10-identity-required.conf") &&
+      strcontains(yamldecode(google_compute_instance.this.metadata["user-data"]).bootcmd[1], "if [ ! -f /etc/sandbox/provisioning-complete ]; then") &&
+      jsonencode(yamldecode(google_compute_instance.this.metadata["user-data"]).bootcmd[2]) == jsonencode([
+        "sh", "-c", "if [ -f /etc/sandbox/provisioning-complete ]; then exec \"$@\"; fi", "provisioning-boot", "sh", "-c", "echo caller-bootstrap"
+      ]) &&
+      jsonencode(yamldecode(google_compute_instance.this.metadata["user-data"]).bootcmd[3]) == jsonencode([
+        "sh", "-c", "if [ -f /etc/sandbox/provisioning-complete ]; then exec \"$@\"; fi", "provisioning-boot", "echo", "two words"
+      ]) &&
+      endswith(google_compute_instance.this.metadata["startup-script"], "then\n:\n:\nfi")
+    )
+    error_message = "Persist caller shell and argv boot commands behind explicit release, with identity gates first and a valid empty startup script."
   }
 }

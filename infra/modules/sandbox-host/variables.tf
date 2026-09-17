@@ -86,7 +86,7 @@ variable "desired_status" {
   nullable    = true
 
   validation {
-    condition     = var.desired_status == null || contains(["RUNNING", "TERMINATED"], var.desired_status)
+    condition     = var.desired_status == null ? true : contains(["RUNNING", "TERMINATED"], var.desired_status)
     error_message = "desired_status must be RUNNING, TERMINATED, or null."
   }
 }
@@ -123,4 +123,16 @@ variable "external_ip" {
   description = "Attach an ephemeral external IP at creation. Cells without NAT depend on it for everything that leaves the host: first-boot downloads, guest egress, and the guest DNS forwarder. Ignored after creation, matching hosts whose address was added by hand."
   type        = bool
   default     = false
+}
+
+variable "provisioning" {
+  description = "Hold new hosts outside runtime deployment and scheduling until operator handoff."
+  type        = bool
+  default     = false
+}
+
+variable "provisioning_run_id" {
+  description = "Manual provisioning run identity for safe initialization retries."
+  type        = string
+  default     = ""
 }

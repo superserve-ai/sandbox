@@ -6,6 +6,11 @@ on:
     paths:
       - "infra/**"
       - "scripts/terraform-*.sh"
+      - "scripts/provision-host.py"
+      - "deploy/host-provisioning-hold.sh"
+      - "deploy/release-host-provisioning.sh"
+      - ".github/workflows/host-provision.yml"
+      - ".github/workflows/scripts/test_terraform_boot_image.py"
       - "scripts/sanitize-terraform-plan.sh"
       - ".github/workflows/terraform-*.yml"
 
@@ -14,6 +19,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  terraform-code-validation:
+    name: Terraform code validation (no cloud credentials)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          # Terraform 1.14+ supports test cleanup for prevent_destroy resources.
+          terraform_version: '1.14.9'
+          terraform_wrapper: false
+      - name: Validate regional configurations without backends
+        run: bash scripts/terraform-validate.sh
+      - name: Test host modules with mocked providers
+        run: |
+          set -euo pipefail
+          for module in sandbox-host managed-identity-host; do
+            terraform -chdir="infra/modules/$module" init -backend=false -input=false
+            terraform -chdir="infra/modules/$module" test
+          done
+      - name: Check image input wiring
+        run: python3 -m unittest discover -s .github/workflows/scripts -p 'test_terraform_boot_image.py'
+
   terraform-plan:
     name: terraform-plan (${{ matrix.name }})
     runs-on: ubuntu-latest

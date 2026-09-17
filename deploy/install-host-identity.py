@@ -69,7 +69,7 @@ def main():
         return json.loads(run('compute', 'instances', 'describe', a.instance, *flags, '--format=json'))
 
     def ssh(script):
-        return run('compute', 'ssh', a.instance, *flags, '--command='+script)
+        return run('compute', 'ssh', a.instance, *flags, '--tunnel-through-iap', '--command='+script)
 
     with installation_lock(ssh):
         machine = describe()
