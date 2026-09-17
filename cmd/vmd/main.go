@@ -648,6 +648,16 @@ func main() {
 			fmt.Println("cgroup-supervision")
 			fmt.Println(vm.WakeProtocolCapability)
 			return
+		case "raise-wake-floor":
+			// Operator step before the first frozen image can exist anywhere:
+			// with the floor up on every host, no vmd without the wake protocol
+			// can start on one, so a later rollback cannot strand a frozen
+			// guest. Durable before it returns; idempotent.
+			if err := vm.RaiseWakeProtocolFloor(); err != nil {
+				fmt.Fprintln(os.Stderr, "raise-wake-floor:", err)
+				os.Exit(1)
+			}
+			return
 		case "drain-check":
 			os.Exit(runDrainCheck())
 		case "launcher-prune":
