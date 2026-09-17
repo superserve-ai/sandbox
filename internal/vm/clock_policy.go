@@ -2,6 +2,8 @@ package vm
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -199,4 +201,95 @@ func (m *Manager) restoreWithClockFallback(policy *bool, restore func(clockRealt
 		m.log.Warn().Msg("firecracker rejected the clock option; falling back to legacy clock behaviour for every restore")
 	}
 	return false, restore(nil)
+}
+
+// defaultGuestFreezeBudget bounds the pause-side wait for the guest to stop
+// its workload. Only ever paid when the restore would freeze the clock.
+const defaultGuestFreezeBudget = 500 * time.Millisecond
+
+// resumeImageFacts returns what the image being resumed says about its guest
+// and its workload, preferring the durable record to the filesystem.
+//
+// An ordinary resume reloads the exact image the VM was paused into, and that
+// pause wrote the facts to the record and the manifest together — so the
+// record is already the answer and the resume path need not go to disk for
+// it. The image fact is what decides: a record that carries it answers, and a
+// guest that cannot correct its clock is never frozen, so its record answers
+// too. Only an explicit override, supplying an image this VM was never paused
+// into, or a record that never carried the fact (a rollback to a binary
+// without the field drops it on rewrite, and its silence must not be read as
+// "no") has to look. A manifest this binary cannot trust is an error the
+// caller must refuse on.
+func resumeImageFacts(memPath, pausedMemPath string, recordedCorrects, recordedFrozen *bool, recordedToken string) (correctsWallClock, workloadFrozen bool, token string, err error) {
+	if memPath == pausedMemPath {
+		// A recorded frozen fact answers only when the record is complete:
+		// a rewrite by an older binary can keep the flag and drop the token
+		// or the capability, and a wake with an empty token is refused.
+		if recordedFrozen != nil && (!*recordedFrozen || (recordedToken != "" && recordedCorrects != nil)) {
+			return recordedCorrects != nil && *recordedCorrects, *recordedFrozen, recordedToken, nil
+		}
+		if recordedCorrects != nil && !*recordedCorrects {
+			return false, false, "", nil
+		}
+	}
+	m, err := imageManifest(memPath)
+	if err != nil {
+		return false, false, "", err
+	}
+	if m != nil {
+		return m.GuestCorrectsClock, m.WorkloadFrozen, m.FreezeToken, nil
+	}
+	// No manifest of its own: the image holds no frozen workload, which an
+	// overlay never inherits, but its guest came from the template beneath
+	// it, so the capability is read from there, as the pause-time check does.
+	if base, ok := readLayeredBase(memPath); ok {
+		if bm, berr := imageManifest(base); berr == nil && bm != nil {
+			return bm.GuestCorrectsClock, false, "", nil
+		}
+	}
+	return false, false, "", nil
+}
+
+// freezeGuestForPause freezes the workload ahead of a snapshot. A failed freeze
+// is ambiguous, so the guest is thawed and that must confirm, else the pause
+// aborts. A retry, if any, mints a new token: the guest refuses a released one.
+func (m *Manager) freezeGuestForPause(ctx context.Context, ip, token string, log zerolog.Logger) (frozen bool, err error) {
+	budget := m.cfg.GuestFreezeBudget
+	if budget <= 0 {
+		budget = defaultGuestFreezeBudget
+	}
+	fctx, cancel := context.WithTimeout(ctx, budget)
+	echo, ferr := boxdFreezeGuest(fctx, ip, token)
+	cancel()
+	if ferr == nil && (echo.Token != token || echo.Version != WakeProtocolVersion) {
+		// The guest froze, but not as this protocol understands it: release it.
+		ferr = fmt.Errorf("freeze reply names protocol %d token %q, asked %d %q", echo.Version, echo.Token, WakeProtocolVersion, token)
+	}
+	if ferr == nil {
+		return true, nil
+	}
+	tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer tcancel()
+	terr := boxdThawGuest(tctx, ip, token)
+	if errors.Is(terr, ErrGuestTokenMismatch) {
+		// The guest holds no freeze under this token, which says nothing about
+		// an earlier one: only a workload confirmed running is unfrozen. Its
+		// own budget: a thaw that spent this one must not fail the check.
+		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		terr = boxdGuestRunning(rctx, ip)
+		rcancel()
+	}
+	if terr != nil {
+		return false, fmt.Errorf("guest workload state unknown after failed freeze (%v); thaw not confirmed: %w", ferr, terr)
+	}
+	log.Warn().Err(ferr).Msg("pause: guest workload not frozen; this image will wake the slower way")
+	return false, nil
+}
+
+// noteGuestClockUnready latches this host to unfrozen restores: host time is a
+// host property, so the caller's retry takes the path that does not need it.
+func (m *Manager) noteGuestClockUnready(log zerolog.Logger, cause error) {
+	if m.guestClockUnready.CompareAndSwap(false, true) {
+		log.Error().Err(cause).Msg("guest could not correct its clock; this host will restore with the clock unfrozen until vmd restarts")
+	}
 }
