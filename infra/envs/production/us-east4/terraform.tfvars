@@ -28,3 +28,4 @@ system_team_id_secret_name            = "system-team-id-production"
 notification_channel_ids              = ["projects/rayai-prod/notificationChannels/7690949645937454026"]
 
 host_c_reservation_name = "superserve-vmd-use4-z3-a"
+host_c_host_id          = "use4-3-3d1e6cebc17448d693e5458619ad00c4"
