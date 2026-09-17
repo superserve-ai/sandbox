@@ -545,7 +545,7 @@ func TestTrialCreditWarningSenderKeepsRecipientsPrivate(t *testing.T) {
 		},
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			return &mockRow{scanFn: func(dest ...any) error {
-				if strings.Contains(sql, "-- name: IsTrialCreditWarningClaimCurrent") {
+				if strings.Contains(sql, "-- name: IsTrialCreditWarningClaimCurrent") || strings.Contains(sql, "-- name: IsTrialCreditWarningRecipientCurrent") {
 					*dest[0].(*bool) = true
 					return nil
 				}
@@ -638,7 +638,7 @@ func TestTrialCreditWarningPartialDeliverySurvivesNewClaim(t *testing.T) {
 				},
 				queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 					return &mockRow{scanFn: func(dest ...any) error {
-						if strings.Contains(sql, "-- name: IsTrialCreditWarningClaimCurrent") {
+						if strings.Contains(sql, "-- name: IsTrialCreditWarningClaimCurrent") || strings.Contains(sql, "-- name: IsTrialCreditWarningRecipientCurrent") {
 							*dest[0].(*bool) = true
 							return nil
 						}
@@ -919,5 +919,44 @@ func TestTrialCreditWarningNormalizesRecipients(t *testing.T) {
 	got := dedupeWarningRecipients([]string{" Owner@Example.com ", "owner@example.com", "  "})
 	if len(got) != 1 || got[0] != "owner@example.com" {
 		t.Fatalf("recipients = %v", got)
+	}
+}
+
+func TestTrialCreditWarningAllRecipientsRevokedRemainsRetryable(t *testing.T) {
+	queries := db.New(&mockDBTX{
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "-- name: ListTrialCreditWarningRecipients") {
+				return &scanRows{rows: []func(...any) error{func(dest ...any) error {
+					*dest[0].(*string) = "former-owner@example.com"
+					return nil
+				}}}, nil
+			}
+			return emptyRows{}, nil
+		},
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			return &mockRow{scanFn: func(dest ...any) error {
+				if strings.Contains(sql, "-- name: IsTrialCreditWarningRecipientCurrent") {
+					*dest[0].(*bool) = false
+					return nil
+				}
+				if strings.Contains(sql, "-- name: GetTeam :one") {
+					return nil
+				}
+				return fmt.Errorf("unexpected query: %s", sql)
+			}}
+		},
+	})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("provider called for revoked recipient")
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	sender := NewResendTrialCreditWarningSender("test-key", "billing@example.com", queries)
+	sender.endpoint, sender.client = server.URL, server.Client()
+	err := sender.SendTrialCreditWarningWithKey(context.Background(), uuid.New(), 1, uuid.New())
+	var unknown UnknownTrialCreditWarningOutcome
+	var permanent *permanentTrialCreditWarningError
+	if err == nil || errors.As(err, &unknown) || errors.As(err, &permanent) {
+		t.Fatalf("expected retryable no-recipient error, got %v", err)
 	}
 }

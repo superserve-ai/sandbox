@@ -733,3 +733,44 @@ func TestTrialWarningSenderRejectsPreviousGrantLifecycle(t *testing.T) {
 		t.Fatalf("new grant after sent warning: provider calls = %d, status = %s", calls, warningStatus(t, team))
 	}
 }
+
+func TestTrialWarningRechecksRecipientsBetweenSubmissions(t *testing.T) {
+	for _, change := range []string{"membership", "role", "email"} {
+		t.Run(change, func(t *testing.T) {
+			ctx := context.Background()
+			team := seedWarningWorkerTeam(t)
+			for i := 0; i < 2; i++ {
+				owner := seedRBACProfile(t)
+				seedMembership(t, ctx, team, owner)
+				seedTeamRoleAssignment(t, ctx, owner, mustRoleID(t, ctx, "team_owner"), team)
+			}
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var statement string
+				switch change {
+				case "membership":
+					statement = `UPDATE team_memberships SET status='inactive' WHERE team_id=$1`
+				case "role":
+					statement = `UPDATE user_role_assignments SET revoked_at=now() WHERE team_id=$1`
+				case "email":
+					statement = `UPDATE profile SET email='changed-' || email WHERE id IN (SELECT user_id FROM team_memberships WHERE team_id=$1)`
+				}
+				if _, err := testPool.Exec(ctx, statement, team); err != nil {
+					t.Error(err)
+				}
+				w.WriteHeader(http.StatusAccepted)
+			}))
+			defer server.Close()
+			h := &api.Handlers{DB: testQueries, TrialWarningSender: api.NewTrialCreditWarningSenderForTest(testQueries, server.URL, server.Client())}
+			api.ProcessTrialCreditWarningForTest(h, ctx, team)
+			if calls != 1 {
+				t.Fatalf("provider calls=%d, want only the recipient authorized before the change", calls)
+			}
+			deliveries, err := testQueries.ListTrialCreditWarningDeliveries(ctx, team)
+			if err != nil || len(deliveries) != 1 {
+				t.Fatalf("accepted deliveries=%v, err=%v", deliveries, err)
+			}
+		})
+	}
+}

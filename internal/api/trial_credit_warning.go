@@ -189,10 +189,21 @@ func (s *ResendTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Cont
 	if err != nil {
 		return err
 	}
+	handled := len(resolved)
 	// Submit one message per recipient. Resend's `to` array is rendered as a
 	// shared To header, which would disclose other billing members' addresses.
 	for _, recipient := range recipients {
 		if resolved[recipient] {
+			continue
+		}
+		// Earlier submissions may outlive a membership or billing-role change.
+		allowed, err := s.queries.IsTrialCreditWarningRecipientCurrent(ctx, db.IsTrialCreditWarningRecipientCurrentParams{
+			TeamID: teamID, Recipient: recipient,
+		})
+		if err != nil {
+			return err
+		}
+		if !allowed {
 			continue
 		}
 		// Recipient resolution and earlier provider calls can take time. Read
@@ -234,6 +245,7 @@ func (s *ResendTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Cont
 			if rows != 1 {
 				return &unknownTrialCreditWarningError{err: errors.New("trial warning rejection claim no longer current")}
 			}
+			handled++
 			log.Warn().Err(err).Str("team_id", teamID.String()).Msg("trial credit warning recipient permanently rejected; not retrying")
 			continue
 		}
@@ -248,6 +260,10 @@ func (s *ResendTrialCreditWarningSender) sendTrialCreditWarning(ctx context.Cont
 		if rows != 1 {
 			return &unknownTrialCreditWarningError{err: errors.New("trial warning delivery claim no longer current")}
 		}
+		handled++
+	}
+	if handled == 0 {
+		return errors.New("trial credit warning has no current billing recipients")
 	}
 	return nil
 }
