@@ -1,7 +1,8 @@
 [Unit]
 Description=Superserve Edge Proxy
-After=network-online.target vmd.service
+After=network-online.target vmd.service proxy.socket
 Wants=network-online.target
+Requires=proxy.socket
 
 [Service]
 Type=simple

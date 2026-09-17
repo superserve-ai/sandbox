@@ -419,7 +419,7 @@ func (h *Handler) handleExecControl(ctx context.Context, client boxdpbconnect.Pr
 		}
 
 	case "signal":
-		signum, ok := signalNameToNumber(msg.Name)
+		signum, ok := execSignalNameToNumber(msg.Name)
 		if !ok {
 			l.Warn().Str("name", msg.Name).Msg("exec/ws: unknown signal name")
 			return
@@ -468,4 +468,18 @@ func writeExecData(ctx context.Context, ws *websocket.Conn, channel byte, data [
 	wctx, cancel := context.WithTimeout(ctx, writeWait)
 	defer cancel()
 	return ws.Write(wctx, websocket.MessageBinary, frame)
+}
+
+// execSignalNameToNumber is the terminal's table plus the signals a caller
+// may send to a process it started. Linux numbers: the guest's.
+func execSignalNameToNumber(name string) (int32, bool) {
+	switch name {
+	case "SIGKILL":
+		return 9, true
+	case "SIGUSR1":
+		return 10, true
+	case "SIGUSR2":
+		return 12, true
+	}
+	return signalNameToNumber(name)
 }

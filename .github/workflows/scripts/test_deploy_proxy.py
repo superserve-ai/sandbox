@@ -103,6 +103,37 @@ class DeployProxyTests(unittest.TestCase):
         service = (Path(__file__).parents[3] / "deploy/proxy.service").read_text()
         self.assertIn("Environment=PROXY_ADDR=:5007\n", service)
         self.assertIn("Environment=PROXY_REDIRECT_ADDR=:5008\n", service)
+        # systemd holds the same ports for the proxy across restarts.
+        socket = (Path(__file__).parents[3] / "deploy/proxy.socket").read_text()
+        self.assertIn("ListenStream=5007\n", socket)
+        self.assertIn("ListenStream=5008\n", socket)
+        self.assertIn("Requires=proxy.socket\n", service)
+
+    def test_every_proxy_service_installer_also_installs_the_socket(self):
+        # The service Requires= the socket unit; an installer that ships one
+        # without the other leaves a proxy that cannot start.
+        repo = Path(__file__).parents[3]
+        installers = [p for p in list(repo.glob("deploy/**/*")) + list(repo.glob(".github/**/*"))
+                      if p.is_file() and p.suffix in (".py", ".sh") and "test_" not in p.name
+                      and "/etc/systemd/system/proxy.service" in p.read_text()]
+        self.assertTrue(installers)
+        for installer in installers:
+            with self.subTest(installer=str(installer.relative_to(repo))):
+                self.assertIn("/etc/systemd/system/proxy.socket", installer.read_text())
+
+    def test_socket_unit_is_installed_and_bound_before_the_service_restarts(self):
+        script = self.generate_script("")
+        self.assertIn("sudo mv /tmp/proxy.socket /etc/systemd/system/proxy.socket", script)
+        self.assertIn("sudo systemctl enable proxy proxy.socket", script)
+        # A changed unit is bound again, not just reloaded; a rollback binds the restored one.
+        self.assertIn("sudo cmp -s /tmp/proxy.socket /etc/systemd/system/proxy.socket", script)
+        rollback = script.index("rollback_peer_advertisement() {")
+        restored = script.index('if ! sudo test -f "$rollback_dir/proxy.socket"; then', rollback)
+        self.assertIn("sudo systemctl start proxy.socket || return 1", script[restored:restored + 600])
+        self.assertIn('if [ "$socket_changed" -eq 1 ] || ! sudo systemctl is-active --quiet proxy.socket; then', script)
+        bind = script.index("sudo systemctl start proxy.socket")
+        restart = script.index("if ! sudo systemctl restart proxy; then", bind)
+        self.assertLess(bind, restart)
 
     def test_standby_pins_host_without_overriding_bootstrap_policy(self):
         script = self.generate_script("", routing="0", expected_standby="example-host")
@@ -299,6 +330,7 @@ class DeployProxyTests(unittest.TestCase):
                     "bin/proxy": "old binary",
                     "etc/systemd/system/proxy.service": "old unit",
                     "tmp/proxy.service": "unit",
+                    "tmp/proxy.socket": "socket unit",
                 }
                 for name, contents in files.items():
                     path = root / name
@@ -391,8 +423,10 @@ class DeployProxyTests(unittest.TestCase):
                 if failed_service != "none":
                     self.assertEqual((root / "bin/proxy").read_text(), "old binary")
                     self.assertEqual((root / "etc/systemd/system/proxy.service").read_text(), "old unit")
+                    self.assertFalse((root / "etc/systemd/system/proxy.socket").exists())
                 if failed_service == "none":
                     self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual((root / "etc/systemd/system/proxy.socket").read_text(), "socket unit")
                     proxy_env = (root / "etc/sandbox/proxy.env").read_text()
                     self.assertIn('HOST_ID=default\n' if legacy else 'HOST_ID=example-region-2-generated\n', proxy_env)
                     if not identity:

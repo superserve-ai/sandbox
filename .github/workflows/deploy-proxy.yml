@@ -67,6 +67,7 @@ on:
       - 'go.mod'
       - 'go.sum'
       - 'deploy/proxy.service'
+      - 'deploy/proxy.socket'
       - '.github/workflows/deploy-proxy.yml'
       - '.github/workflows/scripts/deploy-proxy.py'
       - '.github/workflows/scripts/select-deploy-target.sh'
