@@ -469,7 +469,7 @@ module "sandbox_host_c" {
   labels = merge(local.sandbox_host_labels, {
     component                  = "vmd"
     sandbox_role               = "vmd"
-    sandbox_status             = "provisioning"
+    sandbox_status             = "ready"
     "goog-ops-agent-policy"    = "v2-template-1-7-0"
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
