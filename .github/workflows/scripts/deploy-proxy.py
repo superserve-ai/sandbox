@@ -309,9 +309,14 @@ def main() -> int:
                     fi
                 done
                 sudo systemctl daemon-reload || return 1
-                # A build that binds the ports itself needs the socket unit gone.
+                # The restored unit must be the one bound: a build that binds
+                # the ports itself needs the socket gone, and a restored unit
+                # file only takes effect through a restart of the socket.
                 if ! sudo test -f "$rollback_dir/proxy.socket"; then
                     sudo systemctl disable --now proxy.socket 2>/dev/null || true
+                else
+                    sudo systemctl stop proxy proxy.socket 2>/dev/null || true
+                    sudo systemctl start proxy.socket || return 1
                 fi
                 if ! sudo test -f "$rollback_dir/proxy" || ! sudo test -f "$rollback_dir/proxy.service"; then
                     sudo systemctl stop proxy || return 1
