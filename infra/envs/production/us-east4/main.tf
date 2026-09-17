@@ -89,7 +89,7 @@ module "network" {
     peer_ingress = {
       name          = "superserve-use4-allow-peer-ingress"
       direction     = "INGRESS"
-      source_ranges = ["10.2.0.3/32", "10.2.0.4/32"]
+      source_ranges = ["10.2.0.4/32"]
       source_tags   = ["vmd-use4", "vmd-usw2"]
       target_tags   = ["vmd-use4"]
       allow = [{
