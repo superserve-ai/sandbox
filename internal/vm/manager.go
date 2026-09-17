@@ -721,8 +721,8 @@ type Manager struct {
 	// older Firecracker under a running daemon, and the first restore it refuses
 	// clears this for good.
 	clockRealtimeCapable atomic.Bool
-	// guestClockUnready latches this host to unfrozen restores after a guest
-	// reported it could not correct its clock. See noteGuestClockUnready.
+	// guestClockUnready latches once a guest reported it cannot correct its
+	// clock: every later restore takes the unfrozen path until vmd restarts.
 	guestClockUnready atomic.Bool
 	// pendingWakes are reattached records that owe a wake, held back from
 	// m.vms until the startup pool completes it. See queuePendingWake.

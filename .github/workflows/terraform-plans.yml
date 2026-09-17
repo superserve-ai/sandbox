@@ -43,6 +43,7 @@ jobs:
       # Existing Monitoring channel resource names are non-secret references;
       # the channel's Slack credential remains owned by Cloud Monitoring.
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -147,7 +148,7 @@ jobs:
           } > "$summary_file"
           exit "$plan_status"
 
-      - name: Verify west promotion and OTLP ingress
+      - name: Verify west VMD and OTLP ingress
         if: env.HAS_GCP_AUTH == 'true' && matrix.name == 'production-us-west2'
         shell: bash
         run: bash "${GITHUB_WORKSPACE}/scripts/terraform-plan-west.sh"

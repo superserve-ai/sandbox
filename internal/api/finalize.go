@@ -49,6 +49,8 @@ func (h *Handlers) finalizePause(ctx context.Context, params db.FinalizePausePar
 	return h.DB.FinalizePauseGeneration(ctx, db.FinalizePauseGenerationParams{
 		ID:                     params.ID,
 		TeamID:                 params.TeamID,
+		PauseOpID:              params.PauseOpID,
+		PauseOpLeaseVersion:    params.PauseOpLeaseVersion,
 		Path:                   params.Path,
 		MemPath:                params.MemPath,
 		SizeBytes:              params.SizeBytes,

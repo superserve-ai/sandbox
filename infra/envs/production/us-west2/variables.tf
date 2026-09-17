@@ -110,13 +110,19 @@ variable "network_name" {
   default = "superserve-production-vpc"
 }
 
-variable "active_sandbox_host" {
-  description = "Which sandbox host serves the cell: primary or standby."
+variable "standby_host_id" {
+  description = "The host's HOST_ID as vmd registers it (the installed host identity, not the slot name); DEFAULT_HOST_ID and alert filters follow it."
   type        = string
-  default     = "primary"
+  default     = "usw2-2"
+}
+
+variable "cloud_ids_runbook_base_url" {
+  description = "Shared HTTPS runbook base URL supplied through the RUNBOOK_BASE_URL repository Actions variable."
+  type        = string
+  nullable    = false
 
   validation {
-    condition     = contains(["primary", "standby"], var.active_sandbox_host)
-    error_message = "active_sandbox_host must be primary or standby."
+    condition     = can(regex("^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>?#()\\[\\]]*)?$", var.cloud_ids_runbook_base_url))
+    error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
   }
 }

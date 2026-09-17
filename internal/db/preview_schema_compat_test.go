@@ -182,7 +182,7 @@ func TestSyncHostCapabilitiesUsesCompleteSetSemantics(t *testing.T) {
 	}
 }
 
-func TestHostCapabilityBatchGateLocksExactActiveHeartbeat(t *testing.T) {
+func TestHostCapabilityBatchGateLocksExactEligibleHeartbeat(t *testing.T) {
 	path := filepath.Join("..", "..", "db", "queries", "hosts.sql")
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -193,19 +193,26 @@ func TestHostCapabilityBatchGateLocksExactActiveHeartbeat(t *testing.T) {
 	if start < 0 {
 		t.Fatal("HostHasCapabilities query block is missing")
 	}
-	// The unlocked variant follows immediately; bound the locked block at it so
-	// this assertion covers only the FOR SHARE query.
+	// Bound the evaluation block separately from the host-lock statement.
 	end := strings.Index(queries[start:], "-- name: HostHasCapabilitiesUnlocked :one")
 	if end < 0 {
 		t.Fatal("HostHasCapabilities query terminator is missing")
 	}
+	lockStart := strings.Index(queries, "-- name: LockHostForCapabilities :execrows")
+	if lockStart < 0 || lockStart >= start || !strings.Contains(queries[lockStart:start], "FOR SHARE") {
+		t.Fatal("missing separate host share lock")
+	}
 	query := queries[start : start+end]
+	if strings.Contains(query, "FOR SHARE") {
+		t.Fatal("capability evaluation must use a new non-locking snapshot")
+	}
 	for _, required := range []string{
 		"WITH target_host AS MATERIALIZED",
 		"WHERE id = sqlc.arg('host_id')",
-		"status = 'active'",
+		"status = ANY(sqlc.arg('allowed_statuses')::text[])",
+		"sqlc.narg('heartbeat_after')::timestamptz IS NULL",
+		"OR last_heartbeat_at > sqlc.narg('heartbeat_after')",
 		"last_heartbeat_at IS NOT NULL",
-		"FOR SHARE",
 		"unnest(sqlc.arg('required_capabilities')::text[])",
 		"hc.host_id = h.id",
 		"hc.heartbeat_at = h.last_heartbeat_at",
@@ -219,8 +226,8 @@ func TestHostCapabilityBatchGateLocksExactActiveHeartbeat(t *testing.T) {
 	}
 }
 
-// The unlocked variant used on the create/resume pre-flight paths must run the
-// same relational division against the same active-heartbeat host, but WITHOUT
+// The unlocked variant used on active-only pre-flight paths must run the
+// same relational division against the same eligible host, but WITHOUT
 // the row lock — that is the whole point of the second query (a burst of
 // pre-flight checks must not serialize behind the host's heartbeat writer).
 func TestHostHasCapabilitiesUnlockedRunsSameDivisionWithoutRowLock(t *testing.T) {
@@ -234,7 +241,7 @@ func TestHostHasCapabilitiesUnlockedRunsSameDivisionWithoutRowLock(t *testing.T)
 	if start < 0 {
 		t.Fatal("HostHasCapabilitiesUnlocked query block is missing")
 	}
-	end := strings.Index(queries[start:], "-- name: MarkHostUnhealthy :exec")
+	end := strings.Index(queries[start:], ";")
 	if end < 0 {
 		t.Fatal("HostHasCapabilitiesUnlocked query terminator is missing")
 	}
@@ -242,7 +249,9 @@ func TestHostHasCapabilitiesUnlockedRunsSameDivisionWithoutRowLock(t *testing.T)
 	for _, required := range []string{
 		"WITH target_host AS MATERIALIZED",
 		"WHERE id = sqlc.arg('host_id')",
-		"status = 'active'",
+		"status = ANY(sqlc.arg('allowed_statuses')::text[])",
+		"sqlc.narg('heartbeat_after')::timestamptz IS NULL",
+		"OR last_heartbeat_at > sqlc.narg('heartbeat_after')",
 		"last_heartbeat_at IS NOT NULL",
 		"unnest(sqlc.arg('required_capabilities')::text[])",
 		"hc.host_id = h.id",

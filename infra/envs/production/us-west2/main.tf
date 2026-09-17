@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.7.0"
 
   backend "gcs" {
     bucket = "superserve-terraform-state-prod"
@@ -50,27 +50,18 @@ locals {
 
   api_service_account_email = "superserve-api-runner@${local.project_id}.iam.gserviceaccount.com"
 
-  # The control plane dials whichever host active_sandbox_host selects. The
-  # selected host must already be running and serving before it is applied —
-  # instance run state is operational, not Terraform-managed, so that a host
-  # started for an incident is never stopped again by a later apply.
-  active_vmd_ip = var.active_sandbox_host == "standby" ? module.sandbox_host_b.internal_ip : module.sandbox_host.internal_ip
+  # The control plane dials the cell's host.
+  active_vmd_ip = module.sandbox_host_b.internal_ip
 
-  # The host currently serving vmd traffic, and so the host whose HOST_ID
-  # tags its metrics. Alert filters must key on this, not on sandbox_host,
-  # or a standby promotion leaves them watching a host_id that stopped
-  # emitting.
-  active_host_name = var.active_sandbox_host == "standby" ? module.sandbox_host_b.instance_name : module.sandbox_host.instance_name
+  # The host serving vmd traffic, and so the host whose HOST_ID tags its
+  # metrics. Alert filters key on this.
+  active_host_name = module.sandbox_host_b.instance_name
 
   # The host_id that actually tags this cell's metrics: vmd's HOST_ID runtime
-  # env, which is ALSO its identity in the host table. It is not derivable from
-  # the instance name — this cell's row predates the convention of naming rows
-  # after the instance, and HOST_ID must never be changed to match, because
-  # heartbeats and reconciler scoping key on the existing row. Alert filters
-  # that guess the instance name here select no series and never fire, which
-  # looks identical to a healthy host.
-  #
-  # Verify against the host before changing: grep '^HOST_ID=' /etc/sandbox/vmd.env
+  # env, which is ALSO its identity in the host table. It is the installed
+  # host identity (slot name plus a generated suffix), not the instance name,
+  # set in tfvars from the host itself:
+  #   grep '^HOST_ID=' /etc/sandbox/host-identity.env
   #
   # Deliberately NOT the same as active_host_name, and the two must not be
   # merged: the host-local collector stamps its own HOST_ID (the instance name,
@@ -78,13 +69,7 @@ locals {
   # host-level series like filesystem utilization carry the instance name while
   # vmd's own OTLP series carry vmd's HOST_ID. One machine, two host_id values,
   # depending on which process emitted the metric.
-  metrics_host_id = var.active_sandbox_host == "standby" ? "usw2-2" : "usw2"
-
-  # Exactly one host carries component=vmd, the label the shared deploy
-  # pipeline discovers; the other is parked under a cell-scoped label so
-  # rollouts skip it instead of failing against a host that is out of service.
-  primary_component = var.active_sandbox_host == "primary" ? "vmd" : "vmd-usw2-standby"
-  standby_component = var.active_sandbox_host == "standby" ? "vmd" : "vmd-usw2-standby"
+  metrics_host_id = var.standby_host_id
 }
 module "network" {
   source = "../../../modules/network"
@@ -109,6 +94,17 @@ module "network" {
   vpc_connector_subnet_ip     = var.connector_subnet_cidr
 
   firewall_rules = {
+    peer_ingress = {
+      name        = "superserve-usw2-allow-peer-ingress"
+      direction   = "INGRESS"
+      source_tags = ["vmd-use4", "vmd-usw2"]
+      target_tags = ["vmd-usw2"]
+      allow = [{
+        protocol = "tcp"
+        ports    = ["5009"]
+      }]
+      description = "Allow private mTLS forwarding between production VMD hosts."
+    }
     allow_vmd_grpc = {
       name          = "superserve-usw2-allow-cr-vmd"
       direction     = "INGRESS"
@@ -224,10 +220,9 @@ module "api" {
     STRIPE_CHECKOUT_PRICE_IDS   = "price_1U60fMPyzR3Q9AgflfcjIHsp,price_1U60hxPyzR3Q9AgfOsciXQ43"
     APP_ALLOWED_ORIGINS         = "https://console.superserve.ai"
 
-    # The serving host's identity for VMD-call metric labels, following
-    # active_sandbox_host like the address above. Without it the wrapper
-    # falls back to labeling every series "default", which host-grouped
-    # dashboards cannot attribute and a standby promotion would not update.
+    # The serving host's identity for VMD-call metric labels. Without it the
+    # wrapper falls back to labeling every series "default", which
+    # host-grouped dashboards cannot attribute.
     DEFAULT_HOST_ID = local.metrics_host_id
   }
 
@@ -276,58 +271,8 @@ module "api" {
   labels = local.common_labels
 }
 
-module "sandbox_host" {
-  source = "../../../modules/sandbox-host"
-
-  project_id    = local.project_id
-  environment   = local.environment
-  region        = local.region
-  zone          = local.zone
-  instance_name = "superserve-vmd-${local.resource_suffix}"
-  machine_type  = var.machine_type
-  subnet        = module.network.subnetwork_self_link
-  internal_ip   = "10.1.0.2"
-  tags          = ["vmd-usw2"]
-  labels = merge(local.sandbox_host_labels, {
-    component                  = local.primary_component
-    sandbox_role               = "vmd"
-    "vanta-contains-user-data" = "true"
-    "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
-  })
-
-  service_account_email = data.google_service_account.api_runner.email
-  # 24.04 images are only published under the -amd64 family.
-  boot_disk_image     = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
-  boot_disk_size_gb   = 250
-  can_ip_forward      = false
-  on_host_maintenance = "TERMINATE"
-
-  metadata = {
-    enable-osconfig = "TRUE"
-    enable-oslogin  = "TRUE"
-  }
-}
-
-# Background-data disk, separate from the local-SSD array serving live VM
-# disk I/O: pause-backup staging reads every staged file twice before it
-# leaves the host (digest pre-check, then the upload stream), and on this
-# host both reads would otherwise land on the same array as tenant reads.
-# Other background workloads (logs, metrics) are candidates for the same
-# disk later; only backup staging (BACKUP_STAGING_DIR, wired in
-# deploy-vmd.yml) uses it today. One per host, primary and standby alike
-# (see sandbox_data_b below): the deploy label — and so the
-# BACKUP_STAGING_DIR-configured deploy step — follows active_sandbox_host
-# to whichever host is actually serving, and deploy-vmd.py's mount
-# precondition refuses to deploy onto a host missing this device, so a
-# promotion must never find the newly-active host without one.
-#
-# Sized for real headroom rather than steady-state drain: this cell's
-# peak pause rate runs on the order of 1.3k generations/hour at ~12MB
-# packed each, so a fully stalled uploader fills roughly 15.6GB/hour.
-# 1024GB absorbs that for ~65 hours (~2.7 days) before the disk itself
-# becomes the constraint. hyperdisk-balanced, not pd-balanced: this is a
-# Z3 metal host, which rejects standard Persistent Disk types the same
-# way it rejects the API-default pd-standard boot disk.
+# Background-data disk of the retired host, kept detached until its staged
+# backups are confirmed drained or empty. The attachment went with the host.
 resource "google_compute_disk" "sandbox_data" {
   project = local.project_id
   name    = "superserve-vmd-usw2-sandbox-data"
@@ -345,34 +290,7 @@ resource "google_compute_disk" "sandbox_data" {
   }
 }
 
-# No deletion_policy here (unlike staging's equivalent block, which
-# pins a provider major version new enough to support it): the
-# google_compute_attached_disk resource under this file's pinned
-# provider constraint (~> 6.0, resolving as of this writing to the
-# latest 6.x release) exposes no such argument — confirmed against the
-# provider's own schema, not assumed — so setting it fails
-# terraform validate outright. The disk survives instance
-# deletion/replacement regardless: attaching it through this resource
-# (the API's attachDisk call) rather than as an instance-creation-time
-# disk means GCP does not auto-delete it when the instance goes away,
-# and prevent_destroy above already stops Terraform from deleting the
-# disk resource itself — sufficient on its own to preserve the data.
-# Deliberately NOT prevent_destroy here too: this attachment is keyed
-# on the instance's self link, so the documented host-recreation flow
-# (host-dr-runbook.md) replaces it whenever the instance is rebuilt, and
-# prevent_destroy on the attachment would block that replacement.
-resource "google_compute_attached_disk" "sandbox_data" {
-  project     = local.project_id
-  zone        = local.zone
-  disk        = google_compute_disk.sandbox_data.id
-  instance    = module.sandbox_host.instance_self_link
-  device_name = "superserve-sandbox-data"
-  mode        = "READ_WRITE"
-}
-
-# Cold standby for the cell, normally kept stopped. Promotion = start this
-# host, then set active_sandbox_host = "standby" and apply: the switch routes
-# the control plane here and moves the deploy-fleet label off the primary.
+# The cell's host.
 module "sandbox_host_b" {
   source = "../../../modules/sandbox-host"
 
@@ -386,15 +304,17 @@ module "sandbox_host_b" {
   internal_ip   = "10.1.0.3"
   tags          = ["vmd-usw2"]
   labels = merge(local.sandbox_host_labels, {
-    component                  = local.standby_component
+    component                  = "vmd"
     sandbox_role               = "vmd"
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
-  service_account_email = data.google_service_account.api_runner.email
-  boot_disk_image       = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
-  boot_disk_size_gb     = 250
+  service_account_email     = google_service_account.vmd_runtime.email
+  allow_stopping_for_update = true
+  depends_on                = [google_project_iam_member.vmd_telemetry, google_storage_bucket_iam_member.vmd_backup, google_service_account_iam_member.vmd_deploy_act_as]
+  boot_disk_image           = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  boot_disk_size_gb         = 250
   # Metal machine types reject the API-default pd-standard boot disk.
   boot_disk_type      = "hyperdisk-balanced"
   can_ip_forward      = false
@@ -408,15 +328,13 @@ module "sandbox_host_b" {
 
 # The standby's own background-data disk — see sandbox_data above for
 # why every host carrying the "vmd" deploy label needs one, and for why
-# hyperdisk-balanced (this is a Z3 metal host too). Sized the same as
-# the primary's: on promotion this host takes over the same traffic, so
-# the same headroom math applies.
+# hyperdisk-balanced (this is a Z3 metal host too). Hyperdisks only grow.
 resource "google_compute_disk" "sandbox_data_b" {
   project = local.project_id
   name    = "superserve-vmd-usw2-2-sandbox-data"
   zone    = local.zone
   type    = "hyperdisk-balanced"
-  size    = 1024
+  size    = 4096
 
   labels = merge(local.common_labels, {
     component = "vmd"
@@ -428,10 +346,24 @@ resource "google_compute_disk" "sandbox_data_b" {
   }
 }
 
-# See sandbox_data's attachment above for why there's no deletion_policy
-# here (unsupported under this file's pinned ~> 6.0 provider), why the
-# disk is safe without it, and why prevent_destroy stays off this
-# attachment specifically (it must be replaceable across host rebuilds).
+# Background-data disk, separate from the local-SSD array serving live VM
+# disk I/O: pause-backup staging reads every staged file twice before it
+# leaves the host (digest pre-check, then the upload stream), and on this
+# host both reads would otherwise land on the same array as tenant reads.
+# Only backup staging (BACKUP_STAGING_DIR, wired in deploy-vmd.yml) uses
+# it today; deploy-vmd.py's mount precondition refuses to deploy onto a
+# host missing this device. hyperdisk-balanced, not pd-balanced: this is
+# a Z3 metal host, which rejects standard Persistent Disk types.
+#
+# No deletion_policy on the attachment: the google_compute_attached_disk
+# resource under this file's pinned ~> 6.0 provider exposes no such
+# argument. The disk survives instance deletion regardless: attaching it
+# through this resource (the API's attachDisk call) rather than as an
+# instance-creation-time disk means GCP does not auto-delete it, and
+# prevent_destroy on the disk stops Terraform from deleting the disk
+# itself. Deliberately NOT prevent_destroy on the attachment: it is keyed
+# on the instance's self link, so the documented host-recreation flow
+# (host-dr-runbook.md) replaces it whenever the instance is rebuilt.
 resource "google_compute_attached_disk" "sandbox_data_b" {
   project     = local.project_id
   zone        = local.zone
@@ -448,12 +380,6 @@ module "observability" {
   environment              = local.environment
   notification_channel_ids = var.notification_channel_ids
   compute_instance_cpu_alerts = {
-    sandbox_host = {
-      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / CPU saturation"
-      instance_name = module.sandbox_host.instance_name
-      instance_id   = module.sandbox_host.instance_id
-    }
-    # Inert while the standby is stopped (no data, no fire).
     sandbox_host_b = {
       display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / CPU saturation"
       instance_name = module.sandbox_host_b.instance_name
@@ -461,21 +387,20 @@ module "observability" {
     }
   }
   host_maintenance_event_alerts = {
-    sandbox_host = {
-      display_name  = "Infrastructure / ${module.sandbox_host.instance_name} / host maintenance event"
-      instance_name = module.sandbox_host.instance_name
-      instance_id   = module.sandbox_host.instance_id
+    sandbox_host_b = {
+      display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / host maintenance event"
+      instance_name = module.sandbox_host_b.instance_name
+      instance_id   = module.sandbox_host_b.instance_id
     }
   }
-  # Backup pipeline alerts scoped to this cell's host via the host_id
-  # metric label (HOST_ID on the host matches the instance name). Follows
-  # active_sandbox_host so a standby promotion keeps the filter on whichever
-  # host is actually emitting.
+  # Backup alerts use the stable collector identity plus the legacy host_id
+  # selector while older collectors roll forward.
   # Thresholds are the module defaults except oldest_pending_age_duration;
   # the rationale for each default sits on the module's variables.
   backup_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Backup / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Backup / ${local.active_host_name}"
     # A share of this cell's traffic pauses in scheduled batches rather
     # than steadily, confirmed via backup_journal_pending{priority="pause"}
     # and the control plane's pause-endpoint request log. The module
@@ -510,13 +435,13 @@ module "observability" {
   # they mean "the controller engaged and still lost", not "the controller is
   # doing its job" — move them together with the ceiling or not at all.
   launch_path_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Launch path / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Launch path / ${local.active_host_name}"
   }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
-  # the same host_id label the backup metrics use, and following
-  # active_sandbox_host for the same reason. Module defaults: warn at 85%
-  # sustained 30 minutes, page at 95%.
+  # the same host_id label the backup metrics use. Module defaults: warn at
+  # 85% sustained 30 minutes, page at 95%.
   host_disk_alerts = {
     host_id        = local.active_host_name
     display_prefix = "Infrastructure / ${local.active_host_name}"
@@ -561,5 +486,6 @@ module "cloud_ids" {
   endpoint_name              = "superserve-ids-${local.resource_suffix}"
   mirrored_subnet_self_links = local.cloud_ids_mirrored_subnet_self_links
   notification_channel_ids   = var.notification_channel_ids
+  runbook_base_url           = var.cloud_ids_runbook_base_url
   labels                     = local.common_labels
 }

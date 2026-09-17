@@ -734,7 +734,7 @@ paths:
           schema:
             type: string
             enum:
-              [starting, active, pausing, paused, resuming, failed, deleted]
+              [starting, active, pausing, paused, resuming, migrating, failed, deleted]
         - name: sort
           in: query
           required: false
@@ -1158,11 +1158,47 @@ paths:
         Snapshots the sandbox's full state (memory + disk), suspends the VM,
         and transitions to `paused`. Resume it later to continue exactly where
         it left off — same memory, same running processes, same files.
+
+        The request holds until the pause is decided; if the host has not
+        answered by then, the response is `202 Accepted` and the pause
+        continues in the background. Send `Prefer: respond-async` to get
+        `202` as soon as the pause is recorded instead. Either way
+        `GET /sandboxes/{sandbox_id}` reports `paused` once it lands (or
+        `failed` if the VM turned out to be gone).
       security:
         - apiKey: []
+      parameters:
+        - name: Prefer
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: [respond-async]
+          description: >
+            Accept `202` with `{"status":"pausing"}` over a held connection.
       responses:
         "204":
           description: Sandbox paused
+        "202":
+          description: >
+            Pause recorded and in progress; poll the sandbox until it is
+            `paused`. Immediate with `Prefer: respond-async`, otherwise
+            returned when the pause is still in progress after the request's
+            wait.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: Seconds to wait before polling.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [pausing]
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -3153,12 +3189,15 @@ components:
           type: string
         status:
           type: string
-          enum: [active, paused, resuming]
+          enum: [active, pausing, paused, resuming, migrating, failed]
           description: >
             Current state of the sandbox. `active` means running; `paused`
-            means paused and awaiting resume. `resuming` is a transient
-            state observed while the platform restores a paused sandbox
-            (e.g. via auto-resume on `/exec`); clients should retry shortly.
+            means paused and awaiting resume. `pausing`, `resuming` and
+            `migrating` are transient states observed while the platform
+            pauses, restores, or relocates a sandbox (e.g. after a `202`
+            from `/pause`, or auto-resume on `/exec`); clients should poll
+            or retry shortly. `failed` means the sandbox can no longer be
+            resumed.
         vcpu_count:
           type: integer
         memory_mib:
@@ -4179,7 +4218,7 @@ components:
           description: Env-var name the secret resolves to inside the sandbox.
         status:
           type: string
-          enum: [active, paused, resuming, failed]
+          enum: [active, pausing, paused, resuming, migrating, failed]
 
     ProviderShortcut:
       type: object

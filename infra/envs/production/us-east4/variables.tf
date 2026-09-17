@@ -52,8 +52,8 @@ variable "boot_disk_type" {
   default     = "hyperdisk-balanced"
 }
 
-variable "standby_reservation_name" {
-  description = "Reservation to target for the z3 host. Null uses default affinity, which auto-consumes a matching (non-specific) z3 reservation in the zone."
+variable "host_c_reservation_name" {
+  description = "z3 reservation the sandbox host targets; null uses default affinity."
   type        = string
   default     = null
 }
@@ -117,4 +117,20 @@ variable "notification_channel_ids" {
   description = "Existing monitored Cloud Monitoring notification channel resource names for infrastructure alerts."
   type        = list(string)
   default     = []
+}
+
+variable "cloud_ids_runbook_base_url" {
+  description = "Shared HTTPS runbook base URL supplied through the RUNBOOK_BASE_URL repository Actions variable."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>?#()\\[\\]]*)?$", var.cloud_ids_runbook_base_url))
+    error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
+  }
+}
+
+variable "host_c_host_id" {
+  description = "The serving host's HOST_ID as vmd registers it (the installed host identity, not the slot name); DEFAULT_HOST_ID and alert filters follow it."
+  type        = string
 }

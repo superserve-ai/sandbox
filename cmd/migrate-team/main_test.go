@@ -910,6 +910,18 @@ func TestTeamMigration(t *testing.T) {
 		}
 	})
 
+	t.Run("purge refuses while a destroyed sandbox still owes its host reclaim", func(t *testing.T) {
+		mustExec(t, srcPool, `INSERT INTO sandbox_teardown (sandbox_id, host_id) VALUES ($1, $2)`, f.sb3, sourceHostID)
+		defer mustExec(t, srcPool, `DELETE FROM sandbox_teardown WHERE sandbox_id = $1`, f.sb3)
+
+		cfg := f.cfg(phasePurge)
+		cfg.confirmTeamName = "migration-drill"
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), f.sb3.String()) {
+			t.Fatalf("pending teardown must block purge, got: %v", err)
+		}
+	})
+
 	t.Run("detach refuses when the source is no longer quiescent", func(t *testing.T) {
 		mustExec(t, srcPool, `UPDATE sandbox SET status = 'active' WHERE id = $1`, f.sb1)
 		defer mustExec(t, srcPool, `UPDATE sandbox SET status = 'paused' WHERE id = $1`, f.sb1)

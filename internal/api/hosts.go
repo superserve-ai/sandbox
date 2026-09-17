@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
@@ -27,8 +28,9 @@ type hostStorageMeasurement struct {
 }
 
 type hostHeartbeatRequest struct {
-	Capabilities []string                 `json:"capabilities"`
-	Storage      []hostStorageMeasurement `json:"storage,omitempty"`
+	IncarnationID string                   `json:"incarnation_id,omitempty"`
+	Capabilities  []string                 `json:"capabilities"`
+	Storage       []hostStorageMeasurement `json:"storage,omitempty"`
 
 	// Self-description, sent by vmds that support self-registration. When a
 	// heartbeat arrives for an unknown host id with a complete description,
@@ -71,6 +73,14 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 			return
 		}
 	}
+	if req.IncarnationID != "" {
+		id, err := uuid.Parse(req.IncarnationID)
+		if err != nil || id == uuid.Nil || !req.describesHost() {
+			respondErrorMsg(c, "bad_request", "incarnation requires a nonzero UUID and complete host description", http.StatusBadRequest)
+			return
+		}
+		req.IncarnationID = id.String()
+	}
 	if len(req.Capabilities) > maxHostCapabilities {
 		respondErrorMsg(c, "bad_request", "too many capabilities", http.StatusBadRequest)
 		return
@@ -110,10 +120,19 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 		storageMiB = append(storageMiB, int32(mib))
 	}
 
+	// The fencing claim and advisory lock must span every heartbeat write.
+	if h.Pool == nil {
+		respondErrorMsg(c, "service_unavailable", "host heartbeat transactions are not configured", http.StatusServiceUnavailable)
+		return
+	}
+
 	ctx := c.Request.Context()
 	registered := false
 	reclaimed := false
 	beat := func(q *db.Queries) (status, prevStatus string, _ error) {
+		if err := q.PrepareHostHeartbeat(ctx, db.PrepareHostHeartbeatParams{HostID: hostID, IncarnationID: req.IncarnationID}); err != nil {
+			return "", "", err
+		}
 		host, err := q.GetHostForUpdate(ctx, hostID)
 		if err == pgx.ErrNoRows {
 			if !req.describesHost() {
@@ -196,6 +215,15 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 			}
 		}
 
+		if req.IncarnationID != "" && !host.IncarnationID.Valid {
+			if err := q.BindHostIncarnation(ctx, db.BindHostIncarnationParams{HostID: hostID, IncarnationID: uuid.MustParse(req.IncarnationID)}); err != nil {
+				return "", "", err
+			}
+			// Pre-binding reports cannot be attributed to this incarnation.
+			if err := q.DeleteHostPressure(ctx, hostID); err != nil {
+				return "", "", err
+			}
+		}
 		row, err := q.UpdateHostHeartbeat(ctx, hostID)
 		if err != nil {
 			return "", "", err
@@ -223,25 +251,22 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 	}
 
 	var host db.UpdateHostHeartbeatRow
-	var err error
-	if h.Pool == nil {
+	tx, err := h.Pool.Begin(ctx)
+	if err == nil {
+		defer tx.Rollback(ctx)
 		var status, prevStatus string
-		status, prevStatus, err = beat(h.DB)
-		host.Status = status
-		host.PrevStatus = prevStatus
-	} else {
-		var tx pgx.Tx
-		if tx, err = h.Pool.Begin(ctx); err == nil {
-			defer tx.Rollback(ctx)
-			var status, prevStatus string
-			if status, prevStatus, err = beat(h.DB.WithTx(tx)); err == nil {
-				host.Status = status
-				host.PrevStatus = prevStatus
-				err = tx.Commit(ctx)
-			}
+		if status, prevStatus, err = beat(h.DB.WithTx(tx)); err == nil {
+			host.Status = status
+			host.PrevStatus = prevStatus
+			err = tx.Commit(ctx)
 		}
 	}
 	if err != nil {
+		var pgerr *pgconn.PgError
+		if errors.As(err, &pgerr) && pgerr.Code == "P0001" {
+			respondErrorMsg(c, "conflict", "host incarnation or endpoint is fenced; operator recovery may be required", http.StatusConflict)
+			return
+		}
 		if err == errHostNotRegistered {
 			respondErrorMsg(c, "not_found", "host not found", http.StatusNotFound)
 			return
@@ -439,6 +464,7 @@ func timestamptzString(ts pgtype.Timestamptz) any {
 // pressureReport mirrors vmd's pressureRequest. vmd_addr is the identity
 // fence checked against the host row inside the upsert itself.
 type pressureReport struct {
+	IncarnationID         string `json:"incarnation_id,omitempty"`
 	VMDAddr               string `json:"vmd_addr"`
 	RunningSandboxes      int32  `json:"running_sandboxes"`
 	ProvisioningSandboxes int32  `json:"provisioning_sandboxes"`
@@ -491,6 +517,7 @@ func (h *Handlers) HostReportPressure(c *gin.Context) {
 	}
 	rows, err := h.DB.UpsertHostPressure(c.Request.Context(), db.UpsertHostPressureParams{
 		HostID:                hostID,
+		IncarnationID:         req.IncarnationID,
 		VmdAddr:               req.VMDAddr,
 		RunningSandboxes:      req.RunningSandboxes,
 		ProvisioningSandboxes: req.ProvisioningSandboxes,
@@ -519,4 +546,44 @@ func (h *Handlers) HostReportPressure(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"recorded": true})
+}
+
+// HostRebindIncarnation requires the separate operator credential. Acceptance
+// demotes the host and clears heartbeat attestation; activation remains separate.
+func (h *Handlers) HostRebindIncarnation(c *gin.Context) {
+	var req struct {
+		Expected string `json:"expected_incarnation"`
+		New      string `json:"new_incarnation"`
+	}
+	if err := bindJSONStrict(c, &req); err != nil {
+		respondErrorMsg(c, "bad_request", "invalid rebind request", http.StatusBadRequest)
+		return
+	}
+	expected, e1 := uuid.Parse(req.Expected)
+	next, e2 := uuid.Parse(req.New)
+	if e1 != nil || e2 != nil || expected == uuid.Nil || next == uuid.Nil || expected == next {
+		respondErrorMsg(c, "bad_request", "distinct nonzero incarnation UUIDs required", http.StatusBadRequest)
+		return
+	}
+	generation, err := h.DB.RebindHostIncarnation(c.Request.Context(), db.RebindHostIncarnationParams{
+		HostID: c.Param("host_id"), ExpectedIncarnation: expected, NewIncarnation: next,
+	})
+	if err != nil {
+		var pgerr *pgconn.PgError
+		if errors.As(err, &pgerr) && (pgerr.Code == "P0001" || pgerr.Code == "P0002") {
+			respondErrorMsg(c, "conflict", "host or expected incarnation unavailable, or proposed incarnation retired", http.StatusConflict)
+			return
+		}
+		log.Error().Err(err).Str("host_id", c.Param("host_id")).Msg("host incarnation rebind failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if h.Hosts != nil {
+		h.Hosts.Invalidate(c.Param("host_id"))
+	}
+	if h.Scheduler != nil {
+		h.Scheduler.Invalidate()
+	}
+	log.Info().Str("host_id", c.Param("host_id")).Str("incarnation_id", next.String()).Int64("peer_generation", generation).Msg("host incarnation rebound by operator")
+	c.JSON(http.StatusOK, gin.H{"peer_generation": generation})
 }

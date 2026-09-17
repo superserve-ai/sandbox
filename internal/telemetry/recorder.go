@@ -134,6 +134,23 @@ type LauncherState struct {
 	Ready bool
 }
 
+// TeardownAttempt is one attempt at a deleted sandbox's host-side reclaim.
+// Path is where it ran (delete, sweep); Result is completed,
+// deferred, timeout, permanent, or skipped. Both are fixed vocabularies
+// owned by the call sites.
+type TeardownAttempt struct {
+	Path   string
+	Result string
+}
+
+// TeardownBacklog is the reclaims still owed, sampled after each sweep.
+type TeardownBacklog struct {
+	Total            int64
+	Retrying         int64
+	Permanent        int64
+	OldestAgeSeconds float64
+}
+
 // LatencyPhase records one timed phase of a sandbox operation, the unit the
 // latency dashboards aggregate (p50/p90/p99 via histogram_quantile). Every
 // label is a bounded enum owned by the emitting call site — never tenant,
@@ -158,6 +175,31 @@ type PeerIngress struct {
 	Region   string
 	HostID   string
 	Duration time.Duration
+}
+
+// PeerEvent records bounded peer-transport lifecycle telemetry. HostID and
+// Region are fleet-scoped; no endpoint, sandbox, user, or raw error values
+// belong here.
+type PeerEvent struct {
+	Kind     string
+	Result   string
+	Region   string
+	HostID   string
+	Delta    int64
+	Forced   bool
+	Duration time.Duration
+}
+
+// RoutingOutcome records one bounded public data-plane routing decision.
+// Callers must not attach sandbox, team, or user identifiers.
+type RoutingOutcome struct {
+	Outcome string // local | remote | ownership_error | peer_error
+	HostID  string
+}
+
+// RoutingOutcomeRecorder is optional so existing recorder fakes remain source-compatible.
+type RoutingOutcomeRecorder interface {
+	RecordRoutingOutcome(context.Context, RoutingOutcome)
 }
 
 // CapacityShadow is one shadow ranking evaluation: what capacity-based
@@ -204,8 +246,11 @@ type Recorder interface {
 	RecordDBPoolStats(context.Context, DBPoolStats)
 	RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)
 	RecordLauncherState(context.Context, LauncherState)
+	RecordTeardownAttempt(context.Context, TeardownAttempt)
+	RecordTeardownBacklog(context.Context, TeardownBacklog)
 	RecordLatencyPhase(context.Context, LatencyPhase)
 	RecordPeerIngress(context.Context, PeerIngress)
+	RecordPeerEvent(context.Context, PeerEvent)
 }
 
 type noopRecorder struct{}
@@ -232,5 +277,20 @@ func (noopRecorder) RecordBackupCoverage(context.Context, []BackupCoverage)     
 func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                         {}
 func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)     {}
 func (noopRecorder) RecordLauncherState(context.Context, LauncherState)                     {}
+func (noopRecorder) RecordTeardownAttempt(context.Context, TeardownAttempt)                 {}
+func (noopRecorder) RecordTeardownBacklog(context.Context, TeardownBacklog)                 {}
 func (noopRecorder) RecordLatencyPhase(context.Context, LatencyPhase)                       {}
 func (noopRecorder) RecordPeerIngress(context.Context, PeerIngress)                         {}
+func (noopRecorder) RecordPeerEvent(context.Context, PeerEvent)                             {}
+
+func (noopRecorder) RecordRoutingOutcome(context.Context, RoutingOutcome) {}
+
+// OwnershipLookup measures the synchronous routing lookup without per-sandbox labels.
+type OwnershipLookup struct {
+	Duration time.Duration
+	Result   string
+}
+
+type OwnershipLookupRecorder interface {
+	RecordOwnershipLookup(context.Context, OwnershipLookup)
+}

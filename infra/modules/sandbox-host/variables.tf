@@ -79,6 +79,18 @@ variable "metadata" {
   default     = {}
 }
 
+variable "desired_status" {
+  description = "RUNNING or TERMINATED to have Terraform hold the instance's power state; null (the default) leaves it to operators."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition     = var.desired_status == null || contains(["RUNNING", "TERMINATED"], var.desired_status)
+    error_message = "desired_status must be RUNNING, TERMINATED, or null."
+  }
+}
+
 variable "allow_stopping_for_update" {
   description = "Whether Terraform may stop the instance to apply in-place updates."
   type        = bool
@@ -105,4 +117,10 @@ variable "reservation_name" {
   description = "Name of a SPECIFIC_RESERVATION to consume for this instance. Null to schedule normally (on-demand). The instance's zone must match the reservation's zone."
   type        = string
   default     = null
+}
+
+variable "external_ip" {
+  description = "Attach an ephemeral external IP at creation. Cells without NAT depend on it for everything that leaves the host: first-boot downloads, guest egress, and the guest DNS forwarder. Ignored after creation, matching hosts whose address was added by hand."
+  type        = bool
+  default     = false
 }

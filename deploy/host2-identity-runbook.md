@@ -1,0 +1,660 @@
+> For authoritative peer generation binding, in-place reinstall, or VM
+> replacement, follow [the host identity rollout](host-generation-rollout.md).
+> Replacement VMs receive new full host IDs; only same-VM rebuilds keep their ID
+> and use operator-authorized incarnation rebind. This standby bootstrap keeps
+> its legacy identity restrictions and does not provision replacement identity.
+
+# Cold-standby peer identity bootstrap
+
+Run staging first. The migration targets are `superserve-vmd-staging-2`
+(`10.0.0.3`, `n2-standard-32`) and then `superserve-vmd-usw2-2`
+(`10.1.0.3`, the existing production Z3 configuration). No serving Host 1
+operation is part of this procedure. Retain the existing private IP.
+
+## Creation-time managed identity
+
+For a new MWI host, opt into `infra/modules/managed-identity-host` with Google
+Beta 8.2.0 and pass `module.peer_identity.creation_identity` in its create
+request. Set `identity_at_creation=true` on peer identity reconciliation so it
+validates the VM and records its new numeric instance ID without retrofitting.
+The module preserves the independently managed data disk and prevents destruction.
+Existing hosts are not switched to this module by the backport. Replacement and
+admission require separate environment plans; never treat bootstrap as permission
+to replace an admitted host. The Superserve provider remains an explicit option.
+
+## Plan and migrate
+
+The migration plan checker rejects saved plans that change Host 2's Compute
+instance or managed identity adapter in either cell. Routine Terraform CD and
+the manual Terraform rollout workflows enforce this guard. Use the restricted
+operator-applied saved-plan procedure below for the migration itself, excluding
+unrelated dashboard and infrastructure changes.
+This includes adapter-only changes, which can restart the VM independently.
+Routine applies can resume once both resources are no-ops. Perform this
+migration with an operator-applied saved plan after the checks below; a merge
+or generic rollout confirmation does not authorize Host 2 maintenance.
+
+For a future migration, set the repository variable
+`HOST_IDENTITY_ROLLOUT_READY=false` to pause automatic VMD and proxy deployments,
+and wait for in-flight deployments to finish. Use manual dispatch for the
+coordinated runtime rollout. Set it to `true` only after the
+operator-applied plans succeed and Host 2 instance/identity changes are no-ops
+in both cells and the [host identity rollout](host-generation-rollout.md)
+prerequisites are complete for all automatic VMD deployment targets. Retain
+`true` after rollout: automatic VMD deployments require that exact value;
+removing or unsetting the variable blocks them. An unset variable permits
+automatic proxy deployments only.
+
+Keep the GitHub Actions variable `HOST2_PEER_IDENTITY_READY_STAGING` unset
+until staging Host 2 completes migration and bootstrap verification; keep
+`HOST2_PEER_IDENTITY_READY_USW` unset until the equivalent production checks
+complete. This lets routine proxy deployments continue before migration.
+Set the applicable variable to `true` in the `staging` or `production` GitHub
+environment after verification and before restoring Host 2 to ready deployment
+discovery. The flag requires bootstrap on that host; it does not supply its
+SPIFFE URI or enable peer ingress/routing. Once enabled, retain it so missing
+bootstrap fails closed on subsequent deployments.
+
+1. Confirm the target owns no sandbox state and remains provisioning in the
+   host directory. Remove `sandbox_status=ready` and remove or change
+   `component=vmd` on Host 2: routine VMD and proxy workflows use the latter
+   selector even when the ready label is absent. Staging normally retains
+   `component=vmd`; explicitly change it to `vmd-staging-standby` in the
+   reviewed maintenance configuration before migration. Keep that configuration
+   through bootstrap so a Terraform apply cannot restore discovery prematurely.
+   In production west, Host 2 is the cell's only serving host: this
+   procedure does not apply there. Stop. A production host change requires
+   a drained replacement host serving first, per the host maintenance
+   runbook. Wait for any deployments
+   that already discovered Host 2 to finish before migration. Keep both
+   selectors excluded and placement disabled for the maintenance window;
+   keep peer routing disabled.
+2. Review sanitized plans for the applicable root. Expect only Host 2's
+   service account/stop opt-in and standby label, its dedicated runtime IAM,
+   the new cell CA and managed identity adapter, and us-west2's shared peer
+   firewall rule.
+   Host 1 must have no action. Existing VM, disk and private IP resource
+   addresses remain unchanged. `prevent_destroy` and ordinary hosts' default
+   stop protection remain enabled. Any proposed VM replacement is a stop
+   condition requiring a separate reviewed replacement procedure.
+   In the applicable root, run `terraform plan -out=host2-migration.tfplan`
+   and review that saved plan with `terraform show host2-migration.tfplan`.
+   For production, first require the completed staging rehearsal evidence.
+   Ensure the reviewed plan preserves Host 2's discovery exclusion: its
+   Terraform labels must not restore `component=vmd` during maintenance.
+3. Apply the reviewed plan with a current Google Cloud SDK (tested command
+   schema: 578.0.0), Python 3.10+, and authenticated Terraform credentials.
+   The identity adapter invokes `gcloud` using **its active credential**, so
+   configure it as the same approved infrastructure principal as Terraform;
+   provider-only impersonation is insufficient. That principal needs existing
+   Compute/IAM deployment rights plus workload identity pool and CA admin
+   permissions. Runtime accounts receive none of those admin roles.
+   Run `terraform apply host2-migration.tfplan` in that same root while the
+   maintenance window and discovery exclusion remain in effect. Do not bypass
+   the workflow guard or re-plan between review and apply.
+4. Export the public bootstrap artifact from that exact root:
+
+   ```sh
+   terraform output -json host2_peer_bootstrap > /tmp/host2-peer.json
+   python3 deploy/bootstrap-host2.py /tmp/host2-peer.json
+   ```
+
+   Run the Python command from the repository root. The script checks the
+   immutable instance ID, private IP, runtime service account and host name,
+   preserves the existing host-row ID, installs the refresh worker, and enables
+   guest certificate provisioning with `[MWLID] enabled=true` in
+   `/etc/default/instance_configs.cfg`. It starts the cold standby if Terraform
+   left it stopped. If managed credentials are absent on a running standby,
+   normal bootstrap waits and fails closed if credentials never appear. Only
+   the explicit `--legacy-activate` recovery mode attempts Compute stop/start
+   for legacy retrofit artifacts; it is not used for the staging replacement. Before each power operation it
+   rechecks the immutable instance identity, runtime account, managed identity,
+   exact standby label and exclusion from `sandbox_status=ready`. Keep directory
+   placement disabled and do not run admission concurrently with bootstrap.
+   The stop requests local SSD preservation and fails rather than discarding
+   data if preservation is unsupported. VMD is held behind a temporary systemd
+   condition across activation; failed bootstrap retains this guard for retry.
+   It remains stopped after bootstrap for the controlled runtime deployment.
+   Already-active managed credentials skip the VM stop/start, including when
+   a guest-agent refresh temporarily makes source files unavailable.
+   Bootstrap waits up to five minutes for all three nonempty files under
+   `/run/secrets/workload-spiffe-credentials`, tolerating SSH reconnects after
+   start. It then runs `vmd-peer-credentials.service`, requires
+   `/etc/superserve/peer/current`, and validates the published generation before
+   reporting success. Timeout or publication failure blocks admission; fix the
+   underlying identity/guest-agent configuration and rerun bootstrap.
+   If GCP reports a capacity stockout at start, bootstrap confirms whether the
+   host remains stopped and fails with an operator-visible diagnostic. It does
+   not retry start automatically. Retry bootstrap later; do not recreate the
+   host or change its identity to work around a zonal stockout.
+   Staging keeps `superserve-vmd-staging-2`; production keeps `usw2-2`.
+   A conflicting existing HOST_ID is an error, not an implicit rename.
+
+The pinned stable production provider lacks the required identity fields.
+`terraform_data.managed_identity` reconciles its Terraform-owned inputs with
+Google's CLI, including exact instance-ID attestation. The Compute update
+explicitly allows `RESTART` (required by the SDK); unchanged identities are
+not updated again. This restart is not certificate activation; full stop/start
+belongs only to the guarded bootstrap procedure, never to an unconditional
+Terraform side effect. CA-pool bindings for both workload certificate requester
+and pool reader use `principal://iam.googleapis.com/projects/PROJECT_NUMBER/name/locations/global/workloadIdentityPools/POOL_ID`;
+the `/name/` segment is required for managed workload identity principals.
+This operation is visible in the adapter's configuration,
+not as a native Compute field in a plan. It must be reviewed with the code.
+For drift repair, replace that adapter resource in a reviewed plan; it reuses
+existing pools/identities and replaces the attestation policy with the exact
+configured set. It never deletes trust resources. Do not manually add hosts
+to this policy: extend the Terraform configuration when the next drained host
+is ready, retaining the existing authorized instance IDs.
+
+## Peer credentials during rollout
+
+Choose `mwi` or `superserve` explicitly. Both publish validated certificates to
+`/etc/superserve/peer/current/{tls.crt,tls.key,ca.crt}` with the existing SPIFFE
+identity. There is no automatic provider or plaintext fallback.
+
+For Superserve-issued certificates, apply the reviewed `infra/modules/peer-ca`
+configuration first. Only its issuer service account receives CAS issuance
+permissions; VMD accounts must not receive issuance or issuer-impersonation
+rights. `peer_ca_operator_members` defaults to no grants. Configure reviewed
+operator principals explicitly, audit inherited IAM, and import existing custody
+resources rather than recreating an active CA. Keep host private keys root-owned
+at mode `0600`; never put leaf keys or certificates in Terraform.
+
+Production Private CA API enablement has one Terraform owner:
+`module.peer_identity.google_project_service.privateca` in the `us-west2`
+state. Ensure that prerequisite is applied before provisioning the east CA;
+do not declare or import the same project service into the east state.
+
+For the east standby, export the manual provider identity contract from
+`infra/envs/production/us-east4` after applying the reviewed CA configuration:
+
+```sh
+terraform output -json peer_identity_artifact > east-peer-identity.json
+terraform output -json peer_ca_issuance_policy > east-peer-policy.json
+jq -e --slurpfile policy east-peer-policy.json \
+  '.spiffe_uri == $policy[0].spiffe_uri and .credential_policy == $policy[0].credential_policy' \
+  east-peer-identity.json
+```
+
+Use this artifact unchanged as `/etc/superserve/peer/identity.json` on the
+reviewed east standby when preparing its manual credential installation. The
+issuer policy and the host validator must use the same exact URI; do not copy
+west's identity or infer it from the instance name. This file contains no keys
+and does not authorize a host: review the immutable instance identity and issuer
+host allowlist separately. The serving east host's existing identity and trust
+remain unchanged until a separate reviewed trust rollout.
+
+`bootstrap-host2.py` currently accepts only staging and west Host 2. Do not use
+it for the east standby or bypass its target checks. East runtime preparation,
+credential installation, trust distribution, and admission remain separate
+operator steps; the outputs here are not a complete east bootstrap payload.
+
+Install a supplied bundle on the host using:
+
+```sh
+sudo /usr/local/sbin/refresh-peer-credentials --provider superserve \
+  --cert /path/to/tls.crt --key /path/to/tls.key --ca /path/to/ca.crt
+sudo /usr/local/sbin/refresh-peer-credentials --check
+sudo cat /etc/superserve/peer/status.json
+sudo journalctl -u vmd-peer-credentials.service --since="1 hour ago" --no-pager
+```
+
+Check expiry, failures, `checked_at` freshness and `proxy_reload_required` before
+admission. Renew before expiry and coordinate any required service reload with
+the maintenance window. Do not disable authentication to recover from an invalid
+bundle. Switching back with `--provider mwi` requires working managed credentials
+and coordinated trust across peers; a failed publication retains the prior bundle.
+
+Production activation still requires automated authenticated issuance/renewal,
+expiry/failure monitoring and seamless credential reload. Systemd credentials are
+snapshots at service start, and the MWI refresh path can restart the public proxy.
+Publishing files alone does not update loaded credentials or guarantee continuity
+of active streams. These are outstanding rollout prerequisites.
+
+## Runtime baseline and readiness
+
+Recreating a boot disk exposed a missing provisioning contract: CD installs
+binaries, but does not supply the cell's secretsproxy CA or kernel/rootfs assets.
+The independently preserved sandbox-data disk does not restore these files.
+
+### Existing-cell CA and artifact contract
+
+Existing templates trust the **cell's existing secretsproxy CA**. An additional
+or replacement host must restore that same certificate and private key before
+activation. This CA is separate from the Superserve peer mTLS credentials;
+leave `/etc/superserve/peer/current` untouched. Missing or partial CA state is a
+hard CD precondition failure, before binary installation or VMD activation.
+CD never generates a CA. A genuinely brand-new cell can explicitly follow the
+new-cell provisioning procedure and allow the daemon to initialize its CA
+before invoking CD; missing files never select that mode automatically.
+
+The runtime library can generate a CA when both files are absent. That behavior
+is not authority to generate one for an existing cell. The previous fresh-host
+instructions incorrectly inferred the deployment policy from that library.
+There is no secretsproxy CA restore from Secret Manager wired into CD. Use the
+canonical operator-workstation transfer below, never GCS for the private key.
+
+Read-only staging Host 1 inspection confirmed these configured artifacts:
+
+| Path | SHA-256 before the next boxd injection |
+| --- | --- |
+| `/var/lib/sandbox/kernel/vmlinux-4.14-fuse` | `3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761` |
+| `/var/lib/sandbox/rootfs/base.ext4` | `7494f2288113b40f881575dfa8dfa6e50c4c78114a9d144af36f67fedf720ca0` |
+
+The canonical new-host procedure permits non-secret `hostprep/` bucket assets,
+but no exact staging object/version is established here. Use the verified Host 1
+files, not an invented bucket location. Coordinate against concurrent deployments:
+the kernel is a pinned artifact, but CD modifies base.ext4 by injecting boxd.
+Recheck source hashes and target hashes during copying; after CD, the rootfs hash
+can legitimately change. Verify the existing Firecracker binary matches Host 1
+and retain the cell's guest-kernel/snapshot lineage.
+
+### Operator preparation (not performed by CD)
+
+Run on the operator workstation. These commands do not activate VMD or admit
+Host 2. Keep its standby label and non-ready placement state. Do not run while
+another operator is deploying or changing the source artifacts. The commands
+refuse to overwrite an existing destination CA pair; investigate partial or
+unexpected material instead of rotating it.
+
+```bash
+set -euo pipefail
+umask 077
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT HUP INT TERM
+ssh1() { gcloud compute ssh superserve-vmd-staging --project=rayai-dev --zone=us-central1-a --tunnel-through-iap --quiet --command="set -eu; $1" -- -T; }
+ssh2() { gcloud compute ssh superserve-vmd-staging-2 --project=rayai-dev --zone=us-central1-a --tunnel-through-iap --quiet --command="set -eu; $1" -- -T; }
+
+# Inspect only selected non-secret settings and artifact hashes.
+ssh1 'sudo grep -E "^(KERNEL_PATH|BASE_ROOTFS_PATH)=" /etc/sandbox/vmd.env; sudo sha256sum /var/lib/sandbox/kernel/vmlinux-4.14-fuse /var/lib/sandbox/rootfs/base.ext4 /usr/local/bin/firecracker'
+ssh1 'sudo cat /var/lib/sandbox/kernel/vmlinux-4.14-fuse' > "$work/vmlinux-4.14-fuse"
+ssh1 'sudo cat /var/lib/sandbox/rootfs/base.ext4' > "$work/base.ext4"
+(cd "$work" && shasum -a 256 -c <<'HASHES'
+3be77273fc267d2d2c239dc081cb3955f320dd0d3790de2b02690cb7f1af6761  vmlinux-4.14-fuse
+7494f2288113b40f881575dfa8dfa6e50c4c78114a9d144af36f67fedf720ca0  base.ext4
+HASHES
+)
+# Repeat source hashes; stop if they changed during the copy.
+ssh1 'sudo sha256sum /var/lib/sandbox/kernel/vmlinux-4.14-fuse /var/lib/sandbox/rootfs/base.ext4'
+ssh2 'sudo systemctl stop superserve-vmd.socket superserve-vmd.service; sudo install -d -m 0755 /var/lib/sandbox/kernel /var/lib/sandbox/rootfs'
+ssh2 'sudo tee /var/lib/sandbox/kernel/vmlinux-4.14-fuse >/dev/null' < "$work/vmlinux-4.14-fuse"
+ssh2 'sudo tee /var/lib/sandbox/rootfs/base.ext4 >/dev/null' < "$work/base.ext4"
+ssh2 'sudo chown root:root /var/lib/sandbox/kernel/vmlinux-4.14-fuse /var/lib/sandbox/rootfs/base.ext4; sudo chmod 0644 /var/lib/sandbox/kernel/vmlinux-4.14-fuse /var/lib/sandbox/rootfs/base.ext4; sudo sha256sum /var/lib/sandbox/kernel/vmlinux-4.14-fuse /var/lib/sandbox/rootfs/base.ext4'
+
+# Secrets travel host -> private workstation directory -> host, never GCS.
+ssh1 'sudo cat /var/lib/secretsproxy/ca.crt' > "$work/ca.crt"
+ssh1 'sudo cat /var/lib/secretsproxy/ca.key' > "$work/ca.key"
+chmod 0644 "$work/ca.crt"
+chmod 0600 "$work/ca.key"
+openssl x509 -in "$work/ca.crt" -pubkey -noout > "$work/cert.pub"
+openssl pkey -in "$work/ca.key" -pubout > "$work/key.pub"
+cmp "$work/cert.pub" "$work/key.pub"
+# DynamicUser has no passwd entry while the daemon is inactive. Let systemd
+# allocate its actual identity and StateDirectory without starting secretsproxy.
+ssh2 'sudo systemctl stop superserve-secretsproxy.service; sudo test ! -e /var/lib/secretsproxy/ca.crt && sudo test ! -e /var/lib/secretsproxy/ca.key'
+COPYFILE_DISABLE=1 tar -C "$work" -cf - ca.crt ca.key | ssh2 'sudo systemd-run --quiet --wait --pipe --collect --unit=secretsproxy-ca-restore --property=User=superserve-secretsproxy --property=DynamicUser=yes --property=StateDirectory=secretsproxy --property=StateDirectoryMode=0700 /bin/sh -ec "tar --no-same-owner -xf - -C /var/lib/secretsproxy; chmod 0644 /var/lib/secretsproxy/ca.crt; chmod 0600 /var/lib/secretsproxy/ca.key; stat -c \"%a %U %n\" /var/lib/secretsproxy/ca.crt /var/lib/secretsproxy/ca.key"'
+rm -f "$work/ca.key" "$work/ca.crt" "$work/cert.pub" "$work/key.pub"
+```
+
+The transient restore unit owns the files as `superserve-secretsproxy`, with
+certificate 0644/key 0600. While DynamicUser is inactive its UID may display
+numerically; the real service's StateDirectory setup restores ownership to its
+allocated identity at startup. Do not create a conflicting static account.
+The shell trap removes all workstation copies on exit; do not retain them in
+backups or shell output. If transfer fails partway, leave VMD stopped and resolve
+the partial destination pair before retrying. Never start secretsproxy to repair
+a missing CA in this cell.
+
+Configure the approved artifact paths without copying Host 1's env or HOST_ID:
+
+```bash
+ssh2 'sudo install -d -m 0755 /etc/sandbox; sudo touch /etc/sandbox/vmd.env /etc/sandbox/secretsproxy.env; sudo chown root:root /etc/sandbox/*.env; sudo chmod 0600 /etc/sandbox/vmd.env; sudo chmod 0600 /etc/sandbox/secretsproxy.env
+for setting in KERNEL_PATH=/var/lib/sandbox/kernel/vmlinux-4.14-fuse BASE_ROOTFS_PATH=/var/lib/sandbox/rootfs/base.ext4 HOST_ID=superserve-vmd-staging-2; do
+  key=${setting%%=*}
+  if ! sudo grep -q "^$key=" /etc/sandbox/vmd.env; then echo "$setting" | sudo tee -a /etc/sandbox/vmd.env >/dev/null; fi
+done
+sudo grep -E "^(KERNEL_PATH|BASE_ROOTFS_PATH|HOST_ID)=" /etc/sandbox/vmd.env
+sudo test -s /var/lib/secretsproxy/ca.crt
+sudo test -s /var/lib/secretsproxy/ca.key
+sudo test -s /var/lib/sandbox/kernel/vmlinux-4.14-fuse
+sudo test -s /var/lib/sandbox/rootfs/base.ext4
+sudo test -x /usr/local/bin/firecracker
+sudo test -x /usr/local/bin/template-builder
+sudo test -c /dev/kvm
+mountpoint -q /mnt/sandbox-data
+sudo systemctl is-active google-guest-agent.service
+sudo test -d /etc/superserve/peer/current'
+```
+
+Review any already-configured paths instead of overwriting them. Host 2 must
+retain its own instance-name HOST_ID; an existing value is preserved by CD.
+Leave `HOST_INTERFACE` unset for automatic default-route discovery, or verify an
+intentional override with `ip link`. Check guest DNS and Firecracker compatibility
+against the canonical host preparation procedure. Rerun the documented
+`bootstrap-host2.py --provider superserve` baseline with the Terraform artifact
+before requesting the standby deployment. It leaves VMD stopped; do not admit it.
+
+### Template storage before transfer or admission
+
+Keep template rootfs and memory snapshots on the same storage layout as the
+existing host in that cell. Production local-SSD templates must not move to the
+background-data disk: that changes cold-read latency and can turn reflink clones
+into full rootfs copies. Staging uses attached storage; compare the replacement's
+mounts and runtime paths with the first staging host rather than assuming NVMe.
+
+This identity rollout does not install template bind mounts or migrate template
+contents. If an earlier manual experiment moved templates, restore the cell's
+normal layout during a drained maintenance window before admission. Preserve
+source data and inspect uncovered directories before copying or reseeding.
+Size rootfs and snapshot artifacts, verify destination free space, and verify
+artifact identity after transfer. Reseed after runtime-disk loss; making templates
+persistent is not an identity-migration prerequisite.
+
+### Schedulable capacity at host preparation
+
+Set `VMD_SCHEDULABLE_MEMORY_MIB` and `VMD_SCHEDULABLE_VCPUS` in
+`/etc/sandbox/vmd.env` when preparing the host, using the approved cell admission
+budgets. Deployment and identity bootstrap preserve these host-owned settings;
+no capacity GitHub variables are required. Verify the named host reports the
+intended capacity before activation. It remains provisioning until an operator
+admits it.
+
+### Named-host heartbeat region
+
+An identity-bound host must send a complete self-description. Private endpoints
+alone are insufficient: an empty region causes heartbeat rejection. VMD deploy
+now fills missing or empty `HOST_REGION` for every non-`default` HOST_ID from
+`GCP_REGION`, checked
+against the discovered instance zone. If deployment is not region-scoped, the
+instance zone supplies the region. Staging uses `us-central1`; production hosts
+use their actual deployment region, including standby hosts. Bootstrap sets the
+same fallback from its Terraform-provided zone. Both paths preserve a non-empty
+explicit `HOST_REGION`; final verification checks that the runtime region is
+non-empty, rather than requiring it to equal the default. Region/zone ambiguity
+fails deployment before uploads; named-host activation requires a non-empty
+runtime region. A region already stored in the database does not substitute for
+the region in each identity-bound heartbeat.
+No manual HOST_REGION or SANDBOX_ID_REGION setting is needed on a fresh host.
+
+Deployment preserves HOST_ID and does not add, replace or remove region settings
+on the legacy `HOST_ID=default` host. Its description-less heartbeat compatibility
+is not evidence that a named identity-bound host can omit its region. Schedulable
+capacity is set during host preparation; this does not admit Host 2 or migrate
+legacy identity semantics.
+
+### Host interface and advertised addresses
+
+VMD no longer assumes the primary host NIC is `eth0`. With `HOST_INTERFACE`
+unset, it selects the unique lowest-metric IPv4 default route and asks the kernel
+for the private source address used to reach that route's gateway. The resolved
+interface is shared by host firewall/template-builder configuration; the resolved
+address is reused for automatic VMD and proxy advertisement. Queries are local,
+bounded to two seconds, and run once at startup rather than on sandbox requests.
+
+Inspect routing with `ip -j -4 route show default` and
+`ip -j -4 route get <gateway-from-default-route>`. The selected route must have
+one interface and one concrete private IPv4 source. Equal-cost defaults,
+multipath, unavailable interfaces, missing source addresses, or public/link-local
+sources fail closed. More complex routing requires an explicit `HOST_INTERFACE`.
+That interface must provide a unique private IPv4 address for automatic
+advertisement. An explicit override is never silently replaced; remove a stale
+`HOST_INTERFACE=eth0` setting to opt into discovery, or correct it intentionally.
+
+Existing explicit advertisement overrides retain their semantics, including the
+private peer-ingress endpoint validation. Peer mTLS and host admission do not
+change. Do not work around an advertisement acknowledgement failure by disabling
+the gate or publishing a wildcard/loopback address.
+
+### Provision the standby OTEL collector before final verification
+
+VMD deployment does not install the host-local OTEL collector. After runtime
+provisioning, run **Deploy OTEL Collector** from this migration branch with
+`environment: staging` and `target: standby`. The staging job sources the same
+fixed-label selector as VMD/proxy: `component=vmd-staging-standby`, with exactly
+`superserve-vmd-staging-2` required as the discovered host. Zero matches, a
+serving host, or multiple matches fail before deployment. It does not fall back
+to `component=vmd`.
+
+The OTEL target defaults to `serving` to preserve existing manual behavior;
+select `standby` explicitly. Push runs retain the configured staging label, and
+production keeps its existing cell filters and rollout sequence (the target
+input applies only to staging).
+
+Fresh-host collector deployment must install files **and** leave the service
+persistently enabled and active. A staging attempt exposed a shell rendering bug:
+an indented `collector.env` heredoc terminator swallowed the enable/restart and
+health commands into the env file. The deployment now renders that heredoc
+separately from multiline health checks, rewrites the env file cleanly on retry,
+and verifies persistent enablement plus runtime health before reporting success.
+A manual `enable --now` is not a provisioning requirement; rerun the corrected
+collector deployment after reviewing any prior failed attempt.
+
+Do not run `bootstrap-host2.py --verify` until the standby collector deployment
+has succeeded. Confirm `superserve-otel-collector.service` is active and its
+health endpoint responds before final verification; the deployment also checks
+collector metrics. An inactive/not-found collector is an incomplete provisioning
+step, not a peer-credential bootstrap failure. This does not admit Host 2.
+
+### Retiring the legacy VMD during enrollment
+
+Enrollment recognizes a loaded `agentbox-vmd.service`, even if its env files
+look complete. Before service changes it requires no running Firecracker or
+template-builder processes and no active/activating guest units. If workloads
+remain, stop enrollment and drain them through the existing lifecycle procedure;
+do not kill guests or retire their manager as part of fresh-host deployment.
+Inspection failures also abort.
+
+After installing the fresh-host activation guard, deployment stops the new VMD
+units, disables and stops `agentbox-vmd.service`, and persistently masks the
+legacy unit. A locally installed regular unit file is preserved as
+`/etc/systemd/system/agentbox-vmd.service.retired` before masking. The mask
+survives reboot and blocks dependency/manual starts as well as boot enablement.
+Retries preserve the mask; an unexpected existing backup requires inspection.
+
+Ports 50051 and 9090 must have no TCP listeners after retirement and immediately
+before releasing the socket activation guard. A remaining unmanaged VMD or other
+listener causes failure, with listener details for diagnosis; deployment never
+kills it automatically. Leave the host outside placement and resolve the owner
+before retrying. These retirement checks do not run on ordinary configured
+serving hosts without the legacy unit. Peer credentials are unaffected.
+
+### Staging workflow runtime configuration
+
+The staging GitHub environment is the canonical source for fresh-host runtime
+configuration. The VMD workflow passes `vars.CONTROL_PLANE_URL_STAGING` as
+`CONTROL_PLANE_URL`, `secrets.DATABASE_URL_STAGING` as `DATABASE_URL`, and
+`secrets.STAGING_INTERNAL_API_TOKEN` as `INTERNAL_API_TOKEN`. These values are
+configured in that environment; the workflow rejects unset values before invoking
+the deploy script. Never copy Host 1's env file to supply them.
+
+The deploy script also validates these inputs for fresh or partially configured
+hosts. If any input is absent, a read-only probe rejects an incomplete host before
+bundle upload, env writes, unit changes, binary replacement or boxd injection.
+The check runs again at the start of remote convergence. Already-configured hosts
+can preserve omitted values when invoked outside the workflow; supplied values
+still intentionally reconcile both env files. Missing inputs leave the host as
+found, including any guard from an earlier attempt.
+
+Once the CA/artifact and baseline checks above pass, rerun the VMD workflow on
+this branch with `environment: staging` and `target: standby`. This configuration
+change does not itself transfer prerequisites, deploy, or admit Host 2.
+Manual production standby deployments resolve the single instance carrying
+`component=vmd-<cell>-standby` in the selected region. Promotion and rollback
+swap that role label; deployment selection follows the applied labels.
+
+CD creates env files without truncating existing content, keeps vmd.env root-owned
+0600 and secretsproxy.env 0600, and reconciles deployment-supplied control-plane,
+auth and database values. It requires an explicit approved KERNEL_PATH, defaults
+only missing BASE_ROOTFS_PATH to `/var/lib/sandbox/rootfs/base.ext4`, and preserves
+configured alternatives. It checks artifacts and the shared CA before installing
+binaries, then requires secretsproxy health before first VMD activation. The
+persistent bootstrap guard survives failed attempts. A retry also injects boxd
+when an earlier partial deploy already installed the same binary. Normal serving
+hosts retain their existing restart order. No peer certificates are changed.
+
+After any stop/start, verify the intended runtime filesystem layout,
+`/mnt/sandbox-data` is mounted, and the configured `KERNEL_PATH` and
+`BASE_ROOTFS_PATH` exist. Reseed the normal release's templates when local SSD
+contents were lost. Deploy the matching normal VMD release to this specific
+provisioning host through the controlled deployment path; routine ready-host
+CD must remain excluded during preparation.
+
+Wait for the guest agent and credential timer, then run:
+
+```sh
+python3 deploy/bootstrap-host2.py --verify /tmp/host2-peer.json
+```
+
+This is only the local verification subset: Compute identity, URI SAN, key pair, trust chain, expiry,
+key ownership/mode, services, and endpoint acknowledgement from the current
+VMD invocation. Also inspect the host directory: the expected stable HOST_ID
+must have a fresh heartbeat, the correct private VMD address and capabilities,
+and remain non-serving. With peer ingress disabled, its advertised proxy
+endpoint retains the existing contract. After the routing rollout enables
+ingress, verify the advertised private peer endpoint is `10.0.0.3:5009` or
+`10.1.0.3:5009` respectively.
+
+### Required pre-admission evidence
+
+Complete every check below while Host 2 is provisioning, both deployment
+selectors exclude it, and routing is disabled. A successful `--verify` is not admission
+approval. Any failed or missing check blocks admission and production rollout.
+Save timestamped output with the release SHA, Terraform bootstrap artifact and
+VMD invocation ID in the private rollout evidence; never attach credentials,
+full environment files, or customer data to the public repository.
+
+1. **Directory and capabilities.** Use the existing read-only database access
+   for the target cell. Run this query in `psql` (staging values shown):
+
+   ```sql
+   \set host_id superserve-vmd-staging-2
+   SELECT now() AS observed_at, h.id, h.region, h.status, h.identity_bound,
+          h.vmd_addr, h.proxy_addr, h.last_heartbeat_at,
+          now() - h.last_heartbeat_at AS heartbeat_age,
+          ARRAY(SELECT hc.capability FROM host_capability hc
+                WHERE hc.host_id = h.id
+                  AND hc.heartbeat_at = h.last_heartbeat_at
+                ORDER BY hc.capability) AS current_capabilities
+   FROM host h WHERE h.id = :'host_id';
+   ```
+
+   Require exactly one row with the Terraform `host_id`, expected region,
+   `identity_bound = true`, and `status = provisioning`. Require heartbeat age
+   below 60 seconds, then repeat after the next heartbeat and require the
+   timestamp to advance. Compare `vmd_addr` to the private IP and configured
+   gRPC port (normally `10.0.0.3:50051`; production `10.1.0.3:50051`). Compare
+   `proxy_addr` to the deployed release's effective advertisement, including
+   `PROXY_ADVERTISE_ADDR` and `PEER_PROXY_LISTEN_ADDR`; do not assume the peer
+   port before ingress is enabled. Record the expected capability set from
+   the deployed release and compare it to `current_capabilities`. In
+   particular, browser preview support requires all four capabilities in
+   [the deployment registry](README.md#preview-authentication-rollout-and-rollback-safety).
+   An empty or incomplete set is not a pass for a release that requires them.
+   Production uses `\set host_id usw2-2`.
+
+2. **Admission gates.** Capture the target's Compute labels with
+   `gcloud compute instances describe INSTANCE --project=PROJECT --zone=ZONE --format='json(id,labels)'`,
+   using the exact values from the bootstrap artifact. Require
+   `sandbox_status` to be absent or different from `ready` and `component`
+   to be absent or different from `vmd`. Confirm routine VMD/proxy discovery
+   and the ready selectors in `deploy/environments.yaml` exclude this host, and retain the
+   provisioning row from check 1. Check the deployed routing configuration
+   still has peer routing disabled. Do not change status or labels as part of
+   verification; both database activation and CD enrollment require the
+   separate deliberate admission step.
+
+3. **Artifacts after restart.** On Host 2, inspect the effective VMD unit with
+   `sudo systemctl cat superserve-vmd.service` and read only `KERNEL_PATH`,
+   `BASE_ROOTFS_PATH` and template-path settings from its environment files and
+   overrides. For each resolved kernel, rootfs and required seeded template
+   artifact, run `sudo test -s PATH` and `sudo sha256sum PATH`; compare against
+   the approved, hardware-compatible release manifest. Record manifest ID,
+   paths, checksums, and the complete required template inventory. A present
+   template-builder binary does not prove seeding. Missing templates or a
+   missing reference manifest block the check; reseed through normal host
+   preparation, then repeat after confirming the data mounts. Hashing is an
+   offline maintenance check, never part of sandbox startup or resume.
+
+4. **Agents actually ready.** On Host 2, run the collector's existing probes:
+
+   ```sh
+   curl --fail --silent --show-error --max-time 10 http://127.0.0.1:13133/
+   curl --fail --silent --show-error --max-time 10 http://127.0.0.1:8888/metrics
+   sudo systemctl is-active google-guest-agent.service
+   ```
+
+   Require healthy collector HTTP responses, collector self-metrics, and
+   an active guest agent. Inspect their current-boot journals for
+   authentication or export failures. Capture fresh host-scoped telemetry in
+   the configured monitoring backend after migration, with the expected host
+   label and increasing sample timestamps; local health alone does not prove
+   the new identity can export. Compare
+   `/etc/needrestart/conf.d/50-superserve.conf` and
+   `/etc/apt/apt.conf.d/99superserve-no-auto-upgrades` to the host module's
+   patching policy and require `apt-daily-upgrade.timer` to remain disabled.
+   For additional agents in the approved host baseline, record each agent's
+   own health probe and a fresh backend acknowledgement. Use the
+   [collector validation procedure](otel/README.md) for exporter failures and
+   queue pressure. Missing remote samples or acknowledgements remain pending, not
+   a successful agent check.
+
+Record one row per check with expected value, observed value, UTC observation
+time, evidence location and PASS/FAIL/PENDING. Include local `--verify` output
+as its own row. The original checklist started **PENDING: not executed**. See the dated staging
+validation record below for subsequent operator-reported results; local tests
+alone are not staging execution evidence. All rows must
+be PASS before admission, and the separate staging drain/peer rehearsal must
+also pass before the production plan is applied.
+
+Exercise a backup create and restore read using the dedicated runtime
+identity in its own bucket. Review effective IAM to confirm it has no delete,
+admin, or other-cell read grants; existing shared-account writers retain only
+their prior access. Secretsproxy uses the control-plane vault, so no new
+Secret Manager or KMS grants are needed on the host identity.
+
+## Credential lifecycle and rollout
+
+A regional cell shares one CA/pool and the `vmd-peer-proxy` managed identity.
+Each host is authorized by an immutable instance ID, never by the shared
+service account. Staging and production have separate trust domains. The
+CA's private key is managed by CA Service; VM private keys never enter
+Terraform, GitHub or the exported artifact.
+
+The guest agent rotates 24-hour credentials. A root timer validates and
+atomically publishes each complete generation at the fixed peer paths.
+It preserves the prior valid generation on invalid SAN/key/chain/expiry and
+reports failures through `vmd-peer-credentials.service` in the journal. The
+root-only source directory is created by tmpfiles before the guest agent.
+The proxy deploy reads `identity.json` locally and checks credentials before
+changing its unit/config, even before the cell's readiness flag is enabled.
+Missing bootstrap fails closed once that flag is enabled or ingress is
+requested. A file lock coordinates refresh with systemd `LoadCredential`;
+rotation restarts only the proxy to load the new material, retrying failed
+reloads. It never restarts VMD or enters a sandbox startup/resume path.
+
+After staging Host 2 passes readiness and host-directory checks, use the
+label-only admission procedure below. As part of that separate admission,
+change staging `module.sandbox_host_b.labels.component` to `vmd` in Terraform
+and review/apply the label plan through the operator path above before restoring
+the ready label. Do not enroll it with an out-of-band component label change
+that the next Terraform apply would undo. Only after the old host is drained
+may its separate migration occur. Once both hosts are peer-capable, the
+routing rollout may enable ingress/routing and verify bidirectional traffic,
+pause/resume and restore across hosts. Record that evidence before applying
+the production Host 2 plan. Production admission remains a separate step.
+
+References: [managed identity setup](https://docs.cloud.google.com/iam/docs/create-managed-workload-identities),
+[Compute credential lifecycle](https://docs.cloud.google.com/compute/docs/access/authenticate-workloads-over-mtls).
+
+
+## Peer rollout and legacy heartbeat
+
+Deploy private ingress on every reachable owner with routing disabled, verify
+TLS 1.3 and exact SPIFFE authorization in both directions, then enable routing
+through a separate deployment. Keep peer ingress when a host leaves placement.
+Legacy `HOST_ID=default` may send description-less heartbeats; do not bind or
+change its identity just to satisfy a named-host deployment gate.
+
+Staging replacement plans, admission checks and execution evidence remain in
+the migration branch's runbook. They are not production bootstrap operations.

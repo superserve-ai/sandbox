@@ -14,6 +14,7 @@ import (
 	"google.golang.org/grpc/status"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -59,6 +60,72 @@ type PeerIngress struct {
 	MaxStreams int64
 
 	activeStreams atomic.Int64
+	admissionMu   sync.Mutex
+	changed       chan struct{}
+	waiters       int
+}
+
+const peerAdmissionTimeout = 500 * time.Millisecond
+const maxPeerWaiters = 128
+
+// Admission is shared by all connections. Wait without receiving request data
+// or dialing the local target; a full queue fails closed without replay.
+func (p *PeerIngress) acquire(ctx context.Context) error {
+	timer := time.NewTimer(peerAdmissionTimeout)
+	defer timer.Stop()
+	p.admissionMu.Lock()
+	defer p.admissionMu.Unlock()
+	limit := p.MaxStreams
+	if limit <= 0 {
+		limit = maxPeerStreams
+	}
+	queued := false
+	defer func() {
+		if queued {
+			p.waiters--
+		}
+	}()
+	for {
+		if err := ctx.Err(); err != nil {
+			return status.FromContextError(err).Err()
+		}
+		if p.activeStreams.Load() < limit {
+			p.activeStreams.Add(1)
+			return nil
+		}
+		if !queued {
+			if p.waiters >= maxPeerWaiters {
+				return status.Error(codes.ResourceExhausted, "peer admission queue full")
+			}
+			p.waiters++
+			queued = true
+		}
+		if p.changed == nil {
+			p.changed = make(chan struct{})
+		}
+		changed := p.changed
+		p.admissionMu.Unlock()
+		select {
+		case <-ctx.Done():
+			p.admissionMu.Lock()
+			return status.FromContextError(ctx.Err()).Err()
+		case <-timer.C:
+			p.admissionMu.Lock()
+			return status.Error(codes.ResourceExhausted, "peer admission wait expired")
+		case <-changed:
+			p.admissionMu.Lock()
+		}
+	}
+}
+
+func (p *PeerIngress) release() {
+	p.admissionMu.Lock()
+	defer p.admissionMu.Unlock()
+	p.activeStreams.Add(-1)
+	if p.changed != nil {
+		close(p.changed)
+		p.changed = nil
+	}
 }
 
 // halfCloseWrite propagates the peer's receive-side half-close to the fixed
@@ -88,18 +155,13 @@ func writeFull(conn net.Conn, data []byte) error {
 }
 
 func (p *PeerIngress) Forward(s peerpb.PeerProxy_ForwardServer) error {
-	active := p.activeStreams.Add(1)
-	defer p.activeStreams.Add(-1)
-	limit := p.MaxStreams
-	if limit <= 0 {
-		limit = maxPeerStreams
-	}
-	if active > limit {
+	if err := p.acquire(s.Context()); err != nil {
 		if p.Recorder != nil {
 			p.Recorder.RecordPeerIngress(s.Context(), telemetry.PeerIngress{Event: "stream_rejected", Result: telemetry.ResultError})
 		}
-		return status.Error(codes.ResourceExhausted, "peer stream limit reached")
+		return err
 	}
+	defer p.release()
 	started := time.Now()
 	if p.Recorder != nil {
 		p.Recorder.RecordPeerIngress(s.Context(), telemetry.PeerIngress{Event: "tls_auth", Result: telemetry.ResultSuccess})

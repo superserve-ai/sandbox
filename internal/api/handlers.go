@@ -174,6 +174,17 @@ type Handlers struct {
 	asyncCond  *sync.Cond // lazily created by WaitAsyncBookkeeping, guarded by asyncMu
 	asyncCount int
 
+	// TeardownInlineBudget bounds the host reclaim a delete runs before it
+	// answers; zero means the default. The sweeper finishes whatever did
+	// not fit.
+	TeardownInlineBudget time.Duration
+	// inlineTeardowns caps how many inline reclaims may hold a vmd RPC at
+	// once on this replica; a delete that finds it full leaves its reclaim
+	// to the sweeper. Lazily set up so struct-literal construction in tests
+	// needs nothing.
+	inlineTeardownsOnce sync.Once
+	inlineTeardowns     chan struct{}
+
 	// activityGate caps how many activity-log inserts may hold DB connections
 	// at once (see writeActivity). Lazily created so struct-literal
 	// construction keeps working.
@@ -212,21 +223,30 @@ type Handlers struct {
 // needs that protection must therefore run BEFORE the status flip inside the
 // same job, the way the create path orders its stamp before ActivateSandbox.
 func (h *Handlers) asyncBookkeeping(name string, fn func()) {
-	h.asyncMu.Lock()
-	h.asyncCount++
-	h.asyncMu.Unlock()
+	h.asyncBegin()
 	go func() {
-		defer func() {
-			h.asyncMu.Lock()
-			h.asyncCount--
-			if h.asyncCount == 0 && h.asyncCond != nil {
-				h.asyncCond.Broadcast()
-			}
-			h.asyncMu.Unlock()
-		}()
+		defer h.asyncEnd()
 		defer sentrylog.Recover(name)
 		fn()
 	}()
+}
+
+// asyncBegin/asyncEnd bracket one unit of fire-and-forget work for
+// WaitAsyncBookkeeping, whether it runs on its own goroutine or on a pooled
+// worker (delete teardowns).
+func (h *Handlers) asyncBegin() {
+	h.asyncMu.Lock()
+	h.asyncCount++
+	h.asyncMu.Unlock()
+}
+
+func (h *Handlers) asyncEnd() {
+	h.asyncMu.Lock()
+	h.asyncCount--
+	if h.asyncCount == 0 && h.asyncCond != nil {
+		h.asyncCond.Broadcast()
+	}
+	h.asyncMu.Unlock()
 }
 
 // WaitAsyncBookkeeping blocks until no fire-and-forget bookkeeping goroutines
@@ -322,33 +342,66 @@ func (h *Handlers) vmdForHost(ctx context.Context, hostID string) (VMDClient, er
 	return c, nil
 }
 
-// revertPauseAsync undoes BeginPause's claim after a pause that failed
-// before completing — status back to 'active' and the billing interval
-// reopened, in ONE statement (RevertPauseToActive) so a failure between the
-// two facts is unrepresentable. Runs detached from the caller's cancellation
-// (a client disconnect must not orphan the revert) while keeping trace
-// context.
-func (h *Handlers) revertPauseAsync(c *gin.Context, sandboxID, teamID uuid.UUID, l zerolog.Logger) {
-	revertCtx := context.WithoutCancel(c.Request.Context())
-	actorID := actorIDFromContext(c)
-	go func() {
-		ctx, cancel := context.WithTimeout(revertCtx, asyncTimeout)
-		defer cancel()
+// pauseClaimConfirmWindow bounds how long after BeginPause a lost reply may
+// still be confirmed as this request's claim: within it the minted lease is
+// live and nothing else can have claimed the operation. A variable so tests
+// can shorten it.
+var pauseClaimConfirmWindow = time.Duration(pauseLeaseSeconds)*time.Second - pauseLeaseSkew
+
+// claimedPause answers for a BeginPause whose reply was lost: the row was
+// claimed by this request if it is 'pausing' under the operation id the
+// request minted.
+func (h *Handlers) claimedPause(ctx context.Context, id, teamID, op uuid.UUID) (db.BeginPauseRow, bool) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncTimeout)
+	defer cancel()
+	sb, err := h.DB.GetSandbox(rctx, db.GetSandboxParams{ID: id, TeamID: teamID})
+	if err != nil || sb.Status != db.SandboxStatusPausing || !sb.PauseOpID.Valid || uuid.UUID(sb.PauseOpID.Bytes) != op {
+		return db.BeginPauseRow{}, false
+	}
+	return db.BeginPauseRow(sb), true
+}
+
+// revertPause undoes BeginPause's claim when nothing was dispatched, in one
+// fenced statement, retried briefly, and reports whether the row is known to
+// be 'active' again. A false return means the caller must hear "pausing",
+// not "failed": either the write could not be made and the operation stands
+// for the reconciler, or the fence matched nothing because another worker
+// already took the operation over, and its pause goes on. Detached from
+// request cancellation, but the attempts share one deadline: on the
+// synchronous path this runs inside the request, so retries must not stack
+// their timeouts.
+func (h *Handlers) revertPause(reqCtx context.Context, sandboxID, teamID uuid.UUID, lease pauseLease, actorID *uuid.UUID, l zerolog.Logger) bool {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
+	defer cancel()
+	backoff := 200 * time.Millisecond
+	for attempt := 1; ; attempt++ {
 		n, err := h.DB.RevertPauseToActive(ctx, db.RevertPauseToActiveParams{
-			SandboxID: sandboxID,
-			TeamID:    teamID,
-			ActorID:   actorUUID(actorID),
+			SandboxID:           sandboxID,
+			TeamID:              teamID,
+			PauseOpID:           lease.id,
+			PauseOpLeaseVersion: &lease.version,
+			ActorID:             actorUUID(actorID),
 		})
-		if err != nil {
-			l.Error().Err(err).Msg("async pause revert failed")
-			return
+		if err == nil {
+			if n == 0 {
+				// The lease was reclaimed or the row moved on (delete) first;
+				// whatever holds it now decides, so nothing here is 'active'.
+				l.Warn().Msg("pause revert skipped: operation no longer held under this lease")
+				return false
+			}
+			return true
 		}
-		if n == 0 {
-			// Another transition (delete, reaper) moved the sandbox out
-			// of 'pausing' first; its state wins over the revert.
-			l.Warn().Msg("pause revert skipped: sandbox no longer pausing")
+		if attempt >= 3 || ctx.Err() != nil {
+			l.Error().Err(err).Msg("pause revert failed; the row stays 'pausing' and the reconciler will complete the pause")
+			return false
 		}
-	}()
+		l.Warn().Err(err).Int("attempt", attempt).Msg("pause revert failed; retrying")
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+		}
+		backoff *= 2
+	}
 }
 
 // vmdTimeout is the default deadline for VMD gRPC calls.
@@ -620,34 +673,6 @@ func (h *Handlers) openSandboxInterval(reqCtx context.Context, sandboxID, teamID
 	}
 }
 
-// openSandboxIntervalInheritActor opens an interval after a system-initiated
-// revert (e.g. reaper's pause-then-rollback) where the original actor was
-// lost. Looks up the most recently closed interval's actor and uses it as
-// the new open's actor_id; this keeps the sandbox contributing to WAU
-// across a brief outage instead of getting dropped by the view's "actor_id
-// IS NOT NULL" filter. Falls back to NULL if no prior closed interval
-// exists.
-//
-// Only the reaper revert paths use this. The user-facing handler paths
-// always have an explicit actor from the request context, so they call
-// openSandboxInterval directly.
-func (h *Handlers) openSandboxIntervalInheritActor(reqCtx context.Context, sandboxID, teamID uuid.UUID) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(reqCtx), asyncTimeout)
-	defer cancel()
-	var actorID *uuid.UUID
-	if prior, err := h.DB.GetMostRecentClosedSandboxIntervalActor(ctx, sandboxID); err == nil && prior.Valid {
-		a := uuid.UUID(prior.Bytes)
-		actorID = &a
-	}
-	if err := h.DB.OpenSandboxActiveInterval(ctx, db.OpenSandboxActiveIntervalParams{
-		SandboxID: sandboxID,
-		TeamID:    teamID,
-		ActorID:   actorUUID(actorID),
-	}); err != nil {
-		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("open sandbox_active_interval (inherit) failed")
-	}
-}
-
 // closeSandboxInterval closes the currently-open interval for a sandbox.
 // reason is one of paused / timeout_paused / deleted / failed. Idempotent:
 // if no interval is open (e.g. delete-after-pause), the UPDATE matches zero
@@ -745,7 +770,7 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			// The route is not a lifecycle op, so PhaseStart silences nothing.
 			tAuth := PhaseStart(c)
 			tResume := time.Now()
-			resumedAccess, ok := h.resumePausedSandbox(c, &sandbox, teamID)
+			resumedAccess, ok := h.resumePausedSandbox(c, &sandbox, teamID, nil)
 			// Emitted for failures too — auto-resume totals must not censor.
 			RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID,
 				map[string]time.Duration{"total": time.Since(tResume), "lookup": tResume.Sub(tAuth)})
@@ -757,7 +782,9 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		case db.SandboxStatusStarting, db.SandboxStatusResuming:
 			// Likely the fire-and-forget activate write in flight (or a
 			// concurrent create/resume finishing); wait for the flip
-			// rather than 409 the owner's own follow-up.
+			// rather than 409 the owner's own follow-up. 'migrating' (an
+			// operator's boot elsewhere, minutes at worst) is not settled
+			// here: it takes the conflict below and the client retries.
 			if time.Now().Before(deadline) {
 				time.Sleep(activateSettlePoll)
 				continue
@@ -773,9 +800,13 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 
 // resumePausedSandbox restores the VM, reapplies network config, and flips
 // the sandbox to active. Starts with an atomic paused→resuming DB claim so
-// concurrent resumes don't both call VMD; the loser gets 409. On any failure
+// concurrent resumes don't both call VMD; the loser gets 409. The caller
+// need only know the row's id and team: the claim returns the row. When
+// the claim finds no paused row, a non-nil settled is asked whether to try
+// once more, after it has read the row and either waited out a pause
+// still finalizing or replied with the conflict itself. On any failure
 // after VMD resume succeeds, destroys the VM + reverts to paused.
-func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID) (string, bool) {
+func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, teamID uuid.UUID, settled func() bool) (string, bool) {
 	sandboxID := sandbox.ID
 	l := sandboxLogger(sandboxID.String(), sandbox.HostID)
 
@@ -820,18 +851,23 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID, phases)
 	}()
 
-	if !sandbox.SnapshotID.Valid {
-		l.Error().Msg("paused sandbox has no snapshot_id")
-		respondError(c, ErrInternal)
-		return "", false
-	}
-
 	// One statement for the claim and the boot inputs; see ClaimResume.
-	claimed, err := h.DB.ClaimResume(c.Request.Context(), db.ClaimResumeParams{
+	claimParams := db.ClaimResumeParams{
 		ID:      sandboxID,
 		TeamID:  teamID,
 		LockKey: sandboxID.String(),
-	})
+	}
+	claimed, err := h.DB.ClaimResume(c.Request.Context(), claimParams)
+	if err == pgx.ErrNoRows && settled != nil {
+		// The caller's wait is its lookup, not this claim.
+		tWait := time.Now()
+		retry := settled()
+		tStart = tStart.Add(time.Since(tWait))
+		if !retry {
+			return "", false
+		}
+		claimed, err = h.DB.ClaimResume(c.Request.Context(), claimParams)
+	}
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			// Someone else is already resuming, or the sandbox is no longer
@@ -849,6 +885,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return "", false
 	}
 	*sandbox = claimed.Sandbox
+	l = sandboxLogger(sandboxID.String(), sandbox.HostID)
+	SetTelemetryHostID(c, sandbox.HostID)
 
 	revertCtx := context.WithoutCancel(c.Request.Context())
 	revertToPaused := func() {
@@ -862,6 +900,14 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 	}
 
+	if !sandbox.SnapshotID.Valid {
+		l.Error().Msg("paused sandbox has no snapshot_id")
+		markRevert()
+		revertToPaused()
+		respondError(c, ErrInternal)
+		return "", false
+	}
+
 	// Strict sandboxes may only resume while their host proves enforcement
 	// support; a missing policy row is an older control plane's legacy
 	// sandbox. The policy rides the claim, so a refusal here reverts it. The
@@ -873,7 +919,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		Ports:      claimedPortPolicies(claimed.PortNumbers, claimed.PortAccesses, claimed.PortTokenVersions),
 	}
 	if resumePolicy.requiresBrowserCapability() {
-		if !h.requireHostPreviewPortBrowserAuth(c, sandbox.HostID) {
+		if !h.requireOwnerResumeCapabilities(c, sandbox.HostID, previewBrowserCapabilities()...) {
 			markRevert()
 			revertToPaused()
 			return "", false
@@ -885,7 +931,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		resumePolicy, err = h.applyPreviewMutationValidated(c.Request.Context(), sandboxID, teamID, func(*db.Queries) error {
 			return nil
 		}, func(q *db.Queries, _ previewPolicySnapshot) error {
-			return validateHostPreviewBrowserCapabilities(c.Request.Context(), q, sandbox.HostID)
+			return validateOwnerResumeBrowserCapabilities(c.Request.Context(), q, sandbox.HostID)
 		})
 		if err != nil {
 			if !h.handlePreviewMutationResult(c, sandboxID, "ActivatePreviewBrowserAuthForResume", err) {
@@ -894,10 +940,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 				return "", false
 			}
 		}
-	} else if resumePolicy.Access != preview.AccessLegacyPublic && !h.requireHostPreviewPorts(c, sandbox.HostID) {
-		markRevert()
-		revertToPaused()
-		return "", false
+	} else if resumePolicy.Access != preview.AccessLegacyPublic {
+		if !h.requireOwnerResumeCapabilities(c, sandbox.HostID, preview.HostCapabilityPorts) {
+			markRevert()
+			revertToPaused()
+			return "", false
+		}
 	}
 	resumeVMDAccess := resumePolicy.vmdAccess()
 
@@ -1088,17 +1136,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			return false
 		}
 		effectivePolicy = currentPolicy
-		// A private publication may have changed while the VM was restoring.
-		// Gate the reapply against the host's current browser heartbeat too;
-		// otherwise a resume that began public could activate a
-		// concurrently-added browser policy on a downgraded host.
-		if currentPolicy.requiresBrowserCapability() {
-			if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
-				markRevert()
-				pauseAndRevert()
-				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
-				return false
-			}
+		// Policy requirements and owner capabilities may change during restore.
+		if capabilityErr := validateOwnerResumePolicyCapabilities(postCtx, h.DB, sandbox.HostID, currentPolicy); capabilityErr != nil {
+			markRevert()
+			pauseAndRevert()
+			h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewCapabilitiesAfterResume", capabilityErr)
+			return false
 		}
 		if policyErr = vmd.UpdateSandboxPreviewPolicy(postCtx, sandboxID.String(), currentPolicy.vmdAccess(), currentPolicy.vmdPorts(), currentPolicy.Revision); policyErr != nil {
 			if currentPolicy.vmdAccess() == preview.AccessLegacyPublic && isVMDUnimplemented(policyErr) {
@@ -1137,15 +1180,13 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			if !reapplyPolicy() {
 				return "", false
 			}
-		case resumePolicy.requiresBrowserCapability():
-			// The policy is the claim's. The host's browser heartbeat can
-			// lapse during the boot, so re-check it before activation the
-			// way the reapply does; otherwise a resume could activate a
-			// browser policy on a downgraded host.
-			if capabilityErr := validateHostPreviewBrowserCapabilities(postCtx, h.DB, sandbox.HostID); capabilityErr != nil {
+		default:
+			// The attested policy is current, but the owner's capabilities
+			// can lapse during boot and must be rechecked before activation.
+			if capabilityErr := validateOwnerResumePolicyCapabilities(postCtx, h.DB, sandbox.HostID, resumePolicy); capabilityErr != nil {
 				markRevert()
 				pauseAndRevert()
-				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewBrowserAuthAfterResume", capabilityErr)
+				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewCapabilitiesAfterResume", capabilityErr)
 				return "", false
 			}
 		}
@@ -1423,90 +1464,103 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 
-	// PauseSandbox responds as soon as vmd's PauseVM RPC completes, then
-	// flips pausing -> paused via fire-and-forget bookkeeping (deliberately
-	// off the pause hot path — see finalize-pause in PauseSandbox). The
-	// owner's own immediate follow-up resume can therefore read the row
-	// before that write lands; poll through 'pausing' with a backed-off
-	// interval (nextSettlePollInterval) over pausingSettleWindow rather than
-	// 409 an operation the client was just told succeeded. Any other
-	// non-paused status is a real conflict and fails immediately.
-	deadline := time.Now().Add(pausingSettleWindow)
-	waitStart := time.Now()
-	poll := pausingSettlePollStart
-	reads := 0
-	canceled := false
-	for {
-		var err error
-		sandbox, err = h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
-			ID:     sandboxID,
-			TeamID: teamID,
-		})
-		reads++
-		if err != nil {
-			if err == pgx.ErrNoRows {
-				respondError(c, ErrSandboxNotFound)
-				return
-			}
-			log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
-			respondError(c, ErrInternal)
-			return
-		}
-		if sandbox.Status == db.SandboxStatusPausing && time.Now().Before(deadline) {
-			// Context-aware wait: a client that disconnects or hits its
-			// deadline mid-backoff releases this goroutine at cancellation
-			// instead of holding it for the rest of the interval — and skips
-			// the re-read, which on a canceled context could only fail and be
-			// misreported as an internal DB error.
-			timer := time.NewTimer(poll)
-			select {
-			case <-timer.C:
-				poll = nextSettlePollInterval(poll)
-				continue
-			case <-c.Request.Context().Done():
-				timer.Stop()
-				canceled = true
-			}
-		}
-		break
-	}
-	// The common case resolves on the first read, so this only fires for the
-	// racing/stuck case — once per affected resume, not once per poll — and
-	// stays off the hot path.
-	if reads > 1 {
-		waited := time.Since(waitStart)
-		// Only pausing→paused counts as settled: a row that left 'pausing'
-		// for any other state (a failed pause reverting to active, a delete
-		// claiming the row) still 409s below, and folding it into "settled"
-		// would contaminate the metric with pause failures.
-		var result string
-		switch {
-		case canceled:
-			result = telemetry.SettleResultCanceled
-		case sandbox.Status == db.SandboxStatusPaused:
-			result = telemetry.SettleResultSettled
-		case sandbox.Status == db.SandboxStatusPausing:
-			result = telemetry.SettleResultTimeout
-		default:
-			result = telemetry.SettleResultDiverged
-		}
-		l := sandboxLogger(sandboxID.String(), sandbox.HostID)
-		l.Warn().
-			Dur("waited", waited).
-			Int("reads", reads).
-			Str("result", result).
-			Msg("resume waited for racing pause finalize to settle")
-		RecordResumeSettleWait(c.Request.Context(), result, sandbox.HostID, waited, reads)
-	}
-	SetTelemetryHostID(c, sandbox.HostID)
-
-	if sandbox.Status != db.SandboxStatusPaused {
-		respondError(c, ErrInvalidState)
-		return
-	}
-
+	// The claim is the first statement to touch the row: a paused sandbox
+	// is the common case, and the claim both proves and takes it in one
+	// round trip. The row is read only when the claim finds no paused row,
+	// to tell a pause still settling from a real conflict or a missing
+	// sandbox. That wait counts as lookup, not as the claim.
 	tLookupDone = time.Now()
-	if _, ok := h.resumePausedSandbox(c, &sandbox, teamID); !ok {
+	sandbox = db.Sandbox{ID: sandboxID, TeamID: teamID}
+	settled := func() bool {
+		// PauseSandbox responds as soon as vmd's PauseVM RPC completes, then
+		// flips pausing -> paused via fire-and-forget bookkeeping (deliberately
+		// off the pause hot path — see finalize-pause in PauseSandbox). The
+		// owner's own immediate follow-up resume can therefore find the row
+		// before that write lands; poll through 'pausing' with a backed-off
+		// interval (nextSettlePollInterval) over pausingSettleWindow rather than
+		// 409 an operation the client was just told succeeded. Any other
+		// non-paused status is a real conflict and fails immediately.
+		deadline := time.Now().Add(pausingSettleWindow)
+		waitStart := time.Now()
+		poll := pausingSettlePollStart
+		reads := 0
+		canceled := false
+		for {
+			var err error
+			sandbox, err = h.DB.GetSandbox(c.Request.Context(), db.GetSandboxParams{
+				ID:     sandboxID,
+				TeamID: teamID,
+			})
+			reads++
+			if err != nil {
+				// Ended before any claim could land: the whole request is lookup.
+				tLookupDone = time.Time{}
+				if err == pgx.ErrNoRows {
+					respondError(c, ErrSandboxNotFound)
+					return false
+				}
+				log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("DB GetSandbox failed")
+				respondError(c, ErrInternal)
+				return false
+			}
+			if sandbox.Status == db.SandboxStatusPausing && time.Now().Before(deadline) {
+				// Context-aware wait: a client that disconnects or hits its
+				// deadline mid-backoff releases this goroutine at cancellation
+				// instead of holding it for the rest of the interval — and skips
+				// the re-read, which on a canceled context could only fail and be
+				// misreported as an internal DB error.
+				timer := time.NewTimer(poll)
+				select {
+				case <-timer.C:
+					poll = nextSettlePollInterval(poll)
+					continue
+				case <-c.Request.Context().Done():
+					timer.Stop()
+					canceled = true
+				}
+			}
+			break
+		}
+		// A single read means the claim lost to a real state change; the
+		// racing/stuck case polls, and is reported once per affected resume.
+		if reads > 1 {
+			waited := time.Since(waitStart)
+			// Only pausing→paused counts as settled: a row that left 'pausing'
+			// for any other state (a failed pause reverting to active, a delete
+			// claiming the row) still 409s below, and folding it into "settled"
+			// would contaminate the metric with pause failures.
+			var result string
+			switch {
+			case canceled:
+				result = telemetry.SettleResultCanceled
+			case sandbox.Status == db.SandboxStatusPaused:
+				result = telemetry.SettleResultSettled
+			case sandbox.Status == db.SandboxStatusPausing:
+				result = telemetry.SettleResultTimeout
+			default:
+				result = telemetry.SettleResultDiverged
+			}
+			l := sandboxLogger(sandboxID.String(), sandbox.HostID)
+			l.Warn().
+				Dur("waited", waited).
+				Int("reads", reads).
+				Str("result", result).
+				Msg("resume waited for racing pause finalize to settle")
+			RecordResumeSettleWait(c.Request.Context(), result, sandbox.HostID, waited, reads)
+		}
+		SetTelemetryHostID(c, sandbox.HostID)
+
+		if sandbox.Status != db.SandboxStatusPaused {
+			// A settle-window 409 is the slowest lookup there is; it must
+			// land there, not vanish into a claim that never happened.
+			tLookupDone = time.Time{}
+			respondError(c, ErrInvalidState)
+			return false
+		}
+		tLookupDone = time.Now()
+		return true
+	}
+	if _, ok := h.resumePausedSandbox(c, &sandbox, teamID, settled); !ok {
 		return
 	}
 
@@ -1574,12 +1628,14 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// — this CAS and resume's BeginResume cannot both win the same row — while still
 	// letting a crash-wedged sandbox be deleted. The same statement writes the
 	// revocation row, so a crash before teardown can't leave a live VM with a valid JWT.
-	if _, err := h.DB.DestroySandbox(c.Request.Context(), db.DestroySandboxParams{
+	destroyed, err := h.DB.DestroySandbox(c.Request.Context(), db.DestroySandboxParams{
 		ID:                      sandboxID,
 		TeamID:                  teamID,
 		RevocationExpiresAt:     time.Now().Add(SecretsJWTLifetime),
 		StaleTransitionalBefore: time.Now().Add(-staleTransitionGrace),
-	}); err != nil {
+		LeaseSeconds:            h.birthLeaseSeconds(),
+	})
+	if err != nil {
 		if err == pgx.ErrNoRows {
 			// Not claimable from its current state. Re-read to tell a
 			// just-completed delete (idempotent) from a transitional state
@@ -1602,7 +1658,18 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
-	h.teardownDestroyedSandbox(c.Request.Context(), sandboxID, sandbox.HostID, sandbox.BasePath, sandbox.TemplateID)
+	// The row is deleted and the host-side reclaim it owes is recorded with
+	// it, owned by this request for one bounded attempt. A reachable host is
+	// done in a fraction of the budget, and a caller that deletes and
+	// re-creates then finds the VM's memory, cores and network slot already
+	// released; a host that does not answer costs the caller the budget and
+	// nothing more, and the sweeper finishes the reclaim. The context is
+	// detached from the request so a client that goes away mid-reclaim does
+	// not interrupt it.
+	h.teardownInline(context.WithoutCancel(c.Request.Context()), teardownRecord{
+		SandboxID: destroyed.ID, HostID: destroyed.HostID, BasePath: destroyed.BasePath,
+		TemplateID: destroyed.TemplateID, Attempts: 1,
+	}, "delete")
 
 	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
@@ -1611,55 +1678,312 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// teardownDestroyedSandbox reclaims host-side state for a sandbox whose
-// guarded soft-delete has already committed: the VM (with its run dir and
-// netns), pause snapshots, and the per-build artifact dir. Best-effort
-// throughout — the vm reconciler backstops anything missed here. Shared by
-// user-initiated deletes and the auto-delete reaper so the two paths cannot
-// diverge.
-func (h *Handlers) teardownDestroyedSandbox(ctx context.Context, sandboxID uuid.UUID, hostID string, basePath *string, templateID pgtype.UUID) {
+// Reclaim timing. The inline budget is the whole of what a delete spends on
+// its own reclaim before answering, settlement included: the reclaim runs
+// under the budget less a reserve kept for the settle. The record is born
+// owned for the budget plus teardownBirthLeaseMargin, so the sweeper takes
+// over shortly after an inline attempt that did not finish, was skipped, or
+// died with the process. teardownLease is the sweeper's own lease per
+// attempt and outlasts the sweep budget plus its settle. Retries back off
+// from teardownRetryMin, doubling per attempt, up to teardownRetryMax,
+// which permanent failures use from the start.
+const (
+	defaultTeardownInlineBudget = 5 * time.Second
+	maxTeardownInlineBudget     = 30 * time.Second
+	teardownSettleReserveMax    = 500 * time.Millisecond
+	teardownBirthLeaseMargin    = 5 * time.Second
+	teardownSweepBudget         = 30 * time.Second
+	teardownLease               = 60 * time.Second
+	teardownSweepInterval       = 30 * time.Second
+	teardownSweepWorkers        = 8
+	teardownRetryMin            = 30 * time.Second
+	teardownRetryMax            = time.Hour
+	maxInlineTeardowns          = 64
+)
+
+// errTeardownHostUnregistered: the sandbox's host is no longer known to the
+// control plane, so no retry can reach it; the reclaim is kept for an
+// operator.
+var errTeardownHostUnregistered = errors.New("host not registered")
+
+// teardownRecord is one sandbox_teardown row as an attempt sees it. The
+// attempt number is the fence every settle carries: a worker whose lease
+// ran out cannot complete or defer what a newer attempt owns.
+type teardownRecord struct {
+	SandboxID  uuid.UUID
+	HostID     string
+	BasePath   *string
+	TemplateID pgtype.UUID
+	Attempts   int32
+}
+
+func (h *Handlers) inlineBudget() time.Duration {
+	if h.TeardownInlineBudget <= 0 {
+		return defaultTeardownInlineBudget
+	}
+	return min(h.TeardownInlineBudget, maxTeardownInlineBudget)
+}
+
+// birthLeaseSeconds is how long a delete owns its record: its inline budget
+// and a margin for the response.
+func (h *Handlers) birthLeaseSeconds() int32 {
+	return int32((h.inlineBudget() + teardownBirthLeaseMargin) / time.Second)
+}
+
+// teardownInline runs the attempt the record was born owning, bounded as a
+// whole by the inline budget. When this replica already has its fill of
+// inline reclaims on the wire the attempt is skipped outright, with no
+// database call on the way out: the sweeper takes the record when its
+// birth lease ends.
+func (h *Handlers) teardownInline(ctx context.Context, rec teardownRecord, path string) {
+	h.inlineTeardownsOnce.Do(func() { h.inlineTeardowns = make(chan struct{}, maxInlineTeardowns) })
+	select {
+	case h.inlineTeardowns <- struct{}{}:
+	default:
+		l := sandboxLogger(rec.SandboxID.String(), rec.HostID)
+		l.Info().Msg("teardown: inline limiter full; left to the sweeper")
+		recordTeardownAttempt(ctx, path, "skipped")
+		return
+	}
+	defer func() { <-h.inlineTeardowns }()
+	budget := h.inlineBudget()
+	settleCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	runCtx, cancelRun := context.WithTimeout(settleCtx, budget-min(teardownSettleReserveMax, budget/10))
+	defer cancelRun()
+	h.settleTeardown(settleCtx, rec, path, h.reclaimSandbox(runCtx, rec))
+}
+
+// reclaimSandbox reclaims host-side state for a sandbox whose guarded
+// soft-delete has already committed: the VM (with its run dir and netns),
+// pause snapshots, and the per-build artifact dir. Every step is idempotent
+// and NotFound from the host means done, so a retry runs the whole sequence
+// again. Inline attempts and the sweeper both come through here, so the two
+// cannot diverge in what they reclaim.
+func (h *Handlers) reclaimSandbox(ctx context.Context, rec teardownRecord) error {
+	if err := h.teardownVM(ctx, rec.SandboxID, rec.HostID); err != nil {
+		return err
+	}
+	if err := h.cleanupSandboxSnapshots(ctx, rec.SandboxID, rec.HostID); err != nil {
+		return err
+	}
+	return h.gcOldBuildArtifacts(ctx, rec.HostID, rec.BasePath, rec.TemplateID)
+}
+
+// settleTeardown writes the attempt's outcome within ctx. A host that did
+// not answer holds the host's other pending reclaims too, so the sweeper
+// does not try them one by one; reclaims in flight elsewhere are not
+// touched. With ctx already spent nothing is written: the record's lease
+// runs out and the sweeper recovers it.
+func (h *Handlers) settleTeardown(ctx context.Context, rec teardownRecord, path string, err error) {
+	l := sandboxLogger(rec.SandboxID.String(), rec.HostID)
+	if ctx.Err() != nil {
+		l.Warn().AnErr("attempt", err).Msg("teardown: budget spent before settling; the lease recovers it")
+		recordTeardownAttempt(ctx, path, "timeout")
+		return
+	}
+	sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err == nil {
+		if _, cerr := h.DB.CompleteTeardown(sctx, db.CompleteTeardownParams{SandboxID: rec.SandboxID, Attempts: rec.Attempts}); cerr != nil {
+			l.Warn().Err(cerr).Msg("teardown done but its record could not be removed; the sweeper will repeat it")
+		}
+		recordTeardownAttempt(ctx, path, "completed")
+		return
+	}
+	result, retry := "deferred", teardownBackoff(rec.Attempts)
+	permanent := errors.Is(err, errTeardownHostUnregistered)
+	switch {
+	case permanent:
+		result, retry = "permanent", teardownRetryMax
+	case errors.Is(err, context.DeadlineExceeded):
+		result = "timeout"
+	}
+	msg := err.Error()
+	if _, derr := h.DB.DeferTeardown(sctx, db.DeferTeardownParams{
+		RetryAfterSeconds: int32(retry / time.Second), Permanent: permanent, LastError: &msg,
+		SandboxID: rec.SandboxID, Attempts: rec.Attempts,
+	}); derr != nil {
+		l.Warn().Err(derr).Msg("teardown could not be deferred; the sweeper retries it when the lease ends")
+	}
+	if isVMDUnavailable(err) || isVMDDeadline(err) {
+		held, herr := h.DB.DeferHostTeardowns(sctx, db.DeferHostTeardownsParams{
+			RetryAfterSeconds: int32(retry / time.Second), LastError: &msg, HostID: rec.HostID,
+		})
+		if herr != nil {
+			l.Warn().Err(herr).Msg("teardown: holding the host's other reclaims failed")
+		} else if held > 0 {
+			l.Info().Int64("held", held).Dur("retry_after", retry).Msg("teardown: host did not answer; its other reclaims wait too")
+		}
+	}
+	l.Warn().Err(err).Str("result", result).Int32("attempts", rec.Attempts).Dur("retry_after", retry).Msg("teardown incomplete")
+	recordTeardownAttempt(ctx, path, result)
+}
+
+func teardownBackoff(attempts int32) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts > 8 {
+		return teardownRetryMax
+	}
+	return min(teardownRetryMin<<(attempts-1), teardownRetryMax)
+}
+
+func recordTeardownAttempt(ctx context.Context, path, result string) {
+	currentTelemetryRecorder().RecordTeardownAttempt(ctx, telemetry.TeardownAttempt{Path: path, Result: result})
+}
+
+// StartTeardownSweeper retries recorded reclaims nobody owns: inline
+// attempts that ran out of budget, were skipped, or died with the process,
+// and deferred ones whose backoff has passed. Every replica sweeps; the
+// claim is atomic and takes the host's lease with the record, so no two
+// workers anywhere share a record or work the same host at once.
+func (h *Handlers) StartTeardownSweeper(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(teardownSweepInterval)
+		defer ticker.Stop()
+		log.Info().Msg("teardown sweeper started")
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sentrylog.RunSafe("teardown-sweep", func() { h.SweepTeardowns(ctx) })
+			}
+		}
+	}()
+}
+
+// SweepTeardowns drains claimable reclaims with a fixed set of workers, each
+// taking one record at a time until none is left, then publishes the
+// backlog. Exported so tests can run one sweep directly.
+func (h *Handlers) SweepTeardowns(ctx context.Context) {
+	var wg sync.WaitGroup
+	for i := 0; i < teardownSweepWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer sentrylog.Recover("teardown-sweep-worker")
+			for ctx.Err() == nil {
+				rec, ok := h.claimNextTeardown(ctx)
+				if !ok {
+					return
+				}
+				runCtx, cancelRun := context.WithTimeout(ctx, teardownSweepBudget)
+				err := h.reclaimSandbox(runCtx, rec)
+				cancelRun()
+				// The settle clock starts after the reclaim: a slow host must not eat it.
+				settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+				h.settleTeardown(settleCtx, rec, "sweep", err)
+				cancelSettle()
+				h.releaseTeardownHost(ctx, rec)
+			}
+		}()
+	}
+	wg.Wait()
+	h.recordTeardownBacklog(ctx)
+}
+
+// claimNextTeardown takes the sweeper's next record and its host's lease.
+// The database serializes claims for one host across replicas; a claim
+// that loses that race comes back empty although other hosts may have
+// work, so an empty claim is asked once more before the worker stops.
+func (h *Handlers) claimNextTeardown(ctx context.Context) (teardownRecord, bool) {
+	for try := 0; try < 2; try++ {
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		row, err := h.DB.ClaimNextTeardown(qctx, int32(teardownLease/time.Second))
+		cancel()
+		switch {
+		case err == nil:
+			return teardownRecord{SandboxID: row.SandboxID, HostID: row.HostID, BasePath: row.BasePath, TemplateID: row.TemplateID, Attempts: row.Attempts}, true
+		case errors.Is(err, pgx.ErrNoRows):
+			continue
+		default:
+			log.Warn().Err(err).Msg("teardown sweep: claim failed")
+			return teardownRecord{}, false
+		}
+	}
+	return teardownRecord{}, false
+}
+
+func (h *Handlers) releaseTeardownHost(ctx context.Context, rec teardownRecord) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := h.DB.ReleaseTeardownHost(rctx, db.ReleaseTeardownHostParams{HostID: rec.HostID, SandboxID: rec.SandboxID, Attempt: rec.Attempts}); err != nil {
+		l := sandboxLogger(rec.SandboxID.String(), rec.HostID)
+		l.Warn().Err(err).Msg("teardown sweep: host release failed; the host waits out the lease")
+	}
+}
+
+func (h *Handlers) recordTeardownBacklog(ctx context.Context) {
+	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	b, err := h.DB.TeardownBacklog(qctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("teardown sweep: backlog query failed")
+		return
+	}
+	currentTelemetryRecorder().RecordTeardownBacklog(ctx, telemetry.TeardownBacklog{
+		Total: b.Total, Permanent: b.Permanent, Retrying: b.Retrying, OldestAgeSeconds: b.OldestAgeSeconds,
+	})
+	if b.Total > 0 {
+		log.Info().Int64("total", b.Total).Int64("retrying", b.Retrying).Int64("permanent", b.Permanent).
+			Float64("oldest_age_seconds", b.OldestAgeSeconds).Msg("teardown backlog")
+	}
+}
+
+// hostForTeardown resolves the host's client. A host the control plane no
+// longer knows is a permanent failure; anything else is retried.
+func (h *Handlers) hostForTeardown(ctx context.Context, hostID string) (VMDClient, error) {
+	vmd, err := h.vmdForHost(ctx, hostID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: %v", errTeardownHostUnregistered, err)
+		}
+		return nil, fmt.Errorf("resolve host: %w", err)
+	}
+	return vmd, nil
+}
+
+// teardownVM fans out the revocation and tears the VM down.
+func (h *Handlers) teardownVM(ctx context.Context, sandboxID uuid.UUID, hostID string) error {
 	l := sandboxLogger(sandboxID.String(), hostID)
 	// The revocation row is committed with the delete claim; fan it out to the
 	// host so the daemon refuses the JWT now. Best-effort — bootstrap re-fans
 	// from the persisted row on restart.
 	go h.fanoutSandboxRevoke(context.Background(), sandboxID, hostID)
 
-	// Tear down the VM best-effort and unconditionally: a sandbox claimed from a
-	// stale transition or a 'failed' state may still hold a VM, run dir, and netns
-	// that only DestroyInstance reclaims (an absent VM is an idempotent no-op). A
-	// failure here is reconciled by the vm reconciler, so a vmd hiccup must not fail
-	// an already-committed delete.
-	if vmd, lookupErr := h.vmdForHost(ctx, hostID); lookupErr != nil {
-		l.Warn().Err(lookupErr).Msg("resolve VMD for delete teardown; reconciler will reclaim")
-	} else {
-		vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
-		if derr := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); derr != nil && !isVMDNotFound(derr) {
-			l.Warn().Err(derr).Msg("VMD DestroyInstance for delete teardown; reconciler will reclaim")
-		}
-		vmdCancel()
+	// Tear down the VM unconditionally: a sandbox claimed from a stale
+	// transition or a 'failed' state may still hold a VM, run dir, and netns
+	// that only DestroyInstance reclaims (an absent VM is an idempotent
+	// no-op).
+	vmd, err := h.hostForTeardown(ctx, hostID)
+	if err != nil {
+		l.Warn().Err(err).Msg("resolve VMD for delete teardown")
+		return err
 	}
-
-	// Best-effort cleanup of pause snapshots. Failures are logged but
-	// don't fail the delete — manual cleanup may be required if vmd was
-	// unreachable.
-	h.cleanupSandboxSnapshots(ctx, sandboxID, hostID)
-
-	// Best-effort GC of the per-build artifact dir if this sandbox was the
-	// last reference and the template has since moved to a newer build.
-	h.gcOldBuildArtifacts(ctx, hostID, basePath, templateID)
+	vmdCtx, cancel := context.WithTimeout(ctx, vmdTimeout)
+	defer cancel()
+	if derr := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); derr != nil && !isVMDNotFound(derr) {
+		l.Warn().Err(derr).Msg("VMD DestroyInstance for delete teardown")
+		return fmt.Errorf("destroy vm: %w", derr)
+	}
+	return nil
 }
 
 // gcOldBuildArtifacts deletes the per-build dir if the just-destroyed sandbox
 // at sandboxBasePath was the last reference and the template has moved on.
-// Best-effort.
-func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sandboxBasePath *string, sandboxTemplateID pgtype.UUID) {
+// Nothing to do is not an error; a step that did not run is, so the reclaim
+// is retried rather than recorded complete with the dir still there.
+func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sandboxBasePath *string, sandboxTemplateID pgtype.UUID) error {
 	if sandboxBasePath == nil || !sandboxTemplateID.Valid {
-		return
+		return nil
 	}
 	basePath := *sandboxBasePath
 	buildID := filepath.Base(filepath.Dir(basePath))
 	if buildID == "" || buildID == "." || buildID == string(filepath.Separator) {
-		return
+		return nil
 	}
 	templateID := uuid.UUID(sandboxTemplateID.Bytes).String()
 
@@ -1668,76 +1992,82 @@ func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sa
 
 	refs, err := h.DB.CountActiveSandboxesAtBasePath(gcCtx, &basePath)
 	if err != nil {
-		log.Warn().Err(err).Str("base_path", basePath).Msg("gc: CountActiveSandboxesAtBasePath")
-		return
+		return fmt.Errorf("gc: count references: %w", err)
 	}
 	if refs > 0 {
-		return
+		return nil
 	}
 	// Team-blind: sandbox's team may not own the template (system templates),
 	// so GetTemplateForOwner would falsely report "not in use" → over-delete.
+	// A template that is gone has no current build to protect, and its own
+	// cleanup may not have reached this host, so the delete still runs.
 	tplBase, err := h.DB.GetTemplateBasePath(gcCtx, sandboxTemplateID.Bytes)
-	if err != nil {
-		log.Warn().Err(err).Str("base_path", basePath).Msg("gc: GetTemplateBasePath")
-		return
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("gc: template base path: %w", err)
 	}
-	if tplBase != nil && *tplBase == basePath {
-		return
+	if err == nil && tplBase != nil && *tplBase == basePath {
+		return nil
 	}
 
-	vmd, err := h.vmdForHost(gcCtx, hostID)
+	vmd, err := h.hostForTeardown(gcCtx, hostID)
 	if err != nil {
-		return
+		return err
 	}
-	if err := vmd.DeleteBuildArtifacts(gcCtx, templateID, buildID); err != nil {
+	if err := vmd.DeleteBuildArtifacts(gcCtx, templateID, buildID); err != nil && !isVMDNotFound(err) {
 		log.Warn().Err(err).Str("template_id", templateID).Str("build_id", buildID).Msg("gc: DeleteBuildArtifacts")
+		return fmt.Errorf("gc: delete build artifacts: %w", err)
 	}
+	return nil
 }
 
 // cleanupSandboxSnapshots deletes the on-disk snapshot files via vmd and
-// the snapshot DB rows for a destroyed sandbox. Best-effort.
-func (h *Handlers) cleanupSandboxSnapshots(reqCtx context.Context, sandboxID uuid.UUID, hostID string) {
+// the snapshot DB rows for a destroyed sandbox. The rows stay while the
+// files could not be removed, so a retry still finds them.
+func (h *Handlers) cleanupSandboxSnapshots(reqCtx context.Context, sandboxID uuid.UUID, hostID string) error {
 	l := sandboxLogger(sandboxID.String(), hostID)
 	// List snapshot rows first: they feed the per-file fallback below and are
 	// cleared at the end.
 	snaps, err := h.DB.ListSnapshotsBySandbox(reqCtx, sandboxID)
 	if err != nil {
-		l.Warn().Err(err).Msg("list snapshots for cleanup")
+		return fmt.Errorf("list snapshots: %w", err)
 	}
 
 	// Remove the whole <SnapshotDir>/<id>/ tree path-based, independent of
 	// snapshot DB rows — reclaims pause artifacts even when a row is missing.
 	// On an old vmd that predates this RPC (control-plane-deploys-first window),
-	// fall back to the per-file delete so cleanup still runs. Best-effort;
-	// anything missed is left for out-of-band GC.
-	if vmd, verr := h.vmdForHost(reqCtx, hostID); verr != nil {
-		l.Warn().Err(verr).Msg("resolve vmd for snapshot cleanup; files may need GC")
-	} else {
-		ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
-		switch delErr := vmd.DeleteSandboxSnapshots(ctx, sandboxID.String()); {
-		case delErr == nil || isVMDNotFound(delErr):
-		case isVMDUnimplemented(delErr):
-			for _, s := range snaps {
-				memPath := ""
-				if s.MemPath != nil {
-					memPath = *s.MemPath
-				}
-				if e := vmd.DeleteSnapshot(ctx, sandboxID.String(), s.Path, memPath); e != nil && !isVMDNotFound(e) {
-					l.Warn().Err(e).Str("snapshot_id", s.ID.String()).Msg("vmd DeleteSnapshot (fallback) failed")
-				}
+	// fall back to the per-file delete so cleanup still runs.
+	vmd, err := h.hostForTeardown(reqCtx, hostID)
+	if err != nil {
+		l.Warn().Err(err).Msg("resolve vmd for snapshot cleanup")
+		return err
+	}
+	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
+	defer cancel()
+	switch delErr := vmd.DeleteSandboxSnapshots(ctx, sandboxID.String()); {
+	case delErr == nil || isVMDNotFound(delErr):
+	case isVMDUnimplemented(delErr):
+		for _, s := range snaps {
+			memPath := ""
+			if s.MemPath != nil {
+				memPath = *s.MemPath
 			}
-		default:
-			l.Warn().Err(delErr).Msg("vmd DeleteSandboxSnapshots failed; files may need GC")
+			if e := vmd.DeleteSnapshot(ctx, sandboxID.String(), s.Path, memPath); e != nil && !isVMDNotFound(e) {
+				l.Warn().Err(e).Str("snapshot_id", s.ID.String()).Msg("vmd DeleteSnapshot (fallback) failed")
+				return fmt.Errorf("delete snapshot: %w", e)
+			}
 		}
-		cancel()
+	default:
+		l.Warn().Err(delErr).Msg("vmd DeleteSandboxSnapshots failed")
+		return fmt.Errorf("delete snapshots: %w", delErr)
 	}
 
 	// Clear the snapshot DB rows (their files are gone above).
 	for _, s := range snaps {
 		if delErr := h.DB.DeleteSnapshot(reqCtx, s.ID); delErr != nil {
-			log.Warn().Err(delErr).Str("snapshot_id", s.ID.String()).Msg("DB DeleteSnapshot failed")
+			return fmt.Errorf("delete snapshot row %s: %w", s.ID, delErr)
 		}
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1930,6 +2260,7 @@ var sandboxStatusFilterValues = []string{
 	string(db.SandboxStatusPausing),
 	string(db.SandboxStatusPaused),
 	string(db.SandboxStatusResuming),
+	string(db.SandboxStatusMigrating),
 	string(db.SandboxStatusFailed),
 	string(db.SandboxStatusDeleted),
 }
@@ -2378,12 +2709,23 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
-	// Resolve secret references before spinning up the VM so a typo 400s cleanly.
-	secretBindings, secretMeta, appErr := h.resolveSecretBindingsForCreate(c.Request.Context(), teamID, req.Secrets)
-	if appErr != nil {
-		respondError(c, appErr)
-		return
+	// Resolve secret references before spinning up the VM so a typo 400s
+	// cleanly. The template read below needs nothing from this, so the two
+	// round trips overlap; the result is joined once the template is in hand.
+	type resolvedSecrets struct {
+		bindings []db.AddSandboxSecretParams
+		meta     []SecretBindingMeta
+		err      *AppError
 	}
+	// The context is taken here, not in the goroutine: gin recycles c once
+	// the handler returns, and a template failure can return before the
+	// goroutine has even started.
+	secretsCtx := c.Request.Context()
+	secretsCh := make(chan resolvedSecrets, 1)
+	go func() {
+		bindings, meta, appErr := h.resolveSecretBindingsForCreate(secretsCtx, teamID, req.Secrets)
+		secretsCh <- resolvedSecrets{bindings, meta, appErr}
+	}()
 
 	// Default the create to the `superserve/base` template so every sandbox
 	// has a consistent baseline image. Callers can opt out by setting
@@ -2407,6 +2749,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var fromTemplateName, fromTemplateID string
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
+		// Stamped before the error check so a failed lookup still lands in
+		// the phase series; a successful one is re-stamped after the join.
 		tLookupDone = time.Now()
 		if err != nil {
 			return // error already responded
@@ -2437,6 +2781,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		fromTemplateName = tpl.Name
 		fromTemplateID = tpl.ID.String()
 	}
+
+	secrets := <-secretsCh
+	if secrets.err != nil {
+		respondError(c, secrets.err)
+		return
+	}
+	secretBindings, secretMeta := secrets.bindings, secrets.meta
+	tLookupDone = time.Now()
 
 	// Select a host for this sandbox.
 	tSchedStart = time.Now()
@@ -3016,23 +3368,33 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 // Sandbox Pause
 // ---------------------------------------------------------------------------
 
-// pauseWithRetry pauses a VM, retrying once on a non-NotFound failure. A
-// timed-out pause may have actually completed on the host, so reverting the
-// row to active would drift it against a paused VM; PauseVM is idempotent, so
-// the retry returns the recorded snapshot and the row converges to paused.
-// NotFound is terminal — the VM is genuinely gone.
-func pauseWithRetry(reqCtx context.Context, vmd vmdclient.Client, id, pauseToken string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
-	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
+// pauseWithRetry pauses a VM, retrying once on an undecided failure (PauseVM
+// is idempotent, so a timed-out pause that completed returns its snapshot).
+// Every attempt ends before leaseUntil, and the retry goes only to a freshly
+// resolved host: a stale machine's answer says nothing about the VM.
+func (h *Handlers) pauseWithRetry(reqCtx context.Context, vmd VMDClient, hostID, id, pauseToken string, leaseUntil time.Time) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
+	deadline, ok := attemptDeadline(leaseUntil, vmdTimeout)
+	if !ok {
+		return "", "", nil, "", errPauseLeaseExpired
+	}
+	ctx, cancel := context.WithDeadline(reqCtx, deadline)
 	snapshotPath, memPath, manifest, ackedToken, err = vmd.PauseInstance(ctx, id, "", pauseToken)
 	cancel()
-	if err == nil || isVMDNotFound(err) {
+	if err == nil || isVMDNotFound(err) || isVMDFailedPrecondition(err) {
 		return snapshotPath, memPath, manifest, ackedToken, err
 	}
-	// Detach from the request ctx: the client's deadline may already have
-	// fired, but the reconciliation to a consistent state must still run.
-	rctx, rcancel := context.WithTimeout(context.WithoutCancel(reqCtx), vmdTimeout)
+	if deadline, ok = attemptDeadline(leaseUntil, vmdTimeout); !ok {
+		return "", "", nil, "", err
+	}
+	// Detached from the request: the client's deadline may already have
+	// fired, but the row must still converge.
+	rctx, rcancel := context.WithDeadline(context.WithoutCancel(reqCtx), deadline)
 	defer rcancel()
-	return vmd.PauseInstance(rctx, id, "", pauseToken)
+	fresh, rerr := h.vmdForHost(rctx, hostID)
+	if rerr != nil {
+		return "", "", nil, "", fmt.Errorf("resolve host for pause retry: %w", rerr)
+	}
+	return fresh.PauseInstance(rctx, id, "", pauseToken)
 }
 
 func (h *Handlers) PauseSandbox(c *gin.Context) {
@@ -3062,10 +3424,35 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	// path. An empty result means the sandbox either doesn't exist, isn't
 	// ours, or isn't currently active — we do a cheap existence check to
 	// return the right error code (404 vs 409).
+	// The pause's identity is minted before it is claimed, so the same id
+	// names it in the row, in every host call, and as its backup token.
+	claimedAt := time.Now()
+	pauseOp := uuid.New()
 	sandbox, err := h.DB.BeginPause(c.Request.Context(), db.BeginPauseParams{
-		ID:     sandboxID,
-		TeamID: teamID,
+		ID:           sandboxID,
+		TeamID:       teamID,
+		PauseOpID:    pgtype.UUID{Bytes: pauseOp, Valid: true},
+		LeaseSeconds: pauseLeaseSeconds,
+		ActorID:      actorUUID(actorIDFromContext(c)),
 	})
+	if err != nil && err != pgx.ErrNoRows {
+		// The reply may have been lost after the claim committed. The row then
+		// carries the operation this request minted, which nothing else can
+		// produce; a claim confirmed that way proceeds, or the reconciler
+		// would pause the VM behind a caller told "failed". Only while the
+		// lease it minted cannot have expired, though: past that another
+		// worker may hold the operation, and its lease is not this request's
+		// to adopt, so the pause is left to whoever holds it.
+		if claimed, ok := h.claimedPause(c.Request.Context(), sandboxID, teamID, pauseOp); ok {
+			if time.Since(claimedAt) >= pauseClaimConfirmWindow {
+				log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("BeginPause reply outlived its lease; the pause is left to the reconciler")
+				respondPause(c, pauseUndecided)
+				return
+			}
+			log.Warn().Err(err).Str("sandbox_id", sandboxID.String()).Msg("BeginPause reply lost after the claim committed")
+			sandbox, err = claimed, nil
+		}
+	}
 	if err == nil {
 		pauseHostID = sandbox.HostID // label error outcomes past the claim too
 	}
@@ -3096,95 +3483,31 @@ func (h *Handlers) PauseSandbox(c *gin.Context) {
 	l := sandboxLogger(sandboxID.String(), sandbox.HostID)
 
 	// BeginPause's CTE atomically closed the open active interval together
-	// with the status transition; nothing to do here. If the pause
-	// subsequently fails, the revert paths reopen a new interval.
+	// with the status transition; nothing to do here. If the host
+	// cannot be resolved, the revert reopens a new interval.
 
-	// Resolve the VMD client for this sandbox's host. BeginPause has
-	// already claimed 'pausing' and closed the billing interval, so a
-	// lookup failure — now a real path when the host row is missing —
-	// must compensate exactly like a daemon failure, or the sandbox is
-	// stuck in 'pausing' and unbilled even after the registration is
-	// repaired.
-	vmd, vmdLookupErr := h.vmdForHost(c.Request.Context(), sandbox.HostID)
-	if vmdLookupErr != nil {
-		l.Error().Err(vmdLookupErr).Msg("resolve VMD for pause failed")
-		h.revertPauseAsync(c, sandboxID, teamID, l)
-		respondError(c, ErrInternal)
+	// Read from the request here: past this point the dispatch may outlive
+	// it, and nothing on another goroutine may touch c.
+	actorID := actorIDFromContext(c)
+	leaseUntil := leaseDeadline(sandbox.PauseOpLeaseUntil, claimedAt, pauseLeaseSeconds)
+
+	if !prefersAsync(c) {
+		respondPause(c, h.dispatchPause(c.Request.Context(), sandbox, leaseUntil, actorID, false, l))
 		return
 	}
 
-	// Call VMD to pause and snapshot the VM.
-	// Minted per pause: rides the pause RPC into the host's backup
-	// pipeline and returns in the upload report, naming this exact pause
-	// for coverage linkage.
-	pauseToken := uuid.NewString()
-	snapshotPath, memPath, manifest, ackedPauseToken, err := pauseWithRetry(c.Request.Context(), vmd, sandboxID.String(), pauseToken)
-	if err != nil {
-		// VMD says the VM doesn't exist — it crashed or was removed out-of-band.
-		// Mark the sandbox failed and return 410 Gone. No revert — the VM is
-		// already dead, "active" was a lie.
-		if isVMDNotFound(err) {
-			l.Warn().Err(err).Msg("VMD PauseInstance: VM unavailable, marking sandbox failed")
-			h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID, sandbox.HostID, false)
-			respondError(c, ErrSandboxGone)
-			return
-		}
-
-		l.Error().Err(err).Msg("VMD PauseInstance failed")
-		h.revertPauseAsync(c, sandboxID, teamID, l)
-		respondError(c, ErrInternal)
-		return
-	}
-
-	l.Debug().
-		Str("snapshot_path", snapshotPath).
-		Str("mem_path", memPath).
-		Msg("VMD pause complete")
-
-	// Past this point the snapshot already exists on disk — the pause has
-	// physically happened, so the bookkeeping (snapshot row upsert + status
-	// flip pausing → paused in a single CTE) is fire-and-forget. BeginPause's
-	// gate write owns the row and every other transition is status-gated, so
-	// a racing resume sees 'pausing' and 409s until this lands. Detached from
-	// cancellation so a client disconnect cannot orphan the bookkeeping;
-	// trace/span context preserved. The upsert replaces the old "insert a new
-	// row + delete the previous" flow, so there's no explicit prev-snapshot
-	// cleanup to schedule here.
-	finalizeCtx := context.WithoutCancel(c.Request.Context())
-	h.asyncBookkeeping("finalize-pause", func() {
-		fctx, fcancel := context.WithTimeout(finalizeCtx, asyncTimeout)
-		defer fcancel()
-		params := db.FinalizePauseParams{
-			ID:      sandboxID,
-			TeamID:  teamID,
-			Path:    snapshotPath,
-			MemPath: &memPath,
-			Trigger: "pause",
-			// Store only what the daemon ECHOED: an older daemon drops the
-			// token, and storing it anyway would demand of its reports an
-			// identity they can never carry.
-			PauseToken: ackedPauseToken,
-		}
-		applyManifest(&params, manifest)
-		if _, err := h.finalizePause(fctx, params); err != nil {
-			// ErrNoRows means the sandbox was soft-deleted between BeginPause
-			// and FinalizePause (a rare race with DeleteSandbox). The VM is
-			// already stopped and its snapshot files are on disk — nothing to
-			// finalize for a sandbox that no longer exists.
-			if err == pgx.ErrNoRows {
-				l.Warn().Msg("FinalizePause: sandbox deleted mid-pause")
-				return
-			}
-			l.Error().Err(err).Msg("async DB FinalizePause failed — sandbox may be stuck in 'pausing'")
-			return
-		}
+	// The pause is recorded; the caller is told so at once. Everything else,
+	// host resolution included, runs detached and lands on the row.
+	// The 202 only accepts the pause; the lifecycle metric gets the
+	// dispatch's own outcome and duration once it has decided.
+	DeferTelemetry(c)
+	bg := context.WithoutCancel(c.Request.Context())
+	hostID := sandbox.HostID
+	h.asyncBookkeeping("pause-dispatch", func() {
+		outcome := h.dispatchPause(bg, sandbox, leaseUntil, actorID, true, l)
+		RecordSandboxTransition(bg, "pause", pauseResult(outcome), hostID, time.Since(tPause))
 	})
-
-	// Interval was already closed at BeginPause; FinalizePause is the
-	// end of the VMD pause work, not the moment the sandbox left active.
-	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "paused", "success", &sandbox.Name, nil, nil)
-	h.capture(c, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
-	c.Status(http.StatusNoContent)
+	acceptPausing(c)
 }
 
 // ---------------------------------------------------------------------------
@@ -3488,6 +3811,12 @@ func (h *Handlers) PatchSandbox(c *gin.Context) {
 	}
 
 	if body.TimeoutSeconds.Set {
+		if sandbox.Status == db.SandboxStatusMigrating {
+			// The update below is gated the same way; answering here names
+			// the reason instead of a not-found.
+			respondError(c, ErrInvalidState)
+			return
+		}
 		if !h.applyRowsAffectedPatch(c, sandbox, teamID, "timeout_updated", func() (int64, error) {
 			return h.DB.UpdateSandboxTimeout(c.Request.Context(), db.UpdateSandboxTimeoutParams{
 				ID:             sandboxID,

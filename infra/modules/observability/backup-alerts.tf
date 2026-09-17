@@ -14,7 +14,20 @@
 # running with backup silently disabled (backup_enabled=0).
 
 locals {
-  backup_filter_suffix = var.backup_alerts == null ? "" : " AND metric.labels.host_id = \"${var.backup_alerts.host_id}\""
+  backup_host_label = var.backup_alerts == null ? "" : coalesce(var.backup_alerts.collector_host_id, var.backup_alerts.host_id)
+  backup_filter_suffix = var.backup_alerts == null ? "" : (
+    var.backup_alerts.collector_host_id == null
+    ? " AND metric.labels.host_id = \"${var.backup_alerts.host_id}\""
+    : " AND (metric.labels.host_id = \"${var.backup_alerts.host_id}\" OR metric.labels.collector_host_id = \"${var.backup_alerts.collector_host_id}\")"
+  )
+
+  # Monitoring forbids mixing AND and OR within metric.labels restrictions.
+  # Split filters with result/priority constraints into OR-combined conditions;
+  # keep a single union for unconstrained metrics so percentile reduction is unchanged.
+  backup_host_filters = var.backup_alerts == null ? [] : concat(
+    [" AND metric.labels.host_id = \"${var.backup_alerts.host_id}\""],
+    var.backup_alerts.collector_host_id == null ? [] : [" AND metric.labels.collector_host_id = \"${var.backup_alerts.collector_host_id}\""]
+  )
 
   backup_alert_conditions = var.backup_alerts == null ? {} : merge({
     upload_failures = {
@@ -32,7 +45,7 @@ locals {
       aligner       = "ALIGN_RATE"
       duration      = "1800s"
       documentation = <<-EOT
-        Backup upload attempts on ${var.backup_alerts.host_id} have been failing at more than ${var.backup_alerts.upload_failures_per_hour}/hour for 30 minutes. The journal retries with capped backoff, so sustained failures mean the bucket, credentials, or network path is broken and the backlog is growing.
+        Backup upload attempts on ${local.backup_host_label} have been failing at more than ${var.backup_alerts.upload_failures_per_hour}/hour for 30 minutes. The journal retries with capped backoff, so sustained failures mean the bucket, credentials, or network path is broken and the backlog is growing.
 
         Owner: Infrastructure Operations. Response: check vmd backup logs on the host for the failing generation and error, verify bucket IAM and connectivity, and confirm backup_journal_pending drains after the fix.
       EOT
@@ -57,7 +70,7 @@ locals {
       aligner       = "ALIGN_MAX"
       duration      = var.backup_alerts.oldest_pending_age_duration
       documentation = <<-EOT
-        The oldest queued backup generation on ${var.backup_alerts.host_id} has been waiting more than ${var.backup_alerts.oldest_pending_age_seconds}s. Queued pauses are not yet durable in the bucket, so this is direct restore-point exposure.
+        The oldest queued backup generation on ${local.backup_host_label} has been waiting more than ${var.backup_alerts.oldest_pending_age_seconds}s. Queued pauses are not yet durable in the bucket, so this is direct restore-point exposure.
 
         Owner: Infrastructure Operations. Response: check whether the uploader is failing (backup_upload_total{result="failed"}), bandwidth-capped behind a large template upload, or wedged; drain must resume before the local staging tier fills.
       EOT
@@ -83,7 +96,7 @@ locals {
       reducer       = "REDUCE_PERCENTILE_99"
       duration      = "1800s"
       documentation = <<-EOT
-        The p99 of the synchronous backup hook on the pause RPC path on ${var.backup_alerts.host_id} exceeded ${var.backup_alerts.pause_hook_p99_seconds}s for 30 minutes. This latency is paid by every pause the control plane issues.
+        The p99 of the synchronous backup hook on the pause RPC path on ${local.backup_host_label} exceeded ${var.backup_alerts.pause_hook_p99_seconds}s for 30 minutes. This latency is paid by every pause the control plane issues.
 
         Owner: Infrastructure Operations. Response: compare backup_stage_duration_seconds and backup_pause_hook_duration_seconds to find the regressing stage, and check recent vmd deploys for work added to the pause path; size-dependent hashing belongs on the detached worker, never on the RPC path.
       EOT
@@ -105,7 +118,7 @@ locals {
       aligner       = "ALIGN_MIN"
       duration      = var.backup_alerts.outbox_stalled_duration
       documentation = <<-EOT
-        Completed backup generations on ${var.backup_alerts.host_id} have had undelivered completion notifications for the whole alert window. Downstream coverage bookkeeping and staging cleanup key on these signals.
+        Completed backup generations on ${local.backup_host_label} have had undelivered completion notifications for the whole alert window. Downstream coverage bookkeeping and staging cleanup key on these signals.
 
         Owner: Infrastructure Operations. Response: check vmd logs for "backup notification" failures (outbox read or clear errors point at the journal DB; callback errors point at the write-back consumer) and confirm backup_outbox_pending returns to zero.
       EOT
@@ -125,7 +138,7 @@ locals {
         aligner       = "ALIGN_MAX"
         duration      = "1800s"
         documentation = <<-EOT
-          ${var.backup_alerts.host_id} is running with the backup pipeline disabled (backup_enabled=0, meaning BACKUP_BUCKET is unset). Every pause on this host is currently without a durable copy.
+          ${local.backup_host_label} is running with the backup pipeline disabled (backup_enabled=0, meaning BACKUP_BUCKET is unset). Every pause on this host is currently without a durable copy.
 
           Owner: Infrastructure Operations. Response: restore BACKUP_BUCKET in the host's vmd environment and restart vmd; the pending-marker sweep re-enqueues pauses that were owed a backup while disabled.
         EOT
@@ -143,21 +156,25 @@ resource "google_monitoring_alert_policy" "backup" {
   enabled               = true
   notification_channels = var.notification_channel_ids
 
-  conditions {
-    display_name = each.value.display_name
+  dynamic "conditions" {
+    for_each = each.value.extra_filter == "" ? [local.backup_filter_suffix] : local.backup_host_filters
+    content {
+      display_name = conditions.key == 0 ? each.value.display_name : "${each.value.display_name} / collector identity"
 
-    condition_threshold {
-      filter          = "metric.type = \"${each.value.metric_type}\" AND resource.type = \"prometheus_target\"${each.value.extra_filter}${local.backup_filter_suffix}"
-      comparison      = each.value.comparison
-      threshold_value = each.value.threshold
-      duration        = each.value.duration
-      aggregations {
-        alignment_period     = "60s"
-        per_series_aligner   = each.value.aligner
-        cross_series_reducer = try(each.value.reducer, null)
-      }
-      trigger {
-        count = 1
+      condition_threshold {
+        filter          = "metric.type = \"${each.value.metric_type}\" AND resource.type = \"prometheus_target\"${each.value.extra_filter}${conditions.value}"
+        comparison      = each.value.comparison
+        threshold_value = each.value.threshold
+        duration        = each.value.duration
+        aggregations {
+          alignment_period     = "60s"
+          per_series_aligner   = each.value.aligner
+          cross_series_reducer = try(each.value.reducer, null)
+          group_by_fields      = try(each.value.reducer, null) == null ? null : ["metric.label.host_id"]
+        }
+        trigger {
+          count = 1
+        }
       }
     }
   }

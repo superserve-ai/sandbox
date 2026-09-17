@@ -295,7 +295,39 @@ func run() error {
 	// Launch the timeout reaper. This goroutine destroys sandboxes whose
 	// `timeout_seconds` hard cap has elapsed, regardless of state. Scoped
 	// to ctx so it exits on shutdown.
-	handlers.StartTimeoutReaper(ctx, api.DefaultReaperConfig())
+	reaperCfg := api.DefaultReaperConfig()
+	// Both bound how much the reaper pauses per tick; the defaults suit
+	// steady-state expirations, and an operator raises them for a planned
+	// wave (a whole host's worth of sandboxes brought back to paused). The
+	// ceilings keep one tick from turning into a fleet-sized query; a value
+	// outside them is ignored, not clamped, so a typo changes nothing.
+	if v := os.Getenv("REAPER_BATCH_SIZE"); v != "" {
+		if n, perr := strconv.ParseInt(v, 10, 32); perr == nil && n > 0 && n <= 2000 {
+			reaperCfg.BatchSize = int32(n)
+		} else {
+			log.Warn().Str("value", v).Msg("REAPER_BATCH_SIZE ignored; want 1..2000")
+		}
+	}
+	if v := os.Getenv("REAPER_PARALLELISM"); v != "" {
+		if n, perr := strconv.ParseInt(v, 10, 32); perr == nil && n > 0 && n <= 200 {
+			reaperCfg.Parallelism = int(n)
+		} else {
+			log.Warn().Str("value", v).Msg("REAPER_PARALLELISM ignored; want 1..200")
+		}
+	}
+	handlers.StartTimeoutReaper(ctx, reaperCfg)
+	handlers.StartPauseReconciler(ctx)
+	// How long a delete spends reclaiming the host side before it answers;
+	// the sweeper finishes anything that did not fit. Bounded so a value
+	// cannot turn deletes into long waits.
+	if v := os.Getenv("TEARDOWN_INLINE_BUDGET"); v != "" {
+		if d, perr := time.ParseDuration(v); perr == nil && d >= time.Second && d <= 30*time.Second {
+			handlers.TeardownInlineBudget = d
+		} else {
+			log.Warn().Str("value", v).Msg("TEARDOWN_INLINE_BUDGET ignored; want 1s..30s")
+		}
+	}
+	handlers.StartTeardownSweeper(ctx)
 
 	// Launch the template build supervisor. Drives template_build rows
 	// through pending → building → snapshotting → ready/failed by calling

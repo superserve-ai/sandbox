@@ -63,6 +63,13 @@ processors:
         action: delete
       - key: error
         action: delete
+  # Stable deployment identity for alert selection. Keep the sender's host_id
+  # intact: it identifies the registered host incarnation's full database ID.
+  attributes/collector_host_id:
+    actions:
+      - key: collector_host_id
+        value: ${env:HOST_ID}
+        action: upsert
   # Host-level series carry the same bounded host_id label the vmd backup
   # metrics use, so alert policies scope one cell's host the same way for
   # both. HOST_ID is written into collector.env by the deploy path and
@@ -99,7 +106,7 @@ service:
   pipelines:
     metrics:
       receivers: [otlp, prometheus/self]
-      processors: [memory_limiter, resourcedetection/gcp, resource/gmp_location, attributes/drop_internal_high_cardinality, batch]
+      processors: [memory_limiter, resourcedetection/gcp, resource/gmp_location, attributes/drop_internal_high_cardinality, attributes/collector_host_id, batch]
       exporters: [googlemanagedprometheus]
     # Separate pipeline so host_id is only stamped onto host-level series;
     # OTLP senders (control plane, vmd) already set their own host_id.

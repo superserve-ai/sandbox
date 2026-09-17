@@ -28,6 +28,7 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
       API_BASE_URL: https://usw-api.superserve.ai
       API_KEY: ${{ secrets.SS_TEST_API_KEY_USW }}
       SANDBOX_BASE_URL: https://usw-sandbox.superserve.ai
@@ -65,6 +66,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
           terraform apply -input=false -auto-approve tfplan
 
       - name: Smoke test production/us-west2

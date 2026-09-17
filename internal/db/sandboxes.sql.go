@@ -107,12 +107,21 @@ func (q *Queries) AdvanceSandboxPreviewPolicy(ctx context.Context, sandboxID uui
 const beginPause = `-- name: BeginPause :one
 WITH paused AS (
   UPDATE sandbox
-  SET status = 'pausing', updated_at = now()
-  WHERE sandbox.id = $1
-    AND sandbox.team_id = $2
+  SET status = 'pausing', updated_at = now(),
+      -- The pause's identity and the caller's lease on it, which keeps the
+      -- reconciler off the row until the caller has given up.
+      pause_op_id = $1,
+      pause_op_started_at = now(),
+      pause_op_lease_until = now() + make_interval(secs => $2::int),
+      pause_op_lease_version = pause_op_lease_version + 1,
+      pause_op_attention_at = NULL,
+      pause_op_trigger = 'pause',
+      pause_op_actor_id = $3::uuid
+  WHERE sandbox.id = $4
+    AND sandbox.team_id = $5
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id
 ),
 closed_interval AS (
   UPDATE sandbox_active_interval
@@ -128,14 +137,17 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path, p.disk_mib, p.auto_delete_seconds, p.auto_delete_at, p.failed_at, p.had_secret_bindings, p.secret_env_fingerprint, p.secret_env_ip, p.secret_env_injected_at, p.secret_env_expires_at
+SELECT p.id, p.team_id, p.name, p.status, p.vcpu_count, p.memory_mib, p.host_id, p.ip_address, p.pid, p.snapshot_id, p.created_at, p.updated_at, p.destroyed_at, p.network_config, p.timeout_seconds, p.metadata, p.template_id, p.snapshot_path, p.mem_path, p.base_path, p.delta_path, p.disk_mib, p.auto_delete_seconds, p.auto_delete_at, p.failed_at, p.had_secret_bindings, p.secret_env_fingerprint, p.secret_env_ip, p.secret_env_injected_at, p.secret_env_expires_at, p.pause_op_id, p.pause_op_started_at, p.pause_op_lease_until, p.pause_op_lease_version, p.pause_op_attention_at, p.pause_op_trigger, p.pause_op_actor_id
 FROM paused p
 LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id
 `
 
 type BeginPauseParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
+	PauseOpID    pgtype.UUID `json:"pause_op_id"`
+	LeaseSeconds int32       `json:"lease_seconds"`
+	ActorID      pgtype.UUID `json:"actor_id"`
+	ID           uuid.UUID   `json:"id"`
+	TeamID       uuid.UUID   `json:"team_id"`
 }
 
 type BeginPauseRow struct {
@@ -169,6 +181,13 @@ type BeginPauseRow struct {
 	SecretEnvIp          *string            `json:"secret_env_ip"`
 	SecretEnvInjectedAt  pgtype.Timestamptz `json:"secret_env_injected_at"`
 	SecretEnvExpiresAt   pgtype.Timestamptz `json:"secret_env_expires_at"`
+	PauseOpID            pgtype.UUID        `json:"pause_op_id"`
+	PauseOpStartedAt     pgtype.Timestamptz `json:"pause_op_started_at"`
+	PauseOpLeaseUntil    pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpLeaseVersion  int64              `json:"pause_op_lease_version"`
+	PauseOpAttentionAt   pgtype.Timestamptz `json:"pause_op_attention_at"`
+	PauseOpTrigger       *string            `json:"pause_op_trigger"`
+	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
 }
 
 // Atomic ownership + state check + transition to 'pausing' AND close of any
@@ -182,7 +201,13 @@ type BeginPauseRow struct {
 // currently active", and the caller disambiguates via a fallback
 // GetSandbox in the rare error path.
 func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPauseRow, error) {
-	row := q.db.QueryRow(ctx, beginPause, arg.ID, arg.TeamID)
+	row := q.db.QueryRow(ctx, beginPause,
+		arg.PauseOpID,
+		arg.LeaseSeconds,
+		arg.ActorID,
+		arg.ID,
+		arg.TeamID,
+	)
 	var i BeginPauseRow
 	err := row.Scan(
 		&i.ID,
@@ -215,6 +240,13 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPa
 		&i.SecretEnvIp,
 		&i.SecretEnvInjectedAt,
 		&i.SecretEnvExpiresAt,
+		&i.PauseOpID,
+		&i.PauseOpStartedAt,
+		&i.PauseOpLeaseUntil,
+		&i.PauseOpLeaseVersion,
+		&i.PauseOpAttentionAt,
+		&i.PauseOpTrigger,
+		&i.PauseOpActorID,
 	)
 	return i, err
 }
@@ -223,7 +255,7 @@ const beginResume = `-- name: BeginResume :one
 UPDATE sandbox
 SET status = 'resuming', auto_delete_at = NULL, updated_at = now()
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL AND status = 'paused'
-RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at
+RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id
 `
 
 type BeginResumeParams struct {
@@ -269,6 +301,13 @@ func (q *Queries) BeginResume(ctx context.Context, arg BeginResumeParams) (Sandb
 		&i.SecretEnvIp,
 		&i.SecretEnvInjectedAt,
 		&i.SecretEnvExpiresAt,
+		&i.PauseOpID,
+		&i.PauseOpStartedAt,
+		&i.PauseOpLeaseUntil,
+		&i.PauseOpLeaseVersion,
+		&i.PauseOpAttentionAt,
+		&i.PauseOpTrigger,
+		&i.PauseOpActorID,
 	)
 	return i, err
 }
@@ -299,6 +338,13 @@ revoked AS (
   SELECT id, $2 FROM destroyed WHERE had_secret_bindings IS NOT FALSE
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
+owed AS (
+  -- No inline attempt here: born at zero so the sweeper's first claim is attempt 1.
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until, attempts)
+  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => $3::int), 0
+  FROM destroyed
+  ON CONFLICT (sandbox_id) DO NOTHING
+),
 closed_compute AS (
   UPDATE sandbox_active_interval
   SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
@@ -327,6 +373,7 @@ FROM destroyed d
 type ClaimAutoDeleteSandboxesParams struct {
 	BatchSize           int32     `json:"batch_size"`
 	RevocationExpiresAt time.Time `json:"revocation_expires_at"`
+	LeaseSeconds        int32     `json:"lease_seconds"`
 }
 
 type ClaimAutoDeleteSandboxesRow struct {
@@ -350,7 +397,7 @@ type ClaimAutoDeleteSandboxesRow struct {
 // after the claim can't strand a deleted sandbox with a live JWT or an open
 // interval. Returns the columns the caller needs for VM/artifact teardown.
 func (q *Queries) ClaimAutoDeleteSandboxes(ctx context.Context, arg ClaimAutoDeleteSandboxesParams) ([]ClaimAutoDeleteSandboxesRow, error) {
-	rows, err := q.db.Query(ctx, claimAutoDeleteSandboxes, arg.BatchSize, arg.RevocationExpiresAt)
+	rows, err := q.db.Query(ctx, claimAutoDeleteSandboxes, arg.BatchSize, arg.RevocationExpiresAt, arg.LeaseSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -376,23 +423,30 @@ func (q *Queries) ClaimAutoDeleteSandboxes(ctx context.Context, arg ClaimAutoDel
 	return items, nil
 }
 
-const claimBillingIneligibleSandboxes = `-- name: ClaimBillingIneligibleSandboxes :many
+const claimBillingIneligibleSandbox = `-- name: ClaimBillingIneligibleSandbox :one
 WITH candidates AS (
   SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
   FROM sandbox s
-  WHERE s.team_id = $1
+  WHERE s.id = $1::uuid
+    AND s.team_id = $2::uuid
     AND s.destroyed_at IS NULL
     AND s.status = 'active'
     AND NOT team_sandbox_billing_eligible(s.team_id)
-  ORDER BY s.created_at ASC
-  LIMIT $2
   FOR UPDATE OF s SKIP LOCKED
 ), paused AS (
   UPDATE sandbox
-  SET status = 'pausing', updated_at = now()
+  SET status = 'pausing', updated_at = now(),
+      pause_op_id = gen_random_uuid(),
+      pause_op_started_at = now(),
+      pause_op_lease_until = now() + make_interval(secs => $3::int),
+      pause_op_lease_version = sandbox.pause_op_lease_version + 1,
+      pause_op_attention_at = NULL,
+      pause_op_trigger = 'billing_ineligible',
+      pause_op_actor_id = NULL
   FROM candidates
   WHERE sandbox.id = candidates.id
-  RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config
+  RETURNING candidates.id, candidates.team_id, candidates.name, candidates.snapshot_id, candidates.host_id, sandbox.network_config,
+            sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until
 ), closed_intervals AS (
   UPDATE sandbox_active_interval
   SET ended_at = GREATEST(now(), started_at), end_reason = 'paused'
@@ -406,82 +460,85 @@ WITH candidates AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config,
+       p.pause_op_id, p.pause_op_lease_version, p.pause_op_lease_until
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
 `
 
-type ClaimBillingIneligibleSandboxesParams struct {
-	TeamID uuid.UUID `json:"team_id"`
-	Limit  int32     `json:"limit"`
+type ClaimBillingIneligibleSandboxParams struct {
+	ID           uuid.UUID `json:"id"`
+	TeamID       uuid.UUID `json:"team_id"`
+	LeaseSeconds int32     `json:"lease_seconds"`
 }
 
-type ClaimBillingIneligibleSandboxesRow struct {
-	ID            uuid.UUID   `json:"id"`
-	TeamID        uuid.UUID   `json:"team_id"`
-	Name          string      `json:"name"`
-	SnapshotID    pgtype.UUID `json:"snapshot_id"`
-	HostID        string      `json:"host_id"`
-	NetworkConfig []byte      `json:"network_config"`
+type ClaimBillingIneligibleSandboxRow struct {
+	ID                  uuid.UUID          `json:"id"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	Name                string             `json:"name"`
+	SnapshotID          pgtype.UUID        `json:"snapshot_id"`
+	HostID              string             `json:"host_id"`
+	NetworkConfig       []byte             `json:"network_config"`
+	PauseOpID           pgtype.UUID        `json:"pause_op_id"`
+	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
+	PauseOpLeaseUntil   pgtype.Timestamptz `json:"pause_op_lease_until"`
 }
 
-// Atomically claims active sandboxes for a team whose billing eligibility was
-// lost. The bounded batch and SKIP LOCKED make this safe to retry and keep
-// webhook reconciliation off the request's critical path.
-func (q *Queries) ClaimBillingIneligibleSandboxes(ctx context.Context, arg ClaimBillingIneligibleSandboxesParams) ([]ClaimBillingIneligibleSandboxesRow, error) {
-	rows, err := q.db.Query(ctx, claimBillingIneligibleSandboxes, arg.TeamID, arg.Limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ClaimBillingIneligibleSandboxesRow{}
-	for rows.Next() {
-		var i ClaimBillingIneligibleSandboxesRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.SnapshotID,
-			&i.HostID,
-			&i.NetworkConfig,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+// Claims one listed candidate under FOR UPDATE SKIP LOCKED, re-checking
+// eligibility; no rows means another replica has it or it no longer applies.
+func (q *Queries) ClaimBillingIneligibleSandbox(ctx context.Context, arg ClaimBillingIneligibleSandboxParams) (ClaimBillingIneligibleSandboxRow, error) {
+	row := q.db.QueryRow(ctx, claimBillingIneligibleSandbox, arg.ID, arg.TeamID, arg.LeaseSeconds)
+	var i ClaimBillingIneligibleSandboxRow
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.SnapshotID,
+		&i.HostID,
+		&i.NetworkConfig,
+		&i.PauseOpID,
+		&i.PauseOpLeaseVersion,
+		&i.PauseOpLeaseUntil,
+	)
+	return i, err
 }
 
-const claimExpiredSandboxes = `-- name: ClaimExpiredSandboxes :many
-WITH open_sessions AS (
-  -- Current session start per sandbox: the open interval, computed once.
-  SELECT sandbox_id, max(started_at) AS session_start
-  FROM sandbox_active_interval
-  WHERE ended_at IS NULL
-  GROUP BY sandbox_id
+const claimExpiredSandbox = `-- name: ClaimExpiredSandbox :one
+WITH open_session AS (
+  SELECT max(i.started_at) AS session_start
+  FROM sandbox_active_interval i
+  WHERE i.sandbox_id = $1::uuid AND i.ended_at IS NULL
 ),
 expired AS (
-  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id
-  FROM sandbox s
-  LEFT JOIN open_sessions os ON os.sandbox_id = s.id
-  WHERE s.destroyed_at IS NULL
+  SELECT s.id, s.team_id, s.name, s.snapshot_id, s.host_id, s.status
+  FROM sandbox s, open_session os
+  WHERE s.id = $1::uuid
+    AND s.destroyed_at IS NULL
     AND s.timeout_seconds IS NOT NULL
-    AND s.status = 'active'
+    AND s.status IN ('active', 'migrating')
     AND COALESCE(os.session_start, s.created_at) + (s.timeout_seconds || ' seconds')::interval < now()
     AND COALESCE(os.session_start, s.created_at) < now() - interval '60 seconds'
-  ORDER BY s.created_at ASC
-  LIMIT $1
   FOR UPDATE OF s SKIP LOCKED
 ),
 paused AS (
   UPDATE sandbox
-  SET status = 'pausing', updated_at = now()
+  SET status = 'pausing', updated_at = now(),
+      -- Same pause identity and lease as BeginPause; minted here since the
+      -- rows are chosen inside the statement.
+      pause_op_id = gen_random_uuid(),
+      pause_op_started_at = now(),
+      pause_op_lease_until = now() + make_interval(secs => $2::int),
+      pause_op_lease_version = sandbox.pause_op_lease_version + 1,
+      pause_op_attention_at = NULL,
+      -- A migrating row is an operator's boot being put back to paused;
+      -- the trigger remembers that so a failed attempt reverts to
+      -- migrating, never to active.
+      pause_op_trigger = CASE WHEN expired.status = 'migrating' THEN 'migration' ELSE 'timeout' END,
+      pause_op_actor_id = NULL
   FROM expired
   WHERE sandbox.id = expired.id
-  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id, sandbox.network_config
+  RETURNING expired.id, expired.team_id, expired.name, expired.snapshot_id, expired.host_id, sandbox.network_config,
+            sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until
 ),
 closed_intervals AS (
   -- Same atomicity story as BeginPause: bundle the active-interval close
@@ -502,59 +559,179 @@ closed_billing_compute AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config
+SELECT p.id, p.team_id, p.name, p.snapshot_id, p.host_id, p.network_config,
+       p.pause_op_id, p.pause_op_lease_version, p.pause_op_lease_until
 FROM paused p
 LEFT JOIN closed_intervals ci ON ci.sandbox_id = p.id
 `
 
-type ClaimExpiredSandboxesRow struct {
-	ID            uuid.UUID   `json:"id"`
-	TeamID        uuid.UUID   `json:"team_id"`
-	Name          string      `json:"name"`
-	SnapshotID    pgtype.UUID `json:"snapshot_id"`
-	HostID        string      `json:"host_id"`
-	NetworkConfig []byte      `json:"network_config"`
+type ClaimExpiredSandboxParams struct {
+	ID           uuid.UUID `json:"id"`
+	LeaseSeconds int32     `json:"lease_seconds"`
 }
 
-// Atomically claims active sandboxes past their timeout and marks them 'pausing'.
-// FOR UPDATE OF s SKIP LOCKED lets concurrent reaper replicas skip in-flight rows.
-//
-// timeout_seconds bounds an active session, not total lifetime, so the window is
-// anchored on the current session start (the open sandbox_active_interval row,
-// reopened on resume) — each resume re-arms it. Anchoring on created_at would
-// instead keep a sandbox that ever exceeded its timeout permanently eligible.
-//
-// COALESCE falls back to created_at when interval bookkeeping (best-effort) leaves
-// an active sandbox with no open interval; otherwise the NULL comparison would
-// silently exempt it from the timeout.
-//
-// Only 'active' rows are eligible; the 60s grace floor spares freshly started or
-// resumed sandboxes with very short timeouts.
-func (q *Queries) ClaimExpiredSandboxes(ctx context.Context, limit int32) ([]ClaimExpiredSandboxesRow, error) {
-	rows, err := q.db.Query(ctx, claimExpiredSandboxes, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ClaimExpiredSandboxesRow{}
-	for rows.Next() {
-		var i ClaimExpiredSandboxesRow
-		if err := rows.Scan(
-			&i.ID,
-			&i.TeamID,
-			&i.Name,
-			&i.SnapshotID,
-			&i.HostID,
-			&i.NetworkConfig,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+type ClaimExpiredSandboxRow struct {
+	ID                  uuid.UUID          `json:"id"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	Name                string             `json:"name"`
+	SnapshotID          pgtype.UUID        `json:"snapshot_id"`
+	HostID              string             `json:"host_id"`
+	NetworkConfig       []byte             `json:"network_config"`
+	PauseOpID           pgtype.UUID        `json:"pause_op_id"`
+	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
+	PauseOpLeaseUntil   pgtype.Timestamptz `json:"pause_op_lease_until"`
+}
+
+// Claims one listed candidate: its timeout is re-evaluated for this sandbox
+// alone under FOR UPDATE SKIP LOCKED, so a row another replica holds, or one
+// that resumed since the scan, comes back as no rows. Marks it 'pausing' with
+// a fresh pause operation and closes its intervals in the same statement.
+func (q *Queries) ClaimExpiredSandbox(ctx context.Context, arg ClaimExpiredSandboxParams) (ClaimExpiredSandboxRow, error) {
+	row := q.db.QueryRow(ctx, claimExpiredSandbox, arg.ID, arg.LeaseSeconds)
+	var i ClaimExpiredSandboxRow
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.SnapshotID,
+		&i.HostID,
+		&i.NetworkConfig,
+		&i.PauseOpID,
+		&i.PauseOpLeaseVersion,
+		&i.PauseOpLeaseUntil,
+	)
+	return i, err
+}
+
+const claimNextTeardown = `-- name: ClaimNextTeardown :one
+WITH candidate AS (
+  SELECT t.sandbox_id, t.host_id, t.attempts + 1 AS attempt
+  FROM sandbox_teardown t
+  WHERE t.sandbox_id IN (
+    -- One row per host, so racing workers lock rows of different hosts
+    -- rather than piling onto the oldest host and losing its lease.
+    SELECT DISTINCT ON (host_id) sandbox_id
+    FROM sandbox_teardown
+    WHERE lease_until <= now()
+      AND retry_at <= now()
+      AND NOT EXISTS (
+        SELECT 1 FROM sandbox_teardown_host h
+        WHERE h.host_id = sandbox_teardown.host_id AND h.lease_until > now()
+      )
+    ORDER BY host_id, created_at
+  )
+    AND t.lease_until <= now()
+    AND t.retry_at <= now()
+  ORDER BY t.created_at
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+),
+host_lease AS (
+  INSERT INTO sandbox_teardown_host (host_id, sandbox_id, attempt, lease_until)
+  SELECT host_id, sandbox_id, attempt, now() + make_interval(secs => $1::int)
+  FROM candidate
+  ON CONFLICT (host_id) DO UPDATE
+    SET sandbox_id = EXCLUDED.sandbox_id, attempt = EXCLUDED.attempt, lease_until = EXCLUDED.lease_until
+    WHERE sandbox_teardown_host.lease_until <= now()
+  RETURNING host_id
+)
+UPDATE sandbox_teardown t
+SET lease_until = now() + make_interval(secs => $1::int),
+    attempts = c.attempt
+FROM candidate c
+JOIN host_lease h ON h.host_id = c.host_id
+WHERE t.sandbox_id = c.sandbox_id
+RETURNING t.sandbox_id, t.host_id, t.base_path, t.template_id, t.attempts
+`
+
+type ClaimNextTeardownRow struct {
+	SandboxID  uuid.UUID   `json:"sandbox_id"`
+	HostID     string      `json:"host_id"`
+	BasePath   *string     `json:"base_path"`
+	TemplateID pgtype.UUID `json:"template_id"`
+	Attempts   int32       `json:"attempts"`
+}
+
+// The sweeper's claim: the oldest reclaim nobody owns whose backoff has
+// passed, on a host no sweeper is working, taking the host's lease in the
+// same statement. Two claims racing for one host serialize on its row in
+// sandbox_teardown_host; the one that finds the lease already taken claims
+// nothing. So a host that does not answer occupies one worker fleet-wide.
+func (q *Queries) ClaimNextTeardown(ctx context.Context, leaseSeconds int32) (ClaimNextTeardownRow, error) {
+	row := q.db.QueryRow(ctx, claimNextTeardown, leaseSeconds)
+	var i ClaimNextTeardownRow
+	err := row.Scan(
+		&i.SandboxID,
+		&i.HostID,
+		&i.BasePath,
+		&i.TemplateID,
+		&i.Attempts,
+	)
+	return i, err
+}
+
+const claimPendingPause = `-- name: ClaimPendingPause :one
+WITH due AS (
+  SELECT s.id FROM sandbox s
+  WHERE s.id = $2::uuid
+    AND s.status = 'pausing' AND s.destroyed_at IS NULL
+    AND s.pause_op_id IS NOT NULL
+    AND (s.pause_op_lease_until < now()
+         OR (s.pause_op_lease_until IS NULL
+             AND s.pause_op_started_at < now() - make_interval(secs => $3::int)))
+  FOR UPDATE OF s SKIP LOCKED
+)
+UPDATE sandbox
+SET pause_op_lease_until = now() + make_interval(secs => $1::int),
+    pause_op_lease_version = sandbox.pause_op_lease_version + 1
+FROM due
+WHERE sandbox.id = due.id
+RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.host_id,
+          sandbox.pause_op_id, sandbox.pause_op_lease_version, sandbox.pause_op_lease_until,
+          sandbox.pause_op_started_at, sandbox.pause_op_attention_at, sandbox.pause_op_trigger,
+          sandbox.pause_op_actor_id
+`
+
+type ClaimPendingPauseParams struct {
+	LeaseSeconds  int32     `json:"lease_seconds"`
+	ID            uuid.UUID `json:"id"`
+	MinAgeSeconds int32     `json:"min_age_seconds"`
+}
+
+type ClaimPendingPauseRow struct {
+	ID                  uuid.UUID          `json:"id"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	Name                string             `json:"name"`
+	HostID              string             `json:"host_id"`
+	PauseOpID           pgtype.UUID        `json:"pause_op_id"`
+	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
+	PauseOpLeaseUntil   pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpStartedAt    pgtype.Timestamptz `json:"pause_op_started_at"`
+	PauseOpAttentionAt  pgtype.Timestamptz `json:"pause_op_attention_at"`
+	PauseOpTrigger      *string            `json:"pause_op_trigger"`
+	PauseOpActorID      pgtype.UUID        `json:"pause_op_actor_id"`
+}
+
+// Leases one listed pause, re-checked under FOR UPDATE SKIP LOCKED. Only
+// the lease moves; updated_at is left alone so a renewal never reads as
+// activity.
+func (q *Queries) ClaimPendingPause(ctx context.Context, arg ClaimPendingPauseParams) (ClaimPendingPauseRow, error) {
+	row := q.db.QueryRow(ctx, claimPendingPause, arg.LeaseSeconds, arg.ID, arg.MinAgeSeconds)
+	var i ClaimPendingPauseRow
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.HostID,
+		&i.PauseOpID,
+		&i.PauseOpLeaseVersion,
+		&i.PauseOpLeaseUntil,
+		&i.PauseOpStartedAt,
+		&i.PauseOpAttentionAt,
+		&i.PauseOpTrigger,
+		&i.PauseOpActorID,
+	)
+	return i, err
 }
 
 const claimResume = `-- name: ClaimResume :one
@@ -592,7 +769,7 @@ FROM (
 ) x
 WHERE sandbox.id = lk.id AND sandbox.id = x.id
   AND sandbox.destroyed_at IS NULL AND sandbox.status = 'paused'
-RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcpu_count, sandbox.memory_mib, sandbox.host_id, sandbox.ip_address, sandbox.pid, sandbox.snapshot_id, sandbox.created_at, sandbox.updated_at, sandbox.destroyed_at, sandbox.network_config, sandbox.timeout_seconds, sandbox.metadata, sandbox.template_id, sandbox.snapshot_path, sandbox.mem_path, sandbox.base_path, sandbox.delta_path, sandbox.disk_mib, sandbox.auto_delete_seconds, sandbox.auto_delete_at, sandbox.failed_at, sandbox.had_secret_bindings, sandbox.secret_env_fingerprint, sandbox.secret_env_ip, sandbox.secret_env_injected_at, sandbox.secret_env_expires_at,
+RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcpu_count, sandbox.memory_mib, sandbox.host_id, sandbox.ip_address, sandbox.pid, sandbox.snapshot_id, sandbox.created_at, sandbox.updated_at, sandbox.destroyed_at, sandbox.network_config, sandbox.timeout_seconds, sandbox.metadata, sandbox.template_id, sandbox.snapshot_path, sandbox.mem_path, sandbox.base_path, sandbox.delta_path, sandbox.disk_mib, sandbox.auto_delete_seconds, sandbox.auto_delete_at, sandbox.failed_at, sandbox.had_secret_bindings, sandbox.secret_env_fingerprint, sandbox.secret_env_ip, sandbox.secret_env_injected_at, sandbox.secret_env_expires_at, sandbox.pause_op_id, sandbox.pause_op_started_at, sandbox.pause_op_lease_until, sandbox.pause_op_lease_version, sandbox.pause_op_attention_at, sandbox.pause_op_trigger, sandbox.pause_op_actor_id,
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
@@ -665,6 +842,13 @@ func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (Claim
 		&i.Sandbox.SecretEnvIp,
 		&i.Sandbox.SecretEnvInjectedAt,
 		&i.Sandbox.SecretEnvExpiresAt,
+		&i.Sandbox.PauseOpID,
+		&i.Sandbox.PauseOpStartedAt,
+		&i.Sandbox.PauseOpLeaseUntil,
+		&i.Sandbox.PauseOpLeaseVersion,
+		&i.Sandbox.PauseOpAttentionAt,
+		&i.Sandbox.PauseOpTrigger,
+		&i.Sandbox.PauseOpActorID,
 		&i.SnapPath,
 		&i.SnapMemPath,
 		&i.SnapCreatedAt,
@@ -677,6 +861,26 @@ func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (Claim
 		&i.TemplateBasePath,
 	)
 	return i, err
+}
+
+const completeTeardown = `-- name: CompleteTeardown :execrows
+DELETE FROM sandbox_teardown
+WHERE sandbox_id = $1 AND attempts = $2
+`
+
+type CompleteTeardownParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Attempts  int32     `json:"attempts"`
+}
+
+// Fenced on the attempt: a worker whose lease ran out cannot remove a
+// reclaim a newer attempt is still working on.
+func (q *Queries) CompleteTeardown(ctx context.Context, arg CompleteTeardownParams) (int64, error) {
+	result, err := q.db.Exec(ctx, completeTeardown, arg.SandboxID, arg.Attempts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const countActiveSandboxesAtBasePath = `-- name: CountActiveSandboxesAtBasePath :one
@@ -728,13 +932,13 @@ const createSandbox = `-- name: CreateSandbox :one
 WITH ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, false)
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $19::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -791,6 +995,13 @@ type CreateSandboxRow struct {
 	SecretEnvIp          *string            `json:"secret_env_ip"`
 	SecretEnvInjectedAt  pgtype.Timestamptz `json:"secret_env_injected_at"`
 	SecretEnvExpiresAt   pgtype.Timestamptz `json:"secret_env_expires_at"`
+	PauseOpID            pgtype.UUID        `json:"pause_op_id"`
+	PauseOpStartedAt     pgtype.Timestamptz `json:"pause_op_started_at"`
+	PauseOpLeaseUntil    pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpLeaseVersion  int64              `json:"pause_op_lease_version"`
+	PauseOpAttentionAt   pgtype.Timestamptz `json:"pause_op_attention_at"`
+	PauseOpTrigger       *string            `json:"pause_op_trigger"`
+	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
 }
 
 // ID is supplied by the caller (generated in Go via uuid.New()) rather
@@ -857,6 +1068,13 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (C
 		&i.SecretEnvIp,
 		&i.SecretEnvInjectedAt,
 		&i.SecretEnvExpiresAt,
+		&i.PauseOpID,
+		&i.PauseOpStartedAt,
+		&i.PauseOpLeaseUntil,
+		&i.PauseOpLeaseVersion,
+		&i.PauseOpAttentionAt,
+		&i.PauseOpTrigger,
+		&i.PauseOpActorID,
 	)
 	return i, err
 }
@@ -871,13 +1089,13 @@ WITH tpl AS (
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
   SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, tpl_id, $16, $17, $18, $19, disk_mib, $20, false FROM tpl
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $21::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -936,6 +1154,13 @@ type CreateSandboxFromTemplateRow struct {
 	SecretEnvIp          *string            `json:"secret_env_ip"`
 	SecretEnvInjectedAt  pgtype.Timestamptz `json:"secret_env_injected_at"`
 	SecretEnvExpiresAt   pgtype.Timestamptz `json:"secret_env_expires_at"`
+	PauseOpID            pgtype.UUID        `json:"pause_op_id"`
+	PauseOpStartedAt     pgtype.Timestamptz `json:"pause_op_started_at"`
+	PauseOpLeaseUntil    pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpLeaseVersion  int64              `json:"pause_op_lease_version"`
+	PauseOpAttentionAt   pgtype.Timestamptz `json:"pause_op_attention_at"`
+	PauseOpTrigger       *string            `json:"pause_op_trigger"`
+	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
 }
 
 // CreateSandbox variant that holds FOR KEY SHARE on the template row
@@ -998,6 +1223,13 @@ func (q *Queries) CreateSandboxFromTemplate(ctx context.Context, arg CreateSandb
 		&i.SecretEnvIp,
 		&i.SecretEnvInjectedAt,
 		&i.SecretEnvExpiresAt,
+		&i.PauseOpID,
+		&i.PauseOpStartedAt,
+		&i.PauseOpLeaseUntil,
+		&i.PauseOpLeaseVersion,
+		&i.PauseOpAttentionAt,
+		&i.PauseOpTrigger,
+		&i.PauseOpActorID,
 	)
 	return i, err
 }
@@ -1012,7 +1244,7 @@ WITH tpl AS (
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, had_secret_bindings)
   SELECT $4, $2, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, tpl_id, $15, $16, $17, $18, disk_mib, $19, true FROM tpl
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $20::text, 0 FROM ins
@@ -1022,7 +1254,7 @@ WITH tpl AS (
   SELECT ins.id, ($21::uuid[])[i], ($22::text[])[i], ($23::text[])[i]
   FROM ins, generate_subscripts($21::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
@@ -1084,6 +1316,13 @@ type CreateSandboxFromTemplateWithSecretsRow struct {
 	SecretEnvIp          *string            `json:"secret_env_ip"`
 	SecretEnvInjectedAt  pgtype.Timestamptz `json:"secret_env_injected_at"`
 	SecretEnvExpiresAt   pgtype.Timestamptz `json:"secret_env_expires_at"`
+	PauseOpID            pgtype.UUID        `json:"pause_op_id"`
+	PauseOpStartedAt     pgtype.Timestamptz `json:"pause_op_started_at"`
+	PauseOpLeaseUntil    pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpLeaseVersion  int64              `json:"pause_op_lease_version"`
+	PauseOpAttentionAt   pgtype.Timestamptz `json:"pause_op_attention_at"`
+	PauseOpTrigger       *string            `json:"pause_op_trigger"`
+	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
 }
 
 // CreateSandboxFromTemplate plus secret bindings in one statement (see
@@ -1148,6 +1387,13 @@ func (q *Queries) CreateSandboxFromTemplateWithSecrets(ctx context.Context, arg 
 		&i.SecretEnvIp,
 		&i.SecretEnvInjectedAt,
 		&i.SecretEnvExpiresAt,
+		&i.PauseOpID,
+		&i.PauseOpStartedAt,
+		&i.PauseOpLeaseUntil,
+		&i.PauseOpLeaseVersion,
+		&i.PauseOpAttentionAt,
+		&i.PauseOpTrigger,
+		&i.PauseOpActorID,
 	)
 	return i, err
 }
@@ -1156,7 +1402,7 @@ const createSandboxWithSecrets = `-- name: CreateSandboxWithSecrets :one
 WITH ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, auto_delete_seconds, had_secret_bindings)
   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, true)
-  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
   SELECT ins.id, $19::text, 0 FROM ins
@@ -1166,7 +1412,7 @@ WITH ins AS (
   SELECT ins.id, ($20::uuid[])[i], ($21::text[])[i], ($22::text[])[i]
   FROM ins, generate_subscripts($20::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at FROM ins
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 `
 
@@ -1226,6 +1472,13 @@ type CreateSandboxWithSecretsRow struct {
 	SecretEnvIp          *string            `json:"secret_env_ip"`
 	SecretEnvInjectedAt  pgtype.Timestamptz `json:"secret_env_injected_at"`
 	SecretEnvExpiresAt   pgtype.Timestamptz `json:"secret_env_expires_at"`
+	PauseOpID            pgtype.UUID        `json:"pause_op_id"`
+	PauseOpStartedAt     pgtype.Timestamptz `json:"pause_op_started_at"`
+	PauseOpLeaseUntil    pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpLeaseVersion  int64              `json:"pause_op_lease_version"`
+	PauseOpAttentionAt   pgtype.Timestamptz `json:"pause_op_attention_at"`
+	PauseOpTrigger       *string            `json:"pause_op_trigger"`
+	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
 }
 
 // CreateSandbox plus its strict preview policy and secret bindings in ONE
@@ -1290,8 +1543,73 @@ func (q *Queries) CreateSandboxWithSecrets(ctx context.Context, arg CreateSandbo
 		&i.SecretEnvIp,
 		&i.SecretEnvInjectedAt,
 		&i.SecretEnvExpiresAt,
+		&i.PauseOpID,
+		&i.PauseOpStartedAt,
+		&i.PauseOpLeaseUntil,
+		&i.PauseOpLeaseVersion,
+		&i.PauseOpAttentionAt,
+		&i.PauseOpTrigger,
+		&i.PauseOpActorID,
 	)
 	return i, err
+}
+
+const deferHostTeardowns = `-- name: DeferHostTeardowns :execrows
+UPDATE sandbox_teardown
+SET retry_at = GREATEST(retry_at, now() + make_interval(secs => $1::int)),
+    last_error = $2
+WHERE host_id = $3 AND lease_until <= now()
+`
+
+type DeferHostTeardownsParams struct {
+	RetryAfterSeconds int32   `json:"retry_after_seconds"`
+	LastError         *string `json:"last_error"`
+	HostID            string  `json:"host_id"`
+}
+
+// The host did not answer: hold every reclaim on it that nobody is working
+// on, so the sweeper does not try them one by one. Reclaims in flight are
+// left to their workers, and a reclaim already waiting longer keeps its
+// own backoff.
+func (q *Queries) DeferHostTeardowns(ctx context.Context, arg DeferHostTeardownsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferHostTeardowns, arg.RetryAfterSeconds, arg.LastError, arg.HostID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deferTeardown = `-- name: DeferTeardown :execrows
+UPDATE sandbox_teardown
+SET lease_until = now(),
+    retry_at = now() + make_interval(secs => $1::int),
+    permanent = $2,
+    last_error = $3
+WHERE sandbox_id = $4 AND attempts = $5
+`
+
+type DeferTeardownParams struct {
+	RetryAfterSeconds int32     `json:"retry_after_seconds"`
+	Permanent         bool      `json:"permanent"`
+	LastError         *string   `json:"last_error"`
+	SandboxID         uuid.UUID `json:"sandbox_id"`
+	Attempts          int32     `json:"attempts"`
+}
+
+// The attempt did not finish: release the lease, hold the reclaim for the
+// backoff, keep why. Fenced on the attempt like CompleteTeardown.
+func (q *Queries) DeferTeardown(ctx context.Context, arg DeferTeardownParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferTeardown,
+		arg.RetryAfterSeconds,
+		arg.Permanent,
+		arg.LastError,
+		arg.SandboxID,
+		arg.Attempts,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const destroySandbox = `-- name: DestroySandbox :one
@@ -1302,10 +1620,10 @@ WITH destroyed AS (
     AND sandbox.destroyed_at IS NULL
     AND (
       sandbox.status IN ('active', 'paused', 'failed')
-      OR (sandbox.status IN ('starting', 'resuming', 'pausing')
+      OR (sandbox.status IN ('starting', 'resuming', 'pausing', 'migrating')
           AND sandbox.updated_at < $3)
     )
-  RETURNING id, had_secret_bindings
+  RETURNING id, had_secret_bindings, host_id, base_path, template_id
 ),
 revoked AS (
   -- Only sandboxes that ever had a binding: the proxy consults this set only
@@ -1314,6 +1632,15 @@ revoked AS (
   -- revoke.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
   SELECT id, $4 FROM destroyed WHERE had_secret_bindings IS NOT FALSE
+  ON CONFLICT (sandbox_id) DO NOTHING
+),
+owed AS (
+  -- The host-side reclaim is recorded with the delete, so neither a slow
+  -- host nor a control-plane restart can lose it (see sandbox_teardown).
+  -- Owned by the caller for its inline attempt; the sweeper takes it after.
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until)
+  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => $5::int)
+  FROM destroyed
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -1337,7 +1664,7 @@ closed_storage AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT id FROM destroyed
+SELECT id, host_id, base_path, template_id FROM destroyed
 `
 
 type DestroySandboxParams struct {
@@ -1345,10 +1672,18 @@ type DestroySandboxParams struct {
 	TeamID                  uuid.UUID `json:"team_id"`
 	StaleTransitionalBefore time.Time `json:"stale_transitional_before"`
 	RevocationExpiresAt     time.Time `json:"revocation_expires_at"`
+	LeaseSeconds            int32     `json:"lease_seconds"`
+}
+
+type DestroySandboxRow struct {
+	ID         uuid.UUID   `json:"id"`
+	HostID     string      `json:"host_id"`
+	BasePath   *string     `json:"base_path"`
+	TemplateID pgtype.UUID `json:"template_id"`
 }
 
 // Atomic, guarded soft-delete. Claims the sandbox from a quiescent state
-// (active/paused/failed) or from a transitional state (starting/resuming/pausing)
+// (active/paused/failed) or from a transitional state (starting/resuming/pausing/migrating)
 // whose owning worker is provably gone — updated_at older than
 // stale_transitional_before. It never claims a live transition, so it serializes
 // against a concurrent resume/pause (this CAS and BeginResume target the same row,
@@ -1360,16 +1695,22 @@ type DestroySandboxParams struct {
 //
 // The revocation + interval-close CTEs are mirrored in ClaimAutoDeleteSandboxes;
 // keep the side effects of both in sync.
-func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) (uuid.UUID, error) {
+func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) (DestroySandboxRow, error) {
 	row := q.db.QueryRow(ctx, destroySandbox,
 		arg.ID,
 		arg.TeamID,
 		arg.StaleTransitionalBefore,
 		arg.RevocationExpiresAt,
+		arg.LeaseSeconds,
 	)
-	var id uuid.UUID
-	err := row.Scan(&id)
-	return id, err
+	var i DestroySandboxRow
+	err := row.Scan(
+		&i.ID,
+		&i.HostID,
+		&i.BasePath,
+		&i.TemplateID,
+	)
+	return i, err
 }
 
 const ensureSandboxPreviewPolicy = `-- name: EnsureSandboxPreviewPolicy :exec
@@ -1401,12 +1742,18 @@ WITH target AS (
   SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
+    -- Fenced to the named operation's current lease; a reclaimed or stale
+    -- worker matches nothing. Callers without an operation keep the broad guard.
+    AND ($3::uuid IS NULL
+         OR (status = 'pausing'
+             AND pause_op_id = $3::uuid
+             AND pause_op_lease_version = $4::bigint))
   FOR UPDATE
 ),
 upserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, pause_token)
-  SELECT target.id, target.team_id, $3, $4, $5, $6,
-         NULLIF($7::text, '') FROM target
+  SELECT target.id, target.team_id, $5, $6, $7, $8,
+         NULLIF($9::text, '') FROM target
   ON CONFLICT (sandbox_id)
   DO UPDATE SET
     path = EXCLUDED.path,
@@ -1432,12 +1779,12 @@ upserted AS (
   RETURNING snapshot.id AS snap_id
 ),
 fresh AS (
-  SELECT unnest($8::text[]) AS file_name,
-         unnest($9::text[])      AS path,
-         unnest($10::bigint[])    AS size_bytes,
-         unnest($11::bigint[]) AS allocated_bytes,
-         unnest($12::text[])    AS sha256,
-         unnest($13::text[]) AS base_path
+  SELECT unnest($10::text[]) AS file_name,
+         unnest($11::text[])      AS path,
+         unnest($12::bigint[])    AS size_bytes,
+         unnest($13::bigint[]) AS allocated_bytes,
+         unnest($14::text[])    AS sha256,
+         unnest($15::text[]) AS base_path
 ),
 kept AS (
   INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256, base_path)
@@ -1472,27 +1819,38 @@ SET snapshot_id = (SELECT snap_id FROM upserted),
     -- make_interval(NULL) propagates NULL, so an unset auto_delete_seconds
     -- leaves the deadline NULL (never deleted).
     auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
-    updated_at = now()
+    updated_at = now(),
+    -- The operation is complete: clear it so nothing can claim this row
+    -- under its identity later. Its token lives on with the snapshot.
+    pause_op_id = NULL, pause_op_started_at = NULL,
+    pause_op_lease_until = NULL, pause_op_attention_at = NULL,
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
 FROM upserted
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
+  AND ($3::uuid IS NULL
+       OR (sandbox.status = 'pausing'
+           AND sandbox.pause_op_id = $3::uuid
+           AND sandbox.pause_op_lease_version = $4::bigint))
 RETURNING upserted.snap_id::uuid AS snapshot_id
 `
 
 type FinalizePauseParams struct {
-	ID                     uuid.UUID `json:"id"`
-	TeamID                 uuid.UUID `json:"team_id"`
-	Path                   string    `json:"path"`
-	MemPath                *string   `json:"mem_path"`
-	SizeBytes              int64     `json:"size_bytes"`
-	Trigger                string    `json:"trigger"`
-	PauseToken             string    `json:"pause_token"`
-	ManifestFileNames      []string  `json:"manifest_file_names"`
-	ManifestPaths          []string  `json:"manifest_paths"`
-	ManifestSizes          []int64   `json:"manifest_sizes"`
-	ManifestAllocatedBytes []int64   `json:"manifest_allocated_bytes"`
-	ManifestDigests        []string  `json:"manifest_digests"`
-	ManifestBasePaths      []string  `json:"manifest_base_paths"`
+	ID                     uuid.UUID   `json:"id"`
+	TeamID                 uuid.UUID   `json:"team_id"`
+	PauseOpID              pgtype.UUID `json:"pause_op_id"`
+	PauseOpLeaseVersion    *int64      `json:"pause_op_lease_version"`
+	Path                   string      `json:"path"`
+	MemPath                *string     `json:"mem_path"`
+	SizeBytes              int64       `json:"size_bytes"`
+	Trigger                string      `json:"trigger"`
+	PauseToken             string      `json:"pause_token"`
+	ManifestFileNames      []string    `json:"manifest_file_names"`
+	ManifestPaths          []string    `json:"manifest_paths"`
+	ManifestSizes          []int64     `json:"manifest_sizes"`
+	ManifestAllocatedBytes []int64     `json:"manifest_allocated_bytes"`
+	ManifestDigests        []string    `json:"manifest_digests"`
+	ManifestBasePaths      []string    `json:"manifest_base_paths"`
 }
 
 // Upsert the sandbox's live snapshot row and flip status to 'paused'.
@@ -1514,6 +1872,8 @@ func (q *Queries) FinalizePause(ctx context.Context, arg FinalizePauseParams) (u
 	row := q.db.QueryRow(ctx, finalizePause,
 		arg.ID,
 		arg.TeamID,
+		arg.PauseOpID,
+		arg.PauseOpLeaseVersion,
 		arg.Path,
 		arg.MemPath,
 		arg.SizeBytes,
@@ -1542,33 +1902,39 @@ WITH target AS (
   SELECT id, team_id FROM sandbox
   WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
     AND status IN ('pausing', 'resuming')
+    -- Fenced to the named operation's current lease; a reclaimed or stale
+    -- worker matches nothing. Callers without an operation keep the broad guard.
+    AND ($3::uuid IS NULL
+         OR (status = 'pausing'
+             AND pause_op_id = $3::uuid
+             AND pause_op_lease_version = $4::bigint))
   FOR UPDATE
 ),
 inserted AS (
   INSERT INTO snapshot (sandbox_id, team_id, path, mem_path, size_bytes, trigger, generation, pause_token)
-  SELECT target.id, target.team_id, $3, $4,
+  SELECT target.id, target.team_id, $5, $6,
          -- A non-positive total means the manifest was partial (hash budget
          -- exhausted or a file failed to hash): carry the prior head's
          -- known size forward as the best available estimate, mirroring
          -- the legacy upsert's keep-prior semantics. The incomplete
          -- manifest itself is surfaced by coverage monitoring.
-         CASE WHEN $5 > 0 THEN $5
+         CASE WHEN $7 > 0 THEN $7
               ELSE COALESCE((SELECT s.size_bytes FROM snapshot s
                              WHERE s.sandbox_id = target.id
                              ORDER BY s.generation DESC LIMIT 1), 0) END,
-         $6,
+         $8,
          COALESCE((SELECT max(s.generation) FROM snapshot s WHERE s.sandbox_id = target.id), 0) + 1,
-         NULLIF($7::text, '')
+         NULLIF($9::text, '')
   FROM target
   RETURNING snapshot.id AS snap_id
 ),
 fresh AS (
-  SELECT unnest($8::text[]) AS file_name,
-         unnest($9::text[])      AS path,
-         unnest($10::bigint[])    AS size_bytes,
-         unnest($11::bigint[]) AS allocated_bytes,
-         unnest($12::text[])    AS sha256,
-         unnest($13::text[]) AS base_path
+  SELECT unnest($10::text[]) AS file_name,
+         unnest($11::text[])      AS path,
+         unnest($12::bigint[])    AS size_bytes,
+         unnest($13::bigint[]) AS allocated_bytes,
+         unnest($14::text[])    AS sha256,
+         unnest($15::text[]) AS base_path
 ),
 manifested AS (
   INSERT INTO artifact_manifest (snapshot_id, file_name, path, size_bytes, allocated_bytes, sha256, base_path)
@@ -1588,16 +1954,27 @@ UPDATE sandbox
 SET snapshot_id = (SELECT snap_id FROM inserted),
     status = 'paused',
     auto_delete_at = now() + make_interval(secs => sandbox.auto_delete_seconds),
-    updated_at = now()
+    updated_at = now(),
+    -- The operation is complete: clear it so nothing can claim this row
+    -- under its identity later. Its token lives on with the snapshot.
+    pause_op_id = NULL, pause_op_started_at = NULL,
+    pause_op_lease_until = NULL, pause_op_attention_at = NULL,
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
 FROM inserted
 WHERE sandbox.id = $1 AND sandbox.team_id = $2 AND sandbox.destroyed_at IS NULL
   AND sandbox.status IN ('pausing', 'resuming')
+  AND ($3::uuid IS NULL
+       OR (sandbox.status = 'pausing'
+           AND sandbox.pause_op_id = $3::uuid
+           AND sandbox.pause_op_lease_version = $4::bigint))
 RETURNING inserted.snap_id::uuid AS snapshot_id
 `
 
 type FinalizePauseGenerationParams struct {
 	ID                     uuid.UUID   `json:"id"`
 	TeamID                 uuid.UUID   `json:"team_id"`
+	PauseOpID              pgtype.UUID `json:"pause_op_id"`
+	PauseOpLeaseVersion    *int64      `json:"pause_op_lease_version"`
 	Path                   string      `json:"path"`
 	MemPath                *string     `json:"mem_path"`
 	SizeBytes              interface{} `json:"size_bytes"`
@@ -1622,6 +1999,8 @@ func (q *Queries) FinalizePauseGeneration(ctx context.Context, arg FinalizePause
 	row := q.db.QueryRow(ctx, finalizePauseGeneration,
 		arg.ID,
 		arg.TeamID,
+		arg.PauseOpID,
+		arg.PauseOpLeaseVersion,
 		arg.Path,
 		arg.MemPath,
 		arg.SizeBytes,
@@ -1675,7 +2054,7 @@ func (q *Queries) GetPublishedPreviewPort(ctx context.Context, arg GetPublishedP
 }
 
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at FROM sandbox
+SELECT id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
 `
 
@@ -1718,6 +2097,13 @@ func (q *Queries) GetSandbox(ctx context.Context, arg GetSandboxParams) (Sandbox
 		&i.SecretEnvIp,
 		&i.SecretEnvInjectedAt,
 		&i.SecretEnvExpiresAt,
+		&i.PauseOpID,
+		&i.PauseOpStartedAt,
+		&i.PauseOpLeaseUntil,
+		&i.PauseOpLeaseVersion,
+		&i.PauseOpAttentionAt,
+		&i.PauseOpTrigger,
+		&i.PauseOpActorID,
 	)
 	return i, err
 }
@@ -1756,6 +2142,34 @@ func (q *Queries) GetSandboxNetworkConfig(ctx context.Context, arg GetSandboxNet
 	var network_config []byte
 	err := row.Scan(&network_config)
 	return network_config, err
+}
+
+const getSandboxPeerEndpoint = `-- name: GetSandboxPeerEndpoint :one
+SELECT s.host_id, h.vmd_addr, h.proxy_addr, h.incarnation_id, h.peer_generation
+FROM sandbox s LEFT JOIN host h ON h.id = s.host_id AND h.last_heartbeat_at IS NOT NULL
+WHERE s.id = $1 AND s.destroyed_at IS NULL
+`
+
+type GetSandboxPeerEndpointRow struct {
+	HostID         string      `json:"host_id"`
+	VmdAddr        *string     `json:"vmd_addr"`
+	ProxyAddr      *string     `json:"proxy_addr"`
+	IncarnationID  pgtype.UUID `json:"incarnation_id"`
+	PeerGeneration *int64      `json:"peer_generation"`
+}
+
+// A missing owner or unbound host remains distinguishable from a valid route.
+func (q *Queries) GetSandboxPeerEndpoint(ctx context.Context, id uuid.UUID) (GetSandboxPeerEndpointRow, error) {
+	row := q.db.QueryRow(ctx, getSandboxPeerEndpoint, id)
+	var i GetSandboxPeerEndpointRow
+	err := row.Scan(
+		&i.HostID,
+		&i.VmdAddr,
+		&i.ProxyAddr,
+		&i.IncarnationID,
+		&i.PeerGeneration,
+	)
+	return i, err
 }
 
 const getSandboxPreviewPolicy = `-- name: GetSandboxPreviewPolicy :one
@@ -1808,7 +2222,7 @@ func (q *Queries) GetSandboxStatusForPreviewMutation(ctx context.Context, arg Ge
 }
 
 const getSandboxWithPreviewPolicy = `-- name: GetSandboxWithPreviewPolicy :one
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS access
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -1861,6 +2275,13 @@ func (q *Queries) GetSandboxWithPreviewPolicy(ctx context.Context, arg GetSandbo
 		&i.Sandbox.SecretEnvIp,
 		&i.Sandbox.SecretEnvInjectedAt,
 		&i.Sandbox.SecretEnvExpiresAt,
+		&i.Sandbox.PauseOpID,
+		&i.Sandbox.PauseOpStartedAt,
+		&i.Sandbox.PauseOpLeaseUntil,
+		&i.Sandbox.PauseOpLeaseVersion,
+		&i.Sandbox.PauseOpAttentionAt,
+		&i.Sandbox.PauseOpTrigger,
+		&i.Sandbox.PauseOpActorID,
 		&i.Access,
 	)
 	return i, err
@@ -1911,6 +2332,135 @@ func (q *Queries) HasLegacySnapshotUnique(ctx context.Context) (bool, error) {
 	var legacy bool
 	err := row.Scan(&legacy)
 	return legacy, err
+}
+
+const listBillingIneligibleSandboxes = `-- name: ListBillingIneligibleSandboxes :many
+SELECT s.id
+FROM sandbox s
+WHERE s.team_id = $1
+  AND s.destroyed_at IS NULL
+  AND s.status = 'active'
+  AND NOT team_sandbox_billing_eligible(s.team_id)
+ORDER BY s.created_at ASC
+LIMIT $2
+`
+
+type ListBillingIneligibleSandboxesParams struct {
+	TeamID uuid.UUID `json:"team_id"`
+	Limit  int32     `json:"limit"`
+}
+
+// Active sandboxes of a team whose billing eligibility was lost, oldest
+// first, unlocked; ClaimBillingIneligibleSandbox takes them one at a time.
+func (q *Queries) ListBillingIneligibleSandboxes(ctx context.Context, arg ListBillingIneligibleSandboxesParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listBillingIneligibleSandboxes, arg.TeamID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listExpiredSandboxes = `-- name: ListExpiredSandboxes :many
+WITH open_sessions AS (
+  SELECT sandbox_id, max(started_at) AS session_start
+  FROM sandbox_active_interval
+  WHERE ended_at IS NULL
+  GROUP BY sandbox_id
+)
+SELECT s.id
+FROM sandbox s
+LEFT JOIN open_sessions os ON os.sandbox_id = s.id
+WHERE s.destroyed_at IS NULL
+  AND s.timeout_seconds IS NOT NULL
+  AND s.status IN ('active', 'migrating')
+  AND COALESCE(os.session_start, s.created_at) + (s.timeout_seconds || ' seconds')::interval < now()
+  AND COALESCE(os.session_start, s.created_at) < now() - interval '60 seconds'
+ORDER BY s.created_at ASC
+LIMIT $1
+`
+
+// The expired candidates in age order, unlocked and unleased: one scan per
+// tick feeds every worker, and a candidate holds nothing while it waits.
+// ClaimExpiredSandbox re-checks each one under lock at dispatch time.
+//
+// timeout_seconds bounds the current session (its open interval, reopened on
+// resume), falling back to created_at when no interval is open; the 60s grace
+// floor spares freshly started or resumed sandboxes with very short timeouts.
+// 'migrating' rows are an operator's boot on another host that must be
+// paused again without ever being exposed as active; they carry a short
+// timeout for exactly this scan.
+func (q *Queries) ListExpiredSandboxes(ctx context.Context, limit int32) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listExpiredSandboxes, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPendingPauses = `-- name: ListPendingPauses :many
+SELECT id FROM sandbox
+WHERE status = 'pausing' AND destroyed_at IS NULL
+  AND pause_op_id IS NOT NULL
+  AND (pause_op_lease_until < now()
+       OR (pause_op_lease_until IS NULL
+           AND pause_op_started_at < now() - make_interval(secs => $1::int)))
+ORDER BY pause_op_lease_until ASC NULLS FIRST, pause_op_started_at ASC
+LIMIT $2
+`
+
+type ListPendingPausesParams struct {
+	MinAgeSeconds int32 `json:"min_age_seconds"`
+	MaxRows       int32 `json:"max_rows"`
+}
+
+// Pauses whose caller has given up: still 'pausing' with an expired lease.
+// Every holder's attempt ends before its lease does, and a holder that stops
+// early releases the lease, so an expired lease is claimable at once. A row
+// with no lease recorded falls back to an age gate. Longest-eligible first so
+// a row that keeps failing cannot cycle ahead of newer ones. Unlocked; rows
+// without an operation predate this contract and are skipped.
+func (q *Queries) ListPendingPauses(ctx context.Context, arg ListPendingPausesParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listPendingPauses, arg.MinAgeSeconds, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listPinnedBuildPaths = `-- name: ListPinnedBuildPaths :many
@@ -2055,7 +2605,7 @@ func (q *Queries) ListSandboxesByHost(ctx context.Context, hostID string) ([]Lis
 }
 
 const listSandboxesByTeamCreatedAsc = `-- name: ListSandboxesByTeamCreatedAsc :many
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -2131,6 +2681,13 @@ func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSan
 			&i.Sandbox.SecretEnvIp,
 			&i.Sandbox.SecretEnvInjectedAt,
 			&i.Sandbox.SecretEnvExpiresAt,
+			&i.Sandbox.PauseOpID,
+			&i.Sandbox.PauseOpStartedAt,
+			&i.Sandbox.PauseOpLeaseUntil,
+			&i.Sandbox.PauseOpLeaseVersion,
+			&i.Sandbox.PauseOpAttentionAt,
+			&i.Sandbox.PauseOpTrigger,
+			&i.Sandbox.PauseOpActorID,
 			&i.PreviewAccess,
 		); err != nil {
 			return nil, err
@@ -2145,7 +2702,7 @@ func (q *Queries) ListSandboxesByTeamCreatedAsc(ctx context.Context, arg ListSan
 
 const listSandboxesByTeamCreatedDesc = `-- name: ListSandboxesByTeamCreatedDesc :many
 
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -2234,6 +2791,13 @@ func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSa
 			&i.Sandbox.SecretEnvIp,
 			&i.Sandbox.SecretEnvInjectedAt,
 			&i.Sandbox.SecretEnvExpiresAt,
+			&i.Sandbox.PauseOpID,
+			&i.Sandbox.PauseOpStartedAt,
+			&i.Sandbox.PauseOpLeaseUntil,
+			&i.Sandbox.PauseOpLeaseVersion,
+			&i.Sandbox.PauseOpAttentionAt,
+			&i.Sandbox.PauseOpTrigger,
+			&i.Sandbox.PauseOpActorID,
 			&i.PreviewAccess,
 		); err != nil {
 			return nil, err
@@ -2247,7 +2811,7 @@ func (q *Queries) ListSandboxesByTeamCreatedDesc(ctx context.Context, arg ListSa
 }
 
 const listSandboxesByTeamPaged = `-- name: ListSandboxesByTeamPaged :many
-SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at,
+SELECT s.id, s.team_id, s.name, s.status, s.vcpu_count, s.memory_mib, s.host_id, s.ip_address, s.pid, s.snapshot_id, s.created_at, s.updated_at, s.destroyed_at, s.network_config, s.timeout_seconds, s.metadata, s.template_id, s.snapshot_path, s.mem_path, s.base_path, s.delta_path, s.disk_mib, s.auto_delete_seconds, s.auto_delete_at, s.failed_at, s.had_secret_bindings, s.secret_env_fingerprint, s.secret_env_ip, s.secret_env_injected_at, s.secret_env_expires_at, s.pause_op_id, s.pause_op_started_at, s.pause_op_lease_until, s.pause_op_lease_version, s.pause_op_attention_at, s.pause_op_trigger, s.pause_op_actor_id,
   COALESCE(p.default_access, p.access, 'legacy_public')::text AS preview_access
 FROM sandbox s
 LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
@@ -2346,6 +2910,13 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 			&i.Sandbox.SecretEnvIp,
 			&i.Sandbox.SecretEnvInjectedAt,
 			&i.Sandbox.SecretEnvExpiresAt,
+			&i.Sandbox.PauseOpID,
+			&i.Sandbox.PauseOpStartedAt,
+			&i.Sandbox.PauseOpLeaseUntil,
+			&i.Sandbox.PauseOpLeaseVersion,
+			&i.Sandbox.PauseOpAttentionAt,
+			&i.Sandbox.PauseOpTrigger,
+			&i.Sandbox.PauseOpActorID,
 			&i.PreviewAccess,
 		); err != nil {
 			return nil, err
@@ -2361,7 +2932,7 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 const lockSandboxForPreviewMutation = `-- name: LockSandboxForPreviewMutation :one
 SELECT id FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
-FOR UPDATE
+FOR NO KEY UPDATE
 `
 
 type LockSandboxForPreviewMutationParams struct {
@@ -2371,11 +2942,39 @@ type LockSandboxForPreviewMutationParams struct {
 
 // The sandbox row exists for both legacy (no policy row) and strict sandboxes,
 // so it is the stable per-sandbox serialization point across the transition.
+// Allow storage-interval foreign-key checks while a heartbeat holds the host
+// lock: preview validation acquires that host lock after this sandbox lock.
 func (q *Queries) LockSandboxForPreviewMutation(ctx context.Context, arg LockSandboxForPreviewMutationParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, lockSandboxForPreviewMutation, arg.ID, arg.TeamID)
 	var id uuid.UUID
 	err := row.Scan(&id)
 	return id, err
+}
+
+const markPauseAttention = `-- name: MarkPauseAttention :execrows
+UPDATE sandbox
+SET pause_op_attention_at = now()
+WHERE id = $1 AND destroyed_at IS NULL AND status = 'pausing'
+  AND pause_op_id = $2
+  AND pause_op_lease_version = $3
+  AND pause_op_attention_at IS NULL
+`
+
+type MarkPauseAttentionParams struct {
+	ID                  uuid.UUID   `json:"id"`
+	PauseOpID           pgtype.UUID `json:"pause_op_id"`
+	PauseOpLeaseVersion int64       `json:"pause_op_lease_version"`
+}
+
+// Flags a pause pending past its age threshold for an operator, once. The
+// operation itself is left exactly as it is: age is not evidence of the VM's
+// state.
+func (q *Queries) MarkPauseAttention(ctx context.Context, arg MarkPauseAttentionParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markPauseAttention, arg.ID, arg.PauseOpID, arg.PauseOpLeaseVersion)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const markSandboxFailed = `-- name: MarkSandboxFailed :one
@@ -2384,9 +2983,16 @@ WITH failed AS (
   -- auto_delete_at is cleared: the deadline is only meaningful in 'paused',
   -- and a stale one would resurface (or instantly fire) if the sandbox is
   -- ever returned to 'paused' by a recovery path.
-  SET status = 'failed', auto_delete_at = NULL, updated_at = now()
+  SET status = 'failed', auto_delete_at = NULL, updated_at = now(),
+      pause_op_id = NULL, pause_op_started_at = NULL,
+      pause_op_lease_until = NULL, pause_op_attention_at = NULL,
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
   WHERE sandbox.id = $1 AND sandbox.destroyed_at IS NULL
     AND sandbox.status = $2
+    -- A pause worker may only fail the operation it holds the lease on.
+    AND ($3::uuid IS NULL
+         OR (sandbox.pause_op_id = $3::uuid
+             AND sandbox.pause_op_lease_version = $4::bigint))
   RETURNING id
 ),
 closed_active AS (
@@ -2407,8 +3013,10 @@ SELECT count(*) FROM failed
 `
 
 type MarkSandboxFailedParams struct {
-	ID             uuid.UUID     `json:"id"`
-	ObservedStatus SandboxStatus `json:"observed_status"`
+	ID                  uuid.UUID     `json:"id"`
+	ObservedStatus      SandboxStatus `json:"observed_status"`
+	PauseOpID           pgtype.UUID   `json:"pause_op_id"`
+	PauseOpLeaseVersion *int64        `json:"pause_op_lease_version"`
 }
 
 // Used by the reconciler to mark a sandbox failed when VMD detects it is
@@ -2429,7 +3037,12 @@ type MarkSandboxFailedParams struct {
 // once whether or not the primary query reads its output, so selecting from
 // `failed` still performs both closes.
 func (q *Queries) MarkSandboxFailed(ctx context.Context, arg MarkSandboxFailedParams) (int64, error) {
-	row := q.db.QueryRow(ctx, markSandboxFailed, arg.ID, arg.ObservedStatus)
+	row := q.db.QueryRow(ctx, markSandboxFailed,
+		arg.ID,
+		arg.ObservedStatus,
+		arg.PauseOpID,
+		arg.PauseOpLeaseVersion,
+	)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -2534,20 +3147,91 @@ func (q *Queries) RecordSandboxSecretEnv(ctx context.Context, arg RecordSandboxS
 	return err
 }
 
+const releasePauseLease = `-- name: ReleasePauseLease :execrows
+UPDATE sandbox
+SET pause_op_lease_until = now() + make_interval(secs => $1::int)
+WHERE id = $2 AND destroyed_at IS NULL AND status = 'pausing'
+  AND pause_op_id = $3
+  AND pause_op_lease_version = $4
+`
+
+type ReleasePauseLeaseParams struct {
+	RetryAfterSeconds   int32       `json:"retry_after_seconds"`
+	ID                  uuid.UUID   `json:"id"`
+	PauseOpID           pgtype.UUID `json:"pause_op_id"`
+	PauseOpLeaseVersion int64       `json:"pause_op_lease_version"`
+}
+
+// A worker gives its lease back, undecided, and says when the next attempt
+// may start. Fenced on the lease it holds: a reclaimed lease releases
+// nothing.
+func (q *Queries) ReleasePauseLease(ctx context.Context, arg ReleasePauseLeaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releasePauseLease,
+		arg.RetryAfterSeconds,
+		arg.ID,
+		arg.PauseOpID,
+		arg.PauseOpLeaseVersion,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const releaseTeardownHost = `-- name: ReleaseTeardownHost :exec
+UPDATE sandbox_teardown_host
+SET lease_until = now()
+WHERE host_id = $1 AND sandbox_id = $2 AND attempt = $3
+`
+
+type ReleaseTeardownHostParams struct {
+	HostID    string    `json:"host_id"`
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Attempt   int32     `json:"attempt"`
+}
+
+// The sweeper's attempt on this host is over; fenced on the reclaim attempt
+// it was working so a worker whose lease ran out cannot release a newer
+// holder, even one working the same reclaim.
+func (q *Queries) ReleaseTeardownHost(ctx context.Context, arg ReleaseTeardownHostParams) error {
+	_, err := q.db.Exec(ctx, releaseTeardownHost, arg.HostID, arg.SandboxID, arg.Attempt)
+	return err
+}
+
 const revertPauseToActive = `-- name: RevertPauseToActive :one
 WITH reverted AS (
   UPDATE sandbox
-  SET status = 'active', updated_at = now()
+  -- A migration pause goes back to 'migrating': that boot is not the
+  -- owner's session and must not become reachable or billed.
+  SET status = (CASE WHEN sandbox.pause_op_trigger = 'migration' THEN 'migrating' ELSE 'active' END)::sandbox_status,
+      updated_at = now(),
+      -- The pause is over: drop its identity so a result that arrives late
+      -- for it can no longer match this row.
+      pause_op_id = NULL, pause_op_started_at = NULL,
+      pause_op_lease_until = NULL, pause_op_attention_at = NULL,
+      pause_op_trigger = NULL, pause_op_actor_id = NULL
   WHERE sandbox.id = $1
     AND sandbox.team_id = $2
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'pausing'
-  RETURNING id, team_id, vcpu_count, memory_mib
+    AND ($3::uuid IS NULL
+         OR (sandbox.pause_op_id = $3::uuid
+             AND sandbox.pause_op_lease_version = $4::bigint))
+  RETURNING id, team_id, vcpu_count, memory_mib, status
 ),
 opened_active AS (
+  -- The reopened interval keeps the actor of the one the pause closed when
+  -- the revert has none of its own (an automatic pause): actor-level
+  -- activity reporting skips NULL actors.
   INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
-  SELECT r.id, r.team_id, $3, now()
+  SELECT r.id, r.team_id,
+         COALESCE($5::uuid,
+                  (SELECT i.actor_id FROM sandbox_active_interval i
+                   WHERE i.sandbox_id = r.id AND i.ended_at IS NOT NULL
+                   ORDER BY i.ended_at DESC LIMIT 1)),
+         now()
   FROM reverted r
+  WHERE r.status = 'active'
   ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
   RETURNING sandbox_id
 ),
@@ -2565,9 +3249,11 @@ SELECT count(*) FROM reverted
 `
 
 type RevertPauseToActiveParams struct {
-	SandboxID uuid.UUID   `json:"sandbox_id"`
-	TeamID    uuid.UUID   `json:"team_id"`
-	ActorID   pgtype.UUID `json:"actor_id"`
+	SandboxID           uuid.UUID   `json:"sandbox_id"`
+	TeamID              uuid.UUID   `json:"team_id"`
+	PauseOpID           pgtype.UUID `json:"pause_op_id"`
+	PauseOpLeaseVersion *int64      `json:"pause_op_lease_version"`
+	ActorID             pgtype.UUID `json:"actor_id"`
 }
 
 // BeginPause's mirror for the failed-pause compensation path: status back to
@@ -2578,7 +3264,13 @@ type RevertPauseToActiveParams struct {
 // status = 'pausing': if another actor already moved the sandbox on
 // (delete, reaper failover), their transition wins and this returns 0.
 func (q *Queries) RevertPauseToActive(ctx context.Context, arg RevertPauseToActiveParams) (int64, error) {
-	row := q.db.QueryRow(ctx, revertPauseToActive, arg.SandboxID, arg.TeamID, arg.ActorID)
+	row := q.db.QueryRow(ctx, revertPauseToActive,
+		arg.SandboxID,
+		arg.TeamID,
+		arg.PauseOpID,
+		arg.PauseOpLeaseVersion,
+		arg.ActorID,
+	)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -2656,6 +3348,33 @@ func (q *Queries) SandboxExists(ctx context.Context, arg SandboxExistsParams) (b
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const teardownBacklog = `-- name: TeardownBacklog :one
+SELECT count(*)::bigint AS total,
+       count(*) FILTER (WHERE permanent)::bigint AS permanent,
+       count(*) FILTER (WHERE last_error IS NOT NULL AND NOT permanent)::bigint AS retrying,
+       coalesce(extract(epoch FROM now() - min(created_at)), 0)::float8 AS oldest_age_seconds
+FROM sandbox_teardown
+`
+
+type TeardownBacklogRow struct {
+	Total            int64   `json:"total"`
+	Permanent        int64   `json:"permanent"`
+	Retrying         int64   `json:"retrying"`
+	OldestAgeSeconds float64 `json:"oldest_age_seconds"`
+}
+
+func (q *Queries) TeardownBacklog(ctx context.Context) (TeardownBacklogRow, error) {
+	row := q.db.QueryRow(ctx, teardownBacklog)
+	var i TeardownBacklogRow
+	err := row.Scan(
+		&i.Total,
+		&i.Permanent,
+		&i.Retrying,
+		&i.OldestAgeSeconds,
+	)
+	return i, err
 }
 
 const unpublishPort = `-- name: UnpublishPort :execrows
@@ -2812,7 +3531,7 @@ const updateSandboxTimeout = `-- name: UpdateSandboxTimeout :execrows
 UPDATE sandbox
 SET timeout_seconds = $2,
     updated_at = now()
-WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL
+WHERE id = $1 AND team_id = $3 AND destroyed_at IS NULL AND status <> 'migrating'
 `
 
 type UpdateSandboxTimeoutParams struct {
@@ -2825,7 +3544,9 @@ type UpdateSandboxTimeoutParams struct {
 // next tick: the window is evaluated against the current active session
 // start, so lowering it below already-elapsed session time pauses the
 // sandbox on the next sweep. On a paused sandbox it applies to the next
-// active session after resume.
+// active session after resume. Not while migrating: the timeout is the
+// operator's arm on that boot, and the owner's value is put back with the
+// row; the caller reports the conflict and the owner retries in a minute.
 func (q *Queries) UpdateSandboxTimeout(ctx context.Context, arg UpdateSandboxTimeoutParams) (int64, error) {
 	result, err := q.db.Exec(ctx, updateSandboxTimeout, arg.ID, arg.TimeoutSeconds, arg.TeamID)
 	if err != nil {

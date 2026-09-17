@@ -85,9 +85,10 @@ resource "google_compute_global_address" "this" {
 }
 
 resource "google_compute_target_https_proxy" "this" {
-  project = var.project_id
-  name    = var.https_proxy_name
-  url_map = google_compute_url_map.this.id
+  project    = var.project_id
+  name       = var.https_proxy_name
+  url_map    = google_compute_url_map.this.id
+  ssl_policy = var.ssl_policy
   # A target HTTPS proxy stores certificate_map as the versioned Certificate
   # Manager resource URL, not the bare `projects/.../certificateMaps/...` that
   # `.id` returns. Match that exact form so the post-import plan is a no-op.

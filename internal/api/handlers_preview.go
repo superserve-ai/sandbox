@@ -248,7 +248,7 @@ func (h *Handlers) applyPreviewMutationFinalized(ctx context.Context, sandboxID,
 	if h.Pool == nil {
 		return run(h.DB)
 	}
-	tx, err := h.Pool.Begin(ctx)
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return previewPolicySnapshot{}, nil, err
 	}
@@ -279,8 +279,14 @@ func (h *Handlers) applyPreviewMutationValidated(ctx context.Context, sandboxID,
 }
 
 func validateHostPreviewCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
-	ok, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
-		HostID: hostID, RequiredCapabilities: capabilities,
+	started := time.Now()
+	defer func() {
+		RecordLatencyPhases(ctx, "preview_mutation", hostID, map[string]time.Duration{"host_capability_validation": time.Since(started)})
+	}()
+
+	ok, err := q.LockedHostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+		AllowedStatuses: []string{"active"},
+		HostID:          hostID, RequiredCapabilities: capabilities,
 	})
 	if err != nil {
 		return err
@@ -289,6 +295,56 @@ func validateHostPreviewCapabilities(ctx context.Context, q *db.Queries, hostID 
 		return &missingHostPreviewCapabilityError{capability: strings.Join(capabilities, `", "`)}
 	}
 	return nil
+}
+
+// Owner resume preserves lifecycle continuity while placement and mutations
+// retain the active-only capability rule.
+func validateOwnerResumeBrowserCapabilities(ctx context.Context, q *db.Queries, hostID string) error {
+	return validateOwnerResumeCapabilities(ctx, q, hostID, previewBrowserCapabilities()...)
+}
+
+func validateOwnerResumeCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
+	started := time.Now()
+	defer func() {
+		RecordLatencyPhases(ctx, "resume", hostID, map[string]time.Duration{"host_capability_validation": time.Since(started)})
+	}()
+
+	ok, err := q.LockedHostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+		AllowedStatuses: []string{"active", "draining"},
+		HostID:          hostID, RequiredCapabilities: capabilities,
+		HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},
+	})
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return &missingHostPreviewCapabilityError{capability: strings.Join(capabilities, `", "`)}
+	}
+	return nil
+}
+
+func validateOwnerResumePolicyCapabilities(ctx context.Context, q *db.Queries, hostID string, policy previewPolicySnapshot) error {
+	if policy.requiresBrowserCapability() {
+		return validateOwnerResumeBrowserCapabilities(ctx, q, hostID)
+	}
+	if policy.Access != preview.AccessLegacyPublic {
+		return validateOwnerResumeCapabilities(ctx, q, hostID, preview.HostCapabilityPorts)
+	}
+	return nil
+}
+
+func (h *Handlers) requireOwnerResumeCapabilities(c *gin.Context, hostID string, capabilities ...string) bool {
+	hasCapabilities, err := h.hostHasCapabilitiesCachedForScope(c.Request.Context(), hostID, capabilities, ownerResumeCapabilities)
+	if err != nil || hasCapabilities {
+		return h.respondHostCapabilityResult(c, hostID, capabilities, hasCapabilities, err)
+	}
+	// Active-only diagnostics cannot explain the owner-resume eligibility rule.
+	log.Warn().Str("host_id", hostID).Str("sandbox_id", c.Param("sandbox_id")).
+		Strs("required_capabilities", capabilities).Msg("owner resume capability enforcement rejected request")
+	respondErrorMsg(c, "conflict",
+		fmt.Sprintf("The sandbox's host does not enforce all required capabilities (%s); retry after the fleet is upgraded", strings.Join(capabilities, ", ")),
+		http.StatusConflict)
+	return false
 }
 
 func previewBrowserCapabilities() []string {

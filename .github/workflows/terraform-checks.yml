@@ -39,6 +39,26 @@ jobs:
       - name: Validate Terraform roots
         run: scripts/terraform-validate.sh
 
+      - name: Test peer CA custody and IAM with mocked providers
+        run: |
+          terraform -chdir=infra/modules/peer-ca init -backend=false -lockfile=readonly -input=false
+          terraform -chdir=infra/modules/peer-ca test
+
+      - name: Test creation-time managed identity host with mocked provider
+        run: |
+          terraform -chdir=infra/modules/managed-identity-host init -backend=false -input=false
+          terraform -chdir=infra/modules/managed-identity-host test
+
+      - name: Test alert selection across generated host identities
+        run: |
+          terraform -chdir=infra/modules/observability init -backend=false -input=false
+          terraform -chdir=infra/modules/observability test
+
+      - name: Test Cloud IDS triage alerts with mocked provider
+        run: |
+          terraform -chdir=infra/modules/cloud-ids init -backend=false -input=false
+          terraform -chdir=infra/modules/cloud-ids test
+
   terraform-plan-summary:
     name: Terraform Plan Summary
     runs-on: ubuntu-latest

@@ -17,13 +17,14 @@ import (
 type SandboxStatus string
 
 const (
-	SandboxStatusStarting SandboxStatus = "starting"
-	SandboxStatusActive   SandboxStatus = "active"
-	SandboxStatusPausing  SandboxStatus = "pausing"
-	SandboxStatusPaused   SandboxStatus = "paused"
-	SandboxStatusDeleted  SandboxStatus = "deleted"
-	SandboxStatusFailed   SandboxStatus = "failed"
-	SandboxStatusResuming SandboxStatus = "resuming"
+	SandboxStatusStarting  SandboxStatus = "starting"
+	SandboxStatusActive    SandboxStatus = "active"
+	SandboxStatusPausing   SandboxStatus = "pausing"
+	SandboxStatusPaused    SandboxStatus = "paused"
+	SandboxStatusDeleted   SandboxStatus = "deleted"
+	SandboxStatusFailed    SandboxStatus = "failed"
+	SandboxStatusResuming  SandboxStatus = "resuming"
+	SandboxStatusMigrating SandboxStatus = "migrating"
 )
 
 func (e *SandboxStatus) Scan(src interface{}) error {
@@ -421,6 +422,8 @@ type Host struct {
 	CreatedAt         time.Time          `json:"created_at"`
 	UpdatedAt         time.Time          `json:"updated_at"`
 	IdentityBound     bool               `json:"identity_bound"`
+	IncarnationID     pgtype.UUID        `json:"incarnation_id"`
+	PeerGeneration    *int64             `json:"peer_generation"`
 }
 
 // Data-plane capabilities jointly advertised by the currently running host services. heartbeat_at must match host.last_heartbeat_at, so an old control-plane heartbeat automatically invalidates an attestation it cannot replace.
@@ -429,6 +432,11 @@ type HostCapability struct {
 	Capability  string    `json:"capability"`
 	HeartbeatAt time.Time `json:"heartbeat_at"`
 	CreatedAt   time.Time `json:"created_at"`
+}
+
+type HostIdentityRegistry struct {
+	HostID  string `json:"host_id"`
+	Retired bool   `json:"retired"`
 }
 
 type HostPressure struct {
@@ -446,6 +454,18 @@ type HostPressure struct {
 	MaxSandboxes          int32     `json:"max_sandboxes"`
 	UnknownAllocationVms  int32     `json:"unknown_allocation_vms"`
 	ReportedAt            time.Time `json:"reported_at"`
+}
+
+type HostRetiredAddress struct {
+	HostID        string    `json:"host_id"`
+	IncarnationID uuid.UUID `json:"incarnation_id"`
+	VmdAddr       string    `json:"vmd_addr"`
+}
+
+type HostRetiredIncarnation struct {
+	HostID                 string    `json:"host_id"`
+	IncarnationID          uuid.UUID `json:"incarnation_id"`
+	SuccessorIncarnationID uuid.UUID `json:"successor_incarnation_id"`
 }
 
 type NetFlow struct {
@@ -597,6 +617,18 @@ type Sandbox struct {
 	SecretEnvInjectedAt pgtype.Timestamptz `json:"secret_env_injected_at"`
 	// Expiry of the injected proxy JWT; a resume re-injects when it is near.
 	SecretEnvExpiresAt pgtype.Timestamptz `json:"secret_env_expires_at"`
+	// Identity of the pause in flight, reused as the pause token across every attempt; NULL when no pause is pending.
+	PauseOpID        pgtype.UUID        `json:"pause_op_id"`
+	PauseOpStartedAt pgtype.Timestamptz `json:"pause_op_started_at"`
+	// Until when the worker holding pause_op_lease_version may act on the pause; expired or NULL means claimable.
+	PauseOpLeaseUntil   pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpLeaseVersion int64              `json:"pause_op_lease_version"`
+	// When a pause pending past its age threshold was flagged for an operator; set once.
+	PauseOpAttentionAt pgtype.Timestamptz `json:"pause_op_attention_at"`
+	// Why the pause in flight was started (pause, timeout, billing_ineligible); kept so a reconciled pause records its original cause.
+	PauseOpTrigger *string `json:"pause_op_trigger"`
+	// Who asked for the pause in flight; NULL for automatic pauses. Kept so a reconciled pause is attributed to them.
+	PauseOpActorID pgtype.UUID `json:"pause_op_actor_id"`
 }
 
 type SandboxActiveInterval struct {
@@ -676,6 +708,29 @@ type SandboxStorageInterval struct {
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
+}
+
+// Host-side reclaim still owed for a deleted sandbox; removed when the VM and its artifacts are gone.
+type SandboxTeardown struct {
+	SandboxID  uuid.UUID   `json:"sandbox_id"`
+	HostID     string      `json:"host_id"`
+	BasePath   *string     `json:"base_path"`
+	TemplateID pgtype.UUID `json:"template_id"`
+	CreatedAt  time.Time   `json:"created_at"`
+	// Until when the worker on this reclaim owns it; passed means no one is working on it.
+	LeaseUntil time.Time `json:"lease_until"`
+	// Not attempted again before this; the backoff after a failed attempt.
+	RetryAt   time.Time `json:"retry_at"`
+	Attempts  int32     `json:"attempts"`
+	Permanent bool      `json:"permanent"`
+	LastError *string   `json:"last_error"`
+}
+
+type SandboxTeardownHost struct {
+	HostID     string    `json:"host_id"`
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	Attempt    int32     `json:"attempt"`
+	LeaseUntil time.Time `json:"lease_until"`
 }
 
 type Secret struct {

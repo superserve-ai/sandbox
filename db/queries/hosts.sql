@@ -114,18 +114,21 @@ DELETE FROM host_capability hc
 WHERE hc.host_id = sqlc.arg(host_id)
   AND NOT (hc.capability = ANY(COALESCE(sqlc.arg(capabilities)::text[], ARRAY[]::text[])));
 
+-- name: LockHostForCapabilities :execrows
+SELECT id FROM host WHERE id = sqlc.arg('host_id') FOR SHARE;
+
 -- name: HostHasCapabilities :one
--- Lock the one active host row whose heartbeat anchors this capability set.
--- Callers that run this in a mutation transaction keep the host stable until
--- VMD delivery and commit, while the relational division below proves that
--- every requested capability belongs to that exact heartbeat.
+-- Evaluate in a new READ COMMITTED statement after LockHostForCapabilities,
+-- in the same transaction, to avoid mixing pre-wait capability rows with a
+-- post-wait host row. Lifecycle callers use LockedHostHasCapabilities.
 WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
   FROM host
   WHERE id = sqlc.arg('host_id')
-    AND status = 'active'
+    AND status = ANY(sqlc.arg('allowed_statuses')::text[])
     AND last_heartbeat_at IS NOT NULL
-  FOR SHARE
+    AND (sqlc.narg('heartbeat_after')::timestamptz IS NULL
+         OR last_heartbeat_at > sqlc.narg('heartbeat_after'))
 )
 SELECT EXISTS (
   SELECT 1
@@ -147,16 +150,18 @@ SELECT EXISTS (
 -- HostHasCapabilities without the row lock, for standalone pre-flight reads
 -- outside a mutation transaction: omitting the lock keeps concurrent checks
 -- from serializing behind the host's heartbeat writer. Transactional callers
--- that must pin the host across a commit use HostHasCapabilities.
+-- that must pin the host across a commit use LockedHostHasCapabilities.
 --
--- Also returns the host's VMD address (empty when the host is not active),
+-- Also returns the host's VMD address (empty when the host is ineligible),
 -- so the caller can record this read as the registry's address verification.
 WITH target_host AS MATERIALIZED (
   SELECT id, vmd_addr, last_heartbeat_at
   FROM host
   WHERE id = sqlc.arg('host_id')
-    AND status = 'active'
+    AND status = ANY(sqlc.arg('allowed_statuses')::text[])
     AND last_heartbeat_at IS NOT NULL
+    AND (sqlc.narg('heartbeat_after')::timestamptz IS NULL
+         OR last_heartbeat_at > sqlc.narg('heartbeat_after'))
 )
 SELECT
   EXISTS (
@@ -191,6 +196,9 @@ WHERE status = 'active'
 ORDER BY last_heartbeat_at ASC;
 
 -- name: ListActiveHostsByLoad :many
+-- 'migrating' rows (an operator's boots being put back to paused) are not
+-- counted: they are bounded and short-lived, and the partial index behind
+-- this JOIN is keyed to exactly this predicate.
 -- Returns active hosts sorted by current sandbox count (ascending).
 -- The scheduler picks the first row (least loaded host). One query
 -- replaces N per-host lookups.
@@ -219,14 +227,15 @@ ORDER BY COUNT(s.id) ASC;
 -- name: ListHostsAdmin :many
 -- Operator view (hostctl): every host regardless of status, with live
 -- sandbox counts for drain progress. transitional counts pausing/resuming
--- sandboxes whose lifecycle RPC is still using the host — a host is not
--- drained while any exist, even when running and paused both read zero.
+-- sandboxes whose lifecycle RPC is still using the host, and migrating
+-- ones an operator has claimed here — a host is not drained while any
+-- exist, even when running and paused both read zero.
 SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        h.capacity_memory_mib, h.capacity_vcpus,
        h.last_heartbeat_at, h.created_at, h.updated_at,
        COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('active', 'starting')
                                       AND s.destroyed_at IS NULL), 0)::int AS running_count,
-       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('pausing', 'resuming')
+       COALESCE(COUNT(s.id) FILTER (WHERE s.status IN ('pausing', 'resuming', 'migrating')
                                       AND s.destroyed_at IS NULL), 0)::int AS transitional_count,
        COALESCE(COUNT(s.id) FILTER (WHERE s.status = 'paused'
                                       AND s.destroyed_at IS NULL), 0)::int AS paused_count,
@@ -350,6 +359,7 @@ SELECT h.id, @running_sandboxes, @provisioning_sandboxes, @paused_sandboxes,
        now()
 FROM host h
 WHERE h.id = @host_id AND h.vmd_addr = @vmd_addr
+  AND (h.incarnation_id IS NULL OR h.incarnation_id::text = sqlc.arg(incarnation_id)::text)
 -- FOR SHARE serializes the address check against an identity reclaim
 -- (which takes the row FOR UPDATE): without it this statement could
 -- evaluate the old address from its snapshot and insert stale pressure
@@ -443,3 +453,14 @@ WHERE h.status = 'active'
         AND hc.heartbeat_at = h.last_heartbeat_at
     )
   );
+
+-- name: PrepareHostHeartbeat :exec
+SELECT prepare_host_heartbeat(sqlc.arg(host_id)::text, sqlc.arg(incarnation_id)::text);
+
+-- name: BindHostIncarnation :exec
+UPDATE host SET incarnation_id = sqlc.arg(incarnation_id)::uuid
+WHERE id = sqlc.arg(host_id) AND incarnation_id IS NULL;
+
+-- name: RebindHostIncarnation :one
+SELECT rebind_host_incarnation(sqlc.arg(host_id)::text,
+    sqlc.arg(expected_incarnation)::uuid, sqlc.arg(new_incarnation)::uuid)::bigint AS peer_generation;

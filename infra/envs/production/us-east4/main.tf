@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.5.0"
+  required_version = ">= 1.7.0"
 
   backend "gcs" {
     bucket = "superserve-terraform-state-prod"
@@ -47,16 +47,14 @@ locals {
   })
 
   # The host_id that tags vmd's own metrics and scopes the reconciler: its
-  # HOST_ID runtime env, which is ALSO its identity in the host table. The
-  # cell's sole host derives it from the instance name (its deployed HOST_ID),
-  # so DEFAULT_HOST_ID and every alert filter match the live host exactly.
-  #
-  # Verify against the host before changing: grep '^HOST_ID=' /etc/sandbox/vmd.env
-  metrics_host_id = module.sandbox_host_b.instance_name
+  # HOST_ID runtime env, which is ALSO its identity in the host table. It is
+  # the installed host identity, not the instance name; set it from
+  #   grep '^HOST_ID=' /etc/sandbox/host-identity.env
+  metrics_host_id = var.host_c_host_id
 
-  # Control-plane address + alert identity for the cell's host.
-  active_vmd_ip    = module.sandbox_host_b.internal_ip
-  active_host_name = module.sandbox_host_b.instance_name
+  # Control-plane address + alert identity for the cell's serving host.
+  active_vmd_ip    = module.sandbox_host_c.internal_ip
+  active_host_name = module.sandbox_host_c.instance_name
 }
 
 module "network" {
@@ -88,6 +86,19 @@ module "network" {
   vpc_connector_subnet_ip     = var.connector_subnet_cidr
 
   firewall_rules = {
+    peer_ingress = {
+      name          = "superserve-use4-allow-peer-ingress"
+      direction     = "INGRESS"
+      source_ranges = ["10.2.0.4/32"]
+      source_tags   = ["vmd-use4", "vmd-usw2"]
+      target_tags   = ["vmd-use4"]
+      allow = [{
+        protocol = "tcp"
+        ports    = ["5009"]
+      }]
+      description = "Allow private VMD peer ingress within the cell."
+    }
+
     allow_vmd_grpc = {
       name          = "superserve-use4-allow-cr-vmd"
       direction     = "INGRESS"
@@ -118,6 +129,11 @@ module "network" {
 data "google_service_account" "api_runner" {
   project    = local.project_id
   account_id = "superserve-api-runner"
+}
+
+data "google_service_account" "github_actions" {
+  project    = local.project_id
+  account_id = "superserve-github-actions"
 }
 
 # The CD service account needs Certificate Manager access to read/manage the
@@ -259,6 +275,8 @@ module "api" {
 module "api_cert_lb" {
   source = "../../../modules/cloud-run-cert-lb"
 
+  ssl_policy = google_compute_ssl_policy.https.id
+
   project_id        = local.project_id
   region            = local.region
   cloud_run_service = module.api.service_name
@@ -289,83 +307,110 @@ module "cloud_ids" {
   endpoint_name              = "superserve-ids-${local.resource_suffix}"
   mirrored_subnet_self_links = local.cloud_ids_mirrored_subnet_self_links
   notification_channel_ids   = var.notification_channel_ids
+  runbook_base_url           = var.cloud_ids_runbook_base_url
   labels                     = local.common_labels
 }
 
-# The cell's sole sandbox/VMD host. Distinct identity (its HOST_ID is its
-# instance name) carried over from when it was provisioned as the standby.
-# It replaced the original c4 host, whose module was removed after cutover.
-module "sandbox_host_b" {
+# The cell's host.
+locals {
+  host_c_artifact_bucket = module.backup_storage.bucket_name
+  host_c_kernel_object   = "vmlinux-4.14-fuse"
+  # Expected MD5 of each hostprep object, as the object store attests it;
+  # the bootstrap refuses a download that does not match.
+  host_c_kernel_md5 = "e897201a3ba4d45f3f0e5aac78288d92"
+  host_c_rootfs_md5 = "121426943f2dc7c0d6b0227063b1a482"
+  # The release the fleet runs and the digest it verified; the fleet deploy
+  # refuses a host on any other.
+  host_c_firecracker_version = "v1.15.3"
+  host_c_firecracker_sha256  = "a771380d8707a7026949c8ec9dbd2b393893238fe77ab03ba25fb026920079e0"
+
+  # Non-secret vmd.env keys the bootstrap writes once. The deploy upserts
+  # its own keys on top; secrets are appended by an operator.
+  host_c_vmd_env = {
+    HOST_REGION                 = local.region
+    VMD_SCHEDULABLE_MEMORY_MIB  = "1500000"
+    VMD_SCHEDULABLE_VCPUS       = "192"
+    VMD_DNS_REDIRECT_PORT       = "19053"
+    VMD_EGRESS_BLOCKLIST_CONFIG = "/etc/sandbox/egress-blocklist.yaml"
+    SECRETSPROXY_CA_CERT        = "/var/lib/secretsproxy/ca.crt"
+  }
+}
+
+module "sandbox_host_c" {
   source = "../../../modules/sandbox-host"
 
   project_id    = local.project_id
   environment   = local.environment
   region        = local.region
   zone          = local.zone
-  instance_name = "superserve-vmd-${local.resource_suffix}-2"
-  # The z3 replacement for the retired, maintenance-prone c4 host.
-  machine_type = "z3-highmem-192-highlssd-metal"
-  subnet       = module.network.subnetwork_self_link
-  internal_ip  = "10.2.0.3"
-  tags         = ["vmd-use4"]
+  instance_name = "superserve-vmd-${local.resource_suffix}-3"
+  machine_type  = "z3-highmem-192-highlssd-metal"
+  subnet        = module.network.subnetwork_self_link
+  internal_ip   = "10.2.0.4"
+  tags          = ["vmd-use4"]
 
   labels = merge(local.sandbox_host_labels, {
     component                  = "vmd"
     sandbox_role               = "vmd"
-    sandbox_status             = "provisioning"
+    sandbox_status             = "ready"
     "goog-ops-agent-policy"    = "v2-template-1-7-0"
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
 
-  service_account_email = data.google_service_account.api_runner.email
+  service_account_email = google_service_account.vmd_runtime.email
 
-  # 22.04 to match the primary and this cell's snapshot lineage (existing
-  # paused sandboxes and us-central1-seeded snapshots are 22.04-taken); a
-  # host-OS mismatch has been observed to break snapshot restore.
-  boot_disk_image = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
-
-  # Metal machine types reject the API-default pd-standard boot disk.
-  boot_disk_type = var.boot_disk_type
+  boot_disk_image   = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
+  boot_disk_size_gb = 200
+  boot_disk_type    = var.boot_disk_type
 
   can_ip_forward      = false
   on_host_maintenance = "TERMINATE"
+  reservation_name    = var.host_c_reservation_name
 
-  # Targets a z3 reservation (see standby_reservation_name); null uses default
-  # affinity against a matching z3 reservation in the zone.
-  reservation_name = var.standby_reservation_name
+  # The subnet has no NAT, so this address is the host's path to the
+  # internet: first-boot downloads, guest egress, and the guest DNS
+  # forwarder all go through it. Every serving host in the cell carries one.
+  external_ip = true
+
+  # First boot fetches artifacts and writes logs and metrics under the
+  # runtime identity's grants below; create those first so the boot is not
+  # racing them.
+  depends_on = [
+    google_storage_bucket_iam_member.vmd_backup,
+    google_project_iam_member.vmd_telemetry,
+    google_service_account_iam_member.vmd_deploy_act_as,
+  ]
 
   metadata = {
     enable-osconfig = "TRUE"
     enable-oslogin  = "TRUE"
-    startup-script = templatefile("${path.module}/../../../../deploy/unbound/unbound-bootstrap.sh.tftpl", {
-      guest_cidr         = "10.11.0.0/16"
-      local_dns_port     = "19053"
-      dot_hostname       = "j0mqwd9sm7.cloudflare-gateway.com"
-      dot_upstream_addrs = ["162.159.36.5", "162.159.46.5"]
-    })
+    startup-script = join("\n\n", [
+      templatefile("${path.module}/../../../../deploy/host-bootstrap/sandbox-host-bootstrap.sh.tftpl", {
+        localssd_script     = file("${path.module}/../../../../deploy/host-bootstrap/sandbox-localssd.sh")
+        artifact_bucket     = local.host_c_artifact_bucket
+        kernel_object       = local.host_c_kernel_object
+        kernel_md5          = local.host_c_kernel_md5
+        rootfs_object       = "base.ext4"
+        rootfs_md5          = local.host_c_rootfs_md5
+        data_disk_device    = "superserve-sandbox-data"
+        vmd_env             = local.host_c_vmd_env
+        firecracker_version = local.host_c_firecracker_version
+        firecracker_sha256  = local.host_c_firecracker_sha256
+      }),
+      templatefile("${path.module}/../../../../deploy/unbound/unbound-bootstrap.sh.tftpl", {
+        guest_cidr         = "10.11.0.0/16"
+        local_dns_port     = "19053"
+        dot_hostname       = "j0mqwd9sm7.cloudflare-gateway.com"
+        dot_upstream_addrs = ["162.159.36.5", "162.159.46.5"]
+      }),
+    ])
   }
 }
 
-# Background-data disk, separate from the local-SSD array serving live VM
-# disk I/O: pause-backup staging reads every staged file twice before it
-# leaves the host (digest pre-check, then the upload stream), and on this
-# host both reads would otherwise land on the same array as tenant reads.
-# Other background workloads (logs, metrics) are candidates for the same
-# disk later; only backup staging (BACKUP_STAGING_DIR, wired in
-# deploy-vmd.yml) uses it today.
-#
-# Sized for real headroom rather than steady-state drain: this cell's
-# peak pause rate runs on the order of 1.3k generations/hour at ~12MB
-# packed each, so a fully stalled uploader fills roughly 15.6GB/hour.
-# 1024GB absorbs that for ~65 hours (~2.7 days) before the disk itself
-# becomes the constraint. hyperdisk-balanced, not pd-balanced: this is a
-# Z3 metal host, which rejects standard Persistent Disk types the same
-# way it rejects the API-default pd-standard boot disk (see
-# boot_disk_type above).
-resource "google_compute_disk" "sandbox_data" {
+resource "google_compute_disk" "sandbox_data_c" {
   project = local.project_id
-  name    = "superserve-vmd-use4-sandbox-data"
+  name    = "${module.sandbox_host_c.instance_name}-sandbox-data"
   zone    = local.zone
   type    = "hyperdisk-balanced"
   size    = 1024
@@ -380,29 +425,44 @@ resource "google_compute_disk" "sandbox_data" {
   }
 }
 
-# No deletion_policy here (unlike staging's equivalent block, which
-# pins a provider major version new enough to support it): the
-# google_compute_attached_disk resource under this file's pinned
-# provider constraint (~> 6.0, resolving as of this writing to the
-# latest 6.x release) exposes no such argument — confirmed against the
-# provider's own schema, not assumed — so setting it fails
-# terraform validate outright. The disk survives instance
-# deletion/replacement regardless: attaching it through this resource
-# (the API's attachDisk call) rather than as an instance-creation-time
-# disk means GCP does not auto-delete it when the instance goes away,
-# and prevent_destroy above already stops Terraform from deleting the
-# disk resource itself — sufficient on its own to preserve the data.
-# Deliberately NOT prevent_destroy here too: this attachment is keyed
-# on the instance's self link, so the documented host-recreation flow
-# (host-dr-runbook.md) replaces it whenever the instance is rebuilt, and
-# prevent_destroy on the attachment would block that replacement.
-resource "google_compute_attached_disk" "sandbox_data" {
+resource "google_compute_attached_disk" "sandbox_data_c" {
   project     = local.project_id
   zone        = local.zone
-  disk        = google_compute_disk.sandbox_data.id
-  instance    = module.sandbox_host_b.instance_self_link
+  disk        = google_compute_disk.sandbox_data_c.id
+  instance    = module.sandbox_host_c.instance_self_link
   device_name = "superserve-sandbox-data"
   mode        = "READ_WRITE"
+}
+
+# Dedicated runtime identity for the standby: logs and metrics, write-only
+# backup uploads, and the deploy pipeline may attach it to the instance.
+resource "google_service_account" "vmd_runtime" {
+  project      = local.project_id
+  account_id   = "vmd-runtime-production-use4"
+  display_name = "VMD runtime production-use4"
+}
+
+resource "google_project_iam_member" "vmd_telemetry" {
+  for_each = toset(["roles/logging.logWriter", "roles/monitoring.metricWriter"])
+  project  = local.project_id
+  role     = each.value
+  member   = "serviceAccount:${google_service_account.vmd_runtime.email}"
+}
+
+resource "google_service_account_iam_member" "vmd_deploy_act_as" {
+  service_account_id = google_service_account.vmd_runtime.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${data.google_service_account.github_actions.email}"
+}
+
+# The dedicated runtime identity creates and reads backup objects within
+# its cell, never deletes or overwrites: pause uploads, the hostprep
+# artifacts at first boot, and cross-host restores all run under it.
+resource "google_storage_bucket_iam_member" "vmd_backup" {
+  for_each = toset(["roles/storage.objectCreator", "roles/storage.objectViewer"])
+  bucket   = module.backup_storage.bucket_name
+  role     = each.value
+  member   = "serviceAccount:${google_service_account.vmd_runtime.email}"
 }
 
 module "observability" {
@@ -412,21 +472,21 @@ module "observability" {
   environment              = local.environment
   notification_channel_ids = var.notification_channel_ids
   compute_instance_cpu_alerts = {
-    sandbox_host_b = {
-      display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / CPU saturation"
-      instance_name = module.sandbox_host_b.instance_name
-      instance_id   = module.sandbox_host_b.instance_id
+    sandbox_host_c = {
+      display_name  = "Infrastructure / ${module.sandbox_host_c.instance_name} / CPU saturation"
+      instance_name = module.sandbox_host_c.instance_name
+      instance_id   = module.sandbox_host_c.instance_id
     }
   }
-  # Backup pipeline alerts scoped to this cell's host via the host_id
-  # metric label (vmd's HOST_ID — see metrics_host_id, which is not the
-  # instance name on this cell). Module
+  # Scope through the stable collector identity, retaining the legacy host_id
+  # selector until older collectors have rolled forward. Module
   # defaults hold regardless of the cell's traffic: the failure-rate
   # threshold keys on retry pressure (one stuck generation retries ~6
   # times/hour under the capped backoff), not on pause volume.
   backup_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Backup / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Backup / ${local.active_host_name}"
   }
   # Backup coverage: paused sandboxes with no verified backup at all,
   # sampled by the control plane from this cell's database. Created
@@ -456,8 +516,9 @@ module "observability" {
   # they mean "the controller engaged and still lost", not "the controller is
   # doing its job" — move them together with the ceiling or not at all.
   launch_path_alerts = {
-    host_id        = local.metrics_host_id
-    display_prefix = "Launch path / ${local.active_host_name}"
+    collector_host_id = local.active_host_name
+    host_id           = local.metrics_host_id
+    display_prefix    = "Launch path / ${local.active_host_name}"
   }
   # Root-filesystem (OS disk) utilization for the same host, scoped through
   # the same host_id label the backup metrics use. Module defaults: warn at
@@ -469,10 +530,10 @@ module "observability" {
   host_maintenance_event_alerts = {
     # Fires when a maintenance window is scheduled on the host — the exact
     # signal that motivated retiring the maintenance-prone c4.
-    sandbox_host_b = {
-      display_name  = "Infrastructure / ${module.sandbox_host_b.instance_name} / host maintenance event"
-      instance_name = module.sandbox_host_b.instance_name
-      instance_id   = module.sandbox_host_b.instance_id
+    sandbox_host_c = {
+      display_name  = "Infrastructure / ${module.sandbox_host_c.instance_name} / host maintenance event"
+      instance_name = module.sandbox_host_c.instance_name
+      instance_id   = module.sandbox_host_c.instance_id
     }
   }
   labels = local.common_labels
@@ -494,9 +555,7 @@ module "backup_storage" {
 
   restore_service_account_id = "superserve-backup-ro-${local.resource_suffix}"
 
-  writer_members = [
-    "serviceAccount:${data.google_service_account.api_runner.email}",
-  ]
+  writer_members = []
 
   labels = merge(local.common_labels, {
     component                  = "backup"

@@ -9,6 +9,7 @@ resource "google_compute_instance" "this" {
   machine_type              = var.machine_type
   can_ip_forward            = var.can_ip_forward
   allow_stopping_for_update = var.allow_stopping_for_update
+  desired_status            = var.desired_status
   tags                      = var.tags
   labels                    = local.instance_labels
 
@@ -25,6 +26,11 @@ resource "google_compute_instance" "this" {
   network_interface {
     subnetwork = var.subnet
     network_ip = var.internal_ip
+
+    dynamic "access_config" {
+      for_each = var.external_ip ? [1] : []
+      content {}
+    }
   }
 
   # Prepend the host patching policy to whatever startup script the
@@ -35,6 +41,9 @@ resource "google_compute_instance" "this" {
   metadata = merge(
     var.metadata,
     {
+      user-data = "#cloud-config\n${yamlencode(merge(local.host_cloud_config, {
+        bootcmd = concat([local.host_identity_prerequisite], try(local.host_cloud_config.bootcmd, []))
+      }))}"
       startup-script = trimspace(join("\n\n", compact([
         local.host_patching_policy,
         lookup(var.metadata, "startup-script", ""),
@@ -93,6 +102,34 @@ resource "google_compute_instance" "this" {
 }
 
 locals {
+  # Images must already contain the identity-gated units and fencing-aware VMD.
+  # Reassert the gate before caller boot commands; bootcmd can race socket activation.
+  host_cloud_config          = yamldecode(lookup(var.metadata, "user-data", "{}"))
+  host_identity_prerequisite = <<-EOT
+    set -eu
+    # Preserve normal boot activation once installed; VMD validates the identity.
+    if [ ! -s /etc/sandbox/host-identity.json ] || [ ! -s /etc/sandbox/host-identity.env ]; then
+      for unit in superserve-vmd.socket superserve-vmd.service; do
+        if systemctl cat "$unit" >/dev/null 2>&1; then
+          systemctl stop "$unit"
+        fi
+      done
+    fi
+    mkdir -p /etc/systemd/system/superserve-vmd.service.d /etc/systemd/system/superserve-vmd.socket.d
+    cat > /etc/systemd/system/superserve-vmd.socket.d/10-identity-required.conf <<'IDENTITY'
+    [Unit]
+    ConditionPathExists=/etc/sandbox/host-identity.json
+    ConditionPathExists=/etc/sandbox/host-identity.env
+    IDENTITY
+    cat > /etc/systemd/system/superserve-vmd.service.d/10-identity-required.conf <<'IDENTITY'
+    [Service]
+    Environment=HOST_IDENTITY_REQUIRED=1
+    ExecStartPre=/usr/bin/test -s /etc/sandbox/host-identity.json
+    EnvironmentFile=/etc/sandbox/host-identity.env
+    IDENTITY
+    systemctl daemon-reload
+  EOT
+
   # Host patching policy: no automatic OS upgrades, and library-upgrade
   # tooling must never restart the VM or platform units — a restarted
   # firecracker unit is a destroyed customer VM. Mirrors the deploy assets

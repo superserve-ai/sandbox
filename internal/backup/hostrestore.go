@@ -3,8 +3,10 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -479,6 +481,11 @@ type CachingBaseReader struct {
 	Inner BlobReader
 	Dir   string
 	group singleflight.Group
+
+	// cloneable caches canCloneInto's answer per destination filesystem
+	// (st_dev): a fleet restores onto one or two filesystems, so the probe
+	// runs once per filesystem rather than once per base per sandbox.
+	cloneable sync.Map // uint64 -> bool
 }
 
 func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.ReadCloser, error) {
@@ -542,4 +549,205 @@ func (c *CachingBaseReader) NewReader(ctx context.Context, object string) (io.Re
 		return nil, err
 	}
 	return os.Open(cached)
+}
+
+// canCloneInto reports whether a file in c.Dir can be reflinked into dst:
+// the two must share a filesystem that supports cloning, which a probe of
+// the cache directory alone cannot prove. Probed once per destination
+// filesystem with a one-byte file; dst is left with its length unchanged.
+func (c *CachingBaseReader) canCloneInto(dst *os.File) bool {
+	if !cloneSupported {
+		return false
+	}
+	dev, ok := deviceOf(dst)
+	if !ok {
+		return c.probeClone(dst)
+	}
+	if v, hit := c.cloneable.Load(dev); hit {
+		return v.(bool)
+	}
+	// A wave of first requests on one filesystem probes once; the rest
+	// share the answer. Each caller's dst is only touched by its own probe.
+	v, _, _ := c.group.Do(fmt.Sprintf("probe/%d", dev), func() (any, error) {
+		res := c.probeClone(dst)
+		c.cloneable.Store(dev, res)
+		return res, nil
+	})
+	return v.(bool)
+}
+
+func (c *CachingBaseReader) probeClone(dst *os.File) bool {
+	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
+		return false
+	}
+	src, err := os.CreateTemp(c.Dir, ".probe-*")
+	if err != nil {
+		return false
+	}
+	defer os.Remove(src.Name())
+	defer src.Close()
+	if _, err := src.Write([]byte{0}); err != nil {
+		return false
+	}
+	// Clone one byte at offset 0 of dst, then restore dst to empty; dst is
+	// freshly created by the caller, so nothing is lost.
+	if err := cloneRange(dst, src, 0, 1, 0); err != nil {
+		return false
+	}
+	return dst.Truncate(0) == nil
+}
+
+// isHexDigest reports whether s is a lowercase hex sha256 (64 chars).
+func isHexDigest(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// MaterializeBase implements BaseMaterializer. The first request for a
+// digest unpacks the cached object once into a ".candidate-<sha>" sibling
+// of the spool; every request clones that file (or the published
+// ".unpacked-<sha>" master) into dst. Nothing here hashes: the caller
+// verifies every destination anyway, and the returned callback promotes
+// the candidate to a master only after such a verification has passed,
+// so the cache never holds a trusted copy nobody checked and the base is
+// read exactly once per destination. The callback is bound to the very
+// file that was cloned: a candidate replaced or removed in the meantime
+// (a concurrent restore, an interrupted one) is neither published nor
+// discarded on this destination's account. Destinations unpacked
+// directly, and clones of an already published master, return no
+// callback. cloneFile fails on filesystems without reflink, and the
+// fallback is a plain copy, so the result is the same bytes everywhere
+// and only the disk cost differs. Concurrent first requests coalesce.
+func (c *CachingBaseReader) MaterializeBase(ctx context.Context, object string, mf ManifestFile, dst *os.File) (func(bool) error, error) {
+	if !strings.HasPrefix(object, "bases/") {
+		return nil, fmt.Errorf("materialize: %q is not a shared base object", object)
+	}
+	// The digest becomes a path component; a manifest is bucket content,
+	// so it must be exactly a lowercase hex sha256 before it touches the
+	// filesystem, or a crafted entry could steer the master copy outside
+	// the cache.
+	if !isHexDigest(mf.SHA256) {
+		return nil, fmt.Errorf("materialize: manifest digest %q is not a sha256", mf.SHA256)
+	}
+	if !c.canCloneInto(dst) {
+		// Nothing to share with this destination: unpack straight into it,
+		// the same single pass the streaming path always did, and build no
+		// master nobody could clone.
+		rc, err := c.NewReader(ctx, object)
+		if err != nil {
+			return nil, err
+		}
+		defer rc.Close()
+		return nil, unpackExtents(ctx, rc, mf, dst)
+	}
+	master := c.masterPath(mf.SHA256)
+	if src, err := os.Open(master); err == nil {
+		defer src.Close()
+		return nil, cloneFile(dst, src)
+	}
+	// Candidates carry a unique suffix: a name is never reused after a
+	// failed verification removed it, so a callback bound to it can only
+	// ever act on the bytes this destination was cloned from.
+	pattern := filepath.Join(c.Dir, ".candidate-"+mf.SHA256+"-*")
+	v, err, _ := c.group.Do(pattern, func() (any, error) {
+		if _, err := os.Stat(master); err == nil {
+			return master, nil
+		}
+		if existing, _ := filepath.Glob(pattern); len(existing) > 0 {
+			return existing[0], nil
+		}
+		rc, err := c.NewReader(ctx, object)
+		if err != nil {
+			return nil, err
+		}
+		defer rc.Close()
+		tmp, err := os.CreateTemp(c.Dir, ".candidate-"+mf.SHA256+"-*")
+		if err != nil {
+			return nil, err
+		}
+		if err := unpackExtents(ctx, rc, mf, tmp); err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return nil, err
+		}
+		if err := tmp.Sync(); err != nil {
+			tmp.Close()
+			os.Remove(tmp.Name())
+			return nil, err
+		}
+		if err := tmp.Close(); err != nil {
+			os.Remove(tmp.Name())
+			return nil, err
+		}
+		return tmp.Name(), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	candidate := v.(string)
+	src, err := os.Open(candidate)
+	if errors.Is(err, fs.ErrNotExist) && candidate != master {
+		// Published or discarded between the coalesced unpack and this
+		// open; the master is the only remaining verified source.
+		candidate = master
+		src, err = os.Open(master)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer src.Close()
+	if candidate == master {
+		return nil, cloneFile(dst, src)
+	}
+	cloned, err := src.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if err := cloneFile(dst, src); err != nil {
+		return nil, err
+	}
+	return func(verified bool) error { return c.publishCandidate(candidate, master, cloned, verified) }, nil
+}
+
+// publishCandidate promotes the candidate a destination was cloned from
+// to the master every later restore clones from, once that destination
+// passed the restorer's full verification: the two are the same bytes,
+// so the master is verified without a second read. A failed verification
+// discards the candidate so the next request unpacks afresh. The
+// candidate's name is unique to its unpack, and the file is still checked
+// to be the one that was cloned, so a callback can neither publish nor
+// remove another restore's bytes.
+func (c *CachingBaseReader) publishCandidate(candidate, master string, cloned os.FileInfo, verified bool) error {
+	current, err := os.Stat(candidate)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !os.SameFile(cloned, current) {
+		return nil
+	}
+	if !verified {
+		return os.Remove(candidate)
+	}
+	if _, err := os.Stat(master); err == nil {
+		// Another verified restore published first; the bytes are equal.
+		return os.Remove(candidate)
+	}
+	if err := os.Rename(candidate, master); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+func (c *CachingBaseReader) masterPath(sha string) string {
+	return filepath.Join(c.Dir, ".unpacked-"+sha)
 }
