@@ -555,9 +555,7 @@ module "backup_storage" {
 
   restore_service_account_id = "superserve-backup-ro-${local.resource_suffix}"
 
-  writer_members = [
-    "serviceAccount:${data.google_service_account.api_runner.email}",
-  ]
+  writer_members = []
 
   labels = merge(local.common_labels, {
     component                  = "backup"
