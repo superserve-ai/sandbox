@@ -1666,6 +1666,18 @@ func (p *phaseSink) RecordLatencyPhase(_ context.Context, ph telemetry.LatencyPh
 	p.phases = append(p.phases, ph)
 }
 
+// modeOf is the mode the first sample of op/phase carried, or "-" if none.
+func (p *phaseSink) modeOf(op, phase string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, ph := range p.phases {
+		if ph.Op == op && ph.Phase == phase {
+			return ph.Mode
+		}
+	}
+	return "-"
+}
+
 func (p *phaseSink) has(op, phase string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -2657,7 +2669,48 @@ func TestDormantHostAddsNothingToALegacyLifecycle(t *testing.T) {
 		if sink.has("restore", "wake_floor") {
 			t.Fatalf("phases = %+v; a legacy create proved a floor", sink.phases)
 		}
+		if mode := sink.modeOf("restore", "load_snapshot"); mode != "" {
+			t.Fatalf("load_snapshot mode = %q; a legacy restore's phases carry no mode", mode)
+		}
 	})
+}
+
+// A frozen image's restore records its phases under the frozen mode, so the
+// dashboard can put the two kinds of restore side by side.
+func TestFrozenRestoreRecordsItsPhasesAsFrozen(t *testing.T) {
+	useTempFloor(t)
+	origWake := boxdWakeGuest
+	t.Cleanup(func() { boxdWakeGuest = origWake })
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return nil }
+
+	dir := t.TempDir()
+	snapPath, memPath, basePath := filepath.Join(dir, "vm.snap"), filepath.Join(dir, "mem.snap"), filepath.Join(dir, "base.ext4")
+	overlay := filepath.Join(dir, "vm-1", "overlay.ext4")
+	if err := os.MkdirAll(filepath.Dir(overlay), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{snapPath, memPath, basePath, overlay} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedFrozenManifest(t, memPath, "tok")
+	sink := &phaseSink{}
+	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir, GuestClockFreezeEnabled: true}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1), recorder: sink}
+	m.clockRealtimeCapable.Store(true)
+	m.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		return 4321, SupervisionUnit, nil
+	}
+	m.restoreSnapshotHook = func(_, _, _ string, clock *bool) error { return nil }
+	inst, err := m.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath}, nil, "team", "owner", "", nil, 0)
+	if err != nil || inst == nil {
+		t.Fatalf("restore: inst=%v err=%v", inst, err)
+	}
+	for _, phase := range []string{"load_snapshot", "wait_boxd"} {
+		if mode := sink.modeOf("restore", phase); mode != "frozen" {
+			t.Errorf("%s mode = %q, want frozen; phases = %+v", phase, mode, sink.phases)
+		}
+	}
 }
 
 // Recovery of an intent without a token, an unfrozen rewrite the crash

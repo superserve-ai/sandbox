@@ -27,6 +27,21 @@ Env vars:
                        Reconciled, not merely upserted: unset in the
                        workflow removes the line on the next deploy, which
                        is the rollout's documented off switch.
+  VMD_GUEST_CLOCK_FREEZE
+                       optional — "true" has vmd freeze a guest's clock across
+                       the snapshot of an image whose workload was frozen,
+                       and wake it on restore. Reconciled like
+                       BACKUP_BACKFILL: unset in the workflow removes the line
+                       on the next deploy. The second switch to turn on and
+                       the first to turn off; a host turned off still wakes
+                       the frozen images it holds.
+  VMD_TEMPLATE_FREEZE_WORKLOAD
+                       optional — "true" has the builds vmd forks freeze the
+                       guest's workload for the template snapshot. Reconciled
+                       the same way. Only ever set where the vmd binary
+                       carries the wake protocol and the floor is up on every
+                       host (vmd raise-wake-floor): a frozen template owes a
+                       wake, and nothing else gives one.
   BACKUP_JOURNAL_PATH  optional — path for the backup uploader's BoltDB
                        journal. Upserted into vmd.env when set; empty = skip,
                        leaving vmd's default (next to RUN_DIR, i.e. on the
@@ -368,6 +383,8 @@ def main() -> int:
     backup_journal_path = os.environ.get("BACKUP_JOURNAL_PATH", "")
     backup_staging_dir = os.environ.get("BACKUP_STAGING_DIR", "")
     backup_backfill = os.environ.get("BACKUP_BACKFILL", "")
+    guest_clock_freeze = os.environ.get("VMD_GUEST_CLOCK_FREEZE", "")
+    template_freeze = os.environ.get("VMD_TEMPLATE_FREEZE_WORKLOAD", "")
     otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
     control_plane_url = os.environ.get("CONTROL_PLANE_URL", "")
     internal_api_token = os.environ.get("INTERNAL_API_TOKEN", "")
@@ -386,6 +403,10 @@ def main() -> int:
     q_backup_line = shlex.quote(f"BACKUP_BUCKET={backup_bucket}")
     q_backup_backfill = shlex.quote(backup_backfill)
     q_backup_backfill_line = shlex.quote(f"BACKUP_BACKFILL={backup_backfill}")
+    q_guest_clock_freeze = shlex.quote(guest_clock_freeze)
+    q_guest_clock_freeze_line = shlex.quote(f"VMD_GUEST_CLOCK_FREEZE={guest_clock_freeze}")
+    q_template_freeze = shlex.quote(template_freeze)
+    q_template_freeze_line = shlex.quote(f"VMD_TEMPLATE_FREEZE_WORKLOAD={template_freeze}")
     q_backup_workers = shlex.quote(backup_upload_concurrency)
     q_backup_workers_line = shlex.quote(f"BACKUP_UPLOAD_CONCURRENCY={backup_upload_concurrency}")
     q_backup_journal = shlex.quote(backup_journal_path)
@@ -1003,6 +1024,19 @@ def main() -> int:
             sudo sed -i '/^BACKUP_BACKFILL=/d' /etc/sandbox/vmd.env
             if [ -n {q_backup_backfill} ]; then
                 echo {q_backup_backfill_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Reconcile VMD_GUEST_CLOCK_FREEZE the same way: a rollout switch
+            # whose off step is unsetting it in the workflow.
+            sudo sed -i '/^VMD_GUEST_CLOCK_FREEZE=/d' /etc/sandbox/vmd.env
+            if [ -n {q_guest_clock_freeze} ]; then
+                echo {q_guest_clock_freeze_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Reconcile VMD_TEMPLATE_FREEZE_WORKLOAD the same way.
+            sudo sed -i '/^VMD_TEMPLATE_FREEZE_WORKLOAD=/d' /etc/sandbox/vmd.env
+            if [ -n {q_template_freeze} ]; then
+                echo {q_template_freeze_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
             # Reconcile both env files after the fresh-host bootstrap. Missing

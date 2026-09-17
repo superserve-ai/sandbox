@@ -3524,6 +3524,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	restoreWorkloadFrozen := manifest != nil && manifest.WorkloadFrozen
 	restoreGuestCorrects := manifest != nil && manifest.GuestCorrectsClock
+	// Phases of a frozen image's restore are labelled so the two kinds can be
+	// compared side by side.
+	restoreMode := ""
+	if restoreWorkloadFrozen {
+		restoreMode = "frozen"
+	}
 	if restoreWorkloadFrozen {
 		// The floor rises before this host acts on an image that owes a wake,
 		// or a rollback could later meet the image with nothing to witness it.
@@ -3835,7 +3841,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			attemptPhases["entry_to_sem"] = tSemAcquired.Sub(tEntry)
 			attemptPhases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
 		}
-		m.recordPhases("restore", "", attemptPhases)
+		m.recordPhases("restore", restoreMode, attemptPhases)
 
 		// attemptErr is this attempt's result alone; it lands in restoreErr after
 		// the load log so a stale prior-attempt error can never leak into the
@@ -3958,7 +3964,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Msg("snapshot loaded")
 		// Failed attempts included: a slow failing load (tap-busy retry,
 		// terminal failure) must appear in the distribution, not vanish.
-		m.recordPhases("restore", "", map[string]time.Duration{"load_snapshot": time.Since(tFcReady)})
+		m.recordPhases("restore", restoreMode, map[string]time.Duration{"load_snapshot": time.Since(tFcReady)})
 		restoreErr = attemptErr
 
 		if restoreErr == nil {
@@ -4029,7 +4035,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// recreated: an in-place overlay recreated from scratch is truncated.
 			clockRetried = true
 			m.noteGuestClockUnready(log, wakeErr)
-			m.recordPhases("restore", "", map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
+			m.recordPhases("restore", restoreMode, map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
 			m.stopUnitDuringRestoreError(vmID)
 			if !vmDeadForRetry(m, vmID) {
 				log.Warn().Msg("VM not confirmed dead after stop — not relaunching")
@@ -4141,7 +4147,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Emit the exhausted readiness wait immediately, before teardown, so
 		// the sample measures the probe (not unit stop + resource release +
 		// persist join) and the concurrent-destroy return below can't skip it.
-		m.recordPhases("restore", "", map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
+		m.recordPhases("restore", restoreMode, map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
 		// The console (FC log + guest serial) is the only witness to where
 		// the guest stalled between vCPU resume and first output; the
 		// teardown below deletes it, so capture it now. Only for a genuine
@@ -4308,7 +4314,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		Int64("wait_boxd_ms", tBoxdReady.Sub(tBoxdStart).Milliseconds()).
 		Int64("persist_state_ms", tPersisted.Sub(tBoxdReady).Milliseconds()).
 		Msg("VM restored from snapshot")
-	m.recordPhases("restore", "", map[string]time.Duration{
+	m.recordPhases("restore", restoreMode, map[string]time.Duration{
 		"wait_boxd": tBoxdReady.Sub(tBoxdStart),
 		"persist":   tPersisted.Sub(tBoxdReady),
 	})
