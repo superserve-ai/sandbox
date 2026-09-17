@@ -1921,6 +1921,49 @@ func TestUnfrozenPauseKeepsTheOldManifestUntilItsSnapshotLands(t *testing.T) {
 	}
 }
 
+// The startup pass starts the pool before its scan: a wake queued early is
+// served while later records are still being read, and the drain at the end
+// only waits. A wake queued before the pool exists waits for it.
+func TestQueuedWakesAreServedDuringTheStartupScan(t *testing.T) {
+	origWake := boxdWakeGuest
+	t.Cleanup(func() { boxdWakeGuest = origWake })
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return nil }
+
+	dir := t.TempDir()
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeToken: "tok", Supervision: SupervisionUnit, IP: "10.0.0.2"}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+	mgr.startWakePool(context.Background())
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.queuePendingWake(toInstance(rec), unlock)
+	pw := mgr.pendingWake("vm-1")
+	if pw == nil {
+		t.Fatal("not queued")
+	}
+	// Served with no drain called: the scan is still notionally running.
+	select {
+	case <-pw.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the queued wake was not served while the scan ran")
+	}
+	if inst := mgr.vms["vm-1"]; inst == nil || inst.WakePending || inst.Status != StatusRunning {
+		t.Fatalf("instance = %+v; want the woken VM published", inst)
+	}
+	if n := mgr.drainPendingWakes(context.Background()); n != 1 {
+		t.Fatalf("drain = %d, want the one wake counted", n)
+	}
+}
+
 // A request that meets a queued wake early in the startup pass waits for
 // the pool to start before its bound runs: the scan ahead of the pool is
 // not counted in the queue, and giving up during it would report a live,

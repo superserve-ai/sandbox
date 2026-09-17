@@ -725,14 +725,20 @@ type Manager struct {
 	// clock: every later restore takes the unfrozen path until vmd restarts.
 	guestClockUnready atomic.Bool
 	// pendingWakes are reattached records that owe a wake, held back from
-	// m.vms until the startup pool completes it. See queuePendingWake.
+	// m.vms until the pool completes it. See queuePendingWake.
 	pendingWakeMu sync.Mutex
 	pendingWakes  map[string]*pendingWake
-	// wakeDrainStarted closes when the pool begins serving queued wakes,
-	// after the startup pass has scanned every record; a request waiting
-	// on a queued wake counts its bound from then, not from the scan.
+	// wakeDrainStarted closes when the pool begins serving queued wakes; a
+	// request waiting on a queued wake counts its bound from then.
 	wakeDrainStarted chan struct{}
 	wakeDrainBegun   bool
+	// The pool: started by the startup pass before its scan, so a wake
+	// queued early is served while later records are still being read. A
+	// wake queued before the pool exists waits for it.
+	wakePoolCtx context.Context
+	wakeSem     chan struct{}
+	wakeWG      sync.WaitGroup
+	wakeWoken   atomic.Int32
 	// reattachDeferred marks ids whose startup reattach was left to the
 	// request holding their lifecycle lock; see reattachByID.
 	reattachDeferred sync.Map
@@ -4853,6 +4859,9 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	// the orphans, and the next restart re-evaluates.
 	conclusive := true
 	m.reattachStopDeadline.Store(time.Now().Add(reattachStopPassBudget))
+	// Wakes queued by the scan are served as it runs, not after it: a
+	// recovering sandbox must not wait behind every record on the host.
+	m.startWakePool(ctx)
 	for _, snap := range records {
 		// Stop on shutdown: a cancelled ctx makes liveness checks fail, which
 		// would otherwise misfire the stale-cleanup path against live VMs.
@@ -5155,9 +5164,9 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			m.mu.RUnlock()
 			return inst, ok
 		}
-		// The pool starts only once the startup pass has scanned every
-		// record, and that scan is not bounded by the queue: wait for the
-		// pool to start, then for it to reach this wake.
+		// A wake queued before the pool exists waits for it, unbounded by
+		// the queue: wait for the pool to start, then for it to reach this
+		// wake.
 		select {
 		case <-pw.done:
 			return published()
@@ -8807,69 +8816,88 @@ func pendingWakeWaitBound(queued int) time.Duration {
 
 func (m *Manager) queuePendingWake(inst *VMInstance, unlock func()) {
 	m.pendingWakeMu.Lock()
-	defer m.pendingWakeMu.Unlock()
 	if m.pendingWakes == nil {
 		m.pendingWakes = map[string]*pendingWake{}
 	}
 	if _, queued := m.pendingWakes[inst.ID]; queued {
+		m.pendingWakeMu.Unlock()
 		unlock()
 		return
 	}
-	m.pendingWakes[inst.ID] = &pendingWake{inst: inst, done: make(chan struct{}), unlock: unlock}
-}
-
-// drainPendingWakes completes every queued wake through a bounded pool and
-// publishes each outcome: Running once woken, Error otherwise — never a frozen
-// guest presented as ready. Returns how many were published Running.
-func (m *Manager) drainPendingWakes(ctx context.Context) int {
-	m.noteWakeDrainStarted()
-	m.pendingWakeMu.Lock()
-	queued := make([]*pendingWake, 0, len(m.pendingWakes))
-	for _, pw := range m.pendingWakes {
-		queued = append(queued, pw)
+	pw := &pendingWake{inst: inst, done: make(chan struct{}), unlock: unlock}
+	m.pendingWakes[inst.ID] = pw
+	started := m.wakePoolCtx != nil
+	if started {
+		m.wakeWG.Add(1)
 	}
 	m.pendingWakeMu.Unlock()
-	if len(queued) == 0 {
-		return 0
+	if started {
+		go m.serveWake(pw)
 	}
-	var woken atomic.Int32
-	sem := make(chan struct{}, wakeRecoveryWorkers)
-	var wg sync.WaitGroup
-	for _, pw := range queued {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(pw *pendingWake) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			defer sentrylog.Recover("wake-recovery")
-			defer func() {
-				m.pendingWakeMu.Lock()
-				delete(m.pendingWakes, pw.inst.ID)
-				m.pendingWakeMu.Unlock()
-				close(pw.done)
-				pw.unlock()
-			}()
-			log := m.log.With().Str("vm_id", pw.inst.ID).Logger()
-			// The lifecycle lock has been held since the startup pass queued
-			// this VM, so no restore or resume for the id can have run
-			// meanwhile; the map check below is belt and braces.
-			m.mu.RLock()
-			_, taken := m.vms[pw.inst.ID]
-			m.mu.RUnlock()
-			if taken {
-				log.Info().Msg("reattach: a request replaced this VM before its wake completed; recovery instance abandoned")
-				return
-			}
-			if err := m.completeOwedWake(ctx, pw.inst, log); err == nil {
-				woken.Add(1)
-			} else {
-				m.parkUnservable(pw.inst, errors.Is(err, ErrGuestTokenMismatch))
-			}
-			m.publishRecovered(pw.inst)
-		}(pw)
+}
+
+// startWakePool begins serving queued wakes, wakeRecoveryWorkers at a time,
+// including any queued before it started. Idempotent.
+func (m *Manager) startWakePool(ctx context.Context) {
+	m.pendingWakeMu.Lock()
+	if m.wakePoolCtx != nil {
+		m.pendingWakeMu.Unlock()
+		return
 	}
-	wg.Wait()
-	return int(woken.Load())
+	m.wakePoolCtx = ctx
+	m.wakeSem = make(chan struct{}, wakeRecoveryWorkers)
+	backlog := make([]*pendingWake, 0, len(m.pendingWakes))
+	for _, pw := range m.pendingWakes {
+		backlog = append(backlog, pw)
+	}
+	m.wakeWG.Add(len(backlog))
+	m.pendingWakeMu.Unlock()
+	m.noteWakeDrainStarted()
+	for _, pw := range backlog {
+		go m.serveWake(pw)
+	}
+}
+
+// serveWake completes one queued wake under the pool's worker bound and
+// publishes the outcome: Running once woken, Error otherwise — never a
+// frozen guest presented as ready.
+func (m *Manager) serveWake(pw *pendingWake) {
+	defer m.wakeWG.Done()
+	m.wakeSem <- struct{}{}
+	defer func() { <-m.wakeSem }()
+	defer sentrylog.Recover("wake-recovery")
+	defer func() {
+		m.pendingWakeMu.Lock()
+		delete(m.pendingWakes, pw.inst.ID)
+		m.pendingWakeMu.Unlock()
+		close(pw.done)
+		pw.unlock()
+	}()
+	log := m.log.With().Str("vm_id", pw.inst.ID).Logger()
+	// The lifecycle lock has been held since the startup pass queued this
+	// VM, so no restore or resume for the id can have run meanwhile; the
+	// map check below is belt and braces.
+	m.mu.RLock()
+	_, taken := m.vms[pw.inst.ID]
+	m.mu.RUnlock()
+	if taken {
+		log.Info().Msg("reattach: a request replaced this VM before its wake completed; recovery instance abandoned")
+		return
+	}
+	if err := m.completeOwedWake(m.wakePoolCtx, pw.inst, log); err == nil {
+		m.wakeWoken.Add(1)
+	} else {
+		m.parkUnservable(pw.inst, errors.Is(err, ErrGuestTokenMismatch))
+	}
+	m.publishRecovered(pw.inst)
+}
+
+// drainPendingWakes starts the pool if the startup pass has not, then waits
+// for every queued wake. Returns how many the pool has published Running.
+func (m *Manager) drainPendingWakes(ctx context.Context) int {
+	m.startWakePool(ctx)
+	m.wakeWG.Wait()
+	return int(m.wakeWoken.Load())
 }
 
 // completeOwedWake sends the wake a reattached record still owes. Nil once
