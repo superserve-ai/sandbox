@@ -635,6 +635,61 @@ func TestReattachReleasesAGuestAnInterruptedPauseFroze(t *testing.T) {
 	}
 }
 
+// A guest a pause parked Error, its release unconfirmed and its token kept,
+// is offered that release on reattach and served as Running once the guest
+// confirms it; one that cannot be released stays parked with its intent.
+func TestReattachReleasesAGuestAPauseParkedAsError(t *testing.T) {
+	raiseFloorForTest(t)
+	origThaw, origRunning := boxdThawGuest, boxdGuestRunning
+	t.Cleanup(func() { boxdThawGuest, boxdGuestRunning = origThaw, origRunning })
+	for _, tc := range []struct {
+		name       string
+		thaw       error
+		wantStatus VMStatus
+		wantIntent bool
+	}{
+		{"released", nil, StatusRunning, false},
+		{"unreachable", errors.New("connection refused"), StatusError, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { store.Close() })
+			vmDir := filepath.Join(dir, "vm-1")
+			if err := os.MkdirAll(vmDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := writePauseIntent(vmDir, pauseIntent{VMID: "vm-1", FreezeToken: "tok", ArtifactID: "a"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Put(VMRecord{ID: "vm-1", Status: StatusError, Supervision: SupervisionUnit, IP: "10.0.0.2"}); err != nil {
+				t.Fatal(err)
+			}
+			var sawToken string
+			boxdThawGuest = func(_ context.Context, _ string, token string) error { sawToken = token; return tc.thaw }
+			boxdGuestRunning = func(context.Context, string) error { return nil }
+			mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+			inst := mgr.reattachByID("vm-1", false)
+			if inst == nil || sawToken != "tok" {
+				t.Fatalf("inst=%v token=%q, want the parked record offered its release", inst, sawToken)
+			}
+			inst.mu.RLock()
+			st := inst.Status
+			inst.mu.RUnlock()
+			got, _ := store.Get("vm-1")
+			if st != tc.wantStatus || got == nil || got.Status != tc.wantStatus {
+				t.Errorf("status %v record %+v, want %v in both", st, got, tc.wantStatus)
+			}
+			if _, serr := os.Stat(pauseIntentPath(vmDir)); (serr == nil) != tc.wantIntent {
+				t.Errorf("intent present=%v, want %v", serr == nil, tc.wantIntent)
+			}
+		})
+	}
+}
+
 // A record that owes a wake is not served until the wake completes: a request
 // arriving through the lazy path completes it inline, the startup pass queues it
 // for the pool, and a request during that wait sees the pool's outcome.

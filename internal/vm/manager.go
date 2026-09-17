@@ -5473,6 +5473,17 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 		rec.Status = StatusError
 		m.parkUnservable(inst, true)
 	}
+	// A guest a pause parked Error with its token kept is offered that
+	// release now; it is served as Running only once confirmed. Anything
+	// else leaves it parked, its process kept for the reconciler.
+	if rec.Status == StatusError && m.frozenPauseIntent(rec.ID) && m.recoverPauseIntent(ctx, inst, log) {
+		rec.Status = StatusRunning
+		inst.mu.Lock()
+		inst.Status = StatusRunning
+		inst.mu.Unlock()
+		m.vmStopUnconfirmed.Delete(rec.ID)
+		log.Warn().Msg("reattach: released a guest a pause had parked as error; served as running")
+	}
 	if rec.Status == StatusRunning && inst.WakePending {
 		if cleanupStale {
 			// Queued for the pool after the pass, holding the lifecycle lock
@@ -8873,6 +8884,16 @@ func (m *Manager) completeOwedWake(ctx context.Context, inst *VMInstance, log ze
 	inst.mu.Unlock()
 	log.Info().Msg("reattach: completed the wake a restore owed this guest")
 	return nil
+}
+
+// frozenPauseIntent reports whether an intent with a token stands for vmID:
+// a pause froze the guest and did not finish.
+func (m *Manager) frozenPauseIntent(vmID string) bool {
+	if !wakeProtocolFloorRaised() {
+		return false
+	}
+	in, err := readPauseIntent(filepath.Join(m.cfg.SnapshotDir, vmID))
+	return err == nil && in != nil && in.FreezeToken != ""
 }
 
 // recoverPauseIntent releases a guest a pause froze and then died before
