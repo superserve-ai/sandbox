@@ -311,9 +311,7 @@ module "cloud_ids" {
   labels                     = local.common_labels
 }
 
-# The cell's sole sandbox/VMD host. Distinct identity (its HOST_ID is its
-# instance name) carried over from when it was provisioned as the standby.
-# It replaced the original c4 host, whose module was removed after cutover.
+# The cell's first host, parked. Its HOST_ID is its instance name.
 module "sandbox_host_b" {
   source = "../../../modules/sandbox-host"
 
@@ -424,11 +422,8 @@ resource "google_compute_attached_disk" "sandbox_data" {
   mode        = "READ_WRITE"
 }
 
-# Second host for the cell, provisioned as a standby under a new identity.
-# Same shape and OS lineage as the serving host so snapshots restore across
-# the two. Labeled out of deploy discovery until it is prepared; the
-# first-boot script below does everything a deploy assumes is already on a
-# host, except secrets.
+# The cell's serving host. Same shape and OS lineage as the first host so
+# snapshots restore across the two.
 locals {
   host_c_artifact_bucket = module.backup_storage.bucket_name
   host_c_kernel_object   = "vmlinux-4.14-fuse"
