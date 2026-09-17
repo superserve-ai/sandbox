@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/coreos/go-systemd/v22/activation"
 	"net"
 	"net/http"
 	"net/netip"
@@ -247,14 +248,22 @@ func main() {
 		Addr:    redirectAddr,
 		Handler: redirectMux,
 	}
+	// Socket-activated listeners survive a restart (deploy/proxy.socket).
+	publicLis, redirectLis := inheritedListeners(activation.Listeners, addr, redirectAddr, log)
 	go func() {
 		log.Info().Str("addr", redirectAddr).Msg("starting HTTP→HTTPS redirect listener")
-		if err := redirectSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		if redirectLis != nil {
+			err = redirectSrv.Serve(redirectLis)
+		} else {
+			err = redirectSrv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("redirect listener error")
 		}
 	}()
 
-	if err := proxy.ListenAndServe(ctx, addr, mux, log); err != nil {
+	if err := proxy.Serve(ctx, publicLis, addr, mux, log); err != nil {
 		log.Fatal().Err(err).Msg("proxy error")
 	}
 	if peerErr != nil {

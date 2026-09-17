@@ -538,3 +538,18 @@ func TestExecWS_InvalidStartClosesWS(t *testing.T) {
 		t.Errorf("close status = %d, want PolicyViolation", websocket.CloseStatus(err))
 	}
 }
+
+func TestExecSignalTableAllowsKillingOwnProcess(t *testing.T) {
+	for name, want := range map[string]int32{"SIGINT": 2, "SIGTERM": 15, "SIGKILL": 9, "SIGUSR1": 10, "SIGUSR2": 12} {
+		got, ok := execSignalNameToNumber(name)
+		if !ok || got != want {
+			t.Errorf("execSignalNameToNumber(%q) = %d, %v; want %d", name, got, ok, want)
+		}
+	}
+	if _, ok := execSignalNameToNumber("SIGSTOP"); ok {
+		t.Error("SIGSTOP must stay rejected")
+	}
+	if _, ok := signalNameToNumber("SIGKILL"); ok {
+		t.Error("the terminal table must keep rejecting SIGKILL")
+	}
+}
