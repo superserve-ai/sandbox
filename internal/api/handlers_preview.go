@@ -248,7 +248,7 @@ func (h *Handlers) applyPreviewMutationFinalized(ctx context.Context, sandboxID,
 	if h.Pool == nil {
 		return run(h.DB)
 	}
-	tx, err := h.Pool.Begin(ctx)
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return previewPolicySnapshot{}, nil, err
 	}
@@ -279,7 +279,12 @@ func (h *Handlers) applyPreviewMutationValidated(ctx context.Context, sandboxID,
 }
 
 func validateHostPreviewCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
-	ok, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+	started := time.Now()
+	defer func() {
+		RecordLatencyPhases(ctx, "preview_mutation", hostID, map[string]time.Duration{"host_capability_validation": time.Since(started)})
+	}()
+
+	ok, err := q.LockedHostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
 		AllowedStatuses: []string{"active"},
 		HostID:          hostID, RequiredCapabilities: capabilities,
 	})
@@ -299,7 +304,12 @@ func validateOwnerResumeBrowserCapabilities(ctx context.Context, q *db.Queries, 
 }
 
 func validateOwnerResumeCapabilities(ctx context.Context, q *db.Queries, hostID string, capabilities ...string) error {
-	ok, err := q.HostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
+	started := time.Now()
+	defer func() {
+		RecordLatencyPhases(ctx, "resume", hostID, map[string]time.Duration{"host_capability_validation": time.Since(started)})
+	}()
+
+	ok, err := q.LockedHostHasCapabilities(ctx, db.HostHasCapabilitiesParams{
 		AllowedStatuses: []string{"active", "draining"},
 		HostID:          hostID, RequiredCapabilities: capabilities,
 		HeartbeatAfter: pgtype.Timestamptz{Time: time.Now().Add(-heartbeatTimeout), Valid: true},

@@ -857,9 +857,11 @@ WHERE s.id = $1 AND s.team_id = $2 AND s.destroyed_at IS NULL;
 -- name: LockSandboxForPreviewMutation :one
 -- The sandbox row exists for both legacy (no policy row) and strict sandboxes,
 -- so it is the stable per-sandbox serialization point across the transition.
+-- Allow storage-interval foreign-key checks while a heartbeat holds the host
+-- lock: preview validation acquires that host lock after this sandbox lock.
 SELECT id FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
-FOR UPDATE;
+FOR NO KEY UPDATE;
 
 -- name: GetSandboxStatusForPreviewMutation :one
 -- Read after LockSandboxForPreviewMutation in the same transaction when host

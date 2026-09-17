@@ -193,13 +193,19 @@ func TestHostCapabilityBatchGateLocksExactEligibleHeartbeat(t *testing.T) {
 	if start < 0 {
 		t.Fatal("HostHasCapabilities query block is missing")
 	}
-	// The unlocked variant follows immediately; bound the locked block at it so
-	// this assertion covers only the FOR SHARE query.
+	// Bound the evaluation block separately from the host-lock statement.
 	end := strings.Index(queries[start:], "-- name: HostHasCapabilitiesUnlocked :one")
 	if end < 0 {
 		t.Fatal("HostHasCapabilities query terminator is missing")
 	}
+	lockStart := strings.Index(queries, "-- name: LockHostForCapabilities :execrows")
+	if lockStart < 0 || lockStart >= start || !strings.Contains(queries[lockStart:start], "FOR SHARE") {
+		t.Fatal("missing separate host share lock")
+	}
 	query := queries[start : start+end]
+	if strings.Contains(query, "FOR SHARE") {
+		t.Fatal("capability evaluation must use a new non-locking snapshot")
+	}
 	for _, required := range []string{
 		"WITH target_host AS MATERIALIZED",
 		"WHERE id = sqlc.arg('host_id')",
@@ -207,7 +213,6 @@ func TestHostCapabilityBatchGateLocksExactEligibleHeartbeat(t *testing.T) {
 		"sqlc.narg('heartbeat_after')::timestamptz IS NULL",
 		"OR last_heartbeat_at > sqlc.narg('heartbeat_after')",
 		"last_heartbeat_at IS NOT NULL",
-		"FOR SHARE",
 		"unnest(sqlc.arg('required_capabilities')::text[])",
 		"hc.host_id = h.id",
 		"hc.heartbeat_at = h.last_heartbeat_at",

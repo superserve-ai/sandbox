@@ -114,11 +114,13 @@ DELETE FROM host_capability hc
 WHERE hc.host_id = sqlc.arg(host_id)
   AND NOT (hc.capability = ANY(COALESCE(sqlc.arg(capabilities)::text[], ARRAY[]::text[])));
 
+-- name: LockHostForCapabilities :execrows
+SELECT id FROM host WHERE id = sqlc.arg('host_id') FOR SHARE;
+
 -- name: HostHasCapabilities :one
--- Lock the one eligible host row whose heartbeat anchors this capability set.
--- Callers that run this in a mutation transaction keep the host stable until
--- VMD delivery and commit, while the relational division below proves that
--- every requested capability belongs to that exact heartbeat.
+-- Evaluate in a new READ COMMITTED statement after LockHostForCapabilities,
+-- in the same transaction, to avoid mixing pre-wait capability rows with a
+-- post-wait host row. Lifecycle callers use LockedHostHasCapabilities.
 WITH target_host AS MATERIALIZED (
   SELECT id, last_heartbeat_at
   FROM host
@@ -127,7 +129,6 @@ WITH target_host AS MATERIALIZED (
     AND last_heartbeat_at IS NOT NULL
     AND (sqlc.narg('heartbeat_after')::timestamptz IS NULL
          OR last_heartbeat_at > sqlc.narg('heartbeat_after'))
-  FOR SHARE
 )
 SELECT EXISTS (
   SELECT 1
@@ -149,7 +150,7 @@ SELECT EXISTS (
 -- HostHasCapabilities without the row lock, for standalone pre-flight reads
 -- outside a mutation transaction: omitting the lock keeps concurrent checks
 -- from serializing behind the host's heartbeat writer. Transactional callers
--- that must pin the host across a commit use HostHasCapabilities.
+-- that must pin the host across a commit use LockedHostHasCapabilities.
 --
 -- Also returns the host's VMD address (empty when the host is ineligible),
 -- so the caller can record this read as the registry's address verification.

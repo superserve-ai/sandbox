@@ -205,11 +205,48 @@ type mockRow struct {
 func (r *mockRow) Scan(dest ...any) error { return r.scanFn(dest...) }
 
 type mockDBTX struct {
-	queryRowFn func(ctx context.Context, sql string, args ...any) pgx.Row
-	execFn     func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	capabilityTxEvent func(string)
+	queryRowFn        func(ctx context.Context, sql string, args ...any) pgx.Row
+	execFn            func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	// queryFn is optional; nil falls back to an empty rows iterator.
 	queryFn func(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
+
+// The fake transaction shares the scripted rows while exposing real transaction
+// boundaries to capability validation tests.
+type mockCapabilityTx struct {
+	pgx.Tx
+	mock *mockDBTX
+}
+
+func (m *mockDBTX) BeginTx(_ context.Context, opts pgx.TxOptions) (pgx.Tx, error) {
+	if opts.IsoLevel != pgx.ReadCommitted {
+		return nil, fmt.Errorf("unexpected isolation: %s", opts.IsoLevel)
+	}
+	if m.capabilityTxEvent != nil {
+		m.capabilityTxEvent("begin")
+	}
+	return &mockCapabilityTx{mock: m}, nil
+}
+func (tx *mockCapabilityTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	return tx.mock.QueryRow(ctx, sql, args...)
+}
+func (tx *mockCapabilityTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(sql, "-- name: LockHostForCapabilities :execrows") {
+		if tx.mock.capabilityTxEvent != nil {
+			tx.mock.capabilityTxEvent("lock")
+		}
+		return pgconn.NewCommandTag("SELECT 1"), nil
+	}
+	return tx.mock.Exec(ctx, sql, args...)
+}
+func (tx *mockCapabilityTx) Commit(context.Context) error {
+	if tx.mock.capabilityTxEvent != nil {
+		tx.mock.capabilityTxEvent("commit")
+	}
+	return nil
+}
+func (tx *mockCapabilityTx) Rollback(context.Context) error { return nil }
 
 func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	// The finalize-mode probe runs before every FinalizePause. Unit tests
@@ -5000,10 +5037,20 @@ func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *test
 	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
 	port := publishedPortResponse{Port: 3000, Access: preview.AccessPrivate, TokenVersion: 12}
 
+	transactionOpen := false
 	paused := false
 	vmd := &stubVMD{
+		resumeFn: func(context.Context, string, string, string, []byte) (string, error) {
+			if transactionOpen {
+				t.Fatal("resume under host lock")
+			}
+			return "192.0.2.1", nil
+		},
 		resumeAttest: vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 8, NetworkRulesApplied: true},
 		pauseFn: func(context.Context, string, string) (string, string, error) {
+			if transactionOpen {
+				t.Fatal("compensation under host lock")
+			}
 			paused = true
 			return "/snapshots/test/vmstate.snap", "/snapshots/test/mem.snap", nil
 		},
@@ -5012,6 +5059,14 @@ func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *test
 	// has lost the capability by the time the post-boot check reads it.
 	lockedChecks := 0
 	mock := &mockDBTX{
+		capabilityTxEvent: func(event string) {
+			if event == "begin" {
+				transactionOpen = true
+			}
+			if event == "commit" {
+				transactionOpen = false
+			}
+		},
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
