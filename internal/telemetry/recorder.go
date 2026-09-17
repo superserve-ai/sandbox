@@ -134,6 +134,23 @@ type LauncherState struct {
 	Ready bool
 }
 
+// TeardownAttempt is one attempt at a deleted sandbox's host-side reclaim.
+// Path is where it ran (delete, sweep); Result is completed,
+// deferred, timeout, permanent, or skipped. Both are fixed vocabularies
+// owned by the call sites.
+type TeardownAttempt struct {
+	Path   string
+	Result string
+}
+
+// TeardownBacklog is the reclaims still owed, sampled after each sweep.
+type TeardownBacklog struct {
+	Total            int64
+	Retrying         int64
+	Permanent        int64
+	OldestAgeSeconds float64
+}
+
 // LatencyPhase records one timed phase of a sandbox operation, the unit the
 // latency dashboards aggregate (p50/p90/p99 via histogram_quantile). Every
 // label is a bounded enum owned by the emitting call site — never tenant,
@@ -229,6 +246,8 @@ type Recorder interface {
 	RecordDBPoolStats(context.Context, DBPoolStats)
 	RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)
 	RecordLauncherState(context.Context, LauncherState)
+	RecordTeardownAttempt(context.Context, TeardownAttempt)
+	RecordTeardownBacklog(context.Context, TeardownBacklog)
 	RecordLatencyPhase(context.Context, LatencyPhase)
 	RecordPeerIngress(context.Context, PeerIngress)
 	RecordPeerEvent(context.Context, PeerEvent)
@@ -258,6 +277,8 @@ func (noopRecorder) RecordBackupCoverage(context.Context, []BackupCoverage)     
 func (noopRecorder) RecordDBPoolStats(context.Context, DBPoolStats)                         {}
 func (noopRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure)     {}
 func (noopRecorder) RecordLauncherState(context.Context, LauncherState)                     {}
+func (noopRecorder) RecordTeardownAttempt(context.Context, TeardownAttempt)                 {}
+func (noopRecorder) RecordTeardownBacklog(context.Context, TeardownBacklog)                 {}
 func (noopRecorder) RecordLatencyPhase(context.Context, LatencyPhase)                       {}
 func (noopRecorder) RecordPeerIngress(context.Context, PeerIngress)                         {}
 func (noopRecorder) RecordPeerEvent(context.Context, PeerEvent)                             {}

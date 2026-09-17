@@ -753,3 +753,48 @@ func TestRevertToActive_UnwritableRevertLeavesPausing(t *testing.T) {
 		t.Fatalf("fails = %d, releases = %d; want no terminal write and the lease handed back", fails, releases)
 	}
 }
+
+// Auto-deleted sandboxes are reclaimed by the teardown sweeper alone: the
+// reaper records the reclaim claimable at once and never calls the host
+// itself, so no record is owned by two workers.
+func TestReaper_AutoDeleteLeavesTheReclaimToTheSweeper(t *testing.T) {
+	sandboxID := uuid.New()
+	var destroyed int32
+	var lease int32 = -1
+	h := newReaperHandlers(
+		&reaperMockDBTX{
+			queryFn: func(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+				if !strings.Contains(sql, "auto_delete_at") {
+					return newIDRows(nil), nil
+				}
+				if v, ok := args[2].(int32); ok {
+					atomic.StoreInt32(&lease, v)
+				}
+				return &scanRows{rows: []func(dest ...any) error{func(dest ...any) error {
+					*dest[0].(*uuid.UUID) = sandboxID
+					*dest[1].(*uuid.UUID) = uuid.New()
+					*dest[2].(*string) = "sbx-expired"
+					*dest[3].(*string) = "host-a"
+					*dest[4].(**string) = nil
+					*dest[5].(*pgtype.UUID) = pgtype.UUID{}
+					return nil
+				}}}, nil
+			},
+			queryRowFn: func(context.Context, string, ...any) pgx.Row { return activityRow() },
+		},
+		&stubVMD{destroyFn: func(context.Context, string, bool) error {
+			atomic.AddInt32(&destroyed, 1)
+			return nil
+		}},
+	)
+
+	h.reapAutoDeleteOnce(context.Background(), 10, zerolog.Nop())
+	h.WaitAsyncBookkeeping()
+
+	if atomic.LoadInt32(&lease) != 0 {
+		t.Fatalf("auto-delete birth lease = %d s, want 0 (claimable by the sweeper at once)", lease)
+	}
+	if atomic.LoadInt32(&destroyed) != 0 {
+		t.Fatal("the reaper reclaimed the host inline; that is the sweeper's")
+	}
+}

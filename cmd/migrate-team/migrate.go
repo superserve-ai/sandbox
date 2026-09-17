@@ -276,12 +276,17 @@ func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string,
 // source with raw SQL would strand those host resources. Destroy failed
 // sandboxes before the window. 'migrating' is an operator's claim on a
 // paused sandbox mid-move between hosts; its artifacts are in flight too.
-func activeSandboxes(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]string, error) {
+// A pending sandbox_teardown blocks too: purge would cascade it away with
+// the row and strand the reclaim on the source host.
+func activeSandboxes(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
-		SELECT id, name, status FROM sandbox
-		WHERE team_id = $1 AND destroyed_at IS NULL
-		  AND status IN ('active', 'starting', 'resuming', 'pausing', 'migrating', 'failed')
-		ORDER BY created_at`, teamID)
+		SELECT s.id, s.name, s.status, t.sandbox_id IS NOT NULL
+		FROM sandbox s LEFT JOIN sandbox_teardown t ON t.sandbox_id = s.id
+		WHERE s.team_id = $1
+		  AND ((s.destroyed_at IS NULL
+		        AND s.status IN ('active', 'starting', 'resuming', 'pausing', 'migrating', 'failed'))
+		       OR t.sandbox_id IS NOT NULL)
+		ORDER BY s.created_at`, teamID)
 	if err != nil {
 		return nil, fmt.Errorf("list active sandboxes: %w", err)
 	}
@@ -291,8 +296,12 @@ func activeSandboxes(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) (
 	for rows.Next() {
 		var id uuid.UUID
 		var name, status string
-		if err := rows.Scan(&id, &name, &status); err != nil {
+		var reclaimPending bool
+		if err := rows.Scan(&id, &name, &status, &reclaimPending); err != nil {
 			return nil, err
+		}
+		if reclaimPending {
+			status += " (host reclaim pending)"
 		}
 		out = append(out, fmt.Sprintf("%s (%s) status=%s", id, name, status))
 	}
@@ -1453,6 +1462,13 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		return err
 	} else if len(builds) > 0 {
 		return fmt.Errorf("aborting purge: template build slipped in before the locks:\n  %s", strings.Join(builds, "\n  "))
+	}
+	// Rows locked: an auto-delete that committed after the checks above is
+	// visible now and its teardown would cascade with the row below.
+	if blockers, err := activeSandboxes(ctx, tx, cfg.teamID); err != nil {
+		return err
+	} else if len(blockers) > 0 {
+		return fmt.Errorf("aborting purge: sandbox changed before the locks:\n  %s", strings.Join(blockers, "\n  "))
 	}
 	// The source rows die below, so capture the rollup-flag state now and
 	// restore it into the dest after the deletes commit — purged
