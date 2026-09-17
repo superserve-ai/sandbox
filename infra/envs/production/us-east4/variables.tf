@@ -52,14 +52,8 @@ variable "boot_disk_type" {
   default     = "hyperdisk-balanced"
 }
 
-variable "standby_reservation_name" {
-  description = "Reservation to target for the z3 host. Null uses default affinity, which auto-consumes a matching (non-specific) z3 reservation in the zone."
-  type        = string
-  default     = null
-}
-
 variable "host_c_reservation_name" {
-  description = "z3 reservation the standby sandbox host targets; null uses default affinity."
+  description = "z3 reservation the sandbox host targets; null uses default affinity."
   type        = string
   default     = null
 }

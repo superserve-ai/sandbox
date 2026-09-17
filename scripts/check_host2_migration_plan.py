@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
-"""Keep Host 2 maintenance out of routine Terraform rollout workflows."""
+"""Keep Host 2 maintenance out of routine Terraform rollout workflows.
 
+The guarded host module is the root's identity-bound host: module.sandbox_host_b
+unless the workflow names another with --guarded, which the east root does for
+module.sandbox_host_c.
+"""
+
+import argparse
 import json
 import sys
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--guarded", default="module.sandbox_host_b")
+    args = parser.parse_args()
+    guarded = args.guarded.rstrip(".") + "."
+
     plan = json.load(sys.stdin)
     if not isinstance(plan, dict) or "format_version" not in plan:
         raise ValueError("Expected Terraform plan JSON")
@@ -14,7 +25,7 @@ def main():
     for resource in plan.get("resource_changes", []):
         address = resource["address"]
         host = (
-            address.startswith("module.sandbox_host_b.")
+            address.startswith(guarded)
             and resource["type"] == "google_compute_instance"
         )
         # The adapter can restart the VM even when the Compute plan is a no-op.
