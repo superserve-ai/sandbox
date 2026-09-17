@@ -236,11 +236,12 @@ func TestHostCapCacheStaleGraceAndEviction(t *testing.T) {
 
 // The transactional validate must issue the locked query; the pre-flight
 // cache must issue the unlocked one. Pins the routing so a refactor can't
-// silently drop FOR SHARE from the mutation path.
+// silently drop the lock-then-read transaction from the mutation path.
 func TestCapabilityQueryRouting(t *testing.T) {
 	var mu sync.Mutex
 	var sqls []string
-	mock := &mockDBTX{queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
+	var events []string
+	mock := &mockDBTX{capabilityTxEvent: func(event string) { events = append(events, event) }, queryRowFn: func(ctx context.Context, sql string, args ...any) pgx.Row {
 		mu.Lock()
 		sqls = append(sqls, sql)
 		mu.Unlock()
@@ -254,16 +255,23 @@ func TestCapabilityQueryRouting(t *testing.T) {
 	if err := validateHostPreviewCapabilities(context.Background(), q, "host-a", "preview_ports_v1"); err != nil {
 		t.Fatal(err)
 	}
+	if strings.Join(events, ",") != "begin,lock,commit" {
+		t.Fatalf("transaction sequence=%v", events)
+	}
 	mu.Lock()
 	first := sqls[0]
 	mu.Unlock()
-	if !strings.Contains(first, "-- name: HostHasCapabilities :one") || !strings.Contains(first, "FOR SHARE") {
-		t.Fatalf("transactional validate must use the locked query, got: %.60s", first)
+	if !strings.Contains(first, "-- name: HostHasCapabilities :one") || strings.Contains(first, "FOR SHARE") {
+		t.Fatalf("transactional validate must evaluate with a fresh non-locking statement, got: %.60s", first)
 	}
 
+	events = nil
 	h := &Handlers{DB: q}
 	if ok, err := h.hostHasCapabilitiesCached(context.Background(), "host-a", []string{"preview_ports_v1"}); err != nil || !ok {
 		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("preflight opened a transaction: %v", events)
 	}
 	mu.Lock()
 	last := sqls[len(sqls)-1]

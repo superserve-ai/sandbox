@@ -28,10 +28,12 @@ func (r *captureRecorder) RecordDBPoolStats(context.Context, DBPoolStats) {}
 
 func (r *captureRecorder) RecordPausedNetworkPressure(context.Context, PausedNetworkPressure) {}
 
-func (r *captureRecorder) RecordLauncherState(context.Context, LauncherState) {}
-func (r *captureRecorder) RecordLatencyPhase(context.Context, LatencyPhase)   {}
-func (r *captureRecorder) RecordPeerIngress(context.Context, PeerIngress)     {}
-func (r *captureRecorder) RecordPeerEvent(context.Context, PeerEvent)         {}
+func (r *captureRecorder) RecordLauncherState(context.Context, LauncherState)     {}
+func (r *captureRecorder) RecordTeardownAttempt(context.Context, TeardownAttempt) {}
+func (r *captureRecorder) RecordTeardownBacklog(context.Context, TeardownBacklog) {}
+func (r *captureRecorder) RecordLatencyPhase(context.Context, LatencyPhase)       {}
+func (r *captureRecorder) RecordPeerIngress(context.Context, PeerIngress)         {}
+func (r *captureRecorder) RecordPeerEvent(context.Context, PeerEvent)             {}
 
 func TestInstrumentedVMDClientRecordsHostID(t *testing.T) {
 	recorder := &captureRecorder{}

@@ -20,12 +20,20 @@ def change(address, actions):
 
 
 class Host2MigrationPlanTest(unittest.TestCase):
-    def run_guard(self, changes):
-        return subprocess.run(
-            [sys.executable, str(SCRIPT)],
-            input=json.dumps({"format_version": "1.2", "resource_changes": changes}),
-            text=True, capture_output=True,
-        )
+    def run_guard(self, changes, guarded=None):
+        plan = {"format_version": "1.2", "resource_changes": changes}
+        cmd = [sys.executable, str(SCRIPT)] + (["--guarded", guarded] if guarded else [])
+        return subprocess.run(cmd, input=json.dumps(plan), text=True, capture_output=True)
+
+    def test_named_guarded_host_is_protected_and_the_other_may_retire(self):
+        third = "module.sandbox_host_c.google_compute_instance.this"
+        result = self.run_guard([change(third, ["update"])], guarded="module.sandbox_host_c")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(third, result.stderr)
+        result = self.run_guard([change(HOST, ["delete"]), change(third, ["no-op"])], guarded="module.sandbox_host_c")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Without the flag the default host stays guarded and the third is not.
+        self.assertEqual(self.run_guard([change(third, ["update"])]).returncode, 0)
 
     def test_blocks_vm_changes_and_identity_adapter_independently(self):
         for address in (HOST, IDENTITY):
@@ -57,6 +65,17 @@ class Host2MigrationPlanTest(unittest.TestCase):
                     text=True, capture_output=True,
                 )
                 self.assertNotEqual(result.returncode, 0)
+
+    def test_east_rollout_guards_its_named_host_before_apply(self):
+        workflow = (SCRIPT.parent.parent / ".github/workflows/terraform-cd.yml").read_text()
+        block = workflow.split("cd infra/envs/production/us-east4\n", 1)[1]
+        before_apply = block.split("terraform apply", 1)[0]
+        self.assertIn(
+            'terraform plan -input=false -out=tfplan\n'
+            '          terraform show -json tfplan | python3 '
+            '"$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --guarded module.sandbox_host_c\n',
+            before_apply,
+        )
 
     def test_all_rollout_paths_guard_the_saved_plan_before_apply(self):
         workflows = SCRIPT.parent.parent / ".github/workflows"

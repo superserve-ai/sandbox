@@ -231,7 +231,6 @@ WITH target_host AS MATERIALIZED (
     AND last_heartbeat_at IS NOT NULL
     AND ($4::timestamptz IS NULL
          OR last_heartbeat_at > $4)
-  FOR SHARE
 )
 SELECT EXISTS (
   SELECT 1
@@ -257,10 +256,9 @@ type HostHasCapabilitiesParams struct {
 	HeartbeatAfter       pgtype.Timestamptz `json:"heartbeat_after"`
 }
 
-// Lock the one eligible host row whose heartbeat anchors this capability set.
-// Callers that run this in a mutation transaction keep the host stable until
-// VMD delivery and commit, while the relational division below proves that
-// every requested capability belongs to that exact heartbeat.
+// Evaluate in a new READ COMMITTED statement after LockHostForCapabilities,
+// in the same transaction, to avoid mixing pre-wait capability rows with a
+// post-wait host row. Lifecycle callers use LockedHostHasCapabilities.
 func (q *Queries) HostHasCapabilities(ctx context.Context, arg HostHasCapabilitiesParams) (bool, error) {
 	row := q.db.QueryRow(ctx, hostHasCapabilities,
 		arg.RequiredCapabilities,
@@ -317,7 +315,7 @@ type HostHasCapabilitiesUnlockedRow struct {
 // HostHasCapabilities without the row lock, for standalone pre-flight reads
 // outside a mutation transaction: omitting the lock keeps concurrent checks
 // from serializing behind the host's heartbeat writer. Transactional callers
-// that must pin the host across a commit use HostHasCapabilities.
+// that must pin the host across a commit use LockedHostHasCapabilities.
 //
 // Also returns the host's VMD address (empty when the host is ineligible),
 // so the caller can record this read as the registry's address verification.
@@ -813,6 +811,18 @@ func (q *Queries) ListStaleHosts(ctx context.Context, lastHeartbeatAt pgtype.Tim
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockHostForCapabilities = `-- name: LockHostForCapabilities :execrows
+SELECT id FROM host WHERE id = $1 FOR SHARE
+`
+
+func (q *Queries) LockHostForCapabilities(ctx context.Context, hostID string) (int64, error) {
+	result, err := q.db.Exec(ctx, lockHostForCapabilities, hostID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const markHostUnhealthy = `-- name: MarkHostUnhealthy :exec

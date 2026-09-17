@@ -109,10 +109,10 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig, logger zero
 		Msg("timeout reaper started")
 
 	// Own goroutine, not another case in the select below: the poll's pauses
-	// and auto-delete teardowns block for host round trips, and sharing this
-	// goroutine would let a slow batch hold off the sweeps — the reason they
-	// ran last in the single-ticker loop this replaced. Concurrency here is
-	// not new: every control-plane instance already runs both loops.
+	// block for host round trips, and sharing this goroutine would let a
+	// slow batch hold off the sweeps — the reason they ran last in the
+	// single-ticker loop this replaced. Concurrency here is not new: every
+	// control-plane instance already runs both loops.
 	go h.sweepLoop(ctx, sweepInterval, logger)
 
 	ticker := time.NewTicker(cfg.Interval)
@@ -120,7 +120,7 @@ func (h *Handlers) reaperLoop(ctx context.Context, cfg ReaperConfig, logger zero
 
 	runTick := func() {
 		sentrylog.RunSafe("reaper", func() { h.reapOnce(ctx, cfg.BatchSize, parallelism, logger) })
-		sentrylog.RunSafe("auto-delete", func() { h.reapAutoDeleteOnce(ctx, cfg.BatchSize, parallelism, logger) })
+		sentrylog.RunSafe("auto-delete", func() { h.reapAutoDeleteOnce(ctx, cfg.BatchSize, logger) })
 	}
 
 	// Run once immediately so a control plane restart does not delay
@@ -271,15 +271,16 @@ func (h *Handlers) sweepOrphanedSnapshotRows(ctx context.Context, logger zerolog
 
 // reapAutoDeleteOnce deletes paused sandboxes whose auto-delete deadline has
 // passed. ClaimAutoDeleteSandboxes soft-deletes the rows (revocation written,
-// intervals closed) in one guarded statement, so everything after the claim is
-// best-effort teardown of VM state and artifacts — same contract as the
-// user-initiated DeleteSandbox, where the vm reconciler backstops any teardown
-// step that fails.
-func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, parallelism int, logger zerolog.Logger) {
+// intervals closed, reclaim recorded) in one guarded statement. The reclaim
+// itself is the teardown sweeper's from the start: nothing here waits on a
+// host, and no record is ever owned twice, which an inline attempt on a
+// batch this size could not promise.
+func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, logger zerolog.Logger) {
 	queryCtx, queryCancel := context.WithTimeout(ctx, 10*time.Second)
 	due, err := h.DB.ClaimAutoDeleteSandboxes(queryCtx, db.ClaimAutoDeleteSandboxesParams{
 		BatchSize:           batchSize,
 		RevocationExpiresAt: time.Now().Add(SecretsJWTLifetime),
+		LeaseSeconds:        0,
 	})
 	queryCancel()
 	if err != nil {
@@ -291,35 +292,16 @@ func (h *Handlers) reapAutoDeleteOnce(ctx context.Context, batchSize int32, para
 		return
 	}
 
-	logger.Info().Int("count", len(due)).Msg("reaper: deleting expired paused sandboxes")
-
-	dispatchBounded(ctx, due, parallelism, func(sbx db.ClaimAutoDeleteSandboxesRow) {
-		h.teardownAutoDeleted(ctx, sbx, logger)
-	})
-}
-
-// autoDeleteTeardownTimeout bounds one sandbox's teardown in the reaper.
-// The VMD calls inside carry their own timeouts, but the snapshot DB calls
-// do not — without this umbrella a hung query would pin a dispatch slot and
-// wedge the reaper loop on wg.Wait.
-const autoDeleteTeardownTimeout = 2 * time.Minute
-
-// teardownAutoDeleted reclaims VM state for one sandbox already soft-deleted
-// by ClaimAutoDeleteSandboxes, via the same teardown path as DeleteSandbox.
-func (h *Handlers) teardownAutoDeleted(ctx context.Context, sbx db.ClaimAutoDeleteSandboxesRow, logger zerolog.Logger) {
-	l := logger.With().
-		Str("sandbox_id", sbx.ID.String()).
-		Str("host_id", sbx.HostID).
-		Str("team_id", sbx.TeamID.String()).
-		Str("name", sbx.Name).
-		Logger()
-
-	tctx, cancel := context.WithTimeout(ctx, autoDeleteTeardownTimeout)
-	defer cancel()
-	h.teardownDestroyedSandbox(tctx, sbx.ID, sbx.HostID, sbx.BasePath, sbx.TemplateID)
-
-	l.Info().Msg("reaper: sandbox auto-deleted after paused window elapsed")
-	h.logSandboxActivity(tctx, sbx.ID, sbx.TeamID, nil, "sandbox", "auto_deleted", "success", &sbx.Name, nil, nil)
+	logger.Info().Int("count", len(due)).Msg("reaper: deleted expired paused sandboxes; the sweeper reclaims their hosts")
+	for _, sbx := range due {
+		logger.Info().
+			Str("sandbox_id", sbx.ID.String()).
+			Str("host_id", sbx.HostID).
+			Str("team_id", sbx.TeamID.String()).
+			Str("name", sbx.Name).
+			Msg("reaper: sandbox auto-deleted after paused window elapsed")
+		h.logSandboxActivity(ctx, sbx.ID, sbx.TeamID, nil, "sandbox", "auto_deleted", "success", &sbx.Name, nil, nil)
+	}
 }
 
 // pauseExpired pauses one sandbox that was atomically claimed by

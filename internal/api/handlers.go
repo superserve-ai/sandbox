@@ -174,6 +174,17 @@ type Handlers struct {
 	asyncCond  *sync.Cond // lazily created by WaitAsyncBookkeeping, guarded by asyncMu
 	asyncCount int
 
+	// TeardownInlineBudget bounds the host reclaim a delete runs before it
+	// answers; zero means the default. The sweeper finishes whatever did
+	// not fit.
+	TeardownInlineBudget time.Duration
+	// inlineTeardowns caps how many inline reclaims may hold a vmd RPC at
+	// once on this replica; a delete that finds it full leaves its reclaim
+	// to the sweeper. Lazily set up so struct-literal construction in tests
+	// needs nothing.
+	inlineTeardownsOnce sync.Once
+	inlineTeardowns     chan struct{}
+
 	// activityGate caps how many activity-log inserts may hold DB connections
 	// at once (see writeActivity). Lazily created so struct-literal
 	// construction keeps working.
@@ -212,21 +223,30 @@ type Handlers struct {
 // needs that protection must therefore run BEFORE the status flip inside the
 // same job, the way the create path orders its stamp before ActivateSandbox.
 func (h *Handlers) asyncBookkeeping(name string, fn func()) {
-	h.asyncMu.Lock()
-	h.asyncCount++
-	h.asyncMu.Unlock()
+	h.asyncBegin()
 	go func() {
-		defer func() {
-			h.asyncMu.Lock()
-			h.asyncCount--
-			if h.asyncCount == 0 && h.asyncCond != nil {
-				h.asyncCond.Broadcast()
-			}
-			h.asyncMu.Unlock()
-		}()
+		defer h.asyncEnd()
 		defer sentrylog.Recover(name)
 		fn()
 	}()
+}
+
+// asyncBegin/asyncEnd bracket one unit of fire-and-forget work for
+// WaitAsyncBookkeeping, whether it runs on its own goroutine or on a pooled
+// worker (delete teardowns).
+func (h *Handlers) asyncBegin() {
+	h.asyncMu.Lock()
+	h.asyncCount++
+	h.asyncMu.Unlock()
+}
+
+func (h *Handlers) asyncEnd() {
+	h.asyncMu.Lock()
+	h.asyncCount--
+	if h.asyncCount == 0 && h.asyncCond != nil {
+		h.asyncCond.Broadcast()
+	}
+	h.asyncMu.Unlock()
 }
 
 // WaitAsyncBookkeeping blocks until no fire-and-forget bookkeeping goroutines
@@ -1608,12 +1628,14 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	// — this CAS and resume's BeginResume cannot both win the same row — while still
 	// letting a crash-wedged sandbox be deleted. The same statement writes the
 	// revocation row, so a crash before teardown can't leave a live VM with a valid JWT.
-	if _, err := h.DB.DestroySandbox(c.Request.Context(), db.DestroySandboxParams{
+	destroyed, err := h.DB.DestroySandbox(c.Request.Context(), db.DestroySandboxParams{
 		ID:                      sandboxID,
 		TeamID:                  teamID,
 		RevocationExpiresAt:     time.Now().Add(SecretsJWTLifetime),
 		StaleTransitionalBefore: time.Now().Add(-staleTransitionGrace),
-	}); err != nil {
+		LeaseSeconds:            h.birthLeaseSeconds(),
+	})
+	if err != nil {
 		if err == pgx.ErrNoRows {
 			// Not claimable from its current state. Re-read to tell a
 			// just-completed delete (idempotent) from a transitional state
@@ -1636,7 +1658,18 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 		return
 	}
 
-	h.teardownDestroyedSandbox(c.Request.Context(), sandboxID, sandbox.HostID, sandbox.BasePath, sandbox.TemplateID)
+	// The row is deleted and the host-side reclaim it owes is recorded with
+	// it, owned by this request for one bounded attempt. A reachable host is
+	// done in a fraction of the budget, and a caller that deletes and
+	// re-creates then finds the VM's memory, cores and network slot already
+	// released; a host that does not answer costs the caller the budget and
+	// nothing more, and the sweeper finishes the reclaim. The context is
+	// detached from the request so a client that goes away mid-reclaim does
+	// not interrupt it.
+	h.teardownInline(context.WithoutCancel(c.Request.Context()), teardownRecord{
+		SandboxID: destroyed.ID, HostID: destroyed.HostID, BasePath: destroyed.BasePath,
+		TemplateID: destroyed.TemplateID, Attempts: 1,
+	}, "delete")
 
 	// DestroySandbox's CTE atomically closed the open sandbox_active_interval row.
 	h.logSandboxActivity(c.Request.Context(), sandboxID, teamID, actorIDFromContext(c), "sandbox", "deleted", "success", &sandbox.Name, nil, nil)
@@ -1645,55 +1678,312 @@ func (h *Handlers) DeleteSandbox(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// teardownDestroyedSandbox reclaims host-side state for a sandbox whose
-// guarded soft-delete has already committed: the VM (with its run dir and
-// netns), pause snapshots, and the per-build artifact dir. Best-effort
-// throughout — the vm reconciler backstops anything missed here. Shared by
-// user-initiated deletes and the auto-delete reaper so the two paths cannot
-// diverge.
-func (h *Handlers) teardownDestroyedSandbox(ctx context.Context, sandboxID uuid.UUID, hostID string, basePath *string, templateID pgtype.UUID) {
+// Reclaim timing. The inline budget is the whole of what a delete spends on
+// its own reclaim before answering, settlement included: the reclaim runs
+// under the budget less a reserve kept for the settle. The record is born
+// owned for the budget plus teardownBirthLeaseMargin, so the sweeper takes
+// over shortly after an inline attempt that did not finish, was skipped, or
+// died with the process. teardownLease is the sweeper's own lease per
+// attempt and outlasts the sweep budget plus its settle. Retries back off
+// from teardownRetryMin, doubling per attempt, up to teardownRetryMax,
+// which permanent failures use from the start.
+const (
+	defaultTeardownInlineBudget = 5 * time.Second
+	maxTeardownInlineBudget     = 30 * time.Second
+	teardownSettleReserveMax    = 500 * time.Millisecond
+	teardownBirthLeaseMargin    = 5 * time.Second
+	teardownSweepBudget         = 30 * time.Second
+	teardownLease               = 60 * time.Second
+	teardownSweepInterval       = 30 * time.Second
+	teardownSweepWorkers        = 8
+	teardownRetryMin            = 30 * time.Second
+	teardownRetryMax            = time.Hour
+	maxInlineTeardowns          = 64
+)
+
+// errTeardownHostUnregistered: the sandbox's host is no longer known to the
+// control plane, so no retry can reach it; the reclaim is kept for an
+// operator.
+var errTeardownHostUnregistered = errors.New("host not registered")
+
+// teardownRecord is one sandbox_teardown row as an attempt sees it. The
+// attempt number is the fence every settle carries: a worker whose lease
+// ran out cannot complete or defer what a newer attempt owns.
+type teardownRecord struct {
+	SandboxID  uuid.UUID
+	HostID     string
+	BasePath   *string
+	TemplateID pgtype.UUID
+	Attempts   int32
+}
+
+func (h *Handlers) inlineBudget() time.Duration {
+	if h.TeardownInlineBudget <= 0 {
+		return defaultTeardownInlineBudget
+	}
+	return min(h.TeardownInlineBudget, maxTeardownInlineBudget)
+}
+
+// birthLeaseSeconds is how long a delete owns its record: its inline budget
+// and a margin for the response.
+func (h *Handlers) birthLeaseSeconds() int32 {
+	return int32((h.inlineBudget() + teardownBirthLeaseMargin) / time.Second)
+}
+
+// teardownInline runs the attempt the record was born owning, bounded as a
+// whole by the inline budget. When this replica already has its fill of
+// inline reclaims on the wire the attempt is skipped outright, with no
+// database call on the way out: the sweeper takes the record when its
+// birth lease ends.
+func (h *Handlers) teardownInline(ctx context.Context, rec teardownRecord, path string) {
+	h.inlineTeardownsOnce.Do(func() { h.inlineTeardowns = make(chan struct{}, maxInlineTeardowns) })
+	select {
+	case h.inlineTeardowns <- struct{}{}:
+	default:
+		l := sandboxLogger(rec.SandboxID.String(), rec.HostID)
+		l.Info().Msg("teardown: inline limiter full; left to the sweeper")
+		recordTeardownAttempt(ctx, path, "skipped")
+		return
+	}
+	defer func() { <-h.inlineTeardowns }()
+	budget := h.inlineBudget()
+	settleCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	runCtx, cancelRun := context.WithTimeout(settleCtx, budget-min(teardownSettleReserveMax, budget/10))
+	defer cancelRun()
+	h.settleTeardown(settleCtx, rec, path, h.reclaimSandbox(runCtx, rec))
+}
+
+// reclaimSandbox reclaims host-side state for a sandbox whose guarded
+// soft-delete has already committed: the VM (with its run dir and netns),
+// pause snapshots, and the per-build artifact dir. Every step is idempotent
+// and NotFound from the host means done, so a retry runs the whole sequence
+// again. Inline attempts and the sweeper both come through here, so the two
+// cannot diverge in what they reclaim.
+func (h *Handlers) reclaimSandbox(ctx context.Context, rec teardownRecord) error {
+	if err := h.teardownVM(ctx, rec.SandboxID, rec.HostID); err != nil {
+		return err
+	}
+	if err := h.cleanupSandboxSnapshots(ctx, rec.SandboxID, rec.HostID); err != nil {
+		return err
+	}
+	return h.gcOldBuildArtifacts(ctx, rec.HostID, rec.BasePath, rec.TemplateID)
+}
+
+// settleTeardown writes the attempt's outcome within ctx. A host that did
+// not answer holds the host's other pending reclaims too, so the sweeper
+// does not try them one by one; reclaims in flight elsewhere are not
+// touched. With ctx already spent nothing is written: the record's lease
+// runs out and the sweeper recovers it.
+func (h *Handlers) settleTeardown(ctx context.Context, rec teardownRecord, path string, err error) {
+	l := sandboxLogger(rec.SandboxID.String(), rec.HostID)
+	if ctx.Err() != nil {
+		l.Warn().AnErr("attempt", err).Msg("teardown: budget spent before settling; the lease recovers it")
+		recordTeardownAttempt(ctx, path, "timeout")
+		return
+	}
+	sctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err == nil {
+		if _, cerr := h.DB.CompleteTeardown(sctx, db.CompleteTeardownParams{SandboxID: rec.SandboxID, Attempts: rec.Attempts}); cerr != nil {
+			l.Warn().Err(cerr).Msg("teardown done but its record could not be removed; the sweeper will repeat it")
+		}
+		recordTeardownAttempt(ctx, path, "completed")
+		return
+	}
+	result, retry := "deferred", teardownBackoff(rec.Attempts)
+	permanent := errors.Is(err, errTeardownHostUnregistered)
+	switch {
+	case permanent:
+		result, retry = "permanent", teardownRetryMax
+	case errors.Is(err, context.DeadlineExceeded):
+		result = "timeout"
+	}
+	msg := err.Error()
+	if _, derr := h.DB.DeferTeardown(sctx, db.DeferTeardownParams{
+		RetryAfterSeconds: int32(retry / time.Second), Permanent: permanent, LastError: &msg,
+		SandboxID: rec.SandboxID, Attempts: rec.Attempts,
+	}); derr != nil {
+		l.Warn().Err(derr).Msg("teardown could not be deferred; the sweeper retries it when the lease ends")
+	}
+	if isVMDUnavailable(err) || isVMDDeadline(err) {
+		held, herr := h.DB.DeferHostTeardowns(sctx, db.DeferHostTeardownsParams{
+			RetryAfterSeconds: int32(retry / time.Second), LastError: &msg, HostID: rec.HostID,
+		})
+		if herr != nil {
+			l.Warn().Err(herr).Msg("teardown: holding the host's other reclaims failed")
+		} else if held > 0 {
+			l.Info().Int64("held", held).Dur("retry_after", retry).Msg("teardown: host did not answer; its other reclaims wait too")
+		}
+	}
+	l.Warn().Err(err).Str("result", result).Int32("attempts", rec.Attempts).Dur("retry_after", retry).Msg("teardown incomplete")
+	recordTeardownAttempt(ctx, path, result)
+}
+
+func teardownBackoff(attempts int32) time.Duration {
+	if attempts < 1 {
+		attempts = 1
+	}
+	if attempts > 8 {
+		return teardownRetryMax
+	}
+	return min(teardownRetryMin<<(attempts-1), teardownRetryMax)
+}
+
+func recordTeardownAttempt(ctx context.Context, path, result string) {
+	currentTelemetryRecorder().RecordTeardownAttempt(ctx, telemetry.TeardownAttempt{Path: path, Result: result})
+}
+
+// StartTeardownSweeper retries recorded reclaims nobody owns: inline
+// attempts that ran out of budget, were skipped, or died with the process,
+// and deferred ones whose backoff has passed. Every replica sweeps; the
+// claim is atomic and takes the host's lease with the record, so no two
+// workers anywhere share a record or work the same host at once.
+func (h *Handlers) StartTeardownSweeper(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(teardownSweepInterval)
+		defer ticker.Stop()
+		log.Info().Msg("teardown sweeper started")
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sentrylog.RunSafe("teardown-sweep", func() { h.SweepTeardowns(ctx) })
+			}
+		}
+	}()
+}
+
+// SweepTeardowns drains claimable reclaims with a fixed set of workers, each
+// taking one record at a time until none is left, then publishes the
+// backlog. Exported so tests can run one sweep directly.
+func (h *Handlers) SweepTeardowns(ctx context.Context) {
+	var wg sync.WaitGroup
+	for i := 0; i < teardownSweepWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer sentrylog.Recover("teardown-sweep-worker")
+			for ctx.Err() == nil {
+				rec, ok := h.claimNextTeardown(ctx)
+				if !ok {
+					return
+				}
+				runCtx, cancelRun := context.WithTimeout(ctx, teardownSweepBudget)
+				err := h.reclaimSandbox(runCtx, rec)
+				cancelRun()
+				// The settle clock starts after the reclaim: a slow host must not eat it.
+				settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+				h.settleTeardown(settleCtx, rec, "sweep", err)
+				cancelSettle()
+				h.releaseTeardownHost(ctx, rec)
+			}
+		}()
+	}
+	wg.Wait()
+	h.recordTeardownBacklog(ctx)
+}
+
+// claimNextTeardown takes the sweeper's next record and its host's lease.
+// The database serializes claims for one host across replicas; a claim
+// that loses that race comes back empty although other hosts may have
+// work, so an empty claim is asked once more before the worker stops.
+func (h *Handlers) claimNextTeardown(ctx context.Context) (teardownRecord, bool) {
+	for try := 0; try < 2; try++ {
+		qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		row, err := h.DB.ClaimNextTeardown(qctx, int32(teardownLease/time.Second))
+		cancel()
+		switch {
+		case err == nil:
+			return teardownRecord{SandboxID: row.SandboxID, HostID: row.HostID, BasePath: row.BasePath, TemplateID: row.TemplateID, Attempts: row.Attempts}, true
+		case errors.Is(err, pgx.ErrNoRows):
+			continue
+		default:
+			log.Warn().Err(err).Msg("teardown sweep: claim failed")
+			return teardownRecord{}, false
+		}
+	}
+	return teardownRecord{}, false
+}
+
+func (h *Handlers) releaseTeardownHost(ctx context.Context, rec teardownRecord) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := h.DB.ReleaseTeardownHost(rctx, db.ReleaseTeardownHostParams{HostID: rec.HostID, SandboxID: rec.SandboxID, Attempt: rec.Attempts}); err != nil {
+		l := sandboxLogger(rec.SandboxID.String(), rec.HostID)
+		l.Warn().Err(err).Msg("teardown sweep: host release failed; the host waits out the lease")
+	}
+}
+
+func (h *Handlers) recordTeardownBacklog(ctx context.Context) {
+	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	b, err := h.DB.TeardownBacklog(qctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("teardown sweep: backlog query failed")
+		return
+	}
+	currentTelemetryRecorder().RecordTeardownBacklog(ctx, telemetry.TeardownBacklog{
+		Total: b.Total, Permanent: b.Permanent, Retrying: b.Retrying, OldestAgeSeconds: b.OldestAgeSeconds,
+	})
+	if b.Total > 0 {
+		log.Info().Int64("total", b.Total).Int64("retrying", b.Retrying).Int64("permanent", b.Permanent).
+			Float64("oldest_age_seconds", b.OldestAgeSeconds).Msg("teardown backlog")
+	}
+}
+
+// hostForTeardown resolves the host's client. A host the control plane no
+// longer knows is a permanent failure; anything else is retried.
+func (h *Handlers) hostForTeardown(ctx context.Context, hostID string) (VMDClient, error) {
+	vmd, err := h.vmdForHost(ctx, hostID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("%w: %v", errTeardownHostUnregistered, err)
+		}
+		return nil, fmt.Errorf("resolve host: %w", err)
+	}
+	return vmd, nil
+}
+
+// teardownVM fans out the revocation and tears the VM down.
+func (h *Handlers) teardownVM(ctx context.Context, sandboxID uuid.UUID, hostID string) error {
 	l := sandboxLogger(sandboxID.String(), hostID)
 	// The revocation row is committed with the delete claim; fan it out to the
 	// host so the daemon refuses the JWT now. Best-effort — bootstrap re-fans
 	// from the persisted row on restart.
 	go h.fanoutSandboxRevoke(context.Background(), sandboxID, hostID)
 
-	// Tear down the VM best-effort and unconditionally: a sandbox claimed from a
-	// stale transition or a 'failed' state may still hold a VM, run dir, and netns
-	// that only DestroyInstance reclaims (an absent VM is an idempotent no-op). A
-	// failure here is reconciled by the vm reconciler, so a vmd hiccup must not fail
-	// an already-committed delete.
-	if vmd, lookupErr := h.vmdForHost(ctx, hostID); lookupErr != nil {
-		l.Warn().Err(lookupErr).Msg("resolve VMD for delete teardown; reconciler will reclaim")
-	} else {
-		vmdCtx, vmdCancel := context.WithTimeout(ctx, vmdTimeout)
-		if derr := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); derr != nil && !isVMDNotFound(derr) {
-			l.Warn().Err(derr).Msg("VMD DestroyInstance for delete teardown; reconciler will reclaim")
-		}
-		vmdCancel()
+	// Tear down the VM unconditionally: a sandbox claimed from a stale
+	// transition or a 'failed' state may still hold a VM, run dir, and netns
+	// that only DestroyInstance reclaims (an absent VM is an idempotent
+	// no-op).
+	vmd, err := h.hostForTeardown(ctx, hostID)
+	if err != nil {
+		l.Warn().Err(err).Msg("resolve VMD for delete teardown")
+		return err
 	}
-
-	// Best-effort cleanup of pause snapshots. Failures are logged but
-	// don't fail the delete — manual cleanup may be required if vmd was
-	// unreachable.
-	h.cleanupSandboxSnapshots(ctx, sandboxID, hostID)
-
-	// Best-effort GC of the per-build artifact dir if this sandbox was the
-	// last reference and the template has since moved to a newer build.
-	h.gcOldBuildArtifacts(ctx, hostID, basePath, templateID)
+	vmdCtx, cancel := context.WithTimeout(ctx, vmdTimeout)
+	defer cancel()
+	if derr := vmd.DestroyInstance(vmdCtx, sandboxID.String(), true); derr != nil && !isVMDNotFound(derr) {
+		l.Warn().Err(derr).Msg("VMD DestroyInstance for delete teardown")
+		return fmt.Errorf("destroy vm: %w", derr)
+	}
+	return nil
 }
 
 // gcOldBuildArtifacts deletes the per-build dir if the just-destroyed sandbox
 // at sandboxBasePath was the last reference and the template has moved on.
-// Best-effort.
-func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sandboxBasePath *string, sandboxTemplateID pgtype.UUID) {
+// Nothing to do is not an error; a step that did not run is, so the reclaim
+// is retried rather than recorded complete with the dir still there.
+func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sandboxBasePath *string, sandboxTemplateID pgtype.UUID) error {
 	if sandboxBasePath == nil || !sandboxTemplateID.Valid {
-		return
+		return nil
 	}
 	basePath := *sandboxBasePath
 	buildID := filepath.Base(filepath.Dir(basePath))
 	if buildID == "" || buildID == "." || buildID == string(filepath.Separator) {
-		return
+		return nil
 	}
 	templateID := uuid.UUID(sandboxTemplateID.Bytes).String()
 
@@ -1702,76 +1992,82 @@ func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sa
 
 	refs, err := h.DB.CountActiveSandboxesAtBasePath(gcCtx, &basePath)
 	if err != nil {
-		log.Warn().Err(err).Str("base_path", basePath).Msg("gc: CountActiveSandboxesAtBasePath")
-		return
+		return fmt.Errorf("gc: count references: %w", err)
 	}
 	if refs > 0 {
-		return
+		return nil
 	}
 	// Team-blind: sandbox's team may not own the template (system templates),
 	// so GetTemplateForOwner would falsely report "not in use" → over-delete.
+	// A template that is gone has no current build to protect, and its own
+	// cleanup may not have reached this host, so the delete still runs.
 	tplBase, err := h.DB.GetTemplateBasePath(gcCtx, sandboxTemplateID.Bytes)
-	if err != nil {
-		log.Warn().Err(err).Str("base_path", basePath).Msg("gc: GetTemplateBasePath")
-		return
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("gc: template base path: %w", err)
 	}
-	if tplBase != nil && *tplBase == basePath {
-		return
+	if err == nil && tplBase != nil && *tplBase == basePath {
+		return nil
 	}
 
-	vmd, err := h.vmdForHost(gcCtx, hostID)
+	vmd, err := h.hostForTeardown(gcCtx, hostID)
 	if err != nil {
-		return
+		return err
 	}
-	if err := vmd.DeleteBuildArtifacts(gcCtx, templateID, buildID); err != nil {
+	if err := vmd.DeleteBuildArtifacts(gcCtx, templateID, buildID); err != nil && !isVMDNotFound(err) {
 		log.Warn().Err(err).Str("template_id", templateID).Str("build_id", buildID).Msg("gc: DeleteBuildArtifacts")
+		return fmt.Errorf("gc: delete build artifacts: %w", err)
 	}
+	return nil
 }
 
 // cleanupSandboxSnapshots deletes the on-disk snapshot files via vmd and
-// the snapshot DB rows for a destroyed sandbox. Best-effort.
-func (h *Handlers) cleanupSandboxSnapshots(reqCtx context.Context, sandboxID uuid.UUID, hostID string) {
+// the snapshot DB rows for a destroyed sandbox. The rows stay while the
+// files could not be removed, so a retry still finds them.
+func (h *Handlers) cleanupSandboxSnapshots(reqCtx context.Context, sandboxID uuid.UUID, hostID string) error {
 	l := sandboxLogger(sandboxID.String(), hostID)
 	// List snapshot rows first: they feed the per-file fallback below and are
 	// cleared at the end.
 	snaps, err := h.DB.ListSnapshotsBySandbox(reqCtx, sandboxID)
 	if err != nil {
-		l.Warn().Err(err).Msg("list snapshots for cleanup")
+		return fmt.Errorf("list snapshots: %w", err)
 	}
 
 	// Remove the whole <SnapshotDir>/<id>/ tree path-based, independent of
 	// snapshot DB rows — reclaims pause artifacts even when a row is missing.
 	// On an old vmd that predates this RPC (control-plane-deploys-first window),
-	// fall back to the per-file delete so cleanup still runs. Best-effort;
-	// anything missed is left for out-of-band GC.
-	if vmd, verr := h.vmdForHost(reqCtx, hostID); verr != nil {
-		l.Warn().Err(verr).Msg("resolve vmd for snapshot cleanup; files may need GC")
-	} else {
-		ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
-		switch delErr := vmd.DeleteSandboxSnapshots(ctx, sandboxID.String()); {
-		case delErr == nil || isVMDNotFound(delErr):
-		case isVMDUnimplemented(delErr):
-			for _, s := range snaps {
-				memPath := ""
-				if s.MemPath != nil {
-					memPath = *s.MemPath
-				}
-				if e := vmd.DeleteSnapshot(ctx, sandboxID.String(), s.Path, memPath); e != nil && !isVMDNotFound(e) {
-					l.Warn().Err(e).Str("snapshot_id", s.ID.String()).Msg("vmd DeleteSnapshot (fallback) failed")
-				}
+	// fall back to the per-file delete so cleanup still runs.
+	vmd, err := h.hostForTeardown(reqCtx, hostID)
+	if err != nil {
+		l.Warn().Err(err).Msg("resolve vmd for snapshot cleanup")
+		return err
+	}
+	ctx, cancel := context.WithTimeout(reqCtx, vmdTimeout)
+	defer cancel()
+	switch delErr := vmd.DeleteSandboxSnapshots(ctx, sandboxID.String()); {
+	case delErr == nil || isVMDNotFound(delErr):
+	case isVMDUnimplemented(delErr):
+		for _, s := range snaps {
+			memPath := ""
+			if s.MemPath != nil {
+				memPath = *s.MemPath
 			}
-		default:
-			l.Warn().Err(delErr).Msg("vmd DeleteSandboxSnapshots failed; files may need GC")
+			if e := vmd.DeleteSnapshot(ctx, sandboxID.String(), s.Path, memPath); e != nil && !isVMDNotFound(e) {
+				l.Warn().Err(e).Str("snapshot_id", s.ID.String()).Msg("vmd DeleteSnapshot (fallback) failed")
+				return fmt.Errorf("delete snapshot: %w", e)
+			}
 		}
-		cancel()
+	default:
+		l.Warn().Err(delErr).Msg("vmd DeleteSandboxSnapshots failed")
+		return fmt.Errorf("delete snapshots: %w", delErr)
 	}
 
 	// Clear the snapshot DB rows (their files are gone above).
 	for _, s := range snaps {
 		if delErr := h.DB.DeleteSnapshot(reqCtx, s.ID); delErr != nil {
-			log.Warn().Err(delErr).Str("snapshot_id", s.ID.String()).Msg("DB DeleteSnapshot failed")
+			return fmt.Errorf("delete snapshot row %s: %w", s.ID, delErr)
 		}
 	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

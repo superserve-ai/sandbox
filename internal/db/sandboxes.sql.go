@@ -338,6 +338,13 @@ revoked AS (
   SELECT id, $2 FROM destroyed WHERE had_secret_bindings IS NOT FALSE
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
+owed AS (
+  -- No inline attempt here: born at zero so the sweeper's first claim is attempt 1.
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until, attempts)
+  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => $3::int), 0
+  FROM destroyed
+  ON CONFLICT (sandbox_id) DO NOTHING
+),
 closed_compute AS (
   UPDATE sandbox_active_interval
   SET ended_at = GREATEST(now(), started_at), end_reason = 'deleted'
@@ -366,6 +373,7 @@ FROM destroyed d
 type ClaimAutoDeleteSandboxesParams struct {
 	BatchSize           int32     `json:"batch_size"`
 	RevocationExpiresAt time.Time `json:"revocation_expires_at"`
+	LeaseSeconds        int32     `json:"lease_seconds"`
 }
 
 type ClaimAutoDeleteSandboxesRow struct {
@@ -389,7 +397,7 @@ type ClaimAutoDeleteSandboxesRow struct {
 // after the claim can't strand a deleted sandbox with a live JWT or an open
 // interval. Returns the columns the caller needs for VM/artifact teardown.
 func (q *Queries) ClaimAutoDeleteSandboxes(ctx context.Context, arg ClaimAutoDeleteSandboxesParams) ([]ClaimAutoDeleteSandboxesRow, error) {
-	rows, err := q.db.Query(ctx, claimAutoDeleteSandboxes, arg.BatchSize, arg.RevocationExpiresAt)
+	rows, err := q.db.Query(ctx, claimAutoDeleteSandboxes, arg.BatchSize, arg.RevocationExpiresAt, arg.LeaseSeconds)
 	if err != nil {
 		return nil, err
 	}
@@ -595,6 +603,73 @@ func (q *Queries) ClaimExpiredSandbox(ctx context.Context, arg ClaimExpiredSandb
 	return i, err
 }
 
+const claimNextTeardown = `-- name: ClaimNextTeardown :one
+WITH candidate AS (
+  SELECT t.sandbox_id, t.host_id, t.attempts + 1 AS attempt
+  FROM sandbox_teardown t
+  WHERE t.sandbox_id IN (
+    -- One row per host, so racing workers lock rows of different hosts
+    -- rather than piling onto the oldest host and losing its lease.
+    SELECT DISTINCT ON (host_id) sandbox_id
+    FROM sandbox_teardown
+    WHERE lease_until <= now()
+      AND retry_at <= now()
+      AND NOT EXISTS (
+        SELECT 1 FROM sandbox_teardown_host h
+        WHERE h.host_id = sandbox_teardown.host_id AND h.lease_until > now()
+      )
+    ORDER BY host_id, created_at
+  )
+    AND t.lease_until <= now()
+    AND t.retry_at <= now()
+  ORDER BY t.created_at
+  LIMIT 1
+  FOR UPDATE SKIP LOCKED
+),
+host_lease AS (
+  INSERT INTO sandbox_teardown_host (host_id, sandbox_id, attempt, lease_until)
+  SELECT host_id, sandbox_id, attempt, now() + make_interval(secs => $1::int)
+  FROM candidate
+  ON CONFLICT (host_id) DO UPDATE
+    SET sandbox_id = EXCLUDED.sandbox_id, attempt = EXCLUDED.attempt, lease_until = EXCLUDED.lease_until
+    WHERE sandbox_teardown_host.lease_until <= now()
+  RETURNING host_id
+)
+UPDATE sandbox_teardown t
+SET lease_until = now() + make_interval(secs => $1::int),
+    attempts = c.attempt
+FROM candidate c
+JOIN host_lease h ON h.host_id = c.host_id
+WHERE t.sandbox_id = c.sandbox_id
+RETURNING t.sandbox_id, t.host_id, t.base_path, t.template_id, t.attempts
+`
+
+type ClaimNextTeardownRow struct {
+	SandboxID  uuid.UUID   `json:"sandbox_id"`
+	HostID     string      `json:"host_id"`
+	BasePath   *string     `json:"base_path"`
+	TemplateID pgtype.UUID `json:"template_id"`
+	Attempts   int32       `json:"attempts"`
+}
+
+// The sweeper's claim: the oldest reclaim nobody owns whose backoff has
+// passed, on a host no sweeper is working, taking the host's lease in the
+// same statement. Two claims racing for one host serialize on its row in
+// sandbox_teardown_host; the one that finds the lease already taken claims
+// nothing. So a host that does not answer occupies one worker fleet-wide.
+func (q *Queries) ClaimNextTeardown(ctx context.Context, leaseSeconds int32) (ClaimNextTeardownRow, error) {
+	row := q.db.QueryRow(ctx, claimNextTeardown, leaseSeconds)
+	var i ClaimNextTeardownRow
+	err := row.Scan(
+		&i.SandboxID,
+		&i.HostID,
+		&i.BasePath,
+		&i.TemplateID,
+		&i.Attempts,
+	)
+	return i, err
+}
+
 const claimPendingPause = `-- name: ClaimPendingPause :one
 WITH due AS (
   SELECT s.id FROM sandbox s
@@ -786,6 +861,26 @@ func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (Claim
 		&i.TemplateBasePath,
 	)
 	return i, err
+}
+
+const completeTeardown = `-- name: CompleteTeardown :execrows
+DELETE FROM sandbox_teardown
+WHERE sandbox_id = $1 AND attempts = $2
+`
+
+type CompleteTeardownParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Attempts  int32     `json:"attempts"`
+}
+
+// Fenced on the attempt: a worker whose lease ran out cannot remove a
+// reclaim a newer attempt is still working on.
+func (q *Queries) CompleteTeardown(ctx context.Context, arg CompleteTeardownParams) (int64, error) {
+	result, err := q.db.Exec(ctx, completeTeardown, arg.SandboxID, arg.Attempts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const countActiveSandboxesAtBasePath = `-- name: CountActiveSandboxesAtBasePath :one
@@ -1459,6 +1554,64 @@ func (q *Queries) CreateSandboxWithSecrets(ctx context.Context, arg CreateSandbo
 	return i, err
 }
 
+const deferHostTeardowns = `-- name: DeferHostTeardowns :execrows
+UPDATE sandbox_teardown
+SET retry_at = GREATEST(retry_at, now() + make_interval(secs => $1::int)),
+    last_error = $2
+WHERE host_id = $3 AND lease_until <= now()
+`
+
+type DeferHostTeardownsParams struct {
+	RetryAfterSeconds int32   `json:"retry_after_seconds"`
+	LastError         *string `json:"last_error"`
+	HostID            string  `json:"host_id"`
+}
+
+// The host did not answer: hold every reclaim on it that nobody is working
+// on, so the sweeper does not try them one by one. Reclaims in flight are
+// left to their workers, and a reclaim already waiting longer keeps its
+// own backoff.
+func (q *Queries) DeferHostTeardowns(ctx context.Context, arg DeferHostTeardownsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferHostTeardowns, arg.RetryAfterSeconds, arg.LastError, arg.HostID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deferTeardown = `-- name: DeferTeardown :execrows
+UPDATE sandbox_teardown
+SET lease_until = now(),
+    retry_at = now() + make_interval(secs => $1::int),
+    permanent = $2,
+    last_error = $3
+WHERE sandbox_id = $4 AND attempts = $5
+`
+
+type DeferTeardownParams struct {
+	RetryAfterSeconds int32     `json:"retry_after_seconds"`
+	Permanent         bool      `json:"permanent"`
+	LastError         *string   `json:"last_error"`
+	SandboxID         uuid.UUID `json:"sandbox_id"`
+	Attempts          int32     `json:"attempts"`
+}
+
+// The attempt did not finish: release the lease, hold the reclaim for the
+// backoff, keep why. Fenced on the attempt like CompleteTeardown.
+func (q *Queries) DeferTeardown(ctx context.Context, arg DeferTeardownParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deferTeardown,
+		arg.RetryAfterSeconds,
+		arg.Permanent,
+		arg.LastError,
+		arg.SandboxID,
+		arg.Attempts,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const destroySandbox = `-- name: DestroySandbox :one
 WITH destroyed AS (
   UPDATE sandbox
@@ -1470,7 +1623,7 @@ WITH destroyed AS (
       OR (sandbox.status IN ('starting', 'resuming', 'pausing', 'migrating')
           AND sandbox.updated_at < $3)
     )
-  RETURNING id, had_secret_bindings
+  RETURNING id, had_secret_bindings, host_id, base_path, template_id
 ),
 revoked AS (
   -- Only sandboxes that ever had a binding: the proxy consults this set only
@@ -1479,6 +1632,15 @@ revoked AS (
   -- revoke.
   INSERT INTO sandbox_revocation (sandbox_id, expires_at)
   SELECT id, $4 FROM destroyed WHERE had_secret_bindings IS NOT FALSE
+  ON CONFLICT (sandbox_id) DO NOTHING
+),
+owed AS (
+  -- The host-side reclaim is recorded with the delete, so neither a slow
+  -- host nor a control-plane restart can lose it (see sandbox_teardown).
+  -- Owned by the caller for its inline attempt; the sweeper takes it after.
+  INSERT INTO sandbox_teardown (sandbox_id, host_id, base_path, template_id, lease_until)
+  SELECT id, host_id, base_path, template_id, now() + make_interval(secs => $5::int)
+  FROM destroyed
   ON CONFLICT (sandbox_id) DO NOTHING
 ),
 closed_compute AS (
@@ -1502,7 +1664,7 @@ closed_storage AS (
     AND ended_at IS NULL
   RETURNING sandbox_id
 )
-SELECT id FROM destroyed
+SELECT id, host_id, base_path, template_id FROM destroyed
 `
 
 type DestroySandboxParams struct {
@@ -1510,6 +1672,14 @@ type DestroySandboxParams struct {
 	TeamID                  uuid.UUID `json:"team_id"`
 	StaleTransitionalBefore time.Time `json:"stale_transitional_before"`
 	RevocationExpiresAt     time.Time `json:"revocation_expires_at"`
+	LeaseSeconds            int32     `json:"lease_seconds"`
+}
+
+type DestroySandboxRow struct {
+	ID         uuid.UUID   `json:"id"`
+	HostID     string      `json:"host_id"`
+	BasePath   *string     `json:"base_path"`
+	TemplateID pgtype.UUID `json:"template_id"`
 }
 
 // Atomic, guarded soft-delete. Claims the sandbox from a quiescent state
@@ -1525,16 +1695,22 @@ type DestroySandboxParams struct {
 //
 // The revocation + interval-close CTEs are mirrored in ClaimAutoDeleteSandboxes;
 // keep the side effects of both in sync.
-func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) (uuid.UUID, error) {
+func (q *Queries) DestroySandbox(ctx context.Context, arg DestroySandboxParams) (DestroySandboxRow, error) {
 	row := q.db.QueryRow(ctx, destroySandbox,
 		arg.ID,
 		arg.TeamID,
 		arg.StaleTransitionalBefore,
 		arg.RevocationExpiresAt,
+		arg.LeaseSeconds,
 	)
-	var id uuid.UUID
-	err := row.Scan(&id)
-	return id, err
+	var i DestroySandboxRow
+	err := row.Scan(
+		&i.ID,
+		&i.HostID,
+		&i.BasePath,
+		&i.TemplateID,
+	)
+	return i, err
 }
 
 const ensureSandboxPreviewPolicy = `-- name: EnsureSandboxPreviewPolicy :exec
@@ -2756,7 +2932,7 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 const lockSandboxForPreviewMutation = `-- name: LockSandboxForPreviewMutation :one
 SELECT id FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
-FOR UPDATE
+FOR NO KEY UPDATE
 `
 
 type LockSandboxForPreviewMutationParams struct {
@@ -2766,6 +2942,8 @@ type LockSandboxForPreviewMutationParams struct {
 
 // The sandbox row exists for both legacy (no policy row) and strict sandboxes,
 // so it is the stable per-sandbox serialization point across the transition.
+// Allow storage-interval foreign-key checks while a heartbeat holds the host
+// lock: preview validation acquires that host lock after this sandbox lock.
 func (q *Queries) LockSandboxForPreviewMutation(ctx context.Context, arg LockSandboxForPreviewMutationParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, lockSandboxForPreviewMutation, arg.ID, arg.TeamID)
 	var id uuid.UUID
@@ -3000,6 +3178,26 @@ func (q *Queries) ReleasePauseLease(ctx context.Context, arg ReleasePauseLeasePa
 	return result.RowsAffected(), nil
 }
 
+const releaseTeardownHost = `-- name: ReleaseTeardownHost :exec
+UPDATE sandbox_teardown_host
+SET lease_until = now()
+WHERE host_id = $1 AND sandbox_id = $2 AND attempt = $3
+`
+
+type ReleaseTeardownHostParams struct {
+	HostID    string    `json:"host_id"`
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Attempt   int32     `json:"attempt"`
+}
+
+// The sweeper's attempt on this host is over; fenced on the reclaim attempt
+// it was working so a worker whose lease ran out cannot release a newer
+// holder, even one working the same reclaim.
+func (q *Queries) ReleaseTeardownHost(ctx context.Context, arg ReleaseTeardownHostParams) error {
+	_, err := q.db.Exec(ctx, releaseTeardownHost, arg.HostID, arg.SandboxID, arg.Attempt)
+	return err
+}
+
 const revertPauseToActive = `-- name: RevertPauseToActive :one
 WITH reverted AS (
   UPDATE sandbox
@@ -3150,6 +3348,33 @@ func (q *Queries) SandboxExists(ctx context.Context, arg SandboxExistsParams) (b
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err
+}
+
+const teardownBacklog = `-- name: TeardownBacklog :one
+SELECT count(*)::bigint AS total,
+       count(*) FILTER (WHERE permanent)::bigint AS permanent,
+       count(*) FILTER (WHERE last_error IS NOT NULL AND NOT permanent)::bigint AS retrying,
+       coalesce(extract(epoch FROM now() - min(created_at)), 0)::float8 AS oldest_age_seconds
+FROM sandbox_teardown
+`
+
+type TeardownBacklogRow struct {
+	Total            int64   `json:"total"`
+	Permanent        int64   `json:"permanent"`
+	Retrying         int64   `json:"retrying"`
+	OldestAgeSeconds float64 `json:"oldest_age_seconds"`
+}
+
+func (q *Queries) TeardownBacklog(ctx context.Context) (TeardownBacklogRow, error) {
+	row := q.db.QueryRow(ctx, teardownBacklog)
+	var i TeardownBacklogRow
+	err := row.Scan(
+		&i.Total,
+		&i.Permanent,
+		&i.Retrying,
+		&i.OldestAgeSeconds,
+	)
+	return i, err
 }
 
 const unpublishPort = `-- name: UnpublishPort :execrows
