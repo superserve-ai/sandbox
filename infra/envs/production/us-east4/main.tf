@@ -47,16 +47,14 @@ locals {
   })
 
   # The host_id that tags vmd's own metrics and scopes the reconciler: its
-  # HOST_ID runtime env, which is ALSO its identity in the host table. The
-  # cell's sole host derives it from the instance name (its deployed HOST_ID),
-  # so DEFAULT_HOST_ID and every alert filter match the live host exactly.
-  #
-  # Verify against the host before changing: grep '^HOST_ID=' /etc/sandbox/vmd.env
-  metrics_host_id = module.sandbox_host_b.instance_name
+  # HOST_ID runtime env, which is ALSO its identity in the host table. It is
+  # the installed host identity, not the instance name; set it from
+  #   grep '^HOST_ID=' /etc/sandbox/host-identity.env
+  metrics_host_id = var.host_c_host_id
 
-  # Control-plane address + alert identity for the cell's host.
-  active_vmd_ip    = module.sandbox_host_b.internal_ip
-  active_host_name = module.sandbox_host_b.instance_name
+  # Control-plane address + alert identity for the cell's serving host.
+  active_vmd_ip    = module.sandbox_host_c.internal_ip
+  active_host_name = module.sandbox_host_c.instance_name
 }
 
 module "network" {
@@ -313,9 +311,7 @@ module "cloud_ids" {
   labels                     = local.common_labels
 }
 
-# The cell's sole sandbox/VMD host. Distinct identity (its HOST_ID is its
-# instance name) carried over from when it was provisioned as the standby.
-# It replaced the original c4 host, whose module was removed after cutover.
+# The cell's first host, parked. Its HOST_ID is its instance name.
 module "sandbox_host_b" {
   source = "../../../modules/sandbox-host"
 
@@ -331,7 +327,7 @@ module "sandbox_host_b" {
   tags         = ["vmd-use4"]
 
   labels = merge(local.sandbox_host_labels, {
-    component                  = "vmd"
+    component                  = "vmd-use4-standby"
     sandbox_role               = "vmd"
     sandbox_status             = "provisioning"
     "goog-ops-agent-policy"    = "v2-template-1-7-0"
@@ -426,11 +422,8 @@ resource "google_compute_attached_disk" "sandbox_data" {
   mode        = "READ_WRITE"
 }
 
-# Second host for the cell, provisioned as a standby under a new identity.
-# Same shape and OS lineage as the serving host so snapshots restore across
-# the two. Labeled out of deploy discovery until it is prepared; the
-# first-boot script below does everything a deploy assumes is already on a
-# host, except secrets.
+# The cell's serving host. Same shape and OS lineage as the first host so
+# snapshots restore across the two.
 locals {
   host_c_artifact_bucket = module.backup_storage.bucket_name
   host_c_kernel_object   = "vmlinux-4.14-fuse"
@@ -469,9 +462,9 @@ module "sandbox_host_c" {
   tags          = ["vmd-use4"]
 
   labels = merge(local.sandbox_host_labels, {
-    component                  = "vmd-use4-standby"
+    component                  = "vmd"
     sandbox_role               = "vmd"
-    sandbox_status             = "provisioning"
+    sandbox_status             = "ready"
     "goog-ops-agent-policy"    = "v2-template-1-7-0"
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
