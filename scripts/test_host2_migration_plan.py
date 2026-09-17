@@ -71,7 +71,7 @@ class Host2MigrationPlanTest(unittest.TestCase):
     def test_all_rollout_paths_guard_the_saved_plan_before_apply(self):
         workflows = SCRIPT.parent.parent / ".github/workflows"
         for name, roots in {
-            "terraform-cd.yml": ("staging/us-central1", "production/us-west2"),
+            "terraform-cd.yml": ("staging/us-central1", "production/us-west2", "production/us-east4"),
             "terraform-rollout-staging.yml": ("staging/us-central1",),
             "terraform-rollout-production.yml": ("production/us-west2",),
         }.items():
