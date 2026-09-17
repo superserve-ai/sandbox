@@ -109,6 +109,18 @@ class DeployProxyTests(unittest.TestCase):
         self.assertIn("ListenStream=5008\n", socket)
         self.assertIn("Requires=proxy.socket\n", service)
 
+    def test_every_proxy_service_installer_also_installs_the_socket(self):
+        # The service Requires= the socket unit; an installer that ships one
+        # without the other leaves a proxy that cannot start.
+        repo = Path(__file__).parents[3]
+        installers = [p for p in list(repo.glob("deploy/**/*")) + list(repo.glob(".github/**/*"))
+                      if p.is_file() and p.suffix in (".py", ".sh") and "test_" not in p.name
+                      and "/etc/systemd/system/proxy.service" in p.read_text()]
+        self.assertTrue(installers)
+        for installer in installers:
+            with self.subTest(installer=str(installer.relative_to(repo))):
+                self.assertIn("/etc/systemd/system/proxy.socket", installer.read_text())
+
     def test_socket_unit_is_installed_and_bound_before_the_service_restarts(self):
         script = self.generate_script("")
         self.assertIn("sudo mv /tmp/proxy.socket /etc/systemd/system/proxy.socket", script)
