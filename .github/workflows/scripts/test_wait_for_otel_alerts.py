@@ -16,7 +16,8 @@ class AlertRolloutGateTests(unittest.TestCase):
     def ready(self, jobs, status='in_progress', runs=None):
         if runs is None:
             runs = [{'id': 123, 'head_sha': 'current', 'head_branch': 'main', 'status': status}]
-        pages = [[{'workflow_runs': runs}], [{'jobs': jobs}]]
+        pages = [[{'workflow_runs': runs}], [{'workflow_runs': runs}],
+                 [{'jobs': jobs}], [{'workflow_runs': runs}]]
         with patch.object(MODULE, 'api', side_effect=pages) as api:
             result = MODULE.alert_applies_ready('example/repository', 'current', self.required)
         self.assertIn('head_sha=current&event=push&branch=main', api.call_args_list[0].args[0])
@@ -46,9 +47,38 @@ class AlertRolloutGateTests(unittest.TestCase):
 
     def test_latest_run_is_authoritative(self):
         runs = [{'id': i, 'head_sha': 'current', 'head_branch': 'main', 'status': 'in_progress'} for i in (1, 2)]
-        with patch.object(MODULE, 'api', side_effect=[[{'workflow_runs': runs}], [{'jobs': []}]]) as api:
+        with patch.object(MODULE, 'api', side_effect=[
+            [{'workflow_runs': runs}], [{'workflow_runs': runs[::-1]}], [{'jobs': []}]
+        ]) as api:
             self.assertFalse(MODULE.alert_applies_ready('example/repository', 'current', self.required))
-        self.assertIn('/runs/2/jobs?', api.call_args_list[1].args[0])
+        self.assertIn('/runs/2/jobs?', api.call_args_list[2].args[0])
+
+    def test_older_successful_apply_cannot_authorize_after_newer_revision(self):
+        old = {'id': 1, 'head_sha': 'current', 'head_branch': 'main', 'status': 'completed'}
+        newer = dict(old, id=2, head_sha='newer')
+        for status in ('queued', 'in_progress', 'completed'):
+            with self.subTest(status=status), patch.object(MODULE, 'api', side_effect=[
+                [{'workflow_runs': [old]}], [{'workflow_runs': [dict(newer, status=status)]}]
+            ]) as api, self.assertRaisesRegex(RuntimeError, 'stale rollout'):
+                MODULE.alert_applies_ready('example/repository', 'current', self.required)
+            self.assertEqual(api.call_count, 2)  # Old successful jobs cannot bypass freshness.
+
+    def test_new_revision_during_success_check_fails_closed(self):
+        old = {'id': 1, 'head_sha': 'current', 'head_branch': 'main', 'status': 'completed'}
+        newer = dict(old, id=2, head_sha='newer')
+        with patch.object(MODULE, 'api', side_effect=[
+            [{'workflow_runs': [old]}], [{'workflow_runs': [old]}],
+            [{'jobs': self.jobs()}], [{'workflow_runs': [newer]}],
+        ]), self.assertRaisesRegex(RuntimeError, 'changed during'):
+            MODULE.alert_applies_ready('example/repository', 'current', self.required)
+
+    def test_latest_lookup_does_not_scan_history_or_filter_by_sha(self):
+        with patch.object(MODULE, 'api', return_value=[{'workflow_runs': []}]) as api:
+            self.assertIsNone(MODULE.latest_alert_run('example/repository'))
+        api.assert_called_once_with(
+            'repos/example/repository/actions/workflows/terraform-cd.yml/runs?event=push&branch=main&per_page=1',
+            paginate=False,
+        )
 
     def test_polling_honors_enabled_cells_and_times_out_closed(self):
         env = {'GITHUB_REPOSITORY': 'example/repository', 'GITHUB_SHA': 'current', 'OTEL_USE4_ENABLED': 'enabled'}
@@ -67,11 +97,17 @@ class AlertRolloutGateTests(unittest.TestCase):
         production = workflow.split('  deploy-production:', 1)[1]
         self.assertIn('actions: read', production)
         self.assertIn('needs: [deploy-staging]', production)
+        self.assertIn('group: otel-collector-production', production)
+        self.assertIn('cancel-in-progress: false', production)
+        for cell in ('use4', 'usw2'):
+            step = production.split(f'- name: Deploy OTEL Collector to {cell} cell VMD instances', 1)[1].split('- name:', 1)[0]
+            self.assertIn('python3 .github/workflows/scripts/wait-for-otel-alerts.py\n          python3 .github/workflows/scripts/deploy-otel-collector.py', step)
         self.assertLess(production.index('python3 .github/workflows/scripts/wait-for-otel-alerts.py'),
                         production.index('python3 .github/workflows/scripts/deploy-otel-collector.py'))
         gate = production.split('- name: Wait for same-revision production alert applies', 1)[1].split('- name:', 1)[0]
         self.assertNotIn('if:', gate)  # Manual production dispatches must pass the same gate.
         terraform = (SCRIPT.parents[1] / 'terraform-cd.yml').read_text()
+        self.assertNotIn('group: otel-collector-production', terraform)
         collector_paths = workflow.split('    paths:', 1)[1].split('jobs:', 1)[0]
         for line in collector_paths.splitlines():
             if line.strip().startswith('- '):
