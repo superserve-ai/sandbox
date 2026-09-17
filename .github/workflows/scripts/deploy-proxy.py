@@ -204,6 +204,7 @@ def main() -> int:
             ("bin/proxy", f"/tmp/proxy-{sha}"),
             ("bin/check-legacy-heartbeat", f"/tmp/check-legacy-heartbeat-{sha}"),
             ("deploy/proxy.service", "/tmp/proxy.service"),
+            ("deploy/proxy.socket", "/tmp/proxy.socket"),
         ]:
             subprocess.run(
                 [
@@ -254,7 +255,7 @@ def main() -> int:
 
             sudo mkdir -p /etc/sandbox
             rollback_dir=$(sudo mktemp -d /etc/sandbox/proxy-rollback.XXXXXX)
-            for config in {install_dir}/proxy /etc/systemd/system/proxy.service /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
+            for config in {install_dir}/proxy /etc/systemd/system/proxy.service /etc/systemd/system/proxy.socket /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
                 if sudo test -f "$config"; then
                     sudo cp -p "$config" "$rollback_dir/$(basename "$config")"
                 fi
@@ -298,7 +299,7 @@ def main() -> int:
                 # Restore the executable, unit, and configuration together before
                 # restoring the advertised endpoint. The old environment may not
                 # satisfy the new binary's startup requirements.
-                for config in {install_dir}/proxy /etc/systemd/system/proxy.service /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
+                for config in {install_dir}/proxy /etc/systemd/system/proxy.service /etc/systemd/system/proxy.socket /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
                     if sudo test -f "$rollback_dir/$(basename "$config")"; then
                         # Rename avoids overwriting a running executable in place.
                         sudo cp -p "$rollback_dir/$(basename "$config")" "$config.restore-{sha}" || return 1
@@ -308,6 +309,15 @@ def main() -> int:
                     fi
                 done
                 sudo systemctl daemon-reload || return 1
+                # The restored unit must be the one bound: a build that binds
+                # the ports itself needs the socket gone, and a restored unit
+                # file only takes effect through a restart of the socket.
+                if ! sudo test -f "$rollback_dir/proxy.socket"; then
+                    sudo systemctl disable --now proxy.socket 2>/dev/null || true
+                else
+                    sudo systemctl stop proxy proxy.socket 2>/dev/null || true
+                    sudo systemctl start proxy.socket || return 1
+                fi
                 if ! sudo test -f "$rollback_dir/proxy" || ! sudo test -f "$rollback_dir/proxy.service"; then
                     sudo systemctl stop proxy || return 1
                 elif ! sudo systemctl restart proxy || ! sudo systemctl is-active --quiet proxy; then
@@ -379,8 +389,15 @@ def main() -> int:
             sudo chmod +x {install_dir}/proxy
 
             sudo mv /tmp/proxy.service /etc/systemd/system/proxy.service
+            # An open socket keeps the options it was bound with; a changed
+            # unit means it must be bound again.
+            socket_changed=0
+            if ! sudo cmp -s /tmp/proxy.socket /etc/systemd/system/proxy.socket; then
+                socket_changed=1
+            fi
+            sudo mv /tmp/proxy.socket /etc/systemd/system/proxy.socket
             sudo systemctl daemon-reload
-            sudo systemctl enable proxy
+            sudo systemctl enable proxy proxy.socket
 
             peer_cert_file={peer_env['PEER_PROXY_CERT_FILE']!r}
             peer_key_file={peer_env['PEER_PROXY_KEY_FILE']!r}
@@ -463,6 +480,17 @@ def main() -> int:
             {database_env_command}
             sudo chmod 0600 /etc/sandbox/proxy.env
 
+            # Binding the socket needs the ports free: a proxy that still binds
+            # them itself, or a socket bound with an older unit, stops first.
+            # One gap, only on those rollouts.
+            if [ "$socket_changed" -eq 1 ] || ! sudo systemctl is-active --quiet proxy.socket; then
+                sudo systemctl stop proxy proxy.socket 2>/dev/null || true
+                if ! sudo systemctl start proxy.socket; then
+                    echo "ERROR: proxy.socket failed to bind the public ports" >&2
+                    sudo systemctl status --no-pager proxy.socket >&2 || true
+                    exit 1
+                fi
+            fi
             if ! sudo systemctl restart proxy; then
                 echo "ERROR: proxy restart failed" >&2
                 sudo systemctl status --no-pager proxy >&2 || true
