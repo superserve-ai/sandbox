@@ -101,9 +101,8 @@ func TestTrialCreditWarningWorkerUsesPoolCapacity(t *testing.T) {
 	}
 }
 
-func TestTrialCreditWarningWithoutSenderSkipsDatabase(t *testing.T) {
-	// A query through this unconnected database would panic.
-	h := &Handlers{DB: db.New(nil)}
+func TestTrialCreditWarningWithoutDatabase(t *testing.T) {
+	h := &Handlers{}
 	h.processTrialCreditWarning(context.Background(), uuid.New())
 }
 
@@ -119,6 +118,8 @@ func TestTrialCreditWarningCancellationReleasesClaimForRetry(t *testing.T) {
 		queryRowFn: func(queryCtx context.Context, sql string, args ...any) pgx.Row {
 			return &mockRow{scanFn: func(dest ...any) error {
 				switch {
+				case strings.Contains(sql, "-- name: GetTeamTrialRunway"):
+					*dest[0].(*string) = "test-lifecycle"
 				case strings.Contains(sql, "-- name: GetTeamTrialBalance"):
 					balanceReads++
 					if balanceReads == 2 {
@@ -148,6 +149,9 @@ func TestTrialCreditWarningCancellationReleasesClaimForRetry(t *testing.T) {
 		execFn: func(cleanupCtx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 			if err := cleanupCtx.Err(); err != nil {
 				return pgconn.CommandTag{}, err
+			}
+			if strings.Contains(sql, "-- name: UpsertTeamTrialRunway") {
+				return pgconn.NewCommandTag("INSERT 0 1"), nil
 			}
 			if args[0] != teamID || args[1] != claimToken || status != "claimed" {
 				t.Fatalf("unexpected claim mutation: args=%v status=%s", args, status)
@@ -200,6 +204,8 @@ func TestTrialCreditWarningRechecksForecastAfterClaim(t *testing.T) {
 				queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 					return &mockRow{scanFn: func(dest ...any) error {
 						switch {
+						case strings.Contains(sql, "-- name: GetTeamTrialRunway"):
+							*dest[0].(*string) = "test-lifecycle"
 						case strings.Contains(sql, "-- name: GetTeamTrialBalance"):
 							balanceReads++
 							remaining := int64(1)
@@ -227,6 +233,9 @@ func TestTrialCreditWarningRechecksForecastAfterClaim(t *testing.T) {
 					}}
 				},
 				execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+					if strings.Contains(sql, "-- name: UpsertTeamTrialRunway") {
+						return pgconn.NewCommandTag("INSERT 0 1"), nil
+					}
 					if args[0] != teamID || args[1] != claimToken || status != "claimed" {
 						t.Fatalf("unexpected claim mutation: args=%v status=%s", args, status)
 					}

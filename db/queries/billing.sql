@@ -1190,7 +1190,6 @@ SELECT c.team_id
 FROM consuming_teams c
 LEFT JOIN team_billing_account a ON a.team_id = c.team_id
 WHERE a.trial_ended_at IS NULL
-  AND NOT EXISTS (SELECT 1 FROM trial_credit_warning_state w WHERE w.team_id = c.team_id AND w.lifecycle_key = trial_credit_warning_lifecycle(c.team_id) AND w.status <> 'pending')
   AND EXISTS (SELECT 1 FROM team_credit_grant g WHERE g.team_id = c.team_id AND g.reason = 'signup trial credit')
 ORDER BY c.team_id
 LIMIT sqlc.arg(batch_limit);
@@ -1302,3 +1301,22 @@ JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_en
 )
 SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds
 FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start;
+
+
+-- name: GetTeamTrialRunway :one
+WITH lifecycle AS (
+    SELECT trial_credit_warning_lifecycle(sqlc.arg(team_id))::text AS key
+)
+SELECT lifecycle.key::text AS lifecycle_key,
+       COALESCE(r.state, 'unknown')::text AS state,
+       r.observed_at
+FROM lifecycle
+LEFT JOIN team_trial_runway r ON r.team_id = sqlc.arg(team_id) AND r.lifecycle_key = lifecycle.key;
+
+-- name: UpsertTeamTrialRunway :exec
+INSERT INTO team_trial_runway (team_id, lifecycle_key, state, observed_at)
+SELECT sqlc.arg(team_id), sqlc.arg(lifecycle_key)::text, sqlc.arg(state)::text, sqlc.arg(observed_at)::timestamptz
+WHERE trial_credit_warning_lifecycle(sqlc.arg(team_id)) = sqlc.arg(lifecycle_key)
+ON CONFLICT (team_id) DO UPDATE
+SET lifecycle_key = EXCLUDED.lifecycle_key, state = EXCLUDED.state, observed_at = EXCLUDED.observed_at
+WHERE team_trial_runway.observed_at < EXCLUDED.observed_at;

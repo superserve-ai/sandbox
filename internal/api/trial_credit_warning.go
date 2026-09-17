@@ -338,7 +338,7 @@ func (e *unknownTrialCreditWarningError) UnknownTrialCreditWarning() bool { retu
 
 // Discover one bounded page per existing eligibility tick, outside reconciliation.
 func (h *Handlers) scheduleTrialCreditWarningDiscovery(ctx context.Context) {
-	if h.DB == nil || h.Pool == nil || h.TrialWarningSender == nil {
+	if h.DB == nil || h.Pool == nil {
 		return
 	}
 	h.asyncMu.Lock()
@@ -435,7 +435,7 @@ func (pass *trialCreditWarningPass) dispatch(h *Handlers, ctx context.Context, t
 }
 
 func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UUID) {
-	if h.DB == nil || h.TrialWarningSender == nil {
+	if h.DB == nil {
 		return
 	}
 	// Provider calls are advisory and must not pin one of the bounded worker
@@ -443,38 +443,38 @@ func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UU
 	workCtx, cancel := context.WithTimeout(ctx, trialCreditWarningTimeout)
 	defer cancel()
 	ctx = workCtx
-	s, err := h.DB.GetRecentTrialBurnSample(ctx, teamID)
+	observedAt := time.Now().UTC()
+	cached, err := h.DB.GetTeamTrialRunway(ctx, teamID)
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("trial credit warning sample read failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("trial runway lifecycle read failed")
 		return
 	}
-	started, ok1 := s.StartedAt.(time.Time)
-	ended, ok2 := s.EndedAt.(time.Time)
-	if !ok1 || !ok2 {
+	state := "unknown"
+	var remaining float64
+	var sample trialBurnSample
+	s, sampleErr := h.DB.GetRecentTrialBurnSample(ctx, teamID)
+	b, balanceErr := h.DB.GetTeamTrialBalance(ctx, teamID)
+	if sampleErr != nil || balanceErr != nil {
+		log.Error().Err(errors.Join(sampleErr, balanceErr)).Str("team_id", teamID.String()).Msg("trial runway inputs read failed")
+	} else if trialCreditWarningLifecycleEligible(b.Eligible, b.State) {
+		started, ok1 := s.StartedAt.(time.Time)
+		ended, ok2 := s.EndedAt.(time.Time)
+		spent, spentErr := numericFloat(s.SpentUsd)
+		elapsed, elapsedErr := numericFloat(s.ElapsedSeconds)
+		var remainingErr error
+		remaining, remainingErr = numericFloat(b.RemainingUsd)
+		sample = trialBurnSample{SpentUSD: spent, Started: started, Ended: ended, ElapsedSeconds: elapsed}
+		if ok1 && ok2 && spentErr == nil && elapsedErr == nil && elapsed > 0 && remainingErr == nil {
+			state = trialRunwayState(remaining, time.Now(), sample)
+		}
+	}
+	if err := h.DB.UpsertTeamTrialRunway(ctx, db.UpsertTeamTrialRunwayParams{
+		TeamID: teamID, LifecycleKey: cached.LifecycleKey, State: state, ObservedAt: observedAt,
+	}); err != nil {
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("trial runway persistence failed")
 		return
 	}
-	spent, err := numericFloat(s.SpentUsd)
-	elapsedSeconds, elapsedErr := numericFloat(s.ElapsedSeconds)
-	if elapsedErr != nil || elapsedSeconds <= 0 {
-		return
-	}
-	sample := trialBurnSample{SpentUSD: spent, Started: started, Ended: ended, ElapsedSeconds: elapsedSeconds}
-	if err != nil || spent < 0.05 || !ended.After(time.Now().Add(-15*time.Minute)) {
-		return
-	}
-	b, err := h.DB.GetTeamTrialBalance(ctx, teamID)
-	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("trial credit warning balance read failed")
-		return
-	}
-	if !trialCreditWarningLifecycleEligible(b.Eligible, b.State) {
-		return
-	}
-	remaining, err := numericFloat(b.RemainingUsd)
-	if err != nil {
-		return
-	}
-	if !trialCreditWarningEligible(remaining, time.Now(), sample) {
+	if state != "under_24h" || h.TrialWarningSender == nil {
 		return
 	}
 	claimToken, err := h.DB.ClaimTrialCreditWarning(ctx, teamID)
@@ -573,20 +573,30 @@ type trialBurnSample struct {
 // sample whose wall-clock rate predicts strictly under 24 hours remaining.
 // Concurrent runtime is deliberately not part of the denominator.
 func trialCreditWarningEligible(remainingUSD float64, now time.Time, sample trialBurnSample) bool {
+	return trialRunwayState(remainingUSD, now, sample) == "under_24h"
+}
+
+func trialRunwayState(remainingUSD float64, now time.Time, sample trialBurnSample) string {
 	if math.IsNaN(remainingUSD) || math.IsInf(remainingUSD, 0) || math.IsNaN(sample.SpentUSD) || math.IsInf(sample.SpentUSD, 0) || remainingUSD <= 0 || sample.SpentUSD < 0.05 || sample.Ended.Before(sample.Started) {
-		return false
+		return "unknown"
 	}
 	// Require recent activity and at least five cents of measured spend; a
 	// fast workload needs no minimum duration to supply that signal.
 	if !sample.Ended.After(now.Add(-15*time.Minute)) || sample.Ended.After(now) {
-		return false
+		return "unknown"
 	}
 	// Include idle wall time since the last interval instead of extrapolating
 	// a short, completed burst as though it were still running.
 	elapsed := now.Sub(sample.Started)
 	if elapsed <= 0 {
-		return false
+		return "unknown"
 	}
 	rate := sample.SpentUSD / elapsed.Hours()
-	return rate > 0 && remainingUSD/rate < 24
+	if rate <= 0 || math.IsInf(rate, 0) || math.IsNaN(rate) {
+		return "unknown"
+	}
+	if remainingUSD/rate < 24 {
+		return "under_24h"
+	}
+	return "over_24h"
 }

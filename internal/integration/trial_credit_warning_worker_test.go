@@ -542,8 +542,16 @@ func TestTrialWarningDispatchIncludesPausedStorageTeam(t *testing.T) {
 		calls++
 		return nil
 	})}
-	api.RefreshActiveTrialEligibilityForTest(h, ctx)
-	h.WaitAsyncBookkeeping()
+	// Admission may defer advisory work while reconciliation occupies the pool.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		api.RefreshActiveTrialEligibilityForTest(h, ctx)
+		h.WaitAsyncBookkeeping()
+		if calls != 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if calls != 1 || warningStatus(t, team) != "sent" {
 		t.Fatalf("paused storage warning: calls=%d status=%s", calls, warningStatus(t, team))
 	}

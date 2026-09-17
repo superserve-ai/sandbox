@@ -930,6 +930,13 @@ type TeamTrialEligibilityCache struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+type TeamTrialRunway struct {
+	TeamID       uuid.UUID `json:"team_id"`
+	LifecycleKey string    `json:"lifecycle_key"`
+	State        string    `json:"state"`
+	ObservedAt   time.Time `json:"observed_at"`
+}
+
 type TelemetrySamplerLease struct {
 	Name        string    `json:"name"`
 	LockedBy    string    `json:"locked_by"`

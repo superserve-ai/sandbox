@@ -1263,6 +1263,30 @@ func (q *Queries) GetTeamTrialBalance(ctx context.Context, teamID uuid.UUID) (Ge
 	return i, err
 }
 
+const getTeamTrialRunway = `-- name: GetTeamTrialRunway :one
+WITH lifecycle AS (
+    SELECT trial_credit_warning_lifecycle($1)::text AS key
+)
+SELECT lifecycle.key::text AS lifecycle_key,
+       COALESCE(r.state, 'unknown')::text AS state,
+       r.observed_at
+FROM lifecycle
+LEFT JOIN team_trial_runway r ON r.team_id = $1 AND r.lifecycle_key = lifecycle.key
+`
+
+type GetTeamTrialRunwayRow struct {
+	LifecycleKey string             `json:"lifecycle_key"`
+	State        string             `json:"state"`
+	ObservedAt   pgtype.Timestamptz `json:"observed_at"`
+}
+
+func (q *Queries) GetTeamTrialRunway(ctx context.Context, teamID uuid.UUID) (GetTeamTrialRunwayRow, error) {
+	row := q.db.QueryRow(ctx, getTeamTrialRunway, teamID)
+	var i GetTeamTrialRunwayRow
+	err := row.Scan(&i.LifecycleKey, &i.State, &i.ObservedAt)
+	return i, err
+}
+
 const grantTeamCredit = `-- name: GrantTeamCredit :one
 INSERT INTO team_credit_grant (
     team_id, amount_usd, remaining_usd, reason, expires_at, created_by
@@ -2003,7 +2027,6 @@ SELECT c.team_id
 FROM consuming_teams c
 LEFT JOIN team_billing_account a ON a.team_id = c.team_id
 WHERE a.trial_ended_at IS NULL
-  AND NOT EXISTS (SELECT 1 FROM trial_credit_warning_state w WHERE w.team_id = c.team_id AND w.lifecycle_key = trial_credit_warning_lifecycle(c.team_id) AND w.status <> 'pending')
   AND EXISTS (SELECT 1 FROM team_credit_grant g WHERE g.team_id = c.team_id AND g.reason = 'signup trial credit')
 ORDER BY c.team_id
 LIMIT $1
@@ -3228,4 +3251,30 @@ func (q *Queries) UpsertTeamBillingUsageHour(ctx context.Context, arg UpsertTeam
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const upsertTeamTrialRunway = `-- name: UpsertTeamTrialRunway :exec
+INSERT INTO team_trial_runway (team_id, lifecycle_key, state, observed_at)
+SELECT $1, $2::text, $3::text, $4::timestamptz
+WHERE trial_credit_warning_lifecycle($1) = $2
+ON CONFLICT (team_id) DO UPDATE
+SET lifecycle_key = EXCLUDED.lifecycle_key, state = EXCLUDED.state, observed_at = EXCLUDED.observed_at
+WHERE team_trial_runway.observed_at < EXCLUDED.observed_at
+`
+
+type UpsertTeamTrialRunwayParams struct {
+	TeamID       uuid.UUID `json:"team_id"`
+	LifecycleKey string    `json:"lifecycle_key"`
+	State        string    `json:"state"`
+	ObservedAt   time.Time `json:"observed_at"`
+}
+
+func (q *Queries) UpsertTeamTrialRunway(ctx context.Context, arg UpsertTeamTrialRunwayParams) error {
+	_, err := q.db.Exec(ctx, upsertTeamTrialRunway,
+		arg.TeamID,
+		arg.LifecycleKey,
+		arg.State,
+		arg.ObservedAt,
+	)
+	return err
 }
