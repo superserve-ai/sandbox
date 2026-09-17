@@ -31,6 +31,7 @@ func TestRecentTrialBurnSampleClampsOverlappingIntervals(t *testing.T) {
 			t.Run(resource+"/"+tc.name, func(t *testing.T) {
 				ctx := context.Background()
 				teamID := mustCreateTeam(t, ctx, "trial-overlap-"+uuid.NewString()[:8])
+				backdateWarningSampleGrant(t, teamID)
 				tx, err := testPool.Begin(ctx)
 				if err != nil {
 					t.Fatal(err)
@@ -124,6 +125,7 @@ func TestRecentTrialBurnSampleClampsOverlappingIntervals(t *testing.T) {
 func TestRecentTrialBurnSampleUsesFreshWallClockWindow(t *testing.T) {
 	ctx := context.Background()
 	teamID := mustCreateTeam(t, ctx, "trial-warning-sample-"+uuid.NewString()[:8])
+	backdateWarningSampleGrant(t, teamID)
 	sandboxID := seedPrivatePreviewSandbox(t, teamID, testDefaultHostID, "trial-warning-sample")
 	now := time.Now().UTC()
 
@@ -191,6 +193,7 @@ func TestRecentTrialBurnSampleUsesFreshWallClockWindow(t *testing.T) {
 	// An open interval that predates the window still overlaps it and must be
 	// clamped to the six-hour boundary rather than discarded.
 	longTeam := mustCreateTeam(t, ctx, "trial-warning-long-"+uuid.NewString()[:8])
+	backdateWarningSampleGrant(t, longTeam)
 	longSandbox := seedPrivatePreviewSandbox(t, longTeam, testDefaultHostID, "trial-warning-long")
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO sandbox_compute_billing_interval
@@ -210,6 +213,7 @@ func TestRecentTrialBurnSampleUsesFreshWallClockWindow(t *testing.T) {
 
 	// A team with no recent signal must remain sparse/unavailable.
 	emptyTeam := mustCreateTeam(t, ctx, "trial-warning-empty-"+uuid.NewString()[:8])
+	backdateWarningSampleGrant(t, emptyTeam)
 	empty, err := testQueries.GetRecentTrialBurnSample(ctx, emptyTeam)
 	if err != nil {
 		t.Fatalf("GetRecentTrialBurnSample empty: %v", err)
@@ -220,6 +224,7 @@ func TestRecentTrialBurnSampleUsesFreshWallClockWindow(t *testing.T) {
 
 	// Usage outside the bounded freshness window must not become a signal.
 	staleTeam := mustCreateTeam(t, ctx, "trial-warning-stale-"+uuid.NewString()[:8])
+	backdateWarningSampleGrant(t, staleTeam)
 	staleSandbox := seedPrivatePreviewSandbox(t, staleTeam, testDefaultHostID, "trial-warning-stale")
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO sandbox_compute_billing_interval
@@ -234,5 +239,88 @@ func TestRecentTrialBurnSampleUsesFreshWallClockWindow(t *testing.T) {
 	}
 	if stale.StartedAt != nil || stale.EndedAt != nil {
 		t.Fatalf("stale sample timestamps = (%v, %v), want nil", stale.StartedAt, stale.EndedAt)
+	}
+}
+
+func backdateWarningSampleGrant(t *testing.T, teamID uuid.UUID) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(), `UPDATE team_credit_grant
+		SET created_at = now() - interval '1 day'
+		WHERE team_id = $1 AND reason = 'signup trial credit'`, teamID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecentTrialBurnSampleStartsAtLatestSignupGrant(t *testing.T) {
+	for _, resource := range []string{"compute", "storage"} {
+		t.Run(resource, func(t *testing.T) {
+			ctx := context.Background()
+			team := mustCreateTeam(t, ctx, "trial-lifecycle-sample-"+uuid.NewString()[:8])
+			backdateWarningSampleGrant(t, team)
+			sandbox := seedPrivatePreviewSandbox(t, team, testDefaultHostID, "trial-lifecycle-sample")
+			tx, err := testPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			var now time.Time
+			if err := tx.QueryRow(ctx, `SELECT now()`).Scan(&now); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO team_feature_flag (team_id, key, enabled)
+				VALUES ($1, 'billing_storage_billing_enabled', true)
+				ON CONFLICT (team_id, key) DO UPDATE SET enabled = true`, team); err != nil {
+				t.Fatal(err)
+			}
+			query := `INSERT INTO sandbox_compute_billing_interval
+				(sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason)
+				VALUES ($1, $2, 2, 1024, now()-interval '2 hours', now()-interval '1 minute', 'paused')`
+			if resource == "storage" {
+				query = `INSERT INTO sandbox_storage_interval
+					(sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason)
+					VALUES ($1, $2, 1024, now()-interval '2 hours', now()-interval '1 minute', 'deleted')`
+			}
+			if _, err := tx.Exec(ctx, query, sandbox, team); err != nil {
+				t.Fatal(err)
+			}
+			queries := db.New(tx)
+			before, err := queries.GetRecentTrialBurnSample(ctx, team)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Only the portion after the newest grant belongs to its lifecycle.
+			if _, err := tx.Exec(ctx, `INSERT INTO team_credit_grant
+				(team_id, amount_usd, remaining_usd, reason, created_at)
+				VALUES ($1, 5, 5, 'signup trial credit', now()-interval '30 minutes')`, team); err != nil {
+				t.Fatal(err)
+			}
+			after, err := queries.GetRecentTrialBurnSample(ctx, team)
+			if err != nil {
+				t.Fatal(err)
+			}
+			started, ok := after.StartedAt.(time.Time)
+			if !ok || !started.Equal(now.Add(-30*time.Minute)) {
+				t.Fatalf("sample start = %v, want newest grant boundary", after.StartedAt)
+			}
+			oldSpend, _ := before.SpentUsd.Float64Value()
+			newSpend, _ := after.SpentUsd.Float64Value()
+			if !oldSpend.Valid || !newSpend.Valid || newSpend.Float64 <= 0 || newSpend.Float64 >= oldSpend.Float64 {
+				t.Fatalf("spend before=%v after=%v, want positive truncated spend", oldSpend, newSpend)
+			}
+			// A grant newer than all activity must not inherit the old burn rate.
+			if _, err := tx.Exec(ctx, `INSERT INTO team_credit_grant
+				(team_id, amount_usd, remaining_usd, reason)
+				VALUES ($1, 5, 5, 'signup trial credit')`, team); err != nil {
+				t.Fatal(err)
+			}
+			empty, err := queries.GetRecentTrialBurnSample(ctx, team)
+			if err != nil {
+				t.Fatal(err)
+			}
+			spent, _ := empty.SpentUsd.Float64Value()
+			if !spent.Valid || spent.Float64 != 0 || empty.StartedAt != nil || empty.EndedAt != nil {
+				t.Fatalf("pre-lifecycle activity produced sample: %+v", empty)
+			}
+		})
 	}
 }

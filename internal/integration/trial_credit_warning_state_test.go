@@ -193,6 +193,7 @@ func TestTrialCreditWarningLifecycleSuppressesIneligibleTrials(t *testing.T) {
 func TestRecentTrialBurnSampleUsesWallClockAndRejectsStaleData(t *testing.T) {
 	ctx := context.Background()
 	teamID := mustCreateTeam(t, ctx, "trial-warning-sample-"+uuid.NewString()[:8])
+	backdateWarningSampleGrant(t, teamID)
 	sandboxID := uuid.New()
 	if _, err := testPool.Exec(ctx, `INSERT INTO sandbox (id, team_id, name, status, host_id) VALUES ($1,$2,'sample','active',$3)`, sandboxID, teamID, testDefaultHostID); err != nil {
 		t.Fatalf("create sandbox: %v", err)

@@ -703,11 +703,28 @@ func TestTrialWarningSenderRejectsPreviousGrantLifecycle(t *testing.T) {
 	}
 	h := &api.Handlers{DB: testQueries, TrialWarningSender: sender}
 	api.ProcessTrialCreditWarningForTest(h, ctx, team)
+	if calls != 0 || warningStatus(t, team) != "absent" {
+		t.Fatal("new lifecycle inherited usage from before its grant")
+	}
+	// Move the grant before the fixture's usage to provide a meaningful sample.
+	if _, err := testPool.Exec(ctx, `UPDATE team_credit_grant SET created_at=now()-interval '150 minutes'
+		WHERE team_id=$1 AND reason='signup trial credit' AND amount_usd=0.01`, team); err != nil {
+		t.Fatal(err)
+	}
+	api.ProcessTrialCreditWarningForTest(h, ctx, team)
 	api.ProcessTrialCreditWarningForTest(h, ctx, team)
 	if calls != 1 || warningStatus(t, team) != "sent" {
 		t.Fatalf("renewed lifecycle provider calls = %d, status = %s", calls, warningStatus(t, team))
 	}
 	if _, err := testPool.Exec(ctx, `INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason) VALUES ($1, 0.01, 0.01, 'signup trial credit')`, team); err != nil {
+		t.Fatal(err)
+	}
+	api.ProcessTrialCreditWarningForTest(h, ctx, team)
+	if calls != 1 || warningStatus(t, team) != "absent" {
+		t.Fatal("new grant after sent warning inherited the previous sample")
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE team_credit_grant SET created_at=now()-interval '150 minutes'
+		WHERE team_id=$1 AND reason='signup trial credit' AND amount_usd=0.01`, team); err != nil {
 		t.Fatal(err)
 	}
 	api.ProcessTrialCreditWarningForTest(h, ctx, team)

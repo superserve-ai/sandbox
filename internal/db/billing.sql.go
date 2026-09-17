@@ -637,7 +637,13 @@ func (q *Queries) GetBillingUsageExportByIdentifier(ctx context.Context, stripeM
 }
 
 const getRecentTrialBurnSample = `-- name: GetRecentTrialBurnSample :one
-WITH selected_plan AS (
+WITH sample_window AS MATERIALIZED (
+  -- A new signup grant starts a new warning lifecycle. Do not extrapolate
+  -- consumption from the previous lifecycle into its warning.
+  SELECT GREATEST(now() - interval '6 hours', MAX(created_at)) AS started_at
+  FROM team_credit_grant
+  WHERE team_id = $1 AND reason = 'signup trial credit'
+), selected_plan AS (
   SELECT COALESCE((SELECT tpp.plan_key FROM team_pricing_plan tpp JOIN pricing_plan pp ON pp.key = tpp.plan_key
     WHERE tpp.team_id = $1 AND pp.active AND tpp.effective_from <= now()
       AND (tpp.effective_to IS NULL OR tpp.effective_to > now())
@@ -656,7 +662,7 @@ WITH selected_plan AS (
   FROM ranked_rates
   WHERE rate_rank = 1
 ), recent_compute AS MATERIALIZED (
-  SELECT GREATEST(i.started_at, now() - interval '6 hours') AS started_at,
+  SELECT GREATEST(i.started_at, (SELECT started_at FROM sample_window)) AS started_at,
          i.ended_at, vcpu_count, memory_mib
   FROM (
     (SELECT started_at, ended_at, vcpu_count, memory_mib FROM sandbox_compute_billing_interval
@@ -664,7 +670,7 @@ WITH selected_plan AS (
      LIMIT 1025)
     UNION ALL
     (SELECT started_at, ended_at, vcpu_count, memory_mib FROM sandbox_compute_billing_interval
-     WHERE team_id = $1 AND ended_at > now() - interval '6 hours'
+     WHERE team_id = $1 AND ended_at > (SELECT started_at FROM sample_window)
      LIMIT 1025)
   ) i
 ), compute AS (
@@ -677,7 +683,7 @@ FROM recent_compute b
  CROSS JOIN rates
  WHERE b.started_at < now()
 ), recent_storage AS MATERIALIZED (
-  SELECT GREATEST(i.started_at, now() - interval '6 hours') AS started_at,
+  SELECT GREATEST(i.started_at, (SELECT started_at FROM sample_window)) AS started_at,
          i.ended_at, disk_mib
   FROM (
     (SELECT started_at, ended_at, disk_mib FROM sandbox_storage_interval
@@ -685,7 +691,7 @@ FROM recent_compute b
      LIMIT 1025)
     UNION ALL
     (SELECT started_at, ended_at, disk_mib FROM sandbox_storage_interval
-     WHERE team_id = $1 AND ended_at > now() - interval '6 hours' AND feature_enabled('billing_storage_billing_enabled', $1)
+     WHERE team_id = $1 AND ended_at > (SELECT started_at FROM sample_window) AND feature_enabled('billing_storage_billing_enabled', $1)
      LIMIT 1025)
   ) i
 ), sample_bounds AS (
