@@ -2932,7 +2932,7 @@ func (q *Queries) ListSandboxesByTeamPaged(ctx context.Context, arg ListSandboxe
 const lockSandboxForPreviewMutation = `-- name: LockSandboxForPreviewMutation :one
 SELECT id FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL
-FOR UPDATE
+FOR NO KEY UPDATE
 `
 
 type LockSandboxForPreviewMutationParams struct {
@@ -2942,6 +2942,8 @@ type LockSandboxForPreviewMutationParams struct {
 
 // The sandbox row exists for both legacy (no policy row) and strict sandboxes,
 // so it is the stable per-sandbox serialization point across the transition.
+// Allow storage-interval foreign-key checks while a heartbeat holds the host
+// lock: preview validation acquires that host lock after this sandbox lock.
 func (q *Queries) LockSandboxForPreviewMutation(ctx context.Context, arg LockSandboxForPreviewMutationParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, lockSandboxForPreviewMutation, arg.ID, arg.TeamID)
 	var id uuid.UUID
