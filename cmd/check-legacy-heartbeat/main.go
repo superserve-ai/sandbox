@@ -13,20 +13,20 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-func processConfig(data []byte) (string, error) {
+func processConfig(data []byte) (string, string, error) {
 	env := map[string]string{}
 	for _, entry := range strings.Split(string(data), "\x00") {
 		if k, v, ok := strings.Cut(entry, "="); ok {
 			env[k] = v
 		}
 	}
-	if env["HOST_ID"] != "default" {
-		return "", fmt.Errorf("legacy check requires explicit running HOST_ID=default")
+	if env["HOST_ID"] == "" {
+		return "", "", fmt.Errorf("legacy check requires explicit running HOST_ID")
 	}
 	if env["DATABASE_URL"] == "" {
-		return "", fmt.Errorf("running VMD has no DATABASE_URL")
+		return "", "", fmt.Errorf("running VMD has no DATABASE_URL")
 	}
-	return env["DATABASE_URL"], nil
+	return env["HOST_ID"], env["DATABASE_URL"], nil
 }
 
 const heartbeatQuery = `SELECT COALESCE(
@@ -34,7 +34,7 @@ const heartbeatQuery = `SELECT COALESCE(
  AND last_heartbeat_at > to_timestamp($2)
  AND last_heartbeat_at > now() - interval '60 seconds'
  AND last_heartbeat_at <= now(), false)
- FROM host WHERE id = 'default'`
+ FROM host WHERE id = $3`
 
 func check(pid int, started int64, addr string) error {
 	if pid <= 0 || started <= 0 || addr == "" {
@@ -44,7 +44,7 @@ func check(pid int, started int64, addr string) error {
 	if err != nil {
 		return fmt.Errorf("cannot read running VMD configuration")
 	}
-	database, err := processConfig(data)
+	hostID, database, err := processConfig(data)
 	if err != nil {
 		return err
 	}
@@ -61,8 +61,8 @@ func check(pid int, started int64, addr string) error {
 	}
 	defer tx.Rollback(ctx)
 	var accepted bool
-	if err := tx.QueryRow(ctx, heartbeatQuery, addr, started).Scan(&accepted); err != nil || !accepted {
-		return fmt.Errorf("no fresh unbound default-host heartbeat for this VMD start/address")
+	if err := tx.QueryRow(ctx, heartbeatQuery, addr, started, hostID).Scan(&accepted); err != nil || !accepted {
+		return fmt.Errorf("no fresh unbound heartbeat for running HOST_ID %q at this VMD start/address", hostID)
 	}
 	return nil
 }
