@@ -351,7 +351,7 @@ module "sandbox_host" {
   tags        = ["superserve-vmd"]
 
   labels = merge(local.sandbox_host_labels, {
-    component    = "vmd"
+    component    = "vmd-staging-draining"
     sandbox_role = "vmd"
   })
 
