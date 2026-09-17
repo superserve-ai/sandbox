@@ -378,6 +378,14 @@ type ManagerConfig struct {
 	// this says. Default false.
 	GuestClockFreezeEnabled bool
 
+	// TemplateFreezeWorkload has the template builder freeze a guest's
+	// workload for its snapshot when the guest proves it corrects its own
+	// wall clock, and mark the image so. Every sandbox created from such a
+	// template owes a wake, which only a supervisor with the wake protocol
+	// gives: the floor is raised before the image is published. Default
+	// false; the switch to turn on first, and the one to turn off first.
+	TemplateFreezeWorkload bool
+
 	// RequirePresenceSidecar controls refusing a layered UFFD restore whose
 	// overlay has no .presence side-car next to it. Without the side-car,
 	// Firecracker falls back to inferring page presence from the overlay's

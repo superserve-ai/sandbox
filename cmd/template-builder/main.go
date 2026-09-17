@@ -48,6 +48,7 @@ func main() {
 	slotIndex := flag.Int("slot-index", 200, "network slot index (must not collide with vmd)")
 	launcherNS := flag.String("launcher-ns", "", "path to vmd's pruned launcher mount-namespace pin; empty selects the legacy `ip netns exec` launch")
 	netlinkOps := flag.Bool("netlink-slot-ops", false, "build this VM's network slot over netlink instead of forking iproute2")
+	freezeWorkload := flag.Bool("freeze-workload", false, "freeze the guest's workload for the snapshot when it proves it corrects its clock, and mark the image")
 	timeout := flag.Duration("timeout", 15*time.Minute, "build timeout")
 	flag.Parse()
 
@@ -73,21 +74,22 @@ func main() {
 	}()
 
 	err := runBuild(ctx, buildConfig{
-		templateID:  *templateID,
-		buildID:     *buildID,
-		spec:        spec,
-		vcpu:        uint32(*vcpu),
-		memoryMiB:   uint32(*memory),
-		diskMiB:     uint32(*disk),
-		runDir:      *runDir,
-		snapshotDir: *snapshotDir,
-		kernelPath:  *kernelPath,
-		fcBin:       *fcBin,
-		boxdBin:     *boxdBin,
-		hostIface:   *hostIface,
-		slotIndex:   *slotIndex,
-		launcherNS:  *launcherNS,
-		netlinkOps:  *netlinkOps,
+		templateID:     *templateID,
+		buildID:        *buildID,
+		spec:           spec,
+		vcpu:           uint32(*vcpu),
+		memoryMiB:      uint32(*memory),
+		diskMiB:        uint32(*disk),
+		runDir:         *runDir,
+		snapshotDir:    *snapshotDir,
+		kernelPath:     *kernelPath,
+		fcBin:          *fcBin,
+		boxdBin:        *boxdBin,
+		hostIface:      *hostIface,
+		slotIndex:      *slotIndex,
+		launcherNS:     *launcherNS,
+		netlinkOps:     *netlinkOps,
+		freezeWorkload: *freezeWorkload,
 	})
 	if err != nil {
 		// Emit a user-visible error (stable code + user-friendly message)
@@ -183,9 +185,9 @@ type buildConfig struct {
 	launcherNS  string
 	netlinkOps  bool
 	// freezeWorkload builds the image with its workload freezer and, once the
-	// guest has proven it corrects its clock, snapshots it frozen. Set by
-	// nothing yet: a frozen image is only safe under a supervisor that can wake
-	// it, so the switch arrives with that supervisor.
+	// guest has proven it corrects its clock, snapshots it frozen. Passed by
+	// the supervisor that forks this build, from its own switch: a frozen
+	// image is only safe under one that can wake it.
 	freezeWorkload bool
 }
 

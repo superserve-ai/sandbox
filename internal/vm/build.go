@@ -132,6 +132,43 @@ func validBuildPathSegment(id string) bool {
 // build's. Published means the builder's metadata reads whole; a torn or
 // empty file from an interrupted write is leftovers, not a template. Any
 // other failure to read it blocks the build rather than deciding either way.
+// templateBuildArgs is the builder's command line for one build.
+func (m *Manager) templateBuildArgs(req BuildTemplateRequest, buildVMID string, specJSON []byte, slotIndex int) []string {
+	args := []string{
+		"--template-id", req.TemplateID,
+		"--build-id", buildVMID,
+		"--spec", string(specJSON),
+		"--vcpu", fmt.Sprint(req.VCPU),
+		"--memory", fmt.Sprint(req.MemoryMiB),
+		"--disk", fmt.Sprint(req.DiskMiB),
+		"--run-dir", m.cfg.RunDir,
+		"--snapshot-dir", m.cfg.SnapshotDir,
+		"--kernel", m.cfg.KernelPath,
+		"--firecracker", m.cfg.FirecrackerBin,
+		"--boxd", m.cfg.BoxdBinaryPath,
+		"--host-interface", m.cfg.HostInterface,
+		"--slot-index", fmt.Sprint(slotIndex),
+		// Resolved here, not in the subprocess: launchLauncherPath applies the
+		// same readiness and pin-mounted gates a VM launch does, and returns ""
+		// to fall back to the legacy entry. The subprocess re-checks the pin
+		// immediately before it launches, since a build can spend minutes
+		// pulling an image before it gets there.
+		"--launcher-ns", m.launchLauncherPath(buildVMID),
+	}
+	// The build creates its own slot, so it must use the same backend as this
+	// daemon: on the shell backend its slot setup forks `ip netns exec`
+	// repeatedly, and each of those clones the host mount table and stalls
+	// every concurrent launch — the cost the netlink backend exists to remove.
+	if m.netMgr.UsesNetlinkSlotOps() {
+		args = append(args, "--netlink-slot-ops")
+	}
+	// Only a host switched to it freezes; the builder never decides alone.
+	if m.cfg.TemplateFreezeWorkload {
+		args = append(args, "--freeze-workload")
+	}
+	return args
+}
+
 func (m *Manager) prepareBuildDir(templateID, buildVMID string) error {
 	if !validBuildPathSegment(templateID) || !validBuildPathSegment(buildVMID) {
 		return status.Errorf(codes.InvalidArgument, "template %q build %q: ids must name a single directory each", templateID, buildVMID)
@@ -214,34 +251,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	}
 	defer releaseSlot()
 
-	cmd := exec.CommandContext(ctx, m.cfg.TemplateBuilderBin,
-		"--template-id", req.TemplateID,
-		"--build-id", buildVMID,
-		"--spec", string(specJSON),
-		"--vcpu", fmt.Sprint(req.VCPU),
-		"--memory", fmt.Sprint(req.MemoryMiB),
-		"--disk", fmt.Sprint(req.DiskMiB),
-		"--run-dir", m.cfg.RunDir,
-		"--snapshot-dir", m.cfg.SnapshotDir,
-		"--kernel", m.cfg.KernelPath,
-		"--firecracker", m.cfg.FirecrackerBin,
-		"--boxd", m.cfg.BoxdBinaryPath,
-		"--host-interface", m.cfg.HostInterface,
-		"--slot-index", fmt.Sprint(slotIndex),
-		// Resolved here, not in the subprocess: launchLauncherPath applies the
-		// same readiness and pin-mounted gates a VM launch does, and returns ""
-		// to fall back to the legacy entry. The subprocess re-checks the pin
-		// immediately before it launches, since a build can spend minutes
-		// pulling an image before it gets there.
-		"--launcher-ns", m.launchLauncherPath(buildVMID),
-	)
-	// The build creates its own slot, so it must use the same backend as this
-	// daemon: on the shell backend its slot setup forks `ip netns exec`
-	// repeatedly, and each of those clones the host mount table and stalls
-	// every concurrent launch — the cost the netlink backend exists to remove.
-	if m.netMgr.UsesNetlinkSlotOps() {
-		cmd.Args = append(cmd.Args, "--netlink-slot-ops")
-	}
+	cmd := exec.CommandContext(ctx, m.cfg.TemplateBuilderBin, m.templateBuildArgs(req, buildVMID, specJSON, slotIndex)...)
 
 	// Stdout carries structured NDJSON build events — parse and forward
 	// to the build log buffer so SSE subscribers see real-time progress.

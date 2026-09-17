@@ -812,6 +812,9 @@ func main() {
 	// Off by default: it only does anything for a snapshot whose guest corrects
 	// its own wall clock, and forcing legacy is the way back if one misbehaves.
 	guestClockFreezeEnabled := envOrDefault("VMD_GUEST_CLOCK_FREEZE", "false") == "true"
+	// Off by default: a frozen template is only safe under a supervisor that
+	// wakes it, so this follows the binary, never precedes it.
+	templateFreezeWorkload := envOrDefault("VMD_TEMPLATE_FREEZE_WORKLOAD", "false") == "true"
 	// Pause-side wait for the guest to stop its workload before a frozen-clock
 	// snapshot; only paid when the restore would freeze the clock.
 	guestFreezeBudget := 500 * time.Millisecond
@@ -994,6 +997,7 @@ func main() {
 		DirtyTrackingSessionEnabled:         dirtyTrackingSessionEnabled,
 		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
 		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
+		TemplateFreezeWorkload:              templateFreezeWorkload,
 		GuestFreezeBudget:                   guestFreezeBudget,
 		RequirePresenceSidecar:              requirePresenceSidecar,
 		PausedNetworkReclaimEnabled:         pausedNetworkReclaimEnabled,
