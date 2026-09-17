@@ -126,3 +126,22 @@ variable "cloud_ids_runbook_base_url" {
     error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
   }
 }
+
+variable "boot_disk_image" {
+  default     = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  description = "Regional creation-time image default; existing boot disks remain unchanged."
+  type        = string
+  nullable    = false
+}
+
+variable "host_image_overrides" {
+  description = "Creation-time image overrides keyed by configured host module name."
+  type        = map(string)
+  default     = {}
+}
+
+variable "provisioning_hosts" {
+  description = "Host module names held outside scheduling and runtime deployment during maintenance. Remove only after readiness and explicit admission."
+  type        = set(string)
+  default     = []
+}

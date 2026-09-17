@@ -120,3 +120,15 @@ variable "sandbox_data_disk" {
   description = "Existing independently protected persistent disk to reattach without auto-delete."
   type        = string
 }
+
+variable "provisioning" {
+  description = "Hold new hosts outside runtime deployment and scheduling until operator handoff."
+  type        = bool
+  default     = false
+}
+
+variable "provisioning_run_id" {
+  description = "Manual provisioning run identity for safe initialization retries."
+  type        = string
+  default     = ""
+}
