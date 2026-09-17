@@ -20,12 +20,22 @@ def change(address, actions):
 
 
 class Host2MigrationPlanTest(unittest.TestCase):
-    def run_guard(self, changes):
+    def run_guard(self, changes, suffix=None):
+        plan = {"format_version": "1.2", "resource_changes": changes}
+        if suffix:
+            plan["variables"] = {"resource_suffix": {"value": suffix}}
         return subprocess.run(
             [sys.executable, str(SCRIPT)],
-            input=json.dumps({"format_version": "1.2", "resource_changes": changes}),
-            text=True, capture_output=True,
+            input=json.dumps(plan), text=True, capture_output=True,
         )
+
+    def test_east_guards_its_third_host_and_lets_its_second_retire(self):
+        third = "module.sandbox_host_c.google_compute_instance.this"
+        result = self.run_guard([change(third, ["update"])], suffix="use4")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(third, result.stderr)
+        result = self.run_guard([change(HOST, ["delete"]), change(third, ["no-op"])], suffix="use4")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_blocks_vm_changes_and_identity_adapter_independently(self):
         for address in (HOST, IDENTITY):

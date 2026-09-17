@@ -21,7 +21,7 @@ set -euo pipefail
 
 PROJECT=rayai-prod
 ZONE=us-east4-c
-INSTANCE=superserve-vmd-use4-2
+INSTANCE=superserve-vmd-use4-3
 NETWORK=superserve-production-vpc
 TAG=vmd-use4
 

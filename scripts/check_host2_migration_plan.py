@@ -10,11 +10,17 @@ def main():
     if not isinstance(plan, dict) or "format_version" not in plan:
         raise ValueError("Expected Terraform plan JSON")
 
+    # The guarded host is the cell's identity-bound one: the second host in
+    # every cell but us-east4, whose second host was retired and whose third
+    # host carries the identity.
+    suffix = plan.get("variables", {}).get("resource_suffix", {}).get("value")
+    guarded = "module.sandbox_host_c." if suffix == "use4" else "module.sandbox_host_b."
+
     blocked = []
     for resource in plan.get("resource_changes", []):
         address = resource["address"]
         host = (
-            address.startswith("module.sandbox_host_b.")
+            address.startswith(guarded)
             and resource["type"] == "google_compute_instance"
         )
         # The adapter can restart the VM even when the Compute plan is a no-op.
