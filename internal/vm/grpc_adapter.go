@@ -131,6 +131,9 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 	case a.mgr.backupRevivedTarget(req.GetVmId(), req.GetBackupGeneration()) != nil:
 		inst, rulesApplied = a.mgr.backupRevivedTarget(req.GetVmId(), req.GetBackupGeneration()), resumeNetworkRules != nil
 	case a.mgr.pauseArtifactsMissing(req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath()):
+		if req.GetBackupGeneration() == "" {
+			return nil, pauseArtifactsMissingErr(req.GetVmId())
+		}
 		inst, err = a.mgr.resumeFromBackupLocked(ctx, req.GetVmId(), req.GetBackupGeneration(), resumeNetworkRules)
 		rulesApplied = resumeNetworkRules != nil
 	default:

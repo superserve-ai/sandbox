@@ -751,17 +751,11 @@ FROM (
          COALESCE(pp.ports, '{}')::int[] AS port_numbers,
          COALESCE(pp.accesses, '{}')::text[] AS port_accesses,
          COALESCE(pp.token_versions, '{}')::bigint[] AS port_token_versions,
-         t.base_path AS template_base_path,
-         COALESCE(bg.generation, '')::text AS backup_generation
+         t.base_path AS template_base_path
   FROM sandbox sb
   LEFT JOIN snapshot s ON s.id = sb.snapshot_id AND s.team_id = sb.team_id
   LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = sb.id
   LEFT JOIN template t ON t.id = sb.template_id
-  LEFT JOIN LATERAL (
-    SELECT generation FROM backup_generation
-    WHERE covered_snapshot_id = s.id AND covered_snapshot_generation = s.generation
-    ORDER BY completed_at DESC LIMIT 1
-  ) bg ON true
   LEFT JOIN LATERAL (
     SELECT array_agg(pp.port ORDER BY pp.port) AS ports,
            array_agg(pp.access ORDER BY pp.port) AS accesses,
@@ -779,7 +773,7 @@ RETURNING sandbox.id, sandbox.team_id, sandbox.name, sandbox.status, sandbox.vcp
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path, x.backup_generation
+          x.template_base_path
 `
 
 type ClaimResumeParams struct {
@@ -800,7 +794,6 @@ type ClaimResumeRow struct {
 	PortAccesses      []string           `json:"port_accesses"`
 	PortTokenVersions []int64            `json:"port_token_versions"`
 	TemplateBasePath  *string            `json:"template_base_path"`
-	BackupGeneration  string             `json:"backup_generation"`
 }
 
 // The paused→resuming claim plus the boot inputs in one round trip:
@@ -866,7 +859,6 @@ func (q *Queries) ClaimResume(ctx context.Context, arg ClaimResumeParams) (Claim
 		&i.PortAccesses,
 		&i.PortTokenVersions,
 		&i.TemplateBasePath,
-		&i.BackupGeneration,
 	)
 	return i, err
 }

@@ -5,6 +5,8 @@ package vmdclient
 
 import (
 	"context"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc/status"
 )
 
 // ResourceLimits is a sandbox's declared allocation, passed to restore so
@@ -232,4 +234,23 @@ type BuildStatusResult struct {
 	ErrorMessage            string // populated on failed/cancelled
 	StartedAtUnix           int64
 	EndedAtUnix             int64
+}
+
+// PauseArtifactsMissingReason marks a resume the host refused because the
+// pause artifacts are gone from it; the caller may retry naming the backup
+// generation recorded as covering the pause.
+const PauseArtifactsMissingReason = "PAUSE_ARTIFACTS_MISSING"
+
+// IsPauseArtifactsMissing reports whether err carries that mark.
+func IsPauseArtifactsMissing(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == PauseArtifactsMissingReason {
+			return true
+		}
+	}
+	return false
 }

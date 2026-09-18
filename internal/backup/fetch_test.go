@@ -133,28 +133,32 @@ func TestFetchGenerationOverlayWithBaseThroughLimiter(t *testing.T) {
 	}
 }
 
-func TestPruneBaseCacheDropsOldestFirst(t *testing.T) {
+func TestPruneBaseCacheDropsOldestCachedObjectsAndSparesPromotedBases(t *testing.T) {
 	dir := t.TempDir()
-	old := filepath.Join(dir, ".unpacked-aaaa")
-	newer := filepath.Join(dir, ".unpacked-bbbb")
-	for _, p := range []string{old, newer} {
+	oldSpool := filepath.Join(dir, "bases_aaaa_fp")
+	master := filepath.Join(dir, ".unpacked-bbbb")
+	promoted := filepath.Join(dir, "base-cccc.ext4")
+	for _, p := range []string{oldSpool, master, promoted} {
 		if err := os.WriteFile(p, bytes.Repeat([]byte{1}, 1024), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
 	past := time.Now().Add(-time.Hour)
-	if err := os.Chtimes(old, past, past); err != nil {
+	if err := os.Chtimes(oldSpool, past, past); err != nil {
 		t.Fatal(err)
 	}
 	removed, err := PruneBaseCache(dir, 1500)
 	if err != nil || removed != 1 {
 		t.Fatalf("removed=%d err=%v", removed, err)
 	}
-	if _, err := os.Stat(old); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("the oldest master must go first")
+	if _, err := os.Stat(oldSpool); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the oldest cached object must go first, spools included")
 	}
-	if _, err := os.Stat(newer); err != nil {
+	if _, err := os.Stat(master); err != nil {
 		t.Fatal("the newer master must stay")
+	}
+	if _, err := os.Stat(promoted); err != nil {
+		t.Fatal("a promoted base is never the cache's to drop")
 	}
 }
 
