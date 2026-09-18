@@ -51,6 +51,11 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		return nil, err
 	}
 	defer unlock()
+	return m.reviveVMLocked(ctx, vmID, diskPath, basePath, standaloneDisk, allowRecordless, teamID, ownerID, vcpu, memMiB, rules)
+}
+
+// reviveVMLocked is ReviveVM under the caller's per-VM op lock.
+func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath string, standaloneDisk, allowRecordless bool, teamID, ownerID string, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
 	// Never revive over a live or healthy VM. A paused VM with its
 	// snapshot is healthy at rest and refused: resume owns that path.
 	if inst, err := m.getInstance(vmID); err == nil {
@@ -58,18 +63,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		st, snap, mem, baseMem := inst.Status, inst.SnapshotPath, inst.MemFilePath, inst.BaseMemPath
 		inst.mu.RUnlock()
 		inst.mu.RLock()
-		pausedDisk := inst.DiskPath
-		if pausedDisk == "" {
-			rundirKey := vmID
-			if inst.RunDirID != "" {
-				rundirKey = inst.RunDirID
-			}
-			fname := "rootfs.ext4"
-			if inst.Config.BasePath != "" {
-				fname = "overlay.ext4"
-			}
-			pausedDisk = filepath.Join(m.cfg.RunDir, rundirKey, fname)
-		}
+		pausedDisk := pausedDiskPath(m.cfg.RunDir, vmID, inst.DiskPath, inst.RunDirID, inst.Config.BasePath)
 		pausedBase := inst.Config.BasePath
 		inst.mu.RUnlock()
 		// Idempotency: a live, verified VM whose recorded salvage path
@@ -143,7 +137,7 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 			// base count as pause artifacts too: a paused VM that lost
 			// its rootfs is precisely the case the salvaged disk exists
 			// to recover.
-			if statRegularFile(snap) && mem != "" && statRegularFile(mem) && (baseMem == "" || statRegularFile(baseMem)) && statRegularFile(pausedDisk) && (pausedBase == "" || statRegularFile(pausedBase)) {
+			if pauseArtifactsPresent(snap, mem, baseMem, pausedDisk, pausedBase) {
 				return nil, status.Errorf(codes.FailedPrecondition, "vm %s is paused with a snapshot; resume owns healthy paused VMs", vmID)
 			}
 			m.log.Warn().Str("vm_id", vmID).Msg("paused record has missing snapshot artifacts; treating as unresumable and allowing revival")

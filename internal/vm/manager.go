@@ -442,6 +442,11 @@ type Manager struct {
 	// backupEnqueue hands finalized pause manifests to the durability
 	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
 	backupEnqueue func(backup.Task) error
+	// backupReader and backupLister bring a lost pause back from the bucket
+	// so a resume can revive the sandbox from its disk.
+	backupReader      backup.BlobReader
+	backupLister      backup.BlobLister
+	backupRestoreRoot string
 	// backupStaging is the uploader-visible staging tree: where a
 	// finished generation ends up for the uploader to hash and stream
 	// from, and where the at-rest/backfill worker path (StageTask)

@@ -1199,6 +1199,8 @@ func main() {
 			Metrics:     backupMetrics,
 		}
 		// backup_setup: metrics recorder, journal open, GCS storage.NewClient, uploader.
+		gcsReader := backup.NewGCSReader(gcsClient, bucket)
+		mgr.SetBackupRestore(gcsReader, gcsReader, envOrDefault("BACKUP_RESTORE_ROOT", filepath.Join(cfg.SnapshotDir, ".restore")))
 		st.mark("backup_setup", true, -1)
 		// Staging pins enqueued artifacts so sandbox teardown cannot
 		// erase a queued generation; the sweep clears residue from

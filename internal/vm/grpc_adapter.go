@@ -123,7 +123,14 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		}
 	}
 
-	inst, rulesApplied, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
+	var inst *VMInstance
+	var rulesApplied bool
+	if a.mgr.backupReader != nil && a.mgr.pauseArtifactsMissing(req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath()) {
+		inst, err = a.mgr.resumeFromBackupLocked(ctx, req.GetVmId(), resumeNetworkRules)
+		rulesApplied = resumeNetworkRules != nil
+	} else {
+		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
+	}
 	if err != nil {
 		return nil, err
 	}
