@@ -1095,10 +1095,11 @@ FROM compute, rates, sample_bounds;
 -- A claimed row is never reclaimed after a timeout: the worker may have
 -- crashed after provider acceptance, so retrying could duplicate the email.
 INSERT INTO trial_credit_warning_state (team_id, lifecycle_key, status, claim_token, claimed_at)
-VALUES (sqlc.arg(team_id), trial_credit_warning_lifecycle(sqlc.arg(team_id)), 'claimed', gen_random_uuid(), now())
+VALUES (sqlc.arg(team_id), sqlc.arg(lifecycle_key)::text, 'claimed', gen_random_uuid(), now())
 ON CONFLICT (team_id, lifecycle_key) DO UPDATE
 SET status = 'claimed', claim_token = gen_random_uuid(), claimed_at = now(), updated_at = now()
 WHERE trial_credit_warning_state.status = 'pending'
+  AND trial_credit_warning_state.lifecycle_key = sqlc.arg(lifecycle_key)::text
 RETURNING claim_token;
 
 -- name: IsTrialCreditWarningClaimCurrent :one

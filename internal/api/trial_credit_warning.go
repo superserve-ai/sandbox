@@ -477,7 +477,9 @@ func (h *Handlers) processTrialCreditWarning(ctx context.Context, teamID uuid.UU
 	if state != "under_24h" || h.TrialWarningSender == nil {
 		return
 	}
-	claimToken, err := h.DB.ClaimTrialCreditWarning(ctx, teamID)
+	claimToken, err := h.DB.ClaimTrialCreditWarning(ctx, db.ClaimTrialCreditWarningParams{
+		TeamID: teamID, LifecycleKey: cached.LifecycleKey,
+	})
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("trial credit warning claim failed")

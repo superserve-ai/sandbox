@@ -267,17 +267,23 @@ func (q *Queries) ClaimTeamCommercialBillingAnchor(ctx context.Context, arg Clai
 
 const claimTrialCreditWarning = `-- name: ClaimTrialCreditWarning :one
 INSERT INTO trial_credit_warning_state (team_id, lifecycle_key, status, claim_token, claimed_at)
-VALUES ($1, trial_credit_warning_lifecycle($1), 'claimed', gen_random_uuid(), now())
+VALUES ($1, $2::text, 'claimed', gen_random_uuid(), now())
 ON CONFLICT (team_id, lifecycle_key) DO UPDATE
 SET status = 'claimed', claim_token = gen_random_uuid(), claimed_at = now(), updated_at = now()
 WHERE trial_credit_warning_state.status = 'pending'
+  AND trial_credit_warning_state.lifecycle_key = $2::text
 RETURNING claim_token
 `
 
+type ClaimTrialCreditWarningParams struct {
+	TeamID       uuid.UUID `json:"team_id"`
+	LifecycleKey string    `json:"lifecycle_key"`
+}
+
 // A claimed row is never reclaimed after a timeout: the worker may have
 // crashed after provider acceptance, so retrying could duplicate the email.
-func (q *Queries) ClaimTrialCreditWarning(ctx context.Context, teamID uuid.UUID) (pgtype.UUID, error) {
-	row := q.db.QueryRow(ctx, claimTrialCreditWarning, teamID)
+func (q *Queries) ClaimTrialCreditWarning(ctx context.Context, arg ClaimTrialCreditWarningParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, claimTrialCreditWarning, arg.TeamID, arg.LifecycleKey)
 	var claim_token pgtype.UUID
 	err := row.Scan(&claim_token)
 	return claim_token, err
