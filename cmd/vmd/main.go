@@ -1997,7 +1997,14 @@ func main() {
 	// pre_ready: reconciler, heartbeat, local HTTP — the tail before serving.
 	st.mark("pre_ready", true, -1)
 	startupReady.Store(true)
-	// Off the readiness path: the namespace scan scales with fleet size.
+	st.mark("ready", true, -1)
+	log.Info().Msg("startup complete — gRPC serving requests")
+	// Released only after the readiness line is emitted: the deploy
+	// readiness check reads that line from the journal, so nothing the
+	// background work logs may come ahead of it.
+	close(postReady)
+
+	// After the readiness line: the namespace scan scales with fleet size.
 	go func() {
 		defer sentrylog.Recover("neigh-table-check")
 		neighCap, err := readNeighTableCap()
@@ -2010,12 +2017,6 @@ func main() {
 				Msg("kernel neighbour table cap is too small for this host; raise net.ipv4.neigh.default.gc_thresh3")
 		}
 	}()
-	st.mark("ready", true, -1)
-	log.Info().Msg("startup complete — gRPC serving requests")
-	// Released only after the readiness line is emitted: the deploy
-	// readiness check reads that line from the journal, so nothing the
-	// background work logs may come ahead of it.
-	close(postReady)
 
 	// Leak gauge for network namespaces — independent of the launcher path.
 	// Started AFTER readiness (and so after StartPool): its immediate first
