@@ -72,24 +72,23 @@ func TestPauseArtifactsMissing(t *testing.T) {
 	}
 }
 
+// slowEmptyStore holds no generation and takes delay to say so.
 type slowEmptyStore struct {
 	delay time.Duration
-	lists atomic.Int32
+	reads atomic.Int32
 }
 
-func (s *slowEmptyStore) NewReader(context.Context, string) (io.ReadCloser, error) {
-	return nil, backup.ErrObjectNotFound
-}
-
-func (s *slowEmptyStore) List(ctx context.Context, _ string) ([]backup.ObjectInfo, error) {
-	s.lists.Add(1)
+func (s *slowEmptyStore) NewReader(ctx context.Context, _ string) (io.ReadCloser, error) {
+	s.reads.Add(1)
 	select {
 	case <-time.After(s.delay):
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	return nil, nil
+	return nil, backup.ErrObjectNotFound
 }
+
+func (s *slowEmptyStore) List(context.Context, string) ([]backup.ObjectInfo, error) { return nil, nil }
 
 func newBackupTestManager(t *testing.T, store *slowEmptyStore) *Manager {
 	t.Helper()
@@ -103,9 +102,9 @@ func newBackupTestManager(t *testing.T, store *slowEmptyStore) *Manager {
 	return mgr
 }
 
-func TestResumeFromBackupFailsClosedWithoutAnchor(t *testing.T) {
+func TestResumeFromBackupFailsClosedWithoutARecordedGeneration(t *testing.T) {
 	mgr := newBackupTestManager(t, &slowEmptyStore{})
-	_, err := mgr.resumeFromBackupLocked(context.Background(), "vm-1", nil, nil)
+	_, err := mgr.resumeFromBackupLocked(context.Background(), "vm-1", "", nil)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("err = %v, want FailedPrecondition", err)
 	}
@@ -114,23 +113,23 @@ func TestResumeFromBackupFailsClosedWithoutAnchor(t *testing.T) {
 func TestResumeFromBackupOutlivesTheCallerAndIsJoinedByTheRetry(t *testing.T) {
 	store := &slowEmptyStore{delay: 300 * time.Millisecond}
 	mgr := newBackupTestManager(t, store)
-	anchor := backup.CaptureAnchor{"vmstate.snap": "abc"}
+	gen := "gen-a"
 
 	short, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	_, err := mgr.resumeFromBackupLocked(short, "vm-1", anchor, nil)
+	_, err := mgr.resumeFromBackupLocked(short, "vm-1", gen, nil)
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("first attempt: err = %v, want Unavailable while the fetch continues", err)
 	}
-	if _, err := mgr.resumeFromBackupLocked(context.Background(), "vm-1", backup.CaptureAnchor{"vmstate.snap": "other"}, nil); status.Code(err) != codes.Aborted {
-		t.Fatalf("different pause mid-flight: err = %v, want Aborted", err)
+	if _, err := mgr.resumeFromBackupLocked(context.Background(), "vm-1", "gen-b", nil); status.Code(err) != codes.Aborted {
+		t.Fatalf("different generation mid-flight: err = %v, want Aborted", err)
 	}
-	_, err = mgr.resumeFromBackupLocked(context.Background(), "vm-1", anchor, nil)
+	_, err = mgr.resumeFromBackupLocked(context.Background(), "vm-1", gen, nil)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("retry: err = %v, want FailedPrecondition from the joined fetch finding no backup", err)
 	}
-	if n := store.lists.Load(); n != 1 {
-		t.Fatalf("bucket listed %d times, want one shared fetch", n)
+	if n := store.reads.Load(); n != 1 {
+		t.Fatalf("manifest fetched %d times, want one shared fetch", n)
 	}
 	mgr.backupFlightsMu.Lock()
 	left := len(mgr.backupFlights)
@@ -140,23 +139,23 @@ func TestResumeFromBackupOutlivesTheCallerAndIsJoinedByTheRetry(t *testing.T) {
 	}
 }
 
-func TestBackupRevivedTargetAdoptsTheSamePauseOnly(t *testing.T) {
+func TestBackupRevivedTargetAdoptsTheSameGenerationOnly(t *testing.T) {
 	orig := vmDeadForRetry
 	vmDeadForRetry = func(*Manager, string) bool { return false }
 	defer func() { vmDeadForRetry = orig }()
-	live := &VMInstance{ID: "vm-1", Status: StatusRunning, BackupAnchor: "vmstate.snap=abc"}
+	live := &VMInstance{ID: "vm-1", Status: StatusRunning, BackupGeneration: "gen-a"}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": live}}
-	if mgr.backupRevivedTarget("vm-1", "vmstate.snap=abc") != live {
-		t.Fatal("a retry of the same recorded pause must adopt the revived VM")
+	if mgr.backupRevivedTarget("vm-1", "gen-a") != live {
+		t.Fatal("a retry for the same generation must adopt the revived VM")
 	}
-	if mgr.backupRevivedTarget("vm-1", "vmstate.snap=other") != nil {
-		t.Fatal("a different pause must not adopt it")
+	if mgr.backupRevivedTarget("vm-1", "gen-b") != nil {
+		t.Fatal("a different generation must not adopt it")
 	}
 	if mgr.backupRevivedTarget("vm-1", "") != nil {
-		t.Fatal("no anchor must not adopt it")
+		t.Fatal("no generation must not adopt it")
 	}
 	live.Unverified = true
-	if mgr.backupRevivedTarget("vm-1", "vmstate.snap=abc") != nil {
+	if mgr.backupRevivedTarget("vm-1", "gen-a") != nil {
 		t.Fatal("an unverified VM must not be adopted")
 	}
 }
@@ -223,7 +222,7 @@ func TestResumeFromBackupKeepsTheLocalDiskWhenOnlyAnOlderPauseIsBackedUp(t *test
 	if !mgr.pauseArtifactsMissing("vm-1", "", "") {
 		t.Fatal("the newer pause's memory file is gone")
 	}
-	_, err := mgr.resumeFromBackupLocked(context.Background(), "vm-1", backup.CaptureAnchor{"vmstate.snap": "bbbb"}, nil)
+	_, err := mgr.resumeFromBackupLocked(context.Background(), "vm-1", "gen-b", nil)
 	if status.Code(err) != codes.FailedPrecondition {
 		t.Fatalf("err = %v, want FailedPrecondition: only an older pause is backed up", err)
 	}
@@ -241,14 +240,13 @@ func TestResumeVMRetryAdoptsTheBackupRevivedVM(t *testing.T) {
 	boxdHealthProbe = func(context.Context, string, time.Duration) error { return nil }
 	defer func() { vmDeadForRetry, boxdHealthProbe = origDead, origProbe }()
 
-	anchor := map[string]string{"vmstate.snap": "abc"}
-	live := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.9", PID: 41, BackupAnchor: backup.AnchorKey(anchor), Config: VMConfig{VCPU: 2, MemoryMiB: 512}}
+	live := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.9", PID: 41, BackupGeneration: "gen-a", Config: VMConfig{VCPU: 2, MemoryMiB: 512}}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": live}, netMgr: &ownedNetMgr{&fakeNetMgr{}}}
 	store := &slowEmptyStore{}
 	mgr.SetBackupRestore(store, store, t.TempDir(), BackupRestoreOptions{})
 	a := NewGRPCAdapter(mgr)
 
-	resp, err := a.ResumeVM(context.Background(), &vmdpb.ResumeVMRequest{VmId: "vm-1", SnapshotPath: "/gone/vmstate.snap", MemFilePath: "/gone/mem.snap", BackupAnchor: anchor})
+	resp, err := a.ResumeVM(context.Background(), &vmdpb.ResumeVMRequest{VmId: "vm-1", SnapshotPath: "/gone/vmstate.snap", MemFilePath: "/gone/mem.snap", BackupGeneration: "gen-a"})
 	if err != nil {
 		t.Fatalf("retry with the original request must adopt the revived VM, got %v", err)
 	}

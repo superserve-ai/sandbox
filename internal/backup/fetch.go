@@ -14,9 +14,9 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// ErrNoMatchingBackup reports that no completed generation carries every
-// digest the caller recorded for the pause it wants back.
-var ErrNoMatchingBackup = errors.New("no backup generation matches the recorded pause")
+// ErrNoMatchingBackup reports that the generation recorded for the pause is
+// not held complete in the bucket.
+var ErrNoMatchingBackup = errors.New("the recorded backup generation is not in the bucket")
 
 // Restored locates a restored generation's bootable disk and its base.
 type Restored struct {
@@ -62,42 +62,32 @@ func RestoredDisk(dir string) (Restored, error) {
 	return r, fmt.Errorf("restore marker lists no rootfs")
 }
 
-// FetchMatching restores the newest generation whose manifest carries every
-// digest in anchor into destDir. A completed restore already in destDir
-// that matches is reused; anything else there is discarded first. An empty
-// anchor cannot prove which pause a generation is, so it never matches.
-func FetchMatching(ctx context.Context, r BlobReader, lister BlobLister, sandboxID string, anchor CaptureAnchor, destDir string, progress ProgressFunc) (Restored, error) {
-	if len(anchor) == 0 {
+// FetchGeneration restores exactly the named generation into destDir. A
+// completed restore of that generation already in destDir is reused;
+// anything else there is discarded first. A generation the bucket no
+// longer holds complete fails closed rather than falling back to another.
+func FetchGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, progress ProgressFunc) (Restored, error) {
+	if generation == "" {
 		return Restored{}, ErrNoMatchingBackup
 	}
-	if done, err := RestoredDisk(destDir); err == nil && anchor.matches(done.Manifest) {
+	if done, err := RestoredDisk(destDir); err == nil && done.Manifest.Generation == generation {
 		return done, nil
 	}
 	if err := os.RemoveAll(destDir); err != nil {
 		return Restored{}, fmt.Errorf("clear restore dir: %w", err)
 	}
-	gens, err := ListGenerations(ctx, lister, sandboxID)
+	m, err := fetchManifest(ctx, r, sandboxID, generation, func(string, ...any) {})
 	if err != nil {
-		return Restored{}, fmt.Errorf("list generations: %w", err)
+		if errors.Is(err, ErrGenerationIncomplete) {
+			return Restored{}, ErrNoMatchingBackup
+		}
+		return Restored{}, err
 	}
-	for _, g := range gens {
-		m, err := fetchManifest(ctx, r, sandboxID, g.Generation, func(string, ...any) {})
-		if err != nil {
-			if ctx.Err() != nil {
-				return Restored{}, err
-			}
-			continue
-		}
-		if !anchor.matches(m) {
-			continue
-		}
-		skip := func(mf ManifestFile) bool { return isSharedEntry(mf) && hostHoldsBase(m, mf.SHA256) }
-		if _, err := restoreGeneration(ctx, r, sandboxID, g.Generation, destDir, skip, progress); err != nil {
-			return Restored{}, err
-		}
-		return RestoredDisk(destDir)
+	skip := func(mf ManifestFile) bool { return isSharedEntry(mf) && hostHoldsBase(m, mf.SHA256) }
+	if _, err := restoreGeneration(ctx, r, sandboxID, generation, destDir, skip, progress); err != nil {
+		return Restored{}, err
 	}
-	return Restored{}, ErrNoMatchingBackup
+	return RestoredDisk(destDir)
 }
 
 // hostBaseFor is the template base an overlay was paused over, when the
@@ -120,19 +110,6 @@ func hostHoldsBase(m *GenerationManifest, sha string) bool {
 		}
 	}
 	return false
-}
-
-// AnchorKey is a stable identity for an anchor, for comparing requests.
-func AnchorKey(anchor map[string]string) string {
-	if len(anchor) == 0 {
-		return ""
-	}
-	parts := make([]string, 0, len(anchor))
-	for name, sha := range anchor {
-		parts = append(parts, name+"="+sha)
-	}
-	sort.Strings(parts)
-	return strings.Join(parts, ";")
 }
 
 // LimitedReader caps the bytes per second streamed from a blob store.

@@ -321,7 +321,7 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, _, pauseToken string) (
 	}
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
-func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ string, _ map[int32]vmdclient.PortPolicy, _ int64) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
+func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ string) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
 	s.resumeCalls.Add(1)
 	if s.resumeFn != nil {
 		s.resumeFn()

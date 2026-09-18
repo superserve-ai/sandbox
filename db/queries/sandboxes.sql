@@ -566,11 +566,17 @@ FROM (
          COALESCE(pp.ports, '{}')::int[] AS port_numbers,
          COALESCE(pp.accesses, '{}')::text[] AS port_accesses,
          COALESCE(pp.token_versions, '{}')::bigint[] AS port_token_versions,
-         t.base_path AS template_base_path
+         t.base_path AS template_base_path,
+         COALESCE(bg.generation, '')::text AS backup_generation
   FROM sandbox sb
   LEFT JOIN snapshot s ON s.id = sb.snapshot_id AND s.team_id = sb.team_id
   LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = sb.id
   LEFT JOIN template t ON t.id = sb.template_id
+  LEFT JOIN LATERAL (
+    SELECT generation FROM backup_generation
+    WHERE covered_snapshot_id = s.id
+    ORDER BY completed_at DESC LIMIT 1
+  ) bg ON true
   LEFT JOIN LATERAL (
     SELECT array_agg(pp.port ORDER BY pp.port) AS ports,
            array_agg(pp.access ORDER BY pp.port) AS accesses,
@@ -588,7 +594,7 @@ RETURNING sqlc.embed(sandbox),
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path;
+          x.template_base_path, x.backup_generation;
 
 -- name: ResumePostBootCheck :one
 -- The two reads a resume makes after the boot, in one statement: the

@@ -44,10 +44,11 @@ func (m *Manager) SetBackupEnqueue(fn func(backup.Task) error) {
 // BackupRestoreOptions bound what a wave of backup-backed resumes may take
 // from the host.
 type BackupRestoreOptions struct {
-	Concurrency int           // fetches in flight at once
-	Limiter     *rate.Limiter // download bytes per second, shared by all fetches
-	CacheBytes  int64         // unpacked template bases kept between restores
-	FetchBudget time.Duration // a fetch outlives the RPC that started it up to this
+	Concurrency  int           // fetches in flight at once
+	Limiter      *rate.Limiter // download bytes per second, shared by all fetches
+	CacheBytes   int64         // unpacked template bases kept between restores
+	FetchBudget  time.Duration // a fetch outlives the RPC that started it up to this
+	AbandonAfter time.Duration // a finished fetch nobody claims is dropped after this
 }
 
 // SetBackupRestore enables reviving a paused sandbox from its bucket backup
@@ -59,7 +60,16 @@ func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobL
 	if opts.FetchBudget <= 0 {
 		opts.FetchBudget = 15 * time.Minute
 	}
+	if opts.AbandonAfter <= 0 {
+		opts.AbandonAfter = time.Hour
+	}
 	m.backupReader, m.backupLister, m.backupRestoreRoot, m.backupRestore = reader, lister, root, opts
+	if opts.Limiter != nil {
+		reader = &backup.LimitedReader{Inner: reader, Limiter: opts.Limiter}
+	}
+	// One cache for every restore on the host: its coordination of shared
+	// bases only holds when all fetches go through the same reader.
+	m.backupBaseReader = &backup.CachingBaseReader{Inner: reader, Dir: m.backupBaseDir()}
 	m.backupFetchSem = make(chan struct{}, opts.Concurrency)
 	m.backupFlights = map[string]*backupFlight{}
 }

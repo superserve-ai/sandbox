@@ -2,7 +2,6 @@ package vm
 
 import (
 	"context"
-	"github.com/superserve-ai/sandbox/internal/backup"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -126,14 +125,13 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 
 	var inst *VMInstance
 	var rulesApplied bool
-	anchorKey := backup.AnchorKey(req.GetBackupAnchor())
 	switch {
 	case a.mgr.backupReader == nil:
 		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
-	case a.mgr.backupRevivedTarget(req.GetVmId(), anchorKey) != nil:
-		inst, rulesApplied = a.mgr.backupRevivedTarget(req.GetVmId(), anchorKey), resumeNetworkRules != nil
+	case a.mgr.backupRevivedTarget(req.GetVmId(), req.GetBackupGeneration()) != nil:
+		inst, rulesApplied = a.mgr.backupRevivedTarget(req.GetVmId(), req.GetBackupGeneration()), resumeNetworkRules != nil
 	case a.mgr.pauseArtifactsMissing(req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath()):
-		inst, err = a.mgr.resumeFromBackupLocked(ctx, req.GetVmId(), backup.CaptureAnchor(req.GetBackupAnchor()), resumeNetworkRules)
+		inst, err = a.mgr.resumeFromBackupLocked(ctx, req.GetVmId(), req.GetBackupGeneration(), resumeNetworkRules)
 		rulesApplied = resumeNetworkRules != nil
 	default:
 		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)

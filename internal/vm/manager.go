@@ -102,23 +102,23 @@ type VMInstance struct {
 	// MainPID resolver can still be in flight — writing a stopped unit's PID
 	// into the new attempt's record. Bumped under mu at each attempt start;
 	// a resolver whose captured generation no longer matches drops its write.
-	launchGen      uint64
-	SocketPath     string
-	VsockPath      string
-	IP             string
-	TAPDevice      string
-	MACAddress     string
-	Status         VMStatus
-	Unverified     bool   // Running persisted before boxd readiness (see VMRecord)
-	RevivalPending bool   // revival attempt in flight (see VMRecord)
-	RevivedDisk    string // resolved salvage path of a completed revival (see VMRecord)
-	BackupAnchor   string // recorded pause a backup-backed resume booted from (see VMRecord)
-	Config         VMConfig
-	RunDirID       string // Directory name under RunDir for this VM's files.
-	Namespace      string // Network namespace name.
-	DiskPath       string
-	SnapshotPath   string
-	MemFilePath    string
+	launchGen        uint64
+	SocketPath       string
+	VsockPath        string
+	IP               string
+	TAPDevice        string
+	MACAddress       string
+	Status           VMStatus
+	Unverified       bool   // Running persisted before boxd readiness (see VMRecord)
+	RevivalPending   bool   // revival attempt in flight (see VMRecord)
+	RevivedDisk      string // resolved salvage path of a completed revival (see VMRecord)
+	BackupGeneration string // backup a backup-backed resume booted from (see VMRecord)
+	Config           VMConfig
+	RunDirID         string // Directory name under RunDir for this VM's files.
+	Namespace        string // Network namespace name.
+	DiskPath         string
+	SnapshotPath     string
+	MemFilePath      string
 	// CorrectsWallClock records whether this guest fixes its own wall clock on
 	// wake, resolved once when it was restored. Cached so pause never has to go
 	// to the filesystem to find out. Nil means unresolved — a record written by a
@@ -449,6 +449,7 @@ type Manager struct {
 	backupLister      backup.BlobLister
 	backupRestoreRoot string
 	backupRestore     BackupRestoreOptions
+	backupBaseReader  backup.BlobReader
 	backupFetchSem    chan struct{}
 	backupFlightsMu   sync.Mutex
 	backupFlights     map[string]*backupFlight
@@ -1528,6 +1529,7 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) (err e
 		rundirKey = inst.RunDirID
 	}
 	m.cleanupRunDir(rundirKey)
+	m.cleanupRestoreStaging(vmID)
 	m.removeVM(vmID)
 
 	log.Info().Msg("VM destroyed")
