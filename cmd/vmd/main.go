@@ -1634,13 +1634,6 @@ func main() {
 	// below isn't held for the fill; creates fall back to on-demand until warm.
 	netPoolFresh, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_FRESH_SIZE", "256"))
 	netPoolRecycle, _ := strconv.Atoi(envOrDefault("VMD_NET_POOL_RECYCLE_SIZE", "256"))
-	if neighCap, err := readNeighTableCap(); err == nil {
-		liveNetns, _, _ := netMgr.NetnsStats()
-		if short := neighTableShortfall(neighCap, liveNetns+netPoolFresh+netPoolRecycle); short > 0 {
-			log.Error().Int("gc_thresh3", neighCap).Int("slots", liveNetns+netPoolFresh+netPoolRecycle).Int("shortfall", short).
-				Msg("kernel neighbour table cap is below the slot count; raise net.ipv4.neigh.default.gc_thresh3")
-		}
-	}
 	// One predicate decides both the plan and the call: PlanStartupAdoption
 	// parks refill behind a pass the caller promises to start, so the two
 	// must never diverge.
@@ -2004,6 +1997,19 @@ func main() {
 	// pre_ready: reconciler, heartbeat, local HTTP — the tail before serving.
 	st.mark("pre_ready", true, -1)
 	startupReady.Store(true)
+	// Off the readiness path: the namespace scan scales with fleet size.
+	go func() {
+		defer sentrylog.Recover("neigh-table-check")
+		neighCap, err := readNeighTableCap()
+		if err != nil {
+			return
+		}
+		liveNetns, _, _ := netMgr.NetnsStats()
+		if short := neighTableShortfall(neighCap, liveNetns+netPoolFresh); short > 0 {
+			log.Error().Int("gc_thresh3", neighCap).Int("slots", liveNetns+netPoolFresh).Int("shortfall", short).
+				Msg("kernel neighbour table cap is below the slot count; raise net.ipv4.neigh.default.gc_thresh3")
+		}
+	}()
 	st.mark("ready", true, -1)
 	log.Info().Msg("startup complete — gRPC serving requests")
 	// Released only after the readiness line is emitted: the deploy
