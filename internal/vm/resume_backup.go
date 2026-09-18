@@ -274,6 +274,9 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 	revived, err := m.reviveVMLocked(ctx, vmID, r.Disk, r.Base, r.Standalone, false, teamID, ownerID, vcpu, memMiB, rules)
 	m.recordPhases("resume", "backup", map[string]time.Duration{"backup_boot": time.Since(tBoot)})
 	if err != nil {
+		// A retry fetches again; the staging copy must not outlive a
+		// resume nobody may ever retry.
+		_ = os.RemoveAll(m.restoreStagingDir(vmID))
 		return nil, err
 	}
 	revived.mu.Lock()
