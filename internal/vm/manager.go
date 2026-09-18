@@ -3553,12 +3553,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	m.mu.Lock()
 	prevInst, inPlace := m.vms[vmID]
-	// A tracked instance with no rundir is a failed attempt whose cleanup
-	// already ran; restarting it in place would need the overlay that
-	// cleanup removed, so the retry starts over.
+	// A failed instance with no rundir is an attempt whose cleanup already
+	// ran; restarting it in place would need the overlay that cleanup
+	// removed, so the retry starts over. Any other status may still own a
+	// process and keeps the in-place stop.
 	if inPlace && !priorRunDir {
-		delete(m.vms, vmID)
-		prevInst, inPlace = nil, false
+		prevInst.mu.RLock()
+		cleanedUp := prevInst.Status == StatusError && prevInst.TeardownPending == ""
+		prevInst.mu.RUnlock()
+		if cleanedUp {
+			delete(m.vms, vmID)
+			prevInst, inPlace = nil, false
+		}
 	}
 	prevSupervision := SupervisionUnit
 	if inPlace {
