@@ -2005,7 +2005,7 @@ func main() {
 			return
 		}
 		liveNetns, _, _ := netMgr.NetnsStats()
-		if short := neighTableShortfall(neighCap, liveNetns); short > 0 {
+		if short := neighTableShortfall(neighCap, liveNetns, netPoolFresh); short > 0 {
 			log.Error().Int("gc_thresh3", neighCap).Int("netns", liveNetns).Int("shortfall", short).
 				Msg("kernel neighbour table cap is too small for this host; raise net.ipv4.neigh.default.gc_thresh3")
 		}
