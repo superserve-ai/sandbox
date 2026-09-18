@@ -624,8 +624,15 @@ SELECT claim_team_commercial_billing_anchor(sqlc.arg(team_id), sqlc.arg(anchor))
 SELECT establish_billing_cutover(sqlc.arg(cutover), sqlc.arg(preserved_team_ids)::uuid[])::int AS team_count;
 
 -- name: BeginTeamBillingCheckout :one
-UPDATE team_billing_account SET checkout_initializing_at = now(), checkout_anchor_snapshot = commercial_billing_anchor, checkout_session_id = NULL, updated_at = now()
-WHERE team_id = sqlc.arg(team_id) AND (checkout_initializing_at IS NULL OR checkout_initializing_at < now() - interval '32 minutes') RETURNING *;
+UPDATE team_billing_account
+SET checkout_initializing_at = now(),
+    checkout_anchor_snapshot = COALESCE(checkout_anchor_snapshot, commercial_billing_anchor),
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id)
+  AND (checkout_session_id IS NOT NULL
+       OR checkout_initializing_at IS NULL
+       OR checkout_initializing_at < now() - interval '32 minutes')
+RETURNING *;
 
 -- name: FinishTeamBillingCheckout :exec
 UPDATE team_billing_account SET checkout_initializing_at = NULL, checkout_anchor_snapshot = NULL, checkout_session_id = NULL, updated_at = now() WHERE team_id = sqlc.arg(team_id);

@@ -165,8 +165,15 @@ func (q *Queries) AssignTeamPricingPlan(ctx context.Context, arg AssignTeamPrici
 }
 
 const beginTeamBillingCheckout = `-- name: BeginTeamBillingCheckout :one
-UPDATE team_billing_account SET checkout_initializing_at = now(), checkout_anchor_snapshot = commercial_billing_anchor, checkout_session_id = NULL, updated_at = now()
-WHERE team_id = $1 AND (checkout_initializing_at IS NULL OR checkout_initializing_at < now() - interval '32 minutes') RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at
+UPDATE team_billing_account
+SET checkout_initializing_at = now(),
+    checkout_anchor_snapshot = COALESCE(checkout_anchor_snapshot, commercial_billing_anchor),
+    updated_at = now()
+WHERE team_id = $1
+  AND (checkout_session_id IS NOT NULL
+       OR checkout_initializing_at IS NULL
+       OR checkout_initializing_at < now() - interval '32 minutes')
+RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at
 `
 
 func (q *Queries) BeginTeamBillingCheckout(ctx context.Context, teamID uuid.UUID) (TeamBillingAccount, error) {
