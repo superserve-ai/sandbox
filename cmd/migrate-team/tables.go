@@ -119,6 +119,8 @@ var migratedTables = []tableSpec{
 	{"team_credit_grant", "team_id = $1"},
 	{"team_credit_ledger", "team_id = $1"},
 	{"quota_alert_state", "team_id = $1"},
+	{"trial_credit_warning_state", "team_id = $1"},
+	{"trial_credit_warning_delivery", "team_id = $1"},
 	{"activity", "team_id = $1"},
 	// Live revocations move with the team so a stale sandbox JWT can't be
 	// replayed against the dest cell's proxy. Rows self-expire.

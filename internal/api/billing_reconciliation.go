@@ -21,6 +21,7 @@ const (
 )
 
 func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
+	h.scheduleTrialCreditWarningDiscovery(ctx)
 	var after *uuid.UUID
 	for {
 		var afterID pgtype.UUID

@@ -1017,6 +1017,139 @@ SELECT trial.grant_usd::numeric AS grant_usd,
        trial.eligible::boolean AS eligible
 FROM get_team_trial_balance(sqlc.arg(team_id)) AS trial;
 
+-- Bound both index reads and aggregation; oversized samples yield no forecast.
+-- Separate open and closed intervals to use the team/open and team/end indexes.
+-- name: GetRecentTrialBurnSample :one
+WITH sample_window AS MATERIALIZED (
+  -- A new signup grant starts a new warning lifecycle. Do not extrapolate
+  -- consumption from the previous lifecycle into its warning.
+  SELECT GREATEST(now() - interval '6 hours', MAX(created_at)) AS started_at
+  FROM team_credit_grant
+  WHERE team_id = sqlc.arg(team_id) AND reason = 'signup trial credit'
+), selected_plan AS (
+  SELECT COALESCE((SELECT tpp.plan_key FROM team_pricing_plan tpp JOIN pricing_plan pp ON pp.key = tpp.plan_key
+    WHERE tpp.team_id = sqlc.arg(team_id) AND pp.active AND tpp.effective_from <= now()
+      AND (tpp.effective_to IS NULL OR tpp.effective_to > now())
+    ORDER BY tpp.effective_from DESC LIMIT 1), 'payg') AS plan_key
+), ranked_rates AS (
+  SELECT r.resource, r.price_usd,
+         row_number() OVER (PARTITION BY r.resource, r.unit ORDER BY r.effective_from DESC, r.created_at DESC, r.id DESC) AS rate_rank
+  FROM pricing_rate r
+  JOIN selected_plan p ON p.plan_key = r.plan_key
+  JOIN pricing_plan pp ON pp.key = r.plan_key AND pp.active
+  WHERE r.unit = 'second' AND r.effective_from <= now() AND (r.effective_to IS NULL OR r.effective_to > now())
+), rates AS (
+  SELECT COALESCE(MAX(price_usd) FILTER (WHERE resource = 'vcpu' AND rate_rank = 1), 0)::numeric AS vcpu,
+         COALESCE(MAX(price_usd) FILTER (WHERE resource = 'memory_gib' AND rate_rank = 1), 0)::numeric AS memory,
+         COALESCE(MAX(price_usd) FILTER (WHERE resource = 'storage_gib' AND rate_rank = 1), 0)::numeric AS storage
+  FROM ranked_rates
+  WHERE rate_rank = 1
+), recent_compute AS MATERIALIZED (
+  SELECT GREATEST(i.started_at, (SELECT started_at FROM sample_window)) AS started_at,
+         i.ended_at, vcpu_count, memory_mib
+  FROM (
+    (SELECT started_at, ended_at, vcpu_count, memory_mib FROM sandbox_compute_billing_interval
+     WHERE team_id = sqlc.arg(team_id) AND ended_at IS NULL
+     LIMIT 1025)
+    UNION ALL
+    (SELECT started_at, ended_at, vcpu_count, memory_mib FROM sandbox_compute_billing_interval
+     WHERE team_id = sqlc.arg(team_id) AND ended_at > (SELECT started_at FROM sample_window)
+     LIMIT 1025)
+  ) i
+), compute AS (
+  -- Convert each resource's usage to USD before aggregating.  The raw
+  -- interval duration is vCPU-seconds and must never be exposed as spend.
+  SELECT COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(b.ended_at, now()), now()) - b.started_at)) * (b.vcpu_count * rates.vcpu + b.memory_mib / 1024.0 * rates.memory)), 0)::numeric AS amount,
+       MIN(b.started_at) AS started_at,
+       MAX(COALESCE(b.ended_at, now())) AS ended_at
+FROM recent_compute b
+ CROSS JOIN rates
+ WHERE b.started_at < now()
+), recent_storage AS MATERIALIZED (
+  SELECT GREATEST(i.started_at, (SELECT started_at FROM sample_window)) AS started_at,
+         i.ended_at, disk_mib
+  FROM (
+    (SELECT started_at, ended_at, disk_mib FROM sandbox_storage_interval
+     WHERE team_id = sqlc.arg(team_id) AND ended_at IS NULL AND feature_enabled('billing_storage_billing_enabled', sqlc.arg(team_id))
+     LIMIT 1025)
+    UNION ALL
+    (SELECT started_at, ended_at, disk_mib FROM sandbox_storage_interval
+     WHERE team_id = sqlc.arg(team_id) AND ended_at > (SELECT started_at FROM sample_window) AND feature_enabled('billing_storage_billing_enabled', sqlc.arg(team_id))
+     LIMIT 1025)
+  ) i
+), sample_bounds AS (
+  SELECT MIN(started_at) AS started_at,
+         MAX(LEAST(ended_at, now())) AS ended_at
+  FROM (
+    SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_compute WHERE started_at < now()
+    UNION ALL
+    SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_storage WHERE started_at < now()
+  ) intervals
+)
+SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN feature_enabled('billing_storage_billing_enabled', sqlc.arg(team_id)) THEN COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(s.ended_at, now()), now()) - s.started_at)) * s.disk_mib / 1024.0 * rates.storage) FROM recent_storage s CROSS JOIN rates WHERE s.started_at < now()), 0) ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
+       sample_bounds.started_at, sample_bounds.ended_at,
+       EXTRACT(EPOCH FROM (sample_bounds.ended_at - sample_bounds.started_at))::numeric AS elapsed_seconds
+FROM compute, rates, sample_bounds;
+
+-- name: ClaimTrialCreditWarning :one
+-- A claimed row is never reclaimed after a timeout: the worker may have
+-- crashed after provider acceptance, so retrying could duplicate the email.
+INSERT INTO trial_credit_warning_state (team_id, lifecycle_key, status, claim_token, claimed_at)
+VALUES (sqlc.arg(team_id), sqlc.arg(lifecycle_key)::text, 'claimed', gen_random_uuid(), now())
+ON CONFLICT (team_id, lifecycle_key) DO UPDATE
+SET status = 'claimed', claim_token = gen_random_uuid(), claimed_at = now(), updated_at = now()
+WHERE trial_credit_warning_state.status = 'pending'
+  AND trial_credit_warning_state.lifecycle_key = sqlc.arg(lifecycle_key)::text
+RETURNING claim_token;
+
+-- name: IsTrialCreditWarningClaimCurrent :one
+SELECT EXISTS (
+    SELECT 1 FROM trial_credit_warning_state
+    WHERE team_id = sqlc.arg(team_id) AND claim_token = sqlc.arg(claim_token)
+      AND status = 'claimed'
+      AND lifecycle_key = trial_credit_warning_lifecycle(sqlc.arg(team_id))
+)::boolean AS current;
+
+-- name: CompleteTrialCreditWarning :exec
+-- A finished recipient loop with rejections is terminal, but not fully sent.
+UPDATE trial_credit_warning_state
+SET status = CASE WHEN EXISTS (
+        SELECT 1 FROM trial_credit_warning_delivery d WHERE d.team_id = sqlc.arg(team_id) AND d.lifecycle_key = trial_credit_warning_state.lifecycle_key AND d.rejected_at IS NOT NULL
+    ) THEN 'suppressed' ELSE 'sent' END,
+    sent_at = CASE WHEN EXISTS (
+        SELECT 1 FROM trial_credit_warning_delivery d WHERE d.team_id = sqlc.arg(team_id) AND d.lifecycle_key = trial_credit_warning_state.lifecycle_key AND d.rejected_at IS NOT NULL
+    ) THEN NULL ELSE now() END,
+    updated_at = now()
+WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.arg(claim_token);
+
+-- name: ListTrialCreditWarningDeliveries :many
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = sqlc.arg(team_id) AND lifecycle_key = trial_credit_warning_lifecycle(sqlc.arg(team_id)) AND sent_at IS NOT NULL;
+
+-- name: ListTrialCreditWarningRejections :many
+SELECT recipient FROM trial_credit_warning_delivery WHERE team_id = sqlc.arg(team_id) AND lifecycle_key = trial_credit_warning_lifecycle(sqlc.arg(team_id)) AND rejected_at IS NOT NULL;
+
+-- name: RecordTrialCreditWarningRejection :execrows
+INSERT INTO trial_credit_warning_delivery (team_id, lifecycle_key, recipient, sent_at, rejected_at)
+SELECT s.team_id, s.lifecycle_key, sqlc.arg(recipient)::text, NULL, now() FROM trial_credit_warning_state s
+WHERE s.team_id = sqlc.arg(team_id) AND s.status = 'claimed' AND s.claim_token = sqlc.arg(claim_token)
+ON CONFLICT (team_id, lifecycle_key, recipient) DO NOTHING;
+
+-- name: RecordTrialCreditWarningDelivery :execrows
+INSERT INTO trial_credit_warning_delivery (team_id, lifecycle_key, recipient)
+SELECT s.team_id, s.lifecycle_key, sqlc.arg(recipient)::text FROM trial_credit_warning_state s
+WHERE s.team_id = sqlc.arg(team_id) AND s.status = 'claimed' AND s.claim_token = sqlc.arg(claim_token)
+ON CONFLICT (team_id, lifecycle_key, recipient) DO NOTHING;
+
+-- name: ReleaseTrialCreditWarning :exec
+UPDATE trial_credit_warning_state SET status = 'pending', claimed_at = NULL, updated_at = now()
+WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.arg(claim_token);
+
+-- name: MarkTrialCreditWarningUnknown :exec
+-- An interrupted provider request may have been accepted. Do not reclaim it,
+-- because retrying would violate the one-warning invariant.
+UPDATE trial_credit_warning_state SET status = 'unknown', updated_at = now()
+WHERE team_id = sqlc.arg(team_id) AND status = 'claimed' AND claim_token = sqlc.arg(claim_token);
+
 -- name: IsTeamSandboxBillingEligible :one
 SELECT team_sandbox_billing_eligible(sqlc.arg(team_id)) AS eligible;
 
@@ -1039,6 +1172,27 @@ WHERE s.destroyed_at IS NULL
   AND a.trial_ended_at IS NULL
   AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
 ORDER BY s.team_id
+LIMIT sqlc.arg(batch_limit);
+
+-- name: ListTrialCreditWarningTeams :many
+WITH consuming_teams AS (
+    SELECT s.team_id
+    FROM sandbox s
+    WHERE s.destroyed_at IS NULL AND s.status = 'active'
+      AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+    UNION
+    SELECT i.team_id
+    FROM sandbox_storage_interval i
+    WHERE i.ended_at IS NULL AND i.disk_mib > 0 AND i.started_at < now()
+      AND i.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+      AND feature_enabled('billing_storage_billing_enabled', i.team_id)
+)
+SELECT c.team_id
+FROM consuming_teams c
+LEFT JOIN team_billing_account a ON a.team_id = c.team_id
+WHERE a.trial_ended_at IS NULL
+  AND EXISTS (SELECT 1 FROM team_credit_grant g WHERE g.team_id = c.team_id AND g.reason = 'signup trial credit')
+ORDER BY c.team_id
 LIMIT sqlc.arg(batch_limit);
 
 -- name: ListTeamsWithActiveIneligibleSandboxes :many
@@ -1148,3 +1302,22 @@ JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_en
 )
 SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds
 FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start;
+
+
+-- name: GetTeamTrialRunway :one
+WITH lifecycle AS (
+    SELECT trial_credit_warning_lifecycle(sqlc.arg(team_id))::text AS key
+)
+SELECT lifecycle.key::text AS lifecycle_key,
+       COALESCE(r.state, 'unknown')::text AS state,
+       r.observed_at
+FROM lifecycle
+LEFT JOIN team_trial_runway r ON r.team_id = sqlc.arg(team_id) AND r.lifecycle_key = lifecycle.key;
+
+-- name: UpsertTeamTrialRunway :exec
+INSERT INTO team_trial_runway (team_id, lifecycle_key, state, observed_at)
+SELECT sqlc.arg(team_id), sqlc.arg(lifecycle_key)::text, sqlc.arg(state)::text, sqlc.arg(observed_at)::timestamptz
+WHERE trial_credit_warning_lifecycle(sqlc.arg(team_id)) = sqlc.arg(lifecycle_key)
+ON CONFLICT (team_id) DO UPDATE
+SET lifecycle_key = EXCLUDED.lifecycle_key, state = EXCLUDED.state, observed_at = EXCLUDED.observed_at
+WHERE team_trial_runway.observed_at < EXCLUDED.observed_at;

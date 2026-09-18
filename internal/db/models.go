@@ -930,6 +930,13 @@ type TeamTrialEligibilityCache struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+type TeamTrialRunway struct {
+	TeamID       uuid.UUID `json:"team_id"`
+	LifecycleKey string    `json:"lifecycle_key"`
+	State        string    `json:"state"`
+	ObservedAt   time.Time `json:"observed_at"`
+}
+
 type TelemetrySamplerLease struct {
 	Name        string    `json:"name"`
 	LockedBy    string    `json:"locked_by"`
@@ -972,6 +979,24 @@ type TemplateBuild struct {
 	FinalizedAt   pgtype.Timestamptz  `json:"finalized_at"`
 	CreatedAt     time.Time           `json:"created_at"`
 	UpdatedAt     time.Time           `json:"updated_at"`
+}
+
+type TrialCreditWarningDelivery struct {
+	TeamID       uuid.UUID          `json:"team_id"`
+	Recipient    string             `json:"recipient"`
+	SentAt       pgtype.Timestamptz `json:"sent_at"`
+	RejectedAt   pgtype.Timestamptz `json:"rejected_at"`
+	LifecycleKey string             `json:"lifecycle_key"`
+}
+
+type TrialCreditWarningState struct {
+	TeamID       uuid.UUID          `json:"team_id"`
+	Status       string             `json:"status"`
+	ClaimToken   pgtype.UUID        `json:"claim_token"`
+	ClaimedAt    pgtype.Timestamptz `json:"claimed_at"`
+	SentAt       pgtype.Timestamptz `json:"sent_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
+	LifecycleKey string             `json:"lifecycle_key"`
 }
 
 type UserRoleAssignment struct {
