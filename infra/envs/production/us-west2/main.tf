@@ -313,7 +313,8 @@ module "sandbox_host_b" {
   service_account_email     = google_service_account.vmd_runtime.email
   allow_stopping_for_update = true
   depends_on                = [google_project_iam_member.vmd_telemetry, google_storage_bucket_iam_member.vmd_backup, google_service_account_iam_member.vmd_deploy_act_as]
-  boot_disk_image           = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2404-lts-amd64"
+  boot_disk_image           = lookup(var.host_image_overrides, "sandbox_host_b", var.boot_disk_image)
+  provisioning              = contains(var.provisioning_hosts, "sandbox_host_b")
   boot_disk_size_gb         = 250
   # Metal machine types reject the API-default pd-standard boot disk.
   boot_disk_type      = "hyperdisk-balanced"

@@ -1,0 +1,132 @@
+name: Provision VMD Host
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: Regional Terraform configuration
+        type: choice
+        required: true
+        options: [us-central1, us-west2, us-east4]
+      host:
+        description: Exact configured host module (sandbox_host, sandbox_host_b, sandbox_host_c)
+        type: string
+        required: true
+      image:
+        description: Boot image reference for this host operation
+        type: string
+        required: true
+      operation:
+        description: Create an absent host (existing identity/monitoring required) or replace an evacuated host
+        type: choice
+        required: true
+        options: [create, replace]
+      prerequisites_ready:
+        description: Target is evacuated/excluded and serving control planes enforce identity fencing
+        type: boolean
+        required: true
+        default: false
+
+# Serialize manual operations in a region. Terraform state locking and stale-plan
+# rejection also protect against intervening routine CD applies.
+concurrency:
+  group: host-provision-${{ inputs.region }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  REGION: ${{ inputs.region }}
+  HOST: ${{ inputs.host }}
+  IMAGE: ${{ inputs.image }}
+  OPERATION: ${{ inputs.operation }}
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.target.outputs.environment }}
+      attempt: ${{ steps.target.outputs.attempt }}
+    steps:
+      - name: Resolve target and require approval protection
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.HOST_PROVISION_ENVIRONMENT_READ_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_REF: ${{ github.ref }}
+          READY: ${{ inputs.prerequisites_ready }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_REF" = refs/heads/main
+          test "$READY" = true
+          case "$REGION:$HOST" in
+            us-central1:sandbox_host|us-central1:sandbox_host_b) environment=staging ;;
+            us-west2:sandbox_host|us-west2:sandbox_host_b|us-east4:sandbox_host_b|us-east4:sandbox_host_c) environment=production ;;
+            *) echo 'Unsupported region/host'; exit 1 ;;
+          esac
+          test -n "$GH_TOKEN" || { echo "Missing HOST_PROVISION_ENVIRONMENT_READ_TOKEN (repository Environments: read)"; exit 1; }
+          # The apply job must wait for review of this run's saved plan.
+          gh api "repos/$REPOSITORY/environments/host-provision-$environment" |
+            jq -e 'any(.protection_rules[]?; .type == "required_reviewers" and (.reviewers | length) > 0)'
+          echo "environment=$environment" >> "$GITHUB_OUTPUT"
+          echo "attempt=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+
+  plan:
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: ${{ needs.preflight.outputs.environment }}
+    env:
+      PLAN_ATTEMPT: ${{ needs.preflight.outputs.attempt }}
+      TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.14.9'
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Save private plan and publish review summary
+        run: python3 scripts/provision-host.py plan --region "$REGION" --host "$HOST" --image "$IMAGE" --operation "$OPERATION"
+
+  approve:
+    needs: [preflight, plan]
+    runs-on: ubuntu-latest
+    environment: host-provision-${{ needs.preflight.outputs.environment }}
+    permissions: {}
+    steps:
+      - name: Record saved-plan approval
+        run: echo 'The saved plan from this run was approved. No different plan may be applied.'
+
+  apply:
+    needs: [preflight, plan, approve]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.preflight.outputs.environment }}
+    env:
+      PLAN_ATTEMPT: ${{ needs.preflight.outputs.attempt }}
+      TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.14.9'
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Apply approved plan and initialize identity without admission
+        run: python3 scripts/provision-host.py apply --region "$REGION" --host "$HOST" --image "$IMAGE" --operation "$OPERATION"

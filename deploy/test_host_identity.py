@@ -40,6 +40,7 @@ class HostIdentityTests(unittest.TestCase):
                         path = next(a.split('=', 2)[2] for a in args if a.startswith('--metadata-from-file='))
                         provider = json.loads(Path(path).read_text())
                     elif args[1:3] == ['compute', 'ssh']:
+                        self.assertIn('--tunnel-through-iap', args)
                         script = next(a[len('--command='):] for a in args if a.startswith('--command='))
                         if script.startswith('if sudo test -f'):
                             output = json.dumps(local)
@@ -94,6 +95,7 @@ class HostIdentityTests(unittest.TestCase):
                             output = json.dumps({'id': '100', 'metadata': {'items': [
                                 {'key': identity.KEY, 'value': json.dumps(original)}]}})
                         elif args[1:3] == ['compute', 'ssh']:
+                            self.assertIn('--tunnel-through-iap', args)
                             script = next(a[len('--command='):] for a in args if a.startswith('--command='))
                             if script.startswith('if sudo test -f'):
                                 output = json.dumps(original)
@@ -131,6 +133,7 @@ class HostIdentityTests(unittest.TestCase):
                 provider = json.loads(Path(path).read_text())
                 metadata_writes.append(dict(provider))
             elif args[1:3] == ['compute', 'ssh']:
+                self.assertIn('--tunnel-through-iap', args)
                 script = next(a[len('--command='):] for a in args if a.startswith('--command='))
                 if script in (f'sudo mkdir {identity.LOCK}', f'sudo rmdir {identity.LOCK}'):
                     pass
@@ -235,6 +238,7 @@ class HostIdentityTests(unittest.TestCase):
                     path = next(a.split('=', 2)[2] for a in args if a.startswith('--metadata-from-file='))
                     provider = json.loads(Path(path).read_text())
                 elif args[1:3] == ['compute', 'ssh']:
+                    self.assertIn('--tunnel-through-iap', args)
                     script = next(a[len('--command='):] for a in args if a.startswith('--command='))
                     if script == f'sudo mkdir {identity.LOCK}':
                         try:
@@ -346,6 +350,7 @@ class HostIdentityTests(unittest.TestCase):
             if args[1:4] == ['compute', 'instances', 'describe']:
                 output = json.dumps({'id': '101'})
             elif args[1:3] == ['compute', 'ssh']:
+                self.assertIn('--tunnel-through-iap', args)
                 script = next(a[len('--command='):] for a in args if a.startswith('--command='))
                 self.assertIn(script, [f'sudo mkdir {identity.LOCK}', f'sudo rmdir {identity.LOCK}',
                                       f'if sudo test -f {identity.STATE}; then sudo cat {identity.STATE}; fi'])

@@ -220,6 +220,14 @@ func TestIntegration_ClaimResume_CarriesSnapshotTimeAndSecretEnvRecord(t *testin
 	ctx := context.Background()
 	teamID, apiKey := seedTeamAndKey(t)
 	sandboxID := seedPausedSandbox(t, apiKey)
+	var snapshotCreatedAt pgtype.Timestamptz
+	if err := testPool.QueryRow(ctx, `
+		SELECT s.created_at FROM snapshot s
+		JOIN sandbox sb ON sb.snapshot_id = s.id AND sb.team_id = s.team_id
+		WHERE sb.id = $1 AND sb.team_id = $2
+	`, sandboxID, teamID).Scan(&snapshotCreatedAt); err != nil {
+		t.Fatalf("read pause snapshot timestamp: %v", err)
+	}
 
 	fingerprint, ip := "abc123", "10.0.0.5"
 	if err := testQueries.RecordSandboxSecretEnv(ctx, db.RecordSandboxSecretEnvParams{
@@ -234,8 +242,8 @@ func TestIntegration_ClaimResume_CarriesSnapshotTimeAndSecretEnvRecord(t *testin
 	if err != nil {
 		t.Fatalf("claim: %v", err)
 	}
-	if !claimed.SnapCreatedAt.Valid || claimed.SnapCreatedAt.Time.After(time.Now()) {
-		t.Fatalf("snap_created_at = %v, want the pause's timestamp", claimed.SnapCreatedAt)
+	if !claimed.SnapCreatedAt.Valid || !claimed.SnapCreatedAt.Time.Equal(snapshotCreatedAt.Time) {
+		t.Fatalf("snap_created_at = %v, want the pause's timestamp %v", claimed.SnapCreatedAt, snapshotCreatedAt)
 	}
 	sb := claimed.Sandbox
 	if sb.SecretEnvFingerprint == nil || *sb.SecretEnvFingerprint != fingerprint || sb.SecretEnvIp == nil || *sb.SecretEnvIp != ip ||

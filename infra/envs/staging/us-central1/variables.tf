@@ -75,3 +75,22 @@ variable "system_team_id_secret_name" {
   type        = string
   default     = null
 }
+
+variable "boot_disk_image" {
+  default     = "projects/rayai-dev/global/images/superserve-vmd-20260401-224137"
+  description = "Regional creation-time image default; existing boot disks remain unchanged."
+  type        = string
+  nullable    = false
+}
+
+variable "host_image_overrides" {
+  description = "Creation-time image overrides keyed by configured host module name."
+  type        = map(string)
+  default     = {}
+}
+
+variable "provisioning_hosts" {
+  description = "Host module names held outside scheduling and runtime deployment during maintenance. Remove only after readiness and explicit admission."
+  type        = set(string)
+  default     = []
+}

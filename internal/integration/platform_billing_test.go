@@ -51,6 +51,8 @@ func decodePlatformBilling(t *testing.T, body []byte) platformBillingTestRespons
 
 func TestPlatformBillingPaginationTotalsAndPartialFailures(t *testing.T) {
 	ctx := context.Background()
+	fixedNow := time.Now().UTC()
+	effectiveFrom := fixedNow.Add(-time.Hour)
 	suffix := uuid.NewString()[:8]
 	prefix := "platform-billing-" + suffix
 	goodTeam, err := testQueries.CreateTeam(ctx, prefix+"-alpha")
@@ -70,21 +72,21 @@ func TestPlatformBillingPaginationTotalsAndPartialFailures(t *testing.T) {
 		t.Fatalf("seed incomplete pricing plan: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `
-		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd)
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
 		VALUES
-			($1, 'vcpu', 'second', 0.00001)
-	`, planKey); err != nil {
+			($1, 'vcpu', 'second', 0.00001, $2)
+	`, planKey, effectiveFrom); err != nil {
 		t.Fatalf("seed incomplete pricing rates: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `
-		INSERT INTO team_pricing_plan (team_id, plan_key)
-		VALUES ($2, $1)
-	`, planKey, badTeam.ID); err != nil {
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($2, $1, $3)
+	`, planKey, badTeam.ID, effectiveFrom); err != nil {
 		t.Fatalf("assign incomplete pricing plan: %v", err)
 	}
 
 	actorID := seedPlatformAdminProfile(t)
-	r := newInternalRouter(t)
+	r := newInternalRouterWithNow(t, func() time.Time { return fixedNow })
 
 	first := doInternal(
 		r,

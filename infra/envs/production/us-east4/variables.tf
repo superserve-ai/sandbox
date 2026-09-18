@@ -134,3 +134,22 @@ variable "host_c_host_id" {
   description = "The serving host's HOST_ID as vmd registers it (the installed host identity, not the slot name); DEFAULT_HOST_ID and alert filters follow it."
   type        = string
 }
+
+variable "boot_disk_image" {
+  default     = "projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts"
+  description = "Regional creation-time image default; existing boot disks remain unchanged."
+  type        = string
+  nullable    = false
+}
+
+variable "host_image_overrides" {
+  description = "Creation-time image overrides keyed by configured host module name."
+  type        = map(string)
+  default     = {}
+}
+
+variable "provisioning_hosts" {
+  description = "Host module names held outside scheduling and runtime deployment during maintenance. Remove only after readiness and explicit admission."
+  type        = set(string)
+  default     = []
+}

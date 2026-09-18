@@ -57,18 +57,9 @@ Migrations leave existing hosts with both incarnation and generation NULL.
    command with VMD stopped. It reuses that identity without requiring rebind.
    `--new-machine` attests the VM has never registered; do not use it to recover
    lost local state on a previously registered VM.
-   Before provisioning, bake this release's `deploy/superserve-vmd.service` and
-   `deploy/superserve-vmd.socket` into the image's systemd unit directory together
-   with the fencing-aware VMD binary. Pin provisioning to that image. The baked
-   units require identity before any daemon start, including socket activation
-   before cloud-init. Images with older units or binaries are unsupported;
-   cloud-init `bootcmd` cannot close their early-boot registration race.
-   Verify the image's effective units retain the mandatory identity environment
-   and nonempty state check, with no drop-ins clearing these settings. Boot a
-   disposable VM with missing identity and attempt socket activation: VMD must
-   not register. Repeat with copied identity from a different disposable VM:
-   provider-ID verification must fail before registration. Do not admit the
-   image for provisioning until both checks pass.
+   Use the configured regional image or an explicit manual-provisioning override.
+   Preserve identity-gated service/socket startup and provider-ID verification;
+   keep the host out of placement until manual readiness checks pass.
    The host modules reassert the gate before caller boot commands as a secondary
    safeguard. Existing instances ignore startup metadata changes and keep
    their current IDs. Never copy instance metadata or identity files to a
