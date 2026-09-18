@@ -983,35 +983,11 @@ type restored struct {
 }
 
 func restoredDisk(root, id string) (restored, error) {
-	var r restored
-	dir := filepath.Join(root, id)
-	marker := filepath.Join(dir, backup.ManifestObject)
-	raw, err := os.ReadFile(marker)
+	r, err := backup.RestoredDisk(filepath.Join(root, id))
 	if err != nil {
-		return r, fmt.Errorf("not restored")
+		return restored{}, err
 	}
-	if err := json.Unmarshal(raw, &r.manifest); err != nil {
-		return r, fmt.Errorf("restore marker: %w", err)
-	}
-	for _, f := range r.manifest.Files {
-		if f.Name != "rootfs.ext4" {
-			continue
-		}
-		r.disk = filepath.Join(dir, f.Name)
-		if _, err := os.Stat(r.disk); err != nil {
-			return r, fmt.Errorf("restored without a rootfs")
-		}
-		if f.BaseSHA256 == "" {
-			r.standalone = true
-			return r, nil
-		}
-		r.base = filepath.Join(dir, backup.SharedBaseName(f.BaseSHA256))
-		if _, err := os.Stat(r.base); err != nil {
-			return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
-		}
-		return r, nil
-	}
-	return r, fmt.Errorf("restore marker lists no rootfs")
+	return restored{disk: r.Disk, base: r.Base, standalone: r.Standalone, manifest: *r.Manifest}, nil
 }
 
 // current reports whether the restored generation is the sandbox's

@@ -40,6 +40,12 @@ func (m *Manager) SetBackupEnqueue(fn func(backup.Task) error) {
 	m.backupEnqueue = fn
 }
 
+// SetBackupRestore enables reviving a paused sandbox from its bucket backup
+// when the pause artifacts are gone from the host; root is the staging tree.
+func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobLister, root string) {
+	m.backupReader, m.backupLister, m.backupRestoreRoot = reader, lister, root
+}
+
 // SetBackupMetrics installs the optional backup metrics recorder. Same
 // startup-only pattern as SetBackupEnqueue; a nil recorder (metrics
 // disabled) is safe at every call site, and recording never affects
