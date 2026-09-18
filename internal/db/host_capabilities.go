@@ -42,36 +42,39 @@ func (q *Queries) LockedHostHasCapabilities(ctx context.Context, arg HostHasCapa
 }
 
 // LockedResumePostBootCheck is ResumePostBootCheck evaluated after
-// LockHostForCapabilities in one short READ COMMITTED transaction, so the
-// capability snapshot follows any heartbeat update already in flight.
+// LockHostForCapabilities, so the capability snapshot follows any heartbeat
+// update already in flight. Both statements go out as one pipelined batch:
+// the server runs them in order inside the batch's implicit transaction,
+// the lock waits on the writer and the read that follows takes its snapshot
+// after that wait, for one round trip instead of a transaction's four.
 func (q *Queries) LockedResumePostBootCheck(ctx context.Context, arg ResumePostBootCheckParams) (ResumePostBootCheckRow, error) {
-	beginner, ok := q.db.(interface {
-		BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
+	batcher, ok := q.db.(interface {
+		SendBatch(context.Context, *pgx.Batch) pgx.BatchResults
 	})
 	if !ok {
-		return ResumePostBootCheckRow{}, fmt.Errorf("locked resume check requires a transaction-capable connection")
+		return ResumePostBootCheckRow{}, fmt.Errorf("locked resume check requires a batch-capable connection")
 	}
-	tx, err := beginner.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	b := &pgx.Batch{}
+	b.Queue(lockHostForCapabilities, arg.HostID)
+	b.Queue(resumePostBootCheck,
+		arg.RequiredCapabilities,
+		arg.ID,
+		arg.TeamID,
+		arg.HostID,
+		arg.AllowedStatuses,
+		arg.HeartbeatAfter,
+	)
+	results := batcher.SendBatch(ctx, b)
+	defer results.Close()
+	if _, err := results.Exec(); err != nil {
+		return ResumePostBootCheckRow{}, err
+	}
+	var row ResumePostBootCheckRow
+	err := results.QueryRow().Scan(&row.Access, &row.WireAccess, &row.Revision, &row.HostEligible)
 	if err != nil {
 		return ResumePostBootCheckRow{}, err
 	}
-	defer func() {
-		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		_ = tx.Rollback(cleanup)
-	}()
-	locked := q.WithTx(tx)
-	if _, err := locked.LockHostForCapabilities(ctx, arg.HostID); err != nil {
-		return ResumePostBootCheckRow{}, err
-	}
-	row, err := locked.ResumePostBootCheck(ctx, arg)
-	if err != nil {
-		return ResumePostBootCheckRow{}, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return ResumePostBootCheckRow{}, err
-	}
-	return row, nil
+	return row, results.Close()
 }
 
 func (q *Queries) lockedHostHasCapabilities(ctx context.Context, arg HostHasCapabilitiesParams) (bool, error) {

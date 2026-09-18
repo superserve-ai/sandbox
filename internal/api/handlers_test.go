@@ -248,6 +248,61 @@ func (tx *mockCapabilityTx) Commit(context.Context) error {
 }
 func (tx *mockCapabilityTx) Rollback(context.Context) error { return nil }
 
+// mockBatch runs a pipelined batch's statements in order against the
+// scripted rows. begin and commit bracket the batch like a transaction so
+// the lock-window checks read the same for both shapes.
+type mockBatch struct {
+	mock  *mockDBTX
+	ctx   context.Context
+	items []pgx.QueuedQuery
+	next  int
+}
+
+func (m *mockDBTX) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	if m.capabilityTxEvent != nil {
+		m.capabilityTxEvent("begin")
+	}
+	items := make([]pgx.QueuedQuery, len(b.QueuedQueries))
+	for i, q := range b.QueuedQueries {
+		items[i] = *q
+	}
+	return &mockBatch{mock: m, ctx: ctx, items: items}
+}
+
+func (b *mockBatch) take() (string, []any) {
+	if b.next >= len(b.items) {
+		panic("batch results read past the queued statements")
+	}
+	q := b.items[b.next]
+	b.next++
+	return q.SQL, q.Arguments
+}
+func (b *mockBatch) Exec() (pgconn.CommandTag, error) {
+	sql, args := b.take()
+	if strings.Contains(sql, "-- name: LockHostForCapabilities :execrows") {
+		if b.mock.capabilityTxEvent != nil {
+			b.mock.capabilityTxEvent("lock")
+		}
+		return pgconn.NewCommandTag("SELECT 1"), nil
+	}
+	return b.mock.Exec(b.ctx, sql, args...)
+}
+func (b *mockBatch) QueryRow() pgx.Row {
+	sql, args := b.take()
+	return b.mock.QueryRow(b.ctx, sql, args...)
+}
+func (b *mockBatch) Query() (pgx.Rows, error) {
+	sql, args := b.take()
+	return b.mock.Query(b.ctx, sql, args...)
+}
+func (b *mockBatch) Close() error {
+	if b.mock != nil && b.mock.capabilityTxEvent != nil {
+		b.mock.capabilityTxEvent("commit")
+	}
+	b.mock = nil
+	return nil
+}
+
 func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
 	// The finalize-mode probe runs before every FinalizePause. Unit tests
 	// exercise legacy mode (the index exists until the contract phase), so
@@ -5144,10 +5199,10 @@ func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *test
 }
 
 // On the attested path the post-boot policy read and the owner capability
-// check are one statement, evaluated after the host lock in one short
-// transaction: no separate policy read and no locked check of its own. It
-// carries the policy's requirement and the owner-resume host rule, and a
-// host that no longer meets it re-pauses the guest.
+// check are one statement, evaluated after the host lock in one pipelined
+// batch: no separate policy read and no locked check of its own. It carries
+// the policy's requirement and the owner-resume host rule, and a host that
+// no longer meets it re-pauses the guest.
 func TestResumeSandbox_PostBootCheckIsOneStatementUnderTheHostLock(t *testing.T) {
 	for _, eligible := range []bool{true, false} {
 		t.Run(fmt.Sprintf("eligible=%v", eligible), func(t *testing.T) {
@@ -5215,7 +5270,7 @@ func TestResumeSandbox_PostBootCheckIsOneStatementUnderTheHostLock(t *testing.T)
 				t.Fatalf("post-boot checks=%d policy reads=%d locked checks=%d; want 1/0/0", postChecks, policyReads, lockedChecks)
 			}
 			if !slices.Equal(events, []string{"begin", "lock", "read", "commit"}) {
-				t.Fatalf("transaction events = %v, want the read after the host lock in one transaction", events)
+				t.Fatalf("batch events = %v, want the read after the host lock in one batch", events)
 			}
 			if paused != !eligible {
 				t.Fatalf("paused = %v, want %v", paused, !eligible)
