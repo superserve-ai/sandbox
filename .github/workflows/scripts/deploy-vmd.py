@@ -30,14 +30,15 @@ Env vars:
   VMD_GUEST_CLOCK_FREEZE
                        optional — "true" has vmd freeze a guest's clock across
                        the snapshot of an image whose workload was frozen,
-                       and wake it on restore. Reconciled like
-                       BACKUP_BACKFILL: unset in the workflow removes the line
-                       on the next deploy. The second switch to turn on and
-                       the first to turn off; a host turned off still wakes
-                       the frozen images it holds.
+                       and wake it on restore. Upserted into vmd.env when
+                       set; empty = skip, leaving a line set on the host
+                       alone, as the other feature flags are. Off is an
+                       explicit "false". The second switch to turn on and the
+                       first to turn off; a host turned off still wakes the
+                       frozen images it holds.
   VMD_TEMPLATE_FREEZE_WORKLOAD
                        optional — "true" has the builds vmd forks freeze the
-                       guest's workload for the template snapshot. Reconciled
+                       guest's workload for the template snapshot. Upserted
                        the same way. Only ever set where the vmd binary
                        carries the wake protocol and the floor is up on every
                        host (vmd raise-wake-floor): a frozen template owes a
@@ -1026,16 +1027,16 @@ def main() -> int:
                 echo {q_backup_backfill_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
-            # Reconcile VMD_GUEST_CLOCK_FREEZE the same way: a rollout switch
-            # whose off step is unsetting it in the workflow.
-            sudo sed -i '/^VMD_GUEST_CLOCK_FREEZE=/d' /etc/sandbox/vmd.env
+            # Upsert VMD_GUEST_CLOCK_FREEZE when set; empty leaves a line set
+            # on the host alone, as the other feature flags are.
             if [ -n {q_guest_clock_freeze} ]; then
+                sudo sed -i '/^VMD_GUEST_CLOCK_FREEZE=/d' /etc/sandbox/vmd.env
                 echo {q_guest_clock_freeze_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
-            # Reconcile VMD_TEMPLATE_FREEZE_WORKLOAD the same way.
-            sudo sed -i '/^VMD_TEMPLATE_FREEZE_WORKLOAD=/d' /etc/sandbox/vmd.env
+            # Upsert VMD_TEMPLATE_FREEZE_WORKLOAD the same way.
             if [ -n {q_template_freeze} ]; then
+                sudo sed -i '/^VMD_TEMPLATE_FREEZE_WORKLOAD=/d' /etc/sandbox/vmd.env
                 echo {q_template_freeze_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 

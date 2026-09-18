@@ -2004,6 +2004,11 @@ func main() {
 	// background work logs may come ahead of it.
 	close(postReady)
 
+	if neighCap, err := readNeighTableCap(); err == nil && neighCap <= kernelDefaultNeighTableCap {
+		log.Error().Int("gc_thresh3", neighCap).
+			Msg("kernel neighbour table cap is at the default; raise net.ipv4.neigh.default.gc_thresh3 or guests drop off the host under bursts")
+	}
+
 	// Leak gauge for network namespaces — independent of the launcher path.
 	// Started AFTER readiness (and so after StartPool): its immediate first
 	// sample walks the fleet under the allocator lock, which must not contend
