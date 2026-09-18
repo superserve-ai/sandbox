@@ -51,10 +51,13 @@ func RestoredDisk(dir string) (Restored, error) {
 			return r, nil
 		}
 		r.Base = filepath.Join(dir, SharedBaseName(f.BaseSHA256))
-		if _, err := os.Stat(r.Base); err != nil {
-			return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
+		if _, err := os.Stat(r.Base); err == nil {
+			return r, nil
 		}
-		return r, nil
+		if r.Base = hostBaseFor(f); r.Base != "" {
+			return r, nil
+		}
+		return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
 	}
 	return r, fmt.Errorf("restore marker lists no rootfs")
 }
@@ -88,12 +91,35 @@ func FetchMatching(ctx context.Context, r BlobReader, lister BlobLister, sandbox
 		if !anchor.matches(m) {
 			continue
 		}
-		if _, err := RestoreGeneration(ctx, r, sandboxID, g.Generation, destDir, progress); err != nil {
+		skip := func(mf ManifestFile) bool { return isSharedEntry(mf) && hostHoldsBase(m, mf.SHA256) }
+		if _, err := restoreGeneration(ctx, r, sandboxID, g.Generation, destDir, skip, progress); err != nil {
 			return Restored{}, err
 		}
 		return RestoredDisk(destDir)
 	}
 	return Restored{}, ErrNoMatchingBackup
+}
+
+// hostBaseFor is the template base an overlay was paused over, when the
+// host still has it. Build directories are immutable and named by build,
+// so the recorded path identifies the content.
+func hostBaseFor(f ManifestFile) string {
+	if f.BasePath == "" {
+		return ""
+	}
+	if info, err := os.Stat(f.BasePath); err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	return f.BasePath
+}
+
+func hostHoldsBase(m *GenerationManifest, sha string) bool {
+	for _, f := range m.Files {
+		if f.BaseSHA256 == sha && hostBaseFor(f) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // AnchorKey is a stable identity for an anchor, for comparing requests.
