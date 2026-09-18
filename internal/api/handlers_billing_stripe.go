@@ -799,6 +799,19 @@ func (h *Handlers) ApproveTeamBillingPeriod(c *gin.Context) {
 		respondErrorMsg(c, "conflict", "cannot approve an open billing period", http.StatusConflict)
 		return
 	}
+	account, accountErr := h.DB.GetTeamBillingAccount(c.Request.Context(), teamID)
+	if accountErr != nil && !errors.Is(accountErr, pgx.ErrNoRows) {
+		log.Error().Err(accountErr).Str("team_id", teamID.String()).Msg("load billing account for period approval failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if accountErr == nil && account.CommercialBillingAnchor.Valid {
+		expectedStart, expectedEnd, anchored := billing.AnniversaryPeriod(account.CommercialBillingAnchor.Time, periodStart)
+		if anchored && (!periodStart.Equal(expectedStart) || !periodEnd.Equal(expectedEnd)) {
+			respondErrorMsg(c, "conflict", "period does not match the team's commercial billing anchor", http.StatusConflict)
+			return
+		}
+	}
 	if _, _, err := h.upsertBillingSnapshot(c.Request.Context(), teamID, periodStart, periodEnd); err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("prepare billing period approval failed")
 		respondError(c, ErrInternal)
@@ -819,7 +832,6 @@ func (h *Handlers) ApproveTeamBillingPeriod(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	account, _ := h.DB.GetTeamBillingAccount(c.Request.Context(), teamID)
 	c.JSON(http.StatusOK, billingPeriodResponseFromDB(period, account))
 }
 
