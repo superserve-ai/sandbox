@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -41,7 +42,8 @@ func pauseArtifactsPresent(snap, mem, baseMem, disk, base string) bool {
 }
 
 // pauseArtifactsMissing is true for a paused record whose resume would
-// fail on a file the host no longer has.
+// fail on a file the host no longer has. Omitted request paths resolve
+// from the record, as the resume itself resolves them.
 func (m *Manager) pauseArtifactsMissing(vmID, snapshotPath, memPath string) bool {
 	inst, err := m.getInstance(vmID)
 	if err != nil {
@@ -63,10 +65,10 @@ func (m *Manager) pauseArtifactsMissing(vmID, snapshotPath, memPath string) bool
 }
 
 // backupRevivedTarget returns the live VM a backup-backed resume for the
-// same recorded pause already booted, so a retry of that request adopts
-// it instead of failing on artifacts the cold boot never had.
-func (m *Manager) backupRevivedTarget(vmID, anchorKey string) *VMInstance {
-	if anchorKey == "" {
+// same generation already booted, so a retry of that request adopts it
+// instead of failing on artifacts the cold boot never had.
+func (m *Manager) backupRevivedTarget(vmID, generation string) *VMInstance {
+	if generation == "" {
 		return nil
 	}
 	m.mu.RLock()
@@ -76,7 +78,7 @@ func (m *Manager) backupRevivedTarget(vmID, anchorKey string) *VMInstance {
 		return nil
 	}
 	existing.mu.RLock()
-	match := existing.Status == StatusRunning && !existing.Unverified && existing.BackupAnchor == anchorKey
+	match := existing.Status == StatusRunning && !existing.Unverified && existing.BackupGeneration == generation
 	existing.mu.RUnlock()
 	if !match || vmDeadForRetry(m, vmID) {
 		return nil
@@ -85,28 +87,45 @@ func (m *Manager) backupRevivedTarget(vmID, anchorKey string) *VMInstance {
 }
 
 // backupFlight is one fetch of a sandbox's backup, shared by every resume
-// attempt for the same recorded pause and detached from the RPC deadlines
-// that observe it, so a retry picks the download up where it stands.
+// attempt for the same generation and detached from the RPC deadlines
+// that observe it, so a retry picks the download up where it stands. A
+// finished fetch nobody claims is dropped with its staging dir.
 type backupFlight struct {
-	anchorKey string
-	done      chan struct{}
-	restored  backup.Restored
-	err       error
+	generation string
+	done       chan struct{}
+	claimed    chan struct{}
+	claimOnce  sync.Once
+	restored   backup.Restored
+	err        error
 }
 
-func (m *Manager) backupFlightFor(vmID, anchorKey string, anchor backup.CaptureAnchor, dest string) (*backupFlight, error) {
+func (f *backupFlight) claim() { f.claimOnce.Do(func() { close(f.claimed) }) }
+
+func (m *Manager) backupBaseDir() string { return filepath.Join(m.backupRestoreRoot, ".base-cache") }
+
+func (m *Manager) restoreStagingDir(vmID string) string {
+	return filepath.Join(m.backupRestoreRoot, vmID)
+}
+
+func (m *Manager) backupFlightFor(vmID, generation string) (*backupFlight, error) {
 	m.backupFlightsMu.Lock()
 	defer m.backupFlightsMu.Unlock()
 	if f := m.backupFlights[vmID]; f != nil {
-		if f.anchorKey != anchorKey {
-			return nil, status.Errorf(codes.Aborted, "vm %s: a restore of a different pause is in flight", vmID)
+		if f.generation != generation {
+			return nil, status.Errorf(codes.Aborted, "vm %s: a restore of a different backup is in flight", vmID)
 		}
 		return f, nil
 	}
-	f := &backupFlight{anchorKey: anchorKey, done: make(chan struct{})}
+	f := &backupFlight{generation: generation, done: make(chan struct{}), claimed: make(chan struct{})}
 	m.backupFlights[vmID] = f
-	go func() {
-		defer sentrylog.Recover("backup-fetch")
+	go m.runBackupFlight(vmID, f)
+	return f, nil
+}
+
+func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
+	defer sentrylog.Recover("backup-fetch")
+	dest := m.restoreStagingDir(vmID)
+	func() {
 		defer close(f.done)
 		ctx, cancel := context.WithTimeout(context.Background(), m.backupRestore.FetchBudget)
 		defer cancel()
@@ -117,27 +136,44 @@ func (m *Manager) backupFlightFor(vmID, anchorKey string, anchor backup.CaptureA
 			f.err = ctx.Err()
 			return
 		}
-		var reader backup.BlobReader = m.backupReader
-		if m.backupRestore.Limiter != nil {
-			reader = &backup.LimitedReader{Inner: reader, Limiter: m.backupRestore.Limiter}
-		}
-		cacheDir := m.backupBaseDir()
-		reader = &backup.CachingBaseReader{Inner: reader, Dir: cacheDir}
 		log := m.log.With().Str("vm_id", vmID).Logger()
-		f.restored, f.err = backup.FetchMatching(ctx, reader, m.backupLister, vmID, anchor, dest, func(format string, args ...any) {
+		f.restored, f.err = backup.FetchGeneration(ctx, m.backupBaseReader, vmID, f.generation, dest, func(format string, args ...any) {
 			log.Debug().Msgf(format, args...)
 		})
+		if f.err == nil {
+			f.err = m.promoteBase(&f.restored, dest)
+		}
 		if m.backupRestore.CacheBytes > 0 {
-			if _, perr := backup.PruneBaseCache(cacheDir, m.backupRestore.CacheBytes); perr != nil {
+			if _, perr := backup.PruneBaseCache(m.backupBaseDir(), m.backupRestore.CacheBytes); perr != nil {
 				log.Warn().Err(perr).Msg("backup base cache prune")
 			}
 		}
-		m.sweepPromotedBases(cacheDir)
+		m.sweepPromotedBases()
 	}()
-	return f, nil
+	select {
+	case <-f.claimed:
+	case <-time.After(m.backupRestore.AbandonAfter):
+		m.backupFlightDone(vmID, f)
+		_ = os.RemoveAll(dest)
+	}
 }
 
-func (m *Manager) backupBaseDir() string { return filepath.Join(m.backupRestoreRoot, ".base-cache") }
+func (m *Manager) backupFlightDone(vmID string, f *backupFlight) {
+	m.backupFlightsMu.Lock()
+	if m.backupFlights[vmID] == f {
+		delete(m.backupFlights, vmID)
+	}
+	m.backupFlightsMu.Unlock()
+}
+
+// cleanupRestoreStaging drops whatever a backup-backed resume left for the
+// VM once the VM itself is gone.
+func (m *Manager) cleanupRestoreStaging(vmID string) {
+	if m.backupRestoreRoot == "" || !isLeafName(vmID) {
+		return
+	}
+	_ = os.RemoveAll(m.restoreStagingDir(vmID))
+}
 
 // promoteBase moves a base materialized inside the staging dir to a path
 // that outlives it: the revived VM keeps reading the base for its whole
@@ -159,9 +195,13 @@ func (m *Manager) promoteBase(r *backup.Restored, dest string) error {
 	return nil
 }
 
+// promotedBaseGrace keeps a freshly promoted base out of the sweep until
+// the resume that fetched it has attached it to its VM.
+const promotedBaseGrace = time.Hour
+
 // sweepPromotedBases drops promoted bases no tracked VM reads any more.
-func (m *Manager) sweepPromotedBases(dir string) {
-	entries, err := os.ReadDir(dir)
+func (m *Manager) sweepPromotedBases() {
+	entries, err := os.ReadDir(m.backupBaseDir())
 	if err != nil {
 		return
 	}
@@ -177,29 +217,25 @@ func (m *Manager) sweepPromotedBases(dir string) {
 		if !strings.HasPrefix(e.Name(), "base-") || !strings.HasSuffix(e.Name(), ".ext4") {
 			continue
 		}
-		if path := filepath.Join(dir, e.Name()); !inUse[path] {
+		info, err := e.Info()
+		if err != nil || time.Since(info.ModTime()) < promotedBaseGrace {
+			continue
+		}
+		if path := filepath.Join(m.backupBaseDir(), e.Name()); !inUse[path] {
 			_ = os.Remove(path)
 		}
 	}
 }
 
-func (m *Manager) backupFlightDone(vmID string, f *backupFlight) {
-	m.backupFlightsMu.Lock()
-	if m.backupFlights[vmID] == f {
-		delete(m.backupFlights, vmID)
-	}
-	m.backupFlightsMu.Unlock()
-}
-
-// resumeFromBackupLocked brings a paused sandbox back from the bucket
-// generation that carries the pause the control plane recorded, when the
+// resumeFromBackupLocked brings a paused sandbox back from the backup
+// generation the control plane recorded as covering the pause, when the
 // pause artifacts are gone from the host. Backups hold the disk and not
 // the memory, so the sandbox boots cold with its files intact. The fetch
 // runs on its own budget; a caller whose deadline expires first gets
 // Unavailable and its retry joins the same fetch.
-func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID string, anchor backup.CaptureAnchor, rules *sandboxNetworkRules) (*VMInstance, error) {
-	if len(anchor) == 0 {
-		return nil, status.Errorf(codes.FailedPrecondition, "vm %s: pause artifacts missing on host and the pause has no recorded digests to match a backup against", vmID)
+func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation string, rules *sandboxNetworkRules) (*VMInstance, error) {
+	if generation == "" {
+		return nil, status.Errorf(codes.FailedPrecondition, "vm %s: pause artifacts missing on host and no backup is recorded for the pause", vmID)
 	}
 	inst, err := m.getInstance(vmID)
 	if err != nil {
@@ -211,10 +247,8 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID string, ancho
 	if err := os.MkdirAll(m.backupRestoreRoot, 0o700); err != nil {
 		return nil, status.Errorf(codes.Internal, "restore root: %v", err)
 	}
-	anchorKey := backup.AnchorKey(anchor)
-	dest := filepath.Join(m.backupRestoreRoot, vmID)
 	tFetch := time.Now()
-	flight, err := m.backupFlightFor(vmID, anchorKey, anchor, dest)
+	flight, err := m.backupFlightFor(vmID, generation)
 	if err != nil {
 		return nil, err
 	}
@@ -223,20 +257,18 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID string, ancho
 	case <-ctx.Done():
 		return nil, status.Errorf(codes.Unavailable, "vm %s: backup restore in progress; retry", vmID)
 	}
+	flight.claim()
 	m.backupFlightDone(vmID, flight)
 	m.recordPhases("resume", "backup", map[string]time.Duration{"backup_fetch": time.Since(tFetch)})
 	if flight.err != nil {
 		if errors.Is(flight.err, backup.ErrNoMatchingBackup) {
-			return nil, status.Errorf(codes.FailedPrecondition, "vm %s: pause artifacts missing on host and no backup carries the recorded pause", vmID)
+			return nil, status.Errorf(codes.FailedPrecondition, "vm %s: pause artifacts missing on host and the recorded backup is not in the bucket", vmID)
 		}
 		return nil, status.Errorf(codes.Unavailable, "vm %s: fetch backup: %v", vmID, flight.err)
 	}
 	r := flight.restored
-	if err := m.promoteBase(&r, dest); err != nil {
-		return nil, status.Errorf(codes.Internal, "vm %s: keep restored base: %v", vmID, err)
-	}
 	log := m.log.With().Str("vm_id", vmID).Logger()
-	log.Info().Str("generation", r.Manifest.Generation).Dur("fetch", time.Since(tFetch)).
+	log.Info().Str("generation", generation).Dur("fetch", time.Since(tFetch)).
 		Msg("resume: pause artifacts missing on host; reviving from backup")
 	tBoot := time.Now()
 	revived, err := m.reviveVMLocked(ctx, vmID, r.Disk, r.Base, r.Standalone, false, teamID, ownerID, vcpu, memMiB, rules)
@@ -245,9 +277,9 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID string, ancho
 		return nil, err
 	}
 	revived.mu.Lock()
-	revived.BackupAnchor = anchorKey
+	revived.BackupGeneration = generation
 	revived.mu.Unlock()
 	_, _ = m.persistStateIfPresent(revived)
-	_ = os.RemoveAll(dest)
+	_ = os.RemoveAll(m.restoreStagingDir(vmID))
 	return revived, nil
 }

@@ -48,16 +48,7 @@ func writePauseFixture(t *testing.T, dir, state string) Task {
 	return task
 }
 
-func anchorFor(task Task) CaptureAnchor {
-	for _, f := range task.Files {
-		if f.Name == "vmstate.snap" {
-			return CaptureAnchor{"vmstate.snap": f.SHA256}
-		}
-	}
-	return nil
-}
-
-func TestFetchMatchingPicksTheAnchoredGenerationNotTheNewest(t *testing.T) {
+func TestFetchGenerationPicksTheRecordedGenerationNotTheNewest(t *testing.T) {
 	store := newMemBlobs()
 	older := writePauseFixture(t, t.TempDir(), "pause A")
 	uploadFixture(t, store, older)
@@ -65,46 +56,46 @@ func TestFetchMatchingPicksTheAnchoredGenerationNotTheNewest(t *testing.T) {
 	uploadFixture(t, store, newer)
 
 	dest := filepath.Join(t.TempDir(), older.SandboxID)
-	got, err := FetchMatching(context.Background(), store, store, older.SandboxID, anchorFor(older), dest, nil)
+	got, err := FetchGeneration(context.Background(), store, older.SandboxID, older.Generation, dest, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Manifest.Generation != older.Generation {
-		t.Fatalf("restored generation %s, want the anchored %s", got.Manifest.Generation, older.Generation)
+		t.Fatalf("restored generation %s, want the recorded %s", got.Manifest.Generation, older.Generation)
 	}
 	if !got.Standalone || got.Disk != filepath.Join(dest, "rootfs.ext4") {
 		t.Fatalf("restored = %+v", got)
 	}
 }
 
-func TestFetchMatchingFailsClosed(t *testing.T) {
+func TestFetchGenerationFailsClosed(t *testing.T) {
 	store := newMemBlobs()
 	task := writePauseFixture(t, t.TempDir(), "pause A")
 	uploadFixture(t, store, task)
 	dest := filepath.Join(t.TempDir(), "x")
 
-	if _, err := FetchMatching(context.Background(), store, store, task.SandboxID, nil, dest, nil); !errors.Is(err, ErrNoMatchingBackup) {
-		t.Fatalf("empty anchor: err = %v, want ErrNoMatchingBackup", err)
+	if _, err := FetchGeneration(context.Background(), store, task.SandboxID, "", dest, nil); !errors.Is(err, ErrNoMatchingBackup) {
+		t.Fatalf("no recorded generation: err = %v, want ErrNoMatchingBackup", err)
 	}
-	stale := CaptureAnchor{"vmstate.snap": digestOf([]byte("pause never uploaded"))}
-	if _, err := FetchMatching(context.Background(), store, store, task.SandboxID, stale, dest, nil); !errors.Is(err, ErrNoMatchingBackup) {
-		t.Fatalf("unmatched anchor: err = %v, want ErrNoMatchingBackup", err)
+	unfinished := digestOf([]byte("pause never uploaded"))
+	if _, err := FetchGeneration(context.Background(), store, task.SandboxID, unfinished, dest, nil); !errors.Is(err, ErrNoMatchingBackup) {
+		t.Fatalf("generation not in the bucket: err = %v, want ErrNoMatchingBackup", err)
 	}
 	if _, err := os.Stat(dest); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("a failed match must leave no restore dir behind")
 	}
 }
 
-func TestFetchMatchingReusesACompletedRestore(t *testing.T) {
+func TestFetchGenerationReusesACompletedRestore(t *testing.T) {
 	store := newMemBlobs()
 	task := writePauseFixture(t, t.TempDir(), "pause A")
 	uploadFixture(t, store, task)
 	dest := filepath.Join(t.TempDir(), task.SandboxID)
-	if _, err := FetchMatching(context.Background(), store, store, task.SandboxID, anchorFor(task), dest, nil); err != nil {
+	if _, err := FetchGeneration(context.Background(), store, task.SandboxID, task.Generation, dest, nil); err != nil {
 		t.Fatal(err)
 	}
 	counter := &countingReader{inner: store}
-	if _, err := FetchMatching(context.Background(), counter, store, task.SandboxID, anchorFor(task), dest, nil); err != nil {
+	if _, err := FetchGeneration(context.Background(), counter, task.SandboxID, task.Generation, dest, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(counter.reads) != 0 {
@@ -112,7 +103,7 @@ func TestFetchMatchingReusesACompletedRestore(t *testing.T) {
 	}
 }
 
-func TestFetchMatchingOverlayWithBaseThroughLimiter(t *testing.T) {
+func TestFetchGenerationOverlayWithBaseThroughLimiter(t *testing.T) {
 	store := newMemBlobs()
 	dir := t.TempDir()
 	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
@@ -129,7 +120,7 @@ func TestFetchMatchingOverlayWithBaseThroughLimiter(t *testing.T) {
 	root := t.TempDir()
 	limited := &LimitedReader{Inner: store, Limiter: rate.NewLimiter(rate.Limit(64<<20), 1<<20)}
 	cache := &CachingBaseReader{Inner: limited, Dir: filepath.Join(root, ".base-cache")}
-	got, err := FetchMatching(context.Background(), cache, store, task.SandboxID, anchorFor(task), filepath.Join(root, task.SandboxID), nil)
+	got, err := FetchGeneration(context.Background(), cache, task.SandboxID, task.Generation, filepath.Join(root, task.SandboxID), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,15 +158,7 @@ func TestPruneBaseCacheDropsOldestFirst(t *testing.T) {
 	}
 }
 
-func TestAnchorKeyIsOrderIndependent(t *testing.T) {
-	a := AnchorKey(map[string]string{"x": "1", "y": "2"})
-	b := AnchorKey(map[string]string{"y": "2", "x": "1"})
-	if a != b || a == "" || AnchorKey(nil) != "" {
-		t.Fatalf("keys %q %q", a, b)
-	}
-}
-
-func TestFetchMatchingUsesTheHostBaseWithoutDownloadingIt(t *testing.T) {
+func TestFetchGenerationUsesTheHostBaseWithoutDownloadingIt(t *testing.T) {
 	store := newMemBlobs()
 	dir := t.TempDir()
 	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
@@ -191,7 +174,7 @@ func TestFetchMatchingUsesTheHostBaseWithoutDownloadingIt(t *testing.T) {
 
 	counter := &countingReader{inner: store}
 	dest := filepath.Join(t.TempDir(), task.SandboxID)
-	got, err := FetchMatching(context.Background(), counter, store, task.SandboxID, anchorFor(task), dest, nil)
+	got, err := FetchGeneration(context.Background(), counter, task.SandboxID, task.Generation, dest, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
