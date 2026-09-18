@@ -1022,15 +1022,16 @@ type restorePlan struct {
 // planRestore picks the disk action + delta_dir for a restore. createOverlay
 // requires ALL of {basePath, deltaDir, !inPlace} — anything missing means
 // we'd be cloning over an existing per-VM file, so fall back to reuse.
-func planRestore(basePath, deltaDir string, inPlace bool) restorePlan {
+func planRestore(basePath, deltaDir string, reuse bool) restorePlan {
 	p := restorePlan{deltaDir: deltaDir}
-	if inPlace {
+	if reuse {
 		// fc's delta-apply truncates the overlay; force empty to stop a
-		// caller mistake from clobbering per-VM state.
+		// caller mistake from clobbering per-VM state. A same-ID retry after
+		// a cleaned-up failure has no rundir, so the overlay is built again.
 		p.deltaDir = ""
 	}
 	switch {
-	case basePath != "" && deltaDir != "" && !inPlace:
+	case basePath != "" && p.deltaDir != "":
 		p.action = restoreCreateOverlay
 	case basePath != "":
 		p.action = restoreReuseOverlay
@@ -3613,10 +3614,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// active units, a predecessor-era orphan may exist with no bookkeeping.
 	// Only the first attempt qualifies: any retry follows a start of the
 	// same unit name.
+	// In place only when the prior life left its disk, slot and supervisor
+	// behind; a retry after cleanup keeps the stop but takes fresh resources.
+	reuse := inPlace && priorRunDir
+
 	freshUnit := m.orphanScanDone.Load() && !inPlace && !priorRunDir &&
 		!isBuildVM(vmID) && !unitMaybeWindingDown(systemdUnitName(vmID))
 
-	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
+	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, reuse)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
 	// see cleanupRunDirKeepOverlay.
 	cleanupAfterRestoreFailure := func() {
@@ -3653,7 +3658,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	// inPlace resume always uses the File backend; UffdEnabled=false is the
 	// ops circuit breaker that forces fresh restores onto File too.
-	useUffd := !inPlace && m.cfg.UffdEnabled
+	useUffd := !reuse && m.cfg.UffdEnabled
 
 	// Loop-carried across restore attempts: only what the post-loop code reads.
 	var (
@@ -3690,7 +3695,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			restorePhasesRecorded = false
 			tNetReady, tFcReady = time.Time{}, time.Time{}
 		}
-		if inPlace {
+		if reuse {
 			existingNet := m.netMgr.GetVMNetInfo(vmID)
 			if existingNet != nil {
 				tapDevice = existingNet.TAPDevice
@@ -3792,7 +3797,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		if startErr != nil {
 			tFailBoundary = time.Now()
-			m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
+			m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
 			m.setStatus(vmID, m.preWakeFailureStatus(inst, wakeOwedPublished && restoreFromPaused))
 			return nil, fmt.Errorf("start firecracker: %w", startErr)
 		}
@@ -3804,7 +3809,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// owes their wake.
 			tFailBoundary = time.Now()
 			m.stopUnitDuringRestoreError(vmID)
-			m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
+			m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
 			m.setStatus(vmID, m.preWakeFailureStatus(inst, wakeOwedPublished && restoreFromPaused))
 			return nil, fmt.Errorf("vm %s: wake record could not be made durable before the load", vmID)
 		}
@@ -3943,7 +3948,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 					inst.mu.Unlock()
 				}
 			}
-		case inPlace:
+		case reuse:
 			restoreClockFrozen, attemptErr = m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
 				return RestoreSnapshot(socketPath, snapshotPath, memPath, plan.deltaDir, clock)
 			})
@@ -4049,7 +4054,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		// Retriable only for a fresh-restore tap0 busy. The overlay and inst are
 		// kept for the next attempt; terminal cleanup lives below the loop.
-		if inPlace || attempt >= maxRestoreAttempts || !isTapDeviceBusyErr(restoreErr) {
+		if reuse || attempt >= maxRestoreAttempts || !isTapDeviceBusyErr(restoreErr) {
 			break
 		}
 		m.stopUnitDuringRestoreError(vmID)
@@ -4081,7 +4086,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Firecracker is already running; stop the unit before other
 		// cleanup or it leaks. See stopUnitDuringRestoreError comment.
 		m.stopUnitDuringRestoreError(vmID)
-		m.releaseFailedRestore(vmID, inPlace, isTapDeviceBusyErr(restoreErr), cleanupAfterRestoreFailure)
+		m.releaseFailedRestore(vmID, reuse, isTapDeviceBusyErr(restoreErr), cleanupAfterRestoreFailure)
 		m.setStatus(vmID, m.preWakeFailureStatus(inst, wakeOwedPublished && restoreFromPaused))
 		// armLayered may have set DirtyTracked=true on inst before the restore call;
 		// clear it on failure so a lingering instance can't later take a Diff against a
@@ -4161,7 +4166,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Teardown first — none of it touches BoltDB, so a stalled persist
 		// cannot keep the failed restore's unit and network alive.
 		m.stopUnitDuringRestoreError(vmID)
-		m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
+		m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
 		// Durable-state convergence is unbounded fsync work (the persist
 		// join, then another synchronous Put) and BoltDB is slow under
 		// exactly the host pressure that stalls readiness — it must not
@@ -4265,7 +4270,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// the restore; the retry only costs latency when the store is
 		// already broken.
 		m.stopUnitDuringRestoreError(vmID)
-		m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
+		m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("vm %s restored but its state could not be persisted", vmID)
 	}
@@ -4288,7 +4293,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if !stillTracked {
 		m.deleteState(vmID)
 		m.stopUnitDuringRestoreError(vmID)
-		m.releaseFailedRestore(vmID, inPlace, false, cleanupAfterRestoreFailure)
+		m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
 		return nil, status.Errorf(codes.NotFound, "vm %s was destroyed during restore", vmID)
 	}
 	tPersisted := time.Now()
