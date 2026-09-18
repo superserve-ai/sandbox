@@ -427,6 +427,9 @@ func (c *stripeHTTPClient) CreateCheckoutSession(ctx context.Context, params Str
 		form.Set("metadata["+key+"]", value)
 		form.Set("subscription_data[metadata]["+key+"]", value)
 	}
+	if params.BackdateStartDate != nil {
+		form.Set("subscription_data[backdate_start_date]", strconv.FormatInt(params.BackdateStartDate.Unix(), 10))
+	}
 	for i, priceID := range params.PriceIDs {
 		form.Set(fmt.Sprintf("line_items[%d][price]", i), priceID)
 	}
@@ -2982,13 +2985,13 @@ func stripeMeterRoundedValue(value float64) float64 {
 }
 
 func stripeSubscriptionPeriodBounds(obj stripeSubscriptionObject) (int64, int64, bool) {
-	if obj.CurrentPeriodStart > 0 && obj.CurrentPeriodEnd > 0 {
-		return obj.CurrentPeriodStart, obj.CurrentPeriodEnd, true
-	}
 	for _, item := range obj.Items.Data {
 		if item.CurrentPeriodStart > 0 && item.CurrentPeriodEnd > 0 {
 			return item.CurrentPeriodStart, item.CurrentPeriodEnd, true
 		}
+	}
+	if obj.CurrentPeriodStart > 0 && obj.CurrentPeriodEnd > 0 {
+		return obj.CurrentPeriodStart, obj.CurrentPeriodEnd, true
 	}
 	return 0, 0, false
 }
