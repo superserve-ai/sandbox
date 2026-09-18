@@ -26,6 +26,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	grpcstatus "google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/abuse"
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/billing"
@@ -289,6 +290,15 @@ func run() error {
 		go shadow.Run(ctx)
 		log.Info().Msg("capacity ranking shadow evaluation enabled (measurement only; placement unchanged)")
 	}
+
+	computeSource := abuse.NewConfigComputeSource(cfg.ComputeRestrictionsFile, abuse.LoadComputeOwners(dbPool), func(ctx context.Context, result string) {
+		if rec, ok := recorder.(telemetry.ComputeRecorder); ok {
+			rec.RecordComputeRefresh(ctx, result)
+		}
+	})
+	computeSource.Refresh(ctx)
+	handlers.ComputeRestrictions = &abuse.ComputeEvaluator{Source: computeSource}
+	go computeSource.Run(ctx)
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
