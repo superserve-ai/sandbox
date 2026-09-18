@@ -18,6 +18,7 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/network"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
@@ -259,3 +260,40 @@ func TestResumeVMRetryAdoptsTheBackupRevivedVM(t *testing.T) {
 type ownedNetMgr struct{ *fakeNetMgr }
 
 func (o *ownedNetMgr) GetVMNetInfo(string) *network.VMNetInfo { return &network.VMNetInfo{} }
+
+func TestResumeVMWithoutAGenerationTellsTheControlPlaneWhatItNeeds(t *testing.T) {
+	dir := t.TempDir()
+	snap := touch(t, filepath.Join(dir, "snap", "vmstate.snap"))
+	mgr := &Manager{
+		log:    zerolog.Nop(),
+		cfg:    ManagerConfig{RunDir: filepath.Join(dir, "run")},
+		vms:    map[string]*VMInstance{"vm-1": {ID: "vm-1", Status: StatusPaused, SnapshotPath: snap, MemFilePath: filepath.Join(dir, "snap", "mem.snap")}},
+		netMgr: &ownedNetMgr{&fakeNetMgr{}},
+	}
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, filepath.Join(dir, ".restore"), BackupRestoreOptions{})
+	a := NewGRPCAdapter(mgr)
+
+	_, err := a.ResumeVM(context.Background(), &vmdpb.ResumeVMRequest{VmId: "vm-1"})
+	if !vmdclient.IsPauseArtifactsMissing(err) {
+		t.Fatalf("err = %v, want the pause-artifacts-missing mark", err)
+	}
+	if n := store.reads.Load(); n != 0 {
+		t.Fatal("no fetch may start before the control plane names the generation")
+	}
+}
+
+func TestSetBackupRestoreSweepsStagingLeftByAPreviousProcess(t *testing.T) {
+	root := t.TempDir()
+	touch(t, filepath.Join(root, "vm-old", "rootfs.ext4"))
+	touch(t, filepath.Join(root, ".base-cache", ".unpacked-abc"))
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, root, BackupRestoreOptions{})
+	if _, err := os.Stat(filepath.Join(root, "vm-old")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("stale staging must be swept at startup")
+	}
+	if _, err := os.Stat(filepath.Join(root, ".base-cache", ".unpacked-abc")); err != nil {
+		t.Fatal("the base cache must survive startup")
+	}
+}

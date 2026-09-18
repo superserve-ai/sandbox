@@ -9,11 +9,13 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
+	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // pausedDiskPath is the disk a paused record boots from: recorded, or
@@ -62,6 +64,17 @@ func (m *Manager) pauseArtifactsMissing(vmID, snapshotPath, memPath string) bool
 	}
 	disk := pausedDiskPath(m.cfg.RunDir, vmID, inst.DiskPath, inst.RunDirID, inst.Config.BasePath)
 	return !pauseArtifactsPresent(snapshotPath, memPath, inst.BaseMemPath, disk, inst.Config.BasePath)
+}
+
+// pauseArtifactsMissingErr tells the control plane the pause artifacts are
+// gone from this host, so it can name the backup generation covering the
+// pause and try again.
+func pauseArtifactsMissingErr(vmID string) error {
+	st := status.Newf(codes.FailedPrecondition, "vm %s: pause artifacts missing on host; retry with the recorded backup generation", vmID)
+	if withInfo, err := st.WithDetails(&errdetails.ErrorInfo{Reason: vmdclient.PauseArtifactsMissingReason, Domain: "vmd"}); err == nil {
+		return withInfo.Err()
+	}
+	return st.Err()
 }
 
 // backupRevivedTarget returns the live VM a backup-backed resume for the

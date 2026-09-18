@@ -72,6 +72,22 @@ func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobL
 	m.backupBaseReader = &backup.CachingBaseReader{Inner: reader, Dir: m.backupBaseDir()}
 	m.backupFetchSem = make(chan struct{}, opts.Concurrency)
 	m.backupFlights = map[string]*backupFlight{}
+	m.sweepRestoreStaging()
+}
+
+// sweepRestoreStaging drops staging a previous process left behind: no
+// fetch survives a restart, and a completed one is cheap to redo.
+func (m *Manager) sweepRestoreStaging() {
+	entries, err := os.ReadDir(m.backupRestoreRoot)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.Name() == filepath.Base(m.backupBaseDir()) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(m.backupRestoreRoot, e.Name()))
+	}
 }
 
 // SetBackupMetrics installs the optional backup metrics recorder. Same

@@ -161,3 +161,17 @@ WHERE sandbox_id = sqlc.arg(sandbox_id)
 
 -- name: SetSnapshotSizeBytes :exec
 UPDATE snapshot SET size_bytes = $2 WHERE id = $1;
+
+-- name: CoveredBackupGeneration :one
+-- The backup generation recorded as covering the sandbox's current pause,
+-- exactly: the snapshot row and its generation counter, since the row is
+-- reused across pauses. Empty when the pause has no completed backup.
+SELECT COALESCE(bg.generation, '')::text AS generation
+FROM sandbox sb
+JOIN snapshot s ON s.id = sb.snapshot_id
+LEFT JOIN LATERAL (
+  SELECT generation FROM backup_generation
+  WHERE covered_snapshot_id = s.id AND covered_snapshot_generation = s.generation
+  ORDER BY completed_at DESC LIMIT 1
+) bg ON true
+WHERE sb.id = $1;

@@ -133,9 +133,10 @@ type limitedReadCloser struct {
 
 func (l *limitedReadCloser) Close() error { return l.c.Close() }
 
-// PruneBaseCache drops the oldest unpacked bases in a CachingBaseReader
-// directory until the cache fits maxBytes. Candidates and masters in use
-// stay readable through their open descriptors.
+// PruneBaseCache drops the oldest cached objects in a CachingBaseReader
+// directory, unpacked masters and packed spools alike, until the cache fits
+// maxBytes. Files in use stay readable through their open descriptors;
+// promoted bases live beside them and are never counted here.
 func PruneBaseCache(dir string, maxBytes int64) (removed int, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -151,7 +152,9 @@ func PruneBaseCache(dir string, maxBytes int64) (removed int, err error) {
 	var masters []master
 	var total int64
 	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), ".unpacked-") {
+		name := e.Name()
+		cached := strings.HasPrefix(name, ".unpacked-") || (!strings.HasPrefix(name, ".") && !strings.HasPrefix(name, "base-"))
+		if !cached || !e.Type().IsRegular() {
 			continue
 		}
 		info, err := e.Info()
