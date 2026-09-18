@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/fsnotify/fsnotify"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -341,16 +340,22 @@ func imageManifest(memPath string) (*WallClockManifest, error) {
 	return ReadWallClockManifest(memPath)
 }
 
-// WatchTemplateManifests raises the rollback floor for frozen templates as
-// they land, so no restore has to happen first: a scan at start and every few
-// minutes plus a watch on the tree, off every request path. The returned
-// channel closes once the watcher has stopped.
+// templateScanInterval is how often an activated host scans its templates
+// for frozen ones it has not witnessed; a seam for tests.
+var templateScanInterval = firecrackerCapabilityRefreshInterval
+
+// WatchTemplateManifests raises the rollback floor for frozen templates the
+// host holds, so no restore has to happen first: a scan at start and every
+// templateScanInterval, off every request path. Bounded by the number of
+// template directories, with no per-directory watch. Nothing in this
+// repository puts a template on a host from elsewhere; the scan covers a
+// copy made by hand, and the guard's contract is that whoever makes one
+// raises the floor first. The returned channel closes once the scan has
+// stopped.
 func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger) (stopped <-chan struct{}) {
 	done := make(chan struct{})
-	// Only a host that may act on frozen images watches: with the switch off
-	// this does no filesystem work. A frozen template must not reach such a
-	// host; that is owed by the paths that admit templates, before the first
-	// frozen image is ever produced, and is not enforced here.
+	// Only a host that may act on frozen images scans: with the switch off
+	// this does no filesystem work.
 	if m.cfg.SnapshotDir == "" || !m.cfg.GuestClockFreezeEnabled {
 		close(done)
 		return done
@@ -363,58 +368,7 @@ func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger
 	go func() {
 		defer close(done)
 		scan()
-		// A template lands by copy, between scans. The tree is watched so a
-		// frozen one is witnessed as it lands, with the periodic scan as the
-		// fallback for anything the watch missed; a host that cannot watch
-		// keeps the scan alone.
-		root := filepath.Join(m.cfg.SnapshotDir, TemplatesDirName)
-		// The root is created if absent, so the watch has something to
-		// attach to before the first template lands rather than after.
-		if err := os.MkdirAll(root, 0o755); err != nil {
-			log.Warn().Err(err).Str("path", root).Msg("template root cannot be created; frozen templates are witnessed by the periodic scan alone")
-		}
-		var events <-chan fsnotify.Event
-		var errs <-chan error
-		if w, werr := fsnotify.NewWatcher(); werr == nil {
-			defer w.Close()
-			watchTemplateTree(w, root)
-			events, errs = w.Events, w.Errors
-			// Anything that landed while the watches were being added.
-			scan()
-			t := time.NewTicker(firecrackerCapabilityRefreshInterval)
-			defer t.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-t.C:
-					scan()
-				case ev := <-events:
-					// Writes too: an importer that creates the path and then
-					// streams the manifest into it is complete only at its
-					// last write, and a partial file simply fails to parse.
-					if !ev.Has(fsnotify.Create) && !ev.Has(fsnotify.Rename) && !ev.Has(fsnotify.Write) {
-						continue
-					}
-					if info, serr := os.Stat(ev.Name); serr == nil && info.IsDir() {
-						// A new template or build directory: watch it, and
-						// read what may already be inside.
-						watchTemplateTree(w, ev.Name)
-						scan()
-						continue
-					}
-					if strings.HasSuffix(ev.Name, clockFreezeMarkerSuffix) {
-						if n := m.noteTemplateManifest(ev.Name); n > 0 && !wakeProtocolEvidenceLogged.Swap(true) {
-							log.Info().Str("path", ev.Name).Msg("a frozen template landed; a vmd without the wake protocol is refused from now on")
-						}
-					}
-				case <-errs:
-				}
-			}
-		} else {
-			log.Warn().Err(werr).Msg("template tree cannot be watched; frozen templates are witnessed by the periodic scan alone")
-		}
-		t := time.NewTicker(firecrackerCapabilityRefreshInterval)
+		t := time.NewTicker(templateScanInterval)
 		defer t.Stop()
 		for {
 			select {
@@ -426,47 +380,6 @@ func (m *Manager) WatchTemplateManifests(ctx context.Context, log zerolog.Logger
 		}
 	}()
 	return done
-}
-
-// watchTemplateTree watches dir and every directory beneath it to the depth
-// templates live at (templates/<template>/<build>); inotify watches are not
-// recursive, so each level is added, and what is already there is added now.
-func watchTemplateTree(w *fsnotify.Watcher, dir string) {
-	_ = w.Add(dir)
-	if rel, err := filepath.Rel(filepath.Dir(dir), dir); err != nil || rel == "" {
-		return
-	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if e.IsDir() {
-			sub := filepath.Join(dir, e.Name())
-			_ = w.Add(sub)
-			if subs, err := os.ReadDir(sub); err == nil {
-				for _, b := range subs {
-					if b.IsDir() {
-						_ = w.Add(filepath.Join(sub, b.Name()))
-					}
-				}
-			}
-		}
-	}
-}
-
-// noteTemplateManifest reads one manifest that just landed and raises the
-// floor for a frozen one. Returns 1 if it was frozen.
-func (m *Manager) noteTemplateManifest(path string) int {
-	man, err := ReadWallClockManifest(strings.TrimSuffix(path, clockFreezeMarkerSuffix))
-	if err == nil && (man == nil || !man.WorkloadFrozen) {
-		return 0
-	}
-	if err := noteWakeProtocolEvidence(); err != nil {
-		m.log.Error().Err(err).Str("path", path).Msg("frozen template landed but the wake-protocol floor could not be raised; the periodic scan retries")
-		return 0
-	}
-	return 1
 }
 
 var wakeProtocolEvidenceLogged atomic.Bool

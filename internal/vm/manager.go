@@ -378,6 +378,14 @@ type ManagerConfig struct {
 	// this says. Default false.
 	GuestClockFreezeEnabled bool
 
+	// TemplateFreezeWorkload has the template builder freeze a guest's
+	// workload for its snapshot when the guest proves it corrects its own
+	// wall clock, and mark the image so. Every sandbox created from such a
+	// template owes a wake, which only a supervisor with the wake protocol
+	// gives: the floor is raised before the image is published. Default
+	// false; the switch to turn on first, and the one to turn off first.
+	TemplateFreezeWorkload bool
+
 	// RequirePresenceSidecar controls refusing a layered UFFD restore whose
 	// overlay has no .presence side-car next to it. Without the side-car,
 	// Firecracker falls back to inferring page presence from the overlay's
@@ -725,14 +733,20 @@ type Manager struct {
 	// clock: every later restore takes the unfrozen path until vmd restarts.
 	guestClockUnready atomic.Bool
 	// pendingWakes are reattached records that owe a wake, held back from
-	// m.vms until the startup pool completes it. See queuePendingWake.
+	// m.vms until the pool completes it. See queuePendingWake.
 	pendingWakeMu sync.Mutex
 	pendingWakes  map[string]*pendingWake
-	// wakeDrainStarted closes when the pool begins serving queued wakes,
-	// after the startup pass has scanned every record; a request waiting
-	// on a queued wake counts its bound from then, not from the scan.
+	// wakeDrainStarted closes when the pool begins serving queued wakes; a
+	// request waiting on a queued wake counts its bound from then.
 	wakeDrainStarted chan struct{}
 	wakeDrainBegun   bool
+	// The pool: started by the startup pass before its scan, so a wake
+	// queued early is served while later records are still being read. A
+	// wake queued before the pool exists waits for it.
+	wakePoolCtx context.Context
+	wakeSem     chan struct{}
+	wakeWG      sync.WaitGroup
+	wakeWoken   atomic.Int32
 	// reattachDeferred marks ids whose startup reattach was left to the
 	// request holding their lifecycle lock; see reattachByID.
 	reattachDeferred sync.Map
@@ -3396,6 +3410,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// the in-flight one) so failed attempts — which can consume most of the
 	// restore deadline — form the phase tails instead of vanishing.
 	restorePhasesRecorded := false
+	// Phases of a frozen image's restore are labelled so the two kinds can be
+	// compared side by side; set once the manifest is read, before any phase
+	// that follows it, and seen by the failure recorder below.
+	restoreMode := ""
 	var attempt int
 	var tDiskReady, tNetReady, tFcReady, tAttemptStart, tFailBoundary time.Time
 	defer func() {
@@ -3433,7 +3451,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				phases["net_to_fc"] = end.Sub(tNetReady)
 			}
 		}
-		m.recordPhases("restore", "", phases)
+		m.recordPhases("restore", restoreMode, phases)
 	}()
 	// Cold/hot segmentation tags for the phase log, sampled once (not per
 	// attempt): concurrency, template-cache age, and host CPU/mem pressure.
@@ -3510,6 +3528,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	restoreWorkloadFrozen := manifest != nil && manifest.WorkloadFrozen
 	restoreGuestCorrects := manifest != nil && manifest.GuestCorrectsClock
+	if restoreWorkloadFrozen {
+		restoreMode = "frozen"
+	}
 	if restoreWorkloadFrozen {
 		// The floor rises before this host acts on an image that owes a wake,
 		// or a rollback could later meet the image with nothing to witness it.
@@ -3821,7 +3842,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			attemptPhases["entry_to_sem"] = tSemAcquired.Sub(tEntry)
 			attemptPhases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
 		}
-		m.recordPhases("restore", "", attemptPhases)
+		m.recordPhases("restore", restoreMode, attemptPhases)
 
 		// attemptErr is this attempt's result alone; it lands in restoreErr after
 		// the load log so a stale prior-attempt error can never leak into the
@@ -3944,7 +3965,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Msg("snapshot loaded")
 		// Failed attempts included: a slow failing load (tap-busy retry,
 		// terminal failure) must appear in the distribution, not vanish.
-		m.recordPhases("restore", "", map[string]time.Duration{"load_snapshot": time.Since(tFcReady)})
+		m.recordPhases("restore", restoreMode, map[string]time.Duration{"load_snapshot": time.Since(tFcReady)})
 		restoreErr = attemptErr
 
 		if restoreErr == nil {
@@ -4015,7 +4036,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// recreated: an in-place overlay recreated from scratch is truncated.
 			clockRetried = true
 			m.noteGuestClockUnready(log, wakeErr)
-			m.recordPhases("restore", "", map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
+			m.recordPhases("restore", restoreMode, map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
 			m.stopUnitDuringRestoreError(vmID)
 			if !vmDeadForRetry(m, vmID) {
 				log.Warn().Msg("VM not confirmed dead after stop — not relaunching")
@@ -4127,7 +4148,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// Emit the exhausted readiness wait immediately, before teardown, so
 		// the sample measures the probe (not unit stop + resource release +
 		// persist join) and the concurrent-destroy return below can't skip it.
-		m.recordPhases("restore", "", map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
+		m.recordPhases("restore", restoreMode, map[string]time.Duration{"wait_boxd": time.Since(tBoxdStart)})
 		// The console (FC log + guest serial) is the only witness to where
 		// the guest stalled between vCPU resume and first output; the
 		// teardown below deletes it, so capture it now. Only for a genuine
@@ -4294,7 +4315,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		Int64("wait_boxd_ms", tBoxdReady.Sub(tBoxdStart).Milliseconds()).
 		Int64("persist_state_ms", tPersisted.Sub(tBoxdReady).Milliseconds()).
 		Msg("VM restored from snapshot")
-	m.recordPhases("restore", "", map[string]time.Duration{
+	m.recordPhases("restore", restoreMode, map[string]time.Duration{
 		"wait_boxd": tBoxdReady.Sub(tBoxdStart),
 		"persist":   tPersisted.Sub(tBoxdReady),
 	})
@@ -4853,6 +4874,9 @@ func (m *Manager) ReattachAll(ctx context.Context) (reattached, stale int) {
 	// the orphans, and the next restart re-evaluates.
 	conclusive := true
 	m.reattachStopDeadline.Store(time.Now().Add(reattachStopPassBudget))
+	// Wakes queued by the scan are served as it runs, not after it: a
+	// recovering sandbox must not wait behind every record on the host.
+	m.startWakePool(ctx)
 	for _, snap := range records {
 		// Stop on shutdown: a cancelled ctx makes liveness checks fail, which
 		// would otherwise misfire the stale-cleanup path against live VMs.
@@ -5155,9 +5179,9 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 			m.mu.RUnlock()
 			return inst, ok
 		}
-		// The pool starts only once the startup pass has scanned every
-		// record, and that scan is not bounded by the queue: wait for the
-		// pool to start, then for it to reach this wake.
+		// A wake queued before the pool exists waits for it, unbounded by
+		// the queue: wait for the pool to start, then for it to reach this
+		// wake.
 		select {
 		case <-pw.done:
 			return published()
@@ -8807,69 +8831,88 @@ func pendingWakeWaitBound(queued int) time.Duration {
 
 func (m *Manager) queuePendingWake(inst *VMInstance, unlock func()) {
 	m.pendingWakeMu.Lock()
-	defer m.pendingWakeMu.Unlock()
 	if m.pendingWakes == nil {
 		m.pendingWakes = map[string]*pendingWake{}
 	}
 	if _, queued := m.pendingWakes[inst.ID]; queued {
+		m.pendingWakeMu.Unlock()
 		unlock()
 		return
 	}
-	m.pendingWakes[inst.ID] = &pendingWake{inst: inst, done: make(chan struct{}), unlock: unlock}
-}
-
-// drainPendingWakes completes every queued wake through a bounded pool and
-// publishes each outcome: Running once woken, Error otherwise — never a frozen
-// guest presented as ready. Returns how many were published Running.
-func (m *Manager) drainPendingWakes(ctx context.Context) int {
-	m.noteWakeDrainStarted()
-	m.pendingWakeMu.Lock()
-	queued := make([]*pendingWake, 0, len(m.pendingWakes))
-	for _, pw := range m.pendingWakes {
-		queued = append(queued, pw)
+	pw := &pendingWake{inst: inst, done: make(chan struct{}), unlock: unlock}
+	m.pendingWakes[inst.ID] = pw
+	started := m.wakePoolCtx != nil
+	if started {
+		m.wakeWG.Add(1)
 	}
 	m.pendingWakeMu.Unlock()
-	if len(queued) == 0 {
-		return 0
+	if started {
+		go m.serveWake(pw)
 	}
-	var woken atomic.Int32
-	sem := make(chan struct{}, wakeRecoveryWorkers)
-	var wg sync.WaitGroup
-	for _, pw := range queued {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(pw *pendingWake) {
-			defer wg.Done()
-			defer func() { <-sem }()
-			defer sentrylog.Recover("wake-recovery")
-			defer func() {
-				m.pendingWakeMu.Lock()
-				delete(m.pendingWakes, pw.inst.ID)
-				m.pendingWakeMu.Unlock()
-				close(pw.done)
-				pw.unlock()
-			}()
-			log := m.log.With().Str("vm_id", pw.inst.ID).Logger()
-			// The lifecycle lock has been held since the startup pass queued
-			// this VM, so no restore or resume for the id can have run
-			// meanwhile; the map check below is belt and braces.
-			m.mu.RLock()
-			_, taken := m.vms[pw.inst.ID]
-			m.mu.RUnlock()
-			if taken {
-				log.Info().Msg("reattach: a request replaced this VM before its wake completed; recovery instance abandoned")
-				return
-			}
-			if err := m.completeOwedWake(ctx, pw.inst, log); err == nil {
-				woken.Add(1)
-			} else {
-				m.parkUnservable(pw.inst, errors.Is(err, ErrGuestTokenMismatch))
-			}
-			m.publishRecovered(pw.inst)
-		}(pw)
+}
+
+// startWakePool begins serving queued wakes, wakeRecoveryWorkers at a time,
+// including any queued before it started. Idempotent.
+func (m *Manager) startWakePool(ctx context.Context) {
+	m.pendingWakeMu.Lock()
+	if m.wakePoolCtx != nil {
+		m.pendingWakeMu.Unlock()
+		return
 	}
-	wg.Wait()
-	return int(woken.Load())
+	m.wakePoolCtx = ctx
+	m.wakeSem = make(chan struct{}, wakeRecoveryWorkers)
+	backlog := make([]*pendingWake, 0, len(m.pendingWakes))
+	for _, pw := range m.pendingWakes {
+		backlog = append(backlog, pw)
+	}
+	m.wakeWG.Add(len(backlog))
+	m.pendingWakeMu.Unlock()
+	m.noteWakeDrainStarted()
+	for _, pw := range backlog {
+		go m.serveWake(pw)
+	}
+}
+
+// serveWake completes one queued wake under the pool's worker bound and
+// publishes the outcome: Running once woken, Error otherwise — never a
+// frozen guest presented as ready.
+func (m *Manager) serveWake(pw *pendingWake) {
+	defer m.wakeWG.Done()
+	m.wakeSem <- struct{}{}
+	defer func() { <-m.wakeSem }()
+	defer sentrylog.Recover("wake-recovery")
+	defer func() {
+		m.pendingWakeMu.Lock()
+		delete(m.pendingWakes, pw.inst.ID)
+		m.pendingWakeMu.Unlock()
+		close(pw.done)
+		pw.unlock()
+	}()
+	log := m.log.With().Str("vm_id", pw.inst.ID).Logger()
+	// The lifecycle lock has been held since the startup pass queued this
+	// VM, so no restore or resume for the id can have run meanwhile; the
+	// map check below is belt and braces.
+	m.mu.RLock()
+	_, taken := m.vms[pw.inst.ID]
+	m.mu.RUnlock()
+	if taken {
+		log.Info().Msg("reattach: a request replaced this VM before its wake completed; recovery instance abandoned")
+		return
+	}
+	if err := m.completeOwedWake(m.wakePoolCtx, pw.inst, log); err == nil {
+		m.wakeWoken.Add(1)
+	} else {
+		m.parkUnservable(pw.inst, errors.Is(err, ErrGuestTokenMismatch))
+	}
+	m.publishRecovered(pw.inst)
+}
+
+// drainPendingWakes starts the pool if the startup pass has not, then waits
+// for every queued wake. Returns how many the pool has published Running.
+func (m *Manager) drainPendingWakes(ctx context.Context) int {
+	m.startWakePool(ctx)
+	m.wakeWG.Wait()
+	return int(m.wakeWoken.Load())
 }
 
 // completeOwedWake sends the wake a reattached record still owes. Nil once

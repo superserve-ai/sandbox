@@ -1666,6 +1666,18 @@ func (p *phaseSink) RecordLatencyPhase(_ context.Context, ph telemetry.LatencyPh
 	p.phases = append(p.phases, ph)
 }
 
+// modeOf is the mode the first sample of op/phase carried, or "-" if none.
+func (p *phaseSink) modeOf(op, phase string) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, ph := range p.phases {
+		if ph.Op == op && ph.Phase == phase {
+			return ph.Mode
+		}
+	}
+	return "-"
+}
+
 func (p *phaseSink) has(op, phase string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1918,6 +1930,49 @@ func TestUnfrozenPauseKeepsTheOldManifestUntilItsSnapshotLands(t *testing.T) {
 	}
 	if man, err := ReadWallClockManifest(memSnap); err != nil || man != nil {
 		t.Fatalf("manifest=%+v err=%v; the replaced image is unfrozen and must carry no manifest", man, err)
+	}
+}
+
+// The startup pass starts the pool before its scan: a wake queued early is
+// served while later records are still being read, and the drain at the end
+// only waits. A wake queued before the pool exists waits for it.
+func TestQueuedWakesAreServedDuringTheStartupScan(t *testing.T) {
+	origWake := boxdWakeGuest
+	t.Cleanup(func() { boxdWakeGuest = origWake })
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return nil }
+
+	dir := t.TempDir()
+	store, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	rec := VMRecord{ID: "vm-1", Status: StatusRunning, Unverified: true, WakePending: true, ClockFrozen: true, FreezeToken: "tok", WakeToken: "tok", Supervision: SupervisionUnit, IP: "10.0.0.2"}
+	if err := store.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{SnapshotDir: dir}, state: store, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}}
+	mgr.startWakePool(context.Background())
+	unlock, err := mgr.lockVMOp(context.Background(), "vm-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.queuePendingWake(toInstance(rec), unlock)
+	pw := mgr.pendingWake("vm-1")
+	if pw == nil {
+		t.Fatal("not queued")
+	}
+	// Served with no drain called: the scan is still notionally running.
+	select {
+	case <-pw.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the queued wake was not served while the scan ran")
+	}
+	if inst := mgr.vms["vm-1"]; inst == nil || inst.WakePending || inst.Status != StatusRunning {
+		t.Fatalf("instance = %+v; want the woken VM published", inst)
+	}
+	if n := mgr.drainPendingWakes(context.Background()); n != 1 {
+		t.Fatalf("drain = %d, want the one wake counted", n)
 	}
 }
 
@@ -2614,7 +2669,68 @@ func TestDormantHostAddsNothingToALegacyLifecycle(t *testing.T) {
 		if sink.has("restore", "wake_floor") {
 			t.Fatalf("phases = %+v; a legacy create proved a floor", sink.phases)
 		}
+		if mode := sink.modeOf("restore", "load_snapshot"); mode != "" {
+			t.Fatalf("load_snapshot mode = %q; a legacy restore's phases carry no mode", mode)
+		}
 	})
+}
+
+// A frozen image's restore records its phases under the frozen mode, so the
+// dashboard can put the two kinds of restore side by side.
+func TestFrozenRestoreRecordsItsPhasesAsFrozen(t *testing.T) {
+	useTempFloor(t)
+	origWake := boxdWakeGuest
+	t.Cleanup(func() { boxdWakeGuest = origWake })
+	boxdWakeGuest = func(context.Context, string, time.Duration, bool, string) error { return nil }
+
+	dir := t.TempDir()
+	snapPath, memPath, basePath := filepath.Join(dir, "vm.snap"), filepath.Join(dir, "mem.snap"), filepath.Join(dir, "base.ext4")
+	overlay := filepath.Join(dir, "vm-1", "overlay.ext4")
+	if err := os.MkdirAll(filepath.Dir(overlay), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{snapPath, memPath, basePath, overlay} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seedFrozenManifest(t, memPath, "tok")
+	sink := &phaseSink{}
+	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: dir, GuestClockFreezeEnabled: true}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1), recorder: sink}
+	m.clockRealtimeCapable.Store(true)
+	m.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		return 4321, SupervisionUnit, nil
+	}
+	m.restoreSnapshotHook = func(_, _, _ string, clock *bool) error { return nil }
+	inst, err := m.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath}, nil, "team", "owner", "", nil, 0)
+	if err != nil || inst == nil {
+		t.Fatalf("restore: inst=%v err=%v", inst, err)
+	}
+	for _, phase := range []string{"load_snapshot", "wait_boxd"} {
+		if mode := sink.modeOf("restore", phase); mode != "frozen" {
+			t.Errorf("%s mode = %q, want frozen; phases = %+v", phase, mode, sink.phases)
+		}
+	}
+
+	// A frozen restore that fails during its setup is labelled the same way:
+	// its failed phases belong in the frozen tail, not the legacy one.
+	failing := &phaseSink{}
+	f := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: t.TempDir(), GuestClockFreezeEnabled: true}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1), recorder: failing}
+	f.clockRealtimeCapable.Store(true)
+	f.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		return 0, SupervisionUnit, errors.New("launch refused")
+	}
+	if _, err := f.RestoreVMSnapshot(context.Background(), "vm-2", snapPath, memPath, VMConfig{BasePath: basePath}, nil, "team", "owner", "", nil, 0); err == nil {
+		t.Fatal("want the launch failure")
+	}
+	if len(failing.phases) == 0 {
+		t.Fatal("a failed restore recorded no phases")
+	}
+	for _, ph := range failing.phases {
+		if ph.Mode != "frozen" {
+			t.Errorf("failed restore's %s mode = %q, want frozen", ph.Phase, ph.Mode)
+		}
+	}
 }
 
 // Recovery of an intent without a token, an unfrozen rewrite the crash

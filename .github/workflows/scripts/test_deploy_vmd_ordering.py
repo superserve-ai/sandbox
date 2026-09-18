@@ -163,6 +163,37 @@ class BackupStagingDirRollbackTests(unittest.TestCase):
             self.assertNotIn("BACKUP_STAGING_DIR", env_file.read_text())
             self.assertIn("OTHER=1", env_file.read_text())
 
+    def _switch_block(self, name):
+        match = re.search(rf"# Reconcile {name} .*?\n(?:.*\n)*?\s*fi\n", SOURCE)
+        self.assertIsNotNone(match, f"could not locate the {name} reconcile block")
+        return match.group(0)
+
+    def test_guest_clock_switches_are_reconciled(self):
+        # Both activation switches follow the BACKUP_BACKFILL contract: the
+        # stale line always goes, and comes back only when the workflow sets
+        # it, so unsetting a switch turns it off on the next deploy.
+        for name, q in (
+            ("VMD_GUEST_CLOCK_FREEZE", "q_guest_clock_freeze"),
+            ("VMD_TEMPLATE_FREEZE_WORKLOAD", "q_template_freeze"),
+        ):
+            block = self._switch_block(name).replace("sudo ", "")
+            for value, want_present in (("", False), ("true", True)):
+                rendered = block.replace("{" + q + "}", repr(value) if value else "''").replace(
+                    "{" + q + "_line}", f"'{name}={value}'"
+                )
+                with tempfile.TemporaryDirectory() as d:
+                    env_file = Path(d) / "vmd.env"
+                    env_file.write_text(f"{name}=stale\nOTHER=1\n")
+                    script = rendered.replace("/etc/sandbox/vmd.env", str(env_file))
+                    result = subprocess.run(
+                        ["sh", "-c", linux_shell_prelude() + script], capture_output=True, text=True
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    content = env_file.read_text()
+                    self.assertNotIn(f"{name}=stale", content, (name, value))
+                    self.assertEqual(f"{name}=true" in content, want_present, (name, value))
+                    self.assertIn("OTHER=1", content)
+
     def test_non_empty_value_replaces_a_stale_line_on_the_host(self):
         # Companion behavioral case: a new value still upserts correctly
         # (delete-then-append), not just delete-and-skip.

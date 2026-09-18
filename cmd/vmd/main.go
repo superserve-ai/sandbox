@@ -648,6 +648,16 @@ func main() {
 			fmt.Println("cgroup-supervision")
 			fmt.Println(vm.WakeProtocolCapability)
 			return
+		case "raise-wake-floor":
+			// Operator step before the first frozen image can exist anywhere:
+			// with the floor up on every host, no vmd without the wake protocol
+			// can start on one, so a later rollback cannot strand a frozen
+			// guest. Durable before it returns; idempotent.
+			if err := vm.RaiseWakeProtocolFloor(); err != nil {
+				fmt.Fprintln(os.Stderr, "raise-wake-floor:", err)
+				os.Exit(1)
+			}
+			return
 		case "drain-check":
 			os.Exit(runDrainCheck())
 		case "launcher-prune":
@@ -802,6 +812,9 @@ func main() {
 	// Off by default: it only does anything for a snapshot whose guest corrects
 	// its own wall clock, and forcing legacy is the way back if one misbehaves.
 	guestClockFreezeEnabled := envOrDefault("VMD_GUEST_CLOCK_FREEZE", "false") == "true"
+	// Off by default: a frozen template is only safe under a supervisor that
+	// wakes it, so this follows the binary, never precedes it.
+	templateFreezeWorkload := envOrDefault("VMD_TEMPLATE_FREEZE_WORKLOAD", "false") == "true"
 	// Pause-side wait for the guest to stop its workload before a frozen-clock
 	// snapshot; only paid when the restore would freeze the clock.
 	guestFreezeBudget := 500 * time.Millisecond
@@ -984,6 +997,7 @@ func main() {
 		DirtyTrackingSessionEnabled:         dirtyTrackingSessionEnabled,
 		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
 		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
+		TemplateFreezeWorkload:              templateFreezeWorkload,
 		GuestFreezeBudget:                   guestFreezeBudget,
 		RequirePresenceSidecar:              requirePresenceSidecar,
 		PausedNetworkReclaimEnabled:         pausedNetworkReclaimEnabled,

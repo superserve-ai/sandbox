@@ -324,14 +324,14 @@ func TestTemplateWatchRunsOnlyWhenTheSwitchIsOn(t *testing.T) {
 	}
 }
 
-// A frozen template that lands after the watch started is witnessed as it
-// lands, not at the next periodic scan: the floor is up within moments.
-func TestTemplateWatchWitnessesATemplateAsItLands(t *testing.T) {
+// A frozen template that lands after the scan started, under a root that
+// did not exist yet, is witnessed by the next periodic scan.
+func TestTemplateScanWitnessesATemplateThatLandsLater(t *testing.T) {
 	dir := t.TempDir()
 	isolateEvidence(t, dir)
-	if err := os.MkdirAll(filepath.Join(dir, TemplatesDirName), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	orig := templateScanInterval
+	templateScanInterval = 20 * time.Millisecond
+	t.Cleanup(func() { templateScanInterval = orig })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir, GuestClockFreezeEnabled: true}}
@@ -341,12 +341,10 @@ func TestTemplateWatchWitnessesATemplateAsItLands(t *testing.T) {
 	if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
 		t.Fatal("nothing had landed yet")
 	}
-	// The copy: directories first, then the manifest, renamed into place.
 	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
 	if err := os.MkdirAll(tpl, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond)
 	seedFrozenManifest(t, filepath.Join(tpl, "mem.snap"), "tok")
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -354,79 +352,7 @@ func TestTemplateWatchWitnessesATemplateAsItLands(t *testing.T) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("the frozen template that landed was not witnessed")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// A manifest streamed into its final path, created empty and written after,
-// is witnessed at its last write, not left for the next periodic scan.
-func TestTemplateWatchWitnessesAManifestStreamedIntoPlace(t *testing.T) {
-	dir := t.TempDir()
-	isolateEvidence(t, dir)
-	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
-	if err := os.MkdirAll(tpl, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir, GuestClockFreezeEnabled: true}}
-	stopped := m.WatchTemplateManifests(ctx, zerolog.Nop())
-	defer func() { cancel(); <-stopped }()
-	time.Sleep(50 * time.Millisecond)
-
-	path := WallClockMarkerPath(filepath.Join(tpl, "mem.snap"))
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(50 * time.Millisecond) // the create is seen while the file is empty
-	body := `{"version":1,"artifact_id":"a","workload_frozen":true,"guest_corrects_clock":true,"freeze_token":"tok"}`
-	if _, err := f.WriteString(body[:20]); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(50 * time.Millisecond) // a partial write does not parse
-	if _, err := f.WriteString(body[20:]); err != nil {
-		t.Fatal(err)
-	}
-	f.Close()
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the streamed frozen manifest was not witnessed at its last write")
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
-// A watch started before the templates root exists still witnesses the first
-// template to land: the root is created so the watch attaches to it.
-func TestTemplateWatchAttachesBeforeTheRootExists(t *testing.T) {
-	dir := t.TempDir()
-	isolateEvidence(t, dir)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	m := &Manager{cfg: ManagerConfig{SnapshotDir: dir, GuestClockFreezeEnabled: true}}
-	stopped := m.WatchTemplateManifests(ctx, zerolog.Nop())
-	defer func() { cancel(); <-stopped }()
-	time.Sleep(50 * time.Millisecond)
-	tpl := filepath.Join(dir, TemplatesDirName, "tpl", "build-1")
-	if err := os.MkdirAll(tpl, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(50 * time.Millisecond)
-	seedFrozenManifest(t, filepath.Join(tpl, "mem.snap"), "tok")
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		if _, err := os.Stat(wakeProtocolEvidencePath); err == nil {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("a template landing under a root created after the watch started was not witnessed")
+			t.Fatal("the frozen template that landed was not witnessed by the periodic scan")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
