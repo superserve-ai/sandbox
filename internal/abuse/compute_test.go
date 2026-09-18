@@ -4,11 +4,15 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 func TestComputePolicy(t *testing.T) {
@@ -26,7 +30,7 @@ func TestComputePolicy(t *testing.T) {
 						trust = fmt.Sprintf(`["%s"]`, team)
 					}
 					data := []byte(fmt.Sprintf(`{"mode":%q,"trusted_teams":%s,"restrictions":[{"subject_type":%q,"subject_id":%q,"actions":["create"]}]}`, mode, trust, subject, id))
-					s := NewConfigComputeSource("unused", func(context.Context) (map[uuid.UUID][]uuid.UUID, error) {
+					s := NewConfigComputeSource("unused", func(context.Context, []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error) {
 						return map[uuid.UUID][]uuid.UUID{team: {other, owner}}, nil
 					}, nil)
 					s.readFile = func(string) ([]byte, error) { return data, nil }
@@ -177,7 +181,7 @@ func TestComputeConfigOmittedAndEmptyLists(t *testing.T) {
 func TestComputeOwnerFailureFailsOpenWithoutLosingTeamRestrictions(t *testing.T) {
 	team, owner := uuid.New(), uuid.New()
 	fail := false
-	s := NewConfigComputeSource("unused", func(context.Context) (map[uuid.UUID][]uuid.UUID, error) {
+	s := NewConfigComputeSource("unused", func(context.Context, []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error) {
 		if fail {
 			return nil, os.ErrPermission
 		}
@@ -287,7 +291,7 @@ func TestComputeBackgroundReloadAndShutdown(t *testing.T) {
 func TestComputeOwnerChangesAndTrustedTeams(t *testing.T) {
 	pilot, example, owner := uuid.New(), uuid.New(), uuid.New()
 	owners := map[uuid.UUID][]uuid.UUID{pilot: {owner}, example: {owner}}
-	s := NewConfigComputeSource("unused", func(context.Context) (map[uuid.UUID][]uuid.UUID, error) { return owners, nil }, nil)
+	s := NewConfigComputeSource("unused", func(context.Context, []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error) { return owners, nil }, nil)
 	trust := fmt.Sprintf(`[%q,%q]`, pilot, example)
 	s.readFile = func(string) ([]byte, error) {
 		return []byte(fmt.Sprintf(`{"mode":"enforce","trusted_teams":%s,"restrictions":[{"subject_type":"user","subject_id":%q,"actions":["create","resume"]},{"subject_type":"team","subject_id":%q,"actions":["resume"]}]}`, trust, owner, pilot)), nil
@@ -313,5 +317,68 @@ func TestComputeOwnerChangesAndTrustedTeams(t *testing.T) {
 	}
 	if e.Evaluate(pilot, ActionResume).Outcome != "blocked" {
 		t.Fatal("team restriction lost")
+	}
+}
+
+func TestComputeRefreshScopesOwnerLoadToConfiguredUsers(t *testing.T) {
+	first, second, team := uuid.New(), uuid.New(), uuid.New()
+	var calls [][]uuid.UUID
+	s := NewConfigComputeSource("unused", func(_ context.Context, ids []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error) {
+		calls = append(calls, ids)
+		return map[uuid.UUID][]uuid.UUID{team: ids}, nil
+	}, nil)
+	data := fmt.Sprintf(`{"mode":"enforce","restrictions":[{"subject_type":"user","subject_id":%q,"actions":["create"]},{"subject_type":"user","subject_id":%q,"actions":["resume"]},{"subject_type":"team","subject_id":%q,"actions":["create"]}]}`, first, first, team)
+	s.readFile = func(string) ([]byte, error) { return []byte(data), nil }
+	s.Refresh(context.Background())
+	if len(calls) != 1 || !reflect.DeepEqual(calls[0], []uuid.UUID{first}) {
+		t.Fatalf("expected only the unique configured user, got %v", calls)
+	}
+	e := &ComputeEvaluator{Source: s}
+	if e.Evaluate(team, ActionResume).Outcome != "blocked" {
+		t.Fatal("duplicate user restrictions lost resume action")
+	}
+	data = fmt.Sprintf(`{"mode":"enforce","restrictions":[{"subject_type":"user","subject_id":%q,"actions":["create"]}]}`, second)
+	s.Refresh(context.Background())
+	if len(calls) != 2 || !reflect.DeepEqual(calls[1], []uuid.UUID{second}) {
+		t.Fatalf("refresh did not replace requested users: %v", calls)
+	}
+	if e.Evaluate(team, ActionResume).Outcome != "allowed" {
+		t.Fatal("removed user restriction remained effective")
+	}
+	data = fmt.Sprintf(`{"mode":"enforce","restrictions":[{"subject_type":"team","subject_id":%q,"actions":["create"]}]}`, team)
+	s.Refresh(context.Background())
+	if len(calls) != 2 {
+		t.Fatal("team-only config loaded owners")
+	}
+}
+
+type computeOwnerQuery struct {
+	db.DBTX
+	query func(string, ...interface{}) (pgx.Rows, error)
+}
+
+func (q computeOwnerQuery) Query(_ context.Context, sql string, args ...interface{}) (pgx.Rows, error) {
+	return q.query(sql, args...)
+}
+
+func TestLoadComputeOwnersFiltersRequestedUsers(t *testing.T) {
+	ids := []uuid.UUID{uuid.New(), uuid.New()}
+	queryErr := fmt.Errorf("query failed")
+	calls := 0
+	load := LoadComputeOwners(computeOwnerQuery{query: func(sql string, args ...interface{}) (pgx.Rows, error) {
+		calls++
+		if !strings.Contains(sql, "ura.user_id = ANY($1::uuid[])") || len(args) != 1 || !reflect.DeepEqual(args[0], ids) {
+			t.Fatalf("owner query must filter requested users: %s, %v", sql, args)
+		}
+		return nil, queryErr
+	}})
+	for _, empty := range [][]uuid.UUID{nil, {}} {
+		owners, err := load(context.Background(), empty)
+		if err != nil || len(owners) != 0 || calls != 0 {
+			t.Fatal("empty user filter must not query owners")
+		}
+	}
+	if _, err := load(context.Background(), ids); err != queryErr || calls != 1 {
+		t.Fatalf("expected filtered query error, got %v (%d queries)", err, calls)
 	}
 }

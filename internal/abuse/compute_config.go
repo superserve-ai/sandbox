@@ -25,9 +25,9 @@ type computeConfig struct {
 	} `json:"restrictions"`
 }
 
-// OwnerLoader returns canonical active owners grouped by team. It is called
-// only during refresh, never while evaluating lifecycle requests.
-type OwnerLoader func(context.Context) (map[uuid.UUID][]uuid.UUID, error)
+// OwnerLoader returns canonical active owners among the requested user IDs,
+// grouped by team. It is called only during refresh, never during evaluation.
+type OwnerLoader func(context.Context, []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error)
 
 type ConfigComputeSource struct {
 	path     string
@@ -97,7 +97,11 @@ func (s *ConfigComputeSource) Refresh(ctx context.Context) {
 	}
 	if len(userActions) > 0 && s.owners != nil {
 		ownerCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		owners, err := s.owners(ownerCtx)
+		userIDs := make([]uuid.UUID, 0, len(userActions))
+		for id := range userActions {
+			userIDs = append(userIDs, id)
+		}
+		owners, err := s.owners(ownerCtx, userIDs)
 		cancel()
 		if err != nil {
 			s.result(ctx, "owners_error")
@@ -172,12 +176,16 @@ func parseComputeConfig(data []byte) (computeConfig, error) {
 }
 
 func LoadComputeOwners(q db.DBTX) OwnerLoader {
-	return func(ctx context.Context) (map[uuid.UUID][]uuid.UUID, error) {
+	return func(ctx context.Context, userIDs []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error) {
+		if len(userIDs) == 0 {
+			return nil, nil
+		}
 		rows, err := q.Query(ctx, `SELECT DISTINCT ura.team_id, ura.user_id
    FROM user_role_assignments ura
    JOIN roles r ON r.id = ura.role_id AND r.scope_type = 'team'
    JOIN team_memberships tm ON tm.team_id = ura.team_id AND tm.user_id = ura.user_id AND tm.status = 'active'
-   WHERE ura.scope_type = 'team' AND ura.revoked_at IS NULL AND r.name = 'team_owner'`)
+   WHERE ura.scope_type = 'team' AND ura.revoked_at IS NULL AND r.name = 'team_owner'
+     AND ura.user_id = ANY($1::uuid[])`, userIDs)
 		if err != nil {
 			return nil, err
 		}
