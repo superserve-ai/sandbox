@@ -157,12 +157,13 @@ func (f *fakeNetMgr) TeardownVMOrNamespace(vmID, fallbackNamespace string) {
 // stale combination could clobber the per-VM overlay.
 func TestPlanRestore(t *testing.T) {
 	tests := []struct {
-		name       string
-		basePath   string
-		deltaDir   string
-		inPlace    bool
-		wantAction restoreDiskAction
-		wantDelta  string
+		name        string
+		basePath    string
+		deltaDir    string
+		inPlace     bool
+		priorRunDir bool
+		wantAction  restoreDiskAction
+		wantDelta   string
 	}{
 		{
 			name:       "create-from-template: fresh overlay, hydrate from delta",
@@ -181,12 +182,21 @@ func TestPlanRestore(t *testing.T) {
 			wantDelta:  "",
 		},
 		{
-			name:       "in-place resume: reuse, force-empty delta even if caller passes one",
+			name:        "in-place resume: reuse, force-empty delta even if caller passes one",
+			basePath:    "/run/templates/t/b/base.ext4",
+			deltaDir:    "/snap/templates/t/b",
+			inPlace:     true,
+			priorRunDir: true,
+			wantAction:  restoreReuseOverlay,
+			wantDelta:   "",
+		},
+		{
+			name:       "in-place retry after a cleaned-up failure → build the overlay again",
 			basePath:   "/run/templates/t/b/base.ext4",
 			deltaDir:   "/snap/templates/t/b",
 			inPlace:    true,
-			wantAction: restoreReuseOverlay,
-			wantDelta:  "",
+			wantAction: restoreCreateOverlay,
+			wantDelta:  "/snap/templates/t/b",
 		},
 		{
 			name:       "legacy: no overlay fields → resolve disk the old way",
@@ -199,7 +209,7 @@ func TestPlanRestore(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := planRestore(tc.basePath, tc.deltaDir, tc.inPlace)
+			got := planRestore(tc.basePath, tc.deltaDir, tc.inPlace, tc.priorRunDir)
 			if got.action != tc.wantAction {
 				t.Errorf("action = %v, want %v", got.action, tc.wantAction)
 			}

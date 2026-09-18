@@ -1022,15 +1022,16 @@ type restorePlan struct {
 // planRestore picks the disk action + delta_dir for a restore. createOverlay
 // requires ALL of {basePath, deltaDir, !inPlace} — anything missing means
 // we'd be cloning over an existing per-VM file, so fall back to reuse.
-func planRestore(basePath, deltaDir string, inPlace bool) restorePlan {
+func planRestore(basePath, deltaDir string, inPlace, priorRunDir bool) restorePlan {
 	p := restorePlan{deltaDir: deltaDir}
-	if inPlace {
+	if inPlace && priorRunDir {
 		// fc's delta-apply truncates the overlay; force empty to stop a
-		// caller mistake from clobbering per-VM state.
+		// caller mistake from clobbering per-VM state. A same-ID retry after
+		// a cleaned-up failure has no rundir, so the overlay is built again.
 		p.deltaDir = ""
 	}
 	switch {
-	case basePath != "" && deltaDir != "" && !inPlace:
+	case basePath != "" && p.deltaDir != "":
 		p.action = restoreCreateOverlay
 	case basePath != "":
 		p.action = restoreReuseOverlay
@@ -3553,19 +3554,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	m.mu.Lock()
 	prevInst, inPlace := m.vms[vmID]
-	// A failed instance with no rundir is an attempt whose cleanup already
-	// ran; restarting it in place would need the overlay that cleanup
-	// removed, so the retry starts over. Any other status may still own a
-	// process and keeps the in-place stop.
-	if inPlace && !priorRunDir {
-		prevInst.mu.RLock()
-		cleanedUp := prevInst.Status == StatusError && prevInst.TeardownPending == ""
-		prevInst.mu.RUnlock()
-		if cleanedUp {
-			delete(m.vms, vmID)
-			prevInst, inPlace = nil, false
-		}
-	}
 	prevSupervision := SupervisionUnit
 	if inPlace {
 		prevInst.mu.RLock()
@@ -3629,7 +3617,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	freshUnit := m.orphanScanDone.Load() && !inPlace && !priorRunDir &&
 		!isBuildVM(vmID) && !unitMaybeWindingDown(systemdUnitName(vmID))
 
-	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace)
+	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, inPlace, priorRunDir)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
 	// see cleanupRunDirKeepOverlay.
 	cleanupAfterRestoreFailure := func() {
