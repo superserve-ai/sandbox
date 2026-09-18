@@ -49,6 +49,7 @@ type BackupRestoreOptions struct {
 	CacheBytes   int64         // unpacked template bases kept between restores
 	FetchBudget  time.Duration // a fetch outlives the RPC that started it up to this
 	AbandonAfter time.Duration // a finished fetch nobody claims is dropped after this
+	MaxUnclaimed int           // finished fetches kept for a retry at once; the oldest go first
 }
 
 // SetBackupRestore enables reviving a paused sandbox from its bucket backup
@@ -61,7 +62,10 @@ func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobL
 		opts.FetchBudget = 15 * time.Minute
 	}
 	if opts.AbandonAfter <= 0 {
-		opts.AbandonAfter = time.Hour
+		opts.AbandonAfter = 5 * time.Minute
+	}
+	if opts.MaxUnclaimed <= 0 {
+		opts.MaxUnclaimed = 2 * opts.Concurrency
 	}
 	m.backupReader, m.backupLister, m.backupRestoreRoot, m.backupRestore = reader, lister, root, opts
 	if opts.Limiter != nil {

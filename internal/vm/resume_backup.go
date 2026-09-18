@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -104,15 +105,29 @@ func (m *Manager) backupRevivedTarget(vmID, generation string) *VMInstance {
 // that observe it, so a retry picks the download up where it stands. A
 // finished fetch nobody claims is dropped with its staging dir.
 type backupFlight struct {
-	generation string
-	done       chan struct{}
-	claimed    chan struct{}
-	claimOnce  sync.Once
-	restored   backup.Restored
-	err        error
+	generation  string
+	done        chan struct{}
+	claimed     chan struct{}
+	dropped     chan struct{}
+	claimOnce   sync.Once
+	dropOnce    sync.Once
+	completedAt time.Time
+	restored    backup.Restored
+	err         error
 }
 
 func (f *backupFlight) claim() { f.claimOnce.Do(func() { close(f.claimed) }) }
+
+func (f *backupFlight) drop() { f.dropOnce.Do(func() { close(f.dropped) }) }
+
+func (f *backupFlight) unclaimed() bool {
+	select {
+	case <-f.claimed:
+		return false
+	default:
+		return !f.completedAt.IsZero()
+	}
+}
 
 func (m *Manager) backupBaseDir() string { return filepath.Join(m.backupRestoreRoot, ".base-cache") }
 
@@ -131,7 +146,7 @@ func (m *Manager) backupFlightFor(vmID, generation string) (*backupFlight, error
 		}
 		return f, nil
 	}
-	f := &backupFlight{generation: generation, done: make(chan struct{}), claimed: make(chan struct{})}
+	f := &backupFlight{generation: generation, done: make(chan struct{}), claimed: make(chan struct{}), dropped: make(chan struct{})}
 	m.backupFlights[vmID] = f
 	go m.runBackupFlight(vmID, f)
 	return f, nil
@@ -164,12 +179,41 @@ func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 			}
 		}
 		m.sweepPromotedBases()
+		f.completedAt = time.Now()
 	}()
+	m.dropUnclaimedBeyondCap()
 	select {
 	case <-f.claimed:
+	case <-f.dropped:
 	case <-time.After(m.backupRestore.AbandonAfter):
 		m.backupFlightDone(vmID, f)
 		_ = os.RemoveAll(dest)
+	}
+}
+
+// dropUnclaimedBeyondCap keeps completed fetches waiting for a retry within
+// the configured count, oldest out first, so a recovery wave cannot hold a
+// full sandbox disk per stalled request until each expires.
+func (m *Manager) dropUnclaimedBeyondCap() {
+	m.backupFlightsMu.Lock()
+	defer m.backupFlightsMu.Unlock()
+	type waiting struct {
+		vmID string
+		f    *backupFlight
+	}
+	var pending []waiting
+	for vmID, f := range m.backupFlights {
+		if f.unclaimed() {
+			pending = append(pending, waiting{vmID, f})
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].f.completedAt.Before(pending[j].f.completedAt) })
+	for len(pending) > m.backupRestore.MaxUnclaimed {
+		oldest := pending[0]
+		pending = pending[1:]
+		delete(m.backupFlights, oldest.vmID)
+		oldest.f.drop()
+		_ = os.RemoveAll(m.restoreStagingDir(oldest.vmID))
 	}
 }
 
