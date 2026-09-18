@@ -8,14 +8,17 @@ import (
 
 const neighTableCapPath = "/proc/sys/net/ipv4/neigh/default/gc_thresh3"
 
-// Every slot is a host-side veth with its own neighbour entry, so the kernel
-// cap must cover the live namespaces plus the warm pool or guests drop off
-// the host under bursts.
-func neighTableShortfall(cap, slots int) int {
-	if cap >= slots {
+// The cap must cover a neighbour entry per namespace on disk and never sit
+// near the kernel default a rebuilt host boots with, or guests drop off the
+// host under bursts.
+const neighTableFloor = 4096
+
+func neighTableShortfall(cap, netns int) int {
+	need := max(netns, neighTableFloor)
+	if cap >= need {
 		return 0
 	}
-	return slots - cap
+	return need - cap
 }
 
 func readNeighTableCap() (int, error) {

@@ -3,13 +3,16 @@ package main
 import "testing"
 
 func TestNeighTableShortfall(t *testing.T) {
-	if got := neighTableShortfall(32768, 4587); got != 0 {
-		t.Fatalf("cap above slots: got %d, want 0", got)
+	cases := []struct{ cap, netns, want int }{
+		{32768, 4587, 0},
+		{1024, 4587, 3563},
+		{1024, 100, 3072},
+		{8192, 100, 0},
+		{4096, 4096, 0},
 	}
-	if got := neighTableShortfall(1024, 4587); got != 3563 {
-		t.Fatalf("kernel default cap: got %d, want 3563", got)
-	}
-	if got := neighTableShortfall(1024, 1024); got != 0 {
-		t.Fatalf("cap equal to slots: got %d, want 0", got)
+	for _, c := range cases {
+		if got := neighTableShortfall(c.cap, c.netns); got != c.want {
+			t.Errorf("cap %d netns %d: got %d, want %d", c.cap, c.netns, got, c.want)
+		}
 	}
 }

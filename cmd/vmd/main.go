@@ -2004,14 +2004,10 @@ func main() {
 		if err != nil {
 			return
 		}
-		// Warm namespaces already on disk are in the netns count; only the
-		// pool's remaining deficit adds more.
 		liveNetns, _, _ := netMgr.NetnsStats()
-		fresh, recycled, _ := netMgr.PoolStats()
-		slots := liveNetns + max(netPoolFresh-fresh-recycled, 0)
-		if short := neighTableShortfall(neighCap, slots); short > 0 {
-			log.Error().Int("gc_thresh3", neighCap).Int("slots", slots).Int("shortfall", short).
-				Msg("kernel neighbour table cap is below the slot count; raise net.ipv4.neigh.default.gc_thresh3")
+		if short := neighTableShortfall(neighCap, liveNetns); short > 0 {
+			log.Error().Int("gc_thresh3", neighCap).Int("netns", liveNetns).Int("shortfall", short).
+				Msg("kernel neighbour table cap is too small for this host; raise net.ipv4.neigh.default.gc_thresh3")
 		}
 	}()
 	st.mark("ready", true, -1)
