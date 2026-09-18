@@ -31,7 +31,8 @@ sysctl -q -p /etc/sysctl.d/90-sandbox-forward.conf
 
 # Every sandbox slot is a host-side veth with its own neighbour entry; the
 # kernel default cap of 1024 overflows under bursts and drops guest traffic.
-# Written once so a larger value set by an operator survives reboots.
+# Written and applied once; later boots load it with the rest of sysctl.d,
+# so a larger value an operator persists elsewhere is never overridden.
 if [ ! -f /etc/sysctl.d/90-sandbox-neigh.conf ]; then
   printf '%s\n' \
     'net.ipv4.neigh.default.gc_thresh1 = 8192' \
@@ -40,8 +41,8 @@ if [ ! -f /etc/sysctl.d/90-sandbox-neigh.conf ]; then
     'net.ipv6.neigh.default.gc_thresh1 = 8192' \
     'net.ipv6.neigh.default.gc_thresh2 = 16384' \
     'net.ipv6.neigh.default.gc_thresh3 = 32768' > /etc/sysctl.d/90-sandbox-neigh.conf
+  sysctl -q -p /etc/sysctl.d/90-sandbox-neigh.conf
 fi
-sysctl -q -p /etc/sysctl.d/90-sandbox-neigh.conf
 
 install -d -m 0755 /var/lib/sandbox/kernel /var/lib/sandbox/rootfs /etc/sandbox
 install -d -m 0755 /etc/systemd/system/superserve-vmd.service.d
