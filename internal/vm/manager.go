@@ -4699,10 +4699,10 @@ func (m *Manager) recoveryFinished(inst *VMInstance) {
 	m.recovery.mu.Lock()
 	delete(m.recovery.tracked, inst)
 	m.recovery.mu.Unlock()
+	m.backfillMachineConfigAsync(inst)
 	if m.recovery.done != nil {
 		m.recovery.done(inst.ID)
 	}
-	m.backfillMachineConfigAsync(inst)
 }
 
 // applyMachineConfig records a probed allocation in memory, and only
