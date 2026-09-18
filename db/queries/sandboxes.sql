@@ -338,8 +338,19 @@ WHERE s.host_id = $1 AND s.destroyed_at IS NULL;
 -- name: GetSnapshotPathsByIDs :many
 -- Batched snapshot-path lookup for the reconciler's paused-snapshot drift
 -- check. Replaces the old per-inventory join with a PK lookup over just the
--- snapshot IDs of paused sandboxes.
-SELECT id, path FROM snapshot WHERE id = ANY(@ids::uuid[]);
+-- snapshot IDs of paused sandboxes. mem_path and covered let the drift check
+-- tell a fetchable partial miss — vmstate.snap gone, mem.snap still local,
+-- and a verified backup generation covers this exact snapshot (identical
+-- join to ClaimResume's covered_backup_generation and paused_unbacked_count
+-- in hosts.sql; served by idx_backup_generation_covered_snapshot) — from a
+-- real loss that fetch-on-resume cannot recover from either.
+SELECT s.id, s.path, s.mem_path,
+       EXISTS (
+         SELECT 1 FROM backup_generation bg
+         WHERE bg.covered_snapshot_id = s.id
+           AND bg.covered_snapshot_generation = s.generation
+       ) AS covered
+FROM snapshot s WHERE s.id = ANY(@ids::uuid[]);
 
 -- name: ListRecentlyDestroyedSandboxIDsByHost :many
 -- Used by the VMD disk reconciler so a sandbox destroyed within the grace
@@ -550,6 +561,16 @@ RETURNING *;
 -- only, a failed resume returns the row to paused with the deadline it had,
 -- and activation clears it.
 -- 0 rows: not paused, or another resume claimed it.
+--
+-- covered_backup_generation names the generation VERIFIED to cover this
+-- exact snapshot (not "the sandbox's latest backup" — see
+-- paused_unbacked_count's identical join in hosts.sql for why that
+-- distinction matters), so a fetch-before-resume-enabled host knows what
+-- to restore if its local disk is missing the snapshot. Folded in here
+-- rather than a second query so the hot resume path stays a single round
+-- trip even though most resumes have no use for the value. '' — the
+-- common case, no report has verified coverage of this pause yet — means
+-- fetch-before-resume has nothing to offer, not an error.
 UPDATE sandbox
 SET status = 'resuming', updated_at = now()
 FROM (
@@ -566,7 +587,13 @@ FROM (
          COALESCE(pp.ports, '{}')::int[] AS port_numbers,
          COALESCE(pp.accesses, '{}')::text[] AS port_accesses,
          COALESCE(pp.token_versions, '{}')::bigint[] AS port_token_versions,
-         t.base_path AS template_base_path
+         t.base_path AS template_base_path,
+         COALESCE((SELECT bg.generation FROM backup_generation bg
+          WHERE bg.sandbox_id = s.sandbox_id
+            AND bg.covered_snapshot_id = s.id
+            AND bg.covered_snapshot_generation = s.generation
+          ORDER BY bg.reported_at DESC
+          LIMIT 1), ''::text)::text AS covered_backup_generation
   FROM sandbox sb
   LEFT JOIN snapshot s ON s.id = sb.snapshot_id AND s.team_id = sb.team_id
   LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = sb.id
@@ -588,7 +615,7 @@ RETURNING sqlc.embed(sandbox),
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path;
+          x.template_base_path, x.covered_backup_generation;
 
 -- name: RecordSandboxSecretEnv :exec
 -- Bookkeeping after a successful secrets injection: what the guest now

@@ -925,17 +925,18 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 		}
 		return r, id, flips
 	}
-	// input builds a paused row plus the batched snapshot-path map that
+	// input builds a paused row plus the batched snapshot-info map that
 	// resolvePausedSnapshotPaths would supply in production (path is a
-	// missing file, so Drift 4 evaluates the miss).
-	input := func(t *testing.T, id string) (map[string]db.ListSandboxesByHostRow, map[uuid.UUID]string) {
+	// missing file, so Drift 4 evaluates the miss; not a fetchable partial
+	// miss by default, so existing cases still exercise proven absence).
+	input := func(t *testing.T, id string) (map[string]db.ListSandboxesByHostRow, map[uuid.UUID]pausedSnapshotInfo) {
 		t.Helper()
 		sbID := uuid.MustParse(id)
 		snapPath := filepath.Join(t.TempDir(), "gone.snap")
 		return map[string]db.ListSandboxesByHostRow{
 				id: {ID: sbID, Status: db.SandboxStatusPaused, SnapshotID: pgtype.UUID{Bytes: sbID, Valid: true}},
-			}, map[uuid.UUID]string{
-				sbID: snapPath,
+			}, map[uuid.UUID]pausedSnapshotInfo{
+				sbID: {Path: snapPath},
 			}
 	}
 	stubStat := func(t *testing.T, present, missing bool) {
@@ -996,6 +997,45 @@ func TestFailMissingSnapshots_LockWindow(t *testing.T) {
 		r.failMissingSnapshots(context.Background(), zerolog.Nop(), dbRows, paths, time.Now())
 		if len(*flips) != 0 {
 			t.Fatalf("a locked VM must defer, got %v", *flips)
+		}
+	})
+
+	// A fetchable partial miss (vmstate.snap gone, mem.snap still local, a
+	// verified backup generation covers this exact snapshot) must defer
+	// rather than fail — resumeVMLocked's fetch-on-resume trigger can still
+	// bring this sandbox back. Only when the recovery path is actually gone
+	// (mem.snap absent, or no covered generation) does proven absence flip.
+	t.Run("a fetchable partial miss defers instead of failing", func(t *testing.T) {
+		r, id, flips := newFixture(t)
+		stubStat(t, false, true) // vmstate.snap proven absent
+		dbRows, infos := input(t, id)
+		sbID := uuid.MustParse(id)
+		memPath := filepath.Join(t.TempDir(), "mem.snap")
+		if err := os.WriteFile(memPath, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write mem.snap: %v", err)
+		}
+		info := infos[sbID]
+		info.MemPath = memPath
+		info.Covered = true
+		infos[sbID] = info
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), dbRows, infos, time.Now())
+		if len(*flips) != 0 {
+			t.Fatalf("a fetchable partial miss must not be failed, got %v", *flips)
+		}
+	})
+
+	t.Run("covered but mem.snap also gone still flips", func(t *testing.T) {
+		r, id, flips := newFixture(t)
+		stubStat(t, false, true)
+		dbRows, infos := input(t, id)
+		sbID := uuid.MustParse(id)
+		info := infos[sbID]
+		info.MemPath = filepath.Join(t.TempDir(), "also-gone.snap") // never written
+		info.Covered = true
+		infos[sbID] = info
+		r.failMissingSnapshots(context.Background(), zerolog.Nop(), dbRows, infos, time.Now())
+		if len(*flips) != 1 {
+			t.Fatalf("a real loss must still flip even when a generation is covered, got %v", *flips)
 		}
 	})
 }
