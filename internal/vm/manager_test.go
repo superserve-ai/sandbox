@@ -157,12 +157,13 @@ func (f *fakeNetMgr) TeardownVMOrNamespace(vmID, fallbackNamespace string) {
 // stale combination could clobber the per-VM overlay.
 func TestPlanRestore(t *testing.T) {
 	tests := []struct {
-		name       string
-		basePath   string
-		deltaDir   string
-		inPlace    bool
-		wantAction restoreDiskAction
-		wantDelta  string
+		name        string
+		basePath    string
+		deltaDir    string
+		inPlace     bool
+		priorRunDir bool
+		wantAction  restoreDiskAction
+		wantDelta   string
 	}{
 		{
 			name:       "create-from-template: fresh overlay, hydrate from delta",
@@ -181,12 +182,21 @@ func TestPlanRestore(t *testing.T) {
 			wantDelta:  "",
 		},
 		{
-			name:       "in-place resume: reuse, force-empty delta even if caller passes one",
+			name:        "in-place resume: reuse, force-empty delta even if caller passes one",
+			basePath:    "/run/templates/t/b/base.ext4",
+			deltaDir:    "/snap/templates/t/b",
+			inPlace:     true,
+			priorRunDir: true,
+			wantAction:  restoreReuseOverlay,
+			wantDelta:   "",
+		},
+		{
+			name:       "in-place retry after a cleaned-up failure → build the overlay again",
 			basePath:   "/run/templates/t/b/base.ext4",
 			deltaDir:   "/snap/templates/t/b",
 			inPlace:    true,
-			wantAction: restoreReuseOverlay,
-			wantDelta:  "",
+			wantAction: restoreCreateOverlay,
+			wantDelta:  "/snap/templates/t/b",
 		},
 		{
 			name:       "legacy: no overlay fields → resolve disk the old way",
@@ -199,7 +209,7 @@ func TestPlanRestore(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := planRestore(tc.basePath, tc.deltaDir, tc.inPlace)
+			got := planRestore(tc.basePath, tc.deltaDir, tc.inPlace && tc.priorRunDir)
 			if got.action != tc.wantAction {
 				t.Errorf("action = %v, want %v", got.action, tc.wantAction)
 			}
@@ -3191,5 +3201,38 @@ func TestReattachRecord_CgroupRecordOverFallbackUnit_NotReleased(t *testing.T) {
 	}
 	if kept, _ := store.Get("vm-1"); kept != nil {
 		t.Fatal("release must delete the record")
+	}
+}
+
+func TestRestoreVMSnapshot_FailedAttemptWithoutRunDir_StartsOver(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The first attempt failed after cleanup removed its rundir; the same-ID
+	// retry must not be treated as an in-place restart of it. A missing base
+	// stops the fresh path at the overlay step, which is all this needs.
+	basePath := filepath.Join(dir, "missing-base.ext4")
+	failed := &VMInstance{ID: "vm-1", Status: StatusError, SnapshotPath: snapPath, MemFilePath: memPath}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		cfg:        ManagerConfig{RunDir: filepath.Join(dir, "rundir")},
+		vms:        map[string]*VMInstance{"vm-1": failed},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	_, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath, DeltaDir: dir}, nil, "team", "owner", "", nil, 0)
+	if err == nil || !strings.Contains(err.Error(), "stat base") {
+		t.Fatalf("retry after a cleaned-up failure must start over from the base, got %v", err)
+	}
+	mgr.mu.RLock()
+	cur := mgr.vms["vm-1"]
+	mgr.mu.RUnlock()
+	if cur == failed {
+		t.Fatal("the failed instance must be dropped before the retry")
 	}
 }
