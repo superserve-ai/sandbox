@@ -3410,6 +3410,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// the in-flight one) so failed attempts — which can consume most of the
 	// restore deadline — form the phase tails instead of vanishing.
 	restorePhasesRecorded := false
+	// Phases of a frozen image's restore are labelled so the two kinds can be
+	// compared side by side; set once the manifest is read, before any phase
+	// that follows it, and seen by the failure recorder below.
+	restoreMode := ""
 	var attempt int
 	var tDiskReady, tNetReady, tFcReady, tAttemptStart, tFailBoundary time.Time
 	defer func() {
@@ -3447,7 +3451,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				phases["net_to_fc"] = end.Sub(tNetReady)
 			}
 		}
-		m.recordPhases("restore", "", phases)
+		m.recordPhases("restore", restoreMode, phases)
 	}()
 	// Cold/hot segmentation tags for the phase log, sampled once (not per
 	// attempt): concurrency, template-cache age, and host CPU/mem pressure.
@@ -3524,9 +3528,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	restoreWorkloadFrozen := manifest != nil && manifest.WorkloadFrozen
 	restoreGuestCorrects := manifest != nil && manifest.GuestCorrectsClock
-	// Phases of a frozen image's restore are labelled so the two kinds can be
-	// compared side by side.
-	restoreMode := ""
 	if restoreWorkloadFrozen {
 		restoreMode = "frozen"
 	}

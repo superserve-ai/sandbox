@@ -2711,6 +2711,26 @@ func TestFrozenRestoreRecordsItsPhasesAsFrozen(t *testing.T) {
 			t.Errorf("%s mode = %q, want frozen; phases = %+v", phase, mode, sink.phases)
 		}
 	}
+
+	// A frozen restore that fails during its setup is labelled the same way:
+	// its failed phases belong in the frozen tail, not the legacy one.
+	failing := &phaseSink{}
+	f := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{RunDir: t.TempDir(), GuestClockFreezeEnabled: true}, netMgr: &fakeNetMgr{}, vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1), recorder: failing}
+	f.clockRealtimeCapable.Store(true)
+	f.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		return 0, SupervisionUnit, errors.New("launch refused")
+	}
+	if _, err := f.RestoreVMSnapshot(context.Background(), "vm-2", snapPath, memPath, VMConfig{BasePath: basePath}, nil, "team", "owner", "", nil, 0); err == nil {
+		t.Fatal("want the launch failure")
+	}
+	if len(failing.phases) == 0 {
+		t.Fatal("a failed restore recorded no phases")
+	}
+	for _, ph := range failing.phases {
+		if ph.Mode != "frozen" {
+			t.Errorf("failed restore's %s mode = %q, want frozen", ph.Phase, ph.Mode)
+		}
+	}
 }
 
 // Recovery of an intent without a token, an unfrozen rewrite the crash
