@@ -25,6 +25,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/authz"
+	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -628,6 +629,16 @@ func (h *Handlers) getTeamBillingUsage(c *gin.Context, platform bool) {
 		respondErrorMsg(c, "bad_request", err.Error(), http.StatusBadRequest)
 		return
 	}
+	if strings.TrimSpace(c.Query("period_start")) == "" && strings.TrimSpace(c.Query("period_end")) == "" {
+		if account, accountErr := h.DB.GetTeamBillingAccount(c.Request.Context(), teamID); accountErr == nil && account.CommercialBillingAnchor.Valid {
+			if start, end, anchored := billing.AnniversaryPeriod(account.CommercialBillingAnchor.Time, h.nowUTC()); anchored {
+				periodStart, periodEnd = start, end
+			}
+		} else if accountErr != nil && !errors.Is(accountErr, pgx.ErrNoRows) {
+			respondError(c, ErrInternal)
+			return
+		}
+	}
 	usage, period, err := h.readBillingSnapshot(c.Request.Context(), teamID, periodStart, periodEnd)
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read billing snapshot failed")
@@ -658,6 +669,14 @@ func (h *Handlers) listTeamBillingPeriods(c *gin.Context, platform bool) {
 	}
 	now := h.nowUTC()
 	currentStart, currentEnd := currentBillingPeriod(now)
+	if account, accountErr := h.DB.GetTeamBillingAccount(c.Request.Context(), teamID); accountErr == nil && account.CommercialBillingAnchor.Valid {
+		if start, end, anchored := billing.AnniversaryPeriod(account.CommercialBillingAnchor.Time, now); anchored {
+			currentStart, currentEnd = start, end
+		}
+	} else if accountErr != nil && !errors.Is(accountErr, pgx.ErrNoRows) {
+		respondError(c, ErrInternal)
+		return
+	}
 	if _, _, err := h.upsertBillingSnapshot(c.Request.Context(), teamID, currentStart, currentEnd); err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("seed current billing period failed")
 		respondError(c, ErrInternal)
@@ -1401,8 +1420,19 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
+	checkoutAccount, err := h.DB.BeginTeamBillingCheckout(c.Request.Context(), teamID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			respondErrorMsg(c, "conflict", "another checkout is already in progress", http.StatusConflict)
+			return
+		}
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("begin Stripe checkout failed")
+		respondError(c, ErrInternal)
+		return
+	}
 	claimedAccount, err := h.DB.ClaimStripeCheckoutActor(c.Request.Context(), db.ClaimStripeCheckoutActorParams{TeamID: teamID, ActorID: pgtype.UUID{Bytes: actorID, Valid: true}})
 	if err != nil {
+		_ = h.DB.FinishTeamBillingCheckout(c.Request.Context(), teamID)
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("claim Stripe checkout actor failed")
 		respondError(c, ErrInternal)
 		return
@@ -1416,8 +1446,16 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		PriceIDs:          priceIDs,
 		Metadata:          map[string]string{"activation_user_id": checkoutActor.String()},
 		IdempotencyKey:    checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs),
+		BackdateStartDate: func() *time.Time {
+			if checkoutAccount.CheckoutAnchorSnapshot.Valid {
+				anchor := checkoutAccount.CheckoutAnchorSnapshot.Time
+				return &anchor
+			}
+			return nil
+		}(),
 	})
 	if err != nil {
+		_ = h.DB.FinishTeamBillingCheckout(c.Request.Context(), teamID)
 		if strings.Contains(err.Error(), " returned 4") || strings.Contains(strings.ToLower(err.Error()), "not configured") {
 			_ = h.DB.ReleaseStripeCheckoutActor(c.Request.Context(), db.ReleaseStripeCheckoutActorParams{TeamID: teamID, ActorID: pgtype.UUID{Bytes: actorID, Valid: true}})
 		}
@@ -1425,6 +1463,7 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		respondErrorMsg(c, "bad_gateway", "Stripe checkout session creation failed", http.StatusBadGateway)
 		return
 	}
+	_ = h.DB.SetTeamBillingCheckoutSession(c.Request.Context(), db.SetTeamBillingCheckoutSessionParams{TeamID: teamID, SessionID: stringPtr(session.ID)})
 	c.JSON(http.StatusOK, billingSessionResponse{ID: session.ID, URL: session.URL})
 }
 
@@ -2074,12 +2113,18 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, q *db.Queries,
 			return wrapStripePromotionReservationError(processErr, promotionReservationAttempted, account.TeamID, uuid.UUID(activationUser.Bytes))
 		}
 		_, err = q.UpsertTeamBillingAccountSubscription(ctx, db.UpsertTeamBillingAccountSubscriptionParams{
-			TeamID:                    account.TeamID,
-			StripeCustomerID:          stringPtr(obj.Customer),
-			StripeSubscriptionID:      stringPtr(obj.ID),
-			StripeSubscriptionStatus:  stringPtr(obj.Status),
-			CurrentPeriodStart:        periodStart,
-			CurrentPeriodEnd:          periodEnd,
+			TeamID:                   account.TeamID,
+			StripeCustomerID:         stringPtr(obj.Customer),
+			StripeSubscriptionID:     stringPtr(obj.ID),
+			StripeSubscriptionStatus: stringPtr(obj.Status),
+			CurrentPeriodStart:       periodStart,
+			CurrentPeriodEnd:         periodEnd,
+			CommercialBillingAnchor: func() pgtype.Timestamptz {
+				if ok {
+					return timestamptzFromUnix(start)
+				}
+				return pgtype.Timestamptz{}
+			}(),
 			CancelAtPeriodEnd:         boolPtr(obj.CancelAtPeriodEnd),
 			StripeSubscriptionEventAt: timestamptzFromUnix(int64(event.Created)),
 		})

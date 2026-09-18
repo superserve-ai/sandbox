@@ -2627,6 +2627,7 @@ INSERT INTO team_billing_account (
     stripe_subscription_event_at,
     current_period_start,
     current_period_end,
+    commercial_billing_anchor,
     cancel_at_period_end
 )
 VALUES (
@@ -2638,7 +2639,8 @@ VALUES (
     $6,
     $7,
     $8,
-    COALESCE($9, false)
+    $9,
+    COALESCE($10, false)
 )
 ON CONFLICT (team_id) DO UPDATE
 SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_account.stripe_customer_id),
@@ -2648,7 +2650,8 @@ SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_acco
     stripe_subscription_event_at = COALESCE(EXCLUDED.stripe_subscription_event_at, team_billing_account.stripe_subscription_event_at),
     current_period_start = COALESCE(EXCLUDED.current_period_start, team_billing_account.current_period_start),
     current_period_end = COALESCE(EXCLUDED.current_period_end, team_billing_account.current_period_end),
-    cancel_at_period_end = COALESCE($9, team_billing_account.cancel_at_period_end),
+    commercial_billing_anchor = COALESCE(team_billing_account.commercial_billing_anchor, EXCLUDED.commercial_billing_anchor),
+    cancel_at_period_end = COALESCE($10, team_billing_account.cancel_at_period_end),
     updated_at = now()
 RETURNING team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status, current_period_start, current_period_end, cancel_at_period_end, created_at, updated_at, stripe_invoice_status, stripe_subscription_event_at, trial_ended_at, stripe_activation_credit_granted_at, stripe_activation_credit_grant_id, commercial_billing_anchor, checkout_initializing_at, checkout_anchor_snapshot, checkout_session_id, stripe_activation_user_id, stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id, stripe_checkout_actor_id, stripe_checkout_actor_claimed_at
 `
@@ -2662,6 +2665,7 @@ type UpsertTeamBillingAccountSubscriptionParams struct {
 	StripeSubscriptionEventAt pgtype.Timestamptz `json:"stripe_subscription_event_at"`
 	CurrentPeriodStart        pgtype.Timestamptz `json:"current_period_start"`
 	CurrentPeriodEnd          pgtype.Timestamptz `json:"current_period_end"`
+	CommercialBillingAnchor   pgtype.Timestamptz `json:"commercial_billing_anchor"`
 	CancelAtPeriodEnd         interface{}        `json:"cancel_at_period_end"`
 }
 
@@ -2675,6 +2679,7 @@ func (q *Queries) UpsertTeamBillingAccountSubscription(ctx context.Context, arg 
 		arg.StripeSubscriptionEventAt,
 		arg.CurrentPeriodStart,
 		arg.CurrentPeriodEnd,
+		arg.CommercialBillingAnchor,
 		arg.CancelAtPeriodEnd,
 	)
 	var i TeamBillingAccount
@@ -2708,11 +2713,29 @@ func (q *Queries) UpsertTeamBillingAccountSubscription(ctx context.Context, arg 
 
 const upsertTeamBillingPeriod = `-- name: UpsertTeamBillingPeriod :one
 INSERT INTO team_billing_period (team_id, period_start, period_end, status)
-VALUES (
+SELECT
     $1,
     $2,
     $3,
     $4
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM team_billing_period billed
+    WHERE billed.team_id = $1
+      AND (billed.period_start, billed.period_end) <>
+          ($2, $3)
+      AND (
+          billed.status = 'exported'
+          OR billed.exported_at IS NOT NULL
+          OR (
+              billed.finalized_at IS NOT NULL
+              AND (billed.blocked_reason IS NULL OR billed.blocked_reason NOT IN (
+                  'reporting_only_calendar_period', 'discarded_before_billing_cutover'
+              ))
+          )
+      )
+      AND tstzrange(billed.period_start, billed.period_end, '[)') &&
+          tstzrange($2, $3, '[)')
 )
 ON CONFLICT (team_id, period_start, period_end) DO UPDATE
 SET status = CASE

@@ -434,11 +434,29 @@ FOR UPDATE;
 
 -- name: UpsertTeamBillingPeriod :one
 INSERT INTO team_billing_period (team_id, period_start, period_end, status)
-VALUES (
+SELECT
     sqlc.arg(team_id),
     sqlc.arg(period_start),
     sqlc.arg(period_end),
     sqlc.arg(status)
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM team_billing_period billed
+    WHERE billed.team_id = sqlc.arg(team_id)
+      AND (billed.period_start, billed.period_end) <>
+          (sqlc.arg(period_start), sqlc.arg(period_end))
+      AND (
+          billed.status = 'exported'
+          OR billed.exported_at IS NOT NULL
+          OR (
+              billed.finalized_at IS NOT NULL
+              AND (billed.blocked_reason IS NULL OR billed.blocked_reason NOT IN (
+                  'reporting_only_calendar_period', 'discarded_before_billing_cutover'
+              ))
+          )
+      )
+      AND tstzrange(billed.period_start, billed.period_end, '[)') &&
+          tstzrange(sqlc.arg(period_start), sqlc.arg(period_end), '[)')
 )
 ON CONFLICT (team_id, period_start, period_end) DO UPDATE
 SET status = CASE
@@ -662,6 +680,7 @@ INSERT INTO team_billing_account (
     stripe_subscription_event_at,
     current_period_start,
     current_period_end,
+    commercial_billing_anchor,
     cancel_at_period_end
 )
 VALUES (
@@ -673,6 +692,7 @@ VALUES (
     sqlc.narg(stripe_subscription_event_at),
     sqlc.narg(current_period_start),
     sqlc.narg(current_period_end),
+    sqlc.narg(commercial_billing_anchor),
     COALESCE(sqlc.narg(cancel_at_period_end), false)
 )
 ON CONFLICT (team_id) DO UPDATE
@@ -683,6 +703,7 @@ SET stripe_customer_id = COALESCE(EXCLUDED.stripe_customer_id, team_billing_acco
     stripe_subscription_event_at = COALESCE(EXCLUDED.stripe_subscription_event_at, team_billing_account.stripe_subscription_event_at),
     current_period_start = COALESCE(EXCLUDED.current_period_start, team_billing_account.current_period_start),
     current_period_end = COALESCE(EXCLUDED.current_period_end, team_billing_account.current_period_end),
+    commercial_billing_anchor = COALESCE(team_billing_account.commercial_billing_anchor, EXCLUDED.commercial_billing_anchor),
     cancel_at_period_end = COALESCE(sqlc.narg(cancel_at_period_end), team_billing_account.cancel_at_period_end),
     updated_at = now()
 RETURNING *;
