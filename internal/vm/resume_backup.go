@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -50,6 +51,12 @@ func (m *Manager) pauseArtifactsMissing(vmID, snapshotPath, memPath string) bool
 	defer inst.mu.RUnlock()
 	if inst.Status != StatusPaused {
 		return false
+	}
+	if snapshotPath == "" {
+		snapshotPath = inst.SnapshotPath
+	}
+	if memPath == "" {
+		memPath = inst.MemFilePath
 	}
 	disk := pausedDiskPath(m.cfg.RunDir, vmID, inst.DiskPath, inst.RunDirID, inst.Config.BasePath)
 	return !pauseArtifactsPresent(snapshotPath, memPath, inst.BaseMemPath, disk, inst.Config.BasePath)
@@ -114,7 +121,7 @@ func (m *Manager) backupFlightFor(vmID, anchorKey string, anchor backup.CaptureA
 		if m.backupRestore.Limiter != nil {
 			reader = &backup.LimitedReader{Inner: reader, Limiter: m.backupRestore.Limiter}
 		}
-		cacheDir := filepath.Join(m.backupRestoreRoot, ".base-cache")
+		cacheDir := m.backupBaseDir()
 		reader = &backup.CachingBaseReader{Inner: reader, Dir: cacheDir}
 		log := m.log.With().Str("vm_id", vmID).Logger()
 		f.restored, f.err = backup.FetchMatching(ctx, reader, m.backupLister, vmID, anchor, dest, func(format string, args ...any) {
@@ -125,8 +132,55 @@ func (m *Manager) backupFlightFor(vmID, anchorKey string, anchor backup.CaptureA
 				log.Warn().Err(perr).Msg("backup base cache prune")
 			}
 		}
+		m.sweepPromotedBases(cacheDir)
 	}()
 	return f, nil
+}
+
+func (m *Manager) backupBaseDir() string { return filepath.Join(m.backupRestoreRoot, ".base-cache") }
+
+// promoteBase moves a base materialized inside the staging dir to a path
+// that outlives it: the revived VM keeps reading the base for its whole
+// life, and a later pause or resume must reopen it.
+func (m *Manager) promoteBase(r *backup.Restored, dest string) error {
+	if r.Base == "" || !strings.HasPrefix(r.Base, dest+string(filepath.Separator)) {
+		return nil
+	}
+	if err := os.MkdirAll(m.backupBaseDir(), 0o700); err != nil {
+		return err
+	}
+	stable := filepath.Join(m.backupBaseDir(), filepath.Base(r.Base))
+	if _, err := os.Stat(stable); err != nil {
+		if err := os.Rename(r.Base, stable); err != nil {
+			return err
+		}
+	}
+	r.Base = stable
+	return nil
+}
+
+// sweepPromotedBases drops promoted bases no tracked VM reads any more.
+func (m *Manager) sweepPromotedBases(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	inUse := map[string]bool{}
+	m.mu.RLock()
+	for _, inst := range m.vms {
+		inst.mu.RLock()
+		inUse[inst.Config.BasePath] = true
+		inst.mu.RUnlock()
+	}
+	m.mu.RUnlock()
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), "base-") || !strings.HasSuffix(e.Name(), ".ext4") {
+			continue
+		}
+		if path := filepath.Join(dir, e.Name()); !inUse[path] {
+			_ = os.Remove(path)
+		}
+	}
 }
 
 func (m *Manager) backupFlightDone(vmID string, f *backupFlight) {
@@ -178,6 +232,9 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID string, ancho
 		return nil, status.Errorf(codes.Unavailable, "vm %s: fetch backup: %v", vmID, flight.err)
 	}
 	r := flight.restored
+	if err := m.promoteBase(&r, dest); err != nil {
+		return nil, status.Errorf(codes.Internal, "vm %s: keep restored base: %v", vmID, err)
+	}
 	log := m.log.With().Str("vm_id", vmID).Logger()
 	log.Info().Str("generation", r.Manifest.Generation).Dur("fetch", time.Since(tFetch)).
 		Msg("resume: pause artifacts missing on host; reviving from backup")

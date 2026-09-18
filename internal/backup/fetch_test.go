@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -171,5 +172,35 @@ func TestAnchorKeyIsOrderIndependent(t *testing.T) {
 	b := AnchorKey(map[string]string{"y": "2", "x": "1"})
 	if a != b || a == "" || AnchorKey(nil) != "" {
 		t.Fatalf("keys %q %q", a, b)
+	}
+}
+
+func TestFetchMatchingUsesTheHostBaseWithoutDownloadingIt(t *testing.T) {
+	store := newMemBlobs()
+	dir := t.TempDir()
+	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+	basePath := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writePauseFixture(t, dir, "pause A")
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+
+	counter := &countingReader{inner: store}
+	dest := filepath.Join(t.TempDir(), task.SandboxID)
+	got, err := FetchMatching(context.Background(), counter, store, task.SandboxID, anchorFor(task), dest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Base != basePath {
+		t.Fatalf("base = %s, want the host's %s", got.Base, basePath)
+	}
+	for object := range counter.reads {
+		if strings.HasPrefix(object, "bases/") {
+			t.Fatalf("downloaded %s although the host holds the base", object)
+		}
 	}
 }
