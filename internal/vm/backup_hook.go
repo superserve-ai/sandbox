@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"golang.org/x/time/rate"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -76,18 +75,10 @@ func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobL
 }
 
 // sweepRestoreStaging drops staging a previous process left behind: no
-// fetch survives a restart, and a completed one is cheap to redo.
+// fetch survives a restart, and a completed one is cheap to redo. Only the
+// staging subtree this daemon owns is touched, whatever the root is set to.
 func (m *Manager) sweepRestoreStaging() {
-	entries, err := os.ReadDir(m.backupRestoreRoot)
-	if err != nil {
-		return
-	}
-	for _, e := range entries {
-		if e.Name() == filepath.Base(m.backupBaseDir()) {
-			continue
-		}
-		_ = os.RemoveAll(filepath.Join(m.backupRestoreRoot, e.Name()))
-	}
+	_ = os.RemoveAll(m.restoreStagingRoot())
 }
 
 // SetBackupMetrics installs the optional backup metrics recorder. Same

@@ -116,8 +116,10 @@ func (f *backupFlight) claim() { f.claimOnce.Do(func() { close(f.claimed) }) }
 
 func (m *Manager) backupBaseDir() string { return filepath.Join(m.backupRestoreRoot, ".base-cache") }
 
+func (m *Manager) restoreStagingRoot() string { return filepath.Join(m.backupRestoreRoot, "staging") }
+
 func (m *Manager) restoreStagingDir(vmID string) string {
-	return filepath.Join(m.backupRestoreRoot, vmID)
+	return filepath.Join(m.restoreStagingRoot(), vmID)
 }
 
 func (m *Manager) backupFlightFor(vmID, generation string) (*backupFlight, error) {
@@ -257,8 +259,8 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 	inst.mu.RLock()
 	teamID, ownerID, vcpu, memMiB := inst.TeamID, inst.OwnerID, inst.Config.VCPU, inst.Config.MemoryMiB
 	inst.mu.RUnlock()
-	if err := os.MkdirAll(m.backupRestoreRoot, 0o700); err != nil {
-		return nil, status.Errorf(codes.Internal, "restore root: %v", err)
+	if err := os.MkdirAll(m.restoreStagingRoot(), 0o700); err != nil {
+		return nil, status.Errorf(codes.Internal, "restore staging: %v", err)
 	}
 	tFetch := time.Now()
 	flight, err := m.backupFlightFor(vmID, generation)
@@ -284,7 +286,7 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 	log.Info().Str("generation", generation).Dur("fetch", time.Since(tFetch)).
 		Msg("resume: pause artifacts missing on host; reviving from backup")
 	tBoot := time.Now()
-	revived, err := m.reviveVMLocked(ctx, vmID, r.Disk, r.Base, r.Standalone, false, teamID, ownerID, vcpu, memMiB, rules)
+	revived, err := m.reviveVMLocked(ctx, vmID, r.Disk, r.Base, r.Standalone, false, teamID, ownerID, vcpu, memMiB, rules, generation)
 	m.recordPhases("resume", "backup", map[string]time.Duration{"backup_boot": time.Since(tBoot)})
 	if err != nil {
 		// A retry fetches again; the staging copy must not outlive a
@@ -292,10 +294,6 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 		_ = os.RemoveAll(m.restoreStagingDir(vmID))
 		return nil, err
 	}
-	revived.mu.Lock()
-	revived.BackupGeneration = generation
-	revived.mu.Unlock()
-	_, _ = m.persistStateIfPresent(revived)
 	_ = os.RemoveAll(m.restoreStagingDir(vmID))
 	return revived, nil
 }
