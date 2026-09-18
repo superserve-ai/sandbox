@@ -1638,12 +1638,6 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	if err := h.reserveStripePromotionBeforeWebhook(c.Request.Context(), event); err != nil {
-		log.Error().Err(err).Str("event_id", event.ID).Msg("reserve Stripe promotion before webhook processing failed")
-		respondError(c, ErrInternal)
-		return
-	}
-
 	recordTx, err := h.Pool.BeginTx(c.Request.Context(), pgx.TxOptions{})
 	if err != nil {
 		log.Error().Err(err).Str("event_id", event.ID).Msg("begin Stripe webhook record transaction failed")
@@ -1684,6 +1678,11 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 	}
 	if err := recordTx.Commit(c.Request.Context()); err != nil {
 		log.Error().Err(err).Str("event_id", event.ID).Msg("commit Stripe webhook record failed")
+		respondError(c, ErrInternal)
+		return
+	}
+	if err := h.reserveStripePromotionBeforeWebhook(c.Request.Context(), event); err != nil {
+		log.Error().Err(err).Str("event_id", event.ID).Msg("reserve Stripe promotion before webhook processing failed")
 		respondError(c, ErrInternal)
 		return
 	}
