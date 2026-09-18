@@ -5,12 +5,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
+
+	"golang.org/x/time/rate"
 )
 
-// ErrNoBackup reports a sandbox with no completed generation in the bucket.
-var ErrNoBackup = errors.New("no completed backup generation")
+// ErrNoMatchingBackup reports that no completed generation carries every
+// digest the caller recorded for the pause it wants back.
+var ErrNoMatchingBackup = errors.New("no backup generation matches the recorded pause")
 
 // Restored locates a restored generation's bootable disk and its base.
 type Restored struct {
@@ -53,18 +59,115 @@ func RestoredDisk(dir string) (Restored, error) {
 	return r, fmt.Errorf("restore marker lists no rootfs")
 }
 
-// FetchNewest restores the sandbox's newest completed generation into
-// destDir, which must not exist, and resolves its disk.
-func FetchNewest(ctx context.Context, r BlobReader, lister BlobLister, sandboxID, destDir string, progress ProgressFunc) (Restored, error) {
+// FetchMatching restores the newest generation whose manifest carries every
+// digest in anchor into destDir. A completed restore already in destDir
+// that matches is reused; anything else there is discarded first. An empty
+// anchor cannot prove which pause a generation is, so it never matches.
+func FetchMatching(ctx context.Context, r BlobReader, lister BlobLister, sandboxID string, anchor CaptureAnchor, destDir string, progress ProgressFunc) (Restored, error) {
+	if len(anchor) == 0 {
+		return Restored{}, ErrNoMatchingBackup
+	}
+	if done, err := RestoredDisk(destDir); err == nil && anchor.matches(done.Manifest) {
+		return done, nil
+	}
+	if err := os.RemoveAll(destDir); err != nil {
+		return Restored{}, fmt.Errorf("clear restore dir: %w", err)
+	}
 	gens, err := ListGenerations(ctx, lister, sandboxID)
 	if err != nil {
 		return Restored{}, fmt.Errorf("list generations: %w", err)
 	}
-	if len(gens) == 0 {
-		return Restored{}, ErrNoBackup
+	for _, g := range gens {
+		m, err := fetchManifest(ctx, r, sandboxID, g.Generation, func(string, ...any) {})
+		if err != nil {
+			if ctx.Err() != nil {
+				return Restored{}, err
+			}
+			continue
+		}
+		if !anchor.matches(m) {
+			continue
+		}
+		if _, err := RestoreGeneration(ctx, r, sandboxID, g.Generation, destDir, progress); err != nil {
+			return Restored{}, err
+		}
+		return RestoredDisk(destDir)
 	}
-	if _, err := RestoreGeneration(ctx, r, sandboxID, gens[0].Generation, destDir, progress); err != nil {
-		return Restored{}, err
+	return Restored{}, ErrNoMatchingBackup
+}
+
+// AnchorKey is a stable identity for an anchor, for comparing requests.
+func AnchorKey(anchor map[string]string) string {
+	if len(anchor) == 0 {
+		return ""
 	}
-	return RestoredDisk(destDir)
+	parts := make([]string, 0, len(anchor))
+	for name, sha := range anchor {
+		parts = append(parts, name+"="+sha)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ";")
+}
+
+// LimitedReader caps the bytes per second streamed from a blob store.
+type LimitedReader struct {
+	Inner   BlobReader
+	Limiter *rate.Limiter
+}
+
+func (l *LimitedReader) NewReader(ctx context.Context, object string) (io.ReadCloser, error) {
+	rc, err := l.Inner.NewReader(ctx, object)
+	if err != nil {
+		return nil, err
+	}
+	return &limitedReadCloser{limitedReader: limitedReader{r: rc, limiter: l.Limiter, ctx: ctx}, c: rc}, nil
+}
+
+type limitedReadCloser struct {
+	limitedReader
+	c io.Closer
+}
+
+func (l *limitedReadCloser) Close() error { return l.c.Close() }
+
+// PruneBaseCache drops the oldest unpacked bases in a CachingBaseReader
+// directory until the cache fits maxBytes. Candidates and masters in use
+// stay readable through their open descriptors.
+func PruneBaseCache(dir string, maxBytes int64) (removed int, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	type master struct {
+		path string
+		info os.FileInfo
+	}
+	var masters []master
+	var total int64
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), ".unpacked-") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		masters = append(masters, master{filepath.Join(dir, e.Name()), info})
+		total += info.Size()
+	}
+	sort.Slice(masters, func(i, j int) bool { return masters[i].info.ModTime().Before(masters[j].info.ModTime()) })
+	for _, m := range masters {
+		if total <= maxBytes {
+			break
+		}
+		if err := os.Remove(m.path); err != nil {
+			return removed, err
+		}
+		total -= m.info.Size()
+		removed++
+	}
+	return removed, nil
 }

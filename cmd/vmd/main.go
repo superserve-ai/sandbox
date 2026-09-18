@@ -1199,8 +1199,27 @@ func main() {
 			Metrics:     backupMetrics,
 		}
 		// backup_setup: metrics recorder, journal open, GCS storage.NewClient, uploader.
-		gcsReader := backup.NewGCSReader(gcsClient, bucket)
-		mgr.SetBackupRestore(gcsReader, gcsReader, envOrDefault("BACKUP_RESTORE_ROOT", filepath.Join(cfg.SnapshotDir, ".restore")))
+		if envOrDefault("BACKUP_RESTORE_ON_RESUME", "false") == "true" {
+			gcsReader := backup.NewGCSReader(gcsClient, bucket)
+			probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
+			_, perr := gcsReader.List(probeCtx, "sandboxes/.probe/")
+			probeCancel()
+			if perr != nil {
+				log.Error().Err(perr).Str("bucket", bucket).Msg("backup restore on resume disabled: this host cannot read the backup bucket")
+			} else {
+				restoreMbps, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_BANDWIDTH_MBPS", "200"))
+				if restoreMbps <= 0 {
+					restoreMbps = 200
+				}
+				restoreWorkers, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_CONCURRENCY", "2"))
+				cacheGiB, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_CACHE_GIB", "100"))
+				mgr.SetBackupRestore(gcsReader, gcsReader, envOrDefault("BACKUP_RESTORE_ROOT", filepath.Join(cfg.SnapshotDir, ".restore")), vm.BackupRestoreOptions{
+					Concurrency: restoreWorkers,
+					Limiter:     rate.NewLimiter(rate.Limit(restoreMbps)*125000, 32<<20),
+					CacheBytes:  int64(cacheGiB) << 30,
+				})
+			}
+		}
 		st.mark("backup_setup", true, -1)
 		// Staging pins enqueued artifacts so sandbox teardown cannot
 		// erase a queued generation; the sweep clears residue from

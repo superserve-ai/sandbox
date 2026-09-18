@@ -112,6 +112,7 @@ type VMInstance struct {
 	Unverified     bool   // Running persisted before boxd readiness (see VMRecord)
 	RevivalPending bool   // revival attempt in flight (see VMRecord)
 	RevivedDisk    string // resolved salvage path of a completed revival (see VMRecord)
+	BackupAnchor   string // recorded pause a backup-backed resume booted from (see VMRecord)
 	Config         VMConfig
 	RunDirID       string // Directory name under RunDir for this VM's files.
 	Namespace      string // Network namespace name.
@@ -447,6 +448,10 @@ type Manager struct {
 	backupReader      backup.BlobReader
 	backupLister      backup.BlobLister
 	backupRestoreRoot string
+	backupRestore     BackupRestoreOptions
+	backupFetchSem    chan struct{}
+	backupFlightsMu   sync.Mutex
+	backupFlights     map[string]*backupFlight
 	// backupStaging is the uploader-visible staging tree: where a
 	// finished generation ends up for the uploader to hash and stream
 	// from, and where the at-rest/backfill worker path (StageTask)

@@ -77,6 +77,16 @@ resource "google_storage_bucket_iam_member" "writer_create" {
   member = each.value
 }
 
+# A runtime that writes pause backups reads them back when a resume finds
+# the pause artifacts gone from the host.
+resource "google_storage_bucket_iam_member" "writer_view" {
+  for_each = toset(var.writer_members)
+
+  bucket = google_storage_bucket.backup.name
+  role   = "roles/storage.objectViewer"
+  member = each.value
+}
+
 # Operator restore tooling uses a separate per-cell identity. Restore tooling and drills impersonate
 # it; the impersonation grants are managed out-of-band (admin-held, same
 # pattern as the KMS grants) so the shared runtime identity never gains read.

@@ -995,8 +995,16 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// earlier attempt's VM attests the same way.
 	var attested vmdclient.ResumeAttestation
 	statelessFallback := false
+	// The recorded pause digests let the host stand a backup in for lost
+	// artifacts only when it is provably this pause.
+	backupAnchor := map[string]string{}
+	if rows, aerr := h.DB.LatestSnapshotManifest(c.Request.Context(), sandboxID); aerr == nil {
+		for _, r := range rows {
+			backupAnchor[r.FileName] = r.Sha256
+		}
+	}
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), sandbox.HostID, func(ctx context.Context) (string, uint32, uint32, error) {
-		ip, vcpu, memMiB, att, rerr := vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig, resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision)
+		ip, vcpu, memMiB, att, rerr := vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig, resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, backupAnchor)
 		attested = att
 		return ip, vcpu, memMiB, rerr
 	})

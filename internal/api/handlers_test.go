@@ -108,7 +108,7 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir, pauseToken
 	}
 	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
-func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
+func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
 	if s.resumePolicyFn != nil {
 		s.resumePolicyFn(previewAccess, previewPorts, previewPolicyRevision)
 	}
