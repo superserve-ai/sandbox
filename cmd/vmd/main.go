@@ -2004,19 +2004,10 @@ func main() {
 	// background work logs may come ahead of it.
 	close(postReady)
 
-	// After the readiness line: the namespace scan scales with fleet size.
-	go func() {
-		defer sentrylog.Recover("neigh-table-check")
-		neighCap, err := readNeighTableCap()
-		if err != nil {
-			return
-		}
-		liveNetns, _, _ := netMgr.NetnsStats()
-		if short := neighTableShortfall(neighCap, liveNetns, netPoolFresh); short > 0 {
-			log.Error().Int("gc_thresh3", neighCap).Int("netns", liveNetns).Int("shortfall", short).
-				Msg("kernel neighbour table cap is too small for this host; raise net.ipv4.neigh.default.gc_thresh3")
-		}
-	}()
+	if neighCap, err := readNeighTableCap(); err == nil && neighCap <= kernelDefaultNeighTableCap {
+		log.Error().Int("gc_thresh3", neighCap).
+			Msg("kernel neighbour table cap is at the default; raise net.ipv4.neigh.default.gc_thresh3 or guests drop off the host under bursts")
+	}
 
 	// Leak gauge for network namespaces — independent of the launcher path.
 	// Started AFTER readiness (and so after StartPool): its immediate first

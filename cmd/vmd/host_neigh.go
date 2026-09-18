@@ -8,22 +8,9 @@ import (
 
 const neighTableCapPath = "/proc/sys/net/ipv4/neigh/default/gc_thresh3"
 
-// The cap must leave headroom over a neighbour entry per namespace, counting
-// what is on disk plus what the warm pool may still build, and never sit near
-// the kernel default a rebuilt host boots with, or guests drop off the host
-// under bursts.
-const neighTableFloor = 4096
-
-func neighTableShortfall(cap, netns, poolTarget int) int {
-	if poolTarget <= 0 {
-		poolTarget = 32
-	}
-	need := max(2*(netns+poolTarget), neighTableFloor)
-	if cap >= need {
-		return 0
-	}
-	return need - cap
-}
+// A host still at the kernel default was not provisioned; every slot is a
+// host-side veth with its own neighbour entry and bursts overflow 1024.
+const kernelDefaultNeighTableCap = 1024
 
 func readNeighTableCap() (int, error) {
 	b, err := os.ReadFile(neighTableCapPath)
