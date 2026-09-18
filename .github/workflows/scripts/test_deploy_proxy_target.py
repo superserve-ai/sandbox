@@ -57,7 +57,7 @@ class ProxyTargetTests(unittest.TestCase):
         standby = env["DEPLOY_EVENT"] == "workflow_dispatch" and env["DEPLOY_TARGET"] == "standby"
         self.assertEqual(env["VMD_LABEL"], f'component=vmd-{env["DEPLOY_CELL"]}-standby' if standby else "component=vmd")
         if env["DEPLOY_CELL"] != "staging":
-            self.assertEqual(env["PEER_PROXY_LISTEN_ADDR"], "auto" if standby or env.get("PEER_ROUTING_ENABLED") == "1" or env.get("PEER_INGRESS_ENABLED") == "1" else "")
+            self.assertEqual(env["PEER_PROXY_LISTEN_ADDR"], "auto" if standby or env.get("PEER_INGRESS_ENABLED") == "1" else "")
             if standby:
                 self.assertEqual(env.get("PEER_IDENTITY_HOSTS", ""), identity_policy)
         selected = []
@@ -91,7 +91,7 @@ class ProxyTargetTests(unittest.TestCase):
                                              DEPLOY_CELL=cell, GCP_REGION=region),
                                  (0, ["example-serving"]))
 
-    def test_routing_enabled_push_preserves_serving_ingress(self):
+    def test_routing_enabled_push_does_not_enable_serving_ingress(self):
         for cell, region in (("usw2", "us-west2"), ("use4", "us-east4")):
             self.assertEqual(self.select(f"example-serving,{region}-a\n",
                                          DEPLOY_EVENT="push", DEPLOY_TARGET="serving",
@@ -112,7 +112,7 @@ class ProxyTargetTests(unittest.TestCase):
             self.assertEqual(routing_expression, f"vars.{routing_vars[cell]}")
             self.assertIn("PROXY_DATABASE_URL: ${{ secrets." + database_secrets[cell] + " }}", step)
             for staging, east, west, east_ingress, west_ingress, staging_listener, event, target in product(
-                    ("", "0", "1"), ("", "0", "1"), ("", "0", "1"), ("", "1"), ("", "1"),
+                    ("", "0", "1"), ("", "0", "1"), ("", "0", "1"), ("", "0", "1"), ("", "0", "1"),
                     ("", "auto"), ("push", "workflow_dispatch"), ("serving", "standby")):
                 variables = dict(PEER_ROUTING_ENABLED=staging, PEER_ROUTING_ENABLED_USE4=east,
                                  PEER_ROUTING_ENABLED_USW=west, PEER_INGRESS_ENABLED_PROD=east_ingress,
@@ -129,7 +129,7 @@ class ProxyTargetTests(unittest.TestCase):
                         expected = "auto" if staging == "1" else staging_listener
                     else:
                         ingress = east_ingress if cell == "use4" else west_ingress
-                        expected = "auto" if routing == "1" or ingress == "1" or (
+                        expected = "auto" if ingress == "1" or (
                             event == "workflow_dispatch" and target == "standby") else ""
                     self.assertEqual(listener, expected)
 
