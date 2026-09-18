@@ -3553,6 +3553,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 
 	m.mu.Lock()
 	prevInst, inPlace := m.vms[vmID]
+	// A tracked instance with no rundir is a failed attempt whose cleanup
+	// already ran; restarting it in place would need the overlay that
+	// cleanup removed, so the retry starts over.
+	if inPlace && !priorRunDir {
+		delete(m.vms, vmID)
+		prevInst, inPlace = nil, false
+	}
 	prevSupervision := SupervisionUnit
 	if inPlace {
 		prevInst.mu.RLock()

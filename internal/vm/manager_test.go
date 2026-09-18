@@ -3193,3 +3193,36 @@ func TestReattachRecord_CgroupRecordOverFallbackUnit_NotReleased(t *testing.T) {
 		t.Fatal("release must delete the record")
 	}
 }
+
+func TestRestoreVMSnapshot_FailedAttemptWithoutRunDir_StartsOver(t *testing.T) {
+	dir := t.TempDir()
+	snapPath := filepath.Join(dir, "vmstate.snap")
+	memPath := filepath.Join(dir, "mem.snap")
+	for _, p := range []string{snapPath, memPath} {
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The first attempt failed after cleanup removed its rundir; the same-ID
+	// retry must not be treated as an in-place restart of it. A missing base
+	// stops the fresh path at the overlay step, which is all this needs.
+	basePath := filepath.Join(dir, "missing-base.ext4")
+	failed := &VMInstance{ID: "vm-1", Status: StatusError, SnapshotPath: snapPath, MemFilePath: memPath}
+	mgr := &Manager{
+		log:        zerolog.Nop(),
+		cfg:        ManagerConfig{RunDir: filepath.Join(dir, "rundir")},
+		vms:        map[string]*VMInstance{"vm-1": failed},
+		restoreSem: make(chan struct{}, 1),
+	}
+
+	_, err := mgr.RestoreVMSnapshot(context.Background(), "vm-1", snapPath, memPath, VMConfig{BasePath: basePath, DeltaDir: dir}, nil, "team", "owner", "", nil, 0)
+	if err == nil || !strings.Contains(err.Error(), "stat base") {
+		t.Fatalf("retry after a cleaned-up failure must start over from the base, got %v", err)
+	}
+	mgr.mu.RLock()
+	cur := mgr.vms["vm-1"]
+	mgr.mu.RUnlock()
+	if cur == failed {
+		t.Fatal("the failed instance must be dropped before the retry")
+	}
+}
