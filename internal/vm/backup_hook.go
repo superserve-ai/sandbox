@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"golang.org/x/time/rate"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,10 +41,27 @@ func (m *Manager) SetBackupEnqueue(fn func(backup.Task) error) {
 	m.backupEnqueue = fn
 }
 
+// BackupRestoreOptions bound what a wave of backup-backed resumes may take
+// from the host.
+type BackupRestoreOptions struct {
+	Concurrency int           // fetches in flight at once
+	Limiter     *rate.Limiter // download bytes per second, shared by all fetches
+	CacheBytes  int64         // unpacked template bases kept between restores
+	FetchBudget time.Duration // a fetch outlives the RPC that started it up to this
+}
+
 // SetBackupRestore enables reviving a paused sandbox from its bucket backup
 // when the pause artifacts are gone from the host; root is the staging tree.
-func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobLister, root string) {
-	m.backupReader, m.backupLister, m.backupRestoreRoot = reader, lister, root
+func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobLister, root string, opts BackupRestoreOptions) {
+	if opts.Concurrency <= 0 {
+		opts.Concurrency = 2
+	}
+	if opts.FetchBudget <= 0 {
+		opts.FetchBudget = 15 * time.Minute
+	}
+	m.backupReader, m.backupLister, m.backupRestoreRoot, m.backupRestore = reader, lister, root, opts
+	m.backupFetchSem = make(chan struct{}, opts.Concurrency)
+	m.backupFlights = map[string]*backupFlight{}
 }
 
 // SetBackupMetrics installs the optional backup metrics recorder. Same
