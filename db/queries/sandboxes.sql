@@ -590,6 +590,45 @@ RETURNING sqlc.embed(sandbox),
           x.port_numbers, x.port_accesses, x.port_token_versions,
           x.template_base_path;
 
+-- name: ResumePostBootCheck :one
+-- The two reads a resume makes after the boot, in one statement: the
+-- sandbox's current preview policy (its revision proves whether a mutation
+-- landed during the boot) and whether the host still meets the claim
+-- policy's capability requirement. Unlocked, like the create pre-flight:
+-- nothing is pinned across a commit here, and the host row lock would only
+-- queue behind the heartbeat writer. host_eligible is meaningful only for a
+-- non-empty required set; the caller ignores it for a legacy policy.
+WITH target_host AS MATERIALIZED (
+  SELECT host.id, host.last_heartbeat_at
+  FROM host
+  WHERE host.id = sqlc.arg('host_id')
+    AND host.status = ANY(sqlc.arg('allowed_statuses')::text[])
+    AND host.last_heartbeat_at IS NOT NULL
+    AND host.last_heartbeat_at > sqlc.arg('heartbeat_after')::timestamptz
+)
+SELECT
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
+  COALESCE(p.access, 'legacy_public')::text AS wire_access,
+  COALESCE(p.revision, 0)::bigint AS revision,
+  EXISTS (
+    SELECT 1
+    FROM target_host h
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM unnest(sqlc.arg('required_capabilities')::text[]) AS required(capability)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM host_capability hc
+        WHERE hc.host_id = h.id
+          AND hc.capability = required.capability
+          AND hc.heartbeat_at = h.last_heartbeat_at
+      )
+    )
+  ) AS host_eligible
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.id = sqlc.arg('id') AND s.team_id = sqlc.arg('team_id') AND s.destroyed_at IS NULL;
+
 -- name: RecordSandboxSecretEnv :exec
 -- Bookkeeping after a successful secrets injection: what the guest now
 -- holds, for the resume-time reuse check. Off the hot path; a lost write
