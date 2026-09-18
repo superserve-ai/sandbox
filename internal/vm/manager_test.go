@@ -209,7 +209,7 @@ func TestPlanRestore(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := planRestore(tc.basePath, tc.deltaDir, tc.inPlace, tc.priorRunDir)
+			got := planRestore(tc.basePath, tc.deltaDir, tc.inPlace && tc.priorRunDir)
 			if got.action != tc.wantAction {
 				t.Errorf("action = %v, want %v", got.action, tc.wantAction)
 			}
