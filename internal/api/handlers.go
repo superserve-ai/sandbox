@@ -786,7 +786,11 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			// operator's boot elsewhere, minutes at worst) is not settled
 			// here: it takes the conflict below and the client retries.
 			if time.Now().Before(deadline) {
-				time.Sleep(activateSettlePoll)
+				select {
+				case <-time.After(activateSettlePoll):
+				case <-c.Request.Context().Done():
+					return nil, ""
+				}
 				continue
 			}
 			respondError(c, ErrInvalidState)
