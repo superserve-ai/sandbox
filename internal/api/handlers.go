@@ -26,6 +26,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/superserve-ai/sandbox/internal/abuse"
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/authz"
@@ -149,12 +150,13 @@ type HostRegistry interface {
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
-	VMD       VMDClient // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
-	DB        *db.Queries
-	Pool      *pgxpool.Pool // required by paths that need their own transaction (e.g. build-concurrency admission)
-	Config    *config.Config
-	Hosts     HostRegistry // when set, routes VMD calls via host_id
-	Scheduler Scheduler    // when set, picks host on create
+	ComputeRestrictions *abuse.ComputeEvaluator
+	VMD                 VMDClient // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
+	DB                  *db.Queries
+	Pool                *pgxpool.Pool // required by paths that need their own transaction (e.g. build-concurrency admission)
+	Config              *config.Config
+	Hosts               HostRegistry // when set, routes VMD calls via host_id
+	Scheduler           Scheduler    // when set, picks host on create
 	// Shadow, when set, receives a sample of creates for capacity
 	// ranking that influences nothing. Offering is a non-blocking
 	// channel send; see ShadowEvaluator.
@@ -760,9 +762,6 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 		case db.SandboxStatusActive:
 			return &sandbox, row.Access
 		case db.SandboxStatusPaused:
-			if !h.requireBillingEligible(c, teamID) {
-				return nil, ""
-			}
 			// The resume returns the post-restore access it pushed to VMD, so
 			// the response reports exactly what the VM enforces.
 			// lookup ends here, from the auth boundary. total covers the resume
@@ -850,6 +849,29 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		}
 		RecordLatencyPhases(c.Request.Context(), "resume", sandbox.HostID, phases)
 	}()
+
+	decision := h.ComputeRestrictions.Evaluate(teamID, abuse.ActionResume)
+	// Explicit resumes normally claim without reading. A denial must first
+	// establish a paused target, preserving missing/state responses and the
+	// existing pause-settle window without adding I/O to allowed resumes.
+	if decision.Outcome == "blocked" && settled != nil {
+		tWait := time.Now()
+		paused := settled()
+		tStart = tStart.Add(time.Since(tWait))
+		if !paused {
+			return "", false
+		}
+	}
+	if rec, ok := currentTelemetryRecorder().(telemetry.ComputeRecorder); ok {
+		rec.RecordComputeDecision(c.Request.Context(), string(abuse.ActionResume), string(decision.Mode), decision.Outcome, decision.SubjectType)
+	}
+	if decision.Outcome == "blocked" {
+		respondErrorMsg(c, "abuse_denied", "Sandbox operation is not permitted", http.StatusForbidden)
+		return "", false
+	}
+	if !h.requireBillingEligible(c, teamID) {
+		return "", false
+	}
 
 	// One statement for the claim and the boot inputs; see ClaimResume.
 	claimParams := db.ClaimResumeParams{
@@ -1456,9 +1478,6 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		return
 	}
 	if !h.requireTeamSandboxWrite(c, teamID) {
-		return
-	}
-	if !h.requireBillingEligible(c, teamID) {
 		return
 	}
 
@@ -2703,7 +2722,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if !h.requireTeamSandboxWrite(c, teamID) {
 		return
 	}
-	if !h.requireBillingEligible(c, teamID) {
+	if !h.requireComputeAllowed(c, teamID, abuse.ActionCreate) || !h.requireBillingEligible(c, teamID) {
 		return
 	}
 

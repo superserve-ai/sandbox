@@ -17,9 +17,10 @@ import (
 
 // Config holds all configuration for the Superserve Sandbox control plane.
 type Config struct {
-	Port        string // API_PORT, default "8080"
-	VMDAddress  string // VMD_GRPC_ADDRESS, default "localhost:50051"
-	DatabaseURL string // DATABASE_URL, required
+	ComputeRestrictionsFile string // COMPUTE_RESTRICTIONS_FILE; empty disables config loading
+	Port                    string // API_PORT, default "8080"
+	VMDAddress              string // VMD_GRPC_ADDRESS, default "localhost:50051"
+	DatabaseURL             string // DATABASE_URL, required
 
 	StripeSecretKey               string   // STRIPE_SECRET_KEY
 	StripeWebhookSecret           string   // STRIPE_WEBHOOK_SECRET (snapshot lifecycle destination)
@@ -111,6 +112,7 @@ func Load() (*Config, error) {
 	checkoutPriceIDs := checkoutPriceIDs()
 
 	cfg := &Config{
+		ComputeRestrictionsFile:       os.Getenv("COMPUTE_RESTRICTIONS_FILE"),
 		Port:                          envOrDefault("API_PORT", "8080"),
 		VMDAddress:                    envOrDefault("VMD_GRPC_ADDRESS", "localhost:50051"),
 		DatabaseURL:                   dbURL,

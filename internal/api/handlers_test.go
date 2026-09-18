@@ -1272,6 +1272,11 @@ func pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID uuid.UUID) db.Sandb
 }
 
 func TestResumeSandbox_LegacyPolicyToleratesOldVMD(t *testing.T) {
+	testResumeSandboxLegacyPolicyToleratesOldVMD(t, nil)
+}
+
+func testResumeSandboxLegacyPolicyToleratesOldVMD(t *testing.T, configure func(*Handlers, uuid.UUID)) {
+	t.Helper()
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
@@ -1329,6 +1334,9 @@ func TestResumeSandbox_LegacyPolicyToleratesOldVMD(t *testing.T) {
 	}
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	if configure != nil {
+		configure(h, teamID)
+	}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
 
@@ -2283,6 +2291,11 @@ func TestActivateSandbox_AlreadyActive_200WithSandboxResponse(t *testing.T) {
 }
 
 func TestActivateSandbox_PausedResumesAndReturns200(t *testing.T) {
+	testActivateSandboxPausedResumesAndReturns200(t, nil)
+}
+
+func testActivateSandboxPausedResumesAndReturns200(t *testing.T, configure func(*Handlers, uuid.UUID)) {
+	t.Helper()
 	sandboxID := uuid.New()
 	teamID := uuid.New()
 	snapshotID := uuid.New()
@@ -2322,6 +2335,9 @@ func TestActivateSandbox_PausedResumesAndReturns200(t *testing.T) {
 		VMD:    vmd,
 		DB:     db.New(mock),
 		Config: &config.Config{SandboxAccessTokenSeed: []byte("test-seed-for-hmac-32-bytes-min!!")},
+	}
+	if configure != nil {
+		configure(h, teamID)
 	}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
@@ -2479,6 +2495,11 @@ func createSandboxReq(body string) *http.Request {
 }
 
 func TestCreateSandbox_Success(t *testing.T) {
+	testCreateSandboxSuccess(t, nil)
+}
+
+func testCreateSandboxSuccess(t *testing.T, configure func(*Handlers, uuid.UUID)) {
+	t.Helper()
 	teamID := uuid.New()
 	sandboxID := uuid.New()
 
@@ -2533,6 +2554,9 @@ func TestCreateSandbox_Success(t *testing.T) {
 	}
 
 	h := &Handlers{VMD: vmd, DB: db.New(mock), Scheduler: scheduler}
+	if configure != nil {
+		configure(h, teamID)
+	}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(`{"name":"my-sandbox"}`))
 
