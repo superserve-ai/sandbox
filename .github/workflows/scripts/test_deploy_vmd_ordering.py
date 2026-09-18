@@ -164,14 +164,14 @@ class BackupStagingDirRollbackTests(unittest.TestCase):
             self.assertIn("OTHER=1", env_file.read_text())
 
     def _switch_block(self, name):
-        match = re.search(rf"# Reconcile {name} .*?\n(?:.*\n)*?\s*fi\n", SOURCE)
-        self.assertIsNotNone(match, f"could not locate the {name} reconcile block")
+        match = re.search(rf"# Upsert {name} .*?\n(?:.*\n)*?\s*fi\n", SOURCE)
+        self.assertIsNotNone(match, f"could not locate the {name} upsert block")
         return match.group(0)
 
-    def test_guest_clock_switches_are_reconciled(self):
-        # Both activation switches follow the BACKUP_BACKFILL contract: the
-        # stale line always goes, and comes back only when the workflow sets
-        # it, so unsetting a switch turns it off on the next deploy.
+    def test_guest_clock_switches_are_upserted_when_set(self):
+        # Both activation switches follow the feature-flag convention: a value
+        # from the workflow replaces the host's line, and an empty one leaves
+        # a line set on the host alone, so a hand-set switch survives deploys.
         for name, q in (
             ("VMD_GUEST_CLOCK_FREEZE", "q_guest_clock_freeze"),
             ("VMD_TEMPLATE_FREEZE_WORKLOAD", "q_template_freeze"),
@@ -190,7 +190,7 @@ class BackupStagingDirRollbackTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     content = env_file.read_text()
-                    self.assertNotIn(f"{name}=stale", content, (name, value))
+                    self.assertEqual(f"{name}=stale" in content, not want_present, (name, value))
                     self.assertEqual(f"{name}=true" in content, want_present, (name, value))
                     self.assertIn("OTHER=1", content)
 
