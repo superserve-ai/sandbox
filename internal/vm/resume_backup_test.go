@@ -301,3 +301,36 @@ func TestSetBackupRestoreSweepsStagingLeftByAPreviousProcess(t *testing.T) {
 		t.Fatal("nothing outside the owned staging subtree may be touched")
 	}
 }
+
+func TestUnclaimedRestoresAreCappedOldestFirst(t *testing.T) {
+	root := t.TempDir()
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, root, BackupRestoreOptions{Concurrency: 1, MaxUnclaimed: 1})
+	mk := func(vmID string, age time.Duration) *backupFlight {
+		touch(t, filepath.Join(mgr.restoreStagingDir(vmID), "rootfs.ext4"))
+		f := &backupFlight{generation: "g", done: make(chan struct{}), claimed: make(chan struct{}), dropped: make(chan struct{}), completedAt: time.Now().Add(-age)}
+		close(f.done)
+		mgr.backupFlights[vmID] = f
+		return f
+	}
+	older := mk("vm-old", time.Minute)
+	newer := mk("vm-new", time.Second)
+
+	mgr.dropUnclaimedBeyondCap()
+
+	if _, err := os.Stat(mgr.restoreStagingDir("vm-old")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the oldest unclaimed restore must be dropped")
+	}
+	if _, err := os.Stat(mgr.restoreStagingDir("vm-new")); err != nil {
+		t.Fatal("the newest unclaimed restore stays within the cap")
+	}
+	select {
+	case <-older.dropped:
+	default:
+		t.Fatal("the dropped flight must be told so its goroutine exits")
+	}
+	if mgr.backupFlights["vm-old"] != nil || mgr.backupFlights["vm-new"] != newer {
+		t.Fatal("only the dropped flight leaves the map")
+	}
+}
