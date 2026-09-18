@@ -574,7 +574,7 @@ FROM (
   LEFT JOIN template t ON t.id = sb.template_id
   LEFT JOIN LATERAL (
     SELECT generation FROM backup_generation
-    WHERE covered_snapshot_id = s.id
+    WHERE covered_snapshot_id = s.id AND covered_snapshot_generation = s.generation
     ORDER BY completed_at DESC LIMIT 1
   ) bg ON true
   LEFT JOIN LATERAL (
