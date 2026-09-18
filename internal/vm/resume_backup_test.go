@@ -230,7 +230,7 @@ func TestResumeFromBackupKeepsTheLocalDiskWhenOnlyAnOlderPauseIsBackedUp(t *test
 	if _, err := os.Stat(disk); err != nil {
 		t.Fatal("the newer local disk must survive a refused restore")
 	}
-	if _, err := os.Stat(filepath.Join(dir, ".restore", "vm-1")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(dir, ".restore", "staging", "vm-1")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("no staging dir may be left behind")
 	}
 }
@@ -285,15 +285,19 @@ func TestResumeVMWithoutAGenerationTellsTheControlPlaneWhatItNeeds(t *testing.T)
 
 func TestSetBackupRestoreSweepsStagingLeftByAPreviousProcess(t *testing.T) {
 	root := t.TempDir()
-	touch(t, filepath.Join(root, "vm-old", "rootfs.ext4"))
+	touch(t, filepath.Join(root, "staging", "vm-old", "rootfs.ext4"))
 	touch(t, filepath.Join(root, ".base-cache", ".unpacked-abc"))
+	bystander := touch(t, filepath.Join(root, "unrelated", "keep.me"))
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
 	store := &slowEmptyStore{}
 	mgr.SetBackupRestore(store, store, root, BackupRestoreOptions{})
-	if _, err := os.Stat(filepath.Join(root, "vm-old")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(root, "staging", "vm-old")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("stale staging must be swept at startup")
 	}
 	if _, err := os.Stat(filepath.Join(root, ".base-cache", ".unpacked-abc")); err != nil {
 		t.Fatal("the base cache must survive startup")
+	}
+	if _, err := os.Stat(bystander); err != nil {
+		t.Fatal("nothing outside the owned staging subtree may be touched")
 	}
 }

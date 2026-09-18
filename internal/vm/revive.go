@@ -51,11 +51,14 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		return nil, err
 	}
 	defer unlock()
-	return m.reviveVMLocked(ctx, vmID, diskPath, basePath, standaloneDisk, allowRecordless, teamID, ownerID, vcpu, memMiB, rules)
+	return m.reviveVMLocked(ctx, vmID, diskPath, basePath, standaloneDisk, allowRecordless, teamID, ownerID, vcpu, memMiB, rules, "")
 }
 
-// reviveVMLocked is ReviveVM under the caller's per-VM op lock.
-func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath string, standaloneDisk, allowRecordless bool, teamID, ownerID string, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
+// reviveVMLocked is ReviveVM under the caller's per-VM op lock. A non-empty
+// backupGeneration names the backup the salvage came from and rides on the
+// record from its first durable write, so a retry after a crash still
+// recognizes the boot as its own.
+func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath string, standaloneDisk, allowRecordless bool, teamID, ownerID string, vcpu, memMiB uint32, rules *sandboxNetworkRules, backupGeneration string) (*VMInstance, error) {
 	// Never revive over a live or healthy VM. A paused VM with its
 	// snapshot is healthy at rest and refused: resume owns that path.
 	if inst, err := m.getInstance(vmID); err == nil {
@@ -439,6 +442,7 @@ func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath s
 		inst.Unverified = true
 		inst.RevivalPending = true
 		inst.RevivedDisk = diskPath
+		inst.BackupGeneration = backupGeneration
 		inst.TeamID = prevRec.TeamID
 		inst.OwnerID = prevRec.OwnerID
 		inst.PreviewAccess = prevRec.PreviewAccess
