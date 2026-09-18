@@ -207,7 +207,8 @@ module "api" {
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
     SUPABASE_URL                = var.supabase_url
-    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host.internal_ip)
+    DEFAULT_HOST_ID             = var.build_host_id
+    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host_b.internal_ip)
     STRIPE_API_BASE_URL         = "https://api.stripe.com"
     STRIPE_CHECKOUT_PRICE_IDS   = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
     STRIPE_API_VERSION          = "2026-05-27.dahlia"
