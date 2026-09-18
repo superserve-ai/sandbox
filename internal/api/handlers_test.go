@@ -5052,7 +5052,7 @@ func sameKeyUnderKid(t *testing.T, s *SecretsSigner, kid string) *SecretsSigner 
 // A browser policy is gated on the host's capability before the claim and
 // again before activation, since the heartbeat can lapse during the boot.
 // The second check runs even when nothing moved the policy meanwhile, as
-// the folded post-boot read, outside any host lock.
+// the folded post-boot read under the host lock.
 func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *testing.T) {
 	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
 	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
@@ -5099,8 +5099,8 @@ func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *test
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: ResumePostBootCheck :one"):
 				postChecks++
-				if transactionOpen {
-					t.Fatal("post-boot check under host lock")
+				if !transactionOpen {
+					t.Fatal("post-boot check outside the host lock")
 				}
 				return resumePostBootRow(preview.AccessPrivate, 8, false)
 			case strings.Contains(sql, "-- name: LockSandboxForPreviewMutation :one"):
@@ -5144,10 +5144,11 @@ func TestResumeSandbox_AttestedBrowserPolicyRechecksHostBeforeActivation(t *test
 }
 
 // On the attested path the post-boot policy read and the owner capability
-// check are one unlocked statement: no separate policy read, no host lock,
-// no transaction. It carries the policy's requirement and the owner-resume
-// host rule, and a host that no longer meets it re-pauses the guest.
-func TestResumeSandbox_PostBootCheckIsOneUnlockedStatement(t *testing.T) {
+// check are one statement, evaluated after the host lock in one short
+// transaction: no separate policy read and no locked check of its own. It
+// carries the policy's requirement and the owner-resume host rule, and a
+// host that no longer meets it re-pauses the guest.
+func TestResumeSandbox_PostBootCheckIsOneStatementUnderTheHostLock(t *testing.T) {
 	for _, eligible := range []bool{true, false} {
 		t.Run(fmt.Sprintf("eligible=%v", eligible), func(t *testing.T) {
 			sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
@@ -5163,14 +5164,11 @@ func TestResumeSandbox_PostBootCheckIsOneUnlockedStatement(t *testing.T) {
 					return "/snapshots/test/vmstate.snap", "/snapshots/test/mem.snap", nil
 				},
 			}
-			postChecks, policyReads, lockedChecks, transactions := 0, 0, 0, 0
+			postChecks, policyReads, lockedChecks := 0, 0, 0
+			var events []string
 			var postArgs []any
 			mock := &mockDBTX{
-				capabilityTxEvent: func(event string) {
-					if event == "begin" {
-						transactions++
-					}
-				},
+				capabilityTxEvent: func(event string) { events = append(events, event) },
 				queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 					switch {
 					case strings.Contains(sql, "-- name: ClaimResume :one"):
@@ -5186,6 +5184,7 @@ func TestResumeSandbox_PostBootCheckIsOneUnlockedStatement(t *testing.T) {
 					case strings.Contains(sql, "-- name: ResumePostBootCheck :one"):
 						postChecks++
 						postArgs = args
+						events = append(events, "read")
 						return resumePostBootRow(preview.AccessPublic, 3, eligible)
 					case strings.Contains(sql, "FinalizePause"):
 						return uuidRow(snapshotID)
@@ -5212,8 +5211,11 @@ func TestResumeSandbox_PostBootCheckIsOneUnlockedStatement(t *testing.T) {
 			if w.Code != wantCode {
 				t.Fatalf("status = %d, want %d: %s", w.Code, wantCode, w.Body.String())
 			}
-			if postChecks != 1 || policyReads != 0 || lockedChecks != 0 || transactions != 0 {
-				t.Fatalf("post-boot checks=%d policy reads=%d locked checks=%d transactions=%d; want 1/0/0/0", postChecks, policyReads, lockedChecks, transactions)
+			if postChecks != 1 || policyReads != 0 || lockedChecks != 0 {
+				t.Fatalf("post-boot checks=%d policy reads=%d locked checks=%d; want 1/0/0", postChecks, policyReads, lockedChecks)
+			}
+			if !slices.Equal(events, []string{"begin", "lock", "read", "commit"}) {
+				t.Fatalf("transaction events = %v, want the read after the host lock in one transaction", events)
 			}
 			if paused != !eligible {
 				t.Fatalf("paused = %v, want %v", paused, !eligible)
@@ -5232,6 +5234,66 @@ func TestResumeSandbox_PostBootCheckIsOneUnlockedStatement(t *testing.T) {
 				t.Fatalf("allowed statuses = %v, want the owner-resume rule", postArgs[4])
 			}
 		})
+	}
+}
+
+// A heartbeat that is withdrawing the capability when the boot finishes has
+// not committed yet. The post-boot read waits on the host lock behind it and
+// sees the withdrawal, so the resume is refused and the guest re-paused.
+func TestResumeSandbox_PostBootCheckSeesAWithdrawalInFlight(t *testing.T) {
+	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HostID = "withdrawing-host-" + uuid.NewString()
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+
+	paused := false
+	vmd := &stubVMD{
+		resumeAttest: vmdclient.ResumeAttestation{PreviewProtocol: preview.HostCapabilityPorts, PreviewPolicyRevision: 3, NetworkRulesApplied: true},
+		pauseFn: func(context.Context, string, string) (string, string, error) {
+			paused = true
+			return "/snapshots/test/vmstate.snap", "/snapshots/test/mem.snap", nil
+		},
+	}
+	// The withdrawal commits while the lock is waited on: before the lock the
+	// capability is still visible, after it the read must see it gone.
+	withdrawn := false
+	mock := &mockDBTX{
+		capabilityTxEvent: func(event string) {
+			if event == "lock" {
+				withdrawn = true
+			}
+		},
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRow(sb, &snap, preview.AccessPublic, 3)
+			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(!withdrawn)
+			case strings.Contains(sql, "-- name: ResumePostBootCheck :one"):
+				return resumePostBootRow(preview.AccessPublic, 3, !withdrawn)
+			case strings.Contains(sql, "FinalizePause"):
+				return uuidRow(snapshotID)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(context.Context, string, ...any) (pgx.Rows, error) { return emptyRows{}, nil },
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 for a capability withdrawn during the boot: %s", w.Code, w.Body.String())
+	}
+	if !paused {
+		t.Fatal("the resumed VM must be re-paused, not left active on a host that withdrew enforcement")
 	}
 }
 

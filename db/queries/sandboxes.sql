@@ -594,10 +594,10 @@ RETURNING sqlc.embed(sandbox),
 -- The two reads a resume makes after the boot, in one statement: the
 -- sandbox's current preview policy (its revision proves whether a mutation
 -- landed during the boot) and whether the host still meets the claim
--- policy's capability requirement. Unlocked, like the create pre-flight:
--- nothing is pinned across a commit here, and the host row lock would only
--- queue behind the heartbeat writer. host_eligible is meaningful only for a
--- non-empty required set; the caller ignores it for a legacy policy.
+-- policy's capability requirement. When that requirement is non-empty,
+-- evaluate it after LockHostForCapabilities in the same transaction, as
+-- HostHasCapabilities is (LockedResumePostBootCheck); host_eligible is
+-- meaningful only then, and the caller ignores it for a legacy policy.
 WITH target_host AS MATERIALIZED (
   SELECT host.id, host.last_heartbeat_at
   FROM host

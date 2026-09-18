@@ -348,22 +348,28 @@ func ownerResumeCapabilitiesFor(policy previewPolicySnapshot) []string {
 
 // resumePostBootCheck is the post-boot policy read and owner capability
 // check of a resume as one statement: the current policy, and a
-// capabilityErr when the host no longer meets what policy requires. A
-// legacy policy requires nothing and is never refused.
+// capabilityErr when the host no longer meets what policy requires. When
+// policy requires anything, the statement runs under the host lock so it
+// follows a heartbeat already withdrawing a capability. A legacy policy
+// requires nothing, reads without the lock, and is never refused.
 func (h *Handlers) resumePostBootCheck(ctx context.Context, sandboxID, teamID uuid.UUID, hostID string, policy previewPolicySnapshot) (current previewPolicySnapshot, capabilityErr, err error) {
 	capabilities := ownerResumeCapabilitiesFor(policy)
+	params := db.ResumePostBootCheckParams{
+		ID: sandboxID, TeamID: teamID, HostID: hostID,
+		AllowedStatuses:      []string{"active", "draining"},
+		HeartbeatAfter:       time.Now().Add(-heartbeatTimeout),
+		RequiredCapabilities: append([]string{}, capabilities...),
+	}
+	var row db.ResumePostBootCheckRow
 	if len(capabilities) > 0 {
 		started := time.Now()
 		defer func() {
 			RecordLatencyPhases(ctx, "resume", hostID, map[string]time.Duration{"host_capability_validation": time.Since(started)})
 		}()
+		row, err = h.DB.LockedResumePostBootCheck(ctx, params)
+	} else {
+		row, err = h.DB.ResumePostBootCheck(ctx, params)
 	}
-	row, err := h.DB.ResumePostBootCheck(ctx, db.ResumePostBootCheckParams{
-		ID: sandboxID, TeamID: teamID, HostID: hostID,
-		AllowedStatuses:      []string{"active", "draining"},
-		HeartbeatAfter:       time.Now().Add(-heartbeatTimeout),
-		RequiredCapabilities: append([]string{}, capabilities...),
-	})
 	if err != nil {
 		return previewPolicySnapshot{}, nil, err
 	}
