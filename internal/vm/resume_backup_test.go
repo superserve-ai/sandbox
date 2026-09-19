@@ -341,10 +341,11 @@ func TestUnclaimedRestoresAreCappedOldestFirst(t *testing.T) {
 }
 
 func TestBackupFlightAdmissionIsBounded(t *testing.T) {
-	store := &slowEmptyStore{delay: time.Second}
+	store := &slowEmptyStore{delay: 200 * time.Millisecond}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
 	mgr.SetBackupRestore(store, store, t.TempDir(), BackupRestoreOptions{Concurrency: 1, MaxFlights: 1})
-	if _, err := mgr.backupFlightFor("vm-1", "g"); err != nil {
+	f, err := mgr.backupFlightFor("vm-1", "g")
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := mgr.backupFlightFor("vm-1", "g"); err != nil {
@@ -353,6 +354,7 @@ func TestBackupFlightAdmissionIsBounded(t *testing.T) {
 	if _, err := mgr.backupFlightFor("vm-2", "g"); status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("beyond the flight cap: err = %v, want ResourceExhausted", err)
 	}
+	<-f.done
 }
 
 func TestSweepKeepsABaseAFlightStillHoldsForItsResume(t *testing.T) {
@@ -383,5 +385,37 @@ func TestSweepKeepsABaseAFlightStillHoldsForItsResume(t *testing.T) {
 	mgr.sweepPromotedBases()
 	if _, err := os.Stat(base); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("once released and unreferenced, an old base is swept")
+	}
+}
+
+func TestRealFlightOrderKeepsAReusedOldBaseThroughItsOwnSweep(t *testing.T) {
+	root := t.TempDir()
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, root, BackupRestoreOptions{CacheBytes: 1 << 30, AbandonAfter: time.Hour})
+	// The host already promoted this base long ago; nothing references it.
+	stable := touch(t, filepath.Join(mgr.backupBaseDir(), "base-abc.ext4"))
+	past := time.Now().Add(-2 * promotedBaseGrace)
+	if err := os.Chtimes(stable, past, past); err != nil {
+		t.Fatal(err)
+	}
+	orig := fetchBackupGeneration
+	fetchBackupGeneration = func(_ context.Context, _ backup.BlobReader, _, _, dest string, _ backup.ProgressFunc) (backup.Restored, error) {
+		disk := touch(t, filepath.Join(dest, "rootfs.ext4"))
+		base := touch(t, filepath.Join(dest, "base-abc.ext4"))
+		return backup.Restored{Disk: disk, Base: base, Manifest: &backup.GenerationManifest{Generation: "g"}}, nil
+	}
+	defer func() { fetchBackupGeneration = orig }()
+
+	f, err := mgr.backupFlightFor("vm-1", "g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-f.done
+	if _, err := os.Stat(stable); err != nil {
+		t.Fatal("the fetch's own sweep deleted the promoted base it reused")
+	}
+	if !mgr.claimFlight("vm-1", f) || f.restored.Base != stable {
+		t.Fatalf("claim failed or base = %s, want the promoted %s", f.restored.Base, stable)
 	}
 }
