@@ -3752,7 +3752,7 @@ components:
         disk_mib:
           type: integer
           minimum: 1024
-          maximum: 30720
+          maximum: 65536
           default: 4096
         build_spec:
           $ref: "#/components/schemas/BuildSpec"

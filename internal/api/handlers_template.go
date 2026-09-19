@@ -99,7 +99,7 @@ const (
 	// Platform ceiling — applies to every team including system.
 	absoluteMaxVcpu      = 10
 	absoluteMaxMemoryMib = 20480
-	absoluteMaxDiskMib   = 30720
+	absoluteMaxDiskMib   = 65536
 
 	// Customer-team defaults (overridable via team.max_template_*).
 	defaultMaxVcpu      = 2
