@@ -1575,9 +1575,15 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 		t.Fatalf("seed billing credit: %v", err)
 	}
 
-	requestStarted := time.Now().UTC()
+	// Open usage uses PostgreSQL's clock, which can differ from the test process.
+	var requestStarted, requestFinished time.Time
+	if err := testPool.QueryRow(ctx, `SELECT now()`).Scan(&requestStarted); err != nil {
+		t.Fatalf("read database time before summary: %v", err)
+	}
 	w := do(r, "GET", "/billing/summary", viewerKey, "")
-	requestFinished := time.Now().UTC()
+	if err := testPool.QueryRow(ctx, `SELECT now()`).Scan(&requestFinished); err != nil {
+		t.Fatalf("read database time after summary: %v", err)
+	}
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
