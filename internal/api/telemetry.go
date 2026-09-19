@@ -242,3 +242,10 @@ func lifecycleResult(status int) string {
 		return telemetry.ResultError
 	}
 }
+
+func currentBillingRecorder() telemetry.BillingRecorder {
+	if recorder, ok := currentTelemetryRecorder().(telemetry.BillingRecorder); ok {
+		return recorder
+	}
+	return telemetry.NoopBillingRecorder{}
+}

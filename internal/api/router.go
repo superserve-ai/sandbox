@@ -115,6 +115,11 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	operator := r.Group("/internal")
 	operator.Use(OperatorAuth(), InternalActorFromHeader())
 	{
+		// Billing recovery requires a credential unavailable to VMD hosts.
+		operator.POST("/teams/:team_id/billing/periods/:period_id/adopt-exports", h.AdoptBillingExports)
+		operator.POST("/billing/export-events/:event_id/recover", h.RecoverBillingExport)
+		operator.POST("/teams/:team_id/billing/periods/:period_id/measure-correction", h.MeasureBillingCorrection)
+		operator.POST("/billing/export-corrections/:correction_id/apply", h.ApplyBillingCorrection)
 		operator.GET("/hosts", h.HostList)
 		operator.POST("/hosts/:host_id/status", h.HostUpdateStatus)
 		operator.POST("/hosts/:host_id/incarnation", h.HostRebindIncarnation)
@@ -156,6 +161,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetPlatformTeamBillingExportPreview)
 		internal.POST("/teams/:team_id/billing/periods/:period_id/approve", h.ApproveTeamBillingPeriod)
 		internal.POST("/teams/:team_id/billing/periods/:period_id/export", h.ExportTeamBillingPeriod)
+		internal.GET("/teams/:team_id/billing/periods/:period_id/export-accounting", h.GetBillingExportAccounting)
 
 		// RBAC Phase 2b platform recovery and internal team administration.
 		internal.GET("/teams/:team_id/members", h.ListPlatformTeamMembers)

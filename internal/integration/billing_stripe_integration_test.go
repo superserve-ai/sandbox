@@ -24,6 +24,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
@@ -64,6 +65,15 @@ type thinEventStripeClient struct {
 	retrieveCalls     int
 	retrieveErrOnCall int
 	retrieveErr       error
+}
+
+type summaryStripeClient struct {
+	*fakeStripeClient
+	countedUsage func(string, string, time.Time, time.Time) (string, error)
+}
+
+func (f *summaryStripeClient) CountedMeterUsage(_ context.Context, eventName, customer string, start, end time.Time) (string, error) {
+	return f.countedUsage(eventName, customer, start, end)
 }
 
 func (f *thinEventStripeClient) RetrieveEvent(context.Context, string) (json.RawMessage, error) {
@@ -131,6 +141,11 @@ func (f *fakeStripeClient) ReportMeterEvent(_ context.Context, params api.Stripe
 
 func newBillingRouter(t *testing.T, stripe api.StripeBillingClient) *gin.Engine {
 	t.Helper()
+	return newBillingRouterWithPool(t, stripe, testPool)
+}
+
+func newBillingRouterWithPool(t *testing.T, stripe api.StripeBillingClient, pool *pgxpool.Pool) *gin.Engine {
+	t.Helper()
 	t.Setenv("INTERNAL_API_TOKEN", internalRBACToken)
 	cfg := &config.Config{
 		Port:                          "0",
@@ -142,10 +157,10 @@ func newBillingRouter(t *testing.T, stripe api.StripeBillingClient) *gin.Engine 
 		StripeCheckoutPriceIDs:        []string{"price_cpu", "price_memory", "price_storage"},
 		AppAllowedOrigins:             []string{"https://app.superserve.test"},
 	}
-	h := api.NewHandlers(&stubVMD{}, testQueries, cfg)
-	h.Pool = testPool
+	h := api.NewHandlers(&stubVMD{}, db.New(pool), cfg)
+	h.Pool = pool
 	h.Stripe = stripe
-	return api.SetupRouter(t.Context(), h, testPool)
+	return api.SetupRouter(t.Context(), h, pool)
 }
 
 func seedBillingPeriodForStripe(t *testing.T, approved bool, exportEnabled bool) (uuid.UUID, string, time.Time, time.Time) {
@@ -2101,9 +2116,34 @@ func TestIntegration_LiveBillingSkipsZeroUsageExports(t *testing.T) {
 }
 
 func TestIntegration_ShadowExportDoesNotBlockLaterLiveExport(t *testing.T) {
-	teamID, periodID, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, false)
+	teamID, periodID, periodStart, periodEnd := seedBillingPeriodForStripe(t, false, false)
 	adminID := seedPlatformAdminProfile(t)
-	stripe := &fakeStripeClient{}
+	if _, err := testQueries.ApproveTeamBillingPeriod(context.Background(), db.ApproveTeamBillingPeriodParams{
+		TeamID:      teamID,
+		PeriodStart: periodStart,
+		PeriodEnd:   periodEnd,
+		ApprovedBy:  pgtype.UUID{Bytes: adminID, Valid: true},
+	}); err != nil {
+		t.Fatalf("approve billing period: %v", err)
+	}
+	summaryCalls := make(map[string]int)
+	stripe := &summaryStripeClient{
+		fakeStripeClient: &fakeStripeClient{},
+		countedUsage: func(eventName, customer string, start, end time.Time) (string, error) {
+			if customer != "cus_"+teamID.String() || !start.Equal(periodStart) || !end.Equal(periodEnd) {
+				return "", fmt.Errorf("unexpected summary scope: %s %s %s", customer, start, end)
+			}
+			summaryCalls[eventName]++
+			switch summaryCalls[eventName] {
+			case 1:
+				return "0", nil
+			case 2:
+				return "2.000000000000", nil
+			default:
+				return "", fmt.Errorf("unexpected summary read for %s", eventName)
+			}
+		},
+	}
 	r := newBillingRouter(t, stripe)
 
 	if _, err := testPool.Exec(context.Background(), `
@@ -2119,6 +2159,12 @@ func TestIntegration_ShadowExportDoesNotBlockLaterLiveExport(t *testing.T) {
 	}
 	if got := exportAttemptCount(t, teamID, "skipped_shadow"); got != 2 {
 		t.Fatalf("skipped shadow attempts = %d, want 2", got)
+	}
+	if len(stripe.reportCalls) != 0 || len(summaryCalls) != 0 {
+		t.Fatal("shadow export contacted Stripe")
+	}
+	if got := billingPeriodStatus(t, teamID, periodStart, periodEnd); got != "exported" {
+		t.Fatalf("period status after shadow export = %q, want exported", got)
 	}
 
 	if _, err := testPool.Exec(context.Background(), `
@@ -2136,6 +2182,22 @@ func TestIntegration_ShadowExportDoesNotBlockLaterLiveExport(t *testing.T) {
 	}
 	if got := len(stripe.reportCalls); got != 2 {
 		t.Fatalf("live export stripe calls = %d, want 2", got)
+	}
+	if got := exportAttemptCount(t, teamID, "skipped_shadow"); got != 2 {
+		t.Fatalf("preserved shadow attempts = %d, want 2", got)
+	}
+	var enrolled bool
+	if err := testPool.QueryRow(context.Background(), `SELECT EXISTS(SELECT 1 FROM billing_incremental_period
+        WHERE team_id=$1 AND period_start=$2 AND period_end=$3)`, teamID, periodStart, periodEnd).Scan(&enrolled); err != nil {
+		t.Fatal(err)
+	}
+	if !enrolled {
+		t.Fatal("live export did not enroll the shadow period in incremental accounting")
+	}
+	for _, call := range stripe.reportCalls {
+		if call.Value != "2.000000000000" || summaryCalls[call.EventName] != 2 {
+			t.Fatalf("live export was not reconciled for the expected quantity: %+v, summary calls %v", call, summaryCalls)
+		}
 	}
 	if got := billingPeriodStatus(t, teamID, periodStart, periodEnd); got != "exported" {
 		t.Fatalf("period status after live export = %q, want exported", got)

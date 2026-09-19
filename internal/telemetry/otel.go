@@ -66,6 +66,7 @@ type OTelConfig struct {
 // OTelRecorder emits the sandbox control plane's bounded operational metrics
 // through OTLP. It intentionally exposes only a small label vocabulary.
 type OTelRecorder struct {
+	billing          *billingMetrics
 	computeDecisions metric.Int64Counter
 	computeRefreshes metric.Int64Counter
 	provider         *sdkmetric.MeterProvider
@@ -305,6 +306,9 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.peerHandshakeDuration, err = meter.Float64Histogram("peer_handshake_duration_seconds", metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
+		return nil, err
+	}
+	if err = r.initBilling(meter); err != nil {
 		return nil, err
 	}
 	return r, nil

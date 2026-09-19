@@ -143,16 +143,8 @@ data "google_service_account" "github_actions" {
   account_id = "superserve-github-actions"
 }
 
-# The api-runner SA's encrypt/decrypt grant on the credentials-kek KMS key is
-# managed out-of-band and owned centrally: the CD Terraform SA lacks KMS
-# setIamPolicy on the key, and the SA is shared across cells, so this follows
-# the same out-of-band pattern as the shared runtime secrets.
-
-# The runtime grant for the shared system-team-id-production secret is owned
-# solely by production/us-central1 (its api_runtime_secrets set), matching how
-# the other shared runtime secrets (posthog/slack/sentry) are granted to the
-# shared api-runner SA — so this root doesn't double-manage the same binding
-# from a separate state.
+# Legacy host api-runner grants remain centrally owned. The control plane's
+# dedicated identity and runtime grants are owned by controlplane-identity.tf.
 
 # deploy-proxy.yml fetches this secret directly via `gcloud secrets versions
 # access` at deploy time for the usw cell step, instead of through a Cloud
@@ -172,7 +164,7 @@ module "api" {
   environment           = local.environment
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
-  service_account_email = data.google_service_account.api_runner.email
+  service_account_email = google_service_account.controlplane_runtime.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
 
   cpu_limit    = "2"
@@ -189,7 +181,8 @@ module "api" {
   min_instances     = 10
   max_instances     = 30
   startup_cpu_boost = true
-  cpu_idle          = true
+  # In-process billing workers must run between requests.
+  cpu_idle = false
 
   env = {
     API_PORT               = "8080"
@@ -226,41 +219,7 @@ module "api" {
     DEFAULT_HOST_ID = local.metrics_host_id
   }
 
-  secrets = {
-    DATABASE_URL = {
-      secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
-    }
-    INTERNAL_API_TOKEN = {
-      secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")
-    }
-    SANDBOX_ACCESS_TOKEN_SEED = {
-      secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
-    }
-    SECRETS_SIGNING_KEY = {
-      secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
-    }
-    SENTRY_DSN = {
-      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn")
-    }
-    SYSTEM_TEAM_ID = {
-      secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
-    }
-    SLACK_QUOTA_ALERT_WEBHOOK = {
-      secret = "slack-quota-alert-webhook"
-    }
-    POSTHOG_KEY = {
-      secret = "posthog-project-key"
-    }
-    STRIPE_SECRET_KEY = {
-      secret = "stripe-secret-key-usw"
-    }
-    STRIPE_WEBHOOK_SECRET = {
-      secret = "stripe-webhook-secret-usw"
-    }
-    STRIPE_METER_ERROR_WEBHOOK_SECRET = {
-      secret = "stripe-meter-error-webhook-secret-usw"
-    }
-  }
+  secrets = local.controlplane_secrets
 
   vpc_connector  = null
   vpc_egress     = "PRIVATE_RANGES_ONLY"
@@ -269,6 +228,12 @@ module "api" {
   vpc_tags       = ["cr-usw2"]
 
   labels = local.common_labels
+
+  depends_on = [
+    google_secret_manager_secret_iam_member.controlplane_runtime_secrets,
+    google_kms_crypto_key_iam_member.controlplane_credentials,
+    google_service_account_iam_member.controlplane_deploy_act_as,
+  ]
 }
 
 # Background-data disk of the retired host, kept detached until its staged

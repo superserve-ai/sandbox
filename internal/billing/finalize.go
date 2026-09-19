@@ -110,6 +110,18 @@ func FinalizeTeamBillingPeriodWithCredits(
 		return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("list billing export attempts for finalization: %w", err)
 	}
 	storageBillingEnabled := storageBillingEnabledFromExportAttempts(exportRows)
+	var incrementalVcpuSeconds, incrementalMemoryGibSeconds, incrementalStorageGibSeconds pgtype.Numeric
+	if err := tx.QueryRow(ctx, `SELECT
+        sum(e.quantity) FILTER (WHERE a.resource_type='cpu')*3600,
+        sum(e.quantity) FILTER (WHERE a.resource_type='memory')*3600,
+        sum(e.quantity) FILTER (WHERE a.resource_type='storage')*3600
+        FROM billing_export_allocation a
+        JOIN billing_export_event e ON e.allocation_id=a.id AND e.active
+        WHERE a.team_id=$1 AND a.period_start=$2 AND a.period_end=$3
+          AND e.status IN ('submitted','adopted')`, teamID, periodStart, periodEnd).Scan(&incrementalVcpuSeconds, &incrementalMemoryGibSeconds, &incrementalStorageGibSeconds); err != nil {
+		return FinalizeTeamBillingPeriodResult{}, err
+	}
+	storageBillingEnabled = storageBillingEnabled || incrementalStorageGibSeconds.Valid
 
 	ratesAt, err := q.ListActivePricingRatesForTeam(ctx, db.ListActivePricingRatesForTeamParams{
 		TeamID:      teamID,
@@ -137,6 +149,26 @@ func FinalizeTeamBillingPeriodWithCredits(
 	}
 	memoryGibSeconds := memoryMibSeconds.DivInt64(1024)
 	storageGibSeconds := storageMibSeconds.DivInt64(1024)
+	// Approved corrections can exceed the immutable close measurement.
+	if incrementalVcpuSeconds.Valid {
+		vcpuSeconds, err = exactDecimalFromNumeric(incrementalVcpuSeconds)
+		if err != nil {
+			return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("convert exported vcpu usage failed: %w", err)
+		}
+	}
+	if incrementalMemoryGibSeconds.Valid {
+		memoryGibSeconds, err = exactDecimalFromNumeric(incrementalMemoryGibSeconds)
+		if err != nil {
+			return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("convert exported memory usage failed: %w", err)
+		}
+	}
+	if incrementalStorageGibSeconds.Valid {
+		// Measurements can keep growing after storage billing is disabled.
+		storageGibSeconds, err = exactDecimalFromNumeric(incrementalStorageGibSeconds)
+		if err != nil {
+			return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("convert exported storage usage failed: %w", err)
+		}
+	}
 
 	vcpuRate, err := exactDecimalFromNumeric(pricingRates["vcpu"].PriceUsd)
 	if err != nil {
