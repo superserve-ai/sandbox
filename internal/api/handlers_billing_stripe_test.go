@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -13,6 +14,11 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/superserve-ai/sandbox/internal/billing"
+	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 func TestStripeMeterErrorDetailsExtractsThinEventRequest(t *testing.T) {
@@ -215,8 +221,8 @@ func (r *stripeCheckoutSessionRoundTripper) RoundTrip(req *http.Request) (*http.
 
 func TestValidateBillingExportItemsRejectsNegativeValue(t *testing.T) {
 	err := validateBillingExportItems([]billingExportPreviewItem{
-		{ResourceType: "cpu", Value: 1},
-		{ResourceType: "memory", Value: -0.25},
+		{ResourceType: "cpu", Value: "1"},
+		{ResourceType: "memory", Value: "-0.25"},
 	})
 	if err == nil {
 		t.Fatal("expected negative billing export quantity to be rejected")
@@ -445,5 +451,93 @@ func TestStripeMeterQuantityPreservesNormalizedUnits(t *testing.T) {
 				t.Fatalf("quantity = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestBillingPreviewExactSplitMatchesClose(t *testing.T) {
+	teamID := uuid.MustParse("b2f39952-e8ad-4cae-b634-5e250fd3a13a")
+	start, end := time.Unix(100, 0).UTC(), time.Unix(200, 0).UTC()
+	for _, resource := range []string{"vcpu", "memory_gib", "storage_gib"} {
+		t.Run(resource, func(t *testing.T) {
+			firstRaw, closeRaw := "18000000.0000000009", "36000000.0000000018"
+			if resource != "vcpu" {
+				firstRaw, closeRaw = "18432000000.0000009216", "36864000000.0000018432"
+			}
+			var first, total pgtype.Numeric
+			if err := first.Scan(firstRaw); err != nil {
+				t.Fatal(err)
+			}
+			if err := total.Scan(closeRaw); err != nil {
+				t.Fatal(err)
+			}
+			usage := db.TeamBillingUsage{VcpuSeconds: total, MemoryMibSeconds: total, StorageMibSeconds: total}
+			items, err := billingPreviewItems(teamID, start, end, usage, []billingResourceState{{
+				BillingResourceConfig: config.BillingResourceConfig{ResourceKey: resource, CheckoutEnabled: true, StripeEventName: resource + "_hours"},
+				Billable:              true,
+			}}, "cus_example")
+			if err != nil || len(items) != 1 {
+				t.Fatalf("preview = %v, %v", items, err)
+			}
+			item := items[0]
+			const want = "10000.000000000001"
+			if item.Value.String() != want {
+				t.Fatalf("close quantity = %s, want %s", item.Value, want)
+			}
+			encoded, err := json.Marshal(item)
+			if err != nil || !strings.Contains(string(encoded), `"value":`+want) {
+				t.Fatalf("preview JSON lost precision: %s, %v", encoded, err)
+			}
+			increment, err := billing.MeterUsageQuantity(first, resource)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cumulative, err := billing.MeterUsageQuantity(total, resource)
+			if err != nil {
+				t.Fatal(err)
+			}
+			residual, err := billing.DecimalDelta(cumulative, increment)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a, _ := new(big.Rat).SetString(increment)
+			b, _ := new(big.Rat).SetString(residual)
+			if got := new(big.Rat).Add(a, b).FloatString(12); got != item.Value.String() {
+				t.Fatalf("split total = %s, close = %s", got, item.Value)
+			}
+			row := db.BillingUsageExport{
+				TeamID: teamID, ResourceType: item.ResourceType, StripeEventName: item.EventName,
+				StripeCustomerID: stringPtr("cus_example"), StripeMeterEventIdentifier: item.Identifier,
+				Value: billingPreviewNumeric(item.Value),
+			}
+			quantity, ok, err := billingExportRetryQuantity(row, start, end)
+			if err != nil || !ok || quantity != want {
+				t.Fatalf("persisted retry = %s, %v, %v", quantity, ok, err)
+			}
+			if item.Identifier == item.legacyIdentifier {
+				t.Fatal("precision-changing payload reused the old identifier")
+			}
+		})
+	}
+}
+
+func TestBillingExportRetryPreservesLegacyPayload(t *testing.T) {
+	teamID := uuid.MustParse("814141ea-03a7-46d1-8f2f-19fbc84dd5ce")
+	start, end := time.Unix(100, 0).UTC(), time.Unix(200, 0).UTC()
+	value := stripeMeterRoundedValue(34293.55253429355)
+	want, _ := stripeMeterQuantity(value)
+	identifier := meterIdentifierForPayload(teamID, start, end, "cpu", "cpu_hours", "cus_example", value)
+	for _, storedIdentifier := range []string{identifier, meterIdentifier(teamID, start, end, "cpu")} {
+		key := stripeMeterEventIdempotencyKey(storedIdentifier, "cpu_hours", "cus_example", want, end.Add(-time.Second).Unix())
+		row := db.BillingUsageExport{
+			TeamID: teamID, ResourceType: "cpu", StripeEventName: "cpu_hours", StripeCustomerID: stringPtr("cus_example"),
+			StripeMeterEventIdentifier: storedIdentifier, StripeIdempotencyKey: stringPtr(key), Value: numericFromFloat(value),
+		}
+		got, ok, err := billingExportRetryQuantity(row, start, end)
+		if err != nil || !ok || got != want {
+			t.Fatalf("legacy retry = %s, %v, %v; want %s", got, ok, err, want)
+		}
+		if gotKey := stripeMeterEventIdempotencyKey(storedIdentifier, row.StripeEventName, derefString(row.StripeCustomerID), got, end.Add(-time.Second).Unix()); gotKey != key {
+			t.Fatal("legacy retry payload changed its idempotency key")
+		}
 	}
 }

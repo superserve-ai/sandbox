@@ -56,6 +56,15 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - uses: sqlc-dev/setup-sqlc@v4
+        with:
+          sqlc-version: '1.30.0'
+
+      - name: Validate billing suites and worker load
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
+        run: bash scripts/validate-billing.sh
+
       - name: Run integration tests
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
