@@ -354,3 +354,34 @@ func TestBackupFlightAdmissionIsBounded(t *testing.T) {
 		t.Fatalf("beyond the flight cap: err = %v, want ResourceExhausted", err)
 	}
 }
+
+func TestSweepKeepsABaseAFlightStillHoldsForItsResume(t *testing.T) {
+	root := t.TempDir()
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, root, BackupRestoreOptions{})
+	base := touch(t, filepath.Join(mgr.backupBaseDir(), "base-old.ext4"))
+	past := time.Now().Add(-2 * promotedBaseGrace)
+	if err := os.Chtimes(base, past, past); err != nil {
+		t.Fatal(err)
+	}
+	f := &backupFlight{generation: "g", done: make(chan struct{}), dropped: make(chan struct{}), state: flightUnclaimed, completedAt: time.Now(), restored: backup.Restored{Base: base}}
+	mgr.backupFlights["vm-1"] = f
+
+	mgr.sweepPromotedBases()
+	if _, err := os.Stat(base); err != nil {
+		t.Fatal("a base a finished fetch holds for its resume must survive the sweep")
+	}
+	if !mgr.claimFlight("vm-1", f) {
+		t.Fatal("claim")
+	}
+	mgr.sweepPromotedBases()
+	if _, err := os.Stat(base); err != nil {
+		t.Fatal("a base a claimed resume is booting from must survive the sweep")
+	}
+	mgr.releaseFlight("vm-1", f)
+	mgr.sweepPromotedBases()
+	if _, err := os.Stat(base); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("once released and unreferenced, an old base is swept")
+	}
+}

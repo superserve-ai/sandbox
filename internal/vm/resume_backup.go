@@ -159,7 +159,16 @@ func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 	defer sentrylog.Recover("backup-fetch")
 	dest := m.restoreStagingDir(vmID)
 	func() {
+		// The flight is claimable before done is closed, so a woken waiter
+		// never finds it still fetching.
 		defer close(f.done)
+		defer func() {
+			m.backupFlightsMu.Lock()
+			if f.state == flightFetching {
+				f.state, f.completedAt = flightUnclaimed, time.Now()
+			}
+			m.backupFlightsMu.Unlock()
+		}()
 		ctx, cancel := context.WithTimeout(context.Background(), m.backupRestore.FetchBudget)
 		defer cancel()
 		select {
@@ -189,11 +198,6 @@ func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 			m.backupCacheMu.Unlock()
 		}
 	}()
-	m.backupFlightsMu.Lock()
-	if f.state == flightFetching {
-		f.state, f.completedAt = flightUnclaimed, time.Now()
-	}
-	m.backupFlightsMu.Unlock()
 	m.dropUnclaimedBeyondCap()
 	select {
 	case <-f.dropped:
@@ -203,7 +207,9 @@ func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 }
 
 // claimFlight hands the finished fetch to exactly one resume; false means
-// the cap or expiry dropped it first and the caller must start over.
+// the cap or expiry dropped it first and the caller must start over. A
+// claimed flight stays registered, holding its base in use, until the
+// resume that claimed it releases it.
 func (m *Manager) claimFlight(vmID string, f *backupFlight) bool {
 	m.backupFlightsMu.Lock()
 	defer m.backupFlightsMu.Unlock()
@@ -211,11 +217,16 @@ func (m *Manager) claimFlight(vmID string, f *backupFlight) bool {
 		return false
 	}
 	f.state = flightClaimed
+	f.drop()
+	return true
+}
+
+func (m *Manager) releaseFlight(vmID string, f *backupFlight) {
+	m.backupFlightsMu.Lock()
 	if m.backupFlights[vmID] == f {
 		delete(m.backupFlights, vmID)
 	}
-	f.drop()
-	return true
+	m.backupFlightsMu.Unlock()
 }
 
 func (f *backupFlight) drop() {
@@ -298,6 +309,29 @@ func (m *Manager) promoteBase(r *backup.Restored, dest string) error {
 	return nil
 }
 
+// basesInUse is every promoted base a tracked VM reads plus every one a
+// flight still holds for the resume that will claim it.
+func (m *Manager) basesInUse() map[string]bool {
+	inUse := map[string]bool{}
+	m.mu.RLock()
+	for _, inst := range m.vms {
+		inst.mu.RLock()
+		inUse[inst.Config.BasePath] = true
+		inst.mu.RUnlock()
+	}
+	m.mu.RUnlock()
+	m.backupFlightsMu.Lock()
+	for _, f := range m.backupFlights {
+		// A fetching flight is still writing its result; the states past
+		// it were published under this lock.
+		if (f.state == flightUnclaimed || f.state == flightClaimed) && f.restored.Base != "" {
+			inUse[f.restored.Base] = true
+		}
+	}
+	m.backupFlightsMu.Unlock()
+	return inUse
+}
+
 // promotedBaseGrace keeps a freshly promoted base out of the sweep until
 // the resume that fetched it has attached it to its VM.
 const promotedBaseGrace = time.Hour
@@ -308,14 +342,7 @@ func (m *Manager) sweepPromotedBases() {
 	if err != nil {
 		return
 	}
-	inUse := map[string]bool{}
-	m.mu.RLock()
-	for _, inst := range m.vms {
-		inst.mu.RLock()
-		inUse[inst.Config.BasePath] = true
-		inst.mu.RUnlock()
-	}
-	m.mu.RUnlock()
+	inUse := m.basesInUse()
 	for _, e := range entries {
 		if !strings.HasPrefix(e.Name(), "base-") || !strings.HasSuffix(e.Name(), ".ext4") {
 			continue
@@ -363,6 +390,7 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 	if !m.claimFlight(vmID, flight) {
 		return nil, status.Errorf(codes.Unavailable, "vm %s: the restored backup was dropped before this resume claimed it; retry", vmID)
 	}
+	defer m.releaseFlight(vmID, flight)
 	m.recordPhases("resume", "backup", map[string]time.Duration{"backup_fetch": time.Since(tFetch)})
 	if flight.err != nil {
 		if errors.Is(flight.err, backup.ErrNoMatchingBackup) {
