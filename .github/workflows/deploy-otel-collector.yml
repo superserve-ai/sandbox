@@ -14,7 +14,7 @@ on:
           - staging
           - production
       target:
-        description: 'Staging host target (production keeps its existing cell selection)'
+        description: 'Staging host target (production deploys to every VMD-role host in each enabled cell)'
         required: true
         type: choice
         default: serving
@@ -24,10 +24,14 @@ on:
   push:
     branches: [main]
     paths:
+      # Every Terraform revision that supersedes the gate needs a collector run.
+      - 'infra/**'
+      - '.github/workflows/terraform-cd.yml'
       - 'deploy/otel/**'
       - 'deploy/superserve-otel-collector.service'
       - '.github/workflows/deploy-otel-collector.yml'
       - '.github/workflows/scripts/deploy-otel-collector.py'
+      - '.github/workflows/scripts/wait-for-otel-alerts.py'
       - '.github/workflows/scripts/select-deploy-target.sh'
 
 jobs:
@@ -79,15 +83,28 @@ jobs:
         (github.event_name == 'push' && needs.deploy-staging.result == 'success') ||
         (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
       )
+    # Keep collectors ordered without taking a lock needed by Terraform CD.
+    concurrency:
+      group: otel-collector-production
+      cancel-in-progress: false
     needs: [deploy-staging]
     runs-on: ubuntu-latest
     environment: production
     permissions:
       contents: read
+      actions: read
       id-token: write
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      OTEL_USE4_ENABLED: ${{ vars.CLOUD_RUN_SERVICE_USE4 }}
+      OTEL_USW2_ENABLED: ${{ vars.CLOUD_RUN_SERVICE_USW }}
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Wait for same-revision production alert applies
+        run: python3 .github/workflows/scripts/wait-for-otel-alerts.py
 
       - name: Authenticate to GCP
         uses: google-github-actions/auth@v2
@@ -98,16 +115,18 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      # The use4 cell host is the primary production host (api.superserve.ai).
+      # In both production cells, sandbox_role includes serving and standby
+      # hosts regardless of component changes during promotion.
       # Skipped until CLOUD_RUN_SERVICE_USE4 is set.
       - name: Deploy OTEL Collector to use4 cell VMD instances
         if: vars.CLOUD_RUN_SERVICE_USE4 != ''
         env:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: us-east4
-          VMD_FILTER: labels.component=vmd AND labels.environment=production AND labels.region=us-east4
+          VMD_FILTER: labels.sandbox_role=vmd AND labels.environment=production AND labels.region=us-east4
           OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
         run: |
+          python3 .github/workflows/scripts/wait-for-otel-alerts.py
           python3 .github/workflows/scripts/deploy-otel-collector.py
 
       # Both production cells need a host-local collector: without one,
@@ -126,4 +145,5 @@ jobs:
           VMD_FILTER: labels.sandbox_role=vmd AND labels.environment=production AND labels.region=us-west2
           OTEL_COLLECTOR_PROJECT: ${{ vars.GCP_PROJECT }}
         run: |
+          python3 .github/workflows/scripts/wait-for-otel-alerts.py
           python3 .github/workflows/scripts/deploy-otel-collector.py

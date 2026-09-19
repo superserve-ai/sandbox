@@ -6,6 +6,14 @@ on:
     paths:
       - 'infra/**'
       - '.github/workflows/terraform-cd.yml'
+      # Production collectors require same-revision alert applies, even on
+      # collector-only pushes. Keep these paths aligned with that workflow.
+      - 'deploy/otel/**'
+      - 'deploy/superserve-otel-collector.service'
+      - '.github/workflows/deploy-otel-collector.yml'
+      - '.github/workflows/scripts/deploy-otel-collector.py'
+      - '.github/workflows/scripts/wait-for-otel-alerts.py'
+      - '.github/workflows/scripts/select-deploy-target.sh'
 
 jobs:
   wait-for-migrations:
