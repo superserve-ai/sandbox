@@ -316,6 +316,145 @@ type BackupGeneration struct {
 	CoveredSnapshotGeneration *int64      `json:"covered_snapshot_generation"`
 }
 
+type BillingExportAllocation struct {
+	ID              uuid.UUID      `json:"id"`
+	TeamID          uuid.UUID      `json:"team_id"`
+	PeriodStart     time.Time      `json:"period_start"`
+	PeriodEnd       time.Time      `json:"period_end"`
+	ResourceType    string         `json:"resource_type"`
+	CoverageStart   pgtype.Numeric `json:"coverage_start"`
+	CoverageEnd     pgtype.Numeric `json:"coverage_end"`
+	MeasuredThrough time.Time      `json:"measured_through"`
+	CreatedAt       time.Time      `json:"created_at"`
+	CorrectionID    pgtype.UUID    `json:"correction_id"`
+}
+
+type BillingExportCorrection struct {
+	ID                  uuid.UUID          `json:"id"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	PeriodStart         time.Time          `json:"period_start"`
+	PeriodEnd           time.Time          `json:"period_end"`
+	ResourceType        string             `json:"resource_type"`
+	Frozen              bool               `json:"frozen"`
+	Version             int64              `json:"version"`
+	MeasuredQuantity    pgtype.Numeric     `json:"measured_quantity"`
+	BaselineQuantity    pgtype.Numeric     `json:"baseline_quantity"`
+	ReservedQuantity    pgtype.Numeric     `json:"reserved_quantity"`
+	TargetQuantity      pgtype.Numeric     `json:"target_quantity"`
+	PreviousID          pgtype.UUID        `json:"previous_id"`
+	MeasurementSnapshot string             `json:"measurement_snapshot"`
+	CreatedAt           time.Time          `json:"created_at"`
+	AppliedAt           pgtype.Timestamptz `json:"applied_at"`
+	AppliedBy           pgtype.UUID        `json:"applied_by"`
+	ApprovalSnapshot    *string            `json:"approval_snapshot"`
+	Action              *string            `json:"action"`
+	Evidence            *string            `json:"evidence"`
+}
+
+type BillingExportDiscovery struct {
+	Singleton     bool        `json:"singleton"`
+	AfterTeam     pgtype.UUID `json:"after_team"`
+	ResetExisting bool        `json:"reset_existing"`
+	NextRunAt     time.Time   `json:"next_run_at"`
+}
+
+type BillingExportEvent struct {
+	ID               uuid.UUID          `json:"id"`
+	AllocationID     uuid.UUID          `json:"allocation_id"`
+	Identifier       string             `json:"identifier"`
+	IdempotencyKey   string             `json:"idempotency_key"`
+	EventName        string             `json:"event_name"`
+	CustomerID       string             `json:"customer_id"`
+	Quantity         pgtype.Numeric     `json:"quantity"`
+	QuantityPayload  string             `json:"quantity_payload"`
+	EventTimestamp   int64              `json:"event_timestamp"`
+	Source           string             `json:"source"`
+	Evidence         *string            `json:"evidence"`
+	RecoveryOutcome  *string            `json:"recovery_outcome"`
+	RecoveryEvidence *string            `json:"recovery_evidence"`
+	Replaces         pgtype.UUID        `json:"replaces"`
+	Active           bool               `json:"active"`
+	Status           string             `json:"status"`
+	FirstAttemptAt   pgtype.Timestamptz `json:"first_attempt_at"`
+	SubmittedAt      pgtype.Timestamptz `json:"submitted_at"`
+	NextAttemptAt    time.Time          `json:"next_attempt_at"`
+	LeaseToken       pgtype.UUID        `json:"lease_token"`
+	LeaseUntil       pgtype.Timestamptz `json:"lease_until"`
+	AttemptCount     int32              `json:"attempt_count"`
+	LastError        *string            `json:"last_error"`
+	CreatedAt        time.Time          `json:"created_at"`
+	UpdatedAt        time.Time          `json:"updated_at"`
+}
+
+type BillingExportMeasurement struct {
+	TeamID            uuid.UUID      `json:"team_id"`
+	PeriodStart       time.Time      `json:"period_start"`
+	PeriodEnd         time.Time      `json:"period_end"`
+	HourStart         time.Time      `json:"hour_start"`
+	VcpuSeconds       pgtype.Numeric `json:"vcpu_seconds"`
+	MemoryMibSeconds  pgtype.Numeric `json:"memory_mib_seconds"`
+	StorageMibSeconds pgtype.Numeric `json:"storage_mib_seconds"`
+}
+
+type BillingExportMeasurementQueue struct {
+	TeamID            uuid.UUID          `json:"team_id"`
+	HourStart         time.Time          `json:"hour_start"`
+	Pending           bool               `json:"pending"`
+	HourEnd           pgtype.Timestamptz `json:"hour_end"`
+	VcpuSeconds       pgtype.Numeric     `json:"vcpu_seconds"`
+	MemoryMibSeconds  pgtype.Numeric     `json:"memory_mib_seconds"`
+	StorageMibSeconds pgtype.Numeric     `json:"storage_mib_seconds"`
+}
+
+type BillingExportObservation struct {
+	TeamID            uuid.UUID      `json:"team_id"`
+	PeriodStart       time.Time      `json:"period_start"`
+	PeriodEnd         time.Time      `json:"period_end"`
+	ResourceType      string         `json:"resource_type"`
+	LocalQuantity     pgtype.Numeric `json:"local_quantity"`
+	SubmittedQuantity pgtype.Numeric `json:"submitted_quantity"`
+	ReservedQuantity  pgtype.Numeric `json:"reserved_quantity"`
+	CountedQuantity   pgtype.Numeric `json:"counted_quantity"`
+	ObservedAt        time.Time      `json:"observed_at"`
+	QueryStart        time.Time      `json:"query_start"`
+	QueryEnd          time.Time      `json:"query_end"`
+	LastError         *string        `json:"last_error"`
+}
+
+type BillingExportUsage struct {
+	TeamID            uuid.UUID      `json:"team_id"`
+	PeriodStart       time.Time      `json:"period_start"`
+	PeriodEnd         time.Time      `json:"period_end"`
+	VcpuSeconds       pgtype.Numeric `json:"vcpu_seconds"`
+	MemoryMibSeconds  pgtype.Numeric `json:"memory_mib_seconds"`
+	StorageMibSeconds pgtype.Numeric `json:"storage_mib_seconds"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+}
+
+type BillingExportWork struct {
+	TeamID            uuid.UUID          `json:"team_id"`
+	NextRunAt         time.Time          `json:"next_run_at"`
+	LeaseToken        pgtype.UUID        `json:"lease_token"`
+	LeaseUntil        pgtype.Timestamptz `json:"lease_until"`
+	SeedAfter         pgtype.Timestamptz `json:"seed_after"`
+	SeedComplete      bool               `json:"seed_complete"`
+	LastError         *string            `json:"last_error"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+	NextReconcileAt   time.Time          `json:"next_reconcile_at"`
+	ReconcileError    *string            `json:"reconcile_error"`
+	CorrectionAfter   pgtype.Timestamptz `json:"correction_after"`
+	CorrectionThrough pgtype.Timestamptz `json:"correction_through"`
+	NextCorrectionAt  time.Time          `json:"next_correction_at"`
+}
+
+type BillingIncrementalPeriod struct {
+	TeamID            uuid.UUID `json:"team_id"`
+	PeriodStart       time.Time `json:"period_start"`
+	PeriodEnd         time.Time `json:"period_end"`
+	CreatedAt         time.Time `json:"created_at"`
+	CorrectionVersion int64     `json:"correction_version"`
+}
+
 type BillingPeriodAnomaly struct {
 	ID          uuid.UUID          `json:"id"`
 	TeamID      uuid.UUID          `json:"team_id"`

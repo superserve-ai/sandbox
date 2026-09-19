@@ -334,7 +334,13 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
+          gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE_USW }} \
+            --region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }} --format=json | \
+            python3 .github/workflows/scripts/check_controlplane_identity.py \
+              --project ${{ vars.GCP_PROJECT }} --cell usw2
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USW }} \
+            --no-cpu-throttling \
+            --min-instances 10 \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --region ${{ vars.GCP_REGION_USW }} \
             --project ${{ vars.GCP_PROJECT }}
@@ -500,7 +506,13 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
+          gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE_USE4 }} \
+            --region ${{ vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }} --format=json | \
+            python3 .github/workflows/scripts/check_controlplane_identity.py \
+              --project ${{ vars.GCP_PROJECT }} --cell use4
           gcloud run services update ${{ vars.CLOUD_RUN_SERVICE_USE4 }} \
+            --no-cpu-throttling \
+            --min-instances 10 \
             --image ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT }}/superserve/controlplane:${{ github.sha }} \
             --region ${{ vars.GCP_REGION_USE4 }} \
             --project ${{ vars.GCP_PROJECT }}

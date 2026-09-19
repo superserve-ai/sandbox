@@ -147,20 +147,8 @@ resource "google_project_iam_member" "cd_certificatemanager" {
   member  = "serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"
 }
 
-# A5: us-east4 control plane for the "use" cell.
-#
-# This is a host swap, not a new cell: us-east4 shares the use-cell Supabase,
-# runtime secrets, api-runner service account, and KMS key with us-central1.
-# Only the service name, region, and VMD address are region-local — traffic
-# splits between this service and the us-central1 one during cutover, then
-# us-central1 drains. Secrets resolve to the shared (suffix-less) use-cell
-# names via the *_secret_name overrides in terraform.tfvars.
-#
-# No per-root secret IAM here: the shared api-runner SA already holds the
-# runtime accessor grants (owned by us-central1's api_runtime_secrets) and the
-# credentials-kek encrypt/decrypt grant (owned out-of-band). Re-declaring them
-# from this state would double-manage the same bindings — the same split we
-# settled for usw2 in #232/#233.
+# The use-cell control plane retains its shared secrets and KMS key.
+# Runtime IAM is owned here for its dedicated control-plane identity.
 module "api" {
   source = "../../../modules/api"
 
@@ -168,7 +156,7 @@ module "api" {
   environment           = local.environment
   region                = local.region
   service_name          = "superserve-api-${local.resource_suffix}"
-  service_account_email = data.google_service_account.api_runner.email
+  service_account_email = google_service_account.controlplane_runtime.email
   # First create must reference a tag that actually exists, or the initial
   # revision never goes ready and the apply fails. The other regions can carry
   # a ":replace-me" placeholder only because their services already exist and
@@ -192,7 +180,8 @@ module "api" {
   min_instances     = 10
   max_instances     = 30
   startup_cpu_boost = true
-  cpu_idle          = true
+  # In-process billing workers must run between requests.
+  cpu_idle = false
 
   env = {
     API_PORT               = "8080"
@@ -222,41 +211,7 @@ module "api" {
     APP_ALLOWED_ORIGINS         = "https://console.superserve.ai"
   }
 
-  secrets = {
-    DATABASE_URL = {
-      secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
-    }
-    INTERNAL_API_TOKEN = {
-      secret = coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}")
-    }
-    SANDBOX_ACCESS_TOKEN_SEED = {
-      secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
-    }
-    SECRETS_SIGNING_KEY = {
-      secret = coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}")
-    }
-    SENTRY_DSN = {
-      secret = coalesce(var.sentry_dsn_secret_name, "sentry-dsn")
-    }
-    SYSTEM_TEAM_ID = {
-      secret = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
-    }
-    SLACK_QUOTA_ALERT_WEBHOOK = {
-      secret = "slack-quota-alert-webhook"
-    }
-    POSTHOG_KEY = {
-      secret = "posthog-project-key"
-    }
-    STRIPE_SECRET_KEY = {
-      secret = "stripe-secret-key-use"
-    }
-    STRIPE_WEBHOOK_SECRET = {
-      secret = "stripe-webhook-secret-use"
-    }
-    STRIPE_METER_ERROR_WEBHOOK_SECRET = {
-      secret = "stripe-meter-error-webhook-secret-use"
-    }
-  }
+  secrets = local.controlplane_secrets
 
   vpc_connector  = null
   vpc_egress     = "PRIVATE_RANGES_ONLY"
@@ -265,6 +220,12 @@ module "api" {
   vpc_tags       = ["cr-use4"]
 
   labels = local.common_labels
+
+  depends_on = [
+    google_secret_manager_secret_iam_member.controlplane_runtime_secrets,
+    google_kms_crypto_key_iam_member.controlplane_credentials,
+    google_service_account_iam_member.controlplane_deploy_act_as,
+  ]
 }
 
 # api.superserve.ai external HTTPS load balancer (global). Fronts the use-cell
