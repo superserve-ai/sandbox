@@ -3198,6 +3198,81 @@ func (q *Queries) ReleaseTeardownHost(ctx context.Context, arg ReleaseTeardownHo
 	return err
 }
 
+const resumePostBootCheck = `-- name: ResumePostBootCheck :one
+WITH target_host AS MATERIALIZED (
+  SELECT host.id, host.last_heartbeat_at
+  FROM host
+  WHERE host.id = $4
+    AND host.status = ANY($5::text[])
+    AND host.last_heartbeat_at IS NOT NULL
+    AND host.last_heartbeat_at > $6::timestamptz
+)
+SELECT
+  COALESCE(p.default_access, p.access, 'legacy_public')::text AS access,
+  COALESCE(p.access, 'legacy_public')::text AS wire_access,
+  COALESCE(p.revision, 0)::bigint AS revision,
+  EXISTS (
+    SELECT 1
+    FROM target_host h
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM unnest($1::text[]) AS required(capability)
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM host_capability hc
+        WHERE hc.host_id = h.id
+          AND hc.capability = required.capability
+          AND hc.heartbeat_at = h.last_heartbeat_at
+      )
+    )
+  ) AS host_eligible
+FROM sandbox s
+LEFT JOIN sandbox_preview_policy p ON p.sandbox_id = s.id
+WHERE s.id = $2 AND s.team_id = $3 AND s.destroyed_at IS NULL
+`
+
+type ResumePostBootCheckParams struct {
+	RequiredCapabilities []string  `json:"required_capabilities"`
+	ID                   uuid.UUID `json:"id"`
+	TeamID               uuid.UUID `json:"team_id"`
+	HostID               string    `json:"host_id"`
+	AllowedStatuses      []string  `json:"allowed_statuses"`
+	HeartbeatAfter       time.Time `json:"heartbeat_after"`
+}
+
+type ResumePostBootCheckRow struct {
+	Access       string `json:"access"`
+	WireAccess   string `json:"wire_access"`
+	Revision     int64  `json:"revision"`
+	HostEligible bool   `json:"host_eligible"`
+}
+
+// The two reads a resume makes after the boot, in one statement: the
+// sandbox's current preview policy (its revision proves whether a mutation
+// landed during the boot) and whether the host still meets the claim
+// policy's capability requirement. When that requirement is non-empty,
+// evaluate it after LockHostForCapabilities in the same transaction, as
+// HostHasCapabilities is (LockedResumePostBootCheck); host_eligible is
+// meaningful only then, and the caller ignores it for a legacy policy.
+func (q *Queries) ResumePostBootCheck(ctx context.Context, arg ResumePostBootCheckParams) (ResumePostBootCheckRow, error) {
+	row := q.db.QueryRow(ctx, resumePostBootCheck,
+		arg.RequiredCapabilities,
+		arg.ID,
+		arg.TeamID,
+		arg.HostID,
+		arg.AllowedStatuses,
+		arg.HeartbeatAfter,
+	)
+	var i ResumePostBootCheckRow
+	err := row.Scan(
+		&i.Access,
+		&i.WireAccess,
+		&i.Revision,
+		&i.HostEligible,
+	)
+	return i, err
+}
+
 const revertPauseToActive = `-- name: RevertPauseToActive :one
 WITH reverted AS (
   UPDATE sandbox

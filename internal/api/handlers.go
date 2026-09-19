@@ -1164,10 +1164,12 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	case attested.PreviewProtocol == preview.HostCapabilityPorts:
 		// Stamped before the guest ran, or a newer policy the record already
 		// held and kept. The database may be newer still: a mutation that
-		// committed after the claim and whose own push failed. One revision
-		// read proves what is current and names the policy the reply
-		// reports; only a daemon behind it gets the full read and push.
-		currentPolicy, policyErr := h.loadPreviewPolicy(postCtx, sandboxID, teamID)
+		// committed after the claim and whose own push failed. One statement
+		// under the host lock reads the current revision, which names the
+		// policy the reply reports, and whether the owner's capabilities
+		// lapsed during the boot; only a daemon behind the database gets the
+		// full read and push.
+		currentPolicy, capabilityErr, policyErr := h.resumePostBootCheck(postCtx, sandboxID, teamID, sandbox.HostID, resumePolicy)
 		if policyErr != nil {
 			failPost(policyErr, "reload preview policy after resume failed")
 			return "", false
@@ -1180,15 +1182,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			if !reapplyPolicy() {
 				return "", false
 			}
-		default:
-			// The attested policy is current, but the owner's capabilities
-			// can lapse during boot and must be rechecked before activation.
-			if capabilityErr := validateOwnerResumePolicyCapabilities(postCtx, h.DB, sandbox.HostID, resumePolicy); capabilityErr != nil {
-				markRevert()
-				pauseAndRevert()
-				h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewCapabilitiesAfterResume", capabilityErr)
-				return "", false
-			}
+		case capabilityErr != nil:
+			markRevert()
+			pauseAndRevert()
+			h.handlePreviewMutationResult(c, sandboxID, "ReapplyPreviewCapabilitiesAfterResume", capabilityErr)
+			return "", false
 		}
 	case attested.PreviewProtocol == "":
 		// A daemon from before the resume request carried the policy. It may

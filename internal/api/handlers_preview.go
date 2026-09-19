@@ -333,6 +333,53 @@ func validateOwnerResumePolicyCapabilities(ctx context.Context, q *db.Queries, h
 	return nil
 }
 
+// ownerResumeCapabilitiesFor is what validateOwnerResumePolicyCapabilities
+// asks of the host for policy: the browser chain for a private policy, the
+// ports capability for any other strict one, nothing for a legacy one.
+func ownerResumeCapabilitiesFor(policy previewPolicySnapshot) []string {
+	if policy.requiresBrowserCapability() {
+		return previewBrowserCapabilities()
+	}
+	if policy.Access != preview.AccessLegacyPublic {
+		return []string{preview.HostCapabilityPorts}
+	}
+	return nil
+}
+
+// resumePostBootCheck is the post-boot policy read and owner capability
+// check of a resume as one statement: the current policy, and a
+// capabilityErr when the host no longer meets what policy requires. When
+// policy requires anything, the statement runs under the host lock so it
+// follows a heartbeat already withdrawing a capability. A legacy policy
+// requires nothing, reads without the lock, and is never refused.
+func (h *Handlers) resumePostBootCheck(ctx context.Context, sandboxID, teamID uuid.UUID, hostID string, policy previewPolicySnapshot) (current previewPolicySnapshot, capabilityErr, err error) {
+	capabilities := ownerResumeCapabilitiesFor(policy)
+	params := db.ResumePostBootCheckParams{
+		ID: sandboxID, TeamID: teamID, HostID: hostID,
+		AllowedStatuses:      []string{"active", "draining"},
+		HeartbeatAfter:       time.Now().Add(-heartbeatTimeout),
+		RequiredCapabilities: append([]string{}, capabilities...),
+	}
+	var row db.ResumePostBootCheckRow
+	if len(capabilities) > 0 {
+		started := time.Now()
+		defer func() {
+			RecordLatencyPhases(ctx, "resume", hostID, map[string]time.Duration{"host_capability_validation": time.Since(started)})
+		}()
+		row, err = h.DB.LockedResumePostBootCheck(ctx, params)
+	} else {
+		row, err = h.DB.ResumePostBootCheck(ctx, params)
+	}
+	if err != nil {
+		return previewPolicySnapshot{}, nil, err
+	}
+	current = previewPolicySnapshot{Access: row.Access, WireAccess: row.WireAccess, Revision: row.Revision}
+	if len(capabilities) > 0 && !row.HostEligible {
+		capabilityErr = &missingHostPreviewCapabilityError{capability: strings.Join(capabilities, `", "`)}
+	}
+	return current, capabilityErr, nil
+}
+
 func (h *Handlers) requireOwnerResumeCapabilities(c *gin.Context, hostID string, capabilities ...string) bool {
 	hasCapabilities, err := h.hostHasCapabilitiesCachedForScope(c.Request.Context(), hostID, capabilities, ownerResumeCapabilities)
 	if err != nil || hasCapabilities {
