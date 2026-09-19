@@ -453,6 +453,7 @@ type Manager struct {
 	backupFetchSem    chan struct{}
 	backupFlightsMu   sync.Mutex
 	backupFlights     map[string]*backupFlight
+	backupCacheMu     sync.RWMutex
 	// backupStaging is the uploader-visible staging tree: where a
 	// finished generation ends up for the uploader to hash and stream
 	// from, and where the at-rest/backfill worker path (StageTask)

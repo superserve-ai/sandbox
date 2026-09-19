@@ -309,7 +309,7 @@ func TestUnclaimedRestoresAreCappedOldestFirst(t *testing.T) {
 	mgr.SetBackupRestore(store, store, root, BackupRestoreOptions{Concurrency: 1, MaxUnclaimed: 1})
 	mk := func(vmID string, age time.Duration) *backupFlight {
 		touch(t, filepath.Join(mgr.restoreStagingDir(vmID), "rootfs.ext4"))
-		f := &backupFlight{generation: "g", done: make(chan struct{}), claimed: make(chan struct{}), dropped: make(chan struct{}), completedAt: time.Now().Add(-age)}
+		f := &backupFlight{generation: "g", done: make(chan struct{}), dropped: make(chan struct{}), state: flightUnclaimed, completedAt: time.Now().Add(-age)}
 		close(f.done)
 		mgr.backupFlights[vmID] = f
 		return f
@@ -325,12 +325,32 @@ func TestUnclaimedRestoresAreCappedOldestFirst(t *testing.T) {
 	if _, err := os.Stat(mgr.restoreStagingDir("vm-new")); err != nil {
 		t.Fatal("the newest unclaimed restore stays within the cap")
 	}
-	select {
-	case <-older.dropped:
-	default:
-		t.Fatal("the dropped flight must be told so its goroutine exits")
+	if mgr.claimFlight("vm-old", older) {
+		t.Fatal("a dropped restore can never be claimed")
 	}
-	if mgr.backupFlights["vm-old"] != nil || mgr.backupFlights["vm-new"] != newer {
-		t.Fatal("only the dropped flight leaves the map")
+	if !mgr.claimFlight("vm-new", newer) {
+		t.Fatal("the kept restore must be claimable exactly once")
+	}
+	if mgr.claimFlight("vm-new", newer) {
+		t.Fatal("a second claim must fail")
+	}
+	mgr.dropUnclaimedBeyondCap()
+	if _, err := os.Stat(mgr.restoreStagingDir("vm-new")); err != nil {
+		t.Fatal("a claimed restore is never dropped by the cap")
+	}
+}
+
+func TestBackupFlightAdmissionIsBounded(t *testing.T) {
+	store := &slowEmptyStore{delay: time.Second}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	mgr.SetBackupRestore(store, store, t.TempDir(), BackupRestoreOptions{Concurrency: 1, MaxFlights: 1})
+	if _, err := mgr.backupFlightFor("vm-1", "g"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.backupFlightFor("vm-1", "g"); err != nil {
+		t.Fatal("joining the same flight never counts against admission")
+	}
+	if _, err := mgr.backupFlightFor("vm-2", "g"); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("beyond the flight cap: err = %v, want ResourceExhausted", err)
 	}
 }

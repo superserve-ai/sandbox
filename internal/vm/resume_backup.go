@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -102,32 +101,30 @@ func (m *Manager) backupRevivedTarget(vmID, generation string) *VMInstance {
 
 // backupFlight is one fetch of a sandbox's backup, shared by every resume
 // attempt for the same generation and detached from the RPC deadlines
-// that observe it, so a retry picks the download up where it stands. A
-// finished fetch nobody claims is dropped with its staging dir.
+// that observe it, so a retry picks the download up where it stands. Its
+// state moves under the flights lock only: a finished fetch is either
+// claimed by exactly one resume, which then owns the staging, or dropped
+// by the cap or expiry, never both.
 type backupFlight struct {
-	generation  string
-	done        chan struct{}
-	claimed     chan struct{}
-	dropped     chan struct{}
-	claimOnce   sync.Once
-	dropOnce    sync.Once
+	generation string
+	done       chan struct{}
+	dropped    chan struct{}
+	restored   backup.Restored
+	err        error
+
+	// Guarded by Manager.backupFlightsMu.
+	state       flightState
 	completedAt time.Time
-	restored    backup.Restored
-	err         error
 }
 
-func (f *backupFlight) claim() { f.claimOnce.Do(func() { close(f.claimed) }) }
+type flightState int
 
-func (f *backupFlight) drop() { f.dropOnce.Do(func() { close(f.dropped) }) }
-
-func (f *backupFlight) unclaimed() bool {
-	select {
-	case <-f.claimed:
-		return false
-	default:
-		return !f.completedAt.IsZero()
-	}
-}
+const (
+	flightFetching flightState = iota
+	flightUnclaimed
+	flightClaimed
+	flightDropped
+)
 
 func (m *Manager) backupBaseDir() string { return filepath.Join(m.backupRestoreRoot, ".base-cache") }
 
@@ -137,6 +134,9 @@ func (m *Manager) restoreStagingDir(vmID string) string {
 	return filepath.Join(m.restoreStagingRoot(), vmID)
 }
 
+// backupFlightFor joins the flight already fetching the generation or
+// starts one, refusing outright when the host already carries as many
+// flights as it will queue.
 func (m *Manager) backupFlightFor(vmID, generation string) (*backupFlight, error) {
 	m.backupFlightsMu.Lock()
 	defer m.backupFlightsMu.Unlock()
@@ -146,7 +146,10 @@ func (m *Manager) backupFlightFor(vmID, generation string) (*backupFlight, error
 		}
 		return f, nil
 	}
-	f := &backupFlight{generation: generation, done: make(chan struct{}), claimed: make(chan struct{}), dropped: make(chan struct{})}
+	if len(m.backupFlights) >= m.backupRestore.MaxFlights {
+		return nil, status.Errorf(codes.ResourceExhausted, "vm %s: the host is restoring as many backups as it queues; retry later", vmID)
+	}
+	f := &backupFlight{generation: generation, done: make(chan struct{}), dropped: make(chan struct{})}
 	m.backupFlights[vmID] = f
 	go m.runBackupFlight(vmID, f)
 	return f, nil
@@ -167,27 +170,79 @@ func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 			return
 		}
 		log := m.log.With().Str("vm_id", vmID).Logger()
+		// Readers hold the cache lock shared; the prune below takes it
+		// exclusively, so nothing is deleted between discovery and open.
+		m.backupCacheMu.RLock()
 		f.restored, f.err = backup.FetchGeneration(ctx, m.backupBaseReader, vmID, f.generation, dest, func(format string, args ...any) {
 			log.Debug().Msgf(format, args...)
 		})
 		if f.err == nil {
 			f.err = m.promoteBase(&f.restored, dest)
 		}
+		m.backupCacheMu.RUnlock()
 		if m.backupRestore.CacheBytes > 0 {
+			m.backupCacheMu.Lock()
 			if _, perr := backup.PruneBaseCache(m.backupBaseDir(), m.backupRestore.CacheBytes); perr != nil {
 				log.Warn().Err(perr).Msg("backup base cache prune")
 			}
+			m.sweepPromotedBases()
+			m.backupCacheMu.Unlock()
 		}
-		m.sweepPromotedBases()
-		f.completedAt = time.Now()
 	}()
+	m.backupFlightsMu.Lock()
+	if f.state == flightFetching {
+		f.state, f.completedAt = flightUnclaimed, time.Now()
+	}
+	m.backupFlightsMu.Unlock()
 	m.dropUnclaimedBeyondCap()
 	select {
-	case <-f.claimed:
 	case <-f.dropped:
 	case <-time.After(m.backupRestore.AbandonAfter):
-		m.backupFlightDone(vmID, f)
-		_ = os.RemoveAll(dest)
+		m.dropFlights(func(id string, g *backupFlight) bool { return g == f })
+	}
+}
+
+// claimFlight hands the finished fetch to exactly one resume; false means
+// the cap or expiry dropped it first and the caller must start over.
+func (m *Manager) claimFlight(vmID string, f *backupFlight) bool {
+	m.backupFlightsMu.Lock()
+	defer m.backupFlightsMu.Unlock()
+	if f.state != flightUnclaimed {
+		return false
+	}
+	f.state = flightClaimed
+	if m.backupFlights[vmID] == f {
+		delete(m.backupFlights, vmID)
+	}
+	f.drop()
+	return true
+}
+
+func (f *backupFlight) drop() {
+	select {
+	case <-f.dropped:
+	default:
+		close(f.dropped)
+	}
+}
+
+// dropFlights marks every unclaimed flight victim selects as dropped under
+// the lock, then removes their staging outside it.
+func (m *Manager) dropFlights(victim func(vmID string, f *backupFlight) bool) {
+	var dests []string
+	m.backupFlightsMu.Lock()
+	for vmID, f := range m.backupFlights {
+		if f.state != flightUnclaimed || !victim(vmID, f) {
+			continue
+		}
+		f.state = flightDropped
+		delete(m.backupFlights, vmID)
+		f.drop()
+		dests = append(dests, m.restoreStagingDir(vmID))
+	}
+	m.backupFlightsMu.Unlock()
+	for _, d := range dests {
+		_ = os.RemoveAll(d)
 	}
 }
 
@@ -196,33 +251,22 @@ func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 // full sandbox disk per stalled request until each expires.
 func (m *Manager) dropUnclaimedBeyondCap() {
 	m.backupFlightsMu.Lock()
-	defer m.backupFlightsMu.Unlock()
-	type waiting struct {
-		vmID string
-		f    *backupFlight
-	}
-	var pending []waiting
-	for vmID, f := range m.backupFlights {
-		if f.unclaimed() {
-			pending = append(pending, waiting{vmID, f})
+	var pending []*backupFlight
+	for _, f := range m.backupFlights {
+		if f.state == flightUnclaimed {
+			pending = append(pending, f)
 		}
 	}
-	sort.Slice(pending, func(i, j int) bool { return pending[i].f.completedAt.Before(pending[j].f.completedAt) })
+	sort.Slice(pending, func(i, j int) bool { return pending[i].completedAt.Before(pending[j].completedAt) })
+	excess := map[*backupFlight]bool{}
 	for len(pending) > m.backupRestore.MaxUnclaimed {
-		oldest := pending[0]
+		excess[pending[0]] = true
 		pending = pending[1:]
-		delete(m.backupFlights, oldest.vmID)
-		oldest.f.drop()
-		_ = os.RemoveAll(m.restoreStagingDir(oldest.vmID))
-	}
-}
-
-func (m *Manager) backupFlightDone(vmID string, f *backupFlight) {
-	m.backupFlightsMu.Lock()
-	if m.backupFlights[vmID] == f {
-		delete(m.backupFlights, vmID)
 	}
 	m.backupFlightsMu.Unlock()
+	if len(excess) > 0 {
+		m.dropFlights(func(_ string, f *backupFlight) bool { return excess[f] })
+	}
 }
 
 // cleanupRestoreStaging drops whatever a backup-backed resume left for the
@@ -316,8 +360,9 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 	case <-ctx.Done():
 		return nil, status.Errorf(codes.Unavailable, "vm %s: backup restore in progress; retry", vmID)
 	}
-	flight.claim()
-	m.backupFlightDone(vmID, flight)
+	if !m.claimFlight(vmID, flight) {
+		return nil, status.Errorf(codes.Unavailable, "vm %s: the restored backup was dropped before this resume claimed it; retry", vmID)
+	}
 	m.recordPhases("resume", "backup", map[string]time.Duration{"backup_fetch": time.Since(tFetch)})
 	if flight.err != nil {
 		if errors.Is(flight.err, backup.ErrNoMatchingBackup) {
