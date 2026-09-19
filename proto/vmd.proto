@@ -390,6 +390,10 @@ message ResumeVMRequest {
   string preview_access = 7;
   repeated PreviewPort preview_ports = 8;
   int64 preview_policy_revision = 9;
+  // The backup generation the control plane recorded as covering the pause
+  // being resumed. When the pause artifacts are gone from the host, only
+  // that generation may stand in for them.
+  string backup_generation = 10;
 }
 
 message ResumeVMResponse {

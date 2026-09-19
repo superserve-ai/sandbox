@@ -535,7 +535,7 @@ func (c *grpcVMDClient) PauseInstance(ctx context.Context, vmID, snapshotDir, pa
 	return resp.SnapshotPath, resp.MemFilePath, manifest, acked, nil
 }
 
-func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
+func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, backupGeneration string) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
 	req := &vmdpb.ResumeVMRequest{
 		VmId:                  vmID,
 		SnapshotPath:          snapshotPath,
@@ -543,6 +543,7 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 		PreviewAccess:         previewAccess,
 		PreviewPorts:          previewPortsToProto(previewPorts),
 		PreviewPolicyRevision: previewPolicyRevision,
+		BackupGeneration:      backupGeneration,
 	}
 	if len(networkConfig) > 0 {
 		var persisted struct {

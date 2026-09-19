@@ -1017,8 +1017,24 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// earlier attempt's VM attests the same way.
 	var attested vmdclient.ResumeAttestation
 	statelessFallback := false
+	// Only a host that has lost the pause artifacts asks for the backup
+	// generation recorded as covering this pause; the ordinary resume
+	// never pays for the lookup. The generation is kept for the retry so
+	// a retry adopts the boot it started.
+	backupGeneration := ""
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), sandbox.HostID, func(ctx context.Context) (string, uint32, uint32, error) {
-		ip, vcpu, memMiB, att, rerr := vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig, resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision)
+		ip, vcpu, memMiB, att, rerr := vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig, resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, backupGeneration)
+		if vmdclient.IsPauseArtifactsMissing(rerr) && backupGeneration == "" {
+			gen, gerr := h.DB.CoveredBackupGeneration(ctx, sandboxID)
+			if gerr != nil && !errors.Is(gerr, pgx.ErrNoRows) {
+				l.Warn().Err(gerr).Msg("covered backup generation lookup failed")
+			}
+			if gen == "" {
+				return ip, vcpu, memMiB, rerr
+			}
+			backupGeneration = gen
+			ip, vcpu, memMiB, att, rerr = vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig, resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, backupGeneration)
+		}
 		attested = att
 		return ip, vcpu, memMiB, rerr
 	})

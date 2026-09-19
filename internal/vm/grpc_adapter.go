@@ -123,7 +123,22 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		}
 	}
 
-	inst, rulesApplied, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
+	var inst *VMInstance
+	var rulesApplied bool
+	switch {
+	case a.mgr.backupReader == nil:
+		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
+	case a.mgr.backupRevivedTarget(req.GetVmId(), req.GetBackupGeneration()) != nil:
+		inst, rulesApplied = a.mgr.backupRevivedTarget(req.GetVmId(), req.GetBackupGeneration()), resumeNetworkRules != nil
+	case a.mgr.pauseArtifactsMissing(req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath()):
+		if req.GetBackupGeneration() == "" {
+			return nil, pauseArtifactsMissingErr(req.GetVmId())
+		}
+		inst, err = a.mgr.resumeFromBackupLocked(ctx, req.GetVmId(), req.GetBackupGeneration(), resumeNetworkRules)
+		rulesApplied = resumeNetworkRules != nil
+	default:
+		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -1715,8 +1715,12 @@ type ResumeVMRequest struct {
 	PreviewAccess         string         `protobuf:"bytes,7,opt,name=preview_access,json=previewAccess,proto3" json:"preview_access,omitempty"`
 	PreviewPorts          []*PreviewPort `protobuf:"bytes,8,rep,name=preview_ports,json=previewPorts,proto3" json:"preview_ports,omitempty"`
 	PreviewPolicyRevision int64          `protobuf:"varint,9,opt,name=preview_policy_revision,json=previewPolicyRevision,proto3" json:"preview_policy_revision,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// The backup generation the control plane recorded as covering the pause
+	// being resumed. When the pause artifacts are gone from the host, only
+	// that generation may stand in for them.
+	BackupGeneration string `protobuf:"bytes,10,opt,name=backup_generation,json=backupGeneration,proto3" json:"backup_generation,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ResumeVMRequest) Reset() {
@@ -1803,6 +1807,13 @@ func (x *ResumeVMRequest) GetPreviewPolicyRevision() int64 {
 		return x.PreviewPolicyRevision
 	}
 	return 0
+}
+
+func (x *ResumeVMRequest) GetBackupGeneration() string {
+	if x != nil {
+		return x.BackupGeneration
+	}
+	return ""
 }
 
 type ResumeVMResponse struct {
@@ -4009,7 +4020,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"size_bytes\x18\x03 \x01(\x03R\tsizeBytes\x12\x16\n" +
 	"\x06sha256\x18\x04 \x01(\tR\x06sha256\x12\x1b\n" +
 	"\tbase_path\x18\x05 \x01(\tR\bbasePath\x12'\n" +
-	"\x0fallocated_bytes\x18\x06 \x01(\x03R\x0eallocatedBytes\"\x83\x04\n" +
+	"\x0fallocated_bytes\x18\x06 \x01(\x03R\x0eallocatedBytes\"\xb0\x04\n" +
 	"\x0fResumeVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -4018,7 +4029,9 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\benv_vars\x18\x05 \x03(\v2/.superserve.vmd.v1.ResumeVMRequest.EnvVarsEntryR\aenvVars\x12%\n" +
 	"\x0epreview_access\x18\a \x01(\tR\rpreviewAccess\x12C\n" +
 	"\rpreview_ports\x18\b \x03(\v2\x1e.superserve.vmd.v1.PreviewPortR\fpreviewPorts\x126\n" +
-	"\x17preview_policy_revision\x18\t \x01(\x03R\x15previewPolicyRevision\x1a:\n" +
+	"\x17preview_policy_revision\x18\t \x01(\x03R\x15previewPolicyRevision\x12+\n" +
+	"\x11backup_generation\x18\n" +
+	" \x01(\tR\x10backupGeneration\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x06\x10\aR\x0esecrets_broker\"\xdc\x02\n" +
