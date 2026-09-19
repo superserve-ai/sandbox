@@ -155,6 +155,9 @@ func (m *Manager) backupFlightFor(vmID, generation string) (*backupFlight, error
 	return f, nil
 }
 
+// fetchBackupGeneration is the fetch a flight runs; tests stand in for it.
+var fetchBackupGeneration = backup.FetchGeneration
+
 func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 	defer sentrylog.Recover("backup-fetch")
 	dest := m.restoreStagingDir(vmID)
@@ -162,13 +165,7 @@ func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 		// The flight is claimable before done is closed, so a woken waiter
 		// never finds it still fetching.
 		defer close(f.done)
-		defer func() {
-			m.backupFlightsMu.Lock()
-			if f.state == flightFetching {
-				f.state, f.completedAt = flightUnclaimed, time.Now()
-			}
-			m.backupFlightsMu.Unlock()
-		}()
+		defer m.publishFlight(f)
 		ctx, cancel := context.WithTimeout(context.Background(), m.backupRestore.FetchBudget)
 		defer cancel()
 		select {
@@ -182,13 +179,16 @@ func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 		// Readers hold the cache lock shared; the prune below takes it
 		// exclusively, so nothing is deleted between discovery and open.
 		m.backupCacheMu.RLock()
-		f.restored, f.err = backup.FetchGeneration(ctx, m.backupBaseReader, vmID, f.generation, dest, func(format string, args ...any) {
+		f.restored, f.err = fetchBackupGeneration(ctx, m.backupBaseReader, vmID, f.generation, dest, func(format string, args ...any) {
 			log.Debug().Msgf(format, args...)
 		})
 		if f.err == nil {
 			f.err = m.promoteBase(&f.restored, dest)
 		}
 		m.backupCacheMu.RUnlock()
+		// Published before any sweep runs, so the base this fetch holds
+		// counts as in use from here on.
+		m.publishFlight(f)
 		if m.backupRestore.CacheBytes > 0 {
 			m.backupCacheMu.Lock()
 			if _, perr := backup.PruneBaseCache(m.backupBaseDir(), m.backupRestore.CacheBytes); perr != nil {
@@ -204,6 +204,16 @@ func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 	case <-time.After(m.backupRestore.AbandonAfter):
 		m.dropFlights(func(id string, g *backupFlight) bool { return g == f })
 	}
+}
+
+// publishFlight makes a finished fetch claimable; the result fields are
+// complete before this and read only by states past it.
+func (m *Manager) publishFlight(f *backupFlight) {
+	m.backupFlightsMu.Lock()
+	if f.state == flightFetching {
+		f.state, f.completedAt = flightUnclaimed, time.Now()
+	}
+	m.backupFlightsMu.Unlock()
 }
 
 // claimFlight hands the finished fetch to exactly one resume; false means
