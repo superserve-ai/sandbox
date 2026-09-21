@@ -257,24 +257,32 @@ func TestIntegration_HostCapabilityRequiresActiveCurrentHeartbeat(t *testing.T) 
 	}
 }
 
+func findMigrationsDir() (string, error) {
+	// Walk up from the test file to the repo root (contains supabase/).
+	dir, _ := os.Getwd()
+	for {
+		migrationsDir := filepath.Join(dir, "supabase", "migrations")
+		if _, err := os.Stat(migrationsDir); err == nil {
+			return migrationsDir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("could not find supabase/migrations from %s", dir)
+		}
+		dir = parent
+	}
+}
+
 // applyMigrations reads SQL files from supabase/migrations/ and executes them
 // in order against the test database. Uses IF NOT EXISTS / OR REPLACE so it is
 // safe to run repeatedly against the same database.
 func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	// Walk up from the test file to the repo root (contains supabase/).
-	dir, _ := os.Getwd()
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "supabase", "migrations")); err == nil {
-			break
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return fmt.Errorf("could not find supabase/migrations from %s", dir)
-		}
-		dir = parent
+	migrationsDir, err := findMigrationsDir()
+	if err != nil {
+		return err
 	}
 
-	entries, err := os.ReadDir(filepath.Join(dir, "supabase", "migrations"))
+	entries, err := os.ReadDir(migrationsDir)
 	if err != nil {
 		return fmt.Errorf("read migrations dir: %w", err)
 	}
@@ -285,7 +293,7 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		if !strings.HasSuffix(e.Name(), ".sql") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, "supabase", "migrations", e.Name()))
+		data, err := os.ReadFile(filepath.Join(migrationsDir, e.Name()))
 		if err != nil {
 			return fmt.Errorf("read %s: %w", e.Name(), err)
 		}
@@ -3346,6 +3354,90 @@ func TestIntegration_BillingExportFeatureFlag(t *testing.T) {
 		PeriodEnd:   periodEnd,
 	}); err != nil {
 		t.Fatalf("expected billing export after enabling flag: %v", err)
+	}
+}
+
+func TestIntegration_BillingExportDefaultMigrationBackfillsExistingTeams(t *testing.T) {
+	ctx := context.Background()
+	missingTeam, _ := seedTeamAndKey(t)
+	optedOutTeam, _ := seedTeamAndKey(t)
+	alreadyEnabledTeam, _ := seedTeamAndKey(t)
+
+	migrationsDir, err := findMigrationsDir()
+	if err != nil {
+		t.Fatalf("find migrations directory: %v", err)
+	}
+	migration, err := os.ReadFile(filepath.Join(migrationsDir, "20260921190000_billing_export_enabled_by_default.sql"))
+	if err != nil {
+		t.Fatalf("read billing export default migration: %v", err)
+	}
+
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin migration test transaction: %v", err)
+	}
+	defer tx.Rollback(ctx) // The migration test must not alter shared fixtures.
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE feature_flag
+		SET enabled = false
+		WHERE key = 'billing_export_enabled'
+	`); err != nil {
+		t.Fatalf("seed pre-migration global default: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', false),
+		       ($2, 'billing_export_enabled', true)
+	`, optedOutTeam, alreadyEnabledTeam); err != nil {
+		t.Fatalf("seed existing team overrides: %v", err)
+	}
+
+	if _, err := tx.Exec(ctx, string(migration)); err != nil {
+		t.Fatalf("apply billing export default migration: %v", err)
+	}
+	if _, err := tx.Exec(ctx, string(migration)); err != nil {
+		t.Fatalf("reapply billing export default migration: %v", err)
+	}
+
+	checkTeamFlag := func(teamID uuid.UUID, want bool) {
+		t.Helper()
+		var got bool
+		if err := tx.QueryRow(ctx, `
+			SELECT enabled
+			FROM team_feature_flag
+			WHERE team_id = $1 AND key = 'billing_export_enabled'
+		`, teamID).Scan(&got); err != nil {
+			t.Fatalf("read billing export flag for %s: %v", teamID, err)
+		}
+		if got != want {
+			t.Fatalf("billing export flag for %s = %v, want %v", teamID, got, want)
+		}
+	}
+	checkTeamFlag(missingTeam, true)
+	checkTeamFlag(optedOutTeam, false)
+	checkTeamFlag(alreadyEnabledTeam, true)
+
+	var globalEnabled bool
+	if err := tx.QueryRow(ctx, `
+		SELECT enabled FROM feature_flag WHERE key = 'billing_export_enabled'
+	`).Scan(&globalEnabled); err != nil {
+		t.Fatalf("read migrated global default: %v", err)
+	}
+	if !globalEnabled {
+		t.Fatal("billing export global default remains disabled after migration")
+	}
+
+	var missingTeamRows int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM team_feature_flag
+		WHERE team_id = $1 AND key = 'billing_export_enabled'
+	`, missingTeam).Scan(&missingTeamRows); err != nil {
+		t.Fatalf("count backfilled team flags: %v", err)
+	}
+	if missingTeamRows != 1 {
+		t.Fatalf("backfilled team flag rows = %d, want 1 after rerun", missingTeamRows)
 	}
 }
 
