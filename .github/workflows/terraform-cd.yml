@@ -6,6 +6,7 @@ on:
     paths:
       - 'infra/**'
       - '.github/workflows/terraform-cd.yml'
+      - '.github/workflows/scripts/wait_credentials_key_iam.py'
 
 jobs:
   wait-for-migrations:
@@ -226,6 +227,8 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
+      - uses: google-github-actions/setup-gcloud@v2
+
       - name: Verify validation dependencies
         run: |
           set -euo pipefail
@@ -248,6 +251,9 @@ jobs:
             -target='module.iam.google_project_iam_member.project_bindings["cd_privateca_auditor"]' \
             -out=tfplan
           terraform apply -input=false -auto-approve tfplan
+
+      - name: Wait for credentials key IAM propagation
+        run: python3 .github/workflows/scripts/wait_credentials_key_iam.py --project "${{ vars.GCP_PROJECT }}"
 
   production-us-west2-infra:
     name: Apply production/us-west2

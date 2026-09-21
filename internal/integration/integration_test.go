@@ -1988,7 +1988,9 @@ func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
 func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) {
 	ctx := context.Background()
 	teamID, ownerKey := seedTeamAndKey(t)
-	r := newRouter(t)
+	r := newRouterWithNow(t, func() time.Time {
+		return time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	})
 
 	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
 	reportingStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
