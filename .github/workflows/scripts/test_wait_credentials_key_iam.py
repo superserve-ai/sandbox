@@ -41,6 +41,16 @@ class PermissionWaitTest(unittest.TestCase):
                 else:
                     self.assertFalse(wait_iam.has_permission('example-project'))
 
+    @patch.object(wait_iam.subprocess, 'check_output', return_value='example-token')
+    def test_transport_failure_retries_then_observes_permission(self, token):
+        for failure in (urllib.error.URLError('DNS unavailable'), TimeoutError('timed out'), ConnectionResetError('reset')):
+            with self.subTest(failure=type(failure).__name__):
+                response = io.BytesIO(json.dumps({'permissions': [wait_iam.PERMISSION]}).encode())
+                with patch.object(wait_iam.urllib.request, 'urlopen', side_effect=[failure, response]) as request, patch.object(wait_iam.time, 'sleep') as sleep:
+                    wait_iam.wait_for_permission('example-project')
+                self.assertEqual(request.call_count, 2)
+                sleep.assert_called_once()
+
     def test_waits_until_permission_is_effective(self):
         with patch.object(wait_iam, 'has_permission', side_effect=[False, True]) as check, patch.object(wait_iam.time, 'sleep') as sleep:
             wait_iam.wait_for_permission('example-project')
