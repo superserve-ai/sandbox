@@ -76,6 +76,22 @@ class ControlplaneIdentityTest(unittest.TestCase):
                     self.assertNotIn('controlplane_runtime', host)
                     self.assertNotIn('OPERATOR_API_TOKEN', host)
 
+    def test_cd_policy_management_is_scoped_to_credentials_key(self):
+        source = (ROOT / 'infra/envs/production/us-central1/cd-credentials-key-iam.tf').read_text()
+        self.assertIn('role    = "roles/iam.securityAdmin"', source)
+        self.assertIn('serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com', source)
+        self.assertIn("resource.type == 'cloudkms.googleapis.com/CryptoKey' && resource.name == 'projects/${local.project_id}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek'", source)
+        self.assertNotIn('roles/cloudkms.admin', source)
+        self.assertNotIn('resource.name.startsWith', source)
+
+    def test_key_policy_permission_bootstraps_before_both_regions(self):
+        workflow = (ROOT / '.github/workflows/terraform-cd.yml').read_text()
+        bootstrap = workflow.split('  production-us-central1-bootstrap:', 1)[1].split('\n  production-us-west2-infra:', 1)[0]
+        self.assertIn('-target=google_project_iam_member.cd_credentials_key_iam', bootstrap)
+        for region in ('us-east4', 'us-west2'):
+            job = workflow.split(f'  production-{region}-infra:', 1)[1].split('\n    steps:', 1)[0]
+            self.assertIn('production-us-central1-bootstrap', job)
+
     def test_controlplane_key_grants_exclude_deployment_identity(self):
         for region in ('us-east4', 'us-west2'):
             source = (ROOT / 'infra/envs/production' / region / 'controlplane-identity.tf').read_text()

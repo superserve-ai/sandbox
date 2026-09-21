@@ -150,9 +150,8 @@ resource "google_secret_manager_secret_iam_member" "api_runtime_secrets" {
 }
 
 # The api-runner SA's encrypt/decrypt grant on the credentials-kek KMS key is
-# managed out-of-band: the CD Terraform SA lacks KMS setIamPolicy on the key,
-# and the SA is shared across cells, so this follows the same out-of-band
-# pattern as the shared runtime secrets.
+# retained out-of-band for the legacy shared host identity. Regional roots own
+# the dedicated control-plane grants; do not adopt the legacy host grant here.
 
 
 # Production monitoring dashboards. These are fleet-wide (whole-fleet

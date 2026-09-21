@@ -203,7 +203,7 @@ jobs:
           echo "staging/us-central1 API deploy and smoke validation passed." >> "$GITHUB_STEP_SUMMARY"
 
   production-us-central1-bootstrap:
-    name: Bootstrap production/us-central1 project services
+    name: Bootstrap production/us-central1 project services and CD permissions
     runs-on: ubuntu-latest
     environment: production
     needs: [staging-us-central1-infra]
@@ -232,7 +232,7 @@ jobs:
           command -v jq
           command -v curl
 
-      - name: Apply production/us-central1 project services
+      - name: Apply production/us-central1 project services and CD permissions
         run: |
           set -euo pipefail
           echo "## Terraform rollout: production/us-central1 bootstrap" >> "$GITHUB_STEP_SUMMARY"
@@ -240,6 +240,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false \
+            -target=google_project_iam_member.cd_credentials_key_iam \
             -target=google_project_service.cloud_ids \
             -target=google_project_service.compute \
             -target=google_project_service.logging \
