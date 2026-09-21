@@ -125,21 +125,18 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 
 	var inst *VMInstance
 	var rulesApplied bool
-	restoreOn := a.mgr.BackupRestoreEnabled()
-	var revived *VMInstance
-	var needsGeneration bool
-	if restoreOn {
-		revived, needsGeneration = a.mgr.backupRevivedTarget(req.GetVmId(), req.GetBackupGeneration())
-	}
+	// A VM this host already booted from a backup is recognized from its
+	// record alone; only starting a new fetch depends on the switch.
+	revived, needsGeneration := a.mgr.backupRevivedTarget(req.GetVmId(), req.GetBackupGeneration())
 	switch {
-	case !restoreOn:
-		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
 	case needsGeneration:
 		return nil, pauseArtifactsMissingErr(req.GetVmId())
 	case revived != nil:
 		// Rules live in this process; after a restart the adopted VM has
 		// none until they are applied again.
 		inst, rulesApplied = revived, a.mgr.applyAdoptedNetworkRules(req.GetVmId(), resumeNetworkRules)
+	case !a.mgr.BackupRestoreEnabled():
+		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
 	case a.mgr.pauseArtifactsMissing(req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath()):
 		if req.GetBackupGeneration() == "" {
 			return nil, pauseArtifactsMissingErr(req.GetVmId())

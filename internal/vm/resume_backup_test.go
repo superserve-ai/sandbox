@@ -480,3 +480,21 @@ func TestResumeVMRetryWithoutAGenerationIsToldToLookItUp(t *testing.T) {
 		t.Fatalf("err = %v, want the mark that sends the control plane to look the generation up", err)
 	}
 }
+
+func TestAdoptionOfARevivedVMSurvivesTheFallbackBeingWithdrawn(t *testing.T) {
+	origDead, origProbe := vmDeadForRetry, boxdHealthProbe
+	vmDeadForRetry = func(*Manager, string) bool { return false }
+	boxdHealthProbe = func(context.Context, string, time.Duration) error { return nil }
+	defer func() { vmDeadForRetry, boxdHealthProbe = origDead, origProbe }()
+	live := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.9", PID: 7, BackupGeneration: "gen-a"}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": live}, netMgr: &ownedNetMgr{&fakeNetMgr{}}}
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, t.TempDir(), BackupRestoreOptions{})
+	mgr.DisableBackupRestore()
+	a := NewGRPCAdapter(mgr)
+
+	resp, err := a.ResumeVM(context.Background(), &vmdpb.ResumeVMRequest{VmId: "vm-1", SnapshotPath: "/gone/vmstate.snap", MemFilePath: "/gone/mem.snap", BackupGeneration: "gen-a"})
+	if err != nil || resp.GetPid() != 7 {
+		t.Fatalf("withdrawing the fallback must not orphan a VM it already booted: resp=%v err=%v", resp, err)
+	}
+}
