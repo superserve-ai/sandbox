@@ -328,6 +328,11 @@ func (m *Manager) restorePausedAnchor(vmID string) {
 	if m.state == nil {
 		return
 	}
+	// Destroy bypasses the lifecycle lock this resume holds; the record
+	// owner lock is what it does take, so holding it across the read and
+	// the publication keeps a destroyed record from coming back.
+	unlockOwner := m.lockRecordOwner(vmID)
+	defer unlockOwner()
 	if _, destroying := m.destroying.Load(vmID); destroying {
 		return
 	}

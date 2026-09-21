@@ -682,3 +682,44 @@ func TestATornDownBackupBootLeavesTheVMRecoverableOnRetry(t *testing.T) {
 		t.Fatalf("retry: err = %v fetches = %d, want recovery re-entered from the parked record", err, fetches)
 	}
 }
+
+func TestRestorePausedAnchorYieldsToADestroyThatFinishesFirst(t *testing.T) {
+	dir := t.TempDir()
+	stateStore, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stateStore.Close()
+	if err := stateStore.Put(VMRecord{ID: "vm-1", Status: StatusPaused, RevivalPending: true}); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{log: zerolog.Nop(), state: stateStore, vms: map[string]*VMInstance{}}
+
+	// A destroy in progress holds the record owner lock and then deletes
+	// the record; the anchor must wait for it and find nothing to restore.
+	unlock := mgr.lockRecordOwner("vm-1")
+	done := make(chan struct{})
+	go func() {
+		mgr.restorePausedAnchor("vm-1")
+		close(done)
+	}()
+	time.Sleep(30 * time.Millisecond)
+	if err := stateStore.Delete("vm-1"); err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	<-done
+	if mgr.vms["vm-1"] != nil {
+		t.Fatal("a record the destroy deleted must not be republished")
+	}
+
+	// And a destroy that has only marked itself in progress wins as well.
+	if err := stateStore.Put(VMRecord{ID: "vm-1", Status: StatusPaused, RevivalPending: true}); err != nil {
+		t.Fatal(err)
+	}
+	mgr.destroying.Store("vm-1", struct{}{})
+	mgr.restorePausedAnchor("vm-1")
+	if mgr.vms["vm-1"] != nil {
+		t.Fatal("a destroy in progress must win over the anchor")
+	}
+}

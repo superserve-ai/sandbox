@@ -1988,9 +1988,8 @@ func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
 func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) {
 	ctx := context.Background()
 	teamID, ownerKey := seedTeamAndKey(t)
-	r := newRouterWithNow(t, func() time.Time {
-		return time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
-	})
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	r := newRouterWithNow(t, func() time.Time { return now })
 
 	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
 	reportingStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
@@ -2020,9 +2019,9 @@ func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) 
 	if !ok {
 		t.Fatalf("billing_period not an object: %v", body["billing_period"])
 	}
-	// The summary reports the anniversary period that contains now, which
-	// rolls forward a month at a time from the anchor.
-	wantStart, wantEnd, anchored := billing.AnniversaryPeriod(anchor, time.Now())
+	// The summary reports the anniversary period containing the router's
+	// clock, which rolls forward a month at a time from the anchor.
+	wantStart, wantEnd, anchored := billing.AnniversaryPeriod(anchor, now)
 	if !anchored {
 		t.Fatalf("anchor %s is not yet in effect", anchor)
 	}
