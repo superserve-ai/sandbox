@@ -3279,6 +3279,17 @@ func TestIntegration_BillingExportFeatureFlag(t *testing.T) {
 	periodStart := time.Now().UTC().Truncate(time.Hour)
 	periodEnd := periodStart.Add(24 * time.Hour)
 
+	enabled, err := testQueries.IsFeatureEnabledForTeam(ctx, db.IsFeatureEnabledForTeamParams{
+		Key:    "billing_export_enabled",
+		TeamID: pgtype.UUID{Bytes: teamID, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("check billing export default: %v", err)
+	}
+	if !enabled {
+		t.Fatal("billing export disabled for newly created team")
+	}
+
 	if _, err := testQueries.UpsertTeamBillingPeriod(ctx, db.UpsertTeamBillingPeriodParams{
 		TeamID:      teamID,
 		PeriodStart: periodStart,
@@ -3296,12 +3307,20 @@ func TestIntegration_BillingExportFeatureFlag(t *testing.T) {
 		t.Fatalf("upsert billing usage before export: %v", err)
 	}
 
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("disable billing_export_enabled: %v", err)
+	}
+
 	if _, err := testQueries.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{
 		TeamID:      teamID,
 		PeriodStart: periodStart,
 		PeriodEnd:   periodEnd,
 	}); err == nil {
-		t.Fatal("expected billing export to be gated off by default")
+		t.Fatal("expected explicit billing export opt-out to gate export")
 	}
 
 	if _, err := testPool.Exec(ctx, `
