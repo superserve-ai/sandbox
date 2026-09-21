@@ -566,3 +566,75 @@ func TestSweepPromotedBasesWaitsForReattach(t *testing.T) {
 		t.Fatal("unreferenced base not swept after reattach completed")
 	}
 }
+
+func TestEvictionRetiresStagingBeforeAReplacementCanClaimThePath(t *testing.T) {
+	root := t.TempDir()
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, root, BackupRestoreOptions{})
+	touch(t, filepath.Join(mgr.restoreStagingDir("vm-1"), "rootfs.ext4"))
+	f := &backupFlight{generation: "g", done: make(chan struct{}), dropped: make(chan struct{}), state: flightUnclaimed, completedAt: time.Now()}
+	close(f.done)
+	mgr.backupFlights["vm-1"] = f
+
+	mgr.dropFlights(func(string, *backupFlight) bool { return true })
+	if _, err := os.Stat(mgr.restoreStagingDir("vm-1")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the retired directory must be gone from the path a retry will use")
+	}
+	replacement := touch(t, filepath.Join(mgr.restoreStagingDir("vm-1"), "rootfs.ext4"))
+	time.Sleep(50 * time.Millisecond)
+	if _, err := os.Stat(replacement); err != nil {
+		t.Fatal("a retry's fresh download must not be deleted by the old flight's eviction")
+	}
+	entries, _ := os.ReadDir(mgr.restoreStagingRoot())
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".dropped-") {
+			t.Fatalf("retired staging %s must be deleted", e.Name())
+		}
+	}
+}
+
+func TestAFailedBackupBootLeavesTheVMRecoverableOnRetry(t *testing.T) {
+	origDead, origProbe := vmDeadForRetry, boxdHealthProbe
+	vmDeadForRetry = func(*Manager, string) bool { return true }
+	boxdHealthProbe = func(context.Context, string, time.Duration) error { return nil }
+	defer func() { vmDeadForRetry, boxdHealthProbe = origDead, origProbe }()
+
+	dir := t.TempDir()
+	stateStore, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stateStore.Close()
+	// A run dir that is a file makes every rootfs copy fail.
+	runDir := touch(t, filepath.Join(dir, "rundir-is-a-file"))
+	rec := VMRecord{ID: "vm-1", Status: StatusPaused, TeamID: "team", SnapshotPath: filepath.Join(dir, "gone", "vmstate.snap"), MemFilePath: filepath.Join(dir, "gone", "mem.snap"), VCPU: 1, MemoryMiB: 256}
+	if err := stateStore.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{log: zerolog.Nop(), state: stateStore, cfg: ManagerConfig{RunDir: runDir}, vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{},
+		unitDead: func(context.Context, string) bool { return true }}
+	mgr.reattachComplete.Store(true)
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, filepath.Join(dir, ".restore"), BackupRestoreOptions{})
+	fetches := 0
+	orig := fetchBackupGeneration
+	fetchBackupGeneration = func(_ context.Context, _ backup.BlobReader, _, _, dest string, _ backup.ProgressFunc) (backup.Restored, error) {
+		fetches++
+		disk := touch(t, filepath.Join(dest, "rootfs.ext4"))
+		return backup.Restored{Disk: disk, Standalone: true, Manifest: &backup.GenerationManifest{Generation: "g"}}, nil
+	}
+	defer func() { fetchBackupGeneration = orig }()
+	a := NewGRPCAdapter(mgr)
+	req := &vmdpb.ResumeVMRequest{VmId: "vm-1", BackupGeneration: "g"}
+
+	if _, err := a.ResumeVM(context.Background(), req); err == nil || !strings.Contains(err.Error(), "copy rootfs") {
+		t.Fatalf("first attempt: err = %v, want the injected copy failure", err)
+	}
+	if _, err := a.ResumeVM(context.Background(), req); err == nil || !strings.Contains(err.Error(), "copy rootfs") {
+		t.Fatalf("retry: err = %v, want recovery re-entered and the same injected failure, not a refused ordinary resume", err)
+	}
+	if fetches != 2 {
+		t.Fatalf("fetches = %d, want the retry to fetch again", fetches)
+	}
+}

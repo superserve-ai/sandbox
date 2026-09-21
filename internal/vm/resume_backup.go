@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -255,9 +256,11 @@ func (f *backupFlight) drop() {
 }
 
 // dropFlights marks every unclaimed flight victim selects as dropped under
-// the lock, then removes their staging outside it.
+// the lock and retires its staging there too, so a retry that registers
+// the moment the lock is released writes to a path nothing else deletes.
+// The retired directories are removed outside the lock.
 func (m *Manager) dropFlights(victim func(vmID string, f *backupFlight) bool) {
-	var dests []string
+	var retired []string
 	m.backupFlightsMu.Lock()
 	for vmID, f := range m.backupFlights {
 		if f.state != flightUnclaimed || !victim(vmID, f) {
@@ -266,12 +269,29 @@ func (m *Manager) dropFlights(victim func(vmID string, f *backupFlight) bool) {
 		f.state = flightDropped
 		delete(m.backupFlights, vmID)
 		f.drop()
-		dests = append(dests, m.restoreStagingDir(vmID))
+		if aside, ok := m.retireStagingLocked(vmID); ok {
+			retired = append(retired, aside)
+		}
 	}
 	m.backupFlightsMu.Unlock()
-	for _, d := range dests {
+	for _, d := range retired {
 		_ = os.RemoveAll(d)
 	}
+}
+
+// retireStagingLocked renames a VM's staging aside in one step, under the
+// flights lock, and reports the new path to delete.
+func (m *Manager) retireStagingLocked(vmID string) (string, bool) {
+	dir := m.restoreStagingDir(vmID)
+	if _, err := os.Stat(dir); err != nil {
+		return "", false
+	}
+	aside := dir + ".dropped-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	if err := os.Rename(dir, aside); err != nil {
+		m.log.Warn().Err(err).Str("vm_id", vmID).Msg("restore staging could not be retired")
+		return "", false
+	}
+	return aside, true
 }
 
 // dropUnclaimedBeyondCap keeps completed fetches waiting for a retry within
@@ -297,6 +317,39 @@ func (m *Manager) dropUnclaimedBeyondCap() {
 	}
 }
 
+// restorePausedAnchor makes memory follow the durable record after a
+// failed backup boot: revival puts the paused record back, but the failed
+// instance it booted stays in the map in the error state, where the next
+// resume would no longer see a paused VM to recover. Only that exact
+// state is replaced; a failure whose teardown is unconfirmed keeps its
+// error record durably and is left alone.
+func (m *Manager) restorePausedAnchor(vmID string) {
+	if m.state == nil {
+		return
+	}
+	rec, err := m.state.Get(vmID)
+	if err != nil || rec.Status != StatusPaused {
+		return
+	}
+	m.mu.Lock()
+	inst := m.vms[vmID]
+	failed := false
+	if inst != nil {
+		inst.mu.RLock()
+		failed = inst.Status == StatusError
+		inst.mu.RUnlock()
+	}
+	if failed {
+		// Folded back here rather than through the on-demand loader: a
+		// record with a revival pending is parked by that loader while
+		// this resume's own lock is held.
+		restored := toInstance(*rec)
+		m.vms[vmID] = restored
+		m.indexVM(vmID, restored)
+	}
+	m.mu.Unlock()
+}
+
 // retainStagingForRetry keeps a finished restore for the retry that follows
 // a deadline, and drops it once the retention passes with no flight around
 // to use it.
@@ -304,9 +357,13 @@ func (m *Manager) retainStagingForRetry(vmID string) {
 	time.AfterFunc(m.backupRestore.AbandonAfter, func() {
 		m.backupFlightsMu.Lock()
 		_, inFlight := m.backupFlights[vmID]
-		m.backupFlightsMu.Unlock()
+		aside, retired := "", false
 		if !inFlight {
-			_ = os.RemoveAll(m.restoreStagingDir(vmID))
+			aside, retired = m.retireStagingLocked(vmID)
+		}
+		m.backupFlightsMu.Unlock()
+		if retired {
+			_ = os.RemoveAll(aside)
 		}
 	})
 }
@@ -444,6 +501,7 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 	revived, err := m.reviveVMLocked(ctx, vmID, r.Disk, r.Base, r.Standalone, false, teamID, ownerID, vcpu, memMiB, rules, generation)
 	m.recordPhases("resume", "backup", map[string]time.Duration{"backup_boot": time.Since(tBoot)})
 	if err != nil {
+		m.restorePausedAnchor(vmID)
 		if ctx.Err() != nil {
 			// The download is done and the caller's retry is imminent;
 			// starting it over would only run out of time again.
