@@ -71,13 +71,35 @@ func (h *Handlers) AdoptBillingExports(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	resources := map[string]string{}
+	resources := map[[2]string]bool{}
 	for _, resource := range h.billingResourceStates(storage) {
 		if resource.Billable && resource.CheckoutEnabled {
-			resources[billingExportResourceType(resource.ResourceKey)] = resource.StripeEventName
+			resources[[2]string{billingExportResourceType(resource.ResourceKey), resource.StripeEventName}] = true
 		}
 	}
-	totals := map[string]*big.Rat{}
+	rows, err := h.Pool.Query(ctx, `SELECT DISTINCT resource_type,stripe_event_name FROM billing_usage_export
+        WHERE team_id=$1 AND period_start=$2 AND period_end=$3
+        AND status NOT IN ('skipped_shadow','skipped_zero','skipped_disabled')`, team, start, end)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	for rows.Next() {
+		var meter [2]string
+		if err = rows.Scan(&meter[0], &meter[1]); err != nil {
+			rows.Close()
+			respondError(c, ErrInternal)
+			return
+		}
+		resources[meter] = true
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	totals := map[[2]string]*big.Rat{}
 	seen := map[string]bool{}
 	observationEnd := h.nowUTC()
 	if end.Before(observationEnd) {
@@ -92,26 +114,26 @@ func (h *Handlers) AdoptBillingExports(c *gin.Context) {
 			return
 		}
 		value, ok := new(big.Rat).SetString(event.Quantity)
-		if !ok || value.Sign() <= 0 || event.Identifier == "" || event.IdempotencyKey == "" || seen[event.Identifier] || event.CustomerID != *account.StripeCustomerID || resources[event.Resource] != event.EventName || event.EventName == "" || event.Through.After(h.nowUTC()) || event.Timestamp < queryStart.Unix() || event.Timestamp >= queryEnd.Unix() {
+		if !ok || value.Sign() <= 0 || event.Identifier == "" || event.IdempotencyKey == "" || seen[event.Identifier] || event.CustomerID != *account.StripeCustomerID || !resources[[2]string{event.Resource, event.EventName}] || event.EventName == "" || event.Through.After(h.nowUTC()) || event.Timestamp < queryStart.Unix() || event.Timestamp >= queryEnd.Unix() {
 			respondErrorMsg(c, "bad_request", "invalid or duplicate adoption payload", http.StatusBadRequest)
 			return
 		}
 		seen[event.Identifier] = true
-		if totals[event.Resource] == nil {
-			totals[event.Resource] = new(big.Rat)
+		if totals[[2]string{event.Resource, event.EventName}] == nil {
+			totals[[2]string{event.Resource, event.EventName}] = new(big.Rat)
 		}
-		totals[event.Resource].Add(totals[event.Resource], value)
+		totals[[2]string{event.Resource, event.EventName}].Add(totals[[2]string{event.Resource, event.EventName}], value)
 	}
 	through := h.nowUTC().Truncate(time.Minute)
 	if end.Before(through) {
 		through = end
 	}
-	// Read every billable meter: omitting an additional manual resource must
+	// Read current and persisted legacy meters: omitting an additional resource must
 	// fail the same way as a mismatch in a listed resource.
-	for resource, eventName := range resources {
-		counted, readErr := reader.CountedMeterUsage(ctx, eventName, *account.StripeCustomerID, start, through)
+	for meter := range resources {
+		counted, readErr := reader.CountedMeterUsage(ctx, meter[1], *account.StripeCustomerID, start, through)
 		actual, valid := new(big.Rat).SetString(counted)
-		expected := totals[resource]
+		expected := totals[meter]
 		if expected == nil {
 			expected = new(big.Rat)
 		}
