@@ -151,30 +151,45 @@ func (h *Handlers) incrementalReconciliationItems(ctx context.Context, p billing
 	if err != nil {
 		return nil, err
 	}
-	for _, resource := range resources {
-		if resource.Billable && resource.CheckoutEnabled {
+	configured := make(map[string]bool, len(items))
+	for _, item := range items {
+		configured[item.ResourceType] = true
+	}
+	rows, err := h.Pool.Query(ctx, `SELECT DISTINCT resource_type FROM billing_export_allocation
+        WHERE team_id=$1 AND period_start=$2 AND period_end=$3 ORDER BY resource_type`, p.TeamID, p.Start, p.End)
+	if err != nil {
+		return nil, err
+	}
+	var persisted []string
+	for rows.Next() {
+		var resource string
+		if err = rows.Scan(&resource); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		persisted = append(persisted, resource)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	store := billing.ExportStore{Pool: h.Pool}
+	for _, resource := range persisted {
+		if configured[resource] {
 			continue
 		}
-		var allocated bool
-		err := h.Pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_export_allocation
-            WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND resource_type=$4)`,
-			p.TeamID, p.Start, p.End, billingExportResourceType(resource.ResourceKey)).Scan(&allocated)
+		totals, err := store.Totals(ctx, p, resource)
 		if err != nil {
 			return nil, err
 		}
-		if allocated {
-			totals, err := (billing.ExportStore{Pool: h.Pool}).Totals(ctx, p, billingExportResourceType(resource.ResourceKey))
-			if err != nil {
-				return nil, err
-			}
-			// Measurements can keep growing after disablement; only existing
-			// reservations and reviewed corrections remain billable.
-			items = append(items, incrementalExportItem{
-				ResourceType: billingExportResourceType(resource.ResourceKey),
-				EventName:    resource.StripeEventName,
-				Quantity:     totals.Reserved,
-			})
+		name, err := store.MeterEventName(ctx, p, resource, "")
+		if err != nil {
+			return nil, err
 		}
+		// Disabled or removed resources retain their existing coverage, not
+		// any subsequent measurements. The persisted events pin the meter.
+		items = append(items, incrementalExportItem{ResourceType: resource, EventName: name, Quantity: totals.Reserved})
 	}
 	return items, nil
 }

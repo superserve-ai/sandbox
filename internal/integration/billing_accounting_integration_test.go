@@ -199,19 +199,29 @@ func TestIntegration_BillingExportAccountingInsertionCursors(t *testing.T) {
 	first := uuid.MustParse("80000000-0000-4000-8000-000000000001")
 	tied := uuid.MustParse("80000000-0000-4000-8000-000000000002")
 	later := uuid.MustParse("10000000-0000-4000-8000-000000000001")
+	exec := testPool.Exec
 	insert := func(id uuid.UUID, at time.Time) {
 		t.Helper()
-		if _, err := testPool.Exec(t.Context(), `INSERT INTO billing_export_event
+		if _, err := exec(t.Context(), `INSERT INTO billing_export_event
             (id,allocation_id,identifier,idempotency_key,event_name,customer_id,quantity,quantity_payload,event_timestamp,source,status,active,created_at)
             SELECT $1::uuid,allocation_id,($1::uuid)::text,($1::uuid)::text,event_name,customer_id,quantity,quantity_payload,event_timestamp,source,status,false,$3
             FROM billing_export_event WHERE id=$2`, id, original.ID, at); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := testPool.Exec(t.Context(), `INSERT INTO billing_export_correction
+		if _, err := exec(t.Context(), `INSERT INTO billing_export_correction
             (id,team_id,period_start,period_end,resource_type,frozen,version,measured_quantity,baseline_quantity,reserved_quantity,target_quantity,measurement_snapshot,created_at)
             VALUES ($1,$2,$3,$4,'cpu',false,0,1,1,1,1,'fixture',$5)`, id, period.TeamID, period.Start, period.End, at); err != nil {
 			t.Fatal(err)
 		}
+	}
+	tx, err := testPool.Begin(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(t.Context())
+	var transactionStart time.Time
+	if err := tx.QueryRow(t.Context(), `SELECT now()`).Scan(&transactionStart); err != nil {
+		t.Fatal(err)
 	}
 	insert(first, created)
 	insert(tied, created)
@@ -246,8 +256,12 @@ func TestIntegration_BillingExportAccountingInsertionCursors(t *testing.T) {
 		}
 	}
 	read("", []uuid.UUID{original.ID, first, tied}, []uuid.UUID{first, tied})
-	// The new rows sort below the previous cursor by UUID, but after it by creation time.
-	insert(later, created.Add(time.Second))
+	// A transaction begun before the previous page commits rows with an older timestamp.
+	exec = tx.Exec
+	insert(later, transactionStart)
+	if err := tx.Commit(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	read("?after="+tied.String()+"&after_correction="+tied.String(), []uuid.UUID{later}, []uuid.UUID{later})
 	read("?after="+first.String(), []uuid.UUID{tied, later}, []uuid.UUID{first, tied, later})
 	read("?after_correction="+first.String(), []uuid.UUID{original.ID, first, tied, later}, []uuid.UUID{tied, later})

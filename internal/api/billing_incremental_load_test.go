@@ -496,6 +496,10 @@ func TestIntegration_IncrementalWorkerLoad(t *testing.T) {
 			testOlderPeriodFailure(t, pool, recovery)
 		})
 	}
+	t.Run("period-attempt-fairness", func(t *testing.T) {
+		exec(`UPDATE billing_export_work SET next_run_at='infinity',next_reconcile_at='infinity'`)
+		testPeriodAttemptFairness(t, pool)
+	})
 	t.Run("boundary-storage-enablement", func(t *testing.T) {
 		testBoundaryStorageEnablement(t, pool)
 	})
@@ -566,7 +570,7 @@ type olderPeriodFailureStripe struct {
 }
 
 func (s *olderPeriodFailureStripe) CountedMeterUsage(ctx context.Context, event, customer string, start, end time.Time) (string, error) {
-	if start.Equal(s.failedStart) {
+	if !start.After(s.failedStart) {
 		if s.recovery {
 			return "1", nil
 		}
@@ -626,6 +630,62 @@ func testOlderPeriodFailure(t *testing.T, pool *pgxpool.Pool, recovery bool) {
  FROM billing_export_work WHERE team_id=$1`, team.ID, billingPeriodID(anchor, current)).Scan(&recorded); err != nil || !recorded {
 			t.Fatalf("period failure and retry backoff not preserved: recorded=%v err=%v", recorded, err)
 		}
+	}
+}
+
+func testPeriodAttemptFairness(t *testing.T, pool *pgxpool.Pool) {
+	ctx := t.Context()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	current := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	anchor := current.AddDate(0, -3, 0)
+	provider := &olderPeriodFailureStripe{failedStart: current.AddDate(0, -1, 0), failure: errors.New("example summary unavailable")}
+	h := &Handlers{Pool: pool, DB: db.New(pool), Stripe: provider, Now: func() time.Time { return now }}
+	team, err := h.DB.CreateTeam(ctx, "example-period-fairness")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_status,commercial_billing_anchor)
+ VALUES($1,$2,'active',$3)`, team.ID, "cus_example_"+team.ID.String(), anchor)
+	exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true),($1,'billing_storage_billing_enabled',false)
+ ON CONFLICT(team_id,key) DO UPDATE SET enabled=EXCLUDED.enabled`, team.ID)
+	exec(`INSERT INTO billing_export_work(team_id,next_run_at,next_reconcile_at,seed_complete,next_correction_at)
+ VALUES($1,now()-interval '100 years','infinity',true,$2)`, team.ID, now.Add(24*time.Hour))
+	for _, start := range []time.Time{anchor, anchor.AddDate(0, 1, 0), anchor.AddDate(0, 2, 0), current} {
+		end := start.AddDate(0, 1, 0)
+		exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open')`, team.ID, start, end)
+		exec(`INSERT INTO billing_incremental_period(team_id,period_start,period_end) VALUES($1,$2,$3)`, team.ID, start, end)
+		exec(`INSERT INTO billing_export_usage(team_id,period_start,period_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds)
+ VALUES($1,$2,$3,3600,0,0)`, team.ID, start, end)
+	}
+	wantErr := provider.failure
+	for attempt := 0; attempt < 2; attempt++ {
+		exec(`UPDATE billing_export_work SET next_run_at=now()-interval '100 years' WHERE team_id=$1`, team.ID)
+		worked, measured, err := h.incrementalBillingTick(ctx, time.Hour)
+		if !worked || measured != 0 || err == nil {
+			t.Fatalf("tick: worked=%v measured=%d err=%v", worked, measured, err)
+		}
+		if attempt == 0 && len(provider.calls) != 0 {
+			t.Fatalf("first batch unexpectedly submitted: %+v", provider.calls)
+		}
+		if attempt == 1 && (len(provider.calls) != 1 || provider.calls[0].Timestamp < current.Unix()) {
+			t.Fatalf("later period starved behind failed periods: %+v", provider.calls)
+		}
+	}
+	// Reconciliation has its own bounded queue and must also rotate on errors.
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := h.reconcileIncrementalBillingTeam(ctx, team.ID); !errors.Is(err, wantErr) {
+			t.Fatalf("reconcile: %v", err)
+		}
+	}
+	var attempted int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM billing_incremental_period WHERE team_id=$1 AND last_reconcile_attempt_at IS NOT NULL`, team.ID).Scan(&attempted); err != nil || attempted != 4 {
+		t.Fatalf("reconciliation skipped periods: attempted=%d err=%v", attempted, err)
 	}
 }
 
@@ -1491,13 +1551,21 @@ func testBoundaryStorageEnablement(t *testing.T, pool *pgxpool.Pool) {
 			if err != nil || quantity != "1.500000000000" {
 				t.Fatalf("full-hour measured storage=%s err=%v", quantity, err)
 			}
-			for _, checkoutDisabled := range []bool{false, true} {
+			for _, mode := range []string{"unbillable", "checkout-disabled", "removed"} {
 				resources := h.billingResourceStates(true)
 				for i := range resources {
 					if resources[i].ResourceKey == "storage_gib" {
-						resources[i].Billable = checkoutDisabled
-						resources[i].CheckoutEnabled = !checkoutDisabled
+						resources[i].Billable = mode == "checkout-disabled"
+						resources[i].CheckoutEnabled = mode != "checkout-disabled"
 						resources[i].StripeEventName = "renamed_storage_hours"
+					}
+				}
+				if mode == "removed" {
+					for i := range resources {
+						if resources[i].ResourceKey == "storage_gib" {
+							resources = append(resources[:i], resources[i+1:]...)
+							break
+						}
 					}
 				}
 				items, err := h.incrementalReconciliationItems(ctx, p, usage, resources)

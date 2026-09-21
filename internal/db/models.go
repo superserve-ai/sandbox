@@ -349,6 +349,7 @@ type BillingExportCorrection struct {
 	ApprovalSnapshot    *string            `json:"approval_snapshot"`
 	Action              *string            `json:"action"`
 	Evidence            *string            `json:"evidence"`
+	AccountingSequence  int64              `json:"accounting_sequence"`
 }
 
 type BillingExportDiscovery struct {
@@ -359,31 +360,32 @@ type BillingExportDiscovery struct {
 }
 
 type BillingExportEvent struct {
-	ID               uuid.UUID          `json:"id"`
-	AllocationID     uuid.UUID          `json:"allocation_id"`
-	Identifier       string             `json:"identifier"`
-	IdempotencyKey   string             `json:"idempotency_key"`
-	EventName        string             `json:"event_name"`
-	CustomerID       string             `json:"customer_id"`
-	Quantity         pgtype.Numeric     `json:"quantity"`
-	QuantityPayload  string             `json:"quantity_payload"`
-	EventTimestamp   int64              `json:"event_timestamp"`
-	Source           string             `json:"source"`
-	Evidence         *string            `json:"evidence"`
-	RecoveryOutcome  *string            `json:"recovery_outcome"`
-	RecoveryEvidence *string            `json:"recovery_evidence"`
-	Replaces         pgtype.UUID        `json:"replaces"`
-	Active           bool               `json:"active"`
-	Status           string             `json:"status"`
-	FirstAttemptAt   pgtype.Timestamptz `json:"first_attempt_at"`
-	SubmittedAt      pgtype.Timestamptz `json:"submitted_at"`
-	NextAttemptAt    time.Time          `json:"next_attempt_at"`
-	LeaseToken       pgtype.UUID        `json:"lease_token"`
-	LeaseUntil       pgtype.Timestamptz `json:"lease_until"`
-	AttemptCount     int32              `json:"attempt_count"`
-	LastError        *string            `json:"last_error"`
-	CreatedAt        time.Time          `json:"created_at"`
-	UpdatedAt        time.Time          `json:"updated_at"`
+	ID                 uuid.UUID          `json:"id"`
+	AllocationID       uuid.UUID          `json:"allocation_id"`
+	Identifier         string             `json:"identifier"`
+	IdempotencyKey     string             `json:"idempotency_key"`
+	EventName          string             `json:"event_name"`
+	CustomerID         string             `json:"customer_id"`
+	Quantity           pgtype.Numeric     `json:"quantity"`
+	QuantityPayload    string             `json:"quantity_payload"`
+	EventTimestamp     int64              `json:"event_timestamp"`
+	Source             string             `json:"source"`
+	Evidence           *string            `json:"evidence"`
+	RecoveryOutcome    *string            `json:"recovery_outcome"`
+	RecoveryEvidence   *string            `json:"recovery_evidence"`
+	Replaces           pgtype.UUID        `json:"replaces"`
+	Active             bool               `json:"active"`
+	Status             string             `json:"status"`
+	FirstAttemptAt     pgtype.Timestamptz `json:"first_attempt_at"`
+	SubmittedAt        pgtype.Timestamptz `json:"submitted_at"`
+	NextAttemptAt      time.Time          `json:"next_attempt_at"`
+	LeaseToken         pgtype.UUID        `json:"lease_token"`
+	LeaseUntil         pgtype.Timestamptz `json:"lease_until"`
+	AttemptCount       int32              `json:"attempt_count"`
+	LastError          *string            `json:"last_error"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+	AccountingSequence int64              `json:"accounting_sequence"`
 }
 
 type BillingExportMeasurement struct {
@@ -422,13 +424,14 @@ type BillingExportObservation struct {
 }
 
 type BillingExportUsage struct {
-	TeamID            uuid.UUID      `json:"team_id"`
-	PeriodStart       time.Time      `json:"period_start"`
-	PeriodEnd         time.Time      `json:"period_end"`
-	VcpuSeconds       pgtype.Numeric `json:"vcpu_seconds"`
-	MemoryMibSeconds  pgtype.Numeric `json:"memory_mib_seconds"`
-	StorageMibSeconds pgtype.Numeric `json:"storage_mib_seconds"`
-	UpdatedAt         time.Time      `json:"updated_at"`
+	TeamID              uuid.UUID          `json:"team_id"`
+	PeriodStart         time.Time          `json:"period_start"`
+	PeriodEnd           time.Time          `json:"period_end"`
+	VcpuSeconds         pgtype.Numeric     `json:"vcpu_seconds"`
+	MemoryMibSeconds    pgtype.Numeric     `json:"memory_mib_seconds"`
+	StorageMibSeconds   pgtype.Numeric     `json:"storage_mib_seconds"`
+	UpdatedAt           time.Time          `json:"updated_at"`
+	LastExportAttemptAt pgtype.Timestamptz `json:"last_export_attempt_at"`
 }
 
 type BillingExportWork struct {
@@ -448,11 +451,12 @@ type BillingExportWork struct {
 }
 
 type BillingIncrementalPeriod struct {
-	TeamID            uuid.UUID `json:"team_id"`
-	PeriodStart       time.Time `json:"period_start"`
-	PeriodEnd         time.Time `json:"period_end"`
-	CreatedAt         time.Time `json:"created_at"`
-	CorrectionVersion int64     `json:"correction_version"`
+	TeamID                 uuid.UUID          `json:"team_id"`
+	PeriodStart            time.Time          `json:"period_start"`
+	PeriodEnd              time.Time          `json:"period_end"`
+	CreatedAt              time.Time          `json:"created_at"`
+	CorrectionVersion      int64              `json:"correction_version"`
+	LastReconcileAttemptAt pgtype.Timestamptz `json:"last_reconcile_attempt_at"`
 }
 
 type BillingPeriodAnomaly struct {
