@@ -1484,6 +1484,15 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 	teamID, ownerKey := seedTeamAndKey(t)
 	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
 	r := newRouter(t)
+	// This test exercises the shadow-mode response explicitly. Billing export
+	// is live by default, so do not rely on the global default here.
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("disable billing export for shadow-mode test: %v", err)
+	}
 
 	cw := do(r, "POST", "/sandboxes", ownerKey, `{"name":"billing-summary-box"}`)
 	if cw.Code != http.StatusCreated {
