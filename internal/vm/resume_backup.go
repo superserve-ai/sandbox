@@ -194,16 +194,18 @@ func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 		// Published before any sweep runs, so the base this fetch holds
 		// counts as in use from here on.
 		m.publishFlight(f)
-		if m.backupRestore.CacheBytes > 0 {
-			m.backupCacheMu.Lock()
-			if _, perr := backup.PruneBaseCache(m.backupBaseDir(), m.backupRestore.CacheBytes); perr != nil {
-				log.Warn().Err(perr).Msg("backup base cache prune")
-			}
-			m.sweepPromotedBases()
-			m.backupCacheMu.Unlock()
-		}
 	}()
 	m.dropUnclaimedBeyondCap()
+	// Cache maintenance waits for every other download to finish; the
+	// waiter has its result already, so that wait costs it nothing.
+	if m.backupRestore.CacheBytes > 0 {
+		m.backupCacheMu.Lock()
+		if _, perr := backup.PruneBaseCache(m.backupBaseDir(), m.backupRestore.CacheBytes); perr != nil {
+			m.log.Warn().Err(perr).Str("vm_id", vmID).Msg("backup base cache prune")
+		}
+		m.sweepPromotedBases()
+		m.backupCacheMu.Unlock()
+	}
 	select {
 	case <-f.dropped:
 	case <-time.After(m.backupRestore.AbandonAfter):

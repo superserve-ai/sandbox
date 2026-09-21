@@ -133,10 +133,39 @@ type limitedReadCloser struct {
 
 func (l *limitedReadCloser) Close() error { return l.c.Close() }
 
+// cacheTemporary reports a spool or candidate an interrupted process may
+// have left behind; nothing reads one across processes.
+func cacheTemporary(name string) bool {
+	return strings.HasPrefix(name, ".spool-") || strings.HasPrefix(name, ".candidate-")
+}
+
+// SweepCacheTemporaries removes leftover temporaries from a cache directory
+// no fetch is using; call it at startup.
+func SweepCacheTemporaries(dir string) (removed int, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	for _, e := range entries {
+		if !cacheTemporary(e.Name()) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
+}
+
 // PruneBaseCache drops the oldest cached objects in a CachingBaseReader
-// directory, unpacked masters and packed spools alike, until the cache fits
-// maxBytes. Files in use stay readable through their open descriptors;
-// promoted bases live beside them and are never counted here.
+// directory, unpacked masters, packed spools and stale temporaries alike,
+// until the cache fits maxBytes. The caller must hold the cache exclusively
+// so no fetch is mid-write; promoted bases live beside the cache and are
+// never counted here.
 func PruneBaseCache(dir string, maxBytes int64) (removed int, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -153,7 +182,7 @@ func PruneBaseCache(dir string, maxBytes int64) (removed int, err error) {
 	var total int64
 	for _, e := range entries {
 		name := e.Name()
-		cached := strings.HasPrefix(name, ".unpacked-") || (!strings.HasPrefix(name, ".") && !strings.HasPrefix(name, "base-"))
+		cached := strings.HasPrefix(name, ".unpacked-") || cacheTemporary(name) || (!strings.HasPrefix(name, ".") && !strings.HasPrefix(name, "base-"))
 		if !cached || !e.Type().IsRegular() {
 			continue
 		}

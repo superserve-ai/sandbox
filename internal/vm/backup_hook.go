@@ -81,6 +81,9 @@ func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobL
 	m.backupFetchSem = make(chan struct{}, opts.Concurrency)
 	m.backupFlights = map[string]*backupFlight{}
 	m.sweepRestoreStaging()
+	if _, err := backup.SweepCacheTemporaries(m.backupBaseDir()); err != nil {
+		m.log.Warn().Err(err).Msg("backup base cache temporaries")
+	}
 	m.backupRestoreOn.Store(true)
 }
 

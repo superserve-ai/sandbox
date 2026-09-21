@@ -191,3 +191,35 @@ func TestFetchGenerationUsesTheHostBaseWithoutDownloadingIt(t *testing.T) {
 		}
 	}
 }
+
+func TestCacheTemporariesAreSweptAndCounted(t *testing.T) {
+	dir := t.TempDir()
+	spool := filepath.Join(dir, ".spool-123")
+	candidate := filepath.Join(dir, ".candidate-abcd-456")
+	master := filepath.Join(dir, ".unpacked-abcd")
+	for _, p := range []string{spool, candidate, master} {
+		if err := os.WriteFile(p, bytes.Repeat([]byte{1}, 1024), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := SweepCacheTemporaries(dir)
+	if err != nil || removed != 2 {
+		t.Fatalf("swept %d err=%v, want the two temporaries", removed, err)
+	}
+	if _, err := os.Stat(master); err != nil {
+		t.Fatal("the sweep must leave finished masters alone")
+	}
+	if err := os.WriteFile(spool, bytes.Repeat([]byte{1}, 1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(spool, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := PruneBaseCache(dir, 1500); err != nil || removed != 1 {
+		t.Fatalf("prune removed %d err=%v, want the stale temporary counted and evicted first", removed, err)
+	}
+	if _, err := os.Stat(spool); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the stale temporary must be the first to go")
+	}
+}
