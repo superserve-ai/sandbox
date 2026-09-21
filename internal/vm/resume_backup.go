@@ -77,26 +77,31 @@ func pauseArtifactsMissingErr(vmID string) error {
 	return st.Err()
 }
 
-// backupRevivedTarget returns the live VM a backup-backed resume for the
-// same generation already booted, so a retry of that request adopts it
-// instead of failing on artifacts the cold boot never had.
-func (m *Manager) backupRevivedTarget(vmID, generation string) *VMInstance {
-	if generation == "" {
-		return nil
-	}
-	m.mu.RLock()
-	existing := m.vms[vmID]
-	m.mu.RUnlock()
-	if existing == nil {
-		return nil
+// backupRevivedTarget returns the live VM a backup-backed resume already
+// booted, so a retry of that request adopts it instead of failing on
+// artifacts the cold boot never had. needsGeneration is set when such a VM
+// exists but the request did not name its generation: the caller must look
+// it up and come back, or the VM stays unrecognized while its row stays
+// paused.
+func (m *Manager) backupRevivedTarget(vmID, generation string) (target *VMInstance, needsGeneration bool) {
+	existing, err := m.getInstance(vmID)
+	if err != nil {
+		return nil, false
 	}
 	existing.mu.RLock()
-	match := existing.Status == StatusRunning && !existing.Unverified && existing.BackupGeneration == generation
+	revived := existing.Status == StatusRunning && !existing.Unverified && existing.BackupGeneration != ""
+	match := revived && existing.BackupGeneration == generation
 	existing.mu.RUnlock()
-	if !match || vmDeadForRetry(m, vmID) {
-		return nil
+	if !revived || vmDeadForRetry(m, vmID) {
+		return nil, false
 	}
-	return existing
+	if generation == "" {
+		return nil, true
+	}
+	if !match {
+		return nil, false
+	}
+	return existing, false
 }
 
 // backupFlight is one fetch of a sandbox's backup, shared by every resume

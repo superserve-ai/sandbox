@@ -146,17 +146,20 @@ func TestBackupRevivedTargetAdoptsTheSameGenerationOnly(t *testing.T) {
 	defer func() { vmDeadForRetry = orig }()
 	live := &VMInstance{ID: "vm-1", Status: StatusRunning, BackupGeneration: "gen-a"}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": live}}
-	if mgr.backupRevivedTarget("vm-1", "gen-a") != live {
+	if got, _ := mgr.backupRevivedTarget("vm-1", "gen-a"); got != live {
 		t.Fatal("a retry for the same generation must adopt the revived VM")
 	}
-	if mgr.backupRevivedTarget("vm-1", "gen-b") != nil {
-		t.Fatal("a different generation must not adopt it")
+	if got, ask := mgr.backupRevivedTarget("vm-1", "gen-b"); got != nil || ask {
+		t.Fatal("a different generation must neither adopt nor prompt")
 	}
-	if mgr.backupRevivedTarget("vm-1", "") != nil {
-		t.Fatal("no generation must not adopt it")
+	if got, ask := mgr.backupRevivedTarget("vm-1", ""); got != nil || !ask {
+		t.Fatal("no generation must prompt the caller to look it up")
+	}
+	if _, ask := mgr.backupRevivedTarget("vm-2", ""); ask {
+		t.Fatal("an unknown vm prompts nothing")
 	}
 	live.Unverified = true
-	if mgr.backupRevivedTarget("vm-1", "gen-a") != nil {
+	if got, _ := mgr.backupRevivedTarget("vm-1", "gen-a"); got != nil {
 		t.Fatal("an unverified VM must not be adopted")
 	}
 }
@@ -459,5 +462,21 @@ func TestBackupRestoreCanBeWithdrawn(t *testing.T) {
 	mgr.DisableBackupRestore()
 	if mgr.BackupRestoreEnabled() {
 		t.Fatal("a failed bucket probe must withdraw the fallback")
+	}
+}
+
+func TestResumeVMRetryWithoutAGenerationIsToldToLookItUp(t *testing.T) {
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false }
+	defer func() { vmDeadForRetry = orig }()
+	live := &VMInstance{ID: "vm-1", Status: StatusRunning, IP: "192.0.2.9", BackupGeneration: "gen-a"}
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": live}, netMgr: &ownedNetMgr{&fakeNetMgr{}}}
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, t.TempDir(), BackupRestoreOptions{})
+	a := NewGRPCAdapter(mgr)
+
+	_, err := a.ResumeVM(context.Background(), &vmdpb.ResumeVMRequest{VmId: "vm-1", SnapshotPath: "/gone/vmstate.snap", MemFilePath: "/gone/mem.snap"})
+	if !vmdclient.IsPauseArtifactsMissing(err) {
+		t.Fatalf("err = %v, want the mark that sends the control plane to look the generation up", err)
 	}
 }
