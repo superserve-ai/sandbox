@@ -918,6 +918,13 @@ func TestIntegration_CreateStripeCheckoutSessionBlocksExistingSubscription(t *te
 
 func TestIntegration_CreateStripeCheckoutSessionDeniedInShadowMode(t *testing.T) {
 	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("disable billing export for shadow-mode test: %v", err)
+	}
 	stripe := &fakeStripeClient{}
 	r := newBillingRouter(t, stripe)
 
@@ -931,11 +938,17 @@ func TestIntegration_CreateStripeCheckoutSessionDeniedInShadowMode(t *testing.T)
 	if got := len(stripe.customerCalls); got != 0 {
 		t.Fatalf("customer calls = %d, want 0 in shadow mode", got)
 	}
-	_ = teamID
 }
 
 func TestIntegration_CustomerPortalSessionDeniedInShadowMode(t *testing.T) {
 	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "team_owner")
+	if _, err := testPool.Exec(context.Background(), `
+		INSERT INTO team_feature_flag (team_id, key, enabled)
+		VALUES ($1, 'billing_export_enabled', false)
+		ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled
+	`, teamID); err != nil {
+		t.Fatalf("disable billing export for shadow-mode test: %v", err)
+	}
 	if _, err := testPool.Exec(context.Background(), `
 		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
 		VALUES ($1, $2, $3, 'active')
