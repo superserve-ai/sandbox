@@ -1157,6 +1157,7 @@ func main() {
 	// across vmd restarts, and the bandwidth cap keeps backups from
 	// competing with guest traffic.
 	backupBucket := os.Getenv("BACKUP_BUCKET")
+	var enableBackupRestore func()
 	var backupJournal *backup.Journal
 	if bucket := backupBucket; bucket != "" {
 		journalPath := envOrDefault("BACKUP_JOURNAL_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "backup.db"))
@@ -1200,13 +1201,18 @@ func main() {
 		}
 		// backup_setup: metrics recorder, journal open, GCS storage.NewClient, uploader.
 		if envOrDefault("BACKUP_RESTORE_ON_RESUME", "false") == "true" {
-			gcsReader := backup.NewGCSReader(gcsClient, bucket)
-			probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
-			_, perr := gcsReader.List(probeCtx, "sandboxes/.probe/")
-			probeCancel()
-			if perr != nil {
-				log.Error().Err(perr).Str("bucket", bucket).Msg("backup restore on resume disabled: this host cannot read the backup bucket")
-			} else {
+			// Switched on after readiness, once the bucket answers: a
+			// resume that lands before then takes the ordinary path, and a
+			// host that cannot read the bucket never offers the fallback.
+			enableBackupRestore = func() {
+				gcsReader := backup.NewGCSReader(gcsClient, bucket)
+				probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
+				_, perr := gcsReader.List(probeCtx, "sandboxes/.probe/")
+				probeCancel()
+				if perr != nil {
+					log.Error().Err(perr).Str("bucket", bucket).Msg("backup restore on resume disabled: this host cannot read the backup bucket")
+					return
+				}
 				restoreMbps, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_BANDWIDTH_MBPS", "200"))
 				if restoreMbps <= 0 {
 					restoreMbps = 200
@@ -1218,6 +1224,7 @@ func main() {
 					Limiter:     rate.NewLimiter(rate.Limit(restoreMbps)*125000, 32<<20),
 					CacheBytes:  int64(cacheGiB) << 30,
 				})
+				log.Info().Str("bucket", bucket).Msg("backup restore on resume enabled")
 			}
 		}
 		st.mark("backup_setup", true, -1)
@@ -2024,6 +2031,12 @@ func main() {
 	// readiness check reads that line from the journal, so nothing the
 	// background work logs may come ahead of it.
 	close(postReady)
+	if enableBackupRestore != nil {
+		go func() {
+			defer sentrylog.Recover("backup-restore-enable")
+			enableBackupRestore()
+		}()
+	}
 
 	if neighCap, err := readNeighTableCap(); err == nil && neighCap <= kernelDefaultNeighTableCap {
 		log.Error().Int("gc_thresh3", neighCap).

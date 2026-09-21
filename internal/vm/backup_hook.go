@@ -81,7 +81,11 @@ func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobL
 	m.backupFetchSem = make(chan struct{}, opts.Concurrency)
 	m.backupFlights = map[string]*backupFlight{}
 	m.sweepRestoreStaging()
+	m.backupRestoreOn.Store(true)
 }
+
+// BackupRestoreEnabled reports whether a resume may fall back to the bucket.
+func (m *Manager) BackupRestoreEnabled() bool { return m.backupRestoreOn.Load() }
 
 // sweepRestoreStaging drops staging a previous process left behind: no
 // fetch survives a restart, and a completed one is cheap to redo. Only the

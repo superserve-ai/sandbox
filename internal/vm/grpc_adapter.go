@@ -125,12 +125,13 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 
 	var inst *VMInstance
 	var rulesApplied bool
+	restoreOn := a.mgr.BackupRestoreEnabled()
 	var revived *VMInstance
-	if a.mgr.backupReader != nil {
+	if restoreOn {
 		revived = a.mgr.backupRevivedTarget(req.GetVmId(), req.GetBackupGeneration())
 	}
 	switch {
-	case a.mgr.backupReader == nil:
+	case !restoreOn:
 		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
 	case revived != nil:
 		inst, rulesApplied = revived, resumeNetworkRules != nil

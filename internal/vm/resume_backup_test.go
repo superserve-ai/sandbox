@@ -419,3 +419,35 @@ func TestRealFlightOrderKeepsAReusedOldBaseThroughItsOwnSweep(t *testing.T) {
 		t.Fatalf("claim failed or base = %s, want the promoted %s", f.restored.Base, stable)
 	}
 }
+
+func TestAFailedClaimedFetchLeavesNoStaging(t *testing.T) {
+	root := t.TempDir()
+	mgr := newBackupTestManager(t, &slowEmptyStore{})
+	mgr.backupRestoreRoot = root
+	orig := fetchBackupGeneration
+	fetchBackupGeneration = func(_ context.Context, _ backup.BlobReader, _, _, dest string, _ backup.ProgressFunc) (backup.Restored, error) {
+		touch(t, filepath.Join(dest, "rootfs.ext4"))
+		return backup.Restored{}, errors.New("promote failed after the disk landed")
+	}
+	defer func() { fetchBackupGeneration = orig }()
+
+	_, err := mgr.resumeFromBackupLocked(context.Background(), "vm-1", "g", nil)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("err = %v, want Unavailable", err)
+	}
+	if _, err := os.Stat(mgr.restoreStagingDir("vm-1")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("a failed fetch must not leave its staging behind")
+	}
+}
+
+func TestBackupRestoreIsOffUntilEnabled(t *testing.T) {
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	if mgr.BackupRestoreEnabled() {
+		t.Fatal("off by default")
+	}
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, t.TempDir(), BackupRestoreOptions{})
+	if !mgr.BackupRestoreEnabled() {
+		t.Fatal("on once configured")
+	}
+}

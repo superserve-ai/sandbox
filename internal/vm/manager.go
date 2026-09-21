@@ -445,6 +445,7 @@ type Manager struct {
 	backupEnqueue func(backup.Task) error
 	// backupReader and backupLister bring a lost pause back from the bucket
 	// so a resume can revive the sandbox from its disk.
+	backupRestoreOn   atomic.Bool
 	backupReader      backup.BlobReader
 	backupLister      backup.BlobLister
 	backupRestoreRoot string
@@ -1530,7 +1531,11 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) (err e
 		rundirKey = inst.RunDirID
 	}
 	m.cleanupRunDir(rundirKey)
-	m.cleanupRestoreStaging(vmID)
+	// Revival tears the zombie down through here on its way to booting
+	// from the staged disk; only a real destroy drops that staging.
+	if ctx.Value(reviveTeardownCtxKey{}) == nil {
+		m.cleanupRestoreStaging(vmID)
+	}
 	m.removeVM(vmID)
 
 	log.Info().Msg("VM destroyed")

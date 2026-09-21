@@ -403,6 +403,7 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 	defer m.releaseFlight(vmID, flight)
 	m.recordPhases("resume", "backup", map[string]time.Duration{"backup_fetch": time.Since(tFetch)})
 	if flight.err != nil {
+		_ = os.RemoveAll(m.restoreStagingDir(vmID))
 		if errors.Is(flight.err, backup.ErrNoMatchingBackup) {
 			return nil, status.Errorf(codes.FailedPrecondition, "vm %s: pause artifacts missing on host and the recorded backup is not in the bucket", vmID)
 		}
