@@ -451,3 +451,13 @@ func TestBackupRestoreIsOffUntilEnabled(t *testing.T) {
 		t.Fatal("on once configured")
 	}
 }
+
+func TestBackupRestoreCanBeWithdrawn(t *testing.T) {
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, t.TempDir(), BackupRestoreOptions{})
+	mgr.DisableBackupRestore()
+	if mgr.BackupRestoreEnabled() {
+		t.Fatal("a failed bucket probe must withdraw the fallback")
+	}
+}

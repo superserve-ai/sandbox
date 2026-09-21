@@ -87,6 +87,10 @@ func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobL
 // BackupRestoreEnabled reports whether a resume may fall back to the bucket.
 func (m *Manager) BackupRestoreEnabled() bool { return m.backupRestoreOn.Load() }
 
+// DisableBackupRestore withdraws the fallback, for a host that turns out
+// unable to read the bucket.
+func (m *Manager) DisableBackupRestore() { m.backupRestoreOn.Store(false) }
+
 // sweepRestoreStaging drops staging a previous process left behind: no
 // fetch survives a restart, and a completed one is cheap to redo. Only the
 // staging subtree this daemon owns is touched, whatever the root is set to.

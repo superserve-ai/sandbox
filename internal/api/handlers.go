@@ -1019,8 +1019,11 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	statelessFallback := false
 	// Only a host that has lost the pause artifacts asks for the backup
 	// generation recorded as covering this pause; the ordinary resume
-	// never pays for the lookup. The generation is kept for the retry so
-	// a retry adopts the boot it started.
+	// never pays for the lookup. It stays synchronous because the retry
+	// cannot proceed without it, on a request that has already failed
+	// and is about to spend seconds fetching and booting: one probe of a
+	// covering index, about a millisecond. The generation is kept for the
+	// retry so a retry adopts the boot it started.
 	backupGeneration := ""
 	ipAddress, actualVcpu, actualMemMiB, _, err := retryTransientBoot(bootCtx, sandboxID.String(), sandbox.HostID, func(ctx context.Context) (string, uint32, uint32, error) {
 		ip, vcpu, memMiB, att, rerr := vmd.ResumeInstance(ctx, sandboxID.String(), snapshotPath, memPath, sandbox.NetworkConfig, resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, backupGeneration)

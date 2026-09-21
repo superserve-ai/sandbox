@@ -1157,7 +1157,7 @@ func main() {
 	// across vmd restarts, and the bandwidth cap keeps backups from
 	// competing with guest traffic.
 	backupBucket := os.Getenv("BACKUP_BUCKET")
-	var enableBackupRestore func()
+	var probeBackupRestore func()
 	var backupJournal *backup.Journal
 	if bucket := backupBucket; bucket != "" {
 		journalPath := envOrDefault("BACKUP_JOURNAL_PATH", filepath.Join(filepath.Dir(cfg.RunDir), "backup.db"))
@@ -1201,30 +1201,32 @@ func main() {
 		}
 		// backup_setup: metrics recorder, journal open, GCS storage.NewClient, uploader.
 		if envOrDefault("BACKUP_RESTORE_ON_RESUME", "false") == "true" {
-			// Switched on after readiness, once the bucket answers: a
-			// resume that lands before then takes the ordinary path, and a
-			// host that cannot read the bucket never offers the fallback.
-			enableBackupRestore = func() {
-				gcsReader := backup.NewGCSReader(gcsClient, bucket)
+			// On from the first resume: wiring is local. The bucket probe
+			// runs after readiness and only ever withdraws the fallback, so
+			// startup never waits on the network and no resume lands in a
+			// window where a recoverable sandbox is refused.
+			gcsReader := backup.NewGCSReader(gcsClient, bucket)
+			restoreMbps, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_BANDWIDTH_MBPS", "200"))
+			if restoreMbps <= 0 {
+				restoreMbps = 200
+			}
+			restoreWorkers, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_CONCURRENCY", "2"))
+			cacheGiB, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_CACHE_GIB", "100"))
+			mgr.SetBackupRestore(gcsReader, gcsReader, envOrDefault("BACKUP_RESTORE_ROOT", filepath.Join(cfg.SnapshotDir, ".restore")), vm.BackupRestoreOptions{
+				Concurrency: restoreWorkers,
+				Limiter:     rate.NewLimiter(rate.Limit(restoreMbps)*125000, 32<<20),
+				CacheBytes:  int64(cacheGiB) << 30,
+			})
+			probeBackupRestore = func() {
 				probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
 				_, perr := gcsReader.List(probeCtx, "sandboxes/.probe/")
 				probeCancel()
 				if perr != nil {
+					mgr.DisableBackupRestore()
 					log.Error().Err(perr).Str("bucket", bucket).Msg("backup restore on resume disabled: this host cannot read the backup bucket")
 					return
 				}
-				restoreMbps, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_BANDWIDTH_MBPS", "200"))
-				if restoreMbps <= 0 {
-					restoreMbps = 200
-				}
-				restoreWorkers, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_CONCURRENCY", "2"))
-				cacheGiB, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_CACHE_GIB", "100"))
-				mgr.SetBackupRestore(gcsReader, gcsReader, envOrDefault("BACKUP_RESTORE_ROOT", filepath.Join(cfg.SnapshotDir, ".restore")), vm.BackupRestoreOptions{
-					Concurrency: restoreWorkers,
-					Limiter:     rate.NewLimiter(rate.Limit(restoreMbps)*125000, 32<<20),
-					CacheBytes:  int64(cacheGiB) << 30,
-				})
-				log.Info().Str("bucket", bucket).Msg("backup restore on resume enabled")
+				log.Info().Str("bucket", bucket).Msg("backup restore on resume verified against the bucket")
 			}
 		}
 		st.mark("backup_setup", true, -1)
@@ -2031,10 +2033,10 @@ func main() {
 	// readiness check reads that line from the journal, so nothing the
 	// background work logs may come ahead of it.
 	close(postReady)
-	if enableBackupRestore != nil {
+	if probeBackupRestore != nil {
 		go func() {
-			defer sentrylog.Recover("backup-restore-enable")
-			enableBackupRestore()
+			defer sentrylog.Recover("backup-restore-probe")
+			probeBackupRestore()
 		}()
 	}
 
