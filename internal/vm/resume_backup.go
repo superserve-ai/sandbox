@@ -318,36 +318,39 @@ func (m *Manager) dropUnclaimedBeyondCap() {
 }
 
 // restorePausedAnchor makes memory follow the durable record after a
-// failed backup boot: revival puts the paused record back, but the failed
-// instance it booted stays in the map in the error state, where the next
-// resume would no longer see a paused VM to recover. Only that exact
-// state is replaced; a failure whose teardown is unconfirmed keeps its
-// error record durably and is left alone.
+// failed backup boot: revival puts the paused record back, but memory
+// holds either the failed instance in the error state or, after a
+// completed teardown, nothing at all, and either way the next resume
+// would no longer see a paused VM to recover. A destroy in progress
+// wins, and a failure whose teardown is unconfirmed keeps its error
+// record durably and is left alone.
 func (m *Manager) restorePausedAnchor(vmID string) {
 	if m.state == nil {
 		return
 	}
+	if _, destroying := m.destroying.Load(vmID); destroying {
+		return
+	}
 	rec, err := m.state.Get(vmID)
-	if err != nil || rec.Status != StatusPaused {
+	if err != nil || rec == nil || rec.Status != StatusPaused {
 		return
 	}
 	m.mu.Lock()
-	inst := m.vms[vmID]
-	failed := false
-	if inst != nil {
+	defer m.mu.Unlock()
+	if inst := m.vms[vmID]; inst != nil {
 		inst.mu.RLock()
-		failed = inst.Status == StatusError
+		failed := inst.Status == StatusError
 		inst.mu.RUnlock()
+		if !failed {
+			return
+		}
 	}
-	if failed {
-		// Folded back here rather than through the on-demand loader: a
-		// record with a revival pending is parked by that loader while
-		// this resume's own lock is held.
-		restored := toInstance(*rec)
-		m.vms[vmID] = restored
-		m.indexVM(vmID, restored)
-	}
-	m.mu.Unlock()
+	// Folded back here rather than through the on-demand loader: a record
+	// with a revival pending is parked by that loader while this resume's
+	// own lock is held.
+	restored := toInstance(*rec)
+	m.vms[vmID] = restored
+	m.indexVM(vmID, restored)
 }
 
 // retainStagingForRetry keeps a finished restore for the retry that follows

@@ -638,3 +638,47 @@ func TestAFailedBackupBootLeavesTheVMRecoverableOnRetry(t *testing.T) {
 		t.Fatalf("fetches = %d, want the retry to fetch again", fetches)
 	}
 }
+
+func TestATornDownBackupBootLeavesTheVMRecoverableOnRetry(t *testing.T) {
+	// The post-teardown state a readiness timeout leaves behind: the durable
+	// record parked as paused with the revival pending, nothing in memory.
+	origDead, origProbe := vmDeadForRetry, boxdHealthProbe
+	vmDeadForRetry = func(*Manager, string) bool { return true }
+	boxdHealthProbe = func(context.Context, string, time.Duration) error { return nil }
+	defer func() { vmDeadForRetry, boxdHealthProbe = origDead, origProbe }()
+
+	dir := t.TempDir()
+	stateStore, err := OpenStateStore(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stateStore.Close()
+	runDir := touch(t, filepath.Join(dir, "rundir-is-a-file"))
+	rec := VMRecord{ID: "vm-1", Status: StatusPaused, RevivalPending: true, TeamID: "team", SnapshotPath: filepath.Join(dir, "gone", "vmstate.snap"), MemFilePath: filepath.Join(dir, "gone", "mem.snap"), VCPU: 1, MemoryMiB: 256}
+	if err := stateStore.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	mgr := &Manager{log: zerolog.Nop(), state: stateStore, cfg: ManagerConfig{RunDir: runDir}, vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{},
+		unitDead: func(context.Context, string) bool { return true }}
+	mgr.reattachComplete.Store(true)
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, filepath.Join(dir, ".restore"), BackupRestoreOptions{})
+	fetches := 0
+	orig := fetchBackupGeneration
+	fetchBackupGeneration = func(_ context.Context, _ backup.BlobReader, _, _, dest string, _ backup.ProgressFunc) (backup.Restored, error) {
+		fetches++
+		disk := touch(t, filepath.Join(dest, "rootfs.ext4"))
+		return backup.Restored{Disk: disk, Standalone: true, Manifest: &backup.GenerationManifest{Generation: "g"}}, nil
+	}
+	defer func() { fetchBackupGeneration = orig }()
+
+	mgr.restorePausedAnchor("vm-1")
+	if mgr.vms["vm-1"] == nil {
+		t.Fatal("the parked paused record must be folded back into memory")
+	}
+	a := NewGRPCAdapter(mgr)
+	_, err = a.ResumeVM(context.Background(), &vmdpb.ResumeVMRequest{VmId: "vm-1", BackupGeneration: "g"})
+	if err == nil || !strings.Contains(err.Error(), "copy rootfs") || fetches != 1 {
+		t.Fatalf("retry: err = %v fetches = %d, want recovery re-entered from the parked record", err, fetches)
+	}
+}
