@@ -368,7 +368,13 @@ func (m *Manager) basesInUse() map[string]bool {
 const promotedBaseGrace = time.Hour
 
 // sweepPromotedBases drops promoted bases no tracked VM reads any more.
+// Nothing is swept until reattach has finished: before that a VM from the
+// previous run may hold a base without yet being in m.vms, and dropping
+// that base would strand its next pause and resume.
 func (m *Manager) sweepPromotedBases() {
+	if !m.reattachComplete.Load() {
+		return
+	}
 	entries, err := os.ReadDir(m.backupBaseDir())
 	if err != nil {
 		return

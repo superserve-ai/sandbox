@@ -1212,6 +1212,10 @@ func main() {
 			}
 			restoreWorkers, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_CONCURRENCY", "2"))
 			cacheGiB, _ := strconv.Atoi(envOrDefault("BACKUP_RESTORE_CACHE_GIB", "100"))
+			if cacheGiB <= 0 {
+				log.Warn().Str("value", os.Getenv("BACKUP_RESTORE_CACHE_GIB")).Msg("BACKUP_RESTORE_CACHE_GIB is not a positive integer; using 100")
+				cacheGiB = 100
+			}
 			mgr.SetBackupRestore(gcsReader, gcsReader, envOrDefault("BACKUP_RESTORE_ROOT", filepath.Join(cfg.SnapshotDir, ".restore")), vm.BackupRestoreOptions{
 				Concurrency: restoreWorkers,
 				Limiter:     rate.NewLimiter(rate.Limit(restoreMbps)*125000, 32<<20),

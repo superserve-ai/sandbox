@@ -380,6 +380,8 @@ func TestBackupFlightAdmissionIsBounded(t *testing.T) {
 func TestSweepKeepsABaseAFlightStillHoldsForItsResume(t *testing.T) {
 	root := t.TempDir()
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	// This host's VMs are all known: the sweep may act.
+	mgr.reattachComplete.Store(true)
 	store := &slowEmptyStore{}
 	mgr.SetBackupRestore(store, store, root, BackupRestoreOptions{})
 	base := touch(t, filepath.Join(mgr.backupBaseDir(), "base-old.ext4"))
@@ -533,5 +535,34 @@ func TestStagingRetainedAfterADeadlineOutlivesOnlyTheRetryWindow(t *testing.T) {
 	}
 	if _, err := os.Stat(mgr.restoreStagingDir("vm-2")); err != nil {
 		t.Fatal("staging a new flight is using must stay")
+	}
+}
+
+// A promoted base is never swept before reattach has finished: the VMs of
+// the previous run are not in m.vms yet, so their bases would read as unused.
+func TestSweepPromotedBasesWaitsForReattach(t *testing.T) {
+	dir := t.TempDir()
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}, backupRestoreRoot: dir}
+	if err := os.MkdirAll(mgr.backupBaseDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := filepath.Join(mgr.backupBaseDir(), "base-old.ext4")
+	if err := os.WriteFile(base, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * promotedBaseGrace)
+	if err := os.Chtimes(base, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr.sweepPromotedBases()
+	if _, err := os.Stat(base); err != nil {
+		t.Fatal("base swept before reattach completed")
+	}
+
+	mgr.reattachComplete.Store(true)
+	mgr.sweepPromotedBases()
+	if _, err := os.Stat(base); !os.IsNotExist(err) {
+		t.Fatal("unreferenced base not swept after reattach completed")
 	}
 }
