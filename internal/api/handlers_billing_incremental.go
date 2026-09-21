@@ -189,19 +189,19 @@ func (h *Handlers) GetBillingExportAccounting(c *gin.Context) {
 		return
 	}
 	after, correctionAfter := uuid.Nil, uuid.Nil
-	var afterCreated, correctionCreated time.Time
-	// Each collection has its own cursor; UUIDs identify the immutable row,
-	// while creation time determines traversal order.
+	var afterSequence, correctionSequence int64
+	// Each collection has its own UUID cursor. The persisted sequence is
+	// assigned under the period lock, so later commits cannot fall behind it.
 	for _, cursor := range []struct {
-		param string
-		id    *uuid.UUID
-		at    *time.Time
-		query string
+		param    string
+		id       *uuid.UUID
+		sequence *int64
+		query    string
 	}{
-		{"after", &after, &afterCreated, `SELECT e.created_at FROM billing_export_event e
+		{"after", &after, &afterSequence, `SELECT e.accounting_sequence FROM billing_export_event e
             JOIN billing_export_allocation a ON a.id=e.allocation_id
             WHERE e.id=$4 AND a.team_id=$1 AND a.period_start=$2 AND a.period_end=$3`},
-		{"after_correction", &correctionAfter, &correctionCreated, `SELECT created_at FROM billing_export_correction
+		{"after_correction", &correctionAfter, &correctionSequence, `SELECT accounting_sequence FROM billing_export_correction
             WHERE id=$4 AND team_id=$1 AND period_start=$2 AND period_end=$3`},
 	} {
 		if raw := c.Query(cursor.param); raw != "" {
@@ -210,7 +210,7 @@ func (h *Handlers) GetBillingExportAccounting(c *gin.Context) {
 				respondErrorMsg(c, "bad_request", "invalid accounting cursor", http.StatusBadRequest)
 				return
 			}
-			err = h.Pool.QueryRow(c.Request.Context(), cursor.query, team, start, end, *cursor.id).Scan(cursor.at)
+			err = h.Pool.QueryRow(c.Request.Context(), cursor.query, team, start, end, *cursor.id).Scan(cursor.sequence)
 			if errors.Is(err, pgx.ErrNoRows) {
 				respondErrorMsg(c, "bad_request", "accounting cursor does not belong to this period", http.StatusBadRequest)
 				return
@@ -225,16 +225,16 @@ func (h *Handlers) GetBillingExportAccounting(c *gin.Context) {
 	// observations separate from event-derived submission accounting.
 	var result []byte
 	err = h.Pool.QueryRow(c.Request.Context(), `SELECT jsonb_build_object(
-        'events',COALESCE((SELECT jsonb_agg(to_jsonb(e)-'lease_token'-'lease_until' ORDER BY e.created_at,e.id)
+        'events',COALESCE((SELECT jsonb_agg(to_jsonb(e)-'lease_token'-'lease_until' ORDER BY e.accounting_sequence)
             FROM (SELECT e.* FROM billing_export_event e JOIN billing_export_allocation a ON a.id=e.allocation_id
-            WHERE a.team_id=$1 AND a.period_start=$2 AND a.period_end=$3 AND (e.created_at,e.id)>($5,$4) ORDER BY e.created_at,e.id LIMIT 500) e),'[]'::jsonb),
-        'corrections',COALESCE((SELECT jsonb_agg(to_jsonb(c) ORDER BY c.created_at,c.id) FROM
-            (SELECT * FROM billing_export_correction WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND (created_at,id)>($7,$6) ORDER BY created_at,id LIMIT 500) c),'[]'::jsonb),
+            WHERE a.team_id=$1 AND a.period_start=$2 AND a.period_end=$3 AND e.accounting_sequence>$4 ORDER BY e.accounting_sequence LIMIT 500) e),'[]'::jsonb),
+        'corrections',COALESCE((SELECT jsonb_agg(to_jsonb(c) ORDER BY c.accounting_sequence) FROM
+            (SELECT * FROM billing_export_correction WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND accounting_sequence>$5 ORDER BY accounting_sequence LIMIT 500) c),'[]'::jsonb),
         'local_measurement',(SELECT to_jsonb(u) FROM billing_export_usage u WHERE u.team_id=$1 AND u.period_start=$2 AND u.period_end=$3),
         'worker',(SELECT jsonb_build_object('next_run_at',w.next_run_at,'last_error',w.last_error,'seed_complete',w.seed_complete)
             FROM billing_export_work w WHERE w.team_id=$1),
         'observations',COALESCE((SELECT jsonb_agg(to_jsonb(o)) FROM billing_export_observation o
-            WHERE o.team_id=$1 AND o.period_start=$2 AND o.period_end=$3),'[]'::jsonb))`, team, start, end, after, afterCreated, correctionAfter, correctionCreated).Scan(&result)
+            WHERE o.team_id=$1 AND o.period_start=$2 AND o.period_end=$3),'[]'::jsonb))`, team, start, end, afterSequence, correctionSequence).Scan(&result)
 	if err != nil {
 		respondError(c, ErrInternal)
 		return

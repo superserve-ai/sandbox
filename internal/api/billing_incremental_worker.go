@@ -248,7 +248,7 @@ func (h *Handlers) processIncrementalBillingTeam(ctx context.Context, team uuid.
           OR EXISTS(SELECT 1 FROM billing_export_observation o WHERE o.team_id=p.team_id AND o.period_start=p.period_start AND o.period_end=p.period_end
              AND (o.observed_at<u.updated_at OR o.observed_at<now()-interval '6 hours' OR o.last_error IS NOT NULL
                OR o.submitted_quantity<>o.local_quantity OR o.counted_quantity IS DISTINCT FROM o.local_quantity)))
-        ORDER BY p.period_start LIMIT 2`, team)
+        ORDER BY u.last_export_attempt_at NULLS FIRST,p.period_start LIMIT 2`, team)
 	if err != nil {
 		return measured, false, err
 	}
@@ -268,6 +268,10 @@ func (h *Handlers) processIncrementalBillingTeam(ctx context.Context, team uuid.
 	}
 	var failures []error
 	for _, p := range periods {
+		if _, err = h.Pool.Exec(ctx, `UPDATE billing_export_usage SET last_export_attempt_at=clock_timestamp()
+            WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End); err != nil {
+			return measured, false, err
+		}
 		if _, err = h.exportIncrementalPeriod(ctx, p); err != nil {
 			failures = append(failures, fmt.Errorf("export period %s: %w", billingPeriodID(p.Start, p.End), err))
 		}
@@ -279,9 +283,12 @@ func (h *Handlers) processIncrementalBillingTeam(ctx context.Context, team uuid.
         WHERE p.team_id=$1 AND p.status IN ('exported','finalized')
         AND NOT EXISTS(SELECT 1 FROM billing_export_observation o WHERE o.team_id=p.team_id AND o.period_start=p.period_start
           AND o.period_end=p.period_end AND o.observed_at>now()-interval '6 hours')
-        ORDER BY p.period_start LIMIT 1`, team).Scan(&frozen.Start, &frozen.End)
+        ORDER BY i.last_reconcile_attempt_at NULLS FIRST,p.period_start LIMIT 1`, team).Scan(&frozen.Start, &frozen.End)
 	if err == nil {
-		_, err = h.reconcileFrozenIncrementalPeriod(ctx, frozen)
+		err = h.markIncrementalReconciliationAttempt(ctx, frozen)
+		if err == nil {
+			_, err = h.reconcileFrozenIncrementalPeriod(ctx, frozen)
+		}
 	} else if err == pgx.ErrNoRows {
 		err = nil
 	}
@@ -293,10 +300,8 @@ func (h *Handlers) processIncrementalBillingTeam(ctx context.Context, team uuid.
 func (h *Handlers) reconcileIncrementalBillingTeam(ctx context.Context, team uuid.UUID) error {
 	rows, err := h.Pool.Query(ctx, `SELECT p.period_start,p.period_end,p.status FROM team_billing_period p
         JOIN billing_incremental_period i USING(team_id,period_start,period_end)
-        LEFT JOIN LATERAL (SELECT min(observed_at) AS observed_at FROM billing_export_observation o
-          WHERE o.team_id=p.team_id AND o.period_start=p.period_start AND o.period_end=p.period_end) o ON true
         WHERE p.team_id=$1
-        ORDER BY o.observed_at NULLS FIRST,p.period_start LIMIT 2`, team)
+        ORDER BY i.last_reconcile_attempt_at NULLS FIRST,p.period_start LIMIT 2`, team)
 	if err != nil {
 		return err
 	}
@@ -322,10 +327,19 @@ func (h *Handlers) reconcileIncrementalBillingTeam(ctx context.Context, team uui
 	}
 	var failures []error
 	for _, p := range periods {
+		if err = h.markIncrementalReconciliationAttempt(ctx, p.period); err != nil {
+			return err
+		}
 		_, err = h.reconcileIncrementalPeriod(ctx, p.period, p.frozen)
 		if err != nil {
 			failures = append(failures, err)
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func (h *Handlers) markIncrementalReconciliationAttempt(ctx context.Context, p billing.ExportPeriod) error {
+	_, err := h.Pool.Exec(ctx, `UPDATE billing_incremental_period SET last_reconcile_attempt_at=clock_timestamp()
+        WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End)
+	return err
 }
