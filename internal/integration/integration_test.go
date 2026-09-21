@@ -2008,7 +2008,9 @@ func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) 
 	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
 	r := newRouterWithNow(t, func() time.Time { return now })
 
-	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
+	// Keep the anchor safely behind the test clock so this assertion remains
+	// stable as the calendar advances past the original fixed fixture date.
+	anchor := time.Now().UTC().Add(-24 * time.Hour).Truncate(time.Hour)
 	reportingStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	reportingEnd := reportingStart.AddDate(0, 1, 0)
 	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{

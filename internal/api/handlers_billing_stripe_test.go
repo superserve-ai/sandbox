@@ -50,6 +50,98 @@ func TestStripeEventTimestampAcceptsSnapshotAndThinFormats(t *testing.T) {
 	}
 }
 
+func TestActivatingStripeSubscriptionStatus(t *testing.T) {
+	for _, status := range []string{"active", "trialing"} {
+		if !isActivatingStripeSubscriptionStatus(status) {
+			t.Fatalf("status %q should activate billing", status)
+		}
+	}
+	for _, status := range []string{"incomplete", "past_due", "canceled", "paused", "incomplete_expired", ""} {
+		if isActivatingStripeSubscriptionStatus(status) {
+			t.Fatalf("status %q should not activate billing", status)
+		}
+	}
+	for _, status := range []string{"canceled", "unpaid", "paused", "incomplete_expired"} {
+		if !isTerminalStripeSubscriptionStatus(status) {
+			t.Fatalf("status %q should be terminal", status)
+		}
+	}
+}
+
+func TestEqualTimestampStripeSubscriptionSkipsOnlyCompleteActivation(t *testing.T) {
+	validTime := pgtype.Timestamptz{Time: time.Unix(1, 0).UTC(), Valid: true}
+	complete := db.TeamBillingAccount{
+		StripeSubscriptionID:            stringPtr("sub_current"),
+		StripeSubscriptionStatus:        stringPtr("active"),
+		TrialEndedAt:                    validTime,
+		StripeActivationCreditGrantedAt: validTime,
+		StripeActivationCreditGrantID:   stringPtr("grant_test"),
+	}
+	if !shouldSkipEqualTimestampStripeSubscription(complete, "sub_current", "active") {
+		t.Fatal("complete activation should remain a same-timestamp no-op")
+	}
+	if shouldSkipEqualTimestampStripeSubscription(complete, "sub_replacement", "active") {
+		t.Fatal("same-timestamp replacement subscription must not be suppressed")
+	}
+	for _, missing := range []string{"trial ended", "grant timestamp", "grant id"} {
+		incomplete := complete
+		switch missing {
+		case "trial ended":
+			incomplete.TrialEndedAt = pgtype.Timestamptz{}
+		case "grant timestamp":
+			incomplete.StripeActivationCreditGrantedAt = pgtype.Timestamptz{}
+		case "grant id":
+			incomplete.StripeActivationCreditGrantID = nil
+		}
+		if shouldSkipEqualTimestampStripeSubscription(incomplete, "sub_current", "active") {
+			t.Fatalf("same-timestamp active event should retry with missing %s", missing)
+		}
+	}
+	for _, previousStatus := range []string{"past_due", "incomplete", "active"} {
+		incomplete := complete
+		incomplete.StripeSubscriptionStatus = stringPtr(previousStatus)
+		incomplete.TrialEndedAt = pgtype.Timestamptz{}
+		if shouldSkipEqualTimestampStripeSubscription(incomplete, "sub_current", "canceled") {
+			t.Fatalf("same-timestamp terminal event should replace %s state", previousStatus)
+		}
+	}
+	incomplete := complete
+	incomplete.TrialEndedAt = pgtype.Timestamptz{}
+	terminal := incomplete
+	terminal.StripeSubscriptionStatus = stringPtr("canceled")
+	if !shouldSkipEqualTimestampStripeSubscription(terminal, "sub_current", "active") {
+		t.Fatal("same-timestamp activation must not resurrect terminal state")
+	}
+	if !shouldSkipEqualTimestampStripeSubscription(terminal, "sub_current", "incomplete_expired") {
+		t.Fatal("same-timestamp terminal state should retain the first terminal status")
+	}
+	previouslyIncomplete := incomplete
+	previouslyIncomplete.StripeSubscriptionStatus = stringPtr("incomplete")
+	if shouldSkipEqualTimestampStripeSubscription(previouslyIncomplete, "sub_current", "active") {
+		t.Fatal("same-timestamp transition into active should be processed")
+	}
+}
+
+func TestStripeSubscriptionCreatedAssociationGuard(t *testing.T) {
+	account := db.TeamBillingAccount{StripeSubscriptionID: stringPtr("sub_current")}
+	if !stripeSubscriptionMatchesCurrentAssociation(account, "sub_current") {
+		t.Fatal("current subscription should be associated")
+	}
+	if deferProcessing, ignore := shouldIgnoreUnassociatedStripeSubscriptionCreated(account, "sub_replaced"); deferProcessing || !ignore {
+		t.Fatalf("replaced subscription should be ignored after association: defer=%v ignore=%v", deferProcessing, ignore)
+	}
+
+	account = db.TeamBillingAccount{CheckoutInitializingAt: pgtype.Timestamptz{Valid: true}, CheckoutSessionID: stringPtr("cs_current")}
+	if deferProcessing, ignore := shouldIgnoreUnassociatedStripeSubscriptionCreated(account, "sub_current"); !deferProcessing || ignore {
+		t.Fatalf("subscription during checkout should be deferred: defer=%v ignore=%v", deferProcessing, ignore)
+	}
+
+	account = db.TeamBillingAccount{}
+	if deferProcessing, ignore := shouldIgnoreUnassociatedStripeSubscriptionCreated(account, "sub_first"); deferProcessing || !ignore {
+		t.Fatalf("unassociated first subscription must be ignored: defer=%v ignore=%v", deferProcessing, ignore)
+	}
+}
+
 func TestStripeMeterErrorSamplePayloadsIncludesEveryRequest(t *testing.T) {
 	payload := json.RawMessage(`{"reason":{"error_types":[{"sample_errors":[{"error_message":"first","request":{"idempotency_key":"meter-event:first"}},{"error_message":"second","request":{"idempotency_key":"meter-event:second"}}]}]}}`)
 	samples := stripeMeterErrorSamplePayloads(payload)
