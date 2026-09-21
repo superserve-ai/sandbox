@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/billing"
+	"github.com/superserve-ai/sandbox/internal/config"
 )
 
 func seedIncrementalPeriod(t *testing.T) (billing.ExportStore, billing.ExportPeriod) {
@@ -309,6 +310,9 @@ func TestIntegration_IncrementalAdoptionEndpoint(t *testing.T) {
 		{"provider_unavailable", http.StatusConflict},
 		{"valid_repeated_adoption", http.StatusOK},
 		{"legacy_repeated_adoption", http.StatusOK},
+		{"legacy_removed", http.StatusOK},
+		{"legacy_disabled", http.StatusOK},
+		{"legacy_renamed", http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			team, periodID, start, end := seedBillingPeriodForStripe(t, true, false)
@@ -356,7 +360,7 @@ func TestIntegration_IncrementalAdoptionEndpoint(t *testing.T) {
 			case "boundary_outside_period":
 				events[0].Through = end.Add(time.Hour)
 			}
-			if tc.name == "legacy_repeated_adoption" {
+			if strings.HasPrefix(tc.name, "legacy_") {
 				for _, event := range events {
 					if _, err := testPool.Exec(t.Context(), `INSERT INTO billing_usage_export
                         (team_id,period_start,period_end,resource_type,stripe_customer_id,stripe_meter_event_identifier,stripe_event_name,value,status,stripe_idempotency_key)
@@ -383,6 +387,8 @@ func TestIntegration_IncrementalAdoptionEndpoint(t *testing.T) {
 					return "1.25", nil
 				case "memory_gib_hours":
 					return "2.5", nil
+				case "renamed_cpu_hours":
+					return "0", nil
 				default:
 					t.Fatalf("unexpected billable meter: %s", eventName)
 					return "", nil
@@ -396,6 +402,13 @@ func TestIntegration_IncrementalAdoptionEndpoint(t *testing.T) {
 			}
 			t.Setenv("OPERATOR_API_TOKEN", operatorRBACToken)
 			r := newBillingRouter(t, stripe)
+			if tc.name == "legacy_removed" || tc.name == "legacy_disabled" || tc.name == "legacy_renamed" {
+				resources := []config.BillingResourceConfig{{ResourceKey: "memory_gib", Billable: true, CheckoutEnabled: true, StripeEventName: "memory_gib_hours"}}
+				if tc.name != "legacy_removed" {
+					resources = append(resources, config.BillingResourceConfig{ResourceKey: "vcpu", Billable: tc.name == "legacy_renamed", CheckoutEnabled: true, StripeEventName: "renamed_cpu_hours"})
+				}
+				r = newBillingRouterWithPool(t, stripe, testPool, resources...)
+			}
 			admin := seedPlatformAdminProfile(t)
 			path := "/internal/teams/" + team.String() + "/billing/periods/" + periodID + "/adopt-exports"
 			attempts := 1
