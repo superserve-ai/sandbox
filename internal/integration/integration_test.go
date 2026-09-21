@@ -2012,19 +2012,25 @@ func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) 
 	if !ok {
 		t.Fatalf("billing_period not an object: %v", body["billing_period"])
 	}
+	// The summary reports the anniversary period that contains now, which
+	// rolls forward a month at a time from the anchor.
+	wantStart, wantEnd, anchored := billing.AnniversaryPeriod(anchor, time.Now())
+	if !anchored {
+		t.Fatalf("anchor %s is not yet in effect", anchor)
+	}
 	gotStart, err := time.Parse(time.RFC3339, period["start"].(string))
 	if err != nil {
 		t.Fatalf("parse billing period start: %v", err)
 	}
-	if !gotStart.Equal(anchor) {
-		t.Fatalf("billing summary period start = %s, want %s", gotStart, anchor)
+	if !gotStart.Equal(wantStart) {
+		t.Fatalf("billing summary period start = %s, want %s", gotStart, wantStart)
 	}
 	gotEnd, err := time.Parse(time.RFC3339, period["end"].(string))
 	if err != nil {
 		t.Fatalf("parse billing period end: %v", err)
 	}
-	if !gotEnd.Equal(anchor.AddDate(0, 1, 0)) {
-		t.Fatalf("billing summary period end = %s, want %s", gotEnd, anchor.AddDate(0, 1, 0))
+	if !gotEnd.Equal(wantEnd) {
+		t.Fatalf("billing summary period end = %s, want %s", gotEnd, wantEnd)
 	}
 }
 
