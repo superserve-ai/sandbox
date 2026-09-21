@@ -144,10 +144,11 @@ func newBillingRouter(t *testing.T, stripe api.StripeBillingClient) *gin.Engine 
 	return newBillingRouterWithPool(t, stripe, testPool)
 }
 
-func newBillingRouterWithPool(t *testing.T, stripe api.StripeBillingClient, pool *pgxpool.Pool) *gin.Engine {
+func newBillingRouterWithPool(t *testing.T, stripe api.StripeBillingClient, pool *pgxpool.Pool, resources ...config.BillingResourceConfig) *gin.Engine {
 	t.Helper()
 	t.Setenv("INTERNAL_API_TOKEN", internalRBACToken)
 	cfg := &config.Config{
+		BillingResources:              resources,
 		Port:                          "0",
 		VMDAddress:                    "localhost:0",
 		SystemTeamID:                  testSystemTeamID.String(),

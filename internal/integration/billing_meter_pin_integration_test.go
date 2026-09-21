@@ -4,11 +4,14 @@ package integration
 
 import (
 	"errors"
+	"fmt"
+	"net/http"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/billing"
+	"github.com/superserve-ai/sandbox/internal/config"
 )
 
 func TestIntegration_IncrementalMeterPinnedAcrossConcurrentConfigurations(t *testing.T) {
@@ -97,5 +100,35 @@ func TestIntegration_IncrementalAdoptionPinsMeterAndRejectsMixedInventory(t *tes
 	next, err := s.Reserve(t.Context(), p, "cpu", "15", through, payload)
 	if err != nil || next == nil || next.EventName != event.EventName || next.Quantity != "5.000000000000" {
 		t.Fatalf("adopted residual: %+v %v", next, err)
+	}
+}
+
+func TestIntegration_IncrementalRemovedResourceCorrection(t *testing.T) {
+	t.Setenv("OPERATOR_API_TOKEN", operatorRBACToken)
+	for _, hours := range []int{8, 10, 12} {
+		t.Run(fmt.Sprint(hours), func(t *testing.T) {
+			s, p, actor, _ := frozenCorrectionFixture(t)
+			correctionExec(t, `UPDATE sandbox_compute_billing_interval SET ended_at=started_at+make_interval(hours=>$2) WHERE team_id=$1`, p.TeamID, hours)
+			c, err := s.MeasureCorrection(t.Context(), p, "cpu")
+			if err != nil {
+				t.Fatal(err)
+			}
+			router := newBillingRouterWithPool(t, nil, testPool, config.BillingResourceConfig{ResourceKey: "memory_gib", Billable: true, CheckoutEnabled: true, StripeEventName: "memory_gib_hours"})
+			action := "accept_usage"
+			if hours < 10 {
+				action = "retain_exported"
+			}
+			path := "/internal/billing/export-corrections/" + c.ID.String() + "/apply"
+			response := doBillingOperator(router, path, operatorRBACToken, actor.String(), fmt.Sprintf(`{"action":%q,"evidence":"reviewed removed resource usage"}`, action))
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("apply removed resource: %d %s", response.Code, response.Body.String())
+			}
+			if hours > 10 {
+				event := acceptIncrement(t, s, p)
+				if event.EventName != "example_cpu_hours" || event.Quantity != "2.000000000000" {
+					t.Fatalf("correction payload: %+v", event)
+				}
+			}
+		})
 	}
 }
