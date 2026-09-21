@@ -297,6 +297,20 @@ func (m *Manager) dropUnclaimedBeyondCap() {
 	}
 }
 
+// retainStagingForRetry keeps a finished restore for the retry that follows
+// a deadline, and drops it once the retention passes with no flight around
+// to use it.
+func (m *Manager) retainStagingForRetry(vmID string) {
+	time.AfterFunc(m.backupRestore.AbandonAfter, func() {
+		m.backupFlightsMu.Lock()
+		_, inFlight := m.backupFlights[vmID]
+		m.backupFlightsMu.Unlock()
+		if !inFlight {
+			_ = os.RemoveAll(m.restoreStagingDir(vmID))
+		}
+	})
+}
+
 // cleanupRestoreStaging drops whatever a backup-backed resume left for the
 // VM once the VM itself is gone.
 func (m *Manager) cleanupRestoreStaging(vmID string) {
@@ -424,8 +438,12 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 	revived, err := m.reviveVMLocked(ctx, vmID, r.Disk, r.Base, r.Standalone, false, teamID, ownerID, vcpu, memMiB, rules, generation)
 	m.recordPhases("resume", "backup", map[string]time.Duration{"backup_boot": time.Since(tBoot)})
 	if err != nil {
-		// A retry fetches again; the staging copy must not outlive a
-		// resume nobody may ever retry.
+		if ctx.Err() != nil {
+			// The download is done and the caller's retry is imminent;
+			// starting it over would only run out of time again.
+			m.retainStagingForRetry(vmID)
+			return nil, err
+		}
 		_ = os.RemoveAll(m.restoreStagingDir(vmID))
 		return nil, err
 	}

@@ -1269,7 +1269,9 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			failPost(merr, "load secret bindings on resume failed")
 			return "", false
 		}
-		if len(meta) > 0 && !h.guestHoldsSecretEnv(*sandbox, claimed.SnapCreatedAt, meta) {
+		// A guest booted cold from a backup holds nothing injected at
+		// create, whatever the row remembers about the last injection.
+		if len(meta) > 0 && (attested.ColdBoot || !h.guestHoldsSecretEnv(*sandbox, claimed.SnapCreatedAt, meta)) {
 			if aerr := h.applySecretBindings(postCtx, *sandbox, meta); aerr != nil {
 				failPost(aerr, "reapply secret bindings on resume failed")
 				return "", false

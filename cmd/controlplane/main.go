@@ -580,6 +580,7 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 		PreviewProtocol:       resp.GetPreviewProtocol(),
 		PreviewPolicyRevision: resp.GetPreviewPolicyRevision(),
 		NetworkRulesApplied:   resp.GetNetworkRulesApplied(),
+		ColdBoot:              resp.GetColdBoot(),
 	}, nil
 }
 

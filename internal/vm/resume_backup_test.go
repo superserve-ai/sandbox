@@ -295,7 +295,24 @@ func TestSetBackupRestoreSweepsStagingLeftByAPreviousProcess(t *testing.T) {
 	store := &slowEmptyStore{}
 	mgr.SetBackupRestore(store, store, root, BackupRestoreOptions{})
 	if _, err := os.Stat(filepath.Join(root, "staging", "vm-old")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("stale staging must be swept at startup")
+		t.Fatal("stale staging must be out of the way at startup")
+	}
+	setAside := func() int {
+		entries, _ := os.ReadDir(root)
+		n := 0
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "staging.old-") {
+				n++
+			}
+		}
+		return n
+	}
+	if setAside() != 1 {
+		t.Fatalf("startup sets the old staging aside with one rename, found %d", setAside())
+	}
+	mgr.BackupRestoreMaintenance()
+	if setAside() != 0 {
+		t.Fatal("maintenance must delete the staging set aside")
 	}
 	if _, err := os.Stat(filepath.Join(root, ".base-cache", ".unpacked-abc")); err != nil {
 		t.Fatal("the base cache must survive startup")
@@ -496,5 +513,25 @@ func TestAdoptionOfARevivedVMSurvivesTheFallbackBeingWithdrawn(t *testing.T) {
 	resp, err := a.ResumeVM(context.Background(), &vmdpb.ResumeVMRequest{VmId: "vm-1", SnapshotPath: "/gone/vmstate.snap", MemFilePath: "/gone/mem.snap", BackupGeneration: "gen-a"})
 	if err != nil || resp.GetPid() != 7 {
 		t.Fatalf("withdrawing the fallback must not orphan a VM it already booted: resp=%v err=%v", resp, err)
+	}
+}
+
+func TestStagingRetainedAfterADeadlineOutlivesOnlyTheRetryWindow(t *testing.T) {
+	root := t.TempDir()
+	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
+	store := &slowEmptyStore{}
+	mgr.SetBackupRestore(store, store, root, BackupRestoreOptions{AbandonAfter: 50 * time.Millisecond})
+	touch(t, filepath.Join(mgr.restoreStagingDir("vm-1"), "rootfs.ext4"))
+	touch(t, filepath.Join(mgr.restoreStagingDir("vm-2"), "rootfs.ext4"))
+	mgr.backupFlights["vm-2"] = &backupFlight{generation: "g", done: make(chan struct{}), dropped: make(chan struct{})}
+
+	mgr.retainStagingForRetry("vm-1")
+	mgr.retainStagingForRetry("vm-2")
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(mgr.restoreStagingDir("vm-1")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("staging nobody retried must go once the retention passes")
+	}
+	if _, err := os.Stat(mgr.restoreStagingDir("vm-2")); err != nil {
+		t.Fatal("staging a new flight is using must stay")
 	}
 }

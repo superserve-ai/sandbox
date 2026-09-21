@@ -1218,6 +1218,7 @@ func main() {
 				CacheBytes:  int64(cacheGiB) << 30,
 			})
 			probeBackupRestore = func() {
+				mgr.BackupRestoreMaintenance()
 				probeCtx, probeCancel := context.WithTimeout(ctx, 10*time.Second)
 				_, perr := gcsReader.List(probeCtx, "sandboxes/.probe/")
 				probeCancel()

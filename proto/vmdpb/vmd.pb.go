@@ -1831,6 +1831,10 @@ type ResumeVMResponse struct {
 	// including one adopted from an earlier attempt. False means the caller
 	// must push them itself.
 	NetworkRulesApplied bool `protobuf:"varint,7,opt,name=network_rules_applied,json=networkRulesApplied,proto3" json:"network_rules_applied,omitempty"`
+	// The guest booted cold from a backup of its disk rather than waking
+	// from its memory image: everything injected at create, secrets
+	// included, is gone from it and must be applied again.
+	ColdBoot bool `protobuf:"varint,9,opt,name=cold_boot,json=coldBoot,proto3" json:"cold_boot,omitempty"`
 	// The policy revision the record holds after the stamp: the request's
 	// when it was applied, higher when the record already held a newer
 	// policy and kept it. Set only with preview_protocol.
@@ -1914,6 +1918,13 @@ func (x *ResumeVMResponse) GetPreviewProtocol() string {
 func (x *ResumeVMResponse) GetNetworkRulesApplied() bool {
 	if x != nil {
 		return x.NetworkRulesApplied
+	}
+	return false
+}
+
+func (x *ResumeVMResponse) GetColdBoot() bool {
+	if x != nil {
+		return x.ColdBoot
 	}
 	return false
 }
@@ -4034,7 +4045,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	" \x01(\tR\x10backupGeneration\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x06\x10\aR\x0esecrets_broker\"\xdc\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x06\x10\aR\x0esecrets_broker\"\xf9\x02\n" +
 	"\x10ResumeVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1f\n" +
 	"\vsocket_path\x18\x02 \x01(\tR\n" +
@@ -4044,7 +4055,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x03pid\x18\x04 \x01(\rR\x03pid\x12J\n" +
 	"\x0fresource_limits\x18\x05 \x01(\v2!.superserve.vmd.v1.ResourceLimitsR\x0eresourceLimits\x12)\n" +
 	"\x10preview_protocol\x18\x06 \x01(\tR\x0fpreviewProtocol\x122\n" +
-	"\x15network_rules_applied\x18\a \x01(\bR\x13networkRulesApplied\x126\n" +
+	"\x15network_rules_applied\x18\a \x01(\bR\x13networkRulesApplied\x12\x1b\n" +
+	"\tcold_boot\x18\t \x01(\bR\bcoldBoot\x126\n" +
 	"\x17preview_policy_revision\x18\b \x01(\x03R\x15previewPolicyRevision\"O\n" +
 	"\x15CreateSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12!\n" +

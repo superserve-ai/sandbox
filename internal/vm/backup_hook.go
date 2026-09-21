@@ -81,9 +81,6 @@ func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobL
 	m.backupFetchSem = make(chan struct{}, opts.Concurrency)
 	m.backupFlights = map[string]*backupFlight{}
 	m.sweepRestoreStaging()
-	if _, err := backup.SweepCacheTemporaries(m.backupBaseDir()); err != nil {
-		m.log.Warn().Err(err).Msg("backup base cache temporaries")
-	}
 	m.backupRestoreOn.Store(true)
 }
 
@@ -94,11 +91,40 @@ func (m *Manager) BackupRestoreEnabled() bool { return m.backupRestoreOn.Load() 
 // unable to read the bucket.
 func (m *Manager) DisableBackupRestore() { m.backupRestoreOn.Store(false) }
 
-// sweepRestoreStaging drops staging a previous process left behind: no
-// fetch survives a restart, and a completed one is cheap to redo. Only the
-// staging subtree this daemon owns is touched, whatever the root is set to.
+// sweepRestoreStaging moves staging a previous process left behind out of
+// the way in one rename: no fetch survives a restart, and a completed one
+// is cheap to redo. Deleting it is the maintenance pass's job, after
+// readiness. Only the staging subtree this daemon owns is touched.
 func (m *Manager) sweepRestoreStaging() {
-	_ = os.RemoveAll(m.restoreStagingRoot())
+	staging := m.restoreStagingRoot()
+	if _, err := os.Stat(staging); err != nil {
+		return
+	}
+	aside := staging + ".old-" + time.Now().UTC().Format("20060102T150405.000")
+	if err := os.Rename(staging, aside); err != nil {
+		m.log.Warn().Err(err).Msg("backup restore staging could not be set aside")
+	}
+}
+
+// BackupRestoreMaintenance removes staging set aside at startup and the
+// temporaries an interrupted fetch left in the base cache. Run it after
+// readiness: it walks whatever residue a crash left.
+func (m *Manager) BackupRestoreMaintenance() {
+	if m.backupRestoreRoot == "" {
+		return
+	}
+	if entries, err := os.ReadDir(m.backupRestoreRoot); err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "staging.old-") {
+				_ = os.RemoveAll(filepath.Join(m.backupRestoreRoot, e.Name()))
+			}
+		}
+	}
+	m.backupCacheMu.Lock()
+	defer m.backupCacheMu.Unlock()
+	if _, err := backup.SweepCacheTemporaries(m.backupBaseDir()); err != nil {
+		m.log.Warn().Err(err).Msg("backup base cache temporaries")
+	}
 }
 
 // SetBackupMetrics installs the optional backup metrics recorder. Same

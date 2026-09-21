@@ -172,6 +172,9 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
+	inst.mu.RLock()
+	coldBoot := inst.BackupGeneration != ""
+	inst.mu.RUnlock()
 	resp := &vmdpb.ResumeVMResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,
@@ -182,6 +185,7 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			MemoryMib: inst.Config.MemoryMiB,
 		},
 		NetworkRulesApplied: rulesApplied,
+		ColdBoot:            coldBoot,
 	}
 	if previewAccess != "" {
 		// Attests the request's policy fields were applied, and which

@@ -32,6 +32,9 @@ type ResumeAttestation struct {
 	// newer policy and kept it.
 	PreviewPolicyRevision int64
 	NetworkRulesApplied   bool
+	// ColdBoot reports a guest booted from a backup of its disk: nothing
+	// injected at create survived, and the caller must apply it again.
+	ColdBoot bool
 }
 
 type PortPolicy struct {
