@@ -64,8 +64,8 @@ resource "google_secret_manager_secret_iam_member" "controlplane_runtime_secrets
   member    = "serviceAccount:${google_service_account.controlplane_runtime.email}"
 }
 
-# Bootstrap and repair this grant with key-administrator credentials; CD cannot
-# change the shared key policy.
+# CD receives key-scoped IAM administration from the shared us-central1
+# bootstrap before this regional root applies runtime grants.
 resource "google_kms_crypto_key_iam_member" "controlplane_credentials" {
   crypto_key_id = "projects/${local.project_id}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
   role          = "roles/cloudkms.cryptoKeyEncrypterDecrypter"

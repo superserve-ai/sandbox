@@ -172,18 +172,17 @@ Before deploying the binary:
 1. Review plans for both production roots. Expect new control-plane identities,
    secret metadata, secret accessor grants, key grants, deployment act-as grants,
    and Cloud Run template changes. No host identity or VM changes are required.
-2. A KMS key administrator must bootstrap
-   `google_kms_crypto_key_iam_member.controlplane_credentials` in each regional
-   root with a targeted apply using administrator credentials. Its dependency
-   creates the regional `google_service_account.controlplane_runtime` first.
-   Import any existing runtime grant into its owning root before applying.
-   Keep key-policy administration with the administrator: the deployment account
-   must have only the read permission `cloudkms.cryptoKeys.getIamPolicy` needed
-   to refresh these resources, without `cloudkms.cryptoKeys.setIamPolicy` or
-   direct encrypt/decrypt access. Check effective permissions, including inherited
-   roles. If the former deployment `roles/cloudkms.admin` grant was already
-   applied, use administrator credentials to apply its removal in the east root
-   before resuming CD; also revoke any equivalent out-of-band grant.
+2. Run the shared production/us-central1 bootstrap before either regional apply.
+   Normal Terraform CD already enforces this ordering. It grants the deployment
+   account `roles/iam.securityAdmin` with an exact resource type/name condition
+   restricting access to the `credentials-kek` CryptoKey. CD can then create,
+   repair, and remove regional runtime IAM grants without an administrator apply.
+   The grant provides IAM policy management, not direct encrypt/decrypt or key
+   lifecycle permissions. CD is trusted to deploy code using runtime credentials
+   and to manage this key's access policy. For a manual regional rollout, run
+   the shared bootstrap first; do not run an older failed workflow revision that
+   predates this dependency. Import existing Terraform-managed resources into
+   their owning root when necessary.
 3. In each root, bootstrap `google_secret_manager_secret.operator_api_token`
    with a targeted apply.
    Add an enabled secret version through the approved operator credential process
@@ -191,11 +190,8 @@ Before deploying the binary:
    an empty secret prevents a ready Cloud Run revision. If metadata or an IAM
    grant already exists, import it into its owning root before applying.
 4. Apply the complete regional plans, east then west. Each API module waits for
-   its secret, key, and deployment grants. The runtime key grants must already
-   be present and refreshable by CD; creation, repair, replacement, and removal
-   require administrator credentials. If key-policy drift blocks CD, have the
-   administrator reconcile the affected grant before retrying; do not grant CD
-   key-policy write access. Verify both services become ready
+   its secret, key, and deployment grants. CD manages the runtime key grants
+   using the shared bootstrap permission. Verify both services become ready
    with the new runtime identity and operator secret reference. Exercise an
    existing KMS-backed credential operation and normal database/API access to
    confirm the identity switch preserved required access.
@@ -218,8 +214,9 @@ then restore the prior identity in Terraform and revoke the new operator grants.
 Adoption/recovery will remain unavailable until the isolated identity is restored;
 the normal deployment compatibility gate deliberately blocks that configuration.
 Do not work around it by granting the shared host account operator-secret access.
-Retain secret versions for audited recovery. Remove runtime KMS grants with
-administrator credentials before deleting the corresponding runtime identities.
+Retain secret versions for audited recovery. Let Terraform remove runtime KMS
+grants before deleting the corresponding runtime identities. Retain the shared CD permission until regional grant removal
+is complete.
 
 ## Rollout and rollback
 
