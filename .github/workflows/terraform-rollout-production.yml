@@ -58,6 +58,17 @@ jobs:
           command -v jq
           command -v curl
 
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Bootstrap credentials key IAM
+        run: |
+          set -euo pipefail
+          terraform -chdir=infra/envs/production/us-central1 init -input=false
+          terraform -chdir=infra/envs/production/us-central1 plan -input=false \
+            -target=google_project_iam_member.cd_credentials_key_iam -out=cd-key.tfplan
+          terraform -chdir=infra/envs/production/us-central1 apply -input=false -auto-approve cd-key.tfplan
+          python3 .github/workflows/scripts/wait_credentials_key_iam.py --project "${{ vars.GCP_PROJECT }}"
+
       - name: Terraform apply production/us-west2
         run: |
           set -euo pipefail

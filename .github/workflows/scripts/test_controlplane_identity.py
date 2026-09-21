@@ -78,16 +78,28 @@ class ControlplaneIdentityTest(unittest.TestCase):
 
     def test_cd_policy_management_is_scoped_to_credentials_key(self):
         source = (ROOT / 'infra/envs/production/us-central1/cd-credentials-key-iam.tf').read_text()
+        binding = re.search(r'resource "google_project_iam_member" "cd_credentials_key_iam" \{(.*?)\n\}', source, re.S)
+        self.assertIsNotNone(binding)
+        source = binding.group(1)
+        condition = re.search(r'condition \{(.*?)\n  \}', source, re.S)
+        self.assertIsNotNone(condition)
         self.assertIn('role    = "roles/iam.securityAdmin"', source)
         self.assertIn('serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com', source)
-        self.assertIn("resource.type == 'cloudkms.googleapis.com/CryptoKey' && resource.name == 'projects/${local.project_id}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek'", source)
+        self.assertIn("resource.type == 'cloudkms.googleapis.com/CryptoKey' && resource.name == 'projects/${local.project_id}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek'", condition.group(1))
         self.assertNotIn('roles/cloudkms.admin', source)
         self.assertNotIn('resource.name.startsWith', source)
 
     def test_key_policy_permission_bootstraps_before_both_regions(self):
         workflow = (ROOT / '.github/workflows/terraform-cd.yml').read_text()
+        self.assertIn("'.github/workflows/scripts/wait_credentials_key_iam.py'", workflow.split('jobs:', 1)[0])
         bootstrap = workflow.split('  production-us-central1-bootstrap:', 1)[1].split('\n  production-us-west2-infra:', 1)[0]
         self.assertIn('-target=google_project_iam_member.cd_credentials_key_iam', bootstrap)
+        self.assertIn('wait_credentials_key_iam.py', bootstrap)
+        self.assertLess(bootstrap.index('terraform apply'), bootstrap.index('wait_credentials_key_iam.py'))
+        manual = (ROOT / '.github/workflows/terraform-rollout-production.yml').read_text().split('  central1:', 1)[0]
+        self.assertIn('-target=google_project_iam_member.cd_credentials_key_iam', manual)
+        self.assertLess(manual.index('apply -input=false -auto-approve cd-key.tfplan'), manual.index('wait_credentials_key_iam.py'))
+        self.assertLess(manual.index('wait_credentials_key_iam.py'), manual.index('- name: Terraform apply production/us-west2'))
         for region in ('us-east4', 'us-west2'):
             job = workflow.split(f'  production-{region}-infra:', 1)[1].split('\n    steps:', 1)[0]
             self.assertIn('production-us-central1-bootstrap', job)

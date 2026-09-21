@@ -173,15 +173,19 @@ Before deploying the binary:
    secret metadata, secret accessor grants, key grants, deployment act-as grants,
    and Cloud Run template changes. No host identity or VM changes are required.
 2. Run the shared production/us-central1 bootstrap before either regional apply.
-   Normal Terraform CD already enforces this ordering. It grants the deployment
+   Normal Terraform CD and the manual west2/all rollout enforce this ordering.
+   The bootstrap grants the deployment
    account `roles/iam.securityAdmin` with an exact resource type/name condition
    restricting access to the `credentials-kek` CryptoKey. CD can then create,
    repair, and remove regional runtime IAM grants without an administrator apply.
    The grant provides IAM policy management, not direct encrypt/decrypt or key
    lifecycle permissions. CD is trusted to deploy code using runtime credentials
-   and to manage this key's access policy. For a manual regional rollout, run
-   the shared bootstrap first; do not run an older failed workflow revision that
-   predates this dependency. Import existing Terraform-managed resources into
+   and to manage this key's access policy. Both workflows poll the key's
+   `testIamPermissions` endpoint for up to ten minutes before proceeding, so
+   eventual IAM propagation cannot release regional applies prematurely. For
+   direct regional Terraform commands, run the shared bootstrap and permission
+   check first. Do not run an older failed workflow revision that predates these
+   dependencies. Import existing Terraform-managed resources into
    their owning root when necessary.
 3. In each root, bootstrap `google_secret_manager_secret.operator_api_token`
    with a targeted apply.

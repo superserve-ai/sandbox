@@ -175,7 +175,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 		}
 	}
 
-	now := time.Now().UTC()
+	now := h.nowUTC()
 	periodStart, periodEnd := billing.CurrentBillingPeriod(now)
 	account, accountErr := h.DB.GetTeamBillingAccount(c.Request.Context(), teamID)
 	if accountErr != nil && !errors.Is(accountErr, pgx.ErrNoRows) {
