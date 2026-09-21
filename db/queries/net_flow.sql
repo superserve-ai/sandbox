@@ -21,3 +21,9 @@ WHERE sandbox_id = sqlc.arg('sandbox_id')
        OR (ts, 'connection', id) < (sqlc.narg('cursor_ts')::timestamptz, sqlc.narg('cursor_kind')::text, sqlc.narg('cursor_id')::bigint))
 ORDER BY ts DESC, id DESC
 LIMIT sqlc.arg('row_limit');
+
+-- name: MaintainLogPartitions :exec
+-- Creates the day partitions inside each log's retention window and ahead
+-- of it, and drops the days past it. Idempotent; the control plane runs it
+-- hourly.
+SELECT log_partitions_maintain('net_flow', 7), log_partitions_maintain('proxy_audit', 7);
