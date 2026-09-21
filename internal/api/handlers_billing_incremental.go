@@ -327,6 +327,12 @@ func (h *Handlers) ApplyBillingCorrection(c *gin.Context) {
 			eventName = state.StripeEventName
 		}
 	}
+	// Reviewed recovery keeps the period's meter even after configuration removal.
+	eventName, err = (billing.ExportStore{Pool: h.Pool}).MeterEventName(ctx, p, resource, eventName)
+	if err != nil {
+		respondErrorMsg(c, "conflict", err.Error(), http.StatusConflict)
+		return
+	}
 	if eventName == "" {
 		respondErrorMsg(c, "conflict", "resource is not enabled for billing", http.StatusConflict)
 		return
