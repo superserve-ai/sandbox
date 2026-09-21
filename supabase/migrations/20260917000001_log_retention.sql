@@ -1,10 +1,10 @@
--- net_flow and proxy_audit grow with every connection and request a sandbox
--- makes and were never aged out; net_flow alone filled the control-plane
--- disk. Both become range-partitioned by day so retention is a partition
--- drop — instant, and it returns the disk — rather than a delete. The last
--- seven days are carried over; older rows go with the old tables.
--- log_partitions_maintain() creates the days inside the window and ahead of
--- it and drops the days past it; the control plane runs it hourly.
+-- net_flow and proxy_audit are range-partitioned by day so retention is a
+-- partition drop rather than a delete. The window is seven days (today and
+-- the six before it); those rows are carried over, the rest go with the old
+-- tables. The copy needs free space for the retained rows and their indexes
+-- before the old tables are dropped. log_partitions_maintain() creates the
+-- days inside the window and ahead of it and drops the days past it; the
+-- control plane runs it hourly.
 
 BEGIN;
 
@@ -17,7 +17,7 @@ DECLARE
 BEGIN
   -- Replicas run this concurrently; one at a time per table.
   PERFORM pg_advisory_xact_lock(hashtext('log_partitions_maintain'), parent::oid::int);
-  FOR i IN -keep_days..ahead_days LOOP
+  FOR i IN 1 - keep_days..ahead_days LOOP
     d := today + i;
     child := format('%s_%s', parent::text, to_char(d, 'YYYYMMDD'));
     EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF %s FOR VALUES FROM (%L) TO (%L)',
@@ -29,7 +29,7 @@ BEGIN
     FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
     WHERE i.inhparent = parent
       AND c.relname ~ '_\d{8}$'
-      AND to_date(right(c.relname, 8), 'YYYYMMDD') < today - keep_days
+      AND to_date(right(c.relname, 8), 'YYYYMMDD') <= today - keep_days
   LOOP
     EXECUTE format('DROP TABLE IF EXISTS %I', child);
   END LOOP;
@@ -66,7 +66,7 @@ ALTER TABLE net_flow ENABLE ROW LEVEL SECURITY;
 SELECT log_partitions_maintain('net_flow', 7);
 INSERT INTO net_flow (id, ts, team_id, sandbox_id, protocol, host, dst_ip, dst_port, verdict, match_rule, bytes_sent, bytes_recv, duration_ms)
 SELECT id, ts, team_id, sandbox_id, protocol, host, dst_ip, dst_port, verdict, match_rule, bytes_sent, bytes_recv, duration_ms
-FROM net_flow_old WHERE ts >= now() - interval '7 days';
+FROM net_flow_old WHERE ts >= ((now() AT TIME ZONE 'UTC')::date - 6)::timestamp AT TIME ZONE 'UTC';
 DROP TABLE net_flow_old;
 
 -- proxy_audit
@@ -100,7 +100,7 @@ ALTER TABLE proxy_audit ENABLE ROW LEVEL SECURITY;
 SELECT log_partitions_maintain('proxy_audit', 7);
 INSERT INTO proxy_audit (id, ts, team_id, sandbox_id, secret_id, method, host, path, status, upstream_status, latency_ms, error_code)
 SELECT id, ts, team_id, sandbox_id, secret_id, method, host, path, status, upstream_status, latency_ms, error_code
-FROM proxy_audit_old WHERE ts >= now() - interval '7 days';
+FROM proxy_audit_old WHERE ts >= ((now() AT TIME ZONE 'UTC')::date - 6)::timestamp AT TIME ZONE 'UTC';
 DROP TABLE proxy_audit_old;
 
 COMMIT;
