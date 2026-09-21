@@ -25,6 +25,8 @@ def has_permission(project):
         if error.code in (403, 429, 500, 502, 503, 504):
             return False
         raise RuntimeError(f'KMS permission check failed with HTTP {error.code}') from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        return False
 
 
 def wait_for_permission(project, timeout=600):
