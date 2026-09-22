@@ -123,12 +123,16 @@ CREATE INDEX IF NOT EXISTS sandbox_snapshot_template
 ALTER TABLE sandbox
     ADD COLUMN IF NOT EXISTS source_snapshot_id uuid;
 
+-- NOT VALID: adding the key is then metadata only. Validation scans the
+-- sandbox table and runs in the next migration, under a lock that does not
+-- block sandbox writes. New rows are checked either way.
 DO $$
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sandbox_source_snapshot_fk') THEN
     ALTER TABLE sandbox
       ADD CONSTRAINT sandbox_source_snapshot_fk
-      FOREIGN KEY (source_snapshot_id, team_id) REFERENCES sandbox_snapshot(id, team_id);
+      FOREIGN KEY (source_snapshot_id, team_id) REFERENCES sandbox_snapshot(id, team_id)
+      NOT VALID;
   END IF;
 END $$;
 
