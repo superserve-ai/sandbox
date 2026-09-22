@@ -30,7 +30,7 @@ variable "writer_members" {
 }
 
 variable "reader_members" {
-  description = "IAM members (serviceAccount:... form) granted managed-folder template-prefix object read/list access. Keep this list to same-cell control-plane readers; no write or delete permission is implied."
+  description = "IAM members (serviceAccount:... form) granted whole-bucket object read/list access. Keep this list to same-cell control-plane readers; no write or delete permission is implied."
   type        = list(string)
   default     = []
 }

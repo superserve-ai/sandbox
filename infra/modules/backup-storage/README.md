@@ -25,7 +25,7 @@ generation is recorded in the control-plane database.
 | Identity | Roles | Can |
 | --- | --- | --- |
 | legacy shared runtime (`writer_members`) | `objectCreator` only | create new objects, nothing else |
-| dedicated per-cell control-plane SA (`reader_members`) | managed-folder `objectViewer` on `templates/` | read/list `templates/` manifests and referenced objects in that cell; no sandbox access, write, or delete |
+| dedicated per-cell control-plane SA (`reader_members`) | bucket-level `objectViewer` on its cell-local bucket | read/list backup objects in that cell, including `sandboxes/`, `templates/`, and `bases/` when present; no write or delete |
 | dedicated per-cell VMD SA (environment-owned grants) | `objectCreator` + `objectViewer` | create/read/list within its cell only; no delete/overwrite |
 | dedicated restore SA (created by this module) | `objectViewer` | read/list, for restore tooling and drills via impersonation |
 | dedicated GC SA (created by this module) | `objectAdmin` | delete objects past the retention window |
@@ -38,10 +38,9 @@ Uploader idempotency uses an `ifGenerationMatch=0` precondition instead of
 get/list: a 412 response means the object already exists and is treated as
 success.
 
-The `templates/` managed folder is the reader boundary. A bucket IAM condition
-cannot provide the same isolation for listings because Cloud Storage evaluates
-`storage.objects.list` against the bucket resource rather than an individual
-object name.
+The bucket itself is the reader boundary. Cell-local bucket separation prevents
+cross-cell reads; the reader role remains read-only and grants no write or
+delete authority.
 
 The restore and GC service accounts are control-plane/tooling-only: no host
 or runtime service may run as them, and impersonation grants are managed
