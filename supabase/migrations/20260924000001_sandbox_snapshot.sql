@@ -140,3 +140,24 @@ DROP TRIGGER IF EXISTS trg_sandbox_snapshot_quota ON sandbox_snapshot;
 CREATE TRIGGER trg_sandbox_snapshot_quota
     BEFORE INSERT ON sandbox_snapshot
     FOR EACH ROW EXECUTE FUNCTION sandbox_snapshot_quota_on_insert();
+
+-- Failed and deleted rows leave the quota count, so they never come back:
+-- the only way to a live row is a fresh insert through the quota trigger.
+CREATE OR REPLACE FUNCTION sandbox_snapshot_no_revive() RETURNS trigger
+    LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF OLD.status = 'failed' AND NEW.status NOT IN ('failed', 'deleting') THEN
+        RAISE EXCEPTION 'snapshot % failed and cannot become %', OLD.id, NEW.status;
+    END IF;
+    IF OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS NULL THEN
+        RAISE EXCEPTION 'snapshot % is deleted and cannot be restored', OLD.id;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_sandbox_snapshot_no_revive ON sandbox_snapshot;
+CREATE TRIGGER trg_sandbox_snapshot_no_revive
+    BEFORE UPDATE ON sandbox_snapshot
+    FOR EACH ROW EXECUTE FUNCTION sandbox_snapshot_no_revive();

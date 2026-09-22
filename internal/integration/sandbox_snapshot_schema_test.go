@@ -69,7 +69,8 @@ func TestSandboxSnapshotSchema(t *testing.T) {
 
 	// Team cap counts across sandboxes: a(1 live) + b(2) = 3, the next is refused.
 	key := "retry-1"
-	if _, err := insertSnapshotRow(ctx, teamID, b, &key); err != nil {
+	keyed, err := insertSnapshotRow(ctx, teamID, b, &key)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := insertSnapshotRow(ctx, teamID, b, nil); err != nil {
@@ -85,10 +86,21 @@ func TestSandboxSnapshotSchema(t *testing.T) {
 	}
 
 	// A ready row must name its artifacts.
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'ready' WHERE id = $1`, first); pgCode(err) != "23514" {
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'ready' WHERE id = $1`, keyed); pgCode(err) != "23514" {
 		t.Fatalf("ready without artifacts: want 23514, got %v", err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'ready', overlay_path = '/o', snapshot_path = '/v', mem_path = '/m' WHERE id = $1`, first); err != nil {
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'ready', overlay_path = '/o', snapshot_path = '/v', mem_path = '/m' WHERE id = $1`, keyed); err != nil {
 		t.Fatalf("ready with artifacts: %v", err)
+	}
+
+	// Failed and deleted rows left the count, so they can never come back.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'ready', overlay_path = '/o', snapshot_path = '/v', mem_path = '/m' WHERE id = $1`, first); err == nil {
+		t.Fatal("reviving a failed snapshot should be refused")
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET deleted_at = NULL WHERE id = $1`, third); err == nil {
+		t.Fatal("undeleting a snapshot should be refused")
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'deleting' WHERE id = $1`, first); err != nil {
+		t.Fatalf("failed to deleting is the one allowed exit: %v", err)
 	}
 }
