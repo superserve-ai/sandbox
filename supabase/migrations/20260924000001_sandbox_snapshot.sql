@@ -114,6 +114,12 @@ CREATE INDEX IF NOT EXISTS sandbox_snapshot_base_path
     ON sandbox_snapshot (base_path)
     WHERE deleted_at IS NULL AND status IN ('creating', 'ready');
 
+-- Template delete counts references while holding the template row lock
+-- that create-from-template waits on, so the count must not scan.
+CREATE INDEX IF NOT EXISTS sandbox_snapshot_template
+    ON sandbox_snapshot (template_id)
+    WHERE deleted_at IS NULL AND status IN ('creating', 'ready');
+
 ALTER TABLE sandbox
     ADD COLUMN IF NOT EXISTS source_snapshot_id uuid;
 
