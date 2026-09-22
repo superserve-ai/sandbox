@@ -341,6 +341,7 @@ func run() error {
 		}
 	}
 	handlers.StartTeardownSweeper(ctx)
+	handlers.StartLogRetention(ctx)
 
 	// Launch the template build supervisor. Drives template_build rows
 	// through pending → building → snapshotting → ready/failed by calling
