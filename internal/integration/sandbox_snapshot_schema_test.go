@@ -103,4 +103,14 @@ func TestSandboxSnapshotSchema(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'deleting' WHERE id = $1`, first); err != nil {
 		t.Fatalf("failed to deleting is the one allowed exit: %v", err)
 	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'ready', overlay_path = '/o', snapshot_path = '/v', mem_path = '/m' WHERE id = $1`, first); err == nil {
+		t.Fatal("deleting is terminal; deleting to ready should be refused")
+	}
+	var live int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_snapshot WHERE team_id = $1 AND deleted_at IS NULL AND status IN ('creating', 'ready')`, teamID).Scan(&live); err != nil {
+		t.Fatal(err)
+	}
+	if live > 3 {
+		t.Fatalf("live snapshots exceed the team cap: %d", live)
+	}
 }
