@@ -288,6 +288,8 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
+      - uses: google-github-actions/setup-gcloud@v2
+
       - name: Verify validation dependencies
         run: |
           set -euo pipefail
@@ -303,7 +305,32 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
+          gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
+            --region "${{ vars.GCP_REGION_USW }}" \
+            --project "${{ vars.GCP_PROJECT }}" \
+            --format=json > "$RUNNER_TEMP/production-usw2-before.json"
+          previous=$(jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // empty' \
+            "$RUNNER_TEMP/production-usw2-before.json")
+          test -n "$previous" || { echo "No 100% serving revision; refusing an identity-changing Terraform apply." >&2; exit 1; }
+          rollback() {
+            rc=$?
+            if [[ "$rc" -ne 0 ]]; then
+              gcloud run services update-traffic "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
+                --to-revisions "${previous}=100" \
+                --region "${{ vars.GCP_REGION_USW }}" \
+                --project "${{ vars.GCP_PROJECT }}" || true
+            fi
+            exit "$rc"
+          }
+          trap rollback EXIT
+          # Keep the identity-only revision out of traffic until the following
+          # API job grants and verifies its KMS access.
+          gcloud run services update-traffic "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
+            --to-revisions "${previous}=100" \
+            --region "${{ vars.GCP_REGION_USW }}" \
+            --project "${{ vars.GCP_PROJECT }}"
           terraform apply -input=false -auto-approve tfplan
+          trap - EXIT
 
   production-us-west2-api:
     name: Deploy API production/us-west2
@@ -494,6 +521,8 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
+      - uses: google-github-actions/setup-gcloud@v2
+
       - name: Terraform apply production/us-east4
         run: |
           set -euo pipefail
@@ -503,7 +532,32 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --guarded module.sandbox_host_c
+          gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
+            --region "${{ vars.GCP_REGION_USE4 }}" \
+            --project "${{ vars.GCP_PROJECT }}" \
+            --format=json > "$RUNNER_TEMP/production-use4-before.json"
+          previous=$(jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // empty' \
+            "$RUNNER_TEMP/production-use4-before.json")
+          test -n "$previous" || { echo "No 100% serving revision; refusing an identity-changing Terraform apply." >&2; exit 1; }
+          rollback() {
+            rc=$?
+            if [[ "$rc" -ne 0 ]]; then
+              gcloud run services update-traffic "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
+                --to-revisions "${previous}=100" \
+                --region "${{ vars.GCP_REGION_USE4 }}" \
+                --project "${{ vars.GCP_PROJECT }}" || true
+            fi
+            exit "$rc"
+          }
+          trap rollback EXIT
+          # Keep the identity-only revision out of traffic until the following
+          # API job grants and verifies its KMS access.
+          gcloud run services update-traffic "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
+            --to-revisions "${previous}=100" \
+            --region "${{ vars.GCP_REGION_USE4 }}" \
+            --project "${{ vars.GCP_PROJECT }}"
           terraform apply -input=false -auto-approve tfplan
+          trap - EXIT
 
   production-us-east4-api:
     name: Deploy API production/us-east4

@@ -16,13 +16,14 @@ run "control_plane_reader_is_read_only" {
 
   assert {
     condition = (
-      google_storage_bucket_iam_member.reader_view["serviceAccount:reader@example-project.iam.gserviceaccount.com"].bucket == "example-backup" &&
-      google_storage_bucket_iam_member.reader_view["serviceAccount:reader@example-project.iam.gserviceaccount.com"].role == "roles/storage.objectViewer" &&
+      google_storage_managed_folder.templates.name == "templates/" &&
+      google_storage_managed_folder_iam_member.reader_view["serviceAccount:reader@example-project.iam.gserviceaccount.com"].managed_folder == "templates/" &&
+      google_storage_managed_folder_iam_member.reader_view["serviceAccount:reader@example-project.iam.gserviceaccount.com"].role == "roles/storage.objectViewer" &&
       length(google_storage_bucket_iam_member.writer_create) == 0 &&
-      !contains([for grant in values(google_storage_bucket_iam_member.reader_view) : grant.role], "roles/storage.objectCreator") &&
-      !contains([for grant in values(google_storage_bucket_iam_member.reader_view) : grant.role], "roles/storage.objectAdmin")
+      !contains([for grant in values(google_storage_managed_folder_iam_member.reader_view) : grant.role], "roles/storage.objectCreator") &&
+      !contains([for grant in values(google_storage_managed_folder_iam_member.reader_view) : grant.role], "roles/storage.objectAdmin")
     )
-    error_message = "Control-plane readers must receive whole-bucket objectViewer access."
+    error_message = "Control-plane readers must receive template managed-folder objectViewer access."
   }
 
   assert {

@@ -444,9 +444,29 @@ def main() -> int:
             for binding in bucket_policy.get("bindings", [])
             if reader_member in binding.get("members", [])
         }
-        if "roles/storage.objectViewer" not in reader_roles:
+        if reader_roles:
             raise VerificationError(
-                f"bucket {bucket} has no objectViewer grant for {identity}"
+                "runtime identity must not receive a bucket-level backup grant: "
+                f"{sorted(reader_roles)}"
+            )
+        managed_folder_policy_json = evidence.command(
+            "managed-folder-iam",
+            gcloud(
+                "storage",
+                "managed-folders",
+                "get-iam-policy",
+                f"gs://{bucket}/{object_prefix}",
+                "--format=json",
+            ),
+        )
+        managed_folder_policy = json.loads(managed_folder_policy_json)
+        if not any(
+            binding.get("role") == "roles/storage.objectViewer"
+            and reader_member in binding.get("members", [])
+            for binding in managed_folder_policy.get("bindings", [])
+        ):
+            raise VerificationError(
+                f"managed folder {object_prefix} has no objectViewer grant for {identity}"
             )
         evidence.command(
             "project-iam",
