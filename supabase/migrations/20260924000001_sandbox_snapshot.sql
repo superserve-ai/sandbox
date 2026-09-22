@@ -1,6 +1,24 @@
 -- Customer snapshots: point-in-time captures a new sandbox can be created from.
 -- Kept apart from `snapshot`, the resume image overwritten on every pause.
 -- Forks are independent copies, so a snapshot can be deleted at any time.
+--
+-- The sandbox index must be pre-built CONCURRENTLY by hand on a populated
+-- database, as with the other sandbox indexes: the runner wraps this file in a
+-- transaction, where CONCURRENTLY cannot run, and a plain build blocks sandbox
+-- writes for the table scan. Run before merging:
+--
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS sandbox_by_source_snapshot
+--     ON sandbox (source_snapshot_id) WHERE source_snapshot_id IS NOT NULL;
+--   SELECT indisvalid FROM pg_index
+--   WHERE indexrelid = 'sandbox_by_source_snapshot'::regclass;
+--
+-- The column must exist first, so on a populated database apply the ALTER
+-- TABLE sandbox statement below by hand ahead of the pre-build.
+
+BEGIN;
+
+SET LOCAL lock_timeout = '5s';
+SET LOCAL statement_timeout = '10s';
 
 CREATE TABLE IF NOT EXISTS sandbox_snapshot (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -76,6 +94,19 @@ ALTER TABLE sandbox
 
 COMMENT ON COLUMN sandbox.source_snapshot_id IS
   'Snapshot this sandbox was created from; NULL when created from a template.';
+
+-- IF NOT EXISTS matches by name only; an interrupted concurrent pre-build
+-- leaves an INVALID index it would silently keep.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_index
+    WHERE indexrelid = to_regclass('public.sandbox_by_source_snapshot')
+      AND NOT indisvalid
+  ) THEN
+    RAISE EXCEPTION 'sandbox_by_source_snapshot exists but is INVALID; DROP INDEX it, re-run the concurrent pre-build, then retry';
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS sandbox_by_source_snapshot
     ON sandbox (source_snapshot_id)
@@ -162,3 +193,5 @@ DROP TRIGGER IF EXISTS trg_sandbox_snapshot_no_revive ON sandbox_snapshot;
 CREATE TRIGGER trg_sandbox_snapshot_no_revive
     BEFORE UPDATE ON sandbox_snapshot
     FOR EACH ROW EXECUTE FUNCTION sandbox_snapshot_no_revive();
+
+COMMIT;
