@@ -296,7 +296,7 @@ resource "google_compute_disk" "sandbox_data_b" {
   name    = "superserve-vmd-usw2-2-sandbox-data"
   zone    = local.zone
   type    = "hyperdisk-balanced"
-  size    = 4096
+  size    = 8192
 
   labels = merge(local.common_labels, {
     component = "vmd"
