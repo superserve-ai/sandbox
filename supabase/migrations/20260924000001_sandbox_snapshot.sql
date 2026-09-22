@@ -132,7 +132,8 @@ ALTER TABLE team
 
 -- Count quota, serialized on the team row like sandbox_quota_on_insert.
 -- Only creating and ready rows count: a failed capture never blocks a retry,
--- and a row being deleted has already given its slot back.
+-- and a row being deleted has already given its slot back. deleted_at IS NULL
+-- is implied by the status but names the partial indexes' predicate.
 CREATE OR REPLACE FUNCTION sandbox_snapshot_quota_on_insert() RETURNS trigger
     LANGUAGE plpgsql
 AS $$
@@ -162,14 +163,14 @@ BEGIN
     END IF;
 
     SELECT count(*) INTO n FROM sandbox_snapshot
-    WHERE team_id = NEW.team_id AND status IN ('creating', 'ready');
+    WHERE team_id = NEW.team_id AND deleted_at IS NULL AND status IN ('creating', 'ready');
     IF n >= team_limit THEN
         RAISE EXCEPTION 'snapshot quota exceeded for team (count=%, max=%)', n, team_limit
             USING ERRCODE = 'SS002';
     END IF;
 
     SELECT count(*) INTO n FROM sandbox_snapshot
-    WHERE sandbox_id = NEW.sandbox_id AND status IN ('creating', 'ready');
+    WHERE sandbox_id = NEW.sandbox_id AND deleted_at IS NULL AND status IN ('creating', 'ready');
     IF n >= sandbox_limit THEN
         RAISE EXCEPTION 'snapshot quota exceeded for sandbox (count=%, max=%)', n, sandbox_limit
             USING ERRCODE = 'SS002';
