@@ -172,11 +172,14 @@ DECLARE
     sandbox_limit int;
     n             bigint;
 BEGIN
+    -- NO KEY UPDATE: excludes other snapshot inserts for the team but not the
+    -- KEY SHARE locks sandbox create, pause and resume take through their
+    -- foreign keys, so an in-flight capture never stalls them.
     SELECT max_snapshots, max_snapshots_per_sandbox
     INTO team_limit, sandbox_limit
     FROM team
     WHERE id = NEW.team_id
-    FOR UPDATE;
+    FOR NO KEY UPDATE;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'team % does not exist', NEW.team_id;

@@ -192,3 +192,30 @@ func TestSandboxSnapshotSchema(t *testing.T) {
 		t.Fatalf("template after its snapshot is deleting: %+v err=%v", del, err)
 	}
 }
+
+// A snapshot insert holds its team-row lock until commit; sandbox creation
+// for the same team must not wait on it.
+func TestSandboxSnapshotInsertDoesNotBlockSandboxCreate(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	src, err := insertSandboxRow(ctx, teamID, "snap-lock-src")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO sandbox_snapshot (team_id, sandbox_id, kind, host_id, vcpu_count, memory_mib, disk_mib, base_path)
+		VALUES ($1, $2, 'fs', 'default', 1, 1024, 4096, '/base.ext4')`, teamID, src); err != nil {
+		t.Fatal(err)
+	}
+	// Bounded wait: a lock conflict shows up as a timeout, not a hang.
+	waitCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if _, err := insertSandboxRow(waitCtx, teamID, "snap-lock-other"); err != nil {
+		t.Fatalf("sandbox insert blocked behind an open snapshot insert: %v", err)
+	}
+}
