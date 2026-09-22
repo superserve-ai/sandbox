@@ -72,12 +72,16 @@ type stripeClient struct {
 	httpClient *http.Client
 }
 
+const billingRecoveryOperationTimeout = 2 * time.Minute
+
 func (c stripeClient) request(ctx context.Context, method, path string, form url.Values, out any, idempotency string) error {
 	var body io.Reader
 	if form != nil {
 		body = strings.NewReader(form.Encode())
 	}
-	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(c.baseURL, "/")+path, body)
+	requestCtx, cancel := context.WithTimeout(ctx, billingRecoveryOperationTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, method, strings.TrimRight(c.baseURL, "/")+path, body)
 	if err != nil {
 		return err
 	}
@@ -236,8 +240,9 @@ func main() {
 	if err != nil {
 		fatal(err.Error())
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
+	// Keep fleet scans alive across pages; individual DB, Stripe, and account
+	// operations are bounded below.
+	ctx := context.Background()
 	cfg, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		fatal(err.Error())
@@ -250,7 +255,9 @@ func main() {
 	stripe := stripeClient{baseURL: stripeBaseURL, secret: os.Getenv("STRIPE_SECRET_KEY"), version: stripeVersion}
 	var after *uuid.UUID
 	for {
-		accounts, err := loadAccounts(ctx, pool, targetID, after, batchSize)
+		loadCtx, cancelLoad := context.WithTimeout(ctx, billingRecoveryOperationTimeout)
+		accounts, err := loadAccounts(loadCtx, pool, targetID, after, batchSize)
+		cancelLoad()
 		if err != nil {
 			fatal(err.Error())
 		}
@@ -258,7 +265,9 @@ func main() {
 			fatal("-apply target did not resolve to one billing account")
 		}
 		for _, account := range accounts {
-			outcome := auditAccount(ctx, pool, stripe, account, excludedID, apply)
+			accountCtx, cancelAccount := context.WithTimeout(ctx, billingRecoveryOperationTimeout)
+			outcome := auditAccount(accountCtx, pool, stripe, account, excludedID, apply)
+			cancelAccount()
 			encoded, _ := json.Marshal(outcome)
 			fmt.Println(string(encoded))
 		}
@@ -277,7 +286,9 @@ func loadAccounts(ctx context.Context, pool *pgxpool.Pool, target, after *uuid.U
  FROM team_billing_account
 	 WHERE (($1::uuid IS NOT NULL AND team_id = $1)
 	    OR ($1::uuid IS NULL
-	        AND (stripe_activation_credit_grant_id IS NULL OR trial_ended_at IS NULL)))
+	        AND (stripe_activation_credit_grant_id IS NULL
+	             OR stripe_activation_credit_granted_at IS NULL
+	             OR trial_ended_at IS NULL)))
 	   AND ($2::uuid IS NULL OR team_id > $2)
  ORDER BY team_id
  LIMIT $3`
