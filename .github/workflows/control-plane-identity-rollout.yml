@@ -85,15 +85,19 @@ jobs:
             test -s "$RUNNER_TEMP/control-plane-identity/staging/$artifact"
           done
           trap - EXIT
+      - name: Prepare sanitized staging evidence
+        if: always()
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/sanitize-control-plane-evidence.py" \
+            --cell staging \
+            --input-dir "$RUNNER_TEMP/control-plane-identity/staging" \
+            --output-dir "$RUNNER_TEMP/control-plane-identity/public-staging"
       - name: Upload staging evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: control-plane-identity-staging-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/control-plane-identity/staging
-            staging-contract.json
-            staging-before.json
+          path: ${{ runner.temp }}/control-plane-identity/public-staging
           if-no-files-found: error
 
   production-use4:
@@ -189,15 +193,19 @@ jobs:
             test -s "$RUNNER_TEMP/control-plane-identity/use4/$artifact"
           done
           trap - EXIT
+      - name: Prepare sanitized production use4 evidence
+        if: always()
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/sanitize-control-plane-evidence.py" \
+            --cell production-use4 \
+            --input-dir "$RUNNER_TEMP/control-plane-identity/use4" \
+            --output-dir "$RUNNER_TEMP/control-plane-identity/public-use4"
       - name: Upload production use4 evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: control-plane-identity-use4-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/control-plane-identity/use4
-            use4-contract.json
-            use4-before.json
+          path: ${{ runner.temp }}/control-plane-identity/public-use4
           if-no-files-found: error
 
   production-usw2:
@@ -293,13 +301,17 @@ jobs:
             test -s "$RUNNER_TEMP/control-plane-identity/usw2/$artifact"
           done
           trap - EXIT
+      - name: Prepare sanitized production usw2 evidence
+        if: always()
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/sanitize-control-plane-evidence.py" \
+            --cell production-usw2 \
+            --input-dir "$RUNNER_TEMP/control-plane-identity/usw2" \
+            --output-dir "$RUNNER_TEMP/control-plane-identity/public-usw2"
       - name: Upload production usw2 evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: control-plane-identity-usw2-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/control-plane-identity/usw2
-            usw2-contract.json
-            usw2-before.json
+          path: ${{ runner.temp }}/control-plane-identity/public-usw2
           if-no-files-found: error
