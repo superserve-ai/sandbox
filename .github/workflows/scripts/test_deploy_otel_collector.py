@@ -120,7 +120,10 @@ class OtelTargetSelectionTests(unittest.TestCase):
                 return future
 
         with patch.dict(MODULE.os.environ, env, clear=True), \
-             patch.object(MODULE.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, rows, '')) as run, \
+             patch.object(MODULE.subprocess, 'run', **(
+                 {'side_effect': rows} if callable(rows) else
+                 {'return_value': subprocess.CompletedProcess([], 0, rows, '')}
+             )) as run, \
              patch.object(MODULE, 'prepare_collector_binaries', return_value={}) as prepare, \
              patch.object(MODULE.os.path, 'exists', return_value=True), \
              patch.object(MODULE, 'ThreadPoolExecutor', Executor):
@@ -150,18 +153,60 @@ class OtelTargetSelectionTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(selected, ['serving-host'])
 
-    def test_production_filter_fanout_is_unchanged(self):
-        env = {'GCP_PROJECT': 'example-project', 'GCP_REGION': 'us-west2',
-               'VMD_FILTER': 'labels.sandbox_role=vmd AND labels.environment=production AND labels.region=us-west2'}
-        result, selected, calls, _ = self.deploy_selection(env, 'host-a,us-west2-a\nhost-b,us-west2-b\n')
+    def test_production_cells_select_all_running_vmd_roles_independent_of_target(self):
+        workflow = (SCRIPT.parents[1] / 'deploy-otel-collector.yml').read_text()
+        production = workflow.split('  deploy-production:', 1)[1]
+        self.assertNotIn('inputs.target', production)
+        self.assertNotIn('select-deploy-target.sh', production)
+        self.assertIn("github.event_name == 'push' && needs.deploy-staging.result == 'success'", production)
+        self.assertIn('needs: [deploy-staging]', production)
+        for region, cell in [('us-east4', 'use4'), ('us-west2', 'usw2')]:
+            step = production.split(f'- name: Deploy OTEL Collector to {cell} cell VMD instances', 1)[1]
+            step = step.split('        run: |', 1)[0]
+            host_filter = step.split('VMD_FILTER: ', 1)[1].splitlines()[0]
+            self.assertEqual(host_filter, f'labels.sandbox_role=vmd AND labels.environment=production AND labels.region={region}')
+            self.assertIn(f'GCP_REGION: {region}', step)
+            # Model the label/status predicates sent to GCE, using mixed inventory.
+            inventory = [
+                ('serving-host', 'vmd', 'vmd', 'production', region, 'RUNNING'),
+                ('standby-host', 'vmd-standby', 'vmd', 'production', region, 'RUNNING'),
+                ('non-vmd-host', 'vmd', 'proxy', 'production', region, 'RUNNING'),
+                ('other-region', 'vmd', 'vmd', 'production', 'europe-west1', 'RUNNING'),
+                ('staging-host', 'vmd', 'vmd', 'staging', region, 'RUNNING'),
+                ('stopped-host', 'vmd', 'vmd', 'production', region, 'TERMINATED'),
+            ]
+
+            def list_instances(command, **kwargs):
+                query = next(arg.removeprefix('--filter=') for arg in command if arg.startswith('--filter='))
+                rows = []
+                for name, component, role, environment, host_region, status in inventory:
+                    fields = {'labels.component': component, 'labels.sandbox_role': role,
+                              'labels.environment': environment, 'labels.region': host_region, 'status': status}
+                    if all(fields[key] == value for key, value in
+                           (term.split('=', 1) for term in query.split(' AND '))):
+                        rows.append(f'{name},{host_region}-a\n')
+                return subprocess.CompletedProcess(command, 0, ''.join(rows), '')
+
+            for target in ('serving', 'standby'):
+                with self.subTest(region=region, target=target):
+                    env = {'GCP_PROJECT': 'example-project', 'GCP_REGION': region,
+                           'VMD_FILTER': host_filter, 'DEPLOY_TARGET': target}
+                    result, selected, calls, _ = self.deploy_selection(env, list_instances)
+                    self.assertEqual(result, 0)
+                    self.assertEqual(selected, ['serving-host', 'standby-host'])
+                    self.assertIn('--filter=' + host_filter + ' AND status=RUNNING', calls[0].args[0])
+
+    def test_production_region_guard_rejects_other_zone_even_if_labels_match(self):
+        env = {'GCP_PROJECT': 'example-project', 'GCP_REGION': 'us-east4',
+               'VMD_FILTER': 'labels.sandbox_role=vmd AND labels.environment=production AND labels.region=us-east4'}
+        result, selected, _, _ = self.deploy_selection(env, 'east-host,us-east4-c\nwest-host,us-west2-a\n')
         self.assertEqual(result, 0)
-        self.assertEqual(selected, ['host-a', 'host-b'])
-        self.assertIn('--filter=' + env['VMD_FILTER'] + ' AND status=RUNNING', calls[0].args[0])
+        self.assertEqual(selected, ['east-host'])
 
 
 
 class OtelRenderedDeploymentTests(unittest.TestCase):
-    def exercise(self, fail='', existing=False):
+    def exercise(self, fail='', existing=False, identity=None, expected_host='example-host'):
         import os
         import tempfile
         from shell_test_support import linux_shell_prelude
@@ -169,6 +214,10 @@ class OtelRenderedDeploymentTests(unittest.TestCase):
             root = Path(tmp)
             staging = root / 'staging'
             staging.mkdir()
+            if identity is not None:
+                identity_file = root/'etc/sandbox/host-identity.env'
+                identity_file.parent.mkdir(parents=True)
+                identity_file.write_text(identity)
             binary = '#!/bin/sh\necho otelcol-contrib ' + MODULE.OTEL_COLLECTOR_VERSION + '\n'
             for name, data in [('otelcol-contrib', binary), ('collector-gmp.yaml', 'receivers: {}\n'),
                                ('superserve-otel-collector.service', '[Install]\nWantedBy=multi-user.target\n')]:
@@ -201,7 +250,14 @@ journalctl() { :; }
             result = subprocess.run(['bash', '-c', linux_shell_prelude() + prelude + script], capture_output=True, text=True,
                                     env=dict(os.environ, FAIL=fail, STATE=tmp, CALLS=str(root/'calls')))
             env_file = root/'etc/sandbox/otel/collector.env'
-            self.assertEqual(env_file.read_text(), 'GCP_PROJECT=example-project\nGCP_ZONE=us-central1-a\nHOST_ID=example-host\n')
+            if expected_host is None:
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('invalid installed host identity', result.stderr)
+                self.assertFalse(env_file.exists())
+                self.assertFalse((root/'calls').exists())
+                self.assertFalse(staging.exists())
+                return result, ''
+            self.assertEqual(env_file.read_text(), f'GCP_PROJECT=example-project\nGCP_ZONE=us-central1-a\nHOST_ID={expected_host}\nCOLLECTOR_HOST_ID=example-host\n')
             self.assertEqual(env_file.stat().st_mode & 0o777, 0o644)
             self.assertFalse(staging.exists(), 'staging cleanup must run')
             calls = (root/'calls').read_text()
@@ -218,6 +274,18 @@ journalctl() { :; }
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertLess(calls.index('daemon-reload'), calls.index('enable '))
             self.assertLess(calls.index('enable '), calls.index('restart '))
+
+    def test_authoritative_generated_identity_is_written(self):
+        host_id = 'use4-3-0123456789abcdef0123456789abcdef'
+        result, _ = self.exercise(identity=f'HOST_ID={host_id}\nHOST_IDENTITY_FILE=/etc/sandbox/host-identity.json\n', expected_host=host_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_malformed_installed_identity_fails_before_config_or_service_changes(self):
+        for identity in ('', 'OTHER=value\n', 'HOST_ID=\n', 'HOST_ID=-invalid\n',
+                         'HOST_ID=has spaces\n', 'HOST_ID=$(touch /tmp/unsafe)\n',
+                         'HOST_ID=first\nHOST_ID=second\n', 'HOST_ID=' + 'a' * 257 + '\n'):
+            with self.subTest(identity=identity):
+                self.exercise(identity=identity, expected_host=None)
 
     def test_enable_start_or_readiness_failure_cannot_report_success(self):
         for fail in ('enable', 'restart', 'is-active', 'runtime-only', 'health'):

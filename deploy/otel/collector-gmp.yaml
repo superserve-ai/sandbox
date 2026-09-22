@@ -68,12 +68,11 @@ processors:
   attributes/collector_host_id:
     actions:
       - key: collector_host_id
-        value: ${env:HOST_ID}
+        value: ${env:COLLECTOR_HOST_ID}
         action: upsert
   # Host-level series carry the same bounded host_id label the vmd backup
   # metrics use, so alert policies scope one cell's host the same way for
-  # both. HOST_ID is written into collector.env by the deploy path and
-  # matches the instance name.
+  # both. HOST_ID is the installed identity, or the instance name on legacy hosts.
   attributes/host_id:
     actions:
       - key: host_id
@@ -112,5 +111,5 @@ service:
     # OTLP senders (control plane, vmd) already set their own host_id.
     metrics/host:
       receivers: [hostmetrics]
-      processors: [memory_limiter, resourcedetection/gcp, resource/gmp_location, attributes/host_id, batch]
+      processors: [memory_limiter, resourcedetection/gcp, resource/gmp_location, attributes/host_id, attributes/collector_host_id, batch]
       exporters: [googlemanagedprometheus]

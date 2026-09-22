@@ -221,8 +221,8 @@ variable "host_disk_alerts" {
   description = <<-EOT
     Alert policies over root-filesystem utilization exported by the
     host-local OTel collector's hostmetrics receiver, scoped to one
-    cell's vmd host via the host_id metric label (stamped from HOST_ID
-    in the collector env, which matches the instance name). The metric
+    cell's vmd host via the legacy host_id or stable collector_host_id
+    metric label. Pass the instance name as host_id. The metric
     covers the root mountpoint only, so utilization means the OS disk
     rather than the sandbox data arrays. Null disables the set.
   EOT

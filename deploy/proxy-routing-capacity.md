@@ -15,8 +15,20 @@ The generic GitHub variable `PEER_ROUTING_ENABLED` only controls staging.
 
 ## Database access
 
-Run `deploy/proxy-routing-role.sql` against each routing database as its
-administrator. Set a generated password separately using psql's
+The normal Supabase migration workflow installs the role and authorization
+contract in `supabase/migrations/20260923000010_sandbox_proxy_router.sql` in each
+cell. CD applies the same migration history to staging (`DATABASE_URL_STAGING`),
+east (`DATABASE_URL_PROD`), then west (`DATABASE_URL_USWEST`), independently of
+routing enablement. East receives this role even while its routing variable is
+unset; enabling east later requires no region-specific SQL change.
+
+The migration preserves existing credentials and connection limits, repairs
+security attributes, and replaces direct SELECT grants on `sandbox` and `host`
+with the routing column allowlist. Grants on unrelated objects are preserved.
+Repairing privileged attributes requires an administrator authorized to change
+those attributes; the migration fails rather than silently retaining them.
+For a new role, set a generated
+password separately using psql's
 `\password sandbox_proxy_router`; do not commit it or put it in command history.
 The role can read only the sandbox and host columns used for discovery. Its
 SELECT policies permit fleet-wide discovery without bypassing row-level security

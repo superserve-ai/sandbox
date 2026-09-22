@@ -89,7 +89,7 @@ run "generated_host_ids_use_stable_collector_identity" {
       anytrue([for condition in google_monitoring_alert_policy.backup["upload_failures"].conditions : strcontains(one(condition.condition_threshold).filter, "metric.labels.collector_host_id")]) &&
       contains(yamldecode(file("../../../deploy/otel/collector-gmp.yaml")).service.pipelines.metrics.processors, "attributes/collector_host_id") &&
       yamldecode(file("../../../deploy/otel/collector-gmp.yaml")).processors["attributes/collector_host_id"].actions == [
-        { key = "collector_host_id", value = "$${env:HOST_ID}", action = "upsert" }
+        { key = "collector_host_id", value = "$${env:COLLECTOR_HOST_ID}", action = "upsert" }
       ] &&
       !contains(yamldecode(file("../../../deploy/otel/collector-gmp.yaml")).service.pipelines.metrics.processors, "attributes/host_id")
     )
@@ -106,5 +106,51 @@ run "disabled_alerts_create_no_policies" {
   assert {
     condition     = length(google_monitoring_alert_policy.backup) == 0 && length(google_monitoring_alert_policy.launch_path) == 0
     error_message = "Null configurations must continue disabling the policy sets."
+  }
+}
+
+run "disk_alerts_cover_legacy_and_generated_host_identity" {
+  command = plan
+  variables {
+    host_disk_alerts = {
+      host_id        = "example-host"
+      display_prefix = "Infrastructure / example-host"
+    }
+  }
+  assert {
+    condition = alltrue([
+      for key, expected in {
+        root_fs_warning  = { threshold = 0.85, duration = "1800s" }
+        root_fs_critical = { threshold = 0.95, duration = "300s" }
+        } : (
+        google_monitoring_alert_policy.host_disk[key].combiner == "OR" &&
+        toset([for condition in google_monitoring_alert_policy.host_disk[key].conditions : one(condition.condition_threshold).filter]) == toset([
+          for suffix in [
+            " AND metric.labels.host_id = \"example-host\"",
+            " AND metric.labels.collector_host_id = \"example-host\" AND metric.labels.host_id != \"example-host\""
+          ] :
+          "metric.type = \"prometheus.googleapis.com/system_filesystem_utilization/gauge\" AND resource.type = \"prometheus_target\" AND metric.labels.mountpoint = \"/\"${suffix}"
+        ]) &&
+        alltrue([for condition in google_monitoring_alert_policy.host_disk[key].conditions : (
+          one(condition.condition_threshold).comparison == "COMPARISON_GT" &&
+          one(condition.condition_threshold).threshold_value == expected.threshold &&
+          one(condition.condition_threshold).duration == expected.duration &&
+          one(one(condition.condition_threshold).aggregations).alignment_period == "60s" &&
+          one(one(condition.condition_threshold).aggregations).per_series_aligner == "ALIGN_MAX" &&
+          one(one(condition.condition_threshold).trigger).count == 1
+        )])
+      )
+    ])
+    error_message = "Disk alerts must cover legacy and generated identities with mutually exclusive conditions and unchanged root-only thresholds and windows."
+  }
+  assert {
+    condition = (
+      length(google_monitoring_alert_policy.host_disk) == 2 &&
+      contains(yamldecode(file("../../../deploy/otel/collector-gmp.yaml")).service.pipelines["metrics/host"].processors, "attributes/collector_host_id") &&
+      yamldecode(file("../../../deploy/otel/collector-gmp.yaml")).processors["attributes/host_id"].actions == [
+        { key = "host_id", value = "$${env:HOST_ID}", action = "upsert" }
+      ]
+    )
+    error_message = "Host metrics must preserve authoritative HOST_ID and also stamp the stable collector identity used by alerts."
   }
 }
