@@ -855,7 +855,7 @@ type SandboxSnapshot struct {
 	Status         string      `json:"status"`
 	Name           *string     `json:"name"`
 	IdempotencyKey *string     `json:"idempotency_key"`
-	// Host holding the artifacts. v1 forks run on this host.
+	// Host holding the artifacts; forks run there.
 	HostID    string `json:"host_id"`
 	VcpuCount int32  `json:"vcpu_count"`
 	MemoryMib int32  `json:"memory_mib"`

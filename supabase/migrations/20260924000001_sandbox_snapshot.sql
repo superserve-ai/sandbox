@@ -1,8 +1,6 @@
--- Customer snapshots: an immutable point-in-time capture of a sandbox that new
--- sandboxes can be created from. Kept apart from `snapshot`, which is the
--- sandbox's own resume image and is overwritten on every pause. A snapshot
--- outlives its source sandbox; forks are independent copies, so deleting one
--- never affects them.
+-- Customer snapshots: point-in-time captures a new sandbox can be created from.
+-- Kept apart from `snapshot`, the resume image overwritten on every pause.
+-- Forks are independent copies, so a snapshot can be deleted at any time.
 
 CREATE TABLE IF NOT EXISTS sandbox_snapshot (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -49,7 +47,7 @@ ALTER TABLE sandbox_snapshot ENABLE ROW LEVEL SECURITY;
 COMMENT ON COLUMN sandbox_snapshot.sandbox_id IS
   'Sandbox the snapshot was captured from. Kept after that sandbox is destroyed.';
 COMMENT ON COLUMN sandbox_snapshot.host_id IS
-  'Host holding the artifacts. v1 forks run on this host.';
+  'Host holding the artifacts; forks run there.';
 COMMENT ON COLUMN sandbox_snapshot.base_path IS
   'Template base image the overlay sits on. Pins the template build while the snapshot exists.';
 COMMENT ON COLUMN sandbox_snapshot.base_mem_path IS
