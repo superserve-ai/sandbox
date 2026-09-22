@@ -448,7 +448,7 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 	if err != nil {
 		return "", err
 	}
-	if deref(current.CustomerID) != deref(original.CustomerID) || deref(current.SubscriptionID) != deref(original.SubscriptionID) || deref(current.Status) != deref(original.Status) || deref(current.GrantID) != deref(original.GrantID) || !sameTime(current.EventAt, original.EventAt) || current.CheckoutAt != nil {
+	if !sameRecoveryBillingSnapshot(current, original) || current.CheckoutAt != nil {
 		return "", errors.New("local billing association changed; rerun the audit")
 	}
 	// A locked terminal projection is authoritative local evidence that this
@@ -490,6 +490,29 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 	}
 	sub = finalEvidence.subscription
 	grantID = finalEvidence.grantID
+	// Re-read the locked projection immediately before the local write so the
+	// guarded update uses the current subscription status and event watermark.
+	var latest billingAccount
+	err = tx.QueryRow(ctx, `SELECT team_id, stripe_customer_id, stripe_subscription_id,
+        stripe_subscription_status, stripe_subscription_event_at,
+        stripe_activation_credit_grant_id, trial_ended_at,
+        checkout_initializing_at
+        FROM team_billing_account WHERE team_id = $1 FOR UPDATE`, original.TeamID).
+		Scan(&latest.TeamID, &latest.CustomerID, &latest.SubscriptionID, &latest.Status, &latest.EventAt, &latest.GrantID, &latest.TrialEndedAt, &latest.CheckoutAt)
+	if err != nil {
+		return "", err
+	}
+	if !sameRecoveryBillingSnapshot(latest, current) || latest.CheckoutAt != nil {
+		return "", errors.New("local subscription state changed during revalidation; rerun the audit")
+	}
+	if isTerminalSubscriptionStatus(deref(latest.Status)) {
+		return "", fmt.Errorf("local subscription became terminal during revalidation (status %q); rerun the audit", deref(latest.Status))
+	}
+	current = latest
+	watermark = time.Now().UTC()
+	if current.EventAt != nil && current.EventAt.After(watermark) {
+		return "", errors.New("a newer subscription event watermark is already present; rerun the audit")
+	}
 	// Advance the local event watermark in the same transaction as activation;
 	// delayed deliveries then fail the normal stale-event check.
 	result, err := tx.Exec(ctx, `UPDATE team_billing_account
@@ -503,7 +526,9 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
             stripe_activation_credit_grant_id = COALESCE(stripe_activation_credit_grant_id, $6),
             updated_at = now()
 		WHERE team_id = $1
-		  AND stripe_subscription_event_at IS NOT DISTINCT FROM $8::timestamptz`, original.TeamID, sub.Status, sub.CurrentPeriodStart, sub.CurrentPeriodEnd, sub.CancelAtPeriodEnd, grantID, watermark, current.EventAt)
+		  AND stripe_subscription_status IS NOT DISTINCT FROM $9::text
+		  AND (stripe_subscription_event_at IS NULL OR stripe_subscription_event_at <= $7::timestamptz)
+		  AND stripe_subscription_event_at IS NOT DISTINCT FROM $8::timestamptz`, original.TeamID, sub.Status, sub.CurrentPeriodStart, sub.CurrentPeriodEnd, sub.CancelAtPeriodEnd, grantID, watermark, current.EventAt, current.Status)
 	if err != nil {
 		return "", err
 	}
@@ -521,6 +546,15 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 
 func isActivating(status string) bool {
 	return strings.EqualFold(status, "active") || strings.EqualFold(status, "trialing")
+}
+
+func sameRecoveryBillingSnapshot(left, right billingAccount) bool {
+	return left.TeamID == right.TeamID &&
+		deref(left.CustomerID) == deref(right.CustomerID) &&
+		deref(left.SubscriptionID) == deref(right.SubscriptionID) &&
+		deref(left.Status) == deref(right.Status) &&
+		deref(left.GrantID) == deref(right.GrantID) &&
+		sameTime(left.EventAt, right.EventAt)
 }
 
 func isTerminalSubscriptionStatus(status string) bool {
