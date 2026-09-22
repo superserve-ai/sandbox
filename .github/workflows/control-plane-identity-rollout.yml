@@ -38,10 +38,17 @@ jobs:
           gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format=json > "$GITHUB_WORKSPACE/staging-before.json"
           previous=$(jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // empty' "$GITHUB_WORKSPACE/staging-before.json")
           test -n "$previous" || { echo "No 100% rollback revision; refusing staged migration." >&2; exit 1; }
+          previous_identity=$(jq -r '[.spec.template.serviceAccount, .spec.template.serviceAccountName, .spec.template.spec.serviceAccountName]
+            | map(select(type == "string" and length > 0)) | .[0] // empty' "$GITHUB_WORKSPACE/staging-before.json")
+          test -n "$previous_identity" || { echo "No rollback service identity; refusing staged migration." >&2; exit 1; }
+          identity_apply_started=false
           rollback() {
             rc=$?
             if [[ "$rc" -ne 0 && -n "$previous" ]]; then
               gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/staging/rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/staging/rollback.stderr" || true
+              if [[ "$identity_apply_started" == true ]]; then
+                gcloud run services update "$SERVICE" --service-account "$previous_identity" --no-traffic --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/staging/identity-rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/staging/identity-rollback.stderr" || true
+              fi
               echo "rollback_revision=$previous" > "$RUNNER_TEMP/control-plane-identity/staging/rollback.txt"
             fi
             exit "$rc"
@@ -54,6 +61,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/staging-contract.json"
           # Terraform must not leave the new identity serving while the
@@ -131,10 +139,17 @@ jobs:
           gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format=json > "$GITHUB_WORKSPACE/use4-before.json"
           previous=$(jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // empty' "$GITHUB_WORKSPACE/use4-before.json")
           test -n "$previous" || { echo "No 100% rollback revision; refusing staged migration." >&2; exit 1; }
+          previous_identity=$(jq -r '[.spec.template.serviceAccount, .spec.template.serviceAccountName, .spec.template.spec.serviceAccountName]
+            | map(select(type == "string" and length > 0)) | .[0] // empty' "$GITHUB_WORKSPACE/use4-before.json")
+          test -n "$previous_identity" || { echo "No rollback service identity; refusing staged migration." >&2; exit 1; }
+          identity_apply_started=false
           rollback() {
             rc=$?
             if [[ "$rc" -ne 0 && -n "$previous" ]]; then
               gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/use4/rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/use4/rollback.stderr" || true
+              if [[ "$identity_apply_started" == true ]]; then
+                gcloud run services update "$SERVICE" --service-account "$previous_identity" --no-traffic --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/use4/identity-rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/use4/identity-rollback.stderr" || true
+              fi
               echo "rollback_revision=$previous" > "$RUNNER_TEMP/control-plane-identity/use4/rollback.txt"
             fi
             exit "$rc"
@@ -147,6 +162,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/use4-contract.json"
           gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
@@ -239,10 +255,17 @@ jobs:
           gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format=json > "$GITHUB_WORKSPACE/usw2-before.json"
           previous=$(jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // empty' "$GITHUB_WORKSPACE/usw2-before.json")
           test -n "$previous" || { echo "No 100% rollback revision; refusing staged migration." >&2; exit 1; }
+          previous_identity=$(jq -r '[.spec.template.serviceAccount, .spec.template.serviceAccountName, .spec.template.spec.serviceAccountName]
+            | map(select(type == "string" and length > 0)) | .[0] // empty' "$GITHUB_WORKSPACE/usw2-before.json")
+          test -n "$previous_identity" || { echo "No rollback service identity; refusing staged migration." >&2; exit 1; }
+          identity_apply_started=false
           rollback() {
             rc=$?
             if [[ "$rc" -ne 0 && -n "$previous" ]]; then
               gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/usw2/rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/usw2/rollback.stderr" || true
+              if [[ "$identity_apply_started" == true ]]; then
+                gcloud run services update "$SERVICE" --service-account "$previous_identity" --no-traffic --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/usw2/identity-rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/usw2/identity-rollback.stderr" || true
+              fi
               echo "rollback_revision=$previous" > "$RUNNER_TEMP/control-plane-identity/usw2/rollback.txt"
             fi
             exit "$rc"
@@ -255,6 +278,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/usw2-contract.json"
           gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
