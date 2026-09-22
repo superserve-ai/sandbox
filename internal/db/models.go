@@ -868,10 +868,18 @@ type SandboxSnapshot struct {
 	MemPath      *string `json:"mem_path"`
 	OverlayPath  *string `json:"overlay_path"`
 	// Bytes the snapshot uniquely holds on disk, for metering; 0 until ready.
-	SizeBytes int64              `json:"size_bytes"`
-	CreatedAt time.Time          `json:"created_at"`
-	ReadyAt   pgtype.Timestamptz `json:"ready_at"`
-	DeletedAt pgtype.Timestamptz `json:"deleted_at"`
+	SizeBytes      int64  `json:"size_bytes"`
+	TimeoutSeconds *int32 `json:"timeout_seconds"`
+	NetworkConfig  []byte `json:"network_config"`
+	// Array of {env_key, secret_id} the source had at capture; a fork re-binds by secret_id with fresh tokens.
+	SecretBindings []byte  `json:"secret_bindings"`
+	FcBuildSha     *string `json:"fc_build_sha"`
+	GuestKernel    *string `json:"guest_kernel"`
+	// Firecracker snapshot format version the memory image was written with; NULL for an fs snapshot.
+	SnapshotFormat *string            `json:"snapshot_format"`
+	CreatedAt      time.Time          `json:"created_at"`
+	ReadyAt        pgtype.Timestamptz `json:"ready_at"`
+	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
 }
 
 type SandboxStorageInterval struct {

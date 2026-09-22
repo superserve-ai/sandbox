@@ -24,6 +24,14 @@ CREATE TABLE IF NOT EXISTS sandbox_snapshot (
     mem_path        text,
     overlay_path    text,
     size_bytes      bigint NOT NULL DEFAULT 0 CHECK (size_bytes >= 0),
+    -- Settings a fork inherits, kept here because the source may be gone by then.
+    timeout_seconds int,
+    network_config  jsonb,
+    secret_bindings jsonb NOT NULL DEFAULT '[]'::jsonb,
+    -- What the memory image needs to load; a mismatch is refused, not attempted.
+    fc_build_sha    text,
+    guest_kernel    text,
+    snapshot_format text,
     created_at      timestamptz NOT NULL DEFAULT now(),
     ready_at        timestamptz,
     deleted_at      timestamptz,
@@ -48,6 +56,10 @@ COMMENT ON COLUMN sandbox_snapshot.base_mem_path IS
   'Template memory image the memory diff layers on; NULL for a full image or an fs snapshot.';
 COMMENT ON COLUMN sandbox_snapshot.size_bytes IS
   'Bytes the snapshot uniquely holds on disk, for metering; 0 until ready.';
+COMMENT ON COLUMN sandbox_snapshot.secret_bindings IS
+  'Array of {env_key, secret_id} the source had at capture; a fork re-binds by secret_id with fresh tokens.';
+COMMENT ON COLUMN sandbox_snapshot.snapshot_format IS
+  'Firecracker snapshot format version the memory image was written with; NULL for an fs snapshot.';
 
 CREATE UNIQUE INDEX IF NOT EXISTS sandbox_snapshot_idempotency
     ON sandbox_snapshot (team_id, sandbox_id, idempotency_key)
