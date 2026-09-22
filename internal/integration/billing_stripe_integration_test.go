@@ -1025,6 +1025,95 @@ func TestIntegration_StripeSubscriptionCreatedBeforeCheckoutCompletedActivates(t
 	}
 }
 
+func TestIntegration_StripePendingCheckoutReconcilesLatestLifecycle(t *testing.T) {
+	for _, tc := range []struct {
+		name, initialStatus, eventType, finalStatus string
+		equalTime, reverse                          bool
+		wantGrants                                  int
+	}{
+		{name: "canceled", initialStatus: "active", eventType: "deleted", finalStatus: "canceled"},
+		{name: "activated", initialStatus: "incomplete", eventType: "updated", finalStatus: "active", wantGrants: 1},
+		{name: "canceled_reverse", initialStatus: "active", eventType: "deleted", finalStatus: "canceled", reverse: true},
+		{name: "activated_reverse", initialStatus: "incomplete", eventType: "updated", finalStatus: "active", reverse: true, wantGrants: 1},
+		{name: "canceled_equal_time", initialStatus: "active", eventType: "deleted", finalStatus: "canceled", equalTime: true},
+		{name: "paused", initialStatus: "active", eventType: "paused", finalStatus: "paused"},
+		{name: "resumed", initialStatus: "incomplete", eventType: "resumed", finalStatus: "active", wantGrants: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			teamID, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
+			customerID, subscriptionID := "cus_"+teamID.String(), "sub_"+teamID.String()
+			at := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+			if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account (team_id, stripe_customer_id, checkout_initializing_at, checkout_session_id) VALUES ($1,$2,$3,'cs_test_123')`, teamID, customerID, at); err != nil {
+				t.Fatal(err)
+			}
+			stripe := &fakeStripeClient{}
+			r := newBillingRouter(t, stripe)
+			deliver := func(payload []byte) *httptest.ResponseRecorder {
+				req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC()))
+				return doRequest(r, req)
+			}
+			later := at.Add(2 * time.Second)
+			if tc.equalTime {
+				later = at.Add(time.Second)
+			}
+			ids := []string{"evt_created_" + teamID.String(), "evt_lifecycle_" + teamID.String()}
+			payloads := [][]byte{
+				stripeSubscriptionWebhookPayload(t, ids[0], "customer.subscription.created", subscriptionID, customerID, tc.initialStatus, at.Add(time.Second), at, at.AddDate(0, 1, 0)),
+				stripeSubscriptionWebhookPayload(t, ids[1], "customer.subscription."+tc.eventType, subscriptionID, customerID, tc.finalStatus, later, at, at.AddDate(0, 1, 0)),
+			}
+			if tc.reverse {
+				payloads[0], payloads[1] = payloads[1], payloads[0]
+			}
+			for _, payload := range payloads {
+				if response := deliver(payload); response.Code != http.StatusInternalServerError {
+					t.Fatalf("pending delivery = %d, want retryable 500: %s", response.Code, response.Body.String())
+				}
+			}
+			// A different subscription for the same customer must never be imported.
+			foreign := stripeSubscriptionWebhookPayload(t, "evt_foreign_"+teamID.String(), "customer.subscription.updated", "sub_foreign_"+teamID.String(), customerID, "active", later.Add(time.Second), at, at.AddDate(0, 1, 0))
+			if response := deliver(foreign); response.Code != http.StatusInternalServerError {
+				t.Fatalf("foreign pending delivery = %d", response.Code)
+			}
+			checkout := stripeCheckoutWebhookPayload(t, "evt_checkout_"+teamID.String(), teamID.String(), customerID, subscriptionID, later.Add(2*time.Second))
+			if response := deliver(checkout); response.Code != http.StatusOK {
+				t.Fatalf("checkout = %d: %s", response.Code, response.Body.String())
+			}
+			verify := func() {
+				t.Helper()
+				account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if derefString(account.StripeSubscriptionID) != subscriptionID || derefString(account.StripeSubscriptionStatus) != tc.finalStatus {
+					t.Fatalf("subscription = %q/%q, want %s/%s", derefString(account.StripeSubscriptionID), derefString(account.StripeSubscriptionStatus), subscriptionID, tc.finalStatus)
+				}
+				if len(stripe.creditGrantCalls) != tc.wantGrants || account.TrialEndedAt.Valid != (tc.wantGrants == 1) || (account.StripeActivationCreditGrantID != nil) != (tc.wantGrants == 1) {
+					t.Fatalf("grants=%d trialEnded=%v grantID=%v, want %d activations", len(stripe.creditGrantCalls), account.TrialEndedAt.Valid, account.StripeActivationCreditGrantID, tc.wantGrants)
+				}
+				for _, id := range ids {
+					var processed bool
+					if err := testPool.QueryRow(ctx, `SELECT processed_at IS NOT NULL FROM stripe_webhook_event WHERE event_id=$1`, id).Scan(&processed); err != nil || !processed {
+						t.Fatalf("event %s processed=%v err=%v", id, processed, err)
+					}
+				}
+				if account.CheckoutInitializingAt.Valid || account.CheckoutSessionID != nil {
+					t.Fatal("matching checkout reservation was not cleared")
+				}
+			}
+			verify()
+			for _, payload := range append(payloads, foreign, checkout) {
+				if response := deliver(payload); response.Code != http.StatusOK {
+					t.Fatalf("redelivery = %d: %s", response.Code, response.Body.String())
+				}
+			}
+			verify()
+		})
+	}
+}
+
 func TestIntegration_StripeSubscriptionCreatedAfterCheckoutExpiryIsIgnored(t *testing.T) {
 	ctx := context.Background()
 	teamID, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
