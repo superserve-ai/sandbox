@@ -104,6 +104,13 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 		return nil, err
 	}
 	defer release()
+	// The id lock serializes this capture with a delete or a retry for the
+	// same id; it is taken before the VM lock everywhere, so the order holds.
+	unlockID, err := m.lockSavedSnapshot(ctx, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockID()
 	unlock, err := m.lockVMOp(ctx, vmID)
 	if err != nil {
 		return nil, err
@@ -126,7 +133,7 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 		return nil, status.Errorf(codes.FailedPrecondition, "vm %s is %v; a saved snapshot needs a running or paused VM", vmID, st)
 	}
 	diskPath := m.instanceDiskPath(inst)
-	if err := m.savedCaptureHeadroom(kind, st, cfg.MemoryMiB, diskPath); err != nil {
+	if err := m.savedCaptureHeadroom(kind, st, inst, diskPath); err != nil {
 		return nil, err
 	}
 
@@ -193,6 +200,11 @@ func (m *Manager) DeleteSavedSnapshot(ctx context.Context, snapshotID string) er
 	if err != nil {
 		return err
 	}
+	unlock, err := m.lockSavedSnapshot(ctx, snapshotID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("remove saved snapshot: %w", err)
 	}
@@ -414,20 +426,16 @@ func accumulateSavedMemory(ctx context.Context, tmp, final, memFile, baseMem, ra
 	return nil
 }
 
-// capturePausedSaved copies a paused source's resume image and disk. The
-// source's Firecracker must be gone: a lingering process could still write
-// the overlay under the copy.
+// capturePausedSaved copies a paused source's resume image and disk once its
+// Firecracker is proven gone.
 func (m *Manager) capturePausedSaved(ctx context.Context, inst *VMInstance, tmp, final, diskPath string, kind SavedSnapshotKind, man *SavedSnapshotManifest) error {
 	inst.mu.RLock()
-	snapshotPath, memFile, baseMem, socket := inst.SnapshotPath, inst.MemFilePath, inst.BaseMemPath, inst.SocketPath
+	snapshotPath, memFile, baseMem := inst.SnapshotPath, inst.MemFilePath, inst.BaseMemPath
 	inst.mu.RUnlock()
-	if socket != "" {
-		pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		_, err := VMState(pctx, socket)
-		cancel()
-		if err == nil {
-			return status.Error(codes.Unavailable, "paused source still answers on its Firecracker socket; retry once its stop completes")
-		}
+	// The same at-rest proof backups gate on: Paused alone does not say the
+	// process is gone, and a deactivating one may still flush guest writes.
+	if !m.vmConfirmedAtRest(ctx, inst.ID) {
+		return status.Error(codes.Unavailable, "paused source is not confirmed at rest; retry once its stop completes")
 	}
 	if kind == SavedSnapshotMemFS {
 		if snapshotPath == "" || memFile == "" {
@@ -576,6 +584,22 @@ func removeSavedStaging(parent, snapshotID string) {
 	}
 }
 
+// lockSavedSnapshot serializes create and delete for one snapshot id.
+func (m *Manager) lockSavedSnapshot(ctx context.Context, snapshotID string) (func(), error) {
+	v, _ := m.savedIDLocks.LoadOrStore(snapshotID, make(chan struct{}, 1))
+	ch := v.(chan struct{})
+	select {
+	case ch <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-ch
+			return nil, err
+		}
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 // acquireSavedCapture bounds concurrent captures per host: each one holds a
 // source frozen and copies a disk, and a burst must not stall the host.
 func (m *Manager) acquireSavedCapture(ctx context.Context) (func(), error) {
@@ -595,13 +619,22 @@ func (m *Manager) acquireSavedCapture(ctx context.Context) (func(), error) {
 }
 
 // savedCaptureHeadroom refuses a capture the snapshot filesystem cannot hold:
-// a running full memory image is written in full, and a disk copy may not
-// reflink on this filesystem.
-func (m *Manager) savedCaptureHeadroom(kind SavedSnapshotKind, st VMStatus, memoryMiB uint32, diskPath string) error {
+// a running full memory image is written in full, and a copy may not reflink
+// on this filesystem.
+func (m *Manager) savedCaptureHeadroom(kind SavedSnapshotKind, st VMStatus, inst *VMInstance, diskPath string) error {
 	diskBytes, _ := allocatedBytes(diskPath)
 	need := int64(savedCaptureHeadroom) + diskBytes
-	if kind == SavedSnapshotMemFS && st == StatusRunning {
-		need += int64(memoryMiB) << 20
+	if kind == SavedSnapshotMemFS {
+		inst.mu.RLock()
+		memoryMiB, memFile, snapshotPath := inst.Config.MemoryMiB, inst.MemFilePath, inst.SnapshotPath
+		inst.mu.RUnlock()
+		if st == StatusRunning {
+			need += int64(memoryMiB) << 20
+		} else {
+			memBytes, _ := allocatedBytes(memFile)
+			stateBytes, _ := allocatedBytes(snapshotPath)
+			need += memBytes + stateBytes
+		}
 	}
 	var fs unix.Statfs_t
 	if err := unix.Statfs(m.cfg.SnapshotDir, &fs); err != nil {

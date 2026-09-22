@@ -3,9 +3,11 @@ package vm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
@@ -29,6 +31,8 @@ func newSavedTestManager(t *testing.T) *Manager {
 			FirecrackerBin: filepath.Join(root, "missing-firecracker"),
 		},
 		vms: map[string]*VMInstance{},
+		// Every seeded source is at rest; the real probe needs systemd and cgroups.
+		unitDead: func(context.Context, string) bool { return true },
 	}
 	if err := os.MkdirAll(m.cfg.SnapshotDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -327,5 +331,32 @@ func TestCloneOrCopyFileKeepsHoles(t *testing.T) {
 	}
 	if n, _ := allocatedBytes(dst); n >= si.Size() {
 		t.Errorf("copy is not sparse: %d allocated of %d", n, si.Size())
+	}
+}
+
+func TestCreateSavedSnapshotRefusesSourceNotAtRest(t *testing.T) {
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, false)
+	m.unitDead = func(context.Context, string) bool { return false }
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS); status.Code(err) != codes.Unavailable {
+		t.Errorf("want Unavailable, got %v", err)
+	}
+}
+
+func TestSavedSnapshotIDLockSerializesDelete(t *testing.T) {
+	m := newSavedTestManager(t)
+	id := uuid.NewString()
+	unlock, err := m.lockSavedSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := m.DeleteSavedSnapshot(ctx, id); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("delete during a capture of the same id: want deadline exceeded, got %v", err)
+	}
+	unlock()
+	if err := m.DeleteSavedSnapshot(context.Background(), id); err != nil {
+		t.Errorf("delete after release: %v", err)
 	}
 }

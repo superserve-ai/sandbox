@@ -697,6 +697,7 @@ type Manager struct {
 	// Saved-snapshot captures in flight, bounded per host; see acquireSavedCapture.
 	savedCaptures     chan struct{}
 	savedCapturesOnce sync.Once
+	savedIDLocks      sync.Map // snapshot id -> chan struct{}; see lockSavedSnapshot
 	fcSHAOnce         sync.Once
 	fcSHA             string
 
