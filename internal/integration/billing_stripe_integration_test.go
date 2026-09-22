@@ -1869,7 +1869,7 @@ func TestIntegration_StripeWebhookDuplicateDeliveryIsSafe(t *testing.T) {
 	r := newBillingRouter(t, &fakeStripeClient{})
 
 	createdAt := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
-	payload := stripeSubscriptionWebhookPayload(t, "evt_test_duplicate", "customer.subscription.created", "sub_duplicate", "cus_"+teamID.String(), "active", createdAt, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	payload := stripeSubscriptionWebhookPayload(t, "evt_test_duplicate", "customer.subscription.created", "sub_"+teamID.String(), "cus_"+teamID.String(), "active", createdAt, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
 	sig := stripeSignature(t, payload, time.Now().UTC())
 
 	for i := 0; i < 2; i++ {
@@ -2485,7 +2485,7 @@ func TestIntegration_StripeWebhookIgnoresForeignOrStaleSubscriptionEvents(t *tes
 	r := newBillingRouter(t, &fakeStripeClient{})
 
 	currentCreated := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
-	currentPayload := stripeSubscriptionWebhookPayload(t, "evt_subscription_current", "customer.subscription.created", "sub_current", "cus_"+teamID.String(), "active", currentCreated, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
+	currentPayload := stripeSubscriptionWebhookPayload(t, "evt_subscription_current", "customer.subscription.created", "sub_"+teamID.String(), "cus_"+teamID.String(), "active", currentCreated, time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC))
 	currentSig := stripeSignature(t, currentPayload, time.Now().UTC())
 	req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(currentPayload)))
 	req.Header.Set("Content-Type", "application/json")
@@ -2503,7 +2503,7 @@ func TestIntegration_StripeWebhookIgnoresForeignOrStaleSubscriptionEvents(t *tes
 		t.Fatalf("foreign subscription webhook: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 
-	stalePayload := stripeSubscriptionWebhookPayload(t, "evt_subscription_stale", "customer.subscription.updated", "sub_current", "cus_"+teamID.String(), "past_due", currentCreated.Add(-2*time.Hour), time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
+	stalePayload := stripeSubscriptionWebhookPayload(t, "evt_subscription_stale", "customer.subscription.updated", "sub_"+teamID.String(), "cus_"+teamID.String(), "past_due", currentCreated.Add(-2*time.Hour), time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC))
 	staleSig := stripeSignature(t, stalePayload, time.Now().UTC())
 	req = httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(stalePayload)))
 	req.Header.Set("Content-Type", "application/json")
@@ -2516,8 +2516,8 @@ func TestIntegration_StripeWebhookIgnoresForeignOrStaleSubscriptionEvents(t *tes
 	if err != nil {
 		t.Fatalf("load billing account: %v", err)
 	}
-	if account.StripeSubscriptionID == nil || *account.StripeSubscriptionID != "sub_current" {
-		t.Fatalf("subscription id = %q, want sub_current", derefString(account.StripeSubscriptionID))
+	if account.StripeSubscriptionID == nil || *account.StripeSubscriptionID != "sub_"+teamID.String() {
+		t.Fatalf("subscription id = %q, want seeded subscription", derefString(account.StripeSubscriptionID))
 	}
 	if account.StripeSubscriptionStatus == nil || *account.StripeSubscriptionStatus != "active" {
 		t.Fatalf("subscription status = %q, want active", derefString(account.StripeSubscriptionStatus))
