@@ -480,21 +480,42 @@ def main() -> int:
             gcloud("storage", "objects", "list", f"gs://{bucket}/sandboxes/", impersonate),
             expect_denied=True,
         )
-        probe = args.evidence_dir / "write-probe"
-        probe_payload = b"control-plane identity isolation probe\n"
-        try:
-            probe.write_bytes(probe_payload)
-            if not probe.is_file() or probe.read_bytes() != probe_payload:
-                raise VerificationError(
-                    f"write probe was not created deterministically: {probe}"
-                )
-        except OSError as exc:
-            raise VerificationError(f"cannot create write probe: {probe}") from exc
-        evidence.command(
-            "write-denied",
-            gcloud("storage", "cp", str(probe), f"gs://{bucket}/templates/.permission-probe", impersonate),
-            expect_denied=True,
+        # Policy Troubleshooter evaluates create access without issuing a
+        # mutating request. A real upload is unsafe here: if a bad grant lets
+        # the first attempt create the fixed probe object, a retry would test
+        # overwrite instead and could incorrectly pass with create access
+        # still enabled.
+        create_resource = storage_object_resource(bucket, "templates/.permission-probe")
+        create_response = evidence.command(
+            "create-permission-check",
+            gcloud(
+                "policy-troubleshoot",
+                "iam",
+                create_resource,
+                f"--principal-email={identity}",
+                "--permission=storage.objects.create",
+                "--format=json",
+            ),
         )
+        try:
+            create_access = policy_troubleshooter_access(create_response)
+        except VerificationError:
+            evidence.index[-1]["status"] = "FAIL"
+            raise
+        evidence.index[-1].update(
+            {
+                "principal": identity,
+                "resource": create_resource,
+                "permission": "storage.objects.create",
+                "access": create_access,
+            }
+        )
+        if create_access not in {"NOT_GRANTED", "DENIED"}:
+            evidence.index[-1]["status"] = "FAIL"
+            raise VerificationError(
+                "runtime identity has storage.objects.create under the templates/ prefix "
+                f"({create_access})"
+            )
         # Policy Troubleshooter evaluates the effective permission without
         # issuing a mutating request.  In particular, never use the live
         # manifest as a delete probe: an unexpected grant must not destroy a
@@ -784,7 +805,7 @@ def main() -> int:
             "own-template-list",
             "manifest-read",
             "sandbox-list-denied",
-            "write-denied",
+            "create-permission-check",
             "delete-permission-check",
             "bucket-iam",
             "managed-folder-iam",

@@ -86,6 +86,13 @@ class DeletePermissionProbeTests(unittest.TestCase):
         with self.assertRaises(VERIFY.VerificationError):
             VERIFY.policy_troubleshooter_access("{}")
 
+    def test_create_probe_targets_a_synthetic_object_resource(self):
+        self.assertEqual(
+            VERIFY.storage_object_resource("cell-backups", "templates/.permission-probe"),
+            "//storage.googleapis.com/projects/_/buckets/cell-backups/objects/"
+            "templates/.permission-probe",
+        )
+
 
 class EffectiveIamCommandTests(unittest.TestCase):
     def test_effective_iam_uses_supported_project_scope_flag(self):
