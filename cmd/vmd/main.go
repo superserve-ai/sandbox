@@ -817,6 +817,10 @@ func main() {
 	templateFreezeWorkload := envOrDefault("VMD_TEMPLATE_FREEZE_WORKLOAD", "false") == "true"
 	// Pause-side wait for the guest to stop its workload before a frozen-clock
 	// snapshot; only paid when the restore would freeze the clock.
+	savedSnapshotConcurrency := 0
+	if n, err := strconv.Atoi(envOrDefault("VMD_SAVED_SNAPSHOT_CONCURRENCY", "0")); err == nil {
+		savedSnapshotConcurrency = n
+	}
 	guestFreezeBudget := 500 * time.Millisecond
 	if v := envOrDefault("VMD_GUEST_FREEZE_BUDGET_MS", ""); v != "" {
 		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
@@ -999,6 +1003,7 @@ func main() {
 		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
 		TemplateFreezeWorkload:              templateFreezeWorkload,
 		GuestFreezeBudget:                   guestFreezeBudget,
+		SavedSnapshotConcurrency:            savedSnapshotConcurrency,
 		RequirePresenceSidecar:              requirePresenceSidecar,
 		PausedNetworkReclaimEnabled:         pausedNetworkReclaimEnabled,
 		PausedNetworkSlotHeadroomPercent:    pausedNetworkSlotHeadroomPercent,

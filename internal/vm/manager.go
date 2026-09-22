@@ -372,6 +372,10 @@ type ManagerConfig struct {
 	// workload before a frozen-clock snapshot. Zero means the default.
 	GuestFreezeBudget time.Duration
 
+	// SavedSnapshotConcurrency caps concurrent saved-snapshot captures per
+	// host. Zero means the default.
+	SavedSnapshotConcurrency int
+
 	// GuestClockFreezeEnabled lets a restore ask Firecracker to freeze the guest's
 	// monotonic clock across the snapshot instead of advancing it by the time the
 	// snapshot sat unused. Only takes effect for a snapshot whose guest can correct
@@ -689,6 +693,12 @@ type Manager struct {
 	// holds the lock until destroy SIGKILLs the process), so blocking it
 	// would turn a recoverable wedge into a permanent hang.
 	vmOpLocks sync.Map
+
+	// Saved-snapshot captures in flight, bounded per host; see acquireSavedCapture.
+	savedCaptures     chan struct{}
+	savedCapturesOnce sync.Once
+	fcSHAOnce         sync.Once
+	fcSHA             string
 
 	// launchGenSeq issues launch generations. It is manager-global and
 	// monotonic on purpose: a per-instance counter restarts at zero whenever
@@ -7377,7 +7387,7 @@ func isLeafName(s string) bool {
 // isReservedRunDirName reports whether name is a shared dir under RunDir
 // (template mount target, build tree) rather than a per-VM dir.
 func isReservedRunDirName(name string) bool {
-	return name == templateDirName || name == TemplatesDirName || name == stallForensicsDirName
+	return name == templateDirName || name == TemplatesDirName || name == stallForensicsDirName || name == SavedSnapshotsDirName
 }
 
 // abortResumeLocked reverts a freshly-resumed VM back to Paused when a

@@ -41,6 +41,12 @@ service VMDaemon {
   // may resume.
   rpc DeleteSandboxSnapshots(DeleteSandboxSnapshotsRequest) returns (DeleteSandboxSnapshotsResponse);
 
+  // Saved snapshots: customer captures a new sandbox can be created from.
+  // Idempotent on snapshot_id; the caller syncs the guest before capturing a
+  // running source.
+  rpc CreateSavedSnapshot(CreateSavedSnapshotRequest) returns (CreateSavedSnapshotResponse);
+  rpc DeleteSavedSnapshot(DeleteSavedSnapshotRequest) returns (DeleteSavedSnapshotResponse);
+
   // DeleteTemplateArtifacts removes a template's on-disk snapshot dir and
   // rootfs. Idempotent.
   rpc DeleteTemplateArtifacts(DeleteTemplateArtifactsRequest) returns (DeleteTemplateArtifactsResponse);
@@ -685,3 +691,33 @@ message InvalidateSandboxRulesRequest {
   string sandbox_id = 1;
 }
 message InvalidateSandboxRulesResponse {}
+
+message CreateSavedSnapshotRequest {
+  string vm_id = 1;        // Source sandbox, running or paused.
+  string snapshot_id = 2;  // Caller-minted UUID; a retry with it returns the committed snapshot.
+  string kind = 3;         // "fs" or "mem+fs".
+}
+message CreateSavedSnapshotResponse {
+  string snapshot_id = 1;
+  string kind = 2;
+  // Files the snapshot owns; base paths belong to the template it pins.
+  string base_path = 3;
+  string disk_path = 4;
+  string snapshot_path = 5;    // vmstate; empty for fs.
+  string mem_path = 6;         // empty for fs.
+  string base_mem_path = 7;    // set when mem_path is a diff over a template image.
+  uint32 vcpu_count = 8;
+  uint32 memory_mib = 9;
+  uint32 disk_size_mib = 10;
+  int64 size_bytes = 11;       // Allocated bytes of the owned files.
+  // What a warm restore of the memory image needs to match.
+  string kernel_path = 12;
+  string firecracker_sha256 = 13;
+  int64 created_at_unix = 14;
+}
+message DeleteSavedSnapshotRequest {
+  string snapshot_id = 1;
+}
+message DeleteSavedSnapshotResponse {
+  bool deleted = 1;
+}

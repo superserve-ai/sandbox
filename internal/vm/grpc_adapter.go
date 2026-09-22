@@ -330,6 +330,36 @@ func (a *GRPCAdapter) DeleteSnapshot(ctx context.Context, req *vmdpb.DeleteSnaps
 	return &vmdpb.DeleteSnapshotResponse{Deleted: true}, nil
 }
 
+func (a *GRPCAdapter) CreateSavedSnapshot(ctx context.Context, req *vmdpb.CreateSavedSnapshotRequest) (*vmdpb.CreateSavedSnapshotResponse, error) {
+	man, err := a.mgr.CreateSavedSnapshot(ctx, req.GetVmId(), req.GetSnapshotId(), SavedSnapshotKind(req.GetKind()))
+	if err != nil {
+		return nil, err
+	}
+	return &vmdpb.CreateSavedSnapshotResponse{
+		SnapshotId:        man.SnapshotID,
+		Kind:              string(man.Kind),
+		BasePath:          man.BasePath,
+		DiskPath:          man.DiskPath,
+		SnapshotPath:      man.SnapshotPath,
+		MemPath:           man.MemPath,
+		BaseMemPath:       man.BaseMemPath,
+		VcpuCount:         man.VCPU,
+		MemoryMib:         man.MemoryMiB,
+		DiskSizeMib:       man.DiskSizeMiB,
+		SizeBytes:         man.SizeBytes,
+		KernelPath:        man.KernelPath,
+		FirecrackerSha256: man.FirecrackerSHA256,
+		CreatedAtUnix:     man.CreatedAt.Unix(),
+	}, nil
+}
+
+func (a *GRPCAdapter) DeleteSavedSnapshot(ctx context.Context, req *vmdpb.DeleteSavedSnapshotRequest) (*vmdpb.DeleteSavedSnapshotResponse, error) {
+	if err := a.mgr.DeleteSavedSnapshot(ctx, req.GetSnapshotId()); err != nil {
+		return nil, err
+	}
+	return &vmdpb.DeleteSavedSnapshotResponse{Deleted: true}, nil
+}
+
 // DeleteSandboxSnapshots removes a sandbox's entire snapshot directory.
 // Idempotent; scoped to <SnapshotDir>/<vm_id>/ at the Manager layer.
 func (a *GRPCAdapter) DeleteSandboxSnapshots(ctx context.Context, req *vmdpb.DeleteSandboxSnapshotsRequest) (*vmdpb.DeleteSandboxSnapshotsResponse, error) {
