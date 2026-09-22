@@ -27,6 +27,24 @@ type recoveryStripeFixture struct {
 	cancelOnCall map[string]int
 }
 
+func (f *recoveryStripeFixture) setCancelOnCall(subscriptionID string, call int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelOnCall[subscriptionID] = call
+}
+
+func (f *recoveryStripeFixture) grantCallCount(customerID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.grantCalls[customerID]
+}
+
+func (f *recoveryStripeFixture) subscriptionCallCount(subscriptionID string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.subCalls[subscriptionID]
+}
+
 func newRecoveryStripeFixture(t *testing.T) *recoveryStripeFixture {
 	t.Helper()
 	f := &recoveryStripeFixture{
@@ -148,11 +166,11 @@ func TestIntegration_BillingRecoveryDryRunApplyRevalidatesAndExcludes(t *testing
 	if err := testPool.QueryRow(ctx, `SELECT stripe_subscription_id FROM team_billing_account WHERE team_id=$1`, postGrantRaceTeam).Scan(&postGrantRaceSubscription); err != nil {
 		t.Fatal(err)
 	}
-	stripe.cancelOnCall[raceSubscription] = 2
+	stripe.setCancelOnCall(raceSubscription, 2)
 	// The subscription changes after the grant POST but before the final
 	// post-mutation revalidation. Recovery must report the race and leave local
 	// activation uncommitted.
-	stripe.cancelOnCall[postGrantRaceSubscription] = 3
+	stripe.setCancelOnCall(postGrantRaceSubscription, 3)
 
 	dryRun := runBillingRecoveryCommand(t, stripe.server.URL, "-team", goodTeam.String())
 	if dryRun["outcome"] != "candidate" || dryRun["reason"] != "active_subscription_without_activation_grant" {
@@ -200,11 +218,13 @@ func TestIntegration_BillingRecoveryDryRunApplyRevalidatesAndExcludes(t *testing
 	}
 
 	repeated := runBillingRecoveryCommand(t, stripe.server.URL, "-team", goodTeam.String(), "-apply")
-	if repeated["outcome"] != "repaired" || stripe.grantCalls["cus_"+strings.TrimPrefix(goodSubscription, "sub_")] != 1 {
-		t.Fatalf("repeat apply = %#v, grant calls = %v; want one external grant", repeated, stripe.grantCalls)
+	goodGrantCalls := stripe.grantCallCount("cus_" + strings.TrimPrefix(goodSubscription, "sub_"))
+	if repeated["outcome"] != "repaired" || goodGrantCalls != 1 {
+		t.Fatalf("repeat apply = %#v, grant calls = %v; want one external grant", repeated, goodGrantCalls)
 	}
-	if stripe.subCalls[goodSubscription] < 4 {
-		t.Fatalf("subscription lookups = %d, want audit plus apply revalidation on both runs", stripe.subCalls[goodSubscription])
+	goodSubCalls := stripe.subscriptionCallCount(goodSubscription)
+	if goodSubCalls < 4 {
+		t.Fatalf("subscription lookups = %d, want audit plus apply revalidation on both runs", goodSubCalls)
 	}
 
 	race := runBillingRecoveryCommand(t, stripe.server.URL, "-team", raceTeam.String(), "-apply")
@@ -230,17 +250,17 @@ func TestIntegration_BillingRecoveryDryRunApplyRevalidatesAndExcludes(t *testing
 	if postGrantRaceLocalGrant != nil {
 		t.Fatalf("post-grant race mutated local grant to %q", *postGrantRaceLocalGrant)
 	}
-	grantCalls := stripe.grantCalls["cus_"+strings.TrimPrefix(postGrantRaceSubscription, "sub_")]
+	grantCalls := stripe.grantCallCount("cus_" + strings.TrimPrefix(postGrantRaceSubscription, "sub_"))
 	if grantCalls != 1 {
 		t.Fatalf("post-grant race made %d grant calls, want one idempotent external attempt", grantCalls)
 	}
 
-	beforeExcludedCalls := stripe.subCalls[raceSubscription]
+	beforeExcludedCalls := stripe.subscriptionCallCount(raceSubscription)
 	excluded := runBillingRecoveryCommand(t, stripe.server.URL, "-team", raceTeam.String(), "-exclude-team", raceTeam.String())
 	if excluded["outcome"] != "skipped" || excluded["reason"] != "operationally_excluded" {
 		t.Fatalf("excluded result = %#v, want operational exclusion", excluded)
 	}
-	if stripe.subCalls[raceSubscription] != beforeExcludedCalls {
+	if stripe.subscriptionCallCount(raceSubscription) != beforeExcludedCalls {
 		t.Fatal("excluded recovery target unexpectedly called Stripe")
 	}
 }
