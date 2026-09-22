@@ -8,6 +8,11 @@ output "sandbox_host_contract" {
   value       = module.sandbox_host_b.contract
 }
 
+output "controlplane_identity_contract" {
+  description = "Per-cell Cloud Run identity, backup read boundary, secret dependencies, and migration ownership."
+  value       = local.controlplane_identity_contract
+}
+
 output "deployment_config" {
   description = "Deployment identity for this environment."
   value = {

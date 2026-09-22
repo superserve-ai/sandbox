@@ -29,6 +29,12 @@ variable "writer_members" {
   type        = list(string)
 }
 
+variable "reader_members" {
+  description = "IAM members (serviceAccount:... form) granted managed-folder template-prefix object read/list access. Keep this list to same-cell control-plane readers; no write or delete permission is implied."
+  type        = list(string)
+  default     = []
+}
+
 variable "restore_service_account_id" {
   description = "Account ID for the dedicated read-only restore service account. Nothing runs as it; restore tooling impersonates it via out-of-band grants."
   type        = string

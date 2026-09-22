@@ -143,8 +143,8 @@ module "iam" {
       role    = "roles/monitoring.metricWriter"
       members = ["serviceAccount:superserve-api@${local.project_id}.iam.gserviceaccount.com"]
     }
-    # The CD service account needs subnetworks.update to enable VPC flow logs
-    # (added in #257). Granted out-of-band to unblock the staging apply; imported
+    # The CD service account needs subnetworks.update to enable VPC flow logs.
+    # Granted out-of-band to unblock the staging apply; imported
     # (see imports.tf) so a rebuild adopts it instead of creating a duplicate.
     # Prod's CD SA already carries networkAdmin.
     cd_network_admin = {
@@ -196,7 +196,7 @@ module "api" {
   environment           = local.environment
   region                = local.region
   service_name          = "superserve-api"
-  service_account_email = module.iam.service_account_emails["superserve_api"]
+  service_account_email = google_service_account.controlplane_runtime.email
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
   env = {
     API_PORT                    = "8080"
@@ -244,10 +244,10 @@ module "api" {
   labels        = local.common_labels
 
   depends_on = [
-    google_secret_manager_secret_iam_member.api_runtime_system_team_id,
-    google_secret_manager_secret_iam_member.api_runtime_stripe_secret_key,
-    google_secret_manager_secret_iam_member.api_runtime_stripe_webhook_secret,
-    google_secret_manager_secret_iam_member.api_runtime_stripe_meter_error_webhook_secret,
+    google_secret_manager_secret_iam_member.controlplane_runtime,
+    google_project_iam_member.controlplane_metric_writer,
+    google_service_account_iam_member.controlplane_deploy_act_as,
+    module.backup_storage,
   ]
 }
 resource "google_compute_disk" "sandbox_data" {
@@ -277,6 +277,9 @@ resource "google_compute_attached_disk" "sandbox_data" {
 
   deletion_policy = "PREVENT"
 }
+# Legacy Cloud Run revisions retain these grants until the staged cutover is
+# drained. The new serving identity's grants live in control-plane-identity.tf;
+# the shared identity remains attached to the draining VMD host.
 resource "google_secret_manager_secret_iam_member" "api_runtime_system_team_id" {
   project   = local.project_id
   secret_id = coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}")
@@ -683,6 +686,10 @@ module "backup_storage" {
 
   writer_members = [
     "serviceAccount:${module.iam.service_account_emails["superserve_api"]}",
+  ]
+
+  reader_members = [
+    "serviceAccount:${google_service_account.controlplane_runtime.email}",
   ]
 
   labels = merge(local.common_labels, {
