@@ -24,7 +24,7 @@ SET LOCAL statement_timeout = '10s';
 CREATE TABLE IF NOT EXISTS sandbox_snapshot (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     team_id         uuid NOT NULL REFERENCES team(id),
-    sandbox_id      uuid NOT NULL REFERENCES sandbox(id),
+    sandbox_id      uuid NOT NULL,
     template_id     uuid REFERENCES template(id),
     kind            text NOT NULL CHECK (kind IN ('fs', 'mem+fs')),
     status          text NOT NULL DEFAULT 'creating'
@@ -52,6 +52,11 @@ CREATE TABLE IF NOT EXISTS sandbox_snapshot (
     created_at      timestamptz NOT NULL DEFAULT now(),
     ready_at        timestamptz,
     deleted_at      timestamptz,
+
+    -- The source sandbox belongs to the same team, and a fork's pointer can
+    -- only name a snapshot of its own team.
+    FOREIGN KEY (sandbox_id, team_id) REFERENCES sandbox(id, team_id),
+    UNIQUE (id, team_id),
 
     -- Deletion is the only way out: a deleted row was in deleting first.
     CONSTRAINT sandbox_snapshot_deleted_was_deleting CHECK (
@@ -94,6 +99,16 @@ CREATE INDEX IF NOT EXISTS sandbox_snapshot_by_team
     ON sandbox_snapshot (team_id, created_at DESC)
     WHERE deleted_at IS NULL;
 
+-- The quota counts run under the team lock on every capture; these cover
+-- exactly the counted rows so failed captures never widen the scan.
+CREATE INDEX IF NOT EXISTS sandbox_snapshot_quota_team
+    ON sandbox_snapshot (team_id)
+    WHERE deleted_at IS NULL AND status IN ('creating', 'ready');
+
+CREATE INDEX IF NOT EXISTS sandbox_snapshot_quota_sandbox
+    ON sandbox_snapshot (sandbox_id)
+    WHERE deleted_at IS NULL AND status IN ('creating', 'ready');
+
 ALTER TABLE sandbox
     ADD COLUMN IF NOT EXISTS source_snapshot_id uuid;
 
@@ -102,7 +117,7 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sandbox_source_snapshot_fk') THEN
     ALTER TABLE sandbox
       ADD CONSTRAINT sandbox_source_snapshot_fk
-      FOREIGN KEY (source_snapshot_id) REFERENCES sandbox_snapshot(id);
+      FOREIGN KEY (source_snapshot_id, team_id) REFERENCES sandbox_snapshot(id, team_id);
   END IF;
 END $$;
 

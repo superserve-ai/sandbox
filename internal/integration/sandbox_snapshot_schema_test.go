@@ -125,4 +125,21 @@ func TestSandboxSnapshotSchema(t *testing.T) {
 	if _, err := insertSnapshotRow(ctx, teamID, a, nil); err != nil {
 		t.Fatalf("insert next to a deleting row: %v", err)
 	}
+
+	// Tenant boundaries: a snapshot belongs to its sandbox's team, and a fork
+	// can only point at a snapshot of its own team.
+	otherTeam, _ := seedTeamAndKey(t)
+	if _, err := insertSnapshotRow(ctx, otherTeam, a, nil); pgCode(err) != "23503" {
+		t.Fatalf("snapshot of another team's sandbox: want 23503, got %v", err)
+	}
+	otherSandbox, err := insertSandboxRow(ctx, otherTeam, "snap-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET source_snapshot_id = $1 WHERE id = $2`, keyed, otherSandbox); pgCode(err) != "23503" {
+		t.Fatalf("fork pointing at another team's snapshot: want 23503, got %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET source_snapshot_id = $1 WHERE id = $2`, keyed, a); err != nil {
+		t.Fatalf("fork pointing at own team's snapshot: %v", err)
+	}
 }
