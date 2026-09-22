@@ -794,8 +794,8 @@ def main() -> int:
             # WARNING: this runtime override survives a rollback to an
             # older script revision (which cannot know to clear it) and
             # lasts until reboot. To clear it by hand:
-            #   systemctl set-property --runtime sandboxes.slice CPUWeight=100 IOWeight=100
-            sudo systemctl set-property --runtime sandboxes.slice CPUWeight=400 IOWeight=400 2>/dev/null || true
+            #   systemctl set-property --runtime sandboxes.slice CPUWeight=100 IOWeight=100 MemoryLow=0
+            sudo systemctl set-property --runtime sandboxes.slice CPUWeight=400 IOWeight=400 MemoryLow=70% 2>/dev/null || true
             sudo systemctl enable --quiet superserve-vmd.socket
             sudo systemctl enable --now --quiet superserve-maintenance-watch.timer
             # Delegated cgroup subtree for direct-spawn VMs. Enable for boot, but

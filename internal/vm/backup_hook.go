@@ -688,6 +688,16 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 		for _, f := range promoted.Files {
 			uploadPaths[f.Name] = f.Path
 		}
+		// A copy that landed elsewhere means the local staging copy was
+		// just read for the last time (hashed above, then copied); the
+		// uploader reads the promoted one. Drop what it left in cache.
+		// When both roots are one tree nothing was copied and the
+		// uploader still reads this file, so it keeps its pages.
+		for name, local := range finalPaths {
+			if uploadPaths[name] != local {
+				_ = backup.DropPageCache(local)
+			}
+		}
 	}
 	for i := range entries {
 		if p, ok := uploadPaths[entries[i].FileName]; ok {
