@@ -21,7 +21,7 @@ func TestTrialBalanceMigrationUpgradeConverges(t *testing.T) {
 	}
 	defer tx.Rollback(ctx)
 
-	cleanMigration, err := os.ReadFile("../../supabase/migrations/20260922000007_billing_trial_balance.sql")
+	cleanMigration, err := os.ReadFile("../../supabase/migrations/20260923000007_billing_trial_balance.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestTrialBalanceMigrationUpgradeConverges(t *testing.T) {
 	if _, err := tx.Exec(ctx, `SET LOCAL check_function_bodies = on`); err != nil {
 		t.Fatal(err)
 	}
-	migration, err := os.ReadFile("../../supabase/migrations/20260922000005_trial_balance_corrections.sql")
+	migration, err := os.ReadFile("../../supabase/migrations/20260923000005_trial_balance_corrections.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
