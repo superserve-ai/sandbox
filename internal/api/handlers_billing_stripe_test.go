@@ -283,6 +283,48 @@ func TestStripeCreditBalanceRejectsPartiallyMalformedBalances(t *testing.T) {
 	}
 }
 
+type stripeCreditGrantRoundTripper struct {
+	form url.Values
+}
+
+func (r *stripeCreditGrantRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+	r.form, err = url.ParseQuery(string(body))
+	if err != nil {
+		return nil, err
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader(`{"id":"grant_example"}`)),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+func TestStripeCreateBillingCreditGrantPersistsActivationIdentity(t *testing.T) {
+	transport := &stripeCreditGrantRoundTripper{}
+	client := &stripeHTTPClient{
+		baseURL:    "https://stripe.example.test",
+		secretKey:  "sk_test_example",
+		apiVersion: "2025-06-30",
+		httpClient: &http.Client{Transport: transport},
+	}
+	identity := "stripe-activation-credit-00000000-0000-0000-0000-000000000001"
+	if _, err := client.CreateBillingCreditGrant(t.Context(), StripeCreateBillingCreditGrantParams{
+		CustomerID:     "cus_example",
+		AmountCents:    9500,
+		IdempotencyKey: identity,
+	}); err != nil {
+		t.Fatalf("create credit grant: %v", err)
+	}
+	if got := transport.form.Get("metadata[activation_identity]"); got != identity {
+		t.Fatalf("activation identity metadata = %q, want %q", got, identity)
+	}
+}
+
 func TestStripeExpectedInvoiceAmountClampsPayableEstimate(t *testing.T) {
 	if got := stripeExpectedInvoiceAmount(30, 20); got != 10 {
 		t.Fatalf("expected payable estimate = %v, want 10", got)

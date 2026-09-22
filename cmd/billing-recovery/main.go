@@ -55,7 +55,9 @@ type stripeGrant struct {
 			PriceType string `json:"price_type"`
 		} `json:"scope"`
 	} `json:"applicability_config"`
-	Metadata map[string]string `json:"metadata"`
+	ExpiresAt *int64            `json:"expires_at"`
+	VoidedAt  *int64            `json:"voided_at"`
+	Metadata  map[string]string `json:"metadata"`
 }
 
 type stripeGrantList struct {
@@ -153,8 +155,18 @@ func isActivationGrantApplicable(grant stripeGrant) bool {
 	return strings.EqualFold(strings.TrimSpace(grant.ApplicabilityConfig.Scope.PriceType), "metered")
 }
 
+func isActivationGrantUsable(grant stripeGrant, now time.Time) bool {
+	if !isActivationGrantAmount(grant) || !isActivationGrantApplicable(grant) {
+		return false
+	}
+	if grant.VoidedAt != nil {
+		return false
+	}
+	return grant.ExpiresAt == nil || *grant.ExpiresAt > now.Unix()
+}
+
 func isVerifiedActivationGrant(grant stripeGrant, localGrantID, identity string) bool {
-	if strings.TrimSpace(grant.ID) == "" || !isActivationGrantAmount(grant) || !isActivationGrantApplicable(grant) {
+	if strings.TrimSpace(grant.ID) == "" || !isActivationGrantUsable(grant, time.Now().UTC()) {
 		return false
 	}
 	// A persisted grant ID is an immutable local identity. When local state is
