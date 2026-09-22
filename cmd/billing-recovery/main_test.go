@@ -14,12 +14,12 @@ import (
 )
 
 func TestIsActivating(t *testing.T) {
-	for _, status := range []string{"active", "trialing", "ACTIVE"} {
+	for _, status := range []string{"active", "trialing", "past_due", "ACTIVE", "PAST_DUE"} {
 		if !isActivating(status) {
 			t.Errorf("isActivating(%q) = false, want true", status)
 		}
 	}
-	for _, status := range []string{"past_due", "canceled", "paused", "incomplete"} {
+	for _, status := range []string{"canceled", "paused", "incomplete"} {
 		if isActivating(status) {
 			t.Errorf("isActivating(%q) = true, want false", status)
 		}
@@ -36,6 +36,18 @@ func TestIsTerminalSubscriptionStatus(t *testing.T) {
 		if isTerminalSubscriptionStatus(status) {
 			t.Errorf("isTerminalSubscriptionStatus(%q) = true, want false", status)
 		}
+	}
+}
+
+func TestStripeRecoveryWatermarkMatchesStripePrecision(t *testing.T) {
+	now := time.Date(2026, time.September, 22, 19, 22, 15, 987654321, time.FixedZone("example", -5*60*60))
+	got := stripeRecoveryWatermark(now)
+	want := time.Date(2026, time.September, 23, 0, 22, 15, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("stripeRecoveryWatermark(%v) = %v, want %v", now, got, want)
+	}
+	if got.Nanosecond() != 0 {
+		t.Fatalf("stripe recovery watermark retains subsecond precision: %v", got)
 	}
 }
 
@@ -174,6 +186,16 @@ func TestAuditAccountDryRunSkipsUnsafeTargetsAndDoesNotMutate(t *testing.T) {
 			name:       "active subscription without grant",
 			account:    billingAccount{TeamID: teamID, CustomerID: stringPtrForTest("cus_active"), SubscriptionID: stringPtrForTest("sub_active")},
 			sub:        activeSubscription,
+			wantResult: "candidate",
+			wantReason: "active_subscription_without_activation_grant",
+		},
+		{
+			name:    "past_due subscription without grant",
+			account: billingAccount{TeamID: teamID, CustomerID: stringPtrForTest("cus_active"), SubscriptionID: stringPtrForTest("sub_active")},
+			sub: stripeSubscription{
+				ID: "sub_active", Customer: "cus_active", Status: "past_due",
+				CurrentPeriodStart: 1_700_000_000, CurrentPeriodEnd: 1_700_086_400,
+			},
 			wantResult: "candidate",
 			wantReason: "active_subscription_without_activation_grant",
 		},

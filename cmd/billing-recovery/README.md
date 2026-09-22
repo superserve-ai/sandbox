@@ -23,7 +23,8 @@ Apply one explicitly targeted repair only after reviewing its dry-run result:
 go run ./cmd/billing-recovery -team <team-uuid> -apply
 ```
 
-`-apply` rechecks Stripe ownership, current active status, and grant
+`-apply` rechecks Stripe ownership, current activating status (`active`,
+`trialing`, or `past_due`), and grant
 ownership, then re-locks and revalidates the local association before writing.
 The repair records a subscription-event watermark while holding that lock, so
 older delayed webhook deliveries cannot overwrite the recovered projection.

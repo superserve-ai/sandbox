@@ -491,7 +491,7 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 	}
 	sub := evidence.subscription
 	grantID := evidence.grantID
-	watermark := time.Now().UTC()
+	watermark := stripeRecoveryWatermark(time.Now())
 	if current.EventAt != nil && current.EventAt.After(watermark) {
 		return "", errors.New("a newer subscription event watermark is already present; rerun the audit")
 	}
@@ -532,7 +532,7 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 		return "", fmt.Errorf("local subscription became terminal during revalidation (status %q); rerun the audit", deref(latest.Status))
 	}
 	current = latest
-	watermark = time.Now().UTC()
+	watermark = stripeRecoveryWatermark(time.Now())
 	if current.EventAt != nil && current.EventAt.After(watermark) {
 		return "", errors.New("a newer subscription event watermark is already present; rerun the audit")
 	}
@@ -568,7 +568,16 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 }
 
 func isActivating(status string) bool {
-	return strings.EqualFold(status, "active") || strings.EqualFold(status, "trialing")
+	return strings.EqualFold(status, "active") ||
+		strings.EqualFold(status, "trialing") ||
+		strings.EqualFold(status, "past_due")
+}
+
+// Stripe webhook created timestamps have whole-second precision. Keep the
+// recovery watermark at that same precision so an event created later in the
+// same second is not incorrectly treated as stale.
+func stripeRecoveryWatermark(now time.Time) time.Time {
+	return now.UTC().Truncate(time.Second)
 }
 
 func sameRecoveryBillingSnapshot(left, right billingAccount) bool {
