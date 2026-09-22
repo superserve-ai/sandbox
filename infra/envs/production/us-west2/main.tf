@@ -63,12 +63,8 @@ locals {
   # set in tfvars from the host itself:
   #   grep '^HOST_ID=' /etc/sandbox/host-identity.env
   #
-  # Deliberately NOT the same as active_host_name, and the two must not be
-  # merged: the host-local collector stamps its own HOST_ID (the instance name,
-  # rewritten on every collector deploy) onto the hostmetrics pipeline, so
-  # host-level series like filesystem utilization carry the instance name while
-  # vmd's own OTLP series carry vmd's HOST_ID. One machine, two host_id values,
-  # depending on which process emitted the metric.
+  # The collector stamps active_host_name as collector_host_id for alert
+  # selection, independently of the authoritative HOST_ID on managed hosts.
   metrics_host_id = var.standby_host_id
 }
 module "network" {

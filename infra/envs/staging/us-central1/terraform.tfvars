@@ -9,3 +9,4 @@ database_url_secret_name              = "database-url-staging"
 internal_api_token_secret_name        = "internal-api-token-staging"
 sandbox_access_token_seed_secret_name = "sandbox-access-token-seed-staging"
 secrets_signing_key_secret_name       = "secretsproxy-signing-key-staging"
+peer_ca_operator_members              = ["user:alejandro@superserve.ai"]

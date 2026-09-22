@@ -1,12 +1,13 @@
-project_id             = "rayai-prod"
-environment            = "production"
-region                 = "us-east4"
-zone                   = "us-east4-c"
-create_network         = false
-network_name           = "superserve-production-vpc"
-resource_suffix        = "use4"
-service_account_suffix = "use4"
-subnet_cidr            = "10.2.0.0/24"
+project_id               = "rayai-prod"
+environment              = "production"
+region                   = "us-east4"
+zone                     = "us-east4-c"
+create_network           = false
+network_name             = "superserve-production-vpc"
+resource_suffix          = "use4"
+service_account_suffix   = "use4"
+subnet_cidr              = "10.2.0.0/24"
+peer_ca_operator_members = ["user:alejandro@superserve.ai"]
 # Direct-VPC-egress subnet for the Cloud Run control plane — distinct from the
 # host subnet, sourced by the vmd-gRPC + OTLP firewall rules so Cloud Run can
 # reach the host. Direct VPC egress allocates instance IPs from this range and
