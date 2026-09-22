@@ -68,8 +68,8 @@ infrastructure changes may resume automatically after the staged cutover.
    revision without routing traffic to it. The central KMS owner grant is then
    applied before cutover. The verifier gates the stage on a runtime-identity
    KMS encrypt/decrypt round trip as well as same-cell manifest/reference
-   reads, cross-cell list denial, deterministic write denial plus a
-   non-mutating IAM Policy Troubleshooter check for delete denial, Secret
+   reads, cross-cell list denial, non-mutating IAM Policy Troubleshooter
+   checks for create and delete denial, Secret
    Manager access, effective IAM analysis, deployment act-as, and the
    centrally owned KMS binding. It also requires the latest ready revision to
    have 100% traffic under the dedicated identity.
@@ -126,11 +126,12 @@ python3 scripts/verify-control-plane-identity.py \
 ```
 
 The verifier discovers the actual generation `manifest.json` object, reads
-each referenced artifact, creates and validates its own deterministic write
-probe, and uses IAM Policy Troubleshooter to confirm that the runtime identity
-is denied `storage.objects.delete` on that object. It never attempts to delete
-the live manifest. A missing local probe or missing object is not a negative
-IAM result.
+each referenced artifact, and uses IAM Policy Troubleshooter to confirm that
+the runtime identity is denied `storage.objects.create` for a synthetic object
+under `templates/` and `storage.objects.delete` on the live manifest. These
+checks are non-mutating, so retries cannot turn a create check into an
+overwrite check or alter a customer artifact. A missing object is not a
+negative IAM result.
 
 Also verify that the deployment principal can update the Cloud Run service with
 the new identity and mint credentials as that identity for the probes, that the
