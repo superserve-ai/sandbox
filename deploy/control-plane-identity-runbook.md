@@ -69,24 +69,26 @@ infrastructure changes may resume automatically after the staged cutover.
    applied before cutover. The verifier gates the stage on a runtime-identity
    KMS encrypt/decrypt round trip as well as same-cell manifest/reference
    reads, cross-cell list denial, non-mutating IAM Policy Troubleshooter
-   checks for create and delete denial, Secret
+   checks for sandbox and cross-cell object-get denial plus create and delete denial, Secret
    Manager access, effective IAM analysis, deployment act-as, and the
    centrally owned KMS binding. It also requires the latest ready revision to
    have 100% traffic under the dedicated identity.
 4. Keep the old shared production runner grants until both old revisions are
    drained and the dependency audit below is complete. The workflow's failure
-   trap routes traffic back to the captured revision and includes the outcome
-   in the private evidence even when verification fails.
+   trap restores both the captured revision's traffic and the pre-migration
+   Cloud Run service identity, then includes the outcome in the private
+   evidence even when verification fails.
 5. After the drain, remove only obsolete shared control-plane grants. Do not
    remove a grant that a legacy host, restore tool, GC job, or rollback
    revision still uses. In particular, staging's `superserve-api` host grant
    stays until that host is separately migrated.
 
-Cloud Run rollout failure leaves the old revision serving. Do not revoke the
-old identity's secret/KMS permissions until the new revision is ready and
-positive checks have passed. To roll back, route traffic to the last known
-good revision, restore the old identity's grants if they were already removed,
-and repeat the checks before retrying the cutover.
+Cloud Run rollout failure leaves the old revision serving and restores the
+service template to its pre-migration identity. Do not revoke the old
+identity's secret/KMS permissions until the new revision is ready and positive
+checks have passed. To roll back, route traffic to the last known good
+revision, restore the old identity's grants if they were already removed, and
+repeat the checks before retrying the cutover.
 
 ## Durable evidence gate
 
@@ -127,11 +129,12 @@ python3 scripts/verify-control-plane-identity.py \
 
 The verifier discovers the actual generation `manifest.json` object, reads
 each referenced artifact, and uses IAM Policy Troubleshooter to confirm that
-the runtime identity is denied `storage.objects.create` for a synthetic object
-under `templates/` and `storage.objects.delete` on the live manifest. These
-checks are non-mutating, so retries cannot turn a create check into an
-overwrite check or alter a customer artifact. A missing object is not a
-negative IAM result.
+the runtime identity is denied `storage.objects.get` for a synthetic object
+under `sandboxes/` in its own and every other cell's bucket. It also confirms
+denial of `storage.objects.create` for a synthetic object under `templates/`
+and `storage.objects.delete` on the live manifest. These checks are
+non-mutating, so retries cannot turn a create check into an overwrite check or
+alter a customer artifact. A missing object is not a negative IAM result.
 
 Also verify that the deployment principal can update the Cloud Run service with
 the new identity and mint credentials as that identity for the probes, that the

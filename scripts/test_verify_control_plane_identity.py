@@ -94,6 +94,57 @@ class DeletePermissionProbeTests(unittest.TestCase):
         )
 
 
+class ObjectReadPermissionProbeTests(unittest.TestCase):
+    def test_sandbox_get_probe_is_non_mutating_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = VERIFY.Evidence(Path(directory))
+            commands = []
+
+            def command(name, argv, **_kwargs):
+                commands.append((name, argv))
+                evidence.index.append({"name": name, "status": "PASS"})
+                return '{"access":"NOT_GRANTED"}'
+
+            evidence.command = command
+            VERIFY.require_permission_denied(
+                evidence,
+                "sandbox-get-permission-check",
+                "reader@example-project.iam.gserviceaccount.com",
+                "cell-backups",
+                "sandboxes/.permission-probe",
+                "storage.objects.get",
+            )
+
+            name, argv = commands[0]
+            self.assertEqual(name, "sandbox-get-permission-check")
+            self.assertIn(
+                "//storage.googleapis.com/projects/_/buckets/cell-backups/objects/"
+                "sandboxes/.permission-probe",
+                argv,
+            )
+            self.assertIn("--permission=storage.objects.get", argv)
+
+    def test_sandbox_get_probe_rejects_granted_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = VERIFY.Evidence(Path(directory))
+
+            def command(name, argv, **_kwargs):
+                evidence.index.append({"name": name, "status": "PASS"})
+                return '{"access":"GRANTED"}'
+
+            evidence.command = command
+            with self.assertRaises(VERIFY.VerificationError):
+                VERIFY.require_permission_denied(
+                    evidence,
+                    "cross-cell-get-1",
+                    "reader@example-project.iam.gserviceaccount.com",
+                    "other-cell-backups",
+                    "sandboxes/.permission-probe",
+                    "storage.objects.get",
+                )
+            self.assertEqual(evidence.index[0]["status"], "FAIL")
+
+
 class EffectiveIamCommandTests(unittest.TestCase):
     def test_effective_iam_uses_supported_project_scope_flag(self):
         command = VERIFY.effective_iam_command(

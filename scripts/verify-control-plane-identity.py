@@ -269,6 +269,49 @@ def storage_object_resource(bucket: str, name: str) -> str:
     return f"//storage.googleapis.com/projects/_/buckets/{bucket}/objects/{name}"
 
 
+def require_permission_denied(
+    evidence: Evidence,
+    name: str,
+    identity: str,
+    bucket: str,
+    object_name: str,
+    permission: str,
+) -> None:
+    """Fail closed unless Policy Troubleshooter denies one object permission."""
+    resource = storage_object_resource(bucket, object_name)
+    response = evidence.command(
+        name,
+        gcloud(
+            "policy-troubleshoot",
+            "iam",
+            resource,
+            f"--principal-email={identity}",
+            f"--permission={permission}",
+            "--format=json",
+        ),
+    )
+    try:
+        access = policy_troubleshooter_access(response)
+    except VerificationError:
+        evidence.index[-1]["status"] = "FAIL"
+        raise
+    evidence.index[-1].update(
+        {
+            "principal": identity,
+            "resource": resource,
+            "permission": permission,
+            "access": access,
+        }
+    )
+    # The v2alpha1 CLI reports a denied permission as NOT_GRANTED; accept
+    # DENIED as well for older Policy Troubleshooter response versions.
+    if access not in {"NOT_GRANTED", "DENIED"}:
+        evidence.index[-1]["status"] = "FAIL"
+        raise VerificationError(
+            f"runtime identity has {permission} on {resource} ({access})"
+        )
+
+
 def policy_troubleshooter_access(response: str) -> str:
     """Extract the access decision from a Policy Troubleshooter response."""
     try:
@@ -480,6 +523,27 @@ def main() -> int:
             gcloud("storage", "objects", "list", f"gs://{bucket}/sandboxes/", impersonate),
             expect_denied=True,
         )
+        # A denied listing does not prove that a principal cannot read a
+        # known object path. Policy Troubleshooter checks the object-level get
+        # permission without requiring the synthetic object to exist.
+        sandbox_probe = "sandboxes/.permission-probe"
+        require_permission_denied(
+            evidence,
+            "sandbox-get-permission-check",
+            identity,
+            bucket,
+            sandbox_probe,
+            "storage.objects.get",
+        )
+        for index, other in enumerate(args.other_bucket, 1):
+            require_permission_denied(
+                evidence,
+                f"cross-cell-get-{index}",
+                identity,
+                other,
+                sandbox_probe,
+                "storage.objects.get",
+            )
         # Policy Troubleshooter evaluates create access without issuing a
         # mutating request. A real upload is unsafe here: if a bad grant lets
         # the first attempt create the fixed probe object, a retry would test
@@ -805,6 +869,7 @@ def main() -> int:
             "own-template-list",
             "manifest-read",
             "sandbox-list-denied",
+            "sandbox-get-permission-check",
             "create-permission-check",
             "delete-permission-check",
             "bucket-iam",
@@ -815,6 +880,9 @@ def main() -> int:
         ]
         required_checks.extend(
             f"cross-cell-list-{index}" for index, _ in enumerate(args.other_bucket, 1)
+        )
+        required_checks.extend(
+            f"cross-cell-get-{index}" for index, _ in enumerate(args.other_bucket, 1)
         )
         required_checks.extend(
             f"referenced-read-{index}" for index, _ in enumerate(references, 1)
