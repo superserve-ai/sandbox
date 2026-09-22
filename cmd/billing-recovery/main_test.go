@@ -51,6 +51,30 @@ func TestStripeRecoveryWatermarkMatchesStripePrecision(t *testing.T) {
 	}
 }
 
+func TestStripeSubscriptionPeriodBoundsUsesItemPeriodsBeforeTopLevelFallback(t *testing.T) {
+	itemStart, itemEnd := int64(1_700_000_000), int64(1_700_086_400)
+	gotStart, gotEnd, ok := (stripeSubscription{
+		CurrentPeriodStart: 0,
+		CurrentPeriodEnd:   0,
+		Items: stripeSubscriptionItems{Data: []stripeSubscriptionItem{{
+			CurrentPeriodStart: itemStart,
+			CurrentPeriodEnd:   itemEnd,
+		}}},
+	}).periodBounds()
+	if !ok || gotStart != itemStart || gotEnd != itemEnd {
+		t.Fatalf("item period bounds = (%d, %d, %t), want (%d, %d, true)", gotStart, gotEnd, ok, itemStart, itemEnd)
+	}
+
+	fallbackStart, fallbackEnd := int64(1_800_000_000), int64(1_800_086_400)
+	gotStart, gotEnd, ok = (stripeSubscription{
+		CurrentPeriodStart: fallbackStart,
+		CurrentPeriodEnd:   fallbackEnd,
+	}).periodBounds()
+	if !ok || gotStart != fallbackStart || gotEnd != fallbackEnd {
+		t.Fatalf("top-level period bounds = (%d, %d, %t), want (%d, %d, true)", gotStart, gotEnd, ok, fallbackStart, fallbackEnd)
+	}
+}
+
 func TestParseOptionalUUID(t *testing.T) {
 	if got, err := parseOptionalUUID(""); err != nil || got != nil {
 		t.Fatalf("empty UUID = (%v, %v), want (nil, nil)", got, err)
@@ -125,11 +149,13 @@ func TestVerifiedActivationGrantRequiresApplicabilityAndIdentity(t *testing.T) {
 func TestAuditAccountDryRunSkipsUnsafeTargetsAndDoesNotMutate(t *testing.T) {
 	teamID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
 	activeSubscription := stripeSubscription{
-		ID:                 "sub_active",
-		Customer:           "cus_active",
-		Status:             "active",
-		CurrentPeriodStart: 1_700_000_000,
-		CurrentPeriodEnd:   1_700_086_400,
+		ID:       "sub_active",
+		Customer: "cus_active",
+		Status:   "active",
+		Items: stripeSubscriptionItems{Data: []stripeSubscriptionItem{{
+			CurrentPeriodStart: 1_700_000_000,
+			CurrentPeriodEnd:   1_700_086_400,
+		}}},
 	}
 	identity := activationGrantIdentity(teamID)
 	existingGrant := stripeGrant{

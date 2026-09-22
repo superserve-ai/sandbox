@@ -33,12 +33,34 @@ type billingAccount struct {
 }
 
 type stripeSubscription struct {
-	ID                 string `json:"id"`
-	Customer           string `json:"customer"`
-	Status             string `json:"status"`
-	CurrentPeriodStart int64  `json:"current_period_start"`
-	CurrentPeriodEnd   int64  `json:"current_period_end"`
-	CancelAtPeriodEnd  bool   `json:"cancel_at_period_end"`
+	ID                 string                  `json:"id"`
+	Customer           string                  `json:"customer"`
+	Status             string                  `json:"status"`
+	CurrentPeriodStart int64                   `json:"current_period_start"`
+	CurrentPeriodEnd   int64                   `json:"current_period_end"`
+	CancelAtPeriodEnd  bool                    `json:"cancel_at_period_end"`
+	Items              stripeSubscriptionItems `json:"items"`
+}
+
+type stripeSubscriptionItems struct {
+	Data []stripeSubscriptionItem `json:"data"`
+}
+
+type stripeSubscriptionItem struct {
+	CurrentPeriodStart int64 `json:"current_period_start"`
+	CurrentPeriodEnd   int64 `json:"current_period_end"`
+}
+
+func (s stripeSubscription) periodBounds() (int64, int64, bool) {
+	for _, item := range s.Items.Data {
+		if item.CurrentPeriodStart > 0 && item.CurrentPeriodEnd > 0 {
+			return item.CurrentPeriodStart, item.CurrentPeriodEnd, true
+		}
+	}
+	if s.CurrentPeriodStart > 0 && s.CurrentPeriodEnd > 0 {
+		return s.CurrentPeriodStart, s.CurrentPeriodEnd, true
+	}
+	return 0, 0, false
 }
 
 type stripeGrant struct {
@@ -340,7 +362,7 @@ func auditAccount(ctx context.Context, pool *pgxpool.Pool, stripe stripeClient, 
 		out["stripe_status"] = sub.Status
 		return out
 	}
-	if sub.CurrentPeriodStart <= 0 || sub.CurrentPeriodEnd <= sub.CurrentPeriodStart {
+	if periodStart, periodEnd, ok := sub.periodBounds(); !ok || periodEnd <= periodStart {
 		out["outcome"], out["reason"] = "unresolved", "subscription_period_bounds_missing"
 		return out
 	}
@@ -402,6 +424,10 @@ func auditAccount(ctx context.Context, pool *pgxpool.Pool, stripe stripeClient, 
 type stripeActivationEvidence struct {
 	subscription stripeSubscription
 	grantID      string
+	// watermark is the Stripe ordering boundary observed before grant
+	// pagination. It must not be derived after those reads, because a later
+	// local timestamp could outrank a terminal webhook created in the gap.
+	watermark time.Time
 }
 
 // revalidateStripeActivation reads the current Stripe authority for a locked
@@ -415,13 +441,14 @@ func revalidateStripeActivation(ctx context.Context, stripe stripeClient, accoun
 	if err != nil {
 		return stripeActivationEvidence{}, fmt.Errorf("revalidate Stripe subscription: %w", err)
 	}
+	watermark := stripeRecoveryWatermark(time.Now())
 	if sub.ID != *account.SubscriptionID || sub.Customer != *account.CustomerID {
 		return stripeActivationEvidence{}, errors.New("Stripe subscription ownership changed; rerun the audit")
 	}
 	if !isActivating(sub.Status) {
 		return stripeActivationEvidence{}, fmt.Errorf("Stripe subscription is no longer active (status %q)", sub.Status)
 	}
-	if sub.CurrentPeriodStart <= 0 || sub.CurrentPeriodEnd <= sub.CurrentPeriodStart {
+	if periodStart, periodEnd, ok := sub.periodBounds(); !ok || periodEnd <= periodStart {
 		return stripeActivationEvidence{}, errors.New("Stripe subscription period bounds are no longer valid")
 	}
 	grants, err := stripe.grants(ctx, *account.CustomerID)
@@ -452,7 +479,7 @@ func revalidateStripeActivation(ctx context.Context, stripe stripeClient, accoun
 	if localGrantID == "" && matchingGrants == 0 && possibleGrants > 0 {
 		return stripeActivationEvidence{}, errors.New("Stripe activation grant identity or applicability is unverified")
 	}
-	return stripeActivationEvidence{subscription: sub, grantID: grantID}, nil
+	return stripeActivationEvidence{subscription: sub, grantID: grantID, watermark: watermark}, nil
 }
 
 func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe stripeClient, original billingAccount) (string, error) {
@@ -490,8 +517,12 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 		return "", err
 	}
 	sub := evidence.subscription
+	periodStart, periodEnd, ok := sub.periodBounds()
+	if !ok || periodEnd <= periodStart {
+		return "", errors.New("Stripe subscription period bounds are no longer valid")
+	}
 	grantID := evidence.grantID
-	watermark := stripeRecoveryWatermark(time.Now())
+	watermark := evidence.watermark
 	if current.EventAt != nil && current.EventAt.After(watermark) {
 		return "", errors.New("a newer subscription event watermark is already present; rerun the audit")
 	}
@@ -512,7 +543,12 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 		return "", err
 	}
 	sub = finalEvidence.subscription
+	periodStart, periodEnd, ok = sub.periodBounds()
+	if !ok || periodEnd <= periodStart {
+		return "", errors.New("Stripe subscription period bounds are no longer valid")
+	}
 	grantID = finalEvidence.grantID
+	watermark = finalEvidence.watermark
 	// Re-read the locked projection immediately before the local write so the
 	// guarded update uses the current subscription status and event watermark.
 	var latest billingAccount
@@ -532,7 +568,6 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 		return "", fmt.Errorf("local subscription became terminal during revalidation (status %q); rerun the audit", deref(latest.Status))
 	}
 	current = latest
-	watermark = stripeRecoveryWatermark(time.Now())
 	if current.EventAt != nil && current.EventAt.After(watermark) {
 		return "", errors.New("a newer subscription event watermark is already present; rerun the audit")
 	}
@@ -551,7 +586,7 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 		WHERE team_id = $1
 		  AND stripe_subscription_status IS NOT DISTINCT FROM $9::text
 		  AND (stripe_subscription_event_at IS NULL OR stripe_subscription_event_at <= $7::timestamptz)
-		  AND stripe_subscription_event_at IS NOT DISTINCT FROM $8::timestamptz`, original.TeamID, sub.Status, sub.CurrentPeriodStart, sub.CurrentPeriodEnd, sub.CancelAtPeriodEnd, grantID, watermark, current.EventAt, current.Status)
+		  AND stripe_subscription_event_at IS NOT DISTINCT FROM $8::timestamptz`, original.TeamID, sub.Status, periodStart, periodEnd, sub.CancelAtPeriodEnd, grantID, watermark, current.EventAt, current.Status)
 	if err != nil {
 		return "", err
 	}
