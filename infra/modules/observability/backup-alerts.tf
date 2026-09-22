@@ -356,14 +356,11 @@ resource "google_monitoring_alert_policy" "backup_coverage" {
 # on. Series carry the same bounded host_id label as the backup metrics.
 
 locals {
-  # Separate OR conditions keep the mountpoint restriction valid in Monitoring
-  # while covering collectors before and after authoritative identity rollout.
-  host_disk_host_filters = var.host_disk_alerts == null ? [] : [
-    " AND metric.labels.host_id = \"${var.host_disk_alerts.host_id}\"",
-    # Legacy collectors emit both labels with the same value. Only the first
-    # condition may match those series, avoiding duplicate incidents.
-    " AND metric.labels.collector_host_id = \"${var.host_disk_alerts.host_id}\" AND metric.labels.host_id != \"${var.host_disk_alerts.host_id}\""
-  ]
+  # Monitoring rejects an alert filter naming a metric label it has never seen
+  # on the metric, so this stays on host_id until every collector has reported
+  # collector_host_id on the host series. See the collector env: HOST_ID and
+  # COLLECTOR_HOST_ID are both the instance name for now.
+  host_disk_filter_suffix = var.host_disk_alerts == null ? "" : " AND metric.labels.host_id = \"${var.host_disk_alerts.host_id}\""
 
   host_disk_alert_conditions = var.host_disk_alerts == null ? {} : {
     root_fs_warning = {
@@ -419,24 +416,21 @@ resource "google_monitoring_alert_policy" "host_disk" {
   severity              = each.value.severity
   notification_channels = var.notification_channel_ids
 
-  dynamic "conditions" {
-    for_each = local.host_disk_host_filters
-    content {
-      display_name = conditions.key == 0 ? each.value.display_name : "${each.value.display_name} / collector identity"
+  conditions {
+    display_name = each.value.display_name
 
-      condition_threshold {
-        filter          = "metric.type = \"${each.value.metric_type}\" AND resource.type = \"prometheus_target\"${each.value.extra_filter}${conditions.value}"
-        comparison      = each.value.comparison
-        threshold_value = each.value.threshold
-        duration        = each.value.duration
-        aggregations {
-          alignment_period     = "60s"
-          per_series_aligner   = each.value.aligner
-          cross_series_reducer = try(each.value.reducer, null)
-        }
-        trigger {
-          count = 1
-        }
+    condition_threshold {
+      filter          = "metric.type = \"${each.value.metric_type}\" AND resource.type = \"prometheus_target\"${each.value.extra_filter}${local.host_disk_filter_suffix}"
+      comparison      = each.value.comparison
+      threshold_value = each.value.threshold
+      duration        = each.value.duration
+      aggregations {
+        alignment_period     = "60s"
+        per_series_aligner   = each.value.aligner
+        cross_series_reducer = try(each.value.reducer, null)
+      }
+      trigger {
+        count = 1
       }
     }
   }
