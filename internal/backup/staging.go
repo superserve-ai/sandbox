@@ -536,9 +536,6 @@ func snapshotFile(ctx context.Context, dst, src string) error {
 		os.Remove(tmp)
 		return err
 	}
-	// Written once, read next by whoever hashes or streams it; the pages
-	// this copy leaves behind would only crowd out what live VMs cache.
-	_ = dropPageCache(out)
 	if err := out.Close(); err != nil {
 		os.Remove(tmp)
 		return err

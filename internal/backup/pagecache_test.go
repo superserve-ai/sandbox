@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -80,30 +81,54 @@ func TestUploaderDropsOnlyStagedCopies(t *testing.T) {
 	}
 }
 
-// A copy the pipeline writes is fsynced and then let go of; the file is
-// intact afterwards, the drop being a hint and not a change.
-func TestSnapshotCopyDropsItsPagesAndKeepsItsBytes(t *testing.T) {
-	dir := t.TempDir()
-	src := filepath.Join(dir, "src")
-	data := []byte("staged bytes that must survive the drop")
-	if err := os.WriteFile(src, data, 0o644); err != nil {
+// A failed attempt keeps the staged copy's pages for the retry; the drop
+// happens once, on the attempt that finishes with the file.
+func TestUploaderKeepsPagesForRetry(t *testing.T) {
+	var dropped []string
+	prev := dropStagingPages
+	dropStagingPages = func(f *os.File) error {
+		dropped = append(dropped, f.Name())
+		return nil
+	}
+	t.Cleanup(func() { dropStagingPages = prev })
+
+	j, _ := testJournal(t)
+	store := newMemStore()
+	u := &Uploader{Journal: j, Store: store}
+	task := writeTask(t, t.TempDir())
+	task.Staged = true
+	failing := "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[1].Path, "vmstate.snap")
+	store.fail[failing] = errors.New("transient")
+	if err := j.Enqueue(task); err != nil {
 		t.Fatal(err)
 	}
-	dst := filepath.Join(dir, "other", "dst")
-	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+	now := task.EnqueuedAt.Add(time.Minute)
+	fake := now
+	u.Now = func() time.Time { return fake }
+	if _, err := u.drainOne(context.Background(), now); err != nil {
 		t.Fatal(err)
 	}
-	if err := snapshotFile(context.Background(), dst, src); err != nil {
+	for _, d := range dropped {
+		if d == task.Files[1].Path {
+			t.Fatal("failed attempt dropped the file its retry re-reads")
+		}
+	}
+
+	delete(store.fail, failing)
+	fake = now.Add(time.Hour)
+	if _, err := u.drainOne(context.Background(), now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(dst)
-	if err != nil {
-		t.Fatal(err)
+	if _, ok := store.objects["sandboxes/sb-1/gen-abc/manifest.json"]; !ok {
+		t.Fatal("manifest missing after retry")
 	}
-	if string(got) != string(data) {
-		t.Fatalf("copy = %q, want %q", got, data)
+	n := 0
+	for _, d := range dropped {
+		if d == task.Files[1].Path {
+			n++
+		}
 	}
-	if err := DropPageCache(dst); err != nil {
-		t.Fatalf("DropPageCache: %v", err)
+	if n != 1 {
+		t.Fatalf("retried file dropped %d times, want once on the successful attempt", n)
 	}
 }

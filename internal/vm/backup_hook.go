@@ -41,6 +41,44 @@ func (m *Manager) SetBackupEnqueue(fn func(backup.Task) error) {
 	m.backupEnqueue = fn
 }
 
+// SetBackupLoad installs the journal read the promotion path consults
+// before letting go of a local staging copy's cached pages: an enqueue
+// that deduped against an existing row may have kept that row's paths,
+// so only the row itself says whether the local copy is still read.
+// Startup-only, like SetBackupEnqueue.
+func (m *Manager) SetBackupLoad(fn func(backup.Task) (backup.Task, bool, error)) {
+	m.backupLoad = fn
+}
+
+// dropPageCache is backup.DropPageCache behind a hook for tests.
+var dropPageCache = backup.DropPageCache
+
+// releasePromotedLocalCopies drops the cached pages of the local staging
+// copies a promotion left behind, but only those the journal's row for
+// this generation no longer names. The row is authoritative: a dedupe
+// against an earlier staged row keeps that row's paths, which may be
+// these very files, and the uploader then reads them. Without a load
+// hook, or without a row, nothing is dropped; the sweep still reclaims
+// the copies once the journal is done with the generation.
+func (m *Manager) releasePromotedLocalCopies(vmID, gen string, local map[string]string) {
+	if m.backupLoad == nil {
+		return
+	}
+	row, ok, err := m.backupLoad(backup.Task{SandboxID: vmID, Generation: gen})
+	if err != nil || !ok {
+		return
+	}
+	inUse := make(map[string]bool, len(row.Files))
+	for _, f := range row.Files {
+		inUse[f.Path] = true
+	}
+	for _, path := range local {
+		if !inUse[path] {
+			_ = dropPageCache(path)
+		}
+	}
+}
+
 // BackupRestoreOptions bound what a wave of backup-backed resumes may take
 // from the host.
 type BackupRestoreOptions struct {
@@ -688,16 +726,6 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 		for _, f := range promoted.Files {
 			uploadPaths[f.Name] = f.Path
 		}
-		// A copy that landed elsewhere means the local staging copy was
-		// just read for the last time (hashed above, then copied); the
-		// uploader reads the promoted one. Drop what it left in cache.
-		// When both roots are one tree nothing was copied and the
-		// uploader still reads this file, so it keeps its pages.
-		for name, local := range finalPaths {
-			if uploadPaths[name] != local {
-				_ = backup.DropPageCache(local)
-			}
-		}
 	}
 	for i := range entries {
 		if p, ok := uploadPaths[entries[i].FileName]; ok {
@@ -706,6 +734,11 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 	}
 	if ok, _, _ := m.enqueueBackup(pb.VMID, entries, pb.backupPriority(), pb.PauseToken); ok {
 		m.deletePendingBackupIf(pb, log)
+		// The local copies were hashed above and, on a host with a
+		// separate upload root, copied from once more; whichever of them
+		// the journal's row does not name has now been read for the last
+		// time and gives up its cached pages.
+		m.releasePromotedLocalCopies(pb.VMID, gen, finalPaths)
 		// Deliberately NOT cleaning up the local (pauseStagingRoot) copy
 		// here, even though it is usually redundant once promotion has
 		// landed a copy in the upload-visible tree: the journal dedupes
