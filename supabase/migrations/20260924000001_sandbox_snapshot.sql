@@ -215,12 +215,16 @@ CREATE TRIGGER trg_sandbox_snapshot_quota
     BEFORE INSERT ON sandbox_snapshot
     FOR EACH ROW EXECUTE FUNCTION sandbox_snapshot_quota_on_insert();
 
--- Failed rows leave the quota count and deletion is terminal, so neither
--- ever comes back: the only way to a live row is an insert through the quota trigger.
+-- Failed rows leave the quota count, deletion is terminal, and a row never
+-- changes owner: the only way to a live row is an insert through the quota trigger.
 CREATE OR REPLACE FUNCTION sandbox_snapshot_no_revive() RETURNS trigger
     LANGUAGE plpgsql
 AS $$
 BEGIN
+    -- Ownership and kind are fixed at insert; moving a row would dodge the quota.
+    IF NEW.team_id <> OLD.team_id OR NEW.sandbox_id <> OLD.sandbox_id OR NEW.kind <> OLD.kind THEN
+        RAISE EXCEPTION 'snapshot % cannot change team, sandbox or kind', OLD.id;
+    END IF;
     IF OLD.status = 'failed' AND NEW.status NOT IN ('failed', 'deleting') THEN
         RAISE EXCEPTION 'snapshot % failed and cannot become %', OLD.id, NEW.status;
     END IF;

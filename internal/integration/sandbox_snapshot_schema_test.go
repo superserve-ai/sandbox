@@ -109,6 +109,9 @@ func TestSandboxSnapshotSchema(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'deleting' WHERE id = $1`, first); err != nil {
 		t.Fatalf("failed to deleting is the one allowed exit: %v", err)
 	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET sandbox_id = $1 WHERE id = $2`, a, keyed); err == nil {
+		t.Fatal("moving a snapshot to another sandbox should be refused")
+	}
 	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'ready', overlay_path = '/o', snapshot_path = '/v', mem_path = '/m' WHERE id = $1`, first); err == nil {
 		t.Fatal("deleting is terminal; deleting to ready should be refused")
 	}
