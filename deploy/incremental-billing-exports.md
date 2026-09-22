@@ -25,6 +25,28 @@ provider totals and their observation window, time, and errors.
   uncertain event older than 23 hours requires operator recovery.
 - Unchanged usage is reconciled on a separate six-hour interval.
 
+## Customer billing enablement
+
+`billing_export_enabled` is the live-billing switch used by both the billing
+summary and Stripe checkout. Live billing is the default for new teams. The
+enablement migration inserts an explicit `true` row for every existing team
+without an override, then enables the global flag. Existing team-level `false`
+rows are preserved as reviewed opt-outs and take precedence over the global
+default.
+
+After applying the migration in each production cell, verify all of the
+following before handover:
+
+1. `feature_flag.enabled` is `true` for `billing_export_enabled`.
+2. Every team has a `team_feature_flag` row for that key.
+3. The count of `enabled = false` overrides matches the reviewed opt-out list.
+4. A newly created team reports live billing and can open Stripe checkout.
+5. Each reviewed opt-out remains in shadow mode and cannot open checkout.
+
+Do not replace the migration with a global update alone: the explicit backfill
+keeps the fleet state auditable and prevents a later global-default change from
+silently changing reviewed opt-outs.
+
 Production control planes in `us-east4` and `us-west2` use continuously allocated
 CPU (`cpu_idle = false`) and retain ten minimum instances per revision. Both the
 API and Terraform deployment workflows enforce those settings so background

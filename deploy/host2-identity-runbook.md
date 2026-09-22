@@ -650,7 +650,7 @@ References: [managed identity setup](https://docs.cloud.google.com/iam/docs/crea
 
 ## Peer rollout and legacy heartbeat
 
-Deploy private ingress on every reachable owner with routing disabled, verify
+Deploy private ingress on every remote destination with source routing disabled, verify
 TLS 1.3 and exact SPIFFE authorization in both directions, then enable routing
 through a separate deployment. Keep peer ingress when a host leaves placement.
 Legacy `HOST_ID=default` may send description-less heartbeats; do not bind or
