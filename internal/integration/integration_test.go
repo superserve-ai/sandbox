@@ -329,7 +329,7 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, _, pauseToken string) (
 	}
 	return "/snapshots/disk.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
-func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ string, _ map[int32]vmdclient.PortPolicy, _ int64) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
+func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ string) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
 	s.resumeCalls.Add(1)
 	if s.resumeFn != nil {
 		s.resumeFn()
@@ -2005,9 +2005,8 @@ func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
 func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) {
 	ctx := context.Background()
 	teamID, ownerKey := seedTeamAndKey(t)
-	r := newRouterWithNow(t, func() time.Time {
-		return time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
-	})
+	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	r := newRouterWithNow(t, func() time.Time { return now })
 
 	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
 	reportingStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
@@ -2037,19 +2036,25 @@ func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) 
 	if !ok {
 		t.Fatalf("billing_period not an object: %v", body["billing_period"])
 	}
+	// The summary reports the anniversary period containing the router's
+	// clock, which rolls forward a month at a time from the anchor.
+	wantStart, wantEnd, anchored := billing.AnniversaryPeriod(anchor, now)
+	if !anchored {
+		t.Fatalf("anchor %s is not yet in effect", anchor)
+	}
 	gotStart, err := time.Parse(time.RFC3339, period["start"].(string))
 	if err != nil {
 		t.Fatalf("parse billing period start: %v", err)
 	}
-	if !gotStart.Equal(anchor) {
-		t.Fatalf("billing summary period start = %s, want %s", gotStart, anchor)
+	if !gotStart.Equal(wantStart) {
+		t.Fatalf("billing summary period start = %s, want %s", gotStart, wantStart)
 	}
 	gotEnd, err := time.Parse(time.RFC3339, period["end"].(string))
 	if err != nil {
 		t.Fatalf("parse billing period end: %v", err)
 	}
-	if !gotEnd.Equal(anchor.AddDate(0, 1, 0)) {
-		t.Fatalf("billing summary period end = %s, want %s", gotEnd, anchor.AddDate(0, 1, 0))
+	if !gotEnd.Equal(wantEnd) {
+		t.Fatalf("billing summary period end = %s, want %s", gotEnd, wantEnd)
 	}
 }
 

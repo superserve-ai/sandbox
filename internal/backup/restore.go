@@ -159,6 +159,12 @@ type ProgressFunc func(format string, args ...any)
 // directory as restored. Artifact entries named manifest.json are
 // rejected up front so the marker can never collide.
 func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, progress ProgressFunc) (*GenerationManifest, error) {
+	return restoreGeneration(ctx, r, sandboxID, generation, destDir, nil, progress)
+}
+
+// restoreGeneration is RestoreGeneration with entries skip reports as
+// already satisfied outside destDir, such as a shared base the host holds.
+func restoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, skip func(ManifestFile) bool, progress ProgressFunc) (*GenerationManifest, error) {
 	report := func(format string, args ...any) {
 		if progress != nil {
 			progress(format, args...)
@@ -205,6 +211,10 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 		if err := validSegment(mf.Name); err != nil {
 			return fail(fmt.Errorf("manifest file name: %w", err))
 		}
+		if skip != nil && skip(mf) {
+			report("skipping %s: satisfied on the host", mf.Name)
+			continue
+		}
 		report("restoring %s (%d bytes packed, %d apparent)", mf.Name, mf.PackedSize, mf.Size)
 		madeFile, publish, err := restoreFile(ctx, r, sandboxID, generation, mf, root)
 		if madeFile {
@@ -221,6 +231,9 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 	// verification cannot leave earlier files implicitly blessed: either
 	// the whole set passes or the whole set is gone.
 	for _, mf := range manifest.Files {
+		if skip != nil && skip(mf) {
+			continue
+		}
 		err := verifyFile(ctx, root, mf)
 		if publish := publishers[mf.Name]; publish != nil {
 			// This verification is the one that blesses the copy the

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"golang.org/x/time/rate"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,6 +39,92 @@ func (m *Manager) SetPauseStagingRoot(dir string) {
 // as covered while nothing reached BoltDB.
 func (m *Manager) SetBackupEnqueue(fn func(backup.Task) error) {
 	m.backupEnqueue = fn
+}
+
+// BackupRestoreOptions bound what a wave of backup-backed resumes may take
+// from the host.
+type BackupRestoreOptions struct {
+	Concurrency  int           // fetches in flight at once
+	Limiter      *rate.Limiter // download bytes per second, shared by all fetches
+	CacheBytes   int64         // unpacked template bases kept between restores
+	FetchBudget  time.Duration // a fetch outlives the RPC that started it up to this
+	AbandonAfter time.Duration // a finished fetch nobody claims is dropped after this
+	MaxUnclaimed int           // finished fetches kept for a retry at once; the oldest go first
+	MaxFlights   int           // fetches queued or running at once; beyond it resumes are refused
+}
+
+// SetBackupRestore enables reviving a paused sandbox from its bucket backup
+// when the pause artifacts are gone from the host; root is the staging tree.
+func (m *Manager) SetBackupRestore(reader backup.BlobReader, lister backup.BlobLister, root string, opts BackupRestoreOptions) {
+	if opts.Concurrency <= 0 {
+		opts.Concurrency = 2
+	}
+	if opts.FetchBudget <= 0 {
+		opts.FetchBudget = 15 * time.Minute
+	}
+	if opts.AbandonAfter <= 0 {
+		opts.AbandonAfter = 5 * time.Minute
+	}
+	if opts.MaxUnclaimed <= 0 {
+		opts.MaxUnclaimed = 2 * opts.Concurrency
+	}
+	if opts.MaxFlights <= 0 {
+		opts.MaxFlights = 4 * opts.Concurrency
+	}
+	m.backupReader, m.backupLister, m.backupRestoreRoot, m.backupRestore = reader, lister, root, opts
+	if opts.Limiter != nil {
+		reader = &backup.LimitedReader{Inner: reader, Limiter: opts.Limiter}
+	}
+	// One cache for every restore on the host: its coordination of shared
+	// bases only holds when all fetches go through the same reader.
+	m.backupBaseReader = &backup.CachingBaseReader{Inner: reader, Dir: m.backupBaseDir()}
+	m.backupFetchSem = make(chan struct{}, opts.Concurrency)
+	m.backupFlights = map[string]*backupFlight{}
+	m.sweepRestoreStaging()
+	m.backupRestoreOn.Store(true)
+}
+
+// BackupRestoreEnabled reports whether a resume may fall back to the bucket.
+func (m *Manager) BackupRestoreEnabled() bool { return m.backupRestoreOn.Load() }
+
+// DisableBackupRestore withdraws the fallback, for a host that turns out
+// unable to read the bucket.
+func (m *Manager) DisableBackupRestore() { m.backupRestoreOn.Store(false) }
+
+// sweepRestoreStaging moves staging a previous process left behind out of
+// the way in one rename: no fetch survives a restart, and a completed one
+// is cheap to redo. Deleting it is the maintenance pass's job, after
+// readiness. Only the staging subtree this daemon owns is touched.
+func (m *Manager) sweepRestoreStaging() {
+	staging := m.restoreStagingRoot()
+	if _, err := os.Stat(staging); err != nil {
+		return
+	}
+	aside := staging + ".old-" + time.Now().UTC().Format("20060102T150405.000")
+	if err := os.Rename(staging, aside); err != nil {
+		m.log.Warn().Err(err).Msg("backup restore staging could not be set aside")
+	}
+}
+
+// BackupRestoreMaintenance removes staging set aside at startup and the
+// temporaries an interrupted fetch left in the base cache. Run it after
+// readiness: it walks whatever residue a crash left.
+func (m *Manager) BackupRestoreMaintenance() {
+	if m.backupRestoreRoot == "" {
+		return
+	}
+	if entries, err := os.ReadDir(m.backupRestoreRoot); err == nil {
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "staging.old-") {
+				_ = os.RemoveAll(filepath.Join(m.backupRestoreRoot, e.Name()))
+			}
+		}
+	}
+	m.backupCacheMu.Lock()
+	defer m.backupCacheMu.Unlock()
+	if _, err := backup.SweepCacheTemporaries(m.backupBaseDir()); err != nil {
+		m.log.Warn().Err(err).Msg("backup base cache temporaries")
+	}
 }
 
 // SetBackupMetrics installs the optional backup metrics recorder. Same

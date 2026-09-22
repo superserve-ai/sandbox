@@ -123,7 +123,29 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		}
 	}
 
-	inst, rulesApplied, err := a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
+	var inst *VMInstance
+	var rulesApplied bool
+	// A VM this host already booted from a backup is recognized from its
+	// record alone; only starting a new fetch depends on the switch.
+	revived, needsGeneration := a.mgr.backupRevivedTarget(req.GetVmId(), req.GetBackupGeneration())
+	switch {
+	case needsGeneration:
+		return nil, pauseArtifactsMissingErr(req.GetVmId())
+	case revived != nil:
+		// Rules live in this process; after a restart the adopted VM has
+		// none until they are applied again.
+		inst, rulesApplied = revived, a.mgr.applyAdoptedNetworkRules(req.GetVmId(), resumeNetworkRules)
+	case !a.mgr.BackupRestoreEnabled():
+		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
+	case a.mgr.pauseArtifactsMissing(req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath()):
+		if req.GetBackupGeneration() == "" {
+			return nil, pauseArtifactsMissingErr(req.GetVmId())
+		}
+		inst, err = a.mgr.resumeFromBackupLocked(ctx, req.GetVmId(), req.GetBackupGeneration(), resumeNetworkRules)
+		rulesApplied = resumeNetworkRules != nil
+	default:
+		inst, rulesApplied, err = a.mgr.resumeVMLocked(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), resumeNetworkRules)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -150,6 +172,9 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 		return nil, status.Errorf(codes.Internal, "env vars injection failed: %v", err)
 	}
 
+	inst.mu.RLock()
+	coldBoot := inst.BackupGeneration != ""
+	inst.mu.RUnlock()
 	resp := &vmdpb.ResumeVMResponse{
 		VmId:       inst.ID,
 		SocketPath: inst.SocketPath,
@@ -160,6 +185,7 @@ func (a *GRPCAdapter) ResumeVM(ctx context.Context, req *vmdpb.ResumeVMRequest) 
 			MemoryMib: inst.Config.MemoryMiB,
 		},
 		NetworkRulesApplied: rulesApplied,
+		ColdBoot:            coldBoot,
 	}
 	if previewAccess != "" {
 		// Attests the request's policy fields were applied, and which

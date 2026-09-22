@@ -390,6 +390,10 @@ message ResumeVMRequest {
   string preview_access = 7;
   repeated PreviewPort preview_ports = 8;
   int64 preview_policy_revision = 9;
+  // The backup generation the control plane recorded as covering the pause
+  // being resumed. When the pause artifacts are gone from the host, only
+  // that generation may stand in for them.
+  string backup_generation = 10;
 }
 
 message ResumeVMResponse {
@@ -406,6 +410,10 @@ message ResumeVMResponse {
   // including one adopted from an earlier attempt. False means the caller
   // must push them itself.
   bool network_rules_applied = 7;
+  // The guest booted cold from a backup of its disk rather than waking
+  // from its memory image: everything injected at create, secrets
+  // included, is gone from it and must be applied again.
+  bool cold_boot = 9;
   // The policy revision the record holds after the stamp: the request's
   // when it was applied, higher when the record already held a newer
   // policy and kept it. Set only with preview_protocol.

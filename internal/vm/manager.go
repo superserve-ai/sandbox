@@ -102,22 +102,23 @@ type VMInstance struct {
 	// MainPID resolver can still be in flight — writing a stopped unit's PID
 	// into the new attempt's record. Bumped under mu at each attempt start;
 	// a resolver whose captured generation no longer matches drops its write.
-	launchGen      uint64
-	SocketPath     string
-	VsockPath      string
-	IP             string
-	TAPDevice      string
-	MACAddress     string
-	Status         VMStatus
-	Unverified     bool   // Running persisted before boxd readiness (see VMRecord)
-	RevivalPending bool   // revival attempt in flight (see VMRecord)
-	RevivedDisk    string // resolved salvage path of a completed revival (see VMRecord)
-	Config         VMConfig
-	RunDirID       string // Directory name under RunDir for this VM's files.
-	Namespace      string // Network namespace name.
-	DiskPath       string
-	SnapshotPath   string
-	MemFilePath    string
+	launchGen        uint64
+	SocketPath       string
+	VsockPath        string
+	IP               string
+	TAPDevice        string
+	MACAddress       string
+	Status           VMStatus
+	Unverified       bool   // Running persisted before boxd readiness (see VMRecord)
+	RevivalPending   bool   // revival attempt in flight (see VMRecord)
+	RevivedDisk      string // resolved salvage path of a completed revival (see VMRecord)
+	BackupGeneration string // backup a backup-backed resume booted from (see VMRecord)
+	Config           VMConfig
+	RunDirID         string // Directory name under RunDir for this VM's files.
+	Namespace        string // Network namespace name.
+	DiskPath         string
+	SnapshotPath     string
+	MemFilePath      string
 	// CorrectsWallClock records whether this guest fixes its own wall clock on
 	// wake, resolved once when it was restored. Cached so pause never has to go
 	// to the filesystem to find out. Nil means unresolved — a record written by a
@@ -442,6 +443,18 @@ type Manager struct {
 	// backupEnqueue hands finalized pause manifests to the durability
 	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
 	backupEnqueue func(backup.Task) error
+	// backupReader and backupLister bring a lost pause back from the bucket
+	// so a resume can revive the sandbox from its disk.
+	backupRestoreOn   atomic.Bool
+	backupReader      backup.BlobReader
+	backupLister      backup.BlobLister
+	backupRestoreRoot string
+	backupRestore     BackupRestoreOptions
+	backupBaseReader  backup.BlobReader
+	backupFetchSem    chan struct{}
+	backupFlightsMu   sync.Mutex
+	backupFlights     map[string]*backupFlight
+	backupCacheMu     sync.RWMutex
 	// backupStaging is the uploader-visible staging tree: where a
 	// finished generation ends up for the uploader to hash and stream
 	// from, and where the at-rest/backfill worker path (StageTask)
@@ -1518,6 +1531,11 @@ func (m *Manager) DestroyVM(ctx context.Context, vmID string, force bool) (err e
 		rundirKey = inst.RunDirID
 	}
 	m.cleanupRunDir(rundirKey)
+	// Revival tears the zombie down through here on its way to booting
+	// from the staged disk; only a real destroy drops that staging.
+	if ctx.Value(reviveTeardownCtxKey{}) == nil {
+		m.cleanupRestoreStaging(vmID)
+	}
 	m.removeVM(vmID)
 
 	log.Info().Msg("VM destroyed")

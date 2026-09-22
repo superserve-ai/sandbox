@@ -13,6 +13,28 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const coveredBackupGeneration = `-- name: CoveredBackupGeneration :one
+SELECT COALESCE(bg.generation, '')::text AS generation
+FROM sandbox sb
+JOIN snapshot s ON s.id = sb.snapshot_id
+LEFT JOIN LATERAL (
+  SELECT generation FROM backup_generation
+  WHERE covered_snapshot_id = s.id AND covered_snapshot_generation = s.generation
+  ORDER BY completed_at DESC LIMIT 1
+) bg ON true
+WHERE sb.id = $1
+`
+
+// The backup generation recorded as covering the sandbox's current pause,
+// exactly: the snapshot row and its generation counter, since the row is
+// reused across pauses. Empty when the pause has no completed backup.
+func (q *Queries) CoveredBackupGeneration(ctx context.Context, id uuid.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, coveredBackupGeneration, id)
+	var generation string
+	err := row.Scan(&generation)
+	return generation, err
+}
+
 const latestSandboxBackup = `-- name: LatestSandboxBackup :one
 SELECT generation, bucket, LEAST(completed_at, reported_at)::timestamptz AS completed_at
 FROM (

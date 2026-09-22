@@ -5,6 +5,8 @@ package vmdclient
 
 import (
 	"context"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc/status"
 )
 
 // ResourceLimits is a sandbox's declared allocation, passed to restore so
@@ -30,6 +32,9 @@ type ResumeAttestation struct {
 	// newer policy and kept it.
 	PreviewPolicyRevision int64
 	NetworkRulesApplied   bool
+	// ColdBoot reports a guest booted from a backup of its disk: nothing
+	// injected at create survived, and the caller must apply it again.
+	ColdBoot bool
 }
 
 type PortPolicy struct {
@@ -68,7 +73,7 @@ type Client interface {
 	// ResumeInstance restores a paused VM. The preview policy rides along so
 	// the daemon stamps it before the guest runs; the attestation reports
 	// what the daemon applied, with empty fields for a daemon from before it.
-	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64) (ipAddress string, actualVcpu, actualMemMiB uint32, attested ResumeAttestation, err error)
+	ResumeInstance(ctx context.Context, instanceID, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, backupGeneration string) (ipAddress string, actualVcpu, actualMemMiB uint32, attested ResumeAttestation, err error)
 	// RestoreSnapshot is the stateless restore path used as a fallback when
 	// ResumeInstance fails with NotFound (e.g. after a VMD crash lost the
 	// in-memory map but the snapshot files are still on disk). basePath +
@@ -232,4 +237,23 @@ type BuildStatusResult struct {
 	ErrorMessage            string // populated on failed/cancelled
 	StartedAtUnix           int64
 	EndedAtUnix             int64
+}
+
+// PauseArtifactsMissingReason marks a resume the host refused because the
+// pause artifacts are gone from it; the caller may retry naming the backup
+// generation recorded as covering the pause.
+const PauseArtifactsMissingReason = "PAUSE_ARTIFACTS_MISSING"
+
+// IsPauseArtifactsMissing reports whether err carries that mark.
+func IsPauseArtifactsMissing(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	for _, d := range st.Details() {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == PauseArtifactsMissingReason {
+			return true
+		}
+	}
+	return false
 }

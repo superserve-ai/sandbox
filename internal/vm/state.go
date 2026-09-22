@@ -173,6 +173,9 @@ type VMRecord struct {
 	// request (a lost RPC response, a failed post-commit injection)
 	// recognize the live VM as its own completed work.
 	RevivedDisk string `json:"revived_disk,omitempty"`
+	// BackupGeneration names the backup a backup-backed resume booted from,
+	// so a retry of that resume recognizes the live VM as its own.
+	BackupGeneration string `json:"backup_generation,omitempty"`
 	// TeardownPending mirrors VMInstance.TeardownPending: a non-empty value
 	// is an explicit, durable claim that this record's resources were
 	// deliberately retained after a failed op and the reconciler owns the
@@ -925,6 +928,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		Unverified:                 inst.Unverified,
 		RevivalPending:             inst.RevivalPending,
 		RevivedDisk:                inst.RevivedDisk,
+		BackupGeneration:           inst.BackupGeneration,
 		TeardownPending:            inst.TeardownPending,
 		RunDirID:                   inst.RunDirID,
 		Namespace:                  inst.Namespace,
@@ -1028,6 +1032,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		Unverified:             rec.Unverified,
 		RevivalPending:         rec.RevivalPending,
 		RevivedDisk:            rec.RevivedDisk,
+		BackupGeneration:       rec.BackupGeneration,
 		TeardownPending:        rec.TeardownPending,
 		RunDirID:               rec.RunDirID,
 		Namespace:              rec.Namespace,
