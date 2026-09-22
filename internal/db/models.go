@@ -772,6 +772,8 @@ type Sandbox struct {
 	PauseOpTrigger *string `json:"pause_op_trigger"`
 	// Who asked for the pause in flight; NULL for automatic pauses. Kept so a reconciled pause is attributed to them.
 	PauseOpActorID pgtype.UUID `json:"pause_op_actor_id"`
+	// Snapshot this sandbox was created from; NULL when created from a template.
+	SourceSnapshotID pgtype.UUID `json:"source_snapshot_id"`
 }
 
 type SandboxActiveInterval struct {
@@ -841,6 +843,35 @@ type SandboxSecret struct {
 	SecretID   uuid.UUID `json:"secret_id"`
 	EnvKey     string    `json:"env_key"`
 	ProxyToken *string   `json:"proxy_token"`
+}
+
+type SandboxSnapshot struct {
+	ID     uuid.UUID `json:"id"`
+	TeamID uuid.UUID `json:"team_id"`
+	// Sandbox the snapshot was captured from. Kept after that sandbox is destroyed.
+	SandboxID      uuid.UUID   `json:"sandbox_id"`
+	TemplateID     pgtype.UUID `json:"template_id"`
+	Kind           string      `json:"kind"`
+	Status         string      `json:"status"`
+	Name           *string     `json:"name"`
+	IdempotencyKey *string     `json:"idempotency_key"`
+	// Host holding the artifacts. v1 forks run on this host.
+	HostID    string `json:"host_id"`
+	VcpuCount int32  `json:"vcpu_count"`
+	MemoryMib int32  `json:"memory_mib"`
+	DiskMib   int32  `json:"disk_mib"`
+	// Template base image the overlay sits on. Pins the template build while the snapshot exists.
+	BasePath string `json:"base_path"`
+	// Template memory image the memory diff layers on; NULL for a full image or an fs snapshot.
+	BaseMemPath  *string `json:"base_mem_path"`
+	SnapshotPath *string `json:"snapshot_path"`
+	MemPath      *string `json:"mem_path"`
+	OverlayPath  *string `json:"overlay_path"`
+	// Bytes the snapshot uniquely holds on disk, for metering; 0 until ready.
+	SizeBytes int64              `json:"size_bytes"`
+	CreatedAt time.Time          `json:"created_at"`
+	ReadyAt   pgtype.Timestamptz `json:"ready_at"`
+	DeletedAt pgtype.Timestamptz `json:"deleted_at"`
 }
 
 type SandboxStorageInterval struct {
@@ -929,11 +960,13 @@ type Team struct {
 	MaxTemplates         *int32    `json:"max_templates"`
 	MaxSandboxes         int32     `json:"max_sandboxes"`
 	// Frozen at the sharded-counter migration; read team_active_sandbox_counts instead.
-	ActiveSandboxCount    int32  `json:"active_sandbox_count"`
-	CredentialStoreKind   string `json:"credential_store_kind"`
-	CredentialStoreConfig []byte `json:"credential_store_config"`
-	UnmatchedHostPolicy   string `json:"unmatched_host_policy"`
-	HomeRegion            string `json:"home_region"`
+	ActiveSandboxCount     int32  `json:"active_sandbox_count"`
+	CredentialStoreKind    string `json:"credential_store_kind"`
+	CredentialStoreConfig  []byte `json:"credential_store_config"`
+	UnmatchedHostPolicy    string `json:"unmatched_host_policy"`
+	HomeRegion             string `json:"home_region"`
+	MaxSnapshots           int32  `json:"max_snapshots"`
+	MaxSnapshotsPerSandbox int32  `json:"max_snapshots_per_sandbox"`
 }
 
 type TeamActiveSandboxCount struct {
