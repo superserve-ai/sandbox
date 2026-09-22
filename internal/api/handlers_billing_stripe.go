@@ -2027,10 +2027,13 @@ func shouldIgnoreUnassociatedStripeSubscriptionCreated(account db.TeamBillingAcc
 	if strings.TrimSpace(derefString(account.StripeSubscriptionID)) != "" || account.CheckoutSessionID != nil {
 		return false, true
 	}
-	// Without a current subscription or checkout association, the signed
-	// customer mapping alone does not prove that this subscription belongs to
-	// the team. A later authoritative checkout/current-subscription path may
-	// establish the association, but this event must not bind it implicitly.
+	// A customer-mapped team with no current subscription or checkout
+	// reservation may be receiving its first subscription outside Checkout
+	// (for example, after a sales-assisted billing handoff). The signed
+	// customer-to-team mapping is the authority for that initial import.
+	if strings.TrimSpace(derefString(account.StripeCustomerID)) != "" {
+		return false, false
+	}
 	return false, true
 }
 

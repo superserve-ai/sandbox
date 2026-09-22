@@ -136,9 +136,14 @@ func TestStripeSubscriptionCreatedAssociationGuard(t *testing.T) {
 		t.Fatalf("subscription during checkout should be deferred: defer=%v ignore=%v", deferProcessing, ignore)
 	}
 
+	account = db.TeamBillingAccount{StripeCustomerID: stringPtr("cus_first")}
+	if deferProcessing, ignore := shouldIgnoreUnassociatedStripeSubscriptionCreated(account, "sub_first"); deferProcessing || ignore {
+		t.Fatalf("first subscription for a mapped customer should be imported: defer=%v ignore=%v", deferProcessing, ignore)
+	}
+
 	account = db.TeamBillingAccount{}
 	if deferProcessing, ignore := shouldIgnoreUnassociatedStripeSubscriptionCreated(account, "sub_first"); deferProcessing || !ignore {
-		t.Fatalf("unassociated first subscription must be ignored: defer=%v ignore=%v", deferProcessing, ignore)
+		t.Fatalf("subscription without a mapped customer must be ignored: defer=%v ignore=%v", deferProcessing, ignore)
 	}
 }
 
