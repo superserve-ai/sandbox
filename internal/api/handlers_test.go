@@ -57,6 +57,9 @@ type stubVMD struct {
 	// nil echoes the current capability. Point at "" to model a vmd from
 	// before the echo existed.
 	restorePreviewProtocol *string
+	// lastResumeGeneration captures the generation ResumeInstance was last
+	// called with, so tests can assert whether a fetch generation was named.
+	lastResumeGeneration string
 }
 
 type stubScheduler struct {
@@ -108,7 +111,8 @@ func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir, pauseToken
 	}
 	return "/snapshots/vmstate.snap", "/snapshots/mem.snap", nil, pauseToken, nil
 }
-func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
+func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, generation string) (string, uint32, uint32, vmdclient.ResumeAttestation, error) {
+	s.lastResumeGeneration = generation
 	if s.resumePolicyFn != nil {
 		s.resumePolicyFn(previewAccess, previewPorts, previewPolicyRevision)
 	}
@@ -1187,6 +1191,15 @@ func snapshotRow(s db.Snapshot) *mockRow {
 // claimResumeRow mocks ClaimResume's RETURNING; a nil snap models a
 // missing snapshot row.
 func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, ports ...publishedPortResponse) *mockRow {
+	return claimResumeRowWithGeneration(sb, snap, access, revision, "", ports...)
+}
+
+// claimResumeRowWithGeneration is claimResumeRow plus the covered-generation
+// column, for the one test that asserts it flows into VMD.ResumeInstance —
+// every other caller has nothing to verify from it, hence the default "" on
+// the plain helper above (also production's own value when no report has
+// verified coverage of this pause).
+func claimResumeRowWithGeneration(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, coveredGeneration string, ports ...publishedPortResponse) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
 		if err := sandboxRow(sb).scanFn(dest[:37]...); err != nil {
 			return err
@@ -1221,6 +1234,7 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 		*dest[44].(*[]string) = accesses
 		*dest[45].(*[]int64) = versions
 		*dest[46].(**string) = nil
+		*dest[47].(*string) = coveredGeneration
 		return nil
 	}}
 }
@@ -1358,6 +1372,63 @@ func testResumeSandboxLegacyPolicyToleratesOldVMD(t *testing.T, configure func(*
 	}
 	if body["id"] != sandboxID.String() {
 		t.Errorf("id = %q, want %q", body["id"], sandboxID)
+	}
+}
+
+// TestResumeSandbox_NamesLatestBackupGeneration verifies resumePausedSandbox
+// threads the sandbox's latest durable backup generation into
+// VMD.ResumeInstance, so a fetch-before-resume-enabled host knows exactly
+// what to restore if its local disk is missing the snapshot.
+func TestResumeSandbox_NamesLatestBackupGeneration(t *testing.T) {
+	sandboxID := uuid.New()
+	teamID := uuid.New()
+	snapshotID := uuid.New()
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	snap := db.Snapshot{
+		ID: snapshotID, SandboxID: sandboxID, TeamID: teamID,
+		Path: "/snapshots/test/vmstate.snap", SizeBytes: 1024, Trigger: "pause",
+	}
+
+	vmd := &stubVMD{}
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandbox :one"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "-- name: GetSandboxPreviewPolicy :one"):
+				return previewPolicyRow(preview.AccessPublic, 8)
+			case (strings.Contains(sql, "-- name: HostHasCapabilities :one") || strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one")):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: ClaimResume :one"):
+				return claimResumeRowWithGeneration(sb, &snap, preview.AccessPublic, 8, "gen-xyz", publishedPortResponse{Port: 3000, Access: preview.AccessPublic})
+			default:
+				return activityRow()
+			}
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			switch {
+			case strings.Contains(sql, "-- name: ListPublishedPorts :many"):
+				return previewPortRows(8080), nil
+			case strings.Contains(sql, "-- name: ListSandboxSecretBindingMeta :many"):
+				return emptyRows{}, nil
+			default:
+				return nil, fmt.Errorf("unexpected Query: %s", sql)
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
+	}
+	if vmd.lastResumeGeneration != "gen-xyz" {
+		t.Errorf("ResumeInstance generation = %q, want %q", vmd.lastResumeGeneration, "gen-xyz")
 	}
 }
 

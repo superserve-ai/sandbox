@@ -45,7 +45,7 @@ func TestResumeVM_AdoptionAppliesRequestRules(t *testing.T) {
 	t.Run("no rules", func(t *testing.T) {
 		existing := runningForAdoption(t)
 		mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}}
-		inst, applied, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil)
+		inst, applied, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", nil, "")
 		if err != nil || inst != existing || !applied {
 			t.Fatalf("got inst=%v applied=%v err=%v, want the existing VM with nothing left to apply", inst == existing, applied, err)
 		}
@@ -54,7 +54,7 @@ func TestResumeVM_AdoptionAppliesRequestRules(t *testing.T) {
 		existing := runningForAdoption(t)
 		net := &slotNetMgr{info: &network.VMNetInfo{HostIP: "10.11.0.5"}}
 		mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}, netMgr: net}
-		_, applied, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", rules)
+		_, applied, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", rules, "")
 		if err != nil || !applied {
 			t.Fatalf("applied=%v err=%v, want the rules applied on adoption", applied, err)
 		}
@@ -66,7 +66,7 @@ func TestResumeVM_AdoptionAppliesRequestRules(t *testing.T) {
 		existing := runningForAdoption(t)
 		net := &fakeNetMgr{}
 		mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{"vm-1": existing}, netMgr: net}
-		inst, applied, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", rules)
+		inst, applied, err := mgr.resumeVMLocked(context.Background(), "vm-1", "", "", rules, "")
 		if err != nil || inst != existing {
 			t.Fatalf("adoption must still return the VM, got inst=%v err=%v", inst == existing, err)
 		}
