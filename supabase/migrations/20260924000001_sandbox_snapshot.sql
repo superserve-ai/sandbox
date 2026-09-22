@@ -7,13 +7,14 @@
 -- transaction, where CONCURRENTLY cannot run, and a plain build blocks sandbox
 -- writes for the table scan. Run before merging:
 --
+--   ALTER TABLE sandbox ADD COLUMN IF NOT EXISTS source_snapshot_id uuid;
 --   CREATE INDEX CONCURRENTLY IF NOT EXISTS sandbox_by_source_snapshot
 --     ON sandbox (source_snapshot_id) WHERE source_snapshot_id IS NOT NULL;
 --   SELECT indisvalid FROM pg_index
 --   WHERE indexrelid = 'sandbox_by_source_snapshot'::regclass;
 --
--- The column must exist first, so on a populated database apply the ALTER
--- TABLE sandbox statement below by hand ahead of the pre-build.
+-- The column is added bare so the pre-build needs nothing else; the foreign
+-- key to sandbox_snapshot is added below, once that table exists.
 
 BEGIN;
 
@@ -52,6 +53,10 @@ CREATE TABLE IF NOT EXISTS sandbox_snapshot (
     ready_at        timestamptz,
     deleted_at      timestamptz,
 
+    -- Deletion is the only way out: a deleted row was in deleting first.
+    CONSTRAINT sandbox_snapshot_deleted_was_deleting CHECK (
+        deleted_at IS NULL OR status = 'deleting'
+    ),
     -- A ready row names every artifact its kind needs.
     CONSTRAINT sandbox_snapshot_ready_has_artifacts CHECK (
         status <> 'ready'
@@ -90,7 +95,16 @@ CREATE INDEX IF NOT EXISTS sandbox_snapshot_by_team
     WHERE deleted_at IS NULL;
 
 ALTER TABLE sandbox
-    ADD COLUMN IF NOT EXISTS source_snapshot_id uuid REFERENCES sandbox_snapshot(id);
+    ADD COLUMN IF NOT EXISTS source_snapshot_id uuid;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sandbox_source_snapshot_fk') THEN
+    ALTER TABLE sandbox
+      ADD CONSTRAINT sandbox_source_snapshot_fk
+      FOREIGN KEY (source_snapshot_id) REFERENCES sandbox_snapshot(id);
+  END IF;
+END $$;
 
 COMMENT ON COLUMN sandbox.source_snapshot_id IS
   'Snapshot this sandbox was created from; NULL when created from a template.';
@@ -117,8 +131,8 @@ ALTER TABLE team
     ADD COLUMN IF NOT EXISTS max_snapshots_per_sandbox int NOT NULL DEFAULT 20;
 
 -- Count quota, serialized on the team row like sandbox_quota_on_insert.
--- Live rows are everything not deleted and not failed; a failed capture never
--- blocks a retry.
+-- Only creating and ready rows count: a failed capture never blocks a retry,
+-- and a row being deleted has already given its slot back.
 CREATE OR REPLACE FUNCTION sandbox_snapshot_quota_on_insert() RETURNS trigger
     LANGUAGE plpgsql
 AS $$
@@ -148,14 +162,14 @@ BEGIN
     END IF;
 
     SELECT count(*) INTO n FROM sandbox_snapshot
-    WHERE team_id = NEW.team_id AND deleted_at IS NULL AND status <> 'failed';
+    WHERE team_id = NEW.team_id AND status IN ('creating', 'ready');
     IF n >= team_limit THEN
         RAISE EXCEPTION 'snapshot quota exceeded for team (count=%, max=%)', n, team_limit
             USING ERRCODE = 'SS002';
     END IF;
 
     SELECT count(*) INTO n FROM sandbox_snapshot
-    WHERE sandbox_id = NEW.sandbox_id AND deleted_at IS NULL AND status <> 'failed';
+    WHERE sandbox_id = NEW.sandbox_id AND status IN ('creating', 'ready');
     IF n >= sandbox_limit THEN
         RAISE EXCEPTION 'snapshot quota exceeded for sandbox (count=%, max=%)', n, sandbox_limit
             USING ERRCODE = 'SS002';

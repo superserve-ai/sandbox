@@ -63,7 +63,10 @@ func TestSandboxSnapshotSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("after a failed row: %v", err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET deleted_at = now() WHERE id = $1`, third); err != nil {
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET deleted_at = now() WHERE id = $1`, third); pgCode(err) != "23514" {
+		t.Fatalf("deleted without deleting: want 23514, got %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'deleting', deleted_at = now() WHERE id = $1`, third); err != nil {
 		t.Fatal(err)
 	}
 
@@ -107,10 +110,19 @@ func TestSandboxSnapshotSchema(t *testing.T) {
 		t.Fatal("deleting is terminal; deleting to ready should be refused")
 	}
 	var live int
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_snapshot WHERE team_id = $1 AND deleted_at IS NULL AND status IN ('creating', 'ready')`, teamID).Scan(&live); err != nil {
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_snapshot WHERE team_id = $1 AND status IN ('creating', 'ready')`, teamID).Scan(&live); err != nil {
 		t.Fatal(err)
 	}
 	if live > 3 {
 		t.Fatalf("live snapshots exceed the team cap: %d", live)
+	}
+
+	// A row being deleted has given its slot back: with the team cap raised to
+	// four, the three live rows plus the one in deleting still admit an insert.
+	if _, err := testPool.Exec(ctx, `UPDATE team SET max_snapshots = 4 WHERE id = $1`, teamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insertSnapshotRow(ctx, teamID, a, nil); err != nil {
+		t.Fatalf("insert next to a deleting row: %v", err)
 	}
 }
