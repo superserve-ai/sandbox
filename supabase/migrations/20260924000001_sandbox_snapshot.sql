@@ -109,6 +109,11 @@ CREATE INDEX IF NOT EXISTS sandbox_snapshot_quota_sandbox
     ON sandbox_snapshot (sandbox_id)
     WHERE deleted_at IS NULL AND status IN ('creating', 'ready');
 
+-- Every sandbox destroy asks whether its build is still referenced.
+CREATE INDEX IF NOT EXISTS sandbox_snapshot_base_path
+    ON sandbox_snapshot (base_path)
+    WHERE deleted_at IS NULL AND status IN ('creating', 'ready');
+
 ALTER TABLE sandbox
     ADD COLUMN IF NOT EXISTS source_snapshot_id uuid;
 

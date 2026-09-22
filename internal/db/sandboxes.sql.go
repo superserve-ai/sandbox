@@ -888,12 +888,19 @@ func (q *Queries) CompleteTeardown(ctx context.Context, arg CompleteTeardownPara
 }
 
 const countActiveSandboxesAtBasePath = `-- name: CountActiveSandboxesAtBasePath :one
-SELECT COUNT(*)::bigint FROM sandbox
-WHERE base_path = $1 AND destroyed_at IS NULL
+SELECT (
+  (SELECT COUNT(*)::bigint FROM sandbox
+   WHERE sandbox.base_path = $1 AND sandbox.destroyed_at IS NULL)
+  + (SELECT COUNT(*)::bigint FROM sandbox_snapshot
+     WHERE sandbox_snapshot.base_path = $1
+       AND sandbox_snapshot.deleted_at IS NULL
+       AND sandbox_snapshot.status IN ('creating', 'ready'))
+)::bigint
 `
 
-// Count of non-destroyed sandboxes still referencing this base_path. Used at
-// destroy time to decide whether the per-build artifact dir is safe to GC.
+// Count of non-destroyed sandboxes and live snapshots still referencing this
+// base_path. Used at destroy time to decide whether the per-build artifact
+// dir is safe to GC.
 func (q *Queries) CountActiveSandboxesAtBasePath(ctx context.Context, basePath *string) (int64, error) {
 	row := q.db.QueryRow(ctx, countActiveSandboxesAtBasePath, basePath)
 	var column_1 int64
@@ -2478,12 +2485,16 @@ func (q *Queries) ListPendingPauses(ctx context.Context, arg ListPendingPausesPa
 }
 
 const listPinnedBuildPaths = `-- name: ListPinnedBuildPaths :many
-SELECT DISTINCT base_path FROM sandbox
-WHERE base_path IS NOT NULL AND destroyed_at IS NULL
+SELECT DISTINCT sandbox.base_path FROM sandbox
+WHERE sandbox.base_path IS NOT NULL AND sandbox.destroyed_at IS NULL
+UNION
+SELECT sandbox_snapshot.base_path FROM sandbox_snapshot
+WHERE sandbox_snapshot.deleted_at IS NULL AND sandbox_snapshot.status IN ('creating', 'ready')
 `
 
 // Reconciler input: distinct base_path values held by non-destroyed
-// sandboxes. Their builds must survive even if the template moved on.
+// sandboxes and live snapshots. Their builds must survive even if the
+// template moved on.
 func (q *Queries) ListPinnedBuildPaths(ctx context.Context) ([]*string, error) {
 	rows, err := q.db.Query(ctx, listPinnedBuildPaths)
 	if err != nil {

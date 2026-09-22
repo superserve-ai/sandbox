@@ -720,7 +720,7 @@ func (h *Handlers) DeleteTemplate(c *gin.Context) {
 		switch {
 		case res.LiveCount > 0:
 			respondErrorMsg(c, "conflict",
-				fmt.Sprintf("template has %d sandbox(es) (active, paused, or failed) still referencing it; destroy them first", res.LiveCount),
+				fmt.Sprintf("template has %d sandbox(es) or snapshot(s) still referencing it; delete them first", res.LiveCount),
 				http.StatusConflict)
 		case res.InflightBuildCount > 0:
 			respondErrorMsg(c, "conflict",

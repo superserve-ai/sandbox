@@ -1132,7 +1132,9 @@ WITH locked AS (
 counted AS (
   SELECT
     (SELECT COUNT(*)::bigint FROM sandbox
-     WHERE template_id = $1 AND destroyed_at IS NULL) AS live_count,
+     WHERE template_id = $1 AND destroyed_at IS NULL)
+    + (SELECT COUNT(*)::bigint FROM sandbox_snapshot
+       WHERE template_id = $1 AND deleted_at IS NULL AND status IN ('creating', 'ready')) AS live_count,
     (SELECT COUNT(*)::bigint FROM template_build
      WHERE template_id = $1
        AND status IN ('pending', 'building', 'snapshotting')) AS inflight_build_count
@@ -1159,13 +1161,13 @@ type SoftDeleteTemplateIfUnusedParams struct {
 
 type SoftDeleteTemplateIfUnusedRow struct {
 	Found              bool  `json:"found"`
-	LiveCount          int64 `json:"live_count"`
+	LiveCount          int32 `json:"live_count"`
 	InflightBuildCount int64 `json:"inflight_build_count"`
 	Deleted            bool  `json:"deleted"`
 }
 
-// Soft-deletes a template only if no live sandbox references it AND no
-// build is in flight. Blocking on builds prevents the vmd-side artifact
+// Soft-deletes a template only if no live sandbox or snapshot references it
+// AND no build is in flight. Blocking on builds prevents the vmd-side artifact
 // cleanup from racing with template-builder still writing to the same dirs.
 func (q *Queries) SoftDeleteTemplateIfUnused(ctx context.Context, arg SoftDeleteTemplateIfUnusedParams) (SoftDeleteTemplateIfUnusedRow, error) {
 	row := q.db.QueryRow(ctx, softDeleteTemplateIfUnused, arg.ID, arg.TeamID)

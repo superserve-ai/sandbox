@@ -6,9 +6,12 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 func pgCode(err error) string {
@@ -141,5 +144,48 @@ func TestSandboxSnapshotSchema(t *testing.T) {
 	}
 	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET source_snapshot_id = $1 WHERE id = $2`, keyed, a); err != nil {
 		t.Fatalf("fork pointing at own team's snapshot: %v", err)
+	}
+
+	// Live snapshots pin their template build and block template deletion,
+	// even with no sandbox left on it.
+	base := "/base.ext4"
+	refs, err := testQueries.CountActiveSandboxesAtBasePath(ctx, &base)
+	if err != nil || refs == 0 {
+		t.Fatalf("base path referenced by live snapshots: refs=%d err=%v", refs, err)
+	}
+	pinned, err := testQueries.ListPinnedBuildPaths(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, p := range pinned {
+		if p != nil && *p == base {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("snapshot base path missing from the pinned build paths")
+	}
+	tpl := insertTemplateAt(t, teamID, "snap-tpl", time.Now())
+	if _, err := testPool.Exec(ctx, `UPDATE team SET max_snapshots = 10, max_snapshots_per_sandbox = 10 WHERE id = $1`, teamID); err != nil {
+		t.Fatal(err)
+	}
+	var pinning uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO sandbox_snapshot (team_id, sandbox_id, template_id, kind, host_id, vcpu_count, memory_mib, disk_mib, base_path)
+		VALUES ($1, $2, $3, 'fs', 'default', 1, 1024, 4096, '/tpl-base.ext4')
+		RETURNING id`, teamID, b, tpl).Scan(&pinning); err != nil {
+		t.Fatal(err)
+	}
+	del, err := testQueries.SoftDeleteTemplateIfUnused(ctx, db.SoftDeleteTemplateIfUnusedParams{ID: tpl, TeamID: teamID})
+	if err != nil || !del.Found || del.Deleted || del.LiveCount != 1 {
+		t.Fatalf("template with a live snapshot: %+v err=%v", del, err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'deleting' WHERE id = $1`, pinning); err != nil {
+		t.Fatal(err)
+	}
+	del, err = testQueries.SoftDeleteTemplateIfUnused(ctx, db.SoftDeleteTemplateIfUnusedParams{ID: tpl, TeamID: teamID})
+	if err != nil || !del.Deleted {
+		t.Fatalf("template after its snapshot is deleting: %+v err=%v", del, err)
 	}
 }

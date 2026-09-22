@@ -99,16 +99,27 @@ SELECT * FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 
 -- name: CountActiveSandboxesAtBasePath :one
--- Count of non-destroyed sandboxes still referencing this base_path. Used at
--- destroy time to decide whether the per-build artifact dir is safe to GC.
-SELECT COUNT(*)::bigint FROM sandbox
-WHERE base_path = $1 AND destroyed_at IS NULL;
+-- Count of non-destroyed sandboxes and live snapshots still referencing this
+-- base_path. Used at destroy time to decide whether the per-build artifact
+-- dir is safe to GC.
+SELECT (
+  (SELECT COUNT(*)::bigint FROM sandbox
+   WHERE sandbox.base_path = $1 AND sandbox.destroyed_at IS NULL)
+  + (SELECT COUNT(*)::bigint FROM sandbox_snapshot
+     WHERE sandbox_snapshot.base_path = $1
+       AND sandbox_snapshot.deleted_at IS NULL
+       AND sandbox_snapshot.status IN ('creating', 'ready'))
+)::bigint;
 
 -- name: ListPinnedBuildPaths :many
 -- Reconciler input: distinct base_path values held by non-destroyed
--- sandboxes. Their builds must survive even if the template moved on.
-SELECT DISTINCT base_path FROM sandbox
-WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
+-- sandboxes and live snapshots. Their builds must survive even if the
+-- template moved on.
+SELECT DISTINCT sandbox.base_path FROM sandbox
+WHERE sandbox.base_path IS NOT NULL AND sandbox.destroyed_at IS NULL
+UNION
+SELECT sandbox_snapshot.base_path FROM sandbox_snapshot
+WHERE sandbox_snapshot.deleted_at IS NULL AND sandbox_snapshot.status IN ('creating', 'ready');
 
 -- Static created_at variants of ListSandboxesByTeamPaged. The plain ORDER BY
 -- lets the planner walk idx_sandbox_team_created_active (forward for DESC,
