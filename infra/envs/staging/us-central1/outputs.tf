@@ -3,6 +3,11 @@ output "api_contract" {
   value       = module.api.contract
 }
 
+output "controlplane_identity_contract" {
+  description = "Per-cell Cloud Run identity, backup read boundary, secret dependencies, and migration ownership."
+  value       = local.controlplane_identity_contract
+}
+
 output "network_contract" {
   description = "Rendered staging network contract."
   value       = module.network.contract

@@ -224,7 +224,9 @@ module "api" {
   depends_on = [
     google_secret_manager_secret_iam_member.controlplane_runtime_secrets,
     google_kms_crypto_key_iam_member.controlplane_credentials,
+    google_project_iam_member.controlplane_metric_writer,
     google_service_account_iam_member.controlplane_deploy_act_as,
+    module.backup_storage,
   ]
 }
 
@@ -502,9 +504,8 @@ module "observability" {
 }
 
 # Durability tier for the host's local-SSD artifacts (sandbox snapshots,
-# template builds). The vmd host runs as the shared api-runner SA, so that SA
-# is the writer: create+read on this bucket, never delete — deletes belong to
-# the module's dedicated GC identity, which nothing on the host runs as.
+# template builds). The VMD host uses its dedicated identity below; the
+# control-plane reader is separate and never receives write/delete access.
 module "backup_storage" {
   source = "../../../modules/backup-storage"
 
@@ -518,6 +519,10 @@ module "backup_storage" {
   restore_service_account_id = "superserve-backup-ro-${local.resource_suffix}"
 
   writer_members = []
+
+  reader_members = [
+    "serviceAccount:${google_service_account.controlplane_runtime.email}",
+  ]
 
   labels = merge(local.common_labels, {
     component                  = "backup"
