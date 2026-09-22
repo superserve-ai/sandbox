@@ -108,7 +108,8 @@ const listPendingStripeSubscriptionEventsSQL = `
 SELECT event_id, event_type, payload, received_at, processed_at, last_error, updated_at
 FROM stripe_webhook_event
 WHERE processed_at IS NULL
-  AND event_type = 'customer.subscription.created'
+  AND event_type IN ('customer.subscription.created', 'customer.subscription.updated',
+                     'customer.subscription.deleted', 'customer.subscription.paused', 'customer.subscription.resumed')
   AND payload->'data'->'object'->>'customer' = $1
   AND payload->'data'->'object'->>'id' = $2
 ORDER BY received_at, event_id
