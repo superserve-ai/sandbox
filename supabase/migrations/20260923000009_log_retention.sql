@@ -8,7 +8,7 @@
 
 BEGIN;
 
-CREATE OR REPLACE FUNCTION log_partitions_maintain(parent regclass, keep_days int, ahead_days int DEFAULT 7)
+CREATE OR REPLACE FUNCTION log_partitions_maintain(parent text, keep_days int, ahead_days int DEFAULT 7)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
   today date := (now() AT TIME ZONE 'UTC')::date;
@@ -16,18 +16,23 @@ DECLARE
   child text;
 BEGIN
   -- Replicas run this concurrently; one at a time per table.
-  PERFORM pg_advisory_xact_lock(hashtext('log_partitions_maintain'), parent::oid::int);
+  PERFORM pg_advisory_xact_lock(hashtext('log_partitions_maintain'), hashtext(parent));
+  -- Only a new or expired day is DDL, and DDL waits on readers: give up
+  -- well inside the log writers' deadline and let the next pass retry.
+  SET LOCAL lock_timeout = '2s';
   FOR i IN 1 - keep_days..ahead_days LOOP
     d := today + i;
-    child := format('%s_%s', parent::text, to_char(d, 'YYYYMMDD'));
-    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF %s FOR VALUES FROM (%L) TO (%L)',
-                   child, parent, d::timestamp AT TIME ZONE 'UTC', (d + 1)::timestamp AT TIME ZONE 'UTC');
-    EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', child);
+    child := format('%s_%s', parent, to_char(d, 'YYYYMMDD'));
+    IF to_regclass(child) IS NULL THEN
+      EXECUTE format('CREATE TABLE %I PARTITION OF %I FOR VALUES FROM (%L) TO (%L)',
+                     child, parent, d::timestamp AT TIME ZONE 'UTC', (d + 1)::timestamp AT TIME ZONE 'UTC');
+      EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', child);
+    END IF;
   END LOOP;
   FOR child IN
     SELECT c.relname
     FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
-    WHERE i.inhparent = parent
+    WHERE i.inhparent = parent::regclass
       AND c.relname ~ '_\d{8}$'
       AND to_date(right(c.relname, 8), 'YYYYMMDD') <= today - keep_days
   LOOP

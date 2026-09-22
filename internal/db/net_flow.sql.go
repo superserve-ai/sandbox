@@ -131,13 +131,18 @@ func (q *Queries) ListNetFlowEvents(ctx context.Context, arg ListNetFlowEventsPa
 }
 
 const maintainLogPartitions = `-- name: MaintainLogPartitions :exec
-SELECT log_partitions_maintain('net_flow', 7), log_partitions_maintain('proxy_audit', 7)
+SELECT log_partitions_maintain($1::text, $2::int)
 `
 
-// Creates the day partitions inside each log's retention window and ahead
-// of it, and drops the days past it. Idempotent; the control plane runs it
-// hourly.
-func (q *Queries) MaintainLogPartitions(ctx context.Context) error {
-	_, err := q.db.Exec(ctx, maintainLogPartitions)
+type MaintainLogPartitionsParams struct {
+	Parent   string `json:"parent"`
+	KeepDays int32  `json:"keep_days"`
+}
+
+// Creates the day partitions inside one log table's retention window and
+// ahead of it, and drops the days past it. Idempotent; the control plane
+// runs it hourly, one table per call so no table waits on another's locks.
+func (q *Queries) MaintainLogPartitions(ctx context.Context, arg MaintainLogPartitionsParams) error {
+	_, err := q.db.Exec(ctx, maintainLogPartitions, arg.Parent, arg.KeepDays)
 	return err
 }

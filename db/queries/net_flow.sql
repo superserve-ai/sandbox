@@ -23,7 +23,7 @@ ORDER BY ts DESC, id DESC
 LIMIT sqlc.arg('row_limit');
 
 -- name: MaintainLogPartitions :exec
--- Creates the day partitions inside each log's retention window and ahead
--- of it, and drops the days past it. Idempotent; the control plane runs it
--- hourly.
-SELECT log_partitions_maintain('net_flow', 7), log_partitions_maintain('proxy_audit', 7);
+-- Creates the day partitions inside one log table's retention window and
+-- ahead of it, and drops the days past it. Idempotent; the control plane
+-- runs it hourly, one table per call so no table waits on another's locks.
+SELECT log_partitions_maintain(sqlc.arg(parent)::text, sqlc.arg(keep_days)::int);
