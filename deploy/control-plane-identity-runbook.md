@@ -2,10 +2,9 @@
 
 This runbook is the operator contract for the three serving cells. Terraform
 creates one Cloud Run runtime identity per cell, grants it the cell's exact
-runtime secret set, and grants `roles/storage.objectViewer` on the
-`templates/` managed folder in that cell's backup bucket. The managed-folder
-binding provides template object get/list; it does not provide sandbox access,
-create, overwrite, or delete.
+runtime secret set, and grants `roles/storage.objectViewer` on that cell's
+backup bucket. The bucket is cell-local; the binding is read-only and provides
+no create, overwrite, or delete access.
 
 ## Published contract
 
@@ -40,7 +39,7 @@ encrypt/decrypt round trip before the workflow routes the revision.
 ## Migration order
 
 1. From each environment root, review `terraform plan` and confirm the new
-   service account, exact secret set, managed-folder viewer grant, metric-writer grant,
+   service account, exact secret set, bucket viewer grant, metric-writer grant,
    and scoped GitHub Actions act-as and token-creation grants. Confirm no VMD service account is a
    `reader_members` entry.
 2. Run the manually confirmed
