@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -97,6 +98,15 @@ func TestVerifiedActivationGrantRequiresApplicabilityAndIdentity(t *testing.T) {
 	grant.ApplicabilityConfig.Scope.PriceType = "metered"
 	if !isVerifiedActivationGrant(grant, grant.ID, "") {
 		t.Fatal("a persisted local grant ID may establish identity, but applicability is still required")
+	}
+	grant.ExpiresAt = int64PtrForTest(time.Now().UTC().Add(-time.Minute).Unix())
+	if isVerifiedActivationGrant(grant, grant.ID, "") {
+		t.Fatal("an expired grant must not establish activation")
+	}
+	grant.ExpiresAt = nil
+	grant.VoidedAt = int64PtrForTest(time.Now().UTC().Unix())
+	if isVerifiedActivationGrant(grant, grant.ID, "") {
+		t.Fatal("a voided grant must not establish activation")
 	}
 }
 
@@ -228,6 +238,8 @@ func newRecoveryTestStripeClient(t *testing.T, sub stripeSubscription, grants []
 }
 
 func stringPtrForTest(value string) *string { return &value }
+
+func int64PtrForTest(value int64) *int64 { return &value }
 
 func uuidPtrForTest(value uuid.UUID) *uuid.UUID { return &value }
 

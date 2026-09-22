@@ -335,6 +335,12 @@ func (c *stripeHTTPClient) CreateBillingCreditGrant(ctx context.Context, params 
 	form.Set("amount[monetary][currency]", "usd")
 	form.Set("amount[monetary][value]", strconv.FormatInt(params.AmountCents, 10))
 	form.Set("applicability_config[scope][price_type]", "metered")
+	// The team-scoped idempotency key is also persisted on the grant so
+	// recovery can distinguish this entitlement from another promotional grant
+	// belonging to the same customer.
+	if params.AmountCents == 9500 && strings.TrimSpace(params.IdempotencyKey) != "" {
+		form.Set("metadata[activation_identity]", params.IdempotencyKey)
+	}
 	var resp struct {
 		ID string `json:"id"`
 	}
