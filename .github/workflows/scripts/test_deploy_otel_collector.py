@@ -206,7 +206,7 @@ class OtelTargetSelectionTests(unittest.TestCase):
 
 
 class OtelRenderedDeploymentTests(unittest.TestCase):
-    def exercise(self, fail='', existing=False, identity=None, expected_host='example-host'):
+    def exercise(self, fail='', existing=False):
         import os
         import tempfile
         from shell_test_support import linux_shell_prelude
@@ -214,10 +214,6 @@ class OtelRenderedDeploymentTests(unittest.TestCase):
             root = Path(tmp)
             staging = root / 'staging'
             staging.mkdir()
-            if identity is not None:
-                identity_file = root/'etc/sandbox/host-identity.env'
-                identity_file.parent.mkdir(parents=True)
-                identity_file.write_text(identity)
             binary = '#!/bin/sh\necho otelcol-contrib ' + MODULE.OTEL_COLLECTOR_VERSION + '\n'
             for name, data in [('otelcol-contrib', binary), ('collector-gmp.yaml', 'receivers: {}\n'),
                                ('superserve-otel-collector.service', '[Install]\nWantedBy=multi-user.target\n')]:
@@ -250,14 +246,7 @@ journalctl() { :; }
             result = subprocess.run(['bash', '-c', linux_shell_prelude() + prelude + script], capture_output=True, text=True,
                                     env=dict(os.environ, FAIL=fail, STATE=tmp, CALLS=str(root/'calls')))
             env_file = root/'etc/sandbox/otel/collector.env'
-            if expected_host is None:
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn('invalid installed host identity', result.stderr)
-                self.assertFalse(env_file.exists())
-                self.assertFalse((root/'calls').exists())
-                self.assertFalse(staging.exists())
-                return result, ''
-            self.assertEqual(env_file.read_text(), f'GCP_PROJECT=example-project\nGCP_ZONE=us-central1-a\nHOST_ID={expected_host}\nCOLLECTOR_HOST_ID=example-host\n')
+            self.assertEqual(env_file.read_text(), 'GCP_PROJECT=example-project\nGCP_ZONE=us-central1-a\nHOST_ID=example-host\nCOLLECTOR_HOST_ID=example-host\n')
             self.assertEqual(env_file.stat().st_mode & 0o777, 0o644)
             self.assertFalse(staging.exists(), 'staging cleanup must run')
             calls = (root/'calls').read_text()
@@ -275,17 +264,11 @@ journalctl() { :; }
             self.assertLess(calls.index('daemon-reload'), calls.index('enable '))
             self.assertLess(calls.index('enable '), calls.index('restart '))
 
-    def test_authoritative_generated_identity_is_written(self):
-        host_id = 'use4-3-0123456789abcdef0123456789abcdef'
-        result, _ = self.exercise(identity=f'HOST_ID={host_id}\nHOST_IDENTITY_FILE=/etc/sandbox/host-identity.json\n', expected_host=host_id)
+    def test_collector_identity_label_matches_the_instance_name(self):
+        # Until every collector has reported collector_host_id, HOST_ID stays
+        # the instance name so the disk alert filter keeps matching.
+        result, _ = self.exercise()
         self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_malformed_installed_identity_fails_before_config_or_service_changes(self):
-        for identity in ('', 'OTHER=value\n', 'HOST_ID=\n', 'HOST_ID=-invalid\n',
-                         'HOST_ID=has spaces\n', 'HOST_ID=$(touch /tmp/unsafe)\n',
-                         'HOST_ID=first\nHOST_ID=second\n', 'HOST_ID=' + 'a' * 257 + '\n'):
-            with self.subTest(identity=identity):
-                self.exercise(identity=identity, expected_host=None)
 
     def test_enable_start_or_readiness_failure_cannot_report_success(self):
         for fail in ('enable', 'restart', 'is-active', 'runtime-only', 'health'):

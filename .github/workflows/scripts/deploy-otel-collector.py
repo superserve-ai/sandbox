@@ -99,16 +99,6 @@ def _deploy_script(staging_dir: str, collector_project: str, zone_name: str, nam
         STAGING_DIR={shlex.quote(staging_dir)}
         trap 'rm -rf -- "$STAGING_DIR"' EXIT
 
-        host_id={shlex.quote(name)}
-        # Installed identity is authoritative; only legacy hosts may fall back.
-        if sudo test -e /etc/sandbox/host-identity.env || sudo test -L /etc/sandbox/host-identity.env; then
-          host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/host-identity.env)
-          if ! [[ "$host_id" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{{0,255}}$ ]]; then
-            echo 'ERROR: invalid installed host identity environment' >&2
-            exit 1
-          fi
-        fi
-
         if [ ! -x "$OTEL_BINARY" ] || \
            ! "$OTEL_BINARY" --version 2>/dev/null | grep -Fq "$OTEL_VERSION"; then
           echo "Installing otelcol-contrib v$OTEL_VERSION from uploaded artifact"
@@ -126,10 +116,10 @@ def _deploy_script(staging_dir: str, collector_project: str, zone_name: str, nam
           /etc/systemd/system/superserve-otel-collector.service
 
         sudo mkdir -p /etc/sandbox/otel
-        sudo tee /etc/sandbox/otel/collector.env >/dev/null <<OTELENV
+        sudo tee /etc/sandbox/otel/collector.env >/dev/null <<'OTELENV'
         GCP_PROJECT={collector_project}
         GCP_ZONE={zone_name}
-        HOST_ID=$host_id
+        HOST_ID={name}
         COLLECTOR_HOST_ID={name}
         OTELENV
         sudo chmod 0644 /etc/sandbox/otel/collector.env
