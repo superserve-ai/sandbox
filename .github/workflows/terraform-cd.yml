@@ -128,6 +128,7 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell staging
           terraform apply -input=false -auto-approve tfplan
 
   staging-us-central1-api:
@@ -305,6 +306,7 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-usw2
           gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
             --region "${{ vars.GCP_REGION_USW }}" \
             --project "${{ vars.GCP_PROJECT }}" \
@@ -532,6 +534,7 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --guarded module.sandbox_host_c
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-use4
           gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
             --region "${{ vars.GCP_REGION_USE4 }}" \
             --project "${{ vars.GCP_PROJECT }}" \

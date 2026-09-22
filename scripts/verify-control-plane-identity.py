@@ -12,6 +12,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -69,21 +70,44 @@ class Evidence:
         *,
         expect_denied: bool = False,
         redact_stdout: bool = False,
+        stream_stdout: bool = False,
         env: dict[str, str] | None = None,
     ) -> str:
         self.sequence += 1
         stem = f"{self.sequence:02d}-{name}"
-        result = subprocess.run(
-            argv,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
-        stdout = "<redacted>\n" if redact_stdout else result.stdout
+        if stream_stdout:
+            # Artifact probes can return arbitrarily large, non-UTF-8 bodies.
+            # Send those bytes directly to the OS sink instead of asking
+            # subprocess to decode or buffer them in memory.
+            result = subprocess.run(
+                argv,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+            stdout = "<redacted>\n" if redact_stdout else "<binary stdout streamed>\n"
+            observed_stdout = ""
+            raw_stderr = result.stderr or b""
+            stderr = (
+                raw_stderr.decode("utf-8", errors="replace")
+                if isinstance(raw_stderr, bytes)
+                else str(raw_stderr)
+            )
+        else:
+            result = subprocess.run(
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            stdout = "<redacted>\n" if redact_stdout else result.stdout
+            observed_stdout = result.stdout
+            stderr = result.stderr
         (self.root / "commands" / f"{stem}.stdout").write_text(stdout)
-        (self.root / "commands" / f"{stem}.stderr").write_text(result.stderr)
-        observed = result.stdout + result.stderr
+        (self.root / "commands" / f"{stem}.stderr").write_text(stderr)
+        observed = observed_stdout + stderr
         denied = bool(PERMISSION_DENIED.search(observed))
         passed = (result.returncode != 0 and denied) if expect_denied else result.returncode == 0
         self.index.append(
@@ -93,6 +117,7 @@ class Evidence:
                 "returncode": result.returncode,
                 "expected_permission_denial": expect_denied,
                 "stdout_redacted": redact_stdout,
+                "stdout_streamed": stream_stdout,
                 "permission_denied_observed": denied,
                 "status": "PASS" if passed else "FAIL",
             }
@@ -103,7 +128,7 @@ class Evidence:
                 f"{name}: expected {expectation}, got exit {result.returncode}; "
                 f"see {self.root / 'commands' / f'{stem}.stderr'}"
             )
-        return result.stdout
+        return observed_stdout
 
     def write_index(self, status: str) -> None:
         (self.root / "evidence.json").write_text(
@@ -137,6 +162,18 @@ def gcloud(*args: str) -> list[str]:
     return ["gcloud", *args]
 
 
+def effective_iam_command(project: str, identity: str, bucket: str) -> list[str]:
+    """Build the project-scoped effective IAM analysis command."""
+    return gcloud(
+        "asset",
+        "analyze-iam-policy",
+        f"--project={project}",
+        f"--identity=serviceAccount:{identity}",
+        f"--full-resource-name=//storage.googleapis.com/projects/_/buckets/{bucket}",
+        "--format=json",
+    )
+
+
 def contract(path: Path) -> dict[str, object]:
     try:
         value = json.loads(path.read_text())
@@ -164,22 +201,33 @@ def contract(path: Path) -> dict[str, object]:
     return value
 
 
-def object_name(uri: str, bucket: str) -> str:
+def object_name(uri: str, bucket: str, generation_prefix: str | None = None) -> str:
     if uri.startswith("gs://"):
         prefix = f"gs://{bucket}/"
         if not uri.startswith(prefix):
             raise VerificationError(f"referenced object is outside the cell bucket: {uri}")
         return uri[len(prefix) :]
-    return uri.removeprefix("gs://") if uri.startswith(f"gs://{bucket}") else uri
+    # Shared objects are deliberately bucket-relative: the uploader stores
+    # them under bases/ so generations can reuse one immutable object.
+    if uri.startswith(("bases/", "templates/", "sandboxes/")):
+        return uri
+    if generation_prefix is None:
+        return uri
+    if uri.startswith("/"):
+        raise VerificationError(f"referenced object escapes its generation: {uri}")
+    resolved = posixpath.normpath(posixpath.join(generation_prefix, uri))
+    if resolved != generation_prefix and not resolved.startswith(generation_prefix + "/"):
+        raise VerificationError(f"referenced object escapes its generation: {uri}")
+    return resolved
 
 
 def manifest_references(manifest_text: str) -> list[str]:
     """Return every bucket object named by a generation manifest.
 
-    GenerationManifest stores exact object names in each files[*].object
-    field. Walk the decoded document instead of assuming a particular field
-    ordering or stopping after the first artifact; the verifier must prove
-    access to the complete published set.
+    Walk the decoded document instead of assuming a particular field ordering
+    or stopping after the first artifact; the verifier must prove access to
+    the complete published set. Ordinary uploader entries are relative to the
+    manifest generation, while shared bases/ entries are bucket-relative.
     """
     try:
         value = json.loads(manifest_text)
@@ -214,6 +262,22 @@ def kms_key_parts(resource: str) -> tuple[str, str, str, str]:
     if not match:
         raise VerificationError(f"invalid KMS crypto-key resource: {resource}")
     return match.groups()
+
+
+def storage_object_resource(bucket: str, name: str) -> str:
+    """Return the IAM resource name for one Cloud Storage object."""
+    return f"//storage.googleapis.com/projects/_/buckets/{bucket}/objects/{name}"
+
+
+def policy_troubleshooter_access(response: str) -> str:
+    """Extract the access decision from a Policy Troubleshooter response."""
+    try:
+        value = json.loads(response)
+    except json.JSONDecodeError as exc:
+        raise VerificationError("IAM Policy Troubleshooter returned invalid JSON") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("access"), str):
+        raise VerificationError("IAM Policy Troubleshooter response has no access decision")
+    return str(value["access"])
 
 
 def runtime_identity(resource: dict[str, object]) -> str | None:
@@ -382,11 +446,15 @@ def main() -> int:
         )
         (args.evidence_dir / "manifest.json").write_text(manifest_text)
 
+        generation_prefix = manifest.rsplit("/", 1)[0]
         references = list(args.referenced_object) + manifest_references(manifest_text)
         references = list(
             dict.fromkeys(
                 name
-                for name in (object_name(ref.strip().rstrip("}]"), bucket) for ref in references)
+                for name in (
+                    object_name(ref.strip().rstrip("}]"), bucket, generation_prefix)
+                    for ref in references
+                )
                 if name != manifest
             )
         )
@@ -398,6 +466,7 @@ def main() -> int:
                 f"referenced-read-{index}",
                 gcloud("storage", "cat", f"gs://{bucket}/{name}", impersonate),
                 redact_stdout=True,
+                stream_stdout=True,
             )
 
         for index, other in enumerate(args.other_bucket, 1):
@@ -426,12 +495,43 @@ def main() -> int:
             gcloud("storage", "cp", str(probe), f"gs://{bucket}/templates/.permission-probe", impersonate),
             expect_denied=True,
         )
-        delete_target = f"gs://{bucket}/{manifest}"
-        evidence.command(
-            "delete-target-exists",
-            gcloud("storage", "objects", "describe", delete_target, impersonate, "--format=json"),
+        # Policy Troubleshooter evaluates the effective permission without
+        # issuing a mutating request.  In particular, never use the live
+        # manifest as a delete probe: an unexpected grant must not destroy a
+        # customer artifact while the verifier is detecting that drift.
+        delete_resource = storage_object_resource(bucket, manifest)
+        delete_response = evidence.command(
+            "delete-permission-check",
+            gcloud(
+                "policy-troubleshoot",
+                "iam",
+                delete_resource,
+                f"--principal-email={identity}",
+                "--permission=storage.objects.delete",
+                "--format=json",
+            ),
         )
-        evidence.command("delete-denied", gcloud("storage", "rm", delete_target, impersonate), expect_denied=True)
+        try:
+            delete_access = policy_troubleshooter_access(delete_response)
+        except VerificationError:
+            evidence.index[-1]["status"] = "FAIL"
+            raise
+        evidence.index[-1].update(
+            {
+                "principal": identity,
+                "resource": delete_resource,
+                "permission": "storage.objects.delete",
+                "access": delete_access,
+            }
+        )
+        # The v2alpha1 CLI reports a denied permission as NOT_GRANTED; accept
+        # DENIED as well for older Policy Troubleshooter response versions.
+        if delete_access not in {"NOT_GRANTED", "DENIED"}:
+            evidence.index[-1]["status"] = "FAIL"
+            raise VerificationError(
+                "runtime identity has storage.objects.delete on the live manifest "
+                f"({delete_access})"
+            )
 
         bucket_policy_json = evidence.command(
             "bucket-iam",
@@ -588,14 +688,7 @@ def main() -> int:
                 )
         evidence.command(
             "effective-iam",
-            gcloud(
-                "asset",
-                "analyze-iam-policy",
-                f"--scope=projects/{args.project}",
-                f"--identity=serviceAccount:{identity}",
-                f"--full-resource-name=//storage.googleapis.com/projects/_/buckets/{bucket}",
-                "--format=json",
-            ),
+            effective_iam_command(args.project, identity, bucket),
         )
         for index, secret in enumerate(cp["secret_ids"], 1):
             evidence.command(
@@ -692,8 +785,7 @@ def main() -> int:
             "manifest-read",
             "sandbox-list-denied",
             "write-denied",
-            "delete-target-exists",
-            "delete-denied",
+            "delete-permission-check",
             "bucket-iam",
             "managed-folder-iam",
             "project-iam",

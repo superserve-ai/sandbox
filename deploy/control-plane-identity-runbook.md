@@ -37,6 +37,11 @@ uses the centrally authorized owner to apply the per-runtime
 Secret Manager binding as that same runtime identity, and performs an
 encrypt/decrypt round trip before the workflow routes the revision.
 
+Automatic Terraform CD runs a plan-time identity guard for all three serving
+cells and refuses any control-plane service-account transition before apply.
+Use the staged identity rollout for that transition; ordinary image and
+infrastructure changes may resume automatically after the staged cutover.
+
 ## Migration order
 
 1. From each environment root, review `terraform plan` and confirm the new
@@ -62,7 +67,8 @@ encrypt/decrypt round trip before the workflow routes the revision.
    revision without routing traffic to it. The central KMS owner grant is then
    applied before cutover. The verifier gates the stage on a runtime-identity
    KMS encrypt/decrypt round trip as well as same-cell manifest/reference
-   reads, cross-cell list denial, deterministic write/delete denial, Secret
+   reads, cross-cell list denial, deterministic write denial plus a
+   non-mutating IAM Policy Troubleshooter check for delete denial, Secret
    Manager access, effective IAM analysis, deployment act-as, and the
    centrally owned KMS binding. It also requires the latest ready revision to
    have 100% traffic under the dedicated identity.
@@ -130,10 +136,10 @@ python3 scripts/verify-control-plane-identity.py \
 
 The verifier discovers the actual generation `manifest.json` object, reads
 each referenced artifact, creates and validates its own deterministic write
-probe, and confirms that the existing manifest chosen as the delete target is
-present before attempting the delete. It fails unless every negative command
-returns a permission-denied response; a missing local probe or missing object
-is not a negative IAM result.
+probe, and uses IAM Policy Troubleshooter to confirm that the runtime identity
+is denied `storage.objects.delete` on that object. It never attempts to delete
+the live manifest. A missing local probe or missing object is not a negative
+IAM result.
 
 Also verify that the deployment principal can update the Cloud Run service with
 the new identity and mint credentials as that identity for the probes, that the
@@ -143,7 +149,7 @@ plane's existing KMS-dependent operation still succeeds. Inspect effective IAM
 before declaring the negative checks complete.
 
 For the effective audit, retain the verifier's
-`gcloud asset analyze-iam-policy --scope=projects/PROJECT ...` output together
+`gcloud asset analyze-iam-policy --project=PROJECT ...` output together
 with the direct project, bucket, managed-folder, and service-account policies. In the cleanup
 row, record `removed` or `retained-with-dependency`, the exact principal and
 role, the dependency owner, and the observation time. Only rows marked
