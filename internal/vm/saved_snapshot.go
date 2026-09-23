@@ -619,22 +619,30 @@ func writeSavedSnapshotManifest(dir string, man *SavedSnapshotManifest) error {
 }
 
 // SweepSavedSnapshotStaging reclaims staging directories a previous process
-// died in. The list is taken at startup, before any capture can stage under
-// a new name, and the removal runs in the background so a multi-GiB image
-// never delays reattach. The returned channel closes when it is done.
-func (m *Manager) SweepSavedSnapshotStaging(log zerolog.Logger) (int, <-chan struct{}) {
+// died in. The saved directory grows with the snapshots on the host, so the
+// listing runs in the background along with the removals. Each candidate is
+// removed under its snapshot id lock, which a live capture holds for its whole
+// duration, so an in-flight staging dir is never touched. The returned channel
+// closes when the sweep is done.
+func (m *Manager) SweepSavedSnapshotStaging(log zerolog.Logger) <-chan struct{} {
 	done := make(chan struct{})
-	if m.cfg.SnapshotDir == "" {
-		close(done)
-		return 0, done
-	}
-	stale, _ := filepath.Glob(filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, ".*.tmp-*"))
 	go func() {
 		defer close(done)
+		if m.cfg.SnapshotDir == "" {
+			return
+		}
 		start := time.Now()
+		stale, _ := filepath.Glob(filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, ".*.tmp-*"))
 		n := 0
 		for _, d := range stale {
-			if err := os.RemoveAll(d); err != nil {
+			id, _, _ := strings.Cut(strings.TrimPrefix(filepath.Base(d), "."), ".tmp-")
+			unlock, err := m.lockSavedSnapshot(context.Background(), id)
+			if err != nil {
+				return
+			}
+			err = os.RemoveAll(d)
+			unlock()
+			if err != nil {
 				log.Warn().Err(err).Str("dir", d).Msg("saved snapshot staging could not be removed")
 				continue
 			}
@@ -644,7 +652,7 @@ func (m *Manager) SweepSavedSnapshotStaging(log zerolog.Logger) (int, <-chan str
 			log.Info().Int("removed", n).Dur("took", time.Since(start)).Msg("swept abandoned saved snapshot staging")
 		}
 	}()
-	return len(stale), done
+	return done
 }
 
 func removeSavedStaging(parent, snapshotID string) {

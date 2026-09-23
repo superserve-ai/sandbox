@@ -412,10 +412,7 @@ func TestSweepSavedSnapshotStaging(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	n, done := m.SweepSavedSnapshotStaging(zerolog.Nop())
-	if n != 2 {
-		t.Errorf("found %d staging dirs, want 2", n)
-	}
+	done := m.SweepSavedSnapshotStaging(zerolog.Nop())
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
@@ -581,5 +578,32 @@ func TestRestoreDiscardsAFailedSavedDiskClone(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(m.cfg.RunDir, child)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("run dir survived the failed clone, so a retry would reuse a disk that was never made: %v", err)
+	}
+}
+
+func TestSweepLeavesALiveCaptureStagingAlone(t *testing.T) {
+	m := newSavedTestManager(t)
+	id := uuid.NewString()
+	dir := filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, "."+id+".tmp-"+uuid.NewString())
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := m.lockSavedSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := m.SweepSavedSnapshotStaging(zerolog.Nop())
+	time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("staging of a capture holding its id lock was swept: %v", err)
+	}
+	unlock()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sweep did not finish after the lock was released")
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("abandoned staging survived the sweep: %v", err)
 	}
 }
