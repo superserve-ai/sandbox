@@ -18,11 +18,15 @@ import (
 // command); that a binary built from that package does is shown there.
 const wakeProtocolMarker = WakeProtocolCapability
 
+// stagedIntentMarker is the second floor's literal; see StagedIntentCapability.
+const stagedIntentMarker = StagedIntentCapability
+
 type wakeGuardWorld struct {
 	t        *testing.T
 	dir      string
 	guard    string
 	evidence string
+	staged   string
 }
 
 func newWakeGuardWorld(t *testing.T) *wakeGuardWorld {
@@ -34,16 +38,19 @@ func newWakeGuardWorld(t *testing.T) *wakeGuardWorld {
 	if !strings.Contains(string(src), wakeProtocolMarker) {
 		t.Fatalf("guard script no longer greps for %q — update this harness", wakeProtocolMarker)
 	}
-	if !strings.Contains(string(src), wakeProtocolEvidencePath) {
-		t.Fatalf("guard script no longer references %q — update this harness", wakeProtocolEvidencePath)
+	for _, want := range []string{wakeProtocolEvidencePath, stagedIntentMarker, stagedIntentEvidencePath} {
+		if !strings.Contains(string(src), want) {
+			t.Fatalf("guard script no longer references %q — update this harness", want)
+		}
 	}
 	dir := t.TempDir()
 	host := filepath.Join(dir, "host")
 	if err := os.MkdirAll(host, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	w := &wakeGuardWorld{t: t, dir: dir, evidence: filepath.Join(host, "evidence")}
+	w := &wakeGuardWorld{t: t, dir: dir, evidence: filepath.Join(host, "evidence"), staged: filepath.Join(host, "staged-evidence")}
 	rewritten := strings.ReplaceAll(string(src), wakeProtocolEvidencePath, w.evidence)
+	rewritten = strings.ReplaceAll(rewritten, stagedIntentEvidencePath, w.staged)
 	w.guard = filepath.Join(dir, "guard.sh")
 	if err := os.WriteFile(w.guard, []byte(rewritten), 0o755); err != nil {
 		t.Fatal(err)
@@ -51,11 +58,21 @@ func newWakeGuardWorld(t *testing.T) *wakeGuardWorld {
 	return w
 }
 
+// binary is a current build when capable, carrying every marker; an old
+// build carries none.
 func (w *wakeGuardWorld) binary(name string, capable bool) string {
 	w.t.Helper()
-	body := "not a real vmd\n"
 	if capable {
-		body += wakeProtocolMarker + "\n"
+		return w.binaryWith(name, wakeProtocolMarker, stagedIntentMarker)
+	}
+	return w.binaryWith(name)
+}
+
+func (w *wakeGuardWorld) binaryWith(name string, markers ...string) string {
+	w.t.Helper()
+	body := "not a real vmd\n"
+	for _, m := range markers {
+		body += m + "\n"
 	}
 	p := filepath.Join(w.dir, name)
 	if err := os.WriteFile(p, []byte(body), 0o755); err != nil {
@@ -124,6 +141,59 @@ func TestWakeFloorGuard(t *testing.T) {
 		seedFrozenManifest(t, filepath.Join(sb, "mem.snap"), "tok")
 		if ok, out := w.run(w.binary("vmd", false)); !ok {
 			t.Fatalf("the guard walked the trees: %s", out)
+		}
+	})
+}
+
+// The second floor fences the build before staged intents: it carries the
+// wake protocol, so the first floor admits it, and it would strip the
+// manifest a staged intent leaves in place.
+func TestStagedIntentFloorGuard(t *testing.T) {
+	t.Run("staged_evidence_refuses_a_wake_only_binary_and_admits_a_current_one", func(t *testing.T) {
+		w := newWakeGuardWorld(t)
+		if err := os.WriteFile(w.staged, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if ok, out := w.run(w.binaryWith("previous-vmd", wakeProtocolMarker)); ok || !strings.Contains(out, "REFUSING") || !strings.Contains(out, stagedIntentMarker) {
+			t.Fatalf("wake-only binary admitted over staged evidence: ok=%v %s", ok, out)
+		}
+		if ok, out := w.run(w.binary("current-vmd", true)); !ok {
+			t.Fatalf("current binary refused: %s", out)
+		}
+	})
+	t.Run("wake_evidence_alone_still_admits_a_wake_only_binary", func(t *testing.T) {
+		w := newWakeGuardWorld(t)
+		if err := os.WriteFile(w.evidence, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if ok, out := w.run(w.binaryWith("previous-vmd", wakeProtocolMarker)); !ok {
+			t.Fatalf("a host with no staged intents refused the previous build: %s", out)
+		}
+	})
+	t.Run("both_floors_are_checked", func(t *testing.T) {
+		w := newWakeGuardWorld(t)
+		for _, p := range []string{w.evidence, w.staged} {
+			if err := os.WriteFile(p, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if ok, _ := w.run(w.binaryWith("staged-only-vmd", stagedIntentMarker)); ok {
+			t.Fatal("a binary without the wake protocol was admitted over wake evidence")
+		}
+		if ok, _ := w.run(w.binaryWith("wake-only-vmd", wakeProtocolMarker)); ok {
+			t.Fatal("a binary without staged intents was admitted over staged evidence")
+		}
+		if ok, out := w.run(w.binary("current-vmd", true)); !ok {
+			t.Fatalf("current binary refused: %s", out)
+		}
+	})
+	t.Run("an_unknowable_staged_marker_refuses_a_wake_only_binary", func(t *testing.T) {
+		w := newWakeGuardWorld(t)
+		if err := os.Symlink(w.staged, w.staged); err != nil {
+			t.Fatal(err)
+		}
+		if ok, out := w.run(w.binaryWith("previous-vmd", wakeProtocolMarker)); ok || !strings.Contains(out, "cannot look up") {
+			t.Fatalf("wake-only binary admitted over an unknowable staged marker: ok=%v %s", ok, out)
 		}
 	})
 }

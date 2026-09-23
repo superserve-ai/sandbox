@@ -642,11 +642,13 @@ func main() {
 		switch os.Args[1] {
 		case "capabilities":
 			// Advertised so rollback tooling can detect a downgrade to a binary
-			// that lacks cgroup supervision, or the wake protocol frozen images
-			// depend on. Env-free by design; the literals are what the deploy
-			// guard greps the binary for, so they must stay verbatim.
+			// that lacks cgroup supervision, the wake protocol frozen images
+			// depend on, or the staged intents a capture journals. Env-free by
+			// design; the literals are what the deploy guard greps the binary
+			// for, so they must stay verbatim.
 			fmt.Println("cgroup-supervision")
 			fmt.Println(vm.WakeProtocolCapability)
+			fmt.Println(vm.StagedIntentCapability)
 			return
 		case "raise-wake-floor":
 			// Operator step before the first frozen image can exist anywhere:

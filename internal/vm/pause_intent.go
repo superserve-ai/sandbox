@@ -3,8 +3,11 @@ package vm
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 )
 
 // A pause rewrites this VM's image in place. Between freezing the guest,
@@ -25,6 +28,56 @@ type pauseIntent struct {
 	// Staged means the write went to a staging directory and the images
 	// beside this intent were not touched, so their manifests stand.
 	Staged bool `json:"staged,omitempty"`
+}
+
+// StagedIntentCapability is the string a vmd that reads staged intents
+// carries; the host guard greps the binary for it.
+const StagedIntentCapability = "staged-intent-1"
+
+// stagedIntentEvidencePath records that this host has journalled a staged
+// intent. A vmd without StagedIntentCapability recovers one as an
+// interrupted rewrite and strips the manifest the source's images still
+// need, so the evidence is durable before the first such intent is written
+// and the host guard refuses such a vmd from then on.
+var stagedIntentEvidencePath = "/var/lib/sandbox/staged-intent-evidence"
+
+const stagedIntentEvidenceNote = "this host has journalled staged capture intents\n"
+
+var (
+	stagedIntentEvidenceDurable atomic.Bool
+	stagedIntentEvidenceMu      sync.Mutex
+)
+
+// ensureStagedIntentFloor is durable once, then free.
+func ensureStagedIntentFloor() error {
+	if stagedIntentEvidenceDurable.Load() {
+		return nil
+	}
+	stagedIntentEvidenceMu.Lock()
+	defer stagedIntentEvidenceMu.Unlock()
+	if stagedIntentEvidenceDurable.Load() {
+		return nil
+	}
+	if _, err := os.Stat(stagedIntentEvidencePath); err == nil {
+		// Visible, but not proven durable by this process.
+		if err := syncDir(filepath.Dir(stagedIntentEvidencePath)); err != nil {
+			return err
+		}
+	} else if err := raiseEvidenceFile(stagedIntentEvidencePath, stagedIntentEvidenceNote); err != nil {
+		return err
+	}
+	stagedIntentEvidenceDurable.Store(true)
+	return nil
+}
+
+// writeStagedIntent journals an intent whose write goes to staging, behind
+// the floor that keeps an older vmd from misreading it.
+func writeStagedIntent(dir string, in pauseIntent) error {
+	if err := ensureStagedIntentFloor(); err != nil {
+		return fmt.Errorf("raise the staged-intent floor: %w", err)
+	}
+	in.Staged = true
+	return writePauseIntent(dir, in)
 }
 
 func pauseIntentPath(dir string) string { return filepath.Join(dir, pauseIntentName) }

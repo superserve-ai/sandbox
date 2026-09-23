@@ -263,7 +263,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
 		return fmt.Errorf("create source snapshot dir: %w", err)
 	}
-	if err := writePauseIntent(sourceDir, pauseIntent{VMID: vmID, FreezeToken: token, ArtifactID: artifact, Staged: true}); err != nil {
+	if err := writeStagedIntent(sourceDir, pauseIntent{VMID: vmID, FreezeToken: token, ArtifactID: artifact}); err != nil {
 		return fmt.Errorf("record capture intent: %w", err)
 	}
 	frozen := false
