@@ -90,7 +90,7 @@ WITH tpl AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id
+SELECT ins.*
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
@@ -99,16 +99,27 @@ SELECT * FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;
 
 -- name: CountActiveSandboxesAtBasePath :one
--- Count of non-destroyed sandboxes still referencing this base_path. Used at
--- destroy time to decide whether the per-build artifact dir is safe to GC.
-SELECT COUNT(*)::bigint FROM sandbox
-WHERE base_path = $1 AND destroyed_at IS NULL;
+-- Count of non-destroyed sandboxes and live snapshots still referencing this
+-- base_path. Used at destroy time to decide whether the per-build artifact
+-- dir is safe to GC.
+SELECT (
+  (SELECT COUNT(*)::bigint FROM sandbox
+   WHERE sandbox.base_path = $1 AND sandbox.destroyed_at IS NULL)
+  + (SELECT COUNT(*)::bigint FROM sandbox_snapshot
+     WHERE sandbox_snapshot.base_path = $1
+       AND sandbox_snapshot.deleted_at IS NULL
+       AND sandbox_snapshot.status IN ('creating', 'ready'))
+)::bigint;
 
 -- name: ListPinnedBuildPaths :many
 -- Reconciler input: distinct base_path values held by non-destroyed
--- sandboxes. Their builds must survive even if the template moved on.
-SELECT DISTINCT base_path FROM sandbox
-WHERE base_path IS NOT NULL AND destroyed_at IS NULL;
+-- sandboxes and live snapshots. Their builds must survive even if the
+-- template moved on.
+SELECT DISTINCT sandbox.base_path FROM sandbox
+WHERE sandbox.base_path IS NOT NULL AND sandbox.destroyed_at IS NULL
+UNION
+SELECT sandbox_snapshot.base_path FROM sandbox_snapshot
+WHERE sandbox_snapshot.deleted_at IS NULL AND sandbox_snapshot.status IN ('creating', 'ready');
 
 -- Static created_at variants of ListSandboxesByTeamPaged. The plain ORDER BY
 -- lets the planner walk idx_sandbox_team_created_active (forward for DESC,
