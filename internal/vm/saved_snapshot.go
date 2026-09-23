@@ -276,7 +276,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		captureErr = fcPauseVMContext(cctx, socket)
 	}
 	if captureErr == nil {
-		captureErr = m.captureSavedDisk(ctx, diskPath, man.BasePath, tmp, final, man)
+		captureErr = m.captureSavedDisk(cctx, diskPath, man.BasePath, tmp, final, man)
 	}
 	// A memory capture spends the dirty baseline (diff) or resets it (full),
 	// and after a failure it is unknown: the source's next pause is a full one.
@@ -879,11 +879,7 @@ func applyPresentPages(ctx context.Context, src string, present presence.Bitmap,
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		off, n := int64(i)*page, int64(j-i)*page
-		if _, err := out.Seek(off, io.SeekStart); err != nil {
-			return err
-		}
-		if _, err := io.CopyN(out, io.NewSectionReader(in, off, n), n); err != nil {
+		if err := copyRange(ctx, out, in, int64(i)*page, int64(j-i)*page); err != nil {
 			return err
 		}
 		i = j
@@ -905,8 +901,7 @@ func copyDataExtents(ctx context.Context, in, out *os.File, size int64) error {
 		}
 		if err != nil {
 			if off == 0 {
-				_, cerr := io.Copy(out, io.NewSectionReader(in, 0, size))
-				return cerr
+				return copyRange(ctx, out, in, 0, size)
 			}
 			return err
 		}
@@ -920,13 +915,30 @@ func copyDataExtents(ctx context.Context, in, out *os.File, size int64) error {
 		if hole <= data {
 			return fmt.Errorf("invalid extent [%d,%d)", data, hole)
 		}
-		if _, err := out.Seek(data, io.SeekStart); err != nil {
-			return err
-		}
-		if _, err := io.CopyN(out, io.NewSectionReader(in, data, hole-data), hole-data); err != nil {
+		if err := copyRange(ctx, out, in, data, hole-data); err != nil {
 			return err
 		}
 		off = hole
+	}
+	return nil
+}
+
+// copyRange copies n bytes at off from in to out in bounded pieces, honoring
+// ctx between them: a large extent must not outlive the caller's budget.
+func copyRange(ctx context.Context, out, in *os.File, off, n int64) error {
+	const piece = 32 << 20
+	for done := int64(0); done < n; {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		chunk := min(int64(piece), n-done)
+		if _, err := out.Seek(off+done, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(out, io.NewSectionReader(in, off+done, chunk), chunk); err != nil {
+			return err
+		}
+		done += chunk
 	}
 	return nil
 }

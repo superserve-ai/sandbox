@@ -446,3 +446,14 @@ func TestCommittedRetryWaitsForTheIDLock(t *testing.T) {
 		t.Errorf("retry after release: %v", err)
 	}
 }
+
+func TestCopyHonoursCancellation(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	pageFile(t, src, 16, map[int]byte{0: 'X', 15: 'Y'}, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := cloneOrCopyFile(ctx, src, filepath.Join(root, "dst")); !errors.Is(err, context.Canceled) {
+		t.Errorf("copy with a cancelled context: want Canceled, got %v", err)
+	}
+}
