@@ -136,9 +136,11 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 		return nil, status.Errorf(codes.FailedPrecondition, "vm %s is %v; a saved snapshot needs a running or paused VM", vmID, st)
 	}
 	diskPath := m.instanceDiskPath(inst)
-	if err := m.savedCaptureHeadroom(kind, st, inst, diskPath); err != nil {
+	unreserve, err := m.savedCaptureHeadroom(kind, st, inst, diskPath)
+	if err != nil {
 		return nil, err
 	}
+	defer unreserve()
 
 	parent := filepath.Dir(dir)
 	if err := os.MkdirAll(parent, 0o755); err != nil {
@@ -734,10 +736,21 @@ func (m *Manager) acquireSavedCapture(ctx context.Context) (func(), error) {
 	}
 }
 
+// savedFreeBytes reports the snapshot filesystem's free space.
+var savedFreeBytes = func(dir string) (int64, error) {
+	var fs unix.Statfs_t
+	if err := unix.Statfs(dir, &fs); err != nil {
+		return 0, err
+	}
+	return int64(fs.Bavail) * int64(fs.Bsize), nil
+}
+
 // savedCaptureHeadroom refuses a capture the snapshot filesystem cannot hold:
 // a running full memory image is written in full, and a copy may not reflink
-// on this filesystem.
-func (m *Manager) savedCaptureHeadroom(kind SavedSnapshotKind, st VMStatus, inst *VMInstance, diskPath string) error {
+// on this filesystem. The need stays reserved until the returned release
+// runs, so concurrent captures cannot each be admitted against the same
+// free space.
+func (m *Manager) savedCaptureHeadroom(kind SavedSnapshotKind, st VMStatus, inst *VMInstance, diskPath string) (func(), error) {
 	diskBytes, _ := allocatedBytes(diskPath)
 	need := int64(savedCaptureHeadroom) + diskBytes
 	if kind == SavedSnapshotMemFS {
@@ -752,15 +765,16 @@ func (m *Manager) savedCaptureHeadroom(kind SavedSnapshotKind, st VMStatus, inst
 			need += memBytes + stateBytes
 		}
 	}
-	var fs unix.Statfs_t
-	if err := unix.Statfs(m.cfg.SnapshotDir, &fs); err != nil {
-		return fmt.Errorf("statfs snapshot dir: %w", err)
+	free, err := savedFreeBytes(m.cfg.SnapshotDir)
+	if err != nil {
+		return nil, fmt.Errorf("statfs snapshot dir: %w", err)
 	}
-	free := int64(fs.Bavail) * int64(fs.Bsize)
-	if free < need {
-		return status.Errorf(codes.ResourceExhausted, "snapshot filesystem has %d bytes free; capture needs %d", free, need)
+	release := func() { m.savedReserved.Add(-need) }
+	if reserved := m.savedReserved.Add(need); free < reserved {
+		release()
+		return nil, status.Errorf(codes.ResourceExhausted, "snapshot filesystem has %d bytes free and captures in flight hold %d; this one needs %d", free, reserved-need, need)
 	}
-	return nil
+	return release, nil
 }
 
 // firecrackerExeSHA hashes the running VM's Firecracker through its exe

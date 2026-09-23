@@ -703,6 +703,7 @@ type Manager struct {
 
 	// Saved-snapshot captures in flight, bounded per host; see acquireSavedCapture.
 	savedCaptures     chan struct{}
+	savedReserved     atomic.Int64 // bytes admitted captures still expect to write
 	savedCapturesOnce sync.Once
 	savedIDMu         sync.Mutex
 	savedIDLocks      map[string]*savedIDLock // see lockSavedSnapshot

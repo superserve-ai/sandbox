@@ -676,3 +676,28 @@ func TestStandaloneSavedDiskRestoreRefusesWithoutReflink(t *testing.T) {
 		t.Errorf("standalone restore without reflink: want FailedPrecondition, got %v", err)
 	}
 }
+
+func TestSavedCaptureHeadroomIsReservedAcrossCaptures(t *testing.T) {
+	orig := savedFreeBytes
+	t.Cleanup(func() { savedFreeBytes = orig })
+	savedFreeBytes = func(string) (int64, error) { return 1 << 30, nil }
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, false)
+	inst.Config.MemoryMiB = 600 // one fits in 1 GiB with the fixed headroom, two do not
+	first, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst, inst.DiskPath)
+	if err != nil {
+		t.Fatalf("first capture: %v", err)
+	}
+	if _, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst, inst.DiskPath); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("second capture against the same free space: want ResourceExhausted, got %v", err)
+	}
+	first()
+	second, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst, inst.DiskPath)
+	if err != nil {
+		t.Fatalf("capture after the first released: %v", err)
+	}
+	second()
+	if got := m.savedReserved.Load(); got != 0 {
+		t.Errorf("reservation leaked: %d bytes", got)
+	}
+}
