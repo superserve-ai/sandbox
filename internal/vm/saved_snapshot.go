@@ -109,7 +109,7 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 		return nil, err
 	}
 	defer unlockID()
-	if man, err := m.committedSavedSnapshot(dir, vmID); man != nil || err != nil {
+	if man, err := m.committedSavedSnapshot(dir, vmID, kind); man != nil || err != nil {
 		return man, err
 	}
 	unlock, err := m.lockVMOp(ctx, vmID)
@@ -565,7 +565,7 @@ func (m *Manager) instanceDiskPath(inst *VMInstance) string {
 	return filepath.Join(m.cfg.RunDir, key, name)
 }
 
-func (m *Manager) committedSavedSnapshot(dir, vmID string) (*SavedSnapshotManifest, error) {
+func (m *Manager) committedSavedSnapshot(dir, vmID string, kind SavedSnapshotKind) (*SavedSnapshotManifest, error) {
 	man, err := readSavedSnapshotManifest(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -573,8 +573,8 @@ func (m *Manager) committedSavedSnapshot(dir, vmID string) (*SavedSnapshotManife
 	if err != nil {
 		return nil, status.Errorf(codes.DataLoss, "saved snapshot %s: %v", filepath.Base(dir), err)
 	}
-	if man.SourceVMID != vmID {
-		return nil, status.Errorf(codes.AlreadyExists, "saved snapshot %s belongs to vm %s", man.SnapshotID, man.SourceVMID)
+	if man.SourceVMID != vmID || man.Kind != kind {
+		return nil, status.Errorf(codes.AlreadyExists, "saved snapshot %s is a %s snapshot of vm %s", man.SnapshotID, man.Kind, man.SourceVMID)
 	}
 	return man, nil
 }

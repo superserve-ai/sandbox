@@ -194,9 +194,12 @@ func TestCreateSavedSnapshotPausedLayered(t *testing.T) {
 	if !before.ModTime().Equal(after.ModTime()) {
 		t.Error("retry rewrote the manifest")
 	}
-	// The same id for another source is refused.
+	// The same id for another source, or for another kind, is refused.
 	if _, err := m.CreateSavedSnapshot(ctx, uuid.NewString(), id, SavedSnapshotMemFS); status.Code(err) != codes.AlreadyExists {
 		t.Errorf("foreign retry: want AlreadyExists, got %v", err)
+	}
+	if _, err := m.CreateSavedSnapshot(ctx, inst.ID, id, SavedSnapshotFS); status.Code(err) != codes.AlreadyExists {
+		t.Errorf("retry with another kind: want AlreadyExists, got %v", err)
 	}
 
 	if err := m.DeleteSavedSnapshot(ctx, id); err != nil {
