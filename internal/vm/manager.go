@@ -119,6 +119,9 @@ type VMInstance struct {
 	DiskPath         string
 	SnapshotPath     string
 	MemFilePath      string
+	// SourceSnapshotID names the saved snapshot this VM was created from, so
+	// a retried create recognizes it without the snapshot, which may be gone.
+	SourceSnapshotID string
 	// CorrectsWallClock records whether this guest fixes its own wall clock on
 	// wake, resolved once when it was restored. Cached so pause never has to go
 	// to the filesystem to find out. Nil means unresolved — a record written by a
@@ -3346,14 +3349,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
 		return nil, status.Errorf(codes.InvalidArgument, "vm_id %q must be a valid per-VM identifier", vmID)
 	}
-	var fork *SavedSnapshotManifest
-	if resourceLimits.SavedSnapshotID != "" {
-		var err error
-		fork, snapshotPath, memPath, err = m.forkSource(vmID, &resourceLimits, snapshotPath, memPath)
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate restore
 	// waits for the in-flight attempt, then retriedLaunchTarget recognizes
@@ -3379,7 +3374,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// restore slot (or fails on the semaphore when all slots are busy).
 	// lazyReattach loads a paused VM the background reattach hasn't reached.
 	m.lazyReattach(vmID)
-	if existing, needsVerify := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+	var existing *VMInstance
+	var needsVerify bool
+	if resourceLimits.SavedSnapshotID != "" {
+		existing, needsVerify = m.retriedForkTarget(vmID, resourceLimits.SavedSnapshotID)
+	} else {
+		existing, needsVerify = m.retriedLaunchTarget(vmID, snapshotPath, memPath)
+	}
+	if existing != nil {
 		// The adopted VM keeps its stamped policy without re-validation, and
 		// the response still attests it: sound only while every vmd generation
 		// that could have served the prior attempt stamps the request's policy
@@ -3430,6 +3432,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
+	}
+	// Only now does a create from a snapshot need the snapshot itself: a
+	// retry of one that completed was answered above, whether or not the
+	// snapshot still exists.
+	var fork *SavedSnapshotManifest
+	if resourceLimits.SavedSnapshotID != "" {
+		var err error
+		fork, snapshotPath, memPath, err = m.forkSource(vmID, &resourceLimits, snapshotPath, memPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// A control plane from before preview publication sends the zero-value
@@ -3657,9 +3670,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// process in a different mode alongside the surviving old one (same
 		// ID, disk, netns, tap). Fresh (non-inPlace) creates keep "" and the
 		// launch chooses by the armed flag.
-		Supervision:  prevSupervision,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
+		Supervision:      prevSupervision,
+		SnapshotPath:     snapshotPath,
+		SourceSnapshotID: resourceLimits.SavedSnapshotID,
+		MemFilePath:      memPath,
 		// Kept through the launch: a failure returns a restore from a paused
 		// record to Paused in its place in the reclaim order; the commit clears it.
 		PausedAt: prevPausedAt,

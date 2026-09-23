@@ -689,6 +689,26 @@ func (m *Manager) forkSource(childID string, cfg *VMConfig, snapshotPath, memPat
 	return man, filepath.Join(own, "vmstate.snap"), filepath.Join(own, filepath.Base(man.MemPath)), nil
 }
 
+// retriedForkTarget is retriedLaunchTarget for a create from a snapshot: the
+// request names no files, so the child is matched by the snapshot it came
+// from and by owning its artifacts, never by files that may since be gone.
+func (m *Manager) retriedForkTarget(vmID, snapshotID string) (*VMInstance, bool) {
+	m.mu.RLock()
+	existing := m.vms[vmID]
+	m.mu.RUnlock()
+	if existing == nil {
+		return nil, false
+	}
+	existing.mu.RLock()
+	source, snap, mem := existing.SourceSnapshotID, existing.SnapshotPath, existing.MemFilePath
+	existing.mu.RUnlock()
+	own := filepath.Join(m.cfg.SnapshotDir, vmID)
+	if source != snapshotID || snap != filepath.Join(own, "vmstate.snap") || filepath.Dir(mem) != own {
+		return nil, false
+	}
+	return m.retriedLaunchTarget(vmID, snap, mem)
+}
+
 // savedSnapshotCommitted reports whether the snapshot is still on disk. The
 // caller holds its lock, so the answer holds until the lock is released.
 func savedSnapshotCommitted(man *SavedSnapshotManifest) error {

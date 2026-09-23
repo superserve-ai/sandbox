@@ -896,3 +896,55 @@ func TestStrictPresenceForkValidatesTheSnapshotItself(t *testing.T) {
 		t.Fatalf("a valid layered snapshot was refused before any copy: %v", err)
 	}
 }
+
+func TestCompletedForkRetryOutlivesItsSource(t *testing.T) {
+	useTempFloor(t)
+	m := newSavedTestManager(t)
+	m.restoreSem = make(chan struct{}, 1)
+	src, _ := seedPausedSource(t, m, false)
+	ctx := context.Background()
+	man, err := m.CreateSavedSnapshot(ctx, src.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := uuid.NewString()
+	cfg := VMConfig{VCPU: 1, MemoryMiB: 1024, SavedSnapshotID: man.SnapshotID}
+	_, snap, mem, err := m.forkSource(child, &cfg, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk, err := m.materializeFork(ctx, child, man)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The completed fork whose response was lost.
+	existing := &VMInstance{ID: child, Status: StatusRunning, SourceSnapshotID: man.SnapshotID, SnapshotPath: snap, MemFilePath: mem, DiskPath: disk, Config: cfg}
+	m.mu.Lock()
+	m.vms[child] = existing
+	m.mu.Unlock()
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false }
+	t.Cleanup(func() { vmDeadForRetry = orig })
+	request := VMConfig{VCPU: 1, MemoryMiB: 1024, SavedSnapshotID: man.SnapshotID}
+	if got, err := m.restoreVMSnapshot(ctx, child, "", "", request, nil, "", "", "", nil, 0, ""); err != nil || got != existing {
+		t.Fatalf("retry with the snapshot present: got %v, %v", got, err)
+	}
+	if err := m.DeleteSavedSnapshot(ctx, man.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := m.restoreVMSnapshot(ctx, child, "", "", request, nil, "", "", "", nil, 0, ""); err != nil || got != existing {
+		t.Fatalf("retry after the snapshot was deleted: got %v, %v", got, err)
+	}
+	// The same child asked for from another snapshot is not this retry.
+	other := VMConfig{VCPU: 1, MemoryMiB: 1024, SavedSnapshotID: uuid.NewString()}
+	if got, _ := m.restoreVMSnapshot(ctx, child, "", "", other, nil, "", "", "", nil, 0, ""); got == existing {
+		t.Fatal("a request for another snapshot adopted the child of this one")
+	}
+}
+
+func TestForkSourceSurvivesTheRecord(t *testing.T) {
+	inst := &VMInstance{ID: "vm-1", SourceSnapshotID: "snap-1"}
+	if got := toInstance(toRecord(inst)); got.SourceSnapshotID != "snap-1" {
+		t.Errorf("source snapshot lost across the record: %q", got.SourceSnapshotID)
+	}
+}
