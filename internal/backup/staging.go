@@ -75,6 +75,11 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 			}
 		} else {
 			task.Files[i].Path = staged
+			// The copy now waits its turn in the upload queue, which can
+			// be days; its pages go now and come back once at upload,
+			// after which the ack deletes the file. Shared bases stay
+			// cached: every generation on the template reads them.
+			_ = dropStagingPages(staged)
 		}
 		// The base is GC-owned: destroying the last sandbox on an old
 		// template build deletes it, which would abandon every queued

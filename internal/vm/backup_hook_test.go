@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -996,6 +998,97 @@ func TestEnqueueStagedPendingPromotesAcrossDifferentRoots(t *testing.T) {
 	// point-in-time success bit) is trusted to reclaim it.
 	if _, err := os.Stat(filepath.Join(pauseRoot, "vm-1", gotGeneration)); err != nil {
 		t.Fatalf("local pause-staging copy removed by the enqueue path itself: %v", err)
+	}
+}
+
+// After a promotion, the local copies give up their cached pages only
+// when the journal's row names the promoted paths; a row that kept the
+// local paths (a dedupe against an earlier staged enqueue) is still read
+// from them, so they keep their pages.
+func TestPromotionReleasesLocalCopiesOnlyWhenTheJournalMovedOn(t *testing.T) {
+	for _, rowKeepsLocal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rowKeepsLocal=%v", rowKeepsLocal), func(t *testing.T) {
+			dir := t.TempDir()
+			pauseRoot := filepath.Join(dir, "pause-local")
+			uploadRoot := filepath.Join(dir, "upload-visible")
+			snap := filepath.Join(dir, "vmstate.snap")
+			disk := filepath.Join(dir, "rootfs.ext4")
+			if err := os.WriteFile(snap, []byte("vm state"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(disk, []byte("pause-time disk bytes"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			var mu sync.Mutex
+			var dropped []string
+			prev := dropPageCache
+			dropPageCache = func(path string) error {
+				mu.Lock()
+				dropped = append(dropped, path)
+				mu.Unlock()
+				return nil
+			}
+			t.Cleanup(func() { dropPageCache = prev })
+
+			tasks := make(chan backup.Task, 1)
+			m := &Manager{
+				vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+				unitDead: func(context.Context, string) bool { return false },
+			}
+			m.pauseStagingRoot = pauseRoot
+			m.backupStaging = uploadRoot
+			var enqueued backup.Task
+			m.SetBackupEnqueue(func(task backup.Task) error { enqueued = task; tasks <- task; return nil })
+			m.SetBackupLoad(func(task backup.Task) (backup.Task, bool, error) {
+				row := enqueued
+				if rowKeepsLocal {
+					// The row an earlier staged enqueue left: same
+					// generation, local paths.
+					for i := range row.Files {
+						row.Files[i].Path = filepath.Join(pauseRoot, "vm-1", row.Generation, row.Files[i].Name)
+					}
+				}
+				return row, true, nil
+			})
+			awaitRehashWorkers(t, m, 1)
+
+			m.backupPause(context.Background(), "vm-1", snap, disk, "", "tok-test", zerolog.Nop())
+			var gen string
+			select {
+			case task := <-tasks:
+				gen = task.Generation
+			case <-time.After(10 * time.Second):
+				t.Fatal("pause never enqueued")
+			}
+			// The worker releases after the enqueue it just reported.
+			deadline := time.Now().Add(5 * time.Second)
+			for {
+				mu.Lock()
+				n := len(dropped)
+				mu.Unlock()
+				if n > 0 || rowKeepsLocal || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			time.Sleep(50 * time.Millisecond)
+			mu.Lock()
+			defer mu.Unlock()
+			local := map[string]bool{
+				filepath.Join(pauseRoot, "vm-1", gen, "vmstate.snap"): true,
+				filepath.Join(pauseRoot, "vm-1", gen, "rootfs.ext4"):  true,
+			}
+			if rowKeepsLocal {
+				if len(dropped) != 0 {
+					t.Fatalf("dropped %v while the journal row still names the local copies", dropped)
+				}
+				return
+			}
+			if len(dropped) != 2 || !local[dropped[0]] || !local[dropped[1]] {
+				t.Fatalf("dropped %v, want exactly the two local copies under %s", dropped, pauseRoot)
+			}
+		})
 	}
 }
 
