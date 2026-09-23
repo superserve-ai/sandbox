@@ -2,9 +2,9 @@ package backup
 
 import "os"
 
-// dropStagingPages is dropPageCache behind a hook so tests can observe which
-// files the uploader lets go of.
-var dropStagingPages = dropPageCache
+// dropStagingPages is DropPageCache behind a hook so tests can observe which
+// files staging lets go of.
+var dropStagingPages = func(path string) error { return DropPageCache(path) }
 
 // DropPageCache drops the cached pages of the file at path. For a staging
 // copy the pipeline has finished reading; never for an original artifact,

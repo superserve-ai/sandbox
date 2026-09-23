@@ -902,7 +902,7 @@ func (u *Uploader) verifiedHere(task *Task, object string) (bool, error) {
 // rather than re-deriving it. shipped counts bytes written into a newly
 // created object (zero on dedupes, skips, and failures that abort the
 // create), so byte accounting reflects storage actually done.
-func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_ ManifestFile, objectPath string, shipped int64, retErr error) {
+func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_ ManifestFile, objectPath string, shipped int64, _ error) {
 	if file.Name == ManifestObject {
 		return ManifestFile{}, "", 0, fmt.Errorf("artifact name %q collides with the manifest object", file.Name)
 	}
@@ -911,20 +911,6 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		return ManifestFile{}, "", 0, err
 	}
 	defer f.Close()
-	if task.Staged && !file.Shared {
-		// The pipeline's own copy, read here for the last time when the
-		// attempt succeeds: hashed, streamed, then deleted on ack. Its
-		// pages are dropped on the way out (before Close) so they stop
-		// displacing cache live VMs need. A failed attempt keeps them for
-		// the retry. A shared base is re-read by every generation on its
-		// template and an unstaged path is an original, so neither is
-		// touched.
-		defer func() {
-			if retErr == nil {
-				_ = dropStagingPages(f)
-			}
-		}()
-	}
 	extents, apparent, err := Extents(f)
 	if err != nil {
 		return ManifestFile{}, "", 0, fmt.Errorf("extents %s: %w", file.Path, err)
