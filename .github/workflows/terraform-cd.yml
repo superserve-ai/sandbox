@@ -5,6 +5,7 @@ name: Terraform CD
 # sequence.
 concurrency:
   group: control-plane-deploy
+  queue: max
   cancel-in-progress: false
 
 on:
@@ -311,9 +312,6 @@ jobs:
           cd infra/envs/production/us-west2
           terraform init -input=false
           terraform validate
-          terraform plan -input=false -out=tfplan
-          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
-          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-usw2
           gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
             --region "${{ vars.GCP_REGION_USW }}" \
             --project "${{ vars.GCP_PROJECT }}" \
@@ -332,12 +330,15 @@ jobs:
             exit "$rc"
           }
           trap rollback EXIT
-          # Keep the new revision out of traffic until the following API job
-          # verifies its runtime KMS access.
+          # Pin before planning: a saved plan can otherwise restore LATEST
+          # during a template update, before the API job verifies access.
           gcloud run services update-traffic "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
             --to-revisions "${previous}=100" \
             --region "${{ vars.GCP_REGION_USW }}" \
             --project "${{ vars.GCP_PROJECT }}"
+          terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-usw2 --pinned-revision "$previous"
           terraform apply -input=false -auto-approve tfplan
           trap - EXIT
 
@@ -537,9 +538,6 @@ jobs:
           cd infra/envs/production/us-east4
           terraform init -input=false
           terraform validate
-          terraform plan -input=false -out=tfplan
-          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --guarded module.sandbox_host_c
-          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-use4
           gcloud run services describe "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
             --region "${{ vars.GCP_REGION_USE4 }}" \
             --project "${{ vars.GCP_PROJECT }}" \
@@ -558,12 +556,15 @@ jobs:
             exit "$rc"
           }
           trap rollback EXIT
-          # Keep the new revision out of traffic until the following API job
-          # verifies its runtime KMS access.
+          # Pin before planning: a saved plan can otherwise restore LATEST
+          # during a template update, before the API job verifies access.
           gcloud run services update-traffic "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
             --to-revisions "${previous}=100" \
             --region "${{ vars.GCP_REGION_USE4 }}" \
             --project "${{ vars.GCP_PROJECT }}"
+          terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --guarded module.sandbox_host_c
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-use4 --pinned-revision "$previous"
           terraform apply -input=false -auto-approve tfplan
           trap - EXIT
 

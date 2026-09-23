@@ -4,6 +4,7 @@ name: Terraform Rollout Staging
 # staged control-plane identity migration.
 concurrency:
   group: control-plane-deploy
+  queue: max
   cancel-in-progress: false
 
 on:

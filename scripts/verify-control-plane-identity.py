@@ -712,10 +712,16 @@ def main() -> int:
                 raise VerificationError(
                     f"unchanged host identity {host} can impersonate serving identity {identity}"
                 )
-        evidence.command(
+        runtime_effective_json = evidence.command(
             "effective-iam",
             effective_iam_command(args.project, identity, bucket),
         )
+        try:
+            # Intended reader grants are valid; incomplete analysis is not.
+            iam_analysis_results(runtime_effective_json)
+        except VerificationError as exc:
+            evidence.index[-1]["status"] = "FAIL"
+            raise VerificationError(f"runtime identity {identity}: {exc}") from exc
         for index, secret in enumerate(cp["secret_ids"], 1):
             evidence.command(
                 f"secret-access-{index}",
