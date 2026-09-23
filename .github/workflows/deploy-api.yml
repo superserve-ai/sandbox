@@ -318,18 +318,15 @@ jobs:
 
       - name: Verify use4 KMS access before routing traffic
         env:
-          KMS_OWNER: ${{ secrets.KMS_POLICY_OWNER_SERVICE_ACCOUNT }}
           RUNTIME_IDENTITY: superserve-controlplane-use4@${{ vars.GCP_PROJECT }}.iam.gserviceaccount.com
         run: |
           set -euo pipefail
-          test -n "$KMS_OWNER" || { echo "KMS_POLICY_OWNER_SERVICE_ACCOUNT is required before production cutover." >&2; exit 1; }
           bash scripts/verify-control-plane-kms.sh \
             --project "${{ vars.GCP_PROJECT }}" \
             --region "${{ vars.GCP_REGION_USE4 }}" \
             --service "${{ vars.CLOUD_RUN_SERVICE_USE4 }}" \
             --runtime-service-account "$RUNTIME_IDENTITY" \
             --kms-key-resource "projects/${{ vars.GCP_PROJECT }}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek" \
-            --kms-owner "$KMS_OWNER" \
             --evidence-dir "$RUNNER_TEMP/control-plane-kms/use4" \
             --secret database-url \
             --secret internal-api-token \
@@ -392,18 +389,15 @@ jobs:
       - name: Verify usw KMS access before routing traffic
         if: vars.CLOUD_RUN_SERVICE_USW != ''
         env:
-          KMS_OWNER: ${{ secrets.KMS_POLICY_OWNER_SERVICE_ACCOUNT }}
           RUNTIME_IDENTITY: superserve-controlplane-usw2@${{ vars.GCP_PROJECT }}.iam.gserviceaccount.com
         run: |
           set -euo pipefail
-          test -n "$KMS_OWNER" || { echo "KMS_POLICY_OWNER_SERVICE_ACCOUNT is required before production cutover." >&2; exit 1; }
           bash scripts/verify-control-plane-kms.sh \
             --project "${{ vars.GCP_PROJECT }}" \
             --region "${{ vars.GCP_REGION_USW }}" \
             --service "${{ vars.CLOUD_RUN_SERVICE_USW }}" \
             --runtime-service-account "$RUNTIME_IDENTITY" \
             --kms-key-resource "projects/${{ vars.GCP_PROJECT }}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek" \
-            --kms-owner "$KMS_OWNER" \
             --evidence-dir "$RUNNER_TEMP/control-plane-kms/usw2" \
             --secret database-url-usw2 \
             --secret internal-api-token \

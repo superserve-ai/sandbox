@@ -109,7 +109,7 @@ locals {
     kms_grant_role            = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
     kms_verification          = "encrypt-decrypt-as-runtime-identity-before-cutover"
     kms_grant_evidence        = "control-plane-identity rollout kms-grant.txt and evidence.json"
-    kms_grant_owner           = "central KMS policy owner (out-of-band)"
+    kms_grant_owner           = "regional Terraform root"
     host_identity_unchanged   = local.host_identity_unchanged
     host_identities_unchanged = local.host_identities_unchanged
   }

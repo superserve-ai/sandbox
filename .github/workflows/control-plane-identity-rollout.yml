@@ -67,6 +67,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
           identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/staging-contract.json"
@@ -178,28 +179,20 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
           identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/use4-contract.json"
           gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
             > "$RUNNER_TEMP/control-plane-identity/use4/pre-kms-route.stdout" \
             2> "$RUNNER_TEMP/control-plane-identity/use4/pre-kms-route.stderr"
-          kms_owner="${{ secrets.KMS_POLICY_OWNER_SERVICE_ACCOUNT }}"
-          test -n "$kms_owner" || { echo "KMS_POLICY_OWNER_SERVICE_ACCOUNT is required for production cutover." >&2; exit 1; }
           kms_key=$(jq -r '.kms_key_resource // empty' "$GITHUB_WORKSPACE/use4-contract.json")
           runtime_identity=$(jq -r '.runtime_service_account // empty' "$GITHUB_WORKSPACE/use4-contract.json")
           kms_principal=$(jq -r '.kms_grant_principal // empty' "$GITHUB_WORKSPACE/use4-contract.json")
           test -n "$kms_key" -a -n "$runtime_identity" -a "$kms_principal" = "$runtime_identity" || { echo "Production identity contract is missing a matching KMS key, runtime identity, or grant principal." >&2; exit 1; }
-          gcloud kms keys add-iam-policy-binding "$kms_key" \
-            --member="serviceAccount:${runtime_identity}" \
-            --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" \
-            --impersonate-service-account="$kms_owner" \
-            --project="$PROJECT" \
-            > "$RUNNER_TEMP/control-plane-identity/use4/kms-grant.stdout" \
-            2> "$RUNNER_TEMP/control-plane-identity/use4/kms-grant.stderr"
           cat > "$RUNNER_TEMP/control-plane-identity/use4/kms-grant.txt" <<EOF
-          status=applied-before-cutover
-          owner=$kms_owner
+          status=terraform-managed-before-cutover
+          owner=terraform
           identity=$runtime_identity
           key=$kms_key
           role=roles/cloudkms.cryptoKeyEncrypterDecrypter
@@ -212,7 +205,6 @@ jobs:
             --previous-revision "$previous" \
             --allow-pending-traffic \
             --route-traffic \
-            --kms-owner "$kms_owner" \
             --contract-file "$GITHUB_WORKSPACE/use4-contract.json" \
             --evidence-dir "$RUNNER_TEMP/control-plane-identity/use4" \
             --other-bucket superserve-artifact-backup-staging-usc1 \
@@ -304,28 +296,20 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
           identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/usw2-contract.json"
           gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
             > "$RUNNER_TEMP/control-plane-identity/usw2/pre-kms-route.stdout" \
             2> "$RUNNER_TEMP/control-plane-identity/usw2/pre-kms-route.stderr"
-          kms_owner="${{ secrets.KMS_POLICY_OWNER_SERVICE_ACCOUNT }}"
-          test -n "$kms_owner" || { echo "KMS_POLICY_OWNER_SERVICE_ACCOUNT is required for production cutover." >&2; exit 1; }
           kms_key=$(jq -r '.kms_key_resource // empty' "$GITHUB_WORKSPACE/usw2-contract.json")
           runtime_identity=$(jq -r '.runtime_service_account // empty' "$GITHUB_WORKSPACE/usw2-contract.json")
           kms_principal=$(jq -r '.kms_grant_principal // empty' "$GITHUB_WORKSPACE/usw2-contract.json")
           test -n "$kms_key" -a -n "$runtime_identity" -a "$kms_principal" = "$runtime_identity" || { echo "Production identity contract is missing a matching KMS key, runtime identity, or grant principal." >&2; exit 1; }
-          gcloud kms keys add-iam-policy-binding "$kms_key" \
-            --member="serviceAccount:${runtime_identity}" \
-            --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" \
-            --impersonate-service-account="$kms_owner" \
-            --project="$PROJECT" \
-            > "$RUNNER_TEMP/control-plane-identity/usw2/kms-grant.stdout" \
-            2> "$RUNNER_TEMP/control-plane-identity/usw2/kms-grant.stderr"
           cat > "$RUNNER_TEMP/control-plane-identity/usw2/kms-grant.txt" <<EOF
-          status=applied-before-cutover
-          owner=$kms_owner
+          status=terraform-managed-before-cutover
+          owner=terraform
           identity=$runtime_identity
           key=$kms_key
           role=roles/cloudkms.cryptoKeyEncrypterDecrypter
@@ -338,7 +322,6 @@ jobs:
             --previous-revision "$previous" \
             --allow-pending-traffic \
             --route-traffic \
-            --kms-owner "$kms_owner" \
             --contract-file "$GITHUB_WORKSPACE/usw2-contract.json" \
             --evidence-dir "$RUNNER_TEMP/control-plane-identity/usw2" \
             --other-bucket superserve-artifact-backup-staging-usc1 \
