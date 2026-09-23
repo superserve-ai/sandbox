@@ -706,8 +706,8 @@ type Manager struct {
 	savedCapturesOnce sync.Once
 	savedIDMu         sync.Mutex
 	savedIDLocks      map[string]*savedIDLock // see lockSavedSnapshot
-	// reflinkOverlay stands in for the exact overlay clone in tests.
-	reflinkOverlay func(ctx context.Context, src, dst string) error
+	// reflinkFile stands in for the exact file clone in tests.
+	reflinkFile func(ctx context.Context, src, dst string) error
 
 	// launchGenSeq issues launch generations. It is manager-global and
 	// monotonic on purpose: a per-instance counter restarts at zero whenever
@@ -7334,15 +7334,16 @@ func (m *Manager) cloneSavedDisk(ctx context.Context, dirName, savedDisk, basePa
 	if err := os.MkdirAll(vmDir, 0o755); err != nil {
 		return "", fmt.Errorf("mkdir vm dir: %w", err)
 	}
-	name, copy := "rootfs.ext4", cloneOrCopyFile
+	name := "rootfs.ext4"
 	if basePath != "" {
-		name, copy = "overlay.ext4", reflinkFileExact
-		if m.reflinkOverlay != nil {
-			copy = m.reflinkOverlay
-		}
+		name = "overlay.ext4"
+	}
+	clone := reflinkFileExact
+	if m.reflinkFile != nil {
+		clone = m.reflinkFile
 	}
 	dst := filepath.Join(vmDir, name)
-	if err := copy(ctx, savedDisk, dst); err != nil {
+	if err := clone(ctx, savedDisk, dst); err != nil {
 		// A partial file left here would pass a same-id retry as the VM's
 		// existing disk.
 		_ = os.Remove(dst)
@@ -9037,8 +9038,12 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 	if in.FreezeToken == "" {
 		// An unfrozen rewrite that was interrupted: the images here are
 		// unfrozen or torn, so a manifest beside them that says frozen is
-		// stale either way and must not outlive the intent.
+		// stale either way and must not outlive the intent. A staged write
+		// left them as they were.
 		for _, name := range []string{"mem.diff", "mem.snap"} {
+			if in.Staged {
+				break
+			}
 			if _, err := removeWallClockManifest(filepath.Join(dir, name)); err != nil {
 				log.Error().Err(err).Msg("reattach: a stale frozen manifest beside an interrupted rewrite could not be removed; parking as error")
 				return false

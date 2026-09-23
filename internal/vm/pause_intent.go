@@ -22,6 +22,9 @@ type pauseIntent struct {
 	VMID        string `json:"vm_id"`
 	FreezeToken string `json:"freeze_token,omitempty"`
 	ArtifactID  string `json:"artifact_id"`
+	// Staged means the write went to a staging directory and the images
+	// beside this intent were not touched, so their manifests stand.
+	Staged bool `json:"staged,omitempty"`
 }
 
 func pauseIntentPath(dir string) string { return filepath.Join(dir, pauseIntentName) }

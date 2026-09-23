@@ -261,7 +261,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
 		return fmt.Errorf("create source snapshot dir: %w", err)
 	}
-	if err := writePauseIntent(sourceDir, pauseIntent{VMID: vmID, FreezeToken: token, ArtifactID: artifact}); err != nil {
+	if err := writePauseIntent(sourceDir, pauseIntent{VMID: vmID, FreezeToken: token, ArtifactID: artifact, Staged: true}); err != nil {
 		return fmt.Errorf("record capture intent: %w", err)
 	}
 	frozen := false
@@ -512,8 +512,8 @@ func (m *Manager) captureSavedDisk(ctx context.Context, diskPath, basePath, tmp,
 	if basePath != "" {
 		name = "overlay.ext4"
 		copy = reflinkFileExact
-		if m.reflinkOverlay != nil {
-			copy = m.reflinkOverlay
+		if m.reflinkFile != nil {
+			copy = m.reflinkFile
 		}
 	}
 	if err := copy(ctx, diskPath, filepath.Join(tmp, name)); err != nil {

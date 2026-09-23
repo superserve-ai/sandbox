@@ -32,7 +32,7 @@ func newSavedTestManager(t *testing.T) *Manager {
 		// Every seeded source is at rest; the real probe needs systemd and cgroups.
 		unitDead: func(context.Context, string) bool { return true },
 		// The test filesystem may not reflink; the refusal has its own test.
-		reflinkOverlay: cloneOrCopyFile,
+		reflinkFile: cloneOrCopyFile,
 	}
 	if err := os.MkdirAll(m.cfg.SnapshotDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -375,7 +375,7 @@ func TestSavedSnapshotIDLockSerializesDelete(t *testing.T) {
 
 func TestOverlayCaptureRefusesWithoutReflink(t *testing.T) {
 	m := newSavedTestManager(t)
-	m.reflinkOverlay = nil
+	m.reflinkFile = nil
 	probe := filepath.Join(t.TempDir(), "probe")
 	if err := os.WriteFile(probe, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
@@ -514,7 +514,7 @@ func TestCloneSavedDiskLeavesNoPartialFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.reflinkOverlay = func(_ context.Context, _, dst string) error {
+	m.reflinkFile = func(_ context.Context, _, dst string) error {
 		if err := os.WriteFile(dst, []byte("partial"), 0o644); err != nil {
 			return err
 		}
@@ -573,7 +573,7 @@ func TestRestoreDiscardsAFailedSavedDiskClone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.reflinkOverlay = func(_ context.Context, _, dst string) error {
+	m.reflinkFile = func(_ context.Context, _, dst string) error {
 		_ = os.WriteFile(dst, []byte("partial"), 0o644)
 		return errors.New("disk full")
 	}
@@ -625,5 +625,54 @@ func TestSavedSnapshotDiskSizeSurvivesReattach(t *testing.T) {
 	}
 	if man.DiskSizeMiB == 0 {
 		t.Error("disk size lost across reattach")
+	}
+}
+
+func TestRecoveryKeepsTheSourceImageManifestAfterAStagedCapture(t *testing.T) {
+	raiseFloorForTest(t)
+	m := newSavedTestManager(t)
+	vmDir := filepath.Join(m.cfg.SnapshotDir, "vm-1")
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mem := filepath.Join(vmDir, "mem.diff")
+	frozen := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: "resume", WorkloadFrozen: true, FreezeToken: "tok"}
+	if err := WriteWallClockManifest(mem, frozen); err != nil {
+		t.Fatal(err)
+	}
+	inst := &VMInstance{ID: "vm-1"}
+	if err := writePauseIntent(vmDir, pauseIntent{VMID: "vm-1", ArtifactID: "capture", Staged: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !m.recoverPauseIntent(context.Background(), inst, zerolog.Nop()) {
+		t.Fatal("recovery after a staged capture failed")
+	}
+	if !fileExists(WallClockMarkerPath(mem)) {
+		t.Fatal("a staged capture's recovery stripped the manifest the source image still needs")
+	}
+	// An interrupted in-place rewrite still strips it.
+	if err := writePauseIntent(vmDir, pauseIntent{VMID: "vm-1", ArtifactID: "rewrite"}); err != nil {
+		t.Fatal(err)
+	}
+	if !m.recoverPauseIntent(context.Background(), inst, zerolog.Nop()) {
+		t.Fatal("recovery after a rewrite failed")
+	}
+	if fileExists(WallClockMarkerPath(mem)) {
+		t.Error("an interrupted rewrite's stale manifest survived")
+	}
+}
+
+func TestStandaloneSavedDiskRestoreRefusesWithoutReflink(t *testing.T) {
+	m := newSavedTestManager(t)
+	m.reflinkFile = nil
+	saved := filepath.Join(m.cfg.SnapshotDir, "rootfs.ext4")
+	if err := os.WriteFile(saved, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := reflinkFileExact(context.Background(), saved, saved+".clone"); err == nil {
+		t.Skip("test filesystem reflinks; the refusal cannot be exercised here")
+	}
+	if _, err := m.cloneSavedDisk(context.Background(), uuid.NewString(), saved, ""); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("standalone restore without reflink: want FailedPrecondition, got %v", err)
 	}
 }
