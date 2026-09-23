@@ -447,6 +447,10 @@ type Manager struct {
 	// backupEnqueue hands finalized pause manifests to the durability
 	// pipeline; nil when backup is disabled. See SetBackupEnqueue.
 	backupEnqueue func(backup.Task) error
+	// backupLoad reads back the journal row a generation ended up with,
+	// which is the only authority on whose staged copy the uploader
+	// will read; nil means no row is ever assumed.
+	backupLoad func(backup.Task) (backup.Task, bool, error)
 	// backupReader and backupLister bring a lost pause back from the bucket
 	// so a resume can revive the sandbox from its disk.
 	backupRestoreOn   atomic.Bool

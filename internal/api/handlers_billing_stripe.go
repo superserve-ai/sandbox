@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +41,7 @@ const (
 )
 
 var errBillingRedirectOriginsNotConfigured = errors.New("billing redirect origins are not configured")
+var errStripeCheckoutAssociationPending = errors.New("Stripe checkout association is still being established")
 
 type StripeBillingClient interface {
 	CreateCustomer(ctx context.Context, params StripeCreateCustomerParams) (StripeCustomer, error)
@@ -334,6 +336,12 @@ func (c *stripeHTTPClient) CreateBillingCreditGrant(ctx context.Context, params 
 	form.Set("amount[monetary][currency]", "usd")
 	form.Set("amount[monetary][value]", strconv.FormatInt(params.AmountCents, 10))
 	form.Set("applicability_config[scope][price_type]", "metered")
+	// The team-scoped idempotency key is also persisted on the grant so
+	// recovery can distinguish this entitlement from another promotional grant
+	// belonging to the same customer.
+	if params.AmountCents == 9500 && strings.TrimSpace(params.IdempotencyKey) != "" {
+		form.Set("metadata[activation_identity]", params.IdempotencyKey)
+	}
 	var resp struct {
 		ID string `json:"id"`
 	}
@@ -1718,7 +1726,8 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-		existing, gerr := recordQ.GetStripeWebhookEventForUpdate(c.Request.Context(), event.ID)
+		// Preserve the account-before-webhook lock order used by checkout reconciliation.
+		existing, gerr := recordQ.GetStripeWebhookEvent(c.Request.Context(), event.ID)
 		if gerr != nil {
 			log.Error().Err(gerr).Str("event_id", event.ID).Msg("load existing Stripe webhook event failed")
 			respondError(c, ErrInternal)
@@ -1735,6 +1744,7 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 			return
 		}
 	}
+	// Release recording locks before processing acquires the billing-account lock.
 	if err := recordTx.Commit(c.Request.Context()); err != nil {
 		log.Error().Err(err).Str("event_id", event.ID).Msg("commit Stripe webhook record failed")
 		respondError(c, ErrInternal)
@@ -1754,6 +1764,13 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 		_ = processTx.Rollback(c.Request.Context())
 	}()
 	q := h.DB.WithTx(processTx)
+
+	if err := h.lockStripeWebhookAccountForProcessing(c.Request.Context(), q, event); err != nil {
+		log.Error().Err(err).Str("event_id", event.ID).Str("event_type", event.Type).Msg("lock Stripe billing account before webhook event failed")
+		h.rollbackAndPersistStripeWebhookFailure(c.Request.Context(), processTx, event.ID, err.Error())
+		respondError(c, ErrInternal)
+		return
+	}
 
 	existing, err := q.GetStripeWebhookEventForUpdate(c.Request.Context(), event.ID)
 	if err != nil {
@@ -1850,6 +1867,42 @@ func (h *Handlers) rollbackAndPersistStripeWebhookFailure(ctx context.Context, t
 	}
 }
 
+// lockStripeWebhookAccountForProcessing establishes the lock order shared by
+// normal webhook delivery and checkout reconciliation: the team billing row is
+// acquired before any webhook row. This prevents a deferred subscription
+// delivery and checkout reconciliation from taking opposite lock orders.
+func (h *Handlers) lockStripeWebhookAccountForProcessing(ctx context.Context, q *db.Queries, event stripeEventEnvelope) error {
+	switch event.Type {
+	case "checkout.session.completed", "checkout.session.expired":
+		var obj stripeCheckoutCompletedObject
+		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
+			return err
+		}
+		teamID, err := uuid.Parse(strings.TrimSpace(obj.ClientReferenceID))
+		if err != nil {
+			return err
+		}
+		_, err = q.LockTeamBillingAccount(ctx, teamID)
+		return err
+	case "customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted", "customer.subscription.paused", "customer.subscription.resumed":
+		var obj stripeSubscriptionObject
+		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
+			return err
+		}
+		_, err := q.LockTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
+		return err
+	case "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
+		var obj stripeInvoiceObject
+		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
+			return err
+		}
+		_, err := q.LockTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
+		return err
+	default:
+		return nil
+	}
+}
+
 func (h *Handlers) resolveStripeWebhookRouting(ctx context.Context, event *stripeEventEnvelope) (stripeWebhookRoutingDecision, error) {
 	switch event.Type {
 	case "checkout.session.completed", "checkout.session.expired":
@@ -1912,6 +1965,113 @@ func isStripeMeterErrorEvent(eventType string) bool {
 		eventType == "billing.meter.no_meter_found" || eventType == "v1.billing.meter.no_meter_found"
 }
 
+func isActivatingStripeSubscriptionStatus(status string) bool {
+	return strings.EqualFold(strings.TrimSpace(status), "active") || strings.EqualFold(strings.TrimSpace(status), "trialing")
+}
+
+func isTerminalStripeSubscriptionStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "canceled", "unpaid", "paused", "incomplete_expired":
+		return true
+	default:
+		return false
+	}
+}
+
+func isStripeActivationStateComplete(account db.TeamBillingAccount) bool {
+	return account.TrialEndedAt.Valid &&
+		account.StripeActivationCreditGrantedAt.Valid &&
+		strings.TrimSpace(derefString(account.StripeActivationCreditGrantID)) != ""
+}
+
+func shouldSkipEqualTimestampStripeSubscription(account db.TeamBillingAccount, incomingSubscriptionID, incomingStatus string) bool {
+	currentSubscriptionID := strings.TrimSpace(derefString(account.StripeSubscriptionID))
+	if currentSubscriptionID == "" || currentSubscriptionID != strings.TrimSpace(incomingSubscriptionID) {
+		return false
+	}
+	previousStatus := derefString(account.StripeSubscriptionStatus)
+	// At Stripe's one-second timestamp precision, terminal state wins over
+	// non-terminal state. This prevents an equal-time cancellation from being
+	// discarded after a past_due/incomplete event, while the terminal-state
+	// check below prevents an equal-time activation from resurrecting billing.
+	if isTerminalStripeSubscriptionStatus(incomingStatus) {
+		return isTerminalStripeSubscriptionStatus(previousStatus)
+	}
+	if isTerminalStripeSubscriptionStatus(previousStatus) {
+		return true
+	}
+	if !isActivatingStripeSubscriptionStatus(incomingStatus) {
+		return true
+	}
+	return isActivatingStripeSubscriptionStatus(previousStatus) && isStripeActivationStateComplete(account)
+}
+
+func stripeSubscriptionMatchesCurrentAssociation(account db.TeamBillingAccount, subscriptionID string) bool {
+	currentSubscriptionID := strings.TrimSpace(derefString(account.StripeSubscriptionID))
+	return currentSubscriptionID != "" && currentSubscriptionID == strings.TrimSpace(subscriptionID)
+}
+
+func shouldIgnoreUnassociatedStripeSubscriptionCreated(account db.TeamBillingAccount, subscriptionID string) (deferProcessing bool, ignore bool) {
+	if stripeSubscriptionMatchesCurrentAssociation(account, subscriptionID) {
+		return false, false
+	}
+	// A reservation still being established must remain retryable. Once the
+	// reservation has completed or expired, any persisted association (including
+	// the retained session ID after expiry) makes an unassociated delivery stale.
+	if account.CheckoutInitializingAt.Valid {
+		return true, false
+	}
+	if strings.TrimSpace(derefString(account.StripeSubscriptionID)) != "" || account.CheckoutSessionID != nil {
+		return false, true
+	}
+	// A customer-mapped team with no current subscription or checkout
+	// reservation may be receiving its first subscription outside Checkout
+	// (for example, after a sales-assisted billing handoff). The signed
+	// customer-to-team mapping is the authority for that initial import.
+	if strings.TrimSpace(derefString(account.StripeCustomerID)) != "" {
+		return false, false
+	}
+	return false, true
+}
+
+func (h *Handlers) reconcilePendingStripeSubscriptionEvents(ctx context.Context, tx pgx.Tx, pending []db.StripeWebhookEvent) error {
+	type pendingEvent struct {
+		id       string
+		event    stripeEventEnvelope
+		terminal bool
+	}
+	events := make([]pendingEvent, 0, len(pending))
+	for _, row := range pending {
+		var event stripeEventEnvelope
+		if err := json.Unmarshal(row.Payload, &event); err != nil {
+			return fmt.Errorf("decode deferred Stripe subscription event %s: %w", row.EventID, err)
+		}
+		var obj stripeSubscriptionObject
+		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
+			return fmt.Errorf("decode deferred Stripe subscription object %s: %w", row.EventID, err)
+		}
+		events = append(events, pendingEvent{row.EventID, event, event.Type == "customer.subscription.deleted" || isTerminalStripeSubscriptionStatus(obj.Status)})
+	}
+	// Apply the latest retained state before any activation side effects.
+	// Terminal state wins ties at Stripe's one-second timestamp precision.
+	sort.SliceStable(events, func(i, j int) bool {
+		if events[i].event.Created != events[j].event.Created {
+			return events[i].event.Created > events[j].event.Created
+		}
+		return events[i].terminal && !events[j].terminal
+	})
+	q := h.DB.WithTx(tx)
+	for _, pending := range events {
+		if err := h.processStripeWebhookEvent(ctx, tx, pending.event); err != nil {
+			return err
+		}
+		if _, err := q.MarkStripeWebhookEventProcessed(ctx, pending.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (h *Handlers) processStripeWebhookEvent(ctx context.Context, tx pgx.Tx, event stripeEventEnvelope) error {
 	q := h.DB.WithTx(tx)
 	eventAt := stripeEventTime(int64(event.Created))
@@ -1930,11 +2090,25 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, tx pgx.Tx, eve
 		if err != nil {
 			return err
 		}
-		account, err := q.GetTeamBillingAccount(ctx, teamID)
+		// Checkout completion is authoritative only for the customer that
+		// started the current reservation. A delayed completion from a
+		// different customer must not rebind the team.
+		if strings.TrimSpace(obj.Customer) == "" || strings.TrimSpace(obj.Subscription) == "" {
+			return fmt.Errorf("completed Stripe checkout is missing customer or subscription")
+		}
+		// Account-before-webhook locking prevents deadlocks with subscription delivery.
+		account, err := q.LockTeamBillingAccount(ctx, teamID)
+		if err != nil {
+			return err
+		}
+		pending, err := q.LockPendingStripeSubscriptionEvents(ctx, obj.Customer, obj.Subscription)
 		if err != nil {
 			return err
 		}
 		if account.CheckoutSessionID == nil || *account.CheckoutSessionID != obj.ID {
+			return nil
+		}
+		if account.StripeCustomerID == nil || *account.StripeCustomerID != obj.Customer {
 			return nil
 		}
 		_, err = q.UpsertTeamBillingAccountSubscription(ctx, db.UpsertTeamBillingAccountSubscriptionParams{
@@ -1942,7 +2116,19 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, tx pgx.Tx, eve
 			StripeCustomerID:     stringPtr(obj.Customer),
 			StripeSubscriptionID: stringPtr(obj.Subscription),
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		if err := q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{
+			TeamID:         teamID,
+			SubscriptionID: stringPtr(obj.Subscription),
+		}); err != nil {
+			return err
+		}
+		// Checkout proves the session/subscription pair. Reconcile matching
+		// lifecycle events newest first so stale activation cannot grant credit
+		// before an already-retained cancellation is applied.
+		return h.reconcilePendingStripeSubscriptionEvents(ctx, tx, pending)
 	case "checkout.session.expired":
 		var obj stripeCheckoutCompletedObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
@@ -1958,7 +2144,7 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, tx pgx.Tx, eve
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return err
 		}
-		account, err := q.GetTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
+		account, err := q.LockTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
 		if err != nil {
 			return err
 		}
@@ -1968,23 +2154,40 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, tx pgx.Tx, eve
 		if eventAt.IsZero() {
 			return nil
 		}
-		if account.StripeSubscriptionEventAt.Valid && !eventAt.After(account.StripeSubscriptionEventAt.Time.UTC()) {
+		associated := stripeSubscriptionMatchesCurrentAssociation(account, obj.ID)
+		if event.Type == "customer.subscription.created" {
+			deferProcessing, ignore := shouldIgnoreUnassociatedStripeSubscriptionCreated(account, obj.ID)
+			if deferProcessing {
+				return errStripeCheckoutAssociationPending
+			}
+			if ignore {
+				return nil
+			}
+			associated = true
+		} else if !associated {
+			if account.CheckoutInitializingAt.Valid {
+				return errStripeCheckoutAssociationPending
+			}
 			return nil
 		}
-		if event.Type != "customer.subscription.created" &&
-			(account.StripeSubscriptionID == nil || *account.StripeSubscriptionID != obj.ID) {
-			return nil
-		}
-		// While Checkout is reserved, a created event for an older subscription
-		// must not replace the subscription recorded by the current attempt.
-		// Outside Checkout, retain normal event-time ordering for subscription
-		// reconciliation (including first-time imports of an existing account).
-		if event.Type == "customer.subscription.created" && account.CheckoutInitializingAt.Valid &&
-			(account.StripeSubscriptionID == nil || *account.StripeSubscriptionID != obj.ID) {
-			return nil
+		if account.StripeSubscriptionEventAt.Valid {
+			previousAt := account.StripeSubscriptionEventAt.Time.UTC()
+			if eventAt.Before(previousAt) {
+				return nil
+			}
+			// Stripe timestamps have second precision. Permit an equal-time
+			// activation to complete a state that was only partially observed,
+			// but never let an equal-time event regress an already terminal state.
+			orderingStatus := obj.Status
+			if event.Type == "customer.subscription.deleted" {
+				orderingStatus = "canceled"
+			}
+			if eventAt.Equal(previousAt) && shouldSkipEqualTimestampStripeSubscription(account, obj.ID, orderingStatus) {
+				return nil
+			}
 		}
 		start, end, ok := stripeSubscriptionPeriodBounds(obj)
-		terminalStatus := strings.EqualFold(obj.Status, "unpaid") || strings.EqualFold(obj.Status, "canceled") || strings.EqualFold(obj.Status, "paused") || event.Type == "customer.subscription.deleted"
+		terminalStatus := isTerminalStripeSubscriptionStatus(obj.Status) || event.Type == "customer.subscription.deleted"
 		if !ok && !terminalStatus {
 			return nil
 		}
@@ -1993,7 +2196,7 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, tx pgx.Tx, eve
 			periodStart = timestamptzFromUnix(start)
 			periodEnd = timestamptzFromUnix(end)
 		}
-		_, err = q.UpsertTeamBillingAccountSubscription(ctx, db.UpsertTeamBillingAccountSubscriptionParams{
+		updated, err := q.UpsertTeamBillingAccountSubscription(ctx, db.UpsertTeamBillingAccountSubscriptionParams{
 			TeamID:                    account.TeamID,
 			StripeCustomerID:          stringPtr(obj.Customer),
 			StripeSubscriptionID:      stringPtr(obj.ID),
@@ -2007,7 +2210,10 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, tx pgx.Tx, eve
 			return err
 		}
 		if strings.EqualFold(obj.Status, "active") || strings.EqualFold(obj.Status, "trialing") {
-			grantID := derefString(account.StripeActivationCreditGrantID)
+			// Use the row returned by the upsert. The billing row lock and this
+			// read ensure distinct webhook IDs and recovery cannot both decide
+			// that the team still needs a grant.
+			grantID := derefString(updated.StripeActivationCreditGrantID)
 			if grantID == "" {
 				if h.Stripe == nil {
 					return fmt.Errorf("Stripe billing client is not configured")
@@ -2025,7 +2231,16 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, tx pgx.Tx, eve
 				}
 				grantID = grant.ID
 			}
-			return q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: account.TeamID, StripeGrantID: grantID})
+			if err := q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: account.TeamID, StripeGrantID: grantID}); err != nil {
+				return err
+			}
+			// Only the checkout associated with this subscription is cleared.
+			// The predicate is a no-op for non-checkout activations and protects
+			// a newer reservation from delayed subscription events.
+			return q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{
+				TeamID:         account.TeamID,
+				SubscriptionID: stringPtr(obj.ID),
+			})
 		}
 		return nil
 	case "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
@@ -2033,7 +2248,7 @@ func (h *Handlers) processStripeWebhookEvent(ctx context.Context, tx pgx.Tx, eve
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
 			return err
 		}
-		account, err := q.GetTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
+		account, err := q.LockTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
 		if err != nil {
 			return err
 		}

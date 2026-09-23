@@ -31,4 +31,4 @@ cp -R db supabase "$sqlc_dir/"
 mkdir -p "$sqlc_dir/internal/db"
 suite billing-sqlc-generate sqlc generate -f "$sqlc_dir/sqlc.yaml"
 # The DB package also contains a handwritten transaction helper.
-suite billing-sqlc-drift diff -ru --exclude='*_test.go' --exclude='host_capabilities.go' internal/db "$sqlc_dir/internal/db"
+suite billing-sqlc-drift diff -ru --exclude='*_test.go' --exclude='host_capabilities.go' --exclude='billing_lock.go' internal/db "$sqlc_dir/internal/db"

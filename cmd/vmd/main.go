@@ -1371,6 +1371,7 @@ func main() {
 		mgr.SetBackupStaging(stagingRoot)
 		mgr.SetPauseStagingRoot(pauseStagingRoot)
 		mgr.SetBackupEnqueue(journal.Enqueue)
+		mgr.SetBackupLoad(journal.Load)
 		mgr.SetBackupCovered(func(t backup.Task) (bool, error) {
 			// Coverage is per bucket: a completed generation elsewhere
 			// must not suppress uploading into this one.

@@ -446,9 +446,10 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[34].(*pgtype.Timestamptz) = s.PauseOpAttentionAt
 		*dest[35].(**string) = s.PauseOpTrigger
 		*dest[36].(*pgtype.UUID) = s.PauseOpActorID
-		if len(dest) == 38 {
+		*dest[37].(*pgtype.UUID) = s.SourceSnapshotID
+		if len(dest) == 39 {
 			// GetSandboxWithPreviewPolicy: trailing COALESCE'd effective access.
-			*dest[37].(*string) = "legacy_public"
+			*dest[38].(*string) = "legacy_public"
 		}
 		return nil
 	}}
@@ -1188,7 +1189,7 @@ func snapshotRow(s db.Snapshot) *mockRow {
 // missing snapshot row.
 func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, ports ...publishedPortResponse) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
-		if err := sandboxRow(sb).scanFn(dest[:37]...); err != nil {
+		if err := sandboxRow(sb).scanFn(dest[:38]...); err != nil {
 			return err
 		}
 		var snapPath, snapMemPath *string
@@ -1198,15 +1199,15 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			snapPath, snapMemPath = &p, snap.MemPath
 			snapCreatedAt = pgtype.Timestamptz{Time: snap.CreatedAt, Valid: true}
 		}
-		*dest[37].(**string) = snapPath
-		*dest[38].(**string) = snapMemPath
-		*dest[39].(*pgtype.Timestamptz) = snapCreatedAt
+		*dest[38].(**string) = snapPath
+		*dest[39].(**string) = snapMemPath
+		*dest[40].(*pgtype.Timestamptz) = snapCreatedAt
 		if access == "" {
 			access = preview.AccessLegacyPublic
 		}
-		*dest[40].(*string) = access
 		*dest[41].(*string) = access
-		*dest[42].(*int64) = revision
+		*dest[42].(*string) = access
+		*dest[43].(*int64) = revision
 		numbers, accesses, versions := []int32{}, []string{}, []int64{}
 		for _, port := range ports {
 			version := port.TokenVersion
@@ -1217,10 +1218,10 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			accesses = append(accesses, port.Access)
 			versions = append(versions, version)
 		}
-		*dest[43].(*[]int32) = numbers
-		*dest[44].(*[]string) = accesses
-		*dest[45].(*[]int64) = versions
-		*dest[46].(**string) = nil
+		*dest[44].(*[]int32) = numbers
+		*dest[45].(*[]string) = accesses
+		*dest[46].(*[]int64) = versions
+		*dest[47].(**string) = nil
 		return nil
 	}}
 }
