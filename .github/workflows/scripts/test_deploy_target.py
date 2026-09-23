@@ -75,7 +75,10 @@ class DeployTargetTests(unittest.TestCase):
         self.assertIn('EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}', gate)
         self.assertIn('EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}', gate)
         production = workflow.split('  deploy-production:\n', 1)[1]
-        self.assertIn('Record linked staging promotion evidence', production)
+        self.assertIn('Validate linked staging promotion evidence', production)
+        self.assertIn('echo "- Evidence status: $EVIDENCE_STATUS"', production)
+        self.assertNotIn('echo "- Executable runbook: $RUNBOOK_URL"', production)
+        self.assertNotIn('echo "- Recorded staging evidence: $EVIDENCE_URL"', production)
         self.assertIn("vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS == 'passed'", production)
         script = gate.split('        run: |\n', 1)[1]
         cases = (

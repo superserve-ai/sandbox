@@ -242,7 +242,7 @@ jobs:
         with:
           ref: ${{ inputs.revision || github.sha }}
 
-      - name: Record linked staging promotion evidence
+      - name: Validate linked staging promotion evidence
         env:
           RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}
           EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
@@ -259,8 +259,9 @@ jobs:
           fi
           {
             echo '### Proxy generation promotion evidence'
-            echo "- Executable runbook: $RUNBOOK_URL"
-            echo "- Recorded staging evidence: $EVIDENCE_URL"
+            # Actions summaries are public for this repository.  Keep the
+            # configured runbook/evidence URLs out of the summary because the
+            # gate intentionally accepts links whose access may be private.
             echo "- Evidence status: $EVIDENCE_STATUS"
           } >> "$GITHUB_STEP_SUMMARY"
 
