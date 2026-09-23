@@ -525,3 +525,61 @@ func TestCloneSavedDiskLeavesNoPartialFile(t *testing.T) {
 		t.Error("partial clone left behind for a retry to adopt")
 	}
 }
+
+func TestCaptureQueuedOnABusyVMHoldsNoSlot(t *testing.T) {
+	m := newSavedTestManager(t)
+	m.cfg.SavedSnapshotConcurrency = 1
+	inst, _ := seedPausedSource(t, m, false)
+	release, err := m.acquireSavedCapture(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	busy := uuid.NewString()
+	unlockBusy, err := m.lockVMOp(context.Background(), busy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	queued := make(chan struct{})
+	go func() {
+		defer close(queued)
+		_, _ = m.CreateSavedSnapshot(ctx, busy, uuid.NewString(), SavedSnapshotFS)
+	}()
+	// A slot taken on the way to the VM lock stays taken until the lock
+	// frees, so a short wait is enough to see it.
+	time.Sleep(100 * time.Millisecond)
+	if n := len(m.savedCaptures); n != 0 {
+		t.Fatalf("%d slot(s) held by a request still waiting for its VM lock", n)
+	}
+	tctx, tcancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer tcancel()
+	if _, err := m.CreateSavedSnapshot(tctx, inst.ID, uuid.NewString(), SavedSnapshotFS); err != nil {
+		t.Fatalf("capture of an idle VM behind a queued request for another: %v", err)
+	}
+	cancel()
+	unlockBusy()
+	<-queued
+}
+
+func TestRestoreDiscardsAFailedSavedDiskClone(t *testing.T) {
+	m := newSavedTestManager(t)
+	m.restoreSem = make(chan struct{}, 1)
+	inst, _ := seedPausedSource(t, m, true)
+	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.reflinkOverlay = func(_ context.Context, _, dst string) error {
+		_ = os.WriteFile(dst, []byte("partial"), 0o644)
+		return errors.New("disk full")
+	}
+	child := uuid.NewString()
+	cfg := VMConfig{VCPU: man.VCPU, MemoryMiB: man.MemoryMiB, BasePath: man.BasePath, SavedDiskPath: man.DiskPath}
+	if _, err := m.restoreVMSnapshot(context.Background(), child, man.SnapshotPath, man.MemPath, cfg, nil, "", "", "", nil, 0, ""); err == nil {
+		t.Fatal("restore should fail with the clone")
+	}
+	if _, err := os.Stat(filepath.Join(m.cfg.RunDir, child)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("run dir survived the failed clone, so a retry would reuse a disk that was never made: %v", err)
+	}
+}

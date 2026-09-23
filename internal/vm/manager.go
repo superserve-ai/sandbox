@@ -3691,6 +3691,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	if diskErr != nil {
 		tFailBoundary = time.Now()
+		// A run dir left behind makes the retry plan a reuse of the disk
+		// this attempt never finished.
+		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		return nil, diskErr
 	}

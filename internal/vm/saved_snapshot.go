@@ -112,16 +112,18 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 	if man, err := m.committedSavedSnapshot(dir, vmID); man != nil || err != nil {
 		return man, err
 	}
-	release, err := m.acquireSavedCapture(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
 	unlock, err := m.lockVMOp(ctx, vmID)
 	if err != nil {
 		return nil, err
 	}
 	defer unlock()
+	// After the VM lock, as restore does: requests queued on one busy VM
+	// must not hold the host's capture slots.
+	release, err := m.acquireSavedCapture(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 
 	inst, err := m.getInstance(vmID)
 	if err != nil {
