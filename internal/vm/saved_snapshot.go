@@ -504,25 +504,24 @@ func (m *Manager) capturePausedSaved(ctx context.Context, inst *VMInstance, tmp,
 	return m.captureSavedDisk(ctx, diskPath, man.BasePath, tmp, final, man)
 }
 
-// captureSavedDisk clones the source's disk. An overlay's holes mean "read
-// the base", and a filesystem may turn written zeros into holes, so an overlay
-// is reflinked extent-exact or the capture is refused; a standalone rootfs
-// may be copied.
+// captureSavedDisk clones the source's disk, reflinked or refused: an
+// overlay's holes mean "read the base" and a copy may not keep them, and a
+// restore reflinks the saved disk back the same way, so a disk that could
+// only be copied here would publish a snapshot this host cannot restore.
 func (m *Manager) captureSavedDisk(ctx context.Context, diskPath, basePath, tmp, final string, man *SavedSnapshotManifest) error {
 	name := "rootfs.ext4"
-	copy := cloneOrCopyFile
 	if basePath != "" {
 		name = "overlay.ext4"
-		copy = reflinkFileExact
-		if m.reflinkFile != nil {
-			copy = m.reflinkFile
-		}
 	}
-	if err := copy(ctx, diskPath, filepath.Join(tmp, name)); err != nil {
-		if basePath != "" && errors.Is(err, errNoReflink) {
-			return status.Errorf(codes.FailedPrecondition, "overlay copies need a reflink filesystem under %s: %v", m.cfg.SnapshotDir, err)
+	clone := reflinkFileExact
+	if m.reflinkFile != nil {
+		clone = m.reflinkFile
+	}
+	if err := clone(ctx, diskPath, filepath.Join(tmp, name)); err != nil {
+		if errors.Is(err, errNoReflink) {
+			return status.Errorf(codes.FailedPrecondition, "saved disks need a reflink filesystem under %s: %v", m.cfg.SnapshotDir, err)
 		}
-		return fmt.Errorf("copy disk: %w", err)
+		return fmt.Errorf("clone disk: %w", err)
 	}
 	man.DiskPath = filepath.Join(final, name)
 	man.BasePath = basePath

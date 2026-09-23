@@ -703,3 +703,21 @@ func TestSavedCaptureHeadroomIsReservedAcrossCaptures(t *testing.T) {
 		t.Errorf("reservation leaked: %d bytes", got)
 	}
 }
+
+func TestStandaloneCaptureRefusesWithoutReflink(t *testing.T) {
+	m := newSavedTestManager(t)
+	m.reflinkFile = nil
+	probe := filepath.Join(t.TempDir(), "probe")
+	if err := os.WriteFile(probe, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := reflinkFileExact(context.Background(), probe, probe+".clone"); err == nil {
+		t.Skip("test filesystem reflinks; the refusal cannot be exercised here")
+	}
+	inst, _ := seedPausedSource(t, m, false)
+	inst.Config.BasePath = ""
+	inst.DiskPath = filepath.Join(m.cfg.RunDir, inst.ID, "overlay.ext4")
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("standalone capture without reflink: want FailedPrecondition, got %v", err)
+	}
+}
