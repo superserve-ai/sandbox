@@ -41,6 +41,15 @@ IOWeight=400
 # Memory ceiling: percentage is of total host RAM (correct semantics).
 MemoryMax=95%
 
+# Memory floor: while this slice is under 70% of host RAM, reclaim takes
+# from the unprotected slices first. What lives here is VM memory and the
+# page cache of memory snapshots a resume faults from, while the rest of
+# the host is mostly one-shot backup reads; without the floor, global
+# reclaim evicts a pause's snapshot within minutes and the next resume
+# reads it back from disk. Best-effort: ignored under real exhaustion.
+# Applied to the live slice by the deploy script, in lockstep with this.
+MemoryLow=70%
+
 # No CPUQuota: systemd interprets N% as N% of ONE CPU, not the host. A
 # prior CPUQuota=90% capped all sandboxes to 0.9 CPU total, serializing
 # burst creates. CPU fairness left to the kernel scheduler; per-VM vCPU
