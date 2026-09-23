@@ -15,6 +15,86 @@ OLD = {'id':'old','unit':'proxy-old.service','ports':{'public':5100}}
 NEW = {'id':'new','unit':'proxy-new.service','ports':{'public':5110}}
 
 
+class StandbyPromotionTests(unittest.TestCase):
+    def test_same_rollout_promotes_exact_prepared_generation_and_recovers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary, unit = root / 'proxy', root / 'proxy.service'
+            binary.write_bytes(b'prepared binary')
+            unit.write_text('prepared unit')
+            request = dict(rollout='prepared', target='standby', revision='abc', env={})
+            previous = MODULE.request_identity(request, binary, unit)
+            state = dict(rollout='prepared', target='standby', phase='standby_ready',
+                         request_hash=previous, old=copy.deepcopy(OLD),
+                         candidate=copy.deepcopy(NEW), active=copy.deepcopy(NEW))
+            serving = dict(request, target='serving')
+            identity = previous
+            self.assertEqual(MODULE.standby_promotion_identity(state, serving, binary, unit), previous)
+            ownership = Mock()
+            ownership.assert_owned = Mock()
+            path = root / 'state.json'
+            MODULE.begin_standby_promotion(state,
+                lambda value: MODULE.save_owned_state(ownership, path, value))
+            recovered = json.loads(path.read_text())
+            self.assertEqual(recovered['candidate'], NEW)
+            self.assertEqual(recovered['request_hash'], previous)
+            self.assertFalse(ownership.terminal_saved)
+            MODULE.check_retry(recovered, 'prepared', identity)
+            self.assertEqual(MODULE.standby_promotion_identity(recovered, serving, binary, unit), previous)
+            host = Mock()
+            host.local.return_value = True
+            host.stop.return_value = 'drained'
+            MODULE.Rollout(host, recovered,
+                lambda value: MODULE.save_owned_state(ownership, path, value)).run()
+            host.start.assert_called_once_with(NEW)
+            host.membership.assert_any_call(NEW, True)
+            self.assertEqual(recovered['phase'], 'complete')
+            self.assertTrue(json.loads(path.read_text())['_promoted_standby'])
+            self.assertEqual(MODULE.standby_promotion_identity(recovered, serving, binary, unit), previous)
+            with self.assertRaises(RuntimeError):
+                MODULE.standby_promotion_identity(recovered, request, binary, unit)
+
+    def test_promotion_rejects_changed_inputs_or_unfinished_preparation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary, unit = Path(directory) / 'proxy', Path(directory) / 'proxy.service'
+            binary.write_bytes(b'prepared')
+            unit.write_text('unit')
+            request = dict(rollout='prepared', target='standby', revision='abc', env={})
+            state = dict(rollout='prepared', target='standby', phase='standby_ready',
+                         request_hash=MODULE.request_identity(request, binary, unit))
+            for changed in (dict(request, target='serving', revision='other'),
+                            dict(request, target='serving', env={'NEW': 'value'})):
+                with self.assertRaisesRegex(RuntimeError, 'immutable'):
+                    MODULE.standby_promotion_identity(state, changed, binary, unit)
+            serving = dict(request, target='serving')
+            self.assertIsNone(MODULE.standby_promotion_identity(
+                dict(state, phase='preparing'), serving, binary, unit))
+            binary.write_bytes(b'changed')
+            with self.assertRaisesRegex(RuntimeError, 'immutable'):
+                MODULE.standby_promotion_identity(state, serving, binary, unit)
+
+    def test_preparation_reuses_snapshot_and_updates_only_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation = root / 'generations' / NEW['id']
+            generation.mkdir(parents=True)
+            prepared = dict(rollout='prepared', target='standby', revision='abc', env={})
+            (generation / 'request.json').write_text(json.dumps(prepared))
+            (generation / 'proxy').write_bytes(b'prepared binary')
+            host = Mock()
+            host.assert_owned = Mock()
+            serving = dict(prepared, target='serving')
+            with patch.object(MODULE, 'ROOT', root), patch.object(MODULE.shutil, 'copyfile'), \
+                    patch.object(MODULE, 'command'):
+                MODULE.prepare(host, NEW, serving, root)
+                MODULE.prepare(host, NEW, serving, root)
+                self.assertEqual(json.loads((generation / 'request.json').read_text()), serving)
+                self.assertEqual((generation / 'proxy').read_bytes(), b'prepared binary')
+                for invalid in (prepared, dict(serving, env={'CHANGED': 'yes'})):
+                    with self.assertRaisesRegex(RuntimeError, 'immutable'):
+                        MODULE.prepare(host, NEW, invalid, root)
+
+
 class CredentialRenewalTests(unittest.TestCase):
     def fixture(self, directory):
         root = Path(directory)

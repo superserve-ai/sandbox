@@ -310,6 +310,29 @@ def check_retry(state, rollout, identity):
         raise RuntimeError('retry changed immutable rollout inputs; resume with the original request and binary')
 
 
+def standby_promotion_identity(state, request, binary, unit):
+    if state.get('rollout') != request['rollout']:
+        return None
+    promoted = state.get('_promoted_standby', False)
+    if promoted and request.get('target') != 'serving':
+        raise RuntimeError('a promoted standby cannot return to preparation')
+    if not promoted and not (state.get('target') == 'standby'
+                             and state.get('phase') == 'standby_ready'
+                             and request.get('target') == 'serving'):
+        return None
+    # Preserve the original owner identity throughout promotion and retries.
+    # Only target changes; binary, unit, credentials and all other inputs match.
+    identity = request_identity(dict(request, target='standby'), binary, unit)
+    check_retry(state, request['rollout'], identity)
+    return identity
+
+
+def begin_standby_promotion(state, save):
+    state.update(target='serving', phase='preparing', active=state['old'],
+                 _promoted_standby=True)
+    save(state)
+
+
 def ensure_bootstrap_ready(state, rollout, bootstrap):
     """Reject a fresh generation deploy while the cell still serves legacy listeners."""
     active = state.get('active') or {}
@@ -959,6 +982,9 @@ def deploy_locked(args, config, config_hash, host, state, state_path, instance_i
     # reached a terminal state or the new rollout has been persisted.  Popping
     # it here made a second interrupted retry unable to match the owner that
     # was written before the certificate rotation.
+    promotion_identity = standby_promotion_identity(
+        state, request, request_path.parent / 'proxy', request_path.parent / 'proxy.service')
+    identity = promotion_identity or identity
     owner_identity = state.get('_credential_previous_request_hash') or identity
     check_retry(state, rollout, identity)
     recovery = state.get('_credential_recovery')
@@ -977,6 +1003,8 @@ def deploy_locked(args, config, config_hash, host, state, state_path, instance_i
         host.ownership = host.cloud.ownership = ownership
         def save(value):
             save_owned_state(ownership, state_path, value)
+        if promotion_identity is not None and state.get('target') == 'standby':
+            begin_standby_promotion(state, save)
         if state.get('config_hash', config_hash) != config_hash:
             state['config_hash'] = config_hash
             save(state)
@@ -1216,8 +1244,13 @@ def prepare(host, generation, request, upload):
     host.assert_owned()
     directory = ROOT / 'generations' / generation['id']
     if directory.exists():
-        if json.loads((directory/'request.json').read_text()) != request:
-            raise RuntimeError('immutable generation request changed')
+        prepared = json.loads((directory/'request.json').read_text())
+        if prepared != request:
+            if prepared.get('target') != 'standby' or request != dict(prepared, target='serving'):
+                raise RuntimeError('immutable generation request changed')
+            # Target controls rollout orchestration; executable, environment,
+            # unit and credential snapshots remain the prepared generation.
+            atomic(directory/'request.json', request)
         shutil.copyfile(directory/'proxy.service',Path('/etc/systemd/system')/generation['unit'])
         command('systemctl','daemon-reload')
         return
