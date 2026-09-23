@@ -156,23 +156,52 @@ def atomic(path, value):
         os.close(fd)
 
 
+def save_owned_state(ownership, state_path, value):
+    ownership.assert_owned()
+    terminal = value.get('phase') in TERMINAL_PHASES and not value.get('_credential_recovery')
+    if terminal:
+        value.pop('_credential_previous_request_hash', None)
+        value.pop('_credential_previous_rollout', None)
+    atomic(state_path, value)
+    ownership.terminal_saved = terminal
+
+
 def ready(body, generation):
     return (isinstance(body, dict) and body.get('resolver_ready') is True
             and body.get('generation', '') == generation)
 
 
-def manifest_identity(config):
-    # Terraform's migration acknowledgement and applied frontend references
-    # change while the cell owner is held between bootstrap and resume.
+def manifest_identity(config, include_serving_host=False):
+    # Terraform's frontend state and serving-host selection can change while
+    # this host retains the same static rollout configuration.
     static = {key: value for key, value in config.items()
               if key not in ('migration_complete', 'frontend_backend_references',
-                             'frontend_resources')}
+                             'frontend_resources')
+              and (include_serving_host or key != 'serving_host')}
     # Terraform emits null for an omitted optional address. Keep existing
     # manifests retry-compatible when no frontend pin was configured.
     static['routes'] = [{key: value for key, value in route.items()
                          if key != 'probe_ip' or value is not None}
                         for route in config['routes']]
     return hashlib.sha256(json.dumps(static, sort_keys=True).encode()).hexdigest()
+
+
+def check_manifest_identity(config, state, manifest_path):
+    current = manifest_identity(config)
+    previous = state.get('config_hash', current)
+    if previous == current:
+        return current
+    # A persisted manifest proves the prior hash and all host-static inputs;
+    # only Terraform's serving-host selection may differ during promotion.
+    try:
+        installed = json.loads(manifest_path.read_text())
+        compatible = (previous == manifest_identity(installed, include_serving_host=True)
+                      and current == manifest_identity(installed))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        compatible = False
+    if not compatible:
+        raise RuntimeError('static rollout manifest changed; reconcile infrastructure before deployment')
+    return current
 
 
 def verify_frontend_references(config):
@@ -755,9 +784,7 @@ def main():
         legacy = {'id': '', 'unit': 'proxy.service', 'ports': {'public':5007,'redirect':5008,'peer':5009,'local':5010}}
         state_path = ROOT / 'state.json'
         state = json.loads(state_path.read_text()) if state_path.exists() else {'active':legacy, 'phase':'complete'}
-        config_hash = manifest_identity(config)
-        if state.get('config_hash',config_hash) != config_hash:
-            raise RuntimeError('static rollout manifest changed; reconcile infrastructure before deployment')
+        config_hash = check_manifest_identity(config, state, manifest_path)
         if args.bootstrap and not state.get('bootstrap') and (state['phase'] != 'complete' or state['active']['id']):
             raise RuntimeError('bootstrap is only allowed before the first generation rollout')
         if args.refresh_credentials:
@@ -949,13 +976,10 @@ def deploy_locked(args, config, config_hash, host, state, state_path, instance_i
         ownership.update_owner(rollout, identity)
         host.ownership = host.cloud.ownership = ownership
         def save(value):
-            ownership.assert_owned()
-            if value.get('phase') in TERMINAL_PHASES:
-                value.pop('_credential_previous_request_hash', None)
-                value.pop('_credential_previous_rollout', None)
-                value.pop('_credential_recovery', None)
-            atomic(state_path, value)
-            ownership.terminal_saved = value['phase'] in TERMINAL_PHASES
+            save_owned_state(ownership, state_path, value)
+        if state.get('config_hash', config_hash) != config_hash:
+            state['config_hash'] = config_hash
+            save(state)
         # Persist the regenerated request hash and recovery marker while the
         # recovered durable owner is still held.  A process loss before the
         # next phase transition can then reacquire that same owner.
@@ -1137,28 +1161,29 @@ def reconcile_credential_renewal(host, state, save, recovery):
     candidate may have crossed the registration boundary; only then remove
     its artifact so the next generation is prepared from the fresh request.
     """
-    if state.get('phase') not in CREDENTIAL_RECOVERABLE_PHASES:
+    if state.get('phase') not in CREDENTIAL_RECOVERABLE_PHASES | {'rolled_back'}:
         raise RuntimeError('credential renewal cannot rebuild after shutdown has started')
     candidate, old = state['candidate'], state['old']
-    member = any(host.cloud.member(route, candidate['ports'][route['listener']])
-                 for route in host.config['routes'])
-    active = command('systemctl', 'show', candidate['unit'], '-p', 'ActiveState', '--value').strip()
-    full_rollback = member or state['phase'] in {
-        'registering', 'candidate_verified', 'withdrawing', 'withdrawn',
-        'switching_private', 'cutover_verified', 'rollback',
-        'rollback_restoring', 'rollback_withdrawing', 'rollback_stopping',
-    }
-    if full_rollback:
-        Rollout(host, state, save).rollback()
-    else:
-        # A candidate that has only reached local readiness is not registered
-        # and can be stopped directly after the old serving generation proves
-        # healthy.  This also covers a start interrupted before its phase was
-        # advanced beyond ``starting``.
-        host.verify(old)
-        if active not in ('inactive', 'failed'):
-            host.stop(candidate)
-        Rollout(host, state, save).phase('rolled_back', active=old)
+    if state['phase'] != 'rolled_back':
+        member = any(host.cloud.member(route, candidate['ports'][route['listener']])
+                     for route in host.config['routes'])
+        active = command('systemctl', 'show', candidate['unit'], '-p', 'ActiveState', '--value').strip()
+        full_rollback = member or state['phase'] in {
+            'registering', 'candidate_verified', 'withdrawing', 'withdrawn',
+            'switching_private', 'cutover_verified', 'rollback',
+            'rollback_restoring', 'rollback_withdrawing', 'rollback_stopping',
+        }
+        if full_rollback:
+            Rollout(host, state, save).rollback()
+        else:
+            # A candidate that has only reached local readiness is not registered
+            # and can be stopped directly after the old serving generation proves
+            # healthy.  This also covers a start interrupted before its phase was
+            # advanced beyond ``starting``.
+            host.verify(old)
+            if active not in ('inactive', 'failed'):
+                host.stop(candidate)
+            Rollout(host, state, save).phase('rolled_back', active=old)
 
     root = getattr(host, 'root', None)
     if not isinstance(root, Path):

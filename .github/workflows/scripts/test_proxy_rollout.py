@@ -194,6 +194,56 @@ class CredentialRenewalTests(unittest.TestCase):
             self.assertLess(index(lambda event: event == ('stop', 'new')),
                             index(lambda event: event[0] == 'cleanup'))
 
+    def test_intermediate_rollback_keeps_owner_markers_until_replacement_is_saved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            ownership = Mock(spec=MODULE.CellLock)
+            ownership.terminal_saved = False
+            recovery = {'previous_rollout': 'credentials-old',
+                        'credential_generation': 'certificate-c'}
+            state = dict(phase='rolled_back', rollout='credentials-old',
+                         request_hash='replacement-inputs', active=OLD, old=OLD,
+                         candidate=NEW, _credential_recovery=recovery,
+                         _credential_previous_request_hash='original-inputs',
+                         _credential_previous_rollout='credentials-old')
+
+            MODULE.save_owned_state(ownership, path, state)
+            persisted = json.loads(path.read_text())
+            self.assertEqual(persisted['_credential_recovery'], recovery)
+            self.assertEqual(persisted['_credential_previous_request_hash'], 'original-inputs')
+            self.assertEqual(persisted['_credential_previous_rollout'], 'credentials-old')
+            self.assertFalse(ownership.terminal_saved)
+
+            state = dict(persisted, phase='preparing', rollout='credentials-new')
+            state.pop('_credential_recovery')
+            MODULE.save_owned_state(ownership, path, state)
+            self.assertEqual(json.loads(path.read_text())['_credential_previous_request_hash'],
+                             'original-inputs')
+            state['phase'] = 'complete'
+            MODULE.save_owned_state(ownership, path, state)
+            self.assertNotIn('_credential_previous_request_hash', json.loads(path.read_text()))
+            self.assertNotIn('_credential_previous_rollout', json.loads(path.read_text()))
+            self.assertTrue(ownership.terminal_saved)
+
+    def test_rotated_renewal_resumes_cleanup_after_rollback_was_saved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            candidate = root / 'generations' / NEW['id']
+            candidate.mkdir(parents=True)
+            units = root / 'units'
+            units.mkdir()
+            (units / NEW['unit']).touch()
+            host = Mock(root=root, unit_root=units)
+            state = dict(phase='rolled_back', old=OLD, candidate=NEW, active=OLD)
+            with patch.object(MODULE, 'command', return_value='') as command:
+                MODULE.reconcile_credential_renewal(
+                    host, state, Mock(), {'previous_rollout': 'credentials-old'})
+            self.assertFalse(candidate.exists())
+            self.assertFalse((units / NEW['unit']).exists())
+            host.verify.assert_not_called()
+            host.stop.assert_not_called()
+            command.assert_called_once_with('systemctl', 'daemon-reload')
+
     def test_current_snapshot_needs_no_rollout_and_unfinished_code_deploy_is_not_stolen(self):
         with tempfile.TemporaryDirectory() as directory:
             root, peer, upload, state, _ = self.fixture(directory)
@@ -619,14 +669,39 @@ class BootstrapTests(unittest.TestCase):
 
     def test_manifest_migration_signal_does_not_change_static_identity(self):
         config = dict(instance='example-host', routes=[dict(listener='redirect')], migration_complete=False,
-                      frontend_backend_references={'redirect': ['legacy-backend']})
+                      frontend_backend_references={'redirect': ['legacy-backend']},
+                      serving_host={'instance': 'example-serving', 'ip': '192.0.2.10'})
         original = MODULE.manifest_identity(config)
         config['migration_complete'] = True
         config['frontend_backend_references'] = {'redirect': ['replacement-backend']}
         config['frontend_resources'] = {'redirect': ['target-tcp-proxy:example-redirect']}
+        config['serving_host'] = {'instance': 'example-host', 'ip': '192.0.2.11'}
         self.assertEqual(MODULE.manifest_identity(config), original)
         config['routes'][0]['listener'] = 'public'
         self.assertNotEqual(MODULE.manifest_identity(config), original)
+
+    def test_prepared_standby_accepts_legacy_hash_when_serving_host_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = Path(directory) / 'proxy-rollout.json'
+            prepared = dict(project='example-project', zone='us-central1-a',
+                            instance='example-standby', ip='192.0.2.11',
+                            routes=[dict(listener='public', backend='example-backend')],
+                            serving_host={'instance': 'example-serving', 'ip': '192.0.2.10'})
+            manifest.write_text(json.dumps(prepared))
+            state = {'config_hash': MODULE.manifest_identity(
+                prepared, include_serving_host=True)}
+            promoted = copy.deepcopy(prepared)
+            promoted['serving_host'] = {'instance': 'example-standby', 'ip': '192.0.2.11'}
+            current = MODULE.check_manifest_identity(promoted, state, manifest)
+            self.assertEqual(current, MODULE.manifest_identity(promoted))
+            changed = copy.deepcopy(promoted)
+            changed['routes'][0]['backend'] = 'different-backend'
+            with self.assertRaisesRegex(RuntimeError, 'static rollout manifest changed'):
+                MODULE.check_manifest_identity(changed, state, manifest)
+
+            state['config_hash'] = current
+            manifest.write_text(json.dumps(promoted))
+            self.assertEqual(MODULE.check_manifest_identity(promoted, state, manifest), current)
 
 
 class PreparationArtifactTests(unittest.TestCase):
