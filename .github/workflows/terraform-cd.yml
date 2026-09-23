@@ -1,5 +1,12 @@
 name: Terraform CD
 
+# Serialize infra-inclusive API deployments with the staged identity rollout
+# and code-only Deploy API workflow through the full apply and verification
+# sequence.
+concurrency:
+  group: control-plane-deploy
+  cancel-in-progress: false
+
 on:
   push:
     branches: [main]

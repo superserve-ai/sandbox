@@ -74,6 +74,11 @@ resource "google_storage_managed_folder" "templates" {
   name   = local.reader_object_prefix
 }
 
+resource "google_storage_managed_folder" "bases" {
+  bucket = google_storage_bucket.backup.name
+  name   = local.base_object_prefix
+}
+
 # Legacy shared runtimes stay write-only. Dedicated per-cell VMD identities
 # may receive bucket-scoped create/read grants from their environment root
 # for fetch-before-resume. No host receives delete or overwrite permission.
@@ -86,13 +91,22 @@ resource "google_storage_bucket_iam_member" "writer_create" {
 }
 
 # Serving control planes inspect template manifests and referenced artifacts;
-# they never create, overwrite, or delete backup objects. Grant the role on a
-# managed folder so list requests remain scoped to the templates/ prefix.
+# they never create, overwrite, or delete backup objects. Grant the role on
+# managed folders so list requests remain scoped to the reader prefixes.
 resource "google_storage_managed_folder_iam_member" "reader_view" {
   for_each = toset(var.reader_members)
 
   bucket         = google_storage_bucket.backup.name
   managed_folder = google_storage_managed_folder.templates.name
+  role           = "roles/storage.objectViewer"
+  member         = each.value
+}
+
+resource "google_storage_managed_folder_iam_member" "reader_bases_view" {
+  for_each = toset(var.reader_members)
+
+  bucket         = google_storage_bucket.backup.name
+  managed_folder = google_storage_managed_folder.bases.name
   role           = "roles/storage.objectViewer"
   member         = each.value
 }
@@ -130,7 +144,15 @@ resource "google_storage_bucket_iam_member" "gc_admin" {
 }
 
 locals {
+  # Template manifests may point at immutable shared bases outside their
+  # generation prefix, so both managed-folder roots are part of the reader
+  # contract.
   reader_object_prefix = "templates/"
+  base_object_prefix   = "bases/"
+  reader_object_prefixes = [
+    local.reader_object_prefix,
+    local.base_object_prefix,
+  ]
 
   backup_storage_contract = {
     project_id              = var.project_id
@@ -140,6 +162,7 @@ locals {
     writer_members          = var.writer_members
     reader_members          = var.reader_members
     reader_object_prefix    = local.reader_object_prefix
+    reader_object_prefixes  = local.reader_object_prefixes
     gc_service_account      = google_service_account.gc.email
     restore_service_account = google_service_account.restore.email
     soft_delete_seconds     = var.soft_delete_retention_seconds

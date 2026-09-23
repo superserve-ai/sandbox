@@ -1,5 +1,11 @@
 name: Control-plane identity rollout
 
+# Hold the same lock as ordinary API and Terraform CD deployments so an
+# identity-changing apply cannot be followed by an unchecked revision route.
+concurrency:
+  group: control-plane-deploy
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:

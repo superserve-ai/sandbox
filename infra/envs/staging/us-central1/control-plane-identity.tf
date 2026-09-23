@@ -63,6 +63,7 @@ locals {
     deployment_permissions  = ["iam.serviceAccounts.actAs", "iam.serviceAccounts.getAccessToken"]
     backup_bucket           = module.backup_storage.bucket_name
     backup_object_prefix    = module.backup_storage.contract.reader_object_prefix
+    backup_object_prefixes  = module.backup_storage.contract.reader_object_prefixes
     backup_permissions      = ["storage.objects.get", "storage.objects.list"]
     secret_ids              = sort(tolist(local.controlplane_secret_ids))
     kms_key_resource        = null
