@@ -120,8 +120,19 @@ CREATE INDEX IF NOT EXISTS sandbox_snapshot_template
     ON sandbox_snapshot (template_id)
     WHERE deleted_at IS NULL AND status IN ('creating', 'ready');
 
-ALTER TABLE sandbox
-    ADD COLUMN IF NOT EXISTS source_snapshot_id uuid;
+-- Pre-built by hand on a populated database (see the header). IF NOT EXISTS
+-- would still take the table's exclusive lock before looking, which a busy
+-- sandbox table does not grant within the timeout; the catalog is checked
+-- first so the pre-built path takes no lock at all.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'sandbox' AND column_name = 'source_snapshot_id'
+  ) THEN
+    ALTER TABLE sandbox ADD COLUMN source_snapshot_id uuid;
+  END IF;
+END $$;
 
 -- NOT VALID: adding the key is then metadata only. Validation scans the
 -- sandbox table and runs in the next migration, under a lock that does not
@@ -139,8 +150,9 @@ END $$;
 COMMENT ON COLUMN sandbox.source_snapshot_id IS
   'Snapshot this sandbox was created from; NULL when created from a template.';
 
--- IF NOT EXISTS matches by name only; an interrupted concurrent pre-build
--- leaves an INVALID index it would silently keep.
+-- Same catalog-first check for the index: an interrupted concurrent
+-- pre-build leaves an INVALID index that must not be silently kept, and a
+-- valid one must not cost the table lock a plain CREATE INDEX takes.
 DO $$
 BEGIN
   IF EXISTS (
@@ -150,11 +162,12 @@ BEGIN
   ) THEN
     RAISE EXCEPTION 'sandbox_by_source_snapshot exists but is INVALID; DROP INDEX it, re-run the concurrent pre-build, then retry';
   END IF;
+  IF to_regclass('public.sandbox_by_source_snapshot') IS NULL THEN
+    CREATE INDEX sandbox_by_source_snapshot
+        ON sandbox (source_snapshot_id)
+        WHERE source_snapshot_id IS NOT NULL;
+  END IF;
 END $$;
-
-CREATE INDEX IF NOT EXISTS sandbox_by_source_snapshot
-    ON sandbox (source_snapshot_id)
-    WHERE source_snapshot_id IS NOT NULL;
 
 ALTER TABLE team
     ADD COLUMN IF NOT EXISTS max_snapshots int NOT NULL DEFAULT 100,
