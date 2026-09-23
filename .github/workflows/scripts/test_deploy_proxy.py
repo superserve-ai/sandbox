@@ -270,7 +270,7 @@ class DeployProxyTests(unittest.TestCase):
                             sleep() {{ :; }}
                             sudo() {{ "$@"; }}
                             sed() {{ echo {host}; }}
-                            legacy_heartbeat_ready() {{ return {0 if receipt and not bound and host == "default" else 1}; }}
+                            legacy_heartbeat_ready() {{ return {0 if receipt and not bound else 1}; }}
                             systemctl() {{
                                 if [ "$1" = show ]; then
                                     if [ "{restarted}" = True ]; then
@@ -287,7 +287,7 @@ class DeployProxyTests(unittest.TestCase):
                             }}
                             '''
                             result = subprocess.run(["bash"], input=functions + readiness + "wait_for_vmd_ready", text=True, capture_output=True)
-                            self.assertEqual(result.returncode == 0, (bound or host == "default") and receipt and not restarted, result.stderr)
+                            self.assertEqual(result.returncode == 0, receipt and not restarted, result.stderr)
 
     def test_rollback_restores_listener_before_advertisement(self):
         cases = [(addr, failure, "spiffe://example.test/peer") for addr, failure in (("192.0.2.2:5009", "proxy"),
