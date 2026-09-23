@@ -12,9 +12,7 @@
 
 name: Deploy Proxy
 
-# Serialize with Deploy VMD rather than canceling: both workflows rewrite
-# /etc/sandbox/vmd.env and restart VMD on the same hosts. A queued run starts
-# only after the other deployment has completed its non-atomic update.
+# Durable cell ownership and host flock also serialize interrupted sessions.
 concurrency:
   group: deploy-vmd
   cancel-in-progress: false
@@ -38,6 +36,22 @@ on:
         options:
           - serving
           - standby
+      revision:
+        description: 'Original commit SHA when resuming an interrupted rollout'
+        required: false
+        type: string
+      rollout_id:
+        description: 'Original rollout ID when resuming an interrupted run; use the same revision and inputs'
+        required: false
+        type: string
+      operation:
+        description: 'Prepare or resume the bootstrap generation around Terraform frontend migration, or deploy'
+        required: true
+        type: choice
+        default: deploy
+        options:
+          - deploy
+          - bootstrap
       production_cell:
         description: 'Production cell for manual deployments'
         required: true
@@ -67,14 +81,28 @@ on:
       - 'go.sum'
       - 'deploy/proxy.service'
       - 'deploy/proxy.socket'
+      - 'deploy/proxy-generation.service'
+      - 'deploy/refresh-peer-credentials.py'
+      - '.github/workflows/scripts/proxy_rollout.py'
       - '.github/workflows/deploy-proxy.yml'
       - '.github/workflows/scripts/deploy-proxy.py'
       - '.github/workflows/scripts/select-deploy-target.sh'
 
 env:
+  PROXY_ROLLOUT_ID: ${{ inputs.rollout_id || github.run_id }}
+  PROXY_OPERATION: ${{ inputs.operation || 'deploy' }}
+  PROXY_ROLLOUT_MANIFESTS: bin/proxy-rollout.json
+  # These repository variables are populated only after the executable
+  # Notion runbook is published and its staging evidence is recorded.
+  PROXY_GENERATION_RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}
+  PROXY_GENERATION_PROMOTION_EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
+  PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}
   DEPLOY_EVENT: ${{ github.event_name }}
   DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
   DEPLOY_TARGET: ${{ inputs.target || 'serving' }}
+  # Carry the selected role into the immutable host request.  The remote
+  # controller must not infer serving behavior from a reused cell manifest.
+  PROXY_TARGET: ${{ inputs.target || 'serving' }}
   DEPLOY_PRODUCTION_CELL: ${{ inputs.production_cell || 'usw2' }}
 
 jobs:
@@ -85,7 +113,25 @@ jobs:
         env:
           DEPLOY_EVENT: ${{ github.event_name }}
           ROLLOUT_READY: ${{ vars.HOST_IDENTITY_ROLLOUT_READY }}
+          GENERATION_READY: ${{ vars.PROXY_GENERATION_PROMOTION_READY }}
+          RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}
+          EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
+          EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}
         run: |
+          if [ "$DEPLOY_EVENT" = push ] && [ "${GENERATION_READY:-}" != true ]; then
+            echo 'Generation migration and staging promotion evidence are required before automatic rollout.' >&2
+            exit 1
+          fi
+          if [ "$DEPLOY_EVENT" = push ]; then
+            notion_url_pattern='^https://(([A-Za-z0-9-]+\.)?(notion\.so|notion\.site)|app\.notion\.com)/[^[:space:]<>#]+$'
+            https_url_pattern='^https://[^[:space:]<>#]+$'
+            if [[ ! "${RUNBOOK_URL:-}" =~ $notion_url_pattern ]] ||
+               [[ ! "${EVIDENCE_URL:-}" =~ $https_url_pattern ]] ||
+               [ "${EVIDENCE_STATUS:-}" != passed ]; then
+              echo 'Generation promotion requires a published Notion runbook, immutable HTTPS staging evidence link, and passed evidence status.' >&2
+              exit 1
+            fi
+          fi
           if [ "$DEPLOY_EVENT" = push ] && [ "${ROLLOUT_READY:-}" != true ]; then
             echo 'Host identity migration is not complete; use the coordinated manual rollout procedure.' >&2
             exit 1
@@ -101,6 +147,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision || github.sha }}
+
+      - name: Record proxy revision
+        run: echo "PROXY_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -123,17 +174,29 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Read applied proxy manifests from the owning state
+        run: |
+          umask 077
+          terraform -chdir=infra/envs/staging/us-central1 init -input=false
+          terraform -chdir=infra/envs/staging/us-central1 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
+
       # GCP_REGION scopes label discovery to the primary region so the
       # usw cell host (same project, same label) isn't folded into this
       # fan-out — the cell deploys sequentially after production below.
       - name: Discover and deploy proxy to VMD instances
         env:
           DEPLOY_CELL: staging
+          # Production bootstrap still verifies the already-promoted staging deployment.
+          PROXY_OPERATION: ${{ inputs.environment == 'production' && 'deploy' || inputs.operation || 'deploy' }}
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ env.PROXY_REVISION }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_STAGING }}
           PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_STAGING }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_STAGING }}
@@ -166,7 +229,7 @@ jobs:
           python3 .github/workflows/scripts/deploy-proxy.py
 
   deploy-production:
-    if: github.event_name == 'push' || github.event.inputs.environment == 'production'
+    if: (github.event_name == 'push' || github.event.inputs.environment == 'production') && vars.PROXY_GENERATION_PROMOTION_READY == 'true' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS == 'passed' && vars.PROXY_GENERATION_RUNBOOK_URL != '' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL != ''
     needs: [deploy-staging]
     runs-on: ubuntu-latest
     environment: production
@@ -176,6 +239,33 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision || github.sha }}
+
+      - name: Record linked staging promotion evidence
+        env:
+          RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}
+          EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
+          EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}
+        run: |
+          set -eu
+          notion_url_pattern='^https://(([A-Za-z0-9-]+\.)?(notion\.so|notion\.site)|app\.notion\.com)/[^[:space:]<>#]+$'
+          https_url_pattern='^https://[^[:space:]<>#]+$'
+          if [[ ! "$RUNBOOK_URL" =~ $notion_url_pattern ]] ||
+             [[ ! "$EVIDENCE_URL" =~ $https_url_pattern ]] ||
+             [ "$EVIDENCE_STATUS" != passed ]; then
+            echo 'Linked Notion runbook or staging promotion evidence is missing or invalid; refusing production deployment.' >&2
+            exit 1
+          fi
+          {
+            echo '### Proxy generation promotion evidence'
+            echo "- Executable runbook: $RUNBOOK_URL"
+            echo "- Recorded staging evidence: $EVIDENCE_URL"
+            echo "- Evidence status: $EVIDENCE_STATUS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record proxy revision
+        run: echo "PROXY_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -198,6 +288,17 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Read applied us-east4 proxy manifests from the owning state
+        if: github.event_name != 'workflow_dispatch' || inputs.production_cell == 'use4'
+        run: |
+          umask 077
+          terraform -chdir=infra/envs/production/us-east4 init -input=false
+          terraform -chdir=infra/envs/production/us-east4 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
+
       # us-east4 is the "use" cell's primary host (api.superserve.ai routes to
       # the use-cell control plane there). It deploys FIRST so a usw-cell failure
       # below can't leave the primary host on a stale proxy. Reuses the primary
@@ -215,7 +316,7 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION_USE4 }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ env.PROXY_REVISION }}
           SANDBOX_ACCESS_TOKEN_SEED: ${{ secrets.SANDBOX_ACCESS_TOKEN_SEED_PROD }}
           PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_PROD }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
@@ -242,6 +343,13 @@ jobs:
           : "${GCP_REGION:?Refusing an unscoped proxy deployment}"
           python3 .github/workflows/scripts/deploy-proxy.py
 
+      - name: Read applied us-west2 proxy manifests from the owning state
+        if: (github.event_name == 'workflow_dispatch' && (inputs.production_cell == 'usw2' || inputs.production_cell == '')) || (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != '')
+        run: |
+          umask 077
+          terraform -chdir=infra/envs/production/us-west2 init -input=false
+          terraform -chdir=infra/envs/production/us-west2 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
+
       # The usw cell deploys as a step in this job — not a separate job —
       # for the same reason Deploy API / CD Migrate / Seed Templates do it
       # this way: a second job referencing the production environment would
@@ -253,7 +361,7 @@ jobs:
       # the cell host must carry the label; zero matches fails the deploy
       # rather than silently skipping the cell.
       #
-      # The deploy rewrites /etc/sandbox/proxy.env on the host, so the cell
+      # Each generation receives its own environment file, so the cell
       # MUST NOT reuse the prod values: its domain differs per the
       # regional hostname scheme
       # (PROXY_DOMAIN_USW = usw-sandbox.superserve.ai) and its token seed
@@ -269,7 +377,7 @@ jobs:
           GCP_REGION: ${{ vars.GCP_REGION_USW }}
           VMD_LABEL: ${{ vars.VMD_LABEL }}
           VMD_INSTALL_DIR: ${{ vars.VMD_INSTALL_DIR }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ env.PROXY_REVISION }}
           PROXY_ALLOWED_ORIGINS: ${{ vars.PROXY_ALLOWED_ORIGINS_PROD }}
           PROXY_DATABASE_URL: ${{ secrets.PROXY_DATABASE_URL_USWEST }}
           PROXY_DOMAIN: ${{ vars.PROXY_DOMAIN_USW }}

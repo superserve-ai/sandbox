@@ -304,7 +304,10 @@ func TestServePeerListenerShutdownForcesActiveStreamStop(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- ServePeerListener(ctx, ln, tlsCfg, target.Addr().String(), zerolog.Nop()) }()
+	const grace = 200 * time.Millisecond
+	go func() {
+		serveDone <- ServePeerListenerWithDrain(ctx, ln, tlsCfg, target.Addr().String(), zerolog.Nop(), nil, maxPeerStreams, grace)
+	}()
 	cert, err := tlsCertificate(clientCert, clientKey)
 	if err != nil {
 		t.Fatal(err)
@@ -326,14 +329,19 @@ func TestServePeerListenerShutdownForcesActiveStreamStop(t *testing.T) {
 		t.Fatal("target was not dialed")
 	}
 	cancel()
-	conn.SetReadDeadline(time.Now().Add(peerShutdownGrace + time.Second))
+	select {
+	case <-serveDone:
+		t.Fatal("Serve returned before the active stream drained")
+	case <-time.After(20 * time.Millisecond):
+	}
+	conn.SetReadDeadline(time.Now().Add(grace + time.Second))
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
 		t.Fatal("active target connection remained open after shutdown")
 	}
 	conn.Close()
 	select {
 	case <-serveDone:
-	case <-time.After(peerShutdownGrace + time.Second):
+	case <-time.After(grace + time.Second):
 		t.Fatal("peer listener did not stop within forced-stop bound")
 	}
 }

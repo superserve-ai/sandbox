@@ -207,10 +207,11 @@ bundle. Switching back with `--provider mwi` requires working managed credential
 and coordinated trust across peers; a failed publication retains the prior bundle.
 
 Production activation still requires automated authenticated issuance/renewal,
-expiry/failure monitoring and seamless credential reload. Systemd credentials are
-snapshots at service start, and the MWI refresh path can restart the public proxy.
-Publishing files alone does not update loaded credentials or guarantee continuity
-of active streams. These are outstanding rollout prerequisites.
+expiry/failure monitoring and seamless credential reload. Legacy hosts load systemd
+credential snapshots by restarting the public proxy. Hosts migrated to generation
+rollouts load immutable credential snapshots through the same health-gated cutover
+as a code deployment. Monitor `proxy-credential-rollout.service` failures and
+`proxy_reload_required`; publication alone does not prove a new snapshot is serving.
 
 ## Runtime baseline and readiness
 
@@ -629,9 +630,12 @@ root-only source directory is created by tmpfiles before the guest agent.
 The proxy deploy reads `identity.json` locally and checks credentials before
 changing its unit/config, even before the cell's readiness flag is enabled.
 Missing bootstrap fails closed once that flag is enabled or ingress is
-requested. A file lock coordinates refresh with systemd `LoadCredential`;
-rotation restarts only the proxy to load the new material, retrying failed
-reloads. It never restarts VMD or enters a sandbox startup/resume path.
+requested. A file lock coordinates publication with credential snapshot creation.
+On migrated hosts, `proxy-credential-rollout.timer` checks once per minute and
+resumes interrupted credential rollouts under the normal host/cell locks. An
+unfinished code deployment must be recovered before renewal can proceed. Legacy
+hosts still restart only the proxy to load new material. Neither path restarts
+VMD or enters a sandbox startup/resume path.
 
 After staging Host 2 passes readiness and host-directory checks, use the
 label-only admission procedure below. As part of that separate admission,

@@ -29,7 +29,11 @@ class DeployTargetTests(unittest.TestCase):
                      for ready in (None, '', 'false', 'true', 'TRUE', '1', 'tru', ' true ')]
             for event, ready, expected in cases:
                 with self.subTest(kind=kind, event=event, ready=ready):
-                    env = dict(os.environ, DEPLOY_EVENT=event)
+                    env = dict(os.environ, DEPLOY_EVENT=event, GENERATION_READY='true')
+                    if kind == 'proxy':
+                        env.update(RUNBOOK_URL='https://www.notion.so/example-team/proxy-generation',
+                                   EVIDENCE_URL='https://evidence.example/proxy-generation/2026-09-21',
+                                   EVIDENCE_STATUS='passed')
                     env.pop('ROLLOUT_READY', None)
                     if ready is not None:
                         env['ROLLOUT_READY'] = ready
@@ -39,6 +43,158 @@ class DeployTargetTests(unittest.TestCase):
                     if expected:
                         if kind == 'proxy' or ready is not None:
                             self.assertIn('use the coordinated manual rollout procedure', result.stderr)
+
+    def test_proxy_automatic_rollouts_require_generation_promotion(self):
+        workflow = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
+        gate = re.split(r'^  [a-z][a-z-]*:\n', workflow.split('  migration-gate:\n', 1)[1],
+                        maxsplit=1, flags=re.M)[0]
+        self.assertIn('GENERATION_READY: ${{ vars.PROXY_GENERATION_PROMOTION_READY }}', gate)
+        script = gate.split('        run: |\n', 1)[1]
+        for event in ('push', 'workflow_dispatch'):
+            for ready in (None, '', 'false', 'true', 'TRUE', '1', 'tru', ' true '):
+                with self.subTest(event=event, ready=ready):
+                    env = dict(os.environ, DEPLOY_EVENT=event, ROLLOUT_READY='true',
+                               RUNBOOK_URL='https://www.notion.so/example-team/proxy-generation',
+                               EVIDENCE_URL='https://evidence.example/proxy-generation/2026-09-21',
+                               EVIDENCE_STATUS='passed')
+                    env.pop('GENERATION_READY', None)
+                    if ready is not None:
+                        env['GENERATION_READY'] = ready
+                    result = subprocess.run(['bash', '-eu', '-c', script], capture_output=True,
+                                            env=env, text=True)
+                    expected = int(event == 'push' and ready != 'true')
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    if expected:
+                        self.assertIn('Generation migration and staging promotion evidence', result.stderr)
+
+    def test_proxy_automatic_rollouts_require_linked_runbook_and_recorded_evidence(self):
+        workflow = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
+        gate = re.split(r'^  [a-z][a-z-]*:\n', workflow.split('  migration-gate:\n', 1)[1],
+                        maxsplit=1, flags=re.M)[0]
+        self.assertIn('RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}', gate)
+        self.assertIn('EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}', gate)
+        self.assertIn('EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}', gate)
+        production = workflow.split('  deploy-production:\n', 1)[1]
+        self.assertIn('Record linked staging promotion evidence', production)
+        self.assertIn("vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS == 'passed'", production)
+        script = gate.split('        run: |\n', 1)[1]
+        cases = (
+            ('https://www.notion.so/example-team/page', 'https://evidence.example/run-1', 'passed', 0),
+            ('https://app.notion.com/example-team/page', 'https://evidence.example/run-1', 'passed', 0),
+            ('', 'https://evidence.example/run-1', 'passed', 1),
+            ('http://runbook.example/page', 'https://evidence.example/run-1', 'passed', 1),
+            ('https://runbook.example/page', 'https://evidence.example/run-1', 'passed', 1),
+            ('https://www.notion.so/example-team/page', '', 'passed', 1),
+            ('https://www.notion.so/example-team/page', 'https://evidence.example/run-1', 'pending', 1),
+        )
+        for runbook, evidence, status, expected in cases:
+            with self.subTest(runbook=runbook, evidence=evidence, status=status):
+                env = dict(os.environ, DEPLOY_EVENT='push', ROLLOUT_READY='true',
+                           GENERATION_READY='true', RUNBOOK_URL=runbook,
+                           EVIDENCE_URL=evidence, EVIDENCE_STATUS=status)
+                result = subprocess.run(['bash', '-eu', '-c', script], capture_output=True,
+                                        env=env, text=True)
+                self.assertEqual(result.returncode, expected, result.stderr)
+                if expected:
+                    self.assertIn('published Notion runbook', result.stderr)
+
+    def test_proxy_bootstrap_uses_applied_manifests_and_promoted_staging(self):
+        workflow = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
+        staging, production = workflow.split('  deploy-staging:\n',1)[1].split('  deploy-production:\n',1)
+        for job, root in ((staging,'staging/us-central1'),(production,'production/us-east4')):
+            output = f'terraform -chdir=infra/envs/{root} output -json proxy_generation_rollout'
+            self.assertLess(job.index(output),job.index('python3 .github/workflows/scripts/deploy-proxy.py'))
+        self.assertIn("PROXY_OPERATION: ${{ inputs.environment == 'production' && 'deploy' || inputs.operation || 'deploy' }}",staging)
+        self.assertIn("PROXY_OPERATION: ${{ inputs.operation || 'deploy' }}",workflow)
+
+    def test_production_proxy_loads_each_cells_own_manifest(self):
+        workflow = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
+        production = workflow.split('  deploy-production:\n', 1)[1]
+        steps = re.split(r'^      - ', production, flags=re.M)
+        for region, deploy_name in (
+            ('us-east4', 'Deploy proxy to us-east4 use-cell VMD instance'),
+            ('us-west2', 'Deploy proxy to usw cell VMD instances'),
+        ):
+            with self.subTest(region=region):
+                index = next(i for i, step in enumerate(steps)
+                             if step.startswith(f'name: {deploy_name}\n'))
+                load, deploy = steps[index - 1:index + 1]
+                load_guard = re.search(r'^        if: (.+)$', load, re.M).group(1)
+                deploy_guard = re.search(r'^        if: (.+)$', deploy, re.M).group(1)
+                self.assertEqual(load_guard, deploy_guard)
+                root = f'infra/envs/production/{region}'
+                self.assertIn(f'terraform -chdir={root} init -input=false', load)
+                self.assertIn(f'terraform -chdir={root} output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"', load)
+                self.assertEqual(load.count(' output -json proxy_generation_rollout'), 1)
+
+    def test_each_proxy_environment_commits_a_cell_for_rollout_manifests(self):
+        cells = (
+            ('staging/us-central1', 'staging'),
+            ('production/us-east4', 'use4'),
+            ('production/us-west2', 'usw2'),
+        )
+        for root, cell in cells:
+            with self.subTest(root=root):
+                tfvars = (SCRIPTS.parent.parent.parent / 'infra' / 'envs' / root / 'terraform.tfvars').read_text()
+                self.assertNotIn('proxy_generation_cells = {}', tfvars)
+                self.assertIn(f'proxy_generation_cells = {{\n  {cell} = {{', tfvars)
+                self.assertRegex(tfvars, r'(?m)^    instance\s*=\s*"[^"]+"$')
+                if cell == 'usw2':
+                    # The west public route is the adopted regional URL map;
+                    # the east-owned SSL/redirect frontends must not be
+                    # represented as west cutover routes.
+                    self.assertIn('"public-http" = {', tfvars)
+                    self.assertNotIn('"public-tcp" = {', tfvars)
+                    self.assertNotIn('redirect = {', tfvars)
+
+                generations = (SCRIPTS.parent.parent.parent / 'infra' / 'envs' / root / 'proxy-generations.tf').read_text()
+                self.assertNotRegex(generations, r'(?m)^\s*default\s*=\s*\{\}\s*$')
+                self.assertIn('output "proxy_generation_rollout"', generations)
+                self.assertIn('serving_host', generations)
+
+    def test_generation_manifest_keeps_serving_identity_for_standby_resolution(self):
+        module = (SCRIPTS.parent.parent.parent / 'infra' / 'modules' / 'proxy-lb' / 'generations.tf').read_text()
+        self.assertIn('serving_host = {', module)
+        self.assertIn('instance = var.generation_cell.instance', module)
+        self.assertIn('ip       = var.generation_cell.ip', module)
+
+    def test_generation_backends_are_attached_to_owned_frontends(self):
+        root = SCRIPTS.parent.parent.parent / 'infra' / 'envs'
+        owned_frontends = {
+            'staging/us-central1': ('staging', ('public-http', 'public-tcp', 'redirect')),
+            'production/us-east4': ('use4', ('public-http', 'public-tcp', 'redirect')),
+        }
+        for environment, (cell, routes) in owned_frontends.items():
+            with self.subTest(environment=environment):
+                generations = (root / environment / 'proxy-generations.tf').read_text()
+                frontends = (root / environment / 'proxy-frontends.tf').read_text()
+                for route in routes:
+                    backend_expression = (
+                        f'module.proxy_generations["{cell}"].generation_backend_services.redirect'
+                        if route == 'redirect' else
+                        f'module.proxy_generations["{cell}"].generation_backend_services["{route}"]'
+                    )
+                    self.assertIn(
+                        backend_expression,
+                        generations if route != 'redirect' else frontends,
+                    )
+                self.assertIn('frontend_backend_references', generations)
+                self.assertIn('migration_complete', generations)
+
+        # The west backend is owned by its regional state, while the global
+        # URL map is owned by east; both sides must retain the same explicit
+        # backend identity for the cross-state route.
+        west = (root / 'production/us-west2/proxy-generations.tf').read_text()
+        east = (root / 'production/us-east4/proxy-frontends.tf').read_text()
+        backend = 'proxy-usw2-public-http-generations'
+        self.assertIn(backend, east)
+        self.assertIn('module.proxy_generations["usw2"].generation_backend_services["public-http"]', west)
+        self.assertIn('data "terraform_remote_state" "use4"', west)
+        self.assertIn('data.terraform_remote_state.use4.outputs.proxy_west_frontend_backend_references', west)
+        self.assertIn('url-map:sandbox-dataplane', west)
+        self.assertIn('target-https-proxy:dp-https', west)
+        self.assertIn('frontend_backend_references', west)
+        self.assertIn('migration_complete', west)
 
     def deploy_selection(self, rows, region="us-central1", expected="example-standby"):
         spec = importlib.util.spec_from_file_location("deploy_selection", SCRIPTS / "deploy-vmd.py")
@@ -197,7 +353,24 @@ class DeployTargetTests(unittest.TestCase):
             workflow = (SCRIPTS.parent / f"deploy-{kind}.yml").read_text()
             production = workflow.split("  deploy-production:\n", 1)[1]
             self.assertIn("    needs: [deploy-staging]\n", production)
-            self.assertIn("if: github.event_name == 'push' || github.event.inputs.environment == 'production'", production)
+            condition = re.search(r'^    if: (.+)$', production, re.M)[1]
+            for event in ('push', 'workflow_dispatch'):
+                for environment in ('', 'staging', 'production'):
+                    for ready in ('', 'false', 'true', 'TRUE', '1', 'tru', ' true '):
+                        with self.subTest(kind=kind, event=event, environment=environment, ready=ready):
+                            context = dict(
+                                github=SimpleNamespace(event_name=event, event=SimpleNamespace(
+                                    inputs=SimpleNamespace(environment=environment))),
+                                vars=SimpleNamespace(
+                                    PROXY_GENERATION_PROMOTION_READY=ready,
+                                    PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS='passed',
+                                    PROXY_GENERATION_RUNBOOK_URL='https://www.notion.so/example-team/page',
+                                    PROXY_GENERATION_PROMOTION_EVIDENCE_URL='https://evidence.example/run-1'))
+                            selected = eval(condition.replace('&&', ' and ').replace('||', ' or '),
+                                            {'__builtins__': {}}, context)
+                            expected = ((event == 'push' or environment == 'production')
+                                        and (kind != 'proxy' or ready == 'true'))
+                            self.assertEqual(selected, expected)
             steps = [s for s in re.split(r"^      - name: ", workflow, flags=re.M)
                      if f"python3 .github/workflows/scripts/deploy-{kind}.py" in s]
             self.assertEqual(len(steps), 3)
