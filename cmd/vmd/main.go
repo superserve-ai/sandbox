@@ -1025,7 +1025,9 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
 	}
-	mgr.SweepSavedSnapshotStaging(log)
+	if n, _ := mgr.SweepSavedSnapshotStaging(log); n > 0 {
+		log.Info().Int("staging_dirs", n).Msg("reclaiming abandoned saved snapshot staging in the background")
+	}
 
 	// ---- TCP egress proxy ----
 	// Must be set before ReattachAll or any VM operations so domain

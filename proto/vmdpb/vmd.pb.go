@@ -3979,7 +3979,8 @@ type CreateSavedSnapshotResponse struct {
 	MemoryMib    uint32 `protobuf:"varint,9,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
 	DiskSizeMib  uint32 `protobuf:"varint,10,opt,name=disk_size_mib,json=diskSizeMib,proto3" json:"disk_size_mib,omitempty"`
 	SizeBytes    int64  `protobuf:"varint,11,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"` // Allocated bytes of the owned files.
-	// What a warm restore of the memory image needs to match.
+	// What a warm restore of the memory image needs to match. The hash names
+	// the Firecracker process that wrote the image; empty when unknown.
 	KernelPath        string `protobuf:"bytes,12,opt,name=kernel_path,json=kernelPath,proto3" json:"kernel_path,omitempty"`
 	FirecrackerSha256 string `protobuf:"bytes,13,opt,name=firecracker_sha256,json=firecrackerSha256,proto3" json:"firecracker_sha256,omitempty"`
 	CreatedAtUnix     int64  `protobuf:"varint,14,opt,name=created_at_unix,json=createdAtUnix,proto3" json:"created_at_unix,omitempty"`

@@ -25,10 +25,9 @@ func newSavedTestManager(t *testing.T) *Manager {
 	m := &Manager{
 		log: zerolog.Nop(),
 		cfg: ManagerConfig{
-			SnapshotDir:    filepath.Join(root, "snapshots"),
-			RunDir:         filepath.Join(root, "rundir"),
-			KernelPath:     "/kernel/vmlinux",
-			FirecrackerBin: filepath.Join(root, "missing-firecracker"),
+			SnapshotDir: filepath.Join(root, "snapshots"),
+			RunDir:      filepath.Join(root, "rundir"),
+			KernelPath:  "/kernel/vmlinux",
 		},
 		vms: map[string]*VMInstance{},
 		// Every seeded source is at rest; the real probe needs systemd and cgroups.
@@ -413,8 +412,14 @@ func TestSweepSavedSnapshotStaging(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if n := m.SweepSavedSnapshotStaging(zerolog.Nop()); n != 2 {
-		t.Errorf("swept %d staging dirs, want 2", n)
+	n, done := m.SweepSavedSnapshotStaging(zerolog.Nop())
+	if n != 2 {
+		t.Errorf("found %d staging dirs, want 2", n)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background sweep did not finish")
 	}
 	if !fileExists(man.DiskPath) {
 		t.Error("committed snapshot was swept")
@@ -496,5 +501,27 @@ func TestCloneSavedDiskGivesTheVMItsOwnCopy(t *testing.T) {
 	f.Close()
 	if pageAt(t, man.DiskPath, 7) != 'D' {
 		t.Error("snapshot disk changed under the child's write")
+	}
+}
+
+func TestCloneSavedDiskLeavesNoPartialFile(t *testing.T) {
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, false)
+	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.reflinkOverlay = func(_ context.Context, _, dst string) error {
+		if err := os.WriteFile(dst, []byte("partial"), 0o644); err != nil {
+			return err
+		}
+		return errors.New("disk full")
+	}
+	child := uuid.NewString()
+	if _, err := m.cloneSavedDisk(context.Background(), child, man.DiskPath, man.BasePath); err == nil {
+		t.Fatal("clone should fail")
+	}
+	if fileExists(filepath.Join(m.cfg.RunDir, child, "overlay.ext4")) {
+		t.Error("partial clone left behind for a retry to adopt")
 	}
 }

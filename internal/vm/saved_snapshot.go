@@ -52,21 +52,23 @@ const (
 // SavedSnapshotManifest is the commit record of one saved snapshot. Every
 // path it owns lies inside its directory; base paths belong to the template.
 type SavedSnapshotManifest struct {
-	Version           int               `json:"version"`
-	SnapshotID        string            `json:"snapshot_id"`
-	SourceVMID        string            `json:"source_vm_id"`
-	Kind              SavedSnapshotKind `json:"kind"`
-	CreatedAt         time.Time         `json:"created_at"`
-	VCPU              uint32            `json:"vcpu"`
-	MemoryMiB         uint32            `json:"memory_mib"`
-	DiskSizeMiB       uint32            `json:"disk_size_mib"`
-	BasePath          string            `json:"base_path,omitempty"`
-	DiskPath          string            `json:"disk_path"`
-	SnapshotPath      string            `json:"snapshot_path,omitempty"`
-	MemPath           string            `json:"mem_path,omitempty"`
-	BaseMemPath       string            `json:"base_mem_path,omitempty"`
-	KernelPath        string            `json:"kernel_path"`
-	FirecrackerSHA256 string            `json:"firecracker_sha256,omitempty"`
+	Version      int               `json:"version"`
+	SnapshotID   string            `json:"snapshot_id"`
+	SourceVMID   string            `json:"source_vm_id"`
+	Kind         SavedSnapshotKind `json:"kind"`
+	CreatedAt    time.Time         `json:"created_at"`
+	VCPU         uint32            `json:"vcpu"`
+	MemoryMiB    uint32            `json:"memory_mib"`
+	DiskSizeMiB  uint32            `json:"disk_size_mib"`
+	BasePath     string            `json:"base_path,omitempty"`
+	DiskPath     string            `json:"disk_path"`
+	SnapshotPath string            `json:"snapshot_path,omitempty"`
+	MemPath      string            `json:"mem_path,omitempty"`
+	BaseMemPath  string            `json:"base_mem_path,omitempty"`
+	KernelPath   string            `json:"kernel_path"`
+	// FirecrackerSHA256 identifies the process that wrote the memory image;
+	// empty when unknown, as for a paused source.
+	FirecrackerSHA256 string `json:"firecracker_sha256,omitempty"`
 	// SizeBytes is the allocated size of the files this snapshot owns.
 	SizeBytes int64 `json:"size_bytes"`
 }
@@ -155,19 +157,21 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 	}()
 
 	man := &SavedSnapshotManifest{
-		Version:           savedSnapshotVersion,
-		SnapshotID:        snapshotID,
-		SourceVMID:        vmID,
-		Kind:              kind,
-		CreatedAt:         time.Now().UTC(),
-		VCPU:              cfg.VCPU,
-		MemoryMiB:         cfg.MemoryMiB,
-		DiskSizeMiB:       cfg.DiskSizeMiB,
-		BasePath:          cfg.BasePath,
-		KernelPath:        m.cfg.KernelPath,
-		FirecrackerSHA256: m.firecrackerSHA(),
+		Version:     savedSnapshotVersion,
+		SnapshotID:  snapshotID,
+		SourceVMID:  vmID,
+		Kind:        kind,
+		CreatedAt:   time.Now().UTC(),
+		VCPU:        cfg.VCPU,
+		MemoryMiB:   cfg.MemoryMiB,
+		DiskSizeMiB: cfg.DiskSizeMiB,
+		BasePath:    cfg.BasePath,
+		KernelPath:  m.cfg.KernelPath,
 	}
 	if st == StatusRunning {
+		// The image is written by the live process, which may predate the
+		// binary on disk; a paused image's producer went unrecorded.
+		man.FirecrackerSHA256 = firecrackerExeSHA(inst)
 		err = m.captureRunningSaved(ctx, inst, tmp, dir, diskPath, kind, man, log)
 	} else {
 		err = m.capturePausedSaved(ctx, inst, tmp, dir, diskPath, kind, man)
@@ -612,26 +616,33 @@ func writeSavedSnapshotManifest(dir string, man *SavedSnapshotManifest) error {
 	return os.Rename(path+".tmp", path)
 }
 
-// SweepSavedSnapshotStaging removes every staging directory under the saved
-// snapshot root. Run at startup, when no capture can be in flight, so a
-// capture the previous process died in never keeps its image on disk.
-func (m *Manager) SweepSavedSnapshotStaging(log zerolog.Logger) int {
+// SweepSavedSnapshotStaging reclaims staging directories a previous process
+// died in. The list is taken at startup, before any capture can stage under
+// a new name, and the removal runs in the background so a multi-GiB image
+// never delays reattach. The returned channel closes when it is done.
+func (m *Manager) SweepSavedSnapshotStaging(log zerolog.Logger) (int, <-chan struct{}) {
+	done := make(chan struct{})
 	if m.cfg.SnapshotDir == "" {
-		return 0
+		close(done)
+		return 0, done
 	}
 	stale, _ := filepath.Glob(filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, ".*.tmp-*"))
-	n := 0
-	for _, d := range stale {
-		if err := os.RemoveAll(d); err != nil {
-			log.Warn().Err(err).Str("dir", d).Msg("saved snapshot staging could not be removed")
-			continue
+	go func() {
+		defer close(done)
+		start := time.Now()
+		n := 0
+		for _, d := range stale {
+			if err := os.RemoveAll(d); err != nil {
+				log.Warn().Err(err).Str("dir", d).Msg("saved snapshot staging could not be removed")
+				continue
+			}
+			n++
 		}
-		n++
-	}
-	if n > 0 {
-		log.Info().Int("removed", n).Msg("swept abandoned saved snapshot staging")
-	}
-	return n
+		if n > 0 {
+			log.Info().Int("removed", n).Dur("took", time.Since(start)).Msg("swept abandoned saved snapshot staging")
+		}
+	}()
+	return len(stale), done
 }
 
 func removeSavedStaging(parent, snapshotID string) {
@@ -730,20 +741,26 @@ func (m *Manager) savedCaptureHeadroom(kind SavedSnapshotKind, st VMStatus, inst
 	return nil
 }
 
-func (m *Manager) firecrackerSHA() string {
-	m.fcSHAOnce.Do(func() {
-		f, err := os.Open(m.cfg.FirecrackerBin)
-		if err != nil {
-			return
-		}
-		defer f.Close()
-		h := sha256.New()
-		if _, err := io.Copy(h, f); err != nil {
-			return
-		}
-		m.fcSHA = hex.EncodeToString(h.Sum(nil))
-	})
-	return m.fcSHA
+// firecrackerExeSHA hashes the running VM's Firecracker through its exe
+// link, which names the binary the process runs even after the file on disk
+// was replaced. Empty when it cannot be read.
+func firecrackerExeSHA(inst *VMInstance) string {
+	inst.mu.RLock()
+	pid := inst.PID
+	inst.mu.RUnlock()
+	if pid <= 0 {
+		return ""
+	}
+	f, err := os.Open(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // fcPauseVMContext pauses the vCPUs over a bare request, like UnpauseVMContext.

@@ -708,8 +708,6 @@ type Manager struct {
 	savedIDLocks      map[string]*savedIDLock // see lockSavedSnapshot
 	// reflinkOverlay stands in for the exact overlay clone in tests.
 	reflinkOverlay func(ctx context.Context, src, dst string) error
-	fcSHAOnce      sync.Once
-	fcSHA          string
 
 	// launchGenSeq issues launch generations. It is manager-global and
 	// monotonic on purpose: a per-instance counter restarts at zero whenever
@@ -7342,6 +7340,9 @@ func (m *Manager) cloneSavedDisk(ctx context.Context, dirName, savedDisk, basePa
 	}
 	dst := filepath.Join(vmDir, name)
 	if err := copy(ctx, savedDisk, dst); err != nil {
+		// A partial file left here would pass a same-id retry as the VM's
+		// existing disk.
+		_ = os.Remove(dst)
 		if errors.Is(err, errNoReflink) {
 			return "", status.Errorf(codes.FailedPrecondition, "saved disk %s needs a reflink filesystem shared with %s: %v", savedDisk, m.cfg.RunDir, err)
 		}
