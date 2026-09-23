@@ -236,23 +236,23 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	}
 	willFreeze := kind == SavedSnapshotMemFS && corrects && m.cfg.GuestClockFreezeEnabled &&
 		m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load()
-	token, artifact := "", ""
-	sourceDir := filepath.Join(m.cfg.SnapshotDir, vmID)
-	intentWritten := false
+	token, artifact := "", NewArtifactID()
 	if willFreeze {
-		token, artifact = NewFreezeToken(), NewArtifactID()
-		if err := m.ensureWakeFloorTimed("saved-snapshot"); err != nil {
-			return fmt.Errorf("record the rollback floor before freezing: %w", err)
-		}
-		if err := os.MkdirAll(sourceDir, 0o755); err != nil {
-			return fmt.Errorf("create source snapshot dir: %w", err)
-		}
-		// Durable before the freeze: a crash must find the token, or the
-		// guest stays frozen with nobody able to release it.
-		if err := writePauseIntent(sourceDir, pauseIntent{VMID: vmID, FreezeToken: token, ArtifactID: artifact}); err != nil {
-			return fmt.Errorf("record capture intent: %w", err)
-		}
-		intentWritten = true
+		token = NewFreezeToken()
+	}
+	// Every running capture pauses the vCPUs, so every one is journalled
+	// first: a vmd that dies before the release finds the intent on reattach
+	// and resumes the guest, with the token when it was frozen. The floor is
+	// what makes reattach look for intents at all.
+	sourceDir := filepath.Join(m.cfg.SnapshotDir, vmID)
+	if err := m.ensureWakeFloorTimed("saved-snapshot"); err != nil {
+		return fmt.Errorf("record the rollback floor before pausing: %w", err)
+	}
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		return fmt.Errorf("create source snapshot dir: %w", err)
+	}
+	if err := writePauseIntent(sourceDir, pauseIntent{VMID: vmID, FreezeToken: token, ArtifactID: artifact}); err != nil {
+		return fmt.Errorf("record capture intent: %w", err)
 	}
 	frozen := false
 	if willFreeze {
@@ -284,9 +284,6 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		m.abandonDirtyBaseline(inst)
 	}
 	if captureErr == nil && kind == SavedSnapshotMemFS && corrects {
-		if artifact == "" {
-			artifact = NewArtifactID()
-		}
 		wm := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifact, WorkloadFrozen: frozen, GuestCorrectsClock: true}
 		if frozen {
 			wm.FreezeToken = token
@@ -306,10 +303,8 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		m.markUnservable(inst, log)
 		return status.Errorf(codes.Unavailable, "source could not be resumed after capture: %v", errors.Join(captureErr, releaseErr))
 	}
-	if intentWritten {
-		if err := clearPauseIntent(sourceDir); err != nil {
-			return fmt.Errorf("clear capture intent: %w", err)
-		}
+	if err := clearPauseIntent(sourceDir); err != nil {
+		return fmt.Errorf("clear capture intent: %w", err)
 	}
 	if captureErr != nil {
 		return captureErr

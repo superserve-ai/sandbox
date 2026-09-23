@@ -457,3 +457,44 @@ func TestCopyHonoursCancellation(t *testing.T) {
 		t.Errorf("copy with a cancelled context: want Canceled, got %v", err)
 	}
 }
+
+func TestPlanRestoreClonesSavedDisk(t *testing.T) {
+	if p := planRestore("/base.ext4", "/delta", "/saved/overlay.ext4", false); p.action != restoreCloneSavedDisk || p.deltaDir != "" {
+		t.Errorf("saved disk with base: %+v", p)
+	}
+	if p := planRestore("", "", "/saved/rootfs.ext4", false); p.action != restoreCloneSavedDisk {
+		t.Errorf("saved standalone disk: %+v", p)
+	}
+	if p := planRestore("/base.ext4", "", "/saved/overlay.ext4", true); p.action != restoreReuseOverlay {
+		t.Errorf("in-place retry keeps its own overlay: %+v", p)
+	}
+}
+
+func TestCloneSavedDiskGivesTheVMItsOwnCopy(t *testing.T) {
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, false)
+	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := uuid.NewString()
+	disk, err := m.cloneSavedDisk(context.Background(), child, man.DiskPath, man.BasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disk != filepath.Join(m.cfg.RunDir, child, "overlay.ext4") || pageAt(t, disk, 7) != 'D' {
+		t.Errorf("clone: path %s", disk)
+	}
+	// The child's writes never reach the snapshot.
+	f, err := os.OpenFile(disk, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{'C'}, 7*testPage); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if pageAt(t, man.DiskPath, 7) != 'D' {
+		t.Error("snapshot disk changed under the child's write")
+	}
+}

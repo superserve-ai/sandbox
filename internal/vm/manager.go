@@ -265,6 +265,9 @@ type VMConfig struct {
 	// DeltaDir hydrates a fresh per-VM overlay from <dir>/rootfs.delta on
 	// restore. Empty for in-place resume of an already-populated overlay.
 	DeltaDir string
+	// SavedDiskPath materializes a saved snapshot's disk as this VM's own
+	// copy instead of hydrating from DeltaDir; see cloneSavedDisk.
+	SavedDiskPath string
 }
 
 // ManagerConfig holds paths and settings for the VM manager.
@@ -1039,9 +1042,10 @@ func TemplateMagicOverlayPath(runDir string) string {
 type restoreDiskAction int
 
 const (
-	restoreCreateOverlay restoreDiskAction = iota // overlay clone of a template
-	restoreReuseOverlay                           // existing per-VM overlay (resume)
-	restoreLegacyResolve                          // legacy non-overlay path
+	restoreCreateOverlay  restoreDiskAction = iota // overlay clone of a template
+	restoreReuseOverlay                            // existing per-VM overlay (resume)
+	restoreLegacyResolve                           // legacy non-overlay path
+	restoreCloneSavedDisk                          // per-VM copy of a saved snapshot's disk
 )
 
 // restorePlan is planRestore's output — pure decision, no I/O.
@@ -1053,7 +1057,7 @@ type restorePlan struct {
 // planRestore picks the disk action + delta_dir for a restore. createOverlay
 // requires ALL of {basePath, deltaDir, !inPlace} — anything missing means
 // we'd be cloning over an existing per-VM file, so fall back to reuse.
-func planRestore(basePath, deltaDir string, reuse bool) restorePlan {
+func planRestore(basePath, deltaDir, savedDisk string, reuse bool) restorePlan {
 	p := restorePlan{deltaDir: deltaDir}
 	if reuse {
 		// fc's delta-apply truncates the overlay; force empty to stop a
@@ -1062,6 +1066,9 @@ func planRestore(basePath, deltaDir string, reuse bool) restorePlan {
 		p.deltaDir = ""
 	}
 	switch {
+	case savedDisk != "" && !reuse:
+		p.deltaDir = ""
+		p.action = restoreCloneSavedDisk
 	case basePath != "" && p.deltaDir != "":
 		p.action = restoreCreateOverlay
 	case basePath != "":
@@ -3657,7 +3664,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	freshUnit := m.orphanScanDone.Load() && !inPlace && !priorRunDir &&
 		!isBuildVM(vmID) && !unitMaybeWindingDown(systemdUnitName(vmID))
 
-	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, reuse)
+	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, resourceLimits.SavedDiskPath, reuse)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
 	// see cleanupRunDirKeepOverlay.
 	cleanupAfterRestoreFailure := func() {
@@ -3681,6 +3688,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 	case restoreLegacyResolve:
 		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
+	case restoreCloneSavedDisk:
+		diskPath, diskErr = m.cloneSavedDisk(ctx, vmID, resourceLimits.SavedDiskPath, resourceLimits.BasePath)
 	}
 	if diskErr != nil {
 		tFailBoundary = time.Now()
@@ -7314,6 +7323,31 @@ func (m *Manager) copyRootfsExact(ctx context.Context, dirName, srcRootfs string
 		return "", fmt.Errorf("exact copy (source and run dir must share a reflink filesystem): %s: %w", string(out), err)
 	}
 	return diskPath, nil
+}
+
+// cloneSavedDisk gives the VM its own copy of a saved snapshot's disk. An
+// overlay is reflinked extent-exact or refused, as captureSavedDisk made it;
+// a standalone rootfs may be copied.
+func (m *Manager) cloneSavedDisk(ctx context.Context, dirName, savedDisk, basePath string) (string, error) {
+	vmDir := filepath.Join(m.cfg.RunDir, dirName)
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir vm dir: %w", err)
+	}
+	name, copy := "rootfs.ext4", cloneOrCopyFile
+	if basePath != "" {
+		name, copy = "overlay.ext4", reflinkFileExact
+		if m.reflinkOverlay != nil {
+			copy = m.reflinkOverlay
+		}
+	}
+	dst := filepath.Join(vmDir, name)
+	if err := copy(ctx, savedDisk, dst); err != nil {
+		if errors.Is(err, errNoReflink) {
+			return "", status.Errorf(codes.FailedPrecondition, "saved disk %s needs a reflink filesystem shared with %s: %v", savedDisk, m.cfg.RunDir, err)
+		}
+		return "", fmt.Errorf("clone saved disk: %w", err)
+	}
+	return dst, nil
 }
 
 // createOverlay creates a sparse per-VM overlay file pre-sized to the base
