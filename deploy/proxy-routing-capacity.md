@@ -121,5 +121,6 @@ keep ingress on destinations that other sources still use.
 Readiness accepts an acknowledged heartbeat from the current VMD invocation,
 including identity-bound hosts retaining the legacy `default` ID. Bound hosts
 also acknowledge removal of an endpoint. The database fallback accepts only a
-fresh, matching heartbeat from a genuinely unbound `default` host; it cannot
+fresh, matching heartbeat for the running VMD’s explicit `HOST_ID` when that host
+is unbound (including named legacy hosts); it cannot
 substitute for a missing acknowledgement on a bound host.

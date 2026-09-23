@@ -279,7 +279,7 @@ def main() -> int:
                 # still-current invocation before old routing can be retired.
                 local deadline=$((SECONDS + 90))
                 # Bound hosts can retain HOST_ID=default. The DB fallback
-                # independently requires an unbound default-host record.
+                # independently requires an unbound record for the running HOST_ID.
                 for attempt in $(seq 1 90); do
                     [ "$SECONDS" -lt "$deadline" ] || break
                     invocation=$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)
