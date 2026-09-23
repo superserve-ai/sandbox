@@ -3,9 +3,9 @@
 This runbook is the operator contract for the three serving cells. Terraform
 creates one Cloud Run runtime identity per cell, grants it the cell's exact
 runtime secret set, and grants `roles/storage.objectViewer` on the
-`templates/` managed folder in that cell's backup bucket. The managed-folder
-binding provides template object get/list; it does not provide sandbox access,
-create, overwrite, or delete.
+`templates/` and `bases/` managed folders in that cell's backup bucket. The
+managed-folder bindings provide template and shared-base object get/list; they
+do not provide sandbox access, create, overwrite, or delete.
 
 ## Published contract
 
@@ -17,7 +17,7 @@ create, overwrite, or delete.
 
 The authoritative rendered values are the `controlplane_identity_contract`
 outputs from each environment root. The output includes the runtime identity,
-bucket, allowed storage permissions and object prefix, secret IDs, deployment
+bucket, allowed storage permissions and reader object prefixes, secret IDs, deployment
 identity, deployment act-as and token-creation permissions, KMS grant principal
 and role, and KMS owner. The KMS key is the shared credentials key for both production
 cells; its `roles/cloudkms.cryptoKeyEncrypterDecrypter` grant is applied by the
@@ -45,7 +45,7 @@ infrastructure changes may resume automatically after the staged cutover.
 ## Migration order
 
 1. From each environment root, review `terraform plan` and confirm the new
-   service account, exact secret set, managed-folder viewer grant, metric-writer grant,
+   service account, exact secret set, template and shared-base managed-folder viewer grants, metric-writer grant,
    and scoped GitHub Actions act-as and token-creation grants. Confirm no VMD service account is a
    `reader_members` entry.
 2. Run the manually confirmed
@@ -69,7 +69,7 @@ infrastructure changes may resume automatically after the staged cutover.
    applied before cutover. The verifier gates the stage on a runtime-identity
    KMS encrypt/decrypt round trip as well as same-cell manifest/reference
    reads, cross-cell list denial, non-mutating IAM Policy Troubleshooter
-   checks for sandbox and cross-cell object-get denial plus create and delete denial, Secret
+   checks for sandbox and cross-cell sandbox/template object-get denial plus create and delete denial, Secret
    Manager access, effective IAM analysis, deployment act-as, and the
    centrally owned KMS binding. It also requires the latest ready revision to
    have 100% traffic under the dedicated identity.
@@ -111,7 +111,8 @@ summary alone is not approval.
 
 The verifier discovers a real generation manifest at
 `templates/<template>/<build>/<generation>/manifest.json` and reads every
-artifact named by its `files[*].object` entries. If a manifest uses a format
+artifact named by its `files[*].object` entries, including bucket-relative
+`bases/` shared objects. If a manifest uses a format
 without discoverable object URIs, rerun it with one `--referenced-object`
 argument per manifest reference; do not substitute a made-up path.
 
@@ -129,12 +130,13 @@ python3 scripts/verify-control-plane-identity.py \
 
 The verifier discovers the actual generation `manifest.json` object, reads
 each referenced artifact, and uses IAM Policy Troubleshooter to confirm that
-the runtime identity is denied `storage.objects.get` for a synthetic object
-under `sandboxes/` in its own and every other cell's bucket. It also confirms
-denial of `storage.objects.create` for a synthetic object under `templates/`
-and `storage.objects.delete` on the live manifest. These checks are
-non-mutating, so retries cannot turn a create check into an overwrite check or
-alter a customer artifact. A missing object is not a negative IAM result.
+the runtime identity is denied `storage.objects.get` for synthetic objects
+under `sandboxes/` in its own and every other cell's bucket and under
+`templates/` in every other cell's bucket. It also confirms denial of
+`storage.objects.create` for a synthetic object under `templates/` and
+`storage.objects.delete` on the live manifest. These checks are non-mutating,
+so retries cannot turn a create check into an overwrite check or alter a
+customer artifact. A missing object is not a negative IAM result.
 
 Also verify that the deployment principal can update the Cloud Run service with
 the new identity and mint credentials as that identity for the probes, that the

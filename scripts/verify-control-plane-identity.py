@@ -187,6 +187,7 @@ def contract(path: Path) -> dict[str, object]:
         "deployment_identity",
         "backup_bucket",
         "backup_object_prefix",
+        "backup_object_prefixes",
         "backup_permissions",
         "secret_ids",
         "host_identities_unchanged",
@@ -196,8 +197,17 @@ def contract(path: Path) -> dict[str, object]:
         raise VerificationError(f"identity contract is missing: {', '.join(missing)}")
     if sorted(value["backup_permissions"]) != ["storage.objects.get", "storage.objects.list"]:
         raise VerificationError("identity contract grants more than storage get/list")
+    prefixes = value["backup_object_prefixes"]
+    if (
+        not isinstance(prefixes, list)
+        or any(not isinstance(prefix, str) for prefix in prefixes)
+        or sorted(prefixes) != ["bases/", "templates/"]
+    ):
+        raise VerificationError(
+            "identity contract must restrict backup reads to the bases/ and templates/ prefixes"
+        )
     if value["backup_object_prefix"] != "templates/":
-        raise VerificationError("identity contract must restrict backup reads to the templates/ prefix")
+        raise VerificationError("identity contract must retain templates/ as the manifest prefix")
     return value
 
 
@@ -352,6 +362,7 @@ def main() -> int:
         identity = str(cp["runtime_service_account"])
         bucket = str(cp["backup_bucket"])
         object_prefix = str(cp["backup_object_prefix"])
+        object_prefixes = [str(prefix) for prefix in cp["backup_object_prefixes"]]
         legacy = str(cp["legacy_runtime_account"])
         raw_hosts = cp["host_identities_unchanged"]
         if not isinstance(raw_hosts, list) or not all(
@@ -374,6 +385,7 @@ def main() -> int:
             "legacy_runtime_account": legacy,
             "backup_bucket": bucket,
             "backup_object_prefix": cp["backup_object_prefix"],
+            "backup_object_prefixes": object_prefixes,
             "deployment_identity": cp["deployment_identity"],
             "backup_permissions": cp["backup_permissions"],
             "secret_ids": cp["secret_ids"],
@@ -544,6 +556,14 @@ def main() -> int:
                 sandbox_probe,
                 "storage.objects.get",
             )
+            require_permission_denied(
+                evidence,
+                f"cross-cell-template-get-{index}",
+                identity,
+                other,
+                "templates/.permission-probe",
+                "storage.objects.get",
+            )
         # Policy Troubleshooter evaluates create access without issuing a
         # mutating request. A real upload is unsafe here: if a bad grant lets
         # the first attempt create the fixed probe object, a retry would test
@@ -634,25 +654,26 @@ def main() -> int:
                 "runtime identity must not receive a bucket-level backup grant: "
                 f"{sorted(reader_roles)}"
             )
-        managed_folder_policy_json = evidence.command(
-            "managed-folder-iam",
-            gcloud(
-                "storage",
-                "managed-folders",
-                "get-iam-policy",
-                f"gs://{bucket}/{object_prefix}",
-                "--format=json",
-            ),
-        )
-        managed_folder_policy = json.loads(managed_folder_policy_json)
-        if not any(
-            binding.get("role") == "roles/storage.objectViewer"
-            and reader_member in binding.get("members", [])
-            for binding in managed_folder_policy.get("bindings", [])
-        ):
-            raise VerificationError(
-                f"managed folder {object_prefix} has no objectViewer grant for {identity}"
+        for index, prefix in enumerate(object_prefixes, 1):
+            managed_folder_policy_json = evidence.command(
+                f"managed-folder-iam-{index}",
+                gcloud(
+                    "storage",
+                    "managed-folders",
+                    "get-iam-policy",
+                    f"gs://{bucket}/{prefix}",
+                    "--format=json",
+                ),
             )
+            managed_folder_policy = json.loads(managed_folder_policy_json)
+            if not any(
+                binding.get("role") == "roles/storage.objectViewer"
+                and reader_member in binding.get("members", [])
+                for binding in managed_folder_policy.get("bindings", [])
+            ):
+                raise VerificationError(
+                    f"managed folder {prefix} has no objectViewer grant for {identity}"
+                )
         evidence.command(
             "project-iam",
             gcloud("projects", "get-iam-policy", args.project, "--format=json"),
@@ -873,7 +894,6 @@ def main() -> int:
             "create-permission-check",
             "delete-permission-check",
             "bucket-iam",
-            "managed-folder-iam",
             "project-iam",
             "service-account-iam",
             "effective-iam",
@@ -885,6 +905,9 @@ def main() -> int:
             f"cross-cell-get-{index}" for index, _ in enumerate(args.other_bucket, 1)
         )
         required_checks.extend(
+            f"cross-cell-template-get-{index}" for index, _ in enumerate(args.other_bucket, 1)
+        )
+        required_checks.extend(
             f"referenced-read-{index}" for index, _ in enumerate(references, 1)
         )
         required_checks.extend(
@@ -893,6 +916,10 @@ def main() -> int:
         required_checks.extend(
             f"host-effective-iam-{index}"
             for index, _ in enumerate(host_identities, 1)
+        )
+        required_checks.extend(
+            f"managed-folder-iam-{index}"
+            for index, _ in enumerate(object_prefixes, 1)
         )
         if kms:
             required_checks.extend(["kms-iam", "kms-encrypt-as-runtime", "kms-decrypt-as-runtime"])

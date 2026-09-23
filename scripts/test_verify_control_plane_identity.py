@@ -144,6 +144,35 @@ class ObjectReadPermissionProbeTests(unittest.TestCase):
                 )
             self.assertEqual(evidence.index[0]["status"], "FAIL")
 
+    def test_cross_cell_template_get_probe_targets_other_cell_template_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = VERIFY.Evidence(Path(directory))
+            commands = []
+
+            def command(name, argv, **_kwargs):
+                commands.append((name, argv))
+                evidence.index.append({"name": name, "status": "PASS"})
+                return '{"access":"NOT_GRANTED"}'
+
+            evidence.command = command
+            VERIFY.require_permission_denied(
+                evidence,
+                "cross-cell-template-get-1",
+                "reader@example-project.iam.gserviceaccount.com",
+                "other-cell-backups",
+                "templates/.permission-probe",
+                "storage.objects.get",
+            )
+
+            name, argv = commands[0]
+            self.assertEqual(name, "cross-cell-template-get-1")
+            self.assertIn(
+                "//storage.googleapis.com/projects/_/buckets/other-cell-backups/objects/"
+                "templates/.permission-probe",
+                argv,
+            )
+            self.assertIn("--permission=storage.objects.get", argv)
+
 
 class EffectiveIamCommandTests(unittest.TestCase):
     def test_effective_iam_uses_supported_project_scope_flag(self):

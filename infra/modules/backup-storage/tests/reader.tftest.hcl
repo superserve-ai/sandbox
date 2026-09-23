@@ -17,20 +17,26 @@ run "control_plane_reader_is_read_only" {
   assert {
     condition = (
       google_storage_managed_folder.templates.name == "templates/" &&
+      google_storage_managed_folder.bases.name == "bases/" &&
       google_storage_managed_folder_iam_member.reader_view["serviceAccount:reader@example-project.iam.gserviceaccount.com"].managed_folder == "templates/" &&
       google_storage_managed_folder_iam_member.reader_view["serviceAccount:reader@example-project.iam.gserviceaccount.com"].role == "roles/storage.objectViewer" &&
+      google_storage_managed_folder_iam_member.reader_bases_view["serviceAccount:reader@example-project.iam.gserviceaccount.com"].managed_folder == "bases/" &&
+      google_storage_managed_folder_iam_member.reader_bases_view["serviceAccount:reader@example-project.iam.gserviceaccount.com"].role == "roles/storage.objectViewer" &&
       length(google_storage_bucket_iam_member.writer_create) == 0 &&
       !contains([for grant in values(google_storage_managed_folder_iam_member.reader_view) : grant.role], "roles/storage.objectCreator") &&
-      !contains([for grant in values(google_storage_managed_folder_iam_member.reader_view) : grant.role], "roles/storage.objectAdmin")
+      !contains([for grant in values(google_storage_managed_folder_iam_member.reader_view) : grant.role], "roles/storage.objectAdmin") &&
+      !contains([for grant in values(google_storage_managed_folder_iam_member.reader_bases_view) : grant.role], "roles/storage.objectCreator") &&
+      !contains([for grant in values(google_storage_managed_folder_iam_member.reader_bases_view) : grant.role], "roles/storage.objectAdmin")
     )
-    error_message = "Control-plane readers must receive template managed-folder objectViewer access."
+    error_message = "Control-plane readers must receive template and shared-base managed-folder objectViewer access."
   }
 
   assert {
     condition = (
       contains(output.contract.reader_members, "serviceAccount:reader@example-project.iam.gserviceaccount.com") &&
-      output.contract.reader_object_prefix == "templates/"
+      output.contract.reader_object_prefix == "templates/" &&
+      output.contract.reader_object_prefixes == ["templates/", "bases/"]
     )
-    error_message = "The rendered backup contract must publish the configured reader and template prefix."
+    error_message = "The rendered backup contract must publish the configured reader and all reader prefixes."
   }
 }

@@ -13,6 +13,13 @@
 
 name: Deploy API
 
+# Serialize all control-plane changes with the staged identity migration and
+# Terraform CD. A queued deployment must not route a revision while the
+# identity rollout is still applying and verifying its permissions.
+concurrency:
+  group: control-plane-deploy
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
