@@ -272,7 +272,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		captureErr = fcPauseVMContext(ctx, socket)
 	}
 	if captureErr == nil {
-		captureErr = captureSavedDisk(ctx, diskPath, man.BasePath, tmp, final, man)
+		captureErr = m.captureSavedDisk(ctx, diskPath, man.BasePath, tmp, final, man)
 	}
 	// A memory capture spends the dirty baseline (diff) or resets it (full),
 	// and after a failure it is unknown: the source's next pause is a full one.
@@ -399,7 +399,7 @@ func accumulateSavedMemory(ctx context.Context, tmp, final, memFile, baseMem, ra
 		}
 		prior = &p
 	}
-	if err := applySparse(ctx, raw, target); err != nil {
+	if err := applyPresentPages(ctx, raw, delta, target); err != nil {
 		return fmt.Errorf("apply memory diff: %w", err)
 	}
 	if baseMem != "" {
@@ -490,20 +490,56 @@ func (m *Manager) capturePausedSaved(ctx context.Context, inst *VMInstance, tmp,
 		man.MemPath = filepath.Join(final, name)
 		man.BaseMemPath = baseMem
 	}
-	return captureSavedDisk(ctx, diskPath, man.BasePath, tmp, final, man)
+	return m.captureSavedDisk(ctx, diskPath, man.BasePath, tmp, final, man)
 }
 
-func captureSavedDisk(ctx context.Context, diskPath, basePath, tmp, final string, man *SavedSnapshotManifest) error {
+// captureSavedDisk clones the source's disk. An overlay's holes mean "read
+// the base", and a filesystem may turn written zeros into holes, so an overlay
+// is reflinked extent-exact or the capture is refused; a standalone rootfs
+// may be copied.
+func (m *Manager) captureSavedDisk(ctx context.Context, diskPath, basePath, tmp, final string, man *SavedSnapshotManifest) error {
 	name := "rootfs.ext4"
+	copy := cloneOrCopyFile
 	if basePath != "" {
 		name = "overlay.ext4"
+		copy = reflinkFileExact
+		if m.reflinkOverlay != nil {
+			copy = m.reflinkOverlay
+		}
 	}
-	if err := cloneOrCopyFile(ctx, diskPath, filepath.Join(tmp, name)); err != nil {
+	if err := copy(ctx, diskPath, filepath.Join(tmp, name)); err != nil {
+		if basePath != "" && errors.Is(err, errNoReflink) {
+			return status.Errorf(codes.FailedPrecondition, "overlay copies need a reflink filesystem under %s: %v", m.cfg.SnapshotDir, err)
+		}
 		return fmt.Errorf("copy disk: %w", err)
 	}
 	man.DiskPath = filepath.Join(final, name)
 	man.BasePath = basePath
 	return nil
+}
+
+var errNoReflink = errors.New("filesystem cannot reflink")
+
+// reflinkFileExact clones src into dst with no fallback.
+func reflinkFileExact(ctx context.Context, src, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if err := cloneFileFD(out, in); err != nil {
+		out.Close()
+		_ = os.Remove(dst)
+		return fmt.Errorf("%w: %v", errNoReflink, err)
+	}
+	return out.Close()
 }
 
 // instanceDiskPath resolves the VM's writable disk the way resume does.
@@ -584,18 +620,44 @@ func removeSavedStaging(parent, snapshotID string) {
 	}
 }
 
+// savedIDLock is one snapshot id's lock; the entry lives while a holder or a
+// waiter references it, so the map does not grow with every id ever seen.
+type savedIDLock struct {
+	ch   chan struct{}
+	refs int
+}
+
 // lockSavedSnapshot serializes create and delete for one snapshot id.
 func (m *Manager) lockSavedSnapshot(ctx context.Context, snapshotID string) (func(), error) {
-	v, _ := m.savedIDLocks.LoadOrStore(snapshotID, make(chan struct{}, 1))
-	ch := v.(chan struct{})
+	m.savedIDMu.Lock()
+	if m.savedIDLocks == nil {
+		m.savedIDLocks = map[string]*savedIDLock{}
+	}
+	l := m.savedIDLocks[snapshotID]
+	if l == nil {
+		l = &savedIDLock{ch: make(chan struct{}, 1)}
+		m.savedIDLocks[snapshotID] = l
+	}
+	l.refs++
+	m.savedIDMu.Unlock()
+	release := func() {
+		m.savedIDMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(m.savedIDLocks, snapshotID)
+		}
+		m.savedIDMu.Unlock()
+	}
 	select {
-	case ch <- struct{}{}:
+	case l.ch <- struct{}{}:
 		if err := ctx.Err(); err != nil {
-			<-ch
+			<-l.ch
+			release()
 			return nil, err
 		}
-		return func() { <-ch }, nil
+		return func() { <-l.ch; release() }, nil
 	case <-ctx.Done():
+		release()
 		return nil, ctx.Err()
 	}
 }
@@ -757,18 +819,15 @@ func cloneOrCopyFile(ctx context.Context, src, dst string) error {
 	return out.Close()
 }
 
-// applySparse writes src's data extents into dst at the same offsets; dst
-// must already be src's size.
-func applySparse(ctx context.Context, src, dst string) error {
+// applyPresentPages writes every page the diff's presence map names into dst
+// at the same offset, zero pages included: the map, not the extent layout,
+// says which pages the diff provides.
+func applyPresentPages(ctx context.Context, src string, present presence.Bitmap, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	info, err := in.Stat()
-	if err != nil {
-		return err
-	}
 	out, err := os.OpenFile(dst, os.O_WRONLY, 0)
 	if err != nil {
 		return err
@@ -778,11 +837,30 @@ func applySparse(ctx context.Context, src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if dinfo.Size() != info.Size() {
-		return fmt.Errorf("diff size %d does not match image size %d", info.Size(), dinfo.Size())
+	page := int64(present.PageSize)
+	if page <= 0 || int64(present.NPages)*page > dinfo.Size() {
+		return fmt.Errorf("presence map (%d pages of %d) exceeds image size %d", present.NPages, page, dinfo.Size())
 	}
-	if err := copyDataExtents(ctx, in, out, info.Size()); err != nil {
-		return err
+	for i := 0; i < int(present.NPages); {
+		if !present.IsSet(i) {
+			i++
+			continue
+		}
+		j := i
+		for j < int(present.NPages) && present.IsSet(j) {
+			j++
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		off, n := int64(i)*page, int64(j-i)*page
+		if _, err := out.Seek(off, io.SeekStart); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(out, io.NewSectionReader(in, off, n), n); err != nil {
+			return err
+		}
+		i = j
 	}
 	return out.Sync()
 }

@@ -33,6 +33,8 @@ func newSavedTestManager(t *testing.T) *Manager {
 		vms: map[string]*VMInstance{},
 		// Every seeded source is at rest; the real probe needs systemd and cgroups.
 		unitDead: func(context.Context, string) bool { return true },
+		// The test filesystem may not reflink; the refusal has its own test.
+		reflinkOverlay: cloneOrCopyFile,
 	}
 	if err := os.MkdirAll(m.cfg.SnapshotDir, 0o755); err != nil {
 		t.Fatal(err)
@@ -252,12 +254,17 @@ func TestAccumulateSavedMemory(t *testing.T) {
 		pageFile(t, overlay, 4, map[int]byte{1: 'S'}, true)
 		raw := filepath.Join(tmp, "mem.capture.diff")
 		pageFile(t, raw, 4, map[int]byte{2: 'N'}, true)
+		// Page 1 was dirtied to all zeros: present in the map, a hole in the
+		// file. It must overwrite the overlay's 'S'.
+		if err := presence.Write(raw, testPage, 4, []uint64{1<<1 | 1<<2}); err != nil {
+			t.Fatal(err)
+		}
 		var man SavedSnapshotManifest
 		if err := accumulateSavedMemory(ctx, tmp, "/final", overlay, base, raw, &man); err != nil {
 			t.Fatal(err)
 		}
 		target := filepath.Join(tmp, "mem.diff")
-		if pageAt(t, target, 1) != 'S' || pageAt(t, target, 2) != 'N' || pageAt(t, target, 0) != 0 {
+		if pageAt(t, target, 1) != 0 || pageAt(t, target, 2) != 'N' || pageAt(t, target, 0) != 0 {
 			t.Error("accumulated pages wrong")
 		}
 		p, err := presence.Read(target)
@@ -358,5 +365,37 @@ func TestSavedSnapshotIDLockSerializesDelete(t *testing.T) {
 	unlock()
 	if err := m.DeleteSavedSnapshot(context.Background(), id); err != nil {
 		t.Errorf("delete after release: %v", err)
+	}
+}
+
+func TestOverlayCaptureRefusesWithoutReflink(t *testing.T) {
+	m := newSavedTestManager(t)
+	m.reflinkOverlay = nil
+	probe := filepath.Join(t.TempDir(), "probe")
+	if err := os.WriteFile(probe, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := reflinkFileExact(context.Background(), probe, probe+".clone"); err == nil {
+		t.Skip("test filesystem reflinks; the refusal cannot be exercised here")
+	}
+	inst, _ := seedPausedSource(t, m, false)
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("overlay capture without reflink: want FailedPrecondition, got %v", err)
+	}
+}
+
+func TestSavedSnapshotIDLockIsReclaimed(t *testing.T) {
+	m := newSavedTestManager(t)
+	id := uuid.NewString()
+	unlock, err := m.lockSavedSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	m.savedIDMu.Lock()
+	n := len(m.savedIDLocks)
+	m.savedIDMu.Unlock()
+	if n != 0 {
+		t.Errorf("lock entries left after release: %d", n)
 	}
 }

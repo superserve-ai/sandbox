@@ -697,9 +697,12 @@ type Manager struct {
 	// Saved-snapshot captures in flight, bounded per host; see acquireSavedCapture.
 	savedCaptures     chan struct{}
 	savedCapturesOnce sync.Once
-	savedIDLocks      sync.Map // snapshot id -> chan struct{}; see lockSavedSnapshot
-	fcSHAOnce         sync.Once
-	fcSHA             string
+	savedIDMu         sync.Mutex
+	savedIDLocks      map[string]*savedIDLock // see lockSavedSnapshot
+	// reflinkOverlay stands in for the exact overlay clone in tests.
+	reflinkOverlay func(ctx context.Context, src, dst string) error
+	fcSHAOnce      sync.Once
+	fcSHA          string
 
 	// launchGenSeq issues launch generations. It is manager-global and
 	// monotonic on purpose: a per-instance counter restarts at zero whenever
