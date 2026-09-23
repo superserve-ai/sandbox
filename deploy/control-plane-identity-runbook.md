@@ -12,8 +12,8 @@ do not provide sandbox access, create, overwrite, or delete.
 | Cell | Cloud Run identity | Backup bucket | Deployment principal (act-as + token creator) | Host identity |
 | --- | --- | --- | --- | --- |
 | staging | `superserve-cp-staging` | `superserve-artifact-backup-staging-usc1` | environment GitHub Actions service account | legacy `superserve-api` remains on the draining host |
-| production use | `superserve-cp-use4` | `superserve-artifact-backup-use4` | environment GitHub Actions service account | dedicated `vmd-runtime-production-use4` |
-| production usw2 | `superserve-cp-usw2` | `superserve-artifact-backup-usw2` | environment GitHub Actions service account | dedicated `vmd-runtime-production-usw2` |
+| production use | `superserve-controlplane-use4` | `superserve-artifact-backup-use4` | environment GitHub Actions service account | dedicated `vmd-runtime-production-use4` |
+| production usw2 | `superserve-controlplane-usw2` | `superserve-artifact-backup-usw2` | environment GitHub Actions service account | dedicated `vmd-runtime-production-usw2` |
 
 The authoritative rendered values are the `controlplane_identity_contract`
 outputs from each environment root. The output includes the runtime identity,
@@ -102,8 +102,13 @@ without command arguments, policy documents, object names, or identities.
 
 The release owner must retain the private verifier directory through the
 approved change-record process and link it with the Terraform plan/apply and
-UTC observation time before declaring a cell complete. A missing summary or
-any FAIL row is an incomplete migration, even if the service health endpoint
+UTC observation time before declaring a cell complete. Each workflow stage
+uploads that directory to the restricted bucket named by the
+`CONTROL_PLANE_EVIDENCE_BUCKET` repository variable under a run- and
+cell-specific prefix before the runner is torn down. Configure that bucket as
+the approved private evidence store with the required retention and encryption
+controls; it must not be one of the template-backup buckets. A missing summary
+or any FAIL row is an incomplete migration, even if the service health endpoint
 responds. The workflow also fails closed when the private `evidence.json` is
 missing any required PASS row, including one for every unchanged host
 principal's inability to impersonate the serving identity; an uploaded

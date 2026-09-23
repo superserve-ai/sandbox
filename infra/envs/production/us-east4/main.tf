@@ -26,12 +26,15 @@ locals {
 }
 
 locals {
-  project_id             = var.project_id
-  environment            = var.environment
-  region                 = var.region
-  zone                   = var.zone
-  resource_suffix        = coalesce(var.resource_suffix, var.environment)
-  service_account_suffix = coalesce(var.service_account_suffix, local.resource_suffix)
+  project_id                = var.project_id
+  environment               = var.environment
+  region                    = var.region
+  zone                      = var.zone
+  resource_suffix           = coalesce(var.resource_suffix, var.environment)
+  service_account_suffix    = coalesce(var.service_account_suffix, local.resource_suffix)
+  legacy_runtime_account    = data.google_service_account.api_runner.email
+  host_identity_unchanged   = google_service_account.vmd_runtime.email
+  host_identities_unchanged = [google_service_account.vmd_runtime.email]
 
   common_labels = {
     environment = local.environment
