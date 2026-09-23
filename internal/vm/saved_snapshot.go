@@ -35,6 +35,9 @@ const (
 	defaultSavedCaptures      = 2
 	savedCaptureHeadroom      = 256 << 20
 	savedUnpauseAttempts      = 3
+	// savedCaptureBudget bounds the Firecracker snapshot request: past it the
+	// source is released or recorded as unservable rather than left paused.
+	savedCaptureBudget = 90 * time.Second
 )
 
 // SavedSnapshotKind is what a saved snapshot holds: the disk alone, or the
@@ -96,6 +99,14 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 	}
 	log := m.log.With().Str("vm_id", vmID).Str("snapshot_id", snapshotID).Logger()
 
+	// The id lock serializes this call with a delete or a retry for the same
+	// id, the committed check included; it is taken before the VM lock
+	// everywhere, so the order holds.
+	unlockID, err := m.lockSavedSnapshot(ctx, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockID()
 	if man, err := m.committedSavedSnapshot(dir, vmID); man != nil || err != nil {
 		return man, err
 	}
@@ -104,22 +115,11 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 		return nil, err
 	}
 	defer release()
-	// The id lock serializes this capture with a delete or a retry for the
-	// same id; it is taken before the VM lock everywhere, so the order holds.
-	unlockID, err := m.lockSavedSnapshot(ctx, snapshotID)
-	if err != nil {
-		return nil, err
-	}
-	defer unlockID()
 	unlock, err := m.lockVMOp(ctx, vmID)
 	if err != nil {
 		return nil, err
 	}
 	defer unlock()
-	// The attempt this one waited on may have committed.
-	if man, err := m.committedSavedSnapshot(dir, vmID); man != nil || err != nil {
-		return man, err
-	}
 
 	inst, err := m.getInstance(vmID)
 	if err != nil {
@@ -265,11 +265,15 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	}
 
 	tFrozen := time.Now()
+	// Bounded on its own: the RPC deadline may be long, and a Firecracker that
+	// stops answering must not hold the source paused past this.
+	cctx, cancel := context.WithTimeout(ctx, savedCaptureBudget)
+	defer cancel()
 	var captureErr error
 	if kind == SavedSnapshotMemFS {
-		captureErr = m.captureRunningMemory(ctx, tmp, final, socket, memFile, baseMem, dirtyTracked, sessionID, man, log)
+		captureErr = m.captureRunningMemory(cctx, tmp, final, socket, memFile, baseMem, dirtyTracked, sessionID, man, log)
 	} else {
-		captureErr = fcPauseVMContext(ctx, socket)
+		captureErr = fcPauseVMContext(cctx, socket)
 	}
 	if captureErr == nil {
 		captureErr = m.captureSavedDisk(ctx, diskPath, man.BasePath, tmp, final, man)
@@ -324,7 +328,7 @@ func (m *Manager) captureRunningMemory(ctx context.Context, tmp, final, socket, 
 	man.SnapshotPath = filepath.Join(final, "vmstate.snap")
 	if m.cfg.IncrementalSnapshotEnabled && dirtyTracked && memFile != "" && fileExists(memFile) {
 		raw := filepath.Join(tmp, "mem.capture.diff")
-		err := CreateDiffSnapshot(socket, vmstate, raw, sessionID)
+		err := CreateDiffSnapshotContext(ctx, socket, vmstate, raw, sessionID)
 		switch {
 		case err == nil:
 			return accumulateSavedMemory(ctx, tmp, final, memFile, baseMem, raw, man)
@@ -336,7 +340,7 @@ func (m *Manager) captureRunningMemory(ctx context.Context, tmp, final, socket, 
 			return fmt.Errorf("create diff snapshot: %w", err)
 		}
 	}
-	if err := CreateSnapshot(socket, vmstate, filepath.Join(tmp, "mem.snap"), "", SnapshotNormal); err != nil {
+	if err := CreateSnapshotContext(ctx, socket, vmstate, filepath.Join(tmp, "mem.snap"), "", SnapshotNormal); err != nil {
 		return fmt.Errorf("create snapshot: %w", err)
 	}
 	man.MemPath = filepath.Join(final, "mem.snap")
@@ -611,6 +615,28 @@ func writeSavedSnapshotManifest(dir string, man *SavedSnapshotManifest) error {
 		return err
 	}
 	return os.Rename(path+".tmp", path)
+}
+
+// SweepSavedSnapshotStaging removes every staging directory under the saved
+// snapshot root. Run at startup, when no capture can be in flight, so a
+// capture the previous process died in never keeps its image on disk.
+func (m *Manager) SweepSavedSnapshotStaging(log zerolog.Logger) int {
+	if m.cfg.SnapshotDir == "" {
+		return 0
+	}
+	stale, _ := filepath.Glob(filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, ".*.tmp-*"))
+	n := 0
+	for _, d := range stale {
+		if err := os.RemoveAll(d); err != nil {
+			log.Warn().Err(err).Str("dir", d).Msg("saved snapshot staging could not be removed")
+			continue
+		}
+		n++
+	}
+	if n > 0 {
+		log.Info().Int("removed", n).Msg("swept abandoned saved snapshot staging")
+	}
+	return n
 }
 
 func removeSavedStaging(parent, snapshotID string) {

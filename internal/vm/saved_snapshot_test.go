@@ -399,3 +399,50 @@ func TestSavedSnapshotIDLockIsReclaimed(t *testing.T) {
 		t.Errorf("lock entries left after release: %d", n)
 	}
 }
+
+func TestSweepSavedSnapshotStaging(t *testing.T) {
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, false)
+	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName)
+	for _, d := range []string{"." + uuid.NewString() + ".tmp-" + uuid.NewString(), "." + uuid.NewString() + ".tmp-x"} {
+		if err := os.MkdirAll(filepath.Join(root, d, "sub"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := m.SweepSavedSnapshotStaging(zerolog.Nop()); n != 2 {
+		t.Errorf("swept %d staging dirs, want 2", n)
+	}
+	if !fileExists(man.DiskPath) {
+		t.Error("committed snapshot was swept")
+	}
+	entries, _ := os.ReadDir(root)
+	if len(entries) != 1 {
+		t.Errorf("want only the committed snapshot left, got %d entries", len(entries))
+	}
+}
+
+func TestCommittedRetryWaitsForTheIDLock(t *testing.T) {
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, false)
+	id := uuid.NewString()
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, id, SavedSnapshotFS); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := m.lockSavedSnapshot(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := m.CreateSavedSnapshot(ctx, inst.ID, id, SavedSnapshotFS); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("retry while the id is locked: want deadline exceeded, got %v", err)
+	}
+	unlock()
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, id, SavedSnapshotFS); err != nil {
+		t.Errorf("retry after release: %v", err)
+	}
+}
