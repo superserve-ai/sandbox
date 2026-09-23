@@ -31,6 +31,18 @@ class DeployVmdBundleTests(unittest.TestCase):
         self.assertRegex(SOURCE, r"superserve-vmd\.service\.d/30-wake-floor-guard\.conf")
         self.assertRegex(SOURCE, r"\{install_dir\}/vmd-wake-floor-guard")
 
+    def test_staged_intent_floor_guard_has_its_own_paths(self):
+        # Its own executable and drop-in too: the revision that introduced
+        # the wake floor reinstalls that guard when rolled back to, and would
+        # erase a check added to it.
+        self.assertIn("deploy/vmd-staged-intent-floor-guard", _bundle_files())
+        self.assertIn("deploy/superserve-vmd-staged-intent-floor-guard.conf", _bundle_files())
+        self.assertRegex(SOURCE, r"superserve-vmd\.service\.d/31-staged-intent-floor-guard\.conf")
+        self.assertRegex(SOURCE, r"\{install_dir\}/vmd-staged-intent-floor-guard")
+        check = SOURCE.index("deploy/vmd-staged-intent-floor-guard {extract_dir}/bin/vmd")
+        install = SOURCE.index("sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd")
+        self.assertLess(check, install)
+
     def test_downgrade_is_checked_before_the_binary_lands(self):
         # The deploy runs the bundled guard against the new binary, so the
         # check has one source, and it runs before the binary is installed.
