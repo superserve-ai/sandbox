@@ -478,10 +478,11 @@ message RestoreSnapshotRequest {
   repeated PreviewPort preview_ports = 13;
   // Monotonic generation used to reject stale full-allowlist pushes.
   int64 preview_policy_revision = 14;
-  // A saved snapshot's disk to materialize as this VM's own copy: with
-  // base_path an extent-exact overlay clone, otherwise a standalone rootfs.
-  // Not combined with delta_dir.
-  string saved_disk_path = 15;
+  // A saved snapshot to create this VM from. The daemon gives the VM its own
+  // copy of every file the snapshot owns before using any of them, so
+  // snapshot_path and mem_file_path must be empty and base_path, if set,
+  // must be the snapshot's.
+  string saved_snapshot_id = 15;
 }
 
 message PreviewPort {

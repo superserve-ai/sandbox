@@ -660,6 +660,91 @@ func (m *Manager) SweepSavedSnapshotStaging(log zerolog.Logger) <-chan struct{} 
 	return done
 }
 
+// forkSource resolves the snapshot a VM is created from and fixes the paths
+// the VM will own, before any lock: a retried request then names the same
+// files as the attempt it repeats.
+func (m *Manager) forkSource(childID string, cfg *VMConfig, snapshotPath, memPath string) (*SavedSnapshotManifest, string, string, error) {
+	if snapshotPath != "" || memPath != "" {
+		return nil, "", "", status.Error(codes.InvalidArgument, "a saved snapshot names its own files; snapshot_path and mem_file_path must be empty")
+	}
+	dir, err := m.savedSnapshotDir(cfg.SavedSnapshotID)
+	if err != nil {
+		return nil, "", "", err
+	}
+	man, err := readSavedSnapshotManifest(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, "", "", status.Errorf(codes.NotFound, "saved snapshot %s does not exist", cfg.SavedSnapshotID)
+	}
+	if err != nil {
+		return nil, "", "", status.Errorf(codes.DataLoss, "saved snapshot %s: %v", cfg.SavedSnapshotID, err)
+	}
+	if man.SnapshotPath == "" {
+		return nil, "", "", status.Errorf(codes.FailedPrecondition, "saved snapshot %s holds no memory image; a VM is created from it by cold boot", cfg.SavedSnapshotID)
+	}
+	if cfg.BasePath != "" && cfg.BasePath != man.BasePath {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "base_path %q is not saved snapshot %s's base %q", cfg.BasePath, cfg.SavedSnapshotID, man.BasePath)
+	}
+	cfg.BasePath = man.BasePath
+	own := filepath.Join(m.cfg.SnapshotDir, childID)
+	return man, filepath.Join(own, "vmstate.snap"), filepath.Join(own, filepath.Base(man.MemPath)), nil
+}
+
+// materializeFork gives the VM its own copy of every file the snapshot owns,
+// under the snapshot id lock: a delete either finishes first and is answered
+// not-found, or waits until the VM holds everything it needs. Returns the
+// VM's disk.
+func (m *Manager) materializeFork(ctx context.Context, childID string, man *SavedSnapshotManifest) (string, error) {
+	unlock, err := m.lockSavedSnapshot(ctx, man.SnapshotID)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	if _, err := os.Stat(filepath.Join(filepath.Dir(man.DiskPath), savedSnapshotManifestName)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", status.Errorf(codes.NotFound, "saved snapshot %s was deleted", man.SnapshotID)
+		}
+		return "", fmt.Errorf("stat saved snapshot: %w", err)
+	}
+	own := filepath.Join(m.cfg.SnapshotDir, childID)
+	if err := os.MkdirAll(own, 0o755); err != nil {
+		return "", fmt.Errorf("create vm snapshot dir: %w", err)
+	}
+	memDst := filepath.Join(own, filepath.Base(man.MemPath))
+	files := [][2]string{{man.SnapshotPath, filepath.Join(own, "vmstate.snap")}, {man.MemPath, memDst}}
+	for _, side := range []func(string) string{presence.SidecarPath, layeredBaseSidecarPath, WallClockMarkerPath} {
+		if _, err := os.Stat(side(man.MemPath)); err == nil {
+			files = append(files, [2]string{side(man.MemPath), side(memDst)})
+		}
+	}
+	clone := m.fileClone()
+	for _, f := range files {
+		if err := clone(ctx, f[0], f[1]); err != nil {
+			if errors.Is(err, errNoReflink) {
+				return "", status.Errorf(codes.FailedPrecondition, "saved snapshot %s needs a reflink filesystem shared with %s: %v", man.SnapshotID, m.cfg.SnapshotDir, err)
+			}
+			return "", fmt.Errorf("clone %s: %w", filepath.Base(f[0]), err)
+		}
+	}
+	return m.cloneSavedDisk(ctx, childID, man.DiskPath, man.BasePath)
+}
+
+// cleanupForkCopies removes the snapshot-dir copies a failed fork made.
+func (m *Manager) cleanupForkCopies(childID string) {
+	if !isLeafName(childID) || isReservedRunDirName(childID) {
+		return
+	}
+	_ = os.RemoveAll(filepath.Join(m.cfg.SnapshotDir, childID))
+}
+
+// fileClone is the exact clone for every file a VM takes from a saved
+// snapshot; tests stand in for it on filesystems that cannot reflink.
+func (m *Manager) fileClone() func(context.Context, string, string) error {
+	if m.reflinkFile != nil {
+		return m.reflinkFile
+	}
+	return reflinkFileExact
+}
+
 func diskSizeMiB(path string) (uint32, error) {
 	fi, err := os.Stat(path)
 	if err != nil {

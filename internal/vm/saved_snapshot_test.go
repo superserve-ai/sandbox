@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -466,14 +467,14 @@ func TestCopyHonoursCancellation(t *testing.T) {
 	}
 }
 
-func TestPlanRestoreClonesSavedDisk(t *testing.T) {
-	if p := planRestore("/base.ext4", "/delta", "/saved/overlay.ext4", false); p.action != restoreCloneSavedDisk || p.deltaDir != "" {
-		t.Errorf("saved disk with base: %+v", p)
+func TestPlanRestoreMaterializesFork(t *testing.T) {
+	if p := planRestore("/base.ext4", "/delta", true, false); p.action != restoreMaterializeFork || p.deltaDir != "" {
+		t.Errorf("fork with base: %+v", p)
 	}
-	if p := planRestore("", "", "/saved/rootfs.ext4", false); p.action != restoreCloneSavedDisk {
-		t.Errorf("saved standalone disk: %+v", p)
+	if p := planRestore("", "", true, false); p.action != restoreMaterializeFork {
+		t.Errorf("fork of a standalone disk: %+v", p)
 	}
-	if p := planRestore("/base.ext4", "", "/saved/overlay.ext4", true); p.action != restoreReuseOverlay {
+	if p := planRestore("/base.ext4", "", true, true); p.action != restoreReuseOverlay {
 		t.Errorf("in-place retry keeps its own overlay: %+v", p)
 	}
 }
@@ -565,7 +566,7 @@ func TestCaptureQueuedOnABusyVMHoldsNoSlot(t *testing.T) {
 	<-queued
 }
 
-func TestRestoreDiscardsAFailedSavedDiskClone(t *testing.T) {
+func TestRestoreDiscardsAFailedFork(t *testing.T) {
 	m := newSavedTestManager(t)
 	m.restoreSem = make(chan struct{}, 1)
 	inst, _ := seedPausedSource(t, m, true)
@@ -573,17 +574,134 @@ func TestRestoreDiscardsAFailedSavedDiskClone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.reflinkFile = func(_ context.Context, _, dst string) error {
-		_ = os.WriteFile(dst, []byte("partial"), 0o644)
-		return errors.New("disk full")
+	// The memory copies succeed; the disk, copied last, fails.
+	m.reflinkFile = func(ctx context.Context, src, dst string) error {
+		if filepath.Base(dst) == "overlay.ext4" {
+			_ = os.WriteFile(dst, []byte("partial"), 0o644)
+			return errors.New("disk full")
+		}
+		return cloneOrCopyFile(ctx, src, dst)
 	}
 	child := uuid.NewString()
-	cfg := VMConfig{VCPU: man.VCPU, MemoryMiB: man.MemoryMiB, BasePath: man.BasePath, SavedDiskPath: man.DiskPath}
-	if _, err := m.restoreVMSnapshot(context.Background(), child, man.SnapshotPath, man.MemPath, cfg, nil, "", "", "", nil, 0, ""); err == nil {
-		t.Fatal("restore should fail with the clone")
+	cfg := VMConfig{VCPU: man.VCPU, MemoryMiB: man.MemoryMiB, SavedSnapshotID: man.SnapshotID}
+	if _, err := m.restoreVMSnapshot(context.Background(), child, "", "", cfg, nil, "", "", "", nil, 0, ""); err == nil {
+		t.Fatal("restore should fail with the disk clone")
 	}
-	if _, err := os.Stat(filepath.Join(m.cfg.RunDir, child)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("run dir survived the failed clone, so a retry would reuse a disk that was never made: %v", err)
+	for _, dir := range []string{filepath.Join(m.cfg.RunDir, child), filepath.Join(m.cfg.SnapshotDir, child)} {
+		if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s survived the failed fork, so a retry would reuse files that were never finished: %v", dir, err)
+		}
+	}
+}
+
+func TestForkHoldsTheSnapshotLockWhileItCopies(t *testing.T) {
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, true)
+	ctx := context.Background()
+	man, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	var once sync.Once
+	m.reflinkFile = func(ctx context.Context, src, dst string) error {
+		once.Do(func() { close(entered) })
+		<-gate
+		return cloneOrCopyFile(ctx, src, dst)
+	}
+	child := uuid.NewString()
+	forkDone := make(chan error, 1)
+	go func() {
+		_, err := m.materializeFork(ctx, child, man)
+		forkDone <- err
+	}()
+	<-entered
+	delDone := make(chan error, 1)
+	go func() { delDone <- m.DeleteSavedSnapshot(ctx, man.SnapshotID) }()
+	select {
+	case err := <-delDone:
+		t.Fatalf("delete finished (%v) while the fork was still copying", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(gate)
+	if err := <-forkDone; err != nil {
+		t.Fatalf("fork: %v", err)
+	}
+	if err := <-delDone; err != nil {
+		t.Fatalf("delete after the fork: %v", err)
+	}
+	// The VM owns everything it will use, and the snapshot is gone.
+	own := filepath.Join(m.cfg.SnapshotDir, child)
+	for _, f := range []string{"vmstate.snap", "mem.diff", "mem.diff.presence", "mem.diff.base"} {
+		if !fileExists(filepath.Join(own, f)) {
+			t.Errorf("the VM lacks its own %s", f)
+		}
+	}
+	if pageAt(t, filepath.Join(own, "mem.diff"), 1) != 'S' {
+		t.Error("the VM's memory copy differs from the snapshot")
+	}
+	if pageAt(t, filepath.Join(m.cfg.RunDir, child, "overlay.ext4"), 7) != 'D' {
+		t.Error("the VM's disk copy differs from the snapshot")
+	}
+	if _, err := os.Stat(filepath.Dir(man.DiskPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("snapshot dir survived its delete: %v", err)
+	}
+}
+
+func TestForkAfterDeleteIsNotFound(t *testing.T) {
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, true)
+	ctx := context.Background()
+	man, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DeleteSavedSnapshot(ctx, man.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	child := uuid.NewString()
+	if _, err := m.materializeFork(ctx, child, man); status.Code(err) != codes.NotFound {
+		t.Fatalf("fork of a deleted snapshot: want NotFound, got %v", err)
+	}
+	cfg := VMConfig{SavedSnapshotID: man.SnapshotID}
+	if _, _, _, err := m.forkSource(child, &cfg, "", ""); status.Code(err) != codes.NotFound {
+		t.Errorf("resolving a deleted snapshot: want NotFound, got %v", err)
+	}
+}
+
+func TestForkSourceFixesTheVMsOwnPaths(t *testing.T) {
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, true)
+	ctx := context.Background()
+	man, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := uuid.NewString()
+	cfg := VMConfig{SavedSnapshotID: man.SnapshotID}
+	got, vmstate, mem, err := m.forkSource(child, &cfg, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := filepath.Join(m.cfg.SnapshotDir, child)
+	if got.SnapshotID != man.SnapshotID || vmstate != filepath.Join(own, "vmstate.snap") || mem != filepath.Join(own, "mem.diff") || cfg.BasePath != man.BasePath {
+		t.Errorf("vmstate=%s mem=%s base=%s", vmstate, mem, cfg.BasePath)
+	}
+	// The request may not name files of its own, nor another base.
+	if _, _, _, err := m.forkSource(child, &VMConfig{SavedSnapshotID: man.SnapshotID}, man.SnapshotPath, man.MemPath); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("request naming the snapshot's files: want InvalidArgument, got %v", err)
+	}
+	if _, _, _, err := m.forkSource(child, &VMConfig{SavedSnapshotID: man.SnapshotID, BasePath: "/elsewhere/base.ext4"}, "", ""); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("request naming another base: want InvalidArgument, got %v", err)
+	}
+	// An fs snapshot has nothing to restore warm from.
+	fs, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := m.forkSource(child, &VMConfig{SavedSnapshotID: fs.SnapshotID}, "", ""); status.Code(err) != codes.FailedPrecondition {
+		t.Errorf("warm fork of an fs snapshot: want FailedPrecondition, got %v", err)
 	}
 }
 

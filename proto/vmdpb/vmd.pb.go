@@ -2087,12 +2087,13 @@ type RestoreSnapshotRequest struct {
 	PreviewPorts  []*PreviewPort `protobuf:"bytes,13,rep,name=preview_ports,json=previewPorts,proto3" json:"preview_ports,omitempty"`
 	// Monotonic generation used to reject stale full-allowlist pushes.
 	PreviewPolicyRevision int64 `protobuf:"varint,14,opt,name=preview_policy_revision,json=previewPolicyRevision,proto3" json:"preview_policy_revision,omitempty"`
-	// A saved snapshot's disk to materialize as this VM's own copy: with
-	// base_path an extent-exact overlay clone, otherwise a standalone rootfs.
-	// Not combined with delta_dir.
-	SavedDiskPath string `protobuf:"bytes,15,opt,name=saved_disk_path,json=savedDiskPath,proto3" json:"saved_disk_path,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// A saved snapshot to create this VM from. The daemon gives the VM its own
+	// copy of every file the snapshot owns before using any of them, so
+	// snapshot_path and mem_file_path must be empty and base_path, if set,
+	// must be the snapshot's.
+	SavedSnapshotId string `protobuf:"bytes,15,opt,name=saved_snapshot_id,json=savedSnapshotId,proto3" json:"saved_snapshot_id,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *RestoreSnapshotRequest) Reset() {
@@ -2216,9 +2217,9 @@ func (x *RestoreSnapshotRequest) GetPreviewPolicyRevision() int64 {
 	return 0
 }
 
-func (x *RestoreSnapshotRequest) GetSavedDiskPath() string {
+func (x *RestoreSnapshotRequest) GetSavedSnapshotId() string {
 	if x != nil {
-		return x.SavedDiskPath
+		return x.SavedSnapshotId
 	}
 	return ""
 }
@@ -4366,7 +4367,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12&\n" +
-	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xe8\x05\n" +
+	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xec\x05\n" +
 	"\x16RestoreSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -4381,8 +4382,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\bowner_id\x18\v \x01(\tR\aownerId\x12%\n" +
 	"\x0epreview_access\x18\f \x01(\tR\rpreviewAccess\x12C\n" +
 	"\rpreview_ports\x18\r \x03(\v2\x1e.superserve.vmd.v1.PreviewPortR\fpreviewPorts\x126\n" +
-	"\x17preview_policy_revision\x18\x0e \x01(\x03R\x15previewPolicyRevision\x12&\n" +
-	"\x0fsaved_disk_path\x18\x0f \x01(\tR\rsavedDiskPath\x1a:\n" +
+	"\x17preview_policy_revision\x18\x0e \x01(\x03R\x15previewPolicyRevision\x12*\n" +
+	"\x11saved_snapshot_id\x18\x0f \x01(\tR\x0fsavedSnapshotId\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x04\x10\x05R\foverlay_path\"^\n" +

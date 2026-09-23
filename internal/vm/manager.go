@@ -265,9 +265,9 @@ type VMConfig struct {
 	// DeltaDir hydrates a fresh per-VM overlay from <dir>/rootfs.delta on
 	// restore. Empty for in-place resume of an already-populated overlay.
 	DeltaDir string
-	// SavedDiskPath materializes a saved snapshot's disk as this VM's own
-	// copy instead of hydrating from DeltaDir; see cloneSavedDisk.
-	SavedDiskPath string
+	// SavedSnapshotID names a saved snapshot to create this VM from; every
+	// file it owns becomes the VM's own before use. See materializeFork.
+	SavedSnapshotID string
 }
 
 // ManagerConfig holds paths and settings for the VM manager.
@@ -1041,10 +1041,10 @@ func TemplateMagicOverlayPath(runDir string) string {
 type restoreDiskAction int
 
 const (
-	restoreCreateOverlay  restoreDiskAction = iota // overlay clone of a template
-	restoreReuseOverlay                            // existing per-VM overlay (resume)
-	restoreLegacyResolve                           // legacy non-overlay path
-	restoreCloneSavedDisk                          // per-VM copy of a saved snapshot's disk
+	restoreCreateOverlay   restoreDiskAction = iota // overlay clone of a template
+	restoreReuseOverlay                             // existing per-VM overlay (resume)
+	restoreLegacyResolve                            // legacy non-overlay path
+	restoreMaterializeFork                          // the VM's own copies of a saved snapshot's files
 )
 
 // restorePlan is planRestore's output — pure decision, no I/O.
@@ -1056,7 +1056,7 @@ type restorePlan struct {
 // planRestore picks the disk action + delta_dir for a restore. createOverlay
 // requires ALL of {basePath, deltaDir, !inPlace} — anything missing means
 // we'd be cloning over an existing per-VM file, so fall back to reuse.
-func planRestore(basePath, deltaDir, savedDisk string, reuse bool) restorePlan {
+func planRestore(basePath, deltaDir string, fork, reuse bool) restorePlan {
 	p := restorePlan{deltaDir: deltaDir}
 	if reuse {
 		// fc's delta-apply truncates the overlay; force empty to stop a
@@ -1065,9 +1065,9 @@ func planRestore(basePath, deltaDir, savedDisk string, reuse bool) restorePlan {
 		p.deltaDir = ""
 	}
 	switch {
-	case savedDisk != "" && !reuse:
+	case fork && !reuse:
 		p.deltaDir = ""
-		p.action = restoreCloneSavedDisk
+		p.action = restoreMaterializeFork
 	case basePath != "" && p.deltaDir != "":
 		p.action = restoreCreateOverlay
 	case basePath != "":
@@ -3344,6 +3344,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
 		return nil, status.Errorf(codes.InvalidArgument, "vm_id %q must be a valid per-VM identifier", vmID)
 	}
+	var fork *SavedSnapshotManifest
+	if resourceLimits.SavedSnapshotID != "" {
+		var err error
+		fork, snapshotPath, memPath, err = m.forkSource(vmID, &resourceLimits, snapshotPath, memPath)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Serialize same-vmID lifecycle ops (see lockVMOp): a duplicate restore
 	// waits for the in-flight attempt, then retriedLaunchTarget recognizes
@@ -3663,13 +3671,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	freshUnit := m.orphanScanDone.Load() && !inPlace && !priorRunDir &&
 		!isBuildVM(vmID) && !unitMaybeWindingDown(systemdUnitName(vmID))
 
-	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, resourceLimits.SavedDiskPath, reuse)
+	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, fork != nil, reuse)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
 	// see cleanupRunDirKeepOverlay.
 	cleanupAfterRestoreFailure := func() {
-		if plan.action == restoreReuseOverlay {
+		switch plan.action {
+		case restoreReuseOverlay:
 			m.cleanupRunDirKeepOverlay(vmID)
-		} else {
+		case restoreMaterializeFork:
+			m.cleanupRunDir(vmID)
+			m.cleanupForkCopies(vmID)
+		default:
 			m.cleanupRunDir(vmID)
 		}
 	}
@@ -3687,8 +3699,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 	case restoreLegacyResolve:
 		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
-	case restoreCloneSavedDisk:
-		diskPath, diskErr = m.cloneSavedDisk(ctx, vmID, resourceLimits.SavedDiskPath, resourceLimits.BasePath)
+	case restoreMaterializeFork:
+		diskPath, diskErr = m.materializeFork(ctx, vmID, fork)
 	}
 	if diskErr != nil {
 		tFailBoundary = time.Now()
