@@ -1,7 +1,9 @@
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
+from types import SimpleNamespace
 import subprocess
 import tempfile
 import unittest
@@ -163,6 +165,31 @@ class DeployProxyTests(unittest.TestCase):
         self.assertEqual(self.requests[0]['env']['PEER_PROXY_LISTEN_ADDR'], '')
         for key in ('PEER_PROXY_CERT_FILE', 'PEER_PROXY_KEY_FILE', 'PEER_PROXY_CA_FILE'):
             self.assertEqual(self.requests[0]['env'][key], '')
+
+    def test_production_serving_outbound_only_keeps_ingress_disabled(self):
+        workflow = Path(__file__).parents[1].joinpath('deploy-proxy.yml').read_text()
+        for cell, routing_var, ingress_var in (
+                ('usw2', 'PEER_ROUTING_ENABLED_USW', 'PEER_INGRESS_ENABLED_USW'),
+                ('use4', 'PEER_ROUTING_ENABLED_USE4', 'PEER_INGRESS_ENABLED_PROD')):
+            with self.subTest(cell=cell):
+                step = workflow.split(f'DEPLOY_CELL: {cell}', 1)[1]
+                context = dict(vars=SimpleNamespace(**{routing_var: '1', ingress_var: ''}),
+                               github=SimpleNamespace(event_name='workflow_dispatch'),
+                               inputs=SimpleNamespace(target='serving'))
+                config = {}
+                for key in ('PEER_ROUTING_ENABLED', 'PEER_PROXY_LISTEN_ADDR'):
+                    expression = re.search(key + r': \$\{\{ (.+) \}\}', step)[1]
+                    config[key] = eval(expression.replace('&&', ' and ').replace('||', ' or '),
+                                       {'__builtins__': {}}, context)
+                self.assertEqual(config, dict(PEER_ROUTING_ENABLED='1', PEER_PROXY_LISTEN_ADDR=''))
+                self.assertEqual(self.deploy(PROXY_DATABASE_URL='postgres://example', **config), 0)
+                env = self.requests[0]['env']
+                self.assertEqual(env['PEER_ROUTING_ENABLED'], '1')
+                self.assertEqual(env['PEER_PROXY_LISTEN_ADDR'], '')
+                self.assertTrue(env['PEER_PROXY_CERT_FILE'])
+                remote = self.commands[-1][-1]
+                self.assertNotIn('vmd.env', remote)
+                self.assertNotIn('restart', remote)
 
     def test_required_bootstrap_policy_is_preserved(self):
         self.assertEqual(self.deploy(PEER_IDENTITY_HOSTS='example-host'),0)
