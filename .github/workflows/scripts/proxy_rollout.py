@@ -310,6 +310,29 @@ def check_retry(state, rollout, identity):
         raise RuntimeError('retry changed immutable rollout inputs; resume with the original request and binary')
 
 
+def resolve_standby_promotion_request(state, request, root):
+    if (request.get('target') != 'serving'
+            or request.get('rollout') != state.get('standby_origin')
+            or not (state.get('phase') == 'standby_ready' or state.get('_promoted_standby'))):
+        return request
+    prepared = json.loads((root / 'generations' / state['candidate']['id'] / 'request.json').read_text())
+    # Renewal may replace credentials and generation, but the original code
+    # deployment remains the operator's promotion handle. All other inputs
+    # are still checked against the renewed request's immutable identity.
+    request = dict(request, rollout=state['rollout'])
+    if 'credential_generation' in prepared:
+        request['credential_generation'] = prepared['credential_generation']
+    return request
+
+
+def standby_origin(state, request):
+    if (request.get('target') == 'standby' and state.get('target') == 'standby'
+            and state.get('phase') == 'standby_ready'
+            and request['rollout'].startswith('credentials-')):
+        return state.get('standby_origin', state['rollout'])
+    return request['rollout']
+
+
 def standby_promotion_identity(state, request, binary, unit):
     if state.get('rollout') != request['rollout']:
         return None
@@ -935,7 +958,8 @@ def credential_request(state, root, upload, peer=Path('/etc/superserve/peer')):
 def deploy_locked(args, config, config_hash, host, state, state_path, instance_id):
     manifest_path = Path('/etc/sandbox/proxy-rollout.json')
     request_path = Path(args.request)
-    request = json.loads(request_path.read_text())
+    request = resolve_standby_promotion_request(
+        state, json.loads(request_path.read_text()), ROOT)
     target = request.get('target', 'serving')
     if target not in ('serving', 'standby'):
         raise ValueError('rollout target must be serving or standby')
@@ -1047,7 +1071,9 @@ def deploy_locked(args, config, config_hash, host, state, state_path, instance_i
                     old['drain_seconds'] = seconds
                 candidate = {'id':generation, 'unit':f'proxy-{generation}.service', 'drain_seconds':seconds,
                              'ports':dict(zip(('public','redirect','peer','local'),range(base,base+4)))}
+            origin = standby_origin(state, request)
             state = dict(rollout=rollout, revision=request['revision'], request_hash=identity,
+                         standby_origin=origin,
                          config_hash=config_hash, phase='preparing', old=old, candidate=candidate,
                          timestamps={'preparing': time.time()},
                          endpoint_context={key: config[key] for key in

@@ -108,7 +108,42 @@ env:
 jobs:
   migration-gate:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      revision: ${{ steps.revision.outputs.revision }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Validate deployment revision
+        id: revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CURRENT_REF: ${{ github.ref }}
+          CURRENT_SHA: ${{ github.sha }}
+          REQUESTED_REVISION: ${{ inputs.revision }}
+          REQUESTED_ROLLOUT_ID: ${{ inputs.rollout_id }}
+        run: |
+          set -euo pipefail
+          [ "$CURRENT_REF" = refs/heads/main ] || { echo 'Deployments must be dispatched from main.' >&2; exit 1; }
+          revision="$CURRENT_SHA"
+          if [ -n "$REQUESTED_REVISION$REQUESTED_ROLLOUT_ID" ]; then
+            [[ "$REQUESTED_REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo 'Retry requires the original full commit SHA.' >&2; exit 1; }
+            [[ "$REQUESTED_ROLLOUT_ID" =~ ^[0-9]+$ ]] || { echo 'Retry requires the original workflow run ID.' >&2; exit 1; }
+            gh api "repos/$GH_REPO/actions/runs/$REQUESTED_ROLLOUT_ID" > original-run.json
+            jq -e --arg sha "$REQUESTED_REVISION" '
+              .head_sha == $sha and .head_branch == "main" and
+              .path == ".github/workflows/deploy-proxy.yml" and
+              (.event == "push" or .event == "workflow_dispatch")
+            ' original-run.json > /dev/null
+            revision="$REQUESTED_REVISION"
+          fi
+          git merge-base --is-ancestor "$revision" origin/main
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
       - name: Require host identity readiness for automatic rollout
         env:
           DEPLOY_EVENT: ${{ github.event_name }}
@@ -148,7 +183,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.revision || github.sha }}
+          ref: ${{ needs.migration-gate.outputs.revision }}
 
       - name: Record proxy revision
         run: echo "PROXY_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
@@ -234,7 +269,7 @@ jobs:
 
   deploy-production:
     if: (github.event_name == 'push' || github.event.inputs.environment == 'production') && vars.PROXY_GENERATION_PROMOTION_READY == 'true' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS == 'passed' && vars.PROXY_GENERATION_RUNBOOK_URL != '' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL != ''
-    needs: [deploy-staging]
+    needs: [migration-gate, deploy-staging]
     runs-on: ubuntu-latest
     environment: production
     permissions:
@@ -244,7 +279,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.revision || github.sha }}
+          ref: ${{ needs.migration-gate.outputs.revision }}
 
       - name: Validate linked staging promotion evidence
         env:

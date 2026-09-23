@@ -54,6 +54,35 @@ class StandbyPromotionTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 MODULE.standby_promotion_identity(recovered, request, binary, unit)
 
+    def test_credential_renewal_preserves_original_promotion_handle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, peer, upload, state, original = CredentialRenewalTests().fixture(directory)
+            original['target'] = 'standby'
+            generation = root / 'generations' / OLD['id']
+            (generation / 'request.json').write_text(json.dumps(original))
+            state.update(target='standby', phase='standby_ready', candidate=OLD)
+            renewed = json.loads(MODULE.credential_request(state, root, upload, peer).read_text())
+            origin = MODULE.standby_origin(state, renewed)
+            self.assertEqual(origin, original['rollout'])
+            (generation / 'request.json').write_text(json.dumps(renewed))
+            identity = MODULE.request_identity(renewed, upload / 'proxy', upload / 'proxy.service')
+            state.update(rollout=renewed['rollout'], request_hash=identity, standby_origin=origin,
+                         retired_rollouts=[original['rollout']])
+            serving = MODULE.resolve_standby_promotion_request(
+                state, dict(original, target='serving'), root)
+            self.assertEqual(serving['rollout'], renewed['rollout'])
+            self.assertEqual(serving['credential_generation'], 'certificate-b')
+            self.assertEqual(MODULE.standby_promotion_identity(
+                state, serving, upload / 'proxy', upload / 'proxy.service'), identity)
+            self.assertEqual(MODULE.standby_origin(
+                state, dict(renewed, rollout='credentials-again')), origin)
+            changed = MODULE.resolve_standby_promotion_request(
+                state, dict(original, target='serving', revision='changed'), root)
+            with self.assertRaisesRegex(RuntimeError, 'immutable'):
+                MODULE.standby_promotion_identity(state, changed, upload / 'proxy', upload / 'proxy.service')
+            unrelated = dict(original, target='serving', rollout='another')
+            self.assertEqual(MODULE.resolve_standby_promotion_request(state, unrelated, root), unrelated)
+
     def test_promotion_rejects_changed_inputs_or_unfinished_preparation(self):
         with tempfile.TemporaryDirectory() as directory:
             binary, unit = Path(directory) / 'proxy', Path(directory) / 'proxy.service'

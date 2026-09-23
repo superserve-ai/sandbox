@@ -45,7 +45,7 @@ class DeployTargetTests(unittest.TestCase):
             # Read the gate up to the next job, preserving its nested steps.
             gate = re.split(r'^  [a-z][a-z-]*:\n', workflow.split('  migration-gate:\n', 1)[1], maxsplit=1, flags=re.M)[0]
             self.assertIn('ROLLOUT_READY: ${{ vars.HOST_IDENTITY_ROLLOUT_READY }}', gate)
-            script = gate.split('        run: |\n', 1)[1]
+            script = gate.rsplit('        run: |\n', 1)[1]
             staging = workflow.split('  deploy-staging:\n', 1)[1].split('    steps:', 1)[0]
             self.assertRegex(staging, r'needs: \[[^\]]*migration-gate[^\]]*\]')
             cases = [(event, ready, int(event == 'push' and ready != 'true'))
@@ -73,7 +73,7 @@ class DeployTargetTests(unittest.TestCase):
         gate = re.split(r'^  [a-z][a-z-]*:\n', workflow.split('  migration-gate:\n', 1)[1],
                         maxsplit=1, flags=re.M)[0]
         self.assertIn('GENERATION_READY: ${{ vars.PROXY_GENERATION_PROMOTION_READY }}', gate)
-        script = gate.split('        run: |\n', 1)[1]
+        script = gate.rsplit('        run: |\n', 1)[1]
         for event in ('push', 'workflow_dispatch'):
             for ready in (None, '', 'false', 'true', 'TRUE', '1', 'tru', ' true '):
                 with self.subTest(event=event, ready=ready):
@@ -104,7 +104,7 @@ class DeployTargetTests(unittest.TestCase):
         self.assertNotIn('echo "- Executable runbook: $RUNBOOK_URL"', production)
         self.assertNotIn('echo "- Recorded staging evidence: $EVIDENCE_URL"', production)
         self.assertIn("vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS == 'passed'", production)
-        script = gate.split('        run: |\n', 1)[1]
+        script = gate.rsplit('        run: |\n', 1)[1]
         cases = (
             ('https://www.notion.so/example-team/page', 'https://evidence.example/run-1', 'passed', 0),
             ('https://app.notion.com/example-team/page', 'https://evidence.example/run-1', 'passed', 0),
@@ -379,7 +379,7 @@ class DeployTargetTests(unittest.TestCase):
         for kind in ("vmd", "proxy"):
             workflow = (SCRIPTS.parent / f"deploy-{kind}.yml").read_text()
             production = workflow.split("  deploy-production:\n", 1)[1]
-            self.assertIn("    needs: [deploy-staging]\n", production)
+            self.assertRegex(production, r"needs: \[[^\]]*deploy-staging[^\]]*\]")
             condition = re.search(r'^    if: (.+)$', production, re.M)[1]
             for event in ('push', 'workflow_dispatch'):
                 for environment in ('', 'staging', 'production'):
