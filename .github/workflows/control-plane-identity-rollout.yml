@@ -99,6 +99,16 @@ jobs:
             test -s "$RUNNER_TEMP/control-plane-identity/staging/$artifact"
           done
           trap - EXIT
+      - name: Persist private staging evidence
+        if: always()
+        env:
+          EVIDENCE_BUCKET: ${{ vars.CONTROL_PLANE_EVIDENCE_BUCKET }}
+        run: |
+          set -euo pipefail
+          test -n "$EVIDENCE_BUCKET" || { echo "CONTROL_PLANE_EVIDENCE_BUCKET is required to retain private rollout evidence." >&2; exit 1; }
+          gcloud storage cp --recursive \
+            "$RUNNER_TEMP/control-plane-identity/staging" \
+            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/staging"
       - name: Prepare sanitized staging evidence
         if: always()
         run: |
@@ -215,6 +225,16 @@ jobs:
             test -s "$RUNNER_TEMP/control-plane-identity/use4/$artifact"
           done
           trap - EXIT
+      - name: Persist private production use4 evidence
+        if: always()
+        env:
+          EVIDENCE_BUCKET: ${{ vars.CONTROL_PLANE_EVIDENCE_BUCKET }}
+        run: |
+          set -euo pipefail
+          test -n "$EVIDENCE_BUCKET" || { echo "CONTROL_PLANE_EVIDENCE_BUCKET is required to retain private rollout evidence." >&2; exit 1; }
+          gcloud storage cp --recursive \
+            "$RUNNER_TEMP/control-plane-identity/use4" \
+            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/production-use4"
       - name: Prepare sanitized production use4 evidence
         if: always()
         run: |
@@ -331,6 +351,16 @@ jobs:
             test -s "$RUNNER_TEMP/control-plane-identity/usw2/$artifact"
           done
           trap - EXIT
+      - name: Persist private production usw2 evidence
+        if: always()
+        env:
+          EVIDENCE_BUCKET: ${{ vars.CONTROL_PLANE_EVIDENCE_BUCKET }}
+        run: |
+          set -euo pipefail
+          test -n "$EVIDENCE_BUCKET" || { echo "CONTROL_PLANE_EVIDENCE_BUCKET is required to retain private rollout evidence." >&2; exit 1; }
+          gcloud storage cp --recursive \
+            "$RUNNER_TEMP/control-plane-identity/usw2" \
+            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/production-usw2"
       - name: Prepare sanitized production usw2 evidence
         if: always()
         run: |

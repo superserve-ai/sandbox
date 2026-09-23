@@ -400,7 +400,7 @@ jobs:
       - name: Verify KMS access before routing traffic
         env:
           KMS_OWNER: ${{ secrets.KMS_POLICY_OWNER_SERVICE_ACCOUNT }}
-          RUNTIME_IDENTITY: superserve-cp-usw2@${{ vars.GCP_PROJECT }}.iam.gserviceaccount.com
+          RUNTIME_IDENTITY: superserve-controlplane-usw2@${{ vars.GCP_PROJECT }}.iam.gserviceaccount.com
         run: |
           set -euo pipefail
           test -n "$KMS_OWNER" || { echo "KMS_POLICY_OWNER_SERVICE_ACCOUNT is required before production cutover." >&2; exit 1; }
@@ -628,7 +628,7 @@ jobs:
       - name: Verify KMS access before routing traffic
         env:
           KMS_OWNER: ${{ secrets.KMS_POLICY_OWNER_SERVICE_ACCOUNT }}
-          RUNTIME_IDENTITY: superserve-cp-use4@${{ vars.GCP_PROJECT }}.iam.gserviceaccount.com
+          RUNTIME_IDENTITY: superserve-controlplane-use4@${{ vars.GCP_PROJECT }}.iam.gserviceaccount.com
         run: |
           set -euo pipefail
           test -n "$KMS_OWNER" || { echo "KMS_POLICY_OWNER_SERVICE_ACCOUNT is required before production cutover." >&2; exit 1; }

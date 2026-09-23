@@ -96,7 +96,7 @@ locals {
     environment               = local.environment
     region                    = local.region
     runtime_service_account   = google_service_account.controlplane_runtime.email
-    legacy_runtime_account    = data.google_service_account.api_runner.email
+    legacy_runtime_account    = local.legacy_runtime_account
     deployment_identity       = data.google_service_account.github_actions.email
     deployment_permissions    = ["iam.serviceAccounts.actAs", "iam.serviceAccounts.getAccessToken"]
     backup_bucket             = module.backup_storage.bucket_name
@@ -106,11 +106,11 @@ locals {
     secret_ids                = sort([for config in values(local.controlplane_secrets) : config.secret])
     kms_key_resource          = "projects/${local.project_id}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
     kms_grant_principal       = google_service_account.controlplane_runtime.email
-    kms_grant_role             = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
-    kms_verification           = "encrypt-decrypt-as-runtime-identity-before-cutover"
-    kms_grant_evidence         = "control-plane-identity rollout kms-grant.txt and evidence.json"
-    kms_grant_owner            = "central KMS policy owner (out-of-band)"
-    host_identity_unchanged    = google_service_account.vmd_runtime.email
-    host_identities_unchanged  = [google_service_account.vmd_runtime.email]
+    kms_grant_role            = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
+    kms_verification          = "encrypt-decrypt-as-runtime-identity-before-cutover"
+    kms_grant_evidence        = "control-plane-identity rollout kms-grant.txt and evidence.json"
+    kms_grant_owner           = "central KMS policy owner (out-of-band)"
+    host_identity_unchanged   = local.host_identity_unchanged
+    host_identities_unchanged = local.host_identities_unchanged
   }
 }
