@@ -65,7 +65,6 @@ type SavedSnapshotManifest struct {
 	SnapshotPath string            `json:"snapshot_path,omitempty"`
 	MemPath      string            `json:"mem_path,omitempty"`
 	BaseMemPath  string            `json:"base_mem_path,omitempty"`
-	KernelPath   string            `json:"kernel_path"`
 	// FirecrackerSHA256 identifies the process that wrote the memory image;
 	// empty when unknown, as for a paused source.
 	FirecrackerSHA256 string `json:"firecracker_sha256,omitempty"`
@@ -158,6 +157,12 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 		}
 	}()
 
+	// The block device is the file, and a reattached VM's config no longer
+	// says how big it was asked to be.
+	diskMiB, err := diskSizeMiB(diskPath)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "source disk: %v", err)
+	}
 	man := &SavedSnapshotManifest{
 		Version:     savedSnapshotVersion,
 		SnapshotID:  snapshotID,
@@ -166,9 +171,8 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 		CreatedAt:   time.Now().UTC(),
 		VCPU:        cfg.VCPU,
 		MemoryMiB:   cfg.MemoryMiB,
-		DiskSizeMiB: cfg.DiskSizeMiB,
+		DiskSizeMiB: diskMiB,
 		BasePath:    cfg.BasePath,
-		KernelPath:  m.cfg.KernelPath,
 	}
 	if st == StatusRunning {
 		// The image is written by the live process, which may predate the
@@ -653,6 +657,14 @@ func (m *Manager) SweepSavedSnapshotStaging(log zerolog.Logger) <-chan struct{} 
 		}
 	}()
 	return done
+}
+
+func diskSizeMiB(path string) (uint32, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return uint32((fi.Size() + (1 << 20) - 1) >> 20), nil
 }
 
 func removeSavedStaging(parent, snapshotID string) {

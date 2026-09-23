@@ -348,7 +348,6 @@ func (a *GRPCAdapter) CreateSavedSnapshot(ctx context.Context, req *vmdpb.Create
 		MemoryMib:         man.MemoryMiB,
 		DiskSizeMib:       man.DiskSizeMiB,
 		SizeBytes:         man.SizeBytes,
-		KernelPath:        man.KernelPath,
 		FirecrackerSha256: man.FirecrackerSHA256,
 		CreatedAtUnix:     man.CreatedAt.Unix(),
 	}, nil

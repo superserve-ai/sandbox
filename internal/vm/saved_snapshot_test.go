@@ -27,7 +27,6 @@ func newSavedTestManager(t *testing.T) *Manager {
 		cfg: ManagerConfig{
 			SnapshotDir: filepath.Join(root, "snapshots"),
 			RunDir:      filepath.Join(root, "rundir"),
-			KernelPath:  "/kernel/vmlinux",
 		},
 		vms: map[string]*VMInstance{},
 		// Every seeded source is at rest; the real probe needs systemd and cgroups.
@@ -222,6 +221,10 @@ func TestCreateSavedSnapshotPausedFSOnly(t *testing.T) {
 	}
 	if man.MemPath != "" || man.SnapshotPath != "" || man.BaseMemPath != "" {
 		t.Fatalf("fs snapshot carries memory: %+v", man)
+	}
+	// The seeded overlay is 8 pages; the size is the file's, not the config's.
+	if man.DiskSizeMiB != 1 {
+		t.Errorf("disk size %d MiB, want 1 from the file", man.DiskSizeMiB)
 	}
 	entries, _ := os.ReadDir(filepath.Dir(man.DiskPath))
 	if len(entries) != 2 {
@@ -608,5 +611,19 @@ func TestSweepLeavesALiveCaptureStagingAlone(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("abandoned staging survived the sweep: %v", err)
+	}
+}
+
+func TestSavedSnapshotDiskSizeSurvivesReattach(t *testing.T) {
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, false)
+	// A reattached VM's config carries no disk size.
+	inst.Config.DiskSizeMiB = 0
+	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if man.DiskSizeMiB == 0 {
+		t.Error("disk size lost across reattach")
 	}
 }

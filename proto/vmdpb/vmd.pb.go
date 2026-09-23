@@ -3979,9 +3979,7 @@ type CreateSavedSnapshotResponse struct {
 	MemoryMib    uint32 `protobuf:"varint,9,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
 	DiskSizeMib  uint32 `protobuf:"varint,10,opt,name=disk_size_mib,json=diskSizeMib,proto3" json:"disk_size_mib,omitempty"`
 	SizeBytes    int64  `protobuf:"varint,11,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"` // Allocated bytes of the owned files.
-	// What a warm restore of the memory image needs to match. The hash names
-	// the Firecracker process that wrote the image; empty when unknown.
-	KernelPath        string `protobuf:"bytes,12,opt,name=kernel_path,json=kernelPath,proto3" json:"kernel_path,omitempty"`
+	// The Firecracker process that wrote the memory image; empty when unknown.
 	FirecrackerSha256 string `protobuf:"bytes,13,opt,name=firecracker_sha256,json=firecrackerSha256,proto3" json:"firecracker_sha256,omitempty"`
 	CreatedAtUnix     int64  `protobuf:"varint,14,opt,name=created_at_unix,json=createdAtUnix,proto3" json:"created_at_unix,omitempty"`
 	unknownFields     protoimpl.UnknownFields
@@ -4093,13 +4091,6 @@ func (x *CreateSavedSnapshotResponse) GetSizeBytes() int64 {
 		return x.SizeBytes
 	}
 	return 0
-}
-
-func (x *CreateSavedSnapshotResponse) GetKernelPath() string {
-	if x != nil {
-		return x.KernelPath
-	}
-	return ""
 }
 
 func (x *CreateSavedSnapshotResponse) GetFirecrackerSha256() string {
@@ -4514,7 +4505,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1f\n" +
 	"\vsnapshot_id\x18\x02 \x01(\tR\n" +
 	"snapshotId\x12\x12\n" +
-	"\x04kind\x18\x03 \x01(\tR\x04kind\"\xe9\x03\n" +
+	"\x04kind\x18\x03 \x01(\tR\x04kind\"\xc8\x03\n" +
 	"\x1bCreateSavedSnapshotResponse\x12\x1f\n" +
 	"\vsnapshot_id\x18\x01 \x01(\tR\n" +
 	"snapshotId\x12\x12\n" +
@@ -4531,9 +4522,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\rdisk_size_mib\x18\n" +
 	" \x01(\rR\vdiskSizeMib\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\v \x01(\x03R\tsizeBytes\x12\x1f\n" +
-	"\vkernel_path\x18\f \x01(\tR\n" +
-	"kernelPath\x12-\n" +
+	"size_bytes\x18\v \x01(\x03R\tsizeBytes\x12-\n" +
 	"\x12firecracker_sha256\x18\r \x01(\tR\x11firecrackerSha256\x12&\n" +
 	"\x0fcreated_at_unix\x18\x0e \x01(\x03R\rcreatedAtUnix\"=\n" +
 	"\x1aDeleteSavedSnapshotRequest\x12\x1f\n" +
