@@ -173,7 +173,7 @@ BEGIN
     RAISE EXCEPTION 'sandbox_by_source_snapshot exists but is INVALID; DROP INDEX it, re-run the concurrent pre-build, then retry';
   END IF;
   IF to_regclass('public.sandbox_by_source_snapshot') IS NULL THEN
-    CREATE INDEX sandbox_by_source_snapshot
+    CREATE INDEX IF NOT EXISTS sandbox_by_source_snapshot
         ON sandbox (source_snapshot_id)
         WHERE source_snapshot_id IS NOT NULL;
   END IF;
