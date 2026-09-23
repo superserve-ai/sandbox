@@ -623,6 +623,7 @@ class BootstrapTests(unittest.TestCase):
         original = MODULE.manifest_identity(config)
         config['migration_complete'] = True
         config['frontend_backend_references'] = {'redirect': ['replacement-backend']}
+        config['frontend_resources'] = {'redirect': ['target-tcp-proxy:example-redirect']}
         self.assertEqual(MODULE.manifest_identity(config), original)
         config['routes'][0]['listener'] = 'public'
         self.assertNotEqual(MODULE.manifest_identity(config), original)

@@ -39,6 +39,11 @@ module "proxy_generations" {
   generation_cell = each.value
 }
 
+output "proxy_generation_bootstrap" {
+  description = "Module-only manifest available after generation preparation, before frontend import or cutover."
+  value       = { for key, cell in module.proxy_generations : key => cell.generation_rollout }
+}
+
 locals {
   # The rollout gate is derived from the adopted frontend resources below,
   # rather than accepting the input acknowledgement as proof of a cutover.

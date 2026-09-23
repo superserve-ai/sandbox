@@ -15,6 +15,30 @@ SCRIPTS = Path(__file__).parent
 
 
 class DeployTargetTests(unittest.TestCase):
+    def test_frontend_owning_states_require_bootstrap_before_automatic_apply(self):
+        workflow = (SCRIPTS.parent / 'terraform-cd.yml').read_text()
+        deploy = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
+        for name, gate in (
+            ('staging/us-central1', 'PROXY_STAGING_FRONTEND_MIGRATED'),
+            ('production/us-east4', 'PROXY_PRODUCTION_FRONTEND_MIGRATED'),
+        ):
+            with self.subTest(state=name):
+                step = workflow.split(f'- name: Terraform apply {name}\n', 1)[1]
+                self.assertIn(f'vars.{gate}', step.split('        run: |', 1)[0])
+                guard = step.split('        run: |\n', 1)[1].split('          echo "## Terraform rollout:', 1)[0]
+                for value in ('', 'false', 'true'):
+                    result = subprocess.run(['bash', '-eu', '-c', guard],
+                                            capture_output=True, text=True,
+                                            env=dict(os.environ, PROXY_FRONTEND_MIGRATED=value))
+                    self.assertEqual(result.returncode, 0 if value == 'true' else 1)
+        for state in ('staging/us-central1', 'production/us-east4', 'production/us-west2'):
+            with self.subTest(bootstrap_output=state):
+                generations = (SCRIPTS.parent.parent.parent / 'infra' / 'envs' / state
+                               / 'proxy-generations.tf').read_text()
+                self.assertIn('output "proxy_generation_bootstrap"', generations)
+                self.assertIn('key => cell.generation_rollout', generations)
+                self.assertIn(f'terraform -chdir=infra/envs/{state} output -json proxy_generation_bootstrap', deploy)
+
     def test_automatic_rollouts_enforce_identity_gates(self):
         for kind in ('vmd', 'proxy'):
             workflow = (SCRIPTS.parent / f'deploy-{kind}.yml').read_text()

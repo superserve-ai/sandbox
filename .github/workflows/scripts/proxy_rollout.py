@@ -165,7 +165,8 @@ def manifest_identity(config):
     # Terraform's migration acknowledgement and applied frontend references
     # change while the cell owner is held between bootstrap and resume.
     static = {key: value for key, value in config.items()
-              if key not in ('migration_complete', 'frontend_backend_references')}
+              if key not in ('migration_complete', 'frontend_backend_references',
+                             'frontend_resources')}
     # Terraform emits null for an omitted optional address. Keep existing
     # manifests retry-compatible when no frontend pin was configured.
     static['routes'] = [{key: value for key, value in route.items()

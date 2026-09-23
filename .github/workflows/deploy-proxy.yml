@@ -182,7 +182,11 @@ jobs:
         run: |
           umask 077
           terraform -chdir=infra/envs/staging/us-central1 init -input=false
-          terraform -chdir=infra/envs/staging/us-central1 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
+          if [ "${{ inputs.operation || 'deploy' }}" = bootstrap ] && [ "${{ inputs.environment || 'staging' }}" = staging ]; then
+            terraform -chdir=infra/envs/staging/us-central1 output -json proxy_generation_bootstrap > "$PROXY_ROLLOUT_MANIFESTS"
+          else
+            terraform -chdir=infra/envs/staging/us-central1 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
+          fi
 
       # GCP_REGION scopes label discovery to the primary region so the
       # usw cell host (same project, same label) isn't folded into this
@@ -298,7 +302,11 @@ jobs:
         run: |
           umask 077
           terraform -chdir=infra/envs/production/us-east4 init -input=false
-          terraform -chdir=infra/envs/production/us-east4 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
+          if [ "${{ inputs.operation || 'deploy' }}" = bootstrap ]; then
+            terraform -chdir=infra/envs/production/us-east4 output -json proxy_generation_bootstrap > "$PROXY_ROLLOUT_MANIFESTS"
+          else
+            terraform -chdir=infra/envs/production/us-east4 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
+          fi
 
       # us-east4 is the "use" cell's primary host (api.superserve.ai routes to
       # the use-cell control plane there). It deploys FIRST so a usw-cell failure
@@ -349,7 +357,11 @@ jobs:
         run: |
           umask 077
           terraform -chdir=infra/envs/production/us-west2 init -input=false
-          terraform -chdir=infra/envs/production/us-west2 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
+          if [ "${{ inputs.operation || 'deploy' }}" = bootstrap ]; then
+            terraform -chdir=infra/envs/production/us-west2 output -json proxy_generation_bootstrap > "$PROXY_ROLLOUT_MANIFESTS"
+          else
+            terraform -chdir=infra/envs/production/us-west2 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
+          fi
 
       # The usw cell deploys as a step in this job — not a separate job —
       # for the same reason Deploy API / CD Migrate / Seed Templates do it

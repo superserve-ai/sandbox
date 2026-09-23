@@ -42,6 +42,11 @@ module "proxy_generations" {
   generation_cell = each.value
 }
 
+output "proxy_generation_bootstrap" {
+  description = "Module-only manifest available after generation preparation, before the east-owned frontend cutover."
+  value       = { for key, cell in module.proxy_generations : key => cell.generation_rollout }
+}
+
 # The global frontend resources remain owned by the east state. Read their
 # applied backend references through the owning state's output so the west
 # rollout manifest is evidence of the applied URL-map migration, rather than
