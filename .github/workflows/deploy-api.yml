@@ -328,6 +328,7 @@ jobs:
             --runtime-service-account "$RUNTIME_IDENTITY" \
             --kms-key-resource "projects/${{ vars.GCP_PROJECT }}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek" \
             --evidence-dir "$RUNNER_TEMP/control-plane-kms/use4" \
+            --secret operator-api-token-use4 \
             --secret database-url \
             --secret internal-api-token \
             --secret sandbox-access-token-seed \
@@ -399,6 +400,7 @@ jobs:
             --runtime-service-account "$RUNTIME_IDENTITY" \
             --kms-key-resource "projects/${{ vars.GCP_PROJECT }}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek" \
             --evidence-dir "$RUNNER_TEMP/control-plane-kms/usw2" \
+            --secret operator-api-token-usw2 \
             --secret database-url-usw2 \
             --secret internal-api-token \
             --secret sandbox-access-token-seed \
