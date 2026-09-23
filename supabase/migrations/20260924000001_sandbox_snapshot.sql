@@ -120,18 +120,25 @@ CREATE INDEX IF NOT EXISTS sandbox_snapshot_template
     ON sandbox_snapshot (template_id)
     WHERE deleted_at IS NULL AND status IN ('creating', 'ready');
 
--- The sandbox lock is taken only when it is free: a queued request would
--- hold every new sandbox query behind it while it waits, and a busy table
--- rarely drains within the timeout. Once held it covers the rest of this
--- transaction, all of it milliseconds.
+-- Pre-built by hand on a populated database (see the header), so a present
+-- column is skipped without touching the sandbox table's lock. When it is
+-- missing the lock is taken only when free: a queued request would hold every
+-- new sandbox query behind it while it waits. sqlc cannot see DDL inside a DO
+-- block, so db/schema/ declares this column for code generation only.
 DO $$
 DECLARE
   tries int := 0;
 BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'sandbox' AND column_name = 'source_snapshot_id'
+  ) THEN
+    RETURN;
+  END IF;
   LOOP
     BEGIN
       LOCK TABLE sandbox IN ACCESS EXCLUSIVE MODE NOWAIT;
-      RETURN;
+      EXIT;
     EXCEPTION WHEN lock_not_available THEN
       tries := tries + 1;
       IF tries >= 80 THEN
@@ -140,26 +147,39 @@ BEGIN
       PERFORM pg_sleep(0.1);
     END;
   END LOOP;
+  ALTER TABLE sandbox ADD COLUMN IF NOT EXISTS source_snapshot_id uuid;
+  COMMENT ON COLUMN sandbox.source_snapshot_id IS
+    'Snapshot this sandbox was created from; NULL when created from a template.';
 END $$;
 
-ALTER TABLE sandbox
-    ADD COLUMN IF NOT EXISTS source_snapshot_id uuid;
-
--- NOT VALID: adding the key is then metadata only. Validation scans the
--- sandbox table and runs in the next migration, under a lock that does not
--- block sandbox writes. New rows are checked either way.
+-- NOT VALID: adding the key is then metadata only, under a lock only writers
+-- contend for, taken only when free. Validation scans the sandbox table in
+-- the next migration under a lock that blocks no writes. New rows are checked
+-- either way.
 DO $$
+DECLARE
+  tries int := 0;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sandbox_source_snapshot_fk') THEN
-    ALTER TABLE sandbox
-      ADD CONSTRAINT sandbox_source_snapshot_fk
-      FOREIGN KEY (source_snapshot_id, team_id) REFERENCES sandbox_snapshot(id, team_id)
-      NOT VALID;
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'sandbox_source_snapshot_fk') THEN
+    RETURN;
   END IF;
+  LOOP
+    BEGIN
+      LOCK TABLE sandbox IN SHARE ROW EXCLUSIVE MODE NOWAIT;
+      EXIT;
+    EXCEPTION WHEN lock_not_available THEN
+      tries := tries + 1;
+      IF tries >= 80 THEN
+        RAISE;
+      END IF;
+      PERFORM pg_sleep(0.1);
+    END;
+  END LOOP;
+  ALTER TABLE sandbox
+    ADD CONSTRAINT sandbox_source_snapshot_fk
+    FOREIGN KEY (source_snapshot_id, team_id) REFERENCES sandbox_snapshot(id, team_id)
+    NOT VALID;
 END $$;
-
-COMMENT ON COLUMN sandbox.source_snapshot_id IS
-  'Snapshot this sandbox was created from; NULL when created from a template.';
 
 -- An interrupted concurrent pre-build leaves an INVALID index that must
 -- not be silently kept; a valid one is left alone.
