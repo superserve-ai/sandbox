@@ -924,6 +924,9 @@ def credential_request(state, root, upload, peer=Path('/etc/superserve/peer')):
         return None
     directory = root / 'generations' / generation['id']
     request = json.loads((directory / 'request.json').read_text())
+    env = request['env']
+    if env.get('PEER_ROUTING_ENABLED') != '1' and not env.get('PEER_PROXY_LISTEN_ADDR'):
+        return None
     current = (peer / 'current').resolve(strict=True).name
     if not unfinished:
         if (directory / 'credential-generation').read_text() == current:

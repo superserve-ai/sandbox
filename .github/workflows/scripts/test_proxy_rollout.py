@@ -3,7 +3,10 @@ import json
 import tempfile
 import copy
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
+import textwrap
 import unittest
 from unittest.mock import Mock, call, patch
 
@@ -130,7 +133,8 @@ class CredentialRenewalTests(unittest.TestCase):
         active = root / 'generations' / OLD['id']
         active.mkdir(parents=True)
         request = dict(rollout='code-deploy', revision='revision-a',
-                       env={'PROXY_DOMAIN': 'example.test', 'PROXY_DRAIN_GRACE': '30s'})
+                       env={'PROXY_DOMAIN': 'example.test', 'PROXY_DRAIN_GRACE': '30s',
+                            'PEER_ROUTING_ENABLED': '1'})
         (active / 'request.json').write_text(json.dumps(request))
         (active / 'proxy').write_bytes(b'immutable executable')
         (active / 'credential-generation').write_text('certificate-a')
@@ -466,6 +470,16 @@ class CredentialRenewalTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'unfinished deployment'):
                 MODULE.credential_request(state, root, upload, peer)
 
+    def test_tls_enabled_generation_missing_snapshot_marker_still_fails(self):
+        for env in ({'PEER_ROUTING_ENABLED': '1'}, {'PEER_PROXY_LISTEN_ADDR': 'auto'}):
+            with self.subTest(env=env), tempfile.TemporaryDirectory() as directory:
+                root, peer, upload, state, request = self.fixture(directory)
+                active = root / 'generations' / OLD['id']
+                (active / 'request.json').write_text(json.dumps(dict(request, env=env)))
+                (active / 'credential-generation').unlink()
+                with self.assertRaises(FileNotFoundError):
+                    MODULE.credential_request(state, root, upload, peer)
+
     def test_legacy_credential_refresh_reloads_the_running_proxy(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -551,7 +565,7 @@ class BootstrapManifestTests(unittest.TestCase):
             'next-rollout', False)
 
     def bootstrap(self, directory, state=None, actual_instance='example-host', migrated=False,
-                 frontend_backend_references=None):
+                 frontend_backend_references=None, manifest=None):
         root = Path(directory)
         config = dict(project='example-project', instance='example-host', zone='us-central1-a',
                       ip='192.0.2.10', migration_complete=migrated,
@@ -567,6 +581,9 @@ class BootstrapManifestTests(unittest.TestCase):
                       })
         if frontend_backend_references is not None:
             config['frontend_backend_references'] = frontend_backend_references
+        if manifest is not None:
+            config = manifest
+            migrated = config.get('migration_complete', False)
         upload = root / 'manifest.json'
         upload.write_text(json.dumps(config))
         request = root / 'request.json'
@@ -653,6 +670,65 @@ class BootstrapManifestTests(unittest.TestCase):
             self.assertEqual(retried_state['phase'], 'bootstrap_ready')
             retried.verify.assert_not_called()
             retried.stop.assert_not_called()
+
+    def test_workflow_bootstrap_selection_finalizes_the_same_rollout(self):
+        workflow = Path(__file__).parents[1].joinpath('deploy-proxy.yml').read_text()
+        names = ('Read applied proxy manifests from the owning state',
+                 'Read applied us-east4 proxy manifests from the owning state',
+                 'Read applied us-west2 proxy manifests from the owning state')
+        for name in names:
+            with self.subTest(step=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _, config, _, _ = self.bootstrap(root)
+                (root / 'state.json').unlink()
+                preparation = {key: value for key, value in config.items()
+                               if key not in ('migration_complete', 'frontend_backend_references')}
+                applied = dict(config, migration_complete=True)
+                outputs = root / 'tf-outputs.json'
+                selected = root / 'selected.json'
+                fake = root / 'terraform'
+                fake.write_text('#!/bin/sh\nif [ "$2" = init ]; then exit 0; fi\n'
+                                'cat "$TF_OUTPUT_FILE"\nexit "${TF_OUTPUT_STATUS:-0}"\n')
+                fake.chmod(0o755)
+                step = workflow.split(f'      - name: {name}\n', 1)[1].split('      - name:', 1)[0]
+                script = textwrap.dedent(step.split('        run: |\n', 1)[1].split('\n      #', 1)[0])
+                env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
+                           PROXY_OPERATION='bootstrap', PROXY_ROLLOUT_MANIFESTS=str(selected),
+                           TF_OUTPUT_FILE=str(outputs))
+
+                def select(values, **overrides):
+                    outputs.write_text(json.dumps(values))
+                    return subprocess.run(['bash', '-c', script], env=dict(env, **overrides),
+                                          capture_output=True, text=True)
+
+                bootstrap_outputs = {'proxy_generation_bootstrap': {'value': {'cell': preparation}}}
+                result = select(bootstrap_outputs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                _, _, before, saved = self.bootstrap(root, manifest=json.loads(selected.read_text())['cell'])
+                self.assertEqual(saved['phase'], 'bootstrap_ready')
+                before.verify.assert_not_called()
+                # A retry before the frontend apply must remain resumable.
+                self.assertEqual(select(bootstrap_outputs).returncode, 0)
+                _, _, _, retry = self.bootstrap(root, manifest=json.loads(selected.read_text())['cell'])
+                self.assertEqual(retry['phase'], 'bootstrap_ready')
+                applied_outputs = dict(bootstrap_outputs, proxy_generation_rollout={'value': {'cell': applied}})
+                result = select(applied_outputs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                _, _, after, completed = self.bootstrap(root, manifest=json.loads(selected.read_text())['cell'])
+                self.assertEqual(completed['phase'], 'complete')
+                self.assertEqual(completed['rollout'], saved['rollout'])
+                self.assertEqual(completed['request_hash'], saved['request_hash'])
+                after.verify.assert_called_once_with(completed['old'])
+                # Selection must retain an applied rollback signal, not infer
+                # migration success from the existence of the output alone.
+                reverted = dict(applied, migration_complete=False)
+                self.assertEqual(select(dict(bootstrap_outputs,
+                    proxy_generation_rollout={'value': {'cell': reverted}})).returncode, 0)
+                self.assertEqual(json.loads(selected.read_text())['cell'], reverted)
+                self.assertNotEqual(select(bootstrap_outputs, PROXY_OPERATION='deploy').returncode, 0)
+                self.assertNotEqual(select(bootstrap_outputs, TF_OUTPUT_STATUS='1').returncode, 0)
+                self.assertNotEqual(select(dict(bootstrap_outputs,
+                    proxy_generation_rollout={'value': None})).returncode, 0)
 
     def test_wrong_host_does_not_install_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -927,6 +1003,10 @@ class PreparationArtifactTests(unittest.TestCase):
             (etc / 'sandbox' / 'proxy.env').write_text('')
             (etc / 'sandbox' / 'vmd.env').write_text(
                 'PROXY_HEALTH_URL=http://127.0.0.1:5007/health\n')
+            peer = etc / 'superserve' / 'peer'
+            (peer / 'certificate-a').mkdir(parents=True)
+            (peer / 'current').symlink_to('certificate-a')
+            (peer / 'identity.json').write_text(json.dumps({'spiffe_uri': 'spiffe://example.test/host'}))
             upload = root / 'upload'
             upload.mkdir()
             (upload / 'proxy').write_bytes(b'immutable executable')
@@ -941,6 +1021,7 @@ class PreparationArtifactTests(unittest.TestCase):
             request = {
                 'rollout': 'example-rollout',
                 'revision': 'revision-a',
+                'require_identity': True,
                 'env': {
                     'PROXY_DOMAIN': 'example.test',
                     'PEER_ROUTING_ENABLED': '0',
@@ -971,6 +1052,11 @@ class PreparationArtifactTests(unittest.TestCase):
             self.assertFalse((artifact / 'peer-key').exists())
             self.assertFalse((artifact / 'peer-ca').exists())
             command.assert_called_once_with('systemctl', 'daemon-reload')
+            for phase in MODULE.TERMINAL_PHASES:
+                with self.subTest(phase=phase):
+                    state = dict(phase=phase, active=generation, rollout=request['rollout'])
+                    self.assertIsNone(MODULE.credential_request(state, artifact.parent.parent, upload, peer))
+            self.assertFalse((upload / 'request.json').exists())
 
     def test_prepare_client_only_routing_snapshots_credentials(self):
         with tempfile.TemporaryDirectory() as directory:

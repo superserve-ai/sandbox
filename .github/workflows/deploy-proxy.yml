@@ -214,14 +214,20 @@ jobs:
           terraform_wrapper: false
 
       - name: Read applied proxy manifests from the owning state
+        env:
+          PROXY_OPERATION: ${{ inputs.environment == 'production' && 'deploy' || inputs.operation || 'deploy' }}
         run: |
+          set -euo pipefail
           umask 077
           terraform -chdir=infra/envs/staging/us-central1 init -input=false
-          if [ "${{ inputs.operation || 'deploy' }}" = bootstrap ] && [ "${{ inputs.environment || 'staging' }}" = staging ]; then
-            terraform -chdir=infra/envs/staging/us-central1 output -json proxy_generation_bootstrap > "$PROXY_ROLLOUT_MANIFESTS"
-          else
-            terraform -chdir=infra/envs/staging/us-central1 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
-          fi
+          # Preparation can precede frontend imports; retries use the applied
+          # output once available so the same rollout can finalize or revert.
+          terraform -chdir=infra/envs/staging/us-central1 output -json |
+            jq -e --arg operation "$PROXY_OPERATION" '
+              if $operation == "bootstrap" and (has("proxy_generation_rollout") | not)
+              then .proxy_generation_bootstrap.value
+              else .proxy_generation_rollout.value end
+            ' > "$PROXY_ROLLOUT_MANIFESTS"
 
       # GCP_REGION scopes label discovery to the primary region so the
       # usw cell host (same project, same label) isn't folded into this
@@ -335,13 +341,15 @@ jobs:
       - name: Read applied us-east4 proxy manifests from the owning state
         if: github.event_name != 'workflow_dispatch' || inputs.production_cell == 'use4'
         run: |
+          set -euo pipefail
           umask 077
           terraform -chdir=infra/envs/production/us-east4 init -input=false
-          if [ "${{ inputs.operation || 'deploy' }}" = bootstrap ]; then
-            terraform -chdir=infra/envs/production/us-east4 output -json proxy_generation_bootstrap > "$PROXY_ROLLOUT_MANIFESTS"
-          else
-            terraform -chdir=infra/envs/production/us-east4 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
-          fi
+          terraform -chdir=infra/envs/production/us-east4 output -json |
+            jq -e --arg operation "$PROXY_OPERATION" '
+              if $operation == "bootstrap" and (has("proxy_generation_rollout") | not)
+              then .proxy_generation_bootstrap.value
+              else .proxy_generation_rollout.value end
+            ' > "$PROXY_ROLLOUT_MANIFESTS"
 
       # us-east4 is the "use" cell's primary host (api.superserve.ai routes to
       # the use-cell control plane there). It deploys FIRST so a usw-cell failure
@@ -390,13 +398,15 @@ jobs:
       - name: Read applied us-west2 proxy manifests from the owning state
         if: (github.event_name == 'workflow_dispatch' && (inputs.production_cell == 'usw2' || inputs.production_cell == '')) || (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != '')
         run: |
+          set -euo pipefail
           umask 077
           terraform -chdir=infra/envs/production/us-west2 init -input=false
-          if [ "${{ inputs.operation || 'deploy' }}" = bootstrap ]; then
-            terraform -chdir=infra/envs/production/us-west2 output -json proxy_generation_bootstrap > "$PROXY_ROLLOUT_MANIFESTS"
-          else
-            terraform -chdir=infra/envs/production/us-west2 output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"
-          fi
+          terraform -chdir=infra/envs/production/us-west2 output -json |
+            jq -e --arg operation "$PROXY_OPERATION" '
+              if $operation == "bootstrap" and (has("proxy_generation_rollout") | not)
+              then .proxy_generation_bootstrap.value
+              else .proxy_generation_rollout.value end
+            ' > "$PROXY_ROLLOUT_MANIFESTS"
 
       # The usw cell deploys as a step in this job — not a separate job —
       # for the same reason Deploy API / CD Migrate / Seed Templates do it

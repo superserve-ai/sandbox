@@ -37,7 +37,7 @@ class DeployTargetTests(unittest.TestCase):
                                / 'proxy-generations.tf').read_text()
                 self.assertIn('output "proxy_generation_bootstrap"', generations)
                 self.assertIn('key => cell.generation_rollout', generations)
-                self.assertIn(f'terraform -chdir=infra/envs/{state} output -json proxy_generation_bootstrap', deploy)
+                self.assertIn(f'terraform -chdir=infra/envs/{state} output -json |', deploy)
 
     def test_automatic_rollouts_enforce_identity_gates(self):
         for kind in ('vmd', 'proxy'):
@@ -129,7 +129,7 @@ class DeployTargetTests(unittest.TestCase):
         workflow = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
         staging, production = workflow.split('  deploy-staging:\n',1)[1].split('  deploy-production:\n',1)
         for job, root in ((staging,'staging/us-central1'),(production,'production/us-east4')):
-            output = f'terraform -chdir=infra/envs/{root} output -json proxy_generation_rollout'
+            output = f'terraform -chdir=infra/envs/{root} output -json |'
             self.assertLess(job.index(output),job.index('python3 .github/workflows/scripts/deploy-proxy.py'))
         self.assertIn("PROXY_OPERATION: ${{ inputs.environment == 'production' && 'deploy' || inputs.operation || 'deploy' }}",staging)
         self.assertIn("PROXY_OPERATION: ${{ inputs.operation || 'deploy' }}",workflow)
@@ -151,8 +151,8 @@ class DeployTargetTests(unittest.TestCase):
                 self.assertEqual(load_guard, deploy_guard)
                 root = f'infra/envs/production/{region}'
                 self.assertIn(f'terraform -chdir={root} init -input=false', load)
-                self.assertIn(f'terraform -chdir={root} output -json proxy_generation_rollout > "$PROXY_ROLLOUT_MANIFESTS"', load)
-                self.assertEqual(load.count(' output -json proxy_generation_rollout'), 1)
+                self.assertIn(f'terraform -chdir={root} output -json |', load)
+                self.assertEqual(load.count(' output -json'), 1)
 
     def test_each_proxy_environment_commits_a_cell_for_rollout_manifests(self):
         cells = (
