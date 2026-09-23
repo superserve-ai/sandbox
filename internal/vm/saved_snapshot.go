@@ -758,7 +758,10 @@ func (m *Manager) savedCaptureHeadroom(kind SavedSnapshotKind, st VMStatus, inst
 		memoryMiB, memFile, snapshotPath := inst.Config.MemoryMiB, inst.MemFilePath, inst.SnapshotPath
 		inst.mu.RUnlock()
 		if st == StatusRunning {
-			need += int64(memoryMiB) << 20
+			// A diff is written raw and then applied onto the image it
+			// joins, so two guest-sized files can exist until the raw one
+			// is removed.
+			need += 2 * int64(memoryMiB) << 20
 		} else {
 			memBytes, _ := allocatedBytes(memFile)
 			stateBytes, _ := allocatedBytes(snapshotPath)

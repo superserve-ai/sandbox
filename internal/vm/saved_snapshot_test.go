@@ -680,10 +680,12 @@ func TestStandaloneSavedDiskRestoreRefusesWithoutReflink(t *testing.T) {
 func TestSavedCaptureHeadroomIsReservedAcrossCaptures(t *testing.T) {
 	orig := savedFreeBytes
 	t.Cleanup(func() { savedFreeBytes = orig })
-	savedFreeBytes = func(string) (int64, error) { return 1 << 30, nil }
+	savedFreeBytes = func(string) (int64, error) { return 4 << 30, nil }
 	m := newSavedTestManager(t)
 	inst, _ := seedPausedSource(t, m, false)
-	inst.Config.MemoryMiB = 600 // one fits in 1 GiB with the fixed headroom, two do not
+	// A running capture reserves twice its memory: one fits in 4 GiB with
+	// the fixed headroom, two do not.
+	inst.Config.MemoryMiB = 1000
 	first, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst, inst.DiskPath)
 	if err != nil {
 		t.Fatalf("first capture: %v", err)
