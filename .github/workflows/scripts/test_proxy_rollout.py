@@ -242,6 +242,110 @@ class CredentialRenewalTests(unittest.TestCase):
             self.assertFalse(candidate.exists())
             self.assertFalse((units / NEW['unit']).exists())
 
+    def test_rotated_request_resumes_across_recovery_interruptions(self):
+        for phase in ('before_save', 'starting', 'rollback_restoring', 'rolled_back', 'after_cleanup'):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                root, peer, upload, state, _ = self.fixture(directory)
+                original = json.loads(MODULE.credential_request(state, root, upload, peer).read_text())
+                original_hash = MODULE.request_identity(original, upload / 'proxy', upload / 'proxy.service')
+                state.update(phase='starting', old=OLD, candidate=NEW,
+                             rollout=original['rollout'], request_hash=original_hash)
+                before = copy.deepcopy(state)
+                candidate = root / 'generations' / NEW['id']
+                candidate.mkdir()
+                (peer / 'current').unlink()
+                (peer / 'certificate-c').mkdir()
+                (peer / 'current').symlink_to('certificate-c')
+                replacement = json.loads(MODULE.credential_request(state, root, upload, peer).read_text())
+                self.assertEqual(json.loads((root / 'credential-request.json').read_text()), original)
+                if phase == 'before_save':
+                    recovered = before
+                else:
+                    state['phase'] = 'rolled_back' if phase == 'after_cleanup' else phase
+                    MODULE.save_owned_state(Mock(spec=MODULE.CellLock), root / 'state.json', state)
+                    recovered = json.loads((root / 'state.json').read_text())
+                    if phase == 'after_cleanup':
+                        candidate.rmdir()
+                resumed = json.loads(MODULE.credential_request(recovered, root, upload, peer).read_text())
+                self.assertEqual(resumed, replacement)
+                self.assertEqual(recovered['_credential_previous_request_hash'], original_hash)
+                self.assertEqual(recovered['_credential_previous_rollout'], original['rollout'])
+                self.assertEqual(recovered['_credential_recovery']['previous_rollout'], original['rollout'])
+                # A second publication during rollback still recovers the
+                # original owner, even after the stale artifact was removed.
+                (peer / 'current').unlink()
+                (peer / 'certificate-d').mkdir()
+                (peer / 'current').symlink_to('certificate-d')
+                renewed = json.loads(MODULE.credential_request(recovered, root, upload, peer).read_text())
+                self.assertEqual(renewed['credential_generation'], 'certificate-d')
+                self.assertNotEqual(renewed['rollout'], replacement['rollout'])
+                self.assertEqual(recovered['_credential_previous_request_hash'], original_hash)
+                self.assertEqual(recovered['_credential_recovery']['previous_rollout'], original['rollout'])
+                MODULE.save_owned_state(Mock(spec=MODULE.CellLock), root / 'state.json', recovered)
+                restarted = json.loads((root / 'state.json').read_text())
+                self.assertEqual(json.loads(MODULE.credential_request(restarted, root, upload, peer).read_text()), renewed)
+                for field, value in (('rollout', 'credentials-unrelated'), ('revision', 'changed-code')):
+                    invalid = copy.deepcopy(restarted)
+                    invalid['_credential_request'][field] = value
+                    with self.assertRaisesRegex(RuntimeError, 'credential recovery request'):
+                        MODULE.credential_request(invalid, root, upload, peer)
+
+    def test_replacement_rollout_resumes_from_its_saved_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, peer, upload, state, _ = self.fixture(directory)
+            original = json.loads(MODULE.credential_request(state, root, upload, peer).read_text())
+            identity = MODULE.request_identity(original, upload / 'proxy', upload / 'proxy.service')
+            state.update(phase='starting', old=OLD, candidate=NEW,
+                         rollout=original['rollout'], request_hash=identity)
+            (root / 'generations' / NEW['id']).mkdir()
+            (peer / 'current').unlink()
+            (peer / 'certificate-c').mkdir()
+            (peer / 'current').symlink_to('certificate-c')
+            request_path = MODULE.credential_request(state, root, upload, peer)
+            replacement = json.loads(request_path.read_text())
+            config = dict(project='example-project', zone='us-central1-a', instance='example-host',
+                          ip='192.0.2.10', ownership_bucket='example-cell-ownership',
+                          routes=[dict(listener='public', neg='public-neg', backend='public-backend',
+                                       probe='https://example.test/health')],
+                          frontend_backend_references={'public-backend': ['public-backend']})
+            path = root / 'state.json'
+            store = OwnershipStore()
+            owner = MODULE.CellLock(config, original['rollout'], identity, path, '123456789')
+            owner.request = store.request
+            owner.acquire()
+            host = Mock(root=root, config=config)
+            host.cloud.member.return_value = False
+            host.stop.return_value = {}
+            units = root / 'etc' / 'systemd' / 'system'
+            units.mkdir(parents=True)
+            (root / 'run' / 'lock').mkdir(parents=True)
+
+            class ControllerPath(type(root)):
+                def __new__(cls, *values):
+                    value = str(Path(*values))
+                    return root / value.lstrip('/') if value.startswith(('/etc/', '/run/')) else Path(value)
+
+            args = Mock(request=str(request_path), manifest=None, bootstrap=False)
+            with patch.object(MODULE, 'ROOT', root), patch.object(MODULE, 'Path', ControllerPath), \
+                 patch.object(MODULE.CellLock, 'request', side_effect=store.request), \
+                 patch.object(MODULE, 'command', return_value='inactive'), \
+                 patch.object(MODULE, 'prune_generations'), patch.object(MODULE, 'install_credential_timer'), \
+                 patch.object(MODULE, 'prepare', side_effect=Interrupted()) as prepare:
+                with self.assertRaises(Interrupted):
+                    MODULE.deploy_locked(args, config, 'config-hash', host, state, path, '123456789')
+                recovered = json.loads(path.read_text())
+                self.assertEqual(recovered['rollout'], replacement['rollout'])
+                self.assertEqual(recovered['_credential_request'], replacement)
+                self.assertNotIn('_credential_recovery', recovered)
+                self.assertEqual(json.loads((root / 'credential-request.json').read_text()), original)
+                self.assertEqual(json.loads(MODULE.credential_request(recovered, root, upload, peer).read_text()), replacement)
+                prepare.side_effect = None
+                MODULE.deploy_locked(args, config, 'config-hash', host, recovered, path, '123456789')
+            completed = json.loads(path.read_text())
+            self.assertEqual(completed['phase'], 'complete')
+            self.assertNotIn('_credential_previous_request_hash', completed)
+            self.assertIsNone(store.record)
+
     def test_rotated_renewal_reconciles_a_registered_candidate_in_rollback_order(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -303,7 +407,7 @@ class CredentialRenewalTests(unittest.TestCase):
             self.assertLess(index(lambda event: event == ('stop', 'new')),
                             index(lambda event: event[0] == 'cleanup'))
 
-    def test_intermediate_rollback_keeps_owner_markers_until_replacement_is_saved(self):
+    def test_terminal_state_keeps_owner_markers_until_cloud_release(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'state.json'
             ownership = Mock(spec=MODULE.CellLock)
@@ -330,8 +434,8 @@ class CredentialRenewalTests(unittest.TestCase):
                              'original-inputs')
             state['phase'] = 'complete'
             MODULE.save_owned_state(ownership, path, state)
-            self.assertNotIn('_credential_previous_request_hash', json.loads(path.read_text()))
-            self.assertNotIn('_credential_previous_rollout', json.loads(path.read_text()))
+            self.assertEqual(json.loads(path.read_text())['_credential_previous_request_hash'], 'original-inputs')
+            self.assertEqual(json.loads(path.read_text())['_credential_previous_rollout'], 'credentials-old')
             self.assertTrue(ownership.terminal_saved)
 
     def test_rotated_renewal_resumes_cleanup_after_rollback_was_saved(self):
@@ -1457,6 +1561,64 @@ class CellOwnershipTests(unittest.TestCase):
             raise RuntimeError('candidate failed')
         self.assertIsNone(self.store.record)
 
+    def test_completed_renewal_releases_original_owner_after_interruption(self):
+        for failure in ('before_release', 'delete_failed', 'delete_reply_lost', 'cleanup_failed'):
+            with self.subTest(failure=failure):
+                config = dict(ownership_bucket='example-cell-ownership', instance='example-host', zone='us-central1-a')
+                owner = self.owner(rollout='credentials-old', identity='old-inputs')
+                owner.acquire()
+                owner.update_owner('credentials-new', 'new-inputs')
+                state = dict(phase='complete', rollout='credentials-new', request_hash='new-inputs',
+                             _credential_previous_rollout='credentials-old',
+                             _credential_previous_request_hash='old-inputs')
+                MODULE.save_owned_state(owner, self.state, state)
+
+                def fail_delete(method, path, data=None):
+                    if method == 'DELETE':
+                        if failure == 'delete_reply_lost':
+                            self.store.request(method, path, data)
+                        raise TimeoutError('delete unavailable')
+                    return self.store.request(method, path, data)
+
+                if failure in ('delete_failed', 'delete_reply_lost'):
+                    owner.request = fail_delete
+                    with self.assertRaises(TimeoutError):
+                        owner.__exit__(None, None, None)
+                elif failure == 'cleanup_failed':
+                    with patch.object(MODULE, 'atomic', side_effect=OSError('save interrupted')):
+                        with self.assertRaises(OSError):
+                            owner.__exit__(None, None, None)
+                recovered = json.loads(self.state.read_text())
+                self.assertEqual(recovered['_credential_previous_request_hash'], 'old-inputs')
+                with patch.object(MODULE.CellLock, 'request', side_effect=self.store.request):
+                    MODULE.release_completed_recovery(config, recovered, self.state, '123456789')
+                self.assertIsNone(self.store.record)
+                self.assertNotIn('_credential_previous_request_hash', recovered)
+                self.assertNotIn('_credential_previous_rollout', json.loads(self.state.read_text()))
+                next_owner = self.owner(rollout='next-deploy')
+                next_owner.acquire()
+                next_owner.release()
+
+    def test_terminal_recovery_cleanup_cannot_take_another_hosts_lock(self):
+        owner = self.owner(host='other-host', rollout='other-deploy')
+        owner.acquire()
+        state = dict(phase='complete', rollout='credentials-new', request_hash='new-inputs',
+                     _credential_previous_rollout='credentials-old',
+                     _credential_previous_request_hash='old-inputs')
+        MODULE.atomic(self.state, state)
+        config = dict(ownership_bucket='example-cell-ownership', instance='example-host', zone='us-central1-a')
+        with patch.object(MODULE.CellLock, 'request', side_effect=self.store.request):
+            with self.assertRaisesRegex(RuntimeError, 'unfinished ownership'):
+                MODULE.release_completed_recovery(config, state, self.state, '123456789')
+        owner.assert_owned()
+
+    def test_intermediate_credential_rollback_does_not_release_owner(self):
+        state = dict(phase='rolled_back', rollout='run', request_hash='inputs',
+                     _credential_recovery={'previous_rollout': 'run'})
+        with self.owner() as owner:
+            MODULE.save_owned_state(owner, self.state, state)
+        owner.assert_owned()
+
     def test_create_and_release_use_generation_preconditions(self):
         first, second = self.owner(), self.owner(host='other-host')
         request = first.request
@@ -1872,7 +2034,7 @@ class RolloutTests(unittest.TestCase):
                 self.assertEqual(host.members,{'old'})
                 self.assertNotIn('stop old',host.events)
                 self.assertLess(host.events.index('remove new'),host.events.index('verify old'))
-                self.assertLess(host.events.index('remove new'),host.events.index('health old'))
+                self.assertLess(host.events.index('health old'),host.events.index('remove new'))
                 self.assertLess(host.events.index('propagated old'),host.events.index('stop new'))
 
     def test_failure_after_shutdown_never_restores_stopped_old(self):
@@ -1929,8 +2091,31 @@ class RolloutTests(unittest.TestCase):
             return True
         host.local=fail
         with self.assertRaises(RuntimeError):controller.run()
-        self.assertEqual(host.members, {'old'})
+        self.assertEqual(host.members, {'old', 'new'})
         self.assertNotIn('stop new',host.events)
+
+    def test_failed_old_lb_health_preserves_candidate_and_retry_completes(self):
+        host = Host()
+        host.failure = 'propagated new'
+        controller = self.controller(host)
+        health = host.health
+
+        def unready_old(generation):
+            if generation['id'] == 'old':
+                raise RuntimeError('old not healthy at load balancer')
+            return health(generation)
+
+        host.health = unready_old
+        with self.assertRaisesRegex(RuntimeError, 'old not healthy'):
+            controller.run()
+        self.assertEqual(host.members, {'old', 'new'})
+        self.assertNotIn('remove new', host.events)
+        self.assertNotIn('stop new', host.events)
+        host.health = health
+        with self.assertRaisesRegex(RuntimeError, 'rollback completed'):
+            controller.run()
+        self.assertEqual(host.members, {'old'})
+        self.assertEqual(host.running, {'old'})
 
     def test_failed_old_external_verification_preserves_candidate(self):
         host = Host()
@@ -1948,6 +2133,7 @@ class RolloutTests(unittest.TestCase):
             controller.run()
         self.assertEqual(controller.state['phase'], 'rollback_restoring')
         self.assertEqual(host.members, {'old'})
+        self.assertLess(host.events.index('registered_ready old'), host.events.index('remove new'))
         self.assertLess(host.events.index('remove new'), host.events.index('verify old'))
         self.assertNotIn('stop new', host.events)
 

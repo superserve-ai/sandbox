@@ -127,8 +127,13 @@ class CellLock:
             state = json.loads(self.state_path.read_text())
             if (state.get('rollout') == self.owner['rollout']
                     and state.get('request_hash') == self.owner['identity']
-                    and state['phase'] in TERMINAL_PHASES):
+                    and state['phase'] in TERMINAL_PHASES
+                    and not state.get('_credential_recovery')):
                 self.release()
+                if '_credential_previous_request_hash' in state:
+                    state.pop('_credential_previous_request_hash', None)
+                    state.pop('_credential_previous_rollout', None)
+                    atomic(self.state_path, state)
 
 
 def command(*args, **kwargs):
@@ -159,11 +164,22 @@ def atomic(path, value):
 def save_owned_state(ownership, state_path, value):
     ownership.assert_owned()
     terminal = value.get('phase') in TERMINAL_PHASES and not value.get('_credential_recovery')
-    if terminal:
-        value.pop('_credential_previous_request_hash', None)
-        value.pop('_credential_previous_rollout', None)
     atomic(state_path, value)
     ownership.terminal_saved = terminal
+
+
+def release_completed_recovery(config, state, state_path, instance_id):
+    # A completed renewal may still own the cloud lock under its pre-rotation
+    # identity. Finish release before a timer decides no renewal is needed.
+    identity = state.get('_credential_previous_request_hash')
+    if (not identity or state['phase'] not in TERMINAL_PHASES
+            or state.get('_credential_recovery')):
+        return
+    rollout = state.get('_credential_previous_rollout') or state['rollout']
+    with CellLock(config, rollout, identity, state_path, instance_id) as ownership:
+        ownership.update_owner(state['rollout'], state['request_hash'])
+    state.pop('_credential_previous_request_hash', None)
+    state.pop('_credential_previous_rollout', None)
 
 
 def ready(body, generation):
@@ -690,6 +706,7 @@ class Rollout:
         # old membership before probing the route or retiring the candidate.
         self.phase('rollback_restoring')
         self.host.membership(old, True)
+        self.host.registered_ready(old)
         # Remove the candidate before probing the restored route so the public
         # verification cannot still be served by the failed generation.
         self.host.membership(candidate, False)
@@ -831,6 +848,7 @@ def main():
         state_path = ROOT / 'state.json'
         state = json.loads(state_path.read_text()) if state_path.exists() else {'active':legacy, 'phase':'complete'}
         config_hash = check_manifest_identity(config, state, manifest_path)
+        release_completed_recovery(config, state, state_path, instance_id)
         if args.bootstrap and not state.get('bootstrap') and (state['phase'] != 'complete' or state['active']['id']):
             raise RuntimeError('bootstrap is only allowed before the first generation rollout')
         if args.refresh_credentials:
@@ -879,8 +897,14 @@ def reload_legacy_proxy(peer=None):
     return True
 
 
+def credential_rollout_id(generation, certificate, previous_rollout):
+    return 'credentials-' + hashlib.sha256(
+        f'{generation}:{certificate}:{previous_rollout}'.encode()).hexdigest()[:32]
+
+
 def credential_request(state, root, upload, peer=Path('/etc/superserve/peer')):
-    if state['phase'] not in TERMINAL_PHASES:
+    unfinished = state['phase'] not in TERMINAL_PHASES or bool(state.get('_credential_recovery'))
+    if unfinished:
         generation = state.get('old')
         if not isinstance(generation, dict):
             raise RuntimeError('credential renewal waits for the unfinished deployment')
@@ -901,16 +925,24 @@ def credential_request(state, root, upload, peer=Path('/etc/superserve/peer')):
     directory = root / 'generations' / generation['id']
     request = json.loads((directory / 'request.json').read_text())
     current = (peer / 'current').resolve(strict=True).name
-    if state['phase'] in TERMINAL_PHASES:
+    if not unfinished:
         if (directory / 'credential-generation').read_text() == current:
             return None
-        request['rollout'] = 'credentials-' + hashlib.sha256(
-            (generation['id'] + ':' + current + ':' + state.get('rollout', '')).encode()).hexdigest()[:32]
+        request['rollout'] = credential_rollout_id(generation['id'], current, state.get('rollout', ''))
         request['credential_generation'] = current
         atomic(root / 'credential-request.json', request)
     else:
-        request = json.loads((root / 'credential-request.json').read_text())
-        if request['rollout'] != state['rollout']:
+        request = dict(state['_credential_request']) if '_credential_request' in state else json.loads(
+            (root / 'credential-request.json').read_text())
+        recovery = state.get('_credential_recovery')
+        expected_rollout = state['rollout']
+        if recovery is not None:
+            expected_rollout = credential_rollout_id(
+                generation['id'], recovery['credential_generation'], state['rollout'])
+            if (recovery['previous_rollout'] != state['rollout']
+                    or request.get('credential_generation') != recovery['credential_generation']):
+                raise RuntimeError('credential recovery request does not match saved recovery')
+        if request['rollout'] != expected_rollout:
             raise RuntimeError('credential recovery request does not match durable rollout identity')
         baseline = json.loads((directory / 'request.json').read_text())
         immutable = (set(request) | set(baseline)) - {'rollout', 'credential_generation'}
@@ -923,13 +955,11 @@ def credential_request(state, root, upload, peer=Path('/etc/superserve/peer')):
         candidate_id = state.get('candidate', {}).get('id', '')
         candidate = root / 'generations' / candidate_id if candidate_id else None
         if (request.get('credential_generation') != current
-                and state['phase'] in CREDENTIAL_RECOVERABLE_PHASES
-                and candidate is not None and candidate.exists()):
-            previous_rollout = request['rollout']
-            request['rollout'] = 'credentials-' + hashlib.sha256(
-                (generation['id'] + ':' + current + ':' + previous_rollout).encode()).hexdigest()[:32]
+                and (recovery is not None or (state['phase'] in CREDENTIAL_RECOVERABLE_PHASES
+                     and candidate is not None and candidate.exists()))):
+            previous_rollout = state['rollout']
+            request['rollout'] = credential_rollout_id(generation['id'], current, previous_rollout)
             request['credential_generation'] = current
-            atomic(root / 'credential-request.json', request)
             state['_credential_recovery'] = {
                 'previous_rollout': previous_rollout,
                 'credential_generation': current,
@@ -937,11 +967,13 @@ def credential_request(state, root, upload, peer=Path('/etc/superserve/peer')):
         elif (request.get('credential_generation') != current
               and (candidate is None or not candidate.exists())):
             request['credential_generation'] = current
-            atomic(root / 'credential-request.json', request)
+        # Persist the request with its recovery marker on the next owned state
+        # save. Until then the previous request remains safe to regenerate.
+        state['_credential_request'] = request
     shutil.copyfile(directory / 'proxy', upload / 'proxy')
     shutil.copyfile(directory / 'unit.template', upload / 'proxy.service')
     atomic(upload / 'request.json', request)
-    if state['phase'] not in TERMINAL_PHASES:
+    if unfinished:
         # Keep the durable retry fence aligned with a regenerated credential
         # request. The code revision, environment and unit remain unchanged;
         # only the published credential generation is allowed to move. Retain
@@ -1080,6 +1112,8 @@ def deploy_locked(args, config, config_hash, host, state, state_path, instance_i
                                            ('project', 'zone', 'instance', 'ip', 'routes')},
                          bootstrap=args.bootstrap, target=target,
                          retired_rollouts=retired_rollouts(state))
+            if rollout.startswith('credentials-'):
+                state['_credential_request'] = request
             if recovery is not None and previous_owner_identity:
                 state['_credential_previous_request_hash'] = previous_owner_identity
                 state['_credential_previous_rollout'] = previous_owner_rollout
