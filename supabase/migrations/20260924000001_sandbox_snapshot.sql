@@ -120,19 +120,30 @@ CREATE INDEX IF NOT EXISTS sandbox_snapshot_template
     ON sandbox_snapshot (template_id)
     WHERE deleted_at IS NULL AND status IN ('creating', 'ready');
 
--- Pre-built by hand on a populated database (see the header). IF NOT EXISTS
--- would still take the table's exclusive lock before looking, which a busy
--- sandbox table does not grant within the timeout; the catalog is checked
--- first so the pre-built path takes no lock at all.
+-- The sandbox lock is taken only when it is free: a queued request would
+-- hold every new sandbox query behind it while it waits, and a busy table
+-- rarely drains within the timeout. Once held it covers the rest of this
+-- transaction, all of it milliseconds.
 DO $$
+DECLARE
+  tries int := 0;
 BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'sandbox' AND column_name = 'source_snapshot_id'
-  ) THEN
-    ALTER TABLE sandbox ADD COLUMN source_snapshot_id uuid;
-  END IF;
+  LOOP
+    BEGIN
+      LOCK TABLE sandbox IN ACCESS EXCLUSIVE MODE NOWAIT;
+      RETURN;
+    EXCEPTION WHEN lock_not_available THEN
+      tries := tries + 1;
+      IF tries >= 80 THEN
+        RAISE;
+      END IF;
+      PERFORM pg_sleep(0.1);
+    END;
+  END LOOP;
 END $$;
+
+ALTER TABLE sandbox
+    ADD COLUMN IF NOT EXISTS source_snapshot_id uuid;
 
 -- NOT VALID: adding the key is then metadata only. Validation scans the
 -- sandbox table and runs in the next migration, under a lock that does not
@@ -150,9 +161,8 @@ END $$;
 COMMENT ON COLUMN sandbox.source_snapshot_id IS
   'Snapshot this sandbox was created from; NULL when created from a template.';
 
--- Same catalog-first check for the index: an interrupted concurrent
--- pre-build leaves an INVALID index that must not be silently kept, and a
--- valid one must not cost the table lock a plain CREATE INDEX takes.
+-- An interrupted concurrent pre-build leaves an INVALID index that must
+-- not be silently kept; a valid one is left alone.
 DO $$
 BEGIN
   IF EXISTS (
