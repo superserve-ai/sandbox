@@ -4,6 +4,7 @@ name: Control-plane identity rollout
 # identity-changing apply cannot be followed by an unchecked revision route.
 concurrency:
   group: control-plane-deploy
+  queue: max
   cancel-in-progress: false
 
 on:

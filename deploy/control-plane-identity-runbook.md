@@ -41,6 +41,10 @@ Automatic Terraform CD runs a plan-time identity guard for all three serving
 cells and refuses any control-plane service-account transition before apply.
 Use the staged identity rollout for that transition; ordinary image and
 infrastructure changes may resume automatically after the staged cutover.
+Production CD pins traffic before creating its saved plan and checks that the
+plan retains 100% traffic on the captured revision. All deployment paths use
+the same multi-run queue so an active identity rollout does not cause the
+API and Terraform workflows waiting behind it to replace each other.
 
 ## Migration order
 

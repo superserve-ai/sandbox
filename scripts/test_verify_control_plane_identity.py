@@ -1,9 +1,13 @@
 import importlib.util
+import io
 import json
+import os
+from contextlib import redirect_stderr
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -298,6 +302,93 @@ class KmsOwnershipTests(unittest.TestCase):
         source = (root / "scripts/verify-control-plane-kms.sh").read_text()
         self.assertIn("gcloud kms encrypt", source)
         self.assertIn("gcloud kms decrypt", source)
+
+
+class RuntimeIamRolloutTests(unittest.TestCase):
+    def run_verifier(self, runtime_analysis):
+        identity = "reader@example-project.iam.gserviceaccount.com"
+        deployer = "deployer@example-project.iam.gserviceaccount.com"
+        manifest = "templates/template/build/generation/manifest.json"
+        service = {
+            "spec": {"template": {"spec": {"serviceAccountName": identity}}},
+            "status": {"latestReadyRevisionName": "api-new", "traffic": [{"revisionName": "api-new", "percent": 100}]},
+        }
+        responses = {
+            "service": service,
+            "latest-ready-revision": {"spec": {"serviceAccountName": identity}},
+            "own-template-list": manifest,
+            "manifest-read": {"files": [{"object": "memory.pack"}]},
+            "bucket-iam": {"bindings": []},
+            "project-iam": {"bindings": []},
+            "service-account-iam": {"bindings": [
+                {"role": role, "members": [f"serviceAccount:{deployer}"]}
+                for role in ("roles/iam.serviceAccountUser", "roles/iam.serviceAccountTokenCreator")
+            ]},
+            "host-effective-iam-1": {"fullyExplored": True},
+            "effective-iam": runtime_analysis,
+            "route-latest": "",
+            "traffic-after-route": service,
+            "latest-revision": {"spec": {"serviceAccountName": identity}},
+        }
+        commands = []
+
+        def command(evidence, name, argv, **kwargs):
+            commands.append(name)
+            evidence.index.append({"name": name, "status": "PASS"})
+            if "policy-troubleshoot" in argv:
+                result = {"access": "NOT_GRANTED"}
+            elif name.startswith("managed-folder-iam-"):
+                result = {"bindings": [{"role": "roles/storage.objectViewer", "members": [f"serviceAccount:{identity}"]}]}
+            elif kwargs.get("expect_denied") or name.startswith("referenced-read-"):
+                result = ""
+            else:
+                result = responses[name]
+            return result if isinstance(result, str) else json.dumps(result)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            contract_path = root / "contract.json"
+            contract_path.write_text(json.dumps({
+                "runtime_service_account": identity, "legacy_runtime_account": "legacy@example.com",
+                "deployment_identity": deployer, "backup_bucket": "own-cell",
+                "backup_object_prefix": "templates/", "backup_object_prefixes": ["templates/", "bases/"],
+                "backup_permissions": ["storage.objects.get", "storage.objects.list"],
+                "secret_ids": [], "host_identities_unchanged": ["host@example.com"],
+            }))
+            argv = [str(SPEC.origin), "--cell", "example", "--project", "example-project",
+                    "--region", "example-region", "--service", "api", "--contract-file", str(contract_path),
+                    "--evidence-dir", str(root / "evidence"), "--other-bucket", "other-cell",
+                    "--allow-pending-traffic", "--route-traffic"]
+            previous_umask = os.umask(0o077)
+            try:
+                with patch.object(sys, "argv", argv), patch.object(VERIFY.Evidence, "command", command), redirect_stderr(io.StringIO()):
+                    status = VERIFY.main()
+            finally:
+                os.umask(previous_umask)
+            return status, json.loads((root / "evidence/evidence.json").read_text()), commands
+
+    def test_incomplete_runtime_iam_fails_evidence_and_never_routes(self):
+        for response in (
+            {}, "invalid JSON", {"fullyExplored": False},
+            {"fullyExplored": True, "nonCriticalErrors": [{"cause": "PERMISSION_DENIED"}]},
+            {"fullyExplored": True, "mainAnalysis": {"fullyExplored": False}},
+        ):
+            with self.subTest(response=response):
+                status, evidence, commands = self.run_verifier(response)
+                self.assertEqual(status, 1)
+                self.assertEqual(evidence["status"], "FAIL")
+                runtime = next(check for check in evidence["checks"] if check["name"] == "effective-iam")
+                self.assertEqual(runtime["status"], "FAIL")
+                self.assertNotIn("route-latest", commands)
+
+    def test_complete_runtime_iam_with_intended_grants_allows_routing(self):
+        status, evidence, commands = self.run_verifier({
+            "fullyExplored": True,
+            "mainAnalysis": {"fullyExplored": True, "analysisResults": [{"iamBinding": {"role": "roles/storage.objectViewer"}}]},
+        })
+        self.assertEqual(status, 0)
+        self.assertEqual(evidence["status"], "PASS")
+        self.assertIn("route-latest", commands)
 
 
 if __name__ == "__main__":

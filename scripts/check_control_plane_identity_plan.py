@@ -50,9 +50,36 @@ def changed_identity(plan: dict[str, Any]) -> tuple[str, str | None, str | None]
     return None
 
 
+def traffic_is_pinned(plan: dict[str, Any], revision: str) -> bool:
+    """Reject a service update that could restore LATEST from a saved plan."""
+    for resource in plan.get("resource_changes", []):
+        if not isinstance(resource, dict) or resource.get("address") != API_RESOURCE:
+            continue
+        change = resource.get("change", {})
+        if not isinstance(change, dict):
+            return False
+        after = change.get("after")
+        if not isinstance(after, dict):
+            return False
+        traffic = after.get("traffic")
+        if not isinstance(traffic, list) or any(not isinstance(target, dict) for target in traffic):
+            return False
+        active = [target for target in traffic if target.get("percent", 0) != 0]
+        if len(active) != 1:
+            return False
+        target = active[0]
+        return (
+            target.get("type") == "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION"
+            and target.get("revision") == revision
+            and target.get("percent") == 100
+        )
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cell", required=True)
+    parser.add_argument("--pinned-revision")
     args = parser.parse_args()
     try:
         plan = json.load(sys.stdin)
@@ -63,6 +90,13 @@ def main() -> int:
         print(f"cannot inspect Terraform plan for {args.cell}: expected an object", file=sys.stderr)
         return 2
 
+    if args.pinned_revision and not traffic_is_pinned(plan, args.pinned_revision):
+        print(
+            f"Saved Terraform plan for {args.cell} does not keep 100% traffic on "
+            f"{args.pinned_revision!r}; pin traffic before creating a new plan.",
+            file=sys.stderr,
+        )
+        return 1
     transition = changed_identity(plan)
     if transition is None:
         return 0

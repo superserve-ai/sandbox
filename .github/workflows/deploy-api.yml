@@ -18,6 +18,7 @@ name: Deploy API
 # identity rollout is still applying and verifying its permissions.
 concurrency:
   group: control-plane-deploy
+  queue: max
   cancel-in-progress: false
 
 on:
