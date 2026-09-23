@@ -474,8 +474,8 @@ func TestPlanRestoreMaterializesFork(t *testing.T) {
 	if p := planRestore("", "", true, false); p.action != restoreMaterializeFork {
 		t.Errorf("fork of a standalone disk: %+v", p)
 	}
-	if p := planRestore("/base.ext4", "", true, true); p.action != restoreReuseOverlay {
-		t.Errorf("in-place retry keeps its own overlay: %+v", p)
+	if p := planRestore("/base.ext4", "", true, true); p.action != restoreMaterializeFork {
+		t.Errorf("a fork retry takes fresh copies: %+v", p)
 	}
 }
 
@@ -837,5 +837,62 @@ func TestStandaloneCaptureRefusesWithoutReflink(t *testing.T) {
 	inst.DiskPath = filepath.Join(m.cfg.RunDir, inst.ID, "overlay.ext4")
 	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("standalone capture without reflink: want FailedPrecondition, got %v", err)
+	}
+}
+
+func TestForkOfAFrozenSnapshotOwesItsWake(t *testing.T) {
+	useTempFloor(t)
+	m := newSavedTestManager(t)
+	m.restoreSem = make(chan struct{}, 1)
+	m.netMgr = &fakeNetMgr{}
+	src, _ := seedPausedSource(t, m, false)
+	seedFrozenManifest(t, src.MemFilePath, "saved-token")
+	man, err := m.CreateSavedSnapshot(context.Background(), src.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := uuid.NewString()
+	launched, frozen, token := false, false, ""
+	m.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		launched = true
+		m.mu.RLock()
+		in := m.vms[child]
+		m.mu.RUnlock()
+		in.mu.RLock()
+		frozen = in.SnapshotWorkloadFrozen != nil && *in.SnapshotWorkloadFrozen
+		token = in.FreezeToken
+		in.mu.RUnlock()
+		if !fileExists(WallClockMarkerPath(filepath.Join(m.cfg.SnapshotDir, child, "mem.snap"))) {
+			t.Error("the VM's own manifest was not in place before the launch")
+		}
+		return 0, SupervisionUnit, errors.New("stop before a real launch")
+	}
+	_, _ = m.restoreVMSnapshot(context.Background(), child, "", "", VMConfig{VCPU: 1, MemoryMiB: 1024, SavedSnapshotID: man.SnapshotID}, nil, "", "", "", nil, 0, "")
+	if !launched {
+		t.Fatal("restore did not reach the launch")
+	}
+	if !frozen || token != "saved-token" {
+		t.Fatalf("frozen=%v token=%q; want the snapshot's freeze carried into the launch", frozen, token)
+	}
+}
+
+func TestStrictPresenceForkValidatesTheSnapshotItself(t *testing.T) {
+	useTempFloor(t)
+	m := newSavedTestManager(t)
+	m.restoreSem = make(chan struct{}, 1)
+	m.cfg.RequirePresenceSidecar = "always"
+	src, _ := seedPausedSource(t, m, true)
+	man, err := m.CreateSavedSnapshot(context.Background(), src.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clones := 0
+	m.reflinkFile = func(context.Context, string, string) error {
+		clones++
+		return errors.New("stop at the first copy")
+	}
+	_, err = m.restoreVMSnapshot(context.Background(), uuid.NewString(), "", "", VMConfig{VCPU: 1, MemoryMiB: 1024, SavedSnapshotID: man.SnapshotID}, nil, "", "", "", nil, 0, "")
+	if clones == 0 {
+		t.Fatalf("a valid layered snapshot was refused before any copy: %v", err)
 	}
 }

@@ -689,6 +689,18 @@ func (m *Manager) forkSource(childID string, cfg *VMConfig, snapshotPath, memPat
 	return man, filepath.Join(own, "vmstate.snap"), filepath.Join(own, filepath.Base(man.MemPath)), nil
 }
 
+// savedSnapshotCommitted reports whether the snapshot is still on disk. The
+// caller holds its lock, so the answer holds until the lock is released.
+func savedSnapshotCommitted(man *SavedSnapshotManifest) error {
+	if _, err := os.Stat(filepath.Join(filepath.Dir(man.DiskPath), savedSnapshotManifestName)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return status.Errorf(codes.NotFound, "saved snapshot %s was deleted", man.SnapshotID)
+		}
+		return fmt.Errorf("stat saved snapshot: %w", err)
+	}
+	return nil
+}
+
 // materializeFork gives the VM its own copy of every file the snapshot owns,
 // under the snapshot id lock: a delete either finishes first and is answered
 // not-found, or waits until the VM holds everything it needs. Returns the
@@ -699,21 +711,30 @@ func (m *Manager) materializeFork(ctx context.Context, childID string, man *Save
 		return "", err
 	}
 	defer unlock()
-	if _, err := os.Stat(filepath.Join(filepath.Dir(man.DiskPath), savedSnapshotManifestName)); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", status.Errorf(codes.NotFound, "saved snapshot %s was deleted", man.SnapshotID)
-		}
-		return "", fmt.Errorf("stat saved snapshot: %w", err)
+	if err := savedSnapshotCommitted(man); err != nil {
+		return "", err
 	}
+	return m.materializeForkLocked(ctx, childID, man)
+}
+
+// materializeForkLocked is materializeFork for a caller that holds the
+// snapshot's lock and has checked it is committed.
+func (m *Manager) materializeForkLocked(ctx context.Context, childID string, man *SavedSnapshotManifest) (string, error) {
 	own := filepath.Join(m.cfg.SnapshotDir, childID)
 	if err := os.MkdirAll(own, 0o755); err != nil {
 		return "", fmt.Errorf("create vm snapshot dir: %w", err)
 	}
+	vmstate := filepath.Join(own, "vmstate.snap")
 	memDst := filepath.Join(own, filepath.Base(man.MemPath))
-	files := [][2]string{{man.SnapshotPath, filepath.Join(own, "vmstate.snap")}, {man.MemPath, memDst}}
-	for _, side := range []func(string) string{presence.SidecarPath, layeredBaseSidecarPath, WallClockMarkerPath} {
-		if _, err := os.Stat(side(man.MemPath)); err == nil {
-			files = append(files, [2]string{side(man.MemPath), side(memDst)})
+	files := [][2]string{{man.SnapshotPath, vmstate}, {man.MemPath, memDst}}
+	for _, side := range [][2]string{
+		{man.SnapshotPath + ".overlay", vmstate + ".overlay"},
+		{presence.SidecarPath(man.MemPath), presence.SidecarPath(memDst)},
+		{layeredBaseSidecarPath(man.MemPath), layeredBaseSidecarPath(memDst)},
+		{WallClockMarkerPath(man.MemPath), WallClockMarkerPath(memDst)},
+	} {
+		if _, err := os.Stat(side[0]); err == nil {
+			files = append(files, side)
 		}
 	}
 	clone := m.fileClone()

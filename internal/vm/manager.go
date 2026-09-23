@@ -1065,7 +1065,9 @@ func planRestore(basePath, deltaDir string, fork, reuse bool) restorePlan {
 		p.deltaDir = ""
 	}
 	switch {
-	case fork && !reuse:
+	case fork:
+		// Fresh copies on every attempt: the snapshot is the truth, not what
+		// a prior attempt left behind.
 		p.deltaDir = ""
 		p.action = restoreMaterializeFork
 	case basePath != "" && p.deltaDir != "":
@@ -3456,6 +3458,27 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, ctx.Err()
 	}
 	tSemAcquired := time.Now()
+	// A fork reads what the image says from the snapshot itself, and holds the
+	// snapshot's lock from here until its own copies exist below, so a delete
+	// cannot come between the reading and the copying.
+	metaSnapshot, metaMem := snapshotPath, memPath
+	var unlockFork func()
+	if fork != nil {
+		unlock, err := m.lockSavedSnapshot(ctx, fork.SnapshotID)
+		if err != nil {
+			return nil, err
+		}
+		unlockFork = unlock
+		defer func() {
+			if unlockFork != nil {
+				unlockFork()
+			}
+		}()
+		if err := savedSnapshotCommitted(fork); err != nil {
+			return nil, err
+		}
+		metaSnapshot, metaMem = fork.SnapshotPath, fork.MemPath
+	}
 	// Failed restores return before the first-attempt success block below
 	// records the setup phases; emit whichever stages completed (elapsed for
 	// the in-flight one) so failed attempts — which can consume most of the
@@ -3513,8 +3536,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// inflight = other restores in flight (we already hold a slot, so subtract
 	// it); an uncontended restore reads 0. len >= 1 here, so no underflow.
 	inflight := len(m.restoreSem) - 1
-	warmthPath := memPath
-	if base, ok := readLayeredBase(memPath); ok {
+	warmthPath := metaMem
+	if base, ok := readLayeredBase(metaMem); ok {
 		warmthPath = base
 	}
 	tplAgeSecs := m.templateRestoreAge(warmthPath)
@@ -3527,16 +3550,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	//
 	// Side-car == overlay-mode marker. Fail clean if BasePath is missing
 	// rather than fall through and risk opening an unrelated rootfs.
-	if resourceLimits.BasePath == "" && snapshotPath != "" {
-		if _, err := os.Stat(snapshotPath + ".overlay"); err == nil {
+	if resourceLimits.BasePath == "" && metaSnapshot != "" {
+		if _, err := os.Stat(metaSnapshot + ".overlay"); err == nil {
 			return nil, status.Errorf(codes.FailedPrecondition,
-				"snapshot %q is overlay-mode but no base_path was provided to restore", snapshotPath)
+				"snapshot %q is overlay-mode but no base_path was provided to restore", metaSnapshot)
 		}
 	}
 	// Presence gate for layered overlays (same predicate the layered backend
 	// selection uses below).
-	if _, hasBase := readLayeredBase(memPath); hasBase || isOverlayMemFile(memPath) {
-		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
+	if _, hasBase := readLayeredBase(metaMem); hasBase || isOverlayMemFile(metaMem) {
+		if gerr := m.gateOverlayPresence(metaMem, log); gerr != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
 	}
@@ -3573,7 +3596,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// disk every time, never cached by path: a cache would turn any exception
 	// into a frozen image restored the old way. One small open beside the
 	// sidecar read here; an untrusted manifest refuses before any launch.
-	manifest, merr := imageManifest(memPath)
+	manifest, merr := imageManifest(metaMem)
 	if merr != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
 	}
@@ -3586,7 +3609,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// The floor rises before this host acts on an image that owes a wake,
 		// or a rollback could later meet the image with nothing to witness it.
 		if err := m.ensureWakeFloorTimed("restore"); err != nil {
-			return nil, status.Errorf(codes.Unavailable, "image %q owes a wake and the rollback floor could not be recorded on this host: %v", memPath, err)
+			return nil, status.Errorf(codes.Unavailable, "image %q owes a wake and the rollback floor could not be recorded on this host: %v", metaMem, err)
 		}
 	}
 	restoreToken, restoreArtifactID := "", ""
@@ -3700,7 +3723,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	case restoreLegacyResolve:
 		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
 	case restoreMaterializeFork:
-		diskPath, diskErr = m.materializeFork(ctx, vmID, fork)
+		diskPath, diskErr = m.materializeForkLocked(ctx, vmID, fork)
 	}
 	if diskErr != nil {
 		tFailBoundary = time.Now()
@@ -3709,6 +3732,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		return nil, diskErr
+	}
+	if unlockFork != nil {
+		unlockFork()
+		unlockFork = nil
 	}
 	tDiskReady = time.Now()
 
