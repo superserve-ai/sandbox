@@ -67,7 +67,7 @@ locals {
     backup_permissions      = ["storage.objects.get", "storage.objects.list"]
     secret_ids              = sort(tolist(local.controlplane_secret_ids))
     kms_key_resource        = null
-    kms_grant_owner         = "central KMS policy owner (out-of-band)"
+    kms_grant_owner         = null
     host_identity_unchanged = module.iam.service_account_emails["superserve_api"]
     host_identities_unchanged = [
       module.iam.service_account_emails["superserve_api"],

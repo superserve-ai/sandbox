@@ -20,9 +20,10 @@ outputs from each environment root. The output includes the runtime identity,
 bucket, allowed storage permissions and reader object prefixes, secret IDs, deployment
 identity, deployment act-as and token-creation permissions, KMS grant principal
 and role, and KMS owner. The KMS key is the shared credentials key for both production
-cells; its `roles/cloudkms.cryptoKeyEncrypterDecrypter` grant is applied by the
-central owner through the rollout workflow (outside the production Terraform
-identity) before either production cutover.
+cells; each production Terraform root already owns its runtime identity's
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` grant. The shared-key bootstrap
+provides the deployment principal's key-scoped IAM administration separately;
+this rollout does not change that bootstrap or require another owner identity.
 
 The serving identities must never be attached to a VMD instance. VMD grants
 remain environment-owned: staging's legacy host keeps its existing writer
@@ -32,10 +33,9 @@ part of this migration.
 
 The regular production API deployment workflows update Cloud Run with
 `--no-traffic`, then run `scripts/verify-control-plane-kms.sh`. That check
-uses the centrally authorized owner to apply the per-runtime
-`roles/cloudkms.cryptoKeyEncrypterDecrypter` binding, verifies every production
-Secret Manager binding as that same runtime identity, and performs an
-encrypt/decrypt round trip before the workflow routes the revision.
+verifies access to every production runtime secret and performs an
+encrypt/decrypt round trip as the runtime identity before the workflow routes
+the revision. It does not change IAM policy.
 
 Automatic Terraform CD runs a plan-time identity guard for all three serving
 cells and refuses any control-plane service-account transition before apply.
@@ -50,28 +50,26 @@ infrastructure changes may resume automatically after the staged cutover.
    `reader_members` entry.
 2. Run the manually confirmed
    `.github/workflows/control-plane-identity-rollout.yml` with `confirm=apply`.
-   Production environments must provide the centrally authorized
-   `KMS_POLICY_OWNER_SERVICE_ACCOUNT` secret; the deployment identity only
-   impersonates that owner for the key binding. Before rollout, the central KMS
-   policy owner must grant the environment deployment identity
-   `roles/iam.serviceAccountTokenCreator` on that owner service account; this
-   cross-root grant is out-of-band because production Terraform cannot manage
-   the KMS policy owner. Terraform grants the same token-creation role on each
+   Terraform grants the deployment principal scoped token creation on each
    dedicated runtime identity so the verifier can run its GCS, Secret Manager,
-   and runtime KMS probes.
+   and runtime KMS probes. No separate KMS-owner secret is required.
    The workflow is deliberately serial: staging, production use4, then
    production usw2. Each stage captures the serving revision before apply,
-   applies and validates its Terraform plan, verifies the deployed identity,
+   validates its saved Terraform plan, then applies it and verifies the deployed identity,
    retains the full evidence privately, and uploads only a sanitized summary.
-   A failed stage blocks later cells.
+   The plan guard rejects all VM, persistent-disk, disk-attachment, and host
+   identity-adapter changes, including staging's legacy host. Handle any such
+   maintenance separately; this rollout must not restart hosts. A failed stage
+   blocks later cells.
 3. For each production stage, Terraform first creates the new identity and
-   revision without routing traffic to it. The central KMS owner grant is then
-   applied before cutover. The verifier gates the stage on a runtime-identity
+   revision without routing traffic to it and manages its existing KMS grant.
+   The verifier gates the stage on a runtime-identity
    KMS encrypt/decrypt round trip as well as same-cell manifest/reference
-   reads, cross-cell list denial, non-mutating IAM Policy Troubleshooter
-   checks for sandbox and cross-cell sandbox/template object-get denial plus create and delete denial, Secret
-   Manager access, effective IAM analysis, deployment act-as, and the
-   centrally owned KMS binding. It also requires the latest ready revision to
+   reads, cross-cell root and prefix list denial, non-mutating IAM Policy
+   Troubleshooter checks for own-cell sandbox reads, own-cell mutations, and
+   cross-cell reads and mutations across all three prefixes, Secret Manager
+   access, fully explored effective IAM analysis, deployment act-as, and the
+   Terraform-managed KMS binding. It also requires the latest ready revision to
    have 100% traffic under the dedicated identity.
 4. Keep the old shared production runner grants until both old revisions are
    drained and the dependency audit below is complete. The workflow's failure
@@ -129,17 +127,18 @@ For each cell, record the command output and timestamp in the rollout record:
 python3 scripts/verify-control-plane-identity.py \
   --cell CELL --project PROJECT --region REGION --service SERVICE \
   --contract-file CONTRACT.json --evidence-dir EVIDENCE_DIR \
-  --kms-owner KMS_POLICY_OWNER_SERVICE_ACCOUNT \
   --other-bucket OTHER_CELL_BUCKET
 ```
 
 The verifier discovers the actual generation `manifest.json` object, reads
 each referenced artifact, and uses IAM Policy Troubleshooter to confirm that
-the runtime identity is denied `storage.objects.get` for synthetic objects
-under `sandboxes/` in its own and every other cell's bucket and under
-`templates/` in every other cell's bucket. It also confirms denial of
-`storage.objects.create` for a synthetic object under `templates/` and
-`storage.objects.delete` on the live manifest. These checks are non-mutating,
+the runtime identity is denied `storage.objects.get` under `sandboxes/` in
+its own bucket and under `templates/`, `bases/`, and `sandboxes/` in every
+other cell's bucket. It confirms denial of `storage.objects.create` and
+`storage.objects.delete` for synthetic objects under all three prefixes in
+its own and every other cell's bucket, plus deletion of the live manifest.
+It also requires list denial at each cross-cell prefix, not just the bucket
+root. These object-permission checks are non-mutating,
 so retries cannot turn a create check into an overwrite check or alter a
 customer artifact. A missing object is not a negative IAM result.
 

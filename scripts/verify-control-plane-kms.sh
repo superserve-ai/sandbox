@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# Grant and verify the production control-plane KMS prerequisite before routing
-# a new Cloud Run revision. The deployment identity impersonates the centrally
-# authorized KMS policy owner; the explicitly expected runtime identity is
-# checked against Cloud Run and performs the secret/KMS probes.
+# Verify runtime KMS and secret access before routing a new Cloud Run revision.
+# Terraform owns IAM grants; this probe never changes policy.
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 --project PROJECT --region REGION --service SERVICE --runtime-service-account SERVICE_ACCOUNT --kms-key-resource RESOURCE --kms-owner SERVICE_ACCOUNT --evidence-dir DIR [--secret SECRET_ID ...]" >&2
+  echo "usage: $0 --project PROJECT --region REGION --service SERVICE --runtime-service-account SERVICE_ACCOUNT --kms-key-resource RESOURCE --evidence-dir DIR [--secret SECRET_ID ...]" >&2
   exit 2
 }
 
@@ -15,7 +13,6 @@ REGION=""
 SERVICE=""
 RUNTIME_IDENTITY=""
 KMS_KEY_RESOURCE=""
-KMS_OWNER=""
 EVIDENCE_DIR=""
 SECRET_IDS=()
 
@@ -26,14 +23,13 @@ while [[ $# -gt 0 ]]; do
     --service) SERVICE=${2:-}; shift 2 ;;
     --runtime-service-account) RUNTIME_IDENTITY=${2:-}; shift 2 ;;
     --kms-key-resource) KMS_KEY_RESOURCE=${2:-}; shift 2 ;;
-    --kms-owner) KMS_OWNER=${2:-}; shift 2 ;;
     --evidence-dir) EVIDENCE_DIR=${2:-}; shift 2 ;;
     --secret) SECRET_IDS+=("${2:-}"); shift 2 ;;
     *) usage ;;
   esac
 done
 
-[[ -n "$PROJECT" && -n "$REGION" && -n "$SERVICE" && -n "$RUNTIME_IDENTITY" && -n "$KMS_KEY_RESOURCE" && -n "$KMS_OWNER" && -n "$EVIDENCE_DIR" ]] || usage
+[[ -n "$PROJECT" && -n "$REGION" && -n "$SERVICE" && -n "$RUNTIME_IDENTITY" && -n "$KMS_KEY_RESOURCE" && -n "$EVIDENCE_DIR" ]] || usage
 mkdir -p "$EVIDENCE_DIR"
 
 observed_identity=$(gcloud run services describe "$SERVICE" \
@@ -54,24 +50,6 @@ else
   echo "invalid KMS crypto-key resource: $KMS_KEY_RESOURCE" >&2
   exit 1
 fi
-
-gcloud kms keys add-iam-policy-binding "$key_name" \
-  --keyring="$keyring" --location="$key_location" \
-  --member="serviceAccount:${RUNTIME_IDENTITY}" \
-  --role="roles/cloudkms.cryptoKeyEncrypterDecrypter" \
-  --impersonate-service-account="$KMS_OWNER" \
-  --project="$key_project" \
-  >"$EVIDENCE_DIR/kms-grant.stdout" 2>"$EVIDENCE_DIR/kms-grant.stderr"
-
-gcloud kms keys get-iam-policy "$key_name" \
-  --keyring="$keyring" --location="$key_location" --project="$key_project" \
-  --impersonate-service-account="$KMS_OWNER" --format=json \
-  >"$EVIDENCE_DIR/kms-policy.json"
-jq -e \
-  --arg role "roles/cloudkms.cryptoKeyEncrypterDecrypter" \
-  --arg member "serviceAccount:${RUNTIME_IDENTITY}" \
-  'any(.bindings[]?; .role == $role and ((.members // []) | index($member) != null))' \
-  "$EVIDENCE_DIR/kms-policy.json" >/dev/null
 
 probe_dir=$(mktemp -d)
 trap 'rm -rf "$probe_dir"' EXIT
@@ -104,7 +82,7 @@ done
 cat >"$EVIDENCE_DIR/kms-prerequisite.txt" <<EOF
 status=passed-before-cutover
 observed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-owner=$KMS_OWNER
+grant_owner=terraform
 identity=$RUNTIME_IDENTITY
 key=$KMS_KEY_RESOURCE
 role=roles/cloudkms.cryptoKeyEncrypterDecrypter

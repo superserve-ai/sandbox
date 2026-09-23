@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -15,6 +16,14 @@ SPEC.loader.exec_module(VERIFY)
 
 
 class ManifestObjectResolutionTests(unittest.TestCase):
+    def test_object_listing_recurses_below_each_prefix(self):
+        for prefix in ("", "templates/", "bases/", "sandboxes/"):
+            with self.subTest(prefix=prefix):
+                command = VERIFY.storage_list_command("cell-backups", prefix, "reader@example.com")
+                self.assertEqual(command[:4], ["gcloud", "storage", "objects", "list"])
+                self.assertIn(f"gs://cell-backups/{prefix}**", command)
+                self.assertIn("--impersonate-service-account=reader@example.com", command)
+
     def test_uploader_manifest_resolves_generation_local_and_shared_objects(self):
         manifest = """{
           "generation": "gen-123",
@@ -95,6 +104,46 @@ class DeletePermissionProbeTests(unittest.TestCase):
 
 
 class ObjectReadPermissionProbeTests(unittest.TestCase):
+    def test_denial_matrix_covers_every_prefix_and_cell(self):
+        manifest = "templates/tpl/build/gen/manifest.json"
+        checks = VERIFY.storage_denial_checks("own", ["east", "west"], manifest)
+        observed = {(bucket, name, permission) for _, bucket, name, permission in checks}
+        expected = {
+            (bucket, f"{prefix}/.permission-probe", f"storage.objects.{operation}")
+            for bucket, operations in (
+                ("own", ("create", "delete")),
+                ("east", ("get", "create", "delete")),
+                ("west", ("get", "create", "delete")),
+            )
+            for prefix in ("templates", "bases", "sandboxes")
+            for operation in operations
+        }
+        expected.add(("own", "sandboxes/.permission-probe", "storage.objects.get"))
+        expected.add(("own", manifest, "storage.objects.delete"))
+        self.assertEqual(observed, expected)
+        self.assertEqual(len({check[0] for check in checks}), len(checks))
+
+    def test_all_denial_probes_reject_grants_and_unknown_results_without_mutating(self):
+        checks = VERIFY.storage_denial_checks("own", ["other"], "templates/t/b/g/manifest.json")
+        for response in ('{"access":"GRANTED"}', '{"access":"UNKNOWN_INFO"}', '{}', 'null', 'invalid'):
+            for name, bucket, object_name, permission in checks:
+                with self.subTest(name=name, response=response), tempfile.TemporaryDirectory() as directory:
+                    evidence = VERIFY.Evidence(Path(directory))
+
+                    def command(check_name, argv, **_kwargs):
+                        self.assertEqual(argv[:3], ["gcloud", "policy-troubleshoot", "iam"])
+                        self.assertIn(VERIFY.storage_object_resource(bucket, object_name), argv)
+                        self.assertIn(f"--permission={permission}", argv)
+                        evidence.index.append({"name": check_name, "status": "PASS"})
+                        return response
+
+                    evidence.command = command
+                    with self.assertRaises(VERIFY.VerificationError):
+                        VERIFY.require_permission_denied(
+                            evidence, name, "reader@example.com", bucket, object_name, permission,
+                        )
+                    self.assertEqual(evidence.index[-1]["status"], "FAIL")
+
     def test_sandbox_get_probe_is_non_mutating_and_fails_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             evidence = VERIFY.Evidence(Path(directory))
@@ -181,6 +230,74 @@ class EffectiveIamCommandTests(unittest.TestCase):
         )
         self.assertIn("--project=example-project", command)
         self.assertNotIn("--scope=projects/example-project", command)
+
+
+class EffectiveIamCompletenessTests(unittest.TestCase):
+    def test_complete_empty_results_allow_protobuf_omission(self):
+        for analysis in ({"fullyExplored": True}, {"fullyExplored": True, "analysisResults": []}):
+            self.assertEqual(VERIFY.iam_analysis_results(json.dumps(analysis)), [])
+            self.assertEqual(VERIFY.iam_analysis_results(json.dumps({
+                "fullyExplored": True, "mainAnalysis": analysis,
+                "serviceAccountImpersonationAnalysis": [analysis],
+            })), [])
+
+    def test_every_analysis_must_explicitly_be_complete(self):
+        for incomplete in ({}, {"fullyExplored": False}, {"fullyExplored": "true"}, {"fullyExplored": 1}):
+            for document in (
+                incomplete,
+                {**incomplete, "mainAnalysis": {"fullyExplored": True}},
+                {"fullyExplored": True, "mainAnalysis": incomplete},
+                {"fullyExplored": True, "mainAnalysis": {"fullyExplored": True},
+                 "serviceAccountImpersonationAnalysis": [incomplete]},
+            ):
+                with self.subTest(document=document), self.assertRaises(VERIFY.VerificationError):
+                    VERIFY.iam_analysis_results(json.dumps(document))
+
+    def test_errors_and_malformed_results_are_rejected(self):
+        for document in (
+            [], None,
+            {"fullyExplored": True, "analysisResults": {}},
+            {"fullyExplored": True, "nonCriticalErrors": [{"cause": "PERMISSION_DENIED"}]},
+            {"fullyExplored": True, "nonCriticalErrors": {}},
+            {"fullyExplored": True, "mainAnalysis": None},
+            {"fullyExplored": True, "mainAnalysis": {"fullyExplored": True, "nonCriticalErrors": [{}]}},
+            {"fullyExplored": True, "serviceAccountImpersonationAnalysis": []},
+            {"fullyExplored": True, "mainAnalysis": {"fullyExplored": True},
+             "serviceAccountImpersonationAnalysis": {}},
+            {"fullyExplored": True, "mainAnalysis": {"fullyExplored": True},
+             "serviceAccountImpersonationAnalysis": [{"fullyExplored": True, "analysisResults": None}]},
+        ):
+            with self.subTest(document=document), self.assertRaises(VERIFY.VerificationError):
+                VERIFY.iam_analysis_results(json.dumps(document))
+        with self.assertRaises(VERIFY.VerificationError):
+            VERIFY.iam_analysis_results("invalid JSON")
+
+    def test_direct_and_impersonation_grants_are_preserved_for_rejection(self):
+        for key in ("mainAnalysis", "serviceAccountImpersonationAnalysis"):
+            document = {"fullyExplored": True, "mainAnalysis": {"fullyExplored": True}}
+            grant = {"fullyExplored": True, "analysisResults": [{"identity": "host"}]}
+            document[key] = [grant] if key == "serviceAccountImpersonationAnalysis" else grant
+            self.assertEqual(VERIFY.iam_analysis_results(json.dumps(document)), [{"identity": "host"}])
+
+
+class KmsOwnershipTests(unittest.TestCase):
+    def test_deployments_only_verify_terraform_owned_grants(self):
+        root = Path(__file__).resolve().parents[1]
+        for path in (
+            "scripts/verify-control-plane-kms.sh",
+            "scripts/verify-control-plane-identity.py",
+            ".github/workflows/control-plane-identity-rollout.yml",
+            ".github/workflows/deploy-api.yml",
+            ".github/workflows/terraform-cd.yml",
+        ):
+            with self.subTest(path=path):
+                source = (root / path).read_text()
+                self.assertNotIn("KMS_POLICY_OWNER_SERVICE_ACCOUNT", source)
+                self.assertNotIn("--kms-owner", source)
+                self.assertNotIn("gcloud kms keys add-iam-policy-binding", source)
+        source = (root / "scripts/verify-control-plane-kms.sh").read_text()
+        self.assertIn("gcloud kms encrypt", source)
+        self.assertIn("gcloud kms decrypt", source)
 
 
 if __name__ == "__main__":
