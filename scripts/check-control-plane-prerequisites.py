@@ -81,23 +81,6 @@ def contract_from_plan(plan):
     return contract
 
 
-def check_template_references(evidence, bucket):
-    listed = evidence.command("template-list", VERIFY.gcloud(
-        "storage", "objects", "list", f"gs://{bucket}/templates/**", "--format=value(name)",
-    ))
-    manifest = next((name for name in listed.splitlines() if VERIFY.TEMPLATE_MANIFEST.fullmatch(name)), None)
-    require(manifest is not None, "No template generation manifest exists")
-    text = evidence.command("template-manifest", VERIFY.gcloud("storage", "cat", f"gs://{bucket}/{manifest}"))
-    prefix = manifest.rsplit("/", 1)[0]
-    references = list(dict.fromkeys(VERIFY.object_name(ref, bucket, prefix) for ref in VERIFY.manifest_references(text)))
-    references = [ref for ref in references if ref != manifest]
-    require(bool(references), "Template manifest has no referenced artifacts")
-    for index, ref in enumerate(references, 1):
-        evidence.command(f"template-reference-{index}", VERIFY.gcloud(
-            "storage", "objects", "describe", f"gs://{bucket}/{ref}", "--format=json",
-        ))
-
-
 def check_prerequisites(args, contract, preflight):
     evidence = preflight.evidence
     command = preflight.command
@@ -120,7 +103,6 @@ def check_prerequisites(args, contract, preflight):
     command("project-policy", VERIFY.gcloud("projects", "get-iam-policy", args.project, "--format=json"))
     for index, target in enumerate([bucket, *args.other_bucket], 1):
         command(f"bucket-policy-{index}", VERIFY.gcloud("storage", "buckets", "get-iam-policy", f"gs://{target}", "--format=json"))
-    preflight.check("template-references", lambda: check_template_references(evidence, bucket))
 
     # These probes check whether tooling can reach a definite decision. Current
     # grants may change during the regional apply; the cutover verifier still

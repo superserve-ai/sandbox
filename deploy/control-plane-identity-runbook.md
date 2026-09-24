@@ -126,7 +126,7 @@ The prerequisite jobs read the desired contract from a fresh Terraform plan;
 production does not need a previously applied contract output. They check API
 availability, the actual caller, rollback revision, own/cross-project policy
 visibility and complete IAM tooling analysis (including group/impersonation expansion),
-template manifest/reference availability, enabled latest secret versions, and
+enabled latest secret versions, and
 production KMS policy/primary-version readiness. Failed probes retry together
 six times with ten seconds between rounds, preserving private attempt evidence.
 Unknown policies and incomplete analyses block migration. Public artifacts contain
@@ -140,6 +140,8 @@ explicit isolation denials, runtime secret/artifact reads and KMS round trips,
 and scoped deployment impersonation before routing the candidate. In particular,
 production's pending managed folders and token-creator grants are created by the
 existing regional Terraform; the prerequisite job does not demand them early.
+Template manifests and referenced artifacts are read only by the post-apply
+runtime verifier, so preflight does not require deployment-account payload access.
 
 ### Inherited policy visibility
 
