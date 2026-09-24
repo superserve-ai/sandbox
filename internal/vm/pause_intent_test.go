@@ -207,3 +207,41 @@ func TestCompletedPauseIntentClearsItself(t *testing.T) {
 		t.Error("intent still present after the resume")
 	}
 }
+
+func TestStagedIntentIsJournalledBehindItsFloor(t *testing.T) {
+	origPath := stagedIntentEvidencePath
+	t.Cleanup(func() {
+		stagedIntentEvidencePath = origPath
+		stagedIntentEvidenceDurable.Store(false)
+	})
+	stagedIntentEvidenceDurable.Store(false)
+	host := t.TempDir()
+	stagedIntentEvidencePath = filepath.Join(host, "staged-intent-evidence")
+	dir := filepath.Join(t.TempDir(), "vm-1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeStagedIntent(dir, pauseIntent{VMID: "vm-1", ArtifactID: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stagedIntentEvidencePath); err != nil {
+		t.Fatalf("intent journalled without the floor: %v", err)
+	}
+	in, err := readPauseIntent(dir)
+	if err != nil || in == nil || !in.Staged {
+		t.Fatalf("intent = %+v, %v; want a staged intent", in, err)
+	}
+	// A floor that cannot be raised refuses the intent.
+	stagedIntentEvidenceDurable.Store(false)
+	stagedIntentEvidencePath = filepath.Join(host, "missing", "evidence")
+	other := filepath.Join(t.TempDir(), "vm-2")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeStagedIntent(other, pauseIntent{VMID: "vm-2", ArtifactID: "b"}); err == nil {
+		t.Fatal("intent journalled although the floor could not be raised")
+	}
+	if in, _ := readPauseIntent(other); in != nil {
+		t.Error("an intent was left behind a floor that is not up")
+	}
+}

@@ -94,3 +94,14 @@ variable "provisioning_hosts" {
   type        = set(string)
   default     = []
 }
+
+variable "build_host_id" {
+  description = "Registered HOST_ID of the active host used for template builds and default routing."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = length(trimspace(var.build_host_id)) > 0
+    error_message = "build_host_id must identify the active registered host."
+  }
+}

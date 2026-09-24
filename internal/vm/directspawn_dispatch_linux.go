@@ -116,6 +116,9 @@ func (m *Manager) launchFirecrackerImpl(ctx context.Context, vmID, socketPath, p
 // group and wait it empty, then rmdir; unit mode: the existing systemd stop.
 // Idempotent — a missing group or unit is a no-op.
 func (m *Manager) stopVM(ctx context.Context, vmID string, supervision Supervision) error {
+	if m.stopVMHook != nil {
+		return m.stopVMHook(ctx, vmID, supervision)
+	}
 	if !knownSupervision(supervision) {
 		// Dispatching unknown to the unit path would no-op against a
 		// nonexistent unit and report the stop clean.

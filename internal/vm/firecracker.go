@@ -358,11 +358,16 @@ const (
 // containing dirty blocks — required to create sandboxes from this template.
 // mode=SnapshotFlatten bakes those deltas into base.ext4 (see SnapshotMode).
 func CreateSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, mode SnapshotMode) error {
+	return CreateSnapshotContext(context.Background(), socketPath, snapshotPath, memPath, blockDeltaDir, mode)
+}
+
+// CreateSnapshotContext is CreateSnapshot bounded by ctx: a Firecracker that
+// stops answering cannot hold the caller past its deadline.
+func CreateSnapshotContext(ctx context.Context, socketPath, snapshotPath, memPath, blockDeltaDir string, mode SnapshotMode) error {
 	if mode == SnapshotFlatten && blockDeltaDir == "" {
 		return fmt.Errorf("SnapshotFlatten requires non-empty blockDeltaDir")
 	}
 	fc := newFCClient(socketPath)
-	ctx := context.Background()
 
 	// Pause the VM.
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
@@ -445,8 +450,12 @@ func VMState(ctx context.Context, socketPath string) (string, error) {
 }
 
 func CreateDiffSnapshot(socketPath, snapshotPath, memPath, expectedSessionID string) error {
+	return CreateDiffSnapshotContext(context.Background(), socketPath, snapshotPath, memPath, expectedSessionID)
+}
+
+// CreateDiffSnapshotContext is CreateDiffSnapshot bounded by ctx.
+func CreateDiffSnapshotContext(ctx context.Context, socketPath, snapshotPath, memPath, expectedSessionID string) error {
 	fc := newFCClient(socketPath)
-	ctx := context.Background()
 
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
 		Context: ctx,

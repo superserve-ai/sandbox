@@ -97,7 +97,7 @@ curl -sf http://127.0.0.1:8888/metrics | rg '^otelcol_'
 
 ### Staging rollout
 
-Staging is the only environment enabled in Terraform for app-side OTEL export in Phase 2. Cloud Run sends OTLP to `http://10.0.0.2:4318`, which is the staging VMD host's internal IP.
+Staging is the only environment enabled in Terraform for app-side OTEL export in Phase 2. Cloud Run sends OTLP to `http://10.0.0.3:4318`, which is the active staging VMD host's internal IP (Host B).
 
 Required staging runtime env:
 
@@ -105,7 +105,7 @@ Required staging runtime env:
 OTEL_METRICS_ENABLED=true
 OTEL_SERVICE_NAME=sandbox-controlplane
 OTEL_ENVIRONMENT=staging
-OTEL_EXPORTER_OTLP_ENDPOINT=http://10.0.0.2:4318
+OTEL_EXPORTER_OTLP_ENDPOINT=http://10.0.0.3:4318
 OTEL_EXPORT_INTERVAL=15s
 ```
 

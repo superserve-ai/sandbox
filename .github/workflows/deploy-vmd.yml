@@ -71,6 +71,8 @@ on:
       - 'deploy/superserve-vmd-rollback-guard.conf'
       - 'deploy/vmd-wake-floor-guard'
       - 'deploy/superserve-vmd-wake-floor-guard.conf'
+      - 'deploy/vmd-staged-intent-floor-guard'
+      - 'deploy/superserve-vmd-staged-intent-floor-guard.conf'
       - 'deploy/superserve-vmd-start-generation.conf'
       - 'deploy/superserve-secretsproxy.service'
       - 'deploy/firecracker@.service'

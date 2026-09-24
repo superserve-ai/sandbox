@@ -119,6 +119,9 @@ type VMInstance struct {
 	DiskPath         string
 	SnapshotPath     string
 	MemFilePath      string
+	// SourceSnapshotID names the saved snapshot this VM was created from, so
+	// a retried create recognizes it without the snapshot, which may be gone.
+	SourceSnapshotID string
 	// CorrectsWallClock records whether this guest fixes its own wall clock on
 	// wake, resolved once when it was restored. Cached so pause never has to go
 	// to the filesystem to find out. Nil means unresolved — a record written by a
@@ -265,6 +268,9 @@ type VMConfig struct {
 	// DeltaDir hydrates a fresh per-VM overlay from <dir>/rootfs.delta on
 	// restore. Empty for in-place resume of an already-populated overlay.
 	DeltaDir string
+	// SavedSnapshotID names a saved snapshot to create this VM from; every
+	// file it owns becomes the VM's own before use. See materializeFork.
+	SavedSnapshotID string
 }
 
 // ManagerConfig holds paths and settings for the VM manager.
@@ -371,6 +377,10 @@ type ManagerConfig struct {
 	// GuestFreezeBudget bounds the pause-side wait for a guest to stop its
 	// workload before a frozen-clock snapshot. Zero means the default.
 	GuestFreezeBudget time.Duration
+
+	// SavedSnapshotConcurrency caps concurrent saved-snapshot captures per
+	// host. Zero means the default.
+	SavedSnapshotConcurrency int
 
 	// GuestClockFreezeEnabled lets a restore ask Firecracker to freeze the guest's
 	// monotonic clock across the snapshot instead of advancing it by the time the
@@ -512,6 +522,8 @@ type Manager struct {
 	// launchFirecrackerHook is a test seam. When set, launchFirecracker
 	// delegates to it instead of the platform-specific implementation.
 	launchFirecrackerHook func(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error)
+	// stopVMHook is the same kind of seam for stopVM.
+	stopVMHook func(ctx context.Context, vmID string, supervision Supervision) error
 	// restoreForResumeHook is a test seam for the snapshot restore step.
 	restoreForResumeHook func(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, trackingSessionID string, err error)
 	// restoreSnapshotHook is the restore path's.
@@ -693,6 +705,15 @@ type Manager struct {
 	// holds the lock until destroy SIGKILLs the process), so blocking it
 	// would turn a recoverable wedge into a permanent hang.
 	vmOpLocks sync.Map
+
+	// Saved-snapshot captures in flight, bounded per host; see acquireSavedCapture.
+	savedCaptures     chan struct{}
+	savedReserved     atomic.Int64 // bytes admitted captures still expect to write
+	savedCapturesOnce sync.Once
+	savedIDMu         sync.Mutex
+	savedIDLocks      map[string]*savedIDLock // see lockSavedSnapshot
+	// reflinkFile stands in for the exact file clone in tests.
+	reflinkFile func(ctx context.Context, src, dst string) error
 
 	// launchGenSeq issues launch generations. It is manager-global and
 	// monotonic on purpose: a per-instance counter restarts at zero whenever
@@ -1025,9 +1046,10 @@ func TemplateMagicOverlayPath(runDir string) string {
 type restoreDiskAction int
 
 const (
-	restoreCreateOverlay restoreDiskAction = iota // overlay clone of a template
-	restoreReuseOverlay                           // existing per-VM overlay (resume)
-	restoreLegacyResolve                          // legacy non-overlay path
+	restoreCreateOverlay   restoreDiskAction = iota // overlay clone of a template
+	restoreReuseOverlay                             // existing per-VM overlay (resume)
+	restoreLegacyResolve                            // legacy non-overlay path
+	restoreMaterializeFork                          // the VM's own copies of a saved snapshot's files
 )
 
 // restorePlan is planRestore's output — pure decision, no I/O.
@@ -1039,7 +1061,7 @@ type restorePlan struct {
 // planRestore picks the disk action + delta_dir for a restore. createOverlay
 // requires ALL of {basePath, deltaDir, !inPlace} — anything missing means
 // we'd be cloning over an existing per-VM file, so fall back to reuse.
-func planRestore(basePath, deltaDir string, reuse bool) restorePlan {
+func planRestore(basePath, deltaDir string, fork, reuse bool) restorePlan {
 	p := restorePlan{deltaDir: deltaDir}
 	if reuse {
 		// fc's delta-apply truncates the overlay; force empty to stop a
@@ -1048,6 +1070,11 @@ func planRestore(basePath, deltaDir string, reuse bool) restorePlan {
 		p.deltaDir = ""
 	}
 	switch {
+	case fork:
+		// Fresh copies on every attempt: the snapshot is the truth, not what
+		// a prior attempt left behind.
+		p.deltaDir = ""
+		p.action = restoreMaterializeFork
 	case basePath != "" && p.deltaDir != "":
 		p.action = restoreCreateOverlay
 	case basePath != "":
@@ -3365,7 +3392,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// restore slot (or fails on the semaphore when all slots are busy).
 	// lazyReattach loads a paused VM the background reattach hasn't reached.
 	m.lazyReattach(vmID)
-	if existing, needsVerify := m.retriedLaunchTarget(vmID, snapshotPath, memPath); existing != nil {
+	var existing *VMInstance
+	var needsVerify bool
+	if resourceLimits.SavedSnapshotID != "" {
+		existing, needsVerify = m.retriedForkTarget(vmID, resourceLimits.SavedSnapshotID)
+	} else {
+		existing, needsVerify = m.retriedLaunchTarget(vmID, snapshotPath, memPath)
+	}
+	if existing != nil {
 		// The adopted VM keeps its stamped policy without re-validation, and
 		// the response still attests it: sound only while every vmd generation
 		// that could have served the prior attempt stamps the request's policy
@@ -3417,6 +3451,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
 	}
+	// Only now does a create from a snapshot need the snapshot itself: a
+	// retry of one that completed was answered above, whether or not the
+	// snapshot still exists.
+	var fork *SavedSnapshotManifest
+	if resourceLimits.SavedSnapshotID != "" {
+		var err error
+		fork, snapshotPath, memPath, err = m.forkSource(vmID, &resourceLimits, snapshotPath, memPath)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// A control plane from before preview publication sends the zero-value
 	// policy on restore. Preserve an existing in-memory or sidecar-backed policy
@@ -3444,6 +3489,29 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, ctx.Err()
 	}
 	tSemAcquired := time.Now()
+	// A fork reads what the image says from the snapshot itself, under the
+	// snapshot's lock. The lock is released once the reads are done and taken
+	// again for the copies, which check the snapshot is still the same one,
+	// so neither a prior life's stop nor a second fork of the same snapshot
+	// waits behind this one for longer than its reads.
+	metaSnapshot, metaMem := snapshotPath, memPath
+	var unlockFork func()
+	if fork != nil {
+		unlock, err := m.lockSavedSnapshot(ctx, fork.SnapshotID)
+		if err != nil {
+			return nil, err
+		}
+		unlockFork = unlock
+		defer func() {
+			if unlockFork != nil {
+				unlockFork()
+			}
+		}()
+		if err := savedSnapshotCommitted(fork); err != nil {
+			return nil, err
+		}
+		metaSnapshot, metaMem = fork.SnapshotPath, fork.MemPath
+	}
 	// Failed restores return before the first-attempt success block below
 	// records the setup phases; emit whichever stages completed (elapsed for
 	// the in-flight one) so failed attempts — which can consume most of the
@@ -3501,8 +3569,8 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// inflight = other restores in flight (we already hold a slot, so subtract
 	// it); an uncontended restore reads 0. len >= 1 here, so no underflow.
 	inflight := len(m.restoreSem) - 1
-	warmthPath := memPath
-	if base, ok := readLayeredBase(memPath); ok {
+	warmthPath := metaMem
+	if base, ok := readLayeredBase(metaMem); ok {
 		warmthPath = base
 	}
 	tplAgeSecs := m.templateRestoreAge(warmthPath)
@@ -3515,16 +3583,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	//
 	// Side-car == overlay-mode marker. Fail clean if BasePath is missing
 	// rather than fall through and risk opening an unrelated rootfs.
-	if resourceLimits.BasePath == "" && snapshotPath != "" {
-		if _, err := os.Stat(snapshotPath + ".overlay"); err == nil {
+	if resourceLimits.BasePath == "" && metaSnapshot != "" {
+		if _, err := os.Stat(metaSnapshot + ".overlay"); err == nil {
 			return nil, status.Errorf(codes.FailedPrecondition,
-				"snapshot %q is overlay-mode but no base_path was provided to restore", snapshotPath)
+				"snapshot %q is overlay-mode but no base_path was provided to restore", metaSnapshot)
 		}
 	}
 	// Presence gate for layered overlays (same predicate the layered backend
 	// selection uses below).
-	if _, hasBase := readLayeredBase(memPath); hasBase || isOverlayMemFile(memPath) {
-		if gerr := m.gateOverlayPresence(memPath, log); gerr != nil {
+	if _, hasBase := readLayeredBase(metaMem); hasBase || isOverlayMemFile(metaMem) {
+		if gerr := m.gateOverlayPresence(metaMem, log); gerr != nil {
 			return nil, status.Errorf(codes.FailedPrecondition, "%v", gerr)
 		}
 	}
@@ -3561,7 +3629,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// disk every time, never cached by path: a cache would turn any exception
 	// into a frozen image restored the old way. One small open beside the
 	// sidecar read here; an untrusted manifest refuses before any launch.
-	manifest, merr := imageManifest(memPath)
+	manifest, merr := imageManifest(metaMem)
 	if merr != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "%v", merr)
 	}
@@ -3574,12 +3642,16 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// The floor rises before this host acts on an image that owes a wake,
 		// or a rollback could later meet the image with nothing to witness it.
 		if err := m.ensureWakeFloorTimed("restore"); err != nil {
-			return nil, status.Errorf(codes.Unavailable, "image %q owes a wake and the rollback floor could not be recorded on this host: %v", memPath, err)
+			return nil, status.Errorf(codes.Unavailable, "image %q owes a wake and the rollback floor could not be recorded on this host: %v", metaMem, err)
 		}
 	}
 	restoreToken, restoreArtifactID := "", ""
 	if manifest != nil {
 		restoreToken, restoreArtifactID = manifest.FreezeToken, manifest.ArtifactID
+	}
+	if unlockFork != nil {
+		unlockFork()
+		unlockFork = nil
 	}
 
 	// Sampled before this attempt creates the rundir: a pre-existing rundir
@@ -3593,6 +3665,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.mu.Lock()
 	prevInst, inPlace := m.vms[vmID]
 	prevSupervision := SupervisionUnit
+	var stopErr error
 	if inPlace {
 		prevInst.mu.RLock()
 		prevSupervision = prevInst.Supervision
@@ -3606,7 +3679,17 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// StatusCreating instance takes over the id — no window in which
 		// this VM's resources are invisible to pressure.
 		m.mu.Unlock()
-		_ = m.stopVM(ctx, vmID, prevSupervision)
+		stopErr = m.stopVM(ctx, vmID, prevSupervision)
+		m.mu.Lock()
+	}
+	// A fork replaces the files here, so every life that may own them is
+	// stopped first: the recorded one above and, whatever the record says,
+	// anything under either supervision. A run dir with no record is a fork
+	// this daemon lost before persisting, and a life parked as error after an
+	// unconfirmed stop may run under a supervision its record never had.
+	if fork != nil && (inPlace || priorRunDir) && stopErr == nil {
+		m.mu.Unlock()
+		stopErr = m.stopLeftoverLife(ctx, vmID)
 		m.mu.Lock()
 	}
 
@@ -3622,9 +3705,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// process in a different mode alongside the surviving old one (same
 		// ID, disk, netns, tap). Fresh (non-inPlace) creates keep "" and the
 		// launch chooses by the armed flag.
-		Supervision:  prevSupervision,
-		SnapshotPath: snapshotPath,
-		MemFilePath:  memPath,
+		Supervision:      prevSupervision,
+		SnapshotPath:     snapshotPath,
+		SourceSnapshotID: resourceLimits.SavedSnapshotID,
+		MemFilePath:      memPath,
 		// Kept through the launch: a failure returns a restore from a paused
 		// record to Paused in its place in the reclaim order; the commit clears it.
 		PausedAt: prevPausedAt,
@@ -3659,18 +3743,23 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	freshUnit := m.orphanScanDone.Load() && !inPlace && !priorRunDir &&
 		!isBuildVM(vmID) && !unitMaybeWindingDown(systemdUnitName(vmID))
 
-	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, reuse)
+	plan := planRestore(resourceLimits.BasePath, resourceLimits.DeltaDir, fork != nil, reuse)
 	// Failure cleanup must not delete an overlay this attempt didn't create:
 	// see cleanupRunDirKeepOverlay.
 	cleanupAfterRestoreFailure := func() {
-		if plan.action == restoreReuseOverlay {
+		switch plan.action {
+		case restoreReuseOverlay:
 			m.cleanupRunDirKeepOverlay(vmID)
-		} else {
+		case restoreMaterializeFork:
+			m.cleanupRunDir(vmID)
+			m.cleanupForkCopies(vmID)
+		default:
 			m.cleanupRunDir(vmID)
 		}
 	}
 	var diskPath string
 	var diskErr error
+	diskUntouched := false
 	switch plan.action {
 	case restoreCreateOverlay:
 		diskPath, diskErr = m.createOverlay(vmID, resourceLimits.BasePath)
@@ -3683,9 +3772,29 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 	case restoreLegacyResolve:
 		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
+	case restoreMaterializeFork:
+		if (inPlace || priorRunDir) && stopErr != nil {
+			// A stop that did not confirm may leave a Firecracker that still
+			// owns the files here; replacing them would truncate its disk.
+			diskErr = status.Errorf(codes.Unavailable, "vm %s could not be confirmed stopped before being replaced: %v", vmID, stopErr)
+			diskUntouched = true
+		} else {
+			// Every prior life is confirmed stopped; nothing is left to charge.
+			m.vmStopUnconfirmed.Delete(vmID)
+			diskPath, diskErr = m.materializeFork(ctx, vmID, fork)
+		}
 	}
 	if diskErr != nil {
 		tFailBoundary = time.Now()
+		if diskUntouched {
+			// Nothing of the prior life was touched and its process may
+			// live: keep charging it behind the record until a confirmed stop.
+			m.markUnservable(inst, log)
+			return nil, diskErr
+		}
+		// A run dir left behind makes the retry plan a reuse of the disk
+		// this attempt never finished.
+		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		return nil, diskErr
 	}
@@ -7337,6 +7446,35 @@ func placeBlockMap(blockMap, diskPath string) error {
 	return os.WriteFile(dst, data, 0o644)
 }
 
+// cloneSavedDisk gives the VM its own copy of a saved snapshot's disk. An
+// overlay is reflinked extent-exact or refused, as captureSavedDisk made it;
+// a standalone rootfs may be copied.
+func (m *Manager) cloneSavedDisk(ctx context.Context, dirName, savedDisk, basePath string) (string, error) {
+	vmDir := filepath.Join(m.cfg.RunDir, dirName)
+	if err := os.MkdirAll(vmDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir vm dir: %w", err)
+	}
+	name := "rootfs.ext4"
+	if basePath != "" {
+		name = "overlay.ext4"
+	}
+	clone := reflinkFileExact
+	if m.reflinkFile != nil {
+		clone = m.reflinkFile
+	}
+	dst := filepath.Join(vmDir, name)
+	if err := clone(ctx, savedDisk, dst); err != nil {
+		// A partial file left here would pass a same-id retry as the VM's
+		// existing disk.
+		_ = os.Remove(dst)
+		if errors.Is(err, errNoReflink) {
+			return "", status.Errorf(codes.FailedPrecondition, "saved disk %s needs a reflink filesystem shared with %s: %v", savedDisk, m.cfg.RunDir, err)
+		}
+		return "", fmt.Errorf("clone saved disk: %w", err)
+	}
+	return dst, nil
+}
+
 // createOverlay creates a sparse per-VM overlay file pre-sized to the base
 // — explicit size avoids relying on fc's open-time set_len contract.
 func (m *Manager) createOverlay(dirName, basePath string) (string, error) {
@@ -7416,7 +7554,7 @@ func isLeafName(s string) bool {
 // isReservedRunDirName reports whether name is a shared dir under RunDir
 // (template mount target, build tree) rather than a per-VM dir.
 func isReservedRunDirName(name string) bool {
-	return name == templateDirName || name == TemplatesDirName || name == stallForensicsDirName
+	return name == templateDirName || name == TemplatesDirName || name == stallForensicsDirName || name == SavedSnapshotsDirName
 }
 
 // abortResumeLocked reverts a freshly-resumed VM back to Paused when a
@@ -9020,8 +9158,12 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 	if in.FreezeToken == "" {
 		// An unfrozen rewrite that was interrupted: the images here are
 		// unfrozen or torn, so a manifest beside them that says frozen is
-		// stale either way and must not outlive the intent.
+		// stale either way and must not outlive the intent. A staged write
+		// left them as they were.
 		for _, name := range []string{"mem.diff", "mem.snap"} {
+			if in.Staged {
+				break
+			}
 			if _, err := removeWallClockManifest(filepath.Join(dir, name)); err != nil {
 				log.Error().Err(err).Msg("reattach: a stale frozen manifest beside an interrupted rewrite could not be removed; parking as error")
 				return false

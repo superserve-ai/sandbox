@@ -157,12 +157,23 @@ func RaiseWakeProtocolFloor() error {
 		wakeProtocolEvidenceDurable.Store(true)
 		return nil
 	}
-	tmp := wakeProtocolEvidencePath + ".tmp." + strconv.Itoa(os.Getpid())
+	if err := raiseEvidenceFile(wakeProtocolEvidencePath, wakeProtocolEvidenceNote); err != nil {
+		return err
+	}
+	wakeProtocolEvidenceSeen.Store(true)
+	wakeProtocolEvidenceDurable.Store(true)
+	return nil
+}
+
+// raiseEvidenceFile creates a floor's witness whole and durable: written and
+// synced under a temporary name, renamed into place, the directory synced.
+func raiseEvidenceFile(path, note string) error {
+	tmp := path + ".tmp." + strconv.Itoa(os.Getpid())
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	if _, err := f.WriteString(wakeProtocolEvidenceNote); err != nil {
+	if _, err := f.WriteString(note); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
@@ -176,16 +187,11 @@ func RaiseWakeProtocolFloor() error {
 		os.Remove(tmp)
 		return err
 	}
-	if err := os.Rename(tmp, wakeProtocolEvidencePath); err != nil {
+	if err := os.Rename(tmp, path); err != nil {
 		os.Remove(tmp)
 		return err
 	}
-	if err := syncDir(filepath.Dir(wakeProtocolEvidencePath)); err != nil {
-		return err
-	}
-	wakeProtocolEvidenceSeen.Store(true)
-	wakeProtocolEvidenceDurable.Store(true)
-	return nil
+	return syncDir(filepath.Dir(path))
 }
 
 var ErrWallClockManifest = errors.New("wall-clock manifest unreadable")

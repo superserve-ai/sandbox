@@ -642,11 +642,13 @@ func main() {
 		switch os.Args[1] {
 		case "capabilities":
 			// Advertised so rollback tooling can detect a downgrade to a binary
-			// that lacks cgroup supervision, or the wake protocol frozen images
-			// depend on. Env-free by design; the literals are what the deploy
-			// guard greps the binary for, so they must stay verbatim.
+			// that lacks cgroup supervision, the wake protocol frozen images
+			// depend on, or the staged intents a capture journals. Env-free by
+			// design; the literals are what the deploy guard greps the binary
+			// for, so they must stay verbatim.
 			fmt.Println("cgroup-supervision")
 			fmt.Println(vm.WakeProtocolCapability)
+			fmt.Println(vm.StagedIntentCapability)
 			return
 		case "raise-wake-floor":
 			// Operator step before the first frozen image can exist anywhere:
@@ -817,6 +819,10 @@ func main() {
 	templateFreezeWorkload := envOrDefault("VMD_TEMPLATE_FREEZE_WORKLOAD", "false") == "true"
 	// Pause-side wait for the guest to stop its workload before a frozen-clock
 	// snapshot; only paid when the restore would freeze the clock.
+	savedSnapshotConcurrency := 0
+	if n, err := strconv.Atoi(envOrDefault("VMD_SAVED_SNAPSHOT_CONCURRENCY", "0")); err == nil {
+		savedSnapshotConcurrency = n
+	}
 	guestFreezeBudget := 500 * time.Millisecond
 	if v := envOrDefault("VMD_GUEST_FREEZE_BUDGET_MS", ""); v != "" {
 		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
@@ -999,6 +1005,7 @@ func main() {
 		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
 		TemplateFreezeWorkload:              templateFreezeWorkload,
 		GuestFreezeBudget:                   guestFreezeBudget,
+		SavedSnapshotConcurrency:            savedSnapshotConcurrency,
 		RequirePresenceSidecar:              requirePresenceSidecar,
 		PausedNetworkReclaimEnabled:         pausedNetworkReclaimEnabled,
 		PausedNetworkSlotHeadroomPercent:    pausedNetworkSlotHeadroomPercent,
@@ -1020,6 +1027,7 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
 	}
+	mgr.SweepSavedSnapshotStaging(log)
 
 	// ---- TCP egress proxy ----
 	// Must be set before ReattachAll or any VM operations so domain
