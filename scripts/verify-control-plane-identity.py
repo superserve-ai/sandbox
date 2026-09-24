@@ -16,6 +16,7 @@ import posixpath
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -28,6 +29,12 @@ OBJECT_URI = re.compile(r"gs://[^\"'\s,]+|(?:templates|bases)/[A-Za-z0-9_./-]+")
 TEMPLATE_MANIFEST = re.compile(
     r"templates/[^/]+/[^/]+/[^/]+/manifest\.json"
 )
+IMPERSONATION_FAILURE = re.compile(
+    r"failed to impersonate|iam\.serviceAccounts\.(?:getAccessToken|implicitDelegation)",
+    re.IGNORECASE,
+)
+RUNTIME_IAM_RETRY_SECONDS = 420
+RUNTIME_IAM_RETRY_INTERVAL = 15
 
 
 class VerificationError(RuntimeError):
@@ -62,8 +69,51 @@ class Evidence:
         (self.root / "commands").mkdir(exist_ok=True)
         self.index: list[dict[str, object]] = []
         self.sequence = 0
+        self.runtime_retry_deadline: float | None = None
 
     def command(
+        self,
+        name: str,
+        argv: list[str],
+        *,
+        expect_denied: bool = False,
+        redact_stdout: bool = False,
+        stream_stdout: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> str:
+        runtime_probe = any(arg.startswith("--impersonate-service-account=") for arg in argv)
+        attempts = []
+        while True:
+            try:
+                value = self._command_once(
+                    name, argv, expect_denied=expect_denied,
+                    redact_stdout=redact_stdout, stream_stdout=stream_stdout, env=env,
+                )
+            except VerificationError:
+                check = self.index[-1]
+                retryable = runtime_probe and check["permission_denied_observed"] and (
+                    not expect_denied or check["impersonation_failed"]
+                )
+                if retryable:
+                    now = time.monotonic()
+                    if self.runtime_retry_deadline is None:
+                        # Fresh Terraform grants can take minutes to propagate.
+                        # Share one retry window across the cell's runtime probes.
+                        self.runtime_retry_deadline = now + RUNTIME_IAM_RETRY_SECONDS
+                    delay = min(RUNTIME_IAM_RETRY_INTERVAL, self.runtime_retry_deadline - now)
+                    if delay > 0:
+                        attempts.append(self.index.pop())
+                        print(f"{name}: waiting for runtime IAM propagation; retrying in {delay:g}s", flush=True)
+                        time.sleep(delay)
+                        continue
+                if attempts:
+                    check["attempts"] = attempts
+                raise
+            if attempts:
+                self.index[-1]["attempts"] = attempts
+            return value
+
+    def _command_once(
         self,
         name: str,
         argv: list[str],
@@ -109,7 +159,8 @@ class Evidence:
         (self.root / "commands" / f"{stem}.stderr").write_text(stderr)
         observed = observed_stdout + stderr
         denied = bool(PERMISSION_DENIED.search(observed))
-        passed = (result.returncode != 0 and denied) if expect_denied else result.returncode == 0
+        impersonation_failed = bool(IMPERSONATION_FAILURE.search(observed))
+        passed = (result.returncode != 0 and denied and not impersonation_failed) if expect_denied else result.returncode == 0
         self.index.append(
             {
                 "name": name,
@@ -119,6 +170,7 @@ class Evidence:
                 "stdout_redacted": redact_stdout,
                 "stdout_streamed": stream_stdout,
                 "permission_denied_observed": denied,
+                "impersonation_failed": impersonation_failed,
                 "status": "PASS" if passed else "FAIL",
             }
         )

@@ -2,7 +2,7 @@ import importlib.util
 import io
 import json
 import os
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import sys
 import tempfile
@@ -79,6 +79,98 @@ class BinaryArtifactProbeTests(unittest.TestCase):
                 "probe stderr",
             )
             self.assertTrue(evidence.index[0]["stdout_streamed"])
+
+
+class RuntimePropagationTests(unittest.TestCase):
+    runtime_argv = VERIFY.storage_list_command("cell-backups", "templates/", "reader@example.com")
+    mint_denial = "PERMISSION_DENIED: Failed to impersonate reader; iam.serviceAccounts.getAccessToken denied"
+    storage_denial = "ERROR: Permission denied: storage.objects.list"
+
+    def exercise(self, replies, probes):
+        elapsed = [0]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            elapsed[0] += seconds
+
+        def run(argv, **kwargs):
+            code, stdout, stderr = replies.pop(0)
+            return VERIFY.subprocess.CompletedProcess(argv, code, stdout, stderr)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(VERIFY.subprocess, "run", side_effect=run) as calls, \
+                patch.object(VERIFY.time, "monotonic", side_effect=lambda: elapsed[0]), \
+                patch.object(VERIFY.time, "sleep", side_effect=sleep), \
+                patch.object(VERIFY, "RUNTIME_IAM_RETRY_SECONDS", 30), \
+                redirect_stdout(io.StringIO()):
+            evidence = VERIFY.Evidence(Path(directory))
+            outcomes = []
+            for name, argv, options in probes:
+                try:
+                    outcomes.append(evidence.command(name, argv, **options))
+                except VERIFY.VerificationError:
+                    outcomes.append(None)
+            evidence.write_index("PASS" if all(value is not None for value in outcomes) else "FAIL")
+            saved = json.loads((Path(directory) / "evidence.json").read_text())
+            files = {path.name: path.read_text() for path in (Path(directory) / "commands").iterdir()}
+            return outcomes, saved, files, sleeps, calls.call_count
+
+    def test_new_token_and_storage_grants_can_propagate_with_attempt_evidence(self):
+        outcomes, saved, files, sleeps, calls = self.exercise([
+            (1, "", self.mint_denial), (1, "", self.storage_denial), (0, "manifest\n", ""),
+        ], [("own-template-list", self.runtime_argv, {})])
+        self.assertEqual(outcomes, ["manifest\n"])
+        self.assertEqual(saved["status"], "PASS")
+        self.assertEqual([row["status"] for row in saved["checks"]], ["PASS"])
+        self.assertEqual([row["status"] for row in saved["checks"][0]["attempts"]], ["FAIL", "FAIL"])
+        self.assertIn(self.mint_denial, files["01-own-template-list.stderr"])
+        self.assertEqual(sleeps, [15, 15])
+        self.assertEqual(calls, 3)
+
+    def test_permanent_denial_exhausts_shared_window_and_stays_failed(self):
+        outcomes, saved, _, sleeps, calls = self.exercise([
+            (1, "", self.mint_denial), (0, "manifest", ""),
+            (1, "", self.storage_denial), (1, "", self.storage_denial),
+        ], [("own-template-list", self.runtime_argv, {}), ("manifest-read", self.runtime_argv, {})])
+        self.assertEqual(outcomes, ["manifest", None])
+        self.assertEqual(saved["status"], "FAIL")
+        self.assertEqual([row["status"] for row in saved["checks"]], ["PASS", "FAIL"])
+        self.assertEqual(len(saved["checks"][1]["attempts"]), 1)
+        self.assertEqual(sum(sleeps), 30)
+        self.assertEqual(calls, 4)
+
+    def test_impersonation_failure_is_not_an_isolation_denial(self):
+        for replies, expected in (
+            ([(1, "", self.mint_denial)] * 3, "FAIL"),
+            ([(1, "", self.mint_denial), (1, "", self.storage_denial)], "PASS"),
+        ):
+            with self.subTest(expected=expected):
+                _, saved, _, _, _ = self.exercise(replies, [
+                    ("cross-cell-list-denied", self.runtime_argv, {"expect_denied": True}),
+                ])
+                self.assertEqual(saved["status"], expected)
+                self.assertEqual(saved["checks"][0]["status"], expected)
+
+    def test_unexpected_access_non_iam_errors_and_traffic_writes_do_not_retry(self):
+        for reply, argv, options in (
+            ((0, "unexpected-object", ""), self.runtime_argv, {"expect_denied": True}),
+            ((1, "", "connection reset"), self.runtime_argv, {}),
+            ((1, "", self.storage_denial), ["gcloud", "run", "services", "update-traffic"], {}),
+        ):
+            with self.subTest(reply=reply):
+                _, saved, _, sleeps, calls = self.exercise([reply], [("probe", argv, options)])
+                self.assertEqual(saved["status"], "FAIL")
+                self.assertEqual(sleeps, [])
+                self.assertEqual(calls, 1)
+
+    def test_retried_secret_output_remains_redacted(self):
+        _, saved, files, _, _ = self.exercise([
+            (1, "partial-secret", self.storage_denial), (0, "full-secret", ""),
+        ], [("secret-access", self.runtime_argv, {"redact_stdout": True})])
+        self.assertEqual(saved["status"], "PASS")
+        self.assertEqual(files["01-secret-access.stdout"], "<redacted>\n")
+        self.assertEqual(files["02-secret-access.stdout"], "<redacted>\n")
 
 
 class KmsOwnershipTests(unittest.TestCase):
