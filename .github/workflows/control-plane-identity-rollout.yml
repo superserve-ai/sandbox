@@ -16,6 +16,7 @@ on:
         type: string
 
 env:
+  TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
   CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
 
 jobs:

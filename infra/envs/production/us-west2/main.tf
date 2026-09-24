@@ -181,6 +181,8 @@ module "api" {
   cpu_idle = false
 
   env = {
+    COMPUTE_RESTRICTIONS_FILE = "${local.controlplane_secret_volumes.compute-restrictions.mount_path}/${local.controlplane_secret_volumes.compute-restrictions.path}"
+
     API_PORT               = "8080"
     EDGE_PROXY_DOMAIN      = "usw-sandbox.superserve.ai"
     SANDBOX_ID_REGION      = "usw"
@@ -215,7 +217,8 @@ module "api" {
     DEFAULT_HOST_ID = local.metrics_host_id
   }
 
-  secrets = local.controlplane_secrets
+  secrets        = local.controlplane_secrets
+  secret_volumes = local.controlplane_secret_volumes
 
   vpc_connector  = null
   vpc_egress     = "PRIVATE_RANGES_ONLY"
@@ -227,6 +230,7 @@ module "api" {
 
   depends_on = [
     google_secret_manager_secret_iam_member.controlplane_runtime_secrets,
+    google_secret_manager_secret_iam_member.controlplane_runtime_secret_volumes,
     google_kms_crypto_key_iam_member.controlplane_credentials,
     google_project_iam_member.controlplane_metric_writer,
     google_service_account_iam_member.controlplane_deploy_act_as,

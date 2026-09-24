@@ -74,3 +74,16 @@ needed. After deployment, recheck the Vanta control for every production host
 and retain the sanitized plan as evidence. The plan command documented here is
 review-only; the repository's explicitly authorized production workflows can
 apply Terraform changes after their normal approval gates.
+
+## Compute restriction configuration
+
+Both production API roots require `TF_VAR_compute_restrictions_secret_name` to
+identify an existing Secret Manager secret with an enabled `latest` version.
+Set the `COMPUTE_RESTRICTIONS_SECRET_NAME` GitHub Actions repository secret for
+CI and deployment workflows; export the Terraform variable for local plans.
+Missing or empty configuration fails the production plan rather than removing
+the enforcement mount. Staging does not use this input.
+
+Operators manage the JSON versions separately. Terraform manages the runtime
+access grants, read-only file mount, and `COMPUTE_RESTRICTIONS_FILE` path without
+reading or storing the restriction contents.
