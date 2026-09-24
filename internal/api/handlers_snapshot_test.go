@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,8 +29,8 @@ import (
 // generated queries (see internal/db/models.go).
 func sandboxSnapshotRow(s db.SandboxSnapshot) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
-		if len(dest) != 27 {
-			return fmt.Errorf("sandbox_snapshot scan wants 27 columns, got %d", len(dest))
+		if len(dest) != 28 {
+			return fmt.Errorf("sandbox_snapshot scan wants 28 columns, got %d", len(dest))
 		}
 		*dest[0].(*uuid.UUID) = s.ID
 		*dest[1].(*uuid.UUID) = s.TeamID
@@ -58,6 +59,7 @@ func sandboxSnapshotRow(s db.SandboxSnapshot) *mockRow {
 		*dest[24].(*time.Time) = s.CreatedAt
 		*dest[25].(*pgtype.Timestamptz) = s.ReadyAt
 		*dest[26].(*pgtype.Timestamptz) = s.DeletedAt
+		*dest[27].(*time.Time) = s.SweepAfter
 		return nil
 	}}
 }
@@ -134,8 +136,6 @@ func TestCreateSandboxSnapshotCapturesAndAnswersReady(t *testing.T) {
 			switch {
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sb)
-			case strings.Contains(sql, "-- name: CountTeamSnapshotsCreating :one"):
-				return countRow(0)
 			case strings.Contains(sql, "-- name: CreateSandboxSnapshot :one"):
 				inserted = snapshotFixture(teamID, sandboxID, "creating")
 				inserted.ID = args[0].(uuid.UUID)
@@ -222,16 +222,24 @@ func TestCreateSandboxSnapshotMapsQuotaAndIdempotentReplay(t *testing.T) {
 	key := "deploy-42"
 	existing.IdempotencyKey = &key
 	insertErr := error(&pgconn.PgError{Code: snapshotQuotaErrCode, Message: "snapshot quota exceeded"})
+	keyOnFile := false
+	inserts, loadedSandbox := 0, 0
 	mock := &mockDBTX{
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
+				loadedSandbox++
 				return sandboxRow(sb)
-			case strings.Contains(sql, "-- name: CountTeamSnapshotsCreating :one"):
-				return countRow(1)
 			case strings.Contains(sql, "-- name: CreateSandboxSnapshot :one"):
+				inserts++
+				if pe, ok := insertErr.(*pgconn.PgError); ok && pe.Code == "23505" {
+					keyOnFile = true
+				}
 				return errRow(insertErr)
 			case strings.Contains(sql, "-- name: GetSandboxSnapshotByIdempotencyKey :one"):
+				if !keyOnFile {
+					return errRow(pgx.ErrNoRows)
+				}
 				return sandboxSnapshotRow(existing)
 			}
 			return errRow(fmt.Errorf("unexpected query: %s", sql))
@@ -244,21 +252,92 @@ func TestCreateSandboxSnapshotMapsQuotaAndIdempotentReplay(t *testing.T) {
 	}}
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	r := snapshotRouter(h, teamID)
+	post := func(body map[string]any) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, jsonReq(http.MethodPost, "/sandboxes/"+sandboxID.String()+"/snapshot", body))
+		return w
+	}
+	errCode := func(w *httptest.ResponseRecorder) string {
+		return parseJSON(t, w)["error"].(map[string]any)["code"].(string)
+	}
 
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, jsonReq(http.MethodPost, "/sandboxes/"+sandboxID.String()+"/snapshot", map[string]any{"kind": "fs"}))
-	if w.Code != http.StatusTooManyRequests || parseJSON(t, w)["error"].(map[string]any)["code"] != "too_many_snapshots" {
+	// The limits are the trigger's verdict, one code each.
+	if w := post(map[string]any{"kind": "fs"}); w.Code != http.StatusTooManyRequests || errCode(w) != "too_many_snapshots" {
 		t.Fatalf("quota: status=%d body=%s", w.Code, w.Body.String())
 	}
+	insertErr = &pgconn.PgError{Code: snapshotInFlightErrCode, Message: "snapshots in flight limit reached"}
+	if w := post(map[string]any{"kind": "fs"}); w.Code != http.StatusTooManyRequests || errCode(w) != "too_many_snapshots_in_flight" {
+		t.Fatalf("in flight: status=%d body=%s", w.Code, w.Body.String())
+	}
 
+	// Two first requests with one key: the loser re-reads the winner's row.
 	insertErr = &pgconn.PgError{Code: "23505", ConstraintName: "sandbox_snapshot_idempotency"}
-	w = httptest.NewRecorder()
-	r.ServeHTTP(w, jsonReq(http.MethodPost, "/sandboxes/"+sandboxID.String()+"/snapshot", map[string]any{"kind": "mem+fs", "idempotency_key": key}))
-	if w.Code != http.StatusOK || parseJSON(t, w)["id"] != existing.ID.String() {
+	if w := post(map[string]any{"kind": "mem+fs", "idempotency_key": key}); w.Code != http.StatusOK || parseJSON(t, w)["id"] != existing.ID.String() {
+		t.Fatalf("replay after a lost race: status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// A key on file is answered before the source or the limits are looked
+	// at: the same replay works with the team at its limits and the source
+	// gone, and never inserts or captures.
+	insertErr, loadedSandbox, inserts = &pgconn.PgError{Code: snapshotInFlightErrCode}, 0, 0
+	sb.Status = db.SandboxStatusDeleted
+	if w := post(map[string]any{"kind": "mem+fs", "idempotency_key": key}); w.Code != http.StatusOK || parseJSON(t, w)["id"] != existing.ID.String() {
 		t.Fatalf("replay: status=%d body=%s", w.Code, w.Body.String())
 	}
+	if loadedSandbox != 0 || inserts != 0 {
+		t.Fatalf("replay loaded the sandbox %d time(s) and inserted %d time(s); want neither", loadedSandbox, inserts)
+	}
+	existing.Status, existing.DeletedAt = "deleting", pgtype.Timestamptz{Time: time.Now(), Valid: true}
+	if w := post(map[string]any{"kind": "mem+fs", "idempotency_key": key}); w.Code != http.StatusGone || errCode(w) != "gone" {
+		t.Fatalf("replay of a deleted snapshot: status=%d body=%s; want 410", w.Code, w.Body.String())
+	}
 	if captured != 0 {
-		t.Fatalf("the host was asked %d time(s); a refused insert must never capture", captured)
+		t.Fatalf("the host was asked %d time(s); a refused insert or a replay must never capture", captured)
+	}
+}
+
+func TestCreateSandboxSnapshotLeavesALostAnswerToTheSweep(t *testing.T) {
+	teamID, sandboxID := uuid.New(), uuid.New()
+	base := "/base.ext4"
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusActive, HostID: "host-1", BasePath: &base, VcpuCount: 1, MemoryMib: 1024, DiskMib: 4096}
+	failed, released := false, false
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandbox :one"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "-- name: CreateSandboxSnapshot :one"):
+				row := snapshotFixture(teamID, sandboxID, "creating")
+				row.ID = args[0].(uuid.UUID)
+				return sandboxSnapshotRow(row)
+			}
+			return errRow(fmt.Errorf("unexpected query: %s", sql))
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			switch {
+			case strings.Contains(sql, "-- name: MarkSandboxSnapshotFailed :execrows"):
+				failed = true
+			case strings.Contains(sql, "-- name: ReleaseSandboxSnapshotCapture :execrows"):
+				released = true
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	hostCleaned := false
+	vmd := &stubVMD{
+		createSavedFn: func(context.Context, string, string, string) (vmdclient.SavedSnapshot, error) {
+			return vmdclient.SavedSnapshot{}, status.Error(codes.Unavailable, "connection reset while the capture ran")
+		},
+		deleteSavedFn: func(context.Context, string) error { hostCleaned = true; return nil },
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	snapshotRouter(h, teamID).ServeHTTP(w, jsonReq(http.MethodPost, "/sandboxes/"+sandboxID.String()+"/snapshot", nil))
+	if w.Code != http.StatusAccepted || parseJSON(t, w)["status"] != "creating" || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("status=%d retry-after=%q body=%s; want 202 with the row still creating", w.Code, w.Header().Get("Retry-After"), w.Body.String())
+	}
+	if failed || hostCleaned || !released {
+		t.Fatalf("failed=%v hostCleaned=%v released=%v; a lost answer must destroy nothing and hand the row to the sweep", failed, hostCleaned, released)
 	}
 }
 
@@ -272,8 +351,6 @@ func TestCreateSandboxSnapshotFailsTheRowWhenTheHostCannot(t *testing.T) {
 			switch {
 			case strings.Contains(sql, "-- name: GetSandbox :one"):
 				return sandboxRow(sb)
-			case strings.Contains(sql, "-- name: CountTeamSnapshotsCreating :one"):
-				return countRow(0)
 			case strings.Contains(sql, "-- name: CreateSandboxSnapshot :one"):
 				row := snapshotFixture(teamID, sandboxID, "creating")
 				row.ID = args[0].(uuid.UUID)
@@ -416,26 +493,43 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 	teamID, sandboxID := uuid.New(), uuid.New()
 	committed := snapshotFixture(teamID, sandboxID, "creating")
 	gone := snapshotFixture(teamID, sandboxID, "creating")
+	lost := snapshotFixture(teamID, sandboxID, "creating")
 	deleting := snapshotFixture(teamID, sandboxID, "deleting")
+	// Settled by another sweep and deleted by the user while this sweep's
+	// capture was in flight: the capture made the files again.
+	revived := snapshotFixture(teamID, sandboxID, "creating")
 	var readied, failed, deleted []uuid.UUID
+	var mu sync.Mutex
 	mock := &mockDBTX{
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
-			if strings.Contains(sql, "-- name: ListStuckSandboxSnapshots :many") {
-				return &scriptedRows{rows: []*mockRow{sandboxSnapshotRow(committed), sandboxSnapshotRow(gone), sandboxSnapshotRow(deleting)}}, nil
+			if strings.Contains(sql, "-- name: ClaimStuckSandboxSnapshots :many") {
+				return &scriptedRows{rows: []*mockRow{sandboxSnapshotRow(committed), sandboxSnapshotRow(gone), sandboxSnapshotRow(lost), sandboxSnapshotRow(deleting), sandboxSnapshotRow(revived)}}, nil
 			}
 			return nil, fmt.Errorf("unexpected query: %s", sql)
 		},
 		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
-			if strings.Contains(sql, "-- name: MarkSandboxSnapshotReady :one") {
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case strings.Contains(sql, "-- name: MarkSandboxSnapshotReady :one"):
 				id := args[len(args)-1].(uuid.UUID)
+				if id == revived.ID {
+					return errRow(pgx.ErrNoRows)
+				}
 				readied = append(readied, id)
 				r := committed
 				r.ID, r.Status = id, "ready"
+				return sandboxSnapshotRow(r)
+			case strings.Contains(sql, "-- name: GetSandboxSnapshotUnscoped :one"):
+				r := revived
+				r.Status, r.DeletedAt = "deleting", pgtype.Timestamptz{Time: time.Now(), Valid: true}
 				return sandboxSnapshotRow(r)
 			}
 			return errRow(fmt.Errorf("unexpected query: %s", sql))
 		},
 		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			mu.Lock()
+			defer mu.Unlock()
 			id := args[0].(uuid.UUID)
 			switch {
 			case strings.Contains(sql, "-- name: MarkSandboxSnapshotFailed :execrows"):
@@ -446,12 +540,22 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
+	var hostDeleted []string
 	vmd := &stubVMD{
 		createSavedFn: func(_ context.Context, _, snapshotID, kind string) (vmdclient.SavedSnapshot, error) {
-			if snapshotID == gone.ID.String() {
+			switch snapshotID {
+			case gone.ID.String():
 				return vmdclient.SavedSnapshot{}, status.Error(codes.NotFound, "vm gone")
+			case lost.ID.String():
+				return vmdclient.SavedSnapshot{}, status.Error(codes.Unavailable, "host restarting")
 			}
 			return vmdclient.SavedSnapshot{Kind: kind, DiskPath: "/saved/x/overlay.ext4", SnapshotPath: "/saved/x/vmstate.snap", MemPath: "/saved/x/mem.diff", SizeBytes: 1}, nil
+		},
+		deleteSavedFn: func(_ context.Context, id string) error {
+			mu.Lock()
+			defer mu.Unlock()
+			hostDeleted = append(hostDeleted, id)
+			return nil
 		},
 	}
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
@@ -460,9 +564,62 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 		t.Errorf("readied = %v, want only the committed row", readied)
 	}
 	if len(failed) != 1 || failed[0] != gone.ID {
-		t.Errorf("failed = %v, want only the row whose VM is gone", failed)
+		t.Errorf("failed = %v, want only the row whose VM is gone; a lost answer stays creating", failed)
 	}
 	if len(deleted) != 1 || deleted[0] != deleting.ID {
 		t.Errorf("deleted = %v, want only the deleting row", deleted)
 	}
+	want := map[string]bool{gone.ID.String(): true, deleting.ID.String(): true, revived.ID.String(): true}
+	if len(hostDeleted) != len(want) {
+		t.Fatalf("host deletes = %v; want the refused row's leftovers, the deleting row and the files made again for the deleted row", hostDeleted)
+	}
+	for _, id := range hostDeleted {
+		if !want[id] {
+			t.Errorf("host delete of %s; want only %v", id, want)
+		}
+	}
+}
+
+func TestSnapshotSweepWorksHostsSideBySide(t *testing.T) {
+	teamID, sandboxID := uuid.New(), uuid.New()
+	stuck := snapshotFixture(teamID, sandboxID, "creating")
+	stuck.HostID = "host-hung"
+	other := snapshotFixture(teamID, sandboxID, "deleting")
+	other.HostID = "host-fine"
+	mock := &mockDBTX{
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "-- name: ClaimStuckSandboxSnapshots :many") {
+				return &scriptedRows{rows: []*mockRow{sandboxSnapshotRow(stuck), sandboxSnapshotRow(other)}}, nil
+			}
+			return nil, fmt.Errorf("unexpected query: %s", sql)
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	release := make(chan struct{})
+	settled := make(chan struct{})
+	vmd := &stubVMD{
+		createSavedFn: func(ctx context.Context, _, _, _ string) (vmdclient.SavedSnapshot, error) {
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
+			return vmdclient.SavedSnapshot{}, status.Error(codes.Unavailable, "never answered")
+		},
+		deleteSavedFn: func(context.Context, string) error { close(settled); return nil },
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.SweepSnapshotsOnce(context.Background(), zerolog.Nop())
+	}()
+	select {
+	case <-settled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the other host's delete waited behind a host that does not answer")
+	}
+	close(release)
+	<-done
 }

@@ -939,10 +939,12 @@ paths:
         disk only and boots fresh. A running sandbox is paused for the
         capture: under a second for the first memory snapshot of a sandbox,
         longer when all of memory has to be written. The call returns once
-        the snapshot is ready. Snapshots outlive the sandbox they came from.
+        the snapshot is ready; if the host's answer is lost on the way, it
+        returns the snapshot still `creating` and the platform settles it
+        with the host shortly. Snapshots outlive the sandbox they came from.
 
         Pass `idempotency_key` to make a retry return the snapshot the first
-        request made instead of taking another.
+        request made instead of taking another, whatever became of it since.
       security:
         - apiKey: []
       requestBody:
@@ -960,6 +962,18 @@ paths:
                 $ref: "#/components/schemas/SnapshotResponse"
         "200":
           description: A snapshot an earlier request with the same `idempotency_key` made
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "202":
+          description: >
+            The host's answer was lost; the snapshot is still `creating` and
+            is settled with the host shortly. Poll `GET /snapshots/{snapshot_id}`.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
           content:
             application/json:
               schema:
@@ -986,8 +1000,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "410":
+          description: The snapshot an earlier request with the same `idempotency_key` made has since been deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "503":
-          description: The host could not take the snapshot right now; retry
+          description: The host cannot take the snapshot as it stands; retry
           content:
             application/json:
               schema:

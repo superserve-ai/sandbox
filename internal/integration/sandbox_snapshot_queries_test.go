@@ -31,7 +31,7 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 		row, err := q.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
 			ID: uuid.New(), TeamID: teamID, SandboxID: sandboxID, Kind: kind, IdempotencyKey: key,
 			HostID: "default", VcpuCount: 1, MemoryMib: 1024, DiskMib: 4096, BasePath: "/base.ext4",
-			NetworkConfig: []byte("{}"), SecretBindings: []byte("[]"),
+			NetworkConfig: []byte("{}"), SecretBindings: []byte("[]"), SweepAfter: time.Now().Add(15 * time.Minute),
 		})
 		if err != nil {
 			t.Fatalf("create %s: %v", kind, err)
@@ -41,9 +41,6 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	fs := create("fs", &key)
 	if fs.Status != "creating" {
 		t.Fatalf("new row status %q", fs.Status)
-	}
-	if n, _ := q.CountTeamSnapshotsCreating(ctx, teamID); n != 1 {
-		t.Fatalf("creating count %d, want 1", n)
 	}
 	if _, err := q.BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: fs.ID, TeamID: teamID}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("delete of a creating row: want no rows, got %v", err)
@@ -95,13 +92,19 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	if _, err := q.GetSandboxSnapshot(ctx, db.GetSandboxSnapshotParams{ID: fs.ID, TeamID: teamID}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("deleted row still readable: %v", err)
 	}
+	// The key still names it, so its request learns it was deleted.
+	if got, err := q.GetSandboxSnapshotByIdempotencyKey(ctx, db.GetSandboxSnapshotByIdempotencyKeyParams{TeamID: teamID, SandboxID: sandboxID, IdempotencyKey: &key}); err != nil || got.ID != fs.ID || !got.DeletedAt.Valid {
+		t.Fatalf("by key after delete: %v %v deleted=%v", got.ID, err, got.DeletedAt.Valid)
+	}
 	if n, _ := q.CountSandboxSnapshots(ctx, db.CountSandboxSnapshotsParams{TeamID: teamID, SandboxID: sandboxID}); n != 1 {
 		t.Fatalf("count after delete %d, want 1", n)
 	}
 
-	// The sweep sees an old creating row and any deleting row, never a fresh one.
+	// The sweep claims a creating row once it is due and a deleting row at
+	// once, never a fresh row, and a claimed row is not due again until its
+	// retry time; a capture whose answer was lost is due at once.
 	old := create("fs", nil)
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET created_at = now() - interval '1 hour' WHERE id = $1`, old.ID); err != nil {
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET sweep_after = now() - interval '1 hour' WHERE id = $1`, old.ID); err != nil {
 		t.Fatal(err)
 	}
 	vmstate, memFile := "/saved/m/vmstate.snap", "/saved/m/mem.diff"
@@ -112,15 +115,29 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 		t.Fatal(err)
 	}
 	fresh := create("fs", nil)
-	stuck, err := q.ListStuckSandboxSnapshots(ctx, db.ListStuckSandboxSnapshotsParams{CreatingBefore: time.Now().Add(-15 * time.Minute), RowLimit: 50})
-	if err != nil {
-		t.Fatal(err)
+	claim := func() map[uuid.UUID]bool {
+		t.Helper()
+		rows, err := q.ClaimStuckSandboxSnapshots(ctx, db.ClaimStuckSandboxSnapshotsParams{RetryAt: time.Now().Add(time.Minute), RowLimit: 50})
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen := map[uuid.UUID]bool{}
+		for _, r := range rows {
+			seen[r.ID] = true
+		}
+		return seen
 	}
-	seen := map[uuid.UUID]bool{}
-	for _, r := range stuck {
-		seen[r.ID] = true
-	}
+	seen := claim()
 	if !seen[old.ID] || !seen[mem.ID] || seen[fresh.ID] {
-		t.Fatalf("stuck rows: old=%v deleting=%v fresh=%v", seen[old.ID], seen[mem.ID], seen[fresh.ID])
+		t.Fatalf("claimed rows: old=%v deleting=%v fresh=%v", seen[old.ID], seen[mem.ID], seen[fresh.ID])
+	}
+	if seen = claim(); seen[old.ID] || seen[mem.ID] {
+		t.Fatalf("claimed again before their retry time: old=%v deleting=%v", seen[old.ID], seen[mem.ID])
+	}
+	if n, err := q.ReleaseSandboxSnapshotCapture(ctx, fresh.ID); err != nil || n != 1 {
+		t.Fatalf("release: %d %v", n, err)
+	}
+	if seen = claim(); !seen[fresh.ID] {
+		t.Fatal("a released capture was not claimed at once")
 	}
 }

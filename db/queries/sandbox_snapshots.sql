@@ -1,17 +1,17 @@
 -- name: CreateSandboxSnapshot :one
 -- The row exists as creating before the host is asked, under the id the
 -- host's capture is keyed by, so an answer lost on the way back is settled
--- later from the host (see the snapshot sweep). The quota trigger counts on
--- insert; a retry carrying an idempotency key already on file is refused by
--- the unique index and re-read by the caller.
+-- later from the host (see the snapshot sweep). The trigger counts the
+-- limits on insert; a retry carrying an idempotency key already on file is
+-- refused by the unique index and re-read by the caller.
 INSERT INTO sandbox_snapshot (
     id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key,
     host_id, vcpu_count, memory_mib, disk_mib, base_path,
-    timeout_seconds, network_config, secret_bindings
+    timeout_seconds, network_config, secret_bindings, sweep_after
 ) VALUES (
     @id, @team_id, @sandbox_id, @template_id, @kind, 'creating', sqlc.narg('name'), sqlc.narg('idempotency_key'),
     @host_id, @vcpu_count, @memory_mib, @disk_mib, @base_path,
-    sqlc.narg('timeout_seconds'), @network_config, @secret_bindings
+    sqlc.narg('timeout_seconds'), @network_config, @secret_bindings, @sweep_after
 )
 RETURNING *;
 
@@ -20,9 +20,15 @@ RETURNING *;
 SELECT * FROM sandbox_snapshot
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
 
+-- name: GetSandboxSnapshotUnscoped :one
+-- Any team, any state: for settling a host's answer against the row.
+SELECT * FROM sandbox_snapshot WHERE id = $1;
+
 -- name: GetSandboxSnapshotByIdempotencyKey :one
+-- Deleted rows included: the request that made a since-deleted snapshot is
+-- told so, not given a second capture.
 SELECT * FROM sandbox_snapshot
-WHERE team_id = $1 AND sandbox_id = $2 AND idempotency_key = $3 AND deleted_at IS NULL;
+WHERE team_id = $1 AND sandbox_id = $2 AND idempotency_key = $3;
 
 -- name: ListSandboxSnapshots :many
 SELECT * FROM sandbox_snapshot
@@ -33,10 +39,6 @@ LIMIT sqlc.narg('row_limit')::bigint OFFSET sqlc.arg('row_offset')::bigint;
 -- name: CountSandboxSnapshots :one
 SELECT count(*) FROM sandbox_snapshot
 WHERE team_id = $1 AND sandbox_id = $2 AND deleted_at IS NULL;
-
--- name: CountTeamSnapshotsCreating :one
-SELECT count(*) FROM sandbox_snapshot
-WHERE team_id = $1 AND status = 'creating' AND deleted_at IS NULL;
 
 -- name: MarkSandboxSnapshotReady :one
 -- Only a row still creating becomes ready: the request that started the
@@ -53,6 +55,12 @@ RETURNING *;
 UPDATE sandbox_snapshot SET status = 'failed'
 WHERE id = $1 AND status = 'creating';
 
+-- name: ReleaseSandboxSnapshotCapture :execrows
+-- A capture whose answer was lost is the sweep's to settle, now rather than
+-- when the row ages out.
+UPDATE sandbox_snapshot SET sweep_after = now()
+WHERE id = $1 AND status = 'creating';
+
 -- name: RenameSandboxSnapshot :one
 UPDATE sandbox_snapshot SET name = $3
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
@@ -62,7 +70,7 @@ RETURNING *;
 -- A row still creating is left to its capture and the sweep: deleting it
 -- here could leave the host holding a snapshot no row names. A row already
 -- deleting is driven again.
-UPDATE sandbox_snapshot SET status = 'deleting'
+UPDATE sandbox_snapshot SET status = 'deleting', sweep_after = now()
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL AND status <> 'creating'
 RETURNING *;
 
@@ -70,11 +78,18 @@ RETURNING *;
 UPDATE sandbox_snapshot SET deleted_at = now()
 WHERE id = $1 AND status = 'deleting' AND deleted_at IS NULL;
 
--- name: ListStuckSandboxSnapshots :many
--- Rows a capture or a delete left behind: creating since before the time a
--- capture can take, or deleting at all. Unscoped, for the sweep.
-SELECT * FROM sandbox_snapshot
-WHERE deleted_at IS NULL
-  AND ((status = 'creating' AND created_at < @creating_before) OR status = 'deleting')
-ORDER BY created_at
-LIMIT sqlc.arg('row_limit')::bigint;
+-- name: ClaimStuckSandboxSnapshots :many
+-- Rows a capture or a delete left behind, due for the sweep. Each claimed
+-- row is pushed out to @retry_at, so a host that does not answer holds back
+-- nothing but its own rows and another replica's sweep passes over them.
+UPDATE sandbox_snapshot SET sweep_after = @retry_at
+WHERE id IN (
+    SELECT id FROM sandbox_snapshot
+    WHERE deleted_at IS NULL
+      AND status IN ('creating', 'deleting')
+      AND sweep_after <= now()
+    ORDER BY sweep_after
+    LIMIT sqlc.arg('row_limit')::bigint
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING *;

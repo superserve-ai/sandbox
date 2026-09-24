@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -36,17 +37,18 @@ const (
 	// up does not abandon a capture that is already stalling the guest.
 	snapshotCaptureTimeout = 10 * time.Minute
 	snapshotDeleteTimeout  = 30 * time.Second
-	// Captures a team may have in flight at once, on top of the host's own
-	// per-host bound.
-	snapshotsInFlightPerTeam = 4
-	// SQLSTATE raised by the sandbox_snapshot quota trigger.
-	snapshotQuotaErrCode = "SS002"
+	// SQLSTATEs raised by the sandbox_snapshot quota trigger: the team's or
+	// sandbox's snapshot limit, and the team's limit on captures in flight.
+	snapshotQuotaErrCode    = "SS002"
+	snapshotInFlightErrCode = "SS003"
 
 	snapshotSweepInterval = time.Minute
-	// A row creating since before this is asked about again; a capture's
-	// own budget is minutes, so a row this old has lost its answer.
-	snapshotSweepCreatingAge       = 15 * time.Minute
-	snapshotSweepBatch       int64 = 50
+	// A row still creating this long after its insert has lost its answer
+	// and is due for the sweep; a capture's own budget is minutes.
+	snapshotSweepCreatingAge = 15 * time.Minute
+	// A claimed row is due again after this, whether or not the host answered.
+	snapshotSweepRetry       = time.Minute
+	snapshotSweepBatch int64 = 50
 )
 
 type createSnapshotRequest struct {
@@ -110,9 +112,9 @@ func parseSnapshotID(c *gin.Context) (uuid.UUID, error) {
 	return id, nil
 }
 
-func isSnapshotQuotaErr(err error) bool {
+func isSnapshotLimitErr(err error, code string) bool {
 	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == snapshotQuotaErrCode
+	return errors.As(err, &pgErr) && pgErr.Code == code
 }
 
 // CreateSandboxSnapshot captures a sandbox into a saved snapshot and answers
@@ -153,6 +155,21 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 	}
 	ctx := c.Request.Context()
 
+	// A key already on file is answered with what it made, whatever became
+	// of it or its source since; only a new key is checked for eligibility.
+	if body.IdempotencyKey != nil {
+		existing, err := h.DB.GetSandboxSnapshotByIdempotencyKey(ctx, db.GetSandboxSnapshotByIdempotencyKeyParams{TeamID: teamID, SandboxID: sandboxID, IdempotencyKey: body.IdempotencyKey})
+		if err == nil {
+			respondSnapshotReplay(c, existing)
+			return
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			log.Error().Err(err).Msg("snapshot: idempotent lookup")
+			respondError(c, ErrInternal)
+			return
+		}
+	}
+
 	sb, err := h.DB.GetSandbox(ctx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -169,16 +186,6 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 	}
 	if sb.BasePath == nil {
 		respondErrorMsg(c, "conflict", "sandbox predates overlay disks and cannot be snapshotted; create a new one from its template", http.StatusConflict)
-		return
-	}
-	inFlight, err := h.DB.CountTeamSnapshotsCreating(ctx, teamID)
-	if err != nil {
-		log.Error().Err(err).Msg("snapshot: count captures in flight")
-		respondError(c, ErrInternal)
-		return
-	}
-	if inFlight >= snapshotsInFlightPerTeam {
-		respondErrorMsg(c, "too_many_snapshots_in_flight", fmt.Sprintf("team has %d snapshots being created; wait for one to finish", inFlight), http.StatusTooManyRequests)
 		return
 	}
 	bindings, err := h.snapshotSecretBindings(ctx, sandboxID)
@@ -207,20 +214,22 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 		TimeoutSeconds: sb.TimeoutSeconds,
 		NetworkConfig:  netCfg,
 		SecretBindings: bindings,
+		SweepAfter:     time.Now().Add(snapshotSweepCreatingAge),
 	})
 	if err != nil {
 		switch {
 		case body.IdempotencyKey != nil && isUniqueViolation(err):
-			// The same request already made a snapshot: answer with it,
-			// whatever state it has reached.
+			// Another request with the same key got in first.
 			existing, gerr := h.DB.GetSandboxSnapshotByIdempotencyKey(ctx, db.GetSandboxSnapshotByIdempotencyKeyParams{TeamID: teamID, SandboxID: sandboxID, IdempotencyKey: body.IdempotencyKey})
 			if gerr != nil {
 				log.Error().Err(gerr).Msg("snapshot: idempotent re-read")
 				respondError(c, ErrInternal)
 				return
 			}
-			c.JSON(http.StatusOK, snapshotJSON(existing))
-		case isSnapshotQuotaErr(err):
+			respondSnapshotReplay(c, existing)
+		case isSnapshotLimitErr(err, snapshotInFlightErrCode):
+			respondErrorMsg(c, "too_many_snapshots_in_flight", "team has reached its limit on snapshots being created at once; wait for one to finish", http.StatusTooManyRequests)
+		case isSnapshotLimitErr(err, snapshotQuotaErrCode):
 			respondErrorMsg(c, "too_many_snapshots", "team or sandbox has reached its snapshot limit; delete some or contact support@superserve.ai for higher", http.StatusTooManyRequests)
 		default:
 			log.Error().Err(err).Msg("snapshot: insert")
@@ -240,25 +249,40 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 	defer cancel()
 	snap, err := client.CreateSavedSnapshot(cctx, sandboxID.String(), row.ID.String(), body.Kind)
 	if err != nil {
-		h.failSnapshot(row.ID, sb.HostID, client)
-		respondSnapshotCaptureError(c, err)
+		if snapshotCaptureRefused(err) {
+			h.failSnapshot(row.ID, sb.HostID, client)
+			respondSnapshotCaptureError(c, err)
+			return
+		}
+		// The answer was lost, not refused: the host may hold the snapshot.
+		// The row stays creating and the sweep settles it from the host.
+		h.releaseSnapshotCapture(row.ID)
+		log.Warn().Err(err).Str("snapshot_id", row.ID.String()).Str("host_id", sb.HostID).Msg("snapshot: capture answer lost; left to the sweep")
+		c.Header("Retry-After", "60")
+		c.JSON(http.StatusAccepted, snapshotJSON(row))
 		return
 	}
-	ready, err := h.markSnapshotReady(cctx, row.ID, snap)
+	current, err := h.settleCapture(cctx, client, row, snap)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// Settled by the sweep, or deleted meanwhile: answer with what the row says.
-			if current, gerr := h.DB.GetSandboxSnapshot(ctx, db.GetSandboxSnapshotParams{ID: row.ID, TeamID: teamID}); gerr == nil {
-				c.JSON(http.StatusOK, snapshotJSON(current))
-				return
-			}
-		}
 		// The host holds the snapshot; the sweep records it if this did not.
 		log.Error().Err(err).Str("snapshot_id", row.ID.String()).Msg("snapshot: mark ready")
 		respondError(c, ErrInternal)
 		return
 	}
-	c.JSON(http.StatusCreated, snapshotJSON(ready))
+	if current.Status != "ready" || current.DeletedAt.Valid {
+		respondSnapshotReplay(c, current)
+		return
+	}
+	c.JSON(http.StatusCreated, snapshotJSON(current))
+}
+
+// respondSnapshotReplay answers for a snapshot an earlier request made.
+func respondSnapshotReplay(c *gin.Context, row db.SandboxSnapshot) {
+	if row.DeletedAt.Valid {
+		respondErrorMsg(c, "gone", "the snapshot this request made has been deleted", http.StatusGone)
+		return
+	}
+	c.JSON(http.StatusOK, snapshotJSON(row))
 }
 
 func (h *Handlers) snapshotSecretBindings(ctx context.Context, sandboxID uuid.UUID) ([]byte, error) {
@@ -296,6 +320,54 @@ func optString(s string) *string {
 	return &s
 }
 
+// settleCapture records the host's answer on the row. A row no longer
+// creating was settled by the other party, or is being deleted: a delete
+// may have removed the files this capture has just made again, so they are
+// removed once more.
+func (h *Handlers) settleCapture(ctx context.Context, client VMDClient, row db.SandboxSnapshot, snap vmdclient.SavedSnapshot) (db.SandboxSnapshot, error) {
+	ready, err := h.markSnapshotReady(ctx, row.ID, snap)
+	if err == nil {
+		return ready, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return db.SandboxSnapshot{}, err
+	}
+	current, err := h.DB.GetSandboxSnapshotUnscoped(ctx, row.ID)
+	if err != nil {
+		return db.SandboxSnapshot{}, err
+	}
+	if current.Status == "deleting" {
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotDeleteTimeout)
+		defer cancel()
+		if err := client.DeleteSavedSnapshot(dctx, row.ID.String()); err != nil && !isVMDNotFound(err) {
+			log.Error().Err(err).Str("snapshot_id", row.ID.String()).Str("host_id", row.HostID).Msg("snapshot: host may hold files for a deleted snapshot")
+		}
+	}
+	return current, nil
+}
+
+// releaseSnapshotCapture hands a row whose capture answer was lost to the
+// sweep. Detached from the request, like failSnapshot.
+func (h *Handlers) releaseSnapshotCapture(id uuid.UUID) {
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotDeleteTimeout)
+	defer cancel()
+	if _, err := h.DB.ReleaseSandboxSnapshotCapture(ctx, id); err != nil {
+		log.Error().Err(err).Str("snapshot_id", id.String()).Msg("snapshot: release to the sweep")
+	}
+}
+
+// snapshotCaptureRefused reports an answer that says the host did not and
+// will not commit the snapshot as things stand. Any other error is an answer
+// lost on the way: the host may hold the snapshot, so nothing is destroyed.
+func snapshotCaptureRefused(err error) bool {
+	switch status.Code(err) {
+	case codes.Unimplemented, codes.NotFound, codes.FailedPrecondition, codes.InvalidArgument,
+		codes.AlreadyExists, codes.ResourceExhausted:
+		return true
+	}
+	return false
+}
+
 // failSnapshot records a capture that did not commit and, given a client,
 // removes whatever the host may hold for the id. Detached from the request:
 // the row must not stay creating because the caller went away.
@@ -324,8 +396,6 @@ func respondSnapshotCaptureError(c *gin.Context, err error) {
 		respondErrorMsg(c, "bad_request", vmdErrorMessage(err), http.StatusBadRequest)
 	case codes.ResourceExhausted:
 		respondErrorMsg(c, "host_capacity", vmdErrorMessage(err), http.StatusServiceUnavailable)
-	case codes.Unavailable, codes.DeadlineExceeded:
-		respondErrorMsg(c, "capture_failed", "the snapshot could not be taken right now; retry", http.StatusServiceUnavailable)
 	default:
 		log.Error().Err(err).Msg("snapshot: capture")
 		respondError(c, ErrInternal)
@@ -512,27 +582,41 @@ func (h *Handlers) StartSnapshotSweeper(ctx context.Context) {
 	}()
 }
 
-// SweepSnapshotsOnce asks the host about every stale row. Age alone proves
-// nothing: a capture whose answer was lost may have committed, so the same
-// idempotent request is issued again and the row settles on what the host
-// says. Exported so tests can run a pass directly.
+// SweepSnapshotsOnce asks the host about every row that is due. Age alone
+// proves nothing: a capture whose answer was lost may have committed, so the
+// same idempotent request is issued again and the row settles on what the
+// host says. Hosts are worked side by side, each one's rows in turn, so a
+// host that does not answer holds back only its own. Exported so tests can
+// run a pass directly.
 func (h *Handlers) SweepSnapshotsOnce(ctx context.Context, logger zerolog.Logger) {
 	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	rows, err := h.DB.ListStuckSandboxSnapshots(qctx, db.ListStuckSandboxSnapshotsParams{
-		CreatingBefore: time.Now().Add(-snapshotSweepCreatingAge),
-		RowLimit:       snapshotSweepBatch,
+	rows, err := h.DB.ClaimStuckSandboxSnapshots(qctx, db.ClaimStuckSandboxSnapshotsParams{
+		RetryAt:  time.Now().Add(snapshotSweepRetry),
+		RowLimit: snapshotSweepBatch,
 	})
 	cancel()
 	if err != nil {
-		logger.Error().Err(err).Msg("snapshot sweep: list")
+		logger.Error().Err(err).Msg("snapshot sweep: claim")
 		return
 	}
+	byHost := map[string][]db.SandboxSnapshot{}
 	for _, row := range rows {
-		if ctx.Err() != nil {
-			return
-		}
-		h.sweepSnapshot(ctx, row, logger.With().Str("snapshot_id", row.ID.String()).Str("host_id", row.HostID).Logger())
+		byHost[row.HostID] = append(byHost[row.HostID], row)
 	}
+	var wg sync.WaitGroup
+	for _, rows := range byHost {
+		wg.Add(1)
+		go func(rows []db.SandboxSnapshot) {
+			defer wg.Done()
+			for _, row := range rows {
+				if ctx.Err() != nil {
+					return
+				}
+				h.sweepSnapshot(ctx, row, logger.With().Str("snapshot_id", row.ID.String()).Str("host_id", row.HostID).Logger())
+			}
+		}(rows)
+	}
+	wg.Wait()
 }
 
 func (h *Handlers) sweepSnapshot(ctx context.Context, row db.SandboxSnapshot, logger zerolog.Logger) {
@@ -548,14 +632,13 @@ func (h *Handlers) sweepSnapshot(ctx context.Context, row db.SandboxSnapshot, lo
 		cancel()
 		switch {
 		case err == nil:
-			if _, err := h.markSnapshotReady(ctx, row.ID, snap); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			current, err := h.settleCapture(ctx, client, row, snap)
+			if err != nil {
 				logger.Error().Err(err).Msg("snapshot sweep: mark ready")
 				return
 			}
-			logger.Info().Msg("snapshot sweep: settled ready from the host")
-		case status.Code(err) == codes.NotFound, status.Code(err) == codes.FailedPrecondition,
-			status.Code(err) == codes.InvalidArgument, status.Code(err) == codes.AlreadyExists:
-			// The host cannot produce this snapshot as things stand.
+			logger.Info().Str("status", current.Status).Msg("snapshot sweep: settled from the host")
+		case snapshotCaptureRefused(err):
 			h.failSnapshot(row.ID, row.HostID, client)
 			logger.Warn().Err(err).Msg("snapshot sweep: settled failed from the host")
 		default:
