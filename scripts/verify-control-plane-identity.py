@@ -16,6 +16,7 @@ import posixpath
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -62,6 +63,7 @@ class Evidence:
         (self.root / "commands").mkdir(exist_ok=True)
         self.index: list[dict[str, object]] = []
         self.sequence = 0
+        self.last_policy_request: float | None = None
 
     def command(
         self,
@@ -75,6 +77,14 @@ class Evidence:
     ) -> str:
         self.sequence += 1
         stem = f"{self.sequence:02d}-{name}"
+        if argv[:3] == ["gcloud", "policy-troubleshoot", "iam"]:
+            # Two production preflights share the 15 requests/minute quota.
+            # Nine seconds per process leaves room for both without a burst.
+            if self.last_policy_request is not None:
+                delay = 9 - (time.monotonic() - self.last_policy_request)
+                if delay > 0:
+                    time.sleep(delay)
+            self.last_policy_request = time.monotonic()
         if stream_stdout:
             # Artifact probes can return arbitrarily large, non-UTF-8 bodies.
             # Send those bytes directly to the OS sink instead of asking
@@ -170,6 +180,7 @@ def effective_iam_command(project: str, identity: str, bucket: str) -> list[str]
         f"--project={project}",
         f"--identity=serviceAccount:{identity}",
         f"--full-resource-name=//storage.googleapis.com/projects/_/buckets/{bucket}",
+        "--show-response",
         "--format=json",
     )
 
@@ -182,7 +193,7 @@ def host_effective_iam_command(project: str, host: str, identity: str) -> list[s
         "--permissions=iam.serviceAccounts.actAs,iam.serviceAccounts.getAccessToken,iam.serviceAccounts.getOpenIdToken",
         "--analyze-service-account-impersonation", "--expand-groups",
         "--expand-resources", "--expand-roles", "--output-group-edges",
-        "--output-resource-edges", "--format=json",
+        "--output-resource-edges", "--show-response", "--format=json",
     )
 
 
@@ -354,6 +365,62 @@ def storage_object_resource(bucket: str, name: str) -> str:
     return f"//storage.googleapis.com/projects/_/buckets/{bucket}/objects/{name}"
 
 
+def read_managed_folders(evidence: Evidence, name: str, bucket: str) -> list[str]:
+    response = evidence.command(name, gcloud(
+        "storage", "managed-folders", "list", f"gs://{bucket}/", "--format=json",
+    ))
+    try:
+        folders = json.loads(response)
+        if not isinstance(folders, list) or any(
+            not isinstance(folder, dict)
+            or folder.get("bucket") != bucket
+            or not isinstance(folder.get("name"), str)
+            or not folder["name"].endswith("/")
+            for folder in folders
+        ):
+            raise VerificationError("managed-folder inventory is invalid")
+    except (json.JSONDecodeError, VerificationError) as exc:
+        evidence.index[-1]["status"] = "FAIL"
+        raise VerificationError("cannot determine managed-folder policy hierarchy") from exc
+    return sorted({folder["name"] for folder in folders})
+
+
+def managed_folder_denial_checks(
+    bucket: str, other_buckets: list[str], folders: dict[str, list[str]],
+) -> list[tuple[str, str, str, str]]:
+    checks = []
+    for bucket_index, target in enumerate([bucket, *other_buckets], 1):
+        for folder_index, folder in enumerate(folders[target], 1):
+            prefix = folder.split("/", 1)[0]
+            if prefix not in {"templates", "bases", "sandboxes"} or folder == f"{prefix}/":
+                continue
+            operations = ("get", "create", "delete") if target != bucket or prefix == "sandboxes" else ("create", "delete")
+            for operation in operations:
+                checks.append((
+                    f"managed-folder-{bucket_index}-{folder_index}-{operation}-denied",
+                    target, f"{folder}.permission-probe", f"storage.objects.{operation}",
+                ))
+    return checks
+
+
+def storage_permission_command(
+    identity: str, bucket: str, object_name: str, permission: str, folders: list[str],
+) -> list[str]:
+    # Objects are not supported policy targets. Select their nearest managed
+    # folder (or bucket) and provide the object attributes for IAM Conditions.
+    resource = f"//storage.googleapis.com/projects/_/buckets/{bucket}"
+    folder = max((name for name in folders if object_name.startswith(name)), key=len, default="")
+    if folder:
+        resource += f"/managedFolders/{folder}"
+    return gcloud(
+        "policy-troubleshoot", "iam", resource,
+        f"--principal-email={identity}", f"--permission={permission}",
+        f"--resource-name=projects/_/buckets/{bucket}/objects/{object_name}",
+        "--resource-service=storage.googleapis.com",
+        "--resource-type=storage.googleapis.com/Object", "--format=json",
+    )
+
+
 def require_permission_denied(
     evidence: Evidence,
     name: str,
@@ -361,19 +428,13 @@ def require_permission_denied(
     bucket: str,
     object_name: str,
     permission: str,
+    folders: list[str],
 ) -> None:
     """Fail closed unless Policy Troubleshooter denies one object permission."""
     resource = storage_object_resource(bucket, object_name)
     response = evidence.command(
         name,
-        gcloud(
-            "policy-troubleshoot",
-            "iam",
-            resource,
-            f"--principal-email={identity}",
-            f"--permission={permission}",
-            "--format=json",
-        ),
+        storage_permission_command(identity, bucket, object_name, permission, folders),
     )
     try:
         access = policy_troubleshooter_access(response)
@@ -617,9 +678,15 @@ def main() -> int:
         # Evaluate get/create/delete without touching live objects. An actual
         # mutation could destroy data or turn a retried create into an overwrite.
         denial_checks = storage_denial_checks(bucket, args.other_bucket, manifest)
+        managed_folders = {
+            target: read_managed_folders(evidence, f"managed-folders-{index}", target)
+            for index, target in enumerate([bucket, *args.other_bucket], 1)
+        }
+        denial_checks.extend(managed_folder_denial_checks(bucket, args.other_bucket, managed_folders))
         for name, target_bucket, target_object, permission in denial_checks:
             require_permission_denied(
                 evidence, name, identity, target_bucket, target_object, permission,
+                managed_folders[target_bucket],
             )
 
         bucket_policy_json = evidence.command(
@@ -821,6 +888,9 @@ def main() -> int:
             "effective-iam",
         ]
         required_checks.extend(denied_list_checks)
+        required_checks.extend(
+            f"managed-folders-{index}" for index, _ in enumerate([bucket, *args.other_bucket], 1)
+        )
         required_checks.extend(check[0] for check in denial_checks)
         required_checks.extend(
             f"referenced-read-{index}" for index, _ in enumerate(references, 1)

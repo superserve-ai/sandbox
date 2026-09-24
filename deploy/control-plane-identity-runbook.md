@@ -148,6 +148,15 @@ existing regional Terraform; the prerequisite job does not demand them early.
 Template manifests and referenced artifacts are read only by the post-apply
 runtime verifier, so preflight does not require deployment-account payload access.
 
+Storage policy probes inventory managed folders and select the nearest folder
+or bucket policy, with object attributes supplied separately for IAM Conditions.
+They also check each nested managed folder under the three storage prefixes.
+Missing folder inventory blocks verification. IAM analysis requests the full
+API response so completeness and impersonation results remain available.
+Policy Troubleshooter requests start at least nine seconds apart in each job,
+keeping the two concurrent production preflights below their shared default
+15-request-per-minute quota. Other quota consumers can still cause failures.
+
 ### Inherited policy visibility
 
 Project grants cannot provide access to ancestor policies. If private preflight

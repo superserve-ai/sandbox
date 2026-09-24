@@ -100,8 +100,13 @@ class ProbeTests(unittest.TestCase):
                 if name == "deployment-identity": return CONTRACT["deployment_identity"]
                 if name == "verification-apis": return "cloudasset.googleapis.com\npolicytroubleshooter.googleapis.com\n"
                 if name == "service-readiness": return '{"status":{"traffic":[{"percent":100,"revisionName":"old-revision"}]}}'
+                if name.startswith("managed-folders-"):
+                    bucket = argv[4].removeprefix("gs://").removesuffix("/")
+                    return json.dumps([{"bucket": bucket, "name": prefix} for prefix in ("templates/", "bases/")])
                 if argv[1:3] == ["policy-troubleshoot", "iam"]: return '{"access":"NOT_GRANTED"}'
-                if argv[1:3] == ["asset", "analyze-iam-policy"]: return '{"fullyExplored":true,"analysisResults":[]}'
+                if argv[1:3] == ["asset", "analyze-iam-policy"]:
+                    self.assertIn("--show-response", argv)
+                    return '{"fullyExplored":true,"mainAnalysis":{"fullyExplored":true}}'
                 if name.startswith("secret-version-"): return '{"state":"ENABLED"}'
                 if name == "kms-primary": return '{"primary":{"state":"ENABLED"}}'
                 return '{}'
@@ -159,6 +164,24 @@ class ProbeTests(unittest.TestCase):
     def test_disabled_kms_primary_is_rejected(self):
         _, checks = self.run_cell(kms=True, failures={"kms-primary": '{"primary":{"state":"DISABLED"}}'})
         self.assertEqual({row["name"] for row in checks if row["status"] == "FAIL"}, {"kms-primary"})
+
+    def test_unknown_inventory_blocks_probes_instead_of_assuming_no_folder_grants(self):
+        calls, checks = self.run_cell(failures={"managed-folders-2": '{}'})
+        rows = {row["name"]: row for row in checks}
+        self.assertEqual(rows["managed-folders-2"]["status"], "FAIL")
+        self.assertEqual(rows["policy-visibility-cross-cell-1-templates-get"]["status"], "FAIL")
+        self.assertEqual(rows["nested-managed-folder-policy-visibility"]["status"], "FAIL")
+        self.assertFalse(any(name == "policy-visibility-cross-cell-1-templates-get" for name, _ in calls))
+
+    def test_nested_policy_visibility_is_checked_before_apply(self):
+        calls, checks = self.run_cell(failures={"managed-folders-2": json.dumps([
+            {"bucket": "example-east", "name": "templates/"},
+            {"bucket": "example-east", "name": "templates/team/"},
+        ]), "policy-visibility-managed-folder-2-2-get-denied": '{"access":"UNKNOWN_INFO"}'})
+        rows = {row["name"]: row for row in checks}
+        self.assertEqual(rows["nested-managed-folder-policy-visibility"]["status"], "FAIL")
+        argv = dict(calls)["policy-visibility-managed-folder-2-2-get-denied"]
+        self.assertEqual(argv[3], "//storage.googleapis.com/projects/_/buckets/example-east/managedFolders/templates/team/")
 
 
 class WorkflowTests(unittest.TestCase):
