@@ -438,6 +438,18 @@ func TestDeleteSnapshotRemovesReadyRefusesCreatingDefersOnHostError(t *testing.T
 	if w.Code != http.StatusAccepted || w.Header().Get("Retry-After") == "" || deleted != 1 {
 		t.Fatalf("host error: status=%d retry-after=%q deleted=%d; want 202 with the row left deleting", w.Code, w.Header().Get("Retry-After"), deleted)
 	}
+
+	// A host that does not answer costs the caller the inline budget, not
+	// the host timeout.
+	hostErr = nil
+	h.TeardownInlineBudget = 50 * time.Millisecond
+	vmd.deleteSavedFn = func(ctx context.Context, _ string) error { <-ctx.Done(); return ctx.Err() }
+	start := time.Now()
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/snapshots/"+row.ID.String(), nil))
+	if w.Code != http.StatusAccepted || deleted != 1 || time.Since(start) > 5*time.Second {
+		t.Fatalf("host hung: status=%d deleted=%d after %s; want 202 within the inline budget", w.Code, deleted, time.Since(start))
+	}
 }
 
 func TestPatchSnapshotRenames(t *testing.T) {

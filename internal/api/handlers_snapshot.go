@@ -505,8 +505,10 @@ func (h *Handlers) PatchSnapshot(c *gin.Context) {
 	c.JSON(http.StatusOK, snapshotJSON(row))
 }
 
-// DeleteSnapshot removes a snapshot: the row goes to deleting first, so a
-// host that does not answer leaves it for the sweep rather than alive.
+// DeleteSnapshot removes a snapshot: the row goes to deleting first, then
+// the host gets one attempt within the inline budget a sandbox delete also
+// answers under, and a host that does not answer in time leaves the row to
+// the sweep rather than the caller waiting.
 func (h *Handlers) DeleteSnapshot(c *gin.Context) {
 	id, err := parseSnapshotID(c)
 	if err != nil {
@@ -534,7 +536,7 @@ func (h *Handlers) DeleteSnapshot(c *gin.Context) {
 		respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
 		return
 	}
-	if err := h.deleteSnapshotOnHost(ctx, row); err != nil {
+	if err := h.deleteSnapshotOnHost(ctx, row, h.inlineBudget()); err != nil {
 		log.Warn().Err(err).Str("snapshot_id", id.String()).Str("host_id", row.HostID).Msg("snapshot: host delete deferred to the sweep")
 		c.Header("Retry-After", "30")
 		c.JSON(http.StatusAccepted, gin.H{"status": "deleting"})
@@ -545,12 +547,12 @@ func (h *Handlers) DeleteSnapshot(c *gin.Context) {
 
 // deleteSnapshotOnHost removes the files and records the row deleted. A host
 // that no longer knows the id has nothing to remove.
-func (h *Handlers) deleteSnapshotOnHost(ctx context.Context, row db.SandboxSnapshot) error {
+func (h *Handlers) deleteSnapshotOnHost(ctx context.Context, row db.SandboxSnapshot, wait time.Duration) error {
 	client, err := h.vmdForHost(ctx, row.HostID)
 	if err != nil {
 		return err
 	}
-	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotDeleteTimeout)
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), wait)
 	defer cancel()
 	if err := client.DeleteSavedSnapshot(dctx, row.ID.String()); err != nil && !isVMDNotFound(err) {
 		return err
@@ -697,7 +699,7 @@ func (h *Handlers) sweepSnapshot(ctx context.Context, row db.SandboxSnapshot, lo
 			unsettled().Err(err).Msg("snapshot sweep: host did not settle the capture; will ask again")
 		}
 	case "deleting":
-		if err := h.deleteSnapshotOnHost(ctx, row); err != nil {
+		if err := h.deleteSnapshotOnHost(ctx, row, snapshotDeleteTimeout); err != nil {
 			logger.Warn().Err(err).Msg("snapshot sweep: delete not finished; will ask again")
 			return
 		}
