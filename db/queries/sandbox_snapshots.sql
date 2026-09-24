@@ -1,0 +1,80 @@
+-- name: CreateSandboxSnapshot :one
+-- The row exists as creating before the host is asked, under the id the
+-- host's capture is keyed by, so an answer lost on the way back is settled
+-- later from the host (see the snapshot sweep). The quota trigger counts on
+-- insert; a retry carrying an idempotency key already on file is refused by
+-- the unique index and re-read by the caller.
+INSERT INTO sandbox_snapshot (
+    id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key,
+    host_id, vcpu_count, memory_mib, disk_mib, base_path,
+    timeout_seconds, network_config, secret_bindings
+) VALUES (
+    @id, @team_id, @sandbox_id, @template_id, @kind, 'creating', sqlc.narg('name'), sqlc.narg('idempotency_key'),
+    @host_id, @vcpu_count, @memory_mib, @disk_mib, @base_path,
+    sqlc.narg('timeout_seconds'), @network_config, @secret_bindings
+)
+RETURNING *;
+
+-- name: GetSandboxSnapshot :one
+-- Team-scoped: another team's row and a deleted row are the same 404.
+SELECT * FROM sandbox_snapshot
+WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
+
+-- name: GetSandboxSnapshotByIdempotencyKey :one
+SELECT * FROM sandbox_snapshot
+WHERE team_id = $1 AND sandbox_id = $2 AND idempotency_key = $3 AND deleted_at IS NULL;
+
+-- name: ListSandboxSnapshots :many
+SELECT * FROM sandbox_snapshot
+WHERE team_id = $1 AND sandbox_id = $2 AND deleted_at IS NULL
+ORDER BY created_at DESC, id DESC
+LIMIT sqlc.narg('row_limit')::bigint OFFSET sqlc.arg('row_offset')::bigint;
+
+-- name: CountSandboxSnapshots :one
+SELECT count(*) FROM sandbox_snapshot
+WHERE team_id = $1 AND sandbox_id = $2 AND deleted_at IS NULL;
+
+-- name: CountTeamSnapshotsCreating :one
+SELECT count(*) FROM sandbox_snapshot
+WHERE team_id = $1 AND status = 'creating' AND deleted_at IS NULL;
+
+-- name: MarkSandboxSnapshotReady :one
+-- Only a row still creating becomes ready: the request that started the
+-- capture and the sweep may both carry the host's answer.
+UPDATE sandbox_snapshot
+SET status = 'ready', ready_at = now(),
+    base_mem_path = sqlc.narg('base_mem_path'), snapshot_path = sqlc.narg('snapshot_path'),
+    mem_path = sqlc.narg('mem_path'), overlay_path = @overlay_path,
+    size_bytes = @size_bytes, fc_build_sha = sqlc.narg('fc_build_sha')
+WHERE id = @id AND status = 'creating'
+RETURNING *;
+
+-- name: MarkSandboxSnapshotFailed :execrows
+UPDATE sandbox_snapshot SET status = 'failed'
+WHERE id = $1 AND status = 'creating';
+
+-- name: RenameSandboxSnapshot :one
+UPDATE sandbox_snapshot SET name = $3
+WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
+RETURNING *;
+
+-- name: BeginSandboxSnapshotDelete :one
+-- A row still creating is left to its capture and the sweep: deleting it
+-- here could leave the host holding a snapshot no row names. A row already
+-- deleting is driven again.
+UPDATE sandbox_snapshot SET status = 'deleting'
+WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL AND status <> 'creating'
+RETURNING *;
+
+-- name: MarkSandboxSnapshotDeleted :execrows
+UPDATE sandbox_snapshot SET deleted_at = now()
+WHERE id = $1 AND status = 'deleting' AND deleted_at IS NULL;
+
+-- name: ListStuckSandboxSnapshots :many
+-- Rows a capture or a delete left behind: creating since before the time a
+-- capture can take, or deleting at all. Unscoped, for the sweep.
+SELECT * FROM sandbox_snapshot
+WHERE deleted_at IS NULL
+  AND ((status = 'creating' AND created_at < @creating_before) OR status = 'deleting')
+ORDER BY created_at
+LIMIT sqlc.arg('row_limit')::bigint;

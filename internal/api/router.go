@@ -49,6 +49,13 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.POST("/sandboxes/:sandbox_id/secrets", h.AttachSandboxSecret)
 		api.DELETE("/sandboxes/:sandbox_id/secrets/:env_key", h.DetachSandboxSecret)
 
+		// Saved snapshots: captures a new sandbox can be created from.
+		api.POST("/sandboxes/:sandbox_id/snapshot", h.CreateSandboxSnapshot)
+		api.GET("/sandboxes/:sandbox_id/snapshots", h.ListSandboxSnapshots)
+		api.GET("/snapshots/:snapshot_id", h.GetSnapshot)
+		api.PATCH("/snapshots/:snapshot_id", h.PatchSnapshot)
+		api.DELETE("/snapshots/:snapshot_id", h.DeleteSnapshot)
+
 		// Directory listing (metadata) flows through the control plane via
 		// boxd's FilesystemService.ListDir, so it works on every sandbox
 		// regardless of boxd version. Paused sandboxes are resumed transparently.
