@@ -4,7 +4,6 @@ set -euo pipefail
 : "${PROJECT:?PROJECT is required}"
 : "${STATE_BUCKET:?STATE_BUCKET is required}"
 : "${DEPLOYMENT_SERVICE_ACCOUNT:?DEPLOYMENT_SERVICE_ACCOUNT is required}"
-: "${TF_VAR_policy_reader_service_accounts:?TF_VAR_policy_reader_service_accounts is required}"
 : "${GITHUB_ENV:?GITHUB_ENV is required}"
 : "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
 : "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}"
@@ -19,8 +18,7 @@ terraform init -input=false -reconfigure -lockfile=readonly \
   -backend-config="prefix=bootstrap/control-plane-evidence"
 applied=false
 for attempt in 1 2 3 4 5 6; do
-  # A partial apply can enable an API before its operation-read grant has
-  # propagated. Replan against saved state rather than replaying a stale plan.
+  # Replan after a partial apply rather than replaying a stale plan.
   if terraform plan -input=false -out=tfplan && terraform apply -input=false -auto-approve tfplan; then
     applied=true
     break

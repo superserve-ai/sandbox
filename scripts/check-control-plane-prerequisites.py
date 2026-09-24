@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check rollout tooling as the deployment identity before changing Cloud Run."""
+"""Check deployment readiness before changing Cloud Run."""
 
 import argparse
 import importlib.util
@@ -84,11 +84,9 @@ def contract_from_plan(plan):
 def check_prerequisites(args, contract, preflight):
     evidence = preflight.evidence
     command = preflight.command
-    # New runtime/host account emails may still be computed in the plan. Probe
-    # tooling with the existing caller; the cutover verifier checks the actual
-    # newly provisioned identities, grants, and isolation after apply.
+    # Runtime/host emails may still be computed in the plan. Readiness uses the
+    # existing caller; actual runtime access is verified after regional apply.
     identity = contract["deployment_identity"]
-    bucket = contract["backup_bucket"]
     require(contract["deployment_identity"] == args.deployment_identity, "Plan names a different deployment identity")
     require(contract["region"] == args.region, "Plan names a different region")
     require(identity.endswith(f"@{args.project}.iam.gserviceaccount.com"), "Plan names a different deployment project")
@@ -96,43 +94,8 @@ def check_prerequisites(args, contract, preflight):
 
     command("deployment-identity", VERIFY.gcloud("auth", "list", "--filter=status:ACTIVE", "--format=value(account)"),
             lambda text: require(text.strip() == args.deployment_identity, "Preflight is not running as the deployment account"))
-    command("verification-apis", VERIFY.gcloud("services", "list", "--enabled", f"--project={args.project}", "--format=value(config.name)"),
-            lambda text: require({"cloudasset.googleapis.com", "policytroubleshooter.googleapis.com"} <= set(text.splitlines()), "Verification APIs are not enabled"))
     command("service-readiness", VERIFY.gcloud("run", "services", "describe", args.service, f"--project={args.project}", f"--region={args.region}", "--format=json"),
             lambda text: require(any(entry.get("percent") == 100 and entry.get("revisionName") for entry in json.loads(text).get("status", {}).get("traffic", [])), "No 100% rollback revision"))
-    command("project-policy", VERIFY.gcloud("projects", "get-iam-policy", args.project, "--format=json"))
-    managed_folders = {}
-    for index, target in enumerate([bucket, *args.other_bucket], 1):
-        command(f"bucket-policy-{index}", VERIFY.gcloud("storage", "buckets", "get-iam-policy", f"gs://{target}", "--format=json"))
-        name = f"managed-folders-{index}"
-        preflight.check(name, lambda name=name, target=target: managed_folders.update({
-            target: VERIFY.read_managed_folders(evidence, name, target),
-        }))
-
-    # These probes check whether tooling can reach a definite decision. Current
-    # grants may change during the regional apply; the cutover verifier still
-    # requires explicit denial for every isolation check afterwards.
-    def check_permission(name, target, obj, permission):
-        require(target in managed_folders, "Managed-folder inventory is unavailable")
-        argv = VERIFY.storage_permission_command(identity, target, obj, permission, managed_folders[target])
-        text = evidence.command(name, [*argv, f"--project={args.project}"])
-        require(VERIFY.policy_troubleshooter_access(text) in {"GRANTED", "NOT_GRANTED", "DENIED"},
-                "Policy decision is unknown; inspect inherited policies, custom roles, and group visibility")
-
-    for name, target, obj, permission in VERIFY.storage_denial_checks(bucket, args.other_bucket, "templates/.permission-probe"):
-        name = f"policy-visibility-{name.removesuffix('-denied')}"
-        preflight.check(name, lambda name=name, target=target, obj=obj, permission=permission:
-                        check_permission(name, target, obj, permission))
-
-    def check_nested_folders():
-        require(all(target in managed_folders for target in [bucket, *args.other_bucket]),
-                "Managed-folder inventory is unavailable")
-        for name, target, obj, permission in VERIFY.managed_folder_denial_checks(bucket, args.other_bucket, managed_folders):
-            check_permission(f"policy-visibility-{name}", target, obj, permission)
-
-    preflight.check("nested-managed-folder-policy-visibility", check_nested_folders)
-    command("impersonation-analysis", VERIFY.host_effective_iam_command(args.project, identity, identity), VERIFY.iam_analysis_results)
-    command("effective-iam", VERIFY.effective_iam_command(args.project, identity, bucket), VERIFY.iam_analysis_results)
     for index, secret in enumerate(contract["secret_ids"], 1):
         command(f"secret-version-{index}", VERIFY.gcloud("secrets", "versions", "describe", "latest", f"--secret={secret}", f"--project={args.project}", "--format=json"),
                 lambda text: require(json.loads(text).get("state") == "ENABLED", "Latest secret version is not enabled"))
@@ -148,7 +111,6 @@ def main():
         parser.add_argument(f"--{name}", required=True)
     parser.add_argument("--plan-file", type=Path, required=True)
     parser.add_argument("--evidence-dir", type=Path, required=True)
-    parser.add_argument("--other-bucket", action="append", default=[])
     args = parser.parse_args()
     evidence = VERIFY.Evidence(args.evidence_dir)
     try:

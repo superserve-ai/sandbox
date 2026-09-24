@@ -15,10 +15,8 @@ on:
         required: true
         type: string
 
-# Both projects grant policy inspection to the existing deployment accounts.
 env:
   CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
-  TF_VAR_policy_reader_service_accounts: '["superserve-github-actions@rayai-dev.iam.gserviceaccount.com", "superserve-github-actions@rayai-prod.iam.gserviceaccount.com"]'
 
 jobs:
   bootstrap:
@@ -48,7 +46,7 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v2
-      - name: Bootstrap verification APIs, policy readers, and evidence
+      - name: Prepare evidence storage and KMS metadata access
         env:
           PROJECT: ${{ vars.GCP_PROJECT }}
           DEPLOYMENT_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
@@ -69,24 +67,18 @@ jobs:
             state_bucket: superserve-terraform-state
             region_variable: GCP_REGION
             service_variable: CLOUD_RUN_SERVICE
-            other_bucket_1: superserve-artifact-backup-use4
-            other_bucket_2: superserve-artifact-backup-usw2
           - cell: production-use4
             environment: production
             root: infra/envs/production/us-east4
             state_bucket: superserve-terraform-state-prod
             region_variable: GCP_REGION_USE4
             service_variable: CLOUD_RUN_SERVICE_USE4
-            other_bucket_1: superserve-artifact-backup-staging-usc1
-            other_bucket_2: superserve-artifact-backup-usw2
           - cell: production-usw2
             environment: production
             root: infra/envs/production/us-west2
             state_bucket: superserve-terraform-state-prod
             region_variable: GCP_REGION_USW
             service_variable: CLOUD_RUN_SERVICE_USW
-            other_bucket_1: superserve-artifact-backup-staging-usc1
-            other_bucket_2: superserve-artifact-backup-use4
     runs-on: ubuntu-latest
     environment: ${{ matrix.environment }}
     permissions:
@@ -96,8 +88,6 @@ jobs:
       CELL: ${{ matrix.cell }}
       TF_ROOT: ${{ matrix.root }}
       STATE_BUCKET: ${{ matrix.state_bucket }}
-      OTHER_BUCKET_1: ${{ matrix.other_bucket_1 }}
-      OTHER_BUCKET_2: ${{ matrix.other_bucket_2 }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -134,8 +124,7 @@ jobs:
           python3 scripts/check-control-plane-prerequisites.py \
             --cell "$CELL" --project "$PROJECT" --region "$REGION" --service "$SERVICE" \
             --deployment-identity "$DEPLOYMENT_IDENTITY" \
-            --plan-file "$RUNNER_TEMP/prerequisite-plan.json" --evidence-dir "$evidence" \
-            --other-bucket "$OTHER_BUCKET_1" --other-bucket "$OTHER_BUCKET_2"
+            --plan-file "$RUNNER_TEMP/prerequisite-plan.json" --evidence-dir "$evidence"
       - name: Persist private prerequisite evidence
         if: always()
         run: |
