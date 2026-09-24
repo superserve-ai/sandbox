@@ -264,6 +264,24 @@ func TestFreezeEndpointStatusCodes(t *testing.T) {
 			t.Errorf("status %d body %s, want 200 echoing version and token", rec.Code, rec.Body.String())
 		}
 	})
+	t.Run("sync_flushes_once_frozen", func(t *testing.T) {
+		cg := newFake()
+		fz := newFreezer(cg, testDir)
+		flushedWhile := ""
+		fz.flush = func() { flushedWhile, _ = cg.readState() }
+		rec := httptest.NewRecorder()
+		fz.handleFreeze(rec, httptest.NewRequest(http.MethodPost, "/freeze", strings.NewReader(`{"token":"t1","sync":true}`)))
+		if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"synced":true`) || flushedWhile != "FROZEN" {
+			t.Errorf("status %d body %s flushed while %q, want 200 echoing synced with the flush after the freeze", rec.Code, rec.Body.String(), flushedWhile)
+		}
+		rec = httptest.NewRecorder()
+		fz2 := newFreezer(newFake(), testDir)
+		fz2.flush = func() { t.Error("flushed without being asked") }
+		fz2.handleFreeze(rec, httptest.NewRequest(http.MethodPost, "/freeze", strings.NewReader(`{"token":"t1"}`)))
+		if strings.Contains(rec.Body.String(), "synced") {
+			t.Errorf("body %s claims a flush nobody asked for", rec.Body.String())
+		}
+	})
 	t.Run("no_token_is_400", func(t *testing.T) {
 		if got := post(newFreezer(newFake(), testDir), "/freeze", ""); got != 400 {
 			t.Errorf("status %d, want 400", got)

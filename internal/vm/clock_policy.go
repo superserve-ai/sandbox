@@ -267,19 +267,31 @@ func resumeImageFacts(memPath, pausedMemPath string, recordedCorrects, recordedF
 // is ambiguous, so the guest is thawed and that must confirm, else the pause
 // aborts. A retry, if any, mints a new token: the guest refuses a released one.
 func (m *Manager) freezeGuestForPause(ctx context.Context, ip, token string, log zerolog.Logger) (frozen bool, err error) {
+	frozen, _, err = m.freezeGuest(ctx, ip, token, false, log)
+	return frozen, err
+}
+
+// freezeGuest is freezeGuestForPause with, when sync is set, the guest's
+// filesystems flushed once its workload is stopped; synced reports whether
+// the guest did, which an older agent cannot.
+func (m *Manager) freezeGuest(ctx context.Context, ip, token string, sync bool, log zerolog.Logger) (frozen, synced bool, err error) {
 	budget := m.cfg.GuestFreezeBudget
 	if budget <= 0 {
 		budget = defaultGuestFreezeBudget
 	}
+	freeze := boxdFreezeGuest
+	if sync {
+		freeze = boxdFreezeGuestSync
+	}
 	fctx, cancel := context.WithTimeout(ctx, budget)
-	echo, ferr := boxdFreezeGuest(fctx, ip, token)
+	echo, ferr := freeze(fctx, ip, token)
 	cancel()
 	if ferr == nil && (echo.Token != token || echo.Version != WakeProtocolVersion) {
 		// The guest froze, but not as this protocol understands it: release it.
 		ferr = fmt.Errorf("freeze reply names protocol %d token %q, asked %d %q", echo.Version, echo.Token, WakeProtocolVersion, token)
 	}
 	if ferr == nil {
-		return true, nil
+		return true, echo.Synced, nil
 	}
 	tctx, tcancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer tcancel()
@@ -293,10 +305,10 @@ func (m *Manager) freezeGuestForPause(ctx context.Context, ip, token string, log
 		rcancel()
 	}
 	if terr != nil {
-		return false, fmt.Errorf("guest workload state unknown after failed freeze (%v); thaw not confirmed: %w", ferr, terr)
+		return false, false, fmt.Errorf("guest workload state unknown after failed freeze (%v); thaw not confirmed: %w", ferr, terr)
 	}
 	log.Warn().Err(ferr).Msg("pause: guest workload not frozen; this image will wake the slower way")
-	return false, nil
+	return false, false, nil
 }
 
 // noteGuestClockUnready latches this host to unfrozen restores: host time is a

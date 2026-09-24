@@ -31,10 +31,11 @@ import (
 const (
 	SavedSnapshotsDirName     = "saved"
 	savedSnapshotManifestName = "manifest.json"
-	// Deleted ids, one empty file each, never reaped: a capture for one is
-	// refused, so a delete is final however late a retry of the capture
-	// arrives.
+	// Deleted ids, one empty file each, kept for a day: a capture for one is
+	// refused while its file is there, and a retry of the capture can arrive
+	// no later than its own deadline after the delete, minutes.
 	savedTombstonesDirName = ".deleted"
+	savedTombstoneTTL      = 24 * time.Hour
 	savedSnapshotVersion   = 1
 	defaultSavedCaptures   = 2
 	savedCaptureHeadroom   = 256 << 20
@@ -295,6 +296,7 @@ func (m *Manager) DeleteSavedSnapshot(ctx context.Context, snapshotID string) er
 	if err := writeSavedTombstone(dir); err != nil {
 		return fmt.Errorf("record saved snapshot deletion: %w", err)
 	}
+	reapSavedTombstones(filepath.Dir(savedTombstonePath(dir)), time.Now().Add(-savedTombstoneTTL))
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("remove saved snapshot: %w", err)
 	}
@@ -321,8 +323,9 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		return err
 	}
 	// The disk alone is an fs snapshot, so what the guest has written but
-	// not yet flushed has to reach it first. A memory image carries the page
-	// cache itself.
+	// not yet flushed has to reach it first: here while the workload still
+	// runs, and again below once it is stopped, for a guest that can. A
+	// memory image carries the page cache itself.
 	if kind == SavedSnapshotFS && ip != "" {
 		if err := syncGuestFilesystems(ctx, ip); err != nil {
 			return status.Errorf(codes.FailedPrecondition, "guest did not flush its filesystems before the capture: %v", err)
@@ -332,8 +335,10 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	if recordedCorrects == nil {
 		corrects = guestCorrectsWallClock(memFile, baseMem)
 	}
-	willFreeze := kind == SavedSnapshotMemFS && corrects && m.cfg.GuestClockFreezeEnabled &&
-		m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load()
+	// An fs capture stops the workload so nothing is written between the
+	// flush and the pause; only a memory image also needs the clock policy.
+	willFreeze := corrects && m.cfg.GuestClockFreezeEnabled &&
+		(kind == SavedSnapshotFS || (m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load()))
 	token, artifact := "", NewArtifactID()
 	if willFreeze {
 		token = NewFreezeToken()
@@ -352,10 +357,10 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	if err := writeStagedIntent(sourceDir, pauseIntent{VMID: vmID, FreezeToken: token, ArtifactID: artifact}); err != nil {
 		return fmt.Errorf("record capture intent: %w", err)
 	}
-	frozen := false
+	frozen, synced := false, false
 	if willFreeze {
 		var ferr error
-		frozen, ferr = m.freezeGuestForPause(ctx, ip, token, log)
+		frozen, synced, ferr = m.freezeGuest(ctx, ip, token, kind == SavedSnapshotFS, log)
 		if ferr != nil {
 			m.markUnservable(inst, log)
 			return ferr
@@ -417,7 +422,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		return captureErr
 	}
 	m.recordPhases("saved_snapshot", string(kind), map[string]time.Duration{"frozen": frozenFor})
-	log.Info().Dur("frozen", frozenFor).Bool("workload_frozen", frozen).Msg("saved snapshot: source captured and released")
+	log.Info().Dur("frozen", frozenFor).Bool("workload_frozen", frozen).Bool("guest_flushed_stopped", synced).Msg("saved snapshot: source captured and released")
 	return nil
 }
 
@@ -699,6 +704,18 @@ func writeSavedTombstone(dir string) error {
 	return fsyncDir(filepath.Dir(path))
 }
 
+func reapSavedTombstones(tombs string, before time.Time) {
+	entries, err := os.ReadDir(tombs)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && info.ModTime().Before(before) {
+			_ = os.Remove(filepath.Join(tombs, e.Name()))
+		}
+	}
+}
+
 func readSavedSnapshotManifest(dir string) (*SavedSnapshotManifest, error) {
 	b, err := os.ReadFile(filepath.Join(dir, savedSnapshotManifestName))
 	if err != nil {
@@ -752,6 +769,7 @@ func (m *Manager) SweepSavedSnapshotStaging(log zerolog.Logger) <-chan struct{} 
 			return
 		}
 		start := time.Now()
+		reapSavedTombstones(filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, savedTombstonesDirName), start.Add(-savedTombstoneTTL))
 		stale, _ := filepath.Glob(filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, ".*.tmp-*"))
 		n := 0
 		for _, d := range stale {
