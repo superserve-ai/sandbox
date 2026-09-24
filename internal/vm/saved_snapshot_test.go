@@ -1000,3 +1000,57 @@ func TestAwaitFirecrackerOutlastsABusyAPI(t *testing.T) {
 		t.Fatalf("wait took %s after a 1.5s recovery", d)
 	}
 }
+
+func TestForkSourceTakesResourcesFromTheSnapshot(t *testing.T) {
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, true)
+	ctx := context.Background()
+	man, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := VMConfig{SavedSnapshotID: man.SnapshotID}
+	if _, _, _, err := m.forkSource(uuid.NewString(), &cfg, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VCPU != man.VCPU || cfg.MemoryMiB != man.MemoryMiB || cfg.DiskSizeMiB != man.DiskSizeMiB {
+		t.Errorf("config %+v does not carry the snapshot's shape %d/%d/%d", cfg, man.VCPU, man.MemoryMiB, man.DiskSizeMiB)
+	}
+	small := VMConfig{SavedSnapshotID: man.SnapshotID, VCPU: man.VCPU, MemoryMiB: man.MemoryMiB / 2}
+	if _, _, _, err := m.forkSource(uuid.NewString(), &small, "", ""); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("request with another memory size: want InvalidArgument, got %v", err)
+	}
+}
+
+func TestForkRefusesASnapshotReplacedUnderItsId(t *testing.T) {
+	m := newSavedTestManager(t)
+	first, _ := seedPausedSource(t, m, true)
+	second, _ := seedPausedSource(t, m, true)
+	ctx := context.Background()
+	id := uuid.NewString()
+	man, err := m.CreateSavedSnapshot(ctx, first.ID, id, SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := uuid.NewString()
+	cfg := VMConfig{SavedSnapshotID: id}
+	if _, _, _, err := m.forkSource(child, &cfg, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	// Between the read and the copy: the id is deleted and captured again
+	// from another sandbox.
+	if err := m.DeleteSavedSnapshot(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.CreateSavedSnapshot(ctx, second.ID, id, SavedSnapshotMemFS); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.materializeFork(ctx, child, man); status.Code(err) != codes.NotFound {
+		t.Fatalf("fork from a manifest the id no longer describes: want NotFound, got %v", err)
+	}
+	for _, dir := range []string{filepath.Join(m.cfg.RunDir, child), filepath.Join(m.cfg.SnapshotDir, child)} {
+		if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s left behind by a refused fork", dir)
+		}
+	}
+}

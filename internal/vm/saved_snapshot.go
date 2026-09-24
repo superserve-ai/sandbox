@@ -726,7 +726,16 @@ func (m *Manager) forkSource(childID string, cfg *VMConfig, snapshotPath, memPat
 	if cfg.BasePath != "" && cfg.BasePath != man.BasePath {
 		return nil, "", "", status.Errorf(codes.InvalidArgument, "base_path %q is not saved snapshot %s's base %q", cfg.BasePath, cfg.SavedSnapshotID, man.BasePath)
 	}
+	// The image fixes the machine's shape, and the host's capacity accounting
+	// charges what the config says, so the two must agree.
+	if cfg.VCPU != 0 && cfg.VCPU != man.VCPU {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "vcpu %d is not saved snapshot %s's %d", cfg.VCPU, cfg.SavedSnapshotID, man.VCPU)
+	}
+	if cfg.MemoryMiB != 0 && cfg.MemoryMiB != man.MemoryMiB {
+		return nil, "", "", status.Errorf(codes.InvalidArgument, "memory %d MiB is not saved snapshot %s's %d", cfg.MemoryMiB, cfg.SavedSnapshotID, man.MemoryMiB)
+	}
 	cfg.BasePath = man.BasePath
+	cfg.VCPU, cfg.MemoryMiB, cfg.DiskSizeMiB = man.VCPU, man.MemoryMiB, man.DiskSizeMiB
 	own := filepath.Join(m.cfg.SnapshotDir, childID)
 	return man, filepath.Join(own, "vmstate.snap"), filepath.Join(own, filepath.Base(man.MemPath)), nil
 }
@@ -751,16 +760,33 @@ func (m *Manager) retriedForkTarget(vmID, snapshotID string) (*VMInstance, bool)
 	return m.retriedLaunchTarget(vmID, snap, mem)
 }
 
-// savedSnapshotCommitted reports whether the snapshot is still on disk. The
-// caller holds its lock, so the answer holds until the lock is released.
+// savedSnapshotCommitted reports whether the snapshot man describes is still
+// on disk. man was read before the caller took the snapshot's lock, and the
+// id could have been deleted and captured again meanwhile, so the manifest
+// is read again under the lock and must be the same snapshot; the answer
+// then holds until the lock is released.
 func savedSnapshotCommitted(man *SavedSnapshotManifest) error {
-	if _, err := os.Stat(filepath.Join(filepath.Dir(man.DiskPath), savedSnapshotManifestName)); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return status.Errorf(codes.NotFound, "saved snapshot %s was deleted", man.SnapshotID)
-		}
-		return fmt.Errorf("stat saved snapshot: %w", err)
+	now, err := readSavedSnapshotManifest(filepath.Dir(man.DiskPath))
+	if errors.Is(err, os.ErrNotExist) {
+		return status.Errorf(codes.NotFound, "saved snapshot %s was deleted", man.SnapshotID)
+	}
+	if err != nil {
+		return fmt.Errorf("read saved snapshot: %w", err)
+	}
+	if !now.sameSnapshot(man) {
+		return status.Errorf(codes.NotFound, "saved snapshot %s was replaced since it was read", man.SnapshotID)
 	}
 	return nil
+}
+
+// sameSnapshot reports whether two manifests describe one capture: the
+// same source, kind, files and moment.
+func (a *SavedSnapshotManifest) sameSnapshot(b *SavedSnapshotManifest) bool {
+	return a.SnapshotID == b.SnapshotID && a.SourceVMID == b.SourceVMID && a.Kind == b.Kind &&
+		a.BasePath == b.BasePath && a.DiskPath == b.DiskPath && a.SnapshotPath == b.SnapshotPath &&
+		a.MemPath == b.MemPath && a.BaseMemPath == b.BaseMemPath &&
+		a.VCPU == b.VCPU && a.MemoryMiB == b.MemoryMiB && a.DiskSizeMiB == b.DiskSizeMiB &&
+		a.CreatedAt.Equal(b.CreatedAt)
 }
 
 // materializeFork gives the VM its own copy of every file the snapshot owns,
