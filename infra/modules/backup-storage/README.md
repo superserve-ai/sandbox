@@ -14,6 +14,7 @@ files on any replacement host:
 ```
 sandboxes/<sandbox_id>/<generation>/            vmstate.snap, disk files, manifest (mem files never upload: filesystem-only durability)
 templates/<template_id>/<build_id>/             vmstate.snap, mem.snap, *.delta, base.ext4, build.meta.json, manifest
+bases/<sha256>.p<fingerprint>                   immutable shared base images referenced by template manifests
 ```
 
 `<generation>` is a monotonically increasing per-sandbox backup counter so
@@ -25,6 +26,7 @@ generation is recorded in the control-plane database.
 | Identity | Roles | Can |
 | --- | --- | --- |
 | legacy shared runtime (`writer_members`) | `objectCreator` only | create new objects, nothing else |
+| dedicated per-cell control-plane SA (`reader_members`) | managed-folder `objectViewer` on `templates/` and `bases/` | read/list template manifests, referenced objects, and shared base objects in that cell; no sandbox access, write, or delete |
 | dedicated per-cell VMD SA (environment-owned grants) | `objectCreator` + `objectViewer` | create/read/list within its cell only; no delete/overwrite |
 | dedicated restore SA (created by this module) | `objectViewer` | read/list, for restore tooling and drills via impersonation |
 | dedicated GC SA (created by this module) | `objectAdmin` | delete objects past the retention window |
@@ -36,6 +38,11 @@ exfiltrate every cell's backups), cannot delete, and cannot **overwrite**
 Uploader idempotency uses an `ifGenerationMatch=0` precondition instead of
 get/list: a 412 response means the object already exists and is treated as
 success.
+
+The `templates/` and `bases/` managed folders are the reader boundaries. A
+bucket IAM condition cannot provide the same isolation for listings because
+Cloud Storage evaluates `storage.objects.list` against the bucket resource
+rather than an individual object name.
 
 The restore and GC service accounts are control-plane/tooling-only: no host
 or runtime service may run as them, and impersonation grants are managed

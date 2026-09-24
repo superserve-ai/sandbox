@@ -1,0 +1,180 @@
+# Control-plane identity isolation
+
+This runbook is the operator contract for the three serving cells. Terraform
+creates one Cloud Run runtime identity per cell, grants it the cell's exact
+runtime secret set, and grants `roles/storage.objectViewer` on the
+`templates/` and `bases/` managed folders in that cell's backup bucket. The
+managed-folder bindings provide template and shared-base object get/list; they
+do not provide sandbox access, create, overwrite, or delete.
+
+## Published contract
+
+| Cell | Cloud Run identity | Backup bucket | Deployment principal (act-as + token creator) | Host identity |
+| --- | --- | --- | --- | --- |
+| staging | `superserve-cp-staging` | `superserve-artifact-backup-staging-usc1` | environment GitHub Actions service account | legacy `superserve-api` remains on the draining host |
+| production use | `superserve-controlplane-use4` | `superserve-artifact-backup-use4` | environment GitHub Actions service account | dedicated `vmd-runtime-production-use4` |
+| production usw2 | `superserve-controlplane-usw2` | `superserve-artifact-backup-usw2` | environment GitHub Actions service account | dedicated `vmd-runtime-production-usw2` |
+
+The authoritative rendered values are the `controlplane_identity_contract`
+outputs from each environment root. The output includes the runtime identity,
+bucket, allowed storage permissions and reader object prefixes, secret IDs, deployment
+identity, deployment act-as and token-creation permissions, KMS grant principal
+and role, and KMS owner. The KMS key is the shared credentials key for both production
+cells; each production Terraform root already owns its runtime identity's
+`roles/cloudkms.cryptoKeyEncrypterDecrypter` grant. The shared-key bootstrap
+provides the deployment principal's key-scoped IAM administration separately;
+this rollout does not change that bootstrap or require another owner identity.
+
+The serving identities must never be attached to a VMD instance. VMD grants
+remain environment-owned: staging's legacy host keeps its existing writer
+grant while it drains, and the dedicated production VMD identities keep their
+existing create/read grants. No new host grant or host impersonation grant is
+part of this migration.
+
+The regular production API deployment workflows update Cloud Run with
+`--no-traffic`, then run `scripts/verify-control-plane-kms.sh`. That check
+verifies access to every production runtime secret and performs an
+encrypt/decrypt round trip as the runtime identity before the workflow routes
+the revision. It does not change IAM policy.
+
+Automatic Terraform CD runs a plan-time identity guard for all three serving
+cells and refuses any control-plane service-account transition before apply.
+Use the staged identity rollout for that transition; ordinary image and
+infrastructure changes may resume automatically after the staged cutover.
+Production CD pins traffic before creating its saved plan and checks that the
+plan retains 100% traffic on the captured revision. All deployment paths use
+the same multi-run queue so an active identity rollout does not cause the
+API and Terraform workflows waiting behind it to replace each other.
+
+## Migration order
+
+1. From each environment root, review `terraform plan` and confirm the new
+   service account, exact secret set, template and shared-base managed-folder viewer grants, metric-writer grant,
+   and scoped GitHub Actions act-as and token-creation grants. Confirm no VMD service account is a
+   `reader_members` entry.
+2. Run the manually confirmed
+   `.github/workflows/control-plane-identity-rollout.yml` with `confirm=apply`.
+   Terraform grants the deployment principal scoped token creation on each
+   dedicated runtime identity so the verifier can run its GCS, Secret Manager,
+   and runtime KMS probes. No separate KMS-owner secret is required.
+   Before touching Cloud Run, each stage applies the isolated evidence-storage
+   Terraform root and proves it can upload evidence. No manual bucket creation
+   or GitHub evidence-bucket variable is needed.
+   The workflow is deliberately serial: staging, production use4, then
+   production usw2. Each stage captures the serving revision before apply,
+   validates its saved Terraform plan, then applies it and verifies the deployed identity,
+   retains the full evidence privately, and uploads only a sanitized summary.
+   The plan guard rejects all VM, persistent-disk, disk-attachment, and host
+   identity-adapter changes, including staging's legacy host. Handle any such
+   maintenance separately; this rollout must not restart hosts. A failed stage
+   blocks later cells.
+3. For each production stage, Terraform first creates the new identity and
+   revision without routing traffic to it and manages its existing KMS grant.
+   The verifier gates the stage on a runtime-identity
+   KMS encrypt/decrypt round trip as well as same-cell manifest/reference
+   reads, cross-cell root and prefix list denial, non-mutating IAM Policy
+   Troubleshooter checks for own-cell sandbox reads, own-cell mutations, and
+   cross-cell reads and mutations across all three prefixes, Secret Manager
+   access, fully explored effective IAM analysis, deployment act-as, and the
+   Terraform-managed KMS binding. The workflow captures the latest created
+   revision after apply, verifies that exact candidate's identity and Ready
+   condition, then routes traffic to it by name. A retired zero-traffic candidate
+   can be Ready while `latestReadyRevisionName` still names the old revision.
+   The final check requires the verified candidate to have 100% traffic.
+4. Keep the old shared production runner grants until both old revisions are
+   drained and the dependency audit below is complete. The workflow's failure
+   trap restores both the captured revision's traffic and the pre-migration
+   Cloud Run service identity, then includes the outcome in the private
+   evidence even when verification fails.
+5. After the drain, remove only obsolete shared control-plane grants. Do not
+   remove a grant that a legacy host, restore tool, GC job, or rollback
+   revision still uses. In particular, staging's `superserve-api` host grant
+   stays until that host is separately migrated.
+
+Cloud Run rollout failure leaves the old revision serving and restores the
+service template to its pre-migration identity. Do not revoke the old
+identity's secret/KMS permissions until the new revision is ready and positive
+checks have passed. To roll back, route traffic to the last known good
+revision, restore the old identity's grants if they were already removed, and
+repeat the checks before retrying the cutover.
+
+## Durable evidence gate
+
+The verifier keeps its full evidence directory on the runner while the stage
+is executing; it includes production principals, resource names, IAM policies,
+and command output and must never be uploaded. The workflow artifact contains
+only `summary.json` and `summary.txt`, generated by
+`scripts/sanitize-control-plane-evidence.py`. Those public-safe summaries
+record the cell, overall status, and each check's name and PASS/FAIL verdict,
+without command arguments, policy documents, object names, or identities.
+
+Each stage bootstraps `infra/bootstrap/control-plane-evidence` in its own project
+before changing service identity or traffic. State lives at
+`bootstrap/control-plane-evidence` in the existing environment Terraform state
+bucket. Staging uses its own store; both production regions share the production
+store and state. The bucket name is `<project-id>-control-plane-evidence` and is
+passed directly from Terraform to the upload steps.
+
+Buckets enforce uniform access and public access prevention, use Google-managed
+encryption at rest, prevent Terraform destruction, and retain objects for 90
+days with lifecycle deletion eligible after that period. Retention is not locked.
+The environment's deployment principal receives bucket-scoped object creator
+and viewer grants so the CLI can discover upload destinations; no object delete
+grant is added. Existing project IAM still applies. Evidence is
+stored under a run-, attempt-, and cell-specific prefix. No template-backup
+bucket is used. Bootstrap and an actual test upload must succeed before the
+identity migration begins. The deployment principal needs permission to create
+buckets and manage bucket IAM, in addition to its existing Terraform state access.
+
+The release owner links the private evidence with the Terraform plan/apply and
+UTC observation time before declaring a cell complete. A missing summary
+or any FAIL row is an incomplete migration, even if the service health endpoint
+responds. The workflow also fails closed when the private `evidence.json` is
+missing any required PASS row, including one for every unchanged host
+principal's inability to impersonate the serving identity; an uploaded
+summary alone is not approval.
+
+The verifier discovers a real generation manifest at
+`templates/<template>/<build>/<generation>/manifest.json` and reads every
+artifact named by its `files[*].object` entries, including bucket-relative
+`bases/` shared objects. If a manifest uses a format
+without discoverable object URIs, rerun it with one `--referenced-object`
+argument per manifest reference; do not substitute a made-up path.
+
+## Verification checklist
+
+For each cell, record the command output and timestamp in the rollout record:
+
+```sh
+python3 scripts/verify-control-plane-identity.py \
+  --cell CELL --project PROJECT --region REGION --service SERVICE \
+  --contract-file CONTRACT.json --evidence-dir EVIDENCE_DIR \
+  --other-bucket OTHER_CELL_BUCKET
+```
+
+The verifier discovers the actual generation `manifest.json` object, reads
+each referenced artifact, and uses IAM Policy Troubleshooter to confirm that
+the runtime identity is denied `storage.objects.get` under `sandboxes/` in
+its own bucket and under `templates/`, `bases/`, and `sandboxes/` in every
+other cell's bucket. It confirms denial of `storage.objects.create` and
+`storage.objects.delete` for synthetic objects under all three prefixes in
+its own and every other cell's bucket, plus deletion of the live manifest.
+It also requires list denial at each cross-cell prefix, not just the bucket
+root. These object-permission checks are non-mutating,
+so retries cannot turn a create check into an overwrite check or alter a
+customer artifact. A missing object is not a negative IAM result.
+
+Also verify that the deployment principal can update the Cloud Run service with
+the new identity and mint credentials as that identity for the probes, that the
+runtime can access every rendered Secret Manager secret, and that the control
+plane's existing KMS-dependent operation still succeeds. Inspect effective IAM
+(including inherited project/folder grants and service-account impersonation)
+before declaring the negative checks complete.
+
+For the effective audit, retain the verifier's
+`gcloud asset analyze-iam-policy --project=PROJECT ...` output together
+with the direct project, bucket, managed-folder, and service-account policies. In the cleanup
+row, record `removed` or `retained-with-dependency`, the exact principal and
+role, the dependency owner, and the observation time. Only rows marked
+`removed` after the old revision is drained may be revoked; rows needed by the
+staging host, restore/GC tooling, or rollback remain explicitly retained.

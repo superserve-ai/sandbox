@@ -1,0 +1,388 @@
+name: Control-plane identity rollout
+
+# Hold the same lock as ordinary API and Terraform CD deployments so an
+# identity-changing apply cannot be followed by an unchecked revision route.
+concurrency:
+  group: control-plane-deploy
+  queue: max
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type apply to run the staged identity migration"
+        required: true
+        type: string
+
+jobs:
+  staging:
+    name: Stage staging/us-central1
+    if: ${{ github.ref == 'refs/heads/main' && inputs.confirm == 'apply' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Bootstrap and check private evidence storage
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          DEPLOYMENT_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          STATE_BUCKET: superserve-terraform-state
+        run: scripts/bootstrap-control-plane-evidence.sh
+      - name: Apply and verify staging identity
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          REGION: ${{ vars.GCP_REGION }}
+          SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/control-plane-identity/staging"
+          gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format=json > "$GITHUB_WORKSPACE/staging-before.json"
+          previous=$(jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // empty' "$GITHUB_WORKSPACE/staging-before.json")
+          test -n "$previous" || { echo "No 100% rollback revision; refusing staged migration." >&2; exit 1; }
+          previous_identity=$(jq -r '[.spec.template.serviceAccount, .spec.template.serviceAccountName, .spec.template.spec.serviceAccountName]
+            | map(select(type == "string" and length > 0)) | .[0] // empty' "$GITHUB_WORKSPACE/staging-before.json")
+          test -n "$previous_identity" || { echo "No rollback service identity; refusing staged migration." >&2; exit 1; }
+          identity_apply_started=false
+          rollback() {
+            rc=$?
+            if [[ "$rc" -ne 0 && -n "$previous" ]]; then
+              gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/staging/rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/staging/rollback.stderr" || true
+              if [[ "$identity_apply_started" == true ]]; then
+                gcloud run services update "$SERVICE" --service-account "$previous_identity" --no-traffic --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/staging/identity-rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/staging/identity-rollback.stderr" || true
+              fi
+              echo "rollback_revision=$previous" > "$RUNNER_TEMP/control-plane-identity/staging/rollback.txt"
+            fi
+            exit "$rc"
+          }
+          trap rollback EXIT
+          gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
+            > "$RUNNER_TEMP/control-plane-identity/staging/pre-apply-route.stdout" \
+            2> "$RUNNER_TEMP/control-plane-identity/staging/pre-apply-route.stderr"
+          cd infra/envs/staging/us-central1
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
+          identity_apply_started=true
+          terraform apply -input=false -auto-approve tfplan
+          terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/staging-contract.json"
+          candidate=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format='value(status.latestCreatedRevisionName)')
+          test -n "$candidate" || { echo "No candidate revision after apply." >&2; exit 1; }
+          # Terraform must not leave the new identity serving while the
+          # deployed permission probes are still pending.
+          gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
+            > "$RUNNER_TEMP/control-plane-identity/staging/pre-verification-route.stdout" \
+            2> "$RUNNER_TEMP/control-plane-identity/staging/pre-verification-route.stderr"
+          cat > "$RUNNER_TEMP/control-plane-identity/staging/kms-grant.txt" <<EOF
+          status=not-applicable
+          reason=staging-control-plane-does-not-configure-KMS_KEY_RESOURCE
+          EOF
+          python3 "$GITHUB_WORKSPACE/scripts/verify-control-plane-identity.py" \
+            --cell staging \
+            --project "$PROJECT" \
+            --region "$REGION" \
+            --service "$SERVICE" \
+            --previous-revision "$previous" \
+            --candidate-revision "$candidate" \
+            --allow-pending-traffic \
+            --route-traffic \
+            --contract-file "$GITHUB_WORKSPACE/staging-contract.json" \
+            --evidence-dir "$RUNNER_TEMP/control-plane-identity/staging" \
+            --other-bucket superserve-artifact-backup-use4 \
+            --other-bucket superserve-artifact-backup-usw2
+          test -s "$RUNNER_TEMP/control-plane-identity/staging/evidence.json"
+          jq -e '.status == "PASS" and all(.checks[]; .status == "PASS")' \
+            "$RUNNER_TEMP/control-plane-identity/staging/evidence.json" >/dev/null
+          echo "rollback=available_revision:${previous}" > "$RUNNER_TEMP/control-plane-identity/staging/rollback.txt"
+          for artifact in contract.json revision-traffic.json legacy-grant-audit.txt rollback.txt kms-grant.txt; do
+            test -s "$RUNNER_TEMP/control-plane-identity/staging/$artifact"
+          done
+          trap - EXIT
+      - name: Persist private staging evidence
+        if: always()
+        env:
+          EVIDENCE_BUCKET: ${{ env.CONTROL_PLANE_EVIDENCE_BUCKET }}
+        run: |
+          set -euo pipefail
+          test -n "$EVIDENCE_BUCKET" || { echo "Evidence storage bootstrap did not complete." >&2; exit 1; }
+          gcloud storage cp --recursive --if-generation-match=0 \
+            "$RUNNER_TEMP/control-plane-identity/staging" \
+            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/staging/"
+      - name: Prepare sanitized staging evidence
+        if: always()
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/sanitize-control-plane-evidence.py" \
+            --cell staging \
+            --input-dir "$RUNNER_TEMP/control-plane-identity/staging" \
+            --output-dir "$RUNNER_TEMP/control-plane-identity/public-staging"
+      - name: Upload staging evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: control-plane-identity-staging-${{ github.run_id }}
+          path: ${{ runner.temp }}/control-plane-identity/public-staging
+          if-no-files-found: error
+
+  production-use4:
+    name: Stage production/us-east4
+    needs: [staging]
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Bootstrap and check private evidence storage
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          DEPLOYMENT_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          STATE_BUCKET: superserve-terraform-state-prod
+        run: scripts/bootstrap-control-plane-evidence.sh
+      - name: Apply and verify production use4 identity
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          REGION: ${{ vars.GCP_REGION_USE4 }}
+          SERVICE: ${{ vars.CLOUD_RUN_SERVICE_USE4 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/control-plane-identity/use4"
+          gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format=json > "$GITHUB_WORKSPACE/use4-before.json"
+          previous=$(jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // empty' "$GITHUB_WORKSPACE/use4-before.json")
+          test -n "$previous" || { echo "No 100% rollback revision; refusing staged migration." >&2; exit 1; }
+          previous_identity=$(jq -r '[.spec.template.serviceAccount, .spec.template.serviceAccountName, .spec.template.spec.serviceAccountName]
+            | map(select(type == "string" and length > 0)) | .[0] // empty' "$GITHUB_WORKSPACE/use4-before.json")
+          test -n "$previous_identity" || { echo "No rollback service identity; refusing staged migration." >&2; exit 1; }
+          identity_apply_started=false
+          rollback() {
+            rc=$?
+            if [[ "$rc" -ne 0 && -n "$previous" ]]; then
+              gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/use4/rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/use4/rollback.stderr" || true
+              if [[ "$identity_apply_started" == true ]]; then
+                gcloud run services update "$SERVICE" --service-account "$previous_identity" --no-traffic --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/use4/identity-rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/use4/identity-rollback.stderr" || true
+              fi
+              echo "rollback_revision=$previous" > "$RUNNER_TEMP/control-plane-identity/use4/rollback.txt"
+            fi
+            exit "$rc"
+          }
+          trap rollback EXIT
+          gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
+            > "$RUNNER_TEMP/control-plane-identity/use4/pre-apply-route.stdout" \
+            2> "$RUNNER_TEMP/control-plane-identity/use4/pre-apply-route.stderr"
+          cd infra/envs/production/us-east4
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
+          identity_apply_started=true
+          terraform apply -input=false -auto-approve tfplan
+          terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/use4-contract.json"
+          candidate=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format='value(status.latestCreatedRevisionName)')
+          test -n "$candidate" || { echo "No candidate revision after apply." >&2; exit 1; }
+          gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
+            > "$RUNNER_TEMP/control-plane-identity/use4/pre-kms-route.stdout" \
+            2> "$RUNNER_TEMP/control-plane-identity/use4/pre-kms-route.stderr"
+          kms_key=$(jq -r '.kms_key_resource // empty' "$GITHUB_WORKSPACE/use4-contract.json")
+          runtime_identity=$(jq -r '.runtime_service_account // empty' "$GITHUB_WORKSPACE/use4-contract.json")
+          kms_principal=$(jq -r '.kms_grant_principal // empty' "$GITHUB_WORKSPACE/use4-contract.json")
+          test -n "$kms_key" -a -n "$runtime_identity" -a "$kms_principal" = "$runtime_identity" || { echo "Production identity contract is missing a matching KMS key, runtime identity, or grant principal." >&2; exit 1; }
+          cat > "$RUNNER_TEMP/control-plane-identity/use4/kms-grant.txt" <<EOF
+          status=terraform-managed-before-cutover
+          owner=terraform
+          identity=$runtime_identity
+          key=$kms_key
+          role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+          EOF
+          python3 "$GITHUB_WORKSPACE/scripts/verify-control-plane-identity.py" \
+            --cell production-use4 \
+            --project "$PROJECT" \
+            --region "$REGION" \
+            --service "$SERVICE" \
+            --previous-revision "$previous" \
+            --candidate-revision "$candidate" \
+            --allow-pending-traffic \
+            --route-traffic \
+            --contract-file "$GITHUB_WORKSPACE/use4-contract.json" \
+            --evidence-dir "$RUNNER_TEMP/control-plane-identity/use4" \
+            --other-bucket superserve-artifact-backup-staging-usc1 \
+            --other-bucket superserve-artifact-backup-usw2
+          test -s "$RUNNER_TEMP/control-plane-identity/use4/evidence.json"
+          jq -e '.status == "PASS" and all(.checks[]; .status == "PASS")' \
+            "$RUNNER_TEMP/control-plane-identity/use4/evidence.json" >/dev/null
+          echo "rollback=available_revision:${previous}" > "$RUNNER_TEMP/control-plane-identity/use4/rollback.txt"
+          for artifact in contract.json revision-traffic.json legacy-grant-audit.txt rollback.txt kms-grant.txt; do
+            test -s "$RUNNER_TEMP/control-plane-identity/use4/$artifact"
+          done
+          trap - EXIT
+      - name: Persist private production use4 evidence
+        if: always()
+        env:
+          EVIDENCE_BUCKET: ${{ env.CONTROL_PLANE_EVIDENCE_BUCKET }}
+        run: |
+          set -euo pipefail
+          test -n "$EVIDENCE_BUCKET" || { echo "Evidence storage bootstrap did not complete." >&2; exit 1; }
+          gcloud storage cp --recursive --if-generation-match=0 \
+            "$RUNNER_TEMP/control-plane-identity/use4" \
+            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/production-use4/"
+      - name: Prepare sanitized production use4 evidence
+        if: always()
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/sanitize-control-plane-evidence.py" \
+            --cell production-use4 \
+            --input-dir "$RUNNER_TEMP/control-plane-identity/use4" \
+            --output-dir "$RUNNER_TEMP/control-plane-identity/public-use4"
+      - name: Upload production use4 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: control-plane-identity-use4-${{ github.run_id }}
+          path: ${{ runner.temp }}/control-plane-identity/public-use4
+          if-no-files-found: error
+
+  production-usw2:
+    name: Stage production/us-west2
+    needs: [production-use4]
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Bootstrap and check private evidence storage
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          DEPLOYMENT_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          STATE_BUCKET: superserve-terraform-state-prod
+        run: scripts/bootstrap-control-plane-evidence.sh
+      - name: Apply and verify production usw2 identity
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          REGION: ${{ vars.GCP_REGION_USW }}
+          SERVICE: ${{ vars.CLOUD_RUN_SERVICE_USW }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/control-plane-identity/usw2"
+          gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format=json > "$GITHUB_WORKSPACE/usw2-before.json"
+          previous=$(jq -r '[.status.traffic[]? | select(.percent == 100) | .revisionName] | first // empty' "$GITHUB_WORKSPACE/usw2-before.json")
+          test -n "$previous" || { echo "No 100% rollback revision; refusing staged migration." >&2; exit 1; }
+          previous_identity=$(jq -r '[.spec.template.serviceAccount, .spec.template.serviceAccountName, .spec.template.spec.serviceAccountName]
+            | map(select(type == "string" and length > 0)) | .[0] // empty' "$GITHUB_WORKSPACE/usw2-before.json")
+          test -n "$previous_identity" || { echo "No rollback service identity; refusing staged migration." >&2; exit 1; }
+          identity_apply_started=false
+          rollback() {
+            rc=$?
+            if [[ "$rc" -ne 0 && -n "$previous" ]]; then
+              gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/usw2/rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/usw2/rollback.stderr" || true
+              if [[ "$identity_apply_started" == true ]]; then
+                gcloud run services update "$SERVICE" --service-account "$previous_identity" --no-traffic --region "$REGION" --project "$PROJECT" > "$RUNNER_TEMP/control-plane-identity/usw2/identity-rollback.stdout" 2> "$RUNNER_TEMP/control-plane-identity/usw2/identity-rollback.stderr" || true
+              fi
+              echo "rollback_revision=$previous" > "$RUNNER_TEMP/control-plane-identity/usw2/rollback.txt"
+            fi
+            exit "$rc"
+          }
+          trap rollback EXIT
+          gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
+            > "$RUNNER_TEMP/control-plane-identity/usw2/pre-apply-route.stdout" \
+            2> "$RUNNER_TEMP/control-plane-identity/usw2/pre-apply-route.stderr"
+          cd infra/envs/production/us-west2
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
+          identity_apply_started=true
+          terraform apply -input=false -auto-approve tfplan
+          terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/usw2-contract.json"
+          candidate=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format='value(status.latestCreatedRevisionName)')
+          test -n "$candidate" || { echo "No candidate revision after apply." >&2; exit 1; }
+          gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
+            > "$RUNNER_TEMP/control-plane-identity/usw2/pre-kms-route.stdout" \
+            2> "$RUNNER_TEMP/control-plane-identity/usw2/pre-kms-route.stderr"
+          kms_key=$(jq -r '.kms_key_resource // empty' "$GITHUB_WORKSPACE/usw2-contract.json")
+          runtime_identity=$(jq -r '.runtime_service_account // empty' "$GITHUB_WORKSPACE/usw2-contract.json")
+          kms_principal=$(jq -r '.kms_grant_principal // empty' "$GITHUB_WORKSPACE/usw2-contract.json")
+          test -n "$kms_key" -a -n "$runtime_identity" -a "$kms_principal" = "$runtime_identity" || { echo "Production identity contract is missing a matching KMS key, runtime identity, or grant principal." >&2; exit 1; }
+          cat > "$RUNNER_TEMP/control-plane-identity/usw2/kms-grant.txt" <<EOF
+          status=terraform-managed-before-cutover
+          owner=terraform
+          identity=$runtime_identity
+          key=$kms_key
+          role=roles/cloudkms.cryptoKeyEncrypterDecrypter
+          EOF
+          python3 "$GITHUB_WORKSPACE/scripts/verify-control-plane-identity.py" \
+            --cell production-usw2 \
+            --project "$PROJECT" \
+            --region "$REGION" \
+            --service "$SERVICE" \
+            --previous-revision "$previous" \
+            --candidate-revision "$candidate" \
+            --allow-pending-traffic \
+            --route-traffic \
+            --contract-file "$GITHUB_WORKSPACE/usw2-contract.json" \
+            --evidence-dir "$RUNNER_TEMP/control-plane-identity/usw2" \
+            --other-bucket superserve-artifact-backup-staging-usc1 \
+            --other-bucket superserve-artifact-backup-use4
+          test -s "$RUNNER_TEMP/control-plane-identity/usw2/evidence.json"
+          jq -e '.status == "PASS" and all(.checks[]; .status == "PASS")' \
+            "$RUNNER_TEMP/control-plane-identity/usw2/evidence.json" >/dev/null
+          echo "rollback=available_revision:${previous}" > "$RUNNER_TEMP/control-plane-identity/usw2/rollback.txt"
+          for artifact in contract.json revision-traffic.json legacy-grant-audit.txt rollback.txt kms-grant.txt; do
+            test -s "$RUNNER_TEMP/control-plane-identity/usw2/$artifact"
+          done
+          trap - EXIT
+      - name: Persist private production usw2 evidence
+        if: always()
+        env:
+          EVIDENCE_BUCKET: ${{ env.CONTROL_PLANE_EVIDENCE_BUCKET }}
+        run: |
+          set -euo pipefail
+          test -n "$EVIDENCE_BUCKET" || { echo "Evidence storage bootstrap did not complete." >&2; exit 1; }
+          gcloud storage cp --recursive --if-generation-match=0 \
+            "$RUNNER_TEMP/control-plane-identity/usw2" \
+            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/production-usw2/"
+      - name: Prepare sanitized production usw2 evidence
+        if: always()
+        run: |
+          python3 "$GITHUB_WORKSPACE/scripts/sanitize-control-plane-evidence.py" \
+            --cell production-usw2 \
+            --input-dir "$RUNNER_TEMP/control-plane-identity/usw2" \
+            --output-dir "$RUNNER_TEMP/control-plane-identity/public-usw2"
+      - name: Upload production usw2 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: control-plane-identity-usw2-${{ github.run_id }}
+          path: ${{ runner.temp }}/control-plane-identity/public-usw2
+          if-no-files-found: error

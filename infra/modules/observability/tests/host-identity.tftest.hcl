@@ -109,7 +109,7 @@ run "disabled_alerts_create_no_policies" {
   }
 }
 
-run "disk_alerts_cover_legacy_and_generated_host_identity" {
+run "disk_alerts_select_the_collector_instance_identity" {
   command = plan
   variables {
     host_disk_alerts = {
@@ -124,24 +124,17 @@ run "disk_alerts_cover_legacy_and_generated_host_identity" {
         root_fs_critical = { threshold = 0.95, duration = "300s" }
         } : (
         google_monitoring_alert_policy.host_disk[key].combiner == "OR" &&
-        toset([for condition in google_monitoring_alert_policy.host_disk[key].conditions : one(condition.condition_threshold).filter]) == toset([
-          for suffix in [
-            " AND metric.labels.host_id = \"example-host\"",
-            " AND metric.labels.collector_host_id = \"example-host\" AND metric.labels.host_id != \"example-host\""
-          ] :
-          "metric.type = \"prometheus.googleapis.com/system_filesystem_utilization/gauge\" AND resource.type = \"prometheus_target\" AND metric.labels.mountpoint = \"/\"${suffix}"
-        ]) &&
-        alltrue([for condition in google_monitoring_alert_policy.host_disk[key].conditions : (
-          one(condition.condition_threshold).comparison == "COMPARISON_GT" &&
-          one(condition.condition_threshold).threshold_value == expected.threshold &&
-          one(condition.condition_threshold).duration == expected.duration &&
-          one(one(condition.condition_threshold).aggregations).alignment_period == "60s" &&
-          one(one(condition.condition_threshold).aggregations).per_series_aligner == "ALIGN_MAX" &&
-          one(one(condition.condition_threshold).trigger).count == 1
-        )])
+        one(one(google_monitoring_alert_policy.host_disk[key].conditions).condition_threshold).filter ==
+        "metric.type = \"prometheus.googleapis.com/system_filesystem_utilization/gauge\" AND resource.type = \"prometheus_target\" AND metric.labels.mountpoint = \"/\" AND metric.labels.host_id = \"example-host\"" &&
+        one(one(google_monitoring_alert_policy.host_disk[key].conditions).condition_threshold).comparison == "COMPARISON_GT" &&
+        one(one(google_monitoring_alert_policy.host_disk[key].conditions).condition_threshold).threshold_value == expected.threshold &&
+        one(one(google_monitoring_alert_policy.host_disk[key].conditions).condition_threshold).duration == expected.duration &&
+        one(one(one(google_monitoring_alert_policy.host_disk[key].conditions).condition_threshold).aggregations).alignment_period == "60s" &&
+        one(one(one(google_monitoring_alert_policy.host_disk[key].conditions).condition_threshold).aggregations).per_series_aligner == "ALIGN_MAX" &&
+        one(one(one(google_monitoring_alert_policy.host_disk[key].conditions).condition_threshold).trigger).count == 1
       )
     ])
-    error_message = "Disk alerts must cover legacy and generated identities with mutually exclusive conditions and unchanged root-only thresholds and windows."
+    error_message = "Disk alerts must select the collector's instance identity with unchanged root-only thresholds and windows."
   }
   assert {
     condition = (
@@ -151,6 +144,25 @@ run "disk_alerts_cover_legacy_and_generated_host_identity" {
         { key = "host_id", value = "$${env:HOST_ID}", action = "upsert" }
       ]
     )
-    error_message = "Host metrics must preserve authoritative HOST_ID and also stamp the stable collector identity used by alerts."
+    error_message = "Host metrics must keep HOST_ID and also stamp the stable collector identity the alerts will move to."
+  }
+}
+
+# The disk alert filter cannot name collector_host_id until every collector has
+# reported it on the host series; Monitoring 404s an unknown label.
+run "disk_alerts_do_not_reference_an_unreported_label" {
+  command = plan
+  variables {
+    host_disk_alerts = {
+      host_id        = "example-host"
+      display_prefix = "Infrastructure / example-host"
+    }
+  }
+  assert {
+    condition = alltrue([
+      for policy in values(google_monitoring_alert_policy.host_disk) :
+      !anytrue([for condition in policy.conditions : strcontains(one(condition.condition_threshold).filter, "collector_host_id")])
+    ])
+    error_message = "Disk alert filters must not reference collector_host_id before the collectors emit it."
   }
 }
