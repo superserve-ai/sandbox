@@ -53,6 +53,10 @@ const (
 	HostCapabilityCanProxyTraffic = "can_proxy_traffic"
 	HostCapabilityCanReadFiles    = "can_read_files"
 	HostCapabilityCanWriteFiles   = "can_write_files"
+	// HostCapabilitySavedSnapshots is advertised by a vmd that captures and
+	// deletes saved snapshots and refuses a capture for an id it has deleted,
+	// so the control plane never asks an older daemon for one.
+	HostCapabilitySavedSnapshots = "saved_snapshots_v1"
 
 	// Published preview ports exclude privileged ports and boxd's reserved
 	// service port. Keeping this vocabulary shared prevents the API, VMD,

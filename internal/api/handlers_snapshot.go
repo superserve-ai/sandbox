@@ -20,6 +20,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
@@ -192,6 +193,20 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 	}
 	if sb.BasePath == nil {
 		respondErrorMsg(c, "conflict", "sandbox predates overlay disks and cannot be snapshotted; create a new one from its template", http.StatusConflict)
+		return
+	}
+	// Only a host whose delete is final is asked, whatever this build of
+	// the control plane would assume of it: during a rollout the daemon on
+	// the sandbox's host may be older than the API. A draining host still
+	// serves its own sandboxes.
+	capable, err := h.hostHasCapabilitiesCachedForScope(ctx, sb.HostID, []string{preview.HostCapabilitySavedSnapshots}, ownerResumeCapabilities)
+	if err != nil {
+		log.Error().Err(err).Str("host_id", sb.HostID).Msg("snapshot: host capability")
+		respondError(c, ErrInternal)
+		return
+	}
+	if !capable {
+		respondErrorMsg(c, "host_not_ready", "the sandbox's host cannot take snapshots yet; retry later", http.StatusServiceUnavailable)
 		return
 	}
 	bindings, err := h.snapshotSecretBindings(ctx, sandboxID)

@@ -1007,7 +1007,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          description: The host cannot take the snapshot as it stands; retry
+          description: The host cannot take the snapshot as it stands, or does not support snapshots yet; retry
           content:
             application/json:
               schema:
