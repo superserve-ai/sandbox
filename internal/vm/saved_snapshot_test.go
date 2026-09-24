@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -946,5 +948,55 @@ func TestForkSourceSurvivesTheRecord(t *testing.T) {
 	inst := &VMInstance{ID: "vm-1", SourceSnapshotID: "snap-1"}
 	if got := toInstance(toRecord(inst)); got.SourceSnapshotID != "snap-1" {
 		t.Errorf("source snapshot lost across the record: %q", got.SourceSnapshotID)
+	}
+}
+
+func TestSavedCaptureBudgetScalesWithMemory(t *testing.T) {
+	if got := savedCaptureBudget(SavedSnapshotFS, 16384); got != savedCaptureBaseBudget {
+		t.Errorf("fs capture budget %s, want the base", got)
+	}
+	if got := savedCaptureBudget(SavedSnapshotMemFS, 1024); got != savedCaptureBaseBudget+16*time.Second {
+		t.Errorf("1 GiB memory capture budget %s", got)
+	}
+	if got := savedCaptureBudget(SavedSnapshotMemFS, 16384); got != savedCaptureBaseBudget+256*time.Second {
+		t.Errorf("16 GiB memory capture budget %s", got)
+	}
+}
+
+func TestAwaitFirecrackerOutlastsABusyAPI(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "fc.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-ready:
+			_, _ = w.Write([]byte(`{"state":"Paused"}`))
+		case <-r.Context().Done():
+		}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	// Still busy: the wait gives up on its own bound, not before.
+	start := time.Now()
+	if err := awaitFirecracker(context.Background(), sock, 2*time.Second); err == nil {
+		t.Fatal("wait returned before the API answered")
+	}
+	if time.Since(start) < 2*time.Second {
+		t.Fatal("wait gave up before its bound")
+	}
+	// Done a moment later: the wait returns as soon as the API answers.
+	go func() {
+		time.Sleep(1500 * time.Millisecond)
+		close(ready)
+	}()
+	start = time.Now()
+	if err := awaitFirecracker(context.Background(), sock, 30*time.Second); err != nil {
+		t.Fatalf("wait after the API came back: %v", err)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("wait took %s after a 1.5s recovery", d)
 	}
 }

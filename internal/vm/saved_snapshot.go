@@ -35,10 +35,43 @@ const (
 	defaultSavedCaptures      = 2
 	savedCaptureHeadroom      = 256 << 20
 	savedUnpauseAttempts      = 3
-	// savedCaptureBudget bounds the Firecracker snapshot request: past it the
-	// source is released or recorded as unservable rather than left paused.
-	savedCaptureBudget = 90 * time.Second
+	// A capture's budget: a base for the request itself, plus the time a
+	// full memory image takes at the slowest write rate the capture waits
+	// for before it treats Firecracker as stuck.
+	savedCaptureBaseBudget     = 60 * time.Second
+	savedCaptureFloorMiBPerSec = 64
 )
+
+// savedCaptureBudget bounds the Firecracker snapshot request. A memory
+// capture may write all of guest memory, so its budget grows with the memory
+// size; an fs capture writes none.
+func savedCaptureBudget(kind SavedSnapshotKind, memoryMiB uint32) time.Duration {
+	if kind != SavedSnapshotMemFS {
+		return savedCaptureBaseBudget
+	}
+	return savedCaptureBaseBudget + time.Duration(memoryMiB/savedCaptureFloorMiBPerSec)*time.Second
+}
+
+// awaitFirecracker waits for a Firecracker whose last request was abandoned
+// mid-way to answer its API again, in short bounded probes: an image it was
+// asked for keeps being written after the request is gone, and the vCPUs
+// stay paused until it is done.
+func awaitFirecracker(ctx context.Context, socketPath string, wait time.Duration) error {
+	base := context.WithoutCancel(ctx)
+	deadline := time.Now().Add(wait)
+	for {
+		pctx, cancel := context.WithTimeout(base, 5*time.Second)
+		_, err := VMState(pctx, socketPath)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("firecracker api not answering %s after the capture budget: %w", wait, err)
+		}
+		time.Sleep(time.Second)
+	}
+}
 
 // SavedSnapshotKind is what a saved snapshot holds: the disk alone, or the
 // disk with the memory image a warm restore needs.
@@ -279,7 +312,8 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	tFrozen := time.Now()
 	// Bounded on its own: the RPC deadline may be long, and a Firecracker that
 	// stops answering must not hold the source paused past this.
-	cctx, cancel := context.WithTimeout(ctx, savedCaptureBudget)
+	budget := savedCaptureBudget(kind, man.MemoryMiB)
+	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	var captureErr error
 	if kind == SavedSnapshotMemFS {
@@ -304,6 +338,14 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	}
 	frozenFor := time.Since(tFrozen)
 
+	// Releasing the guest while Firecracker still writes the abandoned image
+	// would only time out and write the source off; wait for the API first.
+	if captureErr != nil && cctx.Err() != nil {
+		log.Warn().Dur("budget", budget).Msg("saved snapshot: capture exceeded its budget; waiting for Firecracker before releasing the source")
+		if werr := awaitFirecracker(ctx, socket, budget); werr != nil {
+			log.Error().Err(werr).Msg("saved snapshot: Firecracker did not come back")
+		}
+	}
 	var releaseErr error
 	if frozen {
 		releaseErr = m.releaseFrozenGuest(ctx, socket, ip, token)
