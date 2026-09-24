@@ -65,11 +65,12 @@ resource "google_project_iam_member" "analysis" {
 
 # Each project owns its policy-reader grants. Neither deployment account needs
 # IAM administration in the other project, or access to its object payloads.
+# Deny Reviewer is organization-only; any such access is administrator-managed.
 resource "google_project_iam_member" "policy_reader" {
   for_each = {
     for pair in setproduct(
       setunion(var.policy_reader_service_accounts, [var.deployment_service_account]),
-      ["roles/iam.securityReviewer", "roles/iam.denyReviewer"],
+      ["roles/iam.securityReviewer"],
     ) : "${pair[0]}/${pair[1]}" => pair
   }
 

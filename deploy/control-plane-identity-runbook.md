@@ -106,7 +106,7 @@ Troubleshooter APIs with `disable_on_destroy = false`. It grants each project's
 own deployment account Cloud Asset Viewer, Role Viewer, and Service Usage
 Consumer. API activation depends on the Consumer grant, which permits the
 provider to poll activation operations. Partial bootstrap failures retry with a
-fresh plan against saved state. Both deployment accounts receive Security Reviewer and Deny Reviewer
+fresh plan against saved state. Both deployment accounts receive Security Reviewer
 in each project so they can inspect cross-project policies. These grants do not
 include object payload reads, secret values, runtime impersonation, or policy
 modification. Production also grants its deployment account KMS Viewer on the
@@ -172,6 +172,10 @@ terraform -chdir=infra/bootstrap/control-plane-policy-visibility apply visibilit
 This root supports projects attached directly to the organization. Any folder or
 organization deny-policy visibility gap requires separately reviewed administrator
 access; the root does not grant those permissions across unrelated descendants.
+[Deny Reviewer](https://docs.cloud.google.com/iam/docs/roles-permissions/iam#iam.denyReviewer)
+can only be granted at organization scope, never in the project bootstrap.
+Security Reviewer includes deny-policy listing but not deny-policy reads; if
+those reads are required, an organization administrator must arrange that access.
 Unknown results remain blocking. If policies include Google Workspace groups or
 domains, the corresponding
 Workspace visibility is also required; the Google Cloud IAM bootstrap cannot
