@@ -301,6 +301,7 @@ func run() error {
 	})
 	computeSource.Refresh(ctx)
 	handlers.ComputeRestrictions = &abuse.ComputeEvaluator{Source: computeSource}
+	handlers.SignupRestrictions = &abuse.SignupEvaluator{Source: computeSource}
 	go handlers.RunComputeReconciliation(ctx, computeSource)
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
