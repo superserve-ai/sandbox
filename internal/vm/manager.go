@@ -3660,6 +3660,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		stopErr = m.stopVM(ctx, vmID, prevSupervision)
 		m.mu.Lock()
 	}
+	// A run dir with no record can be a fork this daemon started and lost
+	// before persisting; its Firecracker may still run. A fork replaces the
+	// files here, so that life is stopped first, whatever supervised it.
+	if fork != nil && !inPlace && priorRunDir {
+		m.mu.Unlock()
+		stopErr = m.stopLeftoverLife(ctx, vmID)
+		m.mu.Lock()
+	}
 
 	inst := &VMInstance{
 		ID:        vmID,
@@ -3741,7 +3749,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	case restoreLegacyResolve:
 		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
 	case restoreMaterializeFork:
-		if inPlace && stopErr != nil {
+		if (inPlace || priorRunDir) && stopErr != nil {
 			// A stop that did not confirm may leave a Firecracker that still
 			// owns the files here; replacing them would truncate its disk.
 			diskErr = status.Errorf(codes.Unavailable, "vm %s could not be confirmed stopped before being replaced: %v", vmID, stopErr)

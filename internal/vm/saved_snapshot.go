@@ -133,9 +133,15 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 	}
 	log := m.log.With().Str("vm_id", vmID).Str("snapshot_id", snapshotID).Logger()
 
-	// The id lock serializes this call with a delete or a retry for the same
-	// id, the committed check included; it is taken before the VM lock
-	// everywhere, so the order holds.
+	// The VM lock comes first, as it does for a restore that creates a VM
+	// from a snapshot, so the two never wait on each other's locks in
+	// opposite orders. The id lock then serializes this call with a delete
+	// or a retry for the same id, the committed check included.
+	unlock, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	unlockID, err := m.lockSavedSnapshot(ctx, snapshotID)
 	if err != nil {
 		return nil, err
@@ -144,11 +150,6 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 	if man, err := m.committedSavedSnapshot(dir, vmID, kind); man != nil || err != nil {
 		return man, err
 	}
-	unlock, err := m.lockVMOp(ctx, vmID)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
 	// After the VM lock, as restore does: requests queued on one busy VM
 	// must not hold the host's capture slots.
 	release, err := m.acquireSavedCapture(ctx)
@@ -835,6 +836,19 @@ func (m *Manager) materializeForkLocked(ctx context.Context, childID string, man
 		}
 	}
 	return m.cloneSavedDisk(ctx, childID, man.DiskPath, man.BasePath)
+}
+
+// stopLeftoverLife stops whatever may still run for an id that has a run
+// dir but no record, under either supervision; each stop is a no-op when
+// nothing is there.
+func (m *Manager) stopLeftoverLife(ctx context.Context, vmID string) error {
+	if err := m.stopVM(ctx, vmID, SupervisionUnit); err != nil {
+		return err
+	}
+	if m.cgroups != nil {
+		return m.stopVM(ctx, vmID, SupervisionCgroup)
+	}
+	return nil
 }
 
 // cleanupForkCopies removes the snapshot-dir copies a failed fork made.

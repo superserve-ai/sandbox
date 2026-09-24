@@ -1117,3 +1117,88 @@ func TestSavedCaptureHeadroomReservesNothingForReflinkedImages(t *testing.T) {
 		t.Fatalf("running memory capture with little free space: want ResourceExhausted, got %v", err)
 	}
 }
+
+func TestForkOverALeftoverRunDirStopsItsLifeFirst(t *testing.T) {
+	useTempFloor(t)
+	m := newSavedTestManager(t)
+	m.restoreSem = make(chan struct{}, 1)
+	m.netMgr = &fakeNetMgr{}
+	src, _ := seedPausedSource(t, m, true)
+	ctx := context.Background()
+	man, err := m.CreateSavedSnapshot(ctx, src.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A run dir with no record: a fork this daemon lost before persisting.
+	child := uuid.NewString()
+	rundir := filepath.Join(m.cfg.RunDir, child)
+	if err := os.MkdirAll(rundir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	overlay := filepath.Join(rundir, "overlay.ext4")
+	if err := os.WriteFile(overlay, []byte("leftover disk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := VMConfig{SavedSnapshotID: man.SnapshotID}
+
+	// Its life cannot be confirmed stopped: nothing is touched.
+	m.stopVMHook = func(context.Context, string, Supervision) error { return errors.New("unit still active") }
+	if _, err := m.restoreVMSnapshot(ctx, child, "", "", cfg, nil, "", "", "", nil, 0, ""); status.Code(err) != codes.Unavailable {
+		t.Fatalf("fork over a leftover whose stop did not confirm: want Unavailable, got %v", err)
+	}
+	if b, _ := os.ReadFile(overlay); string(b) != "leftover disk" {
+		t.Fatal("the leftover's disk was replaced")
+	}
+
+	// Stopped for sure: the fork replaces the files and goes on to launch.
+	stopped := []Supervision{}
+	m.stopVMHook = func(_ context.Context, _ string, s Supervision) error { stopped = append(stopped, s); return nil }
+	launched, replaced := false, false
+	m.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		launched = true
+		replaced = pageAt(t, overlay, 7) == 'D'
+		return 0, SupervisionUnit, errors.New("stop before a real launch")
+	}
+	m.mu.Lock()
+	delete(m.vms, child)
+	m.mu.Unlock()
+	_, _ = m.restoreVMSnapshot(ctx, child, "", "", cfg, nil, "", "", "", nil, 0, "")
+	if len(stopped) == 0 || stopped[0] != SupervisionUnit {
+		t.Fatalf("stops before the fork: %v, want the unit stopped first", stopped)
+	}
+	if !launched {
+		t.Fatal("the fork did not reach the launch once the leftover was stopped")
+	}
+	if !replaced {
+		t.Fatal("the fork did not replace the leftover's disk with the snapshot's before launching")
+	}
+}
+
+func TestCaptureWaitingForItsVMHoldsNoSnapshotLock(t *testing.T) {
+	m := newSavedTestManager(t)
+	busy := uuid.NewString()
+	unlockBusy, err := m.lockVMOp(context.Background(), busy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := uuid.NewString()
+	ctx, cancel := context.WithCancel(context.Background())
+	queued := make(chan struct{})
+	go func() {
+		defer close(queued)
+		_, _ = m.CreateSavedSnapshot(ctx, busy, id, SavedSnapshotFS)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	// A restore of that id takes the VM lock first and the id lock second;
+	// the capture parked on the VM lock must not be holding the id lock.
+	lctx, lcancel := context.WithTimeout(context.Background(), time.Second)
+	defer lcancel()
+	unlockID, err := m.lockSavedSnapshot(lctx, id)
+	if err != nil {
+		t.Fatalf("snapshot id lock held by a capture still waiting for its VM: %v", err)
+	}
+	unlockID()
+	cancel()
+	unlockBusy()
+	<-queued
+}
