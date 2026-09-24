@@ -93,7 +93,11 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	os.Exit(m.Run())
+	workerCtx, stopStorageWorker := context.WithCancel(context.Background())
+	api.StartStorageReportWorker(workerCtx, testPool)
+	code := m.Run()
+	stopStorageWorker()
+	os.Exit(code)
 }
 
 func resetTestSchema(ctx context.Context, pool *pgxpool.Pool) error {

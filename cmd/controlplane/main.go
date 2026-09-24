@@ -388,6 +388,7 @@ func run() error {
 	// host unhealthy, so this instance stops routing to it at detection time
 	// rather than at cache expiry.
 	go api.StartHostDetector(ctx, queries, sched.Invalidate)
+	api.StartStorageReportWorker(ctx, dbPool)
 
 	// Billing dashboard rollups are provisional and recomputable from raw
 	// interval rows. Team-level feature flags decide which tenants roll up.

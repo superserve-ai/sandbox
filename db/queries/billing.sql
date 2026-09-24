@@ -242,6 +242,7 @@ upserted AS (
               OR p.finalized_at IS NOT NULL
           )
     )
+      AND storage_reports_complete_through(usage.team_id, usage.period_end)
     ON CONFLICT (team_id, period_start, period_end) DO UPDATE
     SET vcpu_seconds = EXCLUDED.vcpu_seconds,
         memory_mib_seconds = EXCLUDED.memory_mib_seconds,
@@ -275,6 +276,7 @@ immutable_existing AS (
           existing.exported_at IS NOT NULL
           OR existing.finalized_at IS NOT NULL
       )
+      AND storage_reports_complete_through(existing.team_id, existing.period_end)
 )
 SELECT * FROM upserted
 UNION ALL
@@ -365,6 +367,7 @@ usage AS (
         storage.storage_mib_seconds
     FROM compute, storage
     WHERE feature_enabled('billing_hourly_rollups', sqlc.arg(team_id)::uuid)
+      AND storage_reports_complete_through(sqlc.arg(team_id)::uuid, sqlc.arg(hour_end)::timestamptz)
 )
 INSERT INTO team_billing_usage_hourly (
     team_id, hour_start, hour_end,
@@ -516,6 +519,7 @@ WITH exported_period AS (
             AND u.period_end = team_billing_period.period_end
             AND u.finalized_at IS NULL
       )
+      AND storage_reports_complete_through(team_billing_period.team_id, team_billing_period.period_end)
       AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
     RETURNING *
 ),
@@ -544,6 +548,7 @@ WITH exporting_period AS (
       AND team_billing_period.period_end = sqlc.arg(period_end)
       AND team_billing_period.status IN ('approved', 'exporting', 'exported')
       AND team_billing_period.finalized_at IS NULL
+      AND storage_reports_complete_through(team_billing_period.team_id, team_billing_period.period_end)
       AND feature_enabled('billing_export_enabled', team_billing_period.team_id)
     RETURNING *
 ),
@@ -980,6 +985,7 @@ WITH ranked AS (
         ) AS team_rank
     FROM team_billing_period
     WHERE finalized_at IS NULL
+      AND storage_reports_complete_through(team_id, period_end)
 )
 SELECT *
 FROM ranked
