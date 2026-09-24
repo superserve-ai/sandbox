@@ -1,4 +1,4 @@
-# Config-backed compute restrictions
+# Config-backed restrictions
 
 Set `COMPUTE_RESTRICTIONS_FILE` to an operator-supplied private JSON file on the
 control plane. An empty path disables loading. Provisioning and distribution of
@@ -12,20 +12,38 @@ the file are separate operational concerns.
     {
       "subject_type": "team",
       "subject_id": "580a748d-84de-4137-9db5-e14d64c59061",
-    "actions": ["create"]
+      "actions": ["create", "resume"]
+    },
+    {
+      "subject_type": "fingerprint",
+      "subject_value": "opaque-visitor-id",
+      "actions": ["signup"]
     }
   ]
 }
 ```
 
 Modes are `off` (also the omitted default), `observe`, and `enforce`. Trusted
-teams bypass all restrictions. Subjects are `team` or `user` UUIDs; each entry
-requires at least one recognized legacy action, `create` or `resume`. Either
-action, or both together, represents one compute restriction: it blocks both
-create and resume and targets active sandboxes for periodic containment. There
-is no create-only or resume-only policy. Unknown fields, unsupported
-values, and invalid UUIDs reject the candidate config. No promotion, fingerprint,
-payment, or domain state is interpreted as trust or a compute restriction.
+teams bypass compute restrictions only. `team` and `user` subjects require a
+nonzero UUID `subject_id` and one or more `create` or `resume` actions.
+Either legacy action blocks both create and resume and targets active sandboxes
+for periodic containment; there is no create-only or resume-only policy.
+`fingerprint` subjects require a nonempty, opaque `subject_value` of at most
+256 bytes and only the `signup` action. Fingerprint matches are exact and
+case-sensitive; they do not affect create or resume. Unknown fields,
+unsupported subject/action combinations, and invalid values reject the
+candidate config. No promotion, payment, or domain state is interpreted as
+trust or a restriction.
+
+Roll out the new file format in stages. Deploy a version that understands
+`fingerprint`/`signup` entries to every control-plane reader in every cell,
+and confirm no older reader remains, before adding those entries to any
+distributed restriction file. Older readers reject the entire file as invalid;
+an older reader restarted with that file serves empty/off policy, including
+for existing compute restrictions. Before rolling back to an older version,
+remove all `fingerprint`/`signup` entries from every distributed file and
+confirm the older compatible content is in place before restarting old
+readers. Keep existing `team`/`user` entries while removing signup entries.
 
 The file loads at startup and refreshes before each approximately five-minute
 containment sweep. Sweeps do not overlap within a process; their duration is
@@ -54,7 +72,8 @@ With operational metrics enabled, `compute_restriction_decision_total` reports
 `allowed`, `would_deny`, or `blocked`, with bounded action, mode, subject type,
 and `source=config` labels. `compute_reconciliation_total` reports bounded sweep
 and candidate outcomes, including would-pause, pending and confirmed completion.
-`compute_restriction_refresh_total` reports success,
+`signup_restriction_decision_total` reports signup decisions with bounded labels
+and no visitor ID. `compute_restriction_refresh_total` reports success,
 read errors, invalid content, and owner-resolution errors. Refresh failures also
 emit an error log without subject or policy values. An owner-resolution error
 can accompany successful publication of the remaining config state.

@@ -71,6 +71,7 @@ type OTelRecorder struct {
 	computeRefreshes  metric.Int64Counter
 	computeReconciles metric.Int64Counter
 	provider          *sdkmetric.MeterProvider
+	signupDecisions   metric.Int64Counter
 
 	serviceName string
 	environment string
@@ -169,6 +170,9 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.computeReconciles, err = meter.Int64Counter("compute_reconciliation_total"); err != nil {
+		return nil, err
+	}
+	if r.signupDecisions, err = meter.Int64Counter("signup_restriction_decision_total"); err != nil {
 		return nil, err
 	}
 	if r.sandboxTransitions, err = meter.Int64Counter("sandbox_transition_total"); err != nil {

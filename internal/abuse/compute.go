@@ -13,10 +13,11 @@ const (
 // ComputeSnapshot is immutable after publication. User matches are joined to
 // canonical team owners in the background, keeping evaluation constant-time.
 type ComputeSnapshot struct {
-	mode    ComputeMode
-	trusted map[uuid.UUID]bool
-	teams   map[uuid.UUID]bool
-	users   map[uuid.UUID]bool
+	mode         ComputeMode
+	trusted      map[uuid.UUID]bool
+	teams        map[uuid.UUID]bool
+	users        map[uuid.UUID]bool
+	fingerprints map[string]bool
 }
 
 type ComputeSource interface{ Snapshot() *ComputeSnapshot }
