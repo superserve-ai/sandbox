@@ -311,6 +311,14 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	if err := m.resolveOutstandingFreeze(ctx, vmID, socket, ip, recordedArtifact, log); err != nil {
 		return err
 	}
+	// The disk alone is an fs snapshot, so what the guest has written but
+	// not yet flushed has to reach it first. A memory image carries the page
+	// cache itself.
+	if kind == SavedSnapshotFS && ip != "" {
+		if err := syncGuestFilesystems(ctx, ip); err != nil {
+			return status.Errorf(codes.Unavailable, "guest did not flush its filesystems before the capture: %v", err)
+		}
+	}
 	corrects := recordedCorrects != nil && *recordedCorrects
 	if recordedCorrects == nil {
 		corrects = guestCorrectsWallClock(memFile, baseMem)
@@ -901,6 +909,27 @@ func (m *Manager) fileClone() func(context.Context, string, string) error {
 		return m.reflinkFile
 	}
 	return reflinkFileExact
+}
+
+// syncGuestFilesystems runs sync inside the guest through boxd, bounded.
+func syncGuestFilesystems(ctx context.Context, vmIP string) error {
+	body, _ := json.Marshal(struct {
+		Command  string `json:"command"`
+		TimeoutS int    `json:"timeout_s"`
+	}{Command: "sync", TimeoutS: 20})
+	sctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	reply, err := postBoxd(sctx, vmIP, "/exec", body)
+	if err != nil {
+		return err
+	}
+	var res struct {
+		ExitCode int `json:"exit_code"`
+	}
+	if err := json.Unmarshal(reply, &res); err == nil && res.ExitCode != 0 {
+		return fmt.Errorf("sync exited %d", res.ExitCode)
+	}
+	return nil
 }
 
 func diskSizeMiB(path string) (uint32, error) {
