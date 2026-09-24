@@ -1202,3 +1202,38 @@ func TestCaptureWaitingForItsVMHoldsNoSnapshotLock(t *testing.T) {
 	unlockBusy()
 	<-queued
 }
+
+func TestCaptureWaitingForASlotHoldsNoVMLock(t *testing.T) {
+	m := newSavedTestManager(t)
+	m.cfg.SavedSnapshotConcurrency = 1
+	inst, _ := seedPausedSource(t, m, false)
+	// The host's only slot is taken by another sandbox's capture.
+	release, err := m.acquireSavedCapture(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS)
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	// A resume of this sandbox takes its lifecycle lock; the capture parked
+	// on the slot must not be holding it.
+	lctx, lcancel := context.WithTimeout(context.Background(), time.Second)
+	defer lcancel()
+	unlock, err := m.lockVMOp(lctx, inst.ID)
+	if err != nil {
+		t.Fatalf("the source's lock is held by a capture still waiting for a slot: %v", err)
+	}
+	unlock()
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("capture after the slot freed: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("capture did not proceed once the slot freed")
+	}
+}

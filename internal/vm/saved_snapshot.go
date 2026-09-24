@@ -105,6 +105,42 @@ type SavedSnapshotManifest struct {
 	SizeBytes int64 `json:"size_bytes"`
 }
 
+// savedCaptureAdmissible answers a retry for a committed id and refuses a
+// source that cannot be captured, under the source's lock and the id's, in
+// that order. It holds neither afterwards.
+func (m *Manager) savedCaptureAdmissible(ctx context.Context, vmID, snapshotID string, kind SavedSnapshotKind, dir string) (*SavedSnapshotManifest, error) {
+	unlock, err := m.lockVMOp(ctx, vmID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	unlockID, err := m.lockSavedSnapshot(ctx, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlockID()
+	if man, err := m.committedSavedSnapshot(dir, vmID, kind); man != nil || err != nil {
+		return man, err
+	}
+	_, _, _, err = m.savedCaptureSource(vmID)
+	return nil, err
+}
+
+// savedCaptureSource loads the source and requires it running or paused.
+func (m *Manager) savedCaptureSource(vmID string) (*VMInstance, VMStatus, VMConfig, error) {
+	inst, err := m.getInstance(vmID)
+	if err != nil {
+		return nil, 0, VMConfig{}, err
+	}
+	inst.mu.RLock()
+	st, cfg := inst.Status, inst.Config
+	inst.mu.RUnlock()
+	if st != StatusRunning && st != StatusPaused {
+		return nil, 0, VMConfig{}, status.Errorf(codes.FailedPrecondition, "vm %s is %v; a saved snapshot needs a running or paused VM", vmID, st)
+	}
+	return inst, st, cfg, nil
+}
+
 func (m *Manager) savedSnapshotDir(snapshotID string) (string, error) {
 	if m.cfg.SnapshotDir == "" || !filepath.IsAbs(m.cfg.SnapshotDir) {
 		return "", status.Error(codes.FailedPrecondition, "snapshot_dir must be configured as an absolute path")
@@ -133,6 +169,20 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 	}
 	log := m.log.With().Str("vm_id", vmID).Str("snapshot_id", snapshotID).Logger()
 
+	// Admission first, under the source's lock: a request for a busy source
+	// waits there holding nothing, and a retry or a bad request is answered
+	// without a slot. The slot is then waited for with no lock held, so a
+	// resume of this sandbox never queues behind another sandbox's capture.
+	// The locks are taken again for the capture itself, and the source
+	// checked again, since it may have moved meanwhile.
+	if man, err := m.savedCaptureAdmissible(ctx, vmID, snapshotID, kind, dir); man != nil || err != nil {
+		return man, err
+	}
+	release, err := m.acquireSavedCapture(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	// The VM lock comes first, as it does for a restore that creates a VM
 	// from a snapshot, so the two never wait on each other's locks in
 	// opposite orders. The id lock then serializes this call with a delete
@@ -150,24 +200,9 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 	if man, err := m.committedSavedSnapshot(dir, vmID, kind); man != nil || err != nil {
 		return man, err
 	}
-	// After the VM lock, as restore does: requests queued on one busy VM
-	// must not hold the host's capture slots.
-	release, err := m.acquireSavedCapture(ctx)
+	inst, st, cfg, err := m.savedCaptureSource(vmID)
 	if err != nil {
 		return nil, err
-	}
-	defer release()
-
-	inst, err := m.getInstance(vmID)
-	if err != nil {
-		return nil, err
-	}
-	inst.mu.RLock()
-	st := inst.Status
-	cfg := inst.Config
-	inst.mu.RUnlock()
-	if st != StatusRunning && st != StatusPaused {
-		return nil, status.Errorf(codes.FailedPrecondition, "vm %s is %v; a saved snapshot needs a running or paused VM", vmID, st)
 	}
 	diskPath := m.instanceDiskPath(inst)
 	unreserve, err := m.savedCaptureHeadroom(kind, st, inst)
