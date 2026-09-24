@@ -307,6 +307,12 @@ resource "google_compute_disk" "sandbox_data_b" {
 
   lifecycle {
     prevent_destroy = true
+    # This disk carries host state across the standby's promotion lifecycle.
+    # Its API shape may predate the current host definition (for example, a
+    # provider-reported disk type or computed performance field). Never turn
+    # that drift into a replacement of the protected disk; capacity changes
+    # remain an explicit operator action because hyperdisks only grow.
+    ignore_changes = all
   }
 }
 

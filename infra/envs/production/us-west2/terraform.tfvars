@@ -19,3 +19,23 @@ notification_channel_ids              = ["projects/rayai-prod/notificationChanne
 standby_host_id                       = "usw2-2-74d81d76d23344479f2b8c99de6cb42f"
 # Preserve the existing issuer impersonation grant during promotion.
 peer_ca_operator_members = ["user:alejandro@superserve.ai"]
+
+proxy_generation_cells = {
+  usw2 = {
+    zone            = "us-west2-a"
+    instance        = "superserve-vmd-usw2-2"
+    ip              = "10.1.0.3"
+    network         = "projects/rayai-prod/global/networks/superserve-production-vpc"
+    subnetwork      = "projects/rayai-prod/regions/us-west2/subnetworks/superserve-usw2-subnet"
+    target_tags     = ["vmd-usw2"]
+    service_account = "vmd-runtime-production-usw2@rayai-prod.iam.gserviceaccount.com"
+    routes = {
+      "public-http" = {
+        protocol = "HTTP"
+        listener = "public"
+        probe    = "https://usw-sandbox.superserve.ai/health"
+        probe_ip = "34.120.241.214"
+      }
+    }
+  }
+}

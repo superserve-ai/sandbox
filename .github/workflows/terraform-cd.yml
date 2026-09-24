@@ -128,8 +128,14 @@ jobs:
           command -v curl
 
       - name: Terraform apply staging/us-central1
+        env:
+          PROXY_FRONTEND_MIGRATED: ${{ vars.PROXY_STAGING_FRONTEND_MIGRATED }}
         run: |
           set -euo pipefail
+          if [ "${PROXY_FRONTEND_MIGRATED:-}" != true ]; then
+            echo 'Staging proxy frontends require module-only preparation, serving bootstrap, and a reviewed manual frontend cutover before automatic full applies.' >&2
+            exit 1
+          fi
           echo "## Terraform rollout: staging/us-central1" >> "$GITHUB_STEP_SUMMARY"
           cd infra/envs/staging/us-central1
           terraform init -input=false
@@ -532,8 +538,14 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
 
       - name: Terraform apply production/us-east4
+        env:
+          PROXY_FRONTEND_MIGRATED: ${{ vars.PROXY_PRODUCTION_FRONTEND_MIGRATED }}
         run: |
           set -euo pipefail
+          if [ "${PROXY_FRONTEND_MIGRATED:-}" != true ]; then
+            echo 'Production proxy frontends require module-only preparation, serving bootstrap, and a reviewed manual frontend cutover before automatic full applies.' >&2
+            exit 1
+          fi
           echo "## Terraform rollout: production/us-east4" >> "$GITHUB_STEP_SUMMARY"
           cd infra/envs/production/us-east4
           terraform init -input=false

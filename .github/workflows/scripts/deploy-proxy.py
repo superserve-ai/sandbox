@@ -7,8 +7,12 @@ Env vars:
   GCP_REGION                 required — restrict discovery to this region
   EXPECTED_STANDBY_HOST      optional — exact identity from select-deploy-target.sh
   VMD_LABEL                  required — gcloud instances list label filter
-  VMD_INSTALL_DIR            required — bin install dir on the host
-  SHA                        required — commit SHA (only first 8 chars used)
+  SHA                        required — immutable revision identity
+  PROXY_ROLLOUT_ID           stable retry identity; overrides the CI run ID
+  PROXY_ROLLOUT_MANIFESTS    required — Terraform proxy_generation_rollout JSON output
+  PROXY_OPERATION            optional — deploy (default) or bootstrap before frontend migration
+  PROXY_TARGET               optional — serving (default) or non-serving standby
+  PROXY_DRAIN_GRACE          optional — defaults to 30s, maximum 10m
   PROXY_DOMAIN               required — host suffix the proxy serves (e.g. sandbox.superserve.ai)
   PROXY_DOMAINS              optional — comma-separated host suffixes; overrides
                              PROXY_DOMAIN on the proxy when set (DNS transitions)
@@ -17,7 +21,6 @@ Env vars:
   PROXY_ALLOWED_ORIGINS      optional — comma-separated origin patterns
   REQUIRE_DATA_PLANE         optional — "", "0", or "1"
   PEER_PROXY_TARGET_ADDR     optional — loopback address for peer ingress
-  PEER_PROXY_SPIFFE_URI      required — authorized peer certificate URI
   SENTRY_DSN                 optional — Sentry DSN URL for error reporting
   PEER_IDENTITY_HOSTS        optional — comma-separated hosts requiring identity bootstrap
   EXPECTED_STANDBY_HOST      optional — require exactly this deployment host
@@ -26,13 +29,65 @@ Env vars:
   Peer identity and certificate paths are supplied by host bootstrap.
 """
 
+import json
+import tempfile
+import uuid
 import os
 import re
 import shlex
 import subprocess
 import sys
-import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+def verify_frontend_references(config):
+    """Verify the bounded, applied frontend inventory from Terraform.
+
+    The migration acknowledgement is not evidence that a frontend switched.
+    Compare every declared route with the backend references read from the
+    applied frontend resources before authorizing a recurring rollout.
+    """
+    routes = config.get("routes")
+    references = config.get("frontend_backend_references")
+    if not isinstance(routes, list) or not isinstance(references, dict):
+        raise ValueError("Terraform migration output must include frontend_backend_references")
+    if not 1 <= len(routes) <= 8 or len(references) > 8:
+        raise ValueError("Terraform migration output exceeds the route bound")
+
+    expected = {}
+    for route in routes:
+        if not isinstance(route, dict):
+            raise ValueError("Terraform migration output contains an invalid route")
+        name = route.get("name") or route.get("backend")
+        backend = route.get("backend_self_link") or route.get("backend")
+        if not isinstance(name, str) or not name or not isinstance(backend, str) or not backend:
+            raise ValueError("Terraform migration output route is missing its backend identity")
+        if name in expected:
+            raise ValueError(f"duplicate frontend route {name}")
+        expected[name] = backend
+
+    frontend_resources = config.get("frontend_resources")
+    if frontend_resources is not None:
+        if (not isinstance(frontend_resources, dict)
+                or set(frontend_resources) != set(expected)):
+            raise ValueError("frontend resource inventory must cover every declared route")
+        for name, resources in frontend_resources.items():
+            if (not isinstance(resources, list) or not 1 <= len(resources) <= 16
+                    or any(not isinstance(resource, str) or not resource for resource in resources)):
+                raise ValueError(f"frontend route {name} is missing its adopted resource inventory")
+
+    if set(references) != set(expected):
+        missing = sorted(set(expected) - set(references))
+        extra = sorted(set(references) - set(expected))
+        raise ValueError(f"frontend references do not cover declared routes (missing={missing}, extra={extra})")
+
+    for name, backend in expected.items():
+        applied = references[name]
+        if isinstance(applied, str):
+            applied = [applied]
+        if (not isinstance(applied, list) or len(applied) > 16 or not applied
+                or any(reference != backend for reference in applied)):
+            raise ValueError(f"frontend route {name} does not reference replacement backend {backend}")
 
 
 def main() -> int:
@@ -43,10 +98,6 @@ def main() -> int:
         return 1
     expected_standby = os.environ.get("EXPECTED_STANDBY_HOST", "")
     label = os.environ.get("VMD_LABEL", "component=vmd")
-    # The installed unit is superserve-vmd.service; retain an override for
-    # environments that use a deliberately different unit name.
-    service = os.environ.get("VMD_SERVICE", "superserve-vmd")
-    install_dir = os.environ.get("VMD_INSTALL_DIR", "/usr/local/bin")
     sha = os.environ["SHA"][:8]
 
     proxy_domain = os.environ.get("PROXY_DOMAIN", "")
@@ -78,8 +129,6 @@ def main() -> int:
     if peer_routing == "1" and not database_url:
         print("ERROR: PROXY_DATABASE_URL is required for cross-host routing", file=sys.stderr)
         return 1
-    database_env_line = ('PROXY_DATABASE_URL="' + database_url.replace('\\', '\\\\').replace('"', '\\"') + '"') if peer_routing == "1" else ""
-    database_env_command = ("printf '%s\\n' " + shlex.quote(database_env_line) + " | sudo tee -a /etc/sandbox/proxy.env > /dev/null") if database_env_line else ":"
     terminal_origins = os.environ.get("PROXY_ALLOWED_ORIGINS", "")
     if terminal_origins and not re.fullmatch(r"[A-Za-z0-9.,:/*\-]+", terminal_origins):
         print("ERROR: PROXY_ALLOWED_ORIGINS contains disallowed characters", file=sys.stderr)
@@ -99,13 +148,19 @@ def main() -> int:
         )
     }
     peer_env["PEER_PROXY_TARGET_ADDR"] = peer_env["PEER_PROXY_TARGET_ADDR"] or "127.0.0.1:5010"
+    peer_listen = peer_env["PEER_PROXY_LISTEN_ADDR"]
+    peer_transport = peer_routing == "1" or bool(peer_listen)
     for key, default in (
         ("PEER_PROXY_CERT_FILE", "/etc/superserve/peer/tls.crt"),
         ("PEER_PROXY_KEY_FILE", "/etc/superserve/peer/tls.key"),
         ("PEER_PROXY_CA_FILE", "/etc/superserve/peer/ca.crt"),
     ):
-        peer_env[key] = default
-    peer_listen = peer_env["PEER_PROXY_LISTEN_ADDR"]
+        if peer_transport:
+            peer_env[key] = peer_env[key] or default
+        else:
+            # A host without peer ingress or outbound routing must not require
+            # identity files just to prepare an otherwise independent proxy.
+            peer_env[key] = ""
     if peer_listen not in ("", "auto") and not peer_listen.endswith(":5009"):
         print("ERROR: PEER_PROXY_LISTEN_ADDR must use port 5009", file=sys.stderr)
         return 1
@@ -116,12 +171,6 @@ def main() -> int:
     # Empty = skip: enabling the proxy's OTLP exporter is a per-environment
     # opt-in, matching the vmd deploy's OTEL_ENVIRONMENT convention.
     otel_environment = os.environ.get("OTEL_ENVIRONMENT", "")
-    otel_env_lines = ""
-    if otel_environment:
-        otel_env_lines = (
-            "\n            OTEL_METRICS_ENABLED=true"
-            f"\n            OTEL_ENVIRONMENT={otel_environment}"
-        )
     if sentry_dsn and not re.fullmatch(r"https://[A-Za-z0-9@./:_\-]+", sentry_dsn):
         print("ERROR: SENTRY_DSN must be a https:// URL or empty", file=sys.stderr)
         return 1
@@ -131,7 +180,7 @@ def main() -> int:
             "gcloud", "compute", "instances", "list",
             f"--project={project}",
             f"--filter=labels.{label}" + ("" if expected_standby else " AND status=RUNNING"),
-            "--format=csv[no-heading](name,zone,status)" if expected_standby else "--format=csv[no-heading](name,zone)",
+            "--format=csv[no-heading](name,zone,status,networkInterfaces[0].networkIP)" if expected_standby else "--format=csv[no-heading](name,zone)",
         ],
         capture_output=True, text=True,
     )
@@ -142,7 +191,8 @@ def main() -> int:
         return 1
 
     instances = [
-        {"name": r[0], "zone": r[1], "status": r[2] if len(r) > 2 else ""}
+        {"name": r[0], "zone": r[1], "status": r[2] if len(r) > 2 else "",
+         "ip": r[3] if len(r) > 3 else ""}
         for line in result.stdout.strip().splitlines()
         if line.strip()
         for r in [line.strip().split(",")]
@@ -184,6 +234,53 @@ def main() -> int:
         print(f"No instances with label {label} found in {where}", file=sys.stderr)
         return 1
 
+    operation = os.environ.get("PROXY_OPERATION", "deploy")
+    target = (os.environ.get("PROXY_TARGET") or os.environ.get("DEPLOY_TARGET", "serving")) or "serving"
+    try:
+        if operation not in ("deploy", "bootstrap"):
+            raise ValueError("PROXY_OPERATION must be deploy or bootstrap")
+        if target not in ("serving", "standby"):
+            raise ValueError("PROXY_TARGET must be serving or standby")
+        if target == "standby" and operation == "bootstrap":
+            raise ValueError("standby deployments cannot run the serving bootstrap operation")
+        with open(os.environ["PROXY_ROLLOUT_MANIFESTS"]) as source:
+            manifests = json.load(source)
+        for inst in instances:
+            matches = [manifest for manifest in manifests.values()
+                       if manifest["project"] == project and manifest["instance"] == inst["name"]
+                       and manifest["zone"] == inst["zone"].split("/")[-1]]
+            if not matches and target == "standby":
+                # Terraform owns the cell's serving identity and generation
+                # routes.  A role-swapped standby is intentionally outside
+                # that static host inventory, so reuse the one serving-cell
+                # manifest and replace only the host identity for this run.
+                candidates = [manifest for manifest in manifests.values()
+                              if manifest.get("project") == project
+                              and (manifest.get("serving_host", manifest).get("zone")
+                                   == inst["zone"].split("/")[-1])]
+                if len(candidates) == 1:
+                    if not inst.get("ip"):
+                        described = subprocess.run(
+                            ["gcloud", "compute", "instances", "describe", inst["name"],
+                             f"--zone={inst['zone']}", f"--project={project}", "--quiet",
+                             "--format=value(networkInterfaces[0].networkIP)"],
+                            capture_output=True, text=True,
+                        )
+                        if described.returncode != 0 or not described.stdout.strip():
+                            raise ValueError(f"could not resolve standby IP for {inst['name']}")
+                        inst["ip"] = described.stdout.strip().splitlines()[-1]
+                    serving = candidates[0]
+                    matches = [dict(serving, instance=inst["name"], zone=inst["zone"].split("/")[-1],
+                                    ip=inst["ip"])]
+            if len(matches) != 1:
+                raise ValueError(f"expected exactly one Terraform manifest for {inst['name']}")
+            inst["manifest"] = matches[0]
+            if operation == "deploy" and target == "serving":
+                verify_frontend_references(matches[0])
+    except (KeyError, ValueError, OSError, TypeError, AttributeError) as error:
+        print(f"ERROR: rollout manifest: {error}", file=sys.stderr)
+        return 1
+
     print(f"Deploying proxy to {len(instances)} instance(s) in {where}")
 
     # gcloud generates the runner's SSH key on first use. With per-host deploys
@@ -200,331 +297,53 @@ def main() -> int:
         host_region = zone.rsplit("/", 1)[-1].rsplit("-", 1)[0]
         tag = f"{name}/{zone}"
 
-        for src, dst in [
-            ("bin/proxy", f"/tmp/proxy-{sha}"),
-            ("bin/check-legacy-heartbeat", f"/tmp/check-legacy-heartbeat-{sha}"),
-            ("deploy/proxy.service", "/tmp/proxy.service"),
-            ("deploy/proxy.socket", "/tmp/proxy.socket"),
-        ]:
-            subprocess.run(
-                [
-                    "gcloud", "compute", "scp", src, f"{name}:{dst}",
-                    f"--zone={zone}", f"--project={project}",
-                    "--quiet", "--tunnel-through-iap",
-                ],
-                check=True, capture_output=True,
-            )
-        print(f"[{tag}] proxy uploaded")
-
-        deploy_script = textwrap.dedent(f"""
-            set -euo pipefail
-
-            # Match VMD's environment precedence. Only legacy hosts without an
-            # installed identity may fall back to vmd.env or the instance name.
-            if sudo test -e /etc/sandbox/host-identity.env; then
-                host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/host-identity.env)
-                if ! [[ "$host_id" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{{0,255}}$ ]]; then
-                    echo 'ERROR: invalid installed host identity environment' >&2
-                    exit 1
-                fi
-            else
-                host_id=$(sudo sed -n 's/^HOST_ID=//p' /etc/sandbox/vmd.env 2>/dev/null | tail -n1 || true)
-            fi
-
-            chmod 0755 /tmp/check-legacy-heartbeat-{sha}
-            peer_identity=""
-            if sudo test -f /etc/superserve/peer/identity.json; then
-                # Shared with the refresh worker through systemd credential load.
-                exec 9< /run/lock/vmd-peer-credentials.lock
-                flock -s 9
-                peer_identity=$(sudo python3 -c 'import json; print(json.load(open("/etc/superserve/peer/identity.json"))["spiffe_uri"])')
-                if ! [[ "$peer_identity" =~ ^spiffe://[A-Za-z0-9._:/-]+$ ]]; then
-                    echo 'ERROR: invalid infrastructure peer identity' >&2
-                    exit 1
-                fi
-                sudo /usr/local/sbin/refresh-peer-credentials --check
-            elif [ "{int(name in peer_identity_hosts)}" -eq 1 ]; then
-                echo 'ERROR: host requires infrastructure identity bootstrap' >&2
-                exit 1
-            elif ! sudo test -s /etc/sandbox/proxy.env; then
-                # Legacy peer identity lives in proxy.env. A rebuilt host must
-                # restore it or bootstrap before deployment can preserve mTLS.
-                echo 'ERROR: restore the legacy proxy.env or bootstrap host identity before deployment' >&2
-                exit 1
-            fi
-
-            sudo mkdir -p /etc/sandbox
-            rollback_dir=$(sudo mktemp -d /etc/sandbox/proxy-rollback.XXXXXX)
-            for config in {install_dir}/proxy /etc/systemd/system/proxy.service /etc/systemd/system/proxy.socket /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
-                if sudo test -f "$config"; then
-                    sudo cp -p "$config" "$rollback_dir/$(basename "$config")"
-                fi
-            done
-
-            peer_listen_addr=""
-            peer_endpoint_changed=0
-            existing_peer_listen_addr=""
-            legacy_heartbeat_ready() {{
-                pid=$(systemctl show -p MainPID --value {service})
-                started=$(systemctl show -p ExecMainStartTimestamp --value {service})
-                # Round up to exclude a heartbeat just before this process started.
-                started=$(date -d "$started" +%s) || return 1
-                started=$((started + 1))
-                host_ip=$(curl -fsS --max-time 2 -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip) || return 1
-                sudo /tmp/check-legacy-heartbeat-{sha} --pid "$pid" --started "$started" --address "$host_ip:50051"
-            }}
-            wait_for_vmd_ready() {{
-                # Type=simple becomes active before VMD can serve requests.
-                # Readiness and endpoint acknowledgement must belong to the
-                # still-current invocation before old routing can be retired.
-                local deadline=$((SECONDS + 90))
-                # Bound hosts can retain HOST_ID=default. The DB fallback
-                # independently requires an unbound record for the running HOST_ID.
-                for attempt in $(seq 1 90); do
-                    [ "$SECONDS" -lt "$deadline" ] || break
-                    invocation=$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)
-                    if [ -n "$invocation" ] \
-                       && sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'gRPC serving requests' --no-pager >/dev/null 2>&1 \
-                       && {{ sudo journalctl "_SYSTEMD_INVOCATION_ID=$invocation" --quiet -g 'host endpoint heartbeat accepted' --no-pager >/dev/null 2>&1 || legacy_heartbeat_ready; }} \
-                       && [ "$(systemctl show -p InvocationID --value {service} 2>/dev/null || true)" = "$invocation" ] \
-                       && sudo systemctl is-active --quiet {service}; then
-                        return 0
-                    fi
-                    sleep 1
-                done
-                echo "ERROR: {service} did not reach application readiness and endpoint acknowledgement within 90s (legacy default requires a fresh DB heartbeat)" >&2
-                return 1
-            }}
-            rollback_peer_advertisement() {{
-                # Restore the executable, unit, and configuration together before
-                # restoring the advertised endpoint. The old environment may not
-                # satisfy the new binary's startup requirements.
-                for config in {install_dir}/proxy /etc/systemd/system/proxy.service /etc/systemd/system/proxy.socket /etc/sandbox/proxy.env /etc/sandbox/vmd.env /etc/systemd/system/proxy.service.d/peer-credentials.conf; do
-                    if sudo test -f "$rollback_dir/$(basename "$config")"; then
-                        # Rename avoids overwriting a running executable in place.
-                        sudo cp -p "$rollback_dir/$(basename "$config")" "$config.restore-{sha}" || return 1
-                        sudo mv "$config.restore-{sha}" "$config" || return 1
-                    else
-                        sudo rm -f "$config" || return 1
-                    fi
-                done
-                sudo systemctl daemon-reload || return 1
-                # The restored unit must be the one bound: a build that binds
-                # the ports itself needs the socket gone, and a restored unit
-                # file only takes effect through a restart of the socket.
-                if ! sudo test -f "$rollback_dir/proxy.socket"; then
-                    sudo systemctl disable --now proxy.socket 2>/dev/null || true
-                else
-                    sudo systemctl stop proxy proxy.socket 2>/dev/null || true
-                    sudo systemctl start proxy.socket || return 1
-                fi
-                if ! sudo test -f "$rollback_dir/proxy" || ! sudo test -f "$rollback_dir/proxy.service"; then
-                    sudo systemctl stop proxy || return 1
-                elif ! sudo systemctl restart proxy || ! sudo systemctl is-active --quiet proxy; then
-                    echo "ERROR: proxy restart failed during rollback" >&2
-                    sudo journalctl -u proxy --no-pager -n 40 >&2 || true
-                    return 1
-                fi
-                if [ "$peer_endpoint_changed" -eq 1 ]; then
-                    # VMD reads its environment only at process startup; restart
-                    # it so the running process matches the restored env file.
-                    if ! sudo systemctl restart {service} || ! wait_for_vmd_ready; then
-                        echo "ERROR: {service} restart failed while rolling back peer advertisement" >&2
-                        sudo systemctl status --no-pager {service} >&2 || true
-                        sudo journalctl -u {service} --no-pager -n 40 >&2 || true
-                        return 1
-                    fi
-                fi
-            }}
-            deployment_mutated=0
-            finish_deployment() {{
-                result=$?
-                trap - EXIT
-                if [ "$result" -ne 0 ] && [ "$deployment_mutated" -eq 1 ]; then
-                    if ! rollback_peer_advertisement; then
-                        echo "ERROR: rollback failed; snapshots retained at $rollback_dir" >&2
-                        exit "$result"
-                    fi
-                fi
-                sudo rm -rf "$rollback_dir"
-                rm -f /tmp/check-legacy-heartbeat-{sha}
-                exit "$result"
-            }}
-            trap finish_deployment EXIT
-
-            # Both outbound clients and inbound ingress use the host identity.
-            # Legacy hosts retain their existing peer configuration.
-            if [ -n "$peer_identity" ]; then
-                sudo install -d -m 0750 /etc/superserve/peer
-                for credential in \
-                    "{peer_env['PEER_PROXY_CERT_FILE']}" \
-                    "{peer_env['PEER_PROXY_KEY_FILE']}" \
-                    "{peer_env['PEER_PROXY_CA_FILE']}"; do
-                    # The SSH deployment account cannot traverse the
-                    # root-owned credential directory; validate with the
-                    # same privileges used to install and load the files.
-                    if ! sudo test -s "$credential"; then
-                        echo "ERROR: peer credential missing: $credential" >&2
-                        exit 1
-                    fi
-                done
-                # DynamicUser cannot traverse the root-owned bootstrap
-                # directory. Let systemd copy credentials into its private
-                # runtime credential directory and point the proxy there.
-                sudo install -d -m 0755 /etc/systemd/system/proxy.service.d
-                deployment_mutated=1
-                sudo tee /etc/systemd/system/proxy.service.d/peer-credentials.conf > /dev/null <<CREDENTIALS
-                [Service]
-                LoadCredential=peer-cert:{peer_env['PEER_PROXY_CERT_FILE']}
-                LoadCredential=peer-key:{peer_env['PEER_PROXY_KEY_FILE']}
-                LoadCredential=peer-ca:{peer_env['PEER_PROXY_CA_FILE']}
-                Environment=PEER_PROXY_CERT_FILE=%d/peer-cert
-                Environment=PEER_PROXY_KEY_FILE=%d/peer-key
-                Environment=PEER_PROXY_CA_FILE=%d/peer-ca
-                CREDENTIALS
-            fi
-
-            deployment_mutated=1
-            sudo mv /tmp/proxy-{sha} {install_dir}/proxy
-            sudo chmod +x {install_dir}/proxy
-
-            sudo mv /tmp/proxy.service /etc/systemd/system/proxy.service
-            # An open socket keeps the options it was bound with; a changed
-            # unit means it must be bound again.
-            socket_changed=0
-            if ! sudo cmp -s /tmp/proxy.socket /etc/systemd/system/proxy.socket; then
-                socket_changed=1
-            fi
-            sudo mv /tmp/proxy.socket /etc/systemd/system/proxy.socket
-            sudo systemctl daemon-reload
-            sudo systemctl enable proxy proxy.socket
-
-            peer_cert_file={peer_env['PEER_PROXY_CERT_FILE']!r}
-            peer_key_file={peer_env['PEER_PROXY_KEY_FILE']!r}
-            peer_ca_file={peer_env['PEER_PROXY_CA_FILE']!r}
-            if [ -n "$peer_identity" ]; then
-                peer_cert_file=/run/credentials/proxy.service/peer-cert
-                peer_key_file=/run/credentials/proxy.service/peer-key
-                peer_ca_file=/run/credentials/proxy.service/peer-ca
-            fi
-            if [ -n "$peer_identity" ] && [ -n "{peer_env['PEER_PROXY_LISTEN_ADDR']}" ]; then
-                sudo mkdir -p /etc/sandbox
-                peer_listen_addr={peer_env['PEER_PROXY_LISTEN_ADDR']}
-                if [ "$peer_listen_addr" = "auto" ]; then
-                    peer_ip=$(curl -fsS -H 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip)
-                    # 5008 is reserved for the wildcard HTTP redirect listener.
-                    # Keep peer ingress on its own private port so the two binds
-                    # cannot collide when the staging shortcut is enabled.
-                    peer_listen_addr="$peer_ip:5009"
-                fi
-                # vmd owns host.proxy_addr advertisement. Keep its environment in
-                # lockstep with the proxy listener so the heartbeat publishes the
-                # private peer endpoint when ingress is enabled.
-                sudo touch /etc/sandbox/vmd.env
-                existing_peer_listen_addr=$(sudo sed -n 's/^PEER_PROXY_LISTEN_ADDR=//p' /etc/sandbox/vmd.env | tail -n1 || true)
-                peer_endpoint_changed=1
-                if [ "$existing_peer_listen_addr" = "$peer_listen_addr" ]; then
-                    peer_endpoint_changed=0
-                else
-                    sudo sed -i '/^PEER_PROXY_LISTEN_ADDR=/d' /etc/sandbox/vmd.env
-                    printf 'PEER_PROXY_LISTEN_ADDR=%s\\n' "$peer_listen_addr" | sudo tee -a /etc/sandbox/vmd.env > /dev/null
-                fi
-            elif [ -n "$peer_identity" ]; then
-                # Remove the prior advertisement when peer ingress is disabled
-                # (including rollback). VMD only reads this environment at
-                # startup, so restart it only when a stale advertisement
-                # actually exists; ordinary deployments must not interrupt it.
-                if sudo grep -q '^PEER_PROXY_LISTEN_ADDR=' /etc/sandbox/vmd.env 2>/dev/null; then
-                    existing_peer_listen_addr=$(sudo sed -n 's/^PEER_PROXY_LISTEN_ADDR=//p' /etc/sandbox/vmd.env | tail -n1 || true)
-                    peer_endpoint_changed=1
-                    sudo sed -i '/^PEER_PROXY_LISTEN_ADDR=/d' /etc/sandbox/vmd.env
-                    if ! sudo systemctl restart {service}; then
-                        echo "ERROR: {service} restart failed" >&2
-                        sudo systemctl status --no-pager {service} >&2 || true
-                        sudo journalctl -u {service} --no-pager -n 40 >&2 || true
-                        exit 1
-                    fi
-                    if ! wait_for_vmd_ready; then
-                        echo "ERROR: {service} failed to become active after restart" >&2
-                        sudo systemctl status --no-pager {service} >&2 || true
-                        sudo journalctl -u {service} --no-pager -n 40 >&2 || true
-                        exit 1
-                    fi
-                fi
-            fi
-            deployment_mutated=1
-            sudo tee /etc/sandbox/proxy.env > /dev/null <<PROXYENV
-            PROXY_DOMAIN={proxy_domain}
-            PROXY_DOMAINS={proxy_domains}
-            SANDBOX_ACCESS_TOKEN_SEED={access_seed}
-            PROXY_ALLOWED_ORIGINS={terminal_origins}
-            REQUIRE_DATA_PLANE={require_data_plane}
-            SENTRY_DSN={sentry_dsn}
-            PEER_PROXY_LISTEN_ADDR=$peer_listen_addr
-            PEER_PROXY_TARGET_ADDR={peer_env['PEER_PROXY_TARGET_ADDR']}
-            PEER_PROXY_CERT_FILE=$peer_cert_file
-            PEER_PROXY_KEY_FILE=$peer_key_file
-            PEER_PROXY_CA_FILE=$peer_ca_file
-            PEER_PROXY_SPIFFE_URI=$peer_identity
-            PEER_PROXY_MAX_STREAMS={peer_max_streams}
-            PEER_ROUTING_ENABLED={peer_routing}
-            HOST_ID=${{host_id:-{name}}}
-            HOST_REGION={host_region}{otel_env_lines}
-            PROXYENV
-            if [ -z "$peer_identity" ]; then
-                sudo sed -i '/^PEER_PROXY_/d' /etc/sandbox/proxy.env
-                if sudo test -f "$rollback_dir/proxy.env"; then
-                    sudo awk '/^PEER_PROXY_/' "$rollback_dir/proxy.env" | sudo tee -a /etc/sandbox/proxy.env > /dev/null
-                fi
-            fi
-            {database_env_command}
-            sudo chmod 0600 /etc/sandbox/proxy.env
-
-            # Binding the socket needs the ports free: a proxy that still binds
-            # them itself, or a socket bound with an older unit, stops first.
-            # One gap, only on those rollouts.
-            if [ "$socket_changed" -eq 1 ] || ! sudo systemctl is-active --quiet proxy.socket; then
-                sudo systemctl stop proxy proxy.socket 2>/dev/null || true
-                if ! sudo systemctl start proxy.socket; then
-                    echo "ERROR: proxy.socket failed to bind the public ports" >&2
-                    sudo systemctl status --no-pager proxy.socket >&2 || true
-                    exit 1
-                fi
-            fi
-            if ! sudo systemctl restart proxy; then
-                echo "ERROR: proxy restart failed" >&2
-                sudo systemctl status --no-pager proxy >&2 || true
-                sudo journalctl -u proxy --no-pager -n 40 >&2 || true
-                exit 1
-            fi
-            sleep 3
-            if ! sudo systemctl is-active --quiet proxy; then
-                echo "ERROR: proxy failed to become active after restart" >&2
-                sudo systemctl status --no-pager proxy >&2 || true
-                sudo journalctl -u proxy --no-pager -n 40 >&2 || true
-                exit 1
-            fi
-            # Start and verify peer ingress before VMD advertises its endpoint.
-            # This prevents heartbeat routing from switching to a closed port if
-            # proxy configuration or credentials are invalid.
-            if [ -n "$peer_listen_addr" ] && [ "$peer_endpoint_changed" -eq 1 ]; then
-                if ! sudo systemctl restart {service}; then
-                    echo "ERROR: {service} restart failed" >&2
-                    sudo systemctl status --no-pager {service} >&2 || true
-                    sudo journalctl -u {service} --no-pager -n 40 >&2 || true
-                    exit 1
-                fi
-                if ! wait_for_vmd_ready; then
-                    echo "ERROR: {service} failed to become active after restart" >&2
-                    sudo systemctl status --no-pager {service} >&2 || true
-                    sudo journalctl -u {service} --no-pager -n 40 >&2 || true
-                    exit 1
-                fi
-            fi
-        """)
-        # Heredoc terminators must begin at column zero in the generated shell.
-        deploy_script = deploy_script.replace("    CREDENTIALS\n", "CREDENTIALS\n")
-
+        rollout = os.environ.get("PROXY_ROLLOUT_ID") or os.environ.get("GITHUB_RUN_ID")
+        if not rollout:
+            raise RuntimeError("PROXY_ROLLOUT_ID is required outside CI; reuse it to resume")
+        upload = "/tmp/proxy-upload-" + uuid.uuid4().hex
+        request = {
+            "rollout": rollout, "revision": os.environ["SHA"], "target": target,
+            "require_identity": name in peer_identity_hosts,
+            "env": {
+                "PROXY_DOMAIN": proxy_domain, "PROXY_DOMAINS": proxy_domains,
+                "SANDBOX_ACCESS_TOKEN_SEED": access_seed, "PROXY_ALLOWED_ORIGINS": terminal_origins,
+                "REQUIRE_DATA_PLANE": require_data_plane, "SENTRY_DSN": sentry_dsn,
+                "PEER_ROUTING_ENABLED": peer_routing, "PEER_PROXY_MAX_STREAMS": peer_max_streams,
+                "PROXY_DATABASE_URL": database_url if peer_routing == "1" else "", "HOST_REGION": host_region,
+                "OTEL_ENVIRONMENT": otel_environment,
+                "OTEL_METRICS_ENABLED": "true" if otel_environment else "false",
+                "PROXY_DRAIN_GRACE": os.environ.get("PROXY_DRAIN_GRACE", "30s"),
+                **peer_env,
+            },
+        }
+        ssh = ["gcloud", "compute", "ssh", name, f"--zone={zone}", f"--project={project}",
+               "--quiet", "--tunnel-through-iap"]
+        subprocess.run(ssh + ["--command", "install -d -m 0700 " + shlex.quote(upload)], check=True, capture_output=True)
+        with tempfile.TemporaryDirectory() as local:
+            request_file = os.path.join(local, "request.json")
+            with open(request_file, "w") as output:
+                json.dump(request, output)
+            os.chmod(request_file, 0o600)
+            manifest_file = os.path.join(local, "manifest.json")
+            with open(manifest_file, "w") as output:
+                json.dump(inst["manifest"], output)
+            os.chmod(manifest_file, 0o600)
+            for src, dst in [
+                ("bin/proxy", "proxy"),
+                ("deploy/proxy-generation.service", "proxy.service"),
+                (".github/workflows/scripts/proxy_rollout.py", "controller.py"),
+                ("deploy/refresh-peer-credentials.py", "refresh-peer-credentials.py"),
+                (request_file, "request.json"),
+                (manifest_file, "manifest.json"),
+            ]:
+                subprocess.run(["gcloud", "compute", "scp", src, f"{name}:{upload}/{dst}",
+                                f"--zone={zone}", f"--project={project}", "--quiet", "--tunnel-through-iap"],
+                               check=True, capture_output=True)
+        deploy_script = ("set -eu; trap " + shlex.quote("rm -rf " + shlex.quote(upload)) + " EXIT; "
+                         + "sudo python3 " + shlex.quote(upload + "/controller.py")
+                         + " --manifest " + shlex.quote(upload + "/manifest.json")
+                         + (" --bootstrap" if operation == "bootstrap" else "")
+                         + " --request " + shlex.quote(upload + "/request.json"))
         r = subprocess.run(
             [
                 "gcloud", "compute", "ssh", name,
@@ -540,7 +359,13 @@ def main() -> int:
                 f"--- stdout ---\n{r.stdout}\n"
                 f"--- stderr ---\n{r.stderr}"
             )
-        print(f"[{tag}] proxy active")
+        if operation == "bootstrap":
+            result = "bootstrap phase saved; resume the same rollout after Terraform frontend migration"
+        elif target == "standby":
+            result = "standby generation prepared; serving membership and cutover suppressed"
+        else:
+            result = "proxy cutover externally verified"
+        print(f"[{tag}] {result}")
 
     failed = []
     with ThreadPoolExecutor(max_workers=len(instances)) as ex:
