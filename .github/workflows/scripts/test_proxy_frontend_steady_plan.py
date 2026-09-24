@@ -60,6 +60,20 @@ class SteadyFrontendTests(unittest.TestCase):
     def test_manual_staging_apply_preserves_setting_and_refuses_traffic_changes(self):
         workflow = (ROOT / '.github/workflows/terraform-rollout-staging.yml').read_text()
         step = workflow.split('      - name: Terraform apply staging/us-central1\n')[1].split('\n      - name:')[0]
+        self.exercise_apply_step(step, 'staging')
+
+    def test_identity_applies_preserve_proxy_routes(self):
+        workflow = (ROOT / '.github/workflows/control-plane-identity-rollout.yml').read_text()
+        for name, cell in (('staging', 'staging'), ('production use4', 'production')):
+            step = workflow.split('      - name: Apply and verify ' + name + ' identity\n')[1].split('\n      - name:')[0]
+            # Execute the actual plan-to-apply portion without Cloud Run operations.
+            header, script = step.split('        run: |\n')
+            script = 'set -euo pipefail\n' + script[script.index('          terraform plan'):]
+            script = script[:script.index('          terraform output')]
+            with self.subTest(cell=cell):
+                self.exercise_apply_step(header + '        run: |\n' + script, cell)
+
+    def exercise_apply_step(self, step, cell):
         expression = re.search(r'TF_VAR_proxy_generation_frontends_enabled: \$\{\{ (.+) \}\}', step)[1]
         script = step.split('        run: |\n')[1]
         with tempfile.TemporaryDirectory() as directory:
@@ -77,11 +91,12 @@ esac
             for setting in ('', 'false', 'true', 'TRUE'):
                 selected = eval(expression.replace('&&', ' and ').replace('||', ' or '),
                                 {'__builtins__': {}},
-                                {'vars': SimpleNamespace(PROXY_STAGING_FRONTEND_MIGRATED=setting)})
+                                {'vars': SimpleNamespace(PROXY_STAGING_FRONTEND_MIGRATED=setting,
+                                                         PROXY_PRODUCTION_FRONTEND_MIGRATED=setting)})
                 for mutation in (None, 'backend_service', 'certificate_map'):
                     items = [dict(address=address, type=address.split('.')[0], change=dict(actions=['no-op'],
                                   before={'id': address}, after={'id': address}))
-                             for address in steady.STAGING_FRONTENDS]
+                             for address in (steady.STAGING_FRONTENDS if cell == 'staging' else steady.FRONTENDS)]
                     if mutation:
                         items[0]['change']['actions'] = ['update']
                         items[0]['change']['after'][mutation] = 'example-unintended-change'
@@ -101,6 +116,20 @@ esac
                         self.assertEqual(applied.exists(), mutation is None)
                         if mutation:
                             self.assertIn('Use the explicit proxy migration for frontend changes', result.stderr)
+
+    def test_additional_forwarding_rule_cannot_expose_existing_proxy(self):
+        items = [dict(address=address, change=dict(actions=['no-op'], before={'id': address},
+                      after={'id': address})) for address in steady.STAGING_FRONTENDS]
+        proxy_id = 'projects/example-project/global/targetSslProxies/example-proxy'
+        items[0]['change']['before']['id'] = items[0]['change']['after']['id'] = proxy_id
+        extra = dict(address='google_compute_global_forwarding_rule.additional',
+                     type='google_compute_global_forwarding_rule',
+                     change=dict(actions=['create'], before=None,
+                                 after={'target': 'https://www.googleapis.com/compute/v1/' + proxy_id}))
+        with self.assertRaises(ValueError):
+            steady.validate({'resource_changes': items + [extra]}, 'staging')
+        extra['change']['after']['target'] = 'projects/example-project/global/targetHttpsProxies/unrelated-api'
+        steady.validate({'resource_changes': items + [extra]}, 'staging')
 
 
 if __name__ == '__main__':
