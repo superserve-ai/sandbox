@@ -1,9 +1,10 @@
 name: Terraform Rollout Staging
 
-# Serialize manual infrastructure applies with API deployments and the
-# staged control-plane identity migration.
+# Proxy migration shares the proxy/VMD queue through the saved-plan apply.
+# Timeout-only cleanup must run alongside the abort waiting on those operations.
+# Other infrastructure applies retain the control-plane deployment queue.
 concurrency:
-  group: control-plane-deploy
+  group: ${{ inputs.proxy_migration && inputs.proxy_migration != 'none' && inputs.proxy_migration != 'expedite-abort' && 'deploy-vmd' || 'control-plane-deploy' }}
   queue: max
   cancel-in-progress: false
 
@@ -22,6 +23,19 @@ on:
         description: 'Run the existing staging smoke test without applying Terraform'
         type: boolean
         default: false
+      proxy_prepare:
+        description: 'Grant CI role-management access and prepare proxy resources without switching traffic'
+        type: boolean
+        default: false
+      proxy_runtime_iam:
+        description: 'Apply only the approved staging project-wide NEG runtime grant'
+        type: boolean
+        default: false
+      proxy_migration:
+        description: 'One-time staging hold, frontend cutover/rollback, release after first generation, or verified abort'
+        type: choice
+        default: none
+        options: [none, hold, cutover, rollback, release, abort, expedite-abort]
 
 jobs:
   smoke:
@@ -36,11 +50,17 @@ jobs:
       - name: Confirm smoke-only validation
         env:
           CONFIRM: ${{ inputs.confirm }}
+          PROXY_MIGRATION: ${{ inputs.proxy_migration }}
           PRIVATECA_BOOTSTRAP: ${{ inputs.privateca_bootstrap }}
+          PROXY_PREPARE: ${{ inputs.proxy_prepare }}
+          PROXY_RUNTIME_IAM: ${{ inputs.proxy_runtime_iam }}
         run: |
           set -euo pipefail
           test "$CONFIRM" = smoke
+          test "$PROXY_MIGRATION" = none
           test "$PRIVATECA_BOOTSTRAP" = false
+          test "$PROXY_PREPARE" = false
+          test "$PROXY_RUNTIME_IAM" = false
 
       - uses: actions/checkout@v4
 
@@ -62,9 +82,16 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       CONFIRM: ${{ inputs.confirm }}
+      PROXY_MIGRATION: ${{ inputs.proxy_migration }}
+      PROXY_PREPARE: ${{ inputs.proxy_prepare }}
+      PROXY_RUNTIME_IAM: ${{ inputs.proxy_runtime_iam }}
     steps:
       - name: Confirm bootstrap
-        run: test "$CONFIRM" = apply
+        run: |
+          test "$CONFIRM" = apply
+          test "$PROXY_MIGRATION" = none
+          test "$PROXY_PREPARE" = false
+          test "$PROXY_RUNTIME_IAM" = false
 
       - uses: actions/checkout@v4
 
@@ -98,8 +125,195 @@ jobs:
           '
           terraform apply -input=false -lock-timeout=5m tfplan
 
+  proxy-prepare:
+    if: ${{ inputs.proxy_prepare && !inputs.privateca_bootstrap && !inputs.smoke_only }}
+    name: Prepare staging proxy infrastructure
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: 'true'
+      CONFIRM: ${{ inputs.confirm }}
+      PROXY_MIGRATION: ${{ inputs.proxy_migration }}
+      PROXY_RUNTIME_IAM: ${{ inputs.proxy_runtime_iam }}
+    steps:
+      - name: Confirm preparation
+        run: |
+          test "$CONFIRM" = apply
+          test "$PROXY_MIGRATION" = none
+          test "$PROXY_RUNTIME_IAM" = false
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Apply CI role-management grant
+        working-directory: infra/envs/staging/us-central1
+        run: |
+          set -euo pipefail
+          target='module.iam.google_project_iam_member.project_bindings["cd_role_admin"]'
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -lock-timeout=5m -target="$target" -out=role-plan
+          terraform show -json role-plan | jq -e --arg target "$target" '
+            all(.resource_changes[]?;
+              .change.actions == ["no-op"] or
+              .change.actions == ["read"] or
+              (.address == $target and
+               .change.actions == ["create"] and
+               .change.after.project == "rayai-dev" and
+               .change.after.role == "roles/iam.roleAdmin" and
+               .change.after.member == "serviceAccount:superserve-github-actions@rayai-dev.iam.gserviceaccount.com" and
+               (.change.after.condition | length) == 0))
+          '
+          terraform apply -input=false -lock-timeout=5m role-plan
+
+      - name: Wait for role-management permissions
+        run: |
+          set -euo pipefail
+          permissions='["iam.roles.create","iam.roles.get","iam.roles.update","iam.roles.delete"]'
+          for attempt in $(seq 1 30); do
+            token="$(gcloud auth print-access-token)"
+            if curl --fail --silent --show-error --max-time 15 \
+              -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+              --data "{\"permissions\":$permissions}" \
+              https://cloudresourcemanager.googleapis.com/v1/projects/rayai-dev:testIamPermissions |
+              jq -e --argjson expected "$permissions" '($expected - (.permissions // [])) | length == 0'; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo 'CI role-management permissions did not become available.' >&2
+          exit 1
+
+      - name: Prepare generation resources without frontend changes
+        working-directory: infra/envs/staging/us-central1
+        run: |
+          set -euo pipefail
+          # Leave the endpoint binding to the separately confirmed runtime action.
+          targets=()
+          for resource in \
+            google_compute_network_endpoint_group.generation \
+            google_compute_health_check.generation_http \
+            google_compute_health_check.generation_tcp \
+            google_compute_backend_service.generation \
+            google_compute_firewall.generation \
+            google_project_iam_custom_role.generation \
+            google_project_iam_custom_role.generation_support \
+            google_project_iam_member.generation_support \
+            google_storage_bucket.generation_ownership \
+            google_storage_bucket_iam_member.generation_ownership; do
+            targets+=("-target=module.proxy_generations[\"staging\"].$resource")
+          done
+          terraform plan -input=false -lock-timeout=5m "${targets[@]}" -out=proxy-plan
+          terraform show -json proxy-plan | jq -e '
+            all(.resource_changes[]?;
+              .change.actions == ["no-op"] or
+              .change.actions == ["read"] or
+              ((.address | startswith("module.proxy_generations[\"staging\"].")) and
+               .address != "module.proxy_generations[\"staging\"].google_project_iam_member.generation[0]" and
+               .change.actions == ["create"] and
+               (.change.after.project == "rayai-dev" or
+                (.type == "google_storage_bucket_iam_member" and
+                 .change.after.bucket == "rayai-dev-proxy-staging-ownership"))))
+          '
+          terraform apply -input=false -lock-timeout=5m proxy-plan
+          terraform output -json proxy_generation_bootstrap |
+            jq -e 'keys == ["staging"] and .staging.project == "rayai-dev"'
+          echo 'Staging proxy resources prepared; frontend references are unchanged.' >> "$GITHUB_STEP_SUMMARY"
+
+  proxy-runtime-iam:
+    if: ${{ inputs.proxy_runtime_iam && !inputs.proxy_prepare && !inputs.privateca_bootstrap && !inputs.smoke_only }}
+    name: Apply staging runtime endpoint exception
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: 'true'
+      CONFIRM: ${{ inputs.confirm }}
+      PROXY_MIGRATION: ${{ inputs.proxy_migration }}
+    steps:
+      - name: Confirm runtime grant
+        run: |
+          test "$CONFIRM" = apply
+          test "$PROXY_MIGRATION" = none
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Apply only the staging runtime endpoint grant
+        working-directory: infra/envs/staging/us-central1
+        run: |
+          set -euo pipefail
+          terraform init -input=false
+          terraform validate
+          terraform plan -input=false -lock-timeout=5m \
+            -target='module.proxy_generations["staging"].google_project_iam_member.generation[0]' \
+            -out=runtime-plan
+          terraform show -json runtime-plan | python3 "$GITHUB_WORKSPACE/scripts/check_staging_proxy_runtime_plan.py"
+          terraform apply -input=false -lock-timeout=5m runtime-plan
+          echo 'Staging runtime may read/attach/detach endpoints in all project NEGs; production unchanged.' >> "$GITHUB_STEP_SUMMARY"
+
+  proxy-migration:
+    if: ${{ inputs.proxy_migration != 'none' && !inputs.proxy_runtime_iam && !inputs.proxy_prepare && !inputs.privateca_bootstrap && !inputs.smoke_only }}
+    name: Migrate staging proxy frontends
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.proxy_migration == 'abort' && 90 || 20 }}
+    environment: staging
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TF_IN_AUTOMATION: 'true'
+      CONFIRM: ${{ inputs.confirm }}
+      PROXY_MIGRATION: ${{ inputs.proxy_migration }}
+    steps:
+      - name: Confirm migration
+        run: |
+          test "$CONFIRM" = apply
+          case "$PROXY_MIGRATION" in hold|cutover|rollback|release|abort|expedite-abort) ;; *) exit 1 ;; esac
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Run staging migration step
+        run: python3 scripts/staging_proxy_migration.py "$PROXY_MIGRATION"
+
   staging:
-    if: ${{ !inputs.privateca_bootstrap && !inputs.smoke_only }}
+    if: ${{ !inputs.privateca_bootstrap && !inputs.smoke_only && !inputs.proxy_prepare && !inputs.proxy_runtime_iam && inputs.proxy_migration == 'none' }}
     name: Apply staging us-central1
     runs-on: ubuntu-latest
     permissions:
