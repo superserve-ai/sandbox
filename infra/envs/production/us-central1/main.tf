@@ -113,6 +113,10 @@ module "iam" {
       role    = "roles/privateca.auditor"
       members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
     }
+    cd_role_admin = {
+      role    = "roles/iam.roleAdmin"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
     grafana_monitoring_viewer = {
       role = "roles/monitoring.viewer"
       members = [
