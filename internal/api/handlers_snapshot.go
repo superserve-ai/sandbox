@@ -48,8 +48,12 @@ const (
 	// and is due for the sweep; a capture's own budget is minutes.
 	snapshotSweepCreatingAge = 15 * time.Minute
 	// A claimed row is due again after this, whether or not the host answered.
-	snapshotSweepRetry       = time.Minute
-	snapshotSweepBatch int64 = 50
+	snapshotSweepRetry = time.Minute
+	// A capture unsettled this long has a host that stopped answering: it
+	// no longer counts against its team, and it is reported as an error so
+	// an operator retires the host's rows along with the host.
+	snapshotSweepStuckAge       = time.Hour
+	snapshotSweepBatch    int64 = 50
 )
 
 type createSnapshotRequest struct {
@@ -676,9 +680,13 @@ func (h *Handlers) sweepHost(ctx context.Context, hostID string, logger zerolog.
 }
 
 func (h *Handlers) sweepSnapshot(ctx context.Context, row db.SandboxSnapshot, logger zerolog.Logger) {
+	unsettled := logger.Warn
+	if row.Status == "creating" && time.Since(row.CreatedAt) > snapshotSweepStuckAge {
+		unsettled = logger.Error
+	}
 	client, err := h.vmdForHost(ctx, row.HostID)
 	if err != nil {
-		logger.Warn().Err(err).Msg("snapshot sweep: host unresolved")
+		unsettled().Err(err).Msg("snapshot sweep: host unresolved")
 		return
 	}
 	switch row.Status {
@@ -698,7 +706,7 @@ func (h *Handlers) sweepSnapshot(ctx context.Context, row db.SandboxSnapshot, lo
 			h.failSnapshot(row.ID, row.HostID, client)
 			logger.Warn().Err(err).Msg("snapshot sweep: settled failed from the host")
 		default:
-			logger.Warn().Err(err).Msg("snapshot sweep: host did not settle the capture; will ask again")
+			unsettled().Err(err).Msg("snapshot sweep: host did not settle the capture; will ask again")
 		}
 	case "deleting":
 		if err := h.deleteSnapshotOnHost(ctx, row); err != nil {

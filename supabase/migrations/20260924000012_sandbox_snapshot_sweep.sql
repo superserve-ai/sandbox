@@ -55,8 +55,11 @@ BEGIN
         RETURN NEW;
     END IF;
 
+    -- A capture still unsettled an hour on has a host that stopped
+    -- answering; it is the sweep's and the operator's, not the team's slot.
     SELECT count(*) INTO n FROM sandbox_snapshot
-    WHERE team_id = NEW.team_id AND deleted_at IS NULL AND status = 'creating';
+    WHERE team_id = NEW.team_id AND deleted_at IS NULL AND status = 'creating'
+      AND created_at > now() - interval '1 hour';
     IF n >= in_flight_limit THEN
         RAISE EXCEPTION 'snapshots in flight limit reached for team (count=%, max=%)', n, in_flight_limit
             USING ERRCODE = 'SS003';

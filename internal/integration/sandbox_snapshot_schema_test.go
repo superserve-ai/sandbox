@@ -239,6 +239,14 @@ func TestSandboxSnapshotInFlightLimit(t *testing.T) {
 	if admitted.Load() != 1 {
 		t.Fatalf("burst admitted %d captures past a limit of one", admitted.Load())
 	}
+
+	// A capture unsettled for over an hour no longer holds the team's slot.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET created_at = now() - interval '2 hours' WHERE team_id = $1 AND status = 'creating'`, teamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insertSnapshotRow(ctx, teamID, sb, nil); err != nil {
+		t.Fatalf("insert next to a stale capture: %v", err)
+	}
 }
 
 // A snapshot insert holds its team-row lock until commit; sandbox creation
