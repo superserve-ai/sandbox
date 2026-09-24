@@ -18,6 +18,9 @@ concurrency:
   group: terraform-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
+
 jobs:
   terraform-code-validation:
     name: Terraform code validation (no cloud credentials)

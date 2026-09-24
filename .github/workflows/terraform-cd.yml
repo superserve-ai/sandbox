@@ -24,6 +24,9 @@ on:
       - '.github/workflows/scripts/select-deploy-target.sh'
       - '.github/workflows/scripts/wait_credentials_key_iam.py'
 
+env:
+  TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
+
 jobs:
   wait-for-migrations:
     runs-on: ubuntu-latest
@@ -439,6 +442,7 @@ jobs:
             --secret internal-api-token \
             --secret sandbox-access-token-seed \
             --secret secretsproxy-signing-key \
+            --secret "${TF_VAR_compute_restrictions_secret_name:?Set COMPUTE_RESTRICTIONS_SECRET_NAME}" \
             --secret sentry-dsn \
             --secret system-team-id-production \
             --secret slack-quota-alert-webhook \
@@ -668,6 +672,7 @@ jobs:
             --secret internal-api-token \
             --secret sandbox-access-token-seed \
             --secret secretsproxy-signing-key \
+            --secret "${TF_VAR_compute_restrictions_secret_name:?Set COMPUTE_RESTRICTIONS_SECRET_NAME}" \
             --secret sentry-dsn \
             --secret system-team-id-production \
             --secret slack-quota-alert-webhook \

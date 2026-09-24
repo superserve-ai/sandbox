@@ -23,6 +23,9 @@ on:
           - central1
           - all
 
+env:
+  TF_VAR_compute_restrictions_secret_name: ${{ secrets.COMPUTE_RESTRICTIONS_SECRET_NAME }}
+
 jobs:
   west2:
     name: Apply production us-west2

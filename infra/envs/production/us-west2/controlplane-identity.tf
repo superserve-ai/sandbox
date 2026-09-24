@@ -15,6 +15,20 @@ resource "google_secret_manager_secret" "operator_api_token" {
 }
 
 locals {
+  # Operators publish versions; Terraform manages only the mount and access.
+  controlplane_secret_volumes = {
+    compute-restrictions = {
+      secret     = var.compute_restrictions_secret_name
+      mount_path = "/etc/superserve"
+      path       = "abuse-restrictions.json"
+      version    = "latest"
+    }
+  }
+  controlplane_secret_ids = toset(concat(
+    [for config in values(local.controlplane_secrets) : config.secret],
+    [for config in values(local.controlplane_secret_volumes) : config.secret],
+  ))
+
   controlplane_secrets = {
     DATABASE_URL = {
       secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
@@ -64,6 +78,15 @@ resource "google_secret_manager_secret_iam_member" "controlplane_runtime_secrets
   member    = "serviceAccount:${google_service_account.controlplane_runtime.email}"
 }
 
+resource "google_secret_manager_secret_iam_member" "controlplane_runtime_secret_volumes" {
+  for_each = local.controlplane_secret_volumes
+
+  project   = local.project_id
+  secret_id = each.value.secret
+  role      = "roles/secretmanager.secretAccessor"
+  member    = "serviceAccount:${google_service_account.controlplane_runtime.email}"
+}
+
 # CD receives key-scoped IAM administration from the shared us-central1
 # bootstrap before this regional root applies runtime grants.
 resource "google_kms_crypto_key_iam_member" "controlplane_credentials" {
@@ -103,7 +126,7 @@ locals {
     backup_object_prefix      = module.backup_storage.contract.reader_object_prefix
     backup_object_prefixes    = module.backup_storage.contract.reader_object_prefixes
     backup_permissions        = ["storage.objects.get", "storage.objects.list"]
-    secret_ids                = sort([for config in values(local.controlplane_secrets) : config.secret])
+    secret_ids                = sort(tolist(local.controlplane_secret_ids))
     kms_key_resource          = "projects/${local.project_id}/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
     kms_grant_principal       = google_service_account.controlplane_runtime.email
     kms_grant_role            = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
