@@ -30,7 +30,7 @@ import (
 // only after this returns, and the ordinary auto-pause machinery then
 // takes the revived sandbox through the standard pause path, which is
 // what lands it paused with a fresh, uploaded generation.
-func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string, standaloneDisk, allowRecordless bool, teamID, ownerID string, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
+func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath, blockMap string, standaloneDisk, allowRecordless bool, teamID, ownerID string, vcpu, memMiB uint32, rules *sandboxNetworkRules) (*VMInstance, error) {
 	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
 		return nil, status.Error(codes.InvalidArgument, "vm_id must be a valid per-VM identifier")
 	}
@@ -40,6 +40,14 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 	}
 	if !fi.Mode().IsRegular() {
 		return nil, status.Errorf(codes.InvalidArgument, "disk_path %q is not a regular file", diskPath)
+	}
+	if blockMap != "" {
+		if standaloneDisk {
+			return nil, status.Error(codes.InvalidArgument, "block_map_path describes an overlay; a standalone disk has none")
+		}
+		if !statRegularFile(blockMap) {
+			return nil, status.Errorf(codes.InvalidArgument, "block_map_path %q is not a regular file", blockMap)
+		}
 	}
 	// The whole revival transaction holds the VM's lifecycle lock:
 	// without it, two concurrent revives for one id can interleave so
@@ -51,14 +59,15 @@ func (m *Manager) ReviveVM(ctx context.Context, vmID, diskPath, basePath string,
 		return nil, err
 	}
 	defer unlock()
-	return m.reviveVMLocked(ctx, vmID, diskPath, basePath, standaloneDisk, allowRecordless, teamID, ownerID, vcpu, memMiB, rules, "")
+	return m.reviveVMLocked(ctx, vmID, diskPath, basePath, blockMap, standaloneDisk, allowRecordless, teamID, ownerID, vcpu, memMiB, rules, "")
 }
 
 // reviveVMLocked is ReviveVM under the caller's per-VM op lock. A non-empty
 // backupGeneration names the backup the salvage came from and rides on the
 // record from its first durable write, so a retry after a crash still
-// recognizes the boot as its own.
-func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath string, standaloneDisk, allowRecordless bool, teamID, ownerID string, vcpu, memMiB uint32, rules *sandboxNetworkRules, backupGeneration string) (*VMInstance, error) {
+// recognizes the boot as its own. blockMap, when non-empty, is the
+// snapshot's saved overlay block map and boots with the disk.
+func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath, blockMap string, standaloneDisk, allowRecordless bool, teamID, ownerID string, vcpu, memMiB uint32, rules *sandboxNetworkRules, backupGeneration string) (*VMInstance, error) {
 	// Never revive over a live or healthy VM. A paused VM with its
 	// snapshot is healthy at rest and refused: resume owns that path.
 	if inst, err := m.getInstance(vmID); err == nil {
@@ -280,6 +289,21 @@ func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath s
 		}
 		basePath = resolvedBase
 	}
+	// The map dies in the same teardown too, and the boot would fail
+	// after the zombie's residue is already gone.
+	if blockMap != "" {
+		if !filepath.IsAbs(blockMap) {
+			return nil, status.Errorf(codes.InvalidArgument, "block_map_path %q must be absolute", blockMap)
+		}
+		resolvedMap, merr := filepath.EvalSymlinks(blockMap)
+		if merr != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "block_map_path: %v", merr)
+		}
+		if strings.HasPrefix(resolvedMap+string(filepath.Separator), vmRunDir) || strings.HasPrefix(resolvedMap, vmRunDir) {
+			return nil, status.Errorf(codes.InvalidArgument, "block_map_path %q is inside the VM's run directory, which revival deletes; restore the map elsewhere first", blockMap)
+		}
+		blockMap = resolvedMap
+	}
 
 	reviveStart := time.Now()
 	// Force-clear the zombie's residue. Fail closed on error: booting
@@ -462,7 +486,7 @@ func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath s
 		}
 		return nil
 	}
-	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, rules, seed, preLaunch, true, supervision, vcpu, memMiB)
+	inst, err := m.coldBootFromRootfs(ctx, vmID, diskPath, basePath, blockMap, rules, seed, preLaunch, true, supervision, vcpu, memMiB)
 	if err != nil {
 		// An unconfirmed stop of the spawned VM keeps the boot's
 		// truthful StatusError record: restoring the zombie record over

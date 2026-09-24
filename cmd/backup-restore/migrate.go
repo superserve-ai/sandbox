@@ -384,6 +384,7 @@ func runMigrate(args []string) int {
 		id         string
 		s          shape
 		disk, base string
+		blockMap   string
 		standalone bool
 	}
 	// Boots run on a fixed pool fed a little at a time, so the poll below
@@ -412,7 +413,7 @@ func runMigrate(args []string) int {
 	defer close(jobs)
 
 	run = func(j job) {
-		id, s, disk, base, standalone := j.id, j.s, j.disk, j.base, j.standalone
+		id, s, disk, base, blockMap, standalone := j.id, j.s, j.disk, j.base, j.blockMap, j.standalone
 		{
 			{
 				{
@@ -469,7 +470,7 @@ func runMigrate(args []string) int {
 					// to the source, still paused, exactly as it was.
 					rctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 					resp, err := vmd.ReviveVM(rctx, &vmdpb.ReviveVMRequest{
-						VmId: id, DiskPath: disk, BasePath: base, StandaloneDisk: standalone, AllowRecordless: true,
+						VmId: id, DiskPath: disk, BasePath: base, BlockMapPath: blockMap, StandaloneDisk: standalone, AllowRecordless: true,
 						TeamId: s.team, Vcpu: uint32(s.vcpu), MemMib: uint32(s.mem),
 						AllowedCidrs: s.rules.allowedCIDRs, DeniedCidrs: s.rules.deniedCIDRs, AllowedDomains: s.rules.allowedDomains,
 					})
@@ -797,7 +798,7 @@ func runMigrate(args []string) int {
 				booting++
 				mu.Unlock()
 				handed++
-				jobs <- job{id: id, s: s, disk: rd.disk, base: rd.base, standalone: rd.standalone}
+				jobs <- job{id: id, s: s, disk: rd.disk, base: rd.base, blockMap: rd.blockMap, standalone: rd.standalone}
 			}
 			mu.Lock()
 			fmt.Printf("handed %d, booting %d, in flight %d, queued %d, moved %d, failed %d, %s elapsed\n",
@@ -978,6 +979,7 @@ func parseEgressRules(raw []byte) (egressRules, error) {
 // uploaded as a full image has no base dependency).
 type restored struct {
 	disk, base string
+	blockMap   string
 	standalone bool
 	manifest   backup.GenerationManifest
 }
@@ -987,7 +989,7 @@ func restoredDisk(root, id string) (restored, error) {
 	if err != nil {
 		return restored{}, err
 	}
-	return restored{disk: r.Disk, base: r.Base, standalone: r.Standalone, manifest: *r.Manifest}, nil
+	return restored{disk: r.Disk, base: r.Base, blockMap: r.BlockMap, standalone: r.Standalone, manifest: *r.Manifest}, nil
 }
 
 // current reports whether the restored generation is the sandbox's
