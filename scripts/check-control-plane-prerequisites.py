@@ -101,17 +101,36 @@ def check_prerequisites(args, contract, preflight):
     command("service-readiness", VERIFY.gcloud("run", "services", "describe", args.service, f"--project={args.project}", f"--region={args.region}", "--format=json"),
             lambda text: require(any(entry.get("percent") == 100 and entry.get("revisionName") for entry in json.loads(text).get("status", {}).get("traffic", [])), "No 100% rollback revision"))
     command("project-policy", VERIFY.gcloud("projects", "get-iam-policy", args.project, "--format=json"))
+    managed_folders = {}
     for index, target in enumerate([bucket, *args.other_bucket], 1):
         command(f"bucket-policy-{index}", VERIFY.gcloud("storage", "buckets", "get-iam-policy", f"gs://{target}", "--format=json"))
+        name = f"managed-folders-{index}"
+        preflight.check(name, lambda name=name, target=target: managed_folders.update({
+            target: VERIFY.read_managed_folders(evidence, name, target),
+        }))
 
     # These probes check whether tooling can reach a definite decision. Current
     # grants may change during the regional apply; the cutover verifier still
     # requires explicit denial for every isolation check afterwards.
+    def check_permission(name, target, obj, permission):
+        require(target in managed_folders, "Managed-folder inventory is unavailable")
+        argv = VERIFY.storage_permission_command(identity, target, obj, permission, managed_folders[target])
+        text = evidence.command(name, [*argv, f"--project={args.project}"])
+        require(VERIFY.policy_troubleshooter_access(text) in {"GRANTED", "NOT_GRANTED", "DENIED"},
+                "Policy decision is unknown; inspect inherited policies, custom roles, and group visibility")
+
     for name, target, obj, permission in VERIFY.storage_denial_checks(bucket, args.other_bucket, "templates/.permission-probe"):
-        command(f"policy-visibility-{name.removesuffix('-denied')}", VERIFY.gcloud("policy-troubleshoot", "iam", VERIFY.storage_object_resource(target, obj),
-                f"--project={args.project}", f"--principal-email={identity}", f"--permission={permission}", "--format=json"),
-                lambda text: require(VERIFY.policy_troubleshooter_access(text) in {"GRANTED", "NOT_GRANTED", "DENIED"},
-                    "Policy decision is unknown; inspect inherited policies, custom roles, and group visibility"))
+        name = f"policy-visibility-{name.removesuffix('-denied')}"
+        preflight.check(name, lambda name=name, target=target, obj=obj, permission=permission:
+                        check_permission(name, target, obj, permission))
+
+    def check_nested_folders():
+        require(all(target in managed_folders for target in [bucket, *args.other_bucket]),
+                "Managed-folder inventory is unavailable")
+        for name, target, obj, permission in VERIFY.managed_folder_denial_checks(bucket, args.other_bucket, managed_folders):
+            check_permission(f"policy-visibility-{name}", target, obj, permission)
+
+    preflight.check("nested-managed-folder-policy-visibility", check_nested_folders)
     command("impersonation-analysis", VERIFY.host_effective_iam_command(args.project, identity, identity), VERIFY.iam_analysis_results)
     command("effective-iam", VERIFY.effective_iam_command(args.project, identity, bucket), VERIFY.iam_analysis_results)
     for index, secret in enumerate(contract["secret_ids"], 1):

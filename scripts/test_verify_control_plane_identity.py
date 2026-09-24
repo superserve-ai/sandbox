@@ -56,6 +56,32 @@ class ManifestObjectResolutionTests(unittest.TestCase):
 
 
 class BinaryArtifactProbeTests(unittest.TestCase):
+    def test_policy_requests_are_paced_across_success_and_failure_only(self):
+        now = [0.0]
+        starts = []
+        def sleep(seconds):
+            now[0] += seconds
+        def run(argv, **kwargs):
+            starts.append((argv[:3], now[0]))
+            now[0] += 1
+            return VERIFY.subprocess.CompletedProcess(argv, 1 if len(starts) == 3 else 0, '{}', '')
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(VERIFY.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(VERIFY.time, "sleep", side_effect=sleep) as wait, \
+                patch.object(VERIFY.subprocess, "run", side_effect=run):
+            evidence = VERIFY.Evidence(Path(directory))
+            policy = ["gcloud", "policy-troubleshoot", "iam", "example-resource"]
+            evidence.command("first-policy", policy)
+            evidence.command("other-command", ["gcloud", "auth", "list"])
+            with self.assertRaises(VERIFY.VerificationError):
+                evidence.command("failed-policy", policy)
+            evidence.command("retried-policy", policy)
+            now[0] += 20
+            evidence.command("later-policy", policy)
+            self.assertEqual([start for argv, start in starts if argv == policy[:3]], [0, 9, 18, 39])
+            self.assertEqual(starts[1][1], 1)
+            self.assertEqual(wait.call_count, 2)
+
     def test_binary_stdout_is_streamed_without_utf8_decoding(self):
         with tempfile.TemporaryDirectory() as directory:
             evidence = VERIFY.Evidence(Path(directory))
@@ -136,7 +162,7 @@ class ObjectReadPermissionProbeTests(unittest.TestCase):
 
                     def command(check_name, argv, **_kwargs):
                         self.assertEqual(argv[:3], ["gcloud", "policy-troubleshoot", "iam"])
-                        self.assertIn(VERIFY.storage_object_resource(bucket, object_name), argv)
+                        self.assertIn(f"--resource-name=projects/_/buckets/{bucket}/objects/{object_name}", argv)
                         self.assertIn(f"--permission={permission}", argv)
                         evidence.index.append({"name": check_name, "status": "PASS"})
                         return response
@@ -144,7 +170,7 @@ class ObjectReadPermissionProbeTests(unittest.TestCase):
                     evidence.command = command
                     with self.assertRaises(VERIFY.VerificationError):
                         VERIFY.require_permission_denied(
-                            evidence, name, "reader@example.com", bucket, object_name, permission,
+                            evidence, name, "reader@example.com", bucket, object_name, permission, [],
                         )
                     self.assertEqual(evidence.index[-1]["status"], "FAIL")
 
@@ -166,12 +192,13 @@ class ObjectReadPermissionProbeTests(unittest.TestCase):
                 "cell-backups",
                 "sandboxes/.permission-probe",
                 "storage.objects.get",
+                [],
             )
 
             name, argv = commands[0]
             self.assertEqual(name, "sandbox-get-permission-check")
             self.assertIn(
-                "//storage.googleapis.com/projects/_/buckets/cell-backups/objects/"
+                "--resource-name=projects/_/buckets/cell-backups/objects/"
                 "sandboxes/.permission-probe",
                 argv,
             )
@@ -194,6 +221,7 @@ class ObjectReadPermissionProbeTests(unittest.TestCase):
                     "other-cell-backups",
                     "sandboxes/.permission-probe",
                     "storage.objects.get",
+                    [],
                 )
             self.assertEqual(evidence.index[0]["status"], "FAIL")
 
@@ -215,16 +243,64 @@ class ObjectReadPermissionProbeTests(unittest.TestCase):
                 "other-cell-backups",
                 "templates/.permission-probe",
                 "storage.objects.get",
+                ["templates/"],
             )
 
             name, argv = commands[0]
             self.assertEqual(name, "cross-cell-template-get-1")
             self.assertIn(
-                "//storage.googleapis.com/projects/_/buckets/other-cell-backups/objects/"
+                "--resource-name=projects/_/buckets/other-cell-backups/objects/"
                 "templates/.permission-probe",
                 argv,
             )
             self.assertIn("--permission=storage.objects.get", argv)
+            self.assertEqual(argv[3], "//storage.googleapis.com/projects/_/buckets/other-cell-backups/managedFolders/templates/")
+
+
+class StoragePolicyHierarchyTests(unittest.TestCase):
+    def test_selects_nearest_policy_and_preserves_object_condition_context(self):
+        for obj, suffix in (
+            ("templates/.permission-probe", "/managedFolders/templates/"),
+            ("templates/team/build/manifest.json", "/managedFolders/templates/team/"),
+            ("templates/teammate/manifest.json", "/managedFolders/templates/"),
+            ("sandboxes/.permission-probe", ""),
+        ):
+            with self.subTest(obj=obj):
+                argv = VERIFY.storage_permission_command(
+                    "reader@example.com", "example-bucket", obj, "storage.objects.delete",
+                    ["templates/team/", "templates/", "bases/"],
+                )
+                self.assertEqual(argv[3], f"//storage.googleapis.com/projects/_/buckets/example-bucket{suffix}")
+                self.assertIn(f"--resource-name=projects/_/buckets/example-bucket/objects/{obj}", argv)
+                self.assertIn("--resource-service=storage.googleapis.com", argv)
+                self.assertIn("--resource-type=storage.googleapis.com/Object", argv)
+
+    def test_nested_folder_grants_are_probed_even_outside_the_manifest_path(self):
+        folders = {"own": ["templates/", "templates/team/", "bases/shared/", "sandboxes/team/"],
+                   "other": ["templates/", "templates/team/", "bases/shared/", "sandboxes/team/"]}
+        checks = VERIFY.managed_folder_denial_checks("own", ["other"], folders)
+        observed = {(target, obj, permission) for _, target, obj, permission in checks}
+        expected = {
+            (target, f"{folder}.permission-probe", f"storage.objects.{operation}")
+            for target in folders
+            for folder in folders[target] if folder not in ("templates/", "bases/", "sandboxes/")
+            for operation in (("get", "create", "delete") if target == "other" or folder.startswith("sandboxes/") else ("create", "delete"))
+        }
+        self.assertEqual(observed, expected)
+        self.assertEqual(len({name for name, *_ in checks}), len(checks))
+
+    def test_missing_or_malformed_inventory_cannot_fall_back_to_bucket_policies(self):
+        for response in ('{}', 'null', 'invalid', '[{}]', '[{"bucket":"other","name":"templates/"}]',
+                         '[{"bucket":"example-bucket","name":"templates"}]'):
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as directory:
+                evidence = VERIFY.Evidence(Path(directory))
+                def command(name, argv):
+                    evidence.index.append({"name": name, "status": "PASS"})
+                    return response
+                evidence.command = command
+                with self.assertRaises(VERIFY.VerificationError):
+                    VERIFY.read_managed_folders(evidence, "folders", "example-bucket")
+                self.assertEqual(evidence.index[-1]["status"], "FAIL")
 
 
 class EffectiveIamCommandTests(unittest.TestCase):
@@ -233,7 +309,14 @@ class EffectiveIamCommandTests(unittest.TestCase):
             "example-project", "reader@example-project.iam.gserviceaccount.com", "cell-backups"
         )
         self.assertIn("--project=example-project", command)
+        self.assertIn("--show-response", command)
         self.assertNotIn("--scope=projects/example-project", command)
+
+    def test_impersonation_analysis_requests_full_response_required_by_edge_flags(self):
+        command = VERIFY.host_effective_iam_command("example-project", "host@example.com", "reader@example.com")
+        self.assertIn("--show-response", command)
+        self.assertIn("--output-resource-edges", command)
+        self.assertIn("--output-group-edges", command)
 
 
 class EffectiveIamCompletenessTests(unittest.TestCase):
@@ -259,7 +342,7 @@ class EffectiveIamCompletenessTests(unittest.TestCase):
 
     def test_errors_and_malformed_results_are_rejected(self):
         for document in (
-            [], None,
+            [], None, [{"ACLs": [], "policy": {}}],
             {"fullyExplored": True, "analysisResults": {}},
             {"fullyExplored": True, "nonCriticalErrors": [{"cause": "PERMISSION_DENIED"}]},
             {"fullyExplored": True, "nonCriticalErrors": {}},
@@ -350,7 +433,10 @@ class RuntimeIamRolloutTests(unittest.TestCase):
                 self.assertNotIn("--to-latest", argv)
             evidence.index.append({"name": name, "status": "PASS"})
             if "policy-troubleshoot" in argv:
-                result = {"access": "NOT_GRANTED"}
+                result = responses.get(name, {"access": "NOT_GRANTED"})
+            elif name.startswith("managed-folders-"):
+                target = argv[4].removeprefix("gs://").removesuffix("/")
+                result = responses.get(name, [{"bucket": target, "name": prefix} for prefix in ("templates/", "templates/team/", "bases/")])
             elif name.startswith("managed-folder-iam-"):
                 result = {"bindings": [{"role": "roles/storage.objectViewer", "members": [f"serviceAccount:{identity}"]}]}
             elif kwargs.get("expect_denied") or name.startswith("referenced-read-"):
@@ -403,6 +489,16 @@ class RuntimeIamRolloutTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(evidence["status"], "PASS")
         self.assertIn("route-candidate", commands)
+
+    def test_nested_writer_grant_or_unknown_inventory_prevents_routing(self):
+        for override in ({"managed-folder-1-3-create-denied": {"access": "GRANTED"}},
+                         {"managed-folders-2": {}},
+                         {"managed-folder-2-3-get-denied": {"access": "UNKNOWN_INFO"}}):
+            with self.subTest(override=override):
+                status, evidence, commands = self.run_verifier({"fullyExplored": True}, override)
+                self.assertEqual(status, 1)
+                self.assertEqual(evidence["status"], "FAIL")
+                self.assertNotIn("route-candidate", commands)
 
     def test_wrong_identity_unready_or_unrelated_candidate_never_routes(self):
         valid = {"metadata": {"name": "api-new", "labels": {"serving.knative.dev/service": "api"}},
