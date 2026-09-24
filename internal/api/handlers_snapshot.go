@@ -28,8 +28,9 @@ import (
 // be created from. Its row exists as creating before the host is asked, under
 // the id the host's capture is keyed by, so an answer lost on the way back is
 // settled later by asking the host again (see the sweep). The host serializes
-// captures and deletes of one id, and a fork takes private copies before it
-// uses anything, so a delete is unconditional once a row is ready or failed.
+// captures and deletes of one id, refuses a capture for an id it has deleted,
+// and a fork takes private copies before it uses anything, so a delete is
+// unconditional once a row is ready or failed, and final.
 const (
 	snapshotKindFS    = "fs"
 	snapshotKindMemFS = "mem+fs"
@@ -267,7 +268,7 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 		c.JSON(http.StatusAccepted, snapshotJSON(row))
 		return
 	}
-	current, err := h.settleCapture(cctx, client, row, snap)
+	current, err := h.settleCapture(cctx, row, snap)
 	if err != nil {
 		// The host holds the snapshot; the sweep records it if this did not.
 		log.Error().Err(err).Str("snapshot_id", row.ID.String()).Msg("snapshot: mark ready")
@@ -326,10 +327,9 @@ func optString(s string) *string {
 }
 
 // settleCapture records the host's answer on the row. A row no longer
-// creating was settled by the other party, or is being deleted: a delete
-// may have removed the files this capture has just made again, so they are
-// removed once more, by the sweep if not here.
-func (h *Handlers) settleCapture(ctx context.Context, client VMDClient, row db.SandboxSnapshot, snap vmdclient.SavedSnapshot) (db.SandboxSnapshot, error) {
+// creating was settled by the other party or is being deleted; a delete
+// takes what the host holds, and the host commits nothing for a deleted id.
+func (h *Handlers) settleCapture(ctx context.Context, row db.SandboxSnapshot, snap vmdclient.SavedSnapshot) (db.SandboxSnapshot, error) {
 	ready, err := h.markSnapshotReady(ctx, row.ID, snap)
 	if err == nil {
 		return ready, nil
@@ -337,19 +337,7 @@ func (h *Handlers) settleCapture(ctx context.Context, client VMDClient, row db.S
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return db.SandboxSnapshot{}, err
 	}
-	current, err := h.DB.GetSandboxSnapshotUnscoped(ctx, row.ID)
-	if err != nil {
-		return db.SandboxSnapshot{}, err
-	}
-	if current.Status == "deleting" {
-		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotDeleteTimeout)
-		defer cancel()
-		if err := client.DeleteSavedSnapshot(dctx, row.ID.String()); err != nil && !isVMDNotFound(err) {
-			log.Warn().Err(err).Str("snapshot_id", row.ID.String()).Str("host_id", row.HostID).Msg("snapshot: files made again for a deleted snapshot; left to the sweep")
-			h.scheduleSnapshotSweep(row.ID)
-		}
-	}
-	return current, nil
+	return h.DB.GetSandboxSnapshotUnscoped(ctx, row.ID)
 }
 
 // scheduleSnapshotSweep makes a row the sweep's to settle now. Detached from
@@ -696,7 +684,7 @@ func (h *Handlers) sweepSnapshot(ctx context.Context, row db.SandboxSnapshot, lo
 		cancel()
 		switch {
 		case err == nil:
-			current, err := h.settleCapture(ctx, client, row, snap)
+			current, err := h.settleCapture(ctx, row, snap)
 			if err != nil {
 				logger.Error().Err(err).Msg("snapshot sweep: mark ready")
 				return

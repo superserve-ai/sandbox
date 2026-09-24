@@ -1037,12 +1037,18 @@ func TestForkRefusesASnapshotReplacedUnderItsId(t *testing.T) {
 	if _, _, _, err := m.forkSource(child, &cfg, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	// Between the read and the copy: the id is deleted and captured again
-	// from another sandbox.
-	if err := m.DeleteSavedSnapshot(ctx, id); err != nil {
+	// Between the read and the copy, the id comes to hold another sandbox's
+	// snapshot: not through the host, which refuses a deleted id, but on disk.
+	other, err := m.CreateSavedSnapshot(ctx, second.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.CreateSavedSnapshot(ctx, second.ID, id, SavedSnapshotMemFS); err != nil {
+	dir, _ := m.savedSnapshotDir(id)
+	otherDir, _ := m.savedSnapshotDir(other.SnapshotID)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(otherDir, dir); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.materializeFork(ctx, child, man); status.Code(err) != codes.NotFound {
@@ -1339,4 +1345,59 @@ func TestForkHoldsTheSnapshotLockOnlyWhileItReadsAndCopies(t *testing.T) {
 	unlock()
 	close(release)
 	<-done
+}
+
+func TestDeleteSavedSnapshotRefusesEveryLaterCapture(t *testing.T) {
+	m := newSavedTestManager(t)
+	m.cfg.SavedSnapshotConcurrency = 1
+	inst, _ := seedPausedSource(t, m, true)
+	ctx := context.Background()
+	id := uuid.NewString()
+	if _, err := m.CreateSavedSnapshot(ctx, inst.ID, id, SavedSnapshotMemFS); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DeleteSavedSnapshot(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	// A retry of the capture that arrives after the delete is refused, and
+	// makes nothing.
+	if _, err := m.CreateSavedSnapshot(ctx, inst.ID, id, SavedSnapshotMemFS); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("capture after delete: want FailedPrecondition, got %v", err)
+	}
+	dir, _ := m.savedSnapshotDir(id)
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a refused capture left files behind: %v", err)
+	}
+	// So is one the delete overtook while it waited for a slot.
+	late := uuid.NewString()
+	release, err := m.acquireSavedCapture(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.CreateSavedSnapshot(ctx, inst.ID, late, SavedSnapshotMemFS)
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	if err := m.DeleteSavedSnapshot(ctx, late); err != nil {
+		t.Fatal(err)
+	}
+	release()
+	select {
+	case err := <-done:
+		if status.Code(err) != codes.FailedPrecondition {
+			t.Fatalf("capture overtaken by a delete: want FailedPrecondition, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("capture did not proceed once the slot freed")
+	}
+	lateDir, _ := m.savedSnapshotDir(late)
+	if _, err := os.Stat(lateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("an overtaken capture left files behind: %v", err)
+	}
+	// A fresh id is untouched by either.
+	if _, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotMemFS); err != nil {
+		t.Fatalf("capture under a new id: %v", err)
+	}
 }

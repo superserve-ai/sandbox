@@ -141,28 +141,11 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	if seen = claim(); !seen[fresh.ID] {
 		t.Fatal("a released capture was not claimed at once")
 	}
-
-	// A deleted row whose files came back is the sweep's again until the
-	// host confirms, and never the API's.
-	if seen = claim(); seen[fs.ID] {
-		t.Fatal("a deleted row the host confirmed was claimed")
-	}
-	if n, err := q.ScheduleSandboxSnapshotSweep(ctx, fs.ID); err != nil || n != 1 {
-		t.Fatalf("schedule a deleted row: %d %v", n, err)
-	}
-	if seen = claim(); !seen[fs.ID] {
-		t.Fatal("a deleted row owing the host a delete was not claimed")
-	}
-	if _, err := q.GetSandboxSnapshot(ctx, db.GetSandboxSnapshotParams{ID: fs.ID, TeamID: teamID}); !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("deleted row readable while the sweep owns it: %v", err)
-	}
-	if n, _ := q.MarkSandboxSnapshotDeleted(ctx, fs.ID); n != 1 {
-		t.Fatalf("confirming a deleted row again changed %d rows", n)
-	}
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET sweep_after = now() - interval '1 minute' WHERE id = $1 AND sweep_after IS NOT NULL`, fs.ID); err != nil {
-		t.Fatal(err)
+	// A deleted row is nobody's: the host refuses its id from then on.
+	if n, _ := q.ScheduleSandboxSnapshotSweep(ctx, fs.ID); n != 0 {
+		t.Fatalf("a deleted row was scheduled for the sweep (%d rows)", n)
 	}
 	if seen = claim(); seen[fs.ID] {
-		t.Fatal("a deleted row the host confirmed again was claimed")
+		t.Fatal("a deleted row was claimed")
 	}
 }

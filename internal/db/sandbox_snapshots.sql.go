@@ -67,7 +67,8 @@ const claimStuckSandboxSnapshots = `-- name: ClaimStuckSandboxSnapshots :many
 UPDATE sandbox_snapshot SET sweep_after = $1::timestamptz
 WHERE id IN (
     SELECT id FROM sandbox_snapshot
-    WHERE status IN ('creating', 'deleting')
+    WHERE deleted_at IS NULL
+      AND status IN ('creating', 'deleting')
       AND sweep_after <= now()
     ORDER BY sweep_after
     LIMIT $2::bigint
@@ -81,9 +82,8 @@ type ClaimStuckSandboxSnapshotsParams struct {
 	RowLimit int64     `json:"row_limit"`
 }
 
-// Rows a capture or a delete left behind, due for the sweep; a deleted row
-// is among them while the host may still hold its files. Each claimed row
-// is pushed out to @retry_at, so a host that does not answer holds back
+// Rows a capture or a delete left behind, due for the sweep. Each claimed
+// row is pushed out to @retry_at, so a host that does not answer holds back
 // nothing but its own rows and another replica's sweep passes over them.
 func (q *Queries) ClaimStuckSandboxSnapshots(ctx context.Context, arg ClaimStuckSandboxSnapshotsParams) ([]SandboxSnapshot, error) {
 	rows, err := q.db.Query(ctx, claimStuckSandboxSnapshots, arg.RetryAt, arg.RowLimit)
@@ -447,12 +447,12 @@ func (q *Queries) ListSandboxSnapshots(ctx context.Context, arg ListSandboxSnaps
 }
 
 const markSandboxSnapshotDeleted = `-- name: MarkSandboxSnapshotDeleted :execrows
-UPDATE sandbox_snapshot SET deleted_at = COALESCE(deleted_at, now()), sweep_after = NULL
-WHERE id = $1 AND status = 'deleting'
+UPDATE sandbox_snapshot SET deleted_at = now(), sweep_after = NULL
+WHERE id = $1 AND status = 'deleting' AND deleted_at IS NULL
 `
 
-// The host has confirmed it holds nothing; for a row already deleted, that
-// it holds nothing again.
+// The host has confirmed it holds nothing and will commit nothing for the
+// id again, so nothing is owed to the sweep.
 func (q *Queries) MarkSandboxSnapshotDeleted(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, markSandboxSnapshotDeleted, id)
 	if err != nil {
@@ -590,11 +590,11 @@ func (q *Queries) RenameSandboxSnapshot(ctx context.Context, arg RenameSandboxSn
 
 const scheduleSandboxSnapshotSweep = `-- name: ScheduleSandboxSnapshotSweep :execrows
 UPDATE sandbox_snapshot SET sweep_after = now()
-WHERE id = $1 AND status IN ('creating', 'deleting')
+WHERE id = $1 AND status = 'creating'
 `
 
-// A capture whose answer was lost, or a deleted snapshot whose files were
-// made again and not removed, is the sweep's to settle now.
+// A capture whose answer was lost is the sweep's to settle now, not when
+// the row ages out.
 func (q *Queries) ScheduleSandboxSnapshotSweep(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, scheduleSandboxSnapshotSweep, id)
 	if err != nil {

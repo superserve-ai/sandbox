@@ -496,16 +496,12 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 	gone := snapshotFixture(teamID, sandboxID, "creating")
 	lost := snapshotFixture(teamID, sandboxID, "creating")
 	deleting := snapshotFixture(teamID, sandboxID, "deleting")
-	// Settled by another sweep and deleted by the user while this sweep's
-	// capture was in flight: the capture made the files again, and the host
-	// does not take the first request to remove them.
-	revived := snapshotFixture(teamID, sandboxID, "creating")
-	var readied, failed, deleted, scheduled []uuid.UUID
+	var readied, failed, deleted []uuid.UUID
 	var mu sync.Mutex
 	mock := &mockDBTX{
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			if strings.Contains(sql, "-- name: ClaimStuckSandboxSnapshots :many") {
-				return &scriptedRows{rows: []*mockRow{sandboxSnapshotRow(committed), sandboxSnapshotRow(gone), sandboxSnapshotRow(lost), sandboxSnapshotRow(deleting), sandboxSnapshotRow(revived)}}, nil
+				return &scriptedRows{rows: []*mockRow{sandboxSnapshotRow(committed), sandboxSnapshotRow(gone), sandboxSnapshotRow(lost), sandboxSnapshotRow(deleting)}}, nil
 			}
 			return nil, fmt.Errorf("unexpected query: %s", sql)
 		},
@@ -515,16 +511,9 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 			switch {
 			case strings.Contains(sql, "-- name: MarkSandboxSnapshotReady :one"):
 				id := args[len(args)-1].(uuid.UUID)
-				if id == revived.ID {
-					return errRow(pgx.ErrNoRows)
-				}
 				readied = append(readied, id)
 				r := committed
 				r.ID, r.Status = id, "ready"
-				return sandboxSnapshotRow(r)
-			case strings.Contains(sql, "-- name: GetSandboxSnapshotUnscoped :one"):
-				r := revived
-				r.Status, r.DeletedAt = "deleting", pgtype.Timestamptz{Time: time.Now(), Valid: true}
 				return sandboxSnapshotRow(r)
 			}
 			return errRow(fmt.Errorf("unexpected query: %s", sql))
@@ -538,8 +527,6 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 				failed = append(failed, id)
 			case strings.Contains(sql, "-- name: MarkSandboxSnapshotDeleted :execrows"):
 				deleted = append(deleted, id)
-			case strings.Contains(sql, "-- name: ScheduleSandboxSnapshotSweep :execrows"):
-				scheduled = append(scheduled, id)
 			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
@@ -559,17 +546,11 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			hostDeleted = append(hostDeleted, id)
-			if id == revived.ID.String() {
-				return status.Error(codes.Unavailable, "host busy")
-			}
 			return nil
 		},
 	}
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	<-h.SweepSnapshotsOnce(context.Background(), zerolog.Nop())
-	if len(scheduled) != 1 || scheduled[0] != revived.ID {
-		t.Errorf("scheduled = %v, want the deleted row whose files the host did not remove, so the sweep drives it", scheduled)
-	}
 	if len(readied) != 1 || readied[0] != committed.ID {
 		t.Errorf("readied = %v, want only the committed row", readied)
 	}
@@ -579,9 +560,9 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 	if len(deleted) != 1 || deleted[0] != deleting.ID {
 		t.Errorf("deleted = %v, want only the deleting row", deleted)
 	}
-	want := map[string]bool{gone.ID.String(): true, deleting.ID.String(): true, revived.ID.String(): true}
+	want := map[string]bool{gone.ID.String(): true, deleting.ID.String(): true}
 	if len(hostDeleted) != len(want) {
-		t.Fatalf("host deletes = %v; want the refused row's leftovers, the deleting row and the files made again for the deleted row", hostDeleted)
+		t.Fatalf("host deletes = %v; want the refused row's leftovers and the deleting row", hostDeleted)
 	}
 	for _, id := range hostDeleted {
 		if !want[id] {

@@ -18,7 +18,7 @@ COMMENT ON COLUMN sandbox_snapshot.sweep_after IS
 
 CREATE INDEX IF NOT EXISTS sandbox_snapshot_sweep
     ON sandbox_snapshot (sweep_after)
-    WHERE status IN ('creating', 'deleting') AND sweep_after IS NOT NULL;
+    WHERE deleted_at IS NULL AND status IN ('creating', 'deleting');
 
 ALTER TABLE team
     ADD COLUMN IF NOT EXISTS max_snapshots_in_flight int NOT NULL DEFAULT 4;

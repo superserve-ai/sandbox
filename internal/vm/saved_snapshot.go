@@ -31,10 +31,14 @@ import (
 const (
 	SavedSnapshotsDirName     = "saved"
 	savedSnapshotManifestName = "manifest.json"
-	savedSnapshotVersion      = 1
-	defaultSavedCaptures      = 2
-	savedCaptureHeadroom      = 256 << 20
-	savedUnpauseAttempts      = 3
+	// Deleted ids, one empty file each, never reaped: a capture for one is
+	// refused, so a delete is final however late a retry of the capture
+	// arrives.
+	savedTombstonesDirName = ".deleted"
+	savedSnapshotVersion   = 1
+	defaultSavedCaptures   = 2
+	savedCaptureHeadroom   = 256 << 20
+	savedUnpauseAttempts   = 3
 	// A capture's budget: a base for the request itself, plus the time a
 	// full memory image takes at the slowest write rate the capture waits
 	// for before it treats Firecracker as stuck.
@@ -286,6 +290,11 @@ func (m *Manager) DeleteSavedSnapshot(ctx context.Context, snapshotID string) er
 		return err
 	}
 	defer unlock()
+	// The tombstone is durable before the files go, so a crash between the
+	// two leaves the id refused, never a delete that a later capture undoes.
+	if err := writeSavedTombstone(dir); err != nil {
+		return fmt.Errorf("record saved snapshot deletion: %w", err)
+	}
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("remove saved snapshot: %w", err)
 	}
@@ -657,6 +666,9 @@ func (m *Manager) instanceDiskPath(inst *VMInstance) string {
 }
 
 func (m *Manager) committedSavedSnapshot(dir, vmID string, kind SavedSnapshotKind) (*SavedSnapshotManifest, error) {
+	if _, err := os.Stat(savedTombstonePath(dir)); err == nil {
+		return nil, status.Errorf(codes.FailedPrecondition, "saved snapshot %s was deleted", filepath.Base(dir))
+	}
 	man, err := readSavedSnapshotManifest(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -668,6 +680,23 @@ func (m *Manager) committedSavedSnapshot(dir, vmID string, kind SavedSnapshotKin
 		return nil, status.Errorf(codes.AlreadyExists, "saved snapshot %s is a %s snapshot of vm %s", man.SnapshotID, man.Kind, man.SourceVMID)
 	}
 	return man, nil
+}
+
+func savedTombstonePath(dir string) string {
+	return filepath.Join(filepath.Dir(dir), savedTombstonesDirName, filepath.Base(dir))
+}
+
+func writeSavedTombstone(dir string) error {
+	path := savedTombstonePath(dir)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	_ = f.Close()
+	return fsyncDir(filepath.Dir(path))
 }
 
 func readSavedSnapshotManifest(dir string) (*SavedSnapshotManifest, error) {
