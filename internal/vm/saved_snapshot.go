@@ -322,23 +322,27 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	if err := m.resolveOutstandingFreeze(ctx, vmID, socket, ip, recordedArtifact, log); err != nil {
 		return err
 	}
-	// The disk alone is an fs snapshot, so what the guest has written but
-	// not yet flushed has to reach it first: here while the workload still
-	// runs, and again below once it is stopped, for a guest that can. A
-	// memory image carries the page cache itself.
-	if kind == SavedSnapshotFS && ip != "" {
-		if err := syncGuestFilesystems(ctx, ip); err != nil {
-			return status.Errorf(codes.FailedPrecondition, "guest did not flush its filesystems before the capture: %v", err)
-		}
-	}
 	corrects := recordedCorrects != nil && *recordedCorrects
 	if recordedCorrects == nil {
 		corrects = guestCorrectsWallClock(memFile, baseMem)
 	}
-	// An fs capture stops the workload so nothing is written between the
-	// flush and the pause; only a memory image also needs the clock policy.
-	willFreeze := corrects && m.cfg.GuestClockFreezeEnabled &&
-		(kind == SavedSnapshotFS || (m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load()))
+	// The disk alone must hold everything the workload was given, so an fs
+	// capture stops the workload and has the guest flush while it is
+	// stopped, whatever the clock policy says; a guest that cannot is
+	// refused rather than imaged with writes still in its page cache. A
+	// memory image carries the page cache itself and freezes for the clock.
+	if kind == SavedSnapshotFS && (ip == "" || !corrects) {
+		return status.Error(codes.FailedPrecondition, "the sandbox's image cannot stop its workload for a disk snapshot; take a mem+fs snapshot, or create the sandbox from a current template")
+	}
+	if kind == SavedSnapshotFS {
+		// Most of it flushed here, while the workload still runs, so the
+		// stop below is short.
+		if err := syncGuestFilesystems(ctx, ip); err != nil {
+			return status.Errorf(codes.FailedPrecondition, "guest did not flush its filesystems before the capture: %v", err)
+		}
+	}
+	willFreeze := kind == SavedSnapshotFS || (corrects && m.cfg.GuestClockFreezeEnabled &&
+		m.clockRealtimeCapable.Load() && !m.guestClockUnready.Load())
 	token, artifact := "", NewArtifactID()
 	if willFreeze {
 		token = NewFreezeToken()
@@ -364,6 +368,21 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		if ferr != nil {
 			m.markUnservable(inst, log)
 			return ferr
+		}
+		if kind == SavedSnapshotFS && !(frozen && synced) {
+			// Not stopped, or stopped by an agent that cannot flush: the
+			// disk would not be whole, so the source is let go and the
+			// capture refused.
+			if frozen {
+				if err := m.releaseFrozenGuest(ctx, "", ip, token); err != nil {
+					m.markUnservable(inst, log)
+					return status.Errorf(codes.Unavailable, "source could not be released after a refused capture: %v", err)
+				}
+			}
+			if err := clearPauseIntent(sourceDir); err != nil {
+				return fmt.Errorf("clear capture intent: %w", err)
+			}
+			return status.Error(codes.FailedPrecondition, "the sandbox's guest agent cannot flush its filesystems while stopped; take a mem+fs snapshot, or create the sandbox from a current template")
 		}
 	}
 

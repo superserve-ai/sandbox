@@ -936,9 +936,12 @@ paths:
         created from. The sandbox must be active or paused. A `mem+fs`
         snapshot (the default) holds memory and disk, so a sandbox created
         from it resumes with its processes intact; an `fs` snapshot holds the
-        disk only and boots fresh, with the sandbox's processes stopped while
-        its filesystems are flushed, so the disk holds everything they had
-        written. A running sandbox is paused for the
+        disk only and boots fresh. Of a running sandbox, its processes are
+        stopped while its filesystems are flushed, so the disk holds
+        everything they had written; a sandbox whose image cannot do that is
+        refused (`conflict`). Of a paused sandbox, the disk is as it was
+        flushed at the pause; what its processes still held is in the memory
+        image, which only a `mem+fs` snapshot carries. A running sandbox is paused for the
         capture: under a second for the first memory snapshot of a sandbox,
         longer when all of memory has to be written. The call returns once
         the snapshot is ready; if the host's answer is lost on the way, it
