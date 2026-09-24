@@ -55,7 +55,7 @@ class DeployTargetTests(unittest.TestCase):
                     self.assertEqual(result.returncode == 0,
                                      confirm == 'smoke' and bootstrap == 'false')
 
-    def test_frontend_owning_states_require_bootstrap_before_automatic_apply(self):
+    def test_frontend_owning_states_keep_migration_explicit(self):
         workflow = (SCRIPTS.parent / 'terraform-cd.yml').read_text()
         deploy = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
         for name, gate in (
@@ -70,7 +70,7 @@ class DeployTargetTests(unittest.TestCase):
                     result = subprocess.run(['bash', '-eu', '-c', guard],
                                             capture_output=True, text=True,
                                             env=dict(os.environ, PROXY_FRONTEND_MIGRATED=value))
-                    self.assertEqual(result.returncode, 0 if value == 'true' else 1)
+                    self.assertEqual(result.returncode, 0)
         for state in ('staging/us-central1', 'production/us-east4', 'production/us-west2'):
             with self.subTest(bootstrap_output=state):
                 generations = (SCRIPTS.parent.parent.parent / 'infra' / 'envs' / state

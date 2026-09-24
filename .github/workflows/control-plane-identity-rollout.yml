@@ -108,6 +108,7 @@ jobs:
           echo "CONTROL_PLANE_EVIDENCE_BUCKET=$bucket" >> "$GITHUB_ENV"
       - name: Plan and check prerequisites without applying
         env:
+          TF_VAR_proxy_generation_frontends_enabled: ${{ (matrix.cell == 'staging' && vars.PROXY_STAGING_FRONTEND_MIGRATED == 'true' || matrix.cell == 'production-use4' && vars.PROXY_PRODUCTION_FRONTEND_MIGRATED == 'true') && 'true' || 'false' }}
           TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
           PROJECT: ${{ vars.GCP_PROJECT }}
           REGION: ${{ vars[matrix.region_variable] }}
@@ -174,6 +175,7 @@ jobs:
         run: scripts/bootstrap-control-plane-evidence.sh
       - name: Apply and verify staging identity
         env:
+          TF_VAR_proxy_generation_frontends_enabled: ${{ vars.PROXY_STAGING_FRONTEND_MIGRATED == 'true' && 'true' || 'false' }}
           PROJECT: ${{ vars.GCP_PROJECT }}
           REGION: ${{ vars.GCP_REGION }}
           SERVICE: ${{ vars.CLOUD_RUN_SERVICE }}
@@ -207,6 +209,7 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_proxy_frontend_steady_plan.py" staging
           identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/staging-contract.json"
@@ -296,6 +299,7 @@ jobs:
         run: scripts/bootstrap-control-plane-evidence.sh
       - name: Apply and verify production use4 identity
         env:
+          TF_VAR_proxy_generation_frontends_enabled: ${{ vars.PROXY_PRODUCTION_FRONTEND_MIGRATED == 'true' && 'true' || 'false' }}
           PROJECT: ${{ vars.GCP_PROJECT }}
           REGION: ${{ vars.GCP_REGION_USE4 }}
           SERVICE: ${{ vars.CLOUD_RUN_SERVICE_USE4 }}
@@ -329,6 +333,7 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_proxy_frontend_steady_plan.py"
           identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/use4-contract.json"

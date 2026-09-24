@@ -25,6 +25,16 @@ variable "generation_cell" {
   }
 }
 
+variable "staging_project_wide_generation_endpoints" {
+  description = "Explicit staging exception: allow runtime NEG read/attach/detach throughout the project. Production cannot opt in."
+  type        = bool
+  default     = false
+  validation {
+    condition     = !var.staging_project_wide_generation_endpoints || var.environment == "staging"
+    error_message = "Project-wide generation endpoint access is restricted to staging."
+  }
+}
+
 locals {
   generation_routes = var.generation_cell == null ? {} : var.generation_cell.routes
   generation_http_routes = {
@@ -133,8 +143,8 @@ resource "google_project_iam_custom_role" "generation" {
   role_id = "${replace(var.name, "-", "_")}_proxy_endpoints"
   title   = "Proxy endpoint membership"
   permissions = [
+    # Listing endpoints is authorized by the group's get permission.
     "compute.networkEndpointGroups.get",
-    "compute.networkEndpointGroups.listNetworkEndpoints",
     "compute.networkEndpointGroups.attachNetworkEndpoints",
     "compute.networkEndpointGroups.detachNetworkEndpoints",
   ]
@@ -146,13 +156,16 @@ resource "google_project_iam_member" "generation" {
   role    = google_project_iam_custom_role.generation[0].name
   member  = "serviceAccount:${var.generation_cell.service_account}"
 
-  # This binding contains the only endpoint-mutation permissions. Keep the
-  # resource type check positive: an unknown or unsupported resource must not
-  # turn a failed NEG match into project-wide endpoint access.
-  condition {
-    title       = "Cell-owned proxy generation NEGs"
-    description = "Restrict NEG membership operations to this cell's generation NEGs."
-    expression  = "resource.type == 'compute.googleapis.com/NetworkEndpointGroup' && resource.name.startsWith('projects/${var.project_id}/zones/${var.generation_cell.zone}/networkEndpointGroups/${var.name}-')"
+  # NEG resource.type/name attributes are unsupported and fail closed. Keep
+  # that hold outside the explicit staging exception until cell isolation is
+  # implemented with supported IAM attributes and validated in the cloud.
+  dynamic "condition" {
+    for_each = var.staging_project_wide_generation_endpoints ? [] : [1]
+    content {
+      title       = "Cell-owned proxy generation NEGs"
+      description = "Restrict NEG membership operations to this cell's generation NEGs."
+      expression  = "resource.type == 'compute.googleapis.com/NetworkEndpointGroup' && resource.name.startsWith('projects/${var.project_id}/zones/${var.generation_cell.zone}/networkEndpointGroups/${var.name}-')"
+    }
   }
 }
 
@@ -163,8 +176,8 @@ resource "google_project_iam_custom_role" "generation_support" {
   title   = "Proxy endpoint controller support"
   permissions = [
     "compute.instances.use",
+    # Backend get also authorizes the getHealth API method.
     "compute.backendServices.get",
-    "compute.backendServices.getHealth",
     "compute.zoneOperations.get",
   ]
 }

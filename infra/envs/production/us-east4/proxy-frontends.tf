@@ -1,13 +1,19 @@
+variable "proxy_generation_frontends_enabled" {
+  description = "Use generation backends only after the explicit frontend migration."
+  type        = bool
+  default     = false
+}
+
 # Global proxy frontends are owned by the use-cell state.  The URL maps retain
 # all observed host rules while switching only the proxy backend references;
 # this is also the dependency-checked reassignment of the retired central
 # destinations to the us-east4 generation.
 
 locals {
-  use4_proxy_http_backend = module.proxy_generations["use4"].generation_backend_services["public-http"]
-  use4_proxy_tcp_backend  = module.proxy_generations["use4"].generation_backend_services["public-tcp"]
-  use4_redirect_backend   = module.proxy_generations["use4"].generation_backend_services.redirect
-  usw2_proxy_http_backend = "https://www.googleapis.com/compute/v1/projects/${local.project_id}/global/backendServices/proxy-usw2-public-http-generations"
+  use4_proxy_http_backend = var.proxy_generation_frontends_enabled ? module.proxy_generations["use4"].generation_backend_services["public-http"] : "https://www.googleapis.com/compute/v1/projects/${local.project_id}/global/backendServices/dp-use4"
+  use4_proxy_tcp_backend  = var.proxy_generation_frontends_enabled ? module.proxy_generations["use4"].generation_backend_services["public-tcp"] : "https://www.googleapis.com/compute/v1/projects/${local.project_id}/global/backendServices/sandbox-proxy-backend"
+  use4_redirect_backend   = var.proxy_generation_frontends_enabled ? module.proxy_generations["use4"].generation_backend_services.redirect : "https://www.googleapis.com/compute/v1/projects/${local.project_id}/global/backendServices/sandbox-proxy-redirect-backend"
+  usw2_proxy_http_backend = var.proxy_generation_frontends_enabled ? "https://www.googleapis.com/compute/v1/projects/${local.project_id}/global/backendServices/proxy-usw2-public-http-generations" : "https://www.googleapis.com/compute/v1/projects/${local.project_id}/global/backendServices/sandbox-proxy-backend-usw2"
 
   # This is the complete host/path inventory adopted from the production URL
   # map describe output.  Keep the simple proxy maps explicit too: an empty
@@ -49,11 +55,11 @@ locals {
     path_matchers = [
       {
         name            = "usw"
-        default_service = local.usw2_proxy_http_backend
+        default_service = var.proxy_generation_frontends_enabled ? local.usw2_proxy_http_backend : "https://www.googleapis.com/compute/v1/projects/${local.project_id}/global/backendServices/dp-usw"
       },
       {
         name            = "use"
-        default_service = local.use4_proxy_http_backend
+        default_service = var.proxy_generation_frontends_enabled ? local.use4_proxy_http_backend : "https://www.googleapis.com/compute/v1/projects/${local.project_id}/global/backendServices/dp-use"
       },
       {
         name            = "api-usw"
@@ -188,7 +194,7 @@ resource "google_compute_target_ssl_proxy" "proxy" {
   name            = "sandbox-proxy-ssl"
   project         = local.project_id
   backend_service = local.use4_proxy_tcp_backend
-  certificate_map = "projects/${local.project_id}/locations/global/certificateMaps/sandbox-proxy-cert-map"
+  certificate_map = "https://certificatemanager.googleapis.com/v1/projects/${local.project_id}/locations/global/certificateMaps/sandbox-proxy-cert-map"
 
   lifecycle {
     prevent_destroy = true
