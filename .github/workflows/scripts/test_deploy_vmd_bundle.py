@@ -42,6 +42,12 @@ class DeployVmdBundleTests(unittest.TestCase):
         check = SOURCE.index("deploy/vmd-staged-intent-floor-guard {extract_dir}/bin/vmd")
         install = SOURCE.index("sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd")
         self.assertLess(check, install)
+        # The guard is installed and loaded before the binary it fences lands,
+        # so a deploy interrupted between the two never leaves a capable vmd
+        # unguarded.
+        guard = SOURCE.index("{install_dir}/vmd-staged-intent-floor-guard")
+        self.assertLess(guard, install)
+        self.assertLess(SOURCE.index("systemctl daemon-reload", guard), install)
 
     def test_downgrade_is_checked_before_the_binary_lands(self):
         # The deploy runs the bundled guard against the new binary, so the

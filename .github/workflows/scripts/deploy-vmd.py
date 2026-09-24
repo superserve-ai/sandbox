@@ -740,6 +740,17 @@ def main() -> int:
                 exit 1
             fi
 
+            # Staged-intent floor: its guard and drop-in go in, and take
+            # effect, before the binary that journals such intents can run,
+            # so a deploy interrupted between the two never leaves a capable
+            # vmd unguarded. Its own executable and drop-in, so a deploy of
+            # the revision that introduced the wake floor, which reinstalls
+            # that guard, leaves this one in place.
+            sudo install -d -m 0755 /etc/systemd/system/superserve-vmd.service.d
+            sudo install -m 0755 {extract_dir}/deploy/vmd-staged-intent-floor-guard {install_dir}/vmd-staged-intent-floor-guard
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-staged-intent-floor-guard.conf /etc/systemd/system/superserve-vmd.service.d/31-staged-intent-floor-guard.conf
+            sudo systemctl daemon-reload
+
             # Install vmd + template-builder binaries.
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd
             sudo install -m 0755 {extract_dir}/bin/template-builder {install_dir}/template-builder
@@ -787,11 +798,6 @@ def main() -> int:
             # script's guard leaves this one in place. See vmd-wake-floor-guard.
             sudo install -m 0755 {extract_dir}/deploy/vmd-wake-floor-guard {install_dir}/vmd-wake-floor-guard
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-wake-floor-guard.conf /etc/systemd/system/superserve-vmd.service.d/30-wake-floor-guard.conf
-            # Staged-intent floor: its own executable and drop-in as well, so a
-            # deploy of the revision that introduced the wake floor, which
-            # reinstalls that guard, leaves this one in place.
-            sudo install -m 0755 {extract_dir}/deploy/vmd-staged-intent-floor-guard {install_dir}/vmd-staged-intent-floor-guard
-            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-staged-intent-floor-guard.conf /etc/systemd/system/superserve-vmd.service.d/31-staged-intent-floor-guard.conf
             # Start-generation stamp: proves receipt succession (see the
             # drop-in's header). A drop-in for the same reason as the guard
             # above — it must survive deploys of revisions that predate it.
