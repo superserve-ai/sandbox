@@ -305,17 +305,25 @@ class KmsOwnershipTests(unittest.TestCase):
 
 
 class RuntimeIamRolloutTests(unittest.TestCase):
-    def run_verifier(self, runtime_analysis):
+    def run_verifier(self, runtime_analysis, overrides=None):
         identity = "reader@example-project.iam.gserviceaccount.com"
         deployer = "deployer@example-project.iam.gserviceaccount.com"
         manifest = "templates/template/build/generation/manifest.json"
         service = {
             "spec": {"template": {"spec": {"serviceAccountName": identity}}},
-            "status": {"latestReadyRevisionName": "api-new", "traffic": [{"revisionName": "api-new", "percent": 100}]},
+            "status": {"latestCreatedRevisionName": "api-new", "latestReadyRevisionName": "api-old", "traffic": [{"revisionName": "api-old", "percent": 100}]},
         }
+        revision = {
+            "metadata": {"name": "api-new", "labels": {"serving.knative.dev/service": "api"}},
+            "spec": {"serviceAccountName": identity},
+            "status": {"conditions": [{"type": "Ready", "status": "True", "reason": "Retired"}]},
+        }
+        routed_service = {**service, "status": {"latestReadyRevisionName": "api-new",
+                          "traffic": [{"revisionName": "api-new", "percent": 100}]}}
         responses = {
             "service": service,
-            "latest-ready-revision": {"spec": {"serviceAccountName": identity}},
+            "candidate-revision": revision,
+            "service-before-route": service,
             "own-template-list": manifest,
             "manifest-read": {"files": [{"object": "memory.pack"}]},
             "bucket-iam": {"bindings": []},
@@ -326,14 +334,20 @@ class RuntimeIamRolloutTests(unittest.TestCase):
             ]},
             "host-effective-iam-1": {"fullyExplored": True},
             "effective-iam": runtime_analysis,
-            "route-latest": "",
-            "traffic-after-route": service,
+            "route-candidate": "",
+            "traffic-after-route": routed_service,
             "latest-revision": {"spec": {"serviceAccountName": identity}},
         }
+        responses.update(overrides or {})
         commands = []
 
         def command(evidence, name, argv, **kwargs):
             commands.append(name)
+            if name == "candidate-revision":
+                self.assertEqual(argv[4], "api-new")
+            if name == "route-candidate":
+                self.assertIn("--to-revisions=api-new=100", argv)
+                self.assertNotIn("--to-latest", argv)
             evidence.index.append({"name": name, "status": "PASS"})
             if "policy-troubleshoot" in argv:
                 result = {"access": "NOT_GRANTED"}
@@ -358,7 +372,7 @@ class RuntimeIamRolloutTests(unittest.TestCase):
             argv = [str(SPEC.origin), "--cell", "example", "--project", "example-project",
                     "--region", "example-region", "--service", "api", "--contract-file", str(contract_path),
                     "--evidence-dir", str(root / "evidence"), "--other-bucket", "other-cell",
-                    "--allow-pending-traffic", "--route-traffic"]
+                    "--allow-pending-traffic", "--route-traffic", "--candidate-revision", "api-new"]
             previous_umask = os.umask(0o077)
             try:
                 with patch.object(sys, "argv", argv), patch.object(VERIFY.Evidence, "command", command), redirect_stderr(io.StringIO()):
@@ -379,7 +393,7 @@ class RuntimeIamRolloutTests(unittest.TestCase):
                 self.assertEqual(evidence["status"], "FAIL")
                 runtime = next(check for check in evidence["checks"] if check["name"] == "effective-iam")
                 self.assertEqual(runtime["status"], "FAIL")
-                self.assertNotIn("route-latest", commands)
+                self.assertNotIn("route-candidate", commands)
 
     def test_complete_runtime_iam_with_intended_grants_allows_routing(self):
         status, evidence, commands = self.run_verifier({
@@ -388,7 +402,38 @@ class RuntimeIamRolloutTests(unittest.TestCase):
         })
         self.assertEqual(status, 0)
         self.assertEqual(evidence["status"], "PASS")
-        self.assertIn("route-latest", commands)
+        self.assertIn("route-candidate", commands)
+
+    def test_wrong_identity_unready_or_unrelated_candidate_never_routes(self):
+        valid = {"metadata": {"name": "api-new", "labels": {"serving.knative.dev/service": "api"}},
+                 "spec": {"serviceAccountName": "reader@example-project.iam.gserviceaccount.com"},
+                 "status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+        for change in (
+            {"spec": {"serviceAccountName": "legacy@example.com"}},
+            {"status": {"conditions": [{"type": "Ready", "status": "Unknown"}]}},
+            {"status": {}},
+            {"metadata": {"name": "api-new", "labels": {"serving.knative.dev/service": "other"}}},
+        ):
+            with self.subTest(change=change):
+                status, _, commands = self.run_verifier({"fullyExplored": True},
+                    {"candidate-revision": {**valid, **change}})
+                self.assertEqual(status, 1)
+                self.assertNotIn("route-candidate", commands)
+
+    def test_newer_revision_during_checks_does_not_get_routed(self):
+        status, _, commands = self.run_verifier({"fullyExplored": True}, {
+            "service-before-route": {"status": {"latestCreatedRevisionName": "api-newer"}},
+        })
+        self.assertEqual(status, 1)
+        self.assertNotIn("route-candidate", commands)
+
+    def test_latest_traffic_cannot_substitute_for_candidate_after_route(self):
+        status, evidence, _ = self.run_verifier({"fullyExplored": True}, {
+            "traffic-after-route": {"status": {"latestReadyRevisionName": "api-newer",
+                "traffic": [{"latestRevision": True, "revisionName": "api-newer", "percent": 100}]}},
+        })
+        self.assertEqual(status, 1)
+        self.assertEqual(evidence["status"], "FAIL")
 
 
 if __name__ == "__main__":

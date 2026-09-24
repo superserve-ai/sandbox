@@ -43,12 +43,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contract-file", required=True, type=Path)
     parser.add_argument("--evidence-dir", required=True, type=Path)
     parser.add_argument("--previous-revision")
+    parser.add_argument("--candidate-revision")
     parser.add_argument("--allow-pending-traffic", action="store_true")
     parser.add_argument("--route-traffic", action="store_true")
     parser.add_argument("--other-bucket", action="append", default=[])
     parser.add_argument("--manifest-object")
     parser.add_argument("--referenced-object", action="append", default=[])
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.route_traffic and not args.candidate_revision:
+        parser.error("--route-traffic requires --candidate-revision")
+    return args
 
 
 class Evidence:
@@ -475,44 +479,51 @@ def main() -> int:
             raise VerificationError(
                 f"Cloud Run service uses {actual_identity!r}, expected {identity!r}"
             )
-        ready = service.get("status", {}).get("latestReadyRevisionName")
+        # A zero-traffic candidate can be retired while latestReadyRevisionName
+        # still names the previous serving revision. Pin verification to the
+        # revision captured after apply, and use that same name for cutover.
+        candidate = args.candidate_revision or service.get("status", {}).get("latestReadyRevisionName")
         traffic = service.get("status", {}).get("traffic", [])
         serving = sum(
             int(entry.get("percent", 0))
             for entry in traffic
-            if entry.get("revisionName") == ready or entry.get("latestRevision") is True
+            if entry.get("revisionName") == candidate
         )
-        if not ready or (serving != 100 and not args.allow_pending_traffic):
-            raise VerificationError(f"latest ready revision {ready!r} has {serving}% traffic")
+        if not candidate or (serving != 100 and not args.allow_pending_traffic):
+            raise VerificationError(f"candidate revision {candidate!r} has {serving}% traffic")
+        if args.candidate_revision and service.get("status", {}).get("latestCreatedRevisionName") != candidate:
+            raise VerificationError("service changed since candidate revision was captured")
         (args.evidence_dir / "revision-traffic.json").write_text(
             json.dumps(
                 {
-                    "latest_ready_revision": ready,
+                    "candidate_revision": candidate,
                     "runtime_service_account": actual_identity,
                     "traffic": traffic,
                 },
                 indent=2,
-            )
-            + "\n"
+            ) + "\n"
         )
-        latest_json = evidence.command(
-            "latest-ready-revision",
+        candidate_json = evidence.command(
+            "candidate-revision",
             gcloud(
-                "run",
-                "revisions",
-                "describe",
-                ready,
-                f"--region={args.region}",
-                f"--project={args.project}",
-                "--format=json",
+                "run", "revisions", "describe", candidate,
+                f"--region={args.region}", f"--project={args.project}", "--format=json",
             ),
         )
-        latest = json.loads(latest_json)
-        latest_identity = runtime_identity(latest)
-        if latest_identity != identity:
-            raise VerificationError(
-                f"latest ready revision uses {latest_identity!r}, expected {identity!r}"
-            )
+        candidate_revision = json.loads(candidate_json)
+        metadata = candidate_revision.get("metadata", {})
+        if (
+            metadata.get("name") != candidate
+            or metadata.get("labels", {}).get("serving.knative.dev/service") != args.service
+        ):
+            raise VerificationError("candidate revision does not belong to the requested service")
+        if runtime_identity(candidate_revision) != identity:
+            raise VerificationError("candidate revision does not use the expected runtime identity")
+        if not any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in candidate_revision.get("status", {}).get("conditions", [])
+        ):
+            raise VerificationError("candidate revision is not ready")
         previous_identity = None
         if args.previous_revision:
             previous_json = evidence.command(
@@ -806,7 +817,7 @@ def main() -> int:
 
         required_checks = [
             "service",
-            "latest-ready-revision",
+            "candidate-revision",
             "own-template-list",
             "manifest-read",
             "sandbox-list-denied",
@@ -838,14 +849,28 @@ def main() -> int:
         evidence.require_passes(required_checks)
 
         if args.route_traffic:
+            before_route = json.loads(
+                evidence.command(
+                    "service-before-route",
+                    gcloud(
+                        "run", "services", "describe", args.service,
+                        f"--region={args.region}", f"--project={args.project}", "--format=json",
+                    ),
+                )
+            )
+            if (
+                before_route.get("status", {}).get("latestCreatedRevisionName") != candidate
+                or runtime_identity(before_route) != identity
+            ):
+                raise VerificationError("service changed during candidate verification")
             evidence.command(
-                "route-latest",
+                "route-candidate",
                 gcloud(
                     "run",
                     "services",
                     "update-traffic",
                     args.service,
-                    "--to-latest",
+                    f"--to-revisions={candidate}=100",
                     f"--region={args.region}",
                     f"--project={args.project}",
                 ),
@@ -869,9 +894,9 @@ def main() -> int:
             final_serving = sum(
                 int(entry.get("percent", 0))
                 for entry in final_traffic
-                if entry.get("revisionName") == final_ready or entry.get("latestRevision") is True
+                if entry.get("revisionName") == candidate
             )
-            if not final_ready or final_serving != 100:
+            if final_ready != candidate or final_serving != 100:
                 raise VerificationError(
                     f"latest revision {final_ready!r} has {final_serving}% traffic after routing"
                 )
@@ -904,7 +929,7 @@ def main() -> int:
                 )
                 + "\n"
             )
-            evidence.require_passes(["route-latest", "traffic-after-route", "latest-revision"])
+            evidence.require_passes(["service-before-route", "route-candidate", "traffic-after-route", "latest-revision"])
 
         (args.evidence_dir / "legacy-grant-audit.txt").write_text(
             "Legacy identity is retained only until the old revision and shared-host dependencies are drained.\n"

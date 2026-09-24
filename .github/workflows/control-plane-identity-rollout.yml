@@ -34,6 +34,12 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v2
+      - name: Bootstrap and check private evidence storage
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          DEPLOYMENT_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          STATE_BUCKET: superserve-terraform-state
+        run: scripts/bootstrap-control-plane-evidence.sh
       - name: Apply and verify staging identity
         env:
           PROJECT: ${{ vars.GCP_PROJECT }}
@@ -72,6 +78,8 @@ jobs:
           identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/staging-contract.json"
+          candidate=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format='value(status.latestCreatedRevisionName)')
+          test -n "$candidate" || { echo "No candidate revision after apply." >&2; exit 1; }
           # Terraform must not leave the new identity serving while the
           # deployed permission probes are still pending.
           gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
@@ -87,6 +95,7 @@ jobs:
             --region "$REGION" \
             --service "$SERVICE" \
             --previous-revision "$previous" \
+            --candidate-revision "$candidate" \
             --allow-pending-traffic \
             --route-traffic \
             --contract-file "$GITHUB_WORKSPACE/staging-contract.json" \
@@ -104,13 +113,13 @@ jobs:
       - name: Persist private staging evidence
         if: always()
         env:
-          EVIDENCE_BUCKET: ${{ vars.CONTROL_PLANE_EVIDENCE_BUCKET }}
+          EVIDENCE_BUCKET: ${{ env.CONTROL_PLANE_EVIDENCE_BUCKET }}
         run: |
           set -euo pipefail
-          test -n "$EVIDENCE_BUCKET" || { echo "CONTROL_PLANE_EVIDENCE_BUCKET is required to retain private rollout evidence." >&2; exit 1; }
-          gcloud storage cp --recursive \
+          test -n "$EVIDENCE_BUCKET" || { echo "Evidence storage bootstrap did not complete." >&2; exit 1; }
+          gcloud storage cp --recursive --if-generation-match=0 \
             "$RUNNER_TEMP/control-plane-identity/staging" \
-            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/staging"
+            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/staging/"
       - name: Prepare sanitized staging evidence
         if: always()
         run: |
@@ -146,6 +155,12 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v2
+      - name: Bootstrap and check private evidence storage
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          DEPLOYMENT_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          STATE_BUCKET: superserve-terraform-state-prod
+        run: scripts/bootstrap-control-plane-evidence.sh
       - name: Apply and verify production use4 identity
         env:
           PROJECT: ${{ vars.GCP_PROJECT }}
@@ -184,6 +199,8 @@ jobs:
           identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/use4-contract.json"
+          candidate=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format='value(status.latestCreatedRevisionName)')
+          test -n "$candidate" || { echo "No candidate revision after apply." >&2; exit 1; }
           gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
             > "$RUNNER_TEMP/control-plane-identity/use4/pre-kms-route.stdout" \
             2> "$RUNNER_TEMP/control-plane-identity/use4/pre-kms-route.stderr"
@@ -204,6 +221,7 @@ jobs:
             --region "$REGION" \
             --service "$SERVICE" \
             --previous-revision "$previous" \
+            --candidate-revision "$candidate" \
             --allow-pending-traffic \
             --route-traffic \
             --contract-file "$GITHUB_WORKSPACE/use4-contract.json" \
@@ -221,13 +239,13 @@ jobs:
       - name: Persist private production use4 evidence
         if: always()
         env:
-          EVIDENCE_BUCKET: ${{ vars.CONTROL_PLANE_EVIDENCE_BUCKET }}
+          EVIDENCE_BUCKET: ${{ env.CONTROL_PLANE_EVIDENCE_BUCKET }}
         run: |
           set -euo pipefail
-          test -n "$EVIDENCE_BUCKET" || { echo "CONTROL_PLANE_EVIDENCE_BUCKET is required to retain private rollout evidence." >&2; exit 1; }
-          gcloud storage cp --recursive \
+          test -n "$EVIDENCE_BUCKET" || { echo "Evidence storage bootstrap did not complete." >&2; exit 1; }
+          gcloud storage cp --recursive --if-generation-match=0 \
             "$RUNNER_TEMP/control-plane-identity/use4" \
-            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/production-use4"
+            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/production-use4/"
       - name: Prepare sanitized production use4 evidence
         if: always()
         run: |
@@ -263,6 +281,12 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v2
+      - name: Bootstrap and check private evidence storage
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          DEPLOYMENT_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          STATE_BUCKET: superserve-terraform-state-prod
+        run: scripts/bootstrap-control-plane-evidence.sh
       - name: Apply and verify production usw2 identity
         env:
           PROJECT: ${{ vars.GCP_PROJECT }}
@@ -301,6 +325,8 @@ jobs:
           identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/usw2-contract.json"
+          candidate=$(gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" --format='value(status.latestCreatedRevisionName)')
+          test -n "$candidate" || { echo "No candidate revision after apply." >&2; exit 1; }
           gcloud run services update-traffic "$SERVICE" --to-revisions "$previous=100" --region "$REGION" --project "$PROJECT" \
             > "$RUNNER_TEMP/control-plane-identity/usw2/pre-kms-route.stdout" \
             2> "$RUNNER_TEMP/control-plane-identity/usw2/pre-kms-route.stderr"
@@ -321,6 +347,7 @@ jobs:
             --region "$REGION" \
             --service "$SERVICE" \
             --previous-revision "$previous" \
+            --candidate-revision "$candidate" \
             --allow-pending-traffic \
             --route-traffic \
             --contract-file "$GITHUB_WORKSPACE/usw2-contract.json" \
@@ -338,13 +365,13 @@ jobs:
       - name: Persist private production usw2 evidence
         if: always()
         env:
-          EVIDENCE_BUCKET: ${{ vars.CONTROL_PLANE_EVIDENCE_BUCKET }}
+          EVIDENCE_BUCKET: ${{ env.CONTROL_PLANE_EVIDENCE_BUCKET }}
         run: |
           set -euo pipefail
-          test -n "$EVIDENCE_BUCKET" || { echo "CONTROL_PLANE_EVIDENCE_BUCKET is required to retain private rollout evidence." >&2; exit 1; }
-          gcloud storage cp --recursive \
+          test -n "$EVIDENCE_BUCKET" || { echo "Evidence storage bootstrap did not complete." >&2; exit 1; }
+          gcloud storage cp --recursive --if-generation-match=0 \
             "$RUNNER_TEMP/control-plane-identity/usw2" \
-            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/production-usw2"
+            "gs://${EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/production-usw2/"
       - name: Prepare sanitized production usw2 evidence
         if: always()
         run: |
