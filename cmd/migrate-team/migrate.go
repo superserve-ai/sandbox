@@ -209,6 +209,13 @@ func runPlan(ctx context.Context, src *pgxpool.Pool, cfg config) error {
 	for _, k := range liveKeys {
 		log.Warn().Str("api_key", k).Msg("plan: BLOCKER — key not revoked; copy will refuse (freeze rotates keys)")
 	}
+	snapshots, err := teamSnapshots(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	for _, s := range snapshots {
+		log.Warn().Str("snapshot", s).Msg("plan: BLOCKER — sandbox snapshot exists; snapshots do not move between cells yet, copy will refuse")
+	}
 
 	return reportArtifactDirs(ctx, src, cfg)
 }
@@ -278,6 +285,32 @@ func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string,
 // paused sandbox mid-move between hosts; its artifacts are in flight too.
 // A pending sandbox_teardown blocks too: purge would cascade it away with
 // the row and strand the reclaim on the source host.
+// teamSnapshots returns "<id> kind=<kind> status=<status>" for every saved
+// snapshot row of the team, deleted ones included: their artifacts live on
+// the source host and do not move, and a sandbox created from one refers to
+// its row, so a team with any is not copied.
+func teamSnapshots(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
+	rows, err := src.Query(ctx, `
+		SELECT id, kind, status FROM sandbox_snapshot
+		WHERE team_id = $1
+		ORDER BY created_at`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id uuid.UUID
+		var kind, status string
+		if err := rows.Scan(&id, &kind, &status); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s kind=%s status=%s", id, kind, status))
+	}
+	return out, rows.Err()
+}
+
 func activeSandboxes(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
 		SELECT s.id, s.name, s.status, t.sandbox_id IS NOT NULL
@@ -407,6 +440,14 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	if len(liveKeys) > 0 {
 		return fmt.Errorf("refusing to copy: %d API key(s) not revoked (freeze step — the region prefix in the key string cannot follow the team):\n  %s",
 			len(liveKeys), strings.Join(liveKeys, "\n  "))
+	}
+	snapshots, err := teamSnapshots(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(snapshots) > 0 {
+		return fmt.Errorf("refusing to copy: %d sandbox snapshot(s) exist and snapshots do not move between cells yet:\n  %s",
+			len(snapshots), strings.Join(snapshots, "\n  "))
 	}
 
 	// The dest host must exist and live in the dest region before any
