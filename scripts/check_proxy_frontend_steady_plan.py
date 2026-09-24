@@ -11,6 +11,7 @@ FRONTENDS = {
     'google_compute_url_map.proxy_dataplane',
     'google_compute_target_ssl_proxy.proxy',
     'google_compute_target_tcp_proxy.redirect',
+    'google_compute_ssl_policy.https',
     *(f'google_compute_global_forwarding_rule.proxy_frontends["{name}"]'
       for name in ('dataplane', 'ssl', 'redirect', 'east_https', 'west_https')),
     *(f'google_compute_target_https_proxy.adopted["{name}"]'
@@ -41,6 +42,20 @@ def validate(plan, cell='production'):
     frontends = [item for item in plan.get('resource_changes', []) if item['address'] in expected]
     if {item['address'] for item in frontends} != expected or len(frontends) != len(expected):
         raise ValueError('Full plan must include every proxy frontend exactly once')
+    def resource_id(value):
+        return value[value.index('projects/'):] if isinstance(value, str) and 'projects/' in value else value
+
+    protected_targets = {resource_id(item['change'].get('before', {}).get(field))
+                         for item in frontends for field in ('id', 'self_link')
+                         if isinstance(item['change'].get('before'), dict)
+                         and item['change']['before'].get(field)}
+    for item in plan.get('resource_changes', []):
+        if item['address'] in expected or item.get('type') != 'google_compute_global_forwarding_rule':
+            continue
+        change = item['change']
+        if any(resource_id((change.get(side) or {}).get('target')) in protected_targets
+               for side in ('before', 'after')):
+            frontends.append(item)
     for item in frontends:
         change = item['change']
         # A no-op import adopts ownership without changing live traffic.
