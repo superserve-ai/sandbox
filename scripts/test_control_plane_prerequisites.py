@@ -88,7 +88,7 @@ class ProbeTests(unittest.TestCase):
             contract["kms_key_resource"] = "projects/example-project/locations/example-region/keyRings/example/cryptoKeys/example"
         args = argparse.Namespace(
             project="example-project", region="example-region", service="example-api",
-            deployment_identity=CONTRACT["deployment_identity"], other_bucket=["example-east", "example-west"],
+            deployment_identity=CONTRACT["deployment_identity"],
         )
         with tempfile.TemporaryDirectory() as root:
             evidence = CHECK.VERIFY.Evidence(Path(root))
@@ -98,15 +98,7 @@ class ProbeTests(unittest.TestCase):
                 if name in failures:
                     return failures[name]
                 if name == "deployment-identity": return CONTRACT["deployment_identity"]
-                if name == "verification-apis": return "cloudasset.googleapis.com\npolicytroubleshooter.googleapis.com\n"
                 if name == "service-readiness": return '{"status":{"traffic":[{"percent":100,"revisionName":"old-revision"}]}}'
-                if name.startswith("managed-folders-"):
-                    bucket = argv[4].removeprefix("gs://").removesuffix("/")
-                    return json.dumps([{"bucket": bucket, "name": prefix} for prefix in ("templates/", "bases/")])
-                if argv[1:3] == ["policy-troubleshoot", "iam"]: return '{"access":"NOT_GRANTED"}'
-                if argv[1:3] == ["asset", "analyze-iam-policy"]:
-                    self.assertIn("--show-response", argv)
-                    return '{"fullyExplored":true,"mainAnalysis":{"fullyExplored":true}}'
                 if name.startswith("secret-version-"): return '{"state":"ENABLED"}'
                 if name == "kms-primary": return '{"primary":{"state":"ENABLED"}}'
                 return '{}'
@@ -116,72 +108,40 @@ class ProbeTests(unittest.TestCase):
             preflight.run()
             return calls, evidence.index
 
-    def test_first_migration_probes_tooling_without_computed_runtime_or_host_emails(self):
+    def test_first_migration_checks_readiness_without_computed_runtime_or_host_emails(self):
         planned = copy.deepcopy(CONTRACT)
         del planned["runtime_service_account"]
         del planned["host_identities_unchanged"]
         contract = CHECK.contract_from_plan({"output_changes": {"controlplane_identity_contract": {
             "after": planned, "after_unknown": {"runtime_service_account": True, "host_identities_unchanged": [True]},
         }}})
-        calls, checks = self.run_cell(contract_override=contract)
+        _, checks = self.run_cell(contract_override=contract)
         self.assertTrue(all(row["status"] == "PASS" for row in checks))
-        for _, argv in calls:
-            if argv[1:3] == ["policy-troubleshoot", "iam"]:
-                self.assertIn(f"--principal-email={CONTRACT['deployment_identity']}", argv)
-            if "--analyze-service-account-impersonation" in argv:
-                self.assertIn(f"--identity=serviceAccount:{CONTRACT['deployment_identity']}", argv)
-                self.assertIn(f"--full-resource-name=//iam.googleapis.com/projects/example-project/serviceAccounts/{CONTRACT['deployment_identity']}", argv)
 
-    def test_all_cells_probe_cross_project_policies_and_pending_runtime_grants_are_not_required(self):
+    def test_preflight_only_checks_operational_readiness(self):
         for kms in (False, True):
             with self.subTest(kms=kms):
                 calls, checks = self.run_cell(kms=kms)
                 self.assertTrue(all(row["status"] == "PASS" for row in checks))
-                argv = [cmd for _, cmd in calls]
-                self.assertTrue(any("--expand-groups" in cmd and "--analyze-service-account-impersonation" in cmd for cmd in argv))
-                self.assertEqual(sum(cmd[1:4] == ["storage", "buckets", "get-iam-policy"] for cmd in argv), 3)
-                self.assertEqual(sum(cmd[1:3] == ["policy-troubleshoot", "iam"] for cmd in argv), 26)
-                self.assertFalse(any("--impersonate-service-account" in word for cmd in argv for word in cmd))
-                self.assertFalse(any(word in {"apply", "update-traffic", "update", "delete", "create", "access"} for cmd in argv for word in cmd))
-                self.assertFalse(any(cmd[1:3] in (["storage", "cat"], ["storage", "objects"]) for cmd in argv))
-                self.assertEqual(any(name == "kms-primary" for name, _ in calls), kms)
+                expected = {"deployment-identity", "service-readiness", "secret-version-1"}
+                if kms:
+                    expected |= {"kms-policy", "kms-primary"}
+                self.assertEqual({name for name, _ in calls}, expected)
+                self.assertFalse(any("--impersonate-service-account" in word for _, cmd in calls for word in cmd))
+                self.assertFalse(any(word in {"apply", "update-traffic", "update", "delete", "create", "access"} for _, cmd in calls for word in cmd))
 
-    def test_unknown_policies_incomplete_analysis_and_disabled_secrets_all_fail(self):
-        calls, checks = self.run_cell(failures={
-            "policy-visibility-sandbox-get-permission-check": '{"access":"UNKNOWN_INFO"}',
-            "effective-iam": '{"fullyExplored":false}',
+    def test_wrong_caller_missing_rollback_and_disabled_secret_all_fail(self):
+        _, checks = self.run_cell(failures={
+            "deployment-identity": "wrong@example.com",
+            "service-readiness": '{"status":{"traffic":[]}}',
             "secret-version-1": '{"state":"DISABLED"}',
         })
-        failures = {row["name"] for row in checks if row["status"] == "FAIL"}
-        self.assertEqual(failures, {"policy-visibility-sandbox-get-permission-check", "effective-iam", "secret-version-1"})
-        self.assertTrue(any(name == "secret-version-1" for name, _ in calls))
-
-    def test_current_grants_are_allowed_only_by_preflight_not_cutover_verifier(self):
-        _, checks = self.run_cell(failures={"policy-visibility-sandbox-get-permission-check": '{"access":"GRANTED"}'})
-        self.assertTrue(all(row["status"] == "PASS" for row in checks))
-        # The existing cutover suite separately rejects GRANTED for this probe.
+        self.assertEqual({row["name"] for row in checks if row["status"] == "FAIL"},
+                         {"deployment-identity", "service-readiness", "secret-version-1"})
 
     def test_disabled_kms_primary_is_rejected(self):
         _, checks = self.run_cell(kms=True, failures={"kms-primary": '{"primary":{"state":"DISABLED"}}'})
         self.assertEqual({row["name"] for row in checks if row["status"] == "FAIL"}, {"kms-primary"})
-
-    def test_unknown_inventory_blocks_probes_instead_of_assuming_no_folder_grants(self):
-        calls, checks = self.run_cell(failures={"managed-folders-2": '{}'})
-        rows = {row["name"]: row for row in checks}
-        self.assertEqual(rows["managed-folders-2"]["status"], "FAIL")
-        self.assertEqual(rows["policy-visibility-cross-cell-1-templates-get"]["status"], "FAIL")
-        self.assertEqual(rows["nested-managed-folder-policy-visibility"]["status"], "FAIL")
-        self.assertFalse(any(name == "policy-visibility-cross-cell-1-templates-get" for name, _ in calls))
-
-    def test_nested_policy_visibility_is_checked_before_apply(self):
-        calls, checks = self.run_cell(failures={"managed-folders-2": json.dumps([
-            {"bucket": "example-east", "name": "templates/"},
-            {"bucket": "example-east", "name": "templates/team/"},
-        ]), "policy-visibility-managed-folder-2-2-get-denied": '{"access":"UNKNOWN_INFO"}'})
-        rows = {row["name"]: row for row in checks}
-        self.assertEqual(rows["nested-managed-folder-policy-visibility"]["status"], "FAIL")
-        argv = dict(calls)["policy-visibility-managed-folder-2-2-get-denied"]
-        self.assertEqual(argv[3], "//storage.googleapis.com/projects/_/buckets/example-east/managedFolders/templates/team/")
 
 
 class WorkflowTests(unittest.TestCase):

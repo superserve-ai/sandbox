@@ -62,8 +62,8 @@ API and Terraform workflows waiting behind it to replace each other.
    Terraform grants the deployment principal scoped token creation on each
    dedicated runtime identity so the verifier can run its GCS, Secret Manager,
    and runtime KMS probes. No separate KMS-owner secret is required.
-   Before touching Cloud Run, the workflow bootstraps both projects' verification
-   APIs, deployment-account policy inspection, and private evidence storage.
+   Before touching Cloud Run, the workflow prepares private evidence storage in
+   both projects and production's key-scoped KMS metadata access.
    It then plans and checks prerequisites for all three cells as their actual
    GitHub deployment accounts. No manual bucket creation or new GitHub variable
    is needed. All prerequisite jobs must pass before the serial identity rollout:
@@ -78,11 +78,10 @@ API and Terraform workflows waiting behind it to replace each other.
    revision without routing traffic to it and manages its existing KMS grant.
    The verifier gates the stage on a runtime-identity
    KMS encrypt/decrypt round trip as well as same-cell manifest/reference
-   reads, cross-cell root and prefix list denial, non-mutating IAM Policy
-   Troubleshooter checks for own-cell sandbox reads, own-cell mutations, and
-   cross-cell reads and mutations across all three prefixes, Secret Manager
-   access, fully explored effective IAM analysis, deployment act-as, and the
-   Terraform-managed KMS binding. The workflow captures the latest created
+   reads, cross-cell root and prefix list denial, own-cell sandbox list denial,
+   Secret Manager access, and the Terraform-managed KMS binding. The artifact,
+   secret, and encryption probes use credentials minted for the runtime identity.
+   The workflow captures the latest created
    revision after apply, verifies that exact candidate's identity and Ready
    condition, then routes traffic to it by name. A retired zero-traffic candidate
    can be Ready while `latestReadyRevisionName` still names the old revision.
@@ -106,100 +105,57 @@ repeat the checks before retrying the cutover.
 
 ## Verification prerequisites
 
-`infra/bootstrap/control-plane-evidence` enables the Cloud Asset and Policy
-Troubleshooter APIs with `disable_on_destroy = false`. It grants each project's
-own deployment account Cloud Asset Viewer, Role Viewer, and Service Usage
-Consumer. API activation depends on the Consumer grant, which permits the
-provider to poll activation operations. Partial bootstrap failures retry with a
-fresh plan against saved state. Both deployment accounts receive Security Reviewer
-in each project so they can inspect cross-project policies. These grants do not
-include object payload reads, secret values, runtime impersonation, or policy
-modification. Production also grants its deployment account KMS Viewer on the
-single credentials key so preflight can read the primary version's state. The
-bootstrap relies on the existing key-scoped IAM administration for that grant.
-Runtime grants remain owned by the regional roots.
+`infra/bootstrap/control-plane-evidence` manages the private evidence bucket and
+its deployment-account upload grants. Production also grants its deployment
+account KMS Viewer on the single credentials key so preflight can read the
+primary version's state. That grant uses the existing key-scoped IAM
+administration. Runtime grants remain owned by the regional roots.
 
-The bootstrap caller must already be able to enable project services, manage
-project IAM, and manage the evidence bucket and Terraform state. The workflow
-provides `TF_VAR_policy_reader_service_accounts` for both existing deployment
-accounts, plus `TF_VAR_verification_kms_key` in production; preserve those inputs
-if running the bootstrap outside GitHub Actions.
-Each project applies only its own grants. Both bootstraps finish before the
-three prerequisite jobs run, with matrix fail-fast disabled to report all cells.
+The bootstrap caller must be able to manage the evidence bucket and Terraform
+state. When upgrading from an audit-enabled bootstrap, it also needs project IAM
+administration to remove the audit grants previously tracked in that state.
+Both project bootstraps finish before the three prerequisite jobs run. Production
+provides `TF_VAR_verification_kms_key`; preserve that input when running the
+bootstrap outside GitHub Actions.
 
-The prerequisite jobs read the desired contract from a fresh Terraform plan;
-production does not need a previously applied contract output. They check API
-availability, the actual caller, rollback revision, own/cross-project policy
-visibility and complete IAM tooling analysis (including group/impersonation expansion),
-enabled latest secret versions, and
-production KMS policy/primary-version readiness. Failed probes retry together
-six times with ten seconds between rounds, preserving private attempt evidence.
-Unknown policies and incomplete analyses block migration. Public artifacts contain
-only sanitized check names and verdicts. A plan failure is reported as incomplete.
+The prerequisite jobs read the desired contract from a fresh Terraform plan and
+check the actual deployment caller, a 100% rollback revision, enabled latest
+secret versions, and production KMS policy/primary-version readiness. Failed
+checks retry together six times with ten seconds between rounds. Public artifacts
+contain only sanitized check names and verdicts. A plan failure is incomplete.
 
-Prerequisite policy probes use the existing deployment identity and accept any
-definite access decision. Runtime and host account emails can still be computed
-in an initial plan; preflight does not depend on identities the regional apply
-has yet to create. The post-apply verifier still requires
-explicit isolation denials, runtime secret/artifact reads and KMS round trips,
-and scoped deployment impersonation before routing the candidate. In particular,
-production's pending managed folders and token-creator grants are created by the
-existing regional Terraform; the prerequisite job does not demand them early.
-Template manifests and referenced artifacts are read only by the post-apply
-runtime verifier, so preflight does not require deployment-account payload access.
+Runtime and host account emails can still be computed in an initial plan.
+Preflight does not depend on identities or managed folders the regional apply
+has yet to create. The post-apply verifier uses runtime credentials for actual
+artifact and secret reads, negative storage listings, and production KMS round
+trips before routing the candidate. No organization policy, custom-role,
+Policy Troubleshooter, or Cloud Asset inspection is required by the rollout.
 
-Storage policy probes inventory managed folders and select the nearest folder
-or bucket policy, with object attributes supplied separately for IAM Conditions.
-They also check each nested managed folder under the three storage prefixes.
-Missing folder inventory blocks verification. IAM analysis requests the full
-API response so completeness and impersonation results remain available.
-Policy Troubleshooter requests start at least nine seconds apart in each job,
-keeping the two concurrent production preflights below their shared default
-15-request-per-minute quota. Other quota consumers can still cause failures.
+### Retiring former audit setup
 
-### Inherited policy visibility
+The next evidence bootstrap removes its tracked Cloud Asset Viewer, Role Viewer,
+Service Usage Consumer, and Security Reviewer bindings. It preserves the evidence
+bucket, upload grants, and KMS metadata grant at their existing state addresses.
+The audit APIs are removed from Terraform management without disabling them,
+since other callers may still use them.
 
-Project grants cannot provide access to ancestor policies. If private preflight
-evidence reports an unreadable organization policy or custom roles, an
-organization IAM administrator can apply
-`infra/bootstrap/control-plane-policy-visibility` once. This separate root grants
-only `resourcemanager.organizations.getIamPolicy` and `iam.roles.get` to the
-deployment accounts. The role-definition read also covers known custom roles in
-descendant projects; there is no role listing, descendant policy read, payload
-access, or mutation. Role definitions must be readable to evaluate organization
-bindings, including this reader role itself. It is never applied by the rollout, and does not give deployment
-accounts organization IAM administration.
-
-Use an existing private Terraform state bucket accessible to that administrator:
+If an administrator previously applied `infra/bootstrap/control-plane-policy-visibility`,
+that root is now cleanup-only. Using its **original state bucket and prefix**, the
+administrator can review and apply its plan to remove the old organization reader
+bindings and custom role. It creates no permissions and is never run by the rollout.
+If it was never applied, there is no organization cleanup to perform. Do not
+initialize a new state location as a substitute for locating the original state.
 
 ```sh
 terraform -chdir=infra/bootstrap/control-plane-policy-visibility init \
-  -backend-config="bucket=ADMIN_STATE_BUCKET" \
+  -backend-config="bucket=ORIGINAL_ADMIN_STATE_BUCKET" \
   -backend-config="prefix=bootstrap/control-plane-policy-visibility"
 terraform -chdir=infra/bootstrap/control-plane-policy-visibility plan \
   -var='organization_id=ORGANIZATION_ID' \
   -var='deployment_service_accounts=["STAGING_DEPLOYMENT_EMAIL","PRODUCTION_DEPLOYMENT_EMAIL"]' \
-  -out=visibility.tfplan
-terraform -chdir=infra/bootstrap/control-plane-policy-visibility apply visibility.tfplan
+  -out=cleanup.tfplan
+terraform -chdir=infra/bootstrap/control-plane-policy-visibility apply cleanup.tfplan
 ```
-
-This root supports projects attached directly to the organization. Any folder or
-organization deny-policy visibility gap requires separately reviewed administrator
-access; the root does not grant those permissions across unrelated descendants.
-[Deny Reviewer](https://docs.cloud.google.com/iam/docs/roles-permissions/iam#iam.denyReviewer)
-can only be granted at organization scope, never in the project bootstrap.
-Security Reviewer includes deny-policy listing but not deny-policy reads; if
-those reads are required, an organization administrator must arrange that access.
-Unknown results remain blocking. If policies include Google Workspace groups or
-domains, the corresponding
-Workspace visibility is also required; the Google Cloud IAM bootstrap cannot
-supply Workspace `groups.read` or domain-administrator privileges. Resolve any
-such unknown result with the Workspace administrator; do not treat it as denial
-or disable group expansion. Policy Analyzer also has an organization-wide daily
-query allowance unless Security Command Center Premium/Enterprise is activated;
-repeated preflights consume that allowance. Quota failures block the rollout.
-See Google's [Policy Analyzer prerequisites](https://cloud.google.com/policy-intelligence/docs/analyze-iam-policies)
-and [Policy Troubleshooter prerequisites](https://cloud.google.com/policy-intelligence/docs/troubleshoot-access).
 
 ## Durable evidence gate
 
@@ -234,8 +190,7 @@ The release owner links the private evidence with the Terraform plan/apply and
 UTC observation time before declaring a cell complete. A missing summary
 or any FAIL row is an incomplete migration, even if the service health endpoint
 responds. The workflow also fails closed when the private `evidence.json` is
-missing any required PASS row, including one for every unchanged host
-principal's inability to impersonate the serving identity; an uploaded
+missing any required runtime-access or readiness PASS row; an uploaded
 summary alone is not approval.
 
 The verifier discovers a real generation manifest at
@@ -256,29 +211,24 @@ python3 scripts/verify-control-plane-identity.py \
   --other-bucket OTHER_CELL_BUCKET
 ```
 
-The verifier discovers the actual generation `manifest.json` object, reads
-each referenced artifact, and uses IAM Policy Troubleshooter to confirm that
-the runtime identity is denied `storage.objects.get` under `sandboxes/` in
-its own bucket and under `templates/`, `bases/`, and `sandboxes/` in every
-other cell's bucket. It confirms denial of `storage.objects.create` and
-`storage.objects.delete` for synthetic objects under all three prefixes in
-its own and every other cell's bucket, plus deletion of the live manifest.
-It also requires list denial at each cross-cell prefix, not just the bucket
-root. These object-permission checks are non-mutating,
-so retries cannot turn a create check into an overwrite check or alter a
-customer artifact. A missing object is not a negative IAM result.
+The verifier discovers the actual generation `manifest.json` object and reads
+every referenced artifact. It requires actual list denial at each cross-cell
+bucket root and `templates/`, `bases/`, and `sandboxes/` prefix, plus the own-cell
+`sandboxes/` prefix. These probes run as the runtime identity and do not create,
+delete, or overwrite objects.
 
-Also verify that the deployment principal can update the Cloud Run service with
-the new identity and mint credentials as that identity for the probes, that the
-runtime can access every rendered Secret Manager secret, and that the control
-plane's existing KMS-dependent operation still succeeds. Inspect effective IAM
-(including inherited project/folder grants and service-account impersonation)
-before declaring the negative checks complete.
+The deployment principal must be able to update Cloud Run and mint credentials
+for the runtime probes. The runtime must read every rendered Secret Manager
+secret and, in production, complete the existing KMS encrypt/decrypt probe.
+Candidate identity, readiness, and traffic checks gate cutover; rollback remains
+available for a failed stage.
 
-For the effective audit, retain the verifier's
-`gcloud asset analyze-iam-policy --project=PROJECT ...` output together
-with the direct project, bucket, managed-folder, and service-account policies. In the cleanup
-row, record `removed` or `retained-with-dependency`, the exact principal and
-role, the dependency owner, and the observation time. Only rows marked
-`removed` after the old revision is drained may be revoked; rows needed by the
-staging host, restore/GC tooling, or rollback remain explicitly retained.
+The rollout does not perform a comprehensive least-privilege audit. It does not
+prove the absence of object get/create/delete grants or host impersonation paths
+across inherited policies. Terraform still declares the intended runtime grants,
+and the plan guard still rejects changes to hosts and their identities.
+
+For cleanup of obsolete shared runtime grants after the old revision drains,
+record `removed` or `retained-with-dependency`, the exact principal and role, the
+dependency owner, and observation time. Retain grants needed by the staging host,
+restore/GC tooling, or rollback.

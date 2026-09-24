@@ -17,24 +17,18 @@ variable "deployment_service_accounts" {
   type = set(string)
 }
 
-# Applied by an organization IAM administrator, never by the rollout itself.
-# Project-level readers cannot inspect their organization policy or custom roles.
-resource "google_organization_iam_custom_role" "ancestor_policy_reader" {
-  org_id      = var.organization_id
-  role_id     = "controlPlaneAncestorPolicyReader"
-  title       = "Control plane organization policy reader"
-  description = "Read the organization policy and custom-role definitions for rollout verification."
-  # Role definitions must be readable, including this custom role itself.
-  permissions = [
-    "resourcemanager.organizations.getIamPolicy",
-    "iam.roles.get",
-  ]
+# Cleanup-only root: an administrator uses the original backend to revoke any
+# grants created by an earlier rollout version. It creates no new permissions.
+removed {
+  from = google_organization_iam_member.ancestor_policy_reader
+  lifecycle {
+    destroy = true
+  }
 }
 
-resource "google_organization_iam_member" "ancestor_policy_reader" {
-  for_each = var.deployment_service_accounts
-
-  org_id = var.organization_id
-  role   = google_organization_iam_custom_role.ancestor_policy_reader.name
-  member = "serviceAccount:${each.value}"
+removed {
+  from = google_organization_iam_custom_role.ancestor_policy_reader
+  lifecycle {
+    destroy = true
+  }
 }
