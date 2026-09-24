@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -79,8 +80,20 @@ class ProxyTargetTests(unittest.TestCase):
                 raise subprocess.CalledProcessError(1, args)
             return subprocess.CompletedProcess(args, 0, rows, "")
 
-        with patch.dict(os.environ, env, clear=True), patch.object(MODULE.subprocess, "run", side_effect=discover), \
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, env, clear=True), patch.object(MODULE.subprocess, "run", side_effect=discover), \
              patch.object(MODULE.os.path, "exists", return_value=True), patch.object(MODULE, "ThreadPoolExecutor", Executor):
+            manifests = {}
+            for index, row in enumerate((rows or "").splitlines()):
+                name, zone, *_ = row.split(",")
+                manifests[str(index)] = dict(project=env["GCP_PROJECT"], instance=name,
+                                             zone=zone.split("/")[-1], ip="192.0.2.10",
+                                             migration_complete=True,
+                                             routes=[dict(name="public-http", backend="public-backend")],
+                                             frontend_backend_references={"public-http": ["public-backend"]})
+            manifest_file = Path(directory) / "manifests.json"
+            manifest_file.write_text(json.dumps(manifests))
+            os.environ["PROXY_ROLLOUT_MANIFESTS"] = str(manifest_file)
             return MODULE.main(), selected
 
     def test_serving_and_push_keep_normal_fanout(self):
@@ -197,7 +210,8 @@ class ProxyTargetTests(unittest.TestCase):
 
     def test_workflow_guards_select_requested_manual_cell_and_preserve_push(self):
         self.assertIn("DEPLOY_TARGET: ${{ inputs.target || 'serving' }}", WORKFLOW)
-        self.assertIn("needs: [deploy-staging]", WORKFLOW)
+        self.assertIn("PROXY_TARGET: ${{ inputs.target || 'serving' }}", WORKFLOW)
+        self.assertIn("needs: [migration-gate, deploy-staging]", WORKFLOW)
         for event in ("push", "workflow_dispatch"):
             for target in ("", "serving", "standby"):
                 for cell in ("", "use4", "usw2"):

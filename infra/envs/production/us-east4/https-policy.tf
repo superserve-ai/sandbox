@@ -1,6 +1,6 @@
 # Global HTTPS proxies share the policy in this state, alongside the API LB.
-# Adopt only the proxies; existing URL maps, certificates, and forwarding rules
-# retain their current ownership and configuration.
+# The proxy URL maps and forwarding rules are adopted in proxy-frontends.tf so
+# this state can perform the reviewed backend cutover without changing TLS.
 resource "google_compute_ssl_policy" "https" {
   project         = local.project_id
   name            = "superserve-https-tls12"
@@ -39,9 +39,12 @@ locals {
 resource "google_compute_target_https_proxy" "adopted" {
   for_each = local.adopted_https_proxies
 
-  project         = local.project_id
-  name            = each.key
-  url_map         = "https://www.googleapis.com/compute/v1/projects/${local.project_id}/global/urlMaps/${each.value.url_map}"
+  project = local.project_id
+  name    = each.key
+  # The proxy frontends are adopted in proxy-frontends.tf. Keeping the URL-map
+  # reference in this owning state makes the backend cutover explicit while
+  # retaining the existing certificate map and TLS policy.
+  url_map         = each.value.url_map == "sandbox-dataplane" ? google_compute_url_map.proxy_dataplane.id : try(google_compute_url_map.proxy_frontends[each.value.url_map].id, "https://www.googleapis.com/compute/v1/projects/${local.project_id}/global/urlMaps/${each.value.url_map}")
   ssl_policy      = google_compute_ssl_policy.https.id
   certificate_map = each.value.certificate_map == null ? null : "https://certificatemanager.googleapis.com/v1/projects/${local.project_id}/locations/global/certificateMaps/${each.value.certificate_map}"
   ssl_certificates = [

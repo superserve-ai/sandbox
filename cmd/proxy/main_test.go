@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -214,6 +215,38 @@ func TestPeerTransportRequiredOnlyWhenParticipating(t *testing.T) {
 	}
 }
 
+func TestPropagateRedirectErrorCancelsLifecycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	report := make(chan error, 1)
+	want := errors.New("redirect bind failed")
+
+	propagateRedirectError(want, report, cancel)
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("redirect failure did not cancel the proxy lifecycle")
+	}
+	if got := <-report; !errors.Is(got, want) {
+		t.Fatalf("reported redirect error = %v, want %v", got, want)
+	}
+}
+
+func TestPropagateRedirectErrorIgnoresCleanShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	report := make(chan error, 1)
+
+	propagateRedirectError(http.ErrServerClosed, report, cancel)
+	select {
+	case <-ctx.Done():
+		t.Fatal("clean redirect shutdown canceled the proxy lifecycle")
+	case err := <-report:
+		t.Fatalf("clean redirect shutdown reported an error: %v", err)
+	default:
+	}
+}
+
 func TestLocalPeerTargetRejectsPublicAndRedirectListeners(t *testing.T) {
 	for _, target := range []string{"0.0.0.0:5010", "192.0.2.1:5010", "[::]:5010", "127.0.0.1:0", "127.0.0.1:5007", "127.0.0.1:5008"} {
 		t.Run(target, func(t *testing.T) {
@@ -271,5 +304,128 @@ func TestPeerListenerRejectsPublicAndRedirectPorts(t *testing.T) {
 		if err := validatePeerListener(tc.peer, tc.public, tc.redirect); (err != nil) != tc.wantError {
 			t.Errorf("validatePeerListener(%q, %q, %q) = %v", tc.peer, tc.public, tc.redirect, err)
 		}
+	}
+}
+
+func TestReadinessIncludesImmutableGenerationAndDependencyFailure(t *testing.T) {
+	t.Setenv("PROXY_GENERATION", "generation-one")
+	handler := proxy.NewHandler([]string{"sandbox.test"}, nil, zerolog.Nop())
+	mux := newProxyMuxWithReadiness(handler, handler, func(context.Context) bool { return false })
+	t.Setenv("PROXY_GENERATION", "generation-two")
+	request := httptest.NewRequest(http.MethodGet, "http://proxy-readiness.invalid/health", nil)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status %d", response.Code)
+	}
+	var body proxyHealthResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Generation != "generation-one" || body.ResolverReady {
+		t.Fatalf("unexpected readiness: %+v", body)
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatal("readiness must not be cached")
+	}
+}
+
+func TestBareDomainReadinessPreservesPreviewAndRedirectRouting(t *testing.T) {
+	t.Setenv("PROXY_GENERATION", "generation-one")
+	handler := proxy.NewHandler([]string{"east.example.test"}, nil, zerolog.Nop())
+	dataPlane := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	})
+	mux := newProxyMuxWithReadiness(handler, dataPlane, nil)
+	redirect := newRedirectMux(handler, mux)
+	request := httptest.NewRequest(http.MethodGet, "http://east.example.test/health", nil)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	var body proxyHealthResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("bare domain health did not reach readiness: %v", err)
+	}
+	if body.Generation != "generation-one" || response.Header().Get("Cache-Control") != "no-store" || response.Header().Get("X-Proxy-Resolver-Ready") != "false" {
+		t.Fatalf("wrong readiness response: %s", response.Body.String())
+	}
+	for _, resolverReady := range []bool{false, true} {
+		// The readiness handler includes all enabled resolver dependencies.
+		readiness := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("X-Proxy-Generation", "generation-one")
+			w.Header().Set("X-Proxy-Resolver-Ready", strconv.FormatBool(resolverReady))
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			if !resolverReady {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
+			_, _ = w.Write([]byte(`{"resolver_ready":true}`))
+		})
+		redirect := newRedirectMux(handler, readiness)
+		request := httptest.NewRequest(http.MethodGet, "http://east.example.test/health", nil)
+		response := httptest.NewRecorder()
+		redirect.ServeHTTP(response, request)
+		if response.Code != http.StatusMovedPermanently || response.Header().Get("Location") != "https://east.example.test/health" {
+			t.Fatalf("bare domain redirect changed: %d, %s", response.Code, response.Header().Get("Location"))
+		}
+		if response.Header().Get("X-Proxy-Generation") != "generation-one" || response.Header().Get("X-Proxy-Resolver-Ready") != strconv.FormatBool(resolverReady) {
+			t.Fatalf("missing redirect readiness: %v", response.Header())
+		}
+		response = httptest.NewRecorder()
+		redirect.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://proxy-readiness.invalid/health", nil))
+		if !resolverReady && response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("LB health bypassed failed readiness: %d", response.Code)
+		}
+	}
+	request = httptest.NewRequest(http.MethodGet, "http://preview.east.example.test/health", nil)
+	response = httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("preview health bypassed data plane: %d", response.Code)
+	}
+	response = httptest.NewRecorder()
+	redirect.ServeHTTP(response, request)
+	if response.Code != http.StatusMovedPermanently || response.Header().Get("Location") != "https://preview.east.example.test/health" {
+		t.Fatalf("preview redirect changed: %d, %s", response.Code, response.Header().Get("Location"))
+	}
+}
+
+func TestBareDomainReadinessConfiguredStagingAndProductionForms(t *testing.T) {
+	for _, domain := range []string{"staging.example.test", "production.example.test"} {
+		t.Run(domain, func(t *testing.T) {
+			t.Setenv("PROXY_GENERATION", "generation-one")
+			handler := proxy.NewHandler([]string{domain}, nil, zerolog.Nop())
+			dataPlane := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusAccepted)
+			})
+			mux := newProxyMuxWithReadiness(handler, dataPlane, nil)
+			redirect := newRedirectMux(handler, mux)
+
+			response := httptest.NewRecorder()
+			mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+				"https://"+domain+"/health", nil))
+			if response.Code != http.StatusOK || response.Header().Get("X-Proxy-Generation") != "generation-one" ||
+				response.Header().Get("X-Proxy-Resolver-Ready") != "false" {
+				t.Fatalf("bare HTTPS readiness = %d, headers=%v", response.Code, response.Header())
+			}
+
+			response = httptest.NewRecorder()
+			redirect.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+				"http://"+domain+"/health", nil))
+			if response.Code != http.StatusMovedPermanently ||
+				response.Header().Get("Location") != "https://"+domain+"/health" ||
+				response.Header().Get("X-Proxy-Generation") != "generation-one" ||
+				response.Header().Get("X-Proxy-Resolver-Ready") != "false" {
+				t.Fatalf("bare HTTP readiness redirect = %d, headers=%v", response.Code, response.Header())
+			}
+
+			preview := "preview." + domain
+			response = httptest.NewRecorder()
+			mux.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+				"https://"+preview+"/health", nil))
+			if response.Code != http.StatusAccepted || response.Header().Get("X-Proxy-Generation") != "" {
+				t.Fatalf("preview HTTPS route was treated as infrastructure readiness: %d, headers=%v",
+					response.Code, response.Header())
+			}
+		})
 	}
 }

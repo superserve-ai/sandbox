@@ -78,6 +78,108 @@ class PeerCertificateTest(unittest.TestCase):
 
 
 class ManagedIdentityTest(unittest.TestCase):
+    def test_legacy_credentials_reload_the_legacy_proxy_when_rollout_state_exists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            state.write_text(json.dumps({'phase': 'complete', 'active': {'id': ''}}))
+            env = Path(directory) / 'proxy.env'
+            env.write_text('PEER_PROXY_SPIFFE_URI=spiffe://example.test\n')
+            def path(value):
+                if str(value) == '/var/lib/proxy-rollout/state.json':
+                    return state
+                if str(value) == '/etc/sandbox/proxy.env':
+                    return env
+                return Path(value)
+            with patch.object(REFRESH, 'Path', side_effect=path), \
+                 patch.object(REFRESH.subprocess, 'run') as run:
+                REFRESH.reload_proxy(Path(directory), Path(directory) / 'certificate-b', 'spiffe://example.test')
+            run.assert_called_once_with(
+                ['systemctl', 'try-restart', 'proxy.service'], check=True)
+            self.assertEqual((Path(directory) / 'loaded-generation').read_text(), 'certificate-b')
+
+    def test_generation_credentials_still_queue_the_rollout_controller(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            state.write_text(json.dumps({'phase': 'complete', 'active': {'id': 'generation-a'}}))
+            def path(value):
+                if str(value) == '/var/lib/proxy-rollout/state.json':
+                    return state
+                return Path(value)
+            with patch.object(REFRESH, 'Path', side_effect=path), \
+                 patch.object(REFRESH.subprocess, 'run') as run:
+                REFRESH.reload_proxy(Path(directory), Path(directory) / 'certificate-b', 'spiffe://example.test')
+            run.assert_called_once_with(
+                ['systemctl', 'start', '--no-block', 'proxy-credential-rollout.service'], check=True)
+
+    def test_stopping_rollout_queues_credentials_instead_of_restarting_retiring_legacy_proxy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / 'state.json'
+            state.write_text(json.dumps({
+                'phase': 'stopping',
+                'old': {'id': '', 'unit': 'proxy.service'},
+                'candidate': {'id': 'generation-b', 'unit': 'proxy-generation-b.service'},
+            }))
+
+            def path(value):
+                if str(value) == '/var/lib/proxy-rollout/state.json':
+                    return state
+                return Path(value)
+
+            with patch.object(REFRESH, 'Path', side_effect=path), \
+                 patch.object(REFRESH.subprocess, 'run') as run:
+                REFRESH.reload_proxy(Path(directory), Path(directory) / 'certificate-c', 'spiffe://example.test')
+
+            run.assert_called_once_with(
+                ['systemctl', 'start', '--no-block', 'proxy-credential-rollout.service'], check=True)
+
+    def test_report_uses_candidate_credentials_after_stopping_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            peer = root / 'peer'
+            current = peer / 'current'
+            credentials = root / 'credentials'
+            peer.mkdir()
+            current.mkdir()
+            credentials.mkdir()
+            (peer / 'identity.json').write_text(json.dumps({'spiffe_uri': 'spiffe://example.test'}))
+            for name, content in (('tls.crt', b'current-cert'),
+                                  ('tls.key', b'current-key'),
+                                  ('ca.crt', b'current-ca')):
+                (current / name).write_bytes(content)
+
+            old_snapshot = credentials / 'proxy.service'
+            candidate_snapshot = credentials / 'proxy-generation-b.service'
+            old_snapshot.mkdir()
+            candidate_snapshot.mkdir()
+            for name, runtime in (('tls.crt', 'peer-cert'),
+                                  ('tls.key', 'peer-key'), ('ca.crt', 'peer-ca')):
+                (old_snapshot / runtime).write_bytes(b'retiring-credentials')
+                (candidate_snapshot / runtime).write_bytes(
+                    {'peer-cert': b'current-cert', 'peer-key': b'current-key',
+                     'peer-ca': b'current-ca'}[runtime])
+
+            state = root / 'state.json'
+            state.write_text(json.dumps({
+                'phase': 'stopping',
+                'old': {'id': '', 'unit': 'proxy.service'},
+                'candidate': {'id': 'generation-b', 'unit': 'proxy-generation-b.service'},
+            }))
+
+            def path(value):
+                if str(value) == '/var/lib/proxy-rollout/state.json':
+                    return state
+                if str(value) == '/run/credentials':
+                    return credentials
+                return Path(value)
+
+            with patch.object(REFRESH, 'Path', side_effect=path), \
+                 patch.object(REFRESH.time, 'time', return_value=123.0), \
+                 patch('builtins.print'):
+                REFRESH.report(peer, 'superserve', {'seconds_remaining': 86400})
+
+            status = json.loads((peer / 'status.json').read_text())
+            self.assertFalse(status['proxy_reload_required'])
+
     def test_retry_reuses_pool_and_reconciles_exact_instance_attestation(self):
         config = {
             'project_id': 'example-project', 'project_number': '123456789012', 'region': 'us-west2',
