@@ -768,7 +768,6 @@ func testOpenPeriodWorkerExports(t *testing.T, pool *pgxpool.Pool, trace *billin
 		// Advance only this team's durable due time; no wall-clock sleep is needed.
 		exec(`UPDATE billing_export_work SET next_run_at=now()-interval '100 years' WHERE team_id=$1`, team.ID)
 		trace.take()
-		before := time.Now()
 		worked, measured, err := h.incrementalBillingTick(ctx, cadence)
 		queries := trace.take()
 		if err != nil || !worked || measured != measurements {
@@ -819,11 +818,13 @@ func testOpenPeriodWorkerExports(t *testing.T, pool *pgxpool.Pool, trace *billin
 		}
 		var next time.Time
 		var released bool
-		if err := pool.QueryRow(ctx, `SELECT next_run_at,lease_token IS NULL AND lease_until IS NULL AND last_error IS NULL FROM billing_export_work WHERE team_id=$1`, team.ID).Scan(&next, &released); err != nil || !released {
+		var delay float64
+		if err := pool.QueryRow(ctx, `SELECT next_run_at,lease_token IS NULL AND lease_until IS NULL AND last_error IS NULL,
+ extract(epoch FROM(next_run_at-now()))::float8 FROM billing_export_work WHERE team_id=$1`, team.ID).Scan(&next, &released, &delay); err != nil || !released {
 			t.Fatalf("worker did not finish cleanly: released=%v err=%v", released, err)
 		}
-		if next.Before(before.Add(cadence)) || next.After(time.Now().Add(cadence+time.Minute)) {
-			t.Fatalf("next run %s does not follow cadence %s", next, cadence)
+		if delay < cadence.Seconds()-60 || delay > cadence.Seconds()+60 {
+			t.Fatalf("next run %s (delay %.1fs) does not follow cadence %s", next, delay, cadence)
 		}
 	}
 	tick(2, 2, "2.000000000000")

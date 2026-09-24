@@ -13,6 +13,16 @@ type ComputeRecorder interface {
 	RecordComputeRefresh(context.Context, string)
 }
 
+// ComputeReconcileRecorder records bounded outcomes from background sweeps.
+type ComputeReconcileRecorder interface {
+	RecordComputeReconciliation(context.Context, string)
+}
+
+func (r *OTelRecorder) RecordComputeReconciliation(ctx context.Context, outcome string) {
+	outcome = computeLabel(outcome, "run", "matched", "attempted", "completed", "pending", "failure", "would_pause", "no_op_trusted", "no_op_off", "no_op_unrestricted", "no_op_state", "deferred_transition")
+	r.computeReconciles.Add(ctx, 1, metric.WithAttributes(attribute.String("source", "config"), attribute.String("outcome", outcome)))
+}
+
 func (r *OTelRecorder) RecordComputeDecision(ctx context.Context, action, mode, outcome, subject string) {
 	action = computeLabel(action, "create", "resume")
 	mode = computeLabel(mode, "off", "observe", "enforce")

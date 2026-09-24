@@ -115,10 +115,10 @@ WITH paused AS (
       pause_op_lease_until = now() + make_interval(secs => $2::int),
       pause_op_lease_version = pause_op_lease_version + 1,
       pause_op_attention_at = NULL,
-      pause_op_trigger = 'pause',
-      pause_op_actor_id = $3::uuid
-  WHERE sandbox.id = $4
-    AND sandbox.team_id = $5
+      pause_op_trigger = COALESCE($3::text, 'pause'),
+      pause_op_actor_id = $4::uuid
+  WHERE sandbox.id = $5
+    AND sandbox.team_id = $6
     AND sandbox.destroyed_at IS NULL
     AND sandbox.status = 'active'
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, source_snapshot_id
@@ -145,6 +145,7 @@ LEFT JOIN closed_interval ci ON ci.sandbox_id = p.id
 type BeginPauseParams struct {
 	PauseOpID    pgtype.UUID `json:"pause_op_id"`
 	LeaseSeconds int32       `json:"lease_seconds"`
+	Trigger      *string     `json:"trigger"`
 	ActorID      pgtype.UUID `json:"actor_id"`
 	ID           uuid.UUID   `json:"id"`
 	TeamID       uuid.UUID   `json:"team_id"`
@@ -205,6 +206,7 @@ func (q *Queries) BeginPause(ctx context.Context, arg BeginPauseParams) (BeginPa
 	row := q.db.QueryRow(ctx, beginPause,
 		arg.PauseOpID,
 		arg.LeaseSeconds,
+		arg.Trigger,
 		arg.ActorID,
 		arg.ID,
 		arg.TeamID,
