@@ -10,9 +10,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
@@ -33,11 +35,19 @@ func prefersAsync(c *gin.Context) bool {
 
 type pauseOutcome int
 
+func pauseTrigger(trigger *string) string {
+	if trigger != nil && *trigger != "" {
+		return *trigger
+	}
+	return "pause"
+}
+
 const (
-	pauseDone       pauseOutcome = iota // snapshot taken; bookkeeping in flight
+	pauseDone       pauseOutcome = iota // snapshot taken; bookkeeping may be in flight
 	pauseGone                           // host has no such VM; row marked failed
 	pauseUndecided                      // row still 'pausing'; the reconciler finishes it
 	pauseUnresolved                     // host unknown; nothing dispatched, row back to 'active'
+	pauseFinalized                      // containment bookkeeping completed in its worker
 )
 
 // respondPause answers a dispatch the caller waited for. Only a row known to
@@ -79,18 +89,37 @@ func acceptPausing(c *gin.Context) {
 }
 
 // dispatchPause runs the host RPC for a claimed pause and records its answer.
-// It knows nothing of the HTTP request; every write runs detached. accepted
-// says the caller already holds a 202 for this pause.
+// It knows nothing of the HTTP request; HTTP bookkeeping runs detached.
+// accepted says the caller already holds a 202 for this pause.
 func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, leaseUntil time.Time, actorID *uuid.UUID, accepted bool, l zerolog.Logger) pauseOutcome {
+	return h.dispatchPauseWithBookkeeping(ctx, sandbox, leaseUntil, actorID, accepted, l, false)
+}
+
+// Containment keeps post-dispatch writes in its bounded worker. HTTP callers
+// continue to use detached bookkeeping through dispatchPause. Its claim must
+// remain pending if host resolution fails so the reconciler can retry it.
+func (h *Handlers) dispatchContainmentPause(ctx context.Context, sandbox db.BeginPauseRow, leaseUntil time.Time, l zerolog.Logger) pauseOutcome {
+	return h.dispatchPauseWithBookkeeping(ctx, sandbox, leaseUntil, nil, true, l, true)
+}
+
+func (h *Handlers) dispatchPauseWithBookkeeping(ctx context.Context, sandbox db.BeginPauseRow, leaseUntil time.Time, actorID *uuid.UUID, accepted bool, l zerolog.Logger, waitForBookkeeping bool) pauseOutcome {
+	bookkeep := func(name string, fn func()) {
+		if waitForBookkeeping {
+			defer sentrylog.Recover(name)
+			fn()
+			return
+		}
+		h.asyncBookkeeping(name, fn)
+	}
 	sandboxID, teamID := sandbox.ID, sandbox.TeamID
 	lease := pauseLease{id: sandbox.PauseOpID, version: sandbox.PauseOpLeaseVersion}
 	// BeginPause already claimed 'pausing'. A host lookup failure dispatched
 	// nothing, so the VM is known to be running: a caller still waiting is
 	// told so, with the claim reverted first. A caller already told
-	// 'pausing' was promised paused or failed, so for them the claim stands
-	// and the reconciler resolves the host again. If a revert cannot be
-	// written the claim stands as well. This is the only revert after
-	// BeginPause.
+	// 'pausing' was promised paused or failed, and containment also needs
+	// the claim to stand, so the reconciler resolves the host again. If a
+	// revert cannot be written the claim stands as well. This is the only
+	// revert after BeginPause.
 	vmd, err := h.vmdForHost(ctx, sandbox.HostID)
 	if err != nil {
 		l.Error().Err(err).Msg("resolve VMD for pause failed")
@@ -113,14 +142,14 @@ func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, 
 		// 'active' was already a lie.
 		if isVMDNotFound(err) || isVMDFailedPrecondition(err) {
 			l.Warn().Err(err).Msg("VMD PauseInstance: VM unavailable, marking sandbox failed")
-			h.asyncBookkeeping("fail-pause", func() { h.failPause(bg, sandboxID, sandbox.HostID, lease, l) })
+			bookkeep("fail-pause", func() { h.failPause(bg, sandboxID, sandbox.HostID, lease, l) })
 			return pauseGone
 		}
 		// Timeout, unavailable, or any other error after dispatch says
 		// nothing about whether the VM still runs; the row stays 'pausing'
 		// and the reconciler asks the host again (see pause_reconcile.go).
 		l.Warn().Err(err).Msg("VMD PauseInstance undecided — left pausing for reconciliation")
-		h.asyncBookkeeping("release-pause-lease", func() { h.releasePauseLease(bg, sandboxID, lease, 0, l) })
+		bookkeep("release-pause-lease", func() { h.releasePauseLease(bg, sandboxID, lease, 0, l) })
 		return pauseUndecided
 	}
 
@@ -129,11 +158,12 @@ func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, 
 		Str("mem_path", memPath).
 		Msg("VMD pause complete")
 
-	// The snapshot exists on disk, so the bookkeeping (snapshot row upsert +
-	// pausing → paused in one CTE) is fire-and-forget: every other
-	// transition is status-gated and a racing resume 409s until it lands.
+	// The snapshot exists on disk. HTTP callers can detach the bookkeeping
+	// (snapshot row upsert + pausing → paused in one CTE), since other
+	// transitions are status-gated until it lands.
 	finalizeCtx := context.WithoutCancel(ctx)
-	h.asyncBookkeeping("finalize-pause", func() {
+	finalized := false
+	bookkeep("finalize-pause", func() {
 		fctx, fcancel := context.WithTimeout(finalizeCtx, asyncTimeout)
 		defer fcancel()
 		params := db.FinalizePauseParams{
@@ -143,7 +173,7 @@ func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, 
 			PauseOpLeaseVersion: &sandbox.PauseOpLeaseVersion,
 			Path:                snapshotPath,
 			MemPath:             &memPath,
-			Trigger:             "pause",
+			Trigger:             pauseTrigger(sandbox.PauseOpTrigger),
 			// Store only what the daemon echoed: an older daemon drops the
 			// token, and storing it anyway would demand of its reports an
 			// identity they can never carry.
@@ -158,15 +188,35 @@ func (h *Handlers) dispatchPause(ctx context.Context, sandbox db.BeginPauseRow, 
 				return
 			}
 			if !h.pauseLanded(finalizeCtx, sandboxID, teamID, lease) {
-				l.Error().Err(err).Msg("async DB FinalizePause failed — sandbox stays 'pausing' for reconciliation")
+				l.Error().Err(err).Msg("DB FinalizePause failed — sandbox stays 'pausing' for reconciliation")
 				return
 			}
 			l.Warn().Err(err).Msg("FinalizePause answer lost after it committed")
 		}
 		// Recorded once the row says paused: a finalize the reconciler has
 		// to redo must not leave two success entries for one pause.
-		h.logSandboxActivity(finalizeCtx, sandboxID, teamID, actorID, "sandbox", "paused", "success", &sandbox.Name, nil, nil)
-		h.captureFor(actorID, teamID, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
+		activityAction := pauseActivity(pauseTrigger(sandbox.PauseOpTrigger))
+		if waitForBookkeeping {
+			activityCtx, activityCancel := context.WithTimeout(finalizeCtx, asyncTimeout)
+			defer activityCancel()
+			status := "success"
+			h.writeActivity(activityCtx, "activity-log", db.CreateActivityParams{
+				SandboxID:    pgtype.UUID{Bytes: sandboxID, Valid: true},
+				ResourceType: "sandbox", TeamID: teamID, ActorID: actorUUID(actorID),
+				Category: "sandbox", Action: activityAction, Status: &status, SandboxName: &sandbox.Name,
+			})
+		} else {
+			h.logSandboxActivity(finalizeCtx, sandboxID, teamID, actorID, "sandbox", activityAction, "success", &sandbox.Name, nil, nil)
+		}
+		if pauseTrigger(sandbox.PauseOpTrigger) == "abuse" {
+			recordComputeReconciliation(finalizeCtx, "completed")
+		} else {
+			h.captureFor(actorID, teamID, "sandbox_paused", map[string]any{"sandbox_id": sandboxID.String()})
+		}
+		finalized = true
 	})
+	if waitForBookkeeping && finalized {
+		return pauseFinalized
+	}
 	return pauseDone
 }

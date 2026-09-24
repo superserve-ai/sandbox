@@ -456,7 +456,7 @@ WITH paused AS (
       pause_op_lease_until = now() + make_interval(secs => sqlc.arg(lease_seconds)::int),
       pause_op_lease_version = pause_op_lease_version + 1,
       pause_op_attention_at = NULL,
-      pause_op_trigger = 'pause',
+      pause_op_trigger = COALESCE(sqlc.narg(trigger)::text, 'pause'),
       pause_op_actor_id = sqlc.narg(actor_id)::uuid
   WHERE sandbox.id = sqlc.arg(id)
     AND sandbox.team_id = sqlc.arg(team_id)

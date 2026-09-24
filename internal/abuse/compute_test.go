@@ -46,7 +46,7 @@ func TestComputePolicy(t *testing.T) {
 					if d := e.Evaluate(team, ActionCreate); d.Outcome != want {
 						t.Fatalf("got %+v, want %s", d, want)
 					}
-					if d := e.Evaluate(team, ActionResume); d.Outcome != "allowed" {
+					if d := e.Evaluate(team, ActionResume); d.Outcome != want {
 						t.Fatal(d)
 					}
 					if d := e.Evaluate(other, ActionCreate); d.Outcome != "allowed" {
@@ -197,8 +197,29 @@ func TestComputeOwnerFailureFailsOpenWithoutLosingTeamRestrictions(t *testing.T)
 	}
 	fail = true
 	s.Refresh(context.Background())
-	if e.Evaluate(team, ActionCreate).Outcome != "allowed" || e.Evaluate(team, ActionResume).Outcome != "blocked" {
+	if e.Evaluate(team, ActionCreate).Outcome != "blocked" || e.Evaluate(team, ActionResume).Outcome != "blocked" || e.Evaluate(team, ActionResume).SubjectType != "team" {
 		t.Fatal("owner failure must clear only user matching")
+	}
+}
+
+func TestComputeLegacyActionsShareRestriction(t *testing.T) {
+	team, owner := uuid.New(), uuid.New()
+	for _, action := range []Action{ActionCreate, ActionResume} {
+		s := NewConfigComputeSource("unused", func(context.Context, []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error) {
+			return map[uuid.UUID][]uuid.UUID{team: {owner}}, nil
+		}, nil)
+		s.readFile = func(string) ([]byte, error) {
+			return []byte(fmt.Sprintf(`{"mode":"enforce","restrictions":[{"subject_type":"user","subject_id":%q,"actions":[%q]}]}`, owner, action)), nil
+		}
+		s.Refresh(context.Background())
+		for _, operation := range []Action{ActionCreate, ActionResume} {
+			if got := (&ComputeEvaluator{Source: s}).Evaluate(team, operation); got.Outcome != "blocked" {
+				t.Fatalf("legacy %s did not block %s: %+v", action, operation, got)
+			}
+		}
+		if teams := s.Snapshot().RestrictedTeams(); !reflect.DeepEqual(teams, []uuid.UUID{team}) {
+			t.Fatalf("legacy %s candidate teams = %v", action, teams)
+		}
 	}
 }
 
@@ -325,7 +346,12 @@ func TestComputeRefreshScopesOwnerLoadToConfiguredUsers(t *testing.T) {
 	var calls [][]uuid.UUID
 	s := NewConfigComputeSource("unused", func(_ context.Context, ids []uuid.UUID) (map[uuid.UUID][]uuid.UUID, error) {
 		calls = append(calls, ids)
-		return map[uuid.UUID][]uuid.UUID{team: ids}, nil
+		for _, id := range ids {
+			if id == first {
+				return map[uuid.UUID][]uuid.UUID{team: {first}}, nil
+			}
+		}
+		return nil, nil
 	}, nil)
 	data := fmt.Sprintf(`{"mode":"enforce","restrictions":[{"subject_type":"user","subject_id":%q,"actions":["create"]},{"subject_type":"user","subject_id":%q,"actions":["resume"]},{"subject_type":"team","subject_id":%q,"actions":["create"]}]}`, first, first, team)
 	s.readFile = func(string) ([]byte, error) { return []byte(data), nil }
