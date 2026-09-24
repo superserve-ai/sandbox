@@ -15,6 +15,46 @@ SCRIPTS = Path(__file__).parent
 
 
 class DeployTargetTests(unittest.TestCase):
+    def test_staging_smoke_selection_excludes_infrastructure_jobs(self):
+        workflow = (SCRIPTS.parent / 'terraform-rollout-staging.yml').read_text()
+        jobs = {}
+        for name in ('smoke', 'privateca-bootstrap', 'staging'):
+            job = re.split(r'^  [a-z][a-z-]*:\n', workflow.split(f'  {name}:\n', 1)[1],
+                           maxsplit=1, flags=re.M)[0]
+            jobs[name] = job
+        for smoke in (False, True):
+            for bootstrap in (False, True):
+                with self.subTest(smoke=smoke, bootstrap=bootstrap):
+                    selected = []
+                    for name, job in jobs.items():
+                        guard = re.search(r'^    if: \$\{\{ (.+) \}\}$', job, re.M)[1]
+                        guard = guard.replace('&&', 'and').replace('!', 'not ')
+                        if eval(guard, {'__builtins__': {}},
+                                {'inputs': SimpleNamespace(smoke_only=smoke,
+                                                           privateca_bootstrap=bootstrap)}):
+                            selected.append(name)
+                    expected = 'smoke' if smoke else 'privateca-bootstrap' if bootstrap else 'staging'
+                    self.assertEqual(selected, [expected])
+        self.assertIn('environment: staging', jobs['smoke'])
+        self.assertIn('secrets.SS_TEST_API_KEY_STAGING', jobs['smoke'])
+        self.assertNotIn('id-token:', jobs['smoke'])
+        self.assertNotIn('terraform ', jobs['smoke'])
+        self.assertNotIn('google-github-actions/auth', jobs['smoke'])
+
+    def test_staging_smoke_confirmation_rejects_conflicting_modes(self):
+        workflow = (SCRIPTS.parent / 'terraform-rollout-staging.yml').read_text()
+        job = workflow.split('  smoke:\n', 1)[1].split('  privateca-bootstrap:\n', 1)[0]
+        script = job.split('        run: |\n', 1)[1].split('\n      - uses:', 1)[0]
+        for confirm in ('smoke', 'apply', '', 'invalid'):
+            for bootstrap in ('true', 'false'):
+                with self.subTest(confirm=confirm, bootstrap=bootstrap):
+                    result = subprocess.run(['bash', '-eu', '-c', script],
+                                            capture_output=True, text=True,
+                                            env=dict(os.environ, CONFIRM=confirm,
+                                                     PRIVATECA_BOOTSTRAP=bootstrap))
+                    self.assertEqual(result.returncode == 0,
+                                     confirm == 'smoke' and bootstrap == 'false')
+
     def test_frontend_owning_states_require_bootstrap_before_automatic_apply(self):
         workflow = (SCRIPTS.parent / 'terraform-cd.yml').read_text()
         deploy = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()

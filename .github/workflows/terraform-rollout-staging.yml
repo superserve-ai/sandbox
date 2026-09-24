@@ -11,17 +11,48 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type apply to apply staging Terraform and run smoke validation'
+        description: 'Type apply for infrastructure changes, or smoke for smoke-only validation'
         required: true
         type: string
       privateca_bootstrap:
         description: 'Apply only the deployer Private CA read grant; skip rollout and smoke tests'
         type: boolean
         default: false
+      smoke_only:
+        description: 'Run the existing staging smoke test without applying Terraform'
+        type: boolean
+        default: false
 
 jobs:
+  smoke:
+    if: ${{ inputs.smoke_only }}
+    name: Validate staging without infrastructure changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    permissions:
+      contents: read
+    steps:
+      - name: Confirm smoke-only validation
+        env:
+          CONFIRM: ${{ inputs.confirm }}
+          PRIVATECA_BOOTSTRAP: ${{ inputs.privateca_bootstrap }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRM" = smoke
+          test "$PRIVATECA_BOOTSTRAP" = false
+
+      - uses: actions/checkout@v4
+
+      - name: Smoke test staging/us-central1
+        env:
+          API_BASE_URL: https://api-staging.superserve.ai
+          SANDBOX_BASE_URL: https://staging-sandbox.superserve.ai
+          API_KEY: ${{ secrets.SS_TEST_API_KEY_STAGING }}
+        run: scripts/smoke-test-region.sh staging us-central1
+
   privateca-bootstrap:
-    if: ${{ inputs.privateca_bootstrap }}
+    if: ${{ inputs.privateca_bootstrap && !inputs.smoke_only }}
     name: Bootstrap staging Private CA read access
     runs-on: ubuntu-latest
     environment: staging
@@ -68,7 +99,7 @@ jobs:
           terraform apply -input=false -lock-timeout=5m tfplan
 
   staging:
-    if: ${{ !inputs.privateca_bootstrap }}
+    if: ${{ !inputs.privateca_bootstrap && !inputs.smoke_only }}
     name: Apply staging us-central1
     runs-on: ubuntu-latest
     permissions:
