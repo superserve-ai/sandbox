@@ -522,6 +522,8 @@ type Manager struct {
 	// launchFirecrackerHook is a test seam. When set, launchFirecracker
 	// delegates to it instead of the platform-specific implementation.
 	launchFirecrackerHook func(ctx context.Context, vmID, socketPath, perVMRootfs, basePath, netNS string, existing Supervision, hadPriorLife, freshUnit bool) (pid int, supervision Supervision, err error)
+	// stopVMHook is the same kind of seam for stopVM.
+	stopVMHook func(ctx context.Context, vmID string, supervision Supervision) error
 	// restoreForResumeHook is a test seam for the snapshot restore step.
 	restoreForResumeHook func(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, trackingSessionID string, err error)
 	// restoreSnapshotHook is the restore path's.
@@ -3641,6 +3643,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	m.mu.Lock()
 	prevInst, inPlace := m.vms[vmID]
 	prevSupervision := SupervisionUnit
+	var stopErr error
 	if inPlace {
 		prevInst.mu.RLock()
 		prevSupervision = prevInst.Supervision
@@ -3654,7 +3657,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// StatusCreating instance takes over the id — no window in which
 		// this VM's resources are invisible to pressure.
 		m.mu.Unlock()
-		_ = m.stopVM(ctx, vmID, prevSupervision)
+		stopErr = m.stopVM(ctx, vmID, prevSupervision)
 		m.mu.Lock()
 	}
 
@@ -3724,6 +3727,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	}
 	var diskPath string
 	var diskErr error
+	diskUntouched := false
 	switch plan.action {
 	case restoreCreateOverlay:
 		diskPath, diskErr = m.createOverlay(vmID, resourceLimits.BasePath)
@@ -3737,10 +3741,23 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	case restoreLegacyResolve:
 		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
 	case restoreMaterializeFork:
-		diskPath, diskErr = m.materializeForkLocked(ctx, vmID, fork)
+		if inPlace && stopErr != nil {
+			// A stop that did not confirm may leave a Firecracker that still
+			// owns the files here; replacing them would truncate its disk.
+			diskErr = status.Errorf(codes.Unavailable, "vm %s could not be confirmed stopped before being replaced: %v", vmID, stopErr)
+			diskUntouched = true
+		} else {
+			diskPath, diskErr = m.materializeForkLocked(ctx, vmID, fork)
+		}
 	}
 	if diskErr != nil {
 		tFailBoundary = time.Now()
+		if diskUntouched {
+			// Nothing of the prior life was touched and its process may
+			// live: keep charging it behind the record until a confirmed stop.
+			m.markUnservable(inst, log)
+			return nil, diskErr
+		}
 		// A run dir left behind makes the retry plan a reuse of the disk
 		// this attempt never finished.
 		cleanupAfterRestoreFailure()

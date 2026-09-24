@@ -1054,3 +1054,46 @@ func TestForkRefusesASnapshotReplacedUnderItsId(t *testing.T) {
 		}
 	}
 }
+
+func TestForkOverALiveVMRefusesWhenTheStopIsNotConfirmed(t *testing.T) {
+	useTempFloor(t)
+	m := newSavedTestManager(t)
+	m.restoreSem = make(chan struct{}, 1)
+	src, _ := seedPausedSource(t, m, true)
+	ctx := context.Background()
+	man, err := m.CreateSavedSnapshot(ctx, src.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A running VM already owns the id, from another image, and its stop
+	// does not confirm.
+	child := uuid.NewString()
+	rundir := filepath.Join(m.cfg.RunDir, child)
+	if err := os.MkdirAll(rundir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	overlay := filepath.Join(rundir, "overlay.ext4")
+	if err := os.WriteFile(overlay, []byte("live disk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	m.vms[child] = &VMInstance{ID: child, Status: StatusRunning, Supervision: SupervisionUnit, DiskPath: overlay, SnapshotPath: "/elsewhere/vmstate.snap", MemFilePath: "/elsewhere/mem.snap"}
+	m.mu.Unlock()
+	m.stopVMHook = func(context.Context, string, Supervision) error { return errors.New("unit still active") }
+	_, err = m.restoreVMSnapshot(ctx, child, "", "", VMConfig{SavedSnapshotID: man.SnapshotID}, nil, "", "", "", nil, 0, "")
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("fork over a VM whose stop did not confirm: want Unavailable, got %v", err)
+	}
+	if b, _ := os.ReadFile(overlay); string(b) != "live disk" {
+		t.Fatal("the live VM's disk was replaced")
+	}
+	if _, err := os.Stat(rundir); err != nil {
+		t.Fatal("the live VM's run dir was removed")
+	}
+	m.mu.RLock()
+	inst := m.vms[child]
+	m.mu.RUnlock()
+	if inst == nil || inst.Status != StatusError {
+		t.Fatalf("the id is not parked as error: %+v", inst)
+	}
+}
