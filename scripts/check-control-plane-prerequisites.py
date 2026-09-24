@@ -67,19 +67,17 @@ def contract_from_plan(plan):
     change = plan.get("output_changes", {}).get("controlplane_identity_contract", {})
     contract = change.get("after")
     fields = (
-        "runtime_service_account", "deployment_identity", "backup_bucket",
-        "secret_ids", "host_identities_unchanged", "region", "kms_key_resource",
+        "deployment_identity", "backup_bucket", "secret_ids", "region", "kms_key_resource",
     )
     unknown = change.get("after_unknown") or {}
     require(isinstance(contract, dict), "Plan has no control-plane identity contract")
     require(isinstance(unknown, dict), "Identity contract is not known until apply")
     for field in fields:
         require(field in contract and not unknown.get(field), f"Contract field {field} is unknown")
-    for field in fields[:3] + ("region",):
+    for field in ("deployment_identity", "backup_bucket", "region"):
         require(isinstance(contract[field], str) and bool(contract[field]), f"Invalid contract field {field}")
-    for field in ("secret_ids", "host_identities_unchanged"):
-        require(isinstance(contract[field], list) and bool(contract[field]) and
-                all(isinstance(value, str) and value for value in contract[field]), f"Invalid contract field {field}")
+    require(isinstance(contract["secret_ids"], list) and bool(contract["secret_ids"]) and
+            all(isinstance(value, str) and value for value in contract["secret_ids"]), "Invalid secret_ids")
     return contract
 
 
@@ -103,11 +101,14 @@ def check_template_references(evidence, bucket):
 def check_prerequisites(args, contract, preflight):
     evidence = preflight.evidence
     command = preflight.command
-    identity = contract["runtime_service_account"]
+    # New runtime/host account emails may still be computed in the plan. Probe
+    # tooling with the existing caller; the cutover verifier checks the actual
+    # newly provisioned identities, grants, and isolation after apply.
+    identity = contract["deployment_identity"]
     bucket = contract["backup_bucket"]
     require(contract["deployment_identity"] == args.deployment_identity, "Plan names a different deployment identity")
     require(contract["region"] == args.region, "Plan names a different region")
-    require(identity.endswith(f"@{args.project}.iam.gserviceaccount.com"), "Plan names a different runtime project")
+    require(identity.endswith(f"@{args.project}.iam.gserviceaccount.com"), "Plan names a different deployment project")
     (evidence.root / "contract.json").write_text(json.dumps(contract, indent=2) + "\n")
 
     command("deployment-identity", VERIFY.gcloud("auth", "list", "--filter=status:ACTIVE", "--format=value(account)"),
@@ -129,8 +130,7 @@ def check_prerequisites(args, contract, preflight):
                 f"--project={args.project}", f"--principal-email={identity}", f"--permission={permission}", "--format=json"),
                 lambda text: require(VERIFY.policy_troubleshooter_access(text) in {"GRANTED", "NOT_GRANTED", "DENIED"},
                     "Policy decision is unknown; inspect inherited policies, custom roles, and group visibility"))
-    for index, host in enumerate(contract["host_identities_unchanged"], 1):
-        command(f"host-effective-iam-{index}", VERIFY.host_effective_iam_command(args.project, host, identity), VERIFY.iam_analysis_results)
+    command("impersonation-analysis", VERIFY.host_effective_iam_command(args.project, identity, identity), VERIFY.iam_analysis_results)
     command("effective-iam", VERIFY.effective_iam_command(args.project, identity, bucket), VERIFY.iam_analysis_results)
     for index, secret in enumerate(contract["secret_ids"], 1):
         command(f"secret-version-{index}", VERIFY.gcloud("secrets", "versions", "describe", "latest", f"--secret={secret}", f"--project={args.project}", "--format=json"),

@@ -93,12 +93,7 @@ jobs:
       contents: read
       id-token: write
     env:
-      TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
       CELL: ${{ matrix.cell }}
-      PROJECT: ${{ vars.GCP_PROJECT }}
-      REGION: ${{ vars[matrix.region_variable] }}
-      SERVICE: ${{ vars[matrix.service_variable] }}
-      DEPLOYMENT_IDENTITY: ${{ secrets.GCP_SERVICE_ACCOUNT }}
       TF_ROOT: ${{ matrix.root }}
       STATE_BUCKET: ${{ matrix.state_bucket }}
       OTHER_BUCKET_1: ${{ matrix.other_bucket_1 }}
@@ -122,6 +117,12 @@ jobs:
           test -n "$bucket"
           echo "CONTROL_PLANE_EVIDENCE_BUCKET=$bucket" >> "$GITHUB_ENV"
       - name: Plan and check prerequisites without applying
+        env:
+          TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          REGION: ${{ vars[matrix.region_variable] }}
+          SERVICE: ${{ vars[matrix.service_variable] }}
+          DEPLOYMENT_IDENTITY: ${{ secrets.GCP_SERVICE_ACCOUNT }}
         run: |
           set -euo pipefail
           evidence="$RUNNER_TEMP/prerequisites/$CELL"
