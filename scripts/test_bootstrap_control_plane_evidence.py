@@ -23,6 +23,7 @@ if [ "${0##*/}:$1" = "terraform:output" ]; then echo example-control-plane-evide
             result = subprocess.run(['bash', str(SCRIPT)], capture_output=True, text=True, env={
                 **os.environ, 'PATH': f'{root}:{os.environ["PATH"]}', 'PROJECT': 'example-project',
                 'STATE_BUCKET': 'example-state', 'DEPLOYMENT_SERVICE_ACCOUNT': 'deployer@example.com',
+                'TF_VAR_policy_reader_service_accounts': '["deployer@example.com", "peer@example.com"]',
                 'GITHUB_ENV': str(root / 'env'), 'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '2',
                 'GITHUB_JOB': 'production-use4', 'RUNNER_TEMP': str(root),
                 'CALLS': str(root / 'calls'), 'FAILURE': failure,

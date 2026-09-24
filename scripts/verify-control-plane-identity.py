@@ -174,6 +174,18 @@ def effective_iam_command(project: str, identity: str, bucket: str) -> list[str]
     )
 
 
+def host_effective_iam_command(project: str, host: str, identity: str) -> list[str]:
+    return gcloud(
+        "asset", "analyze-iam-policy", f"--project={project}",
+        f"--identity=serviceAccount:{host}",
+        f"--full-resource-name=//iam.googleapis.com/projects/{project}/serviceAccounts/{identity}",
+        "--permissions=iam.serviceAccounts.actAs,iam.serviceAccounts.getAccessToken,iam.serviceAccounts.getOpenIdToken",
+        "--analyze-service-account-impersonation", "--expand-groups",
+        "--expand-resources", "--expand-roles", "--output-group-edges",
+        "--output-resource-edges", "--format=json",
+    )
+
+
 def iam_analysis_results(response: str) -> list[object]:
     """Accept results only when the entire IAM analysis was fully explored."""
     try:
@@ -683,28 +695,10 @@ def main() -> int:
             "iam.serviceAccounts.getAccessToken,"
             "iam.serviceAccounts.getOpenIdToken"
         )
-        serving_resource = (
-            f"//iam.googleapis.com/projects/{args.project}/"
-            f"serviceAccounts/{identity}"
-        )
         for index, host in enumerate(host_identities, 1):
             host_effective_json = evidence.command(
                 f"host-effective-iam-{index}",
-                gcloud(
-                    "asset",
-                    "analyze-iam-policy",
-                    f"--project={args.project}",
-                    f"--identity=serviceAccount:{host}",
-                    f"--full-resource-name={serving_resource}",
-                    f"--permissions={impersonation_permissions}",
-                    "--analyze-service-account-impersonation",
-                    "--expand-groups",
-                    "--expand-resources",
-                    "--expand-roles",
-                    "--output-group-edges",
-                    "--output-resource-edges",
-                    "--format=json",
-                ),
+                host_effective_iam_command(args.project, host, identity),
             )
             evidence.index[-1].update(
                 {

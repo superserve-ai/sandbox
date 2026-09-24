@@ -6,6 +6,7 @@ cd "$ROOT_DIR"
 
 terraform_dirs=(
   infra/bootstrap/control-plane-evidence
+  infra/bootstrap/control-plane-policy-visibility
   infra/envs/staging/us-central1
   infra/envs/production/us-central1
   infra/envs/production/us-west2
