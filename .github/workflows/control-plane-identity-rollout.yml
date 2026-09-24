@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: "Type apply to run the staged identity migration"
+        description: "Deploy staging and production: type apply on main, or apply-branch on another branch"
         required: true
         type: string
 
@@ -23,7 +23,7 @@ env:
 jobs:
   bootstrap:
     name: Prepare ${{ matrix.environment }} verification
-    if: ${{ github.ref == 'refs/heads/main' && inputs.confirm == 'apply' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref_type == 'branch' && ((github.ref == 'refs/heads/main' && inputs.confirm == 'apply') || (github.ref != 'refs/heads/main' && inputs.confirm == 'apply-branch')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -161,7 +161,7 @@ jobs:
   staging:
     needs: [prerequisites]
     name: Stage staging/us-central1
-    if: ${{ github.ref == 'refs/heads/main' && inputs.confirm == 'apply' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref_type == 'branch' && ((github.ref == 'refs/heads/main' && inputs.confirm == 'apply') || (github.ref != 'refs/heads/main' && inputs.confirm == 'apply-branch')) }}
     runs-on: ubuntu-latest
     environment: staging
     permissions:
