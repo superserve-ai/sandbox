@@ -169,7 +169,7 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 		return nil, status.Errorf(codes.FailedPrecondition, "vm %s is %v; a saved snapshot needs a running or paused VM", vmID, st)
 	}
 	diskPath := m.instanceDiskPath(inst)
-	unreserve, err := m.savedCaptureHeadroom(kind, st, inst, diskPath)
+	unreserve, err := m.savedCaptureHeadroom(kind, st, inst)
 	if err != nil {
 		return nil, err
 	}
@@ -494,8 +494,8 @@ func (m *Manager) capturePausedSaved(ctx context.Context, inst *VMInstance, tmp,
 		if snapshotPath == "" || memFile == "" {
 			return status.Error(codes.FailedPrecondition, "paused source has no resume image")
 		}
-		if err := cloneOrCopyFile(ctx, snapshotPath, filepath.Join(tmp, "vmstate.snap")); err != nil {
-			return fmt.Errorf("copy vmstate: %w", err)
+		if err := m.cloneSavedFile(ctx, snapshotPath, filepath.Join(tmp, "vmstate.snap")); err != nil {
+			return err
 		}
 		if sidecar := snapshotPath + ".overlay"; fileExists(sidecar) {
 			if err := cloneOrCopyFile(ctx, sidecar, filepath.Join(tmp, "vmstate.snap.overlay")); err != nil {
@@ -517,8 +517,8 @@ func (m *Manager) capturePausedSaved(ctx context.Context, inst *VMInstance, tmp,
 			baseMem = ""
 		}
 		target := filepath.Join(tmp, name)
-		if err := cloneOrCopyFile(ctx, memFile, target); err != nil {
-			return fmt.Errorf("copy memory image: %w", err)
+		if err := m.cloneSavedFile(ctx, memFile, target); err != nil {
+			return err
 		}
 		if p := presence.SidecarPath(memFile); fileExists(p) {
 			if err := cloneOrCopyFile(ctx, p, presence.SidecarPath(target)); err != nil {
@@ -938,28 +938,33 @@ var savedFreeBytes = func(dir string) (int64, error) {
 	return int64(fs.Bavail) * int64(fs.Bsize), nil
 }
 
-// savedCaptureHeadroom refuses a capture the snapshot filesystem cannot hold:
-// a running full memory image is written in full, and a copy may not reflink
-// on this filesystem. The need stays reserved until the returned release
-// runs, so concurrent captures cannot each be admitted against the same
-// free space.
-func (m *Manager) savedCaptureHeadroom(kind SavedSnapshotKind, st VMStatus, inst *VMInstance, diskPath string) (func(), error) {
-	diskBytes, _ := allocatedBytes(diskPath)
-	need := int64(savedCaptureHeadroom) + diskBytes
-	if kind == SavedSnapshotMemFS {
-		inst.mu.RLock()
-		memoryMiB, memFile, snapshotPath := inst.Config.MemoryMiB, inst.MemFilePath, inst.SnapshotPath
-		inst.mu.RUnlock()
-		if st == StatusRunning {
-			// A diff is written raw and then applied onto the image it
-			// joins, so two guest-sized files can exist until the raw one
-			// is removed.
-			need += 2 * int64(memoryMiB) << 20
-		} else {
-			memBytes, _ := allocatedBytes(memFile)
-			stateBytes, _ := allocatedBytes(snapshotPath)
-			need += memBytes + stateBytes
+// cloneSavedFile reflinks a paused source's image into the staging
+// directory or refuses: the image is taken as it is, never copied, so the
+// space check reserves nothing for it.
+func (m *Manager) cloneSavedFile(ctx context.Context, src, dst string) error {
+	if err := m.fileClone()(ctx, src, dst); err != nil {
+		if errors.Is(err, errNoReflink) {
+			return status.Errorf(codes.FailedPrecondition, "saved images need a reflink filesystem under %s: %v", m.cfg.SnapshotDir, err)
 		}
+		return fmt.Errorf("clone %s: %w", filepath.Base(src), err)
+	}
+	return nil
+}
+
+// savedCaptureHeadroom refuses a capture the snapshot filesystem cannot hold.
+// Disk and paused images are reflinked, never copied, so the fixed headroom
+// covers them; only a running memory capture writes bytes. The need stays
+// reserved until the returned release runs, so concurrent captures cannot
+// each be admitted against the same free space.
+func (m *Manager) savedCaptureHeadroom(kind SavedSnapshotKind, st VMStatus, inst *VMInstance) (func(), error) {
+	need := int64(savedCaptureHeadroom)
+	if kind == SavedSnapshotMemFS && st == StatusRunning {
+		inst.mu.RLock()
+		memoryMiB := inst.Config.MemoryMiB
+		inst.mu.RUnlock()
+		// A diff is written raw and then applied onto the image it joins,
+		// so two guest-sized files can exist until the raw one is removed.
+		need += 2 * int64(memoryMiB) << 20
 	}
 	free, err := savedFreeBytes(m.cfg.SnapshotDir)
 	if err != nil {

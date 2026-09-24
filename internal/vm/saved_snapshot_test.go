@@ -806,15 +806,15 @@ func TestSavedCaptureHeadroomIsReservedAcrossCaptures(t *testing.T) {
 	// A running capture reserves twice its memory: one fits in 4 GiB with
 	// the fixed headroom, two do not.
 	inst.Config.MemoryMiB = 1000
-	first, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst, inst.DiskPath)
+	first, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst)
 	if err != nil {
 		t.Fatalf("first capture: %v", err)
 	}
-	if _, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst, inst.DiskPath); status.Code(err) != codes.ResourceExhausted {
+	if _, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst); status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("second capture against the same free space: want ResourceExhausted, got %v", err)
 	}
 	first()
-	second, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst, inst.DiskPath)
+	second, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst)
 	if err != nil {
 		t.Fatalf("capture after the first released: %v", err)
 	}
@@ -1095,5 +1095,25 @@ func TestForkOverALiveVMRefusesWhenTheStopIsNotConfirmed(t *testing.T) {
 	m.mu.RUnlock()
 	if inst == nil || inst.Status != StatusError {
 		t.Fatalf("the id is not parked as error: %+v", inst)
+	}
+}
+
+func TestSavedCaptureHeadroomReservesNothingForReflinkedImages(t *testing.T) {
+	orig := savedFreeBytes
+	t.Cleanup(func() { savedFreeBytes = orig })
+	savedFreeBytes = func(string) (int64, error) { return 300 << 20, nil }
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, false)
+	inst.Config.MemoryMiB = 16384
+	inst.Config.DiskSizeMiB = 102400
+	for _, kind := range []SavedSnapshotKind{SavedSnapshotFS, SavedSnapshotMemFS} {
+		release, err := m.savedCaptureHeadroom(kind, StatusPaused, inst)
+		if err != nil {
+			t.Fatalf("paused %s capture with little free space: %v", kind, err)
+		}
+		release()
+	}
+	if _, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("running memory capture with little free space: want ResourceExhausted, got %v", err)
 	}
 }
