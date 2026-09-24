@@ -1402,7 +1402,7 @@ func TestDeleteSavedSnapshotRefusesEveryLaterCapture(t *testing.T) {
 	}
 }
 
-func TestDeleteSavedSnapshotKeepsTombstonesForADay(t *testing.T) {
+func TestSavedTombstoneReaperKeepsADay(t *testing.T) {
 	m := newSavedTestManager(t)
 	ctx := context.Background()
 	old, recent := uuid.NewString(), uuid.NewString()
@@ -1416,12 +1416,19 @@ func TestDeleteSavedSnapshotKeepsTombstonesForADay(t *testing.T) {
 	if err := os.Chtimes(savedTombstonePath(oldDir), stale, stale); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.DeleteSavedSnapshot(ctx, uuid.NewString()); err != nil {
-		t.Fatal(err)
+	rctx, cancel := context.WithCancel(ctx)
+	m.RunSavedTombstoneReaper(rctx)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(savedTombstonePath(oldDir)); errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("a tombstone older than a day was kept")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if _, err := os.Stat(savedTombstonePath(oldDir)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("a tombstone older than a day was kept: %v", err)
-	}
+	cancel()
 	recentDir, _ := m.savedSnapshotDir(recent)
 	if _, err := os.Stat(savedTombstonePath(recentDir)); err != nil {
 		t.Fatalf("a fresh tombstone was reaped: %v", err)

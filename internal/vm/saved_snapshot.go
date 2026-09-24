@@ -34,12 +34,13 @@ const (
 	// Deleted ids, one empty file each, kept for a day: a capture for one is
 	// refused while its file is there, and a retry of the capture can arrive
 	// no later than its own deadline after the delete, minutes.
-	savedTombstonesDirName = ".deleted"
-	savedTombstoneTTL      = 24 * time.Hour
-	savedSnapshotVersion   = 1
-	defaultSavedCaptures   = 2
-	savedCaptureHeadroom   = 256 << 20
-	savedUnpauseAttempts   = 3
+	savedTombstonesDirName     = ".deleted"
+	savedTombstoneTTL          = 24 * time.Hour
+	savedTombstoneReapInterval = time.Hour
+	savedSnapshotVersion       = 1
+	defaultSavedCaptures       = 2
+	savedCaptureHeadroom       = 256 << 20
+	savedUnpauseAttempts       = 3
 	// A capture's budget: a base for the request itself, plus the time a
 	// full memory image takes at the slowest write rate the capture waits
 	// for before it treats Firecracker as stuck.
@@ -296,7 +297,6 @@ func (m *Manager) DeleteSavedSnapshot(ctx context.Context, snapshotID string) er
 	if err := writeSavedTombstone(dir); err != nil {
 		return fmt.Errorf("record saved snapshot deletion: %w", err)
 	}
-	reapSavedTombstones(filepath.Dir(savedTombstonePath(dir)), time.Now().Add(-savedTombstoneTTL))
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("remove saved snapshot: %w", err)
 	}
@@ -723,6 +723,28 @@ func writeSavedTombstone(dir string) error {
 	return fsyncDir(filepath.Dir(path))
 }
 
+// RunSavedTombstoneReaper drops tombstones past their day, once now and then
+// hourly, until ctx ends. Off every request: the collection grows with the
+// host's churn, not with what is live, so no delete pays to walk it.
+func (m *Manager) RunSavedTombstoneReaper(ctx context.Context) {
+	if m.cfg.SnapshotDir == "" {
+		return
+	}
+	tombs := filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, savedTombstonesDirName)
+	go func() {
+		ticker := time.NewTicker(savedTombstoneReapInterval)
+		defer ticker.Stop()
+		for {
+			reapSavedTombstones(tombs, time.Now().Add(-savedTombstoneTTL))
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
 func reapSavedTombstones(tombs string, before time.Time) {
 	entries, err := os.ReadDir(tombs)
 	if err != nil {
@@ -788,7 +810,6 @@ func (m *Manager) SweepSavedSnapshotStaging(log zerolog.Logger) <-chan struct{} 
 			return
 		}
 		start := time.Now()
-		reapSavedTombstones(filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, savedTombstonesDirName), start.Add(-savedTombstoneTTL))
 		stale, _ := filepath.Glob(filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName, ".*.tmp-*"))
 		n := 0
 		for _, d := range stale {
