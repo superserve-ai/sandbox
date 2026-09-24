@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -119,6 +120,12 @@ func parseSnapshotID(c *gin.Context) (uuid.UUID, error) {
 	return id, nil
 }
 
+// withinChars is the row constraint's measure: characters, not bytes.
+func withinChars(s string, limit int) bool {
+	n := utf8.RuneCountInString(s)
+	return n >= 1 && n <= limit
+}
+
 func isSnapshotLimitErr(err error, code string) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == code
@@ -152,11 +159,11 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", fmt.Sprintf("kind must be %q or %q", snapshotKindFS, snapshotKindMemFS), http.StatusBadRequest)
 		return
 	}
-	if body.Name != nil && (len(*body.Name) < 1 || len(*body.Name) > 64) {
+	if body.Name != nil && !withinChars(*body.Name, 64) {
 		respondErrorMsg(c, "bad_request", "name must be 1 to 64 characters", http.StatusBadRequest)
 		return
 	}
-	if body.IdempotencyKey != nil && (len(*body.IdempotencyKey) < 1 || len(*body.IdempotencyKey) > 255) {
+	if body.IdempotencyKey != nil && !withinChars(*body.IdempotencyKey, 255) {
 		respondErrorMsg(c, "bad_request", "idempotency_key must be 1 to 255 characters", http.StatusBadRequest)
 		return
 	}
@@ -503,7 +510,7 @@ func (h *Handlers) PatchSnapshot(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "name is required", http.StatusBadRequest)
 		return
 	}
-	if len(*body.Name) < 1 || len(*body.Name) > 64 {
+	if !withinChars(*body.Name, 64) {
 		respondErrorMsg(c, "bad_request", "name must be 1 to 64 characters", http.StatusBadRequest)
 		return
 	}
@@ -684,7 +691,21 @@ func (h *Handlers) sweepHost(ctx context.Context, hostID string, logger zerolog.
 	}
 }
 
-func (h *Handlers) sweepSnapshot(ctx context.Context, row db.SandboxSnapshot, logger zerolog.Logger) {
+func (h *Handlers) sweepSnapshot(ctx context.Context, claimed db.SandboxSnapshot, logger zerolog.Logger) {
+	// Read again now: the row waited its turn behind the host's other rows,
+	// and may have been settled or deleted meanwhile. Whatever the host is
+	// asked from here is bounded by the call's own deadline, well within
+	// the day a deleted id stays refused.
+	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	row, err := h.DB.GetSandboxSnapshotUnscoped(qctx, claimed.ID)
+	cancel()
+	if err != nil {
+		logger.Warn().Err(err).Msg("snapshot sweep: row read")
+		return
+	}
+	if row.Status != claimed.Status || row.DeletedAt.Valid {
+		return
+	}
 	unsettled := logger.Warn
 	if row.Status == "creating" && time.Since(row.CreatedAt) > snapshotSweepStuckAge {
 		unsettled = logger.Error

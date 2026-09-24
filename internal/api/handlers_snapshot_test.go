@@ -514,6 +514,18 @@ func TestPatchSnapshotRenames(t *testing.T) {
 	if w.Code != http.StatusOK || parseJSON(t, w)["name"] != "golden" {
 		t.Fatalf("rename: status=%d body=%s", w.Code, w.Body.String())
 	}
+	// The limit is 64 characters, as the row's is, not 64 bytes.
+	wide := strings.Repeat("é", 64)
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, jsonReq(http.MethodPatch, "/snapshots/"+row.ID.String(), map[string]any{"name": wide}))
+	if w.Code != http.StatusOK || parseJSON(t, w)["name"] != wide {
+		t.Fatalf("64 two-byte characters: status=%d body=%s", w.Code, w.Body.String())
+	}
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, jsonReq(http.MethodPatch, "/snapshots/"+row.ID.String(), map[string]any{"name": wide + "é"}))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("65 characters: status=%d", w.Code)
+	}
 }
 
 func TestListSandboxSnapshotsReturnsNewestFirstWithTotal(t *testing.T) {
@@ -545,12 +557,18 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 	gone := snapshotFixture(teamID, sandboxID, "creating")
 	lost := snapshotFixture(teamID, sandboxID, "creating")
 	deleting := snapshotFixture(teamID, sandboxID, "deleting")
+	// Settled by another replica while it waited its turn.
+	settled := snapshotFixture(teamID, sandboxID, "creating")
+	now := map[uuid.UUID]db.SandboxSnapshot{committed.ID: committed, gone.ID: gone, lost.ID: lost, deleting.ID: deleting}
+	settledNow := settled
+	settledNow.Status = "ready"
+	now[settled.ID] = settledNow
 	var readied, failed, deleted []uuid.UUID
 	var mu sync.Mutex
 	mock := &mockDBTX{
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			if strings.Contains(sql, "-- name: ClaimStuckSandboxSnapshots :many") {
-				return &scriptedRows{rows: []*mockRow{sandboxSnapshotRow(committed), sandboxSnapshotRow(gone), sandboxSnapshotRow(lost), sandboxSnapshotRow(deleting)}}, nil
+				return &scriptedRows{rows: []*mockRow{sandboxSnapshotRow(committed), sandboxSnapshotRow(gone), sandboxSnapshotRow(lost), sandboxSnapshotRow(deleting), sandboxSnapshotRow(settled)}}, nil
 			}
 			return nil, fmt.Errorf("unexpected query: %s", sql)
 		},
@@ -558,6 +576,8 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			switch {
+			case strings.Contains(sql, "-- name: GetSandboxSnapshotUnscoped :one"):
+				return sandboxSnapshotRow(now[args[0].(uuid.UUID)])
 			case strings.Contains(sql, "-- name: MarkSandboxSnapshotReady :one"):
 				id := args[len(args)-1].(uuid.UUID)
 				readied = append(readied, id)
@@ -588,6 +608,8 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 				return vmdclient.SavedSnapshot{}, status.Error(codes.NotFound, "vm gone")
 			case lost.ID.String():
 				return vmdclient.SavedSnapshot{}, status.Error(codes.Unavailable, "host restarting")
+			case settled.ID.String():
+				t.Error("the host was asked for a row that was no longer creating")
 			}
 			return vmdclient.SavedSnapshot{Kind: kind, DiskPath: "/saved/x/overlay.ext4", SnapshotPath: "/saved/x/vmstate.snap", MemPath: "/saved/x/mem.diff", SizeBytes: 1}, nil
 		},
@@ -640,6 +662,15 @@ func TestSnapshotSweepNeverWaitsOnAHost(t *testing.T) {
 				return &scriptedRows{rows: rows}, nil
 			}
 			return nil, fmt.Errorf("unexpected query: %s", sql)
+		},
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			if strings.Contains(sql, "-- name: GetSandboxSnapshotUnscoped :one") {
+				if args[0].(uuid.UUID) == stuck.ID {
+					return sandboxSnapshotRow(stuck)
+				}
+				return sandboxSnapshotRow(other)
+			}
+			return errRow(fmt.Errorf("unexpected query: %s", sql))
 		},
 		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
 			return pgconn.NewCommandTag("UPDATE 1"), nil
