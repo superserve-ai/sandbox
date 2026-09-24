@@ -48,7 +48,7 @@ locals {
     application        = "sandbox-host"
   })
 
-  staging_otlp_endpoint = "http://10.0.0.2:4318"
+  staging_otlp_endpoint = format("http://%s:4318", module.sandbox_host_b.internal_ip)
 
   # Admit only the two staging VMD host addresses to the dedicated peer
   # listener. Keep these selectors peer-only as additional hosts are added.
@@ -207,7 +207,8 @@ module "api" {
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
     SUPABASE_URL                = var.supabase_url
-    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host.internal_ip)
+    DEFAULT_HOST_ID             = var.build_host_id
+    VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host_b.internal_ip)
     STRIPE_API_BASE_URL         = "https://api.stripe.com"
     STRIPE_CHECKOUT_PRICE_IDS   = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
     STRIPE_API_VERSION          = "2026-05-27.dahlia"
@@ -596,9 +597,9 @@ module "observability" {
   # validates the queries before they matter. The disabled-host alert
   # stays off here: staging toggles BACKUP_BUCKET deliberately.
   backup_alerts = {
-    collector_host_id   = module.sandbox_host.instance_name
-    host_id             = module.sandbox_host.instance_name
-    display_prefix      = "Backup / ${module.sandbox_host.instance_name}"
+    collector_host_id   = module.sandbox_host_b.instance_name
+    host_id             = var.build_host_id
+    display_prefix      = "Backup / ${module.sandbox_host_b.instance_name}"
     alert_disabled_host = false
   }
   # Backup coverage, same disabled-by-default shape as the production
@@ -615,8 +616,8 @@ module "observability" {
   # cells so staging validates the query shape first. Module defaults:
   # warn at 85% sustained 30 minutes, page at 95%.
   host_disk_alerts = {
-    host_id        = module.sandbox_host.instance_name
-    display_prefix = "Infrastructure / ${module.sandbox_host.instance_name}"
+    host_id        = module.sandbox_host_b.instance_name
+    display_prefix = "Infrastructure / ${module.sandbox_host_b.instance_name}"
   }
   dashboards = {
     sandbox_operations = {

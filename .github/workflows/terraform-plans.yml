@@ -148,7 +148,7 @@ jobs:
           terraform validate
 
           set +e
-          terraform plan -input=false -no-color -detailed-exitcode -out=tfplan
+          terraform plan -input=false -lock-timeout=5m -no-color -detailed-exitcode -out=tfplan
           plan_status=$?
           set -e
 
