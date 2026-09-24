@@ -611,6 +611,34 @@ type HostRetiredIncarnation struct {
 	SuccessorIncarnationID uuid.UUID `json:"successor_incarnation_id"`
 }
 
+type HostStorageReport struct {
+	HostID               string             `json:"host_id"`
+	IncarnationID        uuid.UUID          `json:"incarnation_id"`
+	ReportID             uuid.UUID          `json:"report_id"`
+	IngestSeq            int64              `json:"ingest_seq"`
+	ReceivedAt           time.Time          `json:"received_at"`
+	Payload              []byte             `json:"payload"`
+	State                string             `json:"state"`
+	Attempts             int32              `json:"attempts"`
+	NextMeasurementIndex int32              `json:"next_measurement_index"`
+	NextAttemptAt        time.Time          `json:"next_attempt_at"`
+	LastError            *string            `json:"last_error"`
+	ProcessedAt          pgtype.Timestamptz `json:"processed_at"`
+	PayloadHash          string             `json:"payload_hash"`
+	ProcessingGeneration int64              `json:"processing_generation"`
+}
+
+type LegacyHostStorageReport struct {
+	HostID                 string      `json:"host_id"`
+	RequestedIncarnationID pgtype.UUID `json:"requested_incarnation_id"`
+	ReportID               uuid.UUID   `json:"report_id"`
+	ReceivedAt             time.Time   `json:"received_at"`
+	Payload                []byte      `json:"payload"`
+	Attempts               int32       `json:"attempts"`
+	NextAttemptAt          time.Time   `json:"next_attempt_at"`
+	LastError              *string     `json:"last_error"`
+}
+
 type NetFlow struct {
 	ID         int64      `json:"id"`
 	Ts         time.Time  `json:"ts"`

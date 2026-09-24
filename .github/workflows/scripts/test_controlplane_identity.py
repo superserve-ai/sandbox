@@ -76,6 +76,19 @@ class ControlplaneIdentityTest(unittest.TestCase):
                     self.assertNotIn('controlplane_runtime', host)
                     self.assertNotIn('OPERATOR_API_TOKEN', host)
 
+    def test_production_permission_probes_include_cell_operator_secret(self):
+        for workflow in ('deploy-api.yml', 'terraform-cd.yml'):
+            source = (ROOT / '.github/workflows' / workflow).read_text()
+            probes = source.split('bash scripts/verify-control-plane-kms.sh')[1:]
+            self.assertEqual(len(probes), 2, workflow)
+            for probe in probes:
+                command = probe.split('\n\n', 1)[0]
+                cell = re.search(r'control-plane-kms/(use4|usw2)"', command).group(1)
+                with self.subTest(workflow=workflow, cell=cell):
+                    self.assertIn(f'--secret operator-api-token-{cell} ', command)
+                    other = 'usw2' if cell == 'use4' else 'use4'
+                    self.assertNotIn(f'--secret operator-api-token-{other} ', command)
+
     def test_cd_policy_management_is_scoped_to_credentials_key(self):
         source = (ROOT / 'infra/envs/production/us-central1/cd-credentials-key-iam.tf').read_text()
         binding = re.search(r'resource "google_project_iam_member" "cd_credentials_key_iam" \{(.*?)\n\}', source, re.S)

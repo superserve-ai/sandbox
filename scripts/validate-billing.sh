@@ -21,7 +21,14 @@ suite() {
 suite billing-unit-race go test -v -race -short -count=1 ./internal/billing ./internal/api
 suite billing-migrations go test -v -tags integration -count=1 -run '^$' ./internal/integration
 suite R16-billing-worker-load-race go test -v -race -tags integration -count=1 -timeout 5m -run '^TestIntegration_IncrementalWorkerLoad$' ./internal/api
-suite billing-integration-race go test -v -race -tags integration -count=1 -timeout 10m -run 'Billing|Incremental' ./internal/integration
+suite storage-report-lease-race go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_StorageReport(Lease|Reclaim|ChunkTimeout)' ./internal/api
+suite storage-settlement-fence-race go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_Storage(ReceiptFence|Settlement)' ./internal/billing
+if [[ "$(go env GOOS)" == "linux" ]]; then
+  suite storage-report-refresh-race go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_StorageReportPeriodicRefresh$' ./internal/vm
+else
+  echo "SKIP: storage-report-refresh-race (requires Linux)"
+fi
+suite billing-integration-race go test -v -race -tags integration -count=1 -timeout 10m -run 'Billing|Incremental|StorageReportReceiptFencesSettlement' ./internal/integration
 
 # Generate into a temporary directory so a failed drift check preserves the tree.
 sqlc_dir="$(mktemp -d)"

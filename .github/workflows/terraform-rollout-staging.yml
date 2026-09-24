@@ -1,5 +1,12 @@
 name: Terraform Rollout Staging
 
+# Serialize manual infrastructure applies with API deployments and the
+# staged control-plane identity migration.
+concurrency:
+  group: control-plane-deploy
+  queue: max
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -106,6 +113,7 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell staging
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
           terraform apply -input=false -auto-approve tfplan
 

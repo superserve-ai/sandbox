@@ -232,6 +232,17 @@ type CapacityShadow struct {
 	Refresh bool
 }
 
+// StorageReportFailure is emitted by the asynchronous storage worker. It is
+// deliberately host-free so the metric remains low cardinality; host_id is
+// carried by the structured error log instead.
+type StorageReportFailure struct {
+	Result string
+}
+
+type StorageReportFailureRecorder interface {
+	RecordStorageReportFailure(context.Context, StorageReportFailure)
+}
+
 // Recorder is the operational metrics boundary. Implementations should emit
 // OpenTelemetry metrics through a collector; callers should not write ad hoc
 // operational metrics into Postgres.
@@ -282,6 +293,7 @@ func (noopRecorder) RecordTeardownBacklog(context.Context, TeardownBacklog)     
 func (noopRecorder) RecordLatencyPhase(context.Context, LatencyPhase)                       {}
 func (noopRecorder) RecordPeerIngress(context.Context, PeerIngress)                         {}
 func (noopRecorder) RecordPeerEvent(context.Context, PeerEvent)                             {}
+func (noopRecorder) RecordStorageReportFailure(context.Context, StorageReportFailure)       {}
 
 func (noopRecorder) RecordRoutingOutcome(context.Context, RoutingOutcome) {}
 

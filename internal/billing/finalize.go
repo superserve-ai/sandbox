@@ -20,6 +20,12 @@ import (
 const finalizedCreditLedgerReason = "billing period finalization credit application"
 const billingMoneyScale = 6
 
+// ErrStorageReportsIncomplete is returned while an accepted storage report
+// for the billing window has not reached durable processed state. Finalization
+// must remain retryable until the report stream's completeness watermark is
+// advanced by the storage worker.
+var ErrStorageReportsIncomplete = errors.New("storage reports are incomplete for billing period")
+
 const (
 	defaultBillingFinalizationPollInterval = 1 * time.Minute
 	defaultBillingFinalizationBatchSize    = 25
@@ -61,7 +67,9 @@ func FinalizeTeamBillingPeriodWithCredits(
 	periodStart time.Time,
 	periodEnd time.Time,
 ) (FinalizeTeamBillingPeriodResult, error) {
-	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+	ctx, cancel := context.WithTimeout(ctx, StorageReportSettlementTimeout)
+	defer cancel()
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return FinalizeTeamBillingPeriodResult{}, err
 	}
@@ -95,6 +103,19 @@ func FinalizeTeamBillingPeriodWithCredits(
 	}
 	if period.Status != "exported" {
 		return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("billing period must be exported before finalization: status=%s", period.Status)
+	}
+	if err := CheckStorageSettlementBoundary(ctx, tx, periodEnd); err != nil {
+		return FinalizeTeamBillingPeriodResult{}, err
+	}
+	if err := FenceStorageReportReceipts(ctx, tx, teamID); err != nil {
+		return FinalizeTeamBillingPeriodResult{}, err
+	}
+	complete, err := storageReportsCompleteThrough(ctx, tx, teamID, periodEnd)
+	if err != nil {
+		return FinalizeTeamBillingPeriodResult{}, fmt.Errorf("check storage report completeness: %w", err)
+	}
+	if !complete {
+		return FinalizeTeamBillingPeriodResult{}, ErrStorageReportsIncomplete
 	}
 
 	usage, err := lockBillingUsageForFinalization(ctx, tx, teamID, periodStart, periodEnd)
@@ -658,6 +679,18 @@ func lockBillingUsageForFinalization(ctx context.Context, tx pgx.Tx, teamID uuid
 		return db.TeamBillingUsage{}, err
 	}
 	return usage, nil
+}
+
+type storageReportsQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func storageReportsCompleteThrough(ctx context.Context, tx storageReportsQuerier, teamID uuid.UUID, boundary time.Time) (bool, error) {
+	var complete bool
+	if err := tx.QueryRow(ctx, `SELECT storage_reports_complete_through($1, $2)`, teamID, boundary).Scan(&complete); err != nil {
+		return false, err
+	}
+	return complete, nil
 }
 
 type activeCreditGrant struct {

@@ -93,7 +93,11 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	os.Exit(m.Run())
+	workerCtx, stopStorageWorker := context.WithCancel(context.Background())
+	api.StartStorageReportWorker(workerCtx, testPool)
+	code := m.Run()
+	stopStorageWorker()
+	os.Exit(code)
 }
 
 func resetTestSchema(ctx context.Context, pool *pgxpool.Pool) error {
@@ -1420,7 +1424,10 @@ func assertFloatBetween(t *testing.T, got, min, max float64) {
 	t.Helper()
 	// Billing usage is measured by PostgreSQL while the bounds use the
 	// application clock; allow a small cross-process clock/scheduling skew.
-	const epsilon = 0.0000001
+	// CI can run the database and application on hosts whose clocks differ by
+	// a few tens of milliseconds; at the rates used here that is still only a
+	// fraction of a micro-dollar.
+	const epsilon = 0.000001
 	if got < min-epsilon || got > max+epsilon {
 		t.Fatalf("got %v, want between %v and %v", got, min, max)
 	}
