@@ -1,575 +1,215 @@
 import importlib.util
-import io
 import json
 import os
 import re
-import subprocess
-import unittest
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+import subprocess
+import tempfile
+import unittest
 from unittest.mock import patch
 
-
-SPEC = importlib.util.spec_from_file_location(
-    "deploy_proxy", Path(__file__).with_name("deploy-proxy.py")
-)
+SPEC = importlib.util.spec_from_file_location('deploy_proxy', Path(__file__).with_name('deploy-proxy.py'))
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-SOURCE = Path(__file__).with_name("deploy-proxy.py").read_text()
-
-
-class DeployProxyOrderingTest(unittest.TestCase):
-    def test_ssh_key_created_before_parallel_fanout(self):
-        # Per-host deploys run in parallel, and gcloud generates the runner's
-        # SSH key on first use. Two hosts starting together race ssh-keygen and
-        # one fails before uploading anything, so the key must exist before
-        # the pool starts.
-        keygen = SOURCE.find('"ssh-keygen", "-q"')
-        pool = SOURCE.find("ThreadPoolExecutor(max_workers=len(instances))")
-        self.assertNotEqual(keygen, -1)
-        self.assertNotEqual(pool, -1)
-        self.assertLess(keygen, pool)
-
-
 class DeployProxyTests(unittest.TestCase):
-    def test_discovery_failure_surfaces_stderr_and_stops_deployment(self):
-        env = {
-            "GCP_PROJECT": "example-project", "SHA": "12345678",
-            "GCP_REGION": "us-central1",
-            "PROXY_DOMAIN": "sandbox.example.test",
-        }
-        diagnostic = "ERROR: permission denied while listing instances\n"
-        result = subprocess.CompletedProcess([], 1, "example-host,us-central1-a\n", diagnostic)
-        stderr = io.StringIO()
-        with patch.dict(os.environ, env, clear=True), patch.object(
-            MODULE.subprocess, "run", return_value=result
-        ) as run, patch.object(MODULE.sys, "stderr", stderr):
-            self.assertEqual(MODULE.main(), 1)
-        self.assertIn(diagnostic, stderr.getvalue())
-        self.assertIn("gcloud instance discovery failed (exit 1)", stderr.getvalue())
-        self.assertEqual(run.call_count, 1, "discovery failure must not contact any host")
-        self.assertEqual(run.call_args.args[0][:4], ["gcloud", "compute", "instances", "list"])
-        self.assertFalse(run.call_args.kwargs.get("check", False))
-
-    def generate_script(self, peer_addr, identity="spiffe://example.test/peer", required_identity=True, expected_result=0, database_url="postgres://postgres:postgres@localhost/sandbox_test", routing="", zone="us-central1-a", expected_standby="", standby=False):
-        scripts = []
-
+    def deploy(self, manifests=None, **overrides):
+        env = dict(GCP_PROJECT='example-project',GCP_REGION='us-central1',SHA='12345678',
+                   PROXY_DOMAIN='sandbox.example.test',PROXY_ROLLOUT_ID='run-1')
+        env.update(overrides)
+        self.commands,self.requests,self.manifests = [],[],[]
         def run(args, **kwargs):
-            output = ""
-            if args[:4] == ["gcloud", "compute", "instances", "list"]:
-                output = f"example-host,{zone}" + (",RUNNING" if standby or expected_standby else "") + "\n"
-            elif args[:3] == ["gcloud", "compute", "ssh"]:
-                scripts.append(args[args.index("--command") + 1])
-            elif args[:2] == ["ssh-keygen", "-q"]:
-                pass
-            elif args[:3] != ["gcloud", "compute", "scp"]:
-                raise AssertionError(f"unexpected command: {args}")
-            return subprocess.CompletedProcess(args, 0, output, "")
+            self.commands.append(args)
+            if args[:4] == ['gcloud','compute','instances','list']:
+                return subprocess.CompletedProcess(
+                    args, 0, env.get('DISCOVERED_INSTANCES', 'example-host,us-central1-a\n'), '')
+            if args[:3] == ['gcloud','compute','scp'] and args[3].endswith('request.json'):
+                self.requests.append(json.loads(Path(args[3]).read_text()))
+            if args[:3] == ['gcloud','compute','scp'] and args[3].endswith('manifest.json'):
+                self.manifests.append(json.loads(Path(args[3]).read_text()))
+            return subprocess.CompletedProcess(args,0,'','')
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,env,clear=True), \
+             patch.object(MODULE.subprocess,'run',side_effect=run), \
+             patch.object(MODULE.os.path,'expanduser',return_value=directory+'/ssh-key'):
+            manifest_file = Path(directory) / 'manifests.json'
+            manifest_file.write_text(json.dumps(manifests if manifests is not None else {
+                'example-cell': dict(project='example-project',instance='example-host',
+                                     zone='us-central1-a',ip='192.0.2.10',
+                                     migration_complete=True,
+                                     routes=[dict(name='public-http', backend='public-backend'),
+                                             dict(name='redirect', backend='redirect-backend')],
+                                     frontend_backend_references={
+                                         'public-http': ['public-backend'],
+                                         'redirect': ['redirect-backend'],
+                                     })}))
+            os.environ['PROXY_ROLLOUT_MANIFESTS'] = str(manifest_file)
+            return MODULE.main()
 
-        env = {
-            "GCP_PROJECT": "example-project",
-            "GCP_REGION": zone.rsplit("/", 1)[-1].rsplit("-", 1)[0],
-            "SHA": "12345678",
-            "PROXY_DATABASE_URL": database_url,
-            "PEER_ROUTING_ENABLED": routing,
-            "PROXY_DOMAIN": "sandbox.example.test",
-            "PEER_PROXY_LISTEN_ADDR": peer_addr,
-            "PEER_IDENTITY_HOSTS": "example-host" if required_identity else "",
-            "EXPECTED_STANDBY_HOST": expected_standby,
-            "PEER_PROXY_SPIFFE_URI": identity,
-            "PEER_PROXY_CERT_FILE": "/etc/peer/cert.pem",
-            "PEER_PROXY_KEY_FILE": "/etc/peer/key.pem",
-            "PEER_PROXY_CA_FILE": "/etc/peer/ca.pem",
-        }
-        if standby:
-            env["EXPECTED_STANDBY_HOST"] = "example-host"
-        with tempfile.TemporaryDirectory() as runner_dir, patch.dict(os.environ, env, clear=True), patch.object(
-            MODULE.subprocess, "run", side_effect=run
-        ), patch.object(MODULE.os.path, "expanduser", return_value=str(Path(runner_dir) / "google_compute_engine")):
-            self.assertEqual(MODULE.main(), expected_result)
-        if expected_result:
-            self.assertEqual(scripts, [])
-            return ""
-        self.assertEqual(len(scripts), 1)
-        self.assertIn("PEER_PROXY_TARGET_ADDR=127.0.0.1:5010\n", scripts[0])
-        return scripts[0]
+    def test_standby_reuses_cell_routes_with_discovered_host_identity(self):
+        serving = dict(project='example-project', instance='example-serving', zone='us-central1-a',
+                       ip='192.0.2.10', serving_host=dict(project='example-project',
+                       instance='example-serving', zone='us-central1-a', ip='192.0.2.10'),
+                       migration_complete=True,
+                       routes=[dict(name='public-http', backend='public-backend')],
+                       frontend_backend_references={'public-http': ['public-backend']})
+        self.assertEqual(self.deploy(
+            manifests={'cell': serving}, DEPLOY_TARGET='standby',
+            EXPECTED_STANDBY_HOST='example-standby',
+            DISCOVERED_INSTANCES='example-standby,us-central1-a,RUNNING,192.0.2.11\n'), 0)
+        self.assertEqual(self.manifests[0]['instance'], 'example-standby')
+        self.assertEqual(self.manifests[0]['ip'], '192.0.2.11')
+        self.assertEqual(self.manifests[0]['routes'], serving['routes'])
+        self.assertEqual(self.requests[0]['target'], 'standby')
 
-    def test_standby_uses_identical_install_and_peer_configuration(self):
-        self.assertEqual(self.generate_script("", standby=True), self.generate_script(""))
+    def test_standby_does_not_require_serving_frontend_adoption(self):
+        manifest = dict(project='example-project', instance='example-serving', zone='us-central1-a',
+                        ip='192.0.2.10', routes=[dict(name='public-http', backend='public-backend')])
+        self.assertEqual(self.deploy(
+            manifests={'cell': manifest}, DEPLOY_TARGET='standby',
+            EXPECTED_STANDBY_HOST='example-standby',
+            DISCOVERED_INSTANCES='example-standby,us-central1-a,RUNNING,192.0.2.11\n'), 0)
 
-    def test_normal_and_redirect_ports_remain_reserved(self):
-        service = (Path(__file__).parents[3] / "deploy/proxy.service").read_text()
-        self.assertIn("Environment=PROXY_ADDR=:5007\n", service)
-        self.assertIn("Environment=PROXY_REDIRECT_ADDR=:5008\n", service)
-        # systemd holds the same ports for the proxy across restarts.
-        socket = (Path(__file__).parents[3] / "deploy/proxy.socket").read_text()
-        self.assertIn("ListenStream=5007\n", socket)
-        self.assertIn("ListenStream=5008\n", socket)
-        self.assertIn("Requires=proxy.socket\n", service)
+    def test_immutable_upload_invokes_host_controller_without_vmd_mutation(self):
+        self.assertEqual(self.deploy(),0)
+        commands = [c[-1] for c in self.commands if c[:3] == ['gcloud','compute','ssh']]
+        self.assertEqual(len(commands),2)
+        self.assertIn('--request',commands[-1])
+        self.assertIn('sudo python3',commands[-1])
+        self.assertNotIn('vmd.env',commands[-1])
+        self.assertNotIn('restart',commands[-1])
+        self.assertEqual(self.requests[0]['rollout'],'run-1')
+        self.assertEqual(self.requests[0]['target'], 'serving')
+        self.assertEqual(self.requests[0]['env']['HOST_REGION'],'us-central1')
 
-    def test_every_proxy_service_installer_also_installs_the_socket(self):
-        # The service Requires= the socket unit; an installer that ships one
-        # without the other leaves a proxy that cannot start.
-        repo = Path(__file__).parents[3]
-        installers = [p for p in list(repo.glob("deploy/**/*")) + list(repo.glob(".github/**/*"))
-                      if p.is_file() and p.suffix in (".py", ".sh") and "test_" not in p.name
-                      and "/etc/systemd/system/proxy.service" in p.read_text()]
-        self.assertTrue(installers)
-        for installer in installers:
-            with self.subTest(installer=str(installer.relative_to(repo))):
-                self.assertIn("/etc/systemd/system/proxy.socket", installer.read_text())
+    def test_bootstrap_uploads_manifest_and_immutable_generation_request(self):
+        manifest = dict(project='example-project',instance='example-host',zone='us-central1-a',
+                        ip='192.0.2.10',migration_complete=False,routes=[])
+        self.assertEqual(self.deploy(manifests={'cell':manifest}, PROXY_OPERATION='bootstrap'),0)
+        self.assertEqual(self.manifests,[manifest])
+        remote = self.commands[-1][-1]
+        self.assertIn('--manifest',remote)
+        self.assertIn('--bootstrap',remote)
+        self.assertIn('--request',remote)
 
-    def test_socket_unit_is_installed_and_bound_before_the_service_restarts(self):
-        script = self.generate_script("")
-        self.assertIn("sudo mv /tmp/proxy.socket /etc/systemd/system/proxy.socket", script)
-        self.assertIn("sudo systemctl enable proxy proxy.socket", script)
-        # A changed unit is bound again, not just reloaded; a rollback binds the restored one.
-        self.assertIn("sudo cmp -s /tmp/proxy.socket /etc/systemd/system/proxy.socket", script)
-        rollback = script.index("rollback_peer_advertisement() {")
-        restored = script.index('if ! sudo test -f "$rollback_dir/proxy.socket"; then', rollback)
-        self.assertIn("sudo systemctl start proxy.socket || return 1", script[restored:restored + 600])
-        self.assertIn('if [ "$socket_changed" -eq 1 ] || ! sudo systemctl is-active --quiet proxy.socket; then', script)
-        bind = script.index("sudo systemctl start proxy.socket")
-        restart = script.index("if ! sudo systemctl restart proxy; then", bind)
-        self.assertLess(bind, restart)
+    def test_standby_rejects_serving_bootstrap_operation(self):
+        self.assertEqual(self.deploy(
+            DEPLOY_TARGET='standby', PROXY_OPERATION='bootstrap',
+            EXPECTED_STANDBY_HOST='example-host',
+            DISCOVERED_INSTANCES='example-host,us-central1-a,RUNNING,192.0.2.10\n'), 1)
+        self.assertEqual(len(self.commands), 1)
 
-    def test_standby_pins_host_without_overriding_bootstrap_policy(self):
-        script = self.generate_script("", routing="0", expected_standby="example-host")
-        self.assertIn('elif [ "1" -eq 1 ]; then', script)
-        self.generate_script("", expected_standby="other-host", expected_result=1)
-        legacy = self.generate_script("", expected_standby="example-host", required_identity=False)
-        self.assertIn('elif [ "0" -eq 1 ]; then', legacy)
-        self.assertIn("restore the legacy proxy.env or bootstrap host identity", legacy)
+    def test_replacement_ci_run_preserves_explicit_retry_identity(self):
+        self.assertEqual(self.deploy(GITHUB_RUN_ID='replacement-run'), 0)
+        self.assertEqual(self.requests[0]['rollout'], 'run-1')
 
-    def test_standby_rejects_extra_discovered_hosts_before_upload(self):
-        env = {
-            "GCP_PROJECT": "example-project", "SHA": "12345678",
-            "PROXY_DOMAIN": "sandbox.example.test", "GCP_REGION": "us-central1",
-            "VMD_LABEL": "component=example-standby",
-            "PEER_IDENTITY_HOSTS": "example-host", "EXPECTED_STANDBY_HOST": "example-host",
-        }
-        result = subprocess.CompletedProcess([], 0, "example-host,us-central1-a\nother-host,us-central1-b\n", "")
-        with patch.dict(os.environ, env, clear=True), patch.object(MODULE.subprocess, "run", return_value=result) as run:
-            self.assertEqual(MODULE.main(), 1)
-        self.assertEqual(run.call_count, 1)
-        self.assertEqual(run.call_args.args[0][:4], ["gcloud", "compute", "instances", "list"])
+    def test_new_ci_run_defaults_to_its_run_identity(self):
+        self.assertEqual(self.deploy(GITHUB_RUN_ID='new-run', PROXY_ROLLOUT_ID=''), 0)
+        self.assertEqual(self.requests[0]['rollout'], 'new-run')
 
-    def test_production_standby_steps_enable_private_ingress(self):
-        workflow = Path(__file__).parents[1].joinpath("deploy-proxy.yml").read_text()
-        production = workflow.split("  deploy-production:", 1)[1]
-        steps = re.split(r"^      - name: ", production, flags=re.MULTILINE)
-        deployments = [step for step in steps if "python3 .github/workflows/scripts/deploy-proxy.py" in step]
-        self.assertEqual(len(deployments), 2)
-        for step in deployments:
-            with self.subTest(step=step.splitlines()[0]):
-                self.assertIn("vars.PEER_INGRESS_ENABLED_", step)
-                script = self.generate_script("auto")
-                self.assertIn('PEER_PROXY_LISTEN_ADDR=', script)
-                self.assertIn(':5009', script)
+    def test_missing_ambiguous_or_unmigrated_manifest_fails_before_upload(self):
+        manifest = dict(project='example-project',instance='example-host',zone='us-central1-a',
+                        ip='192.0.2.10',migration_complete=False,routes=[])
+        for manifests in ({}, {'cell':manifest}, {'one':manifest,'two':manifest},
+                          {'cell':dict(manifest,project='other-project')}):
+            with self.subTest(manifests=manifests):
+                self.assertEqual(self.deploy(manifests=manifests),1)
+                self.assertEqual(len(self.commands),1)
+
+    def test_applied_frontend_references_authorize_without_migration_flag(self):
+        manifest = dict(project='example-project', instance='example-host', zone='us-central1-a',
+                        ip='192.0.2.10', migration_complete=False,
+                        routes=[dict(name='public-http', backend='public-backend')],
+                        frontend_backend_references={'public-http': ['public-backend']})
+        self.assertEqual(self.deploy(manifests={'cell': manifest}), 0)
+
+    def test_migration_flag_cannot_authorize_unswitched_frontend(self):
+        manifest = dict(project='example-project', instance='example-host', zone='us-central1-a',
+                        ip='192.0.2.10', migration_complete=True,
+                        routes=[dict(name='public-http', backend='replacement-backend')],
+                        frontend_backend_references={'public-http': ['legacy-backend']})
+        self.assertEqual(self.deploy(manifests={'cell': manifest}), 1)
+        self.assertEqual(len(self.commands), 1)
+
+    def test_frontend_resource_inventory_covers_declared_routes(self):
+        manifest = dict(project='example-project', instance='example-host', zone='us-central1-a',
+                        ip='192.0.2.10', migration_complete=True,
+                        routes=[dict(name='public-http', backend='replacement-backend')],
+                        frontend_backend_references={'public-http': ['replacement-backend']},
+                        frontend_resources={})
+        self.assertEqual(self.deploy(manifests={'cell': manifest}), 1)
+        self.assertEqual(len(self.commands), 1)
+
+    def test_secrets_are_json_data_not_shell_text(self):
+        secret = 'postgres://router:$(touch /tmp/unsafe)`echo unsafe`@db.example.test/db'
+        self.assertEqual(self.deploy(PROXY_DATABASE_URL=secret,PEER_ROUTING_ENABLED='1'),0)
+        self.assertEqual(self.requests[0]['env']['PROXY_DATABASE_URL'],secret)
+        for key, path in (
+                ('PEER_PROXY_CERT_FILE', '/etc/superserve/peer/tls.crt'),
+                ('PEER_PROXY_KEY_FILE', '/etc/superserve/peer/tls.key'),
+                ('PEER_PROXY_CA_FILE', '/etc/superserve/peer/ca.crt')):
+            self.assertEqual(self.requests[0]['env'][key], path)
+        self.assertTrue(all(secret not in ' '.join(c) for c in self.commands))
 
     def test_disabled_routing_omits_database_credential(self):
-        script = self.generate_script("auto", routing="0", database_url="postgres://routing:secret@db.example.test/db")
-        self.assertNotIn("PROXY_DATABASE_URL=", script)
-        self.assertNotIn("routing:secret", script)
-        enabled = self.generate_script("auto", routing="1")
-        self.assertIn("PROXY_DATABASE_URL=", enabled)
+        self.assertEqual(self.deploy(PROXY_DATABASE_URL='postgres://example'),0)
+        self.assertEqual(self.requests[0]['env']['PROXY_DATABASE_URL'],'')
 
-    def test_database_required_only_for_routing(self):
-        self.generate_script("auto", database_url="", routing="0")
-        self.generate_script("auto", database_url="", routing="1", expected_result=1)
+    def test_disabled_peer_ingress_omits_default_credentials(self):
+        self.assertEqual(self.deploy(
+            PEER_PROXY_LISTEN_ADDR='',
+            PEER_PROXY_CERT_FILE='/etc/superserve/peer/tls.crt',
+            PEER_PROXY_KEY_FILE='/etc/superserve/peer/tls.key',
+            PEER_PROXY_CA_FILE='/etc/superserve/peer/ca.crt'), 0)
+        self.assertEqual(self.requests[0]['env']['PEER_PROXY_LISTEN_ADDR'], '')
+        for key in ('PEER_PROXY_CERT_FILE', 'PEER_PROXY_KEY_FILE', 'PEER_PROXY_CA_FILE'):
+            self.assertEqual(self.requests[0]['env'][key], '')
 
-    def test_routing_requires_explicit_activation(self):
-        self.assertIn("PEER_ROUTING_ENABLED=0\n", self.generate_script("auto"))
-        self.assertIn("PEER_ROUTING_ENABLED=1\n", self.generate_script("auto", routing="1"))
-        self.generate_script("auto", routing="true", expected_result=1)
-
-    def test_peer_region_comes_from_each_instance_zone(self):
-        for zone, region in (("us-central1-a", "us-central1"), ("us-east4-b", "us-east4"),
-                             ("https://www.googleapis.com/compute/v1/projects/example-project/zones/us-west2-a", "us-west2")):
-            with self.subTest(zone=zone):
-                self.assertIn(f"HOST_REGION={region}\n", self.generate_script("auto", zone=zone))
-
-    def test_generated_shell_parses(self):
-        for peer_addr in ("", "auto"):
-            with self.subTest(peer_addr=peer_addr):
-                result = subprocess.run(
-                    ["bash", "-n"], input=self.generate_script(peer_addr), capture_output=True, text=True
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_workflow_identity_is_not_authoritative(self):
-        script = self.generate_script("auto", "spiffe://stale.example.test/peer")
-        self.assertNotIn("spiffe://stale.example.test/peer", script)
-        self.assertIn("/etc/superserve/peer/identity.json", script)
-        self.assertLess(script.index("refresh-peer-credentials --check"), script.index("sudo mv /tmp/proxy"))
-
-    def test_host_identity_precedence(self):
-        script = self.generate_script("")
-        preflight = script[:script.index('chmod 0755 /tmp/check-legacy-heartbeat-')]
-        cases = [(None, 'legacy-host'), ('HOST_ID=example-region-2-generated\n', 'example-region-2-generated'),
-                 ('', None), ('HOST_ID=\n', None), ('HOST_ID=one\nHOST_ID=two\n', None)]
-        for installed, expected in cases:
-            with self.subTest(installed=installed), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                (root / 'vmd.env').write_text('HOST_ID=legacy-host\n')
-                if installed is not None:
-                    (root / 'host-identity.env').write_text(installed)
-                command = preflight.replace('/etc/sandbox', tmp)
-                result = subprocess.run(['bash'], input='sudo() { "$@"; }\n' + command +
-                                        'printf "%s" "$host_id"', text=True, capture_output=True)
-                if expected is None:
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn('invalid installed host identity environment', result.stderr)
-                else:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, expected)
-
-    def test_vmd_readiness_requires_current_invocation(self):
-        script = self.generate_script("")
-        readiness = script[script.index("wait_for_vmd_ready() {"):script.index("rollback_peer_advertisement() {")]
-        for mode in ("ready", "not-ready", "restarted", "heartbeat-pending"):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
-                functions = f'''
-                sleep() {{ :; }}
-                legacy_heartbeat_ready() {{ return 1; }}
-                sudo() {{ "$@"; }}
-                systemctl() {{
-                    if [ "$1" = show ]; then
-                        if [ "{mode}" = restarted ]; then
-                            echo x >> "{tmp}/invocations"
-                            wc -l < "{tmp}/invocations"
-                        else
-                            echo current-invocation
-                        fi
-                    fi
-                    return 0
-                }}
-                journalctl() {{
-                    [ "{mode}" != not-ready ] || return 1
-                    if [ "{mode}" = heartbeat-pending ] && [[ "$*" == *"host endpoint heartbeat accepted"* ]]; then
-                        return 1
-                    fi
-                    return 0
-                }}
-                '''
-                result = subprocess.run(["bash"], input=functions + readiness + "wait_for_vmd_ready", text=True, capture_output=True)
-                self.assertEqual(result.returncode == 0, mode == "ready", result.stderr)
-
-    def test_readiness_uses_acknowledged_binding_not_host_name(self):
-        script = self.generate_script("auto")
-        readiness = script[script.index("wait_for_vmd_ready() {"):script.index("rollback_peer_advertisement() {")]
-        for host in ("default", "named-host"):
-            for bound in (True, False):
-                for receipt in (True, False):
-                    for restarted in (True, False):
-                        with self.subTest(host=host, bound=bound, receipt=receipt, restarted=restarted), tempfile.TemporaryDirectory() as tmp:
-                            functions = f'''
-                            sleep() {{ :; }}
-                            sudo() {{ "$@"; }}
-                            sed() {{ echo {host}; }}
-                            legacy_heartbeat_ready() {{ return {0 if receipt and not bound else 1}; }}
-                            systemctl() {{
-                                if [ "$1" = show ]; then
-                                    if [ "{restarted}" = True ]; then
-                                        echo x >> "{tmp}/invocations"
-                                        wc -l < "{tmp}/invocations"
-                                    else echo current; fi
-                                fi
-                            }}
-                            journalctl() {{
-                                if [[ "$*" == *"host endpoint heartbeat accepted"* ]]; then
-                                    return {0 if bound and receipt else 1}
-                                fi
-                                return 0
-                            }}
-                            '''
-                            result = subprocess.run(["bash"], input=functions + readiness + "wait_for_vmd_ready", text=True, capture_output=True)
-                            self.assertEqual(result.returncode == 0, receipt and not restarted, result.stderr)
-
-    def test_rollback_restores_listener_before_advertisement(self):
-        cases = [(addr, failure, "spiffe://example.test/peer") for addr, failure in (("192.0.2.2:5009", "proxy"),
-                                          ("192.0.2.2:5009", "superserve-vmd"),
-                                          ("", "proxy"),
-                                          ("192.0.2.2:5009", "tee"),
-                                          ("192.0.2.2:5009", "sed"),
-                                          ("192.0.2.2:5009", "chmod"),
-                                          ("192.0.2.2:5009", "tee-dropin"),
-                                          ("192.0.2.2:5009", "binary-install"),
-                                          ("192.0.2.2:5009", "unit-install"),
-                                          ("192.0.2.2:5009", "proxy-always"),
-                                          ("192.0.2.2:5009", "none"))]
-        cases += [(addr, failure, "spiffe://example.test/peer")
-                  for addr in ("auto", "192.0.2.3:5009")
-                  for failure in ("none", "vmd-readiness", "vmd-heartbeat")]
-        cases += [("", "none", "spiffe://example.test/peer"), ("", "none", ""), ("auto", "none", ""),
-                  ("auto", "missing-identity", ""),
-                  ("", "missing-cert", "spiffe://example.test/peer"),
-                  ("auto", "missing-cert", "spiffe://example.test/peer")]
-        cases += [(addr, failure, "") for addr in ("", "auto")
-                  for failure in ("missing-legacy-env", "empty-legacy-env")]
-        cases = [(*case, False) for case in cases] + [
-            ("192.0.2.2:5009", failure, "spiffe://example.test/peer", True)
-            for failure in ("none", "proxy", "superserve-vmd")]
-        self.run_peer_deploy_cases(cases)
-
-    def test_production_serving_outbound_only_does_not_advertise_or_restart_vmd(self):
-        workflow = Path(__file__).parents[1].joinpath("deploy-proxy.yml").read_text()
-        for cell, host_id, zone, routing_var, ingress_var in (
-                ("usw2", "usw2", "us-west2-a", "PEER_ROUTING_ENABLED_USW", "PEER_INGRESS_ENABLED_USW"),
-                ("use4", "default", "us-east4-a", "PEER_ROUTING_ENABLED_USE4", "PEER_INGRESS_ENABLED_PROD")):
-            with self.subTest(cell=cell, host_id=host_id):
-                step = workflow.split(f"DEPLOY_CELL: {cell}", 1)[1]
-                context = dict(vars=SimpleNamespace(**{routing_var: "1", ingress_var: ""}),
-                               github=SimpleNamespace(event_name="workflow_dispatch"),
-                               inputs=SimpleNamespace(target="serving"))
+    def test_production_serving_outbound_only_keeps_ingress_disabled(self):
+        workflow = Path(__file__).parents[1].joinpath('deploy-proxy.yml').read_text()
+        for cell, routing_var, ingress_var in (
+                ('usw2', 'PEER_ROUTING_ENABLED_USW', 'PEER_INGRESS_ENABLED_USW'),
+                ('use4', 'PEER_ROUTING_ENABLED_USE4', 'PEER_INGRESS_ENABLED_PROD')):
+            with self.subTest(cell=cell):
+                step = workflow.split(f'DEPLOY_CELL: {cell}', 1)[1]
+                context = dict(vars=SimpleNamespace(**{routing_var: '1', ingress_var: ''}),
+                               github=SimpleNamespace(event_name='workflow_dispatch'),
+                               inputs=SimpleNamespace(target='serving'))
                 config = {}
-                for key in ("PEER_ROUTING_ENABLED", "PEER_PROXY_LISTEN_ADDR"):
-                    expression = re.search(key + r": \$\{\{ (.+) \}\}", step)[1]
-                    config[key] = eval(expression.replace("&&", " and ").replace("||", " or "),
-                                       {"__builtins__": {}}, context)
-                self.assertEqual(config, dict(PEER_ROUTING_ENABLED="1", PEER_PROXY_LISTEN_ADDR=""))
-                self.run_peer_deploy_cases(
-                    [(config["PEER_PROXY_LISTEN_ADDR"], "none", "spiffe://example.test/peer", False)],
-                    routing=config["PEER_ROUTING_ENABLED"], initial_listener=False,
-                    host_id=host_id, zone=zone)
+                for key in ('PEER_ROUTING_ENABLED', 'PEER_PROXY_LISTEN_ADDR'):
+                    expression = re.search(key + r': \$\{\{ (.+) \}\}', step)[1]
+                    config[key] = eval(expression.replace('&&', ' and ').replace('||', ' or '),
+                                       {'__builtins__': {}}, context)
+                self.assertEqual(config, dict(PEER_ROUTING_ENABLED='1', PEER_PROXY_LISTEN_ADDR=''))
+                self.assertEqual(self.deploy(PROXY_DATABASE_URL='postgres://example', **config), 0)
+                env = self.requests[0]['env']
+                self.assertEqual(env['PEER_ROUTING_ENABLED'], '1')
+                self.assertEqual(env['PEER_PROXY_LISTEN_ADDR'], '')
+                self.assertTrue(env['PEER_PROXY_CERT_FILE'])
+                remote = self.commands[-1][-1]
+                self.assertNotIn('vmd.env', remote)
+                self.assertNotIn('restart', remote)
 
-    def run_peer_deploy_cases(self, cases, routing="", initial_listener=True,
-                             host_id=None, zone="us-central1-a"):
-        for peer_addr, failed_service, identity, legacy in cases:
-            with self.subTest(peer_addr=peer_addr, failed_service=failed_service), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp)
-                old_env = "PEER_PROXY_LISTEN_ADDR=192.0.2.4:5009\n" if initial_listener else "PEER_PROXY_LISTEN_ADDR=\n"
-                old_vmd_env = (old_env + ("HOST_ID=default\n" if legacy else "")
-                               if initial_listener else f"HOST_ID={host_id}\n")
-                old_credentials = "[Service]\nLoadCredential=old-cert:/etc/peer/old.pem\n"
-                files = {
-                    "etc/sandbox/proxy.env": old_env,
-                    "etc/sandbox/vmd.env": old_vmd_env,
-                    "etc/sandbox/host-identity.env": "HOST_ID=default\n" if legacy else "HOST_ID=example-region-2-generated\n",
-                    "etc/systemd/system/proxy.service.d/peer-credentials.conf": old_credentials,
-                    "etc/superserve/peer/tls.crt": "test cert",
-                    "etc/superserve/peer/tls.key": "test key",
-                    "etc/superserve/peer/ca.crt": "test ca",
-                    "tmp/proxy-12345678": "new binary",
-                    "tmp/check-legacy-heartbeat-12345678": f"#!/bin/sh\nexit {0 if legacy else 1}\n",
-                    "bin/proxy": "old binary",
-                    "etc/systemd/system/proxy.service": "old unit",
-                    "tmp/proxy.service": "unit",
-                    "tmp/proxy.socket": "socket unit",
-                }
-                for name, contents in files.items():
-                    path = root / name
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(contents)
-                if host_id:
-                    (root / "etc/sandbox/host-identity.env").unlink()
-                if failed_service == "missing-legacy-env":
-                    (root / "etc/sandbox/proxy.env").unlink()
-                elif failed_service == "empty-legacy-env":
-                    (root / "etc/sandbox/proxy.env").write_text("")
-                (root / "bin").mkdir(exist_ok=True)
-                (root / "run/lock").mkdir(parents=True)
-                (root / "run/lock/vmd-peer-credentials.lock").touch()
-                check = root / "bin/refresh-peer-credentials"
-                check.write_text("#!/bin/sh\nexit 0\n")
-                check.chmod(0o755)
-                if identity:
-                    (root / "etc/superserve/peer/identity.json").write_text(json.dumps({"spiffe_uri": identity}))
-                if not identity or failed_service == "missing-cert":
-                    (root / "etc/superserve/peer/tls.crt").unlink()
-                script = self.generate_script(
-                    peer_addr, identity, (bool(identity) and not host_id) or failed_service == "missing-identity",
-                    routing=routing, zone=zone, standby=host_id is None)
-                script = script.replace("/etc/", f"{root}/etc/")
-                script = script.replace("/tmp/proxy", f"{root}/tmp/proxy")
-                script = script.replace("/tmp/check-legacy-heartbeat", f"{root}/tmp/check-legacy-heartbeat")
-                script = script.replace("/usr/local/bin", f"{root}/bin")
-                script = script.replace("/usr/local/sbin", f"{root}/bin")
-                script = script.replace("/run/lock", f"{root}/run/lock")
-                # A backup suffix makes GNU in-place sed syntax portable to BSD sed.
-                script = script.replace("sed -i ", "sed -i.bak ")
-                functions = f'''
-                sudo() {{
-                    if [ ! -f "{root}/failed" ]; then
-                        case "{failed_service}:$1:$2" in
-                            tee:tee:*/proxy.env|sed:sed:-i.bak|chmod:chmod:0600|tee-dropin:tee:*/peer-credentials.conf|binary-install:mv:*/tmp/proxy-12345678|unit-install:mv:*/tmp/proxy.service)
-                                "$@"
-                                touch "{root}/failed"
-                                return 1
-                                ;;
-                        esac
-                    fi
-                    "$@"
-                }}
-                sleep() {{ :; }}
-                flock() {{ :; }}
-                date() {{ echo 1; }}
-                systemctl() {{
-                    if [ "$1" = show ]; then
-                        if [ "$3" = MainPID ]; then echo 123; else echo current-invocation; fi
-                        return 0
-                    fi
-                    if [ "$1" = restart ]; then
-                        echo "$2" >> "{root}/restarts"
-                        if [ "{failed_service}" = proxy-always ] && [ "$2" = proxy ]; then
-                            touch "{root}/failed"
-                            return 1
-                        fi
-                        if [ "$2" = "{failed_service}" ] && [ ! -f "{root}/failed" ]; then
-                            touch "{root}/failed"
-                            return 1
-                        fi
-                    fi
-                    if [ "$1" = restart ] && [ "$2" = proxy ]; then
-                        if grep -q 'new binary' "{root}/bin/proxy" && ! grep -q '^PEER_ROUTING_ENABLED=' "{root}/etc/sandbox/proxy.env"; then
-                            echo 'new binary cannot start with old environment' >&2
-                            return 1
-                        fi
-                    fi
-                    return 0
-                }}
-                curl() {{
-                    case "$*" in
-                        "-fsS -H Metadata-Flavor: Google http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip"|"-fsS --max-time 2 -H Metadata-Flavor: Google http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip") ;;
-                        *) return 1 ;;
-                    esac
-                    echo 192.0.2.3
-                }}
-                journalctl() {{
-                    if [ "{legacy}" = True ] && [[ "$*" == *"host endpoint heartbeat accepted"* ]]; then return 1; fi
-                    if [ "$(grep -c '^superserve-vmd$' "{root}/restarts")" = 1 ]; then
-                        case "{failed_service}:$*" in
-                            vmd-readiness:*gRPC*|vmd-heartbeat:*heartbeat*)
-                                touch "{root}/failed"
-                                return 1
-                                ;;
-                        esac
-                    fi
-                    return 0
-                }}
-                '''
-                result = subprocess.run(["bash"], input=functions + script, text=True, capture_output=True)
-                if failed_service != "none":
-                    self.assertEqual((root / "bin/proxy").read_text(), "old binary")
-                    self.assertEqual((root / "etc/systemd/system/proxy.service").read_text(), "old unit")
-                    self.assertFalse((root / "etc/systemd/system/proxy.socket").exists())
-                if failed_service == "none":
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual((root / "etc/systemd/system/proxy.socket").read_text(), "socket unit")
-                    proxy_env = (root / "etc/sandbox/proxy.env").read_text()
-                    expected_host = host_id or ("default" if legacy else "example-region-2-generated")
-                    self.assertIn(f"HOST_ID={expected_host}\n", proxy_env)
-                    self.assertIn(f"PEER_ROUTING_ENABLED={routing or '0'}\n", proxy_env)
-                    if not initial_listener:
-                        self.assertIn("PEER_PROXY_LISTEN_ADDR=\n", proxy_env)
-                        self.assertNotIn(":5009", proxy_env)
-                        self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_vmd_env)
-                        self.assertEqual((root / "restarts").read_text().splitlines(), ["proxy"])
-                    if not identity:
-                        self.assertEqual("".join(line + "\n" for line in proxy_env.splitlines() if line.startswith("PEER_PROXY_")), old_env)
-                        self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_vmd_env)
-                        self.assertEqual((root / "etc/systemd/system/proxy.service.d/peer-credentials.conf").read_text(), old_credentials)
-                        self.assertEqual((root / "restarts").read_text().splitlines(), ["proxy"])
-                        self.assertIn("PROXY_DOMAIN=sandbox.example.test", proxy_env)
-                        continue
-                    resolved_addr = "192.0.2.3:5009" if peer_addr in ("auto", "192.0.2.3:5008") else peer_addr
-                    self.assertIn(f"PEER_PROXY_LISTEN_ADDR={resolved_addr}\n", proxy_env)
-                    self.assertIn(f"PEER_PROXY_SPIFFE_URI={identity}\n", proxy_env)
-                    if peer_addr:
-                        self.assertIn(f"PEER_PROXY_LISTEN_ADDR={resolved_addr}\n", (root / "etc/sandbox/vmd.env").read_text())
-                        self.assertEqual((root / "restarts").read_text().splitlines(), ["proxy", "superserve-vmd"])
-                    else:
-                        self.assertNotIn("PEER_PROXY_LISTEN_ADDR", (root / "etc/sandbox/vmd.env").read_text())
-                    dropin = root / "etc/systemd/system/proxy.service.d/peer-credentials.conf"
-                    self.assertEqual(dropin.exists(), bool(identity))
-                    if identity:
-                        for name in ("cert", "key", "ca"):
-                            self.assertIn(f"LoadCredential=peer-{name}:", dropin.read_text())
-                            self.assertIn(f"PEER_PROXY_{name.upper()}_FILE=/run/credentials/proxy.service/peer-{name}\n", proxy_env)
-                    self.assertEqual(list((root / "etc/sandbox").glob("proxy-rollback.*")), [])
-                    continue
-                self.assertNotEqual(result.returncode, 0)
-                if failed_service in ("missing-legacy-env", "empty-legacy-env"):
-                    self.assertIn("restore the legacy proxy.env or bootstrap host identity", result.stderr)
-                    self.assertFalse((root / "restarts").exists())
-                    self.assertEqual((root / "bin/proxy").read_text(), "old binary")
-                    self.assertEqual((root / "tmp/proxy-12345678").read_text(), "new binary")
-                    self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_env)
-                    self.assertEqual((root / "etc/systemd/system/proxy.service.d/peer-credentials.conf").read_text(), old_credentials)
-                    self.assertEqual(list((root / "etc/sandbox").glob("proxy-rollback.*")), [])
-                    legacy_env = root / "etc/sandbox/proxy.env"
-                    if failed_service == "missing-legacy-env":
-                        self.assertFalse(legacy_env.exists())
-                    else:
-                        self.assertEqual(legacy_env.read_text(), "")
-                    continue
-                if failed_service == "missing-identity":
-                    self.assertIn("host requires infrastructure identity bootstrap", result.stderr)
-                    self.assertEqual((root / "etc/sandbox/proxy.env").read_text(), old_env)
-                    self.assertFalse((root / "restarts").exists())
-                    continue
-                if failed_service == "missing-cert":
-                    self.assertIn("peer credential missing", result.stderr)
-                    self.assertEqual((root / "etc/sandbox/proxy.env").read_text(), old_env)
-                    self.assertEqual((root / "etc/systemd/system/proxy.service.d/peer-credentials.conf").read_text(), old_credentials)
-                    self.assertFalse((root / "restarts").exists())
-                    continue
-                self.assertTrue((root / "failed").exists(), result.stderr)
-                self.assertEqual((root / "etc/sandbox/proxy.env").read_text(), old_env)
-                self.assertEqual((root / "etc/sandbox/vmd.env").read_text(), old_vmd_env)
-                self.assertEqual((root / "etc/systemd/system/proxy.service.d/peer-credentials.conf").read_text(), old_credentials)
-                restarts = (root / "restarts").read_text().splitlines()
-                if failed_service in ("tee-dropin", "binary-install", "unit-install"):
-                    self.assertEqual(restarts, ["proxy"])
-                elif failed_service == "proxy-always":
-                    self.assertEqual(restarts, ["proxy", "proxy"])
-                    self.assertIn("snapshots retained", result.stderr)
-                    self.assertEqual(len(list((root / "etc/sandbox").glob("proxy-rollback.*"))), 1)
-                    continue
-                else:
-                    self.assertEqual(restarts[-2:], ["proxy", "superserve-vmd"])
-                self.assertEqual(list((root / "etc/sandbox").glob("proxy-rollback.*")), [])
+    def test_required_bootstrap_policy_is_preserved(self):
+        self.assertEqual(self.deploy(PEER_IDENTITY_HOSTS='example-host'),0)
+        self.assertTrue(self.requests[0]['require_identity'])
+
+    def test_inputs_fail_before_upload(self):
+        for overrides in [dict(GCP_REGION=''),dict(PEER_ROUTING_ENABLED='1'),
+                          dict(PEER_ROUTING_ENABLED='invalid'),dict(PEER_PROXY_LISTEN_ADDR='10.0.0.1:5008'),
+                          dict(PROXY_DOMAINS='one.example.test two.example.test')]:
+            with self.subTest(overrides=overrides):
+                self.assertEqual(self.deploy(**overrides),1)
+                self.assertFalse(self.commands)
+
+    def test_discovery_failure_does_not_contact_hosts(self):
+        env = dict(GCP_PROJECT='example-project',GCP_REGION='us-central1',SHA='12345678',PROXY_DOMAIN='sandbox.example.test')
+        with patch.dict(os.environ,env,clear=True), patch.object(MODULE.subprocess,'run',
+                return_value=subprocess.CompletedProcess([],1,'','permission denied')) as run:
+            self.assertEqual(MODULE.main(),1)
+            self.assertEqual(run.call_count,1)
 
 
-class CombinedCredentialContractTests(unittest.TestCase):
-    def test_base_unit_leaves_mounting_to_identity_dropin(self):
-        unit = Path(__file__).resolve().parents[3] / "deploy" / "proxy.service"
-        self.assertNotIn("LoadCredential=", unit.read_text())
-
-    def test_client_only_deploy_mounts_runtime_credentials(self):
-        script = DeployProxyTests().generate_script("")
-        self.assertIn("LoadCredential=peer-key:/etc/superserve/peer/tls.key", script)
-        self.assertIn("peer_key_file=/run/credentials/proxy.service/peer-key", script)
-        self.assertIn("PEER_PROXY_KEY_FILE=$peer_key_file", script)
-
-
-class PeerPortContractTests(unittest.TestCase):
-
-    def test_reject_non_routing_ports_before_deployment(self):
-        for endpoint in ("10.0.0.2:5008", "10.0.0.2:5010", "[fd00::2]:5011"):
-            with self.subTest(endpoint=endpoint):
-                DeployProxyTests().generate_script(endpoint, expected_result=1)
-
-
-class DatabaseEnvironmentTests(unittest.TestCase):
-    def test_database_url_is_literal_shell_data(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            marker = Path(tmp) / "substitution-ran"
-            passwords = ["p$PASSWORD", f"p$(touch {marker})", f"p`touch {marker}`", "p'quoted"]
-            for password in passwords:
-                with self.subTest(password=password):
-                    url = f"postgres://user:{password}@db.example.test/database"
-                    script = DeployProxyTests().generate_script("auto", database_url=url, routing="1")
-                    command = next(line for line in script.splitlines() if "PROXY_DATABASE_URL=" in line)
-                    command = command.split(" | sudo tee", 1)[0]
-                    result = subprocess.run(["bash", "-c", command], text=True, capture_output=True)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(result.stdout, f'PROXY_DATABASE_URL="{url}"\n')
-                    self.assertFalse(marker.exists(), "password executed a shell substitution")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

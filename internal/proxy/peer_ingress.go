@@ -41,7 +41,7 @@ func (c diagnosticTransportCredentials) Clone() credentials.TransportCredentials
 // peerShutdownGrace bounds how long a peer stream may delay process shutdown.
 // Forward streams are allowed to finish normally, but a peer that never
 // closes must not retain the listener indefinitely.
-const peerShutdownGrace = 5 * time.Second
+const peerShutdownGrace = DefaultDrainGrace
 
 // Bound local connections across all peer transports, not just one HTTP/2 connection.
 const maxPeerStreams = 128
@@ -277,30 +277,39 @@ func ServePeer(ctx context.Context, addr string, tlsCfg *tls.Config, target stri
 // is intentionally performed by the caller so startup failures can be handled
 // synchronously before the public proxy begins serving traffic.
 func ServePeerListener(ctx context.Context, l net.Listener, tlsCfg *tls.Config, target string, log zerolog.Logger) error {
-	return servePeerListener(ctx, l, tlsCfg, target, log, nil, maxPeerStreams)
+	return servePeerListener(ctx, l, tlsCfg, target, log, nil, maxPeerStreams, peerShutdownGrace)
 }
 
 func ServePeerListenerWithRecorder(ctx context.Context, l net.Listener, tlsCfg *tls.Config, target string, log zerolog.Logger, recorder telemetry.Recorder, streamLimit int64) error {
-	return servePeerListener(ctx, l, tlsCfg, target, log, recorder, streamLimit)
+	return servePeerListener(ctx, l, tlsCfg, target, log, recorder, streamLimit, peerShutdownGrace)
 }
 
-func servePeerListener(ctx context.Context, l net.Listener, tlsCfg *tls.Config, target string, log zerolog.Logger, recorder telemetry.Recorder, streamLimit int64) error {
+func ServePeerListenerWithDrain(ctx context.Context, l net.Listener, tlsCfg *tls.Config, target string, log zerolog.Logger, recorder telemetry.Recorder, streamLimit int64, grace time.Duration) error {
+	return servePeerListener(ctx, l, tlsCfg, target, log, recorder, streamLimit, grace)
+}
+
+func servePeerListener(ctx context.Context, l net.Listener, tlsCfg *tls.Config, target string, log zerolog.Logger, recorder telemetry.Recorder, streamLimit int64, grace time.Duration) error {
 	s := grpc.NewServer(grpc.MaxRecvMsgSize(maxPeerFrameBytes), grpc.Creds(diagnosticTransportCredentials{TransportCredentials: credentials.NewTLS(tlsCfg), log: log}))
 	peerpb.RegisterPeerProxyServer(s, &PeerIngress{Target: target, Log: log, Recorder: recorder, MaxStreams: streamLimit})
+	lifecycle, cancel := context.WithCancel(ctx)
+	drained := make(chan struct{})
+	defer func() { cancel(); <-drained }()
 	go func() {
-		<-ctx.Done()
+		<-lifecycle.Done()
+		defer close(drained)
 		stopped := make(chan struct{})
 		go func() {
 			s.GracefulStop()
 			close(stopped)
 		}()
-		timer := time.NewTimer(peerShutdownGrace)
+		timer := time.NewTimer(grace)
 		defer timer.Stop()
 		select {
 		case <-stopped:
 		case <-timer.C:
 			// GracefulStop does not cancel active streams. Force termination
 			// after the bounded drain window so ServePeerListener can return.
+			log.Warn().Msg("peer drain deadline reached; forcing remaining streams closed")
 			s.Stop()
 		}
 	}()

@@ -30,3 +30,35 @@ notification_channel_ids              = ["projects/rayai-prod/notificationChanne
 
 host_c_reservation_name = "superserve-vmd-use4-z3-a"
 host_c_host_id          = "use4-3-3d1e6cebc17448d693e5458619ad00c4"
+
+proxy_generation_cells = {
+  use4 = {
+    zone            = "us-east4-c"
+    instance        = "superserve-vmd-use4-3"
+    ip              = "10.2.0.4"
+    network         = "projects/rayai-prod/global/networks/superserve-production-vpc"
+    subnetwork      = "projects/rayai-prod/regions/us-east4/subnetworks/superserve-use4-subnet"
+    target_tags     = ["vmd-use4"]
+    service_account = "vmd-runtime-production-use4@rayai-prod.iam.gserviceaccount.com"
+    routes = {
+      "public-http" = {
+        protocol = "HTTP"
+        listener = "public"
+        probe    = "https://sandbox.superserve.ai/health"
+        probe_ip = "34.8.17.193"
+      }
+      "public-tcp" = {
+        protocol = "TCP"
+        listener = "public"
+        probe    = "https://sandbox.superserve.ai/health"
+        probe_ip = "34.102.191.241"
+      }
+      redirect = {
+        protocol = "TCP"
+        listener = "redirect"
+        probe    = "http://sandbox.superserve.ai/health"
+        probe_ip = "34.102.191.241"
+      }
+    }
+  }
+}

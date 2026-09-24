@@ -1,0 +1,29 @@
+[Unit]
+Description=Superserve Edge Proxy generation @GENERATION@
+After=network-online.target proxy-private-routing.service
+ConditionPathExists=/run/proxy-private-routing-ready
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/var/lib/proxy-rollout/generations/@GENERATION@/proxy
+EnvironmentFile=/var/lib/proxy-rollout/generations/@GENERATION@/proxy.env
+Environment=VMD_ADDR=http://127.0.0.1:9090
+Restart=on-failure
+RestartSec=2
+# The process owns the configurable deadline (at most ten minutes).
+TimeoutStopSec=615
+KillMode=control-group
+DynamicUser=yes
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=proxy-@GENERATION@
+
+[Install]
+WantedBy=multi-user.target

@@ -29,6 +29,13 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "proxy exited with error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	multi := zerolog.MultiLevelWriter(os.Stdout, &sentrylog.Writer{})
 	log := zerolog.New(multi).With().
@@ -46,6 +53,10 @@ func main() {
 
 	addr := envOrDefault("PROXY_ADDR", ":5007")
 	redirectAddr := envOrDefault("PROXY_REDIRECT_ADDR", ":5008")
+	drainGrace, err := time.ParseDuration(envOrDefault("PROXY_DRAIN_GRACE", "30s"))
+	if err != nil || drainGrace <= 0 || drainGrace > 10*time.Minute {
+		log.Fatal().Msg("PROXY_DRAIN_GRACE must be positive and at most 10m")
+	}
 	vmdAddr := envOrDefault("VMD_ADDR", "http://127.0.0.1:9090")
 	domains := proxyDomains()
 	if legacy := os.Getenv("PROXY_DOMAIN"); legacy != "" && !slices.Contains(domains, legacy) {
@@ -61,6 +72,16 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	workCtx, finishWork := context.WithCancel(context.Background())
+	defer finishWork()
+	drainDeadline := make(chan context.Context, 1)
+	go func() {
+		<-ctx.Done()
+		deadline, cancel := context.WithTimeout(context.Background(), drainGrace)
+		defer cancel()
+		drainDeadline <- deadline
+		<-deadline.Done()
+	}()
 	var peerErr <-chan error
 	peerRecorder := telemetry.NewNoopRecorder()
 
@@ -78,7 +99,7 @@ func main() {
 	var ownership proxy.OwnershipResolver
 	if dbPool != nil {
 		defer dbPool.Close()
-		ownership = proxy.NewCachedOwnershipResolver(ctx, proxy.NewDBOwnershipResolver(dbPool, localHostID))
+		ownership = proxy.NewCachedOwnershipResolver(workCtx, proxy.NewDBOwnershipResolver(dbPool, localHostID))
 	}
 	var routingRecorder telemetry.RoutingOutcomeRecorder
 	var peerTelemetry proxy.RecorderPeerTelemetry
@@ -113,7 +134,7 @@ func main() {
 			log.Info().Msg("otel metrics enabled")
 		}
 	}
-	proxyHandler.StartSweeper(ctx)
+	proxyHandler.StartSweeper(workCtx)
 
 	// Product-usage analytics for exec/files — no-op when POSTHOG_KEY is unset.
 	analyticsClient, err := analytics.New(os.Getenv("POSTHOG_KEY"), os.Getenv("POSTHOG_HOST"), log)
@@ -179,7 +200,15 @@ func main() {
 	router := proxy.NewRoutingHandler(domains, localHostID, ownership, peers, proxyHandler, log, routingRecorder)
 	log.Info().Bool("enabled", routingEnabled == "1").Msg("peer ownership routing configured")
 	mux, localMux := newDataPlaneMuxes(proxyHandler, router, routingEnabled == "1")
+	if dbPool != nil {
+		mux = newProxyMuxWithReadiness(proxyHandler, router, func(ctx context.Context) bool {
+			ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			defer cancel()
+			return dbPool.Ping(ctx) == nil
+		})
+	}
 	var localSrv *http.Server
+	var localConnections *proxy.DrainConnections
 	var localErr <-chan error
 	if peerIngressEnabled(peerAddr) {
 		if err := validatePeerListener(peerAddr, addr, redirectAddr); err != nil {
@@ -203,10 +232,12 @@ func main() {
 		}
 		// Peer traffic terminates at the local handler, never the public router.
 		localSrv = proxy.NewServer(target, localMux)
+		localConnections = proxy.NewDrainConnections()
+		localSrv.ConnState = localConnections.ConnState
 		localErrCh := make(chan error, 1)
 		localErr = localErrCh
 		go func() {
-			err := localSrv.Serve(localListener)
+			err := localSrv.Serve(localConnections.Listener(localListener))
 			if err == http.ErrServerClosed {
 				err = nil
 			}
@@ -224,7 +255,7 @@ func main() {
 		errCh := make(chan error, 1)
 		peerErr = errCh
 		go func() {
-			err := proxy.ServePeerListenerWithRecorder(ctx, peerListener, cfg, target, log, peerRecorder, streamLimit)
+			err := proxy.ServePeerListenerWithDrain(ctx, peerListener, cfg, target, log, peerRecorder, streamLimit, drainGrace)
 			// Always publish the result so shutdown supervision cannot race a
 			// failed Serve call and silently discard its error.
 			errCh <- err
@@ -237,34 +268,35 @@ func main() {
 	}
 
 	// HTTP→HTTPS redirect listener with graceful shutdown.
-	redirectMux := http.NewServeMux()
-	redirectMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		host := r.Host
-		if i := strings.IndexByte(host, ':'); i >= 0 {
-			host = host[:i]
-		}
-		http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
-	})
+	redirectMux := newRedirectMux(proxyHandler, mux)
 	redirectSrv := &http.Server{
 		Addr:    redirectAddr,
 		Handler: redirectMux,
 	}
+	// Buffer the failure so the serve goroutine can report it before canceling
+	// the shared lifecycle and waiting for the public drain to finish.
+	redirectErrCh := make(chan error, 1)
 	// Socket-activated listeners survive a restart (deploy/proxy.socket).
 	publicLis, redirectLis := inheritedListeners(activation.Listeners, addr, redirectAddr, log)
-	go func() {
-		log.Info().Str("addr", redirectAddr).Msg("starting HTTP→HTTPS redirect listener")
-		var err error
-		if redirectLis != nil {
-			err = redirectSrv.Serve(redirectLis)
-		} else {
-			err = redirectSrv.ListenAndServe()
+	if redirectLis == nil {
+		// Bind before starting the public server so a redirect collision fails
+		// startup and cannot be mistaken for a clean lifecycle cancellation.
+		redirectLis, err = net.Listen("tcp", redirectAddr)
+		if err != nil {
+			return fmt.Errorf("bind redirect listener: %w", err)
 		}
+	}
+	go func() {
+		defer close(redirectErrCh)
+		log.Info().Str("addr", redirectAddr).Msg("starting HTTP→HTTPS redirect listener")
+		err := redirectSrv.Serve(redirectLis)
 		if err != nil && err != http.ErrServerClosed {
 			log.Error().Err(err).Msg("redirect listener error")
+			propagateRedirectError(err, redirectErrCh, stop)
 		}
 	}()
 
-	if err := proxy.Serve(ctx, publicLis, addr, mux, log); err != nil {
+	if err := proxy.ServeWithDrain(ctx, publicLis, addr, mux, drainGrace, log); err != nil {
 		log.Fatal().Err(err).Msg("proxy error")
 	}
 	if peerErr != nil {
@@ -274,18 +306,55 @@ func main() {
 	}
 
 	// Shut down the redirect listener cleanly.
-	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutCancel()
+	shutCtx := <-drainDeadline
 	_ = redirectSrv.Shutdown(shutCtx)
+	if err := <-redirectErrCh; err != nil {
+		return fmt.Errorf("redirect listener stopped: %w", err)
+	}
 	if localSrv != nil {
-		_ = localSrv.Shutdown(shutCtx)
+		_ = localConnections.Shutdown(shutCtx, localSrv, log)
 		if err := <-localErr; err != nil {
 			log.Fatal().Err(err).Msg("local peer target stopped")
 		}
 	}
 
 	log.Info().Msg("proxy stopped")
+	return nil
 }
+
+func propagateRedirectError(err error, report chan<- error, stop context.CancelFunc) {
+	if err == nil || err == http.ErrServerClosed {
+		return
+	}
+	report <- err
+	stop()
+}
+
+func newRedirectMux(proxyHandler *proxy.Handler, readiness http.Handler) *http.ServeMux {
+	redirectMux := http.NewServeMux()
+	redirectMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" && !proxyHandler.ServesHost(r.Host) {
+			if r.Host == "proxy-readiness.invalid" {
+				readiness.ServeHTTP(w, r)
+				return
+			}
+			readiness.ServeHTTP(readinessHeaders{w}, r)
+			w.Header().Del("Content-Type")
+		}
+		host := r.Host
+		if i := strings.IndexByte(host, ':'); i >= 0 {
+			host = host[:i]
+		}
+		http.Redirect(w, r, "https://"+host+r.URL.RequestURI(), http.StatusMovedPermanently)
+	})
+	return redirectMux
+}
+
+// Keep the normal redirect while attributing its resolver readiness to this process.
+type readinessHeaders struct{ http.ResponseWriter }
+
+func (w readinessHeaders) WriteHeader(int)                {}
+func (w readinessHeaders) Write(body []byte) (int, error) { return len(body), nil }
 
 // bindLocalPeerTarget keeps peer traffic off the public routing and redirect ports.
 func bindLocalPeerTarget(target, publicAddr, redirectAddr string) (net.Listener, error) {
@@ -300,8 +369,9 @@ func bindLocalPeerTarget(target, publicAddr, redirectAddr string) (net.Listener,
 }
 
 func validatePeerListener(peerAddr, publicAddr, redirectAddr string) error {
-	if err := proxy.ValidatePeerEndpoint(peerAddr); err != nil {
-		return err
+	endpoint, err := netip.ParseAddrPort(peerAddr)
+	if err != nil || !proxy.PrivateBind(peerAddr) || (endpoint.Port() != proxy.PeerPort && endpoint.Port() != 5102 && endpoint.Port() != 5112) {
+		return fmt.Errorf("peer listener must use a private IP and a reserved peer port: %q", peerAddr)
 	}
 	return validateListenerPorts(peerAddr, publicAddr, redirectAddr)
 }
@@ -336,6 +406,7 @@ func peerTransportRequired(routingEnabled, peerAddr string) bool {
 }
 
 type proxyHealthResponse struct {
+	Generation    string   `json:"generation"`
 	Capabilities  []string `json:"capabilities"`
 	FilesEnabled  bool     `json:"files_enabled"`
 	ResolverReady bool     `json:"resolver_ready"`
@@ -406,17 +477,33 @@ func newDataPlaneMuxes(local *proxy.Handler, router http.Handler, routingEnabled
 }
 
 func newProxyMuxWithHandler(proxyHandler *proxy.Handler, dataPlane http.Handler) *http.ServeMux {
+	return newProxyMuxWithReadiness(proxyHandler, dataPlane, nil)
+}
+
+func newProxyMuxWithReadiness(proxyHandler *proxy.Handler, dataPlane http.Handler, dependencies func(context.Context) bool) *http.ServeMux {
+	generation := os.Getenv("PROXY_GENERATION")
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if proxyHandler.ServesHost(r.Host) {
 			dataPlane.ServeHTTP(w, r)
 			return
 		}
+		resolverReady := proxyHandler.ResolverReady(r.Context())
+		if dependencies != nil {
+			resolverReady = dependencies(r.Context()) && resolverReady
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Proxy-Generation", generation)
+		w.Header().Set("X-Proxy-Resolver-Ready", strconv.FormatBool(resolverReady))
 		w.Header().Set("Content-Type", "application/json")
+		if r.Host == "proxy-readiness.invalid" && !resolverReady {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
 		_ = json.NewEncoder(w).Encode(proxyHealthResponse{
+			Generation:    generation,
 			Capabilities:  proxyHandler.PreviewCapabilities(),
 			FilesEnabled:  proxyHandler.FilesEnabled(),
-			ResolverReady: proxyHandler.ResolverReady(r.Context()),
+			ResolverReady: resolverReady,
 		})
 	})
 	mux.Handle("/", dataPlane)

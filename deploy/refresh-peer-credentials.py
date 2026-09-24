@@ -111,6 +111,37 @@ def repair_aliases(peer):
 
 
 def reload_proxy(peer, generation, identity):
+    state_path = Path('/var/lib/proxy-rollout/state.json')
+    if state_path.exists():
+        # Bootstrap and the first generation rollout retain the legacy proxy in
+        # ``old`` until a generation has been adopted.  There is no generation
+        # request for the controller to renew in that state, so reload the
+        # legacy unit directly rather than queueing a no-op controller run.
+        try:
+            state = json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            state = None
+        phase = state.get('phase') if isinstance(state, dict) else None
+        generation_state = (state.get('active') if phase in ('complete', 'rolled_back')
+                            else state.get('old')) if isinstance(state, dict) else None
+        # Once a normal generation rollout persists ``stopping``, the legacy
+        # listener is already past its reload-safe boundary; let that rollout
+        # finish and renew the adopted generation afterward. Bootstrap uses
+        # the same phase name only for an operator-visible migration failure,
+        # where the legacy process remains serving.
+        if (isinstance(generation_state, dict) and not generation_state.get('id')
+                and (phase != 'stopping' or state.get('bootstrap'))):
+            _reload_legacy_proxy(peer, generation, identity)
+            return
+        # The controller takes the rollout lock before the credential lock.
+        # Queue without waiting while this publisher holds the credential lock.
+        subprocess.run(['systemctl', 'start', '--no-block', 'proxy-credential-rollout.service'], check=True)
+        return
+    _reload_legacy_proxy(peer, generation, identity)
+
+
+def _reload_legacy_proxy(peer, generation, identity):
+    """Reload the in-place proxy when no generation-specific unit is active."""
     env = Path('/etc/sandbox/proxy.env')
     loaded = peer / 'loaded-generation'
     if (env.exists() and f"PEER_PROXY_SPIFFE_URI={identity}" in env.read_text().splitlines()
@@ -134,7 +165,15 @@ def report(peer, provider, validity, error=None):
             status['failures'] = status.get('failures', 0) + 1
             status['last_failure_at'] = time.time()
         current = peer / 'current'
-        snapshot = Path('/run/credentials/proxy.service')
+        state_path = Path('/var/lib/proxy-rollout/state.json')
+        state = json.loads(state_path.read_text()) if state_path.exists() else {}
+        # Once shutdown is persisted, ``old`` is the retiring listener and
+        # ``candidate`` is the generation still serving traffic.  Compare the
+        # published credentials with that serving unit so status reflects the
+        # process that actually needs to reload them.
+        active = (state.get('candidate', {}) if state.get('phase') == 'stopping'
+                  else state.get('active', state.get('old', {})))
+        snapshot = Path('/run/credentials') / active.get('unit', 'proxy.service')
         try:
             status['proxy_reload_required'] = any(
                 (current / name).read_bytes() != (snapshot / runtime).read_bytes()
