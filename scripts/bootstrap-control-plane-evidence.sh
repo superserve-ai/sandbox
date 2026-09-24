@@ -4,6 +4,7 @@ set -euo pipefail
 : "${PROJECT:?PROJECT is required}"
 : "${STATE_BUCKET:?STATE_BUCKET is required}"
 : "${DEPLOYMENT_SERVICE_ACCOUNT:?DEPLOYMENT_SERVICE_ACCOUNT is required}"
+: "${TF_VAR_policy_reader_service_accounts:?TF_VAR_policy_reader_service_accounts is required}"
 : "${GITHUB_ENV:?GITHUB_ENV is required}"
 : "${GITHUB_RUN_ID:?GITHUB_RUN_ID is required}"
 : "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT is required}"

@@ -21,6 +21,60 @@ variable "deployment_service_account" {
   type = string
 }
 
+variable "policy_reader_service_accounts" {
+  description = "Deployment accounts that inspect this project's policies for cross-cell isolation checks."
+  type        = set(string)
+}
+
+variable "verification_kms_key" {
+  description = "Production credentials key whose primary-version readiness is checked before rollout."
+  type        = string
+  default     = ""
+}
+
+resource "google_kms_crypto_key_iam_member" "verification_metadata" {
+  for_each = var.verification_kms_key == "" ? toset([]) : toset([var.verification_kms_key])
+
+  crypto_key_id = each.value
+  role          = "roles/cloudkms.viewer"
+  member        = "serviceAccount:${var.deployment_service_account}"
+}
+
+resource "google_project_service" "verification" {
+  for_each = toset(["cloudasset.googleapis.com", "policytroubleshooter.googleapis.com"])
+
+  project            = var.project_id
+  service            = each.value
+  disable_on_destroy = false
+}
+
+resource "google_project_iam_member" "analysis" {
+  for_each = toset([
+    "roles/cloudasset.viewer",
+    "roles/iam.roleViewer",
+    "roles/serviceusage.serviceUsageConsumer",
+  ])
+
+  project = var.project_id
+  role    = each.value
+  member  = "serviceAccount:${var.deployment_service_account}"
+}
+
+# Each project owns its policy-reader grants. Neither deployment account needs
+# IAM administration in the other project, or access to its object payloads.
+resource "google_project_iam_member" "policy_reader" {
+  for_each = {
+    for pair in setproduct(
+      setunion(var.policy_reader_service_accounts, [var.deployment_service_account]),
+      ["roles/iam.securityReviewer", "roles/iam.denyReviewer"],
+    ) : "${pair[0]}/${pair[1]}" => pair
+  }
+
+  project = var.project_id
+  role    = each.value[1]
+  member  = "serviceAccount:${each.value[0]}"
+}
+
 variable "retention_days" {
   description = "Minimum evidence retention and age at which lifecycle deletion becomes eligible."
   type        = number

@@ -57,11 +57,12 @@ API and Terraform workflows waiting behind it to replace each other.
    Terraform grants the deployment principal scoped token creation on each
    dedicated runtime identity so the verifier can run its GCS, Secret Manager,
    and runtime KMS probes. No separate KMS-owner secret is required.
-   Before touching Cloud Run, each stage applies the isolated evidence-storage
-   Terraform root and proves it can upload evidence. No manual bucket creation
-   or GitHub evidence-bucket variable is needed.
-   The workflow is deliberately serial: staging, production use4, then
-   production usw2. Each stage captures the serving revision before apply,
+   Before touching Cloud Run, the workflow bootstraps both projects' verification
+   APIs, deployment-account policy inspection, and private evidence storage.
+   It then plans and checks prerequisites for all three cells as their actual
+   GitHub deployment accounts. No manual bucket creation or new GitHub variable
+   is needed. All prerequisite jobs must pass before the serial identity rollout:
+   staging, production use4, then production usw2. Each stage captures the serving revision before apply,
    validates its saved Terraform plan, then applies it and verifies the deployed identity,
    retains the full evidence privately, and uploads only a sanitized summary.
    The plan guard rejects all VM, persistent-disk, disk-attachment, and host
@@ -98,6 +99,77 @@ checks have passed. To roll back, route traffic to the last known good
 revision, restore the old identity's grants if they were already removed, and
 repeat the checks before retrying the cutover.
 
+## Verification prerequisites
+
+`infra/bootstrap/control-plane-evidence` enables the Cloud Asset and Policy
+Troubleshooter APIs with `disable_on_destroy = false`. It grants each project's
+own deployment account Cloud Asset Viewer, Role Viewer, and Service Usage
+Consumer. Both deployment accounts receive Security Reviewer and Deny Reviewer
+in each project so they can inspect cross-project policies. These grants do not
+include object payload reads, secret values, runtime impersonation, or policy
+modification. Production also grants its deployment account KMS Viewer on the
+single credentials key so preflight can read the primary version's state. The
+bootstrap relies on the existing key-scoped IAM administration for that grant.
+Runtime grants remain owned by the regional roots.
+
+The bootstrap caller must already be able to enable project services, manage
+project IAM, and manage the evidence bucket and Terraform state. The workflow
+provides `TF_VAR_policy_reader_service_accounts` for both existing deployment
+accounts, plus `TF_VAR_verification_kms_key` in production; preserve those inputs
+if running the bootstrap outside GitHub Actions.
+Each project applies only its own grants. Both bootstraps finish before the
+three prerequisite jobs run, with matrix fail-fast disabled to report all cells.
+
+The prerequisite jobs read the desired contract from a fresh Terraform plan;
+production does not need a previously applied contract output. They check API
+availability, the actual caller, rollback revision, own/cross-project policy
+visibility, complete IAM analysis (including host group/impersonation expansion),
+template manifest/reference availability, enabled latest secret versions, and
+production KMS policy/primary-version readiness. Failed probes retry together
+six times with ten seconds between rounds, preserving private attempt evidence.
+Unknown policies and incomplete analyses block migration. Public artifacts contain
+only sanitized check names and verdicts. A plan failure is reported as incomplete.
+
+Prerequisite policy probes accept any definite access decision because the
+regional apply may change current grants. The post-apply verifier still requires
+explicit isolation denials, runtime secret/artifact reads and KMS round trips,
+and scoped deployment impersonation before routing the candidate. In particular,
+production's pending managed folders and token-creator grants are created by the
+existing regional Terraform; the prerequisite job does not demand them early.
+
+### Inherited policy visibility
+
+Project grants cannot provide access to ancestor policies. If private preflight
+evidence reports unreadable organization/folder policies or custom roles, an
+organization IAM administrator can apply
+`infra/bootstrap/control-plane-policy-visibility` once. This separate root grants
+only ancestor policy, deny-policy, and custom-role reads to the deployment
+accounts. It is never applied by the rollout, and does not give deployment
+accounts organization IAM administration.
+
+Use an existing private Terraform state bucket accessible to that administrator:
+
+```sh
+terraform -chdir=infra/bootstrap/control-plane-policy-visibility init \
+  -backend-config="bucket=ADMIN_STATE_BUCKET" \
+  -backend-config="prefix=bootstrap/control-plane-policy-visibility"
+terraform -chdir=infra/bootstrap/control-plane-policy-visibility plan \
+  -var='organization_id=ORGANIZATION_ID' \
+  -var='deployment_service_accounts=["STAGING_DEPLOYMENT_EMAIL","PRODUCTION_DEPLOYMENT_EMAIL"]' \
+  -out=visibility.tfplan
+terraform -chdir=infra/bootstrap/control-plane-policy-visibility apply visibility.tfplan
+```
+
+If policies include Google Workspace groups or domains, the corresponding
+Workspace visibility is also required; the Google Cloud IAM bootstrap cannot
+supply Workspace `groups.read` or domain-administrator privileges. Resolve any
+such unknown result with the Workspace administrator; do not treat it as denial
+or disable group expansion. Policy Analyzer also has an organization-wide daily
+query allowance unless Security Command Center Premium/Enterprise is activated;
+repeated preflights consume that allowance. Quota failures block the rollout.
+See Google's [Policy Analyzer prerequisites](https://cloud.google.com/policy-intelligence/docs/analyze-iam-policies)
+and [Policy Troubleshooter prerequisites](https://cloud.google.com/policy-intelligence/docs/troubleshoot-access).
+
 ## Durable evidence gate
 
 The verifier keeps its full evidence directory on the runner while the stage
@@ -108,8 +180,9 @@ only `summary.json` and `summary.txt`, generated by
 record the cell, overall status, and each check's name and PASS/FAIL verdict,
 without command arguments, policy documents, object names, or identities.
 
-Each stage bootstraps `infra/bootstrap/control-plane-evidence` in its own project
-before changing service identity or traffic. State lives at
+The preparation jobs bootstrap `infra/bootstrap/control-plane-evidence` in both
+projects; each rollout stage rechecks its store before changing service identity
+or traffic. State lives at
 `bootstrap/control-plane-evidence` in the existing environment Terraform state
 bucket. Staging uses its own store; both production regions share the production
 store and state. The bucket name is `<project-id>-control-plane-evidence` and is
