@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.7.0"
+  required_version = ">= 1.9.0"
 
   backend "gcs" {
     bucket = "superserve-terraform-state"
@@ -154,6 +154,10 @@ module "iam" {
     # Bootstrap this grant before a full plan can refresh existing CA resources.
     cd_privateca_auditor = {
       role    = "roles/privateca.auditor"
+      members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
+    }
+    cd_role_admin = {
+      role    = "roles/iam.roleAdmin"
       members = ["serviceAccount:superserve-github-actions@${local.project_id}.iam.gserviceaccount.com"]
     }
     grafana_monitoring_viewer = {

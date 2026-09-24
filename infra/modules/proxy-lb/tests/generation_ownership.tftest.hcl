@@ -75,11 +75,14 @@ run "cell_ownership_is_wired_and_durable" {
     condition = (
       toset(google_project_iam_custom_role.generation[0].permissions) == toset([
         "compute.networkEndpointGroups.get",
-        "compute.networkEndpointGroups.listNetworkEndpoints",
         "compute.networkEndpointGroups.attachNetworkEndpoints",
         "compute.networkEndpointGroups.detachNetworkEndpoints",
       ]) &&
-      contains(google_project_iam_custom_role.generation_support[0].permissions, "compute.instances.use")
+      toset(google_project_iam_custom_role.generation_support[0].permissions) == toset([
+        "compute.instances.use",
+        "compute.backendServices.get",
+        "compute.zoneOperations.get",
+      ])
     )
     error_message = "Endpoint mutation must be isolated from the controller's instance and health-check support permissions."
   }
@@ -89,7 +92,7 @@ run "cell_ownership_is_wired_and_durable" {
       google_project_iam_member.generation[0].condition[0].title == "Cell-owned proxy generation NEGs" &&
       google_project_iam_member.generation[0].condition[0].expression == "resource.type == 'compute.googleapis.com/NetworkEndpointGroup' && resource.name.startsWith('projects/example-project/zones/us-central1-a/networkEndpointGroups/proxy-example-')"
     )
-    error_message = "Runtime NEG mutation must require a matching cell-owned NEG resource."
+    error_message = "The default must retain the existing fail-closed binding until supported cell isolation is validated."
   }
 
   assert {
@@ -148,4 +151,38 @@ run "frontend_addresses_are_preserved_in_manifest" {
     )
     error_message = "LB generation ingress must retain restricted health-check sources while admitting legacy bootstrap and generation listeners without exposing private peer or local-target ports."
   }
+}
+
+run "staging_can_explicitly_allow_project_wide_endpoints" {
+  command = plan
+  variables {
+    staging_project_wide_generation_endpoints = true
+    generation_cell = {
+      zone            = "us-central1-a"
+      instance        = "example-host"
+      ip              = "192.0.2.10"
+      network         = "example-network"
+      subnetwork      = "example-subnetwork"
+      target_tags     = ["example-proxy"]
+      service_account = "example-proxy@example-project.iam.gserviceaccount.com"
+      routes = { public = {
+        protocol = "HTTP"
+        listener = "public"
+        probe    = "https://example.test/health"
+      } }
+    }
+  }
+  assert {
+    condition     = length(google_project_iam_member.generation[0].condition) == 0
+    error_message = "The staging opt-in must provide usable project-wide endpoint access."
+  }
+}
+
+run "production_cannot_enable_project_wide_endpoints" {
+  command = plan
+  variables {
+    environment                               = "production"
+    staging_project_wide_generation_endpoints = true
+  }
+  expect_failures = [var.staging_project_wide_generation_endpoints]
 }
