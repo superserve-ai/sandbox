@@ -184,6 +184,7 @@ module "api" {
     COMPUTE_RESTRICTIONS_FILE = "${local.controlplane_secret_volumes.compute-restrictions.mount_path}/${local.controlplane_secret_volumes.compute-restrictions.path}"
 
     API_PORT               = "8080"
+    TEAM_CREATION_REGION   = "usw"
     EDGE_PROXY_DOMAIN      = "usw-sandbox.superserve.ai"
     SANDBOX_ID_REGION      = "usw"
     SUPABASE_URL           = var.supabase_url

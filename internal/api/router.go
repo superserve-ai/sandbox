@@ -115,6 +115,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// Public pricing is intentionally unauthenticated so the marketing site can render current PAYG rates from the same source as billing.
 	r.GET("/billing/pricing/public", h.GetPublicBillingPricing)
 	r.POST("/stripe/webhook", h.HandleStripeWebhook)
+	r.POST("/internal/teams", TeamCreationInternalAuth(), h.CreateInternalTeam)
 
 	promotionCapture := r.Group("/internal/promotion/signup")
 	promotionCapture.Use(PromotionProducerAuth("PROMOTION_CAPTURE_TOKEN"))
