@@ -13,11 +13,10 @@ run "ancestor_read_only" {
   assert {
     condition = (
       toset(google_organization_iam_custom_role.ancestor_policy_reader.permissions) == toset([
-        "resourcemanager.organizations.getIamPolicy", "resourcemanager.folders.getIamPolicy",
-        "iam.roles.get", "iam.denypolicies.get", "iam.denypolicies.list",
+        "resourcemanager.organizations.getIamPolicy", "iam.roles.get",
       ]) &&
       length(google_organization_iam_member.ancestor_policy_reader) == 2
     )
-    error_message = "Ancestor inspection must grant only policy/custom-role reads to the deployment accounts."
+    error_message = "Organization inspection must not grant descendant folder/deny-policy reads, payload access, or mutation."
   }
 }

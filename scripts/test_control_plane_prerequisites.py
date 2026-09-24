@@ -33,7 +33,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(CHECK.contract_from_plan(plan), CONTRACT)
 
     def test_unknown_or_missing_prerequisite_is_rejected_before_probes(self):
-        for field in CONTRACT:
+        for field in ("deployment_identity", "backup_bucket", "secret_ids", "region", "kms_key_resource"):
             with self.subTest(field=field):
                 plan = {"output_changes": {"controlplane_identity_contract": {
                     "after": CONTRACT, "after_unknown": {field: True},
@@ -78,10 +78,10 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual([x["status"] for x in rows["delayed"]["attempts"]], ["FAIL", "PASS"])
             self.assertEqual(rows["broken"]["status"], "FAIL")
 
-    def run_cell(self, *, kms=False, failures=None):
+    def run_cell(self, *, kms=False, failures=None, contract_override=None):
         calls = []
         failures = failures or {}
-        contract = copy.deepcopy(CONTRACT)
+        contract = copy.deepcopy(CONTRACT if contract_override is None else contract_override)
         if kms:
             contract["kms_key_resource"] = "projects/example-project/locations/example-region/keyRings/example/cryptoKeys/example"
         args = argparse.Namespace(
@@ -110,6 +110,22 @@ class ProbeTests(unittest.TestCase):
             CHECK.check_prerequisites(args, contract, preflight)
             preflight.run()
             return calls, evidence.index
+
+    def test_first_migration_probes_tooling_without_computed_runtime_or_host_emails(self):
+        planned = copy.deepcopy(CONTRACT)
+        del planned["runtime_service_account"]
+        del planned["host_identities_unchanged"]
+        contract = CHECK.contract_from_plan({"output_changes": {"controlplane_identity_contract": {
+            "after": planned, "after_unknown": {"runtime_service_account": True, "host_identities_unchanged": [True]},
+        }}})
+        calls, checks = self.run_cell(contract_override=contract)
+        self.assertTrue(all(row["status"] == "PASS" for row in checks))
+        for _, argv in calls:
+            if argv[1:3] == ["policy-troubleshoot", "iam"]:
+                self.assertIn(f"--principal-email={CONTRACT['deployment_identity']}", argv)
+            if "--analyze-service-account-impersonation" in argv:
+                self.assertIn(f"--identity=serviceAccount:{CONTRACT['deployment_identity']}", argv)
+                self.assertIn(f"--full-resource-name=//iam.googleapis.com/projects/example-project/serviceAccounts/{CONTRACT['deployment_identity']}", argv)
 
     def test_all_cells_probe_cross_project_policies_and_pending_runtime_grants_are_not_required(self):
         for kms in (False, True):

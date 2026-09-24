@@ -104,7 +104,9 @@ repeat the checks before retrying the cutover.
 `infra/bootstrap/control-plane-evidence` enables the Cloud Asset and Policy
 Troubleshooter APIs with `disable_on_destroy = false`. It grants each project's
 own deployment account Cloud Asset Viewer, Role Viewer, and Service Usage
-Consumer. Both deployment accounts receive Security Reviewer and Deny Reviewer
+Consumer. API activation depends on the Consumer grant, which permits the
+provider to poll activation operations. Partial bootstrap failures retry with a
+fresh plan against saved state. Both deployment accounts receive Security Reviewer and Deny Reviewer
 in each project so they can inspect cross-project policies. These grants do not
 include object payload reads, secret values, runtime impersonation, or policy
 modification. Production also grants its deployment account KMS Viewer on the
@@ -123,15 +125,17 @@ three prerequisite jobs run, with matrix fail-fast disabled to report all cells.
 The prerequisite jobs read the desired contract from a fresh Terraform plan;
 production does not need a previously applied contract output. They check API
 availability, the actual caller, rollback revision, own/cross-project policy
-visibility, complete IAM analysis (including host group/impersonation expansion),
+visibility and complete IAM tooling analysis (including group/impersonation expansion),
 template manifest/reference availability, enabled latest secret versions, and
 production KMS policy/primary-version readiness. Failed probes retry together
 six times with ten seconds between rounds, preserving private attempt evidence.
 Unknown policies and incomplete analyses block migration. Public artifacts contain
 only sanitized check names and verdicts. A plan failure is reported as incomplete.
 
-Prerequisite policy probes accept any definite access decision because the
-regional apply may change current grants. The post-apply verifier still requires
+Prerequisite policy probes use the existing deployment identity and accept any
+definite access decision. Runtime and host account emails can still be computed
+in an initial plan; preflight does not depend on identities the regional apply
+has yet to create. The post-apply verifier still requires
 explicit isolation denials, runtime secret/artifact reads and KMS round trips,
 and scoped deployment impersonation before routing the candidate. In particular,
 production's pending managed folders and token-creator grants are created by the
@@ -140,11 +144,14 @@ existing regional Terraform; the prerequisite job does not demand them early.
 ### Inherited policy visibility
 
 Project grants cannot provide access to ancestor policies. If private preflight
-evidence reports unreadable organization/folder policies or custom roles, an
+evidence reports an unreadable organization policy or custom roles, an
 organization IAM administrator can apply
 `infra/bootstrap/control-plane-policy-visibility` once. This separate root grants
-only ancestor policy, deny-policy, and custom-role reads to the deployment
-accounts. It is never applied by the rollout, and does not give deployment
+only `resourcemanager.organizations.getIamPolicy` and `iam.roles.get` to the
+deployment accounts. The role-definition read also covers known custom roles in
+descendant projects; there is no role listing, descendant policy read, payload
+access, or mutation. Role definitions must be readable to evaluate organization
+bindings, including this reader role itself. It is never applied by the rollout, and does not give deployment
 accounts organization IAM administration.
 
 Use an existing private Terraform state bucket accessible to that administrator:
@@ -160,7 +167,11 @@ terraform -chdir=infra/bootstrap/control-plane-policy-visibility plan \
 terraform -chdir=infra/bootstrap/control-plane-policy-visibility apply visibility.tfplan
 ```
 
-If policies include Google Workspace groups or domains, the corresponding
+This root supports projects attached directly to the organization. Any folder or
+organization deny-policy visibility gap requires separately reviewed administrator
+access; the root does not grant those permissions across unrelated descendants.
+Unknown results remain blocking. If policies include Google Workspace groups or
+domains, the corresponding
 Workspace visibility is also required; the Google Cloud IAM bootstrap cannot
 supply Workspace `groups.read` or domain-administrator privileges. Resolve any
 such unknown result with the Workspace administrator; do not treat it as denial

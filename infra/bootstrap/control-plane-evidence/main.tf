@@ -46,6 +46,9 @@ resource "google_project_service" "verification" {
   project            = var.project_id
   service            = each.value
   disable_on_destroy = false
+
+  # The provider polls activation operations using serviceusage.operations.get.
+  depends_on = [google_project_iam_member.analysis["roles/serviceusage.serviceUsageConsumer"]]
 }
 
 resource "google_project_iam_member" "analysis" {

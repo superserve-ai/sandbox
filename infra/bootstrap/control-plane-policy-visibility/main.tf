@@ -18,18 +18,16 @@ variable "deployment_service_accounts" {
 }
 
 # Applied by an organization IAM administrator, never by the rollout itself.
-# Project-level policy readers cannot inspect policies on their ancestors.
+# Project-level readers cannot inspect their organization policy or custom roles.
 resource "google_organization_iam_custom_role" "ancestor_policy_reader" {
   org_id      = var.organization_id
   role_id     = "controlPlaneAncestorPolicyReader"
-  title       = "Control plane ancestor policy reader"
-  description = "Read inherited policies and custom roles for rollout verification."
+  title       = "Control plane organization policy reader"
+  description = "Read the organization policy and custom-role definitions for rollout verification."
+  # Role definitions must be readable, including this custom role itself.
   permissions = [
     "resourcemanager.organizations.getIamPolicy",
-    "resourcemanager.folders.getIamPolicy",
     "iam.roles.get",
-    "iam.denypolicies.get",
-    "iam.denypolicies.list",
   ]
 }
 
