@@ -2,9 +2,11 @@ import argparse
 import copy
 import importlib.util
 import json
+import re
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
@@ -160,6 +162,26 @@ class ProbeTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_branch_rollout_requires_explicit_manual_branch_confirmation(self):
+        workflow = (ROOT / '.github/workflows/control-plane-identity-rollout.yml').read_text()
+        for job in ('bootstrap', 'staging'):
+            block = workflow.split(f'  {job}:\n', 1)[1].split('    runs-on:', 1)[0]
+            condition = re.search(r"^    if: \$\{\{ (.+) \}\}$", block, re.MULTILINE).group(1)
+            for event in ('workflow_dispatch', 'push', 'pull_request'):
+                for ref, ref_type in (('refs/heads/main', 'branch'), ('refs/heads/example-fix', 'branch'), ('refs/tags/example', 'tag')):
+                    for confirmation in ('', 'apply', 'apply-branch'):
+                        with self.subTest(job=job, event=event, ref=ref, confirmation=confirmation):
+                            context = {
+                                'github': SimpleNamespace(event_name=event, ref=ref, ref_type=ref_type),
+                                'inputs': SimpleNamespace(confirm=confirmation),
+                            }
+                            allowed = eval(condition.replace('&&', ' and ').replace('||', ' or '),
+                                           {'__builtins__': {}}, context)
+                            expected = event == 'workflow_dispatch' and ref_type == 'branch' and (
+                                (ref == 'refs/heads/main' and confirmation == 'apply') or
+                                (ref != 'refs/heads/main' and confirmation == 'apply-branch'))
+                            self.assertEqual(allowed, expected)
+
     def test_all_environment_preflights_gate_the_serial_rollout(self):
         workflow = (ROOT / '.github/workflows/control-plane-identity-rollout.yml').read_text()
         bootstrap = workflow.split('  bootstrap:\n')[1].split('\n  prerequisites:')[0]

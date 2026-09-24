@@ -53,7 +53,12 @@ API and Terraform workflows waiting behind it to replace each other.
    and scoped GitHub Actions act-as and token-creation grants. Confirm no VMD service account is a
    `reader_members` entry.
 2. Run the manually confirmed
-   `.github/workflows/control-plane-identity-rollout.yml` with `confirm=apply`.
+   `.github/workflows/control-plane-identity-rollout.yml` from `main` with `confirm=apply`.
+   To validate a change before merge, select its branch and use
+   `confirm=apply-branch`. This runs the full migration against live staging and
+   both production regions using the selected commit, including identity and
+   traffic changes. Tags and non-manual triggers are rejected. The same
+   deployment lock, preflight checks, serial stages, and rollback apply.
    Terraform grants the deployment principal scoped token creation on each
    dedicated runtime identity so the verifier can run its GCS, Secret Manager,
    and runtime KMS probes. No separate KMS-owner secret is required.
