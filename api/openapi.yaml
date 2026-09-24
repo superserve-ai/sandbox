@@ -932,21 +932,16 @@ paths:
       tags: [Snapshots]
       summary: Snapshot a sandbox
       description: |
-        Captures the sandbox into a saved snapshot that new sandboxes can be
-        created from. The sandbox must be active or paused. A `mem+fs`
-        snapshot (the default) holds memory and disk, so a sandbox created
-        from it resumes with its processes intact; an `fs` snapshot holds the
-        disk only and boots fresh: the sandbox's processes are stopped while
-        its filesystems are flushed, so the disk holds everything they had
-        written. An `fs` snapshot needs the sandbox running; a paused one
-        holds its unflushed writes in its memory image, which only a `mem+fs`
-        snapshot carries, and a sandbox whose image cannot stop its processes
-        is refused (`conflict`). A running sandbox is paused for the
-        capture: under a second for the first memory snapshot of a sandbox,
-        longer when all of memory has to be written. The call returns once
-        the snapshot is ready; if the host's answer is lost on the way, it
-        returns the snapshot still `creating` and the platform settles it
-        with the host shortly. Snapshots outlive the sandbox they came from.
+        Captures the sandbox into a saved snapshot of its memory and disk,
+        kept until deleted. Creating a sandbox from a snapshot, resuming with
+        its processes intact, arrives in a later release; until then a
+        snapshot can be listed, renamed and deleted. The sandbox must be
+        active or paused. A running sandbox is paused for the capture: under
+        a second for the first memory snapshot of a sandbox, longer when all
+        of memory has to be written. The call returns once the snapshot is
+        ready; if the host's answer is lost on the way, it returns the
+        snapshot still `creating` and the platform settles it with the host
+        shortly. Snapshots outlive the sandbox they came from.
 
         Pass `idempotency_key` to make a retry return the snapshot the first
         request made instead of taking another, whatever became of it since.
@@ -1109,9 +1104,9 @@ paths:
       tags: [Snapshots]
       summary: Delete a snapshot
       description: |
-        Removes the snapshot. Sandboxes created from it keep their own
-        copies and are unaffected. A snapshot still being created cannot be
-        deleted until it is ready or has failed.
+        Removes the snapshot. A snapshot still being created cannot be
+        deleted until it is ready, has failed, or has been creating for an
+        hour without its host settling it.
       security:
         - apiKey: []
       responses:
@@ -3518,12 +3513,11 @@ components:
       properties:
         kind:
           type: string
-          enum: [fs, "mem+fs"]
+          enum: ["mem+fs"]
           default: "mem+fs"
           description: >
-            `mem+fs` captures memory and disk; a sandbox created from it
-            resumes with its processes intact. `fs` captures the disk only;
-            a sandbox created from it boots fresh.
+            `mem+fs` captures memory and disk. A disk-only kind is not
+            offered yet.
         name:
           type: string
           minLength: 1
@@ -3561,10 +3555,10 @@ components:
           type: string
           format: uuid
           nullable: true
-          description: The template the sandbox was created from; a sandbox created from the snapshot uses the same one.
+          description: The template the captured sandbox was created from.
         kind:
           type: string
-          enum: [fs, "mem+fs"]
+          enum: ["mem+fs"]
         status:
           type: string
           enum: [creating, ready, failed, deleting]

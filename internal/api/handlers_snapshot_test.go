@@ -202,12 +202,12 @@ func TestCreateSandboxSnapshotRefusesASandboxInTransition(t *testing.T) {
 	if w.Code != http.StatusConflict || inserted || captured {
 		t.Fatalf("status=%d inserted=%v captured=%v; want 409 and nothing done", w.Code, inserted, captured)
 	}
-	// A paused sandbox holds its unflushed writes in memory: no disk-only capture.
-	sb.Status = db.SandboxStatusPaused
+	// A disk-only snapshot is not offered until a sandbox can be created from one.
+	sb.Status = db.SandboxStatusActive
 	w = httptest.NewRecorder()
 	snapshotRouter(h, teamID).ServeHTTP(w, jsonReq(http.MethodPost, "/sandboxes/"+sandboxID.String()+"/snapshot", map[string]any{"kind": "fs"}))
-	if w.Code != http.StatusConflict || inserted || captured {
-		t.Fatalf("fs of a paused sandbox: status=%d inserted=%v captured=%v; want 409 and nothing done", w.Code, inserted, captured)
+	if w.Code != http.StatusBadRequest || inserted || captured {
+		t.Fatalf("fs snapshot: status=%d inserted=%v captured=%v; want 400 and nothing done until a sandbox can be created from one", w.Code, inserted, captured)
 	}
 }
 
@@ -303,11 +303,11 @@ func TestCreateSandboxSnapshotMapsQuotaAndIdempotentReplay(t *testing.T) {
 	}
 
 	// The limits are the trigger's verdict, one code each.
-	if w := post(map[string]any{"kind": "fs"}); w.Code != http.StatusTooManyRequests || errCode(w) != "too_many_snapshots" {
+	if w := post(map[string]any{"kind": "mem+fs"}); w.Code != http.StatusTooManyRequests || errCode(w) != "too_many_snapshots" {
 		t.Fatalf("quota: status=%d body=%s", w.Code, w.Body.String())
 	}
 	insertErr = &pgconn.PgError{Code: snapshotInFlightErrCode, Message: "snapshots in flight limit reached"}
-	if w := post(map[string]any{"kind": "fs"}); w.Code != http.StatusTooManyRequests || errCode(w) != "too_many_snapshots_in_flight" {
+	if w := post(map[string]any{"kind": "mem+fs"}); w.Code != http.StatusTooManyRequests || errCode(w) != "too_many_snapshots_in_flight" {
 		t.Fatalf("in flight: status=%d body=%s", w.Code, w.Body.String())
 	}
 

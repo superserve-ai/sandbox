@@ -155,8 +155,15 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 	if body.Kind == "" {
 		body.Kind = snapshotKindMemFS
 	}
-	if body.Kind != snapshotKindFS && body.Kind != snapshotKindMemFS {
-		respondErrorMsg(c, "bad_request", fmt.Sprintf("kind must be %q or %q", snapshotKindFS, snapshotKindMemFS), http.StatusBadRequest)
+	switch body.Kind {
+	case snapshotKindMemFS:
+	case snapshotKindFS:
+		// The host takes them, but nothing creates a sandbox from a disk
+		// alone yet, so nobody is let pay for one.
+		respondErrorMsg(c, "bad_request", fmt.Sprintf("%q snapshots are not available yet; take a %q snapshot", snapshotKindFS, snapshotKindMemFS), http.StatusBadRequest)
+		return
+	default:
+		respondErrorMsg(c, "bad_request", fmt.Sprintf("kind must be %q", snapshotKindMemFS), http.StatusBadRequest)
 		return
 	}
 	if body.Name != nil && !withinChars(*body.Name, 64) {
@@ -200,12 +207,6 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 	}
 	if sb.BasePath == nil {
 		respondErrorMsg(c, "conflict", "sandbox predates overlay disks and cannot be snapshotted; create a new one from its template", http.StatusConflict)
-		return
-	}
-	// The host refuses this too, since the sandbox may pause between here
-	// and the capture; this only spares the row and the round trip.
-	if body.Kind == snapshotKindFS && sb.Status == db.SandboxStatusPaused {
-		respondErrorMsg(c, "conflict", "a paused sandbox holds its unflushed writes in its memory image; take a mem+fs snapshot, or resume it first", http.StatusConflict)
 		return
 	}
 	// Only a host whose delete is final is asked, whatever this build of
