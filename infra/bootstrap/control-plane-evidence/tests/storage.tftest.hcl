@@ -40,11 +40,14 @@ run "private_retained_staging_evidence" {
   }
   assert {
     condition = (
-      length(google_project_iam_member.policy_reader) == 4 &&
-      alltrue([for grant in google_project_iam_member.policy_reader : contains(["roles/iam.securityReviewer", "roles/iam.denyReviewer"], grant.role)]) &&
+      toset(keys(google_project_iam_member.policy_reader)) == toset([
+        "deployer@example-staging.iam.gserviceaccount.com/roles/iam.securityReviewer",
+        "deployer@example-production.iam.gserviceaccount.com/roles/iam.securityReviewer",
+      ]) &&
+      alltrue([for grant in google_project_iam_member.policy_reader : grant.role == "roles/iam.securityReviewer"]) &&
       google_project_iam_member.policy_reader["deployer@example-production.iam.gserviceaccount.com/roles/iam.securityReviewer"].project == "example-staging"
     )
-    error_message = "Cross-project deployment accounts receive policy inspection, without runtime, payload, or mutation grants."
+    error_message = "Cross-project readers must retain their Security Reviewer addresses and exclude organization-only Deny Reviewer bindings."
   }
   assert {
     condition     = length(google_kms_crypto_key_iam_member.verification_metadata) == 0
