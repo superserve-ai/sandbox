@@ -790,8 +790,9 @@ func (h *Handlers) ApproveTeamBillingPeriod(c *gin.Context) {
 		return
 	}
 
-	ctx := c.Request.Context()
-	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{})
+	ctx, cancel := context.WithTimeout(c.Request.Context(), billing.StorageReportSettlementTimeout)
+	defer cancel()
+	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("begin billing period approval transaction failed")
 		respondError(c, ErrInternal)
@@ -799,9 +800,13 @@ func (h *Handlers) ApproveTeamBillingPeriod(c *gin.Context) {
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := h.DB.WithTx(tx)
+	if err := prepareBillingStorageSnapshot(ctx, tx, teamID, periodEnd); err != nil {
+		respondBillingStorageSettlementError(c, err)
+		return
+	}
 	if _, _, err := h.upsertBillingSnapshotWithQueries(ctx, q, teamID, periodStart, periodEnd); err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("prepare billing period approval failed")
-		respondError(c, ErrInternal)
+		respondBillingStorageSettlementError(c, err)
 		return
 	}
 	period, err := q.ApproveTeamBillingPeriod(ctx, db.ApproveTeamBillingPeriodParams{
@@ -953,19 +958,20 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-
-	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{})
+	txCtx, cancelTx := context.WithTimeout(ctx, billing.StorageReportSettlementTimeout)
+	defer cancelTx()
+	tx, err := h.Pool.BeginTx(txCtx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("begin billing export transaction failed")
 		respondError(c, ErrInternal)
 		return
 	}
 	defer func() {
-		_ = tx.Rollback(ctx)
+		_ = tx.Rollback(txCtx)
 	}()
 	q := h.DB.WithTx(tx)
 
-	period, err := q.GetTeamBillingPeriodForUpdate(ctx, db.GetTeamBillingPeriodForUpdateParams{
+	period, err := q.GetTeamBillingPeriodForUpdate(txCtx, db.GetTeamBillingPeriodForUpdateParams{
 		TeamID:      teamID,
 		PeriodStart: periodStart,
 		PeriodEnd:   periodEnd,
@@ -980,7 +986,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 		return
 	}
 
-	existing, err := q.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
+	existing, err := q.ListBillingUsageExportsForPeriod(txCtx, db.ListBillingUsageExportsForPeriodParams{
 		TeamID:      teamID,
 		PeriodStart: periodStart,
 		PeriodEnd:   periodEnd,
@@ -995,7 +1001,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 	var usage db.TeamBillingUsage
 	switch {
 	case period.Status == "exporting" || period.Status == "exported" || len(liveExisting) > 0:
-		frozenUsage, err := q.GetTeamBillingUsageRollup(ctx, db.GetTeamBillingUsageRollupParams{
+		frozenUsage, err := q.GetTeamBillingUsageRollup(txCtx, db.GetTeamBillingUsageRollupParams{
 			TeamID:      teamID,
 			PeriodStart: periodStart,
 			PeriodEnd:   periodEnd,
@@ -1007,10 +1013,14 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 		}
 		usage = frozenUsage
 	default:
-		usageRow, updatedPeriod, err := h.upsertBillingSnapshotWithQueries(ctx, q, teamID, periodStart, periodEnd)
+		if err := prepareBillingStorageSnapshot(txCtx, tx, teamID, periodEnd); err != nil {
+			respondBillingStorageSettlementError(c, err)
+			return
+		}
+		usageRow, updatedPeriod, err := h.upsertBillingSnapshotWithQueries(txCtx, q, teamID, periodStart, periodEnd)
 		if err != nil {
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("prepare billing export failed")
-			respondError(c, ErrInternal)
+			respondBillingStorageSettlementError(c, err)
 			return
 		}
 		period = updatedPeriod
@@ -1035,7 +1045,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 		if (row.Status != "pending" && row.Status != "failed") || (exportEnabled && hasResource(activeResources, row.ResourceType)) {
 			continue
 		}
-		updatedRow, updateErr := q.UpdateBillingUsageExportStatus(ctx, db.UpdateBillingUsageExportStatusParams{
+		updatedRow, updateErr := q.UpdateBillingUsageExportStatus(txCtx, db.UpdateBillingUsageExportStatusParams{
 			ID:     row.ID,
 			Status: "skipped_disabled",
 		})
@@ -1052,7 +1062,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 			respondErrorMsg(c, "conflict", "billing export is still in progress", http.StatusConflict)
 			return
 		}
-		if err := tx.Commit(ctx); err != nil {
+		if err := tx.Commit(txCtx); err != nil {
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("commit already-exported billing period failed")
 			respondError(c, ErrInternal)
 			return
@@ -1071,7 +1081,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 
 	if !exportEnabled {
 		if period.Status == "exported" {
-			if err := tx.Commit(ctx); err != nil {
+			if err := tx.Commit(txCtx); err != nil {
 				log.Error().Err(err).Str("team_id", teamID.String()).Msg("commit already-exported shadow billing period failed")
 				respondError(c, ErrInternal)
 				return
@@ -1089,7 +1099,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 		}
 		for _, item := range items {
 			resourceType := billingExportResourceType(item.ResourceType)
-			if _, err := q.CreateBillingUsageExport(ctx, db.CreateBillingUsageExportParams{
+			if _, err := q.CreateBillingUsageExport(txCtx, db.CreateBillingUsageExportParams{
 				TeamID:                     teamID,
 				PeriodStart:                periodStart,
 				PeriodEnd:                  periodEnd,
@@ -1105,7 +1115,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 				return
 			}
 		}
-		updated, err := q.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
+		updated, err := q.ListBillingUsageExportsForPeriod(txCtx, db.ListBillingUsageExportsForPeriodParams{
 			TeamID:      teamID,
 			PeriodStart: periodStart,
 			PeriodEnd:   periodEnd,
@@ -1115,7 +1125,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-		if _, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(txCtx, `
 			UPDATE team_billing_period
 			SET status = 'exported',
 			    exported_at = COALESCE(exported_at, now()),
@@ -1129,7 +1139,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-		if _, err := tx.Exec(ctx, `
+		if _, err := tx.Exec(txCtx, `
 			UPDATE team_billing_usage
 			SET exported_at = COALESCE(exported_at, now()),
 			    updated_at = now()
@@ -1143,7 +1153,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 			return
 		}
 		period.Status = "exported"
-		if err := tx.Commit(ctx); err != nil {
+		if err := tx.Commit(txCtx); err != nil {
 			log.Error().Err(err).Str("team_id", teamID.String()).Msg("commit shadow billing export failed")
 			respondError(c, ErrInternal)
 			return
@@ -1162,7 +1172,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 
 	if period.Status == "exporting" && !billingExportHasFailedRow(existing) {
 		if billingExportAllFinalized(items, liveExisting) {
-			if err := tx.Commit(ctx); err != nil {
+			if err := tx.Commit(txCtx); err != nil {
 				log.Error().Err(err).Str("team_id", teamID.String()).Msg("commit already-finalized billing export failed")
 				respondError(c, ErrInternal)
 				return
@@ -1217,7 +1227,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 			if !meterOK {
 				status = "skipped_zero"
 			}
-			created, err := q.CreateBillingUsageExport(ctx, db.CreateBillingUsageExportParams{
+			created, err := q.CreateBillingUsageExport(txCtx, db.CreateBillingUsageExportParams{
 				TeamID:                     teamID,
 				PeriodStart:                periodStart,
 				PeriodEnd:                  periodEnd,
@@ -1236,7 +1246,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 			}
 			liveExisting[resourceType] = created
 		}
-		if _, err := q.MarkTeamBillingPeriodExporting(ctx, db.MarkTeamBillingPeriodExportingParams{
+		if _, err := q.MarkTeamBillingPeriodExporting(txCtx, db.MarkTeamBillingPeriodExportingParams{
 			TeamID:      teamID,
 			PeriodStart: periodStart,
 			PeriodEnd:   periodEnd,
@@ -1251,11 +1261,12 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 		}
 	}
 
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(txCtx); err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("commit billing export claim failed")
 		respondError(c, ErrInternal)
 		return
 	}
+	cancelTx()
 
 	updated, err := h.DB.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
 		TeamID:      teamID,
@@ -2576,12 +2587,24 @@ type billingSnapshotQuerier interface {
 	ApproveTeamBillingPeriod(context.Context, db.ApproveTeamBillingPeriodParams) (db.TeamBillingPeriod, error)
 }
 
-func (h *Handlers) upsertBillingSnapshot(ctx context.Context, teamID uuid.UUID, periodStart, periodEnd time.Time) (db.TeamBillingUsage, db.TeamBillingPeriod, error) {
-	usageRow, period, err := h.upsertBillingSnapshotWithQueries(ctx, h.DB, teamID, periodStart, periodEnd)
-	if err != nil {
-		return db.TeamBillingUsage{}, db.TeamBillingPeriod{}, err
+func prepareBillingStorageSnapshot(ctx context.Context, tx pgx.Tx, teamID uuid.UUID, periodEnd time.Time) error {
+	if err := billing.CheckStorageSettlementBoundary(ctx, tx, periodEnd); err != nil {
+		return err
 	}
-	return billingTeamUsageFromUpsertRow(usageRow), period, nil
+	return billing.FenceStorageReportReceipts(ctx, tx, teamID)
+}
+
+func respondBillingStorageSettlementError(c *gin.Context, err error) {
+	switch {
+	case errors.Is(err, billing.ErrStorageReportsIncomplete):
+		respondErrorMsg(c, "conflict", "storage reports are still being accepted or processed; retry billing settlement", http.StatusConflict)
+	case errors.Is(err, billing.ErrStorageSettlementBoundaryOpen):
+		respondErrorMsg(c, "conflict", "billing period is still open according to the database clock; retry after it closes", http.StatusConflict)
+	case errors.Is(err, pgx.ErrNoRows):
+		respondErrorMsg(c, "conflict", "billing usage is not ready for settlement; retry after storage reports finish processing", http.StatusConflict)
+	default:
+		respondError(c, ErrInternal)
+	}
 }
 
 func (h *Handlers) authoritativeBillingPeriod(ctx context.Context, teamID uuid.UUID, at time.Time) (time.Time, time.Time, error) {
@@ -2644,6 +2667,8 @@ func (h *Handlers) readBillingSnapshot(ctx context.Context, teamID uuid.UUID, pe
 	return usage, period, nil
 }
 
+// Callers must fence storage receipts in the same READ COMMITTED transaction
+// before this raw usage snapshot, retaining the fence through commit.
 func (h *Handlers) upsertBillingSnapshotWithQueries(ctx context.Context, q billingSnapshotQuerier, teamID uuid.UUID, periodStart, periodEnd time.Time) (db.UpsertTeamBillingUsageRow, db.TeamBillingPeriod, error) {
 	account, err := q.GetTeamBillingAccount(ctx, teamID)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {

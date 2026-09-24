@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
@@ -270,36 +271,45 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 		if period.Status != "approved" && period.Status != "exporting" {
 			return result, fmt.Errorf("closed billing period requires approval before final export")
 		}
-		tx, err := h.Pool.Begin(ctx)
+		txCtx, cancelTx := context.WithTimeout(ctx, billing.StorageReportSettlementTimeout)
+		defer cancelTx()
+		tx, err := h.Pool.BeginTx(txCtx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 		if err != nil {
 			return result, err
 		}
-		defer tx.Rollback(ctx)
+		defer tx.Rollback(txCtx)
 		q := h.DB.WithTx(tx)
-		locked, err := q.GetTeamBillingPeriodForUpdate(ctx, db.GetTeamBillingPeriodForUpdateParams{TeamID: p.TeamID, PeriodStart: p.Start, PeriodEnd: p.End})
+		locked, err := q.GetTeamBillingPeriodForUpdate(txCtx, db.GetTeamBillingPeriodForUpdateParams{TeamID: p.TeamID, PeriodStart: p.Start, PeriodEnd: p.End})
 		if err != nil {
 			return result, err
 		}
 		if locked.Status == "approved" {
-			row, _, err := h.upsertBillingSnapshotWithQueries(ctx, q, p.TeamID, p.Start, p.End)
+			if err := prepareBillingStorageSnapshot(txCtx, tx, p.TeamID, p.End); err != nil {
+				return result, err
+			}
+			row, _, err := h.upsertBillingSnapshotWithQueries(txCtx, q, p.TeamID, p.Start, p.End)
 			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return result, billing.ErrStorageReportsIncomplete
+				}
 				return result, err
 			}
 			usage = billingTeamUsageFromUpsertRow(row)
-			if _, err = q.MarkTeamBillingPeriodExporting(ctx, db.MarkTeamBillingPeriodExportingParams{TeamID: p.TeamID, PeriodStart: p.Start, PeriodEnd: p.End}); err != nil {
+			if _, err = q.MarkTeamBillingPeriodExporting(txCtx, db.MarkTeamBillingPeriodExportingParams{TeamID: p.TeamID, PeriodStart: p.Start, PeriodEnd: p.End}); err != nil {
 				return result, err
 			}
 		} else if locked.Status == "exporting" {
-			usage, err = q.GetTeamBillingUsageRollup(ctx, db.GetTeamBillingUsageRollupParams{TeamID: p.TeamID, PeriodStart: p.Start, PeriodEnd: p.End})
+			usage, err = q.GetTeamBillingUsageRollup(txCtx, db.GetTeamBillingUsageRollupParams{TeamID: p.TeamID, PeriodStart: p.Start, PeriodEnd: p.End})
 			if err != nil {
 				return result, err
 			}
 		} else {
 			return result, billing.ErrExportRecoveryRequired
 		}
-		if err = tx.Commit(ctx); err != nil {
+		if err = tx.Commit(txCtx); err != nil {
 			return result, err
 		}
+		cancelTx()
 		through = p.End
 	} else {
 		usage.TeamID = p.TeamID

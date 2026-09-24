@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"time"
@@ -20,6 +21,10 @@ const (
 	maxHostCapabilityLength = 64
 	maxHostFieldLength      = 256
 	maxHostStorageSamples   = 300000
+	// Storage intervals store whole MiB values in a signed 32-bit integer.
+	// Validate the byte value before rounding so the MiB conversion cannot
+	// overflow for values near int64's upper bound.
+	maxHostStorageAllocatedBytes int64 = int64(^uint32(0)>>1) * (1 << 20)
 )
 
 type hostStorageMeasurement struct {
@@ -27,10 +32,15 @@ type hostStorageMeasurement struct {
 	AllocatedBytes int64  `json:"allocated_bytes"`
 }
 
+type legacyStorageAckKey struct {
+	hostID, incarnationID string
+}
+
 type hostHeartbeatRequest struct {
-	IncarnationID string                   `json:"incarnation_id,omitempty"`
-	Capabilities  []string                 `json:"capabilities"`
-	Storage       []hostStorageMeasurement `json:"storage,omitempty"`
+	IncarnationID   string                   `json:"incarnation_id,omitempty"`
+	StorageReportID string                   `json:"storage_report_id,omitempty"`
+	Capabilities    []string                 `json:"capabilities"`
+	Storage         []hostStorageMeasurement `json:"storage,omitempty"`
 
 	// Self-description, sent by vmds that support self-registration. When a
 	// heartbeat arrives for an unknown host id with a complete description,
@@ -105,17 +115,23 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 	}
 	storageIDs := make([]uuid.UUID, 0, len(req.Storage))
 	storageMiB := make([]int32, 0, len(req.Storage))
+	seenStorageIDs := make(map[uuid.UUID]struct{}, len(req.Storage))
 	for _, measurement := range req.Storage {
 		sandboxID, err := uuid.Parse(measurement.SandboxID)
 		if err != nil || measurement.AllocatedBytes < 0 {
 			respondErrorMsg(c, "bad_request", "invalid storage measurement", http.StatusBadRequest)
 			return
 		}
-		mib := (measurement.AllocatedBytes + (1 << 20) - 1) >> 20
-		if mib > int64(^uint32(0)>>1) {
+		if _, duplicate := seenStorageIDs[sandboxID]; duplicate {
+			respondErrorMsg(c, "bad_request", "duplicate storage measurement", http.StatusBadRequest)
+			return
+		}
+		seenStorageIDs[sandboxID] = struct{}{}
+		if measurement.AllocatedBytes > maxHostStorageAllocatedBytes {
 			respondErrorMsg(c, "bad_request", "storage measurement is too large", http.StatusBadRequest)
 			return
 		}
+		mib := (measurement.AllocatedBytes + (1 << 20) - 1) >> 20
 		storageIDs = append(storageIDs, sandboxID)
 		storageMiB = append(storageMiB, int32(mib))
 	}
@@ -154,15 +170,6 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 				HostID: hostID, Capabilities: capabilities,
 			}); err != nil {
 				return "", "", err
-			}
-			if len(storageIDs) > 0 {
-				if _, err := q.UpdateHostSandboxStorageMeasurements(ctx, db.UpdateHostSandboxStorageMeasurementsParams{
-					SandboxIds: storageIDs,
-					DiskMib:    storageMiB,
-					HostID:     hostID,
-				}); err != nil {
-					return "", "", err
-				}
 			}
 			return created.Status, created.Status, nil
 		}
@@ -232,15 +239,6 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 			HostID: hostID, Capabilities: capabilities,
 		}); err != nil {
 			return "", "", err
-		}
-		if len(storageIDs) > 0 {
-			if _, err := q.UpdateHostSandboxStorageMeasurements(ctx, db.UpdateHostSandboxStorageMeasurementsParams{
-				SandboxIds: storageIDs,
-				DiskMib:    storageMiB,
-				HostID:     hostID,
-			}); err != nil {
-				return "", "", err
-			}
 		}
 		if !host.IdentityBound && req.describesHost() && req.VMDAddr == host.VmdAddr {
 			if err := q.BindHostIdentity(ctx, hostID); err != nil {
@@ -319,8 +317,80 @@ func (h *Handlers) HostHeartbeat(c *gin.Context) {
 			h.Scheduler.Invalidate()
 		}
 	}
+	storageAccepted := false
+	// Legacy VMDs may still include storage in the heartbeat body. The
+	// compatibility handoff is a separate transaction after liveness has
+	// committed. Its bounded staging attempt can delay the legacy response,
+	// but cannot roll back liveness or wait on storage interval writes.
+	if len(storageIDs) > 0 {
+		measurements := make([]storageReportMeasurement, 0, len(storageIDs))
+		for i, id := range storageIDs {
+			measurements = append(measurements, storageReportMeasurement{
+				SandboxID: id.String(), AllocatedBytes: int64(storageMiB[i]) * (1 << 20),
+			})
+		}
+		reportID := uuid.New()
+		if req.StorageReportID != "" {
+			if parsed, parseErr := uuid.Parse(req.StorageReportID); parseErr == nil && parsed != uuid.Nil {
+				reportID = parsed
+			}
+		}
+		storageAccepted = h.handoffLegacyStorageReport(legacyStorageAckKey{hostID, req.IncarnationID}, reportID,
+			func(ctx context.Context) error {
+				return h.enqueueStorageReport(ctx, hostID, req.IncarnationID, reportID, measurements)
+			},
+			func(ctx context.Context) error {
+				return h.enqueueStorageReportWithRetry(ctx, hostID, req.IncarnationID, reportID, measurements)
+			})
+	}
 
-	c.JSON(http.StatusOK, gin.H{"status": host.Status})
+	response := gin.H{"status": host.Status}
+	if len(storageIDs) > 0 {
+		response["storage_accepted"] = storageAccepted
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+func (h *Handlers) handoffLegacyStorageReport(ackKey legacyStorageAckKey, reportID uuid.UUID, enqueue, retry func(context.Context) error) bool {
+	accepted := func() bool {
+		id, ok := h.legacyStorageAccepted.Load(ackKey)
+		return ok && id == reportID
+	}
+	if accepted() {
+		return true
+	}
+	if _, active := h.legacyStorageInFlight.LoadOrStore(ackKey, reportID); active {
+		return accepted()
+	}
+	// A prior owner may have committed between the cache lookup and claiming
+	// this host. The claim covers both the inline attempt and its retry, even
+	// for old clients that do not provide a stable report ID.
+	if accepted() {
+		h.legacyStorageInFlight.Delete(ackKey)
+		return true
+	}
+	// Old clients interpret heartbeat success as storage acceptance. Try to
+	// cross the durable boundary before responding, after liveness commits.
+	handoffCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err := enqueue(handoffCtx)
+	cancel()
+	if err == nil {
+		h.legacyStorageAccepted.Store(ackKey, reportID)
+		h.legacyStorageInFlight.Delete(ackKey)
+		return true
+	}
+	log.Warn().Err(err).Str("host_id", ackKey.hostID).Msg("legacy heartbeat storage handoff deferred")
+	h.asyncBookkeeping("legacy storage handoff", func() {
+		defer h.legacyStorageInFlight.Delete(ackKey)
+		handoffCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := retry(handoffCtx); err != nil {
+			log.Error().Err(err).Str("host_id", ackKey.hostID).Msg("legacy heartbeat storage handoff failed")
+			return
+		}
+		h.legacyStorageAccepted.Store(ackKey, reportID)
+	})
+	return false
 }
 
 type hostStatusRequest struct {
