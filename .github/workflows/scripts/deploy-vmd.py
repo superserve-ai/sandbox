@@ -345,6 +345,8 @@ BUNDLE_FILES = [
     "deploy/superserve-vmd-rollback-guard.conf",
     "deploy/vmd-wake-floor-guard",
     "deploy/superserve-vmd-wake-floor-guard.conf",
+    "deploy/vmd-staged-intent-floor-guard",
+    "deploy/superserve-vmd-staged-intent-floor-guard.conf",
     "deploy/superserve-vmd-start-generation.conf",
     "deploy/superserve-secretsproxy.service",
     "deploy/firecracker@.service",
@@ -731,6 +733,23 @@ def main() -> int:
                 echo "ERROR: the wake-protocol floor guard rejects this vmd; refusing to install it" >&2
                 exit 1
             fi
+            # Staged-intent floor: same contract, a guard of its own; see
+            # deploy/vmd-staged-intent-floor-guard.
+            if ! sh {extract_dir}/deploy/vmd-staged-intent-floor-guard {extract_dir}/bin/vmd; then
+                echo "ERROR: the staged-intent floor guard rejects this vmd; refusing to install it" >&2
+                exit 1
+            fi
+
+            # Staged-intent floor: its guard and drop-in go in, and take
+            # effect, before the binary that journals such intents can run,
+            # so a deploy interrupted between the two never leaves a capable
+            # vmd unguarded. Its own executable and drop-in, so a deploy of
+            # the revision that introduced the wake floor, which reinstalls
+            # that guard, leaves this one in place.
+            sudo install -d -m 0755 /etc/systemd/system/superserve-vmd.service.d
+            sudo install -m 0755 {extract_dir}/deploy/vmd-staged-intent-floor-guard {install_dir}/vmd-staged-intent-floor-guard
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-staged-intent-floor-guard.conf /etc/systemd/system/superserve-vmd.service.d/31-staged-intent-floor-guard.conf
+            sudo systemctl daemon-reload
 
             # Install vmd + template-builder binaries.
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd

@@ -187,6 +187,8 @@ type VMRecord struct {
 	DiskPath        string `json:"disk_path"`
 	SnapshotPath    string `json:"snapshot_path,omitempty"`
 	MemFilePath     string `json:"mem_file_path,omitempty"`
+	// The saved snapshot this VM was created from; see VMInstance.
+	SourceSnapshotID string `json:"source_snapshot_id,omitempty"`
 	// Persisted so a layered (diff-overlay) sandbox resumes correctly after a vmd
 	// restart: non-empty means MemFilePath is an overlay to be served over this
 	// base. Without it, resume would load the overlay standalone and read the
@@ -935,6 +937,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		DiskPath:                   inst.DiskPath,
 		SnapshotPath:               inst.SnapshotPath,
 		MemFilePath:                inst.MemFilePath,
+		SourceSnapshotID:           inst.SourceSnapshotID,
 		BaseMemPath:                inst.BaseMemPath,
 		StrandedOverlays:           append([]string(nil), inst.StrandedOverlays...),
 		DirtyTrackingSessionID:     inst.DirtyTrackingSessionID,
@@ -1039,6 +1042,7 @@ func toInstance(rec VMRecord) *VMInstance {
 		DiskPath:               rec.DiskPath,
 		SnapshotPath:           rec.SnapshotPath,
 		MemFilePath:            rec.MemFilePath,
+		SourceSnapshotID:       rec.SourceSnapshotID,
 		BaseMemPath:            rec.BaseMemPath,
 		StrandedOverlays:       append([]string(nil), rec.StrandedOverlays...),
 		DirtyTrackingSessionID: rec.DirtyTrackingSessionID,
