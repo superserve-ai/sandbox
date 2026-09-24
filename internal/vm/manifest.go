@@ -98,6 +98,13 @@ func hashFile(ctx context.Context, path string) (string, int64, error) {
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
 
+// overlayBlockMapPath is where Firecracker saves an overlay drive's block
+// map beside the snapshot. A cold boot of the disk takes it as the
+// authoritative record of which blocks the overlay holds.
+func overlayBlockMapPath(snapshotPath string) string {
+	return snapshotPath + ".overlay"
+}
+
 // collectVMStateEntry hashes ONLY the vmstate file: tens of KB, sub
 // millisecond, safe on the pause RPC path. Everything size-dependent
 // (overlay, base) is the async worker's job; the control plane treats
@@ -150,15 +157,15 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 	defer cancel()
 
 	start := time.Now()
-	entries := make([]ManifestEntry, 0, 2)
-	add := func(name, path, basePath, baseKeyPath string) {
+	entries := make([]ManifestEntry, 0, 3)
+	add := func(name, path, basePath, baseKeyPath string) bool {
 		if path == "" {
-			return
+			return false
 		}
 		sum, size, err := backup.HashFileApparent(hctx, path)
 		if err != nil {
 			log.Warn().Err(err).Str("path", path).Msg("pause manifest: hash failed, entry skipped")
-			return
+			return false
 		}
 		allocated := int64(-1)
 		if value, ok := allocatedBytes(path); ok {
@@ -170,7 +177,7 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 			if err != nil {
 				log.Warn().Err(err).Str("path", basePath).
 					Msg("pause manifest: base digest failed, entry skipped")
-				return
+				return false
 			}
 		}
 		entries = append(entries, ManifestEntry{
@@ -182,10 +189,17 @@ func collectPauseManifest(ctx context.Context, snapshotPath, diskPath, diskBaseP
 			BasePath:       basePath,
 			BaseSHA256:     baseSum,
 		})
+		return true
 	}
 	// vmstate first: tiny and guaranteed inside any budget, so even a
 	// budget-exhausted pause records something verifiable.
 	add("vmstate.snap", snapshotPath, "", "")
+	// A saved map that cannot be hashed leaves the manifest incomplete, so
+	// the pause stays pending rather than publishing a generation without
+	// the map its disk was saved with.
+	if p := overlayBlockMapPath(snapshotPath); snapshotPath != "" && diskBasePath != "" && statRegularFile(p) && !add(backup.BlockMapName, p, "", "") {
+		return entries
+	}
 	add("rootfs.ext4", diskPath, diskBasePath, diskBaseKeyPath)
 	log.Info().
 		Int("files", len(entries)).

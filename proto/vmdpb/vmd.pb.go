@@ -1275,8 +1275,12 @@ type ReviveVMRequest struct {
 	// Ownership for the synthesized record: required whenever
 	// allow_recordless is set (there is no other source), and threaded
 	// straight to data-plane usage attribution.
-	TeamId        string `protobuf:"bytes,13,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"`
-	OwnerId       string `protobuf:"bytes,14,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
+	TeamId  string `protobuf:"bytes,13,opt,name=team_id,json=teamId,proto3" json:"team_id,omitempty"`
+	OwnerId string `protobuf:"bytes,14,opt,name=owner_id,json=ownerId,proto3" json:"owner_id,omitempty"`
+	// The overlay's saved block map, restored beside the salvage: the boot
+	// takes it as the record of which blocks the disk holds. Empty derives
+	// the map from the disk's allocation.
+	BlockMapPath  string `protobuf:"bytes,15,opt,name=block_map_path,json=blockMapPath,proto3" json:"block_map_path,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1405,6 +1409,13 @@ func (x *ReviveVMRequest) GetTeamId() string {
 func (x *ReviveVMRequest) GetOwnerId() string {
 	if x != nil {
 		return x.OwnerId
+	}
+	return ""
+}
+
+func (x *ReviveVMRequest) GetBlockMapPath() string {
+	if x != nil {
+		return x.BlockMapPath
 	}
 	return ""
 }
@@ -4290,7 +4301,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x11DestroyVMResponse\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1d\n" +
 	"\n" +
-	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"\xaf\x04\n" +
+	"cleaned_up\x18\x02 \x01(\bR\tcleanedUp\"\xd5\x04\n" +
 	"\x0fReviveVMRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12\x1b\n" +
 	"\tdisk_path\x18\x02 \x01(\tR\bdiskPath\x12\x12\n" +
@@ -4307,7 +4318,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x0fstandalone_disk\x18\v \x01(\bR\x0estandaloneDisk\x12)\n" +
 	"\x10allow_recordless\x18\f \x01(\bR\x0fallowRecordless\x12\x17\n" +
 	"\ateam_id\x18\r \x01(\tR\x06teamId\x12\x19\n" +
-	"\bowner_id\x18\x0e \x01(\tR\aownerId\x1a:\n" +
+	"\bowner_id\x18\x0e \x01(\tR\aownerId\x12$\n" +
+	"\x0eblock_map_path\x18\x0f \x01(\tR\fblockMapPath\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"H\n" +

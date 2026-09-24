@@ -294,10 +294,7 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 			return manifest
 		}
 		stageStart := time.Now()
-		dir, staged, err := backup.StagePending(ctx, m.pauseStagingRoot, vmID, pb.Token, diskBasePath, map[string]string{
-			"vmstate.snap": snapshotPath,
-			"rootfs.ext4":  diskPath,
-		})
+		dir, staged, err := backup.StagePending(ctx, m.pauseStagingRoot, vmID, pb.Token, diskBasePath, pauseFiles(snapshotPath, diskPath, diskBasePath))
 		m.backupMetrics.RecordStageDuration(ctx, time.Since(stageStart))
 		if err == nil {
 			pb.OrigSnapshotPath = snapshotPath
@@ -687,10 +684,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 		m.healPendingBackup(pb, log)
 		return
 	}
-	finalPaths, err := backup.FinishPendingStage(pb.StagedDir, gen, map[string]string{
-		"vmstate.snap": pb.SnapshotPath,
-		"rootfs.ext4":  pb.DiskPath,
-	})
+	finalPaths, err := backup.FinishPendingStage(pb.StagedDir, gen, pauseFiles(pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath))
 	if err != nil {
 		log.Warn().Err(err).Str("vm_id", pb.VMID).
 			Msg("staged pause backup: rename to generation failed; keeping pending record")
@@ -709,13 +703,9 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 	// finds the destination already there and does no actual I/O.
 	uploadPaths := finalPaths
 	if m.backupStaging != "" {
-		promoted := &backup.Task{
-			SandboxID:  pb.VMID,
-			Generation: gen,
-			Files: []backup.TaskFile{
-				{Name: "vmstate.snap", Path: finalPaths["vmstate.snap"]},
-				{Name: "rootfs.ext4", Path: finalPaths["rootfs.ext4"]},
-			},
+		promoted := &backup.Task{SandboxID: pb.VMID, Generation: gen}
+		for name, path := range finalPaths {
+			promoted.Files = append(promoted.Files, backup.TaskFile{Name: name, Path: path})
 		}
 		if err := backup.StageTask(m.backupStaging, promoted); err != nil {
 			log.Warn().Err(err).Str("vm_id", pb.VMID).
@@ -816,6 +806,17 @@ func (m *Manager) reusablePendingBackup(vmID, snapshotPath string) (PendingBacku
 		return PendingBackup{}, false
 	}
 	return prev, true
+}
+
+// pauseFiles names the pause artifacts to stage by their manifest names:
+// the pair a restore needs, plus the overlay block map when the snapshot
+// saved one.
+func pauseFiles(snapshotPath, diskPath, basePath string) map[string]string {
+	files := map[string]string{"vmstate.snap": snapshotPath, "rootfs.ext4": diskPath}
+	if p := overlayBlockMapPath(snapshotPath); basePath != "" && statRegularFile(p) {
+		files[backup.BlockMapName] = p
+	}
+	return files
 }
 
 // resolveStagedLocation handles the crash window between the marker

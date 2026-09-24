@@ -63,7 +63,7 @@ func TestFetchGenerationPicksTheRecordedGenerationNotTheNewest(t *testing.T) {
 	if got.Manifest.Generation != older.Generation {
 		t.Fatalf("restored generation %s, want the recorded %s", got.Manifest.Generation, older.Generation)
 	}
-	if !got.Standalone || got.Disk != filepath.Join(dest, "rootfs.ext4") {
+	if !got.Standalone || got.Disk != filepath.Join(dest, "rootfs.ext4") || got.BlockMap != "" {
 		t.Fatalf("restored = %+v", got)
 	}
 }
@@ -114,13 +114,19 @@ func TestFetchGenerationOverlayWithBaseThroughLimiter(t *testing.T) {
 	task := writePauseFixture(t, dir, "pause A")
 	task.Files[0].BasePath = basePath
 	task.Files[0].BaseSHA256 = digestOf(baseData)
+	blockMap := filepath.Join(dir, BlockMapName)
+	if err := os.WriteFile(blockMap, []byte("saved block map"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task.Files = append(task.Files, TaskFile{Name: BlockMapName, Path: blockMap, SHA256: digestOf([]byte("saved block map")), Size: 15})
 	task.Generation = GenerationKey(task.Files)
 	uploadFixture(t, store, task)
 
 	root := t.TempDir()
 	limited := &LimitedReader{Inner: store, Limiter: rate.NewLimiter(rate.Limit(64<<20), 1<<20)}
 	cache := &CachingBaseReader{Inner: limited, Dir: filepath.Join(root, ".base-cache")}
-	got, err := FetchGeneration(context.Background(), cache, task.SandboxID, task.Generation, filepath.Join(root, task.SandboxID), nil)
+	dest := filepath.Join(root, task.SandboxID)
+	got, err := FetchGeneration(context.Background(), cache, task.SandboxID, task.Generation, dest, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +136,19 @@ func TestFetchGenerationOverlayWithBaseThroughLimiter(t *testing.T) {
 	have, _ := os.ReadFile(got.Base)
 	if !bytes.Equal(have, baseData) {
 		t.Fatal("restored base differs")
+	}
+	if got.BlockMap != filepath.Join(dest, BlockMapName) {
+		t.Fatalf("block map = %q, want it beside the restored disk", got.BlockMap)
+	}
+	if have, _ := os.ReadFile(got.BlockMap); string(have) != "saved block map" {
+		t.Fatalf("restored block map = %q", have)
+	}
+	// A completed restore whose block map went missing is not reusable.
+	if err := os.Remove(got.BlockMap); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoredDisk(dest); err == nil {
+		t.Fatal("a restore missing its block map must not pass as complete")
 	}
 }
 

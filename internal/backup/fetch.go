@@ -23,7 +23,10 @@ type Restored struct {
 	Disk       string
 	Base       string
 	Standalone bool
-	Manifest   *GenerationManifest
+	// BlockMap is the snapshot's saved overlay block map, when the
+	// generation carried one.
+	BlockMap string
+	Manifest *GenerationManifest
 }
 
 // RestoredDisk reads the completion marker in dir and resolves the rootfs
@@ -38,6 +41,12 @@ func RestoredDisk(dir string) (Restored, error) {
 	if err := json.Unmarshal(raw, r.Manifest); err != nil {
 		return r, fmt.Errorf("restore marker: %w", err)
 	}
+	blockMap := ""
+	for _, f := range r.Manifest.Files {
+		if f.Name == BlockMapName {
+			blockMap = filepath.Join(dir, f.Name)
+		}
+	}
 	for _, f := range r.Manifest.Files {
 		if f.Name != "rootfs.ext4" {
 			continue
@@ -49,6 +58,12 @@ func RestoredDisk(dir string) (Restored, error) {
 		if f.BaseSHA256 == "" {
 			r.Standalone = true
 			return r, nil
+		}
+		if blockMap != "" {
+			if _, err := os.Stat(blockMap); err != nil {
+				return r, fmt.Errorf("restored without its block map")
+			}
+			r.BlockMap = blockMap
 		}
 		r.Base = filepath.Join(dir, SharedBaseName(f.BaseSHA256))
 		if _, err := os.Stat(r.Base); err == nil {

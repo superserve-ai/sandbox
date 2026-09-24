@@ -18,8 +18,9 @@ import (
 
 // runRevive drives ReviveVM for a manifest of dead sandboxes, one per
 // line: `<sandbox-id> <disk-path> [vcpu] [mem-mib]` plus optional named
-// tokens `base=<path>`, `allow=<cidr,...>`, `deny=<cidr,...>`,
-// `domains=<domain,...>`. Egress tokens exist because vmd does not
+// tokens `base=<path>`, `block-map=<path>` (the overlay's saved block
+// map restored beside the salvage), `allow=<cidr,...>`,
+// `deny=<cidr,...>`, `domains=<domain,...>`. Egress tokens exist because vmd does not
 // record network policy: the control plane owns it, so a policied
 // sandbox must have its rules supplied here or reapplied before the
 // row activates. Operator tool, run
@@ -92,6 +93,8 @@ func runRevive(args []string) int {
 				} else {
 					req.BasePath = p
 				}
+			} else if p, ok := strings.CutPrefix(tok, "block-map="); ok {
+				req.BlockMapPath = p
 			} else if p, ok := strings.CutPrefix(tok, "allow="); ok {
 				req.AllowedCidrs = splitCommaList(p)
 			} else if p, ok := strings.CutPrefix(tok, "deny="); ok {
@@ -122,6 +125,10 @@ func runRevive(args []string) int {
 		// into a 1 GiB VM.
 		if req.StandaloneDisk && req.BasePath != "" {
 			fmt.Printf("FAILED %s: base=none conflicts with base=%s\n", req.VmId, req.BasePath)
+			badField = true
+		}
+		if req.StandaloneDisk && req.BlockMapPath != "" {
+			fmt.Printf("FAILED %s: base=none conflicts with block-map=%s\n", req.VmId, req.BlockMapPath)
 			badField = true
 		}
 		if len(fields) > 4 {

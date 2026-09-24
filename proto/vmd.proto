@@ -327,6 +327,10 @@ message ReviveVMRequest {
   // straight to data-plane usage attribution.
   string team_id = 13;
   string owner_id = 14;
+  // The overlay's saved block map, restored beside the salvage: the boot
+  // takes it as the record of which blocks the disk holds. Empty derives
+  // the map from the disk's allocation.
+  string block_map_path = 15;
 }
 
 message ReviveVMResponse {

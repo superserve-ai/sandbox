@@ -936,6 +936,60 @@ func TestFastResumeKeepsBackupViaInlineStaging(t *testing.T) {
 	}
 }
 
+// An overlay pause stages the snapshot's block map with the pair, so the
+// generation restores with the map Firecracker saved rather than one
+// derived from the disk's allocation.
+func TestBackupPauseStagesTheOverlayBlockMap(t *testing.T) {
+	dir := t.TempDir()
+	staging := filepath.Join(dir, "staging")
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "overlay.ext4")
+	base := filepath.Join(dir, "base.ext4")
+	blockMap := overlayBlockMapPath(snap)
+	for p, data := range map[string]string{snap: "vm state", disk: "overlay", base: "base bytes", blockMap: "saved block map"} {
+		if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{
+		vms:      map[string]*VMInstance{"vm-1": {Status: StatusPaused, SnapshotPath: snap}},
+		unitDead: func(context.Context, string) bool { return false },
+	}
+	m.backupStaging = staging
+	m.pauseStagingRoot = m.backupStaging
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+	awaitRehashWorkers(t, m, 1)
+
+	m.backupPause(context.Background(), "vm-1", snap, disk, base, "tok-test", zerolog.Nop())
+
+	select {
+	case task := <-tasks:
+		var got *backup.TaskFile
+		for i := range task.Files {
+			if task.Files[i].Name == backup.BlockMapName {
+				got = &task.Files[i]
+			}
+		}
+		if got == nil {
+			t.Fatalf("task files %+v carry no block map", task.Files)
+		}
+		want := sha256.Sum256([]byte("saved block map"))
+		if got.SHA256 != hex.EncodeToString(want[:]) {
+			t.Fatalf("block map digest = %s, want the saved map's", got.SHA256)
+		}
+		if !strings.HasPrefix(got.Path, staging+string(os.PathSeparator)) {
+			t.Fatalf("block map path %s is not staged", got.Path)
+		}
+		if data, err := os.ReadFile(got.Path); err != nil || string(data) != "saved block map" {
+			t.Fatalf("staged block map = %q, %v", data, err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("overlay pause never enqueued")
+	}
+}
+
 // When pauseStagingRoot and backupStaging point at different trees (an
 // operator-configured BACKUP_STAGING_DIR, in production), the pause RPC
 // path still stages inline under pauseStagingRoot, but the detached

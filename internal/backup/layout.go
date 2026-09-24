@@ -77,6 +77,9 @@ const (
 	// ManifestObject is the per-generation metadata object, written last:
 	// its presence marks the generation complete and restorable.
 	ManifestObject = "manifest.json"
+	// BlockMapName is the overlay block map Firecracker saves beside a
+	// snapshot; a restore keeps it beside the disk it describes.
+	BlockMapName = "vmstate.snap.overlay"
 )
 
 // SandboxObject names an artifact object within a sandbox generation.

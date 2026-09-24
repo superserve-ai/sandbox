@@ -1189,6 +1189,9 @@ func pidIsVMFirecracker(pid int, vmID string) bool {
 // per-VM copy must then be hole-exact, so it reflinks strictly rather
 // than falling back to a heuristic sparse copy that could turn
 // guest-written zeros into holes exposing base content.
+// blockMap, when non-empty, is the snapshot's saved block map for that
+// overlay: placed beside the copy, Firecracker takes it as the record of
+// which blocks the overlay holds instead of reading the file's allocation.
 // supervised spawns the VM under the fleet's real lifecycle supervision
 // (systemd unit or validated cgroup, seeded by `supervision`) through
 // the same dispatcher resume uses, so auto-pause's mode-directed stop
@@ -1196,7 +1199,7 @@ func pidIsVMFirecracker(pid int, vmID string) bool {
 // The flag is explicit because SupervisionUnit is the zero value: a
 // sentinel on the mode alone cannot distinguish "unit mode" from the
 // legacy unsupervised spawn kept for throwaway template-build VMs.
-func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, rules *sandboxNetworkRules, seed func(*VMInstance), preLaunch func() error, supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
+func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath, blockMap string, rules *sandboxNetworkRules, seed func(*VMInstance), preLaunch func() error, supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
@@ -1259,6 +1262,13 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("copy rootfs: %w", err)
+	}
+	if blockMap != "" {
+		if err := placeBlockMap(blockMap, diskPath); err != nil {
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("place block map: %w", err)
+		}
 	}
 
 	// 2. Set up networking.
@@ -1695,6 +1705,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	}
 
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
+	// Firecracker rewrites the overlay block map with every snapshot it
+	// saves; one an earlier pause left at this fixed path must not stand
+	// in for this pause's if the save leaves none.
+	if err := os.Remove(overlayBlockMapPath(snapshotPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", "", nil, fmt.Errorf("drop previous block map: %w", err)
+	}
 
 	// Read the fields that select Full vs in-place-diff vs layered together under the
 	// lock, so the decision can't see a torn mix written by a concurrent resume.
@@ -7409,6 +7425,25 @@ func (m *Manager) copyRootfsExact(ctx context.Context, dirName, srcRootfs string
 		return "", fmt.Errorf("exact copy (source and run dir must share a reflink filesystem): %s: %w", string(out), err)
 	}
 	return diskPath, nil
+}
+
+// placeBlockMap puts a snapshot's saved overlay block map where Firecracker
+// looks for one when it opens the per-VM overlay: a link when the map
+// shares the run dir's filesystem (Firecracker only reads it and unlinks
+// its own name), a copy of the small file otherwise.
+func placeBlockMap(blockMap, diskPath string) error {
+	dst := diskPath + ".bitmap"
+	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Link(blockMap, dst); !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	data, err := os.ReadFile(blockMap)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o644)
 }
 
 // cloneSavedDisk gives the VM its own copy of a saved snapshot's disk. An
