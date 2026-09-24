@@ -10,6 +10,7 @@ internal_api_token_secret_name        = "internal-api-token-staging"
 sandbox_access_token_seed_secret_name = "sandbox-access-token-seed-staging"
 secrets_signing_key_secret_name       = "secretsproxy-signing-key-staging"
 peer_ca_operator_members              = ["user:alejandro@superserve.ai"]
+build_host_id                         = "staging-usc1-2-5751551b1d454aaa9445ea891fe3625d"
 
 proxy_generation_cells = {
   staging = {
