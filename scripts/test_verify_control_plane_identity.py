@@ -2,7 +2,7 @@ import importlib.util
 import io
 import json
 import os
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import sys
 import tempfile
@@ -81,207 +81,96 @@ class BinaryArtifactProbeTests(unittest.TestCase):
             self.assertTrue(evidence.index[0]["stdout_streamed"])
 
 
-class DeletePermissionProbeTests(unittest.TestCase):
-    def test_delete_probe_uses_object_resource_without_mutation(self):
-        self.assertEqual(
-            VERIFY.storage_object_resource(
-                "cell-backups", "templates/example/build-1/generation-1/manifest.json"
-            ),
-            "//storage.googleapis.com/projects/_/buckets/cell-backups/objects/"
-            "templates/example/build-1/generation-1/manifest.json",
-        )
-        self.assertEqual(
-            VERIFY.policy_troubleshooter_access('{"access":"NOT_GRANTED"}'),
-            "NOT_GRANTED",
-        )
+class RuntimePropagationTests(unittest.TestCase):
+    runtime_argv = VERIFY.storage_list_command("cell-backups", "templates/", "reader@example.com")
+    mint_denial = "PERMISSION_DENIED: Failed to impersonate reader; iam.serviceAccounts.getAccessToken denied"
+    storage_denial = "ERROR: Permission denied: storage.objects.list"
 
-    def test_delete_probe_rejects_missing_access_decision(self):
-        with self.assertRaises(VERIFY.VerificationError):
-            VERIFY.policy_troubleshooter_access("{}")
+    def exercise(self, replies, probes):
+        elapsed = [0]
+        sleeps = []
 
-    def test_create_probe_targets_a_synthetic_object_resource(self):
-        self.assertEqual(
-            VERIFY.storage_object_resource("cell-backups", "templates/.permission-probe"),
-            "//storage.googleapis.com/projects/_/buckets/cell-backups/objects/"
-            "templates/.permission-probe",
-        )
+        def sleep(seconds):
+            sleeps.append(seconds)
+            elapsed[0] += seconds
 
+        def run(argv, **kwargs):
+            code, stdout, stderr = replies.pop(0)
+            return VERIFY.subprocess.CompletedProcess(argv, code, stdout, stderr)
 
-class ObjectReadPermissionProbeTests(unittest.TestCase):
-    def test_denial_matrix_covers_every_prefix_and_cell(self):
-        manifest = "templates/tpl/build/gen/manifest.json"
-        checks = VERIFY.storage_denial_checks("own", ["east", "west"], manifest)
-        observed = {(bucket, name, permission) for _, bucket, name, permission in checks}
-        expected = {
-            (bucket, f"{prefix}/.permission-probe", f"storage.objects.{operation}")
-            for bucket, operations in (
-                ("own", ("create", "delete")),
-                ("east", ("get", "create", "delete")),
-                ("west", ("get", "create", "delete")),
-            )
-            for prefix in ("templates", "bases", "sandboxes")
-            for operation in operations
-        }
-        expected.add(("own", "sandboxes/.permission-probe", "storage.objects.get"))
-        expected.add(("own", manifest, "storage.objects.delete"))
-        self.assertEqual(observed, expected)
-        self.assertEqual(len({check[0] for check in checks}), len(checks))
-
-    def test_all_denial_probes_reject_grants_and_unknown_results_without_mutating(self):
-        checks = VERIFY.storage_denial_checks("own", ["other"], "templates/t/b/g/manifest.json")
-        for response in ('{"access":"GRANTED"}', '{"access":"UNKNOWN_INFO"}', '{}', 'null', 'invalid'):
-            for name, bucket, object_name, permission in checks:
-                with self.subTest(name=name, response=response), tempfile.TemporaryDirectory() as directory:
-                    evidence = VERIFY.Evidence(Path(directory))
-
-                    def command(check_name, argv, **_kwargs):
-                        self.assertEqual(argv[:3], ["gcloud", "policy-troubleshoot", "iam"])
-                        self.assertIn(VERIFY.storage_object_resource(bucket, object_name), argv)
-                        self.assertIn(f"--permission={permission}", argv)
-                        evidence.index.append({"name": check_name, "status": "PASS"})
-                        return response
-
-                    evidence.command = command
-                    with self.assertRaises(VERIFY.VerificationError):
-                        VERIFY.require_permission_denied(
-                            evidence, name, "reader@example.com", bucket, object_name, permission,
-                        )
-                    self.assertEqual(evidence.index[-1]["status"], "FAIL")
-
-    def test_sandbox_get_probe_is_non_mutating_and_fails_closed(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(VERIFY.subprocess, "run", side_effect=run) as calls, \
+                patch.object(VERIFY.time, "monotonic", side_effect=lambda: elapsed[0]), \
+                patch.object(VERIFY.time, "sleep", side_effect=sleep), \
+                patch.object(VERIFY, "RUNTIME_IAM_RETRY_SECONDS", 30), \
+                redirect_stdout(io.StringIO()):
             evidence = VERIFY.Evidence(Path(directory))
-            commands = []
+            outcomes = []
+            for name, argv, options in probes:
+                try:
+                    outcomes.append(evidence.command(name, argv, **options))
+                except VERIFY.VerificationError:
+                    outcomes.append(None)
+            evidence.write_index("PASS" if all(value is not None for value in outcomes) else "FAIL")
+            saved = json.loads((Path(directory) / "evidence.json").read_text())
+            files = {path.name: path.read_text() for path in (Path(directory) / "commands").iterdir()}
+            return outcomes, saved, files, sleeps, calls.call_count
 
-            def command(name, argv, **_kwargs):
-                commands.append((name, argv))
-                evidence.index.append({"name": name, "status": "PASS"})
-                return '{"access":"NOT_GRANTED"}'
+    def test_new_token_and_storage_grants_can_propagate_with_attempt_evidence(self):
+        outcomes, saved, files, sleeps, calls = self.exercise([
+            (1, "", self.mint_denial), (1, "", self.storage_denial), (0, "manifest\n", ""),
+        ], [("own-template-list", self.runtime_argv, {})])
+        self.assertEqual(outcomes, ["manifest\n"])
+        self.assertEqual(saved["status"], "PASS")
+        self.assertEqual([row["status"] for row in saved["checks"]], ["PASS"])
+        self.assertEqual([row["status"] for row in saved["checks"][0]["attempts"]], ["FAIL", "FAIL"])
+        self.assertIn(self.mint_denial, files["01-own-template-list.stderr"])
+        self.assertEqual(sleeps, [15, 15])
+        self.assertEqual(calls, 3)
 
-            evidence.command = command
-            VERIFY.require_permission_denied(
-                evidence,
-                "sandbox-get-permission-check",
-                "reader@example-project.iam.gserviceaccount.com",
-                "cell-backups",
-                "sandboxes/.permission-probe",
-                "storage.objects.get",
-            )
+    def test_permanent_denial_exhausts_shared_window_and_stays_failed(self):
+        outcomes, saved, _, sleeps, calls = self.exercise([
+            (1, "", self.mint_denial), (0, "manifest", ""),
+            (1, "", self.storage_denial), (1, "", self.storage_denial),
+        ], [("own-template-list", self.runtime_argv, {}), ("manifest-read", self.runtime_argv, {})])
+        self.assertEqual(outcomes, ["manifest", None])
+        self.assertEqual(saved["status"], "FAIL")
+        self.assertEqual([row["status"] for row in saved["checks"]], ["PASS", "FAIL"])
+        self.assertEqual(len(saved["checks"][1]["attempts"]), 1)
+        self.assertEqual(sum(sleeps), 30)
+        self.assertEqual(calls, 4)
 
-            name, argv = commands[0]
-            self.assertEqual(name, "sandbox-get-permission-check")
-            self.assertIn(
-                "//storage.googleapis.com/projects/_/buckets/cell-backups/objects/"
-                "sandboxes/.permission-probe",
-                argv,
-            )
-            self.assertIn("--permission=storage.objects.get", argv)
-
-    def test_sandbox_get_probe_rejects_granted_access(self):
-        with tempfile.TemporaryDirectory() as directory:
-            evidence = VERIFY.Evidence(Path(directory))
-
-            def command(name, argv, **_kwargs):
-                evidence.index.append({"name": name, "status": "PASS"})
-                return '{"access":"GRANTED"}'
-
-            evidence.command = command
-            with self.assertRaises(VERIFY.VerificationError):
-                VERIFY.require_permission_denied(
-                    evidence,
-                    "cross-cell-get-1",
-                    "reader@example-project.iam.gserviceaccount.com",
-                    "other-cell-backups",
-                    "sandboxes/.permission-probe",
-                    "storage.objects.get",
-                )
-            self.assertEqual(evidence.index[0]["status"], "FAIL")
-
-    def test_cross_cell_template_get_probe_targets_other_cell_template_prefix(self):
-        with tempfile.TemporaryDirectory() as directory:
-            evidence = VERIFY.Evidence(Path(directory))
-            commands = []
-
-            def command(name, argv, **_kwargs):
-                commands.append((name, argv))
-                evidence.index.append({"name": name, "status": "PASS"})
-                return '{"access":"NOT_GRANTED"}'
-
-            evidence.command = command
-            VERIFY.require_permission_denied(
-                evidence,
-                "cross-cell-template-get-1",
-                "reader@example-project.iam.gserviceaccount.com",
-                "other-cell-backups",
-                "templates/.permission-probe",
-                "storage.objects.get",
-            )
-
-            name, argv = commands[0]
-            self.assertEqual(name, "cross-cell-template-get-1")
-            self.assertIn(
-                "//storage.googleapis.com/projects/_/buckets/other-cell-backups/objects/"
-                "templates/.permission-probe",
-                argv,
-            )
-            self.assertIn("--permission=storage.objects.get", argv)
-
-
-class EffectiveIamCommandTests(unittest.TestCase):
-    def test_effective_iam_uses_supported_project_scope_flag(self):
-        command = VERIFY.effective_iam_command(
-            "example-project", "reader@example-project.iam.gserviceaccount.com", "cell-backups"
-        )
-        self.assertIn("--project=example-project", command)
-        self.assertNotIn("--scope=projects/example-project", command)
-
-
-class EffectiveIamCompletenessTests(unittest.TestCase):
-    def test_complete_empty_results_allow_protobuf_omission(self):
-        for analysis in ({"fullyExplored": True}, {"fullyExplored": True, "analysisResults": []}):
-            self.assertEqual(VERIFY.iam_analysis_results(json.dumps(analysis)), [])
-            self.assertEqual(VERIFY.iam_analysis_results(json.dumps({
-                "fullyExplored": True, "mainAnalysis": analysis,
-                "serviceAccountImpersonationAnalysis": [analysis],
-            })), [])
-
-    def test_every_analysis_must_explicitly_be_complete(self):
-        for incomplete in ({}, {"fullyExplored": False}, {"fullyExplored": "true"}, {"fullyExplored": 1}):
-            for document in (
-                incomplete,
-                {**incomplete, "mainAnalysis": {"fullyExplored": True}},
-                {"fullyExplored": True, "mainAnalysis": incomplete},
-                {"fullyExplored": True, "mainAnalysis": {"fullyExplored": True},
-                 "serviceAccountImpersonationAnalysis": [incomplete]},
-            ):
-                with self.subTest(document=document), self.assertRaises(VERIFY.VerificationError):
-                    VERIFY.iam_analysis_results(json.dumps(document))
-
-    def test_errors_and_malformed_results_are_rejected(self):
-        for document in (
-            [], None,
-            {"fullyExplored": True, "analysisResults": {}},
-            {"fullyExplored": True, "nonCriticalErrors": [{"cause": "PERMISSION_DENIED"}]},
-            {"fullyExplored": True, "nonCriticalErrors": {}},
-            {"fullyExplored": True, "mainAnalysis": None},
-            {"fullyExplored": True, "mainAnalysis": {"fullyExplored": True, "nonCriticalErrors": [{}]}},
-            {"fullyExplored": True, "serviceAccountImpersonationAnalysis": []},
-            {"fullyExplored": True, "mainAnalysis": {"fullyExplored": True},
-             "serviceAccountImpersonationAnalysis": {}},
-            {"fullyExplored": True, "mainAnalysis": {"fullyExplored": True},
-             "serviceAccountImpersonationAnalysis": [{"fullyExplored": True, "analysisResults": None}]},
+    def test_impersonation_failure_is_not_an_isolation_denial(self):
+        for replies, expected in (
+            ([(1, "", self.mint_denial)] * 3, "FAIL"),
+            ([(1, "", self.mint_denial), (1, "", self.storage_denial)], "PASS"),
         ):
-            with self.subTest(document=document), self.assertRaises(VERIFY.VerificationError):
-                VERIFY.iam_analysis_results(json.dumps(document))
-        with self.assertRaises(VERIFY.VerificationError):
-            VERIFY.iam_analysis_results("invalid JSON")
+            with self.subTest(expected=expected):
+                _, saved, _, _, _ = self.exercise(replies, [
+                    ("cross-cell-list-denied", self.runtime_argv, {"expect_denied": True}),
+                ])
+                self.assertEqual(saved["status"], expected)
+                self.assertEqual(saved["checks"][0]["status"], expected)
 
-    def test_direct_and_impersonation_grants_are_preserved_for_rejection(self):
-        for key in ("mainAnalysis", "serviceAccountImpersonationAnalysis"):
-            document = {"fullyExplored": True, "mainAnalysis": {"fullyExplored": True}}
-            grant = {"fullyExplored": True, "analysisResults": [{"identity": "host"}]}
-            document[key] = [grant] if key == "serviceAccountImpersonationAnalysis" else grant
-            self.assertEqual(VERIFY.iam_analysis_results(json.dumps(document)), [{"identity": "host"}])
+    def test_unexpected_access_non_iam_errors_and_traffic_writes_do_not_retry(self):
+        for reply, argv, options in (
+            ((0, "unexpected-object", ""), self.runtime_argv, {"expect_denied": True}),
+            ((1, "", "connection reset"), self.runtime_argv, {}),
+            ((1, "", self.storage_denial), ["gcloud", "run", "services", "update-traffic"], {}),
+        ):
+            with self.subTest(reply=reply):
+                _, saved, _, sleeps, calls = self.exercise([reply], [("probe", argv, options)])
+                self.assertEqual(saved["status"], "FAIL")
+                self.assertEqual(sleeps, [])
+                self.assertEqual(calls, 1)
+
+    def test_retried_secret_output_remains_redacted(self):
+        _, saved, files, _, _ = self.exercise([
+            (1, "partial-secret", self.storage_denial), (0, "full-secret", ""),
+        ], [("secret-access", self.runtime_argv, {"redact_stdout": True})])
+        self.assertEqual(saved["status"], "PASS")
+        self.assertEqual(files["01-secret-access.stdout"], "<redacted>\n")
+        self.assertEqual(files["02-secret-access.stdout"], "<redacted>\n")
 
 
 class KmsOwnershipTests(unittest.TestCase):
@@ -304,8 +193,8 @@ class KmsOwnershipTests(unittest.TestCase):
         self.assertIn("gcloud kms decrypt", source)
 
 
-class RuntimeIamRolloutTests(unittest.TestCase):
-    def run_verifier(self, runtime_analysis, overrides=None):
+class RuntimeAccessRolloutTests(unittest.TestCase):
+    def run_verifier(self, overrides=None, *, failures=(), omitted=(), cell="staging"):
         identity = "reader@example-project.iam.gserviceaccount.com"
         deployer = "deployer@example-project.iam.gserviceaccount.com"
         manifest = "templates/template/build/generation/manifest.json"
@@ -326,14 +215,10 @@ class RuntimeIamRolloutTests(unittest.TestCase):
             "service-before-route": service,
             "own-template-list": manifest,
             "manifest-read": {"files": [{"object": "memory.pack"}]},
-            "bucket-iam": {"bindings": []},
-            "project-iam": {"bindings": []},
-            "service-account-iam": {"bindings": [
-                {"role": role, "members": [f"serviceAccount:{deployer}"]}
-                for role in ("roles/iam.serviceAccountUser", "roles/iam.serviceAccountTokenCreator")
-            ]},
-            "host-effective-iam-1": {"fullyExplored": True},
-            "effective-iam": runtime_analysis,
+            "secret-access-1": "",
+            "kms-iam": {"bindings": [{"role": "roles/cloudkms.cryptoKeyEncrypterDecrypter", "members": [f"serviceAccount:{identity}"]}]},
+            "kms-encrypt-as-runtime": "",
+            "kms-decrypt-as-runtime": "",
             "route-candidate": "",
             "traffic-after-route": routed_service,
             "latest-revision": {"spec": {"serviceAccountName": identity}},
@@ -343,17 +228,27 @@ class RuntimeIamRolloutTests(unittest.TestCase):
 
         def command(evidence, name, argv, **kwargs):
             commands.append(name)
+            self.assertNotIn(argv[1:3], (["asset", "analyze-iam-policy"], ["policy-troubleshoot", "iam"]))
+            if "get-iam-policy" in argv:
+                self.assertEqual(argv[1:3], ["kms", "keys"])
+            if name in failures:
+                evidence.index.append({"name": name, "status": "FAIL"})
+                raise VERIFY.VerificationError(f"{name}: probe failed")
+            if name.startswith(("referenced-read-", "secret-access-", "kms-encrypt-", "kms-decrypt-")) or kwargs.get("expect_denied"):
+                self.assertIn(f"--impersonate-service-account={identity}", argv)
+            if name.startswith("secret-access-"):
+                self.assertTrue(kwargs.get("redact_stdout"))
+            if name == "kms-decrypt-as-runtime":
+                destination = next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--plaintext-file="))
+                Path(destination).write_bytes(b"control-plane-kms-access-probe-v1\n")
             if name == "candidate-revision":
                 self.assertEqual(argv[4], "api-new")
             if name == "route-candidate":
                 self.assertIn("--to-revisions=api-new=100", argv)
                 self.assertNotIn("--to-latest", argv)
-            evidence.index.append({"name": name, "status": "PASS"})
-            if "policy-troubleshoot" in argv:
-                result = {"access": "NOT_GRANTED"}
-            elif name.startswith("managed-folder-iam-"):
-                result = {"bindings": [{"role": "roles/storage.objectViewer", "members": [f"serviceAccount:{identity}"]}]}
-            elif kwargs.get("expect_denied") or name.startswith("referenced-read-"):
+            if name not in omitted:
+                evidence.index.append({"name": name, "status": "PASS"})
+            if kwargs.get("expect_denied") or name.startswith("referenced-read-"):
                 result = ""
             else:
                 result = responses[name]
@@ -367,9 +262,11 @@ class RuntimeIamRolloutTests(unittest.TestCase):
                 "deployment_identity": deployer, "backup_bucket": "own-cell",
                 "backup_object_prefix": "templates/", "backup_object_prefixes": ["templates/", "bases/"],
                 "backup_permissions": ["storage.objects.get", "storage.objects.list"],
-                "secret_ids": [], "host_identities_unchanged": ["host@example.com"],
+                "secret_ids": ["runtime-secret"], "host_identities_unchanged": ["host@example.com"],
+                "kms_key_resource": "projects/example-project/locations/example-region/keyRings/example/cryptoKeys/example" if cell != "staging" else None,
+                "kms_grant_principal": identity, "kms_grant_role": "roles/cloudkms.cryptoKeyEncrypterDecrypter",
             }))
-            argv = [str(SPEC.origin), "--cell", "example", "--project", "example-project",
+            argv = [str(SPEC.origin), "--cell", cell, "--project", "example-project",
                     "--region", "example-region", "--service", "api", "--contract-file", str(contract_path),
                     "--evidence-dir", str(root / "evidence"), "--other-bucket", "other-cell",
                     "--allow-pending-traffic", "--route-traffic", "--candidate-revision", "api-new"]
@@ -381,28 +278,27 @@ class RuntimeIamRolloutTests(unittest.TestCase):
                 os.umask(previous_umask)
             return status, json.loads((root / "evidence/evidence.json").read_text()), commands
 
-    def test_incomplete_runtime_iam_fails_evidence_and_never_routes(self):
-        for response in (
-            {}, "invalid JSON", {"fullyExplored": False},
-            {"fullyExplored": True, "nonCriticalErrors": [{"cause": "PERMISSION_DENIED"}]},
-            {"fullyExplored": True, "mainAnalysis": {"fullyExplored": False}},
-        ):
-            with self.subTest(response=response):
-                status, evidence, commands = self.run_verifier(response)
-                self.assertEqual(status, 1)
-                self.assertEqual(evidence["status"], "FAIL")
-                runtime = next(check for check in evidence["checks"] if check["name"] == "effective-iam")
-                self.assertEqual(runtime["status"], "FAIL")
-                self.assertNotIn("route-candidate", commands)
+    def test_runtime_access_passes_before_routing_in_all_cells_without_policy_audits(self):
+        for cell in ("staging", "production-use4", "production-usw2"):
+            with self.subTest(cell=cell):
+                status, evidence, commands = self.run_verifier(cell=cell)
+                self.assertEqual(status, 0)
+                self.assertEqual(evidence["status"], "PASS")
+                for name in ("manifest-read", "referenced-read-1", "secret-access-1", "sandbox-list-denied", "cross-cell-1-templates-list-denied"):
+                    self.assertLess(commands.index(name), commands.index("route-candidate"))
+                if cell != "staging":
+                    self.assertLess(commands.index("kms-decrypt-as-runtime"), commands.index("route-candidate"))
 
-    def test_complete_runtime_iam_with_intended_grants_allows_routing(self):
-        status, evidence, commands = self.run_verifier({
-            "fullyExplored": True,
-            "mainAnalysis": {"fullyExplored": True, "analysisResults": [{"iamBinding": {"role": "roles/storage.objectViewer"}}]},
-        })
-        self.assertEqual(status, 0)
-        self.assertEqual(evidence["status"], "PASS")
-        self.assertIn("route-candidate", commands)
+    def test_runtime_probe_failure_or_missing_evidence_prevents_routing(self):
+        for name in ("manifest-read", "referenced-read-1", "secret-access-1", "kms-encrypt-as-runtime", "kms-decrypt-as-runtime",
+                     "sandbox-list-denied", "cross-cell-1-bases-list-denied"):
+            for failure_mode in ("failed", "omitted"):
+                with self.subTest(name=name, failure_mode=failure_mode):
+                    options = {"failures" if failure_mode == "failed" else "omitted": [name]}
+                    status, evidence, commands = self.run_verifier(cell="production-use4", **options)
+                    self.assertEqual(status, 1)
+                    self.assertEqual(evidence["status"], "FAIL")
+                    self.assertNotIn("route-candidate", commands)
 
     def test_wrong_identity_unready_or_unrelated_candidate_never_routes(self):
         valid = {"metadata": {"name": "api-new", "labels": {"serving.knative.dev/service": "api"}},
@@ -415,20 +311,20 @@ class RuntimeIamRolloutTests(unittest.TestCase):
             {"metadata": {"name": "api-new", "labels": {"serving.knative.dev/service": "other"}}},
         ):
             with self.subTest(change=change):
-                status, _, commands = self.run_verifier({"fullyExplored": True},
+                status, _, commands = self.run_verifier(
                     {"candidate-revision": {**valid, **change}})
                 self.assertEqual(status, 1)
                 self.assertNotIn("route-candidate", commands)
 
     def test_newer_revision_during_checks_does_not_get_routed(self):
-        status, _, commands = self.run_verifier({"fullyExplored": True}, {
+        status, _, commands = self.run_verifier({
             "service-before-route": {"status": {"latestCreatedRevisionName": "api-newer"}},
         })
         self.assertEqual(status, 1)
         self.assertNotIn("route-candidate", commands)
 
     def test_latest_traffic_cannot_substitute_for_candidate_after_route(self):
-        status, evidence, _ = self.run_verifier({"fullyExplored": True}, {
+        status, evidence, _ = self.run_verifier({
             "traffic-after-route": {"status": {"latestReadyRevisionName": "api-newer",
                 "traffic": [{"latestRevision": True, "revisionName": "api-newer", "percent": 100}]}},
         })

@@ -16,8 +16,16 @@ cd "$root/infra/bootstrap/control-plane-evidence"
 terraform init -input=false -reconfigure -lockfile=readonly \
   -backend-config="bucket=$STATE_BUCKET" \
   -backend-config="prefix=bootstrap/control-plane-evidence"
-terraform plan -input=false -out=tfplan
-terraform apply -input=false -auto-approve tfplan
+applied=false
+for attempt in 1 2 3 4 5 6; do
+  # Replan after a partial apply rather than replaying a stale plan.
+  if terraform plan -input=false -out=tfplan && terraform apply -input=false -auto-approve tfplan; then
+    applied=true
+    break
+  fi
+  if [[ "$attempt" != 6 ]]; then sleep 10; fi
+done
+[[ "$applied" == true ]] || { echo 'Verification bootstrap did not complete.' >&2; exit 1; }
 bucket=$(terraform output -raw bucket_name)
 
 # Exercise the same create permission as evidence uploads before touching

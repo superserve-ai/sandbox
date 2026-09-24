@@ -21,6 +21,28 @@ variable "deployment_service_account" {
   type = string
 }
 
+variable "verification_kms_key" {
+  description = "Production credentials key whose primary-version readiness is checked before rollout."
+  type        = string
+  default     = ""
+}
+
+resource "google_kms_crypto_key_iam_member" "verification_metadata" {
+  for_each = var.verification_kms_key == "" ? toset([]) : toset([var.verification_kms_key])
+
+  crypto_key_id = each.value
+  role          = "roles/cloudkms.viewer"
+  member        = "serviceAccount:${var.deployment_service_account}"
+}
+
+# Retire the audit tools without disabling APIs that other callers may use.
+removed {
+  from = google_project_service.verification
+  lifecycle {
+    destroy = false
+  }
+}
+
 variable "retention_days" {
   description = "Minimum evidence retention and age at which lifecycle deletion becomes eligible."
   type        = number

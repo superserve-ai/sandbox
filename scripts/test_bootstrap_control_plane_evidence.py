@@ -17,6 +17,10 @@ class EvidenceBootstrapTests(unittest.TestCase):
                 executable.write_text('''#!/bin/sh
 printf '%s %s\\n' "${0##*/}" "$*" >> "$CALLS"
 if [ "${0##*/}:$1" = "$FAILURE" ]; then exit 1; fi
+if [ "$FAILURE" = "terraform:apply-once" ] && [ "${0##*/}:$1" = "terraform:apply" ] && [ ! -f "$CALLS.once" ]; then
+  touch "$CALLS.once"
+  exit 1
+fi
 if [ "${0##*/}:$1" = "terraform:output" ]; then echo example-control-plane-evidence; fi
 ''')
                 executable.chmod(0o755)
@@ -45,8 +49,19 @@ if [ "${0##*/}:$1" = "terraform:output" ]; then echo example-control-plane-evide
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(env, '')
                 self.assertNotIn('gcloud run ', calls)
+                if failure == 'terraform:apply':
+                    self.assertEqual(calls.count('terraform plan'), 6)
+                    self.assertEqual(calls.count('terraform apply'), 6)
                 if failure == 'gcloud:storage':
                     self.assertEqual(calls.count('gcloud storage cp'), 6)
+
+    def test_partial_apply_replans_before_retry_and_still_requires_upload(self):
+        result, calls, env = self.run_bootstrap('terraform:apply-once')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        terraform_calls = [line.split()[1] for line in calls.splitlines() if line.startswith('terraform ')]
+        self.assertEqual(terraform_calls, ['init', 'plan', 'apply', 'plan', 'apply', 'output'])
+        self.assertIn('gcloud storage cp', calls)
+        self.assertIn('CONTROL_PLANE_EVIDENCE_BUCKET=', env)
 
     def test_every_cell_bootstraps_before_identity_changes_and_pins_candidate(self):
         workflow = (ROOT / '.github/workflows/control-plane-identity-rollout.yml').read_text()

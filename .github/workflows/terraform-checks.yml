@@ -42,7 +42,7 @@ jobs:
       - name: Validate Terraform roots
         run: scripts/terraform-validate.sh
 
-      - name: Test private identity rollout evidence storage
+      - name: Test identity rollout evidence bootstrap
         run: terraform -chdir=infra/bootstrap/control-plane-evidence test
 
       - name: Test peer CA custody and IAM with mocked providers

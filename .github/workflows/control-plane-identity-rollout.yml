@@ -11,14 +11,146 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: "Type apply to run the staged identity migration"
+        description: "Deploy staging and production: type apply on main, or apply-branch on another branch"
         required: true
         type: string
 
+env:
+  CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+
 jobs:
+  bootstrap:
+    name: Prepare ${{ matrix.environment }} verification
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref_type == 'branch' && ((github.ref == 'refs/heads/main' && inputs.confirm == 'apply') || (github.ref != 'refs/heads/main' && inputs.confirm == 'apply-branch')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - environment: staging
+            state_bucket: superserve-terraform-state
+          - environment: production
+            state_bucket: superserve-terraform-state-prod
+            verification_kms_key: projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Prepare evidence storage and KMS metadata access
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          DEPLOYMENT_SERVICE_ACCOUNT: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          STATE_BUCKET: ${{ matrix.state_bucket }}
+          TF_VAR_verification_kms_key: ${{ matrix.verification_kms_key }}
+        run: scripts/bootstrap-control-plane-evidence.sh
+
+  prerequisites:
+    name: Check ${{ matrix.cell }} prerequisites
+    needs: [bootstrap]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cell: staging
+            environment: staging
+            root: infra/envs/staging/us-central1
+            state_bucket: superserve-terraform-state
+            region_variable: GCP_REGION
+            service_variable: CLOUD_RUN_SERVICE
+          - cell: production-use4
+            environment: production
+            root: infra/envs/production/us-east4
+            state_bucket: superserve-terraform-state-prod
+            region_variable: GCP_REGION_USE4
+            service_variable: CLOUD_RUN_SERVICE_USE4
+          - cell: production-usw2
+            environment: production
+            root: infra/envs/production/us-west2
+            state_bucket: superserve-terraform-state-prod
+            region_variable: GCP_REGION_USW
+            service_variable: CLOUD_RUN_SERVICE_USW
+    runs-on: ubuntu-latest
+    environment: ${{ matrix.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CELL: ${{ matrix.cell }}
+      TF_ROOT: ${{ matrix.root }}
+      STATE_BUCKET: ${{ matrix.state_bucket }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - uses: google-github-actions/setup-gcloud@v2
+      - name: Locate private evidence storage
+        run: |
+          set -euo pipefail
+          terraform -chdir=infra/bootstrap/control-plane-evidence init -input=false -reconfigure -lockfile=readonly \
+            -backend-config="bucket=$STATE_BUCKET" -backend-config="prefix=bootstrap/control-plane-evidence"
+          bucket=$(terraform -chdir=infra/bootstrap/control-plane-evidence output -raw bucket_name)
+          test -n "$bucket"
+          echo "CONTROL_PLANE_EVIDENCE_BUCKET=$bucket" >> "$GITHUB_ENV"
+      - name: Plan and check prerequisites without applying
+        env:
+          TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+          PROJECT: ${{ vars.GCP_PROJECT }}
+          REGION: ${{ vars[matrix.region_variable] }}
+          SERVICE: ${{ vars[matrix.service_variable] }}
+          DEPLOYMENT_IDENTITY: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/prerequisites/$CELL"
+          mkdir -p "$evidence"
+          terraform -chdir="$TF_ROOT" init -input=false -lockfile=readonly
+          terraform -chdir="$TF_ROOT" plan -input=false -out="$RUNNER_TEMP/prerequisite.tfplan" \
+            > "$evidence/plan.stdout" 2> "$evidence/plan.stderr"
+          terraform -chdir="$TF_ROOT" show -json "$RUNNER_TEMP/prerequisite.tfplan" > "$RUNNER_TEMP/prerequisite-plan.json"
+          python3 scripts/check-control-plane-prerequisites.py \
+            --cell "$CELL" --project "$PROJECT" --region "$REGION" --service "$SERVICE" \
+            --deployment-identity "$DEPLOYMENT_IDENTITY" \
+            --plan-file "$RUNNER_TEMP/prerequisite-plan.json" --evidence-dir "$evidence"
+      - name: Persist private prerequisite evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          test -n "$CONTROL_PLANE_EVIDENCE_BUCKET"
+          test -d "$RUNNER_TEMP/prerequisites/$CELL"
+          gcloud storage cp --recursive --if-generation-match=0 \
+            "$RUNNER_TEMP/prerequisites/$CELL" \
+            "gs://${CONTROL_PLANE_EVIDENCE_BUCKET}/control-plane-identity/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/prerequisites/"
+      - name: Prepare sanitized prerequisite evidence
+        if: always()
+        run: |
+          python3 scripts/sanitize-control-plane-evidence.py --cell "$CELL" \
+            --input-dir "$RUNNER_TEMP/prerequisites/$CELL" --output-dir "$RUNNER_TEMP/public-prerequisites"
+      - name: Upload prerequisite summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: identity-prerequisites-${{ matrix.cell }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/public-prerequisites
+          if-no-files-found: error
+
   staging:
+    needs: [prerequisites]
     name: Stage staging/us-central1
-    if: ${{ github.ref == 'refs/heads/main' && inputs.confirm == 'apply' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref_type == 'branch' && ((github.ref == 'refs/heads/main' && inputs.confirm == 'apply') || (github.ref != 'refs/heads/main' && inputs.confirm == 'apply-branch')) }}
     runs-on: ubuntu-latest
     environment: staging
     permissions:
@@ -144,6 +276,7 @@ jobs:
       contents: read
       id-token: write
     env:
+      TF_VAR_verification_kms_key: projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek
       TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
@@ -270,6 +403,7 @@ jobs:
       contents: read
       id-token: write
     env:
+      TF_VAR_verification_kms_key: projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek
       TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
     steps:
       - uses: actions/checkout@v4

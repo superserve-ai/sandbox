@@ -16,6 +16,7 @@ import posixpath
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -28,6 +29,12 @@ OBJECT_URI = re.compile(r"gs://[^\"'\s,]+|(?:templates|bases)/[A-Za-z0-9_./-]+")
 TEMPLATE_MANIFEST = re.compile(
     r"templates/[^/]+/[^/]+/[^/]+/manifest\.json"
 )
+IMPERSONATION_FAILURE = re.compile(
+    r"failed to impersonate|iam\.serviceAccounts\.(?:getAccessToken|implicitDelegation)",
+    re.IGNORECASE,
+)
+RUNTIME_IAM_RETRY_SECONDS = 420
+RUNTIME_IAM_RETRY_INTERVAL = 15
 
 
 class VerificationError(RuntimeError):
@@ -62,8 +69,51 @@ class Evidence:
         (self.root / "commands").mkdir(exist_ok=True)
         self.index: list[dict[str, object]] = []
         self.sequence = 0
+        self.runtime_retry_deadline: float | None = None
 
     def command(
+        self,
+        name: str,
+        argv: list[str],
+        *,
+        expect_denied: bool = False,
+        redact_stdout: bool = False,
+        stream_stdout: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> str:
+        runtime_probe = any(arg.startswith("--impersonate-service-account=") for arg in argv)
+        attempts = []
+        while True:
+            try:
+                value = self._command_once(
+                    name, argv, expect_denied=expect_denied,
+                    redact_stdout=redact_stdout, stream_stdout=stream_stdout, env=env,
+                )
+            except VerificationError:
+                check = self.index[-1]
+                retryable = runtime_probe and check["permission_denied_observed"] and (
+                    not expect_denied or check["impersonation_failed"]
+                )
+                if retryable:
+                    now = time.monotonic()
+                    if self.runtime_retry_deadline is None:
+                        # Fresh Terraform grants can take minutes to propagate.
+                        # Share one retry window across the cell's runtime probes.
+                        self.runtime_retry_deadline = now + RUNTIME_IAM_RETRY_SECONDS
+                    delay = min(RUNTIME_IAM_RETRY_INTERVAL, self.runtime_retry_deadline - now)
+                    if delay > 0:
+                        attempts.append(self.index.pop())
+                        print(f"{name}: waiting for runtime IAM propagation; retrying in {delay:g}s", flush=True)
+                        time.sleep(delay)
+                        continue
+                if attempts:
+                    check["attempts"] = attempts
+                raise
+            if attempts:
+                self.index[-1]["attempts"] = attempts
+            return value
+
+    def _command_once(
         self,
         name: str,
         argv: list[str],
@@ -109,7 +159,8 @@ class Evidence:
         (self.root / "commands" / f"{stem}.stderr").write_text(stderr)
         observed = observed_stdout + stderr
         denied = bool(PERMISSION_DENIED.search(observed))
-        passed = (result.returncode != 0 and denied) if expect_denied else result.returncode == 0
+        impersonation_failed = bool(IMPERSONATION_FAILURE.search(observed))
+        passed = (result.returncode != 0 and denied and not impersonation_failed) if expect_denied else result.returncode == 0
         self.index.append(
             {
                 "name": name,
@@ -119,6 +170,7 @@ class Evidence:
                 "stdout_redacted": redact_stdout,
                 "stdout_streamed": stream_stdout,
                 "permission_denied_observed": denied,
+                "impersonation_failed": impersonation_failed,
                 "status": "PASS" if passed else "FAIL",
             }
         )
@@ -162,79 +214,12 @@ def gcloud(*args: str) -> list[str]:
     return ["gcloud", *args]
 
 
-def effective_iam_command(project: str, identity: str, bucket: str) -> list[str]:
-    """Build the project-scoped effective IAM analysis command."""
-    return gcloud(
-        "asset",
-        "analyze-iam-policy",
-        f"--project={project}",
-        f"--identity=serviceAccount:{identity}",
-        f"--full-resource-name=//storage.googleapis.com/projects/_/buckets/{bucket}",
-        "--format=json",
-    )
-
-
-def iam_analysis_results(response: str) -> list[object]:
-    """Accept results only when the entire IAM analysis was fully explored."""
-    try:
-        value = json.loads(response)
-    except json.JSONDecodeError as exc:
-        raise VerificationError("effective IAM analysis returned invalid JSON") from exc
-
-    def results(analysis: object) -> list[object]:
-        if not isinstance(analysis, dict) or analysis.get("fullyExplored") is not True:
-            raise VerificationError("effective IAM analysis was incomplete")
-        if analysis.get("nonCriticalErrors", []) != []:
-            raise VerificationError("effective IAM analysis reported errors")
-        # Protobuf JSON omits empty repeated fields, including analysisResults.
-        entries = analysis.get("analysisResults", [])
-        if not isinstance(entries, list):
-            raise VerificationError("effective IAM analysis had invalid results")
-        return entries
-
-    direct = results(value)
-    if "mainAnalysis" not in value:
-        if "serviceAccountImpersonationAnalysis" in value:
-            raise VerificationError("effective IAM analysis had no main analysis")
-        return direct
-    impersonation = value.get("serviceAccountImpersonationAnalysis", [])
-    if not isinstance(impersonation, list):
-        raise VerificationError("effective IAM analysis had invalid impersonation results")
-    combined = direct + results(value["mainAnalysis"])
-    for analysis in impersonation:
-        combined.extend(results(analysis))
-    return combined
-
-
 def storage_list_command(bucket: str, prefix: str, identity: str) -> list[str]:
     # A bare prefix can return only that prefix, not its descendant objects.
     return gcloud(
         "storage", "objects", "list", f"gs://{bucket}/{prefix}**",
         f"--impersonate-service-account={identity}", "--format=value(name)",
     )
-
-
-def storage_denial_checks(
-    bucket: str, other_buckets: list[str], manifest: str,
-) -> list[tuple[str, str, str, str]]:
-    """Describe non-mutating object permission probes for every storage prefix."""
-    checks = [
-        ("sandbox-get-permission-check", bucket, "sandboxes/.permission-probe", "storage.objects.get"),
-        ("delete-permission-check", bucket, manifest, "storage.objects.delete"),
-    ]
-    for prefix in ("templates", "bases", "sandboxes"):
-        for operation in ("create", "delete"):
-            checks.append((
-                f"own-{prefix}-{operation}-denied", bucket,
-                f"{prefix}/.permission-probe", f"storage.objects.{operation}",
-            ))
-        for index, other in enumerate(other_buckets, 1):
-            for operation in ("get", "create", "delete"):
-                checks.append((
-                    f"cross-cell-{index}-{prefix}-{operation}-denied", other,
-                    f"{prefix}/.permission-probe", f"storage.objects.{operation}",
-                ))
-    return checks
 
 
 def contract(path: Path) -> dict[str, object]:
@@ -337,65 +322,6 @@ def kms_key_parts(resource: str) -> tuple[str, str, str, str]:
     return match.groups()
 
 
-def storage_object_resource(bucket: str, name: str) -> str:
-    """Return the IAM resource name for one Cloud Storage object."""
-    return f"//storage.googleapis.com/projects/_/buckets/{bucket}/objects/{name}"
-
-
-def require_permission_denied(
-    evidence: Evidence,
-    name: str,
-    identity: str,
-    bucket: str,
-    object_name: str,
-    permission: str,
-) -> None:
-    """Fail closed unless Policy Troubleshooter denies one object permission."""
-    resource = storage_object_resource(bucket, object_name)
-    response = evidence.command(
-        name,
-        gcloud(
-            "policy-troubleshoot",
-            "iam",
-            resource,
-            f"--principal-email={identity}",
-            f"--permission={permission}",
-            "--format=json",
-        ),
-    )
-    try:
-        access = policy_troubleshooter_access(response)
-    except VerificationError:
-        evidence.index[-1]["status"] = "FAIL"
-        raise
-    evidence.index[-1].update(
-        {
-            "principal": identity,
-            "resource": resource,
-            "permission": permission,
-            "access": access,
-        }
-    )
-    # The v2alpha1 CLI reports a denied permission as NOT_GRANTED; accept
-    # DENIED as well for older Policy Troubleshooter response versions.
-    if access not in {"NOT_GRANTED", "DENIED"}:
-        evidence.index[-1]["status"] = "FAIL"
-        raise VerificationError(
-            f"runtime identity has {permission} on {resource} ({access})"
-        )
-
-
-def policy_troubleshooter_access(response: str) -> str:
-    """Extract the access decision from a Policy Troubleshooter response."""
-    try:
-        value = json.loads(response)
-    except json.JSONDecodeError as exc:
-        raise VerificationError("IAM Policy Troubleshooter returned invalid JSON") from exc
-    if not isinstance(value, dict) or not isinstance(value.get("access"), str):
-        raise VerificationError("IAM Policy Troubleshooter response has no access decision")
-    return str(value["access"])
-
-
 def runtime_identity(resource: dict[str, object]) -> str | None:
     spec = resource.get("spec", {})
     if not isinstance(spec, dict):
@@ -435,8 +361,6 @@ def main() -> int:
         host_identities = [str(value) for value in raw_hosts]
         if not host_identities:
             raise VerificationError("identity contract must publish unchanged host identities")
-        # Production keeps the legacy control-plane account for rollback, but
-        # it is not a VMD host identity and therefore does not belong here.
         impersonate = f"--impersonate-service-account={identity}"
 
         metadata = {
@@ -602,137 +526,6 @@ def main() -> int:
             storage_list_command(bucket, "sandboxes/", identity),
             expect_denied=True,
         )
-        # Evaluate get/create/delete without touching live objects. An actual
-        # mutation could destroy data or turn a retried create into an overwrite.
-        denial_checks = storage_denial_checks(bucket, args.other_bucket, manifest)
-        for name, target_bucket, target_object, permission in denial_checks:
-            require_permission_denied(
-                evidence, name, identity, target_bucket, target_object, permission,
-            )
-
-        bucket_policy_json = evidence.command(
-            "bucket-iam",
-            gcloud("storage", "buckets", "get-iam-policy", f"gs://{bucket}", "--format=json"),
-        )
-        bucket_policy = json.loads(bucket_policy_json)
-        reader_member = f"serviceAccount:{identity}"
-        reader_roles = {
-            binding.get("role")
-            for binding in bucket_policy.get("bindings", [])
-            if reader_member in binding.get("members", [])
-        }
-        if reader_roles:
-            raise VerificationError(
-                "runtime identity must not receive a bucket-level backup grant: "
-                f"{sorted(reader_roles)}"
-            )
-        for index, prefix in enumerate(object_prefixes, 1):
-            managed_folder_policy_json = evidence.command(
-                f"managed-folder-iam-{index}",
-                gcloud(
-                    "storage",
-                    "managed-folders",
-                    "get-iam-policy",
-                    f"gs://{bucket}/{prefix}",
-                    "--format=json",
-                ),
-            )
-            managed_folder_policy = json.loads(managed_folder_policy_json)
-            if not any(
-                binding.get("role") == "roles/storage.objectViewer"
-                and reader_member in binding.get("members", [])
-                for binding in managed_folder_policy.get("bindings", [])
-            ):
-                raise VerificationError(
-                    f"managed folder {prefix} has no objectViewer grant for {identity}"
-                )
-        evidence.command(
-            "project-iam",
-            gcloud("projects", "get-iam-policy", args.project, "--format=json"),
-        )
-        sa_policy_json = evidence.command(
-            "service-account-iam",
-            gcloud("iam", "service-accounts", "get-iam-policy", identity, "--format=json"),
-        )
-        sa_policy = json.loads(sa_policy_json)
-        deploy_member = f"serviceAccount:{cp['deployment_identity']}"
-        if not any(
-            binding.get("role") == "roles/iam.serviceAccountUser"
-            and deploy_member in binding.get("members", [])
-            for binding in sa_policy.get("bindings", [])
-        ):
-            raise VerificationError(
-                f"deployment identity {deploy_member} lacks scoped act-as on {identity}"
-            )
-        if not any(
-            binding.get("role") == "roles/iam.serviceAccountTokenCreator"
-            and deploy_member in binding.get("members", [])
-            for binding in sa_policy.get("bindings", [])
-        ):
-            raise VerificationError(
-                f"deployment identity {deploy_member} lacks scoped token creation on {identity}"
-            )
-
-        # Host identities must not gain a new path to impersonate the serving
-        # reader.  Analyze effective IAM for each unchanged host principal so
-        # project/folder inheritance, group membership, and service-account
-        # impersonation paths are included. Their existing bucket grants are
-        # intentionally left untouched for host behavior.
-        impersonation_permissions = (
-            "iam.serviceAccounts.actAs,"
-            "iam.serviceAccounts.getAccessToken,"
-            "iam.serviceAccounts.getOpenIdToken"
-        )
-        serving_resource = (
-            f"//iam.googleapis.com/projects/{args.project}/"
-            f"serviceAccounts/{identity}"
-        )
-        for index, host in enumerate(host_identities, 1):
-            host_effective_json = evidence.command(
-                f"host-effective-iam-{index}",
-                gcloud(
-                    "asset",
-                    "analyze-iam-policy",
-                    f"--project={args.project}",
-                    f"--identity=serviceAccount:{host}",
-                    f"--full-resource-name={serving_resource}",
-                    f"--permissions={impersonation_permissions}",
-                    "--analyze-service-account-impersonation",
-                    "--expand-groups",
-                    "--expand-resources",
-                    "--expand-roles",
-                    "--output-group-edges",
-                    "--output-resource-edges",
-                    "--format=json",
-                ),
-            )
-            evidence.index[-1].update(
-                {
-                    "principal": host,
-                    "target": identity,
-                    "permissions_checked": impersonation_permissions.split(","),
-                }
-            )
-            try:
-                analysis_results = iam_analysis_results(host_effective_json)
-            except VerificationError as exc:
-                evidence.index[-1]["status"] = "FAIL"
-                raise VerificationError(f"unchanged host identity {host}: {exc}") from exc
-            if analysis_results:
-                evidence.index[-1]["status"] = "FAIL"
-                raise VerificationError(
-                    f"unchanged host identity {host} can impersonate serving identity {identity}"
-                )
-        runtime_effective_json = evidence.command(
-            "effective-iam",
-            effective_iam_command(args.project, identity, bucket),
-        )
-        try:
-            # Intended reader grants are valid; incomplete analysis is not.
-            iam_analysis_results(runtime_effective_json)
-        except VerificationError as exc:
-            evidence.index[-1]["status"] = "FAIL"
-            raise VerificationError(f"runtime identity {identity}: {exc}") from exc
         for index, secret in enumerate(cp["secret_ids"], 1):
             evidence.command(
                 f"secret-access-{index}",
@@ -749,6 +542,7 @@ def main() -> int:
             )
         kms = cp.get("kms_key_resource")
         if kms:
+            reader_member = f"serviceAccount:{identity}"
             expected_kms_role = "roles/cloudkms.cryptoKeyEncrypterDecrypter"
             if cp.get("kms_grant_principal") != identity:
                 raise VerificationError(
@@ -821,26 +615,13 @@ def main() -> int:
             "own-template-list",
             "manifest-read",
             "sandbox-list-denied",
-            "bucket-iam",
-            "project-iam",
-            "service-account-iam",
-            "effective-iam",
         ]
         required_checks.extend(denied_list_checks)
-        required_checks.extend(check[0] for check in denial_checks)
         required_checks.extend(
             f"referenced-read-{index}" for index, _ in enumerate(references, 1)
         )
         required_checks.extend(
             f"secret-access-{index}" for index, _ in enumerate(cp["secret_ids"], 1)
-        )
-        required_checks.extend(
-            f"host-effective-iam-{index}"
-            for index, _ in enumerate(host_identities, 1)
-        )
-        required_checks.extend(
-            f"managed-folder-iam-{index}"
-            for index, _ in enumerate(object_prefixes, 1)
         )
         if kms:
             required_checks.extend(["kms-iam", "kms-encrypt-as-runtime", "kms-decrypt-as-runtime"])

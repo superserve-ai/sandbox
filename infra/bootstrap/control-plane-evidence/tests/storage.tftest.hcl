@@ -25,6 +25,10 @@ run "private_retained_staging_evidence" {
     )
     error_message = "The deployment account may create evidence objects with destination discovery but without delete grants."
   }
+  assert {
+    condition     = length(google_kms_crypto_key_iam_member.verification_metadata) == 0
+    error_message = "Staging must not receive production KMS permissions."
+  }
 }
 
 run "shared_production_evidence" {
@@ -32,6 +36,7 @@ run "shared_production_evidence" {
   variables {
     project_id                 = "example-production"
     deployment_service_account = "deployer@example-production.iam.gserviceaccount.com"
+    verification_kms_key       = "projects/example-production/locations/example-region/keyRings/example/cryptoKeys/credentials"
   }
   assert {
     condition = (
@@ -39,5 +44,14 @@ run "shared_production_evidence" {
       google_storage_bucket_iam_member.upload["roles/storage.objectCreator"].member == "serviceAccount:deployer@example-production.iam.gserviceaccount.com"
     )
     error_message = "Production regions must use the production project store and uploader."
+  }
+  assert {
+    condition = (
+      length(google_kms_crypto_key_iam_member.verification_metadata) == 1 &&
+      one(values(google_kms_crypto_key_iam_member.verification_metadata)).role == "roles/cloudkms.viewer" &&
+      one(values(google_kms_crypto_key_iam_member.verification_metadata)).crypto_key_id == var.verification_kms_key &&
+      one(values(google_kms_crypto_key_iam_member.verification_metadata)).member == "serviceAccount:deployer@example-production.iam.gserviceaccount.com"
+    )
+    error_message = "Production preflight needs key-scoped metadata read before attempting to describe the primary version."
   }
 }
