@@ -67,11 +67,13 @@ WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
 RETURNING *;
 
 -- name: BeginSandboxSnapshotDelete :one
--- A row still creating is left to its capture and the sweep: deleting it
--- here could leave the host holding a snapshot no row names. A row already
--- deleting is driven again.
+-- A row still creating is left to its capture and the sweep unless it has
+-- been creating since before @stale_before, when its host has stopped
+-- answering and the delete is what retires it: the host refuses the id
+-- from then on. A row already deleting is driven again.
 UPDATE sandbox_snapshot SET status = 'deleting', sweep_after = now()
-WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL AND status <> 'creating'
+WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
+  AND (status <> 'creating' OR created_at < @stale_before)
 RETURNING *;
 
 -- name: MarkSandboxSnapshotDeleted :execrows

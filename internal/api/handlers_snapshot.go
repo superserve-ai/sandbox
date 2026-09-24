@@ -202,6 +202,12 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 		respondErrorMsg(c, "conflict", "sandbox predates overlay disks and cannot be snapshotted; create a new one from its template", http.StatusConflict)
 		return
 	}
+	// The host refuses this too, since the sandbox may pause between here
+	// and the capture; this only spares the row and the round trip.
+	if body.Kind == snapshotKindFS && sb.Status == db.SandboxStatusPaused {
+		respondErrorMsg(c, "conflict", "a paused sandbox holds its unflushed writes in its memory image; take a mem+fs snapshot, or resume it first", http.StatusConflict)
+		return
+	}
 	// Only a host whose delete is final is asked, whatever this build of
 	// the control plane would assume of it: during a rollout the daemon on
 	// the sandbox's host may be older than the API. A draining host still
@@ -530,7 +536,9 @@ func (h *Handlers) PatchSnapshot(c *gin.Context) {
 // DeleteSnapshot removes a snapshot: the row goes to deleting first, then
 // the host gets one attempt within the inline budget a sandbox delete also
 // answers under, and a host that does not answer in time leaves the row to
-// the sweep rather than the caller waiting.
+// the sweep rather than the caller waiting. A capture unsettled for an hour
+// can be deleted too: the host refuses its id from the delete on, so
+// whatever its capture still does comes to nothing.
 func (h *Handlers) DeleteSnapshot(c *gin.Context) {
 	id, err := parseSnapshotID(c)
 	if err != nil {
@@ -544,7 +552,7 @@ func (h *Handlers) DeleteSnapshot(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	row, err := h.DB.BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: id, TeamID: teamID})
+	row, err := h.DB.BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: id, TeamID: teamID, StaleBefore: time.Now().Add(-snapshotSweepStuckAge)})
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			log.Error().Err(err).Msg("snapshot: begin delete")

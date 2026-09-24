@@ -202,6 +202,13 @@ func TestCreateSandboxSnapshotRefusesASandboxInTransition(t *testing.T) {
 	if w.Code != http.StatusConflict || inserted || captured {
 		t.Fatalf("status=%d inserted=%v captured=%v; want 409 and nothing done", w.Code, inserted, captured)
 	}
+	// A paused sandbox holds its unflushed writes in memory: no disk-only capture.
+	sb.Status = db.SandboxStatusPaused
+	w = httptest.NewRecorder()
+	snapshotRouter(h, teamID).ServeHTTP(w, jsonReq(http.MethodPost, "/sandboxes/"+sandboxID.String()+"/snapshot", map[string]any{"kind": "fs"}))
+	if w.Code != http.StatusConflict || inserted || captured {
+		t.Fatalf("fs of a paused sandbox: status=%d inserted=%v captured=%v; want 409 and nothing done", w.Code, inserted, captured)
+	}
 }
 
 func TestCreateSandboxSnapshotRefusesAHostWhoseDeleteIsNotFinal(t *testing.T) {
@@ -249,7 +256,7 @@ func TestCreateSandboxSnapshotAnswersNotFoundAcrossTeams(t *testing.T) {
 func TestCreateSandboxSnapshotMapsQuotaAndIdempotentReplay(t *testing.T) {
 	teamID, sandboxID := uuid.New(), uuid.New()
 	base := "/base.ext4"
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusPaused, HostID: "host-1", BasePath: &base, VcpuCount: 1, MemoryMib: 1024, DiskMib: 4096}
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusActive, HostID: "host-1", BasePath: &base, VcpuCount: 1, MemoryMib: 1024, DiskMib: 4096}
 	existing := snapshotFixture(teamID, sandboxID, "ready")
 	key := "deploy-42"
 	existing.IdempotencyKey = &key

@@ -128,12 +128,14 @@ func (m *Manager) savedCaptureAdmissible(ctx context.Context, vmID, snapshotID s
 	if man, err := m.committedSavedSnapshot(dir, vmID, kind); man != nil || err != nil {
 		return man, err
 	}
-	_, _, _, err = m.savedCaptureSource(vmID)
+	_, _, _, err = m.savedCaptureSource(vmID, kind)
 	return nil, err
 }
 
-// savedCaptureSource loads the source and requires it running or paused.
-func (m *Manager) savedCaptureSource(vmID string) (*VMInstance, VMStatus, VMConfig, error) {
+// savedCaptureSource loads the source and requires it running or paused. A
+// paused source holds what its workload had not flushed in its memory
+// image, which a disk alone would lack, so an fs capture needs it running.
+func (m *Manager) savedCaptureSource(vmID string, kind SavedSnapshotKind) (*VMInstance, VMStatus, VMConfig, error) {
 	inst, err := m.getInstance(vmID)
 	if err != nil {
 		return nil, 0, VMConfig{}, err
@@ -143,6 +145,9 @@ func (m *Manager) savedCaptureSource(vmID string) (*VMInstance, VMStatus, VMConf
 	inst.mu.RUnlock()
 	if st != StatusRunning && st != StatusPaused {
 		return nil, 0, VMConfig{}, status.Errorf(codes.FailedPrecondition, "vm %s is %v; a saved snapshot needs a running or paused VM", vmID, st)
+	}
+	if kind == SavedSnapshotFS && st == StatusPaused {
+		return nil, 0, VMConfig{}, status.Errorf(codes.FailedPrecondition, "vm %s is paused and its unflushed writes are in its memory image; a disk snapshot needs it running, or take a mem+fs snapshot", vmID)
 	}
 	return inst, st, cfg, nil
 }
@@ -206,7 +211,7 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 	if man, err := m.committedSavedSnapshot(dir, vmID, kind); man != nil || err != nil {
 		return man, err
 	}
-	inst, st, cfg, err := m.savedCaptureSource(vmID)
+	inst, st, cfg, err := m.savedCaptureSource(vmID, kind)
 	if err != nil {
 		return nil, err
 	}

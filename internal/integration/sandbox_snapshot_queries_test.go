@@ -43,7 +43,7 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	if fs.Status != "creating" {
 		t.Fatalf("new row status %q", fs.Status)
 	}
-	if _, err := q.BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: fs.ID, TeamID: teamID}); !errors.Is(err, pgx.ErrNoRows) {
+	if _, err := q.BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: fs.ID, TeamID: teamID, StaleBefore: time.Now().Add(-time.Hour)}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("delete of a creating row: want no rows, got %v", err)
 	}
 	if got, err := q.GetSandboxSnapshotByIdempotencyKey(ctx, db.GetSandboxSnapshotByIdempotencyKeyParams{TeamID: teamID, SandboxID: sandboxID, IdempotencyKey: &key}); err != nil || got.ID != fs.ID {
@@ -83,7 +83,7 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	}
 
 	// Deleting is the only way out, and a deleted row is gone from every read.
-	deleting, err := q.BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: fs.ID, TeamID: teamID})
+	deleting, err := q.BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: fs.ID, TeamID: teamID, StaleBefore: time.Now().Add(-time.Hour)})
 	if err != nil || deleting.Status != "deleting" {
 		t.Fatalf("begin delete: %+v %v", deleting.Status, err)
 	}
@@ -112,7 +112,7 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	if _, err := q.MarkSandboxSnapshotReady(ctx, db.MarkSandboxSnapshotReadyParams{ID: mem.ID, OverlayPath: &overlay, SnapshotPath: &vmstate, MemPath: &memFile, SizeBytes: 1}); err != nil {
 		t.Fatalf("mark mem+fs ready: %v", err)
 	}
-	if _, err := q.BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: mem.ID, TeamID: teamID}); err != nil {
+	if _, err := q.BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: mem.ID, TeamID: teamID, StaleBefore: time.Now().Add(-time.Hour)}); err != nil {
 		t.Fatal(err)
 	}
 	fresh := create("fs", nil)
@@ -147,5 +147,14 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	}
 	if seen = claim(); seen[fs.ID] {
 		t.Fatal("a deleted row was claimed")
+	}
+
+	// A capture unsettled for an hour is the user's to retire.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET created_at = now() - interval '2 hours' WHERE id = $1`, fresh.ID); err != nil {
+		t.Fatal(err)
+	}
+	retired, err := q.BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: fresh.ID, TeamID: teamID, StaleBefore: time.Now().Add(-time.Hour)})
+	if err != nil || retired.Status != "deleting" {
+		t.Fatalf("delete of a stale capture: %v %v", retired.Status, err)
 	}
 }

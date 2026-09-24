@@ -15,20 +15,23 @@ import (
 
 const beginSandboxSnapshotDelete = `-- name: BeginSandboxSnapshotDelete :one
 UPDATE sandbox_snapshot SET status = 'deleting', sweep_after = now()
-WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL AND status <> 'creating'
+WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
+  AND (status <> 'creating' OR created_at < $3)
 RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after
 `
 
 type BeginSandboxSnapshotDeleteParams struct {
-	ID     uuid.UUID `json:"id"`
-	TeamID uuid.UUID `json:"team_id"`
+	ID          uuid.UUID `json:"id"`
+	TeamID      uuid.UUID `json:"team_id"`
+	StaleBefore time.Time `json:"stale_before"`
 }
 
-// A row still creating is left to its capture and the sweep: deleting it
-// here could leave the host holding a snapshot no row names. A row already
-// deleting is driven again.
+// A row still creating is left to its capture and the sweep unless it has
+// been creating since before @stale_before, when its host has stopped
+// answering and the delete is what retires it: the host refuses the id
+// from then on. A row already deleting is driven again.
 func (q *Queries) BeginSandboxSnapshotDelete(ctx context.Context, arg BeginSandboxSnapshotDeleteParams) (SandboxSnapshot, error) {
-	row := q.db.QueryRow(ctx, beginSandboxSnapshotDelete, arg.ID, arg.TeamID)
+	row := q.db.QueryRow(ctx, beginSandboxSnapshotDelete, arg.ID, arg.TeamID, arg.StaleBefore)
 	var i SandboxSnapshot
 	err := row.Scan(
 		&i.ID,

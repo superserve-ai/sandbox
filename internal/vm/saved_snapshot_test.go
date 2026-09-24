@@ -215,37 +215,24 @@ func TestCreateSavedSnapshotPausedLayered(t *testing.T) {
 	}
 }
 
-func TestCreateSavedSnapshotPausedFSOnly(t *testing.T) {
+func TestCreateSavedSnapshotRefusesADiskOnlyCaptureOfAPausedSource(t *testing.T) {
 	m := newSavedTestManager(t)
 	inst, _ := seedPausedSource(t, m, false)
-	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS); status.Code(err) != codes.FailedPrecondition {
+		t.Fatalf("fs capture of a paused source: want FailedPrecondition, got %v", err)
 	}
-	if man.MemPath != "" || man.SnapshotPath != "" || man.BaseMemPath != "" {
-		t.Fatalf("fs snapshot carries memory: %+v", man)
-	}
-	// The seeded overlay is 8 pages; the size is the file's, not the config's.
-	if man.DiskSizeMiB != 1 {
-		t.Errorf("disk size %d MiB, want 1 from the file", man.DiskSizeMiB)
-	}
-	entries, _ := os.ReadDir(filepath.Dir(man.DiskPath))
-	if len(entries) != 2 {
-		t.Errorf("want disk and manifest only, got %d entries", len(entries))
-	}
-	if got := pageAt(t, man.DiskPath, 3); got != 'D' {
-		t.Errorf("disk page 3 = %q", got)
+	if entries, _ := os.ReadDir(filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName)); len(entries) != 0 {
+		t.Fatalf("a refused capture left %d entries behind", len(entries))
 	}
 }
-
 func TestCreateSavedSnapshotRefusesOtherStates(t *testing.T) {
 	m := newSavedTestManager(t)
 	inst, _ := seedPausedSource(t, m, false)
 	inst.Status = StatusError
-	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS); status.Code(err) != codes.FailedPrecondition {
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("want FailedPrecondition, got %v", err)
 	}
-	if _, err := m.CreateSavedSnapshot(context.Background(), uuid.NewString(), uuid.NewString(), SavedSnapshotFS); status.Code(err) != codes.NotFound {
+	if _, err := m.CreateSavedSnapshot(context.Background(), uuid.NewString(), uuid.NewString(), SavedSnapshotMemFS); status.Code(err) != codes.NotFound {
 		t.Errorf("unknown vm: want NotFound, got %v", err)
 	}
 }
@@ -353,7 +340,7 @@ func TestCreateSavedSnapshotRefusesSourceNotAtRest(t *testing.T) {
 	m := newSavedTestManager(t)
 	inst, _ := seedPausedSource(t, m, false)
 	m.unitDead = func(context.Context, string) bool { return false }
-	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS); status.Code(err) != codes.Unavailable {
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS); status.Code(err) != codes.Unavailable {
 		t.Errorf("want Unavailable, got %v", err)
 	}
 }
@@ -387,7 +374,7 @@ func TestOverlayCaptureRefusesWithoutReflink(t *testing.T) {
 		t.Skip("test filesystem reflinks; the refusal cannot be exercised here")
 	}
 	inst, _ := seedPausedSource(t, m, false)
-	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS); status.Code(err) != codes.FailedPrecondition {
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("overlay capture without reflink: want FailedPrecondition, got %v", err)
 	}
 }
@@ -411,7 +398,7 @@ func TestSavedSnapshotIDLockIsReclaimed(t *testing.T) {
 func TestSweepSavedSnapshotStaging(t *testing.T) {
 	m := newSavedTestManager(t)
 	inst, _ := seedPausedSource(t, m, false)
-	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS)
+	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +427,7 @@ func TestCommittedRetryWaitsForTheIDLock(t *testing.T) {
 	m := newSavedTestManager(t)
 	inst, _ := seedPausedSource(t, m, false)
 	id := uuid.NewString()
-	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, id, SavedSnapshotFS); err != nil {
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, id, SavedSnapshotMemFS); err != nil {
 		t.Fatal(err)
 	}
 	unlock, err := m.lockSavedSnapshot(context.Background(), id)
@@ -449,11 +436,11 @@ func TestCommittedRetryWaitsForTheIDLock(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, err := m.CreateSavedSnapshot(ctx, inst.ID, id, SavedSnapshotFS); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := m.CreateSavedSnapshot(ctx, inst.ID, id, SavedSnapshotMemFS); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("retry while the id is locked: want deadline exceeded, got %v", err)
 	}
 	unlock()
-	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, id, SavedSnapshotFS); err != nil {
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, id, SavedSnapshotMemFS); err != nil {
 		t.Errorf("retry after release: %v", err)
 	}
 }
@@ -484,7 +471,7 @@ func TestPlanRestoreMaterializesFork(t *testing.T) {
 func TestCloneSavedDiskGivesTheVMItsOwnCopy(t *testing.T) {
 	m := newSavedTestManager(t)
 	inst, _ := seedPausedSource(t, m, false)
-	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS)
+	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +500,7 @@ func TestCloneSavedDiskGivesTheVMItsOwnCopy(t *testing.T) {
 func TestCloneSavedDiskLeavesNoPartialFile(t *testing.T) {
 	m := newSavedTestManager(t)
 	inst, _ := seedPausedSource(t, m, false)
-	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS)
+	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -550,7 +537,7 @@ func TestCaptureQueuedOnABusyVMHoldsNoSlot(t *testing.T) {
 	queued := make(chan struct{})
 	go func() {
 		defer close(queued)
-		_, _ = m.CreateSavedSnapshot(ctx, busy, uuid.NewString(), SavedSnapshotFS)
+		_, _ = m.CreateSavedSnapshot(ctx, busy, uuid.NewString(), SavedSnapshotMemFS)
 	}()
 	// A slot taken on the way to the VM lock stays taken until the lock
 	// frees, so a short wait is enough to see it.
@@ -560,7 +547,7 @@ func TestCaptureQueuedOnABusyVMHoldsNoSlot(t *testing.T) {
 	}
 	tctx, tcancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer tcancel()
-	if _, err := m.CreateSavedSnapshot(tctx, inst.ID, uuid.NewString(), SavedSnapshotFS); err != nil {
+	if _, err := m.CreateSavedSnapshot(tctx, inst.ID, uuid.NewString(), SavedSnapshotMemFS); err != nil {
 		t.Fatalf("capture of an idle VM behind a queued request for another: %v", err)
 	}
 	cancel()
@@ -698,11 +685,19 @@ func TestForkSourceFixesTheVMsOwnPaths(t *testing.T) {
 		t.Errorf("request naming another base: want InvalidArgument, got %v", err)
 	}
 	// An fs snapshot has nothing to restore warm from.
-	fs, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotFS)
-	if err != nil {
+	fsID := uuid.NewString()
+	fsDir, _ := m.savedSnapshotDir(fsID)
+	if err := os.MkdirAll(fsDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := m.forkSource(child, &VMConfig{SavedSnapshotID: fs.SnapshotID}, "", ""); status.Code(err) != codes.FailedPrecondition {
+	fsDisk := filepath.Join(fsDir, "overlay.ext4")
+	if err := os.WriteFile(fsDisk, []byte("disk"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeSavedSnapshotManifest(fsDir, &SavedSnapshotManifest{Version: savedSnapshotVersion, SnapshotID: fsID, SourceVMID: inst.ID, Kind: SavedSnapshotFS, CreatedAt: time.Now(), VCPU: 1, MemoryMiB: 1024, DiskSizeMiB: 1, BasePath: man.BasePath, DiskPath: fsDisk}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := m.forkSource(child, &VMConfig{SavedSnapshotID: fsID}, "", ""); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("warm fork of an fs snapshot: want FailedPrecondition, got %v", err)
 	}
 }
@@ -739,7 +734,7 @@ func TestSavedSnapshotDiskSizeSurvivesReattach(t *testing.T) {
 	inst, _ := seedPausedSource(t, m, false)
 	// A reattached VM's config carries no disk size.
 	inst.Config.DiskSizeMiB = 0
-	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS)
+	man, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -837,7 +832,7 @@ func TestStandaloneCaptureRefusesWithoutReflink(t *testing.T) {
 	inst, _ := seedPausedSource(t, m, false)
 	inst.Config.BasePath = ""
 	inst.DiskPath = filepath.Join(m.cfg.RunDir, inst.ID, "overlay.ext4")
-	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS); status.Code(err) != codes.FailedPrecondition {
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS); status.Code(err) != codes.FailedPrecondition {
 		t.Errorf("standalone capture without reflink: want FailedPrecondition, got %v", err)
 	}
 }
@@ -1192,7 +1187,7 @@ func TestCaptureWaitingForItsVMHoldsNoSnapshotLock(t *testing.T) {
 	queued := make(chan struct{})
 	go func() {
 		defer close(queued)
-		_, _ = m.CreateSavedSnapshot(ctx, busy, id, SavedSnapshotFS)
+		_, _ = m.CreateSavedSnapshot(ctx, busy, id, SavedSnapshotMemFS)
 	}()
 	time.Sleep(100 * time.Millisecond)
 	// A restore of that id takes the VM lock first and the id lock second;
@@ -1220,7 +1215,7 @@ func TestCaptureWaitingForASlotHoldsNoVMLock(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		_, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotFS)
+		_, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS)
 		done <- err
 	}()
 	time.Sleep(100 * time.Millisecond)
