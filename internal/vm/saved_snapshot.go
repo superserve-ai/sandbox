@@ -366,6 +366,9 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	if err := writeStagedIntent(sourceDir, pauseIntent{VMID: vmID, FreezeToken: token, ArtifactID: artifact}); err != nil {
 		return fmt.Errorf("record capture intent: %w", err)
 	}
+	// The source is unavailable from the freeze on: the stop and the flush
+	// count as its frozen time, and are measured on their own as well.
+	tFreeze := time.Now()
 	frozen, synced := false, false
 	if willFreeze {
 		var ferr error
@@ -391,7 +394,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		}
 	}
 
-	tFrozen := time.Now()
+	freezeFor := time.Since(tFreeze)
 	// Bounded on its own: the RPC deadline may be long, and a Firecracker that
 	// stops answering must not hold the source paused past this.
 	budget := savedCaptureBudget(kind, man.MemoryMiB)
@@ -418,7 +421,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		}
 		captureErr = WriteWallClockManifest(filepath.Join(tmp, filepath.Base(man.MemPath)), wm)
 	}
-	frozenFor := time.Since(tFrozen)
+	frozenFor := time.Since(tFreeze)
 
 	// Releasing the guest while Firecracker still writes the abandoned image
 	// would only time out and write the source off; wait for the API first.
@@ -445,8 +448,8 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	if captureErr != nil {
 		return captureErr
 	}
-	m.recordPhases("saved_snapshot", string(kind), map[string]time.Duration{"frozen": frozenFor})
-	log.Info().Dur("frozen", frozenFor).Bool("workload_frozen", frozen).Bool("guest_flushed_stopped", synced).Msg("saved snapshot: source captured and released")
+	m.recordPhases("saved_snapshot", string(kind), map[string]time.Duration{"freeze": freezeFor, "frozen": frozenFor})
+	log.Info().Dur("freeze", freezeFor).Dur("frozen", frozenFor).Bool("workload_frozen", frozen).Bool("guest_flushed_stopped", synced).Msg("saved snapshot: source captured and released")
 	return nil
 }
 
