@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -17,14 +18,14 @@ func TestSyncGuestFilesystemsRunsSyncThroughBoxd(t *testing.T) {
 	var got struct {
 		Command string `json:"command"`
 	}
-	exit := int32(0)
+	reply := []byte(`{"stdout":"","stderr":"","exit_code":0}`)
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/exec" {
 			http.NotFound(w, r)
 			return
 		}
 		_ = json.NewDecoder(r.Body).Decode(&got)
-		_ = json.NewEncoder(w).Encode(map[string]any{"stdout": "", "stderr": "", "exit_code": exit})
+		_, _ = w.Write(reply)
 	})}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
@@ -34,8 +35,19 @@ func TestSyncGuestFilesystemsRunsSyncThroughBoxd(t *testing.T) {
 	if got.Command != "sync" {
 		t.Errorf("guest ran %q, want sync", got.Command)
 	}
-	exit = 1
-	if err := syncGuestFilesystems(context.Background(), "127.0.0.1"); err == nil {
-		t.Error("a failed sync was reported as success")
+	// Only a whole reply that says exit 0 is a flush: not a failure that
+	// comes after a long stderr, not a reply without an exit code, not one
+	// that is not a reply at all.
+	for name, bad := range map[string][]byte{
+		"nonzero exit":            []byte(`{"stdout":"","stderr":"","exit_code":1}`),
+		"nonzero exit past 64KiB": []byte(`{"stdout":"","stderr":"` + strings.Repeat("x", 70<<10) + `","exit_code":1}`),
+		"no exit code":            []byte(`{"stdout":"","stderr":""}`),
+		"not json":                []byte(`<html>gateway timeout</html>`),
+		"cut short":               []byte(`{"stdout":"","stderr":"","exit_c`),
+	} {
+		reply = bad
+		if err := syncGuestFilesystems(context.Background(), "127.0.0.1"); err == nil {
+			t.Errorf("%s: reported as a flush", name)
+		}
 	}
 }

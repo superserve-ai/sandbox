@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,7 +60,7 @@ func sandboxSnapshotRow(s db.SandboxSnapshot) *mockRow {
 		*dest[24].(*time.Time) = s.CreatedAt
 		*dest[25].(*pgtype.Timestamptz) = s.ReadyAt
 		*dest[26].(*pgtype.Timestamptz) = s.DeletedAt
-		*dest[27].(*time.Time) = s.SweepAfter
+		*dest[27].(*pgtype.Timestamptz) = s.SweepAfter
 		return nil
 	}}
 }
@@ -317,7 +318,7 @@ func TestCreateSandboxSnapshotLeavesALostAnswerToTheSweep(t *testing.T) {
 			switch {
 			case strings.Contains(sql, "-- name: MarkSandboxSnapshotFailed :execrows"):
 				failed = true
-			case strings.Contains(sql, "-- name: ReleaseSandboxSnapshotCapture :execrows"):
+			case strings.Contains(sql, "-- name: ScheduleSandboxSnapshotSweep :execrows"):
 				released = true
 			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
@@ -496,9 +497,10 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 	lost := snapshotFixture(teamID, sandboxID, "creating")
 	deleting := snapshotFixture(teamID, sandboxID, "deleting")
 	// Settled by another sweep and deleted by the user while this sweep's
-	// capture was in flight: the capture made the files again.
+	// capture was in flight: the capture made the files again, and the host
+	// does not take the first request to remove them.
 	revived := snapshotFixture(teamID, sandboxID, "creating")
-	var readied, failed, deleted []uuid.UUID
+	var readied, failed, deleted, scheduled []uuid.UUID
 	var mu sync.Mutex
 	mock := &mockDBTX{
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
@@ -536,6 +538,8 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 				failed = append(failed, id)
 			case strings.Contains(sql, "-- name: MarkSandboxSnapshotDeleted :execrows"):
 				deleted = append(deleted, id)
+			case strings.Contains(sql, "-- name: ScheduleSandboxSnapshotSweep :execrows"):
+				scheduled = append(scheduled, id)
 			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
@@ -555,11 +559,17 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 			mu.Lock()
 			defer mu.Unlock()
 			hostDeleted = append(hostDeleted, id)
+			if id == revived.ID.String() {
+				return status.Error(codes.Unavailable, "host busy")
+			}
 			return nil
 		},
 	}
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
-	h.SweepSnapshotsOnce(context.Background(), zerolog.Nop())
+	<-h.SweepSnapshotsOnce(context.Background(), zerolog.Nop())
+	if len(scheduled) != 1 || scheduled[0] != revived.ID {
+		t.Errorf("scheduled = %v, want the deleted row whose files the host did not remove, so the sweep drives it", scheduled)
+	}
 	if len(readied) != 1 || readied[0] != committed.ID {
 		t.Errorf("readied = %v, want only the committed row", readied)
 	}
@@ -580,16 +590,24 @@ func TestSnapshotSweepSettlesRowsFromTheHost(t *testing.T) {
 	}
 }
 
-func TestSnapshotSweepWorksHostsSideBySide(t *testing.T) {
+func TestSnapshotSweepNeverWaitsOnAHost(t *testing.T) {
 	teamID, sandboxID := uuid.New(), uuid.New()
 	stuck := snapshotFixture(teamID, sandboxID, "creating")
 	stuck.HostID = "host-hung"
 	other := snapshotFixture(teamID, sandboxID, "deleting")
 	other.HostID = "host-fine"
+	// The first pass claims only the row on the host that never answers;
+	// the next claims it again, its retry time past, with another host's row.
+	passes := [][]*mockRow{
+		{sandboxSnapshotRow(stuck)},
+		{sandboxSnapshotRow(stuck), sandboxSnapshotRow(other)},
+	}
 	mock := &mockDBTX{
 		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			if strings.Contains(sql, "-- name: ClaimStuckSandboxSnapshots :many") {
-				return &scriptedRows{rows: []*mockRow{sandboxSnapshotRow(stuck), sandboxSnapshotRow(other)}}, nil
+				rows := passes[0]
+				passes = passes[1:]
+				return &scriptedRows{rows: rows}, nil
 			}
 			return nil, fmt.Errorf("unexpected query: %s", sql)
 		},
@@ -599,8 +617,10 @@ func TestSnapshotSweepWorksHostsSideBySide(t *testing.T) {
 	}
 	release := make(chan struct{})
 	settled := make(chan struct{})
+	var captures atomic.Int32
 	vmd := &stubVMD{
 		createSavedFn: func(ctx context.Context, _, _, _ string) (vmdclient.SavedSnapshot, error) {
+			captures.Add(1)
 			select {
 			case <-release:
 			case <-ctx.Done():
@@ -610,16 +630,26 @@ func TestSnapshotSweepWorksHostsSideBySide(t *testing.T) {
 		deleteSavedFn: func(context.Context, string) error { close(settled); return nil },
 	}
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		h.SweepSnapshotsOnce(context.Background(), zerolog.Nop())
-	}()
+	first := h.SweepSnapshotsOnce(context.Background(), zerolog.Nop())
+	second := h.SweepSnapshotsOnce(context.Background(), zerolog.Nop())
 	select {
 	case <-settled:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the other host's delete waited behind a host that does not answer")
 	}
+	select {
+	case <-second:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a pass waited on the host that does not answer")
+	}
+	select {
+	case <-first:
+		t.Fatal("the first pass finished while its capture was still held by the host")
+	default:
+	}
 	close(release)
-	<-done
+	<-first
+	if n := captures.Load(); n != 1 {
+		t.Fatalf("the held row was captured %d times; a row in flight is not doubled", n)
+	}
 }

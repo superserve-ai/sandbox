@@ -259,7 +259,9 @@ func postBoxd(ctx context.Context, vmIP, path string, body []byte) ([]byte, erro
 		return nil, fmt.Errorf("POST %s: %w", path, err)
 	}
 	defer resp.Body.Close()
-	reply, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	// Bounded: a reply past this is not one boxd's own endpoints send, and a
+	// cut-short one fails to decode rather than passing for an answer.
+	reply, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
 		return nil, &boxdStatusError{Path: path, Code: resp.StatusCode, Body: strings.TrimSpace(string(reply))}
 	}

@@ -908,8 +908,8 @@ type SandboxSnapshot struct {
 	CreatedAt      time.Time          `json:"created_at"`
 	ReadyAt        pgtype.Timestamptz `json:"ready_at"`
 	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
-	// When the sweep next asks the host about a row still creating or deleting; pushed out on every attempt.
-	SweepAfter time.Time `json:"sweep_after"`
+	// When the sweep next asks the host about a row creating or deleting; pushed out on every attempt, NULL once the host has confirmed.
+	SweepAfter pgtype.Timestamptz `json:"sweep_after"`
 }
 
 type SandboxStorageInterval struct {

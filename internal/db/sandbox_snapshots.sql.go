@@ -64,11 +64,10 @@ func (q *Queries) BeginSandboxSnapshotDelete(ctx context.Context, arg BeginSandb
 }
 
 const claimStuckSandboxSnapshots = `-- name: ClaimStuckSandboxSnapshots :many
-UPDATE sandbox_snapshot SET sweep_after = $1
+UPDATE sandbox_snapshot SET sweep_after = $1::timestamptz
 WHERE id IN (
     SELECT id FROM sandbox_snapshot
-    WHERE deleted_at IS NULL
-      AND status IN ('creating', 'deleting')
+    WHERE status IN ('creating', 'deleting')
       AND sweep_after <= now()
     ORDER BY sweep_after
     LIMIT $2::bigint
@@ -82,8 +81,9 @@ type ClaimStuckSandboxSnapshotsParams struct {
 	RowLimit int64     `json:"row_limit"`
 }
 
-// Rows a capture or a delete left behind, due for the sweep. Each claimed
-// row is pushed out to @retry_at, so a host that does not answer holds back
+// Rows a capture or a delete left behind, due for the sweep; a deleted row
+// is among them while the host may still hold its files. Each claimed row
+// is pushed out to @retry_at, so a host that does not answer holds back
 // nothing but its own rows and another replica's sweep passes over them.
 func (q *Queries) ClaimStuckSandboxSnapshots(ctx context.Context, arg ClaimStuckSandboxSnapshotsParams) ([]SandboxSnapshot, error) {
 	rows, err := q.db.Query(ctx, claimStuckSandboxSnapshots, arg.RetryAt, arg.RowLimit)
@@ -165,22 +165,22 @@ RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_
 `
 
 type CreateSandboxSnapshotParams struct {
-	ID             uuid.UUID   `json:"id"`
-	TeamID         uuid.UUID   `json:"team_id"`
-	SandboxID      uuid.UUID   `json:"sandbox_id"`
-	TemplateID     pgtype.UUID `json:"template_id"`
-	Kind           string      `json:"kind"`
-	Name           *string     `json:"name"`
-	IdempotencyKey *string     `json:"idempotency_key"`
-	HostID         string      `json:"host_id"`
-	VcpuCount      int32       `json:"vcpu_count"`
-	MemoryMib      int32       `json:"memory_mib"`
-	DiskMib        int32       `json:"disk_mib"`
-	BasePath       string      `json:"base_path"`
-	TimeoutSeconds *int32      `json:"timeout_seconds"`
-	NetworkConfig  []byte      `json:"network_config"`
-	SecretBindings []byte      `json:"secret_bindings"`
-	SweepAfter     time.Time   `json:"sweep_after"`
+	ID             uuid.UUID          `json:"id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	SandboxID      uuid.UUID          `json:"sandbox_id"`
+	TemplateID     pgtype.UUID        `json:"template_id"`
+	Kind           string             `json:"kind"`
+	Name           *string            `json:"name"`
+	IdempotencyKey *string            `json:"idempotency_key"`
+	HostID         string             `json:"host_id"`
+	VcpuCount      int32              `json:"vcpu_count"`
+	MemoryMib      int32              `json:"memory_mib"`
+	DiskMib        int32              `json:"disk_mib"`
+	BasePath       string             `json:"base_path"`
+	TimeoutSeconds *int32             `json:"timeout_seconds"`
+	NetworkConfig  []byte             `json:"network_config"`
+	SecretBindings []byte             `json:"secret_bindings"`
+	SweepAfter     pgtype.Timestamptz `json:"sweep_after"`
 }
 
 // The row exists as creating before the host is asked, under the id the
@@ -447,10 +447,12 @@ func (q *Queries) ListSandboxSnapshots(ctx context.Context, arg ListSandboxSnaps
 }
 
 const markSandboxSnapshotDeleted = `-- name: MarkSandboxSnapshotDeleted :execrows
-UPDATE sandbox_snapshot SET deleted_at = now()
-WHERE id = $1 AND status = 'deleting' AND deleted_at IS NULL
+UPDATE sandbox_snapshot SET deleted_at = COALESCE(deleted_at, now()), sweep_after = NULL
+WHERE id = $1 AND status = 'deleting'
 `
 
+// The host has confirmed it holds nothing; for a row already deleted, that
+// it holds nothing again.
 func (q *Queries) MarkSandboxSnapshotDeleted(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, markSandboxSnapshotDeleted, id)
 	if err != nil {
@@ -538,21 +540,6 @@ func (q *Queries) MarkSandboxSnapshotReady(ctx context.Context, arg MarkSandboxS
 	return i, err
 }
 
-const releaseSandboxSnapshotCapture = `-- name: ReleaseSandboxSnapshotCapture :execrows
-UPDATE sandbox_snapshot SET sweep_after = now()
-WHERE id = $1 AND status = 'creating'
-`
-
-// A capture whose answer was lost is the sweep's to settle, now rather than
-// when the row ages out.
-func (q *Queries) ReleaseSandboxSnapshotCapture(ctx context.Context, id uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, releaseSandboxSnapshotCapture, id)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const renameSandboxSnapshot = `-- name: RenameSandboxSnapshot :one
 UPDATE sandbox_snapshot SET name = $3
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
@@ -599,4 +586,19 @@ func (q *Queries) RenameSandboxSnapshot(ctx context.Context, arg RenameSandboxSn
 		&i.SweepAfter,
 	)
 	return i, err
+}
+
+const scheduleSandboxSnapshotSweep = `-- name: ScheduleSandboxSnapshotSweep :execrows
+UPDATE sandbox_snapshot SET sweep_after = now()
+WHERE id = $1 AND status IN ('creating', 'deleting')
+`
+
+// A capture whose answer was lost, or a deleted snapshot whose files were
+// made again and not removed, is the sweep's to settle now.
+func (q *Queries) ScheduleSandboxSnapshotSweep(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, scheduleSandboxSnapshotSweep, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

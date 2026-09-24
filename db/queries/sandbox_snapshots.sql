@@ -55,11 +55,11 @@ RETURNING *;
 UPDATE sandbox_snapshot SET status = 'failed'
 WHERE id = $1 AND status = 'creating';
 
--- name: ReleaseSandboxSnapshotCapture :execrows
--- A capture whose answer was lost is the sweep's to settle, now rather than
--- when the row ages out.
+-- name: ScheduleSandboxSnapshotSweep :execrows
+-- A capture whose answer was lost, or a deleted snapshot whose files were
+-- made again and not removed, is the sweep's to settle now.
 UPDATE sandbox_snapshot SET sweep_after = now()
-WHERE id = $1 AND status = 'creating';
+WHERE id = $1 AND status IN ('creating', 'deleting');
 
 -- name: RenameSandboxSnapshot :one
 UPDATE sandbox_snapshot SET name = $3
@@ -75,18 +75,20 @@ WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL AND status <> 'creating'
 RETURNING *;
 
 -- name: MarkSandboxSnapshotDeleted :execrows
-UPDATE sandbox_snapshot SET deleted_at = now()
-WHERE id = $1 AND status = 'deleting' AND deleted_at IS NULL;
+-- The host has confirmed it holds nothing; for a row already deleted, that
+-- it holds nothing again.
+UPDATE sandbox_snapshot SET deleted_at = COALESCE(deleted_at, now()), sweep_after = NULL
+WHERE id = $1 AND status = 'deleting';
 
 -- name: ClaimStuckSandboxSnapshots :many
--- Rows a capture or a delete left behind, due for the sweep. Each claimed
--- row is pushed out to @retry_at, so a host that does not answer holds back
+-- Rows a capture or a delete left behind, due for the sweep; a deleted row
+-- is among them while the host may still hold its files. Each claimed row
+-- is pushed out to @retry_at, so a host that does not answer holds back
 -- nothing but its own rows and another replica's sweep passes over them.
-UPDATE sandbox_snapshot SET sweep_after = @retry_at
+UPDATE sandbox_snapshot SET sweep_after = sqlc.arg('retry_at')::timestamptz
 WHERE id IN (
     SELECT id FROM sandbox_snapshot
-    WHERE deleted_at IS NULL
-      AND status IN ('creating', 'deleting')
+    WHERE status IN ('creating', 'deleting')
       AND sweep_after <= now()
     ORDER BY sweep_after
     LIMIT sqlc.arg('row_limit')::bigint

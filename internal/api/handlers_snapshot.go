@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
@@ -214,7 +215,7 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 		TimeoutSeconds: sb.TimeoutSeconds,
 		NetworkConfig:  netCfg,
 		SecretBindings: bindings,
-		SweepAfter:     time.Now().Add(snapshotSweepCreatingAge),
+		SweepAfter:     pgtype.Timestamptz{Time: time.Now().Add(snapshotSweepCreatingAge), Valid: true},
 	})
 	if err != nil {
 		switch {
@@ -256,7 +257,7 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 		}
 		// The answer was lost, not refused: the host may hold the snapshot.
 		// The row stays creating and the sweep settles it from the host.
-		h.releaseSnapshotCapture(row.ID)
+		h.scheduleSnapshotSweep(row.ID)
 		log.Warn().Err(err).Str("snapshot_id", row.ID.String()).Str("host_id", sb.HostID).Msg("snapshot: capture answer lost; left to the sweep")
 		c.Header("Retry-After", "60")
 		c.JSON(http.StatusAccepted, snapshotJSON(row))
@@ -323,7 +324,7 @@ func optString(s string) *string {
 // settleCapture records the host's answer on the row. A row no longer
 // creating was settled by the other party, or is being deleted: a delete
 // may have removed the files this capture has just made again, so they are
-// removed once more.
+// removed once more, by the sweep if not here.
 func (h *Handlers) settleCapture(ctx context.Context, client VMDClient, row db.SandboxSnapshot, snap vmdclient.SavedSnapshot) (db.SandboxSnapshot, error) {
 	ready, err := h.markSnapshotReady(ctx, row.ID, snap)
 	if err == nil {
@@ -340,19 +341,20 @@ func (h *Handlers) settleCapture(ctx context.Context, client VMDClient, row db.S
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotDeleteTimeout)
 		defer cancel()
 		if err := client.DeleteSavedSnapshot(dctx, row.ID.String()); err != nil && !isVMDNotFound(err) {
-			log.Error().Err(err).Str("snapshot_id", row.ID.String()).Str("host_id", row.HostID).Msg("snapshot: host may hold files for a deleted snapshot")
+			log.Warn().Err(err).Str("snapshot_id", row.ID.String()).Str("host_id", row.HostID).Msg("snapshot: files made again for a deleted snapshot; left to the sweep")
+			h.scheduleSnapshotSweep(row.ID)
 		}
 	}
 	return current, nil
 }
 
-// releaseSnapshotCapture hands a row whose capture answer was lost to the
-// sweep. Detached from the request, like failSnapshot.
-func (h *Handlers) releaseSnapshotCapture(id uuid.UUID) {
+// scheduleSnapshotSweep makes a row the sweep's to settle now. Detached from
+// the request, like failSnapshot.
+func (h *Handlers) scheduleSnapshotSweep(id uuid.UUID) {
 	ctx, cancel := context.WithTimeout(context.Background(), snapshotDeleteTimeout)
 	defer cancel()
-	if _, err := h.DB.ReleaseSandboxSnapshotCapture(ctx, id); err != nil {
-		log.Error().Err(err).Str("snapshot_id", id.String()).Msg("snapshot: release to the sweep")
+	if _, err := h.DB.ScheduleSandboxSnapshotSweep(ctx, id); err != nil {
+		log.Error().Err(err).Str("snapshot_id", id.String()).Msg("snapshot: schedule for the sweep")
 	}
 }
 
@@ -582,13 +584,28 @@ func (h *Handlers) StartSnapshotSweeper(ctx context.Context) {
 	}()
 }
 
+// snapshotSweepHost is one host's share of the sweep: the rows waiting for
+// it, in claim order, and whether a worker is taking them.
+type snapshotSweepHost struct {
+	queue   []snapshotSweepItem
+	queued  map[uuid.UUID]struct{}
+	running bool
+}
+
+type snapshotSweepItem struct {
+	row  db.SandboxSnapshot
+	done func()
+}
+
 // SweepSnapshotsOnce asks the host about every row that is due. Age alone
 // proves nothing: a capture whose answer was lost may have committed, so the
 // same idempotent request is issued again and the row settles on what the
-// host says. Hosts are worked side by side, each one's rows in turn, so a
-// host that does not answer holds back only its own. Exported so tests can
-// run a pass directly.
-func (h *Handlers) SweepSnapshotsOnce(ctx context.Context, logger zerolog.Logger) {
+// host says. The pass only claims and hands over: each host's rows are taken
+// in turn by that host's worker, so a host that does not answer holds back
+// its own rows and no pass. The returned channel closes once every row this
+// pass handed over is done; exported so tests can run a pass directly.
+func (h *Handlers) SweepSnapshotsOnce(ctx context.Context, logger zerolog.Logger) <-chan struct{} {
+	done := make(chan struct{})
 	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	rows, err := h.DB.ClaimStuckSandboxSnapshots(qctx, db.ClaimStuckSandboxSnapshotsParams{
 		RetryAt:  time.Now().Add(snapshotSweepRetry),
@@ -597,26 +614,65 @@ func (h *Handlers) SweepSnapshotsOnce(ctx context.Context, logger zerolog.Logger
 	cancel()
 	if err != nil {
 		logger.Error().Err(err).Msg("snapshot sweep: claim")
-		return
-	}
-	byHost := map[string][]db.SandboxSnapshot{}
-	for _, row := range rows {
-		byHost[row.HostID] = append(byHost[row.HostID], row)
+		close(done)
+		return done
 	}
 	var wg sync.WaitGroup
-	for _, rows := range byHost {
-		wg.Add(1)
-		go func(rows []db.SandboxSnapshot) {
-			defer wg.Done()
-			for _, row := range rows {
-				if ctx.Err() != nil {
-					return
-				}
-				h.sweepSnapshot(ctx, row, logger.With().Str("snapshot_id", row.ID.String()).Str("host_id", row.HostID).Logger())
-			}
-		}(rows)
+	h.snapshotSweepMu.Lock()
+	if h.snapshotSweepHosts == nil {
+		h.snapshotSweepHosts = map[string]*snapshotSweepHost{}
 	}
-	wg.Wait()
+	for _, row := range rows {
+		host := h.snapshotSweepHosts[row.HostID]
+		if host == nil {
+			host = &snapshotSweepHost{queued: map[uuid.UUID]struct{}{}}
+			h.snapshotSweepHosts[row.HostID] = host
+		}
+		// A row this replica already holds is claimed again only because
+		// its retry time passed while it waited or ran; it is not doubled.
+		if _, held := host.queued[row.ID]; held {
+			continue
+		}
+		host.queued[row.ID] = struct{}{}
+		wg.Add(1)
+		host.queue = append(host.queue, snapshotSweepItem{row: row, done: wg.Done})
+		if !host.running {
+			host.running = true
+			go h.sweepHost(ctx, row.HostID, logger)
+		}
+	}
+	h.snapshotSweepMu.Unlock()
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	return done
+}
+
+// sweepHost takes one host's queued rows in turn until none are left.
+func (h *Handlers) sweepHost(ctx context.Context, hostID string, logger zerolog.Logger) {
+	for {
+		h.snapshotSweepMu.Lock()
+		host := h.snapshotSweepHosts[hostID]
+		if len(host.queue) == 0 {
+			host.running = false
+			h.snapshotSweepMu.Unlock()
+			return
+		}
+		item := host.queue[0]
+		host.queue = host.queue[1:]
+		h.snapshotSweepMu.Unlock()
+
+		if ctx.Err() == nil {
+			sentrylog.RunSafe("snapshot-sweep", func() {
+				h.sweepSnapshot(ctx, item.row, logger.With().Str("snapshot_id", item.row.ID.String()).Str("host_id", hostID).Logger())
+			})
+		}
+		h.snapshotSweepMu.Lock()
+		delete(host.queued, item.row.ID)
+		h.snapshotSweepMu.Unlock()
+		item.done()
+	}
 }
 
 func (h *Handlers) sweepSnapshot(ctx context.Context, row db.SandboxSnapshot, logger zerolog.Logger) {

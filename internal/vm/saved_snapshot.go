@@ -316,7 +316,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	// cache itself.
 	if kind == SavedSnapshotFS && ip != "" {
 		if err := syncGuestFilesystems(ctx, ip); err != nil {
-			return status.Errorf(codes.Unavailable, "guest did not flush its filesystems before the capture: %v", err)
+			return status.Errorf(codes.FailedPrecondition, "guest did not flush its filesystems before the capture: %v", err)
 		}
 	}
 	corrects := recordedCorrects != nil && *recordedCorrects
@@ -912,6 +912,8 @@ func (m *Manager) fileClone() func(context.Context, string, string) error {
 }
 
 // syncGuestFilesystems runs sync inside the guest through boxd, bounded.
+// Only a whole reply that says sync exited 0 counts: a reply cut short, or
+// one with no exit code, is not a flush.
 func syncGuestFilesystems(ctx context.Context, vmIP string) error {
 	body, _ := json.Marshal(struct {
 		Command  string `json:"command"`
@@ -924,10 +926,17 @@ func syncGuestFilesystems(ctx context.Context, vmIP string) error {
 		return err
 	}
 	var res struct {
-		ExitCode int `json:"exit_code"`
+		ExitCode *int32 `json:"exit_code"`
+		Stderr   string `json:"stderr"`
 	}
-	if err := json.Unmarshal(reply, &res); err == nil && res.ExitCode != 0 {
-		return fmt.Errorf("sync exited %d", res.ExitCode)
+	if err := json.Unmarshal(reply, &res); err != nil {
+		return fmt.Errorf("sync: reply: %w", err)
+	}
+	if res.ExitCode == nil {
+		return errors.New("sync: reply carries no exit code")
+	}
+	if *res.ExitCode != 0 {
+		return fmt.Errorf("sync exited %d: %s", *res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
 	return nil
 }
