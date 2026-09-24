@@ -3473,9 +3473,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		return nil, ctx.Err()
 	}
 	tSemAcquired := time.Now()
-	// A fork reads what the image says from the snapshot itself, and holds the
-	// snapshot's lock from here until its own copies exist below, so a delete
-	// cannot come between the reading and the copying.
+	// A fork reads what the image says from the snapshot itself, under the
+	// snapshot's lock. The lock is released once the reads are done and taken
+	// again for the copies, which check the snapshot is still the same one,
+	// so neither a prior life's stop nor a second fork of the same snapshot
+	// waits behind this one for longer than its reads.
 	metaSnapshot, metaMem := snapshotPath, memPath
 	var unlockFork func()
 	if fork != nil {
@@ -3631,6 +3633,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	if manifest != nil {
 		restoreToken, restoreArtifactID = manifest.FreezeToken, manifest.ArtifactID
 	}
+	if unlockFork != nil {
+		unlockFork()
+		unlockFork = nil
+	}
 
 	// Sampled before this attempt creates the rundir: a pre-existing rundir
 	// means a prior attempt on this host reached start.sh (and possibly
@@ -3660,10 +3666,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		stopErr = m.stopVM(ctx, vmID, prevSupervision)
 		m.mu.Lock()
 	}
-	// A run dir with no record can be a fork this daemon started and lost
-	// before persisting; its Firecracker may still run. A fork replaces the
-	// files here, so that life is stopped first, whatever supervised it.
-	if fork != nil && !inPlace && priorRunDir {
+	// A fork replaces the files here, so every life that may own them is
+	// stopped first: the recorded one above and, whatever the record says,
+	// anything under either supervision. A run dir with no record is a fork
+	// this daemon lost before persisting, and a life parked as error after an
+	// unconfirmed stop may run under a supervision its record never had.
+	if fork != nil && (inPlace || priorRunDir) && stopErr == nil {
 		m.mu.Unlock()
 		stopErr = m.stopLeftoverLife(ctx, vmID)
 		m.mu.Lock()
@@ -3755,7 +3763,9 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			diskErr = status.Errorf(codes.Unavailable, "vm %s could not be confirmed stopped before being replaced: %v", vmID, stopErr)
 			diskUntouched = true
 		} else {
-			diskPath, diskErr = m.materializeForkLocked(ctx, vmID, fork)
+			// Every prior life is confirmed stopped; nothing is left to charge.
+			m.vmStopUnconfirmed.Delete(vmID)
+			diskPath, diskErr = m.materializeFork(ctx, vmID, fork)
 		}
 	}
 	if diskErr != nil {
@@ -3771,10 +3781,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		cleanupAfterRestoreFailure()
 		m.setStatus(vmID, StatusError)
 		return nil, diskErr
-	}
-	if unlockFork != nil {
-		unlockFork()
-		unlockFork = nil
 	}
 	tDiskReady = time.Now()
 

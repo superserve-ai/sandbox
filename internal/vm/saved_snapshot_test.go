@@ -1237,3 +1237,106 @@ func TestCaptureWaitingForASlotHoldsNoVMLock(t *testing.T) {
 		t.Fatal("capture did not proceed once the slot freed")
 	}
 }
+
+func TestForkRetryOverAnUnconfirmedLifeStopsEverySupervision(t *testing.T) {
+	useTempFloor(t)
+	m := newSavedTestManager(t)
+	m.restoreSem = make(chan struct{}, 1)
+	m.netMgr = &fakeNetMgr{}
+	m.cgroups = &cgroupTree{}
+	src, _ := seedPausedSource(t, m, true)
+	ctx := context.Background()
+	man, err := m.CreateSavedSnapshot(ctx, src.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A run dir with no record whose Firecracker lives under a cgroup: the
+	// unit stop is a no-op, the cgroup stop fails.
+	child := uuid.NewString()
+	rundir := filepath.Join(m.cfg.RunDir, child)
+	if err := os.MkdirAll(rundir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	overlay := filepath.Join(rundir, "overlay.ext4")
+	if err := os.WriteFile(overlay, []byte("live under a cgroup"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cgroupAlive := true
+	m.stopVMHook = func(_ context.Context, _ string, s Supervision) error {
+		if s == SupervisionCgroup && cgroupAlive {
+			return errors.New("cgroup still populated")
+		}
+		return nil
+	}
+	cfg := VMConfig{SavedSnapshotID: man.SnapshotID}
+	for attempt := 1; attempt <= 2; attempt++ {
+		// The second attempt meets the error record the first one parked,
+		// which says nothing true about the supervision.
+		if _, err := m.restoreVMSnapshot(ctx, child, "", "", cfg, nil, "", "", "", nil, 0, ""); status.Code(err) != codes.Unavailable {
+			t.Fatalf("attempt %d over a life whose cgroup stop failed: want Unavailable, got %v", attempt, err)
+		}
+		if b, _ := os.ReadFile(overlay); string(b) != "live under a cgroup" {
+			t.Fatalf("attempt %d replaced the live VM's disk", attempt)
+		}
+	}
+	// Once every supervision confirms, the fork goes on.
+	cgroupAlive = false
+	replaced := false
+	m.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		replaced = pageAt(t, overlay, 7) == 'D'
+		return 0, SupervisionUnit, errors.New("stop before a real launch")
+	}
+	_, _ = m.restoreVMSnapshot(ctx, child, "", "", cfg, nil, "", "", "", nil, 0, "")
+	if !replaced {
+		t.Fatal("the fork did not proceed once every supervision confirmed the stop")
+	}
+	if _, parked := m.vmStopUnconfirmed.Load(child); parked {
+		t.Error("a confirmed stop left the id charged as unconfirmed")
+	}
+}
+
+func TestForkHoldsTheSnapshotLockOnlyWhileItReadsAndCopies(t *testing.T) {
+	useTempFloor(t)
+	m := newSavedTestManager(t)
+	m.restoreSem = make(chan struct{}, 2)
+	m.netMgr = &fakeNetMgr{}
+	src, _ := seedPausedSource(t, m, true)
+	ctx := context.Background()
+	man, err := m.CreateSavedSnapshot(ctx, src.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A fork over a leftover run dir stalls in the prior life's stop.
+	child := uuid.NewString()
+	if err := os.MkdirAll(filepath.Join(m.cfg.RunDir, child), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stopping := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	m.stopVMHook = func(context.Context, string, Supervision) error {
+		once.Do(func() { close(stopping) })
+		<-release
+		return nil
+	}
+	m.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		return 0, SupervisionUnit, errors.New("stop before a real launch")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = m.restoreVMSnapshot(ctx, child, "", "", VMConfig{SavedSnapshotID: man.SnapshotID}, nil, "", "", "", nil, 0, "")
+	}()
+	<-stopping
+	// Another fork of the same snapshot, or its delete, must not wait behind
+	// that stop.
+	lctx, lcancel := context.WithTimeout(context.Background(), time.Second)
+	defer lcancel()
+	unlock, err := m.lockSavedSnapshot(lctx, man.SnapshotID)
+	if err != nil {
+		t.Fatalf("snapshot lock held through a prior life's stop: %v", err)
+	}
+	unlock()
+	close(release)
+	<-done
+}
