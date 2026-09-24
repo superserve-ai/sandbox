@@ -18,6 +18,7 @@ type teamCreationResult struct {
 
 var errTeamCreationConflict = errors.New("team creation request parameters changed")
 var errTeamCreationDeleted = errors.New("created team was deleted")
+var errTeamCreationPromotionUnavailable = errors.New("canonical promotion enforcement unavailable")
 
 const teamCreationResultSQL = `
 SELECT r.name, r.region, CASE WHEN r.deleted_at IS NULL THEN t.id END
@@ -64,6 +65,13 @@ func createTeamCreationResult(ctx context.Context, pool *pgxpool.Pool, actor uui
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return result, err
+	}
+	var canonicalEnabled bool
+	if err = tx.QueryRow(ctx, `SELECT canonical_promotion_identity_enabled()`).Scan(&canonicalEnabled); err != nil {
+		return result, err
+	}
+	if !canonicalEnabled {
+		return result, errTeamCreationPromotionUnavailable
 	}
 
 	// A regional profile is relational state, never promotion identity authority.

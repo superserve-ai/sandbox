@@ -322,6 +322,8 @@ func (h *Handlers) CreateInternalTeam(c *gin.Context) {
 			respondErrorMsg(c, "idempotency_conflict", "Request parameters conflict", http.StatusConflict)
 		case errors.Is(err, errTeamCreationDeleted):
 			respondErrorMsg(c, "team_deleted", "Created team was deleted", http.StatusGone)
+		case errors.Is(err, errTeamCreationPromotionUnavailable):
+			respondErrorMsg(c, "provisioning_unavailable", "Team provisioning is unavailable", http.StatusServiceUnavailable)
 		default:
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) {
@@ -330,7 +332,7 @@ func (h *Handlers) CreateInternalTeam(c *gin.Context) {
 				log.Error().Str("authorization", claims.Authorization).Msg("team creation database failure")
 			}
 			if isTransientCreateDBErr(err) || errors.Is(err, context.DeadlineExceeded) ||
-				(pgErr != nil && (pgErr.Code == "55000" || pgErr.Code == "42P01" || pgErr.Code == "42883" || pgErr.Code == "40001" || pgErr.Code == "40P01" || pgErr.Code == "55P03")) {
+				(pgErr != nil && (pgErr.Code == "55000" || pgErr.Code == "42P01" || pgErr.Code == "42883" || pgErr.Code == "P0002" || pgErr.Code == "40001" || pgErr.Code == "40P01" || pgErr.Code == "55P03")) {
 				respondErrorMsg(c, "provisioning_unavailable", "Team provisioning is unavailable", http.StatusServiceUnavailable)
 			} else {
 				respondErrorMsg(c, "internal_error", "Team provisioning failed", http.StatusInternalServerError)

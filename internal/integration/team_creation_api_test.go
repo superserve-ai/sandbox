@@ -26,6 +26,7 @@ func TestIntegration_TeamCreationReplayAndRecovery(t *testing.T) {
 	private := ed25519.NewKeyFromSeed(seed)
 	actor := canonicalStripeActor(t, "team-creation-"+uuid.NewString()+"@example.com", true)
 	requestID := uuid.NewString()
+	originalRequestID := requestID
 	name := "Example " + uuid.NewString()
 	h := &api.Handlers{Pool: testPool, Config: &config.Config{
 		TeamCreationRegion: "use",
@@ -65,6 +66,10 @@ func TestIntegration_TeamCreationReplayAndRecovery(t *testing.T) {
 	missing := call("recover", name)
 	if missing.Code != http.StatusNotFound {
 		t.Fatalf("recovery miss: %d %s", missing.Code, missing.Body.String())
+	}
+	var beforeCreate int
+	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM team WHERE name=$1`, name).Scan(&beforeCreate); err != nil || beforeCreate != 0 {
+		t.Fatalf("recovery created a team: count=%d err=%v", beforeCreate, err)
 	}
 	var concurrent [2]*httptest.ResponseRecorder
 	var wg sync.WaitGroup
@@ -115,5 +120,50 @@ func TestIntegration_TeamCreationReplayAndRecovery(t *testing.T) {
 	}
 	if memberships != 1 || roles != 1 || grants != 1 || requests != 1 {
 		t.Fatalf("incomplete result: membership=%d role=%d grant=%d request=%d", memberships, roles, grants, requests)
+	}
+	requestID = uuid.NewString()
+	second := call("create", name+" second")
+	if second.Code != http.StatusOK {
+		t.Fatalf("later creation: %d %s", second.Code, second.Body.String())
+	}
+	var secondResult struct {
+		ID uuid.UUID `json:"id"`
+	}
+	if err := json.Unmarshal(second.Body.Bytes(), &secondResult); err != nil {
+		t.Fatal(err)
+	}
+	if secondResult.ID == result.ID {
+		t.Fatal("new intent reused the original team")
+	}
+	var secondGrants int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team_credit_grant WHERE team_id=$1 AND reason='signup trial credit'`, secondResult.ID).Scan(&secondGrants); err != nil || secondGrants != 0 {
+		t.Fatalf("later creation granted another trial: count=%d err=%v", secondGrants, err)
+	}
+	if _, err := testPool.Exec(ctx, `ALTER TABLE promotion_identity_enforcement DISABLE TRIGGER promotion_identity_enforcement_irreversible;
+		UPDATE promotion_identity_enforcement SET enabled=false, enabled_at=NULL, readiness_reference=NULL WHERE singleton;
+		ALTER TABLE promotion_identity_enforcement ENABLE TRIGGER promotion_identity_enforcement_irreversible;`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := testPool.Exec(context.Background(), `ALTER TABLE promotion_identity_enforcement DISABLE TRIGGER promotion_identity_enforcement_irreversible;
+			UPDATE promotion_identity_enforcement SET enabled=true, enabled_at=now(), readiness_reference='synthetic integration authority' WHERE singleton;
+			ALTER TABLE promotion_identity_enforcement ENABLE TRIGGER promotion_identity_enforcement_irreversible;`); err != nil {
+			t.Errorf("restore canonical promotion gate: %v", err)
+		}
+	}()
+	requestID = uuid.NewString()
+	closedName := name + " gate closed"
+	closed := call("create", closedName)
+	if closed.Code != http.StatusServiceUnavailable || !strings.Contains(closed.Body.String(), "provisioning_unavailable") {
+		t.Fatalf("closed promotion gate: %d %s", closed.Code, closed.Body.String())
+	}
+	var closedTeams int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE name=$1`, closedName).Scan(&closedTeams); err != nil || closedTeams != 0 {
+		t.Fatalf("closed gate created a team: count=%d err=%v", closedTeams, err)
+	}
+	requestID = originalRequestID
+	recoveredWhileClosed := call("recover", name)
+	if recoveredWhileClosed.Code != http.StatusOK || recoveredWhileClosed.Body.String() != created.Body.String() {
+		t.Fatalf("recovery during promotion pause: %d %s", recoveredWhileClosed.Code, recoveredWhileClosed.Body.String())
 	}
 }

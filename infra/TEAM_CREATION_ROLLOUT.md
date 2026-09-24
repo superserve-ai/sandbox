@@ -12,10 +12,11 @@ in a control plane or Terraform configuration.
 Apply the compatible promotion expansion and canonical identity migrations,
 configure the global Auth identity bridge, and reconcile historical promotion
 identities before enabling a signer. The API checks for a canonical promotion
-outcome in the same transaction; an older claim function without that outcome
-causes creation to roll back. Keep the legacy Console path and its compatible
-triggers during expansion. Removal requires verified Console adoption in every
-affected cell and a separate contract migration.
+enforcement gate and outcome in the same transaction. An unopened gate or an
+older claim function without that outcome causes creation to roll back. Keep
+the legacy Console path and its compatible triggers during expansion. Removal
+requires verified Console adoption in every affected cell and a separate
+contract migration.
 
 Publish each new public key to all receiving cells before the Console signs
 with it. During rotation, retain the previous key for at least 150 seconds
