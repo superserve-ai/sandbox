@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "signing_seed_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "kid": "test",
+  "header": {"alg": "EdDSA", "typ": "team-creation+jwt", "kid": "test"},
+  "actor": "53ae930d-e4bd-478a-b64f-82f2b0d7e8e6",
+  "requests": [
+    {"case": "normalized_unicode_create", "body": {"request_id": "42140b1e-ac77-4ab0-9841-d9099ae8265a", "name": "Café ☃", "region": "use"}, "authorization": "create", "expected_status": 200},
+    {"case": "read_only_recovery", "body": {"request_id": "42140b1e-ac77-4ab0-9841-d9099ae8265a", "name": "Café ☃", "region": "use"}, "authorization": "recover", "expected_status": 200},
+    {"case": "uncommitted_recovery", "body": {"request_id": "42140b1e-ac77-4ab0-9841-d9099ae8265a", "name": "Café ☃", "region": "use"}, "authorization": "recover", "expected_status": 404, "expected_code": "result_not_found"},
+    {"case": "wrong_cell", "body": {"request_id": "42140b1e-ac77-4ab0-9841-d9099ae8265a", "name": "Café ☃", "region": "use"}, "receiving_cell": "usw", "authorization": "create", "expected_status": 409, "expected_code": "wrong_region"},
+    {"case": "unnormalized_name", "body": {"request_id": "42140b1e-ac77-4ab0-9841-d9099ae8265a", "name": "\ufeffCafé ☃\u00a0", "region": "use"}, "authorization": "create", "expected_status": 400, "expected_code": "invalid_request"}
+  ]
+}

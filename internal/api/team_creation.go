@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/subtle"
 	"encoding/base64"
@@ -15,6 +16,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/rs/zerolog/log"
 )
 
 const teamCreationBodyLimit = 16 << 10
@@ -211,8 +215,11 @@ func verifyTeamCreationAssertion(raw string, keys map[string]ed25519.PublicKey, 
 	case "create":
 		var objects map[string]json.RawMessage
 		_ = json.Unmarshal(payload, &objects)
+		var identityFields map[string]json.RawMessage
+		_ = json.Unmarshal(objects["identity"], &identityFields)
 		if !hasJSONFields(objects["policy"], "version", "mode", "session", "captcha", "preauth", "google_onboarding", "additional_team") ||
 			!hasJSONFields(objects["identity"], "email", "email_verified") || !validTeamCreationPolicy(claims.Policy) || claims.Identity == nil ||
+			bytes.Equal(identityFields["email_verified"], []byte("null")) ||
 			(claims.Identity.EmailVerified && claims.Identity.Email == nil) {
 			return claims, errTeamPolicy
 		}
@@ -246,7 +253,6 @@ func TeamCreationInternalAuth() gin.HandlerFunc {
 }
 
 // CreateInternalTeam verifies transport and proof before any persistence access.
-// Creation remains closed until the promotion authority accepts a canonical identity.
 func (h *Handlers) CreateInternalTeam(c *gin.Context) {
 	if h.Config == nil || (h.Config.TeamCreationRegion != "use" && h.Config.TeamCreationRegion != "usw") || len(h.Config.TeamCreationKeys) == 0 {
 		respondErrorMsg(c, "provisioning_unavailable", "Team provisioning is unavailable", http.StatusServiceUnavailable)
@@ -296,5 +302,46 @@ func (h *Handlers) CreateInternalTeam(c *gin.Context) {
 		respondErrorMsg(c, "wrong_region", "Wrong receiving region", http.StatusConflict)
 		return
 	}
-	respondErrorMsg(c, "provisioning_unavailable", "Team provisioning is unavailable", http.StatusServiceUnavailable)
+	if h.Pool == nil {
+		respondErrorMsg(c, "provisioning_unavailable", "Team provisioning is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+	var result teamCreationResult
+	if claims.Authorization == "recover" {
+		result, err = readTeamCreationResult(ctx, h.Pool, actor, input)
+	} else {
+		result, err = createTeamCreationResult(ctx, h.Pool, actor, input, claims.Identity)
+	}
+	if err != nil {
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			respondErrorMsg(c, "result_not_found", "No completed result exists", http.StatusNotFound)
+		case errors.Is(err, errTeamCreationConflict):
+			respondErrorMsg(c, "idempotency_conflict", "Request parameters conflict", http.StatusConflict)
+		case errors.Is(err, errTeamCreationDeleted):
+			respondErrorMsg(c, "team_deleted", "Created team was deleted", http.StatusGone)
+		default:
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) {
+				log.Error().Str("db_code", pgErr.Code).Str("authorization", claims.Authorization).Msg("team creation database failure")
+			} else {
+				log.Error().Str("authorization", claims.Authorization).Msg("team creation database failure")
+			}
+			if isTransientCreateDBErr(err) || errors.Is(err, context.DeadlineExceeded) ||
+				(pgErr != nil && (pgErr.Code == "55000" || pgErr.Code == "42P01" || pgErr.Code == "42883" || pgErr.Code == "40001" || pgErr.Code == "40P01" || pgErr.Code == "55P03")) {
+				respondErrorMsg(c, "provisioning_unavailable", "Team provisioning is unavailable", http.StatusServiceUnavailable)
+			} else {
+				respondErrorMsg(c, "internal_error", "Team provisioning failed", http.StatusInternalServerError)
+			}
+		}
+		return
+	}
+	outcome := result.Outcome
+	if outcome == "" {
+		outcome = "existing_result"
+	}
+	log.Info().Str("authorization", claims.Authorization).Str("outcome", outcome).Msg("team creation request completed")
+	c.JSON(http.StatusOK, result)
 }

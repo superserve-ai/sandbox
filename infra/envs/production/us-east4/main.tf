@@ -189,6 +189,7 @@ module "api" {
   env = {
     COMPUTE_RESTRICTIONS_FILE = "${local.controlplane_secret_volumes.compute-restrictions.mount_path}/${local.controlplane_secret_volumes.compute-restrictions.path}"
 
+    TEAM_CREATION_PUBLIC_KEYS = var.team_creation_public_keys
     API_PORT               = "8080"
     TEAM_CREATION_REGION   = "use"
     EDGE_PROXY_DOMAIN      = "sandbox.superserve.ai"
@@ -199,6 +200,7 @@ module "api" {
     TEMPLATE_BUILD_REGION  = local.region
     BACKUP_BUCKET          = "superserve-artifact-backup-use4"
     VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
+
     # The cell host's identity, alongside the address above. Same value as
     # metrics_host_id.
     DEFAULT_HOST_ID  = local.metrics_host_id

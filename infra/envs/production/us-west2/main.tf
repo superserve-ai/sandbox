@@ -183,6 +183,7 @@ module "api" {
   env = {
     COMPUTE_RESTRICTIONS_FILE = "${local.controlplane_secret_volumes.compute-restrictions.mount_path}/${local.controlplane_secret_volumes.compute-restrictions.path}"
 
+    TEAM_CREATION_PUBLIC_KEYS = var.team_creation_public_keys
     API_PORT               = "8080"
     TEAM_CREATION_REGION   = "usw"
     EDGE_PROXY_DOMAIN      = "usw-sandbox.superserve.ai"
@@ -195,6 +196,7 @@ module "api" {
     BACKUP_BUCKET          = "superserve-artifact-backup-usw2"
     VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
+
 
     # Control-plane OTLP metrics export, matching us-east4. The host-local
     # superserve-otel-collector receives OTLP on :4318 and forwards to Google
