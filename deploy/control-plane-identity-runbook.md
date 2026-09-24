@@ -131,6 +131,13 @@ artifact and secret reads, negative storage listings, and production KMS round
 trips before routing the candidate. No organization policy, custom-role,
 Policy Troubleshooter, or Cloud Asset inspection is required by the rollout.
 
+After apply, runtime permission failures retry every 15 seconds within one shared
+seven-minute window per cell, starting at the first denial. Each attempt remains
+in private evidence. This allows newly created impersonation and resource grants
+to propagate; exhausted retries still fail the stage and trigger rollback.
+Credential-minting failures never count as successful negative storage checks.
+See Google's [IAM propagation guidance](https://cloud.google.com/iam/docs/access-change-propagation).
+
 ### Retiring former audit setup
 
 The next evidence bootstrap removes its tracked Cloud Asset Viewer, Role Viewer,
