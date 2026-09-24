@@ -29,6 +29,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/abuse"
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
@@ -342,6 +343,14 @@ func run() error {
 	}
 	handlers.StartTeardownSweeper(ctx)
 	handlers.StartLogRetention(ctx)
+	if cfg.BackupBucket != "" {
+		admin, err := backup.NewGCSAdmin(ctx, cfg.BackupBucket, cfg.BackupGCServiceAccount)
+		if err != nil {
+			return fmt.Errorf("backup gc: %w", err)
+		}
+		handlers.BackupGC = admin
+		handlers.StartBackupGC(ctx)
+	}
 
 	// Launch the template build supervisor. Drives template_build rows
 	// through pending → building → snapshotting → ready/failed by calling

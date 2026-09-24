@@ -1417,3 +1417,8 @@ SELECT count(*)::bigint AS total,
        count(*) FILTER (WHERE last_error IS NOT NULL AND NOT permanent)::bigint AS retrying,
        coalesce(extract(epoch FROM now() - min(created_at)), 0)::float8 AS oldest_age_seconds
 FROM sandbox_teardown;
+
+-- name: DeletedSandboxIDs :many
+-- The subset of ids whose sandbox row says deleted; an id the database does
+-- not know is not one of them.
+SELECT id FROM sandbox WHERE id = ANY(@ids::uuid[]) AND status = 'deleted';

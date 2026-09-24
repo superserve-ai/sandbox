@@ -1633,6 +1633,32 @@ func (q *Queries) DeferTeardown(ctx context.Context, arg DeferTeardownParams) (i
 	return result.RowsAffected(), nil
 }
 
+const deletedSandboxIDs = `-- name: DeletedSandboxIDs :many
+SELECT id FROM sandbox WHERE id = ANY($1::uuid[]) AND status = 'deleted'
+`
+
+// The subset of ids whose sandbox row says deleted; an id the database does
+// not know is not one of them.
+func (q *Queries) DeletedSandboxIDs(ctx context.Context, ids []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, deletedSandboxIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const destroySandbox = `-- name: DestroySandbox :one
 WITH destroyed AS (
   UPDATE sandbox

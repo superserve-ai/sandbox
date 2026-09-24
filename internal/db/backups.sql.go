@@ -13,6 +13,92 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const claimBackupGenerationsToPurge = `-- name: ClaimBackupGenerationsToPurge :many
+WITH due AS (
+  SELECT bg.id
+  FROM backup_generation bg
+  JOIN sandbox s ON s.id = bg.sandbox_id
+  WHERE bg.bucket = $1::text
+    AND s.status = 'deleted'
+    AND bg.purged_at IS NULL
+    AND (bg.purge_claimed_at IS NULL
+         OR bg.purge_claimed_at < now() - make_interval(secs => $2::float8))
+  ORDER BY s.destroyed_at ASC
+  LIMIT $3
+  FOR UPDATE OF bg SKIP LOCKED
+)
+UPDATE backup_generation bg
+SET purge_claimed_at = clock_timestamp()
+FROM due
+WHERE bg.id = due.id
+RETURNING bg.id, bg.sandbox_id, bg.generation, bg.purge_claimed_at AS claimed_at
+`
+
+type ClaimBackupGenerationsToPurgeParams struct {
+	Bucket       string  `json:"bucket"`
+	LeaseSeconds float64 `json:"lease_seconds"`
+	BatchSize    int32   `json:"batch_size"`
+}
+
+type ClaimBackupGenerationsToPurgeRow struct {
+	ID         uuid.UUID          `json:"id"`
+	SandboxID  pgtype.UUID        `json:"sandbox_id"`
+	Generation string             `json:"generation"`
+	ClaimedAt  pgtype.Timestamptz `json:"claimed_at"`
+}
+
+// Leases this bucket's generations of deleted sandboxes to one purge worker
+// at a time. A claim older than the lease belongs to a worker that died and
+// may be taken over. The claim time is the worker's token: finishing the
+// purge requires it unchanged, and a report landing meanwhile clears it.
+func (q *Queries) ClaimBackupGenerationsToPurge(ctx context.Context, arg ClaimBackupGenerationsToPurgeParams) ([]ClaimBackupGenerationsToPurgeRow, error) {
+	rows, err := q.db.Query(ctx, claimBackupGenerationsToPurge, arg.Bucket, arg.LeaseSeconds, arg.BatchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimBackupGenerationsToPurgeRow{}
+	for rows.Next() {
+		var i ClaimBackupGenerationsToPurgeRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.SandboxID,
+			&i.Generation,
+			&i.ClaimedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const claimBackupWalk = `-- name: ClaimBackupWalk :execrows
+INSERT INTO backup_walk (bucket, started_at)
+VALUES ($1, now())
+ON CONFLICT (bucket) DO UPDATE SET started_at = now()
+WHERE backup_walk.started_at < now() - make_interval(secs => $2::float8)
+`
+
+type ClaimBackupWalkParams struct {
+	Bucket          string  `json:"bucket"`
+	IntervalSeconds float64 `json:"interval_seconds"`
+}
+
+// Takes the bucket's walk for this interval; zero rows means another
+// replica started one within the interval. A walk that died keeps its claim
+// until the interval passes and is simply taken next time.
+func (q *Queries) ClaimBackupWalk(ctx context.Context, arg ClaimBackupWalkParams) (int64, error) {
+	result, err := q.db.Exec(ctx, claimBackupWalk, arg.Bucket, arg.IntervalSeconds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const coveredBackupGeneration = `-- name: CoveredBackupGeneration :one
 SELECT COALESCE(bg.generation, '')::text AS generation
 FROM sandbox sb
@@ -20,6 +106,7 @@ JOIN snapshot s ON s.id = sb.snapshot_id
 LEFT JOIN LATERAL (
   SELECT generation FROM backup_generation
   WHERE covered_snapshot_id = s.id AND covered_snapshot_generation = s.generation
+    AND purged_at IS NULL
   ORDER BY completed_at DESC LIMIT 1
 ) bg ON true
 WHERE sb.id = $1
@@ -35,6 +122,37 @@ func (q *Queries) CoveredBackupGeneration(ctx context.Context, id uuid.UUID) (st
 	return generation, err
 }
 
+const inUseBasePaths = `-- name: InUseBasePaths :many
+SELECT DISTINCT base_path::text AS base_path FROM sandbox WHERE destroyed_at IS NULL AND base_path IS NOT NULL
+UNION
+SELECT DISTINCT base_path::text FROM template WHERE deleted_at IS NULL AND base_path IS NOT NULL
+UNION
+SELECT DISTINCT base_path::text FROM sandbox_snapshot WHERE deleted_at IS NULL AND status IN ('creating', 'ready')
+`
+
+// Base images a future pause can name: those of live sandboxes, of existing
+// template builds, and of live saved snapshots, which fork new sandboxes
+// from them. Same holders as ListPinnedBuildPaths, plus templates.
+func (q *Queries) InUseBasePaths(ctx context.Context) ([]string, error) {
+	rows, err := q.db.Query(ctx, inUseBasePaths)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var base_path string
+		if err := rows.Scan(&base_path); err != nil {
+			return nil, err
+		}
+		items = append(items, base_path)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const latestSandboxBackup = `-- name: LatestSandboxBackup :one
 SELECT generation, bucket, LEAST(completed_at, reported_at)::timestamptz AS completed_at
 FROM (
@@ -43,7 +161,7 @@ FROM (
       THEN MIN(reported_at) FILTER (WHERE completed_at > reported_at) OVER ()
       ELSE completed_at END AS effective_at
   FROM backup_generation
-  WHERE sandbox_id = $1
+  WHERE sandbox_id = $1 AND purged_at IS NULL
 ) ranked
 ORDER BY effective_at DESC, completed_at DESC
 LIMIT 1
@@ -160,6 +278,27 @@ func (q *Queries) LockSandboxRow(ctx context.Context, id uuid.UUID) (LockSandbox
 	return i, err
 }
 
+const markBackupGenerationPurged = `-- name: MarkBackupGenerationPurged :execrows
+UPDATE backup_generation
+SET purged_at = now(), purge_claimed_at = NULL
+WHERE id = $1 AND purge_claimed_at = $2
+`
+
+type MarkBackupGenerationPurgedParams struct {
+	ID        uuid.UUID          `json:"id"`
+	ClaimedAt pgtype.Timestamptz `json:"claimed_at"`
+}
+
+// Zero rows means the claim was cleared by a report that landed during the
+// purge: the generation was uploaded again and is left for the next pass.
+func (q *Queries) MarkBackupGenerationPurged(ctx context.Context, arg MarkBackupGenerationPurgedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markBackupGenerationPurged, arg.ID, arg.ClaimedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const markSandboxBackupCovered = `-- name: MarkSandboxBackupCovered :exec
 UPDATE backup_generation
 SET covered_snapshot_id = $1,
@@ -197,11 +336,32 @@ func (q *Queries) MarkSandboxBackupCovered(ctx context.Context, arg MarkSandboxB
 	return err
 }
 
+const oldestRecordedBackup = `-- name: OldestRecordedBackup :one
+SELECT reported_at
+FROM backup_generation
+WHERE bucket = $1
+ORDER BY reported_at ASC
+LIMIT 1
+`
+
+// When the database began recording this bucket's generations; a base
+// object older than this may be referenced by a generation it never saw.
+func (q *Queries) OldestRecordedBackup(ctx context.Context, bucket string) (time.Time, error) {
+	row := q.db.QueryRow(ctx, oldestRecordedBackup, bucket)
+	var reported_at time.Time
+	err := row.Scan(&reported_at)
+	return reported_at, err
+}
+
 const recordSandboxBackupGeneration = `-- name: RecordSandboxBackupGeneration :execrows
 INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (sandbox_id, bucket, generation) WHERE sandbox_id IS NOT NULL
 DO UPDATE SET
+  -- A generation uploaded again after its purge (a host's queued upload
+  -- landing late) is purged again.
+  purged_at = NULL,
+  purge_claimed_at = NULL,
   -- reported_at is the receive-instant freshness cap for skew-bounded
   -- reads, so it moves only when a freshness arm fires: an
   -- enrichment-only update re-describes the same verification and must
@@ -236,6 +396,11 @@ WHERE excluded.completed_at > backup_generation.completed_at
    OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
    OR (jsonb_path_exists(excluded.files, '$[*].object')
        AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'))
+   -- Any report for a purged or purge-claimed generation, an exact
+   -- redelivery included, comes from a host that holds its objects: the
+   -- purge must run again.
+   OR backup_generation.purged_at IS NOT NULL
+   OR backup_generation.purge_claimed_at IS NOT NULL
 `
 
 type RecordSandboxBackupGenerationParams struct {
@@ -331,6 +496,116 @@ func (q *Queries) RecordTemplateBackupGeneration(ctx context.Context, arg Record
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const recordedGenerations = `-- name: RecordedGenerations :many
+SELECT sandbox_id, generation
+FROM backup_generation
+WHERE bucket = $1 AND sandbox_id IS NOT NULL AND purged_at IS NULL
+`
+
+type RecordedGenerationsRow struct {
+	SandboxID  pgtype.UUID `json:"sandbox_id"`
+	Generation string      `json:"generation"`
+}
+
+// The unpurged generations the database knows in this bucket; a complete
+// bucket generation outside this set was never reported, or was purged
+// and uploaded again, and either way its owner decides its fate.
+func (q *Queries) RecordedGenerations(ctx context.Context, bucket string) ([]RecordedGenerationsRow, error) {
+	rows, err := q.db.Query(ctx, recordedGenerations, bucket)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RecordedGenerationsRow{}
+	for rows.Next() {
+		var i RecordedGenerationsRow
+		if err := rows.Scan(&i.SandboxID, &i.Generation); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const recordedSharedBasePaths = `-- name: RecordedSharedBasePaths :many
+SELECT DISTINCT (f->>'base_sha256')::text AS sha256, s.base_path::text AS base_path
+FROM backup_generation bg
+JOIN sandbox s ON s.id = bg.sandbox_id, jsonb_array_elements(bg.files) f
+WHERE bg.bucket = $1::text
+  AND coalesce(f->>'base_sha256', '') <> ''
+  AND s.base_path IS NOT NULL
+`
+
+type RecordedSharedBasePathsRow struct {
+	Sha256   string `json:"sha256"`
+	BasePath string `json:"base_path"`
+}
+
+// Which base image each shared base digest was recorded for, from the
+// sandboxes whose generations named it. A digest with no row here has
+// unknown provenance.
+func (q *Queries) RecordedSharedBasePaths(ctx context.Context, bucket string) ([]RecordedSharedBasePathsRow, error) {
+	rows, err := q.db.Query(ctx, recordedSharedBasePaths, bucket)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RecordedSharedBasePathsRow{}
+	for rows.Next() {
+		var i RecordedSharedBasePathsRow
+		if err := rows.Scan(&i.Sha256, &i.BasePath); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const referencedSharedBases = `-- name: ReferencedSharedBases :many
+SELECT DISTINCT (f->>'base_sha256')::text AS sha256
+FROM backup_generation bg, jsonb_array_elements(bg.files) f
+WHERE bg.bucket = $1::text
+  AND coalesce(f->>'base_sha256', '') <> ''
+  AND (bg.purged_at IS NULL
+       OR greatest(bg.reported_at, bg.purged_at) > now() - make_interval(secs => $2::float8))
+`
+
+type ReferencedSharedBasesParams struct {
+	Bucket       string  `json:"bucket"`
+	GraceSeconds float64 `json:"grace_seconds"`
+}
+
+// The shared base digests named by a generation that can still be
+// restored, or by one reported or purged within the grace period: hosts
+// skip re-uploading a base they verified that recently and a new generation
+// may name it without shipping it. Judged by server time, never the host's
+// clock.
+func (q *Queries) ReferencedSharedBases(ctx context.Context, arg ReferencedSharedBasesParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, referencedSharedBases, arg.Bucket, arg.GraceSeconds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var sha256 string
+		if err := rows.Scan(&sha256); err != nil {
+			return nil, err
+		}
+		items = append(items, sha256)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const setSnapshotSizeBytes = `-- name: SetSnapshotSizeBytes :exec

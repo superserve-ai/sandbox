@@ -303,17 +303,24 @@ type AuditLog struct {
 }
 
 type BackupGeneration struct {
-	ID                        uuid.UUID   `json:"id"`
-	SandboxID                 pgtype.UUID `json:"sandbox_id"`
-	TemplateID                pgtype.UUID `json:"template_id"`
-	BuildID                   *string     `json:"build_id"`
-	Generation                string      `json:"generation"`
-	Bucket                    string      `json:"bucket"`
-	CompletedAt               time.Time   `json:"completed_at"`
-	ReportedAt                time.Time   `json:"reported_at"`
-	Files                     []byte      `json:"files"`
-	CoveredSnapshotID         pgtype.UUID `json:"covered_snapshot_id"`
-	CoveredSnapshotGeneration *int64      `json:"covered_snapshot_generation"`
+	ID                        uuid.UUID          `json:"id"`
+	SandboxID                 pgtype.UUID        `json:"sandbox_id"`
+	TemplateID                pgtype.UUID        `json:"template_id"`
+	BuildID                   *string            `json:"build_id"`
+	Generation                string             `json:"generation"`
+	Bucket                    string             `json:"bucket"`
+	CompletedAt               time.Time          `json:"completed_at"`
+	ReportedAt                time.Time          `json:"reported_at"`
+	Files                     []byte             `json:"files"`
+	CoveredSnapshotID         pgtype.UUID        `json:"covered_snapshot_id"`
+	CoveredSnapshotGeneration *int64             `json:"covered_snapshot_generation"`
+	PurgeClaimedAt            pgtype.Timestamptz `json:"purge_claimed_at"`
+	PurgedAt                  pgtype.Timestamptz `json:"purged_at"`
+}
+
+type BackupWalk struct {
+	Bucket    string    `json:"bucket"`
+	StartedAt time.Time `json:"started_at"`
 }
 
 type BillingExportAllocation struct {

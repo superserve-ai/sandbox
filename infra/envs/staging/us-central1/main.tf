@@ -213,6 +213,11 @@ module "api" {
     STRIPE_CHECKOUT_PRICE_IDS   = "price_1U1UnbQ9Sm5V6nX8PqeQuuOz,price_1U1UqtQ9Sm5V6nX8E1or6k4w"
     STRIPE_API_VERSION          = "2026-05-27.dahlia"
     APP_ALLOWED_ORIGINS         = "https://console-staging.superserve.ai"
+
+    # The purge of deleted sandboxes' backups: the cell's bucket and the
+    # GC identity the runtime impersonates to delete from it.
+    BACKUP_BUCKET             = module.backup_storage.bucket_name
+    BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
   }
   secrets = {
     SANDBOX_ACCESS_TOKEN_SEED = {
@@ -696,4 +701,12 @@ module "backup_storage" {
   labels = merge(local.common_labels, {
     component = "backup"
   })
+}
+
+# The control plane deletes deleted sandboxes' backups as the bucket's GC
+# identity, which it impersonates only for that client.
+resource "google_service_account_iam_member" "controlplane_backup_gc" {
+  service_account_id = "projects/${local.project_id}/serviceAccounts/${module.backup_storage.gc_service_account_email}"
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${google_service_account.controlplane_runtime.email}"
 }
