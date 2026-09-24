@@ -128,6 +128,7 @@ type OTelRecorder struct {
 	peerStreams              metric.Int64UpDownCounter
 	peerEvents               metric.Int64Counter
 	peerHandshakeDuration    metric.Float64Histogram
+	storageReportFailures    metric.Int64Counter
 }
 
 // NewOTelRecorder constructs an OTLP/HTTP metrics recorder. Call Shutdown on
@@ -308,10 +309,20 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 	if r.peerHandshakeDuration, err = meter.Float64Histogram("peer_handshake_duration_seconds", metric.WithExplicitBucketBoundaries(latencyBuckets...)); err != nil {
 		return nil, err
 	}
+	if r.storageReportFailures, err = meter.Int64Counter("storage_measurement_processing_failure_total"); err != nil {
+		return nil, err
+	}
 	if err = r.initBilling(meter); err != nil {
 		return nil, err
 	}
 	return r, nil
+}
+
+func (r *OTelRecorder) RecordStorageReportFailure(ctx context.Context, f StorageReportFailure) {
+	if r == nil {
+		return
+	}
+	r.storageReportFailures.Add(ctx, 1, metric.WithAttributes(r.attrs(attribute.String("result", safeResult(f.Result)))...))
 }
 
 // RecordPeerEvent emits peer lifecycle observations with bounded enum labels.

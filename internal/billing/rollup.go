@@ -194,14 +194,20 @@ func processJobs(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg Hou
 }
 
 func processJob(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg HourlyRollupConfig, workerID string, job rollupJob) error {
-	_, err := q.UpsertTeamBillingUsageHour(ctx, db.UpsertTeamBillingUsageHourParams{
-		TeamID:    job.TeamID,
-		HourStart: timestamptz(job.HourStart),
-		HourEnd:   timestamptz(job.HourEnd),
-	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		// The team flag may have been disabled after the scheduler enqueued the job.
-		err = nil
+	// A job may have been enqueued before the team disabled hourly rollups.
+	// Complete it as a no-op without consulting storage-report completeness;
+	// disabled rollups must not keep retrying an auxiliary telemetry gate.
+	enabled, err := teamFeatureEnabled(ctx, pool, job.TeamID, "billing_hourly_rollups")
+	if err != nil {
+		return err
+	}
+	if !enabled {
+		return completeJob(ctx, pool, job.ID, workerID)
+	}
+
+	err = upsertCompleteRollupUsage(ctx, pool, q, job)
+	if errors.Is(err, ErrStorageReportsIncomplete) {
+		return deferIncompleteRollupJob(ctx, pool, job.ID, workerID)
 	}
 	if err != nil {
 		nextAttemptAt := time.Now().UTC().Add(backoff(job.AttemptCount))
@@ -211,10 +217,71 @@ func processJob(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, cfg Hour
 		return err
 	}
 
-	if err := completeJob(ctx, pool, job.ID, workerID); err != nil {
+	return completeJob(ctx, pool, job.ID, workerID)
+}
+
+func upsertCompleteRollupUsage(ctx context.Context, pool *pgxpool.Pool, q *db.Queries, job rollupJob) error {
+	ctx, cancel := context.WithTimeout(ctx, StorageReportSettlementTimeout)
+	defer cancel()
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
 		return err
 	}
-	return nil
+	defer tx.Rollback(ctx)
+	if err := FenceStorageReportReceipts(ctx, tx, job.TeamID); err != nil {
+		return err
+	}
+	complete, err := storageReportsCompleteThrough(ctx, tx, job.TeamID, job.HourEnd)
+	if err != nil {
+		return fmt.Errorf("check storage report completeness: %w", err)
+	}
+	if !complete {
+		return ErrStorageReportsIncomplete
+	}
+
+	_, err = q.WithTx(tx).UpsertTeamBillingUsageHour(ctx, db.UpsertTeamBillingUsageHourParams{
+		TeamID:    job.TeamID,
+		HourStart: timestamptz(job.HourStart),
+		HourEnd:   timestamptz(job.HourEnd),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The team flag may have been disabled after the scheduler enqueued the job.
+		var enabled bool
+		if flagErr := tx.QueryRow(ctx, `SELECT feature_enabled('billing_hourly_rollups', $1)`, job.TeamID).Scan(&enabled); flagErr != nil {
+			return flagErr
+		}
+		if enabled {
+			// The upsert's snapshot was incomplete even if a worker has now
+			// committed. Retry the aggregation instead of completing an empty job.
+			return ErrStorageReportsIncomplete
+		}
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func deferIncompleteRollupJob(ctx context.Context, pool *pgxpool.Pool, jobID uuid.UUID, workerID string) error {
+	// Claiming reserves one attempt; waiting for accepted storage reports is
+	// not a failed rollup and must not consume its retry budget.
+	const query = `
+UPDATE billing_rollup_job
+SET status = 'pending',
+    attempt_count = GREATEST(attempt_count - 1, 0),
+    locked_by = NULL,
+    locked_until = NULL,
+    next_attempt_at = now() + interval '30 seconds',
+    last_error = 'storage reports incomplete',
+    updated_at = now()
+WHERE id = $1
+  AND locked_by = $2`
+	_, err := pool.Exec(ctx, query, jobID, workerID)
+	if err != nil {
+		return err
+	}
+	return ErrStorageReportsIncomplete
 }
 
 func claimSchedulerLease(ctx context.Context, pool *pgxpool.Pool, workerID string, lockedUntil time.Time) (bool, error) {

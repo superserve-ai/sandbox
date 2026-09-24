@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -442,11 +443,21 @@ func TestIntegration_HostGenerationConcurrentRebindAndHeartbeats(t *testing.T) {
 		t.Fatalf("seed attestations = %d %s", w.Code, w.Body.String())
 	}
 	var capabilities, storage int
-	if err := testPool.QueryRow(ctx, `SELECT
-		(SELECT count(*) FROM host_capability WHERE host_id=$1),
-		(SELECT count(*) FROM sandbox_storage_interval WHERE sandbox_id=$2 AND ended_at IS NULL AND disk_mib=8)`,
-		hostID, sandboxID).Scan(&capabilities, &storage); err != nil {
-		t.Fatal(err)
+	deadline := time.Now().Add(7 * time.Second)
+	for {
+		if err := testPool.QueryRow(ctx, `SELECT
+			(SELECT count(*) FROM host_capability WHERE host_id=$1),
+			(SELECT count(*) FROM sandbox_storage_interval WHERE sandbox_id=$2 AND ended_at IS NULL AND disk_mib=8)`,
+			hostID, sandboxID).Scan(&capabilities, &storage); err != nil {
+			t.Fatal(err)
+		}
+		if capabilities == 2 && storage == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if capabilities != 2 || storage != 1 {
 		t.Fatalf("seeded capabilities=%d storage=%d; want 2 and 1", capabilities, storage)

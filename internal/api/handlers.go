@@ -150,13 +150,15 @@ type HostRegistry interface {
 
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
-	ComputeRestrictions *abuse.ComputeEvaluator
-	VMD                 VMDClient // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
-	DB                  *db.Queries
-	Pool                *pgxpool.Pool // required by paths that need their own transaction (e.g. build-concurrency admission)
-	Config              *config.Config
-	Hosts               HostRegistry // when set, routes VMD calls via host_id
-	Scheduler           Scheduler    // when set, picks host on create
+	ComputeRestrictions   *abuse.ComputeEvaluator
+	VMD                   VMDClient // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
+	DB                    *db.Queries
+	Pool                  *pgxpool.Pool // required by paths that need their own transaction (e.g. build-concurrency admission)
+	legacyStorageAccepted sync.Map      // legacyStorageAckKey -> last durably accepted report ID
+	legacyStorageInFlight sync.Map      // legacyStorageAckKey -> report ID with an active inline attempt or retry
+	Config                *config.Config
+	Hosts                 HostRegistry // when set, routes VMD calls via host_id
+	Scheduler             Scheduler    // when set, picks host on create
 	// Shadow, when set, receives a sample of creates for capacity
 	// ranking that influences nothing. Offering is a non-blocking
 	// channel send; see ShadowEvaluator.
