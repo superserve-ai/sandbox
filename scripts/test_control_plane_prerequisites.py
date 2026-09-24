@@ -98,8 +98,6 @@ class ProbeTests(unittest.TestCase):
                 if name == "deployment-identity": return CONTRACT["deployment_identity"]
                 if name == "verification-apis": return "cloudasset.googleapis.com\npolicytroubleshooter.googleapis.com\n"
                 if name == "service-readiness": return '{"status":{"traffic":[{"percent":100,"revisionName":"old-revision"}]}}'
-                if name == "template-list": return 'templates/example/build/generation/manifest.json\n'
-                if name == "template-manifest": return '{"files":[{"object":"part.snap"},{"object":"bases/shared"}]}'
                 if argv[1:3] == ["policy-troubleshoot", "iam"]: return '{"access":"NOT_GRANTED"}'
                 if argv[1:3] == ["asset", "analyze-iam-policy"]: return '{"fullyExplored":true,"analysisResults":[]}'
                 if name.startswith("secret-version-"): return '{"state":"ENABLED"}'
@@ -138,6 +136,7 @@ class ProbeTests(unittest.TestCase):
                 self.assertEqual(sum(cmd[1:3] == ["policy-troubleshoot", "iam"] for cmd in argv), 26)
                 self.assertFalse(any("--impersonate-service-account" in word for cmd in argv for word in cmd))
                 self.assertFalse(any(word in {"apply", "update-traffic", "update", "delete", "create", "access"} for cmd in argv for word in cmd))
+                self.assertFalse(any(cmd[1:3] in (["storage", "cat"], ["storage", "objects"]) for cmd in argv))
                 self.assertEqual(any(name == "kms-primary" for name, _ in calls), kms)
 
     def test_unknown_policies_incomplete_analysis_and_disabled_secrets_all_fail(self):
@@ -155,9 +154,9 @@ class ProbeTests(unittest.TestCase):
         self.assertTrue(all(row["status"] == "PASS" for row in checks))
         # The existing cutover suite separately rejects GRANTED for this probe.
 
-    def test_missing_manifest_and_disabled_kms_primary_are_reported_together(self):
-        _, checks = self.run_cell(kms=True, failures={"template-list": "", "kms-primary": '{"primary":{"state":"DISABLED"}}'})
-        self.assertEqual({row["name"] for row in checks if row["status"] == "FAIL"}, {"template-references", "kms-primary"})
+    def test_disabled_kms_primary_is_rejected(self):
+        _, checks = self.run_cell(kms=True, failures={"kms-primary": '{"primary":{"state":"DISABLED"}}'})
+        self.assertEqual({row["name"] for row in checks if row["status"] == "FAIL"}, {"kms-primary"})
 
 
 class WorkflowTests(unittest.TestCase):
