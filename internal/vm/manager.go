@@ -9326,6 +9326,20 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 	return true
 }
 
+// presenceWrittenSince reports whether the overlay's presence map was
+// written no earlier than the intent. The intent is durable before the diff
+// and the map is written after it, so a map a Firecracker from before the
+// map left alone, or a crash rolled back, is older; the pre-save mark is not
+// synced and proves nothing after a crash.
+func presenceWrittenSince(mem, intentPath string) bool {
+	in, err := os.Stat(intentPath)
+	if err != nil {
+		return false
+	}
+	sc, err := os.Stat(presence.SidecarPath(mem))
+	return err == nil && !sc.ModTime().Before(in.ModTime())
+}
+
 // settleInterruptedRewrite reconciles the record with the chain a rewrite
 // left behind. An image whose manifest names the intent's artifact was
 // written whole, its manifest after it, so the record takes it, durably, as
@@ -9348,7 +9362,7 @@ func (m *Manager) settleInterruptedRewrite(dir string, in *pauseIntent, inst *VM
 		// The record was written; only the intent's removal was lost.
 		return false, true
 	}
-	vmstate := filepath.Join(dir, "vmstate.snap")
+	vmstate, intentPath := filepath.Join(dir, "vmstate.snap"), pauseIntentPath(dir)
 	for _, name := range []string{"mem.diff", "mem.snap"} {
 		mem := filepath.Join(dir, name)
 		man, err := ReadWallClockManifest(mem)
@@ -9360,11 +9374,9 @@ func (m *Manager) settleInterruptedRewrite(dir string, in *pauseIntent, inst *VM
 			log.Warn().Str("mem", mem).Msg("reattach: a rewritten overlay has no base to be served over; not adopted")
 			continue
 		}
-		if layered {
-			if verr := m.verifyPresenceRefreshed(mem, presenceSaveMark); verr != nil {
-				log.Warn().Err(verr).Str("mem", mem).Msg("reattach: a rewritten overlay's presence map is not the rewrite's; not adopted")
-				continue
-			}
+		if layered && !presenceWrittenSince(mem, intentPath) {
+			log.Warn().Str("mem", mem).Msg("reattach: a rewritten overlay's presence map is not the rewrite's; not adopted")
+			continue
 		}
 		advanceChain(inst, vmstate, mem, base, man)
 		if _, err := m.persistStateIfPresent(inst); err != nil {

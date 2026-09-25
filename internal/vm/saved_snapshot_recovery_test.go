@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
@@ -42,6 +43,15 @@ func frozenSourceRecord(t *testing.T, m *Manager, inst *VMInstance) (overlay str
 	m.cfg.GuestClockFreezeEnabled = true
 	m.clockRealtimeCapable.Store(true)
 	return overlay
+}
+
+// refreshPresence is the presence map's rewrite by the diff, after the intent.
+func refreshPresence(t *testing.T, overlay string) {
+	t.Helper()
+	later := time.Now().Add(time.Second)
+	if err := os.Chtimes(presence.SidecarPath(overlay), later, later); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // reattachFromRecord is a vmd restart: the source is forgotten, rebuilt
@@ -143,6 +153,7 @@ func TestRecoveryWithdrawsAChainARewriteLeftUncertain(t *testing.T) {
 	if err := writePauseIntent(chainDir, pauseIntent{VMID: inst.ID, FreezeToken: "tok-b", ArtifactID: "art-b"}); err != nil {
 		t.Fatal(err)
 	}
+	refreshPresence(t, overlay)
 	recovered := reattachFromRecord(t, m, store, inst.ID)
 	if fileExists(vmstate) || fileExists(overlayBlockMapPath(vmstate)) {
 		t.Fatal("an uncertain chain image was left restorable")
@@ -215,6 +226,7 @@ func TestRecoveryKeepsTheIntentWhenTheAdoptedChainCannotBeRecorded(t *testing.T)
 	if err := writePauseIntent(chainDir, pauseIntent{VMID: inst.ID, FreezeToken: "tok-b", ArtifactID: "art-b"}); err != nil {
 		t.Fatal(err)
 	}
+	refreshPresence(t, overlay)
 	rec, err := store.Get(inst.ID)
 	if err != nil || rec == nil {
 		t.Fatal(err)
@@ -263,6 +275,7 @@ func TestRecoveryRecordsAChainARewriteCompletedBeforeItsRecord(t *testing.T) {
 	if err := writePauseIntent(chainDir, pauseIntent{VMID: inst.ID, FreezeToken: "tok-b", ArtifactID: "art-b"}); err != nil {
 		t.Fatal(err)
 	}
+	refreshPresence(t, overlay)
 	recovered := reattachFromRecord(t, m, store, inst.ID)
 	if recovered.FreezeToken != "tok-b" || recovered.ArtifactID != "art-b" || recovered.DirtyTrackingGeneration != 1 {
 		t.Fatalf("recovered token=%q artifact=%q gen=%d; want the rewrite's", recovered.FreezeToken, recovered.ArtifactID, recovered.DirtyTrackingGeneration)
@@ -313,6 +326,10 @@ func TestRecoveryDoesNotAdoptAnOverlayItCannotServe(t *testing.T) {
 			return os.Chtimes(presence.SidecarPath(overlay), presenceSaveMark, presenceSaveMark)
 		}},
 		{"presence map absent", func(overlay string) error { return os.Remove(presence.SidecarPath(overlay)) }},
+		{"presence map older than the intent, as a crash rolls back", func(overlay string) error {
+			old := time.Now().Add(-time.Hour)
+			return os.Chtimes(presence.SidecarPath(overlay), old, old)
+		}},
 		{"base record absent", func(overlay string) error { return os.Remove(layeredBaseSidecarPath(overlay)) }},
 	}
 	for _, tc := range cases {
@@ -348,9 +365,6 @@ func TestRecoveryDoesNotAdoptAnOverlayItCannotServe(t *testing.T) {
 			}
 			if fileExists(vmstate) {
 				t.Fatal("a chain the record cannot serve was left restorable")
-			}
-			if fileExists(presence.SidecarPath(overlay)) && tc.name == "presence map not refreshed" {
-				t.Fatal("a presence map that is not the rewrite's survived")
 			}
 			if in, err := readPauseIntent(chainDir); err != nil || in != nil {
 				t.Fatalf("intent after the withdrawal: %+v %v; want none", in, err)
