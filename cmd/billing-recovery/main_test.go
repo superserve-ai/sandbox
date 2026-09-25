@@ -118,30 +118,30 @@ func TestVerifiedActivationGrantRequiresApplicabilityAndIdentity(t *testing.T) {
 	grant.Amount.Monetary.Value = 9500
 	grant.Amount.Monetary.Currency = "usd"
 	grant.ApplicabilityConfig.Scope.PriceType = "metered"
-	if !isVerifiedActivationGrant(grant, "", identity) {
+	if !(stripeClient{}).isVerifiedActivationGrant(grant, "", identity) {
 		t.Fatal("matching activation identity and applicability should verify the grant")
 	}
 
 	grant.Metadata[activationGrantIdentityMetadataKey] = "stripe-activation-credit-other-team"
-	if isVerifiedActivationGrant(grant, "", identity) {
+	if (stripeClient{}).isVerifiedActivationGrant(grant, "", identity) {
 		t.Fatal("a grant for another activation identity must remain unverified")
 	}
 	grant.Metadata[activationGrantIdentityMetadataKey] = identity
 	grant.ApplicabilityConfig.Scope.PriceType = "licensed"
-	if isVerifiedActivationGrant(grant, "", identity) {
+	if (stripeClient{}).isVerifiedActivationGrant(grant, "", identity) {
 		t.Fatal("a grant with non-metered applicability must remain unverified")
 	}
 	grant.ApplicabilityConfig.Scope.PriceType = "metered"
-	if !isVerifiedActivationGrant(grant, grant.ID, "") {
+	if !(stripeClient{}).isVerifiedActivationGrant(grant, grant.ID, "") {
 		t.Fatal("a persisted local grant ID may establish identity, but applicability is still required")
 	}
 	grant.ExpiresAt = int64PtrForTest(time.Now().UTC().Add(-time.Minute).Unix())
-	if isVerifiedActivationGrant(grant, grant.ID, "") {
+	if (stripeClient{}).isVerifiedActivationGrant(grant, grant.ID, "") {
 		t.Fatal("an expired grant must not establish activation")
 	}
 	grant.ExpiresAt = nil
 	grant.VoidedAt = int64PtrForTest(time.Now().UTC().Unix())
-	if isVerifiedActivationGrant(grant, grant.ID, "") {
+	if (stripeClient{}).isVerifiedActivationGrant(grant, grant.ID, "") {
 		t.Fatal("a voided grant must not establish activation")
 	}
 }
@@ -294,3 +294,57 @@ func uuidPtrForTest(value uuid.UUID) *uuid.UUID { return &value }
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestRecoverySnapshotIncludesCheckoutIdentity(t *testing.T) {
+	at := time.Now()
+	session := "cs_original"
+	a := billingAccount{CheckoutAt: &at, CheckoutSessionID: &session}
+	b := a
+	replacement := "cs_replacement"
+	b.CheckoutSessionID = &replacement
+	if sameRecoveryBillingSnapshot(a, b) {
+		t.Fatal("replacement checkout was not detected")
+	}
+	b = a
+	later := at.Add(time.Second)
+	b.CheckoutAt = &later
+	if sameRecoveryBillingSnapshot(a, b) {
+		t.Fatal("new checkout reservation was not detected")
+	}
+}
+
+func TestAuditCheckoutSeparatesUnverifiedStateFromLookupFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		code            int
+		body            string
+		outcome, reason string
+	}{
+		{"server failure", 500, `{}`, "unresolved", "stripe_checkout_lookup_failed"},
+		{"invalid response", 200, `not json`, "unresolved", "stripe_checkout_lookup_failed"},
+		{"open session", 200, `{"id":"cs_pending","status":"open"}`, "skipped", "checkout_not_verified_complete"},
+		{"expired session", 200, `{"id":"cs_pending","status":"expired"}`, "skipped", "checkout_not_verified_complete"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if r.Method != http.MethodGet || r.URL.Path != "/v1/checkout/sessions/cs_pending" {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+				}
+				w.WriteHeader(tc.code)
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer server.Close()
+			at := time.Now()
+			account := billingAccount{TeamID: uuid.New(), CustomerID: stringPtrForTest("cus_current"), SubscriptionID: stringPtrForTest("sub_current"), CheckoutSessionID: stringPtrForTest("cs_pending"), CheckoutAt: &at}
+			result := auditAccount(context.Background(), nil, stripeClient{baseURL: server.URL}, account, nil, false)
+			if result["outcome"] != tc.outcome || result["reason"] != tc.reason {
+				t.Fatalf("result=%v, want %s/%s", result, tc.outcome, tc.reason)
+			}
+			if calls != 1 {
+				t.Fatalf("requests=%d, want exactly one read", calls)
+			}
+		})
+	}
+}
