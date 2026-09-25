@@ -221,6 +221,15 @@ module "api" {
     APP_ALLOWED_ORIGINS         = "https://console-staging.superserve.ai"
   }
   secrets = {
+    PROMOTION_AUTH_DATABASE_URL = {
+      secret = google_secret_manager_secret.promotion_auth_database_url.secret_id
+    }
+    PROMOTION_CAPTURE_TOKEN = {
+      secret = google_secret_manager_secret.promotion_capture_token.secret_id
+    }
+    PROMOTION_ACCOUNT_TOKEN = {
+      secret = google_secret_manager_secret.promotion_account_token.secret_id
+    }
     SANDBOX_ACCESS_TOKEN_SEED = {
       secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
     }

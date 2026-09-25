@@ -202,6 +202,21 @@ func run() error {
 		handlers.TrialWarningSender = api.NewResendTrialCreditWarningSender(apiKey, from, queries)
 	}
 	handlers.Pool = dbPool
+	if authURL := os.Getenv("PROMOTION_AUTH_DATABASE_URL"); authURL != "" {
+		authCfg, err := pgxpool.ParseConfig(authURL)
+		if err != nil {
+			return fmt.Errorf("parse promotion auth database url: %w", err)
+		}
+		authCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+		authCfg.ConnConfig.ConnectTimeout = 5 * time.Second
+		authCfg.MaxConns = 4
+		authPool, err := pgxpool.NewWithConfig(ctx, authCfg)
+		if err != nil {
+			return fmt.Errorf("connect to promotion auth database: %w", err)
+		}
+		defer authPool.Close()
+		handlers.PromotionAuthPool = authPool
+	}
 	handlers.Stripe = api.NewStripeBillingClient(cfg)
 
 	// Product-usage analytics — no-op when POSTHOG_KEY is unset.

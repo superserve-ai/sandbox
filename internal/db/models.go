@@ -1404,6 +1404,7 @@ type UserPromotionEntitlement struct {
 	StripeRedemptionAttemptedAt    pgtype.Timestamptz `json:"stripe_redemption_attempted_at"`
 	CreatedAt                      time.Time          `json:"created_at"`
 	UpdatedAt                      time.Time          `json:"updated_at"`
+	StripeDeviceFingerprint        *string            `json:"stripe_device_fingerprint"`
 }
 
 type UserRoleAssignment struct {

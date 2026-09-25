@@ -13,11 +13,48 @@ spec.loader.exec_module(identity)
 
 
 class ControlplaneIdentityTest(unittest.TestCase):
+    def test_promotion_evidence_secrets_reach_every_controlplane(self):
+        for environment, region, secret_file in (
+            ('production', 'us-east4', 'controlplane-identity.tf'),
+            ('production', 'us-west2', 'controlplane-identity.tf'),
+            ('staging', 'us-central1', 'control-plane-identity.tf'),
+        ):
+            root = ROOT / 'infra/envs' / environment / region
+            secrets = (root / secret_file).read_text()
+            main = (root / 'main.tf').read_text()
+            with self.subTest(environment=environment, region=region):
+                for name, resource in (
+                    ('PROMOTION_AUTH_DATABASE_URL', 'promotion_auth_database_url'),
+                    ('PROMOTION_CAPTURE_TOKEN', 'promotion_capture_token'),
+                    ('PROMOTION_ACCOUNT_TOKEN', 'promotion_account_token'),
+                ):
+                    self.assertIn(f'google_secret_manager_secret.{resource}.secret_id', secrets + main)
+                    self.assertRegex(secrets + main, rf'{name}\s*=\s*\{{\s*secret\s*=\s*google_secret_manager_secret\.{resource}\.secret_id')
+                    self.assertNotRegex(main, rf'(?m)^\s*{name}\s*=\s*"')
+                self.assertIn('roles/secretmanager.secretAccessor', secrets)
+                self.assertIn('controlplane_runtime.email', secrets)
+
+    def test_shared_auth_proxy_role_has_only_rpc_privileges(self):
+        migration = (ROOT / 'supabase/shared-auth-migrations/20260925190000_promotion_evidence_proxy_role.sql').read_text()
+        self.assertIn('LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION', migration)
+        self.assertIn('REVOKE ALL ON public.signup_device_attempt, public.signup_device_account_evidence', migration)
+        for function in ('create_signup_device_attempt()',
+                         'verify_signup_device_attempt(uuid,uuid,text,text,timestamptz)',
+                         'bind_signup_device_account(uuid,uuid)',
+                         'get_signup_device_account_evidence(uuid)'):
+            self.assertIn(function, migration)
+        self.assertNotRegex(migration, r'GRANT\s+(?:SELECT|INSERT|UPDATE|DELETE|ALL)\s+ON\s+(?:TABLE\s+)?public\.signup_device_')
+
     def service(self, cell):
+        secrets = [('OPERATOR_API_TOKEN', 'operator-api-token'),
+                   ('PROMOTION_AUTH_DATABASE_URL', 'promotion-auth-database-url'),
+                   ('PROMOTION_CAPTURE_TOKEN', 'promotion-capture-token'),
+                   ('PROMOTION_ACCOUNT_TOKEN', 'promotion-account-token')]
         return {'spec': {'template': {'spec': {
             'serviceAccountName': f'superserve-controlplane-{cell}@example-project.iam.gserviceaccount.com',
-            'containers': [{'env': [{'name': 'OPERATOR_API_TOKEN', 'valueFrom': {
-                'secretKeyRef': {'name': f'operator-api-token-{cell}', 'key': 'latest'}}}]}],
+            'containers': [{'env': [{'name': name, 'valueFrom': {
+                'secretKeyRef': {'name': f'{secret}-{cell}', 'key': 'latest'}}}
+                for name, secret in secrets]}],
         }}}}
 
     def test_accepts_both_cell_identities(self):
@@ -34,6 +71,10 @@ class ControlplaneIdentityTest(unittest.TestCase):
             lambda s: s['containers'][0]['env'][0]['valueFrom']['secretKeyRef'].update(name='internal-api-token'),
             lambda s: s['containers'][0]['env'][0]['valueFrom']['secretKeyRef'].update(name='operator-api-token-usw2'),
             lambda s: s['containers'][0]['env'][0]['valueFrom']['secretKeyRef'].update(key=''),
+            lambda s: s['containers'][0]['env'].pop(1),
+            lambda s: s['containers'][0]['env'][1].update(value='example-url', valueFrom={}),
+            lambda s: s['containers'][0]['env'][2]['valueFrom']['secretKeyRef'].update(name='promotion-capture-token-usw2'),
+            lambda s: s['containers'][0]['env'][3]['valueFrom']['secretKeyRef'].update(key=''),
         ]
         for mutate in mutations:
             candidate = deepcopy(service)

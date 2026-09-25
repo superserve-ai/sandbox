@@ -109,6 +109,17 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	r.GET("/billing/pricing/public", h.GetPublicBillingPricing)
 	r.POST("/stripe/webhook", h.HandleStripeWebhook)
 
+	promotionCapture := r.Group("/internal/promotion/signup")
+	promotionCapture.Use(PromotionProducerAuth("PROMOTION_CAPTURE_TOKEN"))
+	promotionCapture.POST("/attempts", h.CreatePromotionSignupAttempt)
+	promotionCapture.POST("/attempts/verify", h.VerifyPromotionSignupAttempt)
+
+	promotionAccount := r.Group("/internal/promotion/account")
+	promotionAccount.Use(PromotionProducerAuth("PROMOTION_ACCOUNT_TOKEN"))
+	promotionAccount.POST("/bind", h.BindPromotionSignupAccount)
+	promotionAccount.POST("/evidence", h.GetPromotionSignupAccountEvidence)
+	promotionAccount.POST("/register", h.RegisterPromotionSignupDevice)
+
 	// Operator endpoints — authenticated via OPERATOR_API_TOKEN, a separate
 	// credential from the infra-internal token that every vmd host holds
 	// for heartbeats. Host lifecycle approval must not be reachable with a

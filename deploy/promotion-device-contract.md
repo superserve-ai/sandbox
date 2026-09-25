@@ -9,15 +9,66 @@ subsequent grant integration must use the operations below before activation.
 ## Original evidence source
 
 The shared Auth PostgreSQL project owns `signup_device_attempt` and
-`signup_device_account_evidence`. Apply
-`supabase/shared-auth-migrations/20260925000000_signup_device_evidence.sql` **once
-to that project**, separately from each regional migration chain. This store is
-server only, independent of East or West promotion databases. Verified attempts
+`signup_device_account_evidence`. Apply the scripts in
+`supabase/shared-auth-migrations/` in timestamp order **once to that project**,
+separately from each regional migration chain. The immutability script revokes
+Supabase's direct application-role table grants and guards accepted facts.
+This store is server only, independent of East or West promotion databases.
+Verified attempts
 and account bindings are retained indefinitely, including after account deletion;
 unverified attempts may be purged only after their verification window closes.
 Database backups and migration rollback protection must retain the tables.
 
-Console's server, using the shared project's service credential, calls:
+Console's server calls the following scoped control-plane routes, which execute
+the corresponding shared Auth RPCs:
+
+The control plane exposes these operations to Console through dedicated
+credentials. Configure `PROMOTION_AUTH_DATABASE_URL` with access to the shared
+Auth project, `PROMOTION_CAPTURE_TOKEN` for attempt creation and provider
+attestation, and a distinct `PROMOTION_ACCOUNT_TOKEN` for binding, retrieval,
+and selected-region registration. Missing or identical tokens deny requests;
+an unavailable shared Auth database returns `authority_unavailable` and must
+withhold credit. The regional database remains `DATABASE_URL`. Keep these
+credentials server side; the VMD internal token and tenant API keys grant no
+access. Every account operation requires `X-Actor-User-Id` equal to the
+`user_id` in the bounded JSON body. Console must set both from its trusted Auth
+signup result or authenticated server side principal, never browser input.
+
+The staging, production East, and production West Terraform roots each create
+three cell-specific Secret Manager secrets and bind their latest versions to the
+control-plane runtime identity. Apply the shared Auth migrations first, then set
+a password on the `promotion_evidence_proxy` database role. Its URL secret must
+connect as that role; the role has only `USAGE` on `public` and `EXECUTE` on the
+four signup-evidence RPCs, with no direct evidence-table privileges. Create
+the empty secret resources with a targeted Terraform apply, then publish a
+version of each through the operator secret workflow before the full cell apply
+updates Cloud Run. Terraform never stores those values. Keep the capture and
+account tokens different from each other and from `INTERNAL_API_TOKEN`; a
+missing or reused token rejects producer requests. A missing shared Auth
+connection or failed RPC returns `authority_unavailable` and withholds credit.
+
+Before enabling device enforcement in either production region, verify that
+each cell's serving revision has all three secret-backed environment variables,
+that both scoped credentials work only on their own routes, and that original
+evidence can be retrieved and published to the selected region. Check both
+regions independently, including delayed West entry. Keep the device policy
+off until these checks and the inherited canonical activation prerequisites
+have passed.
+
+| Operation | Route | JSON input | Result |
+| --- | --- | --- | --- |
+| Create attempt | `POST /internal/promotion/signup/attempts` | Empty body | `attempt_id`, `challenge` |
+| Verify | `POST /internal/promotion/signup/attempts/verify` | `attempt_id`, `challenge`, `event_id`, `fingerprint`, `event_at` | `verified` or `replayed` |
+| Bind | `POST /internal/promotion/account/bind` | `user_id`, `attempt_id` | `bound`, `replayed`, or `first_evidence_retained` |
+| Retrieve | `POST /internal/promotion/account/evidence` | `user_id` | Original bound evidence; `evidence_missing` if absent |
+| Register locally | `POST /internal/promotion/account/register` | `user_id` | `owner` or `owner_conflict` |
+
+The registration route reads the original binding from shared Auth itself and
+passes that exact evidence to the selected region's SQL function. A regional
+registration request cannot provide a new event or Fingerprint. Requests are
+limited to 4 KiB and database work to three seconds; SQL errors are not
+interpreted as eligibility. Invoke the register route on the selected regional
+control plane before the grant decision, including delayed West entry.
 
 1. `create_signup_device_attempt()` before Fingerprint capture. It returns an
    unpredictable attempt UUID and challenge UUID. Only the challenge is sent to
@@ -45,8 +96,8 @@ Console's server, using the shared project's service credential, calls:
    original event time and binding time. Initial event freshness is checked
    only at verification. Retrieval has no event age limit.
 
-The shared Auth service credential is kept exclusively by trusted Console
-server code. These RPCs and tables grant no access to `anon` or `authenticated`.
+The shared Auth database credential is kept by the control plane. These RPCs
+and tables grant no access to `anon` or `authenticated`.
 A missing shared source, failed provider lookup, failed actor check, or ambiguous
 binding withholds promotional credit; it does not block signup, team creation or
 normal paid access. Console must not infer evidence from cookies, visitor IDs,
@@ -72,7 +123,8 @@ The first regional insert commits independently of any later grant attempt, so
 an abandoned signup, failed award or account deletion cannot transfer ownership.
 
 `promotion_device_decision(user_id, promotion)` returns `eligible`,
-`evidence_missing`, `owner_conflict` or `device_already_redeemed` for promotion
+`evidence_missing`, `owner_conflict`, `device_already_redeemed` or
+`device_reservation_pending` for promotion
 `signup` or `stripe`. SQL errors mean authority unavailable or invalid
 configuration and must withhold credit. The caller must not substitute its own
 Fingerprint, and must always consult this durable lookup even when its input
@@ -87,7 +139,10 @@ before award. `reserve_stripe_promotion_with_device(team_id, user_id, event_id,
 subscription_id, checkout_generation, has_checkout_generation)` checks device
 eligibility before the existing durable local reservation. An existing pending
 reservation replays through the original reservation function without applying
-a newly changed policy. The later grant integration must record actual Stripe
+a newly changed policy. `device_reservation_pending` withholds a new reservation
+while another account's grant on the same device remains unresolved. The reservation
+pins the original Fingerprint in the regional entitlement row; release
+allows a later retry. The later grant integration must record actual Stripe
 issuance in `promotion_device_grant` in the same regional finalization transaction
 by calling `record_stripe_promotion_device_grant(team_id, user_id)` and retain
 the existing actor, evidence and checkout-generation pins. It must
