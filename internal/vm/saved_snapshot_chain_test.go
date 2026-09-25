@@ -39,6 +39,9 @@ type chainFC struct {
 	dirty []map[int]byte
 	// hang, when set, holds a diff until the request is abandoned.
 	hang bool
+	// failDiff, when set, refuses a diff before anything is written or the
+	// generation moves, as a Firecracker that cannot open the file does.
+	failDiff bool
 	// noBlockMap, when set, saves no disk block map beside the vmstate.
 	noBlockMap bool
 	// noPresence, when set, writes a diff without its presence map, as a
@@ -100,6 +103,12 @@ func (f *chainFC) serve(w http.ResponseWriter, r *http.Request) {
 		if f.hang && req.SnapshotType == "Diff" {
 			f.mu.Unlock()
 			<-r.Context().Done()
+			return
+		}
+		if f.failDiff && req.SnapshotType == "Diff" {
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, "cannot open the memory file")
 			return
 		}
 		call := f.calls

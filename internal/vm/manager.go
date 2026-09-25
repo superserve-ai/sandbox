@@ -9330,12 +9330,16 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 // left behind. An image whose manifest names the intent's artifact was
 // written whole, its manifest after it, so the record takes it, durably, as
 // the rewrite would have once the guest was released: a relaunch from the
-// chain then wakes it under the token it was frozen with. Any other chain
-// may be torn, or whole with a manifest that is not its own, and is
+// chain then wakes it under the token it was frozen with. An overlay is
+// taken only with its base record and a presence map the rewrite refreshed,
+// which a Firecracker from before the map leaves stale or absent. Any other
+// chain may be torn, or whole with a manifest that is not its own, and is
 // withdrawn: its vmstate goes, so nothing relaunches from it before the next
 // pause writes it whole, and a first-pass overlay the record never named
-// goes with it. Adopted reports the first case; settled is false when the
-// record or the withdrawal could not be written.
+// goes with it. Whether Firecracker moved on is unknown, so the baseline is
+// spent, durably, and that pause is a full one. Adopted reports the first
+// case; settled is false when the record or the withdrawal could not be
+// written.
 func (m *Manager) settleInterruptedRewrite(dir string, in *pauseIntent, inst *VMInstance, log zerolog.Logger) (adopted, settled bool) {
 	inst.mu.RLock()
 	recordedArtifact, recordedMem := inst.ArtifactID, inst.MemFilePath
@@ -9351,7 +9355,17 @@ func (m *Manager) settleInterruptedRewrite(dir string, in *pauseIntent, inst *VM
 		if err != nil || man == nil || in.ArtifactID == "" || man.ArtifactID != in.ArtifactID || !fileExists(vmstate) {
 			continue
 		}
-		base, _ := readLayeredBase(mem)
+		base, layered := readLayeredBase(mem)
+		if name == "mem.diff" && (!layered || !fileExists(base)) {
+			log.Warn().Str("mem", mem).Msg("reattach: a rewritten overlay has no base to be served over; not adopted")
+			continue
+		}
+		if layered {
+			if verr := m.verifyPresenceRefreshed(mem, presenceSaveMark); verr != nil {
+				log.Warn().Err(verr).Str("mem", mem).Msg("reattach: a rewritten overlay's presence map is not the rewrite's; not adopted")
+				continue
+			}
+		}
 		advanceChain(inst, vmstate, mem, base, man)
 		if _, err := m.persistStateIfPresent(inst); err != nil {
 			log.Error().Err(err).Msg("reattach: a completed rewrite's record could not be written")
@@ -9359,6 +9373,11 @@ func (m *Manager) settleInterruptedRewrite(dir string, in *pauseIntent, inst *VM
 		}
 		log.Warn().Str("mem", mem).Msg("reattach: recorded a chain image a rewrite completed before its record was written")
 		return true, true
+	}
+	m.abandonDirtyBaseline(inst)
+	if _, err := m.persistStateIfPresent(inst); err != nil {
+		log.Error().Err(err).Msg("reattach: the baseline an uncertain rewrite spent could not be recorded")
+		return false, false
 	}
 	withdraw := []string{vmstate, overlayBlockMapPath(vmstate), overlayBlockMapPath(vmstate) + ".prev"}
 	if overlay := filepath.Join(dir, "mem.diff"); recordedMem != overlay {

@@ -156,6 +156,11 @@ func TestRecoveryWithdrawsAChainARewriteLeftUncertain(t *testing.T) {
 	if recovered.FreezeToken != "tok-a" || recovered.MemFilePath != overlay {
 		t.Fatalf("record changed by a withdrawal: token=%q mem=%s", recovered.FreezeToken, recovered.MemFilePath)
 	}
+	// Whether Firecracker moved on is unknown: the next pause is a full one,
+	// after a restart too.
+	if rec, err := store.Get(inst.ID); err != nil || rec == nil || rec.DirtyTrackingSessionID != "" || toInstance(*rec).DirtyTracked {
+		t.Fatalf("durable record after a withdrawal %+v %v; want the baseline spent", rec, err)
+	}
 	// A relaunch from the record's paths is refused for want of its vmstate.
 	if _, err := os.Stat(recovered.SnapshotPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("stat of the withdrawn vmstate: %v", err)
@@ -270,5 +275,86 @@ func TestRecoveryRecordsAChainARewriteCompletedBeforeItsRecord(t *testing.T) {
 	}
 	if _, frozen, token, err := resumeImageFacts(overlay, recovered.MemFilePath, recovered.CorrectsWallClock, recovered.SnapshotWorkloadFrozen, recovered.FreezeToken); err != nil || !frozen || token != "tok-b" {
 		t.Fatalf("wake would use token %q (frozen=%v, err=%v); want the rewrite's", token, frozen, err)
+	}
+}
+
+// A diff Firecracker refused before it moved on leaves the overlay without
+// the records that make it restorable, and the source's baseline spent in
+// memory; the record says so too, or a restart would re-arm the baseline
+// and the next guarded diff would be accepted against that overlay.
+func TestRunningCaptureRefusedBeforeFirecrackerMovedOnSpendsTheBaselineDurably(t *testing.T) {
+	fc := startChainFC(t)
+	fc.failDiff = true
+	m := newSavedTestManager(t)
+	inst := seedRunningSource(t, m, fc, false)
+	chainDir := filepath.Join(m.cfg.SnapshotDir, inst.ID)
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS); err == nil {
+		t.Fatal("a refused diff was reported as a capture")
+	}
+	rec, err := m.state.Get(inst.ID)
+	if err != nil || rec == nil || rec.DirtyTrackingSessionID != "" || rec.DirtyTrackingGeneration != 0 || toInstance(*rec).DirtyTracked {
+		t.Fatalf("durable record after a refused diff %+v %v; want the baseline spent", rec, err)
+	}
+	if in, err := readPauseIntent(chainDir); err != nil || in != nil {
+		t.Fatalf("intent after a durable abandonment: %+v %v; want none", in, err)
+	}
+}
+
+// A rewrite that died after its manifest is adopted only with an overlay a
+// restore can serve: one with its base record and a presence map the
+// rewrite refreshed. A Firecracker from before the map leaves it stale or
+// absent, and such a chain is withdrawn instead.
+func TestRecoveryDoesNotAdoptAnOverlayItCannotServe(t *testing.T) {
+	cases := []struct {
+		name   string
+		damage func(overlay string) error
+	}{
+		{"presence map not refreshed", func(overlay string) error {
+			return os.Chtimes(presence.SidecarPath(overlay), presenceSaveMark, presenceSaveMark)
+		}},
+		{"presence map absent", func(overlay string) error { return os.Remove(presence.SidecarPath(overlay)) }},
+		{"base record absent", func(overlay string) error { return os.Remove(layeredBaseSidecarPath(overlay)) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := startChainFC(t)
+			m := newSavedTestManager(t)
+			store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.state = store
+			inst := seedRunningSource(t, m, fc, false)
+			raiseFloorForTest(t)
+			overlay := frozenSourceRecord(t, m, inst)
+			chainDir := filepath.Join(m.cfg.SnapshotDir, inst.ID)
+			vmstate := filepath.Join(chainDir, "vmstate.snap")
+			if err := os.WriteFile(vmstate, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			whole := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: "art-b", WorkloadFrozen: true, GuestCorrectsClock: true, FreezeToken: "tok-b"}
+			if err := WriteWallClockManifest(overlay, whole); err != nil {
+				t.Fatal(err)
+			}
+			if err := writePauseIntent(chainDir, pauseIntent{VMID: inst.ID, FreezeToken: "tok-b", ArtifactID: "art-b"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.damage(overlay); err != nil {
+				t.Fatal(err)
+			}
+			recovered := reattachFromRecord(t, m, store, inst.ID)
+			if recovered.FreezeToken != "tok-a" || recovered.ArtifactID != "art-a" {
+				t.Fatalf("recovered token=%q artifact=%q; want the chain refused, the record as it was", recovered.FreezeToken, recovered.ArtifactID)
+			}
+			if fileExists(vmstate) {
+				t.Fatal("a chain the record cannot serve was left restorable")
+			}
+			if fileExists(presence.SidecarPath(overlay)) && tc.name == "presence map not refreshed" {
+				t.Fatal("a presence map that is not the rewrite's survived")
+			}
+			if in, err := readPauseIntent(chainDir); err != nil || in != nil {
+				t.Fatalf("intent after the withdrawal: %+v %v; want none", in, err)
+			}
+		})
 	}
 }

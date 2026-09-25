@@ -452,13 +452,16 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	} else {
 		releaseErr = unpauseSourceWithProbe(ctx, socket)
 	}
-	// The chain advance is made durable only now, with the guest released:
-	// a store write must not hold it paused. Until then the record is a
-	// step behind, which a crash turns into a recovered rewrite: the intent
-	// below outlives a crash, and outlives a record that could not be
-	// written, so the chain is never named by a record that does not know it.
+	// What a memory capture did to the record is made durable only now,
+	// with the guest released: a store write must not hold it paused. The
+	// chain advanced, or the baseline was spent by a full image or a write
+	// whose outcome is unknown; a restart must find neither re-armed. Until
+	// then the record is a step behind, which a crash turns into a
+	// recovered rewrite: the intent below outlives a crash, and outlives a
+	// record that could not be written, so the chain is never named by a
+	// record that does not know it.
 	var persistErr error
-	if chainMem != "" {
+	if kind == SavedSnapshotMemFS {
 		persistErr = m.persistChainAdvance(inst, log)
 	}
 	if releaseErr != nil {
@@ -467,7 +470,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		return status.Errorf(codes.Unavailable, "source could not be resumed after capture: %v", errors.Join(captureErr, releaseErr))
 	}
 	if persistErr != nil {
-		return status.Errorf(codes.Unavailable, "chain captured but its record could not be written; the intent stays for recovery: %v", persistErr)
+		return status.Errorf(codes.Unavailable, "source's record could not be written after the capture; the intent stays for recovery: %v", errors.Join(captureErr, persistErr))
 	}
 	if err := clearPauseIntent(sourceDir); err != nil {
 		return fmt.Errorf("clear capture intent: %w", err)
@@ -666,9 +669,10 @@ func advanceChain(inst *VMInstance, vmstate, memPath, baseMem string, wake *Wall
 	inst.mu.Unlock()
 }
 
-// persistChainAdvance writes the advanced record, so a vmd restart before
-// the next pause still finds the chain; a record a destroy removed meanwhile
-// is not brought back. A write that fails is the caller's to answer for.
+// persistChainAdvance writes the record as the capture left it, so a vmd
+// restart before the next pause finds the chain, or the baseline spent; a
+// record a destroy removed meanwhile is not brought back. A write that
+// fails is the caller's to answer for.
 func (m *Manager) persistChainAdvance(inst *VMInstance, log zerolog.Logger) error {
 	wrote, err := m.persistStateIfPresent(inst)
 	if err != nil {
