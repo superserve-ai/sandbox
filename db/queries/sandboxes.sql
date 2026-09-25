@@ -94,6 +94,34 @@ SELECT ins.*
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
+-- name: CreateSandboxFromSnapshot :one
+-- The sandbox created from a saved snapshot: shape, artifact paths and
+-- template pin are the snapshot's, read here so the row never disagrees
+-- with the image it boots. The bindings are the snapshot's re-bound plus the
+-- request's, as arrays that may be empty. Returns 0 rows if the snapshot is
+-- not ready, deleted, or not the caller's.
+WITH src AS (
+  SELECT s.id AS source_snapshot_id, s.host_id, s.template_id, s.vcpu_count, s.memory_mib, s.disk_mib,
+         s.base_path, s.snapshot_path, s.mem_path
+  FROM sandbox_snapshot s
+  WHERE s.id = @snapshot_id AND s.team_id = @team_id
+    AND s.status = 'ready' AND s.deleted_at IS NULL
+), ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id)
+  SELECT @id, @team_id, @name, @status, vcpu_count, memory_mib, host_id, @timeout_seconds, @metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, @auto_delete_seconds, cardinality(@secret_ids::uuid[]) > 0, source_snapshot_id FROM src
+  RETURNING *
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, @preview_access::text, 0 FROM ins
+  RETURNING sandbox_id
+), bindings AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
+  FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
+)
+SELECT ins.* FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
+
 -- name: GetSandbox :one
 SELECT * FROM sandbox
 WHERE id = $1 AND team_id = $2 AND destroyed_at IS NULL;

@@ -15,6 +15,10 @@ WHERE team_id = $1 AND name = $2 AND deleted_at IS NULL;
 SELECT * FROM secret
 WHERE team_id = $1 AND name = ANY($2::text[]) AND deleted_at IS NULL;
 
+-- name: GetSecretsByIDs :many
+SELECT * FROM secret
+WHERE team_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL;
+
 -- name: GetSecretByID :one
 SELECT * FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;

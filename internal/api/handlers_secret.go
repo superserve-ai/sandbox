@@ -1108,24 +1108,82 @@ func (h *Handlers) resolveSecretBindingsForCreate(
 				fmt.Sprintf("secrets[%s] references %q, which does not exist for this team", envKey, name),
 				http.StatusBadRequest)
 		}
-		bindings = append(bindings, db.AddSandboxSecretParams{
-			SecretID: row.ID,
-			EnvKey:   envKey,
-		})
-		token, terr := mintProxyToken(row.ProviderShortcut)
-		if terr != nil {
-			log.Error().Err(terr).Msg("mintProxyToken during sandbox create")
+		binding, m, err := bindSecret(envKey, row)
+		if err != nil {
+			log.Error().Err(err).Msg("mintProxyToken during sandbox create")
 			return nil, nil, ErrInternal
 		}
-		meta = append(meta, SecretBindingMeta{
-			SecretID:         row.ID,
-			EnvKey:           envKey,
-			AuthType:         row.AuthType,
-			AuthConfig:       row.AuthConfig,
-			ProviderShortcut: row.ProviderShortcut,
-			Hosts:            row.Hosts,
-			ProxyToken:       token,
-		})
+		bindings = append(bindings, binding)
+		meta = append(meta, m)
+	}
+	return bindings, meta, nil
+}
+
+// bindSecret is one binding of a secret to an env key, with a fresh proxy token.
+func bindSecret(envKey string, row db.Secret) (db.AddSandboxSecretParams, SecretBindingMeta, error) {
+	token, err := mintProxyToken(row.ProviderShortcut)
+	if err != nil {
+		return db.AddSandboxSecretParams{}, SecretBindingMeta{}, err
+	}
+	return db.AddSandboxSecretParams{SecretID: row.ID, EnvKey: envKey}, SecretBindingMeta{
+		SecretID:         row.ID,
+		EnvKey:           envKey,
+		AuthType:         row.AuthType,
+		AuthConfig:       row.AuthConfig,
+		ProviderShortcut: row.ProviderShortcut,
+		Hosts:            row.Hosts,
+		ProxyToken:       token,
+	}, nil
+}
+
+// rebindSnapshotSecrets binds a sandbox created from a snapshot to the
+// secrets its source was bound to: by id against the team's live secrets,
+// with fresh proxy tokens. A secret deleted since is left out, as is an env
+// key the request sets itself.
+func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, recorded []byte, req *createSandboxRequest) ([]db.AddSandboxSecretParams, []SecretBindingMeta, *AppError) {
+	var bound []struct {
+		EnvKey   string    `json:"env_key"`
+		SecretID uuid.UUID `json:"secret_id"`
+	}
+	if len(recorded) > 0 {
+		if err := json.Unmarshal(recorded, &bound); err != nil {
+			log.Error().Err(err).Msg("decode snapshot secret bindings")
+			return nil, nil, ErrInternal
+		}
+	}
+	if len(bound) == 0 {
+		return nil, nil, nil
+	}
+	ids := make([]uuid.UUID, 0, len(bound))
+	for _, b := range bound {
+		ids = append(ids, b.SecretID)
+	}
+	rows, err := h.DB.GetSecretsByIDs(ctx, db.GetSecretsByIDsParams{TeamID: teamID, Column2: ids})
+	if err != nil {
+		log.Error().Err(err).Msg("DB GetSecretsByIDs during sandbox create")
+		return nil, nil, ErrInternal
+	}
+	byID := make(map[uuid.UUID]db.Secret, len(rows))
+	for _, row := range rows {
+		byID[row.ID] = row
+	}
+	var bindings []db.AddSandboxSecretParams
+	var meta []SecretBindingMeta
+	for _, b := range bound {
+		row, live := byID[b.SecretID]
+		if _, set := req.Secrets[b.EnvKey]; set || !live {
+			continue
+		}
+		if _, set := req.EnvVars[b.EnvKey]; set {
+			continue
+		}
+		binding, m, err := bindSecret(b.EnvKey, row)
+		if err != nil {
+			log.Error().Err(err).Msg("mintProxyToken during sandbox create")
+			return nil, nil, ErrInternal
+		}
+		bindings = append(bindings, binding)
+		meta = append(meta, m)
 	}
 	return bindings, meta, nil
 }

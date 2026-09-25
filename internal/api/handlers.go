@@ -2144,9 +2144,12 @@ type networkConfigRequest struct {
 }
 
 type createSandboxRequest struct {
-	Name         string                `json:"name" binding:"required,min=1,max=64"`
-	FromTemplate *string               `json:"from_template,omitempty"`
-	Network      *networkConfigRequest `json:"network,omitempty"`
+	Name         string  `json:"name" binding:"required,min=1,max=64"`
+	FromTemplate *string `json:"from_template,omitempty"`
+	// SourceSnapshot creates the sandbox from a saved snapshot instead of a
+	// template: its memory and disk, on its host.
+	SourceSnapshot *string               `json:"source_snapshot,omitempty"`
+	Network        *networkConfigRequest `json:"network,omitempty"`
 
 	// TimeoutSeconds auto-pauses the sandbox after it has been active this
 	// long. The window tracks the current active session (re-armed on each
@@ -2200,6 +2203,7 @@ type sandboxResponse struct {
 	MemoryMib         int32      `json:"memory_mib"`
 	AccessToken       string     `json:"access_token,omitempty"`
 	SnapshotID        *uuid.UUID `json:"snapshot_id,omitempty"`
+	SourceSnapshotID  *uuid.UUID `json:"source_snapshot_id,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
 	TimeoutSeconds    *int32     `json:"timeout_seconds,omitempty"`
 	AutoDeleteSeconds *int32     `json:"auto_delete_seconds,omitempty"`
@@ -2239,6 +2243,10 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 		id := uuid.UUID(s.SnapshotID.Bytes)
 		resp.SnapshotID = &id
 	}
+	if s.SourceSnapshotID.Valid {
+		id := uuid.UUID(s.SourceSnapshotID.Bytes)
+		resp.SourceSnapshotID = &id
+	}
 	if s.TimeoutSeconds != nil {
 		resp.TimeoutSeconds = s.TimeoutSeconds
 	}
@@ -2250,26 +2258,32 @@ func (h *Handlers) sandboxToResponse(s db.Sandbox) sandboxResponse {
 	if s.Status == db.SandboxStatusPaused && s.AutoDeleteAt.Valid {
 		resp.AutoDeleteAt = &s.AutoDeleteAt.Time
 	}
-	if len(s.NetworkConfig) > 0 {
-		var stored struct {
-			Egress struct {
-				AllowedCIDRs   []string `json:"allowed_cidrs"`
-				DeniedCIDRs    []string `json:"denied_cidrs"`
-				AllowedDomains []string `json:"allowed_domains"`
-			} `json:"egress"`
-		}
-		if err := json.Unmarshal(s.NetworkConfig, &stored); err == nil {
-			e := stored.Egress
-			allowOut := append(e.AllowedCIDRs, e.AllowedDomains...)
-			if len(allowOut) > 0 || len(e.DeniedCIDRs) > 0 {
-				resp.Network = &networkConfigRequest{
-					AllowOut: allowOut,
-					DenyOut:  e.DeniedCIDRs,
-				}
-			}
-		}
-	}
+	resp.Network = decodeNetworkConfig(s.NetworkConfig)
 	return resp
+}
+
+// decodeNetworkConfig reads stored egress rules back into request shape;
+// nil when there are none.
+func decodeNetworkConfig(raw []byte) *networkConfigRequest {
+	if len(raw) == 0 {
+		return nil
+	}
+	var stored struct {
+		Egress struct {
+			AllowedCIDRs   []string `json:"allowed_cidrs"`
+			DeniedCIDRs    []string `json:"denied_cidrs"`
+			AllowedDomains []string `json:"allowed_domains"`
+		} `json:"egress"`
+	}
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		return nil
+	}
+	e := stored.Egress
+	allowOut := append(e.AllowedCIDRs, e.AllowedDomains...)
+	if len(allowOut) == 0 && len(e.DeniedCIDRs) == 0 {
+		return nil
+	}
+	return &networkConfigRequest{AllowOut: allowOut, DenyOut: e.DeniedCIDRs}
 }
 
 // sandboxToResponseWithToken is like sandboxToResponse but also computes and
@@ -2620,6 +2634,26 @@ func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (h
 	return hostID, true
 }
 
+// placeFork pins a create from a snapshot to the host holding it. The host
+// must create sandboxes from saved snapshots, and is asked while it drains,
+// as for a resume: the snapshot is nowhere else. Writes the error response
+// on failure.
+func (h *Handlers) placeFork(c *gin.Context, hostID string, requiredCapabilities []string) (string, bool) {
+	SetTelemetryHostID(c, hostID)
+	required := append(append([]string(nil), requiredCapabilities...), preview.HostCapabilitySavedSnapshots)
+	eligible, err := h.hostHasCapabilitiesCachedForScope(c.Request.Context(), hostID, required, ownerResumeCapabilities)
+	if err != nil {
+		log.Error().Err(err).Str("host_id", hostID).Msg("snapshot host pre-flight failed")
+		respondError(c, ErrInternal)
+		return "", false
+	}
+	if !eligible {
+		respondErrorMsg(c, "host_not_ready", "the snapshot's host cannot create sandboxes from it right now; retry later", http.StatusServiceUnavailable)
+		return "", false
+	}
+	return hostID, true
+}
+
 func (h *Handlers) CreateSandbox(c *gin.Context) {
 	tHandler := time.Now()
 	// total is based on the auth boundary so it covers a slow cache miss;
@@ -2697,6 +2731,19 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	if req.Name == "" || len(req.Name) > 64 {
 		respondErrorMsg(c, "bad_request", "name is required and must be 1-64 characters", http.StatusBadRequest)
 		return
+	}
+	if req.FromTemplate != nil && req.SourceSnapshot != nil {
+		respondErrorMsg(c, "bad_request", "from_template and source_snapshot are mutually exclusive", http.StatusBadRequest)
+		return
+	}
+	var sourceSnapshotID uuid.UUID
+	if req.SourceSnapshot != nil {
+		id, err := uuid.Parse(*req.SourceSnapshot)
+		if err != nil {
+			respondErrorMsg(c, "bad_request", "source_snapshot is not a valid snapshot ID", http.StatusBadRequest)
+			return
+		}
+		sourceSnapshotID = id
 	}
 
 	if err := validateTimeoutSeconds(req.TimeoutSeconds); err != nil {
@@ -2795,7 +2842,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// has a consistent baseline image. Callers can opt out by setting
 	// from_template to some other name/UUID; today the API always routes
 	// through the template/snapshot-restore path.
-	if req.FromTemplate == nil {
+	if req.FromTemplate == nil && sourceSnapshotID == uuid.Nil {
 		defaultTpl := "superserve/base"
 		req.FromTemplate = &defaultTpl
 	}
@@ -2804,12 +2851,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// and reuse the existing snapshot-restore code path.
 	var snapshotPath, snapshotMemPath, basePath, deltaPath, deltaDir string
 	var templateID pgtype.UUID
-	// Template resources — only populated when the create uses from_template.
+	// The image's shape, the template's or the snapshot's.
 	// vmd.RestoreSnapshot doesn't return ResourceLimits on older builds (proto
 	// gap), so the handler substitutes these at ActivateSandbox time. The
 	// snapshot was built with exactly these values, so they're the
 	// authoritative shape.
-	var templateVcpu, templateMemMiB uint32
+	var imageVcpu, imageMemMiB uint32
 	var fromTemplateName, fromTemplateID string
 	if req.FromTemplate != nil {
 		tpl, err := h.lookupTemplateForCreate(c, teamID, *req.FromTemplate)
@@ -2840,10 +2887,46 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			deltaDir = filepath.Dir(deltaPath)
 		}
 		templateID = pgtype.UUID{Bytes: tpl.ID, Valid: true}
-		templateVcpu = uint32(tpl.Vcpu)
-		templateMemMiB = uint32(tpl.MemoryMib)
+		imageVcpu = uint32(tpl.Vcpu)
+		imageMemMiB = uint32(tpl.MemoryMib)
 		fromTemplateName = tpl.Name
 		fromTemplateID = tpl.ID.String()
+	}
+
+	// A create from a snapshot takes the snapshot's shape, host and template
+	// pin. The daemon copies the image for the new sandbox, so the request
+	// names no files of its own.
+	var source db.SandboxSnapshot
+	if sourceSnapshotID != uuid.Nil {
+		snap, err := h.DB.GetSandboxSnapshot(c.Request.Context(), db.GetSandboxSnapshotParams{ID: sourceSnapshotID, TeamID: teamID})
+		tLookupDone = time.Now()
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
+				return
+			}
+			log.Error().Err(err).Str("snapshot_id", sourceSnapshotID.String()).Msg("snapshot lookup for create failed")
+			respondError(c, ErrInternal)
+			return
+		}
+		if snap.Status != "ready" {
+			respondErrorMsg(c, "conflict", fmt.Sprintf("snapshot is not ready (status=%s)", snap.Status), http.StatusConflict)
+			return
+		}
+		if snap.Kind != snapshotKindMemFS {
+			respondErrorMsg(c, "conflict", fmt.Sprintf("a %q snapshot cannot create a sandbox yet", snap.Kind), http.StatusConflict)
+			return
+		}
+		source = snap
+		basePath = snap.BasePath
+		imageVcpu, imageMemMiB = uint32(snap.VcpuCount), uint32(snap.MemoryMib)
+		// Inherited unless the request sets them.
+		if req.TimeoutSeconds == nil {
+			req.TimeoutSeconds = snap.TimeoutSeconds
+		}
+		if req.Network == nil {
+			req.Network = decodeNetworkConfig(snap.NetworkConfig)
+		}
 	}
 
 	secrets := <-secretsCh
@@ -2852,6 +2935,15 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 	secretBindings, secretMeta := secrets.bindings, secrets.meta
+	if sourceSnapshotID != uuid.Nil {
+		inherited, meta, appErr := h.rebindSnapshotSecrets(c.Request.Context(), teamID, source.SecretBindings, &req)
+		if appErr != nil {
+			respondError(c, appErr)
+			return
+		}
+		secretBindings = append(secretBindings, inherited...)
+		secretMeta = append(secretMeta, meta...)
+	}
 	tLookupDone = time.Now()
 
 	// Select a host for this sandbox.
@@ -2861,7 +2953,12 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		requiredCapabilities = previewBrowserCapabilities()
 	}
 	var placed bool
-	if hostID, placed = h.placeCreate(c, requiredCapabilities); !placed {
+	if sourceSnapshotID != uuid.Nil {
+		hostID, placed = h.placeFork(c, source.HostID, requiredCapabilities)
+	} else {
+		hostID, placed = h.placeCreate(c, requiredCapabilities)
+	}
+	if !placed {
 		return
 	}
 
@@ -2892,8 +2989,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// fails before activation. ActivateSandbox overwrites it with the actuals
 	// vmd reports once the VM is up.
 	insertVcpu, insertMemMiB := int32(defaultVcpu), int32(defaultMemoryMi)
-	if templateID.Valid && templateVcpu > 0 && templateMemMiB > 0 {
-		insertVcpu, insertMemMiB = int32(templateVcpu), int32(templateMemMiB)
+	if imageVcpu > 0 && imageMemMiB > 0 {
+		insertVcpu, insertMemMiB = int32(imageVcpu), int32(imageMemMiB)
 	}
 
 	// Hand this create to capacity ranking for measurement only: the
@@ -2902,7 +2999,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// no query, and takes no lock a request can wait on, so a stalled or
 	// backed-up evaluator drops samples instead of appearing in create
 	// latency.
-	if h.Shadow != nil {
+	// A create from a snapshot has no placement to rank.
+	if h.Shadow != nil && sourceSnapshotID == uuid.Nil {
 		h.Shadow.Offer(requiredCapabilities, insertMemMiB, insertVcpu, hostID)
 	}
 
@@ -2967,7 +3065,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// fallback unobservable for new sandboxes and leaves the quota admission's
 	// uncommitted window statement-sized (see the query comments).
 	insertWithBindings := func() (db.Sandbox, error) {
-		if len(secretBindings) == 0 {
+		if len(secretBindings) == 0 && sourceSnapshotID == uuid.Nil {
 			return runInsert(h.DB)
 		}
 		secretIDs := make([]uuid.UUID, len(secretBindings))
@@ -2978,6 +3076,23 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			envKeys[i] = secretBindings[i].EnvKey
 			// secretMeta is index-aligned with secretBindings; persist its token.
 			proxyTokens[i] = secretMeta[i].ProxyToken
+		}
+		if sourceSnapshotID != uuid.Nil {
+			row, err := h.DB.CreateSandboxFromSnapshot(insertCtx, db.CreateSandboxFromSnapshotParams{
+				SnapshotID:        sourceSnapshotID,
+				TeamID:            teamID,
+				ID:                sandboxID,
+				Name:              req.Name,
+				Status:            db.SandboxStatusStarting,
+				TimeoutSeconds:    req.TimeoutSeconds,
+				Metadata:          metadataJSON,
+				AutoDeleteSeconds: req.AutoDeleteSeconds,
+				PreviewAccess:     previewAccess,
+				SecretIds:         secretIDs,
+				EnvKeys:           envKeys,
+				ProxyTokens:       proxyTokens,
+			})
+			return db.Sandbox(row), err
 		}
 		if templateID.Valid {
 			row, err := h.DB.CreateSandboxFromTemplateWithSecrets(insertCtx, db.CreateSandboxFromTemplateWithSecretsParams{
@@ -3046,12 +3161,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// The closure runs synchronously inside retryTransientBoot; a retry
 	// overwrites the capture with the attempt that produced the returned VM.
 	var previewProtocol string
+	var savedSnapshotID string
+	if sourceSnapshotID != uuid.Nil {
+		savedSnapshotID = sourceSnapshotID.String()
+	}
 	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), hostID, func(ctx context.Context) (string, uint32, uint32, error) {
 		ip, vcpu, memMiB, protocol, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars,
 			// Same shape the sandbox row is being inserted with (the
-			// template's, or the defaults) — declared so the daemon
+			// image's, or the defaults) — declared so the daemon
 			// never has to ask Firecracker for it afterwards.
-			vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB)})
+			vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB), SavedSnapshotID: savedSnapshotID})
 		previewProtocol = protocol
 		return ip, vcpu, memMiB, err
 	})
@@ -3069,8 +3188,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	sandbox := insertRes.sandbox
 	dbErr := insertRes.err
 
-	// 0 rows from CreateSandboxFromTemplate = template deleted mid-create.
-	templateRace := templateID.Valid && errors.Is(dbErr, pgx.ErrNoRows)
+	// 0 rows from the source's insert = the template or snapshot was deleted
+	// mid-create.
+	sourceRace := (templateID.Valid || sourceSnapshotID != uuid.Nil) && errors.Is(dbErr, pgx.ErrNoRows)
+	respondSourceGone := func() {
+		if sourceSnapshotID != uuid.Nil {
+			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
+			return
+		}
+		respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+	}
 
 	// Per-team sandbox count cap; raised by sandbox_quota_on_insert trigger.
 	quotaExceeded := isSandboxQuotaErr(dbErr)
@@ -3097,7 +3224,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// sandbox to a terminal state asynchronously so the request does not sit on
 	// DB restarts or other transient cleanup work.
 	var failDone <-chan bool
-	if !templateRace && !quotaExceeded && (vmdErr != nil || transientCreateFailure) {
+	if !sourceRace && !quotaExceeded && (vmdErr != nil || transientCreateFailure) {
 		failDone = h.markSandboxFailedAsync(c.Request.Context(), sandboxID, teamID, hostID, dbErr != nil)
 	}
 
@@ -3106,8 +3233,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// Both failed — no durable row to keep, and cleanup above already ran
 		// best-effort in case the VM made it far enough to exist.
 		log.Error().Err(dbErr).AnErr("vmd_err", vmdErr).Str("reason", transientReason).Msg("CreateSandbox: DB and VMD both failed")
-		if templateRace {
-			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+		if sourceRace {
+			respondSourceGone()
 			return
 		}
 		if quotaExceeded {
@@ -3132,8 +3259,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// DB insert failed but VMD succeeded or failed independently — the VM
 		// was already cleaned up best-effort above.
 		l.Error().Err(dbErr).Str("reason", transientReason).Msg("CreateSandbox: INSERT failed")
-		if templateRace {
-			respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+		if sourceRace {
+			respondSourceGone()
 			return
 		}
 		if quotaExceeded {
@@ -3307,11 +3434,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// Defense-in-depth: if vmd returns 0 for vcpu/memory (e.g. old vmd
 	// without ResourceLimits in RestoreSnapshotResponse), fall back to
 	// the template's values. The template's shape IS the snapshot's shape.
-	if actualVcpu == 0 && templateVcpu > 0 {
-		actualVcpu = templateVcpu
+	if actualVcpu == 0 && imageVcpu > 0 {
+		actualVcpu = imageVcpu
 	}
-	if actualMemMiB == 0 && templateMemMiB > 0 {
-		actualMemMiB = templateMemMiB
+	if actualMemMiB == 0 && imageMemMiB > 0 {
+		actualMemMiB = imageMemMiB
 	}
 
 	var ipAddr *netip.Addr
@@ -3395,11 +3522,15 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			"template_id":   fromTemplateID,
 		})
 	}
+	if savedSnapshotID != "" {
+		createdMeta, _ = json.Marshal(map[string]string{"source_snapshot_id": savedSnapshotID})
+	}
 	// ActivateSandbox's CTE opens the sandbox_active_interval row (async).
 	h.logSandboxActivity(c.Request.Context(), sandbox.ID, teamID, actorID, "sandbox", "started", "success", &sandbox.Name, nil, createdMeta)
 	h.capture(c, "sandbox_created", map[string]any{
-		"sandbox_id":  sandbox.ID.String(),
-		"template_id": fromTemplateID,
+		"sandbox_id":         sandbox.ID.String(),
+		"template_id":        fromTemplateID,
+		"source_snapshot_id": savedSnapshotID,
 	})
 
 	sandbox.Status = db.SandboxStatusActive

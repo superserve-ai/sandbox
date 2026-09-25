@@ -15,6 +15,10 @@ import (
 type ResourceLimits struct {
 	VCPU      uint32
 	MemoryMiB uint32
+	// SavedSnapshotID names the saved snapshot to create the VM from. The
+	// restore then passes no files of its own, and the sizes must be the
+	// snapshot's.
+	SavedSnapshotID string
 }
 
 // SavedSnapshot is what a host reports for a committed saved snapshot: the

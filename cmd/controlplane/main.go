@@ -640,7 +640,8 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		// socket probe and a goroutine on the host, and the VM is
 		// counted as unsized until that lands. Omitted (zero) only by
 		// callers that do not know the shape.
-		ResourceLimits: restoreResourceLimits(limits),
+		ResourceLimits:  restoreResourceLimits(limits),
+		SavedSnapshotId: limits.SavedSnapshotID,
 	})
 	if err != nil {
 		return "", 0, 0, "", fmt.Errorf("gRPC RestoreSnapshot: %w", err)
