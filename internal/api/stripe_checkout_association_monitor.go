@@ -12,6 +12,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 const (
@@ -24,13 +25,13 @@ const (
 	stripeAssociationTickTimeout = 20 * time.Second
 )
 
-type stripeAssociationAlert struct {
+type StripeAssociationAlert struct {
 	EventID, EventType, CustomerID, SubscriptionID, CheckoutSessionID, TeamID string
 	ReceivedAt                                                                time.Time
 	Age                                                                       time.Duration
 }
 
-func stripeAssociationStillPending(account *db.TeamBillingAccount, subscriptionID string) bool {
+func stripeAssociationStillPending(account *db.TeamBillingAccount, subscriptionID string, receivedAt time.Time) bool {
 	if account == nil {
 		return true // Missing authority does not prove the event obsolete.
 	}
@@ -38,14 +39,16 @@ func stripeAssociationStillPending(account *db.TeamBillingAccount, subscriptionI
 		return false
 	}
 	if account.CheckoutInitializingAt.Valid {
-		return true
+		// A reservation started after the webhook was received cannot be the
+		// one that left this event pending.
+		return !account.CheckoutInitializingAt.Time.After(receivedAt)
 	}
 	// A different established subscription or a retained expired checkout
 	// session proves that the old reservation can no longer associate.
 	return strings.TrimSpace(derefString(account.StripeSubscriptionID)) == "" && account.CheckoutSessionID == nil
 }
 
-func reportStripeAssociationOverdue(a stripeAssociationAlert) error {
+func reportStripeAssociationOverdue(a StripeAssociationAlert) error {
 	log.Error().Str("event_id", a.EventID).Str("event_type", a.EventType).
 		Str("team_id", a.TeamID).Str("stripe_customer_id", a.CustomerID).
 		Str("stripe_subscription_id", a.SubscriptionID).
@@ -65,24 +68,30 @@ func (h *Handlers) StartStripeCheckoutAssociationMonitor(ctx context.Context) {
 		ticker := time.NewTicker(stripeAssociationPoll)
 		defer ticker.Stop()
 		var cursor db.StripeCheckoutAssociationCursor
+		var nextFailureReport time.Time
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case now := <-ticker.C:
 				tickCtx, cancel := context.WithTimeout(ctx, stripeAssociationTickTimeout)
-				var err error
-				cursor, err = h.stripeCheckoutAssociationTick(tickCtx, now, cursor, reportStripeAssociationOverdue)
-				if err != nil && ctx.Err() == nil {
-					log.Error().Err(err).Msg("Stripe checkout association monitor failed")
-				}
+				sentrylog.RunSafe("stripe-checkout-association-monitor", func() {
+					var err error
+					cursor, err = h.StripeCheckoutAssociationTick(tickCtx, now, cursor, reportStripeAssociationOverdue)
+					if err == nil {
+						nextFailureReport = time.Time{}
+					} else if ctx.Err() == nil && !now.Before(nextFailureReport) {
+						log.Error().Err(err).Msg("Stripe checkout association monitor failed")
+						nextFailureReport = now.Add(stripeAssociationCooldown)
+					}
+				})
 				cancel()
 			}
 		}
 	}()
 }
 
-func (h *Handlers) stripeCheckoutAssociationTick(ctx context.Context, now time.Time, cursor db.StripeCheckoutAssociationCursor, report func(stripeAssociationAlert) error) (db.StripeCheckoutAssociationCursor, error) {
+func (h *Handlers) StripeCheckoutAssociationTick(ctx context.Context, now time.Time, cursor db.StripeCheckoutAssociationCursor, report func(StripeAssociationAlert) error) (db.StripeCheckoutAssociationCursor, error) {
 	candidates, err := db.ListStripeCheckoutAssociationCandidates(ctx, h.Pool, now, stripeAssociationGrace, cursor, stripeAssociationBatchSize)
 	if err != nil {
 		return cursor, fmt.Errorf("discover pending Stripe checkout associations: %w", err)
@@ -95,15 +104,24 @@ func (h *Handlers) stripeCheckoutAssociationTick(ctx context.Context, now time.T
 		}
 	}
 	for _, candidate := range candidates {
-		cursor = db.StripeCheckoutAssociationCursor{ReceivedAt: candidate.ReceivedAt, EventID: candidate.EventID}
-		if err := h.inspectStripeCheckoutAssociation(ctx, now, candidate, report); err != nil {
-			log.Error().Err(err).Str("event_id", candidate.EventID).Msg("inspect Stripe checkout association failed")
+		if err := h.InspectStripeCheckoutAssociation(ctx, now, candidate, report); err != nil {
+			claimed, claimErr := db.DeferStripeCheckoutAssociationInspectionFailure(ctx, h.Pool, candidate.EventID, now, now.Add(stripeAssociationCooldown))
+			if claimErr != nil {
+				return cursor, fmt.Errorf("defer failed Stripe checkout association inspection for %s: %w", candidate.EventID, claimErr)
+			}
+			if claimed {
+				log.Error().Err(err).Str("event_id", candidate.EventID).Msg("inspect Stripe checkout association failed")
+			}
+		}
+		if candidate.ReceivedAt.After(cursor.ReceivedAt) ||
+			(candidate.ReceivedAt.Equal(cursor.ReceivedAt) && candidate.EventID > cursor.EventID) {
+			cursor = db.StripeCheckoutAssociationCursor{ReceivedAt: candidate.ReceivedAt, EventID: candidate.EventID}
 		}
 	}
 	return cursor, nil
 }
 
-func (h *Handlers) inspectStripeCheckoutAssociation(ctx context.Context, now time.Time, candidate db.StripeCheckoutAssociationCandidate, report func(stripeAssociationAlert) error) error {
+func (h *Handlers) InspectStripeCheckoutAssociation(ctx context.Context, now time.Time, candidate db.StripeCheckoutAssociationCandidate, report func(StripeAssociationAlert) error) error {
 	var event stripeEventEnvelope
 	if err := json.Unmarshal(candidate.Payload, &event); err != nil {
 		return fmt.Errorf("decode retained event: %w", err)
@@ -136,7 +154,7 @@ func (h *Handlers) inspectStripeCheckoutAssociation(ctx context.Context, now tim
 	if current.ProcessedAt.Valid || current.LastError == nil || *current.LastError != db.StripeCheckoutAssociationPendingError {
 		return tx.Commit(ctx)
 	}
-	pending := stripeAssociationStillPending(account, obj.ID)
+	pending := stripeAssociationStillPending(account, obj.ID, current.ReceivedAt)
 	leaseUntil := now.Add(stripeAssociationLease)
 	claimed, err := db.ClaimStripeCheckoutAssociationAlert(ctx, tx, candidate.EventID, now, leaseUntil)
 	if err != nil {
@@ -145,7 +163,7 @@ func (h *Handlers) inspectStripeCheckoutAssociation(ctx context.Context, now tim
 	if !claimed {
 		return tx.Commit(ctx)
 	}
-	alert := stripeAssociationAlert{EventID: current.EventID, EventType: current.EventType,
+	alert := StripeAssociationAlert{EventID: current.EventID, EventType: current.EventType,
 		CustomerID: obj.Customer, SubscriptionID: obj.ID, ReceivedAt: current.ReceivedAt,
 		Age: now.Sub(current.ReceivedAt)}
 	if account != nil {
@@ -196,7 +214,7 @@ func (h *Handlers) revalidateStripeCheckoutAssociation(ctx context.Context, even
 	}
 	pending := !event.ProcessedAt.Valid && event.LastError != nil &&
 		*event.LastError == db.StripeCheckoutAssociationPendingError &&
-		stripeAssociationStillPending(account, subscriptionID)
+		stripeAssociationStillPending(account, subscriptionID, event.ReceivedAt)
 	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}

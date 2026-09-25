@@ -18,6 +18,7 @@ import (
 )
 
 const consoleImpersonationKeyName = "__console_impersonation__"
+const stripeCheckoutAssociationPendingRequestKey = "stripe_checkout_association_pending"
 
 func isConsoleImpersonation(c *gin.Context) bool {
 	return c.GetString("api_key_name") == consoleImpersonationKeyName
@@ -229,7 +230,7 @@ func RequestLogger() gin.HandlerFunc {
 		}
 
 		evt := log.Info()
-		if status >= 500 {
+		if status >= 500 && !c.GetBool(stripeCheckoutAssociationPendingRequestKey) {
 			evt = log.Error()
 		} else if status >= 400 {
 			evt = log.Warn()

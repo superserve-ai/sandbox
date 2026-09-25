@@ -1809,6 +1809,7 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 		}
 		h.rollbackAndPersistStripeWebhookFailure(c.Request.Context(), processTx, event.ID, failure)
 		if pending {
+			c.Set(stripeCheckoutAssociationPendingRequestKey, true)
 			log.Warn().Err(err).Str("event_id", event.ID).Str("event_type", event.Type).Msg("Stripe checkout association pending")
 		} else {
 			log.Error().Err(err).Str("event_id", event.ID).Str("event_type", event.Type).Msg("process Stripe webhook failed")

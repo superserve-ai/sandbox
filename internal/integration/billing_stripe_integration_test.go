@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -32,6 +33,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 const testStripeWebhookSecret = "whsec_test_secret"
@@ -1029,6 +1031,12 @@ func TestIntegration_StripeSubscriptionCreatedBeforeCheckoutCompletedActivates(t
 }
 
 func TestIntegration_StripePendingCheckoutReconcilesLatestLifecycle(t *testing.T) {
+	transport := &sentry.MockTransport{}
+	previousSentryClient := sentry.CurrentHub().Client()
+	if err := sentry.Init(sentry.ClientOptions{Dsn: "https://test@example.com/1", Transport: transport}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sentry.CurrentHub().BindClient(previousSentryClient) })
 	for _, tc := range []struct {
 		name, initialStatus, eventType, finalStatus string
 		equalTime, reverse                          bool
@@ -1072,12 +1080,27 @@ func TestIntegration_StripePendingCheckoutReconcilesLatestLifecycle(t *testing.T
 			}
 			var warnings bytes.Buffer
 			previousLogger := log.Logger
-			log.Logger = zerolog.New(&warnings)
+			log.Logger = zerolog.New(zerolog.MultiLevelWriter(&warnings, &sentrylog.Writer{}))
 			t.Cleanup(func() { log.Logger = previousLogger })
+			initialSentryEvents := len(transport.Events())
 			for _, payload := range payloads {
 				if response := deliver(payload); response.Code != http.StatusInternalServerError {
 					t.Fatalf("pending delivery = %d, want retryable 500: %s", response.Code, response.Body.String())
 				}
+			}
+			sentry.Flush(time.Second)
+			if got := len(transport.Events()); got != initialSentryEvents {
+				t.Fatalf("pending deliveries forwarded %d Sentry errors: %s", got-initialSentryEvents, warnings.String())
+			}
+			var warningRequests int
+			for _, line := range bytes.Split(warnings.Bytes(), []byte{'\n'}) {
+				var entry map[string]any
+				if json.Unmarshal(line, &entry) == nil && entry["message"] == "request" && entry["status"] == float64(http.StatusInternalServerError) && entry["level"] == "warn" {
+					warningRequests++
+				}
+			}
+			if warningRequests != len(payloads) {
+				t.Fatalf("pending request warnings = %d, want %d: %s", warningRequests, len(payloads), warnings.String())
 			}
 			for _, id := range ids {
 				found := false
@@ -2201,6 +2224,16 @@ func TestIntegration_StripeWebhookIgnoresForeignOwnedEvents(t *testing.T) {
 }
 
 func TestIntegration_StripeWebhookPersistsFailureAfterRollback(t *testing.T) {
+	transport := &sentry.MockTransport{}
+	previousSentryClient := sentry.CurrentHub().Client()
+	if err := sentry.Init(sentry.ClientOptions{Dsn: "https://test@example.com/1", Transport: transport}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sentry.CurrentHub().BindClient(previousSentryClient) })
+	var logs bytes.Buffer
+	previousLogger := log.Logger
+	log.Logger = zerolog.New(zerolog.MultiLevelWriter(&logs, &sentrylog.Writer{}))
+	t.Cleanup(func() { log.Logger = previousLogger })
 	ctx := context.Background()
 	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
 	r := newBillingRouter(t, &fakeStripeClient{})
@@ -2216,6 +2249,30 @@ func TestIntegration_StripeWebhookPersistsFailureAfterRollback(t *testing.T) {
 	w := doRequest(r, req)
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("failing webhook: expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	sentry.Flush(time.Second)
+	if len(transport.Events()) == 0 {
+		t.Fatal("unexpected webhook failure did not reach Sentry")
+	}
+	requestError := false
+	processingError := false
+	for _, line := range bytes.Split(logs.Bytes(), []byte{'\n'}) {
+		var entry map[string]any
+		if json.Unmarshal(line, &entry) != nil {
+			continue
+		}
+		if entry["message"] == "request" && entry["status"] == float64(http.StatusInternalServerError) && entry["level"] == "error" {
+			requestError = true
+		}
+		if entry["message"] == "process Stripe webhook failed" && entry["level"] == "error" && entry["event_id"] == "evt_processing_failure" && entry["event_type"] == "customer.subscription.updated" {
+			processingError = true
+		}
+	}
+	if !requestError {
+		t.Fatalf("unexpected failure did not retain error-level request telemetry: %s", logs.String())
+	}
+	if !processingError {
+		t.Fatalf("unexpected failure did not retain error-level webhook processing telemetry: %s", logs.String())
 	}
 
 	var lastError string

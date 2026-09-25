@@ -150,8 +150,9 @@ not reset this clock.
 
 Before reporting, the monitor checks the current billing account and retained
 event under the same account-before-event lock order as Checkout reconciliation.
-Processed or associated events are silent. A different established subscription
-or an expired Checkout reservation is treated as obsolete; a subscription
+Processed or associated events are silent. A different established subscription,
+an expired Checkout reservation, or a reservation begun after the event was
+received is treated as obsolete; a subscription
 cancellation by itself is not. The monitor only classifies and reports; it does
 not replay webhooks, change billing state, or grant credit.
 
@@ -162,8 +163,17 @@ attempts to release the claim for the next poll; an interrupted release falls
 back to lease expiry. A crash between error logging and cooldown
 bookkeeping can yield a duplicate notification; external Sentry delivery is not
 transactional with the database. Each poll examines at most 100 events, using
-receipt-order keyset pagination and a wraparound scan. The additive migration retains existing
-webhook rows and their original receipt times. After deployment, verify that
+receipt-order keyset pagination and a wraparound scan. Newer receipts past the
+cursor take priority; older due alerts are ordered by their next check time so
+repeated alerts cannot hide rows that have waited longer. Candidate inspection
+failures are logged once per event per 30 minutes, with the same durable
+next-check bookkeeping so a malformed retained event cannot occupy every scan
+batch or repeatedly alert across replicas and restarts. If bookkeeping fails,
+the tick stops without advancing past that event and retries on the next poll.
+Tick failures, including database outages that prevent durable bookkeeping, are
+logged once per worker per 30 minutes until a successful tick resets the limit.
+The additive migration retains existing webhook rows and their original receipt
+times. After deployment, verify that
 this monitor runs in each webhook-receiving control plane and that overdue
 errors qualify for the configured Sentry notification rule; local tests cannot
 prove notification delivery.
