@@ -55,7 +55,8 @@ func TestRestoreSnapshotInstallsAndAttestsItsEgressRules(t *testing.T) {
 	if err != nil || !resp.GetNetworkRulesApplied() {
 		t.Fatalf("restore with rules: applied=%v err=%v", resp.GetNetworkRulesApplied(), err)
 	}
+	// Adopted: the rules go in once more, for the proxy half a restart drops.
 	if len(net.firewallCalls) != 1 || net.firewallCalls[0].allowedCIDRs[0] != "198.51.100.0/24" || net.firewallCalls[0].deniedCIDRs[0] != "0.0.0.0/0" {
-		t.Fatalf("firewall calls = %+v; want the request's rules", net.firewallCalls)
+		t.Fatalf("firewall calls = %+v; want the request's rules once", net.firewallCalls)
 	}
 }

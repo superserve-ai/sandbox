@@ -3449,6 +3449,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				return nil, cerr
 			}
 		}
+		// The earlier attempt installed the rules before its launch, but the
+		// proxy's half lives in memory and a daemon restart drops it.
+		if resourceLimits.EgressRules != nil && !m.applyAdoptedNetworkRules(vmID, resourceLimits.EgressRules) {
+			return nil, status.Errorf(codes.Unavailable, "restore adopted vm %s but could not reinstall its egress rules", vmID)
+		}
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
 	}

@@ -115,7 +115,7 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 	if scheduler.selects != 0 {
 		t.Errorf("scheduler consulted %d times; the snapshot's host is the only place", scheduler.selects)
 	}
-	if capHost != snap.HostID || !hasString(capRequired, preview.HostCapabilitySavedSnapshots) || !hasString(capStatuses, "draining") {
+	if capHost != snap.HostID || !hasString(capRequired, preview.HostCapabilitySavedSnapshots) || !hasString(capRequired, preview.HostCapabilitySnapshotForks) || !hasString(capStatuses, "draining") {
 		t.Errorf("host pre-flight = (%s, %v, %v); want the snapshot's host, saved snapshots required, draining allowed", capHost, capRequired, capStatuses)
 	}
 	// The daemon copies the snapshot's files; the request names none.

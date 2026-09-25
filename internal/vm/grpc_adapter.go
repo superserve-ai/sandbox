@@ -257,9 +257,9 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	if err != nil {
 		return nil, err
 	}
-	// Installed before launch; applied again for a VM adopted from an earlier
-	// attempt, whose proxy rules a daemon restart would have dropped.
-	rulesApplied := vmCfg.EgressRules != nil && a.mgr.applyAdoptedNetworkRules(inst.ID, vmCfg.EgressRules)
+	// A restore that succeeds has its rules in place: installed before the
+	// launch, or again on a VM it adopted.
+	rulesApplied := vmCfg.EgressRules != nil
 
 	// Env vars are pushed in a separate InjectSandboxEnv call so the control
 	// plane can mint a JWT against the now-known source IP before injection.

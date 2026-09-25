@@ -2635,12 +2635,12 @@ func (h *Handlers) placeCreate(c *gin.Context, requiredCapabilities []string) (h
 }
 
 // placeFork pins a create from a snapshot to the host holding it. The host
-// must create sandboxes from saved snapshots, and is asked while it drains,
-// as for a resume: the snapshot is nowhere else. Writes the error response
-// on failure.
+// must create sandboxes from saved snapshots with their rules in place
+// before the guest runs, and is asked while it drains, as for a resume: the
+// snapshot is nowhere else. Writes the error response on failure.
 func (h *Handlers) placeFork(c *gin.Context, hostID string, requiredCapabilities []string) (string, bool) {
 	SetTelemetryHostID(c, hostID)
-	required := append(append([]string(nil), requiredCapabilities...), preview.HostCapabilitySavedSnapshots)
+	required := append(append([]string(nil), requiredCapabilities...), preview.HostCapabilitySavedSnapshots, preview.HostCapabilitySnapshotForks)
 	eligible, err := h.hostHasCapabilitiesCachedForScope(c.Request.Context(), hostID, required, ownerResumeCapabilities)
 	if err != nil {
 		log.Error().Err(err).Str("host_id", hostID).Msg("snapshot host pre-flight failed")

@@ -84,6 +84,16 @@ func TestIntegration_CreateSandbox_FromSnapshot(t *testing.T) {
 	if w := do(r, "POST", "/sandboxes", otherKey, body); w.Code != http.StatusNotFound {
 		t.Fatalf("another team's create: %d %s", w.Code, w.Body.String())
 	}
+	// A host whose daemon cannot install a fork's rules before its guest runs
+	// is never asked to fork.
+	if w := do(r, "POST", "/sandboxes", apiKey, body); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("fork on a host without snapshot forks: %d %s", w.Code, w.Body.String())
+	}
+	if err := testQueries.SyncHostCapabilities(ctx, db.SyncHostCapabilitiesParams{
+		HostID: hostID, Capabilities: []string{preview.HostCapabilityPorts, preview.HostCapabilitySavedSnapshots, preview.HostCapabilitySnapshotForks},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	w := do(r, "POST", "/sandboxes", apiKey, body)
 	if w.Code != http.StatusCreated {
