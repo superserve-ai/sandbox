@@ -29,7 +29,7 @@ func readySnapshotFixture(teamID uuid.UUID, secretIDs ...uuid.UUID) db.SandboxSn
 	snap.SnapshotPath, snap.MemPath, snap.OverlayPath = &vmstate, &mem, &overlay
 	timeout := int32(600)
 	snap.TimeoutSeconds = &timeout
-	snap.NetworkConfig = []byte(`{"egress":{"allowed_cidrs":["10.0.0.0/8"],"denied_cidrs":[],"allowed_domains":["api.openai.com"]}}`)
+	snap.NetworkConfig = []byte(`{"egress":{"allowed_cidrs":["10.0.0.0/8"],"denied_cidrs":[],"allowed_domains":["api.example.com"]}}`)
 	bindings := make([]string, 0, len(secretIDs))
 	for i, id := range secretIDs {
 		bindings = append(bindings, fmt.Sprintf(`{"env_key":"KEY_%d","secret_id":%q}`, i, id))
@@ -40,7 +40,7 @@ func readySnapshotFixture(teamID uuid.UUID, secretIDs ...uuid.UUID) db.SandboxSn
 
 func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 	teamID := uuid.New()
-	live := db.Secret{ID: uuid.New(), TeamID: teamID, Name: "openai", AuthType: "bearer"}
+	live := db.Secret{ID: uuid.New(), TeamID: teamID, Name: "example-key", AuthType: "bearer"}
 	gone := uuid.New()
 	snap := readySnapshotFixture(teamID, live.ID, gone)
 
@@ -128,7 +128,7 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 	}
 	// The inherited rules are installed by the restore, before the resumed
 	// workload runs, not pushed after it.
-	if got.Egress == nil || !hasString(got.Egress.AllowedCIDRs, "10.0.0.0/8") || !hasString(got.Egress.AllowedDomains, "api.openai.com") {
+	if got.Egress == nil || !hasString(got.Egress.AllowedCIDRs, "10.0.0.0/8") || !hasString(got.Egress.AllowedDomains, "api.example.com") {
 		t.Errorf("restore egress = %+v; want the snapshot's rules", got.Egress)
 	}
 	if pushedAllow != nil || pushedDomains != nil || pushedDeny != nil {
@@ -161,7 +161,7 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 
 func TestCreateSandbox_FromSnapshotRequestOverridesInheritance(t *testing.T) {
 	teamID := uuid.New()
-	secret := db.Secret{ID: uuid.New(), TeamID: teamID, Name: "openai", AuthType: "bearer"}
+	secret := db.Secret{ID: uuid.New(), TeamID: teamID, Name: "example-key", AuthType: "bearer"}
 	snap := readySnapshotFixture(teamID, secret.ID)
 
 	var insertArgs []any
