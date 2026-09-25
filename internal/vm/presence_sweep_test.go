@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 
@@ -264,33 +265,46 @@ func TestVerifyPresenceRefreshed(t *testing.T) {
 	sc := presence.SidecarPath(mem)
 
 	// A side-car written during the save is kept: there was none before,
-	// or the save replaced it, however quickly.
-	before := presenceBefore(mem)
+	// or the save wrote it, by rename or in place, however quickly.
+	mark := markPresenceForSave(mem)
 	if err := presence.Write(mem, 4096, 4, []uint64{0b0110}); err != nil {
 		t.Fatal(err)
 	}
-	m.verifyPresenceRefreshed(mem, before, nop)
+	m.verifyPresenceRefreshed(mem, mark, nop)
 	if _, err := os.Stat(sc); err != nil {
 		t.Fatalf("fresh side-car removed: %v", err)
 	}
-	before = presenceBefore(mem)
+	mark = markPresenceForSave(mem)
 	if err := presence.Write(mem, 4096, 4, []uint64{0b0111}); err != nil {
 		t.Fatal(err)
 	}
-	m.verifyPresenceRefreshed(mem, before, nop)
+	m.verifyPresenceRefreshed(mem, mark, nop)
 	if _, err := os.Stat(sc); err != nil {
-		t.Fatalf("replaced side-car removed: %v", err)
+		t.Fatalf("side-car replaced by rename removed: %v", err)
+	}
+	mark = markPresenceForSave(mem)
+	inPlace, err := os.OpenFile(sc, os.O_WRONLY|os.O_TRUNC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inPlace.Write([]byte("rewritten in place")); err != nil {
+		t.Fatal(err)
+	}
+	_ = inPlace.Close()
+	m.verifyPresenceRefreshed(mem, mark, nop)
+	if _, err := os.Stat(sc); err != nil {
+		t.Fatalf("side-car rewritten in place removed: %v", err)
 	}
 
 	// A side-car the save did not touch (the old-Firecracker misorder) is
 	// removed so a newer Firecracker can never trust it.
-	m.verifyPresenceRefreshed(mem, presenceBefore(mem), nop)
+	m.verifyPresenceRefreshed(mem, markPresenceForSave(mem), nop)
 	if _, err := os.Stat(sc); !os.IsNotExist(err) {
 		t.Error("stale side-car not removed")
 	}
 
 	// Missing side-car: warn-only, nothing created.
-	m.verifyPresenceRefreshed(mem, nil, nop)
+	m.verifyPresenceRefreshed(mem, time.Time{}, nop)
 	if _, err := os.Stat(sc); !os.IsNotExist(err) {
 		t.Error("guard created a side-car")
 	}

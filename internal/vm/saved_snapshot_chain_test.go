@@ -39,6 +39,10 @@ type chainFC struct {
 	dirty []map[int]byte
 	// hang, when set, holds a diff until the request is abandoned.
 	hang bool
+	// beforeWrite, when set, runs while the vCPUs are paused, before the
+	// files are written; onResume runs on the request that resumes them.
+	beforeWrite func()
+	onResume    func()
 }
 
 func startChainFC(t *testing.T, dirty ...map[int]byte) *chainFC {
@@ -58,6 +62,10 @@ func startChainFC(t *testing.T, dirty ...map[int]byte) *chainFC {
 func (f *chainFC) serve(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodPatch && r.URL.Path == "/vm":
+		b, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(b), "Resumed") && f.onResume != nil {
+			f.onResume()
+		}
 		w.WriteHeader(http.StatusNoContent)
 	case r.Method == http.MethodGet && r.URL.Path == "/":
 		w.Header().Set("Content-Type", "application/json")
@@ -97,6 +105,9 @@ func (f *chainFC) serve(w http.ResponseWriter, r *http.Request) {
 			pages = f.dirty[call]
 		}
 		f.mu.Unlock()
+		if f.beforeWrite != nil {
+			f.beforeWrite()
+		}
 		if err := writeSnapshotFiles(req.SnapshotPath, req.MemFilePath, req.SnapshotType == "Diff", pages); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = io.WriteString(w, err.Error())
@@ -115,6 +126,10 @@ const chainPages = 4
 // top of what was there; a full image writes every page.
 func writeSnapshotFiles(vmstate, mem string, diff bool, pages map[int]byte) error {
 	if err := os.WriteFile(vmstate, []byte("vmstate"), 0o644); err != nil {
+		return err
+	}
+	// The disk's block map, saved beside the vmstate.
+	if err := os.WriteFile(overlayBlockMapPath(vmstate), []byte("block-map"), 0o644); err != nil {
 		return err
 	}
 	if !diff {
@@ -321,6 +336,9 @@ func TestRunningCaptureKeepsTheSourcesPauseIncremental(t *testing.T) {
 	}
 	if _, err := os.Stat(first.SnapshotPath); err != nil {
 		t.Fatalf("first snapshot has no vmstate: %v", err)
+	}
+	if b, err := os.ReadFile(overlayBlockMapPath(first.SnapshotPath)); err != nil || string(b) != "block-map" {
+		t.Fatalf("first snapshot lacks the disk block map saved beside its vmstate: %v", err)
 	}
 
 	second, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotMemFS)
@@ -531,4 +549,43 @@ func TestRunningCaptureHeadroomIsOneImage(t *testing.T) {
 		t.Fatal(err)
 	}
 	release()
+}
+
+// A destroy that lands while the capture waits on Firecracker removes the
+// record; the capture's advance must not bring it back.
+func TestRunningCaptureDoesNotResurrectADestroyedRecord(t *testing.T) {
+	fc := startChainFC(t, map[int]byte{2: 'X'})
+	m := newSavedTestManager(t)
+	inst := seedRunningSource(t, m, fc, true)
+	fc.beforeWrite = func() {
+		if err := m.state.Delete(inst.ID); err != nil {
+			t.Error(err)
+		}
+	}
+	_, _ = m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if rec, err := m.state.Get(inst.ID); err != nil || rec != nil {
+		t.Fatalf("a destroyed record came back: %+v %v", rec, err)
+	}
+}
+
+// The record is written after the guest is released, never while it waits.
+func TestRunningCapturePersistsAfterTheGuestIsReleased(t *testing.T) {
+	fc := startChainFC(t, map[int]byte{2: 'X'})
+	m := newSavedTestManager(t)
+	inst := seedRunningSource(t, m, fc, true)
+	var atResume int64 = -1
+	fc.onResume = func() {
+		if rec, err := m.state.Get(inst.ID); err == nil && rec != nil {
+			atResume = rec.DirtyTrackingGeneration
+		}
+	}
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS); err != nil {
+		t.Fatal(err)
+	}
+	if atResume != 0 {
+		t.Fatalf("the record read generation %d while the guest was still paused; want the store untouched until the release", atResume)
+	}
+	if rec, _ := m.state.Get(inst.ID); rec == nil || rec.DirtyTrackingGeneration != 1 {
+		t.Fatalf("the advance was not persisted after the release: %+v", rec)
+	}
 }

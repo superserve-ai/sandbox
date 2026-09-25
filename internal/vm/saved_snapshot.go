@@ -390,6 +390,13 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	} else {
 		releaseErr = unpauseSourceWithProbe(ctx, socket)
 	}
+	// The chain advance is made durable only now, with the guest released:
+	// a store write must not hold it paused. Until then the record is a
+	// step behind, which a crash turns into one rejected diff and one full
+	// pause, never a torn chain.
+	if chainMem != "" {
+		m.persistChainAdvance(inst, log)
+	}
 	if releaseErr != nil {
 		// The intent, if any, keeps the token for recovery.
 		m.markUnservable(inst, log)
@@ -449,7 +456,7 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 		}
 	}
 	if chainMem != "" {
-		sidecarBefore := presenceBefore(chainMem)
+		sidecarMark := markPresenceForSave(chainMem)
 		err := CreateDiffSnapshotContext(ctx, socket, vmstate, chainMem, sessionID, generation)
 		switch {
 		case err == nil:
@@ -457,9 +464,9 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 			if layered {
 				recordBase = baseMem
 			}
-			m.chainAdvanced(inst, vmstate, chainMem, recordBase, log)
+			advanceChain(inst, vmstate, chainMem, recordBase)
 			if layered {
-				m.verifyPresenceRefreshed(chainMem, sidecarBefore, log)
+				m.verifyPresenceRefreshed(chainMem, sidecarMark, log)
 			}
 			if err := m.cloneChainIntoSnapshot(ctx, tmp, final, vmstate, chainMem, recordBase, man); err != nil {
 				return chainMem, err
@@ -498,27 +505,43 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 	return "", nil
 }
 
-// chainAdvanced records that the source's chain now holds the image just
-// written: a first-pass source becomes an accumulating one, and the next
-// guarded diff names the generation Firecracker moved to. Persisted, so a
-// vmd restart in between still pauses the source as a diff.
-func (m *Manager) chainAdvanced(inst *VMInstance, vmstate, memPath, baseMem string, log zerolog.Logger) {
+// advanceChain records, in memory, that the source's chain now holds the
+// image just written: a first-pass source becomes an accumulating one, and
+// the next guarded diff names the generation Firecracker moved to. Made
+// durable by persistChainAdvance once the guest is released.
+func advanceChain(inst *VMInstance, vmstate, memPath, baseMem string) {
 	inst.mu.Lock()
 	inst.SnapshotPath = vmstate
 	inst.MemFilePath = memPath
 	inst.BaseMemPath = baseMem
 	inst.DirtyTrackingGeneration++
 	inst.mu.Unlock()
-	if !m.persistState(inst) {
-		log.Error().Msg("saved snapshot: chain advance not persisted; a vmd restart before the next pause makes it a full one")
+}
+
+// persistChainAdvance writes the advanced record, so a vmd restart before
+// the next pause still finds the chain; a record a destroy removed meanwhile
+// is not brought back.
+func (m *Manager) persistChainAdvance(inst *VMInstance, log zerolog.Logger) {
+	wrote, err := m.persistStateIfPresent(inst)
+	switch {
+	case err != nil:
+		log.Error().Err(err).Msg("saved snapshot: chain advance not persisted; a vmd restart before the next pause makes it a full one")
+	case !wrote:
+		log.Warn().Msg("saved snapshot: source destroyed during the capture; its record stays gone")
 	}
 }
 
 // cloneChainIntoSnapshot gives the snapshot its own reflinks of the chain's
-// vmstate and memory image, with the overlay's presence map and base record.
+// vmstate, with the disk block map Firecracker saved beside it, and memory
+// image, with the overlay's presence map and base record.
 func (m *Manager) cloneChainIntoSnapshot(ctx context.Context, tmp, final, vmstate, memPath, baseMem string, man *SavedSnapshotManifest) error {
 	if err := m.cloneSavedFile(ctx, vmstate, filepath.Join(tmp, "vmstate.snap")); err != nil {
 		return err
+	}
+	if blockMap := overlayBlockMapPath(vmstate); fileExists(blockMap) {
+		if err := cloneOrCopyFile(ctx, blockMap, overlayBlockMapPath(filepath.Join(tmp, "vmstate.snap"))); err != nil {
+			return fmt.Errorf("copy block overlay sidecar: %w", err)
+		}
 	}
 	name := "mem.snap"
 	if baseMem != "" {
