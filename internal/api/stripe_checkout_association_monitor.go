@@ -96,26 +96,24 @@ func (h *Handlers) StripeCheckoutAssociationTick(ctx context.Context, now time.T
 	if err != nil {
 		return cursor, fmt.Errorf("discover pending Stripe checkout associations: %w", err)
 	}
-	if len(candidates) == 0 && !cursor.ReceivedAt.IsZero() {
-		cursor = db.StripeCheckoutAssociationCursor{}
-		candidates, err = db.ListStripeCheckoutAssociationCandidates(ctx, h.Pool, now, stripeAssociationGrace, cursor, stripeAssociationBatchSize)
-		if err != nil {
-			return cursor, fmt.Errorf("restart pending Stripe checkout association scan: %w", err)
-		}
-	}
 	for _, candidate := range candidates {
-		if err := h.InspectStripeCheckoutAssociation(ctx, now, candidate, report); err != nil {
-			claimed, claimErr := db.DeferStripeCheckoutAssociationInspectionFailure(ctx, h.Pool, candidate.EventID, now, now.Add(stripeAssociationCooldown))
-			if claimErr != nil {
-				return cursor, fmt.Errorf("defer failed Stripe checkout association inspection for %s: %w", candidate.EventID, claimErr)
+		if candidate.Eligible {
+			if err := h.InspectStripeCheckoutAssociation(ctx, now, candidate, report); err != nil {
+				claimed, claimErr := db.DeferStripeCheckoutAssociationInspectionFailure(ctx, h.Pool, candidate.EventID, now, now.Add(stripeAssociationCooldown))
+				if claimErr != nil {
+					return cursor, fmt.Errorf("defer failed Stripe checkout association inspection for %s: %w", candidate.EventID, claimErr)
+				}
+				if claimed {
+					log.Error().Err(err).Str("event_id", candidate.EventID).Msg("inspect Stripe checkout association failed")
+				}
 			}
-			if claimed {
-				log.Error().Err(err).Str("event_id", candidate.EventID).Msg("inspect Stripe checkout association failed")
+		} else if candidate.Lane == 1 {
+			if err := db.PostponeStripeCheckoutAssociationIneligible(ctx, h.Pool, candidate.EventID, now, stripeAssociationGrace, stripeAssociationRecheck); err != nil {
+				return cursor, fmt.Errorf("postpone ineligible Stripe checkout association %s: %w", candidate.EventID, err)
 			}
 		}
-		if candidate.ReceivedAt.After(cursor.ReceivedAt) ||
-			(candidate.ReceivedAt.Equal(cursor.ReceivedAt) && candidate.EventID > cursor.EventID) {
-			cursor = db.StripeCheckoutAssociationCursor{ReceivedAt: candidate.ReceivedAt, EventID: candidate.EventID}
+		if candidate.Lane == 0 {
+			cursor.ReadyAt, cursor.EventID = candidate.ScanAt, candidate.EventID
 		}
 	}
 	return cursor, nil

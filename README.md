@@ -160,12 +160,13 @@ Database alert bookkeeping coordinates replicas. A claim expires after two
 minutes if a worker exits, a reported event has a 30-minute repeat cooldown,
 and a recovered or obsolete event is rechecked after 24 hours. Reporter failure
 attempts to release the claim for the next poll; an interrupted release falls
-back to lease expiry. A crash between error logging and cooldown
-bookkeeping can yield a duplicate notification; external Sentry delivery is not
+back to lease expiry. A pending transition queues its alert eligibility in the
+same transaction as the retained webhook update, so a retry committed after a
+monitor scan remains discoverable on a later poll. A crash between error logging
+and cooldown bookkeeping can yield a duplicate notification; external Sentry delivery is not
 transactional with the database. Each poll examines at most 100 events, using
-receipt-order keyset pagination and a wraparound scan. Newer receipts past the
-cursor take priority; older due alerts are ordered by their next check time so
-repeated alerts cannot hide rows that have waited longer. Candidate inspection
+an indexed cursor for retained legacy candidates and an indexed due queue that
+starts at the oldest due alert on every poll. Candidate inspection
 failures are logged once per event per 30 minutes, with the same durable
 next-check bookkeeping so a malformed retained event cannot occupy every scan
 batch or repeatedly alert across replicas and restarts. If bookkeeping fails,

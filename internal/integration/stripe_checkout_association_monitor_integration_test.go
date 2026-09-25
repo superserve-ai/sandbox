@@ -28,7 +28,7 @@ func TestIntegration_StripeAssociationMonitorPreservesSignedPendingCheckout(t *t
 	customerID := "cus_" + teamID.String()
 	subscriptionID := "sub_" + teamID.String()
 	eventID := "evt_pending_" + teamID.String()
-	createdAt := time.Now().UTC().Truncate(time.Second)
+	createdAt := time.Now().UTC().Add(time.Second).Truncate(time.Second)
 	if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account
 		(team_id, stripe_customer_id, checkout_initializing_at, checkout_session_id)
 		VALUES ($1, $2, $3, 'cs_test_123')`, teamID, customerID, createdAt.Add(-time.Minute)); err != nil {
@@ -142,7 +142,7 @@ func TestIntegration_StripeAssociationMonitorPreservesSignedPendingCheckout(t *t
 
 func TestIntegration_StripeAssociationMonitorEmissionAndState(t *testing.T) {
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
 	team, err := testQueries.CreateTeam(ctx, "example-team-"+uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
@@ -293,7 +293,7 @@ func TestIntegration_StripeAssociationMonitorEmissionAndState(t *testing.T) {
 
 func TestIntegration_StripeAssociationMonitorIgnoresPreviousCheckoutAttempt(t *testing.T) {
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
 	team, err := testQueries.CreateTeam(ctx, "example-team-"+uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
@@ -365,7 +365,7 @@ func TestIntegration_StripeAssociationMonitorIgnoresPreviousCheckoutAttempt(t *t
 
 func TestIntegration_StripeAssociationMonitorConcurrentClaims(t *testing.T) {
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
 	eventID := "evt_" + uuid.NewString()
 	payload, err := json.Marshal(map[string]any{
 		"id": eventID, "type": "customer.subscription.created",
@@ -427,7 +427,7 @@ func TestIntegration_StripeAssociationMonitorConcurrentClaims(t *testing.T) {
 
 func TestIntegration_StripeAssociationMonitorRecoveryBeforeClaim(t *testing.T) {
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
 	team, err := testQueries.CreateTeam(ctx, "example-team-"+uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
@@ -517,7 +517,7 @@ func TestIntegration_StripeAssociationMonitorRecoveryBeforeClaim(t *testing.T) {
 
 func TestIntegration_StripeAssociationMonitorRecoveryBeforeFinalRevalidation(t *testing.T) {
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
 	team, err := testQueries.CreateTeam(ctx, "example-team-"+uuid.NewString())
 	if err != nil {
 		t.Fatal(err)
@@ -625,7 +625,7 @@ func TestIntegration_StripeAssociationMonitorRecoveryBeforeFinalRevalidation(t *
 
 func TestIntegration_StripeAssociationInspectionFailureBackoff(t *testing.T) {
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
 	badID := "evt_" + uuid.NewString()
 	goodID := "evt_" + uuid.NewString()
 	for _, event := range []struct {
@@ -670,7 +670,7 @@ func TestIntegration_StripeAssociationInspectionFailureBackoff(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, candidate := range candidates {
-			if candidate.EventID == badID {
+			if candidate.EventID == badID && candidate.Eligible {
 				t.Fatalf("failed event due during backoff at %s", at)
 			}
 		}
@@ -685,7 +685,7 @@ func TestIntegration_StripeAssociationInspectionFailureBackoff(t *testing.T) {
 
 func TestIntegration_StripeAssociationCursorRevisitsOlderDueEvents(t *testing.T) {
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
 	h := api.NewHandlers(nil, testQueries, nil)
 	h.Pool = testPool
 	insert := func(receivedAt time.Time, valid bool) string {
@@ -755,15 +755,15 @@ func TestIntegration_StripeAssociationCursorRevisitsOlderDueEvents(t *testing.T)
 
 func TestIntegration_StripeAssociationNewReceiptsAdvancePastDueBacklog(t *testing.T) {
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
 	prefix := "evt_scan_" + uuid.NewString() + "_"
 	oldAt := now.Add(-7 * time.Minute)
 	newAt := now.Add(-6 * time.Minute)
 	if _, err := testPool.Exec(ctx, `
-INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, last_error)
+INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, updated_at, last_error)
 SELECT $1 || lpad(n::text, 3, '0'), 'customer.subscription.created',
        '{"data":{"object":{"id":"sub_example","customer":"cus_example"}}}'::jsonb,
-       $2, $3
+       $2, $2, $3
 FROM generate_series(1, 101) AS n`, prefix, oldAt, db.StripeCheckoutAssociationPendingError); err != nil {
 		t.Fatal(err)
 	}
@@ -771,26 +771,26 @@ FROM generate_series(1, 101) AS n`, prefix, oldAt, db.StripeCheckoutAssociationP
 		_, _ = testPool.Exec(context.Background(), `DELETE FROM stripe_webhook_event WHERE event_id LIKE $1`, prefix+"%")
 	})
 	if _, err := testPool.Exec(ctx, `
-INSERT INTO stripe_checkout_association_alert(event_id, next_check_at)
-SELECT event_id, CASE WHEN event_id = $1 || '101' THEN $3::timestamptz - interval '31 minutes' ELSE $3 END
-FROM stripe_webhook_event WHERE event_id LIKE $2`, prefix, prefix+"%", now); err != nil {
+UPDATE stripe_checkout_association_alert
+SET next_check_at = CASE WHEN event_id = $1 || '101' THEN $3::timestamptz - interval '31 minutes' ELSE $3 END
+WHERE event_id LIKE $2`, prefix, prefix+"%", now); err != nil {
 		t.Fatal(err)
 	}
 	newID := prefix + "new"
 	if _, err := testPool.Exec(ctx, `
-INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, last_error)
+INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, updated_at, last_error)
 VALUES ($1, 'customer.subscription.created',
         '{"data":{"object":{"id":"sub_example","customer":"cus_example"}}}'::jsonb,
-        $2, $3)`, newID, newAt, db.StripeCheckoutAssociationPendingError); err != nil {
+        $2, $2, $3)`, newID, newAt, db.StripeCheckoutAssociationPendingError); err != nil {
 		t.Fatal(err)
 	}
 	candidates, err := db.ListStripeCheckoutAssociationCandidates(ctx, testPool, now, 5*time.Minute,
-		db.StripeCheckoutAssociationCursor{ReceivedAt: oldAt, EventID: prefix + "zzz"}, 100)
+		db.StripeCheckoutAssociationCursor{ReadyAt: oldAt.Add(5 * time.Minute), EventID: prefix + "zzz"}, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(candidates) != 100 {
-		t.Fatalf("candidate count = %d, want 100", len(candidates))
+	if len(candidates) != 51 {
+		t.Fatalf("candidate count = %d, want 51", len(candidates))
 	}
 	if candidates[0].EventID != newID {
 		t.Fatalf("new overdue receipt hidden by due backlog: first=%s", candidates[0].EventID)
@@ -800,9 +800,165 @@ VALUES ($1, 'customer.subscription.created',
 	}
 }
 
-func TestIntegration_StripeAssociationCursorDoesNotPassFailedDeferral(t *testing.T) {
+func TestIntegration_StripeAssociationDiscoveryPagesPastSuppressedAndStaleRows(t *testing.T) {
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
+	prefix := "evt_paged_" + uuid.NewString() + "_"
+	oldAt := now.Add(-10 * time.Minute)
+	payload := `{"data":{"object":{"id":"sub_example","customer":"cus_example"}}}`
+	if _, err := testPool.Exec(ctx, `
+INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, updated_at, last_error)
+SELECT $1 || 'suppressed_' || lpad(n::text, 3, '0'), 'customer.subscription.created', $2,
+       $3, $3, $4
+FROM generate_series(1, 101) AS n`, prefix, payload, oldAt, db.StripeCheckoutAssociationPendingError); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM stripe_webhook_event WHERE event_id LIKE $1`, prefix+"%")
+	})
+	if _, err := testPool.Exec(ctx, `
+UPDATE stripe_checkout_association_alert SET next_check_at = $2
+WHERE event_id LIKE $1`, prefix+"suppressed_%", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `
+INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, updated_at, processed_at, last_error)
+SELECT $1 || 'stale_' || lpad(n::text, 3, '0'), 'customer.subscription.created', $2,
+       $3, $3, $3, $4
+FROM generate_series(1, 101) AS n`, prefix, payload, oldAt, db.StripeCheckoutAssociationPendingError); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `
+UPDATE stripe_checkout_association_alert SET next_check_at = $2
+WHERE event_id LIKE $1`, prefix+"stale_%", oldAt); err != nil {
+		t.Fatal(err)
+	}
+	targetID := prefix + "target"
+	if _, err := testPool.Exec(ctx, `
+INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, updated_at, last_error)
+VALUES ($1, 'customer.subscription.created', $2, $3, $3, $4)`, targetID, payload,
+		now.Add(-5*time.Minute), db.StripeCheckoutAssociationPendingError); err != nil {
+		t.Fatal(err)
+	}
+	h := api.NewHandlers(nil, testQueries, nil)
+	h.Pool = testPool
+	var cursor db.StripeCheckoutAssociationCursor
+	var reported []string
+	for range 4 {
+		candidates, err := db.ListStripeCheckoutAssociationCandidates(ctx, testPool, now, 5*time.Minute, cursor, 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(candidates) > 100 {
+			t.Fatalf("discovery page contains %d rows, want at most 100", len(candidates))
+		}
+		cursor, err = h.StripeCheckoutAssociationTick(ctx, now, cursor, func(a api.StripeAssociationAlert) error {
+			reported = append(reported, a.EventID)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(reported) != 1 || reported[0] != targetID {
+		t.Fatalf("target behind suppressed and stale rows reported %v", reported)
+	}
+}
+
+func TestIntegration_StripeAssociationRetryBehindCursorWithContinuedArrivals(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
+	prefix := "evt_retry_scan_" + uuid.NewString() + "_"
+	payload := `{"data":{"object":{"id":"sub_example","customer":"cus_example"}}}`
+	insert := func(suffix string, receivedAt time.Time, lastError string) string {
+		t.Helper()
+		eventID := prefix + suffix
+		if _, err := testPool.Exec(ctx, `INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, last_error)
+            VALUES ($1, 'customer.subscription.created', $2, $3, $4)`, eventID, payload, receivedAt, lastError); err != nil {
+			t.Fatal(err)
+		}
+		return eventID
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM stripe_webhook_event WHERE event_id LIKE $1`, prefix+"%")
+	})
+	oldID := insert("old", now.Add(-10*time.Minute), "earlier processing failure")
+	h := api.NewHandlers(nil, testQueries, nil)
+	h.Pool = testPool
+	var cursor db.StripeCheckoutAssociationCursor
+	var reported []string
+	report := func(a api.StripeAssociationAlert) error {
+		reported = append(reported, a.EventID)
+		return nil
+	}
+	for minute := range 4 {
+		at := now.Add(time.Duration(minute) * time.Minute)
+		insert("new_"+string(rune('a'+minute)), at.Add(-5*time.Minute), db.StripeCheckoutAssociationPendingError)
+		var retryTx pgx.Tx
+		if minute == 1 {
+			var err error
+			retryTx, err = testPool.BeginTx(ctx, pgx.TxOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = retryTx.Rollback(context.Background()) })
+			if _, err := retryTx.Exec(ctx, `UPDATE stripe_webhook_event
+                SET last_error = $2, updated_at = $3 WHERE event_id = $1`, oldID,
+				db.StripeCheckoutAssociationPendingError, at.Add(-time.Second)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var err error
+		cursor, err = h.StripeCheckoutAssociationTick(ctx, at, cursor, report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cursor.ReadyAt.Equal(at) {
+			t.Fatalf("minute %d scan cursor = %s, want %s", minute, cursor.ReadyAt, at)
+		}
+		if minute == 1 {
+			for _, id := range reported {
+				if id == oldID {
+					t.Fatal("uncommitted retry was reported")
+				}
+			}
+			if err := retryTx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			candidates, err := db.ListStripeCheckoutAssociationCandidates(ctx, testPool, at, 5*time.Minute, cursor, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foundDue := false
+			for _, candidate := range candidates {
+				if candidate.EventID == oldID {
+					if candidate.Lane != 1 || !candidate.Eligible {
+						t.Fatalf("late commit discovered in lane %d, eligible=%t", candidate.Lane, candidate.Eligible)
+					}
+					foundDue = true
+				}
+			}
+			if !foundDue {
+				t.Fatal("committed retry is missing behind the advanced cursor")
+			}
+		}
+		if minute >= 2 {
+			count := 0
+			for _, id := range reported {
+				if id == oldID {
+					count++
+				}
+			}
+			if count != 1 {
+				t.Fatalf("minute %d retried older event reported %d times, want once", minute, count)
+			}
+		}
+	}
+}
+
+func TestIntegration_StripeAssociationFailedReporterRetriesAfterLease(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
 	eventID := "evt_" + uuid.NewString()
 	payload, err := json.Marshal(map[string]any{"data": map[string]any{"object": map[string]any{
 		"id": "sub_" + uuid.NewString(), "customer": "cus_" + uuid.NewString(),
@@ -828,8 +984,13 @@ func TestIntegration_StripeAssociationCursorDoesNotPassFailedDeferral(t *testing
 	if err == nil {
 		t.Fatal("expected failed inspection deferral")
 	}
-	if cursor.EventID != "" || !cursor.ReceivedAt.IsZero() {
-		t.Fatalf("cursor advanced past failed deferral: %+v", cursor)
+	var leaseUntil, nextCheckAt time.Time
+	if err := testPool.QueryRow(ctx, `SELECT lease_until, next_check_at
+FROM stripe_checkout_association_alert WHERE event_id = $1`, eventID).Scan(&leaseUntil, &nextCheckAt); err != nil {
+		t.Fatal(err)
+	}
+	if !leaseUntil.Equal(now.Add(2*time.Minute)) || !nextCheckAt.Equal(leaseUntil) {
+		t.Fatalf("failed reporter lost its retry lease: lease=%s next_check=%s", leaseUntil, nextCheckAt)
 	}
 	var reported []string
 	_, err = h.StripeCheckoutAssociationTick(ctx, now.Add(2*time.Minute), cursor, func(a api.StripeAssociationAlert) error {
@@ -846,7 +1007,7 @@ func TestIntegration_StripeAssociationCursorDoesNotPassFailedDeferral(t *testing
 
 func TestIntegration_StripeAssociationCandidateGraceAndClaims(t *testing.T) {
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Second)
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
 	eventID := "evt_monitor_" + uuid.NewString()
 	payload, err := json.Marshal(map[string]any{
 		"id": eventID, "type": "customer.subscription.deleted", "created": now.Unix(),
@@ -871,7 +1032,7 @@ VALUES ($1, 'customer.subscription.deleted', $2, $3, $4)`, eventID, payload, now
 		}
 		var matches []db.StripeCheckoutAssociationCandidate
 		for _, c := range candidates {
-			if c.EventID == eventID {
+			if c.EventID == eventID && c.Eligible {
 				matches = append(matches, c)
 			}
 		}
@@ -895,13 +1056,17 @@ RETURNING received_at, updated_at`, eventID, db.StripeCheckoutAssociationPending
 		t.Fatalf("candidate at grace = %v", got)
 	}
 	if after, err := db.ListStripeCheckoutAssociationCandidates(ctx, testPool, now, 5*time.Minute,
-		db.StripeCheckoutAssociationCursor{ReceivedAt: now.Add(-5 * time.Minute), EventID: eventID}, 100); err != nil {
+		db.StripeCheckoutAssociationCursor{ReadyAt: now, EventID: eventID}, 100); err != nil {
 		t.Fatal(err)
 	} else {
+		foundNew := false
 		for _, candidate := range after {
-			if candidate.EventID == eventID {
-				t.Fatal("keyset scan revisited the cursor event")
+			if candidate.EventID == eventID && candidate.Lane == 0 {
+				foundNew = true
 			}
+		}
+		if foundNew {
+			t.Fatal("new-event scan revisited the cursor event")
 		}
 	}
 

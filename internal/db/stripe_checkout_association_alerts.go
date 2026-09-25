@@ -15,38 +15,55 @@ type StripeCheckoutAssociationCandidate struct {
 	EventType  string
 	Payload    []byte
 	ReceivedAt time.Time
+	ScanAt     time.Time
+	Lane       int
+	Eligible   bool
 }
 
 type StripeCheckoutAssociationCursor struct {
-	ReceivedAt time.Time
-	EventID    string
+	ReadyAt time.Time
+	EventID string
 }
 
-// ListStripeCheckoutAssociationCandidates bounds each poll. Due alert rows
-// bypass the receipt cursor. Rows past the cursor take priority; older due
-// rows are ordered by next check time so repeats cannot starve uninspected rows.
+// Each lane pages its indexed source before joining the other table. The
+// webhook cursor covers retained rows predating the eligibility trigger;
+// transactionally queued due rows start at the oldest due entry every tick.
 func ListStripeCheckoutAssociationCandidates(ctx context.Context, pool *pgxpool.Pool, now time.Time, grace time.Duration, cursor StripeCheckoutAssociationCursor, limit int) ([]StripeCheckoutAssociationCandidate, error) {
 	rows, err := pool.Query(ctx, `
-SELECT e.event_id, e.event_type, e.payload, e.received_at
-FROM stripe_webhook_event e
-LEFT JOIN stripe_checkout_association_alert a ON a.event_id = e.event_id
-WHERE e.processed_at IS NULL
-  AND e.last_error = 'Stripe checkout association is still being established'
-  AND e.event_type IN ('customer.subscription.created', 'customer.subscription.updated',
-                       'customer.subscription.deleted', 'customer.subscription.paused',
-                       'customer.subscription.resumed')
-  AND e.received_at <= $1
-  AND (a.next_check_at IS NULL OR a.next_check_at <= $2)
-  AND (a.next_check_at <= $2 OR $3::timestamptz IS NULL
-       OR (e.received_at, e.event_id) > ($3, $4))
-ORDER BY CASE WHEN $3::timestamptz IS NULL OR
-                   (e.received_at, e.event_id) > ($3, $4)
-              THEN 0 ELSE 1 END,
-         CASE WHEN $3::timestamptz IS NULL OR
-                   (e.received_at, e.event_id) > ($3, $4)
-              THEN e.received_at ELSE a.next_check_at END,
-         e.received_at, e.event_id
-LIMIT $5`, now.Add(-grace), now, nullableStripeAssociationCursorTime(cursor), cursor.EventID, limit)
+WITH new_page AS MATERIALIZED (
+    SELECT event_id, GREATEST((received_at AT TIME ZONE 'UTC') + interval '5 minutes', updated_at AT TIME ZONE 'UTC') AS scan_at
+    FROM stripe_webhook_event
+    WHERE processed_at IS NULL
+      AND last_error = 'Stripe checkout association is still being established'
+      AND event_type IN ('customer.subscription.created', 'customer.subscription.updated',
+                         'customer.subscription.deleted', 'customer.subscription.paused',
+                         'customer.subscription.resumed')
+      AND GREATEST((received_at AT TIME ZONE 'UTC') + interval '5 minutes', updated_at AT TIME ZONE 'UTC') <= ($1::timestamptz AT TIME ZONE 'UTC')
+      AND (GREATEST((received_at AT TIME ZONE 'UTC') + interval '5 minutes', updated_at AT TIME ZONE 'UTC'), event_id) > ($2::timestamp, $3)
+    ORDER BY GREATEST((received_at AT TIME ZONE 'UTC') + interval '5 minutes', updated_at AT TIME ZONE 'UTC'), event_id
+    LIMIT $4
+), due_page AS MATERIALIZED (
+    SELECT event_id, next_check_at AT TIME ZONE 'UTC' AS scan_at
+    FROM stripe_checkout_association_alert
+    WHERE next_check_at <= $1
+    ORDER BY next_check_at, event_id
+    LIMIT $6
+)
+SELECT p.event_id, e.event_type, e.payload, e.received_at, p.scan_at, 0 AS lane,
+       a.event_id IS NULL AS eligible
+FROM new_page p
+JOIN stripe_webhook_event e USING (event_id)
+LEFT JOIN stripe_checkout_association_alert a USING (event_id)
+UNION ALL
+SELECT p.event_id, e.event_type, e.payload, e.received_at, p.scan_at, 1 AS lane,
+       COALESCE(e.processed_at IS NULL AND e.last_error = 'Stripe checkout association is still being established'
+       AND e.event_type IN ('customer.subscription.created', 'customer.subscription.updated',
+                            'customer.subscription.deleted', 'customer.subscription.paused',
+                            'customer.subscription.resumed') AND e.received_at <= $5, false) AS eligible
+FROM due_page p
+JOIN stripe_webhook_event e USING (event_id)
+ORDER BY lane, scan_at, event_id`, now, stripeAssociationCursorTime(cursor.ReadyAt), cursor.EventID,
+		(limit+1)/2, now.Add(-grace), limit/2)
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +71,7 @@ LIMIT $5`, now.Add(-grace), now, nullableStripeAssociationCursorTime(cursor), cu
 	var candidates []StripeCheckoutAssociationCandidate
 	for rows.Next() {
 		var c StripeCheckoutAssociationCandidate
-		if err := rows.Scan(&c.EventID, &c.EventType, &c.Payload, &c.ReceivedAt); err != nil {
+		if err := rows.Scan(&c.EventID, &c.EventType, &c.Payload, &c.ReceivedAt, &c.ScanAt, &c.Lane, &c.Eligible); err != nil {
 			return nil, err
 		}
 		candidates = append(candidates, c)
@@ -62,11 +79,60 @@ LIMIT $5`, now.Add(-grace), now, nullableStripeAssociationCursorTime(cursor), cu
 	return candidates, rows.Err()
 }
 
-func nullableStripeAssociationCursorTime(cursor StripeCheckoutAssociationCursor) any {
-	if cursor.ReceivedAt.IsZero() {
-		return nil
+func stripeAssociationCursorTime(at time.Time) time.Time {
+	if at.IsZero() {
+		return time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
 	}
-	return cursor.ReceivedAt
+	return at
+}
+
+// Lock the webhook before moving stale bookkeeping. A concurrent retry's
+// trigger inserts eligibility while holding this same webhook row lock.
+func PostponeStripeCheckoutAssociationIneligible(ctx context.Context, pool *pgxpool.Pool, eventID string, now time.Time, grace, recheck time.Duration) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	var unprocessed bool
+	var lastError *string
+	var eventType string
+	var receivedAt time.Time
+	err = tx.QueryRow(ctx, `SELECT processed_at IS NULL, last_error, event_type, received_at
+FROM stripe_webhook_event WHERE event_id = $1 FOR UPDATE`, eventID).Scan(&unprocessed, &lastError, &eventType, &receivedAt)
+	if err == pgx.ErrNoRows {
+		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	if unprocessed && lastError != nil && *lastError == StripeCheckoutAssociationPendingError &&
+		stripeCheckoutAssociationEventType(eventType) && !receivedAt.Add(grace).After(now) {
+		return tx.Commit(ctx)
+	}
+	next := now.Add(recheck)
+	if unprocessed && lastError != nil && *lastError == StripeCheckoutAssociationPendingError &&
+		stripeCheckoutAssociationEventType(eventType) && receivedAt.Add(grace).After(now) {
+		next = receivedAt.Add(grace)
+	}
+	_, err = tx.Exec(ctx, `
+UPDATE stripe_checkout_association_alert
+SET next_check_at = $3
+WHERE event_id = $1 AND next_check_at <= $2`, eventID, now, next)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func stripeCheckoutAssociationEventType(eventType string) bool {
+	switch eventType {
+	case "customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted",
+		"customer.subscription.paused", "customer.subscription.resumed":
+		return true
+	default:
+		return false
+	}
 }
 
 // ClaimStripeCheckoutAssociationAlert reserves a single event across replicas.
