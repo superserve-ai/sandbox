@@ -301,3 +301,18 @@ variable "launch_path_alerts" {
   })
   default = null
 }
+
+variable "runbook_urls" {
+  description = "Direct runbook URLs by logical alert procedure; supply privately before applying alert-bearing modules."
+  type        = map(string)
+  sensitive   = true
+  default     = {}
+  nullable    = false
+
+  validation {
+    condition = alltrue([
+      for url in values(var.runbook_urls) : can(regex("^https?://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>]*)?$", url))
+    ])
+    error_message = "Each runbook URL must be an absolute HTTP(S) URL with a host and no whitespace."
+  }
+}

@@ -358,6 +358,8 @@ resource "google_compute_attached_disk" "sandbox_data_b" {
 module "observability" {
   source = "../../../modules/observability"
 
+  runbook_urls = var.alert_runbook_urls
+
   project_id               = local.project_id
   environment              = local.environment
   notification_channel_ids = var.notification_channel_ids

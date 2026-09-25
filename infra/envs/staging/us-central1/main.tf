@@ -603,6 +603,8 @@ removed {
 module "observability" {
   source = "../../../modules/observability"
 
+  runbook_urls = var.alert_runbook_urls
+
   project_id  = local.project_id
   environment = local.environment
   # Backup pipeline alerts, same set as the production cells so staging
