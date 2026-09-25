@@ -1101,6 +1101,7 @@ WITH src AS (
   FROM sandbox_snapshot s
   WHERE s.id = $1 AND s.team_id = $2
     AND s.status = 'ready' AND s.deleted_at IS NULL
+  FOR SHARE
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id)
   SELECT $3, $2, $4, $5, vcpu_count, memory_mib, host_id, $6, $7, template_id, snapshot_path, mem_path, base_path, disk_mib, $8, cardinality($9::uuid[]) > 0, source_snapshot_id FROM src
@@ -1178,7 +1179,10 @@ type CreateSandboxFromSnapshotRow struct {
 // template pin are the snapshot's, read here so the row never disagrees
 // with the image it boots. The bindings are the snapshot's re-bound plus the
 // request's, as arrays that may be empty. Returns 0 rows if the snapshot is
-// not ready, deleted, or not the caller's.
+// not ready, deleted, or not the caller's. The snapshot is held shared until
+// the new row commits, so a delete lands before it or after, and never
+// while nothing visible references the build both share; forks of one
+// snapshot share the lock.
 func (q *Queries) CreateSandboxFromSnapshot(ctx context.Context, arg CreateSandboxFromSnapshotParams) (CreateSandboxFromSnapshotRow, error) {
 	row := q.db.QueryRow(ctx, createSandboxFromSnapshot,
 		arg.SnapshotID,

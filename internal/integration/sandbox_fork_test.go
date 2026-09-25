@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
@@ -126,5 +128,58 @@ func TestIntegration_CreateSandbox_FromSnapshot(t *testing.T) {
 	}
 	if got, err := testQueries.GetSandbox(ctx, db.GetSandboxParams{ID: forkID, TeamID: teamID}); err != nil || !got.SourceSnapshotID.Valid {
 		t.Errorf("sandbox after its source's delete: %v %v", got.SourceSnapshotID, err)
+	}
+}
+
+// A delete of a snapshot waits for a sandbox being created from it to
+// commit, so the build both reference is never left unreferenced between
+// the two.
+func TestIntegration_SnapshotDeleteWaitsForAForkInsert(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	sourceID, err := insertSandboxRow(ctx, teamID, "lock-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', base_path = '/templates/t/base.ext4', disk_mib = 4096 WHERE id = $1`, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := testQueries.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
+		ID: uuid.New(), TeamID: teamID, SandboxID: sourceID, Kind: "mem+fs",
+		SecretBindings: []byte("[]"), SweepAfter: time.Now().Add(15 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vmstate, mem, overlay := "/saved/l/vmstate.snap", "/saved/l/mem.diff", "/saved/l/overlay.ext4"
+	if _, err := testQueries.MarkSandboxSnapshotReady(ctx, db.MarkSandboxSnapshotReadyParams{ID: snap.ID, SnapshotPath: &vmstate, MemPath: &mem, OverlayPath: &overlay, SizeBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	fork, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fork.Rollback(ctx) //nolint:errcheck
+	if _, err := db.New(fork).CreateSandboxFromSnapshot(ctx, db.CreateSandboxFromSnapshotParams{
+		SnapshotID: snap.ID, TeamID: teamID, ID: uuid.New(), Name: "fork", Status: db.SandboxStatusStarting,
+		Metadata: []byte(`{}`), PreviewAccess: preview.AccessPublic,
+		SecretIds: []uuid.UUID{}, EnvKeys: []string{}, ProxyTokens: []string{},
+	}); err != nil {
+		t.Fatalf("fork insert: %v", err)
+	}
+
+	del, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer del.Rollback(ctx) //nolint:errcheck
+	if _, err := del.Exec(ctx, `SET LOCAL lock_timeout = '200ms'`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.New(del).BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: snap.ID, TeamID: teamID, StaleBefore: time.Now()})
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("delete during an uncommitted fork insert: %v; want it to wait on the snapshot's lock", err)
 	}
 }

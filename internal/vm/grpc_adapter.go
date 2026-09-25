@@ -224,6 +224,13 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	vmCfg.BasePath = req.GetBasePath()
 	vmCfg.DeltaDir = req.GetDeltaDir()
 	vmCfg.SavedSnapshotID = req.GetSavedSnapshotId()
+	if egress := req.GetSandboxNetwork().GetEgress(); egress != nil {
+		vmCfg.EgressRules = &sandboxNetworkRules{
+			allowedCIDRs:   egress.GetAllowedCidrs(),
+			deniedCIDRs:    egress.GetDeniedCidrs(),
+			allowedDomains: egress.GetAllowedDomains(),
+		}
+	}
 
 	var netCfg *network.Config
 	if nc := req.GetNetworkConfig(); nc != nil {
@@ -250,6 +257,9 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	if err != nil {
 		return nil, err
 	}
+	// Installed before launch; applied again for a VM adopted from an earlier
+	// attempt, whose proxy rules a daemon restart would have dropped.
+	rulesApplied := vmCfg.EgressRules != nil && a.mgr.applyAdoptedNetworkRules(inst.ID, vmCfg.EgressRules)
 
 	// Env vars are pushed in a separate InjectSandboxEnv call so the control
 	// plane can mint a JWT against the now-known source IP before injection.
@@ -263,7 +273,8 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 			MemoryMib: inst.Config.MemoryMiB,
 		},
 		// Attests the request's policy fields were applied (see vmd.proto).
-		PreviewProtocol: preview.HostCapabilityPorts,
+		PreviewProtocol:     preview.HostCapabilityPorts,
+		NetworkRulesApplied: rulesApplied,
 	}, nil
 }
 

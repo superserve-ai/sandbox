@@ -3274,9 +3274,15 @@ components:
             holding the snapshot. The snapshot must be `ready` and the
             caller's. vCPU, memory and disk are the snapshot's;
             `timeout_seconds` and `network` are too unless the request sets
-            them. Secrets the source was bound to are bound again with fresh
-            proxy tokens, except env keys the request sets itself; `env_vars`
-            are not inherited. Mutually exclusive with `from_template`.
+            them, and the network rules are in place before anything in the
+            sandbox runs. Commands run in the new sandbox see the environment
+            the source had, with `env_vars` and the secrets set on top.
+            Secrets the source was bound to are bound again with fresh proxy
+            tokens, except env keys the request sets itself. Processes that
+            were running when the snapshot was taken keep the environment
+            they started with, including the source's secret proxy
+            credentials, which do not work in the new sandbox: restart them
+            to use its secrets. Mutually exclusive with `from_template`.
         timeout_seconds:
           type: integer
           format: int32

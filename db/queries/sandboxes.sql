@@ -99,13 +99,17 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 -- template pin are the snapshot's, read here so the row never disagrees
 -- with the image it boots. The bindings are the snapshot's re-bound plus the
 -- request's, as arrays that may be empty. Returns 0 rows if the snapshot is
--- not ready, deleted, or not the caller's.
+-- not ready, deleted, or not the caller's. The snapshot is held shared until
+-- the new row commits, so a delete lands before it or after, and never
+-- while nothing visible references the build both share; forks of one
+-- snapshot share the lock.
 WITH src AS (
   SELECT s.id AS source_snapshot_id, s.host_id, s.template_id, s.vcpu_count, s.memory_mib, s.disk_mib,
          s.base_path, s.snapshot_path, s.mem_path
   FROM sandbox_snapshot s
   WHERE s.id = @snapshot_id AND s.team_id = @team_id
     AND s.status = 'ready' AND s.deleted_at IS NULL
+  FOR SHARE
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id)
   SELECT @id, @team_id, @name, @status, vcpu_count, memory_mib, host_id, @timeout_seconds, @metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, @auto_delete_seconds, cardinality(@secret_ids::uuid[]) > 0, source_snapshot_id FROM src

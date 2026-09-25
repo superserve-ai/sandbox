@@ -15,7 +15,6 @@ import (
 
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
-	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
 // readySnapshotFixture is a ready mem+fs snapshot with everything a fork
@@ -123,8 +122,17 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 	if restoredSnapshot != "" || restoredMem != "" {
 		t.Errorf("restore named files (%q, %q); a fork passes none", restoredSnapshot, restoredMem)
 	}
-	if want := (vmdclient.ResourceLimits{VCPU: 2, MemoryMiB: 2048, SavedSnapshotID: snap.ID.String()}); vmd.restoreLimits != want {
-		t.Errorf("restore limits = %+v, want %+v", vmd.restoreLimits, want)
+	got := vmd.restoreLimits
+	if got.VCPU != 2 || got.MemoryMiB != 2048 || got.SavedSnapshotID != snap.ID.String() {
+		t.Errorf("restore limits = %+v; want the snapshot's shape and id", got)
+	}
+	// The inherited rules are installed by the restore, before the resumed
+	// workload runs, not pushed after it.
+	if got.Egress == nil || !hasString(got.Egress.AllowedCIDRs, "10.0.0.0/8") || !hasString(got.Egress.AllowedDomains, "api.openai.com") {
+		t.Errorf("restore egress = %+v; want the snapshot's rules", got.Egress)
+	}
+	if pushedAllow != nil || pushedDomains != nil || pushedDeny != nil {
+		t.Errorf("rules pushed again after the restore installed them: (%v, %v, %v)", pushedAllow, pushedDeny, pushedDomains)
 	}
 	// The row is the snapshot's, with its timeout and the re-bound secret.
 	if insertArgs[0] != snap.ID || *insertArgs[5].(*int32) != 600 {
@@ -141,10 +149,6 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 	}
 	if injectedJWT == "" || injected["KEY_9"] != "x" {
 		t.Errorf("injected env %v with jwt %q; want the request's env var and a JWT for the binding", injected, injectedJWT)
-	}
-	// Inherited egress rules are applied before the sandbox is handed over.
-	if !hasString(pushedAllow, "10.0.0.0/8") || !hasString(pushedDomains, "api.openai.com") || len(pushedDeny) != 0 {
-		t.Errorf("pushed rules = (%v, %v, %v); want the snapshot's", pushedAllow, pushedDeny, pushedDomains)
 	}
 	body := parseJSON(t, w)
 	if body["source_snapshot_id"] != snap.ID.String() || body["timeout_seconds"].(float64) != 600 || body["status"] != "active" {
@@ -186,11 +190,7 @@ func TestCreateSandbox_FromSnapshotRequestOverridesInheritance(t *testing.T) {
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
-	var pushedAllow []string
-	vmd := &stubVMD{updateNetworkFn: func(_ context.Context, _ string, allow, _, _ []string) error {
-		pushedAllow = allow
-		return nil
-	}}
+	vmd := &stubVMD{}
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
 	body := fmt.Sprintf(`{"name":"fork","from_snapshot":%q,"timeout_seconds":60,"network":{"allow_out":["1.1.1.1"]},"env_vars":{"KEY_0":"mine"}}`, snap.ID)
@@ -204,8 +204,8 @@ func TestCreateSandbox_FromSnapshotRequestOverridesInheritance(t *testing.T) {
 	if !secretsLookedUp || len(insertArgs[8].([]uuid.UUID)) != 0 {
 		t.Errorf("bound secrets = %v; the request's KEY_0 env var wins over the inherited binding", insertArgs[8])
 	}
-	if len(pushedAllow) != 1 || pushedAllow[0] != "1.1.1.1/32" {
-		t.Errorf("pushed allow = %v; want the request's rules over the snapshot's", pushedAllow)
+	if e := vmd.restoreLimits.Egress; e == nil || len(e.AllowedCIDRs) != 1 || e.AllowedCIDRs[0] != "1.1.1.1/32" || len(e.AllowedDomains) != 0 {
+		t.Errorf("restore egress = %+v; want the request's rules over the snapshot's", e)
 	}
 }
 
@@ -329,6 +329,87 @@ func TestCreateSandbox_FromSnapshotRefusesTooManyBindingsBeforeBoot(t *testing.T
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(fmt.Sprintf(`{"name":"fork","from_snapshot":%q,"secrets":{"EXTRA":"extra"}}`, snap.ID)))
 	if w.Code != http.StatusBadRequest || booted {
 		t.Fatalf("status = %d booted = %v; want 400 before any boot: %s", w.Code, booted, w.Body.String())
+	}
+}
+
+// A vmd that cannot install a fork's rules before its workload runs leaves
+// nothing safe to hand over: the fork is torn down, not activated.
+func TestCreateSandbox_FromSnapshotFailsWhenTheHostCannotInstallItsRules(t *testing.T) {
+	teamID := uuid.New()
+	snap := readySnapshotFixture(teamID)
+	var failed bool
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandboxSnapshot :one"):
+				return sandboxSnapshotRow(snap)
+			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
+				return sandboxRow(db.Sandbox{ID: args[2].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 2048})
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "-- name: UpdateSandboxStatus") {
+				failed = true
+			}
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	var destroyed bool
+	vmd := &stubVMD{
+		restoreIgnoresRules: true,
+		destroyFn: func(context.Context, string, bool) error {
+			destroyed = true
+			return nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(fmt.Sprintf(`{"name":"fork","from_snapshot":%q}`, snap.ID)))
+	if w.Code != http.StatusServiceUnavailable || !destroyed || !failed {
+		t.Fatalf("status = %d destroyed = %v failed = %v; want 503 with the fork torn down: %s", w.Code, destroyed, failed, w.Body.String())
+	}
+}
+
+// A source's proxy settings stay in the guest's environment. A fork left
+// with no secrets bound has them cleared, or every HTTPS request it makes
+// would go to the proxy with credentials that are not its own.
+func TestCreateSandbox_FromSnapshotClearsProxySettingsWhenNoSecretsRemain(t *testing.T) {
+	teamID := uuid.New()
+	snap := readySnapshotFixture(teamID, uuid.New())
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandboxSnapshot :one"):
+				return sandboxSnapshotRow(snap)
+			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
+				return sandboxRow(db.Sandbox{ID: args[2].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 2048})
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	var injected map[string]string
+	vmd := &stubVMD{injectEnvFn: func(_ context.Context, _ string, env map[string]string, _ string) error {
+		injected = env
+		return nil
+	}}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	// The source's one secret has since been deleted.
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(fmt.Sprintf(`{"name":"fork","from_snapshot":%q}`, snap.ID)))
+	h.WaitAsyncBookkeeping()
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d; body: %s", w.Code, w.Body.String())
+	}
+	if v, ok := injected["HTTPS_PROXY"]; !ok || v != "" {
+		t.Fatalf("injected env = %v; want HTTPS_PROXY cleared", injected)
 	}
 }
 

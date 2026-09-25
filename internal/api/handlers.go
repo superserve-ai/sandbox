@@ -1076,7 +1076,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 			fctx, fcancel := context.WithTimeout(bootCtx, vmdBootTimeout)
 			// The echo is not consulted here: the post-restore policy reapply
 			// below is this path's attestation.
-			ipAddress, actualVcpu, actualMemMiB, _, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil,
+			ipAddress, actualVcpu, actualMemMiB, _, _, err = vmd.RestoreSnapshot(fctx, sandboxID.String(), snapshotPath, memPath, resumeBasePath, "", sandbox.TeamID.String(), ownerIDFromContext(c), resumeVMDAccess, resumePolicy.vmdPorts(), resumePolicy.Revision, nil,
 				// The row is authoritative for a sandbox that already
 				// exists; declaring it spares the daemon a probe.
 				vmdclient.ResourceLimits{VCPU: uint32(sandbox.VcpuCount), MemoryMiB: uint32(sandbox.MemoryMib)})
@@ -3170,6 +3170,16 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// scoped to the request context so that if the client hangs up, it is
 	// cancelled and VMD cleans up.
 	envVarsToShip := mergeEnvVarsWithSecrets(req.EnvVars, secretMeta)
+	// A fork keeps its source's environment, proxy settings included; with
+	// no secret bound here they name credentials this sandbox cannot use.
+	if _, set := req.EnvVars["HTTPS_PROXY"]; !set && len(secretMeta) == 0 && snapshotHadSecrets(source) {
+		shipped := make(map[string]string, len(envVarsToShip)+1)
+		for k, v := range envVarsToShip {
+			shipped[k] = v
+		}
+		shipped["HTTPS_PROXY"] = ""
+		envVarsToShip = shipped
+	}
 
 	// Phase 1: RestoreSnapshot boots the VM with the caller's env vars and
 	// returns its source IP. For sandboxes with secrets, a follow-up
@@ -3180,16 +3190,24 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// overwrites the capture with the attempt that produced the returned VM.
 	var previewProtocol string
 	var savedSnapshotID string
+	var restoreEgress *vmdclient.EgressRules
 	if sourceSnapshotID != uuid.Nil {
 		savedSnapshotID = sourceSnapshotID.String()
+		// The fork resumes the workload it was captured with, so its rules
+		// go in before the guest runs, not after.
+		if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+			allowedCIDRs, deniedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)
+			restoreEgress = &vmdclient.EgressRules{AllowedCIDRs: allowedCIDRs, DeniedCIDRs: deniedCIDRs, AllowedDomains: allowedDomains}
+		}
 	}
+	var rulesApplied bool
 	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), hostID, func(ctx context.Context) (string, uint32, uint32, error) {
-		ip, vcpu, memMiB, protocol, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars,
+		ip, vcpu, memMiB, protocol, applied, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars,
 			// Same shape the sandbox row is being inserted with (the
 			// image's, or the defaults) — declared so the daemon
 			// never has to ask Firecracker for it afterwards.
-			vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB), SavedSnapshotID: savedSnapshotID})
-		previewProtocol = protocol
+			vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB), SavedSnapshotID: savedSnapshotID, Egress: restoreEgress})
+		previewProtocol, rulesApplied = protocol, applied
 		return ip, vcpu, memMiB, err
 	})
 	tVmdEnd = time.Now()
@@ -3364,6 +3382,15 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 
+	// A fork's workload already ran; a vmd that could not install its rules
+	// first leaves nothing safe to hand over.
+	if restoreEgress != nil && !rulesApplied {
+		l.Error().Msg("vmd did not install a fork's egress rules before its workload ran")
+		h.failSandboxAfterBoot(postCtx, vmd, sandbox.ID, teamID, sandboxID.String(), hostID)
+		respondErrorMsg(c, "host_not_ready", "the snapshot's host cannot apply network rules to a sandbox created from a snapshot yet; retry later", http.StatusServiceUnavailable)
+		return
+	}
+
 	// Persist egress rules before injecting the env, so the secrets proxy's live
 	// rule fetch sees them before the agent can issue a proxied request. The
 	// nftables push happens later (it needs the booted VM); the DB write does not.
@@ -3433,7 +3460,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// This runs before the row goes active, and a failure tears the VM down.
 	// A sandbox that boots without the egress policy it was asked for would
 	// otherwise run with the default allow-all and still report success.
-	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) && !rulesApplied {
 		// network_config was persisted above (before env injection); this
 		// only pushes the nftables rules, which need the booted VM.
 		allowedCIDRs, deniedCIDRs, allowedDomains, _ := egressConfigJSON(req.Network)

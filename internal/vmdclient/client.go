@@ -19,6 +19,14 @@ type ResourceLimits struct {
 	// restore then passes no files of its own, and the sizes must be the
 	// snapshot's.
 	SavedSnapshotID string
+	// Egress, when set, is installed before the guest runs; the restore
+	// reports whether it was.
+	Egress *EgressRules
+}
+
+// EgressRules are a sandbox's outbound rules, split as vmd applies them.
+type EgressRules struct {
+	AllowedCIDRs, DeniedCIDRs, AllowedDomains []string
 }
 
 // SavedSnapshot is what a host reports for a committed saved snapshot: the
@@ -112,7 +120,7 @@ type Client interface {
 	// Firecracker, so a daemon told nothing has to ask Firecracker
 	// afterwards to describe its own host honestly. Declaring it here
 	// keeps that probe off the create path entirely.
-	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits ResourceLimits) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, err error)
+	RestoreSnapshot(ctx context.Context, instanceID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits ResourceLimits) (ipAddress string, actualVcpu, actualMemMiB uint32, previewProtocol string, rulesApplied bool, err error)
 	// InjectSandboxEnv pushes env vars and the optional secrets JWT into a
 	// running sandbox's boxd. Idempotent.
 	InjectSandboxEnv(ctx context.Context, instanceID string, envVars map[string]string, secretsJWT string) error
