@@ -47,6 +47,16 @@ class ProxyRevisionTests(unittest.TestCase):
                        'RUN_METADATA': json.dumps(dict(metadata, path='.github/workflows/other.yml'))}, False),
                      ({'REQUESTED_REVISION': unreviewed, 'REQUESTED_ROLLOUT_ID': '123',
                        'RUN_METADATA': json.dumps(dict(metadata, head_sha=unreviewed))}, False)]
+            staging_validation = dict(CURRENT_REF='refs/heads/unreviewed', CURRENT_SHA=unreviewed,
+                                      DEPLOY_EVENT='workflow_dispatch', VALIDATION_ENVIRONMENT='staging',
+                                      PROXY_DEPLOYMENT_MODE='legacy')
+            cases.extend([
+                (staging_validation, True),
+                (dict(staging_validation, VALIDATION_ENVIRONMENT='production'), False),
+                (dict(staging_validation, PROXY_DEPLOYMENT_MODE='generation'), False),
+                (dict(staging_validation, DEPLOY_EVENT='push'), False),
+                (dict(staging_validation, REQUESTED_REVISION=approved, REQUESTED_ROLLOUT_ID='123'), False),
+            ])
             for override, success in cases:
                 with self.subTest(override=override):
                     (root / 'output').unlink(missing_ok=True)
@@ -54,7 +64,8 @@ class ProxyRevisionTests(unittest.TestCase):
                                             env=dict(env, **override), capture_output=True, text=True)
                     self.assertEqual(result.returncode == 0, success, result.stderr)
                     if success:
-                        self.assertEqual((root / 'output').read_text(), f'revision={approved}\n')
+                        expected_revision = unreviewed if override == staging_validation else approved
+                        self.assertEqual((root / 'output').read_text(), f'revision={expected_revision}\n')
                     else:
                         self.assertFalse((root / 'output').exists())
         self.assertEqual(workflow.count('ref: ${{ needs.migration-gate.outputs.revision }}'), 2)

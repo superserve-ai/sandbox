@@ -84,6 +84,6 @@ systemctl() {
 
     def test_checks_are_wired_before_mutation_and_socket_activation(self):
         self.assertLess(SOURCE.index('legacy_vmd_enrollment() +'), SOURCE.index('# Fresh-host env bootstrap:'))
-        self.assertLess(SOURCE.index('                retire_legacy_vmd'), SOURCE.index('# Extract the deploy bundle'))
+        self.assertLess(SOURCE.index('                retire_legacy_vmd'), SOURCE.index('# Install vmd + template-builder binaries.'))
         gate = SOURCE.index('                require_vmd_ports_free', SOURCE.index('                restart_secretsproxy'))
         self.assertLess(gate, SOURCE.index('sudo rm -f /etc/systemd/system/superserve-vmd.socket.d/05-fresh-runtime.conf'))

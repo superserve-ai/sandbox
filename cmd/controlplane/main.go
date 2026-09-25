@@ -16,6 +16,7 @@ import (
 	"time"
 
 	kms "cloud.google.com/go/kms/apiv1"
+	"cloud.google.com/go/storage"
 	"github.com/getsentry/sentry-go"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,6 +30,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/abuse"
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	dbq "github.com/superserve-ai/sandbox/internal/db"
@@ -301,7 +303,8 @@ func run() error {
 	})
 	computeSource.Refresh(ctx)
 	handlers.ComputeRestrictions = &abuse.ComputeEvaluator{Source: computeSource}
-	go computeSource.Run(ctx)
+	handlers.SignupRestrictions = &abuse.SignupEvaluator{Source: computeSource}
+	go handlers.RunComputeReconciliation(ctx, computeSource)
 
 	router := api.SetupRouter(ctx, handlers, dbPool)
 
@@ -348,39 +351,29 @@ func run() error {
 	// through pending → building → snapshotting → ready/failed by calling
 	// vmd's BuildTemplate / GetBuildStatus / CancelBuild RPCs.
 	buildResolver := func(rctx context.Context, hostID string) (vmdclient.Client, error) {
-		if hostID == "" || handlers.Hosts == nil {
-			return vmdClient, nil
+		if hostID == "" {
+			return nil, supervisor.ErrBuildHostGone
 		}
 		c, err := handlers.Hosts.ClientFor(rctx, hostID)
-		if err != nil {
-			// Bootstrap parity: an unpopulated host table is a supported
-			// mode — buildHostAccepting and TryDispatchBuild both let a
-			// build dispatch when the default host's row is missing, and
-			// this resolver must agree or the just-claimed build is marked
-			// permanently failed right after those gates passed. Only the
-			// CONFIGURED DEFAULT id keeps that fallback; any other id with
-			// a missing row stays a hard error — a recorded build host
-			// that vanished must never silently reroute to a machine that
-			// never ran the build.
-			if errors.Is(err, pgx.ErrNoRows) && hostID == cfg.DefaultHostID {
-				log.Warn().Str("host_id", hostID).
-					Msg("supervisor: default host row missing (bootstrap mode); using configured default client")
-				return vmdClient, nil
-			}
-			if errors.Is(err, pgx.ErrNoRows) {
-				// Missing non-default registration: terminal, never
-				// retryable without operator action.
-				return nil, fmt.Errorf("build host %q not registered: %w", hostID, supervisor.ErrBuildHostGone)
-			}
-			return nil, fmt.Errorf("resolve build host %q: %w", hostID, err)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, supervisor.ErrBuildHostGone
 		}
-		return c, nil
+		return c, err
 	}
-	supervisor.NewBuildSupervisor(
-		supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID),
-		queries,
-		buildResolver,
-	).WithAnalytics(analyticsClient).WithFinalizeHook(api.InvalidateTemplateCache).Start(ctx)
+	buildCfg := supervisor.DefaultBuildSupervisorConfig(cfg.DefaultHostID)
+	buildCfg.Cell = cfg.TemplateBuildRegion
+	buildCfg.PublicationBucket = cfg.TemplateBackupBucket
+	buildSupervisor := supervisor.NewBuildSupervisor(buildCfg, queries, buildResolver).
+		WithAnalytics(analyticsClient).WithFinalizeHook(api.InvalidateTemplateCache)
+	if cfg.TemplateBackupBucket != "" {
+		storageClient, err := storage.NewClient(ctx)
+		if err != nil {
+			return fmt.Errorf("initialize template publication reader: %w", err)
+		}
+		defer storageClient.Close()
+		buildSupervisor.WithPublicationStore(backup.NewGCSReader(storageClient, cfg.TemplateBackupBucket))
+	}
+	buildSupervisor.Start(ctx)
 
 	// Launch the host health detector. Marks active hosts as unhealthy
 	// when their VMD heartbeat goes stale (>2 min). The scheduler
@@ -931,6 +924,7 @@ func (c *grpcVMDClient) streamBuildLogsOnce(ctx context.Context, buildVMID strin
 		}
 		delivered = true
 		if cbErr := onEvent(vmdclient.BuildLogEvent{
+			Sequence:           pbEv.GetSequence(),
 			TimestampUnixNanos: pbEv.GetTimestampUnixNanos(),
 			Stream:             pbEv.GetStream(),
 			Text:               pbEv.GetText(),

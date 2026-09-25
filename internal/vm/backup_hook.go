@@ -294,10 +294,7 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 			return manifest
 		}
 		stageStart := time.Now()
-		dir, staged, err := backup.StagePending(ctx, m.pauseStagingRoot, vmID, pb.Token, diskBasePath, map[string]string{
-			"vmstate.snap": snapshotPath,
-			"rootfs.ext4":  diskPath,
-		})
+		dir, staged, err := backup.StagePending(ctx, m.pauseStagingRoot, vmID, pb.Token, diskBasePath, pauseFiles(snapshotPath, diskPath, diskBasePath))
 		m.backupMetrics.RecordStageDuration(ctx, time.Since(stageStart))
 		if err == nil {
 			pb.OrigSnapshotPath = snapshotPath
@@ -687,10 +684,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 		m.healPendingBackup(pb, log)
 		return
 	}
-	finalPaths, err := backup.FinishPendingStage(pb.StagedDir, gen, map[string]string{
-		"vmstate.snap": pb.SnapshotPath,
-		"rootfs.ext4":  pb.DiskPath,
-	})
+	finalPaths, err := backup.FinishPendingStage(pb.StagedDir, gen, pauseFiles(pb.SnapshotPath, pb.DiskPath, pb.DiskBasePath))
 	if err != nil {
 		log.Warn().Err(err).Str("vm_id", pb.VMID).
 			Msg("staged pause backup: rename to generation failed; keeping pending record")
@@ -709,13 +703,9 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 	// finds the destination already there and does no actual I/O.
 	uploadPaths := finalPaths
 	if m.backupStaging != "" {
-		promoted := &backup.Task{
-			SandboxID:  pb.VMID,
-			Generation: gen,
-			Files: []backup.TaskFile{
-				{Name: "vmstate.snap", Path: finalPaths["vmstate.snap"]},
-				{Name: "rootfs.ext4", Path: finalPaths["rootfs.ext4"]},
-			},
+		promoted := &backup.Task{SandboxID: pb.VMID, Generation: gen}
+		for name, path := range finalPaths {
+			promoted.Files = append(promoted.Files, backup.TaskFile{Name: name, Path: path})
 		}
 		if err := backup.StageTask(m.backupStaging, promoted); err != nil {
 			log.Warn().Err(err).Str("vm_id", pb.VMID).
@@ -816,6 +806,17 @@ func (m *Manager) reusablePendingBackup(vmID, snapshotPath string) (PendingBacku
 		return PendingBackup{}, false
 	}
 	return prev, true
+}
+
+// pauseFiles names the pause artifacts to stage by their manifest names:
+// the pair a restore needs, plus the overlay block map when the snapshot
+// saved one.
+func pauseFiles(snapshotPath, diskPath, basePath string) map[string]string {
+	files := map[string]string{"vmstate.snap": snapshotPath, "rootfs.ext4": diskPath}
+	if p := overlayBlockMapPath(snapshotPath); basePath != "" && statRegularFile(p) {
+		files[backup.BlockMapName] = p
+	}
+	return files
 }
 
 // resolveStagedLocation handles the crash window between the marker
@@ -1433,8 +1434,12 @@ func rebuildTask(vmID string, manifest []ManifestEntry, prio backup.Priority, pa
 // owns retrying a failed write. Template builds ride the checkpoint
 // priority: a template is rebuildable, so a multi-GiB build upload must
 // never head-of-line block a pause generation, which is unique user data.
-func (m *Manager) enqueueTemplateBackup(templateID, buildID string, manifest []ManifestEntry) bool {
+func (m *Manager) enqueueTemplateBackup(templateID, buildID, snapshotDir string, manifest []ManifestEntry) bool {
 	if m.backupEnqueue == nil || len(manifest) == 0 {
+		return false
+	}
+	runtime, err := readBuildMetaJSON(snapshotDir)
+	if err != nil {
 		return false
 	}
 	files := make([]backup.TaskFile, 0, len(manifest))
@@ -1446,13 +1451,17 @@ func (m *Manager) enqueueTemplateBackup(templateID, buildID string, manifest []M
 		// uploader also ship it as a shared bases/ object: the same bytes
 		// twice.
 		files = append(files, backup.TaskFile{
-			Name:   e.FileName,
+			Name:        e.FileName,
+			RuntimePath: e.Path, AllocatedBytes: e.AllocatedBytes,
 			Path:   e.Path,
 			SHA256: e.SHA256,
 			Size:   e.SizeBytes,
 		})
 	}
 	task := backup.Task{
+		BuildIncarnation: m.buildIncarnation,
+		TemplateRuntime: &backup.TemplateRuntime{RootfsPath: runtime.RootfsPath, SnapshotPath: runtime.SnapshotPath,
+			MemPath: runtime.MemFilePath, BasePath: runtime.BasePath, DeltaPath: runtime.DeltaPath, SizeBytes: runtime.SizeBytes},
 		TemplateID: templateID,
 		BuildID:    buildID,
 		Generation: backup.GenerationKey(files),

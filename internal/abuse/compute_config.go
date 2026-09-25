@@ -19,9 +19,10 @@ type computeConfig struct {
 	Mode         ComputeMode `json:"mode"`
 	TrustedTeams []uuid.UUID `json:"trusted_teams"`
 	Restrictions []struct {
-		SubjectType string    `json:"subject_type"`
-		SubjectID   uuid.UUID `json:"subject_id"`
-		Actions     []Action  `json:"actions"`
+		SubjectType  string     `json:"subject_type"`
+		SubjectID    *uuid.UUID `json:"subject_id"`
+		SubjectValue *string    `json:"subject_value"`
+		Actions      []Action   `json:"actions"`
 	} `json:"restrictions"`
 }
 
@@ -81,24 +82,26 @@ func (s *ConfigComputeSource) Refresh(ctx context.Context) {
 		s.result(ctx, "invalid_content")
 		return
 	}
-	snapshot := &ComputeSnapshot{mode: cfg.Mode, trusted: map[uuid.UUID]bool{}, teams: map[computeKey]bool{}, users: map[computeKey]bool{}}
+	snapshot := &ComputeSnapshot{mode: cfg.Mode, trusted: map[uuid.UUID]bool{}, teams: map[uuid.UUID]bool{}, users: map[uuid.UUID]bool{}, fingerprints: map[string]bool{}}
 	for _, id := range cfg.TrustedTeams {
 		snapshot.trusted[id] = true
 	}
-	userActions := map[uuid.UUID][]Action{}
+	userIDsSet := map[uuid.UUID]bool{}
 	for _, r := range cfg.Restrictions {
-		if r.SubjectType == "user" {
-			userActions[r.SubjectID] = append(userActions[r.SubjectID], r.Actions...)
+		if r.SubjectType == "fingerprint" {
+			snapshot.fingerprints[*r.SubjectValue] = true
 			continue
 		}
-		for _, action := range r.Actions {
-			snapshot.teams[computeKey{r.SubjectID, action}] = true
+		if r.SubjectType == "user" {
+			userIDsSet[*r.SubjectID] = true
+			continue
 		}
+		snapshot.teams[*r.SubjectID] = true
 	}
-	if len(userActions) > 0 && s.owners != nil {
+	if len(userIDsSet) > 0 && s.owners != nil {
 		ownerCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		userIDs := make([]uuid.UUID, 0, len(userActions))
-		for id := range userActions {
+		userIDs := make([]uuid.UUID, 0, len(userIDsSet))
+		for id := range userIDsSet {
 			userIDs = append(userIDs, id)
 		}
 		owners, err := s.owners(ownerCtx, userIDs)
@@ -108,8 +111,8 @@ func (s *ConfigComputeSource) Refresh(ctx context.Context) {
 		} else {
 			for team, ids := range owners {
 				for _, id := range ids {
-					for _, action := range userActions[id] {
-						snapshot.users[computeKey{team, action}] = true
+					if userIDsSet[id] {
+						snapshot.users[team] = true
 					}
 				}
 			}
@@ -163,13 +166,30 @@ func parseComputeConfig(data []byte) (computeConfig, error) {
 		}
 	}
 	for _, r := range cfg.Restrictions {
-		if (r.SubjectType != "team" && r.SubjectType != "user") || r.SubjectID == uuid.Nil || len(r.Actions) == 0 {
+		if len(r.Actions) == 0 {
 			return cfg, fmt.Errorf("invalid restriction")
 		}
-		for _, a := range r.Actions {
-			if a != ActionCreate && a != ActionResume {
-				return cfg, fmt.Errorf("invalid action")
+		switch r.SubjectType {
+		case "team", "user":
+			if r.SubjectID == nil || *r.SubjectID == uuid.Nil || r.SubjectValue != nil {
+				return cfg, fmt.Errorf("invalid restriction")
 			}
+			for _, a := range r.Actions {
+				if a != ActionCreate && a != ActionResume {
+					return cfg, fmt.Errorf("invalid action")
+				}
+			}
+		case "fingerprint":
+			if r.SubjectID != nil || r.SubjectValue == nil || !ValidFingerprint(*r.SubjectValue) {
+				return cfg, fmt.Errorf("invalid restriction")
+			}
+			for _, a := range r.Actions {
+				if a != ActionSignup {
+					return cfg, fmt.Errorf("invalid action")
+				}
+			}
+		default:
+			return cfg, fmt.Errorf("invalid restriction")
 		}
 	}
 	return cfg, nil

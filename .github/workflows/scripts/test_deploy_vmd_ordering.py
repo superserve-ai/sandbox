@@ -6,6 +6,7 @@ not a pure function; these assert on the rendered template text. Each test pins
 one property whose violation reintroduces the incident.
 """
 
+import ast
 import os
 import re
 import shlex
@@ -147,6 +148,43 @@ class DeployVmdOrderingTests(unittest.TestCase):
                     ["sh", "-c", query], env=env, capture_output=True, text=True
                 ).stdout
                 self.assertIn(expect, out, "exit=%d" % exit_code)
+
+
+class CapacityPressureDeployTests(unittest.TestCase):
+    def test_build_host_gets_explicit_address_before_restart(self):
+        start = SOURCE.index("# Build hosts must publish capacity pressure.")
+        end = SOURCE.index("# Upsert BACKUP_UPLOAD_CONCURRENCY", start)
+        block = ast.literal_eval('"""' + SOURCE[start:end] + '"""').format()
+        for bucket, expected in (("example-bucket", "VMD_ADVERTISE_ADDR=192.0.2.10:50052"),
+                                 ("", None)):
+            with self.subTest(bucket=bucket), tempfile.TemporaryDirectory() as d:
+                env_file = Path(d) / "vmd.env"
+                env_file.write_text(
+                    f"BACKUP_BUCKET={bucket}\nHOST_INTERFACE=eth0\nGRPC_PORT=50052\n"
+                    "VMD_ADVERTISE_ADDR=192.0.2.1:50051\n"
+                )
+                script = block.replace("/etc/sandbox/vmd.env", str(env_file))
+                prelude = '''set -euo pipefail
+sudo() { "$@"; }
+ip() {
+    if [ "$1" = -4 ] && [ "$2" = -o ]; then
+        echo '2: eth0 inet 192.0.2.10/24 brd 192.0.2.255 scope global eth0'
+    else
+        return 1
+    fi
+}
+'''
+                result = subprocess.run(
+                    ["bash", "-c", prelude + script], capture_output=True, text=True,
+                    env=_gnu_sed_env(d),
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                content = env_file.read_text()
+                if expected:
+                    self.assertIn(expected, content)
+                    self.assertEqual(content.count("VMD_ADVERTISE_ADDR="), 1)
+                else:
+                    self.assertIn("VMD_ADVERTISE_ADDR=192.0.2.1:50051", content)
 
 
 class BackupStagingDirRollbackTests(unittest.TestCase):

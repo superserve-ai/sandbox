@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.7.0"
+  required_version = ">= 1.9.0"
 
   backend "gcs" {
     bucket = "superserve-terraform-state-prod"
@@ -181,6 +181,8 @@ module "api" {
   cpu_idle = false
 
   env = {
+    COMPUTE_RESTRICTIONS_FILE = "${local.controlplane_secret_volumes.compute-restrictions.mount_path}/${local.controlplane_secret_volumes.compute-restrictions.path}"
+
     API_PORT               = "8080"
     EDGE_PROXY_DOMAIN      = "usw-sandbox.superserve.ai"
     SANDBOX_ID_REGION      = "usw"
@@ -188,6 +190,8 @@ module "api" {
     SECRETS_SIGNING_KEY_ID = "v1"
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "15"
+    TEMPLATE_BUILD_REGION  = local.region
+    BACKUP_BUCKET          = "superserve-artifact-backup-usw2"
     VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
 
@@ -215,7 +219,8 @@ module "api" {
     DEFAULT_HOST_ID = local.metrics_host_id
   }
 
-  secrets = local.controlplane_secrets
+  secrets        = local.controlplane_secrets
+  secret_volumes = local.controlplane_secret_volumes
 
   vpc_connector  = null
   vpc_egress     = "PRIVATE_RANGES_ONLY"
@@ -227,6 +232,7 @@ module "api" {
 
   depends_on = [
     google_secret_manager_secret_iam_member.controlplane_runtime_secrets,
+    google_secret_manager_secret_iam_member.controlplane_runtime_secret_volumes,
     google_kms_crypto_key_iam_member.controlplane_credentials,
     google_project_iam_member.controlplane_metric_writer,
     google_service_account_iam_member.controlplane_deploy_act_as,

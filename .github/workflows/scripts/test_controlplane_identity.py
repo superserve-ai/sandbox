@@ -56,12 +56,18 @@ class ControlplaneIdentityTest(unittest.TestCase):
             source = (root / 'main.tf').read_text()
             api = source.split('module "api" {', 1)[1].split('\n}', 1)[0]
             self.assertIn('service_account_email = google_service_account.controlplane_runtime.email', api)
-            self.assertIn('secrets = local.controlplane_secrets', api)
+            self.assertRegex(api, r'(?m)^\s*secrets\s*=\s*local\.controlplane_secrets\s*$')
+            self.assertRegex(api, r'(?m)^\s*secret_volumes\s*=\s*local\.controlplane_secret_volumes\s*$')
+            self.assertIn('COMPUTE_RESTRICTIONS_FILE = "${local.controlplane_secret_volumes.compute-restrictions.mount_path}/${local.controlplane_secret_volumes.compute-restrictions.path}"', api)
+            self.assertIn('google_secret_manager_secret_iam_member.controlplane_runtime_secret_volumes', api)
             self.assertIn('google_secret_manager_secret_iam_member.controlplane_runtime_secrets', api)
             self.assertIn('google_kms_crypto_key_iam_member.controlplane_credentials', api)
             self.assertIn('google_service_account_iam_member.controlplane_deploy_act_as', api)
             grants = (root / 'controlplane-identity.tf').read_text()
             self.assertIn('for config in values(local.controlplane_secrets) : config.secret', grants)
+            self.assertRegex(grants, r'secret\s*=\s*var\.compute_restrictions_secret_name')
+            self.assertRegex(grants, r'mount_path\s*=\s*"/etc/superserve"')
+            self.assertRegex(grants, r'path\s*=\s*"abuse-restrictions.json"')
             self.assertIn('OPERATOR_API_TOKEN = {', grants)
             self.assertIn('roles/secretmanager.secretAccessor', grants)
             self.assertIn('roles/cloudkms.cryptoKeyEncrypterDecrypter', grants)
@@ -85,6 +91,7 @@ class ControlplaneIdentityTest(unittest.TestCase):
                 command = probe.split('\n\n', 1)[0]
                 cell = re.search(r'control-plane-kms/(use4|usw2)"', command).group(1)
                 with self.subTest(workflow=workflow, cell=cell):
+                    self.assertIn('--secret "${TF_VAR_compute_restrictions_secret_name:?Set COMPUTE_RESTRICTIONS_SECRET_NAME}"', command)
                     self.assertIn(f'--secret operator-api-token-{cell} ', command)
                     other = 'usw2' if cell == 'use4' else 'use4'
                     self.assertNotIn(f'--secret operator-api-token-{other} ', command)

@@ -30,13 +30,14 @@ variable "proxy_generation_cells" {
 }
 
 module "proxy_generations" {
-  for_each        = var.proxy_generation_cells
-  source          = "../../../modules/proxy-lb"
-  project_id      = local.project_id
-  environment     = local.environment
-  region          = local.region
-  name            = "proxy-${each.key}"
-  generation_cell = each.value
+  for_each                                  = var.proxy_generation_cells
+  source                                    = "../../../modules/proxy-lb"
+  project_id                                = local.project_id
+  environment                               = local.environment
+  region                                    = local.region
+  name                                      = "proxy-${each.key}"
+  generation_cell                           = each.value
+  staging_project_wide_generation_endpoints = true
 }
 
 output "proxy_generation_bootstrap" {

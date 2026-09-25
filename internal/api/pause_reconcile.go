@@ -179,6 +179,9 @@ func (h *Handlers) reconcilePause(ctx context.Context, row db.ClaimPendingPauseR
 
 	l.Info().Msg("pause reconcile: sandbox paused")
 	RecordSandboxTransition(ctx, "reconcile_pause", telemetry.ResultSuccess, row.HostID, time.Since(started))
+	if trigger == "abuse" {
+		recordComputeReconciliation(ctx, "completed")
+	}
 	// Attributed to whoever asked for it; automatic pauses carry no actor.
 	var actor *uuid.UUID
 	if row.PauseOpActorID.Valid {

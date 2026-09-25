@@ -60,6 +60,11 @@ jobs:
           terraform -chdir=infra/modules/observability init -backend=false -input=false
           terraform -chdir=infra/modules/observability test
 
+      - name: Test proxy generation IAM and ownership
+        run: |
+          terraform -chdir=infra/modules/proxy-lb init -backend=false -input=false
+          terraform -chdir=infra/modules/proxy-lb test
+
       - name: Test Cloud IDS triage alerts with mocked provider
         run: |
           terraform -chdir=infra/modules/cloud-ids init -backend=false -input=false

@@ -1,6 +1,8 @@
 """Exercise manual selection and production step guards without cloud access."""
 
 import importlib.util
+import itertools
+import json
 import os
 from pathlib import Path
 import re
@@ -15,26 +17,52 @@ SCRIPTS = Path(__file__).parent
 
 
 class DeployTargetTests(unittest.TestCase):
+    def test_staging_migration_shares_proxy_deployment_queue(self):
+        workflow = (SCRIPTS.parent / 'terraform-rollout-staging.yml').read_text()
+        expression = re.search(r'^  group: \$\{\{ (.+) \}\}$', workflow, re.M)[1]
+        expression = expression.replace('&&', 'and').replace('||', 'or')
+        proxy_group = re.search(r'^  group: (.+)$', (SCRIPTS.parent / 'deploy-proxy.yml').read_text(), re.M)[1]
+        terraform_group = re.search(r'^  group: (.+)$', (SCRIPTS.parent / 'terraform-cd.yml').read_text(), re.M)[1]
+        for mode in ('', 'none', 'hold', 'cutover', 'rollback', 'release', 'abort', 'expedite-abort'):
+            actual = eval(expression, {'__builtins__': {}}, {'inputs': SimpleNamespace(proxy_migration=mode)})
+            self.assertEqual(actual, terraform_group if mode in ('', 'none', 'expedite-abort') else proxy_group, mode)
+
+    def test_staging_migration_conflicts_fail_before_authentication(self):
+        workflow = (SCRIPTS.parent / 'terraform-rollout-staging.yml').read_text()
+        for name in ('smoke', 'privateca-bootstrap', 'proxy-prepare', 'proxy-runtime-iam'):
+            job = re.split(r'^  [a-z][a-z-]*:\n', workflow.split(f'  {name}:\n', 1)[1],
+                           maxsplit=1, flags=re.M)[0]
+            script = job.split('        run: |\n', 1)[1].split('\n      - uses:', 1)[0]
+            for mode in ('hold', 'cutover', 'rollback', 'release', 'abort', 'expedite-abort'):
+                result = subprocess.run(['bash', '-eu', '-c', script], capture_output=True,
+                                        env=dict(os.environ, CONFIRM='smoke' if name == 'smoke' else 'apply',
+                                                 PRIVATECA_BOOTSTRAP='false', PROXY_PREPARE='false',
+                                                 PROXY_RUNTIME_IAM='false', PROXY_MIGRATION=mode))
+                self.assertNotEqual(result.returncode, 0, (name, mode))
+
     def test_staging_smoke_selection_excludes_infrastructure_jobs(self):
         workflow = (SCRIPTS.parent / 'terraform-rollout-staging.yml').read_text()
         jobs = {}
-        for name in ('smoke', 'privateca-bootstrap', 'staging'):
+        for name in ('smoke', 'privateca-bootstrap', 'proxy-prepare', 'proxy-runtime-iam', 'proxy-migration', 'staging'):
             job = re.split(r'^  [a-z][a-z-]*:\n', workflow.split(f'  {name}:\n', 1)[1],
                            maxsplit=1, flags=re.M)[0]
             jobs[name] = job
-        for smoke in (False, True):
-            for bootstrap in (False, True):
-                with self.subTest(smoke=smoke, bootstrap=bootstrap):
-                    selected = []
-                    for name, job in jobs.items():
-                        guard = re.search(r'^    if: \$\{\{ (.+) \}\}$', job, re.M)[1]
-                        guard = guard.replace('&&', 'and').replace('!', 'not ')
-                        if eval(guard, {'__builtins__': {}},
-                                {'inputs': SimpleNamespace(smoke_only=smoke,
-                                                           privateca_bootstrap=bootstrap)}):
-                            selected.append(name)
-                    expected = 'smoke' if smoke else 'privateca-bootstrap' if bootstrap else 'staging'
-                    self.assertEqual(selected, [expected])
+        for smoke, bootstrap, proxy, runtime, migration in itertools.product((False, True), (False, True), (False, True), (False, True), ('none', 'hold', 'cutover', 'rollback', 'release', 'abort')):
+            with self.subTest(smoke=smoke, bootstrap=bootstrap, proxy=proxy, runtime=runtime):
+                selected = []
+                for name, job in jobs.items():
+                    guard = re.search(r'^    if: \$\{\{ (.+) \}\}$', job, re.M)[1]
+                    guard = guard.replace('&&', 'and').replace('!=', '<>').replace('!', 'not ').replace('<>', '!=')
+                    if eval(guard, {'__builtins__': {}},
+                            {'inputs': SimpleNamespace(smoke_only=smoke,
+                                                       privateca_bootstrap=bootstrap,
+                                                       proxy_prepare=proxy,
+                                                       proxy_runtime_iam=runtime,
+                                                       proxy_migration=migration)}):
+                        selected.append(name)
+                expected = ('smoke' if smoke else 'privateca-bootstrap' if bootstrap
+                            else 'proxy-prepare' if proxy else 'proxy-runtime-iam' if runtime else 'proxy-migration' if migration != 'none' else 'staging')
+                self.assertEqual(selected, [expected])
         self.assertIn('environment: staging', jobs['smoke'])
         self.assertIn('secrets.SS_TEST_API_KEY_STAGING', jobs['smoke'])
         self.assertNotIn('id-token:', jobs['smoke'])
@@ -46,16 +74,105 @@ class DeployTargetTests(unittest.TestCase):
         job = workflow.split('  smoke:\n', 1)[1].split('  privateca-bootstrap:\n', 1)[0]
         script = job.split('        run: |\n', 1)[1].split('\n      - uses:', 1)[0]
         for confirm in ('smoke', 'apply', '', 'invalid'):
-            for bootstrap in ('true', 'false'):
-                with self.subTest(confirm=confirm, bootstrap=bootstrap):
+            for bootstrap, proxy, runtime in itertools.product(('true', 'false'), repeat=3):
+                with self.subTest(confirm=confirm, bootstrap=bootstrap, proxy=proxy):
                     result = subprocess.run(['bash', '-eu', '-c', script],
                                             capture_output=True, text=True,
                                             env=dict(os.environ, CONFIRM=confirm,
-                                                     PRIVATECA_BOOTSTRAP=bootstrap))
+                                                     PRIVATECA_BOOTSTRAP=bootstrap,
+                                                     PROXY_PREPARE=proxy, PROXY_RUNTIME_IAM=runtime, PROXY_MIGRATION="none"))
                     self.assertEqual(result.returncode == 0,
-                                     confirm == 'smoke' and bootstrap == 'false')
+                                     confirm == 'smoke' and bootstrap == proxy == runtime == 'false')
 
-    def test_frontend_owning_states_require_bootstrap_before_automatic_apply(self):
+    def test_privateca_bootstrap_rejects_proxy_preparation(self):
+        workflow = (SCRIPTS.parent / 'terraform-rollout-staging.yml').read_text()
+        job = workflow.split('  privateca-bootstrap:\n', 1)[1].split('  proxy-prepare:\n', 1)[0]
+        script = job.split('        run: |\n', 1)[1].split('\n      - uses:', 1)[0]
+        for confirm, proxy, runtime in itertools.product(('apply', 'smoke', ''), ('true', 'false'), ('true', 'false')):
+            result = subprocess.run(['bash', '-eu', '-c', script], capture_output=True,
+                                    env=dict(os.environ, CONFIRM=confirm, PROXY_PREPARE=proxy, PROXY_RUNTIME_IAM=runtime, PROXY_MIGRATION="none"))
+            self.assertEqual(result.returncode == 0, confirm == 'apply' and proxy == runtime == 'false')
+
+    def test_proxy_preparation_plan_guards_reject_unrelated_changes(self):
+        workflow = (SCRIPTS.parent / 'terraform-rollout-staging.yml').read_text()
+        job = workflow.split('  proxy-prepare:\n', 1)[1].split('  staging:\n', 1)[0]
+        self.assertIn('environment: staging', job)
+        self.assertNotIn('smoke-test-region.sh', job)
+        self.assertNotIn('terraform -chdir=infra/envs/production', job)
+        self.assertLess(job.index('terraform apply -input=false -lock-timeout=5m role-plan'),
+                        job.index('- name: Wait for role-management permissions'))
+        self.assertLess(job.index('- name: Wait for role-management permissions'),
+                        job.index('terraform plan -input=false -lock-timeout=5m "${targets[@]}"'))
+        targets_script = job.split('          targets=()', 1)[1].split('          terraform plan', 1)[0]
+        targets_result = subprocess.run(['bash', '-eu', '-c', 'targets=()\n' + targets_script + '\nprintf "%s\\n" "${targets[@]}"'],
+                                        capture_output=True, text=True, check=True)
+        targets = targets_result.stdout.splitlines()
+        self.assertEqual(len(targets), 10)
+        self.assertNotIn('-target=module.proxy_generations["staging"].google_project_iam_member.generation', targets)
+        self.assertIn('-target=module.proxy_generations["staging"].google_project_iam_custom_role.generation', targets)
+        self.assertNotIn('-target=module.proxy_generations', targets)
+        script = job.split('- name: Apply CI role-management grant', 1)[1]
+        role_guard = script.split("jq -e --arg target \"$target\" '", 1)[1].split("\n          '", 1)[0]
+        proxy_guard = script.split("terraform show -json proxy-plan | jq -e '", 1)[1].split("\n          '", 1)[0]
+        role_guard = role_guard.replace('rayai-dev', 'example-project').replace(
+            'superserve-github-actions', 'example-deployer')
+        proxy_guard = proxy_guard.replace('rayai-dev', 'example-project')
+        target = 'module.iam.google_project_iam_member.project_bindings["cd_role_admin"]'
+        grant = dict(address=target, type='google_project_iam_member',
+                     change=dict(actions=['create'], after=dict(
+                         project='example-project', role='roles/iam.roleAdmin', condition=[],
+                         member='serviceAccount:example-deployer@example-project.iam.gserviceaccount.com')))
+
+        def accepted(guard, changes):
+            result = subprocess.run(['jq', '-e', '--arg', 'target', target, guard],
+                                    input=json.dumps(dict(resource_changes=changes)),
+                                    capture_output=True, text=True)
+            return result.returncode == 0
+
+        self.assertTrue(accepted(role_guard, [grant]))
+        self.assertTrue(accepted(role_guard, []))
+        for key, value in (
+            ('project', 'example-production'), ('role', 'roles/owner'),
+            ('member', 'user:operator@example.com'), ('condition', [{'expression': 'true'}]),
+        ):
+            changed = json.loads(json.dumps(grant))
+            changed['change']['after'][key] = value
+            self.assertFalse(accepted(role_guard, [changed]), key)
+        for actions in (['delete'], ['update'], ['delete', 'create']):
+            changed = json.loads(json.dumps(grant))
+            changed['change']['actions'] = actions
+            self.assertFalse(accepted(role_guard, [changed]), actions)
+        unrelated = json.loads(json.dumps(grant))
+        unrelated['address'] = 'google_project_iam_member.unrelated'
+        self.assertFalse(accepted(role_guard, [unrelated]))
+
+        generation = dict(address='module.proxy_generations["staging"].google_project_iam_custom_role.generation[0]',
+                          type='google_project_iam_custom_role',
+                          change=dict(actions=['create'], after=dict(project='example-project')))
+        self.assertTrue(accepted(proxy_guard, [generation]))
+        endpoint_binding = dict(address='module.proxy_generations["staging"].google_project_iam_member.generation[0]',
+                                type='google_project_iam_member',
+                                change=dict(actions=['create'], after=dict(project='example-project', condition=[])))
+        self.assertFalse(accepted(proxy_guard, [endpoint_binding]))
+        endpoint_binding['change']['actions'] = ['no-op']
+        self.assertTrue(accepted(proxy_guard, [endpoint_binding]))
+        for address, project, actions in (
+            ('google_compute_url_map.proxy', 'example-project', ['create']),
+            (generation['address'], 'example-production', ['create']),
+            (generation['address'], 'example-project', ['update']),
+            (generation['address'], 'example-project', ['delete']),
+        ):
+            changed = dict(address=address, type=generation['type'],
+                           change=dict(actions=actions, after=dict(project=project)))
+            self.assertFalse(accepted(proxy_guard, [changed]))
+        bucket = dict(address='module.proxy_generations["staging"].google_storage_bucket_iam_member.generation_ownership[0]',
+                      type='google_storage_bucket_iam_member',
+                      change=dict(actions=['create'], after=dict(bucket='example-project-proxy-staging-ownership')))
+        self.assertTrue(accepted(proxy_guard, [bucket]))
+        bucket['change']['after']['bucket'] = 'example-unrelated-bucket'
+        self.assertFalse(accepted(proxy_guard, [bucket]))
+
+    def test_frontend_owning_states_keep_migration_explicit(self):
         workflow = (SCRIPTS.parent / 'terraform-cd.yml').read_text()
         deploy = (SCRIPTS.parent / 'deploy-proxy.yml').read_text()
         for name, gate in (
@@ -70,7 +187,7 @@ class DeployTargetTests(unittest.TestCase):
                     result = subprocess.run(['bash', '-eu', '-c', guard],
                                             capture_output=True, text=True,
                                             env=dict(os.environ, PROXY_FRONTEND_MIGRATED=value))
-                    self.assertEqual(result.returncode, 0 if value == 'true' else 1)
+                    self.assertEqual(result.returncode, 0)
         for state in ('staging/us-central1', 'production/us-east4', 'production/us-west2'):
             with self.subTest(bootstrap_output=state):
                 generations = (SCRIPTS.parent.parent.parent / 'infra' / 'envs' / state
@@ -188,7 +305,7 @@ class DeployTargetTests(unittest.TestCase):
                 load, deploy = steps[index - 1:index + 1]
                 load_guard = re.search(r'^        if: (.+)$', load, re.M).group(1)
                 deploy_guard = re.search(r'^        if: (.+)$', deploy, re.M).group(1)
-                self.assertEqual(load_guard, deploy_guard)
+                self.assertEqual(load_guard, "env.PROXY_DEPLOYMENT_MODE == 'generation' && (" + deploy_guard + ")")
                 root = f'infra/envs/production/{region}'
                 self.assertIn(f'terraform -chdir={root} init -input=false', load)
                 self.assertIn(f'terraform -chdir={root} output -json |', load)
@@ -426,6 +543,7 @@ class DeployTargetTests(unittest.TestCase):
                     for ready in ('', 'false', 'true', 'TRUE', '1', 'tru', ' true '):
                         with self.subTest(kind=kind, event=event, environment=environment, ready=ready):
                             context = dict(
+                                needs={'migration-gate': SimpleNamespace(outputs=SimpleNamespace(mode='generation'))},
                                 github=SimpleNamespace(event_name=event, event=SimpleNamespace(
                                     inputs=SimpleNamespace(environment=environment))),
                                 vars=SimpleNamespace(

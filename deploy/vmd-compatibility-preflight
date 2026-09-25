@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Check retained and incoming compatibility floors before installing VMD.
+
+Only rollback/floor guards follow the read-only candidate-path contract. Other
+ExecStartPre hooks may mutate host state and must never run during preflight.
+The service's startup guards remain authoritative if state changes afterward.
+"""
+
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+
+GUARD_NAME = r"vmd-(?:rollback|[a-z0-9-]+-floor)-guard"
+RESIDENT_DIR = Path("/usr/local/bin")
+DROPIN_DIR = Path("/etc/systemd/system/superserve-vmd.service.d")
+
+
+def entries(directory, optional=False):
+    try:
+        directory.lstat()
+    except FileNotFoundError:
+        if optional:
+            return []
+        raise
+    # A dangling directory symlink, unreadable directory, or failed listing is
+    # not an old host without guards. Propagate every inspection failure.
+    return list(directory.iterdir())
+
+
+def require_file(path, executable=False):
+    if not stat.S_ISREG(path.stat().st_mode) or not os.access(
+        path, os.R_OK | (os.X_OK if executable else 0)
+    ):
+        kind = "readable executable" if executable else "readable"
+        raise ValueError(f"guard or candidate is not a {kind} file: {path}")
+
+
+def check(candidate, bundle_dir, resident_dir=RESIDENT_DIR, dropin_dir=DROPIN_DIR):
+    require_file(candidate)
+    resident = {
+        path.name for path in entries(resident_dir, optional=True)
+        if re.fullmatch(GUARD_NAME, path.name)
+    }
+    for dropin in entries(dropin_dir, optional=True):
+        if dropin.suffix != ".conf":
+            continue
+        for line in dropin.read_text().splitlines():
+            if not re.match(r"\s*ExecStartPre\s*=", line):
+                continue
+            # Read only canonical guard references, never interpret shell or
+            # systemd command syntax and never execute unrelated start hooks.
+            resident.update(re.findall(
+                rf"/usr/local/bin/({GUARD_NAME})(?=[\s\"']|$)", line
+            ))
+    for name in sorted(resident):
+        guard = resident_dir / name
+        require_file(guard, executable=True)
+        subprocess.run([str(guard), str(candidate)], check=True, timeout=30)
+
+    bundled = {
+        path.name for path in entries(bundle_dir)
+        if re.fullmatch(GUARD_NAME, path.name)
+    }
+    # These ship with this installer; absence is a broken bundle, not a pass.
+    bundled.update(("vmd-rollback-guard", "vmd-wake-floor-guard", "vmd-staged-intent-floor-guard"))
+    for name in sorted(bundled):
+        guard = bundle_dir / name
+        require_file(guard)
+        # Repository modes may be 0644; the installer makes these executable.
+        subprocess.run(["/bin/sh", str(guard), str(candidate)], check=True, timeout=30)
+
+
+if __name__ == "__main__":
+    try:
+        check(Path(sys.argv[1]), Path(sys.argv[2]))
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        sys.exit(f"ERROR: VMD compatibility preflight failed; refusing candidate installation: {error}")

@@ -251,11 +251,16 @@ func unrevokedKeys(ctx context.Context, src *pgxpool.Pool, teamID uuid.UUID) ([]
 // activeBuilds returns in-flight template builds ("<id> status=<status>")
 // for the team. The freeze must wait these out (or cancel them): copying
 // mid-build template rows would strand half-written artifacts, and the
-// build rows themselves are pinned to source-cell build VMs.
+// build rows themselves are pinned to source-cell build VMs. New durable-build
+// ownership records also block this legacy copy protocol until it can transfer
+// their publications and cleanup obligations.
 func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
-		SELECT id, status FROM template_build
-		WHERE team_id = $1 AND status IN ('pending', 'building', 'snapshotting')
+		SELECT id, CASE WHEN status IN ('pending','building','snapshotting') THEN status::text
+            ELSE 'durable build records require ownership-preserving migration support' END
+        FROM template_build
+        WHERE team_id=$1 AND (status IN ('pending','building','snapshotting') OR EXISTS (
+            SELECT 1 FROM template_build_execution e WHERE e.build_id=template_build.id))
 		ORDER BY created_at`, teamID)
 	if err != nil {
 		return nil, fmt.Errorf("list active builds: %w", err)

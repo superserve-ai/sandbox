@@ -44,6 +44,8 @@ const (
 )
 
 type HeartbeatConfig struct {
+	TemplateBuildReady func() bool
+
 	IncarnationID string
 	// StorageReportID is populated by the legacy heartbeat publisher when a
 	// storage snapshot is carried in the heartbeat body. It gives the
@@ -386,19 +388,21 @@ func postStorageReport(ctx context.Context, client *http.Client, cfg HeartbeatCo
 // not match the host row, so a reclaimed-away daemon cannot overwrite
 // the new holder's numbers.
 type pressureRequest struct {
-	IncarnationID         string `json:"incarnation_id,omitempty"`
-	VMDAddr               string `json:"vmd_addr"`
-	RunningSandboxes      int32  `json:"running_sandboxes"`
-	ProvisioningSandboxes int32  `json:"provisioning_sandboxes"`
-	PausedSandboxes       int32  `json:"paused_sandboxes"`
-	AllocatedMemoryMib    int64  `json:"allocated_memory_mib"`
-	AllocatedVcpus        int64  `json:"allocated_vcpus"`
-	UsedNetSlots          int32  `json:"used_net_slots"`
-	ProvisioningNetSlots  int32  `json:"provisioning_net_slots"`
-	WarmNetSlots          int32  `json:"warm_net_slots"`
-	NetSlotCeiling        int32  `json:"net_slot_ceiling"`
-	MaxNetworkSlots       int32  `json:"max_network_slots,omitempty"`
-	MaxSandboxes          int32  `json:"max_sandboxes,omitempty"`
+	IncludedBuildVMIDs     []string `json:"included_build_vm_ids"`
+	IncludedBuildSlotVMIDs []string `json:"included_build_slot_vm_ids,omitempty"`
+	IncarnationID          string   `json:"incarnation_id,omitempty"`
+	VMDAddr                string   `json:"vmd_addr"`
+	RunningSandboxes       int32    `json:"running_sandboxes"`
+	ProvisioningSandboxes  int32    `json:"provisioning_sandboxes"`
+	PausedSandboxes        int32    `json:"paused_sandboxes"`
+	AllocatedMemoryMib     int64    `json:"allocated_memory_mib"`
+	AllocatedVcpus         int64    `json:"allocated_vcpus"`
+	UsedNetSlots           int32    `json:"used_net_slots"`
+	ProvisioningNetSlots   int32    `json:"provisioning_net_slots"`
+	WarmNetSlots           int32    `json:"warm_net_slots"`
+	NetSlotCeiling         int32    `json:"net_slot_ceiling"`
+	MaxNetworkSlots        int32    `json:"max_network_slots,omitempty"`
+	MaxSandboxes           int32    `json:"max_sandboxes,omitempty"`
 	// Omitted when zero so a control plane that predates the field is
 	// unaffected; a fully described host sends nothing extra.
 	UnknownAllocationVMs int32 `json:"unknown_allocation_vms,omitempty"`
@@ -428,20 +432,22 @@ func sendPressure(ctx context.Context, client *http.Client, cfg HeartbeatConfig,
 	}
 	p := cfg.Pressure()
 	body, err := json.Marshal(pressureRequest{
-		IncarnationID:         cfg.IncarnationID,
-		VMDAddr:               cfg.VMDAddr,
-		RunningSandboxes:      p.RunningSandboxes,
-		ProvisioningSandboxes: p.ProvisioningSandboxes,
-		PausedSandboxes:       p.PausedSandboxes,
-		AllocatedMemoryMib:    p.AllocatedMemoryMib,
-		AllocatedVcpus:        p.AllocatedVcpus,
-		UsedNetSlots:          p.UsedNetSlots,
-		ProvisioningNetSlots:  p.ProvisioningNetSlots,
-		WarmNetSlots:          p.WarmNetSlots,
-		NetSlotCeiling:        p.NetSlotCeiling,
-		MaxNetworkSlots:       cfg.MaxNetworkSlots,
-		MaxSandboxes:          cfg.MaxSandboxes,
-		UnknownAllocationVMs:  p.UnknownAllocationVMs,
+		IncludedBuildVMIDs:     p.IncludedBuildVMIDs,
+		IncludedBuildSlotVMIDs: p.IncludedBuildSlotVMIDs,
+		IncarnationID:          cfg.IncarnationID,
+		VMDAddr:                cfg.VMDAddr,
+		RunningSandboxes:       p.RunningSandboxes,
+		ProvisioningSandboxes:  p.ProvisioningSandboxes,
+		PausedSandboxes:        p.PausedSandboxes,
+		AllocatedMemoryMib:     p.AllocatedMemoryMib,
+		AllocatedVcpus:         p.AllocatedVcpus,
+		UsedNetSlots:           p.UsedNetSlots,
+		ProvisioningNetSlots:   p.ProvisioningNetSlots,
+		WarmNetSlots:           p.WarmNetSlots,
+		NetSlotCeiling:         p.NetSlotCeiling,
+		MaxNetworkSlots:        cfg.MaxNetworkSlots,
+		MaxSandboxes:           cfg.MaxSandboxes,
+		UnknownAllocationVMs:   p.UnknownAllocationVMs,
 	})
 	if err != nil {
 		log.Error().Err(err).Msg("failed to encode pressure body")
@@ -1046,7 +1052,10 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 			Msg("proxy health probe failed; advertising no proxy or file capabilities")
 		proxyState = proxyHealthState{}
 	}
-	capabilities := make([]string, 0, 7)
+	capabilities := make([]string, 0, 8)
+	if cfg.TemplateBuildReady != nil && cfg.TemplateBuildReady() && cfg.Token != "" && cfg.ControlPlaneURL != "" {
+		capabilities = append(capabilities, "template_build_v1")
+	}
 	lifecycleReady := cfg.LifecycleReady != nil && cfg.LifecycleReady()
 	resolverReady := cfg.ResolverReady != nil && cfg.ResolverReady()
 	if lifecycleReady {

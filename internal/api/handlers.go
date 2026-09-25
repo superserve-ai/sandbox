@@ -151,6 +151,7 @@ type HostRegistry interface {
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
 	ComputeRestrictions   *abuse.ComputeEvaluator
+	SignupRestrictions    *abuse.SignupEvaluator
 	VMD                   VMDClient // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
 	DB                    *db.Queries
 	Pool                  *pgxpool.Pool // required by paths that need their own transaction (e.g. build-concurrency admission)
@@ -2042,6 +2043,15 @@ func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sa
 	gcCtx, cancel := context.WithTimeout(reqCtx, 10*time.Second)
 	defer cancel()
 
+	if _, parseErr := uuid.Parse(strings.TrimPrefix(buildID, "build-")); strings.HasPrefix(buildID, "build-") && parseErr == nil {
+		protected, err := h.DB.BuildArtifactProtected(gcCtx, buildID)
+		if err != nil {
+			return err
+		}
+		if protected {
+			return nil
+		}
+	}
 	refs, err := h.DB.CountActiveSandboxesAtBasePath(gcCtx, &basePath)
 	if err != nil {
 		return fmt.Errorf("gc: count references: %w", err)

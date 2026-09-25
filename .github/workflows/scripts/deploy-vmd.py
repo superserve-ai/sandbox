@@ -20,7 +20,9 @@ Env vars:
   SENTRY_DSN           optional — upserted into /etc/sandbox/vmd.env when set
   BACKUP_BUCKET        optional — the cell's artifact backup bucket. Upserted
                        into vmd.env when set; empty = skip, leaving the
-                       host's backup uploader disabled. Staged rollout:
+                       host's backup uploader disabled. Hosts with a bucket
+                       get VMD_ADVERTISE_ADDR from their host interface so
+                       capacity pressure can be published. Staged rollout:
                        staging first, production after the staging soak.
   BACKUP_BACKFILL      optional — "1" enables the paused-sandbox backup
                        backfill sweep (startup + six-hourly re-sweeps).
@@ -342,6 +344,7 @@ BUNDLE_FILES = [
     "deploy/superserve-vmd.socket",
     "deploy/superserve-vms.service",
     "deploy/vmd-rollback-guard",
+    "deploy/vmd-compatibility-preflight",
     "deploy/superserve-vmd-rollback-guard.conf",
     "deploy/vmd-wake-floor-guard",
     "deploy/superserve-vmd-wake-floor-guard.conf",
@@ -564,6 +567,13 @@ def main() -> int:
 
         inject_script = input_preflight + legacy_vmd_enrollment() + textwrap.dedent(f"""
 
+            # Only scratch artifacts change before compatibility is established.
+            # Retained guards can know floors absent from an older deploy bundle.
+            sudo rm -rf {extract_dir}
+            mkdir -p {extract_dir}
+            tar xzf {bundle_remote} -C {extract_dir}
+            sudo python3 {extract_dir}/deploy/vmd-compatibility-preflight {extract_dir}/bin/vmd {extract_dir}/deploy
+
             # Precondition, checked before any host mutation: if
             # BACKUP_JOURNAL_PATH names a path outside a real mount (the
             # local-SSD array being transiently unmounted, most likely),
@@ -689,11 +699,6 @@ def main() -> int:
             done
             # End fresh-host env bootstrap.
 
-            # Extract the deploy bundle into a sha-scoped staging dir so
-            # parallel deploys (or aborted retries) don't collide.
-            sudo rm -rf {extract_dir}
-            mkdir -p {extract_dir}
-            tar xzf {bundle_remote} -C {extract_dir}
             # Rollback safety gate. If the incoming vmd lacks cgroup supervision
             # (a downgrade past direct-spawn), an old binary would mishandle any
             # live or PAUSED cgroup VMs on this host — deleting records/networking
@@ -726,19 +731,9 @@ def main() -> int:
                 echo "host drained — proceeding with downgrade"
             fi
 
-            # Wake-protocol floor: the guard the service runs at every start,
-            # applied to the new binary before it lands. One source for what
-            # it checks; see deploy/vmd-wake-floor-guard.
-            if ! sh {extract_dir}/deploy/vmd-wake-floor-guard {extract_dir}/bin/vmd; then
-                echo "ERROR: the wake-protocol floor guard rejects this vmd; refusing to install it" >&2
-                exit 1
-            fi
-            # Staged-intent floor: same contract, a guard of its own; see
-            # deploy/vmd-staged-intent-floor-guard.
-            if ! sh {extract_dir}/deploy/vmd-staged-intent-floor-guard {extract_dir}/bin/vmd; then
-                echo "ERROR: the staged-intent floor guard rejects this vmd; refusing to install it" >&2
-                exit 1
-            fi
+            # Recheck retained guards before replacing any of them: they may
+            # know floors the incoming bundle does not.
+            sudo python3 {extract_dir}/deploy/vmd-compatibility-preflight {extract_dir}/bin/vmd {extract_dir}/deploy
 
             # Staged-intent floor: its guard and drop-in go in, and take
             # effect, before the binary that journals such intents can run,
@@ -752,6 +747,9 @@ def main() -> int:
             sudo systemctl daemon-reload
 
             # Install vmd + template-builder binaries.
+            # Running workloads may raise floors during preparation. Recheck now;
+            # startup guards still backstop changes after this check.
+            sudo python3 {extract_dir}/deploy/vmd-compatibility-preflight {extract_dir}/bin/vmd {extract_dir}/deploy
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd
             sudo install -m 0755 {extract_dir}/bin/template-builder {install_dir}/template-builder
 
@@ -931,6 +929,32 @@ def main() -> int:
             if [ -n {q_backup} ]; then
                 sudo sed -i '/^BACKUP_BUCKET=/d' /etc/sandbox/vmd.env
                 echo {q_backup_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Build hosts must publish capacity pressure. Resolve the explicit
+            # advertise address from the interface VMD uses for heartbeats.
+            backup_bucket=$(sudo sed -n 's/^BACKUP_BUCKET=//p' /etc/sandbox/vmd.env | tail -n 1)
+            if [ -n "$backup_bucket" ]; then
+                host_interface=$(sudo sed -n 's/^HOST_INTERFACE=//p' /etc/sandbox/vmd.env | tail -n 1)
+                if [ -z "$host_interface" ]; then
+                    host_interface=$(ip -4 route show default | awk 'NR == 1 {{print $5}}')
+                fi
+                if [ -z "$host_interface" ]; then
+                    echo 'ERROR: build host needs a host interface for pressure publication' >&2
+                    exit 1
+                fi
+                host_ip=$(ip -4 -o addr show dev "$host_interface" scope global | awk 'NR == 1 {{split($4, address, "/"); ip=address[1]}} END {{if (NR != 1) exit 1; print ip}}') || {{
+                    echo 'ERROR: build host needs exactly one IPv4 address on its host interface' >&2
+                    exit 1
+                }}
+                grpc_port=$(sudo sed -n 's/^GRPC_PORT=//p' /etc/sandbox/vmd.env | tail -n 1)
+                grpc_port=${{grpc_port:-50051}}
+                if ! [[ "$grpc_port" =~ ^[0-9]+$ ]] || (( 10#$grpc_port < 1 || 10#$grpc_port > 65535 )); then
+                    echo 'ERROR: build host has an invalid GRPC_PORT' >&2
+                    exit 1
+                fi
+                sudo sed -i '/^VMD_ADVERTISE_ADDR=/d' /etc/sandbox/vmd.env
+                echo "VMD_ADVERTISE_ADDR=$host_ip:$grpc_port" | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
             # Upsert BACKUP_UPLOAD_CONCURRENCY (parallel drain workers over

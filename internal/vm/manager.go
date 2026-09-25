@@ -444,6 +444,8 @@ type ManagerConfig struct {
 
 // Manager orchestrates the lifecycle of Firecracker microVMs.
 type Manager struct {
+	buildIncarnation string // immutable daemon identity for durable build reports
+
 	cfg         ManagerConfig
 	netMgr      vmNetworkManager
 	egressProxy *network.EgressProxy
@@ -611,12 +613,9 @@ type Manager struct {
 	// until process exit so late pollers can read terminal outcomes.
 	buildsMu sync.RWMutex
 	builds   map[string]*buildRecord
-	// In-flight build pressure, maintained as counters so CapacityPressure
-	// never scans the (indefinitely retained) build registry: incremented
-	// at registration, decremented ONLY when the build worker returns —
-	// the subprocess-exit point — so a cancelled build keeps its resources
-	// counted until the process is actually gone, not merely marked
-	// terminal.
+	// Build workflow count releases only at worker exit. Memory/vCPU
+	// allocations release when the last build VM exits, independently of
+	// terminal status, so cancellation cannot hide a surviving process.
 	buildPressureCount atomic.Int64
 	buildPressureMem   atomic.Int64
 	buildPressureVcpus atomic.Int64
@@ -1189,6 +1188,9 @@ func pidIsVMFirecracker(pid int, vmID string) bool {
 // per-VM copy must then be hole-exact, so it reflinks strictly rather
 // than falling back to a heuristic sparse copy that could turn
 // guest-written zeros into holes exposing base content.
+// blockMap, when non-empty, is the snapshot's saved block map for that
+// overlay: placed beside the copy, Firecracker takes it as the record of
+// which blocks the overlay holds instead of reading the file's allocation.
 // supervised spawns the VM under the fleet's real lifecycle supervision
 // (systemd unit or validated cgroup, seeded by `supervision`) through
 // the same dispatcher resume uses, so auto-pause's mode-directed stop
@@ -1196,7 +1198,7 @@ func pidIsVMFirecracker(pid int, vmID string) bool {
 // The flag is explicit because SupervisionUnit is the zero value: a
 // sentinel on the mode alone cannot distinguish "unit mode" from the
 // legacy unsupervised spawn kept for throwaway template-build VMs.
-func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath string, rules *sandboxNetworkRules, seed func(*VMInstance), preLaunch func() error, supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
+func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, basePath, blockMap string, rules *sandboxNetworkRules, seed func(*VMInstance), preLaunch func() error, supervised bool, supervision Supervision, vcpu, memMiB uint32) (*VMInstance, error) {
 	if vmID == "" {
 		vmID = uuid.New().String()
 	}
@@ -1259,6 +1261,13 @@ func (m *Manager) coldBootFromRootfs(ctx context.Context, vmID, rootfsPath, base
 		m.cleanupRunDir(vmID)
 		m.setStatus(vmID, StatusError)
 		return nil, fmt.Errorf("copy rootfs: %w", err)
+	}
+	if blockMap != "" {
+		if err := placeBlockMap(blockMap, diskPath); err != nil {
+			m.cleanupRunDir(vmID)
+			m.setStatus(vmID, StatusError)
+			return nil, fmt.Errorf("place block map: %w", err)
+		}
 	}
 
 	// 2. Set up networking.
@@ -1695,6 +1704,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 	}
 
 	snapshotPath = filepath.Join(snapshotDir, "vmstate.snap")
+	// Firecracker rewrites the overlay block map with every snapshot it
+	// saves; one an earlier pause left at this fixed path must not stand
+	// in for this pause's if the save leaves none.
+	if err := os.Remove(overlayBlockMapPath(snapshotPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", "", nil, fmt.Errorf("drop previous block map: %w", err)
+	}
 
 	// Read the fields that select Full vs in-place-diff vs layered together under the
 	// lock, so the decision can't see a torn mix written by a concurrent resume.
@@ -5918,12 +5933,15 @@ func (m *Manager) ReapRecordlessCgroupVMs(ctx context.Context) (protected []stri
 	sweepSafe = true
 	scanned := len(cgIDs)
 	var recorded, recordless, reaped int
+	liveBuilds := make(map[string]bool, len(m.survivingBuilders))
+	for _, proc := range m.survivingBuilders {
+		liveBuilds[proc.buildID] = true
+	}
 	for _, id := range cgIDs {
-		// Build VMs ARE reaped here: pre-gate every cgroup is a previous-life
-		// survivor, and a build's cgroup is recordless (persistState omits build
-		// IDs), so nothing else would ever kill it. The build-VM skip belongs
-		// only in the reconciler, which runs post-gate where a build may be
-		// in-flight.
+		// A predecessor builder still owns its recordless build VM.
+		if liveBuilds[id] {
+			continue
+		}
 		if has, herr := m.state.Has(id); herr != nil || has {
 			if herr != nil {
 				// Unreadable: skip the kill (conservative), but this VM may be
@@ -6487,15 +6505,18 @@ func (m *Manager) setStatus(vmID string, s VMStatus) {
 // prepared-slot ceiling: collapsing either pair would make "can I place
 // here" and "can this host prepare another slot" indistinguishable.
 type HostPressure struct {
-	RunningSandboxes      int32
-	ProvisioningSandboxes int32 // creating VMs + in-flight template builds
-	PausedSandboxes       int32
-	AllocatedMemoryMib    int64 // running + creating VMs + in-flight builds
-	AllocatedVcpus        int64
-	UsedNetSlots          int32
-	ProvisioningNetSlots  int32 // pool refill workers building/delivering
-	WarmNetSlots          int32 // fully built, claimable now
-	NetSlotCeiling        int32 // IP-scheme hard bound, not an operator knob
+	// IncludedBuildVMIDs names builds already charged in this sample.
+	IncludedBuildVMIDs     []string
+	IncludedBuildSlotVMIDs []string
+	RunningSandboxes       int32
+	ProvisioningSandboxes  int32 // creating VMs + in-flight template builds
+	PausedSandboxes        int32
+	AllocatedMemoryMib     int64 // running + creating VMs + in-flight builds
+	AllocatedVcpus         int64
+	UsedNetSlots           int32
+	ProvisioningNetSlots   int32 // pool refill workers building/delivering
+	WarmNetSlots           int32 // fully built, claimable now
+	NetSlotCeiling         int32 // IP-scheme hard bound, not an operator knob
 	// UnknownAllocationVMs counts VMs charged to this host whose size is
 	// not known — records that predate the declared-allocation contract
 	// and whose recovery has not landed yet.
@@ -6515,8 +6536,41 @@ type HostPressure struct {
 // probes, and a signal-0 check against the recycled pid would keep the
 // pressure gate closed for as long as that stranger lives.
 type builderProc struct {
-	pid   int
-	start uint64
+	pid     int
+	start   uint64
+	buildID string
+	slot    int
+	hasSlot bool
+}
+
+// ProtectSurvivingBuildSlots runs before the startup namespace sweep and pool.
+// A predecessor builder may still be pulling its image, so its namespace need
+// not exist yet; its command-line slot is the reservation authority. The /proc
+// pass scales with host process count and must finish before either path can
+// safely reclaim a slot.
+func (m *Manager) ProtectSurvivingBuildSlots() ([]string, error) {
+	scan := m.builderScan
+	if scan == nil {
+		scan = findSurvivingBuilders
+	}
+	procs, err := scan(m.cfg.TemplateBuilderBin)
+	if err != nil {
+		return nil, err
+	}
+	protected := make([]string, 0, len(procs))
+	for _, proc := range procs {
+		if proc.buildID == "" || !proc.hasSlot || proc.slot < 1 || proc.slot > network.MaxSlots {
+			return nil, fmt.Errorf("surviving builder pid %d has no valid network slot", proc.pid)
+		}
+		ns := fmt.Sprintf("ns-%d", proc.slot)
+		m.netMgr.ReserveSlotsAbove(map[string]string{proc.buildID: ns})
+		protected = append(protected, ns)
+	}
+	m.SetSurvivingBuilders(procs)
+	if len(procs) > 0 {
+		m.log.Warn().Int("builders", len(procs)).Msg("surviving template builders protected at startup")
+	}
+	return protected, nil
 }
 
 // SetSurvivingBuilders records template-builder subprocesses that
@@ -6647,6 +6701,10 @@ func (m *Manager) PressureReady() bool {
 		for _, bp := range m.survivingBuilders {
 			if alive(bp) {
 				remaining = append(remaining, bp)
+			} else if bp.hasSlot && m.netMgr != nil {
+				// The predecessor's deferred release cannot run in this daemon.
+				// ReleaseSlot checks both owner and index before touching the slot.
+				m.netMgr.ReleaseSlot(bp.buildID, bp.slot)
 			}
 		}
 		m.survivingBuilders = remaining
@@ -6711,11 +6769,9 @@ func parseProcStartTime(stat []byte) (uint64, bool) {
 
 // findSurvivingBuilders scans /proc for template-builder processes left
 // over from a previous daemon (KillMode=process restarts orphan them).
-// One directory walk with a cmdline read per process — which is exactly
-// why it only ever runs inside ScanSurvivingBuildersAsync's goroutine,
-// never on a startup or lifecycle path. A failed WALK is an error, never
-// an empty result: converting fd exhaustion into "no survivors" would
-// open the gate over a live unsized builder for the rest of its build.
+// One directory walk with a cmdline read per process. Startup also needs a
+// synchronous pass before it can safely reclaim namespaces or start the pool.
+// A failed walk is an error: absence of survivors cannot be inferred.
 func findSurvivingBuilders(builderBin string) ([]builderProc, error) {
 	if builderBin == "" {
 		return nil, nil
@@ -6779,9 +6835,25 @@ func findSurvivingBuilders(builderBin string) ([]builderProc, error) {
 			// process that matched the builder binary — inconclusive.
 			return nil, fmt.Errorf("survivor scan: unparseable stat for pid %s", e.Name())
 		}
-		procs = append(procs, builderProc{pid: pid, start: start})
+		proc := builderProc{pid: pid, start: start, buildID: builderArg(args, "--build-id")}
+		proc.slot, proc.hasSlot = builderSlotFromArgs(args)
+		procs = append(procs, proc)
 	}
 	return procs, nil
+}
+
+func builderSlotFromArgs(args []string) (int, bool) {
+	slot, err := strconv.Atoi(builderArg(args, "--slot-index"))
+	return slot, err == nil
+}
+
+func builderArg(args []string, flag string) string {
+	for i := 1; i+1 < len(args); i++ {
+		if args[i] == flag {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 // procPPID reads a process's parent pid from /proc/<pid>/stat. Errors
@@ -6925,17 +6997,30 @@ func (m *Manager) CapacityPressure() HostPressure {
 	// In-flight template builds run in a subprocess and never enter the
 	// instance map, but their memory and CPU are as real as any
 	// sandbox's, and build distribution (multi-host) will place against
-	// this number — a busy build host must not look idle. Counters, not a
-	// registry scan: records are retained indefinitely, and the counters
+	// this number — a busy build host must not look idle. The counters
 	// release only at worker exit (see registerBuild/buildTemplateWorker),
-	// which also keeps a cancelled build counted until its subprocess is
-	// actually gone.
+	// keeping a cancelled build counted until its subprocess is gone. Read
+	// the registry under the same lock so only builds reflected by the
+	// counters can be named as included in this sample.
+	m.buildsMu.RLock()
 	p.ProvisioningSandboxes += int32(m.buildPressureCount.Load())
 	p.AllocatedMemoryMib += m.buildPressureMem.Load()
 	p.AllocatedVcpus += m.buildPressureVcpus.Load()
+	for id, rec := range m.builds {
+		if rec.workerDone == nil {
+			continue
+		}
+		select {
+		case <-rec.workerDone:
+		default:
+			p.IncludedBuildVMIDs = append(p.IncludedBuildVMIDs, id)
+		}
+	}
+	m.buildsMu.RUnlock()
 	if m.netMgr != nil {
 		st := m.netMgr.SlotPressure()
 		p.UsedNetSlots = int32(st.Used)
+		p.IncludedBuildSlotVMIDs = st.BuildSlotOwners
 		p.ProvisioningNetSlots = int32(st.Provisioning)
 		p.WarmNetSlots = int32(st.WarmReady)
 		p.NetSlotCeiling = int32(st.Ceiling)
@@ -7409,6 +7494,25 @@ func (m *Manager) copyRootfsExact(ctx context.Context, dirName, srcRootfs string
 		return "", fmt.Errorf("exact copy (source and run dir must share a reflink filesystem): %s: %w", string(out), err)
 	}
 	return diskPath, nil
+}
+
+// placeBlockMap puts a snapshot's saved overlay block map where Firecracker
+// looks for one when it opens the per-VM overlay: a link when the map
+// shares the run dir's filesystem (Firecracker only reads it and unlinks
+// its own name), a copy of the small file otherwise.
+func placeBlockMap(blockMap, diskPath string) error {
+	dst := diskPath + ".bitmap"
+	if err := os.Remove(dst); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Link(blockMap, dst); !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	data, err := os.ReadFile(blockMap)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(dst, data, 0o644)
 }
 
 // cloneSavedDisk gives the VM its own copy of a saved snapshot's disk. An

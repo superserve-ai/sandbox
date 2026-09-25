@@ -66,10 +66,12 @@ type OTelConfig struct {
 // OTelRecorder emits the sandbox control plane's bounded operational metrics
 // through OTLP. It intentionally exposes only a small label vocabulary.
 type OTelRecorder struct {
-	billing          *billingMetrics
-	computeDecisions metric.Int64Counter
-	computeRefreshes metric.Int64Counter
-	provider         *sdkmetric.MeterProvider
+	billing           *billingMetrics
+	computeDecisions  metric.Int64Counter
+	computeRefreshes  metric.Int64Counter
+	computeReconciles metric.Int64Counter
+	provider          *sdkmetric.MeterProvider
+	signupDecisions   metric.Int64Counter
 
 	serviceName string
 	environment string
@@ -165,6 +167,12 @@ func NewOTelRecorder(ctx context.Context, cfg OTelConfig) (*OTelRecorder, error)
 		return nil, err
 	}
 	if r.computeRefreshes, err = meter.Int64Counter("compute_restriction_refresh_total"); err != nil {
+		return nil, err
+	}
+	if r.computeReconciles, err = meter.Int64Counter("compute_reconciliation_total"); err != nil {
+		return nil, err
+	}
+	if r.signupDecisions, err = meter.Int64Counter("signup_restriction_decision_total"); err != nil {
 		return nil, err
 	}
 	if r.sandboxTransitions, err = meter.Int64Counter("sandbox_transition_total"); err != nil {

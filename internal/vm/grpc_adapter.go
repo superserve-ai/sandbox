@@ -15,6 +15,7 @@ import (
 
 // GRPCAdapter wraps a Manager to implement vmdpb.VMDaemonServer.
 type GRPCAdapter struct {
+	buildAdmission BuildAdmission
 	vmdpb.UnimplementedVMDaemonServer
 	mgr             *Manager
 	secrets         *SecretsBrokerClient
@@ -425,11 +426,19 @@ func (a *GRPCAdapter) ListDir(ctx context.Context, req *vmdpb.ListDirRequest) (*
 
 // DeleteBuildArtifacts removes a single build's subdir under a template.
 func (a *GRPCAdapter) DeleteBuildArtifacts(ctx context.Context, req *vmdpb.DeleteBuildArtifactsRequest) (*vmdpb.DeleteBuildArtifactsResponse, error) {
+	if err := a.checkBuildIncarnation(ctx); err != nil {
+		return nil, err
+	}
 	tplID := req.GetTemplateId()
 	buildID := req.GetBuildId()
 	if tplID == "" || buildID == "" {
 		return nil, status.Error(codes.InvalidArgument, "template_id and build_id must be set")
 	}
+	unlock, err := a.mgr.lockVMOp(ctx, buildID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if err := a.mgr.DeleteBuildArtifacts(tplID, buildID); err != nil {
 		return nil, err
 	}
@@ -619,6 +628,20 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 		return nil, status.Error(codes.InvalidArgument, "from is required")
 	}
 
+	unlock, err := a.mgr.lockVMOp(ctx, req.GetBuildVmId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	admit, err := a.buildAdmissionCallback(ctx, req.GetBuildVmId())
+	if err != nil {
+		return nil, err
+	}
+	if admit != nil {
+		if _, exists := a.mgr.GetBuildStatus(req.GetBuildVmId()); exists {
+			return &vmdpb.BuildTemplateResponse{BuildVmId: req.GetBuildVmId()}, nil
+		}
+	}
 	spec := builder.BuildSpec{
 		From:     req.GetFrom(),
 		StartCmd: req.GetStartCmd(),
@@ -634,6 +657,7 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 
 	buildVMID, err := a.mgr.BuildTemplate(ctx, BuildTemplateRequest{
 		TemplateID: req.GetTemplateId(),
+		admit:      admit,
 		Spec:       spec,
 		VCPU:       req.GetVcpu(),
 		MemoryMiB:  req.GetMemoryMib(),
@@ -641,6 +665,9 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 		BuildVMID:  req.GetBuildVmId(),
 	})
 	if err != nil {
+		if status.Code(err) != codes.Unknown {
+			return nil, err
+		}
 		return nil, status.Errorf(codes.Internal, "build template: %v", err)
 	}
 
@@ -648,6 +675,9 @@ func (a *GRPCAdapter) BuildTemplate(ctx context.Context, req *vmdpb.BuildTemplat
 }
 
 func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildStatusRequest) (*vmdpb.GetBuildStatusResponse, error) {
+	if err := a.checkBuildIncarnation(ctx); err != nil {
+		return nil, err
+	}
 	if req.GetBuildVmId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "build_vm_id is required")
 	}
@@ -680,11 +710,24 @@ func (a *GRPCAdapter) GetBuildStatus(ctx context.Context, req *vmdpb.GetBuildSta
 }
 
 func (a *GRPCAdapter) CancelBuild(ctx context.Context, req *vmdpb.CancelBuildRequest) (*vmdpb.CancelBuildResponse, error) {
+	if err := a.checkBuildIncarnation(ctx); err != nil {
+		return nil, err
+	}
 	if req.GetBuildVmId() == "" {
 		return nil, status.Error(codes.InvalidArgument, "build_vm_id is required")
 	}
+	unlock, err := a.mgr.lockVMOp(ctx, req.GetBuildVmId())
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if err := a.mgr.CancelBuild(ctx, req.GetBuildVmId()); err != nil {
 		return nil, status.Errorf(codes.Internal, "cancel build: %v", err)
+	}
+	if a.buildAdmission.IncarnationID != "" {
+		if err := a.mgr.waitBuildStopped(ctx, req.GetBuildVmId()); err != nil {
+			return nil, err
+		}
 	}
 	return &vmdpb.CancelBuildResponse{}, nil
 }
@@ -695,6 +738,9 @@ func (a *GRPCAdapter) CancelBuild(ctx context.Context, req *vmdpb.CancelBuildReq
 // Returns NotFound when the build is unknown — the client maps that to a
 // 404 on its SSE endpoint.
 func (a *GRPCAdapter) StreamBuildLogs(req *vmdpb.StreamBuildLogsRequest, stream vmdpb.VMDaemon_StreamBuildLogsServer) error {
+	if err := a.checkBuildIncarnation(stream.Context()); err != nil {
+		return err
+	}
 	if req.GetBuildVmId() == "" {
 		return status.Error(codes.InvalidArgument, "build_vm_id is required")
 	}
@@ -716,6 +762,7 @@ func (a *GRPCAdapter) StreamBuildLogs(req *vmdpb.StreamBuildLogsRequest, stream 
 				return nil
 			}
 			pbEv := &vmdpb.BuildLogEvent{
+				Sequence:           ev.Sequence,
 				TimestampUnix:      ev.Timestamp.Unix(),
 				TimestampUnixNanos: ev.Timestamp.UnixNano(),
 				Stream:             string(ev.Stream),
@@ -791,7 +838,7 @@ func (a *GRPCAdapter) ReviveVM(ctx context.Context, req *vmdpb.ReviveVMRequest) 
 			allowedDomains: req.GetAllowedDomains(),
 		}
 	}
-	inst, err := a.mgr.ReviveVM(ctx, req.GetVmId(), req.GetDiskPath(), req.GetBasePath(), req.GetStandaloneDisk(), req.GetAllowRecordless(), req.GetTeamId(), req.GetOwnerId(), req.GetVcpu(), req.GetMemMib(), rules)
+	inst, err := a.mgr.ReviveVM(ctx, req.GetVmId(), req.GetDiskPath(), req.GetBasePath(), req.GetBlockMapPath(), req.GetStandaloneDisk(), req.GetAllowRecordless(), req.GetTeamId(), req.GetOwnerId(), req.GetVcpu(), req.GetMemMib(), rules)
 	if err != nil {
 		return nil, err
 	}

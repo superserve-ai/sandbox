@@ -13,6 +13,27 @@ type ComputeRecorder interface {
 	RecordComputeRefresh(context.Context, string)
 }
 
+// ComputeReconcileRecorder records bounded outcomes from background sweeps.
+type ComputeReconcileRecorder interface {
+	RecordComputeReconciliation(context.Context, string)
+}
+
+func (r *OTelRecorder) RecordComputeReconciliation(ctx context.Context, outcome string) {
+	outcome = computeLabel(outcome, "run", "matched", "attempted", "completed", "pending", "failure", "would_pause", "no_op_trusted", "no_op_off", "no_op_unrestricted", "no_op_state", "deferred_transition")
+	r.computeReconciles.Add(ctx, 1, metric.WithAttributes(attribute.String("source", "config"), attribute.String("outcome", outcome)))
+}
+
+type SignupRecorder interface {
+	RecordSignupDecision(context.Context, string, string, string)
+}
+
+func (r *OTelRecorder) RecordSignupDecision(ctx context.Context, mode, decision, subject string) {
+	mode = computeLabel(mode, "off", "observe", "enforce")
+	decision = computeLabel(decision, "allowed", "would_deny", "blocked")
+	subject = computeLabel(subject, "none", "fingerprint")
+	r.signupDecisions.Add(ctx, 1, metric.WithAttributes(attribute.String("source", "config"), attribute.String("mode", mode), attribute.String("decision", decision), attribute.String("subject_type", subject)))
+}
+
 func (r *OTelRecorder) RecordComputeDecision(ctx context.Context, action, mode, outcome, subject string) {
 	action = computeLabel(action, "create", "resume")
 	mode = computeLabel(mode, "off", "observe", "enforce")

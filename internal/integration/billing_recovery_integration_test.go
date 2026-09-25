@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +26,7 @@ type recoveryStripeFixture struct {
 	grantCalls   map[string]int
 	grants       map[string][]map[string]any
 	cancelOnCall map[string]int
+	checkouts    map[string]map[string]any
 }
 
 func (f *recoveryStripeFixture) setCancelOnCall(subscriptionID string, call int) {
@@ -52,11 +54,16 @@ func newRecoveryStripeFixture(t *testing.T) *recoveryStripeFixture {
 		grantCalls:   make(map[string]int),
 		grants:       make(map[string][]map[string]any),
 		cancelOnCall: make(map[string]int),
+		checkouts:    make(map[string]map[string]any),
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/v1/checkout/sessions/") {
+			_ = json.NewEncoder(w).Encode(f.checkouts[strings.TrimPrefix(r.URL.Path, "/v1/checkout/sessions/")])
+			return
+		}
 		if strings.HasPrefix(r.URL.Path, "/v1/subscriptions/") {
 			subscriptionID := strings.TrimPrefix(r.URL.Path, "/v1/subscriptions/")
 			f.subCalls[subscriptionID]++
@@ -79,10 +86,14 @@ func newRecoveryStripeFixture(t *testing.T) *recoveryStripeFixture {
 		if r.URL.Path == "/v1/billing/credit_grants" && r.Method == http.MethodPost {
 			customer := r.FormValue("customer")
 			f.grantCalls[customer]++
+			amount, err := strconv.ParseInt(r.FormValue("amount[monetary][value]"), 10, 64)
+			if err != nil {
+				t.Errorf("invalid grant amount: %v", err)
+			}
 			grant := map[string]any{
 				"id":                   "grant_" + strings.TrimPrefix(customer, "cus_"),
 				"category":             "promotional",
-				"amount":               map[string]any{"monetary": map[string]any{"value": 9500, "currency": "usd"}},
+				"amount":               map[string]any{"monetary": map[string]any{"value": amount, "currency": "usd"}},
 				"applicability_config": map[string]any{"scope": map[string]any{"price_type": "metered"}},
 				"metadata":             map[string]string{"activation_identity": r.FormValue("metadata[activation_identity]")},
 			}
@@ -262,5 +273,137 @@ func TestIntegration_BillingRecoveryDryRunApplyRevalidatesAndExcludes(t *testing
 	}
 	if stripe.subscriptionCallCount(raceSubscription) != beforeExcludedCalls {
 		t.Fatal("excluded recovery target unexpectedly called Stripe")
+	}
+}
+
+func TestIntegration_BillingRecoveryCompletedCheckout(t *testing.T) {
+	for _, tc := range []struct {
+		name, status string
+		amount       int
+		mismatch     bool
+		want         string
+	}{
+		{"standard", "complete", 9500, false, "repaired"},
+		{"custom", "complete", 100000, false, "repaired"},
+		{"open", "open", 9500, false, "skipped"},
+		{"wrong_owner", "complete", 9500, true, "skipped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			stripe := newRecoveryStripeFixture(t)
+			subscription := "sub_" + uuid.NewString()
+			customer := "cus_" + strings.TrimPrefix(subscription, "sub_")
+			session := "cs_" + uuid.NewString()
+			team := seedRecoveryBillingAccount(t, subscription)
+			_, err := testPool.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_status=NULL,checkout_initializing_at=now(),checkout_anchor_snapshot=now(),checkout_session_id=$2 WHERE team_id=$1`, team, session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := team.String()
+			if tc.mismatch {
+				owner = uuid.NewString()
+			}
+			stripe.mu.Lock()
+			stripe.checkouts[session] = map[string]any{"id": session, "status": tc.status, "customer": customer, "subscription": subscription, "client_reference_id": owner}
+			stripe.mu.Unlock()
+			args := []string{"-team", team.String(), "-activation-credit-cents", strconv.Itoa(tc.amount)}
+			dry := runBillingRecoveryCommand(t, stripe.server.URL, args...)
+			if tc.want == "repaired" && dry["outcome"] != "candidate" {
+				t.Fatalf("dry-run: %v", dry)
+			}
+			if stripe.grantCallCount(customer) != 0 {
+				t.Fatal("dry-run created credit")
+			}
+			result := runBillingRecoveryCommand(t, stripe.server.URL, append(args, "-apply")...)
+			if result["outcome"] != tc.want {
+				t.Fatalf("apply=%v, want %s", result, tc.want)
+			}
+			var complete, checkoutCleared, anchorCleared bool
+			err = testPool.QueryRow(ctx, `SELECT trial_ended_at IS NOT NULL AND stripe_activation_credit_grant_id IS NOT NULL,checkout_initializing_at IS NULL AND checkout_session_id IS NULL,checkout_anchor_snapshot IS NULL FROM team_billing_account WHERE team_id=$1`, team).Scan(&complete, &checkoutCleared, &anchorCleared)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.want != "repaired" {
+				if complete || checkoutCleared || anchorCleared || stripe.grantCallCount(customer) != 0 {
+					t.Fatal("unsafe checkout mutated")
+				}
+				return
+			}
+			if !complete || !checkoutCleared || !anchorCleared {
+				t.Fatal("activation or checkout cleanup missing")
+			}
+			repeat := runBillingRecoveryCommand(t, stripe.server.URL, append(args, "-apply")...)
+			if repeat["outcome"] != "repaired" || stripe.grantCallCount(customer) != 1 {
+				t.Fatalf("retry=%v creates=%d", repeat, stripe.grantCallCount(customer))
+			}
+			stripe.mu.Lock()
+			amount := stripe.grants[customer][0]["amount"].(map[string]any)["monetary"].(map[string]any)["value"].(int64)
+			stripe.mu.Unlock()
+			if amount != int64(tc.amount) {
+				t.Fatalf("amount=%d, want %d", amount, tc.amount)
+			}
+			if tc.amount != 9500 {
+				wrong := runBillingRecoveryCommand(t, stripe.server.URL, "-team", team.String(), "-apply")
+				if wrong["outcome"] != "unresolved" || stripe.grantCallCount(customer) != 1 {
+					t.Fatalf("wrong amount must not issue credit: %v", wrong)
+				}
+			}
+		})
+	}
+}
+
+func TestIntegration_BillingRecoveryExpiredReservationAndMissingAssociation(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		name := "expired_reservation"
+		if missing {
+			name = "missing_association"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			stripe := newRecoveryStripeFixture(t)
+			subscription := "sub_" + uuid.NewString()
+			customer := "cus_" + strings.TrimPrefix(subscription, "sub_")
+			session := "cs_" + uuid.NewString()
+			team := seedRecoveryBillingAccount(t, subscription)
+			var reservation *time.Time
+			status := "expired"
+			if missing {
+				now := time.Now()
+				reservation = &now
+				status = "complete"
+			}
+			_, err := testPool.Exec(ctx, `UPDATE team_billing_account SET checkout_initializing_at=$2,checkout_session_id=$3,stripe_subscription_id=CASE WHEN $4 THEN NULL ELSE stripe_subscription_id END WHERE team_id=$1`, team, reservation, session, missing)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stripe.mu.Lock()
+			stripe.checkouts[session] = map[string]any{"id": session, "status": status, "customer": customer, "subscription": subscription, "client_reference_id": team.String()}
+			stripe.mu.Unlock()
+			result := runBillingRecoveryCommand(t, stripe.server.URL, "-team", team.String(), "-apply")
+			expected := "repaired"
+			if missing {
+				expected = "skipped"
+			}
+			if result["outcome"] != expected {
+				t.Fatalf("outcome=%v, want %s", result, expected)
+			}
+			var retained string
+			var activated bool
+			var storedSub *string
+			err = testPool.QueryRow(ctx, `SELECT checkout_session_id,trial_ended_at IS NOT NULL,stripe_subscription_id FROM team_billing_account WHERE team_id=$1`, team).Scan(&retained, &activated, &storedSub)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if retained != session {
+				t.Fatal("retained session identity lost")
+			}
+			if missing {
+				if activated || storedSub != nil || stripe.grantCallCount(customer) != 0 {
+					t.Fatal("missing association mutated")
+				}
+			} else if !activated || stripe.grantCallCount(customer) != 1 {
+				t.Fatal("existing subscription not recovered")
+			}
+		})
 	}
 }

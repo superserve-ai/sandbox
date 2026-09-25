@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/superserve-ai/sandbox/internal/backup"
 )
 
 func TestHashFile(t *testing.T) {
@@ -70,9 +72,13 @@ func TestCollectPauseManifest(t *testing.T) {
 	if err := os.WriteFile(base, []byte("basedata"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	blockMap := overlayBlockMapPath(vmstate)
+	if err := os.WriteFile(blockMap, []byte("blocks"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	entries := collectPauseManifest(context.Background(), vmstate, rootfs, base, base, zerolog.Nop())
-	if len(entries) != 2 {
-		t.Fatalf("entries = %d, want 2", len(entries))
+	if len(entries) != 3 {
+		t.Fatalf("entries = %d, want 3", len(entries))
 	}
 	byName := map[string]ManifestEntry{}
 	for _, e := range entries {
@@ -82,12 +88,49 @@ func TestCollectPauseManifest(t *testing.T) {
 	if !ok || vs.Path != vmstate || vs.SizeBytes != 5 || vs.BasePath != "" {
 		t.Errorf("vmstate entry wrong: %+v", vs)
 	}
+	bm, ok := byName[backup.BlockMapName]
+	if !ok || bm.Path != blockMap || bm.SizeBytes != 6 || bm.BasePath != "" {
+		t.Errorf("block map entry wrong: %+v", bm)
+	}
+	// A standalone disk has no overlay for the map to describe.
+	if entries := collectPauseManifest(context.Background(), vmstate, rootfs, "", "", zerolog.Nop()); len(entries) != 2 {
+		t.Errorf("standalone entries = %+v, want vmstate and rootfs only", entries)
+	}
 	rf, ok := byName["rootfs.ext4"]
 	if !ok || rf.Path != rootfs || rf.SizeBytes != 8 || rf.BasePath != base || rf.BaseSHA256 == "" {
 		t.Errorf("rootfs entry wrong: %+v", rf)
 	}
 	if rf.SHA256 == "" || len(rf.SHA256) != 64 {
 		t.Errorf("rootfs sha256 malformed: %q", rf.SHA256)
+	}
+}
+
+// An overlay pause whose saved map exists but cannot be read must not
+// publish a generation without it: the manifest stays incomplete and the
+// pause pending.
+func TestCollectPauseManifestKeepsAnOverlayPausePendingWithoutItsMap(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a mode-0 file")
+	}
+	dir := t.TempDir()
+	vmstate := filepath.Join(dir, "vmstate.snap")
+	rootfs := filepath.Join(dir, "rootfs.ext4")
+	base := filepath.Join(dir, "base.ext4")
+	blockMap := overlayBlockMapPath(vmstate)
+	for p, data := range map[string]string{vmstate: "state", rootfs: "diskdata", base: "basedata", blockMap: "blocks"} {
+		if err := os.WriteFile(p, []byte(data), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(blockMap, 0); err != nil {
+		t.Fatal(err)
+	}
+	entries := collectPauseManifest(context.Background(), vmstate, rootfs, base, base, zerolog.Nop())
+	if len(entries) != 1 || entries[0].FileName != "vmstate.snap" {
+		t.Fatalf("entries = %+v, want vmstate only", entries)
+	}
+	if pauseManifestComplete(entries) {
+		t.Fatal("a manifest without the saved map must not count as complete")
 	}
 }
 

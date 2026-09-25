@@ -634,7 +634,10 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        -- would cross-multiply the per-host rows and corrupt the counts.
        COALESCE((SELECT COUNT(*) FROM template_build tb
                  WHERE tb.vmd_host_id = h.id
-                   AND tb.status IN ('building', 'snapshotting')), 0)::int AS building_count,
+                   AND tb.status IN ('building', 'snapshotting')
+                   AND NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=tb.id)), 0)::int
+       + (SELECT count(*)::int FROM template_build_attempt a WHERE a.host_id=h.id AND a.incarnation_id=h.incarnation_id
+          AND (a.state IN ('claimed','admitted','uploading') OR a.cleanup_pending)) AS building_count,
        -- Paused sandboxes whose CURRENT pause has no durable backup: the
        -- ones whose only up-to-date copy lives on this host's local disk.
        -- Retiring the machine destroys them outright; even
@@ -1111,16 +1114,19 @@ INSERT INTO host_pressure (
     allocated_memory_mib, allocated_vcpus,
     used_net_slots, provisioning_net_slots, warm_net_slots,
     net_slot_ceiling, max_network_slots, max_sandboxes, unknown_allocation_vms,
+    included_build_vm_ids, included_build_slot_vm_ids,
     reported_at
 )
 SELECT h.id, $1, $2, $3,
        $4, $5,
        $6, $7, $8,
        $9, $10, $11, $12,
+       COALESCE($13::text[], '{}'::text[]),
+       COALESCE($14::text[], '{}'::text[]),
        now()
 FROM host h
-WHERE h.id = $13 AND h.vmd_addr = $14
-  AND (h.incarnation_id IS NULL OR h.incarnation_id::text = $15::text)
+WHERE h.id = $15 AND h.vmd_addr = $16
+  AND (h.incarnation_id IS NULL OR h.incarnation_id::text = $17::text)
 FOR SHARE
 ON CONFLICT (host_id) DO UPDATE SET
     running_sandboxes = EXCLUDED.running_sandboxes,
@@ -1135,25 +1141,29 @@ ON CONFLICT (host_id) DO UPDATE SET
     max_network_slots = EXCLUDED.max_network_slots,
     max_sandboxes = EXCLUDED.max_sandboxes,
     unknown_allocation_vms = EXCLUDED.unknown_allocation_vms,
+    included_build_vm_ids = EXCLUDED.included_build_vm_ids,
+    included_build_slot_vm_ids = EXCLUDED.included_build_slot_vm_ids,
     reported_at = EXCLUDED.reported_at
 `
 
 type UpsertHostPressureParams struct {
-	RunningSandboxes      int32  `json:"running_sandboxes"`
-	ProvisioningSandboxes int32  `json:"provisioning_sandboxes"`
-	PausedSandboxes       int32  `json:"paused_sandboxes"`
-	AllocatedMemoryMib    int64  `json:"allocated_memory_mib"`
-	AllocatedVcpus        int64  `json:"allocated_vcpus"`
-	UsedNetSlots          int32  `json:"used_net_slots"`
-	ProvisioningNetSlots  int32  `json:"provisioning_net_slots"`
-	WarmNetSlots          int32  `json:"warm_net_slots"`
-	NetSlotCeiling        int32  `json:"net_slot_ceiling"`
-	MaxNetworkSlots       int32  `json:"max_network_slots"`
-	MaxSandboxes          int32  `json:"max_sandboxes"`
-	UnknownAllocationVms  int32  `json:"unknown_allocation_vms"`
-	HostID                string `json:"host_id"`
-	VmdAddr               string `json:"vmd_addr"`
-	IncarnationID         string `json:"incarnation_id"`
+	RunningSandboxes       int32    `json:"running_sandboxes"`
+	ProvisioningSandboxes  int32    `json:"provisioning_sandboxes"`
+	PausedSandboxes        int32    `json:"paused_sandboxes"`
+	AllocatedMemoryMib     int64    `json:"allocated_memory_mib"`
+	AllocatedVcpus         int64    `json:"allocated_vcpus"`
+	UsedNetSlots           int32    `json:"used_net_slots"`
+	ProvisioningNetSlots   int32    `json:"provisioning_net_slots"`
+	WarmNetSlots           int32    `json:"warm_net_slots"`
+	NetSlotCeiling         int32    `json:"net_slot_ceiling"`
+	MaxNetworkSlots        int32    `json:"max_network_slots"`
+	MaxSandboxes           int32    `json:"max_sandboxes"`
+	UnknownAllocationVms   int32    `json:"unknown_allocation_vms"`
+	IncludedBuildVmIds     []string `json:"included_build_vm_ids"`
+	IncludedBuildSlotVmIds []string `json:"included_build_slot_vm_ids"`
+	HostID                 string   `json:"host_id"`
+	VmdAddr                string   `json:"vmd_addr"`
+	IncarnationID          string   `json:"incarnation_id"`
 }
 
 // Records a host's live pressure report, identity-fenced: the write
@@ -1184,6 +1194,8 @@ func (q *Queries) UpsertHostPressure(ctx context.Context, arg UpsertHostPressure
 		arg.MaxNetworkSlots,
 		arg.MaxSandboxes,
 		arg.UnknownAllocationVms,
+		arg.IncludedBuildVmIds,
+		arg.IncludedBuildSlotVmIds,
 		arg.HostID,
 		arg.VmdAddr,
 		arg.IncarnationID,
