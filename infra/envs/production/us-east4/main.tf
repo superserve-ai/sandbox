@@ -216,6 +216,12 @@ module "api" {
     STRIPE_API_VERSION          = "2026-05-27.dahlia"
     STRIPE_CHECKOUT_PRICE_IDS   = "price_1U60fMPyzR3Q9AgflfcjIHsp,price_1U60hxPyzR3Q9AgfOsciXQ43"
     APP_ALLOWED_ORIGINS         = "https://console.superserve.ai"
+
+    # The purge of deleted sandboxes' backups from BACKUP_BUCKET: the GC
+
+    # identity the runtime impersonates to delete from it.
+
+    BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
   }
 
   secrets        = local.controlplane_secrets
@@ -538,4 +544,12 @@ module "backup_storage" {
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_snapshots_and_files"
   })
+}
+
+# The control plane deletes deleted sandboxes' backups as the bucket's GC
+# identity, which it impersonates only for that client.
+resource "google_service_account_iam_member" "controlplane_backup_gc" {
+  service_account_id = "projects/${local.project_id}/serviceAccounts/${module.backup_storage.gc_service_account_email}"
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:${google_service_account.controlplane_runtime.email}"
 }

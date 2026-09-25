@@ -345,6 +345,14 @@ func run() error {
 	}
 	handlers.StartTeardownSweeper(ctx)
 	handlers.StartLogRetention(ctx)
+	if cfg.BackupGCServiceAccount != "" {
+		admin, err := backup.NewGCSAdmin(ctx, cfg.TemplateBackupBucket, cfg.BackupGCServiceAccount)
+		if err != nil {
+			return fmt.Errorf("backup gc: %w", err)
+		}
+		handlers.BackupGC = admin
+		handlers.StartBackupGC(ctx)
+	}
 
 	// Launch the template build supervisor. Drives template_build rows
 	// through pending → building → snapshotting → ready/failed by calling
