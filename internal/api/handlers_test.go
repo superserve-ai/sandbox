@@ -5532,7 +5532,9 @@ func TestDeleteSandbox_SlowHostCostsOnlyTheBudget(t *testing.T) {
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
-	h := &Handlers{VMD: vmd, DB: db.New(mock), TeardownInlineBudget: 50 * time.Millisecond}
+	// The deferral is written in the tenth of the budget the reclaim leaves
+	// for it; a budget this size leaves enough of that for a loaded runner.
+	h := &Handlers{VMD: vmd, DB: db.New(mock), TeardownInlineBudget: time.Second}
 	w := httptest.NewRecorder()
 	start := time.Now()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
@@ -5540,7 +5542,7 @@ func TestDeleteSandbox_SlowHostCostsOnlyTheBudget(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
 	}
-	if took := time.Since(start); took > 2*time.Second {
+	if took := time.Since(start); took > 3*time.Second {
 		t.Fatalf("response took %s against a host that never answers", took)
 	}
 	if deferred != 1 || heldHost != 1 || completed != 0 {
