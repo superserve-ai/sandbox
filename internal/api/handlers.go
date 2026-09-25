@@ -197,6 +197,13 @@ type Handlers struct {
 	inlineTeardownsOnce sync.Once
 	inlineTeardowns     chan struct{}
 
+	// snapshotSweepHosts is the snapshot sweep's queue per host, guarded by
+	// snapshotSweepMu; a sweep pass hands rows over and returns, and one
+	// worker per host takes them in turn. Lazily created so struct-literal
+	// construction keeps working.
+	snapshotSweepMu    sync.Mutex
+	snapshotSweepHosts map[string]*snapshotSweepHost
+
 	// activityGate caps how many activity-log inserts may hold DB connections
 	// at once (see writeActivity). Lazily created so struct-literal
 	// construction keeps working.

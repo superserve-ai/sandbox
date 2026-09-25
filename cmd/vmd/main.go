@@ -1028,6 +1028,7 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to initialize VM manager")
 	}
 	mgr.SweepSavedSnapshotStaging(log)
+	mgr.RunSavedTombstoneReaper(ctx)
 
 	// ---- TCP egress proxy ----
 	// Must be set before ReattachAll or any VM operations so domain

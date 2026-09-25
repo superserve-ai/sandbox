@@ -917,6 +917,8 @@ type SandboxSnapshot struct {
 	CreatedAt      time.Time          `json:"created_at"`
 	ReadyAt        pgtype.Timestamptz `json:"ready_at"`
 	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
+	// When the sweep next asks the host about a row creating or deleting; pushed out on every attempt, NULL once the host has confirmed.
+	SweepAfter pgtype.Timestamptz `json:"sweep_after"`
 }
 
 type SandboxStorageInterval struct {
@@ -1012,6 +1014,7 @@ type Team struct {
 	HomeRegion             string `json:"home_region"`
 	MaxSnapshots           int32  `json:"max_snapshots"`
 	MaxSnapshotsPerSandbox int32  `json:"max_snapshots_per_sandbox"`
+	MaxSnapshotsInFlight   int32  `json:"max_snapshots_in_flight"`
 }
 
 type TeamActiveSandboxCount struct {
