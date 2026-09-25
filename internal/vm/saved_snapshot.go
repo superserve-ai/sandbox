@@ -597,6 +597,10 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 // from the chain wakes it under the right token. Made durable by
 // persistChainAdvance once the guest is released.
 func advanceChain(inst *VMInstance, vmstate, memPath, baseMem string, wake *WallClockManifest) {
+	// A manifest is written only for a guest that corrects its clock, so
+	// its presence is that fact, resolved here from the image if the record
+	// had it unresolved.
+	corrects := wake != nil
 	frozen, token, artifact := false, "", ""
 	if wake != nil {
 		frozen, token, artifact = wake.WorkloadFrozen, wake.FreezeToken, wake.ArtifactID
@@ -606,6 +610,7 @@ func advanceChain(inst *VMInstance, vmstate, memPath, baseMem string, wake *Wall
 	inst.MemFilePath = memPath
 	inst.BaseMemPath = baseMem
 	inst.DirtyTrackingGeneration++
+	inst.CorrectsWallClock = &corrects
 	inst.SnapshotWorkloadFrozen = &frozen
 	inst.FreezeToken = token
 	inst.ArtifactID = artifact

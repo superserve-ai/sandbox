@@ -747,8 +747,12 @@ func TestRunningCaptureAdvancesTheWakeRecordWithTheChain(t *testing.T) {
 		t.Fatalf("chain image has no manifest: %v", err)
 	}
 	inst.mu.RLock()
-	frozen, token, artifact := inst.SnapshotWorkloadFrozen, inst.FreezeToken, inst.ArtifactID
+	frozen, token, artifact, corrects := inst.SnapshotWorkloadFrozen, inst.FreezeToken, inst.ArtifactID, inst.CorrectsWallClock
 	inst.mu.RUnlock()
+	// The record had the clock capability unresolved; the image said yes.
+	if corrects == nil || !*corrects {
+		t.Fatalf("record clock capability %v; want resolved to true with the chain", corrects)
+	}
 	if chain.ArtifactID == "a" || artifact != chain.ArtifactID {
 		t.Fatalf("record artifact %q, chain manifest %q; want the capture's, not the resumed image's", artifact, chain.ArtifactID)
 	}
