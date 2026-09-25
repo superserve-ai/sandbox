@@ -9273,13 +9273,22 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 	if in == nil {
 		return true
 	}
+	// A rewrite's images are settled first, from what the rewrite left
+	// beside them: the record then names a chain written whole, or nothing
+	// relaunches from one it may not trust. A staged write left them as
+	// they were. A rewrite that cannot be settled keeps its intent, which
+	// refuses a relaunch until a reattach settles it.
+	adopted, settled := false, true
+	if !in.Staged {
+		adopted, settled = m.settleInterruptedRewrite(dir, in, inst, log)
+	}
 	if in.FreezeToken == "" {
 		// An unfrozen rewrite that was interrupted: the images here are
 		// unfrozen or torn, so a manifest beside them that says frozen is
-		// stale either way and must not outlive the intent. A staged write
-		// left them as they were.
+		// stale either way and must not outlive the intent, unless it is
+		// the rewrite's own, just adopted.
 		for _, name := range []string{"mem.diff", "mem.snap"} {
-			if in.Staged {
+			if in.Staged || adopted {
 				break
 			}
 			if _, err := removeWallClockManifest(filepath.Join(dir, name)); err != nil {
@@ -9307,10 +9316,62 @@ func (m *Manager) recoverPauseIntent(ctx context.Context, inst *VMInstance, log 
 		}
 		log.Warn().Msg("reattach: released a guest an interrupted pause had frozen")
 	}
+	if !settled {
+		log.Warn().Msg("reattach: interrupted rewrite could not be settled; its intent stays, and refuses a relaunch, until a reattach settles it")
+		return true
+	}
 	if cerr := clearPauseIntent(dir); cerr != nil {
 		log.Warn().Err(cerr).Msg("reattach: interrupted pause's intent could not be cleared; the next pause rewrites it")
 	}
 	return true
+}
+
+// settleInterruptedRewrite reconciles the record with the chain a rewrite
+// left behind. An image whose manifest names the intent's artifact was
+// written whole, its manifest after it, so the record takes it, durably, as
+// the rewrite would have once the guest was released: a relaunch from the
+// chain then wakes it under the token it was frozen with. Any other chain
+// may be torn, or whole with a manifest that is not its own, and is
+// withdrawn: its vmstate goes, so nothing relaunches from it before the next
+// pause writes it whole, and a first-pass overlay the record never named
+// goes with it. Adopted reports the first case; settled is false when the
+// record or the withdrawal could not be written.
+func (m *Manager) settleInterruptedRewrite(dir string, in *pauseIntent, inst *VMInstance, log zerolog.Logger) (adopted, settled bool) {
+	inst.mu.RLock()
+	recordedArtifact, recordedMem := inst.ArtifactID, inst.MemFilePath
+	inst.mu.RUnlock()
+	if in.ArtifactID != "" && in.ArtifactID == recordedArtifact {
+		// The record was written; only the intent's removal was lost.
+		return false, true
+	}
+	vmstate := filepath.Join(dir, "vmstate.snap")
+	for _, name := range []string{"mem.diff", "mem.snap"} {
+		mem := filepath.Join(dir, name)
+		man, err := ReadWallClockManifest(mem)
+		if err != nil || man == nil || in.ArtifactID == "" || man.ArtifactID != in.ArtifactID || !fileExists(vmstate) {
+			continue
+		}
+		base, _ := readLayeredBase(mem)
+		advanceChain(inst, vmstate, mem, base, man)
+		if _, err := m.persistStateIfPresent(inst); err != nil {
+			log.Error().Err(err).Msg("reattach: a completed rewrite's record could not be written")
+			return true, false
+		}
+		log.Warn().Str("mem", mem).Msg("reattach: recorded a chain image a rewrite completed before its record was written")
+		return true, true
+	}
+	withdraw := []string{vmstate, overlayBlockMapPath(vmstate), overlayBlockMapPath(vmstate) + ".prev"}
+	if overlay := filepath.Join(dir, "mem.diff"); recordedMem != overlay {
+		withdraw = append(withdraw, overlay, layeredBaseSidecarPath(overlay), presence.SidecarPath(overlay), WallClockMarkerPath(overlay))
+	}
+	for _, p := range withdraw {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Error().Err(err).Str("path", p).Msg("reattach: an uncertain chain image could not be withdrawn")
+			return false, false
+		}
+	}
+	log.Warn().Msg("reattach: withdrew a chain image an interrupted rewrite left uncertain; the next pause writes it whole")
+	return false, true
 }
 
 // publishRecovered publishes an instance the wake pool resolved, durably —
