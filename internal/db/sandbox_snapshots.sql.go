@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const beginSandboxSnapshotDelete = `-- name: BeginSandboxSnapshotDelete :one
@@ -159,56 +158,47 @@ INSERT INTO sandbox_snapshot (
     id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key,
     host_id, vcpu_count, memory_mib, disk_mib, base_path,
     timeout_seconds, network_config, secret_bindings, sweep_after
-) VALUES (
-    $1, $2, $3, $4, $5, 'creating', $6, $7,
-    $8, $9, $10, $11, $12,
-    $13, $14, $15, $16
 )
+SELECT $1::uuid, s.team_id, s.id, s.template_id, $2::text, 'creating', $3::text, $4::text,
+    s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.base_path,
+    s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb), $5::jsonb, $6::timestamptz
+FROM sandbox s
+WHERE s.id = $7 AND s.team_id = $8 AND s.destroyed_at IS NULL
+  AND s.status IN ('active', 'paused') AND s.host_id <> '' AND s.base_path IS NOT NULL
+FOR SHARE OF s
 RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after
 `
 
 type CreateSandboxSnapshotParams struct {
-	ID             uuid.UUID          `json:"id"`
-	TeamID         uuid.UUID          `json:"team_id"`
-	SandboxID      uuid.UUID          `json:"sandbox_id"`
-	TemplateID     pgtype.UUID        `json:"template_id"`
-	Kind           string             `json:"kind"`
-	Name           *string            `json:"name"`
-	IdempotencyKey *string            `json:"idempotency_key"`
-	HostID         string             `json:"host_id"`
-	VcpuCount      int32              `json:"vcpu_count"`
-	MemoryMib      int32              `json:"memory_mib"`
-	DiskMib        int32              `json:"disk_mib"`
-	BasePath       string             `json:"base_path"`
-	TimeoutSeconds *int32             `json:"timeout_seconds"`
-	NetworkConfig  []byte             `json:"network_config"`
-	SecretBindings []byte             `json:"secret_bindings"`
-	SweepAfter     pgtype.Timestamptz `json:"sweep_after"`
+	ID             uuid.UUID `json:"id"`
+	Kind           string    `json:"kind"`
+	Name           *string   `json:"name"`
+	IdempotencyKey *string   `json:"idempotency_key"`
+	SecretBindings []byte    `json:"secret_bindings"`
+	SweepAfter     time.Time `json:"sweep_after"`
+	SandboxID      uuid.UUID `json:"sandbox_id"`
+	TeamID         uuid.UUID `json:"team_id"`
 }
 
 // The row exists as creating before the host is asked, under the id the
 // host's capture is keyed by, so an answer lost on the way back is settled
-// later from the host (see the snapshot sweep). The trigger counts the
-// limits on insert; a retry carrying an idempotency key already on file is
-// refused by the unique index and re-read by the caller.
+// later from the host (see the snapshot sweep). What the row records of its
+// source is read here, from a source still live, held shared so a destroy
+// of it lands before or after this row and never between: a template
+// reclaim then always sees the sandbox or the snapshot pinning its build.
+// The trigger counts the limits on insert; a retry carrying an idempotency
+// key already on file is refused by the unique index and re-read by the
+// caller.
 func (q *Queries) CreateSandboxSnapshot(ctx context.Context, arg CreateSandboxSnapshotParams) (SandboxSnapshot, error) {
 	row := q.db.QueryRow(ctx, createSandboxSnapshot,
 		arg.ID,
-		arg.TeamID,
-		arg.SandboxID,
-		arg.TemplateID,
 		arg.Kind,
 		arg.Name,
 		arg.IdempotencyKey,
-		arg.HostID,
-		arg.VcpuCount,
-		arg.MemoryMib,
-		arg.DiskMib,
-		arg.BasePath,
-		arg.TimeoutSeconds,
-		arg.NetworkConfig,
 		arg.SecretBindings,
 		arg.SweepAfter,
+		arg.SandboxID,
+		arg.TeamID,
 	)
 	var i SandboxSnapshot
 	err := row.Scan(

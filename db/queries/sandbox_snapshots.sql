@@ -1,18 +1,25 @@
 -- name: CreateSandboxSnapshot :one
 -- The row exists as creating before the host is asked, under the id the
 -- host's capture is keyed by, so an answer lost on the way back is settled
--- later from the host (see the snapshot sweep). The trigger counts the
--- limits on insert; a retry carrying an idempotency key already on file is
--- refused by the unique index and re-read by the caller.
+-- later from the host (see the snapshot sweep). What the row records of its
+-- source is read here, from a source still live, held shared so a destroy
+-- of it lands before or after this row and never between: a template
+-- reclaim then always sees the sandbox or the snapshot pinning its build.
+-- The trigger counts the limits on insert; a retry carrying an idempotency
+-- key already on file is refused by the unique index and re-read by the
+-- caller.
 INSERT INTO sandbox_snapshot (
     id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key,
     host_id, vcpu_count, memory_mib, disk_mib, base_path,
     timeout_seconds, network_config, secret_bindings, sweep_after
-) VALUES (
-    @id, @team_id, @sandbox_id, @template_id, @kind, 'creating', sqlc.narg('name'), sqlc.narg('idempotency_key'),
-    @host_id, @vcpu_count, @memory_mib, @disk_mib, @base_path,
-    sqlc.narg('timeout_seconds'), @network_config, @secret_bindings, @sweep_after
 )
+SELECT @id::uuid, s.team_id, s.id, s.template_id, @kind::text, 'creating', sqlc.narg('name')::text, sqlc.narg('idempotency_key')::text,
+    s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.base_path,
+    s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb), @secret_bindings::jsonb, @sweep_after::timestamptz
+FROM sandbox s
+WHERE s.id = @sandbox_id AND s.team_id = @team_id AND s.destroyed_at IS NULL
+  AND s.status IN ('active', 'paused') AND s.host_id <> '' AND s.base_path IS NOT NULL
+FOR SHARE OF s
 RETURNING *;
 
 -- name: GetSandboxSnapshot :one

@@ -10,7 +10,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -26,14 +25,24 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	params := func(kind string, key *string) db.CreateSandboxSnapshotParams {
+		return db.CreateSandboxSnapshotParams{
+			ID: uuid.New(), TeamID: teamID, SandboxID: sandboxID, Kind: kind, IdempotencyKey: key,
+			SecretBindings: []byte("[]"), SweepAfter: time.Now().Add(15 * time.Minute),
+		}
+	}
+	// The row takes what it records from a source still live: not one
+	// starting, and not one without an overlay.
+	if _, err := q.CreateSandboxSnapshot(ctx, params("mem+fs", nil)); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("snapshot of a starting sandbox: want no rows, got %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', base_path = '/base.ext4', disk_mib = 4096 WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
 	key := "deploy-1"
 	create := func(kind string, key *string) db.SandboxSnapshot {
 		t.Helper()
-		row, err := q.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
-			ID: uuid.New(), TeamID: teamID, SandboxID: sandboxID, Kind: kind, IdempotencyKey: key,
-			HostID: "default", VcpuCount: 1, MemoryMib: 1024, DiskMib: 4096, BasePath: "/base.ext4",
-			NetworkConfig: []byte("{}"), SecretBindings: []byte("[]"), SweepAfter: pgtype.Timestamptz{Time: time.Now().Add(15 * time.Minute), Valid: true},
-		})
+		row, err := q.CreateSandboxSnapshot(ctx, params(kind, key))
 		if err != nil {
 			t.Fatalf("create %s: %v", kind, err)
 		}
@@ -42,6 +51,9 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	fs := create("fs", &key)
 	if fs.Status != "creating" {
 		t.Fatalf("new row status %q", fs.Status)
+	}
+	if fs.HostID != "default" || fs.BasePath != "/base.ext4" || fs.DiskMib != 4096 || fs.VcpuCount != 1 {
+		t.Fatalf("row did not take the source's values: %+v", fs)
 	}
 	if _, err := q.BeginSandboxSnapshotDelete(ctx, db.BeginSandboxSnapshotDeleteParams{ID: fs.ID, TeamID: teamID, StaleBefore: time.Now().Add(-time.Hour)}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("delete of a creating row: want no rows, got %v", err)
@@ -147,6 +159,14 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	}
 	if seen = claim(); seen[fs.ID] {
 		t.Fatal("a deleted row was claimed")
+	}
+
+	// A destroyed source gives no snapshot, whatever was read of it before.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET destroyed_at = now(), status = 'deleted' WHERE id = $1`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.CreateSandboxSnapshot(ctx, params("mem+fs", nil)); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("snapshot of a destroyed sandbox: want no rows, got %v", err)
 	}
 
 	// A capture unsettled for an hour is the user's to retire.

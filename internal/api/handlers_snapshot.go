@@ -14,7 +14,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"google.golang.org/grpc/codes"
@@ -229,30 +228,21 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 		respondError(c, ErrInternal)
 		return
 	}
-	netCfg := sb.NetworkConfig
-	if len(netCfg) == 0 {
-		netCfg = []byte("{}")
-	}
 	row, err := h.DB.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
 		ID:             uuid.New(),
-		TeamID:         teamID,
-		SandboxID:      sandboxID,
-		TemplateID:     sb.TemplateID,
 		Kind:           body.Kind,
 		Name:           body.Name,
 		IdempotencyKey: body.IdempotencyKey,
-		HostID:         sb.HostID,
-		VcpuCount:      sb.VcpuCount,
-		MemoryMib:      sb.MemoryMib,
-		DiskMib:        sb.DiskMib,
-		BasePath:       *sb.BasePath,
-		TimeoutSeconds: sb.TimeoutSeconds,
-		NetworkConfig:  netCfg,
 		SecretBindings: bindings,
-		SweepAfter:     pgtype.Timestamptz{Time: time.Now().Add(snapshotSweepCreatingAge), Valid: true},
+		SweepAfter:     time.Now().Add(snapshotSweepCreatingAge),
+		SandboxID:      sandboxID,
+		TeamID:         teamID,
 	})
 	if err != nil {
 		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			// The source moved on since it was read above.
+			respondErrorMsg(c, "conflict", "sandbox is no longer active or paused", http.StatusConflict)
 		case body.IdempotencyKey != nil && isUniqueViolation(err):
 			// Another request with the same key got in first.
 			existing, gerr := h.DB.GetSandboxSnapshotByIdempotencyKey(ctx, db.GetSandboxSnapshotByIdempotencyKeyParams{TeamID: teamID, SandboxID: sandboxID, IdempotencyKey: body.IdempotencyKey})

@@ -142,7 +142,7 @@ func TestCreateSandboxSnapshotCapturesAndAnswersReady(t *testing.T) {
 			case strings.Contains(sql, "-- name: CreateSandboxSnapshot :one"):
 				inserted = snapshotFixture(teamID, sandboxID, "creating")
 				inserted.ID = args[0].(uuid.UUID)
-				inserted.Kind = args[4].(string)
+				inserted.Kind = args[1].(string)
 				return sandboxSnapshotRow(inserted)
 			case strings.Contains(sql, "-- name: MarkSandboxSnapshotReady :one"):
 				ready := inserted
@@ -237,6 +237,36 @@ func TestCreateSandboxSnapshotRefusesAHostWhoseDeleteIsNotFinal(t *testing.T) {
 	snapshotRouter(h, teamID).ServeHTTP(w, jsonReq(http.MethodPost, "/sandboxes/"+sandboxID.String()+"/snapshot", nil))
 	if w.Code != http.StatusServiceUnavailable || parseJSON(t, w)["error"].(map[string]any)["code"] != "host_not_ready" || inserted || captured {
 		t.Fatalf("status=%d inserted=%v captured=%v body=%s; want 503 host_not_ready and nothing done", w.Code, inserted, captured, w.Body.String())
+	}
+}
+
+func TestCreateSandboxSnapshotRefusesASourceThatMovedOn(t *testing.T) {
+	teamID, sandboxID := uuid.New(), uuid.New()
+	base := "/base.ext4"
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusActive, HostID: "host-1", BasePath: &base, VcpuCount: 1, MemoryMib: 1024, DiskMib: 4096}
+	mock := &mockDBTX{queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+		switch {
+		case strings.Contains(sql, "-- name: GetSandbox :one"):
+			return sandboxRow(sb)
+		case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+			return scalarBoolRow(true)
+		case strings.Contains(sql, "-- name: CreateSandboxSnapshot :one"):
+			// Destroyed between the read and the insert: the insert finds no
+			// live source to copy.
+			return errRow(pgx.ErrNoRows)
+		}
+		return errRow(fmt.Errorf("unexpected query: %s", sql))
+	}}
+	captured := false
+	vmd := &stubVMD{createSavedFn: func(context.Context, string, string, string) (vmdclient.SavedSnapshot, error) {
+		captured = true
+		return vmdclient.SavedSnapshot{}, nil
+	}}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	snapshotRouter(h, teamID).ServeHTTP(w, jsonReq(http.MethodPost, "/sandboxes/"+sandboxID.String()+"/snapshot", nil))
+	if w.Code != http.StatusConflict || captured {
+		t.Fatalf("status=%d captured=%v body=%s; want 409 and no capture", w.Code, captured, w.Body.String())
 	}
 }
 
