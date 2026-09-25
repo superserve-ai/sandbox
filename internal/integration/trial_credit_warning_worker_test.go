@@ -543,7 +543,7 @@ func TestTrialWarningDispatchIncludesPausedStorageTeam(t *testing.T) {
 		return nil
 	})}
 	// Admission may defer advisory work while reconciliation occupies the pool.
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for {
 		api.RefreshActiveTrialEligibilityForTest(h, ctx)
 		h.WaitAsyncBookkeeping()

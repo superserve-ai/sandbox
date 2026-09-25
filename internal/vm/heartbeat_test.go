@@ -84,6 +84,57 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 	}
 }
 
+func TestSendHeartbeatAdvertisesTemplateBuildOnlyWhenReadyAndConfigured(t *testing.T) {
+	tests := []struct {
+		name       string
+		ready      func() bool
+		token      string
+		controlURL string
+		wantBuild  bool
+	}{
+		{name: "ready and configured", ready: func() bool { return true }, token: "shared", controlURL: "https://control.example.com", wantBuild: true},
+		{name: "readiness unavailable", token: "shared", controlURL: "https://control.example.com"},
+		{name: "not ready", ready: func() bool { return false }, token: "shared", controlURL: "https://control.example.com"},
+		{name: "token missing", ready: func() bool { return true }, controlURL: "https://control.example.com"},
+		{name: "control plane URL missing", ready: func() bool { return true }, token: "shared"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got heartbeatRequest
+			var received bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/health":
+					_ = json.NewEncoder(w).Encode(proxyHealthResponse{})
+				case "/heartbeat":
+					received = true
+					if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+						t.Errorf("decode heartbeat: %v", err)
+					}
+					w.WriteHeader(http.StatusOK)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			cfg := HeartbeatConfig{
+				HostID: "host-a", TemplateBuildReady: tt.ready,
+				Token: tt.token, ControlPlaneURL: tt.controlURL,
+			}
+			ok, _ := sendHeartbeat(context.Background(), server.Client(), cfg,
+				server.URL+"/heartbeat", tt.token, server.URL+"/health", nil, zerolog.Nop())
+			if !ok || !received {
+				t.Fatal("heartbeat was not received successfully")
+			}
+			if gotBuild := slices.Contains(got.Capabilities, "template_build_v1"); gotBuild != tt.wantBuild {
+				t.Fatalf("template_build_v1 advertised = %t, want %t; capabilities = %v", gotBuild, tt.wantBuild, got.Capabilities)
+			}
+		})
+	}
+}
+
 func TestProxyPreviewCapabilitiesRequiresAccessBeforeTokens(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

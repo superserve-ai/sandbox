@@ -211,6 +211,8 @@ module "api" {
     OTEL_METRICS_ENABLED        = "true"
     OTEL_SERVICE_NAME           = "sandbox-controlplane"
     SUPABASE_URL                = var.supabase_url
+    TEMPLATE_BUILD_REGION       = local.region
+    BACKUP_BUCKET               = "superserve-artifact-backup-staging-usc1"
     DEFAULT_HOST_ID             = var.build_host_id
     VMD_GRPC_ADDRESS            = format("%s:50051", module.sandbox_host_b.internal_ip)
     STRIPE_API_BASE_URL         = "https://api.stripe.com"

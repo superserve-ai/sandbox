@@ -808,7 +808,8 @@ type BuildLogEvent struct {
 	// Present on the final event emitted when the build finalizes. Caller
 	// should close its SSE connection after receiving a finished event.
 	Finished      bool   `protobuf:"varint,5,opt,name=finished,proto3" json:"finished,omitempty"`
-	Status        string `protobuf:"bytes,6,opt,name=status,proto3" json:"status,omitempty"` // "ready" | "failed" | "cancelled", set when finished.
+	Status        string `protobuf:"bytes,6,opt,name=status,proto3" json:"status,omitempty"`      // "ready" | "failed" | "cancelled", set when finished.
+	Sequence      uint64 `protobuf:"varint,7,opt,name=sequence,proto3" json:"sequence,omitempty"` // Append order within one build VM's log buffer.
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -883,6 +884,13 @@ func (x *BuildLogEvent) GetStatus() string {
 		return x.Status
 	}
 	return ""
+}
+
+func (x *BuildLogEvent) GetSequence() uint64 {
+	if x != nil {
+		return x.Sequence
+	}
+	return 0
 }
 
 type ResourceLimits struct {
@@ -4266,14 +4274,15 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\x15\n" +
 	"\x13CancelBuildResponse\"8\n" +
 	"\x16StreamBuildLogsRequest\x12\x1e\n" +
-	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\xc8\x01\n" +
+	"\vbuild_vm_id\x18\x01 \x01(\tR\tbuildVmId\"\xe4\x01\n" +
 	"\rBuildLogEvent\x12%\n" +
 	"\x0etimestamp_unix\x18\x01 \x01(\x03R\rtimestampUnix\x120\n" +
 	"\x14timestamp_unix_nanos\x18\x02 \x01(\x03R\x12timestampUnixNanos\x12\x16\n" +
 	"\x06stream\x18\x03 \x01(\tR\x06stream\x12\x12\n" +
 	"\x04text\x18\x04 \x01(\tR\x04text\x12\x1a\n" +
 	"\bfinished\x18\x05 \x01(\bR\bfinished\x12\x16\n" +
-	"\x06status\x18\x06 \x01(\tR\x06status\"\xa8\x01\n" +
+	"\x06status\x18\x06 \x01(\tR\x06status\x12\x1a\n" +
+	"\bsequence\x18\a \x01(\x04R\bsequence\"\xa8\x01\n" +
 	"\x0eResourceLimits\x12\x1d\n" +
 	"\n" +
 	"vcpu_count\x18\x01 \x01(\rR\tvcpuCount\x12\x1d\n" +

@@ -534,19 +534,21 @@ func timestamptzString(ts pgtype.Timestamptz) any {
 // pressureReport mirrors vmd's pressureRequest. vmd_addr is the identity
 // fence checked against the host row inside the upsert itself.
 type pressureReport struct {
-	IncarnationID         string `json:"incarnation_id,omitempty"`
-	VMDAddr               string `json:"vmd_addr"`
-	RunningSandboxes      int32  `json:"running_sandboxes"`
-	ProvisioningSandboxes int32  `json:"provisioning_sandboxes"`
-	PausedSandboxes       int32  `json:"paused_sandboxes"`
-	AllocatedMemoryMib    int64  `json:"allocated_memory_mib"`
-	AllocatedVcpus        int64  `json:"allocated_vcpus"`
-	UsedNetSlots          int32  `json:"used_net_slots"`
-	ProvisioningNetSlots  int32  `json:"provisioning_net_slots"`
-	WarmNetSlots          int32  `json:"warm_net_slots"`
-	NetSlotCeiling        int32  `json:"net_slot_ceiling"`
-	MaxNetworkSlots       int32  `json:"max_network_slots"`
-	MaxSandboxes          int32  `json:"max_sandboxes"`
+	IncludedBuildVMIDs     []string `json:"included_build_vm_ids"`
+	IncludedBuildSlotVMIDs []string `json:"included_build_slot_vm_ids"`
+	IncarnationID          string   `json:"incarnation_id,omitempty"`
+	VMDAddr                string   `json:"vmd_addr"`
+	RunningSandboxes       int32    `json:"running_sandboxes"`
+	ProvisioningSandboxes  int32    `json:"provisioning_sandboxes"`
+	PausedSandboxes        int32    `json:"paused_sandboxes"`
+	AllocatedMemoryMib     int64    `json:"allocated_memory_mib"`
+	AllocatedVcpus         int64    `json:"allocated_vcpus"`
+	UsedNetSlots           int32    `json:"used_net_slots"`
+	ProvisioningNetSlots   int32    `json:"provisioning_net_slots"`
+	WarmNetSlots           int32    `json:"warm_net_slots"`
+	NetSlotCeiling         int32    `json:"net_slot_ceiling"`
+	MaxNetworkSlots        int32    `json:"max_network_slots"`
+	MaxSandboxes           int32    `json:"max_sandboxes"`
 	// Live VMs whose allocation the host could not determine. Non-zero
 	// means the allocation totals are an UNDERCOUNT, so a consumer must
 	// not read the difference as free capacity.
@@ -554,6 +556,22 @@ type pressureReport struct {
 }
 
 func (r pressureReport) valid() bool {
+	if len(r.IncludedBuildVMIDs) > 1000 {
+		return false
+	}
+	if len(r.IncludedBuildSlotVMIDs) > 1000 {
+		return false
+	}
+	for _, id := range r.IncludedBuildVMIDs {
+		if id == "" || len(id) > 255 {
+			return false
+		}
+	}
+	for _, id := range r.IncludedBuildSlotVMIDs {
+		if id == "" || len(id) > 255 {
+			return false
+		}
+	}
 	return r.VMDAddr != "" && len(r.VMDAddr) <= 256 &&
 		r.RunningSandboxes >= 0 && r.ProvisioningSandboxes >= 0 &&
 		r.PausedSandboxes >= 0 && r.AllocatedMemoryMib >= 0 &&
@@ -586,21 +604,23 @@ func (h *Handlers) HostReportPressure(c *gin.Context) {
 		return
 	}
 	rows, err := h.DB.UpsertHostPressure(c.Request.Context(), db.UpsertHostPressureParams{
-		HostID:                hostID,
-		IncarnationID:         req.IncarnationID,
-		VmdAddr:               req.VMDAddr,
-		RunningSandboxes:      req.RunningSandboxes,
-		ProvisioningSandboxes: req.ProvisioningSandboxes,
-		PausedSandboxes:       req.PausedSandboxes,
-		AllocatedMemoryMib:    req.AllocatedMemoryMib,
-		AllocatedVcpus:        req.AllocatedVcpus,
-		UsedNetSlots:          req.UsedNetSlots,
-		ProvisioningNetSlots:  req.ProvisioningNetSlots,
-		WarmNetSlots:          req.WarmNetSlots,
-		NetSlotCeiling:        req.NetSlotCeiling,
-		MaxNetworkSlots:       req.MaxNetworkSlots,
-		MaxSandboxes:          req.MaxSandboxes,
-		UnknownAllocationVms:  req.UnknownAllocationVMs,
+		IncludedBuildVmIds:     req.IncludedBuildVMIDs,
+		IncludedBuildSlotVmIds: req.IncludedBuildSlotVMIDs,
+		HostID:                 hostID,
+		IncarnationID:          req.IncarnationID,
+		VmdAddr:                req.VMDAddr,
+		RunningSandboxes:       req.RunningSandboxes,
+		ProvisioningSandboxes:  req.ProvisioningSandboxes,
+		PausedSandboxes:        req.PausedSandboxes,
+		AllocatedMemoryMib:     req.AllocatedMemoryMib,
+		AllocatedVcpus:         req.AllocatedVcpus,
+		UsedNetSlots:           req.UsedNetSlots,
+		ProvisioningNetSlots:   req.ProvisioningNetSlots,
+		WarmNetSlots:           req.WarmNetSlots,
+		NetSlotCeiling:         req.NetSlotCeiling,
+		MaxNetworkSlots:        req.MaxNetworkSlots,
+		MaxSandboxes:           req.MaxSandboxes,
+		UnknownAllocationVms:   req.UnknownAllocationVMs,
 	})
 	if err != nil {
 		log.Error().Err(err).Str("host_id", hostID).Msg("UpsertHostPressure failed")

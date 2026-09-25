@@ -166,6 +166,10 @@ func TestTemplateSweepRecoversUnjournaledBuild(t *testing.T) {
 		recorded[d.Name] = d.SHA256
 	}
 	for _, f := range task.Files {
+		allocated, ok := allocatedBytes(f.Path)
+		if !ok || f.AllocatedBytes != allocated {
+			t.Fatalf("swept allocation for %s = %d, want disk allocation %d (available=%v)", f.Name, f.AllocatedBytes, allocated, ok)
+		}
 		if f.Name == buildMetaFilename {
 			continue
 		}
@@ -212,9 +216,8 @@ func TestTemplateSweepSkipsCoveredBuild(t *testing.T) {
 	}
 }
 
-// Adopted-build hashing shares the pause recovery's bounded slots: with
-// every slot busy the reconcile is skipped (the sweep retries later), and
-// it proceeds once a slot frees.
+// Adopted-build hashing shares the pause recovery's bounded slots. A
+// completion remains pending while all slots are occupied.
 func TestReconcileHonorsRehashSlots(t *testing.T) {
 	root := t.TempDir()
 	dir := writeAdoptableBuildFixture(t, root, "tpl", "build-tpl")
@@ -239,7 +242,6 @@ func TestReconcileHonorsRehashSlots(t *testing.T) {
 	for i := 0; i < cap(slots); i++ {
 		<-slots
 	}
-	m.reconcileAdoptedBuildBackup(adoptedSnapshot(t, dir, "tpl", "build-tpl"))
 	waitForTask(t, tasks)
 }
 
@@ -266,8 +268,9 @@ func TestBackupBuildArtifactsOverlayFixture(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	meta := fmt.Sprintf(`{"snapshot_path":%q,"mem_path":%q,"base_path":%q,"delta_path":%q,"size_bytes":1}`,
+	meta := fmt.Sprintf(`{"snapshot_path":%q,"mem_path":%q,"rootfs_path":%q,"base_path":%q,"delta_path":%q,"size_bytes":1}`,
 		filepath.Join(dir, "vmstate.snap"), filepath.Join(dir, "mem.snap"),
+		filepath.Join(runDir, "base.ext4"),
 		filepath.Join(runDir, "base.ext4"), filepath.Join(dir, "rootfs.delta"))
 	if err := os.WriteFile(filepath.Join(dir, buildMetaFilename), []byte(meta), 0o644); err != nil {
 		t.Fatal(err)
@@ -305,13 +308,35 @@ func TestBackupBuildArtifactsOverlayFixture(t *testing.T) {
 	m2.reconcileAdoptedBuildBackup(adoptedSnapshot(t, dir, "tpl", "build-tpl"))
 	task2 := waitForTask(t, tasks)
 	basePath = ""
+	publication := make([]backup.PublicationFile, 0, len(task2.Files))
 	for _, f := range task2.Files {
+		publication = append(publication, backup.PublicationFile{
+			Name: f.Name, RuntimePath: f.RuntimePath, SizeBytes: f.Size,
+			AllocatedBytes: f.AllocatedBytes, SHA256: f.SHA256,
+		})
 		if f.Name == "base.ext4" {
 			basePath = f.Path
+		}
+		if f.Name == "base.ext4" || f.Name == "rootfs.delta" {
+			allocated, ok := allocatedBytes(f.Path)
+			if !ok || allocated == 0 || f.AllocatedBytes != allocated {
+				t.Fatalf("reconciled allocation for %s = %d, want nonzero disk allocation %d (available=%v)", f.Name, f.AllocatedBytes, allocated, ok)
+			}
 		}
 	}
 	if basePath != filepath.Join(runDir, "base.ext4") {
 		t.Fatalf("reconciled base path = %q, want the run-dir base", basePath)
+	}
+	if task2.TemplateRuntime == nil {
+		t.Fatal("recovered task lost template runtime")
+	}
+	if err := backup.ValidateTemplatePublication(*task2.TemplateRuntime, publication); err != nil {
+		t.Fatalf("recovered artifact set cannot be published: %v", err)
+	}
+	for _, f := range publication {
+		if (f.Name == "base.ext4" || f.Name == "rootfs.delta") && f.AllocatedBytes <= 0 {
+			t.Fatalf("publication allocation for %s = %d, want nonzero", f.Name, f.AllocatedBytes)
+		}
 	}
 }
 

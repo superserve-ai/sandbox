@@ -49,7 +49,9 @@ func TestSendPressurePublishesSummary(t *testing.T) {
 	defer srv.Close()
 
 	cfg := pressureCfg(HostPressure{
-		RunningSandboxes: 7, ProvisioningSandboxes: 2, PausedSandboxes: 11,
+		IncludedBuildVMIDs:     []string{"build-example"},
+		IncludedBuildSlotVMIDs: []string{"build-reserved"},
+		RunningSandboxes:       7, ProvisioningSandboxes: 2, PausedSandboxes: 11,
 		AllocatedMemoryMib: 7168, AllocatedVcpus: 14,
 		UsedNetSlots: 20, ProvisioningNetSlots: 3, WarmNetSlots: 64, NetSlotCeiling: 65000,
 	})
@@ -61,11 +63,36 @@ func TestSendPressurePublishesSummary(t *testing.T) {
 	if got.VMDAddr != "10.0.0.9:50051" {
 		t.Fatalf("vmd_addr = %q (identity fence missing)", got.VMDAddr)
 	}
+	if len(got.IncludedBuildVMIDs) != 1 || got.IncludedBuildVMIDs[0] != "build-example" {
+		t.Fatalf("included builds = %v", got.IncludedBuildVMIDs)
+	}
+	if len(got.IncludedBuildSlotVMIDs) != 1 || got.IncludedBuildSlotVMIDs[0] != "build-reserved" {
+		t.Fatalf("included build slots = %v", got.IncludedBuildSlotVMIDs)
+	}
 	if got.RunningSandboxes != 7 || got.ProvisioningSandboxes != 2 || got.PausedSandboxes != 11 ||
 		got.AllocatedMemoryMib != 7168 || got.AllocatedVcpus != 14 ||
 		got.UsedNetSlots != 20 || got.ProvisioningNetSlots != 3 || got.WarmNetSlots != 64 ||
 		got.NetSlotCeiling != 65000 || got.MaxSandboxes != 40 || got.MaxNetworkSlots != 500 {
 		t.Fatalf("payload = %+v", got)
+	}
+}
+
+func TestCapacityPressureNamesOnlyCountedBuilds(t *testing.T) {
+	m := &Manager{}
+	for _, id := range []string{"build-active", "build-done"} {
+		rec, err := m.registerBuild(id, "tpl", 1, 1024, func() {}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.completeBuild(id, rec, &BuildTemplateResult{}, nil)
+		m.releaseBuildAlloc(rec, 1, 1024)
+		if id == "build-done" {
+			m.finishBuildWorker(rec)
+		}
+	}
+	p := m.CapacityPressure()
+	if p.ProvisioningSandboxes != 1 || len(p.IncludedBuildVMIDs) != 1 || p.IncludedBuildVMIDs[0] != "build-active" {
+		t.Fatalf("pressure = %+v", p)
 	}
 }
 
@@ -234,8 +261,8 @@ func TestCapacityPressureCountsErrorVMAllocations(t *testing.T) {
 
 // Build pressure comes from counters released at worker exit, not from
 // the registry's terminal status: a cancelled build stays counted while
-// its subprocess may still be dying, and pressure never scans the
-// (indefinitely retained) registry.
+// its subprocess may still be dying. Its inclusion marker must follow
+// the same lifetime so admission does not charge the build twice.
 func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 	m := &Manager{vms: map[string]*VMInstance{}, builds: map[string]*buildRecord{}}
 	rec, err := m.registerBuild("b1", "tpl", 2, 4096, func() {}, nil)
@@ -243,22 +270,22 @@ func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedPressureIndex(m)
-	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 4096 {
+	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 4096 || len(p.IncludedBuildVMIDs) != 1 || p.IncludedBuildVMIDs[0] != "b1" {
 		t.Fatalf("after register: %+v", p)
 	}
 	// Cancel marks the record terminal — the counters must NOT release.
-	if !m.setBuildStatus("b1", BuildStatusCancelled) {
-		t.Fatal("cancel transition failed")
+	if err := m.CancelBuild(context.Background(), "b1"); err != nil {
+		t.Fatal(err)
 	}
 	seedPressureIndex(m)
-	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 4096 {
+	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 4096 || len(p.IncludedBuildVMIDs) != 1 || p.IncludedBuildVMIDs[0] != "b1" {
 		t.Fatalf("after cancel (subprocess may live): %+v, want still counted", p)
 	}
 	// The last build VM exits: allocation returns, the workflow count
 	// holds until the worker itself returns (hash-only interval).
 	m.releaseBuildAlloc(rec, 2, 4096)
 	seedPressureIndex(m)
-	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 0 {
+	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 1 || p.AllocatedMemoryMib != 0 || len(p.IncludedBuildVMIDs) != 1 || p.IncludedBuildVMIDs[0] != "b1" {
 		t.Fatalf("after VM exit: %+v, want allocation released but still provisioning", p)
 	}
 	// Idempotent: the worker's safety-net defer must not double-release.
@@ -266,9 +293,9 @@ func TestCapacityPressureBuildCountersReleaseAtWorkerExit(t *testing.T) {
 	if got := m.buildPressureMem.Load(); got != 0 {
 		t.Fatalf("mem counter = %d after double release, want 0", got)
 	}
-	m.buildPressureCount.Add(-1)
+	m.finishBuildWorker(rec)
 	seedPressureIndex(m)
-	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 0 || p.AllocatedMemoryMib != 0 {
+	if p := m.CapacityPressure(); p.ProvisioningSandboxes != 0 || p.AllocatedMemoryMib != 0 || len(p.IncludedBuildVMIDs) != 0 {
 		t.Fatalf("after worker exit: %+v, want fully released", p)
 	}
 }
@@ -970,7 +997,7 @@ func TestLeakedRecorderNotHiddenByLaterBuild(t *testing.T) {
 	if !m.setBuildStatus("build-a", BuildStatusFailed) {
 		t.Fatal("fail transition")
 	}
-	m.buildPressureCount.Add(-1)
+	m.finishBuildWorker(recA)
 
 	// Build B for the same template starts (not yet recording).
 	if _, err := m.registerBuild("build-b", "tpl-a", 4, 8192, func() {}, nil); err != nil {
