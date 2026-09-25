@@ -2028,7 +2028,13 @@ func TestBackfillQueuesEveryVMWithoutDropping(t *testing.T) {
 // finishing a VM that is eligible RIGHT NOW must leave it queued, not
 // merely untracked.
 func TestBackfillRequeuesAVMThatBecameEligibleWhileFinishing(t *testing.T) {
+	probeStarted, releaseProbe := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseProbe) }) }
+	defer release()
 	done := stubMachineConfigProbe(t, func(context.Context, string) (uint32, uint32, error) {
+		close(probeStarted)
+		<-releaseProbe
 		return 2, 1024, nil
 	})
 
@@ -2049,34 +2055,29 @@ func TestBackfillRequeuesAVMThatBecameEligibleWhileFinishing(t *testing.T) {
 	// The resume already happened: the VM is running and unsized, and its
 	// enqueue was deduped away against that tracking entry.
 	m.recoveryFinished(inst)
+	awaitBackfill(t, done) // The discarded attempt's completion, not the new probe.
 
+	// The dispatcher may already have removed the new item from pending.
+	// Wait for the probe and hold it in flight so its tracking state is stable.
+	select {
+	case <-probeStarted:
+	case <-time.After(15 * time.Second):
+		t.Fatal("a VM eligible at finish time was not re-queued for probing")
+	}
 	m.recovery.mu.Lock()
 	_, tracked := m.recovery.tracked[inst]
-	queued := len(m.recovery.pending)
 	m.recovery.mu.Unlock()
-	if !tracked || queued == 0 {
-		t.Fatalf("a VM eligible at finish time was dropped (tracked=%v queued=%d); it would stay unsized until the next restart",
-			tracked, queued)
-	}
 
-	// Let the re-queued work finish before returning: this test started
-	// a worker pool, and leaving a probe in flight would have cleanup
-	// swap the package-level seams underneath it.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		inst.mu.RLock()
-		sized := inst.Config.MemoryMiB == 1024
-		inst.mu.RUnlock()
-		if sized {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the re-queued VM was never probed")
-		}
-		select {
-		case <-done:
-		case <-time.After(10 * time.Millisecond):
-		}
+	release()
+	awaitBackfill(t, done)
+	if !tracked {
+		t.Fatal("the re-queued VM lost its tracking entry while its probe was in flight")
+	}
+	inst.mu.RLock()
+	vcpu, memoryMiB := inst.Config.VCPU, inst.Config.MemoryMiB
+	inst.mu.RUnlock()
+	if vcpu != 2 || memoryMiB != 1024 {
+		t.Fatalf("re-queued probe recovered allocation %d/%d, want 2/1024", vcpu, memoryMiB)
 	}
 }
 
