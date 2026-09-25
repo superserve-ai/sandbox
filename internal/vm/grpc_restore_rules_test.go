@@ -29,6 +29,10 @@ func TestRestoreSnapshotInstallsAndAttestsItsEgressRules(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The seeded VM's unit is alive, so the restore adopts it.
+	origDead := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false }
+	t.Cleanup(func() { vmDeadForRetry = origDead })
 	net := &fakeNetMgr{}
 	mgr := &Manager{
 		log:        zerolog.Nop(),
