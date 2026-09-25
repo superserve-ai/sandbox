@@ -8,7 +8,9 @@
 -- The trigger counts the limits on insert; a retry carrying an idempotency
 -- key already on file is refused by the unique index and re-read by the
 -- caller. The bindings a fork re-binds are read here too, by a caller that
--- holds the sandbox's secret-write lock, so a detach is in the row or after it.
+-- holds the sandbox's secret-write lock, so a detach is in the row or after
+-- it. Bindings of deleted secrets are kept: their keys are still in the
+-- guest, and a fork clears them.
 INSERT INTO sandbox_snapshot (
     id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key,
     host_id, vcpu_count, memory_mib, disk_mib, base_path,
@@ -19,8 +21,8 @@ SELECT @id::uuid, s.team_id, s.id, s.template_id, @kind::text, 'creating', sqlc.
     s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb),
     COALESCE((
       SELECT jsonb_agg(jsonb_build_object('env_key', ss.env_key, 'secret_id', ss.secret_id) ORDER BY ss.env_key)
-      FROM sandbox_secret ss JOIN secret sec ON sec.id = ss.secret_id
-      WHERE ss.sandbox_id = s.id AND sec.deleted_at IS NULL
+      FROM sandbox_secret ss
+      WHERE ss.sandbox_id = s.id
     ), '[]'::jsonb),
     @sweep_after::timestamptz
 FROM sandbox s
@@ -113,10 +115,9 @@ WHERE id IN (
 RETURNING *;
 
 -- name: SandboxSnapshotCaptureInFlight :one
--- A capture of the sandbox that may still be imaging its guest: its row is
--- creating and younger than a capture's deadline.
+-- A capture of the sandbox that may still image its guest: a creating row,
+-- which the sweep captures again until it settles, however old.
 SELECT EXISTS (
   SELECT 1 FROM sandbox_snapshot
-  WHERE sandbox_id = @sandbox_id AND status = 'creating' AND deleted_at IS NULL
-    AND created_at > @since::timestamptz
+  WHERE sandbox_id = $1 AND status = 'creating' AND deleted_at IS NULL
 );

@@ -68,6 +68,15 @@ func TestIntegration_CreateSandbox_FromSnapshot(t *testing.T) {
 	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: secretID, EnvKey: "TOKEN", ProxyToken: &token}); err != nil {
 		t.Fatal(err)
 	}
+	// Bound, but its secret deleted before the capture: recorded, so a fork
+	// can clear the key.
+	deleted := seedSecret(t, teamID)
+	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: deleted, EnvKey: "DELETED"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE secret SET deleted_at = now() WHERE id = $1`, deleted); err != nil {
+		t.Fatal(err)
+	}
 	// Detached before the capture: not the snapshot's to re-bind.
 	gone := seedSecret(t, teamID)
 	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: gone, EnvKey: "DETACHED"}); err != nil {
@@ -88,6 +97,9 @@ func TestIntegration_CreateSandbox_FromSnapshot(t *testing.T) {
 
 	if w := do(r, "POST", "/sandboxes", apiKey, body); w.Code != http.StatusConflict {
 		t.Fatalf("create from a snapshot still creating: %d %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(string(snap.SecretBindings), `"DELETED"`) || strings.Contains(string(snap.SecretBindings), `"DETACHED"`) {
+		t.Fatalf("recorded bindings = %s; want the deleted secret's key kept and the detached one out", snap.SecretBindings)
 	}
 	vmstate, mem, overlay := "/saved/s/vmstate.snap", "/saved/s/mem.diff", "/saved/s/overlay.ext4"
 	if _, err := testQueries.MarkSandboxSnapshotReady(ctx, db.MarkSandboxSnapshotReadyParams{ID: snap.ID, SnapshotPath: &vmstate, MemPath: &mem, OverlayPath: &overlay, SizeBytes: 1}); err != nil {
@@ -312,6 +324,13 @@ func TestIntegration_SecretAttachWaitsOutASnapshotCapture(t *testing.T) {
 	}
 	if bound, err := testQueries.ListSandboxSecretBindingMeta(ctx, sourceID); err != nil || len(bound) != 0 {
 		t.Fatalf("bindings after a refused attach: %+v %v", bound, err)
+	}
+	// However old: the sweep captures a creating row again until it settles.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET created_at = now() - interval '3 hours' WHERE id = $1`, snap.ID); err != nil {
+		t.Fatal(err)
+	}
+	if w := do(r, "POST", "/sandboxes/"+sourceID.String()+"/secrets", apiKey, body); w.Code != http.StatusConflict {
+		t.Fatalf("attach during an old capture: %d %s; want snapshot_in_progress", w.Code, w.Body.String())
 	}
 	overlay := "/saved/a/overlay.ext4"
 	vmstate, mem := "/saved/a/vmstate.snap", "/saved/a/mem.diff"

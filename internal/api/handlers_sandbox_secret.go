@@ -41,13 +41,10 @@ var (
 
 // refuseDuringCapture keeps the guest a capture images at the bindings its
 // row records: the row is written under the sandbox's secret-write lock,
-// which the caller holds, and until the capture can no longer be writing
-// the image no binding may change.
-func refuseDuringCapture(ctx context.Context, q *db.Queries, sb db.Sandbox) error {
-	inFlight, err := q.SandboxSnapshotCaptureInFlight(ctx, db.SandboxSnapshotCaptureInFlightParams{
-		SandboxID: sb.ID,
-		Since:     time.Now().Add(-snapshotCaptureDeadline(sb.MemoryMib)),
-	})
+// which the caller holds, and while it is creating the sweep may capture
+// again, so no binding may change until it settles or is deleted.
+func refuseDuringCapture(ctx context.Context, q *db.Queries, sandboxID uuid.UUID) error {
+	inFlight, err := q.SandboxSnapshotCaptureInFlight(ctx, sandboxID)
 	if err != nil {
 		return err
 	}
@@ -59,7 +56,7 @@ func refuseDuringCapture(ctx context.Context, q *db.Queries, sb db.Sandbox) erro
 
 func respondSnapshotInFlight(c *gin.Context) {
 	c.Header("Retry-After", "5")
-	respondErrorMsg(c, "snapshot_in_progress", "a snapshot of this sandbox is being taken; retry once it is ready", http.StatusConflict)
+	respondErrorMsg(c, "snapshot_in_progress", "a snapshot of this sandbox is being taken; retry once it is ready or failed, or delete it", http.StatusConflict)
 }
 
 type attachSecretRequest struct {
@@ -165,7 +162,7 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 			return errSandboxMidTransition
 		}
 		liveSandbox = sb
-		if lerr := refuseDuringCapture(ctx, q, sb); lerr != nil {
+		if lerr := refuseDuringCapture(ctx, q, sandboxID); lerr != nil {
 			return lerr
 		}
 		existing, lerr := q.ListSandboxSecretBindings(ctx, sandboxID)
@@ -318,7 +315,7 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 				return lerr
 			}
 		}
-		if lerr := refuseDuringCapture(mutCtx, q, sandbox); lerr != nil {
+		if lerr := refuseDuringCapture(mutCtx, q, sandboxID); lerr != nil {
 			return lerr
 		}
 		deleted, derr := q.DeleteSandboxSecretBinding(mutCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey})

@@ -164,8 +164,8 @@ SELECT $1::uuid, s.team_id, s.id, s.template_id, $2::text, 'creating', $3::text,
     s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb),
     COALESCE((
       SELECT jsonb_agg(jsonb_build_object('env_key', ss.env_key, 'secret_id', ss.secret_id) ORDER BY ss.env_key)
-      FROM sandbox_secret ss JOIN secret sec ON sec.id = ss.secret_id
-      WHERE ss.sandbox_id = s.id AND sec.deleted_at IS NULL
+      FROM sandbox_secret ss
+      WHERE ss.sandbox_id = s.id
     ), '[]'::jsonb),
     $5::timestamptz
 FROM sandbox s
@@ -194,7 +194,9 @@ type CreateSandboxSnapshotParams struct {
 // The trigger counts the limits on insert; a retry carrying an idempotency
 // key already on file is refused by the unique index and re-read by the
 // caller. The bindings a fork re-binds are read here too, by a caller that
-// holds the sandbox's secret-write lock, so a detach is in the row or after it.
+// holds the sandbox's secret-write lock, so a detach is in the row or after
+// it. Bindings of deleted secrets are kept: their keys are still in the
+// guest, and a fork clears them.
 func (q *Queries) CreateSandboxSnapshot(ctx context.Context, arg CreateSandboxSnapshotParams) (SandboxSnapshot, error) {
 	row := q.db.QueryRow(ctx, createSandboxSnapshot,
 		arg.ID,
@@ -590,19 +592,13 @@ const sandboxSnapshotCaptureInFlight = `-- name: SandboxSnapshotCaptureInFlight 
 SELECT EXISTS (
   SELECT 1 FROM sandbox_snapshot
   WHERE sandbox_id = $1 AND status = 'creating' AND deleted_at IS NULL
-    AND created_at > $2::timestamptz
 )
 `
 
-type SandboxSnapshotCaptureInFlightParams struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	Since     time.Time `json:"since"`
-}
-
-// A capture of the sandbox that may still be imaging its guest: its row is
-// creating and younger than a capture's deadline.
-func (q *Queries) SandboxSnapshotCaptureInFlight(ctx context.Context, arg SandboxSnapshotCaptureInFlightParams) (bool, error) {
-	row := q.db.QueryRow(ctx, sandboxSnapshotCaptureInFlight, arg.SandboxID, arg.Since)
+// A capture of the sandbox that may still image its guest: a creating row,
+// which the sweep captures again until it settles, however old.
+func (q *Queries) SandboxSnapshotCaptureInFlight(ctx context.Context, sandboxID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, sandboxSnapshotCaptureInFlight, sandboxID)
 	var exists bool
 	err := row.Scan(&exists)
 	return exists, err

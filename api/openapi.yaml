@@ -1551,7 +1551,8 @@ paths:
           description: >
             The sandbox is not active or paused, or, with `error.code`
             `snapshot_in_progress`, a snapshot of it is being taken; retry
-            after `Retry-After` seconds.
+            after `Retry-After` seconds, or delete a snapshot that never
+            finishes.
           content:
             application/json:
               schema:
@@ -1591,7 +1592,8 @@ paths:
           description: >
             The sandbox is not active or paused, or, with `error.code`
             `snapshot_in_progress`, a snapshot of it is being taken; retry
-            after `Retry-After` seconds.
+            after `Retry-After` seconds, or delete a snapshot that never
+            finishes.
           content:
             application/json:
               schema:
