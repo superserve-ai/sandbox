@@ -1139,8 +1139,8 @@ func bindSecret(envKey string, row db.Secret) (db.AddSandboxSecretParams, Secret
 // rebindSnapshotSecrets binds a sandbox created from a snapshot to the
 // secrets its source was bound to: by id against the team's live secrets,
 // with fresh proxy tokens. A secret deleted since is left out, as is an env
-// key the request sets itself.
-func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, recorded []byte, req *createSandboxRequest) ([]db.AddSandboxSecretParams, []SecretBindingMeta, *AppError) {
+// key the request sets itself, in secrets or envVars.
+func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, recorded []byte, secrets, envVars map[string]string) ([]db.AddSandboxSecretParams, []SecretBindingMeta, *AppError) {
 	var bound []struct {
 		EnvKey   string    `json:"env_key"`
 		SecretID uuid.UUID `json:"secret_id"`
@@ -1171,10 +1171,10 @@ func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, 
 	var meta []SecretBindingMeta
 	for _, b := range bound {
 		row, live := byID[b.SecretID]
-		if _, set := req.Secrets[b.EnvKey]; set || !live {
+		if _, set := secrets[b.EnvKey]; set || !live {
 			continue
 		}
-		if _, set := req.EnvVars[b.EnvKey]; set {
+		if _, set := envVars[b.EnvKey]; set {
 			continue
 		}
 		binding, m, err := bindSecret(b.EnvKey, row)

@@ -2736,10 +2736,11 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "from_template and from_snapshot are mutually exclusive", http.StatusBadRequest)
 		return
 	}
+	// Nil is no snapshot's id, and below it means no snapshot was named.
 	var sourceSnapshotID uuid.UUID
 	if req.FromSnapshot != nil {
 		id, err := uuid.Parse(*req.FromSnapshot)
-		if err != nil {
+		if err != nil || id == uuid.Nil {
 			respondErrorMsg(c, "bad_request", "from_snapshot is not a valid snapshot ID", http.StatusBadRequest)
 			return
 		}
@@ -2897,6 +2898,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// pin. The daemon copies the image for the new sandbox, so the request
 	// names no files of its own.
 	var source db.SandboxSnapshot
+	var reboundCh chan resolvedSecrets
 	if sourceSnapshotID != uuid.Nil {
 		snap, err := h.DB.GetSandboxSnapshot(c.Request.Context(), db.GetSandboxSnapshotParams{ID: sourceSnapshotID, TeamID: teamID})
 		tLookupDone = time.Now()
@@ -2927,6 +2929,15 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		if req.Network == nil {
 			req.Network = decodeNetworkConfig(snap.NetworkConfig)
 		}
+		// The source's secrets are one read by id, overlapped with the host
+		// pre-flight below so a fork pays the longer of the two round trips,
+		// not both; a create from a template never runs it. Joined before
+		// the row is written.
+		reboundCh = make(chan resolvedSecrets, 1)
+		go func() {
+			bindings, meta, appErr := h.rebindSnapshotSecrets(secretsCtx, teamID, snap.SecretBindings, req.Secrets, req.EnvVars)
+			reboundCh <- resolvedSecrets{bindings, meta, appErr}
+		}()
 	}
 
 	secrets := <-secretsCh
@@ -2935,15 +2946,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		return
 	}
 	secretBindings, secretMeta := secrets.bindings, secrets.meta
-	if sourceSnapshotID != uuid.Nil {
-		inherited, meta, appErr := h.rebindSnapshotSecrets(c.Request.Context(), teamID, source.SecretBindings, &req)
-		if appErr != nil {
-			respondError(c, appErr)
-			return
-		}
-		secretBindings = append(secretBindings, inherited...)
-		secretMeta = append(secretMeta, meta...)
-	}
 	tLookupDone = time.Now()
 
 	// Select a host for this sandbox.
@@ -2960,6 +2962,22 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	}
 	if !placed {
 		return
+	}
+	if reboundCh != nil {
+		rebound := <-reboundCh
+		if rebound.err != nil {
+			respondError(c, rebound.err)
+			return
+		}
+		secretBindings = append(secretBindings, rebound.bindings...)
+		secretMeta = append(secretMeta, rebound.meta...)
+		// Each binding is a JWT claim; refused here, before anything boots.
+		if len(secretBindings) > SecretsBindingsCap {
+			respondErrorMsg(c, "bad_request",
+				fmt.Sprintf("the snapshot's %d secret bindings and the request's %d exceed the limit of %d", len(rebound.bindings), len(secrets.bindings), SecretsBindingsCap),
+				http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Resolve the VMD client up front so we don't waste a DB INSERT on

@@ -223,6 +223,7 @@ func TestCreateSandbox_FromSnapshotRefusals(t *testing.T) {
 	}{
 		{name: "both sources", body: fmt.Sprintf(`{"name":"x","from_template":"t","from_snapshot":%q}`, snap.ID), wantStatus: 400, wantCode: "bad_request"},
 		{name: "not an id", body: `{"name":"x","from_snapshot":"latest"}`, wantStatus: 400, wantCode: "bad_request"},
+		{name: "the nil id", body: `{"name":"x","from_snapshot":"00000000-0000-0000-0000-000000000000"}`, wantStatus: 400, wantCode: "bad_request"},
 		{name: "unknown or another team's", snapshot: func() pgx.Row { return notFoundRow() }, wantStatus: 404, wantCode: "not_found"},
 		{name: "still creating", snapshot: func() pgx.Row {
 			creating := snap
@@ -280,6 +281,54 @@ func TestCreateSandbox_FromSnapshotRefusals(t *testing.T) {
 				t.Error("the VM booted for a snapshot deleted mid-create was not destroyed")
 			}
 		})
+	}
+}
+
+func TestCreateSandbox_FromSnapshotRefusesTooManyBindingsBeforeBoot(t *testing.T) {
+	teamID := uuid.New()
+	extra := db.Secret{ID: uuid.New(), TeamID: teamID, Name: "extra", AuthType: "bearer"}
+	inherited := make([]db.Secret, SecretsBindingsCap)
+	ids := make([]uuid.UUID, SecretsBindingsCap)
+	for i := range inherited {
+		inherited[i] = db.Secret{ID: uuid.New(), TeamID: teamID, Name: fmt.Sprintf("s%d", i), AuthType: "bearer"}
+		ids[i] = inherited[i].ID
+	}
+	snap := readySnapshotFixture(teamID, ids...)
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandboxSnapshot :one"):
+				return sandboxSnapshotRow(snap)
+			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "INSERT INTO sandbox"):
+				t.Error("a create over the binding limit must not write a row")
+			}
+			return activityRow()
+		},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			rows := &scanRows{}
+			switch {
+			case strings.Contains(sql, "-- name: GetSecretsByIDs :many"):
+				for _, s := range inherited {
+					rows.rows = append(rows.rows, secretRow(s).scanFn)
+				}
+			case strings.Contains(sql, "-- name: GetSecretsByNames :many"):
+				rows.rows = []func(...any) error{secretRow(extra).scanFn}
+			}
+			return rows, nil
+		},
+	}
+	var booted bool
+	vmd := &stubVMD{restoreFn: func(context.Context, string, string, string) (string, error) {
+		booted = true
+		return "10.0.0.7", nil
+	}}
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Signer: newTestSigner(t, "v1")}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(fmt.Sprintf(`{"name":"fork","from_snapshot":%q,"secrets":{"EXTRA":"extra"}}`, snap.ID)))
+	if w.Code != http.StatusBadRequest || booted {
+		t.Fatalf("status = %d booted = %v; want 400 before any boot: %s", w.Code, booted, w.Body.String())
 	}
 }
 
