@@ -286,14 +286,18 @@ func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string,
 // A pending sandbox_teardown blocks too: purge would cascade it away with
 // the row and strand the reclaim on the source host.
 // teamSnapshots returns "<id> kind=<kind> status=<status>" for every saved
-// snapshot row of the team, deleted ones included: their artifacts live on
-// the source host and do not move, and a sandbox created from one refers to
-// its row, so a team with any is not copied.
+// snapshot row of the team that holds the copy back: a live one, whose
+// artifacts live on the source host and do not move, or a deleted one a
+// sandbox was created from and still refers to. A deleted row nothing
+// refers to is a key kept for idempotent retries, with no artifacts left,
+// and is purged with the team.
 func teamSnapshots(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
-		SELECT id, kind, status FROM sandbox_snapshot
-		WHERE team_id = $1
-		ORDER BY created_at`, teamID)
+		SELECT ss.id, ss.kind, ss.status FROM sandbox_snapshot ss
+		WHERE ss.team_id = $1
+		  AND (ss.deleted_at IS NULL
+		       OR EXISTS (SELECT 1 FROM sandbox s WHERE s.source_snapshot_id = ss.id))
+		ORDER BY ss.created_at`, teamID)
 	if err != nil {
 		return nil, fmt.Errorf("list snapshots: %w", err)
 	}
@@ -1575,6 +1579,13 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	// Break the sandbox↔snapshot cycle so snapshots can go before sandboxes.
 	if _, err := tx.Exec(ctx, `UPDATE sandbox SET snapshot_id = NULL WHERE team_id = $1`, cfg.teamID); err != nil {
 		return fmt.Errorf("null sandbox.snapshot_id: %w", err)
+	}
+	// Only deleted saved snapshot rows nothing refers to are left by now
+	// (copy refused any other); they are not copied and go with the team.
+	if tag, err := tx.Exec(ctx, `DELETE FROM sandbox_snapshot WHERE team_id = $1`, cfg.teamID); err != nil {
+		return fmt.Errorf("delete from sandbox_snapshot: %w", err)
+	} else if tag.RowsAffected() > 0 {
+		log.Info().Int64("deleted", tag.RowsAffected()).Msg("purge: deleted saved snapshot rows dropped with the team")
 	}
 
 	var total int64
