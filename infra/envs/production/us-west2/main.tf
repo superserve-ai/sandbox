@@ -190,6 +190,8 @@ module "api" {
     SECRETS_SIGNING_KEY_ID = "v1"
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "15"
+    TEMPLATE_BUILD_REGION  = local.region
+    BACKUP_BUCKET          = "superserve-artifact-backup-usw2"
     VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
     KMS_KEY_RESOURCE       = "projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek"
 

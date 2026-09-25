@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,14 +23,15 @@ import (
 )
 
 type billingAccount struct {
-	TeamID         uuid.UUID
-	CustomerID     *string
-	SubscriptionID *string
-	Status         *string
-	EventAt        *time.Time
-	GrantID        *string
-	TrialEndedAt   *time.Time
-	CheckoutAt     *time.Time
+	TeamID            uuid.UUID
+	CustomerID        *string
+	SubscriptionID    *string
+	Status            *string
+	EventAt           *time.Time
+	GrantID           *string
+	TrialEndedAt      *time.Time
+	CheckoutAt        *time.Time
+	CheckoutSessionID *string
 }
 
 type stripeSubscription struct {
@@ -88,10 +90,43 @@ type stripeGrantList struct {
 }
 
 type stripeClient struct {
-	baseURL    string
-	secret     string
-	version    string
-	httpClient *http.Client
+	baseURL          string
+	secret           string
+	version          string
+	httpClient       *http.Client
+	grantAmountCents int64
+}
+
+func (c stripeClient) activationCreditCents() int64 {
+	if c.grantAmountCents == 0 {
+		return 9500
+	}
+	return c.grantAmountCents
+}
+
+var errRecoveryCheckoutUnverified = errors.New("checkout not verified complete")
+
+func (c stripeClient) verifyRecoveryCheckout(ctx context.Context, account billingAccount) error {
+	if account.CheckoutAt == nil {
+		return nil
+	}
+	if strings.TrimSpace(deref(account.CheckoutSessionID)) == "" {
+		return fmt.Errorf("%w: pending checkout has no session identity", errRecoveryCheckoutUnverified)
+	}
+	var session struct {
+		ID                string `json:"id"`
+		Status            string `json:"status"`
+		Customer          string `json:"customer"`
+		Subscription      string `json:"subscription"`
+		ClientReferenceID string `json:"client_reference_id"`
+	}
+	if err := c.request(ctx, http.MethodGet, "/v1/checkout/sessions/"+url.PathEscape(*account.CheckoutSessionID), nil, &session, ""); err != nil {
+		return fmt.Errorf("verify checkout: %w", err)
+	}
+	if session.ID != *account.CheckoutSessionID || session.Status != "complete" || session.Customer == "" || session.Customer != deref(account.CustomerID) || session.Subscription == "" || session.Subscription != deref(account.SubscriptionID) || session.ClientReferenceID != account.TeamID.String() {
+		return fmt.Errorf("%w: session does not match the current team/customer/subscription", errRecoveryCheckoutUnverified)
+	}
+	return nil
 }
 
 const billingRecoveryOperationTimeout = 2 * time.Minute
@@ -171,18 +206,18 @@ func activationGrantIdentity(teamID uuid.UUID) string {
 	return "stripe-activation-credit-" + teamID.String()
 }
 
-func isActivationGrantAmount(grant stripeGrant) bool {
+func (c stripeClient) isActivationGrantAmount(grant stripeGrant) bool {
 	return grant.Category == "promotional" &&
 		grant.Amount.Monetary.Currency == "usd" &&
-		grant.Amount.Monetary.Value == 9500
+		grant.Amount.Monetary.Value == c.activationCreditCents()
 }
 
 func isActivationGrantApplicable(grant stripeGrant) bool {
 	return strings.EqualFold(strings.TrimSpace(grant.ApplicabilityConfig.Scope.PriceType), "metered")
 }
 
-func isActivationGrantUsable(grant stripeGrant, now time.Time) bool {
-	if !isActivationGrantAmount(grant) || !isActivationGrantApplicable(grant) {
+func (c stripeClient) isActivationGrantUsable(grant stripeGrant, now time.Time) bool {
+	if !c.isActivationGrantAmount(grant) || !isActivationGrantApplicable(grant) {
 		return false
 	}
 	if grant.VoidedAt != nil {
@@ -191,8 +226,8 @@ func isActivationGrantUsable(grant stripeGrant, now time.Time) bool {
 	return grant.ExpiresAt == nil || *grant.ExpiresAt > now.Unix()
 }
 
-func isVerifiedActivationGrant(grant stripeGrant, localGrantID, identity string) bool {
-	if strings.TrimSpace(grant.ID) == "" || !isActivationGrantUsable(grant, time.Now().UTC()) {
+func (c stripeClient) isVerifiedActivationGrant(grant stripeGrant, localGrantID, identity string) bool {
+	if strings.TrimSpace(grant.ID) == "" || !c.isActivationGrantUsable(grant, time.Now().UTC()) {
 		return false
 	}
 	// A persisted grant ID is an immutable local identity. When local state is
@@ -210,7 +245,7 @@ func (c stripeClient) createGrant(ctx context.Context, customer, key, identity s
 	form.Set("category", "promotional")
 	form.Set("amount[type]", "monetary")
 	form.Set("amount[monetary][currency]", "usd")
-	form.Set("amount[monetary][value]", "9500")
+	form.Set("amount[monetary][value]", strconv.FormatInt(c.activationCreditCents(), 10))
 	form.Set("applicability_config[scope][price_type]", "metered")
 	form.Set("metadata["+activationGrantIdentityMetadataKey+"]", identity)
 	var grant stripeGrant
@@ -227,6 +262,7 @@ func main() {
 	var target string
 	var excluded string
 	var apply bool
+	var grantAmountCents int64
 	var databaseURL string
 	var stripeBaseURL string
 	var stripeVersion string
@@ -238,7 +274,11 @@ func main() {
 	flag.StringVar(&stripeBaseURL, "stripe-api-base-url", envOr("STRIPE_API_BASE_URL", "https://api.stripe.com"), "Stripe API base URL")
 	flag.StringVar(&stripeVersion, "stripe-api-version", os.Getenv("STRIPE_API_VERSION"), "Stripe API version")
 	flag.IntVar(&batchSize, "batch-size", 100, "number of audit rows to fetch per page")
+	flag.Int64Var(&grantAmountCents, "activation-credit-cents", 9500, "activation credit in USD cents; non-default requires -team")
 	flag.Parse()
+	if grantAmountCents <= 0 || (grantAmountCents != 9500 && target == "") {
+		fatal("positive activation credit required; non-default amount requires -team")
+	}
 	if databaseURL == "" {
 		fatal("database URL is required")
 	}
@@ -274,7 +314,7 @@ func main() {
 		fatal(err.Error())
 	}
 	defer pool.Close()
-	stripe := stripeClient{baseURL: stripeBaseURL, secret: os.Getenv("STRIPE_SECRET_KEY"), version: stripeVersion}
+	stripe := stripeClient{baseURL: stripeBaseURL, secret: os.Getenv("STRIPE_SECRET_KEY"), version: stripeVersion, grantAmountCents: grantAmountCents}
 	var after *uuid.UUID
 	for {
 		loadCtx, cancelLoad := context.WithTimeout(ctx, billingRecoveryOperationTimeout)
@@ -304,7 +344,7 @@ func loadAccounts(ctx context.Context, pool *pgxpool.Pool, target, after *uuid.U
 	query := `SELECT team_id, stripe_customer_id, stripe_subscription_id,
         stripe_subscription_status, stripe_subscription_event_at,
         stripe_activation_credit_grant_id, trial_ended_at,
-        checkout_initializing_at
+        checkout_initializing_at, checkout_session_id
  FROM team_billing_account
 	 WHERE (($1::uuid IS NOT NULL AND team_id = $1)
 	    OR ($1::uuid IS NULL
@@ -322,7 +362,7 @@ func loadAccounts(ctx context.Context, pool *pgxpool.Pool, target, after *uuid.U
 	var accounts []billingAccount
 	for rows.Next() {
 		var a billingAccount
-		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.EventAt, &a.GrantID, &a.TrialEndedAt, &a.CheckoutAt); err != nil {
+		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.EventAt, &a.GrantID, &a.TrialEndedAt, &a.CheckoutAt, &a.CheckoutSessionID); err != nil {
 			return nil, err
 		}
 		accounts = append(accounts, a)
@@ -331,7 +371,7 @@ func loadAccounts(ctx context.Context, pool *pgxpool.Pool, target, after *uuid.U
 }
 
 func auditAccount(ctx context.Context, pool *pgxpool.Pool, stripe stripeClient, account billingAccount, excluded *uuid.UUID, apply bool) map[string]any {
-	out := map[string]any{"team_id": account.TeamID.String(), "mode": "dry-run"}
+	out := map[string]any{"team_id": account.TeamID.String(), "mode": "dry-run", "activation_credit_cents": stripe.activationCreditCents()}
 	if apply {
 		out["mode"] = "apply"
 	}
@@ -339,8 +379,11 @@ func auditAccount(ctx context.Context, pool *pgxpool.Pool, stripe stripeClient, 
 		out["outcome"], out["reason"] = "skipped", "operationally_excluded"
 		return out
 	}
-	if account.CheckoutAt != nil {
-		out["outcome"], out["reason"] = "skipped", "checkout_still_in_progress"
+	if err := stripe.verifyRecoveryCheckout(ctx, account); err != nil {
+		out["outcome"], out["reason"], out["error"] = "unresolved", "stripe_checkout_lookup_failed", err.Error()
+		if errors.Is(err, errRecoveryCheckoutUnverified) {
+			out["outcome"], out["reason"] = "skipped", "checkout_not_verified_complete"
+		}
 		return out
 	}
 	if account.CustomerID == nil || account.SubscriptionID == nil || strings.TrimSpace(*account.CustomerID) == "" || strings.TrimSpace(*account.SubscriptionID) == "" {
@@ -378,11 +421,11 @@ func auditAccount(ctx context.Context, pool *pgxpool.Pool, stripe stripeClient, 
 	matchingGrants := 0
 	possibleGrants := 0
 	for _, grant := range grants {
-		if !isActivationGrantAmount(grant) {
+		if grant.Category != "promotional" || grant.Amount.Monetary.Currency != "usd" {
 			continue
 		}
 		possibleGrants++
-		if isVerifiedActivationGrant(grant, localGrantID, identity) {
+		if stripe.isVerifiedActivationGrant(grant, localGrantID, identity) {
 			matchingGrants++
 			grantID = grant.ID
 		}
@@ -434,6 +477,9 @@ type stripeActivationEvidence struct {
 // local account. Recovery must not use the audit snapshot after another
 // writer has had a chance to change the subscription or credit grant.
 func revalidateStripeActivation(ctx context.Context, stripe stripeClient, account billingAccount) (stripeActivationEvidence, error) {
+	if err := stripe.verifyRecoveryCheckout(ctx, account); err != nil {
+		return stripeActivationEvidence{}, err
+	}
 	if account.CustomerID == nil || account.SubscriptionID == nil || strings.TrimSpace(*account.CustomerID) == "" || strings.TrimSpace(*account.SubscriptionID) == "" {
 		return stripeActivationEvidence{}, errors.New("local billing ownership is incomplete; rerun the audit")
 	}
@@ -461,11 +507,11 @@ func revalidateStripeActivation(ctx context.Context, stripe stripeClient, accoun
 	matchingGrants := 0
 	possibleGrants := 0
 	for _, grant := range grants {
-		if !isActivationGrantAmount(grant) {
+		if grant.Category != "promotional" || grant.Amount.Monetary.Currency != "usd" {
 			continue
 		}
 		possibleGrants++
-		if isVerifiedActivationGrant(grant, localGrantID, identity) {
+		if stripe.isVerifiedActivationGrant(grant, localGrantID, identity) {
 			matchingGrants++
 			grantID = grant.ID
 		}
@@ -492,13 +538,13 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 	err = tx.QueryRow(ctx, `SELECT team_id, stripe_customer_id, stripe_subscription_id,
         stripe_subscription_status, stripe_subscription_event_at,
         stripe_activation_credit_grant_id, trial_ended_at,
-        checkout_initializing_at
+        checkout_initializing_at, checkout_session_id
         FROM team_billing_account WHERE team_id = $1 FOR UPDATE`, original.TeamID).
-		Scan(&current.TeamID, &current.CustomerID, &current.SubscriptionID, &current.Status, &current.EventAt, &current.GrantID, &current.TrialEndedAt, &current.CheckoutAt)
+		Scan(&current.TeamID, &current.CustomerID, &current.SubscriptionID, &current.Status, &current.EventAt, &current.GrantID, &current.TrialEndedAt, &current.CheckoutAt, &current.CheckoutSessionID)
 	if err != nil {
 		return "", err
 	}
-	if !sameRecoveryBillingSnapshot(current, original) || current.CheckoutAt != nil {
+	if !sameRecoveryBillingSnapshot(current, original) {
 		return "", errors.New("local billing association changed; rerun the audit")
 	}
 	// A locked terminal projection is authoritative local evidence that this
@@ -555,13 +601,13 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 	err = tx.QueryRow(ctx, `SELECT team_id, stripe_customer_id, stripe_subscription_id,
         stripe_subscription_status, stripe_subscription_event_at,
         stripe_activation_credit_grant_id, trial_ended_at,
-        checkout_initializing_at
+        checkout_initializing_at, checkout_session_id
         FROM team_billing_account WHERE team_id = $1 FOR UPDATE`, original.TeamID).
-		Scan(&latest.TeamID, &latest.CustomerID, &latest.SubscriptionID, &latest.Status, &latest.EventAt, &latest.GrantID, &latest.TrialEndedAt, &latest.CheckoutAt)
+		Scan(&latest.TeamID, &latest.CustomerID, &latest.SubscriptionID, &latest.Status, &latest.EventAt, &latest.GrantID, &latest.TrialEndedAt, &latest.CheckoutAt, &latest.CheckoutSessionID)
 	if err != nil {
 		return "", err
 	}
-	if !sameRecoveryBillingSnapshot(latest, current) || latest.CheckoutAt != nil {
+	if !sameRecoveryBillingSnapshot(latest, current) {
 		return "", errors.New("local subscription state changed during revalidation; rerun the audit")
 	}
 	if isTerminalSubscriptionStatus(deref(latest.Status)) {
@@ -575,6 +621,9 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 	// delayed deliveries then fail the normal stale-event check.
 	result, err := tx.Exec(ctx, `UPDATE team_billing_account
         SET stripe_subscription_status = $2,
+            checkout_initializing_at = NULL,
+            checkout_anchor_snapshot = NULL,
+            checkout_session_id = CASE WHEN checkout_initializing_at IS NOT NULL THEN NULL ELSE checkout_session_id END,
             current_period_start = to_timestamp($3),
             current_period_end = to_timestamp($4),
             cancel_at_period_end = $5,
@@ -621,7 +670,9 @@ func sameRecoveryBillingSnapshot(left, right billingAccount) bool {
 		deref(left.SubscriptionID) == deref(right.SubscriptionID) &&
 		deref(left.Status) == deref(right.Status) &&
 		deref(left.GrantID) == deref(right.GrantID) &&
-		sameTime(left.EventAt, right.EventAt)
+		sameTime(left.EventAt, right.EventAt) &&
+		sameTime(left.CheckoutAt, right.CheckoutAt) &&
+		deref(left.CheckoutSessionID) == deref(right.CheckoutSessionID)
 }
 
 func isTerminalSubscriptionStatus(status string) bool {

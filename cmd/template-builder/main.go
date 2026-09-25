@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,7 +33,17 @@ import (
 
 const boxdPort = 49983
 
+var eventOutputClosed atomic.Bool
+
+func configureBuildEventOutput() {
+	// A builder can outlive the VMD process that owns its stdout reader.
+	// Broken event output must not terminate the build before it writes metadata.
+	signal.Ignore(syscall.SIGPIPE)
+}
+
 func main() {
+	configureBuildEventOutput()
+
 	templateID := flag.String("template-id", "", "template UUID")
 	buildID := flag.String("build-id", "", "build UUID for tracking")
 	specJSON := flag.String("spec", "", "build spec JSON")
@@ -1175,9 +1186,15 @@ type buildEvent struct {
 }
 
 func emit(visibility, stream, format string, args ...any) {
+	if eventOutputClosed.Load() {
+		return
+	}
 	text := fmt.Sprintf(format, args...)
 	line, _ := json.Marshal(buildEvent{Visibility: visibility, Stream: stream, Text: text})
-	fmt.Println(string(line))
+	line = append(line, '\n')
+	if _, err := os.Stdout.Write(line); errors.Is(err, syscall.EPIPE) {
+		eventOutputClosed.Store(true)
+	}
 }
 
 func emitUser(stream, format string, args ...any)     { emit("user", stream, format, args...) }

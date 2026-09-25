@@ -2,8 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +20,7 @@ import (
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
@@ -79,14 +78,16 @@ type templateResponse struct {
 }
 
 type templateBuildResponse struct {
-	ID            uuid.UUID `json:"id"`
-	TemplateID    uuid.UUID `json:"template_id"`
-	Status        string    `json:"status"`
-	BuildSpecHash string    `json:"build_spec_hash"`
-	ErrorMessage  *string   `json:"error_message,omitempty"`
-	StartedAt     *string   `json:"started_at,omitempty"`
-	FinalizedAt   *string   `json:"finalized_at,omitempty"`
-	CreatedAt     string    `json:"created_at"`
+	Execution     *db.BuildExecution `json:"execution,omitempty"`
+	HostID        *string            `json:"host_id,omitempty"`
+	ID            uuid.UUID          `json:"id"`
+	TemplateID    uuid.UUID          `json:"template_id"`
+	Status        string             `json:"status"`
+	BuildSpecHash string             `json:"build_spec_hash"`
+	ErrorMessage  *string            `json:"error_message,omitempty"`
+	StartedAt     *string            `json:"started_at,omitempty"`
+	FinalizedAt   *string            `json:"finalized_at,omitempty"`
+	CreatedAt     string             `json:"created_at"`
 }
 
 // ---------------------------------------------------------------------------
@@ -226,16 +227,13 @@ func validateUserName(name string) error {
 	return nil
 }
 
-// canonicalSpecHash produces a stable hash of the spec for idempotent build
-// submits. Marshals via encoding/json — Go's json package emits map keys in
-// sorted order, so the same spec always hashes to the same value.
-func canonicalSpecHash(spec *buildSpec) (string, error) {
+// canonicalInputHash shares the builder's input identity with seed submissions.
+func canonicalInputHash(spec *buildSpec, vcpu, memoryMiB, diskMiB int32) (string, error) {
 	raw, err := json.Marshal(spec)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(raw)
-	return hex.EncodeToString(sum[:]), nil
+	return builder.InputHash(raw, vcpu, memoryMiB, diskMiB)
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +245,7 @@ func canonicalSpecHash(spec *buildSpec) (string, error) {
 // into. Caller commits to finalize; defer Rollback as a safety net.
 // On limit exceeded or DB error the response is already written and
 // (nil, nil) is returned — caller just returns.
-func (h *Handlers) acquireBuildSlot(c *gin.Context, teamID uuid.UUID) (*db.Queries, pgx.Tx) {
+func (h *Handlers) acquireBuildSlot(c *gin.Context, teamID uuid.UUID, joinTemplate ...uuid.UUID) (*db.Queries, pgx.Tx) {
 	ctx := c.Request.Context()
 	tx, err := h.Pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
@@ -262,6 +260,44 @@ func (h *Handlers) acquireBuildSlot(c *gin.Context, teamID uuid.UUID) (*db.Queri
 		return nil, nil
 	}
 	q := h.DB.WithTx(tx)
+	if len(joinTemplate) != 0 {
+		// Serialize input selection with seed edits before testing the cap:
+		// joining an existing build does not consume another logical slot.
+		if _, err := tx.Exec(ctx, "SELECT id FROM template WHERE id = $1 AND team_id = $2 FOR UPDATE", joinTemplate[0], teamID); err != nil {
+			_ = tx.Rollback(ctx)
+			respondError(c, ErrInternal)
+			return nil, nil
+		}
+		tpl, err := q.GetTemplateForOwner(ctx, db.GetTemplateForOwnerParams{ID: joinTemplate[0], TeamID: teamID})
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			if errors.Is(err, pgx.ErrNoRows) {
+				respondErrorMsg(c, "not_found", "Template not found", http.StatusNotFound)
+			} else {
+				respondError(c, ErrInternal)
+			}
+			return nil, nil
+		}
+		hash, err := builder.InputHash(tpl.BuildSpec, tpl.Vcpu, tpl.MemoryMib, tpl.DiskMib)
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			respondError(c, ErrInternal)
+			return nil, nil
+		}
+		existing, err := q.GetExistingInflightBuild(ctx, db.GetExistingInflightBuildParams{
+			TemplateID: tpl.ID, TeamID: teamID, BuildSpecHash: hash,
+		})
+		if err == nil {
+			_ = tx.Rollback(ctx)
+			c.JSON(http.StatusOK, toBuildResponse(existing))
+			return nil, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			_ = tx.Rollback(ctx)
+			respondError(c, ErrInternal)
+			return nil, nil
+		}
+	}
 	limit, err := q.GetTeamBuildConcurrency(ctx, teamID)
 	if err != nil {
 		_ = tx.Rollback(ctx)
@@ -447,8 +483,8 @@ func (h *Handlers) CreateTemplate(c *gin.Context) {
 
 	// Compute the canonical hash before the DB call so template_build's
 	// idempotency index can do its job on insert. The hash covers the
-	// canonical JSON of the spec — same hash → same build.
-	specHash, err := canonicalSpecHash(req.BuildSpec)
+	// canonical spec and resource shape — same hash → same build inputs.
+	specHash, err := canonicalInputHash(req.BuildSpec, vcpu, memMib, diskMib)
 	if err != nil {
 		log.Error().Err(err).Msg("hash build_spec")
 		respondError(c, ErrInternal)
@@ -738,6 +774,12 @@ func (h *Handlers) DeleteTemplate(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 	h.logTemplateActivity(c.Request.Context(), tplID, teamID, actorIDFromContext(c), "template", "deleted", "success", nil)
 
+	// Attempt-owned artifacts are reclaimed through their recorded owners.
+	// Accepted versions remain pinned for the distribution/retention consumer.
+	hasExecutions, lookupErr := h.DB.HasTemplateExecutions(c.Request.Context(), tplID)
+	if lookupErr != nil || hasExecutions {
+		return
+	}
 	// Drop the on-disk snapshot + rootfs. Safe because SoftDeleteTemplateIfUnused
 	// blocks while any build is in flight, so no template-builder is
 	// currently writing into these dirs.
@@ -781,28 +823,24 @@ func (h *Handlers) CreateTemplateBuild(c *gin.Context) {
 		return
 	}
 
-	// Hash the template's persisted spec — we build whatever's currently
-	// stored, not a fresh client-supplied spec. The spec is fixed at
-	// template create time.
-	var spec buildSpec
-	if err := json.Unmarshal(tpl.BuildSpec, &spec); err != nil {
-		log.Error().Err(err).Str("template_id", tplID.String()).Msg("unmarshal stored build_spec")
-		respondError(c, ErrInternal)
-		return
-	}
-	specHash, err := canonicalSpecHash(&spec)
-	if err != nil {
-		log.Error().Err(err).Msg("hash build_spec")
-		respondError(c, ErrInternal)
-		return
-	}
-
 	ctx := c.Request.Context()
-	q, tx := h.acquireBuildSlot(c, teamID)
+	q, tx := h.acquireBuildSlot(c, teamID, tplID)
 	if q == nil {
 		return
 	}
 	defer tx.Rollback(ctx)
+
+	// acquireBuildSlot holds the template row lock until insertion commits.
+	tpl, err = q.GetTemplateForOwner(ctx, db.GetTemplateForOwnerParams{ID: tplID, TeamID: teamID})
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
+	specHash, err := builder.InputHash(tpl.BuildSpec, tpl.Vcpu, tpl.MemoryMib, tpl.DiskMib)
+	if err != nil {
+		respondError(c, ErrInternal)
+		return
+	}
 
 	build, err := q.CreateTemplateBuild(ctx, db.CreateTemplateBuildParams{
 		TemplateID:    tplID,
@@ -875,7 +913,17 @@ func (h *Handlers) GetTemplateBuild(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, toBuildResponse(build))
+	response := toBuildResponse(build)
+	execution, executionErr := h.DB.GetBuildExecution(c.Request.Context(), build.ID)
+	if executionErr != nil && !errors.Is(executionErr, pgx.ErrNoRows) {
+		respondError(c, ErrInternal)
+		return
+	}
+	if executionErr == nil {
+		response.Execution = &execution
+		response.HostID = build.VmdHostID
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 func (h *Handlers) ListTemplateBuilds(c *gin.Context) {
@@ -1204,6 +1252,15 @@ func (h *Handlers) StreamTemplateBuildLogs(c *gin.Context) {
 		return
 	}
 
+	_, executionErr := h.DB.GetBuildExecution(c.Request.Context(), buildID)
+	if executionErr == nil {
+		h.streamAttemptLogs(c, build)
+		return
+	}
+	if !errors.Is(executionErr, pgx.ErrNoRows) {
+		respondError(c, ErrInternal)
+		return
+	}
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")

@@ -920,7 +920,11 @@ func TestTeamMigration(t *testing.T) {
 		mustExec(t, srcPool, `
 			INSERT INTO template_build (id, template_id, team_id, status, build_spec_hash, vmd_host_id)
 			VALUES ($1, $2, $3, 'pending', 'race-hash', $4)`, buildID, f.tpl, f.team, sourceHostID)
-		defer mustExec(t, srcPool, `DELETE FROM template_build WHERE id = $1`, buildID)
+		defer func() {
+			mustExec(t, srcPool, `UPDATE template_build SET status = 'cancelled' WHERE id = $1`, buildID)
+			mustExec(t, srcPool, `DELETE FROM template_build_execution WHERE build_id = $1`, buildID)
+			mustExec(t, srcPool, `DELETE FROM template_build WHERE id = $1`, buildID)
+		}()
 
 		cfg := f.cfg(phasePurge)
 		cfg.confirmTeamName = "migration-drill"

@@ -277,6 +277,7 @@ func TestIntegration_HostList_IncludesProvisioningAndBuilds(t *testing.T) {
 		t.Fatalf("create template: %d %s", tw.Code, tw.Body.String())
 	}
 	templateID := mustJSON(t, tw)["id"].(string)
+	legacyTemplateBuildFixture(t, templateID)
 	if _, err := testPool.Exec(ctx,
 		`UPDATE template_build SET status = 'building', vmd_host_id = $2 WHERE template_id = $1`,
 		templateID, hostID); err != nil {
@@ -376,6 +377,7 @@ func TestIntegration_TryDispatchBuildRefusesNonActiveHost(t *testing.T) {
 		t.Fatalf("create template: %d %s", tw.Code, tw.Body.String())
 	}
 	templateID := mustJSON(t, tw)["id"].(string)
+	legacyTemplateBuildFixture(t, templateID)
 	var buildID uuid.UUID
 	if err := testPool.QueryRow(ctx,
 		`SELECT id FROM template_build WHERE template_id = $1`, templateID).Scan(&buildID); err != nil {
@@ -756,6 +758,7 @@ func TestIntegration_ReapStaleBuilds_FailsNeverReadyTemplate(t *testing.T) {
 		t.Fatalf("create template: %d %s", tw.Code, tw.Body.String())
 	}
 	templateID := mustJSON(t, tw)["id"].(string)
+	legacyTemplateBuildFixture(t, templateID)
 
 	// Age the pending build past the reap's pending timeout.
 	if _, err := testPool.Exec(ctx,
@@ -1018,5 +1021,16 @@ func TestIntegration_HostPressureSerializesWithReclaim(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatal("stale pressure from the old holder survived the reclaim")
+	}
+}
+
+// Historical supervisor queries remain covered without manufacturing attempts
+// for builds that existed before the new protocol.
+func legacyTemplateBuildFixture(t *testing.T, templateID string) {
+	t.Helper()
+	for _, table := range []string{"template_build_identity", "template_build_execution"} {
+		if _, err := testPool.Exec(context.Background(), "DELETE FROM "+table+" WHERE build_id IN (SELECT id FROM template_build WHERE template_id=$1)", templateID); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

@@ -2034,6 +2034,10 @@ func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) 
 	}); err != nil {
 		t.Fatalf("upsert reporting billing period: %v", err)
 	}
+	wantStart, wantEnd, ok := billing.AnniversaryPeriod(anchor, time.Now().UTC())
+	if !ok {
+		t.Fatal("commercial billing anchor should define a current period")
+	}
 
 	w := do(r, "GET", "/billing/summary", ownerKey, "")
 	if w.Code != http.StatusOK {

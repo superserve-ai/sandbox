@@ -130,6 +130,9 @@ func TestClaimFreshSlot_NoCollisionWithSandbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ClaimFreshSlot: %v", err)
 	}
+	if st := m.SlotPressure(); st.Used != 1 || len(st.BuildSlotOwners) != 1 || st.BuildSlotOwners[0] != "build-tmpl" {
+		t.Fatalf("build reservation pressure = %+v", st)
+	}
 	sandbox, err := m.claimSlotIndex("vm-1")
 	if err != nil {
 		t.Fatalf("claimSlotIndex: %v", err)
@@ -140,6 +143,9 @@ func TestClaimFreshSlot_NoCollisionWithSandbox(t *testing.T) {
 
 	if !m.releaseIfOwned(build, "build-tmpl") {
 		t.Fatalf("releaseIfOwned(%d, build-tmpl) = false, want true", build)
+	}
+	if st := m.SlotPressure(); len(st.BuildSlotOwners) != 0 {
+		t.Fatalf("released build still reported: %+v", st)
 	}
 	reused, err := m.claimSlotIndex("vm-2")
 	if err != nil {

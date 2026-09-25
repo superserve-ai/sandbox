@@ -23,6 +23,7 @@ const (
 // BuildLogEvent is one chunk published to subscribers of a build's log
 // stream. Text is typically one line but may be mid-line for large outputs.
 type BuildLogEvent struct {
+	Sequence  uint64
 	Timestamp time.Time
 	Stream    LogStream
 	Text      string
@@ -48,6 +49,7 @@ const subscriberChanBuffer = 256
 // stored on the buildRecord and cleaned up when the record is deleted.
 type buildLogBuffer struct {
 	mu          sync.Mutex
+	sequence    uint64
 	events      []BuildLogEvent // ring buffer; len capped at buildLogBufferSize
 	dropped     int             // counter of events dropped due to overflow
 	closed      bool            // true once Close has been called
@@ -79,6 +81,8 @@ func (b *buildLogBuffer) Append(ev BuildLogEvent) {
 	if b.closed {
 		return
 	}
+	b.sequence++
+	ev.Sequence = b.sequence
 
 	if len(b.events) >= buildLogBufferSize {
 		// Ring eviction: drop the oldest by shifting. A proper circular
@@ -156,12 +160,14 @@ func (b *buildLogBuffer) Close(finalStatus BuildStatus) {
 	b.closed = true
 
 	finalEvent := BuildLogEvent{
+		Sequence:  b.sequence + 1,
 		Timestamp: time.Now(),
 		Stream:    LogStreamSystem,
 		Text:      string(finalStatus),
 		Finished:  true,
 		Status:    finalStatus,
 	}
+	b.sequence = finalEvent.Sequence
 	// Add to the history so a late subscriber also sees the terminal event.
 	if len(b.events) >= buildLogBufferSize {
 		b.events = b.events[1:]

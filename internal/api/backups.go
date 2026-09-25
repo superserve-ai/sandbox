@@ -64,10 +64,12 @@ var fingerprintHex = regexp.MustCompile(`^[0-9a-f]{1,64}$`)
 // appear: they name staging locations that stop existing after the
 // upload acks, and restore derives object names from the generation key.
 type backupFileReport struct {
-	Name       string `json:"name"`
-	SizeBytes  int64  `json:"size_bytes"`
-	SHA256     string `json:"sha256"`
-	BaseSHA256 string `json:"base_sha256,omitempty"`
+	RuntimePath    string `json:"runtime_path,omitempty"`
+	AllocatedBytes int64  `json:"allocated_bytes,omitempty"`
+	Name           string `json:"name"`
+	SizeBytes      int64  `json:"size_bytes"`
+	SHA256         string `json:"sha256"`
+	BaseSHA256     string `json:"base_sha256,omitempty"`
 	// Shared marks an artifact stored bucket-wide under bases/ rather
 	// than inside the generation prefix.
 	Shared bool `json:"shared,omitempty"`
@@ -86,12 +88,14 @@ type backupFileReport struct {
 // the host's durable outbox; the insert is idempotent on
 // (owner, bucket, generation).
 type backupReport struct {
-	SandboxID   string    `json:"sandbox_id,omitempty"`
-	TemplateID  string    `json:"template_id,omitempty"`
-	BuildID     string    `json:"build_id,omitempty"`
-	Generation  string    `json:"generation"`
-	Bucket      string    `json:"bucket"`
-	CompletedAt time.Time `json:"completed_at"`
+	TemplateRuntime  *backup.TemplateRuntime `json:"template_runtime,omitempty"`
+	BuildIncarnation string                  `json:"build_incarnation,omitempty"`
+	SandboxID        string                  `json:"sandbox_id,omitempty"`
+	TemplateID       string                  `json:"template_id,omitempty"`
+	BuildID          string                  `json:"build_id,omitempty"`
+	Generation       string                  `json:"generation"`
+	Bucket           string                  `json:"bucket"`
+	CompletedAt      time.Time               `json:"completed_at"`
 	// PauseToken echoes the identity this control plane minted for the
 	// pause that produced the generation (threaded through the pause RPC
 	// and the host's journal). Empty from older hosts and pre-token
@@ -221,6 +225,14 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 			return
 		}
 		templateID = id
+	}
+	if req.TemplateRuntime != nil {
+		if req.TemplateID == "" {
+			respondErrorMsg(c, "bad_request", "template runtime requires template owner", http.StatusBadRequest)
+			return
+		}
+		h.reportTemplatePublication(c, req)
+		return
 	}
 	files, err := json.Marshal(req.Files)
 	if err != nil {

@@ -32,10 +32,12 @@ const (
 // the packed upload carries only data extents, and restore verifies the
 // digest after reconstructing the sparse file.
 type TaskFile struct {
-	Name   string `json:"name"`
-	Path   string `json:"path"`
-	SHA256 string `json:"sha256"`
-	Size   int64  `json:"size"`
+	RuntimePath    string `json:"runtime_path,omitempty"`
+	AllocatedBytes int64  `json:"allocated_bytes,omitempty"`
+	Name           string `json:"name"`
+	Path           string `json:"path"`
+	SHA256         string `json:"sha256"`
+	Size           int64  `json:"size"`
 	// BasePath carries an overlay's base-image dependency through to the
 	// generation manifest; empty for standalone files.
 	BasePath string `json:"base_path,omitempty"`
@@ -74,12 +76,14 @@ type TaskFile struct {
 // (always with the BuildID that produced the artifacts) for template
 // builds. The owner picks the object prefix; see Task.objectName.
 type Task struct {
-	SandboxID  string     `json:"sandbox_id,omitempty"`
-	TemplateID string     `json:"template_id,omitempty"`
-	BuildID    string     `json:"build_id,omitempty"`
-	Generation string     `json:"generation"`
-	Files      []TaskFile `json:"files"`
-	Priority   Priority   `json:"priority"`
+	TemplateRuntime  *TemplateRuntime `json:"template_runtime,omitempty"`
+	BuildIncarnation string           `json:"build_incarnation,omitempty"`
+	SandboxID        string           `json:"sandbox_id,omitempty"`
+	TemplateID       string           `json:"template_id,omitempty"`
+	BuildID          string           `json:"build_id,omitempty"`
+	Generation       string           `json:"generation"`
+	Files            []TaskFile       `json:"files"`
+	Priority         Priority         `json:"priority"`
 	// PauseToken names the exact pause this sandbox generation captured
 	// (control-plane-minted, threaded through the pause RPC). Rides the
 	// journal so the completion report can carry it; empty on template

@@ -28,6 +28,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/analytics"
+	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
@@ -36,6 +37,10 @@ import (
 
 // BuildSupervisorConfig controls the supervisor's ticker cadence and bounds.
 type BuildSupervisorConfig struct {
+	// Cell is the environment-local registry region; empty disables new claims.
+	Cell              string
+	PublicationBucket string
+
 	// Interval is the poll period.
 	Interval time.Duration
 
@@ -43,12 +48,12 @@ type BuildSupervisorConfig struct {
 	// worst-case DB + vmd work per tick under a burst of submissions.
 	BatchSize int32
 
-	// GlobalMaxConcurrentBuilds is the host-wide ceiling across all teams.
+	// GlobalMaxConcurrentBuilds is the cell-wide logical-build ceiling across all teams.
 	// Stops a pathological flood from exhausting host capacity even when
 	// per-team limits would allow it.
 	GlobalMaxConcurrentBuilds int32
 
-	// HostID is the vmd host the supervisor dispatches to.
+	// HostID scopes the legacy orphan reconciler; new dispatch uses Cell.
 	HostID string
 
 	// PendingTimeout is how long a build can wait in 'pending' before it's
@@ -109,12 +114,25 @@ var ErrBuildHostGone = errors.New("build host not registered")
 // state lives in the DB. Safe to instantiate once at controlplane boot and
 // Start() with the process-lifetime context.
 type BuildSupervisor struct {
-	cfg        BuildSupervisorConfig
-	q          *db.Queries
-	resolve    Resolver
+	cfg              BuildSupervisorConfig
+	q                *db.Queries
+	resolve          Resolver
+	publicationStore interface {
+		backup.BlobReader
+		backup.BlobLister
+	}
 	log        zerolog.Logger
 	analytics  *analytics.Client   // when set, emits build-outcome events; nil is a no-op
 	onFinalize func(tpl uuid.UUID) // when set, runs after a build lands new template paths; nil is a no-op
+}
+
+// WithPublicationStore enables durable generation recovery after producer loss.
+func (s *BuildSupervisor) WithPublicationStore(store interface {
+	backup.BlobReader
+	backup.BlobLister
+}) *BuildSupervisor {
+	s.publicationStore = store
+	return s
 }
 
 // NewBuildSupervisor constructs a supervisor.
@@ -167,8 +185,24 @@ func isConnDroppedErr(err error) bool {
 // dispatch by up to Interval seconds.
 func (s *BuildSupervisor) Start(ctx context.Context) {
 	go s.loop(ctx)
+	go s.cleanupLoop(ctx)
 	if s.cfg.ReconcileInterval > 0 {
 		go s.reconcileLoop(ctx)
+	}
+}
+
+func (s *BuildSupervisor) cleanupLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.cfg.Interval)
+	defer ticker.Stop()
+
+	sentrylog.RunSafe("build-supervisor-cleanup", func() { s.cleanupAttempts(ctx) })
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sentrylog.RunSafe("build-supervisor-cleanup", func() { s.cleanupAttempts(ctx) })
+		}
 	}
 }
 
@@ -196,10 +230,9 @@ func (s *BuildSupervisor) loop(ctx context.Context) {
 	}
 }
 
-// tick runs one full cycle: reap stale, dispatch pending, poll active. Order
-// matters: reap first so the dispatch phase sees an accurate in-flight
-// count and doesn't over-commit capacity.
+// New builds reconcile through attempt CAS; the remaining passes settle legacy rows.
 func (s *BuildSupervisor) tick(ctx context.Context) {
+	s.tickExecutions(ctx)
 	s.reapStale(ctx)
 	s.dispatchPending(ctx)
 	s.pollActive(ctx)
@@ -248,164 +281,14 @@ func (s *BuildSupervisor) reapStale(ctx context.Context) {
 // is bounded by the total in-flight count; once the global cap is reached,
 // we stop scanning for this tick.
 func (s *BuildSupervisor) dispatchPending(ctx context.Context) {
-	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	// Count current in-flight at the start of the tick. Approximate budget
-	// — new rows may land during the tick, but that's fine: they'll be
-	// picked up next tick and the budget cap keeps us bounded.
-	inflightGlobal, err := s.countInflightGlobal(queryCtx)
+	rows, err := s.q.ListPendingBuildsOrdered(ctx, s.cfg.BatchSize)
 	if err != nil {
-		s.logTickErr(err, "count in-flight builds failed")
+		s.logTickErr(err, "list legacy pending builds")
 		return
 	}
-	if inflightGlobal >= int64(s.cfg.GlobalMaxConcurrentBuilds) {
-		s.log.Debug().Int64("inflight", inflightGlobal).Msg("global build cap reached; skipping dispatch")
-		return
+	for _, row := range rows {
+		s.failBuild(ctx, row.ID, "legacy queued build cannot be replayed safely; resubmit after upgrade")
 	}
-	budget := int64(s.cfg.GlobalMaxConcurrentBuilds) - inflightGlobal
-
-	pending, err := s.q.ListPendingBuildsOrdered(queryCtx, s.cfg.BatchSize)
-	if err != nil {
-		s.logTickErr(err, "list pending builds failed")
-		return
-	}
-
-	for _, row := range pending {
-		if budget <= 0 {
-			break
-		}
-		if err := s.tryDispatchOne(ctx, row); err != nil {
-			// Already logged with context in tryDispatchOne.
-			continue
-		}
-		budget--
-	}
-}
-
-// tryDispatchOne evaluates admission for a single pending row and, on pass,
-// atomically claims it, dispatches to vmd, and stamps the vmd_build_vm_id.
-// On admission fail, leaves the row in pending for a future tick. On
-// dispatch fail, marks the build failed so the user sees it and retries.
-func (s *BuildSupervisor) tryDispatchOne(ctx context.Context, row db.TemplateBuild) error {
-	rowLog := s.log.With().Str("build_id", row.ID.String()).Str("template_id", row.TemplateID.String()).Logger()
-
-	// Per-team concurrency is enforced at submit time (CreateTemplate /
-	// CreateTemplateBuild return 429 when the team is at its cap). The
-	// supervisor dispatches pending rows FIFO without re-checking so a
-	// pending row is never blocked by the count of its own siblings.
-
-	// Look up the template to get its vcpu/mem/disk and persisted build_spec.
-	tplCtx, tplCancel := context.WithTimeout(ctx, 5*time.Second)
-	tpl, err := s.q.GetTemplateForOwner(tplCtx, db.GetTemplateForOwnerParams{
-		ID:     row.TemplateID,
-		TeamID: row.TeamID,
-	})
-	tplCancel()
-	if err != nil {
-		// Template deleted between submission and dispatch — fail the
-		// build cleanly rather than leave it stuck.
-		rowLog.Warn().Err(err).Msg("template missing at dispatch time; failing build")
-		errMsg := "template_gone: template was deleted before its build started"
-		s.failBuild(ctx, row.ID, errMsg)
-		s.logBuildCompleted(ctx, row, "error", errMsg, "")
-		return err
-	}
-
-	var spec builder.BuildSpec
-	if err := json.Unmarshal(tpl.BuildSpec, &spec); err != nil {
-		rowLog.Error().Err(err).Msg("decode template build_spec")
-		errMsg := "invalid_spec: template build_spec is invalid"
-		s.failBuild(ctx, row.ID, errMsg)
-		s.logBuildCompleted(ctx, row, "error", errMsg, "")
-		return err
-	}
-
-	// Attach the id before dispatch so a timed-out RPC can be reconciled.
-	hostID := s.cfg.HostID
-	buildVMID := "build-" + row.ID.String()
-
-	// Hold new builds off a host an operator took out of rotation: a build
-	// started on a draining host would be interrupted by its retirement.
-	// The build stays pending and is retried next tick, so it dispatches
-	// as soon as the host is active again (or, later, elsewhere). This
-	// pre-check exists for the log line and to skip cheaply; the claim in
-	// TryDispatchBuild re-asserts host status atomically, so a drain
-	// landing after this read still wins.
-	statusCtx, statusCancel := context.WithTimeout(ctx, 5*time.Second)
-	host, hostErr := s.q.GetHost(statusCtx, hostID)
-	statusCancel()
-	if !buildHostAccepting(host.Status, hostErr) {
-		rowLog.Warn().Str("host_id", hostID).Str("host_status", host.Status).
-			Msg("build host not active; leaving build pending")
-		return nil
-	}
-
-	claimCtx, claimCancel := context.WithTimeout(ctx, 5*time.Second)
-	affected, err := s.q.TryDispatchBuild(claimCtx, db.TryDispatchBuildParams{
-		ID:           row.ID,
-		VmdHostID:    &hostID,
-		VmdBuildVmID: &buildVMID,
-	})
-	claimCancel()
-	if err != nil {
-		rowLog.Error().Err(err).Msg("try dispatch build")
-		return err
-	}
-	if affected == 0 {
-		rowLog.Debug().Msg("row already claimed by another tick; skipping")
-		return nil
-	}
-
-	dispatchCtx, dispatchCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer dispatchCancel()
-	vmd, err := s.resolve(dispatchCtx, hostID)
-	if err != nil {
-		if errors.Is(err, ErrBuildHostGone) {
-			// Terminal: the host id has no registration. Fail loudly.
-			rowLog.Error().Err(err).Str("host_id", hostID).Msg("resolve VMD for dispatch failed")
-			errMsg := fmt.Sprintf("dispatch_failed: build host unreachable (%s)", hostID)
-			s.failBuild(ctx, row.ID, errMsg)
-			s.logBuildCompleted(ctx, row, "error", errMsg, "")
-			return err
-		}
-		// Transient (DB blip, lookup timeout): the claim must not become a
-		// permanently failed customer build. Return it to pending; the
-		// next tick retries, and the pending reap (keyed on created_at)
-		// bounds how long a build can keep retrying.
-		rowLog.Warn().Err(err).Str("host_id", hostID).
-			Msg("transient build-host resolution failure; requeueing build")
-		// Detached like failBuild's write: shutdown cancelling the tick is
-		// exactly when the resolve fails Canceled, and the requeue must
-		// still land or the claim stays 'building' with no VM behind it.
-		rqCtx, rqCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		if _, rqErr := s.q.RequeueBuildDispatch(rqCtx, row.ID); rqErr != nil {
-			// Leave it claimed: the build-timeout reap recovers it later.
-			rowLog.Error().Err(rqErr).Msg("requeue after transient resolution failure failed")
-		}
-		rqCancel()
-		return err
-	}
-	_, err = vmd.BuildTemplate(dispatchCtx, vmdclient.BuildTemplateInput{
-		TemplateID: row.TemplateID.String(),
-		From:       spec.From,
-		Steps:      specStepsToVMD(spec.Steps),
-		StartCmd:   spec.StartCmd,
-		ReadyCmd:   spec.ReadyCmd,
-		VCPU:       uint32(tpl.Vcpu),
-		MemoryMiB:  uint32(tpl.MemoryMib),
-		DiskMiB:    uint32(tpl.DiskMib),
-		BuildVMID:  buildVMID,
-	})
-	if err != nil {
-		// vmd may have accepted the request; let pollActive reconcile via
-		// GetBuildStatus rather than failing here and orphaning the VM.
-		rowLog.Warn().Err(err).Str("build_vm_id", buildVMID).Msg("vmd.BuildTemplate dispatch errored; next poll will reconcile")
-		return err
-	}
-
-	rowLog.Info().Str("build_vm_id", buildVMID).Msg("build dispatched to vmd")
-	return nil
 }
 
 // pollActive walks every in-flight build and pulls status from vmd. Drives
@@ -642,18 +525,6 @@ func (s *BuildSupervisor) failBuild(ctx context.Context, buildID uuid.UUID, msg 
 	}
 }
 
-// countInflightGlobal returns the total number of in-flight builds across
-// all teams on this host. Cheap COUNT; single DB call per tick.
-func (s *BuildSupervisor) countInflightGlobal(ctx context.Context) (int64, error) {
-	active, err := s.q.ListActiveBuilds(ctx)
-	if err != nil {
-		return 0, err
-	}
-	// pending isn't counted — those haven't been dispatched yet and don't
-	// consume vmd resources.
-	return int64(len(active)), nil
-}
-
 // specStepsToVMD converts internal builder.BuildStep slices to the
 // vmdclient wire shape. Declared here rather than on the types so the
 // builder package stays free of a vmdclient dependency.
@@ -757,6 +628,13 @@ func applyDeletions(ctx context.Context, log zerolog.Logger, vmd buildArtifactDe
 // signal here — see ListInFlightBuilds.
 func (s *BuildSupervisor) collectLiveBuildKeys(ctx context.Context) (map[string]struct{}, error) {
 	live := map[string]struct{}{}
+	keys, err := s.q.ProtectedBuildAttemptKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, key := range keys {
+		live[key] = struct{}{}
+	}
 
 	builds, err := s.q.ListInFlightBuilds(ctx)
 	if err != nil {
@@ -836,16 +714,4 @@ func reconcileDecision(
 		out = append(out, e)
 	}
 	return out
-}
-
-// buildHostAccepting reports whether build dispatch may proceed for the
-// host. Only a positively known non-active status holds builds: a missing
-// row (bootstrap mode, host table unpopulated) or a transient read error
-// must not stall the build pipeline — dispatch failure handling covers a
-// genuinely unreachable host.
-func buildHostAccepting(status string, err error) bool {
-	if err != nil {
-		return true
-	}
-	return status == "active"
 }

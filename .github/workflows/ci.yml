@@ -75,7 +75,9 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
         # Database roles are cluster-wide, even across the suites' separate databases.
-        run: go test -p 1 -v -tags integration -count=1 -race -timeout 10m ./internal/integration/ ./cmd/migrate-team/
+        run: |
+          go test -p 1 -v -tags integration -count=1 -race -timeout 10m ./internal/integration/ ./cmd/migrate-team/
+          go test -v -tags integration -count=1 -race -timeout 10m ./cmd/seed-templates/
 
   build:
     name: Build
