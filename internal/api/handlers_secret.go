@@ -1136,12 +1136,6 @@ func bindSecret(envKey string, row db.Secret) (db.AddSandboxSecretParams, Secret
 	}, nil
 }
 
-// snapshotHadSecrets reports whether the snapshot's source had secrets bound.
-func snapshotHadSecrets(s db.SandboxSnapshot) bool {
-	var bound []json.RawMessage
-	return json.Unmarshal(s.SecretBindings, &bound) == nil && len(bound) > 0
-}
-
 // rebindSnapshotSecrets binds a sandbox created from a snapshot to the
 // secrets its source was bound to: by id against the team's live secrets,
 // with fresh proxy tokens. A secret deleted since is left out, and its key

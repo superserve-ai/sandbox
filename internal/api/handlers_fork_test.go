@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -424,6 +425,50 @@ func TestCreateSandbox_FromSnapshotClearsProxySettingsWhenNoSecretsRemain(t *tes
 	}
 	if v, ok := injected["HTTPS_PROXY"]; !ok || v != "" {
 		t.Fatalf("injected env = %v; want HTTPS_PROXY cleared", injected)
+	}
+}
+
+// The guest may hold proxy settings the snapshot's record never saw, from
+// a secret attached after the record was written: a fork with no secret
+// bound clears them even when the record lists none, and does it in the
+// stamp that runs before the row goes active, not on the response path.
+func TestCreateSandbox_FromSnapshotClearsProxySettingsTheRecordMissed(t *testing.T) {
+	teamID := uuid.New()
+	snap := readySnapshotFixture(teamID)
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandboxSnapshot :one"):
+				return sandboxSnapshotRow(snap)
+			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
+				return sandboxRow(db.Sandbox{ID: args[2].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 2048})
+			}
+			return activityRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	var injects int
+	var injected map[string]string
+	// A failing inject on the response path would answer 500; the stamp's
+	// failure fails the row after the answer.
+	vmd := &stubVMD{injectEnvFn: func(_ context.Context, _ string, env map[string]string, _ string) error {
+		injects++
+		injected = env
+		return errors.New("guest did not answer")
+	}}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(fmt.Sprintf(`{"name":"fork","from_snapshot":%q}`, snap.ID)))
+	h.WaitAsyncBookkeeping()
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d; want 201, the clear riding the stamp rather than the response path: %s", w.Code, w.Body.String())
+	}
+	if v, ok := injected["HTTPS_PROXY"]; injects != 1 || !ok || v != "" {
+		t.Fatalf("injects = %d, env = %v; want one stamp clearing HTTPS_PROXY", injects, injected)
 	}
 }
 

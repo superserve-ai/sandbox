@@ -3182,21 +3182,25 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	envVarsToShip := mergeEnvVarsWithSecrets(req.EnvVars, secretMeta)
 	// A fork keeps its source's environment: the tokens of secrets deleted
 	// since, and with no secret bound here the proxy settings, name
-	// credentials this sandbox cannot use. Anything the request sets wins.
-	if len(secretMeta) == 0 && snapshotHadSecrets(source) {
+	// credentials this sandbox cannot use. The guest may hold proxy settings
+	// the snapshot's record does not know of, attached after it was written,
+	// so they are cleared whatever the record says. Anything the request
+	// sets wins. The clears ride whichever inject runs, the hostname stamp
+	// included, so they cost no round trip of their own.
+	injectEnv := envVarsToShip
+	if sourceSnapshotID != uuid.Nil && len(secretMeta) == 0 {
 		clearedEnv = append(clearedEnv, "HTTPS_PROXY")
 	}
 	if len(clearedEnv) > 0 {
-		shipped := make(map[string]string, len(envVarsToShip)+len(clearedEnv))
+		injectEnv = make(map[string]string, len(envVarsToShip)+len(clearedEnv))
 		for k, v := range envVarsToShip {
-			shipped[k] = v
+			injectEnv[k] = v
 		}
 		for _, k := range clearedEnv {
-			if _, set := shipped[k]; !set {
-				shipped[k] = ""
+			if _, set := injectEnv[k]; !set {
+				injectEnv[k] = ""
 			}
 		}
-		envVarsToShip = shipped
 	}
 
 	// Phase 1: RestoreSnapshot boots the VM with the caller's env vars and
@@ -3444,7 +3448,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// branch entirely; it needs a cross-version vmd rollout to adopt.
 	stampAsync := len(envVarsToShip) == 0 && secretsJWT == ""
 	if !stampAsync {
-		if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), envVarsToShip, secretsJWT); injErr != nil {
+		if injErr := vmd.InjectSandboxEnv(postCtx, sandboxID.String(), injectEnv, secretsJWT); injErr != nil {
 			// A vmd without this RPC already applied these env vars during
 			// RestoreSnapshot; tolerate its absence only when no JWT needs this path.
 			if secretsJWT == "" && isVMDUnimplemented(injErr) {
@@ -3537,7 +3541,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			// matches the sync path's budget.
 			sctx, scancel := context.WithTimeout(activateCtx, vmdTimeout)
 			tStamp := time.Now()
-			stampErr := vmd.InjectSandboxEnv(sctx, sandboxID.String(), envVarsToShip, secretsJWT)
+			stampErr := vmd.InjectSandboxEnv(sctx, sandboxID.String(), injectEnv, secretsJWT)
 			scancel()
 			switch {
 			case stampErr == nil, isVMDUnimplemented(stampErr):
