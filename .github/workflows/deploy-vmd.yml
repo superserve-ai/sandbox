@@ -70,6 +70,7 @@ on:
       - 'deploy/vmd-rollback-guard'
       - 'deploy/superserve-vmd-rollback-guard.conf'
       - 'deploy/vmd-wake-floor-guard'
+      - 'deploy/vmd-compatibility-preflight'
       - 'deploy/superserve-vmd-wake-floor-guard.conf'
       - 'deploy/vmd-staged-intent-floor-guard'
       - 'deploy/superserve-vmd-staged-intent-floor-guard.conf'

@@ -342,6 +342,7 @@ BUNDLE_FILES = [
     "deploy/superserve-vmd.socket",
     "deploy/superserve-vms.service",
     "deploy/vmd-rollback-guard",
+    "deploy/vmd-compatibility-preflight",
     "deploy/superserve-vmd-rollback-guard.conf",
     "deploy/vmd-wake-floor-guard",
     "deploy/superserve-vmd-wake-floor-guard.conf",
@@ -564,6 +565,13 @@ def main() -> int:
 
         inject_script = input_preflight + legacy_vmd_enrollment() + textwrap.dedent(f"""
 
+            # Only scratch artifacts change before compatibility is established.
+            # Retained guards can know floors absent from an older deploy bundle.
+            sudo rm -rf {extract_dir}
+            mkdir -p {extract_dir}
+            tar xzf {bundle_remote} -C {extract_dir}
+            sudo python3 {extract_dir}/deploy/vmd-compatibility-preflight {extract_dir}/bin/vmd {extract_dir}/deploy
+
             # Precondition, checked before any host mutation: if
             # BACKUP_JOURNAL_PATH names a path outside a real mount (the
             # local-SSD array being transiently unmounted, most likely),
@@ -689,11 +697,6 @@ def main() -> int:
             done
             # End fresh-host env bootstrap.
 
-            # Extract the deploy bundle into a sha-scoped staging dir so
-            # parallel deploys (or aborted retries) don't collide.
-            sudo rm -rf {extract_dir}
-            mkdir -p {extract_dir}
-            tar xzf {bundle_remote} -C {extract_dir}
             # Rollback safety gate. If the incoming vmd lacks cgroup supervision
             # (a downgrade past direct-spawn), an old binary would mishandle any
             # live or PAUSED cgroup VMs on this host — deleting records/networking
@@ -726,19 +729,9 @@ def main() -> int:
                 echo "host drained — proceeding with downgrade"
             fi
 
-            # Wake-protocol floor: the guard the service runs at every start,
-            # applied to the new binary before it lands. One source for what
-            # it checks; see deploy/vmd-wake-floor-guard.
-            if ! sh {extract_dir}/deploy/vmd-wake-floor-guard {extract_dir}/bin/vmd; then
-                echo "ERROR: the wake-protocol floor guard rejects this vmd; refusing to install it" >&2
-                exit 1
-            fi
-            # Staged-intent floor: same contract, a guard of its own; see
-            # deploy/vmd-staged-intent-floor-guard.
-            if ! sh {extract_dir}/deploy/vmd-staged-intent-floor-guard {extract_dir}/bin/vmd; then
-                echo "ERROR: the staged-intent floor guard rejects this vmd; refusing to install it" >&2
-                exit 1
-            fi
+            # Recheck retained guards before replacing any of them: they may
+            # know floors the incoming bundle does not.
+            sudo python3 {extract_dir}/deploy/vmd-compatibility-preflight {extract_dir}/bin/vmd {extract_dir}/deploy
 
             # Staged-intent floor: its guard and drop-in go in, and take
             # effect, before the binary that journals such intents can run,
@@ -752,6 +745,9 @@ def main() -> int:
             sudo systemctl daemon-reload
 
             # Install vmd + template-builder binaries.
+            # Running workloads may raise floors during preparation. Recheck now;
+            # startup guards still backstop changes after this check.
+            sudo python3 {extract_dir}/deploy/vmd-compatibility-preflight {extract_dir}/bin/vmd {extract_dir}/deploy
             sudo install -m 0755 {extract_dir}/bin/vmd {install_dir}/vmd
             sudo install -m 0755 {extract_dir}/bin/template-builder {install_dir}/template-builder
 
