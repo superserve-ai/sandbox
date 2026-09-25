@@ -817,3 +817,27 @@ func TestRunningCaptureJournalsAChainWriteAsARewrite(t *testing.T) {
 		t.Fatalf("a full image after a rejected guard was journalled as %+v; want staged", atResume)
 	}
 }
+
+// A chain that moved on but whose record could not be written is not a
+// capture, and its intent stays for recovery: a restart then treats the
+// chain as an interrupted rewrite instead of trusting the stale record.
+func TestRunningCaptureKeepsTheIntentWhenTheRecordCannotBeWritten(t *testing.T) {
+	fc := startChainFC(t, map[int]byte{2: 'X'})
+	m := newSavedTestManager(t)
+	inst := seedRunningSource(t, m, fc, true)
+	chainDir := filepath.Join(m.cfg.SnapshotDir, inst.ID)
+	// The store goes away between the write and the record.
+	fc.onResume = func() { _ = m.state.Close() }
+	id := uuid.NewString()
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, id, SavedSnapshotMemFS); err == nil {
+		t.Fatal("a chain advance that could not be recorded was reported as a capture")
+	}
+	in, err := readPauseIntent(chainDir)
+	if err != nil || in == nil || in.Staged {
+		t.Fatalf("intent after a failed record write: %+v %v; want the rewrite kept for recovery", in, err)
+	}
+	dir, _ := m.savedSnapshotDir(id)
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a snapshot was published without its record: %v", err)
+	}
+}

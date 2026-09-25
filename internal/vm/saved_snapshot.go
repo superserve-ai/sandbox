@@ -405,15 +405,20 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	}
 	// The chain advance is made durable only now, with the guest released:
 	// a store write must not hold it paused. Until then the record is a
-	// step behind, which a crash turns into one rejected diff and one full
-	// pause, never a torn chain.
+	// step behind, which a crash turns into a recovered rewrite: the intent
+	// below outlives a crash, and outlives a record that could not be
+	// written, so the chain is never named by a record that does not know it.
+	var persistErr error
 	if chainMem != "" {
-		m.persistChainAdvance(inst, log)
+		persistErr = m.persistChainAdvance(inst, log)
 	}
 	if releaseErr != nil {
 		// The intent, if any, keeps the token for recovery.
 		m.markUnservable(inst, log)
 		return status.Errorf(codes.Unavailable, "source could not be resumed after capture: %v", errors.Join(captureErr, releaseErr))
+	}
+	if persistErr != nil {
+		return status.Errorf(codes.Unavailable, "chain captured but its record could not be written; the intent stays for recovery: %v", persistErr)
 	}
 	if err := clearPauseIntent(sourceDir); err != nil {
 		return fmt.Errorf("clear capture intent: %w", err)
@@ -609,15 +614,16 @@ func advanceChain(inst *VMInstance, vmstate, memPath, baseMem string, wake *Wall
 
 // persistChainAdvance writes the advanced record, so a vmd restart before
 // the next pause still finds the chain; a record a destroy removed meanwhile
-// is not brought back.
-func (m *Manager) persistChainAdvance(inst *VMInstance, log zerolog.Logger) {
+// is not brought back. A write that fails is the caller's to answer for.
+func (m *Manager) persistChainAdvance(inst *VMInstance, log zerolog.Logger) error {
 	wrote, err := m.persistStateIfPresent(inst)
-	switch {
-	case err != nil:
-		log.Error().Err(err).Msg("saved snapshot: chain advance not persisted; a vmd restart before the next pause makes it a full one")
-	case !wrote:
+	if err != nil {
+		return err
+	}
+	if !wrote {
 		log.Warn().Msg("saved snapshot: source destroyed during the capture; its record stays gone")
 	}
+	return nil
 }
 
 // cloneChainIntoSnapshot gives the snapshot its own reflinks of the chain's
