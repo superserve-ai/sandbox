@@ -1945,6 +1945,12 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		}
 	default:
 		memPath = fullPath
+		// A source on its overlay whose tracking was spent, by a capture
+		// that fell back to a full image, pauses Full here: the overlay it
+		// leaves is reclaimed after the stop, as the layered fallback's is.
+		if instMemFile == overlayPath {
+			orphanedOverlay = overlayPath
+		}
 		// In-place diff (no template base): merge dirtied pages into the VM's own
 		// mem.snap when tracking was armed this run and mem.snap is the resume base —
 		// dirtied offsets are resident/never re-faulted, disjoint from clean reads.

@@ -495,10 +495,76 @@ func TestRunningCaptureTimeoutAbandonsTheBaseline(t *testing.T) {
 		t.Fatalf("a failed first pass moved the record to %s", memFile)
 	}
 	overlay := filepath.Join(m.cfg.SnapshotDir, inst.ID, "mem.diff")
-	for _, p := range []string{overlay, layeredBaseSidecarPath(overlay), presence.SidecarPath(overlay)} {
+	for _, p := range []string{overlay, layeredBaseSidecarPath(overlay), presence.SidecarPath(overlay), filepath.Join(m.cfg.SnapshotDir, inst.ID, "vmstate.snap")} {
 		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("%s left after a torn first pass: %v", filepath.Base(p), err)
 		}
+	}
+}
+
+// A source on its own full image takes the diff in place; a write whose
+// outcome is unknown leaves the image the source is served from alone but
+// takes away the vmstate, so nothing restores a torn image.
+func TestRunningCaptureTimeoutOnAStandaloneImageLeavesNothingToRestore(t *testing.T) {
+	fc := startChainFC(t)
+	fc.hang = true
+	m := newSavedTestManager(t)
+	inst := seedRunningSource(t, m, fc, true)
+	full := filepath.Join(m.cfg.SnapshotDir, inst.ID, "mem.snap")
+	pageFile(t, full, chainPages, map[int]byte{0: 'M', 1: 'M', 2: 'M', 3: 'M'}, false)
+	vmstate := filepath.Join(m.cfg.SnapshotDir, inst.ID, "vmstate.snap")
+	if err := os.WriteFile(vmstate, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inst.mu.Lock()
+	inst.MemFilePath, inst.BaseMemPath = full, ""
+	inst.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if _, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotMemFS); err == nil {
+		t.Fatal("a timed-out write must fail the capture")
+	}
+	if _, err := os.Stat(full); err != nil {
+		t.Fatalf("the image the source runs on was removed: %v", err)
+	}
+	if _, err := os.Stat(vmstate); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a vmstate was left beside a possibly torn image: %v", err)
+	}
+	inst.mu.RLock()
+	tracked, memFile := inst.DirtyTracked, inst.MemFilePath
+	inst.mu.RUnlock()
+	if tracked || memFile != full {
+		t.Fatalf("after a timeout: tracked=%v mem=%s", tracked, memFile)
+	}
+}
+
+// A guard rejected on a source accumulating on its overlay spends the
+// baseline; the full pause that follows strands the overlay for reclaim
+// rather than forgetting it.
+func TestFullPauseAfterASpentBaselineStrandsTheOverlay(t *testing.T) {
+	fc := startChainFC(t, map[int]byte{2: 'X'}, map[int]byte{3: 'Y'})
+	fc.generation = 5
+	m := newSavedTestManager(t)
+	inst := seedRunningSource(t, m, fc, false)
+	overlay := inst.MemFilePath
+	ctx := context.Background()
+	if man, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotMemFS); err != nil || filepath.Base(man.MemPath) != "mem.snap" {
+		t.Fatalf("capture with a rejected guard: %v %v", man, err)
+	}
+	if _, memPath, _, err := m.PauseVM(ctx, inst.ID, "", "tok-test"); err != nil || filepath.Base(memPath) != "mem.snap" {
+		t.Fatalf("pause after a spent baseline: mem=%s err=%v", memPath, err)
+	}
+	// Owed for reclaim, or already reclaimed once the VM was at rest:
+	// never left allocated and forgotten.
+	inst.mu.RLock()
+	stranded := append([]string(nil), inst.StrandedOverlays...)
+	inst.mu.RUnlock()
+	if len(stranded) == 0 {
+		if _, err := os.Stat(overlay); err == nil {
+			t.Fatal("the overlay the source left is neither owed for reclaim nor reclaimed")
+		}
+	} else if len(stranded) != 1 || stranded[0] != overlay {
+		t.Fatalf("stranded overlays %v, want the overlay the source left", stranded)
 	}
 }
 

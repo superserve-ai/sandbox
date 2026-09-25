@@ -481,10 +481,13 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 			}
 		default:
 			// Failed, or timed out with the outcome unknown: the chain may be
-			// torn. Its sidecars go so nothing restores it, and the baseline
-			// with them: the source's next pause is a full one, which
-			// strands and reclaims the overlay.
+			// torn. The vmstate it was written with goes, so nothing can be
+			// restored from it, and an overlay's sidecars with it; the image
+			// the running source is served from is left alone. The baseline
+			// goes too: the source's next pause is a full one, which strands
+			// and reclaims the overlay.
 			m.abandonDirtyBaseline(inst)
+			_ = os.Remove(vmstate)
 			if layered {
 				_ = os.Remove(layeredBaseSidecarPath(overlay))
 				_ = os.Remove(presence.SidecarPath(overlay))
