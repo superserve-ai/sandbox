@@ -281,6 +281,13 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 	defer mutCancel()
 
 	deleteAndRevoke := func(q *db.Queries) error {
+		// A snapshot records the bindings under this lock, so this detach
+		// lands before its row or after it, never between.
+		if h.Pool != nil {
+			if lerr := q.LockSandboxForSecretWrites(mutCtx, sandboxID.String()); lerr != nil {
+				return lerr
+			}
+		}
 		deleted, derr := q.DeleteSandboxSecretBinding(mutCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey})
 		if derr != nil {
 			return derr

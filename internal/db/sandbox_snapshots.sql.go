@@ -161,9 +161,15 @@ INSERT INTO sandbox_snapshot (
 )
 SELECT $1::uuid, s.team_id, s.id, s.template_id, $2::text, 'creating', $3::text, $4::text,
     s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.base_path,
-    s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb), $5::jsonb, $6::timestamptz
+    s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb),
+    COALESCE((
+      SELECT jsonb_agg(jsonb_build_object('env_key', ss.env_key, 'secret_id', ss.secret_id) ORDER BY ss.env_key)
+      FROM sandbox_secret ss JOIN secret sec ON sec.id = ss.secret_id
+      WHERE ss.sandbox_id = s.id AND sec.deleted_at IS NULL
+    ), '[]'::jsonb),
+    $5::timestamptz
 FROM sandbox s
-WHERE s.id = $7 AND s.team_id = $8 AND s.destroyed_at IS NULL
+WHERE s.id = $6 AND s.team_id = $7 AND s.destroyed_at IS NULL
   AND s.status IN ('active', 'paused') AND s.host_id <> '' AND s.base_path IS NOT NULL
 FOR SHARE OF s
 RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after
@@ -174,7 +180,6 @@ type CreateSandboxSnapshotParams struct {
 	Kind           string    `json:"kind"`
 	Name           *string   `json:"name"`
 	IdempotencyKey *string   `json:"idempotency_key"`
-	SecretBindings []byte    `json:"secret_bindings"`
 	SweepAfter     time.Time `json:"sweep_after"`
 	SandboxID      uuid.UUID `json:"sandbox_id"`
 	TeamID         uuid.UUID `json:"team_id"`
@@ -188,14 +193,14 @@ type CreateSandboxSnapshotParams struct {
 // reclaim then always sees the sandbox or the snapshot pinning its build.
 // The trigger counts the limits on insert; a retry carrying an idempotency
 // key already on file is refused by the unique index and re-read by the
-// caller.
+// caller. The bindings a fork re-binds are read here too, by a caller that
+// holds the sandbox's secret-write lock, so a detach is in the row or after it.
 func (q *Queries) CreateSandboxSnapshot(ctx context.Context, arg CreateSandboxSnapshotParams) (SandboxSnapshot, error) {
 	row := q.db.QueryRow(ctx, createSandboxSnapshot,
 		arg.ID,
 		arg.Kind,
 		arg.Name,
 		arg.IdempotencyKey,
-		arg.SecretBindings,
 		arg.SweepAfter,
 		arg.SandboxID,
 		arg.TeamID,

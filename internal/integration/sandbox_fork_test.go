@@ -63,10 +63,21 @@ func TestIntegration_CreateSandbox_FromSnapshot(t *testing.T) {
 		network_config = '{"egress":{"allowed_cidrs":["10.0.0.0/8"],"denied_cidrs":[],"allowed_domains":[]}}' WHERE id = $1`, sourceID, hostID); err != nil {
 		t.Fatal(err)
 	}
+	token := "sp_source"
+	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: secretID, EnvKey: "TOKEN", ProxyToken: &token}); err != nil {
+		t.Fatal(err)
+	}
+	// Detached before the capture: not the snapshot's to re-bind.
+	gone := seedSecret(t, teamID)
+	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: gone, EnvKey: "DETACHED"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testQueries.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sourceID, EnvKey: "DETACHED"}); err != nil {
+		t.Fatal(err)
+	}
 	snap, err := testQueries.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
 		ID: uuid.New(), TeamID: teamID, SandboxID: sourceID, Kind: "mem+fs",
-		SecretBindings: []byte(fmt.Sprintf(`[{"env_key":"TOKEN","secret_id":%q}]`, secretID)),
-		SweepAfter:     time.Now().Add(15 * time.Minute),
+		SweepAfter: time.Now().Add(15 * time.Minute),
 	})
 	if err != nil {
 		t.Fatalf("create snapshot row: %v", err)
@@ -160,7 +171,7 @@ func TestIntegration_SnapshotDeleteWaitsForAForkInsert(t *testing.T) {
 	}
 	snap, err := testQueries.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
 		ID: uuid.New(), TeamID: teamID, SandboxID: sourceID, Kind: "mem+fs",
-		SecretBindings: []byte("[]"), SweepAfter: time.Now().Add(15 * time.Minute),
+		SweepAfter: time.Now().Add(15 * time.Minute),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -195,5 +206,76 @@ func TestIntegration_SnapshotDeleteWaitsForAForkInsert(t *testing.T) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
 		t.Fatalf("delete during an uncommitted fork insert: %v; want it to wait on the snapshot's lock", err)
+	}
+}
+
+// A snapshot records the source's bindings at one moment: a detach waits
+// for the capture's row, and one that committed first is not in it.
+func TestIntegration_SnapshotRecordsBindingsUnderTheSecretWriteLock(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	sourceID, err := insertSandboxRow(ctx, teamID, "bind-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', base_path = '/templates/t/base.ext4', disk_mib = 4096 WHERE id = $1`, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	secretID := seedSecret(t, teamID)
+	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: secretID, EnvKey: "TOKEN"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A detach holds the lock and has deleted the binding, uncommitted.
+	detach, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dq := db.New(detach)
+	if err := dq.LockSandboxForSecretWrites(ctx, sourceID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dq.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		row db.SandboxSnapshot
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		tx, err := testPool.Begin(ctx)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		defer tx.Rollback(ctx) //nolint:errcheck
+		q := db.New(tx)
+		if err := q.LockSandboxForSecretWrites(ctx, sourceID.String()); err != nil {
+			done <- result{err: err}
+			return
+		}
+		row, err := q.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
+			ID: uuid.New(), TeamID: teamID, SandboxID: sourceID, Kind: "mem+fs", SweepAfter: time.Now().Add(15 * time.Minute),
+		})
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
+		done <- result{row, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("the capture did not wait for the detach: %+v", r)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := detach.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := <-done
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if string(r.row.SecretBindings) != "[]" {
+		t.Fatalf("snapshot bindings = %s; a detach that committed first is not the snapshot's", r.row.SecretBindings)
 	}
 }
