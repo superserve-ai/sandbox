@@ -751,3 +751,19 @@ func TestSnapshotSweepNeverWaitsOnAHost(t *testing.T) {
 		t.Fatalf("the held row was captured %d times; a row in flight is not doubled", n)
 	}
 }
+
+func TestSnapshotCaptureDeadlineOutlastsTheHostsBudget(t *testing.T) {
+	// The host allows a minute plus a second per 64 MiB; the deadline must
+	// leave room for that, a slot wait and the settlement.
+	for _, tc := range []struct {
+		memoryMiB int32
+		hostMin   time.Duration
+	}{
+		{1024, time.Minute + 16*time.Second},
+		{65536, time.Minute + 1024*time.Second},
+	} {
+		if got := snapshotCaptureDeadline(tc.memoryMiB); got < tc.hostMin+5*time.Minute {
+			t.Errorf("%d MiB: deadline %s leaves less than five minutes beyond the host's %s", tc.memoryMiB, got, tc.hostMin)
+		}
+	}
+}

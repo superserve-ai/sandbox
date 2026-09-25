@@ -35,11 +35,14 @@ import (
 const (
 	snapshotKindFS    = "fs"
 	snapshotKindMemFS = "mem+fs"
-	// The host bounds its own work by the guest's memory and answers before
-	// this; the request is detached from the caller so a client that hangs
-	// up does not abandon a capture that is already stalling the guest.
-	snapshotCaptureTimeout = 10 * time.Minute
-	snapshotDeleteTimeout  = 30 * time.Second
+	// A capture's deadline: the host bounds its own work at a minute plus
+	// the memory at the rate below, the same floor the host's budget uses,
+	// and this is what a slot wait and the settlement get on top. The
+	// request is detached from the caller so a client that hangs up does
+	// not abandon a capture that is already stalling the guest.
+	snapshotCaptureTimeout        = 10 * time.Minute
+	snapshotCaptureFloorMiBPerSec = 64
+	snapshotDeleteTimeout         = 30 * time.Second
 	// SQLSTATEs raised by the sandbox_snapshot quota trigger: the team's or
 	// sandbox's snapshot limit, and the team's limit on captures in flight.
 	snapshotQuotaErrCode    = "SS002"
@@ -117,6 +120,12 @@ func parseSnapshotID(c *gin.Context) (uuid.UUID, error) {
 		return uuid.Nil, err
 	}
 	return id, nil
+}
+
+// snapshotCaptureDeadline is how long a capture of a source with this much
+// memory may take before it is given up on.
+func snapshotCaptureDeadline(memoryMiB int32) time.Duration {
+	return snapshotCaptureTimeout + time.Duration(memoryMiB/snapshotCaptureFloorMiBPerSec)*time.Second
 }
 
 // withinChars is the row constraint's measure: characters, not bytes.
@@ -270,7 +279,7 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 		respondError(c, ErrHostStateMissing)
 		return
 	}
-	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotCaptureTimeout)
+	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotCaptureDeadline(row.MemoryMib))
 	defer cancel()
 	snap, err := client.CreateSavedSnapshot(cctx, sandboxID.String(), row.ID.String(), body.Kind)
 	if err != nil {
@@ -716,7 +725,7 @@ func (h *Handlers) sweepSnapshot(ctx context.Context, claimed db.SandboxSnapshot
 	}
 	switch row.Status {
 	case "creating":
-		cctx, cancel := context.WithTimeout(ctx, snapshotCaptureTimeout)
+		cctx, cancel := context.WithTimeout(ctx, snapshotCaptureDeadline(row.MemoryMib))
 		snap, err := client.CreateSavedSnapshot(cctx, row.SandboxID.String(), row.ID.String(), row.Kind)
 		cancel()
 		switch {

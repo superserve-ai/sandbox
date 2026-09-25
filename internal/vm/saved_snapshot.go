@@ -720,7 +720,13 @@ func savedTombstonePath(dir string) string {
 
 func writeSavedTombstone(dir string) error {
 	path := savedTombstonePath(dir)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	tombs := filepath.Dir(path)
+	// The directory's own entry is made durable too: on its first delete a
+	// host must not lose the directory and keep the deletion.
+	if err := os.MkdirAll(tombs, 0o755); err != nil {
+		return err
+	}
+	if err := fsyncDir(filepath.Dir(tombs)); err != nil {
 		return err
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
@@ -728,7 +734,7 @@ func writeSavedTombstone(dir string) error {
 		return err
 	}
 	_ = f.Close()
-	return fsyncDir(filepath.Dir(path))
+	return fsyncDir(tombs)
 }
 
 // RunSavedTombstoneReaper drops tombstones past their day, once now and then
