@@ -90,6 +90,13 @@ locals {
 resource "google_monitoring_alert_policy" "launch_path" {
   for_each = local.launch_path_alert_conditions
 
+  lifecycle {
+    precondition {
+      condition     = alltrue([for k in ["vmd_launch", "vmd_network"] : contains(keys(var.runbook_urls), k)])
+      error_message = "Missing required runbook URL for launch_path."
+    }
+  }
+
   project               = var.project_id
   display_name          = each.value.display_name
   combiner              = "OR"
@@ -119,12 +126,15 @@ resource "google_monitoring_alert_policy" "launch_path" {
   }
 
   documentation {
-    content   = each.value.documentation
+    content   = format("%s\n\nRunbook: %s", each.value.documentation, lookup(var.runbook_urls, each.key == "launcher_not_ready" ? "vmd_launch" : "vmd_network", ""))
     mime_type = "text/markdown"
   }
 
   user_labels = merge(var.labels, {
-    alert_type = "launch_path_${each.key}"
-    managed_by = "terraform"
+    superserve_family         = "vmd"
+    superserve_component      = "vmd"
+    superserve_failure_family = lookup({ launcher_not_ready = "launcher_unavailable", netns_accumulation = "network_capacity", netns_runaway = "network_capacity" }, each.key, "")
+    alert_type                = "launch_path_${each.key}"
+    managed_by                = "terraform"
   })
 }

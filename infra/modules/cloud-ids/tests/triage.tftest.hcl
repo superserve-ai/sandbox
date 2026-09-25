@@ -9,6 +9,12 @@ variables {
   network_self_link          = "projects/example-production/global/networks/example"
   mirrored_subnet_self_links = ["projects/example-production/regions/us-east4/subnetworks/example"]
   notification_channel_ids   = ["projects/example-production/notificationChannels/123456"]
+  labels = {
+    superserve_family         = "caller_value"
+    superserve_component      = "caller_value"
+    superserve_failure_family = "caller_value"
+    environment               = "production"
+  }
 }
 
 run "east_triage" {
@@ -92,9 +98,21 @@ run "east_triage" {
   assert {
     condition = alltrue([
       for id in values(var.runbook_ids) :
-      strcontains(google_monitoring_alert_policy.ids_triage.documentation[0].content, "](https://example.com/runbooks/${id})")
+      strcontains(google_monitoring_alert_policy.ids_triage.documentation[0].content, "https://example.com/runbooks/${id}")
     ])
     error_message = "Every canonical runbook must render as a direct notification link."
+  }
+
+  assert {
+    condition = alltrue([
+      for policy in [google_monitoring_alert_policy.ids_triage, google_monitoring_alert_policy.ids_medium] :
+      length(regexall("(?m)^Runbook: https://example.com/runbooks/[^\\s]+$", policy.documentation[0].content)) == 1 &&
+      policy.user_labels.superserve_family == "cloud_ids" &&
+      policy.user_labels.superserve_component == "vmd" &&
+      policy.user_labels.superserve_failure_family == "security_finding" &&
+      policy.user_labels.environment == "production"
+    ])
+    error_message = "Active and retired Cloud IDS policies must retain one primary runbook and reserved triage labels."
   }
 
   assert {
@@ -187,7 +205,7 @@ run "west_triage" {
   assert {
     condition = alltrue([
       for id in values(var.runbook_ids) :
-      strcontains(google_monitoring_alert_policy.ids_triage.documentation[0].content, "](https://example.com/runbooks/${id})")
+      strcontains(google_monitoring_alert_policy.ids_triage.documentation[0].content, "https://example.com/runbooks/${id}")
     ])
     error_message = "Every canonical runbook must render as a direct notification link."
   }
@@ -257,7 +275,7 @@ run "single_trailing_slash" {
   assert {
     condition = alltrue([
       for id in values(var.runbook_ids) :
-      strcontains(google_monitoring_alert_policy.ids_triage.documentation[0].content, "](https://example.com/runbooks/${id})")
+      strcontains(google_monitoring_alert_policy.ids_triage.documentation[0].content, "https://example.com/runbooks/${id}")
     ])
     error_message = "A trailing slash must produce exactly one separator before each page ID."
   }
@@ -271,7 +289,7 @@ run "host_only_base" {
   assert {
     condition = alltrue([
       for id in values(var.runbook_ids) :
-      strcontains(google_monitoring_alert_policy.ids_triage.documentation[0].content, "](https://example.com/${id})")
+      strcontains(google_monitoring_alert_policy.ids_triage.documentation[0].content, "https://example.com/${id}")
     ])
     error_message = "A host-only HTTPS base must produce clickable links with a path separator."
   }
@@ -281,6 +299,14 @@ run "missing_runbook_base_rejected" {
   command = plan
   variables {
     runbook_base_url = ""
+  }
+  expect_failures = [var.runbook_base_url]
+}
+
+run "hostless_runbook_base_rejected" {
+  command = plan
+  variables {
+    runbook_base_url = "https://"
   }
   expect_failures = [var.runbook_base_url]
 }

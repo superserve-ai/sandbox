@@ -20,6 +20,10 @@ resource "google_monitoring_alert_policy" "compute_instance_cpu" {
 
   lifecycle {
     precondition {
+      condition     = contains(keys(var.runbook_urls), "host_cpu")
+      error_message = "Missing required runbook URL for compute_instance_cpu."
+    }
+    precondition {
       condition     = length(var.notification_channel_ids) > 0
       error_message = "notification_channel_ids must contain an existing monitored channel when CPU alerts are configured"
     }
@@ -63,19 +67,23 @@ resource "google_monitoring_alert_policy" "compute_instance_cpu" {
   }
 
   documentation {
-    content = coalesce(each.value.documentation, <<-EOT
+    content = format("%s\n\nRunbook: %s", replace(coalesce(each.value.documentation, <<-EOT
       Sustained CPU utilization above ${format("%.0f", each.value.threshold * 100)}% was observed on ${each.value.instance_name} for ${each.value.evaluation_duration}.
 
       Owner: Infrastructure Operations. Response: confirm host saturation in Cloud Monitoring, inspect running sandbox workload and host services, and scale or drain the host when capacity remains constrained. Record the incident and link the remediation before closing the alert.
     EOT
-    )
+    ), "/(?m)^ *Runbook:[^\\n]*(\\n|$)/", ""), lookup(var.runbook_urls, "host_cpu", ""))
+
     mime_type = "text/markdown"
   }
 
   user_labels = merge(var.labels, {
-    alert_type    = "compute_cpu_saturation"
-    instance_name = each.value.instance_name
-    managed_by    = "terraform"
+    superserve_family         = "host"
+    superserve_component      = "host"
+    superserve_failure_family = "capacity"
+    alert_type                = "compute_cpu_saturation"
+    instance_name             = each.value.instance_name
+    managed_by                = "terraform"
   })
 }
 
@@ -89,6 +97,10 @@ resource "google_monitoring_alert_policy" "host_maintenance_events" {
   notification_channels = var.notification_channel_ids
 
   lifecycle {
+    precondition {
+      condition     = contains(keys(var.runbook_urls), "host_maintenance")
+      error_message = "Missing required runbook URL for host_maintenance_events."
+    }
     precondition {
       condition     = length(var.notification_channel_ids) > 0
       error_message = "notification_channel_ids must contain an existing monitored channel when host maintenance alerts are configured"
@@ -127,21 +139,25 @@ resource "google_monitoring_alert_policy" "host_maintenance_events" {
   }
 
   documentation {
-    content = coalesce(each.value.documentation, <<-EOT
+    content = format("%s\n\nRunbook: %s", replace(coalesce(each.value.documentation, <<-EOT
       Compute Engine logged a host system event for ${each.value.instance_name}: an upcoming maintenance notice, a maintenance termination, a host error, or an automatic restart.
 
       This instance is bare metal — host maintenance terminates and restarts it, taking every workload on it down. On an upcoming-maintenance notice, check `gcloud compute instances describe ${each.value.instance_name} --format="yaml(resourceStatus.upcomingMaintenance)"` for the window and whether it can be triggered early, and drain the host before the window starts. On a termination/restart event, verify the host and its services recovered.
 
       Owner: Infrastructure Operations.
     EOT
-    )
+    ), "/(?m)^ *Runbook:[^\\n]*(\\n|$)/", ""), lookup(var.runbook_urls, "host_maintenance", ""))
+
     mime_type = "text/markdown"
   }
 
   user_labels = merge(var.labels, {
-    alert_type    = "host_maintenance_event"
-    instance_name = each.value.instance_name
-    managed_by    = "terraform"
+    superserve_family         = "host"
+    superserve_component      = "host"
+    superserve_failure_family = "maintenance"
+    alert_type                = "host_maintenance_event"
+    instance_name             = each.value.instance_name
+    managed_by                = "terraform"
   })
 }
 

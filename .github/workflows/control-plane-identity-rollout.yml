@@ -111,6 +111,7 @@ jobs:
         env:
           TF_VAR_proxy_generation_frontends_enabled: ${{ (matrix.cell == 'staging' && vars.PROXY_STAGING_FRONTEND_MIGRATED == 'true' || matrix.cell == 'production-use4' && vars.PROXY_PRODUCTION_FRONTEND_MIGRATED == 'true') && 'true' || 'false' }}
           TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+          TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
           PROJECT: ${{ vars.GCP_PROJECT }}
           REGION: ${{ vars[matrix.region_variable] }}
           SERVICE: ${{ vars[matrix.service_variable] }}
@@ -158,6 +159,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    env:
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -282,6 +285,7 @@ jobs:
     env:
       TF_VAR_verification_kms_key: projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek
       TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -411,6 +415,7 @@ jobs:
     env:
       TF_VAR_verification_kms_key: projects/rayai-prod/locations/us-central1/keyRings/superserve/cryptoKeys/credentials-kek
       TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
