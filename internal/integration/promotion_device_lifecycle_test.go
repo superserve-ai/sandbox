@@ -76,6 +76,21 @@ func promotionIsolatedDatabase(t *testing.T, regional bool) *pgxpool.Pool {
 			t.Fatal(err)
 		}
 		rolloutExec(t, pool, string(migration))
+		migration, err = os.ReadFile("../../supabase/shared-auth-migrations/20260925190000_promotion_evidence_proxy_role.sql")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var roleExists bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='promotion_evidence_proxy')`).Scan(&roleExists); err != nil {
+			t.Fatal(err)
+		}
+		proxyMigration := string(migration)
+		if roleExists {
+			// Roles are cluster-wide; each isolated Auth database still needs its own grants.
+			proxyMigration = strings.Replace(proxyMigration,
+				"CREATE ROLE promotion_evidence_proxy LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;", "", 1)
+		}
+		rolloutExec(t, pool, proxyMigration)
 	}
 	return pool
 }
@@ -108,7 +123,7 @@ func promotionVerifiedSignup(t *testing.T, auth *pgxpool.Pool, user uuid.UUID, f
 	var attempt, challenge uuid.UUID
 	event := "event-" + uuid.NewString()
 	var outcome string
-	promotionAuthRole(t, auth, "service_role", func(tx pgx.Tx) {
+	promotionAuthRole(t, auth, "promotion_evidence_proxy", func(tx pgx.Tx) {
 		if err := tx.QueryRow(ctx, `SELECT * FROM public.create_signup_device_attempt()`).Scan(&attempt, &challenge); err != nil {
 			t.Fatal(err)
 		}
@@ -124,13 +139,13 @@ func promotionVerifiedSignup(t *testing.T, auth *pgxpool.Pool, user uuid.UUID, f
 	if err := auth.QueryRow(ctx, `SELECT count(*) FROM public.get_signup_device_account_evidence($1)`, user).Scan(&unbound); err != nil || unbound != 0 {
 		t.Fatalf("verified attempt published before account binding: %d, %v", unbound, err)
 	}
-	promotionAuthRole(t, auth, "service_role", func(tx pgx.Tx) {
+	promotionAuthRole(t, auth, "promotion_evidence_proxy", func(tx pgx.Tx) {
 		if err := tx.QueryRow(ctx, `SELECT public.verify_signup_device_attempt($1,$2,$3,$4,$5)`, attempt, challenge, event, fingerprint, eventAt).Scan(&outcome); err != nil || outcome != "replayed" {
 			t.Fatalf("verify replay: %q, %v", outcome, err)
 		}
 	})
 	rolloutExec(t, auth, `INSERT INTO auth.users(id,created_at) VALUES($1,clock_timestamp())`, user)
-	promotionAuthRole(t, auth, "service_role", func(tx pgx.Tx) {
+	promotionAuthRole(t, auth, "promotion_evidence_proxy", func(tx pgx.Tx) {
 		if err := tx.QueryRow(ctx, `SELECT public.bind_signup_device_account($1,$2)`, attempt, user).Scan(&outcome); err != nil || outcome != "bound" {
 			t.Fatalf("bind signup: %q, %v", outcome, err)
 		}
@@ -147,7 +162,7 @@ func promotionPublishOriginal(t *testing.T, auth, region *pgxpool.Pool, user uui
 	var attempt uuid.UUID
 	var event, fingerprint string
 	var eventAt, boundAt time.Time
-	promotionAuthRole(t, auth, "service_role", func(tx pgx.Tx) {
+	promotionAuthRole(t, auth, "promotion_evidence_proxy", func(tx pgx.Tx) {
 		if err := tx.QueryRow(ctx, `SELECT * FROM public.get_signup_device_account_evidence($1)`, user).
 			Scan(&attempt, &event, &fingerprint, &eventAt, &boundAt); err != nil {
 			t.Fatal(err)
@@ -208,6 +223,93 @@ func TestIntegration_PromotionSignupGrantWithLateDeviceEvidence(t *testing.T) {
 	}
 }
 
+func TestIntegration_SignupClaimWaitsForRegionalEvidenceRegistration(t *testing.T) {
+	ctx := context.Background()
+	region := promotionIsolatedDatabase(t, true)
+	owner, other := uuid.New(), uuid.New()
+	fingerprint := "visitor-" + uuid.NewString()
+	for _, user := range []uuid.UUID{owner, other} {
+		rolloutExec(t, region, `INSERT INTO profile(id,email) VALUES($1,$2)`, user, user.String()+"@example.com")
+	}
+	rolloutExec(t, region, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+		owner, uuid.New(), "event-"+uuid.NewString(), fingerprint)
+	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,false)`)
+
+	team := uuid.New()
+	rolloutExec(t, region, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "promotion-"+team.String())
+	registration, err := region.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registration.Rollback(ctx)
+	var registrationPID int
+	if err := registration.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&registrationPID); err != nil {
+		t.Fatal(err)
+	}
+	rolloutExec(t, registration, `SELECT pg_advisory_xact_lock(hashtext('stripe-promo-user:' || $1::text)::bigint)`, other)
+
+	claimConn, err := region.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer claimConn.Release()
+	claimCtx, cancelClaim := context.WithCancel(ctx)
+	defer cancelClaim()
+	var claimPID int
+	if err := claimConn.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&claimPID); err != nil {
+		t.Fatal(err)
+	}
+	type claimResult struct {
+		outcome, reason string
+		err             error
+	}
+	claimDone := make(chan claimResult, 1)
+	go func() {
+		var result claimResult
+		result.err = claimConn.QueryRow(claimCtx, `SELECT * FROM claim_team_signup_trial_with_device($1,$2)`, team, other).
+			Scan(&result.outcome, &result.reason)
+		claimDone <- result
+	}()
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		var blocked bool
+		if err := region.QueryRow(ctx, `SELECT $1 = ANY(pg_blocking_pids($2))`, registrationPID, claimPID).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		select {
+		case result := <-claimDone:
+			t.Fatalf("claim passed registration lock: %q %q %v", result.outcome, result.reason, result.err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("claim did not reach registration lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, outcome := promotionClaimSignup(t, region, owner); outcome != "granted" {
+		t.Fatalf("regional owner signup claim: %s", outcome)
+	}
+	var registered string
+	if err := registration.QueryRow(ctx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+		other, uuid.New(), "event-"+uuid.NewString(), fingerprint).Scan(&registered); err != nil || registered != "owner_conflict" {
+		t.Fatalf("concurrent regional registration: %q, %v", registered, err)
+	}
+	if err := registration.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	result := <-claimDone
+	if result.err != nil || result.outcome != "promotion_ineligible" || result.reason != "owner_conflict" {
+		t.Fatalf("claim after registration: %q %q %v", result.outcome, result.reason, result.err)
+	}
+	var grants int
+	if err := region.QueryRow(ctx, `SELECT count(*) FROM promotion_device_grant WHERE promotion='signup' AND fingerprint=$1`, fingerprint).Scan(&grants); err != nil || grants != 1 {
+		t.Fatalf("same regional Fingerprint grants: %d, %v", grants, err)
+	}
+}
+
 func TestIntegration_DeniedSignupDeviceClaimFencesLegacyCompletion(t *testing.T) {
 	ctx := context.Background()
 	region := promotionIsolatedDatabase(t, true)
@@ -258,7 +360,7 @@ func TestIntegration_PromotionSharedAuthIndependentRegions(t *testing.T) {
 	if _, err := auth.Exec(ctx, `SELECT public.bind_signup_device_account($1,$2)`, aEvidence.attempt, b); err == nil {
 		t.Fatal("accepted signup event rebound to another Auth account")
 	}
-	for _, role := range []string{"anon", "authenticated", "service_role"} {
+	for _, role := range []string{"anon", "authenticated", "service_role", "promotion_evidence_proxy"} {
 		var tableAccess bool
 		if err := auth.QueryRow(ctx, `SELECT
 			has_table_privilege($1, 'public.signup_device_attempt', 'SELECT,INSERT,UPDATE,DELETE,TRUNCATE')
@@ -274,7 +376,7 @@ func TestIntegration_PromotionSharedAuthIndependentRegions(t *testing.T) {
 		} {
 			var rpcAccess bool
 			if err := auth.QueryRow(ctx, `SELECT has_function_privilege($1, $2, 'EXECUTE')`, role, signature).
-				Scan(&rpcAccess); err != nil || rpcAccess != (role == "service_role") {
+				Scan(&rpcAccess); err != nil || rpcAccess != (role == "service_role" || role == "promotion_evidence_proxy") {
 				t.Fatalf("shared Auth RPC privilege for %s on %s: %t, %v", role, signature, rpcAccess, err)
 			}
 		}
@@ -306,19 +408,23 @@ func TestIntegration_PromotionSharedAuthIndependentRegions(t *testing.T) {
 			}
 		}
 	}
-	tx, err := auth.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tx.Exec(ctx, `SET LOCAL ROLE service_role`); err != nil {
-		_ = tx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	_, err = tx.Exec(ctx, `SELECT attempt_id FROM public.signup_device_attempt LIMIT 1`)
-	_ = tx.Rollback(ctx)
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
-		t.Fatalf("service role read shared Auth attempt table: expected permission denied, got %v", err)
+	for _, role := range []string{"service_role", "promotion_evidence_proxy"} {
+		for _, table := range []string{"signup_device_attempt", "signup_device_account_evidence"} {
+			tx, err := auth.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, "SET LOCAL ROLE "+pgx.Identifier{role}.Sanitize()); err != nil {
+				_ = tx.Rollback(ctx)
+				t.Fatal(err)
+			}
+			_, err = tx.Exec(ctx, "SELECT * FROM public."+pgx.Identifier{table}.Sanitize()+" LIMIT 1")
+			_ = tx.Rollback(ctx)
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "42501" {
+				t.Fatalf("%s read shared Auth %s table: expected permission denied, got %v", role, table, err)
+			}
+		}
 	}
 	var duplicateAttempt, duplicateChallenge uuid.UUID
 	if err := auth.QueryRow(ctx, `SELECT * FROM public.create_signup_device_attempt()`).Scan(&duplicateAttempt, &duplicateChallenge); err != nil {
@@ -333,7 +439,7 @@ func TestIntegration_PromotionSharedAuthIndependentRegions(t *testing.T) {
 		t.Fatal("provider event was accepted for a second signup attempt")
 	}
 	var laterAttempt, laterChallenge uuid.UUID
-	promotionAuthRole(t, auth, "service_role", func(tx pgx.Tx) {
+	promotionAuthRole(t, auth, "promotion_evidence_proxy", func(tx pgx.Tx) {
 		if err := tx.QueryRow(ctx, `SELECT * FROM public.create_signup_device_attempt()`).Scan(&laterAttempt, &laterChallenge); err != nil {
 			t.Fatal(err)
 		}
