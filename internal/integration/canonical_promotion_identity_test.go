@@ -274,10 +274,15 @@ func TestIntegration_CanonicalPromotionPrivileges(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := strings.Index(string(migration), "REVOKE ALL ON FUNCTION promotion_identity_key")
-	if start < 0 {
+	end := strings.LastIndex(string(migration), "\nCOMMIT;")
+	if start < 0 || end <= start {
 		t.Fatal("promotion privilege segment missing")
 	}
-	rolloutExec(t, tx, string(migration[start:]))
+	// The migration commits itself; this fragment must retain the test rollback.
+	rolloutExec(t, tx, string(migration[start:end]))
+	if tx.Conn().PgConn().TxStatus() != 'T' {
+		t.Fatal("privilege fragment ended the fixture transaction")
+	}
 	for _, role := range []string{"anon", "authenticated", "service_role"} {
 		var claim, reconcile, writeHistory bool
 		if err := tx.QueryRow(ctx, `SELECT has_function_privilege($1,'claim_team_signup_trial(uuid,uuid)','EXECUTE'),
