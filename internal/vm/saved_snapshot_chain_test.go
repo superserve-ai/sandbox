@@ -41,6 +41,9 @@ type chainFC struct {
 	hang bool
 	// noBlockMap, when set, saves no disk block map beside the vmstate.
 	noBlockMap bool
+	// noPresence, when set, writes a diff without its presence map, as a
+	// Firecracker that predates the map does.
+	noPresence bool
 	// beforeWrite, when set, runs while the vCPUs are paused, before the
 	// files are written; onResume runs on the request that resumes them.
 	beforeWrite func()
@@ -110,7 +113,7 @@ func (f *chainFC) serve(w http.ResponseWriter, r *http.Request) {
 		if f.beforeWrite != nil {
 			f.beforeWrite()
 		}
-		if err := writeSnapshotFiles(req.SnapshotPath, req.MemFilePath, req.SnapshotType == "Diff", pages, !f.noBlockMap); err != nil {
+		if err := writeSnapshotFiles(req.SnapshotPath, req.MemFilePath, req.SnapshotType == "Diff" && !f.noPresence, pages, !f.noBlockMap); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = io.WriteString(w, err.Error())
 			return
@@ -681,5 +684,42 @@ func TestRunningCaptureDoesNotReuseAnEarlierBlockMap(t *testing.T) {
 	}
 	if _, err := os.Stat(overlayBlockMapPath(second.SnapshotPath)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("second snapshot carries a block map its save never wrote: %v", err)
+	}
+}
+
+// A diff written without its presence map, by a Firecracker that predates
+// it, gives no snapshot and spends the baseline: the source's next pause is
+// a full one that strands the overlay, never a diff onto a map-less one.
+func TestRunningCaptureWithoutAPresenceMapSpendsTheBaseline(t *testing.T) {
+	fc := startChainFC(t, map[int]byte{2: 'X'}, map[int]byte{3: 'Y'})
+	fc.noPresence = true
+	m := newSavedTestManager(t)
+	inst := seedRunningSource(t, m, fc, true)
+	ctx := context.Background()
+	id := uuid.NewString()
+	if _, err := m.CreateSavedSnapshot(ctx, inst.ID, id, SavedSnapshotMemFS); status.Code(err) != codes.DataLoss {
+		t.Fatalf("capture without a presence map: want DataLoss, got %v", err)
+	}
+	overlay := filepath.Join(m.cfg.SnapshotDir, inst.ID, "mem.diff")
+	inst.mu.RLock()
+	tracked, memFile := inst.DirtyTracked, inst.MemFilePath
+	inst.mu.RUnlock()
+	if tracked || memFile != overlay {
+		t.Fatalf("after a map-less write: tracked=%v mem=%s; want the baseline spent and the chain advanced", tracked, memFile)
+	}
+	dir, _ := m.savedSnapshotDir(id)
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a snapshot was published without a presence map: %v", err)
+	}
+	if _, memPath, _, err := m.PauseVM(ctx, inst.ID, "", "tok-test"); err != nil || filepath.Base(memPath) != "mem.snap" {
+		t.Fatalf("pause after a map-less write: mem=%s err=%v; want a full image", memPath, err)
+	}
+	inst.mu.RLock()
+	stranded := append([]string(nil), inst.StrandedOverlays...)
+	inst.mu.RUnlock()
+	if len(stranded) == 0 {
+		if _, err := os.Stat(overlay); err == nil {
+			t.Fatal("the map-less overlay is neither owed for reclaim nor reclaimed")
+		}
 	}
 }

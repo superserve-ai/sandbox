@@ -474,6 +474,14 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 			advanceChain(inst, vmstate, chainMem, recordBase)
 			if layered {
 				m.verifyPresenceRefreshed(chainMem, sidecarMark, log)
+				if !fileExists(presence.SidecarPath(chainMem)) {
+					// Written by a Firecracker that predates the map: the
+					// overlay cannot be restored, so the source's next pause
+					// must be a full one, which strands it. The chain still
+					// moved on, and the record says so.
+					m.abandonDirtyBaseline(inst)
+					return chainMem, status.Error(codes.DataLoss, "chain overlay has no presence map; the source's next pause is a full one")
+				}
 			}
 			if err := m.cloneChainIntoSnapshot(ctx, tmp, final, vmstate, chainMem, recordBase, man); err != nil {
 				return chainMem, err
