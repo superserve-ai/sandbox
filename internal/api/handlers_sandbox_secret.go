@@ -36,7 +36,31 @@ var (
 	errBindingExists        = errors.New("env key already bound on sandbox")
 	errBindingCapReached    = errors.New("sandbox binding cap reached")
 	errSandboxMidTransition = errors.New("sandbox not in a mutable state")
+	errSnapshotInFlight     = errors.New("a snapshot of the sandbox is being captured")
 )
+
+// refuseDuringCapture keeps the guest a capture images at the bindings its
+// row records: the row is written under the sandbox's secret-write lock,
+// which the caller holds, and until the capture can no longer be writing
+// the image no binding may change.
+func refuseDuringCapture(ctx context.Context, q *db.Queries, sb db.Sandbox) error {
+	inFlight, err := q.SandboxSnapshotCaptureInFlight(ctx, db.SandboxSnapshotCaptureInFlightParams{
+		SandboxID: sb.ID,
+		Since:     time.Now().Add(-snapshotCaptureDeadline(sb.MemoryMib)),
+	})
+	if err != nil {
+		return err
+	}
+	if inFlight {
+		return errSnapshotInFlight
+	}
+	return nil
+}
+
+func respondSnapshotInFlight(c *gin.Context) {
+	c.Header("Retry-After", "5")
+	respondErrorMsg(c, "snapshot_in_progress", "a snapshot of this sandbox is being taken; retry once it is ready", http.StatusConflict)
+}
 
 type attachSecretRequest struct {
 	EnvKey     string `json:"env_key"`
@@ -141,6 +165,9 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 			return errSandboxMidTransition
 		}
 		liveSandbox = sb
+		if lerr := refuseDuringCapture(ctx, q, sb); lerr != nil {
+			return lerr
+		}
 		existing, lerr := q.ListSandboxSecretBindings(ctx, sandboxID)
 		if lerr != nil {
 			return lerr
@@ -184,6 +211,9 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		}
 	}
 	switch {
+	case errors.Is(err, errSnapshotInFlight):
+		respondSnapshotInFlight(c)
+		return
 	case errors.Is(err, errBindingExists):
 		respondErrorMsg(c, "conflict", fmt.Sprintf("env-var key %q is already bound on this sandbox", req.EnvKey), http.StatusConflict)
 		return
@@ -288,6 +318,9 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 				return lerr
 			}
 		}
+		if lerr := refuseDuringCapture(mutCtx, q, sandbox); lerr != nil {
+			return lerr
+		}
 		deleted, derr := q.DeleteSandboxSecretBinding(mutCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey})
 		if derr != nil {
 			return derr
@@ -317,6 +350,10 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		}
 	}
 	if err != nil {
+		if errors.Is(err, errSnapshotInFlight) {
+			respondSnapshotInFlight(c)
+			return
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			respondErrorMsg(c, "not_found", fmt.Sprintf("no secret bound under env-var key %q on this sandbox", envKey), http.StatusNotFound)
 			return

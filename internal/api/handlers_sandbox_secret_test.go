@@ -576,3 +576,46 @@ func TestDetachSandboxSecret_BadStatus_Conflict(t *testing.T) {
 		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
 	}
 }
+
+// A secret change waits out a capture of the sandbox: the capture's row
+// recorded the bindings, and the guest it images must hold the same ones.
+func TestSecretChangesAreRefusedWhileASnapshotIsCaptured(t *testing.T) {
+	teamID, sandboxID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusActive, MemoryMib: 1024}
+	var wrote bool
+	mock := &mockDBTX{
+		captureInFlight: true,
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "GetSandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "GetSecretByName"):
+				return secretRow(db.Secret{ID: uuid.New(), TeamID: teamID, Name: "example-key", AuthType: "bearer"})
+			case strings.Contains(sql, "DeleteSandboxSecretBinding"):
+				wrote = true
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "AddSandboxSecret") {
+				wrote = true
+			}
+			return pgconn.NewCommandTag("INSERT 0 1"), nil
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Encryptor: noopEncryptor{}, Signer: newTestSigner(t, "v1")}
+	r := setupSecretRouter(h, teamID.String())
+
+	attach := httptest.NewRecorder()
+	r.ServeHTTP(attach, attachReq(sandboxID.String(), `{"env_key":"KEY","secret_name":"example-key"}`))
+	detach := httptest.NewRecorder()
+	r.ServeHTTP(detach, httptest.NewRequest(http.MethodDelete, "/sandboxes/"+sandboxID.String()+"/secrets/KEY", nil))
+	for name, w := range map[string]*httptest.ResponseRecorder{"attach": attach, "detach": detach} {
+		if w.Code != http.StatusConflict || w.Header().Get("Retry-After") == "" {
+			t.Errorf("%s during a capture: %d %s; want a retryable 409", name, w.Code, w.Body.String())
+		}
+	}
+	if wrote {
+		t.Error("a binding changed while a capture was imaging the guest")
+	}
+}

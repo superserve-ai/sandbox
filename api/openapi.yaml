@@ -1548,7 +1548,14 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: >
+            The sandbox is not active or paused, or, with `error.code`
+            `snapshot_in_progress`, a snapshot of it is being taken; retry
+            after `Retry-After` seconds.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":
@@ -1581,7 +1588,14 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          $ref: "#/components/responses/Conflict"
+          description: >
+            The sandbox is not active or paused, or, with `error.code`
+            `snapshot_in_progress`, a snapshot of it is being taken; retry
+            after `Retry-After` seconds.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "500":

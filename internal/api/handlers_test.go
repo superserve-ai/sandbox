@@ -235,6 +235,9 @@ type mockDBTX struct {
 	execFn            func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	// queryFn is optional; nil falls back to an empty rows iterator.
 	queryFn func(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	// captureInFlight answers whether a snapshot capture of the sandbox is
+	// running; secret changes ask before every write.
+	captureInFlight bool
 }
 
 // The fake transaction shares the scripted rows while exposing real transaction
@@ -329,6 +332,9 @@ func (b *mockBatch) Close() error {
 }
 
 func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "-- name: SandboxSnapshotCaptureInFlight :one") {
+		return scalarBoolRow(m.captureInFlight)
+	}
 	// The finalize-mode probe runs before every FinalizePause. Unit tests
 	// exercise legacy mode (the index exists until the contract phase), so
 	// answer it centrally instead of scripting it into every test.

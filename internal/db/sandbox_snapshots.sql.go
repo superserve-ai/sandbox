@@ -586,6 +586,28 @@ func (q *Queries) RenameSandboxSnapshot(ctx context.Context, arg RenameSandboxSn
 	return i, err
 }
 
+const sandboxSnapshotCaptureInFlight = `-- name: SandboxSnapshotCaptureInFlight :one
+SELECT EXISTS (
+  SELECT 1 FROM sandbox_snapshot
+  WHERE sandbox_id = $1 AND status = 'creating' AND deleted_at IS NULL
+    AND created_at > $2::timestamptz
+)
+`
+
+type SandboxSnapshotCaptureInFlightParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Since     time.Time `json:"since"`
+}
+
+// A capture of the sandbox that may still be imaging its guest: its row is
+// creating and younger than a capture's deadline.
+func (q *Queries) SandboxSnapshotCaptureInFlight(ctx context.Context, arg SandboxSnapshotCaptureInFlightParams) (bool, error) {
+	row := q.db.QueryRow(ctx, sandboxSnapshotCaptureInFlight, arg.SandboxID, arg.Since)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const scheduleSandboxSnapshotSweep = `-- name: ScheduleSandboxSnapshotSweep :execrows
 UPDATE sandbox_snapshot SET sweep_after = now()
 WHERE id = $1 AND status = 'creating'

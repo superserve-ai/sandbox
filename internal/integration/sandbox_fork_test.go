@@ -41,6 +41,7 @@ func newRouterWithSigner(t *testing.T) *gin.Engine {
 	})
 	h.Pool = testPool
 	h.Signer = signer
+	h.Encryptor = stubEncryptor{}
 	registerTestHandlers(h)
 	return api.SetupRouter(t.Context(), h, testPool)
 }
@@ -277,5 +278,47 @@ func TestIntegration_SnapshotRecordsBindingsUnderTheSecretWriteLock(t *testing.T
 	}
 	if string(r.row.SecretBindings) != "[]" {
 		t.Fatalf("snapshot bindings = %s; a detach that committed first is not the snapshot's", r.row.SecretBindings)
+	}
+}
+
+// No secret changes while a capture may still be imaging the guest, so the
+// image holds the bindings the snapshot records; once it settles, they may.
+func TestIntegration_SecretAttachWaitsOutASnapshotCapture(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	sourceID, err := insertSandboxRow(ctx, teamID, "attach-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', ip_address = '192.0.2.10', base_path = '/templates/t/base.ext4', disk_mib = 4096 WHERE id = $1`, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	secretID := seedSecret(t, teamID)
+	var secretName string
+	if err := testPool.QueryRow(ctx, `SELECT name FROM secret WHERE id = $1`, secretID).Scan(&secretName); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := testQueries.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
+		ID: uuid.New(), TeamID: teamID, SandboxID: sourceID, Kind: "mem+fs", SweepAfter: time.Now().Add(15 * time.Minute),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := newRouterWithSigner(t)
+	body := fmt.Sprintf(`{"env_key":"TOKEN","secret_name":%q}`, secretName)
+	w := do(r, "POST", "/sandboxes/"+sourceID.String()+"/secrets", apiKey, body)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "snapshot_in_progress") {
+		t.Fatalf("attach during a capture: %d %s; want snapshot_in_progress", w.Code, w.Body.String())
+	}
+	if bound, err := testQueries.ListSandboxSecretBindingMeta(ctx, sourceID); err != nil || len(bound) != 0 {
+		t.Fatalf("bindings after a refused attach: %+v %v", bound, err)
+	}
+	overlay := "/saved/a/overlay.ext4"
+	vmstate, mem := "/saved/a/vmstate.snap", "/saved/a/mem.diff"
+	if _, err := testQueries.MarkSandboxSnapshotReady(ctx, db.MarkSandboxSnapshotReadyParams{ID: snap.ID, OverlayPath: &overlay, SnapshotPath: &vmstate, MemPath: &mem, SizeBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if w := do(r, "POST", "/sandboxes/"+sourceID.String()+"/secrets", apiKey, body); w.Code >= 300 {
+		t.Fatalf("attach once the capture settled: %d %s", w.Code, w.Body.String())
 	}
 }

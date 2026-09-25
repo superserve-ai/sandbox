@@ -111,3 +111,12 @@ WHERE id IN (
     FOR UPDATE SKIP LOCKED
 )
 RETURNING *;
+
+-- name: SandboxSnapshotCaptureInFlight :one
+-- A capture of the sandbox that may still be imaging its guest: its row is
+-- creating and younger than a capture's deadline.
+SELECT EXISTS (
+  SELECT 1 FROM sandbox_snapshot
+  WHERE sandbox_id = @sandbox_id AND status = 'creating' AND deleted_at IS NULL
+    AND created_at > @since::timestamptz
+);
