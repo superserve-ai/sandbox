@@ -353,26 +353,26 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	defer cancel()
 	var captureErr error
 	chainMem := ""
+	// What the image says of its guest and workload, for the chain, the
+	// record and the snapshot alike; nothing for a guest that cannot
+	// correct its clock.
+	var wake *WallClockManifest
+	if corrects {
+		wake = &WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifact, WorkloadFrozen: frozen, GuestCorrectsClock: true}
+		if frozen {
+			wake.FreezeToken = token
+		}
+	}
 	if kind == SavedSnapshotMemFS {
-		chainMem, captureErr = m.captureRunningMemory(cctx, inst, tmp, final, socket, memFile, baseMem, dirtyTracked, sessionID, generation, man, log)
+		chainMem, captureErr = m.captureRunningMemory(cctx, inst, tmp, final, socket, memFile, baseMem, dirtyTracked, sessionID, generation, wake, man, log)
 	} else {
 		captureErr = fcPauseVMContext(cctx, socket)
 	}
 	if captureErr == nil {
 		captureErr = m.captureSavedDisk(cctx, diskPath, man.BasePath, tmp, final, man)
 	}
-	if captureErr == nil && kind == SavedSnapshotMemFS && corrects {
-		wm := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifact, WorkloadFrozen: frozen, GuestCorrectsClock: true}
-		if frozen {
-			wm.FreezeToken = token
-		}
-		// The chain holds this image now, so it carries the image's manifest.
-		if chainMem != "" {
-			captureErr = WriteWallClockManifest(chainMem, wm)
-		}
-		if captureErr == nil {
-			captureErr = WriteWallClockManifest(filepath.Join(tmp, filepath.Base(man.MemPath)), wm)
-		}
+	if captureErr == nil && kind == SavedSnapshotMemFS && wake != nil {
+		captureErr = WriteWallClockManifest(filepath.Join(tmp, filepath.Base(man.MemPath)), *wake)
 	}
 	frozenFor := time.Since(tFrozen)
 
@@ -422,7 +422,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 // A rejected guard or an unarmed source gets a full image of its own, and
 // the baseline is spent. Returns the chain image the snapshot was taken
 // from, or "" for a full image.
-func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tmp, final, socket, memFile, baseMem string, dirtyTracked bool, sessionID string, generation int64, man *SavedSnapshotManifest, log zerolog.Logger) (string, error) {
+func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tmp, final, socket, memFile, baseMem string, dirtyTracked bool, sessionID string, generation int64, wake *WallClockManifest, man *SavedSnapshotManifest, log zerolog.Logger) (string, error) {
 	chainDir := filepath.Join(m.cfg.SnapshotDir, inst.ID)
 	overlay := filepath.Join(chainDir, "mem.diff")
 	full := filepath.Join(chainDir, "mem.snap")
@@ -457,13 +457,6 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 	}
 	var sidecarMark time.Time
 	if chainMem != "" {
-		// Firecracker rewrites the disk block map beside the vmstate with
-		// every snapshot it saves one for; one it saves none for must not
-		// leave an earlier capture's beside the chain, or the snapshot takes
-		// it as its own.
-		if err := os.Remove(overlayBlockMapPath(vmstate)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("drop previous block map: %w", err)
-		}
 		if layered {
 			// A map that cannot be marked cannot be proven this save's
 			// afterwards: a full image of its own instead.
@@ -476,14 +469,39 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 		}
 	}
 	if chainMem != "" {
+		// Firecracker rewrites the disk block map beside the vmstate with
+		// every snapshot it saves one for; one it saves none for must not
+		// leave an earlier capture's beside the chain, or the snapshot takes
+		// it as its own. Set aside rather than dropped: a write that never
+		// happens leaves the chain as it was, map included.
+		blockMap := overlayBlockMapPath(vmstate)
+		staged := blockMap + ".prev"
+		if err := os.Rename(blockMap, staged); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("set aside previous block map: %w", err)
+		}
 		err := CreateDiffSnapshotContext(ctx, socket, vmstate, chainMem, sessionID, generation)
 		switch {
 		case err == nil:
+			_ = os.Remove(staged)
 			recordBase := ""
 			if layered {
 				recordBase = baseMem
 			}
-			advanceChain(inst, vmstate, chainMem, recordBase)
+			// The chain holds this image now: its manifest goes beside it
+			// before the record names it, or the image is one nothing may
+			// restore, the same as a torn write.
+			var werr error
+			if wake != nil {
+				werr = WriteWallClockManifest(chainMem, *wake)
+			} else if _, rerr := removeWallClockManifest(chainMem); rerr != nil {
+				werr = rerr
+			}
+			if werr != nil {
+				m.abandonDirtyBaseline(inst)
+				_ = os.Remove(vmstate)
+				return "", fmt.Errorf("write the chain image's wall-clock manifest: %w", werr)
+			}
+			advanceChain(inst, vmstate, chainMem, recordBase, wake)
 			if layered {
 				// A map not proven this save's, absent or left as marked by
 				// a Firecracker that predates it, makes the overlay one
@@ -501,8 +519,12 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 			return chainMem, nil
 		case errors.Is(err, ErrDirtyTrackingMismatch) || m.sessionRejectedAtPause(err):
 			// Rejected before the bitmap or the chain was touched; the vCPUs
-			// are paused and the full image's pause is idempotent.
+			// are paused and the full image's pause is idempotent. The chain
+			// stays as it was, its block map back in place.
 			log.Warn().Err(err).Msg("saved snapshot: guarded diff rejected; taking a full image")
+			if rerr := os.Rename(staged, blockMap); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+				log.Warn().Err(rerr).Msg("saved snapshot: previous block map could not be put back")
+			}
 			if firstPass {
 				_ = os.Remove(layeredBaseSidecarPath(overlay))
 			}
@@ -515,6 +537,7 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 			// and reclaims the overlay.
 			m.abandonDirtyBaseline(inst)
 			_ = os.Remove(vmstate)
+			_ = os.Remove(staged)
 			if layered {
 				_ = os.Remove(layeredBaseSidecarPath(overlay))
 				_ = os.Remove(presence.SidecarPath(overlay))
@@ -536,15 +559,24 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 }
 
 // advanceChain records, in memory, that the source's chain now holds the
-// image just written: a first-pass source becomes an accumulating one, and
-// the next guarded diff names the generation Firecracker moved to. Made
-// durable by persistChainAdvance once the guest is released.
-func advanceChain(inst *VMInstance, vmstate, memPath, baseMem string) {
+// image just written: a first-pass source becomes an accumulating one, the
+// next guarded diff names the generation Firecracker moved to, and the
+// image's wake facts are the record's, as a pause leaves them, so a relaunch
+// from the chain wakes it under the right token. Made durable by
+// persistChainAdvance once the guest is released.
+func advanceChain(inst *VMInstance, vmstate, memPath, baseMem string, wake *WallClockManifest) {
+	frozen, token, artifact := false, "", ""
+	if wake != nil {
+		frozen, token, artifact = wake.WorkloadFrozen, wake.FreezeToken, wake.ArtifactID
+	}
 	inst.mu.Lock()
 	inst.SnapshotPath = vmstate
 	inst.MemFilePath = memPath
 	inst.BaseMemPath = baseMem
 	inst.DirtyTrackingGeneration++
+	inst.SnapshotWorkloadFrozen = &frozen
+	inst.FreezeToken = token
+	inst.ArtifactID = artifact
 	inst.mu.Unlock()
 }
 

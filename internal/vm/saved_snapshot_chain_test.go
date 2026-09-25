@@ -723,3 +723,63 @@ func TestRunningCaptureWithoutAPresenceMapSpendsTheBaseline(t *testing.T) {
 		}
 	}
 }
+
+// A guest that corrects its clock has its chain image written under a fresh
+// artifact: the manifest beside the chain and the record's wake facts both
+// name it, so a relaunch from the chain wakes the image the chain holds.
+func TestRunningCaptureAdvancesTheWakeRecordWithTheChain(t *testing.T) {
+	fc := startChainFC(t, map[int]byte{2: 'X'})
+	m := newSavedTestManager(t)
+	inst := seedRunningSource(t, m, fc, true)
+	// The base says its guest corrects its clock; the image resumed from it
+	// was frozen under an earlier token.
+	seedFrozenManifest(t, inst.BaseMemPath, "old-token")
+	inst.mu.Lock()
+	frozenBefore := true
+	inst.SnapshotWorkloadFrozen, inst.FreezeToken, inst.ArtifactID = &frozenBefore, "old-token", "a"
+	inst.mu.Unlock()
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS); err != nil {
+		t.Fatal(err)
+	}
+	overlay := filepath.Join(m.cfg.SnapshotDir, inst.ID, "mem.diff")
+	chain, err := ReadWallClockManifest(overlay)
+	if err != nil || chain == nil {
+		t.Fatalf("chain image has no manifest: %v", err)
+	}
+	inst.mu.RLock()
+	frozen, token, artifact := inst.SnapshotWorkloadFrozen, inst.FreezeToken, inst.ArtifactID
+	inst.mu.RUnlock()
+	if chain.ArtifactID == "a" || artifact != chain.ArtifactID {
+		t.Fatalf("record artifact %q, chain manifest %q; want the capture's, not the resumed image's", artifact, chain.ArtifactID)
+	}
+	if frozen == nil || *frozen != chain.WorkloadFrozen || token != chain.FreezeToken {
+		t.Fatalf("record frozen=%v token=%q; chain frozen=%v token=%q", frozen, token, chain.WorkloadFrozen, chain.FreezeToken)
+	}
+	if rec, _ := m.state.Get(inst.ID); rec == nil || rec.ArtifactID != chain.ArtifactID {
+		t.Fatalf("wake facts not persisted with the chain: %+v", rec)
+	}
+}
+
+// A guard rejected before anything is written leaves the chain as it was,
+// its disk block map included.
+func TestRunningCaptureWithARejectedGuardKeepsTheChainsBlockMap(t *testing.T) {
+	fc := startChainFC(t, map[int]byte{2: 'X'})
+	fc.generation = 5
+	m := newSavedTestManager(t)
+	inst := seedRunningSource(t, m, fc, false)
+	vmstate := filepath.Join(m.cfg.SnapshotDir, inst.ID, "vmstate.snap")
+	for _, f := range []string{vmstate, overlayBlockMapPath(vmstate)} {
+		if err := os.WriteFile(f, []byte("recorded"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(overlayBlockMapPath(vmstate)); err != nil || string(b) != "recorded" {
+		t.Fatalf("the recorded chain's block map is gone or changed: %v", err)
+	}
+	if _, err := os.Stat(overlayBlockMapPath(vmstate) + ".prev"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a set-aside block map was left behind: %v", err)
+	}
+}
