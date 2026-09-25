@@ -105,12 +105,14 @@ jobs:
   staging-us-central1-infra:
     name: Apply staging/us-central1
     runs-on: ubuntu-latest
+    environment: staging
     needs: [wait-for-migrations]
     permissions:
       contents: read
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
     steps:
       - uses: actions/checkout@v4
 
@@ -237,6 +239,7 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
     steps:
       - uses: actions/checkout@v4
 
@@ -311,6 +314,7 @@ jobs:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
       TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
     steps:
       - uses: actions/checkout@v4
 
@@ -492,6 +496,7 @@ jobs:
     env:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
     steps:
       - uses: actions/checkout@v4
 
@@ -544,6 +549,7 @@ jobs:
       TF_IN_AUTOMATION: 'true'
       TF_VAR_notification_channel_ids: ${{ vars.TF_VAR_NOTIFICATION_CHANNEL_IDS || '[]' }}
       TF_VAR_cloud_ids_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
     steps:
       - uses: actions/checkout@v4
 

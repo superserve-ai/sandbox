@@ -105,3 +105,17 @@ variable "build_host_id" {
     error_message = "build_host_id must identify the active registered host."
   }
 }
+
+variable "alert_runbook_urls" {
+  description = "Direct alert runbook URLs supplied as private JSON through ALERT_RUNBOOK_URLS."
+  type        = map(string)
+  sensitive   = true
+  nullable    = false
+
+  validation {
+    condition = alltrue([
+      for url in values(var.alert_runbook_urls) : can(regex("^https?://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>]*)?$", url))
+    ])
+    error_message = "Each alert runbook URL must be an absolute HTTP(S) URL with a host."
+  }
+}

@@ -10,6 +10,21 @@ import unittest
 ROOT = Path(__file__).resolve().parents[3]
 
 
+class WestPlanWorkflowTests(unittest.TestCase):
+    def test_pr_fallback_reaches_both_plan_steps(self):
+        workflow = (ROOT / '.github/workflows/terraform-plans.yml').read_text()
+        setup = workflow.split('      - name: Set PR runbook URLs\n', 1)[1].split(
+            '      - name: Validate and plan\n', 1)[0]
+        plan = workflow.split('      - name: Validate and plan\n', 1)[1].split(
+            '      - name: Verify west VMD and OTLP ingress\n', 1)[0]
+        west = workflow.split('      - name: Verify west VMD and OTLP ingress\n', 1)[1]
+        self.assertIn('if [[ -z "${TF_VAR_alert_runbook_urls:-}" ]]', setup)
+        self.assertIn('TF_VAR_alert_runbook_urls=', setup)
+        self.assertIn('>> "$GITHUB_ENV"', setup)
+        self.assertIn('terraform plan', plan)
+        self.assertIn('scripts/terraform-plan-west.sh', west)
+
+
 @unittest.skipUnless(shutil.which('jq'), 'jq is required by the plan verifier')
 class WestPlanTests(unittest.TestCase):
     def verify(self, broken_identity=False, broken_endpoint=False):
