@@ -1138,9 +1138,9 @@ func bindSecret(envKey string, row db.Secret) (db.AddSandboxSecretParams, Secret
 
 // rebindSnapshotSecrets binds a sandbox created from a snapshot to the
 // secrets its source was bound to: by id against the team's live secrets,
-// with fresh proxy tokens. A secret deleted since is left out, and its key
-// returned as dropped, as is an env key the request sets itself, in
-// secrets or envVars.
+// with fresh proxy tokens. A secret deleted since, or a key recorded as
+// detached, is left out and its key returned as dropped, as is an env key
+// the request sets itself, in secrets or envVars.
 func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, recorded []byte, secrets, envVars map[string]string) ([]db.AddSandboxSecretParams, []SecretBindingMeta, []string, *AppError) {
 	var bound []struct {
 		EnvKey   string    `json:"env_key"`
@@ -1157,7 +1157,9 @@ func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, 
 	}
 	ids := make([]uuid.UUID, 0, len(bound))
 	for _, b := range bound {
-		ids = append(ids, b.SecretID)
+		if b.SecretID != uuid.Nil {
+			ids = append(ids, b.SecretID)
+		}
 	}
 	rows, err := h.DB.GetSecretsByIDs(ctx, db.GetSecretsByIDsParams{TeamID: teamID, Column2: ids})
 	if err != nil {

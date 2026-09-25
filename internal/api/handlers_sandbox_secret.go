@@ -54,6 +54,47 @@ func refuseDuringCapture(ctx context.Context, q *db.Queries, sandboxID uuid.UUID
 	return nil
 }
 
+// undoAttach takes back a binding whose guest update failed, under the
+// secret-write lock like any binding change. It is not refused during a
+// capture, which may already have recorded the binding: that record is
+// rewritten, so no fork re-binds it. boxd may have applied the env before
+// the error, so the token is revoked and the key recorded as detached.
+func (h *Handlers) undoAttach(ctx context.Context, sandboxID uuid.UUID, envKey, token string) error {
+	undo := func(q *db.Queries) error {
+		if h.Pool != nil {
+			if err := q.LockSandboxForSecretWrites(ctx, sandboxID.String()); err != nil {
+				return err
+			}
+		}
+		if _, err := q.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if err := q.RecordDetachedSecretKey(ctx, db.RecordDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: envKey}); err != nil {
+			return err
+		}
+		if err := q.InsertRevokedProxyToken(ctx, db.InsertRevokedProxyTokenParams{
+			SandboxID:  sandboxID,
+			ProxyToken: token,
+			ExpiresAt:  time.Now().Add(SecretsJWTLifetime),
+		}); err != nil {
+			return err
+		}
+		return q.RefreshCapturingSnapshotSecrets(ctx, sandboxID)
+	}
+	if h.Pool == nil {
+		return undo(h.DB)
+	}
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := undo(h.DB.WithTx(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 func respondSnapshotInFlight(c *gin.Context) {
 	c.Header("Retry-After", "5")
 	respondErrorMsg(c, "snapshot_in_progress", "a snapshot of this sandbox is being taken; retry once it is ready or failed, or delete it", http.StatusConflict)
@@ -193,7 +234,7 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		if bound == 0 {
 			return errSandboxMidTransition
 		}
-		return nil
+		return q.ForgetDetachedSecretKey(ctx, db.ForgetDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: req.EnvKey})
 	}
 
 	if h.Pool == nil {
@@ -240,14 +281,9 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 			// its rollback, leaving the row behind after a 500.
 			rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer rbCancel()
-			_, _ = h.DB.DeleteSandboxSecretBinding(rbCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: req.EnvKey})
-			// boxd may have committed the env/JWT before the apply errored, so revoke
-			// the token too — the binding's credential must not outlive its row.
-			_ = h.DB.InsertRevokedProxyToken(rbCtx, db.InsertRevokedProxyTokenParams{
-				SandboxID:  sandboxID,
-				ProxyToken: token,
-				ExpiresAt:  time.Now().Add(SecretsJWTLifetime),
-			})
+			if rerr := h.undoAttach(rbCtx, sandboxID, req.EnvKey, token); rerr != nil {
+				log.Error().Err(rerr).Str("sandbox_id", sandboxID.String()).Msg("undo a failed secret attach")
+			}
 			respondError(c, ErrInternal)
 			return
 		}
@@ -320,6 +356,9 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		}
 		deleted, derr := q.DeleteSandboxSecretBinding(mutCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey})
 		if derr != nil {
+			return derr
+		}
+		if derr := q.RecordDetachedSecretKey(mutCtx, db.RecordDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: envKey}); derr != nil {
 			return derr
 		}
 		// A binding stored before tokens were persisted has no stored token to

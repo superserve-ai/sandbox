@@ -159,6 +159,20 @@ func (q *Queries) DeleteSandboxSecrets(ctx context.Context, sandboxID uuid.UUID)
 	return err
 }
 
+const forgetDetachedSecretKey = `-- name: ForgetDetachedSecretKey :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = $2
+`
+
+type ForgetDetachedSecretKeyParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	EnvKey    string    `json:"env_key"`
+}
+
+func (q *Queries) ForgetDetachedSecretKey(ctx context.Context, arg ForgetDetachedSecretKeyParams) error {
+	_, err := q.db.Exec(ctx, forgetDetachedSecretKey, arg.SandboxID, arg.EnvKey)
+	return err
+}
+
 const getSecretByID = `-- name: GetSecretByID :one
 SELECT id, team_id, name, auth_type, auth_config, provider_shortcut, hosts, ciphertext, encrypted_dek, kek_id, created_at, updated_at, last_used_at, deleted_at FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
@@ -806,6 +820,21 @@ SELECT pg_advisory_xact_lock(hashtext($1)::bigint)
 // check and insert serialize across API instances, not just the in-process lock.
 func (q *Queries) LockSandboxForSecretWrites(ctx context.Context, hashtext string) error {
 	_, err := q.db.Exec(ctx, lockSandboxForSecretWrites, hashtext)
+	return err
+}
+
+const recordDetachedSecretKey = `-- name: RecordDetachedSecretKey :exec
+INSERT INTO sandbox_secret_detached (sandbox_id, env_key) VALUES ($1, $2)
+ON CONFLICT (sandbox_id, env_key) DO NOTHING
+`
+
+type RecordDetachedSecretKeyParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	EnvKey    string    `json:"env_key"`
+}
+
+func (q *Queries) RecordDetachedSecretKey(ctx context.Context, arg RecordDetachedSecretKeyParams) error {
+	_, err := q.db.Exec(ctx, recordDetachedSecretKey, arg.SandboxID, arg.EnvKey)
 	return err
 }
 

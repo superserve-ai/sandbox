@@ -7,10 +7,9 @@
 -- reclaim then always sees the sandbox or the snapshot pinning its build.
 -- The trigger counts the limits on insert; a retry carrying an idempotency
 -- key already on file is refused by the unique index and re-read by the
--- caller. The bindings a fork re-binds are read here too, by a caller that
--- holds the sandbox's secret-write lock, so a detach is in the row or after
--- it. Bindings of deleted secrets are kept: their keys are still in the
--- guest, and a fork clears them.
+-- caller. The bindings a fork re-binds or clears are read here too, by a
+-- caller that holds the sandbox's secret-write lock, so a detach is in the
+-- row or after it.
 INSERT INTO sandbox_snapshot (
     id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key,
     host_id, vcpu_count, memory_mib, disk_mib, base_path,
@@ -19,11 +18,7 @@ INSERT INTO sandbox_snapshot (
 SELECT @id::uuid, s.team_id, s.id, s.template_id, @kind::text, 'creating', sqlc.narg('name')::text, sqlc.narg('idempotency_key')::text,
     s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.base_path,
     s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb),
-    COALESCE((
-      SELECT jsonb_agg(jsonb_build_object('env_key', ss.env_key, 'secret_id', ss.secret_id) ORDER BY ss.env_key)
-      FROM sandbox_secret ss
-      WHERE ss.sandbox_id = s.id
-    ), '[]'::jsonb),
+    sandbox_secret_record(s.id),
     @sweep_after::timestamptz
 FROM sandbox s
 WHERE s.id = @sandbox_id AND s.team_id = @team_id AND s.destroyed_at IS NULL
@@ -121,3 +116,9 @@ SELECT EXISTS (
   SELECT 1 FROM sandbox_snapshot
   WHERE sandbox_id = $1 AND status = 'creating' AND deleted_at IS NULL
 );
+
+-- name: RefreshCapturingSnapshotSecrets :exec
+-- Re-records the secrets of a capture still in flight, for a binding change
+-- that cannot wait for it: an attach that failed and is undone.
+UPDATE sandbox_snapshot SET secret_bindings = sandbox_secret_record(sandbox_id)
+WHERE sandbox_id = $1 AND status = 'creating' AND deleted_at IS NULL;

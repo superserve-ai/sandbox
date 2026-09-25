@@ -44,6 +44,8 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 	live := db.Secret{ID: uuid.New(), TeamID: teamID, Name: "example-key", AuthType: "bearer"}
 	gone := uuid.New()
 	snap := readySnapshotFixture(teamID, live.ID, gone)
+	// A key detached from the source before the capture.
+	snap.SecretBindings = []byte(strings.TrimSuffix(string(snap.SecretBindings), "]") + `,{"env_key":"KEY_DETACHED"}]`)
 
 	var capHost string
 	var capStatuses, capRequired []string
@@ -158,9 +160,12 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 	if injectedJWT == "" || injected["KEY_9"] != "x" {
 		t.Errorf("injected env %v with jwt %q; want the request's env var and a JWT for the binding", injected, injectedJWT)
 	}
-	// The deleted secret's key held the source's token; it is cleared.
-	if v, ok := injected["KEY_1"]; !ok || v != "" {
-		t.Errorf("injected KEY_1 = %q (set %v); want the deleted secret's key cleared", v, ok)
+	// The deleted secret's and the detached key held the source's tokens;
+	// they are cleared.
+	for _, k := range []string{"KEY_1", "KEY_DETACHED"} {
+		if v, ok := injected[k]; !ok || v != "" {
+			t.Errorf("injected %s = %q (set %v); want it cleared", k, v, ok)
+		}
 	}
 	if _, ok := injected["HTTPS_PROXY"]; ok {
 		t.Error("proxy settings cleared although a secret is bound")

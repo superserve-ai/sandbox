@@ -177,3 +177,10 @@ WHERE pa.secret_id = sqlc.arg('secret_id')
   AND pa.status <= sqlc.arg('status_max')::int
 ORDER BY pa.id DESC
 LIMIT sqlc.arg('row_limit');
+
+-- name: RecordDetachedSecretKey :exec
+INSERT INTO sandbox_secret_detached (sandbox_id, env_key) VALUES ($1, $2)
+ON CONFLICT (sandbox_id, env_key) DO NOTHING;
+
+-- name: ForgetDetachedSecretKey :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = $2;
