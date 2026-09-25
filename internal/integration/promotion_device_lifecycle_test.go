@@ -175,6 +175,38 @@ func promotionClaimSignup(t *testing.T, region *pgxpool.Pool, user uuid.UUID) (u
 	return team, outcome
 }
 
+func TestIntegration_PromotionSignupGrantWithLateDeviceEvidence(t *testing.T) {
+	ctx := context.Background()
+	region := promotionIsolatedDatabase(t, true)
+	owner, recipient := uuid.New(), uuid.New()
+	fingerprint := "visitor-" + uuid.NewString()
+	rolloutExec(t, region, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+		owner, uuid.New(), "event-"+uuid.NewString(), fingerprint)
+
+	team, outcome := promotionClaimSignup(t, region, recipient)
+	if outcome != "granted" {
+		t.Fatalf("signup grant without evidence: %s", outcome)
+	}
+	var grantWithoutEvidence bool
+	if err := region.QueryRow(ctx, `SELECT fingerprint IS NULL FROM promotion_device_grant
+		WHERE promotion='signup' AND user_id=$1 AND team_id=$2`, recipient, team).Scan(&grantWithoutEvidence); err != nil || !grantWithoutEvidence {
+		t.Fatalf("signup grant did not retain missing evidence: %t, %v", grantWithoutEvidence, err)
+	}
+	var registration string
+	if err := region.QueryRow(ctx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+		recipient, uuid.New(), "event-"+uuid.NewString(), fingerprint).Scan(&registration); err != nil || registration != "owner_conflict" {
+		t.Fatalf("late evidence registration: %q, %v", registration, err)
+	}
+	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
+	var decision string
+	if err := region.QueryRow(ctx, `SELECT promotion_device_decision($1,'signup')`, owner).Scan(&decision); err != nil || decision != "device_already_redeemed" {
+		t.Fatalf("owner decision after late evidence: %q, %v", decision, err)
+	}
+	if _, outcome := promotionClaimSignup(t, region, owner); outcome != "promotion_ineligible" {
+		t.Fatalf("owner signup claim after late evidence: %s", outcome)
+	}
+}
+
 func TestIntegration_DeniedSignupDeviceClaimFencesLegacyCompletion(t *testing.T) {
 	ctx := context.Background()
 	region := promotionIsolatedDatabase(t, true)
