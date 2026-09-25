@@ -41,7 +41,7 @@ const (
 )
 
 var errBillingRedirectOriginsNotConfigured = errors.New("billing redirect origins are not configured")
-var errStripeCheckoutAssociationPending = errors.New("Stripe checkout association is still being established")
+var errStripeCheckoutAssociationPending = errors.New(db.StripeCheckoutAssociationPendingError)
 
 type StripeBillingClient interface {
 	CreateCustomer(ctx context.Context, params StripeCreateCustomerParams) (StripeCustomer, error)
@@ -1802,8 +1802,17 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 	}
 
 	if err := h.processStripeWebhookEvent(c.Request.Context(), processTx, event); err != nil {
-		h.rollbackAndPersistStripeWebhookFailure(c.Request.Context(), processTx, event.ID, err.Error())
-		log.Error().Err(err).Str("event_id", event.ID).Str("event_type", event.Type).Msg("process Stripe webhook failed")
+		pending := errors.Is(err, errStripeCheckoutAssociationPending)
+		failure := err.Error()
+		if pending {
+			failure = errStripeCheckoutAssociationPending.Error()
+		}
+		h.rollbackAndPersistStripeWebhookFailure(c.Request.Context(), processTx, event.ID, failure)
+		if pending {
+			log.Warn().Err(err).Str("event_id", event.ID).Str("event_type", event.Type).Msg("Stripe checkout association pending")
+		} else {
+			log.Error().Err(err).Str("event_id", event.ID).Str("event_type", event.Type).Msg("process Stripe webhook failed")
+		}
 		respondError(c, ErrInternal)
 		return
 	}
@@ -1864,7 +1873,16 @@ func (h *Handlers) persistStripeWebhookFailure(ctx context.Context, eventID, las
 		EventID:   eventID,
 		LastError: &lastError,
 	}); err != nil {
-		return err
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		current, currentErr := q.GetStripeWebhookEvent(ctx, eventID)
+		if currentErr != nil {
+			return currentErr
+		}
+		if !current.ProcessedAt.Valid {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }

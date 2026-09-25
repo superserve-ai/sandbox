@@ -818,6 +818,7 @@ UPDATE stripe_webhook_event
 SET last_error = sqlc.arg(last_error),
     updated_at = now()
 WHERE event_id = sqlc.arg(event_id)
+  AND processed_at IS NULL
 RETURNING *;
 
 -- name: IsFeatureEnabledForTeam :one

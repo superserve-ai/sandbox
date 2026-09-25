@@ -137,3 +137,33 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). We use the Developer Certificate of Orig
 OCVSAL 1.0 — see [LICENSE](LICENSE).
 
 Built on [Firecracker](https://github.com/firecracker-microvm/firecracker) (Apache 2.0).
+
+### Deferred Stripe checkout association alerts
+
+A subscription webhook received while its Checkout reservation is being
+associated remains retained and retryable: the endpoint returns HTTP 500 and
+logs a warning with the event ID and type. A control-plane monitor polls each
+minute, independently of webhook traffic and incremental billing export. It
+reports an association still unresolved five minutes after the event's first
+`received_at` through the existing error log and Sentry pipeline. Retries do
+not reset this clock.
+
+Before reporting, the monitor checks the current billing account and retained
+event under the same account-before-event lock order as Checkout reconciliation.
+Processed or associated events are silent. A different established subscription
+or an expired Checkout reservation is treated as obsolete; a subscription
+cancellation by itself is not. The monitor only classifies and reports; it does
+not replay webhooks, change billing state, or grant credit.
+
+Database alert bookkeeping coordinates replicas. A claim expires after two
+minutes if a worker exits, a reported event has a 30-minute repeat cooldown,
+and a recovered or obsolete event is rechecked after 24 hours. Reporter failure
+attempts to release the claim for the next poll; an interrupted release falls
+back to lease expiry. A crash between error logging and cooldown
+bookkeeping can yield a duplicate notification; external Sentry delivery is not
+transactional with the database. Each poll examines at most 100 events, using
+receipt-order keyset pagination and a wraparound scan. The additive migration retains existing
+webhook rows and their original receipt times. After deployment, verify that
+this monitor runs in each webhook-receiving control plane and that overdue
+errors qualify for the configured Sentry notification rule; local tests cannot
+prove notification delivery.

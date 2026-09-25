@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -25,6 +26,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
@@ -1067,9 +1070,25 @@ func TestIntegration_StripePendingCheckoutReconcilesLatestLifecycle(t *testing.T
 			if tc.reverse {
 				payloads[0], payloads[1] = payloads[1], payloads[0]
 			}
+			var warnings bytes.Buffer
+			previousLogger := log.Logger
+			log.Logger = zerolog.New(&warnings)
+			t.Cleanup(func() { log.Logger = previousLogger })
 			for _, payload := range payloads {
 				if response := deliver(payload); response.Code != http.StatusInternalServerError {
 					t.Fatalf("pending delivery = %d, want retryable 500: %s", response.Code, response.Body.String())
+				}
+			}
+			for _, id := range ids {
+				found := false
+				for _, line := range bytes.Split(warnings.Bytes(), []byte{'\n'}) {
+					var entry map[string]any
+					if json.Unmarshal(line, &entry) == nil && entry["event_id"] == id && entry["level"] == "warn" && strings.HasPrefix(fmt.Sprint(entry["event_type"]), "customer.subscription.") {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("pending event %s did not log a warning: %s", id, warnings.String())
 				}
 			}
 			// A different subscription for the same customer must never be imported.

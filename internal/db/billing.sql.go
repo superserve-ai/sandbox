@@ -2179,6 +2179,7 @@ UPDATE stripe_webhook_event
 SET last_error = $1,
     updated_at = now()
 WHERE event_id = $2
+  AND processed_at IS NULL
 RETURNING event_id, event_type, payload, received_at, processed_at, last_error, updated_at
 `
 

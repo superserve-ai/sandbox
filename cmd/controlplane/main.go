@@ -400,6 +400,7 @@ func run() error {
 	}
 	billing.StartBillingFinalizationService(ctx, dbPool, billing.DefaultBillingFinalizationConfig())
 	handlers.StartIncrementalBillingService(ctx)
+	handlers.StartStripeCheckoutAssociationMonitor(ctx)
 
 	// Quota watcher: alerts when a team crosses 80% of a resource limit. Fans out
 	// to a Slack webhook and an email notifier; each channel is independently

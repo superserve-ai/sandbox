@@ -983,6 +983,13 @@ type Snapshot struct {
 	PauseToken *string   `json:"pause_token"`
 }
 
+type StripeCheckoutAssociationAlert struct {
+	EventID     string             `json:"event_id"`
+	LeaseUntil  pgtype.Timestamptz `json:"lease_until"`
+	NextCheckAt time.Time          `json:"next_check_at"`
+	LastAlertAt pgtype.Timestamptz `json:"last_alert_at"`
+}
+
 type StripeWebhookEvent struct {
 	EventID     string             `json:"event_id"`
 	EventType   string             `json:"event_type"`
