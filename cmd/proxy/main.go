@@ -171,6 +171,8 @@ func run() error {
 		log.Info().Msg("files endpoint enabled")
 		proxyHandler.WithExec()
 		log.Info().Msg("exec endpoint enabled")
+		proxyHandler.WithDesktop()
+		log.Info().Msg("desktop endpoint enabled")
 
 		if originsEnv != "" {
 			origins := splitCSV(originsEnv)
