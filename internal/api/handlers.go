@@ -2827,6 +2827,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	type resolvedSecrets struct {
 		bindings []db.AddSandboxSecretParams
 		meta     []SecretBindingMeta
+		dropped  []string
 		err      *AppError
 	}
 	// The context is taken here, not in the goroutine: gin recycles c once
@@ -2836,7 +2837,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	secretsCh := make(chan resolvedSecrets, 1)
 	go func() {
 		bindings, meta, appErr := h.resolveSecretBindingsForCreate(secretsCtx, teamID, req.Secrets)
-		secretsCh <- resolvedSecrets{bindings, meta, appErr}
+		secretsCh <- resolvedSecrets{bindings: bindings, meta: meta, err: appErr}
 	}()
 
 	// Default the create to the `superserve/base` template so every sandbox
@@ -2900,6 +2901,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	var source db.SandboxSnapshot
 	var reboundCh chan resolvedSecrets
 	var forkNetworkConfig []byte
+	// Keys the fork's guest holds from its source that no longer name
+	// anything of the fork's; injected empty.
+	var clearedEnv []string
 	if sourceSnapshotID != uuid.Nil {
 		snap, err := h.DB.GetSandboxSnapshot(c.Request.Context(), db.GetSandboxSnapshotParams{ID: sourceSnapshotID, TeamID: teamID})
 		tLookupDone = time.Now()
@@ -2939,8 +2943,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// the row is written.
 		reboundCh = make(chan resolvedSecrets, 1)
 		go func() {
-			bindings, meta, appErr := h.rebindSnapshotSecrets(secretsCtx, teamID, snap.SecretBindings, req.Secrets, req.EnvVars)
-			reboundCh <- resolvedSecrets{bindings, meta, appErr}
+			bindings, meta, dropped, appErr := h.rebindSnapshotSecrets(secretsCtx, teamID, snap.SecretBindings, req.Secrets, req.EnvVars)
+			reboundCh <- resolvedSecrets{bindings: bindings, meta: meta, dropped: dropped, err: appErr}
 		}()
 	}
 
@@ -2975,6 +2979,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		secretBindings = append(secretBindings, rebound.bindings...)
 		secretMeta = append(secretMeta, rebound.meta...)
+		clearedEnv = rebound.dropped
 		// Each binding is a JWT claim; refused here, before anything boots.
 		if len(secretBindings) > SecretsBindingsCap {
 			respondErrorMsg(c, "bad_request",
@@ -3175,14 +3180,22 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// scoped to the request context so that if the client hangs up, it is
 	// cancelled and VMD cleans up.
 	envVarsToShip := mergeEnvVarsWithSecrets(req.EnvVars, secretMeta)
-	// A fork keeps its source's environment, proxy settings included; with
-	// no secret bound here they name credentials this sandbox cannot use.
-	if _, set := req.EnvVars["HTTPS_PROXY"]; !set && len(secretMeta) == 0 && snapshotHadSecrets(source) {
-		shipped := make(map[string]string, len(envVarsToShip)+1)
+	// A fork keeps its source's environment: the tokens of secrets deleted
+	// since, and with no secret bound here the proxy settings, name
+	// credentials this sandbox cannot use. Anything the request sets wins.
+	if len(secretMeta) == 0 && snapshotHadSecrets(source) {
+		clearedEnv = append(clearedEnv, "HTTPS_PROXY")
+	}
+	if len(clearedEnv) > 0 {
+		shipped := make(map[string]string, len(envVarsToShip)+len(clearedEnv))
 		for k, v := range envVarsToShip {
 			shipped[k] = v
 		}
-		shipped["HTTPS_PROXY"] = ""
+		for _, k := range clearedEnv {
+			if _, set := shipped[k]; !set {
+				shipped[k] = ""
+			}
+		}
 		envVarsToShip = shipped
 	}
 

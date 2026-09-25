@@ -1144,9 +1144,10 @@ func snapshotHadSecrets(s db.SandboxSnapshot) bool {
 
 // rebindSnapshotSecrets binds a sandbox created from a snapshot to the
 // secrets its source was bound to: by id against the team's live secrets,
-// with fresh proxy tokens. A secret deleted since is left out, as is an env
-// key the request sets itself, in secrets or envVars.
-func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, recorded []byte, secrets, envVars map[string]string) ([]db.AddSandboxSecretParams, []SecretBindingMeta, *AppError) {
+// with fresh proxy tokens. A secret deleted since is left out, and its key
+// returned as dropped, as is an env key the request sets itself, in
+// secrets or envVars.
+func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, recorded []byte, secrets, envVars map[string]string) ([]db.AddSandboxSecretParams, []SecretBindingMeta, []string, *AppError) {
 	var bound []struct {
 		EnvKey   string    `json:"env_key"`
 		SecretID uuid.UUID `json:"secret_id"`
@@ -1154,11 +1155,11 @@ func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, 
 	if len(recorded) > 0 {
 		if err := json.Unmarshal(recorded, &bound); err != nil {
 			log.Error().Err(err).Msg("decode snapshot secret bindings")
-			return nil, nil, ErrInternal
+			return nil, nil, nil, ErrInternal
 		}
 	}
 	if len(bound) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	ids := make([]uuid.UUID, 0, len(bound))
 	for _, b := range bound {
@@ -1167,7 +1168,7 @@ func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, 
 	rows, err := h.DB.GetSecretsByIDs(ctx, db.GetSecretsByIDsParams{TeamID: teamID, Column2: ids})
 	if err != nil {
 		log.Error().Err(err).Msg("DB GetSecretsByIDs during sandbox create")
-		return nil, nil, ErrInternal
+		return nil, nil, nil, ErrInternal
 	}
 	byID := make(map[uuid.UUID]db.Secret, len(rows))
 	for _, row := range rows {
@@ -1175,9 +1176,14 @@ func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, 
 	}
 	var bindings []db.AddSandboxSecretParams
 	var meta []SecretBindingMeta
+	var dropped []string
 	for _, b := range bound {
 		row, live := byID[b.SecretID]
-		if _, set := secrets[b.EnvKey]; set || !live {
+		if _, set := secrets[b.EnvKey]; set {
+			continue
+		}
+		if !live {
+			dropped = append(dropped, b.EnvKey)
 			continue
 		}
 		if _, set := envVars[b.EnvKey]; set {
@@ -1186,12 +1192,12 @@ func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, 
 		binding, m, err := bindSecret(b.EnvKey, row)
 		if err != nil {
 			log.Error().Err(err).Msg("mintProxyToken during sandbox create")
-			return nil, nil, ErrInternal
+			return nil, nil, nil, ErrInternal
 		}
 		bindings = append(bindings, binding)
 		meta = append(meta, m)
 	}
-	return bindings, meta, nil
+	return bindings, meta, dropped, nil
 }
 
 // loadSecretBindingMeta rebuilds a sandbox's binding metadata from the DB. The

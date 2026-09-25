@@ -157,6 +157,13 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 	if injectedJWT == "" || injected["KEY_9"] != "x" {
 		t.Errorf("injected env %v with jwt %q; want the request's env var and a JWT for the binding", injected, injectedJWT)
 	}
+	// The deleted secret's key held the source's token; it is cleared.
+	if v, ok := injected["KEY_1"]; !ok || v != "" {
+		t.Errorf("injected KEY_1 = %q (set %v); want the deleted secret's key cleared", v, ok)
+	}
+	if _, ok := injected["HTTPS_PROXY"]; ok {
+		t.Error("proxy settings cleared although a secret is bound")
+	}
 	body := parseJSON(t, w)
 	if body["source_snapshot_id"] != snap.ID.String() || body["timeout_seconds"].(float64) != 600 || body["status"] != "active" {
 		t.Errorf("body = %v; want the source, its timeout and active", body)
