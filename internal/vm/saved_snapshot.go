@@ -698,8 +698,11 @@ func (m *Manager) instanceDiskPath(inst *VMInstance) string {
 }
 
 func (m *Manager) committedSavedSnapshot(dir, vmID string, kind SavedSnapshotKind) (*SavedSnapshotManifest, error) {
+	// Closed on any doubt: an unreadable tombstone is not an absent one.
 	if _, err := os.Stat(savedTombstonePath(dir)); err == nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "saved snapshot %s was deleted", filepath.Base(dir))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, status.Errorf(codes.Unavailable, "saved snapshot %s: deletion record unreadable: %v", filepath.Base(dir), err)
 	}
 	man, err := readSavedSnapshotManifest(dir)
 	if errors.Is(err, os.ErrNotExist) {

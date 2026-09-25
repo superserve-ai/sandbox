@@ -1429,3 +1429,26 @@ func TestSavedTombstoneReaperKeepsADay(t *testing.T) {
 		t.Fatalf("a fresh tombstone was reaped: %v", err)
 	}
 }
+
+func TestCaptureFailsClosedOnAnUnreadableTombstone(t *testing.T) {
+	m := newSavedTestManager(t)
+	inst, _ := seedPausedSource(t, m, true)
+	ctx := context.Background()
+	id := uuid.NewString()
+	dir, _ := m.savedSnapshotDir(id)
+	// The deletion records cannot be read: something that is not a
+	// directory sits where they live.
+	tombs := filepath.Dir(savedTombstonePath(dir))
+	if err := os.MkdirAll(filepath.Dir(tombs), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tombs, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.CreateSavedSnapshot(ctx, inst.ID, id, SavedSnapshotMemFS); status.Code(err) != codes.Unavailable {
+		t.Fatalf("capture with the deletion records unreadable: want Unavailable, got %v", err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a capture that could not check for a deletion left files: %v", err)
+	}
+}
