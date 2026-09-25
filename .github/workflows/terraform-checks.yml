@@ -39,6 +39,15 @@ jobs:
       - name: Test control-plane identity rollout
         run: python3 -m unittest discover -s scripts -p 'test*control_plane*.py'
 
+      - name: Check alert runbook wiring
+        run: python3 scripts/check-alert-runbooks.py
+
+      - name: Check alert triage labels
+        run: python3 scripts/check-alert-triage-labels.py
+
+      - name: Test alert contract validators
+        run: python3 -m unittest discover -s scripts -p 'test_check_alert*.py'
+
       - name: Validate Terraform roots
         run: scripts/terraform-validate.sh
 

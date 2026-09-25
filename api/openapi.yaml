@@ -924,6 +924,220 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /sandboxes/{sandbox_id}/snapshot:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+    post:
+      operationId: createSandboxSnapshot
+      tags: [Snapshots]
+      summary: Snapshot a sandbox
+      description: |
+        Captures the sandbox into a saved snapshot of its memory and disk,
+        kept until deleted. Creating a sandbox from a snapshot, resuming with
+        its processes intact, arrives in a later release; until then a
+        snapshot can be listed, renamed and deleted. The sandbox must be
+        active or paused. A running sandbox is paused for the capture: under
+        a second for the first memory snapshot of a sandbox, longer when all
+        of memory has to be written. The call returns once the snapshot is
+        ready; if the host's answer is lost on the way, it returns the
+        snapshot still `creating` and the platform settles it with the host
+        shortly. Snapshots outlive the sandbox they came from.
+
+        Pass `idempotency_key` to make a retry return the snapshot the first
+        request made instead of taking another, whatever became of it since.
+      security:
+        - apiKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSnapshotRequest"
+      responses:
+        "201":
+          description: Snapshot ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "200":
+          description: A snapshot an earlier request with the same `idempotency_key` made
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "202":
+          description: >
+            The host's answer was lost; the snapshot is still `creating` and
+            is settled with the host shortly. Poll `GET /snapshots/{snapshot_id}`.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The sandbox is not active or paused, or the host cannot capture it as it stands
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: >
+            The team's snapshot limit or its limit on snapshots being created
+            at once is reached (`too_many_snapshots`,
+            `too_many_snapshots_in_flight`), or the request rate limit
+            (`rate_limited`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "410":
+          description: The snapshot an earlier request with the same `idempotency_key` made has since been deleted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: The host cannot take the snapshot as it stands, or does not support snapshots yet; retry
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /sandboxes/{sandbox_id}/snapshots:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+    get:
+      operationId: listSandboxSnapshots
+      tags: [Snapshots]
+      summary: List a sandbox's snapshots
+      description: |
+        Snapshots of the sandbox that have not been deleted, newest first.
+        Snapshots outlive their sandbox, so this lists them for a deleted
+        sandbox too.
+      security:
+        - apiKey: []
+      parameters:
+        - $ref: "#/components/parameters/PageLimit"
+        - $ref: "#/components/parameters/PageOffset"
+      responses:
+        "200":
+          description: Snapshots, newest first
+          headers:
+            X-Total-Count:
+              $ref: "#/components/headers/TotalCount"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/SnapshotResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /snapshots/{snapshot_id}:
+    parameters:
+      - $ref: "#/components/parameters/SnapshotId"
+    get:
+      operationId: getSnapshot
+      tags: [Snapshots]
+      summary: Get a snapshot
+      security:
+        - apiKey: []
+      responses:
+        "200":
+          description: The snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    patch:
+      operationId: patchSnapshot
+      tags: [Snapshots]
+      summary: Rename a snapshot
+      security:
+        - apiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnapshotPatch"
+      responses:
+        "200":
+          description: The renamed snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    delete:
+      operationId: deleteSnapshot
+      tags: [Snapshots]
+      summary: Delete a snapshot
+      description: |
+        Removes the snapshot. A snapshot still being created cannot be
+        deleted until it is ready, has failed, or has been creating for an
+        hour without its host settling it.
+      security:
+        - apiKey: []
+      responses:
+        "204":
+          description: Snapshot deleted
+        "202":
+          description: >
+            The snapshot is marked for deletion and its files are removed
+            shortly; it no longer counts toward any limit.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [deleting]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
   /sandboxes/{sandbox_id}/preview-ports:
     parameters:
       - $ref: "#/components/parameters/SandboxId"
@@ -2380,6 +2594,15 @@ components:
         $ref: "#/components/schemas/PublicSandboxId"
       description: The unique identifier of the sandbox.
 
+    SnapshotId:
+      name: snapshot_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: The unique identifier of the snapshot.
+
     PreviewPort:
       name: port
       in: path
@@ -3284,6 +3507,85 @@ components:
                   revoked:
                     type: boolean
                     default: false
+
+    CreateSnapshotRequest:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: ["mem+fs"]
+          default: "mem+fs"
+          description: >
+            `mem+fs` captures memory and disk. A disk-only kind is not
+            offered yet.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Optional label. Can be changed later with PATCH.
+        idempotency_key:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: >
+            Caller-chosen key, unique per sandbox. A retry carrying the same
+            key returns the snapshot the first request made.
+
+    SnapshotPatch:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+
+    SnapshotResponse:
+      type: object
+      required: [id, sandbox_id, kind, status, size_bytes, resources, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        sandbox_id:
+          type: string
+          format: uuid
+          description: The sandbox the snapshot was taken from. It may since have been deleted.
+        template_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: The template the captured sandbox was created from.
+        kind:
+          type: string
+          enum: ["mem+fs"]
+        status:
+          type: string
+          enum: [creating, ready, failed, deleting]
+        name:
+          type: string
+          nullable: true
+        size_bytes:
+          type: integer
+          format: int64
+          description: Bytes the snapshot holds on disk; 0 until ready.
+        resources:
+          type: object
+          required: [vcpu_count, memory_mib, disk_mib]
+          properties:
+            vcpu_count:
+              type: integer
+            memory_mib:
+              type: integer
+            disk_mib:
+              type: integer
+        created_at:
+          type: string
+          format: date-time
+        ready_at:
+          type: string
+          format: date-time
+          nullable: true
 
     ResumeResponse:
       type: object

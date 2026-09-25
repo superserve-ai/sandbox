@@ -67,7 +67,7 @@ func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
 		t.Fatalf("authorization = %q", gotAuthorization)
 	}
 	want := []string{
-		capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy,
+		capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots,
 		capabilityCanProxyTraffic,
 		capabilityCanReadFiles, capabilityCanWriteFiles,
 		preview.HostCapabilityPorts, preview.HostCapabilityPortAccess,
@@ -245,10 +245,10 @@ func TestSendHeartbeatOmitsCapabilityForOldOrUnavailableProxy(t *testing.T) {
 		healthBody   string
 		want         []string
 	}{
-		{name: "old proxy empty health", healthStatus: http.StatusOK, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}},
-		{name: "proxy unavailable", healthStatus: http.StatusServiceUnavailable, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}},
-		{name: "wrong protocol", healthStatus: http.StatusOK, healthBody: `{"capabilities":["other"]}`, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}},
-		{name: "access without base", healthStatus: http.StatusOK, healthBody: `{"capabilities":["preview_port_access_v1"]}`, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}},
+		{name: "old proxy empty health", healthStatus: http.StatusOK, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots}},
+		{name: "proxy unavailable", healthStatus: http.StatusServiceUnavailable, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots}},
+		{name: "wrong protocol", healthStatus: http.StatusOK, healthBody: `{"capabilities":["other"]}`, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots}},
+		{name: "access without base", healthStatus: http.StatusOK, healthBody: `{"capabilities":["preview_port_access_v1"]}`, want: []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots}},
 	}
 
 	for _, tt := range tests {
@@ -298,7 +298,7 @@ func TestSendHeartbeatOmitsLifecycleCapabilitiesBeforeReady(t *testing.T) {
 		HostID: "host-a", LifecycleReady: func() bool { return false },
 	}, server.URL+"/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
 
-	if reflect.DeepEqual(got.Capabilities, []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}) {
+	if reflect.DeepEqual(got.Capabilities, []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots}) {
 		t.Fatalf("lifecycle capabilities = %#v, want omitted before readiness", got.Capabilities)
 	}
 	for _, capability := range got.Capabilities {
@@ -323,7 +323,7 @@ func TestSendHeartbeatKeepsLifecycleCapabilitiesWhenResolverIsNotReady(t *testin
 	sendHeartbeat(context.Background(), server.Client(), HeartbeatConfig{
 		HostID: "host-a", LifecycleReady: func() bool { return true }, ResolverReady: func() bool { return false },
 	}, server.URL+"/heartbeat", "", server.URL+"/health", nil, zerolog.Nop())
-	want := []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy}
+	want := []string{capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots}
 	if !reflect.DeepEqual(got.Capabilities, want) {
 		t.Fatalf("capabilities = %#v, want %#v", got.Capabilities, want)
 	}

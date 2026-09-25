@@ -90,6 +90,10 @@ type Config struct {
 	OTelEndpoint       string
 	OTelInsecure       bool
 	OTelExportInterval time.Duration
+	// BackupGCServiceAccount turns on the purge of deleted sandboxes' backups
+	// from the cell's backup bucket: the identity, impersonated by the
+	// runtime, that may delete from it. Empty leaves the job off.
+	BackupGCServiceAccount string
 }
 
 // Load reads configuration from environment variables.
@@ -152,6 +156,7 @@ func Load() (*Config, error) {
 		OTelEndpoint:                  envOrDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
 		OTelInsecure:                  boolEnv("OTEL_EXPORTER_OTLP_INSECURE", false),
 		OTelExportInterval:            exportInterval,
+		BackupGCServiceAccount:        strings.TrimSpace(os.Getenv("BACKUP_GC_SERVICE_ACCOUNT")),
 	}
 	return cfg, nil
 }

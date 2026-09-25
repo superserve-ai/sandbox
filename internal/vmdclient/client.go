@@ -17,6 +17,24 @@ type ResourceLimits struct {
 	MemoryMiB uint32
 }
 
+// SavedSnapshot is what a host reports for a committed saved snapshot: the
+// files it owns, their base references, and the sizes a fork inherits.
+type SavedSnapshot struct {
+	Kind         string
+	BasePath     string
+	DiskPath     string
+	SnapshotPath string
+	MemPath      string
+	BaseMemPath  string
+	VCPU         uint32
+	MemoryMiB    uint32
+	DiskSizeMiB  uint32
+	SizeBytes    int64
+	// FirecrackerSHA256 names the Firecracker that wrote the memory image;
+	// empty when the host could not tell.
+	FirecrackerSHA256 string
+}
+
 // PortPolicy is the control-plane representation of one published preview
 // port. Tokenized wire modes require a positive TokenVersion; raw private and
 // public policies leave TokenVersion at zero.
@@ -99,6 +117,12 @@ type Client interface {
 	// control plane to garbage-collect the previous snapshot after a new
 	// pause writes a fresh one.
 	DeleteSnapshot(ctx context.Context, instanceID, snapshotPath, memPath string) error
+	// CreateSavedSnapshot captures a running or paused sandbox into a saved
+	// snapshot the caller keyed by snapshotID; a retry with the same id
+	// returns the committed snapshot. kind is "fs" or "mem+fs".
+	CreateSavedSnapshot(ctx context.Context, instanceID, snapshotID, kind string) (SavedSnapshot, error)
+	// DeleteSavedSnapshot removes a saved snapshot's files. Idempotent.
+	DeleteSavedSnapshot(ctx context.Context, snapshotID string) error
 	// DeleteSandboxSnapshots removes a sandbox's entire on-disk snapshot
 	// directory. Path-based and idempotent — reclaims pause artifacts even
 	// when no snapshot row exists. Only for a sandbox being deleted.

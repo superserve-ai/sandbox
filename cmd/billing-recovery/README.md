@@ -41,3 +41,20 @@ When a subscription-created webhook arrives before its checkout association is
 known, the webhook remains unprocessed and returns a retryable error. A
 matching checkout completion then reconciles that retained delivery; normal
 event-ID deduplication is unchanged.
+
+Recovery requires an existing local customer/subscription association; it does
+not import a missing subscription association from Checkout.
+
+A retained checkout reservation is recoverable only when Stripe confirms the
+exact session is complete for the current team, customer, and subscription.
+Recovery rechecks that proof under the billing-account lock and clears the
+reservation in the same transaction as activation. Open, expired, mismatched,
+and unproven pending sessions remain skipped. An expired session ID retained
+after its reservation was cleared does not block recovery of the existing
+subscription and is preserved. Stripe lookup failures are reported as unresolved.
+
+For an explicitly approved custom credit, use `-team <team-uuid>
+-activation-credit-cents <positive-usd-cents>` for both dry-run and apply.
+The default remains 9500 cents. A custom amount cannot be used for a fleet scan.
+Existing grants must match the requested amount and established identity;
+unverified promotional USD grants block creation rather than being ignored.

@@ -30,6 +30,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/analytics"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/authz"
+	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
@@ -154,9 +155,10 @@ type Handlers struct {
 	SignupRestrictions    *abuse.SignupEvaluator
 	VMD                   VMDClient // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
 	DB                    *db.Queries
-	Pool                  *pgxpool.Pool // required by paths that need their own transaction (e.g. build-concurrency admission)
-	legacyStorageAccepted sync.Map      // legacyStorageAckKey -> last durably accepted report ID
-	legacyStorageInFlight sync.Map      // legacyStorageAckKey -> report ID with an active inline attempt or retry
+	Pool                  *pgxpool.Pool    // required by paths that need their own transaction (e.g. build-concurrency admission)
+	legacyStorageAccepted sync.Map         // legacyStorageAckKey -> last durably accepted report ID
+	legacyStorageInFlight sync.Map         // legacyStorageAckKey -> report ID with an active inline attempt or retry
+	BackupGC              backup.BlobAdmin // deletes from the cell's backup bucket; nil leaves the purge job off
 	Config                *config.Config
 	Hosts                 HostRegistry // when set, routes VMD calls via host_id
 	Scheduler             Scheduler    // when set, picks host on create
@@ -194,6 +196,13 @@ type Handlers struct {
 	// needs nothing.
 	inlineTeardownsOnce sync.Once
 	inlineTeardowns     chan struct{}
+
+	// snapshotSweepHosts is the snapshot sweep's queue per host, guarded by
+	// snapshotSweepMu; a sweep pass hands rows over and returns, and one
+	// worker per host takes them in turn. Lazily created so struct-literal
+	// construction keeps working.
+	snapshotSweepMu    sync.Mutex
+	snapshotSweepHosts map[string]*snapshotSweepHost
 
 	// activityGate caps how many activity-log inserts may hold DB connections
 	// at once (see writeActivity). Lazily created so struct-literal

@@ -56,6 +56,9 @@ func (c cgroupFS) writeState(s string) error {
 type freezer struct {
 	fs  freezerFS
 	dir string
+	// flush writes every dirty page out while the workload is stopped, from
+	// this process, which the freezer never holds.
+	flush func()
 	// mounted is fixed at startup: init mounts the cgroup before boxd runs.
 	mounted bool
 	// mu: spawns hold it shared across Start(); a freeze holds it exclusively.
@@ -86,7 +89,7 @@ var (
 // mount, so an image that claims a freezer it does not have fails closed —
 // freezing is refused, and the builder never marks it.
 func newFreezer(fs freezerFS, dir string) *freezer {
-	f := &freezer{fs: fs, dir: dir}
+	f := &freezer{fs: fs, dir: dir, flush: flushFilesystems}
 	if fs != nil {
 		_, err := fs.readState()
 		f.mounted = err == nil
@@ -426,10 +429,11 @@ func decodeBody(r *http.Request, v any) error {
 	return nil
 }
 
-// POST /freeze {"budget_ms": N, "token": T}: 200 frozen, with the protocol
-// version, capability and token echoed; 400 no token; 409 another freeze is
-// active; 503 cannot freeze; 504 budget exhausted and thawed again; 500 budget
-// exhausted and thaw unconfirmed.
+// POST /freeze {"budget_ms": N, "token": T, "sync": S}: 200 frozen, with the
+// protocol version, capability and token echoed, and the filesystems flushed
+// once the workload is stopped when S is set; 400 no token; 409 another
+// freeze is active; 503 cannot freeze; 504 budget exhausted and thawed again;
+// 500 budget exhausted and thaw unconfirmed.
 func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", "POST")
@@ -440,6 +444,7 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		BudgetMs int64  `json:"budget_ms"`
 		Token    string `json:"token"`
+		Sync     bool   `json:"sync"`
 	}
 	// A body that does not decode whole is refused before anything moves,
 	// whatever fields it did fill.
@@ -467,8 +472,11 @@ func (f *freezer) handleFreeze(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), code)
 		return
 	}
+	if body.Sync {
+		f.flush()
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(freezeReply{Version: protocolVersion, Capability: protocolCapability, Token: body.Token})
+	json.NewEncoder(w).Encode(freezeReply{Version: protocolVersion, Capability: protocolCapability, Token: body.Token, Synced: body.Sync})
 }
 
 // protocolVersion is the wake protocol this boxd speaks; the supervisor
@@ -482,6 +490,7 @@ type freezeReply struct {
 	Version    int    `json:"version"`
 	Capability string `json:"capability"`
 	Token      string `json:"token"`
+	Synced     bool   `json:"synced,omitempty"`
 }
 
 // POST /thaw {"token": T}: the snapshot did not happen. 200 only once

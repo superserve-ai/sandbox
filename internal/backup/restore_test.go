@@ -66,6 +66,14 @@ func (m *memBlobs) NewReader(_ context.Context, object string) (io.ReadCloser, e
 	return io.NopCloser(bytes.NewReader(data)), nil
 }
 
+func (m *memBlobs) Delete(_ context.Context, object string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.objects, object)
+	delete(m.created, object)
+	return nil
+}
+
 func (m *memBlobs) List(_ context.Context, prefix string) ([]ObjectInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
