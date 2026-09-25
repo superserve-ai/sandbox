@@ -3,7 +3,6 @@ package vm
 import (
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/rs/zerolog"
 
@@ -234,6 +233,16 @@ func (m *Manager) instanceBusyForSweep(vmID string, activeUnits map[string]bool)
 	return inst.Status != StatusPaused
 }
 
+// presenceBefore is the overlay's side-car as it stands before a diff save,
+// nil when there is none, for verifyPresenceRefreshed to compare against.
+func presenceBefore(memPath string) os.FileInfo {
+	st, err := os.Stat(presence.SidecarPath(memPath))
+	if err != nil {
+		return nil
+	}
+	return st
+}
+
 // verifyPresenceRefreshed guards a misordered deploy. A diff save through a
 // Firecracker that predates the presence side-car rewrites the overlay but
 // not the side-car, leaving a stale bitmap a NEWER Firecracker would later
@@ -242,8 +251,12 @@ func (m *Manager) instanceBusyForSweep(vmID string, activeUnits map[string]bool)
 // save: remove it and warn, converting the misorder into loud strict-mode
 // refusals (or a sound extent scan pre-convergence) instead of corruption.
 // No-op on correctly ordered deployments — the side-car-aware Firecracker
-// rewrites the file on every save.
-func (m *Manager) verifyPresenceRefreshed(memPath string, saveStart time.Time, log zerolog.Logger) {
+// rewrites the file on every save. The side-car as it was before the save
+// (nil when absent) is what a rewrite is told from: Firecracker replaces it
+// by rename, so a rewritten one is another file, or at the least a changed
+// one. The clock is not consulted, since a small save finishes within one
+// tick of the timestamps a file gets.
+func (m *Manager) verifyPresenceRefreshed(memPath string, before os.FileInfo, log zerolog.Logger) {
 	sc := presence.SidecarPath(memPath)
 	st, err := os.Stat(sc)
 	if os.IsNotExist(err) {
@@ -255,7 +268,7 @@ func (m *Manager) verifyPresenceRefreshed(memPath string, saveStart time.Time, l
 		log.Warn().Err(err).Str("path", sc).Msg("presence side-car stat failed after diff save")
 		return
 	}
-	if st.ModTime().Before(saveStart) {
+	if before != nil && os.SameFile(before, st) && st.ModTime().Equal(before.ModTime()) && st.Size() == before.Size() {
 		if rmErr := os.Remove(sc); rmErr != nil && !os.IsNotExist(rmErr) {
 			log.Warn().Err(rmErr).Str("path", sc).Msg("stale presence side-car removal failed")
 			return

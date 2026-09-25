@@ -250,84 +250,6 @@ func TestCreateSavedSnapshotRefusesOtherStates(t *testing.T) {
 	}
 }
 
-func TestAccumulateSavedMemory(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	base := filepath.Join(root, "base.snap")
-	pageFile(t, base, 4, map[int]byte{0: 'B', 1: 'B', 2: 'B', 3: 'B'}, false)
-
-	t.Run("accumulating pass unions the overlay and the diff", func(t *testing.T) {
-		tmp := t.TempDir()
-		overlay := filepath.Join(t.TempDir(), "mem.diff")
-		pageFile(t, overlay, 4, map[int]byte{1: 'S'}, true)
-		raw := filepath.Join(tmp, "mem.capture.diff")
-		pageFile(t, raw, 4, map[int]byte{2: 'N'}, true)
-		// Page 1 was dirtied to all zeros: present in the map, a hole in the
-		// file. It must overwrite the overlay's 'S'.
-		if err := presence.Write(raw, testPage, 4, []uint64{1<<1 | 1<<2}); err != nil {
-			t.Fatal(err)
-		}
-		var man SavedSnapshotManifest
-		if err := accumulateSavedMemory(ctx, tmp, "/final", overlay, base, raw, &man); err != nil {
-			t.Fatal(err)
-		}
-		target := filepath.Join(tmp, "mem.diff")
-		if pageAt(t, target, 1) != 0 || pageAt(t, target, 2) != 'N' || pageAt(t, target, 0) != 0 {
-			t.Error("accumulated pages wrong")
-		}
-		p, err := presence.Read(target)
-		if err != nil || !p.IsSet(1) || !p.IsSet(2) || p.IsSet(0) || p.IsSet(3) {
-			t.Errorf("presence: %v %+v", err, p)
-		}
-		if b, _ := os.ReadFile(layeredBaseSidecarPath(target)); string(b) != base {
-			t.Errorf("base record = %q", b)
-		}
-		if man.MemPath != "/final/mem.diff" || man.BaseMemPath != base {
-			t.Errorf("manifest: %+v", man)
-		}
-		if fileExists(raw) {
-			t.Error("raw diff left behind")
-		}
-	})
-
-	t.Run("first pass over the template base is the diff alone", func(t *testing.T) {
-		tmp := t.TempDir()
-		raw := filepath.Join(tmp, "mem.capture.diff")
-		pageFile(t, raw, 4, map[int]byte{3: 'N'}, true)
-		var man SavedSnapshotManifest
-		if err := accumulateSavedMemory(ctx, tmp, "/final", base, base, raw, &man); err != nil {
-			t.Fatal(err)
-		}
-		target := filepath.Join(tmp, "mem.diff")
-		if pageAt(t, target, 3) != 'N' || pageAt(t, target, 0) != 0 {
-			t.Error("first-pass pages wrong")
-		}
-		p, _ := presence.Read(target)
-		if !p.IsSet(3) || p.IsSet(0) {
-			t.Errorf("presence: %+v", p)
-		}
-	})
-
-	t.Run("standalone image stays a full image", func(t *testing.T) {
-		tmp := t.TempDir()
-		full := filepath.Join(t.TempDir(), "mem.snap")
-		pageFile(t, full, 4, map[int]byte{0: 'F', 1: 'F', 2: 'F', 3: 'F'}, false)
-		raw := filepath.Join(tmp, "mem.capture.diff")
-		pageFile(t, raw, 4, map[int]byte{2: 'N'}, true)
-		var man SavedSnapshotManifest
-		if err := accumulateSavedMemory(ctx, tmp, "/final", full, "", raw, &man); err != nil {
-			t.Fatal(err)
-		}
-		target := filepath.Join(tmp, "mem.snap")
-		if pageAt(t, target, 2) != 'N' || pageAt(t, target, 1) != 'F' {
-			t.Error("merged full image wrong")
-		}
-		if man.MemPath != "/final/mem.snap" || man.BaseMemPath != "" {
-			t.Errorf("manifest: %+v", man)
-		}
-	})
-}
-
 func TestCloneOrCopyFileKeepsHoles(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, "src")
@@ -803,9 +725,9 @@ func TestSavedCaptureHeadroomIsReservedAcrossCaptures(t *testing.T) {
 	savedFreeBytes = func(string) (int64, error) { return 4 << 30, nil }
 	m := newSavedTestManager(t)
 	inst, _ := seedPausedSource(t, m, false)
-	// A running capture reserves twice its memory: one fits in 4 GiB with
-	// the fixed headroom, two do not.
-	inst.Config.MemoryMiB = 1000
+	// A running capture reserves its memory: one fits in 4 GiB with the
+	// fixed headroom, two do not.
+	inst.Config.MemoryMiB = 2000
 	first, err := m.savedCaptureHeadroom(SavedSnapshotMemFS, StatusRunning, inst)
 	if err != nil {
 		t.Fatalf("first capture: %v", err)

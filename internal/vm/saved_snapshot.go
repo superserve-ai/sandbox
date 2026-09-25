@@ -304,7 +304,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	inst.mu.RLock()
 	socket, ip := inst.SocketPath, inst.IP
 	memFile, baseMem := inst.MemFilePath, inst.BaseMemPath
-	dirtyTracked, sessionID := inst.DirtyTracked, inst.DirtyTrackingSessionID
+	dirtyTracked, sessionID, generation := inst.DirtyTracked, inst.DirtyTrackingSessionID, inst.DirtyTrackingGeneration
 	recordedCorrects, recordedArtifact := inst.CorrectsWallClock, inst.ArtifactID
 	inst.mu.RUnlock()
 
@@ -352,25 +352,27 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	cctx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	var captureErr error
+	chainMem := ""
 	if kind == SavedSnapshotMemFS {
-		captureErr = m.captureRunningMemory(cctx, tmp, final, socket, memFile, baseMem, dirtyTracked, sessionID, man, log)
+		chainMem, captureErr = m.captureRunningMemory(cctx, inst, tmp, final, socket, memFile, baseMem, dirtyTracked, sessionID, generation, man, log)
 	} else {
 		captureErr = fcPauseVMContext(cctx, socket)
 	}
 	if captureErr == nil {
 		captureErr = m.captureSavedDisk(cctx, diskPath, man.BasePath, tmp, final, man)
 	}
-	// A memory capture spends the dirty baseline (diff) or resets it (full),
-	// and after a failure it is unknown: the source's next pause is a full one.
-	if kind == SavedSnapshotMemFS {
-		m.abandonDirtyBaseline(inst)
-	}
 	if captureErr == nil && kind == SavedSnapshotMemFS && corrects {
 		wm := WallClockManifest{Version: WallClockManifestVersion, ArtifactID: artifact, WorkloadFrozen: frozen, GuestCorrectsClock: true}
 		if frozen {
 			wm.FreezeToken = token
 		}
-		captureErr = WriteWallClockManifest(filepath.Join(tmp, filepath.Base(man.MemPath)), wm)
+		// The chain holds this image now, so it carries the image's manifest.
+		if chainMem != "" {
+			captureErr = WriteWallClockManifest(chainMem, wm)
+		}
+		if captureErr == nil {
+			captureErr = WriteWallClockManifest(filepath.Join(tmp, filepath.Base(man.MemPath)), wm)
+		}
 	}
 	frozenFor := time.Since(tFrozen)
 
@@ -404,112 +406,141 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	return nil
 }
 
-// captureRunningMemory writes the source's memory image into tmp. With the
-// dirty baseline armed it takes a guarded diff and folds it into a branch of
-// the image the source resumed from, so the result is complete against its
-// base; a rejected guard or an unarmed source gets a full image.
-func (m *Manager) captureRunningMemory(ctx context.Context, tmp, final, socket, memFile, baseMem string, dirtyTracked bool, sessionID string, man *SavedSnapshotManifest, log zerolog.Logger) error {
-	vmstate := filepath.Join(tmp, "vmstate.snap")
-	man.SnapshotPath = filepath.Join(final, "vmstate.snap")
-	if m.cfg.IncrementalSnapshotEnabled && dirtyTracked && memFile != "" && fileExists(memFile) {
-		raw := filepath.Join(tmp, "mem.capture.diff")
-		err := CreateDiffSnapshotContext(ctx, socket, vmstate, raw, sessionID)
+// captureRunningMemory writes the source's memory the way a pause does, into
+// the sandbox's own chain, and gives the snapshot reflinks of the chain's
+// files. With the dirty baseline armed the write is a guarded diff into the
+// image the source resumed from, so the chain moves on and the source's next
+// pause is a diff again: the record names the chain and the generation
+// Firecracker moved to once the write is in, whatever the reflinks do after.
+// A rejected guard or an unarmed source gets a full image of its own, and
+// the baseline is spent. Returns the chain image the snapshot was taken
+// from, or "" for a full image.
+func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tmp, final, socket, memFile, baseMem string, dirtyTracked bool, sessionID string, generation int64, man *SavedSnapshotManifest, log zerolog.Logger) (string, error) {
+	chainDir := filepath.Join(m.cfg.SnapshotDir, inst.ID)
+	overlay := filepath.Join(chainDir, "mem.diff")
+	full := filepath.Join(chainDir, "mem.snap")
+	vmstate := filepath.Join(chainDir, "vmstate.snap")
+	// The same terms as a pause: layered when the source runs on a template
+	// base, first pass or accumulating; in place when it runs on its own
+	// full image; anything else, a full image of its own.
+	layered := m.cfg.IncrementalSnapshotEnabled && dirtyTracked && baseMem != "" && (memFile == baseMem || memFile == overlay)
+	chainMem := ""
+	switch {
+	case layered:
+		chainMem = overlay
+	case m.cfg.IncrementalSnapshotEnabled && dirtyTracked && memFile == full && fileExists(full):
+		chainMem = full
+	}
+	firstPass := layered && memFile == baseMem
+	if chainMem != "" {
+		if err := os.MkdirAll(chainDir, 0o755); err != nil {
+			return "", fmt.Errorf("create chain dir: %w", err)
+		}
+		if firstPass {
+			// A leftover overlay would keep stale pages under the diff, and
+			// the base record must exist before the overlay does.
+			if err := freshenFirstPassOverlay(overlay); err != nil {
+				log.Warn().Err(err).Msg("saved snapshot: stale overlay could not be removed; taking a full image")
+				chainMem = ""
+			} else if err := os.WriteFile(layeredBaseSidecarPath(overlay), []byte(baseMem), 0o644); err != nil {
+				log.Warn().Err(err).Msg("saved snapshot: base record could not be written; taking a full image")
+				chainMem = ""
+			}
+		}
+	}
+	if chainMem != "" {
+		sidecarBefore := presenceBefore(chainMem)
+		err := CreateDiffSnapshotContext(ctx, socket, vmstate, chainMem, sessionID, generation)
 		switch {
 		case err == nil:
-			return accumulateSavedMemory(ctx, tmp, final, memFile, baseMem, raw, man)
+			recordBase := ""
+			if layered {
+				recordBase = baseMem
+			}
+			m.chainAdvanced(inst, vmstate, chainMem, recordBase, log)
+			if layered {
+				m.verifyPresenceRefreshed(chainMem, sidecarBefore, log)
+			}
+			if err := m.cloneChainIntoSnapshot(ctx, tmp, final, vmstate, chainMem, recordBase, man); err != nil {
+				return chainMem, err
+			}
+			return chainMem, nil
 		case errors.Is(err, ErrDirtyTrackingMismatch) || m.sessionRejectedAtPause(err):
-			// Rejected before the bitmap was touched; the vCPUs are already
-			// paused and the full path's pause is idempotent.
+			// Rejected before the bitmap or the chain was touched; the vCPUs
+			// are paused and the full image's pause is idempotent.
 			log.Warn().Err(err).Msg("saved snapshot: guarded diff rejected; taking a full image")
+			if firstPass {
+				_ = os.Remove(layeredBaseSidecarPath(overlay))
+			}
 		default:
-			return fmt.Errorf("create diff snapshot: %w", err)
-		}
-	}
-	if err := CreateSnapshotContext(ctx, socket, vmstate, filepath.Join(tmp, "mem.snap"), "", SnapshotNormal); err != nil {
-		return fmt.Errorf("create snapshot: %w", err)
-	}
-	man.MemPath = filepath.Join(final, "mem.snap")
-	return nil
-}
-
-// accumulateSavedMemory folds a diff of pages dirtied since the source
-// resumed into a branch of the image it resumed from. Against a template
-// base the result is a layered overlay whose presence map is the union of
-// the branch's and the diff's; against a standalone image it is a full image.
-func accumulateSavedMemory(ctx context.Context, tmp, final, memFile, baseMem, raw string, man *SavedSnapshotManifest) error {
-	delta, err := presence.Read(raw)
-	if err != nil {
-		return status.Errorf(codes.DataLoss, "memory diff has no presence map: %v", err)
-	}
-	// A source resumed straight from a template image has memFile == baseMem
-	// and no overlay yet; one resumed from its own overlay accumulates on it;
-	// anything else is a standalone image and its own base.
-	firstPass := baseMem != "" && memFile == baseMem
-	if !firstPass {
-		if isOverlayMemFile(memFile) {
-			if baseMem == "" {
-				if recorded, ok := readLayeredBase(memFile); ok {
-					baseMem = recorded
+			// Failed, or timed out with the outcome unknown: the chain may be
+			// torn. Its sidecars go so nothing restores it, and the baseline
+			// with them: the source's next pause is a full one, which
+			// strands and reclaims the overlay.
+			m.abandonDirtyBaseline(inst)
+			if layered {
+				_ = os.Remove(layeredBaseSidecarPath(overlay))
+				_ = os.Remove(presence.SidecarPath(overlay))
+				_ = os.Remove(clockFreezeMarkerPath(overlay))
+				if firstPass {
+					_ = os.Remove(overlay)
 				}
 			}
-			if baseMem == "" {
-				return status.Error(codes.FailedPrecondition, "source memory overlay has no base")
-			}
-		} else {
-			baseMem = ""
+			return "", fmt.Errorf("create diff snapshot: %w", err)
 		}
+	}
+	m.abandonDirtyBaseline(inst)
+	if err := CreateSnapshotContext(ctx, socket, filepath.Join(tmp, "vmstate.snap"), filepath.Join(tmp, "mem.snap"), "", SnapshotNormal); err != nil {
+		return "", fmt.Errorf("create snapshot: %w", err)
+	}
+	man.SnapshotPath = filepath.Join(final, "vmstate.snap")
+	man.MemPath = filepath.Join(final, "mem.snap")
+	return "", nil
+}
+
+// chainAdvanced records that the source's chain now holds the image just
+// written: a first-pass source becomes an accumulating one, and the next
+// guarded diff names the generation Firecracker moved to. Persisted, so a
+// vmd restart in between still pauses the source as a diff.
+func (m *Manager) chainAdvanced(inst *VMInstance, vmstate, memPath, baseMem string, log zerolog.Logger) {
+	inst.mu.Lock()
+	inst.SnapshotPath = vmstate
+	inst.MemFilePath = memPath
+	inst.BaseMemPath = baseMem
+	inst.DirtyTrackingGeneration++
+	inst.mu.Unlock()
+	if !m.persistState(inst) {
+		log.Error().Msg("saved snapshot: chain advance not persisted; a vmd restart before the next pause makes it a full one")
+	}
+}
+
+// cloneChainIntoSnapshot gives the snapshot its own reflinks of the chain's
+// vmstate and memory image, with the overlay's presence map and base record.
+func (m *Manager) cloneChainIntoSnapshot(ctx context.Context, tmp, final, vmstate, memPath, baseMem string, man *SavedSnapshotManifest) error {
+	if err := m.cloneSavedFile(ctx, vmstate, filepath.Join(tmp, "vmstate.snap")); err != nil {
+		return err
 	}
 	name := "mem.snap"
 	if baseMem != "" {
 		name = "mem.diff"
 	}
 	target := filepath.Join(tmp, name)
-	var prior *presence.Bitmap
-	switch {
-	case baseMem == "":
-		if err := cloneOrCopyFile(ctx, memFile, target); err != nil {
-			return fmt.Errorf("branch source memory image: %w", err)
-		}
-	case firstPass:
-		info, err := os.Stat(baseMem)
-		if err != nil {
-			return fmt.Errorf("stat memory base: %w", err)
-		}
-		if err := createSparseFile(target, info.Size()); err != nil {
-			return fmt.Errorf("create memory overlay: %w", err)
-		}
-	default:
-		if err := cloneOrCopyFile(ctx, memFile, target); err != nil {
-			return fmt.Errorf("branch source memory overlay: %w", err)
-		}
-		p, err := presence.Read(memFile)
-		if err != nil {
-			return status.Errorf(codes.DataLoss, "source memory overlay has no presence map: %v", err)
-		}
-		prior = &p
-	}
-	if err := applyPresentPages(ctx, raw, delta, target); err != nil {
-		return fmt.Errorf("apply memory diff: %w", err)
+	if err := m.cloneSavedFile(ctx, memPath, target); err != nil {
+		return err
 	}
 	if baseMem != "" {
-		bits := append([]uint64(nil), delta.Bits...)
-		if prior != nil {
-			if prior.PageSize != delta.PageSize || prior.NPages != delta.NPages || len(prior.Bits) != len(bits) {
-				return status.Error(codes.DataLoss, "memory presence maps have different shapes")
-			}
-			for i := range bits {
-				bits[i] |= prior.Bits[i]
-			}
+		p := presence.SidecarPath(memPath)
+		if !fileExists(p) {
+			return status.Error(codes.DataLoss, "chain overlay has no presence map")
 		}
-		if err := presence.Write(target, delta.PageSize, delta.NPages, bits); err != nil {
-			return fmt.Errorf("write memory presence map: %w", err)
+		if err := cloneOrCopyFile(ctx, p, presence.SidecarPath(target)); err != nil {
+			return fmt.Errorf("copy memory presence map: %w", err)
 		}
 		if err := os.WriteFile(layeredBaseSidecarPath(target), []byte(baseMem), 0o644); err != nil {
 			return fmt.Errorf("write memory base record: %w", err)
 		}
 	}
-	_ = os.Remove(raw)
-	_ = os.Remove(presence.SidecarPath(raw))
+	man.SnapshotPath = filepath.Join(final, "vmstate.snap")
 	man.MemPath = filepath.Join(final, name)
 	man.BaseMemPath = baseMem
 	return nil
@@ -1011,9 +1042,9 @@ func (m *Manager) savedCaptureHeadroom(kind SavedSnapshotKind, st VMStatus, inst
 		inst.mu.RLock()
 		memoryMiB := inst.Config.MemoryMiB
 		inst.mu.RUnlock()
-		// A diff is written raw and then applied onto the image it joins,
-		// so two guest-sized files can exist until the raw one is removed.
-		need += 2 * int64(memoryMiB) << 20
+		// A diff joins the chain in place and a full image is one file:
+		// at most a guest's worth of new bytes either way.
+		need += int64(memoryMiB) << 20
 	}
 	free, err := savedFreeBytes(m.cfg.SnapshotDir)
 	if err != nil {
@@ -1141,48 +1172,6 @@ func cloneOrCopyFile(ctx context.Context, src, dst string) error {
 		return err
 	}
 	return out.Close()
-}
-
-// applyPresentPages writes every page the diff's presence map names into dst
-// at the same offset, zero pages included: the map, not the extent layout,
-// says which pages the diff provides.
-func applyPresentPages(ctx context.Context, src string, present presence.Bitmap, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY, 0)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	dinfo, err := out.Stat()
-	if err != nil {
-		return err
-	}
-	page := int64(present.PageSize)
-	if page <= 0 || int64(present.NPages)*page > dinfo.Size() {
-		return fmt.Errorf("presence map (%d pages of %d) exceeds image size %d", present.NPages, page, dinfo.Size())
-	}
-	for i := 0; i < int(present.NPages); {
-		if !present.IsSet(i) {
-			i++
-			continue
-		}
-		j := i
-		for j < int(present.NPages) && present.IsSet(j) {
-			j++
-		}
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if err := copyRange(ctx, out, in, int64(i)*page, int64(j-i)*page); err != nil {
-			return err
-		}
-		i = j
-	}
-	return out.Sync()
 }
 
 // copyDataExtents copies in's data extents into out at their offsets, or the

@@ -81,7 +81,7 @@ func isDiffRequest(body string) bool { return strings.Contains(body, `"snapshot_
 // sends — serializes instead of being dropped as a zero value.
 func TestGuardedSnapshotFieldsSerialize(t *testing.T) {
 	fc := startSnapshotAPIFake(t, nil)
-	if err := CreateDiffSnapshot(fc.socketPath, "/tmp/snap", "/tmp/mem", "tok-1"); err != nil {
+	if err := CreateDiffSnapshot(fc.socketPath, "/tmp/snap", "/tmp/mem", "tok-1", 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := RestoreSnapshotUffdInternalWithOverrides(
@@ -90,12 +90,19 @@ func TestGuardedSnapshotFieldsSerialize(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if err := CreateDiffSnapshot(fc.socketPath, "/tmp/snap", "/tmp/mem", ""); err != nil {
+	if err := CreateDiffSnapshot(fc.socketPath, "/tmp/snap", "/tmp/mem", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	// A source captured while running has moved the generation on.
+	if err := CreateDiffSnapshot(fc.socketPath, "/tmp/snap", "/tmp/mem", "tok-3", 3); err != nil {
 		t.Fatal(err)
 	}
 	bodies := fc.snapshotBodies()
-	if len(bodies) != 3 {
-		t.Fatalf("got %d snapshot requests, want 3", len(bodies))
+	if len(bodies) != 4 {
+		t.Fatalf("got %d snapshot requests, want 4", len(bodies))
+	}
+	if !strings.Contains(bodies[3], `"expected_generation":3`) {
+		t.Fatalf("the generation is not what the caller named: %s", bodies[3])
 	}
 	for _, want := range []string{`"expected_session_id":"tok-1"`, `"expected_generation":0`} {
 		if !strings.Contains(bodies[0], want) {

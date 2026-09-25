@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/rs/zerolog"
 
@@ -264,28 +263,34 @@ func TestVerifyPresenceRefreshed(t *testing.T) {
 	mem := sweepFixture(t, root, "vm-r")
 	sc := presence.SidecarPath(mem)
 
-	// Fresh side-car (written during the save) is kept.
+	// A side-car written during the save is kept: there was none before,
+	// or the save replaced it, however quickly.
+	before := presenceBefore(mem)
 	if err := presence.Write(mem, 4096, 4, []uint64{0b0110}); err != nil {
 		t.Fatal(err)
 	}
-	m.verifyPresenceRefreshed(mem, time.Now().Add(-time.Minute), nop)
+	m.verifyPresenceRefreshed(mem, before, nop)
 	if _, err := os.Stat(sc); err != nil {
 		t.Fatalf("fresh side-car removed: %v", err)
 	}
-
-	// Stale side-car (predates the save — the old-Firecracker misorder) is
-	// removed so a newer Firecracker can never trust it.
-	old := time.Now().Add(-time.Hour)
-	if err := os.Chtimes(sc, old, old); err != nil {
+	before = presenceBefore(mem)
+	if err := presence.Write(mem, 4096, 4, []uint64{0b0111}); err != nil {
 		t.Fatal(err)
 	}
-	m.verifyPresenceRefreshed(mem, time.Now(), nop)
+	m.verifyPresenceRefreshed(mem, before, nop)
+	if _, err := os.Stat(sc); err != nil {
+		t.Fatalf("replaced side-car removed: %v", err)
+	}
+
+	// A side-car the save did not touch (the old-Firecracker misorder) is
+	// removed so a newer Firecracker can never trust it.
+	m.verifyPresenceRefreshed(mem, presenceBefore(mem), nop)
 	if _, err := os.Stat(sc); !os.IsNotExist(err) {
 		t.Error("stale side-car not removed")
 	}
 
 	// Missing side-car: warn-only, nothing created.
-	m.verifyPresenceRefreshed(mem, time.Now(), nop)
+	m.verifyPresenceRefreshed(mem, nil, nop)
 	if _, err := os.Stat(sc); !os.IsNotExist(err) {
 		t.Error("guard created a side-car")
 	}
