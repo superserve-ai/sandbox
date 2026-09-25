@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -831,7 +832,29 @@ func TestIntegration_PendingStripeDeviceReservationSurvivesPolicyChange(t *testi
 		t.Fatalf("second reservation while device policy is off: %s", got)
 	}
 	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
-	rolloutExec(t, region, `SELECT finalize_stripe_promotion($1,$2,$3)`, otherTeam, other, "grant-"+uuid.NewString())
+	var definition string
+	if err := region.QueryRow(ctx, `SELECT pg_get_functiondef('promotion_device_decision(uuid,text)'::regprocedure)`).Scan(&definition); err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(definition, "SELECT CASE")
+	end := strings.Index(definition, "END INTO v_stripe_decision")
+	if start < 0 || end < start ||
+		!strings.Contains(definition[start:end], "stripe_redemption_at IS NOT NULL") ||
+		!strings.Contains(definition[start:end], "stripe_redemption_reserved_team_id IS NOT NULL") {
+		t.Fatal("settled and pending device facts must be read in one SQL statement")
+	}
+	finalize, err := region.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer finalize.Rollback(context.Background())
+	rolloutExec(t, finalize, `SELECT finalize_stripe_promotion($1,$2,$3)`, otherTeam, other, "grant-"+uuid.NewString())
+	if got := reserve(ownerTeam, owner, "evt-"+uuid.NewString()); got != "device_reservation_pending" {
+		t.Fatalf("owner reservation while finalization is uncommitted: %s", got)
+	}
+	if err := finalize.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if got := reserve(ownerTeam, owner, "evt-"+uuid.NewString()); got != "device_already_redeemed" {
 		t.Fatalf("owner reservation after other account settled, before device grant recording: %s", got)
 	}
