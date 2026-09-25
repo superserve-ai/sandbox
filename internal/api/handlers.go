@@ -2899,6 +2899,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// names no files of its own.
 	var source db.SandboxSnapshot
 	var reboundCh chan resolvedSecrets
+	var forkNetworkConfig []byte
 	if sourceSnapshotID != uuid.Nil {
 		snap, err := h.DB.GetSandboxSnapshot(c.Request.Context(), db.GetSandboxSnapshotParams{ID: sourceSnapshotID, TeamID: teamID})
 		tLookupDone = time.Now()
@@ -2928,6 +2929,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 		if req.Network == nil {
 			req.Network = decodeNetworkConfig(snap.NetworkConfig)
+		}
+		if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+			_, _, _, forkNetworkConfig = egressConfigJSON(req.Network)
 		}
 		// The source's secrets are one read by id, overlapped with the host
 		// pre-flight below so a fork pays the longer of the two round trips,
@@ -3109,6 +3113,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				SecretIds:         secretIDs,
 				EnvKeys:           envKeys,
 				ProxyTokens:       proxyTokens,
+				NetworkConfig:     forkNetworkConfig,
 			})
 			return db.Sandbox(row), err
 		}
@@ -3394,7 +3399,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	// Persist egress rules before injecting the env, so the secrets proxy's live
 	// rule fetch sees them before the agent can issue a proxied request. The
 	// nftables push happens later (it needs the booted VM); the DB write does not.
-	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
+	// A fork's row was written with its rules.
+	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) && forkNetworkConfig == nil {
 		_, _, _, networkConfig := egressConfigJSON(req.Network)
 		if err := h.DB.UpdateSandboxNetworkConfig(postCtx, db.UpdateSandboxNetworkConfigParams{
 			ID:            sandbox.ID,

@@ -81,7 +81,10 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 			}
 			return &scanRows{rows: []func(...any) error{secretRow(live).scanFn}}, nil
 		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "-- name: UpdateSandboxNetworkConfig") {
+				t.Error("a fork's rules are written with its row, not after")
+			}
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
@@ -141,10 +144,14 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 	if ids := insertArgs[8].([]uuid.UUID); len(ids) != 1 || ids[0] != live.ID {
 		t.Errorf("bound secrets = %v; want only the live one", ids)
 	}
-	if keys := insertArgs[10].([]string); len(keys) != 1 || keys[0] != "KEY_0" {
+	// A resume reapplies the row's rules, so the row has them from the start.
+	if cfg, _ := insertArgs[9].([]byte); decodeNetworkConfig(cfg) == nil || !strings.Contains(string(cfg), "10.0.0.0/8") {
+		t.Errorf("row network_config = %s; want the inherited rules", cfg)
+	}
+	if keys := insertArgs[11].([]string); len(keys) != 1 || keys[0] != "KEY_0" {
 		t.Errorf("bound env keys = %v; want the live binding's", keys)
 	}
-	if tokens := insertArgs[11].([]string); len(tokens) != 1 || tokens[0] == "" || injected["KEY_0"] != tokens[0] {
+	if tokens := insertArgs[12].([]string); len(tokens) != 1 || tokens[0] == "" || injected["KEY_0"] != tokens[0] {
 		t.Errorf("fresh token %v not the one injected (%q)", tokens, injected["KEY_0"])
 	}
 	if injectedJWT == "" || injected["KEY_9"] != "x" {

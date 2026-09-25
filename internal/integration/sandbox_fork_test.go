@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,6 +114,9 @@ func TestIntegration_CreateSandbox_FromSnapshot(t *testing.T) {
 	}
 	if sb.BasePath == nil || *sb.BasePath != "/templates/t/base.ext4" || sb.SnapshotPath == nil || *sb.SnapshotPath != vmstate || sb.MemPath == nil || *sb.MemPath != mem || sb.DiskMib != 4096 {
 		t.Errorf("row paths = (%v, %v, %v) disk %v; want the snapshot's", sb.BasePath, sb.SnapshotPath, sb.MemPath, sb.DiskMib)
+	}
+	if !strings.Contains(string(sb.NetworkConfig), "10.0.0.0/8") {
+		t.Errorf("row network_config = %s; want the inherited rules, which a resume reapplies", sb.NetworkConfig)
 	}
 	if sb.HadSecretBindings == nil || !*sb.HadSecretBindings {
 		t.Errorf("had_secret_bindings = %v; want true for the re-bound secret", sb.HadSecretBindings)

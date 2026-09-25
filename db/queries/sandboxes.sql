@@ -99,7 +99,9 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 -- template pin are the snapshot's, read here so the row never disagrees
 -- with the image it boots. The bindings are the snapshot's re-bound plus the
 -- request's, as arrays that may be empty. Returns 0 rows if the snapshot is
--- not ready, deleted, or not the caller's. The snapshot is held shared until
+-- not ready, deleted, or not the caller's. The egress rules are written with
+-- the row: the fork's guest runs under them from its first instruction, and
+-- a resume reapplies what the row says. The snapshot is held shared until
 -- the new row commits, so a delete lands before it or after, and never
 -- while nothing visible references the build both share; forks of one
 -- snapshot share the lock.
@@ -111,8 +113,8 @@ WITH src AS (
     AND s.status = 'ready' AND s.deleted_at IS NULL
   FOR SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id)
-  SELECT @id, @team_id, @name, @status, vcpu_count, memory_mib, host_id, @timeout_seconds, @metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, @auto_delete_seconds, cardinality(@secret_ids::uuid[]) > 0, source_snapshot_id FROM src
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id, network_config)
+  SELECT @id, @team_id, @name, @status, vcpu_count, memory_mib, host_id, @timeout_seconds, @metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, @auto_delete_seconds, cardinality(@secret_ids::uuid[]) > 0, source_snapshot_id, sqlc.narg('network_config')::jsonb FROM src
   RETURNING *
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)

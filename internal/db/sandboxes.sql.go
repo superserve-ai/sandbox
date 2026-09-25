@@ -1103,16 +1103,16 @@ WITH src AS (
     AND s.status = 'ready' AND s.deleted_at IS NULL
   FOR SHARE
 ), ins AS (
-  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id)
-  SELECT $3, $2, $4, $5, vcpu_count, memory_mib, host_id, $6, $7, template_id, snapshot_path, mem_path, base_path, disk_mib, $8, cardinality($9::uuid[]) > 0, source_snapshot_id FROM src
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id, network_config)
+  SELECT $3, $2, $4, $5, vcpu_count, memory_mib, host_id, $6, $7, template_id, snapshot_path, mem_path, base_path, disk_mib, $8, cardinality($9::uuid[]) > 0, source_snapshot_id, $10::jsonb FROM src
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, source_snapshot_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
-  SELECT ins.id, $10::text, 0 FROM ins
+  SELECT ins.id, $11::text, 0 FROM ins
   RETURNING sandbox_id
 ), bindings AS (
   INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-  SELECT ins.id, ($9::uuid[])[i], ($11::text[])[i], ($12::text[])[i]
+  SELECT ins.id, ($9::uuid[])[i], ($12::text[])[i], ($13::text[])[i]
   FROM ins, generate_subscripts($9::uuid[], 1) AS g(i)
 )
 SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.source_snapshot_id FROM ins
@@ -1129,6 +1129,7 @@ type CreateSandboxFromSnapshotParams struct {
 	Metadata          []byte        `json:"metadata"`
 	AutoDeleteSeconds *int32        `json:"auto_delete_seconds"`
 	SecretIds         []uuid.UUID   `json:"secret_ids"`
+	NetworkConfig     []byte        `json:"network_config"`
 	PreviewAccess     string        `json:"preview_access"`
 	EnvKeys           []string      `json:"env_keys"`
 	ProxyTokens       []string      `json:"proxy_tokens"`
@@ -1179,7 +1180,9 @@ type CreateSandboxFromSnapshotRow struct {
 // template pin are the snapshot's, read here so the row never disagrees
 // with the image it boots. The bindings are the snapshot's re-bound plus the
 // request's, as arrays that may be empty. Returns 0 rows if the snapshot is
-// not ready, deleted, or not the caller's. The snapshot is held shared until
+// not ready, deleted, or not the caller's. The egress rules are written with
+// the row: the fork's guest runs under them from its first instruction, and
+// a resume reapplies what the row says. The snapshot is held shared until
 // the new row commits, so a delete lands before it or after, and never
 // while nothing visible references the build both share; forks of one
 // snapshot share the lock.
@@ -1194,6 +1197,7 @@ func (q *Queries) CreateSandboxFromSnapshot(ctx context.Context, arg CreateSandb
 		arg.Metadata,
 		arg.AutoDeleteSeconds,
 		arg.SecretIds,
+		arg.NetworkConfig,
 		arg.PreviewAccess,
 		arg.EnvKeys,
 		arg.ProxyTokens,
