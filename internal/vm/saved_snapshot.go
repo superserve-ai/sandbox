@@ -456,6 +456,13 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 		}
 	}
 	if chainMem != "" {
+		// Firecracker rewrites the disk block map beside the vmstate with
+		// every snapshot it saves one for; one it saves none for must not
+		// leave an earlier capture's beside the chain, or the snapshot takes
+		// it as its own.
+		if err := os.Remove(overlayBlockMapPath(vmstate)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("drop previous block map: %w", err)
+		}
 		sidecarMark := markPresenceForSave(chainMem)
 		err := CreateDiffSnapshotContext(ctx, socket, vmstate, chainMem, sessionID, generation)
 		switch {

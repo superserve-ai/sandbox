@@ -39,6 +39,8 @@ type chainFC struct {
 	dirty []map[int]byte
 	// hang, when set, holds a diff until the request is abandoned.
 	hang bool
+	// noBlockMap, when set, saves no disk block map beside the vmstate.
+	noBlockMap bool
 	// beforeWrite, when set, runs while the vCPUs are paused, before the
 	// files are written; onResume runs on the request that resumes them.
 	beforeWrite func()
@@ -108,7 +110,7 @@ func (f *chainFC) serve(w http.ResponseWriter, r *http.Request) {
 		if f.beforeWrite != nil {
 			f.beforeWrite()
 		}
-		if err := writeSnapshotFiles(req.SnapshotPath, req.MemFilePath, req.SnapshotType == "Diff", pages); err != nil {
+		if err := writeSnapshotFiles(req.SnapshotPath, req.MemFilePath, req.SnapshotType == "Diff", pages, !f.noBlockMap); err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = io.WriteString(w, err.Error())
 			return
@@ -124,13 +126,15 @@ const chainPages = 4
 // writeSnapshotFiles is the write a Firecracker does: a diff adds the dirtied
 // pages to the memory file it is given and names them in its presence map on
 // top of what was there; a full image writes every page.
-func writeSnapshotFiles(vmstate, mem string, diff bool, pages map[int]byte) error {
+func writeSnapshotFiles(vmstate, mem string, diff bool, pages map[int]byte, blockMap bool) error {
 	if err := os.WriteFile(vmstate, []byte("vmstate"), 0o644); err != nil {
 		return err
 	}
 	// The disk's block map, saved beside the vmstate.
-	if err := os.WriteFile(overlayBlockMapPath(vmstate), []byte("block-map"), 0o644); err != nil {
-		return err
+	if blockMap {
+		if err := os.WriteFile(overlayBlockMapPath(vmstate), []byte("block-map"), 0o644); err != nil {
+			return err
+		}
 	}
 	if !diff {
 		pages = map[int]byte{}
@@ -653,5 +657,29 @@ func TestRunningCapturePersistsAfterTheGuestIsReleased(t *testing.T) {
 	}
 	if rec, _ := m.state.Get(inst.ID); rec == nil || rec.DirtyTrackingGeneration != 1 {
 		t.Fatalf("the advance was not persisted after the release: %+v", rec)
+	}
+}
+
+// A block map an earlier capture left beside the chain's vmstate is not
+// taken for the next capture's, which saved none.
+func TestRunningCaptureDoesNotReuseAnEarlierBlockMap(t *testing.T) {
+	fc := startChainFC(t, map[int]byte{2: 'X'}, map[int]byte{3: 'Y'})
+	m := newSavedTestManager(t)
+	inst := seedRunningSource(t, m, fc, true)
+	ctx := context.Background()
+	first, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(overlayBlockMapPath(first.SnapshotPath)); err != nil {
+		t.Fatalf("first snapshot lacks its block map: %v", err)
+	}
+	fc.noBlockMap = true
+	second, err := m.CreateSavedSnapshot(ctx, inst.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(overlayBlockMapPath(second.SnapshotPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("second snapshot carries a block map its save never wrote: %v", err)
 	}
 }
