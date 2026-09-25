@@ -783,3 +783,37 @@ func TestRunningCaptureWithARejectedGuardKeepsTheChainsBlockMap(t *testing.T) {
 		t.Fatalf("a set-aside block map was left behind: %v", err)
 	}
 }
+
+// A write into the chain is journalled as the rewrite it is, so a crash
+// in the middle is recovered as one; a capture that takes a full image
+// instead leaves the chain alone and journals that.
+func TestRunningCaptureJournalsAChainWriteAsARewrite(t *testing.T) {
+	fc := startChainFC(t, map[int]byte{2: 'X'}, map[int]byte{3: 'Y'})
+	m := newSavedTestManager(t)
+	inst := seedRunningSource(t, m, fc, true)
+	chainDir := filepath.Join(m.cfg.SnapshotDir, inst.ID)
+	var duringWrite *pauseIntent
+	fc.beforeWrite = func() { duringWrite, _ = readPauseIntent(chainDir) }
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS); err != nil {
+		t.Fatal(err)
+	}
+	if duringWrite == nil || duringWrite.Staged {
+		t.Fatalf("a chain write was journalled as %+v; want a rewrite", duringWrite)
+	}
+	if in, err := readPauseIntent(chainDir); err != nil || in != nil {
+		t.Fatalf("the intent outlived the capture: %+v %v", in, err)
+	}
+
+	// A guard rejected: the full image goes to staging, and the journal
+	// says the chain was left alone.
+	fc.generation = 9
+	var atResume *pauseIntent
+	fc.onResume = func() { atResume, _ = readPauseIntent(chainDir) }
+	fc.beforeWrite = nil
+	if _, err := m.CreateSavedSnapshot(context.Background(), inst.ID, uuid.NewString(), SavedSnapshotMemFS); err != nil {
+		t.Fatal(err)
+	}
+	if atResume == nil || !atResume.Staged {
+		t.Fatalf("a full image after a rejected guard was journalled as %+v; want staged", atResume)
+	}
+}
