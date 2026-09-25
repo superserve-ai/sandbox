@@ -17,6 +17,8 @@ import (
 
 // Config holds all configuration for the Superserve Sandbox control plane.
 type Config struct {
+	TemplateBuildRegion     string // TEMPLATE_BUILD_REGION matches the host registry region exactly
+	TemplateBackupBucket    string // BACKUP_BUCKET, cell-local durable template storage
 	ComputeRestrictionsFile string // COMPUTE_RESTRICTIONS_FILE; empty disables config loading
 	Port                    string // API_PORT, default "8080"
 	VMDAddress              string // VMD_GRPC_ADDRESS, default "localhost:50051"
@@ -96,6 +98,14 @@ func Load() (*Config, error) {
 	if dbURL == "" {
 		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
+	buildRegion := strings.TrimSpace(os.Getenv("TEMPLATE_BUILD_REGION"))
+	if buildRegion == "" {
+		return nil, fmt.Errorf("TEMPLATE_BUILD_REGION is required for template builds")
+	}
+	backupBucket := strings.TrimSpace(os.Getenv("BACKUP_BUCKET"))
+	if backupBucket == "" {
+		return nil, fmt.Errorf("BACKUP_BUCKET is required for template builds")
+	}
 
 	seed, err := loadSeed(
 		os.Getenv("SANDBOX_ACCESS_TOKEN_SEED"),
@@ -126,6 +136,8 @@ func Load() (*Config, error) {
 		AppAllowedOrigins:             splitCSV(os.Getenv("APP_ALLOWED_ORIGINS")),
 		SandboxAccessTokenSeed:        seed,
 		EdgeProxyDomain:               envOrDefault("EDGE_PROXY_DOMAIN", "sandbox.superserve.ai"),
+		TemplateBuildRegion:           buildRegion,
+		TemplateBackupBucket:          backupBucket,
 		DefaultHostID:                 envOrDefault("DEFAULT_HOST_ID", "default"),
 		SchedulerCapacityShadow:       boolEnv("SCHEDULER_CAPACITY_SHADOW", false),
 		SystemTeamID:                  os.Getenv("SYSTEM_TEAM_ID"),

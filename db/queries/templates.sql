@@ -136,9 +136,7 @@ WHERE deleted_at IS NULL
        OR name LIKE sqlc.narg('name_prefix')::text || '%');
 
 -- name: SoftDeleteTemplateIfUnused :one
--- Soft-deletes a template only if no live sandbox or snapshot references it
--- AND no build is in flight. Blocking on builds prevents the vmd-side artifact
--- cleanup from racing with template-builder still writing to the same dirs.
+-- Deletion fences all builds before committing; live sandbox and snapshot references still block it.
 WITH locked AS (
   SELECT t.id AS tpl_id FROM template t
   WHERE t.id = $1 AND t.team_id = $2 AND t.deleted_at IS NULL
@@ -149,24 +147,27 @@ counted AS (
     (SELECT COUNT(*)::bigint FROM sandbox
      WHERE template_id = $1 AND destroyed_at IS NULL)
     + (SELECT COUNT(*)::bigint FROM sandbox_snapshot
-       WHERE template_id = $1 AND deleted_at IS NULL AND status IN ('creating', 'ready')) AS live_count,
-    (SELECT COUNT(*)::bigint FROM template_build
-     WHERE template_id = $1
-       AND status IN ('pending', 'building', 'snapshotting')) AS inflight_build_count
+       WHERE template_id = $1 AND deleted_at IS NULL AND status IN ('creating', 'ready')) AS live_count
+),
+cancelled AS (
+  UPDATE template_build
+  SET status = 'cancelled', finalized_at = now(), updated_at = now(), error_message = 'template deleted'
+  WHERE template_id IN (SELECT tpl_id FROM locked)
+    AND (SELECT live_count FROM counted) = 0
+    AND status IN ('pending', 'building', 'snapshotting')
+  RETURNING id
 ),
 deleted AS (
   UPDATE template t
   SET deleted_at = now(), updated_at = now()
   WHERE t.id IN (SELECT tpl_id FROM locked)
     AND (SELECT live_count FROM counted) = 0
-    AND (SELECT inflight_build_count FROM counted) = 0
+    AND (SELECT count(*) FROM cancelled) >= 0
   RETURNING t.id
 )
-SELECT
-  EXISTS(SELECT 1 FROM locked)  AS found,
-  (SELECT live_count FROM counted) AS live_count,
-  (SELECT inflight_build_count FROM counted) AS inflight_build_count,
-  EXISTS(SELECT 1 FROM deleted) AS deleted;
+SELECT EXISTS(SELECT 1 FROM locked) AS found,
+ (SELECT live_count FROM counted) AS live_count,
+ 0::bigint AS inflight_build_count, EXISTS(SELECT 1 FROM deleted) AS deleted;
 
 -- name: CreateTemplateBuild :one
 -- Insert a new build row. Will fail with a unique-violation if there is
@@ -183,10 +184,13 @@ RETURNING *;
 -- pre-existing build id to the caller. team_id is included defensively so
 -- the query is safe if called outside the post-admission path.
 SELECT * FROM template_build
-WHERE template_id = $1
-  AND team_id = $2
-  AND build_spec_hash = $3
-  AND status IN ('pending', 'building', 'snapshotting');
+WHERE template_build.template_id = $1
+  AND template_build.team_id = $2
+  AND (template_build.build_spec_hash = $3 OR EXISTS (
+    SELECT 1 FROM template_build_input i JOIN template t ON t.id=template_build.template_id
+    WHERE i.build_id=template_build.id AND i.build_spec=t.build_spec
+      AND i.vcpu=t.vcpu AND i.memory_mib=t.memory_mib AND i.disk_mib=t.disk_mib))
+  AND template_build.status IN ('pending', 'building', 'snapshotting');
 
 -- name: GetTemplateBuild :one
 -- Fetch a build visible to the caller's team, scoped to the given template
@@ -216,6 +220,7 @@ WHERE team_id = $1 AND status IN ('pending', 'building', 'snapshotting');
 -- lock), not here.
 SELECT * FROM template_build
 WHERE status = 'pending'
+  AND NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=template_build.id)
 ORDER BY created_at ASC
 LIMIT $1;
 
@@ -259,6 +264,7 @@ WHERE id = $1 AND status = 'building';
 -- poll vmd for status. No row-level lock — these are already past 'pending'.
 SELECT * FROM template_build
 WHERE status IN ('building', 'snapshotting')
+  AND NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=template_build.id)
 ORDER BY started_at ASC NULLS LAST;
 
 -- name: AdvanceBuildStatus :exec
@@ -358,15 +364,16 @@ JOIN template t ON t.id = tb.template_id;
 -- cancelled and (if the template never reached 'ready') transitions
 -- template → failed so listings don't show it stuck in 'building' forever.
 -- A template with a prior successful build keeps its 'ready' status.
-WITH build_done AS (
+WITH locked_template AS (SELECT t.id FROM template t WHERE t.id=sqlc.arg('template_id') AND t.team_id=sqlc.arg('team_id') FOR UPDATE),
+build_done AS (
   UPDATE template_build tb
   SET status = 'cancelled',
       finalized_at = now(),
       updated_at = now(),
       error_message = 'cancelled by user'
-  WHERE tb.id = $1
-    AND tb.template_id = $2
-    AND tb.team_id = $3
+  WHERE tb.id = sqlc.arg('id')
+    AND tb.template_id IN (SELECT id FROM locked_template)
+    AND tb.team_id = sqlc.arg('team_id')
     AND tb.status IN ('pending', 'building', 'snapshotting')
   RETURNING tb.template_id AS tpl_id
 )
@@ -389,10 +396,11 @@ WHERE t.id = build_done.tpl_id
 -- build keep their 'ready' status.
 WITH stale AS (
   SELECT id, template_id, team_id, vmd_host_id, vmd_build_vm_id FROM template_build
-  WHERE
+  WHERE NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=template_build.id) AND (
     (status = 'pending' AND created_at < now() - (sqlc.arg('pending_timeout_seconds')::int || ' seconds')::interval)
     OR
     (status IN ('building', 'snapshotting') AND COALESCE(started_at, created_at) < now() - (sqlc.arg('build_timeout_seconds')::int || ' seconds')::interval)
+  )
   ORDER BY created_at ASC
   LIMIT $1
   FOR UPDATE SKIP LOCKED

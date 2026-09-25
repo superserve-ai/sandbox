@@ -149,6 +149,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		internal.POST("/hosts/:host_id/storage-reports", h.HostStorageReport)
 		internal.PUT("/hosts/:host_id/pressure", h.HostReportPressure)
 		internal.POST("/hosts/:host_id/backups", h.ReportHostBackup)
+		internal.POST("/hosts/:host_id/template-attempts/admit", h.AdmitTemplateAttempt)
 		internal.POST("/secrets/decrypt", h.DecryptSecret)
 		internal.GET("/jwks", h.JWKS)
 		internal.GET("/sandbox_revocations", h.ListSandboxRevocations)

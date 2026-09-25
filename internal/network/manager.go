@@ -152,6 +152,8 @@ type Manager struct {
 	// the map. Guarded by mu.
 	poolOwnedSlots int
 	usedOwnedSlots int
+	// Fresh build claims are sampled with Used for pressure admission.
+	buildSlotOwners map[string]int
 
 	freeSlots  []int // recycled slot indices, guaranteed absent from slotOwner
 	nextSlot   int   // next new slot (used when freeSlots is empty)
@@ -995,6 +997,9 @@ const (
 // the mutex that slot claims and network setup contend for. Caller must
 // hold m.mu.
 func (m *Manager) setSlotOwnerLocked(idx int, owner string) {
+	if prev := m.slotOwner[idx]; m.buildSlotOwners[prev] == idx {
+		delete(m.buildSlotOwners, prev)
+	}
 	m.uncountSlotOwnerLocked(idx)
 	m.slotOwner[idx] = owner
 	if owner == poolOwner {
@@ -1007,6 +1012,9 @@ func (m *Manager) setSlotOwnerLocked(idx int, owner string) {
 // deleteSlotOwnerLocked is the ONLY deleter of slotOwner entries; caller
 // must hold m.mu.
 func (m *Manager) deleteSlotOwnerLocked(idx int) {
+	if prev := m.slotOwner[idx]; m.buildSlotOwners[prev] == idx {
+		delete(m.buildSlotOwners, prev)
+	}
 	m.uncountSlotOwnerLocked(idx)
 	delete(m.slotOwner, idx)
 }
@@ -1080,7 +1088,7 @@ func (m *Manager) withholdIfOwned(idx int, owner string) {
 // via reserveSlotLocked (bypassing the owned/nsExists checks). Pair every
 // ClaimFreshSlot with a ReleaseSlot.
 func (m *Manager) ClaimFreshSlot(owner string) (int, error) {
-	return m.claimSlotIndex(owner)
+	return m.claimSlotIndexWithBuildEvidence(owner, true)
 }
 
 // ReleaseSlot frees a slot claimed via ClaimFreshSlot and tears down any ns/veth
@@ -1118,6 +1126,10 @@ func (m *Manager) claimTeardown(idx int, owner string) bool {
 // assigns it to owner, and returns it. owner is poolOwner for pool pre-allocation
 // or the vmID for an on-demand SetupVM.
 func (m *Manager) claimSlotIndex(owner string) (int, error) {
+	return m.claimSlotIndexWithBuildEvidence(owner, false)
+}
+
+func (m *Manager) claimSlotIndexWithBuildEvidence(owner string, build bool) (int, error) {
 	m.mu.Lock()
 
 	for {
@@ -1186,6 +1198,12 @@ func (m *Manager) claimSlotIndex(owner string) (int, error) {
 		}
 
 		m.assignSlotLocked(idx, owner)
+		if build {
+			if m.buildSlotOwners == nil {
+				m.buildSlotOwners = make(map[string]int)
+			}
+			m.buildSlotOwners[owner] = idx
+		}
 		m.mu.Unlock()
 		return idx, nil
 	}
@@ -1847,10 +1865,11 @@ func (m *Manager) cleanupFull(nsName, vethName string) {
 //	Provisioning: refill workers currently building or delivering a slot
 //	Ceiling:      the IP-scheme hard bound on total slots (not a knob)
 type SlotPressureStats struct {
-	Used         int
-	WarmReady    int
-	Provisioning int
-	Ceiling      int
+	Used            int
+	BuildSlotOwners []string
+	WarmReady       int
+	Provisioning    int
+	Ceiling         int
 }
 
 // SlotPressure returns the current in-memory slot accounting. Pure reads:
@@ -1861,24 +1880,24 @@ type SlotPressureStats struct {
 // WarmReady/Provisioning instead, so the same slot can never appear in
 // two pressure classes at once (Used + Warm + Provisioning is what the
 // prepared-slot ceiling bounds; double-counting would corrupt that
-// formula). Constant-time: the counters are maintained at every
-// ownership transition (see setSlotOwnerLocked), never recomputed by
-// walking the map — the walk would hold the same mutex slot claims and
-// network setup need, for O(fleet) per beat.
+// formula). The counters are maintained at every ownership transition
+// (see setSlotOwnerLocked); only the bounded fresh-build owner set is walked.
 // Provisioning is STRUCTURAL, not a worker count: every
 // pool-owned slot that is not yet claimable from a warm channel is
 // in-flight inventory — refill builds and, after a restart with pool
 // adoption on, potentially hundreds of adoption candidates that hold
 // real namespaces long before any refill worker touches them. The
 // refillActive floor covers workers that have not claimed an index yet.
-// Reads counters maintained at ownership transitions, never a walk: two
-// integer loads under the slot mutex, so the beat cannot hold the lock
-// that slot claims and network setup need.
+// Reads counters maintained at ownership transitions, without scanning
+// the fleet-sized slot map under the allocator lock.
 func (m *Manager) SlotPressure() SlotPressureStats {
 	st := SlotPressureStats{Ceiling: MaxSlots}
 	m.mu.Lock()
 	poolOwned := m.poolOwnedSlots
 	st.Used = m.usedOwnedSlots
+	for owner := range m.buildSlotOwners {
+		st.BuildSlotOwners = append(st.BuildSlotOwners, owner)
+	}
 	m.mu.Unlock()
 	if m.pool != nil {
 		fresh, recycled, ok := m.PoolStats()

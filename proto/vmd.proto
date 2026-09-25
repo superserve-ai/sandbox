@@ -228,6 +228,7 @@ message BuildLogEvent {
   // should close its SSE connection after receiving a finished event.
   bool finished = 5;
   string status = 6; // "ready" | "failed" | "cancelled", set when finished.
+  uint64 sequence = 7; // Append order within one build VM's log buffer.
 }
 
 // ---------------------------------------------------------------------------

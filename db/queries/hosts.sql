@@ -243,7 +243,10 @@ SELECT h.id, h.vmd_addr, h.proxy_addr, h.region, h.status,
        -- would cross-multiply the per-host rows and corrupt the counts.
        COALESCE((SELECT COUNT(*) FROM template_build tb
                  WHERE tb.vmd_host_id = h.id
-                   AND tb.status IN ('building', 'snapshotting')), 0)::int AS building_count,
+                   AND tb.status IN ('building', 'snapshotting')
+                   AND NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=tb.id)), 0)::int
+       + (SELECT count(*)::int FROM template_build_attempt a WHERE a.host_id=h.id AND a.incarnation_id=h.incarnation_id
+          AND (a.state IN ('claimed','admitted','uploading') OR a.cleanup_pending)) AS building_count,
        -- Paused sandboxes whose CURRENT pause has no durable backup: the
        -- ones whose only up-to-date copy lives on this host's local disk.
        -- Retiring the machine destroys them outright; even
@@ -350,12 +353,15 @@ INSERT INTO host_pressure (
     allocated_memory_mib, allocated_vcpus,
     used_net_slots, provisioning_net_slots, warm_net_slots,
     net_slot_ceiling, max_network_slots, max_sandboxes, unknown_allocation_vms,
+    included_build_vm_ids, included_build_slot_vm_ids,
     reported_at
 )
 SELECT h.id, @running_sandboxes, @provisioning_sandboxes, @paused_sandboxes,
        @allocated_memory_mib, @allocated_vcpus,
        @used_net_slots, @provisioning_net_slots, @warm_net_slots,
        @net_slot_ceiling, @max_network_slots, @max_sandboxes, @unknown_allocation_vms,
+       COALESCE(sqlc.arg(included_build_vm_ids)::text[], '{}'::text[]),
+       COALESCE(sqlc.arg(included_build_slot_vm_ids)::text[], '{}'::text[]),
        now()
 FROM host h
 WHERE h.id = @host_id AND h.vmd_addr = @vmd_addr
@@ -380,6 +386,8 @@ ON CONFLICT (host_id) DO UPDATE SET
     max_network_slots = EXCLUDED.max_network_slots,
     max_sandboxes = EXCLUDED.max_sandboxes,
     unknown_allocation_vms = EXCLUDED.unknown_allocation_vms,
+    included_build_vm_ids = EXCLUDED.included_build_vm_ids,
+    included_build_slot_vm_ids = EXCLUDED.included_build_slot_vm_ids,
     reported_at = EXCLUDED.reported_at;
 
 -- name: DeleteHostPressure :exec

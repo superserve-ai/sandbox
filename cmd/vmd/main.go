@@ -1576,8 +1576,17 @@ func main() {
 			return handler(srv, ss)
 		}),
 	)
+	buildRuntimeInstalled := true
+	for _, binary := range []string{cfg.TemplateBuilderBin, cfg.FirecrackerBin} {
+		info, err := os.Stat(binary)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+			buildRuntimeInstalled = false
+			break
+		}
+	}
 	adapter := vm.NewGRPCAdapter(mgr).
-		WithSecretsBroker(cfg.SecretsProxySocket, cfg.SecretsProxySandboxAddr)
+		WithSecretsBroker(cfg.SecretsProxySocket, cfg.SecretsProxySandboxAddr).
+		WithBuildAdmission(vm.BuildAdmission{ControlPlaneURL: cfg.ControlPlaneURL, Token: os.Getenv("INTERNAL_API_TOKEN"), HostID: cfg.HostID, IncarnationID: cfg.IncarnationID})
 	vmdpb.RegisterVMDaemonServer(grpcServer, adapter)
 	if cfg.SecretsProxySocket != "" {
 		log.Info().
@@ -1604,6 +1613,13 @@ func main() {
 	// below; VMs it hasn't reached are loaded on-demand on first request.
 	slotsReserved := mgr.ReserveStartupSlots(ctx)
 	st.mark("slot_reserve", true, -1)
+	// Builder subprocesses survive a same-incarnation daemon restart without
+	// VM records. Discover them before the cgroup reap can stop their VMs.
+	buildNs, err := mgr.ProtectSurvivingBuildSlots()
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot protect surviving template build network slots")
+	}
+	st.mark("build_survivor_protect", true, len(buildNs))
 	// Reap direct-spawn VMs whose record never persisted (crash between spawn
 	// and first write). They have no record to reserve their slot, so the
 	// sweep/adoption below would tear their netns down under a live FC or
@@ -1617,6 +1633,7 @@ func main() {
 	// (sweep AND adoption) must stand down for this boot.
 	protectedNs, sweepSafe := mgr.ReapRecordlessCgroupVMs(ctx)
 	st.mark("cgroup_reap", true, -1)
+	protectedNs = append(protectedNs, buildNs...)
 	adoptNetPool := envOrDefault("VMD_NET_POOL_ADOPT", "false") == "true"
 	sweepRan := false
 	if !adoptNetPool {
@@ -1889,15 +1906,6 @@ func main() {
 				Int32("configured_vcpus", vcpus).Int32("physical_vcpus", physCPU).
 				Msg("configured schedulable capacity exceeds physical capacity — check for a units mistake")
 		}
-		// Builders orphaned by the previous daemon (deploy restarts kill
-		// only the main process) hold unsizable build-VM memory; the
-		// pressure gate stays closed until the async discovery completes
-		// and every survivor exits. Skipped when pressure publication is
-		// not configured: the /proc walk buys nothing for a host that
-		// never publishes.
-		if publishesPressure {
-			mgr.ScanSurvivingBuildersAsync(cfg.TemplateBuilderBin)
-		}
 		proxyHealthURL := os.Getenv("PROXY_HEALTH_URL")
 		if proxyHealthURL == "" {
 			proxyHealthURL = "http://127.0.0.1:5007/health"
@@ -1947,6 +1955,9 @@ func main() {
 				}
 			}
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
+				TemplateBuildReady: func() bool {
+					return startupReady.Load() && backupBucket != "" && buildRuntimeInstalled && cfg.IncarnationID != "" && publishesPressure
+				},
 				IncarnationID:     cfg.IncarnationID,
 				ControlPlaneURL:   cfg.ControlPlaneURL,
 				HostID:            cfg.HostID,

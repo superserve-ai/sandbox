@@ -3,16 +3,16 @@
 // blocks until every build reaches a terminal status.
 //
 // Flow per run:
-//   1. Upsert each JSON under superserve_templates/ into the template table
-//      owned by SYSTEM_TEAM_ID (idempotent on name).
-//   2. Decide whether to enqueue a build for each template:
-//        - Template row just inserted → enqueue.
-//        - Previous build failed / never ran → enqueue.
-//        - Spec hash differs from the last successful build → enqueue.
-//        - --force-rebuild → always enqueue (for "host was replaced").
-//        - Otherwise → skip.
-//   3. Poll until every enqueued build is ready / failed / cancelled.
-//      Exit 0 when all succeed, non-zero if any fail.
+//  1. Upsert each JSON under superserve_templates/ into the template table
+//     owned by SYSTEM_TEAM_ID (idempotent on name).
+//  2. Decide whether to enqueue a build for each template:
+//     - Template row just inserted → enqueue.
+//     - Previous build failed / never ran → enqueue.
+//     - Spec hash differs from the last successful build → enqueue.
+//     - --force-rebuild → enqueue for an explicit baked-runtime refresh.
+//     - Otherwise → skip.
+//  3. Poll until every enqueued build is ready / failed / cancelled.
+//     Exit 0 when all succeed, non-zero if any fail.
 //
 // Intended to run at platform bootstrap and whenever the curated spec
 // list changes. Not scheduled in CI (invoked via a workflow_dispatch-able
@@ -36,7 +36,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -44,6 +43,8 @@ import (
 	"github.com/superserve-ai/sandbox/internal/builder"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+const defaultWaitDeadline = 35 * time.Minute
 
 func main() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339})
@@ -55,8 +56,8 @@ func main() {
 		noWait       bool
 	)
 	flag.StringVar(&dir, "dir", "superserve_templates", "directory containing template JSON files")
-	flag.BoolVar(&forceRebuild, "force-rebuild", false, "re-enqueue a build even when the template is already ready; use after host replacement")
-	flag.DurationVar(&waitDeadline, "wait", 30*time.Minute, "max time to wait for all builds to reach terminal status")
+	flag.BoolVar(&forceRebuild, "force-rebuild", false, "re-enqueue a build even when the template is already ready; use to refresh baked runtime changes")
+	flag.DurationVar(&waitDeadline, "wait", defaultWaitDeadline, "max time to wait for all builds to reach terminal status")
 	flag.BoolVar(&noWait, "no-wait", false, "enqueue builds but don't block until they finish")
 	flag.Parse()
 
@@ -185,9 +186,27 @@ func loadSpecs(dir string) ([]seedSpec, error) {
 func seedOne(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, s seedSpec, forceRebuild bool) (uuid.UUID, bool, error) {
 	vcpu, memMib, diskMib := resolvedResources(s)
 
-	specHash, err := canonicalSpecHash(s.BuildSpec)
+	specHash, err := builder.InputHash(s.BuildSpec, vcpu, memMib, diskMib)
 	if err != nil {
 		return uuid.Nil, false, fmt.Errorf("hash build_spec: %w", err)
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, false, err
+	}
+	defer tx.Rollback(ctx)
+	// Match API submission locking; keep spec edits, resource edits and
+	// input capture in the same transaction.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", teamID.String()); err != nil {
+		return uuid.Nil, false, err
+	}
+	var previousVCPU, previousMemory, previousDisk int32
+	previousErr := tx.QueryRow(ctx, `SELECT vcpu, memory_mib, disk_mib FROM template
+		WHERE team_id = $1 AND name = $2 AND deleted_at IS NULL FOR UPDATE`, teamID, s.Name).
+		Scan(&previousVCPU, &previousMemory, &previousDisk)
+	if previousErr != nil && !errors.Is(previousErr, pgx.ErrNoRows) {
+		return uuid.Nil, false, previousErr
 	}
 
 	// Upsert and capture the resulting status so we can decide whether to
@@ -206,78 +225,93 @@ func seedOne(ctx context.Context, pool *pgxpool.Pool, teamID uuid.UUID, s seedSp
 	`
 	var tplID uuid.UUID
 	var tplStatus string
-	if err := pool.QueryRow(ctx, upsertQ,
+	if err := tx.QueryRow(ctx, upsertQ,
 		teamID, s.Name, []byte(s.BuildSpec), vcpu, memMib, diskMib,
 	).Scan(&tplID, &tplStatus); err != nil {
 		return uuid.Nil, false, fmt.Errorf("upsert template: %w", err)
 	}
 
-	// Decide whether to enqueue a build.
-	needsBuild := forceRebuild || tplStatus != "ready"
+	preserveReadyShape := func() error {
+		if tplStatus != "ready" || previousErr != nil {
+			return nil
+		}
+		_, err := tx.Exec(ctx, `UPDATE template SET vcpu=$2,memory_mib=$3,disk_mib=$4 WHERE id=$1`, tplID, previousVCPU, previousMemory, previousDisk)
+		return err
+	}
+	const existingQ = `SELECT id FROM template_build
+		WHERE template_id = $1 AND (build_spec_hash = $2 OR EXISTS (
+            SELECT 1 FROM template_build_input i JOIN template t ON t.id=template_build.template_id
+            WHERE i.build_id=template_build.id AND i.build_spec=t.build_spec AND i.vcpu=t.vcpu
+                AND i.memory_mib=t.memory_mib AND i.disk_mib=t.disk_mib))
+		  AND status IN ('pending', 'building', 'snapshotting')`
+	var buildID uuid.UUID
+	err = tx.QueryRow(ctx, existingQ, tplID, specHash).Scan(&buildID)
+	if err == nil {
+		if err := preserveReadyShape(); err != nil {
+			return uuid.Nil, false, err
+		}
+		return buildID, true, tx.Commit(ctx)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, err
+	}
+
+	var latestStatus string
+	err = tx.QueryRow(ctx, `SELECT status FROM template_build WHERE template_id=$1
+		ORDER BY created_at DESC, id DESC LIMIT 1`, tplID).Scan(&latestStatus)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, err
+	}
+	needsBuild := forceRebuild || tplStatus != "ready" || latestStatus == "failed" || latestStatus == "cancelled"
 	if !needsBuild {
-		lastHash, err := latestReadyBuildHash(ctx, pool, tplID)
+		lastHash, err := latestReadyBuildHash(ctx, tx, tplID)
 		if err != nil {
 			return uuid.Nil, false, fmt.Errorf("read latest ready build: %w", err)
 		}
-		if lastHash != specHash {
-			needsBuild = true
+		needsBuild = lastHash != specHash
+		// Historical hashes cover only the spec. Keep unchanged ready
+		// templates unchanged during rollout; never invent old snapshots.
+		if needsBuild && previousErr == nil && previousVCPU == vcpu && previousMemory == memMib && previousDisk == diskMib {
+			legacyHash, err := canonicalSpecHash(s.BuildSpec)
+			if err != nil {
+				return uuid.Nil, false, err
+			}
+			needsBuild = lastHash != legacyHash
 		}
 	}
 	if !needsBuild {
-		return uuid.Nil, false, nil
+		return uuid.Nil, false, tx.Commit(ctx)
 	}
 
-	// Insert the template_build row. If an in-flight build already exists
-	// for this (template, hash), the unique partial index rejects with
-	// 23505 — we then return that existing build's id so the wait loop
-	// watches the right row.
-	const insertBuildQ = `
-		INSERT INTO template_build (template_id, team_id, build_spec_hash)
-		VALUES ($1, $2, $3)
-		RETURNING id;
-	`
-	var buildID uuid.UUID
-	err = pool.QueryRow(ctx, insertBuildQ, tplID, teamID, specHash).Scan(&buildID)
-	if err == nil {
-		return buildID, true, nil
+	err = tx.QueryRow(ctx, `INSERT INTO template_build (template_id, team_id, build_spec_hash)
+		VALUES ($1, $2, $3) RETURNING id`, tplID, teamID, specHash).Scan(&buildID)
+	if err != nil {
+		return uuid.Nil, false, fmt.Errorf("insert build: %w", err)
 	}
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		// No status filter: the racer's row may have transitioned to
-		// ready/failed between INSERT and this lookup.
-		const existingQ = `
-			SELECT id FROM template_build
-			WHERE template_id = $1 AND build_spec_hash = $2
-			ORDER BY created_at DESC LIMIT 1;
-		`
-		if scanErr := pool.QueryRow(ctx, existingQ, tplID, specHash).Scan(&buildID); scanErr == nil {
-			return buildID, true, nil
-		}
+	if err := preserveReadyShape(); err != nil {
+		return uuid.Nil, false, err
 	}
-	return uuid.Nil, false, fmt.Errorf("insert build: %w", err)
+	return buildID, true, tx.Commit(ctx)
 }
 
 // latestReadyBuildHash returns the hash of the most recent successful
 // build for this template, or "" when none exists.
-func latestReadyBuildHash(ctx context.Context, pool *pgxpool.Pool, templateID uuid.UUID) (string, error) {
-	const q = `
+func latestReadyBuildHash(ctx context.Context, q db.DBTX, templateID uuid.UUID) (string, error) {
+	const query = `
 		SELECT build_spec_hash FROM template_build
 		WHERE template_id = $1 AND status = 'ready'
 		ORDER BY finalized_at DESC NULLS LAST LIMIT 1;
 	`
 	var hash string
-	err := pool.QueryRow(ctx, q, templateID).Scan(&hash)
+	err := q.QueryRow(ctx, query, templateID).Scan(&hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
 	return hash, err
 }
 
-// canonicalSpecHash matches the handler's internal hashing: unmarshal into
-// builder.BuildSpec, re-marshal with encoding/json (field order = struct
-// field order, map keys sorted), then sha256. The seeder and the handler
-// must produce identical hashes for idempotency to work across both
-// submission paths.
+// canonicalSpecHash recognizes historical spec-only hashes when deciding
+// whether an unchanged ready template needs rebuilding during rollout.
 func canonicalSpecHash(raw []byte) (string, error) {
 	var spec builder.BuildSpec
 	if err := json.Unmarshal(raw, &spec); err != nil {
@@ -294,6 +328,12 @@ func canonicalSpecHash(raw []byte) (string, error) {
 // waitForBuilds polls every tracked build until it hits a terminal state
 // or the context fires. Returns the number of non-success terminal states.
 func waitForBuilds(ctx context.Context, pool *pgxpool.Pool, ids []uuid.UUID) int {
+	return waitForBuildStatuses(ctx, ids, func(ctx context.Context, id uuid.UUID) (string, string, bool, error) {
+		return queryBuildStatus(ctx, pool, id)
+	})
+}
+
+func waitForBuildStatuses(ctx context.Context, ids []uuid.UUID, query func(context.Context, uuid.UUID) (string, string, bool, error)) int {
 	const tick = 5 * time.Second
 	remaining := make(map[uuid.UUID]struct{}, len(ids))
 	for _, id := range ids {
@@ -306,7 +346,7 @@ func waitForBuilds(ctx context.Context, pool *pgxpool.Pool, ids []uuid.UUID) int
 			return failures
 		}
 		for id := range remaining {
-			status, errMsg, terminal, err := queryBuildStatus(ctx, pool, id)
+			status, errMsg, terminal, err := query(ctx, id)
 			if err != nil {
 				log.Warn().Err(err).Str("build_id", id.String()).Msg("poll build status")
 				continue

@@ -44,21 +44,25 @@ type BackupReporter struct {
 // existed; the control plane stores it so a future GC can name a
 // generation's objects without listing the bucket.
 type backupReportFile struct {
-	Name       string `json:"name"`
-	SizeBytes  int64  `json:"size_bytes"`
-	SHA256     string `json:"sha256"`
-	BaseSHA256 string `json:"base_sha256,omitempty"`
-	Shared     bool   `json:"shared,omitempty"`
-	Object     string `json:"object,omitempty"`
+	RuntimePath    string `json:"runtime_path,omitempty"`
+	AllocatedBytes int64  `json:"allocated_bytes,omitempty"`
+	Name           string `json:"name"`
+	SizeBytes      int64  `json:"size_bytes"`
+	SHA256         string `json:"sha256"`
+	BaseSHA256     string `json:"base_sha256,omitempty"`
+	Shared         bool   `json:"shared,omitempty"`
+	Object         string `json:"object,omitempty"`
 }
 
 type backupReportBody struct {
-	SandboxID   string    `json:"sandbox_id,omitempty"`
-	TemplateID  string    `json:"template_id,omitempty"`
-	BuildID     string    `json:"build_id,omitempty"`
-	Generation  string    `json:"generation"`
-	Bucket      string    `json:"bucket"`
-	CompletedAt time.Time `json:"completed_at"`
+	TemplateRuntime  *backup.TemplateRuntime `json:"template_runtime,omitempty"`
+	BuildIncarnation string                  `json:"build_incarnation,omitempty"`
+	SandboxID        string                  `json:"sandbox_id,omitempty"`
+	TemplateID       string                  `json:"template_id,omitempty"`
+	BuildID          string                  `json:"build_id,omitempty"`
+	Generation       string                  `json:"generation"`
+	Bucket           string                  `json:"bucket"`
+	CompletedAt      time.Time               `json:"completed_at"`
 	// PauseToken names the exact pause this generation captured, echoed
 	// from the pause RPC through the journal; empty for pre-token entries
 	// and backfill mints, which fall back to content matching.
@@ -93,6 +97,7 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 		completedAt = time.Now()
 	}
 	body := backupReportBody{
+		TemplateRuntime: task.TemplateRuntime, BuildIncarnation: task.BuildIncarnation,
 		SandboxID:   task.SandboxID,
 		TemplateID:  task.TemplateID,
 		BuildID:     task.BuildID,
@@ -104,7 +109,8 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	}
 	for _, f := range files {
 		body.Files = append(body.Files, backupReportFile{
-			Name:       f.Name,
+			Name:        f.Name,
+			RuntimePath: f.RuntimePath, AllocatedBytes: f.AllocatedBytes,
 			SizeBytes:  f.Size,
 			SHA256:     f.SHA256,
 			BaseSHA256: f.BaseSHA256,
@@ -115,6 +121,9 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	status, statusLine, msg, err := r.post(body)
 	if err != nil {
 		return err
+	}
+	if task.TemplateRuntime != nil && (status < 200 || status >= 300) {
+		return fmt.Errorf("template publication report retained: %s: %s: %w", statusLine, msg, backup.ErrNotificationDeferred)
 	}
 	// Any 2xx clears the outbox entry, including accepted-but-orphaned
 	// reports: only the control plane knows whether an owner row exists,

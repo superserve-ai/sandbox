@@ -33,15 +33,16 @@ func (q *Queries) AdvanceBuildStatus(ctx context.Context, arg AdvanceBuildStatus
 }
 
 const cancelBuild = `-- name: CancelBuild :execrows
-WITH build_done AS (
+WITH locked_template AS (SELECT t.id FROM template t WHERE t.id=$1 AND t.team_id=$2 FOR UPDATE),
+build_done AS (
   UPDATE template_build tb
   SET status = 'cancelled',
       finalized_at = now(),
       updated_at = now(),
       error_message = 'cancelled by user'
-  WHERE tb.id = $1
-    AND tb.template_id = $2
-    AND tb.team_id = $3
+  WHERE tb.id = $3
+    AND tb.template_id IN (SELECT id FROM locked_template)
+    AND tb.team_id = $2
     AND tb.status IN ('pending', 'building', 'snapshotting')
   RETURNING tb.template_id AS tpl_id
 )
@@ -55,9 +56,9 @@ WHERE t.id = build_done.tpl_id
 `
 
 type CancelBuildParams struct {
-	ID         uuid.UUID `json:"id"`
 	TemplateID uuid.UUID `json:"template_id"`
 	TeamID     uuid.UUID `json:"team_id"`
+	ID         uuid.UUID `json:"id"`
 }
 
 // User-initiated cancellation. Atomically transitions template_build →
@@ -65,7 +66,7 @@ type CancelBuildParams struct {
 // template → failed so listings don't show it stuck in 'building' forever.
 // A template with a prior successful build keeps its 'ready' status.
 func (q *Queries) CancelBuild(ctx context.Context, arg CancelBuildParams) (int64, error) {
-	result, err := q.db.Exec(ctx, cancelBuild, arg.ID, arg.TemplateID, arg.TeamID)
+	result, err := q.db.Exec(ctx, cancelBuild, arg.TemplateID, arg.TeamID, arg.ID)
 	if err != nil {
 		return 0, err
 	}
@@ -511,10 +512,13 @@ func (q *Queries) FinalizeBuild(ctx context.Context, arg FinalizeBuildParams) (F
 
 const getExistingInflightBuild = `-- name: GetExistingInflightBuild :one
 SELECT id, template_id, team_id, status, build_spec_hash, vmd_host_id, vmd_build_vm_id, error_message, started_at, finalized_at, created_at, updated_at FROM template_build
-WHERE template_id = $1
-  AND team_id = $2
-  AND build_spec_hash = $3
-  AND status IN ('pending', 'building', 'snapshotting')
+WHERE template_build.template_id = $1
+  AND template_build.team_id = $2
+  AND (template_build.build_spec_hash = $3 OR EXISTS (
+    SELECT 1 FROM template_build_input i JOIN template t ON t.id=template_build.template_id
+    WHERE i.build_id=template_build.id AND i.build_spec=t.build_spec
+      AND i.vcpu=t.vcpu AND i.memory_mib=t.memory_mib AND i.disk_mib=t.disk_mib))
+  AND template_build.status IN ('pending', 'building', 'snapshotting')
 `
 
 type GetExistingInflightBuildParams struct {
@@ -724,6 +728,7 @@ func (q *Queries) GetTemplateForOwner(ctx context.Context, arg GetTemplateForOwn
 const listActiveBuilds = `-- name: ListActiveBuilds :many
 SELECT id, template_id, team_id, status, build_spec_hash, vmd_host_id, vmd_build_vm_id, error_message, started_at, finalized_at, created_at, updated_at FROM template_build
 WHERE status IN ('building', 'snapshotting')
+  AND NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=template_build.id)
 ORDER BY started_at ASC NULLS LAST
 `
 
@@ -878,6 +883,7 @@ func (q *Queries) ListInFlightBuilds(ctx context.Context) ([]ListInFlightBuildsR
 const listPendingBuildsOrdered = `-- name: ListPendingBuildsOrdered :many
 SELECT id, template_id, team_id, status, build_spec_hash, vmd_host_id, vmd_build_vm_id, error_message, started_at, finalized_at, created_at, updated_at FROM template_build
 WHERE status = 'pending'
+  AND NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=template_build.id)
 ORDER BY created_at ASC
 LIMIT $1
 `
@@ -1022,10 +1028,11 @@ func (q *Queries) ListTemplatesForTeamPaged(ctx context.Context, arg ListTemplat
 const reapStaleBuilds = `-- name: ReapStaleBuilds :many
 WITH stale AS (
   SELECT id, template_id, team_id, vmd_host_id, vmd_build_vm_id FROM template_build
-  WHERE
+  WHERE NOT EXISTS (SELECT 1 FROM template_build_execution e WHERE e.build_id=template_build.id) AND (
     (status = 'pending' AND created_at < now() - ($2::int || ' seconds')::interval)
     OR
     (status IN ('building', 'snapshotting') AND COALESCE(started_at, created_at) < now() - ($3::int || ' seconds')::interval)
+  )
   ORDER BY created_at ASC
   LIMIT $1
   FOR UPDATE SKIP LOCKED
@@ -1134,24 +1141,27 @@ counted AS (
     (SELECT COUNT(*)::bigint FROM sandbox
      WHERE template_id = $1 AND destroyed_at IS NULL)
     + (SELECT COUNT(*)::bigint FROM sandbox_snapshot
-       WHERE template_id = $1 AND deleted_at IS NULL AND status IN ('creating', 'ready')) AS live_count,
-    (SELECT COUNT(*)::bigint FROM template_build
-     WHERE template_id = $1
-       AND status IN ('pending', 'building', 'snapshotting')) AS inflight_build_count
+       WHERE template_id = $1 AND deleted_at IS NULL AND status IN ('creating', 'ready')) AS live_count
+),
+cancelled AS (
+  UPDATE template_build
+  SET status = 'cancelled', finalized_at = now(), updated_at = now(), error_message = 'template deleted'
+  WHERE template_id IN (SELECT tpl_id FROM locked)
+    AND (SELECT live_count FROM counted) = 0
+    AND status IN ('pending', 'building', 'snapshotting')
+  RETURNING id
 ),
 deleted AS (
   UPDATE template t
   SET deleted_at = now(), updated_at = now()
   WHERE t.id IN (SELECT tpl_id FROM locked)
     AND (SELECT live_count FROM counted) = 0
-    AND (SELECT inflight_build_count FROM counted) = 0
+    AND (SELECT count(*) FROM cancelled) >= 0
   RETURNING t.id
 )
-SELECT
-  EXISTS(SELECT 1 FROM locked)  AS found,
-  (SELECT live_count FROM counted) AS live_count,
-  (SELECT inflight_build_count FROM counted) AS inflight_build_count,
-  EXISTS(SELECT 1 FROM deleted) AS deleted
+SELECT EXISTS(SELECT 1 FROM locked) AS found,
+ (SELECT live_count FROM counted) AS live_count,
+ 0::bigint AS inflight_build_count, EXISTS(SELECT 1 FROM deleted) AS deleted
 `
 
 type SoftDeleteTemplateIfUnusedParams struct {
@@ -1166,9 +1176,7 @@ type SoftDeleteTemplateIfUnusedRow struct {
 	Deleted            bool  `json:"deleted"`
 }
 
-// Soft-deletes a template only if no live sandbox or snapshot references it
-// AND no build is in flight. Blocking on builds prevents the vmd-side artifact
-// cleanup from racing with template-builder still writing to the same dirs.
+// Deletion fences all builds before committing; live sandbox and snapshot references still block it.
 func (q *Queries) SoftDeleteTemplateIfUnused(ctx context.Context, arg SoftDeleteTemplateIfUnusedParams) (SoftDeleteTemplateIfUnusedRow, error) {
 	row := q.db.QueryRow(ctx, softDeleteTemplateIfUnused, arg.ID, arg.TeamID)
 	var i SoftDeleteTemplateIfUnusedRow

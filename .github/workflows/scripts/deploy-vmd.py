@@ -20,7 +20,9 @@ Env vars:
   SENTRY_DSN           optional — upserted into /etc/sandbox/vmd.env when set
   BACKUP_BUCKET        optional — the cell's artifact backup bucket. Upserted
                        into vmd.env when set; empty = skip, leaving the
-                       host's backup uploader disabled. Staged rollout:
+                       host's backup uploader disabled. Hosts with a bucket
+                       get VMD_ADVERTISE_ADDR from their host interface so
+                       capacity pressure can be published. Staged rollout:
                        staging first, production after the staging soak.
   BACKUP_BACKFILL      optional — "1" enables the paused-sandbox backup
                        backfill sweep (startup + six-hourly re-sweeps).
@@ -927,6 +929,32 @@ def main() -> int:
             if [ -n {q_backup} ]; then
                 sudo sed -i '/^BACKUP_BUCKET=/d' /etc/sandbox/vmd.env
                 echo {q_backup_line} | sudo tee -a /etc/sandbox/vmd.env > /dev/null
+            fi
+
+            # Build hosts must publish capacity pressure. Resolve the explicit
+            # advertise address from the interface VMD uses for heartbeats.
+            backup_bucket=$(sudo sed -n 's/^BACKUP_BUCKET=//p' /etc/sandbox/vmd.env | tail -n 1)
+            if [ -n "$backup_bucket" ]; then
+                host_interface=$(sudo sed -n 's/^HOST_INTERFACE=//p' /etc/sandbox/vmd.env | tail -n 1)
+                if [ -z "$host_interface" ]; then
+                    host_interface=$(ip -4 route show default | awk 'NR == 1 {{print $5}}')
+                fi
+                if [ -z "$host_interface" ]; then
+                    echo 'ERROR: build host needs a host interface for pressure publication' >&2
+                    exit 1
+                fi
+                host_ip=$(ip -4 -o addr show dev "$host_interface" scope global | awk 'NR == 1 {{split($4, address, "/"); ip=address[1]}} END {{if (NR != 1) exit 1; print ip}}') || {{
+                    echo 'ERROR: build host needs exactly one IPv4 address on its host interface' >&2
+                    exit 1
+                }}
+                grpc_port=$(sudo sed -n 's/^GRPC_PORT=//p' /etc/sandbox/vmd.env | tail -n 1)
+                grpc_port=${{grpc_port:-50051}}
+                if ! [[ "$grpc_port" =~ ^[0-9]+$ ]] || (( 10#$grpc_port < 1 || 10#$grpc_port > 65535 )); then
+                    echo 'ERROR: build host has an invalid GRPC_PORT' >&2
+                    exit 1
+                fi
+                sudo sed -i '/^VMD_ADVERTISE_ADDR=/d' /etc/sandbox/vmd.env
+                echo "VMD_ADVERTISE_ADDR=$host_ip:$grpc_port" | sudo tee -a /etc/sandbox/vmd.env > /dev/null
             fi
 
             # Upsert BACKUP_UPLOAD_CONCURRENCY (parallel drain workers over

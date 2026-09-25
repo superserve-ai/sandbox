@@ -119,6 +119,7 @@ test-short:
 
 test-integration: db-reset db-wait
 	DATABASE_URL="$(DATABASE_URL)" go test -tags integration ./internal/integration/ ./cmd/migrate-team/ -v -count=1 -timeout 10m
+	DATABASE_URL="$(DATABASE_URL)" go test -tags integration ./cmd/seed-templates/ -v -count=1 -timeout 10m
 
 ## Lint
 
