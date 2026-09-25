@@ -36,6 +36,14 @@ on:
         options:
           - serving
           - standby
+      deployment_mode:
+        description: 'Keep existing listeners, or use generation cutover; retries must keep the original mode'
+        required: true
+        type: choice
+        default: legacy
+        options:
+          - legacy
+          - generation
       revision:
         description: 'Original commit SHA when resuming an interrupted rollout'
         required: false
@@ -86,9 +94,12 @@ on:
       - '.github/workflows/scripts/proxy_rollout.py'
       - '.github/workflows/deploy-proxy.yml'
       - '.github/workflows/scripts/deploy-proxy.py'
+      - '.github/workflows/scripts/deploy-proxy-legacy.py'
+      - '.github/workflows/scripts/legacy_proxy_preflight.py'
       - '.github/workflows/scripts/select-deploy-target.sh'
 
 env:
+  PROXY_DEPLOYMENT_MODE: ${{ (inputs.operation == 'bootstrap' || inputs.deployment_mode == 'generation' || (github.event_name == 'push' && vars.PROXY_GENERATION_PROMOTION_READY == 'true')) && 'generation' || 'legacy' }}
   PROXY_ROLLOUT_ID: ${{ inputs.rollout_id || github.run_id }}
   PROXY_OPERATION: ${{ inputs.operation || 'deploy' }}
   PROXY_ROLLOUT_MANIFESTS: bin/proxy-rollout.json
@@ -113,6 +124,7 @@ jobs:
       actions: read
     outputs:
       revision: ${{ steps.revision.outputs.revision }}
+      mode: ${{ steps.mode.outputs.mode }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -127,8 +139,14 @@ jobs:
           CURRENT_SHA: ${{ github.sha }}
           REQUESTED_REVISION: ${{ inputs.revision }}
           REQUESTED_ROLLOUT_ID: ${{ inputs.rollout_id }}
+          VALIDATION_ENVIRONMENT: ${{ inputs.environment }}
         run: |
           set -euo pipefail
+          if [ "${DEPLOY_EVENT:-}" = workflow_dispatch ] && [ "${VALIDATION_ENVIRONMENT:-}" = staging ] &&
+             [ "${PROXY_DEPLOYMENT_MODE:-}" = legacy ] && [ -z "$REQUESTED_REVISION$REQUESTED_ROLLOUT_ID" ]; then
+            echo "revision=$CURRENT_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           [ "$CURRENT_REF" = refs/heads/main ] || { echo 'Deployments must be dispatched from main.' >&2; exit 1; }
           revision="$CURRENT_SHA"
           if [ -n "$REQUESTED_REVISION$REQUESTED_ROLLOUT_ID" ]; then
@@ -144,6 +162,9 @@ jobs:
           fi
           git merge-base --is-ancestor "$revision" origin/main
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
+      - name: Select proxy deployment mode
+        id: mode
+        run: echo "mode=$PROXY_DEPLOYMENT_MODE" >> "$GITHUB_OUTPUT"
       - name: Require host identity readiness for automatic rollout
         env:
           DEPLOY_EVENT: ${{ github.event_name }}
@@ -153,11 +174,11 @@ jobs:
           EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
           EVIDENCE_STATUS: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS }}
         run: |
-          if [ "$DEPLOY_EVENT" = push ] && [ "${GENERATION_READY:-}" != true ]; then
+          if [ "${PROXY_DEPLOYMENT_MODE:-generation}" = generation ] && [ "$DEPLOY_EVENT" = push ] && [ "${GENERATION_READY:-}" != true ]; then
             echo 'Generation migration and staging promotion evidence are required before automatic rollout.' >&2
             exit 1
           fi
-          if [ "$DEPLOY_EVENT" = push ]; then
+          if [ "${PROXY_DEPLOYMENT_MODE:-generation}" = generation ] && [ "$DEPLOY_EVENT" = push ]; then
             notion_url_pattern='^https://(([A-Za-z0-9-]+\.)?(notion\.so|notion\.site)|app\.notion\.com)/[^[:space:]<>#]+$'
             https_url_pattern='^https://[^[:space:]<>#]+$'
             if [[ ! "${RUNBOOK_URL:-}" =~ $notion_url_pattern ]] ||
@@ -214,6 +235,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Read applied proxy manifests from the owning state
+        if: env.PROXY_DEPLOYMENT_MODE == 'generation'
         env:
           PROXY_OPERATION: ${{ inputs.environment == 'production' && 'deploy' || inputs.operation || 'deploy' }}
         run: |
@@ -274,7 +296,7 @@ jobs:
           python3 .github/workflows/scripts/deploy-proxy.py
 
   deploy-production:
-    if: (github.event_name == 'push' || github.event.inputs.environment == 'production') && vars.PROXY_GENERATION_PROMOTION_READY == 'true' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS == 'passed' && vars.PROXY_GENERATION_RUNBOOK_URL != '' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL != ''
+    if: (github.event_name == 'push' || github.event.inputs.environment == 'production') && (needs['migration-gate'].outputs.mode == 'legacy' || (vars.PROXY_GENERATION_PROMOTION_READY == 'true' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_STATUS == 'passed' && vars.PROXY_GENERATION_RUNBOOK_URL != '' && vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL != ''))
     needs: [migration-gate, deploy-staging]
     runs-on: ubuntu-latest
     environment: production
@@ -288,6 +310,7 @@ jobs:
           ref: ${{ needs.migration-gate.outputs.revision }}
 
       - name: Validate linked staging promotion evidence
+        if: env.PROXY_DEPLOYMENT_MODE == 'generation'
         env:
           RUNBOOK_URL: ${{ vars.PROXY_GENERATION_RUNBOOK_URL }}
           EVIDENCE_URL: ${{ vars.PROXY_GENERATION_PROMOTION_EVIDENCE_URL }}
@@ -339,7 +362,7 @@ jobs:
           terraform_wrapper: false
 
       - name: Read applied us-east4 proxy manifests from the owning state
-        if: github.event_name != 'workflow_dispatch' || inputs.production_cell == 'use4'
+        if: env.PROXY_DEPLOYMENT_MODE == 'generation' && (github.event_name != 'workflow_dispatch' || inputs.production_cell == 'use4')
         run: |
           set -euo pipefail
           umask 077
@@ -396,7 +419,7 @@ jobs:
           python3 .github/workflows/scripts/deploy-proxy.py
 
       - name: Read applied us-west2 proxy manifests from the owning state
-        if: (github.event_name == 'workflow_dispatch' && (inputs.production_cell == 'usw2' || inputs.production_cell == '')) || (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != '')
+        if: env.PROXY_DEPLOYMENT_MODE == 'generation' && ((github.event_name == 'workflow_dispatch' && (inputs.production_cell == 'usw2' || inputs.production_cell == '')) || (github.event_name != 'workflow_dispatch' && vars.CLOUD_RUN_SERVICE_USW != ''))
         run: |
           set -euo pipefail
           umask 077

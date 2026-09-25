@@ -152,6 +152,7 @@ type HostRegistry interface {
 // Handlers holds shared dependencies for all route handlers.
 type Handlers struct {
 	ComputeRestrictions   *abuse.ComputeEvaluator
+	SignupRestrictions    *abuse.SignupEvaluator
 	VMD                   VMDClient // default VMD client (used when Hosts is nil or host lookup fails on legacy sandboxes)
 	DB                    *db.Queries
 	Pool                  *pgxpool.Pool    // required by paths that need their own transaction (e.g. build-concurrency admission)

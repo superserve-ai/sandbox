@@ -5112,8 +5112,8 @@ func TestIntegration_BillingPeriodFinalizationUsesExportedStorageMode(t *testing
 			stripe_customer_id, stripe_meter_event_identifier, stripe_event_name,
 			value, status
 		)
-		VALUES ($1, $2, $3, 'storage', NULL, 'team-storage-mode', 'storage_gib_hours', 4.000000, 'sent')
-	`, teamID, scenario.periodStart, scenario.periodEnd); err != nil {
+		VALUES ($1, $2, $3, 'storage', NULL, $4, 'storage_gib_hours', 4.000000, 'sent')
+	`, teamID, scenario.periodStart, scenario.periodEnd, "team-storage-mode-"+uuid.New().String()); err != nil {
 		t.Fatalf("seed storage export attempt: %v", err)
 	}
 

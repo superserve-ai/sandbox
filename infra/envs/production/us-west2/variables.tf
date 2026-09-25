@@ -145,3 +145,14 @@ variable "provisioning_hosts" {
   type        = set(string)
   default     = []
 }
+
+variable "compute_restrictions_secret_name" {
+  description = "Existing operator-managed compute restriction secret ID, supplied through deployment configuration."
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-]+$", var.compute_restrictions_secret_name))
+    error_message = "Set compute_restrictions_secret_name to an existing Secret Manager secret ID."
+  }
+}

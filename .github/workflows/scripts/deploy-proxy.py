@@ -91,6 +91,15 @@ def verify_frontend_references(config):
 
 
 def main() -> int:
+    mode = os.environ.get("PROXY_DEPLOYMENT_MODE", "generation")
+    if mode == "legacy":
+        if os.environ.get("PROXY_OPERATION", "deploy") != "deploy":
+            raise ValueError("legacy deployments cannot bootstrap generations")
+        import runpy
+        from pathlib import Path
+        return runpy.run_path(str(Path(__file__).with_name("deploy-proxy-legacy.py")))["main"]()
+    if mode != "generation":
+        raise ValueError("unknown proxy deployment mode")
     project = os.environ["GCP_PROJECT"]
     region = os.environ.get("GCP_REGION", "")
     if not region.strip():
