@@ -583,20 +583,22 @@ type HostIdentityRegistry struct {
 }
 
 type HostPressure struct {
-	HostID                string    `json:"host_id"`
-	RunningSandboxes      int32     `json:"running_sandboxes"`
-	ProvisioningSandboxes int32     `json:"provisioning_sandboxes"`
-	PausedSandboxes       int32     `json:"paused_sandboxes"`
-	AllocatedMemoryMib    int64     `json:"allocated_memory_mib"`
-	AllocatedVcpus        int64     `json:"allocated_vcpus"`
-	UsedNetSlots          int32     `json:"used_net_slots"`
-	ProvisioningNetSlots  int32     `json:"provisioning_net_slots"`
-	WarmNetSlots          int32     `json:"warm_net_slots"`
-	NetSlotCeiling        int32     `json:"net_slot_ceiling"`
-	MaxNetworkSlots       int32     `json:"max_network_slots"`
-	MaxSandboxes          int32     `json:"max_sandboxes"`
-	UnknownAllocationVms  int32     `json:"unknown_allocation_vms"`
-	ReportedAt            time.Time `json:"reported_at"`
+	HostID                 string    `json:"host_id"`
+	RunningSandboxes       int32     `json:"running_sandboxes"`
+	ProvisioningSandboxes  int32     `json:"provisioning_sandboxes"`
+	PausedSandboxes        int32     `json:"paused_sandboxes"`
+	AllocatedMemoryMib     int64     `json:"allocated_memory_mib"`
+	AllocatedVcpus         int64     `json:"allocated_vcpus"`
+	UsedNetSlots           int32     `json:"used_net_slots"`
+	ProvisioningNetSlots   int32     `json:"provisioning_net_slots"`
+	WarmNetSlots           int32     `json:"warm_net_slots"`
+	NetSlotCeiling         int32     `json:"net_slot_ceiling"`
+	MaxNetworkSlots        int32     `json:"max_network_slots"`
+	MaxSandboxes           int32     `json:"max_sandboxes"`
+	UnknownAllocationVms   int32     `json:"unknown_allocation_vms"`
+	ReportedAt             time.Time `json:"reported_at"`
+	IncludedBuildVmIds     []string  `json:"included_build_vm_ids"`
+	IncludedBuildSlotVmIds []string  `json:"included_build_slot_vm_ids"`
 }
 
 type HostRetiredAddress struct {
@@ -1191,6 +1193,60 @@ type TemplateBuild struct {
 	FinalizedAt   pgtype.Timestamptz  `json:"finalized_at"`
 	CreatedAt     time.Time           `json:"created_at"`
 	UpdatedAt     time.Time           `json:"updated_at"`
+}
+
+type TemplateBuildAttempt struct {
+	ID               uuid.UUID          `json:"id"`
+	BuildID          uuid.UUID          `json:"build_id"`
+	HostID           string             `json:"host_id"`
+	IncarnationID    uuid.UUID          `json:"incarnation_id"`
+	VmID             string             `json:"vm_id"`
+	State            string             `json:"state"`
+	ClaimedAt        time.Time          `json:"claimed_at"`
+	AdmittedAt       pgtype.Timestamptz `json:"admitted_at"`
+	Reason           string             `json:"reason"`
+	CleanupCheckedAt pgtype.Timestamptz `json:"cleanup_checked_at"`
+	CleanupPending   bool               `json:"cleanup_pending"`
+}
+
+type TemplateBuildExecution struct {
+	BuildID            uuid.UUID          `json:"build_id"`
+	Revision           int64              `json:"revision"`
+	Cell               *string            `json:"cell"`
+	CurrentAttempt     pgtype.UUID        `json:"current_attempt"`
+	FirstStartedAt     pgtype.Timestamptz `json:"first_started_at"`
+	ReconcileCheckedAt pgtype.Timestamptz `json:"reconcile_checked_at"`
+	Reason             string             `json:"reason"`
+}
+
+type TemplateBuildIdentity struct {
+	BuildID    uuid.UUID `json:"build_id"`
+	TemplateID uuid.UUID `json:"template_id"`
+	InputKey   string    `json:"input_key"`
+}
+
+type TemplateBuildInput struct {
+	BuildID   uuid.UUID `json:"build_id"`
+	BuildSpec []byte    `json:"build_spec"`
+	Vcpu      int32     `json:"vcpu"`
+	MemoryMib int32     `json:"memory_mib"`
+	DiskMib   int32     `json:"disk_mib"`
+}
+
+type TemplateBuildPublication struct {
+	BuildID        uuid.UUID          `json:"build_id"`
+	AttemptID      uuid.UUID          `json:"attempt_id"`
+	TemplateID     uuid.UUID          `json:"template_id"`
+	TeamID         uuid.UUID          `json:"team_id"`
+	Cell           string             `json:"cell"`
+	Revision       int64              `json:"revision"`
+	Bucket         string             `json:"bucket"`
+	Generation     string             `json:"generation"`
+	ManifestObject string             `json:"manifest_object"`
+	Files          []byte             `json:"files"`
+	Runtime        []byte             `json:"runtime"`
+	VerifiedAt     time.Time          `json:"verified_at"`
+	AcceptedAt     pgtype.Timestamptz `json:"accepted_at"`
 }
 
 type TrialCreditWarningDelivery struct {

@@ -195,6 +195,8 @@ module "api" {
     SECRETS_SIGNING_KEY_ID = "v1"
     ALLOW_EPHEMERAL_SEED   = "0"
     DB_MAX_CONNS           = "15"
+    TEMPLATE_BUILD_REGION  = local.region
+    BACKUP_BUCKET          = "superserve-artifact-backup-use4"
     VMD_GRPC_ADDRESS       = format("%s:50051", local.active_vmd_ip)
     # The cell host's identity, alongside the address above. Same value as
     # metrics_host_id.

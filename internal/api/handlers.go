@@ -2036,6 +2036,15 @@ func (h *Handlers) gcOldBuildArtifacts(reqCtx context.Context, hostID string, sa
 	gcCtx, cancel := context.WithTimeout(reqCtx, 10*time.Second)
 	defer cancel()
 
+	if _, parseErr := uuid.Parse(strings.TrimPrefix(buildID, "build-")); strings.HasPrefix(buildID, "build-") && parseErr == nil {
+		protected, err := h.DB.BuildArtifactProtected(gcCtx, buildID)
+		if err != nil {
+			return err
+		}
+		if protected {
+			return nil
+		}
+	}
 	refs, err := h.DB.CountActiveSandboxesAtBasePath(gcCtx, &basePath)
 	if err != nil {
 		return fmt.Errorf("gc: count references: %w", err)

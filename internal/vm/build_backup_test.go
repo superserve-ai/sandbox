@@ -104,6 +104,113 @@ func TestBackupBuildArtifactsHashesAndEnqueuesWithHook(t *testing.T) {
 	}
 }
 
+func TestBuildCompletionDoesNotWaitForBackupEnqueue(t *testing.T) {
+	root := t.TempDir()
+	dir := writeAdoptableBuildFixture(t, root, "tpl", "build-tpl")
+	result, err := readBuildMetaJSON(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	m.SetBackupEnqueue(func(backup.Task) error {
+		close(entered)
+		<-release
+		close(finished)
+		return nil
+	})
+	rec, err := m.registerBuild("build-tpl", "tpl", 1, 1024, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completionDone := make(chan struct{})
+	go func() {
+		m.completeBuildAndScheduleBackup("build-tpl", rec, result, nil)
+		close(completionDone)
+	}()
+	select {
+	case <-completionDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("build completion waited for backup")
+	}
+	snap, ok := m.GetBuildStatus("build-tpl")
+	if !ok || snap.Status != BuildStatusReady {
+		t.Fatalf("build status = %+v ok=%v, want ready while backup runs", snap, ok)
+	}
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("completed build did not schedule backup")
+	}
+	select {
+	case <-finished:
+		t.Fatal("backup finished before the test released the enqueue hook")
+	default:
+	}
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("backup enqueue did not finish")
+	}
+}
+
+func TestBuildCompletionQueuesBackupUntilHashSlotAvailable(t *testing.T) {
+	root := t.TempDir()
+	dir := writeAdoptableBuildFixture(t, root, "tpl", "build-tpl")
+	result, err := readBuildMetaJSON(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks := make(chan backup.Task, 1)
+	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}}
+	m.SetBackupEnqueue(func(task backup.Task) error { tasks <- task; return nil })
+	slots := m.ensureRehashSlots()
+	for i := 0; i < cap(slots); i++ {
+		slots <- struct{}{}
+	}
+	rec, err := m.registerBuild("build-tpl", "tpl", 1, 1024, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		m.completeBuildAndScheduleBackup("build-tpl", rec, result, nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("completion blocked on occupied hashing slots")
+	}
+	if snap, ok := m.GetBuildStatus("build-tpl"); !ok || snap.Status != BuildStatusReady {
+		t.Fatalf("completed status = %+v, found = %t", snap, ok)
+	}
+	select {
+	case <-tasks:
+		t.Fatal("backup started without a hashing slot")
+	default:
+	}
+	for i := 0; i < cap(slots); i++ {
+		<-slots
+	}
+	select {
+	case <-tasks:
+	case <-time.After(10 * time.Second):
+		t.Fatal("completed build was not backed up after hashing capacity returned")
+	}
+}
+
 // A required artifact that is absent before enumeration never reaches the
 // hasher, so the hashed set looks internally complete while build.meta.json
 // knows better. The declared set is the completeness authority: a missing

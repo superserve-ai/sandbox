@@ -24,6 +24,9 @@ import (
 
 // BuildTemplateRequest is the input to Manager.BuildTemplate.
 type BuildTemplateRequest struct {
+	admit     func() error
+	slotIndex *int
+
 	// TemplateID is the key under which the produced snapshot is registered
 	// in the templates map. Typically the template_id from the DB row.
 	TemplateID string
@@ -88,6 +91,19 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 	if buildVMID == "" {
 		buildVMID = defaultBuildVMID(req.TemplateID)
 	}
+	// Reserve through the existing allocator before acknowledging the new
+	// protocol; a capacity rejection must not consume an execution attempt.
+	if req.admit != nil {
+		slotIndex, err := m.netMgr.ClaimFreshSlot(buildVMID)
+		if err != nil {
+			return "", status.Errorf(codes.ResourceExhausted, "reserve build network slot: %v", err)
+		}
+		req.slotIndex = &slotIndex
+		if err := req.admit(); err != nil {
+			m.netMgr.ReleaseSlot(buildVMID, slotIndex)
+			return "", err
+		}
+	}
 	// Fresh context so the build survives the caller's HTTP request
 	// ending. CancelBuild is what stops it.
 	buildCtx, cancel := context.WithCancel(context.Background())
@@ -103,6 +119,9 @@ func (m *Manager) BuildTemplate(ctx context.Context, req BuildTemplateRequest) (
 		return m.prepareBuildDir(req.TemplateID, buildVMID)
 	})
 	if err != nil {
+		if req.slotIndex != nil {
+			m.netMgr.ReleaseSlot(buildVMID, *req.slotIndex)
+		}
 		cancel()
 		return "", err
 	}
@@ -206,20 +225,27 @@ func (m *Manager) prepareBuildDir(templateID, buildVMID string) error {
 // records the outcome in the registry. Never returns an error — all failures
 // are logged and surfaced via completeBuild so GetBuildStatus sees them.
 func (m *Manager) buildTemplateWorker(ctx context.Context, buildVMID string, req BuildTemplateRequest, rec *buildRecord) {
-	// The WORKFLOW count holds until the worker returns (the build stays
-	// provisioning through its artifact hashing), but the memory/vCPU
-	// allocation releases when the last build VM exits — normally at the
-	// sync point inside buildTemplateSync, with this deferred call as the
-	// safety net for early error returns. Releasing allocation at worker
-	// return would publish a full VM's memory during a hash-only interval
-	// that can run for minutes.
+	// The memory/vCPU allocation releases when the last build VM exits —
+	// normally inside buildTemplateSync, with this deferred call as the
+	// safety net for early error returns.
 	// Last to run: the id stays reserved until this worker, and the
 	// subprocess it waited for, are gone.
-	defer close(rec.workerDone)
-	defer m.buildPressureCount.Add(-1)
+	defer m.finishBuildWorker(rec)
+	if req.slotIndex != nil {
+		defer m.netMgr.ReleaseSlot(buildVMID, *req.slotIndex)
+	}
 	defer m.releaseBuildAlloc(rec, req.VCPU, req.MemoryMiB)
 	result, err := m.buildTemplateSync(ctx, buildVMID, req, rec)
+	m.completeBuildAndScheduleBackup(buildVMID, rec, result, err)
+}
+
+func (m *Manager) completeBuildAndScheduleBackup(buildVMID string, rec *buildRecord, result *BuildTemplateResult, err error) {
 	m.completeBuild(buildVMID, rec, result, err)
+	if err == nil {
+		if snap, ok := m.GetBuildStatus(buildVMID); ok && snap.Status == BuildStatusReady && snap.Result == result {
+			m.reconcileAdoptedBuildBackup(snap)
+		}
+	}
 }
 
 // buildTemplateSync delegates the build to the template-builder subprocess.
@@ -238,9 +264,15 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	// Claim a slot from vmd's authoritative allocator so the subprocess's
 	// ns-<idx>/veth-<idx> can't collide with a sandbox slot, and release it (with
 	// any kernel residue) when the build exits — success, failure, or panic.
-	slotIndex, err := m.netMgr.ClaimFreshSlot(buildVMID)
-	if err != nil {
-		return nil, fmt.Errorf("reserve build network slot: %w", err)
+	var slotIndex int
+	if req.slotIndex != nil {
+		slotIndex = *req.slotIndex
+	} else {
+		var err error
+		slotIndex, err = m.netMgr.ClaimFreshSlot(buildVMID)
+		if err != nil {
+			return nil, fmt.Errorf("reserve build network slot: %w", err)
+		}
 	}
 	slotReleased := false
 	releaseSlot := func() {
@@ -314,26 +346,13 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 
 	// The subprocess is gone and the recording VM claims its own slot, so
 	// the build's ns-<idx>/veth-<idx> reservation guards nothing anymore.
-	// Release it before the hashing below: holding a network slot through
-	// minutes of disk reads would shrink sandbox capacity for no reason.
+	// Release it before completing the build and scheduling backup: holding
+	// a network slot through disk reads would shrink sandbox capacity.
 	// The memory/vCPU pressure allocation returns at the same moment and
 	// for the same reason: every build VM is gone (a recorder whose
 	// teardown failed is counted by the instance loop from here on).
 	releaseSlot()
 	m.releaseBuildAlloc(rec, req.VCPU, req.MemoryMiB)
-
-	// Durability: hash the finished artifact set (access.log included when
-	// recorded above), stamp the digests into build.meta.json, and enqueue
-	// the build for backup. Best-effort by design: the artifacts on disk
-	// are valid regardless, so nothing in here fails the build.
-	//
-	// Deliberately synchronous: the build is reported ready only after its
-	// integrity record exists, at the cost of the completion (and any
-	// supervisor timeout budget) covering up to the hash budget for large
-	// artifact sets. The duration is logged so that tradeoff stays visible.
-	hashStart := time.Now()
-	m.backupBuildArtifacts(ctx, req.TemplateID, buildVMID, snapshotDir, result.BasePath, nil, log)
-	log.Info().Dur("backup_hash", time.Since(hashStart)).Msg("build backup pass finished")
 
 	log.Info().Dur("total", time.Since(buildStart)).Msg("template build complete")
 	return result, nil
@@ -374,8 +393,7 @@ func physicalAllocatedBytes(path string) int64 {
 func (m *Manager) backupBuildArtifacts(ctx context.Context, templateID, buildVMID, snapshotDir, basePath string, guard func() bool, log zerolog.Logger) {
 	// No enqueue hook means backup is disabled on this host (BACKUP_BUCKET
 	// unset). Bail before any hashing: the digests exist to feed the backup
-	// journal, and with no consumer the only effect would be delaying every
-	// successful build by up to buildHashBudget plus the metadata hash.
+	// journal, and with no consumer the work has no useful effect.
 	// Same gate as the pause path, just hoisted ahead of the hashing
 	// instead of inside the enqueue.
 	if m.backupEnqueue == nil {
@@ -446,16 +464,21 @@ func (m *Manager) finishBuildBackupEnqueue(ctx context.Context, templateID, buil
 		log.Warn().Err(err).Msg("hashing build.meta.json failed; build not enqueued for backup")
 		return
 	}
+	allocated := int64(-1)
+	if value, ok := allocatedBytes(metaPath); ok {
+		allocated = value
+	}
 	entries = append(entries, ManifestEntry{
-		FileName:  buildMetaFilename,
-		Path:      metaPath,
-		SizeBytes: size,
-		SHA256:    sum,
+		FileName:       buildMetaFilename,
+		Path:           metaPath,
+		SizeBytes:      size,
+		AllocatedBytes: allocated,
+		SHA256:         sum,
 	})
 	if guard != nil && !guard() {
 		return
 	}
-	if m.enqueueTemplateBackup(templateID, buildVMID, entries) {
+	if m.enqueueTemplateBackup(templateID, buildVMID, snapshotDir, entries) {
 		return
 	}
 	// Only the journal write failed; the digests in hand describe the
@@ -466,15 +489,15 @@ func (m *Manager) finishBuildBackupEnqueue(ctx context.Context, templateID, buil
 	// the stamped meta IS the durable retry state, and the template sweep
 	// (this process or the next) rebuilds this exact task from it.
 	log.Warn().Msg("template backup journal write failed; retrying enqueue")
-	go m.retryTemplateEnqueue(templateID, buildVMID, entries, log)
+	go m.retryTemplateEnqueue(templateID, buildVMID, snapshotDir, entries, log)
 }
 
 // retryTemplateEnqueue re-attempts a template build's journal write with
 // bounded backoff. Exhausted retries are logged at error level and left
 // to the periodic template sweep, which re-reconciles every uncovered
 // ready build from its stamped meta, in this process and after restarts.
-func (m *Manager) retryTemplateEnqueue(templateID, buildVMID string, entries []ManifestEntry, log zerolog.Logger) {
-	if retryWithBackoff(func() bool { return m.enqueueTemplateBackup(templateID, buildVMID, entries) }) {
+func (m *Manager) retryTemplateEnqueue(templateID, buildVMID, snapshotDir string, entries []ManifestEntry, log zerolog.Logger) {
+	if retryWithBackoff(func() bool { return m.enqueueTemplateBackup(templateID, buildVMID, snapshotDir, entries) }) {
 		log.Info().Msg("template backup enqueued after retry")
 		return
 	}
@@ -516,8 +539,7 @@ func (m *Manager) buildActive(buildVMID string) bool {
 // such a template would stay unbacked until rebuilt. One in-flight worker
 // per build id, asynchronous so adoption (a status read path) is never
 // serialized behind hash budgets, and routed through the shared rehash
-// slots so a backlog of adopted builds cannot saturate disk bandwidth
-// (skipped workers are retried by the periodic template sweep).
+// slots so a backlog of adopted builds cannot saturate disk bandwidth.
 //
 // Rebuilds can legitimately reuse a build id (the default id is
 // build-<templateID>) and therefore the same directory. A worker that
@@ -546,14 +568,9 @@ func (m *Manager) reconcileAdoptedBuildBackup(snap BuildStatusSnapshot) {
 }
 
 // reconcileAdoptedBuildBackupMode reconciles with the caller's choice of
-// slot policy. The sweep passes waitForSlot=true: its glob order is
-// deterministic, so a non-blocking drop would let the same early-sorted
-// builds consume the slots every pass and starve a later build forever;
-// blocking guarantees every match is processed each sweep, still bounded
-// by the slot count (covered builds hold a slot for milliseconds). The
-// request-path caller keeps the non-blocking drop, since an API call
-// must not park behind multi-GB hash work; the sweep covers whatever it
-// drops.
+// slot policy. The sweep waits in glob order so every match gets a turn.
+// Request-path callers queue the wait in a goroutine, leaving status and
+// completion reads independent of hashing capacity.
 func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, waitForSlot bool) {
 	if m.backupEnqueue == nil || snap.Status != BuildStatusReady || snap.Result == nil {
 		return
@@ -571,14 +588,9 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 	}
 	slots := m.ensureRehashSlots()
 	if waitForSlot {
-		slots <- struct{}{}
-	} else {
 		select {
 		case slots <- struct{}{}:
-		default:
-			// All rehash slots busy: drop this attempt rather than
-			// queueing unbounded hash work; the sweep retries uncovered
-			// builds.
+		case <-rctx.Done():
 			close(handle.done)
 			rcancel()
 			m.adoptedBuildBackups.Delete(inflightKey)
@@ -591,11 +603,18 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 	log := m.log.With().Str("template_id", templateID).Str("build_vm_id", buildVMID).Logger()
 	go func() {
 		defer func() {
-			<-slots
 			close(handle.done)
 			rcancel()
 			m.adoptedBuildBackups.Delete(inflightKey)
 		}()
+		if !waitForSlot {
+			select {
+			case slots <- struct{}{}:
+			case <-rctx.Done():
+				return
+			}
+		}
+		defer func() { <-slots }()
 		metaID, err := baseIdentity(metaPath)
 		if err != nil {
 			log.Warn().Err(err).Msg("adopted build meta unreadable; reconcile skipped")
@@ -652,11 +671,16 @@ func (m *Manager) reconcileAdoptedBuildBackupMode(snap BuildStatusSnapshot, wait
 				m.backupBuildArtifacts(rctx, templateID, buildVMID, dir, res.BasePath, guard, log)
 				return
 			}
+			allocated := int64(-1)
+			if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+				allocated = stat.Blocks * 512
+			}
 			entries = append(entries, ManifestEntry{
-				FileName:  d.Name,
-				Path:      path,
-				SizeBytes: d.SizeBytes,
-				SHA256:    d.SHA256,
+				FileName:       d.Name,
+				Path:           path,
+				SizeBytes:      d.SizeBytes,
+				AllocatedBytes: allocated,
+				SHA256:         d.SHA256,
 			})
 		}
 		log.Info().Int("files", len(entries)).

@@ -28,12 +28,13 @@ import (
 // extent tables. A generation without its manifest object is incomplete
 // and never restored from.
 type GenerationManifest struct {
-	SandboxID  string         `json:"sandbox_id,omitempty"`
-	TemplateID string         `json:"template_id,omitempty"`
-	BuildID    string         `json:"build_id,omitempty"`
-	Generation string         `json:"generation"`
-	Files      []ManifestFile `json:"files"`
-	VMDVersion string         `json:"vmd_version,omitempty"`
+	TemplateRuntime *TemplateRuntime `json:"template_runtime,omitempty"`
+	SandboxID       string           `json:"sandbox_id,omitempty"`
+	TemplateID      string           `json:"template_id,omitempty"`
+	BuildID         string           `json:"build_id,omitempty"`
+	Generation      string           `json:"generation"`
+	Files           []ManifestFile   `json:"files"`
+	VMDVersion      string           `json:"vmd_version,omitempty"`
 }
 
 // ManifestFile describes one packed artifact object. Object is the exact
@@ -41,10 +42,12 @@ type GenerationManifest struct {
 // fingerprint: the extent table in this entry describes that object and
 // no other, even across retries that repacked a physically changed file.
 type ManifestFile struct {
-	Name   string `json:"name"`
-	Object string `json:"object"`
-	SHA256 string `json:"sha256"` // digest of the full apparent content
-	Size   int64  `json:"size"`   // apparent size
+	RuntimePath    string `json:"runtime_path,omitempty"`
+	Name           string `json:"name"`
+	Object         string `json:"object"`
+	SHA256         string `json:"sha256"` // digest of the full apparent content
+	Size           int64  `json:"size"`   // apparent size
+	AllocatedBytes int64  `json:"allocated_bytes,omitempty"`
 	// BasePath records an overlay's base-image dependency: the overlay's
 	// holes are backed by this file's contents, so a restore of the
 	// overlay alone is incomplete without it (the consistency-pair rule).
@@ -615,11 +618,12 @@ func (t *Task) ReportedFiles() []TaskFile {
 // error paths included (dedupes and skips add nothing).
 func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, finalized []TaskFile, streamed int64, _ error) {
 	gen := GenerationManifest{
-		SandboxID:  task.SandboxID,
-		TemplateID: task.TemplateID,
-		BuildID:    task.BuildID,
-		Generation: task.Generation,
-		VMDVersion: u.VMDVersion,
+		TemplateRuntime: task.TemplateRuntime,
+		SandboxID:       task.SandboxID,
+		TemplateID:      task.TemplateID,
+		BuildID:         task.BuildID,
+		Generation:      task.Generation,
+		VMDVersion:      u.VMDVersion,
 	}
 	uploadedBases := map[string]bool{}
 	// objectPaths mirrors gen.Files entry for entry with the exact bucket
@@ -713,7 +717,17 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 		if created {
 			object = objectPaths[i]
 		}
+		var runtimePath string
+		var allocated int64
+		for _, source := range task.Files {
+			if source.Name == mf.Name {
+				runtimePath = source.RuntimePath
+				allocated = source.AllocatedBytes
+				break
+			}
+		}
 		finalized = append(finalized, TaskFile{
+			RuntimePath: runtimePath, AllocatedBytes: allocated,
 			Name: mf.Name, SHA256: mf.SHA256, Size: mf.Size,
 			BasePath: mf.BasePath, BaseSHA256: mf.BaseSHA256,
 			Shared: strings.HasPrefix(mf.Object, "bases/"),
@@ -965,12 +979,13 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 			u.Log.Info().Str("object", object).
 				Msg("shared object verified previously; skipping stream")
 			return ManifestFile{
-				Name:       file.Name,
-				Object:     objectName,
-				SHA256:     file.SHA256,
-				Size:       apparent,
-				PackedSize: PackedSize(extents),
-				Extents:    extents,
+				RuntimePath: file.RuntimePath, Name: file.Name,
+				Object:         objectName,
+				SHA256:         file.SHA256,
+				Size:           apparent,
+				AllocatedBytes: file.AllocatedBytes,
+				PackedSize:     PackedSize(extents),
+				Extents:        extents,
 			}, object, 0, nil
 		}
 	}
@@ -1106,14 +1121,15 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		task.VerifiedObjects = next.VerifiedObjects
 	}
 	return ManifestFile{
-		Name:       file.Name,
-		Object:     objectName,
-		SHA256:     file.SHA256,
-		BasePath:   file.BasePath,
-		BaseSHA256: file.BaseSHA256,
-		Size:       apparent,
-		PackedSize: PackedSize(extents),
-		Extents:    extents,
+		RuntimePath: file.RuntimePath, Name: file.Name,
+		Object:         objectName,
+		SHA256:         file.SHA256,
+		BasePath:       file.BasePath,
+		BaseSHA256:     file.BaseSHA256,
+		Size:           apparent,
+		AllocatedBytes: file.AllocatedBytes,
+		PackedSize:     PackedSize(extents),
+		Extents:        extents,
 	}, object, shipped, nil
 }
 

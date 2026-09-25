@@ -1434,8 +1434,12 @@ func rebuildTask(vmID string, manifest []ManifestEntry, prio backup.Priority, pa
 // owns retrying a failed write. Template builds ride the checkpoint
 // priority: a template is rebuildable, so a multi-GiB build upload must
 // never head-of-line block a pause generation, which is unique user data.
-func (m *Manager) enqueueTemplateBackup(templateID, buildID string, manifest []ManifestEntry) bool {
+func (m *Manager) enqueueTemplateBackup(templateID, buildID, snapshotDir string, manifest []ManifestEntry) bool {
 	if m.backupEnqueue == nil || len(manifest) == 0 {
+		return false
+	}
+	runtime, err := readBuildMetaJSON(snapshotDir)
+	if err != nil {
 		return false
 	}
 	files := make([]backup.TaskFile, 0, len(manifest))
@@ -1447,13 +1451,17 @@ func (m *Manager) enqueueTemplateBackup(templateID, buildID string, manifest []M
 		// uploader also ship it as a shared bases/ object: the same bytes
 		// twice.
 		files = append(files, backup.TaskFile{
-			Name:   e.FileName,
+			Name:        e.FileName,
+			RuntimePath: e.Path, AllocatedBytes: e.AllocatedBytes,
 			Path:   e.Path,
 			SHA256: e.SHA256,
 			Size:   e.SizeBytes,
 		})
 	}
 	task := backup.Task{
+		BuildIncarnation: m.buildIncarnation,
+		TemplateRuntime: &backup.TemplateRuntime{RootfsPath: runtime.RootfsPath, SnapshotPath: runtime.SnapshotPath,
+			MemPath: runtime.MemFilePath, BasePath: runtime.BasePath, DeltaPath: runtime.DeltaPath, SizeBytes: runtime.SizeBytes},
 		TemplateID: templateID,
 		BuildID:    buildID,
 		Generation: backup.GenerationKey(files),

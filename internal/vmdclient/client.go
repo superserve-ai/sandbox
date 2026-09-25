@@ -211,6 +211,7 @@ type DirEntry struct {
 // BuildLogEvent is one decoded event from StreamBuildLogs. Finished=true
 // signals the build reached a terminal status and the stream has closed.
 type BuildLogEvent struct {
+	Sequence           uint64
 	TimestampUnixNanos int64
 	Stream             string // "stdout" | "stderr" | "system"
 	Text               string
