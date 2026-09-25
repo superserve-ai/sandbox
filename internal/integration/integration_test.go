@@ -37,6 +37,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/promotiontest"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
@@ -81,6 +82,10 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "migration failed: %v\n", err)
 		os.Exit(1)
 	}
+	if err := promotiontest.Install(ctx, testPool); err != nil {
+		fmt.Fprintf(os.Stderr, "install trusted identity fixture: %v\n", err)
+		os.Exit(1)
+	}
 
 	testQueries = db.New(testPool)
 
@@ -101,7 +106,7 @@ func TestMain(m *testing.M) {
 }
 
 func resetTestSchema(ctx context.Context, pool *pgxpool.Pool) error {
-	_, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
+	_, err := pool.Exec(ctx, `DROP SCHEMA IF EXISTS promotion_auth CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public;`)
 	return err
 }
 
@@ -1112,6 +1117,7 @@ func seedTeamAndKeyWithRole(t *testing.T, roleName string) (uuid.UUID, string, u
 	if err != nil {
 		t.Fatalf("seedTeamAndKeyWithRole: create team: %v", err)
 	}
+	seedHistoricalTeam(t, team.ID)
 	if _, err := testPool.Exec(ctx, `
 		DELETE FROM team_credit_grant
 		WHERE team_id = $1 AND reason = 'signup trial credit'
@@ -1227,6 +1233,7 @@ func seedTeamAndKeyNoCreator(t *testing.T) (uuid.UUID, string) {
 	if err != nil {
 		t.Fatalf("seedTeamAndKeyNoCreator: create team: %v", err)
 	}
+	seedHistoricalTeam(t, team.ID)
 
 	rawKey := "sk-test-" + uuid.New().String()
 	hash := sha256.Sum256([]byte(rawKey))
@@ -1280,6 +1287,7 @@ func seedTeamKeyAndProfile(t *testing.T) (uuid.UUID, string, uuid.UUID) {
 	if err != nil {
 		t.Fatalf("seedTeamKeyAndProfile: create team: %v", err)
 	}
+	seedHistoricalTeam(t, team.ID)
 
 	profileID := uuid.New()
 	if _, err := testPool.Exec(ctx,
@@ -1324,6 +1332,15 @@ func seedTeamKeyAndProfile(t *testing.T) (uuid.UUID, string, uuid.UUID) {
 	}
 
 	return team.ID, rawKey, profileID
+}
+
+// Generic endpoint fixtures model existing teams, not unfinished Console signups.
+// Signup tests exercise the pending marker through the actual owner chain.
+func seedHistoricalTeam(t *testing.T, teamID uuid.UUID) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(), `DELETE FROM team_signup_trial_provenance WHERE team_id = $1`, teamID); err != nil {
+		t.Fatalf("seed historical team: %v", err)
+	}
 }
 
 func roleIDByName(ctx context.Context, roleName string) (uuid.UUID, error) {
@@ -1785,19 +1802,40 @@ func TestIntegration_GetBillingSummary(t *testing.T) {
 
 func TestIntegration_NewTeamReceivesSignupTrialCredit(t *testing.T) {
 	ctx := context.Background()
-	team, err := testQueries.CreateTeam(ctx, "trial-credit-"+uuid.NewString()[:8])
+	userID := uuid.New()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO profile (id, email)
+		VALUES ($1, $2)
+	`, userID, "trial-credit-"+uuid.NewString()[:8]+"@example.com"); err != nil {
+		t.Fatalf("create profile: %v", err)
+	}
+	// A prior $95 redemption must not consume the user's separate $5 claim.
+	stripeTeam, err := testQueries.CreateTeam(ctx, "trial-credit-stripe-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create Stripe redemption team: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO user_promotion_entitlement (user_id, stripe_redemption_at, stripe_redemption_team_id)
+		VALUES ($1, now(), $2)
+	`, userID, stripeTeam.ID); err != nil {
+		t.Fatalf("seed Stripe redemption: %v", err)
+	}
+	// Membership in an existing team (including an invited-team flow) must not
+	// consume the creator's personal signup trial.
+	joinedTeam, err := testQueries.CreateTeam(ctx, "trial-credit-joined-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create joined team: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_memberships (team_id, user_id, status)
+		VALUES ($1, $2, 'active')
+	`, joinedTeam.ID, userID); err != nil {
+		t.Fatalf("create membership: %v", err)
+	}
+	teamID, err := provisionTeamForUser(ctx, userID, "trial-credit-"+uuid.NewString()[:8])
 	if err != nil {
 		t.Fatalf("create team: %v", err)
 	}
-	teamID := team.ID
-	profileID := uuid.New()
-	if _, err := testPool.Exec(ctx, `INSERT INTO profile (id, email) VALUES ($1, $2)`, profileID, profileID.String()+"@example.com"); err != nil {
-		t.Fatalf("create profile: %v", err)
-	}
-	if _, err := testPool.Exec(ctx, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, teamID, profileID); err != nil {
-		t.Fatalf("create membership: %v", err)
-	}
-
 	var amount, remaining float64
 	if err := testPool.QueryRow(ctx, `
 		SELECT amount_usd, remaining_usd
@@ -1809,6 +1847,195 @@ func TestIntegration_NewTeamReceivesSignupTrialCredit(t *testing.T) {
 	if amount != 5 || remaining != 5 {
 		t.Fatalf("signup trial credit = (%v, %v), want (5, 5)", amount, remaining)
 	}
+	var ownerMemberships, ownerAssignments int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM team_member legacy
+		JOIN team_memberships membership
+		  ON membership.team_id = legacy.team_id
+		 AND membership.user_id = legacy.profile_id
+		WHERE legacy.team_id = $1 AND legacy.profile_id = $2
+		  AND legacy.role = 'owner' AND membership.status = 'active'
+	`, teamID, userID).Scan(&ownerMemberships); err != nil {
+		t.Fatalf("check creator provisioning chain: %v", err)
+	}
+	if ownerMemberships != 1 {
+		t.Fatalf("creator provisioning chain rows = %d, want 1", ownerMemberships)
+	}
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM user_role_assignments assignment
+		JOIN roles role ON role.id = assignment.role_id
+		WHERE assignment.team_id = $1 AND assignment.user_id = $2
+		  AND assignment.scope_type = 'team' AND assignment.revoked_at IS NULL
+		  AND role.name = 'team_owner'
+	`, teamID, userID).Scan(&ownerAssignments); err != nil {
+		t.Fatalf("check creator role assignment: %v", err)
+	}
+	if ownerAssignments != 1 {
+		t.Fatalf("creator role assignments = %d, want 1", ownerAssignments)
+	}
+	var claimedTeamID, redeemedTeamID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		SELECT c.team_id, e.stripe_redemption_team_id
+		FROM user_signup_trial_claim c
+		JOIN user_promotion_entitlement e ON e.user_id = c.user_id
+		WHERE c.user_id = $1
+	`, userID).Scan(&claimedTeamID, &redeemedTeamID); err != nil {
+		t.Fatalf("load independent promotion claims: %v", err)
+	}
+	if claimedTeamID != teamID || redeemedTeamID != stripeTeam.ID {
+		t.Fatalf("promotion claims = (%s, %s), want (%s, %s)", claimedTeamID, redeemedTeamID, teamID, stripeTeam.ID)
+	}
+	var joinedGrantCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'
+	`, joinedTeam.ID).Scan(&joinedGrantCount); err != nil {
+		t.Fatalf("count joined-team signup trial grants: %v", err)
+	}
+	if joinedGrantCount != 0 {
+		t.Fatalf("joined-team signup trial grant count = %d, want 0", joinedGrantCount)
+	}
+
+	// A second team for the same user must not receive another grant.
+	secondTeamID, err := provisionTeamForUser(ctx, userID, "trial-credit-second-"+uuid.NewString()[:8])
+	if err != nil {
+		t.Fatalf("create second team: %v", err)
+	}
+	var grantCount int
+	if err := testPool.QueryRow(ctx, `
+		SELECT count(*) FROM team_credit_grant
+		WHERE team_id IN ($1, $2) AND reason = 'signup trial credit'
+	`, teamID, secondTeamID).Scan(&grantCount); err != nil {
+		t.Fatalf("count signup trial grants: %v", err)
+	}
+	if grantCount != 1 {
+		t.Fatalf("signup trial grant count = %d, want 1", grantCount)
+	}
+	var secondTeamEligible bool
+	if err := testPool.QueryRow(ctx, `SELECT team_sandbox_billing_eligible($1)`, secondTeamID).Scan(&secondTeamEligible); err != nil {
+		t.Fatalf("check repeat-team eligibility: %v", err)
+	}
+	if secondTeamEligible {
+		t.Fatal("repeat-created team remains eligible without a signup grant")
+	}
+
+	// A failed claim (the profile FK is invalid) must roll back the team row.
+	failedName := "trial-credit-rollback-" + uuid.NewString()[:8]
+	if _, err := provisionTeamForUser(ctx, uuid.New(), failedName); err == nil {
+		t.Fatal("create with invalid profile: expected error")
+	}
+	var rolledBackCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE name = $1`, failedName).Scan(&rolledBackCount); err != nil {
+		t.Fatalf("check rolled-back team: %v", err)
+	}
+	if rolledBackCount != 0 {
+		t.Fatalf("rolled-back team count = %d, want 0", rolledBackCount)
+	}
+
+	// A failure after the claim RPC, while the provisioning chain is still in
+	// flight, must roll back both the team and the user's entitlement.
+	rollbackUser := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO profile (id, email) VALUES ($1, $2)`, rollbackUser, "trial-credit-chain-rollback-"+uuid.NewString()[:8]+"@example.com"); err != nil {
+		t.Fatalf("create rollback profile: %v", err)
+	}
+	failedChainName := "trial-credit-chain-rollback-" + uuid.NewString()[:8]
+	if _, err := provisionTeamForUserAfterClaimFailure(ctx, rollbackUser, failedChainName); err == nil {
+		t.Fatal("failed provisioning chain: expected error")
+	}
+	var chainRollbackCount, chainClaimCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE name = $1`, failedChainName).Scan(&chainRollbackCount); err != nil {
+		t.Fatalf("check chain-rolled-back team: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM user_signup_trial_claim WHERE user_id = $1`, rollbackUser).Scan(&chainClaimCount); err != nil {
+		t.Fatalf("check preserved signup claim: %v", err)
+	}
+	if chainRollbackCount != 0 || chainClaimCount != 0 {
+		t.Fatalf("post-claim rollback state = (team %d, claims %d), want (0, 0)", chainRollbackCount, chainClaimCount)
+	}
+
+	// Concurrent provisioning for a fresh user must still produce one claim
+	// and one grant, even though every team insert succeeds.
+	concurrentUser := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO profile (id, email) VALUES ($1, $2)`, concurrentUser, "trial-credit-concurrent-"+uuid.NewString()[:8]+"@example.com"); err != nil {
+		t.Fatalf("create concurrent profile: %v", err)
+	}
+	const concurrentCreates = 4
+	errs := make(chan error, concurrentCreates)
+	for i := 0; i < concurrentCreates; i++ {
+		go func() {
+			_, err := provisionTeamForUser(context.Background(), concurrentUser, "trial-credit-concurrent-owned-"+uuid.NewString()[:8])
+			errs <- err
+		}()
+	}
+	for i := 0; i < concurrentCreates; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent team creation: %v", err)
+		}
+	}
+	var entitlementCount, concurrentGrantCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM user_signup_trial_claim WHERE user_id = $1`, concurrentUser).Scan(&entitlementCount); err != nil {
+		t.Fatalf("count concurrent entitlement: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM team_credit_grant g JOIN user_signup_trial_claim c ON c.team_id = g.team_id WHERE c.user_id = $1 AND g.reason = 'signup trial credit'`, concurrentUser).Scan(&concurrentGrantCount); err != nil {
+		t.Fatalf("count concurrent grants: %v", err)
+	}
+	if entitlementCount != 1 || concurrentGrantCount != 1 {
+		t.Fatalf("concurrent entitlement/grant counts = (%d, %d), want (1, 1)", entitlementCount, concurrentGrantCount)
+	}
+}
+
+// The control-plane provisioning boundary keeps the team, claim, and owner
+// chain in one transaction after authenticating the actor.
+func provisionTeamForUser(ctx context.Context, userID uuid.UUID, name string) (uuid.UUID, error) {
+	return provisionTeamForUserWithFailure(ctx, userID, name, false)
+}
+
+func provisionTeamForUserWithFailure(ctx context.Context, userID uuid.UUID, name string, failAfterMembership bool) (uuid.UUID, error) {
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	defer tx.Rollback(ctx)
+	team, err := testQueries.WithTx(tx).CreateTeamForUser(ctx, db.CreateTeamForUserParams{
+		Name:   name,
+		UserID: userID,
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO team_member (team_id, profile_id, role)
+		VALUES ($1, $2, 'owner')
+	`, team.ID, userID); err != nil {
+		return uuid.Nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO team_memberships (team_id, user_id, status)
+		VALUES ($1, $2, 'active')
+	`, team.ID, userID); err != nil {
+		return uuid.Nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO user_role_assignments (user_id, role_id, scope_type, team_id)
+		SELECT $1, id, 'team', $2
+		FROM roles
+		WHERE name = 'team_owner'
+	`, userID, team.ID); err != nil {
+		return uuid.Nil, err
+	}
+	if failAfterMembership {
+		return team.ID, fmt.Errorf("simulated provisioning chain failure")
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return uuid.Nil, err
+	}
+	return team.ID, nil
+}
+
+func provisionTeamForUserAfterClaimFailure(ctx context.Context, userID uuid.UUID, name string) (uuid.UUID, error) {
+	return provisionTeamForUserWithFailure(ctx, userID, name, true)
 }
 
 func TestIntegration_ExpiredSignupTrialIsBillingIneligible(t *testing.T) {
@@ -2012,12 +2239,10 @@ func TestIntegration_GetBillingSummaryUsesActiveBillingPeriod(t *testing.T) {
 func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) {
 	ctx := context.Background()
 	teamID, ownerKey := seedTeamAndKey(t)
-	now := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
-	r := newRouterWithNow(t, func() time.Time { return now })
+	routerNow := time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC)
+	r := newRouterWithNow(t, func() time.Time { return routerNow })
 
-	// Keep the anchor safely behind the test clock so this assertion remains
-	// stable as the calendar advances past the original fixed fixture date.
-	anchor := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
+	anchor := routerNow.Add(-24 * time.Hour).Truncate(time.Second)
 	reportingStart := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	reportingEnd := reportingStart.AddDate(0, 1, 0)
 	if _, err := testQueries.ClaimTeamCommercialBillingAnchor(ctx, db.ClaimTeamCommercialBillingAnchorParams{
@@ -2051,7 +2276,7 @@ func TestIntegration_GetBillingSummaryUsesCommercialBillingAnchor(t *testing.T) 
 	}
 	// The summary reports the anniversary period containing the router's
 	// clock, which rolls forward a month at a time from the anchor.
-	wantStart, wantEnd, anchored := billing.AnniversaryPeriod(anchor, now)
+	wantStart, wantEnd, anchored := billing.AnniversaryPeriod(anchor, routerNow)
 	if !anchored {
 		t.Fatalf("anchor %s is not yet in effect", anchor)
 	}

@@ -2,13 +2,13 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"math/big"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +20,43 @@ import (
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+func TestStripePromotionReservationErrorsKeepCleanupIdentityAfterAttempt(t *testing.T) {
+	teamID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
+	userID := uuid.MustParse("00000000-0000-0000-0000-000000000002")
+	original := errors.New("finalization failed")
+	err := wrapStripePromotionReservationError(original, true, teamID, userID)
+	var grantErr *stripePromotionGrantError
+	if !errors.As(err, &grantErr) {
+		t.Fatal("post-reservation failure lost cleanup identity")
+	}
+	if grantErr.TeamID != teamID || grantErr.UserID != userID {
+		t.Fatalf("cleanup identity = %s/%s, want %s/%s", grantErr.TeamID, grantErr.UserID, teamID, userID)
+	}
+	if !errors.Is(err, original) {
+		t.Fatal("wrapped failure did not preserve original error")
+	}
+}
+
+func TestStripePromotionRequestErrorPreservesEarlierAttempt(t *testing.T) {
+	teamID, userID := uuid.New(), uuid.New()
+	for _, message := range []string{"stripe returned 400", "stripe returned 401", "stripe returned 409", "stripe returned 429", "stripe returned 500", "transport timeout"} {
+		for _, previouslyAttempted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/previously_attempted=%t", message, previouslyAttempted), func(t *testing.T) {
+				original := errors.New(message)
+				err := wrapStripePromotionGrantRequestError(original, teamID, userID, previouslyAttempted)
+				var grantErr *stripePromotionGrantError
+				if !errors.As(err, &grantErr) || !errors.Is(err, original) || grantErr.TeamID != teamID || grantErr.UserID != userID {
+					t.Fatalf("lost reservation identity or original error: %v", err)
+				}
+				wantRelease := !previouslyAttempted && strings.Contains(message, "returned 4")
+				if grantErr.ReleaseReservation != wantRelease {
+					t.Fatalf("release reservation = %t, want %t", grantErr.ReleaseReservation, wantRelease)
+				}
+			})
+		}
+	}
+}
 
 func TestStripeMeterErrorDetailsExtractsThinEventRequest(t *testing.T) {
 	payload := json.RawMessage(`{"developer_message_summary":"There is 1 invalid event","reason":{"error_types":[{"sample_errors":[{"error_message":"invalid customer","request":{"idempotency_key":"meter-event:test"}}]}]}}`)
@@ -195,6 +232,7 @@ func (r *stripeMeterEventRoundTripper) RoundTrip(req *http.Request) (*http.Respo
 type stripeCheckoutSessionRoundTripper struct {
 	backdateStartDate string
 	clientReferenceID string
+	expiresAt         string
 }
 
 type stripeCreditBalanceRoundTripper struct {
@@ -350,12 +388,36 @@ func (r *stripeCheckoutSessionRoundTripper) RoundTrip(req *http.Request) (*http.
 	}
 	r.backdateStartDate = form.Get("subscription_data[backdate_start_date]")
 	r.clientReferenceID = form.Get("client_reference_id")
+	r.expiresAt = form.Get("expires_at")
 	return &http.Response{
 		StatusCode: http.StatusOK,
 		Body:       io.NopCloser(strings.NewReader(`{"id":"cs_test_123","url":"https://checkout.stripe.test/session"}`)),
 		Header:     make(http.Header),
 		Request:    req,
 	}, nil
+}
+
+func TestStripeCreateCheckoutSessionSendsExpiry(t *testing.T) {
+	transport := &stripeCheckoutSessionRoundTripper{}
+	client := &stripeHTTPClient{
+		baseURL:    "https://stripe.example.test",
+		secretKey:  "sk_test_example",
+		apiVersion: "2025-06-30",
+		httpClient: &http.Client{Transport: transport},
+	}
+	expiresAt := time.Unix(1_787_331_600, 0).UTC()
+	if _, err := client.CreateCheckoutSession(t.Context(), StripeCreateCheckoutSessionParams{
+		CustomerID: "cus_example",
+		SuccessURL: "https://app.superserve.test/billing/success",
+		CancelURL:  "https://app.superserve.test/billing/cancel",
+		PriceIDs:   []string{"price_cpu"},
+		ExpiresAt:  &expiresAt,
+	}); err != nil {
+		t.Fatalf("create checkout session: %v", err)
+	}
+	if transport.expiresAt != "1787331600" {
+		t.Fatalf("checkout expires_at = %q, want %q", transport.expiresAt, "1787331600")
+	}
 }
 
 func TestValidateBillingExportItemsRejectsNegativeValue(t *testing.T) {
@@ -385,6 +447,27 @@ func TestStripeMeterEventIdempotencyKeySeparatesPayloadFromIdentifier(t *testing
 	}
 	if got := stripeMeterEventIdempotencyKey(identifier, "memory_gib_hours", "cus_example", "1.000000000000", 3); got == first {
 		t.Fatal("changed timestamp reused the same idempotency key")
+	}
+}
+
+func TestCheckoutSessionIdempotencyKeyIsIndependentOfActor(t *testing.T) {
+	teamID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	first := checkoutSessionIdempotencyKey(teamID, "cus_example", "https://example.com/success", "https://example.com/cancel", []string{"price_basic"})
+	second := checkoutSessionIdempotencyKey(teamID, "cus_example", "https://example.com/success", "https://example.com/cancel", []string{"price_basic"})
+	if first != second {
+		t.Fatalf("checkout idempotency key changed between billing actors: %q != %q", first, second)
+	}
+}
+
+func TestCheckoutSessionIdempotencyKeyRotatesWithLeaseGeneration(t *testing.T) {
+	teamID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	start := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	first := checkoutSessionIdempotencyKeyForLease(teamID, "cus_example", "https://example.com/success", "https://example.com/cancel", []string{"price_basic"}, start)
+	if got := checkoutSessionIdempotencyKeyForLease(teamID, "cus_example", "https://example.com/success", "https://example.com/cancel", []string{"price_basic"}, start); got != first {
+		t.Fatalf("same lease generation changed idempotency key: %q != %q", got, first)
+	}
+	if got := checkoutSessionIdempotencyKeyForLease(teamID, "cus_example", "https://example.com/success", "https://example.com/cancel", []string{"price_basic"}, start.Add(24*time.Hour)); got == first {
+		t.Fatal("expired checkout lease reused the prior Stripe idempotency key")
 	}
 }
 
@@ -446,7 +529,7 @@ func TestStripeReportMeterEventUsesSeparateIdentifierAndIdempotencyKey(t *testin
 	}
 }
 
-func TestStripeCreateCheckoutSessionSendsBackdateStartDate(t *testing.T) {
+func TestStripeCreateCheckoutSessionOmitsSubscriptionBackdate(t *testing.T) {
 	transport := &stripeCheckoutSessionRoundTripper{}
 	client := &stripeHTTPClient{
 		baseURL:    "https://stripe.example.test",
@@ -454,43 +537,33 @@ func TestStripeCreateCheckoutSessionSendsBackdateStartDate(t *testing.T) {
 		apiVersion: "2025-06-30",
 		httpClient: &http.Client{Transport: transport},
 	}
-	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
 	if _, err := client.CreateCheckoutSession(t.Context(), StripeCreateCheckoutSessionParams{
 		CustomerID:        "cus_example",
 		SuccessURL:        "https://app.superserve.test/billing/success",
 		CancelURL:         "https://app.superserve.test/billing/cancel",
 		ClientReferenceID: "team_example",
 		PriceIDs:          []string{"price_cpu"},
-		BackdateStartDate: &anchor,
 		IdempotencyKey:    "checkout:test",
 	}); err != nil {
 		t.Fatalf("create checkout session: %v", err)
 	}
-	if transport.backdateStartDate != strconv.FormatInt(anchor.Unix(), 10) {
-		t.Fatalf("subscription backdate_start_date = %q, want %d", transport.backdateStartDate, anchor.Unix())
+	if transport.backdateStartDate != "" {
+		t.Fatalf("subscription backdate_start_date = %q, want it omitted", transport.backdateStartDate)
 	}
 	if transport.clientReferenceID != "team_example" {
 		t.Fatalf("client reference id = %q, want %q", transport.clientReferenceID, "team_example")
 	}
 }
 
-func TestCheckoutSessionIdempotencyKeyIncludesBackdateStartDate(t *testing.T) {
+func TestCheckoutSessionIdempotencyKeyIsIndependentOfSubscriptionBackdate(t *testing.T) {
 	teamID := uuid.MustParse("00000000-0000-0000-0000-000000000042")
 	customerID := "cus_example"
 	successURL := "https://app.superserve.test/billing/success"
 	cancelURL := "https://app.superserve.test/billing/cancel"
 	priceIDs := []string{"price_cpu"}
-	first := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs, nil)
-	if got := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs, nil); got != first {
+	first := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs)
+	if got := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs); got != first {
 		t.Fatalf("same checkout payload produced %q, want %q", got, first)
-	}
-	anchor := time.Date(2026, 8, 21, 17, 0, 0, 0, time.UTC)
-	withAnchor := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs, &anchor)
-	if withAnchor == first {
-		t.Fatal("checkout idempotency key ignored backdate start date")
-	}
-	if got := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs, &anchor); got != withAnchor {
-		t.Fatalf("same checkout payload with backdate produced %q, want %q", got, withAnchor)
 	}
 }
 

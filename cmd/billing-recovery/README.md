@@ -30,7 +30,11 @@ The repair records a subscription-event watermark while holding that lock, so
 older delayed webhook deliveries cannot overwrite the recovered projection.
 Canceled, replaced, excluded, or uncertain accounts are reported and skipped.
 The command is repeatable: an existing verified $95 grant is reconciled
-locally, and a missing grant uses the same team-scoped Stripe idempotency key.
+locally when no user promotion or checkout actor is associated with the team.
+It does not create missing grants. An active subscription can legitimately
+have no grant when its activating user is ineligible or unknown. Missing grants
+and user promotion state are reported unresolved and require the normal
+webhook reconciliation workflow, which owns the user and team reservations.
 Grant evidence must also declare metered applicability. When the local grant ID
 is absent, recovery requires the team-scoped activation identity marker; a
 category/amount-only grant is reported unresolved rather than guessed.

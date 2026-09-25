@@ -10,6 +10,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -99,6 +100,11 @@ func run(ctx context.Context, cfg config) error {
 		}
 	}
 
+	if cfg.phase == phaseCopy || cfg.phase == phaseDetach || cfg.phase == phasePurge {
+		if err := checkCanonicalMigrationPrivileges(ctx, dst); err != nil {
+			return err
+		}
+	}
 	var teamName string
 	if err := src.QueryRow(ctx, `SELECT name FROM team WHERE id = $1`, cfg.teamID).Scan(&teamName); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -427,18 +433,43 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 		return fmt.Errorf("dest host %q is in region %q, not --dest-region %q", cfg.destHostID, hostRegion, cfg.destRegion)
 	}
 
-	transforms, err := buildTransforms(ctx, src, dst, cfg)
+	// Commit the source-only fence first so a failed or interrupted copy cannot
+	// reopen source admission after destination ownership has become reachable.
+	if err := fenceSourcePromotionMigration(ctx, src, cfg.teamID); err != nil {
+		return err
+	}
+	sourceTx, err := src.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin source promotion snapshot: %w", err)
+	}
+	defer sourceTx.Rollback(ctx)
+	if err := lockSourcePromotionMigration(ctx, sourceTx, cfg.teamID); err != nil {
+		return err
+	}
+	transforms, err := buildTransforms(ctx, sourceTx, dst, cfg)
 	if err != nil {
 		return err
 	}
 
 	var totalCopied, totalSkipped int64
 	for _, t := range migratedTables {
-		copied, skipped, err := copyTable(ctx, src, dst, t, cfg.teamID, transforms[t.name])
+		copied, skipped, err := copyTable(ctx, sourceTx, dst, t, cfg.teamID, transforms[t.name])
 		if err == nil && t.name == "team" {
-			// Team creation in a current cell provisions the signup grant. A
-			// migration must preserve the source ledger exactly, so remove the
-			// destination-side default before team_credit_grant is copied.
+			// Copied owner roles must not redeem a new signup promotion in the
+			// destination. Older cells may not yet have the pending bridge.
+			var hasTrialProvenance bool
+			if herr := dst.QueryRow(ctx, `SELECT to_regclass('public.team_signup_trial_provenance') IS NOT NULL`).Scan(&hasTrialProvenance); herr != nil {
+				return fmt.Errorf("check destination signup provenance: %w", herr)
+			}
+			if hasTrialProvenance {
+				if _, herr := dst.Exec(ctx, `
+					DELETE FROM public.team_signup_trial_provenance
+					WHERE team_id = $1 AND completed_at IS NULL`, cfg.teamID); herr != nil {
+					return fmt.Errorf("clear destination pending signup provenance: %w", herr)
+				}
+			}
+			// Preserve the source ledger exactly, including on cells that
+			// still provision a default grant when the team row is inserted.
 			if _, herr := dst.Exec(ctx, `
 				DELETE FROM team_credit_grant
 				WHERE team_id = $1 AND reason = 'signup trial credit'`, cfg.teamID); herr != nil {
@@ -448,6 +479,9 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 				DELETE FROM team_trial_eligibility_cache
 				WHERE team_id = $1`, cfg.teamID); herr != nil {
 				return fmt.Errorf("clear destination trial eligibility cache: %w", herr)
+			}
+			if err := mergeSignupTrialState(ctx, sourceTx, dst, cfg.teamID); err != nil {
+				return err
 			}
 			// The moment intervals land, the dest scheduler could discover
 			// this team under the default-TRUE rollup flag and mint jobs,
@@ -472,7 +506,7 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 		log.Info().Str("table", t.name).Int64("copied", copied).Int64("skipped", skipped).Msg("copy")
 	}
 
-	relinked, err := relinkSnapshots(ctx, src, dst, cfg.teamID)
+	relinked, err := relinkSnapshots(ctx, sourceTx, dst, cfg.teamID)
 	if err != nil {
 		return fmt.Errorf("relink sandbox.snapshot_id: %w", err)
 	}
@@ -485,6 +519,174 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	}
 	log.Info().Int64("copied", totalCopied).Int64("skipped_existing", totalSkipped).Msg("copy: done")
 	log.Info().Msg("note: sandbox UUIDs are preserved but public IDs re-mint with the dest region prefix on next fetch — clients holding pre-migration sb-<region>- IDs or preview URLs must re-resolve after cutover")
+	return nil
+}
+
+// Consumption is user-scoped, not an ordinary team row that can be overwritten
+// on retry. Carry it before ownership becomes reachable in the destination,
+// including former creators and members who redeemed on another source team.
+func mergeSignupTrialState(ctx context.Context, src querier, dst *pgxpool.Pool, teamID uuid.UUID) error {
+	var hasDenials, denied bool
+	if err := src.QueryRow(ctx, `SELECT to_regclass('public.team_signup_trial_denial') IS NOT NULL`).Scan(&hasDenials); err != nil {
+		return fmt.Errorf("check source signup denials: %w", err)
+	}
+	if hasDenials {
+		if err := src.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM team_signup_trial_denial WHERE team_id=$1)`, teamID).Scan(&denied); err != nil {
+			return fmt.Errorf("read source signup denial: %w", err)
+		}
+		if denied {
+			if err := dst.QueryRow(ctx, `SELECT to_regclass('public.team_signup_trial_denial') IS NOT NULL`).Scan(&hasDenials); err != nil {
+				return fmt.Errorf("check destination signup denials: %w", err)
+			}
+			if !hasDenials {
+				return fmt.Errorf("destination cannot preserve signup denial; deploy the promotion schema before migrating this team")
+			}
+			if _, err := dst.Exec(ctx, `INSERT INTO team_signup_trial_denial(team_id) VALUES ($1)
+				ON CONFLICT (team_id) DO NOTHING`, teamID); err != nil {
+				return fmt.Errorf("merge signup denial: %w", err)
+			}
+		}
+	}
+	var hasClaims, hasEntitlements, hasProvenance bool
+	if err := src.QueryRow(ctx, `SELECT
+		to_regclass('public.user_signup_trial_claim') IS NOT NULL,
+		to_regclass('public.user_promotion_entitlement') IS NOT NULL,
+		to_regclass('public.team_signup_trial_provenance') IS NOT NULL`).Scan(&hasClaims, &hasEntitlements, &hasProvenance); err != nil {
+		return fmt.Errorf("check source signup claims: %w", err)
+	}
+	claimants := fmt.Sprintf(`SELECT id FROM profile WHERE %s`, profileScope)
+	if hasEntitlements {
+		claimants += ` UNION SELECT stripe_activation_user_id FROM team_billing_account WHERE team_id=$1 AND stripe_activation_user_id IS NOT NULL
+			UNION SELECT stripe_checkout_actor_id FROM team_billing_account WHERE team_id=$1 AND stripe_checkout_actor_id IS NOT NULL`
+	}
+	provenance := "NULL::jsonb"
+	if hasProvenance {
+		claimants += ` UNION SELECT creator_user_id FROM team_signup_trial_provenance
+			WHERE team_id = $1 AND completed_at IS NOT NULL AND creator_user_id IS NOT NULL`
+		if denied {
+			// A denied creator's claim belongs to another team. Retain its
+			// completed link so a later move can still find that consumption.
+			provenance = `(SELECT to_jsonb(p) FROM team_signup_trial_provenance p
+				WHERE p.team_id = $1 AND p.completed_at IS NOT NULL AND p.creator_user_id = consumed.user_id)`
+		}
+	}
+	var sources []string
+	if hasClaims {
+		sources = append(sources, fmt.Sprintf(`SELECT user_id, claimed_at, team_id, 0 AS priority
+			FROM user_signup_trial_claim
+			WHERE team_id = $1 OR user_id IN (%s)`, claimants))
+	}
+	if hasEntitlements {
+		sources = append(sources, fmt.Sprintf(`SELECT user_id, signup_trial_claimed_at AS claimed_at,
+			signup_trial_team_id AS team_id, 1 AS priority FROM user_promotion_entitlement
+			WHERE signup_trial_claimed_at IS NOT NULL AND
+			(signup_trial_team_id = $1 OR user_id IN (%s))`, claimants))
+	}
+	if len(sources) == 0 {
+		var destinationExpanded bool
+		if err := dst.QueryRow(ctx, `SELECT
+			to_regclass('public.user_signup_trial_claim') IS NOT NULL OR
+			to_regclass('public.user_promotion_entitlement') IS NOT NULL`).Scan(&destinationExpanded); err != nil {
+			return fmt.Errorf("check destination promotion authority: %w", err)
+		}
+		if destinationExpanded {
+			return fmt.Errorf("source has no promotion authority; deploy its promotion backfill before migrating to an expanded destination")
+		}
+		return nil
+	}
+	if err := mergeCanonicalPromotionState(ctx, src, dst, teamID, claimants); err != nil {
+		return err
+	}
+	if err := mergeStripePromotionState(ctx, src, dst, teamID, claimants); err != nil {
+		return err
+	}
+	rows, err := src.Query(ctx, `SELECT consumed.user_id, consumed.claimed_at, consumed.team_id, to_jsonb(p), `+provenance+`
+		FROM (SELECT DISTINCT ON (user_id) user_id, claimed_at, team_id
+			FROM (`+strings.Join(sources, " UNION ALL ")+`) claims
+			ORDER BY user_id, priority, claimed_at) consumed
+		JOIN profile p ON p.id = consumed.user_id
+		ORDER BY consumed.user_id`, teamID)
+	if err != nil {
+		return fmt.Errorf("read source signup claims: %w", err)
+	}
+	defer rows.Close()
+	type claim struct {
+		userID     uuid.UUID
+		claimedAt  time.Time
+		teamID     *uuid.UUID
+		profile    json.RawMessage
+		provenance json.RawMessage
+	}
+	var claims []claim
+	for rows.Next() {
+		var c claim
+		if err := rows.Scan(&c.userID, &c.claimedAt, &c.teamID, &c.profile, &c.provenance); err != nil {
+			return fmt.Errorf("scan source signup claim: %w", err)
+		}
+		claims = append(claims, c)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read source signup claims: %w", err)
+	}
+	if len(claims) == 0 {
+		return nil
+	}
+	if err := dst.QueryRow(ctx, `SELECT
+		to_regclass('public.user_signup_trial_claim') IS NOT NULL,
+		to_regclass('public.user_promotion_entitlement') IS NOT NULL,
+		to_regclass('public.team_signup_trial_provenance') IS NOT NULL`).Scan(&hasClaims, &hasEntitlements, &hasProvenance); err != nil {
+		return fmt.Errorf("check destination signup claims: %w", err)
+	}
+	if !hasClaims || !hasEntitlements {
+		return fmt.Errorf("destination cannot preserve consumed signup claims; deploy the promotion schema before migrating this team")
+	}
+	tx, err := dst.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin signup claim merge: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	for _, c := range claims {
+		// A former creator can survive only in the consumption marker. Ordinary
+		// member-profile copying does not necessarily include that actor.
+		if _, err := tx.Exec(ctx, `INSERT INTO profile
+			SELECT * FROM jsonb_populate_record(NULL::profile, $1::jsonb)
+			ON CONFLICT (id) DO NOTHING`, c.profile); err != nil {
+			return fmt.Errorf("copy signup claimant profile: %w", err)
+		}
+		// Preserve destination consumption first, even when only its shared
+		// entitlement row records it. An uncopied source team becomes NULL;
+		// the timestamp still permanently consumes the entitlement.
+		if _, err := tx.Exec(ctx, `INSERT INTO user_signup_trial_claim(user_id, claimed_at, team_id)
+			SELECT $1, COALESCE(e.signup_trial_claimed_at, $2),
+				CASE WHEN e.signup_trial_claimed_at IS NOT NULL THEN e.signup_trial_team_id
+				ELSE (SELECT id FROM team WHERE id = $3) END
+			FROM (SELECT 1) singleton
+			LEFT JOIN user_promotion_entitlement e ON e.user_id = $1
+			ON CONFLICT (user_id) DO NOTHING`, c.userID, c.claimedAt, c.teamID); err != nil {
+			return fmt.Errorf("merge signup claim: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO user_promotion_entitlement(user_id, signup_trial_claimed_at, signup_trial_team_id)
+			SELECT user_id, claimed_at, team_id FROM user_signup_trial_claim WHERE user_id = $1
+			ON CONFLICT (user_id) DO UPDATE
+			SET signup_trial_claimed_at = EXCLUDED.signup_trial_claimed_at,
+				signup_trial_team_id = EXCLUDED.signup_trial_team_id, updated_at = now()
+			WHERE user_promotion_entitlement.signup_trial_claimed_at IS NULL`, c.userID); err != nil {
+			return fmt.Errorf("merge signup entitlement: %w", err)
+		}
+		if len(c.provenance) != 0 {
+			if !hasProvenance {
+				return fmt.Errorf("destination cannot preserve completed signup provenance; deploy the promotion schema before migrating this team")
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO team_signup_trial_provenance
+				SELECT * FROM jsonb_populate_record(NULL::team_signup_trial_provenance, $1::jsonb)
+				ON CONFLICT (team_id) DO NOTHING`, c.provenance); err != nil {
+				return fmt.Errorf("merge completed signup provenance: %w", err)
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit signup claim merge: %w", err)
+	}
 	return nil
 }
 
@@ -853,7 +1055,7 @@ func transformRow(raw []byte, transform rowTransform) ([]byte, error) {
 // relinkSnapshots restores sandbox.snapshot_id in the dest from the source's
 // values, after snapshot rows exist. Idempotent: IS DISTINCT FROM makes a
 // re-run a no-op.
-func relinkSnapshots(ctx context.Context, src, dst *pgxpool.Pool, teamID uuid.UUID) (int64, error) {
+func relinkSnapshots(ctx context.Context, src querier, dst *pgxpool.Pool, teamID uuid.UUID) (int64, error) {
 	rows, err := src.Query(ctx,
 		`SELECT id, snapshot_id FROM sandbox WHERE team_id = $1 AND snapshot_id IS NOT NULL`, teamID)
 	if err != nil {
@@ -1228,6 +1430,11 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 		return err
 	}
 	if alreadyDetached {
+		// Older detach versions removed membership without fencing webhook
+		// admission. Retrofitting the source-only fence does not replay data.
+		if err := fenceSourcePromotionMigration(ctx, src, cfg.teamID); err != nil {
+			return err
+		}
 		log.Info().Msg("detach: source is already detached; nothing to do")
 		return nil
 	}
@@ -1283,11 +1490,17 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 
 	// One transaction: the RBAC chain goes atomically or not at all — a
 	// partial delete would leave the team half-reachable in the source cell.
+	if err := fenceSourcePromotionMigration(ctx, src, cfg.teamID); err != nil {
+		return err
+	}
 	tx, err := src.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := lockSourcePromotionMigration(ctx, tx, cfg.teamID); err != nil {
+		return err
+	}
 
 	// Build admission serializes on the app's per-TEAM advisory lock
 	// (CountInFlightBuildsForTeam's caller contract) — take it so a
@@ -1324,6 +1537,23 @@ func runDetach(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName
 		}
 		if copied > 0 {
 			log.Info().Str("table", name).Int64("swept", copied).Msg("detach: straggler rows copied to dest at cutover")
+		}
+	}
+
+	// A validated operator cutover intentionally removes source ownership while
+	// retaining its cold ledger. Retire only the legacy cleanup guard, not the
+	// consumed claim, in the same transaction as that ownership removal.
+	if err := mergeSignupTrialState(ctx, tx, dst, cfg.teamID); err != nil {
+		return err
+	}
+	var hasTrialProvenance bool
+	if err := tx.QueryRow(ctx, `SELECT to_regclass('public.team_signup_trial_provenance') IS NOT NULL`).Scan(&hasTrialProvenance); err != nil {
+		return fmt.Errorf("check source signup provenance: %w", err)
+	}
+	if hasTrialProvenance {
+		if _, err := tx.Exec(ctx, `DELETE FROM public.team_signup_trial_provenance
+			WHERE team_id = $1 AND completed_at IS NOT NULL`, cfg.teamID); err != nil {
+			return fmt.Errorf("retire source signup cleanup guard: %w", err)
 		}
 	}
 
@@ -1430,11 +1660,17 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	}
 
 	// One transaction: the source either loses the whole team or nothing.
+	if err := fenceSourcePromotionMigration(ctx, src, cfg.teamID); err != nil {
+		return err
+	}
 	tx, err := src.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := lockSourcePromotionMigration(ctx, tx, cfg.teamID); err != nil {
+		return err
+	}
 
 	// Lock the team's rows first: the auto-delete worker claims paused
 	// sandboxes past their deadline with an UPDATE, which now blocks behind
@@ -1534,6 +1770,12 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 				log.Info().Str("table", name).Int64("swept", copied).Msg("purge: straggler rows copied to dest before delete")
 			}
 		}
+	}
+
+	// This merge is monotonic, so unlike team-row upserts it is safe even
+	// after detach and cannot overwrite the destination's live consumption.
+	if err := mergeSignupTrialState(ctx, tx, dst, cfg.teamID); err != nil {
+		return err
 	}
 
 	// Break the sandbox↔snapshot cycle so snapshots can go before sandboxes.

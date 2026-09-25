@@ -698,6 +698,85 @@ type Profile struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+type PromotionDeviceGrant struct {
+	Promotion   string    `json:"promotion"`
+	UserID      uuid.UUID `json:"user_id"`
+	TeamID      uuid.UUID `json:"team_id"`
+	Fingerprint *string   `json:"fingerprint"`
+	GrantedAt   time.Time `json:"granted_at"`
+}
+
+type PromotionDeviceOwner struct {
+	Fingerprint  string    `json:"fingerprint"`
+	UserID       uuid.UUID `json:"user_id"`
+	RegisteredAt time.Time `json:"registered_at"`
+}
+
+type PromotionDevicePolicy struct {
+	Singleton        bool      `json:"singleton"`
+	DeviceEnforced   bool      `json:"device_enforced"`
+	EvidenceRequired bool      `json:"evidence_required"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type PromotionIdentity struct {
+	IdentityKey          string             `json:"identity_key"`
+	SignupClaimedAt      pgtype.Timestamptz `json:"signup_claimed_at"`
+	StripeRedemptionAt   pgtype.Timestamptz `json:"stripe_redemption_at"`
+	StripeReservedTeamID pgtype.UUID        `json:"stripe_reserved_team_id"`
+	StripeReservedUserID pgtype.UUID        `json:"stripe_reserved_user_id"`
+	CreatedAt            time.Time          `json:"created_at"`
+}
+
+type PromotionIdentityBinding struct {
+	UserID      uuid.UUID `json:"user_id"`
+	IdentityKey string    `json:"identity_key"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type PromotionIdentityCurrent struct {
+	UserID          uuid.UUID `json:"user_id"`
+	EvidenceVersion uuid.UUID `json:"evidence_version"`
+}
+
+type PromotionIdentityEnforcement struct {
+	Singleton          bool               `json:"singleton"`
+	Enabled            bool               `json:"enabled"`
+	EnabledAt          pgtype.Timestamptz `json:"enabled_at"`
+	ReadinessReference *string            `json:"readiness_reference"`
+}
+
+type PromotionIdentityEvidence struct {
+	EvidenceVersion uuid.UUID `json:"evidence_version"`
+	UserID          uuid.UUID `json:"user_id"`
+	Email           *string   `json:"email"`
+	EmailVerified   bool      `json:"email_verified"`
+	AuthUpdatedAt   time.Time `json:"auth_updated_at"`
+	ObservedAt      time.Time `json:"observed_at"`
+}
+
+type PromotionIdentityHistory struct {
+	HistoryKey        string             `json:"history_key"`
+	Promotion         string             `json:"promotion"`
+	UserID            pgtype.UUID        `json:"user_id"`
+	TeamID            pgtype.UUID        `json:"team_id"`
+	ClaimedAt         time.Time          `json:"claimed_at"`
+	GrantState        string             `json:"grant_state"`
+	Status            string             `json:"status"`
+	IdentityKeys      []string           `json:"identity_keys"`
+	EvidenceReference *string            `json:"evidence_reference"`
+	ReconciledAt      pgtype.Timestamptz `json:"reconciled_at"`
+	EvidenceVersion   pgtype.UUID        `json:"evidence_version"`
+}
+
+type PromotionSignupDeviceEvidence struct {
+	UserID          uuid.UUID `json:"user_id"`
+	SourceAttemptID uuid.UUID `json:"source_attempt_id"`
+	SourceEventID   string    `json:"source_event_id"`
+	Fingerprint     string    `json:"fingerprint"`
+	RegisteredAt    time.Time `json:"registered_at"`
+}
+
 type ProxyAudit struct {
 	ID             int64       `json:"id"`
 	Ts             time.Time   `json:"ts"`
@@ -976,6 +1055,11 @@ type Snapshot struct {
 	PauseToken *string   `json:"pause_token"`
 }
 
+type StripePromotionMigrationFence struct {
+	TeamID   uuid.UUID `json:"team_id"`
+	FencedAt time.Time `json:"fenced_at"`
+}
+
 type StripeWebhookEvent struct {
 	EventID     string             `json:"event_id"`
 	EventType   string             `json:"event_type"`
@@ -984,6 +1068,12 @@ type StripeWebhookEvent struct {
 	ProcessedAt pgtype.Timestamptz `json:"processed_at"`
 	LastError   *string            `json:"last_error"`
 	UpdatedAt   time.Time          `json:"updated_at"`
+}
+
+type StripeWebhookProcessingLease struct {
+	CustomerID string    `json:"customer_id"`
+	Token      uuid.UUID `json:"token"`
+	ExpiresAt  time.Time `json:"expires_at"`
 }
 
 type Team struct {
@@ -1028,10 +1118,23 @@ type TeamBillingAccount struct {
 	StripeActivationCreditGrantedAt pgtype.Timestamptz `json:"stripe_activation_credit_granted_at"`
 	StripeActivationCreditGrantID   *string            `json:"stripe_activation_credit_grant_id"`
 	// Authoritative Superserve commercial billing start. May predate Stripe subscription creation and must not be overwritten by Checkout time.
-	CommercialBillingAnchor pgtype.Timestamptz `json:"commercial_billing_anchor"`
-	CheckoutInitializingAt  pgtype.Timestamptz `json:"checkout_initializing_at"`
-	CheckoutAnchorSnapshot  pgtype.Timestamptz `json:"checkout_anchor_snapshot"`
-	CheckoutSessionID       *string            `json:"checkout_session_id"`
+	CommercialBillingAnchor                  pgtype.Timestamptz `json:"commercial_billing_anchor"`
+	CheckoutInitializingAt                   pgtype.Timestamptz `json:"checkout_initializing_at"`
+	CheckoutAnchorSnapshot                   pgtype.Timestamptz `json:"checkout_anchor_snapshot"`
+	CheckoutSessionID                        *string            `json:"checkout_session_id"`
+	CheckoutSubscriptionID                   *string            `json:"checkout_subscription_id"`
+	CheckoutCompletedAt                      pgtype.Timestamptz `json:"checkout_completed_at"`
+	CheckoutRequestKey                       *string            `json:"checkout_request_key"`
+	CheckoutPendingAttemptIds                []uuid.UUID        `json:"checkout_pending_attempt_ids"`
+	CheckoutMayExist                         bool               `json:"checkout_may_exist"`
+	StripeActivationUserID                   pgtype.UUID        `json:"stripe_activation_user_id"`
+	StripeActivationCreditReservedAt         pgtype.Timestamptz `json:"stripe_activation_credit_reserved_at"`
+	StripeActivationCreditReservationEventID *string            `json:"stripe_activation_credit_reservation_event_id"`
+	StripeCheckoutActorID                    pgtype.UUID        `json:"stripe_checkout_actor_id"`
+	StripeCheckoutActorClaimedAt             pgtype.Timestamptz `json:"stripe_checkout_actor_claimed_at"`
+	StripeActivationIdentityKey              *string            `json:"stripe_activation_identity_key"`
+	StripeCheckoutIdentityEvidenceVersion    pgtype.UUID        `json:"stripe_checkout_identity_evidence_version"`
+	StripeActivationIdentityEvidenceVersion  pgtype.UUID        `json:"stripe_activation_identity_evidence_version"`
 }
 
 type TeamBillingPeriod struct {
@@ -1136,6 +1239,29 @@ type TeamSandboxCounter struct {
 	TeamID uuid.UUID `json:"team_id"`
 	Shard  int16     `json:"shard"`
 	Cnt    int32     `json:"cnt"`
+}
+
+type TeamSignupPromotionOutcome struct {
+	TeamID      uuid.UUID `json:"team_id"`
+	UserID      uuid.UUID `json:"user_id"`
+	IdentityKey *string   `json:"identity_key"`
+	Outcome     string    `json:"outcome"`
+	Reason      string    `json:"reason"`
+	DecidedAt   time.Time `json:"decided_at"`
+}
+
+type TeamSignupTrialDenial struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type TeamSignupTrialProvenance struct {
+	TeamID         uuid.UUID          `json:"team_id"`
+	CreatorUserID  pgtype.UUID        `json:"creator_user_id"`
+	CreatorBoundAt pgtype.Timestamptz `json:"creator_bound_at"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+	LegacyGrantID  pgtype.UUID        `json:"legacy_grant_id"`
+	CreatedAt      time.Time          `json:"created_at"`
 }
 
 type TeamTrialEligibilityCache struct {
@@ -1267,6 +1393,19 @@ type TrialCreditWarningState struct {
 	LifecycleKey string             `json:"lifecycle_key"`
 }
 
+type UserPromotionEntitlement struct {
+	UserID                         uuid.UUID          `json:"user_id"`
+	SignupTrialClaimedAt           pgtype.Timestamptz `json:"signup_trial_claimed_at"`
+	SignupTrialTeamID              pgtype.UUID        `json:"signup_trial_team_id"`
+	StripeRedemptionAt             pgtype.Timestamptz `json:"stripe_redemption_at"`
+	StripeRedemptionTeamID         pgtype.UUID        `json:"stripe_redemption_team_id"`
+	StripeRedemptionReservedTeamID pgtype.UUID        `json:"stripe_redemption_reserved_team_id"`
+	StripeRedemptionReservedAt     pgtype.Timestamptz `json:"stripe_redemption_reserved_at"`
+	StripeRedemptionAttemptedAt    pgtype.Timestamptz `json:"stripe_redemption_attempted_at"`
+	CreatedAt                      time.Time          `json:"created_at"`
+	UpdatedAt                      time.Time          `json:"updated_at"`
+}
+
 type UserRoleAssignment struct {
 	ID        uuid.UUID          `json:"id"`
 	UserID    uuid.UUID          `json:"user_id"`
@@ -1278,4 +1417,11 @@ type UserRoleAssignment struct {
 	RevokedAt pgtype.Timestamptz `json:"revoked_at"`
 	CreatedAt time.Time          `json:"created_at"`
 	UpdatedAt time.Time          `json:"updated_at"`
+}
+
+type UserSignupTrialClaim struct {
+	UserID    uuid.UUID   `json:"user_id"`
+	ClaimedAt time.Time   `json:"claimed_at"`
+	TeamID    pgtype.UUID `json:"team_id"`
+	CreatedAt time.Time   `json:"created_at"`
 }

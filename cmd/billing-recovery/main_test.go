@@ -212,8 +212,8 @@ func TestAuditAccountDryRunSkipsUnsafeTargetsAndDoesNotMutate(t *testing.T) {
 			name:       "active subscription without grant",
 			account:    billingAccount{TeamID: teamID, CustomerID: stringPtrForTest("cus_active"), SubscriptionID: stringPtrForTest("sub_active")},
 			sub:        activeSubscription,
-			wantResult: "candidate",
-			wantReason: "active_subscription_without_activation_grant",
+			wantResult: "unresolved",
+			wantReason: "activation_grant_requires_webhook_reconciliation",
 		},
 		{
 			name:    "past_due subscription without grant",
@@ -222,8 +222,8 @@ func TestAuditAccountDryRunSkipsUnsafeTargetsAndDoesNotMutate(t *testing.T) {
 				ID: "sub_active", Customer: "cus_active", Status: "past_due",
 				CurrentPeriodStart: 1_700_000_000, CurrentPeriodEnd: 1_700_086_400,
 			},
-			wantResult: "candidate",
-			wantReason: "active_subscription_without_activation_grant",
+			wantResult: "unresolved",
+			wantReason: "activation_grant_requires_webhook_reconciliation",
 		},
 		{
 			name:       "existing verified grant",
@@ -251,6 +251,37 @@ func TestAuditAccountDryRunSkipsUnsafeTargetsAndDoesNotMutate(t *testing.T) {
 			}
 			if stripe.postCalls != 0 {
 				t.Fatalf("dry-run made %d grant creation calls", stripe.postCalls)
+			}
+		})
+	}
+}
+
+func TestAuditAccountApplyRequiresPromotionWorkflow(t *testing.T) {
+	teamID := uuid.New()
+	sub := stripeSubscription{
+		ID: "sub_active", Customer: "cus_active", Status: "active",
+		CurrentPeriodStart: 1_700_000_000, CurrentPeriodEnd: 1_700_086_400,
+	}
+	for _, tc := range []struct {
+		name          string
+		userPromotion bool
+		wantReason    string
+	}{
+		{name: "missing grant", wantReason: "activation_grant_requires_webhook_reconciliation"},
+		{name: "user promotion", userPromotion: true, wantReason: "user_promotion_requires_webhook_reconciliation"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stripe := newRecoveryTestStripeClient(t, sub, nil)
+			account := billingAccount{
+				TeamID: teamID, CustomerID: &sub.Customer, SubscriptionID: &sub.ID,
+				UserPromotion: tc.userPromotion,
+			}
+			result := auditAccount(t.Context(), nil, *stripe.client, account, nil, true)
+			if result["outcome"] != "unresolved" || result["reason"] != tc.wantReason {
+				t.Fatalf("apply result = %#v, want unresolved %s", result, tc.wantReason)
+			}
+			if stripe.postCalls != 0 {
+				t.Fatalf("apply made %d grant creation calls", stripe.postCalls)
 			}
 		})
 	}

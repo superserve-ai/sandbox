@@ -35,6 +35,19 @@ func (f *recoveryStripeFixture) setCancelOnCall(subscriptionID string, call int)
 	f.cancelOnCall[subscriptionID] = call
 }
 
+func (f *recoveryStripeFixture) setExistingGrant(teamID uuid.UUID, subscriptionID string, amount int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	customerID := "cus_" + strings.TrimPrefix(subscriptionID, "sub_")
+	f.grants[customerID] = []map[string]any{{
+		"id":                   "grant_" + teamID.String(),
+		"category":             "promotional",
+		"amount":               map[string]any{"monetary": map[string]any{"value": amount, "currency": "usd"}},
+		"applicability_config": map[string]any{"scope": map[string]any{"price_type": "metered"}},
+		"metadata":             map[string]string{"activation_identity": "stripe-activation-credit-" + teamID.String()},
+	}}
+}
+
 func (f *recoveryStripeFixture) grantCallCount(customerID string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -178,14 +191,16 @@ func TestIntegration_BillingRecoveryDryRunApplyRevalidatesAndExcludes(t *testing
 		t.Fatal(err)
 	}
 	stripe.setCancelOnCall(raceSubscription, 2)
-	// The subscription changes after the grant POST but before the final
-	// post-mutation revalidation. Recovery must report the race and leave local
-	// activation uncommitted.
+	// The subscription changes after the locked evidence read but before the
+	// final revalidation. Recovery must leave local activation uncommitted.
 	stripe.setCancelOnCall(postGrantRaceSubscription, 3)
+	stripe.setExistingGrant(goodTeam, goodSubscription, 9500)
+	stripe.setExistingGrant(raceTeam, raceSubscription, 9500)
+	stripe.setExistingGrant(postGrantRaceTeam, postGrantRaceSubscription, 9500)
 
 	dryRun := runBillingRecoveryCommand(t, stripe.server.URL, "-team", goodTeam.String())
-	if dryRun["outcome"] != "candidate" || dryRun["reason"] != "active_subscription_without_activation_grant" {
-		t.Fatalf("dry-run result = %#v, want active candidate", dryRun)
+	if dryRun["outcome"] != "candidate" || dryRun["reason"] != "existing_stripe_grant_reconcile" {
+		t.Fatalf("dry-run result = %#v, want existing grant candidate", dryRun)
 	}
 	var beforeGrant *string
 	if err := testPool.QueryRow(ctx, `SELECT stripe_activation_credit_grant_id FROM team_billing_account WHERE team_id=$1`, goodTeam).Scan(&beforeGrant); err != nil {
@@ -230,8 +245,8 @@ func TestIntegration_BillingRecoveryDryRunApplyRevalidatesAndExcludes(t *testing
 
 	repeated := runBillingRecoveryCommand(t, stripe.server.URL, "-team", goodTeam.String(), "-apply")
 	goodGrantCalls := stripe.grantCallCount("cus_" + strings.TrimPrefix(goodSubscription, "sub_"))
-	if repeated["outcome"] != "repaired" || goodGrantCalls != 1 {
-		t.Fatalf("repeat apply = %#v, grant calls = %v; want one external grant", repeated, goodGrantCalls)
+	if repeated["outcome"] != "repaired" || goodGrantCalls != 0 {
+		t.Fatalf("repeat apply = %#v, grant calls = %v; want no external grant creation", repeated, goodGrantCalls)
 	}
 	goodSubCalls := stripe.subscriptionCallCount(goodSubscription)
 	if goodSubCalls < 4 {
@@ -262,8 +277,8 @@ func TestIntegration_BillingRecoveryDryRunApplyRevalidatesAndExcludes(t *testing
 		t.Fatalf("post-grant race mutated local grant to %q", *postGrantRaceLocalGrant)
 	}
 	grantCalls := stripe.grantCallCount("cus_" + strings.TrimPrefix(postGrantRaceSubscription, "sub_"))
-	if grantCalls != 1 {
-		t.Fatalf("post-grant race made %d grant calls, want one idempotent external attempt", grantCalls)
+	if grantCalls != 0 {
+		t.Fatalf("final revalidation race made %d grant calls, want none", grantCalls)
 	}
 
 	beforeExcludedCalls := stripe.subscriptionCallCount(raceSubscription)
@@ -281,12 +296,14 @@ func TestIntegration_BillingRecoveryCompletedCheckout(t *testing.T) {
 		name, status string
 		amount       int
 		mismatch     bool
+		grant        bool
 		want         string
 	}{
-		{"standard", "complete", 9500, false, "repaired"},
-		{"custom", "complete", 100000, false, "repaired"},
-		{"open", "open", 9500, false, "skipped"},
-		{"wrong_owner", "complete", 9500, true, "skipped"},
+		{"standard", "complete", 9500, false, true, "repaired"},
+		{"custom", "complete", 100000, false, true, "repaired"},
+		{"missing_grant", "complete", 9500, false, false, "unresolved"},
+		{"open", "open", 9500, false, false, "skipped"},
+		{"wrong_owner", "complete", 9500, true, false, "skipped"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -306,10 +323,16 @@ func TestIntegration_BillingRecoveryCompletedCheckout(t *testing.T) {
 			stripe.mu.Lock()
 			stripe.checkouts[session] = map[string]any{"id": session, "status": tc.status, "customer": customer, "subscription": subscription, "client_reference_id": owner}
 			stripe.mu.Unlock()
+			if tc.grant {
+				stripe.setExistingGrant(team, subscription, int64(tc.amount))
+			}
 			args := []string{"-team", team.String(), "-activation-credit-cents", strconv.Itoa(tc.amount)}
 			dry := runBillingRecoveryCommand(t, stripe.server.URL, args...)
 			if tc.want == "repaired" && dry["outcome"] != "candidate" {
 				t.Fatalf("dry-run: %v", dry)
+			}
+			if tc.name == "missing_grant" && (dry["outcome"] != "unresolved" || dry["reason"] != "activation_grant_requires_webhook_reconciliation") {
+				t.Fatalf("missing grant dry-run: %v", dry)
 			}
 			if stripe.grantCallCount(customer) != 0 {
 				t.Fatal("dry-run created credit")
@@ -317,6 +340,12 @@ func TestIntegration_BillingRecoveryCompletedCheckout(t *testing.T) {
 			result := runBillingRecoveryCommand(t, stripe.server.URL, append(args, "-apply")...)
 			if result["outcome"] != tc.want {
 				t.Fatalf("apply=%v, want %s", result, tc.want)
+			}
+			if tc.name == "missing_grant" && result["reason"] != "activation_grant_requires_webhook_reconciliation" {
+				t.Fatalf("missing grant apply: %v", result)
+			}
+			if stripe.grantCallCount(customer) != 0 {
+				t.Fatal("recovery created credit")
 			}
 			var complete, checkoutCleared, anchorCleared bool
 			err = testPool.QueryRow(ctx, `SELECT trial_ended_at IS NOT NULL AND stripe_activation_credit_grant_id IS NOT NULL,checkout_initializing_at IS NULL AND checkout_session_id IS NULL,checkout_anchor_snapshot IS NULL FROM team_billing_account WHERE team_id=$1`, team).Scan(&complete, &checkoutCleared, &anchorCleared)
@@ -333,7 +362,7 @@ func TestIntegration_BillingRecoveryCompletedCheckout(t *testing.T) {
 				t.Fatal("activation or checkout cleanup missing")
 			}
 			repeat := runBillingRecoveryCommand(t, stripe.server.URL, append(args, "-apply")...)
-			if repeat["outcome"] != "repaired" || stripe.grantCallCount(customer) != 1 {
+			if repeat["outcome"] != "repaired" || stripe.grantCallCount(customer) != 0 {
 				t.Fatalf("retry=%v creates=%d", repeat, stripe.grantCallCount(customer))
 			}
 			stripe.mu.Lock()
@@ -344,7 +373,7 @@ func TestIntegration_BillingRecoveryCompletedCheckout(t *testing.T) {
 			}
 			if tc.amount != 9500 {
 				wrong := runBillingRecoveryCommand(t, stripe.server.URL, "-team", team.String(), "-apply")
-				if wrong["outcome"] != "unresolved" || stripe.grantCallCount(customer) != 1 {
+				if wrong["outcome"] != "unresolved" || stripe.grantCallCount(customer) != 0 {
 					t.Fatalf("wrong amount must not issue credit: %v", wrong)
 				}
 			}
@@ -379,6 +408,9 @@ func TestIntegration_BillingRecoveryExpiredReservationAndMissingAssociation(t *t
 			stripe.mu.Lock()
 			stripe.checkouts[session] = map[string]any{"id": session, "status": status, "customer": customer, "subscription": subscription, "client_reference_id": team.String()}
 			stripe.mu.Unlock()
+			if !missing {
+				stripe.setExistingGrant(team, subscription, 9500)
+			}
 			result := runBillingRecoveryCommand(t, stripe.server.URL, "-team", team.String(), "-apply")
 			expected := "repaired"
 			if missing {
@@ -401,7 +433,7 @@ func TestIntegration_BillingRecoveryExpiredReservationAndMissingAssociation(t *t
 				if activated || storedSub != nil || stripe.grantCallCount(customer) != 0 {
 					t.Fatal("missing association mutated")
 				}
-			} else if !activated || stripe.grantCallCount(customer) != 1 {
+			} else if !activated || stripe.grantCallCount(customer) != 0 {
 				t.Fatal("existing subscription not recovered")
 			}
 		})

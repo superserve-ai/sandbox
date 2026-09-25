@@ -216,7 +216,17 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 	if err != nil {
 		return result, err
 	}
-	if account.StripeCustomerID == nil || !account.CommercialBillingAnchor.Valid {
+	var shadowHandoff bool
+	if err := h.Pool.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM billing_usage_export
+			WHERE team_id=$1 AND period_start=$2 AND period_end=$3
+			  AND status='skipped_shadow'
+		)
+	`, p.TeamID, p.Start, p.End).Scan(&shadowHandoff); err != nil {
+		return result, err
+	}
+	if account.StripeCustomerID == nil || (!account.CommercialBillingAnchor.Valid && !shadowHandoff) {
 		return result, fmt.Errorf("active subscription, customer and commercial anchor are required")
 	}
 	if account.StripeSubscriptionStatus == nil || *account.StripeSubscriptionStatus != "active" {
@@ -233,9 +243,11 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 			return result, fmt.Errorf("active subscription, customer and commercial anchor are required")
 		}
 	}
-	start, end, ok := billing.AnniversaryPeriod(account.CommercialBillingAnchor.Time, p.Start)
-	if !ok || !start.Equal(p.Start) || !end.Equal(p.End) {
-		return result, fmt.Errorf("period does not match commercial anchor")
+	if account.CommercialBillingAnchor.Valid {
+		start, end, ok := billing.AnniversaryPeriod(account.CommercialBillingAnchor.Time, p.Start)
+		if !ok || !start.Equal(p.Start) || !end.Equal(p.End) {
+			return result, fmt.Errorf("period does not match commercial anchor")
+		}
 	}
 	if h.Stripe == nil {
 		return result, fmt.Errorf("Stripe billing is not configured")

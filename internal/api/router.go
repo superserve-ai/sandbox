@@ -91,6 +91,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 		api.GET("/teams/:team_id/billing/periods", h.ListTeamBillingPeriods)
 		api.GET("/teams/:team_id/billing/periods/:period_id/export-preview", h.GetTeamBillingExportPreview)
 		api.POST("/stripe/checkout-session", h.CreateStripeCheckoutSession)
+		api.POST("/stripe/checkout-session/recover", h.RecoverStripeCheckoutSession)
 		api.POST("/stripe/customer-portal-session", h.CreateStripeCustomerPortalSession)
 
 		// RBAC Phase 2b customer-facing team management.

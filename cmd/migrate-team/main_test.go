@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/superserve-ai/sandbox/internal/promotiontest"
 )
 
 // The tests drive all four phases against two real databases created in the
@@ -85,6 +86,10 @@ func TestMain(m *testing.M) {
 	for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
 		if err := applyMigrations(ctx, pool); err != nil {
 			fmt.Fprintf(os.Stderr, "migration failed: %v\n", err)
+			os.Exit(1)
+		}
+		if err := promotiontest.Install(ctx, pool); err != nil {
+			fmt.Fprintf(os.Stderr, "install trusted identity fixture: %v\n", err)
 			os.Exit(1)
 		}
 	}
@@ -214,8 +219,9 @@ func seedFixture(t *testing.T) *fixture {
 
 	// Source cell: the team under migration.
 	mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, 'migration-drill')`, f.team)
-	// This fixture supplies its own credit ledger below; do not include the
-	// signup grant that current team creation provisions automatically.
+	// This fixture supplies its own credit ledger below; suppress automatic
+	// signup redemption before the owner chain is inserted.
+	mustExec(t, srcPool, `DELETE FROM team_signup_trial_provenance WHERE team_id = $1 AND completed_at IS NULL`, f.team)
 	mustExec(t, srcPool, `DELETE FROM team_credit_grant WHERE team_id = $1 AND reason = 'signup trial credit'`, f.team)
 	mustExec(t, srcPool, `DELETE FROM team_trial_eligibility_cache WHERE team_id = $1`, f.team)
 	mustExec(t, srcPool, `INSERT INTO profile (id, email, provider, provider_id) VALUES ($1, 'owner@example.com', 'google', 'google-owner')`, f.owner)
@@ -633,6 +639,25 @@ func TestTeamMigration(t *testing.T) {
 			WHERE ura.team_id = $1 AND ura.user_id = $2`, f.team, f.owner)
 		if got != "team_owner" {
 			t.Errorf("owner's dest role = %s, want team_owner", got)
+		}
+		var pending, claimed, entitled, granted bool
+		if err := dstPool.QueryRow(ctx, `SELECT
+			EXISTS(SELECT 1 FROM team_signup_trial_provenance WHERE team_id=$1 AND completed_at IS NULL),
+			EXISTS(SELECT 1 FROM user_signup_trial_claim WHERE user_id IN ($2,$3)),
+			EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id IN ($2,$3) AND signup_trial_claimed_at IS NOT NULL),
+			EXISTS(SELECT 1 FROM team_credit_grant WHERE team_id=$1 AND reason='signup trial credit')`,
+			f.team, f.owner, f.member).Scan(&pending, &claimed, &entitled, &granted); err != nil {
+			t.Fatal(err)
+		}
+		var sourceClaimed, sourceEntitled bool
+		if err := srcPool.QueryRow(ctx, `SELECT
+			EXISTS(SELECT 1 FROM user_signup_trial_claim WHERE user_id IN ($1,$2)),
+			EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id IN ($1,$2) AND signup_trial_claimed_at IS NOT NULL)`,
+			f.owner, f.member).Scan(&sourceClaimed, &sourceEntitled); err != nil {
+			t.Fatal(err)
+		}
+		if pending || granted || claimed != sourceClaimed || entitled != sourceEntitled {
+			t.Fatalf("copied promotion state: pending=%v granted=%v claimed=%v/%v entitled=%v/%v", pending, granted, claimed, sourceClaimed, entitled, sourceEntitled)
 		}
 
 		// Host remap, home_region rehoming, quota counter.
@@ -1209,6 +1234,762 @@ func TestTeamMigration(t *testing.T) {
 				t.Errorf("after purge, dest %s: got %d rows, want %d", spec.name, got, want)
 			}
 		}
+	})
+}
+
+func TestSignupTrialMigrationDetach(t *testing.T) {
+	ctx := context.Background()
+	team, owner := uuid.New(), uuid.New()
+	mustExec(t, dstPool, `INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
+		VALUES ($1, '192.0.2.1:50051', '192.0.2.1:8080', $2, 65536, 32)
+		ON CONFLICT (id) DO NOTHING`, destHostID, destRegion)
+	mustExec(t, srcPool, `INSERT INTO profile (id, email) VALUES ($1, $2)`, owner, owner.String()+"@example.com")
+	mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, 'signup-detach')`, team)
+	mustExec(t, srcPool, `INSERT INTO team_member (team_id, profile_id, role) VALUES ($1, $2, 'owner')`, team, owner)
+	mustExec(t, srcPool, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, team, owner)
+	mustExec(t, srcPool, `INSERT INTO user_role_assignments (team_id, user_id, scope_type, role_id)
+		SELECT $1, $2, 'team', id FROM roles WHERE name = 'team_owner'`, team, owner)
+	if _, err := srcPool.Exec(ctx, `DELETE FROM user_role_assignments WHERE team_id = $1`, team); err == nil {
+		t.Fatal("completed legacy signup must reject ordinary last-owner cleanup")
+	}
+	var grantID uuid.UUID
+	if err := srcPool.QueryRow(ctx, `SELECT id FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'`, team).Scan(&grantID); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{phase: phaseCopy, teamID: team, sourceURL: srcURL, destURL: dstURL, destHostID: destHostID, destRegion: destRegion}
+	if err := run(ctx, cfg); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	cfg.phase, cfg.confirmTeamName = phaseDetach, "signup-detach"
+	if err := run(ctx, cfg); err != nil {
+		t.Fatalf("detach completed legacy signup: %v", err)
+	}
+	for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+		var preserved bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM team_credit_grant
+			WHERE id = $1 AND team_id = $2 AND amount_usd = 5 AND remaining_usd = 5)`, grantID, team).Scan(&preserved); err != nil || !preserved {
+			t.Fatalf("original signup ledger preserved=%t, error=%v", preserved, err)
+		}
+	}
+	var claimed, guarded, sourceOwner, destinationOwner bool
+	if err := srcPool.QueryRow(ctx, `SELECT
+		EXISTS (SELECT 1 FROM user_signup_trial_claim WHERE user_id = $1 AND team_id = $2),
+		EXISTS (SELECT 1 FROM team_signup_trial_provenance WHERE team_id = $2),
+		EXISTS (SELECT 1 FROM user_role_assignments WHERE team_id = $2)`, owner, team).Scan(&claimed, &guarded, &sourceOwner); err != nil {
+		t.Fatal(err)
+	}
+	if err := dstPool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM user_role_assignments
+		WHERE team_id = $1 AND user_id = $2 AND revoked_at IS NULL)`, team, owner).Scan(&destinationOwner); err != nil {
+		t.Fatal(err)
+	}
+	if !claimed || guarded || sourceOwner || !destinationOwner {
+		t.Fatalf("detach state: claimed=%t guarded=%t source owner=%t destination owner=%t", claimed, guarded, sourceOwner, destinationOwner)
+	}
+	assertMigratedSignupConsumed(t, dstPool, owner, &team)
+	assertSignupRetryHasNoGrant(t, dstPool, owner)
+}
+
+func assertMigratedSignupConsumed(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID, teamID *uuid.UUID) {
+	t.Helper()
+	var consumed bool
+	if err := pool.QueryRow(context.Background(), `SELECT EXISTS (
+		SELECT 1 FROM user_signup_trial_claim c JOIN user_promotion_entitlement e USING (user_id)
+		WHERE c.user_id = $1 AND c.team_id IS NOT DISTINCT FROM $2::uuid
+		  AND e.signup_trial_team_id IS NOT DISTINCT FROM $2::uuid
+		  AND e.signup_trial_claimed_at = c.claimed_at)`, userID, teamID).Scan(&consumed); err != nil || !consumed {
+		t.Fatalf("signup consumption missing for user %s: consumed=%t, error=%v", userID, consumed, err)
+	}
+}
+
+func assertSignupRetryHasNoGrant(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) {
+	t.Helper()
+	var teamID uuid.UUID
+	if err := pool.QueryRow(context.Background(), `SELECT id FROM create_team_with_signup_trial($1, $2, 'usw')`, "signup-retry-"+uuid.NewString(), userID).Scan(&teamID); err != nil {
+		t.Fatal(err)
+	}
+	var grants int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM team_credit_grant
+		WHERE team_id = $1 AND reason = 'signup trial credit'`, teamID).Scan(&grants); err != nil || grants != 0 {
+		t.Fatalf("migrated actor received another signup grant: count=%d, error=%v", grants, err)
+	}
+}
+
+func TestCanonicalPromotionMigration(t *testing.T) {
+	ctx := context.Background()
+	mustExec(t, dstPool, `INSERT INTO host(id,vmd_addr,proxy_addr,region,capacity_memory_mib,capacity_vcpus)
+		VALUES($1,'192.0.2.1:50051','192.0.2.1:8080',$2,65536,32) ON CONFLICT DO NOTHING`, destHostID, destRegion)
+	newActor := func(pool *pgxpool.Pool, email string) uuid.UUID {
+		user := uuid.New()
+		mustExec(t, pool, `INSERT INTO profile(id,email) VALUES($1,$2)`, user, email)
+		mustExec(t, pool, `UPDATE promotion_auth.identity_source SET email=$2,email_confirmed_at=now() WHERE id=$1`, user, email)
+		return user
+	}
+	newTeam := func(user uuid.UUID) config {
+		var team uuid.UUID
+		if err := srcPool.QueryRow(ctx, `SELECT id FROM create_team_with_signup_trial($1,$2,'use')`, "canonical-move-"+uuid.NewString(), user).Scan(&team); err != nil {
+			t.Fatal(err)
+		}
+		return config{phase: phaseCopy, teamID: team, sourceURL: srcURL, destURL: dstURL, destHostID: destHostID, destRegion: destRegion}
+	}
+	t.Run("canonical consumption precedes ownership and survives retries", func(t *testing.T) {
+		mailbox := "moved" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		user := newActor(srcPool, mailbox+"@gmail.com")
+		cfg := newTeam(user)
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,stripe_subscription_status) VALUES($1,'active')`, cfg.teamID)
+		mustExec(t, srcPool, `SELECT reserve_stripe_promotion($1,$2)`, cfg.teamID, user)
+		mustExec(t, srcPool, `SELECT finalize_stripe_promotion($1,$2,'credit_migrated')`, cfg.teamID, user)
+		for range 2 {
+			if err := run(ctx, cfg); err != nil {
+				t.Fatal(err)
+			}
+		}
+		alias := newActor(dstPool, mailbox[:5]+"."+mailbox[5:]+"+alias@googlemail.com")
+		assertSignupRetryHasNoGrant(t, dstPool, alias)
+		var key string
+		if err := dstPool.QueryRow(ctx, `SELECT resolve_promotion_identity($1)`, alias).Scan(&key); err != nil {
+			t.Fatal(err)
+		}
+		var consumed bool
+		if err := dstPool.QueryRow(ctx, `SELECT signup_claimed_at IS NOT NULL AND stripe_redemption_at IS NOT NULL
+			FROM promotion_identity WHERE identity_key=$1`, key).Scan(&consumed); err != nil || !consumed {
+			t.Fatalf("migration lost canonical consumption: %t %v", consumed, err)
+		}
+	})
+	t.Run("unresolved history stays quarantined", func(t *testing.T) {
+		user := newActor(srcPool, uuid.NewString()+"@example.com")
+		cfg := newTeam(user)
+		history := "test-migration:" + cfg.teamID.String()
+		mustExec(t, srcPool, `INSERT INTO promotion_identity_history(history_key,promotion,team_id,claimed_at) VALUES($1,'stripe',$2,now())`, history, cfg.teamID)
+		t.Cleanup(func() {
+			mustExec(t, srcPool, `DELETE FROM promotion_identity_history WHERE history_key=$1`, history)
+			mustExec(t, dstPool, `DELETE FROM promotion_identity_history WHERE history_key=$1`, history)
+		})
+		if err := run(ctx, cfg); err != nil {
+			t.Fatal(err)
+		}
+		var pending bool
+		if err := dstPool.QueryRow(ctx, `SELECT status='pending' AND cardinality(identity_keys)=0 FROM promotion_identity_history WHERE history_key=$1`, history).Scan(&pending); err != nil || !pending {
+			t.Fatalf("migration invented historical identity: %t %v", pending, err)
+		}
+	})
+	t.Run("checkout capture travels without becoming current evidence", func(t *testing.T) {
+		user := newActor(srcPool, "captured"+strings.ReplaceAll(uuid.NewString(), "-", "")+"@gmail.com")
+		cfg := newTeam(user)
+		var version uuid.UUID
+		if err := srcPool.QueryRow(ctx, `SELECT evidence_version FROM promotion_identity_current WHERE user_id=$1`, user).Scan(&version); err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,stripe_checkout_actor_id,stripe_checkout_identity_evidence_version,checkout_initializing_at)
+			VALUES($1,$2,$3,now())`, cfg.teamID, user, version)
+		for range 2 {
+			if err := run(ctx, cfg); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var preserved, current bool
+		if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_billing_account a
+			JOIN promotion_identity_evidence e ON e.evidence_version=a.stripe_checkout_identity_evidence_version
+			WHERE a.team_id=$1 AND e.evidence_version=$2 AND e.user_id=$3),
+			EXISTS(SELECT 1 FROM promotion_identity_current WHERE user_id=$3 AND evidence_version=$2)`, cfg.teamID, version, user).Scan(&preserved, &current); err != nil || !preserved || current {
+			t.Fatalf("captured evidence transfer: preserved=%t promoted to current=%t err=%v", preserved, current, err)
+		}
+	})
+	t.Run("ambiguous external reservation blocks move", func(t *testing.T) {
+		user := newActor(srcPool, uuid.NewString()+"@example.com")
+		cfg := newTeam(user)
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,stripe_subscription_status) VALUES($1,'active')`, cfg.teamID)
+		mustExec(t, srcPool, `SELECT reserve_stripe_promotion($1,$2)`, cfg.teamID, user)
+		if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "settle pending Stripe promotions") {
+			t.Fatalf("ambiguous fence migrated: %v", err)
+		}
+		var owners int
+		if err := dstPool.QueryRow(ctx, `SELECT count(*) FROM user_role_assignments WHERE team_id=$1`, cfg.teamID).Scan(&owners); err != nil || owners != 0 {
+			t.Fatalf("ownership copied before fence settlement: %d %v", owners, err)
+		}
+	})
+	t.Run("reconciled destination cannot erase unknown source history", func(t *testing.T) {
+		user := newActor(srcPool, uuid.NewString()+"@example.com")
+		cfg := newTeam(user)
+		history := "signup-user:" + user.String()
+		mustExec(t, srcPool, `INSERT INTO promotion_identity_history(history_key,promotion,user_id,team_id,claimed_at)
+			VALUES($1,'signup',$2,$3,now())`, history, user, cfg.teamID)
+		t.Cleanup(func() {
+			mustExec(t, srcPool, `DELETE FROM promotion_identity_history WHERE history_key=$1`, history)
+			mustExec(t, dstPool, `DELETE FROM promotion_identity_history WHERE history_key=$1`, history)
+		})
+		mustExec(t, dstPool, `INSERT INTO promotion_identity_history(history_key,promotion,user_id,claimed_at,status,identity_keys,evidence_reference,reconciled_at)
+			VALUES($1,'signup',$2::uuid,now()-interval '1 day','reconciled',ARRAY['user:'||($2::uuid)::text],'destination evidence',now())`, history, user)
+		if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "conflicting historical promotion evidence") {
+			t.Fatalf("unresolved source history discarded: %v", err)
+		}
+		var owners int
+		if err := dstPool.QueryRow(ctx, `SELECT count(*) FROM user_role_assignments WHERE team_id=$1`, cfg.teamID).Scan(&owners); err != nil || owners != 0 {
+			t.Fatalf("ownership copied despite unresolved conflict: %d %v", owners, err)
+		}
+	})
+	t.Run("restricted credential is rejected before destination writes", func(t *testing.T) {
+		user := newActor(srcPool, uuid.NewString()+"@example.com")
+		cfg := newTeam(user)
+		role := "promotion_migration_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		mustExec(t, dstPool, "CREATE ROLE "+role+" LOGIN BYPASSRLS PASSWORD 'disposable-test-password'")
+		t.Cleanup(func() {
+			mustExec(t, dstPool, "DROP OWNED BY "+role)
+			mustExec(t, dstPool, "DROP ROLE "+role)
+		})
+		mustExec(t, dstPool, "GRANT USAGE ON SCHEMA public TO "+role)
+		mustExec(t, dstPool, "GRANT SELECT ON promotion_identity_history TO "+role)
+		limited, err := url.Parse(dstURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		limited.User = url.UserPassword(role, "disposable-test-password")
+		cfg.destURL = limited.String()
+		if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "destination administrator credential") {
+			t.Fatalf("restricted migration was not rejected early: %v", err)
+		}
+		var present bool
+		if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team WHERE id=$1) OR EXISTS(SELECT 1 FROM profile WHERE id=$2)`, cfg.teamID, user).Scan(&present); err != nil || present {
+			t.Fatalf("restricted migration mutated destination: %t %v", present, err)
+		}
+	})
+}
+
+func TestStripeEntitlementMigration(t *testing.T) {
+	ctx := context.Background()
+	for _, role := range []string{"anon", "authenticated", "service_role"} {
+		var exists bool
+		if err := srcPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname=$1)`, role).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if !exists {
+			options := ""
+			if role == "service_role" {
+				options = " BYPASSRLS"
+			}
+			mustExec(t, srcPool, "CREATE ROLE "+role+options)
+			t.Cleanup(func() { mustExec(t, srcPool, "DROP ROLE "+role) })
+		}
+	}
+	newUnactivatedCell := func() (*pgxpool.Pool, string) {
+		name := "stripe_migration_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+		mustExec(t, srcPool, "CREATE DATABASE "+name)
+		cellURL, err := rewriteDBName(srcURL, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pool, err := pgxpool.New(ctx, cellURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			pool.Close()
+			mustExec(t, srcPool, "DROP DATABASE "+name+" WITH (FORCE)")
+		})
+		if err := applyMigrations(ctx, pool); err != nil {
+			t.Fatal(err)
+		}
+		return pool, cellURL
+	}
+	srcPool, srcURL := newUnactivatedCell()
+	dstPool, dstURL := newUnactivatedCell()
+	mustExec(t, dstPool, `INSERT INTO host(id,vmd_addr,proxy_addr,region,capacity_memory_mib,capacity_vcpus)
+		VALUES($1,'192.0.2.1:50051','192.0.2.1:8080',$2,65536,32) ON CONFLICT DO NOTHING`, destHostID, destRegion)
+	newTeam := func(pool *pgxpool.Pool) uuid.UUID {
+		team := uuid.New()
+		mustExec(t, pool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "stripe-move-"+team.String())
+		return team
+	}
+	newFixture := func() (config, uuid.UUID) {
+		actor := uuid.New()
+		team := newTeam(srcPool)
+		mustExec(t, srcPool, `INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com")
+		mustExec(t, srcPool, `INSERT INTO team_member(team_id,profile_id,role) VALUES($1,$2,'member')`, team, actor)
+		mustExec(t, srcPool, `INSERT INTO team_memberships(team_id,user_id,status) VALUES($1,$2,'active')`, team, actor)
+		return config{phase: phaseCopy, teamID: team, sourceURL: srcURL, destURL: dstURL, destHostID: destHostID, destRegion: destRegion}, actor
+	}
+	waitForLockWaiter := func(t *testing.T, blocker uint32) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			var waiting bool
+			if err := srcPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+				WHERE $1::integer=ANY(pg_blocking_pids(pid)))`, blocker).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+			if waiting {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("expected operation to wait on the source promotion lock")
+	}
+	t.Run("uncommitted reservation is observed before ownership copy", func(t *testing.T) {
+		cfg, actor := newFixture()
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id) VALUES($1)`, cfg.teamID)
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		var state string
+		if err := tx.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,'evt_uncommitted')`, cfg.teamID, actor).Scan(&state); err != nil || state != "acquired" {
+			t.Fatalf("reserve: state=%s err=%v", state, err)
+		}
+		copyCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- run(copyCtx, cfg) }()
+		waitForLockWaiter(t, tx.Conn().PgConn().PID())
+		var copied bool
+		if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_memberships WHERE team_id=$1)`, cfg.teamID).Scan(&copied); err != nil || copied {
+			t.Fatalf("ownership published while reservation was uncommitted: copied=%t err=%v", copied, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; err == nil || !strings.Contains(err.Error(), "settle pending Stripe promotions") {
+			t.Fatalf("committed reservation should block copy: %v", err)
+		}
+		if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_memberships WHERE team_id=$1)`, cfg.teamID).Scan(&copied); err != nil || copied {
+			t.Fatalf("ownership published despite pending reservation: copied=%t err=%v", copied, err)
+		}
+	})
+	t.Run("queued reservation rechecks durable cutover fence", func(t *testing.T) {
+		cfg, actor := newFixture()
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,'cus_migrated')`, cfg.teamID)
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('stripe-promo-team:' || $1::uuid::text)::bigint)`, cfg.teamID); err != nil {
+			t.Fatal(err)
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		type result struct {
+			state string
+			err   error
+		}
+		done := make(chan result, 1)
+		go func() {
+			var r result
+			r.err = srcPool.QueryRow(requestCtx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,'evt_queued')`, cfg.teamID, actor).Scan(&r.state)
+			done <- r
+		}()
+		waitForLockWaiter(t, tx.Conn().PgConn().PID())
+		if _, err := tx.Exec(ctx, `INSERT INTO stripe_promotion_migration_fence(team_id) VALUES($1)`, cfg.teamID); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if r := <-done; r.err != nil || r.state != "ineligible" {
+			t.Fatalf("queued reservation ignored cutover: state=%s err=%v", r.state, r.err)
+		}
+		var unchanged bool
+		if err := srcPool.QueryRow(ctx, `SELECT stripe_customer_id='cus_migrated'
+			AND stripe_activation_credit_reserved_at IS NULL AND stripe_activation_credit_grant_id IS NULL
+			AND NOT EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$2 AND
+			(stripe_redemption_at IS NOT NULL OR stripe_redemption_reserved_team_id IS NOT NULL))
+			FROM team_billing_account WHERE team_id=$1`, cfg.teamID, actor).Scan(&unchanged); err != nil || !unchanged {
+			t.Fatalf("fenced promotion mutated billing/entitlement: unchanged=%t err=%v", unchanged, err)
+		}
+		if err := run(ctx, cfg); err != nil {
+			t.Fatal(err)
+		}
+		var copiedFence bool
+		if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stripe_promotion_migration_fence WHERE team_id=$1)`, cfg.teamID).Scan(&copiedFence); err != nil || copiedFence {
+			t.Fatalf("source-only fence copied to destination: %t %v", copiedFence, err)
+		}
+		var readable, writable bool
+		if err := srcPool.QueryRow(ctx, `SELECT has_table_privilege('service_role','stripe_promotion_migration_fence','SELECT'),
+			has_table_privilege('service_role','stripe_promotion_migration_fence','INSERT,UPDATE,DELETE')
+			OR has_table_privilege('authenticated','stripe_promotion_migration_fence','INSERT,UPDATE,DELETE')
+			OR has_table_privilege('anon','stripe_promotion_migration_fence','INSERT,UPDATE,DELETE')`).Scan(&readable, &writable); err != nil || !readable || writable {
+			t.Fatalf("fence privilege boundary: readable=%t writable=%t err=%v", readable, writable, err)
+		}
+		mustExec(t, srcPool, `DELETE FROM team_member WHERE team_id=$1`, cfg.teamID)
+		mustExec(t, srcPool, `DELETE FROM team_memberships WHERE team_id=$1`, cfg.teamID)
+		mustExec(t, srcPool, `DELETE FROM team WHERE id=$1`, cfg.teamID)
+		var retained bool
+		if err := srcPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stripe_promotion_migration_fence WHERE team_id=$1)`, cfg.teamID).Scan(&retained); err != nil || !retained {
+			t.Fatalf("source team deletion removed the cutover fence: retained=%t err=%v", retained, err)
+		}
+	})
+	for _, association := range []string{"same-team", "other-team", "deleted-team", "departed-recipient"} {
+		t.Run(association, func(t *testing.T) {
+			cfg, actor := newFixture()
+			grantTeam := cfg.teamID
+			if association == "other-team" || association == "deleted-team" {
+				grantTeam = newTeam(srcPool)
+			}
+			claimedAt := time.Now().UTC().Truncate(time.Microsecond).Add(-24 * time.Hour)
+			mustExec(t, srcPool, `INSERT INTO user_promotion_entitlement(user_id,stripe_redemption_at,stripe_redemption_team_id)
+				VALUES($1,$2,$3)`, actor, claimedAt, grantTeam)
+			if association == "deleted-team" {
+				mustExec(t, srcPool, `DELETE FROM team WHERE id=$1`, grantTeam)
+			}
+			if association == "departed-recipient" {
+				mustExec(t, srcPool, `DELETE FROM team_member WHERE team_id=$1`, cfg.teamID)
+				mustExec(t, srcPool, `DELETE FROM team_memberships WHERE team_id=$1`, cfg.teamID)
+			}
+			for range 2 {
+				if err := run(ctx, cfg); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var team any
+			if grantTeam == cfg.teamID {
+				team = grantTeam
+			}
+			var preserved, independent bool
+			if err := dstPool.QueryRow(ctx, `SELECT stripe_redemption_at=$2 AND stripe_redemption_team_id IS NOT DISTINCT FROM $3::uuid,
+				signup_trial_claimed_at IS NULL AND NOT EXISTS(SELECT 1 FROM promotion_identity_binding WHERE user_id=$1)
+				FROM user_promotion_entitlement WHERE user_id=$1`, actor, claimedAt, team).Scan(&preserved, &independent); err != nil || !preserved || !independent {
+				t.Fatalf("UUID consumption transfer: preserved=%t independent=%t err=%v", preserved, independent, err)
+			}
+			retryTeam := newTeam(dstPool)
+			mustExec(t, dstPool, `INSERT INTO team_billing_account(team_id) VALUES($1)`, retryTeam)
+			var eligible bool
+			if err := dstPool.QueryRow(ctx, `SELECT stripe_promotion_eligible($1,$2)`, retryTeam, actor).Scan(&eligible); err != nil || eligible {
+				t.Fatalf("migrated actor became eligible again: %t %v", eligible, err)
+			}
+		})
+	}
+	t.Run("existing destination redemption is never replaced", func(t *testing.T) {
+		cfg, actor := newFixture()
+		mustExec(t, srcPool, `INSERT INTO user_promotion_entitlement(user_id,stripe_redemption_at,stripe_redemption_team_id)
+			VALUES($1,now()-interval '1 day',$2)`, actor, cfg.teamID)
+		mustExec(t, dstPool, `INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com")
+		prior := newTeam(dstPool)
+		mustExec(t, dstPool, `INSERT INTO user_promotion_entitlement(user_id,stripe_redemption_at,stripe_redemption_team_id)
+			VALUES($1,now()-interval '2 days',$2)`, actor, prior)
+		before := scanString(t, dstPool, `SELECT to_jsonb(e)::text FROM user_promotion_entitlement e WHERE user_id=$1`, actor)
+		if err := run(ctx, cfg); err != nil {
+			t.Fatal(err)
+		}
+		after := scanString(t, dstPool, `SELECT to_jsonb(e)::text FROM user_promotion_entitlement e WHERE user_id=$1`, actor)
+		if after != before {
+			t.Fatalf("destination entitlement changed: %s -> %s", before, after)
+		}
+	})
+	for _, side := range []string{"source", "destination"} {
+		t.Run(side+" pending reservation fails closed", func(t *testing.T) {
+			cfg, actor := newFixture()
+			pool := srcPool
+			if side == "destination" {
+				pool = dstPool
+				mustExec(t, pool, `INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com")
+			}
+			reservedTeam := newTeam(pool)
+			mustExec(t, pool, `INSERT INTO user_promotion_entitlement(user_id,stripe_redemption_reserved_team_id,stripe_redemption_reserved_at,stripe_redemption_attempted_at)
+				VALUES($1,$2,now(),now())`, actor, reservedTeam)
+			before := scanString(t, pool, `SELECT to_jsonb(e)::text FROM user_promotion_entitlement e WHERE user_id=$1`, actor)
+			if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "settle pending") {
+				t.Fatalf("pending Stripe fence should block migration: %v", err)
+			}
+			var fenced bool
+			if err := srcPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stripe_promotion_migration_fence WHERE team_id=$1)`, cfg.teamID).Scan(&fenced); err != nil || fenced != (side == "destination") {
+				t.Fatalf("source fence must precede destination writes and survive failed copy: fenced=%t err=%v", fenced, err)
+			}
+			after := scanString(t, pool, `SELECT to_jsonb(e)::text FROM user_promotion_entitlement e WHERE user_id=$1`, actor)
+			if after != before {
+				t.Fatalf("pending Stripe fence changed: %s -> %s", before, after)
+			}
+			var copied bool
+			if err := dstPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_memberships WHERE team_id=$1)`, cfg.teamID).Scan(&copied); err != nil || copied {
+				t.Fatalf("pending Stripe fence permitted member copy: %t %v", copied, err)
+			}
+		})
+	}
+	t.Run("missing destination authority fails closed", func(t *testing.T) {
+		cfg, actor := newFixture()
+		mustExec(t, srcPool, `INSERT INTO user_promotion_entitlement(user_id,stripe_redemption_at) VALUES($1,now())`, actor)
+		mustExec(t, dstPool, `ALTER TABLE user_promotion_entitlement RENAME TO test_unavailable_stripe_entitlement`)
+		defer mustExec(t, dstPool, `ALTER TABLE test_unavailable_stripe_entitlement RENAME TO user_promotion_entitlement`)
+		err := mergeStripePromotionState(ctx, srcPool, dstPool, cfg.teamID, fmt.Sprintf(`SELECT id FROM profile WHERE %s`, profileScope))
+		if err == nil || !strings.Contains(err.Error(), "both cells require Stripe entitlement authority") {
+			t.Fatalf("missing Stripe authority should block transfer: %v", err)
+		}
+	})
+}
+
+func TestSignupTrialMigrationClaims(t *testing.T) {
+	ctx := context.Background()
+	mustExec(t, dstPool, `INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
+		VALUES ($1, '192.0.2.1:50051', '192.0.2.1:8080', $2, 65536, 32)
+		ON CONFLICT (id) DO NOTHING`, destHostID, destRegion)
+	newProfile := func(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
+		id := uuid.New()
+		mustExec(t, pool, `INSERT INTO profile (id, email) VALUES ($1, $2)`, id, id.String()+"@example.com")
+		return id
+	}
+	newLegacyTeam := func(t *testing.T, owner uuid.UUID) config {
+		team := uuid.New()
+		mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, $2)`, team, "signup-copy-"+team.String())
+		mustExec(t, srcPool, `INSERT INTO team_member (team_id, profile_id, role) VALUES ($1, $2, 'owner')`, team, owner)
+		mustExec(t, srcPool, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, team, owner)
+		mustExec(t, srcPool, `INSERT INTO user_role_assignments (team_id, user_id, scope_type, role_id)
+			SELECT $1, $2, 'team', id FROM roles WHERE name = 'team_owner'`, team, owner)
+		return config{phase: phaseCopy, teamID: team, sourceURL: srcURL, destURL: dstURL, destHostID: destHostID, destRegion: destRegion}
+	}
+	newExplicitTeam := func(t *testing.T, pool *pgxpool.Pool, owner uuid.UUID) uuid.UUID {
+		var team uuid.UUID
+		if err := pool.QueryRow(ctx, `SELECT id FROM create_team_with_signup_trial($1, $2, 'use')`, "signup-prior-"+uuid.NewString(), owner).Scan(&team); err != nil {
+			t.Fatal(err)
+		}
+		return team
+	}
+
+	t.Run("consumption is present before owner roles and copy retries", func(t *testing.T) {
+		owner := newProfile(t, srcPool)
+		cfg := newLegacyTeam(t, owner)
+		mustExec(t, dstPool, fmt.Sprintf(`CREATE FUNCTION test_migration_signup_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+			  IF NEW.team_id = '%s'::uuid AND NOT EXISTS (
+			    SELECT 1 FROM user_signup_trial_claim c JOIN user_promotion_entitlement e USING (user_id)
+			    WHERE c.user_id = NEW.user_id AND e.signup_trial_claimed_at = c.claimed_at
+			  ) THEN RAISE EXCEPTION 'owner was copied before signup consumption'; END IF;
+			  RETURN NEW;
+			END $$`, cfg.teamID))
+		mustExec(t, dstPool, `CREATE TRIGGER test_migration_signup_guard BEFORE INSERT ON user_role_assignments
+			FOR EACH ROW EXECUTE FUNCTION test_migration_signup_guard()`)
+		t.Cleanup(func() {
+			mustExec(t, dstPool, `DROP TRIGGER test_migration_signup_guard ON user_role_assignments`)
+			mustExec(t, dstPool, `DROP FUNCTION test_migration_signup_guard()`)
+		})
+		for range 2 {
+			if err := run(ctx, cfg); err != nil {
+				t.Fatalf("copy: %v", err)
+			}
+		}
+		assertMigratedSignupConsumed(t, srcPool, owner, &cfg.teamID)
+		assertMigratedSignupConsumed(t, dstPool, owner, &cfg.teamID)
+		assertSignupRetryHasNoGrant(t, dstPool, owner)
+	})
+
+	t.Run("former creator only referenced by consumption marker", func(t *testing.T) {
+		creator, owner := newProfile(t, srcPool), newProfile(t, srcPool)
+		cfg := newLegacyTeam(t, creator)
+		mustExec(t, srcPool, `INSERT INTO team_member (team_id, profile_id, role) VALUES ($1, $2, 'owner')`, cfg.teamID, owner)
+		mustExec(t, srcPool, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, cfg.teamID, owner)
+		mustExec(t, srcPool, `INSERT INTO user_role_assignments (team_id, user_id, scope_type, role_id)
+			SELECT $1, $2, 'team', id FROM roles WHERE name = 'team_owner'`, cfg.teamID, owner)
+		mustExec(t, srcPool, `DELETE FROM user_role_assignments WHERE team_id=$1 AND user_id=$2`, cfg.teamID, creator)
+		mustExec(t, srcPool, `DELETE FROM team_memberships WHERE team_id=$1 AND user_id=$2`, cfg.teamID, creator)
+		mustExec(t, srcPool, `DELETE FROM team_member WHERE team_id=$1 AND profile_id=$2`, cfg.teamID, creator)
+		mustExec(t, srcPool, `UPDATE team_credit_grant SET created_by=NULL WHERE team_id=$1`, cfg.teamID)
+		if err := run(ctx, cfg); err != nil {
+			t.Fatalf("copy: %v", err)
+		}
+		assertMigratedSignupConsumed(t, dstPool, creator, &cfg.teamID)
+		assertSignupRetryHasNoGrant(t, dstPool, creator)
+		var ownerClaimed bool
+		if err := dstPool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM user_signup_trial_claim WHERE user_id=$1)`, owner).Scan(&ownerClaimed); err != nil || ownerClaimed {
+			t.Fatalf("replacement owner consumed the former creator's entitlement: claimed=%t, error=%v", ownerClaimed, err)
+		}
+	})
+
+	for _, association := range []string{"other-team", "deleted-team"} {
+		t.Run(association, func(t *testing.T) {
+			owner := newProfile(t, srcPool)
+			priorTeam := newExplicitTeam(t, srcPool, owner)
+			if association == "deleted-team" {
+				mustExec(t, srcPool, `DELETE FROM team_credit_grant WHERE team_id=$1`, priorTeam)
+				mustExec(t, srcPool, `DELETE FROM team WHERE id=$1`, priorTeam)
+			}
+			cfg := newLegacyTeam(t, owner)
+			if err := run(ctx, cfg); err != nil {
+				t.Fatalf("copy: %v", err)
+			}
+			assertMigratedSignupConsumed(t, dstPool, owner, nil)
+			assertSignupRetryHasNoGrant(t, dstPool, owner)
+			var eligible bool
+			if err := dstPool.QueryRow(ctx, `SELECT team_sandbox_billing_eligible($1)`, cfg.teamID).Scan(&eligible); err != nil || eligible {
+				t.Fatalf("migrated denied team must remain billing-ineligible: eligible=%t, error=%v", eligible, err)
+			}
+		})
+	}
+
+	for _, authority := range []string{"claim", "entitlement-only", "deleted-team"} {
+		t.Run("departed denied creator with "+authority, func(t *testing.T) {
+			creator, owner := newProfile(t, srcPool), newProfile(t, srcPool)
+			priorTeam := newExplicitTeam(t, srcPool, creator)
+			claimedTeam := &priorTeam
+			if authority == "deleted-team" {
+				mustExec(t, srcPool, `DELETE FROM team_credit_grant WHERE team_id=$1`, priorTeam)
+				mustExec(t, srcPool, `DELETE FROM team WHERE id=$1`, priorTeam)
+				claimedTeam = nil
+			}
+			cfg := newLegacyTeam(t, creator)
+			mustExec(t, srcPool, `INSERT INTO team_member (team_id, profile_id, role) VALUES ($1, $2, 'owner')`, cfg.teamID, owner)
+			mustExec(t, srcPool, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, cfg.teamID, owner)
+			mustExec(t, srcPool, `INSERT INTO user_role_assignments (team_id, user_id, scope_type, role_id)
+				SELECT $1, $2, 'team', id FROM roles WHERE name = 'team_owner'`, cfg.teamID, owner)
+			mustExec(t, srcPool, `DELETE FROM user_role_assignments WHERE team_id=$1 AND user_id=$2`, cfg.teamID, creator)
+			mustExec(t, srcPool, `DELETE FROM team_memberships WHERE team_id=$1 AND user_id=$2`, cfg.teamID, creator)
+			mustExec(t, srcPool, `DELETE FROM team_member WHERE team_id=$1 AND profile_id=$2`, cfg.teamID, creator)
+			var inProfileScope, completedDenial bool
+			if err := srcPool.QueryRow(ctx, fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM profile WHERE id=$2 AND (%s)),
+				EXISTS (SELECT 1 FROM team_signup_trial_provenance p JOIN team_signup_trial_denial d USING (team_id)
+				WHERE p.team_id=$1 AND p.creator_user_id=$2 AND p.completed_at IS NOT NULL)`, profileScope),
+				cfg.teamID, creator).Scan(&inProfileScope, &completedDenial); err != nil || inProfileScope || !completedDenial {
+				t.Fatalf("creator must remain linked only by completed provenance: in scope=%t, denied=%t, error=%v", inProfileScope, completedDenial, err)
+			}
+			assertMigratedSignupConsumed(t, srcPool, creator, claimedTeam)
+			if authority == "entitlement-only" {
+				mustExec(t, srcPool, `DELETE FROM user_signup_trial_claim WHERE user_id=$1`, creator)
+			}
+			for range 2 {
+				if err := run(ctx, cfg); err != nil {
+					t.Fatalf("copy: %v", err)
+				}
+				assertMigratedSignupConsumed(t, dstPool, creator, nil)
+			}
+			cfg.phase = phaseDetach
+			cfg.confirmTeamName = "signup-copy-" + cfg.teamID.String()
+			if err := run(ctx, cfg); err != nil {
+				t.Fatalf("detach: %v", err)
+			}
+			assertMigratedSignupConsumed(t, dstPool, creator, nil)
+			assertSignupRetryHasNoGrant(t, dstPool, creator)
+			var eligible, ownerClaimed bool
+			if err := dstPool.QueryRow(ctx, `SELECT team_sandbox_billing_eligible($1),
+				EXISTS (SELECT 1 FROM user_signup_trial_claim WHERE user_id=$2)`, cfg.teamID, owner).Scan(&eligible, &ownerClaimed); err != nil || eligible || ownerClaimed {
+				t.Fatalf("denial and replacement owner eligibility must be preserved: eligible=%t, owner claimed=%t, error=%v", eligible, ownerClaimed, err)
+			}
+			// Model a further destination with no consumption for this actor.
+			// Detach has removed the source's old provenance, so this transfer
+			// can recover the actor only from the first destination's link.
+			mustExec(t, srcPool, `DELETE FROM user_signup_trial_claim WHERE user_id=$1`, creator)
+			mustExec(t, srcPool, `DELETE FROM user_promotion_entitlement WHERE user_id=$1`, creator)
+			if err := mergeSignupTrialState(ctx, dstPool, srcPool, cfg.teamID); err != nil {
+				t.Fatalf("second-hop consumption transfer: %v", err)
+			}
+			assertMigratedSignupConsumed(t, srcPool, creator, nil)
+			assertSignupRetryHasNoGrant(t, srcPool, creator)
+		})
+	}
+
+	t.Run("preserves destination claims and independent Stripe state", func(t *testing.T) {
+		owner := newProfile(t, srcPool)
+		cfg := newLegacyTeam(t, owner)
+		mustExec(t, dstPool, `INSERT INTO profile (id, email) VALUES ($1, $2)`, owner, owner.String()+"@example.com")
+		priorTeam := newExplicitTeam(t, dstPool, owner)
+		mustExec(t, dstPool, `UPDATE user_promotion_entitlement SET stripe_redemption_at=now(), stripe_redemption_team_id=$2 WHERE user_id=$1`, owner, priorTeam)
+		before := scanString(t, dstPool, `SELECT to_jsonb(e)::text FROM user_promotion_entitlement e WHERE user_id=$1`, owner)
+		for range 2 {
+			if err := run(ctx, cfg); err != nil {
+				t.Fatalf("copy: %v", err)
+			}
+		}
+		after := scanString(t, dstPool, `SELECT to_jsonb(e)::text FROM user_promotion_entitlement e WHERE user_id=$1`, owner)
+		if before != after {
+			t.Fatalf("destination entitlement changed: before=%s, after=%s", before, after)
+		}
+		assertMigratedSignupConsumed(t, dstPool, owner, &priorTeam)
+		assertSignupRetryHasNoGrant(t, dstPool, owner)
+	})
+
+	t.Run("source entitlement-only consumption", func(t *testing.T) {
+		owner := newProfile(t, srcPool)
+		cfg := newLegacyTeam(t, owner)
+		mustExec(t, srcPool, `DELETE FROM user_signup_trial_claim WHERE user_id=$1`, owner)
+		if err := run(ctx, cfg); err != nil {
+			t.Fatalf("copy: %v", err)
+		}
+		assertMigratedSignupConsumed(t, dstPool, owner, &cfg.teamID)
+		assertSignupRetryHasNoGrant(t, dstPool, owner)
+	})
+
+	t.Run("destination entitlement-only consumption wins", func(t *testing.T) {
+		owner := newProfile(t, srcPool)
+		cfg := newLegacyTeam(t, owner)
+		mustExec(t, dstPool, `INSERT INTO profile (id, email) VALUES ($1, $2)`, owner, owner.String()+"@example.com")
+		priorTeam := newExplicitTeam(t, dstPool, owner)
+		mustExec(t, dstPool, `DELETE FROM user_signup_trial_claim WHERE user_id=$1`, owner)
+		if err := run(ctx, cfg); err != nil {
+			t.Fatalf("copy: %v", err)
+		}
+		assertMigratedSignupConsumed(t, dstPool, owner, &priorTeam)
+	})
+
+	t.Run("missing destination schema fails before copying ownership", func(t *testing.T) {
+		owner := newProfile(t, srcPool)
+		cfg := newLegacyTeam(t, owner)
+		mustExec(t, dstPool, `ALTER TABLE user_signup_trial_claim RENAME TO test_unavailable_signup_claim`)
+		defer mustExec(t, dstPool, `ALTER TABLE test_unavailable_signup_claim RENAME TO user_signup_trial_claim`)
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), "cannot preserve consumed signup claims") {
+			t.Fatalf("missing schema must block migration: %v", err)
+		}
+		var owners int
+		if err := dstPool.QueryRow(ctx, `SELECT count(*) FROM user_role_assignments WHERE team_id=$1`, cfg.teamID).Scan(&owners); err != nil || owners != 0 {
+			t.Fatalf("unsupported destination received ownership: owners=%d, error=%v", owners, err)
+		}
+	})
+
+	t.Run("missing destination denial schema fails before copying ownership", func(t *testing.T) {
+		owner := newProfile(t, srcPool)
+		newExplicitTeam(t, srcPool, owner)
+		cfg := newLegacyTeam(t, owner)
+		mustExec(t, dstPool, `ALTER TABLE team_signup_trial_denial RENAME TO test_unavailable_signup_denial`)
+		defer mustExec(t, dstPool, `ALTER TABLE test_unavailable_signup_denial RENAME TO team_signup_trial_denial`)
+		err := run(ctx, cfg)
+		if err == nil || !strings.Contains(err.Error(), "cannot preserve signup denial") {
+			t.Fatalf("missing denial schema must block migration: %v", err)
+		}
+		var owners int
+		if err := dstPool.QueryRow(ctx, `SELECT count(*) FROM user_role_assignments WHERE team_id=$1`, cfg.teamID).Scan(&owners); err != nil || owners != 0 {
+			t.Fatalf("unsupported destination received ownership: owners=%d, error=%v", owners, err)
+		}
+	})
+
+	t.Run("older source requires backfill before expanded destination", func(t *testing.T) {
+		owner := newProfile(t, srcPool)
+		cfg := newLegacyTeam(t, owner)
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, `ALTER TABLE user_signup_trial_claim RENAME TO test_old_signup_claim;
+			ALTER TABLE user_promotion_entitlement RENAME TO test_old_promotion_entitlement;
+			ALTER TABLE team_signup_trial_denial RENAME TO test_old_signup_denial`); err != nil {
+			t.Fatal(err)
+		}
+		if err := mergeSignupTrialState(ctx, tx, dstPool, cfg.teamID); err == nil || !strings.Contains(err.Error(), "source has no promotion authority") {
+			t.Fatalf("old source consumption must not be lost: %v", err)
+		}
+		// Old-to-old migrations retain their existing contract. Both sides
+		// must install the backfill before enabling promotion enforcement.
+		for _, table := range []string{"user_signup_trial_claim", "user_promotion_entitlement", "team_signup_trial_denial"} {
+			mustExec(t, dstPool, "ALTER TABLE "+table+" RENAME TO test_old_"+table)
+			defer mustExec(t, dstPool, "ALTER TABLE test_old_"+table+" RENAME TO "+table)
+		}
+		if err := mergeSignupTrialState(ctx, tx, dstPool, cfg.teamID); err != nil {
+			t.Fatalf("old-to-old migration: %v", err)
+		}
+	})
+
+	t.Run("consumed claims from source without legacy provenance", func(t *testing.T) {
+		owner := newProfile(t, srcPool)
+		cfg := newLegacyTeam(t, owner)
+		tx, err := srcPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, `ALTER TABLE team_signup_trial_provenance RENAME TO test_old_signup_provenance`); err != nil {
+			t.Fatal(err)
+		}
+		if err := mergeSignupTrialState(ctx, tx, dstPool, cfg.teamID); err != nil {
+			t.Fatalf("source without provenance: %v", err)
+		}
+		assertMigratedSignupConsumed(t, dstPool, owner, nil)
+		assertSignupRetryHasNoGrant(t, dstPool, owner)
 	})
 }
 

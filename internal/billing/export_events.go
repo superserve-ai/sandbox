@@ -171,7 +171,24 @@ func (s ExportStore) Enroll(ctx context.Context, p ExportPeriod) error {
         FOR UPDATE`, p.TeamID, p.Start, p.End).Scan(&status, &finalized, &exported, &enrolled); err != nil {
 		return err
 	}
-	if enrolled {
+	var shadowOnly bool
+	if exported || status == "exported" {
+		// A shadow handoff is pre-enrolled before its first live export. Once
+		// incremental accounting records coverage or observes even zero usage,
+		// the old shadow rows cannot justify reopening a completed live export.
+		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_usage_export
+			WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='skipped_shadow')
+			AND NOT EXISTS(SELECT 1 FROM billing_usage_export
+			WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status<>'skipped_shadow')
+			AND NOT EXISTS(SELECT 1 FROM billing_export_allocation
+			WHERE team_id=$1 AND period_start=$2 AND period_end=$3)
+			AND NOT EXISTS(SELECT 1 FROM billing_export_observation
+			WHERE team_id=$1 AND period_start=$2 AND period_end=$3)`,
+			p.TeamID, p.Start, p.End).Scan(&shadowOnly); err != nil {
+			return err
+		}
+	}
+	if enrolled && !shadowOnly {
 		return tx.Commit(ctx)
 	}
 	if finalized || status == "blocked" {
@@ -189,14 +206,6 @@ func (s ExportStore) Enroll(ctx context.Context, p ExportPeriod) error {
 	if exported || status == "exported" {
 		// Shadow completion records no provider coverage. Reopen only an
 		// unfinalized shadow-only period, under the same lock as legacy writers.
-		var shadowOnly bool
-		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM billing_usage_export
-            WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status='skipped_shadow')
-            AND NOT EXISTS(SELECT 1 FROM billing_usage_export
-            WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND status<>'skipped_shadow')`,
-			p.TeamID, p.Start, p.End).Scan(&shadowOnly); err != nil {
-			return err
-		}
 		if !shadowOnly {
 			return ErrExportRecoveryRequired
 		}
