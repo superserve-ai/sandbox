@@ -1896,30 +1896,38 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		if usable {
 			snapshotType = "layered"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
+			// One Full pause is the safe degradation from a layered one
+			// (the vCPUs are already paused; CreateSnapshot's pause PATCH is
+			// idempotent). Nothing is removed until that Full has landed: if
+			// it fails the VM keeps running and the overlay with its
+			// sidecars is still the valid artifact.
+			fullInstead := func(why string, err error) error {
+				log.Warn().Err(err).Str("vm_id", vmID).Msg("pause: " + why + "; falling back to full snapshot")
+				snapshotType = "full"
+				memPath, baseMemPath = fullPath, ""
+				if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
+					snapshotDur = time.Since(tSnapshot)
+					return m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
+				}
+				if instMemFile == overlayPath {
+					// The accumulating overlay is now stranded; reclaimed
+					// with its sidecars after the stop.
+					orphanedOverlay = overlayPath
+				} else {
+					// First pass: whatever of the overlay exists, from the
+					// .base sidecar written above to a diff that was not
+					// proven whole, is for an image that never followed.
+					_ = os.Remove(layeredBaseSidecarPath(overlayPath))
+					_ = freshenFirstPassOverlay(overlayPath)
+				}
+				return nil
+			}
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath, trackingSessionID, trackingGeneration); err != nil {
 				if errors.Is(err, ErrDirtyTrackingMismatch) || m.sessionRejectedAtPause(err) {
 					// Rejected before Firecracker touched the bitmap or the
-					// overlay, so one Full pause is the safe degradation (the
-					// vCPUs are already paused; CreateSnapshot's pause PATCH is
-					// idempotent). Nothing is removed until that Full has
-					// landed: if it fails the VM keeps running and the overlay
-					// with its sidecars is still the valid artifact.
-					log.Warn().Err(err).Str("vm_id", vmID).
-						Msg("pause: guarded diff rejected; falling back to full snapshot")
-					snapshotType = "full"
-					memPath, baseMemPath = fullPath, ""
-					if err := CreateSnapshot(socketPath, snapshotPath, memPath, "", SnapshotNormal); err != nil {
-						snapshotDur = time.Since(tSnapshot)
-						return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create snapshot: %w", err))
-					}
-					if instMemFile == overlayPath {
-						// The accumulating overlay is now stranded; reclaimed
-						// with its sidecars after the stop.
-						orphanedOverlay = overlayPath
-					} else {
-						// First pass: only the .base sidecar written above
-						// exists, for an overlay that never followed.
-						_ = os.Remove(layeredBaseSidecarPath(overlayPath))
+					// overlay.
+					if ferr := fullInstead("guarded diff rejected", err); ferr != nil {
+						return "", "", nil, ferr
 					}
 				} else {
 					snapshotDur = time.Since(tSnapshot)
@@ -1939,7 +1947,14 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 					return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
 				}
 			} else if verr := m.verifyPresenceRefreshed(memPath, sidecarMark); verr != nil {
-				log.Warn().Err(verr).Msg("pause: presence side-car not proven this save's")
+				// The diff landed, but its map was not proven this save's:
+				// absent, a strict host refuses the image; stale, a restore
+				// trusts it wrongly. The image is not published; the Full
+				// that replaces it holds everything, and the overlay is
+				// stranded or removed with it.
+				if ferr := fullInstead("presence side-car not proven this save's", verr); ferr != nil {
+					return "", "", nil, ferr
+				}
 			}
 		} else {
 			// Same stranding as the mismatch fallback: an accumulating

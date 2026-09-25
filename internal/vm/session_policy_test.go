@@ -665,3 +665,32 @@ func TestRestoreForResume_RunsTheHookBeforeTheLegacyRetry(t *testing.T) {
 		t.Fatalf("the legacy retry ran after a failed hook: %d requests", n)
 	}
 }
+
+// A Firecracker that leaves the presence side-car as it was does not get
+// its layered image published: the pause takes a Full instead and strands
+// the overlay, as the mismatch fallback does.
+func TestPauseVM_UnrefreshedPresenceMapFallsBackToFull(t *testing.T) {
+	fc := startSnapshotAPIFake(t, nil)
+	m, inst, dir, overlay := layeredPauseFixture(t, fc)
+	if err := presence.Write(overlay, 4096, 4, []uint64{0b0001}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, memPath, _, err := m.PauseVM(context.Background(), "vm-1", dir, "tok-test")
+	if err != nil {
+		t.Fatalf("pause must succeed via the Full fallback: %v", err)
+	}
+	if memPath != filepath.Join(dir, "mem.snap") {
+		t.Fatalf("an unproven layered image was published: %s", memPath)
+	}
+	bodies := fc.snapshotBodies()
+	if len(bodies) != 2 || !isDiffRequest(bodies[0]) || isDiffRequest(bodies[1]) {
+		t.Fatalf("want a Diff then a Full, got %v", bodies)
+	}
+	inst.mu.RLock()
+	base, stranded := inst.BaseMemPath, append([]string(nil), inst.StrandedOverlays...)
+	inst.mu.RUnlock()
+	if base != "" || len(stranded) != 1 || stranded[0] != overlay {
+		t.Fatalf("Full fallback not recorded as standalone with the overlay stranded: base=%q stranded=%v", base, stranded)
+	}
+}
