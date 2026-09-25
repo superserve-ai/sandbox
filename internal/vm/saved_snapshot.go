@@ -455,6 +455,7 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 			}
 		}
 	}
+	var sidecarMark time.Time
 	if chainMem != "" {
 		// Firecracker rewrites the disk block map beside the vmstate with
 		// every snapshot it saves one for; one it saves none for must not
@@ -463,7 +464,18 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 		if err := os.Remove(overlayBlockMapPath(vmstate)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", fmt.Errorf("drop previous block map: %w", err)
 		}
-		sidecarMark := markPresenceForSave(chainMem)
+		if layered {
+			// A map that cannot be marked cannot be proven this save's
+			// afterwards: a full image of its own instead.
+			mark, err := markPresenceForSave(chainMem)
+			if err != nil {
+				log.Warn().Err(err).Msg("saved snapshot: presence map could not be marked; taking a full image")
+				chainMem = ""
+			}
+			sidecarMark = mark
+		}
+	}
+	if chainMem != "" {
 		err := CreateDiffSnapshotContext(ctx, socket, vmstate, chainMem, sessionID, generation)
 		switch {
 		case err == nil:
@@ -473,14 +485,14 @@ func (m *Manager) captureRunningMemory(ctx context.Context, inst *VMInstance, tm
 			}
 			advanceChain(inst, vmstate, chainMem, recordBase)
 			if layered {
-				m.verifyPresenceRefreshed(chainMem, sidecarMark, log)
-				if !fileExists(presence.SidecarPath(chainMem)) {
-					// Written by a Firecracker that predates the map: the
-					// overlay cannot be restored, so the source's next pause
-					// must be a full one, which strands it. The chain still
-					// moved on, and the record says so.
+				// A map not proven this save's, absent or left as marked by
+				// a Firecracker that predates it, makes the overlay one
+				// nothing may restore: the source's next pause must be a
+				// full one, which strands it. The chain still moved on, and
+				// the record says so.
+				if err := m.verifyPresenceRefreshed(chainMem, sidecarMark); err != nil {
 					m.abandonDirtyBaseline(inst)
-					return chainMem, status.Error(codes.DataLoss, "chain overlay has no presence map; the source's next pause is a full one")
+					return chainMem, status.Errorf(codes.DataLoss, "chain overlay's presence map is not this capture's; the source's next pause is a full one: %v", err)
 				}
 			}
 			if err := m.cloneChainIntoSnapshot(ctx, tmp, final, vmstate, chainMem, recordBase, man); err != nil {

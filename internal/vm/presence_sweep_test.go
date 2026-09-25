@@ -260,29 +260,34 @@ func TestSweepRederivesMarkerBothDirections(t *testing.T) {
 func TestVerifyPresenceRefreshed(t *testing.T) {
 	root := t.TempDir()
 	m := &Manager{cfg: ManagerConfig{SnapshotDir: root}, log: zerolog.Nop(), vms: map[string]*VMInstance{}}
-	nop := zerolog.Nop()
 	mem := sweepFixture(t, root, "vm-r")
 	sc := presence.SidecarPath(mem)
 
-	// A side-car written during the save is kept: there was none before,
-	// or the save wrote it, by rename or in place, however quickly.
-	mark := markPresenceForSave(mem)
+	// A side-car written during the save is proven the save's: there was
+	// none before, or the save wrote it, by rename or in place, however
+	// quickly.
+	mark, err := markPresenceForSave(mem)
+	if err != nil || !mark.IsZero() {
+		t.Fatalf("mark with no side-car: %v %v", mark, err)
+	}
 	if err := presence.Write(mem, 4096, 4, []uint64{0b0110}); err != nil {
 		t.Fatal(err)
 	}
-	m.verifyPresenceRefreshed(mem, mark, nop)
-	if _, err := os.Stat(sc); err != nil {
-		t.Fatalf("fresh side-car removed: %v", err)
+	if err := m.verifyPresenceRefreshed(mem, mark); err != nil {
+		t.Fatalf("fresh side-car refused: %v", err)
 	}
-	mark = markPresenceForSave(mem)
+	if mark, err = markPresenceForSave(mem); err != nil || mark.IsZero() {
+		t.Fatalf("mark with a side-car: %v %v", mark, err)
+	}
 	if err := presence.Write(mem, 4096, 4, []uint64{0b0111}); err != nil {
 		t.Fatal(err)
 	}
-	m.verifyPresenceRefreshed(mem, mark, nop)
-	if _, err := os.Stat(sc); err != nil {
-		t.Fatalf("side-car replaced by rename removed: %v", err)
+	if err := m.verifyPresenceRefreshed(mem, mark); err != nil {
+		t.Fatalf("side-car replaced by rename refused: %v", err)
 	}
-	mark = markPresenceForSave(mem)
+	if mark, err = markPresenceForSave(mem); err != nil {
+		t.Fatal(err)
+	}
 	inPlace, err := os.OpenFile(sc, os.O_WRONLY|os.O_TRUNC, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -291,20 +296,26 @@ func TestVerifyPresenceRefreshed(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = inPlace.Close()
-	m.verifyPresenceRefreshed(mem, mark, nop)
-	if _, err := os.Stat(sc); err != nil {
-		t.Fatalf("side-car rewritten in place removed: %v", err)
+	if err := m.verifyPresenceRefreshed(mem, mark); err != nil {
+		t.Fatalf("side-car rewritten in place refused: %v", err)
 	}
 
 	// A side-car the save did not touch (the old-Firecracker misorder) is
-	// removed so a newer Firecracker can never trust it.
-	m.verifyPresenceRefreshed(mem, markPresenceForSave(mem), nop)
+	// refused and removed, so a newer Firecracker can never trust it.
+	if mark, err = markPresenceForSave(mem); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.verifyPresenceRefreshed(mem, mark); err == nil {
+		t.Fatal("a side-car the save never touched was taken for the save's")
+	}
 	if _, err := os.Stat(sc); !os.IsNotExist(err) {
 		t.Error("stale side-car not removed")
 	}
 
-	// Missing side-car: warn-only, nothing created.
-	m.verifyPresenceRefreshed(mem, time.Time{}, nop)
+	// Missing side-car: refused, nothing created.
+	if err := m.verifyPresenceRefreshed(mem, time.Time{}); err == nil {
+		t.Fatal("a missing side-car was taken for the save's")
+	}
 	if _, err := os.Stat(sc); !os.IsNotExist(err) {
 		t.Error("guard created a side-car")
 	}

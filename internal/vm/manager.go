@@ -1885,7 +1885,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		if usable {
 			snapshotType = "layered"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
-			sidecarMark := markPresenceForSave(memPath)
+			sidecarMark, markErr := markPresenceForSave(memPath)
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath, trackingSessionID, trackingGeneration); err != nil {
 				if errors.Is(err, ErrDirtyTrackingMismatch) || m.sessionRejectedAtPause(err) {
 					// Rejected before Firecracker touched the bitmap or the
@@ -1929,7 +1929,9 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 					return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
 				}
 			} else {
-				m.verifyPresenceRefreshed(memPath, sidecarMark, log)
+				if verr := m.verifyPresenceRefreshed(memPath, sidecarMark); verr != nil || markErr != nil {
+					log.Warn().AnErr("verify", verr).AnErr("mark", markErr).Msg("pause: presence side-car not proven this save's")
+				}
 			}
 		} else {
 			// Same stranding as the mismatch fallback: an accumulating
