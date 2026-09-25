@@ -1882,10 +1882,20 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 				usable = false
 			}
 		}
+		// A presence map that cannot be marked cannot be proven this save's
+		// afterwards, and an unproven map is one a restore may trust wrongly:
+		// a Full instead.
+		var sidecarMark time.Time
+		if usable {
+			var markErr error
+			if sidecarMark, markErr = markPresenceForSave(memPath); markErr != nil {
+				log.Warn().Err(markErr).Msg("pause: presence side-car could not be marked; falling back to Full")
+				usable = false
+			}
+		}
 		if usable {
 			snapshotType = "layered"
 			log.Info().Str("snapshot_path", snapshotPath).Msg("pausing VM — creating layered diff snapshot")
-			sidecarMark, markErr := markPresenceForSave(memPath)
 			if err := CreateDiffSnapshot(socketPath, snapshotPath, memPath, trackingSessionID, trackingGeneration); err != nil {
 				if errors.Is(err, ErrDirtyTrackingMismatch) || m.sessionRejectedAtPause(err) {
 					// Rejected before Firecracker touched the bitmap or the
@@ -1928,10 +1938,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 					_ = os.Remove(clockFreezeMarkerPath(memPath))
 					return "", "", nil, m.handleVMError(vmID, fmt.Errorf("create layered diff snapshot: %w", err))
 				}
-			} else {
-				if verr := m.verifyPresenceRefreshed(memPath, sidecarMark); verr != nil || markErr != nil {
-					log.Warn().AnErr("verify", verr).AnErr("mark", markErr).Msg("pause: presence side-car not proven this save's")
-				}
+			} else if verr := m.verifyPresenceRefreshed(memPath, sidecarMark); verr != nil {
+				log.Warn().Err(verr).Msg("pause: presence side-car not proven this save's")
 			}
 		} else {
 			// Same stranding as the mismatch fallback: an accumulating
