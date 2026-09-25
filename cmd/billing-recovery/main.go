@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -247,6 +248,25 @@ func (c stripeClient) isVerifiedActivationGrant(grant stripeGrant, localGrantID,
 		return grant.ID == localGrantID
 	}
 	return strings.TrimSpace(grant.Metadata[activationGrantIdentityMetadataKey]) == identity
+}
+
+func (c stripeClient) createGrant(ctx context.Context, customer, key, identity string) (string, error) {
+	form := url.Values{}
+	form.Set("customer", customer)
+	form.Set("category", "promotional")
+	form.Set("amount[type]", "monetary")
+	form.Set("amount[monetary][currency]", "usd")
+	form.Set("amount[monetary][value]", strconv.FormatInt(c.activationCreditCents(), 10))
+	form.Set("applicability_config[scope][price_type]", "metered")
+	form.Set("metadata["+activationGrantIdentityMetadataKey+"]", identity)
+	var grant stripeGrant
+	if err := c.request(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, key); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(grant.ID) == "" {
+		return "", errors.New("Stripe credit grant response did not include an ID")
+	}
+	return grant.ID, nil
 }
 
 func main() {

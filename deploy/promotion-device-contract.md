@@ -14,8 +14,8 @@ The shared Auth PostgreSQL project owns `signup_device_attempt` and
 separately from each regional migration chain. The immutability script revokes
 Supabase's direct application-role table grants and guards accepted facts.
 This store is server only, independent of East or West promotion databases.
-Verified attempts
-and account bindings are retained indefinitely, including after account deletion;
+Verified attempts and account bindings are retained indefinitely, including after
+account deletion;
 unverified attempts may be purged only after their verification window closes.
 Database backups and migration rollback protection must retain the tables.
 
@@ -163,6 +163,8 @@ registration request cannot provide a new event or Fingerprint. Requests are
 limited to 4 KiB and database work to three seconds; SQL errors are not
 interpreted as eligibility. Invoke the register route on the selected regional
 control plane before the grant decision, including delayed West entry.
+
+The control-plane routes above invoke the following shared Auth operations:
 
 1. `create_signup_device_attempt()` before Fingerprint capture. It returns an
    unpredictable attempt UUID and challenge UUID. Only the challenge is sent to
