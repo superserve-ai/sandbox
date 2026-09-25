@@ -217,9 +217,10 @@ module "api" {
     STRIPE_CHECKOUT_PRICE_IDS   = "price_1U60fMPyzR3Q9AgflfcjIHsp,price_1U60hxPyzR3Q9AgfOsciXQ43"
     APP_ALLOWED_ORIGINS         = "https://console.superserve.ai"
 
-    # The purge of deleted sandboxes' backups: the cell's bucket and the
-    # GC identity the runtime impersonates to delete from it.
-    BACKUP_BUCKET             = module.backup_storage.bucket_name
+    # The purge of deleted sandboxes' backups from BACKUP_BUCKET: the GC
+
+    # identity the runtime impersonates to delete from it.
+
     BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
   }
 

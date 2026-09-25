@@ -345,8 +345,8 @@ func run() error {
 	}
 	handlers.StartTeardownSweeper(ctx)
 	handlers.StartLogRetention(ctx)
-	if cfg.BackupBucket != "" {
-		admin, err := backup.NewGCSAdmin(ctx, cfg.BackupBucket, cfg.BackupGCServiceAccount)
+	if cfg.BackupGCServiceAccount != "" {
+		admin, err := backup.NewGCSAdmin(ctx, cfg.TemplateBackupBucket, cfg.BackupGCServiceAccount)
 		if err != nil {
 			return fmt.Errorf("backup gc: %w", err)
 		}

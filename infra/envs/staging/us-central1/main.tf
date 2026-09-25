@@ -220,9 +220,10 @@ module "api" {
     STRIPE_API_VERSION          = "2026-05-27.dahlia"
     APP_ALLOWED_ORIGINS         = "https://console-staging.superserve.ai"
 
-    # The purge of deleted sandboxes' backups: the cell's bucket and the
-    # GC identity the runtime impersonates to delete from it.
-    BACKUP_BUCKET             = module.backup_storage.bucket_name
+    # The purge of deleted sandboxes' backups from BACKUP_BUCKET: the GC
+
+    # identity the runtime impersonates to delete from it.
+
     BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
   }
   secrets = {
