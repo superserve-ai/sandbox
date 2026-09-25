@@ -63,11 +63,18 @@ func (h *Handlers) runComputeReconciliation(ctx context.Context, source *abuse.C
 				return
 			}
 		}
+		if ctx.Err() != nil {
+			return
+		}
 		if !running {
 			running = true
 			updates = make(chan *abuse.ComputeSnapshot)
 			go func() {
 				defer func() { done <- struct{}{} }()
+				// Cancellation can arrive while refresh or the previous sweep finishes.
+				if ctx.Err() != nil {
+					return
+				}
 				sentrylog.RunSafe("compute-reconciliation", func() { sweep(ctx, updates) })
 			}()
 		}

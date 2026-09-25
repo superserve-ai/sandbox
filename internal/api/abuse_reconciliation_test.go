@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/google/uuid"
@@ -273,6 +274,38 @@ cancelSweep:
 	if peak != 1 || calls != 2 {
 		t.Fatalf("sweeps: calls=%d peak=%d", calls, peak)
 	}
+}
+
+func TestComputeSchedulerCancellationDuringRefreshDoesNotRestartSweep(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		started := make(chan struct{}, 2)
+		source := abuse.NewConfigComputeSource(filepath.Join(t.TempDir(), "missing.json"), nil, func(context.Context, string) {
+			cancel()
+		})
+		ticks := make(chan time.Time)
+		done := make(chan struct{})
+		h := &Handlers{}
+		go func() {
+			defer close(done)
+			h.runComputeReconciliation(ctx, source, ticks, func(context.Context, <-chan *abuse.ComputeSnapshot) {
+				started <- struct{}{}
+			})
+		}()
+		<-started
+		// Finish the first sweep and publish its completion before refreshing.
+		synctest.Wait()
+		ticks <- time.Time{}
+		<-done
+		// Include any sweep goroutine launched just before the scheduler exited.
+		synctest.Wait()
+		select {
+		case <-started:
+			t.Fatal("started another sweep after refresh canceled the scheduler")
+		default:
+		}
+	})
 }
 
 func TestComputeCandidateRechecksPublishedPolicyBeforeClaim(t *testing.T) {

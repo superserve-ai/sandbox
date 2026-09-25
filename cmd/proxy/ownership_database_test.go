@@ -19,7 +19,7 @@ func TestRoutingDatabaseCredentialContract(t *testing.T) {
 	if url == "" {
 		t.Skip("set PEER_ROUTING_TEST_DATABASE_URL for PostgreSQL role contract")
 	}
-	t.Run("administrator", func(t *testing.T) { testRoutingDatabaseCredentialContract(t, url) })
+	t.Run("administrator", func(t *testing.T) { testRoutingDatabaseCredentialContract(t, url, url) })
 	t.Run("role_administrator", func(t *testing.T) {
 		ctx := context.Background()
 		admin, err := pgx.Connect(ctx, url)
@@ -32,17 +32,19 @@ func TestRoutingDatabaseCredentialContract(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() {
-			if _, err := admin.Exec(ctx, "DROP ROLE "+pgx.Identifier{name}.Sanitize()); err != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if _, err := admin.Exec(cleanupCtx, "DROP ROLE "+pgx.Identifier{name}.Sanitize()); err != nil {
 				t.Error(err)
 			}
 		}()
 		cfg := admin.Config()
 		adminURL := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable", cfg.Host, cfg.Port, cfg.Database, name, password)
-		testRoutingDatabaseCredentialContract(t, adminURL)
+		testRoutingDatabaseCredentialContract(t, adminURL, url)
 	})
 }
 
-func testRoutingDatabaseCredentialContract(t *testing.T, url string) {
+func testRoutingDatabaseCredentialContract(t *testing.T, url, cleanupURL string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -63,10 +65,21 @@ func testRoutingDatabaseCredentialContract(t *testing.T, url string) {
 		t.Fatal(err)
 	}
 	defer func() {
-		if _, err := admin.Exec(context.Background(), "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		// FORCE still requires permission to terminate other roles' backends.
+		cleanupAdmin, err := pgx.Connect(cleanupCtx, cleanupURL)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer cleanupAdmin.Close(cleanupCtx)
+		if _, err := cleanupAdmin.Exec(cleanupCtx, "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
 			t.Error(err)
 		}
-		if _, err := admin.Exec(context.Background(), "DROP ROLE IF EXISTS sandbox_proxy_router"); err != nil {
+		roleCtx, cancelRole := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancelRole()
+		if _, err := cleanupAdmin.Exec(roleCtx, "DROP ROLE IF EXISTS sandbox_proxy_router"); err != nil {
 			t.Error(err)
 		}
 	}()
@@ -179,4 +192,17 @@ func testRoutingDatabaseCredentialContract(t *testing.T, url string) {
 	if err == nil {
 		t.Fatal("startup accepted administrator credential")
 	}
+	// Keep a router backend alive through deferred fixture teardown to model a
+	// server connection that has not exited yet after the client pool closes.
+	connectCtx, cancelConnect := context.WithTimeout(context.Background(), 10*time.Second)
+	lingering, err := pgx.Connect(connectCtx, routingURL)
+	cancelConnect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		lingering.Close(closeCtx)
+	})
 }
