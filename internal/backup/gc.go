@@ -102,29 +102,6 @@ func PurgeGeneration(ctx context.Context, store BlobAdmin, sandboxID, generation
 	return deleted, fmt.Errorf("%s: objects keep appearing under the generation", prefix)
 }
 
-// ManifestBaseDigests returns the shared base digests a complete
-// generation's manifest names. An incomplete generation (no manifest)
-// names none.
-func ManifestBaseDigests(ctx context.Context, r BlobReader, sandboxID, generation string) ([]string, error) {
-	manifest, err := fetchManifest(ctx, r, sandboxID, generation, func(string, ...any) {})
-	if errors.Is(err, ErrGenerationIncomplete) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var digests []string
-	for _, f := range manifest.Files {
-		if !isSharedEntry(f) {
-			continue
-		}
-		if sha, _, ok := strings.Cut(strings.TrimPrefix(f.Object, sharedBasePrefix), ".p"); ok && len(sha) == 64 {
-			digests = append(digests, sha)
-		}
-	}
-	return digests, nil
-}
-
 // SandboxGenerations describes every sandbox generation with objects in
 // the bucket, from one listing: for each sandbox id, its generations and
 // whether each is complete (carries a manifest).
@@ -150,23 +127,4 @@ func SandboxGenerations(ctx context.Context, lister BlobLister) (map[string]map[
 		out[id][generation] = out[id][generation] || file == ManifestObject
 	}
 	return out, nil
-}
-
-// SharedBases lists the bucket's shared base objects grouped by content
-// digest: one digest may be stored under several packing fingerprints.
-func SharedBases(ctx context.Context, lister BlobLister) (map[string][]ObjectInfo, error) {
-	objects, err := lister.List(ctx, sharedBasePrefix)
-	if err != nil {
-		return nil, err
-	}
-	bases := map[string][]ObjectInfo{}
-	for _, obj := range objects {
-		rest := strings.TrimPrefix(obj.Name, sharedBasePrefix)
-		sha, _, ok := strings.Cut(rest, ".p")
-		if !ok || len(sha) != 64 {
-			continue
-		}
-		bases[sha] = append(bases[sha], obj)
-	}
-	return bases, nil
 }

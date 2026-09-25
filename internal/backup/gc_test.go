@@ -77,23 +77,6 @@ func TestPurgeGenerationRemovesOnlyThatGeneration(t *testing.T) {
 	}
 }
 
-func TestSharedBasesGroupsObjectsByDigest(t *testing.T) {
-	store := newMemBlobs()
-	sha := digestOf([]byte("base"))
-	for _, name := range []string{"bases/" + sha + ".paaaa", "bases/" + sha + ".pbbbb", "bases/not-a-base", "sandboxes/x/y/z"} {
-		if _, err := store.Create(context.Background(), name, bytes.NewReader([]byte("x"))); err != nil {
-			t.Fatal(err)
-		}
-	}
-	bases, err := SharedBases(context.Background(), store)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(bases) != 1 || len(bases[sha]) != 2 || bases[sha][0].Created.IsZero() {
-		t.Fatalf("bases = %v", bases)
-	}
-}
-
 func TestSandboxGenerationsDescribesTheBucketFromOneListing(t *testing.T) {
 	store := newMemBlobs()
 	a := writePauseFixture(t, t.TempDir(), "pause A")
@@ -115,35 +98,5 @@ func TestSandboxGenerationsDescribesTheBucketFromOneListing(t *testing.T) {
 	}
 	if !got[a.SandboxID][a.Generation] || got[a.SandboxID]["half-done"] {
 		t.Fatalf("completeness = %v; want the uploaded generation complete and the manifest-less one not", got[a.SandboxID])
-	}
-}
-
-func TestManifestBaseDigestsNamesTheSharedBase(t *testing.T) {
-	store := newMemBlobs()
-	dir := t.TempDir()
-	baseData := bytes.Repeat([]byte{0x22}, 64<<10)
-	basePath := filepath.Join(dir, "base.ext4")
-	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	overlay := writePauseFixture(t, dir, "pause A")
-	overlay.Files[0].BasePath = basePath
-	overlay.Files[0].BaseSHA256 = digestOf(baseData)
-	overlay.Generation = GenerationKey(overlay.Files)
-	uploadFixture(t, store, overlay)
-	standalone := writePauseFixture(t, t.TempDir(), "pause B")
-	uploadFixture(t, store, standalone)
-
-	got, err := ManifestBaseDigests(context.Background(), store, overlay.SandboxID, overlay.Generation)
-	if err != nil || len(got) != 1 || got[0] != digestOf(baseData) {
-		t.Fatalf("overlay generation bases = %v, %v", got, err)
-	}
-	got, err = ManifestBaseDigests(context.Background(), store, standalone.SandboxID, standalone.Generation)
-	if err != nil || len(got) != 0 {
-		t.Fatalf("standalone generation bases = %v, %v", got, err)
-	}
-	got, err = ManifestBaseDigests(context.Background(), store, overlay.SandboxID, "0000000000000000000000000000000000000000000000000000000000000000")
-	if err != nil || len(got) != 0 {
-		t.Fatalf("incomplete generation bases = %v, %v; want none and no error", got, err)
 	}
 }

@@ -122,37 +122,6 @@ func (q *Queries) CoveredBackupGeneration(ctx context.Context, id uuid.UUID) (st
 	return generation, err
 }
 
-const inUseBasePaths = `-- name: InUseBasePaths :many
-SELECT DISTINCT base_path::text AS base_path FROM sandbox WHERE destroyed_at IS NULL AND base_path IS NOT NULL
-UNION
-SELECT DISTINCT base_path::text FROM template WHERE deleted_at IS NULL AND base_path IS NOT NULL
-UNION
-SELECT DISTINCT base_path::text FROM sandbox_snapshot WHERE deleted_at IS NULL AND status IN ('creating', 'ready')
-`
-
-// Base images a future pause can name: those of live sandboxes, of existing
-// template builds, and of live saved snapshots, which fork new sandboxes
-// from them. Same holders as ListPinnedBuildPaths, plus templates.
-func (q *Queries) InUseBasePaths(ctx context.Context) ([]string, error) {
-	rows, err := q.db.Query(ctx, inUseBasePaths)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []string{}
-	for rows.Next() {
-		var base_path string
-		if err := rows.Scan(&base_path); err != nil {
-			return nil, err
-		}
-		items = append(items, base_path)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const latestSandboxBackup = `-- name: LatestSandboxBackup :one
 SELECT generation, bucket, LEAST(completed_at, reported_at)::timestamptz AS completed_at
 FROM (
@@ -336,23 +305,6 @@ func (q *Queries) MarkSandboxBackupCovered(ctx context.Context, arg MarkSandboxB
 	return err
 }
 
-const oldestRecordedBackup = `-- name: OldestRecordedBackup :one
-SELECT reported_at
-FROM backup_generation
-WHERE bucket = $1
-ORDER BY reported_at ASC
-LIMIT 1
-`
-
-// When the database began recording this bucket's generations; a base
-// object older than this may be referenced by a generation it never saw.
-func (q *Queries) OldestRecordedBackup(ctx context.Context, bucket string) (time.Time, error) {
-	row := q.db.QueryRow(ctx, oldestRecordedBackup, bucket)
-	var reported_at time.Time
-	err := row.Scan(&reported_at)
-	return reported_at, err
-}
-
 const recordSandboxBackupGeneration = `-- name: RecordSandboxBackupGeneration :execrows
 INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, files)
 VALUES ($1, $2, $3, $4, $5)
@@ -496,116 +448,6 @@ func (q *Queries) RecordTemplateBackupGeneration(ctx context.Context, arg Record
 		return 0, err
 	}
 	return result.RowsAffected(), nil
-}
-
-const recordedGenerations = `-- name: RecordedGenerations :many
-SELECT sandbox_id, generation
-FROM backup_generation
-WHERE bucket = $1 AND sandbox_id IS NOT NULL AND purged_at IS NULL
-`
-
-type RecordedGenerationsRow struct {
-	SandboxID  pgtype.UUID `json:"sandbox_id"`
-	Generation string      `json:"generation"`
-}
-
-// The unpurged generations the database knows in this bucket; a complete
-// bucket generation outside this set was never reported, or was purged
-// and uploaded again, and either way its owner decides its fate.
-func (q *Queries) RecordedGenerations(ctx context.Context, bucket string) ([]RecordedGenerationsRow, error) {
-	rows, err := q.db.Query(ctx, recordedGenerations, bucket)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []RecordedGenerationsRow{}
-	for rows.Next() {
-		var i RecordedGenerationsRow
-		if err := rows.Scan(&i.SandboxID, &i.Generation); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const recordedSharedBasePaths = `-- name: RecordedSharedBasePaths :many
-SELECT DISTINCT (f->>'base_sha256')::text AS sha256, s.base_path::text AS base_path
-FROM backup_generation bg
-JOIN sandbox s ON s.id = bg.sandbox_id, jsonb_array_elements(bg.files) f
-WHERE bg.bucket = $1::text
-  AND coalesce(f->>'base_sha256', '') <> ''
-  AND s.base_path IS NOT NULL
-`
-
-type RecordedSharedBasePathsRow struct {
-	Sha256   string `json:"sha256"`
-	BasePath string `json:"base_path"`
-}
-
-// Which base image each shared base digest was recorded for, from the
-// sandboxes whose generations named it. A digest with no row here has
-// unknown provenance.
-func (q *Queries) RecordedSharedBasePaths(ctx context.Context, bucket string) ([]RecordedSharedBasePathsRow, error) {
-	rows, err := q.db.Query(ctx, recordedSharedBasePaths, bucket)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []RecordedSharedBasePathsRow{}
-	for rows.Next() {
-		var i RecordedSharedBasePathsRow
-		if err := rows.Scan(&i.Sha256, &i.BasePath); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const referencedSharedBases = `-- name: ReferencedSharedBases :many
-SELECT DISTINCT (f->>'base_sha256')::text AS sha256
-FROM backup_generation bg, jsonb_array_elements(bg.files) f
-WHERE bg.bucket = $1::text
-  AND coalesce(f->>'base_sha256', '') <> ''
-  AND (bg.purged_at IS NULL
-       OR greatest(bg.reported_at, bg.purged_at) > now() - make_interval(secs => $2::float8))
-`
-
-type ReferencedSharedBasesParams struct {
-	Bucket       string  `json:"bucket"`
-	GraceSeconds float64 `json:"grace_seconds"`
-}
-
-// The shared base digests named by a generation that can still be
-// restored, or by one reported or purged within the grace period: hosts
-// skip re-uploading a base they verified that recently and a new generation
-// may name it without shipping it. Judged by server time, never the host's
-// clock.
-func (q *Queries) ReferencedSharedBases(ctx context.Context, arg ReferencedSharedBasesParams) ([]string, error) {
-	rows, err := q.db.Query(ctx, referencedSharedBases, arg.Bucket, arg.GraceSeconds)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []string{}
-	for rows.Next() {
-		var sha256 string
-		if err := rows.Scan(&sha256); err != nil {
-			return nil, err
-		}
-		items = append(items, sha256)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
 }
 
 const setSnapshotSizeBytes = `-- name: SetSnapshotSizeBytes :exec
