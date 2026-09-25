@@ -107,7 +107,7 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 	scheduler := &stubScheduler{hostID: "scheduled-host"}
 	h := &Handlers{VMD: vmd, DB: db.New(mock), Scheduler: scheduler, Signer: newTestSigner(t, "v1")}
 	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(fmt.Sprintf(`{"name":"fork","source_snapshot":%q,"env_vars":{"KEY_9":"x"}}`, snap.ID)))
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(fmt.Sprintf(`{"name":"fork","from_snapshot":%q,"env_vars":{"KEY_9":"x"}}`, snap.ID)))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
 	}
@@ -193,7 +193,7 @@ func TestCreateSandbox_FromSnapshotRequestOverridesInheritance(t *testing.T) {
 	}}
 	h := &Handlers{VMD: vmd, DB: db.New(mock)}
 	w := httptest.NewRecorder()
-	body := fmt.Sprintf(`{"name":"fork","source_snapshot":%q,"timeout_seconds":60,"network":{"allow_out":["1.1.1.1"]},"env_vars":{"KEY_0":"mine"}}`, snap.ID)
+	body := fmt.Sprintf(`{"name":"fork","from_snapshot":%q,"timeout_seconds":60,"network":{"allow_out":["1.1.1.1"]},"env_vars":{"KEY_0":"mine"}}`, snap.ID)
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(body))
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
@@ -221,8 +221,8 @@ func TestCreateSandbox_FromSnapshotRefusals(t *testing.T) {
 		wantStatus int
 		wantCode   string
 	}{
-		{name: "both sources", body: fmt.Sprintf(`{"name":"x","from_template":"t","source_snapshot":%q}`, snap.ID), wantStatus: 400, wantCode: "bad_request"},
-		{name: "not an id", body: `{"name":"x","source_snapshot":"latest"}`, wantStatus: 400, wantCode: "bad_request"},
+		{name: "both sources", body: fmt.Sprintf(`{"name":"x","from_template":"t","from_snapshot":%q}`, snap.ID), wantStatus: 400, wantCode: "bad_request"},
+		{name: "not an id", body: `{"name":"x","from_snapshot":"latest"}`, wantStatus: 400, wantCode: "bad_request"},
 		{name: "unknown or another team's", snapshot: func() pgx.Row { return notFoundRow() }, wantStatus: 404, wantCode: "not_found"},
 		{name: "still creating", snapshot: func() pgx.Row {
 			creating := snap
@@ -266,7 +266,7 @@ func TestCreateSandbox_FromSnapshotRefusals(t *testing.T) {
 			h := &Handlers{VMD: vmd, DB: db.New(mock), Scheduler: &stubScheduler{hostID: "scheduled-host"}}
 			body := tc.body
 			if body == "" {
-				body = fmt.Sprintf(`{"name":"x","source_snapshot":%q}`, snap.ID)
+				body = fmt.Sprintf(`{"name":"x","from_snapshot":%q}`, snap.ID)
 			}
 			w := httptest.NewRecorder()
 			setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(body))

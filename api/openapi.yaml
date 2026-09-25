@@ -774,7 +774,7 @@ paths:
       description: |
         Creates a sandbox from a template (defaults to `superserve/base` when
         `from_template` is omitted), or from a saved snapshot named by
-        `source_snapshot`. When the request returns successfully, the
+        `from_snapshot`. When the request returns successfully, the
         sandbox is ready to use — you can run commands against it
         immediately.
 
@@ -942,7 +942,7 @@ paths:
       description: |
         Captures the sandbox into a saved snapshot of its memory and disk,
         kept until deleted. A new sandbox is created from it with
-        `source_snapshot` on `POST /sandboxes`, resuming with its processes
+        `from_snapshot` on `POST /sandboxes`, resuming with its processes
         intact. The sandbox must be active or paused. A running sandbox is
         paused for the capture: under a second for the first memory snapshot
         of a sandbox, longer when all of memory has to be written. The call
@@ -3264,7 +3264,7 @@ components:
             vCPU, memory, and disk values are inherited by the sandbox —
             they cannot be overridden per-sandbox because the snapshot
             dictates VM shape. When omitted, defaults to `superserve/base`.
-        source_snapshot:
+        from_snapshot:
           type: string
           format: uuid
           description: >

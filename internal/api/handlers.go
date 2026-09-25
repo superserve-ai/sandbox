@@ -2146,10 +2146,10 @@ type networkConfigRequest struct {
 type createSandboxRequest struct {
 	Name         string  `json:"name" binding:"required,min=1,max=64"`
 	FromTemplate *string `json:"from_template,omitempty"`
-	// SourceSnapshot creates the sandbox from a saved snapshot instead of a
+	// FromSnapshot creates the sandbox from a saved snapshot instead of a
 	// template: its memory and disk, on its host.
-	SourceSnapshot *string               `json:"source_snapshot,omitempty"`
-	Network        *networkConfigRequest `json:"network,omitempty"`
+	FromSnapshot *string               `json:"from_snapshot,omitempty"`
+	Network      *networkConfigRequest `json:"network,omitempty"`
 
 	// TimeoutSeconds auto-pauses the sandbox after it has been active this
 	// long. The window tracks the current active session (re-armed on each
@@ -2732,15 +2732,15 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "name is required and must be 1-64 characters", http.StatusBadRequest)
 		return
 	}
-	if req.FromTemplate != nil && req.SourceSnapshot != nil {
-		respondErrorMsg(c, "bad_request", "from_template and source_snapshot are mutually exclusive", http.StatusBadRequest)
+	if req.FromTemplate != nil && req.FromSnapshot != nil {
+		respondErrorMsg(c, "bad_request", "from_template and from_snapshot are mutually exclusive", http.StatusBadRequest)
 		return
 	}
 	var sourceSnapshotID uuid.UUID
-	if req.SourceSnapshot != nil {
-		id, err := uuid.Parse(*req.SourceSnapshot)
+	if req.FromSnapshot != nil {
+		id, err := uuid.Parse(*req.FromSnapshot)
 		if err != nil {
-			respondErrorMsg(c, "bad_request", "source_snapshot is not a valid snapshot ID", http.StatusBadRequest)
+			respondErrorMsg(c, "bad_request", "from_snapshot is not a valid snapshot ID", http.StatusBadRequest)
 			return
 		}
 		sourceSnapshotID = id

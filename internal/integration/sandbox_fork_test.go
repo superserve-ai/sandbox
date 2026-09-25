@@ -69,7 +69,7 @@ func TestIntegration_CreateSandbox_FromSnapshot(t *testing.T) {
 		t.Fatalf("create snapshot row: %v", err)
 	}
 	r := newRouterWithSigner(t)
-	body := fmt.Sprintf(`{"name":"fork","source_snapshot":%q}`, snap.ID)
+	body := fmt.Sprintf(`{"name":"fork","from_snapshot":%q}`, snap.ID)
 
 	if w := do(r, "POST", "/sandboxes", apiKey, body); w.Code != http.StatusConflict {
 		t.Fatalf("create from a snapshot still creating: %d %s", w.Code, w.Body.String())
