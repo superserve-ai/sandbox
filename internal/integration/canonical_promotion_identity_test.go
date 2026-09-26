@@ -4,7 +4,6 @@ package integration
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -12,7 +11,6 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func canonicalSignupOutcome(t *testing.T, teamID uuid.UUID) string {
@@ -157,10 +155,14 @@ func TestIntegration_CanonicalSignupEvidenceOutcomes(t *testing.T) {
 		}
 		defer tx.Rollback(ctx)
 		rolloutExec(t, tx, `DELETE FROM promotion_identity_current WHERE user_id=$1`, user)
-		_, err = tx.Exec(ctx, `SELECT create_team_with_signup_trial($1,$2,'use')`, "unavailable-"+uuid.NewString(), user)
-		var pgErr *pgconn.PgError
-		if !errors.As(err, &pgErr) || pgErr.Code != "55000" {
-			t.Fatalf("want unavailable authority, got %v", err)
+		var team uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT id FROM create_team_with_signup_trial($1,$2,'use')`, "unavailable-"+uuid.NewString(), user).Scan(&team); err != nil {
+			t.Fatalf("authority failure blocked team creation: %v", err)
+		}
+		var outcome, reason string
+		if err := tx.QueryRow(ctx, `SELECT outcome,reason FROM team_signup_promotion_outcome WHERE team_id=$1`, team).
+			Scan(&outcome, &reason); err != nil || outcome != "promotion_ineligible" || reason != "authority_unavailable" {
+			t.Fatalf("authority result = %q/%q: %v", outcome, reason, err)
 		}
 		if err := tx.Rollback(ctx); err != nil {
 			t.Fatal(err)

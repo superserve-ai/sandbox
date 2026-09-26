@@ -222,3 +222,30 @@ func (h *Handlers) RegisterPromotionSignupDevice(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"outcome": outcome})
 }
+
+func (h *Handlers) EvaluateSignupPromotion(c *gin.Context) {
+	if !promotionSource(c, h.Pool) {
+		return
+	}
+	var input promotionAccountRequest
+	if !decodePromotionRequest(c, &input) || !promotionAccountActor(c, input.UserID) {
+		return
+	}
+	if input.AttemptID != uuid.Nil {
+		respondErrorMsg(c, "invalid_request", "invalid promotion request", http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := promotionContext(c)
+	defer cancel()
+	var ownership, deviceDecision, eligibility, reason string
+	err := h.Pool.QueryRow(ctx, "select ownership,device_decision,eligibility,reason from evaluate_signup_promotion_snapshot($1)", input.UserID).
+		Scan(&ownership, &deviceDecision, &eligibility, &reason)
+	if err != nil {
+		promotionDBError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ownership": ownership, "device_decision": deviceDecision,
+		"eligibility": eligibility, "reason": reason,
+	})
+}

@@ -23,6 +23,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
@@ -2196,14 +2197,19 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, quer
 	}
 	state, err := queries.ReserveStripePromotionForSubscriptionEventState(ctx, stripePromotionSubscriptionReservationParams(account.TeamID, userID, event.ID, obj))
 	if err != nil {
-		return nil, err
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) {
+			return nil, err
+		}
+		log.Error().Err(err).Str("event_id", event.ID).Msg("Stripe promotion authority unavailable; continue paid activation without credit")
+		return &stripePromotionPreReservation{EventID: event.ID, TeamID: account.TeamID, UserID: userID}, nil
 	}
 	return &stripePromotionPreReservation{
 		EventID:   event.ID,
 		TeamID:    account.TeamID,
 		UserID:    userID,
 		Reserved:  state == "acquired" || state == "existing",
-		Retryable: state == "blocked",
+		Retryable: state == "blocked" || state == "device_reservation_pending",
 	}, nil
 }
 
