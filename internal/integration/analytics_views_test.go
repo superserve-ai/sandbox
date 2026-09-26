@@ -4,10 +4,12 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 // A mixed range (one hour with a matching rate for every resource, one hour
@@ -24,6 +26,24 @@ func TestAnalyticsTeamHourlySpend_MixedRangePoisonsAggregate(t *testing.T) {
 	team, err := testQueries.CreateTeam(ctx, "analytics-view-"+suffix)
 	if err != nil {
 		t.Fatalf("create team: %v", err)
+	}
+
+	// analytics.team_hourly_spend filters to teams with a team_member row
+	// (see 20260801000001) — CreateTeam alone doesn't seed one, so without
+	// this the team is invisible to the view regardless of usage seeded
+	// below.
+	profileID := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO profile (id, email, provider, provider_id) VALUES ($1, $2, 'google', $3)`,
+		profileID, "analytics-view-"+suffix+"@example.com", "google-"+suffix,
+	); err != nil {
+		t.Fatalf("seed profile: %v", err)
+	}
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO team_member (team_id, profile_id, role) VALUES ($1, $2, 'owner')`,
+		team.ID, profileID,
+	); err != nil {
+		t.Fatalf("seed team_member: %v", err)
 	}
 
 	planKey := "analytics-view-plan-" + suffix
@@ -126,5 +146,93 @@ func TestAnalyticsTeamHourlySpend_MixedRangePoisonsAggregate(t *testing.T) {
 	}
 	if total != nil {
 		t.Fatalf("mixed-range aggregate = %v, want NULL (poisoned by the unpriceable hour)", *total)
+	}
+}
+
+// Regression test for review feedback on 20260801000001: excluding a team
+// solely because it lacks a row in the legacy team_member table would hide
+// live billing data, since the current membership-management path
+// (upsertMembership, internal/api/rbac_phase2b.go) only writes
+// team_memberships.
+func TestAnalyticsTeamHourlySpend_IncludesTeamWithOnlyModernMembership(t *testing.T) {
+	ctx := context.Background()
+	suffix := uuid.NewString()[:8]
+
+	team, err := testQueries.CreateTeam(ctx, "analytics-view-modern-"+suffix)
+	if err != nil {
+		t.Fatalf("create team: %v", err)
+	}
+
+	profileID := uuid.New()
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO profile (id, email, provider, provider_id) VALUES ($1, $2, 'google', $3)`,
+		profileID, "analytics-view-modern-"+suffix+"@example.com", "google-"+suffix,
+	); err != nil {
+		t.Fatalf("seed profile: %v", err)
+	}
+	// Only team_memberships, deliberately no team_member row.
+	if _, err := testPool.Exec(ctx,
+		`INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`,
+		team.ID, profileID,
+	); err != nil {
+		t.Fatalf("seed team_memberships: %v", err)
+	}
+
+	hourStart := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_usage_hourly (
+			team_id, hour_start, hour_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+		)
+		VALUES ($1, $2, $3, 3600, 3600, 3600)
+	`, team.ID, hourStart, hourStart.Add(time.Hour)); err != nil {
+		t.Fatalf("seed usage hour: %v", err)
+	}
+
+	var spendUSD *float64
+	if err := testPool.QueryRow(ctx, `
+		SELECT spend_usd FROM analytics.team_hourly_spend
+		WHERE team_name = $1 AND hour_start = $2
+	`, team.Name, hourStart).Scan(&spendUSD); err != nil {
+		t.Fatalf("team with only team_memberships is missing from the view: %v", err)
+	}
+	if spendUSD == nil {
+		t.Fatal("spend_usd = NULL, want a priced value (payg has rates for all three resources)")
+	}
+}
+
+// Regression test: a fully detached team (no rows in any of the three
+// membership tables) must stay excluded even though its historical usage
+// rows remain as a cold fallback until purge.
+func TestAnalyticsTeamHourlySpend_ExcludesFullyDetachedTeam(t *testing.T) {
+	ctx := context.Background()
+	suffix := uuid.NewString()[:8]
+
+	team, err := testQueries.CreateTeam(ctx, "analytics-view-detached-"+suffix)
+	if err != nil {
+		t.Fatalf("create team: %v", err)
+	}
+	// Deliberately no team_member / team_memberships / user_role_assignments
+	// rows — this is what cmd/migrate-team's detach leaves behind.
+
+	hourStart := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_usage_hourly (
+			team_id, hour_start, hour_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds
+		)
+		VALUES ($1, $2, $3, 3600, 3600, 3600)
+	`, team.ID, hourStart, hourStart.Add(time.Hour)); err != nil {
+		t.Fatalf("seed usage hour: %v", err)
+	}
+
+	var spendUSD *float64
+	err = testPool.QueryRow(ctx, `
+		SELECT spend_usd FROM analytics.team_hourly_spend
+		WHERE team_name = $1 AND hour_start = $2
+	`, team.Name, hourStart).Scan(&spendUSD)
+	if err == nil {
+		t.Fatalf("fully detached team appeared in the view with spend_usd=%v, want excluded entirely", spendUSD)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("unexpected query error: %v", err)
 	}
 }
