@@ -983,6 +983,17 @@ func (q *Queries) TouchSecretLastUsed(ctx context.Context, arg TouchSecretLastUs
 	return err
 }
 
+const transactionStartedAt = `-- name: TransactionStartedAt :one
+SELECT now()::timestamptz
+`
+
+func (q *Queries) TransactionStartedAt(ctx context.Context) (time.Time, error) {
+	row := q.db.QueryRow(ctx, transactionStartedAt)
+	var column_1 time.Time
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const updateSecretValue = `-- name: UpdateSecretValue :one
 UPDATE secret
 SET ciphertext = $3,

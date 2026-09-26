@@ -3302,8 +3302,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// directory, which destroy leaves; with no row to tear down later,
 		// they go now, once the VM holding them is gone.
 		destroy := func() {
-			_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
-			if savedSnapshotID != "" {
+			derr := vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+			// Only once no VM can still be using them: a destroy that failed
+			// leaves an orphan the reconciler reclaims whole.
+			if savedSnapshotID != "" && (derr == nil || isVMDNotFound(derr)) {
 				if err := vmd.DeleteSandboxSnapshots(cleanupCtx, sandboxID.String()); err != nil && !isVMDNotFound(err) {
 					l.Warn().Err(err).Msg("remove a failed fork's copies of its snapshot")
 				}

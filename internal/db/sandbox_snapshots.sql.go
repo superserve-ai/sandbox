@@ -535,18 +535,6 @@ func (q *Queries) MarkSandboxSnapshotReady(ctx context.Context, arg MarkSandboxS
 	return i, err
 }
 
-const refreshCapturingSnapshotSecrets = `-- name: RefreshCapturingSnapshotSecrets :exec
-UPDATE sandbox_snapshot SET secret_bindings = sandbox_secret_record(sandbox_id)
-WHERE sandbox_id = $1 AND status = 'creating' AND deleted_at IS NULL
-`
-
-// Re-records the secrets of a capture still in flight, for a binding change
-// that cannot wait for it: an attach that failed and is undone.
-func (q *Queries) RefreshCapturingSnapshotSecrets(ctx context.Context, sandboxID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, refreshCapturingSnapshotSecrets, sandboxID)
-	return err
-}
-
 const renameSandboxSnapshot = `-- name: RenameSandboxSnapshot :one
 UPDATE sandbox_snapshot SET name = $3
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
@@ -624,4 +612,38 @@ func (q *Queries) ScheduleSandboxSnapshotSweep(ctx context.Context, id uuid.UUID
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const withdrawBindingFromSnapshots = `-- name: WithdrawBindingFromSnapshots :exec
+UPDATE sandbox_snapshot SET secret_bindings = (
+  SELECT COALESCE(jsonb_agg(
+    CASE WHEN e->>'env_key' = $1::text AND e->>'secret_id' = $2::uuid::text
+         THEN jsonb_build_object('env_key', e->>'env_key')
+         ELSE e END
+    ORDER BY e->>'env_key'), '[]'::jsonb)
+  FROM jsonb_array_elements(secret_bindings) e
+)
+WHERE sandbox_id = $3::uuid AND deleted_at IS NULL
+  AND created_at >= $4::timestamptz
+`
+
+type WithdrawBindingFromSnapshotsParams struct {
+	EnvKey    string    `json:"env_key"`
+	SecretID  uuid.UUID `json:"secret_id"`
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Since     time.Time `json:"since"`
+}
+
+// Takes a binding back out of every snapshot of the sandbox that could have
+// recorded it, settled or not: those created since the attach began, which
+// then failed and is undone. The key stays, without its secret, for a fork
+// to clear.
+func (q *Queries) WithdrawBindingFromSnapshots(ctx context.Context, arg WithdrawBindingFromSnapshotsParams) error {
+	_, err := q.db.Exec(ctx, withdrawBindingFromSnapshots,
+		arg.EnvKey,
+		arg.SecretID,
+		arg.SandboxID,
+		arg.Since,
+	)
+	return err
 }

@@ -201,3 +201,6 @@ SELECT env_key FROM sandbox_secret_detached WHERE sandbox_id = $1 ORDER BY env_k
 
 -- name: ForgetDetachedSecretKeys :exec
 DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = ANY(@env_keys::text[]);
+
+-- name: TransactionStartedAt :one
+SELECT now()::timestamptz;

@@ -521,6 +521,43 @@ func TestCreateSandbox_FromSnapshotRemovesItsCopiesWhenTheInsertFails(t *testing
 	}
 }
 
+// A destroy that failed may leave the VM running on its copies, so they
+// are left for the orphan's reclaim rather than removed from under it.
+func TestCreateSandbox_FromSnapshotKeepsItsCopiesWhenTheDestroyFails(t *testing.T) {
+	teamID := uuid.New()
+	snap := readySnapshotFixture(teamID)
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "-- name: GetSandboxSnapshot :one"):
+				return sandboxSnapshotRow(snap)
+			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+				return scalarBoolRow(true)
+			case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
+				return errorRow(&pgconn.PgError{Code: "SS001", Message: "sandbox quota exceeded"})
+			}
+			return notFoundRow()
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	var removed bool
+	vmd := &stubVMD{
+		destroyFn: func(context.Context, string, bool) error { return errors.New("vmd unavailable") },
+		deleteSnapsFn: func(context.Context, string) error {
+			removed = true
+			return nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(fmt.Sprintf(`{"name":"fork","from_snapshot":%q}`, snap.ID)))
+	if removed {
+		t.Fatal("a fork's copies were removed although its VM may still run on them")
+	}
+}
+
 func hasString(list []string, s string) bool {
 	for _, v := range list {
 		if v == s {

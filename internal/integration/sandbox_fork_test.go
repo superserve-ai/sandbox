@@ -355,10 +355,10 @@ func TestIntegration_SecretAttachWaitsOutASnapshotCapture(t *testing.T) {
 	}
 }
 
-// An attach undone after a capture recorded it is taken out of that
-// capture's record, and its key recorded as detached, so no fork re-binds
-// the secret; a settled snapshot's record is not touched.
-func TestIntegration_UndoneAttachIsTakenOutOfACaptureInFlight(t *testing.T) {
+// An attach undone after snapshots recorded it has the binding withdrawn
+// from each taken since it began, settled or not, its key kept without the
+// secret; an older snapshot's binding of the same key and secret stays.
+func TestIntegration_UndoneAttachIsWithdrawnFromSnapshotsSinceItBegan(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedTeamAndKey(t)
 	sourceID, err := insertSandboxRow(ctx, teamID, "undo-source")
@@ -382,15 +382,26 @@ func TestIntegration_UndoneAttachIsTakenOutOfACaptureInFlight(t *testing.T) {
 		}
 		return row
 	}
-	settled := create()
-	overlay, vmstate, mem := "/saved/u/overlay.ext4", "/saved/u/vmstate.snap", "/saved/u/mem.diff"
-	if _, err := testQueries.MarkSandboxSnapshotReady(ctx, db.MarkSandboxSnapshotReadyParams{ID: settled.ID, OverlayPath: &overlay, SnapshotPath: &vmstate, MemPath: &mem, SizeBytes: 1}); err != nil {
+	ready := func(id uuid.UUID) {
+		t.Helper()
+		overlay, vmstate, mem := "/saved/u/overlay.ext4", "/saved/u/vmstate.snap", "/saved/u/mem.diff"
+		if _, err := testQueries.MarkSandboxSnapshotReady(ctx, db.MarkSandboxSnapshotReadyParams{ID: id, OverlayPath: &overlay, SnapshotPath: &vmstate, MemPath: &mem, SizeBytes: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// An earlier, legitimate binding of the same key and secret.
+	older := create()
+	ready(older.ID)
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET created_at = now() - interval '1 hour' WHERE id = $1`, older.ID); err != nil {
 		t.Fatal(err)
 	}
-	inFlight := create()
-	if !strings.Contains(string(inFlight.SecretBindings), secretID.String()) {
-		t.Fatalf("capture recorded %s; want the binding", inFlight.SecretBindings)
+	var since time.Time
+	if err := testPool.QueryRow(ctx, `SELECT now()`).Scan(&since); err != nil {
+		t.Fatal(err)
 	}
+	settled := create()
+	ready(settled.ID)
+	inFlight := create()
 
 	// The undo, as the attach handler runs it.
 	if _, err := testQueries.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
@@ -399,18 +410,20 @@ func TestIntegration_UndoneAttachIsTakenOutOfACaptureInFlight(t *testing.T) {
 	if err := testQueries.RecordDetachedSecretKey(ctx, db.RecordDetachedSecretKeyParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := testQueries.RefreshCapturingSnapshotSecrets(ctx, sourceID); err != nil {
+	if err := testQueries.WithdrawBindingFromSnapshots(ctx, db.WithdrawBindingFromSnapshotsParams{SandboxID: sourceID, EnvKey: "TOKEN", SecretID: secretID, Since: since}); err != nil {
 		t.Fatal(err)
 	}
-	got, err := testQueries.GetSandboxSnapshotUnscoped(ctx, inFlight.ID)
-	if err != nil {
-		t.Fatal(err)
+	for _, id := range []uuid.UUID{settled.ID, inFlight.ID} {
+		got, err := testQueries.GetSandboxSnapshotUnscoped(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(got.SecretBindings), secretID.String()) || !strings.Contains(string(got.SecretBindings), `"TOKEN"`) {
+			t.Fatalf("%s record after the undo = %s; want the key without its secret", got.Status, got.SecretBindings)
+		}
 	}
-	if strings.Contains(string(got.SecretBindings), secretID.String()) || !strings.Contains(string(got.SecretBindings), `"TOKEN"`) {
-		t.Fatalf("in-flight record after the undo = %s; want the key without its secret", got.SecretBindings)
-	}
-	if kept, err := testQueries.GetSandboxSnapshotUnscoped(ctx, settled.ID); err != nil || !strings.Contains(string(kept.SecretBindings), secretID.String()) {
-		t.Fatalf("settled record = %s (%v); want it untouched", kept.SecretBindings, err)
+	if kept, err := testQueries.GetSandboxSnapshotUnscoped(ctx, older.ID); err != nil || !strings.Contains(string(kept.SecretBindings), secretID.String()) {
+		t.Fatalf("older record = %s (%v); want it untouched", kept.SecretBindings, err)
 	}
 	// A re-attach of the key forgets it was detached.
 	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: secretID, EnvKey: "TOKEN"}); err != nil {

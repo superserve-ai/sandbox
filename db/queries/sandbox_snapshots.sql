@@ -117,8 +117,18 @@ SELECT EXISTS (
   WHERE sandbox_id = $1 AND status = 'creating' AND deleted_at IS NULL
 );
 
--- name: RefreshCapturingSnapshotSecrets :exec
--- Re-records the secrets of a capture still in flight, for a binding change
--- that cannot wait for it: an attach that failed and is undone.
-UPDATE sandbox_snapshot SET secret_bindings = sandbox_secret_record(sandbox_id)
-WHERE sandbox_id = $1 AND status = 'creating' AND deleted_at IS NULL;
+-- name: WithdrawBindingFromSnapshots :exec
+-- Takes a binding back out of every snapshot of the sandbox that could have
+-- recorded it, settled or not: those created since the attach began, which
+-- then failed and is undone. The key stays, without its secret, for a fork
+-- to clear.
+UPDATE sandbox_snapshot SET secret_bindings = (
+  SELECT COALESCE(jsonb_agg(
+    CASE WHEN e->>'env_key' = sqlc.arg('env_key')::text AND e->>'secret_id' = sqlc.arg('secret_id')::uuid::text
+         THEN jsonb_build_object('env_key', e->>'env_key')
+         ELSE e END
+    ORDER BY e->>'env_key'), '[]'::jsonb)
+  FROM jsonb_array_elements(secret_bindings) e
+)
+WHERE sandbox_id = sqlc.arg('sandbox_id')::uuid AND deleted_at IS NULL
+  AND created_at >= sqlc.arg('since')::timestamptz;

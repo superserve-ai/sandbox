@@ -69,10 +69,11 @@ func recordDetachedKey(ctx context.Context, q *db.Queries, sandboxID uuid.UUID, 
 
 // undoAttach takes back a binding whose guest update failed, under the
 // secret-write lock like any binding change. It is not refused during a
-// capture, which may already have recorded the binding: that record is
-// rewritten, so no fork re-binds it. boxd may have applied the env before
-// the error, so the token is revoked and the key recorded as detached.
-func (h *Handlers) undoAttach(ctx context.Context, sandboxID uuid.UUID, envKey, token string) error {
+// capture: any snapshot taken since the attach began may have recorded the
+// binding, settled or not, and has it withdrawn, so no fork re-binds it.
+// boxd may have applied the env before the error, so the token is revoked
+// and the key recorded as detached.
+func (h *Handlers) undoAttach(ctx context.Context, sandboxID, secretID uuid.UUID, envKey, token string, since time.Time) error {
 	undo := func(q *db.Queries) error {
 		if h.Pool != nil {
 			if err := q.LockSandboxForSecretWrites(ctx, sandboxID.String()); err != nil {
@@ -92,7 +93,9 @@ func (h *Handlers) undoAttach(ctx context.Context, sandboxID uuid.UUID, envKey, 
 		}); err != nil {
 			return err
 		}
-		return q.RefreshCapturingSnapshotSecrets(ctx, sandboxID)
+		return q.WithdrawBindingFromSnapshots(ctx, db.WithdrawBindingFromSnapshotsParams{
+			SandboxID: sandboxID, EnvKey: envKey, SecretID: secretID, Since: since,
+		})
 	}
 	if h.Pool == nil {
 		return undo(h.DB)
@@ -197,11 +200,19 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	// cap and exceed it — which would later wedge re-minting. The in-process lock
 	// only covers one instance. Env-key collisions are caught by the PK.
 	var liveSandbox db.Sandbox
+	// When the binding became visible, at the latest: a snapshot older than
+	// this cannot have recorded it.
+	var attachStarted time.Time
 	insertBinding := func(q *db.Queries) error {
 		if h.Pool != nil {
 			if lerr := q.LockSandboxForSecretWrites(ctx, sandboxID.String()); lerr != nil {
 				return lerr
 			}
+			started, lerr := q.TransactionStartedAt(ctx)
+			if lerr != nil {
+				return lerr
+			}
+			attachStarted = started
 		}
 		// Re-read status under the lock: a resume on another instance may have
 		// flipped it since the early read. The live status decides whether we
@@ -294,7 +305,7 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 			// its rollback, leaving the row behind after a 500.
 			rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer rbCancel()
-			if rerr := h.undoAttach(rbCtx, sandboxID, req.EnvKey, token); rerr != nil {
+			if rerr := h.undoAttach(rbCtx, sandboxID, secret.ID, req.EnvKey, token, attachStarted); rerr != nil {
 				log.Error().Err(rerr).Str("sandbox_id", sandboxID.String()).Msg("undo a failed secret attach")
 			}
 			respondError(c, ErrInternal)
