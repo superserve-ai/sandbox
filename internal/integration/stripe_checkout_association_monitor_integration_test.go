@@ -800,6 +800,70 @@ VALUES ($1, 'customer.subscription.created',
 	}
 }
 
+func TestIntegration_StripeAssociationTickReportsFreshDueEventPastStaleBookkeeping(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
+	prefix := "evt_due_stale_" + uuid.NewString() + "_"
+	payload := `{"data":{"object":{"id":"sub_example","customer":"cus_example"}}}`
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM stripe_webhook_event WHERE event_id LIKE $1`, prefix+"%")
+	})
+	if _, err := testPool.Exec(ctx, `
+INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, updated_at, last_error)
+SELECT $1 || 'stale_' || lpad(n::text, 3, '0'), 'customer.subscription.created', $2,
+       $3, $3, $4
+FROM generate_series(1, 50) AS n`, prefix, payload, now.Add(-10*time.Minute), db.StripeCheckoutAssociationPendingError); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE stripe_webhook_event SET processed_at = $2
+WHERE event_id LIKE $1`, prefix+"stale_%", now); err != nil {
+		t.Fatal(err)
+	}
+	var staleRows int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM stripe_checkout_association_alert
+WHERE event_id LIKE $1 AND next_check_at <= $2`, prefix+"stale_%", now).Scan(&staleRows); err != nil {
+		t.Fatal(err)
+	}
+	if staleRows != 50 {
+		t.Fatalf("due processed bookkeeping rows = %d, want 50", staleRows)
+	}
+	insertPending := func(suffix string, receivedAt time.Time) string {
+		t.Helper()
+		eventID := prefix + suffix
+		if _, err := testPool.Exec(ctx, `INSERT INTO stripe_webhook_event
+(event_id, event_type, payload, received_at, updated_at, last_error)
+VALUES ($1, 'customer.subscription.created', $2, $3, $3, $4)`,
+			eventID, payload, receivedAt, db.StripeCheckoutAssociationPendingError); err != nil {
+			t.Fatal(err)
+		}
+		return eventID
+	}
+	leasedID := insertPending("leased", now.Add(-6*time.Minute))
+	coolingID := insertPending("cooling", now.Add(-6*time.Minute))
+	targetID := insertPending("target", now.Add(-5*time.Minute))
+	if _, err := testPool.Exec(ctx, `UPDATE stripe_checkout_association_alert
+SET lease_until = $2, next_check_at = $2 WHERE event_id = $1`, leasedID, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE stripe_checkout_association_alert
+SET next_check_at = $2, last_alert_at = $3 WHERE event_id = $1`,
+		coolingID, now.Add(30*time.Minute), now); err != nil {
+		t.Fatal(err)
+	}
+	h := api.NewHandlers(nil, testQueries, nil)
+	h.Pool = testPool
+	var reported []string
+	if _, err := h.StripeCheckoutAssociationTick(ctx, now, db.StripeCheckoutAssociationCursor{}, func(a api.StripeAssociationAlert) error {
+		reported = append(reported, a.EventID)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(reported) != 1 || reported[0] != targetID {
+		t.Fatalf("first overdue tick reported %v, want only %s", reported, targetID)
+	}
+}
+
 func TestIntegration_StripeAssociationDiscoveryPagesPastSuppressedAndStaleRows(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
@@ -822,15 +886,15 @@ WHERE event_id LIKE $1`, prefix+"suppressed_%", now.Add(time.Hour)); err != nil 
 		t.Fatal(err)
 	}
 	if _, err := testPool.Exec(ctx, `
-INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, updated_at, processed_at, last_error)
+INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, updated_at, last_error)
 SELECT $1 || 'stale_' || lpad(n::text, 3, '0'), 'customer.subscription.created', $2,
-       $3, $3, $3, $4
+       $3, $3, $4
 FROM generate_series(1, 101) AS n`, prefix, payload, oldAt, db.StripeCheckoutAssociationPendingError); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := testPool.Exec(ctx, `
-UPDATE stripe_checkout_association_alert SET next_check_at = $2
-WHERE event_id LIKE $1`, prefix+"stale_%", oldAt); err != nil {
+UPDATE stripe_webhook_event SET processed_at = $2
+WHERE event_id LIKE $1`, prefix+"stale_%", now); err != nil {
 		t.Fatal(err)
 	}
 	targetID := prefix + "target"

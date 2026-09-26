@@ -26,7 +26,7 @@ type StripeCheckoutAssociationCursor struct {
 }
 
 // Each lane pages its indexed source before joining the other table. The
-// webhook cursor covers retained rows predating the eligibility trigger;
+// webhook cursor covers fresh due rows even when the trigger queued them;
 // transactionally queued due rows start at the oldest due entry every tick.
 func ListStripeCheckoutAssociationCandidates(ctx context.Context, pool *pgxpool.Pool, now time.Time, grace time.Duration, cursor StripeCheckoutAssociationCursor, limit int) ([]StripeCheckoutAssociationCandidate, error) {
 	rows, err := pool.Query(ctx, `
@@ -46,11 +46,12 @@ WITH new_page AS MATERIALIZED (
     SELECT event_id, next_check_at AT TIME ZONE 'UTC' AS scan_at
     FROM stripe_checkout_association_alert
     WHERE next_check_at <= $1
+      AND NOT EXISTS (SELECT 1 FROM new_page n WHERE n.event_id = stripe_checkout_association_alert.event_id)
     ORDER BY next_check_at, event_id
     LIMIT $6
 )
 SELECT p.event_id, e.event_type, e.payload, e.received_at, p.scan_at, 0 AS lane,
-       a.event_id IS NULL AS eligible
+       (a.event_id IS NULL OR a.next_check_at <= $1) AS eligible
 FROM new_page p
 JOIN stripe_webhook_event e USING (event_id)
 LEFT JOIN stripe_checkout_association_alert a USING (event_id)
