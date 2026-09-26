@@ -161,9 +161,11 @@ INSERT INTO sandbox_snapshot (
 )
 SELECT $1::uuid, s.team_id, s.id, s.template_id, $2::text, 'creating', $3::text, $4::text,
     s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.base_path,
-    s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb), $5::jsonb, $6::timestamptz
+    s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb),
+    sandbox_secret_record(s.id),
+    $5::timestamptz
 FROM sandbox s
-WHERE s.id = $7 AND s.team_id = $8 AND s.destroyed_at IS NULL
+WHERE s.id = $6 AND s.team_id = $7 AND s.destroyed_at IS NULL
   AND s.status IN ('active', 'paused') AND s.host_id <> '' AND s.base_path IS NOT NULL
 FOR SHARE OF s
 RETURNING id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after
@@ -174,7 +176,6 @@ type CreateSandboxSnapshotParams struct {
 	Kind           string    `json:"kind"`
 	Name           *string   `json:"name"`
 	IdempotencyKey *string   `json:"idempotency_key"`
-	SecretBindings []byte    `json:"secret_bindings"`
 	SweepAfter     time.Time `json:"sweep_after"`
 	SandboxID      uuid.UUID `json:"sandbox_id"`
 	TeamID         uuid.UUID `json:"team_id"`
@@ -188,14 +189,15 @@ type CreateSandboxSnapshotParams struct {
 // reclaim then always sees the sandbox or the snapshot pinning its build.
 // The trigger counts the limits on insert; a retry carrying an idempotency
 // key already on file is refused by the unique index and re-read by the
-// caller.
+// caller. The bindings a fork re-binds or clears are read here too, by a
+// caller that holds the sandbox's secret-write lock, so a detach is in the
+// row or after it.
 func (q *Queries) CreateSandboxSnapshot(ctx context.Context, arg CreateSandboxSnapshotParams) (SandboxSnapshot, error) {
 	row := q.db.QueryRow(ctx, createSandboxSnapshot,
 		arg.ID,
 		arg.Kind,
 		arg.Name,
 		arg.IdempotencyKey,
-		arg.SecretBindings,
 		arg.SweepAfter,
 		arg.SandboxID,
 		arg.TeamID,
@@ -581,6 +583,22 @@ func (q *Queries) RenameSandboxSnapshot(ctx context.Context, arg RenameSandboxSn
 	return i, err
 }
 
+const sandboxSnapshotCaptureInFlight = `-- name: SandboxSnapshotCaptureInFlight :one
+SELECT EXISTS (
+  SELECT 1 FROM sandbox_snapshot
+  WHERE sandbox_id = $1 AND status = 'creating' AND deleted_at IS NULL
+)
+`
+
+// A capture of the sandbox that may still image its guest: a creating row,
+// which the sweep captures again until it settles, however old.
+func (q *Queries) SandboxSnapshotCaptureInFlight(ctx context.Context, sandboxID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, sandboxSnapshotCaptureInFlight, sandboxID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const scheduleSandboxSnapshotSweep = `-- name: ScheduleSandboxSnapshotSweep :execrows
 UPDATE sandbox_snapshot SET sweep_after = now()
 WHERE id = $1 AND status = 'creating'
@@ -594,4 +612,38 @@ func (q *Queries) ScheduleSandboxSnapshotSweep(ctx context.Context, id uuid.UUID
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const withdrawBindingFromSnapshots = `-- name: WithdrawBindingFromSnapshots :exec
+UPDATE sandbox_snapshot SET secret_bindings = (
+  SELECT COALESCE(jsonb_agg(
+    CASE WHEN e->>'env_key' = $1::text AND e->>'secret_id' = $2::uuid::text
+         THEN jsonb_build_object('env_key', e->>'env_key')
+         ELSE e END
+    ORDER BY e->>'env_key'), '[]'::jsonb)
+  FROM jsonb_array_elements(secret_bindings) e
+)
+WHERE sandbox_id = $3::uuid AND deleted_at IS NULL
+  AND created_at >= $4::timestamptz
+`
+
+type WithdrawBindingFromSnapshotsParams struct {
+	EnvKey    string    `json:"env_key"`
+	SecretID  uuid.UUID `json:"secret_id"`
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Since     time.Time `json:"since"`
+}
+
+// Takes a binding back out of every snapshot of the sandbox that could have
+// recorded it, settled or not: those created since the attach began, which
+// then failed and is undone. The key stays, without its secret, for a fork
+// to clear.
+func (q *Queries) WithdrawBindingFromSnapshots(ctx context.Context, arg WithdrawBindingFromSnapshotsParams) error {
+	_, err := q.db.Exec(ctx, withdrawBindingFromSnapshots,
+		arg.EnvKey,
+		arg.SecretID,
+		arg.SandboxID,
+		arg.Since,
+	)
+	return err
 }

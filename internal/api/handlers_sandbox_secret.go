@@ -36,7 +36,107 @@ var (
 	errBindingExists        = errors.New("env key already bound on sandbox")
 	errBindingCapReached    = errors.New("sandbox binding cap reached")
 	errSandboxMidTransition = errors.New("sandbox not in a mutable state")
+	errSnapshotInFlight     = errors.New("a snapshot of the sandbox is being captured")
 )
+
+// refuseDuringCapture keeps the guest a capture images at the bindings its
+// row records: the row is written under the sandbox's secret-write lock,
+// which the caller holds, and while it is creating the sweep may capture
+// again, so no binding may change until it settles or is deleted.
+func refuseDuringCapture(ctx context.Context, q *db.Queries, sandboxID uuid.UUID) error {
+	inFlight, err := q.SandboxSnapshotCaptureInFlight(ctx, sandboxID)
+	if err != nil {
+		return err
+	}
+	if inFlight {
+		return errSnapshotInFlight
+	}
+	return nil
+}
+
+// detachedKeysKept bounds a sandbox's detached keys. Past it the oldest
+// key's revoked token may survive into a fork, where it is inert.
+const detachedKeysKept = 64
+
+// recordDetachedKey remembers a key detached from the sandbox until its
+// guest is known to have dropped it.
+func recordDetachedKey(ctx context.Context, q *db.Queries, sandboxID uuid.UUID, envKey string) error {
+	if err := q.RecordDetachedSecretKey(ctx, db.RecordDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: envKey}); err != nil {
+		return err
+	}
+	return q.PruneDetachedSecretKeys(ctx, db.PruneDetachedSecretKeysParams{SandboxID: sandboxID, Keep: detachedKeysKept})
+}
+
+// undoAttach takes back a binding whose guest update failed, under the
+// secret-write lock like any binding change. It is not refused during a
+// capture: any snapshot taken since the attach began may have recorded the
+// binding, settled or not, and has it withdrawn, as do sandboxes already
+// created from one, so no fork keeps it.
+// boxd may have applied the env before the error, so the token is revoked
+// and the key recorded as detached.
+func (h *Handlers) undoAttach(ctx context.Context, sandboxID, secretID uuid.UUID, envKey, token string, since time.Time) error {
+	undo := func(q *db.Queries) error {
+		if h.Pool != nil {
+			if err := q.LockSandboxForSecretWrites(ctx, sandboxID.String()); err != nil {
+				return err
+			}
+		}
+		if _, err := q.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if err := recordDetachedKey(ctx, q, sandboxID, envKey); err != nil {
+			return err
+		}
+		if err := q.InsertRevokedProxyToken(ctx, db.InsertRevokedProxyTokenParams{
+			SandboxID:  sandboxID,
+			ProxyToken: token,
+			ExpiresAt:  time.Now().Add(SecretsJWTLifetime),
+		}); err != nil {
+			return err
+		}
+		// The snapshots first: the update waits out any fork still inserting
+		// from one, so the forks' read below sees that fork too.
+		if err := q.WithdrawBindingFromSnapshots(ctx, db.WithdrawBindingFromSnapshotsParams{
+			SandboxID: sandboxID, EnvKey: envKey, SecretID: secretID, Since: since,
+		}); err != nil {
+			return err
+		}
+		forks, err := q.WithdrawBindingFromForks(ctx, db.WithdrawBindingFromForksParams{
+			SandboxID: sandboxID, Since: since, EnvKey: envKey, SecretID: secretID,
+		})
+		if err != nil {
+			return err
+		}
+		for _, f := range forks {
+			if f.ProxyToken == nil || *f.ProxyToken == "" {
+				continue
+			}
+			if err := q.InsertRevokedProxyToken(ctx, db.InsertRevokedProxyTokenParams{
+				SandboxID: f.SandboxID, ProxyToken: *f.ProxyToken, ExpiresAt: time.Now().Add(SecretsJWTLifetime),
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if h.Pool == nil {
+		return undo(h.DB)
+	}
+	tx, err := h.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := undo(h.DB.WithTx(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func respondSnapshotInFlight(c *gin.Context) {
+	c.Header("Retry-After", "5")
+	respondErrorMsg(c, "snapshot_in_progress", "a snapshot of this sandbox is being taken; retry once it is ready or failed, or delete it", http.StatusConflict)
+}
 
 type attachSecretRequest struct {
 	EnvKey     string `json:"env_key"`
@@ -122,11 +222,19 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	// cap and exceed it — which would later wedge re-minting. The in-process lock
 	// only covers one instance. Env-key collisions are caught by the PK.
 	var liveSandbox db.Sandbox
+	// When the binding became visible, at the latest: a snapshot older than
+	// this cannot have recorded it.
+	var attachStarted time.Time
 	insertBinding := func(q *db.Queries) error {
 		if h.Pool != nil {
 			if lerr := q.LockSandboxForSecretWrites(ctx, sandboxID.String()); lerr != nil {
 				return lerr
 			}
+			started, lerr := q.TransactionStartedAt(ctx)
+			if lerr != nil {
+				return lerr
+			}
+			attachStarted = started
 		}
 		// Re-read status under the lock: a resume on another instance may have
 		// flipped it since the early read. The live status decides whether we
@@ -141,6 +249,9 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 			return errSandboxMidTransition
 		}
 		liveSandbox = sb
+		if lerr := refuseDuringCapture(ctx, q, sandboxID); lerr != nil {
+			return lerr
+		}
 		existing, lerr := q.ListSandboxSecretBindings(ctx, sandboxID)
 		if lerr != nil {
 			return lerr
@@ -169,7 +280,7 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		if bound == 0 {
 			return errSandboxMidTransition
 		}
-		return nil
+		return q.ForgetDetachedSecretKey(ctx, db.ForgetDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: req.EnvKey})
 	}
 
 	if h.Pool == nil {
@@ -184,6 +295,9 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		}
 	}
 	switch {
+	case errors.Is(err, errSnapshotInFlight):
+		respondSnapshotInFlight(c)
+		return
 	case errors.Is(err, errBindingExists):
 		respondErrorMsg(c, "conflict", fmt.Sprintf("env-var key %q is already bound on this sandbox", req.EnvKey), http.StatusConflict)
 		return
@@ -213,14 +327,9 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 			// its rollback, leaving the row behind after a 500.
 			rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer rbCancel()
-			_, _ = h.DB.DeleteSandboxSecretBinding(rbCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: req.EnvKey})
-			// boxd may have committed the env/JWT before the apply errored, so revoke
-			// the token too — the binding's credential must not outlive its row.
-			_ = h.DB.InsertRevokedProxyToken(rbCtx, db.InsertRevokedProxyTokenParams{
-				SandboxID:  sandboxID,
-				ProxyToken: token,
-				ExpiresAt:  time.Now().Add(SecretsJWTLifetime),
-			})
+			if rerr := h.undoAttach(rbCtx, sandboxID, secret.ID, req.EnvKey, token, attachStarted); rerr != nil {
+				log.Error().Err(rerr).Str("sandbox_id", sandboxID.String()).Msg("undo a failed secret attach")
+			}
 			respondError(c, ErrInternal)
 			return
 		}
@@ -281,8 +390,21 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 	defer mutCancel()
 
 	deleteAndRevoke := func(q *db.Queries) error {
+		// A snapshot records the bindings under this lock, so this detach
+		// lands before its row or after it, never between.
+		if h.Pool != nil {
+			if lerr := q.LockSandboxForSecretWrites(mutCtx, sandboxID.String()); lerr != nil {
+				return lerr
+			}
+		}
+		if lerr := refuseDuringCapture(mutCtx, q, sandboxID); lerr != nil {
+			return lerr
+		}
 		deleted, derr := q.DeleteSandboxSecretBinding(mutCtx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey})
 		if derr != nil {
+			return derr
+		}
+		if derr := recordDetachedKey(mutCtx, q, sandboxID, envKey); derr != nil {
 			return derr
 		}
 		// A binding stored before tokens were persisted has no stored token to
@@ -310,6 +432,10 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		}
 	}
 	if err != nil {
+		if errors.Is(err, errSnapshotInFlight) {
+			respondSnapshotInFlight(c)
+			return
+		}
 		if errors.Is(err, pgx.ErrNoRows) {
 			respondErrorMsg(c, "not_found", fmt.Sprintf("no secret bound under env-var key %q on this sandbox", envKey), http.StatusNotFound)
 			return
@@ -319,14 +445,17 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		return
 	}
 
-	// Re-mint the reduced set for a running sandbox; a paused one re-mints on
-	// resume. Best-effort — the revocation above already enforces the detach, so a
-	// re-mint failure is not fatal.
+	// Re-mint the reduced set for a running sandbox, clearing the detached key
+	// from its guest; a paused one re-mints on resume. Best-effort — the
+	// revocation above already enforces the detach, so a re-mint failure is
+	// not fatal. Once the guest has dropped the key it need not be remembered.
 	if sandbox.Status == db.SandboxStatusActive {
 		if meta, lerr := h.loadSecretBindingMeta(ctx, sandboxID); lerr != nil {
 			log.Warn().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("load secret bindings after detach")
-		} else if aerr := h.applySecretBindings(ctx, sandbox, meta); aerr != nil {
+		} else if aerr := h.applySecretBindings(ctx, sandbox, meta, envKey); aerr != nil {
 			log.Warn().Err(aerr).Str("sandbox_id", sandboxID.String()).Msg("re-mint secret bindings after detach")
+		} else if ferr := h.DB.ForgetDetachedSecretKey(mutCtx, db.ForgetDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: envKey}); ferr != nil {
+			log.Warn().Err(ferr).Str("sandbox_id", sandboxID.String()).Msg("forget a detached key the guest dropped")
 		}
 	}
 

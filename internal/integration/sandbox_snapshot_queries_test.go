@@ -28,7 +28,7 @@ func TestSandboxSnapshotQueries(t *testing.T) {
 	params := func(kind string, key *string) db.CreateSandboxSnapshotParams {
 		return db.CreateSandboxSnapshotParams{
 			ID: uuid.New(), TeamID: teamID, SandboxID: sandboxID, Kind: kind, IdempotencyKey: key,
-			SecretBindings: []byte("[]"), SweepAfter: time.Now().Add(15 * time.Minute),
+			SweepAfter: time.Now().Add(15 * time.Minute),
 		}
 	}
 	// The row takes what it records from a source still live: not one

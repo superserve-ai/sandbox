@@ -159,6 +159,34 @@ func (q *Queries) DeleteSandboxSecrets(ctx context.Context, sandboxID uuid.UUID)
 	return err
 }
 
+const forgetDetachedSecretKey = `-- name: ForgetDetachedSecretKey :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = $2
+`
+
+type ForgetDetachedSecretKeyParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	EnvKey    string    `json:"env_key"`
+}
+
+func (q *Queries) ForgetDetachedSecretKey(ctx context.Context, arg ForgetDetachedSecretKeyParams) error {
+	_, err := q.db.Exec(ctx, forgetDetachedSecretKey, arg.SandboxID, arg.EnvKey)
+	return err
+}
+
+const forgetDetachedSecretKeys = `-- name: ForgetDetachedSecretKeys :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = ANY($2::text[])
+`
+
+type ForgetDetachedSecretKeysParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	EnvKeys   []string  `json:"env_keys"`
+}
+
+func (q *Queries) ForgetDetachedSecretKeys(ctx context.Context, arg ForgetDetachedSecretKeysParams) error {
+	_, err := q.db.Exec(ctx, forgetDetachedSecretKeys, arg.SandboxID, arg.EnvKeys)
+	return err
+}
+
 const getSecretByID = `-- name: GetSecretByID :one
 SELECT id, team_id, name, auth_type, auth_config, provider_shortcut, hosts, ciphertext, encrypted_dek, kek_id, created_at, updated_at, last_used_at, deleted_at FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
@@ -255,6 +283,51 @@ func (q *Queries) GetSecretByName(ctx context.Context, arg GetSecretByNameParams
 		&i.DeletedAt,
 	)
 	return i, err
+}
+
+const getSecretsByIDs = `-- name: GetSecretsByIDs :many
+SELECT id, team_id, name, auth_type, auth_config, provider_shortcut, hosts, ciphertext, encrypted_dek, kek_id, created_at, updated_at, last_used_at, deleted_at FROM secret
+WHERE team_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL
+`
+
+type GetSecretsByIDsParams struct {
+	TeamID  uuid.UUID   `json:"team_id"`
+	Column2 []uuid.UUID `json:"column_2"`
+}
+
+func (q *Queries) GetSecretsByIDs(ctx context.Context, arg GetSecretsByIDsParams) ([]Secret, error) {
+	rows, err := q.db.Query(ctx, getSecretsByIDs, arg.TeamID, arg.Column2)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Secret{}
+	for rows.Next() {
+		var i Secret
+		if err := rows.Scan(
+			&i.ID,
+			&i.TeamID,
+			&i.Name,
+			&i.AuthType,
+			&i.AuthConfig,
+			&i.ProviderShortcut,
+			&i.Hosts,
+			&i.Ciphertext,
+			&i.EncryptedDek,
+			&i.KekID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.LastUsedAt,
+			&i.DeletedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getSecretsByNames = `-- name: GetSecretsByNames :many
@@ -413,6 +486,30 @@ func (q *Queries) ListAuditForSecret(ctx context.Context, arg ListAuditForSecret
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDetachedSecretKeys = `-- name: ListDetachedSecretKeys :many
+SELECT env_key FROM sandbox_secret_detached WHERE sandbox_id = $1 ORDER BY env_key
+`
+
+func (q *Queries) ListDetachedSecretKeys(ctx context.Context, sandboxID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listDetachedSecretKeys, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var env_key string
+		if err := rows.Scan(&env_key); err != nil {
+			return nil, err
+		}
+		items = append(items, env_key)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -764,6 +861,43 @@ func (q *Queries) LockSandboxForSecretWrites(ctx context.Context, hashtext strin
 	return err
 }
 
+const pruneDetachedSecretKeys = `-- name: PruneDetachedSecretKeys :exec
+DELETE FROM sandbox_secret_detached d
+WHERE d.sandbox_id = $1::uuid AND d.env_key IN (
+  SELECT k.env_key FROM sandbox_secret_detached k
+  WHERE k.sandbox_id = $1::uuid
+  ORDER BY k.detached_at DESC, k.env_key
+  OFFSET $2::int
+)
+`
+
+type PruneDetachedSecretKeysParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Keep      int32     `json:"keep"`
+}
+
+// Keeps the most recent detached keys only, so what a snapshot records
+// stays bounded however many keys a sandbox churns through.
+func (q *Queries) PruneDetachedSecretKeys(ctx context.Context, arg PruneDetachedSecretKeysParams) error {
+	_, err := q.db.Exec(ctx, pruneDetachedSecretKeys, arg.SandboxID, arg.Keep)
+	return err
+}
+
+const recordDetachedSecretKey = `-- name: RecordDetachedSecretKey :exec
+INSERT INTO sandbox_secret_detached (sandbox_id, env_key) VALUES ($1, $2)
+ON CONFLICT (sandbox_id, env_key) DO UPDATE SET detached_at = now()
+`
+
+type RecordDetachedSecretKeyParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	EnvKey    string    `json:"env_key"`
+}
+
+func (q *Queries) RecordDetachedSecretKey(ctx context.Context, arg RecordDetachedSecretKeyParams) error {
+	_, err := q.db.Exec(ctx, recordDetachedSecretKey, arg.SandboxID, arg.EnvKey)
+	return err
+}
+
 const softDeleteSecret = `-- name: SoftDeleteSecret :one
 UPDATE secret
 SET deleted_at = now(), updated_at = now()
@@ -849,6 +983,17 @@ func (q *Queries) TouchSecretLastUsed(ctx context.Context, arg TouchSecretLastUs
 	return err
 }
 
+const transactionStartedAt = `-- name: TransactionStartedAt :one
+SELECT now()::timestamptz
+`
+
+func (q *Queries) TransactionStartedAt(ctx context.Context) (time.Time, error) {
+	row := q.db.QueryRow(ctx, transactionStartedAt)
+	var column_1 time.Time
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
 const updateSecretValue = `-- name: UpdateSecretValue :one
 UPDATE secret
 SET ciphertext = $3,
@@ -894,4 +1039,55 @@ func (q *Queries) UpdateSecretValue(ctx context.Context, arg UpdateSecretValuePa
 		&i.DeletedAt,
 	)
 	return i, err
+}
+
+const withdrawBindingFromForks = `-- name: WithdrawBindingFromForks :many
+DELETE FROM sandbox_secret ss
+USING sandbox fork, sandbox_snapshot snap
+WHERE ss.sandbox_id = fork.id
+  AND fork.source_snapshot_id = snap.id
+  AND snap.sandbox_id = $1::uuid
+  AND snap.created_at >= $2::timestamptz
+  AND ss.env_key = $3::text
+  AND ss.secret_id = $4::uuid
+RETURNING ss.sandbox_id, ss.proxy_token
+`
+
+type WithdrawBindingFromForksParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Since     time.Time `json:"since"`
+	EnvKey    string    `json:"env_key"`
+	SecretID  uuid.UUID `json:"secret_id"`
+}
+
+type WithdrawBindingFromForksRow struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	ProxyToken *string   `json:"proxy_token"`
+}
+
+// Takes a binding back out of sandboxes created, since the attach began,
+// from a snapshot that recorded it; returns their tokens to revoke.
+func (q *Queries) WithdrawBindingFromForks(ctx context.Context, arg WithdrawBindingFromForksParams) ([]WithdrawBindingFromForksRow, error) {
+	rows, err := q.db.Query(ctx, withdrawBindingFromForks,
+		arg.SandboxID,
+		arg.Since,
+		arg.EnvKey,
+		arg.SecretID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WithdrawBindingFromForksRow{}
+	for rows.Next() {
+		var i WithdrawBindingFromForksRow
+		if err := rows.Scan(&i.SandboxID, &i.ProxyToken); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }

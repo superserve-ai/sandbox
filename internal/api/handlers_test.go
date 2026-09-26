@@ -37,9 +37,11 @@ import (
 
 type stubVMD struct {
 	restoreLimits vmdclient.ResourceLimits
-	destroyFn     func(ctx context.Context, id string, force bool) error
-	pauseFn       func(ctx context.Context, id, snapshotDir string) (string, string, error)
-	resumeFn      func(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, error)
+	// restoreIgnoresRules is a vmd that predates rules on restore.
+	restoreIgnoresRules bool
+	destroyFn           func(ctx context.Context, id string, force bool) error
+	pauseFn             func(ctx context.Context, id, snapshotDir string) (string, string, error)
+	resumeFn            func(ctx context.Context, id, snapshotPath, memPath string, networkConfig []byte) (string, error)
 	// resumePolicyFn sees the policy the resume request carried; resumeAttest
 	// is what the stubbed daemon claims to have applied (zero = old daemon).
 	resumePolicyFn         func(access string, ports map[int32]vmdclient.PortPolicy, revision int64)
@@ -140,7 +142,7 @@ func (s *stubVMD) ResumeInstance(ctx context.Context, id, snapshotPath, memPath 
 	}
 	return "10.0.0.1", 1, 1024, s.resumeAttest, nil
 }
-func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
+func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath, _, _, _, _, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, bool, error) {
 	s.restoreLimits = limits
 	protocol := preview.HostCapabilityPorts
 	if s.restorePreviewProtocol != nil {
@@ -149,11 +151,12 @@ func (s *stubVMD) RestoreSnapshot(ctx context.Context, id, snapshotPath, memPath
 	if s.restorePolicyFn != nil {
 		s.restorePolicyFn(previewAccess, previewPorts, previewPolicyRevision)
 	}
+	applied := limits.Egress != nil && !s.restoreIgnoresRules
 	if s.restoreFn != nil {
 		ip, err := s.restoreFn(ctx, id, snapshotPath, memPath)
-		return ip, 1, 1024, protocol, err
+		return ip, 1, 1024, protocol, applied, err
 	}
-	return "10.0.0.1", 1, 1024, protocol, nil
+	return "10.0.0.1", 1, 1024, protocol, applied, nil
 }
 func (s *stubVMD) DeleteSnapshot(ctx context.Context, id, snapshotPath, memPath string) error {
 	if s.deleteSnapshotFn != nil {
@@ -232,6 +235,12 @@ type mockDBTX struct {
 	execFn            func(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	// queryFn is optional; nil falls back to an empty rows iterator.
 	queryFn func(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	// captureInFlight answers whether a snapshot capture of the sandbox is
+	// running; secret changes ask before every write.
+	captureInFlight bool
+	// detachedKeys are the keys detached from the sandbox while it was
+	// paused; a resume of a sandbox that had secrets reads them.
+	detachedKeys []string
 }
 
 // The fake transaction shares the scripted rows while exposing real transaction
@@ -326,6 +335,9 @@ func (b *mockBatch) Close() error {
 }
 
 func (m *mockDBTX) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if strings.Contains(sql, "-- name: SandboxSnapshotCaptureInFlight :one") {
+		return scalarBoolRow(m.captureInFlight)
+	}
 	// The finalize-mode probe runs before every FinalizePause. Unit tests
 	// exercise legacy mode (the index exists until the contract phase), so
 	// answer it centrally instead of scripting it into every test.
@@ -345,6 +357,16 @@ func (m *mockDBTX) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 }
 
 func (m *mockDBTX) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if strings.Contains(sql, "-- name: ListDetachedSecretKeys :many") {
+		rows := &scanRows{}
+		for _, k := range m.detachedKeys {
+			rows.rows = append(rows.rows, func(dest ...any) error {
+				*dest[0].(*string) = k
+				return nil
+			})
+		}
+		return rows, nil
+	}
 	if m.queryFn != nil {
 		return m.queryFn(ctx, sql, args...)
 	}

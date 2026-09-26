@@ -345,9 +345,9 @@ func (s *stubVMD) ResumeInstance(_ context.Context, _, _, _ string, _ []byte, _ 
 	}
 	return "10.0.0.1", 1, 1024, s.resumeAttestation, nil
 }
-func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string, _ vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
+func (s *stubVMD) RestoreSnapshot(_ context.Context, _, _, _, _, _, _, _, _ string, _ map[int32]vmdclient.PortPolicy, _ int64, _ map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, bool, error) {
 	s.restoreCalls.Add(1)
-	return "10.0.0.1", 1, 1024, preview.HostCapabilityPorts, nil
+	return "10.0.0.1", 1, 1024, preview.HostCapabilityPorts, limits.Egress != nil, nil
 }
 func (s *stubVMD) InjectSandboxEnv(_ context.Context, _ string, _ map[string]string, _ string) error {
 	return nil

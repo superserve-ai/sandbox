@@ -15,6 +15,10 @@ WHERE team_id = $1 AND name = $2 AND deleted_at IS NULL;
 SELECT * FROM secret
 WHERE team_id = $1 AND name = ANY($2::text[]) AND deleted_at IS NULL;
 
+-- name: GetSecretsByIDs :many
+SELECT * FROM secret
+WHERE team_id = $1 AND id = ANY($2::uuid[]) AND deleted_at IS NULL;
+
 -- name: GetSecretByID :one
 SELECT * FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL;
@@ -173,3 +177,43 @@ WHERE pa.secret_id = sqlc.arg('secret_id')
   AND pa.status <= sqlc.arg('status_max')::int
 ORDER BY pa.id DESC
 LIMIT sqlc.arg('row_limit');
+
+-- name: RecordDetachedSecretKey :exec
+INSERT INTO sandbox_secret_detached (sandbox_id, env_key) VALUES ($1, $2)
+ON CONFLICT (sandbox_id, env_key) DO UPDATE SET detached_at = now();
+
+-- name: PruneDetachedSecretKeys :exec
+-- Keeps the most recent detached keys only, so what a snapshot records
+-- stays bounded however many keys a sandbox churns through.
+DELETE FROM sandbox_secret_detached d
+WHERE d.sandbox_id = sqlc.arg('sandbox_id')::uuid AND d.env_key IN (
+  SELECT k.env_key FROM sandbox_secret_detached k
+  WHERE k.sandbox_id = sqlc.arg('sandbox_id')::uuid
+  ORDER BY k.detached_at DESC, k.env_key
+  OFFSET sqlc.arg('keep')::int
+);
+
+-- name: ForgetDetachedSecretKey :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = $2;
+
+-- name: ListDetachedSecretKeys :many
+SELECT env_key FROM sandbox_secret_detached WHERE sandbox_id = $1 ORDER BY env_key;
+
+-- name: ForgetDetachedSecretKeys :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = ANY(@env_keys::text[]);
+
+-- name: TransactionStartedAt :one
+SELECT now()::timestamptz;
+
+-- name: WithdrawBindingFromForks :many
+-- Takes a binding back out of sandboxes created, since the attach began,
+-- from a snapshot that recorded it; returns their tokens to revoke.
+DELETE FROM sandbox_secret ss
+USING sandbox fork, sandbox_snapshot snap
+WHERE ss.sandbox_id = fork.id
+  AND fork.source_snapshot_id = snap.id
+  AND snap.sandbox_id = sqlc.arg('sandbox_id')::uuid
+  AND snap.created_at >= sqlc.arg('since')::timestamptz
+  AND ss.env_key = sqlc.arg('env_key')::text
+  AND ss.secret_id = sqlc.arg('secret_id')::uuid
+RETURNING ss.sandbox_id, ss.proxy_token;

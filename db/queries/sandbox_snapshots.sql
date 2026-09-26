@@ -7,7 +7,9 @@
 -- reclaim then always sees the sandbox or the snapshot pinning its build.
 -- The trigger counts the limits on insert; a retry carrying an idempotency
 -- key already on file is refused by the unique index and re-read by the
--- caller.
+-- caller. The bindings a fork re-binds or clears are read here too, by a
+-- caller that holds the sandbox's secret-write lock, so a detach is in the
+-- row or after it.
 INSERT INTO sandbox_snapshot (
     id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key,
     host_id, vcpu_count, memory_mib, disk_mib, base_path,
@@ -15,7 +17,9 @@ INSERT INTO sandbox_snapshot (
 )
 SELECT @id::uuid, s.team_id, s.id, s.template_id, @kind::text, 'creating', sqlc.narg('name')::text, sqlc.narg('idempotency_key')::text,
     s.host_id, s.vcpu_count, s.memory_mib, s.disk_mib, s.base_path,
-    s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb), @secret_bindings::jsonb, @sweep_after::timestamptz
+    s.timeout_seconds, COALESCE(s.network_config, '{}'::jsonb),
+    sandbox_secret_record(s.id),
+    @sweep_after::timestamptz
 FROM sandbox s
 WHERE s.id = @sandbox_id AND s.team_id = @team_id AND s.destroyed_at IS NULL
   AND s.status IN ('active', 'paused') AND s.host_id <> '' AND s.base_path IS NOT NULL
@@ -104,3 +108,27 @@ WHERE id IN (
     FOR UPDATE SKIP LOCKED
 )
 RETURNING *;
+
+-- name: SandboxSnapshotCaptureInFlight :one
+-- A capture of the sandbox that may still image its guest: a creating row,
+-- which the sweep captures again until it settles, however old.
+SELECT EXISTS (
+  SELECT 1 FROM sandbox_snapshot
+  WHERE sandbox_id = $1 AND status = 'creating' AND deleted_at IS NULL
+);
+
+-- name: WithdrawBindingFromSnapshots :exec
+-- Takes a binding back out of every snapshot of the sandbox that could have
+-- recorded it, settled or not: those created since the attach began, which
+-- then failed and is undone. The key stays, without its secret, for a fork
+-- to clear.
+UPDATE sandbox_snapshot SET secret_bindings = (
+  SELECT COALESCE(jsonb_agg(
+    CASE WHEN e->>'env_key' = sqlc.arg('env_key')::text AND e->>'secret_id' = sqlc.arg('secret_id')::uuid::text
+         THEN jsonb_build_object('env_key', e->>'env_key')
+         ELSE e END
+    ORDER BY e->>'env_key'), '[]'::jsonb)
+  FROM jsonb_array_elements(secret_bindings) e
+)
+WHERE sandbox_id = sqlc.arg('sandbox_id')::uuid AND deleted_at IS NULL
+  AND created_at >= sqlc.arg('since')::timestamptz;

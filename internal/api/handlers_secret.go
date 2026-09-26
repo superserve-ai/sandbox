@@ -1108,26 +1108,92 @@ func (h *Handlers) resolveSecretBindingsForCreate(
 				fmt.Sprintf("secrets[%s] references %q, which does not exist for this team", envKey, name),
 				http.StatusBadRequest)
 		}
-		bindings = append(bindings, db.AddSandboxSecretParams{
-			SecretID: row.ID,
-			EnvKey:   envKey,
-		})
-		token, terr := mintProxyToken(row.ProviderShortcut)
-		if terr != nil {
-			log.Error().Err(terr).Msg("mintProxyToken during sandbox create")
+		binding, m, err := bindSecret(envKey, row)
+		if err != nil {
+			log.Error().Err(err).Msg("mintProxyToken during sandbox create")
 			return nil, nil, ErrInternal
 		}
-		meta = append(meta, SecretBindingMeta{
-			SecretID:         row.ID,
-			EnvKey:           envKey,
-			AuthType:         row.AuthType,
-			AuthConfig:       row.AuthConfig,
-			ProviderShortcut: row.ProviderShortcut,
-			Hosts:            row.Hosts,
-			ProxyToken:       token,
-		})
+		bindings = append(bindings, binding)
+		meta = append(meta, m)
 	}
 	return bindings, meta, nil
+}
+
+// bindSecret is one binding of a secret to an env key, with a fresh proxy token.
+func bindSecret(envKey string, row db.Secret) (db.AddSandboxSecretParams, SecretBindingMeta, error) {
+	token, err := mintProxyToken(row.ProviderShortcut)
+	if err != nil {
+		return db.AddSandboxSecretParams{}, SecretBindingMeta{}, err
+	}
+	return db.AddSandboxSecretParams{SecretID: row.ID, EnvKey: envKey}, SecretBindingMeta{
+		SecretID:         row.ID,
+		EnvKey:           envKey,
+		AuthType:         row.AuthType,
+		AuthConfig:       row.AuthConfig,
+		ProviderShortcut: row.ProviderShortcut,
+		Hosts:            row.Hosts,
+		ProxyToken:       token,
+	}, nil
+}
+
+// rebindSnapshotSecrets binds a sandbox created from a snapshot to the
+// secrets its source was bound to: by id against the team's live secrets,
+// with fresh proxy tokens. A secret deleted since, or a key recorded as
+// detached, is left out and its key returned as dropped, as is an env key
+// the request sets itself, in secrets or envVars.
+func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, recorded []byte, secrets, envVars map[string]string) ([]db.AddSandboxSecretParams, []SecretBindingMeta, []string, *AppError) {
+	var bound []struct {
+		EnvKey   string    `json:"env_key"`
+		SecretID uuid.UUID `json:"secret_id"`
+	}
+	if len(recorded) > 0 {
+		if err := json.Unmarshal(recorded, &bound); err != nil {
+			log.Error().Err(err).Msg("decode snapshot secret bindings")
+			return nil, nil, nil, ErrInternal
+		}
+	}
+	if len(bound) == 0 {
+		return nil, nil, nil, nil
+	}
+	ids := make([]uuid.UUID, 0, len(bound))
+	for _, b := range bound {
+		if b.SecretID != uuid.Nil {
+			ids = append(ids, b.SecretID)
+		}
+	}
+	rows, err := h.DB.GetSecretsByIDs(ctx, db.GetSecretsByIDsParams{TeamID: teamID, Column2: ids})
+	if err != nil {
+		log.Error().Err(err).Msg("DB GetSecretsByIDs during sandbox create")
+		return nil, nil, nil, ErrInternal
+	}
+	byID := make(map[uuid.UUID]db.Secret, len(rows))
+	for _, row := range rows {
+		byID[row.ID] = row
+	}
+	var bindings []db.AddSandboxSecretParams
+	var meta []SecretBindingMeta
+	var dropped []string
+	for _, b := range bound {
+		row, live := byID[b.SecretID]
+		if _, set := secrets[b.EnvKey]; set {
+			continue
+		}
+		if !live {
+			dropped = append(dropped, b.EnvKey)
+			continue
+		}
+		if _, set := envVars[b.EnvKey]; set {
+			continue
+		}
+		binding, m, err := bindSecret(b.EnvKey, row)
+		if err != nil {
+			log.Error().Err(err).Msg("mintProxyToken during sandbox create")
+			return nil, nil, nil, ErrInternal
+		}
+		bindings = append(bindings, binding)
+		meta = append(meta, m)
+	}
+	return bindings, meta, dropped, nil
 }
 
 // loadSecretBindingMeta rebuilds a sandbox's binding metadata from the DB. The
@@ -1179,7 +1245,7 @@ func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUI
 // applySecretBindings mints the secrets JWT for meta and injects it, with the secret
 // env vars, into a live sandbox. Empty meta injects no JWT. InjectSandboxEnv merges,
 // so it can add or update an env var but not remove one.
-func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, meta []SecretBindingMeta) error {
+func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, meta []SecretBindingMeta, clear ...string) error {
 	vmd, err := h.vmdForHost(ctx, sandbox.HostID)
 	if err != nil {
 		return fmt.Errorf("resolve vmd for host: %w", err)
@@ -1195,7 +1261,18 @@ func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, 
 			return fmt.Errorf("mint secrets jwt: %w", err)
 		}
 	}
-	if err := vmd.InjectSandboxEnv(ctx, sandbox.ID.String(), mergeEnvVarsWithSecrets(nil, meta), jwt); err != nil {
+	env := mergeEnvVarsWithSecrets(nil, meta)
+	if len(clear) > 0 {
+		cleared := make(map[string]string, len(env)+len(clear))
+		for _, k := range clear {
+			cleared[k] = ""
+		}
+		for k, v := range env {
+			cleared[k] = v
+		}
+		env = cleared
+	}
+	if err := vmd.InjectSandboxEnv(ctx, sandbox.ID.String(), env, jwt); err != nil {
 		return fmt.Errorf("inject sandbox env: %w", err)
 	}
 	if jwt != "" {

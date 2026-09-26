@@ -57,6 +57,10 @@ const (
 	// deletes saved snapshots and refuses a capture for an id it has deleted,
 	// so the control plane never asks an older daemon for one.
 	HostCapabilitySavedSnapshots = "saved_snapshots_v1"
+	// HostCapabilitySnapshotForks is advertised by a vmd that installs a
+	// fork's egress rules before its guest runs; an older one would resume
+	// the captured workload unrestricted.
+	HostCapabilitySnapshotForks = "snapshot_forks_v1"
 
 	// Published preview ports exclude privileged ports and boxd's reserved
 	// service port. Keeping this vocabulary shared prevents the API, VMD,

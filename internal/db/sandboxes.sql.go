@@ -1094,6 +1094,163 @@ func (q *Queries) CreateSandbox(ctx context.Context, arg CreateSandboxParams) (C
 	return i, err
 }
 
+const createSandboxFromSnapshot = `-- name: CreateSandboxFromSnapshot :one
+WITH src AS (
+  SELECT s.id AS source_snapshot_id, s.host_id, s.template_id, s.vcpu_count, s.memory_mib, s.disk_mib,
+         s.base_path, s.snapshot_path, s.mem_path
+  FROM sandbox_snapshot s
+  WHERE s.id = $1 AND s.team_id = $2
+    AND s.status = 'ready' AND s.deleted_at IS NULL
+    AND s.secret_bindings = $3::jsonb
+  FOR SHARE
+), ins AS (
+  INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id, network_config)
+  SELECT $4, $2, $5, $6, vcpu_count, memory_mib, host_id, $7, $8, template_id, snapshot_path, mem_path, base_path, disk_mib, $9, cardinality($10::uuid[]) > 0, source_snapshot_id, $11::jsonb FROM src
+  RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, source_snapshot_id
+), preview_policy AS (
+  INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
+  SELECT ins.id, $12::text, 0 FROM ins
+  RETURNING sandbox_id
+), bindings AS (
+  INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
+  SELECT ins.id, ($10::uuid[])[i], ($13::text[])[i], ($14::text[])[i]
+  FROM ins, generate_subscripts($10::uuid[], 1) AS g(i)
+)
+SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.source_snapshot_id FROM ins
+JOIN preview_policy ON preview_policy.sandbox_id = ins.id
+`
+
+type CreateSandboxFromSnapshotParams struct {
+	SnapshotID        uuid.UUID     `json:"snapshot_id"`
+	TeamID            uuid.UUID     `json:"team_id"`
+	SecretBindings    []byte        `json:"secret_bindings"`
+	ID                uuid.UUID     `json:"id"`
+	Name              string        `json:"name"`
+	Status            SandboxStatus `json:"status"`
+	TimeoutSeconds    *int32        `json:"timeout_seconds"`
+	Metadata          []byte        `json:"metadata"`
+	AutoDeleteSeconds *int32        `json:"auto_delete_seconds"`
+	SecretIds         []uuid.UUID   `json:"secret_ids"`
+	NetworkConfig     []byte        `json:"network_config"`
+	PreviewAccess     string        `json:"preview_access"`
+	EnvKeys           []string      `json:"env_keys"`
+	ProxyTokens       []string      `json:"proxy_tokens"`
+}
+
+type CreateSandboxFromSnapshotRow struct {
+	ID                   uuid.UUID          `json:"id"`
+	TeamID               uuid.UUID          `json:"team_id"`
+	Name                 string             `json:"name"`
+	Status               SandboxStatus      `json:"status"`
+	VcpuCount            int32              `json:"vcpu_count"`
+	MemoryMib            int32              `json:"memory_mib"`
+	HostID               string             `json:"host_id"`
+	IpAddress            *netip.Addr        `json:"ip_address"`
+	Pid                  *int32             `json:"pid"`
+	SnapshotID           pgtype.UUID        `json:"snapshot_id"`
+	CreatedAt            time.Time          `json:"created_at"`
+	UpdatedAt            time.Time          `json:"updated_at"`
+	DestroyedAt          pgtype.Timestamptz `json:"destroyed_at"`
+	NetworkConfig        []byte             `json:"network_config"`
+	TimeoutSeconds       *int32             `json:"timeout_seconds"`
+	Metadata             []byte             `json:"metadata"`
+	TemplateID           pgtype.UUID        `json:"template_id"`
+	SnapshotPath         *string            `json:"snapshot_path"`
+	MemPath              *string            `json:"mem_path"`
+	BasePath             *string            `json:"base_path"`
+	DeltaPath            *string            `json:"delta_path"`
+	DiskMib              int32              `json:"disk_mib"`
+	AutoDeleteSeconds    *int32             `json:"auto_delete_seconds"`
+	AutoDeleteAt         pgtype.Timestamptz `json:"auto_delete_at"`
+	FailedAt             pgtype.Timestamptz `json:"failed_at"`
+	HadSecretBindings    *bool              `json:"had_secret_bindings"`
+	SecretEnvFingerprint *string            `json:"secret_env_fingerprint"`
+	SecretEnvIp          *string            `json:"secret_env_ip"`
+	SecretEnvInjectedAt  pgtype.Timestamptz `json:"secret_env_injected_at"`
+	SecretEnvExpiresAt   pgtype.Timestamptz `json:"secret_env_expires_at"`
+	PauseOpID            pgtype.UUID        `json:"pause_op_id"`
+	PauseOpStartedAt     pgtype.Timestamptz `json:"pause_op_started_at"`
+	PauseOpLeaseUntil    pgtype.Timestamptz `json:"pause_op_lease_until"`
+	PauseOpLeaseVersion  int64              `json:"pause_op_lease_version"`
+	PauseOpAttentionAt   pgtype.Timestamptz `json:"pause_op_attention_at"`
+	PauseOpTrigger       *string            `json:"pause_op_trigger"`
+	PauseOpActorID       pgtype.UUID        `json:"pause_op_actor_id"`
+	SourceSnapshotID     pgtype.UUID        `json:"source_snapshot_id"`
+}
+
+// The sandbox created from a saved snapshot: shape, artifact paths and
+// template pin are the snapshot's, read here so the row never disagrees
+// with the image it boots. The bindings are the snapshot's re-bound plus the
+// request's, as arrays that may be empty. Returns 0 rows if the snapshot is
+// not ready, deleted, or not the caller's. The egress rules are written with
+// the row: the fork's guest runs under them from its first instruction, and
+// a resume reapplies what the row says. The snapshot is held shared until
+// the new row commits, so a delete lands before it or after, and never
+// while nothing visible references the build both share; forks of one
+// snapshot share the lock. The snapshot's secrets must still be the ones the
+// bindings were built from: an undone attach withdraws one, and a fork that
+// read it before then is refused, not granted it.
+func (q *Queries) CreateSandboxFromSnapshot(ctx context.Context, arg CreateSandboxFromSnapshotParams) (CreateSandboxFromSnapshotRow, error) {
+	row := q.db.QueryRow(ctx, createSandboxFromSnapshot,
+		arg.SnapshotID,
+		arg.TeamID,
+		arg.SecretBindings,
+		arg.ID,
+		arg.Name,
+		arg.Status,
+		arg.TimeoutSeconds,
+		arg.Metadata,
+		arg.AutoDeleteSeconds,
+		arg.SecretIds,
+		arg.NetworkConfig,
+		arg.PreviewAccess,
+		arg.EnvKeys,
+		arg.ProxyTokens,
+	)
+	var i CreateSandboxFromSnapshotRow
+	err := row.Scan(
+		&i.ID,
+		&i.TeamID,
+		&i.Name,
+		&i.Status,
+		&i.VcpuCount,
+		&i.MemoryMib,
+		&i.HostID,
+		&i.IpAddress,
+		&i.Pid,
+		&i.SnapshotID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DestroyedAt,
+		&i.NetworkConfig,
+		&i.TimeoutSeconds,
+		&i.Metadata,
+		&i.TemplateID,
+		&i.SnapshotPath,
+		&i.MemPath,
+		&i.BasePath,
+		&i.DeltaPath,
+		&i.DiskMib,
+		&i.AutoDeleteSeconds,
+		&i.AutoDeleteAt,
+		&i.FailedAt,
+		&i.HadSecretBindings,
+		&i.SecretEnvFingerprint,
+		&i.SecretEnvIp,
+		&i.SecretEnvInjectedAt,
+		&i.SecretEnvExpiresAt,
+		&i.PauseOpID,
+		&i.PauseOpStartedAt,
+		&i.PauseOpLeaseUntil,
+		&i.PauseOpLeaseVersion,
+		&i.PauseOpAttentionAt,
+		&i.PauseOpTrigger,
+		&i.PauseOpActorID,
+		&i.SourceSnapshotID,
+	)
+	return i, err
+}
+
 const createSandboxFromTemplate = `-- name: CreateSandboxFromTemplate :one
 WITH tpl AS (
   SELECT t.id AS tpl_id, t.disk_mib FROM template t
