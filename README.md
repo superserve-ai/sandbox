@@ -159,9 +159,10 @@ not replay webhooks, change billing state, or grant credit.
 Database alert bookkeeping coordinates replicas. A claim expires after two
 minutes if a worker exits, a reported event has a 30-minute repeat cooldown,
 and a recovered or obsolete event is rechecked after 24 hours. Reporter failure
-attempts to release the claim for the next poll; an interrupted release falls
-back to lease expiry. A pending transition queues its alert eligibility in the
-same transaction as the retained webhook update, so a retry committed after a
+attempts to release the claim, then defers another inspection for 30 minutes.
+If claim release is interrupted, the two-minute lease permits recovery. A
+pending transition queues its alert eligibility in the same transaction as the
+retained webhook update, so a retry committed after a
 monitor scan remains discoverable on a later poll. A crash between error logging
 and cooldown bookkeeping can yield a duplicate notification; external Sentry delivery is not
 transactional with the database. Each poll examines at most 100 events, using

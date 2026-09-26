@@ -19,6 +19,7 @@ suite() {
 }
 
 suite billing-unit-race go test -v -race -short -count=1 ./internal/billing ./internal/api
+suite sentrylog-unit go test -v -count=1 ./internal/sentrylog
 suite billing-migrations go test -v -tags integration -count=1 -run '^$' ./internal/integration
 suite R16-billing-worker-load-race go test -v -race -tags integration -count=1 -timeout 5m -run '^TestIntegration_IncrementalWorkerLoad$' ./internal/api
 suite storage-report-lease-race go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_StorageReport(Lease|Reclaim|ChunkTimeout)' ./internal/api
