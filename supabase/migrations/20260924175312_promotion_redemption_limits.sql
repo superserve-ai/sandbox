@@ -1,3 +1,5 @@
+BEGIN;
+
 -- Hold legacy creation writes across the snapshot and trigger replacement.
 LOCK TABLE team, team_member, team_memberships, user_role_assignments,
     team_credit_grant IN SHARE ROW EXCLUSIVE MODE;
@@ -1176,3 +1178,5 @@ BEGIN
     RETURN v_anchor;
 END;
 $$;
+
+COMMIT;

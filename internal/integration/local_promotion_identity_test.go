@@ -287,7 +287,9 @@ func TestIntegration_LocalPromotionWriterPrivileges(t *testing.T) {
 	if start < 0 {
 		t.Fatal("promotion privilege segment missing")
 	}
-	rolloutExec(t, tx, string(migration[start:]))
+	privileges := strings.TrimSpace(string(migration[start:]))
+	privileges = strings.TrimSuffix(privileges, "COMMIT;")
+	rolloutExec(t, tx, privileges)
 	for _, role := range []string{"anon", "authenticated", "service_role"} {
 		var write, enable, mutate bool
 		if err := tx.QueryRow(ctx, `SELECT
