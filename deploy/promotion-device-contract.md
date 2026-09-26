@@ -3,8 +3,9 @@
 This is an additive server contract. Regional device enforcement ships off. The
 existing canonical identity rollout and Stripe reservation requirements in
 [promotion identity authority](promotion-identity-authority.md) still apply.
-This change does not switch the live grant callers; the Console producer and
-subsequent grant integration must use the operations below before activation.
+The grant integration routes the existing signup and Stripe writers through
+the regional device authority. Keep the policy off until the selected region's
+Console producer and all grant paths are ready.
 
 ## Original evidence source
 
@@ -239,11 +240,33 @@ reservation replays through the original reservation function without applying
 a newly changed policy. `device_reservation_pending` withholds a new reservation
 while another account's grant on the same device remains unresolved. The reservation
 pins the original Fingerprint in the regional entitlement row; release
-allows a later retry. The later grant integration must record actual Stripe
-issuance in `promotion_device_grant` in the same regional finalization transaction
-by calling `record_stripe_promotion_device_grant(team_id, user_id)` and retain
+allows a later retry. Finalization records actual Stripe issuance in
+`promotion_device_grant` in the same regional transaction by calling
+`record_stripe_promotion_device_grant(team_id, user_id)` and retains
 the existing actor, evidence and checkout-generation pins. It must
 not contact Stripe before a durable reservation or release an uncertain attempt.
+
+The existing `claim_team_signup_trial` entry point now routes through the device
+claim. Explicit team creation and legacy completion triggers use the same
+decision. A promotion authority error completes an initial claim with
+`promotion_ineligible` and `authority_unavailable` without awarding credit or
+aborting team creation. Existing Stripe reservation signatures also route
+through the device reservation before external credit. A promotion authority
+error skips the credit while paid activation continues. Finalization records
+the device grant with the settled Stripe grant in one regional transaction.
+Recoverable or uncertain external attempts retain their reservation.
+An ambiguous database transport failure during reservation is retried because
+its commit state cannot be inferred from the lost response.
+
+`POST /internal/promotion/account/signup-eligibility` accepts `user_id` under
+the account credential and matching `X-Actor-User-Id` header. Call it in East
+after trusted account binding and regional registration, before the original
+signup notification. It returns `ownership` (`owner`, `another_owner`, or
+`evidence_missing`), a policy-aware `device_decision`, and `eligibility` with
+a safe `reason`. `eligibility=unknown` covers pending team checks and unresolved
+canonical evidence, including pre-confirmation identity. This snapshot creates
+no grant, claim, or reservation. The $5 claim rechecks authority atomically.
+The response contains no Fingerprint or other account identifier.
 
 The `promotion_device_policy` row starts with D=off and E=off. The canonical C
 gate remains the existing `promotion_identity_enforcement` authority. A
@@ -255,7 +278,7 @@ creates no owner. Policy changes never delete ownership, grants or pending
 reservations. Existing balances, claims and reservations are untouched, with
 no historical device reconstruction or cross-region financial reconciliation.
 
-Deploy the shared source, then both regional schemas, then the Console producer,
-then grant path integration. Verify initial East publication and later West
-publication independently. Keep enforcement off until canonical readiness,
-producer coverage, and both regional deployments have been verified.
+Deploy the shared source and each regional schema before its Console producer
+and grant path integration. Verify initial East publication and later West
+publication independently. Keep enforcement off in a region until its canonical
+readiness, producer coverage, and every local grant writer have been verified.
