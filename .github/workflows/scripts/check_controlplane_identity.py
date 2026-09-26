@@ -20,6 +20,17 @@ def check(service, project, cell):
     if ('value' in tokens[0] or ref.get('name') != f'operator-api-token-{cell}'
             or not ref.get('key')):
         raise ValueError('operator token must reference the dedicated cell secret')
+    for name, secret in (
+            ('PROMOTION_AUTH_DATABASE_URL', 'promotion-auth-database-url'),
+            ('PROMOTION_CAPTURE_TOKEN', 'promotion-capture-token'),
+            ('PROMOTION_ACCOUNT_TOKEN', 'promotion-account-token')):
+        matches = [env for env in containers[0].get('env', []) if env.get('name') == name]
+        if len(matches) != 1:
+            raise ValueError(f'{name} mapping is missing or duplicated')
+        ref = matches[0].get('valueFrom', {}).get('secretKeyRef', {})
+        if ('value' in matches[0] or ref.get('name') != f'{secret}-{cell}'
+                or not ref.get('key')):
+            raise ValueError(f'{name} must reference the dedicated cell secret')
 
 
 def main():

@@ -705,6 +705,27 @@ type Profile struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+type PromotionDeviceGrant struct {
+	Promotion   string    `json:"promotion"`
+	UserID      uuid.UUID `json:"user_id"`
+	TeamID      uuid.UUID `json:"team_id"`
+	Fingerprint *string   `json:"fingerprint"`
+	GrantedAt   time.Time `json:"granted_at"`
+}
+
+type PromotionDeviceOwner struct {
+	Fingerprint  string    `json:"fingerprint"`
+	UserID       uuid.UUID `json:"user_id"`
+	RegisteredAt time.Time `json:"registered_at"`
+}
+
+type PromotionDevicePolicy struct {
+	Singleton        bool      `json:"singleton"`
+	DeviceEnforced   bool      `json:"device_enforced"`
+	EvidenceRequired bool      `json:"evidence_required"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
 type PromotionIdentity struct {
 	IdentityKey          string             `json:"identity_key"`
 	SignupClaimedAt      pgtype.Timestamptz `json:"signup_claimed_at"`
@@ -753,6 +774,14 @@ type PromotionIdentityHistory struct {
 	EvidenceReference *string            `json:"evidence_reference"`
 	ReconciledAt      pgtype.Timestamptz `json:"reconciled_at"`
 	EvidenceVersion   pgtype.UUID        `json:"evidence_version"`
+}
+
+type PromotionSignupDeviceEvidence struct {
+	UserID          uuid.UUID `json:"user_id"`
+	SourceAttemptID uuid.UUID `json:"source_attempt_id"`
+	SourceEventID   string    `json:"source_event_id"`
+	Fingerprint     string    `json:"fingerprint"`
+	RegisteredAt    time.Time `json:"registered_at"`
 }
 
 type ProxyAudit struct {
@@ -1385,6 +1414,7 @@ type UserPromotionEntitlement struct {
 	StripeRedemptionAttemptedAt    pgtype.Timestamptz `json:"stripe_redemption_attempted_at"`
 	CreatedAt                      time.Time          `json:"created_at"`
 	UpdatedAt                      time.Time          `json:"updated_at"`
+	StripeDeviceFingerprint        *string            `json:"stripe_device_fingerprint"`
 }
 
 type UserRoleAssignment struct {

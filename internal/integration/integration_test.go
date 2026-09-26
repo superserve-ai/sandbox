@@ -43,6 +43,8 @@ import (
 
 const testDefaultHostID = "default"
 
+const integrationSchemaLockKey int64 = 0x5355504552534552
+
 var (
 	testPool         *pgxpool.Pool
 	testQueries      *db.Queries
@@ -72,36 +74,56 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "cannot ping test database: %v\n", err)
 		os.Exit(1)
 	}
+	lockCtx, stopLockWait := context.WithTimeout(context.Background(), 5*time.Minute)
+	lockConn, err := pgx.Connect(lockCtx, dbURL)
+	if err == nil {
+		_, err = lockConn.Exec(lockCtx, `SELECT pg_advisory_lock($1)`, integrationSchemaLockKey)
+	}
+	stopLockWait()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "lock integration test database: %v\n", err)
+		os.Exit(1)
+	}
+	setupCtx, stopSetup := context.WithTimeout(context.Background(), 30*time.Second)
 
-	if err := resetTestSchema(ctx, testPool); err != nil {
+	if err := resetTestSchema(setupCtx, testPool); err != nil {
 		fmt.Fprintf(os.Stderr, "reset test schema: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := applyMigrations(ctx, testPool); err != nil {
+	if err := applyMigrations(setupCtx, testPool); err != nil {
 		fmt.Fprintf(os.Stderr, "migration failed: %v\n", err)
 		os.Exit(1)
 	}
-	if err := promotiontest.Install(ctx, testPool); err != nil {
+	if err := promotiontest.Install(setupCtx, testPool); err != nil {
 		fmt.Fprintf(os.Stderr, "install trusted identity fixture: %v\n", err)
 		os.Exit(1)
 	}
 
 	testQueries = db.New(testPool)
 
-	if err := seedSystemTemplate(ctx, testQueries); err != nil {
+	if err := seedSystemTemplate(setupCtx, testQueries); err != nil {
 		fmt.Fprintf(os.Stderr, "seed system template: %v\n", err)
 		os.Exit(1)
 	}
-	if err := seedPreviewCapableHost(ctx, testQueries); err != nil {
+	if err := seedPreviewCapableHost(setupCtx, testQueries); err != nil {
 		fmt.Fprintf(os.Stderr, "seed preview-capable host: %v\n", err)
 		os.Exit(1)
 	}
+	stopSetup()
 
 	workerCtx, stopStorageWorker := context.WithCancel(context.Background())
 	api.StartStorageReportWorker(workerCtx, testPool)
 	code := m.Run()
 	stopStorageWorker()
+	if _, err := lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, integrationSchemaLockKey); err != nil {
+		fmt.Fprintf(os.Stderr, "unlock integration test database: %v\n", err)
+		code = 1
+	}
+	if err := lockConn.Close(context.Background()); err != nil {
+		fmt.Fprintf(os.Stderr, "close integration test database lock: %v\n", err)
+		code = 1
+	}
 	os.Exit(code)
 }
 

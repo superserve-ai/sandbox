@@ -42,6 +42,30 @@ func InternalAuth() gin.HandlerFunc {
 	}
 }
 
+// PromotionProducerAuth uses credentials dedicated to the signup evidence producer.
+func PromotionProducerAuth(envName string) gin.HandlerFunc {
+	token := os.Getenv(envName)
+	other := "PROMOTION_ACCOUNT_TOKEN"
+	if envName == other {
+		other = "PROMOTION_CAPTURE_TOKEN"
+	}
+	return func(c *gin.Context) {
+		auth := c.GetHeader("Authorization")
+		provided := strings.TrimPrefix(auth, "Bearer ")
+		otherToken := os.Getenv(other)
+		internalToken := os.Getenv("INTERNAL_API_TOKEN")
+		if token == "" || otherToken == "" || token == otherToken ||
+			(token == internalToken && internalToken != "") ||
+			provided == auth || provided == "" ||
+			subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			respondErrorMsg(c, "unauthorized", "invalid promotion producer credential", http.StatusUnauthorized)
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
 // InternalActorFromHeader records an actor UUID from the X-Actor-User-Id
 // header when internal handlers need to attribute an action. The header is
 // optional so read-only internal endpoints can continue to work without it.
