@@ -66,7 +66,7 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 			case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
 				insertArgs = args
 				return sandboxRow(db.Sandbox{
-					ID: args[2].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting,
+					ID: args[3].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting,
 					VcpuCount: 2, MemoryMib: 2048, HostID: snap.HostID, TimeoutSeconds: snap.TimeoutSeconds,
 					SourceSnapshotID: pgtype.UUID{Bytes: snap.ID, Valid: true},
 				})
@@ -141,20 +141,20 @@ func TestCreateSandbox_FromSnapshotForksOnItsHost(t *testing.T) {
 		t.Errorf("rules pushed again after the restore installed them: (%v, %v, %v)", pushedAllow, pushedDeny, pushedDomains)
 	}
 	// The row is the snapshot's, with its timeout and the re-bound secret.
-	if insertArgs[0] != snap.ID || *insertArgs[5].(*int32) != 600 {
-		t.Errorf("insert named snapshot %v with timeout %v; want the source and its 600s", insertArgs[0], insertArgs[5])
+	if insertArgs[0] != snap.ID || *insertArgs[6].(*int32) != 600 {
+		t.Errorf("insert named snapshot %v with timeout %v; want the source and its 600s", insertArgs[0], insertArgs[6])
 	}
-	if ids := insertArgs[8].([]uuid.UUID); len(ids) != 1 || ids[0] != live.ID {
+	if ids := insertArgs[9].([]uuid.UUID); len(ids) != 1 || ids[0] != live.ID {
 		t.Errorf("bound secrets = %v; want only the live one", ids)
 	}
 	// A resume reapplies the row's rules, so the row has them from the start.
-	if cfg, _ := insertArgs[9].([]byte); decodeNetworkConfig(cfg) == nil || !strings.Contains(string(cfg), "10.0.0.0/8") {
+	if cfg, _ := insertArgs[10].([]byte); decodeNetworkConfig(cfg) == nil || !strings.Contains(string(cfg), "10.0.0.0/8") {
 		t.Errorf("row network_config = %s; want the inherited rules", cfg)
 	}
-	if keys := insertArgs[11].([]string); len(keys) != 1 || keys[0] != "KEY_0" {
+	if keys := insertArgs[12].([]string); len(keys) != 1 || keys[0] != "KEY_0" {
 		t.Errorf("bound env keys = %v; want the live binding's", keys)
 	}
-	if tokens := insertArgs[12].([]string); len(tokens) != 1 || tokens[0] == "" || injected["KEY_0"] != tokens[0] {
+	if tokens := insertArgs[13].([]string); len(tokens) != 1 || tokens[0] == "" || injected["KEY_0"] != tokens[0] {
 		t.Errorf("fresh token %v not the one injected (%q)", tokens, injected["KEY_0"])
 	}
 	if injectedJWT == "" || injected["KEY_9"] != "x" {
@@ -195,7 +195,7 @@ func TestCreateSandbox_FromSnapshotRequestOverridesInheritance(t *testing.T) {
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
 				insertArgs = args
-				return sandboxRow(db.Sandbox{ID: args[2].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 2048})
+				return sandboxRow(db.Sandbox{ID: args[3].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 2048})
 			}
 			return activityRow()
 		},
@@ -218,11 +218,11 @@ func TestCreateSandbox_FromSnapshotRequestOverridesInheritance(t *testing.T) {
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201; body: %s", w.Code, w.Body.String())
 	}
-	if *insertArgs[5].(*int32) != 60 {
-		t.Errorf("timeout = %v; want the request's 60s over the snapshot's", insertArgs[5])
+	if *insertArgs[6].(*int32) != 60 {
+		t.Errorf("timeout = %v; want the request's 60s over the snapshot's", insertArgs[6])
 	}
-	if !secretsLookedUp || len(insertArgs[8].([]uuid.UUID)) != 0 {
-		t.Errorf("bound secrets = %v; the request's KEY_0 env var wins over the inherited binding", insertArgs[8])
+	if !secretsLookedUp || len(insertArgs[9].([]uuid.UUID)) != 0 {
+		t.Errorf("bound secrets = %v; the request's KEY_0 env var wins over the inherited binding", insertArgs[9])
 	}
 	if e := vmd.restoreLimits.Egress; e == nil || len(e.AllowedCIDRs) != 1 || e.AllowedCIDRs[0] != "1.1.1.1/32" || len(e.AllowedDomains) != 0 {
 		t.Errorf("restore egress = %+v; want the request's rules over the snapshot's", e)
@@ -233,13 +233,15 @@ func TestCreateSandbox_FromSnapshotRefusals(t *testing.T) {
 	teamID := uuid.New()
 	snap := readySnapshotFixture(teamID)
 	cases := []struct {
-		name       string
-		body       string
-		snapshot   func() pgx.Row
-		capable    bool
-		insert     func() pgx.Row
-		wantStatus int
-		wantCode   string
+		name     string
+		body     string
+		snapshot func() pgx.Row
+		capable  bool
+		insert   func() pgx.Row
+		// goneAfterInsert: the snapshot reads as deleted once the insert ran.
+		goneAfterInsert bool
+		wantStatus      int
+		wantCode        string
 	}{
 		{name: "both sources", body: fmt.Sprintf(`{"name":"x","from_template":"t","from_snapshot":%q}`, snap.ID), wantStatus: 400, wantCode: "bad_request"},
 		{name: "not an id", body: `{"name":"x","from_snapshot":"latest"}`, wantStatus: 400, wantCode: "bad_request"},
@@ -251,11 +253,12 @@ func TestCreateSandbox_FromSnapshotRefusals(t *testing.T) {
 			return sandboxSnapshotRow(creating)
 		}, wantStatus: 409, wantCode: "conflict"},
 		{name: "host cannot fork", capable: false, wantStatus: 503, wantCode: "host_not_ready"},
-		{name: "deleted mid-create", capable: true, insert: func() pgx.Row { return notFoundRow() }, wantStatus: 404, wantCode: "not_found"},
+		{name: "deleted mid-create", capable: true, insert: func() pgx.Row { return notFoundRow() }, goneAfterInsert: true, wantStatus: 404, wantCode: "not_found"},
+		{name: "secrets changed mid-create", capable: true, insert: func() pgx.Row { return notFoundRow() }, wantStatus: 409, wantCode: "snapshot_changed"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var destroyed bool
+			var destroyed, inserted bool
 			vmd := &stubVMD{destroyFn: func(context.Context, string, bool) error {
 				destroyed = true
 				return nil
@@ -264,6 +267,9 @@ func TestCreateSandbox_FromSnapshotRefusals(t *testing.T) {
 				queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
 					switch {
 					case strings.Contains(sql, "-- name: GetSandboxSnapshot :one"):
+						if tc.goneAfterInsert && inserted {
+							return notFoundRow()
+						}
 						if tc.snapshot != nil {
 							return tc.snapshot()
 						}
@@ -271,10 +277,11 @@ func TestCreateSandbox_FromSnapshotRefusals(t *testing.T) {
 					case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
 						return scalarBoolRow(tc.capable)
 					case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
+						inserted = true
 						if tc.insert != nil {
 							return tc.insert()
 						}
-						return sandboxRow(db.Sandbox{ID: args[2].(uuid.UUID), TeamID: teamID, Status: db.SandboxStatusStarting})
+						return sandboxRow(db.Sandbox{ID: args[3].(uuid.UUID), TeamID: teamID, Status: db.SandboxStatusStarting})
 					case strings.Contains(sql, "INSERT INTO sandbox"), strings.Contains(sql, "FROM template"):
 						t.Errorf("unexpected query: %s", sql)
 					}
@@ -366,7 +373,7 @@ func TestCreateSandbox_FromSnapshotFailsWhenTheHostCannotInstallItsRules(t *test
 			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
-				return sandboxRow(db.Sandbox{ID: args[2].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 2048})
+				return sandboxRow(db.Sandbox{ID: args[3].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 2048})
 			}
 			return activityRow()
 		},
@@ -407,7 +414,7 @@ func TestCreateSandbox_FromSnapshotClearsProxySettingsWhenNoSecretsRemain(t *tes
 			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
-				return sandboxRow(db.Sandbox{ID: args[2].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 2048})
+				return sandboxRow(db.Sandbox{ID: args[3].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 2048})
 			}
 			return activityRow()
 		},
@@ -448,7 +455,7 @@ func TestCreateSandbox_FromSnapshotClearsProxySettingsTheRecordMissed(t *testing
 			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
 				return scalarBoolRow(true)
 			case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
-				return sandboxRow(db.Sandbox{ID: args[2].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 2048})
+				return sandboxRow(db.Sandbox{ID: args[3].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 2048})
 			}
 			return activityRow()
 		},

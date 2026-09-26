@@ -1040,3 +1040,54 @@ func (q *Queries) UpdateSecretValue(ctx context.Context, arg UpdateSecretValuePa
 	)
 	return i, err
 }
+
+const withdrawBindingFromForks = `-- name: WithdrawBindingFromForks :many
+DELETE FROM sandbox_secret ss
+USING sandbox fork, sandbox_snapshot snap
+WHERE ss.sandbox_id = fork.id
+  AND fork.source_snapshot_id = snap.id
+  AND snap.sandbox_id = $1::uuid
+  AND snap.created_at >= $2::timestamptz
+  AND ss.env_key = $3::text
+  AND ss.secret_id = $4::uuid
+RETURNING ss.sandbox_id, ss.proxy_token
+`
+
+type WithdrawBindingFromForksParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Since     time.Time `json:"since"`
+	EnvKey    string    `json:"env_key"`
+	SecretID  uuid.UUID `json:"secret_id"`
+}
+
+type WithdrawBindingFromForksRow struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	ProxyToken *string   `json:"proxy_token"`
+}
+
+// Takes a binding back out of sandboxes created, since the attach began,
+// from a snapshot that recorded it; returns their tokens to revoke.
+func (q *Queries) WithdrawBindingFromForks(ctx context.Context, arg WithdrawBindingFromForksParams) ([]WithdrawBindingFromForksRow, error) {
+	rows, err := q.db.Query(ctx, withdrawBindingFromForks,
+		arg.SandboxID,
+		arg.Since,
+		arg.EnvKey,
+		arg.SecretID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WithdrawBindingFromForksRow{}
+	for rows.Next() {
+		var i WithdrawBindingFromForksRow
+		if err := rows.Scan(&i.SandboxID, &i.ProxyToken); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

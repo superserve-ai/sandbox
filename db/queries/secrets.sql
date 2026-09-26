@@ -204,3 +204,16 @@ DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = ANY(@env
 
 -- name: TransactionStartedAt :one
 SELECT now()::timestamptz;
+
+-- name: WithdrawBindingFromForks :many
+-- Takes a binding back out of sandboxes created, since the attach began,
+-- from a snapshot that recorded it; returns their tokens to revoke.
+DELETE FROM sandbox_secret ss
+USING sandbox fork, sandbox_snapshot snap
+WHERE ss.sandbox_id = fork.id
+  AND fork.source_snapshot_id = snap.id
+  AND snap.sandbox_id = sqlc.arg('sandbox_id')::uuid
+  AND snap.created_at >= sqlc.arg('since')::timestamptz
+  AND ss.env_key = sqlc.arg('env_key')::text
+  AND ss.secret_id = sqlc.arg('secret_id')::uuid
+RETURNING ss.sandbox_id, ss.proxy_token;

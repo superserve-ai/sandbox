@@ -1101,19 +1101,20 @@ WITH src AS (
   FROM sandbox_snapshot s
   WHERE s.id = $1 AND s.team_id = $2
     AND s.status = 'ready' AND s.deleted_at IS NULL
+    AND s.secret_bindings = $3::jsonb
   FOR SHARE
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id, network_config)
-  SELECT $3, $2, $4, $5, vcpu_count, memory_mib, host_id, $6, $7, template_id, snapshot_path, mem_path, base_path, disk_mib, $8, cardinality($9::uuid[]) > 0, source_snapshot_id, $10::jsonb FROM src
+  SELECT $4, $2, $5, $6, vcpu_count, memory_mib, host_id, $7, $8, template_id, snapshot_path, mem_path, base_path, disk_mib, $9, cardinality($10::uuid[]) > 0, source_snapshot_id, $11::jsonb FROM src
   RETURNING id, team_id, name, status, vcpu_count, memory_mib, host_id, ip_address, pid, snapshot_id, created_at, updated_at, destroyed_at, network_config, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, delta_path, disk_mib, auto_delete_seconds, auto_delete_at, failed_at, had_secret_bindings, secret_env_fingerprint, secret_env_ip, secret_env_injected_at, secret_env_expires_at, pause_op_id, pause_op_started_at, pause_op_lease_until, pause_op_lease_version, pause_op_attention_at, pause_op_trigger, pause_op_actor_id, source_snapshot_id
 ), preview_policy AS (
   INSERT INTO sandbox_preview_policy (sandbox_id, access, revision)
-  SELECT ins.id, $11::text, 0 FROM ins
+  SELECT ins.id, $12::text, 0 FROM ins
   RETURNING sandbox_id
 ), bindings AS (
   INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key, proxy_token)
-  SELECT ins.id, ($9::uuid[])[i], ($12::text[])[i], ($13::text[])[i]
-  FROM ins, generate_subscripts($9::uuid[], 1) AS g(i)
+  SELECT ins.id, ($10::uuid[])[i], ($13::text[])[i], ($14::text[])[i]
+  FROM ins, generate_subscripts($10::uuid[], 1) AS g(i)
 )
 SELECT ins.id, ins.team_id, ins.name, ins.status, ins.vcpu_count, ins.memory_mib, ins.host_id, ins.ip_address, ins.pid, ins.snapshot_id, ins.created_at, ins.updated_at, ins.destroyed_at, ins.network_config, ins.timeout_seconds, ins.metadata, ins.template_id, ins.snapshot_path, ins.mem_path, ins.base_path, ins.delta_path, ins.disk_mib, ins.auto_delete_seconds, ins.auto_delete_at, ins.failed_at, ins.had_secret_bindings, ins.secret_env_fingerprint, ins.secret_env_ip, ins.secret_env_injected_at, ins.secret_env_expires_at, ins.pause_op_id, ins.pause_op_started_at, ins.pause_op_lease_until, ins.pause_op_lease_version, ins.pause_op_attention_at, ins.pause_op_trigger, ins.pause_op_actor_id, ins.source_snapshot_id FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id
@@ -1122,6 +1123,7 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id
 type CreateSandboxFromSnapshotParams struct {
 	SnapshotID        uuid.UUID     `json:"snapshot_id"`
 	TeamID            uuid.UUID     `json:"team_id"`
+	SecretBindings    []byte        `json:"secret_bindings"`
 	ID                uuid.UUID     `json:"id"`
 	Name              string        `json:"name"`
 	Status            SandboxStatus `json:"status"`
@@ -1185,11 +1187,14 @@ type CreateSandboxFromSnapshotRow struct {
 // a resume reapplies what the row says. The snapshot is held shared until
 // the new row commits, so a delete lands before it or after, and never
 // while nothing visible references the build both share; forks of one
-// snapshot share the lock.
+// snapshot share the lock. The snapshot's secrets must still be the ones the
+// bindings were built from: an undone attach withdraws one, and a fork that
+// read it before then is refused, not granted it.
 func (q *Queries) CreateSandboxFromSnapshot(ctx context.Context, arg CreateSandboxFromSnapshotParams) (CreateSandboxFromSnapshotRow, error) {
 	row := q.db.QueryRow(ctx, createSandboxFromSnapshot,
 		arg.SnapshotID,
 		arg.TeamID,
+		arg.SecretBindings,
 		arg.ID,
 		arg.Name,
 		arg.Status,

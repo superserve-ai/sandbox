@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/superserve-ai/sandbox/internal/api"
@@ -213,7 +214,7 @@ func TestIntegration_SnapshotDeleteWaitsForAForkInsert(t *testing.T) {
 	}
 	defer fork.Rollback(ctx) //nolint:errcheck
 	if _, err := db.New(fork).CreateSandboxFromSnapshot(ctx, db.CreateSandboxFromSnapshotParams{
-		SnapshotID: snap.ID, TeamID: teamID, ID: uuid.New(), Name: "fork", Status: db.SandboxStatusStarting,
+		SnapshotID: snap.ID, TeamID: teamID, SecretBindings: snap.SecretBindings, ID: uuid.New(), Name: "fork", Status: db.SandboxStatusStarting,
 		Metadata: []byte(`{}`), PreviewAccess: preview.AccessPublic,
 		SecretIds: []uuid.UUID{}, EnvKeys: []string{}, ProxyTokens: []string{},
 	}); err != nil {
@@ -402,6 +403,17 @@ func TestIntegration_UndoneAttachIsWithdrawnFromSnapshotsSinceItBegan(t *testing
 	settled := create()
 	ready(settled.ID)
 	inFlight := create()
+	// A fork made from the settled snapshot before the undo, holding the
+	// binding with its own token.
+	forkToken := "sp_fork"
+	forkID := uuid.New()
+	if _, err := testQueries.CreateSandboxFromSnapshot(ctx, db.CreateSandboxFromSnapshotParams{
+		SnapshotID: settled.ID, TeamID: teamID, SecretBindings: settled.SecretBindings, ID: forkID, Name: "fork",
+		Status: db.SandboxStatusStarting, Metadata: []byte(`{}`), PreviewAccess: preview.AccessPublic,
+		SecretIds: []uuid.UUID{secretID}, EnvKeys: []string{"TOKEN"}, ProxyTokens: []string{forkToken},
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// The undo, as the attach handler runs it.
 	if _, err := testQueries.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
@@ -412,6 +424,18 @@ func TestIntegration_UndoneAttachIsWithdrawnFromSnapshotsSinceItBegan(t *testing
 	}
 	if err := testQueries.WithdrawBindingFromSnapshots(ctx, db.WithdrawBindingFromSnapshotsParams{SandboxID: sourceID, EnvKey: "TOKEN", SecretID: secretID, Since: since}); err != nil {
 		t.Fatal(err)
+	}
+	forks, err := testQueries.WithdrawBindingFromForks(ctx, db.WithdrawBindingFromForksParams{SandboxID: sourceID, Since: since, EnvKey: "TOKEN", SecretID: secretID})
+	if err != nil || len(forks) != 1 || forks[0].SandboxID != forkID || forks[0].ProxyToken == nil || *forks[0].ProxyToken != forkToken {
+		t.Fatalf("withdrawn from forks = %+v (%v); want the fork's binding and its token to revoke", forks, err)
+	}
+	// A fork that read the record before the undo is refused, not granted it.
+	if _, err := testQueries.CreateSandboxFromSnapshot(ctx, db.CreateSandboxFromSnapshotParams{
+		SnapshotID: settled.ID, TeamID: teamID, SecretBindings: settled.SecretBindings, ID: uuid.New(), Name: "late",
+		Status: db.SandboxStatusStarting, Metadata: []byte(`{}`), PreviewAccess: preview.AccessPublic,
+		SecretIds: []uuid.UUID{secretID}, EnvKeys: []string{"TOKEN"}, ProxyTokens: []string{"sp_late"},
+	}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("fork from a record read before the undo: %v; want no rows", err)
 	}
 	for _, id := range []uuid.UUID{settled.ID, inFlight.ID} {
 		got, err := testQueries.GetSandboxSnapshotUnscoped(ctx, id)

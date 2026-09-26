@@ -104,13 +104,16 @@ JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 -- a resume reapplies what the row says. The snapshot is held shared until
 -- the new row commits, so a delete lands before it or after, and never
 -- while nothing visible references the build both share; forks of one
--- snapshot share the lock.
+-- snapshot share the lock. The snapshot's secrets must still be the ones the
+-- bindings were built from: an undone attach withdraws one, and a fork that
+-- read it before then is refused, not granted it.
 WITH src AS (
   SELECT s.id AS source_snapshot_id, s.host_id, s.template_id, s.vcpu_count, s.memory_mib, s.disk_mib,
          s.base_path, s.snapshot_path, s.mem_path
   FROM sandbox_snapshot s
   WHERE s.id = @snapshot_id AND s.team_id = @team_id
     AND s.status = 'ready' AND s.deleted_at IS NULL
+    AND s.secret_bindings = @secret_bindings::jsonb
   FOR SHARE
 ), ins AS (
   INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id, timeout_seconds, metadata, template_id, snapshot_path, mem_path, base_path, disk_mib, auto_delete_seconds, had_secret_bindings, source_snapshot_id, network_config)

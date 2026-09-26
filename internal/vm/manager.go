@@ -3873,7 +3873,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		if err := m.applySandboxNetworkRules(vmID, m.netMgr.GetVMNetInfo(vmID), resourceLimits.EgressRules); err != nil {
 			tFailBoundary = time.Now()
-			cleanupAfterRestoreFailure()
+			m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
 			m.setStatus(vmID, StatusError)
 			return nil, err
 		}

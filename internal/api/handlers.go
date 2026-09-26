@@ -3138,6 +3138,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		if sourceSnapshotID != uuid.Nil {
 			row, err := h.DB.CreateSandboxFromSnapshot(insertCtx, db.CreateSandboxFromSnapshotParams{
 				SnapshotID:        sourceSnapshotID,
+				SecretBindings:    source.SecretBindings,
 				TeamID:            teamID,
 				ID:                sandboxID,
 				Name:              req.Name,
@@ -3282,6 +3283,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	sourceRace := (templateID.Valid || sourceSnapshotID != uuid.Nil) && errors.Is(dbErr, pgx.ErrNoRows)
 	respondSourceGone := func() {
 		if sourceSnapshotID != uuid.Nil {
+			// Deleted, or its secrets changed since they were read.
+			rctx, rcancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), asyncTimeout)
+			defer rcancel()
+			if snap, err := h.DB.GetSandboxSnapshot(rctx, db.GetSandboxSnapshotParams{ID: sourceSnapshotID, TeamID: teamID}); err == nil && snap.Status == "ready" {
+				c.Header("Retry-After", "1")
+				respondErrorMsg(c, "snapshot_changed", "the snapshot changed while the sandbox was being created; retry", http.StatusConflict)
+				return
+			}
 			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
 			return
 		}

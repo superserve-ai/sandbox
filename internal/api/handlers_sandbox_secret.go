@@ -70,7 +70,8 @@ func recordDetachedKey(ctx context.Context, q *db.Queries, sandboxID uuid.UUID, 
 // undoAttach takes back a binding whose guest update failed, under the
 // secret-write lock like any binding change. It is not refused during a
 // capture: any snapshot taken since the attach began may have recorded the
-// binding, settled or not, and has it withdrawn, so no fork re-binds it.
+// binding, settled or not, and has it withdrawn, as do sandboxes already
+// created from one, so no fork keeps it.
 // boxd may have applied the env before the error, so the token is revoked
 // and the key recorded as detached.
 func (h *Handlers) undoAttach(ctx context.Context, sandboxID, secretID uuid.UUID, envKey, token string, since time.Time) error {
@@ -93,9 +94,30 @@ func (h *Handlers) undoAttach(ctx context.Context, sandboxID, secretID uuid.UUID
 		}); err != nil {
 			return err
 		}
-		return q.WithdrawBindingFromSnapshots(ctx, db.WithdrawBindingFromSnapshotsParams{
+		// The snapshots first: the update waits out any fork still inserting
+		// from one, so the forks' read below sees that fork too.
+		if err := q.WithdrawBindingFromSnapshots(ctx, db.WithdrawBindingFromSnapshotsParams{
 			SandboxID: sandboxID, EnvKey: envKey, SecretID: secretID, Since: since,
+		}); err != nil {
+			return err
+		}
+		forks, err := q.WithdrawBindingFromForks(ctx, db.WithdrawBindingFromForksParams{
+			SandboxID: sandboxID, Since: since, EnvKey: envKey, SecretID: secretID,
 		})
+		if err != nil {
+			return err
+		}
+		for _, f := range forks {
+			if f.ProxyToken == nil || *f.ProxyToken == "" {
+				continue
+			}
+			if err := q.InsertRevokedProxyToken(ctx, db.InsertRevokedProxyTokenParams{
+				SandboxID: f.SandboxID, ProxyToken: *f.ProxyToken, ExpiresAt: time.Now().Add(SecretsJWTLifetime),
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	if h.Pool == nil {
 		return undo(h.DB)
