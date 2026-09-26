@@ -173,6 +173,20 @@ func (q *Queries) ForgetDetachedSecretKey(ctx context.Context, arg ForgetDetache
 	return err
 }
 
+const forgetDetachedSecretKeys = `-- name: ForgetDetachedSecretKeys :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = ANY($2::text[])
+`
+
+type ForgetDetachedSecretKeysParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	EnvKeys   []string  `json:"env_keys"`
+}
+
+func (q *Queries) ForgetDetachedSecretKeys(ctx context.Context, arg ForgetDetachedSecretKeysParams) error {
+	_, err := q.db.Exec(ctx, forgetDetachedSecretKeys, arg.SandboxID, arg.EnvKeys)
+	return err
+}
+
 const getSecretByID = `-- name: GetSecretByID :one
 SELECT id, team_id, name, auth_type, auth_config, provider_shortcut, hosts, ciphertext, encrypted_dek, kek_id, created_at, updated_at, last_used_at, deleted_at FROM secret
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL
@@ -472,6 +486,30 @@ func (q *Queries) ListAuditForSecret(ctx context.Context, arg ListAuditForSecret
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDetachedSecretKeys = `-- name: ListDetachedSecretKeys :many
+SELECT env_key FROM sandbox_secret_detached WHERE sandbox_id = $1 ORDER BY env_key
+`
+
+func (q *Queries) ListDetachedSecretKeys(ctx context.Context, sandboxID uuid.UUID) ([]string, error) {
+	rows, err := q.db.Query(ctx, listDetachedSecretKeys, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var env_key string
+		if err := rows.Scan(&env_key); err != nil {
+			return nil, err
+		}
+		items = append(items, env_key)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

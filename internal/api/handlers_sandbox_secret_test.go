@@ -619,3 +619,52 @@ func TestSecretChangesAreRefusedWhileASnapshotIsCaptured(t *testing.T) {
 		t.Error("a binding changed while a capture was imaging the guest")
 	}
 }
+
+// A key detached while the sandbox was paused is still in the guest's
+// environment: the resume clears it, and with nothing bound any more the
+// proxy settings too, before the row goes active.
+func TestResumeClearsKeysDetachedWhilePaused(t *testing.T) {
+	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+	had := true
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HadSecretBindings = &had
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+	var injected map[string]string
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) { return "10.0.0.5", nil },
+		injectEnvFn: func(_ context.Context, _ string, env map[string]string, _ string) error {
+			injected = env
+			return nil
+		},
+	}
+	mock := &mockDBTX{
+		detachedKeys: []string{"OLD_KEY"},
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return claimResumeRow(sb, &snap, "", 0)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Signer: newTestSigner(t, "v1")}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body: %s", w.Code, w.Body.String())
+	}
+	for _, k := range []string{"OLD_KEY", "HTTPS_PROXY"} {
+		if v, ok := injected[k]; !ok || v != "" {
+			t.Errorf("resume injected %s = %q (set %v); want it cleared", k, v, ok)
+		}
+	}
+}

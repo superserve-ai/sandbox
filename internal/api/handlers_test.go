@@ -238,6 +238,9 @@ type mockDBTX struct {
 	// captureInFlight answers whether a snapshot capture of the sandbox is
 	// running; secret changes ask before every write.
 	captureInFlight bool
+	// detachedKeys are the keys detached from the sandbox while it was
+	// paused; a resume of a sandbox that had secrets reads them.
+	detachedKeys []string
 }
 
 // The fake transaction shares the scripted rows while exposing real transaction
@@ -354,6 +357,16 @@ func (m *mockDBTX) Exec(ctx context.Context, sql string, args ...any) (pgconn.Co
 }
 
 func (m *mockDBTX) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if strings.Contains(sql, "-- name: ListDetachedSecretKeys :many") {
+		rows := &scanRows{}
+		for _, k := range m.detachedKeys {
+			rows.rows = append(rows.rows, func(dest ...any) error {
+				*dest[0].(*string) = k
+				return nil
+			})
+		}
+		return rows, nil
+	}
 	if m.queryFn != nil {
 		return m.queryFn(ctx, sql, args...)
 	}

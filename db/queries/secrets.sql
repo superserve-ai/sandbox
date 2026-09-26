@@ -195,3 +195,9 @@ WHERE d.sandbox_id = sqlc.arg('sandbox_id')::uuid AND d.env_key IN (
 
 -- name: ForgetDetachedSecretKey :exec
 DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = $2;
+
+-- name: ListDetachedSecretKeys :many
+SELECT env_key FROM sandbox_secret_detached WHERE sandbox_id = $1 ORDER BY env_key;
+
+-- name: ForgetDetachedSecretKeys :exec
+DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = ANY(@env_keys::text[]);
