@@ -229,7 +229,7 @@ func TestIntegration_CanonicalHistoricalMigrationPreservesDuplicates(t *testing.
 	}
 	// Exercise the actual snapshot SQL, not a hand-built substitute. Current
 	// Auth and regional email are deliberately not used to resolve old aliases.
-	migration, err := os.ReadFile("../../supabase/migrations/20260924191820_canonical_promotion_identity.sql")
+	migration, err := os.ReadFile("../../supabase/migrations/20260925195235_canonical_promotion_identity.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,15 +269,20 @@ func TestIntegration_CanonicalPromotionPrivileges(t *testing.T) {
 		IF NOT EXISTS(SELECT FROM pg_roles WHERE rolname=r) THEN EXECUTE format('CREATE ROLE %I NOLOGIN',r); END IF; END LOOP; END $$;
 		GRANT ALL ON promotion_identity,promotion_identity_binding,promotion_identity_history,team_signup_promotion_outcome TO anon,authenticated,service_role;
 		GRANT ALL ON FUNCTION reconcile_promotion_identity_history(text,text[],text,text),claim_team_signup_trial(uuid,uuid) TO anon,authenticated,service_role`)
-	migration, err := os.ReadFile("../../supabase/migrations/20260924191820_canonical_promotion_identity.sql")
+	migration, err := os.ReadFile("../../supabase/migrations/20260925195235_canonical_promotion_identity.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
 	start := strings.Index(string(migration), "REVOKE ALL ON FUNCTION promotion_identity_key")
-	if start < 0 {
+	end := strings.LastIndex(string(migration), "\nCOMMIT;")
+	if start < 0 || end <= start {
 		t.Fatal("promotion privilege segment missing")
 	}
-	rolloutExec(t, tx, string(migration[start:]))
+	// The migration commits itself; this fragment must retain the test rollback.
+	rolloutExec(t, tx, string(migration[start:end]))
+	if tx.Conn().PgConn().TxStatus() != 'T' {
+		t.Fatal("privilege fragment ended the fixture transaction")
+	}
 	for _, role := range []string{"anon", "authenticated", "service_role"} {
 		var claim, reconcile, writeHistory bool
 		if err := tx.QueryRow(ctx, `SELECT has_function_privilege($1,'claim_team_signup_trial(uuid,uuid)','EXECUTE'),

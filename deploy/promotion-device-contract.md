@@ -107,7 +107,7 @@ with the issued challenge and use the provider's server result.
 
 ## Regional publication and claims
 
-Apply `20260925000001_regional_promotion_device_authority.sql` in **each**
+Apply `20260925195301_regional_promotion_device_authority.sql` in **each**
 regional database. Console first publishes the existing canonical Auth identity
 observation, then obtains the shared original device evidence and calls
 `register_promotion_signup_device(user_id, source_attempt_id, source_event_id,

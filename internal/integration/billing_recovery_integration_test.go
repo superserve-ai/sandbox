@@ -27,6 +27,7 @@ type recoveryStripeFixture struct {
 	grants       map[string][]map[string]any
 	cancelOnCall map[string]int
 	checkouts    map[string]map[string]any
+	onFirstRead  map[string]func() error
 }
 
 func (f *recoveryStripeFixture) setCancelOnCall(subscriptionID string, call int) {
@@ -35,7 +36,17 @@ func (f *recoveryStripeFixture) setCancelOnCall(subscriptionID string, call int)
 	f.cancelOnCall[subscriptionID] = call
 }
 
-func (f *recoveryStripeFixture) setExistingGrant(teamID uuid.UUID, subscriptionID string, amount int64) {
+func (f *recoveryStripeFixture) beforeFirstSubscriptionRead(subscriptionID string, hook func() error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onFirstRead[subscriptionID] = hook
+}
+
+func (f *recoveryStripeFixture) setExistingGrant(teamID uuid.UUID, subscriptionID string) {
+	f.setExistingGrantAmount(teamID, subscriptionID, 9500)
+}
+
+func (f *recoveryStripeFixture) setExistingGrantAmount(teamID uuid.UUID, subscriptionID string, amount int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	customerID := "cus_" + strings.TrimPrefix(subscriptionID, "sub_")
@@ -68,6 +79,7 @@ func newRecoveryStripeFixture(t *testing.T) *recoveryStripeFixture {
 		grants:       make(map[string][]map[string]any),
 		cancelOnCall: make(map[string]int),
 		checkouts:    make(map[string]map[string]any),
+		onFirstRead:  make(map[string]func() error),
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -80,6 +92,12 @@ func newRecoveryStripeFixture(t *testing.T) *recoveryStripeFixture {
 		if strings.HasPrefix(r.URL.Path, "/v1/subscriptions/") {
 			subscriptionID := strings.TrimPrefix(r.URL.Path, "/v1/subscriptions/")
 			f.subCalls[subscriptionID]++
+			if hook := f.onFirstRead[subscriptionID]; hook != nil && f.subCalls[subscriptionID] == 1 {
+				if err := hook(); err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+			}
 			status := "active"
 			if cutoff := f.cancelOnCall[subscriptionID]; cutoff > 0 && f.subCalls[subscriptionID] >= cutoff {
 				status = "canceled"
@@ -194,9 +212,9 @@ func TestIntegration_BillingRecoveryDryRunApplyRevalidatesAndExcludes(t *testing
 	// The subscription changes after the locked evidence read but before the
 	// final revalidation. Recovery must leave local activation uncommitted.
 	stripe.setCancelOnCall(postGrantRaceSubscription, 3)
-	stripe.setExistingGrant(goodTeam, goodSubscription, 9500)
-	stripe.setExistingGrant(raceTeam, raceSubscription, 9500)
-	stripe.setExistingGrant(postGrantRaceTeam, postGrantRaceSubscription, 9500)
+	stripe.setExistingGrant(goodTeam, goodSubscription)
+	stripe.setExistingGrant(raceTeam, raceSubscription)
+	stripe.setExistingGrant(postGrantRaceTeam, postGrantRaceSubscription)
 
 	dryRun := runBillingRecoveryCommand(t, stripe.server.URL, "-team", goodTeam.String())
 	if dryRun["outcome"] != "candidate" || dryRun["reason"] != "existing_stripe_grant_reconcile" {
@@ -296,14 +314,15 @@ func TestIntegration_BillingRecoveryCompletedCheckout(t *testing.T) {
 		name, status string
 		amount       int
 		mismatch     bool
-		grant        bool
+		missingGrant bool
 		want         string
 	}{
-		{"standard", "complete", 9500, false, true, "repaired"},
-		{"custom", "complete", 100000, false, true, "repaired"},
-		{"missing_grant", "complete", 9500, false, false, "unresolved"},
+		{"standard", "complete", 9500, false, false, "repaired"},
+		{"custom", "complete", 100000, false, false, "repaired"},
 		{"open", "open", 9500, false, false, "skipped"},
 		{"wrong_owner", "complete", 9500, true, false, "skipped"},
+		{"missing_standard_grant", "complete", 9500, false, true, "unresolved"},
+		{"missing_custom_grant", "complete", 100000, false, true, "unresolved"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -312,6 +331,9 @@ func TestIntegration_BillingRecoveryCompletedCheckout(t *testing.T) {
 			customer := "cus_" + strings.TrimPrefix(subscription, "sub_")
 			session := "cs_" + uuid.NewString()
 			team := seedRecoveryBillingAccount(t, subscription)
+			if !tc.missingGrant {
+				stripe.setExistingGrantAmount(team, subscription, int64(tc.amount))
+			}
 			_, err := testPool.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_status=NULL,checkout_initializing_at=now(),checkout_anchor_snapshot=now(),checkout_session_id=$2 WHERE team_id=$1`, team, session)
 			if err != nil {
 				t.Fatal(err)
@@ -323,15 +345,12 @@ func TestIntegration_BillingRecoveryCompletedCheckout(t *testing.T) {
 			stripe.mu.Lock()
 			stripe.checkouts[session] = map[string]any{"id": session, "status": tc.status, "customer": customer, "subscription": subscription, "client_reference_id": owner}
 			stripe.mu.Unlock()
-			if tc.grant {
-				stripe.setExistingGrant(team, subscription, int64(tc.amount))
-			}
 			args := []string{"-team", team.String(), "-activation-credit-cents", strconv.Itoa(tc.amount)}
 			dry := runBillingRecoveryCommand(t, stripe.server.URL, args...)
 			if tc.want == "repaired" && dry["outcome"] != "candidate" {
 				t.Fatalf("dry-run: %v", dry)
 			}
-			if tc.name == "missing_grant" && (dry["outcome"] != "unresolved" || dry["reason"] != "activation_grant_requires_webhook_reconciliation") {
+			if tc.missingGrant && (dry["outcome"] != "unresolved" || dry["reason"] != "activation_grant_requires_webhook_reconciliation") {
 				t.Fatalf("missing grant dry-run: %v", dry)
 			}
 			if stripe.grantCallCount(customer) != 0 {
@@ -341,11 +360,8 @@ func TestIntegration_BillingRecoveryCompletedCheckout(t *testing.T) {
 			if result["outcome"] != tc.want {
 				t.Fatalf("apply=%v, want %s", result, tc.want)
 			}
-			if tc.name == "missing_grant" && result["reason"] != "activation_grant_requires_webhook_reconciliation" {
+			if tc.missingGrant && result["reason"] != "activation_grant_requires_webhook_reconciliation" {
 				t.Fatalf("missing grant apply: %v", result)
-			}
-			if stripe.grantCallCount(customer) != 0 {
-				t.Fatal("recovery created credit")
 			}
 			var complete, checkoutCleared, anchorCleared bool
 			err = testPool.QueryRow(ctx, `SELECT trial_ended_at IS NOT NULL AND stripe_activation_credit_grant_id IS NOT NULL,checkout_initializing_at IS NULL AND checkout_session_id IS NULL,checkout_anchor_snapshot IS NULL FROM team_billing_account WHERE team_id=$1`, team).Scan(&complete, &checkoutCleared, &anchorCleared)
@@ -394,6 +410,7 @@ func TestIntegration_BillingRecoveryExpiredReservationAndMissingAssociation(t *t
 			customer := "cus_" + strings.TrimPrefix(subscription, "sub_")
 			session := "cs_" + uuid.NewString()
 			team := seedRecoveryBillingAccount(t, subscription)
+			stripe.setExistingGrant(team, subscription)
 			var reservation *time.Time
 			status := "expired"
 			if missing {
@@ -408,9 +425,6 @@ func TestIntegration_BillingRecoveryExpiredReservationAndMissingAssociation(t *t
 			stripe.mu.Lock()
 			stripe.checkouts[session] = map[string]any{"id": session, "status": status, "customer": customer, "subscription": subscription, "client_reference_id": team.String()}
 			stripe.mu.Unlock()
-			if !missing {
-				stripe.setExistingGrant(team, subscription, 9500)
-			}
 			result := runBillingRecoveryCommand(t, stripe.server.URL, "-team", team.String(), "-apply")
 			expected := "repaired"
 			if missing {
@@ -437,5 +451,139 @@ func TestIntegration_BillingRecoveryExpiredReservationAndMissingAssociation(t *t
 				t.Fatal("existing subscription not recovered")
 			}
 		})
+	}
+}
+
+func TestIntegration_BillingRecoveryMissingGrantDoesNotCreateCredit(t *testing.T) {
+	stripe := newRecoveryStripeFixture(t)
+	subscriptionID := "sub_" + uuid.NewString()
+	teamID := seedRecoveryBillingAccount(t, subscriptionID)
+	for _, mode := range [][]string{nil, {"-apply"}} {
+		args := append([]string{"-team", teamID.String()}, mode...)
+		result := runBillingRecoveryCommand(t, stripe.server.URL, args...)
+		if result["outcome"] != "unresolved" || result["reason"] != "activation_grant_requires_webhook_reconciliation" {
+			t.Fatalf("missing grant result = %#v, want unresolved promotion", result)
+		}
+	}
+	if calls := stripe.grantCallCount("cus_" + strings.TrimPrefix(subscriptionID, "sub_")); calls != 0 {
+		t.Fatalf("missing grant made %d creation calls", calls)
+	}
+	var changed bool
+	if err := testPool.QueryRow(t.Context(), `SELECT trial_ended_at IS NOT NULL
+		OR stripe_activation_credit_grant_id IS NOT NULL OR stripe_activation_credit_granted_at IS NOT NULL
+		FROM team_billing_account WHERE team_id=$1`, teamID).Scan(&changed); err != nil || changed {
+		t.Fatalf("missing grant changed local activation: changed=%v err=%v", changed, err)
+	}
+}
+
+func TestIntegration_BillingRecoveryPreservesUserPromotionState(t *testing.T) {
+	for _, state := range []string{"pending", "pending_without_team_actor", "redeemed_without_team_actor", "checkout_actor", "deleted_checkout_actor", "completed_checkout_actor"} {
+		t.Run(state, func(t *testing.T) {
+			ctx := t.Context()
+			stripe := newRecoveryStripeFixture(t)
+			subscriptionID := "sub_" + uuid.NewString()
+			teamID := seedRecoveryBillingAccount(t, subscriptionID)
+			var userID uuid.UUID
+			if err := testPool.QueryRow(ctx, `SELECT user_id FROM team_memberships WHERE team_id=$1 LIMIT 1`, teamID).Scan(&userID); err != nil {
+				t.Fatal(err)
+			}
+			switch state {
+			case "checkout_actor", "deleted_checkout_actor", "completed_checkout_actor":
+				if _, err := testPool.Exec(ctx, `UPDATE team_billing_account SET
+					stripe_checkout_actor_id=CASE WHEN $3 THEN $2::uuid ELSE NULL END,
+					stripe_checkout_actor_claimed_at=now() WHERE team_id=$1`, teamID, userID, state != "deleted_checkout_actor"); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := testPool.Exec(ctx, `INSERT INTO user_promotion_entitlement(user_id) VALUES($1) ON CONFLICT DO NOTHING`, userID); err != nil {
+					t.Fatal(err)
+				}
+				if state == "completed_checkout_actor" {
+					sessionID := "cs_" + uuid.NewString()
+					if _, err := testPool.Exec(ctx, `UPDATE team_billing_account SET checkout_initializing_at=now(),
+						checkout_anchor_snapshot=now(),checkout_session_id=$2 WHERE team_id=$1`, teamID, sessionID); err != nil {
+						t.Fatal(err)
+					}
+					stripe.mu.Lock()
+					stripe.checkouts[sessionID] = map[string]any{"id": sessionID, "status": "complete",
+						"customer":     "cus_" + strings.TrimPrefix(subscriptionID, "sub_"),
+						"subscription": subscriptionID, "client_reference_id": teamID.String()}
+					stripe.mu.Unlock()
+				}
+			case "redeemed_without_team_actor":
+				if _, err := testPool.Exec(ctx, `INSERT INTO user_promotion_entitlement
+					(user_id,stripe_redemption_at,stripe_redemption_team_id) VALUES($1,now(),$2)
+					ON CONFLICT(user_id) DO UPDATE SET stripe_redemption_at=now(),stripe_redemption_team_id=$2`, userID, teamID); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				var reserved bool
+				if err := testPool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event($1,$2,$3)`, teamID, userID, "evt_recovery_"+teamID.String()).Scan(&reserved); err != nil || !reserved {
+					t.Fatalf("reserve promotion: reserved=%v err=%v", reserved, err)
+				}
+				if _, err := testPool.Exec(ctx, `UPDATE user_promotion_entitlement SET stripe_redemption_attempted_at=now() WHERE user_id=$1`, userID); err != nil {
+					t.Fatal(err)
+				}
+				if state == "pending_without_team_actor" {
+					if _, err := testPool.Exec(ctx, `UPDATE team_billing_account SET stripe_activation_user_id=NULL,
+						stripe_activation_credit_reserved_at=NULL,stripe_activation_credit_reservation_event_id=NULL
+						WHERE team_id=$1`, teamID); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			stripe.setExistingGrant(teamID, subscriptionID)
+			var beforeTeam, beforeUser string
+			readState := func(team, user *string) {
+				t.Helper()
+				if err := testPool.QueryRow(ctx, `SELECT row_to_json(a)::text,row_to_json(u)::text
+					FROM team_billing_account a JOIN user_promotion_entitlement u ON u.user_id=$2
+					WHERE a.team_id=$1`, teamID, userID).Scan(team, user); err != nil {
+					t.Fatal(err)
+				}
+			}
+			readState(&beforeTeam, &beforeUser)
+			result := runBillingRecoveryCommand(t, stripe.server.URL, "-team", teamID.String(), "-apply")
+			if result["outcome"] != "unresolved" || result["reason"] != "user_promotion_requires_webhook_reconciliation" {
+				t.Fatalf("user promotion result = %#v, want unresolved user promotion", result)
+			}
+			var afterTeam, afterUser string
+			readState(&afterTeam, &afterUser)
+			if afterTeam != beforeTeam || afterUser != beforeUser {
+				t.Fatalf("recovery mutated user promotion state: team changed=%v user changed=%v", afterTeam != beforeTeam, afterUser != beforeUser)
+			}
+			if calls := stripe.grantCallCount("cus_" + strings.TrimPrefix(subscriptionID, "sub_")); calls != 0 {
+				t.Fatalf("user promotion recovery made %d grant creation calls", calls)
+			}
+		})
+	}
+}
+
+func TestIntegration_BillingRecoveryRechecksPromotionAfterAudit(t *testing.T) {
+	ctx := t.Context()
+	stripe := newRecoveryStripeFixture(t)
+	subscriptionID := "sub_" + uuid.NewString()
+	teamID := seedRecoveryBillingAccount(t, subscriptionID)
+	stripe.setExistingGrant(teamID, subscriptionID)
+	stripe.beforeFirstSubscriptionRead(subscriptionID, func() error {
+		_, err := testPool.Exec(ctx, `SELECT reserve_stripe_promotion_for_event($1,user_id,$2)
+			FROM team_memberships WHERE team_id=$1`, teamID, "evt_racing_"+teamID.String())
+		return err
+	})
+	result := runBillingRecoveryCommand(t, stripe.server.URL, "-team", teamID.String(), "-apply")
+	if result["outcome"] != "unresolved" || result["reason"] != "local_activation_failed" {
+		t.Fatalf("racing promotion result = %#v, want unresolved local activation", result)
+	}
+	var pending, changed bool
+	if err := testPool.QueryRow(ctx, `SELECT
+		a.stripe_activation_user_id IS NOT NULL AND a.stripe_activation_credit_reserved_at IS NOT NULL
+		AND u.stripe_redemption_reserved_team_id=$1,
+		a.trial_ended_at IS NOT NULL OR a.stripe_activation_credit_grant_id IS NOT NULL
+		OR a.stripe_activation_credit_granted_at IS NOT NULL OR u.stripe_redemption_at IS NOT NULL
+		FROM team_billing_account a JOIN user_promotion_entitlement u ON u.user_id=a.stripe_activation_user_id
+		WHERE a.team_id=$1`, teamID).Scan(&pending, &changed); err != nil || !pending || changed {
+		t.Fatalf("racing promotion fence: pending=%v changed=%v err=%v", pending, changed, err)
+	}
+	if calls := stripe.grantCallCount("cus_" + strings.TrimPrefix(subscriptionID, "sub_")); calls != 0 {
+		t.Fatalf("racing promotion made %d grant creation calls", calls)
 	}
 }

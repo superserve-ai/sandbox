@@ -155,19 +155,22 @@ resource "google_monitoring_alert_policy" "ids_triage" {
       customer impact, or another immediate security impact, manually contact the on-call responder and
       open a separate urgent incident with that evidence; do not wait for this routine policy's suppression window.
       Use the existing on-call incident-response process for manual escalation.
-      Runbook: [Investigate Cloud IDS alerts on a VMD endpoint](${local.runbook_urls.investigation})
-      Runbook: [Correlate an IDS finding with VMD proxy activity](${local.runbook_urls.correlation})
-      Runbook: [Contain and remove an abusive sandbox team](${local.runbook_urls.containment})
+      Runbook: ${local.runbook_urls.investigation}
+      Correlation: [Correlate an IDS finding with VMD proxy activity](${local.runbook_urls.correlation})
+      Containment: [Contain and remove an abusive sandbox team](${local.runbook_urls.containment})
       Any older runbook instruction to escalate on detector severity alone is superseded by this triage policy.
     EOT
     mime_type = "text/markdown"
   }
 
   user_labels = merge(var.labels, {
-    alert_type = "cloud_ids_threat_activity"
-    endpoint   = var.endpoint_name
-    managed_by = "terraform"
-    severity   = "triage"
+    superserve_family         = "cloud_ids"
+    superserve_component      = "vmd"
+    superserve_failure_family = "security_finding"
+    alert_type                = "cloud_ids_threat_activity"
+    endpoint                  = var.endpoint_name
+    managed_by                = "terraform"
+    severity                  = "triage"
   })
 }
 
@@ -204,9 +207,12 @@ resource "google_monitoring_alert_policy" "ids_medium" {
   }
 
   user_labels = merge(var.labels, {
-    alert_type = "cloud_ids_threat_activity"
-    endpoint   = var.endpoint_name
-    managed_by = "terraform"
-    severity   = "triage"
+    superserve_family         = "cloud_ids"
+    superserve_component      = "vmd"
+    superserve_failure_family = "security_finding"
+    alert_type                = "cloud_ids_threat_activity"
+    endpoint                  = var.endpoint_name
+    managed_by                = "terraform"
+    severity                  = "triage"
   })
 }

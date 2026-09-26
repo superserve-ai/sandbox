@@ -2071,3 +2071,72 @@ func TestPurgeWithoutDetach(t *testing.T) {
 		}
 	}
 }
+
+// A deleted saved snapshot no sandbox refers to is a retry key with no
+// artifacts: it neither holds the copy back nor survives the purge. A live
+// one holds the copy back.
+func TestDeletedSnapshotsNeitherBlockNorSurvive(t *testing.T) {
+	ctx := context.Background()
+	team := uuid.New()
+	owner := uuid.New()
+	sb := uuid.New()
+
+	mustExec(t, dstPool, `
+		INSERT INTO host (id, vmd_addr, proxy_addr, region, capacity_memory_mib, capacity_vcpus)
+		VALUES ($1, '10.1.0.1:50051', '10.1.0.1:8080', $2, 65536, 32)
+		ON CONFLICT (id) DO NOTHING`, destHostID, destRegion)
+	mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, 'snapshot-drill')`, team)
+	mustExec(t, srcPool, `INSERT INTO profile (id, email, provider, provider_id) VALUES ($1, 'snapshot-owner@example.com', 'google', 'google-snapshot')`, owner)
+	mustExec(t, srcPool, `INSERT INTO team_member (team_id, profile_id, role) VALUES ($1, $2, 'owner')`, team, owner)
+	mustExec(t, srcPool, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, team, owner)
+	mustExec(t, srcPool, `
+		INSERT INTO user_role_assignments (user_id, role_id, scope_type, team_id, granted_by)
+		SELECT $2, r.id, 'team', $1, $2 FROM roles r WHERE r.name = 'team_owner'`, team, owner)
+	sbDir := "/srv/sandboxes/" + sb.String()
+	mustExec(t, srcPool, `
+		INSERT INTO sandbox (id, team_id, name, status, vcpu_count, memory_mib, host_id,
+		                     snapshot_path, mem_path, base_path, delta_path)
+		VALUES ($1, $2, 'snapshot-sb', 'paused', 1, 1024, $3,
+		        $4||'/vmstate.snap', $4||'/mem.snap', $4||'/base.ext4', $4||'/delta.ext4')`,
+		sb, team, sourceHostID, sbDir)
+	deleted := uuid.New()
+	mustExec(t, srcPool, `
+		INSERT INTO sandbox_snapshot (id, team_id, sandbox_id, kind, status, host_id, vcpu_count, memory_mib, disk_mib, base_path, deleted_at)
+		VALUES ($1, $2, $3, 'mem+fs', 'deleting', $4, 1, 1024, 4096, $5||'/base.ext4', now())`,
+		deleted, team, sb, sourceHostID, sbDir)
+
+	cfg := config{teamID: team, sourceURL: srcURL, destURL: dstURL, destHostID: destHostID, destRegion: destRegion}
+	live := uuid.New()
+	mustExec(t, srcPool, `
+		INSERT INTO sandbox_snapshot (id, team_id, sandbox_id, kind, status, host_id, vcpu_count, memory_mib, disk_mib, base_path, overlay_path, snapshot_path, mem_path)
+		VALUES ($1, $2, $3, 'mem+fs', 'ready', $4, 1, 1024, 4096, $5||'/base.ext4', '/o', '/v', '/m')`,
+		live, team, sb, sourceHostID, sbDir)
+	cfg.phase = phaseCopy
+	err := run(ctx, cfg)
+	if err == nil || !strings.Contains(err.Error(), live.String()) || strings.Contains(err.Error(), deleted.String()) {
+		t.Fatalf("copy with a live snapshot: want a refusal naming only the live one, got %v", err)
+	}
+	mustExec(t, srcPool, `UPDATE sandbox_snapshot SET status = 'deleting', deleted_at = now() WHERE id = $1`, live)
+
+	if err := run(ctx, cfg); err != nil {
+		t.Fatalf("copy with only deleted snapshots: %v", err)
+	}
+	cfg.phase = phasePurge
+	cfg.confirmTeamName = "snapshot-drill"
+	if err := run(ctx, cfg); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	var n int64
+	if err := srcPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_snapshot WHERE team_id = $1`, team).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("source still holds %d deleted snapshot rows after the purge", n)
+	}
+	if err := srcPool.QueryRow(ctx, `SELECT count(*) FROM team WHERE id = $1`, team).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Error("source team row survived the purge")
+	}
+}

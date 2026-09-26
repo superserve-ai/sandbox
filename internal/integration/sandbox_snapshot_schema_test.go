@@ -5,6 +5,8 @@ package integration
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -190,6 +192,60 @@ func TestSandboxSnapshotSchema(t *testing.T) {
 	del, err = testQueries.SoftDeleteTemplateIfUnused(ctx, db.SoftDeleteTemplateIfUnusedParams{ID: tpl, TeamID: teamID})
 	if err != nil || !del.Deleted {
 		t.Fatalf("template after its snapshot is deleting: %+v err=%v", del, err)
+	}
+}
+
+// The in-flight limit is the trigger's, counted under the team lock, so a
+// burst of inserts cannot pass it; an idempotent retry is not a new capture.
+func TestSandboxSnapshotInFlightLimit(t *testing.T) {
+	ctx := context.Background()
+	teamID, _ := seedTeamAndKey(t)
+	if _, err := testPool.Exec(ctx, `UPDATE team SET max_snapshots_in_flight = 1 WHERE id = $1`, teamID); err != nil {
+		t.Fatal(err)
+	}
+	sb, err := insertSandboxRow(ctx, teamID, "snap-flight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := "flight-1"
+	first, err := insertSnapshotRow(ctx, teamID, sb, &key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insertSnapshotRow(ctx, teamID, sb, nil); pgCode(err) != "SS003" {
+		t.Fatalf("second capture in flight: want SS003, got %v", err)
+	}
+	if _, err := insertSnapshotRow(ctx, teamID, sb, &key); pgCode(err) != "23505" {
+		t.Fatalf("idempotent retry at the in-flight limit: want 23505, got %v", err)
+	}
+	// Six at once against a limit of one: exactly one gets in.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'failed' WHERE id = $1`, first); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var admitted atomic.Int32
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := insertSnapshotRow(ctx, teamID, sb, nil); err == nil {
+				admitted.Add(1)
+			} else if pgCode(err) != "SS003" {
+				t.Errorf("burst insert: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if admitted.Load() != 1 {
+		t.Fatalf("burst admitted %d captures past a limit of one", admitted.Load())
+	}
+
+	// A capture unsettled for over an hour no longer holds the team's slot.
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET created_at = now() - interval '2 hours' WHERE team_id = $1 AND status = 'creating'`, teamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := insertSnapshotRow(ctx, teamID, sb, nil); err != nil {
+		t.Fatalf("insert next to a stale capture: %v", err)
 	}
 }
 

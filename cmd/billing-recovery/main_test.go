@@ -342,6 +342,11 @@ func TestRecoverySnapshotIncludesCheckoutIdentity(t *testing.T) {
 	if sameRecoveryBillingSnapshot(a, b) {
 		t.Fatal("new checkout reservation was not detected")
 	}
+	b = a
+	b.UserPromotion = true
+	if sameRecoveryBillingSnapshot(a, b) {
+		t.Fatal("new user promotion reservation was not detected")
+	}
 }
 
 func TestAuditCheckoutSeparatesUnverifiedStateFromLookupFailures(t *testing.T) {

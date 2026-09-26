@@ -390,11 +390,15 @@ func (s *stubVMD) UpdateSandboxPreviewPolicy(ctx context.Context, id, access str
 	}
 	return nil
 }
-func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error        { return nil }
-func (s *stubVMD) RevokeSandbox(_ context.Context, _ string) error           { return nil }
-func (s *stubVMD) InvalidateSandboxRules(_ context.Context, _ string) error  { return nil }
-func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error    { return nil }
-func (s *stubVMD) DeleteSandboxSnapshots(_ context.Context, _ string) error  { return nil }
+func (s *stubVMD) InvalidateSecret(_ context.Context, _ string) error       { return nil }
+func (s *stubVMD) RevokeSandbox(_ context.Context, _ string) error          { return nil }
+func (s *stubVMD) InvalidateSandboxRules(_ context.Context, _ string) error { return nil }
+func (s *stubVMD) DeleteSnapshot(_ context.Context, _, _, _ string) error   { return nil }
+func (s *stubVMD) DeleteSandboxSnapshots(_ context.Context, _ string) error { return nil }
+func (s *stubVMD) CreateSavedSnapshot(_ context.Context, _, snapshotID, kind string) (vmdclient.SavedSnapshot, error) {
+	return vmdclient.SavedSnapshot{Kind: kind, DiskPath: "/saved/" + snapshotID + "/overlay.ext4", VCPU: 1, MemoryMiB: 1024, DiskSizeMiB: 4096}, nil
+}
+func (s *stubVMD) DeleteSavedSnapshot(_ context.Context, _ string) error     { return nil }
 func (s *stubVMD) DeleteTemplateArtifacts(_ context.Context, _ string) error { return nil }
 func (s *stubVMD) DeleteBuildArtifacts(_ context.Context, _, _ string) error { return nil }
 func (s *stubVMD) ListBuildArtifacts(_ context.Context) ([]vmdclient.BuildArtifactEntry, error) {

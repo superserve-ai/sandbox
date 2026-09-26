@@ -12,7 +12,7 @@ import (
 )
 
 func TestPromotionBackfillPreservesExplicitSignupActor(t *testing.T) {
-	migration, err := os.ReadFile("../../supabase/migrations/20260924175312_promotion_redemption_limits.sql")
+	migration, err := os.ReadFile("../../supabase/migrations/20260925195213_promotion_redemption_limits.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,7 +127,7 @@ func TestPromotionBackfillPreservesExplicitSignupActor(t *testing.T) {
 }
 
 func TestStripePromotionBackfillRequiresRecordedActor(t *testing.T) {
-	migration, err := os.ReadFile("../../supabase/migrations/20260924175312_promotion_redemption_limits.sql")
+	migration, err := os.ReadFile("../../supabase/migrations/20260925195213_promotion_redemption_limits.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestStripePromotionBackfillRequiresRecordedActor(t *testing.T) {
 		t.Fatal("Stripe promotion backfill not found in migration")
 	}
 	backfill := string(migration[start:end])
-	canonical, err := os.ReadFile("../../supabase/migrations/20260924191820_canonical_promotion_identity.sql")
+	canonical, err := os.ReadFile("../../supabase/migrations/20260925195235_canonical_promotion_identity.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

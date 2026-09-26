@@ -348,6 +348,7 @@ func run() error {
 	}
 	handlers.StartTimeoutReaper(ctx, reaperCfg)
 	handlers.StartPauseReconciler(ctx)
+	handlers.StartSnapshotSweeper(ctx)
 	// How long a delete spends reclaiming the host side before it answers;
 	// the sweeper finishes anything that did not fit. Bounded so a value
 	// cannot turn deletes into long waits.
@@ -360,6 +361,14 @@ func run() error {
 	}
 	handlers.StartTeardownSweeper(ctx)
 	handlers.StartLogRetention(ctx)
+	if cfg.BackupGCServiceAccount != "" {
+		admin, err := backup.NewGCSAdmin(ctx, cfg.TemplateBackupBucket, cfg.BackupGCServiceAccount)
+		if err != nil {
+			return fmt.Errorf("backup gc: %w", err)
+		}
+		handlers.BackupGC = admin
+		handlers.StartBackupGC(ctx)
+	}
 
 	// Launch the template build supervisor. Drives template_build rows
 	// through pending → building → snapshotting → ready/failed by calling
@@ -518,6 +527,33 @@ func (c *grpcVMDClient) DestroyInstance(ctx context.Context, vmID string, force 
 	})
 	if err != nil {
 		return fmt.Errorf("gRPC DestroyVM: %w", err)
+	}
+	return nil
+}
+
+func (c *grpcVMDClient) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID, kind string) (vmdclient.SavedSnapshot, error) {
+	resp, err := c.client.CreateSavedSnapshot(ctx, &vmdpb.CreateSavedSnapshotRequest{VmId: vmID, SnapshotId: snapshotID, Kind: kind})
+	if err != nil {
+		return vmdclient.SavedSnapshot{}, fmt.Errorf("gRPC CreateSavedSnapshot: %w", err)
+	}
+	return vmdclient.SavedSnapshot{
+		Kind:              resp.GetKind(),
+		BasePath:          resp.GetBasePath(),
+		DiskPath:          resp.GetDiskPath(),
+		SnapshotPath:      resp.GetSnapshotPath(),
+		MemPath:           resp.GetMemPath(),
+		BaseMemPath:       resp.GetBaseMemPath(),
+		VCPU:              resp.GetVcpuCount(),
+		MemoryMiB:         resp.GetMemoryMib(),
+		DiskSizeMiB:       resp.GetDiskSizeMib(),
+		SizeBytes:         resp.GetSizeBytes(),
+		FirecrackerSHA256: resp.GetFirecrackerSha256(),
+	}, nil
+}
+
+func (c *grpcVMDClient) DeleteSavedSnapshot(ctx context.Context, snapshotID string) error {
+	if _, err := c.client.DeleteSavedSnapshot(ctx, &vmdpb.DeleteSavedSnapshotRequest{SnapshotId: snapshotID}); err != nil {
+		return fmt.Errorf("gRPC DeleteSavedSnapshot: %w", err)
 	}
 	return nil
 }

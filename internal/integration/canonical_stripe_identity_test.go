@@ -195,7 +195,7 @@ func TestIntegration_CanonicalStripeHistoricalPendingRemainsRecoverable(t *testi
 	ctx := context.Background()
 	userID := canonicalStripeActor(t, "historical"+uuid.New().String()[:8]+"@gmail.com", true)
 	teamID := canonicalStripeTeam(t)
-	migration, err := os.ReadFile("../../supabase/migrations/20260924191922_canonical_stripe_promotion_fences.sql")
+	migration, err := os.ReadFile("../../supabase/migrations/20260925195248_canonical_stripe_promotion_fences.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -746,7 +746,7 @@ func TestIntegration_CanonicalStripeHistoricalReleasedAttemptDoesNotConsume(t *t
 		VALUES($1,$2,now(),now())`, userID, teamID)
 	rolloutExec(t, tx, `UPDATE team_billing_account SET stripe_activation_user_id=$2,stripe_activation_credit_reserved_at=now(),
 		stripe_activation_credit_reservation_event_id='evt_old_failure' WHERE team_id=$1`, teamID, userID)
-	migration, err := os.ReadFile("../../supabase/migrations/20260924191922_canonical_stripe_promotion_fences.sql")
+	migration, err := os.ReadFile("../../supabase/migrations/20260925195248_canonical_stripe_promotion_fences.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

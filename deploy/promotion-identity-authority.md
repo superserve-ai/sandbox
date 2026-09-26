@@ -11,9 +11,9 @@ emails. Claim uniqueness is regional, not coordinated across independently activ
 
 The expansion migrations are:
 
-- `20260924175312_promotion_redemption_limits.sql`: user/team entitlement and legacy compatibility.
-- `20260924191820_canonical_promotion_identity.sql`: local evidence, canonical claims, history and inactive enforcement gate.
-- `20260924191922_canonical_stripe_promotion_fences.sql`: durable Stripe identity and evidence pins.
+- `20260925195213_promotion_redemption_limits.sql`: user/team entitlement and legacy compatibility.
+- `20260925195235_canonical_promotion_identity.sql`: local evidence, canonical claims, history and inactive enforcement gate.
+- `20260925195248_canonical_stripe_promotion_fences.sql`: durable Stripe identity and evidence pins.
 
 Canonical enforcement starts **off**. Existing Console UUID-based claims continue
 through the shared authority, without requiring a simultaneous Console rollout.

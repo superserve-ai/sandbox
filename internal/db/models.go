@@ -303,17 +303,24 @@ type AuditLog struct {
 }
 
 type BackupGeneration struct {
-	ID                        uuid.UUID   `json:"id"`
-	SandboxID                 pgtype.UUID `json:"sandbox_id"`
-	TemplateID                pgtype.UUID `json:"template_id"`
-	BuildID                   *string     `json:"build_id"`
-	Generation                string      `json:"generation"`
-	Bucket                    string      `json:"bucket"`
-	CompletedAt               time.Time   `json:"completed_at"`
-	ReportedAt                time.Time   `json:"reported_at"`
-	Files                     []byte      `json:"files"`
-	CoveredSnapshotID         pgtype.UUID `json:"covered_snapshot_id"`
-	CoveredSnapshotGeneration *int64      `json:"covered_snapshot_generation"`
+	ID                        uuid.UUID          `json:"id"`
+	SandboxID                 pgtype.UUID        `json:"sandbox_id"`
+	TemplateID                pgtype.UUID        `json:"template_id"`
+	BuildID                   *string            `json:"build_id"`
+	Generation                string             `json:"generation"`
+	Bucket                    string             `json:"bucket"`
+	CompletedAt               time.Time          `json:"completed_at"`
+	ReportedAt                time.Time          `json:"reported_at"`
+	Files                     []byte             `json:"files"`
+	CoveredSnapshotID         pgtype.UUID        `json:"covered_snapshot_id"`
+	CoveredSnapshotGeneration *int64             `json:"covered_snapshot_generation"`
+	PurgeClaimedAt            pgtype.Timestamptz `json:"purge_claimed_at"`
+	PurgedAt                  pgtype.Timestamptz `json:"purged_at"`
+}
+
+type BackupWalk struct {
+	Bucket    string    `json:"bucket"`
+	StartedAt time.Time `json:"started_at"`
 }
 
 type BillingExportAllocation struct {
@@ -989,6 +996,8 @@ type SandboxSnapshot struct {
 	CreatedAt      time.Time          `json:"created_at"`
 	ReadyAt        pgtype.Timestamptz `json:"ready_at"`
 	DeletedAt      pgtype.Timestamptz `json:"deleted_at"`
+	// When the sweep next asks the host about a row creating or deleting; pushed out on every attempt, NULL once the host has confirmed.
+	SweepAfter pgtype.Timestamptz `json:"sweep_after"`
 }
 
 type SandboxStorageInterval struct {
@@ -1095,6 +1104,7 @@ type Team struct {
 	HomeRegion             string `json:"home_region"`
 	MaxSnapshots           int32  `json:"max_snapshots"`
 	MaxSnapshotsPerSandbox int32  `json:"max_snapshots_per_sandbox"`
+	MaxSnapshotsInFlight   int32  `json:"max_snapshots_in_flight"`
 }
 
 type TeamActiveSandboxCount struct {

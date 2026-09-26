@@ -20,6 +20,10 @@ INSERT INTO backup_generation (sandbox_id, generation, bucket, completed_at, fil
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (sandbox_id, bucket, generation) WHERE sandbox_id IS NOT NULL
 DO UPDATE SET
+  -- A generation uploaded again after its purge (a host's queued upload
+  -- landing late) is purged again.
+  purged_at = NULL,
+  purge_claimed_at = NULL,
   -- reported_at is the receive-instant freshness cap for skew-bounded
   -- reads, so it moves only when a freshness arm fires: an
   -- enrichment-only update re-describes the same verification and must
@@ -53,7 +57,12 @@ DO UPDATE SET
 WHERE excluded.completed_at > backup_generation.completed_at
    OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
    OR (jsonb_path_exists(excluded.files, '$[*].object')
-       AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'));
+       AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'))
+   -- Any report for a purged or purge-claimed generation, an exact
+   -- redelivery included, comes from a host that holds its objects: the
+   -- purge must run again.
+   OR backup_generation.purged_at IS NOT NULL
+   OR backup_generation.purge_claimed_at IS NOT NULL;
 
 -- name: RecordTemplateBackupGeneration :execrows
 -- Template variant of RecordSandboxBackupGeneration; the two exist
@@ -110,7 +119,7 @@ FROM (
       THEN MIN(reported_at) FILTER (WHERE completed_at > reported_at) OVER ()
       ELSE completed_at END AS effective_at
   FROM backup_generation
-  WHERE sandbox_id = $1
+  WHERE sandbox_id = $1 AND purged_at IS NULL
 ) ranked
 ORDER BY effective_at DESC, completed_at DESC
 LIMIT 1;
@@ -172,6 +181,47 @@ JOIN snapshot s ON s.id = sb.snapshot_id
 LEFT JOIN LATERAL (
   SELECT generation FROM backup_generation
   WHERE covered_snapshot_id = s.id AND covered_snapshot_generation = s.generation
+    AND purged_at IS NULL
   ORDER BY completed_at DESC LIMIT 1
 ) bg ON true
 WHERE sb.id = $1;
+
+-- name: ClaimBackupGenerationsToPurge :many
+-- Leases this bucket's generations of deleted sandboxes to one purge worker
+-- at a time. A claim older than the lease belongs to a worker that died and
+-- may be taken over. The claim time is the worker's token: finishing the
+-- purge requires it unchanged, and a report landing meanwhile clears it.
+WITH due AS (
+  SELECT bg.id
+  FROM backup_generation bg
+  JOIN sandbox s ON s.id = bg.sandbox_id
+  WHERE bg.bucket = sqlc.arg(bucket)::text
+    AND s.status = 'deleted'
+    AND bg.purged_at IS NULL
+    AND (bg.purge_claimed_at IS NULL
+         OR bg.purge_claimed_at < now() - make_interval(secs => sqlc.arg(lease_seconds)::float8))
+  ORDER BY s.destroyed_at ASC
+  LIMIT sqlc.arg(batch_size)
+  FOR UPDATE OF bg SKIP LOCKED
+)
+UPDATE backup_generation bg
+SET purge_claimed_at = clock_timestamp()
+FROM due
+WHERE bg.id = due.id
+RETURNING bg.id, bg.sandbox_id, bg.generation, bg.purge_claimed_at AS claimed_at;
+
+-- name: MarkBackupGenerationPurged :execrows
+-- Zero rows means the claim was cleared by a report that landed during the
+-- purge: the generation was uploaded again and is left for the next pass.
+UPDATE backup_generation
+SET purged_at = now(), purge_claimed_at = NULL
+WHERE id = $1 AND purge_claimed_at = sqlc.arg(claimed_at);
+
+-- name: ClaimBackupWalk :execrows
+-- Takes the bucket's walk for this interval; zero rows means another
+-- replica started one within the interval. A walk that died keeps its claim
+-- until the interval passes and is simply taken next time.
+INSERT INTO backup_walk (bucket, started_at)
+VALUES (sqlc.arg(bucket), now())
+ON CONFLICT (bucket) DO UPDATE SET started_at = now()
+WHERE backup_walk.started_at < now() - make_interval(secs => sqlc.arg(interval_seconds)::float8);

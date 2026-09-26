@@ -431,7 +431,7 @@ func TestIntegration_SignupTrialMutationPrivileges(t *testing.T) {
 }
 
 func TestIntegration_SignupTrialAdoptsInflightLegacyGrant(t *testing.T) {
-	migrationBytes, err := os.ReadFile("../../supabase/migrations/20260924175312_promotion_redemption_limits.sql")
+	migrationBytes, err := os.ReadFile("../../supabase/migrations/20260925195213_promotion_redemption_limits.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

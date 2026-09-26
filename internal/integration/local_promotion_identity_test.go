@@ -279,17 +279,20 @@ func TestIntegration_LocalPromotionWriterPrivileges(t *testing.T) {
 	tx := localIdentityTransaction(t, false)
 	rolloutExec(t, tx, `DO $$ DECLARE r text; BEGIN FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
 		IF NOT EXISTS(SELECT FROM pg_roles WHERE rolname=r) THEN EXECUTE format('CREATE ROLE %I NOLOGIN',r); END IF; END LOOP; END $$`)
-	migration, err := os.ReadFile("../../supabase/migrations/20260924191820_canonical_promotion_identity.sql")
+	migration, err := os.ReadFile("../../supabase/migrations/20260925195235_canonical_promotion_identity.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
 	start := strings.Index(string(migration), "REVOKE ALL ON FUNCTION promotion_identity_key")
-	if start < 0 {
+	end := strings.LastIndex(string(migration), "\nCOMMIT;")
+	if start < 0 || end <= start {
 		t.Fatal("promotion privilege segment missing")
 	}
-	privileges := strings.TrimSpace(string(migration[start:]))
-	privileges = strings.TrimSuffix(privileges, "COMMIT;")
-	rolloutExec(t, tx, privileges)
+	// The migration commits itself; this fragment must retain the test rollback.
+	rolloutExec(t, tx, string(migration[start:end]))
+	if tx.Conn().PgConn().TxStatus() != 'T' {
+		t.Fatal("privilege fragment ended the fixture transaction")
+	}
 	for _, role := range []string{"anon", "authenticated", "service_role"} {
 		var write, enable, mutate bool
 		if err := tx.QueryRow(ctx, `SELECT

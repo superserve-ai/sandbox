@@ -15,6 +15,10 @@ resource "google_monitoring_alert_policy" "sandbox_lifecycle_latency" {
 
   lifecycle {
     precondition {
+      condition     = contains(keys(var.runbook_urls), "lifecycle_latency")
+      error_message = "Missing required runbook URL for sandbox_lifecycle_latency."
+    }
+    precondition {
       condition     = length(var.notification_channel_ids) > 0
       error_message = "notification_channel_ids must contain an existing monitored channel when sandbox lifecycle alerts are configured"
     }
@@ -66,14 +70,19 @@ resource "google_monitoring_alert_policy" "sandbox_lifecycle_latency" {
       The condition is grouped by host_id so a degraded cell/host cannot be hidden by healthy fleet traffic. Use the sandbox latency dashboard's internal vmd restore/launch/network phase panels to identify where the operation is spending time.
 
       Owner: Infrastructure Operations.
+      Runbook: ${lookup(var.runbook_urls, "lifecycle_latency", "")}
     EOT
     mime_type = "text/markdown"
   }
 
   user_labels = merge(var.labels, {
-    alert_type = "sandbox_${each.key}_latency"
-    severity   = "critical"
-    managed_by = "terraform"
+    superserve_family         = "sandbox_lifecycle"
+    superserve_component      = "api"
+    superserve_failure_family = "latency"
+    superserve_operation      = each.key
+    alert_type                = "sandbox_${each.key}_latency"
+    severity                  = "critical"
+    managed_by                = "terraform"
   })
 }
 
@@ -92,6 +101,10 @@ resource "google_monitoring_alert_policy" "sandbox_failed" {
   notification_channels = var.notification_channel_ids
 
   lifecycle {
+    precondition {
+      condition     = contains(keys(var.runbook_urls), "lifecycle_failure")
+      error_message = "Missing required runbook URL for sandbox_failed."
+    }
     precondition {
       condition     = length(var.notification_channel_ids) > 0
       error_message = "notification_channel_ids must contain an existing monitored channel when sandbox lifecycle alerts are configured"
@@ -142,13 +155,19 @@ resource "google_monitoring_alert_policy" "sandbox_failed" {
       Sandbox IDs are intentionally not metric labels. Use structured logs to identify the affected sandbox(es) and failure details without introducing unbounded Prometheus cardinality.
 
       Owner: Infrastructure Operations.
+      Runbook: ${lookup(var.runbook_urls, "lifecycle_failure", "")}
     EOT
     mime_type = "text/markdown"
   }
 
-  user_labels = merge(var.labels, {
-    alert_type = "sandbox_failed"
-    severity   = "critical"
-    managed_by = "terraform"
+  user_labels = merge({
+    for key, value in var.labels : key => value if key != "superserve_operation"
+    }, {
+    superserve_family         = "sandbox_lifecycle"
+    superserve_component      = "api"
+    superserve_failure_family = "lifecycle_failure"
+    alert_type                = "sandbox_failed"
+    severity                  = "critical"
+    managed_by                = "terraform"
   })
 }

@@ -156,15 +156,25 @@ type freezeEcho struct {
 	Version    int    `json:"version"`
 	Capability string `json:"capability"`
 	Token      string `json:"token"`
+	// Synced: the guest flushed its filesystems once the workload was
+	// stopped. An older guest agent never says so.
+	Synced bool `json:"synced"`
 }
 
 // postBoxdFreeze asks the guest to stop its workload ahead of a snapshot.
 func postBoxdFreeze(ctx context.Context, vmIP, token string) (freezeEcho, error) {
+	return postBoxdFreezeSync(ctx, vmIP, token, false)
+}
+
+// postBoxdFreezeSync is postBoxdFreeze that also has the guest flush its
+// filesystems while the workload is stopped.
+func postBoxdFreezeSync(ctx context.Context, vmIP, token string, sync bool) (freezeEcho, error) {
 	// The guest's budget is shorter than ours, so it gives up and thaws first.
 	req := struct {
 		BudgetMs int64  `json:"budget_ms,omitempty"`
 		Token    string `json:"token"`
-	}{Token: token}
+		Sync     bool   `json:"sync,omitempty"`
+	}{Token: token, Sync: sync}
 	if dl, ok := ctx.Deadline(); ok {
 		// The reserve is what the guest's reply needs to reach us after it
 		// gives up; it never eats the whole budget, so a short budget still
@@ -259,7 +269,9 @@ func postBoxd(ctx context.Context, vmIP, path string, body []byte) ([]byte, erro
 		return nil, fmt.Errorf("POST %s: %w", path, err)
 	}
 	defer resp.Body.Close()
-	reply, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	// Bounded: a reply past this is not one boxd's own endpoints send, and a
+	// cut-short one fails to decode rather than passing for an answer.
+	reply, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK {
 		return nil, &boxdStatusError{Path: path, Code: resp.StatusCode, Body: strings.TrimSpace(string(reply))}
 	}
@@ -349,7 +361,10 @@ func waitForGuestWake(ctx context.Context, vmIP string, timeout time.Duration, c
 
 // Seams so the pause and restore paths can be tested without a guest.
 var (
-	boxdFreezeGuest  = postBoxdFreeze
+	boxdFreezeGuest     = postBoxdFreeze
+	boxdFreezeGuestSync = func(ctx context.Context, vmIP, token string) (freezeEcho, error) {
+		return postBoxdFreezeSync(ctx, vmIP, token, true)
+	}
 	boxdThawGuest    = postBoxdThaw
 	boxdWakeGuest    = waitForGuestWake
 	boxdGuestRunning = guestWorkloadRunning

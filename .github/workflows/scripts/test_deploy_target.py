@@ -17,6 +17,16 @@ SCRIPTS = Path(__file__).parent
 
 
 class DeployTargetTests(unittest.TestCase):
+    def test_staging_terraform_jobs_receive_runbook_urls(self):
+        workflow = (SCRIPTS.parent / 'terraform-rollout-staging.yml').read_text()
+        for name in ('privateca-bootstrap', 'proxy-prepare', 'proxy-runtime-iam',
+                     'proxy-migration', 'staging'):
+            with self.subTest(job=name):
+                job = re.split(r'^  [a-z][a-z-]*:\n', workflow.split(f'  {name}:\n', 1)[1],
+                               maxsplit=1, flags=re.M)[0]
+                job_env = job.split('    env:\n', 1)[1].split('    steps:\n', 1)[0]
+                self.assertIn('TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}', job_env)
+
     def test_staging_migration_shares_proxy_deployment_queue(self):
         workflow = (SCRIPTS.parent / 'terraform-rollout-staging.yml').read_text()
         expression = re.search(r'^  group: \$\{\{ (.+) \}\}$', workflow, re.M)[1]

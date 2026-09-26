@@ -81,6 +81,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
       CONFIRM: ${{ inputs.confirm }}
       PROXY_MIGRATION: ${{ inputs.proxy_migration }}
       PROXY_PREPARE: ${{ inputs.proxy_prepare }}
@@ -136,6 +137,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
       CONFIRM: ${{ inputs.confirm }}
       PROXY_MIGRATION: ${{ inputs.proxy_migration }}
       PROXY_RUNTIME_IAM: ${{ inputs.proxy_runtime_iam }}
@@ -245,6 +247,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
       CONFIRM: ${{ inputs.confirm }}
       PROXY_MIGRATION: ${{ inputs.proxy_migration }}
     steps:
@@ -288,6 +291,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
       CONFIRM: ${{ inputs.confirm }}
       PROXY_MIGRATION: ${{ inputs.proxy_migration }}
     steps:
@@ -316,11 +320,13 @@ jobs:
     if: ${{ !inputs.privateca_bootstrap && !inputs.smoke_only && !inputs.proxy_prepare && !inputs.proxy_runtime_iam && inputs.proxy_migration == 'none' }}
     name: Apply staging us-central1
     runs-on: ubuntu-latest
+    environment: staging
     permissions:
       contents: read
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
+      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
       API_BASE_URL: https://api-staging.superserve.ai
       API_KEY: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
       SANDBOX_BASE_URL: https://staging-sandbox.superserve.ai

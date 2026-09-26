@@ -215,6 +215,13 @@ func runPlan(ctx context.Context, src *pgxpool.Pool, cfg config) error {
 	for _, k := range liveKeys {
 		log.Warn().Str("api_key", k).Msg("plan: BLOCKER — key not revoked; copy will refuse (freeze rotates keys)")
 	}
+	snapshots, err := teamSnapshots(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	for _, s := range snapshots {
+		log.Warn().Str("snapshot", s).Msg("plan: BLOCKER — sandbox snapshot exists; snapshots do not move between cells yet, copy will refuse")
+	}
 
 	return reportArtifactDirs(ctx, src, cfg)
 }
@@ -289,6 +296,36 @@ func activeBuilds(ctx context.Context, src querier, teamID uuid.UUID) ([]string,
 // paused sandbox mid-move between hosts; its artifacts are in flight too.
 // A pending sandbox_teardown blocks too: purge would cascade it away with
 // the row and strand the reclaim on the source host.
+// teamSnapshots returns "<id> kind=<kind> status=<status>" for every saved
+// snapshot row of the team that holds the copy back: a live one, whose
+// artifacts live on the source host and do not move, or a deleted one a
+// sandbox was created from and still refers to. A deleted row nothing
+// refers to is a key kept for idempotent retries, with no artifacts left,
+// and is purged with the team.
+func teamSnapshots(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
+	rows, err := src.Query(ctx, `
+		SELECT ss.id, ss.kind, ss.status FROM sandbox_snapshot ss
+		WHERE ss.team_id = $1
+		  AND (ss.deleted_at IS NULL
+		       OR EXISTS (SELECT 1 FROM sandbox s WHERE s.source_snapshot_id = ss.id))
+		ORDER BY ss.created_at`, teamID)
+	if err != nil {
+		return nil, fmt.Errorf("list snapshots: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var id uuid.UUID
+		var kind, status string
+		if err := rows.Scan(&id, &kind, &status); err != nil {
+			return nil, err
+		}
+		out = append(out, fmt.Sprintf("%s kind=%s status=%s", id, kind, status))
+	}
+	return out, rows.Err()
+}
+
 func activeSandboxes(ctx context.Context, src querier, teamID uuid.UUID) ([]string, error) {
 	rows, err := src.Query(ctx, `
 		SELECT s.id, s.name, s.status, t.sandbox_id IS NOT NULL
@@ -418,6 +455,14 @@ func runCopy(ctx context.Context, src, dst *pgxpool.Pool, cfg config) error {
 	if len(liveKeys) > 0 {
 		return fmt.Errorf("refusing to copy: %d API key(s) not revoked (freeze step — the region prefix in the key string cannot follow the team):\n  %s",
 			len(liveKeys), strings.Join(liveKeys, "\n  "))
+	}
+	snapshots, err := teamSnapshots(ctx, src, cfg.teamID)
+	if err != nil {
+		return err
+	}
+	if len(snapshots) > 0 {
+		return fmt.Errorf("refusing to copy: %d sandbox snapshot(s) exist and snapshots do not move between cells yet:\n  %s",
+			len(snapshots), strings.Join(snapshots, "\n  "))
 	}
 
 	// The dest host must exist and live in the dest region before any
@@ -1781,6 +1826,13 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 	// Break the sandbox↔snapshot cycle so snapshots can go before sandboxes.
 	if _, err := tx.Exec(ctx, `UPDATE sandbox SET snapshot_id = NULL WHERE team_id = $1`, cfg.teamID); err != nil {
 		return fmt.Errorf("null sandbox.snapshot_id: %w", err)
+	}
+	// Only deleted saved snapshot rows nothing refers to are left by now
+	// (copy refused any other); they are not copied and go with the team.
+	if tag, err := tx.Exec(ctx, `DELETE FROM sandbox_snapshot WHERE team_id = $1`, cfg.teamID); err != nil {
+		return fmt.Errorf("delete from sandbox_snapshot: %w", err)
+	} else if tag.RowsAffected() > 0 {
+		log.Info().Int64("deleted", tag.RowsAffected()).Msg("purge: deleted saved snapshot rows dropped with the team")
 	}
 
 	var total int64

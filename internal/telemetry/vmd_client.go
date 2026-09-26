@@ -44,6 +44,18 @@ func (c *instrumentedVMDClient) DestroyInstance(ctx context.Context, instanceID 
 	return c.next.DestroyInstance(ctx, instanceID, force)
 }
 
+func (c *instrumentedVMDClient) CreateSavedSnapshot(ctx context.Context, instanceID, snapshotID, kind string) (snap vmdclient.SavedSnapshot, err error) {
+	started := time.Now()
+	defer func() { c.record(ctx, "CreateSavedSnapshot", started, err) }()
+	return c.next.CreateSavedSnapshot(ctx, instanceID, snapshotID, kind)
+}
+
+func (c *instrumentedVMDClient) DeleteSavedSnapshot(ctx context.Context, snapshotID string) (err error) {
+	started := time.Now()
+	defer func() { c.record(ctx, "DeleteSavedSnapshot", started, err) }()
+	return c.next.DeleteSavedSnapshot(ctx, snapshotID)
+}
+
 func (c *instrumentedVMDClient) PauseInstance(ctx context.Context, instanceID, snapshotDir, pauseToken string) (snapshotPath, memPath string, manifest []vmdclient.ManifestEntry, ackedToken string, err error) {
 	started := time.Now()
 	defer func() { c.record(ctx, "PauseVM", started, err) }()

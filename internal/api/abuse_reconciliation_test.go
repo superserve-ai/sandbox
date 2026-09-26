@@ -154,126 +154,120 @@ func TestContainmentDispatchUnresolvedHostKeepsPauseClaim(t *testing.T) {
 }
 
 func TestComputeSchedulerRefreshesBlockedSweepWithoutOverlapAndCancels(t *testing.T) {
-	team := uuid.New()
-	path := filepath.Join(t.TempDir(), "compute.json")
-	writeComputePolicy(t, path, "enforce", []uuid.UUID{team}, nil)
-	refreshes := make(chan abuse.ComputeMode, 4)
-	var source *abuse.ConfigComputeSource
-	source = abuse.NewConfigComputeSource(path, nil, func(_ context.Context, _ string) {
-		refreshes <- (&abuse.ComputeEvaluator{Source: source}).Evaluate(team, abuse.ActionResume).Mode
-	})
-	source.Refresh(context.Background())
-	if got := waitComputeSignal(t, refreshes); got != abuse.ModeEnforce {
-		t.Fatalf("startup mode = %s", got)
-	}
-	ticks := make(chan time.Time)
-	started := make(chan int, 2)
-	sweepModes := make(chan abuse.ComputeMode, 2)
-	firstDone := make(chan struct{})
-	secondDone := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	runnerDone := make(chan struct{})
-	var mu sync.Mutex
-	active, calls, peak := 0, 0, 0
-	h := &Handlers{}
-	go func() {
-		defer close(runnerDone)
-		h.runComputeReconciliation(ctx, source, ticks, func(ctx context.Context, updates <-chan *abuse.ComputeSnapshot) {
-			mu.Lock()
-			calls++
-			call := calls
-			active++
-			if active > peak {
-				peak = active
-			}
-			mu.Unlock()
-			sweepModes <- (&abuse.ComputeEvaluator{Source: source}).Evaluate(team, abuse.ActionResume).Mode
-			started <- call
-			if call == 1 {
-			waitFirst:
-				for {
-					select {
-					case <-firstDone:
-						break waitFirst
-					case <-updates:
-					case <-ctx.Done():
-						break waitFirst
-					}
-				}
-			} else {
-				for ctx.Err() == nil {
-					select {
-					case <-updates:
-					case <-ctx.Done():
-					}
-				}
-			}
-			mu.Lock()
-			active--
-			mu.Unlock()
-			if call == 2 {
-				close(secondDone)
-			}
+	synctest.Test(t, func(t *testing.T) {
+		team := uuid.New()
+		path := filepath.Join(t.TempDir(), "compute.json")
+		writeComputePolicy(t, path, "enforce", []uuid.UUID{team}, nil)
+		refreshes := make(chan abuse.ComputeMode, 4)
+		var source *abuse.ConfigComputeSource
+		source = abuse.NewConfigComputeSource(path, nil, func(_ context.Context, _ string) {
+			refreshes <- (&abuse.ComputeEvaluator{Source: source}).Evaluate(team, abuse.ActionResume).Mode
 		})
-	}()
-	if got := waitComputeSignal(t, started); got != 1 {
-		t.Fatalf("first sweep = %d", got)
-	}
-	if got := waitComputeSignal(t, sweepModes); got != abuse.ModeEnforce {
-		t.Fatalf("startup sweep mode = %s, want enforce", got)
-	}
-	select {
-	case <-refreshes:
-		t.Fatal("scheduler refreshed the startup snapshot before the first tick")
-	default:
-	}
-	writeComputePolicy(t, path, "off", nil, nil)
-	for i := 0; i < 2; i++ {
-		ticks <- time.Time{}
-		if got := waitComputeSignal(t, refreshes); got != abuse.ModeOff {
-			t.Fatalf("refreshed mode = %s", got)
+		source.Refresh(context.Background())
+		if got := waitComputeSignal(t, refreshes); got != abuse.ModeEnforce {
+			t.Fatalf("startup mode = %s", got)
 		}
-	}
-	mu.Lock()
-	if calls != 1 || peak != 1 {
-		t.Fatalf("blocked sweep: calls=%d peak=%d", calls, peak)
-	}
-	mu.Unlock()
-	writeComputePolicy(t, path, "observe", []uuid.UUID{team}, nil)
-	close(firstDone)
-	// The next tick starts a new pass after the first sweep has exited.
-	deadline := time.After(10 * time.Second)
-	for {
+		ticks := make(chan time.Time)
+		started := make(chan int, 2)
+		sweepModes := make(chan abuse.ComputeMode, 2)
+		firstDone := make(chan struct{})
+		secondDone := make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		runnerDone := make(chan struct{})
+		var mu sync.Mutex
+		active, calls, peak := 0, 0, 0
+		h := &Handlers{}
+		go func() {
+			defer close(runnerDone)
+			h.runComputeReconciliation(ctx, source, ticks, func(ctx context.Context, updates <-chan *abuse.ComputeSnapshot) {
+				mu.Lock()
+				calls++
+				call := calls
+				active++
+				if active > peak {
+					peak = active
+				}
+				mu.Unlock()
+				sweepModes <- (&abuse.ComputeEvaluator{Source: source}).Evaluate(team, abuse.ActionResume).Mode
+				started <- call
+				if call == 1 {
+				waitFirst:
+					for {
+						select {
+						case <-firstDone:
+							break waitFirst
+						case <-updates:
+						case <-ctx.Done():
+							break waitFirst
+						}
+					}
+				} else {
+					for ctx.Err() == nil {
+						select {
+						case <-updates:
+						case <-ctx.Done():
+						}
+					}
+				}
+				mu.Lock()
+				active--
+				mu.Unlock()
+				if call == 2 {
+					close(secondDone)
+				}
+			})
+		}()
+		if got := waitComputeSignal(t, started); got != 1 {
+			t.Fatalf("first sweep = %d", got)
+		}
+		if got := waitComputeSignal(t, sweepModes); got != abuse.ModeEnforce {
+			t.Fatalf("startup sweep mode = %s, want enforce", got)
+		}
 		select {
-		case ticks <- time.Time{}:
-		case <-deadline:
-			t.Fatal("next sweep did not start")
+		case <-refreshes:
+			t.Fatal("scheduler refreshed the startup snapshot before the first tick")
+		default:
 		}
+		writeComputePolicy(t, path, "off", nil, nil)
+		for i := 0; i < 2; i++ {
+			ticks <- time.Time{}
+			if got := waitComputeSignal(t, refreshes); got != abuse.ModeOff {
+				t.Fatalf("refreshed mode = %s", got)
+			}
+		}
+		// The refresh notification precedes the scheduler's update handoff. Finish
+		// that tick before letting the first sweep exit or changing its policy.
+		synctest.Wait()
+		mu.Lock()
+		blockedCalls, blockedPeak := calls, peak
+		mu.Unlock()
+		if blockedCalls != 1 || blockedPeak != 1 {
+			t.Fatalf("blocked sweep: calls=%d peak=%d", blockedCalls, blockedPeak)
+		}
+		writeComputePolicy(t, path, "observe", []uuid.UUID{team}, nil)
+		close(firstDone)
+		// Publish the first sweep's completion before the single next tick.
+		synctest.Wait()
+		ticks <- time.Time{}
 		if got := waitComputeSignal(t, refreshes); got != abuse.ModeObserve {
 			t.Fatalf("next refreshed mode = %s, want observe", got)
 		}
-		select {
-		case call := <-started:
-			if call != 2 {
-				t.Fatalf("next sweep = %d", call)
-			}
-			if got := waitComputeSignal(t, sweepModes); got != abuse.ModeObserve {
-				t.Fatalf("next sweep mode = %s, want refreshed observe", got)
-			}
-			goto cancelSweep
-		default:
+		if call := waitComputeSignal(t, started); call != 2 {
+			t.Fatalf("next sweep = %d", call)
 		}
-	}
-cancelSweep:
-	cancel()
-	waitComputeSignal(t, runnerDone)
-	waitComputeSignal(t, secondDone)
-	mu.Lock()
-	defer mu.Unlock()
-	if peak != 1 || calls != 2 {
-		t.Fatalf("sweeps: calls=%d peak=%d", calls, peak)
-	}
+		if got := waitComputeSignal(t, sweepModes); got != abuse.ModeObserve {
+			t.Fatalf("next sweep mode = %s, want refreshed observe", got)
+		}
+		cancel()
+		waitComputeSignal(t, runnerDone)
+		waitComputeSignal(t, secondDone)
+		mu.Lock()
+		defer mu.Unlock()
+		if peak != 1 || calls != 2 {
+			t.Fatalf("sweeps: calls=%d peak=%d", calls, peak)
+		}
+	})
 }
 
 func TestComputeSchedulerCancellationDuringRefreshDoesNotRestartSweep(t *testing.T) {

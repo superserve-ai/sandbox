@@ -102,8 +102,10 @@ func SandboxObject(sandboxID, generation, fileName string) (string, error) {
 // and the fingerprint binds the extent table, so identical bases from
 // any sandbox or host converge on one immutable object.
 func SharedBaseObject(sha256, fingerprint string) string {
-	return "bases/" + sha256 + ".p" + fingerprint
+	return sharedBasePrefix + sha256 + ".p" + fingerprint
 }
+
+const sharedBasePrefix = "bases/"
 
 // TemplateObject names an artifact object within a template build
 // generation. The generation segment matters even though a finished build

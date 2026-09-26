@@ -150,6 +150,13 @@ locals {
 resource "google_monitoring_alert_policy" "backup" {
   for_each = local.backup_alert_conditions
 
+  lifecycle {
+    precondition {
+      condition     = contains(keys(var.runbook_urls), "backup_pipeline")
+      error_message = "Missing required runbook URL for backup."
+    }
+  }
+
   project               = var.project_id
   display_name          = each.value.display_name
   combiner              = "OR"
@@ -184,13 +191,16 @@ resource "google_monitoring_alert_policy" "backup" {
   }
 
   documentation {
-    content   = each.value.documentation
+    content   = format("%s\n\nRunbook: %s", each.value.documentation, lookup(var.runbook_urls, "backup_pipeline", ""))
     mime_type = "text/markdown"
   }
 
   user_labels = merge(var.labels, {
-    alert_type = "backup_${each.key}"
-    managed_by = "terraform"
+    superserve_family         = "backup"
+    superserve_component      = "vmd"
+    superserve_failure_family = lookup({ upload_failures = "backup_upload_failure", backlog_age = "backup_backlog", pause_hook_p99 = "backup_latency", outbox_stalled = "backup_outbox", backup_disabled = "backup_disabled" }, each.key, "")
+    alert_type                = "backup_${each.key}"
+    managed_by                = "terraform"
   })
 }
 
@@ -289,6 +299,13 @@ locals {
 resource "google_monitoring_alert_policy" "backup_coverage" {
   for_each = local.backup_coverage_alert_conditions
 
+  lifecycle {
+    precondition {
+      condition     = contains(keys(var.runbook_urls), "backup_coverage")
+      error_message = "Missing required runbook URL for backup_coverage."
+    }
+  }
+
   project      = var.project_id
   display_name = each.value.display_name
   combiner     = "OR"
@@ -339,13 +356,16 @@ resource "google_monitoring_alert_policy" "backup_coverage" {
   }
 
   documentation {
-    content   = each.value.documentation
+    content   = format("%s\n\nRunbook: %s", each.value.documentation, lookup(var.runbook_urls, "backup_coverage", ""))
     mime_type = "text/markdown"
   }
 
   user_labels = merge(var.labels, {
-    alert_type = "backup_coverage_${each.key}"
-    managed_by = "terraform"
+    superserve_family         = "backup"
+    superserve_component      = "api"
+    superserve_failure_family = "backup_coverage"
+    alert_type                = "backup_coverage_${each.key}"
+    managed_by                = "terraform"
   })
 }
 
@@ -409,6 +429,13 @@ locals {
 resource "google_monitoring_alert_policy" "host_disk" {
   for_each = local.host_disk_alert_conditions
 
+  lifecycle {
+    precondition {
+      condition     = contains(keys(var.runbook_urls), "host_disk")
+      error_message = "Missing required runbook URL for host_disk."
+    }
+  }
+
   project               = var.project_id
   display_name          = each.value.display_name
   combiner              = "OR"
@@ -440,12 +467,15 @@ resource "google_monitoring_alert_policy" "host_disk" {
   }
 
   documentation {
-    content   = each.value.documentation
+    content   = format("%s\n\nRunbook: %s", each.value.documentation, lookup(var.runbook_urls, "host_disk", ""))
     mime_type = "text/markdown"
   }
 
   user_labels = merge(var.labels, {
-    alert_type = "host_disk_${each.key}"
-    managed_by = "terraform"
+    superserve_family         = "host"
+    superserve_component      = "host"
+    superserve_failure_family = "capacity"
+    alert_type                = "host_disk_${each.key}"
+    managed_by                = "terraform"
   })
 }

@@ -53,6 +53,8 @@ type stubVMD struct {
 	updatePreviewFn        func(ctx context.Context, id, access string, ports map[int32]vmdclient.PortPolicy, revision int64) error
 	injectEnvFn            func(ctx context.Context, id string, envVars map[string]string, secretsJWT string) error
 	listDirFn              func(ctx context.Context, id, path string) ([]vmdclient.DirEntry, error)
+	createSavedFn          func(ctx context.Context, id, snapshotID, kind string) (vmdclient.SavedSnapshot, error)
+	deleteSavedFn          func(ctx context.Context, snapshotID string) error
 	// restorePreviewProtocol overrides the boot response's attestation echo;
 	// nil echoes the current capability. Point at "" to model a vmd from
 	// before the echo existed.
@@ -99,6 +101,26 @@ func (s *stubVMD) DestroyInstance(ctx context.Context, id string, force bool) er
 	}
 	return nil
 }
+func (s *stubVMD) CreateSavedSnapshot(ctx context.Context, id, snapshotID, kind string) (vmdclient.SavedSnapshot, error) {
+	if s.createSavedFn != nil {
+		return s.createSavedFn(ctx, id, snapshotID, kind)
+	}
+	snap := vmdclient.SavedSnapshot{Kind: kind, BasePath: "/base.ext4", DiskPath: "/saved/" + snapshotID + "/overlay.ext4", VCPU: 1, MemoryMiB: 1024, DiskSizeMiB: 4096, SizeBytes: 4096}
+	if kind == "mem+fs" {
+		snap.SnapshotPath = "/saved/" + snapshotID + "/vmstate.snap"
+		snap.MemPath = "/saved/" + snapshotID + "/mem.diff"
+		snap.BaseMemPath = "/templates/mem.snap"
+	}
+	return snap, nil
+}
+
+func (s *stubVMD) DeleteSavedSnapshot(ctx context.Context, snapshotID string) error {
+	if s.deleteSavedFn != nil {
+		return s.deleteSavedFn(ctx, snapshotID)
+	}
+	return nil
+}
+
 func (s *stubVMD) PauseInstance(ctx context.Context, id, snapshotDir, pauseToken string) (string, string, []vmdclient.ManifestEntry, string, error) {
 	// Echo like a current daemon; token-drop cases stub pauseFn and are
 	// covered by the client-layer echo comparison, not this fake.
