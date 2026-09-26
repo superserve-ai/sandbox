@@ -1245,7 +1245,7 @@ func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUI
 // applySecretBindings mints the secrets JWT for meta and injects it, with the secret
 // env vars, into a live sandbox. Empty meta injects no JWT. InjectSandboxEnv merges,
 // so it can add or update an env var but not remove one.
-func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, meta []SecretBindingMeta) error {
+func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, meta []SecretBindingMeta, clear ...string) error {
 	vmd, err := h.vmdForHost(ctx, sandbox.HostID)
 	if err != nil {
 		return fmt.Errorf("resolve vmd for host: %w", err)
@@ -1261,7 +1261,18 @@ func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, 
 			return fmt.Errorf("mint secrets jwt: %w", err)
 		}
 	}
-	if err := vmd.InjectSandboxEnv(ctx, sandbox.ID.String(), mergeEnvVarsWithSecrets(nil, meta), jwt); err != nil {
+	env := mergeEnvVarsWithSecrets(nil, meta)
+	if len(clear) > 0 {
+		cleared := make(map[string]string, len(env)+len(clear))
+		for _, k := range clear {
+			cleared[k] = ""
+		}
+		for k, v := range env {
+			cleared[k] = v
+		}
+		env = cleared
+	}
+	if err := vmd.InjectSandboxEnv(ctx, sandbox.ID.String(), env, jwt); err != nil {
 		return fmt.Errorf("inject sandbox env: %w", err)
 	}
 	if jwt != "" {

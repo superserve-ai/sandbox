@@ -823,9 +823,31 @@ func (q *Queries) LockSandboxForSecretWrites(ctx context.Context, hashtext strin
 	return err
 }
 
+const pruneDetachedSecretKeys = `-- name: PruneDetachedSecretKeys :exec
+DELETE FROM sandbox_secret_detached d
+WHERE d.sandbox_id = $1::uuid AND d.env_key IN (
+  SELECT k.env_key FROM sandbox_secret_detached k
+  WHERE k.sandbox_id = $1::uuid
+  ORDER BY k.detached_at DESC, k.env_key
+  OFFSET $2::int
+)
+`
+
+type PruneDetachedSecretKeysParams struct {
+	SandboxID uuid.UUID `json:"sandbox_id"`
+	Keep      int32     `json:"keep"`
+}
+
+// Keeps the most recent detached keys only, so what a snapshot records
+// stays bounded however many keys a sandbox churns through.
+func (q *Queries) PruneDetachedSecretKeys(ctx context.Context, arg PruneDetachedSecretKeysParams) error {
+	_, err := q.db.Exec(ctx, pruneDetachedSecretKeys, arg.SandboxID, arg.Keep)
+	return err
+}
+
 const recordDetachedSecretKey = `-- name: RecordDetachedSecretKey :exec
 INSERT INTO sandbox_secret_detached (sandbox_id, env_key) VALUES ($1, $2)
-ON CONFLICT (sandbox_id, env_key) DO NOTHING
+ON CONFLICT (sandbox_id, env_key) DO UPDATE SET detached_at = now()
 `
 
 type RecordDetachedSecretKeyParams struct {

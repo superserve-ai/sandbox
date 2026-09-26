@@ -180,7 +180,18 @@ LIMIT sqlc.arg('row_limit');
 
 -- name: RecordDetachedSecretKey :exec
 INSERT INTO sandbox_secret_detached (sandbox_id, env_key) VALUES ($1, $2)
-ON CONFLICT (sandbox_id, env_key) DO NOTHING;
+ON CONFLICT (sandbox_id, env_key) DO UPDATE SET detached_at = now();
+
+-- name: PruneDetachedSecretKeys :exec
+-- Keeps the most recent detached keys only, so what a snapshot records
+-- stays bounded however many keys a sandbox churns through.
+DELETE FROM sandbox_secret_detached d
+WHERE d.sandbox_id = sqlc.arg('sandbox_id')::uuid AND d.env_key IN (
+  SELECT k.env_key FROM sandbox_secret_detached k
+  WHERE k.sandbox_id = sqlc.arg('sandbox_id')::uuid
+  ORDER BY k.detached_at DESC, k.env_key
+  OFFSET sqlc.arg('keep')::int
+);
 
 -- name: ForgetDetachedSecretKey :exec
 DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = $2;

@@ -424,3 +424,63 @@ func TestIntegration_UndoneAttachIsTakenOutOfACaptureInFlight(t *testing.T) {
 		t.Fatalf("tombstones after a re-attach: %d %v", n, err)
 	}
 }
+
+// A key detached from a running sandbox is cleared in its guest and not
+// remembered; one detached while it is paused is remembered until then,
+// and only the most recent are.
+func TestIntegration_DetachedKeysAreBounded(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	sourceID, err := insertSandboxRow(ctx, teamID, "detach-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', ip_address = '192.0.2.11' WHERE id = $1`, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	secretID := seedSecret(t, teamID)
+	var secretName string
+	if err := testPool.QueryRow(ctx, `SELECT name FROM secret WHERE id = $1`, secretID).Scan(&secretName); err != nil {
+		t.Fatal(err)
+	}
+	r := newRouterWithSigner(t)
+	tombstones := func() int {
+		t.Helper()
+		var n int
+		if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_secret_detached WHERE sandbox_id = $1`, sourceID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	attachDetach := func(key string) {
+		t.Helper()
+		if w := do(r, "POST", "/sandboxes/"+sourceID.String()+"/secrets", apiKey, fmt.Sprintf(`{"env_key":%q,"secret_name":%q}`, key, secretName)); w.Code >= 300 {
+			t.Fatalf("attach %s: %d %s", key, w.Code, w.Body.String())
+		}
+		if w := do(r, "DELETE", "/sandboxes/"+sourceID.String()+"/secrets/"+key, apiKey, ""); w.Code != http.StatusNoContent {
+			t.Fatalf("detach %s: %d %s", key, w.Code, w.Body.String())
+		}
+	}
+	attachDetach("RUNNING_KEY")
+	if n := tombstones(); n != 0 {
+		t.Fatalf("tombstones after a detach the guest applied: %d; want none", n)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'paused' WHERE id = $1`, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	attachDetach("PAUSED_KEY")
+	if n := tombstones(); n != 1 {
+		t.Fatalf("tombstones after a detach from a paused sandbox: %d; want 1", n)
+	}
+	for i := 0; i < 70; i++ {
+		if err := testQueries.RecordDetachedSecretKey(ctx, db.RecordDetachedSecretKeyParams{SandboxID: sourceID, EnvKey: fmt.Sprintf("CHURN_%02d", i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := testQueries.PruneDetachedSecretKeys(ctx, db.PruneDetachedSecretKeysParams{SandboxID: sourceID, Keep: 64}); err != nil {
+		t.Fatal(err)
+	}
+	if n := tombstones(); n != 64 {
+		t.Fatalf("tombstones after churn: %d; want the 64 most recent", n)
+	}
+}

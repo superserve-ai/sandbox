@@ -54,6 +54,19 @@ func refuseDuringCapture(ctx context.Context, q *db.Queries, sandboxID uuid.UUID
 	return nil
 }
 
+// detachedKeysKept bounds a sandbox's detached keys. Past it the oldest
+// key's revoked token may survive into a fork, where it is inert.
+const detachedKeysKept = 64
+
+// recordDetachedKey remembers a key detached from the sandbox until its
+// guest is known to have dropped it.
+func recordDetachedKey(ctx context.Context, q *db.Queries, sandboxID uuid.UUID, envKey string) error {
+	if err := q.RecordDetachedSecretKey(ctx, db.RecordDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: envKey}); err != nil {
+		return err
+	}
+	return q.PruneDetachedSecretKeys(ctx, db.PruneDetachedSecretKeysParams{SandboxID: sandboxID, Keep: detachedKeysKept})
+}
+
 // undoAttach takes back a binding whose guest update failed, under the
 // secret-write lock like any binding change. It is not refused during a
 // capture, which may already have recorded the binding: that record is
@@ -69,7 +82,7 @@ func (h *Handlers) undoAttach(ctx context.Context, sandboxID uuid.UUID, envKey, 
 		if _, err := q.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sandboxID, EnvKey: envKey}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		if err := q.RecordDetachedSecretKey(ctx, db.RecordDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: envKey}); err != nil {
+		if err := recordDetachedKey(ctx, q, sandboxID, envKey); err != nil {
 			return err
 		}
 		if err := q.InsertRevokedProxyToken(ctx, db.InsertRevokedProxyTokenParams{
@@ -358,7 +371,7 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		if derr != nil {
 			return derr
 		}
-		if derr := q.RecordDetachedSecretKey(mutCtx, db.RecordDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: envKey}); derr != nil {
+		if derr := recordDetachedKey(mutCtx, q, sandboxID, envKey); derr != nil {
 			return derr
 		}
 		// A binding stored before tokens were persisted has no stored token to
@@ -399,14 +412,17 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		return
 	}
 
-	// Re-mint the reduced set for a running sandbox; a paused one re-mints on
-	// resume. Best-effort — the revocation above already enforces the detach, so a
-	// re-mint failure is not fatal.
+	// Re-mint the reduced set for a running sandbox, clearing the detached key
+	// from its guest; a paused one re-mints on resume. Best-effort — the
+	// revocation above already enforces the detach, so a re-mint failure is
+	// not fatal. Once the guest has dropped the key it need not be remembered.
 	if sandbox.Status == db.SandboxStatusActive {
 		if meta, lerr := h.loadSecretBindingMeta(ctx, sandboxID); lerr != nil {
 			log.Warn().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("load secret bindings after detach")
-		} else if aerr := h.applySecretBindings(ctx, sandbox, meta); aerr != nil {
+		} else if aerr := h.applySecretBindings(ctx, sandbox, meta, envKey); aerr != nil {
 			log.Warn().Err(aerr).Str("sandbox_id", sandboxID.String()).Msg("re-mint secret bindings after detach")
+		} else if ferr := h.DB.ForgetDetachedSecretKey(mutCtx, db.ForgetDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: envKey}); ferr != nil {
+			log.Warn().Err(ferr).Str("sandbox_id", sandboxID.String()).Msg("forget a detached key the guest dropped")
 		}
 	}
 
