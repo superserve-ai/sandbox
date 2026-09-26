@@ -3298,13 +3298,24 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		// Any non-empty error can leave a VM behind, so clean it up best-effort
 		// before deciding which failure mode to report.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
+		// A fork's private copies of the snapshot live in its snapshot
+		// directory, which destroy leaves; with no row to tear down later,
+		// they go now, once the VM holding them is gone.
+		destroy := func() {
+			_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+			if savedSnapshotID != "" {
+				if err := vmd.DeleteSandboxSnapshots(cleanupCtx, sandboxID.String()); err != nil && !isVMDNotFound(err) {
+					l.Warn().Err(err).Msg("remove a failed fork's copies of its snapshot")
+				}
+			}
+		}
 		if vmdErr != nil {
 			go func() {
 				defer cleanupCancel()
-				_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+				destroy()
 			}()
 		} else {
-			_ = vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
+			destroy()
 			cleanupCancel()
 		}
 	}
