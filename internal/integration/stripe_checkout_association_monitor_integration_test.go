@@ -1069,6 +1069,116 @@ FROM stripe_checkout_association_alert WHERE event_id = $1`, eventID).Scan(&leas
 	}
 }
 
+func TestIntegration_StripeAssociationRetryPreservesClaimAndCooldown(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)
+	eventID := "evt_" + uuid.NewString()
+	payload, err := json.Marshal(map[string]any{
+		"id": eventID, "type": "customer.subscription.created",
+		"data": map[string]any{"object": map[string]any{
+			"id": "sub_" + uuid.NewString(), "customer": "cus_" + uuid.NewString(),
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, last_error)
+VALUES ($1, 'customer.subscription.created', $2, $3, $4)`, eventID, payload, now.Add(-6*time.Minute), db.StripeCheckoutAssociationPendingError); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM stripe_webhook_event WHERE event_id = $1`, eventID)
+	})
+	h := api.NewHandlers(nil, testQueries, nil)
+	h.Pool = testPool
+	retry := func(at time.Time) {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, `UPDATE stripe_webhook_event SET last_error = 'transient processing failure' WHERE event_id = $1`, eventID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testPool.Exec(ctx, `UPDATE stripe_webhook_event SET last_error = $2, updated_at = $3 WHERE event_id = $1`,
+			eventID, db.StripeCheckoutAssociationPendingError, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	claimed := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.StripeCheckoutAssociationTick(ctx, now, db.StripeCheckoutAssociationCursor{}, func(a api.StripeAssociationAlert) error {
+			if a.EventID == eventID {
+				close(claimed)
+				<-release
+			}
+			return nil
+		})
+		done <- err
+	}()
+	select {
+	case <-claimed:
+	case err := <-done:
+		t.Fatalf("monitor ended before reporting: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("monitor did not claim the event")
+	}
+	retry(now.Add(time.Minute))
+	var leaseUntil *time.Time
+	var nextCheck time.Time
+	if err := testPool.QueryRow(ctx, `SELECT lease_until, next_check_at FROM stripe_checkout_association_alert WHERE event_id = $1`,
+		eventID).Scan(&leaseUntil, &nextCheck); err != nil {
+		t.Fatal(err)
+	}
+	if leaseUntil == nil || !leaseUntil.Equal(now.Add(2*time.Minute)) || !nextCheck.Equal(*leaseUntil) {
+		t.Fatalf("retry revoked active claim: lease=%v next_check=%s", leaseUntil, nextCheck)
+	}
+	var concurrentReports int
+	if _, err := h.StripeCheckoutAssociationTick(ctx, now.Add(time.Minute), db.StripeCheckoutAssociationCursor{}, func(a api.StripeAssociationAlert) error {
+		if a.EventID == eventID {
+			concurrentReports++
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if concurrentReports != 0 {
+		t.Fatalf("retry allowed %d concurrent reports", concurrentReports)
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("monitor did not finish its report")
+	}
+	retry(now.Add(2 * time.Minute))
+	var lastAlert *time.Time
+	if err := testPool.QueryRow(ctx, `SELECT lease_until, next_check_at, last_alert_at
+FROM stripe_checkout_association_alert WHERE event_id = $1`, eventID).Scan(&leaseUntil, &nextCheck, &lastAlert); err != nil {
+		t.Fatal(err)
+	}
+	if leaseUntil != nil || lastAlert == nil || !lastAlert.Equal(now) || !nextCheck.Equal(now.Add(30*time.Minute)) {
+		t.Fatalf("retry reset cooldown: lease=%v next_check=%s last_alert=%v", leaseUntil, nextCheck, lastAlert)
+	}
+	var repeated []string
+	for _, at := range []time.Time{now.Add(2 * time.Minute), now.Add(30 * time.Minute)} {
+		if _, err := h.StripeCheckoutAssociationTick(ctx, at, db.StripeCheckoutAssociationCursor{}, func(a api.StripeAssociationAlert) error {
+			if a.EventID == eventID {
+				repeated = append(repeated, a.EventID)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(repeated) != 1 || repeated[0] != eventID {
+		t.Fatalf("reports across cooldown = %v, want one at expiry", repeated)
+	}
+}
+
 func TestIntegration_StripeAssociationCandidateGraceAndClaims(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Add(time.Second).Truncate(time.Second)

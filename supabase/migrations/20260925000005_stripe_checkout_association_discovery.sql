@@ -35,7 +35,10 @@ BEGIN
         INSERT INTO stripe_checkout_association_alert(event_id, next_check_at)
         VALUES (NEW.event_id, NEW.received_at + interval '5 minutes')
         ON CONFLICT (event_id) DO UPDATE
-        SET lease_until = NULL, next_check_at = EXCLUDED.next_check_at;
+        SET next_check_at = GREATEST(
+            EXCLUDED.next_check_at,
+            COALESCE(stripe_checkout_association_alert.lease_until, '-infinity'::timestamptz),
+            COALESCE(stripe_checkout_association_alert.last_alert_at + interval '30 minutes', '-infinity'::timestamptz));
     END IF;
     RETURN NEW;
 END;
