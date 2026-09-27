@@ -98,6 +98,47 @@ func (h *Handlers) holdSecretWrites(ctx context.Context, sandboxID uuid.UUID) (*
 	return conn, release, nil
 }
 
+// secretWrites is one secret mutation's hold on the sandbox's secret-write
+// lock, its guest update included. Its queries run on the held connection
+// and nothing else touches the database until release: a second pooled
+// connection taken while holding one could wait on a pool the request
+// helps drain. Without a pool (unit tests) nothing is held.
+type secretWrites struct {
+	q       *db.Queries
+	held    *pgxpool.Conn
+	release func()
+}
+
+func (h *Handlers) beginSecretWrites(ctx context.Context, sandboxID uuid.UUID) (*secretWrites, error) {
+	w := &secretWrites{q: h.DB, release: func() {}}
+	if h.Pool == nil {
+		return w, nil
+	}
+	conn, rel, err := h.holdSecretWrites(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	var once sync.Once
+	w.held, w.q, w.release = conn, db.New(conn), func() { once.Do(rel) }
+	return w, nil
+}
+
+// inTx runs fn in one transaction on the held connection.
+func (w *secretWrites) inTx(ctx context.Context, fn func(*db.Queries) error) error {
+	if w.held == nil {
+		return fn(w.q)
+	}
+	tx, err := w.held.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := fn(db.New(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // undoAttach takes back a binding whose guest update failed, with the
 // attach's hold still in place, so no capture has recorded it. boxd may
 // have applied the env before the error, so the token is revoked and the
@@ -210,36 +251,13 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	// taken while holding one could wait on a pool this request helps drain.
 	// Resolved before the hold: resolving can itself need the database.
 	vmd, vmdErr := h.vmdForHost(ctx, sandbox.HostID)
-	var held *pgxpool.Conn
-	q := h.DB
-	release := func() {}
-	if h.Pool != nil {
-		conn, rel, lerr := h.holdSecretWrites(ctx, sandboxID)
-		if lerr != nil {
-			log.Error().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("hold the secret-write lock for attach")
-			respondError(c, ErrInternal)
-			return
-		}
-		var once sync.Once
-		release = func() { once.Do(rel) }
-		defer release()
-		held, q = conn, db.New(conn)
+	w, err := h.beginSecretWrites(ctx, sandboxID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("hold the secret-write lock for attach")
+		respondError(c, ErrInternal)
+		return
 	}
-	// inTx runs fn in one transaction on the held connection.
-	inTx := func(ctx context.Context, fn func(*db.Queries) error) error {
-		if held == nil {
-			return fn(h.DB)
-		}
-		tx, err := held.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx) //nolint:errcheck
-		if err := fn(db.New(tx)); err != nil {
-			return err
-		}
-		return tx.Commit(ctx)
-	}
+	defer w.release()
 	var liveSandbox db.Sandbox
 	insertBinding := func(q *db.Queries) error {
 		// Re-read status under the lock: a resume on another instance may have
@@ -289,7 +307,7 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 		return q.ForgetDetachedSecretKey(ctx, db.ForgetDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: req.EnvKey})
 	}
 
-	err = inTx(ctx, insertBinding)
+	err = w.inTx(ctx, insertBinding)
 	switch {
 	case errors.Is(err, errSnapshotInFlight):
 		respondSnapshotInFlight(c)
@@ -313,7 +331,7 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	// status read under the lock is authoritative. Fail closed: roll back the row
 	// if the proxy JWT can't be re-minted/injected.
 	if liveSandbox.Status == db.SandboxStatusActive {
-		meta, _, lerr := loadSecretBindingState(ctx, q, sandboxID)
+		meta, _, lerr := loadSecretBindingState(ctx, w.q, sandboxID)
 		if lerr == nil {
 			lerr = vmdErr
 		}
@@ -326,15 +344,15 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 			// its rollback, leaving the row behind after a 500.
 			rbCtx, rbCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer rbCancel()
-			if rerr := inTx(rbCtx, func(q *db.Queries) error { return undoAttach(rbCtx, q, sandboxID, req.EnvKey, token) }); rerr != nil {
+			if rerr := w.inTx(rbCtx, func(q *db.Queries) error { return undoAttach(rbCtx, q, sandboxID, req.EnvKey, token) }); rerr != nil {
 				log.Error().Err(rerr).Str("sandbox_id", sandboxID.String()).Msg("undo a failed secret attach")
 			}
-			release()
+			w.release()
 			respondError(c, ErrInternal)
 			return
 		}
 	}
-	release()
+	w.release()
 
 	h.logSandboxActivity(ctx, sandboxID, teamID, actorIDFromContext(c), "secret", "attached", "success", &sandbox.Name, nil, nil)
 	c.JSON(http.StatusCreated, gin.H{"env_key": req.EnvKey, "secret_name": req.SecretName})
@@ -390,14 +408,18 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 	mutCtx, mutCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer mutCancel()
 
+	// Held through the guest update and the detached key's cleanup below, so
+	// no other change to the sandbox's secrets lands between them.
+	vmd, vmdErr := h.vmdForHost(ctx, sandbox.HostID)
+	w, err := h.beginSecretWrites(ctx, sandboxID)
+	if err != nil {
+		log.Error().Err(err).Str("sandbox_id", sandboxID.String()).Msg("hold the secret-write lock for detach")
+		respondError(c, ErrInternal)
+		return
+	}
+	defer w.release()
+
 	deleteAndRevoke := func(q *db.Queries) error {
-		// A snapshot records the bindings under this lock, so this detach
-		// lands before its row or after it, never between.
-		if h.Pool != nil {
-			if lerr := q.LockSandboxForSecretWrites(mutCtx, sandboxID.String()); lerr != nil {
-				return lerr
-			}
-		}
 		// Re-read under the lock: a resume may have moved the sandbox on, and
 		// whether the guest is updated below follows the status now.
 		live, lerr := q.GetSandbox(mutCtx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
@@ -432,18 +454,7 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 		})
 	}
 
-	if h.Pool == nil {
-		// No pool (DBTX-mocked unit tests): run the two writes directly.
-		err = deleteAndRevoke(h.DB)
-	} else {
-		var tx pgx.Tx
-		if tx, err = h.Pool.Begin(mutCtx); err == nil {
-			defer tx.Rollback(mutCtx)
-			if err = deleteAndRevoke(h.DB.WithTx(tx)); err == nil {
-				err = tx.Commit(mutCtx)
-			}
-		}
-	}
+	err = w.inTx(mutCtx, deleteAndRevoke)
 	if err != nil {
 		if errors.Is(err, errSnapshotInFlight) {
 			respondSnapshotInFlight(c)
@@ -467,14 +478,17 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 	// revocation above already enforces the detach, so a re-mint failure is
 	// not fatal. Once the guest has dropped the key it need not be remembered.
 	if sandbox.Status == db.SandboxStatusActive {
-		if meta, lerr := h.loadSecretBindingMeta(ctx, sandboxID); lerr != nil {
+		if meta, _, lerr := loadSecretBindingState(ctx, w.q, sandboxID); lerr != nil {
 			log.Warn().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("load secret bindings after detach")
-		} else if aerr := h.applySecretBindings(ctx, sandbox, meta, envKey); aerr != nil {
+		} else if vmdErr != nil {
+			log.Warn().Err(vmdErr).Str("sandbox_id", sandboxID.String()).Msg("resolve vmd to re-mint secret bindings after detach")
+		} else if aerr := h.applySecretBindingsVia(ctx, vmd, sandbox, meta, envKey); aerr != nil {
 			log.Warn().Err(aerr).Str("sandbox_id", sandboxID.String()).Msg("re-mint secret bindings after detach")
-		} else if ferr := h.DB.ForgetDetachedSecretKey(mutCtx, db.ForgetDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: envKey}); ferr != nil {
+		} else if ferr := w.q.ForgetDetachedSecretKey(mutCtx, db.ForgetDetachedSecretKeyParams{SandboxID: sandboxID, EnvKey: envKey}); ferr != nil {
 			log.Warn().Err(ferr).Str("sandbox_id", sandboxID.String()).Msg("forget a detached key the guest dropped")
 		}
 	}
+	w.release()
 
 	h.logSandboxActivity(ctx, sandboxID, teamID, actorIDFromContext(c), "secret", "detached", "success", &sandbox.Name, nil, nil)
 	c.Status(http.StatusNoContent)

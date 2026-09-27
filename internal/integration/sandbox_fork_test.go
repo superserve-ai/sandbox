@@ -493,3 +493,56 @@ func TestIntegration_DetachedKeysAreBounded(t *testing.T) {
 		t.Fatalf("tombstones after churn: %d; want the 64 most recent", n)
 	}
 }
+
+// A detach takes the sandbox's secret-write lock for its whole run, guest
+// update and cleanup included: while another change holds it, the detach
+// neither changes the binding nor finishes.
+func TestIntegration_DetachWaitsOutAnotherSecretChange(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	sourceID, err := insertSandboxRow(ctx, teamID, "detach-hold")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET status = 'active', ip_address = '192.0.2.12' WHERE id = $1`, sourceID); err != nil {
+		t.Fatal(err)
+	}
+	secretID := seedSecret(t, teamID)
+	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: secretID, EnvKey: "TOKEN"}); err != nil {
+		t.Fatal(err)
+	}
+	r := newRouterWithSigner(t)
+
+	conn, err := testPool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	hq := db.New(conn)
+	if err := hq.HoldSandboxSecretWrites(ctx, sourceID.String()); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan int, 1)
+	go func() {
+		done <- do(r, "DELETE", "/sandboxes/"+sourceID.String()+"/secrets/TOKEN", apiKey, "").Code
+	}()
+	select {
+	case code := <-done:
+		t.Fatalf("detach finished (%d) while another change held the lock", code)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if bound, err := testQueries.ListSandboxSecretBindingMeta(ctx, sourceID); err != nil || len(bound) != 1 || bound[0].Detached {
+		t.Fatalf("bindings while the detach waits: %+v %v; want TOKEN still bound", bound, err)
+	}
+	if ok, err := hq.ReleaseSandboxSecretWrites(ctx, sourceID.String()); err != nil || !ok {
+		t.Fatalf("release: %v %v", ok, err)
+	}
+	if code := <-done; code != http.StatusNoContent {
+		t.Fatalf("detach after the lock was released: %d", code)
+	}
+	// Running: the guest dropped the key, so nothing is remembered.
+	var n int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_secret_detached WHERE sandbox_id = $1`, sourceID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("tombstones after the detach: %d %v", n, err)
+	}
+}
