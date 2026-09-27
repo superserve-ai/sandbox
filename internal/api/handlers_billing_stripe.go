@@ -2433,6 +2433,9 @@ func (h *Handlers) lockStripeWebhookAccountForProcessing(ctx context.Context, q 
 				if attempted {
 					return errors.New("Stripe promotion attempt requires recovery; retry webhook")
 				}
+				if derefString(lockedAccount.StripeActivationCreditReservationEventID) == event.ID {
+					return errors.New("Stripe promotion reservation requires recovery; retry webhook")
+				}
 			}
 		}
 		return err

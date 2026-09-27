@@ -992,20 +992,25 @@ func TestIntegration_StripePromotionReservationTimeoutRetriesWebhook(t *testing.
 }
 
 func TestIntegration_StripePromotionAuthorityFailureAllowsPaidActivation(t *testing.T) {
-	testStripePromotionAuthorityFailureAllowsPaidActivation(t, false, false)
+	testStripePromotionAuthorityFailureAllowsPaidActivation(t, false, false, false)
 }
 
 func TestIntegration_StripePromotionAuthorityFailureWithReservationAllowsPaidActivation(t *testing.T) {
-	testStripePromotionAuthorityFailureAllowsPaidActivation(t, true, false)
+	testStripePromotionAuthorityFailureAllowsPaidActivation(t, true, false, false)
 }
 
 func TestIntegration_StripePromotionAuthorityFailurePreservesAttemptedReservation(t *testing.T) {
-	testStripePromotionAuthorityFailureAllowsPaidActivation(t, true, true)
+	testStripePromotionAuthorityFailureAllowsPaidActivation(t, true, true, false)
 }
 
-func testStripePromotionAuthorityFailureAllowsPaidActivation(t *testing.T, reserved, attempted bool) {
+func TestIntegration_StripePromotionAuthorityFailurePreservesOwningEvent(t *testing.T) {
+	testStripePromotionAuthorityFailureAllowsPaidActivation(t, true, false, true)
+}
+
+func testStripePromotionAuthorityFailureAllowsPaidActivation(t *testing.T, reserved, attempted, owningEvent bool) {
 	ctx := context.Background()
 	teamID, _, userID := seedTeamAndKeyWithRole(t, "team_owner")
+	eventID := "evt_authority_unavailable_" + uuid.NewString()
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
 		VALUES ($1, $2, $3, 'incomplete')
@@ -1039,12 +1044,17 @@ func testStripePromotionAuthorityFailureAllowsPaidActivation(t *testing.T, reser
 				t.Fatal(err)
 			}
 		}
+		reservationEventID := "evt_prior_reservation"
+		if owningEvent {
+			reservationEventID = eventID
+		}
 		if _, err := testPool.Exec(ctx, `
 			UPDATE team_billing_account
 			SET stripe_activation_user_id=$2, stripe_activation_identity_key=$3,
-				stripe_activation_credit_reserved_at=now(), stripe_activation_credit_reservation_event_id='evt_prior_reservation'
+				stripe_activation_identity_evidence_version=capture_promotion_identity_evidence($2),
+				stripe_activation_credit_reserved_at=now(), stripe_activation_credit_reservation_event_id=$4
 			WHERE team_id=$1
-		`, teamID, userID, identity); err != nil {
+		`, teamID, userID, identity, reservationEventID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1071,35 +1081,77 @@ func testStripePromotionAuthorityFailureAllowsPaidActivation(t *testing.T, reser
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if _, err := testPool.Exec(context.Background(), `
+	authorityRestored := false
+	restoreAuthority := func() error {
+		_, err := testPool.Exec(context.Background(), `
 			INSERT INTO promotion_identity_enforcement (singleton, enabled, enabled_at, readiness_reference)
 			VALUES (true, $1, $2, $3)
-		`, canonicalEnabled, enabledAt, readinessReference); err != nil {
+		`, canonicalEnabled, enabledAt, readinessReference)
+		if err == nil {
+			authorityRestored = true
+		}
+		return err
+	}
+	t.Cleanup(func() {
+		if authorityRestored {
+			return
+		}
+		if err := restoreAuthority(); err != nil {
 			t.Errorf("restore canonical promotion authority: %v", err)
 		}
 	})
 
 	stripe := &fakeStripeClient{}
-	eventID := "evt_authority_unavailable_" + uuid.NewString()
-	response := sendStripeActivationWebhook(t, newBillingRouter(t, stripe), eventID, teamID, userID, time.Now().UTC().Truncate(time.Second))
-	if attempted {
+	router := newBillingRouter(t, stripe)
+	created := time.Now().UTC().Truncate(time.Second)
+	response := sendStripeActivationWebhook(t, router, eventID, teamID, userID, created)
+	if attempted || owningEvent {
 		if response.Code != http.StatusInternalServerError {
-			t.Fatalf("attempted promotion webhook: expected 500, got %d: %s", response.Code, response.Body.String())
+			t.Fatalf("reserved promotion webhook: expected 500, got %d: %s", response.Code, response.Body.String())
 		}
-		var processedAt *time.Time
-		if err := testPool.QueryRow(ctx, `SELECT processed_at FROM stripe_webhook_event WHERE event_id=$1`, eventID).Scan(&processedAt); err != nil || processedAt != nil {
-			t.Fatalf("attempted promotion event was processed: processed_at=%v err=%v", processedAt, err)
+		var processedAt, reservedAt *time.Time
+		var reservationEvent *string
+		if err := testPool.QueryRow(ctx, `
+			SELECT e.processed_at, a.stripe_activation_credit_reserved_at, a.stripe_activation_credit_reservation_event_id
+			FROM stripe_webhook_event e JOIN team_billing_account a ON a.team_id=$2 WHERE e.event_id=$1
+		`, eventID, teamID).Scan(&processedAt, &reservedAt, &reservationEvent); err != nil || processedAt != nil || reservedAt == nil {
+			t.Fatalf("reserved promotion event state: processed_at=%v reserved_at=%v err=%v", processedAt, reservedAt, err)
 		}
 		if len(stripe.creditGrantCalls) != 0 {
-			t.Fatal("attempted promotion was issued again")
+			t.Fatal("reserved promotion was issued without authority")
+		}
+		if owningEvent {
+			if reservationEvent == nil || *reservationEvent != eventID {
+				t.Fatalf("owning reservation changed: %v", reservationEvent)
+			}
+			if err := restoreAuthority(); err != nil {
+				t.Fatalf("restore canonical promotion authority: %v", err)
+			}
+			response = sendStripeActivationWebhook(t, router, eventID, teamID, userID, created)
+			if response.Code != http.StatusOK {
+				t.Fatalf("owning event recovery: expected 200, got %d: %s", response.Code, response.Body.String())
+			}
+			var grantID *string
+			if err := testPool.QueryRow(ctx, `
+				SELECT e.processed_at, a.stripe_activation_credit_grant_id
+				FROM stripe_webhook_event e JOIN team_billing_account a ON a.team_id=$2 WHERE e.event_id=$1
+			`, eventID, teamID).Scan(&processedAt, &grantID); err != nil || processedAt == nil || grantID == nil || len(stripe.creditGrantCalls) != 1 {
+				t.Fatalf("owning event did not settle after recovery: processed_at=%v grant_id=%v Stripe=%d err=%v", processedAt, grantID, len(stripe.creditGrantCalls), err)
+			}
+			var historyReconciled bool
+			if err := testPool.QueryRow(ctx, `
+				SELECT EXISTS(SELECT 1 FROM promotion_identity_history
+					WHERE team_id=$1 AND user_id=$2 AND promotion='stripe' AND status='reconciled')
+			`, teamID, userID).Scan(&historyReconciled); err != nil || !historyReconciled {
+				t.Fatalf("recovered legacy grant history was not reconciled: reconciled=%v err=%v", historyReconciled, err)
+			}
 		}
 		return
 	}
 	if response.Code != http.StatusOK {
 		t.Fatalf("paid activation webhook: expected 200, got %d: %s", response.Code, response.Body.String())
 	}
-	response = sendStripeActivationWebhook(t, newBillingRouter(t, stripe), eventID, teamID, userID, time.Now().UTC().Truncate(time.Second))
+	response = sendStripeActivationWebhook(t, router, eventID, teamID, userID, created)
 	if response.Code != http.StatusOK {
 		t.Fatalf("paid activation replay: expected 200, got %d: %s", response.Code, response.Body.String())
 	}
