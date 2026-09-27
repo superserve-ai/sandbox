@@ -4,7 +4,6 @@ package integration
 
 import (
 	"context"
-	"net/http"
 	"testing"
 	"time"
 
@@ -14,24 +13,15 @@ import (
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
-// seedPausedSandbox creates and pauses a sandbox through the API and waits
-// for the pause to finalize, so the row is claimable.
-func seedPausedSandbox(t *testing.T, apiKey string) uuid.UUID {
+// Seed through the database pause transitions so resume-query tests do not
+// depend on the HTTP pause worker's wall-clock lease budget.
+func seedPausedSandbox(t *testing.T, teamID uuid.UUID) uuid.UUID {
 	t.Helper()
-	r := newRouter(t)
-	cw := do(r, "POST", "/sandboxes", apiKey, `{"name":"claim-box"}`)
-	if cw.Code != http.StatusCreated {
-		t.Fatalf("create: %d %s", cw.Code, cw.Body.String())
-	}
-	sid := mustJSON(t, cw)["id"].(string)
-	pw := do(r, "POST", "/sandboxes/"+sid+"/pause", apiKey, "")
-	if pw.Code != http.StatusNoContent {
-		t.Fatalf("pause: %d %s", pw.Code, pw.Body.String())
-	}
-	waitBookkeeping()
-	id, err := uuid.Parse(sid)
-	if err != nil {
-		t.Fatalf("parse sandbox id %q: %v", sid, err)
+	id := seedActiveSandbox(t, teamID, "claim-box")
+	op := uuid.New()
+	claimed := claimPauseOp(t, id, teamID, op)
+	if err := finalize(id, teamID, op, claimed.PauseOpLeaseVersion); err != nil {
+		t.Fatalf("finalize pause: %v", err)
 	}
 	return id
 }
@@ -42,8 +32,8 @@ func seedPausedSandbox(t *testing.T, apiKey string) uuid.UUID {
 // handler tests cannot see this; only the planner can drop the lock call.
 func TestIntegration_ClaimResume_WaitsForAttachLock(t *testing.T) {
 	ctx := context.Background()
-	teamID, apiKey := seedTeamAndKey(t)
-	sandboxID := seedPausedSandbox(t, apiKey)
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := seedPausedSandbox(t, teamID)
 
 	holder, err := testPool.Begin(ctx)
 	if err != nil {
@@ -82,7 +72,7 @@ func TestIntegration_ClaimResume_WaitsForAttachLock(t *testing.T) {
 		if res.row.Sandbox.Status != db.SandboxStatusResuming {
 			t.Errorf("claimed status = %q, want resuming", res.row.Sandbox.Status)
 		}
-		if res.row.SnapPath == nil || *res.row.SnapPath != "/snapshots/disk.snap" {
+		if res.row.SnapPath == nil || *res.row.SnapPath != "/snapshots/vmstate.snap" {
 			t.Errorf("claimed snap_path = %v, want the paused snapshot's path", res.row.SnapPath)
 		}
 	case <-time.After(5 * time.Second):
@@ -95,8 +85,8 @@ func TestIntegration_ClaimResume_WaitsForAttachLock(t *testing.T) {
 // only.
 func TestIntegration_ClaimResume_HoldsAttachLock(t *testing.T) {
 	ctx := context.Background()
-	teamID, apiKey := seedTeamAndKey(t)
-	sandboxID := seedPausedSandbox(t, apiKey)
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := seedPausedSandbox(t, teamID)
 
 	tx, err := testPool.Begin(ctx)
 	if err != nil {
@@ -124,8 +114,8 @@ func TestIntegration_ClaimResume_HoldsAttachLock(t *testing.T) {
 // cannot postpone deletion.
 func TestIntegration_ClaimResume_LeavesDeadlineForRevert(t *testing.T) {
 	ctx := context.Background()
-	teamID, apiKey := seedTeamAndKey(t)
-	sandboxID := seedPausedSandbox(t, apiKey)
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := seedPausedSandbox(t, teamID)
 	if _, err := testPool.Exec(ctx,
 		`UPDATE sandbox SET auto_delete_at = now() - interval '1 hour' WHERE id = $1`, sandboxID,
 	); err != nil {
@@ -161,8 +151,8 @@ func TestIntegration_ClaimResume_LeavesDeadlineForRevert(t *testing.T) {
 // fresh one.
 func TestIntegration_RevertResumeToPaused_ArmsPatchedWindow(t *testing.T) {
 	ctx := context.Background()
-	teamID, apiKey := seedTeamAndKey(t)
-	sandboxID := seedPausedSandbox(t, apiKey)
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := seedPausedSandbox(t, teamID)
 
 	claimPatchRevert := func(patched *int32) {
 		t.Helper()
@@ -218,8 +208,8 @@ func TestIntegration_RevertResumeToPaused_ArmsPatchedWindow(t *testing.T) {
 // lands on the row: the two sides of the resume-time secrets reuse check.
 func TestIntegration_ClaimResume_CarriesSnapshotTimeAndSecretEnvRecord(t *testing.T) {
 	ctx := context.Background()
-	teamID, apiKey := seedTeamAndKey(t)
-	sandboxID := seedPausedSandbox(t, apiKey)
+	teamID, _ := seedTeamAndKey(t)
+	sandboxID := seedPausedSandbox(t, teamID)
 	var snapshotCreatedAt pgtype.Timestamptz
 	if err := testPool.QueryRow(ctx, `
 		SELECT s.created_at FROM snapshot s

@@ -2403,12 +2403,14 @@ func (h *Handlers) lockStripeWebhookAccountForProcessing(ctx context.Context, q 
 		}
 		authorityUnavailable := preReservation != nil && preReservation.AuthorityUnavailable &&
 			preReservation.EventID == event.ID && preReservation.TeamID == account.TeamID
+		promotionSettled := !account.StripeActivationCreditReservedAt.Valid &&
+			(derefString(account.StripeActivationCreditGrantID) != "" || account.StripeActivationCreditGrantedAt.Valid)
 		if authorityUnavailable {
 			// Keep the user fence while allowing billing to proceed without a promotion.
 			if err := q.LockStripePromotionUserForPaidActivation(ctx, preReservation.UserID); err != nil {
 				return err
 			}
-		} else if account.StripeActivationUserID.Valid {
+		} else if !promotionSettled && account.StripeActivationUserID.Valid {
 			if err := q.LockStripePromotion(ctx, db.LockStripePromotionParams{
 				TeamID: account.TeamID, UserID: uuid.UUID(account.StripeActivationUserID.Bytes),
 			}); err != nil {
@@ -2416,6 +2418,13 @@ func (h *Handlers) lockStripeWebhookAccountForProcessing(ctx context.Context, q 
 			}
 		}
 		lockedAccount, err := q.LockTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
+		if err == nil && promotionSettled {
+			// Settled grants need no policy lookup, but a pending attempt still needs its promotion locks.
+			if lockedAccount.StripeActivationCreditReservedAt.Valid ||
+				(derefString(lockedAccount.StripeActivationCreditGrantID) == "" && !lockedAccount.StripeActivationCreditGrantedAt.Valid) {
+				return errors.New("Stripe promotion settlement changed before paid activation; retry webhook")
+			}
+		}
 		if err == nil && authorityUnavailable {
 			if account.StripeActivationCreditReservedAt.Valid != lockedAccount.StripeActivationCreditReservedAt.Valid ||
 				account.StripeActivationUserID != lockedAccount.StripeActivationUserID ||
