@@ -475,7 +475,7 @@ func TestIntegration_PromotionGrantFunctionPrivileges(t *testing.T) {
 		END LOOP;
 	END $$;
 	ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon,authenticated`)
-	migration, err := os.ReadFile("../../supabase/migrations/20260926025127_enforce_promotion_device_grants.sql")
+	migration, err := os.ReadFile("../../supabase/migrations/20260927231112_enforce_promotion_device_grants.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

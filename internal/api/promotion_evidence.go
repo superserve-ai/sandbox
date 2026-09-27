@@ -228,15 +228,15 @@ func (h *Handlers) RegisterPromotionSignupDevice(c *gin.Context) {
 }
 
 func (h *Handlers) EvaluateSignupPromotion(c *gin.Context) {
-	if !promotionSource(c, h.Pool) {
-		return
-	}
 	var input promotionAccountRequest
-	if !decodePromotionRequest(c, &input) || !promotionAccountActor(c, input.UserID) {
+	if !decodePromotionRequest(c, &input) || !promotionAccountActor(c, input) {
 		return
 	}
 	if input.AttemptID != uuid.Nil {
 		respondErrorMsg(c, "invalid_request", "invalid promotion request", http.StatusBadRequest)
+		return
+	}
+	if !promotionSource(c, h.Pool) {
 		return
 	}
 	ctx, cancel := promotionContext(c)

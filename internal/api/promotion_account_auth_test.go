@@ -31,7 +31,7 @@ func TestPromotionAccountAssertions(t *testing.T) {
 	t.Setenv("INTERNAL_API_TOKEN", "internal-example-token")
 	user, otherUser, attempt := uuid.New(), uuid.New(), uuid.New()
 	now := time.Now()
-	for _, operation := range []string{"bind", "evidence", "register"} {
+	for _, operation := range []string{"bind", "evidence", "register", "signup-eligibility"} {
 		t.Run(operation, func(t *testing.T) {
 			for _, tc := range []struct {
 				name   string
@@ -121,6 +121,7 @@ func TestPromotionAccountAssertions(t *testing.T) {
 					account.POST("/bind", h.BindPromotionSignupAccount)
 					account.POST("/evidence", h.GetPromotionSignupAccountEvidence)
 					account.POST("/register", h.RegisterPromotionSignupDevice)
+					account.POST("/signup-eligibility", h.EvaluateSignupPromotion)
 					req := httptest.NewRequest(http.MethodPost, "/internal/promotion/account/"+operation, strings.NewReader(string(payload)))
 					// Matching caller-controlled fields must not override signed identity.
 					req.Header.Set("X-Actor-User-Id", body.UserID.String())

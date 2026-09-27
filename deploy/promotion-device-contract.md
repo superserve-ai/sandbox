@@ -48,10 +48,11 @@ malformed or non-Ed25519 private keys withhold account requests before transport
 
 The adapter signs an EdDSA JWT with `iss: promotion-auth-adapter`,
 `aud: promotion-account`, `sub: <Auth user UUID>`, `iat`, `exp`, and
-`operation: bind|evidence|register`. Both times are required, expiry must be
+`operation: bind|evidence|register|signup-eligibility|create-team`. Both times are required, expiry must be
 later than issue time and at most five minutes after it, and future-issued or
 expired assertions reject. For `bind`, also sign `attempt_id` from the
-server-owned signup flow; for the other operations omit it. The control plane
+server-owned signup flow; `create-team` uses the separate creation binding
+described below. For evidence, registration and eligibility snapshots omit it. The control plane
 verifies the signature, issuer, audience, time bounds, operation and exact
 subject/body match, plus the attempt/body match for binding, before database
 access. `X-Actor-User-Id` is required and must equal that verified subject and
@@ -289,3 +290,101 @@ Deploy the shared source and each regional schema before its Console producer
 and grant path integration. Verify initial East publication and later West
 publication independently. Keep enforcement off in a region until its canonical
 readiness, producer coverage, and every local grant writer have been verified.
+
+## Atomic team creation after registration failure
+
+`POST /internal/promotion/account/create-team` is the trusted Console boundary
+for initial regional team creation. Call it after the registration attempt,
+including when registration or its authority evaluation fails. Do not create the
+team through a separate insert in that failure case: previously accepted regional
+evidence could otherwise authorize a grant.
+
+The route requires the account bearer credential, matching `X-Actor-User-Id`,
+and an EdDSA account assertion as specified above, with `operation=create-team`.
+In addition to `sub`, sign `attempt_id`, `team_id`, `home_region`, and the required
+boolean `authority_unavailable`. The selected backend verifies every signed field
+against the request and requires `home_region` to equal its `SANDBOX_ID_REGION`,
+with the existing East (`use`) default where tagged sandbox IDs are not enabled.
+Production home regions are `use` and `usw`. `attempt_id` is a new server-generated creation attempt UUID,
+separate from the original signup-evidence attempt; `team_id` is a new
+server-generated team UUID. Neither UUID can be repurposed after acceptance.
+
+Request body:
+
+```json
+{
+  "user_id": "<verified Auth user UUID>",
+  "attempt_id": "<server-generated creation attempt UUID>",
+  "team_id": "<server-generated team UUID>",
+  "name": "example-team",
+  "home_region": "use",
+  "authority_unavailable": true
+}
+```
+
+Console derives the actor from its trusted signup result or verified login,
+retains the attempt and team IDs across retries, and derives the boolean only
+from its server-side registration/authority result. Never accept a browser
+eligibility flag or forward browser promotion credentials. Sign `true` for an
+unavailable or ambiguous authority result, even if a previous registration
+succeeded. Missing evidence alone follows the evidence-required policy; confirmed
+ownership denial follows the ordinary regional claim checks. Sign `false` after
+successful registration, including `owner_conflict`; the claim still checks all
+canonical, user, team and device rules. The signed boolean can only withhold
+credit; `false` never authorizes a grant by itself.
+
+The backend calls the service-role-only SQL function:
+
+```sql
+create_team_with_promotion_attempt(
+  p_attempt_id uuid, p_team_id uuid, p_user_id uuid,
+  p_name text, p_home_region text, p_authority_unavailable boolean
+) RETURNS TABLE(team_id uuid, outcome text, reason text)
+```
+
+The binding, team insert, existing signup claim, and result commit in one regional
+transaction. A signed unavailable decision records `promotion_ineligible` /
+`authority_unavailable` before saved evidence can grant credit. It consumes no
+user, canonical or device entitlement. Success returns HTTP 200 with `team_id`,
+`outcome`, and `reason`; Console then continues its existing membership/owner
+provisioning using that team ID. This endpoint does not grant membership, bypass
+independent signup restrictions, or activate billing.
+
+Exact retries return the original result, including the original `granted`
+outcome, without another grant. Renew an expired assertion with the same binding
+and boolean. A changed actor, team, attempt, region, name or decision is rejected;
+a new attempt cannot adopt an existing team. Bindings and results have no expiry
+and survive account/team deletion; replay never recreates a deleted team. A
+previously unavailable attempt stays at zero credit after authority recovers.
+Unrelated database/provisioning failures abort the transaction and retain normal
+retry behavior; a lost response requires retrying the exact request. Do not
+switch to an ordinary team insert or generate a replacement attempt on error.
+
+`signup-eligibility` also requires a signed account assertion, with that exact
+operation and no attempt ID. It remains a non-issuing snapshot and does not
+replace the atomic creation boundary.
+
+### Integration reference and validation handoff
+
+The authentication and migration prerequisite consumed locally is
+`258a404db647eb0a0855971f38b5e887344232a9` from public PR #579. The regional migration
+names follow that revision; the grant integration migrations follow the entire
+prerequisite chain. Do not apply both the superseded migration IDs and their
+renamed replacements. This is a pre-activation integration, not a deployed
+migration-history repair.
+
+The creation regression is `TestIntegration_TrustedTeamPromotionAttempt`, covering
+prior regional evidence plus a failed registration HTTP call, exact no-credit
+replay after registration recovers, successful registration/grant, and forged or
+mismatched inputs. `TestIntegration_PromotionPolicyContentionPreservesProvisioning`
+holds a real policy-row lock across explicit team creation and legacy owner
+assignment. `TestIntegration_TrustedTeamPromotionAttemptPrivilegesAndGrantFailure`
+checks RPC/table access and preservation of unrelated grant-error retries.
+These tests are authored; canonical execution after this change is pending.
+The earlier canonical pass predates this authentication reconciliation and does
+not prove Console signer interoperability. Before activation, record the exact
+validated backend reference and run the actual Console fixture producer and
+`TestPromotionAccountConsoleInterop`; the existing fixture covers bind/evidence/
+register only. Console must additionally implement and verify the creation call
+sequence and new signed fields above before this boundary is integrated end to
+end.

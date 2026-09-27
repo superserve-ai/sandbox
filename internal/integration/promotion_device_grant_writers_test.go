@@ -31,6 +31,7 @@ func TestIntegration_SignupPromotionEligibilityHTTP(t *testing.T) {
 
 	t.Setenv("PROMOTION_CAPTURE_TOKEN", "capture-example-token")
 	t.Setenv("PROMOTION_ACCOUNT_TOKEN", "account-example-token")
+	sign := promotionAssertionSigner(t)
 	router := api.SetupRouter(t.Context(), &api.Handlers{Pool: region}, nil)
 	request := func(token, actor, body string) *httptest.ResponseRecorder {
 		t.Helper()
@@ -39,6 +40,11 @@ func TestIntegration_SignupPromotionEligibilityHTTP(t *testing.T) {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
 		req.Header.Set("X-Actor-User-Id", actor)
+		subject := other
+		if actor == missing.String() {
+			subject = missing
+		}
+		req.Header.Set("X-Promotion-Account-Assertion", sign("signup-eligibility", subject, nil))
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 		return w
