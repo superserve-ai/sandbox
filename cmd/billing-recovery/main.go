@@ -1,6 +1,6 @@
 // Command billing-recovery audits incomplete Stripe activation state and, only
 // with an explicit target and -apply, reconciles one currently eligible team.
-// The default is read-only so a fleet audit cannot accidentally issue credit.
+// The default is read-only so a fleet audit cannot accidentally change billing.
 package main
 
 import (
@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -32,6 +31,7 @@ type billingAccount struct {
 	TrialEndedAt      *time.Time
 	CheckoutAt        *time.Time
 	CheckoutSessionID *string
+	UserPromotion     bool
 }
 
 type stripeSubscription struct {
@@ -239,25 +239,6 @@ func (c stripeClient) isVerifiedActivationGrant(grant stripeGrant, localGrantID,
 	return strings.TrimSpace(grant.Metadata[activationGrantIdentityMetadataKey]) == identity
 }
 
-func (c stripeClient) createGrant(ctx context.Context, customer, key, identity string) (string, error) {
-	form := url.Values{}
-	form.Set("customer", customer)
-	form.Set("category", "promotional")
-	form.Set("amount[type]", "monetary")
-	form.Set("amount[monetary][currency]", "usd")
-	form.Set("amount[monetary][value]", strconv.FormatInt(c.activationCreditCents(), 10))
-	form.Set("applicability_config[scope][price_type]", "metered")
-	form.Set("metadata["+activationGrantIdentityMetadataKey+"]", identity)
-	var grant stripeGrant
-	if err := c.request(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, key); err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(grant.ID) == "" {
-		return "", errors.New("Stripe credit grant response did not include an ID")
-	}
-	return grant.ID, nil
-}
-
 func main() {
 	var target string
 	var excluded string
@@ -340,11 +321,24 @@ func main() {
 	}
 }
 
+// User-scoped promotions must be reconciled by the webhook workflow, which
+// owns their durable reservations and settles both user and team entitlements.
+const recoveryUserPromotionSQL = `(stripe_activation_user_id IS NOT NULL
+        OR stripe_activation_credit_reserved_at IS NOT NULL
+        OR stripe_activation_credit_reservation_event_id IS NOT NULL
+        OR stripe_checkout_actor_id IS NOT NULL
+        OR stripe_checkout_actor_claimed_at IS NOT NULL
+        OR EXISTS (
+            SELECT 1 FROM user_promotion_entitlement u
+            WHERE u.stripe_redemption_team_id = team_billing_account.team_id
+               OR u.stripe_redemption_reserved_team_id = team_billing_account.team_id
+        ))`
+
 func loadAccounts(ctx context.Context, pool *pgxpool.Pool, target, after *uuid.UUID, batchSize int) ([]billingAccount, error) {
 	query := `SELECT team_id, stripe_customer_id, stripe_subscription_id,
         stripe_subscription_status, stripe_subscription_event_at,
         stripe_activation_credit_grant_id, trial_ended_at,
-        checkout_initializing_at, checkout_session_id
+        checkout_initializing_at, checkout_session_id, ` + recoveryUserPromotionSQL + `
  FROM team_billing_account
 	 WHERE (($1::uuid IS NOT NULL AND team_id = $1)
 	    OR ($1::uuid IS NULL
@@ -362,7 +356,7 @@ func loadAccounts(ctx context.Context, pool *pgxpool.Pool, target, after *uuid.U
 	var accounts []billingAccount
 	for rows.Next() {
 		var a billingAccount
-		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.EventAt, &a.GrantID, &a.TrialEndedAt, &a.CheckoutAt, &a.CheckoutSessionID); err != nil {
+		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.EventAt, &a.GrantID, &a.TrialEndedAt, &a.CheckoutAt, &a.CheckoutSessionID, &a.UserPromotion); err != nil {
 			return nil, err
 		}
 		accounts = append(accounts, a)
@@ -384,6 +378,10 @@ func auditAccount(ctx context.Context, pool *pgxpool.Pool, stripe stripeClient, 
 		if errors.Is(err, errRecoveryCheckoutUnverified) {
 			out["outcome"], out["reason"] = "skipped", "checkout_not_verified_complete"
 		}
+		return out
+	}
+	if account.UserPromotion {
+		out["outcome"], out["reason"] = "unresolved", "user_promotion_requires_webhook_reconciliation"
 		return out
 	}
 	if account.CustomerID == nil || account.SubscriptionID == nil || strings.TrimSpace(*account.CustomerID) == "" || strings.TrimSpace(*account.SubscriptionID) == "" {
@@ -442,15 +440,11 @@ func auditAccount(ctx context.Context, pool *pgxpool.Pool, stripe stripeClient, 
 		out["outcome"], out["reason"] = "unresolved", "activation_grant_identity_unverified"
 		return out
 	}
-	if grantID == "" && !apply {
-		out["outcome"], out["reason"] = "candidate", "active_subscription_without_activation_grant"
+	if grantID == "" {
+		out["outcome"], out["reason"] = "unresolved", "activation_grant_requires_webhook_reconciliation"
 		return out
 	}
 	if !apply {
-		if grantID == "" {
-			out["outcome"], out["reason"] = "candidate", "active_subscription_without_activation_grant"
-			return out
-		}
 		out["outcome"], out["reason"], out["grant_id"] = "candidate", "existing_stripe_grant_reconcile", grantID
 		return out
 	}
@@ -538,14 +532,17 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 	err = tx.QueryRow(ctx, `SELECT team_id, stripe_customer_id, stripe_subscription_id,
         stripe_subscription_status, stripe_subscription_event_at,
         stripe_activation_credit_grant_id, trial_ended_at,
-        checkout_initializing_at, checkout_session_id
+        checkout_initializing_at, checkout_session_id, `+recoveryUserPromotionSQL+`
         FROM team_billing_account WHERE team_id = $1 FOR UPDATE`, original.TeamID).
-		Scan(&current.TeamID, &current.CustomerID, &current.SubscriptionID, &current.Status, &current.EventAt, &current.GrantID, &current.TrialEndedAt, &current.CheckoutAt, &current.CheckoutSessionID)
+		Scan(&current.TeamID, &current.CustomerID, &current.SubscriptionID, &current.Status, &current.EventAt, &current.GrantID, &current.TrialEndedAt, &current.CheckoutAt, &current.CheckoutSessionID, &current.UserPromotion)
 	if err != nil {
 		return "", err
 	}
 	if !sameRecoveryBillingSnapshot(current, original) {
 		return "", errors.New("local billing association changed; rerun the audit")
+	}
+	if current.UserPromotion {
+		return "", errors.New("user promotion requires webhook reconciliation")
 	}
 	// A locked terminal projection is authoritative local evidence that this
 	// subscription must not be resurrected from an active Stripe snapshot.
@@ -573,15 +570,10 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 		return "", errors.New("a newer subscription event watermark is already present; rerun the audit")
 	}
 	if grantID == "" {
-		grantID, err = stripe.createGrant(ctx, *current.CustomerID, activationGrantIdentity(current.TeamID), activationGrantIdentity(current.TeamID))
-		if err != nil {
-			return "", err
-		}
+		return "", errors.New("missing activation grant requires webhook reconciliation")
 	}
-	// Stripe grant creation and the local transaction cannot be atomic. Verify
-	// both authorities once more before committing local activation, and bind a
-	// newly-created grant ID into the verification so eventual list changes are
-	// treated as a race rather than as permission to write stale state.
+	// Bind the verified grant ID into the final read so a change to the grant
+	// list cannot substitute a different grant before committing activation.
 	verificationAccount := current
 	verificationAccount.GrantID = &grantID
 	finalEvidence, err := revalidateStripeActivation(ctx, stripe, verificationAccount)
@@ -601,9 +593,9 @@ func applyVerifiedActivation(ctx context.Context, pool *pgxpool.Pool, stripe str
 	err = tx.QueryRow(ctx, `SELECT team_id, stripe_customer_id, stripe_subscription_id,
         stripe_subscription_status, stripe_subscription_event_at,
         stripe_activation_credit_grant_id, trial_ended_at,
-        checkout_initializing_at, checkout_session_id
+        checkout_initializing_at, checkout_session_id, `+recoveryUserPromotionSQL+`
         FROM team_billing_account WHERE team_id = $1 FOR UPDATE`, original.TeamID).
-		Scan(&latest.TeamID, &latest.CustomerID, &latest.SubscriptionID, &latest.Status, &latest.EventAt, &latest.GrantID, &latest.TrialEndedAt, &latest.CheckoutAt, &latest.CheckoutSessionID)
+		Scan(&latest.TeamID, &latest.CustomerID, &latest.SubscriptionID, &latest.Status, &latest.EventAt, &latest.GrantID, &latest.TrialEndedAt, &latest.CheckoutAt, &latest.CheckoutSessionID, &latest.UserPromotion)
 	if err != nil {
 		return "", err
 	}
@@ -670,6 +662,7 @@ func sameRecoveryBillingSnapshot(left, right billingAccount) bool {
 		deref(left.SubscriptionID) == deref(right.SubscriptionID) &&
 		deref(left.Status) == deref(right.Status) &&
 		deref(left.GrantID) == deref(right.GrantID) &&
+		left.UserPromotion == right.UserPromotion &&
 		sameTime(left.EventAt, right.EventAt) &&
 		sameTime(left.CheckoutAt, right.CheckoutAt) &&
 		deref(left.CheckoutSessionID) == deref(right.CheckoutSessionID)

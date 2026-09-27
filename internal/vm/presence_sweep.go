@@ -1,11 +1,10 @@
 package vm
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/presence"
 )
@@ -234,6 +233,30 @@ func (m *Manager) instanceBusyForSweep(vmID string, activeUnits map[string]bool)
 	return inst.Status != StatusPaused
 }
 
+// presenceSaveMark is a time no save leaves on a file: what the side-car is
+// stamped with before a diff save, so a rewrite shows as any other time.
+var presenceSaveMark = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// markPresenceForSave stamps the overlay's side-car ahead of a diff save,
+// so verifyPresenceRefreshed can tell a rewrite from a file the save never
+// touched, however the writer writes it and whatever the timestamp tick.
+// Zero when there is no side-car: any side-car after the save is then the
+// save's. An error when there is one that could not be stamped: then the
+// save's map cannot be proven its own.
+func markPresenceForSave(memPath string) (time.Time, error) {
+	sc := presence.SidecarPath(memPath)
+	if _, err := os.Stat(sc); err != nil {
+		if os.IsNotExist(err) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, fmt.Errorf("stat presence side-car: %w", err)
+	}
+	if err := os.Chtimes(sc, presenceSaveMark, presenceSaveMark); err != nil {
+		return time.Time{}, fmt.Errorf("mark presence side-car: %w", err)
+	}
+	return presenceSaveMark, nil
+}
+
 // verifyPresenceRefreshed guards a misordered deploy. A diff save through a
 // Firecracker that predates the presence side-car rewrites the overlay but
 // not the side-car, leaving a stale bitmap a NEWER Firecracker would later
@@ -242,25 +265,26 @@ func (m *Manager) instanceBusyForSweep(vmID string, activeUnits map[string]bool)
 // save: remove it and warn, converting the misorder into loud strict-mode
 // refusals (or a sound extent scan pre-convergence) instead of corruption.
 // No-op on correctly ordered deployments — the side-car-aware Firecracker
-// rewrites the file on every save.
-func (m *Manager) verifyPresenceRefreshed(memPath string, saveStart time.Time, log zerolog.Logger) {
+// rewrites the file on every save. A rewrite is told by the mark
+// markPresenceForSave left: any write, in place or by rename, leaves the
+// file with the time of the save instead. The clock itself is never
+// compared, since a small save finishes within one tick of the timestamps
+// a file gets. Returns nil only for a side-car shown to be this save's;
+// the error says why it is not, and a stale one is removed on the way.
+func (m *Manager) verifyPresenceRefreshed(memPath string, mark time.Time) error {
 	sc := presence.SidecarPath(memPath)
 	st, err := os.Stat(sc)
 	if os.IsNotExist(err) {
-		log.Warn().Str("path", sc).
-			Msg("presence side-car absent after diff save — Firecracker predates the side-car format; fix deploy ordering")
-		return
+		return fmt.Errorf("presence side-car absent after diff save at %s: Firecracker predates the side-car format; fix deploy ordering", sc)
 	}
 	if err != nil {
-		log.Warn().Err(err).Str("path", sc).Msg("presence side-car stat failed after diff save")
-		return
+		return fmt.Errorf("presence side-car stat after diff save: %w", err)
 	}
-	if st.ModTime().Before(saveStart) {
-		if rmErr := os.Remove(sc); rmErr != nil && !os.IsNotExist(rmErr) {
-			log.Warn().Err(rmErr).Str("path", sc).Msg("stale presence side-car removal failed")
-			return
-		}
-		log.Warn().Str("path", sc).
-			Msg("presence side-car not refreshed by this diff save — removed stale bitmap; Firecracker predates the side-car format, fix deploy ordering")
+	if mark.IsZero() || !st.ModTime().Equal(mark) {
+		return nil
 	}
+	if rmErr := os.Remove(sc); rmErr != nil && !os.IsNotExist(rmErr) {
+		return fmt.Errorf("presence side-car not refreshed by this diff save at %s and its stale bitmap could not be removed: %w", sc, rmErr)
+	}
+	return fmt.Errorf("presence side-car not refreshed by this diff save at %s; removed the stale bitmap: Firecracker predates the side-car format, fix deploy ordering", sc)
 }

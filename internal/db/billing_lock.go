@@ -16,7 +16,8 @@ SELECT team_id, stripe_customer_id, stripe_subscription_id,
        commercial_billing_anchor, cancel_at_period_end, created_at, updated_at,
        trial_ended_at, stripe_activation_credit_granted_at,
        stripe_activation_credit_grant_id, checkout_initializing_at,
-       checkout_session_id
+       checkout_session_id, checkout_subscription_id, checkout_completed_at, stripe_activation_user_id,
+       stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id
 FROM team_billing_account
 WHERE team_id = $1
 FOR UPDATE`
@@ -28,7 +29,8 @@ SELECT team_id, stripe_customer_id, stripe_subscription_id,
        commercial_billing_anchor, cancel_at_period_end, created_at, updated_at,
        trial_ended_at, stripe_activation_credit_granted_at,
        stripe_activation_credit_grant_id, checkout_initializing_at,
-       checkout_session_id
+       checkout_session_id, checkout_subscription_id, checkout_completed_at, stripe_activation_user_id,
+       stripe_activation_credit_reserved_at, stripe_activation_credit_reservation_event_id
 FROM team_billing_account
 WHERE stripe_customer_id = $1
 FOR UPDATE`
@@ -67,6 +69,11 @@ func scanTeamBillingAccount(row rowScanner) (TeamBillingAccount, error) {
 		&account.StripeActivationCreditGrantID,
 		&account.CheckoutInitializingAt,
 		&account.CheckoutSessionID,
+		&account.CheckoutSubscriptionID,
+		&account.CheckoutCompletedAt,
+		&account.StripeActivationUserID,
+		&account.StripeActivationCreditReservedAt,
+		&account.StripeActivationCreditReservationEventID,
 	); err != nil {
 		return TeamBillingAccount{}, err
 	}

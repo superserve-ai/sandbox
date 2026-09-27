@@ -29,6 +29,7 @@ func seedWarningWorkerTeam(t *testing.T) uuid.UUID {
 	sandbox := seedPrivatePreviewSandbox(t, team, testDefaultHostID, "warning-worker")
 	// Keep positive authoritative credit with enough recent spend to warn.
 	for _, sql := range []string{
+		`INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, created_at) SELECT $1, 1, 1, 'signup trial credit', now()-interval '3 hours' WHERE NOT EXISTS (SELECT 1 FROM team_credit_grant WHERE team_id = $1 AND reason = 'signup trial credit')`,
 		`UPDATE team_credit_grant SET amount_usd = 1, remaining_usd = 1, created_at = now()-interval '3 hours' WHERE team_id = $1 AND reason = 'signup trial credit'`,
 		`INSERT INTO sandbox_compute_billing_interval (sandbox_id, team_id, vcpu_count, memory_mib, started_at, ended_at, end_reason) VALUES ($2,$1,2,1024,now()-interval '2 hours',now()-interval '1 minute','paused')`,
 	} {

@@ -611,6 +611,7 @@ func mustCreateTeam(t *testing.T, ctx context.Context, name string) uuid.UUID {
 	if err != nil {
 		t.Fatalf("create team %s: %v", name, err)
 	}
+	seedHistoricalTeam(t, team.ID)
 	return team.ID
 }
 

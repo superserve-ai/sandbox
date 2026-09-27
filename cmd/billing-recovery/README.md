@@ -29,8 +29,12 @@ ownership, then re-locks and revalidates the local association before writing.
 The repair records a subscription-event watermark while holding that lock, so
 older delayed webhook deliveries cannot overwrite the recovered projection.
 Canceled, replaced, excluded, or uncertain accounts are reported and skipped.
-The command is repeatable: an existing verified $95 grant is reconciled
-locally, and a missing grant uses the same team-scoped Stripe idempotency key.
+The command is repeatable: an existing verified grant is reconciled
+locally when no user promotion or checkout actor is associated with the team.
+It does not create missing grants. An active subscription can legitimately
+have no grant when its activating user is ineligible or unknown. Missing grants
+and user promotion state are reported unresolved and require the normal
+webhook reconciliation workflow, which owns the user and team reservations.
 Grant evidence must also declare metered applicability. When the local grant ID
 is absent, recovery requires the team-scoped activation identity marker; a
 category/amount-only grant is reported unresolved rather than guessed.
@@ -53,8 +57,8 @@ and unproven pending sessions remain skipped. An expired session ID retained
 after its reservation was cleared does not block recovery of the existing
 subscription and is preserved. Stripe lookup failures are reported as unresolved.
 
-For an explicitly approved custom credit, use `-team <team-uuid>
+To reconcile an existing custom credit, use `-team <team-uuid>
 -activation-credit-cents <positive-usd-cents>` for both dry-run and apply.
 The default remains 9500 cents. A custom amount cannot be used for a fleet scan.
 Existing grants must match the requested amount and established identity;
-unverified promotional USD grants block creation rather than being ignored.
+unverified promotional USD grants leave recovery unresolved.

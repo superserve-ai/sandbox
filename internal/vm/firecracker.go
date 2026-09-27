@@ -449,12 +449,12 @@ func VMState(ctx context.Context, socketPath string) (string, error) {
 	return info.State, nil
 }
 
-func CreateDiffSnapshot(socketPath, snapshotPath, memPath, expectedSessionID string) error {
-	return CreateDiffSnapshotContext(context.Background(), socketPath, snapshotPath, memPath, expectedSessionID)
+func CreateDiffSnapshot(socketPath, snapshotPath, memPath, expectedSessionID string, expectedGeneration int64) error {
+	return CreateDiffSnapshotContext(context.Background(), socketPath, snapshotPath, memPath, expectedSessionID, expectedGeneration)
 }
 
 // CreateDiffSnapshotContext is CreateDiffSnapshot bounded by ctx.
-func CreateDiffSnapshotContext(ctx context.Context, socketPath, snapshotPath, memPath, expectedSessionID string) error {
+func CreateDiffSnapshotContext(ctx context.Context, socketPath, snapshotPath, memPath, expectedSessionID string, expectedGeneration int64) error {
 	fc := newFCClient(socketPath)
 
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
@@ -470,13 +470,13 @@ func CreateDiffSnapshotContext(ctx context.Context, socketPath, snapshotPath, me
 		SnapshotType: models.SnapshotCreateParamsSnapshotTypeDiff,
 	}
 	// Guarded diff: Firecracker compares the token against the session it
-	// installed at load time and rejects — before consuming the bitmap or
-	// touching memPath — unless it matches exactly. The expected generation is
-	// always 0: vmd arms a fresh session per FC run and the pause is that
-	// run's only guarded snapshot, so any prior consumption (an ad-hoc full
-	// snapshot) shows up as a bumped generation and a clean rejection.
+	// installed at load time, and the generation against the snapshots it has
+	// taken since, and rejects — before consuming the bitmap or touching
+	// memPath — unless both match. A capture of the running source takes a
+	// snapshot and advances the generation the record carries; anything else
+	// that consumed the bitmap shows up as a mismatch and a clean rejection.
 	if expectedSessionID != "" {
-		var gen int64
+		gen := expectedGeneration
 		body.ExpectedSessionID = expectedSessionID
 		body.ExpectedGeneration = &gen
 	}

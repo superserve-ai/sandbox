@@ -41,6 +41,7 @@ jobs:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: sandbox_test
+          POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
         ports:
           - 5432:5432
         options: >-
@@ -70,6 +71,16 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
         run: bash scripts/validate-billing.sh
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Verify promotion migrations through the deployment CLI
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/sandbox_test?sslmode=disable
+          SUPABASE_CLI_REGRESSION: '1'
+        run: go test -v -tags integration -count=1 -race -timeout 10m ./internal/integration/ -run '^TestPromotionMigrationsSupabaseCLI$'
 
       - name: Run integration tests
         env:

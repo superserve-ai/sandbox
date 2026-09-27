@@ -81,7 +81,7 @@ func isDiffRequest(body string) bool { return strings.Contains(body, `"snapshot_
 // sends — serializes instead of being dropped as a zero value.
 func TestGuardedSnapshotFieldsSerialize(t *testing.T) {
 	fc := startSnapshotAPIFake(t, nil)
-	if err := CreateDiffSnapshot(fc.socketPath, "/tmp/snap", "/tmp/mem", "tok-1"); err != nil {
+	if err := CreateDiffSnapshot(fc.socketPath, "/tmp/snap", "/tmp/mem", "tok-1", 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := RestoreSnapshotUffdInternalWithOverrides(
@@ -90,12 +90,19 @@ func TestGuardedSnapshotFieldsSerialize(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if err := CreateDiffSnapshot(fc.socketPath, "/tmp/snap", "/tmp/mem", ""); err != nil {
+	if err := CreateDiffSnapshot(fc.socketPath, "/tmp/snap", "/tmp/mem", "", 0); err != nil {
+		t.Fatal(err)
+	}
+	// A source captured while running has moved the generation on.
+	if err := CreateDiffSnapshot(fc.socketPath, "/tmp/snap", "/tmp/mem", "tok-3", 3); err != nil {
 		t.Fatal(err)
 	}
 	bodies := fc.snapshotBodies()
-	if len(bodies) != 3 {
-		t.Fatalf("got %d snapshot requests, want 3", len(bodies))
+	if len(bodies) != 4 {
+		t.Fatalf("got %d snapshot requests, want 4", len(bodies))
+	}
+	if !strings.Contains(bodies[3], `"expected_generation":3`) {
+		t.Fatalf("the generation is not what the caller named: %s", bodies[3])
 	}
 	for _, want := range []string{`"expected_session_id":"tok-1"`, `"expected_generation":0`} {
 		if !strings.Contains(bodies[0], want) {
@@ -656,5 +663,34 @@ func TestRestoreForResume_RunsTheHookBeforeTheLegacyRetry(t *testing.T) {
 	}
 	if n := len(fc2.snapshotBodies()); n != 1 {
 		t.Fatalf("the legacy retry ran after a failed hook: %d requests", n)
+	}
+}
+
+// A Firecracker that leaves the presence side-car as it was does not get
+// its layered image published: the pause takes a Full instead and strands
+// the overlay, as the mismatch fallback does.
+func TestPauseVM_UnrefreshedPresenceMapFallsBackToFull(t *testing.T) {
+	fc := startSnapshotAPIFake(t, nil)
+	m, inst, dir, overlay := layeredPauseFixture(t, fc)
+	if err := presence.Write(overlay, 4096, 4, []uint64{0b0001}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, memPath, _, err := m.PauseVM(context.Background(), "vm-1", dir, "tok-test")
+	if err != nil {
+		t.Fatalf("pause must succeed via the Full fallback: %v", err)
+	}
+	if memPath != filepath.Join(dir, "mem.snap") {
+		t.Fatalf("an unproven layered image was published: %s", memPath)
+	}
+	bodies := fc.snapshotBodies()
+	if len(bodies) != 2 || !isDiffRequest(bodies[0]) || isDiffRequest(bodies[1]) {
+		t.Fatalf("want a Diff then a Full, got %v", bodies)
+	}
+	inst.mu.RLock()
+	base, stranded := inst.BaseMemPath, append([]string(nil), inst.StrandedOverlays...)
+	inst.mu.RUnlock()
+	if base != "" || len(stranded) != 1 || stranded[0] != overlay {
+		t.Fatalf("Full fallback not recorded as standalone with the overlay stranded: base=%q stranded=%v", base, stranded)
 	}
 }

@@ -208,6 +208,10 @@ type VMRecord struct {
 	// correctness boundary, so a stale value costs one rejected RPC and a Full
 	// pause, never a corrupt overlay.
 	DirtyTrackingSessionID string `json:"dirty_tracking_session_id,omitempty"`
+	// How many snapshots Firecracker has taken of that session's bitmap: a
+	// capture of the running source takes one, and the next guarded pause
+	// must name the count or is rejected and degrades to Full.
+	DirtyTrackingGeneration int64 `json:"dirty_tracking_generation,omitempty"`
 	// CorrectsWallClock records whether this guest fixes its own wall clock on
 	// wake. Persisted because it is a property of the running guest, not of this
 	// daemon: without it a reattached VM would look incapable after a restart and
@@ -941,6 +945,7 @@ func toRecordLocked(inst *VMInstance) VMRecord {
 		BaseMemPath:                inst.BaseMemPath,
 		StrandedOverlays:           append([]string(nil), inst.StrandedOverlays...),
 		DirtyTrackingSessionID:     inst.DirtyTrackingSessionID,
+		DirtyTrackingGeneration:    inst.DirtyTrackingGeneration,
 		CorrectsWallClock:          inst.CorrectsWallClock,
 		ArtifactID:                 inst.ArtifactID,
 		SnapshotWorkloadFrozen:     inst.SnapshotWorkloadFrozen,
@@ -1024,28 +1029,29 @@ func toInstance(rec VMRecord) *VMInstance {
 	ports := previewPortsFromRecord(rec.PreviewPorts, rec.PreviewPortAccess, rec.PreviewPortTokenVersions)
 	ports, tokenPolicyRevision := normalizePreviewTokenPolicy(ports, rec.PreviewPolicyRevision, rec.PreviewTokenPolicyRevision)
 	return &VMInstance{
-		ID:                     rec.ID,
-		PID:                    rec.PID,
-		SocketPath:             rec.SocketPath,
-		VsockPath:              rec.VsockPath,
-		IP:                     rec.IP,
-		TAPDevice:              rec.TAPDevice,
-		MACAddress:             rec.MACAddress,
-		Status:                 rec.Status,
-		Unverified:             rec.Unverified,
-		RevivalPending:         rec.RevivalPending,
-		RevivedDisk:            rec.RevivedDisk,
-		BackupGeneration:       rec.BackupGeneration,
-		TeardownPending:        rec.TeardownPending,
-		RunDirID:               rec.RunDirID,
-		Namespace:              rec.Namespace,
-		DiskPath:               rec.DiskPath,
-		SnapshotPath:           rec.SnapshotPath,
-		MemFilePath:            rec.MemFilePath,
-		SourceSnapshotID:       rec.SourceSnapshotID,
-		BaseMemPath:            rec.BaseMemPath,
-		StrandedOverlays:       append([]string(nil), rec.StrandedOverlays...),
-		DirtyTrackingSessionID: rec.DirtyTrackingSessionID,
+		ID:                      rec.ID,
+		PID:                     rec.PID,
+		SocketPath:              rec.SocketPath,
+		VsockPath:               rec.VsockPath,
+		IP:                      rec.IP,
+		TAPDevice:               rec.TAPDevice,
+		MACAddress:              rec.MACAddress,
+		Status:                  rec.Status,
+		Unverified:              rec.Unverified,
+		RevivalPending:          rec.RevivalPending,
+		RevivedDisk:             rec.RevivedDisk,
+		BackupGeneration:        rec.BackupGeneration,
+		TeardownPending:         rec.TeardownPending,
+		RunDirID:                rec.RunDirID,
+		Namespace:               rec.Namespace,
+		DiskPath:                rec.DiskPath,
+		SnapshotPath:            rec.SnapshotPath,
+		MemFilePath:             rec.MemFilePath,
+		SourceSnapshotID:        rec.SourceSnapshotID,
+		BaseMemPath:             rec.BaseMemPath,
+		StrandedOverlays:        append([]string(nil), rec.StrandedOverlays...),
+		DirtyTrackingSessionID:  rec.DirtyTrackingSessionID,
+		DirtyTrackingGeneration: rec.DirtyTrackingGeneration,
 		// Optimistic re-arm for an adopted running VM: the surviving FC's
 		// bitmap is intact, and the pause-time token check is the correctness
 		// boundary — if anything consumed the bitmap since the session was

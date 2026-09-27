@@ -45,8 +45,9 @@
 //     source cell: they are append-only audit history (audit_logs even
 //     blocks deletes with a trigger) and are host/cell-scoped.
 //
-// The DB URLs must belong to a role that bypasses RLS (service role /
-// postgres), like every other control-plane process.
+// The DB URLs must bypass RLS. With canonical promotions, destination copy,
+// detach and purge additionally require an administrator credential permitted
+// to preserve promotion history; the application service role is insufficient.
 package main
 
 import (
