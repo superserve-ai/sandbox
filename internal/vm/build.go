@@ -322,8 +322,8 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 	}
 	populateBuildAllocations(result)
 
-	// Best-effort: a missing access.log just means sandboxes fall back
-	// to sequential prefetch. The "build-" prefix must remain so isBuildVM
+	// Best-effort: a missing access.log just means sandboxes restore
+	// without prefetch. The "build-" prefix must remain so isBuildVM
 	// skips persistence + reconciler for this throwaway VM.
 	if m.cfg.UffdEnabled && m.cfg.UffdPrefetchEnabled {
 		recordingVMID := "build-record-" + req.TemplateID
@@ -340,7 +340,7 @@ func (m *Manager) buildTemplateSync(ctx context.Context, buildVMID string, req B
 			DeltaDir:  snapshotDir,
 		}
 		if recErr := m.RecordAccessPattern(ctx, recordingVMID, result.SnapshotPath, result.MemFilePath, accessLogPath, recCfg, nil); recErr != nil {
-			log.Warn().Err(recErr).Msg("access-pattern recording failed (sandbox will fall back to sequential prefetch)")
+			log.Warn().Err(recErr).Msg("access-pattern recording failed (sandboxes will restore without prefetch)")
 		}
 	}
 

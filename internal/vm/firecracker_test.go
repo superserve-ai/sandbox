@@ -204,7 +204,7 @@ func TestRestoreSnapshot_AbortOnHandlerDeathInJSONBody(t *testing.T) {
 
 			if err := RestoreSnapshotUffdInternalWithOverrides(
 				socketPath, "/tmp/snap", "/tmp/mem", "", "", "", "eth0", "tap0", "",
-				false, tc.abort, "", nil,
+				false, tc.abort, false, "", nil,
 			); err != nil {
 				t.Fatalf("RestoreSnapshotUffdInternalWithOverrides: %v", err)
 			}
@@ -294,7 +294,7 @@ func TestRestoreSnapshot_ClockRealtimeInJSONBody(t *testing.T) {
 
 			if err := RestoreSnapshotUffdInternalWithOverrides(
 				socketPath, "/tmp/snap", "/tmp/mem", "", "", "", "eth0", "tap0", "",
-				false, false, "", tc.policy,
+				false, false, false, "", tc.policy,
 			); err != nil {
 				t.Fatalf("RestoreSnapshotUffdInternalWithOverrides: %v", err)
 			}

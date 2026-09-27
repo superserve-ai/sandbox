@@ -382,6 +382,12 @@ type ManagerConfig struct {
 	// rather than hanging silently. Independent of the snapshot flags. Default false.
 	HandlerDeathAbortEnabled bool
 
+	// ForkEagerOverlayEnabled has a fork's restore ask Firecracker to copy the
+	// snapshot's pages into the guest in the background instead of faulting
+	// them in one at a time. Takes effect only once the binary advertises it.
+	// Default false.
+	ForkEagerOverlayEnabled bool
+
 	// GuestFreezeBudget bounds the pause-side wait for a guest to stop its
 	// workload before a frozen-clock snapshot. Zero means the default.
 	GuestFreezeBudget time.Duration
@@ -798,6 +804,8 @@ type Manager struct {
 	// dirtyTrackingSessionCapable is the same probe for the guarded-session
 	// fields, demoted on the first refusal exactly like the clock flag.
 	dirtyTrackingSessionCapable atomic.Bool
+	// eagerOverlayCapable is the same probe for mem_backend.eager_overlay.
+	eagerOverlayCapable atomic.Bool
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -2931,7 +2939,7 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 		return m.restoreWithClockFallback(clockPolicy, beforeLegacy, func(clock *bool) error {
 			return RestoreSnapshotUffdInternalWithOverrides(
 				socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
-				m.cfg.HandlerDeathAbortEnabled, sid, clock,
+				m.cfg.HandlerDeathAbortEnabled, false, sid, clock,
 			)
 		})
 	})
@@ -4135,13 +4143,18 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				inst.mu.Unlock()
 			}
 			if attemptErr == nil {
+				// Only a fork pre-copies: its overlay is what it will read, and
+				// its per-fork copy starts cold on every restore.
+				eager := plan.action == restoreMaterializeFork && hasSidecar && m.eagerOverlayEnabled(memPSI, ioPSI)
 				var armed string
 				armed, restoreClockFrozen, attemptErr = m.restoreWithSessionFallback(trackingSessionID, func(sid string) (bool, error) {
 					return m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
-						return RestoreSnapshotUffdInternalWithOverrides(
-							socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
-							m.cfg.HandlerDeathAbortEnabled, sid, clock,
-						)
+						return m.restoreWithEagerOverlayFallback(eager, func(eager bool) error {
+							return RestoreSnapshotUffdInternalWithOverrides(
+								socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+								m.cfg.HandlerDeathAbortEnabled, eager, sid, clock,
+							)
+						})
 					})
 				})
 				if armed != trackingSessionID {
@@ -7897,10 +7910,10 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 	switch {
 	case !exists:
 		m.log.Warn().Str("template_vm", vmID).Str("path", outputPath).
-			Msg("recorder produced no access log; restores will fall back to sequential prefetch")
+			Msg("recorder produced no access log; restores will run without prefetch")
 	case pages == 0:
 		m.log.Warn().Str("template_vm", vmID).Str("path", outputPath).
-			Msg("recorder produced an empty access log; restores will fall back to sequential prefetch")
+			Msg("recorder produced an empty access log; restores will run without prefetch")
 	default:
 		m.log.Info().Str("template_vm", vmID).Str("path", outputPath).Int("pages", pages).
 			Msg("access pattern recorded")

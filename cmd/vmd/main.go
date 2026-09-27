@@ -810,6 +810,7 @@ func main() {
 	// once the binary advertises the capability, and a rollback degrades to
 	// the unguarded behavior. Off is exactly today's behavior.
 	dirtyTrackingSessionEnabled := envOrDefault("VMD_DIRTY_TRACKING_SESSION", "false") == "true"
+	forkEagerOverlayEnabled := envOrDefault("VMD_FORK_EAGER_OVERLAY", "false") == "true"
 	handlerDeathAbortEnabled := envOrDefault("VMD_HANDLER_DEATH_ABORT", "false") == "true"
 	// Off by default: it only does anything for a snapshot whose guest corrects
 	// its own wall clock, and forcing legacy is the way back if one misbehaves.
@@ -1001,6 +1002,7 @@ func main() {
 		VerifySnapshotEnabled:               verifySnapshotEnabled,
 		IncrementalSnapshotEnabled:          incrementalSnapshotEnabled,
 		DirtyTrackingSessionEnabled:         dirtyTrackingSessionEnabled,
+		ForkEagerOverlayEnabled:             forkEagerOverlayEnabled,
 		HandlerDeathAbortEnabled:            handlerDeathAbortEnabled,
 		GuestClockFreezeEnabled:             guestClockFreezeEnabled,
 		TemplateFreezeWorkload:              templateFreezeWorkload,
