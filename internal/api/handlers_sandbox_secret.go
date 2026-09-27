@@ -208,6 +208,8 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	// Everything under the hold runs on the held connection, and the hold ends
 	// before anything else touches the database: a second pooled connection
 	// taken while holding one could wait on a pool this request helps drain.
+	// Resolved before the hold: resolving can itself need the database.
+	vmd, vmdErr := h.vmdForHost(ctx, sandbox.HostID)
 	var held *pgxpool.Conn
 	q := h.DB
 	release := func() {}
@@ -313,7 +315,10 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	if liveSandbox.Status == db.SandboxStatusActive {
 		meta, _, lerr := loadSecretBindingState(ctx, q, sandboxID)
 		if lerr == nil {
-			lerr = h.applySecretBindings(ctx, liveSandbox, meta)
+			lerr = vmdErr
+		}
+		if lerr == nil {
+			lerr = h.applySecretBindingsVia(ctx, vmd, liveSandbox, meta)
 		}
 		if lerr != nil {
 			log.Error().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("apply secret bindings on attach")

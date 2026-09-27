@@ -1262,7 +1262,14 @@ func (h *Handlers) applySecretBindings(ctx context.Context, sandbox db.Sandbox, 
 	if err != nil {
 		return fmt.Errorf("resolve vmd for host: %w", err)
 	}
+	return h.applySecretBindingsVia(ctx, vmd, sandbox, meta, clear...)
+}
+
+// applySecretBindingsVia is applySecretBindings through a daemon client the
+// caller resolved.
+func (h *Handlers) applySecretBindingsVia(ctx context.Context, vmd VMDClient, sandbox db.Sandbox, meta []SecretBindingMeta, clear ...string) error {
 	var jwt string
+	var err error
 	if len(meta) > 0 {
 		sourceIP := ""
 		if sandbox.IpAddress != nil {

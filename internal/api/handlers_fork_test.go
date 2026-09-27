@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -303,8 +305,8 @@ func TestCreateSandbox_FromSnapshotRefusals(t *testing.T) {
 			if errObj, _ := parseJSON(t, w)["error"].(map[string]any); errObj["code"] != tc.wantCode {
 				t.Errorf("error code = %v, want %s", errObj["code"], tc.wantCode)
 			}
-			if tc.insert != nil && !destroyed {
-				t.Error("the VM booted for a snapshot deleted mid-create was not destroyed")
+			if destroyed {
+				t.Error("a fork refused before it booted had a VM to destroy")
 			}
 		})
 	}
@@ -483,10 +485,9 @@ func TestCreateSandbox_FromSnapshotClearsProxySettingsTheRecordMissed(t *testing
 	}
 }
 
-// A fork whose row could not be written leaves nothing on the host: the VM
-// is destroyed and then its copies of the snapshot are removed, which
-// destroy alone leaves behind.
-func TestCreateSandbox_FromSnapshotRemovesItsCopiesWhenTheInsertFails(t *testing.T) {
+// A fork is admitted before it runs: one its insert refuses is never
+// booted, so its captured workload never resumes.
+func TestCreateSandbox_FromSnapshotRefusedAtInsertNeverRuns(t *testing.T) {
 	teamID := uuid.New()
 	snap := readySnapshotFixture(teamID)
 	mock := &mockDBTX{
@@ -505,14 +506,14 @@ func TestCreateSandbox_FromSnapshotRemovesItsCopiesWhenTheInsertFails(t *testing
 			return pgconn.NewCommandTag("UPDATE 1"), nil
 		},
 	}
-	var order []string
+	var restored, destroyed bool
 	vmd := &stubVMD{
-		destroyFn: func(context.Context, string, bool) error {
-			order = append(order, "destroy")
-			return nil
+		restoreFn: func(context.Context, string, string, string) (string, error) {
+			restored = true
+			return "10.0.0.7", nil
 		},
-		deleteSnapsFn: func(_ context.Context, id string) error {
-			order = append(order, "delete-snapshots")
+		destroyFn: func(context.Context, string, bool) error {
+			destroyed = true
 			return nil
 		},
 	}
@@ -522,45 +523,81 @@ func TestCreateSandbox_FromSnapshotRemovesItsCopiesWhenTheInsertFails(t *testing
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d; want 429: %s", w.Code, w.Body.String())
 	}
-	if len(order) != 2 || order[0] != "destroy" || order[1] != "delete-snapshots" {
-		t.Fatalf("cleanup = %v; want the VM destroyed, then its snapshot copies removed", order)
+	if restored || destroyed {
+		t.Fatalf("restored = %v destroyed = %v; a refused fork never boots", restored, destroyed)
 	}
 }
 
-// A destroy that failed may leave the VM running on its copies, so they
-// are left for the orphan's reclaim rather than removed from under it.
-func TestCreateSandbox_FromSnapshotKeepsItsCopiesWhenTheDestroyFails(t *testing.T) {
-	teamID := uuid.New()
-	snap := readySnapshotFixture(teamID)
-	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			switch {
-			case strings.Contains(sql, "-- name: GetSandboxSnapshot :one"):
-				return sandboxSnapshotRow(snap)
-			case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
-				return scalarBoolRow(true)
-			case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
-				return errorRow(&pgconn.PgError{Code: "SS001", Message: "sandbox quota exceeded"})
+// A fork whose boot failed has its VM destroyed and then its copies of the
+// snapshot removed, which destroy alone leaves; a destroy that failed may
+// leave the VM running on them, so they are kept for the orphan's reclaim.
+func TestCreateSandbox_FromSnapshotCleansUpAFailedBoot(t *testing.T) {
+	for _, destroyFails := range []bool{false, true} {
+		teamID := uuid.New()
+		snap := readySnapshotFixture(teamID)
+		mock := &mockDBTX{
+			queryRowFn: func(_ context.Context, sql string, args ...any) pgx.Row {
+				switch {
+				case strings.Contains(sql, "-- name: GetSandboxSnapshot :one"):
+					return sandboxSnapshotRow(snap)
+				case strings.Contains(sql, "-- name: HostHasCapabilitiesUnlocked :one"):
+					return scalarBoolRow(true)
+				case strings.Contains(sql, "-- name: CreateSandboxFromSnapshot :one"):
+					return sandboxRow(db.Sandbox{ID: args[2].(uuid.UUID), TeamID: teamID, Name: "fork", Status: db.SandboxStatusStarting})
+				}
+				return activityRow()
+			},
+			execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			},
+		}
+		var mu sync.Mutex
+		var order []string
+		note := func(step string) {
+			mu.Lock()
+			order = append(order, step)
+			mu.Unlock()
+		}
+		vmd := &stubVMD{
+			restoreFn: func(context.Context, string, string, string) (string, error) {
+				return "", errors.New("launch failed")
+			},
+			destroyFn: func(context.Context, string, bool) error {
+				note("destroy")
+				if destroyFails {
+					return errors.New("vmd unavailable")
+				}
+				return nil
+			},
+			deleteSnapsFn: func(context.Context, string) error {
+				note("delete-snapshots")
+				return nil
+			},
+		}
+		h := &Handlers{VMD: vmd, DB: db.New(mock)}
+		w := httptest.NewRecorder()
+		setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(fmt.Sprintf(`{"name":"fork","from_snapshot":%q}`, snap.ID)))
+		h.WaitAsyncBookkeeping()
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			mu.Lock()
+			n := len(order)
+			mu.Unlock()
+			if n >= 2 || (destroyFails && n >= 1) || time.Now().After(deadline) {
+				break
 			}
-			return notFoundRow()
-		},
-		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		},
-	}
-	var removed bool
-	vmd := &stubVMD{
-		destroyFn: func(context.Context, string, bool) error { return errors.New("vmd unavailable") },
-		deleteSnapsFn: func(context.Context, string) error {
-			removed = true
-			return nil
-		},
-	}
-	h := &Handlers{VMD: vmd, DB: db.New(mock)}
-	w := httptest.NewRecorder()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, createSandboxReq(fmt.Sprintf(`{"name":"fork","from_snapshot":%q}`, snap.ID)))
-	if removed {
-		t.Fatal("a fork's copies were removed although its VM may still run on them")
+			time.Sleep(10 * time.Millisecond)
+		}
+		mu.Lock()
+		got := append([]string(nil), order...)
+		mu.Unlock()
+		want := []string{"destroy", "delete-snapshots"}
+		if destroyFails {
+			want = []string{"destroy"}
+		}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("destroy fails = %v: cleanup = %v, want %v", destroyFails, got, want)
+		}
 	}
 }
 

@@ -3241,15 +3241,34 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		}
 	}
 	var rulesApplied bool
-	ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr := retryTransientBoot(c.Request.Context(), sandboxID.String(), hostID, func(ctx context.Context) (string, uint32, uint32, error) {
-		ip, vcpu, memMiB, protocol, applied, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars,
-			// Same shape the sandbox row is being inserted with (the
-			// image's, or the defaults) — declared so the daemon
-			// never has to ask Firecracker for it afterwards.
-			vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB), SavedSnapshotID: savedSnapshotID, Egress: restoreEgress})
-		previewProtocol, rulesApplied = protocol, applied
-		return ip, vcpu, memMiB, err
-	})
+	// A fork resumes the workload it was captured with the moment it
+	// launches, so it is admitted first: its row, quota and source checks
+	// included, is written before the daemon is asked, and a refused one
+	// never runs. A template's guest runs nothing of the caller's before it
+	// is handed over, so its insert overlaps the boot.
+	var insertRes insertResult
+	admitted := sourceSnapshotID != uuid.Nil
+	if admitted {
+		insertRes = <-insertCh
+	}
+	booted := !admitted || insertRes.err == nil
+	var (
+		ipAddress                string
+		actualVcpu, actualMemMiB uint32
+		vmdRetried               bool
+		vmdErr                   error
+	)
+	if booted {
+		ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr = retryTransientBoot(c.Request.Context(), sandboxID.String(), hostID, func(ctx context.Context) (string, uint32, uint32, error) {
+			ip, vcpu, memMiB, protocol, applied, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars,
+				// Same shape the sandbox row is being inserted with (the
+				// image's, or the defaults) — declared so the daemon
+				// never has to ask Firecracker for it afterwards.
+				vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB), SavedSnapshotID: savedSnapshotID, Egress: restoreEgress})
+			previewProtocol, rulesApplied = protocol, applied
+			return ip, vcpu, memMiB, err
+		})
+	}
 	tVmdEnd = time.Now()
 	if vmdErr != nil {
 		// A failed boot should stop the detached insert from materializing a row
@@ -3259,8 +3278,10 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 
 	// Wait for the parallel INSERT to complete — its result determines
 	// how we handle a VMD failure (mark row failed vs. nothing to mark).
-	insertRes := <-insertCh
-	tInsertReceive = time.Now()
+	if !admitted {
+		insertRes = <-insertCh
+		tInsertReceive = time.Now()
+	}
 	sandbox := insertRes.sandbox
 	dbErr := insertRes.err
 
@@ -3281,7 +3302,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	transientCreateFailure := isTransientCreateDBErr(dbErr) || isVMDDeadline(vmdErr) || isVMDUnavailable(vmdErr)
 	transientReason := createSandboxTransientFailureReason(dbErr, vmdErr)
 
-	if dbErr != nil || vmdErr != nil {
+	if booted && (dbErr != nil || vmdErr != nil) {
 		// Any non-empty error can leave a VM behind, so clean it up best-effort
 		// before deciding which failure mode to report.
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
