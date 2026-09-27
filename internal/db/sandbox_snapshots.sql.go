@@ -613,37 +613,3 @@ func (q *Queries) ScheduleSandboxSnapshotSweep(ctx context.Context, id uuid.UUID
 	}
 	return result.RowsAffected(), nil
 }
-
-const withdrawBindingFromSnapshots = `-- name: WithdrawBindingFromSnapshots :exec
-UPDATE sandbox_snapshot SET secret_bindings = (
-  SELECT COALESCE(jsonb_agg(
-    CASE WHEN e->>'env_key' = $1::text AND e->>'secret_id' = $2::uuid::text
-         THEN jsonb_build_object('env_key', e->>'env_key')
-         ELSE e END
-    ORDER BY e->>'env_key'), '[]'::jsonb)
-  FROM jsonb_array_elements(secret_bindings) e
-)
-WHERE sandbox_id = $3::uuid AND deleted_at IS NULL
-  AND created_at >= $4::timestamptz
-`
-
-type WithdrawBindingFromSnapshotsParams struct {
-	EnvKey    string    `json:"env_key"`
-	SecretID  uuid.UUID `json:"secret_id"`
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	Since     time.Time `json:"since"`
-}
-
-// Takes a binding back out of every snapshot of the sandbox that could have
-// recorded it, settled or not: those created since the attach began, which
-// then failed and is undone. The key stays, without its secret, for a fork
-// to clear.
-func (q *Queries) WithdrawBindingFromSnapshots(ctx context.Context, arg WithdrawBindingFromSnapshotsParams) error {
-	_, err := q.db.Exec(ctx, withdrawBindingFromSnapshots,
-		arg.EnvKey,
-		arg.SecretID,
-		arg.SandboxID,
-		arg.Since,
-	)
-	return err
-}

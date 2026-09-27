@@ -67,6 +67,14 @@ RETURNING *;
 -- check and insert serialize across API instances, not just the in-process lock.
 SELECT pg_advisory_xact_lock(hashtext($1)::bigint);
 
+-- name: HoldSandboxSecretWrites :exec
+-- The same lock, held by the session until released: an attach keeps it
+-- through its guest update, which no transaction should stay open across.
+SELECT pg_advisory_lock(hashtext($1)::bigint);
+
+-- name: ReleaseSandboxSecretWrites :one
+SELECT pg_advisory_unlock(hashtext($1)::bigint);
+
 -- name: AddSandboxSecret :execrows
 -- FOR UPDATE on the sandbox row, taken before the insert because the insert
 -- depends on it, serializes this against every destroy path. A destroy that
@@ -201,19 +209,3 @@ SELECT env_key FROM sandbox_secret_detached WHERE sandbox_id = $1 ORDER BY env_k
 
 -- name: ForgetDetachedSecretKeys :exec
 DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = ANY(@env_keys::text[]);
-
--- name: TransactionStartedAt :one
-SELECT now()::timestamptz;
-
--- name: WithdrawBindingFromForks :many
--- Takes a binding back out of sandboxes created, since the attach began,
--- from a snapshot that recorded it; returns their tokens to revoke.
-DELETE FROM sandbox_secret ss
-USING sandbox fork, sandbox_snapshot snap
-WHERE ss.sandbox_id = fork.id
-  AND fork.source_snapshot_id = snap.id
-  AND snap.sandbox_id = sqlc.arg('sandbox_id')::uuid
-  AND snap.created_at >= sqlc.arg('since')::timestamptz
-  AND ss.env_key = sqlc.arg('env_key')::text
-  AND ss.secret_id = sqlc.arg('secret_id')::uuid
-RETURNING ss.sandbox_id, ss.proxy_token;

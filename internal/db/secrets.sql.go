@@ -375,6 +375,17 @@ func (q *Queries) GetSecretsByNames(ctx context.Context, arg GetSecretsByNamesPa
 	return items, nil
 }
 
+const holdSandboxSecretWrites = `-- name: HoldSandboxSecretWrites :exec
+SELECT pg_advisory_lock(hashtext($1)::bigint)
+`
+
+// The same lock, held by the session until released: an attach keeps it
+// through its guest update, which no transaction should stay open across.
+func (q *Queries) HoldSandboxSecretWrites(ctx context.Context, hashtext string) error {
+	_, err := q.db.Exec(ctx, holdSandboxSecretWrites, hashtext)
+	return err
+}
+
 const insertProxyAudit = `-- name: InsertProxyAudit :exec
 INSERT INTO proxy_audit (
     team_id, sandbox_id, secret_id,
@@ -898,6 +909,17 @@ func (q *Queries) RecordDetachedSecretKey(ctx context.Context, arg RecordDetache
 	return err
 }
 
+const releaseSandboxSecretWrites = `-- name: ReleaseSandboxSecretWrites :one
+SELECT pg_advisory_unlock(hashtext($1)::bigint)
+`
+
+func (q *Queries) ReleaseSandboxSecretWrites(ctx context.Context, hashtext string) (bool, error) {
+	row := q.db.QueryRow(ctx, releaseSandboxSecretWrites, hashtext)
+	var pg_advisory_unlock bool
+	err := row.Scan(&pg_advisory_unlock)
+	return pg_advisory_unlock, err
+}
+
 const softDeleteSecret = `-- name: SoftDeleteSecret :one
 UPDATE secret
 SET deleted_at = now(), updated_at = now()
@@ -983,17 +1005,6 @@ func (q *Queries) TouchSecretLastUsed(ctx context.Context, arg TouchSecretLastUs
 	return err
 }
 
-const transactionStartedAt = `-- name: TransactionStartedAt :one
-SELECT now()::timestamptz
-`
-
-func (q *Queries) TransactionStartedAt(ctx context.Context) (time.Time, error) {
-	row := q.db.QueryRow(ctx, transactionStartedAt)
-	var column_1 time.Time
-	err := row.Scan(&column_1)
-	return column_1, err
-}
-
 const updateSecretValue = `-- name: UpdateSecretValue :one
 UPDATE secret
 SET ciphertext = $3,
@@ -1039,55 +1050,4 @@ func (q *Queries) UpdateSecretValue(ctx context.Context, arg UpdateSecretValuePa
 		&i.DeletedAt,
 	)
 	return i, err
-}
-
-const withdrawBindingFromForks = `-- name: WithdrawBindingFromForks :many
-DELETE FROM sandbox_secret ss
-USING sandbox fork, sandbox_snapshot snap
-WHERE ss.sandbox_id = fork.id
-  AND fork.source_snapshot_id = snap.id
-  AND snap.sandbox_id = $1::uuid
-  AND snap.created_at >= $2::timestamptz
-  AND ss.env_key = $3::text
-  AND ss.secret_id = $4::uuid
-RETURNING ss.sandbox_id, ss.proxy_token
-`
-
-type WithdrawBindingFromForksParams struct {
-	SandboxID uuid.UUID `json:"sandbox_id"`
-	Since     time.Time `json:"since"`
-	EnvKey    string    `json:"env_key"`
-	SecretID  uuid.UUID `json:"secret_id"`
-}
-
-type WithdrawBindingFromForksRow struct {
-	SandboxID  uuid.UUID `json:"sandbox_id"`
-	ProxyToken *string   `json:"proxy_token"`
-}
-
-// Takes a binding back out of sandboxes created, since the attach began,
-// from a snapshot that recorded it; returns their tokens to revoke.
-func (q *Queries) WithdrawBindingFromForks(ctx context.Context, arg WithdrawBindingFromForksParams) ([]WithdrawBindingFromForksRow, error) {
-	rows, err := q.db.Query(ctx, withdrawBindingFromForks,
-		arg.SandboxID,
-		arg.Since,
-		arg.EnvKey,
-		arg.SecretID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []WithdrawBindingFromForksRow{}
-	for rows.Next() {
-		var i WithdrawBindingFromForksRow
-		if err := rows.Scan(&i.SandboxID, &i.ProxyToken); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
 }

@@ -17,7 +17,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/superserve-ai/sandbox/internal/api"
@@ -214,7 +213,7 @@ func TestIntegration_SnapshotDeleteWaitsForAForkInsert(t *testing.T) {
 	}
 	defer fork.Rollback(ctx) //nolint:errcheck
 	if _, err := db.New(fork).CreateSandboxFromSnapshot(ctx, db.CreateSandboxFromSnapshotParams{
-		SnapshotID: snap.ID, TeamID: teamID, SecretBindings: snap.SecretBindings, ID: uuid.New(), Name: "fork", Status: db.SandboxStatusStarting,
+		SnapshotID: snap.ID, TeamID: teamID, ID: uuid.New(), Name: "fork", Status: db.SandboxStatusStarting,
 		Metadata: []byte(`{}`), PreviewAccess: preview.AccessPublic,
 		SecretIds: []uuid.UUID{}, EnvKeys: []string{}, ProxyTokens: []string{},
 	}); err != nil {
@@ -356,13 +355,13 @@ func TestIntegration_SecretAttachWaitsOutASnapshotCapture(t *testing.T) {
 	}
 }
 
-// An attach undone after snapshots recorded it has the binding withdrawn
-// from each taken since it began, settled or not, its key kept without the
-// secret; an older snapshot's binding of the same key and secret stays.
-func TestIntegration_UndoneAttachIsWithdrawnFromSnapshotsSinceItBegan(t *testing.T) {
+// An attach holds the sandbox's secret-write lock through its guest update:
+// a capture waits for it, so a binding the attach undoes is never recorded,
+// and the snapshot has only the key, for a fork to clear.
+func TestIntegration_CaptureWaitsOutAnAttachAndItsUndo(t *testing.T) {
 	ctx := context.Background()
 	teamID, _ := seedTeamAndKey(t)
-	sourceID, err := insertSandboxRow(ctx, teamID, "undo-source")
+	sourceID, err := insertSandboxRow(ctx, teamID, "hold-source")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,95 +369,68 @@ func TestIntegration_UndoneAttachIsWithdrawnFromSnapshotsSinceItBegan(t *testing
 		t.Fatal(err)
 	}
 	secretID := seedSecret(t, teamID)
-	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: secretID, EnvKey: "TOKEN"}); err != nil {
+
+	// The attach: held lock, binding committed, guest update pending.
+	conn, err := testPool.Acquire(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	create := func() db.SandboxSnapshot {
-		t.Helper()
-		row, err := testQueries.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
-			ID: uuid.New(), TeamID: teamID, SandboxID: sourceID, Kind: "mem+fs", SweepAfter: time.Now().Add(15 * time.Minute),
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return row
-	}
-	ready := func(id uuid.UUID) {
-		t.Helper()
-		overlay, vmstate, mem := "/saved/u/overlay.ext4", "/saved/u/vmstate.snap", "/saved/u/mem.diff"
-		if _, err := testQueries.MarkSandboxSnapshotReady(ctx, db.MarkSandboxSnapshotReadyParams{ID: id, OverlayPath: &overlay, SnapshotPath: &vmstate, MemPath: &mem, SizeBytes: 1}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// An earlier, legitimate binding of the same key and secret.
-	older := create()
-	ready(older.ID)
-	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET created_at = now() - interval '1 hour' WHERE id = $1`, older.ID); err != nil {
+	defer conn.Release()
+	aq := db.New(conn)
+	if err := aq.HoldSandboxSecretWrites(ctx, sourceID.String()); err != nil {
 		t.Fatal(err)
 	}
-	var since time.Time
-	if err := testPool.QueryRow(ctx, `SELECT now()`).Scan(&since); err != nil {
-		t.Fatal(err)
-	}
-	settled := create()
-	ready(settled.ID)
-	inFlight := create()
-	// A fork made from the settled snapshot before the undo, holding the
-	// binding with its own token.
-	forkToken := "sp_fork"
-	forkID := uuid.New()
-	if _, err := testQueries.CreateSandboxFromSnapshot(ctx, db.CreateSandboxFromSnapshotParams{
-		SnapshotID: settled.ID, TeamID: teamID, SecretBindings: settled.SecretBindings, ID: forkID, Name: "fork",
-		Status: db.SandboxStatusStarting, Metadata: []byte(`{}`), PreviewAccess: preview.AccessPublic,
-		SecretIds: []uuid.UUID{secretID}, EnvKeys: []string{"TOKEN"}, ProxyTokens: []string{forkToken},
-	}); err != nil {
+	if _, err := aq.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: secretID, EnvKey: "TOKEN"}); err != nil {
 		t.Fatal(err)
 	}
 
-	// The undo, as the attach handler runs it.
-	if _, err := testQueries.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
-		t.Fatal(err)
+	type result struct {
+		row db.SandboxSnapshot
+		err error
 	}
-	if err := testQueries.RecordDetachedSecretKey(ctx, db.RecordDetachedSecretKeyParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := testQueries.WithdrawBindingFromSnapshots(ctx, db.WithdrawBindingFromSnapshotsParams{SandboxID: sourceID, EnvKey: "TOKEN", SecretID: secretID, Since: since}); err != nil {
-		t.Fatal(err)
-	}
-	forks, err := testQueries.WithdrawBindingFromForks(ctx, db.WithdrawBindingFromForksParams{SandboxID: sourceID, Since: since, EnvKey: "TOKEN", SecretID: secretID})
-	if err != nil || len(forks) != 1 || forks[0].SandboxID != forkID || forks[0].ProxyToken == nil || *forks[0].ProxyToken != forkToken {
-		t.Fatalf("withdrawn from forks = %+v (%v); want the fork's binding and its token to revoke", forks, err)
-	}
-	// A fork that read the record before the undo is refused, not granted it.
-	if _, err := testQueries.CreateSandboxFromSnapshot(ctx, db.CreateSandboxFromSnapshotParams{
-		SnapshotID: settled.ID, TeamID: teamID, SecretBindings: settled.SecretBindings, ID: uuid.New(), Name: "late",
-		Status: db.SandboxStatusStarting, Metadata: []byte(`{}`), PreviewAccess: preview.AccessPublic,
-		SecretIds: []uuid.UUID{secretID}, EnvKeys: []string{"TOKEN"}, ProxyTokens: []string{"sp_late"},
-	}); !errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("fork from a record read before the undo: %v; want no rows", err)
-	}
-	for _, id := range []uuid.UUID{settled.ID, inFlight.ID} {
-		got, err := testQueries.GetSandboxSnapshotUnscoped(ctx, id)
+	done := make(chan result, 1)
+	go func() {
+		tx, err := testPool.Begin(ctx)
 		if err != nil {
-			t.Fatal(err)
+			done <- result{err: err}
+			return
 		}
-		if strings.Contains(string(got.SecretBindings), secretID.String()) || !strings.Contains(string(got.SecretBindings), `"TOKEN"`) {
-			t.Fatalf("%s record after the undo = %s; want the key without its secret", got.Status, got.SecretBindings)
+		defer tx.Rollback(ctx) //nolint:errcheck
+		q := db.New(tx)
+		if err := q.LockSandboxForSecretWrites(ctx, sourceID.String()); err != nil {
+			done <- result{err: err}
+			return
 		}
+		row, err := q.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
+			ID: uuid.New(), TeamID: teamID, SandboxID: sourceID, Kind: "mem+fs", SweepAfter: time.Now().Add(15 * time.Minute),
+		})
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
+		done <- result{row, err}
+	}()
+	select {
+	case r := <-done:
+		t.Fatalf("the capture did not wait for the attach: %+v", r)
+	case <-time.After(300 * time.Millisecond):
 	}
-	if kept, err := testQueries.GetSandboxSnapshotUnscoped(ctx, older.ID); err != nil || !strings.Contains(string(kept.SecretBindings), secretID.String()) {
-		t.Fatalf("older record = %s (%v); want it untouched", kept.SecretBindings, err)
-	}
-	// A re-attach of the key forgets it was detached.
-	if _, err := testQueries.AddSandboxSecret(ctx, db.AddSandboxSecretParams{SandboxID: sourceID, SecretID: secretID, EnvKey: "TOKEN"}); err != nil {
+
+	// The guest update failed: undone before the lock is let go.
+	if _, err := aq.DeleteSandboxSecretBinding(ctx, db.DeleteSandboxSecretBindingParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := testQueries.ForgetDetachedSecretKey(ctx, db.ForgetDetachedSecretKeyParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
+	if err := aq.RecordDetachedSecretKey(ctx, db.RecordDetachedSecretKeyParams{SandboxID: sourceID, EnvKey: "TOKEN"}); err != nil {
 		t.Fatal(err)
 	}
-	var n int
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_secret_detached WHERE sandbox_id = $1`, sourceID).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("tombstones after a re-attach: %d %v", n, err)
+	if ok, err := aq.ReleaseSandboxSecretWrites(ctx, sourceID.String()); err != nil || !ok {
+		t.Fatalf("release: %v %v", ok, err)
+	}
+	r := <-done
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if strings.Contains(string(r.row.SecretBindings), secretID.String()) || !strings.Contains(string(r.row.SecretBindings), `"TOKEN"`) {
+		t.Fatalf("snapshot recorded %s; want the undone attach's key without its secret", r.row.SecretBindings)
 	}
 }
 

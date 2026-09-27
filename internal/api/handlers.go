@@ -3138,7 +3138,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		if sourceSnapshotID != uuid.Nil {
 			row, err := h.DB.CreateSandboxFromSnapshot(insertCtx, db.CreateSandboxFromSnapshotParams{
 				SnapshotID:        sourceSnapshotID,
-				SecretBindings:    source.SecretBindings,
 				TeamID:            teamID,
 				ID:                sandboxID,
 				Name:              req.Name,
@@ -3283,14 +3282,6 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	sourceRace := (templateID.Valid || sourceSnapshotID != uuid.Nil) && errors.Is(dbErr, pgx.ErrNoRows)
 	respondSourceGone := func() {
 		if sourceSnapshotID != uuid.Nil {
-			// Deleted, or its secrets changed since they were read.
-			rctx, rcancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), asyncTimeout)
-			defer rcancel()
-			if snap, err := h.DB.GetSandboxSnapshot(rctx, db.GetSandboxSnapshotParams{ID: sourceSnapshotID, TeamID: teamID}); err == nil && snap.Status == "ready" {
-				c.Header("Retry-After", "1")
-				respondErrorMsg(c, "snapshot_changed", "the snapshot changed while the sandbox was being created; retry", http.StatusConflict)
-				return
-			}
 			respondErrorMsg(c, "not_found", "Snapshot not found", http.StatusNotFound)
 			return
 		}
@@ -3313,11 +3304,14 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		destroy := func() {
 			derr := vmd.DestroyInstance(cleanupCtx, sandboxID.String(), true)
 			// Only once no VM can still be using them: a destroy that failed
-			// leaves an orphan the reconciler reclaims whole.
+			// leaves an orphan the reconciler reclaims whole. Their own
+			// deadline, so a slow destroy does not leave them behind.
 			if savedSnapshotID != "" && (derr == nil || isVMDNotFound(derr)) {
-				if err := vmd.DeleteSandboxSnapshots(cleanupCtx, sandboxID.String()); err != nil && !isVMDNotFound(err) {
+				dctx, dcancel := context.WithTimeout(context.WithoutCancel(c.Request.Context()), vmdTimeout)
+				if err := vmd.DeleteSandboxSnapshots(dctx, sandboxID.String()); err != nil && !isVMDNotFound(err) {
 					l.Warn().Err(err).Msg("remove a failed fork's copies of its snapshot")
 				}
+				dcancel()
 			}
 		}
 		if vmdErr != nil {
