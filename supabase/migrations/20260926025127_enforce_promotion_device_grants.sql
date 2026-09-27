@@ -40,7 +40,11 @@ BEGIN
     SET LOCAL lock_timeout = '5s';
     PERFORM pg_advisory_xact_lock(hashtext('stripe-promo-user:' || p_user_id::text)::bigint);
     PERFORM pg_advisory_xact_lock(hashtext('promotion-device-user:' || p_user_id::text)::bigint);
-    v_reason := promotion_device_decision(p_user_id, 'signup');
+    BEGIN
+        v_reason := promotion_device_decision(p_user_id, 'signup');
+    EXCEPTION WHEN SQLSTATE '55000' OR no_data_found THEN
+        v_reason := 'authority_unavailable';
+    END;
     IF v_reason <> 'eligible' THEN
         IF v_provenance.legacy_grant_id IS NULL THEN
             INSERT INTO team_signup_trial_denial(team_id) VALUES(p_team_id) ON CONFLICT DO NOTHING;
@@ -53,8 +57,23 @@ BEGIN
         RETURN QUERY SELECT 'promotion_ineligible'::text, v_reason;
         RETURN;
     END IF;
-    SELECT c.outcome, c.reason INTO v_outcome, v_claim_reason
-        FROM claim_team_signup_trial_without_device(p_team_id, p_user_id) c;
+    BEGIN
+        SELECT c.outcome, c.reason INTO v_outcome, v_claim_reason
+            FROM claim_team_signup_trial_without_device(p_team_id, p_user_id) c;
+    EXCEPTION WHEN SQLSTATE '55000' OR no_data_found THEN
+        v_outcome := 'promotion_ineligible';
+        v_claim_reason := 'authority_unavailable';
+        IF v_provenance.legacy_grant_id IS NULL THEN
+            INSERT INTO team_signup_trial_denial(team_id) VALUES(p_team_id) ON CONFLICT DO NOTHING;
+        END IF;
+        INSERT INTO team_signup_promotion_outcome(team_id, user_id, outcome, reason)
+            VALUES(p_team_id, p_user_id, v_outcome, v_claim_reason);
+        UPDATE team_signup_trial_provenance SET creator_user_id = p_user_id,
+            creator_bound_at = COALESCE(creator_bound_at, now()), completed_at = now()
+            WHERE team_id = p_team_id;
+        RETURN QUERY SELECT v_outcome, v_claim_reason;
+        RETURN;
+    END;
     IF v_outcome = 'granted' THEN
         SELECT e.fingerprint INTO v_fingerprint FROM promotion_signup_device_evidence e WHERE e.user_id = p_user_id;
         INSERT INTO promotion_device_grant(promotion, user_id, team_id, fingerprint)
@@ -62,42 +81,32 @@ BEGIN
     END IF;
     RETURN QUERY SELECT v_outcome, v_claim_reason;
 END $$;
+REVOKE ALL ON FUNCTION claim_team_signup_trial_with_device(uuid,uuid) FROM PUBLIC;
+DO $$ DECLARE r text; BEGIN
+    FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+            EXECUTE format('REVOKE ALL ON FUNCTION claim_team_signup_trial_with_device(uuid,uuid) FROM %I', r);
+        END IF;
+    END LOOP;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        GRANT EXECUTE ON FUNCTION claim_team_signup_trial_with_device(uuid,uuid) TO service_role;
+    END IF;
+END $$;
 
 CREATE OR REPLACE FUNCTION claim_team_signup_trial(p_team_id uuid, p_user_id uuid)
 RETURNS TABLE(outcome text, reason text) LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, public AS $$
-DECLARE v_existing_user uuid;
 BEGIN
     RETURN QUERY SELECT c.outcome, c.reason
         FROM claim_team_signup_trial_with_device(p_team_id, p_user_id) c;
-EXCEPTION WHEN OTHERS THEN
-    IF SQLSTATE = '22023' THEN RAISE; END IF;
-    -- The failed claim subtransaction has rolled back. Complete this initial
-    -- creation without credit so the team can still be provisioned.
-    PERFORM 1 FROM team WHERE id = p_team_id FOR NO KEY UPDATE;
-    IF NOT FOUND OR p_user_id IS NULL THEN RAISE; END IF;
-    SELECT o.user_id INTO v_existing_user FROM team_signup_promotion_outcome o WHERE o.team_id = p_team_id;
-    IF FOUND THEN
-        IF v_existing_user <> p_user_id THEN RAISE; END IF;
-        RETURN QUERY SELECT o.outcome, o.reason FROM team_signup_promotion_outcome o
-            WHERE o.team_id = p_team_id AND o.user_id = p_user_id;
-        RETURN;
-    END IF;
-    IF NOT EXISTS (SELECT 1 FROM team_signup_trial_provenance p
-        WHERE p.team_id = p_team_id AND p.completed_at IS NULL
-          AND (p.creator_user_id IS NULL OR p.creator_user_id = p_user_id)) THEN
-        RAISE;
-    END IF;
-    INSERT INTO team_signup_trial_denial(team_id) VALUES(p_team_id) ON CONFLICT DO NOTHING;
-    INSERT INTO team_signup_promotion_outcome(team_id,user_id,outcome,reason)
-        VALUES(p_team_id,p_user_id,'promotion_ineligible','authority_unavailable');
-    UPDATE team_signup_trial_provenance SET creator_user_id=p_user_id,
-        creator_bound_at=COALESCE(creator_bound_at,now()), completed_at=now()
-        WHERE team_id=p_team_id;
-    RETURN QUERY SELECT 'promotion_ineligible'::text, 'authority_unavailable'::text;
 END $$;
 REVOKE ALL ON FUNCTION claim_team_signup_trial(uuid,uuid) FROM PUBLIC;
-DO $$ BEGIN
+DO $$ DECLARE r text; BEGIN
+    FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+            EXECUTE format('REVOKE ALL ON FUNCTION claim_team_signup_trial(uuid,uuid) FROM %I', r);
+        END IF;
+    END LOOP;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
         GRANT EXECUTE ON FUNCTION claim_team_signup_trial(uuid,uuid) TO service_role;
     END IF;
@@ -179,6 +188,17 @@ BEGIN
     END IF;
     RETURN v_result;
 END $$;
+REVOKE ALL ON FUNCTION reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean) FROM PUBLIC;
+DO $$ DECLARE r text; BEGIN
+    FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+            EXECUTE format('REVOKE ALL ON FUNCTION reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean) FROM %I', r);
+        END IF;
+    END LOOP;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        GRANT EXECUTE ON FUNCTION reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean) TO service_role;
+    END IF;
+END $$;
 
 CREATE OR REPLACE FUNCTION reserve_stripe_promotion_for_subscription_event_state(
     p_team_id uuid, p_user_id uuid, p_event_id text, p_subscription_id text,
@@ -192,7 +212,12 @@ RETURNS text LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog,public AS 
     SELECT reserve_stripe_promotion_with_device(p_team_id,p_user_id,p_event_id,NULL,NULL,false)
 $$;
 REVOKE ALL ON FUNCTION reserve_stripe_promotion_for_subscription_event_state(uuid,uuid,text,text,timestamptz,boolean) FROM PUBLIC;
-DO $$ BEGIN
+DO $$ DECLARE r text; BEGIN
+    FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP
+        IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+            EXECUTE format('REVOKE ALL ON FUNCTION reserve_stripe_promotion_for_subscription_event_state(uuid,uuid,text,text,timestamptz,boolean) FROM %I', r);
+        END IF;
+    END LOOP;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
         GRANT EXECUTE ON FUNCTION reserve_stripe_promotion_for_subscription_event_state(uuid,uuid,text,text,timestamptz,boolean) TO service_role;
     END IF;
@@ -256,6 +281,26 @@ BEGIN
         VALUES (p_team_id, 95, 0, 'stripe promotional credit', p_user_id);
     END IF;
     PERFORM record_stripe_promotion_device_grant(p_team_id, p_user_id);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION activate_team_billing(p_team_id uuid, p_user_id uuid, p_stripe_grant_id text)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    IF NULLIF(BTRIM(p_stripe_grant_id), '') IS NOT NULL THEN
+        PERFORM lock_stripe_promotion(p_team_id, p_user_id);
+    END IF;
+    PERFORM 1 FROM team_billing_account WHERE team_id = p_team_id FOR UPDATE;
+    UPDATE team_billing_account
+    SET trial_ended_at = COALESCE(trial_ended_at, now()), updated_at = now()
+    WHERE team_id = p_team_id
+      AND lower(coalesce(stripe_subscription_status, '')) IN ('active', 'trialing', 'past_due');
+    IF NOT FOUND THEN RETURN; END IF;
+    UPDATE team_credit_grant SET remaining_usd = 0, updated_at = now()
+    WHERE team_id = p_team_id AND reason = 'signup trial credit';
+    IF NULLIF(BTRIM(p_stripe_grant_id), '') IS NOT NULL THEN
+        PERFORM finalize_stripe_promotion(p_team_id, p_user_id, p_stripe_grant_id);
+    END IF;
 END;
 $$;
 

@@ -109,6 +109,9 @@ func (f *fakeStripeClient) CreateBillingCreditGrant(_ context.Context, params ap
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.creditGrantCalls = append(f.creditGrantCalls, params)
+	if f.creditGrantAmbiguousErr != nil && len(f.creditGrantCalls) == f.creditGrantAmbiguousErrAt {
+		return api.StripeBillingCreditGrant{}, f.creditGrantAmbiguousErr
+	}
 	return api.StripeBillingCreditGrant{ID: "credgrant_test_123"}, nil
 }
 
@@ -909,6 +912,373 @@ func TestIntegration_StripeActivationEndsTrialAndGrantsPromoCreditOnce(t *testin
 	}
 	if got := stripe.creditGrantCalls[0].AmountCents; got != 9500 {
 		t.Fatalf("Stripe credit grant amount = %d, want 9500 cents", got)
+	}
+}
+
+func TestIntegration_StripePromotionReservationTimeoutRetriesWebhook(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, userID := seedTeamAndKeyWithRole(t, "team_owner")
+	customerID := "cus_" + teamID.String()
+	subscriptionID := "sub_" + teamID.String()
+	eventID := "evt_reservation_retry_" + teamID.String()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+	`, teamID, customerID, subscriptionID); err != nil {
+		t.Fatalf("seed billing account: %v", err)
+	}
+	created := time.Now().UTC().Truncate(time.Second)
+	payload := stripeSubscriptionWebhookPayloadWithMetadata(t, eventID, "customer.subscription.updated",
+		subscriptionID, customerID, "active", created, created, created.AddDate(0, 1, 0),
+		map[string]string{"activation_user_id": userID.String()})
+	stripe := &fakeStripeClient{creditGrantAmbiguousErr: errors.New("Stripe response lost after grant creation"), creditGrantAmbiguousErrAt: 1}
+	router := newBillingRouter(t, stripe)
+	send := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Stripe-Signature", stripeSignature(t, payload, created))
+		return doRequest(router, req)
+	}
+	if w := send(); w.Code != http.StatusInternalServerError {
+		t.Fatalf("ambiguous grant response: expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	var attemptedAt, reservedAt *time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT u.stripe_redemption_attempted_at, a.stripe_activation_credit_reserved_at
+		FROM user_promotion_entitlement u JOIN team_billing_account a ON a.team_id = $1
+		WHERE u.user_id = $2`, teamID, userID).Scan(&attemptedAt, &reservedAt); err != nil || attemptedAt == nil || reservedAt == nil {
+		t.Fatalf("ambiguous grant lost reservation: attempted_at=%v reserved_at=%v err=%v", attemptedAt, reservedAt, err)
+	}
+
+	lockConn, err := testPool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockConn.Release()
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('stripe-promo-user:' || $1::text)::bigint)`, userID); err != nil {
+		t.Fatalf("lock promotion user: %v", err)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			_, _ = lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock(hashtext('stripe-promo-user:' || $1::text)::bigint)`, userID)
+		}
+	}()
+
+	if w := send(); w.Code != http.StatusInternalServerError {
+		t.Fatalf("contended replay: expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	var processedAt *time.Time
+	if err := testPool.QueryRow(ctx, `SELECT processed_at FROM stripe_webhook_event WHERE event_id=$1`, eventID).Scan(&processedAt); err != nil || processedAt != nil {
+		t.Fatalf("contended event processed: processed_at=%v err=%v", processedAt, err)
+	}
+	if len(stripe.creditGrantCalls) != 1 {
+		t.Fatal("contended reservation reached Stripe")
+	}
+	if _, err := lockConn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext('stripe-promo-user:' || $1::text)::bigint)`, userID); err != nil {
+		t.Fatalf("unlock promotion user: %v", err)
+	}
+	locked = false
+	if w := send(); w.Code != http.StatusOK {
+		t.Fatalf("reservation replay: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(stripe.creditGrantCalls) != 2 || stripe.creditGrantCalls[0].IdempotencyKey != stripe.creditGrantCalls[1].IdempotencyKey {
+		t.Fatalf("Stripe grant replay did not reuse the original idempotency key: calls=%v", stripe.creditGrantCalls)
+	}
+	var grantID *string
+	if err := testPool.QueryRow(ctx, `SELECT stripe_activation_credit_grant_id FROM team_billing_account WHERE team_id=$1`, teamID).Scan(&grantID); err != nil || grantID == nil || *grantID != "credgrant_test_123" {
+		t.Fatalf("replayed grant was not finalized: grant_id=%v err=%v", grantID, err)
+	}
+}
+
+func TestIntegration_StripePromotionAuthorityFailureAllowsPaidActivation(t *testing.T) {
+	testStripePromotionAuthorityFailureAllowsPaidActivation(t, false, false)
+}
+
+func TestIntegration_StripePromotionAuthorityFailureWithReservationAllowsPaidActivation(t *testing.T) {
+	testStripePromotionAuthorityFailureAllowsPaidActivation(t, true, false)
+}
+
+func TestIntegration_StripePromotionAuthorityFailurePreservesAttemptedReservation(t *testing.T) {
+	testStripePromotionAuthorityFailureAllowsPaidActivation(t, true, true)
+}
+
+func testStripePromotionAuthorityFailureAllowsPaidActivation(t *testing.T, reserved, attempted bool) {
+	ctx := context.Background()
+	teamID, _, userID := seedTeamAndKeyWithRole(t, "team_owner")
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+	`, teamID, "cus_"+teamID.String(), "sub_"+teamID.String()); err != nil {
+		t.Fatal(err)
+	}
+	if reserved {
+		identity := "legacy:" + userID.String()
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO promotion_identity(identity_key, stripe_reserved_team_id, stripe_reserved_user_id)
+			VALUES($1, $2, $3)
+			ON CONFLICT (identity_key) DO UPDATE SET
+				stripe_reserved_team_id=EXCLUDED.stripe_reserved_team_id,
+				stripe_reserved_user_id=EXCLUDED.stripe_reserved_user_id
+		`, identity, teamID, userID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO user_promotion_entitlement(user_id, stripe_redemption_reserved_team_id, stripe_redemption_reserved_at)
+			VALUES($1, $2, now())
+			ON CONFLICT (user_id) DO UPDATE SET
+				stripe_redemption_reserved_team_id=EXCLUDED.stripe_redemption_reserved_team_id,
+				stripe_redemption_reserved_at=EXCLUDED.stripe_redemption_reserved_at
+		`, userID, teamID); err != nil {
+			t.Fatal(err)
+		}
+		if attempted {
+			if _, err := testPool.Exec(ctx, `
+				UPDATE user_promotion_entitlement SET stripe_redemption_attempted_at=now() WHERE user_id=$1
+			`, userID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := testPool.Exec(ctx, `
+			UPDATE team_billing_account
+			SET stripe_activation_user_id=$2, stripe_activation_identity_key=$3,
+				stripe_activation_credit_reserved_at=now(), stripe_activation_credit_reservation_event_id='evt_prior_reservation'
+			WHERE team_id=$1
+		`, teamID, userID, identity); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `ALTER TABLE promotion_identity_enforcement DISABLE TRIGGER promotion_identity_enforcement_irreversible`); err != nil {
+		t.Fatal(err)
+	}
+	var canonicalEnabled bool
+	var enabledAt *time.Time
+	var readinessReference *string
+	if err := tx.QueryRow(ctx, `
+		DELETE FROM promotion_identity_enforcement WHERE singleton
+		RETURNING enabled, enabled_at, readiness_reference
+	`).Scan(&canonicalEnabled, &enabledAt, &readinessReference); err != nil {
+		t.Fatalf("remove canonical promotion authority: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `ALTER TABLE promotion_identity_enforcement ENABLE TRIGGER promotion_identity_enforcement_irreversible`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(context.Background(), `
+			INSERT INTO promotion_identity_enforcement (singleton, enabled, enabled_at, readiness_reference)
+			VALUES (true, $1, $2, $3)
+		`, canonicalEnabled, enabledAt, readinessReference); err != nil {
+			t.Errorf("restore canonical promotion authority: %v", err)
+		}
+	})
+
+	stripe := &fakeStripeClient{}
+	eventID := "evt_authority_unavailable_" + uuid.NewString()
+	response := sendStripeActivationWebhook(t, newBillingRouter(t, stripe), eventID, teamID, userID, time.Now().UTC().Truncate(time.Second))
+	if attempted {
+		if response.Code != http.StatusInternalServerError {
+			t.Fatalf("attempted promotion webhook: expected 500, got %d: %s", response.Code, response.Body.String())
+		}
+		var processedAt *time.Time
+		if err := testPool.QueryRow(ctx, `SELECT processed_at FROM stripe_webhook_event WHERE event_id=$1`, eventID).Scan(&processedAt); err != nil || processedAt != nil {
+			t.Fatalf("attempted promotion event was processed: processed_at=%v err=%v", processedAt, err)
+		}
+		if len(stripe.creditGrantCalls) != 0 {
+			t.Fatal("attempted promotion was issued again")
+		}
+		return
+	}
+	if response.Code != http.StatusOK {
+		t.Fatalf("paid activation webhook: expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	response = sendStripeActivationWebhook(t, newBillingRouter(t, stripe), eventID, teamID, userID, time.Now().UTC().Truncate(time.Second))
+	if response.Code != http.StatusOK {
+		t.Fatalf("paid activation replay: expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	var trialEndedAt *time.Time
+	var status string
+	var grantID *string
+	if err := testPool.QueryRow(ctx, `
+		SELECT trial_ended_at, stripe_subscription_status, stripe_activation_credit_grant_id
+		FROM team_billing_account WHERE team_id = $1
+	`, teamID).Scan(&trialEndedAt, &status, &grantID); err != nil {
+		t.Fatal(err)
+	}
+	if trialEndedAt == nil || status != "active" || grantID != nil {
+		t.Fatalf("paid activation state: trial_ended_at=%v status=%q grant_id=%v", trialEndedAt, status, grantID)
+	}
+	var processedAt *time.Time
+	var reservedAt *time.Time
+	if err := testPool.QueryRow(ctx, `
+		SELECT e.processed_at, a.stripe_activation_credit_reserved_at
+		FROM stripe_webhook_event e JOIN team_billing_account a ON a.team_id = $2
+		WHERE e.event_id = $1
+	`, eventID, teamID).Scan(&processedAt, &reservedAt); err != nil || processedAt == nil || (reservedAt != nil) != reserved {
+		t.Fatalf("authority failure webhook state: processed_at=%v reserved_at=%v err=%v", processedAt, reservedAt, err)
+	}
+	var outcome, denialReason string
+	if err := testPool.QueryRow(ctx, `SELECT outcome, reason FROM stripe_promotion_outcome WHERE event_id=$1 AND team_id=$2 AND user_id=$3`,
+		eventID, teamID, userID).Scan(&outcome, &denialReason); err != nil || outcome != "promotion_ineligible" || denialReason != "authority_unavailable" {
+		t.Fatalf("authority failure outcome = %q/%q: %v", outcome, denialReason, err)
+	}
+	var grants, reservations int
+	if err := testPool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM team_credit_grant WHERE team_id = $1 AND reason = 'stripe promotional credit'),
+			(SELECT count(*) FROM user_promotion_entitlement WHERE user_id = $2
+				AND (stripe_redemption_at IS NOT NULL OR stripe_redemption_reserved_team_id IS NOT NULL))
+	`, teamID, userID).Scan(&grants, &reservations); err != nil {
+		t.Fatal(err)
+	}
+	wantReservations := 0
+	if reserved {
+		wantReservations = 1
+	}
+	if grants != 0 || reservations != wantReservations || len(stripe.creditGrantCalls) != 0 {
+		t.Fatalf("promotion issued without authority: local=%d reservations=%d Stripe=%d", grants, reservations, len(stripe.creditGrantCalls))
+	}
+}
+
+func TestIntegration_PendingDevicePromotionAllowsPaidActivation(t *testing.T) {
+	ctx := context.Background()
+	region := promotionIsolatedDatabase(t, true)
+	owner, other := uuid.New(), uuid.New()
+	ownerTeam, otherTeam := uuid.New(), uuid.New()
+	fingerprint := "visitor-" + uuid.NewString()
+	for _, user := range []uuid.UUID{owner, other} {
+		rolloutExec(t, region, `INSERT INTO profile(id,email) VALUES($1,$2)`, user, user.String()+"@example.com")
+		rolloutExec(t, region, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+			user, uuid.New(), "event-"+uuid.NewString(), fingerprint)
+	}
+	for _, team := range []uuid.UUID{ownerTeam, otherTeam} {
+		rolloutExec(t, region, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "promotion-"+team.String())
+		rolloutExec(t, region, `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status)
+			VALUES($1,$2,$3,'incomplete')`, team, "cus_"+team.String(), "sub_"+team.String())
+	}
+	otherEvent := "evt_pending_" + uuid.NewString()
+	var state string
+	if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,$3,$4,NULL,false)`,
+		otherTeam, other, otherEvent, "sub_"+otherTeam.String()).Scan(&state); err != nil || state != "acquired" {
+		t.Fatalf("device-off reservation = %q: %v", state, err)
+	}
+	attemptedAt, err := db.New(region).MarkStripePromotionAttempt(ctx, db.MarkStripePromotionAttemptParams{
+		UserID: other, TeamID: pgtype.UUID{Bytes: otherTeam, Valid: true}, EventID: &otherEvent,
+	})
+	if err != nil || !attemptedAt.Valid {
+		t.Fatalf("mark unresolved Stripe attempt: attempted_at=%v err=%v", attemptedAt, err)
+	}
+	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
+	if err := region.QueryRow(ctx, `SELECT promotion_device_decision($1,'stripe')`, owner).Scan(&state); err != nil || state != "device_reservation_pending" {
+		t.Fatalf("owner decision after policy change = %q: %v", state, err)
+	}
+
+	stripe := &fakeStripeClient{}
+	eventID := "evt_paid_pending_" + uuid.NewString()
+	router := newBillingRouterWithPool(t, stripe, region)
+	created := time.Now().UTC().Truncate(time.Second)
+	for i := 0; i < 2; i++ {
+		response := sendStripeActivationWebhook(t, router, eventID, ownerTeam, owner, created)
+		if response.Code != http.StatusOK {
+			t.Fatalf("paid activation delivery %d: expected 200, got %d: %s", i, response.Code, response.Body.String())
+		}
+	}
+	var trialEndedAt, processedAt *time.Time
+	var status string
+	var grantID *string
+	if err := region.QueryRow(ctx, `SELECT trial_ended_at,stripe_subscription_status,stripe_activation_credit_grant_id
+		FROM team_billing_account WHERE team_id=$1`, ownerTeam).Scan(&trialEndedAt, &status, &grantID); err != nil {
+		t.Fatal(err)
+	}
+	if trialEndedAt == nil || status != "active" || grantID != nil {
+		t.Fatalf("paid activation state: trial_ended_at=%v status=%q grant_id=%v", trialEndedAt, status, grantID)
+	}
+	if err := region.QueryRow(ctx, `SELECT processed_at FROM stripe_webhook_event WHERE event_id=$1`, eventID).Scan(&processedAt); err != nil || processedAt == nil {
+		t.Fatalf("webhook not processed: processed_at=%v err=%v", processedAt, err)
+	}
+	var denialReason string
+	if err := region.QueryRow(ctx, `SELECT reason FROM stripe_promotion_outcome WHERE event_id=$1 AND team_id=$2 AND user_id=$3`,
+		eventID, ownerTeam, owner).Scan(&denialReason); err != nil || denialReason != "device_reservation_pending" {
+		t.Fatalf("pending device outcome = %q: %v", denialReason, err)
+	}
+	var ownerReservations, ownerGrants, teamGrants int
+	if err := region.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM user_promotion_entitlement WHERE user_id=$1 AND (stripe_redemption_at IS NOT NULL OR stripe_redemption_reserved_team_id IS NOT NULL)),
+		(SELECT count(*) FROM promotion_device_grant WHERE user_id=$1 AND promotion='stripe'),
+		(SELECT count(*) FROM team_credit_grant WHERE team_id=$2 AND reason='stripe promotional credit')`, owner, ownerTeam).
+		Scan(&ownerReservations, &ownerGrants, &teamGrants); err != nil || ownerReservations != 0 || ownerGrants != 0 || teamGrants != 0 || len(stripe.creditGrantCalls) != 0 {
+		t.Fatalf("pending device reservation issued promotion: reservations=%d device_grants=%d team_grants=%d Stripe=%d err=%v",
+			ownerReservations, ownerGrants, teamGrants, len(stripe.creditGrantCalls), err)
+	}
+	if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,$3,$4,NULL,false)`,
+		otherTeam, other, otherEvent, "sub_"+otherTeam.String()).Scan(&state); err != nil || state != "existing" {
+		t.Fatalf("original uncertain reservation after paid activation = %q: %v", state, err)
+	}
+	var pendingAttemptAt *time.Time
+	if err := region.QueryRow(ctx, `SELECT stripe_redemption_attempted_at FROM user_promotion_entitlement WHERE user_id=$1`,
+		other).Scan(&pendingAttemptAt); err != nil || pendingAttemptAt == nil || !pendingAttemptAt.Equal(attemptedAt.Time) {
+		t.Fatalf("original Stripe attempt changed: attempted_at=%v err=%v", pendingAttemptAt, err)
+	}
+}
+
+func TestIntegration_StripeDeviceDenialReasonsSurvivePaidActivation(t *testing.T) {
+	ctx := context.Background()
+	region := promotionIsolatedDatabase(t, true)
+	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
+	owner, other, missing := uuid.New(), uuid.New(), uuid.New()
+	fingerprint := "visitor-" + uuid.NewString()
+	for _, user := range []uuid.UUID{owner, other, missing} {
+		rolloutExec(t, region, `INSERT INTO profile(id,email) VALUES($1,$2)`, user, user.String()+"@example.com")
+	}
+	for _, user := range []uuid.UUID{owner, other} {
+		rolloutExec(t, region, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+			user, uuid.New(), "event-"+uuid.NewString(), fingerprint)
+	}
+	// A grant issued while device enforcement was off still fences the owner
+	// after enforcement is enabled.
+	rolloutExec(t, region, `INSERT INTO promotion_device_grant(promotion,user_id,team_id,fingerprint)
+		VALUES('stripe',$1,$2,$3)`, other, uuid.New(), fingerprint)
+
+	stripe := &fakeStripeClient{}
+	router := newBillingRouterWithPool(t, stripe, region)
+	for _, tc := range []struct {
+		user   uuid.UUID
+		reason string
+	}{
+		{other, "owner_conflict"},
+		{owner, "device_already_redeemed"},
+		{missing, "evidence_missing"},
+	} {
+		team, eventID := uuid.New(), "evt_device_denial_"+uuid.NewString()
+		rolloutExec(t, region, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "promotion-"+team.String())
+		rolloutExec(t, region, `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status)
+			VALUES($1,$2,$3,'incomplete')`, team, "cus_"+team.String(), "sub_"+team.String())
+		created := time.Now().UTC().Truncate(time.Second)
+		for delivery := 0; delivery < 2; delivery++ {
+			if response := sendStripeActivationWebhook(t, router, eventID, team, tc.user, created); response.Code != http.StatusOK {
+				t.Fatalf("%s paid activation delivery %d: %d: %s", tc.reason, delivery, response.Code, response.Body.String())
+			}
+		}
+		var reason, outcome string
+		var processedAt, trialEndedAt *time.Time
+		if err := region.QueryRow(ctx, `SELECT o.outcome,o.reason,e.processed_at,a.trial_ended_at
+			FROM stripe_promotion_outcome o JOIN stripe_webhook_event e USING(event_id)
+			JOIN team_billing_account a ON a.team_id=o.team_id
+			WHERE o.event_id=$1 AND o.team_id=$2 AND o.user_id=$3`, eventID, team, tc.user).
+			Scan(&outcome, &reason, &processedAt, &trialEndedAt); err != nil ||
+			outcome != "promotion_ineligible" || reason != tc.reason || processedAt == nil || trialEndedAt == nil {
+			t.Fatalf("%s outcome = %q/%q processed=%v activated=%v: %v", tc.reason, outcome, reason, processedAt, trialEndedAt, err)
+		}
+	}
+	if len(stripe.creditGrantCalls) != 0 {
+		t.Fatalf("denied promotions reached Stripe: %d", len(stripe.creditGrantCalls))
 	}
 }
 
