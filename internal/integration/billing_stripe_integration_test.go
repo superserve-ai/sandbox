@@ -1126,6 +1126,125 @@ func TestIntegration_StripePromotionReservationTimeoutRetriesWebhook(t *testing.
 	}
 }
 
+func removeCanonicalPromotionAuthority(t *testing.T) func() error {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `ALTER TABLE promotion_identity_enforcement DISABLE TRIGGER promotion_identity_enforcement_irreversible`); err != nil {
+		t.Fatal(err)
+	}
+	var canonicalEnabled bool
+	var enabledAt *time.Time
+	var readinessReference *string
+	if err := tx.QueryRow(ctx, `
+		DELETE FROM promotion_identity_enforcement WHERE singleton
+		RETURNING enabled, enabled_at, readiness_reference
+	`).Scan(&canonicalEnabled, &enabledAt, &readinessReference); err != nil {
+		t.Fatalf("remove canonical promotion authority: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `ALTER TABLE promotion_identity_enforcement ENABLE TRIGGER promotion_identity_enforcement_irreversible`); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	authorityRestored := false
+	restoreAuthority := func() error {
+		_, err := testPool.Exec(context.Background(), `
+			INSERT INTO promotion_identity_enforcement (singleton, enabled, enabled_at, readiness_reference)
+			VALUES (true, $1, $2, $3)
+		`, canonicalEnabled, enabledAt, readinessReference)
+		if err == nil {
+			authorityRestored = true
+		}
+		return err
+	}
+	t.Cleanup(func() {
+		if authorityRestored {
+			return
+		}
+		if err := restoreAuthority(); err != nil {
+			t.Errorf("restore canonical promotion authority: %v", err)
+		}
+	})
+	return restoreAuthority
+}
+
+func TestIntegration_StripeSettledPromotionAuthorityFailureAllowsPaidResume(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, userID := seedTeamAndKeyWithRole(t, "team_owner")
+	customerID, subscriptionID := "cus_"+teamID.String(), "sub_"+teamID.String()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_billing_account (team_id, stripe_customer_id, stripe_subscription_id, stripe_subscription_status)
+		VALUES ($1, $2, $3, 'incomplete')
+	`, teamID, customerID, subscriptionID); err != nil {
+		t.Fatal(err)
+	}
+	stripe := &fakeStripeClient{}
+	router := newBillingRouter(t, stripe)
+	created := time.Now().UTC().Truncate(time.Second)
+	response := sendStripeActivationWebhook(t, router, "evt_settled_"+uuid.NewString(), teamID, userID, created)
+	if response.Code != http.StatusOK {
+		t.Fatalf("initial activation: got %d: %s", response.Code, response.Body.String())
+	}
+	before, err := testQueries.GetTeamBillingAccountByStripeCustomerID(ctx, &customerID)
+	if err != nil || before.StripeActivationCreditGrantID == nil || !before.StripeActivationCreditGrantedAt.Valid ||
+		before.StripeActivationCreditReservedAt.Valid || len(stripe.creditGrantCalls) != 1 {
+		t.Fatalf("initial promotion did not settle: account=%+v Stripe=%d err=%v", before, len(stripe.creditGrantCalls), err)
+	}
+	beforeGrants := teamCreditGrantRowCount(t, teamID)
+	removeCanonicalPromotionAuthority(t)
+
+	for i, transition := range []struct{ eventType, status string }{
+		{"customer.subscription.paused", "paused"},
+		{"customer.subscription.resumed", "active"},
+	} {
+		eventID := "evt_settled_transition_" + uuid.NewString()
+		eventAt := created.Add(time.Duration(i+1) * time.Second)
+		payload := stripeSubscriptionWebhookPayloadWithMetadata(t, eventID, transition.eventType,
+			subscriptionID, customerID, transition.status, eventAt, created, created.AddDate(0, 1, 0),
+			map[string]string{"activation_user_id": userID.String()})
+		for replay := 0; replay < 2; replay++ {
+			req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Stripe-Signature", stripeSignature(t, payload, eventAt))
+			response = doRequest(router, req)
+			if response.Code != http.StatusOK {
+				t.Fatalf("%s replay=%d: got %d: %s", transition.eventType, replay, response.Code, response.Body.String())
+			}
+		}
+		var processed bool
+		if err := testPool.QueryRow(ctx, `SELECT processed_at IS NOT NULL FROM stripe_webhook_event WHERE event_id=$1`, eventID).Scan(&processed); err != nil || !processed {
+			t.Fatalf("transition not processed: processed=%v err=%v", processed, err)
+		}
+		after, err := testQueries.GetTeamBillingAccountByStripeCustomerID(ctx, &customerID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.StripeSubscriptionStatus == nil || *after.StripeSubscriptionStatus != transition.status || !after.TrialEndedAt.Valid {
+			t.Fatalf("paid transition not applied: status=%v trial_ended_at=%v", after.StripeSubscriptionStatus, after.TrialEndedAt)
+		}
+		if !reflect.DeepEqual(after.StripeActivationCreditGrantID, before.StripeActivationCreditGrantID) ||
+			after.StripeActivationCreditGrantedAt != before.StripeActivationCreditGrantedAt ||
+			after.StripeActivationCreditReservedAt.Valid || after.StripeActivationUserID != before.StripeActivationUserID ||
+			teamCreditGrantRowCount(t, teamID) != beforeGrants || len(stripe.creditGrantCalls) != 1 {
+			t.Fatal("paid transition changed the settled promotion or issued another grant")
+		}
+	}
+	var redeemed, pending bool
+	if err := testPool.QueryRow(ctx, `
+		SELECT stripe_redemption_at IS NOT NULL AND stripe_redemption_team_id=$2,
+			stripe_redemption_reserved_team_id IS NOT NULL OR stripe_redemption_attempted_at IS NOT NULL
+		FROM user_promotion_entitlement WHERE user_id=$1
+	`, userID, teamID).Scan(&redeemed, &pending); err != nil || !redeemed || pending {
+		t.Fatalf("settled entitlement changed: redeemed=%v pending=%v err=%v", redeemed, pending, err)
+	}
+}
+
 func TestIntegration_StripePromotionAuthorityFailureAllowsPaidActivation(t *testing.T) {
 	testStripePromotionAuthorityFailureAllowsPaidActivation(t, false, false, false)
 }
@@ -1193,48 +1312,7 @@ func testStripePromotionAuthorityFailureAllowsPaidActivation(t *testing.T, reser
 			t.Fatal(err)
 		}
 	}
-	tx, err := testPool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `ALTER TABLE promotion_identity_enforcement DISABLE TRIGGER promotion_identity_enforcement_irreversible`); err != nil {
-		t.Fatal(err)
-	}
-	var canonicalEnabled bool
-	var enabledAt *time.Time
-	var readinessReference *string
-	if err := tx.QueryRow(ctx, `
-		DELETE FROM promotion_identity_enforcement WHERE singleton
-		RETURNING enabled, enabled_at, readiness_reference
-	`).Scan(&canonicalEnabled, &enabledAt, &readinessReference); err != nil {
-		t.Fatalf("remove canonical promotion authority: %v", err)
-	}
-	if _, err := tx.Exec(ctx, `ALTER TABLE promotion_identity_enforcement ENABLE TRIGGER promotion_identity_enforcement_irreversible`); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	authorityRestored := false
-	restoreAuthority := func() error {
-		_, err := testPool.Exec(context.Background(), `
-			INSERT INTO promotion_identity_enforcement (singleton, enabled, enabled_at, readiness_reference)
-			VALUES (true, $1, $2, $3)
-		`, canonicalEnabled, enabledAt, readinessReference)
-		if err == nil {
-			authorityRestored = true
-		}
-		return err
-	}
-	t.Cleanup(func() {
-		if authorityRestored {
-			return
-		}
-		if err := restoreAuthority(); err != nil {
-			t.Errorf("restore canonical promotion authority: %v", err)
-		}
-	})
+	restoreAuthority := removeCanonicalPromotionAuthority(t)
 
 	stripe := &fakeStripeClient{}
 	router := newBillingRouter(t, stripe)
