@@ -67,7 +67,7 @@ func secretRow(s db.Secret) *mockRow {
 	}}
 }
 
-// bindingMetaRow scans one ListSandboxSecretBindingMeta row (7 columns).
+// bindingMetaRow scans one live ListSandboxSecretBindingMeta row.
 func bindingMetaRow(secretID uuid.UUID, envKey, authType string, token string) func(dest ...any) error {
 	return func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = secretID
@@ -78,6 +78,17 @@ func bindingMetaRow(secretID uuid.UUID, envKey, authType string, token string) f
 		*dest[4].(*[]byte) = nil
 		*dest[5].(**string) = nil
 		*dest[6].(*[]string) = []string{"api.anthropic.com"}
+		*dest[7].(*bool) = false
+		return nil
+	}
+}
+
+// detachedKeyRow scans one ListSandboxSecretBindingMeta row for a key
+// detached from the sandbox.
+func detachedKeyRow(envKey string) func(dest ...any) error {
+	return func(dest ...any) error {
+		*dest[1].(*string) = envKey
+		*dest[7].(*bool) = true
 		return nil
 	}
 }
@@ -638,7 +649,12 @@ func TestResumeClearsKeysDetachedWhilePaused(t *testing.T) {
 		},
 	}
 	mock := &mockDBTX{
-		detachedKeys: []string{"OLD_KEY"},
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "ListSandboxSecretBindingMeta") {
+				return &scanRows{rows: []func(...any) error{detachedKeyRow("OLD_KEY")}}, nil
+			}
+			return &scanRows{}, nil
+		},
 		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
 			switch {
 			case strings.Contains(sql, "'resuming'"):
@@ -666,5 +682,36 @@ func TestResumeClearsKeysDetachedWhilePaused(t *testing.T) {
 		if v, ok := injected[k]; !ok || v != "" {
 			t.Errorf("resume injected %s = %q (set %v); want it cleared", k, v, ok)
 		}
+	}
+}
+
+// A detach re-reads the sandbox under the secret-write lock: one that was
+// paused when the request came in but is resuming by then is refused, not
+// detached with the guest left holding the key.
+func TestDetachRechecksStatusUnderTheLock(t *testing.T) {
+	teamID, sandboxID := uuid.New(), uuid.New()
+	var reads int
+	var deleted bool
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "GetSandbox"):
+				reads++
+				status := db.SandboxStatusPaused
+				if reads > 1 {
+					status = db.SandboxStatusResuming
+				}
+				return sandboxRow(db.Sandbox{ID: sandboxID, TeamID: teamID, Status: status})
+			case strings.Contains(sql, "DeleteSandboxSecretBinding"):
+				deleted = true
+			}
+			return activityRow()
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupSecretRouter(h, teamID.String()).ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/sandboxes/"+sandboxID.String()+"/secrets/KEY", nil))
+	if w.Code != http.StatusConflict || deleted {
+		t.Fatalf("status = %d deleted = %v; want 409 with nothing detached: %s", w.Code, deleted, w.Body.String())
 	}
 }

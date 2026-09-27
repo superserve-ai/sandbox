@@ -80,6 +80,10 @@ func (h *Handlers) holdSecretWrites(ctx context.Context, sandboxID uuid.UUID) (*
 		return nil, nil, err
 	}
 	if err := db.New(conn).HoldSandboxSecretWrites(ctx, sandboxID.String()); err != nil {
+		// The lock may have been taken before the error: never pooled again.
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = conn.Conn().Close(cctx)
+		cancel()
 		conn.Release()
 		return nil, nil, err
 	}
@@ -201,16 +205,23 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	// cap and exceed it — which would later wedge re-minting. The in-process lock
 	// only covers one instance. Env-key collisions are caught by the PK. The lock
 	// is held through the guest update below (see holdSecretWrites).
+	// Everything under the hold runs on the held connection, and the hold ends
+	// before anything else touches the database: a second pooled connection
+	// taken while holding one could wait on a pool this request helps drain.
 	var held *pgxpool.Conn
+	q := h.DB
+	release := func() {}
 	if h.Pool != nil {
-		conn, release, lerr := h.holdSecretWrites(ctx, sandboxID)
+		conn, rel, lerr := h.holdSecretWrites(ctx, sandboxID)
 		if lerr != nil {
 			log.Error().Err(lerr).Str("sandbox_id", sandboxID.String()).Msg("hold the secret-write lock for attach")
 			respondError(c, ErrInternal)
 			return
 		}
+		var once sync.Once
+		release = func() { once.Do(rel) }
 		defer release()
-		held = conn
+		held, q = conn, db.New(conn)
 	}
 	// inTx runs fn in one transaction on the held connection.
 	inTx := func(ctx context.Context, fn func(*db.Queries) error) error {
@@ -300,7 +311,7 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 	// status read under the lock is authoritative. Fail closed: roll back the row
 	// if the proxy JWT can't be re-minted/injected.
 	if liveSandbox.Status == db.SandboxStatusActive {
-		meta, lerr := h.loadSecretBindingMeta(ctx, sandboxID)
+		meta, _, lerr := loadSecretBindingState(ctx, q, sandboxID)
 		if lerr == nil {
 			lerr = h.applySecretBindings(ctx, liveSandbox, meta)
 		}
@@ -313,10 +324,12 @@ func (h *Handlers) AttachSandboxSecret(c *gin.Context) {
 			if rerr := inTx(rbCtx, func(q *db.Queries) error { return undoAttach(rbCtx, q, sandboxID, req.EnvKey, token) }); rerr != nil {
 				log.Error().Err(rerr).Str("sandbox_id", sandboxID.String()).Msg("undo a failed secret attach")
 			}
+			release()
 			respondError(c, ErrInternal)
 			return
 		}
 	}
+	release()
 
 	h.logSandboxActivity(ctx, sandboxID, teamID, actorIDFromContext(c), "secret", "attached", "success", &sandbox.Name, nil, nil)
 	c.JSON(http.StatusCreated, gin.H{"env_key": req.EnvKey, "secret_name": req.SecretName})
@@ -380,6 +393,18 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 				return lerr
 			}
 		}
+		// Re-read under the lock: a resume may have moved the sandbox on, and
+		// whether the guest is updated below follows the status now.
+		live, lerr := q.GetSandbox(mutCtx, db.GetSandboxParams{ID: sandboxID, TeamID: teamID})
+		if lerr != nil {
+			return lerr
+		}
+		switch live.Status {
+		case db.SandboxStatusActive, db.SandboxStatusPaused:
+		default:
+			return errSandboxMidTransition
+		}
+		sandbox = live
 		if lerr := refuseDuringCapture(mutCtx, q, sandboxID); lerr != nil {
 			return lerr
 		}
@@ -417,6 +442,10 @@ func (h *Handlers) DetachSandboxSecret(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, errSnapshotInFlight) {
 			respondSnapshotInFlight(c)
+			return
+		}
+		if errors.Is(err, errSandboxMidTransition) {
+			respondErrorMsg(c, "conflict", "sandbox is not in a state that accepts secret changes", http.StatusConflict)
 			return
 		}
 		if errors.Is(err, pgx.ErrNoRows) {

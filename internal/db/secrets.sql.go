@@ -504,30 +504,6 @@ func (q *Queries) ListAuditForSecret(ctx context.Context, arg ListAuditForSecret
 	return items, nil
 }
 
-const listDetachedSecretKeys = `-- name: ListDetachedSecretKeys :many
-SELECT env_key FROM sandbox_secret_detached WHERE sandbox_id = $1 ORDER BY env_key
-`
-
-func (q *Queries) ListDetachedSecretKeys(ctx context.Context, sandboxID uuid.UUID) ([]string, error) {
-	rows, err := q.db.Query(ctx, listDetachedSecretKeys, sandboxID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []string{}
-	for rows.Next() {
-		var env_key string
-		if err := rows.Scan(&env_key); err != nil {
-			return nil, err
-		}
-		items = append(items, env_key)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
 const listProxyAuditEvents = `-- name: ListProxyAuditEvents :many
 SELECT id, ts, team_id, sandbox_id, secret_id, method, host, path, status, upstream_status, latency_ms, error_code FROM proxy_audit
 WHERE sandbox_id = $1
@@ -592,11 +568,17 @@ func (q *Queries) ListProxyAuditEvents(ctx context.Context, arg ListProxyAuditEv
 
 const listSandboxSecretBindingMeta = `-- name: ListSandboxSecretBindingMeta :many
 SELECT s.id AS secret_id, ss.env_key, ss.proxy_token,
-       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts
+       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts, false AS detached
 FROM sandbox_secret ss
 JOIN secret s ON s.id = ss.secret_id
 WHERE ss.sandbox_id = $1 AND s.deleted_at IS NULL
-ORDER BY ss.env_key
+UNION ALL
+SELECT '00000000-0000-0000-0000-000000000000'::uuid, d.env_key, NULL::text,
+       ''::text, '{}'::jsonb, NULL::text, NULL::text[], true
+FROM sandbox_secret_detached d
+WHERE d.sandbox_id = $1
+  AND NOT EXISTS (SELECT 1 FROM sandbox_secret x WHERE x.sandbox_id = $1 AND x.env_key = d.env_key)
+ORDER BY env_key
 `
 
 type ListSandboxSecretBindingMetaRow struct {
@@ -607,10 +589,12 @@ type ListSandboxSecretBindingMetaRow struct {
 	AuthConfig       []byte    `json:"auth_config"`
 	ProviderShortcut *string   `json:"provider_shortcut"`
 	Hosts            []string  `json:"hosts"`
+	Detached         bool      `json:"detached"`
 }
 
 // Per-binding auth shape, hosts, and proxy token for a sandbox; excludes
-// soft-deleted secrets.
+// soft-deleted secrets. Keys detached and not bound again follow, marked
+// detached and with nothing else: the guest may still hold them.
 func (q *Queries) ListSandboxSecretBindingMeta(ctx context.Context, sandboxID uuid.UUID) ([]ListSandboxSecretBindingMetaRow, error) {
 	rows, err := q.db.Query(ctx, listSandboxSecretBindingMeta, sandboxID)
 	if err != nil {
@@ -628,6 +612,7 @@ func (q *Queries) ListSandboxSecretBindingMeta(ctx context.Context, sandboxID uu
 			&i.AuthConfig,
 			&i.ProviderShortcut,
 			&i.Hosts,
+			&i.Detached,
 		); err != nil {
 			return nil, err
 		}

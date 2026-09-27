@@ -1281,29 +1281,16 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 	// false proves an empty set; NULL predates the column.
 	sandbox.IpAddress = ipAddr
 	if sandbox.HadSecretBindings == nil || *sandbox.HadSecretBindings {
-		// Keys detached while paused are still in the guest: read alongside
-		// the bindings, so the resume waits on one round trip, not two.
-		type detachedRead struct {
-			keys []string
-			err  error
-		}
-		detachedCh := make(chan detachedRead, 1)
-		go func() {
-			keys, err := h.DB.ListDetachedSecretKeys(postCtx, sandboxID)
-			detachedCh <- detachedRead{keys, err}
-		}()
-		meta, merr := h.loadSecretBindingMeta(postCtx, sandboxID)
-		detached := <-detachedCh
-		if merr == nil {
-			merr = detached.err
-		}
+		// The same read returns the keys detached while paused, which are
+		// still in the guest.
+		meta, detachedKeys, merr := loadSecretBindingState(postCtx, h.DB, sandboxID)
 		if merr != nil {
 			failPost(merr, "load secret bindings on resume failed")
 			return "", false
 		}
 		// With nothing bound any more, the proxy settings name a JWT whose
 		// bindings are gone, bound to an IP the guest may not have.
-		clear := detached.keys
+		clear := detachedKeys
 		if len(clear) > 0 && len(meta) == 0 {
 			clear = append(clear, "HTTPS_PROXY")
 		}
@@ -1315,8 +1302,8 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 				return "", false
 			}
 		}
-		if len(detached.keys) > 0 {
-			keys := detached.keys
+		if len(detachedKeys) > 0 {
+			keys := detachedKeys
 			h.asyncBookkeeping("forget-detached-secret-keys", func() {
 				fctx, fcancel := context.WithTimeout(context.Background(), asyncTimeout)
 				defer fcancel()

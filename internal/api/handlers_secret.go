@@ -1200,12 +1200,24 @@ func (h *Handlers) rebindSnapshotSecrets(ctx context.Context, teamID uuid.UUID, 
 // stored proxy token is reused so re-minting a JWT doesn't rotate stand-ins; a
 // binding stored before tokens were persisted gets one minted on the fly.
 func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUID) ([]SecretBindingMeta, error) {
-	rows, err := h.DB.ListSandboxSecretBindingMeta(ctx, sandboxID)
+	meta, _, err := loadSecretBindingState(ctx, h.DB, sandboxID)
+	return meta, err
+}
+
+// loadSecretBindingState is loadSecretBindingMeta on q, with the keys
+// detached from the sandbox that its guest may still hold.
+func loadSecretBindingState(ctx context.Context, q *db.Queries, sandboxID uuid.UUID) ([]SecretBindingMeta, []string, error) {
+	rows, err := q.ListSandboxSecretBindingMeta(ctx, sandboxID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	meta := make([]SecretBindingMeta, 0, len(rows))
+	var detached []string
 	for _, r := range rows {
+		if r.Detached {
+			detached = append(detached, r.EnvKey)
+			continue
+		}
 		token := ""
 		if r.ProxyToken != nil {
 			token = *r.ProxyToken
@@ -1213,19 +1225,19 @@ func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUI
 		if token == "" {
 			t, terr := mintProxyToken(r.ProviderShortcut)
 			if terr != nil {
-				return nil, terr
+				return nil, nil, terr
 			}
 			// Persist-or-adopt: the returned token is the authoritative stored one
 			// (ours, or a concurrent writer's via COALESCE), so the token we ship in
 			// the JWT/env below always matches what detach can revoke.
-			stored, perr := h.DB.ClaimSandboxSecretProxyToken(ctx, db.ClaimSandboxSecretProxyTokenParams{
+			stored, perr := q.ClaimSandboxSecretProxyToken(ctx, db.ClaimSandboxSecretProxyTokenParams{
 				SandboxID: sandboxID, EnvKey: r.EnvKey, ProxyToken: &t,
 			})
 			if perr != nil {
-				return nil, fmt.Errorf("persist minted proxy token for %q: %w", r.EnvKey, perr)
+				return nil, nil, fmt.Errorf("persist minted proxy token for %q: %w", r.EnvKey, perr)
 			}
 			if stored == nil {
-				return nil, fmt.Errorf("persist minted proxy token for %q: no token returned", r.EnvKey)
+				return nil, nil, fmt.Errorf("persist minted proxy token for %q: no token returned", r.EnvKey)
 			}
 			token = *stored
 		}
@@ -1239,7 +1251,7 @@ func (h *Handlers) loadSecretBindingMeta(ctx context.Context, sandboxID uuid.UUI
 			ProxyToken:       token,
 		})
 	}
-	return meta, nil
+	return meta, detached, nil
 }
 
 // applySecretBindings mints the secrets JWT for meta and injects it, with the secret

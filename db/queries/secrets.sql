@@ -126,13 +126,20 @@ ORDER BY ss.env_key;
 
 -- name: ListSandboxSecretBindingMeta :many
 -- Per-binding auth shape, hosts, and proxy token for a sandbox; excludes
--- soft-deleted secrets.
+-- soft-deleted secrets. Keys detached and not bound again follow, marked
+-- detached and with nothing else: the guest may still hold them.
 SELECT s.id AS secret_id, ss.env_key, ss.proxy_token,
-       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts
+       s.auth_type, s.auth_config, s.provider_shortcut, s.hosts, false AS detached
 FROM sandbox_secret ss
 JOIN secret s ON s.id = ss.secret_id
 WHERE ss.sandbox_id = $1 AND s.deleted_at IS NULL
-ORDER BY ss.env_key;
+UNION ALL
+SELECT '00000000-0000-0000-0000-000000000000'::uuid, d.env_key, NULL::text,
+       ''::text, '{}'::jsonb, NULL::text, NULL::text[], true
+FROM sandbox_secret_detached d
+WHERE d.sandbox_id = $1
+  AND NOT EXISTS (SELECT 1 FROM sandbox_secret x WHERE x.sandbox_id = $1 AND x.env_key = d.env_key)
+ORDER BY env_key;
 
 -- name: ListSandboxesForSecret :many
 -- Returns (sandbox_id, host_id) for non-destroyed sandboxes bound to this secret.
@@ -203,9 +210,6 @@ WHERE d.sandbox_id = sqlc.arg('sandbox_id')::uuid AND d.env_key IN (
 
 -- name: ForgetDetachedSecretKey :exec
 DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = $2;
-
--- name: ListDetachedSecretKeys :many
-SELECT env_key FROM sandbox_secret_detached WHERE sandbox_id = $1 ORDER BY env_key;
 
 -- name: ForgetDetachedSecretKeys :exec
 DELETE FROM sandbox_secret_detached WHERE sandbox_id = $1 AND env_key = ANY(@env_keys::text[]);
