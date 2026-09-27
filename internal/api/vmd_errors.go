@@ -156,7 +156,11 @@ func (h *Handlers) markSandboxFailedAsync(reqCtx context.Context, sandboxID, tea
 		default:
 		}
 	}
+	// Tracked like other background writes, so a caller that waits for them
+	// (tests) sees this one land too.
+	h.asyncBegin()
 	go func() {
+		defer h.asyncEnd()
 		defer close(done)
 		defer sentrylog.Recover("mark-failed-async")
 		ctx, cancel := context.WithTimeout(asyncCtx, asyncTimeout)

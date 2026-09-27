@@ -3323,7 +3323,9 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			}
 		}
 		if vmdErr != nil {
+			h.asyncBegin()
 			go func() {
+				defer h.asyncEnd()
 				defer cleanupCancel()
 				destroy()
 			}()
