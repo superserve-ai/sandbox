@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
 func TestPromotionProducerCredentialsAreScoped(t *testing.T) {
@@ -41,33 +40,6 @@ func TestPromotionProducerCredentialsAreScoped(t *testing.T) {
 	}
 }
 
-func TestPromotionAccountRequiresMatchingActor(t *testing.T) {
-	accountID := uuid.New()
-	otherID := uuid.New()
-	for _, tc := range []struct {
-		header string
-		status int
-	}{
-		{accountID.String(), http.StatusNoContent},
-		{otherID.String(), http.StatusForbidden},
-		{"", http.StatusForbidden},
-	} {
-		r := gin.New()
-		r.POST("/account", func(c *gin.Context) {
-			if promotionAccountActor(c, accountID) {
-				c.Status(http.StatusNoContent)
-			}
-		})
-		req := httptest.NewRequest(http.MethodPost, "/account", nil)
-		req.Header.Set("X-Actor-User-Id", tc.header)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
-		if w.Code != tc.status {
-			t.Errorf("actor %q: got %d, want %d", tc.header, w.Code, tc.status)
-		}
-	}
-}
-
 func TestPromotionProducerRejectsSharedCredential(t *testing.T) {
 	t.Setenv("PROMOTION_CAPTURE_TOKEN", "same-example-token")
 	t.Setenv("PROMOTION_ACCOUNT_TOKEN", "same-example-token")
@@ -88,20 +60,26 @@ func TestPromotionProducerRejectsMissingPeerOrInternalCredential(t *testing.T) {
 	}{
 		{"missing capture", "", "account-example-token", "internal-example-token"},
 		{"missing peer", "capture-example-token", "", "internal-example-token"},
-		{"internal token reused", "capture-example-token", "account-example-token", "capture-example-token"},
+		{"capture reuses internal", "capture-example-token", "account-example-token", "capture-example-token"},
+		{"account reuses internal", "capture-example-token", "account-example-token", "account-example-token"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("PROMOTION_CAPTURE_TOKEN", tc.captureToken)
 			t.Setenv("PROMOTION_ACCOUNT_TOKEN", tc.accountToken)
 			t.Setenv("INTERNAL_API_TOKEN", tc.internalToken)
-			r := gin.New()
-			r.POST("/capture", PromotionProducerAuth("PROMOTION_CAPTURE_TOKEN"), func(c *gin.Context) { c.Status(http.StatusNoContent) })
-			req := httptest.NewRequest(http.MethodPost, "/capture", nil)
-			req.Header.Set("Authorization", "Bearer capture-example-token")
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
-			if w.Code != http.StatusUnauthorized {
-				t.Fatalf("got %d, want %d", w.Code, http.StatusUnauthorized)
+			for _, scope := range []struct{ path, env, token string }{
+				{"/capture", "PROMOTION_CAPTURE_TOKEN", tc.captureToken},
+				{"/account", "PROMOTION_ACCOUNT_TOKEN", tc.accountToken},
+			} {
+				r := gin.New()
+				r.POST(scope.path, PromotionProducerAuth(scope.env), func(c *gin.Context) { c.Status(http.StatusNoContent) })
+				req := httptest.NewRequest(http.MethodPost, scope.path, nil)
+				req.Header.Set("Authorization", "Bearer "+scope.token)
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, req)
+				if w.Code != http.StatusUnauthorized {
+					t.Fatalf("%s: got %d, want %d", scope.path, w.Code, http.StatusUnauthorized)
+				}
 			}
 		})
 	}

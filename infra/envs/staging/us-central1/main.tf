@@ -230,6 +230,9 @@ module "api" {
     PROMOTION_ACCOUNT_TOKEN = {
       secret = google_secret_manager_secret.promotion_account_token.secret_id
     }
+    PROMOTION_ACCOUNT_PUBLIC_KEY = {
+      secret = google_secret_manager_secret.promotion_account_public_key.secret_id
+    }
     SANDBOX_ACCESS_TOKEN_SEED = {
       secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
     }

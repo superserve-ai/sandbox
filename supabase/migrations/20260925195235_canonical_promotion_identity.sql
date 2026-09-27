@@ -1,3 +1,5 @@
+BEGIN;
+
 LOCK TABLE team, team_member, team_memberships, user_role_assignments,
     team_credit_grant, user_signup_trial_claim, user_promotion_entitlement
     IN SHARE ROW EXCLUSIVE MODE;
@@ -496,3 +498,5 @@ DO $$ DECLARE r text; BEGIN
         GRANT SELECT ON promotion_identity_history,promotion_identity_evidence,promotion_identity_current,promotion_identity_enforcement TO service_role;
     END IF;
 END $$;
+
+COMMIT;

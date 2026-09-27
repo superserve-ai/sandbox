@@ -1244,6 +1244,18 @@ type TeamPricingPlan struct {
 	CreatedAt     time.Time          `json:"created_at"`
 }
 
+type TeamPromotionCreationAttempt struct {
+	AttemptID            uuid.UUID `json:"attempt_id"`
+	TeamID               uuid.UUID `json:"team_id"`
+	UserID               uuid.UUID `json:"user_id"`
+	Name                 string    `json:"name"`
+	HomeRegion           string    `json:"home_region"`
+	AuthorityUnavailable bool      `json:"authority_unavailable"`
+	Outcome              *string   `json:"outcome"`
+	Reason               *string   `json:"reason"`
+	CreatedAt            time.Time `json:"created_at"`
+}
+
 type TeamSandboxCounter struct {
 	TeamID uuid.UUID `json:"team_id"`
 	Shard  int16     `json:"shard"`

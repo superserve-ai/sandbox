@@ -31,12 +31,101 @@ and selected-region registration. Missing or identical tokens deny requests;
 an unavailable shared Auth database returns `authority_unavailable` and must
 withhold credit. The regional database remains `DATABASE_URL`. Keep these
 credentials server side; the VMD internal token and tenant API keys grant no
-access. Every account operation requires `X-Actor-User-Id` equal to the
-`user_id` in the bounded JSON body. Console must set both from its trusted Auth
-signup result or authenticated server side principal, never browser input.
+access. Every account operation also requires a signed
+`X-Promotion-Account-Assertion`; `X-Actor-User-Id` does not establish identity.
+Configure `PROMOTION_ACCOUNT_PUBLIC_KEY` with the standard base64 encoding of
+its 32-byte Ed25519 public key. Missing or invalid keys reject account operations.
+The private key belongs only to Console's trusted Auth adapter, separately from
+the capture/account transport credentials; it is never deployed to the control
+plane or provided to a browser. The adapter must derive identity from the Auth
+signup result or a verified server-side session, never request fields. It must
+not offer arbitrary subject signing to holders of a promotion transport token.
+Console configures `PROMOTION_ACCOUNT_PRIVATE_KEY` as an Ed25519 PKCS#8 PEM
+private key, with actual newlines. Its corresponding raw 32-byte public key,
+standard-base64 encoded, supplies `PROMOTION_ACCOUNT_PUBLIC_KEY` in every
+selected backend cell. Neither variable uses a `NEXT_PUBLIC_` prefix. Missing,
+malformed or non-Ed25519 private keys withhold account requests before transport.
+
+The adapter signs an EdDSA JWT with `iss: promotion-auth-adapter`,
+`aud: promotion-account`, `sub: <Auth user UUID>`, `iat`, `exp`, and
+`operation: bind|evidence|register|signup-eligibility|create-team`. Both times are required, expiry must be
+later than issue time and at most five minutes after it, and future-issued or
+expired assertions reject. For `bind`, also sign `attempt_id` from the
+server-owned signup flow; `create-team` uses the separate creation binding
+described below. For evidence, registration and eligibility snapshots omit it. The control plane
+verifies the signature, issuer, audience, time bounds, operation and exact
+subject/body match, plus the attempt/body match for binding, before database
+access. `X-Actor-User-Id` is required and must equal that verified subject and
+the body's `user_id`; this is a consistency check, never login verification.
+The account bearer credential remains required, so an assertion alone
+never exposes evidence to tenants. The same assertion may retry its idempotent
+operation during its lifetime; the adapter issues a new assertion for later
+requests. This does not expire previously accepted device evidence.
+
+A binding assertion can be issued from the trusted signup response before email
+confirmation, without requiring a user session. Later retrieval and regional
+entry use fresh assertions derived from the current verified session. An
+assertion for one account or operation cannot authorize another.
+
+### Console login verification and consumer handoff
+
+For `/evidence` and `/register`, Console must use its existing request-scoped
+Auth client and call `auth.getUser()` with the current login credential. An
+Auth error, missing user, missing credential or invalid credential must stop
+the operation before signing or calling the promotion backend. Derive the JWT
+subject, actor header and body user ID only from the returned `user.id`. If a
+caller supplies a target user ID, reject a mismatch with that verified ID.
+Matching request fields, decoded JWT claims without verification, `getSession()`
+alone and user-editable metadata do not establish the principal. Reuse the
+existing login flow and Auth verification; this requires no additional database
+connection or regional identity authority.
+
+Keep the assertion signer server-only. It must not be exposed as a browser
+action accepting an arbitrary subject, operation or attempt. Browser headers
+and assertions must never be forwarded as promotion credentials. Console creates
+the outgoing bearer credential, signed assertion, actor header and body itself.
+Raw evidence responses remain inside the server and must not be returned to
+the browser.
+
+`/bind` has a separate provenance rule: retain the server-owned attempt and
+bind it only to the actual account created by the trusted email signup result
+or verified Google signup callback. Email signup can lack a session before
+confirmation; do not require a login for this initial bind or defer persistence
+until confirmation. A normal login is not authority to attach an arbitrary
+attempt to an existing account. Later evidence reuse requires verified login
+and uses the persisted binding without another capture or freshness check.
+
+Console's server-only `promotion-device-evidence` adapter verifies the existing
+login before retrieval and registration and signs each account request. Its
+optional target user ID is only a consistency constraint; the verified Auth
+result supplies the subject, actor header and body. The separate binding caller
+retains trusted signup provenance before confirmation. Backend assertion tests
+alone do not prove this consumer behavior. Deploy the matching consumer and
+public key together, and keep device enforcement off until the consumer's tests
+establish:
+
+| Case | Required result |
+| --- | --- |
+| Missing, invalid or expired login; Auth verification error | No assertion, evidence request or regional registration |
+| Verified user A with browser actor/body IDs for B, including matching forged IDs | Reject before signing or backend access |
+| Valid login for A with no browser identity fields | Derive all outgoing identity fields from verified A |
+| Browser-supplied promotion bearer token or assertion | Never use it for an outgoing promotion call |
+| Trusted email signup before confirmation, without a session | Bind the server-owned attempt to the actual new account |
+| Google signup callback | Bind only the attempt associated with that verified signup |
+| Existing login months later in another browser, including West entry | Reuse A's original evidence and register in the selected region |
+
+For signer interoperability, the Console producer test can write fresh request
+fixtures to `PROMOTION_ASSERTION_FIXTURE_OUT`. Run
+`TestPromotionAccountConsoleInterop` with `PROMOTION_ASSERTION_FIXTURE_IN` pointing
+to that file within five minutes. It passes the actual Console assertions through
+the backend middleware and handler identity checks for all three operations,
+including matching forged actor/body IDs. The fixture contains a generated test
+public key and assertions, never a private key or real account evidence. This
+test skips without the fixture; an ordinary backend suite pass is not evidence
+that the cross-runtime check ran. Record both producer and verifier execution.
 
 The staging, production East, and production West Terraform roots each create
-three cell-specific Secret Manager secrets and bind their latest versions to the
+four cell-specific Secret Manager secrets and bind their latest versions to the
 control-plane runtime identity. Apply the shared Auth migrations first, then set
 a password on the `promotion_evidence_proxy` database role. Its URL secret must
 connect as that role; the role has only `USAGE` on `public` and `EXECUTE` on the
@@ -49,9 +138,10 @@ missing or reused token rejects producer requests. A missing shared Auth
 connection or failed RPC returns `authority_unavailable` and withholds credit.
 
 Before enabling device enforcement in either production region, verify that
-each cell's serving revision has all three secret-backed environment variables,
-that both scoped credentials work only on their own routes, and that original
-evidence can be retrieved and published to the selected region. Check both
+each cell's serving revision has all four secret-backed environment variables,
+that both scoped credentials work only on their own routes, account assertions
+reject unsigned or mismatched actors, and that original evidence can be
+retrieved and published to the selected region. Check both
 regions independently, including delayed West entry. Keep the device policy
 off until these checks and the inherited canonical activation prerequisites
 have passed.
@@ -83,7 +173,8 @@ control plane before the grant decision, including delayed West entry.
    Identical verification replays; a changed event or reused event fails.
 3. After the Auth signup call returns the new Auth user's ID, Console calls
    `bind_signup_device_account(attempt, user_id)`. The caller must bind the ID
-   from that trusted server result, never an email lookup or browser parameter.
+   from that trusted server result, never an email lookup or browser parameter,
+   and sign the matching account/attempt assertion for the bind route.
    The function checks `auth.users` creation time against the attempt and
    serializes same account attempts. The first verified attempt bound to the
    account wins. A missing observation leaves the account unbound so a later
@@ -108,7 +199,7 @@ with the issued challenge and use the provider's server result.
 
 ## Regional publication and claims
 
-Apply `20260925000001_regional_promotion_device_authority.sql` in **each**
+Apply `20260927003551_regional_promotion_device_authority.sql` in **each**
 regional database. Console first publishes the existing canonical Auth identity
 observation, then obtains the shared original device evidence and calls
 `register_promotion_signup_device(user_id, source_attempt_id, source_event_id,
@@ -192,3 +283,101 @@ Deploy the shared source and each regional schema before its Console producer
 and grant path integration. Verify initial East publication and later West
 publication independently. Keep enforcement off in a region until its canonical
 readiness, producer coverage, and every local grant writer have been verified.
+
+## Atomic team creation after registration failure
+
+`POST /internal/promotion/account/create-team` is the trusted Console boundary
+for initial regional team creation. Call it after the registration attempt,
+including when registration or its authority evaluation fails. Do not create the
+team through a separate insert in that failure case: previously accepted regional
+evidence could otherwise authorize a grant.
+
+The route requires the account bearer credential, matching `X-Actor-User-Id`,
+and an EdDSA account assertion as specified above, with `operation=create-team`.
+In addition to `sub`, sign `attempt_id`, `team_id`, `home_region`, and the required
+boolean `authority_unavailable`. The selected backend verifies every signed field
+against the request and requires `home_region` to equal its `SANDBOX_ID_REGION`,
+with the existing East (`use`) default where tagged sandbox IDs are not enabled.
+Production home regions are `use` and `usw`. `attempt_id` is a new server-generated creation attempt UUID,
+separate from the original signup-evidence attempt; `team_id` is a new
+server-generated team UUID. Neither UUID can be repurposed after acceptance.
+
+Request body:
+
+```json
+{
+  "user_id": "<verified Auth user UUID>",
+  "attempt_id": "<server-generated creation attempt UUID>",
+  "team_id": "<server-generated team UUID>",
+  "name": "example-team",
+  "home_region": "use",
+  "authority_unavailable": true
+}
+```
+
+Console derives the actor from its trusted signup result or verified login,
+retains the attempt and team IDs across retries, and derives the boolean only
+from its server-side registration/authority result. Never accept a browser
+eligibility flag or forward browser promotion credentials. Sign `true` for an
+unavailable or ambiguous authority result, even if a previous registration
+succeeded. Missing evidence alone follows the evidence-required policy; confirmed
+ownership denial follows the ordinary regional claim checks. Sign `false` after
+successful registration, including `owner_conflict`; the claim still checks all
+canonical, user, team and device rules. The signed boolean can only withhold
+credit; `false` never authorizes a grant by itself.
+
+The backend calls the service-role-only SQL function:
+
+```sql
+create_team_with_promotion_attempt(
+  p_attempt_id uuid, p_team_id uuid, p_user_id uuid,
+  p_name text, p_home_region text, p_authority_unavailable boolean
+) RETURNS TABLE(team_id uuid, outcome text, reason text)
+```
+
+The binding, team insert, existing signup claim, and result commit in one regional
+transaction. A signed unavailable decision records `promotion_ineligible` /
+`authority_unavailable` before saved evidence can grant credit. It consumes no
+user, canonical or device entitlement. Success returns HTTP 200 with `team_id`,
+`outcome`, and `reason`; Console then continues its existing membership/owner
+provisioning using that team ID. This endpoint does not grant membership, bypass
+independent signup restrictions, or activate billing.
+
+Exact retries return the original result, including the original `granted`
+outcome, without another grant. Renew an expired assertion with the same binding
+and boolean. A changed actor, team, attempt, region, name or decision is rejected;
+a new attempt cannot adopt an existing team. Bindings and results have no expiry
+and survive account/team deletion; replay never recreates a deleted team. A
+previously unavailable attempt stays at zero credit after authority recovers.
+Unrelated database/provisioning failures abort the transaction and retain normal
+retry behavior; a lost response requires retrying the exact request. Do not
+switch to an ordinary team insert or generate a replacement attempt on error.
+
+`signup-eligibility` also requires a signed account assertion, with that exact
+operation and no attempt ID. It remains a non-issuing snapshot and does not
+replace the atomic creation boundary.
+
+### Integration reference and validation handoff
+
+The authentication and migration prerequisite consumed locally is
+`258a404db647eb0a0855971f38b5e887344232a9` from public PR #579. The regional migration
+names follow that revision; the grant integration migrations follow the entire
+prerequisite chain. Do not apply both the superseded migration IDs and their
+renamed replacements. This is a pre-activation integration, not a deployed
+migration-history repair.
+
+The creation regression is `TestIntegration_TrustedTeamPromotionAttempt`, covering
+prior regional evidence plus a failed registration HTTP call, exact no-credit
+replay after registration recovers, successful registration/grant, and forged or
+mismatched inputs. `TestIntegration_PromotionPolicyContentionPreservesProvisioning`
+holds a real policy-row lock across explicit team creation and legacy owner
+assignment. `TestIntegration_TrustedTeamPromotionAttemptPrivilegesAndGrantFailure`
+checks RPC/table access and preservation of unrelated grant-error retries.
+These tests are authored; canonical execution after this change is pending.
+The earlier canonical pass predates this authentication reconciliation and does
+not prove Console signer interoperability. Before activation, record the exact
+validated backend reference and run the actual Console fixture producer and
+`TestPromotionAccountConsoleInterop`; the existing fixture covers bind/evidence/
+register only. Console must additionally implement and verify the creation call
+sequence and new signed fields above before this boundary is integrated end to
+end.

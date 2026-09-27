@@ -115,11 +115,12 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	promotionCapture.POST("/attempts/verify", h.VerifyPromotionSignupAttempt)
 
 	promotionAccount := r.Group("/internal/promotion/account")
-	promotionAccount.Use(PromotionProducerAuth("PROMOTION_ACCOUNT_TOKEN"))
+	promotionAccount.Use(PromotionProducerAuth("PROMOTION_ACCOUNT_TOKEN"), PromotionAccountAuth())
 	promotionAccount.POST("/bind", h.BindPromotionSignupAccount)
 	promotionAccount.POST("/evidence", h.GetPromotionSignupAccountEvidence)
 	promotionAccount.POST("/register", h.RegisterPromotionSignupDevice)
 	promotionAccount.POST("/signup-eligibility", h.EvaluateSignupPromotion)
+	promotionAccount.POST("/create-team", h.CreateTeamWithPromotionAttempt)
 
 	// Operator endpoints — authenticated via OPERATOR_API_TOKEN, a separate
 	// credential from the infra-internal token that every vmd host holds

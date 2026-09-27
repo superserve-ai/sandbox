@@ -41,6 +41,15 @@ resource "google_secret_manager_secret" "promotion_account_token" {
   labels = local.common_labels
 }
 
+resource "google_secret_manager_secret" "promotion_account_public_key" {
+  project   = local.project_id
+  secret_id = "promotion-account-public-key-${local.resource_suffix}"
+  replication {
+    auto {}
+  }
+  labels = local.common_labels
+}
+
 locals {
   # Operators publish versions; Terraform manages only the mount and access.
   controlplane_secret_volumes = {
@@ -65,6 +74,9 @@ locals {
     }
     PROMOTION_ACCOUNT_TOKEN = {
       secret = google_secret_manager_secret.promotion_account_token.secret_id
+    }
+    PROMOTION_ACCOUNT_PUBLIC_KEY = {
+      secret = google_secret_manager_secret.promotion_account_public_key.secret_id
     }
     DATABASE_URL = {
       secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")

@@ -129,9 +129,13 @@ func (h *Handlers) VerifyPromotionSignupAttempt(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"outcome": outcome})
 }
 
-func promotionAccountActor(c *gin.Context, userID uuid.UUID) bool {
+func promotionAccountActor(c *gin.Context, input promotionAccountRequest) bool {
+	value, _ := c.Get("promotion_account")
+	claims, ok := value.(*promotionAccountClaims)
 	actor, err := uuid.Parse(c.GetHeader("X-Actor-User-Id"))
-	if err != nil || userID == uuid.Nil || actor != userID {
+	if !ok || claims == nil || err != nil || actor != input.UserID ||
+		input.UserID == uuid.Nil || claims.Subject != input.UserID.String() ||
+		(claims.Operation == "bind" && claims.AttemptID != input.AttemptID.String()) {
 		respondErrorMsg(c, "forbidden", "account provenance mismatch", http.StatusForbidden)
 		return false
 	}
@@ -139,15 +143,15 @@ func promotionAccountActor(c *gin.Context, userID uuid.UUID) bool {
 }
 
 func (h *Handlers) BindPromotionSignupAccount(c *gin.Context) {
-	if !promotionSource(c, h.PromotionAuthPool) {
-		return
-	}
 	var input promotionAccountRequest
-	if !decodePromotionRequest(c, &input) || !promotionAccountActor(c, input.UserID) {
+	if !decodePromotionRequest(c, &input) || !promotionAccountActor(c, input) {
 		return
 	}
 	if input.AttemptID == uuid.Nil {
 		respondErrorMsg(c, "invalid_request", "invalid promotion request", http.StatusBadRequest)
+		return
+	}
+	if !promotionSource(c, h.PromotionAuthPool) {
 		return
 	}
 	ctx, cancel := promotionContext(c)
@@ -175,15 +179,15 @@ func (h *Handlers) lookupPromotionEvidence(ctx context.Context, userID uuid.UUID
 }
 
 func (h *Handlers) GetPromotionSignupAccountEvidence(c *gin.Context) {
-	if !promotionSource(c, h.PromotionAuthPool) {
-		return
-	}
 	var input promotionAccountRequest
-	if !decodePromotionRequest(c, &input) || !promotionAccountActor(c, input.UserID) {
+	if !decodePromotionRequest(c, &input) || !promotionAccountActor(c, input) {
 		return
 	}
 	if input.AttemptID != uuid.Nil {
 		respondErrorMsg(c, "invalid_request", "invalid promotion request", http.StatusBadRequest)
+		return
+	}
+	if !promotionSource(c, h.PromotionAuthPool) {
 		return
 	}
 	ctx, cancel := promotionContext(c)
@@ -197,15 +201,15 @@ func (h *Handlers) GetPromotionSignupAccountEvidence(c *gin.Context) {
 }
 
 func (h *Handlers) RegisterPromotionSignupDevice(c *gin.Context) {
-	if !promotionSource(c, h.PromotionAuthPool) || !promotionSource(c, h.Pool) {
-		return
-	}
 	var input promotionAccountRequest
-	if !decodePromotionRequest(c, &input) || !promotionAccountActor(c, input.UserID) {
+	if !decodePromotionRequest(c, &input) || !promotionAccountActor(c, input) {
 		return
 	}
 	if input.AttemptID != uuid.Nil {
 		respondErrorMsg(c, "invalid_request", "invalid promotion request", http.StatusBadRequest)
+		return
+	}
+	if !promotionSource(c, h.PromotionAuthPool) || !promotionSource(c, h.Pool) {
 		return
 	}
 	ctx, cancel := promotionContext(c)
@@ -224,15 +228,15 @@ func (h *Handlers) RegisterPromotionSignupDevice(c *gin.Context) {
 }
 
 func (h *Handlers) EvaluateSignupPromotion(c *gin.Context) {
-	if !promotionSource(c, h.Pool) {
-		return
-	}
 	var input promotionAccountRequest
-	if !decodePromotionRequest(c, &input) || !promotionAccountActor(c, input.UserID) {
+	if !decodePromotionRequest(c, &input) || !promotionAccountActor(c, input) {
 		return
 	}
 	if input.AttemptID != uuid.Nil {
 		respondErrorMsg(c, "invalid_request", "invalid promotion request", http.StatusBadRequest)
+		return
+	}
+	if !promotionSource(c, h.Pool) {
 		return
 	}
 	ctx, cancel := promotionContext(c)

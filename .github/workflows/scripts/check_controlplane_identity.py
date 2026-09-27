@@ -23,7 +23,8 @@ def check(service, project, cell):
     for name, secret in (
             ('PROMOTION_AUTH_DATABASE_URL', 'promotion-auth-database-url'),
             ('PROMOTION_CAPTURE_TOKEN', 'promotion-capture-token'),
-            ('PROMOTION_ACCOUNT_TOKEN', 'promotion-account-token')):
+            ('PROMOTION_ACCOUNT_TOKEN', 'promotion-account-token'),
+            ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion-account-public-key')):
         matches = [env for env in containers[0].get('env', []) if env.get('name') == name]
         if len(matches) != 1:
             raise ValueError(f'{name} mapping is missing or duplicated')

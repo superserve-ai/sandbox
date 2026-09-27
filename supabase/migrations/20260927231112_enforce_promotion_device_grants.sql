@@ -41,8 +41,9 @@ BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('stripe-promo-user:' || p_user_id::text)::bigint);
     PERFORM pg_advisory_xact_lock(hashtext('promotion-device-user:' || p_user_id::text)::bigint);
     BEGIN
+        -- This read-only decision can time out on the policy row before any grant.
         v_reason := promotion_device_decision(p_user_id, 'signup');
-    EXCEPTION WHEN SQLSTATE '55000' OR no_data_found THEN
+    EXCEPTION WHEN SQLSTATE '55000' OR SQLSTATE '55P03' OR no_data_found THEN
         v_reason := 'authority_unavailable';
     END;
     IF v_reason <> 'eligible' THEN

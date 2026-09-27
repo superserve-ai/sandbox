@@ -27,6 +27,7 @@ class ControlplaneIdentityTest(unittest.TestCase):
                     ('PROMOTION_AUTH_DATABASE_URL', 'promotion_auth_database_url'),
                     ('PROMOTION_CAPTURE_TOKEN', 'promotion_capture_token'),
                     ('PROMOTION_ACCOUNT_TOKEN', 'promotion_account_token'),
+                    ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion_account_public_key'),
                 ):
                     self.assertIn(f'google_secret_manager_secret.{resource}.secret_id', secrets + main)
                     self.assertRegex(secrets + main, rf'{name}\s*=\s*\{{\s*secret\s*=\s*google_secret_manager_secret\.{resource}\.secret_id')
@@ -49,7 +50,8 @@ class ControlplaneIdentityTest(unittest.TestCase):
         secrets = [('OPERATOR_API_TOKEN', 'operator-api-token'),
                    ('PROMOTION_AUTH_DATABASE_URL', 'promotion-auth-database-url'),
                    ('PROMOTION_CAPTURE_TOKEN', 'promotion-capture-token'),
-                   ('PROMOTION_ACCOUNT_TOKEN', 'promotion-account-token')]
+                   ('PROMOTION_ACCOUNT_TOKEN', 'promotion-account-token'),
+                   ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion-account-public-key')]
         return {'spec': {'template': {'spec': {
             'serviceAccountName': f'superserve-controlplane-{cell}@example-project.iam.gserviceaccount.com',
             'containers': [{'env': [{'name': name, 'valueFrom': {
@@ -75,6 +77,8 @@ class ControlplaneIdentityTest(unittest.TestCase):
             lambda s: s['containers'][0]['env'][1].update(value='example-url', valueFrom={}),
             lambda s: s['containers'][0]['env'][2]['valueFrom']['secretKeyRef'].update(name='promotion-capture-token-usw2'),
             lambda s: s['containers'][0]['env'][3]['valueFrom']['secretKeyRef'].update(key=''),
+            lambda s: s['containers'][0]['env'].pop(4),
+            lambda s: s['containers'][0]['env'][4]['valueFrom']['secretKeyRef'].update(name='promotion-account-public-key-usw2'),
         ]
         for mutate in mutations:
             candidate = deepcopy(service)

@@ -55,7 +55,7 @@ func PromotionProducerAuth(envName string) gin.HandlerFunc {
 		otherToken := os.Getenv(other)
 		internalToken := os.Getenv("INTERNAL_API_TOKEN")
 		if token == "" || otherToken == "" || token == otherToken ||
-			(token == internalToken && internalToken != "") ||
+			((token == internalToken || otherToken == internalToken) && internalToken != "") ||
 			provided == auth || provided == "" ||
 			subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
 			respondErrorMsg(c, "unauthorized", "invalid promotion producer credential", http.StatusUnauthorized)
