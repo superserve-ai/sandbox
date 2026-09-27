@@ -257,6 +257,13 @@ the device grant with the settled Stripe grant in one regional transaction.
 Recoverable or uncertain external attempts retain their reservation.
 An ambiguous database transport failure during reservation is retried because
 its commit state cannot be inferred from the lost response.
+For a completed paid activation with a promotion reservation denial, the webhook writes
+`stripe_promotion_outcome` in the same transaction as activation and webhook
+completion. The row is keyed by Stripe event ID and contains the team, actor,
+`promotion_ineligible`, and a safe reason: `ineligible`, `owner_conflict`,
+`device_already_redeemed`, `evidence_missing`, `device_reservation_pending`, or
+`authority_unavailable`. A contended `blocked` reservation retries the webhook
+and has no completed outcome.
 
 `POST /internal/promotion/account/signup-eligibility` accepts `user_id` under
 the account credential and matching `X-Actor-User-Id` header. Call it in East

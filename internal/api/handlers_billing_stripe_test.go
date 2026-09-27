@@ -14,12 +14,40 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
+
+func TestStripePromotionReservationAuthorityFailureClassification(t *testing.T) {
+	for _, tc := range []struct {
+		code string
+		want bool
+	}{
+		{code: "55000", want: true},  // Invalid policy or missing reservation authority.
+		{code: "P0002", want: true},  // Missing singleton policy row.
+		{code: "42P01", want: true},  // Missing authority relation during rollout.
+		{code: "42883", want: true},  // Missing authority function during rollout.
+		{code: "55P03", want: false}, // Lock contention.
+		{code: "57014", want: false}, // Lock or statement timeout.
+		{code: "40P01", want: false}, // Deadlock.
+		{code: "40001", want: false}, // Serialization failure.
+		{code: "22023", want: false}, // Invalid input needs investigation.
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			err := fmt.Errorf("reserve: %w", &pgconn.PgError{Code: tc.code})
+			if got := isStripePromotionAuthorityFailure(err); got != tc.want {
+				t.Fatalf("authority failure = %t, want %t", got, tc.want)
+			}
+		})
+	}
+	if isStripePromotionAuthorityFailure(errors.New("connection lost")) {
+		t.Fatal("ambiguous transport failure must retry")
+	}
+}
 
 func TestStripePromotionReservationErrorsKeepCleanupIdentityAfterAttempt(t *testing.T) {
 	teamID := uuid.MustParse("00000000-0000-0000-0000-000000000001")

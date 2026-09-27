@@ -43,6 +43,12 @@ func (q *Queries) LockTeamBillingAccountByStripeCustomerID(ctx context.Context, 
 	return scanTeamBillingAccount(q.db.QueryRow(ctx, lockTeamBillingAccountByCustomerSQL, customerID))
 }
 
+// Paid activation retains the user fence when promotion policy cannot be read.
+func (q *Queries) LockStripePromotionUserForPaidActivation(ctx context.Context, userID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('stripe-promo-user:' || $1::text)::bigint)`, userID)
+	return err
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
