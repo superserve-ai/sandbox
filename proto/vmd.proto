@@ -488,6 +488,9 @@ message RestoreSnapshotRequest {
   // snapshot_path and mem_file_path must be empty and base_path, if set,
   // must be the snapshot's.
   string saved_snapshot_id = 15;
+  // Egress rules installed before the guest runs: a VM created from a saved
+  // snapshot resumes the workload it was captured with.
+  SandboxNetworkConfig sandbox_network = 16;
 }
 
 message PreviewPort {
@@ -512,6 +515,9 @@ message RestoreSnapshotResponse {
   // Empty means the vmd predates this field — it may still enforce, so
   // callers attest such vmds via UpdateSandboxPreviewPolicy instead.
   string preview_protocol = 6;
+  // True when the request's sandbox_network rules are in place on the VM.
+  // False means none were sent or the vmd predates the field.
+  bool network_rules_applied = 7;
 }
 
 // InjectSandboxEnv pushes env vars into a running sandbox's boxd. When

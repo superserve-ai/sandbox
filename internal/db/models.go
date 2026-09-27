@@ -932,6 +932,12 @@ type SandboxSecret struct {
 	ProxyToken *string   `json:"proxy_token"`
 }
 
+type SandboxSecretDetached struct {
+	SandboxID  uuid.UUID `json:"sandbox_id"`
+	EnvKey     string    `json:"env_key"`
+	DetachedAt time.Time `json:"detached_at"`
+}
+
 type SandboxSnapshot struct {
 	ID     uuid.UUID `json:"id"`
 	TeamID uuid.UUID `json:"team_id"`

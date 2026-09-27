@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -231,18 +230,11 @@ func (h *Handlers) CreateSandboxSnapshot(c *gin.Context) {
 		respondErrorMsg(c, "host_not_ready", "the sandbox's host cannot take snapshots yet; retry later", http.StatusServiceUnavailable)
 		return
 	}
-	bindings, err := h.snapshotSecretBindings(ctx, sandboxID)
-	if err != nil {
-		log.Error().Err(err).Msg("snapshot: list secret bindings")
-		respondError(c, ErrInternal)
-		return
-	}
-	row, err := h.DB.CreateSandboxSnapshot(ctx, db.CreateSandboxSnapshotParams{
+	row, err := h.insertSnapshotRow(ctx, db.CreateSandboxSnapshotParams{
 		ID:             uuid.New(),
 		Kind:           body.Kind,
 		Name:           body.Name,
 		IdempotencyKey: body.IdempotencyKey,
-		SecretBindings: bindings,
 		SweepAfter:     time.Now().Add(snapshotSweepCreatingAge),
 		SandboxID:      sandboxID,
 		TeamID:         teamID,
@@ -319,20 +311,28 @@ func respondSnapshotReplay(c *gin.Context, row db.SandboxSnapshot) {
 	c.JSON(http.StatusOK, snapshotJSON(row))
 }
 
-func (h *Handlers) snapshotSecretBindings(ctx context.Context, sandboxID uuid.UUID) ([]byte, error) {
-	rows, err := h.DB.ListSandboxSecretBindingMeta(ctx, sandboxID)
+// insertSnapshotRow writes the snapshot's row under the sandbox's
+// secret-write lock, which attach and detach take too: the bindings the row
+// records are the sandbox's at one moment, and a detach either lands before
+// it and is left out or waits for it.
+func (h *Handlers) insertSnapshotRow(ctx context.Context, p db.CreateSandboxSnapshotParams) (db.SandboxSnapshot, error) {
+	if h.Pool == nil {
+		return h.DB.CreateSandboxSnapshot(ctx, p)
+	}
+	tx, err := h.Pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		return db.SandboxSnapshot{}, err
 	}
-	type binding struct {
-		EnvKey   string    `json:"env_key"`
-		SecretID uuid.UUID `json:"secret_id"`
+	defer tx.Rollback(ctx) //nolint:errcheck
+	q := h.DB.WithTx(tx)
+	if err := q.LockSandboxForSecretWrites(ctx, p.SandboxID.String()); err != nil {
+		return db.SandboxSnapshot{}, err
 	}
-	out := make([]binding, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, binding{EnvKey: r.EnvKey, SecretID: r.SecretID})
+	row, err := q.CreateSandboxSnapshot(ctx, p)
+	if err != nil {
+		return db.SandboxSnapshot{}, err
 	}
-	return json.Marshal(out)
+	return row, tx.Commit(ctx)
 }
 
 func (h *Handlers) markSnapshotReady(ctx context.Context, id uuid.UUID, snap vmdclient.SavedSnapshot) (db.SandboxSnapshot, error) {

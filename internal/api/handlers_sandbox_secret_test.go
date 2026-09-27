@@ -67,7 +67,7 @@ func secretRow(s db.Secret) *mockRow {
 	}}
 }
 
-// bindingMetaRow scans one ListSandboxSecretBindingMeta row (7 columns).
+// bindingMetaRow scans one live ListSandboxSecretBindingMeta row.
 func bindingMetaRow(secretID uuid.UUID, envKey, authType string, token string) func(dest ...any) error {
 	return func(dest ...any) error {
 		*dest[0].(*uuid.UUID) = secretID
@@ -78,6 +78,17 @@ func bindingMetaRow(secretID uuid.UUID, envKey, authType string, token string) f
 		*dest[4].(*[]byte) = nil
 		*dest[5].(**string) = nil
 		*dest[6].(*[]string) = []string{"api.anthropic.com"}
+		*dest[7].(*bool) = false
+		return nil
+	}
+}
+
+// detachedKeyRow scans one ListSandboxSecretBindingMeta row for a key
+// detached from the sandbox.
+func detachedKeyRow(envKey string) func(dest ...any) error {
+	return func(dest ...any) error {
+		*dest[1].(*string) = envKey
+		*dest[7].(*bool) = true
 		return nil
 	}
 }
@@ -574,5 +585,133 @@ func TestDetachSandboxSecret_BadStatus_Conflict(t *testing.T) {
 
 	if w.Code != http.StatusConflict {
 		t.Fatalf("status = %d, want 409; body: %s", w.Code, w.Body.String())
+	}
+}
+
+// A secret change waits out a capture of the sandbox: the capture's row
+// recorded the bindings, and the guest it images must hold the same ones.
+func TestSecretChangesAreRefusedWhileASnapshotIsCaptured(t *testing.T) {
+	teamID, sandboxID := uuid.New(), uuid.New()
+	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Status: db.SandboxStatusActive, MemoryMib: 1024}
+	var wrote bool
+	mock := &mockDBTX{
+		captureInFlight: true,
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "GetSandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "GetSecretByName"):
+				return secretRow(db.Secret{ID: uuid.New(), TeamID: teamID, Name: "example-key", AuthType: "bearer"})
+			case strings.Contains(sql, "DeleteSandboxSecretBinding"):
+				wrote = true
+			}
+			return activityRow()
+		},
+		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			if strings.Contains(sql, "AddSandboxSecret") {
+				wrote = true
+			}
+			return pgconn.NewCommandTag("INSERT 0 1"), nil
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock), Encryptor: noopEncryptor{}, Signer: newTestSigner(t, "v1")}
+	r := setupSecretRouter(h, teamID.String())
+
+	attach := httptest.NewRecorder()
+	r.ServeHTTP(attach, attachReq(sandboxID.String(), `{"env_key":"KEY","secret_name":"example-key"}`))
+	detach := httptest.NewRecorder()
+	r.ServeHTTP(detach, httptest.NewRequest(http.MethodDelete, "/sandboxes/"+sandboxID.String()+"/secrets/KEY", nil))
+	for name, w := range map[string]*httptest.ResponseRecorder{"attach": attach, "detach": detach} {
+		if w.Code != http.StatusConflict || w.Header().Get("Retry-After") == "" {
+			t.Errorf("%s during a capture: %d %s; want a retryable 409", name, w.Code, w.Body.String())
+		}
+	}
+	if wrote {
+		t.Error("a binding changed while a capture was imaging the guest")
+	}
+}
+
+// A key detached while the sandbox was paused is still in the guest's
+// environment: the resume clears it, and with nothing bound any more the
+// proxy settings too, before the row goes active.
+func TestResumeClearsKeysDetachedWhilePaused(t *testing.T) {
+	sandboxID, teamID, snapshotID := uuid.New(), uuid.New(), uuid.New()
+	had := true
+	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HadSecretBindings = &had
+	snap := db.Snapshot{ID: snapshotID, SandboxID: sandboxID, TeamID: teamID, Path: "/snapshots/test/vmstate.snap", Trigger: "pause"}
+	var injected map[string]string
+	vmd := &stubVMD{
+		resumeFn: func(_ context.Context, _, _, _ string, _ []byte) (string, error) { return "10.0.0.5", nil },
+		injectEnvFn: func(_ context.Context, _ string, env map[string]string, _ string) error {
+			injected = env
+			return nil
+		},
+	}
+	mock := &mockDBTX{
+		queryFn: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
+			if strings.Contains(sql, "ListSandboxSecretBindingMeta") {
+				return &scanRows{rows: []func(...any) error{detachedKeyRow("OLD_KEY")}}, nil
+			}
+			return &scanRows{}, nil
+		},
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "'resuming'"):
+				return claimResumeRow(sb, &snap, "", 0)
+			case strings.Contains(sql, "FROM sandbox"):
+				return sandboxRow(sb)
+			case strings.Contains(sql, "FROM snapshot"):
+				return snapshotRow(snap)
+			default:
+				return activityRow()
+			}
+		},
+		execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+			return pgconn.NewCommandTag("UPDATE 1"), nil
+		},
+	}
+	h := &Handlers{VMD: vmd, DB: db.New(mock), Signer: newTestSigner(t, "v1")}
+	w := httptest.NewRecorder()
+	setupTestRouter(h, teamID.String()).ServeHTTP(w, resumeRequest(sandboxID.String()))
+	h.WaitAsyncBookkeeping()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d; body: %s", w.Code, w.Body.String())
+	}
+	for _, k := range []string{"OLD_KEY", "HTTPS_PROXY"} {
+		if v, ok := injected[k]; !ok || v != "" {
+			t.Errorf("resume injected %s = %q (set %v); want it cleared", k, v, ok)
+		}
+	}
+}
+
+// A detach re-reads the sandbox under the secret-write lock: one that was
+// paused when the request came in but is resuming by then is refused, not
+// detached with the guest left holding the key.
+func TestDetachRechecksStatusUnderTheLock(t *testing.T) {
+	teamID, sandboxID := uuid.New(), uuid.New()
+	var reads int
+	var deleted bool
+	mock := &mockDBTX{
+		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(sql, "GetSandbox"):
+				reads++
+				status := db.SandboxStatusPaused
+				if reads > 1 {
+					status = db.SandboxStatusResuming
+				}
+				return sandboxRow(db.Sandbox{ID: sandboxID, TeamID: teamID, Status: status})
+			case strings.Contains(sql, "DeleteSandboxSecretBinding"):
+				deleted = true
+			}
+			return activityRow()
+		},
+	}
+	h := &Handlers{VMD: &stubVMD{}, DB: db.New(mock)}
+	w := httptest.NewRecorder()
+	setupSecretRouter(h, teamID.String()).ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/sandboxes/"+sandboxID.String()+"/secrets/KEY", nil))
+	if w.Code != http.StatusConflict || deleted {
+		t.Fatalf("status = %d deleted = %v; want 409 with nothing detached: %s", w.Code, deleted, w.Body.String())
 	}
 }

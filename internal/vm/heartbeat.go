@@ -517,6 +517,7 @@ const (
 	capabilityCanReadFiles    = preview.HostCapabilityCanReadFiles
 	capabilityCanWriteFiles   = preview.HostCapabilityCanWriteFiles
 	capabilitySavedSnapshots  = preview.HostCapabilitySavedSnapshots
+	capabilitySnapshotForks   = preview.HostCapabilitySnapshotForks
 
 	// capabilityCapacityPressure marks a heartbeat from a daemon that
 	// publishes capacity pressure for this host.
@@ -1059,7 +1060,7 @@ func sendHeartbeat(ctx context.Context, client *http.Client, cfg HeartbeatConfig
 	lifecycleReady := cfg.LifecycleReady != nil && cfg.LifecycleReady()
 	resolverReady := cfg.ResolverReady != nil && cfg.ResolverReady()
 	if lifecycleReady {
-		capabilities = append(capabilities, capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots)
+		capabilities = append(capabilities, capabilityCanCreate, capabilityCanResume, capabilityCanPause, capabilityCanDestroy, capabilitySavedSnapshots, capabilitySnapshotForks)
 	}
 	if err == nil {
 		if resolverReady && proxyState.ResolverReady {

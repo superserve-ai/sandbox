@@ -306,6 +306,7 @@ func seedFixture(t *testing.T) *fixture {
 		f.sb3, f.team, sourceHostID, base)
 
 	mustExec(t, srcPool, `INSERT INTO sandbox_secret (sandbox_id, secret_id, env_key) VALUES ($1, $2, 'EXAMPLE_API_KEY')`, f.sb1, f.secret)
+	mustExec(t, srcPool, `INSERT INTO sandbox_secret_detached (sandbox_id, env_key) VALUES ($1, 'EXAMPLE_OLD_KEY')`, f.sb1)
 
 	for _, sb := range []uuid.UUID{f.sb1, f.sb2} {
 		mustExec(t, srcPool, `
@@ -453,6 +454,7 @@ func seedFixture(t *testing.T) *fixture {
 		"artifact_manifest":                  2,
 		"backup_generation":                  2,
 		"sandbox_secret":                     1,
+		"sandbox_secret_detached":            1,
 		"sandbox_active_interval":            2,
 		"sandbox_compute_billing_interval":   2,
 		"sandbox_storage_interval":           2,

@@ -106,6 +106,7 @@ var migratedTables = []tableSpec{
 	// per row, so the destination knows which cell bucket holds the bytes.
 	{"backup_generation", backupGenerationScope},
 	{"sandbox_secret", sandboxScope},
+	{"sandbox_secret_detached", sandboxScope},
 	{"sandbox_active_interval", "team_id = $1"},
 	{"sandbox_compute_billing_interval", "team_id = $1"},
 	{"sandbox_storage_interval", "team_id = $1"},

@@ -277,6 +277,8 @@ type VMConfig struct {
 	// SavedSnapshotID names a saved snapshot to create this VM from; every
 	// file it owns becomes the VM's own before use. See materializeFork.
 	SavedSnapshotID string
+	// EgressRules are installed on a restore before the guest runs.
+	EgressRules *sandboxNetworkRules
 }
 
 // ManagerConfig holds paths and settings for the VM manager.
@@ -3488,6 +3490,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				return nil, cerr
 			}
 		}
+		// The earlier attempt installed the rules before its launch, but the
+		// proxy's half lives in memory and a daemon restart drops it.
+		if resourceLimits.EgressRules != nil && !m.applyAdoptedNetworkRules(vmID, resourceLimits.EgressRules) {
+			return nil, status.Errorf(codes.Unavailable, "restore adopted vm %s but could not reinstall its egress rules", vmID)
+		}
 		log.Info().Msg("restore: VM already running and healthy, returning it")
 		return existing, nil
 	}
@@ -3904,6 +3911,12 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			macAddr = netInfo.MACAddress
 			hostIP = netInfo.HostIP
 			nsName = netInfo.Namespace
+		}
+		if err := m.applySandboxNetworkRules(vmID, m.netMgr.GetVMNetInfo(vmID), resourceLimits.EgressRules); err != nil {
+			tFailBoundary = time.Now()
+			m.releaseFailedRestore(vmID, reuse, false, cleanupAfterRestoreFailure)
+			m.setStatus(vmID, StatusError)
+			return nil, err
 		}
 		tNetReady = time.Now()
 

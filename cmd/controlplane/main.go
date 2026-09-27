@@ -622,7 +622,13 @@ func (c *grpcVMDClient) ResumeInstance(ctx context.Context, vmID, snapshotPath, 
 // instance from the snapshot files, bypassing any in-memory state. For
 // sandboxes with secrets the caller passes envVars=nil and pushes env via
 // InjectSandboxEnv after minting a JWT against the returned source IP.
-func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, error) {
+func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath, memPath, basePath, deltaDir, teamID, ownerID string, previewAccess string, previewPorts map[int32]vmdclient.PortPolicy, previewPolicyRevision int64, envVars map[string]string, limits vmdclient.ResourceLimits) (string, uint32, uint32, string, bool, error) {
+	var sandboxNetwork *vmdpb.SandboxNetworkConfig
+	if e := limits.Egress; e != nil {
+		sandboxNetwork = &vmdpb.SandboxNetworkConfig{Egress: &vmdpb.SandboxNetworkEgressConfig{
+			AllowedCidrs: e.AllowedCIDRs, DeniedCidrs: e.DeniedCIDRs, AllowedDomains: e.AllowedDomains,
+		}}
+	}
 	resp, err := c.client.RestoreSnapshot(ctx, &vmdpb.RestoreSnapshotRequest{
 		VmId:                  vmID,
 		SnapshotPath:          snapshotPath,
@@ -640,17 +646,19 @@ func (c *grpcVMDClient) RestoreSnapshot(ctx context.Context, vmID, snapshotPath,
 		// socket probe and a goroutine on the host, and the VM is
 		// counted as unsized until that lands. Omitted (zero) only by
 		// callers that do not know the shape.
-		ResourceLimits: restoreResourceLimits(limits),
+		ResourceLimits:  restoreResourceLimits(limits),
+		SavedSnapshotId: limits.SavedSnapshotID,
+		SandboxNetwork:  sandboxNetwork,
 	})
 	if err != nil {
-		return "", 0, 0, "", fmt.Errorf("gRPC RestoreSnapshot: %w", err)
+		return "", 0, 0, "", false, fmt.Errorf("gRPC RestoreSnapshot: %w", err)
 	}
 	var vcpu, mem uint32
 	if rl := resp.GetResourceLimits(); rl != nil {
 		vcpu = rl.GetVcpuCount()
 		mem = rl.GetMemoryMib()
 	}
-	return resp.IpAddress, vcpu, mem, resp.GetPreviewProtocol(), nil
+	return resp.IpAddress, vcpu, mem, resp.GetPreviewProtocol(), resp.GetNetworkRulesApplied(), nil
 }
 
 // restoreResourceLimits maps a declared allocation onto the request
