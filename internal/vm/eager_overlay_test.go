@@ -49,7 +49,7 @@ func TestEagerOverlayEnabled(t *testing.T) {
 // forkLoadBody runs a fork of a fresh saved snapshot of a paused source until
 // Firecracker's load request, and returns that request's body. The fake API
 // refuses the load so the restore stops there.
-func forkLoadBody(t *testing.T, layered, capable bool) string {
+func forkLoadBody(t *testing.T, layered, capable bool) (body, mode string) {
 	t.Helper()
 	useTempFloor(t)
 	withPSI(t, 0, 0)
@@ -63,6 +63,8 @@ func forkLoadBody(t *testing.T, layered, capable bool) string {
 	m.cfg.RunDir = runDir
 	m.restoreSem = make(chan struct{}, 1)
 	m.netMgr = &fakeNetMgr{}
+	sink := &phaseSink{}
+	m.recorder = sink
 	m.cfg.UffdEnabled, m.cfg.ResumeUffdEnabled = true, true
 	m.eagerOverlayCapable.Store(capable)
 	src, _ := seedPausedSource(t, m, layered)
@@ -70,10 +72,7 @@ func forkLoadBody(t *testing.T, layered, capable bool) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var (
-		mu   sync.Mutex
-		body string
-	)
+	var mu sync.Mutex
 	m.launchFirecrackerHook = func(_ context.Context, _, socketPath, _, _, _ string, _ Supervision, _, _ bool) (int, Supervision, error) {
 		ln, err := net.Listen("unix", socketPath)
 		if err != nil {
@@ -102,18 +101,19 @@ func forkLoadBody(t *testing.T, layered, capable bool) string {
 	if body == "" {
 		t.Fatalf("the restore never sent a load request: %v", rerr)
 	}
-	return body
+	return body, sink.modeOf("restore", "load_snapshot")
 }
 
 func TestForkRestoreAsksForEagerOverlayOnlyWhenLayeredAndCapable(t *testing.T) {
-	if b := forkLoadBody(t, true, true); !strings.Contains(b, `"eager_overlay":true`) {
-		t.Fatalf("a layered fork on a capable binary must ask for the pre-copy: %s", b)
+	b, mode := forkLoadBody(t, true, true)
+	if !strings.Contains(b, `"eager_overlay":true`) || mode != "eager" {
+		t.Fatalf("a layered fork on a capable binary must ask for the pre-copy under its own mode; mode=%q body=%s", mode, b)
 	}
-	if b := forkLoadBody(t, true, false); strings.Contains(b, "eager_overlay") {
-		t.Fatalf("a binary without the capability must not be sent the field: %s", b)
-	}
-	if b := forkLoadBody(t, false, true); strings.Contains(b, "eager_overlay") {
-		t.Fatalf("a fork with no overlay has nothing to pre-copy: %s", b)
+	for _, c := range []struct{ layered, capable bool }{{true, false}, {false, true}} {
+		b, mode := forkLoadBody(t, c.layered, c.capable)
+		if strings.Contains(b, "eager_overlay") || mode != "" {
+			t.Fatalf("layered=%v capable=%v must not pre-copy; mode=%q body=%s", c.layered, c.capable, mode, b)
+		}
 	}
 }
 

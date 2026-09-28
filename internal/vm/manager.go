@@ -3872,6 +3872,13 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// the sidecar read after Firecracker and networking have started, on
 	// user-visible restore latency.
 	sidecarBase, hasSidecar := readLayeredBase(memPath)
+	// Only a fork pre-copies: its overlay is what it will read, and its per-fork
+	// copy starts cold on every restore. Decided before any phase is recorded,
+	// so every phase of a pre-copying restore carries its own mode.
+	eager := plan.action == restoreMaterializeFork && hasSidecar && m.eagerOverlayEnabled()
+	if eager {
+		restoreMode = strings.TrimPrefix(restoreMode+"+eager", "+")
+	}
 	var (
 		restoreClockFrozen bool
 		clockRetried       bool
@@ -4137,9 +4144,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				inst.mu.Unlock()
 			}
 			if attemptErr == nil {
-				// Only a fork pre-copies: its overlay is what it will read, and
-				// its per-fork copy starts cold on every restore.
-				eager := plan.action == restoreMaterializeFork && hasSidecar && m.eagerOverlayEnabled()
 				var armed string
 				armed, restoreClockFrozen, attemptErr = m.restoreWithSessionFallback(trackingSessionID, func(sid string) (bool, error) {
 					return m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
@@ -4177,6 +4181,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// looks the same as before, which is indistinguishable from the
 			// feature being off.
 			Bool("guest_clock_frozen", restoreClockFrozen).
+			Bool("eager_overlay", eager).
 			Msg("snapshot loaded")
 		// Failed attempts included: a slow failing load (tap-busy retry,
 		// terminal failure) must appear in the distribution, not vanish.
