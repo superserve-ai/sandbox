@@ -7,6 +7,42 @@ resource "google_service_account" "controlplane_runtime" {
   description  = "Cloud Run control plane for the staging cell; never attach to a VMD host."
 }
 
+resource "google_secret_manager_secret" "promotion_auth_database_url" {
+  project   = local.project_id
+  secret_id = "promotion-auth-database-url-${local.resource_suffix}"
+  replication {
+    auto {}
+  }
+  labels = local.common_labels
+}
+
+resource "google_secret_manager_secret" "promotion_capture_token" {
+  project   = local.project_id
+  secret_id = "promotion-capture-token-${local.resource_suffix}"
+  replication {
+    auto {}
+  }
+  labels = local.common_labels
+}
+
+resource "google_secret_manager_secret" "promotion_account_token" {
+  project   = local.project_id
+  secret_id = "promotion-account-token-${local.resource_suffix}"
+  replication {
+    auto {}
+  }
+  labels = local.common_labels
+}
+
+resource "google_secret_manager_secret" "promotion_account_public_key" {
+  project   = local.project_id
+  secret_id = "promotion-account-public-key-${local.resource_suffix}"
+  replication {
+    auto {}
+  }
+  labels = local.common_labels
+}
+
 resource "google_project_iam_member" "controlplane_metric_writer" {
   project = local.project_id
   role    = "roles/monitoring.metricWriter"
@@ -32,16 +68,34 @@ resource "google_service_account_iam_member" "controlplane_deploy_token_creator"
 }
 
 locals {
-  controlplane_secret_ids = toset([
-    coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}"),
-    coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}"),
-    coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}"),
-    coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}"),
-    coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}"),
-    google_secret_manager_secret.stripe_secret_key.secret_id,
-    google_secret_manager_secret.stripe_webhook_secret.secret_id,
-    google_secret_manager_secret.stripe_meter_error_webhook_secret.secret_id,
-  ])
+  promotion_evidence_secrets = var.promotion_evidence_enabled ? {
+    PROMOTION_AUTH_DATABASE_URL = {
+      secret = google_secret_manager_secret.promotion_auth_database_url.secret_id
+    }
+    PROMOTION_CAPTURE_TOKEN = {
+      secret = google_secret_manager_secret.promotion_capture_token.secret_id
+    }
+    PROMOTION_ACCOUNT_TOKEN = {
+      secret = google_secret_manager_secret.promotion_account_token.secret_id
+    }
+    PROMOTION_ACCOUNT_PUBLIC_KEY = {
+      secret = google_secret_manager_secret.promotion_account_public_key.secret_id
+    }
+  } : {}
+
+  controlplane_secret_ids = toset(concat(
+    [for config in values(local.promotion_evidence_secrets) : config.secret],
+    [
+      coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}"),
+      coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}"),
+      coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}"),
+      coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}"),
+      coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}"),
+      google_secret_manager_secret.stripe_secret_key.secret_id,
+      google_secret_manager_secret.stripe_webhook_secret.secret_id,
+      google_secret_manager_secret.stripe_meter_error_webhook_secret.secret_id,
+    ],
+  ))
 }
 
 resource "google_secret_manager_secret_iam_member" "controlplane_runtime" {
