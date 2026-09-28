@@ -146,6 +146,7 @@ func TestIntegration_DeviceReservationRetainsAmbiguousStripePins(t *testing.T) {
 
 func TestIntegration_PromotionDeviceAliasesAfterRegionalAccountDeletion(t *testing.T) {
 	region := promotionIsolatedDatabase(t, true)
+	promotionExampleProviderDomains(t, region)
 	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
 	for _, state := range []string{"unclaimed", "redeemed"} {
 		t.Run(state, func(t *testing.T) {
@@ -163,7 +164,7 @@ func TestIntegration_PromotionDeviceAliasesAfterRegionalAccountDeletion(t *testi
 				}
 				return user
 			}
-			owner := newActor(mailbox+"@gmail.com", fingerprint, "owner")
+			owner := newActor(mailbox+"@mail.example.com", fingerprint, "owner")
 			var ownerTeam uuid.UUID
 			if state == "redeemed" {
 				var outcome string
@@ -182,11 +183,11 @@ func TestIntegration_PromotionDeviceAliasesAfterRegionalAccountDeletion(t *testi
 			}
 			assertAliasDenied := func(device, registration, wantOutcome, wantReason, wantReservation string) {
 				t.Helper()
-				email := strings.ToUpper(mailbox[:6]+"."+mailbox[6:]) + "+" + uuid.NewString() + "@GOOGLEMAIL.COM"
+				email := strings.ToUpper(mailbox[:6]+"."+mailbox[6:]) + "+" + uuid.NewString() + "@ALIAS.EXAMPLE.COM"
 				alias := newActor(email, device, registration)
 				var sameIdentity bool
 				if err := region.QueryRow(ctx, `SELECT promotion_identity_key($1,$2,true)=promotion_identity_key($3,$4,true)`,
-					owner, mailbox+"@gmail.com", alias, email).Scan(&sameIdentity); err != nil || !sameIdentity {
+					owner, mailbox+"@mail.example.com", alias, email).Scan(&sameIdentity); err != nil || !sameIdentity {
 					t.Fatalf("fixture must share canonical identity: %t, %v", sameIdentity, err)
 				}
 				team := uuid.New()
