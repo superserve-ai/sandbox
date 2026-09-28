@@ -2210,8 +2210,24 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, quer
 			return nil, err
 		}
 	}
+	existingReservation := account.StripeActivationCreditReservedAt.Valid
+	existingAttempted := false
+	if existingReservation && userID != uuid.Nil {
+		existingAttempted, err = queries.StripePromotionWasAttempted(ctx, db.StripePromotionWasAttemptedParams{
+			TeamID: pgtype.UUID{Bytes: account.TeamID, Valid: true}, UserID: userID,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	state, err := queries.ReserveStripePromotionForSubscriptionEventState(ctx, stripePromotionSubscriptionReservationParams(account.TeamID, userID, event.ID, obj))
 	if err != nil {
+		// An attempted reservation is the durable recovery fence for an
+		// ambiguous Stripe call. Never turn a replay error into a paid-only
+		// completion, even when the policy read itself is unavailable.
+		if existingReservation && existingAttempted {
+			return nil, err
+		}
 		if !isStripePromotionAuthorityFailure(err) {
 			return nil, err
 		}
@@ -2223,6 +2239,11 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, quer
 	case "acquired", "existing", "blocked":
 	case "ineligible", "user_already_redeemed", "owner_conflict", "device_already_redeemed", "evidence_missing", "device_reservation_pending":
 		denialReason = state
+	case "authority_unavailable":
+		return &stripePromotionPreReservation{
+			EventID: event.ID, TeamID: account.TeamID, UserID: userID,
+			AuthorityUnavailable: true, DenialReason: state,
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown Stripe promotion reservation state %q", state)
 	}

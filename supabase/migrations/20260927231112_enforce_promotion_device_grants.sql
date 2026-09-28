@@ -58,23 +58,10 @@ BEGIN
         RETURN QUERY SELECT 'promotion_ineligible'::text, v_reason;
         RETURN;
     END IF;
-    BEGIN
-        SELECT c.outcome, c.reason INTO v_outcome, v_claim_reason
-            FROM claim_team_signup_trial_without_device(p_team_id, p_user_id) c;
-    EXCEPTION WHEN SQLSTATE '55000' OR no_data_found THEN
-        v_outcome := 'promotion_ineligible';
-        v_claim_reason := 'authority_unavailable';
-        IF v_provenance.legacy_grant_id IS NULL THEN
-            INSERT INTO team_signup_trial_denial(team_id) VALUES(p_team_id) ON CONFLICT DO NOTHING;
-        END IF;
-        INSERT INTO team_signup_promotion_outcome(team_id, user_id, outcome, reason)
-            VALUES(p_team_id, p_user_id, v_outcome, v_claim_reason);
-        UPDATE team_signup_trial_provenance SET creator_user_id = p_user_id,
-            creator_bound_at = COALESCE(creator_bound_at, now()), completed_at = now()
-            WHERE team_id = p_team_id;
-        RETURN QUERY SELECT v_outcome, v_claim_reason;
-        RETURN;
-    END;
+    -- Provisioning and grant errors must remain retryable. Only the
+    -- read-only device decision above is converted to a fail-closed result.
+    SELECT c.outcome, c.reason INTO v_outcome, v_claim_reason
+        FROM claim_team_signup_trial_without_device(p_team_id, p_user_id) c;
     IF v_outcome = 'granted' THEN
         SELECT e.fingerprint INTO v_fingerprint FROM promotion_signup_device_evidence e WHERE e.user_id = p_user_id;
         INSERT INTO promotion_device_grant(promotion, user_id, team_id, fingerprint)
@@ -174,7 +161,13 @@ BEGIN
         RETURN reserve_stripe_promotion_for_subscription_event_state_without_device(p_team_id, p_user_id,
             p_event_id, p_subscription_id, p_checkout_generation, p_has_checkout_generation);
     END IF;
-    v_decision := promotion_device_decision(p_user_id, 'stripe');
+    BEGIN
+        -- A policy-row lock timeout is a promotion-only authority failure.
+        -- Financial reservation contention must still propagate and retry.
+        v_decision := promotion_device_decision(p_user_id, 'stripe');
+    EXCEPTION WHEN SQLSTATE '55P03' THEN
+        RETURN 'authority_unavailable';
+    END;
     IF v_decision <> 'eligible' THEN RETURN v_decision; END IF;
     SELECT fingerprint INTO v_fingerprint FROM promotion_signup_device_evidence WHERE user_id = p_user_id;
     v_result := reserve_stripe_promotion_for_subscription_event_state_without_device(p_team_id, p_user_id,
@@ -213,14 +206,17 @@ RETURNS text LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog,public AS 
     SELECT reserve_stripe_promotion_with_device(p_team_id,p_user_id,p_event_id,NULL,NULL,false)
 $$;
 REVOKE ALL ON FUNCTION reserve_stripe_promotion_for_subscription_event_state(uuid,uuid,text,text,timestamptz,boolean) FROM PUBLIC;
+REVOKE ALL ON FUNCTION reserve_stripe_promotion_for_event_state(uuid,uuid,text) FROM PUBLIC;
 DO $$ DECLARE r text; BEGIN
     FOREACH r IN ARRAY ARRAY['anon','authenticated'] LOOP
         IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
             EXECUTE format('REVOKE ALL ON FUNCTION reserve_stripe_promotion_for_subscription_event_state(uuid,uuid,text,text,timestamptz,boolean) FROM %I', r);
+            EXECUTE format('REVOKE ALL ON FUNCTION reserve_stripe_promotion_for_event_state(uuid,uuid,text) FROM %I', r);
         END IF;
     END LOOP;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='service_role') THEN
         GRANT EXECUTE ON FUNCTION reserve_stripe_promotion_for_subscription_event_state(uuid,uuid,text,text,timestamptz,boolean) TO service_role;
+        GRANT EXECUTE ON FUNCTION reserve_stripe_promotion_for_event_state(uuid,uuid,text) TO service_role;
     END IF;
 END $$;
 
