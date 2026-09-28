@@ -65,7 +65,7 @@ locals {
     [for config in values(local.controlplane_secret_volumes) : config.secret],
   ))
 
-  controlplane_secrets = {
+  promotion_evidence_secrets = var.promotion_evidence_enabled ? {
     PROMOTION_AUTH_DATABASE_URL = {
       secret = google_secret_manager_secret.promotion_auth_database_url.secret_id
     }
@@ -78,6 +78,9 @@ locals {
     PROMOTION_ACCOUNT_PUBLIC_KEY = {
       secret = google_secret_manager_secret.promotion_account_public_key.secret_id
     }
+  } : {}
+
+  controlplane_secrets = merge(local.promotion_evidence_secrets, {
     DATABASE_URL = {
       secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
     }
@@ -114,7 +117,7 @@ locals {
     STRIPE_METER_ERROR_WEBHOOK_SECRET = {
       secret = "stripe-meter-error-webhook-secret-usw"
     }
-  }
+  })
 }
 
 resource "google_secret_manager_secret_iam_member" "controlplane_runtime_secrets" {

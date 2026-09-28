@@ -220,19 +220,7 @@ module "api" {
     STRIPE_API_VERSION          = "2026-05-27.dahlia"
     APP_ALLOWED_ORIGINS         = "https://console-staging.superserve.ai"
   }
-  secrets = {
-    PROMOTION_AUTH_DATABASE_URL = {
-      secret = google_secret_manager_secret.promotion_auth_database_url.secret_id
-    }
-    PROMOTION_CAPTURE_TOKEN = {
-      secret = google_secret_manager_secret.promotion_capture_token.secret_id
-    }
-    PROMOTION_ACCOUNT_TOKEN = {
-      secret = google_secret_manager_secret.promotion_account_token.secret_id
-    }
-    PROMOTION_ACCOUNT_PUBLIC_KEY = {
-      secret = google_secret_manager_secret.promotion_account_public_key.secret_id
-    }
+  secrets = merge(local.promotion_evidence_secrets, {
     SANDBOX_ACCESS_TOKEN_SEED = {
       secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
     }
@@ -258,7 +246,7 @@ module "api" {
     STRIPE_METER_ERROR_WEBHOOK_SECRET = {
       secret = google_secret_manager_secret.stripe_meter_error_webhook_secret.secret_id
     }
-  }
+  })
   vpc_connector = module.network.vpc_connector_id
   labels        = local.common_labels
 

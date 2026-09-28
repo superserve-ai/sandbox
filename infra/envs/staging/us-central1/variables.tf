@@ -1,3 +1,10 @@
+variable "promotion_evidence_enabled" {
+  description = "Attach promotion evidence secrets only after operators publish all four versions and prepare shared Auth. Does not enable device policy."
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
 variable "project_id" {
   description = "GCP project ID for staging."
   type        = string

@@ -223,6 +223,96 @@ func TestIntegration_PromotionSignupGrantWithLateDeviceEvidence(t *testing.T) {
 	}
 }
 
+func TestIntegration_LegacySignupDeviceGrantSurvivesActivation(t *testing.T) {
+	for _, lateEvidence := range []bool{false, true} {
+		name := "registered before grant"
+		if lateEvidence {
+			name = "registered after grant"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			region := promotionIsolatedDatabase(t, true)
+			owner, recipient, team := uuid.New(), uuid.New(), uuid.New()
+			fingerprint := "visitor-" + uuid.NewString()
+			register := func(user uuid.UUID, want string) {
+				t.Helper()
+				var result string
+				if err := region.QueryRow(ctx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+					user, uuid.New(), "event-"+uuid.NewString(), fingerprint).Scan(&result); err != nil || result != want {
+					t.Fatalf("registration = %q, want %q: %v", result, want, err)
+				}
+			}
+			register(owner, "owner")
+			rolloutExec(t, region, `INSERT INTO profile(id,email) VALUES($1,$2)`, recipient, recipient.String()+"@example.com")
+			if !lateEvidence {
+				register(recipient, "owner_conflict")
+			}
+			rolloutExec(t, region, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "promotion-"+team.String())
+			// Model a grant issued before the public claim became device-aware.
+			claimLegacy := func() {
+				t.Helper()
+				var outcome, reason string
+				if err := region.QueryRow(ctx, `SELECT * FROM claim_team_signup_trial_without_device($1,$2)`, team, recipient).
+					Scan(&outcome, &reason); err != nil || outcome != "granted" {
+					t.Fatalf("legacy signup = %q, %q: %v", outcome, reason, err)
+				}
+			}
+			claimLegacy()
+			if lateEvidence {
+				register(recipient, "owner_conflict")
+			}
+			var legacyOnly bool
+			if err := region.QueryRow(ctx, `SELECT
+				EXISTS(SELECT 1 FROM user_signup_trial_claim WHERE user_id=$1 AND team_id=$2)
+				AND EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$1 AND signup_trial_claimed_at IS NOT NULL)
+				AND NOT EXISTS(SELECT 1 FROM promotion_device_grant WHERE user_id=$1)`, recipient, team).
+				Scan(&legacyOnly); err != nil || !legacyOnly {
+				t.Fatalf("expected legacy consumption without a device grant: %t, %v", legacyOnly, err)
+			}
+			rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
+			assertOwnerDenied := func() {
+				t.Helper()
+				var decision string
+				if err := region.QueryRow(ctx, `SELECT promotion_device_decision($1,'signup')`, owner).
+					Scan(&decision); err != nil || decision != "device_already_redeemed" {
+					t.Fatalf("owner decision = %q: %v", decision, err)
+				}
+				ownerTeam, outcome := promotionClaimSignup(t, region, owner)
+				if outcome != "promotion_ineligible" {
+					t.Fatalf("owner signup = %q", outcome)
+				}
+				var consumed bool
+				if err := region.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_credit_grant WHERE team_id=$1)
+					OR EXISTS(SELECT 1 FROM user_signup_trial_claim WHERE user_id=$2)
+					OR EXISTS(SELECT 1 FROM promotion_device_grant WHERE user_id=$2)`, ownerTeam, owner).
+					Scan(&consumed); err != nil || consumed {
+					t.Fatalf("denied owner consumed credit: %t, %v", consumed, err)
+				}
+			}
+			assertOwnerDenied()
+			claimLegacy()
+			var retained bool
+			if err := region.QueryRow(ctx, `SELECT count(*)=1 AND sum(amount_usd)=5 AND sum(remaining_usd)=5
+				FROM team_credit_grant WHERE team_id=$1 AND reason='signup trial credit'`, team).
+				Scan(&retained); err != nil || !retained {
+				t.Fatalf("legacy grant changed after activation and replay: %t, %v", retained, err)
+			}
+			rolloutExec(t, region, `DELETE FROM team_credit_grant WHERE team_id=$1`, team)
+			rolloutExec(t, region, `DELETE FROM team WHERE id=$1`, team)
+			rolloutExec(t, region, `DELETE FROM profile WHERE id=$1`, recipient)
+			var cascaded bool
+			if err := region.QueryRow(ctx, `SELECT
+				NOT EXISTS(SELECT 1 FROM user_signup_trial_claim WHERE user_id=$1)
+				AND NOT EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$1)
+				AND EXISTS(SELECT 1 FROM promotion_identity_history WHERE user_id=$1 AND promotion='signup' AND grant_state='granted')`, recipient).
+				Scan(&cascaded); err != nil || !cascaded {
+				t.Fatalf("legacy grant history did not survive account deletion: %t, %v", cascaded, err)
+			}
+			assertOwnerDenied()
+		})
+	}
+}
+
 func TestIntegration_SignupClaimWaitsForRegionalEvidenceRegistration(t *testing.T) {
 	ctx := context.Background()
 	region := promotionIsolatedDatabase(t, true)
@@ -826,6 +916,84 @@ func TestIntegration_LateDeviceEvidencePinsPendingStripeReservation(t *testing.T
 	if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_with_device($1,$2,$3,NULL,NULL,false)`,
 		ownerTeam, owner, "evt-"+uuid.NewString()).Scan(&result); err != nil || result != "device_reservation_pending" {
 		t.Fatalf("owner escaped pending reservation: %s, %v", result, err)
+	}
+}
+
+func TestIntegration_LegacyStripeDeviceReservationSurvivesActivation(t *testing.T) {
+	for _, settlement := range []bool{false, true} {
+		name := "released"
+		if settlement {
+			name = "settled"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			region := promotionIsolatedDatabase(t, true)
+			owner, other, ownerTeam, otherTeam := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+			fingerprint := "visitor-" + uuid.NewString()
+			for _, user := range []uuid.UUID{owner, other} {
+				rolloutExec(t, region, `INSERT INTO profile(id,email) VALUES($1,$2)`, user, user.String()+"@example.com")
+				var result string
+				if err := region.QueryRow(ctx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+					user, uuid.New(), "event-"+uuid.NewString(), fingerprint).Scan(&result); err != nil {
+					t.Fatal(err)
+				}
+				if user == owner && result != "owner" || user == other && result != "owner_conflict" {
+					t.Fatalf("registration for %s: %s", user, result)
+				}
+			}
+			for _, team := range []uuid.UUID{ownerTeam, otherTeam} {
+				rolloutExec(t, region, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "promotion-"+team.String())
+				rolloutExec(t, region, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team)
+			}
+			event := "evt-" + uuid.NewString()
+			var result string
+			// Preserve the pre-enforcement reservation shape without a device pin.
+			if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state_without_device($1,$2,$3,NULL,NULL,false)`,
+				otherTeam, other, event).Scan(&result); err != nil || result != "acquired" {
+				t.Fatalf("legacy reservation while device policy is off: %s, %v", result, err)
+			}
+			assertLegacyPending := func() {
+				t.Helper()
+				var retained bool
+				if err := region.QueryRow(ctx, `SELECT stripe_device_fingerprint IS NULL
+					AND stripe_redemption_reserved_team_id=$2 AND stripe_redemption_at IS NULL
+					FROM user_promotion_entitlement WHERE user_id=$1`, other, otherTeam).
+					Scan(&retained); err != nil || !retained {
+					t.Fatalf("legacy reservation without device pin was not retained: %t, %v", retained, err)
+				}
+			}
+			reserve := func(team, user uuid.UUID, event, want string) {
+				t.Helper()
+				if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_with_device($1,$2,$3,NULL,NULL,false)`,
+					team, user, event).Scan(&result); err != nil || result != want {
+					t.Fatalf("device reservation = %q, want %q: %v", result, want, err)
+				}
+			}
+			assertLegacyPending()
+			rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
+			reserve(ownerTeam, owner, "evt-"+uuid.NewString(), "device_reservation_pending")
+			reserve(otherTeam, other, event, "existing")
+			assertLegacyPending()
+			reserve(ownerTeam, owner, "evt-"+uuid.NewString(), "device_reservation_pending")
+
+			completion, err := region.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer completion.Rollback(context.Background())
+			want := "acquired"
+			if settlement {
+				rolloutExec(t, completion, `SELECT finalize_stripe_promotion($1,$2,$3)`, otherTeam, other, "grant-"+uuid.NewString())
+				want = "device_already_redeemed"
+			} else {
+				rolloutExec(t, completion, `SELECT release_stripe_promotion($1,$2)`, otherTeam, other)
+			}
+			reserve(ownerTeam, owner, "evt-"+uuid.NewString(), "device_reservation_pending")
+			if err := completion.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			reserve(ownerTeam, owner, "evt-"+uuid.NewString(), want)
+		})
 	}
 }
 

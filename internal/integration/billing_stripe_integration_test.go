@@ -1555,6 +1555,19 @@ func TestIntegration_StripePromotionEligibilityAndConcurrentActivation(t *testin
 	if secondTeamTrialEndedAt == nil {
 		t.Fatal("repeat-user activation did not continue as normal paid billing")
 	}
+	activate(secondTeam, invitedID, "evt_repeat_user", stripe)
+	var repeatOutcome, repeatReason string
+	var repeatProcessedAt *time.Time
+	if err := testPool.QueryRow(ctx, `SELECT o.outcome,o.reason,e.processed_at
+		FROM stripe_promotion_outcome o JOIN stripe_webhook_event e USING(event_id)
+		WHERE o.event_id='evt_repeat_user' AND o.team_id=$1 AND o.user_id=$2`, secondTeam, invitedID).
+		Scan(&repeatOutcome, &repeatReason, &repeatProcessedAt); err != nil ||
+		repeatOutcome != "promotion_ineligible" || repeatReason != "user_already_redeemed" || repeatProcessedAt == nil {
+		t.Fatalf("repeat-user outcome = %s/%s processed=%v: %v", repeatOutcome, repeatReason, repeatProcessedAt, err)
+	}
+	if len(stripe.creditGrantCalls) != 1 || promoGrantCount(secondTeam) != 0 {
+		t.Fatal("repeat-user denial replay issued a promotion")
+	}
 	if err := testPool.QueryRow(ctx, `
 		SELECT count(*)
 		FROM user_promotion_entitlement

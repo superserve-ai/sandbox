@@ -13,7 +13,7 @@ spec.loader.exec_module(identity)
 
 
 class ControlplaneIdentityTest(unittest.TestCase):
-    def test_promotion_evidence_secrets_reach_every_controlplane(self):
+    def test_promotion_evidence_secrets_require_explicit_enablement_in_every_cell(self):
         for environment, region, secret_file in (
             ('production', 'us-east4', 'controlplane-identity.tf'),
             ('production', 'us-west2', 'controlplane-identity.tf'),
@@ -23,15 +23,35 @@ class ControlplaneIdentityTest(unittest.TestCase):
             secrets = (root / secret_file).read_text()
             main = (root / 'main.tf').read_text()
             with self.subTest(environment=environment, region=region):
+                variables = (root / 'variables.tf').read_text()
+                gate = re.search(r'variable "promotion_evidence_enabled" \{(.*?)\n\}', variables, re.S)
+                self.assertIsNotNone(gate)
+                self.assertRegex(gate[1], r'type\s*=\s*bool')
+                self.assertRegex(gate[1], r'default\s*=\s*false')
+                self.assertRegex(gate[1], r'nullable\s*=\s*false')
+                for tfvars in root.glob('*.tfvars'):
+                    self.assertNotRegex(tfvars.read_text(), r'(?m)^\s*promotion_evidence_enabled\s*=\s*true')
+                gated = re.search(
+                    r'promotion_evidence_secrets\s*=\s*var\.promotion_evidence_enabled\s*\?\s*\{(.*?)\n  \}\s*:\s*\{\}',
+                    secrets, re.S)
+                self.assertIsNotNone(gated)
                 for name, resource in (
                     ('PROMOTION_AUTH_DATABASE_URL', 'promotion_auth_database_url'),
                     ('PROMOTION_CAPTURE_TOKEN', 'promotion_capture_token'),
                     ('PROMOTION_ACCOUNT_TOKEN', 'promotion_account_token'),
                     ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion_account_public_key'),
                 ):
-                    self.assertIn(f'google_secret_manager_secret.{resource}.secret_id', secrets + main)
-                    self.assertRegex(secrets + main, rf'{name}\s*=\s*\{{\s*secret\s*=\s*google_secret_manager_secret\.{resource}\.secret_id')
-                    self.assertNotRegex(main, rf'(?m)^\s*{name}\s*=\s*"')
+                    self.assertIn(f'resource "google_secret_manager_secret" "{resource}"', secrets)
+                    self.assertRegex(gated[1], rf'{name}\s*=\s*\{{\s*secret\s*=\s*google_secret_manager_secret\.{resource}\.secret_id')
+                    self.assertNotIn(name, secrets[:gated.start()] + secrets[gated.end():] + main)
+                if environment == 'production':
+                    self.assertRegex(secrets, r'controlplane_secrets\s*=\s*merge\(local\.promotion_evidence_secrets,')
+                    self.assertRegex(main, r'secrets\s*=\s*local\.controlplane_secrets')
+                    self.assertIn('for_each = toset([for config in values(local.controlplane_secrets) : config.secret])', secrets)
+                else:
+                    self.assertRegex(main, r'secrets\s*=\s*merge\(local\.promotion_evidence_secrets,')
+                    self.assertRegex(secrets, r'controlplane_secret_ids\s*=\s*toset\(concat\(\s*\[for config in values\(local\.promotion_evidence_secrets\) : config\.secret\],')
+                    self.assertIn('for_each = local.controlplane_secret_ids', secrets)
                 self.assertIn('roles/secretmanager.secretAccessor', secrets)
                 self.assertIn('controlplane_runtime.email', secrets)
 

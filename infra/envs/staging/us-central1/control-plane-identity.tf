@@ -68,20 +68,34 @@ resource "google_service_account_iam_member" "controlplane_deploy_token_creator"
 }
 
 locals {
-  controlplane_secret_ids = toset([
-    google_secret_manager_secret.promotion_auth_database_url.secret_id,
-    google_secret_manager_secret.promotion_capture_token.secret_id,
-    google_secret_manager_secret.promotion_account_token.secret_id,
-    google_secret_manager_secret.promotion_account_public_key.secret_id,
-    coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}"),
-    coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}"),
-    coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}"),
-    coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}"),
-    coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}"),
-    google_secret_manager_secret.stripe_secret_key.secret_id,
-    google_secret_manager_secret.stripe_webhook_secret.secret_id,
-    google_secret_manager_secret.stripe_meter_error_webhook_secret.secret_id,
-  ])
+  promotion_evidence_secrets = var.promotion_evidence_enabled ? {
+    PROMOTION_AUTH_DATABASE_URL = {
+      secret = google_secret_manager_secret.promotion_auth_database_url.secret_id
+    }
+    PROMOTION_CAPTURE_TOKEN = {
+      secret = google_secret_manager_secret.promotion_capture_token.secret_id
+    }
+    PROMOTION_ACCOUNT_TOKEN = {
+      secret = google_secret_manager_secret.promotion_account_token.secret_id
+    }
+    PROMOTION_ACCOUNT_PUBLIC_KEY = {
+      secret = google_secret_manager_secret.promotion_account_public_key.secret_id
+    }
+  } : {}
+
+  controlplane_secret_ids = toset(concat(
+    [for config in values(local.promotion_evidence_secrets) : config.secret],
+    [
+      coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}"),
+      coalesce(var.secrets_signing_key_secret_name, "secretsproxy-signing-key-${local.resource_suffix}"),
+      coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}"),
+      coalesce(var.internal_api_token_secret_name, "internal-api-token-${local.resource_suffix}"),
+      coalesce(var.system_team_id_secret_name, "system-team-id-${local.resource_suffix}"),
+      google_secret_manager_secret.stripe_secret_key.secret_id,
+      google_secret_manager_secret.stripe_webhook_secret.secret_id,
+      google_secret_manager_secret.stripe_meter_error_webhook_secret.secret_id,
+    ],
+  ))
 }
 
 resource "google_secret_manager_secret_iam_member" "controlplane_runtime" {
