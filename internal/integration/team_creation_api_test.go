@@ -428,16 +428,28 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 		teamCreationStatus(t, client.call(teamCreationRecover(claims), nil), 410, "team_deleted")
 	})
 	t.Run("atomic failures retry every write stage", func(t *testing.T) {
-		for _, table := range []string{"team_member", "team_memberships", "user_role_assignments", "team_creation_requests"} {
+		for _, table := range []string{"team", "team_member", "team_memberships", "user_role_assignments", "team_creation_requests"} {
 			t.Run(table, func(t *testing.T) {
 				actor := uuid.New()
 				claims := teamCreationClaims(actor, uuid.NewString(), "Rollback "+table)
-				rolloutExec(t, pool, `CREATE FUNCTION fail_team_creation_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected write failure'; END $$`)
-				rolloutExec(t, pool, fmt.Sprintf(`CREATE TRIGGER fail_team_creation_write BEFORE INSERT ON %s FOR EACH ROW EXECUTE FUNCTION fail_team_creation_write()`, pgx.Identifier{table}.Sanitize()))
-				response := client.call(claims, nil)
-				rolloutExec(t, pool, fmt.Sprintf(`DROP TRIGGER fail_team_creation_write ON %s`, pgx.Identifier{table}.Sanitize()))
-				rolloutExec(t, pool, `DROP FUNCTION fail_team_creation_write()`)
-				teamCreationStatus(t, response, 500, "internal_error")
+				if table == "team" {
+					other := teamCreationClaims(uuid.New(), uuid.NewString(), claims["name"].(string))
+					otherID := teamCreationID(t, client.call(other, nil))
+					for attempt := 0; attempt < 2; attempt++ {
+						teamCreationStatus(t, client.call(claims, nil), 409, "team_name_conflict")
+					}
+					if n := teamCreationCount(t, pool, `SELECT count(*) FROM team WHERE id=$1 AND name=$2`, otherID, claims["name"]); n != 1 {
+						t.Fatal("name conflict changed the existing team")
+					}
+					rolloutExec(t, pool, `UPDATE team SET name=$2 WHERE id=$1`, otherID, "Renamed "+otherID.String())
+				} else {
+					rolloutExec(t, pool, `CREATE FUNCTION fail_team_creation_write() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected write failure'; END $$`)
+					rolloutExec(t, pool, fmt.Sprintf(`CREATE TRIGGER fail_team_creation_write BEFORE INSERT ON %s FOR EACH ROW EXECUTE FUNCTION fail_team_creation_write()`, pgx.Identifier{table}.Sanitize()))
+					response := client.call(claims, nil)
+					rolloutExec(t, pool, fmt.Sprintf(`DROP TRIGGER fail_team_creation_write ON %s`, pgx.Identifier{table}.Sanitize()))
+					rolloutExec(t, pool, `DROP FUNCTION fail_team_creation_write()`)
+					teamCreationStatus(t, response, 500, "internal_error")
+				}
 				for _, check := range []struct {
 					query string
 					arg   any

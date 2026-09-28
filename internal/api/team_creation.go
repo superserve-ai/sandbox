@@ -485,6 +485,10 @@ func (h *Handlers) createInternalTeam(c *gin.Context, now time.Time) {
 		default:
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) {
+				if pgErr.Code == "23505" && pgErr.TableName == "team" && pgErr.ConstraintName == "team_name_key" {
+					teamCreationError(c, "team_name_conflict", "Team name is already in use", http.StatusConflict)
+					return
+				}
 				log.Error().Str("db_code", pgErr.Code).Str("authorization", claims.Authorization).Msg("team creation database failure")
 			} else {
 				log.Error().Str("authorization", claims.Authorization).Msg("team creation database failure")

@@ -44,6 +44,12 @@ cell. Recovery only reads actor-owned completed results. Completed create replay
 also return the original snapshot without refreshing evidence. Completed records
 have no TTL; administrative team deletion leaves a tombstone returning 410.
 
+A name already used by another team returns HTTP 409 with
+`{"error":{"code":"team_name_conflict","message":"Team name is already in use"}}`.
+The failed creation rolls back all writes and leaves no completed request result.
+Do not automatically retry this conflict unchanged. Choosing a different name is
+a new explicit intent with a fresh request ID and matching signed assertion.
+
 ## Signed identity timestamps and shared fixtures
 
 Create assertions require the exact identity object:
