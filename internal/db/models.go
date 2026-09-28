@@ -466,6 +466,29 @@ type BillingIncrementalPeriod struct {
 	LastReconcileAttemptAt pgtype.Timestamptz `json:"last_reconcile_attempt_at"`
 }
 
+type BillingMeterReconciliation struct {
+	ID                 uuid.UUID      `json:"id"`
+	TeamID             uuid.UUID      `json:"team_id"`
+	PeriodStart        time.Time      `json:"period_start"`
+	PeriodEnd          time.Time      `json:"period_end"`
+	ResourceType       string         `json:"resource_type"`
+	EventName          string         `json:"event_name"`
+	CustomerID         string         `json:"customer_id"`
+	MeterID            string         `json:"meter_id"`
+	LocalQuantity      pgtype.Numeric `json:"local_quantity"`
+	ReservedQuantity   pgtype.Numeric `json:"reserved_quantity"`
+	SubmittedQuantity  pgtype.Numeric `json:"submitted_quantity"`
+	ProviderQuantity   pgtype.Numeric `json:"provider_quantity"`
+	Difference         pgtype.Numeric `json:"difference"`
+	QueryStart         time.Time      `json:"query_start"`
+	QueryEnd           time.Time      `json:"query_end"`
+	ObservedAt         time.Time      `json:"observed_at"`
+	CollectedAt        time.Time      `json:"collected_at"`
+	Policy             string         `json:"policy"`
+	AccountingSnapshot []byte         `json:"accounting_snapshot"`
+	BucketPasses       []byte         `json:"bucket_passes"`
+}
+
 type BillingPeriodAnomaly struct {
 	ID          uuid.UUID          `json:"id"`
 	TeamID      uuid.UUID          `json:"team_id"`

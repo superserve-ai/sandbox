@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
@@ -24,6 +25,51 @@ import (
 
 type stripeMeterSummaryReader interface {
 	CountedMeterUsage(context.Context, string, string, time.Time, time.Time) (string, error)
+}
+
+// A reconciliation decision must not combine summaries from different meters
+// if the active event-name mapping changes between provider reads.
+type pinnedMeterSummaryReader struct {
+	client             *stripeHTTPClient
+	eventName, meterID string
+}
+
+func pinMeterSummaryReader(reader stripeMeterSummaryReader) stripeMeterSummaryReader {
+	if client, ok := reader.(*stripeHTTPClient); ok {
+		return &pinnedMeterSummaryReader{client: client}
+	}
+	return reader
+}
+
+func (r *pinnedMeterSummaryReader) CountedMeterUsage(ctx context.Context, event, customer string, start, end time.Time) (string, error) {
+	start, end = meterObservationWindow(start, end)
+	if !start.Before(end) {
+		return "", fmt.Errorf("meter observation window is not yet complete")
+	}
+	if r.meterID == "" {
+		id, err := r.client.incrementalMeterID(ctx, event)
+		if err != nil {
+			return "", err
+		}
+		r.eventName, r.meterID = event, id
+	}
+	if r.eventName != event {
+		return "", fmt.Errorf("meter event name changed during reconciliation")
+	}
+	return r.client.countedMeterUsage(ctx, r.meterID, customer, start, end)
+}
+
+func (r *pinnedMeterSummaryReader) MeterID() string { return r.meterID }
+
+func (r *pinnedMeterSummaryReader) BucketedMeterUsage(ctx context.Context, event, customer string, start, end time.Time) ([]meterUsageBucket, error) {
+	if r.meterID == "" || r.eventName != event {
+		return nil, fmt.Errorf("meter summary must be pinned before bucket reconciliation")
+	}
+	windows, err := meterEvidenceWindows(start, end)
+	if err != nil {
+		return nil, err
+	}
+	return r.client.bucketedMeterUsage(ctx, r.meterID, customer, windows)
 }
 
 // Attribute aggregate events inside complete provider minutes while retaining
@@ -46,6 +92,10 @@ func (c *stripeHTTPClient) CountedMeterUsage(ctx context.Context, eventName, cus
 	if err != nil {
 		return "", err
 	}
+	return c.countedMeterUsage(ctx, meterID, customer, start, end)
+}
+
+func (c *stripeHTTPClient) countedMeterUsage(ctx context.Context, meterID, customer string, start, end time.Time) (string, error) {
 	values := url.Values{"customer": {customer}, "start_time": {strconv.FormatInt(start.Unix(), 10)}, "end_time": {strconv.FormatInt(end.Unix(), 10)}, "limit": {"100"}}
 	var summary struct {
 		Data *[]struct {
@@ -208,6 +258,10 @@ func (c *stripeHTTPClient) BucketedMeterUsage(ctx context.Context, event, custom
 	if err != nil {
 		return nil, err
 	}
+	return c.bucketedMeterUsage(ctx, meterID, customer, windows)
+}
+
+func (c *stripeHTTPClient) bucketedMeterUsage(ctx context.Context, meterID, customer string, windows []meterUsageBucket) ([]meterUsageBucket, error) {
 	var result []meterUsageBucket
 	for i := 0; i < len(windows); {
 		j := i + 1
@@ -244,6 +298,9 @@ func (c *stripeHTTPClient) BucketedMeterUsage(ctx context.Context, event, custom
 		}
 		if response.Data == nil {
 			return nil, fmt.Errorf("missing meter bucket data")
+		}
+		if len(*response.Data) > j-i {
+			return nil, fmt.Errorf("meter bucket response exceeds requested window count")
 		}
 		seen := map[string]bool{}
 		for _, row := range *response.Data {
@@ -384,6 +441,7 @@ func matchMeterBuckets(events []meterLocalEvent, buckets []meterUsageBucket, eve
 
 type meterReconciliationDecision struct {
 	Outcome, Difference, Bound string
+	CloseEvidence              *meterCloseEvidence
 	Err                        error
 }
 
@@ -424,7 +482,12 @@ func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPerio
 	decision.Outcome = "incomplete"
 	defer func() {
 		start, end := meterObservationWindow(p.Start, through)
+		meterID := ""
+		if pinned, ok := reader.(*pinnedMeterSummaryReader); ok {
+			meterID = pinned.meterID
+		}
 		log.Info().Str("team_id", p.TeamID.String()).Str("resource", item.ResourceType).Str("event_name", item.EventName).
+			Str("meter_id", meterID).
 			Time("query_start", start).Time("query_end", end).Str("local_quantity", item.Quantity).
 			Str("reserved_quantity", totals.Reserved).Str("submitted_quantity", totals.Submitted).Str("provider_quantity", counted).
 			Str("difference", decision.Difference).Str("precision_bound", decision.Bound).Str("policy", meterPrecisionPolicy).
@@ -473,6 +536,23 @@ func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPerio
 	ctx, cancel := context.WithTimeout(ctx, evidenceTimeout)
 	defer cancel()
 	start, end := meterObservationWindow(p.Start, through)
+	var closeEvidence *meterCloseEvidence
+	var err error
+	if through.Equal(p.End) {
+		closeEvidence = &meterCloseEvidence{}
+		identity, ok := reader.(interface{ MeterID() string })
+		if !ok || identity.MeterID() == "" {
+			decision.Err = errors.Join(decision.Err, fmt.Errorf("pinned meter identity unavailable for close"))
+			return
+		}
+		closeEvidence.MeterID = identity.MeterID()
+		closeEvidence.EventName, closeEvidence.Customer = item.EventName, customer
+		closeEvidence.Snapshot, closeEvidence.CollectedAt, err = h.meterAccountingSnapshot(ctx, p, item.ResourceType)
+		if err != nil {
+			decision.Err = errors.Join(decision.Err, err)
+			return
+		}
+	}
 	events, err := h.meterLocalEvidence(ctx, p, item.ResourceType)
 	if err == nil {
 		for pass := 0; pass < 2; pass++ {
@@ -480,6 +560,9 @@ func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPerio
 			buckets, err = bucketReader.BucketedMeterUsage(ctx, item.EventName, customer, start, end)
 			if err == nil {
 				err = matchMeterBuckets(events, buckets, item.EventName, customer, start, end, reserved)
+				if err == nil && closeEvidence != nil {
+					closeEvidence.Passes = append(closeEvidence.Passes, completeMeterBuckets(buckets, start, end))
+				}
 			}
 			if err != nil {
 				break
@@ -510,6 +593,14 @@ func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPerio
 			decision.Outcome = "unexplained_excess"
 		}
 		return
+	}
+	if closeEvidence != nil {
+		after, _, snapshotErr := h.meterAccountingSnapshot(ctx, p, item.ResourceType)
+		if snapshotErr != nil || after != closeEvidence.Snapshot {
+			decision.Err = errors.Join(decision.Err, snapshotErr, fmt.Errorf("accounting snapshot changed during reconciliation"))
+			return
+		}
+		decision.CloseEvidence = closeEvidence
 	}
 	decision.Outcome, decision.Err = "explained_precision", nil
 	return
@@ -771,12 +862,13 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 			return result, totalErr
 		}
 		started := time.Now()
-		counted, countErr := reader.CountedMeterUsage(ctx, item.EventName, *account.StripeCustomerID, p.Start, through)
+		decisionReader := pinMeterSummaryReader(reader)
+		counted, countErr := decisionReader.CountedMeterUsage(ctx, item.EventName, *account.StripeCustomerID, p.Start, through)
 		decisionItem := item
 		decisionItem.Quantity = cumulative
-		decision := h.assessMeterSummary(ctx, p, decisionItem, through, reader, *account.StripeCustomerID, counted, totals, countErr)
+		decision := h.assessMeterSummary(ctx, p, decisionItem, through, decisionReader, *account.StripeCustomerID, counted, totals, countErr)
 		if decision.Err != nil {
-			recordErr := h.recordMeterObservation(ctx, p, decisionItem, through, totals, counted, decision.Err, started)
+			recordErr := h.recordMeterObservation(ctx, p, decisionItem, through, totals, counted, decision.Err, started, nil)
 			return result, errors.Join(decision.Err, recordErr)
 		}
 		for part := 0; part < 2; part++ {
@@ -844,13 +936,14 @@ func (h *Handlers) observeIncrementalResource(ctx context.Context, p billing.Exp
 		return totals, err
 	}
 	started := time.Now()
+	reader = pinMeterSummaryReader(reader)
 	counted, countErr := reader.CountedMeterUsage(ctx, item.EventName, customer, p.Start, through)
 	decision := h.assessMeterSummary(ctx, p, item, through, reader, customer, counted, totals, countErr)
-	err = h.recordMeterObservation(ctx, p, item, through, totals, counted, decision.Err, started)
+	err = h.recordMeterObservation(ctx, p, item, through, totals, counted, decision.Err, started, decision.CloseEvidence)
 	return totals, errors.Join(err, decision.Err)
 }
 
-func (h *Handlers) recordMeterObservation(ctx context.Context, p billing.ExportPeriod, item incrementalExportItem, through time.Time, totals billing.ExportTotals, counted string, decisionErr error, started time.Time) error {
+func (h *Handlers) recordMeterObservation(ctx context.Context, p billing.ExportPeriod, item incrementalExportItem, through time.Time, totals billing.ExportTotals, counted string, decisionErr error, started time.Time, closeEvidence *meterCloseEvidence) error {
 	previousAge, ageErr := (billing.ExportStore{Pool: h.Pool}).PreviousObservationAge(ctx, p, item.ResourceType)
 	if ageErr != nil {
 		log.Warn().Err(ageErr).Msg("billing observation freshness read failed")
@@ -874,12 +967,45 @@ func (h *Handlers) recordMeterObservation(ctx context.Context, p billing.ExportP
 		message = &m
 	}
 	queryStart, queryEnd := meterObservationWindow(p.Start, through)
-	_, err := h.Pool.Exec(ctx, `INSERT INTO billing_export_observation(team_id,period_start,period_end,resource_type,local_quantity,submitted_quantity,reserved_quantity,counted_quantity,query_start,query_end,last_error)
+	if decisionErr != nil {
+		closeEvidence = nil
+	}
+	var exec interface {
+		Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	} = h.Pool
+	var tx pgx.Tx
+	if closeEvidence != nil {
+		var err error
+		tx, err = h.Pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		// All provider work is complete before acquiring the period lock.
+		if _, err = tx.Exec(ctx, `SELECT 1 FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3 FOR UPDATE`, p.TeamID, p.Start, p.End); err != nil {
+			return err
+		}
+		var current *string
+		if err = tx.QueryRow(ctx, `SELECT billing_meter_accounting_snapshot($1,$2,$3,$4)::text`, p.TeamID, p.Start, p.End, item.ResourceType).Scan(&current); err != nil {
+			return err
+		}
+		if current == nil || *current != closeEvidence.Snapshot {
+			return fmt.Errorf("%w: close accounting changed before persistence", billing.ErrExportRecoveryRequired)
+		}
+		exec = tx
+	}
+	_, err := exec.Exec(ctx, `INSERT INTO billing_export_observation(team_id,period_start,period_end,resource_type,local_quantity,submitted_quantity,reserved_quantity,counted_quantity,query_start,query_end,last_error)
         VALUES($1,$2,$3,$4,$5::numeric,$6::numeric,$7::numeric,$8::numeric,$9,$10,$11)
         ON CONFLICT(team_id,period_start,period_end,resource_type) DO UPDATE SET
         local_quantity=EXCLUDED.local_quantity,submitted_quantity=EXCLUDED.submitted_quantity,reserved_quantity=EXCLUDED.reserved_quantity,
         counted_quantity=EXCLUDED.counted_quantity,query_start=EXCLUDED.query_start,query_end=EXCLUDED.query_end,last_error=EXCLUDED.last_error,observed_at=now()`,
 		p.TeamID, p.Start, p.End, item.ResourceType, item.Quantity, totals.Submitted, totals.Reserved, countedValue, queryStart, queryEnd, message)
+	if err == nil && closeEvidence != nil {
+		err = persistMeterCloseEvidence(ctx, tx, p, item.ResourceType, *closeEvidence)
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
+	}
 	currentBillingRecorder().RecordBillingWork(ctx, "reconciliation", err != nil || decisionErr != nil || ageErr != nil, time.Since(started), 1)
 	return err
 }

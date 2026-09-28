@@ -1,0 +1,121 @@
+# Meter precision reconciliation
+
+Local cumulative measurement minus exact reserved coverage determines new usage.
+Provider observations never change reservations, event identities, timestamps,
+payloads, or acceptance status. Manual adoption still requires exact complete
+inventory equality.
+
+## Quantity policy
+
+`exact-daily-one-ulp-v1` allows a positive whole-window residual only when:
+
+- The exact reserved quantity is between `1e-12` and `1e9`, inclusive.
+- The residual is at most `2^(floor(log2(reserved))-52)`, computed with rational
+  arithmetic. The bound includes equality; any amount above it fails closed.
+  Zero reservations have no positive allowance.
+- Two complete provider bucket passes exactly match submitted/adopted local
+  quantities over their persisted event timestamps. Pending, uncertain,
+  rejected, missing, or out-of-window events cannot establish this evidence.
+- An ungrouped reread is unchanged and the local inventory is unchanged.
+
+For `9712.454976049444`, the bound is `2^-39` (approximately
+`1.8189894035458565e-12`), so `9712.454976049445` is a candidate for corroboration.
+No positive residual passes on magnitude alone. The allowance is recomputed
+from each independent exact period total; it is never added to an earlier
+allowance or residual. Repeated reads neither accumulate error nor guarantee
+convergence. Buckets that themselves differ fail closed, however small the
+difference.
+
+This is a deliberately narrow acceptance policy, not a bound guaranteed by
+Stripe. Stripe documents double-precision aggregation loss but does not provide
+a universal error bound. Matching aggregates corroborate quantity, not individual
+event identity or acceptance. See [Stripe's precision documentation](https://docs.stripe.com/changelog/dahlia/2026-04-22/billing-meter-event-values-validation).
+
+Exact equality and provider lag remain allowed for ordinary exports outside this
+residual policy range, with the normal quantity validation and reservation guards.
+Lag cannot authorize closing or speculative resubmission. Unexplained excess,
+unsupported magnitudes, malformed responses and exhausted evidence budgets require
+reconciliation/operator recovery; the system never widens the allowance.
+
+## Evidence and work bounds
+
+Queries use the same half-open, minute-aligned event-time window. Complete UTC
+days use daily summaries; partial first/last days use separate exact-window
+ungrouped summaries. A decision pins one meter ID. Windows span at most 32 days
+and 33 buckets. Each pass makes at most three summary requests with `limit=100`;
+`has_more=true` is incomplete evidence, not a successful truncated result. Empty
+provider intervals are accepted only when the corresponding local quantity is
+zero. [Stripe defines these window and pagination semantics](https://docs.stripe.com/api/billing/meter-event-summary/list).
+
+The fallback reads at most 4097 local rows to enforce a 4096-event limit, makes
+two bucket passes and one ungrouped reread, and has a 30-second timeout. Meter
+discovery is independently capped at five pages. The worker deadline retains
+five seconds for cleanup/backoff when starting fallback work. Existing worker
+leases, scheduling, submission limits and backoff remain unchanged. Provider I/O
+runs outside period locks and sandbox lifecycle paths.
+
+Decision logs include resource, meter, window, local/reserved/submitted/provider
+quantities, exact signed difference, bound, policy and outcome (`equal`,
+`provider_lag`, `explained_precision`, `unexplained_excess`, or `incomplete`).
+Observations retain the raw provider value and errors. They are not accounting.
+
+## Closing and compatibility
+
+An additive migration creates append-only `billing_meter_reconciliation` history.
+Each successful full-period drift observation retains raw quantities, signed
+residual, both complete bucket passes, policy, period/resource/customer/meter,
+collection and observation times, and an exact JSON accounting snapshot. The
+snapshot includes bounded historical event/coverage state, correction version,
+frozen measurements and current customer. It is compared before/after provider
+work, again while persisting under the period lock, and by the database close
+guard. History survives observation refresh and commercial-period rollover.
+
+The existing close/finalization trigger retains its exact local
+measured-target/reserved/submitted, unresolved-delivery and freshness guards.
+For positive drift it additionally checks the history tied to that precise
+observation, a collection age of at most two hours, full-period window, current
+accounting/customer, policy bound and both exact bucket partitions. Subsequent
+periods reconcile independently from zero reserved coverage. Existing correction
+and disabled-resource semantics remain in place.
+
+Deploy the additive migration before the new binary. Equality behavior remains
+compatible. Older writers cannot create drift evidence; updating an observation
+does not refresh the collection time or bind it to old history. Rolling back the
+binary may block drift closing but does not rewrite usage or delete evidence.
+The existing finalization transaction invokes the database guard before committing
+credits/charges. Quantity evidence does not prove invoice or credit correctness.
+
+## Recovery and rollout record
+
+Runtime verification remains **pending** until a separately authorized rollout:
+
+1. Record the actual deployed revision and UTC time. Re-read account, commercial
+   period, work lease/error, measured usage, reservations and every event status.
+   Save immutable payload/identity/coverage snapshots. Do not treat an earlier
+   incident snapshot as current authority.
+2. Validate in staging, then observe the normal worker processing existing work.
+   Do not reset reservations, manually submit totals, replay accepted events, or
+   rebase accounting to a provider summary.
+3. Fix a commercial-period cutoff and compare the identical persisted event-time
+   windows. Record all totals, signed differences, bucket evidence, pending
+   deliveries and provider processing delay. Verify new events cover only the
+   previously unreserved quantity and old payloads/coverage are unchanged.
+4. Verify `billing_export_work.last_error` clears after a successful work pass.
+   Inspect reconciliation errors/evidence separately. Record the next scheduled
+   hourly pass and prove it exports only newly eligible usage.
+5. For unsettled evidence, inspect at the next scheduled pass, then once after
+   six hours, and once after 24 hours. After those three rechecks, or immediately
+   for meaningful excess/invalid evidence, escalate with the retained evidence.
+   Do not run an indefinite manual polling loop or enlarge numerical tolerance.
+   Durable automatic retries retain their existing bounded cadence. Unsettled
+   evidence remains pending, never a pass.
+6. At each commercial close, retain full-period quantity evidence and separately
+   verify invoice line quantities, prices, amounts and credits. A following
+   period does not resolve the earlier period's discrepancy. Financial mismatches
+   require an explicit correction decision; no automatic compensating charge,
+   credit or usage event is authorized by this policy.
+
+For every step retain timestamps, revision, period/cutoff, quantities, outcome
+and evidence location in the private rollout record. No staging, deployed
+recovery, hourly follow-up, provider settlement or invoice verification is claimed
+by local implementation tests.

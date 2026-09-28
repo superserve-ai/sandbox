@@ -144,7 +144,7 @@ func (f meterBucketTransport) RoundTrip(req *http.Request) (*http.Response, erro
 func TestIncrementalBucketReaderBoundsAndEdges(t *testing.T) {
 	start := time.Date(2026, 8, 1, 0, 2, 0, 0, time.UTC)
 	end := start.AddDate(0, 1, 0).Add(7 * time.Hour)
-	for _, mode := range []string{"complete", "pagination", "missing", "missing_completion", "missing_data", "null_data", "wrong_meter", "wrong_window", "duplicate", "negative", "outage"} {
+	for _, mode := range []string{"complete", "pagination", "missing", "missing_completion", "missing_data", "null_data", "wrong_meter", "wrong_window", "duplicate", "oversized", "negative", "outage"} {
 		t.Run(mode, func(t *testing.T) {
 			calls, summaries := 0, 0
 			transport := meterBucketTransport(func(req *http.Request) (*http.Response, error) {
@@ -201,6 +201,10 @@ func TestIncrementalBucketReaderBoundsAndEdges(t *testing.T) {
 						} else {
 							response["data"] = append(rows, rows[0])
 						}
+					case "oversized":
+						response["data"] = append(rows, map[string]any{
+							"id": "extra_summary", "meter": "mtr_example", "start_time": a, "end_time": b, "aggregated_value": 0,
+						})
 					case "negative":
 						rows[0]["aggregated_value"] = -1
 					}
@@ -234,7 +238,7 @@ func TestIncrementalBucketReaderBoundsAndEdges(t *testing.T) {
 }
 
 func TestMeterPrecisionBoundary(t *testing.T) {
-	for _, total := range []string{"0.000000000001", "1", "8191.999999999999", "8192", "9712.454976049444"} {
+	for _, total := range []string{"0.000000000001", "1", "8191.999999999999", "8192", "9712.454976049444", "1000000000"} {
 		local, _ := meterDecimal(total)
 		bound, err := meterPrecisionBound(local)
 		if err != nil {
@@ -271,8 +275,8 @@ func TestMeterPrecisionBoundary(t *testing.T) {
 			t.Fatalf("unsupported total %s", total)
 		}
 	}
-	if decision, _ := compareMeterSummary("1000000000.000000000001", "1000000000"); decision.Err == nil {
-		t.Fatal("provider quantity beyond upper policy boundary accepted")
+	if decision, candidate := compareMeterSummary("1000000000.000000000001", "1000000000"); decision.Err == nil || !candidate {
+		t.Fatalf("upper reserved boundary must require corroborating evidence: %+v candidate=%v", decision, candidate)
 	}
 	if decision, candidate := compareMeterSummary("0.000000000001", "0"); decision.Err == nil || candidate || decision.Outcome != "unexplained_excess" {
 		t.Fatalf("positive provider usage with empty local ledger was explained: %+v candidate=%v", decision, candidate)
@@ -287,6 +291,24 @@ func TestMeterPrecisionBoundary(t *testing.T) {
 		if decision.Err != nil || candidate || decision.Outcome != tc.outcome {
 			t.Fatalf("ordinary %s comparison blocked: %+v candidate=%v", tc.outcome, decision, candidate)
 		}
+	}
+}
+
+func TestCompleteMeterBucketsRetainsPartialEdgesAndZeroWindows(t *testing.T) {
+	start := time.Date(2026, 8, 1, 0, 2, 0, 0, time.UTC)
+	end := start.Add(48 * time.Hour)
+	windows, err := meterEvidenceWindows(start, end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provided := []meterUsageBucket{{Start: windows[1].Start, End: windows[1].End, Quantity: "9712.454976049444"}}
+	complete := completeMeterBuckets(provided, start, end)
+	if len(complete) != 3 || complete[0].Start != start.Unix() || complete[2].End != end.Unix() ||
+		complete[0].Quantity != "0" || complete[1].Quantity != provided[0].Quantity || complete[2].Quantity != "0" {
+		t.Fatalf("incomplete persisted bucket partition: %+v", complete)
+	}
+	if complete[0].End != complete[1].Start || complete[1].End != complete[2].Start {
+		t.Fatalf("persisted evidence has a gap: %+v", complete)
 	}
 }
 
@@ -443,5 +465,76 @@ func TestIncrementalBucketMeterLookupBudget(t *testing.T) {
 	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	if _, err := client.BucketedMeterUsage(t.Context(), "cpu_hours", "cus_example", start, start.Add(24*time.Hour)); err == nil || calls != 5 {
 		t.Fatalf("lookup budget: calls=%d err=%v", calls, err)
+	}
+}
+
+func TestIncrementalDecisionPinsMeterAcrossProviderReads(t *testing.T) {
+	start := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	end := start.Add(24 * time.Hour)
+	lookups, summaries := 0, 0
+	var meters []string
+	transport := meterBucketTransport(func(req *http.Request) (*http.Response, error) {
+		var body string
+		if req.URL.Path == "/v1/billing/meters" {
+			lookups++
+			meter := "mtr_original"
+			if lookups > 1 {
+				meter = "mtr_replacement"
+			}
+			body = fmt.Sprintf(`{"data":[{"id":%q,"event_name":"cpu_hours","default_aggregation":{"formula":"sum"},"customer_mapping":{"event_payload_key":"stripe_customer_id"},"value_settings":{"event_payload_key":"value"}}],"has_more":false}`, meter)
+		} else {
+			summaries++
+			meter := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/v1/billing/meters/"), "/event_summaries")
+			meters = append(meters, meter)
+			q := req.URL.Query()
+			if q.Get("customer") != "cus_example" || q.Get("start_time") != strconv.FormatInt(start.Unix(), 10) || q.Get("end_time") != strconv.FormatInt(end.Unix(), 10) {
+				t.Fatalf("decision query scope changed: %s", req.URL)
+			}
+			quantity := "9712.454976049445"
+			if q.Get("value_grouping_window") == "day" {
+				quantity = "9712.454976049444"
+			}
+			body = fmt.Sprintf(`{"data":[{"id":"summary_example","meter":%q,"start_time":%d,"end_time":%d,"aggregated_value":%s}],"has_more":false}`, meter, start.Unix(), end.Unix(), quantity)
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header), Request: req}, nil
+	})
+	client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
+	reader := pinMeterSummaryReader(client)
+	value, err := reader.CountedMeterUsage(t.Context(), "cpu_hours", "cus_example", start, end)
+	if err != nil || value != "9712.454976049445" {
+		t.Fatalf("initial summary: %q %v", value, err)
+	}
+	for pass := 0; pass < 2; pass++ {
+		buckets, err := reader.(stripeMeterBucketReader).BucketedMeterUsage(t.Context(), "cpu_hours", "cus_example", start, end)
+		if err != nil || len(buckets) != 1 || buckets[0].Quantity != "9712.454976049444" {
+			t.Fatalf("bucket pass %d: %+v %v", pass, buckets, err)
+		}
+	}
+	if reread, err := reader.CountedMeterUsage(t.Context(), "cpu_hours", "cus_example", start, end); err != nil || reread != value {
+		t.Fatalf("summary reread: %q %v", reread, err)
+	}
+	if lookups != 1 || summaries != 4 {
+		t.Fatalf("decision lookup/request budget: lookups=%d summaries=%d", lookups, summaries)
+	}
+	for _, meter := range meters {
+		if meter != "mtr_original" {
+			t.Fatalf("decision mixed meter identities: %v", meters)
+		}
+	}
+	if _, err := reader.CountedMeterUsage(t.Context(), "memory_hours", "cus_example", start, end); err == nil {
+		t.Fatal("pinned reader accepted a different event name")
+	}
+	if _, err := reader.(stripeMeterBucketReader).BucketedMeterUsage(t.Context(), "memory_hours", "cus_example", start, end); err == nil {
+		t.Fatal("pinned buckets accepted a different event name")
+	}
+	if lookups != 1 || summaries != 4 {
+		t.Fatal("changed event name reached the provider")
+	}
+	// A new decision resolves the current mapping; pinning is not a global cache.
+	if _, err := pinMeterSummaryReader(client).CountedMeterUsage(t.Context(), "cpu_hours", "cus_example", start, end); err != nil {
+		t.Fatal(err)
+	}
+	if lookups != 2 || summaries != 5 || meters[4] != "mtr_replacement" {
+		t.Fatalf("new decision retained stale mapping: lookups=%d meters=%v", lookups, meters)
 	}
 }
