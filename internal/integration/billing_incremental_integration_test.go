@@ -307,6 +307,8 @@ func TestIntegration_IncrementalAdoptionEndpoint(t *testing.T) {
 		{"boundary_before_event", http.StatusBadRequest},
 		{"boundary_outside_period", http.StatusBadRequest},
 		{"provider_total_mismatch", http.StatusConflict},
+		{"provider_tiny_excess", http.StatusConflict},
+		{"provider_tiny_lag", http.StatusConflict},
 		{"provider_unavailable", http.StatusConflict},
 		{"valid_repeated_adoption", http.StatusOK},
 		{"legacy_repeated_adoption", http.StatusOK},
@@ -381,6 +383,12 @@ func TestIntegration_IncrementalAdoptionEndpoint(t *testing.T) {
 				}
 				switch eventName {
 				case "cpu_vcpu_hours":
+					if tc.name == "provider_tiny_excess" {
+						return "1.250000000001", nil
+					}
+					if tc.name == "provider_tiny_lag" {
+						return "1.249999999999", nil
+					}
 					if tc.name == "provider_total_mismatch" {
 						return "1.5", nil
 					}

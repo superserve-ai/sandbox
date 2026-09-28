@@ -8,6 +8,9 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"reflect"
+	"regexp"
+	"sort"
 	"strconv"
 	"time"
 
@@ -39,6 +42,34 @@ func (c *stripeHTTPClient) CountedMeterUsage(ctx context.Context, eventName, cus
 		return "", fmt.Errorf("meter observation window is not yet complete")
 	}
 
+	meterID, err := c.incrementalMeterID(ctx, eventName)
+	if err != nil {
+		return "", err
+	}
+	values := url.Values{"customer": {customer}, "start_time": {strconv.FormatInt(start.Unix(), 10)}, "end_time": {strconv.FormatInt(end.Unix(), 10)}, "limit": {"100"}}
+	var summary struct {
+		Data []struct {
+			Value json.Number `json:"aggregated_value"`
+		} `json:"data"`
+		HasMore bool `json:"has_more"`
+	}
+	if err := c.doForm(ctx, http.MethodGet, "/v1/billing/meters/"+url.PathEscape(meterID)+"/event_summaries?"+values.Encode(), nil, &summary, ""); err != nil {
+		return "", err
+	}
+	if summary.HasMore || len(summary.Data) > 1 {
+		return "", fmt.Errorf("unexpected grouped meter summary")
+	}
+	if len(summary.Data) == 0 {
+		return "0", nil
+	}
+	value := summary.Data[0].Value.String()
+	if _, err := billing.DecimalDelta(value, "0"); err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+func (c *stripeHTTPClient) incrementalMeterID(ctx context.Context, eventName string) (string, error) {
 	var meterID string
 	after := ""
 	for page := 0; page < 5; page++ {
@@ -86,27 +117,324 @@ func (c *stripeHTTPClient) CountedMeterUsage(ctx context.Context, eventName, cus
 	if meterID == "" {
 		return "", fmt.Errorf("configured meter was not found within bounded lookup")
 	}
-	values := url.Values{"customer": {customer}, "start_time": {strconv.FormatInt(start.Unix(), 10)}, "end_time": {strconv.FormatInt(end.Unix(), 10)}, "limit": {"100"}}
-	var summary struct {
-		Data []struct {
-			Value json.Number `json:"aggregated_value"`
-		} `json:"data"`
-		HasMore bool `json:"has_more"`
+	return meterID, nil
+}
+
+// Precision reconciliation is deliberately narrower than Stripe's possible
+// aggregation error: exact daily evidence plus at most one binary64 spacing.
+// It is not an event acceptance oracle and never changes reserved coverage.
+const meterPrecisionPolicy = "exact-daily-one-ulp-v1"
+const meterEvidenceLimit = 4096
+
+var errMeterBucketMismatch = errors.New("provider bucket differs from submitted quantity")
+
+var meterDecimalPattern = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]{1,3})?$`)
+
+func meterDecimal(value string) (*big.Rat, error) {
+	if len(value) > 128 || !meterDecimalPattern.MatchString(value) {
+		return nil, fmt.Errorf("invalid meter decimal")
 	}
-	if err := c.doForm(ctx, http.MethodGet, "/v1/billing/meters/"+url.PathEscape(meterID)+"/event_summaries?"+values.Encode(), nil, &summary, ""); err != nil {
-		return "", err
+	r, ok := new(big.Rat).SetString(value)
+	if !ok || r.Sign() < 0 {
+		return nil, fmt.Errorf("invalid meter decimal")
 	}
-	if summary.HasMore || len(summary.Data) > 1 {
-		return "", fmt.Errorf("unexpected grouped meter summary")
+	return r, nil
+}
+
+func meterPrecisionBound(local *big.Rat) (*big.Rat, error) {
+	if local.Cmp(big.NewRat(1, 1_000_000_000_000)) < 0 || local.Cmp(big.NewRat(1_000_000_000, 1)) > 0 {
+		return nil, fmt.Errorf("quantity outside precision policy range [1e-12,1e9]")
 	}
-	if len(summary.Data) == 0 {
-		return "0", nil
+	power := func(exponent int) *big.Rat {
+		if exponent < 0 {
+			return new(big.Rat).SetFrac(big.NewInt(1), new(big.Int).Lsh(big.NewInt(1), uint(-exponent)))
+		}
+		return new(big.Rat).SetInt(new(big.Int).Lsh(big.NewInt(1), uint(exponent)))
 	}
-	value := summary.Data[0].Value.String()
-	if _, err := billing.DecimalDelta(value, "0"); err != nil {
-		return "", err
+	exponent := local.Num().BitLen() - local.Denom().BitLen()
+	if local.Cmp(power(exponent)) < 0 {
+		exponent--
 	}
-	return value, nil
+	return power(exponent - 52), nil
+}
+
+type meterUsageBucket struct {
+	Start, End time.Time
+	Quantity   string
+}
+
+type stripeMeterBucketReader interface {
+	BucketedMeterUsage(context.Context, string, string, time.Time, time.Time) ([]meterUsageBucket, error)
+}
+
+func meterEvidenceWindows(start, end time.Time) ([]meterUsageBucket, error) {
+	if !start.Before(end) || end.Sub(start) > 32*24*time.Hour || !start.Equal(start.Truncate(time.Minute)) || !end.Equal(end.Truncate(time.Minute)) {
+		return nil, fmt.Errorf("unsupported meter evidence window")
+	}
+	var windows []meterUsageBucket
+	for cursor := start.UTC(); cursor.Before(end); {
+		next := cursor.Truncate(24 * time.Hour).Add(24 * time.Hour)
+		if next.After(end) {
+			next = end
+		}
+		windows = append(windows, meterUsageBucket{Start: cursor, End: next})
+		cursor = next
+	}
+	return windows, nil
+}
+
+// Full UTC days fit in one page. Partial-day edges use ungrouped summaries;
+// widening to day boundaries would admit events outside the decision window.
+func (c *stripeHTTPClient) BucketedMeterUsage(ctx context.Context, event, customer string, start, end time.Time) ([]meterUsageBucket, error) {
+	windows, err := meterEvidenceWindows(start, end)
+	if err != nil {
+		return nil, err
+	}
+	meterID, err := c.incrementalMeterID(ctx, event)
+	if err != nil {
+		return nil, err
+	}
+	var result []meterUsageBucket
+	for i := 0; i < len(windows); {
+		j := i + 1
+		grouped := windows[i].End.Sub(windows[i].Start) == 24*time.Hour
+		if grouped {
+			for j < len(windows) && windows[j].End.Sub(windows[j].Start) == 24*time.Hour {
+				j++
+			}
+		}
+		values := url.Values{"customer": {customer}, "start_time": {strconv.FormatInt(windows[i].Start.Unix(), 10)},
+			"end_time": {strconv.FormatInt(windows[j-1].End.Unix(), 10)}, "limit": {"100"}}
+		if grouped {
+			values.Set("value_grouping_window", "day")
+		}
+		var response struct {
+			Data []struct {
+				ID    string      `json:"id"`
+				Meter string      `json:"meter"`
+				Start *int64      `json:"start_time"`
+				End   *int64      `json:"end_time"`
+				Value json.Number `json:"aggregated_value"`
+			} `json:"data"`
+			HasMore *bool `json:"has_more"`
+		}
+		if err := c.doForm(ctx, http.MethodGet, "/v1/billing/meters/"+url.PathEscape(meterID)+"/event_summaries?"+values.Encode(), nil, &response, ""); err != nil {
+			return nil, err
+		}
+		// Missing zero buckets are not assumed to prove absence of usage.
+		if response.HasMore == nil || *response.HasMore || len(response.Data) != j-i {
+			return nil, fmt.Errorf("incomplete bounded meter buckets")
+		}
+		seen := map[string]bool{}
+		for _, row := range response.Data {
+			if row.ID == "" || seen[row.ID] || row.Meter != meterID || row.Start == nil || row.End == nil {
+				return nil, fmt.Errorf("malformed meter bucket identity or window")
+			}
+			seen[row.ID] = true
+			if _, err := meterDecimal(row.Value.String()); err != nil {
+				return nil, err
+			}
+			result = append(result, meterUsageBucket{Start: time.Unix(*row.Start, 0).UTC(), End: time.Unix(*row.End, 0).UTC(), Quantity: row.Value.String()})
+		}
+		i = j
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Start.Before(result[j].Start) })
+	for i := range windows {
+		if !result[i].Start.Equal(windows[i].Start) || !result[i].End.Equal(windows[i].End) {
+			return nil, fmt.Errorf("meter bucket coverage differs from requested window")
+		}
+	}
+	return result, nil
+}
+
+type meterLocalEvent struct {
+	ID, EventName, Customer, Quantity, Status string
+	Timestamp                                 int64
+	Updated                                   time.Time
+}
+
+func (h *Handlers) meterLocalEvidence(ctx context.Context, p billing.ExportPeriod, resource string) ([]meterLocalEvent, error) {
+	rows, err := h.Pool.Query(ctx, `SELECT e.id::text,e.event_name,e.customer_id,e.quantity_payload,e.status,e.event_timestamp,e.updated_at
+        FROM billing_export_allocation a JOIN billing_export_event e ON e.allocation_id=a.id AND e.active
+        WHERE a.team_id=$1 AND a.period_start=$2 AND a.period_end=$3 AND a.resource_type=$4
+        ORDER BY a.coverage_end DESC LIMIT $5`, p.TeamID, p.Start, p.End, resource, meterEvidenceLimit+1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var events []meterLocalEvent
+	for rows.Next() {
+		var event meterLocalEvent
+		if err := rows.Scan(&event.ID, &event.EventName, &event.Customer, &event.Quantity, &event.Status, &event.Timestamp, &event.Updated); err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(events) > meterEvidenceLimit {
+		return nil, fmt.Errorf("local meter evidence exceeds event budget")
+	}
+	return events, nil
+}
+
+func matchMeterBuckets(events []meterLocalEvent, buckets []meterUsageBucket, event, customer string, start, end time.Time, reserved *big.Rat) error {
+	windows, err := meterEvidenceWindows(start, end)
+	if err != nil {
+		return err
+	}
+	if len(events) == 0 || len(events) > meterEvidenceLimit || len(buckets) != len(windows) {
+		return fmt.Errorf("incomplete meter evidence")
+	}
+	totals := make([]*big.Rat, len(windows))
+	for i := range totals {
+		totals[i] = new(big.Rat)
+	}
+	sum := new(big.Rat)
+	for _, e := range events {
+		if (e.Status != "submitted" && e.Status != "adopted") || e.EventName != event || e.Customer != customer || e.Timestamp < start.Unix() || e.Timestamp >= end.Unix() {
+			return fmt.Errorf("unsettled or out-of-window local meter evidence")
+		}
+		quantity, err := meterDecimal(e.Quantity)
+		if err != nil {
+			return err
+		}
+		sum.Add(sum, quantity)
+		for i, w := range windows {
+			if e.Timestamp >= w.Start.Unix() && e.Timestamp < w.End.Unix() {
+				totals[i].Add(totals[i], quantity)
+				break
+			}
+		}
+	}
+	if sum.Cmp(reserved) != 0 {
+		return fmt.Errorf("submitted snapshot differs from reservations")
+	}
+	for i, b := range buckets {
+		if !b.Start.Equal(windows[i].Start) || !b.End.Equal(windows[i].End) {
+			return fmt.Errorf("incomplete meter bucket windows")
+		}
+		quantity, err := meterDecimal(b.Quantity)
+		if err != nil {
+			return err
+		}
+		if quantity.Cmp(totals[i]) != 0 {
+			return fmt.Errorf("%w at %s", errMeterBucketMismatch, b.Start.Format(time.RFC3339))
+		}
+	}
+	return nil
+}
+
+type meterReconciliationDecision struct {
+	Outcome, Difference, Bound string
+	Err                        error
+}
+
+func compareMeterSummary(counted, reservedValue string) (decision meterReconciliationDecision, needsEvidence bool) {
+	decision.Outcome = "incomplete"
+	provider, err := meterDecimal(counted)
+	reserved, localErr := meterDecimal(reservedValue)
+	if err != nil || localErr != nil {
+		decision.Err = errors.Join(billing.ErrExportRecoveryRequired, err, localErr)
+		return
+	}
+	difference := new(big.Rat).Sub(provider, reserved)
+	decision.Difference = difference.RatString()
+	if difference.Sign() <= 0 {
+		decision.Outcome = "equal"
+		if difference.Sign() < 0 {
+			decision.Outcome = "provider_lag"
+		}
+		return
+	}
+	decision.Outcome = "unexplained_excess"
+	bound, err := meterPrecisionBound(reserved)
+	if err != nil {
+		decision.Err = errors.Join(billing.ErrExportRecoveryRequired, err)
+		return
+	}
+	decision.Bound = bound.RatString()
+	if difference.Cmp(bound) > 0 {
+		decision.Err = billing.ErrExportRecoveryRequired
+		return
+	}
+	decision.Outcome = "incomplete"
+	decision.Err = billing.ErrExportRecoveryRequired
+	return decision, true
+}
+
+func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPeriod, item incrementalExportItem, through time.Time, reader stripeMeterSummaryReader, customer, counted string, totals billing.ExportTotals, countErr error) (decision meterReconciliationDecision) {
+	decision.Outcome = "incomplete"
+	defer func() {
+		start, end := meterObservationWindow(p.Start, through)
+		log.Info().Str("team_id", p.TeamID.String()).Str("resource", item.ResourceType).Str("event_name", item.EventName).
+			Time("query_start", start).Time("query_end", end).Str("local_quantity", item.Quantity).
+			Str("reserved_quantity", totals.Reserved).Str("submitted_quantity", totals.Submitted).Str("provider_quantity", counted).
+			Str("difference", decision.Difference).Str("precision_bound", decision.Bound).Str("policy", meterPrecisionPolicy).
+			Str("outcome", decision.Outcome).Err(decision.Err).Msg("billing meter reconciliation decision")
+	}()
+	if countErr != nil {
+		decision.Err = countErr
+		return
+	}
+	var needsEvidence bool
+	decision, needsEvidence = compareMeterSummary(counted, totals.Reserved)
+	if !needsEvidence {
+		return
+	}
+	provider, _ := meterDecimal(counted)
+	reserved, _ := meterDecimal(totals.Reserved)
+	bucketReader, ok := reader.(stripeMeterBucketReader)
+	if !ok {
+		decision.Err = fmt.Errorf("%w: bucket reader unavailable", decision.Err)
+		return
+	}
+	// The timeout covers both provider reads and bounded local snapshots, outside
+	// period locks. Reserve still rechecks authoritative coverage transactionally.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	start, end := meterObservationWindow(p.Start, through)
+	events, err := h.meterLocalEvidence(ctx, p, item.ResourceType)
+	if err == nil {
+		for pass := 0; pass < 2; pass++ {
+			var buckets []meterUsageBucket
+			buckets, err = bucketReader.BucketedMeterUsage(ctx, item.EventName, customer, start, end)
+			if err == nil {
+				err = matchMeterBuckets(events, buckets, item.EventName, customer, start, end, reserved)
+			}
+			if err != nil {
+				break
+			}
+		}
+	}
+	if err == nil {
+		var reread string
+		reread, err = reader.CountedMeterUsage(ctx, item.EventName, customer, p.Start, through)
+		if err == nil {
+			var value *big.Rat
+			value, err = meterDecimal(reread)
+			if err == nil && value.Cmp(provider) != 0 {
+				err = fmt.Errorf("provider summary changed during reconciliation")
+			}
+		}
+	}
+	if err == nil {
+		var after []meterLocalEvent
+		after, err = h.meterLocalEvidence(ctx, p, item.ResourceType)
+		if err == nil && !reflect.DeepEqual(events, after) {
+			err = fmt.Errorf("local evidence changed during reconciliation")
+		}
+	}
+	if err != nil {
+		decision.Err = errors.Join(decision.Err, err)
+		if errors.Is(err, errMeterBucketMismatch) {
+			decision.Outcome = "unexplained_excess"
+		}
+		return
+	}
+	decision.Outcome, decision.Err = "explained_precision", nil
+	return
 }
 
 type incrementalExportItem struct {
@@ -360,15 +688,14 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 		if totalErr != nil {
 			return result, totalErr
 		}
+		started := time.Now()
 		counted, countErr := reader.CountedMeterUsage(ctx, item.EventName, *account.StripeCustomerID, p.Start, through)
-		if countErr != nil {
-			return result, countErr
-		}
-		provider, _ := new(big.Rat).SetString(counted)
-		reserved, _ := new(big.Rat).SetString(totals.Reserved)
-		if provider == nil || reserved == nil || provider.Cmp(reserved) > 0 {
-			_, observeErr := h.observeIncrementalResource(ctx, p, item, through, reader, *account.StripeCustomerID)
-			return result, errors.Join(billing.ErrExportRecoveryRequired, observeErr)
+		decisionItem := item
+		decisionItem.Quantity = cumulative
+		decision := h.assessMeterSummary(ctx, p, decisionItem, through, reader, *account.StripeCustomerID, counted, totals, countErr)
+		if decision.Err != nil {
+			recordErr := h.recordMeterObservation(ctx, p, decisionItem, through, totals, counted, decision.Err, started)
+			return result, errors.Join(decision.Err, recordErr)
 		}
 		for part := 0; part < 2; part++ {
 			_, reserveErr := store.Reserve(ctx, p, item.ResourceType, cumulative, through, billing.ExportPayload{
@@ -431,36 +758,44 @@ func (h *Handlers) observeIncrementalResource(ctx context.Context, p billing.Exp
 		return totals, err
 	}
 	started := time.Now()
+	counted, countErr := reader.CountedMeterUsage(ctx, item.EventName, customer, p.Start, through)
+	decision := h.assessMeterSummary(ctx, p, item, through, reader, customer, counted, totals, countErr)
+	err = h.recordMeterObservation(ctx, p, item, through, totals, counted, decision.Err, started)
+	return totals, errors.Join(err, decision.Err)
+}
+
+func (h *Handlers) recordMeterObservation(ctx context.Context, p billing.ExportPeriod, item incrementalExportItem, through time.Time, totals billing.ExportTotals, counted string, decisionErr error, started time.Time) error {
 	previousAge, ageErr := (billing.ExportStore{Pool: h.Pool}).PreviousObservationAge(ctx, p, item.ResourceType)
 	if ageErr != nil {
 		log.Warn().Err(ageErr).Msg("billing observation freshness read failed")
 	}
-	counted, countErr := reader.CountedMeterUsage(ctx, item.EventName, customer, p.Start, through)
 	var countedMetric *float64
-	if countErr == nil {
+	if _, parseErr := meterDecimal(counted); parseErr == nil {
 		if value, parseErr := strconv.ParseFloat(counted, 64); parseErr == nil {
 			countedMetric = &value
 		}
 	}
 	localMetric, _ := strconv.ParseFloat(item.Quantity, 64)
 	currentBillingRecorder().RecordBillingReconciliation(ctx, item.ResourceType, localMetric, countedMetric, previousAge)
+
 	var countedValue *string
 	var message *string
-	if countErr != nil {
-		m := countErr.Error()
-		message = &m
-	} else {
+	if _, parseErr := meterDecimal(counted); parseErr == nil {
 		countedValue = &counted
 	}
+	if decisionErr != nil {
+		m := decisionErr.Error()
+		message = &m
+	}
 	queryStart, queryEnd := meterObservationWindow(p.Start, through)
-	_, err = h.Pool.Exec(ctx, `INSERT INTO billing_export_observation(team_id,period_start,period_end,resource_type,local_quantity,submitted_quantity,reserved_quantity,counted_quantity,query_start,query_end,last_error)
+	_, err := h.Pool.Exec(ctx, `INSERT INTO billing_export_observation(team_id,period_start,period_end,resource_type,local_quantity,submitted_quantity,reserved_quantity,counted_quantity,query_start,query_end,last_error)
         VALUES($1,$2,$3,$4,$5::numeric,$6::numeric,$7::numeric,$8::numeric,$9,$10,$11)
         ON CONFLICT(team_id,period_start,period_end,resource_type) DO UPDATE SET
         local_quantity=EXCLUDED.local_quantity,submitted_quantity=EXCLUDED.submitted_quantity,reserved_quantity=EXCLUDED.reserved_quantity,
         counted_quantity=EXCLUDED.counted_quantity,query_start=EXCLUDED.query_start,query_end=EXCLUDED.query_end,last_error=EXCLUDED.last_error,observed_at=now()`,
 		p.TeamID, p.Start, p.End, item.ResourceType, item.Quantity, totals.Submitted, totals.Reserved, countedValue, queryStart, queryEnd, message)
-	currentBillingRecorder().RecordBillingWork(ctx, "reconciliation", err != nil || countErr != nil || ageErr != nil, time.Since(started), 1)
-	return totals, errors.Join(err, countErr)
+	currentBillingRecorder().RecordBillingWork(ctx, "reconciliation", err != nil || decisionErr != nil || ageErr != nil, time.Since(started), 1)
+	return err
 }
 
 func (h *Handlers) submitIncrementalEvents(ctx context.Context, p billing.ExportPeriod, limit int) error {
