@@ -209,6 +209,7 @@ func TestIntegration_TeamCreationRequestPrivileges(t *testing.T) {
 	pool := teamCreationDatabase(t, func(pool *pgxpool.Pool) {
 		// Defaults are database-local and must precede table creation.
 		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon,authenticated,service_role`)
+		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon,authenticated,service_role`)
 	})
 	actor, teamID, requestID := uuid.New(), uuid.New(), uuid.NewString()
 	rolloutExec(t, pool, `INSERT INTO team(id,name,home_region) VALUES($1,'Role test team','use')`, teamID)
@@ -234,6 +235,10 @@ func TestIntegration_TeamCreationRequestPrivileges(t *testing.T) {
 			var currentRole string
 			if err := tx.QueryRow(ctx, `SELECT current_user`).Scan(&currentRole); err != nil || currentRole != role {
 				t.Fatalf("current role=%q want=%q err=%v", currentRole, role, err)
+			}
+			var canCreate bool
+			if err := tx.QueryRow(ctx, `SELECT has_function_privilege(current_user, 'create_team_with_signup_trial(text,uuid,text,text)', 'EXECUTE')`).Scan(&canCreate); err != nil || canCreate != (role == "service_role") {
+				t.Fatalf("policy provisioning privilege for %s=%t err=%v", role, canCreate, err)
 			}
 			const insert = `INSERT INTO team_creation_requests(actor_id,cell,request_id,name,region,team_id) VALUES($1,'use',$2,'Role test team','use',$3)`
 			const recover = `SELECT r.name, r.region, CASE WHEN r.deleted_at IS NULL THEN t.id END
@@ -274,6 +279,95 @@ func TestIntegration_TeamCreationRequestPrivileges(t *testing.T) {
 				localIdentityError(t, tx, "42501", statement, actor)
 			}
 			localIdentityError(t, tx, "42501", `TRUNCATE team_creation_requests`)
+		})
+	}
+}
+
+func TestIntegration_TeamCreationAdditionalTeamWithoutRegionalClaim(t *testing.T) {
+	pool := teamCreationDatabase(t)
+	client := newTeamCreationClient(t, pool)
+	ctx := context.Background()
+	for _, canonical := range []bool{false, true} {
+		t.Run(fmt.Sprintf("canonical=%t", canonical), func(t *testing.T) {
+			if canonical {
+				rolloutExec(t, pool, `SELECT enable_canonical_promotion_identity('{"reference":"isolated additional team test","all_writers_ready":true,"rollback_ready":true}')`)
+			}
+			// A fresh regional actor models a creator whose first team is in another cell.
+			actor := uuid.New()
+			claims := teamCreationClaims(actor, uuid.NewString(), fmt.Sprintf("Regional additional team %t", canonical))
+			firstTeamPolicy := claims["policy"]
+			claims["policy"] = map[string]any{"version": 1, "mode": "additional_team", "session": "passed", "captcha": "not_applicable", "preauth": "not_applicable", "google_onboarding": "not_applicable", "additional_team": "passed"}
+			denialsBefore := teamCreationCount(t, pool, `SELECT count(*) FROM team_signup_trial_denial`)
+			rolloutExec(t, pool, `CREATE FUNCTION fail_additional_team_result() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected result failure'; END $$`)
+			rolloutExec(t, pool, `CREATE TRIGGER fail_additional_team_result BEFORE INSERT ON team_creation_requests FOR EACH ROW EXECUTE FUNCTION fail_additional_team_result()`)
+			failed := client.call(claims, nil)
+			rolloutExec(t, pool, `DROP TRIGGER fail_additional_team_result ON team_creation_requests`)
+			rolloutExec(t, pool, `DROP FUNCTION fail_additional_team_result()`)
+			teamCreationStatus(t, failed, http.StatusInternalServerError, "internal_error")
+			if n := teamCreationCount(t, pool, `SELECT count(*) FROM team WHERE name=$1`, claims["name"]); n != 0 {
+				t.Fatal("failed additional creation left a team")
+			}
+			if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_signup_trial_denial`); n != denialsBefore {
+				t.Fatal("failed additional creation left a denial")
+			}
+			for _, query := range []string{
+				`SELECT count(*) FROM profile WHERE id=$1`,
+				`SELECT count(*) FROM promotion_identity_evidence WHERE user_id=$1`,
+				`SELECT count(*) FROM team_signup_promotion_outcome WHERE user_id=$1`,
+				`SELECT count(*) FROM team_member WHERE profile_id=$1`,
+				`SELECT count(*) FROM team_memberships WHERE user_id=$1`,
+				`SELECT count(*) FROM user_role_assignments WHERE user_id=$1`,
+				`SELECT count(*) FROM team_creation_requests WHERE actor_id=$1`,
+			} {
+				if n := teamCreationCount(t, pool, query, actor); n != 0 {
+					t.Fatalf("failed additional creation left state: %s count=%d", query, n)
+				}
+			}
+			teamCreationStatus(t, client.call(teamCreationRecover(claims), nil), http.StatusNotFound, "result_not_found")
+			created := client.call(claims, nil)
+			id := teamCreationID(t, created)
+			teamCreationOutcome(t, pool, id, "promotion_ineligible")
+			for _, query := range []string{
+				`SELECT count(*) FROM team_signup_trial_denial WHERE team_id=$1`,
+				`SELECT count(*) FROM team_signup_promotion_outcome WHERE team_id=$1 AND reason='additional_team'`,
+				`SELECT count(*) FROM team_member WHERE team_id=$1 AND role='owner'`,
+				`SELECT count(*) FROM team_memberships WHERE team_id=$1 AND status='active'`,
+				`SELECT count(*) FROM user_role_assignments a JOIN roles r ON r.id=a.role_id WHERE a.team_id=$1 AND a.revoked_at IS NULL AND r.name='team_owner'`,
+				`SELECT count(*) FROM team_creation_requests WHERE team_id=$1`,
+			} {
+				if n := teamCreationCount(t, pool, query, id); n != 1 {
+					t.Fatalf("incomplete additional creation: %s count=%d", query, n)
+				}
+			}
+			var eligible bool
+			if err := pool.QueryRow(ctx, `SELECT team_sandbox_billing_eligible($1)`, id).Scan(&eligible); err != nil || eligible {
+				t.Fatalf("additional team billing eligible=%t err=%v", eligible, err)
+			}
+			// Legacy claim re-entry must preserve the explicit no-grant decision.
+			var outcome, reason string
+			if err := pool.QueryRow(ctx, `SELECT outcome, reason FROM claim_team_signup_trial($1,$2)`, id, actor).Scan(&outcome, &reason); err != nil || outcome != "promotion_ineligible" || reason != "additional_team" {
+				t.Fatalf("legacy re-entry outcome=%q reason=%q err=%v", outcome, reason, err)
+			}
+			readClient := newTeamCreationClient(t, teamCreationReadOnlyPool(t, pool))
+			// A renewed first-team assertion cannot upgrade a completed no-grant intent.
+			claims["policy"] = firstTeamPolicy
+			for _, replay := range []map[string]any{claims, teamCreationRecover(claims)} {
+				response := readClient.call(replay, nil)
+				teamCreationStatus(t, response, http.StatusOK, "")
+				if response.Body.String() != created.Body.String() {
+					t.Fatal("additional team replay changed committed result")
+				}
+			}
+			teamCreationOutcome(t, pool, id, "promotion_ineligible")
+			for _, query := range []string{
+				`SELECT count(*) FROM user_signup_trial_claim WHERE user_id=$1`,
+				`SELECT count(*) FROM user_promotion_entitlement WHERE user_id=$1 AND signup_trial_claimed_at IS NOT NULL`,
+				`SELECT count(*) FROM promotion_identity_history WHERE user_id=$1 AND promotion='signup'`,
+			} {
+				if n := teamCreationCount(t, pool, query, actor); n != 0 {
+					t.Fatalf("additional creation consumed a signup claim: %s count=%d", query, n)
+				}
+			}
 		})
 	}
 }
@@ -509,7 +603,7 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 		claims[0]["request_id"] = uuid.NewString()
 		claims[0]["name"] = "Additional team"
 		claims[0]["policy"] = map[string]any{"version": 1, "mode": "additional_team", "session": "passed", "captcha": "not_applicable", "preauth": "not_applicable", "google_onboarding": "not_applicable", "additional_team": "passed"}
-		teamCreationOutcome(t, pool, teamCreationID(t, client.call(claims[0], nil)), "already_claimed")
+		teamCreationOutcome(t, pool, teamCreationID(t, client.call(claims[0], nil)), "promotion_ineligible")
 	})
 	t.Run("revision conflict and changed verification", func(t *testing.T) {
 		actor := uuid.New()

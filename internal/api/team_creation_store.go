@@ -49,7 +49,7 @@ func readTeamCreationResult(ctx context.Context, q interface {
 
 // The advisory lock serializes one actor/cell/request across API replicas.
 // All provisioning writes and the immutable result are in the same transaction.
-func createTeamCreationResult(ctx context.Context, pool *pgxpool.Pool, actor uuid.UUID, input teamCreationInput, identity *teamCreationIdentity) (teamCreationResult, error) {
+func createTeamCreationResult(ctx context.Context, pool *pgxpool.Pool, actor uuid.UUID, input teamCreationInput, identity *teamCreationIdentity, policyMode string) (teamCreationResult, error) {
 	var result teamCreationResult
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -99,7 +99,7 @@ func createTeamCreationResult(ctx context.Context, pool *pgxpool.Pool, actor uui
 		return result, errTeamCreationIdentityUnavailable
 	}
 
-	if err = tx.QueryRow(ctx, `SELECT id FROM create_team_with_signup_trial($1, $2, $3)`, input.Name, actor, input.Region).Scan(&result.ID); err != nil {
+	if err = tx.QueryRow(ctx, `SELECT id FROM create_team_with_signup_trial($1, $2, $3, $4)`, input.Name, actor, input.Region, policyMode).Scan(&result.ID); err != nil {
 		return result, err
 	}
 	// Require the authority's explicit outcome in both expansion and enforcement modes.

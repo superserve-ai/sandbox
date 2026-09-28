@@ -470,7 +470,7 @@ func (h *Handlers) createInternalTeam(c *gin.Context, now time.Time) {
 	if claims.Authorization == "recover" {
 		result, err = readTeamCreationResult(ctx, h.Pool, actor, input)
 	} else {
-		result, err = createTeamCreationResult(ctx, h.Pool, actor, input, claims.Identity)
+		result, err = createTeamCreationResult(ctx, h.Pool, actor, input, claims.Identity, claims.Policy.Mode)
 	}
 	if err != nil {
 		switch {
