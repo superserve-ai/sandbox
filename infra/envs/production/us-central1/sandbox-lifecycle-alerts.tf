@@ -6,7 +6,7 @@
 module "sandbox_lifecycle_alerts" {
   source = "../../../modules/observability"
 
-  runbook_urls = var.alert_runbook_urls
+  runbook_urls = module.alert_runbooks.urls
 
   project_id               = local.project_id
   environment              = local.environment

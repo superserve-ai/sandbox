@@ -1,8 +1,10 @@
 # Alert response mapping
 
-Each row names a logical destination in the private `ALERT_RUNBOOK_URLS` JSON map. Supply direct runbook pages before planning or applying alert-bearing roots. Production and staging share the input shape; operators may use distinct pages. The Cloud IDS module uses its existing validated `RUNBOOK_BASE_URL` plus the investigation page ID. No destination is stored here. The URL checks establish syntax and wiring only; operators verify that each page has the right procedure after deployment.
+Alerts use the repository Actions variable `RUNBOOK_BASE_URL`, matching Cloud IDS. Terraform combines that HTTPS base with one page ID per procedure from `infra/modules/alert-runbooks`. The same destinations apply to staging and production. Complete URLs stay out of source control; page IDs are not credentials and access is controlled by the documentation provider.
 
-| Policy and variant | Runbook input | Family | Component | Failure family | Operation |
+Workflows pass the shared variable as `TF_VAR_alert_runbook_base_url` for these alerts and `TF_VAR_cloud_ids_runbook_base_url` for Cloud IDS. Local Terraform runs use the corresponding inputs. Trailing slashes are normalized before appending a page ID. No full-URL map is required.
+
+| Policy and variant | Runbook key | Family | Component | Failure family | Operation |
 | --- | --- | --- | --- | --- | --- |
 | `sandbox_lifecycle_latency[create]` | `lifecycle_latency` | `sandbox_lifecycle` | `api` | `latency` | `create` |
 | `sandbox_lifecycle_latency[resume]` | `lifecycle_latency` | `sandbox_lifecycle` | `api` | `latency` | `resume` |
@@ -27,4 +29,4 @@ Each row names a logical destination in the private `ALERT_RUNBOOK_URLS` JSON ma
 | `ids_triage` | Cloud IDS investigation | `cloud_ids` | `vmd` | `security_finding` | — |
 | `ids_medium` (disabled) | Cloud IDS investigation | `cloud_ids` | `vmd` | `security_finding` | — |
 
-Reuse alert-specific pages where available. For missing procedures, create sparse pages under Operations / Runbooks from the canonical top-level Runbook Template after merge. Never use a generic index as a destination. Configure the private JSON map and existing Cloud IDS base URL before applying new inputs, then inspect rendered policy links and labels. When structured Monitoring notifications are ingested, inspect one representative payload for the labels.
+Each procedure has its own page under Operations / Runbooks. The nine newer destinations are skeletons awaiting procedure content and testing. Fill those pages in place to preserve the committed IDs; do not substitute a generic index. Configure the shared base URL before applying, then inspect rendered policy links and labels. When structured Monitoring notifications are ingested, inspect one representative payload for the labels.

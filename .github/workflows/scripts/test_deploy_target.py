@@ -25,7 +25,7 @@ class DeployTargetTests(unittest.TestCase):
                 job = re.split(r'^  [a-z][a-z-]*:\n', workflow.split(f'  {name}:\n', 1)[1],
                                maxsplit=1, flags=re.M)[0]
                 job_env = job.split('    env:\n', 1)[1].split('    steps:\n', 1)[0]
-                self.assertIn('TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}', job_env)
+                self.assertIn('TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}', job_env)
 
     def test_staging_migration_shares_proxy_deployment_queue(self):
         workflow = (SCRIPTS.parent / 'terraform-rollout-staging.yml').read_text()

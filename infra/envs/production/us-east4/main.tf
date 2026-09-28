@@ -447,7 +447,7 @@ resource "google_storage_bucket_iam_member" "vmd_backup" {
 module "observability" {
   source = "../../../modules/observability"
 
-  runbook_urls = var.alert_runbook_urls
+  runbook_urls = module.alert_runbooks.urls
 
   project_id               = local.project_id
   environment              = local.environment
