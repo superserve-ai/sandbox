@@ -48,7 +48,7 @@ func (c *stripeHTTPClient) CountedMeterUsage(ctx context.Context, eventName, cus
 	}
 	values := url.Values{"customer": {customer}, "start_time": {strconv.FormatInt(start.Unix(), 10)}, "end_time": {strconv.FormatInt(end.Unix(), 10)}, "limit": {"100"}}
 	var summary struct {
-		Data []struct {
+		Data *[]struct {
 			Value json.Number `json:"aggregated_value"`
 		} `json:"data"`
 		HasMore *bool `json:"has_more"`
@@ -56,14 +56,14 @@ func (c *stripeHTTPClient) CountedMeterUsage(ctx context.Context, eventName, cus
 	if err := c.doForm(ctx, http.MethodGet, "/v1/billing/meters/"+url.PathEscape(meterID)+"/event_summaries?"+values.Encode(), nil, &summary, ""); err != nil {
 		return "", err
 	}
-	if summary.HasMore == nil || *summary.HasMore || len(summary.Data) > 1 {
+	if summary.Data == nil || summary.HasMore == nil || *summary.HasMore || len(*summary.Data) > 1 {
 		return "", fmt.Errorf("unexpected grouped meter summary")
 	}
-	if len(summary.Data) == 0 {
+	if len(*summary.Data) == 0 {
 		return "0", nil
 	}
-	value := summary.Data[0].Value.String()
-	if _, err := billing.DecimalDelta(value, "0"); err != nil {
+	value := (*summary.Data)[0].Value.String()
+	if _, err := meterDecimal(value); err != nil {
 		return "", err
 	}
 	return value, nil
@@ -141,26 +141,20 @@ func meterDecimal(value string) (*big.Rat, error) {
 	return r, nil
 }
 
-// meterQuantity is the supported exact quantity domain. Zero is a valid
-// empty bucket; every non-zero value must be representable within the
-// documented reconciliation range.
+// meterQuantity validates a provider or local quantity without applying the
+// narrower residual precision policy. Equality and provider lag remain valid
+// at any supported cumulative magnitude; the precision range is checked only
+// when a positive excess is being considered for an explained-drift bypass.
 func meterQuantity(value string) (*big.Rat, error) {
-	r, err := meterDecimal(value)
-	if err != nil {
-		return nil, err
-	}
-	if r.Sign() == 0 {
-		return r, nil
-	}
-	if r.Cmp(big.NewRat(1, 1_000_000_000_000)) < 0 || r.Cmp(big.NewRat(1_000_000_000, 1)) > 0 {
-		return nil, fmt.Errorf("quantity outside precision policy range [1e-12,1e9]")
-	}
-	return r, nil
+	return meterDecimal(value)
 }
 
+// meterPrecisionBound is consulted only for a positive provider excess. The
+// exact comparison path intentionally permits equality and provider lag at
+// cumulative magnitudes outside this residual policy range.
 func meterPrecisionBound(local *big.Rat) (*big.Rat, error) {
 	if local.Sign() == 0 {
-		return big.NewRat(1, 1_000_000_000_000), nil
+		return new(big.Rat), nil
 	}
 	if local.Cmp(big.NewRat(1, 1_000_000_000_000)) < 0 || local.Cmp(big.NewRat(1_000_000_000, 1)) > 0 {
 		return nil, fmt.Errorf("quantity outside precision policy range [1e-12,1e9]")
@@ -229,7 +223,7 @@ func (c *stripeHTTPClient) BucketedMeterUsage(ctx context.Context, event, custom
 			values.Set("value_grouping_window", "day")
 		}
 		var response struct {
-			Data []struct {
+			Data *[]struct {
 				ID    string      `json:"id"`
 				Meter string      `json:"meter"`
 				Start *int64      `json:"start_time"`
@@ -248,8 +242,11 @@ func (c *stripeHTTPClient) BucketedMeterUsage(ctx context.Context, event, custom
 		if response.HasMore == nil || *response.HasMore {
 			return nil, fmt.Errorf("incomplete bounded meter buckets")
 		}
+		if response.Data == nil {
+			return nil, fmt.Errorf("missing meter bucket data")
+		}
 		seen := map[string]bool{}
-		for _, row := range response.Data {
+		for _, row := range *response.Data {
 			if row.ID == "" || seen[row.ID] || row.Meter != meterID || row.Start == nil || row.End == nil {
 				return nil, fmt.Errorf("malformed meter bucket identity or window")
 			}
@@ -316,9 +313,6 @@ func matchMeterBuckets(events []meterLocalEvent, buckets []meterUsageBucket, eve
 	}
 	if len(events) > meterEvidenceLimit {
 		return fmt.Errorf("incomplete meter evidence")
-	}
-	if _, err := meterPrecisionBound(reserved); err != nil {
-		return err
 	}
 	totals := make([]*big.Rat, len(windows))
 	for i := range totals {
@@ -395,8 +389,8 @@ type meterReconciliationDecision struct {
 
 func compareMeterSummary(counted, reservedValue string) (decision meterReconciliationDecision, needsEvidence bool) {
 	decision.Outcome = "incomplete"
-	provider, err := meterQuantity(counted)
-	reserved, localErr := meterQuantity(reservedValue)
+	provider, err := meterDecimal(counted)
+	reserved, localErr := meterDecimal(reservedValue)
 	if err != nil || localErr != nil {
 		decision.Err = errors.Join(billing.ErrExportRecoveryRequired, err, localErr)
 		return
@@ -444,7 +438,7 @@ func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPerio
 		if value == "" {
 			continue
 		}
-		if _, err := meterQuantity(value); err != nil {
+		if _, err := meterDecimal(value); err != nil {
 			decision.Err = errors.Join(billing.ErrExportRecoveryRequired, err)
 			return
 		}
@@ -682,10 +676,14 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 	}
 	result.Status = period.Status
 	if period.Status == "exported" || period.FinalizedAt.Valid {
-		if err = h.submitIncrementalEvents(ctx, p, 2*len(h.billingResourceStates(storage))); err != nil {
-			return result, err
+		frozenResult, reconcileErr := h.reconcileFrozenIncrementalPeriod(ctx, p)
+		if reconcileErr != nil {
+			return frozenResult, reconcileErr
 		}
-		return h.reconcileFrozenIncrementalPeriod(ctx, p)
+		if err = h.submitIncrementalEvents(ctx, p, 2*len(h.billingResourceStates(storage))); err != nil {
+			return frozenResult, err
+		}
+		return frozenResult, nil
 	}
 
 	var usage db.TeamBillingUsage
@@ -756,12 +754,6 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 	// persisted semantic attribution of the event, never a summary bucket.
 	queryStart, queryEnd := meterObservationWindow(p.Start, through)
 	timestamp := queryEnd.Add(-time.Second).Unix()
-	// Retry already-reserved pending/uncertain events before evaluating a
-	// provider excess gate. Claiming preserves their original identity and
-	// coverage; new allocations remain blocked until reconciliation succeeds.
-	if err = h.submitIncrementalEvents(ctx, p, 2*len(h.billingResourceStates(storage))); err != nil {
-		return result, err
-	}
 	if timestamp < queryStart.Unix() {
 		return result, nil
 	}
@@ -806,6 +798,10 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 		}
 	}
 
+	// Retry already-reserved pending/uncertain events only after every current
+	// usage/correction target has passed the local safety checks above. This
+	// prevents a downward measurement correction from delivering stale coverage
+	// before the gate can return recovery-required.
 	if err = h.submitIncrementalEvents(ctx, p, 2*len(items)); err != nil {
 		return result, err
 	}
@@ -953,6 +949,24 @@ func (h *Handlers) reconcileIncrementalPeriod(ctx context.Context, p billing.Exp
 	items, err := h.incrementalReconciliationItems(ctx, p, usage, h.billingResourceStates(storage))
 	if err != nil {
 		return result, err
+	}
+	// This reconciliation path has no Reserve call to recheck coverage before
+	// retrying a pending event. Validate every current/correction target against
+	// reserved coverage before any delivery claim, preserving the downward-usage
+	// guard.
+	store := billing.ExportStore{Pool: h.Pool}
+	for _, item := range items {
+		target, targetErr := store.CorrectionTarget(ctx, p, item.ResourceType, item.Quantity)
+		if targetErr != nil {
+			return result, targetErr
+		}
+		totals, totalsErr := store.Totals(ctx, p, item.ResourceType)
+		if totalsErr != nil {
+			return result, totalsErr
+		}
+		if _, deltaErr := billing.DecimalDelta(target, totals.Reserved); deltaErr != nil {
+			return result, deltaErr
+		}
 	}
 	var observedErrors []error
 	for _, item := range items {

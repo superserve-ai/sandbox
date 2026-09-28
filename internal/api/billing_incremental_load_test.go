@@ -1831,6 +1831,40 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 	if observations != len(resources) {
 		t.Fatalf("observations=%d want=%d", observations, len(resources))
 	}
+	// A pending event whose reservation is now above measured usage must be
+	// rejected before retry delivery. The existing event identity and payload
+	// remain the only coverage; no replacement or provider call is allowed.
+	if _, err := store.Reserve(ctx, p, "cpu", "9715.454976049444", now, billing.ExportPayload{
+		EventName: resources["cpu"], CustomerID: customer, Timestamp: now.Add(-time.Second).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var pendingID, pendingPayload string
+	if err := pool.QueryRow(ctx, `SELECT e.id::text,e.quantity_payload FROM billing_export_event e
+ JOIN billing_export_allocation a ON a.id=e.allocation_id
+ WHERE a.team_id=$1 AND a.resource_type='cpu' AND e.status='pending'
+ ORDER BY e.created_at DESC LIMIT 1`, team.ID).Scan(&pendingID, &pendingPayload); err != nil {
+		t.Fatal(err)
+	}
+	exec(`UPDATE billing_export_usage SET vcpu_seconds=9714.454976049444*3600 WHERE team_id=$1`, team.ID)
+	provider.mode = "complete"
+	callsBeforeDownward := len(provider.calls)
+	tick(true)
+	if len(provider.calls) != callsBeforeDownward {
+		t.Fatal("downward correction delivered stale pending coverage")
+	}
+	var status, payload string
+	if err := pool.QueryRow(ctx, `SELECT status,quantity_payload FROM billing_export_event WHERE id=$1::uuid`, pendingID).Scan(&status, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || payload != pendingPayload {
+		t.Fatalf("pending event changed during downward correction: status=%s payload=%s", status, payload)
+	}
+	exec(`UPDATE billing_export_usage SET vcpu_seconds=9715.454976049444*3600 WHERE team_id=$1`, team.ID)
+	tick(false)
+	if len(provider.calls) != callsBeforeDownward+1 || provider.calls[len(provider.calls)-1].Value != "1.000000000000" {
+		t.Fatalf("pending coverage was not retried after usage recovered: calls=%d", len(provider.calls)-callsBeforeDownward)
+	}
 	if snapshot() != before {
 		t.Fatal("precision recovery mutated historical payload or coverage")
 	}
@@ -1848,9 +1882,12 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 	// A new local reservation during evidence collection must invalidate the
 	// snapshot, even if provider bucket quantities remain unchanged.
 	provider.changeLocal = func() {
-		_, err := store.Reserve(ctx, p, "cpu", "9715.454976049444", now, billing.ExportPayload{EventName: resources["cpu"], CustomerID: customer, Timestamp: now.Add(-time.Second).Unix()})
+		event, err := store.Reserve(ctx, p, "cpu", "9716.454976049444", now, billing.ExportPayload{EventName: resources["cpu"], CustomerID: customer, Timestamp: now.Add(-time.Second).Unix()})
 		if err != nil {
 			t.Fatal(err)
+		}
+		if event == nil || event.Quantity != "1.000000000000" {
+			t.Fatalf("concurrent reservation did not create one unit of new coverage: %+v", event)
 		}
 	}
 	totals, err := store.Totals(ctx, p, "cpu")

@@ -51,6 +51,15 @@ func TestIncrementalMeterSummaryPreservesDecimalAndMinuteWindow(t *testing.T) {
 	}
 }
 
+func TestIncrementalMeterSummaryAcceptsPolicyQuantitiesBeyondAccountingScale(t *testing.T) {
+	transport := &incrementalSummaryTransport{expectedStart: "0", expectedEnd: "3600", summary: `{"data":[{"aggregated_value":1.0000000000000002}],"has_more":false}`}
+	client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
+	quantity, err := client.CountedMeterUsage(t.Context(), "cpu_hours", "cus_example", time.Unix(0, 0), time.Unix(3600, 0))
+	if err != nil || quantity != "1.0000000000000002" {
+		t.Fatalf("summary=%q %v", quantity, err)
+	}
+}
+
 func TestIncrementalMeterSummaryDoesNotInferEventAcceptance(t *testing.T) {
 	for _, tc := range []struct {
 		body      string
@@ -59,6 +68,8 @@ func TestIncrementalMeterSummaryDoesNotInferEventAcceptance(t *testing.T) {
 	}{
 		{`{"data":[],"has_more":false}`, false, "0"},
 		{`{"data":[]}`, true, ""},
+		{`{"data":null,"has_more":false}`, true, ""},
+		{`{"has_more":false}`, true, ""},
 		{`{"data":[{"aggregated_value":10}],"has_more":true}`, true, ""},
 		{`{"data":[{"aggregated_value":10},{"aggregated_value":5}],"has_more":false}`, true, ""},
 	} {
@@ -133,7 +144,7 @@ func (f meterBucketTransport) RoundTrip(req *http.Request) (*http.Response, erro
 func TestIncrementalBucketReaderBoundsAndEdges(t *testing.T) {
 	start := time.Date(2026, 8, 1, 0, 2, 0, 0, time.UTC)
 	end := start.AddDate(0, 1, 0).Add(7 * time.Hour)
-	for _, mode := range []string{"complete", "pagination", "missing", "missing_completion", "wrong_meter", "wrong_window", "duplicate", "negative", "outage"} {
+	for _, mode := range []string{"complete", "pagination", "missing", "missing_completion", "missing_data", "null_data", "wrong_meter", "wrong_window", "duplicate", "negative", "outage"} {
 		t.Run(mode, func(t *testing.T) {
 			calls, summaries := 0, 0
 			transport := meterBucketTransport(func(req *http.Request) (*http.Response, error) {
@@ -176,6 +187,10 @@ func TestIncrementalBucketReaderBoundsAndEdges(t *testing.T) {
 						response["data"] = rows[:len(rows)-1]
 					case "missing_completion":
 						delete(response, "has_more")
+					case "missing_data":
+						delete(response, "data")
+					case "null_data":
+						response["data"] = nil
 					case "wrong_meter":
 						rows[0]["meter"] = "mtr_other"
 					case "wrong_window":
@@ -247,7 +262,7 @@ func TestMeterPrecisionBoundary(t *testing.T) {
 			}
 		}
 	}
-	if bound, err := meterPrecisionBound(new(big.Rat)); err != nil || bound.Cmp(big.NewRat(1, 1_000_000_000_000)) != 0 {
+	if bound, err := meterPrecisionBound(new(big.Rat)); err != nil || bound.Sign() != 0 {
 		t.Fatalf("zero precision policy: bound=%v err=%v", bound, err)
 	}
 	for _, total := range []string{"0.0000000000009", "1000000000.000000000001"} {
@@ -258,6 +273,20 @@ func TestMeterPrecisionBoundary(t *testing.T) {
 	}
 	if decision, _ := compareMeterSummary("1000000000.000000000001", "1000000000"); decision.Err == nil {
 		t.Fatal("provider quantity beyond upper policy boundary accepted")
+	}
+	if decision, candidate := compareMeterSummary("0.000000000001", "0"); decision.Err == nil || candidate || decision.Outcome != "unexplained_excess" {
+		t.Fatalf("positive provider usage with empty local ledger was explained: %+v candidate=%v", decision, candidate)
+	}
+	for _, tc := range []struct {
+		provider, reserved, outcome string
+	}{
+		{"1000000001", "1000000001", "equal"},
+		{"1000000000", "1000000001", "provider_lag"},
+	} {
+		decision, candidate := compareMeterSummary(tc.provider, tc.reserved)
+		if decision.Err != nil || candidate || decision.Outcome != tc.outcome {
+			t.Fatalf("ordinary %s comparison blocked: %+v candidate=%v", tc.outcome, decision, candidate)
+		}
 	}
 }
 
