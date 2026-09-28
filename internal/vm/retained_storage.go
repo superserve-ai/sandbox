@@ -78,13 +78,45 @@ func retainedRecordPaths(rec VMRecord, runDir string) ([]string, error) {
 			return nil, fmt.Errorf("layered memory base is unknown")
 		}
 	}
+	// DeltaDir and RootfsPath were added after records already existed. Recover
+	// them from the pinned snapshot layout when the durable record was written
+	// by an older daemon; if a pinned overlay is present but its dependency
+	// cannot be recovered, keep the observation unknown rather than clipping
+	// the legacy contribution at cutover.
+	deltaDir := rec.DeltaDir
+	if deltaDir == "" && rec.BasePath != "" && rec.SnapshotPath != "" {
+		candidates := []string{filepath.Dir(rec.SnapshotPath), filepath.Dir(rec.BasePath)}
+		for _, candidate := range candidates {
+			if _, err := os.Stat(filepath.Join(candidate, "rootfs.delta")); err == nil {
+				deltaDir = candidate
+				break
+			}
+		}
+		if deltaDir == "" {
+			if _, layoutErr := templateRootfsForSnapshot(runDir, rec.SnapshotPath); layoutErr == nil {
+				if _, err := os.Stat(rec.BasePath); err == nil {
+					return nil, fmt.Errorf("pinned overlay dependencies are unknown")
+				}
+			}
+		}
+	}
+	rootfs := rec.RootfsPath
+	if rootfs == "" && rec.BasePath == "" && rec.SnapshotPath != "" {
+		if inferred, err := templateRootfsForSnapshot(runDir, rec.SnapshotPath); err == nil {
+			if _, statErr := os.Stat(inferred); statErr == nil {
+				rootfs = inferred
+			} else {
+				return nil, fmt.Errorf("legacy template rootfs dependency is unknown")
+			}
+		}
+	}
 	delta := ""
-	if rec.DeltaDir != "" {
-		delta = filepath.Join(rec.DeltaDir, "rootfs.delta")
+	if deltaDir != "" {
+		delta = filepath.Join(deltaDir, "rootfs.delta")
 	}
 	paths := []string{disk, rec.BasePath, rec.SnapshotPath, rec.MemFilePath, baseMem}
-	if rec.RootfsPath != "" {
-		paths = append(paths, rec.RootfsPath)
+	if rootfs != "" {
+		paths = append(paths, rootfs)
 	}
 	if delta != "" {
 		paths = append(paths, delta)

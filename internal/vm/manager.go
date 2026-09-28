@@ -3577,7 +3577,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// Keep the immutable template rootfs as inventory metadata even though the
 	// restore itself runs from the per-sandbox copy. This path derivation is
 	// bounded and does not touch the filesystem or delay VM startup.
-	if resourceLimits.RootfsPath == "" {
+	// Overlay restores retain their immutable template dependencies through
+	// BasePath/DeltaDir. Inferring the legacy rootfs path for them invents a
+	// file that the overlay builder never creates and makes the whole host
+	// inventory unknown. Only legacy full-copy restores need this fallback.
+	if resourceLimits.RootfsPath == "" && resourceLimits.BasePath == "" {
 		if rootfs, err := templateRootfsForSnapshot(m.cfg.RunDir, metaSnapshot); err == nil {
 			resourceLimits.RootfsPath = rootfs
 		}

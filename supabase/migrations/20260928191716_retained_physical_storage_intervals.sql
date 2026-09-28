@@ -75,9 +75,16 @@ CREATE TRIGGER close_snapshot_retained_storage AFTER UPDATE OF deleted_at ON san
 CREATE FUNCTION retained_storage_mib_seconds(p_team uuid,p_start timestamptz,p_end timestamptz)
 RETURNS numeric LANGUAGE sql STABLE AS $$
  WITH intervals AS MATERIALIZED (
-  SELECT host_id,extents,GREATEST(started_at,p_start) lo,LEAST(COALESCE(ended_at,billing_request_now()),p_end,billing_request_now()) hi
+ SELECT host_id,extents,GREATEST(started_at,p_start) lo,LEAST(COALESCE(ended_at,billing_request_now()),p_end,billing_request_now()) hi
   FROM retained_storage_interval
   WHERE team_id=p_team AND p_start<LEAST(p_end,billing_request_now()) AND started_at<LEAST(p_end,billing_request_now()) AND COALESCE(ended_at,billing_request_now())>p_start
+ ), interval_extents AS MATERIALIZED (
+  -- Decode each retained payload once per historical interval. Expanding the
+  -- JSON inside the slice join multiplied parsing work by every boundary and
+  -- made frequent replacements quadratic in the billing readers.
+  SELECT i.host_id,i.lo,i.hi,e.device,e.start,e.length
+  FROM intervals i
+  CROSS JOIN LATERAL jsonb_to_recordset(i.extents) AS e(device text,start bigint,length bigint)
  ), boundaries AS (
   SELECT host_id,lo at FROM intervals UNION SELECT host_id,hi FROM intervals
  ), slices AS (
@@ -85,8 +92,7 @@ RETURNS numeric LANGUAGE sql STABLE AS $$
  ), allocations AS (
   SELECT s.host_id,s.lo,s.hi,e.device,
    range_agg(int8range(e.start,e.start+e.length,'[)')) blocks
-  FROM slices s JOIN intervals i ON i.host_id=s.host_id AND i.lo<=s.lo AND i.hi>=s.hi
-  CROSS JOIN LATERAL jsonb_to_recordset(i.extents) AS e(device text,start bigint,length bigint)
+  FROM slices s JOIN interval_extents e ON e.host_id=s.host_id AND e.lo<=s.lo AND e.hi>=s.hi
   WHERE s.hi>s.lo GROUP BY s.host_id,s.lo,s.hi,e.device
  ) SELECT COALESCE(sum((upper(r)-lower(r))::numeric*EXTRACT(epoch FROM(hi-lo))/1048576.0),0)
  FROM allocations CROSS JOIN LATERAL unnest(blocks) AS ranges(r)
@@ -105,17 +111,12 @@ WITH legacy_intervals AS MATERIALIZED (
   LEFT JOIN retained_storage_cutover c ON c.host_id=i.host_id AND c.team_id=i.team_id
   WHERE i.team_id=p_team AND p_start<LEAST(p_end,billing_request_now()) AND i.started_at<COALESCE(c.started_at,'infinity')
  ), artifact_bounds AS (
-  SELECT s.*,f.retention_end,f.started_at billing_started_at
-  FROM sandbox s
-  JOIN LATERAL (
-   -- Closing an overlay measurement does not release its referenced artifacts.
-   -- An unbounded retention interval must survive aggregation with closed ones.
-   SELECT min(started_at) started_at,
-    NULLIF(max(COALESCE(artifact_retention_end,'infinity'::timestamptz)),'infinity'::timestamptz) retention_end
-   FROM legacy_intervals i WHERE i.sandbox_id=s.id
-  ) f ON f.started_at IS NOT NULL
-  WHERE s.team_id=p_team AND f.started_at<LEAST(billing_request_now(),p_end)
-    AND COALESCE(f.retention_end,billing_request_now())>p_start
+  -- Keep each host/reference range separate until the final path union. A
+  -- sandbox transfer must not bridge two hosts and reopen a prior cutover.
+  SELECT s.*,i.host_id,i.started_at billing_started_at,i.artifact_retention_end retention_end
+  FROM sandbox s JOIN legacy_intervals i ON i.sandbox_id=s.id
+  WHERE s.team_id=p_team AND i.started_at<LEAST(billing_request_now(),p_end)
+    AND COALESCE(i.artifact_retention_end,billing_request_now())>p_start
  ), artifact_ranges AS (
   SELECT p.path,MAX(COALESCE(am.allocated_bytes,0))::numeric/1048576.0 artifact_mib,
    range_agg(tstzrange(GREATEST(s.billing_started_at,p_start),LEAST(COALESCE(s.retention_end,billing_request_now()),p_end),'[)')) retained_ranges
@@ -165,6 +166,7 @@ AS $$
               FROM sandbox s
               WHERE s.team_id = p_team_id
                 AND s.host_id = r.host_id
+                AND s.status <> 'failed'
                 AND s.created_at <= r.received_at
                 AND (s.destroyed_at IS NULL OR s.destroyed_at > r.received_at)
               UNION ALL SELECT 1 FROM sandbox_snapshot s
@@ -181,6 +183,7 @@ AS $$
               FROM sandbox s
               WHERE s.team_id = p_team_id
                 AND s.host_id = legacy.host_id
+                AND s.status <> 'failed'
                 AND s.created_at <= legacy.received_at
                 AND (s.destroyed_at IS NULL OR s.destroyed_at > legacy.received_at)
               UNION ALL SELECT 1 FROM sandbox_snapshot s

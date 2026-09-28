@@ -205,8 +205,14 @@ func TestRetainedStorageUnionSurvivesSnapshotAndSourceDeletion(t *testing.T) {
 		kind string
 		id   uuid.UUID
 	}{{"sandbox", f.sandboxID}, {"snapshot", snapshot}, {"sandbox", child}} {
+		startBlock := int64(0)
+		if o.kind == "snapshot" {
+			// Give the retained snapshot a private extent so leaving its
+			// interval open cannot be masked by the source's shared baseline.
+			startBlock = 1048576
+		}
 		exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at)
-   VALUES($1,$2,$3,$4,$5,'[{"device":"fs","start":0,"length":1048576}]',$6)`, f.hostID, team, o.kind, o.id, strings.Repeat("a", 64), start)
+   VALUES($1,$2,$3,$4,$5,jsonb_build_array(jsonb_build_object('device','fs','start',$6::bigint,'length',1048576)),$7)`, f.hostID, team, o.kind, o.id, strings.Repeat("a", 64), startBlock, start)
 	}
 	// One extra private MiB on the child; shared baseline stays once.
 	exec(`UPDATE retained_storage_interval SET extents=extents||'[{"device":"fs","start":2097152,"length":1048576}]'::jsonb WHERE owner_id=$1`, child)
@@ -217,7 +223,7 @@ func TestRetainedStorageUnionSurvivesSnapshotAndSourceDeletion(t *testing.T) {
 	for _, window := range []struct {
 		a, b time.Time
 		want float64
-	}{{start, d1, 1200}, {d1, d2, 1200}, {d2, d3, 1200}, {d3, d3.Add(time.Minute), 0}} {
+	}{{start, d1, 1800}, {d1, d2, 1800}, {d2, d3, 1200}, {d3, d3.Add(time.Minute), 0}} {
 		var got float64
 		if err := testPool.QueryRow(ctx, `SELECT retained_storage_mib_seconds($1,$2,$3)::float8`, team, window.a, window.b).Scan(&got); err != nil {
 			t.Fatal(err)
@@ -225,5 +231,12 @@ func TestRetainedStorageUnionSurvivesSnapshotAndSourceDeletion(t *testing.T) {
 		if got != window.want {
 			t.Fatalf("shared retention %v-%v: %v want %v", window.a, window.b, got, window.want)
 		}
+	}
+	var snapshotEnded time.Time
+	if err := testPool.QueryRow(ctx, `SELECT ended_at FROM retained_storage_interval WHERE owner_kind='snapshot' AND owner_id=$1`, snapshot).Scan(&snapshotEnded); err != nil {
+		t.Fatal(err)
+	}
+	if !snapshotEnded.Equal(d2) {
+		t.Fatalf("snapshot interval ended at %v, want %v", snapshotEnded, d2)
 	}
 }

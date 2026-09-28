@@ -21,17 +21,32 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
 	if err != nil {
 		return err
 	}
-	// Lock only owners present in this report. A host-wide lock here would make
-	// a periodic inventory contend with unrelated pause/resume/destroy writes.
+	// Lock only owners whose contribution is new or changed. A host-wide lock
+	// (or locking an unchanged fleet) would make a periodic inventory contend
+	// with unrelated pause/resume/destroy writes.
 	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
  SELECT s.id FROM sandbox s JOIN supplied o ON o.kind='sandbox' AND o.id=s.id
- WHERE s.host_id=$1 AND s.created_at<=$2 AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
+			 WHERE s.host_id=$1 AND s.status <> 'failed' AND s.created_at<=$2 AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
+			   AND NOT EXISTS (
+				 SELECT 1 FROM retained_storage_interval i
+				 JOIN jsonb_to_recordset($3::jsonb) AS current(kind text,id uuid,generation text,extents jsonb)
+				   ON current.kind='sandbox' AND current.id=s.id
+				 WHERE i.host_id=$1 AND i.owner_kind='sandbox' AND i.owner_id=s.id
+				   AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)
+				   AND i.generation=current.generation AND i.extents=current.extents)
  FOR NO KEY UPDATE`, hostID, at, payload); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
- SELECT s.id FROM sandbox_snapshot s JOIN supplied o ON o.kind='snapshot' AND o.id=s.id
- WHERE s.host_id=$1 AND s.ready_at<=$2 AND (s.deleted_at IS NULL OR s.deleted_at>$2)
+	 SELECT s.id FROM sandbox_snapshot s JOIN supplied o ON o.kind='snapshot' AND o.id=s.id
+			 WHERE s.host_id=$1 AND s.status IN ('ready','creating','deleting') AND (s.ready_at IS NULL OR s.ready_at<=$2) AND (s.deleted_at IS NULL OR s.deleted_at>$2)
+			   AND NOT EXISTS (
+				 SELECT 1 FROM retained_storage_interval i
+				 JOIN jsonb_to_recordset($3::jsonb) AS current(kind text,id uuid,generation text,extents jsonb)
+				   ON current.kind='snapshot' AND current.id=s.id
+				 WHERE i.host_id=$1 AND i.owner_kind='snapshot' AND i.owner_id=s.id
+				   AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)
+				   AND i.generation=current.generation AND i.extents=current.extents)
  FOR NO KEY UPDATE`, hostID, at, payload); err != nil {
 		return err
 	}
@@ -39,10 +54,10 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
 	// references, not authority for team attribution or retention lifetime.
 	var complete bool
 	err = tx.QueryRow(ctx, `WITH expected AS (
-  SELECT 'sandbox' kind,s.id FROM sandbox s WHERE s.host_id=$1 AND s.created_at<=$2
+  SELECT 'sandbox' kind,s.id FROM sandbox s WHERE s.host_id=$1 AND s.status <> 'failed' AND s.created_at<=$2
    AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
   UNION ALL
-  SELECT 'snapshot',id FROM sandbox_snapshot WHERE host_id=$1 AND ready_at<=$2
+  SELECT 'snapshot',id FROM sandbox_snapshot WHERE host_id=$1 AND status='ready' AND ready_at<=$2
    AND (deleted_at IS NULL OR deleted_at>$2)
  ), supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
  SELECT NOT EXISTS(SELECT 1 FROM expected e LEFT JOIN supplied s USING(kind,id) WHERE s.id IS NULL)
@@ -58,19 +73,16 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
   SELECT * FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,generation text,extents jsonb)
  ), eligible AS MATERIALIZED (
   SELECT o.*,s.team_id,s.destroyed_at lifetime_end FROM supplied o JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
-  WHERE s.host_id=$1 AND s.created_at<=$2 AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
+  WHERE s.host_id=$1 AND s.status <> 'failed' AND s.created_at<=$2 AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
    AND feature_enabled('billing_metrics_write',s.team_id)
   UNION ALL
-  SELECT o.*,s.team_id,s.deleted_at FROM supplied o JOIN sandbox_snapshot s ON o.kind='snapshot' AND s.id=o.id
-  WHERE s.host_id=$1 AND s.ready_at<=$2 AND (s.deleted_at IS NULL OR s.deleted_at>$2)
+  SELECT o.*,s.team_id,s.deleted_at FROM supplied o JOIN sandbox_snapshot s ON o.kind='snapshot' AND s.status IN ('ready','creating','deleting') AND (s.ready_at IS NULL OR s.ready_at<=$2) AND (s.deleted_at IS NULL OR s.deleted_at>$2)
    AND feature_enabled('billing_metrics_write',s.team_id)
  ), moved AS (
   UPDATE retained_storage_interval old SET ended_at=$2
-  FROM supplied moved_owner
+  FROM eligible moved_owner
   WHERE moved_owner.id=old.owner_id AND moved_owner.kind=old.owner_kind
    AND old.host_id<>$1 AND old.ended_at IS NULL AND old.started_at<$2
-   AND (EXISTS (SELECT 1 FROM sandbox s WHERE old.owner_kind='sandbox' AND s.id=old.owner_id AND feature_enabled('billing_metrics_write',s.team_id))
-     OR EXISTS (SELECT 1 FROM sandbox_snapshot s WHERE old.owner_kind='snapshot' AND s.id=old.owner_id AND feature_enabled('billing_metrics_write',s.team_id)))
   RETURNING old.id
  ), cutover AS (
   INSERT INTO retained_storage_cutover(host_id,team_id,started_at)
@@ -87,6 +99,7 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
  SELECT $1,c.team_id,c.kind,c.id,c.generation,c.extents,$2,c.lifetime_end FROM current c
  LEFT JOIN closed ON closed.id=c.interval_id
  WHERE c.interval_id IS NULL OR closed.id IS NOT NULL
- ON CONFLICT(host_id,owner_kind,owner_id,started_at) DO NOTHING`, hostID, at, payload)
+ ON CONFLICT(host_id,owner_kind,owner_id,started_at) DO UPDATE
+ SET generation=EXCLUDED.generation, extents=EXCLUDED.extents, ended_at=EXCLUDED.ended_at`, hostID, at, payload)
 	return err
 }

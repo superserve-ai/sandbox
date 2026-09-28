@@ -470,6 +470,8 @@ func seedFixture(t *testing.T) *fixture {
 		"sandbox_active_interval":             2,
 		"sandbox_compute_billing_interval":    2,
 		"sandbox_storage_interval":            2,
+		"retained_storage_cutover":            0,
+		"retained_storage_interval":           0,
 		"team_billing_usage":                  1,
 		"team_billing_usage_hourly":           2,
 		"team_billing_period":                 1,
