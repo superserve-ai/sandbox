@@ -382,12 +382,6 @@ type ManagerConfig struct {
 	// rather than hanging silently. Independent of the snapshot flags. Default false.
 	HandlerDeathAbortEnabled bool
 
-	// ForkEagerOverlayEnabled has a fork's restore ask Firecracker to copy the
-	// snapshot's pages into the guest in the background instead of faulting
-	// them in one at a time. Takes effect only once the binary advertises it.
-	// Default false.
-	ForkEagerOverlayEnabled bool
-
 	// GuestFreezeBudget bounds the pause-side wait for a guest to stop its
 	// workload before a frozen-clock snapshot. Zero means the default.
 	GuestFreezeBudget time.Duration

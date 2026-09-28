@@ -9,20 +9,16 @@ import (
 )
 
 func TestEagerOverlayEnabled(t *testing.T) {
-	m := &Manager{log: zerolog.Nop(), cfg: ManagerConfig{ForkEagerOverlayEnabled: true}}
+	m := &Manager{log: zerolog.Nop()}
 	if m.eagerOverlayEnabled(0, 0) {
 		t.Fatal("a binary that does not advertise the field must not get it")
 	}
 	m.eagerOverlayCapable.Store(true)
 	if !m.eagerOverlayEnabled(0, 0) || !m.eagerOverlayEnabled(-1, -1) {
-		t.Fatal("flag on, capable and no pressure should pre-copy")
+		t.Fatal("a capable binary on an unpressured host should pre-copy")
 	}
 	if m.eagerOverlayEnabled(eagerOverlayMaxPSI+1, 0) || m.eagerOverlayEnabled(0, eagerOverlayMaxPSI+1) {
 		t.Fatal("a host under memory or IO pressure should skip the pre-copy")
-	}
-	m.cfg.ForkEagerOverlayEnabled = false
-	if m.eagerOverlayEnabled(0, 0) {
-		t.Fatal("the flag is off")
 	}
 }
 
