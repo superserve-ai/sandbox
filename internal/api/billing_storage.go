@@ -342,6 +342,11 @@ func (h *Handlers) ReconcileStorageBilling(c *gin.Context) {
 			if err != nil {
 				return err
 			}
+			// Activation runs off the lifecycle path. Publish the cutoff-aware
+			// verdict in the same transaction, including on an activation retry.
+			if err := db.New(tx).RefreshTeamTrialEligibility(ctx, team); err != nil {
+				return err
+			}
 			// Recompute only mutable export caches that overlap the one-time
 			// boundary, and wake their hourly measurements. This closes the
 			// activation race with mixed-version workers without touching frozen

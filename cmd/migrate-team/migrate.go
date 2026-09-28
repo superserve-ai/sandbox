@@ -895,7 +895,7 @@ func roleIDsByName(ctx context.Context, pool querier) (map[string]string, error)
 // per-cell projections of global identity shared across ALL of a user's
 // teams in that cell — the migration promises a member's profile EXISTS in
 // the dest, never that it overwrites what the user's other teams already
-// maintain there. Content checksums skip these for the same reason; count
+// maintain there. Their content checksums are separately exempted; count
 // parity over the member scope still applies.
 // validationExemptTables are copied for safety but never gated on:
 // sandbox_revocation and revoked_proxy_token rows self-expire, and the
@@ -907,6 +907,10 @@ func roleIDsByName(ctx context.Context, pool querier) (map[string]string, error)
 var validationExemptTables = map[string]bool{
 	"sandbox_revocation":  true,
 	"revoked_proxy_token": true,
+}
+
+var checksumExemptTables = map[string]bool{
+	"profile": true,
 }
 
 var insertOnlyTables = map[string]bool{
@@ -1216,8 +1220,8 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 		return nil, err
 	}
 	for _, t := range migratedTables {
-		if insertOnlyTables[t.name] || validationExemptTables[t.name] {
-			continue // see insertOnlyTables / validationExemptTables.
+		if checksumExemptTables[t.name] || validationExemptTables[t.name] {
+			continue // see checksumExemptTables / validationExemptTables.
 		}
 		tf := transforms[t.name]
 		if t.name == "sandbox" {

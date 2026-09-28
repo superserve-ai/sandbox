@@ -179,9 +179,14 @@ $$;
 CREATE OR REPLACE FUNCTION refresh_team_trial_eligibility(p_team_id uuid)
 RETURNS boolean LANGUAGE sql STABLE AS $$ SELECT eligible FROM get_team_trial_balance(p_team_id); $$;
 
--- Enforcement must use the same cutoff-aware balance as the API. The cache is
--- advisory and may be absent or stale during a refresh, so it cannot grant
--- eligibility after prospective storage has exhausted the remaining credit.
+-- Recompute old flag-based verdicts before serving the persisted cache. This
+-- migration and the background refresh own usage scans, never create/resume.
+INSERT INTO team_trial_eligibility_cache (team_id, eligible, updated_at)
+SELECT DISTINCT team_id, refresh_team_trial_eligibility(team_id), now()
+FROM team_credit_grant WHERE reason = 'signup trial credit'
+ON CONFLICT (team_id) DO UPDATE
+SET eligible = EXCLUDED.eligible, updated_at = EXCLUDED.updated_at;
+
 CREATE OR REPLACE FUNCTION team_sandbox_billing_eligible(p_team_id uuid)
 RETURNS boolean
 LANGUAGE sql
@@ -190,10 +195,9 @@ AS $$
 WITH account AS (
     SELECT trial_ended_at, stripe_subscription_id, stripe_subscription_status
     FROM team_billing_account WHERE team_id = p_team_id
-), balance AS (
-    SELECT * FROM get_team_trial_balance(p_team_id)
 ), grant_balance AS (
-    SELECT COALESCE(SUM(remaining_usd) FILTER (WHERE expires_at IS NULL OR expires_at > now()), 0)::numeric AS remaining_usd
+    SELECT COALESCE(SUM(remaining_usd) FILTER (WHERE expires_at IS NULL OR expires_at > now()), 0)::numeric AS remaining_usd,
+           COUNT(*)::int AS historical_count
     FROM team_credit_grant
     WHERE team_id = p_team_id AND reason = 'signup trial credit'
 ), denial AS (
@@ -205,10 +209,12 @@ SELECT CASE
     WHEN lower(coalesce(account.stripe_subscription_status, '')) IN ('active','trialing','past_due') THEN true
     WHEN account.trial_ended_at IS NOT NULL THEN false
     WHEN denial.denied OR pending.pending THEN false
-    WHEN balance.state = 'no_grant' AND account.stripe_subscription_id IS NULL THEN true
-    ELSE grant_balance.remaining_usd > 0 AND COALESCE(balance.eligible, false)
+    WHEN grant_balance.historical_count = 0 AND account.stripe_subscription_id IS NULL THEN true
+    ELSE grant_balance.remaining_usd > 0 AND COALESCE(cache.eligible, true)
 END
-FROM balance CROSS JOIN grant_balance CROSS JOIN denial CROSS JOIN pending LEFT JOIN account ON true;
+FROM grant_balance CROSS JOIN denial CROSS JOIN pending
+LEFT JOIN account ON true
+LEFT JOIN team_trial_eligibility_cache cache ON cache.team_id = p_team_id;
 $$;
 
 -- Mixed-version workers may continue writing mutable export caches while a

@@ -421,11 +421,25 @@ func (f warningTransportFunc) RoundTrip(r *http.Request) (*http.Response, error)
 // harness tests, while executing the real discovery and eligibility queries.
 type warningDispatchScope struct {
 	*pgxpool.Pool
-	team uuid.UUID
+	team     uuid.UUID
+	sampleAt time.Time
+}
+
+func (q warningDispatchScope) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if !q.sampleAt.IsZero() && strings.Contains(sql, "-- name: GetRecentTrialBurnSample") {
+		// Fix the sample endpoint so database/application clock skew cannot
+		// make an open interval appear to end in the future.
+		sql = strings.ReplaceAll(sql, "now()", "$2::timestamptz")
+		args = append(args, q.sampleAt)
+	}
+	return q.Pool.QueryRow(ctx, sql, args...)
 }
 
 func (q warningDispatchScope) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	if strings.Contains(sql, "-- name: ListTeamsWithActiveTrialSandboxes") || strings.Contains(sql, "-- name: ListTeamsWithActiveIneligibleSandboxes") {
+	if strings.Contains(sql, "-- name: ListTeamsWithTrialCredits") {
+		sql = strings.ReplaceAll(sql, "WHERE g.reason =", "WHERE g.team_id = '"+q.team.String()+"'::uuid AND g.reason =")
+	}
+	if strings.Contains(sql, "-- name: ListTeamsWithActiveIneligibleSandboxes") {
 		sql = strings.ReplaceAll(sql, "WHERE s.destroyed_at IS NULL", "WHERE s.team_id = '"+q.team.String()+"'::uuid AND s.destroyed_at IS NULL")
 	}
 	if strings.Contains(sql, "-- name: ListTrialCreditWarningTeams") {
@@ -536,7 +550,7 @@ func TestTrialWarningDispatchIncludesPausedStorageTeam(t *testing.T) {
 		}
 	}
 	calls := 0
-	h := &api.Handlers{Pool: testPool, DB: db.New(warningDispatchScope{Pool: testPool, team: team}), TrialWarningSender: warningSenderFunc(func(_ context.Context, id uuid.UUID, remaining float64) error {
+	h := &api.Handlers{Pool: testPool, DB: db.New(warningDispatchScope{Pool: testPool, team: team, sampleAt: time.Now().Add(-time.Minute)}), TrialWarningSender: warningSenderFunc(func(_ context.Context, id uuid.UUID, remaining float64) error {
 		if id != team || remaining <= 0 {
 			t.Errorf("unexpected warning: team=%s remaining=%f", id, remaining)
 		}

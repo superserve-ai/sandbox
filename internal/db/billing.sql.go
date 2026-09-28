@@ -2314,28 +2314,24 @@ func (q *Queries) ListTeamsWithActiveIneligibleSandboxes(ctx context.Context, ar
 	return items, nil
 }
 
-const listTeamsWithActiveTrialSandboxes = `-- name: ListTeamsWithActiveTrialSandboxes :many
-SELECT DISTINCT s.team_id
-FROM sandbox s
-JOIN team_credit_grant g
-  ON g.team_id = s.team_id
-  AND g.reason = 'signup trial credit'
-LEFT JOIN team_billing_account a ON a.team_id = s.team_id
-WHERE s.destroyed_at IS NULL
-  AND s.status = 'active'
+const listTeamsWithTrialCredits = `-- name: ListTeamsWithTrialCredits :many
+SELECT DISTINCT g.team_id
+FROM team_credit_grant g
+LEFT JOIN team_billing_account a ON a.team_id = g.team_id
+WHERE g.reason = 'signup trial credit'
   AND a.trial_ended_at IS NULL
-  AND s.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-ORDER BY s.team_id
+  AND g.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+ORDER BY g.team_id
 LIMIT $2
 `
 
-type ListTeamsWithActiveTrialSandboxesParams struct {
+type ListTeamsWithTrialCreditsParams struct {
 	AfterTeamID pgtype.UUID `json:"after_team_id"`
 	BatchLimit  int32       `json:"batch_limit"`
 }
 
-func (q *Queries) ListTeamsWithActiveTrialSandboxes(ctx context.Context, arg ListTeamsWithActiveTrialSandboxesParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, listTeamsWithActiveTrialSandboxes, arg.AfterTeamID, arg.BatchLimit)
+func (q *Queries) ListTeamsWithTrialCredits(ctx context.Context, arg ListTeamsWithTrialCreditsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listTeamsWithTrialCredits, arg.AfterTeamID, arg.BatchLimit)
 	if err != nil {
 		return nil, err
 	}

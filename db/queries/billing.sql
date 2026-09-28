@@ -1318,18 +1318,14 @@ ON CONFLICT (team_id) DO UPDATE
 SET eligible = EXCLUDED.eligible,
     updated_at = EXCLUDED.updated_at;
 
--- name: ListTeamsWithActiveTrialSandboxes :many
-SELECT DISTINCT s.team_id
-FROM sandbox s
-JOIN team_credit_grant g
-  ON g.team_id = s.team_id
-  AND g.reason = 'signup trial credit'
-LEFT JOIN team_billing_account a ON a.team_id = s.team_id
-WHERE s.destroyed_at IS NULL
-  AND s.status = 'active'
+-- name: ListTeamsWithTrialCredits :many
+SELECT DISTINCT g.team_id
+FROM team_credit_grant g
+LEFT JOIN team_billing_account a ON a.team_id = g.team_id
+WHERE g.reason = 'signup trial credit'
   AND a.trial_ended_at IS NULL
-  AND s.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-ORDER BY s.team_id
+  AND g.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+ORDER BY g.team_id
 LIMIT sqlc.arg(batch_limit);
 
 -- name: ListTrialCreditWarningTeams :many

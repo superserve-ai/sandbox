@@ -2244,3 +2244,61 @@ func TestDeletedSnapshotsNeitherBlockNorSurvive(t *testing.T) {
 		t.Error("source team row survived the purge")
 	}
 }
+
+func TestStorageActivationMigrationValidation(t *testing.T) {
+	for _, conflict := range []bool{false, true} {
+		t.Run(fmt.Sprintf("conflicting_cutoff=%t", conflict), func(t *testing.T) {
+			ctx := t.Context()
+			team, owner := uuid.New(), uuid.New()
+			name := "example-storage-move-" + team.String()
+			mustExec(t, dstPool, `INSERT INTO host(id,vmd_addr,proxy_addr,region,capacity_memory_mib,capacity_vcpus)
+				VALUES($1,'192.0.2.1:50051','192.0.2.1:8080',$2,65536,32) ON CONFLICT(id) DO NOTHING`, destHostID, destRegion)
+			mustExec(t, srcPool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, name)
+			mustExec(t, srcPool, `INSERT INTO profile(id,email) VALUES($1,$2)`, owner, owner.String()+"@example.com")
+			mustExec(t, srcPool, `INSERT INTO team_member(team_id,profile_id,role) VALUES($1,$2,'member')`, team, owner)
+			mustExec(t, srcPool, `INSERT INTO team_memberships(team_id,user_id,status) VALUES($1,$2,'active')`, team, owner)
+			cfg := config{phase: phaseCopy, teamID: team, sourceURL: srcURL, destURL: dstURL, destHostID: destHostID, destRegion: destRegion, confirmTeamName: name}
+			if err := run(ctx, cfg); err != nil {
+				t.Fatal(err)
+			}
+			cutoff := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+			const insert = `INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff,created_at) VALUES($1,$2,$3,$3)`
+			mustExec(t, srcPool, insert, team, cutoff, cutoff)
+			wantDest := cutoff
+			if conflict {
+				wantDest = cutoff.Add(time.Minute)
+				mustExec(t, dstPool, insert, team, wantDest, cutoff)
+			}
+			for retry := 0; retry < 2; retry++ {
+				if err := run(ctx, cfg); err != nil {
+					t.Fatalf("copy retry %d: %v", retry, err)
+				}
+				var got time.Time
+				if err := dstPool.QueryRow(ctx, `SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1`, team).Scan(&got); err != nil || !got.Equal(wantDest) {
+					t.Fatalf("copy changed immutable destination cutoff: %v %v", got, err)
+				}
+				mismatches, err := validateTeam(ctx, srcPool, dstPool, cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !conflict && len(mismatches) != 0 {
+					t.Fatalf("matching retry failed validation: %v", mismatches)
+				}
+				if conflict && (len(mismatches) != 1 || !strings.Contains(mismatches[0], "team_storage_billing_activation: content drift")) {
+					t.Fatalf("equal row counts hid conflicting cutoff: %v", mismatches)
+				}
+			}
+			if conflict {
+				for _, phase := range []string{phaseDetach, phasePurge} {
+					cfg.phase = phase
+					if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "validate found") {
+						t.Fatalf("%s must refuse conflicting activation: %v", phase, err)
+					}
+				}
+				if got := scanString(t, srcPool, `SELECT count(*)::text FROM team_member WHERE team_id=$1`, team); got != "1" {
+					t.Fatalf("rejected migration removed source membership: %s", got)
+				}
+			}
+		})
+	}
+}

@@ -132,6 +132,11 @@ func TestIntegration_BillingProspectiveStorageConsumers(t *testing.T) {
 					if err != nil || numericFloat64(t, balance.ConsumedUsd) != 4500 || numericFloat64(t, balance.RemainingUsd) != amount-4500 {
 						t.Fatalf("trial exhaustion balance: %+v %v", balance, err)
 					}
+					// Paused storage must be discovered by the same background sweep
+					// that publishes eligibility for create/resume cache misses.
+					h := &api.Handlers{DB: db.New(warningDispatchScope{Pool: testPool, team: team.ID})}
+					api.RefreshActiveTrialEligibilityForTest(h, ctx)
+					h.WaitAsyncBookkeeping()
 					eligible, err := testQueries.IsTeamSandboxBillingEligible(ctx, team.ID)
 					if err != nil || eligible != (amount > 4500) {
 						t.Fatalf("trial exhaustion eligibility: %v %v", eligible, err)
@@ -273,13 +278,19 @@ func TestIntegration_BillingStorageTrialActivationDoesNotCreateSubscription(t *t
 	cutoff := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	body := fmt.Sprintf(`{"mode":"activate","approved_cutoff":%q}`, cutoff.Format(time.RFC3339Nano))
 	path := "/internal/teams/" + team.ID.String() + "/billing/storage"
+	storageExec(t, `INSERT INTO team_credit_grant(team_id,amount_usd,remaining_usd,reason) VALUES($1,5,5,'signup trial credit')`, team.ID)
 	for i := 0; i < 2; i++ {
+		storageExec(t, `INSERT INTO team_trial_eligibility_cache(team_id,eligible) VALUES($1,false) ON CONFLICT(team_id) DO UPDATE SET eligible=false`, team.ID)
 		w := doBillingOperator(router, path, operatorRBACToken, admin.String(), body)
 		var response struct {
 			EffectiveAt time.Time `json:"effective_at"`
 		}
 		if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil || w.Code != 200 || !response.EffectiveAt.Equal(cutoff) {
 			t.Fatalf("trial activation: %d %s", w.Code, w.Body.String())
+		}
+		var eligible bool
+		if err := testPool.QueryRow(t.Context(), `SELECT eligible FROM team_trial_eligibility_cache WHERE team_id=$1`, team.ID).Scan(&eligible); err != nil || !eligible {
+			t.Fatalf("activation did not refresh trial eligibility: %v %v", eligible, err)
 		}
 		if _, err := testPool.Exec(t.Context(), `UPDATE team_feature_flag SET enabled=false WHERE team_id=$1 AND key='billing_storage_billing_enabled'`, team.ID); err != nil {
 			t.Fatal(err)

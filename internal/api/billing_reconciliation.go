@@ -28,7 +28,8 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 		if after != nil {
 			afterID = pgtype.UUID{Bytes: *after, Valid: true}
 		}
-		teams, err := h.DB.ListTeamsWithActiveTrialSandboxes(ctx, db.ListTeamsWithActiveTrialSandboxesParams{AfterTeamID: afterID, BatchLimit: 1000})
+		// Paused and historical trials also need refreshed verdicts before resume.
+		teams, err := h.DB.ListTeamsWithTrialCredits(ctx, db.ListTeamsWithTrialCreditsParams{AfterTeamID: afterID, BatchLimit: 1000})
 		if err != nil {
 			log.Error().Err(err).Msg("billing: list active trial teams failed")
 			return
