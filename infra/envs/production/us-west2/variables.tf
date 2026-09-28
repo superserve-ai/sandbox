@@ -164,16 +164,13 @@ variable "compute_restrictions_secret_name" {
   }
 }
 
-variable "alert_runbook_urls" {
-  description = "Direct alert runbook URLs supplied as private JSON through ALERT_RUNBOOK_URLS."
-  type        = map(string)
-  sensitive   = true
+variable "alert_runbook_base_url" {
+  description = "Shared HTTPS runbook base URL supplied through the RUNBOOK_BASE_URL repository Actions variable."
+  type        = string
   nullable    = false
 
   validation {
-    condition = alltrue([
-      for url in values(var.alert_runbook_urls) : can(regex("^https?://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>]*)?$", url))
-    ])
-    error_message = "Each alert runbook URL must be an absolute HTTP(S) URL with a host."
+    condition     = can(regex("^https://[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]+)?(/[^\\s<>?#()\\[\\]]*)?$", var.alert_runbook_base_url))
+    error_message = "Set RUNBOOK_BASE_URL to a nonempty HTTPS base URL without whitespace, query, or fragment."
   }
 }
