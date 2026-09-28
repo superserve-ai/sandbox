@@ -326,6 +326,14 @@ WITH interval_team_set AS MATERIALIZED (
         WHERE i.started_at < $2
           AND $1 < LEAST(now(), $2)
           AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
+
+        UNION
+
+        SELECT i.team_id
+        FROM retained_storage_interval i
+        WHERE i.started_at < $2
+          AND $1 < LEAST(now(), $2)
+          AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
     ) billing_teams
 ),
 candidate_teams AS (
@@ -451,6 +459,15 @@ WHERE feature_enabled('billing_hourly_rollups', $1)
         AND i.started_at < $3
         AND $2 < LEAST(now(), $3)
         AND COALESCE(i.ended_at, LEAST(now(), $3)) > $2
+
+      UNION
+
+      SELECT 1
+      FROM retained_storage_interval i
+      WHERE i.team_id = $1
+        AND i.started_at < $3
+        AND $2 < LEAST(now(), $3)
+        AND COALESCE(i.ended_at, LEAST(now(), $3)) > $2
   )
 ON CONFLICT (team_id, hour_start) DO UPDATE
 SET hour_end = EXCLUDED.hour_end,
@@ -510,6 +527,14 @@ WITH interval_team_set AS MATERIALIZED (
 
         SELECT i.team_id
         FROM sandbox_storage_interval i
+        WHERE i.started_at < $2
+          AND $1 < LEAST(now(), $2)
+          AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1
+
+        UNION
+
+        SELECT i.team_id
+        FROM retained_storage_interval i
         WHERE i.started_at < $2
           AND $1 < LEAST(now(), $2)
           AND COALESCE(i.ended_at, LEAST(now(), $2)) > $1

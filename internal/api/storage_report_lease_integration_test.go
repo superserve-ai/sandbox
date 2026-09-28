@@ -6,7 +6,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -42,7 +44,14 @@ func newStorageLeaseFixture(t *testing.T) storageLeaseFixture {
 	}
 	t.Cleanup(pool.Close)
 	_, err = pool.Exec(t.Context(), `
-		CREATE TEMP TABLE host (id text PRIMARY KEY, incarnation_id uuid);
+		CREATE TEMP TABLE retained_storage_cutover(host_id text,team_id uuid,started_at timestamptz,PRIMARY KEY(host_id,team_id));
+        CREATE TEMP TABLE sandbox_snapshot(id uuid,host_id text,team_id uuid,ready_at timestamptz,deleted_at timestamptz);
+        CREATE TEMP TABLE retained_storage_interval(
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,host_id text,team_id uuid,owner_kind text,owner_id uuid,
+            generation text,extents jsonb,started_at timestamptz,ended_at timestamptz,
+            UNIQUE(host_id,owner_kind,owner_id,started_at));
+        CREATE UNIQUE INDEX retained_lease_current ON retained_storage_interval(host_id,owner_kind,owner_id) WHERE ended_at IS NULL;
+ CREATE TEMP TABLE host (id text PRIMARY KEY, incarnation_id uuid);
 		CREATE TEMP TABLE sandbox (id uuid PRIMARY KEY, team_id uuid NOT NULL, host_id text NOT NULL, created_at timestamptz NOT NULL, destroyed_at timestamptz);
 		CREATE TEMP TABLE sandbox_storage_interval (
 			id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -211,5 +220,30 @@ func TestIntegration_StorageReportChunkTimeout(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) || storageReportErrorIsTerminal(err) {
 		t.Fatalf("slow interval write returned %v, want retryable deadline exceeded", err)
+	}
+}
+
+func TestIntegration_RetainedStorageLeaseRollsBackInventoryAndCutover(t *testing.T) {
+	f := newStorageLeaseFixture(t)
+	inv := &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{{Kind: "sandbox", ID: f.sandboxID.String(), Generation: strings.Repeat("a", 64), Extents: []retainedstorage.Extent{{Device: "fs", Start: 4096, Length: 4096}}}}}
+	measurements := []storageReportMeasurement{{Retained: inv}}
+	if err := applyStorageReport(t.Context(), f.pool, f.hostID, f.incarnationID, f.reportID, 1, f.receivedAt, measurements, 1, 1); err == nil {
+		t.Fatal("stale lease committed retained inventory")
+	}
+	var count int
+	if err := f.pool.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM retained_storage_interval)+(SELECT count(*) FROM retained_storage_cutover)`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("stale worker left billing writes outside cursor transaction")
+	}
+	if err := applyStorageReport(t.Context(), f.pool, f.hostID, f.incarnationID, f.reportID, 2, f.receivedAt, measurements, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.pool.QueryRow(t.Context(), `SELECT count(*) FROM retained_storage_interval WHERE started_at=$1`, f.receivedAt).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatal("retained inventory lost receipt boundary")
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 )
 
 // Keep the stale logical-size billing window short for overlays activated
@@ -44,6 +45,7 @@ const (
 )
 
 type HeartbeatConfig struct {
+	RetainedStorage    func(context.Context) (*retainedstorage.Inventory, error)
 	TemplateBuildReady func() bool
 
 	IncarnationID string
@@ -200,7 +202,11 @@ func runHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger) 
 		case <-ctx.Done():
 			return
 		case <-storageReady:
-			runOverlayStorageSampler(ctx, runDir, overlayStorageSampleInterval, cache, log)
+			if cfg.RetainedStorage != nil && cfg.IncarnationID != "" {
+				runRetainedStorageSampler(ctx, cfg, cache, log)
+			} else {
+				runOverlayStorageSampler(ctx, runDir, overlayStorageSampleInterval, cache, log)
+			}
 		}
 	}()
 	for {
@@ -242,9 +248,12 @@ func runHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger) 
 	}
 }
 
+// Retained inventories use an empty sandbox ID so an older spool reader that
+// drops the unknown field cannot reinterpret them as valid overlay samples.
 type heartbeatStorageMeasurement struct {
-	SandboxID      string `json:"sandbox_id"`
-	AllocatedBytes int64  `json:"allocated_bytes"`
+	Retained       *retainedstorage.Inventory `json:"retained,omitempty"`
+	SandboxID      string                     `json:"sandbox_id"`
+	AllocatedBytes int64                      `json:"allocated_bytes"`
 }
 
 // pressureLoop owns the pressure publisher's state and serializes its

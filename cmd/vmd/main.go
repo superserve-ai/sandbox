@@ -35,6 +35,7 @@ import (
 	"github.com/superserve-ai/sandbox/internal/hostidentity"
 	"github.com/superserve-ai/sandbox/internal/network"
 	"github.com/superserve-ai/sandbox/internal/proxy"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	"github.com/superserve-ai/sandbox/internal/sentrylog"
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 	"github.com/superserve-ai/sandbox/internal/vm"
@@ -1955,7 +1956,12 @@ func main() {
 					log.Warn().Err(err).Msg("unable to resolve heartbeat addresses; heartbeat will omit host self-description")
 				}
 			}
+			var retainedStorage func(context.Context) (*retainedstorage.Inventory, error)
+			if os.Getenv("VMD_RETAINED_STORAGE_REPORTS") == "true" {
+				retainedStorage = mgr.RetainedStorageInventory
+			}
 			vm.StartHeartbeat(ctx, vm.HeartbeatConfig{
+				RetainedStorage: retainedStorage,
 				TemplateBuildReady: func() bool {
 					return startupReady.Load() && backupBucket != "" && buildRuntimeInstalled && cfg.IncarnationID != "" && publishesPressure
 				},

@@ -452,6 +452,8 @@ type ManagerConfig struct {
 
 // Manager orchestrates the lifecycle of Firecracker microVMs.
 type Manager struct {
+	storageEpoch     atomic.Uint64
+	storageMutations atomic.Int64
 	buildIncarnation string // immutable daemon identity for durable build reports
 
 	cfg         ManagerConfig
@@ -884,7 +886,8 @@ func (m *Manager) lockVMOp(ctx context.Context, vmID string) (func(), error) {
 			<-ch
 			return nil, err
 		}
-		return func() { <-ch }, nil
+		finishStorage := m.beginStorageMutation()
+		return func() { finishStorage(); <-ch }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -896,7 +899,8 @@ func (m *Manager) tryLockVMOp(vmID string) (unlock func(), ok bool) {
 	ch := m.vmOpCh(vmID)
 	select {
 	case ch <- struct{}{}:
-		return func() { <-ch }, true
+		finishStorage := m.beginStorageMutation()
+		return func() { finishStorage(); <-ch }, true
 	default:
 		return nil, false
 	}

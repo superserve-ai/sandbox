@@ -96,69 +96,8 @@ WITH compute AS (
       AND i.started_at < LEAST(now(), sqlc.arg(period_end))
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
 ),
-artifact_bounds AS (
-    SELECT
-        s.id,
-        s.team_id,
-        s.snapshot_id,
-        s.template_id,
-        s.base_path,
-        s.delta_path,
-        s.destroyed_at,
-        first_interval.started_at AS billing_started_at
-    FROM sandbox s
-    LEFT JOIN LATERAL (
-        SELECT MIN(i.started_at) AS started_at
-        FROM sandbox_storage_interval i
-        WHERE i.sandbox_id = s.id
-          AND i.team_id = s.team_id
-    ) first_interval ON true
-    WHERE s.team_id = sqlc.arg(team_id)
-      AND first_interval.started_at IS NOT NULL
-      AND first_interval.started_at < LEAST(now(), sqlc.arg(period_end))
-      AND s.created_at < LEAST(now(), sqlc.arg(period_end))
-      AND COALESCE(s.destroyed_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
-),
-artifact_ranges AS (
-    SELECT p.path,
-           MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
-           range_agg(tstzrange(
-               GREATEST(s.billing_started_at, sqlc.arg(period_start)),
-               LEAST(COALESCE(s.destroyed_at, now()), sqlc.arg(period_end)), '[)'
-           )) AS retained_ranges
-    FROM artifact_bounds s
-    LEFT JOIN template t ON t.id = s.template_id
-    CROSS JOIN LATERAL unnest(ARRAY[
-        s.base_path,
-        s.delta_path,
-        CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END
-    ]) AS p(path)
-    LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
-      AND am.path = p.path
-    WHERE p.path IS NOT NULL
-    GROUP BY p.path
-),
-artifact_storage AS (
-    SELECT FLOOR(COALESCE(SUM(artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0))::numeric AS mib_seconds
-    FROM artifact_ranges ar
-    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
-),
 storage AS (
-    -- Overlay intervals are per sandbox; template artifacts are a separate
-    -- distinct-path set so shared bases and deltas are never multiplied by
-    -- the number of sandboxes that pin them.
-    SELECT COALESCE(SUM(
-        EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(i.ended_at, now()), sqlc.arg(period_end))
-            - GREATEST(i.started_at, sqlc.arg(period_start))
-        )) * i.disk_mib
-    ), 0)::numeric + COALESCE(MAX(artifact_storage.mib_seconds), 0) AS storage_mib_seconds
-    FROM artifact_storage
-    LEFT JOIN sandbox_storage_interval i ON
-      i.team_id = sqlc.arg(team_id)
-      AND sqlc.arg(period_start) < LEAST(now(), sqlc.arg(period_end))
-      AND i.started_at < LEAST(now(), sqlc.arg(period_end))
-      AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
+ SELECT storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(period_start)::timestamptz,sqlc.arg(period_end)::timestamptz)::numeric AS storage_mib_seconds
 )
 SELECT
     sqlc.arg(team_id)::uuid AS team_id,
@@ -200,58 +139,8 @@ WITH compute AS (
       AND i.started_at < LEAST(now(), sqlc.arg(period_end))
       AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
 ),
-artifact_bounds AS (
-    SELECT
-        s.id,
-        s.team_id,
-        s.snapshot_id,
-        s.template_id,
-        s.base_path,
-        s.delta_path,
-        s.destroyed_at,
-        first_interval.started_at AS billing_started_at
-    FROM sandbox s
-    LEFT JOIN LATERAL (
-        SELECT MIN(i.started_at) AS started_at
-        FROM sandbox_storage_interval i
-        WHERE i.sandbox_id = s.id
-          AND i.team_id = s.team_id
-    ) first_interval ON true
-    WHERE s.team_id = sqlc.arg(team_id)
-      AND first_interval.started_at IS NOT NULL
-      AND first_interval.started_at < LEAST(now(), sqlc.arg(period_end))
-      AND s.created_at < LEAST(now(), sqlc.arg(period_end))
-      AND COALESCE(s.destroyed_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
-),
-artifact_storage AS (
-    SELECT FLOOR(COALESCE(SUM(ar.artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0))::numeric AS mib_seconds
-    FROM (
-        SELECT p.path,
-               MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
-               range_agg(tstzrange(GREATEST(s.billing_started_at, sqlc.arg(period_start)), LEAST(COALESCE(s.destroyed_at, now()), sqlc.arg(period_end)), '[)')) AS retained_ranges
-        FROM artifact_bounds s
-        LEFT JOIN template t ON t.id = s.template_id
-        CROSS JOIN LATERAL unnest(ARRAY[s.base_path, s.delta_path, CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END]) AS p(path)
-        LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
-          AND am.path = p.path
-        WHERE p.path IS NOT NULL
-        GROUP BY p.path
-    ) ar
-    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
-),
 storage AS (
-    SELECT COALESCE(SUM(
-        EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(i.ended_at, now()), sqlc.arg(period_end))
-            - GREATEST(i.started_at, sqlc.arg(period_start))
-        )) * i.disk_mib
-    ), 0)::numeric + COALESCE(MAX(artifact_storage.mib_seconds), 0) AS storage_mib_seconds
-    FROM artifact_storage
-    LEFT JOIN sandbox_storage_interval i ON
-      i.team_id = sqlc.arg(team_id)
-      AND sqlc.arg(period_start) < LEAST(now(), sqlc.arg(period_end))
-      AND i.started_at < LEAST(now(), sqlc.arg(period_end))
-      AND COALESCE(i.ended_at, LEAST(now(), sqlc.arg(period_end))) > sqlc.arg(period_start)
+ SELECT storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(period_start)::timestamptz,sqlc.arg(period_end)::timestamptz)::numeric AS storage_mib_seconds
 ),
 usage AS (
     SELECT
@@ -350,58 +239,8 @@ WITH compute AS (
       AND sqlc.arg(hour_start) < LEAST(billing_request_now(), sqlc.arg(hour_end))
       AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
 ),
-artifact_bounds AS (
-    SELECT
-        s.id,
-        s.team_id,
-        s.snapshot_id,
-        s.template_id,
-        s.base_path,
-        s.delta_path,
-        s.destroyed_at,
-        first_interval.started_at AS billing_started_at
-    FROM sandbox s
-    LEFT JOIN LATERAL (
-        SELECT MIN(i.started_at) AS started_at
-        FROM sandbox_storage_interval i
-        WHERE i.sandbox_id = s.id
-          AND i.team_id = s.team_id
-    ) first_interval ON true
-    WHERE s.team_id = sqlc.arg(team_id)
-      AND first_interval.started_at IS NOT NULL
-      AND first_interval.started_at < LEAST(billing_request_now(), sqlc.arg(hour_end))
-      AND s.created_at < LEAST(billing_request_now(), sqlc.arg(hour_end))
-      AND COALESCE(s.destroyed_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
-),
-artifact_storage AS (
-    SELECT FLOOR(COALESCE(SUM(ar.artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0))::numeric AS mib_seconds
-    FROM (
-        SELECT p.path,
-               MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
-               range_agg(tstzrange(GREATEST(s.billing_started_at, sqlc.arg(hour_start)), LEAST(COALESCE(s.destroyed_at, billing_request_now()), sqlc.arg(hour_end)), '[)')) AS retained_ranges
-        FROM artifact_bounds s
-        LEFT JOIN template t ON t.id = s.template_id
-        CROSS JOIN LATERAL unnest(ARRAY[s.base_path, s.delta_path, CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END]) AS p(path)
-        LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
-          AND am.path = p.path
-        WHERE p.path IS NOT NULL
-        GROUP BY p.path
-    ) ar
-    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
-),
 storage AS (
-    SELECT COALESCE(SUM(
-        EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(i.ended_at, billing_request_now()), sqlc.arg(hour_end))
-            - GREATEST(i.started_at, sqlc.arg(hour_start))
-        )) * i.disk_mib
-    ), 0)::numeric + COALESCE(MAX(artifact_storage.mib_seconds), 0) AS storage_mib_seconds
-    FROM artifact_storage
-    LEFT JOIN sandbox_storage_interval i ON
-      i.team_id = sqlc.arg(team_id)
-      AND i.started_at < sqlc.arg(hour_end)
-      AND sqlc.arg(hour_start) < LEAST(billing_request_now(), sqlc.arg(hour_end))
-      AND COALESCE(i.ended_at, LEAST(billing_request_now(), sqlc.arg(hour_end))) > sqlc.arg(hour_start)
+ SELECT storage_mib_seconds(sqlc.arg(team_id)::uuid,sqlc.arg(hour_start)::timestamptz,sqlc.arg(hour_end)::timestamptz)::numeric AS storage_mib_seconds
 ),
 usage AS (
     SELECT
@@ -1274,6 +1113,11 @@ FROM recent_compute b
      WHERE team_id = sqlc.arg(team_id) AND ended_at > (SELECT started_at FROM sample_window) AND feature_enabled('billing_storage_billing_enabled', sqlc.arg(team_id))
      LIMIT 1025)
   ) i
+), recent_retained AS MATERIALIZED (
+ SELECT GREATEST(started_at,(SELECT started_at FROM sample_window)) started_at,ended_at
+ FROM retained_storage_interval WHERE team_id=sqlc.arg(team_id)
+ AND COALESCE(ended_at,now())>(SELECT started_at FROM sample_window)
+ AND feature_enabled('billing_storage_billing_enabled',sqlc.arg(team_id)) LIMIT 1025
 ), sample_bounds AS (
   SELECT MIN(started_at) AS started_at,
          MAX(LEAST(ended_at, now())) AS ended_at
@@ -1281,9 +1125,10 @@ FROM recent_compute b
     SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_compute WHERE started_at < now()
     UNION ALL
     SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_storage WHERE started_at < now()
+ UNION ALL SELECT started_at,COALESCE(ended_at,now()) FROM recent_retained WHERE started_at<now()
   ) intervals
 )
-SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN feature_enabled('billing_storage_billing_enabled', sqlc.arg(team_id)) THEN COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(s.ended_at, now()), now()) - s.started_at)) * s.disk_mib / 1024.0 * rates.storage) FROM recent_storage s CROSS JOIN rates WHERE s.started_at < now()), 0) ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
+SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 OR (SELECT count(*) FROM recent_retained)>1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN feature_enabled('billing_storage_billing_enabled', sqlc.arg(team_id)) THEN storage_mib_seconds(sqlc.arg(team_id)::uuid,(SELECT started_at FROM sample_window),now())/1024.0*rates.storage ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
        sample_bounds.started_at, sample_bounds.ended_at,
        EXTRACT(EPOCH FROM (sample_bounds.ended_at - sample_bounds.started_at))::numeric AS elapsed_seconds
 FROM compute, rates, sample_bounds;
@@ -1391,6 +1236,11 @@ WITH consuming_teams AS (
     SELECT i.team_id
     FROM sandbox_storage_interval i
     WHERE i.ended_at IS NULL AND i.disk_mib > 0 AND i.started_at < now()
+      AND i.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+      AND feature_enabled('billing_storage_billing_enabled', i.team_id)
+    UNION
+    SELECT i.team_id FROM retained_storage_interval i
+    WHERE i.ended_at IS NULL AND i.started_at < now()
       AND i.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
       AND feature_enabled('billing_storage_billing_enabled', i.team_id)
 )
@@ -1555,32 +1405,12 @@ JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_en
  FROM buckets b LEFT JOIN compute_intervals i ON
   i.started_at < LEAST(now(),b.bucket_end) AND COALESCE(i.ended_at,LEAST(now(),b.bucket_end)) > b.bucket_start
  GROUP BY b.bucket_start,b.bucket_end
-), storage_intervals AS (
- SELECT i.* FROM sandbox_storage_interval i CROSS JOIN bounds r
- WHERE i.team_id=sqlc.arg(team_id) AND i.started_at < LEAST(now(),r.range_end)
-   AND COALESCE(i.ended_at,now()) > r.range_start
-), artifact_ranges AS (
- SELECT b.bucket_start,b.bucket_end,p.path,
-   MAX(COALESCE(NULLIF(am.allocated_bytes,0),0))::numeric/1048576.0 AS artifact_mib,
-   range_agg(tstzrange(GREATEST(s.started_at,b.bucket_start),LEAST(COALESCE(sb.destroyed_at,now()),b.bucket_end),'[)')) AS retained_ranges
- FROM buckets b
- JOIN storage_intervals s ON TRUE
- JOIN sandbox sb ON sb.id=s.sandbox_id
- LEFT JOIN template t ON t.id=sb.template_id
- CROSS JOIN LATERAL unnest(ARRAY[sb.base_path,sb.delta_path,CASE WHEN sb.base_path IS NULL AND sb.delta_path IS NULL THEN t.rootfs_path END]) AS p(path)
- LEFT JOIN artifact_manifest am ON (am.snapshot_id=sb.snapshot_id OR am.template_id=t.id) AND am.path=p.path
- WHERE p.path IS NOT NULL AND s.started_at < LEAST(now(),b.bucket_end) AND COALESCE(sb.destroyed_at,LEAST(now(),b.bucket_end)) > b.bucket_start
- GROUP BY b.bucket_start,b.bucket_end,p.path
-), artifact_storage AS (
- SELECT bucket_start,bucket_end,COALESCE(SUM(artifact_mib*EXTRACT(EPOCH FROM (upper(r)-lower(r)))),0)::numeric AS mib_seconds
- FROM artifact_ranges CROSS JOIN LATERAL unnest(retained_ranges) AS ranges(r) GROUP BY bucket_start,bucket_end
 ), storage AS (
  SELECT b.bucket_start,b.bucket_end,
-   COALESCE(SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(i.ended_at,now()),b.bucket_end)-GREATEST(i.started_at,b.bucket_start)))*i.disk_mib),0)::numeric + COALESCE(MAX(a.mib_seconds),0) AS storage_mib_seconds
- FROM buckets b LEFT JOIN storage_intervals i ON
-  i.started_at < LEAST(now(),b.bucket_end) AND COALESCE(i.ended_at,LEAST(now(),b.bucket_end)) > b.bucket_start
- LEFT JOIN artifact_storage a ON a.bucket_start=b.bucket_start AND a.bucket_end=b.bucket_end GROUP BY b.bucket_start,b.bucket_end
+ storage_mib_seconds(sqlc.arg(team_id)::uuid,b.bucket_start,b.bucket_end,false)::numeric AS storage_mib_seconds
+ FROM buckets b
 )
+
 SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds
 FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start;
 
