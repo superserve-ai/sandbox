@@ -33,8 +33,10 @@ After historical reconciliation, pending-billing settlement and rollback readine
 an administrator separately enables canonical enforcement. See
 [promotion identity authority](promotion-identity-authority.md) for exact interfaces
 and the activation gate. Once enabled, known missing/unverified email permits a
-team without a grant, but unavailable/stale authority aborts provisioning without
-falling back to a user-ID-only claim.
+team without a grant. With the device grant integration installed, promotion-only
+authority failures also permit provisioning with a durable no-credit outcome;
+they never fall back to a user-ID-only claim. Underlying provisioning failures
+still roll back.
 
 Before legacy completion, a failed write consumes no claim. A lost response
 after the final owner transaction commits is a successfully provisioned team,
@@ -102,8 +104,10 @@ global entitlement coordination across independently active cells.
 
 ## Switch: authenticated API and Console integration
 
-The companion change owns the team-creation HTTP API and Console integration;
-the promotion migration does not introduce either. The API must derive the
+The companion change owns the general team-creation HTTP API and Console
+integration. The narrower trusted promotion creation route described below
+persists the promotion decision and team; it does not provision membership or
+owner roles. The general API must derive the
 actor from verified user authentication, preserve signup/CAPTCHA proof checks,
 use the correct regional database, and commit the complete provisioning chain
 atomically. A shared service key plus an arbitrary caller-supplied user ID is
@@ -134,3 +138,54 @@ team trigger before dropping it, remove obsolete compatibility functions and
 guards deliberately, and retain durable claims, denials, and historical audit
 state. Re-run provisioning, concurrency, migration, billing, and rollback
 tests. Database rollback must not restore the unconditional per-team grant.
+
+## Regional device enforcement
+
+Apply the shared Auth evidence migrations once, then the additive regional
+migrations and enforcement-capable backend in each selected region. The exact
+registration, signed creation, and eligibility-snapshot interfaces are in the
+[promotion device contract](promotion-device-contract.md). Keep device and
+evidence-required gates off until the Console producer and all local grant
+writers are ready. Initial East signup and later West team creation reuse the
+same account's original evidence; ownership and consumption remain regional.
+
+Before activating a region, record evidence that its legacy signup completion,
+explicit creation, billing activation, webhook, and recovery writers use the
+regional authority. Verify signed Console registration and creation, including
+registration failure with valid prior regional evidence and replay after recovery.
+The trusted creation call must persist the no-credit decision atomically; a
+fallback team insert can award credit from that prior evidence. Verify original
+evidence republication on delayed West entry without cookies or a fresh capture.
+Retain the existing canonical history, pending-billing, and rollback readiness
+checks. Another region's readiness is not an activation prerequisite.
+
+C is the existing canonical enforcement gate; D is device duplicate enforcement;
+E requires verified signup device evidence. Both bonuses use the same matrix:
+
+| C | D | E | Future grant decisions |
+| --- | --- | --- | --- |
+| OFF | OFF | OFF | Existing user/team fences; canonical rollout remains off. |
+| OFF | OFF | ON | Invalid; no credit. |
+| OFF | ON | OFF | Invalid; no credit. |
+| OFF | ON | ON | Invalid; no credit. |
+| ON | OFF | OFF | Canonical/user/team fences; device evidence optional. |
+| ON | OFF | ON | Require evidence; device sharing alone does not deny credit. |
+| ON | ON | OFF | Enforce known device/owner restrictions; evidence optional. |
+| ON | ON | ON | Require evidence and enforce device/owner restrictions. |
+
+After the selected region's readiness checks, `set_promotion_device_policy(true)`
+activates D with E defaulting ON. The two-argument `(D, E)` form permits an
+explicit independent evidence policy. Authority/configuration failures withhold
+credit in every mode. Registration always records the immutable first regional
+owner, including when D is OFF; actual grants always record consumption. Missing
+evidence creates no owner and a no-grant consumes no entitlement. Completed
+claims and pending external attempts retain their original results and pins.
+An existing safe retry can reconsider an uncompleted decision; there is no new
+catch-up worker or promise of a later award.
+
+After activation, do not roll back the SQL authority, remove compatibility
+triggers, restore direct credit writers, or deploy a Console fallback that loses
+the trusted no-credit decision. An application rollback must retain these
+contracts and pending Stripe reservation/recovery semantics. Turning D or E off
+is an explicit regional policy change, not a schema rollback; it never erases
+ownership, consumption, historical balances, or uncertain external reservations.

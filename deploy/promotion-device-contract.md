@@ -142,6 +142,16 @@ and account tokens different from each other and from `INTERNAL_API_TOKEN`; a
 missing or reused token rejects producer requests. A missing shared Auth
 connection or failed RPC returns `authority_unavailable` and withholds credit.
 
+In production, Terraform also writes the resolved switch to the Cloud Run
+template as `PROMOTION_EVIDENCE_ENABLED`. Both API deployment workflows read
+this explicit value when checking the deployed template: `true` requires all
+four cell-specific secret mappings; `false` permits their omission. Operator
+identity and token checks always apply, and any present promotion mappings must
+still reference the correct cell secrets. Missing or malformed rollout state
+blocks deployment until Terraform is applied; missing secrets never imply a
+disabled rollout. This template value is deployment metadata, not a device
+policy gate.
+
 Before enabling device enforcement in either production region, verify that
 each cell's serving revision has all four secret-backed environment variables,
 that both scoped credentials work only on their own routes, account assertions
@@ -378,16 +388,18 @@ migration-history repair.
 
 The creation regression is `TestIntegration_TrustedTeamPromotionAttempt`, covering
 prior regional evidence plus a failed registration HTTP call, exact no-credit
-replay after registration recovers, successful registration/grant, and forged or
-mismatched inputs. `TestIntegration_PromotionPolicyContentionPreservesProvisioning`
-holds a real policy-row lock across explicit team creation and legacy owner
-assignment. `TestIntegration_TrustedTeamPromotionAttemptPrivilegesAndGrantFailure`
-checks RPC/table access and preservation of unrelated grant-error retries.
-The canonical validation recorded before this prerequisite update passed these
-three integration tests and the actual Console fixture producer with
-`TestPromotionAccountConsoleInterop` for bind/evidence/register. That evidence
-does not validate this newer prerequisite or the new redemption reason; canonical
-validation of the resulting backend revision is required. The existing Console
-fixture covers bind/evidence/register only. Console must additionally implement
-and verify the creation call sequence and new signed fields above before this boundary is integrated end to
-end.
+replay after registration recovers, successful registration/grant, forged or
+mismatched inputs, and retained results after team/account deletion.
+`TestPromotionAccountAssertions` covers signed creation bindings and rejects
+missing, expired, forged, or mismatched assertions before database access.
+`TestIntegration_PromotionPolicyContentionPreservesProvisioning` holds a real
+policy-row lock across explicit team creation and legacy owner assignment.
+`TestIntegration_TrustedTeamPromotionAttemptPrivilegesAndGrantFailure` checks
+RPC/table access and preservation of unrelated grant-error retries.
+
+Run these tests against the resulting backend revision before rollout. The
+existing Console fixture covers bind/evidence/register only; its pass does not
+prove the creation boundary works end to end. Console must also implement and
+verify the creation call sequence and signed fields above, including failure
+with prior evidence and replay after authority recovers. Enforcement stays off
+until that selected region's consumer and backend validation are recorded.
