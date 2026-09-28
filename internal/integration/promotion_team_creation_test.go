@@ -147,18 +147,20 @@ func TestIntegration_TrustedTeamPromotionAttempt(t *testing.T) {
 				}
 			}
 			// Even a fresh valid assertion cannot change an accepted binding.
-			for _, field := range []string{"user_id", "team_id", "attempt_id", "authority_unavailable"} {
+			for _, field := range []string{"user_id", "team_id", "attempt_id", "authority_unavailable", "name"} {
 				original := body[field]
 				actor := user
 				wantStatus := http.StatusBadRequest
 				if field == "authority_unavailable" {
 					body[field] = !unavailable
+				} else if field == "name" {
+					body[field] = "changed-example-team"
 				} else {
 					body[field] = uuid.New()
 				}
 				if field == "user_id" {
 					actor = body[field].(uuid.UUID)
-				} else {
+				} else if field != "name" {
 					binding[field] = body[field]
 				}
 				if field == "attempt_id" {
@@ -168,7 +170,7 @@ func TestIntegration_TrustedTeamPromotionAttempt(t *testing.T) {
 					t.Fatalf("changed durable %s: %d %s", field, w.Code, w.Body.String())
 				}
 				body[field] = original
-				if field != "user_id" {
+				if field != "user_id" && field != "name" {
 					binding[field] = original
 				}
 			}
@@ -189,6 +191,24 @@ func TestIntegration_TrustedTeamPromotionAttempt(t *testing.T) {
 			var outcome, reason string
 			if err := region.QueryRow(t.Context(), `SELECT * FROM claim_team_signup_trial($1,$2)`, team, user).Scan(&outcome, &reason); err != nil || (unavailable && (outcome != "promotion_ineligible" || reason != "authority_unavailable")) {
 				t.Fatalf("direct claim replay: %s/%s %v", outcome, reason, err)
+			}
+			// Deletion must not reopen an accepted attempt or recreate its team.
+			rolloutExec(t, region, `DELETE FROM team_credit_grant WHERE team_id=$1`, team)
+			rolloutExec(t, region, `DELETE FROM team WHERE id=$1`, team)
+			rolloutExec(t, region, `DELETE FROM profile WHERE id=$1`, user)
+			w := request("create-team", user, body, sign("create-team", user, binding))
+			if w.Code != http.StatusOK || w.Body.String() != first {
+				t.Fatalf("deleted team replay: %d %s, want %s", w.Code, w.Body.String(), first)
+			}
+			var retainedAttempts, retainedOwners int
+			err = region.QueryRow(t.Context(), `SELECT
+                (SELECT count(*) FROM team WHERE id=$1),
+                (SELECT count(*) FROM team_credit_grant WHERE team_id=$1),
+                (SELECT count(*) FROM team_promotion_creation_attempt WHERE attempt_id=$2),
+                (SELECT count(*) FROM promotion_device_owner WHERE user_id=$3)`, team, attempt, user).
+				Scan(&teams, &credits, &retainedAttempts, &retainedOwners)
+			if err != nil || teams != 0 || credits != 0 || retainedAttempts != 1 || retainedOwners != 1 {
+				t.Fatalf("deleted replay state: teams=%d credits=%d attempts=%d owners=%d err=%v", teams, credits, retainedAttempts, retainedOwners, err)
 			}
 		})
 	}

@@ -1,4 +1,4 @@
-"""Fail deployment if Terraform's operator credential isolation is absent."""
+"""Check Terraform's operator identity and configured promotion secret rollout."""
 import argparse
 import json
 import sys
@@ -20,18 +20,22 @@ def check(service, project, cell):
     if ('value' in tokens[0] or ref.get('name') != f'operator-api-token-{cell}'
             or not ref.get('key')):
         raise ValueError('operator token must reference the dedicated cell secret')
-    promotion_secrets = (
+    # Terraform writes its resolved rollout value into the same revision template
+    # as the secrets. Missing secrets cannot establish that rollout is disabled.
+    rollout = [env for env in containers[0].get('env', [])
+               if env.get('name') == 'PROMOTION_EVIDENCE_ENABLED']
+    if (len(rollout) != 1 or 'valueFrom' in rollout[0]
+            or rollout[0].get('value') not in ('true', 'false')):
+        raise ValueError('promotion evidence rollout state is missing or invalid')
+    promotion_evidence_enabled = rollout[0]['value'] == 'true'
+    for name, secret in (
             ('PROMOTION_AUTH_DATABASE_URL', 'promotion-auth-database-url'),
             ('PROMOTION_CAPTURE_TOKEN', 'promotion-capture-token'),
             ('PROMOTION_ACCOUNT_TOKEN', 'promotion-account-token'),
-            ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion-account-public-key'))
-    # Terraform omits all four mappings when the evidence integration is disabled.
-    if not any(env.get('name') == name
-               for env in containers[0].get('env', [])
-               for name, _ in promotion_secrets):
-        return
-    for name, secret in promotion_secrets:
+            ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion-account-public-key')):
         matches = [env for env in containers[0].get('env', []) if env.get('name') == name]
+        if not matches and not promotion_evidence_enabled:
+            continue
         if len(matches) != 1:
             raise ValueError(f'{name} mapping is missing or duplicated')
         ref = matches[0].get('valueFrom', {}).get('secretKeyRef', {})
