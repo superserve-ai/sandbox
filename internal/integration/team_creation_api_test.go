@@ -57,22 +57,30 @@ type teamCreationClient struct {
 }
 
 func newTeamCreationClient(t *testing.T, pool *pgxpool.Pool) *teamCreationClient {
+	return newTeamCreationClientForRegion(t, pool, "use")
+}
+
+func newTeamCreationClientForRegion(t *testing.T, pool *pgxpool.Pool, region string) *teamCreationClient {
 	t.Helper()
 	t.Setenv("INTERNAL_API_TOKEN", "team-creation-test-token")
 	private := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
 	public := private.Public().(ed25519.PublicKey)
 	next := ed25519.NewKeyFromSeed([]byte(strings.Repeat("n", ed25519.SeedSize)))
-	h := &api.Handlers{Pool: pool, Config: &config.Config{TeamCreationRegion: "use", TeamCreationKeys: map[string]ed25519.PublicKey{"test": public, "next": next.Public().(ed25519.PublicKey)}}}
+	h := &api.Handlers{Pool: pool, Config: &config.Config{TeamCreationRegion: region, TeamCreationKeys: map[string]ed25519.PublicKey{"test": public, "next": next.Public().(ed25519.PublicKey)}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	return &teamCreationClient{t: t, router: api.SetupRouter(ctx, h, pool), private: private}
 }
 func teamCreationClaims(actor uuid.UUID, requestID, name string) map[string]any {
+	return teamCreationClaimsForRegion(actor, requestID, name, "use")
+}
+
+func teamCreationClaimsForRegion(actor uuid.UUID, requestID, name, region string) map[string]any {
 	now := time.Now().UTC()
 	stamp := now.Format("2006-01-02T15:04:05.000000Z")
 	return map[string]any{
 		"v": 1, "iss": "superserve-console", "aud": "superserve-team-creation", "purpose": "team-creation", "sub": actor.String(), "iat": now.Unix(), "exp": now.Unix() + 120,
-		"request_id": requestID, "name": name, "region": "use", "authorization": "create",
+		"request_id": requestID, "name": name, "region": region, "authorization": "create",
 		"policy":   map[string]any{"version": 1, "mode": "first_team", "session": "passed", "captcha": "passed", "preauth": "passed", "google_onboarding": "passed", "additional_team": "not_applicable"},
 		"identity": map[string]any{"email": actor.String() + "@example.com", "email_verified": true, "auth_updated_at": stamp, "observed_at": stamp},
 	}
@@ -135,6 +143,19 @@ func teamCreationID(t *testing.T, response *httptest.ResponseRecorder) uuid.UUID
 	}
 	return uuid.MustParse(result["id"])
 }
+
+func teamCreationSnapshot(t *testing.T, response *httptest.ResponseRecorder) map[string]string {
+	t.Helper()
+	teamCreationStatus(t, response, http.StatusOK, "")
+	var result map[string]string
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result) != 3 {
+		t.Fatalf("unexpected result shape: %s", response.Body.String())
+	}
+	return result
+}
 func teamCreationCount(t *testing.T, pool *pgxpool.Pool, query string, args ...any) int {
 	t.Helper()
 	var count int
@@ -176,6 +197,30 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 			t.Fatalf("creation changed gate: %t %v", enabled, err)
 		}
 	})
+	t.Run("successful non-default cell creation and recovery", func(t *testing.T) {
+		uswClient := newTeamCreationClientForRegion(t, pool, "usw")
+		actor := uuid.New()
+		claims := teamCreationClaimsForRegion(actor, uuid.NewString(), "Café  ☃", "usw")
+		snapshot := teamCreationSnapshot(t, uswClient.call(claims, nil))
+		id := uuid.MustParse(snapshot["id"])
+		if snapshot["name"] != "Café  ☃" || snapshot["region"] != "usw" {
+			t.Fatalf("unexpected non-default response: %v", snapshot)
+		}
+		var homeRegion, cell, durableRegion string
+		if err := pool.QueryRow(ctx, `SELECT home_region FROM team WHERE id=$1`, id).Scan(&homeRegion); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT cell, region FROM team_creation_requests WHERE actor_id=$1 AND request_id=$2`, actor, claims["request_id"]).Scan(&cell, &durableRegion); err != nil {
+			t.Fatal(err)
+		}
+		if homeRegion != "usw" || cell != "usw" || durableRegion != "usw" {
+			t.Fatalf("non-default routing home=%q cell=%q durable_region=%q", homeRegion, cell, durableRegion)
+		}
+		recovered := teamCreationSnapshot(t, uswClient.call(teamCreationRecover(claims), nil))
+		if recovered["id"] != snapshot["id"] || recovered["name"] != "Café  ☃" || recovered["region"] != "usw" {
+			t.Fatalf("recovery changed non-default snapshot: create=%v recover=%v", snapshot, recovered)
+		}
+	})
 	// This activation is confined to the disposable test database.
 	rolloutExec(t, pool, `SELECT enable_canonical_promotion_identity('{"reference":"isolated provisioning test","all_writers_ready":true,"rollback_ready":true}')`)
 	t.Run("response loss replay isolation and tombstone", func(t *testing.T) {
@@ -198,6 +243,17 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 			t.Fatal("concurrent requests diverged")
 		}
 		teamCreationOutcome(t, pool, id, "granted")
+		// Simulate a dropped response: the caller has no create response and
+		// recovers using the same logical request identity. Recovery must return
+		// the committed snapshot without fresh create evidence or writes.
+		lostActor := uuid.New()
+		lostClaims := teamCreationClaims(lostActor, uuid.NewString(), "Dropped response Café ☃")
+		_ = client.call(lostClaims, nil)
+		before := teamCreationCount(t, pool, `SELECT count(*) FROM team_creation_requests WHERE actor_id=$1`, lostActor)
+		recoveredLost := teamCreationSnapshot(t, client.call(teamCreationRecover(lostClaims), nil))
+		if recoveredLost["name"] != "Dropped response Café ☃" || before != 1 {
+			t.Fatalf("lost-response recovery changed result: recover=%v requests=%d", recoveredLost, before)
+		}
 		for _, query := range []string{
 			`SELECT count(*) FROM team_member WHERE team_id=$1 AND profile_id=$2 AND role='owner'`,
 			`SELECT count(*) FROM team_memberships WHERE team_id=$1 AND user_id=$2 AND status='active'`,
@@ -378,6 +434,90 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 			t.Fatal("joining consumed trial")
 		}
 		teamCreationOutcome(t, pool, teamCreationID(t, client.call(teamCreationClaims(actor, uuid.NewString(), "Joined actor team"), nil)), "granted")
+	})
+	t.Run("recovery during in-flight creation is read-only", func(t *testing.T) {
+		const lockName = "team-creation-inflight-test"
+		rolloutExec(t, pool, `CREATE FUNCTION hold_team_creation_request() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(hashtextextended('team-creation-inflight-test', 0)); RETURN NEW; END $$`)
+		rolloutExec(t, pool, `CREATE TRIGGER hold_team_creation_request BEFORE INSERT ON team_creation_requests FOR EACH ROW EXECUTE FUNCTION hold_team_creation_request()`)
+		defer func() {
+			rolloutExec(t, pool, `DROP TRIGGER hold_team_creation_request ON team_creation_requests`)
+			rolloutExec(t, pool, `DROP FUNCTION hold_team_creation_request()`)
+		}()
+		hold, err := pool.Acquire(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer hold.Release()
+		if _, err := hold.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, lockName); err != nil {
+			t.Fatal(err)
+		}
+		actor := uuid.New()
+		claims := teamCreationClaims(actor, uuid.NewString(), "In-flight creation")
+		created := make(chan *httptest.ResponseRecorder, 1)
+		go func() { created <- client.call(claims, nil) }()
+		// The trigger has taken the request transaction to the uncertain commit
+		// boundary. A concurrent recovery must not reserve or repair anything.
+		time.Sleep(50 * time.Millisecond)
+		teamCreationStatus(t, client.call(teamCreationRecover(claims), nil), http.StatusNotFound, "result_not_found")
+		if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_creation_requests WHERE actor_id=$1`, actor); n != 0 {
+			t.Fatalf("in-flight recovery observed or created a durable result: %d", n)
+		}
+		if _, err := hold.Exec(ctx, `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, lockName); err != nil {
+			t.Fatal(err)
+		}
+		createdResponse := <-created
+		createdSnapshot := teamCreationSnapshot(t, createdResponse)
+		recovered := teamCreationSnapshot(t, client.call(teamCreationRecover(claims), nil))
+		if recovered["id"] != createdSnapshot["id"] || recovered["name"] != createdSnapshot["name"] {
+			t.Fatalf("post-commit recovery changed result: create=%v recover=%v", createdSnapshot, recovered)
+		}
+	})
+	t.Run("legacy and API creation coexist without duplicate grants", func(t *testing.T) {
+		actor := uuid.New()
+		revision := time.Now().UTC().Truncate(time.Microsecond)
+		claims := teamCreationClaims(actor, uuid.NewString(), "Concurrent API team")
+		claims["identity"].(map[string]any)["auth_updated_at"] = revision.Format("2006-01-02T15:04:05.000000Z")
+		rolloutExec(t, pool, `SELECT upsert_profile_with_promotion_identity($1,$2,true,$3,$3)`, actor, actor.String()+"@example.com", revision)
+		legacyDone := make(chan error, 1)
+		var legacyID uuid.UUID
+		go func() {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				legacyDone <- err
+				return
+			}
+			defer tx.Rollback(ctx)
+			if err = tx.QueryRow(ctx, `INSERT INTO team(name, home_region) VALUES($1,'use') RETURNING id`, "Legacy concurrent team").Scan(&legacyID); err != nil {
+				legacyDone <- err
+				return
+			}
+			if _, err = tx.Exec(ctx, `INSERT INTO team_member(team_id, profile_id, role) VALUES($1,$2,'owner')`, legacyID, actor); err != nil {
+				legacyDone <- err
+				return
+			}
+			if _, err = tx.Exec(ctx, `INSERT INTO team_memberships(team_id, user_id, status) VALUES($1,$2,'active')`, legacyID, actor); err != nil {
+				legacyDone <- err
+				return
+			}
+			if _, err = tx.Exec(ctx, `INSERT INTO user_role_assignments(user_id, role_id, scope_type, team_id, granted_by)
+				SELECT $1, id, 'team', $2, $1 FROM roles WHERE name='team_owner' AND scope_type='team'`, actor, legacyID); err != nil {
+				legacyDone <- err
+				return
+			}
+			legacyDone <- tx.Commit(ctx)
+		}()
+		apiDone := make(chan *httptest.ResponseRecorder, 1)
+		go func() { apiDone <- client.call(claims, nil) }()
+		if err := <-legacyDone; err != nil {
+			t.Fatal(err)
+		}
+		apiID := teamCreationID(t, <-apiDone)
+		if apiID == legacyID {
+			t.Fatal("legacy and API unexpectedly reused one team")
+		}
+		if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_credit_grant WHERE reason='signup trial credit' AND created_by=$1`, actor); n != 1 {
+			t.Fatalf("legacy/API coexistence issued %d grants", n)
+		}
 	})
 	t.Run("registered route rejects before writes", func(t *testing.T) {
 		actor := uuid.New()

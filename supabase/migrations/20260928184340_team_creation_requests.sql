@@ -34,6 +34,11 @@ DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
         REVOKE ALL ON team_creation_requests FROM authenticated;
     END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        -- The control-plane pool uses service_role for this privileged,
+        -- actor-bound idempotency state. Ordinary client roles remain denied.
+        GRANT SELECT, INSERT ON team_creation_requests TO service_role;
+    END IF;
 END $$;
 
 COMMIT;

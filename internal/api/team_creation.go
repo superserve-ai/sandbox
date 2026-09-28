@@ -381,13 +381,25 @@ func TeamCreationInternalAuth() gin.HandlerFunc {
 	}
 }
 
+func validTeamCreationVerifierConfig(region string, keys map[string]ed25519.PublicKey) bool {
+	if region != "use" && region != "usw" || len(keys) == 0 {
+		return false
+	}
+	for kid, key := range keys {
+		if kid == "" || len(kid) > 128 || len(key) != ed25519.PublicKeySize {
+			return false
+		}
+	}
+	return true
+}
+
 // CreateInternalTeam verifies transport and proof before any persistence access.
 func (h *Handlers) CreateInternalTeam(c *gin.Context) {
 	h.createInternalTeam(c, time.Now())
 }
 
 func (h *Handlers) createInternalTeam(c *gin.Context, now time.Time) {
-	if h.Config == nil || (h.Config.TeamCreationRegion != "use" && h.Config.TeamCreationRegion != "usw") || len(h.Config.TeamCreationKeys) == 0 {
+	if h.Config == nil || !validTeamCreationVerifierConfig(h.Config.TeamCreationRegion, h.Config.TeamCreationKeys) {
 		teamCreationError(c, "provisioning_unavailable", "Team provisioning is unavailable", http.StatusServiceUnavailable)
 		return
 	}

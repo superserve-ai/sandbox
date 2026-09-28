@@ -24,6 +24,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+	"github.com/superserve-ai/sandbox/internal/abuse"
 	"github.com/superserve-ai/sandbox/internal/config"
 )
 
@@ -79,6 +80,110 @@ func TestTeamCreationAssertionAuthority(t *testing.T) {
 	claims, err = verifyTeamCreationAssertion(signTeamCreationTestAssertion(t, base, private), keys, now)
 	if err != nil || claims.Authorization != "recover" {
 		t.Fatalf("recovery assertion: %v", err)
+	}
+}
+
+func TestTeamCreationTrustBoundaryRejectionMatrix(t *testing.T) {
+	t.Setenv("INTERNAL_API_TOKEN", "internal-test-token")
+	now := time.Unix(1_800_000_000, 0)
+	private := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	keys := map[string]ed25519.PublicKey{"test": private.Public().(ed25519.PublicKey)}
+	for _, tc := range []struct {
+		name   string
+		change func(map[string]any)
+	}{
+		{"wrong issuer", func(c map[string]any) { c["iss"] = "other-console" }},
+		{"wrong audience", func(c map[string]any) { c["aud"] = "other-service" }},
+		{"unknown policy mode", func(c map[string]any) { c["policy"].(map[string]any)["mode"] = "bypass" }},
+		{"first team missing preauth", func(c map[string]any) { c["policy"].(map[string]any)["preauth"] = "not_applicable" }},
+		{"additional team with first-team proof", func(c map[string]any) {
+			p := c["policy"].(map[string]any)
+			p["mode"], p["additional_team"] = "additional_team", "passed"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := teamCreationTestClaims(now)
+			tc.change(claims)
+			if _, err := verifyTeamCreationAssertion(signTeamCreationTestAssertion(t, claims, private), keys, now); err == nil {
+				t.Fatal("accepted trust-boundary violation")
+			}
+		})
+	}
+	// Algorithm confusion must fail even when the attacker can produce a valid
+	// Ed25519 signature over a header naming a different algorithm.
+	claims := teamCreationTestClaims(now)
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, algorithm := range []string{"HS256", "Ed25519"} {
+		header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"` + algorithm + `","typ":"team-creation+jwt","kid":"test"}`))
+		encodedPayload := base64.RawURLEncoding.EncodeToString(payload)
+		message := header + "." + encodedPayload
+		assertion := message + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, []byte(message)))
+		if _, err := verifyTeamCreationAssertion(assertion, keys, now); err == nil {
+			t.Fatalf("accepted algorithm %s", algorithm)
+		}
+	}
+
+	// Unknown regions are rejected by the registered route before any pool
+	// access, while the internal legacy route remains usable with its token.
+	h := &Handlers{Config: &config.Config{TeamCreationRegion: "use", TeamCreationKeys: keys}, SignupRestrictions: &abuse.SignupEvaluator{Source: abuse.NewConfigComputeSource("", nil, nil)}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	router := SetupRouter(ctx, h, nil)
+	claims = teamCreationTestClaims(time.Now())
+	claims["region"] = "moon"
+	body := `{"request_id":"42140b1e-ac77-4ab0-9841-d9099ae8265a","name":"Café ☃","region":"moon"}`
+	req := httptest.NewRequest(http.MethodPost, "/internal/teams", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer internal-test-token")
+	req.Header.Set("X-Team-Creation-Assertion", signTeamCreationTestAssertion(t, claims, private))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("unknown region route status=%d body=%s", w.Code, w.Body.String())
+	}
+	legacy := httptest.NewRequest(http.MethodPost, "/internal/signup/evaluate", strings.NewReader(`{"subjects":[{"type":"fingerprint","value":"visitor-example"}]}`))
+	legacy.Header.Set("Authorization", "Bearer internal-test-token")
+	legacyResponse := httptest.NewRecorder()
+	router.ServeHTTP(legacyResponse, legacy)
+	if legacyResponse.Code != http.StatusOK {
+		t.Fatalf("legacy route disabled by team verifier rejection: %d %s", legacyResponse.Code, legacyResponse.Body.String())
+	}
+}
+
+func TestTeamCreationMissingVerifierConfigurationOnlyDisablesNewRoute(t *testing.T) {
+	t.Setenv("INTERNAL_API_TOKEN", "internal-test-token")
+	for _, tc := range []struct {
+		name string
+		keys map[string]ed25519.PublicKey
+	}{
+		{name: "missing", keys: nil},
+		{name: "malformed", keys: map[string]ed25519.PublicKey{"bad": []byte("short")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &Handlers{
+				Config:             &config.Config{TeamCreationRegion: "use", TeamCreationKeys: tc.keys},
+				SignupRestrictions: &abuse.SignupEvaluator{Source: abuse.NewConfigComputeSource("", nil, nil)},
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			router := SetupRouter(ctx, h, nil)
+			teamRequest := httptest.NewRequest(http.MethodPost, "/internal/teams", strings.NewReader(`{"request_id":"42140b1e-ac77-4ab0-9841-d9099ae8265a","name":"Example team","region":"use"}`))
+			teamRequest.Header.Set("Authorization", "Bearer internal-test-token")
+			teamResponse := httptest.NewRecorder()
+			router.ServeHTTP(teamResponse, teamRequest)
+			if teamResponse.Code != http.StatusServiceUnavailable || !strings.Contains(teamResponse.Body.String(), "provisioning_unavailable") {
+				t.Fatalf("verifier configuration status=%d body=%s", teamResponse.Code, teamResponse.Body.String())
+			}
+			legacyRequest := httptest.NewRequest(http.MethodPost, "/internal/signup/evaluate", strings.NewReader(`{"subjects":[{"type":"fingerprint","value":"visitor-example"}]}`))
+			legacyRequest.Header.Set("Authorization", "Bearer internal-test-token")
+			legacyResponse := httptest.NewRecorder()
+			router.ServeHTTP(legacyResponse, legacyRequest)
+			if legacyResponse.Code != http.StatusOK {
+				t.Fatalf("verifier configuration disabled legacy route: %d %s", legacyResponse.Code, legacyResponse.Body.String())
+			}
+		})
 	}
 }
 
