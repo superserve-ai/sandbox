@@ -20,6 +20,14 @@ func loadRevocationAccounts(ctx context.Context, pool *pgxpool.Pool, target, aft
 	// this revocation-only scan.
 	rows, err := pool.Query(ctx, `SELECT a.team_id, a.stripe_customer_id, a.stripe_subscription_id,
         a.stripe_subscription_status, a.stripe_activation_credit_grant_id, a.cancel_at_period_end,
+        EXISTS (
+            SELECT 1 FROM stripe_webhook_event e
+            WHERE e.event_type IN ('customer.subscription.updated', 'customer.subscription.deleted')
+              AND e.payload->'data'->'object'->>'customer' = a.stripe_customer_id
+              AND (e.event_type = 'customer.subscription.deleted'
+                   OR e.payload->'data'->'object'->>'cancel_at_period_end' = 'true'
+                   OR lower(e.payload->'data'->'object'->>'status') = 'canceled')
+        ),
         (r.team_id IS NOT NULL AND r.completed_at IS NULL), (r.completed_at IS NOT NULL)
         FROM team_billing_account a LEFT JOIN stripe_activation_credit_revocation r USING (team_id)
         WHERE ($1::uuid IS NULL OR a.team_id = $1)
@@ -33,7 +41,7 @@ func loadRevocationAccounts(ctx context.Context, pool *pgxpool.Pool, target, aft
 	var accounts []billingAccount
 	for rows.Next() {
 		var a billingAccount
-		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.GrantID, &a.CancelAtPeriodEnd, &a.RevocationPending, &a.RevocationComplete); err != nil {
+		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.GrantID, &a.CancelAtPeriodEnd, &a.HistoricalCancellation, &a.RevocationPending, &a.RevocationComplete); err != nil {
 			return nil, err
 		}
 		accounts = append(accounts, a)
@@ -61,7 +69,7 @@ func auditRevocation(ctx context.Context, pool *pgxpool.Pool, stripe stripeClien
 	if strings.TrimSpace(deref(account.CustomerID)) == "" {
 		return unresolved(errors.New("Stripe customer identity missing"))
 	}
-	canceled := account.RevocationPending || account.CancelAtPeriodEnd || strings.EqualFold(deref(account.Status), "canceled")
+	canceled := account.RevocationPending || account.CancelAtPeriodEnd || account.HistoricalCancellation || strings.EqualFold(deref(account.Status), "canceled")
 	if !canceled {
 		if strings.TrimSpace(deref(account.SubscriptionID)) == "" {
 			return unresolved(errors.New("Stripe subscription identity missing"))
@@ -148,6 +156,24 @@ func applyActivationRevocation(ctx context.Context, pool *pgxpool.Pool, stripe s
 	fq := q.WithTx(finalTx)
 	if _, err := fq.LockStripeWebhookProcessingLease(ctx, db.LockStripeWebhookProcessingLeaseParams{CustomerID: *account.CustomerID, Token: token}); err != nil {
 		return err
+	}
+	current, err = fq.LockTeamBillingAccount(ctx, account.TeamID)
+	if err != nil {
+		return err
+	}
+	if current.StripeActivationCreditReservedAt.Valid && !current.StripeActivationUserID.Valid {
+		return errors.New("pending Stripe promotion reservation has no user identity")
+	}
+	if current.StripeActivationUserID.Valid && current.StripeActivationCreditReservedAt.Valid &&
+		!current.StripeActivationCreditGrantedAt.Valid && deref(current.StripeActivationCreditGrantID) == "" {
+		// Stripe may have created the grant before the original response was
+		// lost. Settle the pinned reservation before persisting its ID so the
+		// user entitlement cannot remain pending behind a completed recovery.
+		if err := fq.FinalizeStripePromotion(ctx, db.FinalizeStripePromotionParams{
+			TeamID: account.TeamID, UserID: uuid.UUID(current.StripeActivationUserID.Bytes), StripeGrantID: grantID,
+		}); err != nil {
+			return err
+		}
 	}
 	if _, err := fq.CompleteStripeActivationCreditRevocation(ctx, db.CompleteStripeActivationCreditRevocationParams{TeamID: account.TeamID, CustomerID: *account.CustomerID, GrantID: &grantID}); err != nil {
 		return err

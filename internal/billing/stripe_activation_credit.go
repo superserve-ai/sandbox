@@ -112,6 +112,14 @@ func stripeActivationGrantReconciled(ctx context.Context, request StripeCreditRe
 	if grant.VoidedAt != nil && *grant.VoidedAt > 0 || grant.ExpiresAt != nil && *grant.ExpiresAt <= time.Now().Unix() {
 		return true, nil
 	}
+	available, ledger, err := stripeActivationGrantBalance(ctx, request, grant)
+	if err != nil {
+		return false, err
+	}
+	return available == 0 && ledger == 0, nil
+}
+
+func stripeActivationGrantBalance(ctx context.Context, request StripeCreditRequest, grant StripeActivationGrant) (available, ledger int64, err error) {
 	var summary struct {
 		Customer string `json:"customer"`
 		Balances []struct {
@@ -131,17 +139,18 @@ func stripeActivationGrantReconciled(ctx context.Context, request StripeCreditRe
 	}
 	path := "/v1/billing/credit_balance_summary?customer=" + url.QueryEscape(grant.Customer) + "&filter[type]=credit_grant&filter[credit_grant]=" + url.QueryEscape(grant.ID)
 	if err := request(ctx, http.MethodGet, path, nil, &summary, ""); err != nil {
-		return false, err
+		return 0, 0, err
 	}
 	if summary.Customer != grant.Customer || len(summary.Balances) != 1 {
-		return false, errors.New("Stripe grant balance is unavailable")
+		return 0, 0, errors.New("Stripe grant balance is unavailable")
 	}
 	balance := summary.Balances[0]
 	if balance.Available.Monetary == nil || balance.Ledger.Monetary == nil || balance.Available.Monetary.Currency != "usd" || balance.Ledger.Monetary.Currency != "usd" {
-		return false, errors.New("Stripe grant balance is unrepresentable")
+		return 0, 0, errors.New("Stripe grant balance is unrepresentable")
 	}
-	// Available zero alone can mean credits reserved by a draft invoice.
-	return balance.Available.Monetary.Value == 0 && balance.Ledger.Monetary.Value == 0, nil
+	// Available zero alone can mean credits reserved by a draft invoice;
+	// ledger is the authoritative remaining grant balance.
+	return balance.Available.Monetary.Value, balance.Ledger.Monetary.Value, nil
 }
 
 func RevokeStripeActivationGrant(ctx context.Context, request StripeCreditRequest, teamID uuid.UUID, customerID, grantID string) (string, error) {
@@ -155,6 +164,36 @@ func RevokeStripeActivationGrant(ctx context.Context, request StripeCreditReques
 	}
 	if reconciled {
 		return grant.ID, nil
+	}
+	_, ledger, err := stripeActivationGrantBalance(ctx, request, grant)
+	if err != nil {
+		return "", err
+	}
+	if ledger > 0 && ledger < grant.Amount.Monetary.Value {
+		var expired StripeActivationGrant
+		err = request(ctx, http.MethodPost, "/v1/billing/credit_grants/"+url.PathEscape(grant.ID)+"/expire", url.Values{}, &expired, "stripe-activation-expire-"+uuid.NewString())
+		if err == nil {
+			if verifyErr := expired.verify(teamID, customerID, grant.ID); verifyErr != nil {
+				return "", verifyErr
+			}
+			if expired.ExpiresAt == nil || *expired.ExpiresAt <= 0 {
+				return "", errors.New("Stripe did not confirm activation grant expiration")
+			}
+			available, ledger, checkErr := stripeActivationGrantBalance(ctx, request, expired)
+			if checkErr != nil {
+				return "", checkErr
+			} else if available != 0 || ledger != 0 {
+				return "", errors.New("Stripe activation grant retains a spendable balance after expiration")
+			}
+			return grant.ID, nil
+		}
+		current, readErr := FindStripeActivationGrant(ctx, request, teamID, customerID, grant.ID)
+		if readErr == nil {
+			if done, checkErr := stripeActivationGrantReconciled(ctx, request, current); checkErr == nil && done {
+				return grant.ID, nil
+			}
+		}
+		return "", fmt.Errorf("expire Stripe activation grant: %w", err)
 	}
 	var voided StripeActivationGrant
 	// Stripe caches failed idempotent responses too. A fresh attempt key lets a

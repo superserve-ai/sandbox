@@ -58,7 +58,7 @@ func TestStripeActivationRevocationTransport(t *testing.T) {
 			case "wrong_id":
 				grant.ID = "cred_other"
 			}
-			voids := 0
+			voids, expires := 0, 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Header.Get("Authorization") != "Bearer sk_test_example" || r.Header.Get("Stripe-Version") != "2025-06-30" {
 					t.Error("missing authenticated version-pinned request")
@@ -76,6 +76,9 @@ func TestStripeActivationRevocationTransport(t *testing.T) {
 					if name == "missing_balance" {
 						_, _ = w.Write([]byte(`{"customer":"cus_example","balances":[]}`))
 						return
+					}
+					if name == "partial" && grant.ExpiresAt != nil {
+						available, ledger = 0, 0
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{"customer": "cus_example", "balances": []any{map[string]any{
 						"available_balance": map[string]any{"monetary": map[string]any{"currency": "usd", "value": available}},
@@ -100,6 +103,16 @@ func TestStripeActivationRevocationTransport(t *testing.T) {
 						return
 					}
 					_ = json.NewEncoder(w).Encode(grant)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/expire"):
+					expires++
+					if name != "partial" {
+						t.Errorf("unexpected expire request for %s", name)
+					}
+					if r.URL.EscapedPath() != "/v1/billing/credit_grants/cred%2Fgrant/expire" || !strings.HasPrefix(r.Header.Get("Idempotency-Key"), "stripe-activation-expire-") {
+						t.Error("incorrect expire identity")
+					}
+					grant.ExpiresAt = &stamp
+					_ = json.NewEncoder(w).Encode(grant)
 				default:
 					t.Errorf("unexpected Stripe request: %s %s", r.Method, r.URL)
 					http.NotFound(w, r)
@@ -108,7 +121,7 @@ func TestStripeActivationRevocationTransport(t *testing.T) {
 			defer server.Close()
 			client := &stripeHTTPClient{baseURL: server.URL, secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: server.Client()}
 			got, err := client.RevokeActivationCredit(context.Background(), teamID, "cus_example", "cred/grant")
-			wantErr := strings.HasPrefix(name, "wrong_") || name == "conflicting_identity" || name == "transient" || name == "partial" || name == "missing_balance"
+			wantErr := strings.HasPrefix(name, "wrong_") || name == "conflicting_identity" || name == "transient" || name == "missing_balance"
 			if (err != nil) != wantErr {
 				t.Fatalf("grant=%q err=%v wantErr=%v", got, err, wantErr)
 			}
@@ -117,11 +130,18 @@ func TestStripeActivationRevocationTransport(t *testing.T) {
 			}
 			wantVoids := 0
 			switch name {
-			case "usable", "reserved", "transient", "ambiguous", "partial":
+			case "usable", "reserved", "transient", "ambiguous":
 				wantVoids = 1
 			}
 			if voids != wantVoids {
 				t.Fatalf("voids=%d want=%d", voids, wantVoids)
+			}
+			wantExpires := 0
+			if name == "partial" {
+				wantExpires = 1
+			}
+			if expires != wantExpires {
+				t.Fatalf("expires=%d want=%d", expires, wantExpires)
 			}
 		})
 	}

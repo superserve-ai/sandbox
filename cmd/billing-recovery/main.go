@@ -22,19 +22,20 @@ import (
 )
 
 type billingAccount struct {
-	TeamID             uuid.UUID
-	CustomerID         *string
-	SubscriptionID     *string
-	Status             *string
-	EventAt            *time.Time
-	GrantID            *string
-	TrialEndedAt       *time.Time
-	CheckoutAt         *time.Time
-	CheckoutSessionID  *string
-	UserPromotion      bool
-	CancelAtPeriodEnd  bool
-	RevocationPending  bool
-	RevocationComplete bool
+	TeamID                 uuid.UUID
+	CustomerID             *string
+	SubscriptionID         *string
+	Status                 *string
+	EventAt                *time.Time
+	GrantID                *string
+	TrialEndedAt           *time.Time
+	CheckoutAt             *time.Time
+	CheckoutSessionID      *string
+	UserPromotion          bool
+	CancelAtPeriodEnd      bool
+	HistoricalCancellation bool
+	RevocationPending      bool
+	RevocationComplete     bool
 }
 
 type stripeSubscription struct {

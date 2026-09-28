@@ -22,10 +22,9 @@ type activationRevocationStripe struct {
 	teamID                                   uuid.UUID
 	customer, grantID                        string
 	voided, failVoid, ambiguous, failBalance bool
-	rejectVoid                               bool
 	expires                                  *int64
 	balance                                  int64
-	creates, voids                           int
+	creates, voids, expiresCount             int
 }
 
 func (s *activationRevocationStripe) serve(t *testing.T, w http.ResponseWriter, r *http.Request) {
@@ -50,10 +49,6 @@ func (s *activationRevocationStripe) serve(t *testing.T, w http.ResponseWriter, 
 		_ = json.NewEncoder(w).Encode(grant())
 	case r.Method == "POST" && r.URL.Path == "/v1/billing/credit_grants/"+s.grantID+"/void":
 		s.voids++
-		if s.rejectVoid {
-			http.Error(w, "credit grant has been applied to an invoice", 400)
-			return
-		}
 		if s.failVoid {
 			http.Error(w, "temporary Stripe failure", 503)
 			return
@@ -63,6 +58,11 @@ func (s *activationRevocationStripe) serve(t *testing.T, w http.ResponseWriter, 
 			http.Error(w, "response lost after void", 500)
 			return
 		}
+		_ = json.NewEncoder(w).Encode(grant())
+	case r.Method == "POST" && r.URL.Path == "/v1/billing/credit_grants/"+s.grantID+"/expire":
+		s.expiresCount++
+		stamp := time.Now().Unix()
+		s.expires = &stamp
 		_ = json.NewEncoder(w).Encode(grant())
 	case r.Method == "GET" && r.URL.Path == "/v1/billing/credit_balance_summary":
 		if s.failBalance {
@@ -92,7 +92,7 @@ func (s *activationRevocationStripe) serve(t *testing.T, w http.ResponseWriter, 
 }
 
 func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
-	for _, scenario := range []string{"scheduled", "terminal", "deleted", "stale", "previous_subscription", "same_second", "transient", "ambiguous", "consumed", "expired", "already_voided", "local_finalization_failure", "partial_unresolved"} {
+	for _, scenario := range []string{"scheduled", "terminal", "deleted", "stale", "previous_subscription", "same_second", "transient", "ambiguous", "consumed", "expired", "already_voided", "local_finalization_failure", "partial_reconciled"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.Background()
 			teamID, key, userID := seedTeamAndKeyWithRole(t, "team_owner")
@@ -162,8 +162,8 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 			switch scenario {
 			case "transient":
 				stripe.failVoid = true
-			case "partial_unresolved":
-				stripe.rejectVoid = true
+			case "partial_reconciled":
+				stripe.balance = 5000
 			case "ambiguous":
 				stripe.ambiguous = true
 			case "consumed":
@@ -173,9 +173,6 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 				stripe.expires = &stamp
 			case "already_voided":
 				stripe.voided = true
-			}
-			if scenario == "partial_unresolved" {
-				stripe.balance = 5000
 			}
 			stripe.mu.Unlock()
 			removeFailure := func() {}
@@ -193,7 +190,7 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 			}
 			eventID := "evt_cancel_" + teamID.String()
 			first := send(eventID, eventType, sub, status, scheduled, canceledAt)
-			if scenario == "transient" || scenario == "local_finalization_failure" || scenario == "partial_unresolved" {
+			if scenario == "transient" || scenario == "local_finalization_failure" {
 				if first.Code != 500 {
 					t.Fatalf("failure returned %d: %s", first.Code, first.Body.String())
 				}
@@ -201,9 +198,6 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 				event, eventErr := testQueries.GetStripeWebhookEvent(ctx, eventID)
 				if err != nil || eventErr != nil || pending.CompletedAt.Valid || event.ProcessedAt.Valid {
 					t.Fatalf("failure marked complete: %+v %+v %v %v", pending, event, err, eventErr)
-				}
-				if scenario == "partial_unresolved" {
-					return
 				}
 				removeFailure()
 				stripe.mu.Lock()
@@ -240,6 +234,9 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 			if w := send(eventID, eventType, sub, status, scheduled, canceledAt); w.Code != 200 {
 				t.Fatalf("duplicate: %d", w.Code)
 			}
+			if w := send("evt_cancel_distinct_"+teamID.String(), eventType, sub, status, scheduled, canceledAt); w.Code != 200 {
+				t.Fatalf("distinct duplicate: %d %s", w.Code, w.Body.String())
+			}
 			if w := send("evt_reverse_"+teamID.String(), "customer.subscription.updated", sub, "active", false, at.Add(20*time.Second)); w.Code != 200 {
 				t.Fatalf("reversal: %d", w.Code)
 			}
@@ -272,14 +269,17 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 				t.Fatalf("redemption changed: %v %v", finalRedemption, err)
 			}
 			stripe.mu.Lock()
-			creates, voids := stripe.creates, stripe.voids
+			creates, voids, expiresCount := stripe.creates, stripe.voids, stripe.expiresCount
 			stripe.mu.Unlock()
 			wantVoids := 1
-			if scenario == "consumed" || scenario == "expired" || scenario == "already_voided" {
+			if scenario == "consumed" || scenario == "expired" || scenario == "already_voided" || scenario == "partial_reconciled" {
 				wantVoids = 0
 			}
 			if scenario == "transient" {
 				wantVoids = 2
+			}
+			if scenario == "partial_reconciled" && expiresCount != 1 {
+				t.Fatalf("expires=%d want=1", expiresCount)
 			}
 			if creates != 1 || voids != wantVoids {
 				t.Fatalf("creates=%d voids=%d want=1/%d", creates, voids, wantVoids)
@@ -307,7 +307,7 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 }
 
 func TestIntegration_BillingRecoveryRevokesHistoricalActivationCredit(t *testing.T) {
-	for _, scenario := range []string{"canceled", "remote_scheduled", "missing_id_paginated", "transient"} {
+	for _, scenario := range []string{"canceled", "remote_scheduled", "missing_id_paginated", "transient", "pending_reservation"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := t.Context()
 			teamID, _, userID := seedTeamAndKeyWithRole(t, "team_owner")
@@ -325,9 +325,26 @@ func TestIntegration_BillingRecoveryRevokesHistoricalActivationCredit(t *testing
                 stripe_activation_user_id,trial_ended_at) VALUES($1,$2,$3,$4,$5,now(),$6,now())`, teamID, customer, sub, status, localID, userID); err != nil {
 				t.Fatal(err)
 			}
+			if scenario == "pending_reservation" {
+				if _, err := testPool.Exec(ctx, `UPDATE team_billing_account
+                    SET stripe_activation_credit_grant_id=NULL, stripe_activation_credit_granted_at=NULL
+                    WHERE team_id=$1`, teamID); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if _, err := testPool.Exec(ctx, `INSERT INTO user_promotion_entitlement(user_id,stripe_redemption_at,stripe_redemption_team_id)
                 VALUES($1,now(),$2) ON CONFLICT(user_id) DO UPDATE SET stripe_redemption_at=now(),stripe_redemption_team_id=$2`, userID, teamID); err != nil {
 				t.Fatal(err)
+			}
+			if scenario == "pending_reservation" {
+				if _, err := testPool.Exec(ctx, `UPDATE user_promotion_entitlement
+                    SET stripe_redemption_at=NULL, stripe_redemption_team_id=NULL
+                    WHERE user_id=$1`, userID); err != nil {
+					t.Fatal(err)
+				}
+				if state := canonicalStripeReserve(t, teamID, userID, "evt_pending_recovery_"+teamID.String()); state != "acquired" {
+					t.Fatalf("pending reservation: %s", state)
+				}
 			}
 			var userBefore string
 			if err := testPool.QueryRow(ctx, `SELECT row_to_json(u)::text FROM user_promotion_entitlement u WHERE user_id=$1`, userID).Scan(&userBefore); err != nil {
@@ -396,8 +413,17 @@ func TestIntegration_BillingRecoveryRevokesHistoricalActivationCredit(t *testing
 				t.Fatalf("completion: %+v %v", complete, err)
 			}
 			var userAfter string
-			if err := testPool.QueryRow(ctx, `SELECT row_to_json(u)::text FROM user_promotion_entitlement u WHERE user_id=$1`, userID).Scan(&userAfter); err != nil || userAfter != userBefore {
+			if err := testPool.QueryRow(ctx, `SELECT row_to_json(u)::text FROM user_promotion_entitlement u WHERE user_id=$1`, userID).Scan(&userAfter); err != nil {
 				t.Fatalf("redemption history changed: %v", err)
+			}
+			if scenario != "pending_reservation" && userAfter != userBefore {
+				t.Fatalf("redemption history changed: before=%s after=%s", userBefore, userAfter)
+			}
+			if scenario == "pending_reservation" {
+				var redeemed bool
+				if err := testPool.QueryRow(ctx, `SELECT stripe_redemption_at IS NOT NULL AND stripe_redemption_reserved_team_id IS NULL FROM user_promotion_entitlement WHERE user_id=$1`, userID).Scan(&redeemed); err != nil || !redeemed {
+					t.Fatalf("pending reservation was not finalized: redeemed=%t err=%v", redeemed, err)
+				}
 			}
 			stripe.mu.Lock()
 			creates, voids := stripe.creates, stripe.voids

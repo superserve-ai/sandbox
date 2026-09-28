@@ -2232,6 +2232,12 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, quer
 	if !strings.EqualFold(obj.Status, "active") && !strings.EqualFold(obj.Status, "trialing") {
 		return nil, nil
 	}
+	// A cancellation boundary must never acquire or contend for a new
+	// activation reservation. Its durable revocation intent is reconciled
+	// independently, including while an earlier activation attempt is pending.
+	if obj.CancelAtPeriodEnd || strings.EqualFold(obj.Status, "canceled") || event.Type == "customer.subscription.deleted" {
+		return nil, nil
+	}
 	// Match the processing guards before reserving. Malformed active events are
 	// intentionally ignored by processing and must not leave a durable fence.
 	if strings.TrimSpace(obj.ID) == "" || event.Created == 0 {
@@ -3075,6 +3081,19 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 					}
 				}
 			}
+		} else if cancellation && !stripeSubscriptionMatchesCurrentAssociation(account, obj.ID) &&
+			(account.StripeActivationCreditGrantID != nil || account.StripeActivationCreditGrantedAt.Valid) {
+			// Legacy activations may have no reservation event ID. Without a
+			// durable subscription-owner witness, do not mark this cancellation
+			// processed: recovery must resolve the historical ownership instead
+			// of silently dropping the revocation.
+			return errors.New("historical Stripe activation cancellation ownership is unresolved")
+		}
+		if cancellation &&
+			(account.StripeActivationCreditGrantID != nil || account.StripeActivationCreditGrantedAt.Valid || account.StripeActivationCreditReservedAt.Valid) {
+			if err := q.RequestStripeActivationCreditRevocation(ctx, account.TeamID); err != nil {
+				return err
+			}
 		}
 		// A lifecycle event can establish the subscription ID before checkout
 		// completion. Matching expiration still wins over that association.
@@ -3102,13 +3121,12 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 					return errStripeCheckoutAssociationPending
 				}
 			}
-			return h.settleStaleStripePromotion(ctx, q, account, event.ID, obj.Customer)
-		}
-		if cancellation &&
-			(account.StripeActivationCreditGrantID != nil || account.StripeActivationCreditGrantedAt.Valid || account.StripeActivationCreditReservedAt.Valid) {
-			if err := q.RequestStripeActivationCreditRevocation(ctx, account.TeamID); err != nil {
-				return err
+			if cancellation && account.StripeActivationCreditReservedAt.Valid {
+				// Keep an unresolved activation reservation intact while the
+				// cancellation continuation discovers and settles its grant.
+				return q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)})
 			}
+			return h.settleStaleStripePromotion(ctx, q, account, event.ID, obj.Customer)
 		}
 		if account.StripeSubscriptionEventAt.Valid {
 			previousAt := account.StripeSubscriptionEventAt.Time.UTC()
@@ -3117,6 +3135,9 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 				orderingStatus = "canceled"
 			}
 			if eventAt.Before(previousAt) || (eventAt.Equal(previousAt) && shouldSkipEqualTimestampStripeSubscription(account, obj.ID, orderingStatus, obj.CancelAtPeriodEnd)) {
+				if cancellation && account.StripeActivationCreditReservedAt.Valid {
+					return q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)})
+				}
 				return h.settleStaleStripePromotion(ctx, q, account, event.ID, obj.Customer)
 			}
 		}
@@ -3136,7 +3157,7 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 		promotionReserved := false
 		promotionReservationAttempted := false
 		var activationUser pgtype.UUID
-		if strings.EqualFold(obj.Status, "active") || strings.EqualFold(obj.Status, "trialing") {
+		if !cancellation && (strings.EqualFold(obj.Status, "active") || strings.EqualFold(obj.Status, "trialing")) {
 			if actor := stripePromotionActorForSubscription(account, obj); actor != uuid.Nil {
 				activationUser = pgtype.UUID{Bytes: actor, Valid: true}
 			}
@@ -3202,6 +3223,9 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 			return wrapPromotionReservationErr(err)
 		}
 		if strings.EqualFold(obj.Status, "active") || strings.EqualFold(obj.Status, "trialing") {
+			if cancellation {
+				return q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)})
+			}
 			if derefString(account.StripeActivationCreditGrantID) == "" && !account.StripeActivationCreditGrantedAt.Valid {
 				if !promotionReserved {
 					if err := q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: account.TeamID, UserID: activationUser, StripeGrantID: ""}); err != nil {
