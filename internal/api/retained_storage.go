@@ -59,8 +59,8 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
     OR EXISTS(SELECT 1 FROM retained_storage_interval i WHERE i.owner_kind='sandbox' AND i.owner_id=s.id AND i.ended_at IS NULL)
     OR EXISTS(SELECT 1 FROM sandbox_storage_interval i WHERE i.sandbox_id=s.id AND i.ended_at IS NULL))
    AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
-  UNION ALL
-  SELECT 'snapshot',id FROM sandbox_snapshot WHERE host_id=$1 AND status='ready' AND ready_at<=$2
+ UNION ALL
+  SELECT 'snapshot',id FROM sandbox_snapshot WHERE host_id=$1 AND status IN ('ready','creating','deleting') AND created_at<=$2
    AND (deleted_at IS NULL OR deleted_at>$2)
  ), supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
  SELECT NOT EXISTS(SELECT 1 FROM expected e LEFT JOIN supplied s USING(kind,id) WHERE s.id IS NULL)

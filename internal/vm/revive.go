@@ -467,6 +467,18 @@ func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath, 
 		inst.RevivalPending = true
 		inst.RevivedDisk = diskPath
 		inst.BackupGeneration = backupGeneration
+		// Revival creates a fresh VMInstance through coldBootFromRootfs. Carry
+		// forward the retained-generation anchors so an upgraded sandbox does
+		// not lose its template disk or layered-memory baseline on the next
+		// pause. These are inventory metadata only; the salvage request still
+		// controls the boot disk/base for this run.
+		if prevRec != nil {
+			inst.SourceSnapshotID = prevRec.SourceSnapshotID
+			inst.BaseMemPath = prevRec.BaseMemPath
+			inst.StrandedOverlays = append([]string(nil), prevRec.StrandedOverlays...)
+			inst.Config.RootfsPath = prevRec.RootfsPath
+			inst.Config.DeltaDir = prevRec.DeltaDir
+		}
 		inst.TeamID = prevRec.TeamID
 		inst.OwnerID = prevRec.OwnerID
 		inst.PreviewAccess = prevRec.PreviewAccess

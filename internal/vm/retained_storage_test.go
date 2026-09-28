@@ -70,6 +70,24 @@ func TestRetainedRecordPathsResolvePinnedTemplateAndLayeredSidecar(t *testing.T)
 	}
 }
 
+func TestRetainedRecordPathsAllowRevivedOverlayWithoutTemplateAnchor(t *testing.T) {
+	root := t.TempDir()
+	rec := VMRecord{
+		ID:          uuid.NewString(),
+		Status:      StatusRunning,
+		RevivedDisk: filepath.Join(root, "salvaged.ext4"),
+		DiskPath:    filepath.Join(root, "overlay.ext4"),
+		BasePath:    filepath.Join(root, "template.ext4"),
+	}
+	paths, err := retainedRecordPaths(rec, root)
+	if err != nil {
+		t.Fatalf("revived overlay rejected without unrelated template delta: %v", err)
+	}
+	if !slices.Contains(paths, rec.DiskPath) || !slices.Contains(paths, rec.BasePath) {
+		t.Fatalf("revived overlay dependencies omitted: %v", paths)
+	}
+}
+
 func TestRetainedInventoryRejectsLifecycleOverlap(t *testing.T) {
 	state, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -94,6 +112,31 @@ func TestRetainedInventoryRejectsLifecycleOverlap(t *testing.T) {
 	unlock()
 	if m.storageMutations.Load() != 0 || m.storageEpoch.Load() <= epoch {
 		t.Fatal("operation release did not advance generation")
+	}
+}
+
+func TestRetainedInventoryRejectsIncompleteSavedSnapshotManifest(t *testing.T) {
+	root := t.TempDir()
+	state, err := OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	snapshotID := uuid.NewString()
+	snapshotDir := filepath.Join(root, SavedSnapshotsDirName, snapshotID)
+	if err := os.MkdirAll(snapshotDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := []byte(`{"version":1,"snapshot_id":"` + snapshotID + `","kind":"mem+fs"}`)
+	if err := os.WriteFile(filepath.Join(snapshotDir, savedSnapshotManifestName), manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{state: state, cfg: ManagerConfig{RunDir: root, SnapshotDir: root}}
+	_, err = m.retainedStorageInventory(t.Context(), func(*os.File, int) ([]retainedstorage.Extent, string, error) {
+		return []retainedstorage.Extent{}, "generation", nil
+	})
+	if err == nil {
+		t.Fatal("incomplete saved snapshot manifest was accepted")
 	}
 }
 
@@ -148,12 +191,15 @@ func TestRetainedPausedUpgradeDependencies(t *testing.T) {
 	if err := json.Unmarshal(raw, &rewritten); err != nil {
 		t.Fatal(err)
 	}
-	paths, err := retainedRecordPaths(rewritten, root)
+	paths, resolved, err := resolveRetainedRecordPaths(rewritten, root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Contains(paths, delta) || !slices.Contains(paths, memory) || !slices.Contains(paths, base) {
 		t.Fatalf("lost pinned generation: %v", paths)
+	}
+	if resolved.DeltaDir != generation {
+		t.Fatalf("resolved generation anchor = %q, want %q", resolved.DeltaDir, generation)
 	}
 	// A full pause can erase the last template-generation anchor in old
 	// records. Neither a mutable latest build nor the sandbox image proves it.

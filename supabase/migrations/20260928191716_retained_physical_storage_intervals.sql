@@ -249,12 +249,17 @@ AS $$
               FROM sandbox s
               WHERE s.team_id = p_team_id
                 AND s.host_id = r.host_id
-                AND s.status <> 'failed'
+                AND (s.status <> 'failed'
+                     OR EXISTS (SELECT 1 FROM retained_storage_interval i
+                                WHERE i.owner_kind='sandbox' AND i.owner_id=s.id AND i.ended_at IS NULL)
+                     OR EXISTS (SELECT 1 FROM sandbox_storage_interval i
+                                WHERE i.sandbox_id=s.id AND i.ended_at IS NULL))
                 AND s.created_at <= r.received_at
                 AND (s.destroyed_at IS NULL OR s.destroyed_at > r.received_at)
               UNION ALL SELECT 1 FROM sandbox_snapshot s
               WHERE s.team_id=p_team_id AND s.host_id=r.host_id
-                AND s.ready_at<=r.received_at
+                AND s.status IN ('ready','creating','deleting')
+                AND s.created_at<=r.received_at
                 AND (s.deleted_at IS NULL OR s.deleted_at>r.received_at)
           )
         UNION ALL
@@ -266,12 +271,17 @@ AS $$
               FROM sandbox s
               WHERE s.team_id = p_team_id
                 AND s.host_id = legacy.host_id
-                AND s.status <> 'failed'
+                AND (s.status <> 'failed'
+                     OR EXISTS (SELECT 1 FROM retained_storage_interval i
+                                WHERE i.owner_kind='sandbox' AND i.owner_id=s.id AND i.ended_at IS NULL)
+                     OR EXISTS (SELECT 1 FROM sandbox_storage_interval i
+                                WHERE i.sandbox_id=s.id AND i.ended_at IS NULL))
                 AND s.created_at <= legacy.received_at
                 AND (s.destroyed_at IS NULL OR s.destroyed_at > legacy.received_at)
               UNION ALL SELECT 1 FROM sandbox_snapshot s
               WHERE s.team_id=p_team_id AND s.host_id=legacy.host_id
-                AND s.ready_at<=legacy.received_at
+                AND s.status IN ('ready','creating','deleting')
+                AND s.created_at<=legacy.received_at
                 AND (s.deleted_at IS NULL OR s.deleted_at>legacy.received_at)
           )
     )

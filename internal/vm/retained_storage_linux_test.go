@@ -303,6 +303,15 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 	if got := retainedTestUnion(snapshotOwner.Extents); got < 4*4096 {
 		t.Fatalf("mem+fs snapshot omitted retained artifacts: %d", got)
 	}
+	if err := os.WriteFile(filepath.Join(snapshotDir, savedSnapshotManifestName), []byte(`{"version":1,"snapshot_id":"`+snapshotID+`","kind":"mem+fs"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.RetainedStorageInventory(t.Context()); err == nil {
+		t.Fatal("incomplete snapshot manifest was accepted")
+	}
+	if err := os.WriteFile(filepath.Join(snapshotDir, savedSnapshotManifestName), man, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Remove(rec.MemFilePath); err != nil {
 		t.Fatal(err)
 	}

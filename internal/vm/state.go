@@ -171,7 +171,9 @@ type VMRecord struct {
 	// RevivedDisk records the resolved salvage path a completed revival
 	// booted from: the idempotency witness that lets a retry of the same
 	// request (a lost RPC response, a failed post-commit injection)
-	// recognize the live VM as its own completed work.
+	// recognize the live VM as its own completed work. Retained inventory also
+	// uses its presence as revival provenance when legacy template anchors are
+	// unavailable.
 	RevivedDisk string `json:"revived_disk,omitempty"`
 	// BackupGeneration names the backup a backup-backed resume booted from,
 	// so a retry of that resume recognizes the live VM as its own.

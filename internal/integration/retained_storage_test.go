@@ -163,6 +163,14 @@ func TestRetainedStorageReceiptReplacementAndLegacyIsolation(t *testing.T) {
 	owner.Extents = []retainedstorage.Extent{}
 	post(zero, []retainedstorage.Owner{owner}, http.StatusCreated)
 	waitStorageReportState(t, zero, "processed")
+	var zeroGeneration string
+	var zeroExtents []byte
+	if err := testPool.QueryRow(ctx, `SELECT generation, extents FROM retained_storage_interval WHERE owner_id=$1 AND ended_at IS NULL`, f.sandboxID).Scan(&zeroGeneration, &zeroExtents); err != nil {
+		t.Fatal(err)
+	}
+	if zeroGeneration != owner.Generation || string(zeroExtents) != "[]" {
+		t.Fatalf("explicit zero interval = generation %q extents %s", zeroGeneration, zeroExtents)
+	}
 	if _, err := testQueries.DestroySandbox(ctx, storageRaceDestroyParams(t, f)); err != nil {
 		t.Fatal(err)
 	}

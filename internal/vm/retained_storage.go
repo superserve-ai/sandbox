@@ -49,12 +49,16 @@ func (s *StateStore) retainedRecords() ([]VMRecord, error) {
 	return records, err
 }
 
-func retainedRecordPaths(rec VMRecord, runDir string) ([]string, error) {
+// resolveRetainedRecordPaths returns both the files to measure and any
+// generation anchors recovered from legacy records.  The latter are written
+// back by the background inventory pass so a later pause cannot erase the
+// only durable reference to the template generation it retained.
+func resolveRetainedRecordPaths(rec VMRecord, runDir string) ([]string, VMRecord, error) {
 	if rec.TeardownPending != "" || rec.RevivalPending || rec.WakePending || rec.Unverified {
-		return nil, fmt.Errorf("retained generation is transitioning")
+		return nil, rec, fmt.Errorf("retained generation is transitioning")
 	}
 	if rec.Status == StatusPaused && (rec.SnapshotPath == "" || rec.MemFilePath == "") {
-		return nil, fmt.Errorf("paused memory dependencies are unknown")
+		return nil, rec, fmt.Errorf("paused memory dependencies are unknown")
 	}
 	disk := rec.DiskPath
 	if disk == "" {
@@ -71,18 +75,23 @@ func retainedRecordPaths(rec VMRecord, runDir string) ([]string, error) {
 		// the previous accepted quantity remains in force.
 		if sidecar, ok := readLayeredBase(rec.MemFilePath); ok {
 			if baseMem != "" && filepath.Clean(baseMem) != filepath.Clean(sidecar) {
-				return nil, fmt.Errorf("layered memory base changed during inventory")
+				return nil, rec, fmt.Errorf("layered memory base changed during inventory")
 			}
 			baseMem = sidecar
 		} else if isOverlayMemFile(rec.MemFilePath) && baseMem == "" {
-			return nil, fmt.Errorf("layered memory base is unknown")
+			return nil, rec, fmt.Errorf("layered memory base is unknown")
 		}
 	}
 	// A pause replaces SnapshotPath with the sandbox's own image. For older
 	// records the layered base still pins the immutable template generation;
 	// its build metadata, not the latest template directory, names the disk.
 	deltaDir, rootfs := rec.DeltaDir, rec.RootfsPath
-	if rec.SourceSnapshotID == "" && ((rec.BasePath != "" && deltaDir == "") || (rec.BasePath == "" && rootfs == "")) {
+	// A revived salvage is an explicitly retained allocation when
+	// no template generation anchor survived the old record.  Its durable
+	// BasePath (when present) is still measured, but requiring an unrelated
+	// template delta would reject the whole host after a successful revival.
+	revivedWithoutTemplate := rec.RevivedDisk != "" && rec.BasePath != "" && deltaDir == ""
+	if rec.SourceSnapshotID == "" && !revivedWithoutTemplate && ((rec.BasePath != "" && deltaDir == "") || (rec.BasePath == "" && rootfs == "")) {
 		resolved := false
 		for _, anchor := range []string{baseMem, rec.SnapshotPath} {
 			if anchor == "" {
@@ -131,7 +140,7 @@ func retainedRecordPaths(rec VMRecord, runDir string) ([]string, error) {
 			break
 		}
 		if !resolved {
-			return nil, fmt.Errorf("retained template generation dependencies are unknown")
+			return nil, rec, fmt.Errorf("retained template generation dependencies are unknown")
 		}
 	}
 	delta := ""
@@ -146,7 +155,18 @@ func retainedRecordPaths(rec VMRecord, runDir string) ([]string, error) {
 		paths = append(paths, delta)
 	}
 	paths = append(paths, rec.StrandedOverlays...)
-	return paths, nil
+	// Preserve every recovered anchor, including a sidecar-derived memory base.
+	// These fields are intentionally metadata-only; lifecycle code continues to
+	// use the current pause paths.
+	rec.BaseMemPath = baseMem
+	rec.RootfsPath = rootfs
+	rec.DeltaDir = deltaDir
+	return paths, rec, nil
+}
+
+func retainedRecordPaths(rec VMRecord, runDir string) ([]string, error) {
+	paths, _, err := resolveRetainedRecordPaths(rec, runDir)
+	return paths, err
 }
 
 type retainedFileObservation struct {
@@ -160,6 +180,49 @@ func (m *Manager) RetainedStorageInventory(ctx context.Context) (*retainedstorag
 	return m.retainedStorageInventory(ctx, retainedFileExtents)
 }
 
+// rememberRetainedDependencies persists anchors recovered from a legacy
+// record.  Inventory runs off the lifecycle hot path, so a small conditional
+// record write here is preferable to allowing the next full pause to erase
+// the generation identity and freeze host-wide accounting.
+func (m *Manager) rememberRetainedDependencies(original, resolved VMRecord) error {
+	if original.BaseMemPath == resolved.BaseMemPath && original.RootfsPath == resolved.RootfsPath && original.DeltaDir == resolved.DeltaDir {
+		return nil
+	}
+	if m.state == nil {
+		return nil
+	}
+	m.mu.RLock()
+	inst := m.vms[original.ID]
+	m.mu.RUnlock()
+	if inst != nil {
+		inst.mu.Lock()
+		current := toRecordLocked(inst)
+		if current.BaseMemPath != original.BaseMemPath || current.RootfsPath != original.RootfsPath || current.DeltaDir != original.DeltaDir {
+			inst.mu.Unlock()
+			return nil
+		}
+		inst.BaseMemPath = resolved.BaseMemPath
+		inst.Config.RootfsPath = resolved.RootfsPath
+		inst.Config.DeltaDir = resolved.DeltaDir
+		updated := toRecordLocked(inst)
+		inst.mu.Unlock()
+		_, err := m.state.PutIfPresent(updated)
+		return err
+	}
+	current, err := m.state.Get(original.ID)
+	if err != nil || current == nil {
+		return err
+	}
+	if current.BaseMemPath != original.BaseMemPath || current.RootfsPath != original.RootfsPath || current.DeltaDir != original.DeltaDir {
+		return nil
+	}
+	current.BaseMemPath = resolved.BaseMemPath
+	current.RootfsPath = resolved.RootfsPath
+	current.DeltaDir = resolved.DeltaDir
+	_, err = m.state.PutIfPresent(*current)
+	return err
+}
+
 func (m *Manager) retainedStorageInventory(ctx context.Context, measure func(*os.File, int) ([]retainedstorage.Extent, string, error)) (*retainedstorage.Inventory, error) {
 	epoch := m.storageEpoch.Load()
 	if m.storageMutations.Load() != 0 || m.state == nil {
@@ -171,6 +234,7 @@ func (m *Manager) retainedStorageInventory(ctx context.Context, measure func(*os
 	}
 	inv := &retainedstorage.Inventory{Version: retainedstorage.Version, Owners: make([]retainedstorage.Owner, 0)}
 	observations := make([]retainedFileObservation, 0)
+	dependencyUpdates := make([]struct{ original, resolved VMRecord }, 0)
 	remaining := retainedstorage.MaxExtents
 	add := func(kind, id string, paths []string) error {
 		if len(inv.Owners) >= retainedstorage.MaxOwners {
@@ -226,9 +290,12 @@ func (m *Manager) retainedStorageInventory(ctx context.Context, measure func(*os
 		if _, err := uuid.Parse(rec.ID); err != nil {
 			continue
 		}
-		paths, err := retainedRecordPaths(rec, m.cfg.RunDir)
+		paths, resolved, err := resolveRetainedRecordPaths(rec, m.cfg.RunDir)
 		if err != nil {
 			return nil, err
+		}
+		if rec.BaseMemPath != resolved.BaseMemPath || rec.RootfsPath != resolved.RootfsPath || rec.DeltaDir != resolved.DeltaDir {
+			dependencyUpdates = append(dependencyUpdates, struct{ original, resolved VMRecord }{rec, resolved})
 		}
 		if err := add("sandbox", rec.ID, paths); err != nil {
 			return nil, err
@@ -294,6 +361,14 @@ func (m *Manager) retainedStorageInventory(ctx context.Context, measure func(*os
 	}
 	if !reflect.DeepEqual(records, after) || m.storageMutations.Load() != 0 || m.storageEpoch.Load() != epoch {
 		return nil, fmt.Errorf("retained generation changed during inventory")
+	}
+	for _, update := range dependencyUpdates {
+		if err := m.rememberRetainedDependencies(update.original, update.resolved); err != nil {
+			return nil, err
+		}
+	}
+	if m.storageMutations.Load() != 0 || m.storageEpoch.Load() != epoch {
+		return nil, fmt.Errorf("retained generation changed while persisting dependency anchors")
 	}
 	sort.Slice(inv.Owners, func(i, j int) bool { return inv.Owners[i].Kind+inv.Owners[i].ID < inv.Owners[j].Kind+inv.Owners[j].ID })
 	return inv, inv.Validate()
