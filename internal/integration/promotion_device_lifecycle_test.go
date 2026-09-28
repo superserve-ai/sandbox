@@ -1333,3 +1333,169 @@ func TestIntegration_PendingStripeDeviceReservationSurvivesPolicyChange(t *testi
 	}
 	rolloutExec(t, region, `SELECT record_stripe_promotion_device_grant($1,$2)`, otherTeam, other)
 }
+
+func TestIntegration_LegacyStripeHistorySurvivesProfileDeletion(t *testing.T) {
+	ctx := context.Background()
+	region := promotionIsolatedDatabase(t, true)
+	owner, recipient, ownerTeam, recipientTeam := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	fingerprint := "visitor-" + uuid.NewString()
+	for _, user := range []uuid.UUID{owner, recipient} {
+		rolloutExec(t, region, `INSERT INTO profile(id,email) VALUES($1,$2)`, user, user.String()+"@example.com")
+	}
+	for _, team := range []uuid.UUID{ownerTeam, recipientTeam} {
+		rolloutExec(t, region, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "promotion-"+team.String())
+		rolloutExec(t, region, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team)
+	}
+	// Execute the pre-device finalizer, then its historical grant import. This
+	// must leave no device grant to mask a missing retained-history check.
+	migration, err := os.ReadFile("../../supabase/migrations/20260925195248_canonical_stripe_promotion_fences.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(migration), "CREATE OR REPLACE FUNCTION finalize_stripe_promotion(")
+	end := strings.Index(string(migration), "CREATE OR REPLACE FUNCTION activate_team_billing(")
+	if start < 0 || end <= start {
+		t.Fatal("pre-device Stripe finalizer not found")
+	}
+	legacyFinalizer := strings.Replace(string(migration[start:end]), "FUNCTION finalize_stripe_promotion(", "FUNCTION test_finalize_stripe_without_device(", 1)
+	rolloutExec(t, region, legacyFinalizer)
+	var state string
+	if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state_without_device($1,$2,$3,NULL,NULL,false)`,
+		recipientTeam, recipient, "evt-"+uuid.NewString()).Scan(&state); err != nil || state != "acquired" {
+		t.Fatalf("pre-device reservation: %q, %v", state, err)
+	}
+	grantID := "grant-" + uuid.NewString()
+	rolloutExec(t, region, `SELECT test_finalize_stripe_without_device($1,$2,$3)`, recipientTeam, recipient, grantID)
+	migration, err = os.ReadFile("../../supabase/migrations/20260925195235_canonical_promotion_identity.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start = strings.Index(string(migration), "INSERT INTO promotion_identity_history(history_key, promotion, user_id, team_id, claimed_at, grant_state)")
+	end = strings.Index(string(migration), "CREATE FUNCTION reconcile_promotion_identity_history(")
+	if start < 0 || end <= start {
+		t.Fatal("historical Stripe grant import not found")
+	}
+	rolloutExec(t, region, string(migration[start:end]))
+	rolloutExec(t, region, `SELECT reconcile_promotion_identity_history('stripe-user:' || $1::text,
+		ARRAY[stripe_activation_identity_key], 'synthetic pre-device checkout evidence', 'granted')
+		FROM team_billing_account WHERE team_id=$2`, recipient, recipientTeam)
+	var legacyOnly bool
+	if err := region.QueryRow(ctx, `SELECT
+		EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$1 AND stripe_redemption_at IS NOT NULL)
+		AND EXISTS(SELECT 1 FROM promotion_identity_history WHERE user_id=$1 AND promotion='stripe' AND grant_state='granted')
+		AND NOT EXISTS(SELECT 1 FROM promotion_device_grant WHERE user_id=$1)
+		AND NOT EXISTS(SELECT 1 FROM promotion_signup_device_evidence WHERE user_id=$1)`, recipient).Scan(&legacyOnly); err != nil || !legacyOnly {
+		t.Fatalf("expected pre-device consumption: %t, %v", legacyOnly, err)
+	}
+	for i, user := range []uuid.UUID{owner, recipient} {
+		want := "owner"
+		if i == 1 {
+			want = "owner_conflict"
+		}
+		if err := region.QueryRow(ctx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+			user, uuid.New(), "event-"+uuid.NewString(), fingerprint).Scan(&state); err != nil || state != want {
+			t.Fatalf("late registration: %q, want %q: %v", state, want, err)
+		}
+	}
+	var distinctIdentities bool
+	if err := region.QueryRow(ctx, `SELECT resolve_promotion_identity($1) <> resolve_promotion_identity($2)`, owner, recipient).
+		Scan(&distinctIdentities); err != nil || !distinctIdentities {
+		t.Fatalf("fixture needs different canonical identities: %t, %v", distinctIdentities, err)
+	}
+	// Detach the optional ledger attribution so profile deletion can cascade
+	// the entitlement while retaining the original amount and balance.
+	rolloutExec(t, region, `UPDATE team_credit_grant SET created_by=NULL WHERE team_id=$1`, recipientTeam)
+	rolloutExec(t, region, `DELETE FROM profile WHERE id=$1`, recipient)
+	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
+	if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,$3,NULL,NULL,false)`,
+		ownerTeam, owner, "evt-"+uuid.NewString()).Scan(&state); err != nil || state != "device_already_redeemed" {
+		t.Fatalf("legacy device consumption reopened: %q, %v", state, err)
+	}
+	var retained, untouched, denied bool
+	if err := region.QueryRow(ctx, `SELECT
+		NOT EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$1)
+		AND NOT EXISTS(SELECT 1 FROM promotion_device_grant WHERE user_id=$1)
+		AND EXISTS(SELECT 1 FROM promotion_identity_history WHERE user_id=$1 AND promotion='stripe' AND grant_state='granted')
+		AND EXISTS(SELECT 1 FROM promotion_signup_device_evidence WHERE user_id=$1 AND fingerprint=$2),
+		(SELECT count(*)=1 AND sum(amount_usd)=95 AND sum(remaining_usd)=0 FROM team_credit_grant WHERE team_id=$3)
+		AND EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$3 AND stripe_activation_credit_grant_id=$4),
+		NOT EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$5)
+		AND NOT EXISTS(SELECT 1 FROM team_credit_grant WHERE team_id=$6)
+		AND NOT EXISTS(SELECT 1 FROM promotion_device_grant WHERE user_id=$5)
+		AND EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$6 AND stripe_activation_credit_reserved_at IS NULL)
+		AND EXISTS(SELECT 1 FROM promotion_device_owner WHERE fingerprint=$2 AND user_id=$5)`,
+		recipient, fingerprint, recipientTeam, grantID, owner, ownerTeam).Scan(&retained, &untouched, &denied); err != nil || !retained || !untouched || !denied {
+		t.Fatalf("legacy deletion: retained=%t balance=%t denied=%t err=%v", retained, untouched, denied, err)
+	}
+}
+
+func TestIntegration_PostGrantDeviceReplacementPreservesConsumption(t *testing.T) {
+	ctx := context.Background()
+	auth := promotionIsolatedDatabase(t, false)
+	region := promotionIsolatedDatabase(t, true)
+	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
+	user := uuid.New()
+	original := promotionVerifiedSignup(t, auth, user, "visitor-"+uuid.NewString())
+	if got := promotionPublishOriginal(t, auth, region, user, original); got != "owner" {
+		t.Fatalf("original registration: %q", got)
+	}
+	signupTeam, outcome := promotionClaimSignup(t, region, user)
+	if outcome != "granted" {
+		t.Fatalf("initial signup: %q", outcome)
+	}
+	billingTeam := uuid.New()
+	rolloutExec(t, region, `INSERT INTO team(id,name) VALUES($1,$2)`, billingTeam, "promotion-"+billingTeam.String())
+	rolloutExec(t, region, `INSERT INTO team_billing_account(team_id) VALUES($1)`, billingTeam)
+	var state string
+	if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,$3,NULL,NULL,false)`,
+		billingTeam, user, "evt-"+uuid.NewString()).Scan(&state); err != nil || state != "acquired" {
+		t.Fatalf("initial Stripe: %q, %v", state, err)
+	}
+	rolloutExec(t, region, `SELECT finalize_stripe_promotion($1,$2,$3)`, billingTeam, user, "grant-"+uuid.NewString())
+
+	var attempt, challenge uuid.UUID
+	newEvent, newFingerprint := "event-"+uuid.NewString(), "visitor-"+uuid.NewString()
+	promotionAuthRole(t, auth, "promotion_evidence_proxy", func(tx pgx.Tx) {
+		if err := tx.QueryRow(ctx, `SELECT * FROM create_signup_device_attempt()`).Scan(&attempt, &challenge); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.QueryRow(ctx, `SELECT verify_signup_device_attempt($1,$2,$3,$4,clock_timestamp())`, attempt, challenge, newEvent, newFingerprint).
+			Scan(&state); err != nil || state != "verified" {
+			t.Fatalf("new device verification: %q, %v", state, err)
+		}
+		if err := tx.QueryRow(ctx, `SELECT bind_signup_device_account($1,$2)`, attempt, user).
+			Scan(&state); err != nil || state != "first_evidence_retained" {
+			t.Fatalf("post-grant replacement: %q, %v", state, err)
+		}
+	})
+	if _, err := region.Exec(ctx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`, user, attempt, newEvent, newFingerprint); err == nil {
+		t.Fatal("regional post-grant evidence replacement was accepted")
+	}
+	if got := promotionPublishOriginal(t, auth, region, user, original); got != "owner" {
+		t.Fatalf("returning user registration: %q", got)
+	}
+	repeatTeam, outcome := promotionClaimSignup(t, region, user)
+	if outcome != "already_claimed" {
+		t.Fatalf("repeat signup: %q", outcome)
+	}
+	rolloutExec(t, region, `INSERT INTO team_billing_account(team_id) VALUES($1)`, repeatTeam)
+	if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,$3,NULL,NULL,false)`,
+		repeatTeam, user, "evt-"+uuid.NewString()).Scan(&state); err != nil || state != "user_already_redeemed" {
+		t.Fatalf("repeat Stripe: %q, %v", state, err)
+	}
+	var evidenceRetained, grantsRetained, noRepeat bool
+	if err := region.QueryRow(ctx, `SELECT
+		EXISTS(SELECT 1 FROM promotion_signup_device_evidence WHERE user_id=$1 AND source_attempt_id=$2 AND source_event_id=$3 AND fingerprint=$4)
+		AND EXISTS(SELECT 1 FROM promotion_device_owner WHERE fingerprint=$4 AND user_id=$1)
+		AND NOT EXISTS(SELECT 1 FROM promotion_device_owner WHERE fingerprint=$5),
+		(SELECT count(*)=2 AND bool_and(fingerprint=$4) FROM promotion_device_grant WHERE user_id=$1)
+		AND (SELECT count(*)=2 AND sum(amount_usd)=100 AND sum(remaining_usd)=5 FROM team_credit_grant WHERE team_id=ANY($6::uuid[])),
+		NOT EXISTS(SELECT 1 FROM team_credit_grant WHERE team_id=$7)
+		AND EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$1 AND signup_trial_claimed_at IS NOT NULL
+			AND stripe_redemption_at IS NOT NULL AND stripe_redemption_reserved_team_id IS NULL)
+		AND EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$7 AND stripe_activation_credit_reserved_at IS NULL)`,
+		user, original.attempt, original.event, original.fingerprint, newFingerprint, []uuid.UUID{signupTeam, billingTeam}, repeatTeam).
+		Scan(&evidenceRetained, &grantsRetained, &noRepeat); err != nil || !evidenceRetained || !grantsRetained || !noRepeat {
+		t.Fatalf("replacement: evidence=%t grants=%t no_repeat=%t err=%v", evidenceRetained, grantsRetained, noRepeat, err)
+	}
+}
