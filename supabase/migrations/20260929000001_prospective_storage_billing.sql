@@ -228,9 +228,13 @@ BEGIN
         RETURN NEW;
     END IF;
     IF TG_TABLE_NAME = 'billing_export_measurement' THEN
-        NEW.storage_mib_seconds := billable_storage_mib_seconds(NEW.team_id, NEW.hour_start, LEAST(NEW.hour_start + interval '1 hour', NEW.period_end), false);
+        NEW.storage_mib_seconds := billable_storage_mib_seconds(NEW.team_id, GREATEST(NEW.hour_start, NEW.period_start), LEAST(NEW.hour_start + interval '1 hour', NEW.period_end), false);
     ELSE
-        NEW.storage_mib_seconds := billable_storage_mib_seconds(NEW.team_id, NEW.period_start, NEW.period_end, false);
+        -- Only consumed hour contributions belong in the accumulator. Recomputing
+        -- raw usage through now() would exceed its completed-hour coverage.
+        SELECT COALESCE(SUM(m.storage_mib_seconds), 0) INTO NEW.storage_mib_seconds
+        FROM billing_export_measurement m
+        WHERE m.team_id=NEW.team_id AND m.period_start=NEW.period_start AND m.period_end=NEW.period_end;
     END IF;
     RETURN NEW;
 END;

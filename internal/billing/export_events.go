@@ -39,10 +39,12 @@ type ExportPayload struct {
 }
 
 type ExportEvent struct {
-	ID           uuid.UUID `json:"id"`
-	AllocationID uuid.UUID `json:"allocation_id"`
-	ResourceType string    `json:"resource_type"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID                  uuid.UUID `json:"id"`
+	AllocationID        uuid.UUID `json:"allocation_id"`
+	ResourceType        string    `json:"resource_type"`
+	CreatedAt           time.Time `json:"created_at"`
+	AllocationCreatedAt time.Time `json:"-"`
+	MeasuredThrough     time.Time `json:"-"`
 	ExportPayload
 	Status     string    `json:"status"`
 	LeaseToken uuid.UUID `json:"-"`
@@ -368,6 +370,8 @@ func (s ExportStore) Claim(ctx context.Context, p ExportPeriod) (*ExportEvent, e
 	if err != nil {
 		return nil, err
 	}
+	// Replacements retain the original allocation provenance. Provider minute
+	// attribution can precede activation even when all measured usage follows it.
 	token := uuid.New()
 	row := tx.QueryRow(ctx, `WITH candidate AS (
         SELECT e.id FROM billing_export_event e JOIN billing_export_allocation a ON a.id=e.allocation_id
@@ -378,19 +382,21 @@ func (s ExportStore) Claim(ctx context.Context, p ExportPeriod) (*ExportEvent, e
         AND (e.lease_until IS NULL OR e.lease_until<=now())
         AND feature_enabled('billing_export_enabled',a.team_id)
         AND (a.resource_type<>'storage' OR (
-            storage_billing_activated(a.team_id,a.period_end)
-            AND NOT EXISTS (
+            EXISTS (
                 SELECT 1 FROM team_storage_billing_activation sa
-                WHERE sa.team_id=a.team_id AND to_timestamp(e.event_timestamp) < sa.effective_at
+                WHERE sa.team_id=a.team_id AND a.created_at >= sa.effective_at
+                  AND a.measured_through > sa.effective_at
             )
         ))
         ORDER BY e.created_at,e.id LIMIT 1 FOR UPDATE OF e SKIP LOCKED)
         UPDATE billing_export_event e SET status='uncertain',first_attempt_at=COALESCE(first_attempt_at,now()),
           lease_token=$4,lease_until=now()+interval '2 minutes',attempt_count=attempt_count+1,updated_at=now()
         FROM candidate c WHERE e.id=c.id
-        RETURNING e.id,e.allocation_id,e.identifier,e.idempotency_key,e.event_name,e.customer_id,e.quantity_payload,e.event_timestamp,e.status,e.created_at,(SELECT resource_type FROM billing_export_allocation WHERE id=e.allocation_id)`, p.TeamID, p.Start, p.End, token, immutable)
+        RETURNING e.id,e.allocation_id,e.identifier,e.idempotency_key,e.event_name,e.customer_id,e.quantity_payload,e.event_timestamp,e.status,e.created_at,(SELECT resource_type FROM billing_export_allocation WHERE id=e.allocation_id),
+          (SELECT created_at FROM billing_export_allocation WHERE id=e.allocation_id),
+          (SELECT measured_through FROM billing_export_allocation WHERE id=e.allocation_id)`, p.TeamID, p.Start, p.End, token, immutable)
 	var e ExportEvent
-	err = row.Scan(&e.ID, &e.AllocationID, &e.Identifier, &e.IdempotencyKey, &e.EventName, &e.CustomerID, &e.Quantity, &e.Timestamp, &e.Status, &e.CreatedAt, &e.ResourceType)
+	err = row.Scan(&e.ID, &e.AllocationID, &e.Identifier, &e.IdempotencyKey, &e.EventName, &e.CustomerID, &e.Quantity, &e.Timestamp, &e.Status, &e.CreatedAt, &e.ResourceType, &e.AllocationCreatedAt, &e.MeasuredThrough)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, tx.Commit(ctx)
 	}
@@ -424,12 +430,14 @@ func (s ExportStore) Acknowledge(ctx context.Context, e ExportEvent, submitErr e
 	return err
 }
 
-// Defer returns a definitive preflight failure to the pending queue. No
-// provider request was made, so the idempotency retry window must not start.
+// Defer undoes only this preflight attempt. Earlier attempts may have reached
+// the provider, so their uncertainty and original retry deadline must survive.
 func (s ExportStore) Defer(ctx context.Context, e ExportEvent, deferErr error) error {
 	message := deferErr.Error()
 	tag, err := s.Pool.Exec(ctx, `UPDATE billing_export_event
-        SET status='pending', first_attempt_at=NULL, attempt_count=GREATEST(attempt_count-1,0),
+        SET status=CASE WHEN attempt_count=1 THEN 'pending' ELSE 'uncertain' END,
+            first_attempt_at=CASE WHEN attempt_count=1 THEN NULL ELSE first_attempt_at END,
+            attempt_count=GREATEST(attempt_count-1,0),
             next_attempt_at=now()+interval '5 minutes', lease_token=NULL, lease_until=NULL,
             last_error=$3, updated_at=now()
         WHERE id=$1 AND lease_token=$2 AND active AND status='uncertain'`, e.ID, e.LeaseToken, message)

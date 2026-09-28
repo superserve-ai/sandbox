@@ -49,6 +49,9 @@ func TestStorageSubscriptionReadiness(t *testing.T) {
 		{"wrong rate", 1, false, "canonical"}, {"anchor changed", 0, true, "anchor changed"},
 		{"price scoped credit missing storage", 1, false, "price scope"},
 		{"price scoped credit includes storage", 1, false, ""},
+		{"metered startup credit", 1, false, ""},
+		{"expired price scoped credit missing storage", 1, false, ""},
+		{"voided price scoped credit missing storage", 1, false, ""},
 		{"paginated duplicate", 2, false, "has 2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -117,14 +120,21 @@ func TestStorageSubscriptionReadiness(t *testing.T) {
 					}
 				case "/v1/billing/credit_grants":
 					scope := map[string]any{"price_type": "metered"}
-					if strings.HasPrefix(tc.name, "price scoped") {
+					if strings.Contains(tc.name, "price scoped") {
 						id := "price_cpu"
 						if strings.Contains(tc.name, "includes") {
 							id = "price_storage"
 						}
 						scope = map[string]any{"prices": []any{map[string]string{"id": id}}}
 					}
-					out = map[string]any{"data": []any{map[string]any{"id": "cg_example", "applicability_config": map[string]any{"scope": scope}}}, "has_more": false}
+					grant := map[string]any{"id": "cg_example", "applicability_config": map[string]any{"scope": scope}}
+					if strings.HasPrefix(tc.name, "expired") {
+						grant["expires_at"] = 1
+					}
+					if strings.HasPrefix(tc.name, "voided") {
+						grant["voided_at"] = 1
+					}
+					out = map[string]any{"data": []any{grant}, "has_more": false}
 				default:
 					t.Errorf("unexpected request %s", r.URL)
 					http.Error(w, "unexpected", 404)

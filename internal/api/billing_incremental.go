@@ -483,7 +483,7 @@ func (h *Handlers) submitIncrementalEvents(ctx context.Context, p billing.Export
 			cancel()
 			return err
 		}
-		submitErr := h.reportBillingMeterEvent(submitCtx, p.TeamID, event.ResourceType, event.CreatedAt, event.Timestamp, frozen, StripeReportMeterEventParams{Identifier: event.Identifier, IdempotencyKey: event.IdempotencyKey,
+		submitErr := h.reportBillingMeterEvent(submitCtx, p.TeamID, event.ResourceType, event.AllocationCreatedAt, event.MeasuredThrough, frozen, StripeReportMeterEventParams{Identifier: event.Identifier, IdempotencyKey: event.IdempotencyKey,
 			EventName: event.EventName, CustomerID: event.CustomerID, Value: event.Quantity, Timestamp: event.Timestamp})
 		cancel()
 		var readinessErr *storageReadinessError

@@ -29,8 +29,8 @@ type storageSubscriptionClient interface {
 }
 
 // storageReadinessError means Stripe was not contacted with a meter event.
-// Callers keep the durable export event pending so a prolonged configuration
-// hold cannot consume the provider's retry window.
+// A hold does not start a retry window for a never-submitted event; any
+// uncertainty from earlier submissions remains authoritative.
 type storageReadinessError struct{ err error }
 
 func (e *storageReadinessError) Error() string { return e.err.Error() }
@@ -347,17 +347,17 @@ func (h *Handlers) ReconcileStorageBilling(c *gin.Context) {
 			// activation race with mixed-version workers without touching frozen
 			// history or reservation identities.
 			_, err = tx.Exec(ctx, `
-                UPDATE billing_export_usage u SET storage_mib_seconds = billable_storage_mib_seconds(u.team_id,u.period_start,u.period_end,false)
-                WHERE u.team_id=$1 AND u.period_end > (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)
-                  AND NOT EXISTS (SELECT 1 FROM team_billing_period bp WHERE bp.team_id=u.team_id AND bp.period_start=u.period_start AND bp.period_end=u.period_end
+                UPDATE billing_export_measurement m SET storage_mib_seconds = billable_storage_mib_seconds(m.team_id,GREATEST(m.hour_start,m.period_start),LEAST(m.hour_start+interval '1 hour',m.period_end),false)
+                WHERE m.team_id=$1 AND m.hour_start+interval '1 hour' > (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)
+                  AND NOT EXISTS (SELECT 1 FROM team_billing_period bp WHERE bp.team_id=m.team_id AND bp.period_start=m.period_start AND bp.period_end=m.period_end
                     AND (bp.finalized_at IS NOT NULL OR bp.exported_at IS NOT NULL OR bp.status IN ('exporting','exported','finalized')))`, team)
 			if err != nil {
 				return err
 			}
 			_, err = tx.Exec(ctx, `
-                UPDATE billing_export_measurement m SET storage_mib_seconds = billable_storage_mib_seconds(m.team_id,m.hour_start,LEAST(m.hour_start+interval '1 hour',m.period_end),false)
-                WHERE m.team_id=$1 AND m.hour_start+interval '1 hour' > (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)
-                  AND NOT EXISTS (SELECT 1 FROM team_billing_period bp WHERE bp.team_id=m.team_id AND bp.period_start=m.period_start AND bp.period_end=m.period_end
+                UPDATE billing_export_usage u SET storage_mib_seconds = u.storage_mib_seconds
+                WHERE u.team_id=$1 AND u.period_end > (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)
+                  AND NOT EXISTS (SELECT 1 FROM team_billing_period bp WHERE bp.team_id=u.team_id AND bp.period_start=u.period_start AND bp.period_end=u.period_end
                     AND (bp.finalized_at IS NOT NULL OR bp.exported_at IS NOT NULL OR bp.status IN ('exporting','exported','finalized')))`, team)
 			if err != nil {
 				return err
@@ -385,7 +385,7 @@ func (h *Handlers) ReconcileStorageBilling(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ready": true, "effective_at": at})
 }
 
-func (h *Handlers) reportBillingMeterEvent(ctx context.Context, team uuid.UUID, resource string, createdAt time.Time, eventTimestamp int64, frozen bool, params StripeReportMeterEventParams) error {
+func (h *Handlers) reportBillingMeterEvent(ctx context.Context, team uuid.UUID, resource string, createdAt, measuredThrough time.Time, frozen bool, params StripeReportMeterEventParams) error {
 	if resource != "storage" {
 		return h.Stripe.ReportMeterEvent(ctx, params)
 	}
@@ -395,7 +395,7 @@ func (h *Handlers) reportBillingMeterEvent(ctx context.Context, team uuid.UUID, 
 			return fmt.Errorf("storage export does not match the current subscription/customer/meter; operator reconciliation required")
 		}
 		var eligible bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_storage_billing_activation WHERE team_id=$1 AND effective_at<=LEAST($2::timestamptz,$3::timestamptz) AND effective_at<=clock_timestamp())`, team, createdAt, time.Unix(eventTimestamp, 0)).Scan(&eligible); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_storage_billing_activation WHERE team_id=$1 AND effective_at<=$2::timestamptz AND effective_at<$3::timestamptz AND effective_at<=clock_timestamp())`, team, createdAt, measuredThrough).Scan(&eligible); err != nil {
 			return err
 		}
 		if !eligible {
