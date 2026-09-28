@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -18,7 +19,7 @@ type teamCreationResult struct {
 
 var errTeamCreationConflict = errors.New("team creation request parameters changed")
 var errTeamCreationDeleted = errors.New("created team was deleted")
-var errTeamCreationPromotionUnavailable = errors.New("canonical promotion enforcement unavailable")
+var errTeamCreationIdentityUnavailable = errors.New("trusted promotion identity unavailable")
 
 const teamCreationResultSQL = `
 SELECT r.name, r.region, CASE WHEN r.deleted_at IS NULL THEN t.id END
@@ -66,27 +67,42 @@ func createTeamCreationResult(ctx context.Context, pool *pgxpool.Pool, actor uui
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return result, err
 	}
+
+	if identity == nil {
+		return result, errTeamCreationIdentityUnavailable
+	}
+	authUpdatedAt, err := parseTeamCreationIdentityTime(identity.AuthUpdatedAt)
+	if err != nil {
+		return result, errTeamCreationIdentityUnavailable
+	}
+	observedAt, err := parseTeamCreationIdentityTime(identity.ObservedAt)
+	if err != nil {
+		return result, errTeamCreationIdentityUnavailable
+	}
+	// Match the authority's gate -> actor lock order even while enforcement is off.
 	var canonicalEnabled bool
 	if err = tx.QueryRow(ctx, `SELECT canonical_promotion_identity_enabled()`).Scan(&canonicalEnabled); err != nil {
 		return result, err
 	}
-	if !canonicalEnabled {
-		return result, errTeamCreationPromotionUnavailable
-	}
-
-	// A regional profile is relational state, never promotion identity authority.
-	email := actor.String() + "@example.invalid"
-	if identity != nil && identity.Email != nil && *identity.Email != "" {
-		email = *identity.Email
-	}
-	if _, err = tx.Exec(ctx, `INSERT INTO profile(id, email) VALUES($1, $2) ON CONFLICT (id) DO NOTHING`, actor, email); err != nil {
+	var evidenceOutcome string
+	var evidenceVersion uuid.UUID
+	err = tx.QueryRow(ctx, `SELECT outcome, evidence_version FROM upsert_profile_with_promotion_identity($1,$2,$3,$4,$5)`,
+		actor, identity.Email, identity.EmailVerified, authUpdatedAt, observedAt).Scan(&evidenceOutcome, &evidenceVersion)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "22023" {
+			return result, errTeamCreationIdentityUnavailable
+		}
 		return result, err
 	}
+	if (evidenceOutcome != "applied" && evidenceOutcome != "replayed") || evidenceVersion == uuid.Nil {
+		return result, errTeamCreationIdentityUnavailable
+	}
+
 	if err = tx.QueryRow(ctx, `SELECT id FROM create_team_with_signup_trial($1, $2, $3)`, input.Name, actor, input.Region).Scan(&result.ID); err != nil {
 		return result, err
 	}
-	// Require the canonical authority's explicit result. An older expansion
-	// function without this outcome must roll back rather than grant by user ID.
+	// Require the authority's explicit outcome in both expansion and enforcement modes.
 	if err = tx.QueryRow(ctx, `SELECT outcome FROM team_signup_promotion_outcome WHERE team_id=$1 AND user_id=$2`, result.ID, actor).Scan(&result.Outcome); err != nil {
 		return result, err
 	}

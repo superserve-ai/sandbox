@@ -1,3 +1,5 @@
+BEGIN;
+
 -- A completed intent survives team deletion so its request key cannot create again.
 CREATE TABLE team_creation_requests (
     actor_id uuid NOT NULL,
@@ -13,9 +15,9 @@ CREATE TABLE team_creation_requests (
     CHECK (cell = region)
 );
 
-CREATE INDEX team_creation_requests_team_id_idx ON team_creation_requests(team_id);
+ALTER TABLE team_creation_requests ENABLE ROW LEVEL SECURITY;
 CREATE FUNCTION tombstone_team_creation_requests() RETURNS trigger
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_catalog AS $$
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 BEGIN
     UPDATE team_creation_requests SET deleted_at = now()
     WHERE team_id = OLD.id AND deleted_at IS NULL;
@@ -33,3 +35,5 @@ DO $$ BEGIN
         REVOKE ALL ON team_creation_requests FROM authenticated;
     END IF;
 END $$;
+
+COMMIT;
