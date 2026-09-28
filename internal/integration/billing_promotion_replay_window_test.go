@@ -4,6 +4,8 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -49,11 +51,23 @@ func TestIntegration_ExpiredAmbiguousStripePromotionRetainsFence(t *testing.T) {
 			// would issue another credit instead of replaying the original result.
 			clear(stripe.accepted)
 			if stale {
-				payload := stripeSubscriptionWebhookPayload(t, "evt_canceled_"+teamID.String(), "customer.subscription.deleted",
-					"sub_"+teamID.String(), "cus_"+teamID.String(), "canceled", now.Add(time.Second), now, now.AddDate(0, 1, 0))
+				// Without authoritative grant lookup, cancellation must retain
+				// the ambiguous attempt and leave cleanup retryable.
+				stripe.revocationErr = errors.New("Stripe activation grant lookup unavailable")
+				payload := stripeSubscriptionWebhookPayload(t, "evt_canceled_"+teamID.String(), "customer.subscription.updated",
+					"sub_"+teamID.String(), "cus_"+teamID.String(), "active", now.Add(time.Second), now, now.AddDate(0, 1, 0))
+				var scheduled map[string]any
+				if err := json.Unmarshal(payload, &scheduled); err != nil {
+					t.Fatal(err)
+				}
+				scheduled["data"].(map[string]any)["object"].(map[string]any)["cancel_at_period_end"] = true
+				payload, marshalErr := json.Marshal(scheduled)
+				if marshalErr != nil {
+					t.Fatal(marshalErr)
+				}
 				req := httptest.NewRequest(http.MethodPost, "/stripe/webhook", strings.NewReader(string(payload)))
 				req.Header.Set("Stripe-Signature", stripeSignature(t, payload, now))
-				if w := doRequest(router, req); w.Code != http.StatusOK {
+				if w := doRequest(router, req); w.Code != http.StatusInternalServerError {
 					t.Fatalf("cancellation: %d %s", w.Code, w.Body.String())
 				}
 			}
@@ -85,7 +99,11 @@ func TestIntegration_ExpiredAmbiguousStripePromotionRetainsFence(t *testing.T) {
 				WHERE u.user_id=$2`, teamID, userID, eventID, attemptedAt, identityKey, evidenceVersion).Scan(&retained); err != nil || !retained {
 				t.Fatalf("expired attempt lost durable identity, event or consumption fence: retained=%t err=%v", retained, err)
 			}
-			if state := canonicalStripeReserve(t, teamID, userID, "evt_newer_"+teamID.String()); state != "blocked" {
+			wantState := "blocked"
+			if stale {
+				wantState = "ineligible"
+			}
+			if state := canonicalStripeReserve(t, teamID, userID, "evt_newer_"+teamID.String()); state != wantState {
 				t.Fatalf("later event took ownership of expired ambiguous attempt: %s", state)
 			}
 			if _, err := testPool.Exec(ctx, `INSERT INTO promotion_identity_current(user_id,evidence_version) VALUES($1,$2::uuid)`, userID, evidenceVersion); err != nil {
