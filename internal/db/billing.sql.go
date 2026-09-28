@@ -2659,6 +2659,7 @@ UPDATE stripe_webhook_event
 SET last_error = $1,
     updated_at = now()
 WHERE event_id = $2
+  AND processed_at IS NULL
 RETURNING event_id, event_type, payload, received_at, processed_at, last_error, updated_at
 `
 
@@ -2896,6 +2897,30 @@ type PrepareStripeCheckoutIdentityParams struct {
 
 func (q *Queries) PrepareStripeCheckoutIdentity(ctx context.Context, arg PrepareStripeCheckoutIdentityParams) error {
 	_, err := q.db.Exec(ctx, prepareStripeCheckoutIdentity, arg.TeamID, arg.UserID)
+	return err
+}
+
+const recordStripeCheckoutExpiration = `-- name: RecordStripeCheckoutExpiration :exec
+INSERT INTO stripe_checkout_expiration_evidence
+    (team_id, stripe_customer_id, checkout_generation, checkout_session_id)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (team_id, checkout_generation) DO NOTHING
+`
+
+type RecordStripeCheckoutExpirationParams struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	StripeCustomerID   string    `json:"stripe_customer_id"`
+	CheckoutGeneration time.Time `json:"checkout_generation"`
+	CheckoutSessionID  string    `json:"checkout_session_id"`
+}
+
+func (q *Queries) RecordStripeCheckoutExpiration(ctx context.Context, arg RecordStripeCheckoutExpirationParams) error {
+	_, err := q.db.Exec(ctx, recordStripeCheckoutExpiration,
+		arg.TeamID,
+		arg.StripeCustomerID,
+		arg.CheckoutGeneration,
+		arg.CheckoutSessionID,
+	)
 	return err
 }
 

@@ -137,3 +137,51 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). We use the Developer Certificate of Orig
 OCVSAL 1.0 — see [LICENSE](LICENSE).
 
 Built on [Firecracker](https://github.com/firecracker-microvm/firecracker) (Apache 2.0).
+
+### Deferred Stripe checkout association alerts
+
+A subscription webhook received while its Checkout reservation is being
+associated remains retained and retryable: the endpoint returns HTTP 500 and
+logs a warning with the event ID and type. A control-plane monitor polls each
+minute, independently of webhook traffic and incremental billing export. It
+reports an association still unresolved five minutes after the event's first
+`received_at` through the existing error log and Sentry pipeline. Retries do
+not reset this clock.
+
+Before reporting, the monitor checks the current billing account and retained
+event under the same account-before-event lock order as Checkout reconciliation.
+Processed or associated events are silent. Obsolescence requires verified
+expiration evidence matching the event's team, customer, and checkout generation,
+or an accepted replacement Checkout association that has completed or finalized.
+A different subscription, a reservation begun after receipt, or a subscription
+cancellation alone does not establish obsolescence. The monitor only classifies
+and reports; it does not replay webhooks, change billing state, or grant credit.
+
+Database alert bookkeeping coordinates replicas. A claim expires after two
+minutes if a worker exits, a reported event has a 30-minute repeat cooldown,
+and a recovered or obsolete event is rechecked after 24 hours. Proven obsolescence
+is retained per event, so later checkouts or purging a migrated team's account
+and checkout evidence cannot resurrect its obsolete alerts. Migration purge records
+these decisions before deleting the source evidence, even if the monitor has not
+scanned the event. Missing account state alone never retires an event. Reporter
+failure attempts to release the claim, then defers another
+inspection for 30 minutes.
+If claim release is interrupted, the two-minute lease permits recovery. A
+pending transition queues its alert eligibility in the same transaction as the
+retained webhook update, so a retry committed after a
+monitor scan remains discoverable on a later poll. A crash between error logging
+and cooldown bookkeeping can yield a duplicate notification; external Sentry delivery is not
+transactional with the database. Each poll examines at most 100 events, using
+an indexed cursor for retained legacy candidates and an indexed due queue that
+starts at the oldest due alert on every poll. Candidate inspection
+failures are logged once per event per 30 minutes, with the same durable
+next-check bookkeeping so a malformed retained event cannot occupy every scan
+batch or repeatedly alert across replicas and restarts. If bookkeeping fails,
+the tick stops without advancing past that event and retries on the next poll.
+Tick failures, including database outages that prevent durable bookkeeping, are
+logged once per worker per 30 minutes until a successful tick resets the limit.
+The additive migration retains existing webhook rows and their original receipt
+times. After deployment, verify that
+this monitor runs in each webhook-receiving control plane and that overdue
+errors qualify for the configured Sentry notification rule; local tests cannot
+prove notification delivery.

@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -16,6 +17,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/promotiontest"
 )
 
@@ -395,6 +398,15 @@ func seedFixture(t *testing.T) *fixture {
 	// A neighbor team that must survive detach and purge untouched. It
 	// shares the owner, so detach's membership deletes must scope by team.
 	mustExec(t, srcPool, `INSERT INTO team (id, name) VALUES ($1, 'bystander-team')`, f.teamB)
+	for _, team := range []uuid.UUID{f.team, f.teamB} {
+		for i := 0; i < 2; i++ {
+			mustExec(t, srcPool, `
+				INSERT INTO stripe_checkout_expiration_evidence
+				    (team_id, stripe_customer_id, checkout_generation, checkout_session_id, expired_at)
+				VALUES ($1, $2, $3, $4, $5)`, team, "cus_"+team.String(),
+				base.Add(time.Duration(i)*time.Hour), fmt.Sprintf("cs_%s_%d", team, i), base.Add(3*time.Hour))
+		}
+	}
 	mustExec(t, srcPool, `INSERT INTO team_member (team_id, profile_id, role) VALUES ($1, $2, 'owner')`, f.teamB, f.owner)
 	mustExec(t, srcPool, `INSERT INTO team_memberships (team_id, user_id, status) VALUES ($1, $2, 'active')`, f.teamB, f.owner)
 	mustExec(t, srcPool, `
@@ -440,42 +452,43 @@ func seedFixture(t *testing.T) *fixture {
 		VALUES ($1, $2, 'still-running', 'active', 1, 1024, $3, '10.0.0.9')`, f.sbActive, f.teamC, sourceHostID)
 
 	f.expectedCounts = map[string]int64{
-		"profile":                            2,
-		"team":                               1,
-		"team_member":                        2,
-		"team_memberships":                   2,
-		"user_role_assignments":              2,
-		"api_key":                            2,
-		"secret":                             1,
-		"template":                           1,
-		"template_build":                     1,
-		"sandbox":                            4,
-		"snapshot":                           2,
-		"artifact_manifest":                  2,
-		"backup_generation":                  2,
-		"sandbox_secret":                     1,
-		"sandbox_secret_detached":            1,
-		"sandbox_active_interval":            2,
-		"sandbox_compute_billing_interval":   2,
-		"sandbox_storage_interval":           2,
-		"team_billing_usage":                 1,
-		"team_billing_usage_hourly":          2,
-		"team_billing_period":                1,
-		"billing_period_anomaly":             1,
-		"billing_rollup_job":                 1,
-		"billing_rollup_team_backfill_state": 1,
-		"team_feature_flag":                  2,
-		"team_billing_account":               0,
-		"team_trial_eligibility_cache":       0,
-		"team_pricing_plan":                  1,
-		"team_credit_grant":                  1,
-		"team_credit_ledger":                 1,
-		"quota_alert_state":                  1,
-		"trial_credit_warning_state":         1,
-		"trial_credit_warning_delivery":      2,
-		"activity":                           3,
-		"sandbox_revocation":                 1,
-		"revoked_proxy_token":                1,
+		"profile":                             2,
+		"team":                                1,
+		"team_member":                         2,
+		"team_memberships":                    2,
+		"user_role_assignments":               2,
+		"api_key":                             2,
+		"secret":                              1,
+		"template":                            1,
+		"template_build":                      1,
+		"sandbox":                             4,
+		"snapshot":                            2,
+		"artifact_manifest":                   2,
+		"backup_generation":                   2,
+		"sandbox_secret":                      1,
+		"sandbox_secret_detached":             1,
+		"sandbox_active_interval":             2,
+		"sandbox_compute_billing_interval":    2,
+		"sandbox_storage_interval":            2,
+		"team_billing_usage":                  1,
+		"team_billing_usage_hourly":           2,
+		"team_billing_period":                 1,
+		"billing_period_anomaly":              1,
+		"billing_rollup_job":                  1,
+		"billing_rollup_team_backfill_state":  1,
+		"team_feature_flag":                   2,
+		"team_billing_account":                0,
+		"stripe_checkout_expiration_evidence": 2,
+		"team_trial_eligibility_cache":        0,
+		"team_pricing_plan":                   1,
+		"team_credit_grant":                   1,
+		"team_credit_ledger":                  1,
+		"quota_alert_state":                   1,
+		"trial_credit_warning_state":          1,
+		"trial_credit_warning_delivery":       2,
+		"activity":                            3,
+		"sandbox_revocation":                  1,
+		"revoked_proxy_token":                 1,
 	}
 
 	f.expectedDirs = []string{
@@ -619,6 +632,16 @@ func TestTeamMigration(t *testing.T) {
 		for _, spec := range migratedTables {
 			if got, want := countScoped(t, dstPool, spec, f.team), f.expectedCounts[spec.name]; got != want {
 				t.Errorf("dest %s: got %d rows, want %d", spec.name, got, want)
+			}
+		}
+
+		for _, team := range []uuid.UUID{f.team, f.teamB} {
+			expired, err := db.New(dstPool).HasStripeCheckoutExpiration(ctx, team, "cus_"+team.String(), time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := team == f.team; expired != want {
+				t.Errorf("dest expiration evidence for team %s: got %v, want %v", team, expired, want)
 			}
 		}
 
@@ -1220,6 +1243,9 @@ func TestTeamMigration(t *testing.T) {
 		}
 
 		// The bystander team is untouched; the dest keeps the full copy.
+		if got := countScoped(t, srcPool, tableSpec{"stripe_checkout_expiration_evidence", "team_id = $1"}, f.teamB); got != 2 {
+			t.Errorf("bystander expiration evidence: got %d rows, want 2", got)
+		}
 		var n int64
 		if err := srcPool.QueryRow(ctx, `SELECT count(*) FROM sandbox WHERE team_id = $1`, f.teamB).Scan(&n); err != nil {
 			t.Fatal(err)
@@ -1306,6 +1332,11 @@ func assertMigratedSignupConsumed(t *testing.T, pool *pgxpool.Pool, userID uuid.
 
 func assertSignupRetryHasNoGrant(t *testing.T, pool *pgxpool.Pool, userID uuid.UUID) {
 	t.Helper()
+	// A new signup request needs fresh destination Auth evidence; migration
+	// preserves consumption without publishing current identity authority.
+	mustExec(t, pool, `INSERT INTO promotion_auth.identity_source(id, email, email_confirmed_at)
+		VALUES ($1, $2, now())
+		ON CONFLICT (id) DO UPDATE SET email = promotion_auth.identity_source.email`, userID, userID.String()+"@example.com")
 	var teamID uuid.UUID
 	if err := pool.QueryRow(context.Background(), `SELECT id FROM create_team_with_signup_trial($1, $2, 'usw')`, "signup-retry-"+uuid.NewString(), userID).Scan(&teamID); err != nil {
 		t.Fatal(err)
@@ -2025,6 +2056,46 @@ func TestPurgeWithoutDetach(t *testing.T) {
 		        $4||'/vmstate.snap', $4||'/mem.snap', $4||'/base.ext4', $4||'/delta.ext4')`,
 		sb, team, sourceHostID, sbDir)
 
+	now := time.Now().UTC().Truncate(time.Second)
+	generation := now.Add(-time.Hour)
+	customerID := "cus_" + team.String()
+	mustExec(t, srcPool, `INSERT INTO team_billing_account (team_id, stripe_customer_id)
+		VALUES ($1, $2)`, team, customerID)
+	mustExec(t, srcPool, `INSERT INTO stripe_checkout_expiration_evidence
+		(team_id, stripe_customer_id, checkout_generation, checkout_session_id, expired_at)
+		VALUES ($1, $2, $3, $4, $5)`, team, customerID, generation, "cs_"+team.String(), now)
+	var retained []db.StripeCheckoutAssociationCandidate
+	for _, kind := range []string{"expired", "superseded", "unknown"} {
+		eventID := "evt_" + kind + "_" + team.String()
+		customer := customerID
+		metadata := map[string]string{}
+		if kind == "expired" {
+			metadata["checkout_generation"] = generation.Format(time.RFC3339Nano)
+		} else if kind == "superseded" {
+			mustExec(t, srcPool, `UPDATE team_billing_account
+				SET stripe_subscription_id = $2, checkout_subscription_id = $3, checkout_completed_at = $4 WHERE team_id = $1`,
+				team, "sub_expired_"+team.String(), "sub_replacement_"+team.String(), now.Add(-time.Minute))
+		} else if kind == "unknown" {
+			customer = "cus_unknown_" + team.String()
+		}
+		payload, err := json.Marshal(map[string]any{
+			"id": eventID, "type": "customer.subscription.created",
+			"data": map[string]any{"object": map[string]any{
+				"id": "sub_" + kind + "_" + team.String(), "customer": customer, "metadata": metadata,
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, srcPool, `INSERT INTO stripe_webhook_event(event_id, event_type, payload, received_at, last_error)
+			VALUES ($1, 'customer.subscription.created', $2, $3, $4)`, eventID, payload, generation, db.StripeCheckoutAssociationPendingError)
+		t.Cleanup(func() {
+			_, _ = srcPool.Exec(context.Background(), `DELETE FROM stripe_webhook_event WHERE event_id = $1`, eventID)
+		})
+		candidate := db.StripeCheckoutAssociationCandidate{EventID: eventID, Payload: payload}
+		retained = append(retained, candidate)
+	}
+
 	cfg := config{
 		teamID:     team,
 		sourceURL:  srcURL,
@@ -2044,7 +2115,37 @@ func TestPurgeWithoutDetach(t *testing.T) {
 		t.Fatalf("purge without a prior detach: %v", err)
 	}
 
-	for _, table := range []string{"team_member", "team_memberships", "sandbox"} {
+	// A restarted source monitor must retain the obsolescence decision after
+	// purge removes all account and generation evidence, including after retry.
+	h := api.NewHandlers(nil, db.New(srcPool), nil)
+	h.Pool = srcPool
+	for _, candidate := range retained[:2] {
+		mustExec(t, srcPool, `UPDATE stripe_webhook_event SET last_error = 'retry failure' WHERE event_id = $1`, candidate.EventID)
+		mustExec(t, srcPool, `UPDATE stripe_webhook_event SET last_error = $2 WHERE event_id = $1`, candidate.EventID, db.StripeCheckoutAssociationPendingError)
+	}
+	var alerts []string
+	if _, err := h.StripeCheckoutAssociationTick(ctx, now.Add(25*time.Hour), db.StripeCheckoutAssociationCursor{}, func(a api.StripeAssociationAlert) error {
+		alerts = append(alerts, a.EventID)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(alerts) != 1 || alerts[0] != retained[2].EventID {
+		t.Fatalf("alerts after purge = %v; only missing authority without retirement should alert", alerts)
+	}
+	for i, candidate := range retained {
+		var processed, retired bool
+		var receivedAt time.Time
+		if err := srcPool.QueryRow(ctx, `SELECT e.processed_at IS NOT NULL, e.received_at, a.retired_at IS NOT NULL
+			FROM stripe_webhook_event e JOIN stripe_checkout_association_alert a USING (event_id)
+			WHERE event_id = $1`, candidate.EventID).Scan(&processed, &receivedAt, &retired); err != nil {
+			t.Fatal(err)
+		}
+		if processed || !receivedAt.Equal(generation) || retired != (i < 2) {
+			t.Fatalf("event %s: processed=%v received_at=%s retired=%v", candidate.EventID, processed, receivedAt, retired)
+		}
+	}
+	for _, table := range []string{"team_member", "team_memberships", "sandbox", "team_billing_account", "stripe_checkout_expiration_evidence"} {
 		var n int64
 		if err := srcPool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s WHERE team_id = $1`, table), team).Scan(&n); err != nil {
 			t.Fatal(err)

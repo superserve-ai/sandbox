@@ -226,7 +226,7 @@ module "api" {
 
     BACKUP_GC_SERVICE_ACCOUNT = module.backup_storage.gc_service_account_email
   }
-  secrets = {
+  secrets = merge(local.promotion_evidence_secrets, {
     SANDBOX_ACCESS_TOKEN_SEED = {
       secret = coalesce(var.sandbox_access_token_seed_secret_name, "sandbox-access-token-seed-${local.resource_suffix}")
     }
@@ -252,7 +252,7 @@ module "api" {
     STRIPE_METER_ERROR_WEBHOOK_SECRET = {
       secret = google_secret_manager_secret.stripe_meter_error_webhook_secret.secret_id
     }
-  }
+  })
   vpc_connector = module.network.vpc_connector_id
   labels        = local.common_labels
 

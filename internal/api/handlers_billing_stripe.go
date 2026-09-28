@@ -44,7 +44,7 @@ const (
 )
 
 var errBillingRedirectOriginsNotConfigured = errors.New("billing redirect origins are not configured")
-var errStripeCheckoutAssociationPending = errors.New("Stripe checkout association is still being established")
+var errStripeCheckoutAssociationPending = errors.New(db.StripeCheckoutAssociationPendingError)
 var errStripePromotionSettlementRequired = errors.New("Stripe promotion requires explicit settlement after its safe idempotency replay window")
 
 type StripeBillingClient interface {
@@ -1955,12 +1955,23 @@ func (h *Handlers) HandleStripeWebhook(c *gin.Context) {
 		return
 	}
 	if err := h.processRecordedStripeWebhook(c.Request.Context(), event); err != nil {
-		log.Error().Err(err).Str("event_id", event.ID).Str("event_type", event.Type).Msg("process Stripe webhook failed")
+		if logStripeWebhookProcessingFailure(err, event.ID, event.Type) {
+			c.Set(stripeCheckoutAssociationPendingRequestKey, true)
+		}
 		respondError(c, ErrInternal)
 		return
 	}
 	h.scheduleBillingEligibilityReconciliation(c.Request.Context(), event)
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func logStripeWebhookProcessingFailure(err error, eventID, eventType string) bool {
+	if errors.Is(err, errStripeCheckoutAssociationPending) {
+		log.Warn().Err(err).Str("event_id", eventID).Str("event_type", eventType).Msg("Stripe checkout association pending")
+		return true
+	}
+	log.Error().Err(err).Str("event_id", eventID).Str("event_type", eventType).Msg("process Stripe webhook failed")
+	return false
 }
 
 func (h *Handlers) processRecordedStripeWebhook(ctx context.Context, event stripeEventEnvelope) error {
@@ -2156,9 +2167,13 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, quer
 	// processing before establishing a durable reservation. An ignored stale
 	// event must not fence the user from redeeming on another team.
 	eventAt := stripeEventTime(int64(event.Created))
+	expired, err := stripeSubscriptionGenerationExpired(ctx, queries, account, obj.Metadata["checkout_generation"])
+	if err != nil || expired {
+		return nil, err
+	}
 	associated := stripeSubscriptionMatchesCurrentAssociation(orderingAccount, obj.ID)
 	if event.Type == "customer.subscription.created" {
-		deferProcessing, ignore := shouldIgnoreUnassociatedStripeSubscriptionCreated(orderingAccount, obj.ID)
+		deferProcessing, ignore := shouldIgnoreUnassociatedStripeSubscriptionCreated(account, obj.ID)
 		if deferProcessing || ignore {
 			return nil, nil
 		}
@@ -2232,11 +2247,26 @@ func (h *Handlers) expandStripeThinMeterEvent(ctx context.Context, event *stripe
 	return nil
 }
 
-func (h *Handlers) persistStripeWebhookFailure(ctx context.Context, queries *db.Queries, eventID, lastError string) error {
+func (h *Handlers) persistStripeWebhookFailure(ctx context.Context, queries *db.Queries, eventID string, processErr error) error {
+	lastError := processErr.Error()
+	if errors.Is(processErr, errStripeCheckoutAssociationPending) {
+		lastError = db.StripeCheckoutAssociationPendingError
+	}
 	_, err := queries.MarkStripeWebhookEventFailed(ctx, db.MarkStripeWebhookEventFailedParams{
 		EventID:   eventID,
 		LastError: &lastError,
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Checkout reconciliation can process the event after rollback and
+		// before this guarded failure write.
+		event, lookupErr := queries.GetStripeWebhookEvent(ctx, eventID)
+		if lookupErr != nil {
+			return lookupErr
+		}
+		if event.ProcessedAt.Valid {
+			return nil
+		}
+	}
 	return err
 }
 
@@ -2279,7 +2309,7 @@ func (h *Handlers) rollbackAndPersistStripeWebhookFailure(ctx context.Context, c
 			log.Error().Err(err).Str("event_id", eventID).Msg("preserve Stripe promotion reservation after bookkeeping failure failed")
 		}
 	}
-	if ferr := h.persistStripeWebhookFailure(recoveryCtx, queries, eventID, processErr.Error()); ferr != nil {
+	if ferr := h.persistStripeWebhookFailure(recoveryCtx, queries, eventID, processErr); ferr != nil {
 		log.Error().Err(ferr).Str("event_id", eventID).Msg("persist Stripe webhook failed state failed")
 	}
 	if err := recoveryTx.Commit(recoveryCtx); err != nil {
@@ -2565,6 +2595,14 @@ func shouldIgnoreUnassociatedStripeSubscriptionCreated(account any, subscription
 	return false, true
 }
 
+func stripeSubscriptionGenerationExpired(ctx context.Context, q *db.Queries, account db.GetTeamBillingAccountByStripeCustomerIDRow, checkoutGeneration string) (bool, error) {
+	generation, err := time.Parse(time.RFC3339Nano, checkoutGeneration)
+	if err != nil {
+		return false, nil
+	}
+	return q.HasStripeCheckoutExpiration(ctx, account.TeamID, derefString(account.StripeCustomerID), generation)
+}
+
 // Commit the verified association while retaining the checkout lease. Each
 // retained event can then reserve credit durably before taking the account lock.
 func (h *Handlers) associateStripeCheckoutBeforeReconciliation(ctx context.Context, event stripeEventEnvelope) ([]db.StripeWebhookEvent, error) {
@@ -2835,7 +2873,13 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 			// expiration for that exact generation can still retire the fence.
 			return nil
 		}
-		return q.AbortTeamBillingCheckout(ctx, db.AbortTeamBillingCheckoutParams{TeamID: teamID, LeaseStartedAt: account.CheckoutInitializingAt})
+		if err := q.AbortTeamBillingCheckout(ctx, db.AbortTeamBillingCheckoutParams{TeamID: teamID, LeaseStartedAt: account.CheckoutInitializingAt}); err != nil {
+			return err
+		}
+		return q.RecordStripeCheckoutExpiration(ctx, db.RecordStripeCheckoutExpirationParams{
+			TeamID: teamID, StripeCustomerID: obj.Customer,
+			CheckoutGeneration: account.CheckoutInitializingAt.Time, CheckoutSessionID: obj.ID,
+		})
 	case "checkout.session.completed":
 		var obj stripeCheckoutCompletedObject
 		if err := json.Unmarshal(event.Data.Object, &obj); err != nil {
@@ -2881,6 +2925,15 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 		if eventAt.IsZero() {
 			return nil
 		}
+		// A lifecycle event can establish the subscription ID before checkout
+		// completion. Matching expiration still wins over that association.
+		expired, err := stripeSubscriptionGenerationExpired(ctx, q, account, obj.Metadata["checkout_generation"])
+		if err != nil {
+			return err
+		}
+		if expired {
+			return h.settleStaleStripePromotion(ctx, q, account, event.ID, obj.Customer)
+		}
 		associated := stripeSubscriptionMatchesCurrentAssociation(account, obj.ID)
 		if event.Type == "customer.subscription.created" {
 			deferProcessing, ignore := shouldIgnoreUnassociatedStripeSubscriptionCreated(account, obj.ID)
@@ -2892,6 +2945,12 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 			}
 			associated = true
 		} else if !associated && !canAssociateStripeSubscription(account, obj) {
+			if account.CheckoutSubscriptionID == nil && (account.CheckoutInitializingAt.Valid || strings.TrimSpace(derefString(account.StripeSubscriptionID)) == "") {
+				generation := strings.TrimSpace(obj.Metadata["checkout_generation"])
+				if !account.CheckoutInitializingAt.Valid || generation == "" || generation == account.CheckoutInitializingAt.Time.UTC().Format(time.RFC3339Nano) {
+					return errStripeCheckoutAssociationPending
+				}
+			}
 			return h.settleStaleStripePromotion(ctx, q, account, event.ID, obj.Customer)
 		}
 		if account.StripeSubscriptionEventAt.Valid {

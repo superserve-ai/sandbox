@@ -318,7 +318,9 @@ func TestIntegration_IncrementalWorkerLoad(t *testing.T) {
 	if !correctionAfter.Equal(anchor.Add(95*time.Hour)) || !nextCorrection.Equal(correctionNow.Add(exportCorrectionPageInterval)) {
 		t.Fatalf("unchanged correction page did not advance and pace its cursor: after=%v next=%v", correctionAfter, nextCorrection)
 	}
-	exec(`UPDATE billing_export_work SET next_run_at=now()+interval '1 day' WHERE team_id=$1`, teams[1])
+	// Earlier export and provider-retry fixtures may still be due. Isolate the
+	// lease check to the one row whose deadline and lease this case controls.
+	exec(`UPDATE billing_export_work SET next_run_at=now()+interval '1 day',next_reconcile_at=now()+interval '1 day' WHERE team_id=ANY($1::uuid[])`, teams)
 	// A committed lease must exclude another replica even with no row lock held.
 	leaseToken := uuid.New()
 	exec(`UPDATE billing_export_work SET next_run_at=now(),lease_token=$2,lease_until=now()+interval '1 hour' WHERE team_id=$1`, teams[7], leaseToken)
@@ -1285,7 +1287,6 @@ func testMeasurementCursors(t *testing.T, pool *pgxpool.Pool, trace *billingLoad
 		for _, q := range trace.take() {
 			if strings.Contains(q.sql, "WITH page AS MATERIALIZED") {
 				scanned += q.rows
-				explainBillingLoadQuery(t, pool, q, 48)
 			}
 		}
 		if scanned != wantRows {

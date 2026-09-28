@@ -13,19 +13,112 @@ spec.loader.exec_module(identity)
 
 
 class ControlplaneIdentityTest(unittest.TestCase):
-    def service(self, cell):
+    def test_promotion_evidence_secrets_require_explicit_enablement_in_every_cell(self):
+        for environment, region, secret_file in (
+            ('production', 'us-east4', 'controlplane-identity.tf'),
+            ('production', 'us-west2', 'controlplane-identity.tf'),
+            ('staging', 'us-central1', 'control-plane-identity.tf'),
+        ):
+            root = ROOT / 'infra/envs' / environment / region
+            secrets = (root / secret_file).read_text()
+            main = (root / 'main.tf').read_text()
+            with self.subTest(environment=environment, region=region):
+                variables = (root / 'variables.tf').read_text()
+                gate = re.search(r'variable "promotion_evidence_enabled" \{(.*?)\n\}', variables, re.S)
+                self.assertIsNotNone(gate)
+                self.assertRegex(gate[1], r'type\s*=\s*bool')
+                self.assertRegex(gate[1], r'default\s*=\s*false')
+                self.assertRegex(gate[1], r'nullable\s*=\s*false')
+                for tfvars in root.glob('*.tfvars'):
+                    self.assertNotRegex(tfvars.read_text(), r'(?m)^\s*promotion_evidence_enabled\s*=\s*true')
+                gated = re.search(
+                    r'promotion_evidence_secrets\s*=\s*var\.promotion_evidence_enabled\s*\?\s*\{(.*?)\n  \}\s*:\s*\{\}',
+                    secrets, re.S)
+                self.assertIsNotNone(gated)
+                for name, resource in (
+                    ('PROMOTION_AUTH_DATABASE_URL', 'promotion_auth_database_url'),
+                    ('PROMOTION_CAPTURE_TOKEN', 'promotion_capture_token'),
+                    ('PROMOTION_ACCOUNT_TOKEN', 'promotion_account_token'),
+                    ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion_account_public_key'),
+                ):
+                    self.assertIn(f'resource "google_secret_manager_secret" "{resource}"', secrets)
+                    self.assertRegex(gated[1], rf'{name}\s*=\s*\{{\s*secret\s*=\s*google_secret_manager_secret\.{resource}\.secret_id')
+                    self.assertNotIn(name, secrets[:gated.start()] + secrets[gated.end():] + main)
+                if environment == 'production':
+                    self.assertRegex(secrets, r'controlplane_secrets\s*=\s*merge\(local\.promotion_evidence_secrets,')
+                    self.assertRegex(main, r'secrets\s*=\s*local\.controlplane_secrets')
+                    self.assertIn('for_each = toset([for config in values(local.controlplane_secrets) : config.secret])', secrets)
+                else:
+                    self.assertRegex(main, r'secrets\s*=\s*merge\(local\.promotion_evidence_secrets,')
+                    self.assertRegex(secrets, r'controlplane_secret_ids\s*=\s*toset\(concat\(\s*\[for config in values\(local\.promotion_evidence_secrets\) : config\.secret\],')
+                    self.assertIn('for_each = local.controlplane_secret_ids', secrets)
+                self.assertIn('roles/secretmanager.secretAccessor', secrets)
+                self.assertIn('controlplane_runtime.email', secrets)
+
+    def test_shared_auth_proxy_role_has_only_rpc_privileges(self):
+        migration = (ROOT / 'supabase/shared-auth-migrations/20260925190000_promotion_evidence_proxy_role.sql').read_text()
+        self.assertIn('LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION', migration)
+        self.assertIn('REVOKE ALL ON public.signup_device_attempt, public.signup_device_account_evidence', migration)
+        for function in ('create_signup_device_attempt()',
+                         'verify_signup_device_attempt(uuid,uuid,text,text,timestamptz)',
+                         'bind_signup_device_account(uuid,uuid)',
+                         'get_signup_device_account_evidence(uuid)'):
+            self.assertIn(function, migration)
+        self.assertNotRegex(migration, r'GRANT\s+(?:SELECT|INSERT|UPDATE|DELETE|ALL)\s+ON\s+(?:TABLE\s+)?public\.signup_device_')
+
+    def service(self, cell, promotion_enabled=True):
+        secrets = [('OPERATOR_API_TOKEN', 'operator-api-token'),
+                   ('PROMOTION_AUTH_DATABASE_URL', 'promotion-auth-database-url'),
+                   ('PROMOTION_CAPTURE_TOKEN', 'promotion-capture-token'),
+                   ('PROMOTION_ACCOUNT_TOKEN', 'promotion-account-token'),
+                   ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion-account-public-key')]
+        if not promotion_enabled:
+            secrets = secrets[:1]
         return {'spec': {'template': {'spec': {
             'serviceAccountName': f'superserve-controlplane-{cell}@example-project.iam.gserviceaccount.com',
-            'containers': [{'env': [{'name': 'OPERATOR_API_TOKEN', 'valueFrom': {
-                'secretKeyRef': {'name': f'operator-api-token-{cell}', 'key': 'latest'}}}]}],
+            'containers': [{'env': [{'name': name, 'valueFrom': {
+                'secretKeyRef': {'name': f'{secret}-{cell}', 'key': 'latest'}}}
+                for name, secret in secrets]}],
         }}}}
 
     def test_accepts_both_cell_identities(self):
         for cell in ('use4', 'usw2'):
-            identity.check(self.service(cell), 'example-project', cell)
+            for enabled in (False, True):
+                with self.subTest(cell=cell, promotion_enabled=enabled):
+                    identity.check(self.service(cell, enabled), 'example-project', cell)
+
+    def test_rejects_partial_promotion_configuration(self):
+        for cell in ('use4', 'usw2'):
+            for mask in range(1, 15):
+                service = self.service(cell)
+                container = service['spec']['template']['spec']['containers'][0]
+                env = container['env']
+                container['env'] = env[:1] + [
+                    mapping for i, mapping in enumerate(env[1:]) if mask & (1 << i)]
+                with self.subTest(cell=cell, mask=mask), self.assertRaises(ValueError):
+                    identity.check(service, 'example-project', cell)
+
+    def test_rejects_malformed_promotion_secret_mappings(self):
+        for cell in ('use4', 'usw2'):
+            for index in range(1, 5):
+                for fault in ('duplicate', 'literal', 'wrong_cell', 'missing_version'):
+                    service = self.service(cell)
+                    env = service['spec']['template']['spec']['containers'][0]['env']
+                    mapping = env[index]
+                    if fault == 'duplicate':
+                        env.append(deepcopy(mapping))
+                    elif fault == 'literal':
+                        mapping.update(value='example-value', valueFrom={})
+                    elif fault == 'wrong_cell':
+                        ref = mapping['valueFrom']['secretKeyRef']
+                        other = 'usw2' if cell == 'use4' else 'use4'
+                        ref['name'] = ref['name'].replace(cell, other)
+                    else:
+                        del mapping['valueFrom']['secretKeyRef']['key']
+                    with self.subTest(cell=cell, index=index, fault=fault), self.assertRaises(ValueError):
+                        identity.check(service, 'example-project', cell)
 
     def test_rejects_shared_host_identity_and_missing_or_wrong_credentials(self):
-        service = self.service('use4')
         mutations = [
             lambda s: s.update(serviceAccountName='superserve-api-runner@example-project.iam.gserviceaccount.com'),
             lambda s: s.update(containers=[]),
@@ -35,11 +128,20 @@ class ControlplaneIdentityTest(unittest.TestCase):
             lambda s: s['containers'][0]['env'][0]['valueFrom']['secretKeyRef'].update(name='operator-api-token-usw2'),
             lambda s: s['containers'][0]['env'][0]['valueFrom']['secretKeyRef'].update(key=''),
         ]
-        for mutate in mutations:
-            candidate = deepcopy(service)
-            mutate(candidate['spec']['template']['spec'])
-            with self.assertRaises(ValueError):
-                identity.check(candidate, 'example-project', 'use4')
+        promotion_mutations = [
+            lambda s: s['containers'][0]['env'].pop(1),
+            lambda s: s['containers'][0]['env'][1].update(value='example-url', valueFrom={}),
+            lambda s: s['containers'][0]['env'][2]['valueFrom']['secretKeyRef'].update(name='promotion-capture-token-usw2'),
+            lambda s: s['containers'][0]['env'][3]['valueFrom']['secretKeyRef'].update(key=''),
+            lambda s: s['containers'][0]['env'].pop(4),
+            lambda s: s['containers'][0]['env'][4]['valueFrom']['secretKeyRef'].update(name='promotion-account-public-key-usw2'),
+        ]
+        for enabled in (False, True):
+            for mutate in mutations + (promotion_mutations if enabled else []):
+                candidate = self.service('use4', enabled)
+                mutate(candidate['spec']['template']['spec'])
+                with self.subTest(promotion_enabled=enabled), self.assertRaises(ValueError):
+                    identity.check(candidate, 'example-project', 'use4')
 
     def test_production_deploys_check_identity_before_image_update(self):
         for workflow in ('deploy-api.yml', 'terraform-cd.yml'):
