@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 func TestIntegration_UnassociatedSubscriptionCannotClaimOpenCheckout(t *testing.T) {
@@ -55,14 +56,33 @@ func TestIntegration_UnassociatedSubscriptionCannotClaimOpenCheckout(t *testing.
 					}
 					now := time.Now().UTC().Truncate(time.Second)
 					eventID := "evt_unrelated_" + teamID.String()
+					t.Cleanup(func() {
+						_, _ = testPool.Exec(context.Background(), `DELETE FROM stripe_webhook_event WHERE event_id = $1`, eventID)
+					})
 					payload := stripeSubscriptionWebhookPayloadWithMetadata(t, eventID, eventType, "sub_unrelated_"+teamID.String(), customerID, status, now, now, now.AddDate(0, 1, 0), metadata)
+					wantStatus := http.StatusInternalServerError
+					if generation == "wrong_generation" {
+						wantStatus = http.StatusOK
+					}
 					for attempt := 0; attempt < 2; attempt++ {
 						req := httptest.NewRequest(http.MethodPost, "/stripe/webhook", strings.NewReader(string(payload)))
 						req.Header.Set("Content-Type", "application/json")
 						req.Header.Set("Stripe-Signature", stripeSignature(t, payload, now))
-						if w := doRequest(router, req); w.Code != http.StatusOK {
-							t.Fatalf("unrelated lifecycle delivery %d: %d %s", attempt, w.Code, w.Body.String())
+						if w := doRequest(router, req); w.Code != wantStatus {
+							t.Fatalf("unrelated lifecycle delivery %d: %d, want %d: %s", attempt, w.Code, wantStatus, w.Body.String())
 						}
+					}
+					var processed bool
+					var lastError *string
+					if err := testPool.QueryRow(ctx, `SELECT processed_at IS NOT NULL, last_error FROM stripe_webhook_event WHERE event_id = $1`, eventID).Scan(&processed, &lastError); err != nil {
+						t.Fatal(err)
+					}
+					if generation == "missing_generation" {
+						if processed || lastError == nil || *lastError != db.StripeCheckoutAssociationPendingError {
+							t.Fatalf("unassociated event was not retained for retry: processed=%v last_error=%v", processed, lastError)
+						}
+					} else if !processed || lastError != nil {
+						t.Fatalf("superseded generation was not ignored: processed=%v last_error=%v", processed, lastError)
 					}
 					after, err := testQueries.GetTeamBillingAccount(ctx, teamID)
 					if err != nil {

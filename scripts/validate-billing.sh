@@ -19,6 +19,8 @@ suite() {
 }
 
 suite billing-unit-race go test -v -race -short -count=1 ./internal/billing ./internal/api
+suite billing-controlplane-startup go test -v -race -short -count=1 -run '^TestControlplaneStartsStripeCheckoutAssociationMonitor$' ./cmd/controlplane
+suite sentrylog-unit go test -v -count=1 ./internal/sentrylog
 suite billing-migrations go test -v -tags integration -count=1 -run '^$' ./internal/integration
 suite R16-billing-worker-load-race go test -v -race -tags integration -count=1 -timeout 5m -run '^TestIntegration_IncrementalWorkerLoad$' ./internal/api
 suite storage-report-lease-race go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_StorageReport(Lease|Reclaim|ChunkTimeout)' ./internal/api
@@ -28,7 +30,7 @@ if [[ "$(go env GOOS)" == "linux" ]]; then
 else
   echo "SKIP: storage-report-refresh-race (requires Linux)"
 fi
-suite billing-integration-race go test -v -race -tags integration -count=1 -timeout 10m -run 'Billing|Incremental|StorageReportReceiptFencesSettlement' ./internal/integration
+suite billing-integration-race go test -v -race -tags integration -count=1 -timeout 10m -run 'Billing|Incremental|StorageReportReceiptFencesSettlement|StripeAssociationMonitor' ./internal/integration
 
 # Generate into a temporary directory so a failed drift check preserves the tree.
 sqlc_dir="$(mktemp -d)"
@@ -38,4 +40,4 @@ cp -R db supabase "$sqlc_dir/"
 mkdir -p "$sqlc_dir/internal/db"
 suite billing-sqlc-generate sqlc generate -f "$sqlc_dir/sqlc.yaml"
 # The DB package also contains handwritten helpers.
-suite billing-sqlc-drift diff -ru --exclude='*_test.go' --exclude='host_capabilities.go' --exclude='billing_lock.go' --exclude='template_build_execution.go' --exclude='template_build_input.go' internal/db "$sqlc_dir/internal/db"
+suite billing-sqlc-drift diff -ru --exclude='*_test.go' --exclude='host_capabilities.go' --exclude='billing_lock.go' --exclude='stripe_checkout_association_alerts.go' --exclude='template_build_execution.go' --exclude='template_build_input.go' internal/db "$sqlc_dir/internal/db"

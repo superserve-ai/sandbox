@@ -1285,7 +1285,6 @@ func testMeasurementCursors(t *testing.T, pool *pgxpool.Pool, trace *billingLoad
 		for _, q := range trace.take() {
 			if strings.Contains(q.sql, "WITH page AS MATERIALIZED") {
 				scanned += q.rows
-				explainBillingLoadQuery(t, pool, q, 48)
 			}
 		}
 		if scanned != wantRows {

@@ -75,6 +75,7 @@ var migratedTables = []tableSpec{
 	{"team", "id = $1"},
 	{"team_feature_flag", "team_id = $1"},
 	{"team_billing_account", "team_id = $1"},
+	{"stripe_checkout_expiration_evidence", "team_id = $1"},
 	{"team_trial_eligibility_cache", "team_id = $1"},
 	{"team_member", "team_id = $1"},
 	// team_memberships before user_role_assignments: a dest-side trigger

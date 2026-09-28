@@ -16,6 +16,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
+
+	"github.com/superserve-ai/sandbox/internal/api"
 )
 
 const (
@@ -1833,6 +1835,10 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		return fmt.Errorf("delete from sandbox_snapshot: %w", err)
 	} else if tag.RowsAffected() > 0 {
 		log.Info().Int64("deleted", tag.RowsAffected()).Msg("purge: deleted saved snapshot rows dropped with the team")
+	}
+
+	if err := api.RetireStripeCheckoutAssociationsBeforePurge(ctx, tx, cfg.teamID); err != nil {
+		return fmt.Errorf("retire obsolete checkout associations: %w", err)
 	}
 
 	var total int64
