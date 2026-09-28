@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -705,6 +706,168 @@ func TestIntegration_PromotionSharedAuthIndependentRegions(t *testing.T) {
 	rolloutExec(t, auth, `DELETE FROM auth.users WHERE id=$1`, a)
 	if got := promotionPublishOriginal(t, auth, west, a, aEvidence); got != "owner_conflict" {
 		t.Fatalf("original evidence after Auth account deletion: %s", got)
+	}
+}
+
+func TestIntegration_PromotionSameAccountRedeemsOncePerRegion(t *testing.T) {
+	ctx := context.Background()
+	auth := promotionIsolatedDatabase(t, false)
+	east := promotionIsolatedDatabase(t, true)
+	west := promotionIsolatedDatabase(t, true)
+	user := uuid.New()
+	fingerprint := "visitor-" + uuid.NewString()
+	evidence := promotionVerifiedSignup(t, auth, user, fingerprint)
+
+	assertCompleted := func(t *testing.T, region *pgxpool.Pool, team uuid.UUID, stripe *fakeStripeClient) {
+		t.Helper()
+		var settled bool
+		if err := region.QueryRow(ctx, `SELECT
+			u.signup_trial_claimed_at IS NOT NULL AND u.signup_trial_team_id=$2
+			AND u.stripe_redemption_at IS NOT NULL AND u.stripe_redemption_team_id=$2
+			AND u.stripe_device_fingerprint=$3 AND u.stripe_redemption_reserved_team_id IS NULL
+			AND u.stripe_redemption_reserved_at IS NULL AND u.stripe_redemption_attempted_at IS NULL
+			AND a.stripe_activation_user_id=$1 AND a.stripe_activation_credit_grant_id='credgrant_test_123'
+			AND a.stripe_activation_credit_granted_at IS NOT NULL AND a.trial_ended_at IS NOT NULL
+			AND a.stripe_activation_credit_reserved_at IS NULL
+			AND i.signup_claimed_at IS NOT NULL AND i.stripe_redemption_at IS NOT NULL
+			AND i.stripe_reserved_team_id IS NULL AND i.stripe_reserved_user_id IS NULL
+			AND (SELECT count(*) FROM promotion_identity_binding WHERE user_id=$1)=1
+			AND (SELECT count(*) FROM user_signup_trial_claim WHERE user_id=$1 AND team_id=$2)=1
+			AND (SELECT count(*) FROM team_signup_promotion_outcome WHERE user_id=$1 AND outcome='granted')=1
+			AND (SELECT count(*) FROM promotion_device_grant WHERE fingerprint=$3)=2
+			AND (SELECT count(*) FROM promotion_device_grant WHERE user_id=$1 AND team_id=$2 AND fingerprint=$3 AND promotion='signup')=1
+			AND (SELECT count(*) FROM promotion_device_grant WHERE user_id=$1 AND team_id=$2 AND fingerprint=$3 AND promotion='stripe')=1
+			AND (SELECT count(*) FROM team_billing_account WHERE stripe_activation_user_id=$1 AND stripe_activation_credit_grant_id IS NOT NULL)=1
+			AND NOT EXISTS(SELECT 1 FROM team_billing_account WHERE stripe_activation_credit_reserved_at IS NOT NULL)
+			AND EXISTS(SELECT 1 FROM promotion_device_owner WHERE fingerprint=$3 AND user_id=$1)
+			AND EXISTS(SELECT 1 FROM promotion_signup_device_evidence
+				WHERE user_id=$1 AND fingerprint=$3 AND source_attempt_id=$4 AND source_event_id=$5)
+			FROM user_promotion_entitlement u JOIN team_billing_account a ON a.team_id=$2
+			JOIN promotion_identity i ON i.identity_key=a.stripe_activation_identity_key WHERE u.user_id=$1`,
+			user, team, fingerprint, evidence.attempt, evidence.event).Scan(&settled); err != nil || !settled {
+			t.Fatalf("regional ownership, consumption or settled reservation changed: %t, %v", settled, err)
+		}
+		var grants int
+		var amount, remaining float64
+		if err := region.QueryRow(ctx, `SELECT count(*), COALESCE(sum(amount_usd),0), COALESCE(sum(remaining_usd),0)
+			FROM team_credit_grant WHERE created_by=$1`, user).Scan(&grants, &amount, &remaining); err != nil ||
+			grants != 1 || amount != 5 || remaining != 0 {
+			t.Fatalf("local credits after activation: grants=%d amount=%v remaining=%v err=%v", grants, amount, remaining, err)
+		}
+		if len(stripe.creditGrantCalls) != 1 || stripe.creditGrantCalls[0].AmountCents != 9500 ||
+			stripe.creditGrantCalls[0].CustomerID != "cus_"+team.String() {
+			t.Fatalf("regional Stripe grants: %+v", stripe.creditGrantCalls)
+		}
+	}
+	type regionalResult struct {
+		pool   *pgxpool.Pool
+		team   uuid.UUID
+		stripe *fakeStripeClient
+	}
+	var completed []regionalResult
+	for _, tc := range []struct {
+		name string
+		pool *pgxpool.Pool
+	}{{"east", east}, {"west", west}} {
+		if !t.Run(tc.name, func(t *testing.T) {
+			// East must be fully settled before the same account enters West.
+			for _, previous := range completed {
+				assertCompleted(t, previous.pool, previous.team, previous.stripe)
+			}
+			var empty bool
+			if err := tc.pool.QueryRow(ctx, `SELECT
+				NOT EXISTS(SELECT 1 FROM promotion_signup_device_evidence WHERE user_id=$1)
+				AND NOT EXISTS(SELECT 1 FROM promotion_device_owner WHERE fingerprint=$2)
+				AND NOT EXISTS(SELECT 1 FROM promotion_device_grant WHERE user_id=$1)
+				AND NOT EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$1)
+				AND NOT EXISTS(SELECT 1 FROM pg_foreign_server)
+				AND NOT EXISTS(SELECT 1 FROM pg_extension WHERE extname IN ('dblink','postgres_fdw'))`,
+				user, fingerprint).Scan(&empty); err != nil || !empty {
+				t.Fatalf("region was not independent before entry: %t, %v", empty, err)
+			}
+			rolloutExec(t, tc.pool, `SELECT set_promotion_device_policy(true,true)`)
+			if got := promotionPublishOriginal(t, auth, tc.pool, user, evidence); got != "owner" {
+				t.Fatalf("original evidence publication: %s", got)
+			}
+			team, outcome := promotionClaimSignup(t, tc.pool, user)
+			if outcome != "granted" {
+				t.Fatalf("regional signup: %s", outcome)
+			}
+			var signupCredit bool
+			if err := tc.pool.QueryRow(ctx, `SELECT count(*)=1 AND sum(amount_usd)=5 AND sum(remaining_usd)=5
+				FROM team_credit_grant WHERE team_id=$1 AND created_by=$2 AND reason='signup trial credit'`,
+				team, user).Scan(&signupCredit); err != nil || !signupCredit {
+				t.Fatalf("regional $5 signup credit: %t, %v", signupCredit, err)
+			}
+			duplicateTeam, duplicateOutcome := promotionClaimSignup(t, tc.pool, user)
+			if duplicateOutcome != "already_claimed" {
+				t.Fatalf("duplicate local signup: %s", duplicateOutcome)
+			}
+			for _, id := range []uuid.UUID{team, duplicateTeam} {
+				rolloutExec(t, tc.pool, `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status)
+					VALUES($1,$2,$3,'incomplete')`, id, "cus_"+id.String(), "sub_"+id.String())
+			}
+			event := "evt-" + uuid.NewString()
+			reserve := func(id uuid.UUID, eventID, want string) {
+				t.Helper()
+				var result string
+				if err := tc.pool.QueryRow(ctx, `SELECT reserve_stripe_promotion_with_device($1,$2,$3,NULL,NULL,false)`,
+					id, user, eventID).Scan(&result); err != nil || result != want {
+					t.Fatalf("regional reservation: %q, want %q: %v", result, want, err)
+				}
+			}
+			reserve(team, event, "acquired")
+			reserve(team, event, "existing")
+			reserve(duplicateTeam, "evt-"+uuid.NewString(), "blocked")
+			var pending bool
+			if err := tc.pool.QueryRow(ctx, `SELECT
+				u.stripe_redemption_reserved_team_id=$2 AND u.stripe_redemption_at IS NULL
+				AND u.stripe_device_fingerprint=$3 AND i.stripe_reserved_team_id=$2 AND i.stripe_reserved_user_id=$1
+				AND i.stripe_redemption_at IS NULL AND a.stripe_activation_credit_reservation_event_id=$4
+				AND (SELECT count(*) FROM team_billing_account WHERE stripe_activation_credit_reserved_at IS NOT NULL)=1
+				FROM user_promotion_entitlement u JOIN team_billing_account a ON a.team_id=$2
+				JOIN promotion_identity i ON i.identity_key=a.stripe_activation_identity_key WHERE u.user_id=$1`,
+				user, team, fingerprint, event).Scan(&pending); err != nil || !pending {
+				t.Fatalf("regional reservation replay duplicated or replaced the fence: %t, %v", pending, err)
+			}
+			stripe := &fakeStripeClient{}
+			router := newBillingRouterWithPool(t, stripe, tc.pool)
+			now := time.Now().UTC().Truncate(time.Second)
+			if w := sendStripeActivationWebhook(t, router, event, team, user, now); w.Code != http.StatusOK {
+				t.Fatalf("regional Stripe activation: %d %s", w.Code, w.Body.String())
+			}
+			assertCompleted(t, tc.pool, team, stripe)
+			for _, replayEvent := range []string{event, "evt-" + uuid.NewString()} {
+				if got := promotionPublishOriginal(t, auth, tc.pool, user, evidence); got != "owner" {
+					t.Fatalf("publication replay after redemption: %s", got)
+				}
+				var replay string
+				if err := tc.pool.QueryRow(ctx, `SELECT outcome FROM claim_team_signup_trial_with_device($1,$2)`,
+					team, user).Scan(&replay); err != nil || replay != "granted" {
+					t.Fatalf("signup result replay: %q, %v", replay, err)
+				}
+				reserve(team, replayEvent, "ineligible")
+				reserve(duplicateTeam, "evt-"+uuid.NewString(), "ineligible")
+				if w := sendStripeActivationWebhook(t, router, replayEvent, team, user, now); w.Code != http.StatusOK {
+					t.Fatalf("Stripe activation replay: %d %s", w.Code, w.Body.String())
+				}
+				if w := sendStripeActivationWebhook(t, router, "evt-"+uuid.NewString(), duplicateTeam, user, now); w.Code != http.StatusOK {
+					t.Fatalf("duplicate-team activation: %d %s", w.Code, w.Body.String())
+				}
+				assertCompleted(t, tc.pool, team, stripe)
+			}
+			var duplicateCredits int
+			if err := tc.pool.QueryRow(ctx, `SELECT count(*) FROM team_credit_grant WHERE team_id=$1`, duplicateTeam).
+				Scan(&duplicateCredits); err != nil || duplicateCredits != 0 {
+				t.Fatalf("duplicate team received local credits: %d, %v", duplicateCredits, err)
+			}
+			completed = append(completed, regionalResult{tc.pool, team, stripe})
+		}) {
+			t.FailNow()
+		}
+	}
+	for _, result := range completed {
+		assertCompleted(t, result.pool, result.team, result.stripe)
 	}
 }
 
