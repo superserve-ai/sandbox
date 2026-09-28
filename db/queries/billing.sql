@@ -1602,3 +1602,31 @@ WHERE trial_credit_warning_lifecycle(sqlc.arg(team_id)) = sqlc.arg(lifecycle_key
 ON CONFLICT (team_id) DO UPDATE
 SET lifecycle_key = EXCLUDED.lifecycle_key, state = EXCLUDED.state, observed_at = EXCLUDED.observed_at
 WHERE team_trial_runway.observed_at < EXCLUDED.observed_at;
+
+-- name: RequestStripeActivationCreditRevocation :exec
+INSERT INTO stripe_activation_credit_revocation (team_id, stripe_customer_id)
+SELECT a.team_id, a.stripe_customer_id FROM team_billing_account a
+WHERE a.team_id = sqlc.arg(team_id) AND a.stripe_customer_id IS NOT NULL
+ON CONFLICT (team_id) DO NOTHING;
+
+-- name: GetStripeActivationCreditRevocation :one
+SELECT r.*, a.stripe_activation_credit_grant_id AS activation_grant_id
+FROM stripe_activation_credit_revocation r
+JOIN team_billing_account a ON a.team_id = r.team_id AND a.stripe_customer_id = r.stripe_customer_id
+WHERE r.stripe_customer_id = sqlc.arg(customer_id);
+
+-- name: CompleteStripeActivationCreditRevocation :one
+WITH account AS (
+    UPDATE team_billing_account a
+    SET stripe_activation_credit_grant_id = sqlc.arg(grant_id)::text, updated_at = now()
+    WHERE a.team_id = sqlc.arg(team_id) AND a.stripe_customer_id = sqlc.arg(customer_id)
+      AND (a.stripe_activation_credit_grant_id IS NULL OR a.stripe_activation_credit_grant_id = sqlc.arg(grant_id))
+    RETURNING a.team_id
+)
+UPDATE stripe_activation_credit_revocation r
+SET completed_at = COALESCE(r.completed_at, now()), stripe_grant_id = sqlc.arg(grant_id)
+FROM account a
+WHERE r.team_id = a.team_id AND r.stripe_customer_id = sqlc.arg(customer_id)
+  AND (r.stripe_grant_id IS NULL OR r.stripe_grant_id = sqlc.arg(grant_id))
+RETURNING r.team_id;
+

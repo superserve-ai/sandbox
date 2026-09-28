@@ -22,16 +22,19 @@ import (
 )
 
 type billingAccount struct {
-	TeamID            uuid.UUID
-	CustomerID        *string
-	SubscriptionID    *string
-	Status            *string
-	EventAt           *time.Time
-	GrantID           *string
-	TrialEndedAt      *time.Time
-	CheckoutAt        *time.Time
-	CheckoutSessionID *string
-	UserPromotion     bool
+	TeamID             uuid.UUID
+	CustomerID         *string
+	SubscriptionID     *string
+	Status             *string
+	EventAt            *time.Time
+	GrantID            *string
+	TrialEndedAt       *time.Time
+	CheckoutAt         *time.Time
+	CheckoutSessionID  *string
+	UserPromotion      bool
+	CancelAtPeriodEnd  bool
+	RevocationPending  bool
+	RevocationComplete bool
 }
 
 type stripeSubscription struct {
@@ -243,6 +246,7 @@ func main() {
 	var target string
 	var excluded string
 	var apply bool
+	var revokeActivation bool
 	var grantAmountCents int64
 	var databaseURL string
 	var stripeBaseURL string
@@ -250,6 +254,7 @@ func main() {
 	var batchSize int
 	flag.StringVar(&target, "team", "", "team UUID to audit; required with -apply")
 	flag.StringVar(&excluded, "exclude-team", "", "team UUID to report as excluded (repeat command for more exclusions)")
+	flag.BoolVar(&revokeActivation, "revoke-activation", false, "audit cancellation credit revocation without activation settlement")
 	flag.BoolVar(&apply, "apply", false, "apply one verified repair; default is dry-run")
 	flag.StringVar(&databaseURL, "database-url", os.Getenv("DATABASE_URL"), "Postgres URL (default DATABASE_URL)")
 	flag.StringVar(&stripeBaseURL, "stripe-api-base-url", envOr("STRIPE_API_BASE_URL", "https://api.stripe.com"), "Stripe API base URL")
@@ -259,6 +264,9 @@ func main() {
 	flag.Parse()
 	if grantAmountCents <= 0 || (grantAmountCents != 9500 && target == "") {
 		fatal("positive activation credit required; non-default amount requires -team")
+	}
+	if revokeActivation && grantAmountCents != 9500 {
+		fatal("revocation only supports the standard activation credit")
 	}
 	if databaseURL == "" {
 		fatal("database URL is required")
@@ -299,7 +307,13 @@ func main() {
 	var after *uuid.UUID
 	for {
 		loadCtx, cancelLoad := context.WithTimeout(ctx, billingRecoveryOperationTimeout)
-		accounts, err := loadAccounts(loadCtx, pool, targetID, after, batchSize)
+		var accounts []billingAccount
+		var err error
+		if revokeActivation {
+			accounts, err = loadRevocationAccounts(loadCtx, pool, targetID, after, batchSize)
+		} else {
+			accounts, err = loadAccounts(loadCtx, pool, targetID, after, batchSize)
+		}
 		cancelLoad()
 		if err != nil {
 			fatal(err.Error())
@@ -309,7 +323,12 @@ func main() {
 		}
 		for _, account := range accounts {
 			accountCtx, cancelAccount := context.WithTimeout(ctx, billingRecoveryOperationTimeout)
-			outcome := auditAccount(accountCtx, pool, stripe, account, excludedID, apply)
+			var outcome map[string]any
+			if revokeActivation {
+				outcome = auditRevocation(accountCtx, pool, stripe, account, excludedID, apply)
+			} else {
+				outcome = auditAccount(accountCtx, pool, stripe, account, excludedID, apply)
+			}
 			cancelAccount()
 			encoded, _ := json.Marshal(outcome)
 			fmt.Println(string(encoded))

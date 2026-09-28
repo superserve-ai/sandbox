@@ -65,6 +65,14 @@ type StripeCreditBalance struct {
 	IncludesCurrentPeriodUsage bool
 }
 
+type stripeActivationCreditRevoker interface {
+	RevokeActivationCredit(context.Context, uuid.UUID, string, string) (string, error)
+}
+
+func (c *stripeHTTPClient) RevokeActivationCredit(ctx context.Context, teamID uuid.UUID, customerID, grantID string) (string, error) {
+	return billing.RevokeStripeActivationGrant(ctx, c.doForm, teamID, customerID, grantID)
+}
+
 type stripeCreditBalanceReader interface {
 	GetCustomerCreditBalance(context.Context, string) (StripeCreditBalance, error)
 }
@@ -2067,15 +2075,106 @@ func (h *Handlers) processRecordedStripeWebhook(ctx context.Context, event strip
 		h.rollbackAndPersistStripeWebhookFailure(ctx, conn, lease, processTx, event.ID, err, false)
 		return err
 	}
-	if _, err := q.MarkStripeWebhookEventProcessed(ctx, event.ID); err != nil {
-		h.rollbackAndPersistStripeWebhookFailure(ctx, conn, lease, processTx, event.ID, err, true)
+	cleanupPending, err := stripeActivationCleanupPending(ctx, q, lease)
+	if err != nil {
 		return err
+	}
+	if !cleanupPending {
+		if _, err := q.MarkStripeWebhookEventProcessed(ctx, event.ID); err != nil {
+			h.rollbackAndPersistStripeWebhookFailure(ctx, conn, lease, processTx, event.ID, err, true)
+			return err
+		}
 	}
 	if err := processTx.Commit(ctx); err != nil {
 		h.rollbackAndPersistStripeWebhookFailure(ctx, conn, lease, processTx, event.ID, err, true)
 		return err
 	}
+	if cleanupPending {
+		return h.finishRecordedStripeWebhook(ctx, conn, event.ID, lease)
+	}
 	return nil
+}
+
+func stripeActivationCleanupPending(ctx context.Context, q *db.Queries, lease *stripeWebhookProcessingLease) (bool, error) {
+	if lease == nil {
+		return false, nil
+	}
+	revocation, err := q.GetStripeActivationCreditRevocation(ctx, lease.CustomerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return !revocation.CompletedAt.Valid, err
+}
+
+// Both grant creation and ordinary lifecycle processing commit before this
+// continuation. The webhook stays retryable until external cleanup is confirmed.
+func (h *Handlers) finishRecordedStripeWebhook(ctx context.Context, conn *pgxpool.Conn, eventID string, lease *stripeWebhookProcessingLease) error {
+	err := h.reconcileStripeActivationRevocation(ctx, conn, eventID, lease)
+	if err != nil {
+		h.rollbackAndPersistStripeWebhookFailure(ctx, conn, lease, nil, eventID, err, false)
+	}
+	return err
+}
+
+func (h *Handlers) reconcileStripeActivationRevocation(ctx context.Context, conn *pgxpool.Conn, eventID string, lease *stripeWebhookProcessingLease) error {
+	queries := db.New(conn)
+	var pending db.GetStripeActivationCreditRevocationRow
+	grantID := ""
+	if lease != nil {
+		var err error
+		pending, err = queries.GetStripeActivationCreditRevocation(ctx, lease.CustomerID)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if err == nil && !pending.CompletedAt.Valid {
+			revoker, ok := h.Stripe.(stripeActivationCreditRevoker)
+			if !ok {
+				return errors.New("Stripe activation credit revocation is not configured")
+			}
+			grantID, err = revoker.RevokeActivationCredit(ctx, pending.TeamID, pending.StripeCustomerID, derefString(pending.ActivationGrantID))
+			if err != nil {
+				return err
+			}
+			if grantID == "" {
+				return errors.New("Stripe activation credit revocation returned no grant identity")
+			}
+		}
+	}
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	q := h.DB.WithTx(tx)
+	if err := lease.lock(ctx, q); err != nil {
+		return err
+	}
+	if grantID != "" {
+		account, err := q.GetTeamBillingAccount(ctx, pending.TeamID)
+		if err != nil {
+			return err
+		}
+		// Discovery can resolve an ambiguous creation attempt. Finalize its
+		// pinned redemption before storing the recovered ID, which otherwise
+		// makes promotion finalization treat the account as already settled.
+		if account.StripeActivationUserID.Valid && account.StripeActivationCreditReservedAt.Valid &&
+			!account.StripeActivationCreditGrantedAt.Valid && derefString(account.StripeActivationCreditGrantID) == "" {
+			if err := q.FinalizeStripePromotion(ctx, db.FinalizeStripePromotionParams{
+				TeamID: pending.TeamID, UserID: uuid.UUID(account.StripeActivationUserID.Bytes), StripeGrantID: grantID,
+			}); err != nil {
+				return err
+			}
+		}
+		if _, err := q.CompleteStripeActivationCreditRevocation(ctx, db.CompleteStripeActivationCreditRevocationParams{
+			TeamID: pending.TeamID, CustomerID: pending.StripeCustomerID, GrantID: stringPtr(grantID),
+		}); err != nil {
+			return err
+		}
+	}
+	if _, err := q.MarkStripeWebhookEventProcessed(ctx, eventID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 type stripeWebhookProcessingLease struct {
@@ -2162,6 +2261,7 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, quer
 		StripeActivationCreditGrantID:   account.StripeActivationCreditGrantID,
 		CheckoutInitializingAt:          account.CheckoutInitializingAt,
 		CheckoutSessionID:               account.CheckoutSessionID,
+		CancelAtPeriodEnd:               account.CancelAtPeriodEnd,
 	}
 	// Apply the same ordering and subscription identity guards as webhook
 	// processing before establishing a durable reservation. An ignored stale
@@ -2187,7 +2287,7 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, quer
 		if event.Type == "customer.subscription.deleted" {
 			orderingStatus = "canceled"
 		}
-		if eventAt.Before(previousAt) || (eventAt.Equal(previousAt) && shouldSkipEqualTimestampStripeSubscription(orderingAccount, obj.ID, orderingStatus)) {
+		if eventAt.Before(previousAt) || (eventAt.Equal(previousAt) && shouldSkipEqualTimestampStripeSubscription(orderingAccount, obj.ID, orderingStatus, obj.CancelAtPeriodEnd)) {
 			return nil, nil
 		}
 	}
@@ -2499,22 +2599,23 @@ func isTerminalStripeSubscriptionStatus(status string) bool {
 }
 
 type stripeSubscriptionState struct {
-	SubscriptionID *string
-	Status         *string
-	TrialEndedAt   pgtype.Timestamptz
-	GrantAt        pgtype.Timestamptz
-	GrantID        *string
-	CheckoutAt     pgtype.Timestamptz
-	CheckoutID     *string
-	CustomerID     *string
+	SubscriptionID    *string
+	Status            *string
+	TrialEndedAt      pgtype.Timestamptz
+	GrantAt           pgtype.Timestamptz
+	GrantID           *string
+	CheckoutAt        pgtype.Timestamptz
+	CheckoutID        *string
+	CustomerID        *string
+	CancelAtPeriodEnd bool
 }
 
 func stripeSubscriptionStateFrom(account any) stripeSubscriptionState {
 	switch a := account.(type) {
 	case db.TeamBillingAccount:
-		return stripeSubscriptionState{a.StripeSubscriptionID, a.StripeSubscriptionStatus, a.TrialEndedAt, a.StripeActivationCreditGrantedAt, a.StripeActivationCreditGrantID, a.CheckoutInitializingAt, a.CheckoutSessionID, a.StripeCustomerID}
+		return stripeSubscriptionState{a.StripeSubscriptionID, a.StripeSubscriptionStatus, a.TrialEndedAt, a.StripeActivationCreditGrantedAt, a.StripeActivationCreditGrantID, a.CheckoutInitializingAt, a.CheckoutSessionID, a.StripeCustomerID, a.CancelAtPeriodEnd}
 	case db.GetTeamBillingAccountByStripeCustomerIDRow:
-		return stripeSubscriptionState{a.StripeSubscriptionID, a.StripeSubscriptionStatus, a.TrialEndedAt, a.StripeActivationCreditGrantedAt, a.StripeActivationCreditGrantID, a.CheckoutInitializingAt, a.CheckoutSessionID, a.StripeCustomerID}
+		return stripeSubscriptionState{a.StripeSubscriptionID, a.StripeSubscriptionStatus, a.TrialEndedAt, a.StripeActivationCreditGrantedAt, a.StripeActivationCreditGrantID, a.CheckoutInitializingAt, a.CheckoutSessionID, a.StripeCustomerID, a.CancelAtPeriodEnd}
 	default:
 		return stripeSubscriptionState{}
 	}
@@ -2525,7 +2626,7 @@ func isStripeActivationStateComplete(account any) bool {
 	return a.TrialEndedAt.Valid && a.GrantAt.Valid && strings.TrimSpace(derefString(a.GrantID)) != ""
 }
 
-func shouldSkipEqualTimestampStripeSubscription(account any, incomingSubscriptionID, incomingStatus string) bool {
+func shouldSkipEqualTimestampStripeSubscription(account any, incomingSubscriptionID, incomingStatus string, incomingCancel ...bool) bool {
 	a := stripeSubscriptionStateFrom(account)
 	currentSubscriptionID := strings.TrimSpace(derefString(a.SubscriptionID))
 	if currentSubscriptionID == "" || currentSubscriptionID != strings.TrimSpace(incomingSubscriptionID) {
@@ -2537,6 +2638,11 @@ func shouldSkipEqualTimestampStripeSubscription(account any, incomingSubscriptio
 	}
 	if isTerminalStripeSubscriptionStatus(previousStatus) || !isActivatingStripeSubscriptionStatus(incomingStatus) {
 		return true
+	}
+	if len(incomingCancel) > 0 && incomingCancel[0] != a.CancelAtPeriodEnd {
+		// Cancellation wins same-second ties. A later reversal can update the
+		// projection but cannot erase the durable revocation request.
+		return a.CancelAtPeriodEnd
 	}
 	return isActivatingStripeSubscriptionStatus(previousStatus) && isStripeActivationStateComplete(account)
 }
@@ -2654,8 +2760,14 @@ func (h *Handlers) associateStripeCheckoutBeforeReconciliation(ctx context.Conte
 		if err := h.processStripeWebhookEvent(ctx, tx, latest); err != nil {
 			return nil, err
 		}
-		if _, err := q.MarkStripeWebhookEventProcessed(ctx, latest.ID); err != nil {
-			return nil, err
+		revocation, revocationErr := q.GetStripeActivationCreditRevocation(ctx, obj.Customer)
+		if revocationErr != nil && !errors.Is(revocationErr, pgx.ErrNoRows) {
+			return nil, revocationErr
+		}
+		if errors.Is(revocationErr, pgx.ErrNoRows) || revocation.CompletedAt.Valid {
+			if _, err := q.MarkStripeWebhookEventProcessed(ctx, latest.ID); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -2783,6 +2895,7 @@ func (h *Handlers) finalizeRecordedStripePromotion(ctx context.Context, conn *pg
 	if err := lease.lock(ctx, q); err != nil {
 		return err
 	}
+	cleanupPending := false
 	finalize := func() error {
 		if err := q.LockStripePromotion(ctx, db.LockStripePromotionParams{TeamID: pending.TeamID, UserID: pending.UserID}); err != nil {
 			return err
@@ -2806,14 +2919,26 @@ func (h *Handlers) finalizeRecordedStripePromotion(ctx context.Context, conn *pg
 		if err := q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: pending.TeamID, SubscriptionID: account.StripeSubscriptionID}); err != nil {
 			return err
 		}
-		_, err = q.MarkStripeWebhookEventProcessed(ctx, eventID)
+		cleanupPending, err = stripeActivationCleanupPending(ctx, q, lease)
+		if err != nil {
+			return err
+		}
+		if !cleanupPending {
+			_, err = q.MarkStripeWebhookEventProcessed(ctx, eventID)
+		}
 		return err
 	}
 	if err := finalize(); err != nil {
 		h.rollbackAndPersistStripeWebhookFailure(ctx, conn, lease, tx, eventID, wrapStripePromotionGrantFinalizationError(err, pending.TeamID, pending.UserID), false)
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if cleanupPending {
+		return h.finishRecordedStripeWebhook(ctx, conn, eventID, lease)
+	}
+	return nil
 }
 
 func (h *Handlers) settleStaleStripePromotion(ctx context.Context, q *db.Queries, account db.GetTeamBillingAccountByStripeCustomerIDRow, eventID, customerID string) error {
@@ -2925,6 +3050,32 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 		if eventAt.IsZero() {
 			return nil
 		}
+		cancellation := obj.CancelAtPeriodEnd || strings.EqualFold(obj.Status, "canceled") || event.Type == "customer.subscription.deleted"
+		// A delayed cancellation of the original activation subscription still
+		// revokes its grant after checkout establishes a replacement. The pinned
+		// redemption event proves ownership without weakening projection guards.
+		if cancellation && !stripeSubscriptionMatchesCurrentAssociation(account, obj.ID) &&
+			account.StripeActivationCreditReservationEventID != nil && account.StripeActivationCreditGrantID != nil {
+			original, err := q.GetStripeWebhookEvent(ctx, *account.StripeActivationCreditReservationEventID)
+			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+			if err == nil && strings.HasPrefix(original.EventType, "customer.subscription.") {
+				var envelope stripeEventEnvelope
+				var activation stripeSubscriptionObject
+				if err := json.Unmarshal(original.Payload, &envelope); err != nil {
+					return err
+				}
+				if err := json.Unmarshal(envelope.Data.Object, &activation); err != nil {
+					return err
+				}
+				if activation.ID == obj.ID && activation.Customer == obj.Customer {
+					if err := q.RequestStripeActivationCreditRevocation(ctx, account.TeamID); err != nil {
+						return err
+					}
+				}
+			}
+		}
 		// A lifecycle event can establish the subscription ID before checkout
 		// completion. Matching expiration still wins over that association.
 		expired, err := stripeSubscriptionGenerationExpired(ctx, q, account, obj.Metadata["checkout_generation"])
@@ -2953,15 +3104,24 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 			}
 			return h.settleStaleStripePromotion(ctx, q, account, event.ID, obj.Customer)
 		}
+		if cancellation &&
+			(account.StripeActivationCreditGrantID != nil || account.StripeActivationCreditGrantedAt.Valid || account.StripeActivationCreditReservedAt.Valid) {
+			if err := q.RequestStripeActivationCreditRevocation(ctx, account.TeamID); err != nil {
+				return err
+			}
+		}
 		if account.StripeSubscriptionEventAt.Valid {
 			previousAt := account.StripeSubscriptionEventAt.Time.UTC()
 			orderingStatus := obj.Status
 			if event.Type == "customer.subscription.deleted" {
 				orderingStatus = "canceled"
 			}
-			if eventAt.Before(previousAt) || (eventAt.Equal(previousAt) && shouldSkipEqualTimestampStripeSubscription(account, obj.ID, orderingStatus)) {
+			if eventAt.Before(previousAt) || (eventAt.Equal(previousAt) && shouldSkipEqualTimestampStripeSubscription(account, obj.ID, orderingStatus, obj.CancelAtPeriodEnd)) {
 				return h.settleStaleStripePromotion(ctx, q, account, event.ID, obj.Customer)
 			}
+		}
+		if event.Type == "customer.subscription.deleted" {
+			obj.Status = "canceled"
 		}
 		start, end, ok := stripeSubscriptionPeriodBounds(obj)
 		terminalStatus := strings.EqualFold(obj.Status, "unpaid") || strings.EqualFold(obj.Status, "canceled") || strings.EqualFold(obj.Status, "paused") || event.Type == "customer.subscription.deleted"

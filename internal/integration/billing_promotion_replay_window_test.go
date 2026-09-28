@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -49,11 +50,14 @@ func TestIntegration_ExpiredAmbiguousStripePromotionRetainsFence(t *testing.T) {
 			// would issue another credit instead of replaying the original result.
 			clear(stripe.accepted)
 			if stale {
+				// Without authoritative grant lookup, cancellation must retain
+				// the ambiguous attempt and leave cleanup retryable.
+				stripe.revocationErr = errors.New("Stripe activation grant lookup unavailable")
 				payload := stripeSubscriptionWebhookPayload(t, "evt_canceled_"+teamID.String(), "customer.subscription.deleted",
 					"sub_"+teamID.String(), "cus_"+teamID.String(), "canceled", now.Add(time.Second), now, now.AddDate(0, 1, 0))
 				req := httptest.NewRequest(http.MethodPost, "/stripe/webhook", strings.NewReader(string(payload)))
 				req.Header.Set("Stripe-Signature", stripeSignature(t, payload, now))
-				if w := doRequest(router, req); w.Code != http.StatusOK {
+				if w := doRequest(router, req); w.Code != http.StatusInternalServerError {
 					t.Fatalf("cancellation: %d %s", w.Code, w.Body.String())
 				}
 			}
