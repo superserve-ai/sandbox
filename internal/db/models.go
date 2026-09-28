@@ -784,6 +784,11 @@ type PromotionSignupDeviceEvidence struct {
 	RegisteredAt    time.Time `json:"registered_at"`
 }
 
+type PromotionStripeActorRedemption struct {
+	UserID     uuid.UUID `json:"user_id"`
+	RedeemedAt time.Time `json:"redeemed_at"`
+}
+
 type ProxyAudit struct {
 	ID             int64       `json:"id"`
 	Ts             time.Time   `json:"ts"`

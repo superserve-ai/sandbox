@@ -183,18 +183,35 @@ func TestIntegration_StripeDeviceLegacySettlementSurvivesDeletion(t *testing.T) 
 			}
 			rolloutExec(t, tx, `DELETE FROM team_credit_grant WHERE team_id=$1`, team)
 			rolloutExec(t, tx, `DELETE FROM team WHERE id=$1`, team)
+			var redeemedAt time.Time
+			if err := tx.QueryRow(ctx, `SELECT stripe_redemption_at FROM user_promotion_entitlement WHERE user_id=$1`, recipient).
+				Scan(&redeemedAt); err != nil {
+				t.Fatal(err)
+			}
+			rolloutExec(t, tx, `SAVEPOINT before_actor_deletion`)
 			rolloutExec(t, tx, `DELETE FROM profile WHERE id=$1`, recipient)
 			var retained bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM promotion_stripe_actor_redemption
+				WHERE user_id=$1 AND redeemed_at=$2)`, recipient, redeemedAt).Scan(&retained); err != nil || !retained {
+				t.Fatalf("actor redemption retained during deletion = %t: %v", retained, err)
+			}
+			rolloutExec(t, tx, `ROLLBACK TO SAVEPOINT before_actor_deletion`)
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM promotion_stripe_actor_redemption WHERE user_id=$1)`, recipient).
+				Scan(&retained); err != nil || retained {
+				t.Fatalf("rolled-back deletion retained actor redemption = %t: %v", retained, err)
+			}
+			rolloutExec(t, tx, `DELETE FROM profile WHERE id=$1`, recipient)
 			if err := tx.QueryRow(ctx, `SELECT
 				NOT EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$1)
 				AND EXISTS(SELECT 1 FROM promotion_signup_device_evidence WHERE user_id=$1 AND fingerprint=$2)
 				AND EXISTS(SELECT 1 FROM promotion_device_owner WHERE user_id=$3 AND fingerprint=$2)
+				AND EXISTS(SELECT 1 FROM promotion_stripe_actor_redemption WHERE user_id=$1 AND redeemed_at=$5)
 				AND CASE WHEN $4 THEN
 					EXISTS(SELECT 1 FROM promotion_identity_binding b JOIN promotion_identity i USING(identity_key)
 						WHERE b.user_id=$1 AND i.stripe_redemption_at IS NOT NULL)
 					AND NOT EXISTS(SELECT 1 FROM promotion_identity_history WHERE user_id=$1 AND promotion='stripe')
 				ELSE EXISTS(SELECT 1 FROM promotion_identity_history
-					WHERE user_id=$1 AND promotion='stripe' AND grant_state='granted') END`, recipient, fingerprint, owner, canonical).
+					WHERE user_id=$1 AND promotion='stripe' AND grant_state='granted') END`, recipient, fingerprint, owner, canonical, redeemedAt).
 				Scan(&retained); err != nil || !retained {
 				t.Fatalf("legacy consumption retained after deletion = %t: %v", retained, err)
 			}
@@ -223,6 +240,79 @@ func TestIntegration_StripeDeviceLegacySettlementSurvivesDeletion(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestIntegration_StripeDeviceDeniedCanonicalAliasDoesNotConsume(t *testing.T) {
+	ctx := context.Background()
+	tx := localIdentityTransaction(t, true)
+	rolloutExec(t, tx, `SELECT set_promotion_device_policy(false,false)`)
+	owner, recipient, alias := uuid.New(), uuid.New(), uuid.New()
+	ownerTeam, recipientTeam, aliasTeam := uuid.New(), uuid.New(), uuid.New()
+	fingerprint, recipientFingerprint := "visitor-"+uuid.NewString(), "visitor-"+uuid.NewString()
+	mailbox := "alias" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	localIdentityWrite(t, tx, owner, owner.String()+"@example.com", true, time.Now(), time.Now())
+	localIdentityWrite(t, tx, recipient, mailbox+"@gmail.com", true, time.Now(), time.Now())
+	localIdentityWrite(t, tx, alias, mailbox+"+alias@googlemail.com", true, time.Now(), time.Now())
+	for _, team := range []uuid.UUID{ownerTeam, recipientTeam, aliasTeam} {
+		rolloutExec(t, tx, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "promotion-"+team.String())
+		rolloutExec(t, tx, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team)
+	}
+	register := func(user uuid.UUID, device, want string) {
+		t.Helper()
+		var result string
+		if err := tx.QueryRow(ctx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+			user, uuid.New(), "event-"+uuid.NewString(), device).Scan(&result); err != nil || result != want {
+			t.Fatalf("registration = %q, want %q: %v", result, want, err)
+		}
+	}
+	reserve := func(team, user uuid.UUID, want string) {
+		t.Helper()
+		var result string
+		if err := tx.QueryRow(ctx, `SELECT reserve_stripe_promotion_with_device($1,$2,$3,NULL,NULL,false)`,
+			team, user, "evt-"+uuid.NewString()).Scan(&result); err != nil || result != want {
+			t.Fatalf("reservation = %q, want %q: %v", result, want, err)
+		}
+	}
+	register(owner, fingerprint, "owner")
+	register(recipient, recipientFingerprint, "owner")
+	reserve(recipientTeam, recipient, "acquired")
+	rolloutExec(t, tx, `SELECT finalize_stripe_promotion($1,$2,$3)`, recipientTeam, recipient, "grant-"+uuid.NewString())
+	register(alias, fingerprint, "owner_conflict")
+	// Even an account with an entitlement row has no Stripe consumption after denial.
+	rolloutExec(t, tx, `INSERT INTO user_promotion_entitlement(user_id) VALUES($1)`, alias)
+	reserve(aliasTeam, alias, "ineligible")
+	var bound bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM promotion_identity_binding b
+		JOIN promotion_identity i USING(identity_key) WHERE b.user_id=$1 AND i.stripe_redemption_at IS NOT NULL)
+		AND NOT EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$1
+			AND (stripe_redemption_at IS NOT NULL OR stripe_redemption_reserved_team_id IS NOT NULL))
+		AND NOT EXISTS(SELECT 1 FROM promotion_device_grant WHERE user_id=$1)`, alias).Scan(&bound); err != nil || !bound {
+		t.Fatalf("denied alias binding without grant = %t: %v", bound, err)
+	}
+	rolloutExec(t, tx, `SELECT set_promotion_device_policy(true,true)`)
+	assertOwnerEligible := func() {
+		t.Helper()
+		var result string
+		if err := tx.QueryRow(ctx, `SELECT promotion_device_decision($1,'stripe')`, owner).
+			Scan(&result); err != nil || result != "eligible" {
+			t.Fatalf("owner decision with denied alias = %q: %v", result, err)
+		}
+		rolloutExec(t, tx, `SAVEPOINT owner_reservation`)
+		reserve(ownerTeam, owner, "acquired")
+		rolloutExec(t, tx, `ROLLBACK TO SAVEPOINT owner_reservation`)
+	}
+	assertOwnerEligible()
+	rolloutExec(t, tx, `DELETE FROM profile WHERE id=$1`, alias)
+	var retained bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM promotion_stripe_actor_redemption WHERE user_id=$1)`, alias).
+		Scan(&retained); err != nil || retained {
+		t.Fatalf("denied alias deletion retained consumption = %t: %v", retained, err)
+	}
+	assertOwnerEligible()
+	rolloutExec(t, tx, `DELETE FROM team_credit_grant WHERE team_id=$1`, recipientTeam)
+	rolloutExec(t, tx, `DELETE FROM team WHERE id=$1`, recipientTeam)
+	rolloutExec(t, tx, `DELETE FROM profile WHERE id=$1`, recipient)
+	assertOwnerEligible()
 }
 
 func TestIntegration_StripeDeviceDecisionUsesRetainedGrantHistory(t *testing.T) {
