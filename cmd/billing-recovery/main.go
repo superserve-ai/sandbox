@@ -665,7 +665,8 @@ func sameRecoveryBillingSnapshot(left, right billingAccount) bool {
 		left.UserPromotion == right.UserPromotion &&
 		sameTime(left.EventAt, right.EventAt) &&
 		sameTime(left.CheckoutAt, right.CheckoutAt) &&
-		deref(left.CheckoutSessionID) == deref(right.CheckoutSessionID)
+		deref(left.CheckoutSessionID) == deref(right.CheckoutSessionID) &&
+		left.UserPromotion == right.UserPromotion
 }
 
 func isTerminalSubscriptionStatus(status string) bool {

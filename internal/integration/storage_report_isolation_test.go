@@ -39,6 +39,23 @@ type storageFailureCapture struct {
 	failures []telemetry.StorageReportFailure
 }
 
+type synchronizedLogBuffer struct {
+	mu sync.Mutex
+	bytes.Buffer
+}
+
+func (b *synchronizedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.Write(p)
+}
+
+func (b *synchronizedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.Buffer.String()
+}
+
 func (r *storageFailureCapture) RecordStorageReportFailure(_ context.Context, failure telemetry.StorageReportFailure) {
 	r.mu.Lock()
 	r.failures = append(r.failures, failure)
@@ -230,7 +247,7 @@ func waitLatestStorageReport(t *testing.T, hostID string) uuid.UUID {
 // transaction: liveness commits first, then the valid legacy report reaches
 // the worker and remains retryable after an interval-write failure.
 func TestIntegration_HostHeartbeatRemainsHealthyWhenStorageProcessingFails(t *testing.T) {
-	var logOutput bytes.Buffer
+	var logOutput synchronizedLogBuffer
 	previousLogger := log.Logger
 	log.Logger = zerolog.New(&logOutput).Level(zerolog.InfoLevel)
 	t.Cleanup(func() { log.Logger = previousLogger })
@@ -269,20 +286,25 @@ func TestIntegration_HostHeartbeatRemainsHealthyWhenStorageProcessingFails(t *te
 	if host.Status != "active" {
 		t.Fatalf("storage failure made host unhealthy: %s", host.Status)
 	}
-	if !strings.Contains(logOutput.String(), `"host_id":"`+fixture.hostID+`"`) ||
-		!strings.Contains(logOutput.String(), "storage measurement processing failed") {
-		t.Fatalf("storage failure log = %q, want structured host_id and failure message", logOutput.String())
-	}
-	failures := recorder.snapshot()
-	retryable := false
-	for _, failure := range failures {
-		if failure.Result == "error" {
-			retryable = true
+	deadline := time.Now().Add(12 * time.Second)
+	for {
+		output := logOutput.String()
+		failures := recorder.snapshot()
+		retryable := false
+		for _, failure := range failures {
+			if failure.Result == "error" {
+				retryable = true
+				break
+			}
+		}
+		if strings.Contains(output, `"host_id":"`+fixture.hostID+`"`) &&
+			strings.Contains(output, "storage measurement processing failed") && retryable {
 			break
 		}
-	}
-	if !retryable {
-		t.Fatalf("storage failure metrics = %#v, want retryable failure", failures)
+		if time.Now().After(deadline) {
+			t.Fatalf("storage failure log = %q, metrics = %#v; want structured host_id, failure message, and retryable failure", output, failures)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

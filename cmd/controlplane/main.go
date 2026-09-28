@@ -202,6 +202,10 @@ func run() error {
 		handlers.TrialWarningSender = api.NewResendTrialCreditWarningSender(apiKey, from, queries)
 	}
 	handlers.Pool = dbPool
+	handlers.PromotionAuthPool = newPromotionAuthPool(ctx, os.Getenv("PROMOTION_AUTH_DATABASE_URL"))
+	if handlers.PromotionAuthPool != nil {
+		defer handlers.PromotionAuthPool.Close()
+	}
 	handlers.Stripe = api.NewStripeBillingClient(cfg)
 
 	// Product-usage analytics — no-op when POSTHOG_KEY is unset.
@@ -463,6 +467,27 @@ func run() error {
 
 	log.Info().Msg("controlplane stopped")
 	return nil
+}
+
+func newPromotionAuthPool(ctx context.Context, authURL string) *pgxpool.Pool {
+	if authURL == "" {
+		return nil
+	}
+	authCfg, err := pgxpool.ParseConfig(authURL)
+	if err != nil {
+		// Parse errors can contain credentials from the connection string.
+		log.Warn().Msg("invalid PROMOTION_AUTH_DATABASE_URL; promotion authority unavailable")
+		return nil
+	}
+	authCfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeCacheDescribe
+	authCfg.ConnConfig.ConnectTimeout = 5 * time.Second
+	authCfg.MaxConns = 4
+	authPool, err := pgxpool.NewWithConfig(ctx, authCfg)
+	if err != nil {
+		log.Warn().Msg("promotion auth database pool initialization failed; promotion authority unavailable")
+		return nil
+	}
+	return authPool
 }
 
 // reconcileSystemTeamQuota lifts the system team's max_sandboxes and
