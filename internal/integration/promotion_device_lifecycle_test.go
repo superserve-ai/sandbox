@@ -249,10 +249,11 @@ func TestIntegration_LegacySignupDeviceGrantSurvivesActivation(t *testing.T) {
 				register(recipient, "owner_conflict")
 			}
 			rolloutExec(t, region, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "promotion-"+team.String())
+			// Model a grant issued before the public claim became device-aware.
 			claimLegacy := func() {
 				t.Helper()
 				var outcome, reason string
-				if err := region.QueryRow(ctx, `SELECT * FROM claim_team_signup_trial($1,$2)`, team, recipient).
+				if err := region.QueryRow(ctx, `SELECT * FROM claim_team_signup_trial_without_device($1,$2)`, team, recipient).
 					Scan(&outcome, &reason); err != nil || outcome != "granted" {
 					t.Fatalf("legacy signup = %q, %q: %v", outcome, reason, err)
 				}
@@ -1109,7 +1110,8 @@ func TestIntegration_LegacyStripeDeviceReservationSurvivesActivation(t *testing.
 			}
 			event := "evt-" + uuid.NewString()
 			var result string
-			if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,$3,NULL,NULL,false)`,
+			// Preserve the pre-enforcement reservation shape without a device pin.
+			if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state_without_device($1,$2,$3,NULL,NULL,false)`,
 				otherTeam, other, event).Scan(&result); err != nil || result != "acquired" {
 				t.Fatalf("legacy reservation while device policy is off: %s, %v", result, err)
 			}

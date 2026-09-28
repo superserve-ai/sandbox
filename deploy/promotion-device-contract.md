@@ -261,10 +261,12 @@ its commit state cannot be inferred from the lost response.
 For a completed paid activation with a promotion reservation denial, the webhook writes
 `stripe_promotion_outcome` in the same transaction as activation and webhook
 completion. The row is keyed by Stripe event ID and contains the team, actor,
-`promotion_ineligible`, and a safe reason: `ineligible`, `owner_conflict`,
+`promotion_ineligible`, and a safe reason: `ineligible`, `user_already_redeemed`, `owner_conflict`,
 `device_already_redeemed`, `evidence_missing`, `device_reservation_pending`, or
 `authority_unavailable`. A contended `blocked` reservation retries the webhook
-and has no completed outcome.
+and has no completed outcome. `user_already_redeemed` comes from the atomic
+reservation check of the actor's settled entitlement. Missing canonical evidence
+and migration fences remain `ineligible`; they do not confirm prior redemption.
 
 `POST /internal/promotion/account/signup-eligibility` accepts `user_id` under
 the account credential and matching `X-Actor-User-Id` header. Call it in East
@@ -367,8 +369,11 @@ replace the atomic creation boundary.
 ### Integration reference and validation handoff
 
 The authentication and migration prerequisite consumed locally is
-`258a404db647eb0a0855971f38b5e887344232a9` from public PR #579. The regional migration
-names follow that revision; the grant integration migrations follow the entire
+`cc02819176cbd22941303d3a5a2520caea113805` from public PR #579, based on
+`c3b138e85abd6b26fab9e441d1de31b5fe6072d5`. Its promotion changes are integrated
+as a local content delta from the previously consumed revision, preserving the
+enforcement changes; the historical and squashed series are not both merged.
+The regional migration names follow that revision; the grant integration migrations follow the entire
 prerequisite chain. Do not apply both the superseded migration IDs and their
 renamed replacements. This is a pre-activation integration, not a deployed
 migration-history repair.
@@ -380,11 +385,11 @@ mismatched inputs. `TestIntegration_PromotionPolicyContentionPreservesProvisioni
 holds a real policy-row lock across explicit team creation and legacy owner
 assignment. `TestIntegration_TrustedTeamPromotionAttemptPrivilegesAndGrantFailure`
 checks RPC/table access and preservation of unrelated grant-error retries.
-These tests are authored; canonical execution after this change is pending.
-The earlier canonical pass predates this authentication reconciliation and does
-not prove Console signer interoperability. Before activation, record the exact
-validated backend reference and run the actual Console fixture producer and
-`TestPromotionAccountConsoleInterop`; the existing fixture covers bind/evidence/
-register only. Console must additionally implement and verify the creation call
-sequence and new signed fields above before this boundary is integrated end to
+The canonical validation recorded before this prerequisite update passed these
+three integration tests and the actual Console fixture producer with
+`TestPromotionAccountConsoleInterop` for bind/evidence/register. That evidence
+does not validate this newer prerequisite or the new redemption reason; canonical
+validation of the resulting backend revision is required. The existing Console
+fixture covers bind/evidence/register only. Console must additionally implement
+and verify the creation call sequence and new signed fields above before this boundary is integrated end to
 end.

@@ -2379,7 +2379,7 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, quer
 	var denialReason string
 	switch state {
 	case "acquired", "existing", "blocked":
-	case "ineligible", "owner_conflict", "device_already_redeemed", "evidence_missing", "device_reservation_pending":
+	case "ineligible", "user_already_redeemed", "owner_conflict", "device_already_redeemed", "evidence_missing", "device_reservation_pending":
 		denialReason = state
 	default:
 		return nil, fmt.Errorf("unknown Stripe promotion reservation state %q", state)
