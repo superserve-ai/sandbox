@@ -47,9 +47,11 @@ func TestEagerOverlayEnabled(t *testing.T) {
 }
 
 // forkLoadBody runs a fork of a fresh saved snapshot of a paused source until
-// Firecracker's load request, and returns that request's body. The fake API
-// refuses the load so the restore stops there.
-func forkLoadBody(t *testing.T, layered, capable bool) (body, mode string) {
+// Firecracker's load request, and returns the last request's body and the mode
+// its load was measured under. The fake API refuses the load so the restore
+// stops there; with rolledBack it first refuses eager_overlay as unknown, as a
+// binary without the field would.
+func forkLoadBody(t *testing.T, layered, capable, rolledBack bool) (body, mode string) {
 	t.Helper()
 	useTempFloor(t)
 	withPSI(t, 0, 0)
@@ -84,7 +86,12 @@ func forkLoadBody(t *testing.T, layered, capable bool) (body, mode string) {
 				mu.Lock()
 				body = string(b)
 				mu.Unlock()
+				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
+				if rolledBack && strings.Contains(string(b), "eager_overlay") {
+					_, _ = w.Write([]byte(unknownFieldPayload("eager_overlay")))
+					return
+				}
 				_, _ = w.Write([]byte(`{"fault_message":"stop after the load request"}`))
 				return
 			}
@@ -105,15 +112,24 @@ func forkLoadBody(t *testing.T, layered, capable bool) (body, mode string) {
 }
 
 func TestForkRestoreAsksForEagerOverlayOnlyWhenLayeredAndCapable(t *testing.T) {
-	b, mode := forkLoadBody(t, true, true)
+	b, mode := forkLoadBody(t, true, true, false)
 	if !strings.Contains(b, `"eager_overlay":true`) || mode != "eager" {
 		t.Fatalf("a layered fork on a capable binary must ask for the pre-copy under its own mode; mode=%q body=%s", mode, b)
 	}
 	for _, c := range []struct{ layered, capable bool }{{true, false}, {false, true}} {
-		b, mode := forkLoadBody(t, c.layered, c.capable)
+		b, mode := forkLoadBody(t, c.layered, c.capable, false)
 		if strings.Contains(b, "eager_overlay") || mode != "" {
 			t.Fatalf("layered=%v capable=%v must not pre-copy; mode=%q body=%s", c.layered, c.capable, mode, b)
 		}
+	}
+}
+
+// A binary rolled back under a running daemon refuses the field; the retry
+// without it is measured as the restore that actually ran.
+func TestForkRestoreRefusedEagerOverlayIsMeasuredWithoutIt(t *testing.T) {
+	b, mode := forkLoadBody(t, true, true, true)
+	if strings.Contains(b, "eager_overlay") || mode != "" {
+		t.Fatalf("the retry must drop the field and the eager mode; mode=%q body=%s", mode, b)
 	}
 }
 
@@ -121,23 +137,23 @@ func TestRestoreWithEagerOverlayFallback_UnknownFieldRetriesWithout(t *testing.T
 	m := &Manager{log: zerolog.Nop()}
 	m.eagerOverlayCapable.Store(true)
 	var sent []bool
-	err := m.restoreWithEagerOverlayFallback(true, func(eager bool) error {
+	used, err := m.restoreWithEagerOverlayFallback(true, func(eager bool) error {
 		sent = append(sent, eager)
 		if eager {
 			return errors.New("[PUT /snapshot/load][400] unknown field `eager_overlay`, expected one of `backend_path`")
 		}
 		return nil
 	})
-	if err != nil || len(sent) != 2 || !sent[0] || sent[1] {
-		t.Fatalf("want one refused eager attempt then one without; sent=%v err=%v", sent, err)
+	if err != nil || used || len(sent) != 2 || !sent[0] || sent[1] {
+		t.Fatalf("want one refused eager attempt then one without; sent=%v used=%v err=%v", sent, used, err)
 	}
 	if m.eagerOverlayCapable.Load() {
 		t.Fatal("a refusal must clear the capability for later forks")
 	}
 	sent = nil
-	_ = m.restoreWithEagerOverlayFallback(true, func(eager bool) error { sent = append(sent, eager); return nil })
-	if len(sent) != 1 || sent[0] {
-		t.Fatalf("once cleared, forks must not send the field; sent=%v", sent)
+	used, _ = m.restoreWithEagerOverlayFallback(true, func(eager bool) error { sent = append(sent, eager); return nil })
+	if used || len(sent) != 1 || sent[0] {
+		t.Fatalf("once cleared, forks must not send the field; sent=%v used=%v", sent, used)
 	}
 }
 
@@ -145,9 +161,9 @@ func TestRestoreWithEagerOverlayFallback_OtherErrorsAreNotRetried(t *testing.T) 
 	m := &Manager{log: zerolog.Nop()}
 	m.eagerOverlayCapable.Store(true)
 	calls := 0
-	err := m.restoreWithEagerOverlayFallback(true, func(bool) error { calls++; return errors.New("load snapshot: connection refused") })
-	if err == nil || calls != 1 || !m.eagerOverlayCapable.Load() {
-		t.Fatalf("calls=%d err=%v capable=%v", calls, err, m.eagerOverlayCapable.Load())
+	used, err := m.restoreWithEagerOverlayFallback(true, func(bool) error { calls++; return errors.New("load snapshot: connection refused") })
+	if err == nil || !used || calls != 1 || !m.eagerOverlayCapable.Load() {
+		t.Fatalf("calls=%d used=%v err=%v capable=%v", calls, used, err, m.eagerOverlayCapable.Load())
 	}
 }
 

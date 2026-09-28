@@ -4147,12 +4147,19 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				var armed string
 				armed, restoreClockFrozen, attemptErr = m.restoreWithSessionFallback(trackingSessionID, func(sid string) (bool, error) {
 					return m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
-						return m.restoreWithEagerOverlayFallback(eager, func(eager bool) error {
+						used, err := m.restoreWithEagerOverlayFallback(eager, func(eager bool) error {
 							return RestoreSnapshotUffdInternalWithOverrides(
 								socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
 								m.cfg.HandlerDeathAbortEnabled, eager, sid, clock,
 							)
 						})
+						// A refused field fell back without it: measure the
+						// restore as the one that actually ran.
+						if eager && !used {
+							eager = false
+							restoreMode = strings.TrimSuffix(strings.TrimSuffix(restoreMode, "eager"), "+")
+						}
+						return err
 					})
 				})
 				if armed != trackingSessionID {

@@ -35,17 +35,18 @@ func (m *Manager) eagerOverlayEnabled() bool {
 // restoreWithEagerOverlayFallback runs restore with eager and, if this
 // Firecracker rejects the field as unknown (a rollback under a running
 // daemon), clears the capability and retries once without it. The refusal is
-// raised before any guest state is touched.
-func (m *Manager) restoreWithEagerOverlayFallback(eager bool, restore func(eager bool) error) error {
+// raised before any guest state is touched. Returns whether the restore that
+// ran asked for the pre-copy.
+func (m *Manager) restoreWithEagerOverlayFallback(eager bool, restore func(eager bool) error) (used bool, err error) {
 	if eager && !m.eagerOverlayCapable.Load() {
 		eager = false
 	}
-	err := restore(eager)
+	err = restore(eager)
 	if !eager || err == nil || !strings.Contains(strings.ToLower(err.Error()), unknownEagerOverlayFieldMarker) {
-		return err
+		return eager, err
 	}
 	if m.eagerOverlayCapable.CompareAndSwap(true, false) {
 		m.log.Warn().Msg("firecracker rejected eager_overlay; forks restore without it until the binary advertises it again")
 	}
-	return restore(false)
+	return false, restore(false)
 }
