@@ -10,6 +10,9 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 	"testing"
 
 	"github.com/google/uuid"
@@ -208,52 +211,7 @@ func TestIntegration_PromotionDeviceConcurrentGrantWriters(t *testing.T) {
 		}
 	}
 
-	type result struct {
-		state string
-		err   error
-	}
-	race := func(fn func(int) (string, error)) [2]result {
-		t.Helper()
-		var results [2]result
-		start := make(chan struct{})
-		var wg sync.WaitGroup
-		for i := range users {
-			wg.Add(1)
-			go func(i int) {
-				defer wg.Done()
-				<-start
-				results[i].state, results[i].err = fn(i)
-			}(i)
-		}
-		close(start)
-		wg.Wait()
-		return results
-	}
-
-	var signupTeams [2]uuid.UUID
-	signups := race(func(i int) (string, error) {
-		var team uuid.UUID
-		err := region.QueryRow(ctx, `SELECT id FROM create_team_with_signup_trial($1,$2,'use')`,
-			"concurrent-signup-"+uuid.NewString(), users[i]).Scan(&team)
-		if err != nil {
-			return "", err
-		}
-		signupTeams[i] = team
-		var outcome string
-		err = region.QueryRow(ctx, `SELECT outcome FROM team_signup_promotion_outcome WHERE team_id=$1`, team).Scan(&outcome)
-		return outcome, err
-	})
-	for i, got := range signups {
-		want := "granted"
-		if i == 1 {
-			want = "promotion_ineligible"
-		}
-		if got.err != nil || got.state != want {
-			t.Fatalf("signup %d = %q, err=%v, want %q", i, got.state, got.err, want)
-		}
-	}
-
-	var billingTeams [2]uuid.UUID
+	var signupTeams, billingTeams [2]uuid.UUID
 	var events [2]string
 	for i := range users {
 		billingTeams[i] = uuid.New()
@@ -261,30 +219,111 @@ func TestIntegration_PromotionDeviceConcurrentGrantWriters(t *testing.T) {
 		rolloutExec(t, region, `INSERT INTO team(id,name) VALUES($1,$2)`, billingTeams[i], "concurrent-billing-"+billingTeams[i].String())
 		rolloutExec(t, region, `INSERT INTO team_billing_account(team_id) VALUES($1)`, billingTeams[i])
 	}
-	reservations := race(func(i int) (string, error) {
-		var state string
-		err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,$3,NULL,NULL,false)`,
-			billingTeams[i], users[i], events[i]).Scan(&state)
-		return state, err
-	})
-	for i, got := range reservations {
-		want := "acquired"
-		if i == 1 {
-			want = "owner_conflict"
-		}
-		if got.err != nil || got.state != want {
-			t.Fatalf("Stripe reservation %d = %q, err=%v, want %q", i, got.state, got.err, want)
+
+	// Each round overlaps different accounts at the real policy read. Reverse
+	// the promotions in round two so either attempted split is exercised.
+	for round := 0; round < 2; round++ {
+		func() {
+			ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			holder, err := region.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer holder.Rollback(context.Background())
+			rolloutExec(t, holder, `SELECT 1 FROM promotion_device_policy WHERE singleton FOR UPDATE`)
+			var holderPID int32
+			if err := holder.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holderPID); err != nil {
+				t.Fatal(err)
+			}
+			var conns [2]*pgxpool.Conn
+			var pids [2]int32
+			for i := range users {
+				conns[i], err = region.Acquire(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conns[i].Release()
+				pids[i] = int32(conns[i].Conn().PgConn().PID())
+			}
+			type result struct {
+				state string
+				err   error
+			}
+			var results [2]result
+			var wg sync.WaitGroup
+			defer func() { cancel(); wg.Wait() }()
+			for i := range users {
+				wg.Add(1)
+				go func(i int) {
+					defer wg.Done()
+					if i == round {
+						results[i].err = conns[i].QueryRow(ctx, `SELECT id FROM create_team_with_signup_trial($1,$2,'use')`,
+							"concurrent-signup-"+uuid.NewString(), users[i]).Scan(&signupTeams[i])
+						if results[i].err == nil {
+							results[i].err = conns[i].QueryRow(ctx, `SELECT outcome FROM team_signup_promotion_outcome WHERE team_id=$1`,
+								signupTeams[i]).Scan(&results[i].state)
+						}
+					} else {
+						results[i].err = conns[i].QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,$3,NULL,NULL,false)`,
+							billingTeams[i], users[i], events[i]).Scan(&results[i].state)
+					}
+				}(i)
+			}
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				var bothBlocked bool
+				if err := region.QueryRow(ctx, `SELECT $1 = ANY(pg_blocking_pids($2)) AND $1 = ANY(pg_blocking_pids($3))`,
+					holderPID, pids[0], pids[1]).Scan(&bothBlocked); err != nil {
+					t.Fatal(err)
+				}
+				if bothBlocked {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("signup and Stripe writers did not overlap at the database barrier")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := holder.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			wg.Wait()
+			for i, got := range results {
+				want := "acquired"
+				if i == round {
+					want = "granted"
+				}
+				if i == 1 {
+					want = "owner_conflict"
+					if i == round {
+						want = "promotion_ineligible"
+					}
+				}
+				if got.err != nil || got.state != want {
+					t.Fatalf("round %d account %d: state=%q want=%q err=%v", round, i, got.state, want, got.err)
+				}
+			}
+		}()
+	}
+	for i := range users {
+		_, err := region.Exec(ctx, `SELECT finalize_stripe_promotion($1,$2,$3)`, billingTeams[i], users[i], "grant-"+uuid.NewString())
+		if (i == 0 && err != nil) || (i == 1 && err == nil) {
+			t.Fatalf("Stripe finalization for account %d: %v", i, err)
 		}
 	}
+	var retainedOwner uuid.UUID
+	if err := region.QueryRow(ctx, `SELECT user_id FROM promotion_device_owner WHERE fingerprint=$1`, fingerprint).
+		Scan(&retainedOwner); err != nil || retainedOwner != users[0] {
+		t.Fatalf("promotion race changed owner: %s, %v", retainedOwner, err)
+	}
 
-	finalizations := race(func(i int) (string, error) {
-		_, err := region.Exec(ctx, `SELECT finalize_stripe_promotion($1,$2,$3)`,
-			billingTeams[i], users[i], "grant-"+uuid.NewString())
-		return "", err
-	})
-	if finalizations[0].err != nil || finalizations[1].err == nil {
-		t.Fatalf("Stripe finalization errors = [%v, %v], want winner success and loser rejection",
-			finalizations[0].err, finalizations[1].err)
+	var loserUnreserved bool
+	if err := region.QueryRow(ctx, `SELECT stripe_activation_credit_reserved_at IS NULL
+		AND stripe_activation_credit_grant_id IS NULL
+		AND NOT EXISTS(SELECT 1 FROM promotion_identity WHERE stripe_reserved_user_id=$2)
+		FROM team_billing_account WHERE team_id=$1`, billingTeams[1], users[1]).Scan(&loserUnreserved); err != nil || !loserUnreserved {
+		t.Fatalf("loser retained a billing reservation or grant: %t, %v", loserUnreserved, err)
 	}
 
 	for _, promotion := range []string{"signup", "stripe"} {

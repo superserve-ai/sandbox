@@ -3027,3 +3027,60 @@ func TestIntegration_ShadowExportDoesNotBlockLaterLiveExport(t *testing.T) {
 		t.Fatalf("period status after live export = %q, want exported", got)
 	}
 }
+
+func TestIntegration_StripePromotionPolicyTimeoutAllowsPaidActivation(t *testing.T) {
+	ctx := context.Background()
+	region := promotionIsolatedDatabase(t, true)
+	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
+	user, team := uuid.New(), uuid.New()
+	rolloutExec(t, region, `INSERT INTO profile(id,email) VALUES($1,$2)`, user, user.String()+"@example.com")
+	rolloutExec(t, region, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+		user, uuid.New(), "event-"+uuid.NewString(), "visitor-"+uuid.NewString())
+	rolloutExec(t, region, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "promotion-"+team.String())
+	rolloutExec(t, region, `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,stripe_subscription_status)
+		VALUES($1,$2,$3,'incomplete')`, team, "cus_"+team.String(), "sub_"+team.String())
+	var decision string
+	if err := region.QueryRow(ctx, `SELECT promotion_device_decision($1,'stripe')`, user).Scan(&decision); err != nil || decision != "eligible" {
+		t.Fatalf("uncontended promotion eligibility: %q, %v", decision, err)
+	}
+
+	holder, err := region.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback(ctx)
+	rolloutExec(t, holder, `SELECT 1 FROM promotion_device_policy WHERE singleton FOR UPDATE`)
+	stripe := &fakeStripeClient{}
+	router := newBillingRouterWithPool(t, stripe, region)
+	event := "evt_policy_timeout_" + uuid.NewString()
+	created := time.Now().UTC().Truncate(time.Second)
+	response := sendStripeActivationWebhook(t, router, event, team, user, created)
+	if response.Code != http.StatusOK {
+		t.Fatalf("policy timeout blocked paid activation: %d: %s", response.Code, response.Body.String())
+	}
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	response = sendStripeActivationWebhook(t, router, event, team, user, created)
+	if response.Code != http.StatusOK {
+		t.Fatalf("paid activation replay: %d: %s", response.Code, response.Body.String())
+	}
+	var paid, noConsumption bool
+	var outcome, reason string
+	if err := region.QueryRow(ctx, `SELECT
+		a.trial_ended_at IS NOT NULL AND a.stripe_subscription_status='active' AND e.processed_at IS NOT NULL,
+		a.stripe_activation_credit_grant_id IS NULL AND a.stripe_activation_credit_reserved_at IS NULL
+		AND NOT EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$3
+			AND (stripe_redemption_at IS NOT NULL OR stripe_redemption_reserved_team_id IS NOT NULL OR stripe_redemption_attempted_at IS NOT NULL))
+		AND NOT EXISTS(SELECT 1 FROM promotion_identity WHERE stripe_reserved_user_id=$3)
+		AND NOT EXISTS(SELECT 1 FROM team_credit_grant WHERE team_id=$2)
+		AND NOT EXISTS(SELECT 1 FROM promotion_device_grant WHERE user_id=$3),
+		o.outcome, o.reason
+		FROM team_billing_account a JOIN stripe_webhook_event e ON e.event_id=$1
+		JOIN stripe_promotion_outcome o ON o.event_id=e.event_id AND o.team_id=a.team_id AND o.user_id=$3
+		WHERE a.team_id=$2`, event, team, user).Scan(&paid, &noConsumption, &outcome, &reason); err != nil ||
+		!paid || !noConsumption || outcome != "promotion_ineligible" || reason != "authority_unavailable" || len(stripe.creditGrantCalls) != 0 {
+		t.Fatalf("policy timeout: paid=%t no_consumption=%t outcome=%s/%s Stripe=%d err=%v",
+			paid, noConsumption, outcome, reason, len(stripe.creditGrantCalls), err)
+	}
+}
