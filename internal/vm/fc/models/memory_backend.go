@@ -38,6 +38,9 @@ type MemoryBackend struct {
 	// Optional base (template) memory file for a layered UffdInternal restore. When set, a page is served from backend_path if present there, else from this base. Only meaningful when backend_type is UffdInternal; ignored otherwise.
 	BasePath string `json:"base_path,omitempty"`
 
+	// When true, a background thread copies every page the overlay provides into guest memory after load, so the guest does not fault on them. Only meaningful for a layered UffdInternal restore (base_path set); ignored otherwise. Support is advertised by the eager-overlay capability in `firecracker --version`.
+	EagerOverlay *bool `json:"eager_overlay,omitempty"`
+
 	// Optional path the in-process UFFD handler writes each served page offset to (template-build mode). Only meaningful when backend_type is UffdInternal; ignored otherwise. When present, prefetch is suppressed.
 	RecordTo string `json:"record_to,omitempty"`
 }

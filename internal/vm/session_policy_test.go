@@ -86,7 +86,7 @@ func TestGuardedSnapshotFieldsSerialize(t *testing.T) {
 	}
 	if err := RestoreSnapshotUffdInternalWithOverrides(
 		fc.socketPath, "/tmp/snap", "/tmp/mem", "", "", "", "eth0", "tap0", "",
-		true, false, "tok-2", nil,
+		true, false, false, "tok-2", nil,
 	); err != nil {
 		t.Fatal(err)
 	}

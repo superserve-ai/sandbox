@@ -1464,6 +1464,14 @@ definitions:
         description: Optional path to a recorded page-access trace replayed as
           prefetch on restore. Only meaningful when backend_type is UffdInternal;
           ignored otherwise.
+      eager_overlay:
+        type: boolean
+        default: false
+        description: When true, a background thread copies every page the overlay
+          provides into guest memory after load, so the guest does not fault on
+          them. Only meaningful for a layered UffdInternal restore (base_path set);
+          ignored otherwise. Support is advertised by the eager-overlay capability
+          in `firecracker --version`.
       record_to:
         type: string
         description: Optional path the in-process UFFD handler writes each served
@@ -1700,12 +1708,13 @@ definitions:
           (rejected as a bad request otherwise); installs a (session_id,
           generation=0) token that guarded snapshot requests
           (expected_session_id/expected_generation on PUT /snapshot/create)
-          can later compare against. MUST be freshly generated for every load
-          (a random nonce or UUID), never a stable identifier such as a VM
-          name - every new process re-arms at generation 0, so a reused id
-          would let a token persisted from an earlier process validate against
-          a dirty bitmap it never described. Support is advertised by the
-          dirty-tracking-session capability in the --version output.
+          can later compare against. MUST be freshly
+          generated for every load (a random nonce or UUID), never a stable
+          identifier such as a VM name - every new process re-arms
+          at generation 0, so a reused id would let a token persisted from an
+          earlier process validate against a dirty bitmap it never described.
+          Support is advertised by the dirty-tracking-session capability in
+          the --version output.
       mem_file_path:
         type: string
         description:

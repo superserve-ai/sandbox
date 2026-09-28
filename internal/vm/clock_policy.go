@@ -43,8 +43,8 @@ const firecrackerCapabilityProbeTimeout = 5 * time.Second
 const firecrackerCapabilityRefreshInterval = 5 * time.Minute
 
 // WatchFirecrackerCapability keeps the cached binary capabilities — the clock
-// option and the guarded dirty-tracking session — in step with the binary on
-// disk.
+// option, the guarded dirty-tracking session and eager overlay — in step with
+// the binary on disk.
 //
 // Runs entirely off the lifecycle paths: probing execs a process, which belongs
 // on neither a restore nor a restart. Until the first probe answers, every
@@ -77,6 +77,8 @@ func (m *Manager) WatchFirecrackerCapability(ctx context.Context, log zerolog.Lo
 		track(first, caps, dirtyTrackingSessionCap, &m.dirtyTrackingSessionCapable, m.cfg.DirtyTrackingSessionEnabled,
 			"firecracker dirty-tracking session capability changed",
 			"firecracker lacks the dirty-tracking session; guarded pauses stay off")
+		track(first, caps, eagerOverlayCap, &m.eagerOverlayCapable, false,
+			"firecracker eager-overlay capability changed", "")
 	}
 	go func() {
 		probe(true)

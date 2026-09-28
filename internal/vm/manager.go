@@ -798,6 +798,8 @@ type Manager struct {
 	// dirtyTrackingSessionCapable is the same probe for the guarded-session
 	// fields, demoted on the first refusal exactly like the clock flag.
 	dirtyTrackingSessionCapable atomic.Bool
+	// eagerOverlayCapable is the same probe for mem_backend.eager_overlay.
+	eagerOverlayCapable atomic.Bool
 }
 
 // trackedInstance returns vmID's in-memory instance, or nil — WITHOUT the
@@ -2931,7 +2933,7 @@ func (m *Manager) restoreForResume(socketPath, snapshotPath, memPath, basePath s
 		return m.restoreWithClockFallback(clockPolicy, beforeLegacy, func(clock *bool) error {
 			return RestoreSnapshotUffdInternalWithOverrides(
 				socketPath, snapshotPath, memPath, basePath, "", "", "eth0", netInfo.TAPDevice, "", trackDirty,
-				m.cfg.HandlerDeathAbortEnabled, sid, clock,
+				m.cfg.HandlerDeathAbortEnabled, false, sid, clock,
 			)
 		})
 	})
@@ -3870,6 +3872,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// the sidecar read after Firecracker and networking have started, on
 	// user-visible restore latency.
 	sidecarBase, hasSidecar := readLayeredBase(memPath)
+	// Only a fork pre-copies: its overlay is what it will read, and its per-fork
+	// copy starts cold on every restore. Only the layered UFFD load can carry
+	// the request, so a restore that cannot reach it is not labelled as one.
+	eager := plan.action == restoreMaterializeFork && hasSidecar &&
+		useUffd && m.cfg.ResumeUffdEnabled && m.eagerOverlayEnabled()
+	if eager {
+		restoreMode = strings.TrimPrefix(restoreMode+"+eager", "+")
+	}
 	var (
 		restoreClockFrozen bool
 		clockRetried       bool
@@ -4047,7 +4057,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			attemptPhases["entry_to_sem"] = tSemAcquired.Sub(tEntry)
 			attemptPhases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
 		}
-		m.recordPhases("restore", restoreMode, attemptPhases)
 
 		// attemptErr is this attempt's result alone; it lands in restoreErr after
 		// the load log so a stale prior-attempt error can never leak into the
@@ -4138,10 +4147,19 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 				var armed string
 				armed, restoreClockFrozen, attemptErr = m.restoreWithSessionFallback(trackingSessionID, func(sid string) (bool, error) {
 					return m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
-						return RestoreSnapshotUffdInternalWithOverrides(
-							socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
-							m.cfg.HandlerDeathAbortEnabled, sid, clock,
-						)
+						used, err := m.restoreWithEagerOverlayFallback(eager, func(eager bool) error {
+							return RestoreSnapshotUffdInternalWithOverrides(
+								socketPath, snapshotPath, memPath, basePath, accessLogPath, recordToPath, "eth0", tapDevice, plan.deltaDir, armLayered,
+								m.cfg.HandlerDeathAbortEnabled, eager, sid, clock,
+							)
+						})
+						// A refused field fell back without it: measure the
+						// restore as the one that actually ran.
+						if eager && !used {
+							eager = false
+							restoreMode = strings.TrimSuffix(strings.TrimSuffix(restoreMode, "eager"), "+")
+						}
+						return err
 					})
 				})
 				if armed != trackingSessionID {
@@ -4170,10 +4188,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			// looks the same as before, which is indistinguishable from the
 			// feature being off.
 			Bool("guest_clock_frozen", restoreClockFrozen).
+			Bool("eager_overlay", eager).
 			Msg("snapshot loaded")
 		// Failed attempts included: a slow failing load (tap-busy retry,
-		// terminal failure) must appear in the distribution, not vanish.
-		m.recordPhases("restore", restoreMode, map[string]time.Duration{"load_snapshot": time.Since(tFcReady)})
+		// terminal failure) must appear in the distribution, not vanish. The
+		// setup phases wait for the load too, so a fallback that changed the
+		// mode records the whole attempt under the mode that ran.
+		attemptPhases["load_snapshot"] = time.Since(tFcReady)
+		m.recordPhases("restore", restoreMode, attemptPhases)
 		restoreErr = attemptErr
 
 		if restoreErr == nil {
@@ -7897,10 +7919,10 @@ func (m *Manager) RecordAccessPattern(ctx context.Context, vmID, snapshotPath, m
 	switch {
 	case !exists:
 		m.log.Warn().Str("template_vm", vmID).Str("path", outputPath).
-			Msg("recorder produced no access log; restores will fall back to sequential prefetch")
+			Msg("recorder produced no access log; restores will run without prefetch")
 	case pages == 0:
 		m.log.Warn().Str("template_vm", vmID).Str("path", outputPath).
-			Msg("recorder produced an empty access log; restores will fall back to sequential prefetch")
+			Msg("recorder produced an empty access log; restores will run without prefetch")
 	default:
 		m.log.Info().Str("template_vm", vmID).Str("path", outputPath).Int("pages", pages).
 			Msg("access pattern recorded")
