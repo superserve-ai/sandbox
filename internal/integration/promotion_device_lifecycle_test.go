@@ -1082,6 +1082,42 @@ func TestIntegration_LateDeviceEvidencePinsPendingStripeReservation(t *testing.T
 	}
 }
 
+func TestIntegration_LateStripeEvidenceSurvivesProfileDeletion(t *testing.T) {
+	ctx := context.Background()
+	region := promotionIsolatedDatabase(t, true)
+	owner, recipient, ownerTeam, recipientTeam := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	fingerprint := "visitor-" + uuid.NewString()
+	for _, user := range []uuid.UUID{owner, recipient} {
+		rolloutExec(t, region, `INSERT INTO profile(id,email) VALUES($1,$2)`, user, user.String()+"@example.com")
+	}
+	rolloutExec(t, region, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+		owner, uuid.New(), "event-"+uuid.NewString(), fingerprint)
+	for _, team := range []uuid.UUID{ownerTeam, recipientTeam} {
+		rolloutExec(t, region, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "promotion-"+team.String())
+		rolloutExec(t, region, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team)
+	}
+	event := "evt-" + uuid.NewString()
+	var result string
+	if err := region.QueryRow(ctx, `SELECT reserve_stripe_promotion_with_device($1,$2,$3,NULL,NULL,false)`,
+		recipientTeam, recipient, event).Scan(&result); err != nil || result != "acquired" {
+		t.Fatalf("evidence-free reservation: %q, %v", result, err)
+	}
+	rolloutExec(t, region, `SELECT finalize_stripe_promotion($1,$2,$3)`,
+		recipientTeam, recipient, "grant-"+uuid.NewString())
+	if err := region.QueryRow(ctx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+		recipient, uuid.New(), "event-"+uuid.NewString(), fingerprint).Scan(&result); err != nil || result != "owner_conflict" {
+		t.Fatalf("late evidence registration: %q, %v", result, err)
+	}
+	// Remove the ledger's actor reference before deleting the regional profile.
+	rolloutExec(t, region, `DELETE FROM team_credit_grant WHERE team_id=$1`, recipientTeam)
+	rolloutExec(t, region, `DELETE FROM team WHERE id=$1`, recipientTeam)
+	rolloutExec(t, region, `DELETE FROM profile WHERE id=$1`, recipient)
+	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
+	if err := region.QueryRow(ctx, `SELECT promotion_device_decision($1,'stripe')`, owner).Scan(&result); err != nil || result != "device_already_redeemed" {
+		t.Fatalf("owner escaped settled grant after deletion: %q, %v", result, err)
+	}
+}
+
 func TestIntegration_LegacyStripeDeviceReservationSurvivesActivation(t *testing.T) {
 	for _, settlement := range []bool{false, true} {
 		name := "released"
