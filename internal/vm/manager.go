@@ -4056,7 +4056,6 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			attemptPhases["entry_to_sem"] = tSemAcquired.Sub(tEntry)
 			attemptPhases["sem_to_disk"] = tDiskReady.Sub(tSemAcquired)
 		}
-		m.recordPhases("restore", restoreMode, attemptPhases)
 
 		// attemptErr is this attempt's result alone; it lands in restoreErr after
 		// the load log so a stale prior-attempt error can never leak into the
@@ -4191,8 +4190,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			Bool("eager_overlay", eager).
 			Msg("snapshot loaded")
 		// Failed attempts included: a slow failing load (tap-busy retry,
-		// terminal failure) must appear in the distribution, not vanish.
-		m.recordPhases("restore", restoreMode, map[string]time.Duration{"load_snapshot": time.Since(tFcReady)})
+		// terminal failure) must appear in the distribution, not vanish. The
+		// setup phases wait for the load too, so a fallback that changed the
+		// mode records the whole attempt under the mode that ran.
+		attemptPhases["load_snapshot"] = time.Since(tFcReady)
+		m.recordPhases("restore", restoreMode, attemptPhases)
 		restoreErr = attemptErr
 
 		if restoreErr == nil {

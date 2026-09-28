@@ -108,7 +108,11 @@ func forkLoadBody(t *testing.T, layered, capable, rolledBack bool) (body, mode s
 	if body == "" {
 		t.Fatalf("the restore never sent a load request: %v", rerr)
 	}
-	return body, sink.modeOf("restore", "load_snapshot")
+	load, setup := sink.modeOf("restore", "load_snapshot"), sink.modeOf("restore", "net_to_fc")
+	if load != setup {
+		t.Fatalf("one restore measured under two modes: load=%q setup=%q", load, setup)
+	}
+	return body, load
 }
 
 func TestForkRestoreAsksForEagerOverlayOnlyWhenLayeredAndCapable(t *testing.T) {
