@@ -493,6 +493,9 @@ func TestIntegration_IncrementalWorkerLoad(t *testing.T) {
 		exec(`UPDATE billing_export_work SET next_run_at='infinity',next_reconcile_at='infinity'`)
 		testMeterPrecisionWorker(t, pool)
 	})
+	t.Run("precision-close", func(t *testing.T) {
+		testMeterPrecisionClose(t, pool)
+	})
 	t.Run("frozen-measurement-catchup", func(t *testing.T) {
 		testFrozenMeasurementCatchup(t, pool)
 	})
@@ -1601,9 +1604,15 @@ func testBoundaryStorageEnablement(t *testing.T, pool *pgxpool.Pool) {
 type precisionWorkerStripe struct {
 	openPeriodStripe
 	mode               string
+	attempts           []StripeReportMeterEventParams
 	buckets, summaries int
 	checkUnlocked      func(context.Context) error
 	changeLocal        func()
+}
+
+func (s *precisionWorkerStripe) ReportMeterEvent(ctx context.Context, p StripeReportMeterEventParams) error {
+	s.attempts = append(s.attempts, p)
+	return s.openPeriodStripe.ReportMeterEvent(ctx, p)
 }
 
 func (s *precisionWorkerStripe) CountedMeterUsage(ctx context.Context, event, customer string, start, end time.Time) (string, error) {
@@ -1617,6 +1626,9 @@ func (s *precisionWorkerStripe) CountedMeterUsage(ctx context.Context, event, cu
 		return value, nil
 	}
 	delta := big.NewRat(1, 1_000_000_000_000)
+	if s.mode == "exact" {
+		delta = new(big.Rat)
+	}
 	if s.mode == "excess" {
 		delta = big.NewRat(1, 1)
 	}
@@ -1739,7 +1751,7 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
  VALUES($1,$2,$3,9713.454976049444*3600,9713.454976049444*3686400,9713.454976049444*3686400)`, team.ID, start, end)
 	exec(`INSERT INTO billing_export_work(team_id,next_run_at,next_reconcile_at,seed_complete,next_correction_at)
  VALUES($1,now()-interval '100 years','infinity',true,now()+interval '1 day')`, team.ID)
-	tick := func(wantFailure bool) {
+	tick := func(t *testing.T, wantFailure bool) error {
 		t.Helper()
 		exec(`UPDATE billing_export_work SET next_run_at=now()-interval '100 years' WHERE team_id=$1`, team.ID)
 		worked, n, err := h.incrementalBillingTick(ctx, time.Hour)
@@ -1750,13 +1762,14 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 		if err := pool.QueryRow(ctx, `SELECT (last_error IS NOT NULL)=$2 AND lease_token IS NULL AND next_run_at>now() FROM billing_export_work WHERE team_id=$1`, team.ID, wantFailure).Scan(&recorded); err != nil || !recorded {
 			t.Fatalf("worker error/retry state: %v %v", recorded, err)
 		}
+		return err
 	}
 	initialCalls := len(provider.calls)
 	for _, mode := range []string{"excess", "missing", "outage", "changing_summary", "changing_bucket"} {
 		provider.mode = mode
 		provider.summaries = 0
 		provider.buckets = 0
-		tick(true)
+		tick(t, true)
 		if len(provider.calls) != initialCalls {
 			t.Fatalf("%s authorized export through incomplete evidence", mode)
 		}
@@ -1777,7 +1790,7 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 	}
 	provider.mode = "complete"
 	provider.buckets = 0
-	tick(false)
+	tick(t, false)
 	if len(provider.calls) != initialCalls+3 {
 		t.Fatalf("catch-up events=%d want=%d", len(provider.calls), initialCalls+3)
 	}
@@ -1789,14 +1802,14 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 	if provider.buckets != 12 {
 		t.Fatalf("two bucket reads per gate/observation/resource: %d", provider.buckets)
 	}
-	tick(false)
+	tick(t, false)
 	if len(provider.calls) != initialCalls+3 {
 		t.Fatal("unchanged retry resubmitted usage")
 	}
 	now = now.Add(time.Hour)
 	exec(`UPDATE billing_export_usage SET vcpu_seconds=vcpu_seconds+3600,memory_mib_seconds=memory_mib_seconds+3686400,
  storage_mib_seconds=storage_mib_seconds+3686400,updated_at=clock_timestamp() WHERE team_id=$1`, team.ID)
-	tick(false)
+	tick(t, false)
 	if len(provider.calls) != initialCalls+6 {
 		t.Fatal("later scheduled pass did not export exactly new usage")
 	}
@@ -1849,7 +1862,7 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 	exec(`UPDATE billing_export_usage SET vcpu_seconds=9714.454976049444*3600 WHERE team_id=$1`, team.ID)
 	provider.mode = "complete"
 	callsBeforeDownward := len(provider.calls)
-	tick(true)
+	tick(t, true)
 	if len(provider.calls) != callsBeforeDownward {
 		t.Fatal("downward correction delivered stale pending coverage")
 	}
@@ -1861,13 +1874,92 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 		t.Fatalf("pending event changed during downward correction: status=%s payload=%s", status, payload)
 	}
 	exec(`UPDATE billing_export_usage SET vcpu_seconds=9715.454976049444*3600 WHERE team_id=$1`, team.ID)
-	tick(false)
+	tick(t, false)
 	if len(provider.calls) != callsBeforeDownward+1 || provider.calls[len(provider.calls)-1].Value != "1.000000000000" {
 		t.Fatalf("pending coverage was not retried after usage recovered: calls=%d", len(provider.calls)-callsBeforeDownward)
 	}
 	if snapshot() != before {
 		t.Fatal("precision recovery mutated historical payload or coverage")
 	}
+	for index, delivery := range []string{"pending", "uncertain"} {
+		t.Run("blocked-"+delivery, func(t *testing.T) {
+			target := fmt.Sprintf("%d.454976049444", 9715+index)
+			exec(`UPDATE billing_export_usage SET memory_mib_seconds=$2::numeric*3686400,updated_at=clock_timestamp() WHERE team_id=$1`, team.ID, target)
+			event, err := store.Reserve(ctx, p, "memory", target, now, billing.ExportPayload{
+				EventName: resources["memory"], CustomerID: customer, Timestamp: now.Add(-time.Second).Unix(),
+			})
+			if err != nil || event == nil {
+				t.Fatalf("reserve retry coverage: event=%+v err=%v", event, err)
+			}
+			wantCall := StripeReportMeterEventParams{Identifier: event.Identifier, IdempotencyKey: event.IdempotencyKey,
+				EventName: event.EventName, CustomerID: event.CustomerID, Value: event.Quantity, Timestamp: event.Timestamp}
+			provider.mode = "exact"
+			if delivery == "uncertain" {
+				provider.submit = func(context.Context) error { return errors.New("example delivery timeout") }
+				tick(t, false)
+				provider.submit = nil
+				if provider.attempts[len(provider.attempts)-1] != wantCall {
+					t.Fatal("uncertain attempt changed reserved payload")
+				}
+				// Make the persisted retry due without waiting for wall-clock backoff.
+				exec(`UPDATE billing_export_event SET next_attempt_at=now()-interval '1 second' WHERE id=$1`, event.ID)
+			}
+			reservedSnapshot := meterPrecisionHistorySnapshot(t, pool, team.ID)
+			attemptsBefore := len(provider.attempts)
+			callsBefore := len(provider.calls)
+			var retrySnapshot string
+			if err := pool.QueryRow(ctx, `SELECT jsonb_build_array(status,attempt_count,first_attempt_at,next_attempt_at)::text
+ FROM billing_export_event WHERE id=$1 AND status=$2`, event.ID, delivery).Scan(&retrySnapshot); err != nil {
+				t.Fatal(err)
+			}
+			for _, mode := range []string{"missing", "excess"} {
+				provider.mode = mode
+				for attempt := 0; attempt < 2; attempt++ {
+					provider.buckets, provider.summaries = 0, 0
+					if err := tick(t, true); !errors.Is(err, billing.ErrExportRecoveryRequired) {
+						t.Fatalf("%s did not block on reconciliation: %v", mode, err)
+					}
+					if len(provider.attempts) != attemptsBefore || len(provider.calls) != callsBefore || meterPrecisionHistorySnapshot(t, pool, team.ID) != reservedSnapshot {
+						t.Fatalf("%s changed or delivered %s coverage", mode, delivery)
+					}
+					if provider.buckets > 2 || provider.summaries > 2 || (mode == "missing" && provider.buckets != 1) {
+						t.Fatalf("%s evidence calls: buckets=%d summaries=%d", mode, provider.buckets, provider.summaries)
+					}
+					var unchanged, bounded bool
+					if err := pool.QueryRow(ctx, `SELECT jsonb_build_array(status,attempt_count,first_attempt_at,next_attempt_at)::text=$2
+ FROM billing_export_event WHERE id=$1`, event.ID, retrySnapshot).Scan(&unchanged); err != nil || !unchanged {
+						t.Fatalf("blocked retry state changed: %v %v", unchanged, err)
+					}
+					if err := pool.QueryRow(ctx, `SELECT next_run_at>now() AND next_run_at<=now()+interval '11 minutes'
+ AND lease_token IS NULL AND lease_until IS NULL AND last_error IS NOT NULL FROM billing_export_work WHERE team_id=$1`, team.ID).Scan(&bounded); err != nil || !bounded {
+						t.Fatalf("blocked retry not bounded/released: %v %v", bounded, err)
+					}
+					totals, err := store.Totals(ctx, p, "memory")
+					if err != nil || totals.Reserved != target || totals.Submitted != fmt.Sprintf("%d.454976049444", 9714+index) || totals.Pending != "1.000000000000" {
+						t.Fatalf("blocked reservation: %+v %v", totals, err)
+					}
+				}
+			}
+			provider.mode = "exact"
+			tick(t, false)
+			tick(t, false)
+			if len(provider.attempts) != attemptsBefore+1 || provider.attempts[attemptsBefore] != wantCall || len(provider.calls) != callsBefore+1 {
+				t.Fatal("recovery did not retry exactly the original event once")
+			}
+			var eventCount int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM billing_export_event WHERE customer_id=$1`, customer).Scan(&eventCount); err != nil || eventCount != callsBefore+1 {
+				t.Fatalf("replacement events: count=%d want=%d err=%v", eventCount, callsBefore+1, err)
+			}
+			totals, err := store.Totals(ctx, p, "memory")
+			if err != nil || totals.Reserved != target || totals.Submitted != target || totals.Pending != "0" || meterPrecisionHistorySnapshot(t, pool, team.ID) != reservedSnapshot {
+				t.Fatalf("recovered accounting/history: %+v %v", totals, err)
+			}
+		})
+	}
+	if snapshot() != before {
+		t.Fatal("blocked delivery recovery mutated historical payload or coverage")
+	}
+	provider.mode = "complete"
 	// Full-period observation uses the same evidence policy without changing
 	// events. The database's independent exact finalization guard stays intact.
 	exec(`INSERT INTO team_billing_usage(team_id,period_start,period_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds)
@@ -1903,4 +1995,123 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 		t.Fatalf("concurrent reservation accepted: %+v", decision)
 	}
 	exec(`UPDATE billing_export_work SET next_run_at='infinity',next_reconcile_at='infinity' WHERE team_id=$1`, team.ID)
+}
+
+func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
+	ctx := t.Context()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	start := now.Add(-72*time.Hour).AddDate(0, -1, 0)
+	end := start.AddDate(0, 1, 0)
+	provider := &precisionWorkerStripe{mode: "complete", checkUnlocked: func(ctx context.Context) error {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		_, err = tx.Exec(ctx, `SELECT team_id FROM team_billing_period FOR UPDATE NOWAIT`)
+		return err
+	}}
+	h := &Handlers{Pool: pool, DB: db.New(pool), Stripe: provider, Now: func() time.Time { return now }}
+	team, err := h.DB.CreateTeam(ctx, "example-precision-close")
+	if err != nil {
+		t.Fatal(err)
+	}
+	customer := "cus_example_" + team.ID.String()
+	p := billing.ExportPeriod{TeamID: team.ID, Start: start, End: end}
+	store := billing.ExportStore{Pool: pool}
+	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_status,commercial_billing_anchor)
+ VALUES($1,$2,'active',$3)`, team.ID, customer, start)
+	exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true),($1,'billing_storage_billing_enabled',true)
+ ON CONFLICT(team_id,key) DO UPDATE SET enabled=EXCLUDED.enabled`, team.ID)
+	exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'approved')`, team.ID, start, end)
+	if err := store.Enroll(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	sandbox := uuid.New()
+	exec(`INSERT INTO sandbox(id,team_id,name,status,vcpu_count,memory_mib,host_id)
+ VALUES($1,$2,'example-precision-close','deleted',100,102400,'default')`, sandbox, team.ID)
+	exec(`INSERT INTO sandbox_compute_billing_interval(sandbox_id,team_id,vcpu_count,memory_mib,started_at,ended_at,end_reason)
+ VALUES($1,$2,100,102400,$3,$4,'deleted')`, sandbox, team.ID, start, start.Add(100*time.Hour))
+	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason)
+ VALUES($1,$2,102400,$3,$4,'deleted')`, sandbox, team.ID, start, start.Add(100*time.Hour))
+	for resource, event := range map[string]string{"cpu": "cpu_vcpu_hours", "memory": "memory_gib_hours", "storage": "storage_gib_hours"} {
+		if _, err := store.Reserve(ctx, p, resource, "10000", end, billing.ExportPayload{
+			EventName: event, CustomerID: customer, Timestamp: end.Add(-time.Second).Unix(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.submitIncrementalEvents(ctx, p, 6); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := func() string { return meterPrecisionHistorySnapshot(t, pool, team.ID) }
+	before := snapshot()
+	assertHistory := func() {
+		t.Helper()
+		if snapshot() != before || len(provider.attempts) != 3 || len(provider.calls) != 3 {
+			t.Fatal("close changed historical events/coverage or duplicated delivery")
+		}
+		for _, resource := range []string{"cpu", "memory", "storage"} {
+			totals, err := store.Totals(ctx, p, resource)
+			if err != nil || totals.Reserved != "10000" || totals.Submitted != totals.Reserved || totals.Pending != "0" {
+				t.Fatalf("%s close accounting: %+v %v", resource, totals, err)
+			}
+		}
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		provider.buckets = 0
+		_, err := h.exportIncrementalPeriod(ctx, p)
+		if err == nil || !strings.Contains(err.Error(), "incremental export requires fresh matching Stripe reconciliation") {
+			t.Fatalf("positive drift must reach the exact close guard: %v", err)
+		}
+		var blocked bool
+		if err := pool.QueryRow(ctx, `SELECT status='exporting' AND exported_at IS NULL AND finalized_at IS NULL
+ FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end).Scan(&blocked); err != nil || !blocked {
+			t.Fatalf("precision close did not remain exporting: %v %v", blocked, err)
+		}
+		var explained int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM billing_export_observation WHERE team_id=$1
+ AND local_quantity=10000 AND reserved_quantity=10000 AND submitted_quantity=10000
+ AND counted_quantity=10000.000000000001 AND last_error IS NULL AND query_start=$2 AND query_end=$3`, team.ID, start, end).Scan(&explained); err != nil || explained != 3 || provider.buckets != 12 {
+			t.Fatalf("full-period precision evidence: resources=%d buckets=%d err=%v", explained, provider.buckets, err)
+		}
+		if _, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, pool, team.ID, start, end); err == nil || !strings.Contains(err.Error(), "must be exported before finalization") {
+			t.Fatalf("finalization accepted a blocked close: %v", err)
+		}
+		assertHistory()
+	}
+	// Exact provider evidence is a separate possible outcome, not an assumed
+	// convergence property of repeated summary reads.
+	provider.mode = "exact"
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := h.exportIncrementalPeriod(ctx, p); err != nil {
+			t.Fatalf("exact close: %v", err)
+		}
+		if _, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, pool, team.ID, start, end); err != nil {
+			t.Fatalf("exact close finalization: %v", err)
+		}
+		assertHistory()
+	}
+	var finalized bool
+	if err := pool.QueryRow(ctx, `SELECT status='finalized' AND exported_at IS NOT NULL AND finalized_at IS NOT NULL
+ FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end).Scan(&finalized); err != nil || !finalized {
+		t.Fatalf("exact close finalized=%v err=%v", finalized, err)
+	}
+}
+
+func meterPrecisionHistorySnapshot(t *testing.T, pool *pgxpool.Pool, team uuid.UUID) string {
+	t.Helper()
+	var value string
+	if err := pool.QueryRow(t.Context(), `SELECT jsonb_agg(jsonb_build_array(e.id,e.identifier,e.idempotency_key,e.event_name,e.customer_id,e.quantity,e.quantity_payload,e.event_timestamp,
+ a.id,a.coverage_start,a.coverage_end,a.measured_through) ORDER BY e.id)::text
+ FROM billing_export_event e JOIN billing_export_allocation a ON a.id=e.allocation_id WHERE a.team_id=$1`, team).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	return value
 }
