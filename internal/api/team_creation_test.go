@@ -187,6 +187,44 @@ func TestTeamCreationMissingVerifierConfigurationOnlyDisablesNewRoute(t *testing
 	}
 }
 
+func TestTeamCreationExampleConfigurationDisablesProvisioning(t *testing.T) {
+	example, err := os.ReadFile("../../.env.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEAM_CREATION_REGION", "")
+	t.Setenv("TEAM_CREATION_PUBLIC_KEYS", "")
+	for _, line := range strings.Split(string(example), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok && (key == "TEAM_CREATION_REGION" || key == "TEAM_CREATION_PUBLIC_KEYS") {
+			t.Setenv(key, value)
+		}
+	}
+	t.Setenv("DATABASE_URL", "postgres://example.invalid/sandbox")
+	t.Setenv("SANDBOX_ACCESS_TOKEN_SEED", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	t.Setenv("TEMPLATE_BUILD_REGION", "example-region")
+	t.Setenv("BACKUP_BUCKET", "example-bucket")
+	t.Setenv("OTEL_EXPORT_INTERVAL", "15s")
+	t.Setenv("INTERNAL_API_TOKEN", "internal-test-token")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TeamCreationRegion != "use" || len(cfg.TeamCreationKeys) != 0 {
+		t.Fatalf("example must configure the receiving cell without trusting any signing keys: region=%q keys=%d", cfg.TeamCreationRegion, len(cfg.TeamCreationKeys))
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	router := SetupRouter(ctx, &Handlers{Config: cfg}, nil)
+	req := httptest.NewRequest(http.MethodPost, "/internal/teams", strings.NewReader(`{"request_id":"42140b1e-ac77-4ab0-9841-d9099ae8265a","name":"Example team","region":"use"}`))
+	req.Header.Set("Authorization", "Bearer internal-test-token")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, req)
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "provisioning_unavailable") {
+		t.Fatalf("example provisioning status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestTeamCreationStrictInput(t *testing.T) {
 	for _, raw := range []string{
 		`{"request_id":"a","request_id":"b","name":"x","region":"use"}`,
