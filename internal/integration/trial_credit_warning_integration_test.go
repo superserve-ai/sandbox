@@ -56,9 +56,9 @@ func TestRecentTrialBurnSampleClampsOverlappingIntervals(t *testing.T) {
 					VALUES ($1, $2, now() - interval '1 day')`, teamID, planKey); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := tx.Exec(ctx, `INSERT INTO team_feature_flag (team_id, key, enabled)
+				if _, err := tx.Exec(ctx, `WITH enabled AS (INSERT INTO team_feature_flag (team_id, key, enabled)
 					VALUES ($1, 'billing_storage_billing_enabled', true)
-					ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled`, teamID); err != nil {
+					ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled RETURNING team_id,enabled) INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) SELECT team_id,now()-interval '1 day',now()-interval '1 day' FROM enabled WHERE enabled ON CONFLICT DO NOTHING`, teamID); err != nil {
 					t.Fatal(err)
 				}
 				var endedAt *time.Time
@@ -267,9 +267,9 @@ func TestRecentTrialBurnSampleStartsAtLatestSignupGrant(t *testing.T) {
 			if err := tx.QueryRow(ctx, `SELECT now()`).Scan(&now); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO team_feature_flag (team_id, key, enabled)
+			if _, err := tx.Exec(ctx, `WITH enabled AS (INSERT INTO team_feature_flag (team_id, key, enabled)
 				VALUES ($1, 'billing_storage_billing_enabled', true)
-				ON CONFLICT (team_id, key) DO UPDATE SET enabled = true`, team); err != nil {
+				ON CONFLICT (team_id, key) DO UPDATE SET enabled = true RETURNING team_id,enabled) INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) SELECT team_id,now()-interval '1 day',now()-interval '1 day' FROM enabled WHERE enabled ON CONFLICT DO NOTHING`, team); err != nil {
 				t.Fatal(err)
 			}
 			query := `INSERT INTO sandbox_compute_billing_interval

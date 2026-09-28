@@ -193,6 +193,7 @@ func TestPlatformBillingUsesCurrentPeriodLedgerToReconstructOpeningBalance(t *te
 	`, teamID); err != nil {
 		t.Fatalf("enable storage billing: %v", err)
 	}
+	seedStorageActivation(t, teamID, periodStart)
 
 	var grantID uuid.UUID
 	if err := testPool.QueryRow(ctx, `
@@ -400,6 +401,7 @@ func seedPlatformBillingRatesForTest(t *testing.T, ctx context.Context, teamID u
 	`, teamID); err != nil {
 		t.Fatalf("enable storage billing: %v", err)
 	}
+	seedStorageActivation(t, teamID, effectiveFrom)
 }
 
 func TestPlatformBillingUsesHalfOpenMonthBoundaryForUsage(t *testing.T) {

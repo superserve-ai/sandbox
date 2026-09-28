@@ -528,7 +528,7 @@ func TestTrialWarningDispatchIncludesPausedStorageTeam(t *testing.T) {
 	team := seedWarningWorkerTeam(t)
 	for _, sql := range []string{
 		`UPDATE sandbox SET status='paused' WHERE team_id=$1`,
-		`INSERT INTO team_feature_flag (team_id, key, enabled) VALUES ($1, 'billing_storage_billing_enabled', true) ON CONFLICT (team_id, key) DO UPDATE SET enabled=true`,
+		`WITH enabled AS (INSERT INTO team_feature_flag (team_id, key, enabled) VALUES ($1, 'billing_storage_billing_enabled', true) ON CONFLICT (team_id, key) DO UPDATE SET enabled=true RETURNING team_id,enabled) INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) SELECT team_id,now()-interval '1 day',now()-interval '1 day' FROM enabled WHERE enabled ON CONFLICT DO NOTHING`,
 		`INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at) SELECT id, team_id, 1024, now()-interval '2 hours' FROM sandbox WHERE team_id=$1`,
 	} {
 		if _, err := testPool.Exec(ctx, sql, team); err != nil {
@@ -586,7 +586,7 @@ func TestTrialWarningDiscoveryStorageEligibility(t *testing.T) {
 			if _, err := tx.Exec(ctx, `UPDATE sandbox SET status=$2 WHERE team_id=$1`, team, tc.status); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO team_feature_flag (team_id,key,enabled) VALUES ($1,'billing_storage_billing_enabled',$2) ON CONFLICT (team_id,key) DO UPDATE SET enabled=EXCLUDED.enabled`, team, tc.enabled); err != nil {
+			if _, err := tx.Exec(ctx, `WITH enabled AS (INSERT INTO team_feature_flag (team_id,key,enabled) VALUES ($1,'billing_storage_billing_enabled',$2) ON CONFLICT (team_id,key) DO UPDATE SET enabled=EXCLUDED.enabled RETURNING team_id,enabled) INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) SELECT team_id,now()-interval '1 day',now()-interval '1 day' FROM enabled WHERE enabled ON CONFLICT DO NOTHING`, team, tc.enabled); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO sandbox_storage_interval (sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason) SELECT id,team_id,$2,now()-interval '2 hours',CASE WHEN $3 THEN now()-interval '1 minute' END,CASE WHEN $3 THEN 'deleted' END FROM sandbox WHERE team_id=$1`, team, tc.disk, tc.closed); err != nil {

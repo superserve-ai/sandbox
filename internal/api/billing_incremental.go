@@ -118,7 +118,7 @@ type incrementalExportItem struct {
 func incrementalExportItems(usage db.TeamBillingUsage, resources []billingResourceState) ([]incrementalExportItem, error) {
 	items := make([]incrementalExportItem, 0, len(resources))
 	for _, resource := range resources {
-		if !resource.Billable || !resource.CheckoutEnabled {
+		if !resource.Billable {
 			continue
 		}
 		var seconds pgtype.Numeric
@@ -257,7 +257,7 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 		return result, fmt.Errorf("Stripe reconciliation is not configured")
 	}
 	store := billing.ExportStore{Pool: h.Pool}
-	storage, err := h.billingStorageBillingEnabled(ctx, p.TeamID)
+	storage, err := h.billingStorageBillingEnabledForWindow(ctx, p.TeamID, p.End)
 	if err != nil {
 		return result, err
 	}
@@ -477,7 +477,7 @@ func (h *Handlers) submitIncrementalEvents(ctx context.Context, p billing.Export
 		}
 		started := time.Now()
 		submitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		submitErr := h.Stripe.ReportMeterEvent(submitCtx, StripeReportMeterEventParams{Identifier: event.Identifier, IdempotencyKey: event.IdempotencyKey,
+		submitErr := h.reportBillingMeterEvent(submitCtx, p.TeamID, event.ResourceType, event.CreatedAt, StripeReportMeterEventParams{Identifier: event.Identifier, IdempotencyKey: event.IdempotencyKey,
 			EventName: event.EventName, CustomerID: event.CustomerID, Value: event.Quantity, Timestamp: event.Timestamp})
 		cancel()
 		err = store.Acknowledge(ctx, *event, submitErr)
@@ -521,7 +521,7 @@ func (h *Handlers) reconcileIncrementalPeriod(ctx context.Context, p billing.Exp
 	if err != nil {
 		return result, err
 	}
-	storage, err := h.billingStorageBillingEnabled(ctx, p.TeamID)
+	storage, err := h.billingStorageBillingEnabledForWindow(ctx, p.TeamID, p.End)
 	if err != nil {
 		return result, err
 	}

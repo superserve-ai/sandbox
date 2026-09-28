@@ -150,7 +150,7 @@ func (h *Handlers) GetBillingPricing(c *gin.Context) {
 
 	storageBillingEnabled, err := h.billingStorageBillingEnabled(c.Request.Context(), teamID)
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing feature flag failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing activation failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -297,7 +297,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 
 	storageBillingEnabled, err := h.billingStorageBillingEnabled(c.Request.Context(), teamID)
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing feature flag failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing activation failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -330,6 +330,12 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	storageGibSeconds, err := numericFloat64(usage.StorageGibSeconds)
 	if err != nil {
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("convert storage usage failed")
+		respondError(c, ErrInternal)
+		return
+	}
+
+	billableStorageGibSeconds, err := numericFloat64(usage.BillableStorageGibSeconds)
+	if err != nil {
 		respondError(c, ErrInternal)
 		return
 	}
@@ -374,7 +380,7 @@ func (h *Handlers) GetBillingSummary(c *gin.Context) {
 	charges := billing.CalculateSummaryCharges(
 		vcpuSeconds,
 		memoryGibSeconds,
-		storageGibSeconds,
+		billableStorageGibSeconds,
 		vcpuRate,
 		memoryRate,
 		storageRate,
@@ -594,6 +600,7 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 		cpu, _ := numericFloat64(u.VcpuSeconds)
 		mem, _ := numericFloat64(u.MemoryGibSeconds)
 		storage, _ := numericFloat64(u.StorageGibSeconds)
+		payableStorage, _ := numericFloat64(u.BillableStorageGibSeconds)
 		cpuState, cpuOK := resourceState["vcpu"]
 		memoryState, memoryOK := resourceState["memory_gib"]
 		storageState, storageOK := resourceState["storage_gib"]
@@ -601,9 +608,9 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 			respondError(c, ErrInternal)
 			return
 		}
-		cc, mc, sc := cpu*vcpuRate, mem*memRate, storage*storageRate
-		// Resource costs remain informational even when a resource is tracked but
-		// excluded from billing. Apply billability only to the billed total.
+		cc, mc, sc := cpu*vcpuRate, mem*memRate, payableStorage*storageRate
+		// Compute costs remain informational when excluded from billing;
+		// storage costs use only intervals eligible after activation.
 		billedTotal := 0.0
 		if cpuState.Billable {
 			billedTotal += cc
@@ -742,6 +749,10 @@ func defaultBillingResourcesFromPriceIDs(priceIDs []string) []config.BillingReso
 			resources[i].StripePriceID = priceIDs[i]
 		}
 	}
+	// Legacy two-price installations can continue compute Checkout until the
+	// shared storage price is configured for preload.
+	resources[2].CheckoutEnabled = strings.TrimSpace(resources[2].StripePriceID) != ""
+
 	return resources
 }
 
@@ -761,7 +772,7 @@ func (h *Handlers) billingResourceStates(storageBillingEnabled bool) []billingRe
 func billingCheckoutPriceIDs(resources []billingResourceState) ([]string, error) {
 	ids := make([]string, 0, len(resources))
 	for _, resource := range resources {
-		if !resource.Billable || !resource.CheckoutEnabled {
+		if !resource.SubscriptionIncluded() {
 			continue
 		}
 		if strings.TrimSpace(resource.StripePriceID) == "" {

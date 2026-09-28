@@ -73,7 +73,7 @@ func (h *Handlers) AdoptBillingExports(c *gin.Context) {
 	}
 	resources := map[[2]string]bool{}
 	for _, resource := range h.billingResourceStates(storage) {
-		if resource.Billable && resource.CheckoutEnabled {
+		if resource.Billable {
 			resources[[2]string{billingExportResourceType(resource.ResourceKey), resource.StripeEventName}] = true
 		}
 	}
@@ -338,14 +338,14 @@ func (h *Handlers) ApplyBillingCorrection(c *gin.Context) {
 		respondErrorMsg(c, "conflict", "billing customer is required", http.StatusConflict)
 		return
 	}
-	storage, err := h.billingStorageBillingEnabled(ctx, p.TeamID)
+	storage, err := h.billingStorageBillingEnabledForWindow(ctx, p.TeamID, p.End)
 	if err != nil {
 		respondError(c, ErrInternal)
 		return
 	}
 	eventName := ""
 	for _, state := range h.billingResourceStates(storage) {
-		if billingExportResourceType(state.ResourceKey) == resource && (!needsAllocation || state.Billable && state.CheckoutEnabled) {
+		if billingExportResourceType(state.ResourceKey) == resource && (!needsAllocation || state.Billable) {
 			eventName = state.StripeEventName
 		}
 	}

@@ -559,10 +559,7 @@ func (h *Handlers) billingExportMode(ctx context.Context, teamID uuid.UUID) (str
 }
 
 func (h *Handlers) billingStorageBillingEnabled(ctx context.Context, teamID uuid.UUID) (bool, error) {
-	return h.DB.IsFeatureEnabledForTeam(ctx, db.IsFeatureEnabledForTeamParams{
-		Key:    "billing_storage_billing_enabled",
-		TeamID: pgtype.UUID{Bytes: teamID, Valid: true},
-	})
+	return h.DB.IsStorageBillingActivated(ctx, teamID)
 }
 
 func (h *Handlers) validateBillingRedirectURL(raw string) (string, error) {
@@ -663,9 +660,9 @@ func (h *Handlers) getTeamBillingUsage(c *gin.Context, platform bool) {
 		respondError(c, ErrInternal)
 		return
 	}
-	storageBillingEnabled, err := h.billingStorageBillingEnabled(c.Request.Context(), teamID)
+	storageBillingEnabled, err := h.billingStorageBillingEnabledForWindow(c.Request.Context(), teamID, periodEnd)
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing feature flag failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing activation failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -774,9 +771,9 @@ func (h *Handlers) getTeamBillingExportPreview(c *gin.Context, platform bool) {
 		return
 	}
 
-	storageBillingEnabled, err := h.billingStorageBillingEnabled(c.Request.Context(), teamID)
+	storageBillingEnabled, err := h.billingStorageBillingEnabledForWindow(c.Request.Context(), teamID, periodEnd)
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing feature flag failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing activation failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -997,9 +994,9 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 			}
 		}
 	}
-	storageBillingEnabled, err := h.billingStorageBillingEnabled(c.Request.Context(), teamID)
+	storageBillingEnabled, err := h.billingStorageBillingEnabledForWindow(c.Request.Context(), teamID, periodEnd)
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing feature flag failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing activation failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -1480,7 +1477,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 			}
 		}
 
-		err = h.Stripe.ReportMeterEvent(ctx, StripeReportMeterEventParams{
+		err = h.reportBillingMeterEvent(ctx, teamID, resourceType, row.CreatedAt, StripeReportMeterEventParams{
 			Identifier:     row.StripeMeterEventIdentifier,
 			IdempotencyKey: idempotencyKey,
 			EventName:      row.StripeEventName,
@@ -1633,7 +1630,7 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 	}
 	storageBillingEnabled, err := h.billingStorageBillingEnabled(c.Request.Context(), teamID)
 	if err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing feature flag failed")
+		log.Error().Err(err).Str("team_id", teamID.String()).Msg("read storage billing activation failed")
 		respondError(c, ErrInternal)
 		return
 	}
@@ -3505,7 +3502,7 @@ func billingTeamUsageFromReadRow(usage db.GetTeamBillingUsageRow) (db.TeamBillin
 	if err != nil {
 		return db.TeamBillingUsage{}, err
 	}
-	storageGibSeconds, err := numericFloat64(usage.StorageGibSeconds)
+	storageGibSeconds, err := numericFloat64(usage.BillableStorageGibSeconds)
 	if err != nil {
 		return db.TeamBillingUsage{}, err
 	}
@@ -3653,7 +3650,7 @@ func billingPeriodResponseFromDB(period db.TeamBillingPeriod, account db.GetTeam
 func billingPreviewItems(teamID uuid.UUID, periodStart, periodEnd time.Time, usage db.TeamBillingUsage, resources []billingResourceState, customerID string) ([]billingExportPreviewItem, error) {
 	items := make([]billingExportPreviewItem, 0, len(resources))
 	for _, resource := range resources {
-		if !resource.Billable || !resource.CheckoutEnabled {
+		if !resource.Billable {
 			continue
 		}
 		var raw pgtype.Numeric

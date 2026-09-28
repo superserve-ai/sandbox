@@ -41,6 +41,8 @@ type ExportPayload struct {
 type ExportEvent struct {
 	ID           uuid.UUID `json:"id"`
 	AllocationID uuid.UUID `json:"allocation_id"`
+	ResourceType string    `json:"resource_type"`
+	CreatedAt    time.Time `json:"created_at"`
 	ExportPayload
 	Status     string    `json:"status"`
 	LeaseToken uuid.UUID `json:"-"`
@@ -284,7 +286,7 @@ func (s ExportStore) Reserve(ctx context.Context, p ExportPeriod, resource, cumu
 	}
 	var enabled bool
 	err = tx.QueryRow(ctx, `SELECT feature_enabled('billing_export_enabled',$1)
-        AND ($2 <> 'storage' OR feature_enabled('billing_storage_billing_enabled',$1))`, p.TeamID, resource).Scan(&enabled)
+        AND ($2 <> 'storage' OR storage_billing_activated($1,$3))`, p.TeamID, resource, through).Scan(&enabled)
 	if err != nil {
 		return nil, err
 	}
@@ -375,14 +377,14 @@ func (s ExportStore) Claim(ctx context.Context, p ExportPeriod) (*ExportEvent, e
         AND (e.first_attempt_at IS NULL OR e.first_attempt_at>now()-interval '23 hours')
         AND (e.lease_until IS NULL OR e.lease_until<=now())
         AND feature_enabled('billing_export_enabled',a.team_id)
-        AND (a.resource_type<>'storage' OR feature_enabled('billing_storage_billing_enabled',a.team_id))
+        AND (a.resource_type<>'storage' OR storage_billing_activated(a.team_id,a.period_end))
         ORDER BY e.created_at,e.id LIMIT 1 FOR UPDATE OF e SKIP LOCKED)
         UPDATE billing_export_event e SET status='uncertain',first_attempt_at=COALESCE(first_attempt_at,now()),
           lease_token=$4,lease_until=now()+interval '2 minutes',attempt_count=attempt_count+1,updated_at=now()
         FROM candidate c WHERE e.id=c.id
-        RETURNING e.id,e.allocation_id,e.identifier,e.idempotency_key,e.event_name,e.customer_id,e.quantity_payload,e.event_timestamp,e.status`, p.TeamID, p.Start, p.End, token, immutable)
+        RETURNING e.id,e.allocation_id,e.identifier,e.idempotency_key,e.event_name,e.customer_id,e.quantity_payload,e.event_timestamp,e.status,e.created_at,(SELECT resource_type FROM billing_export_allocation WHERE id=e.allocation_id)`, p.TeamID, p.Start, p.End, token, immutable)
 	var e ExportEvent
-	err = row.Scan(&e.ID, &e.AllocationID, &e.Identifier, &e.IdempotencyKey, &e.EventName, &e.CustomerID, &e.Quantity, &e.Timestamp, &e.Status)
+	err = row.Scan(&e.ID, &e.AllocationID, &e.Identifier, &e.IdempotencyKey, &e.EventName, &e.CustomerID, &e.Quantity, &e.Timestamp, &e.Status, &e.CreatedAt, &e.ResourceType)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, tx.Commit(ctx)
 	}

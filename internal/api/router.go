@@ -135,6 +135,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	operator.Use(OperatorAuth(), InternalActorFromHeader())
 	{
 		// Billing recovery requires a credential unavailable to VMD hosts.
+		operator.POST("/teams/:team_id/billing/storage", h.ReconcileStorageBilling)
 		operator.POST("/teams/:team_id/billing/periods/:period_id/adopt-exports", h.AdoptBillingExports)
 		operator.POST("/billing/export-events/:event_id/recover", h.RecoverBillingExport)
 		operator.POST("/teams/:team_id/billing/periods/:period_id/measure-correction", h.MeasureBillingCorrection)

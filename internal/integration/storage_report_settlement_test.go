@@ -217,6 +217,7 @@ func TestIntegration_StorageReportReceiptFencesSettlement(t *testing.T) {
 }
 
 func seedStorageSettlementPeriod(t *testing.T, teamID uuid.UUID, anchor, start, end time.Time, exported bool) {
+	seedStorageActivation(t, teamID, start)
 	t.Helper()
 	if _, err := testPool.Exec(t.Context(), `INSERT INTO team_billing_account(team_id,commercial_billing_anchor)
 		VALUES ($1,$2) ON CONFLICT(team_id) DO UPDATE SET commercial_billing_anchor=EXCLUDED.commercial_billing_anchor`, teamID, anchor); err != nil {

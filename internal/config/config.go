@@ -173,16 +173,26 @@ func checkoutPriceIDs() []string {
 // The default configuration is loaded from the existing Stripe checkout price
 // environment variables, but a JSON resource list can override it when needed.
 type BillingResourceConfig struct {
-	ResourceKey     string `json:"resource_key"`
-	DisplayName     string `json:"display_name"`
-	SortOrder       int    `json:"sort_order"`
-	UsageUnit       string `json:"usage_unit"`
-	DisplayUnit     string `json:"display_unit"`
-	StripeEventName string `json:"stripe_event_name"`
-	StripePriceID   string `json:"stripe_price_id"`
-	Tracked         bool   `json:"tracked"`
-	Billable        bool   `json:"billable"`
-	CheckoutEnabled bool   `json:"checkout_enabled"`
+	ResourceKey         string `json:"resource_key"`
+	DisplayName         string `json:"display_name"`
+	SortOrder           int    `json:"sort_order"`
+	UsageUnit           string `json:"usage_unit"`
+	DisplayUnit         string `json:"display_unit"`
+	StripeEventName     string `json:"stripe_event_name"`
+	StripePriceID       string `json:"stripe_price_id"`
+	Tracked             bool   `json:"tracked"`
+	Billable            bool   `json:"billable"`
+	CheckoutEnabled     bool   `json:"checkout_enabled"`
+	SubscriptionEnabled *bool  `json:"subscription_enabled,omitempty"`
+}
+
+// SubscriptionIncluded preserves the legacy config spelling while allowing an
+// explicit subscription_enabled value independent of payable usage.
+func (r BillingResourceConfig) SubscriptionIncluded() bool {
+	if r.SubscriptionEnabled != nil {
+		return *r.SubscriptionEnabled
+	}
+	return r.CheckoutEnabled
 }
 
 func billingResources(checkoutPriceIDs []string) []BillingResourceConfig {
@@ -225,6 +235,10 @@ func billingResources(checkoutPriceIDs []string) []BillingResourceConfig {
 			resources[i].StripePriceID = checkoutPriceIDs[i]
 		}
 	}
+	// Legacy two-price installations can continue compute Checkout until the
+	// shared storage price is configured for preload.
+	resources[2].CheckoutEnabled = strings.TrimSpace(resources[2].StripePriceID) != ""
+
 	normalizeBillingResources(resources)
 	return resources
 }

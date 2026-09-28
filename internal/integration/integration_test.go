@@ -3906,6 +3906,7 @@ func TestIntegration_GetTeamBillingUsage(t *testing.T) {
 			vcpuSeconds, memoryGibSeconds, storageGibSeconds)
 	}
 
+	seedStorageActivation(t, teamID, periodStart)
 	rollup, err := testQueries.UpsertTeamBillingUsage(ctx, db.UpsertTeamBillingUsageParams{
 		TeamID:      teamID,
 		PeriodStart: pgtype.Timestamptz{Time: periodStart, Valid: true},
@@ -3989,6 +3990,15 @@ func TestIntegration_GetTeamBillingUsageDeduplicatesSharedArtifact(t *testing.T)
 	if got, want := numericFloat64(t, usage.StorageGibSeconds), float64(artifactBytes/1024/1024*50+20)/1024; got != want {
 		t.Fatalf("storage GiB seconds = %v, want %v", got, want)
 	}
+	seedStorageActivation(t, teamID, periodStart.Add(35*time.Second))
+	eligible, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{TeamID: teamID, PeriodStart: periodStart, PeriodEnd: periodEnd})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := numericFloat64(t, eligible.BillableStorageGibSeconds), float64(artifactBytes/1024/1024*25)/1024; got != want {
+		t.Fatalf("shared artifact after cutoff=%v want=%v", got, want)
+	}
+
 }
 
 func TestIntegration_GetTeamBillingUsageStartsArtifactRetentionAtStorageBoundary(t *testing.T) {
