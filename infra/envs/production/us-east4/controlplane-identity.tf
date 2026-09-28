@@ -14,6 +14,42 @@ resource "google_secret_manager_secret" "operator_api_token" {
   labels = local.common_labels
 }
 
+resource "google_secret_manager_secret" "promotion_auth_database_url" {
+  project   = local.project_id
+  secret_id = "promotion-auth-database-url-${local.resource_suffix}"
+  replication {
+    auto {}
+  }
+  labels = local.common_labels
+}
+
+resource "google_secret_manager_secret" "promotion_capture_token" {
+  project   = local.project_id
+  secret_id = "promotion-capture-token-${local.resource_suffix}"
+  replication {
+    auto {}
+  }
+  labels = local.common_labels
+}
+
+resource "google_secret_manager_secret" "promotion_account_token" {
+  project   = local.project_id
+  secret_id = "promotion-account-token-${local.resource_suffix}"
+  replication {
+    auto {}
+  }
+  labels = local.common_labels
+}
+
+resource "google_secret_manager_secret" "promotion_account_public_key" {
+  project   = local.project_id
+  secret_id = "promotion-account-public-key-${local.resource_suffix}"
+  replication {
+    auto {}
+  }
+  labels = local.common_labels
+}
+
 locals {
   # Operators publish versions; Terraform manages only the mount and access.
   controlplane_secret_volumes = {
@@ -29,7 +65,22 @@ locals {
     [for config in values(local.controlplane_secret_volumes) : config.secret],
   ))
 
-  controlplane_secrets = {
+  promotion_evidence_secrets = var.promotion_evidence_enabled ? {
+    PROMOTION_AUTH_DATABASE_URL = {
+      secret = google_secret_manager_secret.promotion_auth_database_url.secret_id
+    }
+    PROMOTION_CAPTURE_TOKEN = {
+      secret = google_secret_manager_secret.promotion_capture_token.secret_id
+    }
+    PROMOTION_ACCOUNT_TOKEN = {
+      secret = google_secret_manager_secret.promotion_account_token.secret_id
+    }
+    PROMOTION_ACCOUNT_PUBLIC_KEY = {
+      secret = google_secret_manager_secret.promotion_account_public_key.secret_id
+    }
+  } : {}
+
+  controlplane_secrets = merge(local.promotion_evidence_secrets, {
     DATABASE_URL = {
       secret = coalesce(var.database_url_secret_name, "database-url-${local.resource_suffix}")
     }
@@ -66,7 +117,7 @@ locals {
     STRIPE_METER_ERROR_WEBHOOK_SECRET = {
       secret = "stripe-meter-error-webhook-secret-use"
     }
-  }
+  })
 }
 
 resource "google_secret_manager_secret_iam_member" "controlplane_runtime_secrets" {

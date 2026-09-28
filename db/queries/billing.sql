@@ -752,6 +752,12 @@ WHERE team_id = sqlc.arg(team_id)
   AND checkout_initializing_at = sqlc.arg(lease_started_at)
   AND checkout_completed_at IS NULL;
 
+-- name: RecordStripeCheckoutExpiration :exec
+INSERT INTO stripe_checkout_expiration_evidence
+    (team_id, stripe_customer_id, checkout_generation, checkout_session_id)
+VALUES (sqlc.arg(team_id), sqlc.arg(stripe_customer_id), sqlc.arg(checkout_generation), sqlc.arg(checkout_session_id))
+ON CONFLICT (team_id, checkout_generation) DO NOTHING;
+
 -- name: FinishFailedTeamBillingCheckoutAttempt :exec
 WITH attempt AS (
     SELECT current.team_id,
@@ -995,6 +1001,7 @@ UPDATE stripe_webhook_event
 SET last_error = sqlc.arg(last_error),
     updated_at = now()
 WHERE event_id = sqlc.arg(event_id)
+  AND processed_at IS NULL
 RETURNING *;
 
 -- name: IsFeatureEnabledForTeam :one

@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/db"
@@ -82,6 +85,10 @@ func TestIntegration_CheckoutExpirationReleasesOnlyMatchingLease(t *testing.T) {
 			t.Fatalf("%s expiration changed checkout lease/actor: %+v %v", event.name, account, err)
 		}
 	}
+	var expirationCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM stripe_checkout_expiration_evidence WHERE team_id = $1`, teamID).Scan(&expirationCount); err != nil || expirationCount != 0 {
+		t.Fatalf("mismatched expirations recorded evidence: count=%d err=%v", expirationCount, err)
+	}
 	send("evt_matching", "cs_expiry_1", stripe.nextCustomerID)
 	account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
 	if err != nil {
@@ -89,6 +96,11 @@ func TestIntegration_CheckoutExpirationReleasesOnlyMatchingLease(t *testing.T) {
 	}
 	if account.CheckoutInitializingAt.Valid || account.CheckoutSessionID != nil || account.CheckoutSubscriptionID != nil || account.StripeCheckoutActorID.Valid || account.StripeCheckoutActorClaimedAt.Valid {
 		t.Fatalf("matching expiration retained checkout state: %+v", account)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM stripe_checkout_expiration_evidence WHERE team_id = $1
+		AND stripe_customer_id = $2 AND checkout_generation = $3 AND checkout_session_id = $4`,
+		teamID, stripe.nextCustomerID, first.CheckoutInitializingAt.Time, "cs_expiry_1").Scan(&expirationCount); err != nil || expirationCount != 1 {
+		t.Fatalf("matching expiration evidence: count=%d err=%v", expirationCount, err)
 	}
 	if w := do(router, "POST", "/stripe/checkout-session", secondKey, checkoutRegressionBody); w.Code != http.StatusOK {
 		t.Fatalf("replacement checkout: %d %s", w.Code, w.Body.String())
@@ -107,6 +119,9 @@ func TestIntegration_CheckoutExpirationReleasesOnlyMatchingLease(t *testing.T) {
 	account, err = testQueries.GetTeamBillingAccount(ctx, teamID)
 	if err != nil || !account.CheckoutInitializingAt.Valid || !account.CheckoutInitializingAt.Time.Equal(second.CheckoutInitializingAt.Time) || account.StripeCheckoutActorID != second.StripeCheckoutActorID || derefString(account.CheckoutSessionID) != "cs_expiry_2" {
 		t.Fatalf("stale expiration changed replacement checkout: %+v %v", account, err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM stripe_checkout_expiration_evidence WHERE team_id = $1`, teamID).Scan(&expirationCount); err != nil || expirationCount != 1 {
+		t.Fatalf("stale expiration changed evidence: count=%d err=%v", expirationCount, err)
 	}
 	if w := do(router, "POST", "/stripe/checkout-session", firstKey, checkoutRegressionBody); w.Code != http.StatusConflict {
 		t.Fatalf("stale expiration permitted duplicate checkout: %d %s", w.Code, w.Body.String())
@@ -355,5 +370,198 @@ func TestIntegration_CheckoutWithoutSubscriptionFinishesOnAcceptedLifecycle(t *t
 				t.Fatalf("canceled subscription could not restart checkout: %d %s", w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+func TestIntegration_StripeSubscriptionCreatedAfterCheckoutExpiryUsesGenerationEvidence(t *testing.T) {
+	ctx := context.Background()
+	var enabled bool
+	var enabledAt pgtype.Timestamptz
+	var readiness *string
+	if err := testPool.QueryRow(ctx, `SELECT enabled, enabled_at, readiness_reference FROM promotion_identity_enforcement WHERE singleton`).Scan(&enabled, &enabledAt, &readiness); err != nil {
+		t.Fatal(err)
+	}
+	setGate := func(enabled bool, at pgtype.Timestamptz, reference *string) {
+		t.Helper()
+		tx, err := testPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, `ALTER TABLE promotion_identity_enforcement DISABLE TRIGGER promotion_identity_enforcement_irreversible`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE promotion_identity_enforcement SET enabled=$1, enabled_at=$2, readiness_reference=$3`, enabled, at, reference); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `ALTER TABLE promotion_identity_enforcement ENABLE TRIGGER promotion_identity_enforcement_irreversible`); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { setGate(enabled, enabledAt, readiness) })
+	// Matching expiration must protect activation even before canonical enforcement.
+	setGate(false, pgtype.Timestamptz{}, nil)
+	for _, withGeneration := range []bool{false, true} {
+		t.Run(map[bool]string{false: "without_generation", true: "with_generation"}[withGeneration], func(t *testing.T) {
+			teamID, key, actor := seedTeamAndKeyWithRole(t, "team_owner")
+			stripe := &expiringCheckoutStripeClient{fakeStripeClient: &fakeStripeClient{nextCustomerID: "cus_expired_" + teamID.String()}}
+			router := newBillingRouter(t, stripe)
+			if w := do(router, "POST", "/stripe/checkout-session", key, checkoutRegressionBody); w.Code != http.StatusOK {
+				t.Fatalf("checkout: %d %s", w.Code, w.Body.String())
+			}
+			first, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Truncate(time.Second)
+			send := func(payload []byte, want int) {
+				t.Helper()
+				req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Stripe-Signature", stripeSignature(t, payload, now))
+				if w := doRequest(router, req); w.Code != want {
+					t.Fatalf("webhook: want %d, got %d %s", want, w.Code, w.Body.String())
+				}
+			}
+			metadata := map[string]string{"activation_user_id": actor.String()}
+			if withGeneration {
+				metadata["checkout_generation"] = first.CheckoutInitializingAt.Time.UTC().Format(time.RFC3339Nano)
+			}
+			eventID := "evt_expired_subscription_" + teamID.String()
+			subscriptionID := "sub_expired_" + teamID.String()
+			payload := stripeSubscriptionWebhookPayloadWithMetadata(t, eventID, "customer.subscription.created", subscriptionID, stripe.nextCustomerID, "active", now, now, now.AddDate(0, 1, 0), metadata)
+			send(payload, http.StatusInternalServerError)
+			var processed bool
+			var lastError *string
+			if err := testPool.QueryRow(ctx, `SELECT processed_at IS NOT NULL, last_error FROM stripe_webhook_event WHERE event_id=$1`, eventID).Scan(&processed, &lastError); err != nil || processed || lastError == nil || *lastError != db.StripeCheckoutAssociationPendingError {
+				t.Fatalf("deferred event: processed=%v last_error=%v err=%v", processed, lastError, err)
+			}
+			send(checkoutExpiryWebhookPayload(t, "evt_expiration_"+teamID.String(), "checkout.session.expired", "cs_expiry_1", teamID.String(), stripe.nextCustomerID, "", now), http.StatusOK)
+			for range 2 {
+				send(payload, http.StatusOK)
+			}
+			account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !withGeneration {
+				// Customer ownership alone does not prove this subscription
+				// belongs to the expired checkout. Preserve legacy activation.
+				if derefString(account.StripeSubscriptionID) != subscriptionID || derefString(account.StripeSubscriptionStatus) != "active" ||
+					!account.StripeActivationCreditGrantedAt.Valid || len(stripe.creditGrantCalls) != 1 ||
+					account.CheckoutInitializingAt.Valid || account.CheckoutSessionID != nil || account.StripeActivationCreditReservedAt.Valid {
+					t.Fatalf("legacy activation: account=%+v grants=%d", account, len(stripe.creditGrantCalls))
+				}
+				if err := testPool.QueryRow(ctx, `SELECT processed_at IS NOT NULL, last_error FROM stripe_webhook_event WHERE event_id=$1`, eventID).Scan(&processed, &lastError); err != nil || !processed || lastError != nil {
+					t.Fatalf("activated event: processed=%v last_error=%v err=%v", processed, lastError, err)
+				}
+				return
+			}
+			if account.CheckoutInitializingAt.Valid || account.CheckoutSessionID != nil || account.StripeCheckoutActorID.Valid ||
+				account.StripeSubscriptionID != nil || account.StripeSubscriptionStatus != nil || account.StripeSubscriptionEventAt.Valid ||
+				account.TrialEndedAt.Valid || account.StripeActivationCreditGrantID != nil || account.StripeActivationCreditGrantedAt.Valid || account.StripeActivationCreditReservedAt.Valid || len(stripe.creditGrantCalls) != 0 {
+				t.Fatalf("expired checkout activated or retained reservation: %+v grants=%d", account, len(stripe.creditGrantCalls))
+			}
+			if err := testPool.QueryRow(ctx, `SELECT processed_at IS NOT NULL, last_error FROM stripe_webhook_event WHERE event_id=$1`, eventID).Scan(&processed, &lastError); err != nil || !processed || lastError != nil {
+				t.Fatalf("ignored event: processed=%v last_error=%v err=%v", processed, lastError, err)
+			}
+			var reserved bool
+			if err := testPool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM user_promotion_entitlement WHERE user_id=$1 AND stripe_redemption_reserved_team_id IS NOT NULL)`, actor).Scan(&reserved); err != nil || reserved {
+				t.Fatalf("expired checkout fenced promotion: reserved=%v err=%v", reserved, err)
+			}
+
+			// A new, explicitly associated checkout can still activate once.
+			if w := do(router, "POST", "/stripe/checkout-session", key, checkoutRegressionBody); w.Code != http.StatusOK {
+				t.Fatalf("replacement checkout: %d %s", w.Code, w.Body.String())
+			}
+			newSubscription := "sub_replacement_" + teamID.String()
+			newEvent := "evt_replacement_" + teamID.String()
+			replacement := stripeSubscriptionWebhookPayload(t, newEvent, "customer.subscription.created", newSubscription, stripe.nextCustomerID, "active", now, now, now.AddDate(0, 1, 0))
+			send(replacement, http.StatusInternalServerError)
+			send(checkoutExpiryWebhookPayload(t, "evt_completion_"+teamID.String(), "checkout.session.completed", "cs_expiry_2", teamID.String(), stripe.nextCustomerID, newSubscription, now), http.StatusOK)
+			send(replacement, http.StatusOK)
+			account, err = testQueries.GetTeamBillingAccount(ctx, teamID)
+			if err != nil || derefString(account.StripeSubscriptionID) != newSubscription || !account.StripeActivationCreditGrantedAt.Valid || len(stripe.creditGrantCalls) != 1 {
+				t.Fatalf("replacement activation: account=%+v grants=%d err=%v", account, len(stripe.creditGrantCalls), err)
+			}
+		})
+	}
+}
+
+func TestIntegration_StripeLifecycleAfterCheckoutExpiry(t *testing.T) {
+	ctx := context.Background()
+	for _, associated := range []bool{false, true} {
+		for _, eventType := range []string{"created", "updated", "deleted", "paused", "resumed"} {
+			for _, withActor := range []bool{false, true} {
+				t.Run(eventType+"/associated="+strconv.FormatBool(associated)+"/actor="+strconv.FormatBool(withActor), func(t *testing.T) {
+					teamID, key, actor := seedTeamAndKeyWithRole(t, "team_owner")
+					stripe := &expiringCheckoutStripeClient{fakeStripeClient: &fakeStripeClient{nextCustomerID: "cus_expiry_lifecycle_" + teamID.String()}}
+					router := newBillingRouter(t, stripe)
+					if w := do(router, "POST", "/stripe/checkout-session", key, checkoutRegressionBody); w.Code != http.StatusOK {
+						t.Fatalf("checkout: %d %s", w.Code, w.Body.String())
+					}
+					account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					metadata := map[string]string{"checkout_generation": account.CheckoutInitializingAt.Time.UTC().Format(time.RFC3339Nano)}
+					if withActor {
+						metadata["activation_user_id"] = actor.String()
+					}
+					now := time.Now().UTC().Truncate(time.Second)
+					subscriptionID := "sub_expiry_lifecycle_" + teamID.String()
+					send := func(payload []byte) {
+						t.Helper()
+						req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+						req.Header.Set("Content-Type", "application/json")
+						req.Header.Set("Stripe-Signature", stripeSignature(t, payload, now))
+						if w := doRequest(router, req); w.Code != http.StatusOK {
+							t.Fatalf("webhook: %d %s", w.Code, w.Body.String())
+						}
+					}
+					if associated {
+						send(stripeSubscriptionWebhookPayloadWithMetadata(t, "evt_early_"+teamID.String(), "customer.subscription.updated", subscriptionID, stripe.nextCustomerID, "incomplete", now.Add(-time.Second), now, now.AddDate(0, 1, 0), metadata))
+					}
+					send(checkoutExpiryWebhookPayload(t, "evt_expire_"+teamID.String(), "checkout.session.expired", "cs_expiry_1", teamID.String(), stripe.nextCustomerID, "", now))
+					before, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if before.CheckoutInitializingAt.Valid || (associated && derefString(before.StripeSubscriptionID) != subscriptionID) {
+						t.Fatalf("expiration did not preserve the expected early association: %+v", before)
+					}
+					eventID := "evt_late_" + teamID.String()
+					status := "active"
+					if eventType == "paused" {
+						status = "paused"
+					}
+					if eventType == "deleted" {
+						status = "canceled"
+					}
+					payload := stripeSubscriptionWebhookPayloadWithMetadata(t, eventID, "customer.subscription."+eventType, subscriptionID, stripe.nextCustomerID, status, now.Add(time.Second), now, now.AddDate(0, 1, 0), metadata)
+					for range 2 {
+						send(payload)
+					}
+					after, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(before, after) || len(stripe.creditGrantCalls) != 0 {
+						t.Fatalf("expired event changed billing or granted credit: before=%+v after=%+v grants=%d", before, after, len(stripe.creditGrantCalls))
+					}
+					var processed, reserved bool
+					var lastError *string
+					if err := testPool.QueryRow(ctx, `SELECT processed_at IS NOT NULL, last_error FROM stripe_webhook_event WHERE event_id=$1`, eventID).Scan(&processed, &lastError); err != nil || !processed || lastError != nil {
+						t.Fatalf("obsolete event: processed=%v error=%v err=%v", processed, lastError, err)
+					}
+					if err := testPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$1 AND stripe_redemption_reserved_team_id IS NOT NULL)`, actor).Scan(&reserved); err != nil || reserved {
+						t.Fatalf("obsolete event reserved promotion: %v %v", reserved, err)
+					}
+				})
+			}
+		}
 	}
 }
