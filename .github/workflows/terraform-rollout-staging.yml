@@ -81,7 +81,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
-      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
       CONFIRM: ${{ inputs.confirm }}
       PROXY_MIGRATION: ${{ inputs.proxy_migration }}
       PROXY_PREPARE: ${{ inputs.proxy_prepare }}
@@ -137,7 +137,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
-      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
       CONFIRM: ${{ inputs.confirm }}
       PROXY_MIGRATION: ${{ inputs.proxy_migration }}
       PROXY_RUNTIME_IAM: ${{ inputs.proxy_runtime_iam }}
@@ -247,7 +247,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
-      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
       CONFIRM: ${{ inputs.confirm }}
       PROXY_MIGRATION: ${{ inputs.proxy_migration }}
     steps:
@@ -291,7 +291,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
-      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
       CONFIRM: ${{ inputs.confirm }}
       PROXY_MIGRATION: ${{ inputs.proxy_migration }}
     steps:
@@ -326,7 +326,7 @@ jobs:
       id-token: write
     env:
       TF_IN_AUTOMATION: 'true'
-      TF_VAR_alert_runbook_urls: ${{ vars.ALERT_RUNBOOK_URLS }}
+      TF_VAR_alert_runbook_base_url: ${{ vars.RUNBOOK_BASE_URL }}
       API_BASE_URL: https://api-staging.superserve.ai
       API_KEY: ${{ secrets.STAGING_INTERNAL_API_TOKEN }}
       SANDBOX_BASE_URL: https://staging-sandbox.superserve.ai
