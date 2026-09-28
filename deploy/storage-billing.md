@@ -11,7 +11,9 @@ Use the existing Stripe account and environment. Create or verify one active
 Billing Meter with event name `storage_gib_hours`, `sum` aggregation,
 `customer_mapping[type]=by_id`, `customer_mapping[event_payload_key]=stripe_customer_id`,
 and `value_settings[event_payload_key]=value`. Check the account's full meter
-inventory before creating a meter. This setup is shared across teams.
+inventory before creating a meter. The meter must use raw ingestion with no
+`event_time_window`; hourly or daily pre-aggregation overwrites additive
+correction events. This setup is shared across teams.
 
 Create or verify a recurring monthly USD metered price on that meter. Use
 `per_unit`, no quantity transformation, and the canonical active `storage_gib`

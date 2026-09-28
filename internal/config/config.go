@@ -200,6 +200,15 @@ func billingResources(checkoutPriceIDs []string) []BillingResourceConfig {
 		var resources []BillingResourceConfig
 		if err := json.Unmarshal([]byte(raw), &resources); err == nil && len(resources) > 0 {
 			normalizeBillingResources(resources)
+			// Before subscription_enabled existed, storage was commonly marked
+			// checkout_enabled=true without a configured price. Preserve that
+			// legacy omission until preload supplies an actual storage price;
+			// an explicit subscription_enabled=true remains strict at checkout.
+			for i := range resources {
+				if resources[i].ResourceKey == "storage_gib" && resources[i].SubscriptionEnabled == nil && strings.TrimSpace(resources[i].StripePriceID) == "" {
+					resources[i].CheckoutEnabled = false
+				}
+			}
 			return resources
 		}
 	}

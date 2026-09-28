@@ -21,12 +21,20 @@ import (
 
 type StripeStorageSubscriptionParams struct {
 	SubscriptionID, CustomerID, PriceID, EventName, UnitAmountDecimal string
-	Reconcile                                                         bool
+	Reconcile, AllowInactive                                          bool
 }
 
 type storageSubscriptionClient interface {
 	EnsureStorageSubscription(context.Context, StripeStorageSubscriptionParams) error
 }
+
+// storageReadinessError means Stripe was not contacted with a meter event.
+// Callers keep the durable export event pending so a prolonged configuration
+// hold cannot consume the provider's retry window.
+type storageReadinessError struct{ err error }
+
+func (e *storageReadinessError) Error() string { return e.err.Error() }
+func (e *storageReadinessError) Unwrap() error { return e.err }
 
 type storagePrice struct {
 	ID                string `json:"id"`
@@ -74,11 +82,12 @@ func (c *stripeHTTPClient) EnsureStorageSubscription(ctx context.Context, p Stri
 		ValueSettings struct {
 			Key string `json:"event_payload_key"`
 		} `json:"value_settings"`
+		EventTimeWindow *string `json:"event_time_window"`
 	}
 	if err := c.doForm(ctx, http.MethodGet, "/v1/billing/meters/"+url.PathEscape(price.Recurring.Meter), nil, &meter, ""); err != nil {
 		return err
 	}
-	if meter.Status != "active" || meter.EventName != p.EventName || meter.DefaultAggregation.Formula != "sum" || meter.CustomerMapping.Type != "by_id" || meter.CustomerMapping.Key != "stripe_customer_id" || meter.ValueSettings.Key != "value" {
+	if meter.Status != "active" || meter.EventName != p.EventName || meter.DefaultAggregation.Formula != "sum" || meter.EventTimeWindow != nil || meter.CustomerMapping.Type != "by_id" || meter.CustomerMapping.Key != "stripe_customer_id" || meter.ValueSettings.Key != "value" {
 		return fmt.Errorf("storage meter must use active sum aggregation and the configured event/customer/value mapping")
 	}
 	if p.SubscriptionID == "" {
@@ -87,7 +96,7 @@ func (c *stripeHTTPClient) EnsureStorageSubscription(ctx context.Context, p Stri
 	readSubscription := func() (storageSubscription, error) {
 		var sub storageSubscription
 		err := c.doForm(ctx, http.MethodGet, "/v1/subscriptions/"+url.PathEscape(p.SubscriptionID), nil, &sub, "")
-		if err == nil && (sub.ID != p.SubscriptionID || sub.Customer != p.CustomerID || sub.Status != "active" && sub.Status != "trialing" && sub.Status != "past_due") {
+		if err == nil && (sub.ID != p.SubscriptionID || sub.Customer != p.CustomerID || !p.AllowInactive && sub.Status != "active" && sub.Status != "trialing" && sub.Status != "past_due") {
 			err = fmt.Errorf("current subscription/customer association is not active; reconcile billing account first")
 		}
 		return sub, err
@@ -150,7 +159,7 @@ func (c *stripeHTTPClient) storageSubscriptionItems(ctx context.Context, subID s
 			}
 			if item.Price.ID == wanted.ID {
 				count++
-			} else if item.Price.Recurring.Meter == wanted.Recurring.Meter || item.Price.Product == wanted.Product {
+			} else if item.Price.Recurring.Meter == wanted.Recurring.Meter {
 				return 0, fmt.Errorf("subscription has conflicting storage price %s; reconcile it before activation", item.Price.ID)
 			}
 		}
@@ -219,7 +228,7 @@ func (c *stripeHTTPClient) checkStorageCreditScopes(ctx context.Context, custome
 
 func (h *Handlers) storageResource() (config.BillingResourceConfig, error) {
 	for _, r := range h.billingConfiguredResources() {
-		if r.ResourceKey == "storage_gib" && strings.TrimSpace(r.StripePriceID) != "" && r.StripeEventName == "storage_gib_hours" {
+		if r.ResourceKey == "storage_gib" && r.SubscriptionIncluded() && strings.TrimSpace(r.StripePriceID) != "" && r.StripeEventName == "storage_gib_hours" {
 			return r, nil
 		}
 	}
@@ -246,7 +255,7 @@ func (h *Handlers) storageSubscriptionParams(ctx context.Context, q *db.Queries,
 			if !ok {
 				return StripeStorageSubscriptionParams{}, fmt.Errorf("invalid storage price")
 			}
-			amount = exact.Mul(exact, big.NewRat(360000, 1)).FloatString(12)
+			amount = new(big.Rat).Mul(exact, big.NewRat(360000, 1)).FloatString(12)
 		}
 	}
 	if amount == "" {
@@ -257,7 +266,7 @@ func (h *Handlers) storageSubscriptionParams(ctx context.Context, q *db.Queries,
 
 // Storage operations lock the current account association across provider I/O.
 // This is an operator/export path, never a sandbox lifecycle path.
-func (h *Handlers) withStorageSubscription(ctx context.Context, team uuid.UUID, reconcile bool, action func(pgx.Tx, StripeStorageSubscriptionParams) error) error {
+func (h *Handlers) withStorageSubscription(ctx context.Context, team uuid.UUID, reconcile, allowInactive bool, action func(pgx.Tx, StripeStorageSubscriptionParams) error) error {
 	if h.Pool == nil || h.DB == nil {
 		return fmt.Errorf("billing transactions are not configured")
 	}
@@ -289,6 +298,7 @@ func (h *Handlers) withStorageSubscription(ctx context.Context, team uuid.UUID, 
 	if err != nil {
 		return err
 	}
+	request.AllowInactive = allowInactive
 	if err = client.EnsureStorageSubscription(ctx, request); err != nil {
 		return err
 	}
@@ -318,7 +328,7 @@ func (h *Handlers) ReconcileStorageBilling(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 	var effective pgtype.Timestamptz
-	err = h.withStorageSubscription(ctx, team, input.Mode == "reconcile", func(tx pgx.Tx, p StripeStorageSubscriptionParams) error {
+	err = h.withStorageSubscription(ctx, team, input.Mode == "reconcile", false, func(tx pgx.Tx, p StripeStorageSubscriptionParams) error {
 		if input.Mode == "activate" {
 			var enabled bool
 			if err := tx.QueryRow(ctx, `SELECT feature_enabled('billing_storage_billing_enabled',$1) OR storage_billing_activated($1)`, team).Scan(&enabled); err != nil {
@@ -329,6 +339,32 @@ func (h *Handlers) ReconcileStorageBilling(c *gin.Context) {
 			}
 			_, err := tx.Exec(ctx, `INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff,verified_subscription_id,verified_price_id)
                 VALUES($1,GREATEST(clock_timestamp(),$2),$2,NULLIF($3,''),$4) ON CONFLICT(team_id) DO NOTHING`, team, input.ApprovedCutoff, p.SubscriptionID, p.PriceID)
+			if err != nil {
+				return err
+			}
+			// Recompute only mutable export caches that overlap the one-time
+			// boundary, and wake their hourly measurements. This closes the
+			// activation race with mixed-version workers without touching frozen
+			// history or reservation identities.
+			_, err = tx.Exec(ctx, `
+                UPDATE billing_export_usage u SET storage_mib_seconds = billable_storage_mib_seconds(u.team_id,u.period_start,u.period_end,false)
+                WHERE u.team_id=$1 AND u.period_end > (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)
+                  AND NOT EXISTS (SELECT 1 FROM team_billing_period bp WHERE bp.team_id=u.team_id AND bp.period_start=u.period_start AND bp.period_end=u.period_end
+                    AND (bp.finalized_at IS NOT NULL OR bp.exported_at IS NOT NULL OR bp.status IN ('exporting','exported','finalized')))`, team)
+			if err != nil {
+				return err
+			}
+			_, err = tx.Exec(ctx, `
+                UPDATE billing_export_measurement m SET storage_mib_seconds = billable_storage_mib_seconds(m.team_id,m.hour_start,LEAST(m.hour_start+interval '1 hour',m.period_end),false)
+                WHERE m.team_id=$1 AND m.hour_start+interval '1 hour' > (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)
+                  AND NOT EXISTS (SELECT 1 FROM team_billing_period bp WHERE bp.team_id=m.team_id AND bp.period_start=m.period_start AND bp.period_end=m.period_end
+                    AND (bp.finalized_at IS NOT NULL OR bp.exported_at IS NOT NULL OR bp.status IN ('exporting','exported','finalized')))`, team)
+			if err != nil {
+				return err
+			}
+			_, err = tx.Exec(ctx, `
+                UPDATE billing_export_measurement_queue q SET pending=true
+                WHERE q.team_id=$1 AND q.hour_start+interval '1 hour' > (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)`, team)
 			if err != nil {
 				return err
 			}
@@ -349,23 +385,29 @@ func (h *Handlers) ReconcileStorageBilling(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ready": true, "effective_at": at})
 }
 
-func (h *Handlers) reportBillingMeterEvent(ctx context.Context, team uuid.UUID, resource string, createdAt time.Time, params StripeReportMeterEventParams) error {
+func (h *Handlers) reportBillingMeterEvent(ctx context.Context, team uuid.UUID, resource string, createdAt time.Time, eventTimestamp int64, frozen bool, params StripeReportMeterEventParams) error {
 	if resource != "storage" {
 		return h.Stripe.ReportMeterEvent(ctx, params)
 	}
-	return h.withStorageSubscription(ctx, team, false, func(tx pgx.Tx, p StripeStorageSubscriptionParams) error {
+	calledProvider := false
+	err := h.withStorageSubscription(ctx, team, false, frozen, func(tx pgx.Tx, p StripeStorageSubscriptionParams) error {
 		if p.SubscriptionID == "" || p.CustomerID != params.CustomerID || p.EventName != params.EventName {
 			return fmt.Errorf("storage export does not match the current subscription/customer/meter; operator reconciliation required")
 		}
 		var eligible bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_storage_billing_activation WHERE team_id=$1 AND effective_at<=$2 AND effective_at<=clock_timestamp())`, team, createdAt).Scan(&eligible); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM team_storage_billing_activation WHERE team_id=$1 AND effective_at<=LEAST($2::timestamptz,$3::timestamptz) AND effective_at<=clock_timestamp())`, team, createdAt, time.Unix(eventTimestamp, 0)).Scan(&eligible); err != nil {
 			return err
 		}
 		if !eligible {
 			return fmt.Errorf("storage event predates prospective activation; preserve it for operator review")
 		}
+		calledProvider = true
 		return h.Stripe.ReportMeterEvent(ctx, params)
 	})
+	if err != nil && !calledProvider {
+		return &storageReadinessError{err: err}
+	}
+	return err
 }
 
 func (h *Handlers) billingStorageBillingEnabledForWindow(ctx context.Context, team uuid.UUID, end time.Time) (bool, error) {

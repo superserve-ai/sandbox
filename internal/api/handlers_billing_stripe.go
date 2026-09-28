@@ -1477,7 +1477,7 @@ func (h *Handlers) exportTeamBillingPeriod(c *gin.Context) {
 			}
 		}
 
-		err = h.reportBillingMeterEvent(ctx, teamID, resourceType, row.CreatedAt, StripeReportMeterEventParams{
+		err = h.reportBillingMeterEvent(ctx, teamID, resourceType, row.CreatedAt, periodEnd.UTC().Add(-time.Second).Unix(), false, StripeReportMeterEventParams{
 			Identifier:     row.StripeMeterEventIdentifier,
 			IdempotencyKey: idempotencyKey,
 			EventName:      row.StripeEventName,

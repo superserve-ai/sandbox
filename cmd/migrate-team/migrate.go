@@ -911,6 +911,9 @@ var validationExemptTables = map[string]bool{
 
 var insertOnlyTables = map[string]bool{
 	"profile": true,
+	// Activation rows are immutable; retries must preserve the original
+	// timestamp and validation must detect any destination divergence.
+	"team_storage_billing_activation": true,
 }
 
 // allColumns lists a table's column names in attnum order.
@@ -1846,6 +1849,12 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		t := migratedTables[i]
 		if t.name == "profile" {
 			// Profiles are global (multi-team, shared with Auth); they stay.
+			continue
+		}
+		// Activation is immutable; let the team FK cascade remove it with the
+		// team instead of issuing a direct delete that the immutability trigger
+		// must reject.
+		if t.name == "team_storage_billing_activation" {
 			continue
 		}
 		tag, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s`, t.name, t.scope), cfg.teamID)

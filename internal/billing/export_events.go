@@ -284,15 +284,6 @@ func (s ExportStore) Reserve(ctx context.Context, p ExportPeriod, resource, cumu
 	if err != nil {
 		return nil, err
 	}
-	var enabled bool
-	err = tx.QueryRow(ctx, `SELECT feature_enabled('billing_export_enabled',$1)
-        AND ($2 <> 'storage' OR storage_billing_activated($1,$3))`, p.TeamID, resource, through).Scan(&enabled)
-	if err != nil {
-		return nil, err
-	}
-	if !enabled {
-		return nil, fmt.Errorf("billing export is disabled")
-	}
 	var reserved string
 	err = tx.QueryRow(ctx, `SELECT COALESCE((SELECT coverage_end FROM billing_export_allocation
         WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND resource_type=$4
@@ -306,6 +297,15 @@ func (s ExportStore) Reserve(ctx context.Context, p ExportPeriod, resource, cumu
 	}
 	if delta == "0.000000000000" {
 		return nil, nil
+	}
+	var enabled bool
+	err = tx.QueryRow(ctx, `SELECT feature_enabled('billing_export_enabled',$1)
+        AND ($2 <> 'storage' OR storage_billing_activated($1,$3))`, p.TeamID, resource, through).Scan(&enabled)
+	if err != nil {
+		return nil, err
+	}
+	if !enabled {
+		return nil, fmt.Errorf("billing export is disabled")
 	}
 	payloadQuantity, err := meterQuantityPrefix(delta)
 	if err != nil {
@@ -377,7 +377,13 @@ func (s ExportStore) Claim(ctx context.Context, p ExportPeriod) (*ExportEvent, e
         AND (e.first_attempt_at IS NULL OR e.first_attempt_at>now()-interval '23 hours')
         AND (e.lease_until IS NULL OR e.lease_until<=now())
         AND feature_enabled('billing_export_enabled',a.team_id)
-        AND (a.resource_type<>'storage' OR storage_billing_activated(a.team_id,a.period_end))
+        AND (a.resource_type<>'storage' OR (
+            storage_billing_activated(a.team_id,a.period_end)
+            AND NOT EXISTS (
+                SELECT 1 FROM team_storage_billing_activation sa
+                WHERE sa.team_id=a.team_id AND to_timestamp(e.event_timestamp) < sa.effective_at
+            )
+        ))
         ORDER BY e.created_at,e.id LIMIT 1 FOR UPDATE OF e SKIP LOCKED)
         UPDATE billing_export_event e SET status='uncertain',first_attempt_at=COALESCE(first_attempt_at,now()),
           lease_token=$4,lease_until=now()+interval '2 minutes',attempt_count=attempt_count+1,updated_at=now()
@@ -412,6 +418,21 @@ func (s ExportStore) Acknowledge(ctx context.Context, e ExportEvent, submitErr e
             +interval '1 second'*(get_byte(uuid_send(id),0)%60),
         lease_token=NULL,lease_until=NULL,updated_at=now()
         WHERE id=$1 AND lease_token=$2 AND active AND status='uncertain'`, e.ID, e.LeaseToken, status, message)
+	if err == nil && tag.RowsAffected() != 1 {
+		return ErrExportRecoveryRequired
+	}
+	return err
+}
+
+// Defer returns a definitive preflight failure to the pending queue. No
+// provider request was made, so the idempotency retry window must not start.
+func (s ExportStore) Defer(ctx context.Context, e ExportEvent, deferErr error) error {
+	message := deferErr.Error()
+	tag, err := s.Pool.Exec(ctx, `UPDATE billing_export_event
+        SET status='pending', first_attempt_at=NULL, attempt_count=GREATEST(attempt_count-1,0),
+            next_attempt_at=now()+interval '5 minutes', lease_token=NULL, lease_until=NULL,
+            last_error=$3, updated_at=now()
+        WHERE id=$1 AND lease_token=$2 AND active AND status='uncertain'`, e.ID, e.LeaseToken, message)
 	if err == nil && tag.RowsAffected() != 1 {
 		return ErrExportRecoveryRequired
 	}

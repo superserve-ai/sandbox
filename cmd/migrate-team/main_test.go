@@ -478,6 +478,7 @@ func seedFixture(t *testing.T) *fixture {
 		"billing_rollup_team_backfill_state":  1,
 		"team_feature_flag":                   2,
 		"team_billing_account":                0,
+		"team_storage_billing_activation":     0,
 		"stripe_checkout_expiration_evidence": 2,
 		"team_trial_eligibility_cache":        0,
 		"team_pricing_plan":                   1,
