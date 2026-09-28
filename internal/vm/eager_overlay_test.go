@@ -51,7 +51,7 @@ func TestEagerOverlayEnabled(t *testing.T) {
 // its load was measured under. The fake API refuses the load so the restore
 // stops there; with rolledBack it first refuses eager_overlay as unknown, as a
 // binary without the field would.
-func forkLoadBody(t *testing.T, layered, capable, rolledBack bool) (body, mode string) {
+func forkLoadBody(t *testing.T, layered, capable, rolledBack bool, tweak ...func(*Manager)) (body, mode string) {
 	t.Helper()
 	useTempFloor(t)
 	withPSI(t, 0, 0)
@@ -69,6 +69,9 @@ func forkLoadBody(t *testing.T, layered, capable, rolledBack bool) (body, mode s
 	m.recorder = sink
 	m.cfg.UffdEnabled, m.cfg.ResumeUffdEnabled = true, true
 	m.eagerOverlayCapable.Store(capable)
+	for _, f := range tweak {
+		f(m)
+	}
 	src, _ := seedPausedSource(t, m, layered)
 	man, err := m.CreateSavedSnapshot(context.Background(), src.ID, uuid.NewString(), SavedSnapshotMemFS)
 	if err != nil {
@@ -105,7 +108,7 @@ func forkLoadBody(t *testing.T, layered, capable, rolledBack bool) (body, mode s
 		VMConfig{VCPU: 1, MemoryMiB: 1024, SavedSnapshotID: man.SnapshotID}, nil, "", "", "", nil, 0, "")
 	mu.Lock()
 	defer mu.Unlock()
-	if body == "" {
+	if body == "" && len(tweak) == 0 {
 		t.Fatalf("the restore never sent a load request: %v", rerr)
 	}
 	load, setup := sink.modeOf("restore", "load_snapshot"), sink.modeOf("restore", "net_to_fc")
@@ -124,6 +127,19 @@ func TestForkRestoreAsksForEagerOverlayOnlyWhenLayeredAndCapable(t *testing.T) {
 		b, mode := forkLoadBody(t, c.layered, c.capable, false)
 		if strings.Contains(b, "eager_overlay") || mode != "" {
 			t.Fatalf("layered=%v capable=%v must not pre-copy; mode=%q body=%s", c.layered, c.capable, mode, b)
+		}
+	}
+}
+
+// With UFFD switched off the layered load is refused before any request, and
+// the failed attempt must not enter the eager cohort.
+func TestEagerOverlayNotMeasuredWithoutUffd(t *testing.T) {
+	for _, off := range []func(*Manager){
+		func(m *Manager) { m.cfg.UffdEnabled = false },
+		func(m *Manager) { m.cfg.ResumeUffdEnabled = false },
+	} {
+		if _, mode := forkLoadBody(t, true, true, false, off); mode != "" {
+			t.Fatalf("a restore that cannot reach the UFFD load was measured as %q", mode)
 		}
 	}
 }

@@ -3873,9 +3873,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 	// user-visible restore latency.
 	sidecarBase, hasSidecar := readLayeredBase(memPath)
 	// Only a fork pre-copies: its overlay is what it will read, and its per-fork
-	// copy starts cold on every restore. Decided before any phase is recorded,
-	// so every phase of a pre-copying restore carries its own mode.
-	eager := plan.action == restoreMaterializeFork && hasSidecar && m.eagerOverlayEnabled()
+	// copy starts cold on every restore. Only the layered UFFD load can carry
+	// the request, so a restore that cannot reach it is not labelled as one.
+	eager := plan.action == restoreMaterializeFork && hasSidecar &&
+		useUffd && m.cfg.ResumeUffdEnabled && m.eagerOverlayEnabled()
 	if eager {
 		restoreMode = strings.TrimPrefix(restoreMode+"+eager", "+")
 	}
