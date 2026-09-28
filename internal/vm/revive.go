@@ -467,18 +467,7 @@ func (m *Manager) reviveVMLocked(ctx context.Context, vmID, diskPath, basePath, 
 		inst.RevivalPending = true
 		inst.RevivedDisk = diskPath
 		inst.BackupGeneration = backupGeneration
-		// Revival creates a fresh VMInstance through coldBootFromRootfs. Carry
-		// forward the retained-generation anchors so an upgraded sandbox does
-		// not lose its template disk or layered-memory baseline on the next
-		// pause. These are inventory metadata only; the salvage request still
-		// controls the boot disk/base for this run.
-		if prevRec != nil {
-			inst.SourceSnapshotID = prevRec.SourceSnapshotID
-			inst.BaseMemPath = prevRec.BaseMemPath
-			inst.StrandedOverlays = append([]string(nil), prevRec.StrandedOverlays...)
-			inst.Config.RootfsPath = prevRec.RootfsPath
-			inst.Config.DeltaDir = prevRec.DeltaDir
-		}
+		seedRevivedRetainedDependencies(inst, prevRec)
 		inst.TeamID = prevRec.TeamID
 		inst.OwnerID = prevRec.OwnerID
 		inst.PreviewAccess = prevRec.PreviewAccess
@@ -612,3 +601,18 @@ const reviveBoxdReadyBudget = 90 * time.Second
 // directory, so it gets more room than a bare unit stop, but never an
 // unbounded hold on the RPC and lifecycle lock.
 const reviveTeardownBudget = 60 * time.Second
+
+// seedRevivedRetainedDependencies preserves known generation anchors without
+// erasing the salvage rootfs established by coldBootFromRootfs for old records.
+func seedRevivedRetainedDependencies(inst *VMInstance, previous *VMRecord) {
+	if previous == nil {
+		return
+	}
+	inst.SourceSnapshotID = previous.SourceSnapshotID
+	inst.BaseMemPath = previous.BaseMemPath
+	inst.StrandedOverlays = append([]string(nil), previous.StrandedOverlays...)
+	if previous.RootfsPath != "" {
+		inst.Config.RootfsPath = previous.RootfsPath
+	}
+	inst.Config.DeltaDir = previous.DeltaDir
+}

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"time"
 
@@ -19,7 +20,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
-// Lifecycle writers only advance atomics. Discovery never takes their locks.
+// Lifecycle writers advance atomics so discovery can reject overlapping work.
 func (m *Manager) beginStorageMutation() func() {
 	m.storageMutations.Add(1)
 	m.storageEpoch.Add(1)
@@ -180,10 +181,63 @@ func (m *Manager) RetainedStorageInventory(ctx context.Context) (*retainedstorag
 	return m.retainedStorageInventory(ctx, retainedFileExtents)
 }
 
-// rememberRetainedDependencies persists anchors recovered from a legacy
-// record.  Inventory runs off the lifecycle hot path, so a small conditional
-// record write here is preferable to allowing the next full pause to erase
-// the generation identity and freeze host-wide accounting.
+// sameRetainedGeneration fences recovered dependencies against replacement,
+// pause/resume, and deletion/recreation while allowing unrelated policy updates.
+func sameRetainedGeneration(a, b VMRecord) bool {
+	return a.ID == b.ID && a.CreatedAt.Equal(b.CreatedAt) && a.PausedAt.Equal(b.PausedAt) &&
+		a.Status == b.Status && a.PID == b.PID && a.ArtifactID == b.ArtifactID &&
+		a.DiskPath == b.DiskPath && a.BasePath == b.BasePath &&
+		a.SnapshotPath == b.SnapshotPath && a.MemFilePath == b.MemFilePath &&
+		a.BaseMemPath == b.BaseMemPath && a.RootfsPath == b.RootfsPath && a.DeltaDir == b.DeltaDir &&
+		a.SourceSnapshotID == b.SourceSnapshotID && a.RevivedDisk == b.RevivedDisk &&
+		a.BackupGeneration == b.BackupGeneration && a.TeardownPending == b.TeardownPending &&
+		a.RevivalPending == b.RevivalPending && a.WakePending == b.WakePending && a.Unverified == b.Unverified &&
+		a.WakeSnapshotPath == b.WakeSnapshotPath && a.WakeMemPath == b.WakeMemPath &&
+		a.DirtyTrackingSessionID == b.DirtyTrackingSessionID && a.DirtyTrackingGeneration == b.DirtyTrackingGeneration &&
+		slices.Equal(a.StrandedOverlays, b.StrandedOverlays)
+}
+
+// updateRetainedDependencies changes only dependency fields in the current
+// record. The comparison and patch share one transaction; unknown fields and
+// unrelated lifecycle/policy state must survive this background write.
+func (s *StateStore) updateRetainedDependencies(original, resolved VMRecord) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		records := tx.Bucket(bucketName)
+		key := []byte(original.ID)
+		raw := records.Get(key)
+		if raw == nil {
+			return fmt.Errorf("retained owner was removed")
+		}
+		var current VMRecord
+		if err := json.Unmarshal(raw, &current); err != nil {
+			return err
+		}
+		if !sameRetainedGeneration(original, current) {
+			return fmt.Errorf("retained generation changed before dependency update")
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return err
+		}
+		for key, value := range map[string]string{
+			"base_mem_path": resolved.BaseMemPath,
+			"rootfs_path":   resolved.RootfsPath,
+			"delta_dir":     resolved.DeltaDir,
+		} {
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				return err
+			}
+			fields[key] = encoded
+		}
+		updated, err := json.Marshal(fields)
+		if err != nil {
+			return err
+		}
+		return records.Put(key, updated)
+	})
+}
+
 func (m *Manager) rememberRetainedDependencies(original, resolved VMRecord) error {
 	if original.BaseMemPath == resolved.BaseMemPath && original.RootfsPath == resolved.RootfsPath && original.DeltaDir == resolved.DeltaDir {
 		return nil
@@ -191,36 +245,34 @@ func (m *Manager) rememberRetainedDependencies(original, resolved VMRecord) erro
 	if m.state == nil {
 		return nil
 	}
+	// Serialize with pause/resume even for untracked records. This metadata-only
+	// update does not change the sampled artifacts or advance the inventory epoch.
+	ch := m.vmOpCh(original.ID)
+	select {
+	case ch <- struct{}{}:
+		defer func() { <-ch }()
+	default:
+		return fmt.Errorf("retained owner lifecycle operation in progress")
+	}
 	m.mu.RLock()
 	inst := m.vms[original.ID]
 	m.mu.RUnlock()
 	if inst != nil {
 		inst.mu.Lock()
-		current := toRecordLocked(inst)
-		if current.BaseMemPath != original.BaseMemPath || current.RootfsPath != original.RootfsPath || current.DeltaDir != original.DeltaDir {
-			inst.mu.Unlock()
-			return nil
+		defer inst.mu.Unlock()
+		if !sameRetainedGeneration(original, toRecordLocked(inst)) {
+			return fmt.Errorf("retained instance changed before dependency update")
 		}
+	}
+	if err := m.state.updateRetainedDependencies(original, resolved); err != nil {
+		return err
+	}
+	if inst != nil {
 		inst.BaseMemPath = resolved.BaseMemPath
 		inst.Config.RootfsPath = resolved.RootfsPath
 		inst.Config.DeltaDir = resolved.DeltaDir
-		updated := toRecordLocked(inst)
-		inst.mu.Unlock()
-		_, err := m.state.PutIfPresent(updated)
-		return err
 	}
-	current, err := m.state.Get(original.ID)
-	if err != nil || current == nil {
-		return err
-	}
-	if current.BaseMemPath != original.BaseMemPath || current.RootfsPath != original.RootfsPath || current.DeltaDir != original.DeltaDir {
-		return nil
-	}
-	current.BaseMemPath = resolved.BaseMemPath
-	current.RootfsPath = resolved.RootfsPath
-	current.DeltaDir = resolved.DeltaDir
-	_, err = m.state.PutIfPresent(*current)
-	return err
+	return nil
 }
 
 func (m *Manager) retainedStorageInventory(ctx context.Context, measure func(*os.File, int) ([]retainedstorage.Extent, string, error)) (*retainedstorage.Inventory, error) {

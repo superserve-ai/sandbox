@@ -31,8 +31,12 @@ The scan is limited to 4,096 owners, 32,768 file observations and physical range
 8 MiB of durable record input and 8 MiB of report JSON, with a 30-second context
 budget. Individual filesystem syscalls cannot be interrupted. Large or fragmented
 hosts exceeding these limits require qualification before opt-in; the meter does
-not substitute apparent length or provisioned capacity. Lifecycle paths only
-advance atomic counters; they never wait for the sampler. Receiver transactions
+not substitute apparent length or provisioned capacity. Artifact discovery stays off lifecycle paths. Legacy dependency persistence takes
+the per-VM operation lock without waiting and patches three fields in one BoltDB
+transaction, checking the generation again inside that transaction. A subsequent
+pause/resume can wait for that single metadata commit; no filesystem scan runs
+under the lock. Qualify this contention with the lifecycle latency checks before
+opt-in. Receiver transactions
 retain the existing two-second timeout and short lock waits.
 
 Owner histories record generations and physical ranges. Replacing a full memory
@@ -75,3 +79,41 @@ snapshot-only settlement, producer restart, and mixed-version rollback. Compare
 create/resume latency and worker transaction durations under representative fleet
 size and fragmentation. Raw extent-history queries and the atomic host-inventory
 transaction must be qualified at those sizes before opting in production hosts.
+
+
+## Existing records without generation anchors
+
+Do not enable the retained producer on a host until every existing owner resolves.
+A pre-upgrade full pause can leave `RootfsPath` and `DeltaDir` absent,
+`BaseMemPath` empty, and `SnapshotPath` pointing only to the sandbox's pause.
+The host record then cannot identify the original template generation.
+`BasePath` alone identifies a disk base, not the template delta: multiple builds
+can share that base. A block-map sidecar describes written blocks, and a pause
+manifest describes current pause files; neither establishes the missing original
+generation. Selecting the latest template, even the only one currently on disk,
+is not a valid recovery rule. Such a host remains blocked; rejecting its inventory
+preserves prior quantities but does not complete the upgrade.
+
+Before opt-in, reconcile a bounded batch of affected sandbox IDs with their
+control-plane creation references (`sandbox.snapshot_path`, `mem_path`,
+`base_path`, and `delta_path`) on the recorded host. Require a generation-pinned
+reference: a template ID or the current mutable template row is insufficient.
+For overlay records, verify the pinned `delta_path` names `rootfs.delta` and its
+build metadata agrees with the sandbox's recorded base. For full-copy records,
+resolve `RootfsPath` from the build metadata adjacent to the pinned creation
+snapshot (or its verified legacy flat-template layout). Do not put a template
+memory base back into a full pause's `BaseMemPath`.
+
+A migration must persist only the proven disk dependency fields, comparing the
+record's creation and current pause identity atomically, while coordinating with
+its lifecycle operation. Preserve status, pause artifacts, policy, and unknown
+fields. Re-read changed records and retry reconciliation against their new
+identity; do not write a captured whole record. Keep a per-owner receipt of the
+authoritative reference and verified dependency paths, then reopen durable state
+and require a complete inventory before enabling the producer. If those creation
+references are absent, reused, or not generation-pinned, recover the original
+per-sandbox build reference from an authoritative historical record first. There
+is no automatic control-plane-to-host migration for this case in the current
+producer; affected hosts must remain opted out until that reconciliation is
+implemented and its receipts are checked. Missing authority must not become zero
+or trigger a cutover.

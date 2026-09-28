@@ -3,6 +3,7 @@
 package api
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -122,5 +123,72 @@ func TestIntegration_RetainedFailedOwnerCutover(t *testing.T) {
 	}
 	if err := apply(owner(healthy)); err == nil {
 		t.Fatal("failed status retired accepted bytes")
+	}
+}
+
+func TestIntegration_RetainedFailedFirstMeasurementBlocksSettlement(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		name := "durable"
+		if legacy {
+			name = "legacy"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newStorageLeaseFixture(t)
+			ctx := t.Context()
+			exec := func(query string, args ...any) {
+				t.Helper()
+				if _, err := f.pool.Exec(ctx, query, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exec(`CREATE TEMP TABLE legacy_host_storage_report(host_id text,received_at timestamptz)`)
+			exec(`DELETE FROM sandbox_storage_interval`)
+			exec(`UPDATE sandbox SET status='failed' WHERE id=$1`, f.sandboxID)
+			var team uuid.UUID
+			if err := f.pool.QueryRow(ctx, `SELECT team_id FROM sandbox WHERE id=$1`, f.sandboxID).Scan(&team); err != nil {
+				t.Fatal(err)
+			}
+			inv := &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{{
+				Kind: "sandbox", ID: f.sandboxID.String(), Generation: strings.Repeat("a", 64),
+				Extents: []retainedstorage.Extent{{Device: "fs", Start: 4096, Length: 4096}},
+			}}}
+			measurements := []storageReportMeasurement{{Retained: inv}}
+			payload, err := json.Marshal(measurements)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec(`UPDATE host_storage_report SET state='pending',payload=$2,next_measurement_index=0 WHERE report_id=$1`, f.reportID, payload)
+			if legacy {
+				exec(`UPDATE host_storage_report SET state='terminal' WHERE report_id=$1`, f.reportID)
+				exec(`INSERT INTO legacy_host_storage_report VALUES($1,$2)`, f.hostID, f.receivedAt)
+			}
+			complete := func(want bool) {
+				t.Helper()
+				var got bool
+				if err := f.pool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, f.receivedAt.Add(time.Minute)).Scan(&got); err != nil {
+					t.Fatal(err)
+				}
+				if got != want {
+					t.Fatalf("settlement complete=%v, want %v", got, want)
+				}
+			}
+			var count int
+			if err := f.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM retained_storage_interval)+(SELECT count(*) FROM sandbox_storage_interval)`).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("first measurement has prior intervals: %d %v", count, err)
+			}
+			complete(false)
+			// Resolving the legacy receipt into the durable stream must keep the
+			// same fence until its first measurable retained quantity is applied.
+			exec(`DELETE FROM legacy_host_storage_report`)
+			exec(`UPDATE host_storage_report SET state='processing' WHERE report_id=$1`, f.reportID)
+			complete(false)
+			if err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, f.receivedAt, measurements, 1, 1); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval WHERE owner_id=$1 AND started_at=$2 AND ended_at IS NULL AND extents->0->>'length'='4096'`, f.sandboxID, f.receivedAt).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("first retained measurement was not applied at receipt: %d %v", count, err)
+			}
+			complete(true)
+		})
 	}
 }

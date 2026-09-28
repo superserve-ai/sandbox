@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"encoding/json"
+	bolt "go.etcd.io/bbolt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
@@ -288,5 +290,261 @@ func TestRetainedInventoryArtifactRacePreservesAcceptedQuantity(t *testing.T) {
 				t.Fatal("race replaced accepted report quantity")
 			}
 		})
+	}
+}
+
+func TestRetainedDependencyUpdateRejectsNewLifecycleGeneration(t *testing.T) {
+	for _, tracked := range []bool{false, true} {
+		for _, transition := range []string{"pause", "resume", "recreate", "delete"} {
+			t.Run(strconv.FormatBool(tracked)+"/"+transition, func(t *testing.T) {
+				state, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer state.Close()
+				original := VMRecord{ID: uuid.NewString(), Status: StatusRunning, DiskPath: "/example/overlay.ext4", SnapshotPath: "/example/templates/old/vmstate.snap", MemFilePath: "/example/templates/old/mem.snap"}
+				if transition == "resume" {
+					original.Status = StatusPaused
+				}
+				if err := state.Put(original); err != nil {
+					t.Fatal(err)
+				}
+				resolved := original
+				resolved.RootfsPath = "/example/templates/old/rootfs.ext4"
+				m := &Manager{state: state, vms: map[string]*VMInstance{}}
+				if tracked {
+					m.vms[original.ID] = toInstance(original)
+				}
+				unlock, err := m.lockVMOp(t.Context(), original.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// The sampler captured the old record before the operation began.
+				if err := m.rememberRetainedDependencies(original, resolved); err == nil {
+					t.Fatal("dependency update entered an active lifecycle operation")
+				}
+				newer := original
+				switch transition {
+				case "pause":
+					newer.Status = StatusPaused
+					newer.SnapshotPath = "/example/paused/vmstate.snap"
+					newer.MemFilePath = "/example/paused/mem.snap"
+					newer.ArtifactID = "new-pause"
+				case "resume":
+					newer.Status = StatusRunning
+					newer.PID = 12345
+					newer.DiskPath = "/example/resumed/rootfs.ext4"
+				case "recreate":
+					newer.CreatedAt = time.Now().UTC()
+				case "delete":
+					if err := state.Delete(original.ID); err != nil {
+						t.Fatal(err)
+					}
+					delete(m.vms, original.ID)
+				}
+				if transition != "delete" {
+					if err := state.Put(newer); err != nil {
+						t.Fatal(err)
+					}
+					if tracked {
+						m.vms[original.ID] = toInstance(newer)
+					}
+				}
+				unlock()
+				before, err := state.Get(original.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := m.rememberRetainedDependencies(original, resolved); err == nil {
+					t.Fatal("stale dependency update accepted after lifecycle transition")
+				}
+				after, err := state.Get(original.ID)
+				if err != nil || !reflect.DeepEqual(before, after) {
+					t.Fatalf("stale update changed durable lifecycle state: before=%+v after=%+v err=%v", before, after, err)
+				}
+				if inst := m.vms[original.ID]; inst != nil && inst.Config.RootfsPath != "" {
+					t.Fatal("stale dependency installed in memory")
+				}
+			})
+		}
+	}
+}
+
+func TestRetainedDependencyUpdatePreservesCurrentFields(t *testing.T) {
+	for _, tracked := range []bool{false, true} {
+		t.Run(strconv.FormatBool(tracked), func(t *testing.T) {
+			state, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer state.Close()
+			original := VMRecord{ID: uuid.NewString(), Status: StatusPaused, DiskPath: "/example/overlay.ext4", SnapshotPath: "/example/vmstate.snap", MemFilePath: "/example/mem.diff"}
+			current := original
+			current.Metadata = map[string]string{"label": "newer-value"}
+			if err := state.Put(current); err != nil {
+				t.Fatal(err)
+			}
+			// Fields from a newer daemon must survive a dependency-only patch.
+			if err := state.db.Update(func(tx *bolt.Tx) error {
+				b := tx.Bucket(bucketName)
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(b.Get([]byte(original.ID)), &fields); err != nil {
+					return err
+				}
+				fields["future_field"] = json.RawMessage(`"keep"`)
+				raw, err := json.Marshal(fields)
+				if err != nil {
+					return err
+				}
+				return b.Put([]byte(original.ID), raw)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			m := &Manager{state: state, vms: map[string]*VMInstance{}}
+			if tracked {
+				m.vms[original.ID] = toInstance(current)
+			}
+			resolved := original
+			resolved.BaseMemPath = "/example/templates/pinned/mem.snap"
+			resolved.RootfsPath = "/example/templates/pinned/rootfs.ext4"
+			resolved.DeltaDir = "/example/templates/pinned"
+			if err := m.rememberRetainedDependencies(original, resolved); err != nil {
+				t.Fatal(err)
+			}
+			current.BaseMemPath, current.RootfsPath, current.DeltaDir = resolved.BaseMemPath, resolved.RootfsPath, resolved.DeltaDir
+			after, err := state.Get(original.ID)
+			if err != nil || after == nil || !reflect.DeepEqual(*after, current) {
+				t.Fatalf("dependency patch lost current fields: %+v %v", after, err)
+			}
+			if err := state.db.View(func(tx *bolt.Tx) error {
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(tx.Bucket(bucketName).Get([]byte(original.ID)), &fields); err != nil {
+					return err
+				}
+				if string(fields["future_field"]) != `"keep"` {
+					t.Fatal("dependency patch lost unknown field")
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if tracked && !sameRetainedGeneration(current, toRecord(m.vms[original.ID])) {
+				t.Fatal("durable and in-memory dependencies disagree")
+			}
+		})
+	}
+}
+
+func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
+	for _, legacy := range []bool{true, false} {
+		t.Run(strconv.FormatBool(legacy), func(t *testing.T) {
+			root := t.TempDir()
+			statePath := filepath.Join(root, "state.db")
+			state, err := OpenStateStore(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { state.Close() })
+			id := uuid.NewString()
+			previous := VMRecord{ID: id, Status: StatusError}
+			salvage := filepath.Join(root, "salvaged.ext4")
+			if !legacy {
+				previous.RootfsPath = filepath.Join(root, "pinned-rootfs.ext4")
+			}
+			// coldBootFromRootfs establishes this source before invoking the
+			// revival seed; the writable copy is a separate retained file.
+			inst := &VMInstance{ID: id, Status: StatusCreating, Config: VMConfig{RootfsPath: salvage}, RevivedDisk: salvage}
+			seedRevivedRetainedDependencies(inst, &previous)
+			wantRootfs := previous.RootfsPath
+			if legacy {
+				wantRootfs = salvage
+			}
+			if inst.Config.RootfsPath != wantRootfs {
+				t.Fatalf("revival rootfs = %q, want %q", inst.Config.RootfsPath, wantRootfs)
+			}
+			inst.DiskPath = filepath.Join(root, "rootfs.ext4")
+			inst.Status = StatusRunning
+			if err := state.Put(toRecord(inst)); err != nil {
+				t.Fatal(err)
+			}
+			// Persist the full-pause transition, which replaces memory anchors.
+			inst.Status = StatusPaused
+			inst.SnapshotPath = filepath.Join(root, "vmstate.snap")
+			inst.MemFilePath = filepath.Join(root, "mem.snap")
+			inst.BaseMemPath = ""
+			for _, path := range []string{wantRootfs, inst.DiskPath, inst.SnapshotPath, inst.MemFilePath} {
+				if err := os.WriteFile(path, []byte("retained"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := state.Put(toRecord(inst)); err != nil {
+				t.Fatal(err)
+			}
+			if err := state.Close(); err != nil {
+				t.Fatal(err)
+			}
+			state, err = OpenStateStore(statePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, err := state.Get(id)
+			if err != nil || rec == nil {
+				t.Fatalf("restart lost record: %v", err)
+			}
+			m := &Manager{state: state, cfg: ManagerConfig{RunDir: root, SnapshotDir: filepath.Join(root, "snapshots")}, vms: map[string]*VMInstance{id: toInstance(*rec)}}
+			seen := map[string]bool{}
+			inv, err := m.retainedStorageInventory(t.Context(), func(f *os.File, _ int) ([]retainedstorage.Extent, string, error) {
+				seen[f.Name()] = true
+				return []retainedstorage.Extent{{Device: "fs", Start: int64(len(seen)) * 4096, Length: 4096}}, f.Name(), nil
+			})
+			if err != nil || inv == nil || len(inv.Owners) != 1 || len(seen) != 4 || !seen[wantRootfs] {
+				t.Fatalf("revived inventory lost dependencies: paths=%v err=%v", seen, err)
+			}
+		})
+	}
+}
+
+func TestRetainedDependencyUpdateFencesConcurrentDurableWrite(t *testing.T) {
+	state, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	original := VMRecord{ID: uuid.NewString(), Status: StatusRunning, SnapshotPath: "/example/templates/pinned/vmstate.snap"}
+	if err := state.Put(original); err != nil {
+		t.Fatal(err)
+	}
+	resolved := original
+	resolved.RootfsPath = "/example/templates/pinned/rootfs.ext4"
+	// Hold the lifecycle writer transaction while the sampler attempts its
+	// update. Its generation comparison must observe the committed pause.
+	tx, err := state.db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	newer := original
+	newer.Status = StatusPaused
+	newer.SnapshotPath = "/example/paused/vmstate.snap"
+	newer.MemFilePath = "/example/paused/mem.snap"
+	newer.ArtifactID = "new-pause"
+	if _, err := putRecord(tx, newer, true); err != nil {
+		t.Fatal(err)
+	}
+	started, done := make(chan struct{}), make(chan error, 1)
+	go func() {
+		close(started)
+		done <- state.updateRetainedDependencies(original, resolved)
+	}()
+	<-started
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err == nil {
+		t.Fatal("sampler accepted the prior generation after concurrent pause")
+	}
+	after, err := state.Get(original.ID)
+	if err != nil || after == nil || !reflect.DeepEqual(*after, newer) {
+		t.Fatalf("concurrent pause was overwritten: %+v %v", after, err)
 	}
 }
