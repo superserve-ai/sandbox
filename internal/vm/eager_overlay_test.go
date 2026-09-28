@@ -1,24 +1,119 @@
 package vm
 
 import (
+	"context"
 	"errors"
+	"io"
+	"net"
+	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
 
+// withPSI sets the pressure eagerOverlayEnabled reads for the rest of the test.
+func withPSI(t *testing.T, mem, io float64) {
+	prev := eagerOverlayPSI
+	eagerOverlayPSI = func() (float64, float64) { return mem, io }
+	t.Cleanup(func() { eagerOverlayPSI = prev })
+}
+
 func TestEagerOverlayEnabled(t *testing.T) {
 	m := &Manager{log: zerolog.Nop()}
-	if m.eagerOverlayEnabled(0, 0) {
+	withPSI(t, 0, 0)
+	if m.eagerOverlayEnabled() {
 		t.Fatal("a binary that does not advertise the field must not get it")
 	}
 	m.eagerOverlayCapable.Store(true)
-	if !m.eagerOverlayEnabled(0, 0) || !m.eagerOverlayEnabled(-1, -1) {
+	if !m.eagerOverlayEnabled() {
 		t.Fatal("a capable binary on an unpressured host should pre-copy")
 	}
-	if m.eagerOverlayEnabled(eagerOverlayMaxPSI+1, 0) || m.eagerOverlayEnabled(0, eagerOverlayMaxPSI+1) {
-		t.Fatal("a host under memory or IO pressure should skip the pre-copy")
+	withPSI(t, -1, -1)
+	if !m.eagerOverlayEnabled() {
+		t.Fatal("unreadable pressure must not block the pre-copy")
+	}
+	withPSI(t, eagerOverlayMaxPSI+1, 0)
+	if m.eagerOverlayEnabled() {
+		t.Fatal("a host under memory pressure should skip the pre-copy")
+	}
+	withPSI(t, 0, eagerOverlayMaxPSI+1)
+	if m.eagerOverlayEnabled() {
+		t.Fatal("a host under IO pressure should skip the pre-copy")
+	}
+}
+
+// forkLoadBody runs a fork of a fresh saved snapshot of a paused source until
+// Firecracker's load request, and returns that request's body. The fake API
+// refuses the load so the restore stops there.
+func forkLoadBody(t *testing.T, layered, capable bool) string {
+	t.Helper()
+	useTempFloor(t)
+	withPSI(t, 0, 0)
+	m := newSavedTestManager(t)
+	// The API socket lives in the run dir, and t.TempDir is too long for one.
+	runDir, err := os.MkdirTemp("", "eo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(runDir) })
+	m.cfg.RunDir = runDir
+	m.restoreSem = make(chan struct{}, 1)
+	m.netMgr = &fakeNetMgr{}
+	m.cfg.UffdEnabled, m.cfg.ResumeUffdEnabled = true, true
+	m.eagerOverlayCapable.Store(capable)
+	src, _ := seedPausedSource(t, m, layered)
+	man, err := m.CreateSavedSnapshot(context.Background(), src.ID, uuid.NewString(), SavedSnapshotMemFS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		mu   sync.Mutex
+		body string
+	)
+	m.launchFirecrackerHook = func(_ context.Context, _, socketPath, _, _, _ string, _ Supervision, _, _ bool) (int, Supervision, error) {
+		ln, err := net.Listen("unix", socketPath)
+		if err != nil {
+			return 0, SupervisionUnit, err
+		}
+		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/snapshot/load" {
+				b, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				body = string(b)
+				mu.Unlock()
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"fault_message":"stop after the load request"}`))
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		})}
+		go srv.Serve(ln)
+		t.Cleanup(func() { srv.Close() })
+		return 0, SupervisionUnit, nil
+	}
+	_, rerr := m.restoreVMSnapshot(context.Background(), uuid.NewString(), "", "",
+		VMConfig{VCPU: 1, MemoryMiB: 1024, SavedSnapshotID: man.SnapshotID}, nil, "", "", "", nil, 0, "")
+	mu.Lock()
+	defer mu.Unlock()
+	if body == "" {
+		t.Fatalf("the restore never sent a load request: %v", rerr)
+	}
+	return body
+}
+
+func TestForkRestoreAsksForEagerOverlayOnlyWhenLayeredAndCapable(t *testing.T) {
+	if b := forkLoadBody(t, true, true); !strings.Contains(b, `"eager_overlay":true`) {
+		t.Fatalf("a layered fork on a capable binary must ask for the pre-copy: %s", b)
+	}
+	if b := forkLoadBody(t, true, false); strings.Contains(b, "eager_overlay") {
+		t.Fatalf("a binary without the capability must not be sent the field: %s", b)
+	}
+	if b := forkLoadBody(t, false, true); strings.Contains(b, "eager_overlay") {
+		t.Fatalf("a fork with no overlay has nothing to pre-copy: %s", b)
 	}
 }
 

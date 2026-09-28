@@ -14,11 +14,22 @@ const unknownEagerOverlayFieldMarker = "unknown field `eager_overlay`"
 // memory up front, which a host already waiting on either can least afford.
 const eagerOverlayMaxPSI = 10.0
 
+// eagerOverlayPSI reads the memory and IO pressure at the moment a fork asks
+// for the pre-copy; a hook so tests do not depend on the host's.
+var eagerOverlayPSI = func() (mem, io float64) {
+	_, mem, io = cachedPSI()
+	return mem, io
+}
+
 // eagerOverlayEnabled reports whether a fork restore may ask Firecracker to
 // pre-copy its overlay: whenever the binary advertises it and the host is not
 // under pressure. PSI reads -1 when unavailable, which does not block.
-func (m *Manager) eagerOverlayEnabled(memPSI, ioPSI float64) bool {
-	return m.eagerOverlayCapable.Load() && memPSI <= eagerOverlayMaxPSI && ioPSI <= eagerOverlayMaxPSI
+func (m *Manager) eagerOverlayEnabled() bool {
+	if !m.eagerOverlayCapable.Load() {
+		return false
+	}
+	mem, io := eagerOverlayPSI()
+	return mem <= eagerOverlayMaxPSI && io <= eagerOverlayMaxPSI
 }
 
 // restoreWithEagerOverlayFallback runs restore with eager and, if this

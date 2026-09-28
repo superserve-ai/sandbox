@@ -4139,7 +4139,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			if attemptErr == nil {
 				// Only a fork pre-copies: its overlay is what it will read, and
 				// its per-fork copy starts cold on every restore.
-				eager := plan.action == restoreMaterializeFork && hasSidecar && m.eagerOverlayEnabled(memPSI, ioPSI)
+				eager := plan.action == restoreMaterializeFork && hasSidecar && m.eagerOverlayEnabled()
 				var armed string
 				armed, restoreClockFrozen, attemptErr = m.restoreWithSessionFallback(trackingSessionID, func(sid string) (bool, error) {
 					return m.restoreWithClockFallback(clockPolicy, demote, func(clock *bool) error {
