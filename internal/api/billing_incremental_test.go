@@ -58,6 +58,7 @@ func TestIncrementalMeterSummaryDoesNotInferEventAcceptance(t *testing.T) {
 		want      string
 	}{
 		{`{"data":[],"has_more":false}`, false, "0"},
+		{`{"data":[]}`, true, ""},
 		{`{"data":[{"aggregated_value":10}],"has_more":true}`, true, ""},
 		{`{"data":[{"aggregated_value":10},{"aggregated_value":5}],"has_more":false}`, true, ""},
 	} {
@@ -198,8 +199,13 @@ func TestIncrementalBucketReaderBoundsAndEdges(t *testing.T) {
 			})
 			client := &stripeHTTPClient{baseURL: "https://stripe.example.test", secretKey: "sk_test_example", apiVersion: "2025-06-30", httpClient: &http.Client{Transport: transport}}
 			buckets, err := client.BucketedMeterUsage(t.Context(), "cpu_hours", "cus_example", start, end)
-			if mode == "complete" {
-				if err != nil || len(buckets) != 32 || calls != 4 {
+			if mode == "complete" || mode == "missing" {
+				wantBuckets := 32
+				if mode == "missing" {
+					// Each of the three summary responses omits one bucket.
+					wantBuckets = 29
+				}
+				if err != nil || len(buckets) != wantBuckets || calls != 4 {
 					t.Fatalf("buckets=%d calls=%d err=%v", len(buckets), calls, err)
 				}
 			} else if err == nil {
@@ -213,7 +219,7 @@ func TestIncrementalBucketReaderBoundsAndEdges(t *testing.T) {
 }
 
 func TestMeterPrecisionBoundary(t *testing.T) {
-	for _, total := range []string{"0.000000000001", "1", "8191.999999999999", "8192", "9712.454976049444", "1000000000"} {
+	for _, total := range []string{"0.000000000001", "1", "8191.999999999999", "8192", "9712.454976049444"} {
 		local, _ := meterDecimal(total)
 		bound, err := meterPrecisionBound(local)
 		if err != nil {
@@ -241,11 +247,17 @@ func TestMeterPrecisionBoundary(t *testing.T) {
 			}
 		}
 	}
-	for _, total := range []string{"0", "0.0000000000009", "1000000000.000000000001"} {
+	if bound, err := meterPrecisionBound(new(big.Rat)); err != nil || bound.Cmp(big.NewRat(1, 1_000_000_000_000)) != 0 {
+		t.Fatalf("zero precision policy: bound=%v err=%v", bound, err)
+	}
+	for _, total := range []string{"0.0000000000009", "1000000000.000000000001"} {
 		r, _ := meterDecimal(total)
 		if _, err := meterPrecisionBound(r); err == nil {
 			t.Fatalf("unsupported total %s", total)
 		}
+	}
+	if decision, _ := compareMeterSummary("1000000000.000000000001", "1000000000"); decision.Err == nil {
+		t.Fatal("provider quantity beyond upper policy boundary accepted")
 	}
 }
 
@@ -259,7 +271,7 @@ func TestMeterEvidenceWindowsAndLocalInventory(t *testing.T) {
 	buckets[1].Quantity = "9712.454976049444"
 	events := []meterLocalEvent{{ID: "example", EventName: "cpu_hours", Customer: "cus_example", Quantity: buckets[1].Quantity, Status: "submitted", Timestamp: buckets[1].Start.Unix()}}
 	reserved, _ := meterDecimal(events[0].Quantity)
-	for _, mode := range []string{"complete", "missing", "shifted", "nonzero_empty_bucket", "tiny_bucket_drift", "uncertain", "rejected", "pending", "wrong_customer", "wrong_meter", "at_end", "before_start", "wrong_reservations", "malformed"} {
+	for _, mode := range []string{"complete", "missing", "missing_nonzero", "shifted", "nonzero_empty_bucket", "tiny_bucket_drift", "uncertain", "rejected", "pending", "wrong_customer", "wrong_meter", "at_end", "before_start", "wrong_reservations", "malformed"} {
 		t.Run(mode, func(t *testing.T) {
 			bs := append([]meterUsageBucket(nil), buckets...)
 			es := append([]meterLocalEvent(nil), events...)
@@ -267,6 +279,8 @@ func TestMeterEvidenceWindowsAndLocalInventory(t *testing.T) {
 			switch mode {
 			case "missing":
 				bs = bs[:2]
+			case "missing_nonzero":
+				bs = append(bs[:1], bs[2:]...)
 			case "shifted":
 				bs[1].Start = bs[1].Start.Add(time.Minute)
 			case "nonzero_empty_bucket":
@@ -289,7 +303,7 @@ func TestMeterEvidenceWindowsAndLocalInventory(t *testing.T) {
 				bs[1].Quantity = "NaN"
 			}
 			err := matchMeterBuckets(es, bs, "cpu_hours", "cus_example", start, end, total)
-			if (err == nil) != (mode == "complete") {
+			if (err == nil) != (mode == "complete" || mode == "missing") {
 				t.Fatalf("%s: %v", mode, err)
 			}
 		})

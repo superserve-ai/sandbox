@@ -1806,6 +1806,31 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 			t.Fatalf("%s accounting: %+v %v", resource, totals, err)
 		}
 	}
+	rows, err = pool.Query(ctx, `SELECT resource_type,local_quantity::text,submitted_quantity::text,
+ reserved_quantity::text,counted_quantity::text,last_error IS NULL
+ FROM billing_export_observation WHERE team_id=$1 ORDER BY resource_type`, team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var observations int
+	for rows.Next() {
+		var resource, local, submitted, reserved, counted string
+		var clear bool
+		if err := rows.Scan(&resource, &local, &submitted, &reserved, &counted, &clear); err != nil {
+			t.Fatal(err)
+		}
+		observations++
+		if local != reserved || submitted != reserved || counted != "9714.454976049445" || !clear {
+			t.Fatalf("%s observation: local=%s submitted=%s reserved=%s counted=%s clear=%v", resource, local, submitted, reserved, counted, clear)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if observations != len(resources) {
+		t.Fatalf("observations=%d want=%d", observations, len(resources))
+	}
 	if snapshot() != before {
 		t.Fatal("precision recovery mutated historical payload or coverage")
 	}

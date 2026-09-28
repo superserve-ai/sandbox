@@ -51,12 +51,12 @@ func (c *stripeHTTPClient) CountedMeterUsage(ctx context.Context, eventName, cus
 		Data []struct {
 			Value json.Number `json:"aggregated_value"`
 		} `json:"data"`
-		HasMore bool `json:"has_more"`
+		HasMore *bool `json:"has_more"`
 	}
 	if err := c.doForm(ctx, http.MethodGet, "/v1/billing/meters/"+url.PathEscape(meterID)+"/event_summaries?"+values.Encode(), nil, &summary, ""); err != nil {
 		return "", err
 	}
-	if summary.HasMore || len(summary.Data) > 1 {
+	if summary.HasMore == nil || *summary.HasMore || len(summary.Data) > 1 {
 		return "", fmt.Errorf("unexpected grouped meter summary")
 	}
 	if len(summary.Data) == 0 {
@@ -141,7 +141,27 @@ func meterDecimal(value string) (*big.Rat, error) {
 	return r, nil
 }
 
+// meterQuantity is the supported exact quantity domain. Zero is a valid
+// empty bucket; every non-zero value must be representable within the
+// documented reconciliation range.
+func meterQuantity(value string) (*big.Rat, error) {
+	r, err := meterDecimal(value)
+	if err != nil {
+		return nil, err
+	}
+	if r.Sign() == 0 {
+		return r, nil
+	}
+	if r.Cmp(big.NewRat(1, 1_000_000_000_000)) < 0 || r.Cmp(big.NewRat(1_000_000_000, 1)) > 0 {
+		return nil, fmt.Errorf("quantity outside precision policy range [1e-12,1e9]")
+	}
+	return r, nil
+}
+
 func meterPrecisionBound(local *big.Rat) (*big.Rat, error) {
+	if local.Sign() == 0 {
+		return big.NewRat(1, 1_000_000_000_000), nil
+	}
 	if local.Cmp(big.NewRat(1, 1_000_000_000_000)) < 0 || local.Cmp(big.NewRat(1_000_000_000, 1)) > 0 {
 		return nil, fmt.Errorf("quantity outside precision policy range [1e-12,1e9]")
 	}
@@ -221,8 +241,11 @@ func (c *stripeHTTPClient) BucketedMeterUsage(ctx context.Context, event, custom
 		if err := c.doForm(ctx, http.MethodGet, "/v1/billing/meters/"+url.PathEscape(meterID)+"/event_summaries?"+values.Encode(), nil, &response, ""); err != nil {
 			return nil, err
 		}
-		// Missing zero buckets are not assumed to prove absence of usage.
-		if response.HasMore == nil || *response.HasMore || len(response.Data) != j-i {
+		// A completed grouped response may omit empty intervals. Local event
+		// evidence below decides whether an omitted interval is safe to treat as
+		// zero; the provider reader must still reject pagination and malformed
+		// rows.
+		if response.HasMore == nil || *response.HasMore {
 			return nil, fmt.Errorf("incomplete bounded meter buckets")
 		}
 		seen := map[string]bool{}
@@ -231,19 +254,26 @@ func (c *stripeHTTPClient) BucketedMeterUsage(ctx context.Context, event, custom
 				return nil, fmt.Errorf("malformed meter bucket identity or window")
 			}
 			seen[row.ID] = true
-			if _, err := meterDecimal(row.Value.String()); err != nil {
+			bucketStart := time.Unix(*row.Start, 0).UTC()
+			bucketEnd := time.Unix(*row.End, 0).UTC()
+			validWindow := false
+			for _, window := range windows[i:j] {
+				if bucketStart.Equal(window.Start) && bucketEnd.Equal(window.End) {
+					validWindow = true
+					break
+				}
+			}
+			if !validWindow {
+				return nil, fmt.Errorf("meter bucket coverage differs from requested window")
+			}
+			if _, err := meterQuantity(row.Value.String()); err != nil {
 				return nil, err
 			}
-			result = append(result, meterUsageBucket{Start: time.Unix(*row.Start, 0).UTC(), End: time.Unix(*row.End, 0).UTC(), Quantity: row.Value.String()})
+			result = append(result, meterUsageBucket{Start: bucketStart, End: bucketEnd, Quantity: row.Value.String()})
 		}
 		i = j
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Start.Before(result[j].Start) })
-	for i := range windows {
-		if !result[i].Start.Equal(windows[i].Start) || !result[i].End.Equal(windows[i].End) {
-			return nil, fmt.Errorf("meter bucket coverage differs from requested window")
-		}
-	}
 	return result, nil
 }
 
@@ -284,8 +314,11 @@ func matchMeterBuckets(events []meterLocalEvent, buckets []meterUsageBucket, eve
 	if err != nil {
 		return err
 	}
-	if len(events) == 0 || len(events) > meterEvidenceLimit || len(buckets) != len(windows) {
+	if len(events) > meterEvidenceLimit {
 		return fmt.Errorf("incomplete meter evidence")
+	}
+	if _, err := meterPrecisionBound(reserved); err != nil {
+		return err
 	}
 	totals := make([]*big.Rat, len(windows))
 	for i := range totals {
@@ -296,7 +329,7 @@ func matchMeterBuckets(events []meterLocalEvent, buckets []meterUsageBucket, eve
 		if (e.Status != "submitted" && e.Status != "adopted") || e.EventName != event || e.Customer != customer || e.Timestamp < start.Unix() || e.Timestamp >= end.Unix() {
 			return fmt.Errorf("unsettled or out-of-window local meter evidence")
 		}
-		quantity, err := meterDecimal(e.Quantity)
+		quantity, err := meterQuantity(e.Quantity)
 		if err != nil {
 			return err
 		}
@@ -311,11 +344,40 @@ func matchMeterBuckets(events []meterLocalEvent, buckets []meterUsageBucket, eve
 	if sum.Cmp(reserved) != 0 {
 		return fmt.Errorf("submitted snapshot differs from reservations")
 	}
-	for i, b := range buckets {
-		if !b.Start.Equal(windows[i].Start) || !b.End.Equal(windows[i].End) {
+	bucketByWindow := make(map[string]meterUsageBucket, len(buckets))
+	for _, b := range buckets {
+		key := b.Start.UTC().Format(time.RFC3339) + "/" + b.End.UTC().Format(time.RFC3339)
+		if _, exists := bucketByWindow[key]; exists {
+			return fmt.Errorf("duplicate meter bucket window")
+		}
+		valid := false
+		for _, w := range windows {
+			if b.Start.Equal(w.Start) && b.End.Equal(w.End) {
+				valid = true
+				break
+			}
+		}
+		if !valid {
 			return fmt.Errorf("incomplete meter bucket windows")
 		}
-		quantity, err := meterDecimal(b.Quantity)
+		if _, err := meterQuantity(b.Quantity); err != nil {
+			return err
+		}
+		bucketByWindow[key] = b
+	}
+	for i, w := range windows {
+		key := w.Start.UTC().Format(time.RFC3339) + "/" + w.End.UTC().Format(time.RFC3339)
+		b, present := bucketByWindow[key]
+		if !present {
+			// Stripe omits empty grouped intervals. An omitted interval is
+			// complete evidence only when the local submitted snapshot is also
+			// empty for that exact persisted event-time window.
+			if totals[i].Sign() != 0 {
+				return fmt.Errorf("incomplete meter bucket windows")
+			}
+			continue
+		}
+		quantity, err := meterQuantity(b.Quantity)
 		if err != nil {
 			return err
 		}
@@ -333,8 +395,8 @@ type meterReconciliationDecision struct {
 
 func compareMeterSummary(counted, reservedValue string) (decision meterReconciliationDecision, needsEvidence bool) {
 	decision.Outcome = "incomplete"
-	provider, err := meterDecimal(counted)
-	reserved, localErr := meterDecimal(reservedValue)
+	provider, err := meterQuantity(counted)
+	reserved, localErr := meterQuantity(reservedValue)
 	if err != nil || localErr != nil {
 		decision.Err = errors.Join(billing.ErrExportRecoveryRequired, err, localErr)
 		return
@@ -378,6 +440,15 @@ func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPerio
 		decision.Err = countErr
 		return
 	}
+	for _, value := range []string{item.Quantity, totals.Submitted, totals.Pending} {
+		if value == "" {
+			continue
+		}
+		if _, err := meterQuantity(value); err != nil {
+			decision.Err = errors.Join(billing.ErrExportRecoveryRequired, err)
+			return
+		}
+	}
 	var needsEvidence bool
 	decision, needsEvidence = compareMeterSummary(counted, totals.Reserved)
 	if !needsEvidence {
@@ -392,7 +463,20 @@ func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPerio
 	}
 	// The timeout covers both provider reads and bounded local snapshots, outside
 	// period locks. Reserve still rechecks authoritative coverage transactionally.
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	evidenceTimeout := 30 * time.Second
+	if deadline, ok := ctx.Deadline(); ok {
+		// Leave time for the worker to persist lease release and backoff even
+		// when the provider consumes the remainder of the tick budget.
+		remaining := time.Until(deadline) - 5*time.Second
+		if remaining <= 0 {
+			decision.Err = errors.Join(decision.Err, context.DeadlineExceeded)
+			return
+		}
+		if remaining < evidenceTimeout {
+			evidenceTimeout = remaining
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, evidenceTimeout)
 	defer cancel()
 	start, end := meterObservationWindow(p.Start, through)
 	events, err := h.meterLocalEvidence(ctx, p, item.ResourceType)
@@ -672,6 +756,12 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 	// persisted semantic attribution of the event, never a summary bucket.
 	queryStart, queryEnd := meterObservationWindow(p.Start, through)
 	timestamp := queryEnd.Add(-time.Second).Unix()
+	// Retry already-reserved pending/uncertain events before evaluating a
+	// provider excess gate. Claiming preserves their original identity and
+	// coverage; new allocations remain blocked until reconciliation succeeds.
+	if err = h.submitIncrementalEvents(ctx, p, 2*len(h.billingResourceStates(storage))); err != nil {
+		return result, err
+	}
 	if timestamp < queryStart.Unix() {
 		return result, nil
 	}

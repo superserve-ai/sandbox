@@ -205,7 +205,12 @@ func (h *Handlers) incrementalBillingTick(ctx context.Context, cadence time.Dura
 	if more && workErr == nil {
 		delay = time.Minute
 	}
-	_, ackErr := h.Pool.Exec(ctx, `UPDATE billing_export_work SET lease_token=NULL,lease_until=NULL,
+	// Evidence collection may exhaust the tick deadline. A short detached
+	// acknowledgement context still releases the lease and persists backoff,
+	// preventing the row from relying on lease expiry for recovery.
+	ackCtx, ackCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer ackCancel()
+	_, ackErr := h.Pool.Exec(ackCtx, `UPDATE billing_export_work SET lease_token=NULL,lease_until=NULL,
         last_error=CASE WHEN $5 THEN last_error ELSE $3 END,
         reconcile_error=CASE WHEN $5 THEN $3 ELSE reconcile_error END,
         next_reconcile_at=CASE WHEN $5 THEN now()+($4*interval '1 second') ELSE next_reconcile_at END,
