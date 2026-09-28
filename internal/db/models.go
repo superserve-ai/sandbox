@@ -1075,6 +1075,14 @@ type Snapshot struct {
 	PauseToken *string   `json:"pause_token"`
 }
 
+type StripeActivationCreditRevocation struct {
+	TeamID           uuid.UUID          `json:"team_id"`
+	StripeCustomerID string             `json:"stripe_customer_id"`
+	RequestedAt      time.Time          `json:"requested_at"`
+	CompletedAt      pgtype.Timestamptz `json:"completed_at"`
+	StripeGrantID    *string            `json:"stripe_grant_id"`
+}
+
 type StripeCheckoutAssociationAlert struct {
 	EventID     string             `json:"event_id"`
 	LeaseUntil  pgtype.Timestamptz `json:"lease_until"`
