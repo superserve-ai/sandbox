@@ -565,49 +565,138 @@ func TestIntegration_PromotionDeviceRegistrationRollback(t *testing.T) {
 
 func TestIntegration_PromotionDeviceGateMatrix(t *testing.T) {
 	ctx := context.Background()
-	owner, loser, missing := uuid.New(), uuid.New(), uuid.New()
-	fingerprint := "visitor-" + uuid.NewString()
-	for _, user := range []uuid.UUID{owner, loser} {
-		var outcome string
-		err := testPool.QueryRow(ctx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
-			user, uuid.New(), "event-"+uuid.NewString(), fingerprint).Scan(&outcome)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	tx := localIdentityTransaction(t, false)
-	for _, gates := range [][2]bool{{false, true}, {true, false}, {true, true}} {
-		localIdentityError(t, tx, "22023", `SELECT set_promotion_device_policy($1,$2)`, gates[0], gates[1])
-	}
-	if _, err := tx.Exec(ctx, `UPDATE promotion_identity_enforcement
-		SET enabled=true, enabled_at=now(), readiness_reference='integration test' WHERE singleton`); err != nil {
-		t.Fatal(err)
-	}
 	for _, tc := range []struct {
-		device, evidence bool
-		loser, missing   string
+		name                        string
+		canonical, device, evidence bool
+		duplicate, missing          string
 	}{
-		{false, false, "eligible", "eligible"},
-		{false, true, "eligible", "evidence_missing"},
-		{true, false, "owner_conflict", "eligible"},
-		{true, true, "owner_conflict", "evidence_missing"},
+		{"off/off/off", false, false, false, "eligible", "eligible"},
+		{"off/off/on", false, false, true, "configuration", "configuration"},
+		{"off/on/off", false, true, false, "configuration", "configuration"},
+		{"off/on/on", false, true, true, "configuration", "configuration"},
+		{"on/off/off", true, false, false, "eligible", "eligible"},
+		{"on/off/on", true, false, true, "eligible", "evidence_missing"},
+		{"on/on/off", true, true, false, "owner_conflict", "eligible"},
+		{"on/on/on", true, true, true, "owner_conflict", "evidence_missing"},
 	} {
-		if _, err := tx.Exec(ctx, `SELECT set_promotion_device_policy($1,$2)`, tc.device, tc.evidence); err != nil {
-			t.Fatal(err)
-		}
-		var gotLoser, gotMissing, gotOwner string
-		if err := tx.QueryRow(ctx, `SELECT promotion_device_decision($1,'signup')`, loser).Scan(&gotLoser); err != nil {
-			t.Fatal(err)
-		}
-		if err := tx.QueryRow(ctx, `SELECT promotion_device_decision($1,'signup')`, missing).Scan(&gotMissing); err != nil {
-			t.Fatal(err)
-		}
-		if err := tx.QueryRow(ctx, `SELECT promotion_device_decision($1,'signup')`, owner).Scan(&gotOwner); err != nil {
-			t.Fatal(err)
-		}
-		if gotLoser != tc.loser || gotMissing != tc.missing || gotOwner != "eligible" {
-			t.Fatalf("D=%t E=%t: loser=%s missing=%s owner=%s", tc.device, tc.evidence, gotLoser, gotMissing, gotOwner)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			for _, actor := range []struct {
+				name, decision string
+			}{
+				{"owner", "eligible"},
+				{"duplicate", tc.duplicate},
+				{"missing", tc.missing},
+			} {
+				t.Run(actor.name, func(t *testing.T) {
+					tx := localIdentityTransaction(t, tc.canonical)
+					invalid := !tc.canonical && (tc.device || tc.evidence)
+					if invalid {
+						localIdentityError(t, tx, "22023", `SELECT set_promotion_device_policy($1,$2)`, tc.device, tc.evidence)
+						// Malformed persisted gates must also fail closed at both entry points.
+						rolloutExec(t, tx, `UPDATE promotion_device_policy SET device_enforced=$1,evidence_required=$2 WHERE singleton`, tc.device, tc.evidence)
+					} else {
+						rolloutExec(t, tx, `SELECT set_promotion_device_policy($1,$2)`, tc.device, tc.evidence)
+					}
+					user, team := uuid.New(), uuid.New()
+					email := user.String() + "@example.com"
+					version := localIdentityWrite(t, tx, user, email, true, time.Now(), time.Now())
+					rolloutExec(t, tx, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "gate-"+team.String())
+					rolloutExec(t, tx, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team)
+					owner := user
+					var fingerprint any
+					if actor.name != "missing" {
+						fingerprint = "visitor-" + uuid.NewString()
+						if actor.name == "duplicate" {
+							owner = uuid.New()
+							rolloutExec(t, tx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+								owner, uuid.New(), "event-"+uuid.NewString(), fingerprint)
+						}
+						rolloutExec(t, tx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+							user, uuid.New(), "event-"+uuid.NewString(), fingerprint)
+					}
+					event := "evt-" + uuid.NewString()
+					eligible := !invalid && actor.decision == "eligible"
+					wantCount := 0
+					if eligible {
+						wantCount = 1
+					}
+					for retry := 0; retry < 2; retry++ {
+						if invalid {
+							localIdentityError(t, tx, "55000", `SELECT * FROM claim_team_signup_trial_with_device($1,$2)`, team, user)
+							localIdentityError(t, tx, "55000", `SELECT reserve_stripe_promotion_with_device($1,$2,$3,NULL,NULL,false)`, team, user, event)
+						} else {
+							wantOutcome, wantReason, wantReservation := "promotion_ineligible", actor.decision, actor.decision
+							if eligible {
+								wantOutcome, wantReason, wantReservation = "granted", "first_user_claim", "acquired"
+								if tc.canonical {
+									wantReason = "first_identity_claim"
+								}
+								if retry > 0 {
+									wantReservation = "existing"
+								}
+							}
+							var outcome, reason, reservation string
+							if err := tx.QueryRow(ctx, `SELECT outcome,reason FROM claim_team_signup_trial_with_device($1,$2)`,
+								team, user).Scan(&outcome, &reason); err != nil || outcome != wantOutcome || reason != wantReason {
+								t.Fatalf("signup = %q %q, want %q %q: %v", outcome, reason, wantOutcome, wantReason, err)
+							}
+							if err := tx.QueryRow(ctx, `SELECT reserve_stripe_promotion_with_device($1,$2,$3,NULL,NULL,false)`,
+								team, user, event).Scan(&reservation); err != nil || reservation != wantReservation {
+								t.Fatalf("Stripe reservation = %q, want %q: %v", reservation, wantReservation, err)
+							}
+						}
+						var signupState, stripeState, ownership bool
+						if err := tx.QueryRow(ctx, `SELECT
+							(SELECT count(*) FROM team_credit_grant WHERE team_id=$1)=$3
+							AND (SELECT COALESCE(sum(amount_usd),0) FROM team_credit_grant WHERE team_id=$1)=5*$3
+							AND (SELECT COALESCE(sum(remaining_usd),0) FROM team_credit_grant WHERE team_id=$1)=5*$3
+							AND (SELECT count(*) FROM user_signup_trial_claim WHERE user_id=$2 AND team_id=$1)=$3
+							AND (SELECT count(*) FROM user_promotion_entitlement WHERE user_id=$2
+								AND signup_trial_team_id=$1 AND signup_trial_claimed_at IS NOT NULL)=$3
+							AND (SELECT count(*) FROM promotion_device_grant WHERE user_id=$2 AND promotion='signup')=$3
+							AND (SELECT count(*) FROM promotion_device_grant WHERE user_id=$2 AND promotion='signup'
+								AND team_id=$1 AND fingerprint IS NOT DISTINCT FROM $4::text)=$3
+							AND (SELECT count(*) FROM promotion_identity WHERE identity_key=promotion_identity_key($2,$5,true)
+								AND signup_claimed_at IS NOT NULL)=$3`, team, user, wantCount, fingerprint, email).
+							Scan(&signupState); err != nil || !signupState {
+							t.Fatalf("signup grant amount, consumption or device attribution mismatch (retry %d): %t, %v", retry, signupState, err)
+						}
+						if err := tx.QueryRow(ctx, `SELECT
+							(SELECT count(*) FROM team_billing_account WHERE team_id=$1 AND stripe_activation_credit_reserved_at IS NOT NULL)=$3
+							AND (SELECT count(*) FROM user_promotion_entitlement WHERE user_id=$2 AND stripe_redemption_reserved_team_id=$1)=$3
+							AND (SELECT count(*) FROM promotion_identity WHERE stripe_reserved_team_id=$1 AND stripe_reserved_user_id=$2)=$3
+							AND NOT EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$2 AND stripe_redemption_at IS NOT NULL)
+							AND NOT EXISTS(SELECT 1 FROM promotion_device_grant WHERE user_id=$2 AND promotion='stripe')
+							AND NOT EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=$1
+								AND (stripe_activation_credit_granted_at IS NOT NULL OR stripe_activation_credit_grant_id IS NOT NULL))`,
+							team, user, wantCount).Scan(&stripeState); err != nil || !stripeState {
+							t.Fatalf("Stripe reservation fence or premature consumption mismatch (retry %d): %t, %v", retry, stripeState, err)
+						}
+						if eligible {
+							var pinned bool
+							if err := tx.QueryRow(ctx, `SELECT a.stripe_activation_user_id=$2
+								AND a.stripe_activation_credit_reservation_event_id=$3
+								AND a.stripe_activation_identity_evidence_version=$4
+								AND a.stripe_activation_identity_key=CASE WHEN $5 THEN promotion_identity_key($2,$6,true) ELSE 'legacy:'||$2::text END
+								AND u.stripe_device_fingerprint IS NOT DISTINCT FROM $7::text
+								FROM team_billing_account a JOIN user_promotion_entitlement u ON u.user_id=$2
+								WHERE a.team_id=$1`, team, user, event, version, tc.canonical, email, fingerprint).
+								Scan(&pinned); err != nil || !pinned {
+								t.Fatalf("Stripe actor, evidence, event or device pin mismatch: %t, %v", pinned, err)
+							}
+						}
+						if err := tx.QueryRow(ctx, `SELECT CASE WHEN $1::text IS NULL THEN
+							NOT EXISTS(SELECT 1 FROM promotion_signup_device_evidence WHERE user_id=$2)
+							AND NOT EXISTS(SELECT 1 FROM promotion_device_owner WHERE user_id=$2)
+							ELSE EXISTS(SELECT 1 FROM promotion_signup_device_evidence WHERE user_id=$2 AND fingerprint=$1)
+							AND EXISTS(SELECT 1 FROM promotion_device_owner WHERE fingerprint=$1 AND user_id=$3) END`,
+							fingerprint, user, owner).Scan(&ownership); err != nil || !ownership {
+							t.Fatalf("gate changed first ownership or fabricated missing evidence: %t, %v", ownership, err)
+						}
+					}
+				})
+			}
+		})
 	}
 }
 
