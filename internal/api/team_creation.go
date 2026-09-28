@@ -395,7 +395,11 @@ func validTeamCreationVerifierConfig(region string, keys map[string]ed25519.Publ
 
 // CreateInternalTeam verifies transport and proof before any persistence access.
 func (h *Handlers) CreateInternalTeam(c *gin.Context) {
-	h.createInternalTeam(c, time.Now())
+	now := time.Now()
+	if h.Now != nil {
+		now = h.Now()
+	}
+	h.createInternalTeam(c, now)
 }
 
 func (h *Handlers) createInternalTeam(c *gin.Context, now time.Time) {

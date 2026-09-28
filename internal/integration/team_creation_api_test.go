@@ -54,6 +54,7 @@ type teamCreationClient struct {
 	t       *testing.T
 	router  *gin.Engine
 	private ed25519.PrivateKey
+	handler *api.Handlers
 }
 
 func newTeamCreationClient(t *testing.T, pool *pgxpool.Pool) *teamCreationClient {
@@ -69,7 +70,19 @@ func newTeamCreationClientForRegion(t *testing.T, pool *pgxpool.Pool, region str
 	h := &api.Handlers{Pool: pool, Config: &config.Config{TeamCreationRegion: region, TeamCreationKeys: map[string]ed25519.PublicKey{"test": public, "next": next.Public().(ed25519.PublicKey)}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	return &teamCreationClient{t: t, router: api.SetupRouter(ctx, h, pool), private: private}
+	return &teamCreationClient{t: t, router: api.SetupRouter(ctx, h, pool), private: private, handler: h}
+}
+
+func teamCreationReadOnlyPool(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {
+	t.Helper()
+	cfg := pool.Config().Copy()
+	cfg.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
+	readPool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(readPool.Close)
+	return readPool
 }
 func teamCreationClaims(actor uuid.UUID, requestID, name string) map[string]any {
 	return teamCreationClaimsForRegion(actor, requestID, name, "use")
@@ -180,6 +193,85 @@ func teamCreationOutcome(t *testing.T, pool *pgxpool.Pool, id uuid.UUID, want st
 	}
 }
 
+func TestIntegration_TeamCreationRequestPrivileges(t *testing.T) {
+	ctx := context.Background()
+	// Supabase roles must exist when the production migration applies its ACLs.
+	rolloutExec(t, testPool, `DO $$ DECLARE r text; BEGIN
+		FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname=r) THEN
+				EXECUTE format('CREATE ROLE %I NOLOGIN',r);
+			END IF;
+		END LOOP;
+	END $$`)
+	pool := teamCreationDatabase(t)
+	actor, teamID, requestID := uuid.New(), uuid.New(), uuid.NewString()
+	rolloutExec(t, pool, `INSERT INTO team(id,name,home_region) VALUES($1,'Role test team','use')`, teamID)
+	for _, role := range []string{"service_role", "anon", "authenticated"} {
+		t.Run(role, func(t *testing.T) {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			var superuser, bypass bool
+			if err := tx.QueryRow(ctx, `SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname=$1`, role).Scan(&superuser, &bypass); err != nil || superuser {
+				t.Fatalf("role must be non-superuser: %s super=%t err=%v", role, superuser, err)
+			}
+			if role == "service_role" {
+				// Emulate Supabase's role attribute in vanilla Postgres without
+				// changing the migration's request-table grants.
+				rolloutExec(t, tx, `ALTER ROLE service_role BYPASSRLS`)
+			} else if bypass {
+				t.Fatalf("ordinary role %s unexpectedly bypasses RLS", role)
+			}
+			rolloutExec(t, tx, "SET LOCAL ROLE "+pgx.Identifier{role}.Sanitize())
+			var currentRole string
+			if err := tx.QueryRow(ctx, `SELECT current_user`).Scan(&currentRole); err != nil || currentRole != role {
+				t.Fatalf("current role=%q want=%q err=%v", currentRole, role, err)
+			}
+			const insert = `INSERT INTO team_creation_requests(actor_id,cell,request_id,name,region,team_id) VALUES($1,'use',$2,'Role test team','use',$3)`
+			const recover = `SELECT r.name, r.region, CASE WHEN r.deleted_at IS NULL THEN t.id END
+				FROM team_creation_requests r LEFT JOIN team t ON t.id=r.team_id
+				WHERE r.actor_id=$1 AND r.cell='use' AND r.request_id=$2`
+			if role == "service_role" {
+				rolloutExec(t, tx, insert, actor, requestID, teamID)
+				rolloutExec(t, tx, `RESET ROLE`)
+				if !bypass {
+					rolloutExec(t, tx, `ALTER ROLE service_role NOBYPASSRLS`)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				// Recovery uses a new transaction over the committed result.
+				// Fixture role attributes and the legacy team read grant roll back.
+				tx, err = pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback(ctx)
+				rolloutExec(t, tx, `ALTER ROLE service_role BYPASSRLS`)
+				rolloutExec(t, tx, `GRANT SELECT ON team TO service_role`)
+				rolloutExec(t, tx, `SET LOCAL ROLE service_role`)
+				var name, region string
+				var recoveredID uuid.UUID
+				if err := tx.QueryRow(ctx, recover, actor, requestID).Scan(&name, &region, &recoveredID); err != nil || name != "Role test team" || region != "use" || recoveredID != teamID {
+					t.Fatalf("service recovery name=%q region=%q id=%s err=%v", name, region, recoveredID, err)
+				}
+			} else {
+				localIdentityError(t, tx, "42501", insert, actor, requestID, teamID)
+				localIdentityError(t, tx, "42501", `SELECT * FROM team_creation_requests WHERE actor_id=$1`, actor)
+			}
+			for _, statement := range []string{
+				`UPDATE team_creation_requests SET name='Changed' WHERE actor_id=$1`,
+				`DELETE FROM team_creation_requests WHERE actor_id=$1`,
+			} {
+				localIdentityError(t, tx, "42501", statement, actor)
+			}
+			localIdentityError(t, tx, "42501", `TRUNCATE team_creation_requests`)
+		})
+	}
+}
+
 func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 	pool := teamCreationDatabase(t)
 	client := newTeamCreationClient(t, pool)
@@ -200,24 +292,28 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 	t.Run("successful non-default cell creation and recovery", func(t *testing.T) {
 		uswClient := newTeamCreationClientForRegion(t, pool, "usw")
 		actor := uuid.New()
-		claims := teamCreationClaimsForRegion(actor, uuid.NewString(), "Café  ☃", "usw")
+		const name = "Cafe\u0301  ☃"
+		claims := teamCreationClaimsForRegion(actor, uuid.NewString(), name, "usw")
 		snapshot := teamCreationSnapshot(t, uswClient.call(claims, nil))
 		id := uuid.MustParse(snapshot["id"])
-		if snapshot["name"] != "Café  ☃" || snapshot["region"] != "usw" {
+		if snapshot["name"] != name || snapshot["region"] != "usw" {
 			t.Fatalf("unexpected non-default response: %v", snapshot)
 		}
-		var homeRegion, cell, durableRegion string
-		if err := pool.QueryRow(ctx, `SELECT home_region FROM team WHERE id=$1`, id).Scan(&homeRegion); err != nil {
+		var homeRegion, cell, durableRegion, teamName, durableName string
+		if err := pool.QueryRow(ctx, `SELECT home_region, name FROM team WHERE id=$1`, id).Scan(&homeRegion, &teamName); err != nil {
 			t.Fatal(err)
 		}
-		if err := pool.QueryRow(ctx, `SELECT cell, region FROM team_creation_requests WHERE actor_id=$1 AND request_id=$2`, actor, claims["request_id"]).Scan(&cell, &durableRegion); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT cell, region, name FROM team_creation_requests WHERE actor_id=$1 AND request_id=$2`, actor, claims["request_id"]).Scan(&cell, &durableRegion, &durableName); err != nil {
 			t.Fatal(err)
+		}
+		if teamName != name || durableName != name {
+			t.Fatalf("name bytes changed: team=%q durable=%q want=%q", teamName, durableName, name)
 		}
 		if homeRegion != "usw" || cell != "usw" || durableRegion != "usw" {
 			t.Fatalf("non-default routing home=%q cell=%q durable_region=%q", homeRegion, cell, durableRegion)
 		}
 		recovered := teamCreationSnapshot(t, uswClient.call(teamCreationRecover(claims), nil))
-		if recovered["id"] != snapshot["id"] || recovered["name"] != "Café  ☃" || recovered["region"] != "usw" {
+		if recovered["id"] != snapshot["id"] || recovered["name"] != name || recovered["region"] != "usw" {
 			t.Fatalf("recovery changed non-default snapshot: create=%v recover=%v", snapshot, recovered)
 		}
 	})
@@ -249,10 +345,25 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 		lostActor := uuid.New()
 		lostClaims := teamCreationClaims(lostActor, uuid.NewString(), "Dropped response Café ☃")
 		_ = client.call(lostClaims, nil)
-		before := teamCreationCount(t, pool, `SELECT count(*) FROM team_creation_requests WHERE actor_id=$1`, lostActor)
-		recoveredLost := teamCreationSnapshot(t, client.call(teamCreationRecover(lostClaims), nil))
-		if recoveredLost["name"] != "Dropped response Café ☃" || before != 1 {
-			t.Fatalf("lost-response recovery changed result: recover=%v requests=%d", recoveredLost, before)
+		var committedID uuid.UUID
+		var committedName, committedRegion string
+		if err := pool.QueryRow(ctx, `SELECT team_id, name, region FROM team_creation_requests WHERE actor_id=$1 AND cell=$2 AND request_id=$3`, lostActor, lostClaims["region"], lostClaims["request_id"]).Scan(&committedID, &committedName, &committedRegion); err != nil {
+			t.Fatal(err)
+		}
+		readPool := teamCreationReadOnlyPool(t, pool)
+		lostClient := newTeamCreationClient(t, readPool)
+		// Advance beyond expiry plus skew without changing the original assertion.
+		recoveryTime := time.Unix(lostClaims["exp"].(int64)+31, 0)
+		lostClient.handler.Now = func() time.Time { return recoveryTime }
+		teamCreationStatus(t, lostClient.call(lostClaims, nil), http.StatusUnauthorized, "assertion_expired")
+		freshRecovery := teamCreationRecover(lostClaims)
+		freshRecovery["iat"], freshRecovery["exp"] = recoveryTime.Unix(), recoveryTime.Unix()+120
+		recoveredLost := teamCreationSnapshot(t, lostClient.call(freshRecovery, nil))
+		if recoveredLost["id"] != committedID.String() || recoveredLost["name"] != committedName || recoveredLost["region"] != committedRegion {
+			t.Fatalf("lost-response recovery changed committed result: %v", recoveredLost)
+		}
+		if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_creation_requests WHERE actor_id=$1`, lostActor); n != 1 {
+			t.Fatalf("lost-response recovery changed request count: %d", n)
 		}
 		for _, query := range []string{
 			`SELECT count(*) FROM team_member WHERE team_id=$1 AND profile_id=$2 AND role='owner'`,
@@ -271,13 +382,6 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 		identity["auth_updated_at"] = "2000-01-01T00:00:00.000000Z"
 		evidenceBefore := teamCreationCount(t, pool, `SELECT count(*) FROM promotion_identity_evidence WHERE user_id=$1`, actor)
 		// A transaction configured read-only proves recover and completed create do not write.
-		readConfig := pool.Config().Copy()
-		readConfig.ConnConfig.RuntimeParams["default_transaction_read_only"] = "on"
-		readPool, err := pgxpool.NewWithConfig(ctx, readConfig)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer readPool.Close()
 		readClient := newTeamCreationClient(t, readPool)
 		for _, authorization := range []map[string]any{claims, teamCreationRecover(claims)} {
 			response := readClient.call(authorization, func(r *http.Request) {
@@ -443,32 +547,70 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 			rolloutExec(t, pool, `DROP TRIGGER hold_team_creation_request ON team_creation_requests`)
 			rolloutExec(t, pool, `DROP FUNCTION hold_team_creation_request()`)
 		}()
-		hold, err := pool.Acquire(ctx)
+		hold, err := pool.Begin(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer hold.Release()
-		if _, err := hold.Exec(ctx, `SELECT pg_advisory_lock(hashtextextended($1, 0))`, lockName); err != nil {
+		// Rollback releases the lock before the earlier trigger-cleanup defer,
+		// including when an assertion aborts this subtest.
+		defer hold.Rollback(ctx)
+		if _, err := hold.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, lockName); err != nil {
 			t.Fatal(err)
 		}
+		readClient := newTeamCreationClient(t, teamCreationReadOnlyPool(t, pool))
 		actor := uuid.New()
 		claims := teamCreationClaims(actor, uuid.NewString(), "In-flight creation")
 		created := make(chan *httptest.ResponseRecorder, 1)
-		go func() { created <- client.call(claims, nil) }()
-		// The trigger has taken the request transaction to the uncertain commit
-		// boundary. A concurrent recovery must not reserve or repair anything.
-		time.Sleep(50 * time.Millisecond)
-		teamCreationStatus(t, client.call(teamCreationRecover(claims), nil), http.StatusNotFound, "result_not_found")
+		finished := make(chan struct{})
+		createCtx, cancelCreate := context.WithCancel(ctx)
+		defer func() {
+			cancelCreate()
+			_ = hold.Rollback(ctx)
+			<-finished
+		}()
+		go func() {
+			defer close(finished)
+			created <- client.call(claims, func(r *http.Request) { *r = *r.WithContext(createCtx) })
+		}()
+		waitCtx, cancelWait := context.WithTimeout(ctx, 5*time.Second)
+		defer cancelWait()
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			var waiting bool
+			if err := pool.QueryRow(waitCtx, `SELECT EXISTS (
+				SELECT 1 FROM pg_locks held JOIN pg_locks blocked
+				ON blocked.locktype=held.locktype AND blocked.database=held.database
+				AND blocked.classid=held.classid AND blocked.objid=held.objid AND blocked.objsubid=held.objsubid
+				JOIN pg_stat_activity a ON a.pid=blocked.pid
+				WHERE held.pid=$1 AND held.locktype='advisory' AND held.granted AND NOT blocked.granted
+				AND a.wait_event_type='Lock' AND a.wait_event='advisory'
+				AND a.query LIKE 'INSERT INTO team_creation_requests%'
+			)`, hold.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+				t.Fatalf("observe creation at blocking trigger: %v", err)
+			}
+			if waiting {
+				break
+			}
+			select {
+			case <-finished:
+				t.Fatal("creation finished before reaching the blocking trigger")
+			case <-waitCtx.Done():
+				t.Fatal("creation did not reach the blocking trigger")
+			case <-ticker.C:
+			}
+		}
+		teamCreationStatus(t, readClient.call(teamCreationRecover(claims), nil), http.StatusNotFound, "result_not_found")
 		if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_creation_requests WHERE actor_id=$1`, actor); n != 0 {
 			t.Fatalf("in-flight recovery observed or created a durable result: %d", n)
 		}
-		if _, err := hold.Exec(ctx, `SELECT pg_advisory_unlock(hashtextextended($1, 0))`, lockName); err != nil {
+		if err := hold.Rollback(ctx); err != nil {
 			t.Fatal(err)
 		}
 		createdResponse := <-created
 		createdSnapshot := teamCreationSnapshot(t, createdResponse)
-		recovered := teamCreationSnapshot(t, client.call(teamCreationRecover(claims), nil))
-		if recovered["id"] != createdSnapshot["id"] || recovered["name"] != createdSnapshot["name"] {
+		recovered := teamCreationSnapshot(t, readClient.call(teamCreationRecover(claims), nil))
+		if recovered["id"] != createdSnapshot["id"] || recovered["name"] != createdSnapshot["name"] || recovered["region"] != createdSnapshot["region"] {
 			t.Fatalf("post-commit recovery changed result: create=%v recover=%v", createdSnapshot, recovered)
 		}
 	})
