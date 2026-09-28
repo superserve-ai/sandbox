@@ -73,29 +73,112 @@ CREATE TRIGGER close_snapshot_retained_storage AFTER UPDATE OF deleted_at ON san
  FOR EACH ROW WHEN (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL) EXECUTE FUNCTION close_retained_storage_owner();
 
 CREATE FUNCTION retained_storage_mib_seconds(p_team uuid,p_start timestamptz,p_end timestamptz)
-RETURNS numeric LANGUAGE sql STABLE AS $$
- WITH intervals AS MATERIALIZED (
- SELECT host_id,extents,GREATEST(started_at,p_start) lo,LEAST(COALESCE(ended_at,billing_request_now()),p_end,billing_request_now()) hi
-  FROM retained_storage_interval
-  WHERE team_id=p_team AND p_start<LEAST(p_end,billing_request_now()) AND started_at<LEAST(p_end,billing_request_now()) AND COALESCE(ended_at,billing_request_now())>p_start
- ), interval_extents AS MATERIALIZED (
-  -- Decode each retained payload once per historical interval. Expanding the
-  -- JSON inside the slice join multiplied parsing work by every boundary and
-  -- made frequent replacements quadratic in the billing readers.
-  SELECT i.host_id,i.lo,i.hi,e.device,e.start,e.length
-  FROM intervals i
-  CROSS JOIN LATERAL jsonb_to_recordset(i.extents) AS e(device text,start bigint,length bigint)
- ), boundaries AS (
-  SELECT host_id,lo at FROM intervals UNION SELECT host_id,hi FROM intervals
- ), slices AS (
-  SELECT host_id,at lo,lead(at) OVER(PARTITION BY host_id ORDER BY at) hi FROM boundaries
- ), allocations AS (
-  SELECT s.host_id,s.lo,s.hi,e.device,
-   range_agg(int8range(e.start,e.start+e.length,'[)')) blocks
-  FROM slices s JOIN interval_extents e ON e.host_id=s.host_id AND e.lo<=s.lo AND e.hi>=s.hi
-  WHERE s.hi>s.lo GROUP BY s.host_id,s.lo,s.hi,e.device
- ) SELECT COALESCE(sum((upper(r)-lower(r))::numeric*EXTRACT(epoch FROM(hi-lo))/1048576.0),0)
- FROM allocations CROSS JOIN LATERAL unnest(blocks) AS ranges(r)
+RETURNS numeric LANGUAGE plpgsql STABLE AS $$
+DECLARE
+ event record;
+ domain_host text;
+ domain_device text;
+ previous_at timestamptz;
+ total numeric := 0;
+ leaves integer;
+ left_node integer;
+ right_node integer;
+ left_parent integer;
+ right_parent integer;
+ node integer;
+ counts integer[];
+ spans bigint[];
+ covered bigint[];
+BEGIN
+ -- Sweep receipt events once. Coordinate compression and a coverage tree
+ -- keep each add/remove logarithmic in the physical endpoints, regardless
+ -- of how many owner generations precede the current receipt boundary.
+ FOR event IN
+  WITH intervals AS MATERIALIZED (
+   SELECT host_id,extents,GREATEST(started_at,p_start) lo,
+    LEAST(COALESCE(ended_at,billing_request_now()),p_end,billing_request_now()) hi
+   FROM retained_storage_interval
+   WHERE team_id=p_team AND p_start<LEAST(p_end,billing_request_now())
+    AND started_at<LEAST(p_end,billing_request_now())
+    AND COALESCE(ended_at,billing_request_now())>p_start
+  ), extents AS MATERIALIZED (
+   SELECT host_id,lo,hi,e.device,e.start,e.start+e.length finish
+   FROM intervals CROSS JOIN LATERAL jsonb_to_recordset(extents) e(device text,start bigint,length bigint)
+   WHERE hi>lo AND e.length>0
+  ), endpoints AS MATERIALIZED (
+   SELECT host_id,device,point,
+    row_number() OVER(PARTITION BY host_id,device ORDER BY point)::integer idx
+   FROM (SELECT host_id,device,start point FROM extents UNION SELECT host_id,device,finish FROM extents) p
+  ), coordinates AS (
+   SELECT host_id,device,array_agg(point ORDER BY idx) points FROM endpoints GROUP BY host_id,device
+  ), raw_events AS (
+   SELECT e.host_id,e.device,t.at,t.delta,a.idx first_idx,b.idx last_idx
+   FROM extents e
+   JOIN endpoints a ON a.host_id=e.host_id AND a.device=e.device AND a.point=e.start
+   JOIN endpoints b ON b.host_id=e.host_id AND b.device=e.device AND b.point=e.finish
+   CROSS JOIN LATERAL (VALUES(e.lo,1),(e.hi,-1)) t(at,delta)
+  ), events AS (
+   SELECT host_id,device,at,first_idx,last_idx,sum(delta)::integer delta
+   FROM raw_events GROUP BY host_id,device,at,first_idx,last_idx HAVING sum(delta)<>0
+  ), ordered AS (
+   SELECT *,row_number() OVER(PARTITION BY host_id,device ORDER BY at,delta,first_idx,last_idx) ordinal
+   FROM events
+  )
+  SELECT o.*,CASE WHEN ordinal=1 THEN c.points END points
+  FROM ordered o JOIN coordinates c USING(host_id,device)
+  ORDER BY host_id,device,ordinal
+ LOOP
+  IF domain_host IS DISTINCT FROM event.host_id OR domain_device IS DISTINCT FROM event.device THEN
+   domain_host := event.host_id;
+   domain_device := event.device;
+   previous_at := event.at;
+   leaves := 1;
+   WHILE leaves<cardinality(event.points)-1 LOOP leaves := leaves*2; END LOOP;
+   counts := array_fill(0,ARRAY[2*leaves]);
+   spans := array_fill(0::bigint,ARRAY[2*leaves]);
+   covered := array_fill(0::bigint,ARRAY[2*leaves]);
+   FOR node IN 1..cardinality(event.points)-1 LOOP
+    spans[leaves+node-1] := event.points[node+1]-event.points[node];
+   END LOOP;
+   node := leaves-1;
+   WHILE node>0 LOOP
+    spans[node] := spans[2*node]+spans[2*node+1];
+    node := node-1;
+   END LOOP;
+  END IF;
+  total := total+covered[1]::numeric*EXTRACT(epoch FROM(event.at-previous_at));
+  previous_at := event.at;
+  left_node := leaves+event.first_idx-1;
+  right_node := leaves+event.last_idx-1;
+  left_parent := left_node/2;
+  right_parent := (right_node-1)/2;
+  WHILE left_node<right_node LOOP
+   IF left_node%2=1 THEN
+    counts[left_node] := counts[left_node]+event.delta;
+    covered[left_node] := CASE WHEN counts[left_node]>0 THEN spans[left_node]
+     WHEN left_node>=leaves THEN 0 ELSE covered[2*left_node]+covered[2*left_node+1] END;
+    left_node := left_node+1;
+   END IF;
+   IF right_node%2=1 THEN
+    right_node := right_node-1;
+    counts[right_node] := counts[right_node]+event.delta;
+    covered[right_node] := CASE WHEN counts[right_node]>0 THEN spans[right_node]
+     WHEN right_node>=leaves THEN 0 ELSE covered[2*right_node]+covered[2*right_node+1] END;
+   END IF;
+   left_node := left_node/2;
+   right_node := right_node/2;
+  END LOOP;
+  WHILE left_parent>0 LOOP
+   covered[left_parent] := CASE WHEN counts[left_parent]>0 THEN spans[left_parent]
+    ELSE covered[2*left_parent]+covered[2*left_parent+1] END;
+   covered[right_parent] := CASE WHEN counts[right_parent]>0 THEN spans[right_parent]
+    ELSE covered[2*right_parent]+covered[2*right_parent+1] END;
+   left_parent := left_parent/2;
+   right_parent := right_parent/2;
+  END LOOP;
+ END LOOP;
+ RETURN total/1048576.0;
+END;
 $$;
 
 -- Legacy accounting is clipped prospectively, as one complete host/team group.

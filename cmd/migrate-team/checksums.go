@@ -28,7 +28,8 @@ var checksumExclusions = map[string]map[string]bool{
 	// Frozen since the sharded-counter migration (live counts are in
 	// team_sandbox_counter, which is not copied); the stale snapshot it
 	// holds is not part of what the copy promises to preserve.
-	"team": {"active_sandbox_count": true},
+	"team":                      {"active_sandbox_count": true},
+	"retained_storage_interval": {"id": true},
 }
 
 // rowChecksums returns hash → occurrence count for the team's rows of one

@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/superserve-ai/sandbox/internal/billing"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
@@ -238,5 +240,203 @@ func TestRetainedStorageUnionSurvivesSnapshotAndSourceDeletion(t *testing.T) {
 	}
 	if !snapshotEnded.Equal(d2) {
 		t.Fatalf("snapshot interval ended at %v, want %v", snapshotEnded, d2)
+	}
+}
+
+func TestRetainedStorageConsumerParity(t *testing.T) {
+	ctx := t.Context()
+	team, _ := seedTeamAndKey(t)
+	start := time.Date(2026, 8, 15, 11, 0, 0, 0, time.UTC)
+	mid, end := start.Add(30*time.Minute), start.Add(time.Hour)
+	host := "example-retained-" + uuid.NewString()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM retained_storage_interval WHERE team_id=$1`, team)
+	})
+	seedPlatformBillingRatesForTest(t, ctx, team, "retained-parity-"+uuid.NewString(), start.Add(-time.Hour))
+	exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_hourly_rollups',true),($1,'tenant_usage_dashboard',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, team)
+	first, second := uuid.New(), uuid.New()
+	insert := func(id uuid.UUID, a, b time.Time, extents string) {
+		exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at) VALUES($1,$2,'sandbox',$3,'fixture',$4::jsonb,$5,$6)`, host, team, id, extents, a, b)
+	}
+	insert(first, start, mid, `[{"device":"fs","start":0,"length":1073741824}]`)
+	insert(first, mid, end, `[{"device":"fs","start":0,"length":2147483648}]`)
+	insert(second, start, end, `[{"device":"fs","start":0,"length":1073741824},{"device":"fs","start":2147483648,"length":536870912}]`)
+	const want = 7372800.0 // MiB-seconds: (1536 + 2560) * 1800.
+	assertNumeric := func(label string, n pgtype.Numeric, scale, want float64) {
+		t.Helper()
+		v, err := n.Float64Value()
+		if err != nil || !v.Valid || math.Abs(v.Float64*scale-want) > 1e-8 {
+			t.Fatalf("%s: %v %v, want %v", label, v, err, want)
+		}
+	}
+	usage, err := testQueries.GetTeamBillingUsage(ctx, db.GetTeamBillingUsageParams{TeamID: team, PeriodStart: start, PeriodEnd: end})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNumeric("aggregate GiB-seconds", usage.StorageGibSeconds, 1024, want)
+	assertNumeric("paused CPU", usage.VcpuSeconds, 1, 0)
+	assertNumeric("paused memory", usage.MemoryGibSeconds, 1, 0)
+	series, err := testQueries.GetTeamBillingUsageSeries(ctx, db.GetTeamBillingUsageSeriesParams{TeamID: team, PeriodStarts: []time.Time{start, mid}, PeriodEnds: []time.Time{mid, end}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(series) != 2 {
+		t.Fatalf("series rows: %d", len(series))
+	}
+	assertNumeric("first series bucket", series[0].StorageGibSeconds, 1024, 1536*1800)
+	assertNumeric("second series bucket", series[1].StorageGibSeconds, 1024, 2560*1800)
+	var cpu, memory, storage float64
+	if err := testPool.QueryRow(ctx, billing.ExportRemeasurementSQL, team, start, end).Scan(&cpu, &memory, &storage); err != nil {
+		t.Fatal(err)
+	}
+	if cpu != 0 || memory != 0 || storage != want {
+		t.Fatalf("export: cpu=%v memory=%v storage=%v", cpu, memory, storage)
+	}
+	stamp := func(v time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: v, Valid: true} }
+	hourly, err := testQueries.UpsertTeamBillingUsageHour(ctx, db.UpsertTeamBillingUsageHourParams{TeamID: team, HourStart: stamp(start), HourEnd: stamp(end)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNumeric("hourly MiB-seconds", hourly.StorageMibSeconds, 1, want)
+	hourlyRows, err := testQueries.ListTeamBillingUsageHourly(ctx, db.ListTeamBillingUsageHourlyParams{TeamID: team, PeriodStart: start, PeriodEnd: end})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hourlyRows) != 1 {
+		t.Fatalf("hourly rows: %d", len(hourlyRows))
+	}
+	assertNumeric("hourly reader", hourlyRows[0].StorageMibSeconds, 1, want)
+	rollup, err := testQueries.UpsertTeamBillingUsage(ctx, db.UpsertTeamBillingUsageParams{TeamID: team, PeriodStart: stamp(start), PeriodEnd: stamp(end)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNumeric("rollup writer", rollup.StorageMibSeconds, 1, want)
+	persisted, err := testQueries.GetTeamBillingUsageRollup(ctx, db.GetTeamBillingUsageRollupParams{TeamID: team, PeriodStart: start, PeriodEnd: end})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNumeric("rollup reader", persisted.StorageMibSeconds, 1, want)
+	// The trial window and platform request share these exact retained rows.
+	exec(`DELETE FROM team_credit_ledger WHERE team_id=$1`, team)
+	exec(`DELETE FROM team_credit_grant WHERE team_id=$1`, team)
+	exec(`INSERT INTO team_credit_grant(team_id,amount_usd,remaining_usd,reason,created_at) VALUES($1,10,10,'signup trial credit',$2)`, team, start)
+	exec(`INSERT INTO team_billing_account(team_id,trial_ended_at) VALUES($1,$2) ON CONFLICT(team_id) DO UPDATE SET trial_ended_at=$2`, team, end)
+	trial, err := testQueries.GetTeamTrialBalance(ctx, team)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cost := want / 1024 * 0.00000003
+	assertNumeric("trial USD", trial.ConsumedUsd, 1, math.Round(cost*1e6)/1e6)
+	router := newInternalRouterWithNow(t, func() time.Time { return end })
+	actor := seedPlatformAdminProfile(t)
+	for _, sort := range []string{"team_name", "current_charges_usd"} {
+		resp := doInternal(router, http.MethodGet, fmt.Sprintf("/internal/billing?search=%s&sort=%s&order=asc", team, sort), actor.String(), "")
+		if resp.Code != http.StatusOK {
+			t.Fatalf("platform: %d %s", resp.Code, resp.Body.String())
+		}
+		body := decodePlatformBilling(t, resp.Body.Bytes())
+		if len(body.Rows) != 1 || body.Rows[0].Summary == nil {
+			t.Fatalf("platform rows: %+v", body.Rows)
+		}
+		summary := body.Rows[0].Summary
+		if got := summary["storage_mib_seconds"].(float64); got != want {
+			t.Fatalf("platform MiB-seconds %v want %v", got, want)
+		}
+		if got := summary["cost_breakdown_usd"].(map[string]any)["storage"].(float64); math.Abs(got-cost) > 1e-12 {
+			t.Fatalf("platform USD %v want %v", got, cost)
+		}
+	}
+}
+
+func TestRetainedStorageSweepMatchesPhysicalGrid(t *testing.T) {
+	team, _ := seedTeamAndKey(t)
+	ctx := t.Context()
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	var grid [2][2][20][32]bool
+	for i := 0; i < 80; i++ {
+		host, device := (i/2)%2, i%2
+		lo, hi := i%17, i%17+1+i%3
+		left, right := (i*7)%24, (i*7)%24+1+i%8
+		extents := fmt.Sprintf(`[{"device":"fs-%d","start":%d,"length":%d}]`, device, left*4096, (right-left)*4096)
+		if _, err := tx.Exec(ctx, `INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at) VALUES($1,$2,'sandbox',$3,'grid',$4::jsonb,$5,$6)`, fmt.Sprintf("example-host-%d", host), team, uuid.New(), extents, start.Add(time.Duration(lo)*time.Second), start.Add(time.Duration(hi)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		for second := lo; second < hi; second++ {
+			for block := left; block < right; block++ {
+				grid[host][device][second][block] = true
+			}
+		}
+	}
+	var want float64
+	for host := range grid {
+		for device := range grid[host] {
+			for second := 3; second < 17; second++ {
+				for _, occupied := range grid[host][device][second] {
+					if occupied {
+						want += 4096.0 / 1048576
+					}
+				}
+			}
+		}
+	}
+	var got float64
+	if err := tx.QueryRow(ctx, `SELECT retained_storage_mib_seconds($1,$2,$3)::float8`, team, start.Add(3*time.Second), start.Add(17*time.Second)).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("sweep=%v physical grid=%v", got, want)
+	}
+}
+
+func TestRetainedStorageHistorySweepQualification(t *testing.T) {
+	for _, size := range []struct{ owners, epochs int }{{128, 24}, {1024, 288}} {
+		t.Run(fmt.Sprintf("owners-%d-epochs-%d", size.owners, size.epochs), func(t *testing.T) {
+			ctx := t.Context()
+			team, _ := seedTeamAndKey(t)
+			tx, err := testPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.Background())
+			if _, err := tx.Exec(ctx, `SET LOCAL statement_timeout='90s'`); err != nil {
+				t.Fatal(err)
+			}
+			start := time.Now().UTC().Add(-48 * time.Hour).Truncate(time.Second)
+			end := start.Add(time.Duration(size.epochs) * 5 * time.Minute)
+			if _, err := tx.Exec(ctx, `INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
+    SELECT 'example-sweep',$1,'sandbox',md5('owner-'||o)::uuid,'epoch-'||g,
+      jsonb_build_array(jsonb_build_object('device','fs','start',0,'length',1048576),
+       jsonb_build_object('device','fs','start',1048576+(o+(g%2)*($3::int+1))*4096,'length',4096)),
+      $2::timestamptz+g*interval '5 minutes',$2::timestamptz+(g+1)*interval '5 minutes'
+    FROM generate_series(1,$3::int) o CROSS JOIN generate_series(0,$4::int-1) g`, team, start, size.owners, size.epochs); err != nil {
+				t.Fatal(err)
+			}
+			for _, window := range []struct {
+				name string
+				end  time.Time
+			}{{"full-history", end}, {"one-bucket", start.Add(time.Hour)}} {
+				began := time.Now()
+				var got float64
+				if err := tx.QueryRow(ctx, `SELECT retained_storage_mib_seconds($1,$2,$3)::float8`, team, start, window.end).Scan(&got); err != nil {
+					t.Fatal(err)
+				}
+				want := (1 + float64(size.owners)/256) * window.end.Sub(start).Seconds()
+				if got != want {
+					t.Fatalf("usage=%v want %v", got, want)
+				}
+				t.Logf("retained sweep qualification: owners=%d epochs=%d historical_rows=%d extents=%d window=%s elapsed=%s MiB_seconds=%v", size.owners, size.epochs, size.owners*size.epochs, 2*size.owners*size.epochs, window.name, time.Since(began), got)
+			}
+		})
 	}
 }

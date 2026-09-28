@@ -942,7 +942,8 @@ func allColumns(ctx context.Context, dst *pgxpool.Pool, table string) ([]string,
 // converge. Conflicting on the natural key instead lets the copy overwrite
 // scheduler-created rows (id included) and re-runs stay idempotent.
 var conflictTargets = map[string]string{
-	"billing_rollup_job": "(team_id, hour_start)",
+	"billing_rollup_job":        "(team_id, hour_start)",
+	"retained_storage_interval": "(host_id, owner_kind, owner_id, started_at)",
 }
 
 func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (string, error) {
@@ -960,7 +961,7 @@ func conflictClause(ctx context.Context, dst *pgxpool.Pool, table string) (strin
 		}
 		var updates []string
 		for _, col := range cols {
-			if targetCols[col] {
+			if targetCols[col] || (table == "retained_storage_interval" && col == "id") {
 				continue
 			}
 			q := pgx.Identifier{col}.Sanitize()
@@ -1029,6 +1030,22 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 	insertQ := fmt.Sprintf(
 		`INSERT INTO %s SELECT * FROM jsonb_populate_recordset(NULL::%s, $1::jsonb) %s`,
 		t.name, t.name, conflict)
+
+	// Interval IDs are cell-local identities; retries converge on the owner boundary.
+	if t.name == "retained_storage_interval" {
+		cols, err := allColumns(ctx, dst, t.name)
+		if err != nil {
+			return 0, 0, err
+		}
+		var projected []string
+		for _, col := range cols {
+			if col != "id" {
+				projected = append(projected, pgx.Identifier{col}.Sanitize())
+			}
+		}
+		names := strings.Join(projected, ", ")
+		insertQ = fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM jsonb_populate_recordset(NULL::%s, $1::jsonb) %s`, t.name, names, names, t.name, conflict)
+	}
 
 	rows, err := src.Query(ctx, selectQ, teamID)
 	if err != nil {

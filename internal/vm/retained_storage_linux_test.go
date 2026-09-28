@@ -93,6 +93,7 @@ func TestRetainedPhysicalReflinkAllocation(t *testing.T) {
 	if got := retainedTestUnion(baseline); got != stat.Blocks*512 || got >= 64<<20 {
 		t.Fatalf("physical=%d blocks=%d logical=%d", got, stat.Blocks*512, 64<<20)
 	}
+	t.Logf("sparse allocation reconciliation: union=%d st_blocks_bytes=%d apparent_bytes=%d", retainedTestUnion(baseline), stat.Blocks*512, stat.Size)
 	children := []*os.File{makeFile("fork-one"), makeFile("fork-two"), makeFile("fork-three")}
 	for _, child := range children {
 		if err := cloneFileFD(child, base); err != nil {
@@ -120,6 +121,7 @@ func TestRetainedPhysicalReflinkAllocation(t *testing.T) {
 	if got, want := retainedTestUnion(parts...), retainedTestUnion(shared); got != want {
 		t.Fatalf("three clones multiply baseline: %d want %d", got, want)
 	}
+	t.Logf("shared allocation reconciliation: baseline=%d union_with_three_clones=%d", retainedTestUnion(shared), retainedTestUnion(parts...))
 	if _, err := children[0].WriteAt(bytes.Repeat([]byte{0x33}, 4096), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -130,6 +132,7 @@ func TestRetainedPhysicalReflinkAllocation(t *testing.T) {
 	if retainedTestUnion(parts...) <= retainedTestUnion(shared) {
 		t.Fatal("private fork allocation was omitted")
 	}
+	t.Logf("private-write allocation reconciliation: shared=%d combined=%d", retainedTestUnion(shared), retainedTestUnion(parts...))
 	if err := os.Remove(base.Name()); err != nil {
 		t.Fatal(err)
 	}
@@ -142,6 +145,7 @@ func TestRetainedPhysicalReflinkAllocation(t *testing.T) {
 	if got := retainedTestUnion(parts[1:]...); got != retainedTestUnion(parts...) {
 		t.Fatalf("source deletion lost shared data: %d", got)
 	}
+	t.Logf("source-deletion allocation reconciliation: surviving_union=%d", retainedTestUnion(parts[1:]...))
 	independent := makeFile("independent")
 	if _, err := independent.Write(bytes.Repeat([]byte{0x5a}, 1<<20)); err != nil {
 		t.Fatal(err)
@@ -190,6 +194,7 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 		return path
 	}
 	rec := VMRecord{ID: uuid.NewString(), Status: StatusPaused, DiskPath: write("overlay.ext4", 4), SnapshotPath: write("vmstate.snap", 1), MemFilePath: write("mem.snap", 8)}
+	rec.RootfsPath = rec.DiskPath
 	save := func() {
 		t.Helper()
 		if err := state.Put(rec); err != nil {
@@ -210,6 +215,7 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 		t.Fatal("sandbox missing")
 	}
 	fullBytes := retainedTestUnion(full.Owners[0].Extents)
+	t.Logf("full inventory reconciliation: allocated=%d expected=%d", fullBytes, 13*4096)
 	if fullBytes != 13*4096 {
 		t.Fatalf("full physical bytes=%d", fullBytes)
 	}
@@ -224,6 +230,7 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 	rec.BaseMemPath = ""
 	save()
 	replacement := sample()
+	t.Logf("layered/replacement reconciliation: layered=%d replacement=%d", retainedTestUnion(layered.Owners[0].Extents), retainedTestUnion(replacement.Owners[0].Extents))
 	if got := retainedTestUnion(replacement.Owners[0].Extents); got != 8*4096 {
 		t.Fatalf("superseded full/diff images still billable: %d", got)
 	}

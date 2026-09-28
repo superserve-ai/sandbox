@@ -78,36 +78,60 @@ func retainedRecordPaths(rec VMRecord, runDir string) ([]string, error) {
 			return nil, fmt.Errorf("layered memory base is unknown")
 		}
 	}
-	// DeltaDir and RootfsPath were added after records already existed. Recover
-	// them from the pinned snapshot layout when the durable record was written
-	// by an older daemon; if a pinned overlay is present but its dependency
-	// cannot be recovered, keep the observation unknown rather than clipping
-	// the legacy contribution at cutover.
-	deltaDir := rec.DeltaDir
-	if deltaDir == "" && rec.BasePath != "" && rec.SnapshotPath != "" {
-		candidates := []string{filepath.Dir(rec.SnapshotPath), filepath.Dir(rec.BasePath)}
-		for _, candidate := range candidates {
-			if _, err := os.Stat(filepath.Join(candidate, "rootfs.delta")); err == nil {
-				deltaDir = candidate
-				break
+	// A pause replaces SnapshotPath with the sandbox's own image. For older
+	// records the layered base still pins the immutable template generation;
+	// its build metadata, not the latest template directory, names the disk.
+	deltaDir, rootfs := rec.DeltaDir, rec.RootfsPath
+	if rec.SourceSnapshotID == "" && ((rec.BasePath != "" && deltaDir == "") || (rec.BasePath == "" && rootfs == "")) {
+		resolved := false
+		for _, anchor := range []string{baseMem, rec.SnapshotPath} {
+			if anchor == "" {
+				continue
 			}
-		}
-		if deltaDir == "" {
-			if _, layoutErr := templateRootfsForSnapshot(runDir, rec.SnapshotPath); layoutErr == nil {
-				if _, err := os.Stat(rec.BasePath); err == nil {
-					return nil, fmt.Errorf("pinned overlay dependencies are unknown")
+			inferredRootfs, err := templateRootfsForSnapshot(runDir, anchor)
+			if err != nil {
+				continue
+			}
+			meta, err := readBuildMetaJSON(filepath.Dir(anchor))
+			if os.IsNotExist(err) {
+				// Legacy flat template generations predate build.meta.json.
+				// Only a pinned image in that layout identifies their rootfs.
+				if rec.BasePath == "" && filepath.Base(filepath.Dir(filepath.Dir(anchor))) == TemplatesDirName {
+					if _, err := os.Stat(inferredRootfs); err == nil {
+						rootfs, resolved = inferredRootfs, true
+						break
+					}
+				}
+				if rec.BasePath != "" {
+					candidate := filepath.Join(filepath.Dir(anchor), "rootfs.delta")
+					if _, err := os.Stat(candidate); err == nil {
+						deltaDir, resolved = filepath.Dir(candidate), true
+						break
+					}
 				}
 			}
-		}
-	}
-	rootfs := rec.RootfsPath
-	if rootfs == "" && rec.BasePath == "" && rec.SnapshotPath != "" {
-		if inferred, err := templateRootfsForSnapshot(runDir, rec.SnapshotPath); err == nil {
-			if _, statErr := os.Stat(inferred); statErr == nil {
-				rootfs = inferred
-			} else {
-				return nil, fmt.Errorf("legacy template rootfs dependency is unknown")
+			if err != nil {
+				continue
 			}
+			if rec.BasePath != "" {
+				if meta.BasePath != rec.BasePath || meta.DeltaPath == "" {
+					continue
+				}
+				deltaDir = filepath.Dir(meta.DeltaPath)
+				if filepath.Base(meta.DeltaPath) != "rootfs.delta" {
+					continue
+				}
+			} else {
+				if meta.BasePath != "" || meta.RootfsPath == "" {
+					continue
+				}
+				rootfs = meta.RootfsPath
+			}
+			resolved = true
+			break
+		}
+		if !resolved {
+			return nil, fmt.Errorf("retained template generation dependencies are unknown")
 		}
 	}
 	delta := ""
@@ -133,6 +157,10 @@ type retainedFileObservation struct {
 // RetainedStorageInventory samples all owners as one physical-address epoch.
 // Mixing a successful owner with a failed old sample could alias reused blocks.
 func (m *Manager) RetainedStorageInventory(ctx context.Context) (*retainedstorage.Inventory, error) {
+	return m.retainedStorageInventory(ctx, retainedFileExtents)
+}
+
+func (m *Manager) retainedStorageInventory(ctx context.Context, measure func(*os.File, int) ([]retainedstorage.Extent, string, error)) (*retainedstorage.Inventory, error) {
 	epoch := m.storageEpoch.Load()
 	if m.storageMutations.Load() != 0 || m.state == nil {
 		return nil, fmt.Errorf("retained inventory not ready")
@@ -179,7 +207,7 @@ func (m *Manager) RetainedStorageInventory(ctx context.Context) (*retainedstorag
 				f.Close()
 				return fmt.Errorf("retained artifact is not regular")
 			}
-			extents, generation, err := retainedFileExtents(f, remaining)
+			extents, generation, err := measure(f, remaining)
 			f.Close()
 			if err != nil {
 				return err
