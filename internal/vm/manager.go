@@ -1130,10 +1130,21 @@ func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath str
 // <runDir>/templates/<id>/rootfs.ext4. Lets vmd find the template's rootfs
 // without needing controlplane to pass it.
 func templateRootfsForSnapshot(runDir, snapshotPath string) (string, error) {
-	parent := filepath.Dir(snapshotPath) // .../templates/<templateID>
-	templateID := filepath.Base(parent)  // <templateID>
+	parent := filepath.Dir(snapshotPath)
+	templateID := filepath.Base(parent)
 	if filepath.Base(filepath.Dir(parent)) != TemplatesDirName {
-		return "", fmt.Errorf("snapshot path %q does not look like .../templates/<id>/<file>", snapshotPath)
+		// Build snapshots retain one additional build-id directory beneath the
+		// template. Walk only ancestors of the supplied path; never glob the
+		// templates tree or infer an unrelated artifact.
+		for p := parent; p != filepath.Dir(p); p = filepath.Dir(p) {
+			if filepath.Base(filepath.Dir(p)) == TemplatesDirName {
+				parent, templateID = p, filepath.Base(p)
+				break
+			}
+		}
+		if filepath.Base(filepath.Dir(parent)) != TemplatesDirName {
+			return "", fmt.Errorf("snapshot path %q does not look like .../templates/<id>/<file>", snapshotPath)
+		}
 	}
 	if templateID == "" || templateID == "." || templateID == string(filepath.Separator) {
 		return "", fmt.Errorf("snapshot path %q has an empty template id segment", snapshotPath)
@@ -3562,6 +3573,14 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			return nil, err
 		}
 		metaSnapshot, metaMem = fork.SnapshotPath, fork.MemPath
+	}
+	// Keep the immutable template rootfs as inventory metadata even though the
+	// restore itself runs from the per-sandbox copy. This path derivation is
+	// bounded and does not touch the filesystem or delay VM startup.
+	if resourceLimits.RootfsPath == "" {
+		if rootfs, err := templateRootfsForSnapshot(m.cfg.RunDir, metaSnapshot); err == nil {
+			resourceLimits.RootfsPath = rootfs
+		}
 	}
 	// Failed restores return before the first-attempt success block below
 	// records the setup phases; emit whichever stages completed (elapsed for

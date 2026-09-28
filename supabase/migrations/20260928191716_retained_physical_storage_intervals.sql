@@ -24,9 +24,33 @@ CREATE TABLE retained_storage_interval (
 CREATE UNIQUE INDEX retained_storage_current ON retained_storage_interval(host_id,owner_kind,owner_id) WHERE ended_at IS NULL;
 CREATE INDEX retained_storage_team_time ON retained_storage_interval(team_id,started_at);
 CREATE INDEX retained_storage_host_time ON retained_storage_interval(host_id,started_at);
+-- Billing reads constrain both interval edges before expanding extents. Keep
+-- the candidate set indexable so bucketed reads do not repeatedly scan every
+-- historical row for a team or host.
+CREATE INDEX retained_storage_team_window ON retained_storage_interval(team_id,started_at,ended_at);
+CREATE INDEX retained_storage_host_window ON retained_storage_interval(host_id,started_at,ended_at);
 CREATE INDEX retained_storage_owner_close ON retained_storage_interval(owner_kind,owner_id) WHERE ended_at IS NULL;
 ALTER TABLE retained_storage_cutover ENABLE ROW LEVEL SECURITY;
 ALTER TABLE retained_storage_interval ENABLE ROW LEVEL SECURITY;
+
+-- Snapshot the sandbox host at the beginning of each legacy storage interval.
+-- Billing must not consult sandbox.host_id later: reassignment is a lifecycle
+-- operation and must not move an already-finalized legacy cutover boundary.
+ALTER TABLE sandbox_storage_interval ADD COLUMN host_id text;
+UPDATE sandbox_storage_interval i SET host_id=s.host_id
+FROM sandbox s WHERE s.id=i.sandbox_id AND i.host_id IS NULL;
+CREATE FUNCTION stamp_sandbox_storage_interval_host() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF NEW.host_id IS NULL THEN
+  SELECT host_id INTO NEW.host_id FROM sandbox WHERE id=NEW.sandbox_id;
+ END IF;
+ RETURN NEW;
+END;
+$$;
+CREATE TRIGGER stamp_sandbox_storage_interval_host
+ BEFORE INSERT ON sandbox_storage_interval FOR EACH ROW
+ EXECUTE FUNCTION stamp_sandbox_storage_interval_host();
+CREATE INDEX sandbox_storage_interval_host_window ON sandbox_storage_interval(host_id,started_at,ended_at);
 
 -- These triggers do no discovery or aggregation. The lifecycle row lock also
 -- fences the asynchronous report writer; only confirmed deletion ends retention.
@@ -73,18 +97,25 @@ $$;
 -- Series buckets preserve fractional legacy artifact usage until aggregation.
 CREATE FUNCTION storage_mib_seconds(p_team uuid,p_start timestamptz,p_end timestamptz,p_floor_legacy_artifacts boolean DEFAULT true)
 RETURNS numeric LANGUAGE sql STABLE AS $$
- WITH legacy_intervals AS MATERIALIZED (
-  SELECT i.sandbox_id,i.team_id,i.disk_mib,i.started_at,LEAST(i.ended_at,c.started_at) ended_at
-  FROM sandbox_storage_interval i JOIN sandbox s ON s.id=i.sandbox_id
-  LEFT JOIN retained_storage_cutover c ON c.host_id=s.host_id AND c.team_id=i.team_id
+WITH legacy_intervals AS MATERIALIZED (
+  SELECT i.sandbox_id,i.team_id,i.host_id,i.disk_mib,i.started_at,LEAST(i.ended_at,c.started_at) ended_at,
+   LEAST(s.destroyed_at,c.started_at) artifact_retention_end
+  FROM sandbox_storage_interval i
+  JOIN sandbox s ON s.id=i.sandbox_id
+  LEFT JOIN retained_storage_cutover c ON c.host_id=i.host_id AND c.team_id=i.team_id
   WHERE i.team_id=p_team AND p_start<LEAST(p_end,billing_request_now()) AND i.started_at<COALESCE(c.started_at,'infinity')
  ), artifact_bounds AS (
-  SELECT s.*,LEAST(s.destroyed_at,c.started_at) retention_end,f.started_at billing_started_at
+  SELECT s.*,f.retention_end,f.started_at billing_started_at
   FROM sandbox s
-  LEFT JOIN retained_storage_cutover c ON c.host_id=s.host_id AND c.team_id=s.team_id
-  JOIN LATERAL (SELECT min(started_at) started_at FROM legacy_intervals i WHERE i.sandbox_id=s.id) f ON true
+  JOIN LATERAL (
+   -- Closing an overlay measurement does not release its referenced artifacts.
+   -- An unbounded retention interval must survive aggregation with closed ones.
+   SELECT min(started_at) started_at,
+    NULLIF(max(COALESCE(artifact_retention_end,'infinity'::timestamptz)),'infinity'::timestamptz) retention_end
+   FROM legacy_intervals i WHERE i.sandbox_id=s.id
+  ) f ON f.started_at IS NOT NULL
   WHERE s.team_id=p_team AND f.started_at<LEAST(billing_request_now(),p_end)
-    AND COALESCE(LEAST(s.destroyed_at,c.started_at),billing_request_now())>p_start
+    AND COALESCE(f.retention_end,billing_request_now())>p_start
  ), artifact_ranges AS (
   SELECT p.path,MAX(COALESCE(am.allocated_bytes,0))::numeric/1048576.0 artifact_mib,
    range_agg(tstzrange(GREATEST(s.billing_started_at,p_start),LEAST(COALESCE(s.retention_end,billing_request_now()),p_end),'[)')) retained_ranges

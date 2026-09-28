@@ -2,14 +2,15 @@ package vm
 
 import (
 	"context"
-	"github.com/rs/zerolog"
-	"github.com/superserve-ai/sandbox/internal/retainedstorage"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 )
 
 func TestRetainedRecordPathsTrackFullAndLayeredGenerations(t *testing.T) {
@@ -43,6 +44,26 @@ func TestRetainedRecordPathsTrackFullAndLayeredGenerations(t *testing.T) {
 	rec.MemFilePath = ""
 	if _, err = retainedRecordPaths(rec, root); err == nil {
 		t.Fatal("missing paused memory was treated as absent")
+	}
+}
+
+func TestRetainedRecordPathsResolvePinnedTemplateAndLayeredSidecar(t *testing.T) {
+	root := t.TempDir()
+	mem := filepath.Join(root, "mem.diff")
+	base := filepath.Join(root, "template", "mem.snap")
+	if err := os.WriteFile(mem+".base", []byte(base+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := VMRecord{ID: uuid.NewString(), Status: StatusPaused,
+		DiskPath: filepath.Join(root, "overlay.ext4"), BasePath: filepath.Join(root, "template", "base.ext4"), SnapshotPath: filepath.Join(root, "vmstate.snap"),
+		MemFilePath: mem, DeltaDir: filepath.Join(root, "template"), RootfsPath: filepath.Join(root, "template", "rootfs.ext4")}
+	paths, err := retainedRecordPaths(rec, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{rec.DiskPath, rec.BasePath, rec.SnapshotPath, rec.MemFilePath, base, rec.RootfsPath, filepath.Join(rec.DeltaDir, "rootfs.delta")}
+	if !reflect.DeepEqual(paths, want) {
+		t.Fatalf("retained dependencies = %v, want %v", paths, want)
 	}
 }
 

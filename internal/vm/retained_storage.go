@@ -63,7 +63,32 @@ func retainedRecordPaths(rec VMRecord, runDir string) ([]string, error) {
 			disk = filepath.Join(runDir, rec.ID, "rootfs.ext4")
 		}
 	}
-	paths := []string{disk, rec.BasePath, rec.SnapshotPath, rec.MemFilePath, rec.BaseMemPath}
+	baseMem := rec.BaseMemPath
+	if rec.MemFilePath != "" {
+		// Restore and snapshot capture use the sidecar as the authoritative
+		// dependency when older records omitted BaseMemPath. A diff without a
+		// resolvable base is not a partial success: reject the observation so
+		// the previous accepted quantity remains in force.
+		if sidecar, ok := readLayeredBase(rec.MemFilePath); ok {
+			if baseMem != "" && filepath.Clean(baseMem) != filepath.Clean(sidecar) {
+				return nil, fmt.Errorf("layered memory base changed during inventory")
+			}
+			baseMem = sidecar
+		} else if isOverlayMemFile(rec.MemFilePath) && baseMem == "" {
+			return nil, fmt.Errorf("layered memory base is unknown")
+		}
+	}
+	delta := ""
+	if rec.DeltaDir != "" {
+		delta = filepath.Join(rec.DeltaDir, "rootfs.delta")
+	}
+	paths := []string{disk, rec.BasePath, rec.SnapshotPath, rec.MemFilePath, baseMem}
+	if rec.RootfsPath != "" {
+		paths = append(paths, rec.RootfsPath)
+	}
+	if delta != "" {
+		paths = append(paths, delta)
+	}
 	paths = append(paths, rec.StrandedOverlays...)
 	return paths, nil
 }

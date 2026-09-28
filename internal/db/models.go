@@ -1037,6 +1037,7 @@ type SandboxStorageInterval struct {
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
+	HostID    *string            `json:"host_id"`
 }
 
 // Host-side reclaim still owed for a deleted sandbox; removed when the VM and its artifacts are gone.

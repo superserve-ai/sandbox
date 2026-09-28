@@ -21,14 +21,18 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
 	if err != nil {
 		return err
 	}
-	// Same order as lifecycle: sandbox rows before saved snapshot rows. Locks are
-	// bounded by the inventory limit and the enclosing transaction's timeout.
-	if _, err := tx.Exec(ctx, `SELECT id FROM sandbox WHERE host_id=$1 AND created_at<=$2
-  AND (destroyed_at IS NULL OR destroyed_at>$2) ORDER BY id LIMIT 4097 FOR NO KEY UPDATE`, hostID, at); err != nil {
+	// Lock only owners present in this report. A host-wide lock here would make
+	// a periodic inventory contend with unrelated pause/resume/destroy writes.
+	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
+ SELECT s.id FROM sandbox s JOIN supplied o ON o.kind='sandbox' AND o.id=s.id
+ WHERE s.host_id=$1 AND s.created_at<=$2 AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
+ FOR NO KEY UPDATE`, hostID, at, payload); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, `SELECT id FROM sandbox_snapshot WHERE host_id=$1 AND ready_at<=$2
-  AND (deleted_at IS NULL OR deleted_at>$2) ORDER BY id LIMIT 4097 FOR NO KEY UPDATE`, hostID, at); err != nil {
+	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
+ SELECT s.id FROM sandbox_snapshot s JOIN supplied o ON o.kind='snapshot' AND o.id=s.id
+ WHERE s.host_id=$1 AND s.ready_at<=$2 AND (s.deleted_at IS NULL OR s.deleted_at>$2)
+ FOR NO KEY UPDATE`, hostID, at, payload); err != nil {
 		return err
 	}
 	// Ownership comes exclusively from these rows. Host-supplied owner IDs are
@@ -37,7 +41,6 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
 	err = tx.QueryRow(ctx, `WITH expected AS (
   SELECT 'sandbox' kind,s.id FROM sandbox s WHERE s.host_id=$1 AND s.created_at<=$2
    AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
-   AND EXISTS(SELECT 1 FROM sandbox_storage_interval i WHERE i.sandbox_id=s.id AND i.started_at<=$2)
   UNION ALL
   SELECT 'snapshot',id FROM sandbox_snapshot WHERE host_id=$1 AND ready_at<=$2
    AND (deleted_at IS NULL OR deleted_at>$2)
@@ -56,18 +59,25 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
  ), eligible AS MATERIALIZED (
   SELECT o.*,s.team_id,s.destroyed_at lifetime_end FROM supplied o JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
   WHERE s.host_id=$1 AND s.created_at<=$2 AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
-   AND EXISTS(SELECT 1 FROM sandbox_storage_interval i WHERE i.sandbox_id=s.id AND i.started_at<=$2)
    AND feature_enabled('billing_metrics_write',s.team_id)
   UNION ALL
   SELECT o.*,s.team_id,s.deleted_at FROM supplied o JOIN sandbox_snapshot s ON o.kind='snapshot' AND s.id=o.id
   WHERE s.host_id=$1 AND s.ready_at<=$2 AND (s.deleted_at IS NULL OR s.deleted_at>$2)
    AND feature_enabled('billing_metrics_write',s.team_id)
+ ), moved AS (
+  UPDATE retained_storage_interval old SET ended_at=$2
+  FROM supplied moved_owner
+  WHERE moved_owner.id=old.owner_id AND moved_owner.kind=old.owner_kind
+   AND old.host_id<>$1 AND old.ended_at IS NULL AND old.started_at<$2
+   AND (EXISTS (SELECT 1 FROM sandbox s WHERE old.owner_kind='sandbox' AND s.id=old.owner_id AND feature_enabled('billing_metrics_write',s.team_id))
+     OR EXISTS (SELECT 1 FROM sandbox_snapshot s WHERE old.owner_kind='snapshot' AND s.id=old.owner_id AND feature_enabled('billing_metrics_write',s.team_id)))
+  RETURNING old.id
  ), cutover AS (
   INSERT INTO retained_storage_cutover(host_id,team_id,started_at)
   SELECT DISTINCT $1,team_id,$2 FROM eligible ON CONFLICT DO NOTHING
  ), current AS MATERIALIZED (
   SELECT e.*,i.id interval_id,i.generation old_generation,i.extents old_extents
-  FROM eligible e LEFT JOIN retained_storage_interval i ON i.host_id=$1 AND i.owner_kind=e.kind AND i.owner_id=e.id
+ FROM eligible e LEFT JOIN retained_storage_interval i ON i.host_id=$1 AND i.owner_kind=e.kind AND i.owner_id=e.id
    AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)
  ), closed AS (
   UPDATE retained_storage_interval i SET ended_at=$2 FROM current c WHERE i.id=c.interval_id

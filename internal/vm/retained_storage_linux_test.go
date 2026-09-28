@@ -5,13 +5,13 @@ package vm
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/google/uuid"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	"golang.org/x/sys/unix"
 )
@@ -240,6 +240,24 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshotDisk := filepath.Join(snapshotDir, "overlay.ext4")
+	snapshotState := filepath.Join(snapshotDir, "vmstate.snap")
+	snapshotMem := filepath.Join(snapshotDir, "mem.diff")
+	snapshotBaseMem := filepath.Join(snapshotDir, "mem.base")
+	for _, path := range []string{snapshotState, snapshotMem, snapshotBaseMem} {
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.Write(bytes.Repeat([]byte{7}, 4096)); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Sync(); err != nil {
+			f.Close()
+			t.Fatal(err)
+		}
+		f.Close()
+	}
 	src, err := os.Open(rec.DiskPath)
 	if err != nil {
 		t.Fatal(err)
@@ -259,7 +277,7 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 	}
 	src.Close()
 	dst.Close()
-	man, err := json.Marshal(SavedSnapshotManifest{Version: savedSnapshotVersion, SnapshotID: snapshotID, SourceVMID: rec.ID, Kind: SavedSnapshotFS, DiskPath: snapshotDisk})
+	man, err := json.Marshal(SavedSnapshotManifest{Version: savedSnapshotVersion, SnapshotID: snapshotID, SourceVMID: rec.ID, Kind: SavedSnapshotMemFS, DiskPath: snapshotDisk, SnapshotPath: snapshotState, MemPath: snapshotMem, BaseMemPath: snapshotBaseMem})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,6 +286,15 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 	}
 	if got := sample(); len(got.Owners) != 2 {
 		t.Fatal("committed saved snapshot omitted")
+	}
+	var snapshotOwner retainedstorage.Owner
+	for _, owner := range sample().Owners {
+		if owner.Kind == "snapshot" {
+			snapshotOwner = owner
+		}
+	}
+	if got := retainedTestUnion(snapshotOwner.Extents); got < 4*4096 {
+		t.Fatalf("mem+fs snapshot omitted retained artifacts: %d", got)
 	}
 	if err := os.Remove(rec.MemFilePath); err != nil {
 		t.Fatal(err)
