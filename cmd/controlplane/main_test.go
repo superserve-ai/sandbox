@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -11,10 +14,61 @@ import (
 	grpccodes "google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
 
+	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/preview"
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
+
+func TestPromotionAuthConfigurationFailureKeepsAPIAvailable(t *testing.T) {
+	t.Setenv("PROMOTION_CAPTURE_TOKEN", "capture-example-token")
+	t.Setenv("PROMOTION_ACCOUNT_TOKEN", "account-example-token")
+	t.Setenv("INTERNAL_API_TOKEN", "internal-example-token")
+	for _, tc := range []struct {
+		name, authURL string
+	}{
+		{"unset", ""},
+		{"malformed URL", "postgres://example:example-secret@localhost:invalid/promotion"},
+		{"invalid pool configuration", "postgres://localhost/promotion?pool_max_conns=invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			h := &api.Handlers{PromotionAuthPool: newPromotionAuthPool(ctx, tc.authURL)}
+			if h.PromotionAuthPool != nil {
+				h.PromotionAuthPool.Close()
+				t.Fatal("invalid or absent configuration must leave promotion authority unavailable")
+			}
+			r := api.SetupRouter(ctx, h, nil)
+			for _, path := range []string{
+				"/internal/promotion/signup/attempts",
+				"/internal/promotion/signup/attempts/verify",
+			} {
+				req := httptest.NewRequest(http.MethodPost, path, nil)
+				req.Header.Set("Authorization", "Bearer capture-example-token")
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, req)
+				if w.Code != http.StatusServiceUnavailable {
+					t.Fatalf("%s: got %d: %s", path, w.Code, w.Body.String())
+				}
+				var response struct {
+					Error api.AppError `json:"error"`
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+					t.Fatal(err)
+				}
+				if response.Error.Code != "authority_unavailable" {
+					t.Fatalf("%s: unexpected response: %s", path, w.Body.String())
+				}
+			}
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+			if w.Code != http.StatusOK {
+				t.Fatalf("API health: got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
 
 func TestRetryUnavailableRetriesUntilSuccess(t *testing.T) {
 	calls := 0
