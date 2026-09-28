@@ -3,6 +3,7 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -20,15 +21,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/sentrylog"
 )
 
 const testStripeWebhookSecret = "whsec_test_secret"
@@ -912,6 +917,129 @@ func TestIntegration_StripeActivationEndsTrialAndGrantsPromoCreditOnce(t *testin
 	}
 }
 
+func TestIntegration_StripeSubscriptionCreatedAfterCheckoutExpiration(t *testing.T) {
+	created := time.Now().UTC().Truncate(time.Second)
+	expiredGeneration := created.Add(-time.Hour)
+	for _, tc := range []struct {
+		name, generation    string
+		ignored             bool
+		reservationBlocked  bool
+		replacementCheckout bool
+		unsavedSession      bool
+	}{
+		{name: "matching generation", generation: expiredGeneration.Format(time.RFC3339Nano), ignored: true},
+		{name: "different generation", generation: created.Format(time.RFC3339Nano), reservationBlocked: true},
+		{name: "missing generation"},
+		{name: "malformed generation", generation: "invalid", reservationBlocked: true},
+		{name: "replacement checkout matching generation", generation: expiredGeneration.Format(time.RFC3339Nano), ignored: true, replacementCheckout: true},
+		{name: "initializing replacement matching generation", generation: expiredGeneration.Format(time.RFC3339Nano), ignored: true, replacementCheckout: true, unsavedSession: true},
+		{name: "replacement checkout different generation", generation: created.Format(time.RFC3339Nano), replacementCheckout: true},
+		{name: "replacement checkout missing generation", replacementCheckout: true},
+		{name: "replacement checkout malformed generation", generation: "invalid", replacementCheckout: true},
+	} {
+		for _, status := range []string{"active", "paused"} {
+			t.Run(tc.name+"/"+status, func(t *testing.T) {
+				ctx := context.Background()
+				teamID, _, userID := seedTeamAndKeyWithRole(t, "team_owner")
+				customerID, subscriptionID := "cus_"+teamID.String(), "sub_"+teamID.String()
+				if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account (team_id, stripe_customer_id)
+					VALUES ($1, $2)`, teamID, customerID); err != nil {
+					t.Fatal(err)
+				}
+				if err := testQueries.RecordStripeCheckoutExpiration(ctx, db.RecordStripeCheckoutExpirationParams{
+					TeamID: teamID, StripeCustomerID: customerID,
+					CheckoutGeneration: expiredGeneration, CheckoutSessionID: "cs_" + teamID.String(),
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if tc.replacementCheckout {
+					var sessionID *string
+					if !tc.unsavedSession {
+						savedSessionID := "cs_replacement_" + teamID.String()
+						sessionID = &savedSessionID
+					}
+					if _, err := testPool.Exec(ctx, `UPDATE team_billing_account
+						SET checkout_initializing_at = $2, checkout_session_id = $3, stripe_checkout_actor_id = $4
+						WHERE team_id = $1`, teamID, created, sessionID, userID); err != nil {
+						t.Fatal(err)
+					}
+				}
+				beforeAccount, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				metadata := map[string]string{"activation_user_id": userID.String()}
+				if tc.generation != "" {
+					metadata["checkout_generation"] = tc.generation
+				}
+				eventID := "evt_" + uuid.NewString()
+				payload := stripeSubscriptionWebhookPayloadWithMetadata(t, eventID, "customer.subscription.created",
+					subscriptionID, customerID, status, created, created, created.AddDate(0, 1, 0), metadata)
+				if tc.replacementCheckout {
+					if _, err := testPool.Exec(ctx, `INSERT INTO stripe_webhook_event (event_id, event_type, payload, last_error)
+						VALUES ($1, 'customer.subscription.created', $2, $3)`, eventID, payload, db.StripeCheckoutAssociationPendingError); err != nil {
+						t.Fatal(err)
+					}
+				}
+				stripe := &fakeStripeClient{}
+				router := newBillingRouter(t, stripe)
+				// A supplied generation needs its captured checkout identity to
+				// reserve credit; unrelated expiration does not bypass that fence.
+				blocked := tc.reservationBlocked && status == "active"
+				pending := tc.replacementCheckout && !tc.ignored
+				wantStatus := http.StatusOK
+				if blocked || pending {
+					wantStatus = http.StatusInternalServerError
+				}
+				for delivery := 0; delivery < 2; delivery++ {
+					req := httptest.NewRequest(http.MethodPost, "/stripe/webhook", strings.NewReader(string(payload)))
+					req.Header.Set("Content-Type", "application/json")
+					req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC()))
+					if response := doRequest(router, req); response.Code != wantStatus {
+						t.Fatalf("delivery %d: status=%d body=%s", delivery, response.Code, response.Body.String())
+					}
+				}
+				event, err := testQueries.GetStripeWebhookEvent(ctx, eventID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if pending {
+					if event.ProcessedAt.Valid || derefString(event.LastError) != db.StripeCheckoutAssociationPendingError {
+						t.Fatalf("association-pending event: %+v", event)
+					}
+				} else if blocked {
+					if event.ProcessedAt.Valid || derefString(event.LastError) != "Stripe promotion reservation is contended; retry webhook" {
+						t.Fatalf("reservation-blocked event: %+v", event)
+					}
+				} else if !event.ProcessedAt.Valid || event.LastError != nil {
+					t.Fatalf("processed event: %+v", event)
+				}
+				account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if tc.replacementCheckout && !reflect.DeepEqual(account, beforeAccount) {
+					t.Fatalf("redelivery changed replacement checkout: before=%+v after=%+v", beforeAccount, account)
+				}
+				if tc.ignored || blocked || pending {
+					if account.StripeSubscriptionID != nil || account.StripeSubscriptionEventAt.Valid {
+						t.Fatalf("ignored or blocked subscription changed billing state: %+v", account)
+					}
+				} else if derefString(account.StripeSubscriptionID) != subscriptionID || derefString(account.StripeSubscriptionStatus) != status || !account.StripeSubscriptionEventAt.Valid {
+					t.Fatalf("unrelated expiration suppressed subscription: %+v", account)
+				}
+				wantGrants := 0
+				if !tc.ignored && !blocked && !pending && status == "active" {
+					wantGrants = 1
+				}
+				if len(stripe.creditGrantCalls) != wantGrants || account.StripeActivationCreditGrantedAt.Valid != (wantGrants == 1) {
+					t.Fatalf("activation: grants=%d granted_at=%v, want %d grants", len(stripe.creditGrantCalls), account.StripeActivationCreditGrantedAt, wantGrants)
+				}
+			})
+		}
+	}
+}
+
 func TestIntegration_StripePromotionEligibilityAndConcurrentActivation(t *testing.T) {
 	ctx := context.Background()
 	teamID, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
@@ -1143,6 +1271,161 @@ func TestIntegration_StripePromotionEligibilityAndConcurrentActivation(t *testin
 	}
 }
 
+func TestIntegration_StripePendingCheckoutReconcilesLatestLifecycle(t *testing.T) {
+	transport := &sentry.MockTransport{}
+	previousSentryClient := sentry.CurrentHub().Client()
+	if err := sentry.Init(sentry.ClientOptions{Dsn: "https://test@example.com/1", Transport: transport}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sentry.CurrentHub().BindClient(previousSentryClient) })
+	for _, tc := range []struct {
+		name, initialStatus, eventType, finalStatus string
+		equalTime, reverse                          bool
+		wantGrants                                  int
+	}{
+		{name: "canceled", initialStatus: "active", eventType: "deleted", finalStatus: "canceled"},
+		{name: "activated", initialStatus: "incomplete", eventType: "updated", finalStatus: "active", wantGrants: 1},
+		{name: "canceled_reverse", initialStatus: "active", eventType: "deleted", finalStatus: "canceled", reverse: true},
+		{name: "activated_reverse", initialStatus: "incomplete", eventType: "updated", finalStatus: "active", reverse: true, wantGrants: 1},
+		{name: "canceled_equal_time", initialStatus: "active", eventType: "deleted", finalStatus: "canceled", equalTime: true},
+		{name: "paused", initialStatus: "active", eventType: "paused", finalStatus: "paused"},
+		{name: "resumed", initialStatus: "incomplete", eventType: "resumed", finalStatus: "active", wantGrants: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			teamID, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
+			customerID, subscriptionID := "cus_"+teamID.String(), "sub_"+teamID.String()
+			at := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+			checkoutEventID := "evt_checkout_" + teamID.String()
+			if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account (team_id, stripe_customer_id, checkout_initializing_at, checkout_session_id) VALUES ($1,$2,$3,$4)`, teamID, customerID, at, "cs_"+checkoutEventID); err != nil {
+				t.Fatal(err)
+			}
+			stripe := &fakeStripeClient{}
+			r := newBillingRouter(t, stripe)
+			deliver := func(payload []byte) *httptest.ResponseRecorder {
+				req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC()))
+				return doRequest(r, req)
+			}
+			later := at.Add(2 * time.Second)
+			if tc.equalTime {
+				later = at.Add(time.Second)
+			}
+			ids := []string{"evt_created_" + teamID.String(), "evt_lifecycle_" + teamID.String()}
+			eventTypes := []string{"customer.subscription.created", "customer.subscription." + tc.eventType}
+			payloads := [][]byte{
+				stripeSubscriptionWebhookPayload(t, ids[0], eventTypes[0], subscriptionID, customerID, tc.initialStatus, at.Add(time.Second), at, at.AddDate(0, 1, 0)),
+				stripeSubscriptionWebhookPayload(t, ids[1], eventTypes[1], subscriptionID, customerID, tc.finalStatus, later, at, at.AddDate(0, 1, 0)),
+			}
+			var warnings bytes.Buffer
+			previousLogger := log.Logger
+			log.Logger = zerolog.New(zerolog.MultiLevelWriter(&warnings, &sentrylog.Writer{}))
+			t.Cleanup(func() { log.Logger = previousLogger })
+			initialSentryEvents := len(transport.Events())
+			order := []int{0, 1}
+			if tc.reverse {
+				order = []int{1, 0}
+			}
+			for _, i := range order {
+				if response := deliver(payloads[i]); response.Code != http.StatusInternalServerError {
+					t.Fatalf("pending delivery %s = %d, want retryable 500: %s", ids[i], response.Code, response.Body.String())
+				}
+				var processed bool
+				var lastError string
+				if err := testPool.QueryRow(ctx, `SELECT processed_at IS NOT NULL, last_error FROM stripe_webhook_event WHERE event_id=$1`, ids[i]).Scan(&processed, &lastError); err != nil || processed || lastError != db.StripeCheckoutAssociationPendingError {
+					t.Fatalf("pending event %s processed=%v last_error=%q err=%v", ids[i], processed, lastError, err)
+				}
+			}
+			sentry.Flush(time.Second)
+			if got := len(transport.Events()); got != initialSentryEvents {
+				t.Fatalf("pending deliveries forwarded %d Sentry errors: %s", got-initialSentryEvents, warnings.String())
+			}
+			var warningRequests int
+			for _, line := range bytes.Split(warnings.Bytes(), []byte{'\n'}) {
+				var entry map[string]any
+				if json.Unmarshal(line, &entry) == nil && entry["message"] == "request" && entry["status"] == float64(http.StatusInternalServerError) && entry["level"] == "warn" {
+					warningRequests++
+				}
+			}
+			if warningRequests != len(ids) {
+				t.Fatalf("pending request warnings = %d, want %d: %s", warningRequests, len(ids), warnings.String())
+			}
+			for i, id := range ids {
+				found := false
+				for _, line := range bytes.Split(warnings.Bytes(), []byte{'\n'}) {
+					var entry map[string]any
+					if json.Unmarshal(line, &entry) == nil && entry["message"] == "Stripe checkout association pending" && entry["event_id"] == id && entry["event_type"] == eventTypes[i] && entry["level"] == "warn" {
+						found = true
+					}
+				}
+				if !found {
+					t.Fatalf("pending event %s did not log a warning: %s", id, warnings.String())
+				}
+			}
+			// A different subscription for the same customer must never be imported.
+			foreign := stripeSubscriptionWebhookPayload(t, "evt_foreign_"+teamID.String(), "customer.subscription.updated", "sub_foreign_"+teamID.String(), customerID, "active", later.Add(time.Second), at, at.AddDate(0, 1, 0))
+			if response := deliver(foreign); response.Code != http.StatusInternalServerError {
+				t.Fatalf("foreign delivery = %d, want retryable 500", response.Code)
+			}
+			checkout := stripeCheckoutWebhookPayload(t, checkoutEventID, teamID.String(), customerID, subscriptionID, later.Add(2*time.Second))
+			if response := deliver(checkout); response.Code != http.StatusOK {
+				t.Fatalf("checkout = %d: %s", response.Code, response.Body.String())
+			}
+			verify := func() {
+				t.Helper()
+				account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if derefString(account.StripeSubscriptionID) != subscriptionID || derefString(account.StripeSubscriptionStatus) != tc.finalStatus {
+					t.Fatalf("subscription = %q/%q, want %s/%s", derefString(account.StripeSubscriptionID), derefString(account.StripeSubscriptionStatus), subscriptionID, tc.finalStatus)
+				}
+				if len(stripe.creditGrantCalls) != tc.wantGrants || account.TrialEndedAt.Valid != (tc.wantGrants == 1) || (account.StripeActivationCreditGrantID != nil) != (tc.wantGrants == 1) {
+					t.Fatalf("grants=%d trialEnded=%v grantID=%v, want %d activations", len(stripe.creditGrantCalls), account.TrialEndedAt.Valid, account.StripeActivationCreditGrantID, tc.wantGrants)
+				}
+				for _, id := range ids {
+					var processed bool
+					if err := testPool.QueryRow(ctx, `SELECT processed_at IS NOT NULL FROM stripe_webhook_event WHERE event_id=$1`, id).Scan(&processed); err != nil || !processed {
+						t.Fatalf("event %s processed=%v err=%v", id, processed, err)
+					}
+				}
+				if account.CheckoutInitializingAt.Valid || account.CheckoutSessionID != nil {
+					t.Fatal("matching checkout reservation was not cleared")
+				}
+			}
+			verify()
+			for _, payload := range append(payloads, foreign, checkout) {
+				if response := deliver(payload); response.Code != http.StatusOK {
+					t.Fatalf("redelivery = %d: %s", response.Code, response.Body.String())
+				}
+			}
+			verify()
+		})
+	}
+	t.Run("unassociated_without_checkout", func(t *testing.T) {
+		ctx := context.Background()
+		teamID, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
+		customerID := "cus_" + teamID.String()
+		if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account (team_id, stripe_customer_id) VALUES ($1,$2)`, teamID, customerID); err != nil {
+			t.Fatal(err)
+		}
+		at := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+		eventID := "evt_unassociated_" + teamID.String()
+		payload := stripeSubscriptionWebhookPayload(t, eventID, "customer.subscription.updated", "sub_"+teamID.String(), customerID, "active", at, at, at.AddDate(0, 1, 0))
+		req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC()))
+		if response := doRequest(newBillingRouter(t, &fakeStripeClient{}), req); response.Code != http.StatusInternalServerError {
+			t.Fatalf("unassociated delivery = %d, want retryable 500: %s", response.Code, response.Body.String())
+		}
+		var processed bool
+		var lastError string
+		if err := testPool.QueryRow(ctx, `SELECT processed_at IS NOT NULL, last_error FROM stripe_webhook_event WHERE event_id=$1`, eventID).Scan(&processed, &lastError); err != nil || processed || lastError != db.StripeCheckoutAssociationPendingError {
+			t.Fatalf("unassociated event processed=%v last_error=%q err=%v", processed, lastError, err)
+		}
+	})
+}
 func TestIntegration_CreateStripeCheckoutSessionBlocksExistingSubscription(t *testing.T) {
 	teamID, apiKey, _ := seedTeamAndKeyWithRole(t, "team_owner")
 	if _, err := testPool.Exec(context.Background(), `
@@ -1726,7 +2009,146 @@ func TestIntegration_StripeWebhookIgnoresForeignOwnedEvents(t *testing.T) {
 	}
 }
 
+type stripeRecoveryBeforeFailureTracer struct {
+	mu              sync.Mutex
+	associationConn *pgx.Conn
+	eventID         string
+	failureReady    chan struct{}
+	recovered       chan struct{}
+}
+
+func (tr *stripeRecoveryBeforeFailureTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.HasPrefix(data.SQL, "-- name: AssociateTeamBillingCheckoutSubscription ") {
+		tr.mu.Lock()
+		tr.associationConn = conn
+		tr.mu.Unlock()
+	}
+	if strings.HasPrefix(data.SQL, "-- name: MarkStripeWebhookEventFailed ") && len(data.Args) == 2 && data.Args[1] == tr.eventID {
+		close(tr.failureReady)
+		select {
+		case <-tr.recovered:
+		case <-ctx.Done():
+		}
+	}
+	return ctx
+}
+
+func (tr *stripeRecoveryBeforeFailureTracer) TraceQueryEnd(_ context.Context, conn *pgx.Conn, data pgx.TraceQueryEndData) {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if data.Err == nil && data.CommandTag.String() == "COMMIT" && conn == tr.associationConn {
+		tr.associationConn = nil
+		close(tr.recovered)
+	}
+}
+
+func TestIntegration_StripeCheckoutRecoveryBeforeFailurePersistence(t *testing.T) {
+	for _, status := range []string{"paused", "canceled"} {
+		t.Run(status, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			teamID, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
+			customerID, subscriptionID := "cus_"+teamID.String(), "sub_"+teamID.String()
+			eventID, checkoutID := "evt_pending_"+teamID.String(), "evt_checkout_"+teamID.String()
+			at := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
+			if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account
+				(team_id, stripe_customer_id, checkout_initializing_at, checkout_session_id)
+				VALUES ($1, $2, $3, $4)`, teamID, customerID, at, "cs_"+checkoutID); err != nil {
+				t.Fatal(err)
+			}
+			tracer := &stripeRecoveryBeforeFailureTracer{eventID: eventID, failureReady: make(chan struct{}), recovered: make(chan struct{})}
+			poolConfig := testPool.Config().Copy()
+			poolConfig.ConnConfig.Tracer = tracer
+			pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(pool.Close)
+			stripe := &fakeStripeClient{}
+			router := newBillingRouterWithPool(t, stripe, pool)
+			var logs bytes.Buffer
+			previousLogger := log.Logger
+			log.Logger = zerolog.New(zerolog.SyncWriter(&logs))
+			t.Cleanup(func() { log.Logger = previousLogger })
+			eventType := "customer.subscription.paused"
+			if status == "canceled" {
+				eventType = "customer.subscription.deleted"
+			}
+			request := func(payload []byte) *http.Request {
+				req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload))).WithContext(ctx)
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Stripe-Signature", stripeSignature(t, payload, time.Now().UTC()))
+				return req
+			}
+			pendingRequest := request(stripeSubscriptionWebhookPayload(t, eventID, eventType, subscriptionID, customerID, status, at.Add(time.Second), at, at.AddDate(0, 1, 0)))
+			pendingResponse := httptest.NewRecorder()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				router.ServeHTTP(pendingResponse, pendingRequest)
+			}()
+			// Join the request before restoring the logger, including on failure.
+			defer func() { cancel(); <-done }()
+			select {
+			case <-tracer.failureReady:
+			case <-ctx.Done():
+				t.Fatal("pending delivery did not reach failure persistence")
+			}
+			before, err := testQueries.GetStripeWebhookEvent(ctx, eventID)
+			if err != nil || before.ProcessedAt.Valid {
+				t.Fatalf("event before recovery: %+v, %v", before, err)
+			}
+			// The association transaction processes the retained non-activating event
+			// without the delivery lease, then releases the blocked failure write.
+			checkoutResponse := doRequest(router, request(stripeCheckoutWebhookPayload(t, checkoutID, teamID.String(), customerID, subscriptionID, at.Add(2*time.Second))))
+			<-done
+			if checkoutResponse.Code != http.StatusOK || pendingResponse.Code != http.StatusInternalServerError {
+				t.Fatalf("checkout=%d pending=%d; logs: %s", checkoutResponse.Code, pendingResponse.Code, logs.String())
+			}
+			for _, id := range []string{eventID, checkoutID} {
+				event, err := testQueries.GetStripeWebhookEvent(ctx, id)
+				if err != nil || !event.ProcessedAt.Valid || event.LastError != nil {
+					t.Fatalf("recovered event %s: %+v, %v", id, event, err)
+				}
+				if id == eventID && !event.ReceivedAt.Equal(before.ReceivedAt) {
+					t.Fatal("failure persistence changed receipt time")
+				}
+			}
+			account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+			if err != nil || derefString(account.StripeSubscriptionID) != subscriptionID || derefString(account.StripeSubscriptionStatus) != status || len(stripe.creditGrantCalls) != 0 {
+				t.Fatalf("recovered account: %+v, grants=%d, err=%v", account, len(stripe.creditGrantCalls), err)
+			}
+			pendingWarning := false
+			for _, line := range bytes.Split(logs.Bytes(), []byte{'\n'}) {
+				var entry map[string]any
+				if json.Unmarshal(line, &entry) != nil {
+					continue
+				}
+				if entry["level"] == "error" {
+					t.Fatalf("successful recovery emitted an error: %s", line)
+				}
+				if entry["message"] == "Stripe checkout association pending" && entry["event_id"] == eventID && entry["level"] == "warn" {
+					pendingWarning = true
+				}
+			}
+			if !pendingWarning {
+				t.Fatalf("missing pending diagnostic: %s", logs.String())
+			}
+		})
+	}
+}
+
 func TestIntegration_StripeWebhookPersistsFailureAfterRollback(t *testing.T) {
+	transport := &sentry.MockTransport{}
+	previousSentryClient := sentry.CurrentHub().Client()
+	if err := sentry.Init(sentry.ClientOptions{Dsn: "https://test@example.com/1", Transport: transport}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { sentry.CurrentHub().BindClient(previousSentryClient) })
+	var logs bytes.Buffer
+	previousLogger := log.Logger
+	log.Logger = zerolog.New(zerolog.MultiLevelWriter(&logs, &sentrylog.Writer{}))
+	t.Cleanup(func() { log.Logger = previousLogger })
 	ctx := context.Background()
 	teamID, _, _, _ := seedBillingPeriodForStripe(t, true, true)
 	r := newBillingRouter(t, &fakeStripeClient{})
@@ -1742,6 +2164,30 @@ func TestIntegration_StripeWebhookPersistsFailureAfterRollback(t *testing.T) {
 	w := doRequest(r, req)
 	if w.Code != http.StatusInternalServerError {
 		t.Fatalf("failing webhook: expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	sentry.Flush(time.Second)
+	if len(transport.Events()) == 0 {
+		t.Fatal("unexpected webhook failure did not reach Sentry")
+	}
+	requestError := false
+	processingError := false
+	for _, line := range bytes.Split(logs.Bytes(), []byte{'\n'}) {
+		var entry map[string]any
+		if json.Unmarshal(line, &entry) != nil {
+			continue
+		}
+		if entry["message"] == "request" && entry["status"] == float64(http.StatusInternalServerError) && entry["level"] == "error" {
+			requestError = true
+		}
+		if entry["message"] == "process Stripe webhook failed" && entry["level"] == "error" && entry["event_id"] == "evt_processing_failure" && entry["event_type"] == "customer.subscription.updated" {
+			processingError = true
+		}
+	}
+	if !requestError {
+		t.Fatalf("unexpected failure did not retain error-level request telemetry: %s", logs.String())
+	}
+	if !processingError {
+		t.Fatalf("unexpected failure did not retain error-level webhook processing telemetry: %s", logs.String())
 	}
 
 	var lastError string

@@ -1041,6 +1041,22 @@ type Snapshot struct {
 	PauseToken *string   `json:"pause_token"`
 }
 
+type StripeCheckoutAssociationAlert struct {
+	EventID     string             `json:"event_id"`
+	LeaseUntil  pgtype.Timestamptz `json:"lease_until"`
+	NextCheckAt time.Time          `json:"next_check_at"`
+	LastAlertAt pgtype.Timestamptz `json:"last_alert_at"`
+	RetiredAt   pgtype.Timestamptz `json:"retired_at"`
+}
+
+type StripeCheckoutExpirationEvidence struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	StripeCustomerID   string    `json:"stripe_customer_id"`
+	CheckoutGeneration time.Time `json:"checkout_generation"`
+	CheckoutSessionID  string    `json:"checkout_session_id"`
+	ExpiredAt          time.Time `json:"expired_at"`
+}
+
 type StripePromotionMigrationFence struct {
 	TeamID   uuid.UUID `json:"team_id"`
 	FencedAt time.Time `json:"fenced_at"`
