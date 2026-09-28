@@ -35,6 +35,8 @@ DO $$ BEGIN
         REVOKE ALL ON team_creation_requests FROM authenticated;
     END IF;
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        -- Supabase default grants must not allow completed results to be changed.
+        REVOKE ALL ON team_creation_requests FROM service_role;
         -- The control-plane pool uses service_role for this privileged,
         -- actor-bound idempotency state. Ordinary client roles remain denied.
         GRANT SELECT, INSERT ON team_creation_requests TO service_role;

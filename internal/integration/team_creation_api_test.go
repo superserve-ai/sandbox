@@ -25,7 +25,7 @@ import (
 
 // Apply only production migrations, without promotiontest's profile trigger or
 // any preseeded Auth evidence. Fresh actors must work through the signed API.
-func teamCreationDatabase(t *testing.T) *pgxpool.Pool {
+func teamCreationDatabase(t *testing.T, beforeMigrations ...func(*pgxpool.Pool)) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
 	name := "team_creation_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
@@ -44,6 +44,9 @@ func teamCreationDatabase(t *testing.T) *pgxpool.Pool {
 			t.Errorf("drop isolated database: %v", err)
 		}
 	})
+	for _, setup := range beforeMigrations {
+		setup(pool)
+	}
 	if err := applyMigrations(ctx, pool); err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +206,10 @@ func TestIntegration_TeamCreationRequestPrivileges(t *testing.T) {
 			END IF;
 		END LOOP;
 	END $$`)
-	pool := teamCreationDatabase(t)
+	pool := teamCreationDatabase(t, func(pool *pgxpool.Pool) {
+		// Defaults are database-local and must precede table creation.
+		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO anon,authenticated,service_role`)
+	})
 	actor, teamID, requestID := uuid.New(), uuid.New(), uuid.NewString()
 	rolloutExec(t, pool, `INSERT INTO team(id,name,home_region) VALUES($1,'Role test team','use')`, teamID)
 	for _, role := range []string{"service_role", "anon", "authenticated"} {
