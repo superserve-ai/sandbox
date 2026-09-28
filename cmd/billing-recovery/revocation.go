@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/superserve-ai/sandbox/internal/billing"
@@ -28,6 +29,31 @@ func loadRevocationAccounts(ctx context.Context, pool *pgxpool.Pool, target, aft
                    OR e.payload->'data'->'object'->>'cancel_at_period_end' = 'true'
                    OR lower(e.payload->'data'->'object'->>'status') = 'canceled')
         ),
+        EXISTS (
+            SELECT 1 FROM stripe_webhook_event e
+            WHERE e.event_type IN ('customer.subscription.updated', 'customer.subscription.deleted')
+              AND e.payload->'data'->'object'->>'customer' = a.stripe_customer_id
+              AND (e.event_type = 'customer.subscription.deleted'
+                   OR e.payload->'data'->'object'->>'cancel_at_period_end' = 'true'
+                   OR lower(e.payload->'data'->'object'->>'status') = 'canceled')
+              AND (
+                   e.payload->'data'->'object'->>'id' = a.stripe_subscription_id
+                   OR (a.stripe_activation_credit_reservation_event_id IS NOT NULL AND EXISTS (
+                       SELECT 1 FROM stripe_webhook_event activation
+                       WHERE activation.event_id = a.stripe_activation_credit_reservation_event_id
+                         AND activation.payload->'data'->'object'->>'customer' = a.stripe_customer_id
+                         AND activation.payload->'data'->'object'->>'id' = e.payload->'data'->'object'->>'id'
+                   ))
+              )
+        ),
+        a.stripe_activation_credit_reserved_at IS NOT NULL,
+        EXISTS (
+            SELECT 1 FROM user_promotion_entitlement u
+            WHERE u.user_id = a.stripe_activation_user_id
+              AND u.stripe_redemption_reserved_team_id = a.team_id
+              AND u.stripe_redemption_attempted_at IS NOT NULL
+        ),
+        a.stripe_activation_user_id, a.stripe_activation_credit_reservation_event_id,
         (r.team_id IS NOT NULL AND r.completed_at IS NULL), (r.completed_at IS NOT NULL)
         FROM team_billing_account a LEFT JOIN stripe_activation_credit_revocation r USING (team_id)
         WHERE ($1::uuid IS NULL OR a.team_id = $1)
@@ -41,7 +67,7 @@ func loadRevocationAccounts(ctx context.Context, pool *pgxpool.Pool, target, aft
 	var accounts []billingAccount
 	for rows.Next() {
 		var a billingAccount
-		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.GrantID, &a.CancelAtPeriodEnd, &a.HistoricalCancellation, &a.RevocationPending, &a.RevocationComplete); err != nil {
+		if err := rows.Scan(&a.TeamID, &a.CustomerID, &a.SubscriptionID, &a.Status, &a.GrantID, &a.CancelAtPeriodEnd, &a.HistoricalCancellation, &a.HistoricalCancellationOwned, &a.ActivationReserved, &a.ActivationAttempted, &a.ActivationUserID, &a.ActivationReservationEventID, &a.RevocationPending, &a.RevocationComplete); err != nil {
 			return nil, err
 		}
 		accounts = append(accounts, a)
@@ -69,7 +95,10 @@ func auditRevocation(ctx context.Context, pool *pgxpool.Pool, stripe stripeClien
 	if strings.TrimSpace(deref(account.CustomerID)) == "" {
 		return unresolved(errors.New("Stripe customer identity missing"))
 	}
-	canceled := account.RevocationPending || account.CancelAtPeriodEnd || account.HistoricalCancellation || strings.EqualFold(deref(account.Status), "canceled")
+	if account.HistoricalCancellation && !account.HistoricalCancellationOwned && !account.RevocationPending && !account.CancelAtPeriodEnd {
+		return unresolved(errors.New("historical Stripe cancellation ownership is unresolved"))
+	}
+	canceled := account.RevocationPending || account.CancelAtPeriodEnd || strings.EqualFold(deref(account.Status), "canceled")
 	if !canceled {
 		if strings.TrimSpace(deref(account.SubscriptionID)) == "" {
 			return unresolved(errors.New("Stripe subscription identity missing"))
@@ -83,8 +112,25 @@ func auditRevocation(ctx context.Context, pool *pgxpool.Pool, stripe stripeClien
 		}
 		canceled = sub.CancelAtPeriodEnd || strings.EqualFold(sub.Status, "canceled")
 	}
+	if !canceled && account.HistoricalCancellation {
+		canceled = true
+	}
 	if !canceled {
 		out["outcome"], out["reason"] = "skipped", "no_cancellation_evidence"
+		return out
+	}
+	if account.ActivationReserved && !account.ActivationAttempted && strings.TrimSpace(deref(account.GrantID)) == "" {
+		if !account.ActivationUserID.Valid || account.ActivationReservationEventID == nil {
+			return unresolved(errors.New("unattempted Stripe activation reservation ownership is unresolved"))
+		}
+		if !apply {
+			out["outcome"], out["reason"] = "candidate", "unattempted_activation_reservation"
+			return out
+		}
+		if err := applyUnattemptedActivationRevocation(ctx, pool, account); err != nil {
+			return unresolved(err)
+		}
+		out["outcome"], out["reason"] = "reconciled", "unattempted_activation_reservation"
 		return out
 	}
 	grant, err := billing.FindStripeActivationGrant(ctx, stripe.request, account.TeamID, *account.CustomerID, deref(account.GrantID))
@@ -101,6 +147,66 @@ func auditRevocation(ctx context.Context, pool *pgxpool.Pool, stripe stripeClien
 	}
 	out["outcome"], out["reason"] = "reconciled", "activation_credit_revoked"
 	return out
+}
+
+func applyUnattemptedActivationRevocation(ctx context.Context, pool *pgxpool.Pool, account billingAccount) error {
+	if account.CustomerID == nil || !account.ActivationUserID.Valid || account.ActivationReservationEventID == nil {
+		return errors.New("unattempted Stripe activation reservation ownership is unresolved")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	q := db.New(conn)
+	token := uuid.New()
+	if _, err := q.ClaimStripeWebhookProcessingLease(ctx, db.ClaimStripeWebhookProcessingLeaseParams{CustomerID: *account.CustomerID, Token: token}); err != nil {
+		return err
+	}
+	defer func() {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer releaseCancel()
+		_ = q.ReleaseStripeWebhookProcessingLease(releaseCtx, db.ReleaseStripeWebhookProcessingLeaseParams{CustomerID: *account.CustomerID, Token: token})
+	}()
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	tq := q.WithTx(tx)
+	if _, err := tq.LockStripeWebhookProcessingLease(ctx, db.LockStripeWebhookProcessingLeaseParams{CustomerID: *account.CustomerID, Token: token}); err != nil {
+		return err
+	}
+	current, err := tq.LockTeamBillingAccount(ctx, account.TeamID)
+	if err != nil {
+		return err
+	}
+	if deref(current.StripeCustomerID) != *account.CustomerID || current.StripeActivationCreditGrantID != nil || !current.StripeActivationCreditReservedAt.Valid ||
+		!current.StripeActivationUserID.Valid || uuid.UUID(current.StripeActivationUserID.Bytes) != uuid.UUID(account.ActivationUserID.Bytes) ||
+		deref(current.StripeActivationCreditReservationEventID) != *account.ActivationReservationEventID {
+		return errors.New("activation reservation changed; rerun the audit")
+	}
+	attempted, err := tq.StripePromotionWasAttempted(ctx, db.StripePromotionWasAttemptedParams{TeamID: pgtype.UUID{Bytes: account.TeamID, Valid: true}, UserID: uuid.UUID(current.StripeActivationUserID.Bytes)})
+	if err != nil {
+		return err
+	}
+	if attempted {
+		return errors.New("activation reservation has a Stripe attempt; use grant reconciliation")
+	}
+	if err := tq.RequestStripeActivationCreditRevocation(ctx, account.TeamID); err != nil {
+		return err
+	}
+	if err := tq.ReleaseStripePromotionForEvent(ctx, db.ReleaseStripePromotionForEventParams{TeamID: account.TeamID, UserID: uuid.UUID(current.StripeActivationUserID.Bytes), EventID: *account.ActivationReservationEventID}); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE stripe_activation_credit_revocation
+SET completed_at = COALESCE(completed_at, now())
+WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, account.TeamID, *account.CustomerID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func applyActivationRevocation(ctx context.Context, pool *pgxpool.Pool, stripe stripeClient, account billingAccount, grantID string) error {

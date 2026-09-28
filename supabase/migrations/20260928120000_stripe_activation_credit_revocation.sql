@@ -3,8 +3,9 @@ CREATE TABLE stripe_activation_credit_revocation (
     stripe_customer_id text NOT NULL,
     requested_at timestamptz NOT NULL DEFAULT now(),
     completed_at timestamptz,
-    stripe_grant_id text,
-    CHECK (completed_at IS NULL OR stripe_grant_id IS NOT NULL)
+    -- A cancellation can reconcile a reservation that never reached Stripe;
+    -- such a durable no-grant completion still blocks redemption retries.
+    stripe_grant_id text
 );
 ALTER TABLE stripe_activation_credit_revocation ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON stripe_activation_credit_revocation FROM PUBLIC;

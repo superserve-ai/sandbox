@@ -18,24 +18,30 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type billingAccount struct {
-	TeamID                 uuid.UUID
-	CustomerID             *string
-	SubscriptionID         *string
-	Status                 *string
-	EventAt                *time.Time
-	GrantID                *string
-	TrialEndedAt           *time.Time
-	CheckoutAt             *time.Time
-	CheckoutSessionID      *string
-	UserPromotion          bool
-	CancelAtPeriodEnd      bool
-	HistoricalCancellation bool
-	RevocationPending      bool
-	RevocationComplete     bool
+	TeamID                       uuid.UUID
+	CustomerID                   *string
+	SubscriptionID               *string
+	Status                       *string
+	EventAt                      *time.Time
+	GrantID                      *string
+	TrialEndedAt                 *time.Time
+	CheckoutAt                   *time.Time
+	CheckoutSessionID            *string
+	UserPromotion                bool
+	CancelAtPeriodEnd            bool
+	HistoricalCancellation       bool
+	RevocationPending            bool
+	RevocationComplete           bool
+	HistoricalCancellationOwned  bool
+	ActivationReserved           bool
+	ActivationAttempted          bool
+	ActivationUserID             pgtype.UUID
+	ActivationReservationEventID *string
 }
 
 type stripeSubscription struct {

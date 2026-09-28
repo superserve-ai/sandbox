@@ -26,7 +26,7 @@ func activationRevocationGrant(teamID uuid.UUID) billing.StripeActivationGrant {
 }
 
 func TestStripeActivationRevocationTransport(t *testing.T) {
-	for _, name := range []string{"usable", "consumed", "expired", "voided", "reserved", "transient", "ambiguous", "partial", "missing_balance", "wrong_customer", "wrong_amount", "wrong_category", "wrong_currency", "wrong_scope", "conflicting_identity", "wrong_id"} {
+	for _, name := range []string{"usable", "consumed", "expired", "voided", "reserved", "transient", "ambiguous", "partial", "reinstated", "missing_balance", "wrong_customer", "wrong_amount", "wrong_category", "wrong_currency", "wrong_scope", "conflicting_identity", "wrong_id"} {
 		t.Run(name, func(t *testing.T) {
 			teamID := uuid.New()
 			grant := activationRevocationGrant(teamID)
@@ -39,6 +39,8 @@ func TestStripeActivationRevocationTransport(t *testing.T) {
 				available = 0
 			case "partial":
 				available, ledger = 5000, 5000
+			case "reinstated":
+				available, ledger = 9500, 9500
 			case "expired":
 				grant.ExpiresAt = &stamp
 			case "voided":
@@ -77,7 +79,7 @@ func TestStripeActivationRevocationTransport(t *testing.T) {
 						_, _ = w.Write([]byte(`{"customer":"cus_example","balances":[]}`))
 						return
 					}
-					if name == "partial" && grant.ExpiresAt != nil {
+					if grant.ExpiresAt != nil {
 						available, ledger = 0, 0
 					}
 					_ = json.NewEncoder(w).Encode(map[string]any{"customer": "cus_example", "balances": []any{map[string]any{
@@ -93,7 +95,7 @@ func TestStripeActivationRevocationTransport(t *testing.T) {
 						http.Error(w, "temporary failure", 503)
 						return
 					}
-					if name == "partial" {
+					if name == "partial" || name == "consumed" || name == "reinstated" {
 						http.Error(w, "credit grant has been applied to an invoice", 400)
 						return
 					}
@@ -105,7 +107,7 @@ func TestStripeActivationRevocationTransport(t *testing.T) {
 					_ = json.NewEncoder(w).Encode(grant)
 				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/expire"):
 					expires++
-					if name != "partial" {
+					if name != "partial" && name != "consumed" && name != "reinstated" {
 						t.Errorf("unexpected expire request for %s", name)
 					}
 					if r.URL.EscapedPath() != "/v1/billing/credit_grants/cred%2Fgrant/expire" || !strings.HasPrefix(r.Header.Get("Idempotency-Key"), "stripe-activation-expire-") {
@@ -130,14 +132,14 @@ func TestStripeActivationRevocationTransport(t *testing.T) {
 			}
 			wantVoids := 0
 			switch name {
-			case "usable", "reserved", "transient", "ambiguous":
+			case "usable", "reserved", "transient", "ambiguous", "reinstated":
 				wantVoids = 1
 			}
 			if voids != wantVoids {
 				t.Fatalf("voids=%d want=%d", voids, wantVoids)
 			}
 			wantExpires := 0
-			if name == "partial" {
+			if name == "partial" || name == "consumed" || name == "reinstated" {
 				wantExpires = 1
 			}
 			if expires != wantExpires {

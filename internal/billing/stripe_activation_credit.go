@@ -112,11 +112,7 @@ func stripeActivationGrantReconciled(ctx context.Context, request StripeCreditRe
 	if grant.VoidedAt != nil && *grant.VoidedAt > 0 || grant.ExpiresAt != nil && *grant.ExpiresAt <= time.Now().Unix() {
 		return true, nil
 	}
-	available, ledger, err := stripeActivationGrantBalance(ctx, request, grant)
-	if err != nil {
-		return false, err
-	}
-	return available == 0 && ledger == 0, nil
+	return false, nil
 }
 
 func stripeActivationGrantBalance(ctx context.Context, request StripeCreditRequest, grant StripeActivationGrant) (available, ledger int64, err error) {
@@ -169,31 +165,8 @@ func RevokeStripeActivationGrant(ctx context.Context, request StripeCreditReques
 	if err != nil {
 		return "", err
 	}
-	if ledger > 0 && ledger < grant.Amount.Monetary.Value {
-		var expired StripeActivationGrant
-		err = request(ctx, http.MethodPost, "/v1/billing/credit_grants/"+url.PathEscape(grant.ID)+"/expire", url.Values{}, &expired, "stripe-activation-expire-"+uuid.NewString())
-		if err == nil {
-			if verifyErr := expired.verify(teamID, customerID, grant.ID); verifyErr != nil {
-				return "", verifyErr
-			}
-			if expired.ExpiresAt == nil || *expired.ExpiresAt <= 0 {
-				return "", errors.New("Stripe did not confirm activation grant expiration")
-			}
-			available, ledger, checkErr := stripeActivationGrantBalance(ctx, request, expired)
-			if checkErr != nil {
-				return "", checkErr
-			} else if available != 0 || ledger != 0 {
-				return "", errors.New("Stripe activation grant retains a spendable balance after expiration")
-			}
-			return grant.ID, nil
-		}
-		current, readErr := FindStripeActivationGrant(ctx, request, teamID, customerID, grant.ID)
-		if readErr == nil {
-			if done, checkErr := stripeActivationGrantReconciled(ctx, request, current); checkErr == nil && done {
-				return grant.ID, nil
-			}
-		}
-		return "", fmt.Errorf("expire Stripe activation grant: %w", err)
+	if ledger < grant.Amount.Monetary.Value {
+		return expireStripeActivationGrant(ctx, request, teamID, customerID, grant)
 	}
 	var voided StripeActivationGrant
 	// Stripe caches failed idempotent responses too. A fresh attempt key lets a
@@ -215,6 +188,43 @@ func RevokeStripeActivationGrant(ctx context.Context, request StripeCreditReques
 		if done, checkErr := stripeActivationGrantReconciled(ctx, request, current); checkErr == nil && done {
 			return grant.ID, nil
 		}
+		// A grant that was applied to an invoice cannot be voided. Stripe may
+		// restore its full balance when that invoice is voided; expiration is
+		// the terminal operation that prevents the restored credit from being
+		// spendable again.
+		if strings.Contains(strings.ToLower(err.Error()), "invoice") || strings.Contains(strings.ToLower(err.Error()), "applied") {
+			if expiredID, expireErr := expireStripeActivationGrant(ctx, request, teamID, customerID, current); expireErr == nil {
+				return expiredID, nil
+			}
+		}
 	}
 	return "", fmt.Errorf("void Stripe activation grant: %w", err)
+}
+
+func expireStripeActivationGrant(ctx context.Context, request StripeCreditRequest, teamID uuid.UUID, customerID string, grant StripeActivationGrant) (string, error) {
+	var expired StripeActivationGrant
+	err := request(ctx, http.MethodPost, "/v1/billing/credit_grants/"+url.PathEscape(grant.ID)+"/expire", url.Values{}, &expired, "stripe-activation-expire-"+uuid.NewString())
+	if err == nil {
+		if verifyErr := expired.verify(teamID, customerID, grant.ID); verifyErr != nil {
+			return "", verifyErr
+		}
+		if expired.ExpiresAt == nil || *expired.ExpiresAt <= 0 {
+			return "", errors.New("Stripe did not confirm activation grant expiration")
+		}
+		available, ledger, checkErr := stripeActivationGrantBalance(ctx, request, expired)
+		if checkErr != nil {
+			return "", checkErr
+		}
+		if available != 0 || ledger != 0 {
+			return "", errors.New("Stripe activation grant retains a spendable balance after expiration")
+		}
+		return grant.ID, nil
+	}
+	current, readErr := FindStripeActivationGrant(ctx, request, teamID, customerID, grant.ID)
+	if readErr == nil {
+		if done, checkErr := stripeActivationGrantReconciled(ctx, request, current); checkErr == nil && done {
+			return grant.ID, nil
+		}
+	}
+	return "", fmt.Errorf("expire Stripe activation grant: %w", err)
 }

@@ -99,7 +99,11 @@ func TestIntegration_ExpiredAmbiguousStripePromotionRetainsFence(t *testing.T) {
 				WHERE u.user_id=$2`, teamID, userID, eventID, attemptedAt, identityKey, evidenceVersion).Scan(&retained); err != nil || !retained {
 				t.Fatalf("expired attempt lost durable identity, event or consumption fence: retained=%t err=%v", retained, err)
 			}
-			if state := canonicalStripeReserve(t, teamID, userID, "evt_newer_"+teamID.String()); state != "blocked" {
+			wantState := "blocked"
+			if stale {
+				wantState = "ineligible"
+			}
+			if state := canonicalStripeReserve(t, teamID, userID, "evt_newer_"+teamID.String()); state != wantState {
 				t.Fatalf("later event took ownership of expired ambiguous attempt: %s", state)
 			}
 			if _, err := testPool.Exec(ctx, `INSERT INTO promotion_identity_current(user_id,evidence_version) VALUES($1,$2::uuid)`, userID, evidenceVersion); err != nil {

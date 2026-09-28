@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/superserve-ai/sandbox/internal/api"
 	"github.com/superserve-ai/sandbox/internal/config"
+	"github.com/superserve-ai/sandbox/internal/db"
 )
 
 type activationRevocationStripe struct {
@@ -92,7 +94,7 @@ func (s *activationRevocationStripe) serve(t *testing.T, w http.ResponseWriter, 
 }
 
 func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
-	for _, scenario := range []string{"scheduled", "terminal", "deleted", "stale", "previous_subscription", "same_second", "transient", "ambiguous", "consumed", "expired", "already_voided", "local_finalization_failure", "partial_reconciled"} {
+	for _, scenario := range []string{"scheduled", "terminal", "deleted", "stale", "previous_subscription", "unrelated_subscription", "same_second", "transient", "ambiguous", "consumed", "expired", "already_voided", "local_finalization_failure", "partial_reconciled"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.Background()
 			teamID, key, userID := seedTeamAndKeyWithRole(t, "team_owner")
@@ -127,7 +129,7 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 					t.Fatal(err)
 				}
 				event["data"].(map[string]any)["object"].(map[string]any)["cancel_at_period_end"] = scheduled
-				payload, err = json.Marshal(event)
+				payload, err := json.Marshal(event)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -189,6 +191,21 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 				t.Cleanup(removeFailure)
 			}
 			eventID := "evt_cancel_" + teamID.String()
+			if scenario == "unrelated_subscription" {
+				if w := send(eventID, eventType, "sub_unrelated_"+teamID.String(), status, scheduled, canceledAt); w.Code != 500 {
+					t.Fatalf("unrelated cancellation: %d %s", w.Code, w.Body.String())
+				}
+				if _, err := testQueries.GetStripeActivationCreditRevocation(ctx, customer); err == nil {
+					t.Fatal("unrelated cancellation recorded revocation intent")
+				}
+				stripe.mu.Lock()
+				voids := stripe.voids
+				stripe.mu.Unlock()
+				if voids != 0 {
+					t.Fatalf("unrelated cancellation issued %d voids", voids)
+				}
+				return
+			}
 			first := send(eventID, eventType, sub, status, scheduled, canceledAt)
 			if scenario == "transient" || scenario == "local_finalization_failure" {
 				if first.Code != 500 {
@@ -234,8 +251,16 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 			if w := send(eventID, eventType, sub, status, scheduled, canceledAt); w.Code != 200 {
 				t.Fatalf("duplicate: %d", w.Code)
 			}
-			if w := send("evt_cancel_distinct_"+teamID.String(), eventType, sub, status, scheduled, canceledAt); w.Code != 200 {
-				t.Fatalf("distinct duplicate: %d %s", w.Code, w.Body.String())
+			responses := make(chan *httptest.ResponseRecorder, 2)
+			for _, suffix := range []string{"a", "b"} {
+				go func(suffix string) {
+					responses <- send("evt_cancel_distinct_"+suffix+"_"+teamID.String(), eventType, sub, status, scheduled, canceledAt)
+				}(suffix)
+			}
+			for i := 0; i < 2; i++ {
+				if w := <-responses; w.Code != 200 {
+					t.Fatalf("distinct concurrent duplicate: %d %s", w.Code, w.Body.String())
+				}
 			}
 			if w := send("evt_reverse_"+teamID.String(), "customer.subscription.updated", sub, "active", false, at.Add(20*time.Second)); w.Code != 200 {
 				t.Fatalf("reversal: %d", w.Code)
@@ -278,8 +303,12 @@ func TestIntegration_StripeActivationCreditRevocation(t *testing.T) {
 			if scenario == "transient" {
 				wantVoids = 2
 			}
-			if scenario == "partial_reconciled" && expiresCount != 1 {
-				t.Fatalf("expires=%d want=1", expiresCount)
+			wantExpires := 0
+			if scenario == "partial_reconciled" || scenario == "consumed" {
+				wantExpires = 1
+			}
+			if expiresCount != wantExpires {
+				t.Fatalf("expires=%d want=%d", expiresCount, wantExpires)
 			}
 			if creates != 1 || voids != wantVoids {
 				t.Fatalf("creates=%d voids=%d want=1/%d", creates, voids, wantVoids)
@@ -342,8 +371,15 @@ func TestIntegration_BillingRecoveryRevokesHistoricalActivationCredit(t *testing
                     WHERE user_id=$1`, userID); err != nil {
 					t.Fatal(err)
 				}
-				if state := canonicalStripeReserve(t, teamID, userID, "evt_pending_recovery_"+teamID.String()); state != "acquired" {
+				eventID := "evt_pending_recovery_" + teamID.String()
+				if state := canonicalStripeReserve(t, teamID, userID, eventID); state != "acquired" {
 					t.Fatalf("pending reservation: %s", state)
+				}
+				// The remote grant exists, but its creation response was lost before finalization.
+				if _, err := testQueries.MarkStripePromotionAttempt(ctx, db.MarkStripePromotionAttemptParams{
+					TeamID: pgtype.UUID{Bytes: teamID, Valid: true}, UserID: userID, EventID: &eventID,
+				}); err != nil {
+					t.Fatalf("pending activation attempt: %v", err)
 				}
 			}
 			var userBefore string

@@ -2120,13 +2120,30 @@ func (h *Handlers) reconcileStripeActivationRevocation(ctx context.Context, conn
 	queries := db.New(conn)
 	var pending db.GetStripeActivationCreditRevocationRow
 	grantID := ""
+	noGrantReconciliation := false
 	if lease != nil {
 		var err error
 		pending, err = queries.GetStripeActivationCreditRevocation(ctx, lease.CustomerID)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
-		if err == nil && !pending.CompletedAt.Valid {
+		if err == nil && !pending.CompletedAt.Valid && pending.ActivationGrantID == nil && pending.StripeGrantID == nil {
+			account, accountErr := queries.GetTeamBillingAccount(ctx, pending.TeamID)
+			if accountErr != nil {
+				return accountErr
+			}
+			if !account.StripeActivationCreditReservedAt.Valid || !account.StripeActivationUserID.Valid || account.StripeActivationCreditReservationEventID == nil {
+				return errors.New("pending Stripe activation revocation has no grant or reservation witness")
+			}
+			attempted, attemptedErr := queries.StripePromotionWasAttempted(ctx, db.StripePromotionWasAttemptedParams{
+				TeamID: pgtype.UUID{Bytes: pending.TeamID, Valid: true}, UserID: uuid.UUID(account.StripeActivationUserID.Bytes),
+			})
+			if attemptedErr != nil {
+				return attemptedErr
+			}
+			noGrantReconciliation = !attempted
+		}
+		if err == nil && !pending.CompletedAt.Valid && !noGrantReconciliation {
 			revoker, ok := h.Stripe.(stripeActivationCreditRevoker)
 			if !ok {
 				return errors.New("Stripe activation credit revocation is not configured")
@@ -2168,6 +2185,24 @@ func (h *Handlers) reconcileStripeActivationRevocation(ctx context.Context, conn
 		if _, err := q.CompleteStripeActivationCreditRevocation(ctx, db.CompleteStripeActivationCreditRevocationParams{
 			TeamID: pending.TeamID, CustomerID: pending.StripeCustomerID, GrantID: stringPtr(grantID),
 		}); err != nil {
+			return err
+		}
+	} else if noGrantReconciliation {
+		account, err := q.LockTeamBillingAccount(ctx, pending.TeamID)
+		if err != nil {
+			return err
+		}
+		if !account.StripeActivationCreditReservedAt.Valid || !account.StripeActivationUserID.Valid || account.StripeActivationCreditReservationEventID == nil {
+			return errors.New("pending Stripe activation revocation reservation changed")
+		}
+		if err := q.ReleaseStripePromotionForEvent(ctx, db.ReleaseStripePromotionForEventParams{
+			TeamID: pending.TeamID, UserID: uuid.UUID(account.StripeActivationUserID.Bytes), EventID: *account.StripeActivationCreditReservationEventID,
+		}); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE stripe_activation_credit_revocation
+SET completed_at = COALESCE(completed_at, now())
+WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, pending.TeamID, pending.StripeCustomerID); err != nil {
 			return err
 		}
 	}
@@ -3057,16 +3092,24 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 			return nil
 		}
 		cancellation := obj.CancelAtPeriodEnd || strings.EqualFold(obj.Status, "canceled") || event.Type == "customer.subscription.deleted"
-		// A delayed cancellation of the original activation subscription still
-		// revokes its grant after checkout establishes a replacement. The pinned
-		// redemption event proves ownership without weakening projection guards.
-		if cancellation && !stripeSubscriptionMatchesCurrentAssociation(account, obj.ID) &&
-			account.StripeActivationCreditReservationEventID != nil && account.StripeActivationCreditGrantID != nil {
-			original, err := q.GetStripeWebhookEvent(ctx, *account.StripeActivationCreditReservationEventID)
-			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-				return err
+		revocationCompleted := false
+		if !cancellation {
+			revocation, revocationErr := q.GetStripeActivationCreditRevocation(ctx, obj.Customer)
+			if revocationErr != nil && !errors.Is(revocationErr, pgx.ErrNoRows) {
+				return revocationErr
 			}
-			if err == nil && strings.HasPrefix(original.EventType, "customer.subscription.") {
+			revocationCompleted = revocationErr == nil && revocation.CompletedAt.Valid
+		}
+		cancellationOwned := stripeSubscriptionMatchesCurrentAssociation(account, obj.ID)
+		if cancellation && !cancellationOwned && account.StripeActivationCreditReservationEventID != nil {
+			// A delayed cancellation of the original activation subscription still
+			// revokes its grant after checkout establishes a replacement. The pinned
+			// redemption event proves ownership without weakening projection guards.
+			original, lookupErr := q.GetStripeWebhookEvent(ctx, *account.StripeActivationCreditReservationEventID)
+			if lookupErr != nil && !errors.Is(lookupErr, pgx.ErrNoRows) {
+				return lookupErr
+			}
+			if lookupErr == nil && strings.HasPrefix(original.EventType, "customer.subscription.") {
 				var envelope stripeEventEnvelope
 				var activation stripeSubscriptionObject
 				if err := json.Unmarshal(original.Payload, &envelope); err != nil {
@@ -3075,24 +3118,58 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 				if err := json.Unmarshal(envelope.Data.Object, &activation); err != nil {
 					return err
 				}
-				if activation.ID == obj.ID && activation.Customer == obj.Customer {
-					if err := q.RequestStripeActivationCreditRevocation(ctx, account.TeamID); err != nil {
-						return err
-					}
-				}
+				cancellationOwned = activation.ID == obj.ID && activation.Customer == obj.Customer
 			}
-		} else if cancellation && !stripeSubscriptionMatchesCurrentAssociation(account, obj.ID) &&
+		}
+		if cancellation && !cancellationOwned &&
 			(account.StripeActivationCreditGrantID != nil || account.StripeActivationCreditGrantedAt.Valid) {
 			// Legacy activations may have no reservation event ID. Without a
 			// durable subscription-owner witness, do not mark this cancellation
 			// processed: recovery must resolve the historical ownership instead
-			// of silently dropping the revocation.
-			return errors.New("historical Stripe activation cancellation ownership is unresolved")
+			// of silently dropping the revocation. A completed recovery is already
+			// authoritative and lets a delayed delivery settle normally.
+			revocation, revocationErr := q.GetStripeActivationCreditRevocation(ctx, obj.Customer)
+			if revocationErr != nil && !errors.Is(revocationErr, pgx.ErrNoRows) {
+				return revocationErr
+			}
+			if revocationErr != nil || !revocation.CompletedAt.Valid {
+				return errors.New("historical Stripe activation cancellation ownership is unresolved")
+			}
 		}
-		if cancellation &&
+		if cancellation && cancellationOwned &&
 			(account.StripeActivationCreditGrantID != nil || account.StripeActivationCreditGrantedAt.Valid || account.StripeActivationCreditReservedAt.Valid) {
-			if err := q.RequestStripeActivationCreditRevocation(ctx, account.TeamID); err != nil {
-				return err
+			unattempted := false
+			if account.StripeActivationCreditReservedAt.Valid && !account.StripeActivationCreditGrantedAt.Valid && strings.TrimSpace(derefString(account.StripeActivationCreditGrantID)) == "" {
+				if !account.StripeActivationUserID.Valid || account.StripeActivationCreditReservationEventID == nil {
+					return errors.New("unattempted Stripe activation reservation ownership is unresolved")
+				}
+				attempted, attemptedErr := q.StripePromotionWasAttempted(ctx, db.StripePromotionWasAttemptedParams{
+					TeamID: pgtype.UUID{Bytes: account.TeamID, Valid: true}, UserID: uuid.UUID(account.StripeActivationUserID.Bytes),
+				})
+				if attemptedErr != nil {
+					return attemptedErr
+				}
+				if !attempted {
+					if err := q.RequestStripeActivationCreditRevocation(ctx, account.TeamID); err != nil {
+						return err
+					}
+					if err := q.ReleaseStripePromotionForEvent(ctx, db.ReleaseStripePromotionForEventParams{
+						TeamID: account.TeamID, UserID: uuid.UUID(account.StripeActivationUserID.Bytes), EventID: *account.StripeActivationCreditReservationEventID,
+					}); err != nil {
+						return err
+					}
+					if _, err := tx.Exec(ctx, `UPDATE stripe_activation_credit_revocation
+SET completed_at = COALESCE(completed_at, now())
+WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, account.TeamID, obj.Customer); err != nil {
+						return err
+					}
+					unattempted = true
+				}
+			}
+			if !unattempted {
+				if err := q.RequestStripeActivationCreditRevocation(ctx, account.TeamID); err != nil {
+					return err
+				}
 			}
 		}
 		// A lifecycle event can establish the subscription ID before checkout
@@ -3157,7 +3234,7 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 		promotionReserved := false
 		promotionReservationAttempted := false
 		var activationUser pgtype.UUID
-		if !cancellation && (strings.EqualFold(obj.Status, "active") || strings.EqualFold(obj.Status, "trialing")) {
+		if !cancellation && !revocationCompleted && (strings.EqualFold(obj.Status, "active") || strings.EqualFold(obj.Status, "trialing")) {
 			if actor := stripePromotionActorForSubscription(account, obj); actor != uuid.Nil {
 				activationUser = pgtype.UUID{Bytes: actor, Valid: true}
 			}
@@ -3224,6 +3301,12 @@ func (h *Handlers) processStripeWebhookEventWithPreReservation(ctx context.Conte
 		}
 		if strings.EqualFold(obj.Status, "active") || strings.EqualFold(obj.Status, "trialing") {
 			if cancellation {
+				return q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)})
+			}
+			if revocationCompleted {
+				if err := q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: account.TeamID, UserID: pgtype.UUID{}, StripeGrantID: ""}); err != nil {
+					return err
+				}
 				return q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)})
 			}
 			if derefString(account.StripeActivationCreditGrantID) == "" && !account.StripeActivationCreditGrantedAt.Valid {

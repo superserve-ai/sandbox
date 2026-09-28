@@ -166,7 +166,8 @@ BEGIN
     PERFORM pg_advisory_xact_lock(hashtext('stripe-promo-user:' || p_user_id::text)::bigint);
     IF EXISTS (SELECT 1 FROM user_promotion_entitlement WHERE user_id = p_user_id AND stripe_redemption_at IS NOT NULL)
        OR EXISTS (SELECT 1 FROM team_billing_account WHERE team_id = p_team_id
-           AND (stripe_activation_credit_grant_id IS NOT NULL OR stripe_activation_credit_granted_at IS NOT NULL)) THEN
+           AND (stripe_activation_credit_grant_id IS NOT NULL OR stripe_activation_credit_granted_at IS NOT NULL))
+       OR EXISTS (SELECT 1 FROM stripe_activation_credit_revocation WHERE team_id = p_team_id) THEN
         RETURN false;
     END IF;
     IF v_enabled THEN
@@ -186,6 +187,7 @@ BEGIN
     RETURN EXISTS (
         SELECT 1 FROM team_billing_account a
         WHERE a.team_id = p_team_id
+          AND NOT EXISTS (SELECT 1 FROM stripe_activation_credit_revocation r WHERE r.team_id = a.team_id)
           AND NOT EXISTS (SELECT 1 FROM stripe_promotion_migration_fence WHERE team_id=p_team_id)
           AND a.stripe_activation_credit_grant_id IS NULL
           AND a.stripe_activation_credit_granted_at IS NULL
@@ -221,6 +223,11 @@ BEGIN
     END IF;
     SELECT * INTO v_account FROM team_billing_account WHERE team_id = p_team_id;
     IF NOT FOUND THEN RETURN 'blocked'; END IF;
+    -- A cancellation marker is durable even when grant creation never began;
+    -- once cancellation wins, later subscription retries cannot redeem again.
+    IF EXISTS (SELECT 1 FROM stripe_activation_credit_revocation WHERE team_id = p_team_id) THEN
+        RETURN 'ineligible';
+    END IF;
     v_checkout_account := v_account;
     IF v_account.stripe_activation_credit_grant_id IS NOT NULL
        OR v_account.stripe_activation_credit_granted_at IS NOT NULL THEN
@@ -287,6 +294,9 @@ BEGIN
     END IF;
     SELECT * INTO v_account FROM team_billing_account WHERE team_id = p_team_id FOR UPDATE;
     IF NOT FOUND THEN RETURN 'blocked'; END IF;
+    IF EXISTS (SELECT 1 FROM stripe_activation_credit_revocation WHERE team_id = p_team_id) THEN
+        RETURN 'ineligible';
+    END IF;
     IF (
         v_account.stripe_checkout_actor_id IS DISTINCT FROM v_checkout_account.stripe_checkout_actor_id
         OR v_account.stripe_checkout_identity_evidence_version IS DISTINCT FROM v_checkout_account.stripe_checkout_identity_evidence_version
