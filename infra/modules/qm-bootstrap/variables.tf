@@ -4,6 +4,14 @@ variable "project_id" {
 variable "paired_project_id" {
   type = string
 }
+variable "paired_project_number" {
+  description = "Resolved numeric project number for the paired Superserve project; supplied from the reviewed rollout manifest so planning does not require a live lookup."
+  type        = string
+  validation {
+    condition     = can(regex("^[0-9]+$", var.paired_project_number))
+    error_message = "The paired project number must contain only decimal digits."
+  }
+}
 variable "folder_id" {
   type = string
 }

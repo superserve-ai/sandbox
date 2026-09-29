@@ -42,6 +42,7 @@ module "foundation" {
   source                  = "../../modules/qm-bootstrap"
   project_id              = local.environment.project_id
   paired_project_id       = local.environment.paired_project_id
+  paired_project_number   = var.paired_project_number
   regions                 = toset(local.environment.regions)
   folder_id               = var.folder_id
   billing_account         = var.billing_account

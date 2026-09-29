@@ -30,8 +30,11 @@ the release operator transfers its reviewed, non-secret `contract` output.
 | development | `rayai-dev` | `rayai-qm-dev` | `us-central1`: `10.80.0.0/20` |
 | production | `rayai-prod` | `rayai-qm-prod` | `us-central1`: `10.81.0.0/20`; `us-west2`: `10.81.16.0/20`; `us-east4`: `10.81.32.0/20` |
 
-Project numbers are allocated by Google and appear in the bootstrap output.
-Verify project-ID availability, matching deployment regions, quota, and CIDR
+The QM project number is allocated by Google and appears in the bootstrap
+output. The paired Superserve project number is supplied from the reviewed
+rollout preparation manifest and is published alongside its project ID; this
+keeps planning backend-independent and avoids an implicit live lookup. Verify
+project-ID/number pairing, matching deployment regions, quota, and CIDR
 conflicts before applying. Region additions require review of both root maps,
 protected services, cell infrastructure, and the address budget. There is one
 project per environment and one central control database, whose owner chooses
@@ -53,7 +56,7 @@ unsupported subnetwork-name IAM Conditions.
 
 | Identity | Permissions | Resource scope | Use / owner |
 | --- | --- | --- | --- |
-| Environment bootstrap identity in an existing protected administration project | Temporary Project Creator / Billing Account User; initial project Owner supplied by creation; temporary registry IAM administration; state object administration | Selected folder, billing account, newly created QM project, one paired-project image repository, its own bootstrap bucket | Authorized bootstrap only; manual preparation and cleanup below |
+| Environment bootstrap identity in an existing protected administration project | Temporary Project Creator / Billing Account User; initial project Owner supplied by creation; temporary paired-project Service Usage Consumer and registry IAM administration; state object administration | Selected folder, billing account, newly created QM project, paired project quota usage and one image repository, its own bootstrap bucket | Authorized bootstrap only; manual preparation and cleanup below |
 | `qm-infra` | `qm_network`: network/subnet/firewall/router CRUD and operation reads; `storage.objectAdmin` | QM environment project network resources; its routine state bucket only | Routine Terraform network root |
 | `qm-api-deployer` | `qm_deploy_service`: service get/update; operation/project reads and service usage; `iam.serviceAccountUser`; image reader | Named `qm-api` service in supported regions; `qm-api` identity only; one image repository | Routine API deployment; service binding exists only after platform shells exist |
 | `qm-provisioner-deployer` | Same deployment permissions | Named `qm-provisioner` service; provisioner identity only; one image repository | Privileged provisioner deployment, separate protected GitHub environment |

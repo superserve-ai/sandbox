@@ -1,11 +1,12 @@
 output "contract" {
   value = {
-    version           = 1
-    project_id        = google_project.qm.project_id
-    project_number    = google_project.qm.number
-    paired_project_id = var.paired_project_id
-    regions           = var.regions
-    identities        = { for name, account in google_service_account.platform : name => account.email }
+    version               = 1
+    project_id            = google_project.qm.project_id
+    project_number        = google_project.qm.number
+    paired_project_id     = var.paired_project_id
+    paired_project_number = var.paired_project_number
+    regions               = var.regions
+    identities            = { for name, account in google_service_account.platform : name => account.email }
     protected_tag = {
       key   = google_tags_tag_key.protected.id
       value = google_tags_tag_value.protected.id

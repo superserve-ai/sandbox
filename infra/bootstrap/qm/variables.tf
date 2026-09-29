@@ -5,6 +5,14 @@ variable "environment" {
     error_message = "Environment must be development or production."
   }
 }
+variable "paired_project_number" {
+  description = "Resolved numeric project number for the paired Superserve project, from the reviewed rollout manifest."
+  type        = string
+  validation {
+    condition     = can(regex("^[0-9]+$", var.paired_project_number))
+    error_message = "The paired project number must contain only decimal digits."
+  }
+}
 variable "folder_id" {
   type = string
 }

@@ -2,11 +2,12 @@ mock_provider "google" {}
 mock_provider "google-beta" {}
 
 variables {
-  project_id        = "example-qm-dev"
-  paired_project_id = "example-dev"
-  folder_id         = "123456789012"
-  billing_account   = "000000-000000-000000"
-  regions           = ["us-central1", "us-west2"]
+  project_id            = "example-qm-dev"
+  paired_project_id     = "example-dev"
+  paired_project_number = "123456789012"
+  folder_id             = "123456789012"
+  billing_account       = "000000-000000-000000"
+  regions               = ["us-central1", "us-west2"]
   github = {
     owner_id      = "12345"
     repository_id = "67890"

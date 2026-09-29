@@ -29,6 +29,7 @@ manifest with the release evidence:
 : "${QM_BILLING_ACCOUNT:?billing account ID}"
 : "${QM_BOOTSTRAP_CALLER:?authorized user:email or serviceAccount:email principal}"
 : "${QM_GRANT_EXPIRY:?RFC3339 UTC end of the authorized bootstrap window}"
+: "${QM_PAIRED_PROJECT_NUMBER:?resolved numeric project number for the paired project}"
 : "${QM_REGISTRY_LOCATION:?existing image repository region}"
 : "${QM_REGISTRY_REPOSITORY:?existing image repository name}"
 case "$QM_ENV" in
@@ -39,7 +40,7 @@ esac
 QM_BOOTSTRAP_SA="${QM_BOOTSTRAP_ID}@${QM_ADMIN_PROJECT}.iam.gserviceaccount.com"
 QM_BOOTSTRAP_BUCKET="${QM_ADMIN_PROJECT}-${QM_BOOTSTRAP_ID}-state"
 QM_TEMP_CONDITION="expression=request.time < timestamp('${QM_GRANT_EXPIRY}'),title=qm-bootstrap-window"
-export QM_ENV QM_PROJECT QM_PAIRED_PROJECT QM_BOOTSTRAP_SA QM_BOOTSTRAP_BUCKET
+export QM_ENV QM_PROJECT QM_PAIRED_PROJECT QM_PAIRED_PROJECT_NUMBER QM_BOOTSTRAP_SA QM_BOOTSTRAP_BUCKET
 ```
 
 Verify the folder's parent, billing account status, existing project IDs, and
@@ -50,6 +51,7 @@ gcloud resource-manager folders describe "$QM_FOLDER_ID"
 gcloud billing accounts describe "$QM_BILLING_ACCOUNT"
 gcloud projects describe "$QM_ADMIN_PROJECT"
 gcloud projects describe "$QM_PAIRED_PROJECT"
+test "$(gcloud projects describe "$QM_PAIRED_PROJECT" --format='value(projectNumber)')" = "$QM_PAIRED_PROJECT_NUMBER"
 gcloud projects list --filter="projectId=${QM_PROJECT}" --format='table(projectId,projectNumber,lifecycleState)'
 gcloud artifacts repositories describe "$QM_REGISTRY_REPOSITORY" \
   --project="$QM_PAIRED_PROJECT" --location="$QM_REGISTRY_LOCATION"
@@ -91,6 +93,13 @@ gcloud resource-manager folders add-iam-policy-binding "$QM_FOLDER_ID" \
   --condition="$QM_TEMP_CONDITION"
 gcloud billing accounts add-iam-policy-binding "$QM_BILLING_ACCOUNT" \
   --member="serviceAccount:${QM_BOOTSTRAP_SA}" --role=roles/billing.user
+gcloud projects add-iam-policy-binding "$QM_PAIRED_PROJECT" \
+  --member="serviceAccount:${QM_BOOTSTRAP_SA}" \
+  --role=roles/serviceusage.serviceUsageConsumer --condition="$QM_TEMP_CONDITION"
+gcloud projects get-iam-policy "$QM_PAIRED_PROJECT" \
+  --flatten='bindings[].members' \
+  --filter="bindings.members=serviceAccount:${QM_BOOTSTRAP_SA} AND bindings.role=roles/serviceusage.serviceUsageConsumer" \
+  --format='value(bindings.role,bindings.members,bindings.condition.expression)'
 gcloud artifacts repositories add-iam-policy-binding "$QM_REGISTRY_REPOSITORY" \
   --project="$QM_PAIRED_PROJECT" --location="$QM_REGISTRY_LOCATION" \
   --member="serviceAccount:${QM_BOOTSTRAP_SA}" --role=roles/artifactregistry.admin \
@@ -101,6 +110,13 @@ The [billing-account CLI](https://cloud.google.com/sdk/gcloud/reference/billing/
 does not accept a condition flag. Its grant requires explicit removal on every
 exit path; record an administrator cleanup owner and deadline before granting it.
 Do not rely on the other grants' expiry to remove Billing Account User.
+
+The bootstrap providers use the paired project as their provider and quota
+project. Grant `roles/serviceusage.serviceUsageConsumer` only to the exact
+bootstrap identity for the expiring window above. Verify the binding before
+initialization and remove it during cleanup; without it, provider calls can
+fail before the new QM project exists. This is a quota-consumer grant, not
+paired-project IAM administration.
 
 The repository-scoped temporary administrator role is for adding image-reader
 bindings; it includes image mutation and must expire/be removed. The bootstrap
@@ -118,7 +134,7 @@ executor without granting routine jobs bootstrap impersonation.
    exact bootstrap identity using those source credentials. Do not supply an
    already impersonated bootstrap token: it would require a second, self-
    impersonation grant. No long-lived key file. Supply reviewed
-   `environment`, `bootstrap_service_account`, `bootstrap_state_bucket`,
+   `environment`, `paired_project_number`, `bootstrap_service_account`, `bootstrap_state_bucket`,
    `folder_id`, `billing_account`, numeric GitHub IDs/repository
    slug, and `registry` object to `infra/bootstrap/qm`. Initialize GCS using
    `-backend-config="bucket=$QM_BOOTSTRAP_BUCKET"` and
@@ -179,6 +195,9 @@ gcloud resource-manager folders remove-iam-policy-binding "$QM_FOLDER_ID" \
   --condition="$QM_TEMP_CONDITION"
 gcloud billing accounts remove-iam-policy-binding "$QM_BILLING_ACCOUNT" \
   --member="serviceAccount:${QM_BOOTSTRAP_SA}" --role=roles/billing.user
+gcloud projects remove-iam-policy-binding "$QM_PAIRED_PROJECT" \
+  --member="serviceAccount:${QM_BOOTSTRAP_SA}" \
+  --role=roles/serviceusage.serviceUsageConsumer --condition="$QM_TEMP_CONDITION"
 gcloud artifacts repositories remove-iam-policy-binding "$QM_REGISTRY_REPOSITORY" \
   --project="$QM_PAIRED_PROJECT" --location="$QM_REGISTRY_LOCATION" \
   --member="serviceAccount:${QM_BOOTSTRAP_SA}" --role=roles/artifactregistry.admin \
@@ -192,6 +211,7 @@ gcloud iam service-accounts remove-iam-policy-binding "$QM_BOOTSTRAP_SA" \
 gcloud projects get-iam-policy "$QM_PROJECT" --format=json
 gcloud resource-manager folders get-iam-policy "$QM_FOLDER_ID" --format=json
 gcloud billing accounts get-iam-policy "$QM_BILLING_ACCOUNT" --format=json
+gcloud projects get-iam-policy "$QM_PAIRED_PROJECT" --format=json
 gcloud iam service-accounts get-iam-policy "$QM_BOOTSTRAP_SA" --project="$QM_ADMIN_PROJECT" --format=json
 gcloud storage buckets get-iam-policy "gs://${QM_BOOTSTRAP_BUCKET}" --format=json
 gcloud artifacts repositories get-iam-policy "$QM_REGISTRY_REPOSITORY" \
@@ -229,9 +249,39 @@ are protected by Terraform lifecycle rules. An intentional teardown requires a
 separate reviewed change, backups, dependency inspection, and an outage plan.
 Rollback foundation activation by disabling provisioning and restoring the last
 reviewed policy, not by destroying projects or tenant resources. Maintain control
-DB denial throughout rollback. Removing a cell allow disconnects that cell's
-runtimes immediately; restore its last authoritative endpoint/tag tuple before
-resuming workers. Do not independently reassign a tenant to make connectivity work.
+DB denial throughout rollback. Removing a cell allow blocks new connections, but
+does not terminate PostgreSQL sessions that were established before the firewall
+change. Before relying on that removal to end access, stop and drain the affected
+tenant runtimes, terminate their existing database sessions with the authorized
+cell administrator, and verify both conditions. Restore the last authoritative
+endpoint/tag tuple before resuming workers. Do not independently reassign a tenant
+to make connectivity work.
+
+For a recovery that requires access to cease, the release operator must record
+the affected tenant service and database identifiers, then perform the runtime
+shutdown/drain using the owning deployment procedure. The cell administrator
+must terminate only the affected tenant's sessions, for example:
+
+```bash
+psql "$CELL_ADMIN_DSN" -v ON_ERROR_STOP=1 \
+  -v tenant_db="$TENANT_DATABASE" -v tenant_user="$TENANT_DB_USER" <<'SQL'
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = :'tenant_db'
+  AND usename = :'tenant_user'
+  AND pid <> pg_backend_pid();
+SQL
+psql "$CELL_ADMIN_DSN" -v tenant_db="$TENANT_DATABASE" -v tenant_user="$TENANT_DB_USER" -Atqc \
+  "SELECT count(*) FROM pg_stat_activity WHERE datname = :'tenant_db' AND usename = :'tenant_user'" \
+  | grep -Fx 0
+```
+
+Verify that the runtime has no serving instances or new connection attempts,
+that the session count remains zero after the firewall change, and that a new
+connection from the tenant identity is denied. Preserve the command output and
+timestamps with the rollback evidence, excluding credentials. If the runtime
+cannot be shut down or the session count cannot be verified, keep provisioning
+disabled and treat the rollback as incomplete.
 
 ## Impact report
 
@@ -242,7 +292,7 @@ resuming workers. Do not independently reassign a tenant to make connectivity wo
 | Existing Proxy, VMD, VM hosts | No action; no reboot/replacement planned | Stop if a plan proposes any change; explicit separate review required |
 | Existing QM installation/POC | No action | No import, migration, deletion or traffic cutover in this packet |
 | New QM projects, identities, protected state | Dormant declarations | Creation only; later removal/replacement requires separate approval; partial failures use import/reconciliation |
-| New QM VPC/subnets/NAT/firewalls | Dormant declarations | Creation; later firewall changes take effect immediately, CIDR/VPC changes may require replacement and runtime revisions |
+| New QM VPC/subnets/NAT/firewalls | Dormant declarations | Creation; later firewall changes block new connections but do not terminate established sessions. CIDR/VPC changes may require replacement and runtime revisions; terminate sessions or shut down runtimes when rollback requires access to cease |
 | Paired-project image repository IAM | No action until authorized bootstrap | Additive reader bindings, no restart; temporary admin grant removed after bootstrap |
 | Platform secret containers | No values/deployment | Create containers; rotation needs coordinated consumer revisions, never log values |
 | New API/provisioner services and static edge | Contract only | Downstream infrastructure/release creates new revisions after prerequisite readiness; image/traffic rollback must preserve DB compatibility |
