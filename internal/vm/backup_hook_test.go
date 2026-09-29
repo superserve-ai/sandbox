@@ -459,7 +459,7 @@ func TestOlderWorkerCannotDeleteNewerPendingRecord(t *testing.T) {
 	if err := st.PutPendingBackup(newer); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.DeletePendingBackupIf(older.VMID, older.Token); err != nil {
+	if _, _, err := st.DeletePendingBackupIf(older.VMID, older.Token); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := st.ListPendingBackups()
@@ -470,7 +470,7 @@ func TestOlderWorkerCannotDeleteNewerPendingRecord(t *testing.T) {
 		t.Fatalf("pending = %+v, want only the newer record", pending)
 	}
 	// The rightful owner still can.
-	if err := st.DeletePendingBackupIf(newer.VMID, newer.Token); err != nil {
+	if _, _, err := st.DeletePendingBackupIf(newer.VMID, newer.Token); err != nil {
 		t.Fatal(err)
 	}
 	pending, err = st.ListPendingBackups()
@@ -597,7 +597,7 @@ func TestWorkerHealsMissingPendingRecord(t *testing.T) {
 	m.SetBackupEnqueue(func(task backup.Task) error { return nil })
 
 	// The record's initial persist "failed": the store is empty.
-	pb := PendingBackup{VMID: "vm-1", SnapshotPath: snap, DiskPath: disk, Token: newPendingToken()}
+	pb := newPendingBackup("vm-1", snap, disk, "", "")
 	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
 
 	pending, err := st.ListPendingBackups()
@@ -606,6 +606,30 @@ func TestWorkerHealsMissingPendingRecord(t *testing.T) {
 	}
 	if len(pending) != 1 || pending[0].Token != pb.Token {
 		t.Fatalf("pending = %+v, want the healed record", pending)
+	}
+}
+
+// Healing repairs a marker that never landed a write; it must not bring
+// back one whose write landed and whose slot a success has since retired.
+func TestHealDoesNotResurrectAWrittenMarker(t *testing.T) {
+	dir := t.TempDir()
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	m := &Manager{state: st}
+
+	pb := newPendingBackup("vm-1", "/snap", "/disk", "", "")
+	pb.unwritten = !m.persistPendingBackup(pb, zerolog.Nop())
+	if _, deleted, err := st.DeletePendingBackupIf(pb.VMID, pb.Token); err != nil || !deleted {
+		t.Fatalf("retire = %v (%v)", deleted, err)
+	}
+
+	m.healPendingBackup(pb, zerolog.Nop())
+
+	if pending, err := st.ListPendingBackups(); err != nil || len(pending) != 0 {
+		t.Fatalf("pending = %+v (%v), want the retired marker to stay gone", pending, err)
 	}
 }
 
@@ -2013,7 +2037,7 @@ func TestMarkerReuseRotatesOwnershipWithPauseToken(t *testing.T) {
 	}
 
 	// The old worker's owner-guarded cleanup must no-op against it.
-	if err := m.state.DeletePendingBackupIf("vm-1", first.Token); err != nil {
+	if _, _, err := m.state.DeletePendingBackupIf("vm-1", first.Token); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, _ := m.state.GetPendingBackup("vm-1"); !ok {

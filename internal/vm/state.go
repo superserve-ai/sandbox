@@ -1133,7 +1133,29 @@ type PendingBackup struct {
 	// token existed, by the backfill sweep, or by an older control plane;
 	// those reports fall back to content matching.
 	PauseToken string `json:"pause_token,omitempty"`
+	// Enqueued marks a marker kept only so a later sweep can upgrade an
+	// already-queued row to staged paths. The generation is durable in the
+	// journal from then on, so discarding such a marker costs no coverage
+	// and must not count as a dropped pause.
+	Enqueued bool `json:"enqueued,omitempty"`
+	// Version is stamped by every binary that persists a marker. Zero means
+	// a binary that predates Enqueued wrote it, so whether its generation
+	// reached the journal is unknowable and it is never counted as a loss.
+	Version int `json:"version,omitempty"`
+
+	// unwritten marks a copy that may still owe the store its first
+	// write, and is deliberately not persisted: it is set when a pause
+	// mints the marker and cleared once a write lands. Only such a copy
+	// may create the record; any other worker would be resurrecting a
+	// marker some success has already retired.
+	unwritten bool
 }
+
+// PendingBackupVersion is stamped when a marker is minted, so the value a
+// worker carries in memory matches the one on disk. Never stamped on a
+// marker read back from the store: a legacy marker's coverage stays
+// unknowable rather than being promoted by the binary that loaded it.
+const PendingBackupVersion = 1
 
 // PutPendingBackup records (or refreshes) a pause's owed backup.
 func (s *StateStore) PutPendingBackup(p PendingBackup) error {
@@ -1152,16 +1174,44 @@ func (s *StateStore) PutPendingBackup(p PendingBackup) error {
 // a failed initial write, and the newest pause always wins the slot
 // while a newer record is never overwritten by an older worker.
 func (s *StateStore) PutPendingBackupIfOwner(p PendingBackup) error {
+	return s.putPendingBackupIfOwner(p, true)
+}
+
+// RefreshPendingBackupIfOwner is PutPendingBackupIfOwner for a worker
+// holding a copy the store gave it: an empty slot means the pause was
+// retired or discarded while the worker ran, and re-creating the marker
+// would both re-hash an already-journaled pause and make its eventual
+// discard look like a loss.
+func (s *StateStore) RefreshPendingBackupIfOwner(p PendingBackup) error {
+	return s.putPendingBackupIfOwner(p, false)
+}
+
+func (s *StateStore) putPendingBackupIfOwner(p PendingBackup, create bool) error {
 	data, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(pendingBackupBucketName)
-		if v := b.Get([]byte(p.VMID)); v != nil {
+		v := b.Get([]byte(p.VMID))
+		if v == nil && !create {
+			return nil
+		}
+		if v != nil {
 			var cur PendingBackup
-			if json.Unmarshal(v, &cur) == nil && cur.Token > p.Token {
-				return nil
+			if json.Unmarshal(v, &cur) == nil {
+				if cur.Token > p.Token {
+					return nil
+				}
+				// A worker may hold a copy captured before its own
+				// enqueue landed. Rewriting the record from that copy
+				// must not unlearn coverage this token already earned.
+				if cur.Token == p.Token && cur.Enqueued && !p.Enqueued {
+					p.Enqueued = true
+					if data, err = json.Marshal(p); err != nil {
+						return err
+					}
+				}
 			}
 		}
 		return b.Put([]byte(p.VMID), data)
@@ -1192,8 +1242,14 @@ func (s *StateStore) PutPendingBackupIfAbsent(p PendingBackup) (bool, error) {
 // DeletePendingBackupIf clears the marker only while the given token
 // still owns it: an older pause's async worker finishing late must not
 // erase the record a newer pause has since written over the same key.
-func (s *StateStore) DeletePendingBackupIf(vmID, token string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
+// It reports whether this call is what removed it, and returns the
+// record removed: a worker's own copy can predate its own writes, so a
+// verdict about the pause belongs on the durable one. An absent record
+// and one a newer pause owns both report false with no error.
+func (s *StateStore) DeletePendingBackupIf(vmID, token string) (PendingBackup, bool, error) {
+	var removed PendingBackup
+	deleted := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(pendingBackupBucketName)
 		v := b.Get([]byte(vmID))
 		if v == nil {
@@ -1203,8 +1259,13 @@ func (s *StateStore) DeletePendingBackupIf(vmID, token string) error {
 		if json.Unmarshal(v, &cur) == nil && cur.Token != token {
 			return nil
 		}
-		return b.Delete([]byte(vmID))
+		if err := b.Delete([]byte(vmID)); err != nil {
+			return err
+		}
+		removed, deleted = cur, true
+		return nil
 	})
+	return removed, deleted, err
 }
 
 // GetPendingBackup returns a VM's pending-backup marker, if any.

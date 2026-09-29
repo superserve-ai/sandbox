@@ -327,7 +327,7 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 				Msg("packed disk exceeds inline staging budget; deferring to at-rest worker")
 		}
 	}
-	m.persistPendingBackup(pb, log)
+	pb.unwritten = !m.persistPendingBackup(pb, log)
 	go m.rehashPendingBackup(ctx, pb, log)
 	return manifest
 }
@@ -409,7 +409,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 	case pendingSuperseded:
 		log.Warn().Str("vm_id", pb.VMID).
 			Msg("pause backup superseded: sandbox no longer paused on this snapshot")
-		m.deletePendingBackupIf(pb, log)
+		m.dropPendingBackup(rctx, pb, log, telemetry.BackupDropSuperseded)
 		return
 	case pendingInconclusive:
 		log.Warn().Str("vm_id", pb.VMID).
@@ -453,7 +453,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 		if pb.BaseIdentity == "" || cur != pb.BaseIdentity {
 			log.Error().Str("vm_id", pb.VMID).
 				Msg("pause backup dropped: overlay base no longer the pause-time file")
-			m.deletePendingBackupIf(pb, log)
+			m.dropPendingBackup(rctx, pb, log, telemetry.BackupDropBaseReplaced)
 			return
 		}
 	}
@@ -478,7 +478,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 		if cur != pb.BaseIdentity {
 			log.Error().Str("vm_id", pb.VMID).
 				Msg("pause backup dropped: base replaced during rehash")
-			m.deletePendingBackupIf(pb, log)
+			m.dropPendingBackup(rctx, pb, log, telemetry.BackupDropBaseReplaced)
 			return
 		}
 	}
@@ -491,7 +491,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 		}
 		log.Warn().Str("vm_id", pb.VMID).
 			Msg("pause backup superseded during rehash")
-		m.deletePendingBackupIf(pb, log)
+		m.dropPendingBackup(rctx, pb, log, telemetry.BackupDropSuperseded)
 		return
 	}
 	after, err := os.Stat(pb.DiskPath)
@@ -505,7 +505,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 	}
 	if ok, staged, _ := m.enqueueBackup(pb.VMID, retried, pb.backupPriority(), pb.PauseToken); ok {
 		if staged {
-			m.deletePendingBackupIf(pb, log)
+			m.clearEnqueuedMarker(pb, log)
 			return
 		}
 		// Journaled from mutable paths (staging failed even at rest):
@@ -513,6 +513,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 		// entry, exactly like the pause path's unstaged handoff.
 		log.Warn().Str("vm_id", pb.VMID).
 			Msg("rehash enqueued unstaged; keeping marker for staging upgrade")
+		pb.Enqueued = true
 		m.healPendingBackup(pb, log)
 		return
 	}
@@ -524,7 +525,7 @@ func (m *Manager) rehashUnstagedLocked(rctx context.Context, pb PendingBackup, l
 		if fileMissing(pb.SnapshotPath) || fileMissing(pb.DiskPath) {
 			log.Error().Str("vm_id", pb.VMID).
 				Msg("pause backup dropped: artifact missing at rest")
-			m.deletePendingBackupIf(pb, log)
+			m.dropPendingBackup(rctx, pb, log, telemetry.BackupDropArtifactMissing)
 			return
 		}
 		log.Warn().Str("vm_id", pb.VMID).
@@ -588,7 +589,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 		}
 		log.Error().Str("vm_id", pb.VMID).
 			Msg("staged pause backup dropped: staged artifacts missing")
-		m.dropStagedPending(pb, log)
+		m.dropStagedPending(ctx, pb, log, telemetry.BackupDropArtifactMissing)
 		return
 	}
 	baseSrc := pb.DiskBasePath
@@ -606,7 +607,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 					// ship. Terminal, not transient.
 					log.Error().Str("vm_id", pb.VMID).
 						Msg("staged pause backup dropped: unpinned base deleted")
-					m.dropStagedPending(pb, log)
+					m.dropStagedPending(ctx, pb, log, telemetry.BackupDropBaseReplaced)
 					return
 				}
 				log.Warn().Err(err).Str("vm_id", pb.VMID).
@@ -617,7 +618,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 			if pb.BaseIdentity == "" || cur != pb.BaseIdentity {
 				log.Error().Str("vm_id", pb.VMID).
 					Msg("staged pause backup dropped: overlay base no longer the pause-time file")
-				m.dropStagedPending(pb, log)
+				m.dropStagedPending(ctx, pb, log, telemetry.BackupDropBaseReplaced)
 				return
 			}
 		}
@@ -723,7 +724,7 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 		}
 	}
 	if ok, _, _ := m.enqueueBackup(pb.VMID, entries, pb.backupPriority(), pb.PauseToken); ok {
-		m.deletePendingBackupIf(pb, log)
+		m.clearEnqueuedMarker(pb, log)
 		// The local copies were hashed above and, on a host with a
 		// separate upload root, copied from once more; whichever of them
 		// the journal's row does not name has now been read for the last
@@ -840,14 +841,14 @@ func (m *Manager) resolveStagedLocation(pb PendingBackup) PendingBackup {
 
 // dropStagedPending clears an unrecoverable staged marker and its
 // pending directory (post-rename generation dirs are ack-owned).
-func (m *Manager) dropStagedPending(pb PendingBackup, log zerolog.Logger) {
+func (m *Manager) dropStagedPending(ctx context.Context, pb PendingBackup, log zerolog.Logger, reason string) {
 	// Only pending-token directories are marker-owned; a post-rename
 	// generation directory may be referenced by a queued journal task
 	// and belongs to ack cleanup and the sweep.
 	if pb.StagedDir != "" && strings.HasPrefix(filepath.Base(pb.StagedDir), "pending-") {
 		_ = os.RemoveAll(pb.StagedDir)
 	}
-	m.deletePendingBackupIf(pb, log)
+	m.dropPendingBackup(ctx, pb, log, reason)
 }
 
 // RenewPendingStaging refreshes the staging mtime of every durable
@@ -1032,6 +1033,7 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 			writeFailed++
 			continue
 		}
+		pb.unwritten = false
 		if !wrote {
 			// A marker already owns this VM's coverage (a live pause's, or
 			// one retained on a transient failure); the sweep retries it on
@@ -1091,49 +1093,91 @@ func (m *Manager) retryEnqueue(pb PendingBackup, manifest []ManifestEntry, log z
 		return
 	}
 	if staged {
-		m.deletePendingBackupIf(pb, log)
+		m.clearEnqueuedMarker(pb, log)
 		return
 	}
 	// Journaled but from mutable paths: keep the marker so the
 	// sweep can upgrade the queued row, like every other path.
 	log.Warn().Str("vm_id", pb.VMID).
 		Msg("retry enqueued unstaged; keeping marker for staging upgrade")
+	pb.Enqueued = true
 	m.healPendingBackup(pb, log)
 }
 
 // persistPendingBackup and deletePendingBackup tolerate a nil state
 // store (tests, persistence disabled): the async retry still runs, it
 // just loses crash durability.
-func (m *Manager) persistPendingBackup(pb PendingBackup, log zerolog.Logger) {
+func (m *Manager) persistPendingBackup(pb PendingBackup, log zerolog.Logger) bool {
 	if m.state == nil {
-		return
+		return false
 	}
 	if err := m.state.PutPendingBackup(pb); err != nil {
 		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("persist pending backup failed")
+		return false
 	}
+	return true
 }
 
 // deletePendingBackupIf clears the record only while pb's token still
-// owns it: async workers may outlive the pause that spawned them, and a
-// newer pause's record must survive an older worker's cleanup.
-func (m *Manager) deletePendingBackupIf(pb PendingBackup, log zerolog.Logger) {
+// owns it: async workers may outlive the pause that spawned them. False
+// with no error means there was nothing of ours to remove, which callers
+// must tell apart from a store that refused.
+func (m *Manager) deletePendingBackupIf(pb PendingBackup, log zerolog.Logger) (PendingBackup, bool, error) {
 	if m.state == nil {
-		return
+		return PendingBackup{}, false, nil
 	}
-	if err := m.state.DeletePendingBackupIf(pb.VMID, pb.Token); err != nil {
+	removed, deleted, err := m.state.DeletePendingBackupIf(pb.VMID, pb.Token)
+	if err != nil {
 		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("clear pending backup failed")
 	}
+	return removed, deleted, err
+}
+
+// clearEnqueuedMarker retires the marker of a pause whose generation is
+// now durable in the journal. A clear that fails leaves the marker for the
+// sweep, so the enqueue is recorded on it first: without that the sweep
+// would later read a marker that looks uncovered and count a loss that
+// never happened.
+func (m *Manager) clearEnqueuedMarker(pb PendingBackup, log zerolog.Logger) {
+	if _, _, err := m.deletePendingBackupIf(pb, log); err == nil {
+		return
+	}
+	pb.Enqueued = true
+	m.healPendingBackup(pb, log)
+}
+
+// dropPendingBackup discards a pause's marker and counts the loss once the
+// marker is actually gone. Nothing else reports it: the coverage gauge sees
+// only sandboxes still paused, so a resumed one leaves no trace. A marker
+// whose generation already reached the journal is not a loss, however it is
+// later discarded.
+func (m *Manager) dropPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger, reason string) {
+	// The durable record, never the caller's copy: a worker can hold one
+	// captured before its own enqueue landed.
+	removed, deleted, _ := m.deletePendingBackupIf(pb, log)
+	if !deleted || removed.Enqueued || removed.Version < PendingBackupVersion {
+		return
+	}
+	m.backupMetrics.AddPauseBackupDropped(ctx, reason)
 }
 
 // healPendingBackup re-persists a worker's record on every keep-path:
 // the initial persist can fail (disk exhaustion, transient I/O), and a
 // keep decision without a durable record would evaporate with the
 // process. Owner-guarded, so a newer pause's record is never clobbered.
+// A missing slot is written only by a marker that never landed one;
+// for every other worker an empty slot means some success already
+// retired this pause, and recreating it would re-hash a journaled
+// pause and make its eventual discard look like a loss.
 func (m *Manager) healPendingBackup(pb PendingBackup, log zerolog.Logger) {
 	if m.state == nil {
 		return
 	}
-	if err := m.state.PutPendingBackupIfOwner(pb); err != nil {
+	heal := m.state.RefreshPendingBackupIfOwner
+	if pb.unwritten {
+		heal = m.state.PutPendingBackupIfOwner
+	}
+	if err := heal(pb); err != nil {
 		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("re-persist pending backup failed")
 	}
 }
@@ -1146,7 +1190,8 @@ func (m *Manager) healPendingBackup(pb PendingBackup, log zerolog.Logger) {
 func newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath, pauseToken string) PendingBackup {
 	pb := PendingBackup{
 		VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath,
-		Token: newPendingToken(), PauseToken: pauseToken,
+		Token: newPendingToken(), PauseToken: pauseToken, Version: PendingBackupVersion,
+		unwritten: true,
 	}
 	if diskBasePath != "" {
 		if id, err := baseIdentity(diskBasePath); err == nil {
