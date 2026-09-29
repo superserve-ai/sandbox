@@ -204,6 +204,8 @@ module "api" {
   image                 = "us-central1-docker.pkg.dev/${local.project_id}/superserve/controlplane:replace-me"
   env = {
     API_PORT                    = "8080"
+    TEAM_CREATION_REGION        = "use"
+    TEAM_CREATION_PUBLIC_KEYS   = var.team_creation_public_keys
     EDGE_PROXY_DOMAIN           = "staging-sandbox.superserve.ai"
     OTEL_ENVIRONMENT            = local.environment
     OTEL_EXPORTER_OTLP_ENDPOINT = local.staging_otlp_endpoint

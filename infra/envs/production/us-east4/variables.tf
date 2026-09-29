@@ -17,6 +17,12 @@ variable "environment" {
   default     = "production"
 }
 
+variable "team_creation_public_keys" {
+  description = "JSON map of dedicated Console assertion key IDs to base64 Ed25519 public keys. Empty disables team creation."
+  type        = string
+  default     = "{}"
+}
+
 variable "region" {
   description = "Target GCP region."
   type        = string

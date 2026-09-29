@@ -59,6 +59,12 @@ variable "internal_api_token_secret_name" {
   default     = null
 }
 
+variable "team_creation_public_keys" {
+  description = "JSON map of dedicated Console assertion key IDs to base64 Ed25519 public keys. Empty disables team creation."
+  type        = string
+  default     = "{}"
+}
+
 variable "sandbox_access_token_seed_secret_name" {
   description = "Secret Manager secret name for SANDBOX_ACCESS_TOKEN_SEED."
   type        = string
