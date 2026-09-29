@@ -2391,6 +2391,41 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 	if err := pool.QueryRow(ctx, `SELECT jsonb_agg(to_jsonb(e) ORDER BY id)::text FROM billing_meter_reconciliation e WHERE team_id=$1 AND meter_id='mtr_example_precision'`, team.ID).Scan(&retainedEvidence); err != nil || retainedEvidence != oldEvidence {
 		t.Fatalf("remap rewrote historical evidence: %v", err)
 	}
+	t.Run("observation-replaced-during-mapping", func(t *testing.T) {
+		var evidenceIDs []uuid.UUID
+		if err := pool.QueryRow(ctx, `SELECT array_agg(id) FROM billing_meter_reconciliation
+ WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end).Scan(&evidenceIDs); err != nil {
+			t.Fatal(err)
+		}
+		lookupCalls := 0
+		resolve := func(ctx context.Context, eventName string) (string, error) {
+			lookupCalls++
+			if lookupCalls == 1 {
+				// The mapping query has captured the old IDs before this callback.
+				if _, err := h.reconcileFrozenIncrementalPeriod(ctx, p); err != nil {
+					t.Fatalf("replace observations with valid evidence: %v", err)
+				}
+			}
+			return h.ResolveActiveBillingMeter(ctx, eventName)
+		}
+		_, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, pool, team.ID, start, end, resolve)
+		if err == nil || !strings.Contains(err.Error(), "incremental export requires fresh matching Stripe reconciliation") {
+			t.Fatalf("mapping bound to replaced evidence did not fail at reconciliation guard: %v", err)
+		}
+		if lookupCalls != 3 {
+			t.Fatalf("active meter lookups=%d, want 3", lookupCalls)
+		}
+		var replaced int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM billing_export_observation o
+ JOIN billing_meter_reconciliation e USING(team_id,period_start,period_end,resource_type,observed_at)
+ WHERE o.team_id=$1 AND o.period_start=$2 AND o.period_end=$3 AND e.id<>ALL($4::uuid[])`, team.ID, start, end, evidenceIDs).Scan(&replaced); err != nil || replaced != 3 {
+			t.Fatalf("replacement observations: count=%d err=%v", replaced, err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT status='exported' AND finalized_at IS NULL FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end).Scan(&stillExported); err != nil || !stillExported {
+			t.Fatalf("replaced evidence changed period: %v %v", stillExported, err)
+		}
+		assertHistory()
+	})
 	for attempt := 0; attempt < 2; attempt++ {
 		if _, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, pool, team.ID, start, end, h.ResolveActiveBillingMeter); err != nil {
 			t.Fatalf("persistent drift finalization: %v", err)
@@ -2452,7 +2487,7 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 	var retained, independent int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE period_start=$2 AND local_quantity=10000 AND difference=0.000000000001),
  count(*) FILTER (WHERE period_start=$3 AND local_quantity=20000 AND difference=0.000000000001)
- FROM billing_meter_reconciliation WHERE team_id=$1`, team.ID, start, second.Start).Scan(&retained, &independent); err != nil || retained != 6 || independent != 3 {
+ FROM billing_meter_reconciliation WHERE team_id=$1`, team.ID, start, second.Start).Scan(&retained, &independent); err != nil || retained != 9 || independent != 3 {
 		t.Fatalf("independent retained period evidence: first=%d second=%d err=%v", retained, independent, err)
 	}
 }
