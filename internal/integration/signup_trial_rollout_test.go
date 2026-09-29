@@ -4,7 +4,6 @@ package integration
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -12,7 +11,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -236,7 +234,7 @@ func TestIntegration_SignupTrialLegacyFailureBeforeCompletion(t *testing.T) {
 	}
 }
 
-func TestIntegration_SignupTrialOwnerAndGrantRollbackTogether(t *testing.T) {
+func TestIntegration_SignupTrialGrantFailureLeavesClaimRetryable(t *testing.T) {
 	ctx := context.Background()
 	userID := rolloutProfile(t)
 	teamID := rolloutLegacyTeam(t, userID, false)
@@ -247,17 +245,28 @@ func TestIntegration_SignupTrialOwnerAndGrantRollbackTogether(t *testing.T) {
 	defer tx.Rollback(ctx)
 	// Reject the grant itself, after the owner completion trigger has begun.
 	rolloutExec(t, tx, fmt.Sprintf(`ALTER TABLE team_credit_grant ADD CONSTRAINT rollout_injected_grant_failure CHECK (team_id <> '%s'::uuid) NOT VALID`, teamID))
-	rolloutExec(t, tx, `SAVEPOINT owner_insert`)
-	_, err = tx.Exec(ctx, rolloutOwnerInsert, userID, teamID)
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) || pgErr.Code != "23514" || pgErr.ConstraintName != "rollout_injected_grant_failure" {
-		t.Fatalf("owner completion error=%v, want injected grant check violation", err)
+	attempt, err := tx.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	rolloutExec(t, tx, `ROLLBACK TO SAVEPOINT owner_insert`)
+	if _, err := attempt.Exec(ctx, rolloutOwnerInsert, userID, teamID); err == nil {
+		t.Fatal("grant failure did not propagate")
+	}
+	if err := attempt.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rolloutAssertClaim(t, tx, userID, uuid.Nil)
 	rolloutAssertPending(t, tx, teamID, userID)
+	var completed, outcome bool
+	if err := tx.QueryRow(ctx, `SELECT
+		EXISTS (SELECT 1 FROM team_signup_trial_provenance WHERE team_id=$1 AND completed_at IS NOT NULL),
+		EXISTS (SELECT 1 FROM team_signup_promotion_outcome WHERE team_id=$1)`, teamID).
+		Scan(&completed, &outcome); err != nil || completed || outcome {
+		t.Fatalf("failed grant completed claim: completed=%t outcome=%t error=%v", completed, outcome, err)
+	}
 	var assignments int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM user_role_assignments WHERE team_id = $1`, teamID).Scan(&assignments); err != nil || assignments != 0 {
-		t.Fatalf("owner assignments after rollback=%d error=%v", assignments, err)
+		t.Fatalf("owner assignments after grant failure=%d error=%v", assignments, err)
 	}
 	rolloutExec(t, tx, `ALTER TABLE team_credit_grant DROP CONSTRAINT rollout_injected_grant_failure`)
 	rolloutExec(t, tx, rolloutOwnerInsert, userID, teamID)
@@ -267,6 +276,40 @@ func TestIntegration_SignupTrialOwnerAndGrantRollbackTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	rolloutAssertClaim(t, testPool, userID, teamID)
+}
+
+func TestIntegration_SignupTrialLockContentionLeavesClaimRetryable(t *testing.T) {
+	ctx := context.Background()
+	userID := rolloutProfile(t)
+	teamID := rolloutLegacyTeam(t, userID, false)
+	lock, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback(ctx)
+	rolloutExec(t, lock, `SELECT 1 FROM team WHERE id=$1 FOR NO KEY UPDATE`, teamID)
+	attempt, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	localIdentityError(t, attempt, "55P03", `SELECT * FROM claim_team_signup_trial($1,$2)`, teamID, userID)
+	if err := attempt.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rolloutAssertPending(t, testPool, teamID, userID)
+	var completed, outcome bool
+	if err := testPool.QueryRow(ctx, `SELECT
+		EXISTS (SELECT 1 FROM team_signup_trial_provenance WHERE team_id=$1 AND completed_at IS NOT NULL),
+		EXISTS (SELECT 1 FROM team_signup_promotion_outcome WHERE team_id=$1)`, teamID).
+		Scan(&completed, &outcome); err != nil || completed || outcome {
+		t.Fatalf("lock contention completed claim: completed=%t outcome=%t error=%v", completed, outcome, err)
+	}
+	if err := lock.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rolloutExec(t, testPool, `SELECT * FROM claim_team_signup_trial($1,$2)`, teamID, userID)
+	rolloutAssertClaim(t, testPool, userID, teamID)
+	rolloutAssertTeam(t, testPool, teamID, true)
 }
 
 func TestIntegration_SignupTrialMixedConcurrentCreation(t *testing.T) {
