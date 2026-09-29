@@ -79,6 +79,43 @@ func TestRetainedStorageSeriesPreservesFractionalLegacyArtifacts(t *testing.T) {
 	}
 }
 
+func TestRetainedStorageLegacyArtifactPathKeepsHostAllocationsSeparate(t *testing.T) {
+	f := newStorageReportFixture(t, "paused", false)
+	team := sandboxTeamID(t, f.sandboxID)
+	ctx := t.Context()
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	end := start.Add(60 * time.Second)
+	otherSandbox, firstSnapshot, secondSnapshot := uuid.New(), uuid.New(), uuid.New()
+	otherHost := "legacy-artifact-host-" + uuid.NewString()
+	const path = "/example/shared-rootfs.ext4"
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Both hosts retain the same path for the same duration. Their physical
+	// allocations must not be merged merely because the absolute path matches.
+	exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,base_path)
+ VALUES($1,$2,'legacy-other-host','paused',$3,1,1024,8,$4,$5)`, otherSandbox, team, otherHost, start, path)
+	exec(`INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES
+ ($1,$2,$3,$4,'pause'),($5,$6,$3,$4,'pause')`, firstSnapshot, f.sandboxID, team, path, secondSnapshot, otherSandbox)
+	exec(`UPDATE sandbox SET created_at=$2,snapshot_id=$3,base_path=$4 WHERE id=$1`, f.sandboxID, start, firstSnapshot, path)
+	exec(`UPDATE sandbox SET snapshot_id=$2 WHERE id=$1`, otherSandbox, secondSnapshot)
+	exec(`INSERT INTO artifact_manifest(snapshot_id,file_name,path,size_bytes,allocated_bytes,sha256)
+ VALUES($1,'rootfs.ext4',$3,1048576,1048576,$4),($2,'rootfs.ext4',$3,1048576,1048576,$4)`, firstSnapshot, secondSnapshot, path, strings.Repeat("0", 64))
+	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason)
+ VALUES($1,$3,0,$4,$5,'deleted'),($2,$3,0,$4,$5,'deleted')`, f.sandboxID, otherSandbox, team, start, end)
+	var got float64
+	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, start, end).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	want := 2 * end.Sub(start).Seconds()
+	if math.Abs(got-want) > 0.0001 {
+		t.Fatalf("same-path legacy artifacts were merged across hosts: got %v want %v", got, want)
+	}
+}
+
 func TestRetainedStorageReceiptReplacementAndLegacyIsolation(t *testing.T) {
 	f := newStorageReportFixture(t, "paused", true)
 	team := sandboxTeamID(t, f.sandboxID)

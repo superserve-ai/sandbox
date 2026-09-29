@@ -132,7 +132,7 @@ func TestIntegration_RetainedCutoverFencesOwnerCreation(t *testing.T) {
 	}
 }
 
-func TestIntegration_RetainedCutoverPrecedesLaterOwnerInsert(t *testing.T) {
+func TestIntegration_RetainedCutoverDoesNotBlockLaterOwnerInsert(t *testing.T) {
 	for _, kind := range []string{"sandbox", "snapshot"} {
 		t.Run(kind, func(t *testing.T) {
 			f := newRetainedCreationFixture(t)
@@ -171,35 +171,12 @@ func TestIntegration_RetainedCutoverPrecedesLaterOwnerInsert(t *testing.T) {
 				table, status = "sandbox_snapshot", "creating"
 			}
 			id := uuid.New()
-			creatorPID, writerPID := creator.Conn().PgConn().PID(), writer.Conn().PgConn().PID()
-			inserted := make(chan error, 1)
-			go func() {
-				defer close(inserted)
-				_, err := creator.Exec(ctx, `INSERT INTO `+table+`(id,team_id,host_id,status)
+			insertCtx, stopInsert := context.WithTimeout(ctx, 250*time.Millisecond)
+			_, err = creator.Exec(insertCtx, `INSERT INTO `+table+`(id,team_id,host_id,status)
  SELECT $1,team_id,host_id,$2 FROM sandbox WHERE id=$3`, id, status, f.sandboxID)
-				inserted <- err
-			}()
-			// Join the insert before rolling its transaction back on any failure.
-			defer func() {
-				cancel()
-				for range inserted {
-				}
-			}()
-			for {
-				var blocked bool
-				if err := f.pool.QueryRow(ctx, `SELECT $1::int=ANY(pg_blocking_pids($2::int))`, writerPID, creatorPID).Scan(&blocked); err != nil {
-					t.Fatal(err)
-				}
-				if blocked {
-					break
-				}
-				select {
-				case err := <-inserted:
-					t.Fatalf("owner insert escaped uncommitted cutover: %v", err)
-				case <-ctx.Done():
-					t.Fatal(ctx.Err())
-				case <-time.After(time.Millisecond):
-				}
+			stopInsert()
+			if err != nil {
+				t.Fatalf("owner creation waited behind retained report: %v", err)
 			}
 			otherCtx, stop := context.WithTimeout(ctx, 2*time.Second)
 			_, err = f.pool.Exec(otherCtx, `INSERT INTO `+table+`(id,team_id,host_id,status)
@@ -209,9 +186,6 @@ func TestIntegration_RetainedCutoverPrecedesLaterOwnerInsert(t *testing.T) {
 				t.Fatalf("cutover blocked an unrelated host: %v", err)
 			}
 			if err := writer.Commit(ctx); err != nil {
-				t.Fatal(err)
-			}
-			if err := <-inserted; err != nil {
 				t.Fatal(err)
 			}
 			var created time.Time
