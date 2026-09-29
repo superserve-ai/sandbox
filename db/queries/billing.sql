@@ -1214,17 +1214,42 @@ FROM recent_compute b
  CROSS JOIN rates
  WHERE b.started_at < now()
 ), recent_storage AS MATERIALIZED (
-  SELECT GREATEST(i.started_at, (SELECT started_at FROM sample_window), (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id))) AS started_at,
+  SELECT i.sandbox_id,
+         GREATEST(i.started_at, (SELECT started_at FROM sample_window), (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id))) AS started_at,
          i.ended_at, disk_mib
   FROM (
-    (SELECT started_at, ended_at, disk_mib FROM sandbox_storage_interval
+    (SELECT sandbox_id, started_at, ended_at, disk_mib FROM sandbox_storage_interval
      WHERE team_id = sqlc.arg(team_id) AND ended_at IS NULL AND storage_billing_activated(sqlc.arg(team_id))
      LIMIT 1025)
     UNION ALL
-    (SELECT started_at, ended_at, disk_mib FROM sandbox_storage_interval
+    (SELECT sandbox_id, started_at, ended_at, disk_mib FROM sandbox_storage_interval
      WHERE team_id = sqlc.arg(team_id) AND ended_at > (SELECT started_at FROM sample_window) AND storage_billing_activated(sqlc.arg(team_id))
      LIMIT 1025)
   ) i
+), recent_artifact_ranges AS MATERIALIZED (
+  SELECT p.path,
+         MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
+         range_agg(tstzrange(
+           GREATEST(rs.started_at, (SELECT started_at FROM sample_window)),
+           LEAST(COALESCE(rs.ended_at, now()), COALESCE(s.destroyed_at, now()), now()), '[)'
+         )) AS retained_ranges
+  FROM recent_storage rs
+  JOIN sandbox s ON s.id = rs.sandbox_id AND s.team_id = sqlc.arg(team_id)
+  LEFT JOIN template t ON t.id = s.template_id
+  CROSS JOIN LATERAL unnest(ARRAY[
+    s.base_path,
+    s.delta_path,
+    CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END
+  ]) AS p(path)
+  LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
+    AND am.path = p.path
+  WHERE p.path IS NOT NULL
+    AND rs.started_at < LEAST(COALESCE(rs.ended_at, now()), COALESCE(s.destroyed_at, now()), now())
+  GROUP BY p.path
+), artifact_storage AS MATERIALIZED (
+  SELECT COALESCE(SUM(ar.artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0)::numeric AS mib_seconds
+  FROM recent_artifact_ranges ar
+  CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
 ), sample_bounds AS (
   SELECT MIN(started_at) AS started_at,
          MAX(LEAST(ended_at, now())) AS ended_at
@@ -1232,9 +1257,14 @@ FROM recent_compute b
     SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_compute WHERE started_at < now()
     UNION ALL
     SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_storage WHERE started_at < now()
+    UNION ALL
+    SELECT lower(r), upper(r)
+    FROM recent_artifact_ranges ar
+    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
+    WHERE ar.artifact_mib > 0 AND lower(r) < upper(r)
   ) intervals
 )
-SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN storage_billing_activated(sqlc.arg(team_id)) THEN COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(s.ended_at, now()), now()) - s.started_at)) * s.disk_mib / 1024.0 * rates.storage) FROM recent_storage s CROSS JOIN rates WHERE s.started_at < LEAST(COALESCE(s.ended_at, now()), now())), 0) ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
+SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN storage_billing_activated(sqlc.arg(team_id)) THEN COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(s.ended_at, now()), now()) - s.started_at)) * s.disk_mib / 1024.0 * rates.storage) FROM recent_storage s CROSS JOIN rates WHERE s.started_at < LEAST(COALESCE(s.ended_at, now()), now())), 0) + COALESCE((SELECT mib_seconds / 1024.0 * rates.storage FROM artifact_storage), 0) ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
        sample_bounds.started_at, sample_bounds.ended_at,
        EXTRACT(EPOCH FROM (sample_bounds.ended_at - sample_bounds.started_at))::numeric AS elapsed_seconds
 FROM compute, rates, sample_bounds;
@@ -1322,8 +1352,12 @@ SET eligible = EXCLUDED.eligible,
 SELECT DISTINCT g.team_id
 FROM team_credit_grant g
 LEFT JOIN team_billing_account a ON a.team_id = g.team_id
+LEFT JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
 WHERE g.reason = 'signup trial credit'
   AND a.trial_ended_at IS NULL
+  -- A false verdict is stable until a newer grant arrives. Avoid rescanning
+  -- exhausted/expired historical trials while still picking up renewals.
+  AND (c.team_id IS NULL OR c.eligible OR g.created_at > c.updated_at)
   AND g.team_id > COALESCE(sqlc.narg(after_team_id)::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
 ORDER BY g.team_id
 LIMIT sqlc.arg(batch_limit);

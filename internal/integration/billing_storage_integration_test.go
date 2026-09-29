@@ -126,8 +126,12 @@ func TestIntegration_BillingProspectiveStorageConsumers(t *testing.T) {
 			exec(`UPDATE team_feature_flag SET enabled=false WHERE team_id=$1 AND key='billing_storage_billing_enabled'`, team.ID)
 			check()
 			if tc.name == "partial changing quantities" {
+				exec(`UPDATE team_credit_grant SET amount_usd=4500,remaining_usd=4500 WHERE team_id=$1`, team.ID)
 				for _, amount := range []float64{4500, 5000} {
-					exec(`UPDATE team_credit_grant SET amount_usd=$2,remaining_usd=$2 WHERE team_id=$1`, team.ID, amount)
+					if amount == 5000 {
+						// A new grant makes an exhausted trial eligible for refresh.
+						exec(`INSERT INTO team_credit_grant(team_id,amount_usd,remaining_usd,reason) VALUES($1,500,500,'signup trial credit')`, team.ID)
+					}
 					balance, err := testQueries.GetTeamTrialBalance(ctx, team.ID)
 					if err != nil || numericFloat64(t, balance.ConsumedUsd) != 4500 || numericFloat64(t, balance.RemainingUsd) != amount-4500 {
 						t.Fatalf("trial exhaustion balance: %+v %v", balance, err)

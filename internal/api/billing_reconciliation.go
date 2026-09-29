@@ -16,27 +16,26 @@ import (
 )
 
 const (
-	billingPauseWorkers       = 10
-	billingPauseCap     int32 = 1000 // per pass; a follow-up pass picks up the rest
+	billingPauseWorkers                   = 10
+	billingPauseCap                 int32 = 1000 // per pass; a follow-up pass picks up the rest
+	billingTrialEligibilityPageSize int32 = 256
 )
 
 func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 	h.scheduleTrialCreditWarningDiscovery(ctx)
-	var after *uuid.UUID
-	for {
-		var afterID pgtype.UUID
-		if after != nil {
-			afterID = pgtype.UUID{Bytes: *after, Valid: true}
-		}
-		// Paused and historical trials also need refreshed verdicts before resume.
-		teams, err := h.DB.ListTeamsWithTrialCredits(ctx, db.ListTeamsWithTrialCreditsParams{AfterTeamID: afterID, BatchLimit: 1000})
-		if err != nil {
-			log.Error().Err(err).Msg("billing: list active trial teams failed")
-			return
-		}
-		if len(teams) == 0 {
-			break
-		}
+	// Paused and historical trials also need refreshed verdicts before resume,
+	// but only one bounded page is refreshed per tick. The cursor continues
+	// across ticks so a large population makes progress without restarting at
+	// the UUID prefix or monopolizing the database.
+	h.trialEligibilityMu.Lock()
+	afterID := pgtype.UUID{Bytes: h.trialEligibilityAfter, Valid: h.trialEligibilityAfterValid}
+	h.trialEligibilityMu.Unlock()
+	teams, err := h.DB.ListTeamsWithTrialCredits(ctx, db.ListTeamsWithTrialCreditsParams{AfterTeamID: afterID, BatchLimit: billingTrialEligibilityPageSize})
+	if err != nil {
+		log.Error().Err(err).Msg("billing: list active trial teams failed")
+		return
+	}
+	if len(teams) > 0 {
 		dispatchBounded(ctx, teams, 10, func(teamID uuid.UUID) {
 			if err := h.DB.RefreshTeamTrialEligibility(ctx, teamID); err != nil {
 				log.Error().Err(err).Str("team_id", teamID.String()).Msg("billing: refresh trial eligibility failed")
@@ -44,11 +43,23 @@ func (h *Handlers) refreshActiveTrialEligibility(ctx context.Context) {
 			}
 			h.pauseBillingIneligibleTeam(ctx, teamID)
 		})
-		last := teams[len(teams)-1]
-		after = &last
-		if len(teams) < 1000 {
-			break
+		h.trialEligibilityMu.Lock()
+		if len(teams) < int(billingTrialEligibilityPageSize) {
+			h.trialEligibilityAfter = uuid.Nil
+			h.trialEligibilityAfterValid = false
+		} else {
+			h.trialEligibilityAfter = teams[len(teams)-1]
+			h.trialEligibilityAfterValid = true
 		}
+		h.trialEligibilityMu.Unlock()
+	} else {
+		// A full page on the prior tick may have ended exactly at the final
+		// row; restart the next sweep so newly eligible teams are not hidden
+		// behind a stale cursor.
+		h.trialEligibilityMu.Lock()
+		h.trialEligibilityAfter = uuid.Nil
+		h.trialEligibilityAfterValid = false
+		h.trialEligibilityMu.Unlock()
 	}
 	h.reconcileActiveIneligibleTeams(ctx)
 }
