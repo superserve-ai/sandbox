@@ -215,15 +215,6 @@ func TestIntegration_CheckoutSubscriptionReconciliation(t *testing.T) {
 			if order == "newest_terminal_first" {
 				wantStatus, wantGrants = "canceled", 0
 			}
-			if order == "old_event_during_replacement" {
-				// Cancellation of the still-current subscription closes bonus
-				// eligibility without preventing the replacement checkout.
-				wantGrants = 0
-				revocation, err := testQueries.GetStripeActivationCreditRevocation(ctx, stripe.nextCustomerID)
-				if err != nil || !revocation.CompletedAt.Valid || revocation.StripeGrantID != nil {
-					t.Fatalf("cancellation did not persist a no-grant marker: %+v %v", revocation, err)
-				}
-			}
 			if derefString(account.StripeSubscriptionID) != subID || derefString(account.StripeSubscriptionStatus) != wantStatus || account.CheckoutInitializingAt.Valid {
 				t.Fatalf("wrong reconciled account: %+v", account)
 			}

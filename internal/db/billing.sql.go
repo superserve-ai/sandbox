@@ -440,35 +440,6 @@ func (q *Queries) ClaimTrialCreditWarningForLifecycle(ctx context.Context, arg C
 	return claim_token, err
 }
 
-const completeStripeActivationCreditRevocation = `-- name: CompleteStripeActivationCreditRevocation :one
-WITH account AS (
-    UPDATE team_billing_account a
-    SET stripe_activation_credit_grant_id = $1::text, updated_at = now()
-    WHERE a.team_id = $3 AND a.stripe_customer_id = $2
-      AND (a.stripe_activation_credit_grant_id IS NULL OR a.stripe_activation_credit_grant_id = $1)
-    RETURNING a.team_id
-)
-UPDATE stripe_activation_credit_revocation r
-SET completed_at = COALESCE(r.completed_at, now()), stripe_grant_id = $1
-FROM account a
-WHERE r.team_id = a.team_id AND r.stripe_customer_id = $2
-  AND (r.stripe_grant_id IS NULL OR r.stripe_grant_id = $1)
-RETURNING r.team_id
-`
-
-type CompleteStripeActivationCreditRevocationParams struct {
-	GrantID    *string   `json:"grant_id"`
-	CustomerID string    `json:"customer_id"`
-	TeamID     uuid.UUID `json:"team_id"`
-}
-
-func (q *Queries) CompleteStripeActivationCreditRevocation(ctx context.Context, arg CompleteStripeActivationCreditRevocationParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, completeStripeActivationCreditRevocation, arg.GrantID, arg.CustomerID, arg.TeamID)
-	var team_id uuid.UUID
-	err := row.Scan(&team_id)
-	return team_id, err
-}
-
 const completeTeamBillingCheckoutWithoutSubscription = `-- name: CompleteTeamBillingCheckoutWithoutSubscription :exec
 UPDATE team_billing_account
 SET checkout_completed_at = COALESCE(checkout_completed_at, now()), updated_at = now()
@@ -1027,36 +998,6 @@ func (q *Queries) GetRecentTrialBurnSample(ctx context.Context, teamID uuid.UUID
 		&i.StartedAt,
 		&i.EndedAt,
 		&i.ElapsedSeconds,
-	)
-	return i, err
-}
-
-const getStripeActivationCreditRevocation = `-- name: GetStripeActivationCreditRevocation :one
-SELECT r.team_id, r.stripe_customer_id, r.requested_at, r.completed_at, r.stripe_grant_id, a.stripe_activation_credit_grant_id AS activation_grant_id
-FROM stripe_activation_credit_revocation r
-JOIN team_billing_account a ON a.team_id = r.team_id AND a.stripe_customer_id = r.stripe_customer_id
-WHERE r.stripe_customer_id = $1
-`
-
-type GetStripeActivationCreditRevocationRow struct {
-	TeamID            uuid.UUID          `json:"team_id"`
-	StripeCustomerID  string             `json:"stripe_customer_id"`
-	RequestedAt       time.Time          `json:"requested_at"`
-	CompletedAt       pgtype.Timestamptz `json:"completed_at"`
-	StripeGrantID     *string            `json:"stripe_grant_id"`
-	ActivationGrantID *string            `json:"activation_grant_id"`
-}
-
-func (q *Queries) GetStripeActivationCreditRevocation(ctx context.Context, customerID string) (GetStripeActivationCreditRevocationRow, error) {
-	row := q.db.QueryRow(ctx, getStripeActivationCreditRevocation, customerID)
-	var i GetStripeActivationCreditRevocationRow
-	err := row.Scan(
-		&i.TeamID,
-		&i.StripeCustomerID,
-		&i.RequestedAt,
-		&i.CompletedAt,
-		&i.StripeGrantID,
-		&i.ActivationGrantID,
 	)
 	return i, err
 }
@@ -3171,18 +3112,6 @@ type ReleaseTrialCreditWarningParams struct {
 
 func (q *Queries) ReleaseTrialCreditWarning(ctx context.Context, arg ReleaseTrialCreditWarningParams) error {
 	_, err := q.db.Exec(ctx, releaseTrialCreditWarning, arg.TeamID, arg.ClaimToken)
-	return err
-}
-
-const requestStripeActivationCreditRevocation = `-- name: RequestStripeActivationCreditRevocation :exec
-INSERT INTO stripe_activation_credit_revocation (team_id, stripe_customer_id)
-SELECT a.team_id, a.stripe_customer_id FROM team_billing_account a
-WHERE a.team_id = $1 AND a.stripe_customer_id IS NOT NULL
-ON CONFLICT (team_id) DO NOTHING
-`
-
-func (q *Queries) RequestStripeActivationCreditRevocation(ctx context.Context, teamID uuid.UUID) error {
-	_, err := q.db.Exec(ctx, requestStripeActivationCreditRevocation, teamID)
 	return err
 }
 

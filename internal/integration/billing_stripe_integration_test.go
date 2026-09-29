@@ -120,13 +120,6 @@ func (f *fakeStripeClient) CreateBillingCreditGrant(_ context.Context, params ap
 	return api.StripeBillingCreditGrant{ID: "credgrant_test_123"}, nil
 }
 
-func (f *fakeStripeClient) RevokeActivationCredit(_ context.Context, _ uuid.UUID, _ string, grantID string) (string, error) {
-	if grantID == "" {
-		grantID = "credgrant_test_123"
-	}
-	return grantID, nil
-}
-
 func (f *fakeStripeClient) CreateCheckoutSession(_ context.Context, params api.StripeCreateCheckoutSessionParams) (api.StripeCheckoutSession, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

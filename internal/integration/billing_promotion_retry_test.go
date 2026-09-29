@@ -92,20 +92,6 @@ type ambiguousPromotionClient struct {
 	t              *testing.T
 	userID, teamID uuid.UUID
 	accepted       map[string]string
-	revocationErr  error
-	revokedGrantID string
-}
-
-func (s *ambiguousPromotionClient) RevokeActivationCredit(_ context.Context, teamID uuid.UUID, customerID, grantID string) (string, error) {
-	if s.revocationErr != nil {
-		return "", s.revocationErr
-	}
-	accepted := s.accepted["stripe-activation-credit-"+teamID.String()]
-	if teamID != s.teamID || customerID != "cus_"+s.teamID.String() || accepted == "" || grantID != "" && grantID != accepted {
-		return "", errors.New("Stripe activation grant identity is missing")
-	}
-	s.revokedGrantID = accepted
-	return accepted, nil
 }
 
 func (s *ambiguousPromotionClient) CreateBillingCreditGrant(ctx context.Context, p api.StripeCreateBillingCreditGrantParams) (api.StripeBillingCreditGrant, error) {
@@ -185,8 +171,8 @@ func TestIntegration_StaleAmbiguousPromotionReconcilesWithoutReactivating(t *tes
 	if eligible, err := testQueries.IsTeamSandboxBillingEligible(ctx, teamID); err != nil || eligible {
 		t.Fatalf("canceled team retained signup credit eligibility: %v %v", eligible, err)
 	}
-	if len(stripe.creditGrantCalls) != 1 || len(stripe.accepted) != 1 || stripe.revokedGrantID != "credit_"+teamID.String() || derefString(account.StripeActivationCreditGrantID) != stripe.revokedGrantID {
-		t.Fatalf("Stripe calls=%d accepted grants=%d revoked=%s", len(stripe.creditGrantCalls), len(stripe.accepted), stripe.revokedGrantID)
+	if len(stripe.creditGrantCalls) != 2 || len(stripe.accepted) != 1 || derefString(account.StripeActivationCreditGrantID) != "credit_"+teamID.String() {
+		t.Fatalf("Stripe calls=%d accepted grants=%d grant=%s", len(stripe.creditGrantCalls), len(stripe.accepted), derefString(account.StripeActivationCreditGrantID))
 	}
 	otherTeam, _, _ := seedTeamAndKeyWithRole(t, "team_owner")
 	if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account(team_id) VALUES($1)`, otherTeam); err != nil {
