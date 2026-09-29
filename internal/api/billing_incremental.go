@@ -118,7 +118,10 @@ type incrementalExportItem struct {
 func incrementalExportItems(usage db.TeamBillingUsage, resources []billingResourceState) ([]incrementalExportItem, error) {
 	items := make([]incrementalExportItem, 0, len(resources))
 	for _, resource := range resources {
-		if !resource.Billable {
+		// Provider usage is only billable when the current subscription carries
+		// the corresponding metered item. Storage can be preloaded separately,
+		// so subscription inclusion remains independent from its billable gate.
+		if !resource.Billable || !resource.SubscriptionIncluded() {
 			continue
 		}
 		var seconds pgtype.Numeric

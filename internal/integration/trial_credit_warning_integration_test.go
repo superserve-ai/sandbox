@@ -384,13 +384,39 @@ func TestRecentTrialBurnSampleIncludesRetainedArtifacts(t *testing.T) {
 		VALUES ($1, $2, 1024, $3)`, sharedSandboxID, teamID, now.Add(-8*time.Hour)); err != nil {
 		t.Fatalf("seed shared retained artifact usage: %v", err)
 	}
+	// A closed storage interval still retains its sandbox artifact until the
+	// sandbox is destroyed. Its interval ended before the six-hour sample
+	// window, so recent storage rows alone must not be used to discover it.
+	closedSandboxID := seedPrivatePreviewSandbox(t, teamID, testDefaultHostID, "trial-warning-artifact-closed")
+	closedArtifactPath := "/example/artifacts/closed.ext4"
+	var closedTemplateID uuid.UUID
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO template (team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path)
+		VALUES ($1, 'artifact-warning-closed-template', 'ready', '{}', 1, 1024, 1024, $2)
+		RETURNING id`, teamID, closedArtifactPath).Scan(&closedTemplateID); err != nil {
+		t.Fatalf("seed closed artifact template: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox SET template_id = $2 WHERE id = $1`, closedSandboxID, closedTemplateID); err != nil {
+		t.Fatalf("seed closed artifact sandbox template: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO artifact_manifest (template_id, file_name, path, size_bytes, allocated_bytes, sha256)
+		VALUES ($1, 'closed.ext4', $2, 1073741824, 1073741824, repeat('0', 64))`, closedTemplateID, closedArtifactPath); err != nil {
+		t.Fatalf("seed closed artifact manifest: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason)
+		VALUES ($1, $2, 1024, $3, $4, 'deleted')`, closedSandboxID, teamID, now.Add(-8*time.Hour), now.Add(-7*time.Hour)); err != nil {
+		t.Fatalf("seed closed retained artifact usage: %v", err)
+	}
 	sample, err := testQueries.GetRecentTrialBurnSample(ctx, teamID)
 	if err != nil {
 		t.Fatalf("GetRecentTrialBurnSample: %v", err)
 	}
 	spent, err := sample.SpentUsd.Float64Value()
-	if err != nil || !spent.Valid || spent.Float64 < 60000 || spent.Float64 > 66000 {
-		t.Fatalf("artifact-inclusive spend = %v, error = %v, want about 64800 USD with one shared artifact", spent, err)
+	if err != nil || !spent.Valid || spent.Float64 < 84000 || spent.Float64 > 88000 {
+		t.Fatalf("artifact-inclusive spend = %v, error = %v, want about 86400 USD including the retained closed artifact", spent, err)
 	}
 	started, ok := sample.StartedAt.(time.Time)
 	if !ok || now.Sub(started) < 5*time.Hour || now.Sub(started) > 6*time.Hour+time.Minute {

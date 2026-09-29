@@ -120,3 +120,29 @@ func TestIncrementalUsagePartitionsPreserveExactTotal(t *testing.T) {
 		})
 	}
 }
+
+func TestIncrementalExportItemsRequireSubscriptionIncludedResources(t *testing.T) {
+	seconds := pgtype.Numeric{}
+	if err := seconds.Scan("3600"); err != nil {
+		t.Fatal(err)
+	}
+	subscriptionDisabled := false
+	resources := []billingResourceState{
+		{BillingResourceConfig: config.BillingResourceConfig{
+			ResourceKey: "vcpu", StripeEventName: "cpu_vcpu_hours", CheckoutEnabled: true,
+			SubscriptionEnabled: &subscriptionDisabled,
+		}, Billable: true},
+		{BillingResourceConfig: config.BillingResourceConfig{
+			ResourceKey: "memory_gib", StripeEventName: "memory_gib_hours", CheckoutEnabled: true,
+		}, Billable: true},
+	}
+	items, err := incrementalExportItems(db.TeamBillingUsage{
+		VcpuSeconds: seconds, MemoryMibSeconds: seconds,
+	}, resources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].ResourceType != "memory" {
+		t.Fatalf("items = %+v, want only the subscription-included memory resource", items)
+	}
+}
