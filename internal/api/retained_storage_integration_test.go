@@ -3,14 +3,230 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 )
+
+// Share the lease fixture across connections while keeping every row isolated
+// from the integration database. Use the migrated production creation trigger.
+func newRetainedCreationFixture(t *testing.T) storageLeaseFixture {
+	t.Helper()
+	f := newStorageLeaseFixture(t)
+	schema := pgx.Identifier{"retained_creation_" + strings.ReplaceAll(uuid.NewString(), "-", "")}.Sanitize()
+	if _, err := f.pool.Exec(t.Context(), `CREATE SCHEMA `+schema); err != nil {
+		t.Fatal(err)
+	}
+	source := f.pool
+	t.Cleanup(func() {
+		if _, err := source.Exec(context.Background(), `DROP SCHEMA `+schema+` CASCADE`); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, table := range []string{"host", "sandbox", "sandbox_snapshot", "sandbox_storage_interval", "retained_storage_interval", "retained_storage_cutover", "host_storage_report", "feature_flag", "team_feature_flag"} {
+		query := fmt.Sprintf(`CREATE TABLE %[1]s.%[2]s (LIKE pg_temp.%[2]s INCLUDING ALL);
+ INSERT INTO %[1]s.%[2]s OVERRIDING SYSTEM VALUE SELECT * FROM pg_temp.%[2]s;`, schema, table)
+		if _, err := source.Exec(t.Context(), query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := source.Config()
+	cfg.MaxConns = 4
+	cfg.ConnConfig.RuntimeParams["search_path"] = schema + ",public"
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	f.pool = pool
+	for _, table := range []string{"sandbox", "sandbox_snapshot"} {
+		if _, err := pool.Exec(t.Context(), `ALTER TABLE `+table+` ALTER COLUMN created_at DROP DEFAULT;
+ CREATE TRIGGER fence_retained_storage_owner_creation BEFORE INSERT ON `+table+`
+ FOR EACH ROW EXECUTE FUNCTION public.fence_retained_storage_owner_creation()`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return f
+}
+
+func TestIntegration_RetainedCutoverFencesOwnerCreation(t *testing.T) {
+	for _, kind := range []string{"sandbox", "snapshot"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newRetainedCreationFixture(t)
+			ctx := t.Context()
+			creator, err := f.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer creator.Rollback(context.Background())
+			table, status := "sandbox", "paused"
+			if kind == "snapshot" {
+				table, status = "sandbox_snapshot", "creating"
+			}
+			id := uuid.New()
+			if _, err := creator.Exec(ctx, `INSERT INTO `+table+`(id,team_id,host_id,status)
+ SELECT $1,team_id,host_id,$2 FROM sandbox WHERE id=$3`, id, status, f.sandboxID); err != nil {
+				t.Fatal(err)
+			}
+			// Two creations on the same host must not serialize each other.
+			parallel, err := f.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer parallel.Rollback(context.Background())
+			insertCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			_, err = parallel.Exec(insertCtx, `INSERT INTO `+table+`(id,team_id,host_id,status)
+ SELECT $1,team_id,host_id,$2 FROM sandbox WHERE id=$3`, uuid.New(), status, f.sandboxID)
+			cancel()
+			if err != nil {
+				t.Fatalf("concurrent creation was blocked: %v", err)
+			}
+			if err := parallel.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var at time.Time
+			if err := f.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&at); err != nil {
+				t.Fatal(err)
+			}
+			owner := func(kind string, id uuid.UUID) retainedstorage.Owner {
+				return retainedstorage.Owner{Kind: kind, ID: id.String(), Generation: strings.Repeat("a", 64), Extents: []retainedstorage.Extent{{Device: "fs", Start: 4096, Length: 4096}}}
+			}
+			base := owner("sandbox", f.sandboxID)
+			apply := func(owners ...retainedstorage.Owner) error {
+				return applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, at,
+					[]storageReportMeasurement{{Retained: &retainedstorage.Inventory{Version: 1, Owners: owners}}}, 1, 1)
+			}
+			before := storageLeaseRow(t, f)
+			if err := apply(base); err == nil || storageReportErrorIsTerminal(err) {
+				t.Fatalf("uncommitted creation must defer cutover with a retryable error: %v", err)
+			}
+			if after := storageLeaseRow(t, f); before != after {
+				t.Fatal("deferred cutover advanced report progress")
+			}
+			var count int
+			if err := f.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM retained_storage_cutover)+(SELECT count(*) FROM retained_storage_interval)`).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("deferred report changed retained accounting: count=%d err=%v", count, err)
+			}
+			if err := creator.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := apply(base); !errors.Is(err, errStorageReportInvalidPayload) {
+				t.Fatalf("committed omitted owner must fail completeness: %v", err)
+			}
+			if err := apply(base, owner(kind, id)); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval i JOIN retained_storage_cutover c USING(host_id,team_id) WHERE i.started_at=$1 AND c.started_at=$1`, at).Scan(&count); err != nil || count != 2 {
+				t.Fatalf("complete retry did not include both owners at receipt: count=%d err=%v", count, err)
+			}
+		})
+	}
+}
+
+func TestIntegration_RetainedCutoverPrecedesLaterOwnerInsert(t *testing.T) {
+	for _, kind := range []string{"sandbox", "snapshot"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newRetainedCreationFixture(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			creator, err := f.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer creator.Rollback(context.Background())
+			var begun time.Time
+			if err := creator.QueryRow(ctx, `SELECT now()`).Scan(&begun); err != nil {
+				t.Fatal(err)
+			}
+			writer, err := f.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writer.Rollback(context.Background())
+			var at time.Time
+			if err := writer.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&at); err != nil {
+				t.Fatal(err)
+			}
+			if !begun.Before(at) {
+				t.Fatal("creation transaction must predate receipt")
+			}
+			inv := &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{{
+				Kind: "sandbox", ID: f.sandboxID.String(), Generation: strings.Repeat("a", 64),
+				Extents: []retainedstorage.Extent{{Device: "fs", Start: 4096, Length: 4096}},
+			}}}
+			if err := applyRetainedStorage(ctx, writer, f.hostID, at, inv); err != nil {
+				t.Fatal(err)
+			}
+			table, status := "sandbox", "paused"
+			if kind == "snapshot" {
+				table, status = "sandbox_snapshot", "creating"
+			}
+			id := uuid.New()
+			creatorPID, writerPID := creator.Conn().PgConn().PID(), writer.Conn().PgConn().PID()
+			inserted := make(chan error, 1)
+			go func() {
+				defer close(inserted)
+				_, err := creator.Exec(ctx, `INSERT INTO `+table+`(id,team_id,host_id,status)
+ SELECT $1,team_id,host_id,$2 FROM sandbox WHERE id=$3`, id, status, f.sandboxID)
+				inserted <- err
+			}()
+			// Join the insert before rolling its transaction back on any failure.
+			defer func() {
+				cancel()
+				for range inserted {
+				}
+			}()
+			for {
+				var blocked bool
+				if err := f.pool.QueryRow(ctx, `SELECT $1::int=ANY(pg_blocking_pids($2::int))`, writerPID, creatorPID).Scan(&blocked); err != nil {
+					t.Fatal(err)
+				}
+				if blocked {
+					break
+				}
+				select {
+				case err := <-inserted:
+					t.Fatalf("owner insert escaped uncommitted cutover: %v", err)
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				case <-time.After(time.Millisecond):
+				}
+			}
+			otherCtx, stop := context.WithTimeout(ctx, 2*time.Second)
+			_, err = f.pool.Exec(otherCtx, `INSERT INTO `+table+`(id,team_id,host_id,status)
+ SELECT $1,team_id,'other-host',$2 FROM sandbox WHERE id=$3`, uuid.New(), status, f.sandboxID)
+			stop()
+			if err != nil {
+				t.Fatalf("cutover blocked an unrelated host: %v", err)
+			}
+			if err := writer.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-inserted; err != nil {
+				t.Fatal(err)
+			}
+			var created time.Time
+			if err := creator.QueryRow(ctx, `SELECT created_at FROM `+table+` WHERE id=$1`, id).Scan(&created); err != nil {
+				t.Fatal(err)
+			}
+			if !created.After(at) {
+				t.Fatalf("later insert was backdated into inventory: created=%s receipt=%s transaction=%s", created, at, begun)
+			}
+			if err := creator.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
 
 func TestIntegration_RetainedReportOwnershipAndReceiptTransitions(t *testing.T) {
 	f := newStorageLeaseFixture(t)

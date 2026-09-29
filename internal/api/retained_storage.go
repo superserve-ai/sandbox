@@ -50,6 +50,17 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
  FOR NO KEY UPDATE`, hostID, at, payload); err != nil {
 		return err
 	}
+	// Creation holds the shared side until commit. Try only after owner row
+	// locks: snapshot/fork creation may already hold a source row shared.
+	// A separate statement below sees any creator that committed before this
+	// fence; an in-flight creator leaves this report retryable, without cutover.
+	var creationFenced bool
+	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('retained-storage-owner:' || $1, 0))`, hostID).Scan(&creationFenced); err != nil {
+		return err
+	}
+	if !creationFenced {
+		return fmt.Errorf("retained owner creation is in progress")
+	}
 	// Ownership comes exclusively from these rows. Host-supplied owner IDs are
 	// references, not authority for team attribution or retention lifetime.
 	var complete bool

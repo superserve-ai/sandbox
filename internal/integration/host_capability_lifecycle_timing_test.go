@@ -31,12 +31,19 @@ type lifecycleLockTiming struct {
 	completed  int
 	held       time.Duration
 	maxHeld    time.Duration
+	creates    map[*pgx.Conn]time.Time
+	created    int
+	createTime time.Duration
+	maxCreate  time.Duration
 }
 
 func (m *lifecycleLockTiming) TraceQueryStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.statements++
+	if strings.HasPrefix(data.SQL, "-- name: CreateSandbox") {
+		m.creates[conn] = time.Now()
+	}
 	isLock := strings.HasPrefix(data.SQL, "-- name: LockHostForCapabilities ") ||
 		(strings.HasPrefix(data.SQL, "-- name: HostHasCapabilities ") && strings.Contains(data.SQL, "FOR SHARE"))
 	if isLock {
@@ -50,6 +57,13 @@ func (m *lifecycleLockTiming) TraceQueryStart(ctx context.Context, conn *pgx.Con
 func (m *lifecycleLockTiming) TraceQueryEnd(_ context.Context, conn *pgx.Conn, _ pgx.TraceQueryEndData) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if started, ok := m.creates[conn]; ok {
+		elapsed := time.Since(started)
+		m.createTime += elapsed
+		m.maxCreate = max(m.maxCreate, elapsed)
+		m.created++
+		delete(m.creates, conn)
+	}
 	if started, ok := m.locks[conn]; ok && conn.PgConn().TxStatus() == 'I' {
 		elapsed := time.Since(started)
 		m.held += elapsed
@@ -66,7 +80,11 @@ func (m *lifecycleLockTiming) reset(t *testing.T) {
 	if len(m.locks) != 0 {
 		t.Fatal("host validation transaction remains open between requests")
 	}
+	if len(m.creates) != 0 {
+		t.Fatal("creation statement remains open between requests")
+	}
 	m.statements, m.completed, m.held, m.maxHeld = 0, 0, 0, 0
+	m.created, m.createTime, m.maxCreate = 0, 0, 0
 }
 
 func (m *lifecycleLockTiming) requireReleased(t *testing.T) {
@@ -82,7 +100,7 @@ func TestIntegration_HostCapabilityLifecycleTiming(t *testing.T) {
 	const samples = 20
 	t.Setenv("HOST_CAPABILITY_CACHE_TTL", "0")
 	ctx := t.Context()
-	measurement := &lifecycleLockTiming{locks: make(map[*pgx.Conn]time.Time)}
+	measurement := &lifecycleLockTiming{locks: make(map[*pgx.Conn]time.Time), creates: make(map[*pgx.Conn]time.Time)}
 	poolConfig := testPool.Config()
 	poolConfig.ConnConfig.Tracer = measurement
 	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
@@ -118,8 +136,8 @@ func TestIntegration_HostCapabilityLifecycleTiming(t *testing.T) {
 		preview.HostCapabilityPortTokens, preview.HostCapabilityPortBrowserAuth)
 
 	t.Run("create", func(t *testing.T) {
-		var elapsed time.Duration
-		var statements int
+		var elapsed, createTime, maxCreate time.Duration
+		var statements, created int
 		for i := 0; i <= samples; i++ {
 			measurement.reset(t)
 			started := time.Now()
@@ -131,13 +149,21 @@ func TestIntegration_HostCapabilityLifecycleTiming(t *testing.T) {
 			measurement.requireReleased(t)
 			measurement.mu.Lock()
 			queries := measurement.statements
+			count, durationCreate, longest := measurement.created, measurement.createTime, measurement.maxCreate
 			measurement.mu.Unlock()
+			if count != 1 {
+				t.Fatalf("creation statements=%d, want 1", count)
+			}
 			if i > 0 {
 				elapsed += duration
 				statements += queries
+				created += count
+				createTime += durationCreate
+				maxCreate = max(maxCreate, longest)
 			}
 		}
 		t.Logf("create: samples=%d mean handler+bookkeeping=%s mean DB statements=%.1f (stub VMD, uncontended DB)", samples, elapsed/samples, float64(statements)/samples)
+		t.Logf("create insert including owner fence: samples=%d mean=%s max=%s", created, createTime/time.Duration(created), maxCreate)
 	})
 
 	for _, operation := range []string{"resume", "preview-mutation"} {
