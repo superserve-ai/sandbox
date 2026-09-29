@@ -14,10 +14,21 @@ Apply the compatible promotion expansion migrations
 `20260925195235_canonical_promotion_identity.sql`, and
 `20260925195248_canonical_stripe_promotion_fences.sql`, plus the additive
 `20260927003551_regional_promotion_device_authority.sql`,
+`20260927003604_fence_pending_stripe_device_reservations.sql`,
+`20260927003605_serialize_device_reservation_replay.sql`,
+`20260927003607_complete_denied_signup_device_claim.sql`,
+`20260927003608_resolve_late_signup_device_evidence.sql`,
+`20260927003610_atomic_stripe_device_decision.sql`,
 `20260927003611_serialize_signup_device_claim.sql`,
+`20260927003612_fence_legacy_stripe_device_reservations.sql`,
 `20260928233535_team_creation_requests.sql` and
 `20260928233536_team_creation_signup_policy.sql` migrations, in that order,
-before enabling API creation. The signup-policy migration defines the
+before enabling API creation. Apply the full device-authority correction chain:
+the signup-claim serialization migration alone does not update
+`promotion_device_decision`. The late-evidence correction requires the preceding
+pending-reservation schema and prevents a signup grant recorded without a
+fingerprint from being missed when device evidence arrives later.
+The signup-policy migration defines the
 four-argument `create_team_with_signup_trial` function required by the API.
 The API writes signed Auth evidence through
 `upsert_profile_with_promotion_identity` in the same transaction as creation,
