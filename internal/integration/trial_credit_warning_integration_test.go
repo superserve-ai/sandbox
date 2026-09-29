@@ -56,9 +56,9 @@ func TestRecentTrialBurnSampleClampsOverlappingIntervals(t *testing.T) {
 					VALUES ($1, $2, now() - interval '1 day')`, teamID, planKey); err != nil {
 					t.Fatal(err)
 				}
-				if _, err := tx.Exec(ctx, `INSERT INTO team_feature_flag (team_id, key, enabled)
+				if _, err := tx.Exec(ctx, `WITH enabled AS (INSERT INTO team_feature_flag (team_id, key, enabled)
 					VALUES ($1, 'billing_storage_billing_enabled', true)
-					ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled`, teamID); err != nil {
+					ON CONFLICT (team_id, key) DO UPDATE SET enabled = EXCLUDED.enabled RETURNING team_id,enabled) INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) SELECT team_id,now()-interval '1 day',now()-interval '1 day' FROM enabled WHERE enabled ON CONFLICT DO NOTHING`, teamID); err != nil {
 					t.Fatal(err)
 				}
 				var endedAt *time.Time
@@ -267,9 +267,9 @@ func TestRecentTrialBurnSampleStartsAtLatestSignupGrant(t *testing.T) {
 			if err := tx.QueryRow(ctx, `SELECT now()`).Scan(&now); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO team_feature_flag (team_id, key, enabled)
+			if _, err := tx.Exec(ctx, `WITH enabled AS (INSERT INTO team_feature_flag (team_id, key, enabled)
 				VALUES ($1, 'billing_storage_billing_enabled', true)
-				ON CONFLICT (team_id, key) DO UPDATE SET enabled = true`, team); err != nil {
+				ON CONFLICT (team_id, key) DO UPDATE SET enabled = true RETURNING team_id,enabled) INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) SELECT team_id,now()-interval '1 day',now()-interval '1 day' FROM enabled WHERE enabled ON CONFLICT DO NOTHING`, team); err != nil {
 				t.Fatal(err)
 			}
 			query := `INSERT INTO sandbox_compute_billing_interval
@@ -322,5 +322,190 @@ func TestRecentTrialBurnSampleStartsAtLatestSignupGrant(t *testing.T) {
 				t.Fatalf("pre-lifecycle activity produced sample: %+v", empty)
 			}
 		})
+	}
+}
+
+func TestRecentTrialBurnSampleIncludesRetainedArtifacts(t *testing.T) {
+	ctx := context.Background()
+	teamID := mustCreateTeam(t, ctx, "trial-warning-artifact-"+uuid.NewString()[:8])
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_credit_grant
+		(team_id, amount_usd, remaining_usd, reason, created_at)
+		VALUES ($1, 5, 5, 'signup trial credit', now() - interval '1 day')`, teamID); err != nil {
+		t.Fatalf("seed artifact warning trial grant: %v", err)
+	}
+	now := time.Now().UTC()
+	planKey := "trial-warning-artifact-" + uuid.NewString()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_plan (key, name, currency, active)
+		VALUES ($1, 'Artifact warning pricing', 'USD', true)`, planKey); err != nil {
+		t.Fatalf("seed artifact warning plan: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO pricing_rate (plan_key, resource, unit, price_usd, effective_from)
+		VALUES ($1, 'storage_gib', 'second', 1, $2)`, planKey, now.Add(-24*time.Hour)); err != nil {
+		t.Fatalf("seed artifact warning rate: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_pricing_plan (team_id, plan_key, effective_from)
+		VALUES ($1, $2, $3)`, teamID, planKey, now.Add(-24*time.Hour)); err != nil {
+		t.Fatalf("seed artifact warning pricing: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_storage_billing_activation (team_id, effective_at, approved_cutoff)
+		VALUES ($1, $2, $2)`, teamID, now.Add(-24*time.Hour)); err != nil {
+		t.Fatalf("seed artifact warning activation: %v", err)
+	}
+	sandboxID := seedPrivatePreviewSandbox(t, teamID, testDefaultHostID, "trial-warning-artifact")
+	var templateID uuid.UUID
+	artifactPath := "/example/artifacts/shared.ext4"
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO template (team_id, name, status, build_spec, vcpu, memory_mib, disk_mib, rootfs_path)
+		VALUES ($1, 'artifact-warning-template', 'ready', '{}', 1, 1024, 1024, $2)
+		RETURNING id`, teamID, artifactPath).Scan(&templateID); err != nil {
+		t.Fatalf("seed artifact warning template: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox SET template_id = $2 WHERE id = $1`, sandboxID, templateID); err != nil {
+		t.Fatalf("seed artifact warning sandbox template: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO artifact_manifest (template_id, file_name, path, size_bytes, allocated_bytes, sha256)
+		VALUES ($1, 'shared.ext4', $2, 1073741824, 1073741824, repeat('0', 64))`, templateID, artifactPath); err != nil {
+		t.Fatalf("seed artifact warning manifest: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
+		VALUES ($1, $2, 1024, $3)`, sandboxID, teamID, now.Add(-8*time.Hour)); err != nil {
+		t.Fatalf("seed retained artifact usage: %v", err)
+	}
+	sharedSandboxID := seedPrivatePreviewSandbox(t, teamID, testDefaultHostID, "trial-warning-artifact-shared")
+	if _, err := testPool.Exec(ctx, `
+		UPDATE sandbox SET template_id = $2 WHERE id = $1`, sharedSandboxID, templateID); err != nil {
+		t.Fatalf("seed shared artifact warning sandbox template: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
+		VALUES ($1, $2, 1024, $3)`, sharedSandboxID, teamID, now.Add(-8*time.Hour)); err != nil {
+		t.Fatalf("seed shared retained artifact usage: %v", err)
+	}
+	for _, id := range []uuid.UUID{sandboxID, sharedSandboxID} {
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO sandbox_compute_billing_interval (sandbox_id, team_id, vcpu_count, memory_mib, started_at)
+			VALUES ($1, $2, 1, 1024, $3)`, id, teamID, now.Add(-8*time.Hour)); err != nil {
+			t.Fatalf("seed compute before pause: %v", err)
+		}
+		op := uuid.New()
+		claimed := claimPauseOp(t, id, teamID, op)
+		if err := finalize(id, teamID, op, claimed.PauseOpLeaseVersion); err != nil {
+			t.Fatalf("finalize retained artifact pause: %v", err)
+		}
+		var paused, computeClosed, storageOpen bool
+		if err := testPool.QueryRow(ctx, `SELECT
+			(SELECT status = 'paused' AND destroyed_at IS NULL FROM sandbox WHERE id = $1),
+			EXISTS (SELECT 1 FROM sandbox_compute_billing_interval WHERE sandbox_id = $1 AND ended_at IS NOT NULL AND end_reason = 'paused'),
+			EXISTS (SELECT 1 FROM sandbox_storage_interval WHERE sandbox_id = $1 AND ended_at IS NULL)`, id).Scan(&paused, &computeClosed, &storageOpen); err != nil {
+			t.Fatal(err)
+		}
+		if !paused || !computeClosed || !storageOpen {
+			t.Fatalf("pause state: paused=%v computeClosed=%v storageOpen=%v", paused, computeClosed, storageOpen)
+		}
+		// Advance the completed pause past the sample window without changing
+		// the lifecycle's open storage interval or retained artifact.
+		if _, err := testPool.Exec(ctx, `UPDATE sandbox_compute_billing_interval
+			SET ended_at = $2 WHERE sandbox_id = $1`, id, now.Add(-7*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testPool.Exec(ctx, `UPDATE sandbox
+			SET created_at = $2, updated_at = $3 WHERE id = $1`, id, now.Add(-8*time.Hour), now.Add(-7*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sample, err := testQueries.GetRecentTrialBurnSample(ctx, teamID)
+	if err != nil {
+		t.Fatalf("GetRecentTrialBurnSample: %v", err)
+	}
+	spent, err := sample.SpentUsd.Float64Value()
+	if err != nil || !spent.Valid || spent.Float64 < 64799 || spent.Float64 > 64801 {
+		t.Fatalf("artifact-inclusive spend = %v, error = %v, want 64800 USD for two paused overlays and one shared retained artifact", spent, err)
+	}
+	started, ok := sample.StartedAt.(time.Time)
+	if !ok || now.Sub(started) < 5*time.Hour || now.Sub(started) > 6*time.Hour+time.Minute {
+		t.Fatalf("artifact sample start = %v, want six-hour boundary", sample.StartedAt)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_storage_interval SET disk_mib = 0 WHERE team_id = $1`, teamID); err != nil {
+		t.Fatal(err)
+	}
+	teams, err := db.New(warningDispatchScope{Pool: testPool, team: teamID}).ListTrialCreditWarningTeams(ctx, db.ListTrialCreditWarningTeamsParams{BatchLimit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(teams) != 1 || teams[0] != teamID {
+		t.Fatalf("artifact-only warning candidates = %v, want %s", teams, teamID)
+	}
+	sample, err = testQueries.GetRecentTrialBurnSample(ctx, teamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spent, err = sample.SpentUsd.Float64Value()
+	if err != nil || !spent.Valid || spent.Float64 < 21599 || spent.Float64 > 21601 {
+		t.Fatalf("artifact-only spend = %v, error = %v, want 21600 USD", spent, err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET template_id = NULL WHERE team_id = $1`, teamID); err != nil {
+		t.Fatal(err)
+	}
+	sample, err = testQueries.GetRecentTrialBurnSample(ctx, teamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spent, err = sample.SpentUsd.Float64Value()
+	if err != nil || !spent.Valid || spent.Float64 != 0 {
+		t.Fatalf("empty storage spend = %v, error = %v, want zero", spent, err)
+	}
+}
+
+func TestListTeamsWithTrialCreditsSkipsStableIneligibleHistory(t *testing.T) {
+	ctx := context.Background()
+	stale := mustCreateTeam(t, ctx, "trial-refresh-stale-"+uuid.NewString()[:8])
+	renewed := mustCreateTeam(t, ctx, "trial-refresh-renewed-"+uuid.NewString()[:8])
+	active := mustCreateTeam(t, ctx, "trial-refresh-active-"+uuid.NewString()[:8])
+	for _, teamID := range []uuid.UUID{stale, renewed, active} {
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, created_at)
+			VALUES ($1, 5, 0, 'signup trial credit', now() - interval '2 days')`, teamID); err != nil {
+			t.Fatalf("seed exhausted grant for %s: %v", teamID, err)
+		}
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO team_trial_eligibility_cache (team_id, eligible, updated_at)
+			VALUES ($1, false, now() - interval '1 day')
+			ON CONFLICT (team_id) DO UPDATE SET eligible = false, updated_at = EXCLUDED.updated_at`, teamID); err != nil {
+			t.Fatalf("seed cached verdict for %s: %v", teamID, err)
+		}
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO team_credit_grant (team_id, amount_usd, remaining_usd, reason, created_at)
+		VALUES ($1, 5, 5, 'signup trial credit', now())`, renewed); err != nil {
+		t.Fatalf("seed renewed grant: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		UPDATE team_trial_eligibility_cache SET eligible = true, updated_at = now()
+		WHERE team_id = $1`, active); err != nil {
+		t.Fatalf("seed active verdict: %v", err)
+	}
+	seen := map[uuid.UUID]bool{}
+	for _, teamID := range []uuid.UUID{stale, renewed, active} {
+		queries := db.New(warningDispatchScope{Pool: testPool, team: teamID})
+		teams, err := queries.ListTeamsWithTrialCredits(ctx, db.ListTeamsWithTrialCreditsParams{BatchLimit: 100})
+		if err != nil {
+			t.Fatalf("ListTeamsWithTrialCredits: %v", err)
+		}
+		for _, candidate := range teams {
+			seen[candidate] = true
+		}
+	}
+	if seen[stale] {
+		t.Fatal("stable exhausted trial was scheduled for refresh")
+	}
+	if !seen[renewed] || !seen[active] {
+		t.Fatalf("refresh candidates = %v, want renewed and active teams", seen)
 	}
 }

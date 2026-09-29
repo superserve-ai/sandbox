@@ -544,3 +544,70 @@ func TestIncrementalDecisionPinsMeterAcrossProviderReads(t *testing.T) {
 		t.Fatalf("new decision retained stale mapping: lookups=%d meters=%v", lookups, meters)
 	}
 }
+
+func TestIncrementalExportItemsSubscriptionInclusion(t *testing.T) {
+	var cpuSeconds, memorySeconds, storageSeconds pgtype.Numeric
+	for numeric, value := range map[*pgtype.Numeric]string{
+		&cpuSeconds: "3600", &memorySeconds: "7372800", &storageSeconds: "11059200",
+	} {
+		if err := numeric.Scan(value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	usage := db.TeamBillingUsage{
+		VcpuSeconds: cpuSeconds, MemoryMibSeconds: memorySeconds, StorageMibSeconds: storageSeconds,
+	}
+	subscriptionEnabled, subscriptionDisabled := true, false
+	for _, tc := range []struct {
+		name                string
+		checkoutEnabled     bool
+		subscriptionEnabled *bool
+		billable            bool
+		wantCompute         bool
+		wantStorage         bool
+	}{
+		{name: "legacy included", checkoutEnabled: true, billable: true, wantCompute: true, wantStorage: true},
+		{name: "legacy excluded", billable: true, wantStorage: true},
+		{name: "explicit inclusion overrides legacy exclusion", subscriptionEnabled: &subscriptionEnabled, billable: true, wantCompute: true, wantStorage: true},
+		{name: "explicit exclusion overrides legacy inclusion", checkoutEnabled: true, subscriptionEnabled: &subscriptionDisabled, billable: true, wantStorage: true},
+		{name: "nonbillable legacy included", checkoutEnabled: true},
+		{name: "nonbillable explicitly included", subscriptionEnabled: &subscriptionEnabled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, resource := range []struct {
+				key          string
+				resourceType string
+				eventName    string
+				quantity     string
+				want         bool
+			}{
+				{"vcpu", "cpu", "cpu_vcpu_hours", "1.000000000000", tc.wantCompute},
+				{"memory_gib", "memory", "memory_gib_hours", "2.000000000000", tc.wantCompute},
+				{"storage_gib", "storage", "storage_gib_hours", "3.000000000000", tc.wantStorage},
+			} {
+				t.Run(resource.key, func(t *testing.T) {
+					items, err := incrementalExportItems(usage, []billingResourceState{{
+						BillingResourceConfig: config.BillingResourceConfig{
+							ResourceKey: resource.key, StripeEventName: resource.eventName,
+							CheckoutEnabled: tc.checkoutEnabled, SubscriptionEnabled: tc.subscriptionEnabled,
+						},
+						Billable: tc.billable,
+					}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !resource.want {
+						if len(items) != 0 {
+							t.Fatalf("items = %+v, want no export items", items)
+						}
+						return
+					}
+					want := incrementalExportItem{ResourceType: resource.resourceType, EventName: resource.eventName, Quantity: resource.quantity}
+					if len(items) != 1 || items[0] != want {
+						t.Fatalf("items = %+v, want [%+v]", items, want)
+					}
+				})
+			}
+		})
+	}
+}

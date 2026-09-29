@@ -1333,6 +1333,15 @@ type TeamSignupTrialProvenance struct {
 	CreatedAt      time.Time          `json:"created_at"`
 }
 
+type TeamStorageBillingActivation struct {
+	TeamID                 uuid.UUID `json:"team_id"`
+	EffectiveAt            time.Time `json:"effective_at"`
+	ApprovedCutoff         time.Time `json:"approved_cutoff"`
+	VerifiedSubscriptionID *string   `json:"verified_subscription_id"`
+	VerifiedPriceID        *string   `json:"verified_price_id"`
+	CreatedAt              time.Time `json:"created_at"`
+}
+
 type TeamTrialEligibilityCache struct {
 	TeamID    uuid.UUID `json:"team_id"`
 	Eligible  bool      `json:"eligible"`
