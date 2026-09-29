@@ -7,6 +7,9 @@ cd "$ROOT_DIR"
 terraform_dirs=(
   infra/bootstrap/control-plane-evidence
   infra/bootstrap/control-plane-policy-visibility
+  infra/bootstrap/qm
+  infra/envs/qm/development
+  infra/envs/qm/production
   infra/envs/staging/us-central1
   infra/envs/production/us-central1
   infra/envs/production/us-west2
@@ -31,5 +34,16 @@ for dir in "${terraform_dirs[@]}"; do
     cd "$dir"
     TF_IN_AUTOMATION=true terraform init -backend=false -lockfile=readonly -input=false
     terraform validate
+  )
+done
+
+# QM roots stay dormant in deployment workflows. These checks need no cloud
+# credentials and exercise the permission and egress boundaries with mocks.
+for module in qm qm-bootstrap; do
+  (
+    cd "infra/modules/${module}"
+    TF_IN_AUTOMATION=true terraform init -backend=false -lockfile=readonly -input=false
+    terraform validate
+    terraform test
   )
 done
