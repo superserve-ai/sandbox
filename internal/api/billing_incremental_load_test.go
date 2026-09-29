@@ -2459,138 +2459,262 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 
 func testMeterEvidenceEventBudgetDatabase(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
-	ctx := t.Context()
-	exec := func(sql string, args ...any) {
-		t.Helper()
-		if _, err := pool.Exec(ctx, sql, args...); err != nil {
-			t.Fatal(err)
-		}
-	}
-	now := time.Now().UTC().Truncate(time.Hour)
-	start := now.Add(-48 * time.Hour)
-	end := now.Add(-24 * time.Hour)
-	team, err := db.New(pool).CreateTeam(ctx, "example-meter-event-budget")
-	if err != nil {
-		t.Fatal(err)
-	}
-	customer := "cus_example_" + team.ID.String()
-	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_status,commercial_billing_anchor)
+	for _, count := range []int{4096, 4097} {
+		t.Run(fmt.Sprintf("event-budget-%d", count), func(t *testing.T) {
+			ctx := t.Context()
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, err := pool.Exec(ctx, sql, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			now := time.Now().UTC().Truncate(time.Hour)
+			start := now.Add(-72*time.Hour).AddDate(0, -2, 0)
+			end := start.AddDate(0, 1, 0)
+			team, err := db.New(pool).CreateTeam(ctx, fmt.Sprintf("example-meter-event-budget-%d", count))
+			if err != nil {
+				t.Fatal(err)
+			}
+			customer := "cus_example_" + team.ID.String()
+			exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_status,commercial_billing_anchor)
  VALUES($1,$2,'active',$3)`, team.ID, customer, start)
-	exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)
+			exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)
  ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, team.ID)
-	exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'approved')`, team.ID, start, end)
-	p := billing.ExportPeriod{TeamID: team.ID, Start: start, End: end}
-	store := billing.ExportStore{Pool: pool}
-	if err := store.Enroll(ctx, p); err != nil {
-		t.Fatal(err)
-	}
+			exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'approved')`, team.ID, start, end)
+			p := billing.ExportPeriod{TeamID: team.ID, Start: start, End: end}
+			store := billing.ExportStore{Pool: pool}
+			if err := store.Enroll(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+			// Start after measurement has frozen so a rejected export cannot
+			// legitimately change the period or its measurement snapshot.
+			exec(`INSERT INTO team_billing_usage(team_id,period_start,period_end,vcpu_seconds)
+ VALUES($1,$2,$3,$4::numeric*3600)`, team.ID, start, end, count)
+			exec(`UPDATE team_billing_period SET status='exporting' WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end)
 
-	// Bulk-load the exact first row beyond the persisted evidence budget.
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = tx.Exec(ctx, `ALTER TABLE billing_export_allocation DISABLE TRIGGER billing_export_allocation_validate`); err != nil {
-		tx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	if _, err = tx.Exec(ctx, `INSERT INTO billing_export_allocation
+			timestamp := end.Add(-2 * time.Minute).Unix()
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err = tx.Exec(ctx, `ALTER TABLE billing_export_allocation DISABLE TRIGGER billing_export_allocation_validate`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(ctx, `INSERT INTO billing_export_allocation
  (team_id,period_start,period_end,resource_type,coverage_start,coverage_end,measured_through)
  SELECT $1,$2,$3,'cpu',(n-1)::numeric,n::numeric,$3
- FROM generate_series(1,4097) AS n`, team.ID, start, end); err != nil {
-		tx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	if _, err = tx.Exec(ctx, `ALTER TABLE billing_export_allocation ENABLE TRIGGER billing_export_allocation_validate`); err != nil {
-		tx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	if _, err = tx.Exec(ctx, `INSERT INTO billing_export_event
+ FROM generate_series(1,$4::integer) AS n`, team.ID, start, end, count); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(ctx, `ALTER TABLE billing_export_allocation ENABLE TRIGGER billing_export_allocation_validate`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(ctx, `INSERT INTO billing_export_event
  (id,allocation_id,identifier,idempotency_key,event_name,customer_id,quantity,quantity_payload,
   event_timestamp,source,status)
- SELECT gen_random_uuid(),a.id,'meter-budget-'||a.coverage_start::text,
-        'meter-budget-'||a.coverage_start::text,'cpu_vcpu_hours',$2,1,'1',
-        extract(epoch FROM $3::timestamptz - interval '1 second')::bigint,'export','submitted'
+ SELECT gen_random_uuid(),a.id,$5||a.coverage_start::text,
+        $5||a.coverage_start::text,'cpu_vcpu_hours',$2,1,'1',$6,'export','submitted'
  FROM billing_export_allocation a
  WHERE a.team_id=$1 AND a.period_start=$4 AND a.period_end=$3
-   AND a.resource_type='cpu' ORDER BY a.coverage_start`, team.ID, customer, end, start); err != nil {
-		tx.Rollback(ctx)
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
+   AND a.resource_type='cpu' ORDER BY a.coverage_start`, team.ID, customer, end, start, "meter-budget-"+team.ID.String()+"-", timestamp); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
 
-	h := &Handlers{Pool: pool, DB: db.New(pool), Now: func() time.Time { return now }}
-	events, err := h.meterLocalEvidence(ctx, p, "cpu")
-	if err == nil || !strings.Contains(err.Error(), "event budget") || events != nil {
-		t.Fatalf("persisted event budget was accepted: events=%d err=%v", len(events), err)
-	}
-	var snapshot *string
-	if err := pool.QueryRow(ctx, `SELECT billing_meter_accounting_snapshot($1,$2,$3,'cpu')::text`, team.ID, start, end).Scan(&snapshot); err != nil {
-		t.Fatal(err)
-	}
-	if snapshot != nil {
-		t.Fatalf("over-limit accounting snapshot was not incomplete: %s", *snapshot)
-	}
-	provider := &precisionWorkerStripe{
-		openPeriodStripe: openPeriodStripe{summary: func() (string, error) {
-			return "4097.000000000001", nil
-		}},
-		checkUnlocked: func(context.Context) error { return nil },
-	}
-	decision := h.assessMeterSummary(ctx, p, incrementalExportItem{
-		ResourceType: "cpu", EventName: "cpu_vcpu_hours", Quantity: "4097",
-	}, end, provider, customer, "4097.000000000001", billing.ExportTotals{
-		Reserved: "4097", Submitted: "4097",
-	}, nil)
-	if decision.Err == nil || !errors.Is(decision.Err, billing.ErrExportRecoveryRequired) {
-		t.Fatalf("over-limit evidence did not require recovery: %+v", decision)
-	}
+			provider := &precisionWorkerStripe{
+				mode: "complete", drift: big.NewRat(1, 10_000_000_000_000),
+				checkUnlocked: func(context.Context) error { return nil },
+			}
+			for i := 0; i < count; i++ {
+				provider.calls = append(provider.calls, StripeReportMeterEventParams{
+					EventName: "cpu_vcpu_hours", CustomerID: customer, Value: "1", Timestamp: timestamp,
+				})
+			}
+			h := &Handlers{Pool: pool, DB: db.New(pool), Stripe: provider, Now: func() time.Time { return now }}
+			quantity := fmt.Sprint(count)
+			counted, err := provider.CountedMeterUsage(ctx, "cpu_vcpu_hours", customer, start, end)
+			if err != nil {
+				t.Fatal(err)
+			}
+			numeric, needsEvidence := compareMeterSummary(counted, quantity)
+			if !needsEvidence || numeric.Outcome != "incomplete" || numeric.Difference != provider.drift.RatString() {
+				t.Fatalf("fixture did not reach evidence gate: %+v", numeric)
+			}
+			var withinBound bool
+			if err := pool.QueryRow(ctx, `SELECT $1::numeric>0 AND $1::numeric<=billing_meter_precision_bound($2::numeric)`, "0.0000000000001", quantity).Scan(&withinBound); err != nil || !withinBound {
+				t.Fatalf("fixture residual exceeds SQL policy: %v %v", withinBound, err)
+			}
+			events, err := h.meterLocalEvidence(ctx, p, "cpu")
+			if count == 4096 {
+				if err != nil || len(events) != count {
+					t.Fatalf("at-limit local evidence: events=%d err=%v", len(events), err)
+				}
+			} else if err == nil || err.Error() != "local meter evidence exceeds event budget" || events != nil {
+				t.Fatalf("over-limit local evidence: events=%d err=%v", len(events), err)
+			}
 
-	// Supply an observation so the close trigger reaches its reconciliation
-	// gate, then verify that the failed transition leaves state untouched.
-	queryStart := start.Truncate(time.Minute)
-	queryEnd := end.Truncate(time.Minute)
-	exec(`INSERT INTO billing_export_observation
+			// Seed complete evidence even for the over-limit inventory. This
+			// unbounded test-only snapshot differs from the production query
+			// solely in its inventory limit, so missing evidence cannot mask it.
+			var fullSnapshot string
+			var collected time.Time
+			if err := pool.QueryRow(ctx, `SELECT jsonb_build_object(
+ 'events',(SELECT jsonb_agg(jsonb_build_array(a.id,a.coverage_start,a.coverage_end,a.measured_through,a.correction_id,
+ e.id,e.accounting_sequence,e.active,e.status,e.event_name,e.customer_id,e.quantity_payload,
+ e.event_timestamp,e.updated_at,e.recovery_outcome,e.recovery_evidence) ORDER BY a.coverage_end,e.id)
+ FROM billing_export_allocation a LEFT JOIN billing_export_event e ON e.allocation_id=a.id
+ WHERE a.team_id=$1 AND a.period_start=$2 AND a.period_end=$3 AND a.resource_type='cpu'),
+ 'correction_version',(SELECT correction_version FROM billing_incremental_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3),
+ 'measurement',(SELECT jsonb_build_array(vcpu_seconds,memory_mib_seconds,storage_mib_seconds)
+ FROM team_billing_usage WHERE team_id=$1 AND period_start=$2 AND period_end=$3),
+ 'customer',(SELECT stripe_customer_id FROM team_billing_account WHERE team_id=$1))::text,clock_timestamp()`, team.ID, start, end).Scan(&fullSnapshot, &collected); err != nil {
+				t.Fatal(err)
+			}
+			var boundedSnapshot *string
+			if err := pool.QueryRow(ctx, `SELECT billing_meter_accounting_snapshot($1,$2,$3,'cpu')::text`, team.ID, start, end).Scan(&boundedSnapshot); err != nil {
+				t.Fatal(err)
+			}
+			if count == 4096 {
+				if boundedSnapshot == nil || *boundedSnapshot != fullSnapshot {
+					t.Fatal("at-limit SQL snapshot is incomplete or differs from full inventory")
+				}
+			} else if boundedSnapshot != nil {
+				t.Fatal("over-limit SQL snapshot is not NULL")
+			}
+			evidence := meterCloseEvidence{
+				MeterID: provider.MeterID(), EventName: "cpu_vcpu_hours", Customer: customer,
+				Snapshot: fullSnapshot, CollectedAt: collected,
+			}
+			for pass := 0; pass < 2; pass++ {
+				buckets, err := provider.BucketedMeterUsage(ctx, evidence.EventName, customer, start, end)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, bucket := range buckets {
+					want := new(big.Rat)
+					if timestamp >= bucket.Start.Unix() && timestamp < bucket.End.Unix() {
+						want.SetInt64(int64(count))
+					}
+					got, err := meterDecimal(bucket.Quantity)
+					if err != nil || got.Cmp(want) != 0 {
+						t.Fatalf("provider pass %d does not match persisted events: %+v %v", pass, bucket, err)
+					}
+				}
+				evidence.Passes = append(evidence.Passes, completeMeterBuckets(buckets, start, end))
+			}
+			item := incrementalExportItem{ResourceType: "cpu", EventName: evidence.EventName, Quantity: quantity}
+			totals, err := store.Totals(ctx, p, "cpu")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, through := range []time.Time{end.Add(-time.Minute), end} {
+				decision := h.assessMeterSummary(ctx, p, item, through, provider, customer, counted, totals, nil)
+				if count == 4096 {
+					if decision.Err != nil || decision.Outcome != "explained_precision" {
+						t.Fatalf("at-limit export decision: %+v", decision)
+					}
+				} else {
+					want := "local meter evidence exceeds event budget"
+					if through.Equal(end) {
+						want = "incomplete bounded accounting snapshot"
+					}
+					if !errors.Is(decision.Err, billing.ErrExportRecoveryRequired) || decision.Outcome != "incomplete" || !strings.Contains(decision.Err.Error(), want) || decision.CloseEvidence != nil {
+						t.Fatalf("over-limit export rejected for wrong reason: %+v", decision)
+					}
+				}
+			}
+			exec(`INSERT INTO billing_export_observation
  (team_id,period_start,period_end,resource_type,local_quantity,submitted_quantity,reserved_quantity,
-  counted_quantity,observed_at,query_start,query_end,last_error,meter_id)
- VALUES($1,$2,$3,'cpu',4097,4097,4097,4097.000000000001,now(),$4,$5,NULL,'mtr_example_precision')`, team.ID, start, end, queryStart, queryEnd)
-	var beforeAllocations, beforeEvents, beforeHistory int
-	if err := pool.QueryRow(ctx, `SELECT
- (SELECT count(*) FROM billing_export_allocation WHERE team_id=$1 AND period_start=$2 AND period_end=$3),
- (SELECT count(*) FROM billing_export_event e JOIN billing_export_allocation a ON a.id=e.allocation_id
-  WHERE a.team_id=$1 AND a.period_start=$2 AND a.period_end=$3)`, team.ID, start, end).Scan(&beforeAllocations, &beforeEvents); err != nil {
-		t.Fatal(err)
-	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM billing_meter_reconciliation WHERE team_id=$1`, team.ID).Scan(&beforeHistory); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pool.Exec(ctx, `UPDATE team_billing_period SET status='exported',exported_at=now()
- WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end); err == nil {
-		t.Fatal("over-limit accounting snapshot authorized close")
-	}
-	var status string
-	var exported bool
-	if err := pool.QueryRow(ctx, `SELECT status,exported_at IS NOT NULL FROM team_billing_period
- WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end).Scan(&status, &exported); err != nil {
-		t.Fatal(err)
-	}
-	if status != "approved" || exported {
-		t.Fatalf("failed close mutated period: status=%s exported=%v", status, exported)
-	}
-	var afterAllocations, afterEvents, afterHistory int
-	if err := pool.QueryRow(ctx, `SELECT
- (SELECT count(*) FROM billing_export_allocation WHERE team_id=$1 AND period_start=$2 AND period_end=$3),
- (SELECT count(*) FROM billing_export_event e JOIN billing_export_allocation a ON a.id=e.allocation_id
-  WHERE a.team_id=$1 AND a.period_start=$2 AND a.period_end=$3)`, team.ID, start, end).Scan(&afterAllocations, &afterEvents); err != nil {
-		t.Fatal(err)
-	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM billing_meter_reconciliation WHERE team_id=$1`, team.ID).Scan(&afterHistory); err != nil {
-		t.Fatal(err)
-	}
-	if afterAllocations != beforeAllocations || afterEvents != beforeEvents || afterHistory != beforeHistory {
-		t.Fatalf("failed close mutated accounting/history: allocations=%d/%d events=%d/%d history=%d/%d", afterAllocations, beforeAllocations, afterEvents, beforeEvents, afterHistory, beforeHistory)
+ counted_quantity,query_start,query_end,meter_id)
+ VALUES($1,$2,$3,'cpu',$4,$4,$4,$5,$2,$3,$6)`, team.ID, start, end, quantity, counted, provider.MeterID())
+			tx, err = pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if err := persistMeterCloseEvidence(ctx, tx, p, "cpu", evidence); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			state := func() string {
+				t.Helper()
+				var value string
+				if err := pool.QueryRow(ctx, `SELECT jsonb_build_object(
+ 'allocations',(SELECT jsonb_agg(to_jsonb(a) ORDER BY a.id) FROM billing_export_allocation a WHERE team_id=$1),
+ 'events',(SELECT jsonb_agg(to_jsonb(e) ORDER BY e.id) FROM billing_export_event e
+ JOIN billing_export_allocation a ON a.id=e.allocation_id WHERE a.team_id=$1),
+ 'periods',(SELECT jsonb_agg(to_jsonb(p) ORDER BY period_start) FROM team_billing_period p WHERE team_id=$1),
+ 'incremental',(SELECT jsonb_agg(to_jsonb(p) ORDER BY period_start) FROM billing_incremental_period p WHERE team_id=$1),
+ 'usage',(SELECT jsonb_agg(to_jsonb(u) ORDER BY period_start) FROM team_billing_usage u WHERE team_id=$1),
+ 'export_usage',(SELECT jsonb_agg(to_jsonb(u) ORDER BY period_start) FROM billing_export_usage u WHERE team_id=$1),
+ 'history',(SELECT jsonb_agg(to_jsonb(r) ORDER BY id) FROM billing_meter_reconciliation r WHERE team_id=$1))::text`, team.ID).Scan(&value); err != nil {
+					t.Fatal(err)
+				}
+				return value
+			}
+			before := state()
+			mapping, err := billing.RevalidateMeterCloseMapping(ctx, pool, p, h.ResolveActiveBillingMeter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err = pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if err := mapping.Bind(ctx, tx); err != nil {
+				t.Fatal(err)
+			}
+			var mapped bool
+			if err := tx.QueryRow(ctx, `SELECT count(*)=1 AND bool_and(
+ current_setting('billing.close_meter_mapping')::jsonb->'meters'->>r.id::text=r.meter_id)
+ FROM billing_meter_reconciliation r WHERE team_id=$1`, team.ID).Scan(&mapped); err != nil || !mapped {
+				t.Fatalf("close fixture lacks current evidence mapping: %v %v", mapped, err)
+			}
+			var matches bool
+			if err := tx.QueryRow(ctx, `SELECT billing_meter_close_evidence_matches(o) FROM billing_export_observation o
+ WHERE team_id=$1 AND resource_type='cpu'`, team.ID).Scan(&matches); err != nil || matches != (count == 4096) {
+				t.Fatalf("close evidence applicability: matches=%v err=%v", matches, err)
+			}
+			_, closeErr := tx.Exec(ctx, `UPDATE team_billing_period SET status='exported',exported_at=now()
+ WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end)
+			if count == 4096 {
+				if closeErr != nil {
+					t.Fatalf("at-limit database close: %v", closeErr)
+				}
+			} else if closeErr == nil || !strings.Contains(closeErr.Error(), "incremental export requires fresh matching Stripe reconciliation") {
+				t.Fatalf("over-limit close rejected for wrong reason: %v", closeErr)
+			}
+			if err := tx.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if state() != before {
+				t.Fatal("close attempt changed accounting, payloads, coverage, period or history")
+			}
+
+			result, exportErr := h.exportIncrementalPeriod(ctx, p)
+			if count == 4096 {
+				if exportErr != nil || result.Status != "exported" {
+					t.Fatalf("at-limit actual export/close: %+v %v", result, exportErr)
+				}
+			} else {
+				if !errors.Is(exportErr, billing.ErrExportRecoveryRequired) || !strings.Contains(exportErr.Error(), "incomplete bounded accounting snapshot") {
+					t.Fatalf("over-limit actual export rejected for wrong reason: %+v %v", result, exportErr)
+				}
+				if state() != before {
+					t.Fatal("rejected export changed accounting, payloads, coverage, period or history")
+				}
+			}
+			if len(provider.attempts) != 0 || len(provider.calls) != count {
+				t.Fatal("event-budget decision replayed historical usage")
+			}
+		})
 	}
 }
 
