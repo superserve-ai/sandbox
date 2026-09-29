@@ -25,6 +25,13 @@ Never publish state or unsanitized plan JSON as public artifacts. Root outputs
 contain references only. Routine network Terraform never reads bootstrap state;
 the release operator transfers its reviewed, non-secret `contract` output.
 
+Bootstrap also enables the QM project's Cloud Storage `DATA_READ` and
+`DATA_WRITE` audit logs. This project-level configuration covers reads and
+writes of the routine state bucket without granting `qm-infra` project IAM
+authority. The administrator must verify during rollout that the effective
+Cloud Audit Logs routing and retention policy preserves those records; the
+routine network root must not manage or weaken this setting.
+
 | Environment | Paired project | QM project | Regions / tenant CIDRs |
 | --- | --- | --- | --- |
 | development | `rayai-dev` | `rayai-qm-dev` | `us-central1`: `10.80.0.0/20` |

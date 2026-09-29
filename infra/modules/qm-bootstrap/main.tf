@@ -158,6 +158,23 @@ resource "google_storage_bucket" "routine_state" {
   }
 }
 
+# Keep state-object reads and writes attributable without giving the routine
+# state owner project-level IAM policy authority. Effective log routing and
+# retention remain part of the administrator's rollout verification.
+resource "google_project_iam_audit_config" "storage_data_access" {
+  project    = google_project.qm.project_id
+  service    = "storage.googleapis.com"
+  depends_on = [google_project_service.enabled]
+
+  audit_log_config {
+    log_type = "DATA_READ"
+  }
+
+  audit_log_config {
+    log_type = "DATA_WRITE"
+  }
+}
+
 resource "google_storage_bucket_iam_member" "routine_state" {
   bucket = google_storage_bucket.routine_state.name
   role   = "roles/storage.objectAdmin"

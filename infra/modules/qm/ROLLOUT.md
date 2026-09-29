@@ -152,6 +152,10 @@ executor without granting routine jobs bootstrap impersonation.
    with approvals/branch protection; the provisioner deployment environment is
    privileged. Authenticate the routine network job as `qm-infra` and apply the
    matching `infra/envs/qm/...` root. No bootstrap state read is needed.
+   Confirm that the bootstrap project IAM audit configuration enables Cloud
+   Storage `DATA_READ` and `DATA_WRITE` logs, and that the effective Cloud
+   Audit Logs route and retention policy keeps routine state-object access
+   records available to incident-response operators.
 3. Database and edge owners apply their own protected states. Supply control DB
    deny CIDRs and cell endpoint maps to the network root; inspect that control
    denial has higher priority than all cell allows. Populate platform secret
