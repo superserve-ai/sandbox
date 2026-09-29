@@ -254,12 +254,21 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	}
 
 	var inst *VMInstance
-	if id := vmCfg.SavedSnapshotID; id != "" && a.mgr.BackupRestoreEnabled() && a.mgr.savedSnapshotFilesMissing(id) && !a.mgr.forkAlreadyBooted(req.GetVmId(), id) {
+	id := vmCfg.SavedSnapshotID
+	missing := id != "" && a.mgr.savedSnapshotFilesMissing(id)
+	if missing {
+		if inst, err = a.mgr.adoptBackupFork(req.GetVmId(), id, req.GetBackupGeneration(), vmCfg.EgressRules); err != nil {
+			return nil, err
+		}
+	}
+	switch {
+	case inst != nil:
+	case missing && a.mgr.BackupRestoreEnabled() && !a.mgr.forkAlreadyBooted(req.GetVmId(), id):
 		if req.GetBackupGeneration() == "" {
 			return nil, savedSnapshotMissingErr(id)
 		}
 		inst, err = a.mgr.forkFromBackup(ctx, req.GetVmId(), req.GetBackupGeneration(), vmCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
-	} else {
+	default:
 		inst, err = a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
 	}
 	if err != nil {

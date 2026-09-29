@@ -74,3 +74,39 @@ func TestForkOfAMissingSnapshotWithoutBackupRestore(t *testing.T) {
 		t.Fatalf("err = %v, want plain NotFound", err)
 	}
 }
+
+// A destroy that completes while the backup downloads wins: nothing boots.
+func TestForkFromBackupYieldsToADestroyDuringTheDownload(t *testing.T) {
+	m := newSavedTestManager(t)
+	m.SetBackupRestore(&slowEmptyStore{}, &slowEmptyStore{}, filepath.Join(t.TempDir(), ".restore"), BackupRestoreOptions{Concurrency: 1})
+	disk := touch(t, filepath.Join(t.TempDir(), "rootfs.ext4"))
+	orig := fetchBackupGeneration
+	fetchBackupGeneration = func(context.Context, backup.BlobReader, string, string, string, backup.ProgressFunc) (backup.Restored, error) {
+		m.bumpDestroyEpoch("fork-1")
+		return backup.Restored{Disk: disk, Standalone: true}, nil
+	}
+	defer func() { fetchBackupGeneration = orig }()
+	cfg := VMConfig{VCPU: 1, MemoryMiB: 512, SavedSnapshotID: "5f0c2a9e-1b7d-4c3e-8a6f-0d9e2b4c7a13"}
+	if _, err := m.forkFromBackup(context.Background(), "fork-1", "gen-1", cfg, "team", "", "", nil, 0); status.Code(err) != codes.Aborted {
+		t.Fatalf("err = %v, want Aborted", err)
+	}
+	if _, ok := m.vms["fork-1"]; ok {
+		t.Fatal("a destroyed fork was booted")
+	}
+}
+
+// A fork booted from backup is adopted by its retry even once backup
+// restore is off.
+func TestBackupForkRetryIsAdoptedWithBackupRestoreOff(t *testing.T) {
+	m := newSavedTestManager(t)
+	snapshotID := "5f0c2a9e-1b7d-4c3e-8a6f-0d9e2b4c7a13"
+	m.vms["fork-1"] = &VMInstance{ID: "fork-1", Status: StatusRunning, SourceSnapshotID: snapshotID, BackupGeneration: "gen-1"}
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false }
+	defer func() { vmDeadForRetry = orig }()
+	a := &GRPCAdapter{mgr: m}
+	req := &vmdpb.RestoreSnapshotRequest{VmId: "fork-1", SavedSnapshotId: snapshotID, BackupGeneration: "gen-1", ResourceLimits: &vmdpb.ResourceLimits{VcpuCount: 1, MemoryMib: 512}}
+	if resp, err := a.RestoreSnapshot(context.Background(), req); err != nil || resp.GetVmId() != "fork-1" {
+		t.Fatalf("retry: %v, %v", resp, err)
+	}
+}

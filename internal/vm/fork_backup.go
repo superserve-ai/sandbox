@@ -49,9 +49,34 @@ func savedSnapshotMissingErr(snapshotID string) error {
 	return st.Err()
 }
 
+// adoptBackupFork returns the live VM a fork from the snapshot's backup
+// already booted as vmID, with its egress rules reinstalled, so a retry
+// adopts it whether or not backup restore is still on. Nil when there is none.
+func (m *Manager) adoptBackupFork(vmID, snapshotID, generation string, rules *sandboxNetworkRules) (*VMInstance, error) {
+	m.lazyReattach(vmID)
+	m.mu.RLock()
+	inst := m.vms[vmID]
+	m.mu.RUnlock()
+	if inst == nil {
+		return nil, nil
+	}
+	inst.mu.RLock()
+	ours := inst.Status == StatusRunning && !inst.Unverified && inst.SourceSnapshotID == snapshotID &&
+		inst.BackupGeneration != "" && (generation == "" || inst.BackupGeneration == generation)
+	inst.mu.RUnlock()
+	if !ours || vmDeadForRetry(m, vmID) {
+		return nil, nil
+	}
+	if rules != nil && !m.applyAdoptedNetworkRules(vmID, rules) {
+		return nil, status.Errorf(codes.Unavailable, "fork adopted vm %s but could not reinstall its egress rules", vmID)
+	}
+	return inst, nil
+}
+
 // forkFromBackup creates a VM from a saved snapshot whose files are gone
 // from this host by cold booting the disk its backup holds. Backups carry no
-// memory, so the VM starts fresh with the snapshot's files.
+// memory, so the VM starts fresh with the snapshot's files. A destroy that
+// lands at any point wins, as it does over a revival.
 func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, cfg VMConfig, teamID, ownerID, previewAccess string, previewPorts map[int32]PreviewPortPolicy, previewPolicyRevision int64) (*VMInstance, error) {
 	if !isLeafName(vmID) || isReservedRunDirName(vmID) {
 		return nil, status.Errorf(codes.InvalidArgument, "vm_id %q must be a valid per-VM identifier", vmID)
@@ -61,25 +86,37 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 		return nil, err
 	}
 	defer unlock()
+	if inst, err := m.adoptBackupFork(vmID, cfg.SavedSnapshotID, generation, cfg.EgressRules); inst != nil || err != nil {
+		return inst, err
+	}
+	// Own teardowns keep the staged download for the retry, and are
+	// counted so only someone else's destroy reads as one.
+	selfDestroys := uint64(0)
+	teardown := func(c context.Context) error {
+		err := m.DestroyVM(context.WithValue(c, reviveTeardownCtxKey{}, true), vmID, true)
+		if err == nil {
+			selfDestroys++
+		}
+		return err
+	}
 	if inst, err := m.getInstance(vmID); err == nil {
 		inst.mu.RLock()
 		running := inst.Status == StatusRunning && !inst.Unverified
-		ours := inst.SourceSnapshotID == cfg.SavedSnapshotID && inst.BackupGeneration == generation
 		inst.mu.RUnlock()
-		switch {
-		case running && ours && !vmDeadForRetry(m, vmID):
-			// A retry of a fork that booted: adopt it.
-			if cfg.EgressRules != nil && !m.applyAdoptedNetworkRules(vmID, cfg.EgressRules) {
-				return nil, status.Errorf(codes.Unavailable, "fork adopted vm %s but could not reinstall its egress rules", vmID)
-			}
-			return inst, nil
-		case running:
+		if running {
 			return nil, status.Errorf(codes.AlreadyExists, "vm %s is already running", vmID)
 		}
 		// What a failed attempt left behind.
-		if err := m.DestroyVM(ctx, vmID, true); err != nil {
+		if err := teardown(ctx); err != nil {
 			return nil, err
 		}
+	}
+	epoch := m.destroyEpoch(vmID) - selfDestroys
+	destroyed := func() error {
+		if m.destroyEpoch(vmID) != epoch+selfDestroys {
+			return status.Errorf(codes.Aborted, "vm %s was destroyed while its fork was starting; the destroy is authoritative", vmID)
+		}
+		return nil
 	}
 	r, release, err := m.fetchBackup(ctx, "restore", vmID, backup.SnapshotOwner(cfg.SavedSnapshotID), generation)
 	if err != nil {
@@ -99,19 +136,23 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 		inst.PreviewPolicyRevision = previewPolicyRevision
 		inst.PreviewTokenPolicyRevision = inferPreviewTokenPolicyRevision(previewPorts, previewPolicyRevision)
 	}
-	inst, err := m.coldBootFromRootfs(ctx, vmID, r.Disk, r.Base, r.BlockMap, cfg.EgressRules, seed, nil, true, SupervisionUnit, cfg.VCPU, cfg.MemoryMiB)
+	var inst *VMInstance
+	err = destroyed()
+	if err == nil {
+		inst, err = m.coldBootFromRootfs(ctx, vmID, r.Disk, r.Base, r.BlockMap, cfg.EgressRules, seed, destroyed, true, SupervisionUnit, cfg.VCPU, cfg.MemoryMiB)
+	}
 	if err == nil {
 		inst.mu.RLock()
 		ip := inst.IP
 		inst.mu.RUnlock()
 		if werr := m.waitForBoxd(ctx, ip, reviveBoxdReadyBudget); werr != nil {
-			_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
+			_ = teardown(context.WithoutCancel(ctx))
 			err = status.Errorf(codes.Unavailable, "guest did not become ready: %v", werr)
 		}
 	}
 	m.recordPhases("restore", "backup", map[string]time.Duration{"backup_boot": time.Since(tBoot)})
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && destroyed() == nil {
 			// The download is done and the caller's retry is imminent.
 			m.retainStagingForRetry(vmID)
 			return nil, err
@@ -119,10 +160,24 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 		_ = os.RemoveAll(m.restoreStagingDir(vmID))
 		return nil, err
 	}
+	// The verified record is written only if no destroy got in first;
+	// DestroyVM holds the record-owner lock for its whole run.
 	inst.mu.Lock()
 	inst.Unverified = false
 	inst.mu.Unlock()
-	if !m.persistState(inst) {
+	unlockCommit := m.lockRecordOwner(vmID)
+	m.mu.RLock()
+	_, tracked := m.vms[vmID]
+	m.mu.RUnlock()
+	_, destroying := m.destroying.Load(vmID)
+	if !tracked || destroying || destroyed() != nil {
+		unlockCommit()
+		_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
+		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while its fork was completing", vmID)
+	}
+	wrote := m.persistState(inst)
+	unlockCommit()
+	if !wrote {
 		_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
 		return nil, status.Error(codes.Internal, "forked VM could not be durably recorded; torn down for clean retry")
 	}
