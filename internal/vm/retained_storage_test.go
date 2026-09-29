@@ -1,9 +1,12 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	bolt "go.etcd.io/bbolt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -157,6 +160,186 @@ func TestRetainedInventorySpoolPreservesIdentityAndVersion(t *testing.T) {
 	restored := newHeartbeatStorageCache(dir, zerolog.Nop(), incarnation).pendingSnapshot()
 	if !reflect.DeepEqual(pending, restored) {
 		t.Fatal("restart changed retained report identity or explicit zero")
+	}
+}
+
+// These types deliberately match the preceding writer, which discarded unknown
+// measurement fields when decoding and rewriting its queue.
+type legacySpoolMeasurement struct {
+	SandboxID      string `json:"sandbox_id"`
+	AllocatedBytes int64  `json:"allocated_bytes"`
+}
+
+type legacySpoolEntry struct {
+	ReportID     string                   `json:"report_id,omitempty"`
+	Version      uint64                   `json:"version"`
+	Measurements []legacySpoolMeasurement `json:"measurements"`
+}
+
+type legacySpoolState struct {
+	IncarnationID string                   `json:"incarnation_id,omitempty"`
+	ReportSpace   string                   `json:"report_space,omitempty"`
+	Version       uint64                   `json:"version"`
+	Measurements  []legacySpoolMeasurement `json:"measurements,omitempty"`
+	Pending       []legacySpoolEntry       `json:"pending"`
+}
+
+func TestRetainedInventorySpoolSurvivesLegacyRewrite(t *testing.T) {
+	dir := t.TempDir()
+	incarnation := uuid.NewString()
+	legacyPath := filepath.Join(dir, storageReportQueueFilename)
+	// Preserve an already queued overlay report across the initial upgrade too.
+	oldID := uuid.NewString()
+	old := legacySpoolState{IncarnationID: incarnation, ReportSpace: uuid.NewString(), Version: 7,
+		Pending: []legacySpoolEntry{{ReportID: oldID, Version: 7,
+			Measurements: []legacySpoolMeasurement{{SandboxID: uuid.NewString(), AllocatedBytes: 4096}}}}}
+	data, err := json.Marshal(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persistStorageReportFile(legacyPath, data); err != nil {
+		t.Fatal(err)
+	}
+	cache := newHeartbeatStorageCache(dir, zerolog.Nop(), incarnation)
+	inv := &retainedstorage.Inventory{Version: retainedstorage.Version, Owners: []retainedstorage.Owner{
+		{Kind: "sandbox", ID: uuid.NewString(), Generation: strings.Repeat("1", 64), Extents: []retainedstorage.Extent{}},
+	}}
+	if err := cache.store([]heartbeatStorageMeasurement{{Retained: inv}}); err != nil {
+		t.Fatal(err)
+	}
+	want := cache.pendingSnapshot()
+	if len(want) != 2 || want[0].reportID.String() != oldID {
+		t.Fatalf("upgrade lost prior queued report: %#v", want)
+	}
+	before, err := os.ReadFile(cache.queuePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The old daemon starts fresh on a read error, then tries to persist its
+	// overlay sample via a temporary file and rename over the legacy path.
+	var rollback legacySpoolState
+	if data, err := os.ReadFile(legacyPath); err == nil {
+		if err := json.Unmarshal(data, &rollback); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rollback.Version++
+	rollback.Measurements = []legacySpoolMeasurement{{SandboxID: uuid.NewString(), AllocatedBytes: 8192}}
+	rollback.Pending = append(rollback.Pending, legacySpoolEntry{ReportID: uuid.NewString(),
+		Version: rollback.Version, Measurements: rollback.Measurements})
+	data, err = json.Marshal(rollback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := persistStorageReportFile(legacyPath, data); err == nil {
+		t.Fatal("legacy writer replaced the protected queue")
+	}
+	after, err := os.ReadFile(cache.queuePath)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("legacy rewrite changed the durable queue: %v", err)
+	}
+	upgraded := newHeartbeatStorageCache(dir, zerolog.Nop(), incarnation)
+	if got := upgraded.pendingSnapshot(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("re-upgrade changed report identity, order, or payload: %#v", got)
+	}
+	if err := upgraded.store([]heartbeatStorageMeasurement{{Retained: &retainedstorage.Inventory{
+		Version: retainedstorage.Version, Owners: []retainedstorage.Owner{},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	want = upgraded.pendingSnapshot()
+	if len(want) != 3 {
+		t.Fatalf("later inventory was not queued: %#v", want)
+	}
+	received := make(chan storageReportWire, len(want))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var report storageReportWire
+		if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		received <- report
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+	cfg := HeartbeatConfig{HostID: uuid.NewString(), IncarnationID: incarnation}
+	for _, report := range want {
+		next, ok := upgraded.oldestPendingSnapshot()
+		if !ok || !reflect.DeepEqual(next, report) {
+			t.Fatalf("drain reordered reports: %#v", next)
+		}
+		if !postStorageReport(context.Background(), server.Client(), cfg, server.URL, "", next.reportID, next.measurements, zerolog.Nop()) {
+			t.Fatal("preserved report could not be published")
+		}
+		if err := upgraded.markSent(next.version, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range want {
+		report := <-received
+		if report.ReportID != want[i].reportID.String() || !reflect.DeepEqual(report.Measurements, want[i].measurements) {
+			t.Fatalf("published report changed: %#v", report)
+		}
+	}
+	if got := newHeartbeatStorageCache(dir, zerolog.Nop(), incarnation).pendingSnapshot(); len(got) != 0 {
+		t.Fatalf("acknowledged queue reappeared after restart: %#v", got)
+	}
+}
+
+func TestRetainedInventorySpoolMigrationRecovery(t *testing.T) {
+	for _, phase := range []string{"legacy", "staging-created", "queue-moved", "conflicting-legacy"} {
+		t.Run(phase, func(t *testing.T) {
+			dir := t.TempDir()
+			legacyPath := filepath.Join(dir, storageReportQueueFilename)
+			staging := legacyPath + ".migrating"
+			incarnation := uuid.NewString()
+			// A legacy entry without a report ID must retain its fallback version.
+			state := storageReportQueueState{IncarnationID: incarnation, Version: 42,
+				Pending: []storageReportQueueEntry{{Version: 42, Measurements: []heartbeatStorageMeasurement{{SandboxID: uuid.NewString(), AllocatedBytes: 1}}}}}
+			data, err := json.Marshal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if phase != "legacy" {
+				if err := os.Mkdir(staging, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			source := legacyPath
+			if phase == "queue-moved" || phase == "conflicting-legacy" {
+				source = filepath.Join(staging, storageReportQueueStateFilename)
+			}
+			if err := os.WriteFile(source, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if phase == "conflicting-legacy" {
+				if err := os.WriteFile(legacyPath, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cache := newHeartbeatStorageCache(dir, zerolog.Nop(), incarnation)
+			if phase == "conflicting-legacy" {
+				if err := cache.store([]heartbeatStorageMeasurement{{Retained: &retainedstorage.Inventory{Version: retainedstorage.Version, Owners: []retainedstorage.Owner{}}}}); err == nil {
+					t.Fatal("migration conflict allowed a destructive write")
+				}
+				for _, path := range []string{source, legacyPath} {
+					got, err := os.ReadFile(path)
+					if err != nil || !bytes.Equal(got, data) {
+						t.Fatalf("migration conflict lost queue %s: %v", path, err)
+					}
+				}
+				return
+			}
+			got, err := os.ReadFile(cache.queuePath)
+			if err != nil || !bytes.Equal(got, data) {
+				t.Fatalf("migration changed queue bytes: %v", err)
+			}
+			pending := cache.pendingSnapshot()
+			if len(pending) != 1 || pending[0].version != 42 || pending[0].reportID != uuid.Nil || !reflect.DeepEqual(pending[0].measurements, state.Pending[0].Measurements) {
+				t.Fatalf("migration changed legacy retry identity or payload: %#v", pending)
+			}
+		})
 	}
 }
 

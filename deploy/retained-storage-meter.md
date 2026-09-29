@@ -11,12 +11,22 @@ durable storage-report spool. The worker derives teams from sandbox and saved
 snapshot rows, checks completeness, and applies the inventory atomically with
 its report cursor. A host/team cuts over at its first accepted inventory's
 DB receipt time. Older overlay-only reports cannot overwrite that contribution.
-Overlay-only producers can still deliver old payloads, but after cutover retained
-quantities stay at their last accepted values until a compatible producer
-returns. An older binary cannot drain a queued retained inventory: its empty
-sandbox ID deliberately fails old-payload validation if the unknown inventory
-field is dropped. Restore a compatible producer to drain that spool; do not
-rewrite queued report identities. Do not roll back the schema or billing readers after a cutover.
+Overlay-only reports cannot update retained quantities after cutover; those
+quantities stay at their last accepted values until a compatible producer returns.
+On upgrade, background spool restoration moves the existing queue unchanged into
+`.storage-report-queue/state.json`. The directory at the old queue filename
+prevents older binaries from reading or replacing retained payloads. During a
+binary rollback, storage spool reads/writes fail and storage publication stops;
+heartbeat liveness continues. Restore a compatible producer with the same host
+incarnation to drain the preserved queue in order, then publish fresh inventory.
+Do not remove the directory or rewrite queued report identities to enable an old
+writer. Do not roll back the schema or billing readers after a cutover.
+
+An interrupted spool migration resumes from `.storage-report-queue.migrating`
+on restart. If migration fails, storage reporting stays disabled until the
+filesystem problem is resolved and the daemon restarts. Preserve both paths if
+a legacy queue and a staged queue coexist; automatic recovery refuses to
+overwrite either. Heartbeat liveness remains independent of this recovery.
 
 On supported Linux XFS/ext4 filesystems, FIEMAP identifies physical data ranges.
 Their union is charged once per team, host and filesystem at each interval;

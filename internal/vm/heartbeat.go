@@ -31,6 +31,7 @@ const overlayStorageSampleInterval = 5 * time.Minute
 
 const storageReportVersionFilename = ".storage-report-version"
 const storageReportQueueFilename = ".storage-report-queue"
+const storageReportQueueStateFilename = "state.json"
 
 const (
 	storageReportRetryInitial = time.Second
@@ -248,8 +249,8 @@ func runHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger) 
 	}
 }
 
-// Retained inventories use an empty sandbox ID so an older spool reader that
-// drops the unknown field cannot reinterpret them as valid overlay samples.
+// Retained inventories use an empty sandbox ID; only the retained envelope
+// carries their ownership and allocation data.
 type heartbeatStorageMeasurement struct {
 	Retained       *retainedstorage.Inventory `json:"retained,omitempty"`
 	SandboxID      string                     `json:"sandbox_id"`
@@ -557,6 +558,7 @@ type heartbeatStorageCache struct {
 	sentAt        time.Time
 	versionPath   string
 	queuePath     string
+	restoreErr    error
 	pending       []storagePublish
 	incarnationID string
 	log           zerolog.Logger
@@ -595,7 +597,7 @@ func newHeartbeatStorageCacheState(runDir string, log zerolog.Logger, incarnatio
 	// acknowledged separately and must survive a VMD restart while it is
 	// waiting for durable acceptance.
 	if runDir != "" {
-		c.queuePath = filepath.Join(runDir, storageReportQueueFilename)
+		c.queuePath = filepath.Join(runDir, storageReportQueueFilename, storageReportQueueStateFilename)
 	}
 	return c
 }
@@ -619,12 +621,59 @@ func (c *heartbeatStorageCache) restore() {
 	c.sentVersion = state.sentVersion
 	c.sentAt = state.sentAt
 	c.pending = state.pending
+	c.restoreErr = state.restoreErr
 	c.mu.Unlock()
+}
+
+// A directory at the legacy spool filename prevents old binaries from replacing
+// retained payloads with their lossy JSON representation. Move the whole legacy
+// file without decoding it, preserving report identities and queued data. The
+// staging directory also lets a restart finish an interrupted migration.
+func prepareStorageReportQueue(path string) error {
+	dir := filepath.Dir(path)
+	parent := filepath.Dir(dir)
+	staging := dir + ".migrating"
+	info, err := os.Stat(dir)
+	if err == nil && info.IsDir() {
+		return syncDir(parent)
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		return err
+	}
+	if info != nil {
+		target := filepath.Join(staging, storageReportQueueStateFilename)
+		if _, err := os.Stat(target); err == nil {
+			return fmt.Errorf("storage report migration has both legacy and staged queues")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.Rename(dir, target); err != nil {
+			return err
+		}
+	}
+	if err := syncDir(staging); err != nil {
+		return err
+	}
+	if err := syncDir(parent); err != nil {
+		return err
+	}
+	if err := os.Rename(staging, dir); err != nil {
+		return err
+	}
+	return syncDir(parent)
 }
 
 func (c *heartbeatStorageCache) restoreFromDisk() {
 	incarnationReset := false
 	if c.queuePath != "" {
+		if err := prepareStorageReportQueue(c.queuePath); err != nil {
+			c.restoreErr = fmt.Errorf("prepare storage report queue: %w", err)
+			c.log.Error().Err(c.restoreErr).Msg("storage reporting disabled until spool recovery and daemon restart")
+			return
+		}
 		var data []byte
 		var err error
 		if info, statErr := os.Stat(c.queuePath); statErr == nil && info.Size() > storageReportQueueMaxBytes {
@@ -815,6 +864,10 @@ func (c *heartbeatStorageCache) updatePersistedState(update func(*heartbeatStora
 	c.persistMu.Lock()
 	defer c.persistMu.Unlock()
 	c.mu.RLock()
+	if c.restoreErr != nil {
+		c.mu.RUnlock()
+		return c.restoreErr
+	}
 	state := heartbeatStorageCache{
 		measurements: c.measurements, version: c.version, reportSpace: c.reportSpace,
 		sentVersion: c.sentVersion, sentAt: c.sentAt,
