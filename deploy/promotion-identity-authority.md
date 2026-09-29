@@ -107,8 +107,11 @@ When enforcement is on, Gmail/Googlemail identities lowercase, normalize to
 gmail.com, strip the plus suffix and remove local-part dots. Other valid, verified
 providers retain authenticated-user UUID semantics. Known missing, malformed or
 unverified email means `promotion_ineligible`, never a UUID fallback. Absent/stale
-evidence raises unavailable authority rather than issuing credit or recording
-permanent ineligibility for an outage.
+evidence raises unavailable authority in the canonical primitive. The
+[device grant integration](promotion-device-contract.md) catches promotion-only
+authority failures at the grant boundary and persists a no-credit result while
+allowing team creation or paid activation. That result is replayed unchanged;
+it consumes no entitlement and never falls back to an unchecked grant.
 
 | SQLSTATE | Caller meaning |
 | --- | --- |

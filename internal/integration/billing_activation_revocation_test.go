@@ -498,7 +498,7 @@ func TestIntegration_BillingRecoveryRevokesHistoricalActivationCredit(t *testing
 }
 
 func TestIntegration_StripeCancellationBeforeActivationBlocksBonus(t *testing.T) {
-	for _, scenario := range []string{"scheduled", "scheduled_trialing", "scheduled_past_due", "canceled", "deleted", "unrelated", "checkout_associated", "checkout_generation", "checkout_expired", "first_created"} {
+	for _, scenario := range []string{"scheduled", "scheduled_trialing", "scheduled_past_due", "scheduled_first_created", "scheduled_first_created_trialing", "canceled", "deleted", "unrelated", "checkout_associated", "checkout_generation", "checkout_expired", "first_created"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := t.Context()
 			teamID, _, userID := seedTeamAndKeyWithRole(t, "team_owner")
@@ -515,7 +515,8 @@ func TestIntegration_StripeCancellationBeforeActivationBlocksBonus(t *testing.T)
 			router := newBillingRouter(t, stripe)
 			at := time.Now().UTC().Truncate(time.Second).Add(-time.Minute)
 			metadata := map[string]string{"activation_user_id": userID.String()}
-			if strings.HasPrefix(scenario, "checkout_") || scenario == "first_created" {
+			firstCreated := strings.Contains(scenario, "first_created")
+			if strings.HasPrefix(scenario, "checkout_") || firstCreated {
 				if _, err := testPool.Exec(ctx, `UPDATE team_billing_account SET stripe_subscription_id=NULL WHERE team_id=$1`, teamID); err != nil {
 					t.Fatal(err)
 				}
@@ -541,14 +542,14 @@ func TestIntegration_StripeCancellationBeforeActivationBlocksBonus(t *testing.T)
 			eventID, eventType, status := "evt_cancel_before_activation_"+teamID.String(), "customer.subscription.updated", "canceled"
 			if strings.HasPrefix(scenario, "scheduled") {
 				status = "active"
-				if scenario == "scheduled_trialing" {
+				if strings.HasSuffix(scenario, "trialing") {
 					status = "trialing"
 				}
 				if scenario == "scheduled_past_due" {
 					status = "past_due"
 				}
 			}
-			if scenario == "first_created" {
+			if firstCreated {
 				eventType = "customer.subscription.created"
 			}
 			if scenario == "deleted" {
@@ -590,6 +591,14 @@ func TestIntegration_StripeCancellationBeforeActivationBlocksBonus(t *testing.T)
 				}
 			}
 			if strings.HasPrefix(scenario, "scheduled") {
+				account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+				if err != nil || !account.CancelAtPeriodEnd || account.StripeActivationCreditReservedAt.Valid ||
+					account.StripeActivationCreditGrantedAt.Valid || derefString(account.StripeActivationCreditGrantID) != "" || len(stripe.creditGrantCalls) != 0 {
+					t.Fatalf("scheduled cancellation reserved or granted activation credit: %+v calls=%d err=%v", account, len(stripe.creditGrantCalls), err)
+				}
+				if eligible, err := testQueries.IsTeamSandboxBillingEligible(ctx, teamID); err != nil || !eligible {
+					t.Fatalf("scheduled cancellation removed paid-through access: eligible=%v err=%v", eligible, err)
+				}
 				var trialEnded bool
 				var remaining float64
 				if err := testPool.QueryRow(ctx, `SELECT a.trial_ended_at IS NOT NULL, g.remaining_usd
