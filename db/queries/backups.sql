@@ -206,6 +206,13 @@ WHERE sandbox_id = sqlc.arg(sandbox_id)
 -- name: SetSnapshotSizeBytes :exec
 UPDATE snapshot SET size_bytes = $2 WHERE id = $1;
 
+-- name: LatestSnapshotBackupGeneration :one
+-- A saved snapshot never changes, so its newest unpurged generation restores
+-- it.
+SELECT generation FROM backup_generation
+WHERE snapshot_id = $1 AND purged_at IS NULL AND purge_claimed_at IS NULL
+ORDER BY completed_at DESC LIMIT 1;
+
 -- name: CoveredBackupGeneration :one
 -- The backup generation recorded as covering the sandbox's current pause,
 -- exactly: the snapshot row and its generation counter, since the row is

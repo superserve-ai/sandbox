@@ -3267,12 +3267,25 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		vmdErr                   error
 	)
 	if booted {
+		// Same shape the sandbox row is being inserted with (the image's, or
+		// the defaults) — declared so the daemon never has to ask Firecracker
+		// for it afterwards.
+		limits := vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB), SavedSnapshotID: savedSnapshotID, Egress: restoreEgress}
 		ipAddress, actualVcpu, actualMemMiB, vmdRetried, vmdErr = retryTransientBoot(c.Request.Context(), sandboxID.String(), hostID, func(ctx context.Context) (string, uint32, uint32, error) {
-			ip, vcpu, memMiB, protocol, applied, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars,
-				// Same shape the sandbox row is being inserted with (the
-				// image's, or the defaults) — declared so the daemon
-				// never has to ask Firecracker for it afterwards.
-				vmdclient.ResourceLimits{VCPU: uint32(insertVcpu), MemoryMiB: uint32(insertMemMiB), SavedSnapshotID: savedSnapshotID, Egress: restoreEgress})
+			ip, vcpu, memMiB, protocol, applied, err := vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars, limits)
+			// A host that lost the snapshot's files boots its backup instead;
+			// the generation is kept so a retry adopts that boot.
+			if vmdclient.IsSavedSnapshotMissing(err) && limits.BackupGeneration == "" {
+				gen, gerr := h.DB.LatestSnapshotBackupGeneration(ctx, pgtype.UUID{Bytes: sourceSnapshotID, Valid: true})
+				if gerr != nil {
+					if !errors.Is(gerr, pgx.ErrNoRows) {
+						l.Warn().Err(gerr).Msg("snapshot backup generation lookup failed")
+					}
+					return ip, vcpu, memMiB, err
+				}
+				limits.BackupGeneration = gen
+				ip, vcpu, memMiB, protocol, applied, err = vmd.RestoreSnapshot(ctx, sandboxID.String(), snapshotPath, snapshotMemPath, basePath, deltaDir, teamID.String(), ownerIDFromContext(c), previewAccess, nil, 0, req.EnvVars, limits)
+			}
 			previewProtocol, rulesApplied = protocol, applied
 			return ip, vcpu, memMiB, err
 		})

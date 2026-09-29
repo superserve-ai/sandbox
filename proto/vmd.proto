@@ -491,6 +491,10 @@ message RestoreSnapshotRequest {
   // Egress rules installed before the guest runs: a VM created from a saved
   // snapshot resumes the workload it was captured with.
   SandboxNetworkConfig sandbox_network = 16;
+  // The backup generation of saved_snapshot_id to cold boot from when the
+  // host no longer has the snapshot's files; sent after the daemon refuses
+  // with SAVED_SNAPSHOT_MISSING.
+  string backup_generation = 17;
 }
 
 message PreviewPort {

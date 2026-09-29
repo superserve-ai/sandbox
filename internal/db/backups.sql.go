@@ -226,6 +226,21 @@ func (q *Queries) LatestSandboxBackup(ctx context.Context, sandboxID pgtype.UUID
 	return i, err
 }
 
+const latestSnapshotBackupGeneration = `-- name: LatestSnapshotBackupGeneration :one
+SELECT generation FROM backup_generation
+WHERE snapshot_id = $1 AND purged_at IS NULL AND purge_claimed_at IS NULL
+ORDER BY completed_at DESC LIMIT 1
+`
+
+// A saved snapshot never changes, so its newest unpurged generation restores
+// it.
+func (q *Queries) LatestSnapshotBackupGeneration(ctx context.Context, snapshotID pgtype.UUID) (string, error) {
+	row := q.db.QueryRow(ctx, latestSnapshotBackupGeneration, snapshotID)
+	var generation string
+	err := row.Scan(&generation)
+	return generation, err
+}
+
 const latestSnapshotManifest = `-- name: LatestSnapshotManifest :many
 SELECT s.id AS snapshot_id, s.generation AS snapshot_generation,
        COALESCE(s.pause_token, '') AS pause_token, am.file_name, am.sha256
