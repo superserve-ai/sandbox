@@ -637,6 +637,27 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 				replayAuthUpdatedAt, replayObservedAt, evidenceEmail, evidenceVerified, evidenceAuthUpdatedAt, evidenceObservedAt)
 		}
 	})
+	t.Run("renewed create preserves request identity", func(t *testing.T) {
+		renewedClient := newTeamCreationClient(t, pool)
+		actor := uuid.New()
+		requestID := uuid.NewString()
+		claims := teamCreationClaims(actor, requestID, "Renewed create team")
+		expiredAt := time.Unix(claims["exp"].(int64)+31, 0)
+		renewedClient.handler.Now = func() time.Time { return expiredAt }
+
+		teamCreationStatus(t, renewedClient.call(claims, nil), http.StatusUnauthorized, "assertion_expired")
+		if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_creation_requests WHERE actor_id=$1 AND request_id=$2`, actor, requestID); n != 0 {
+			t.Fatalf("expired create persisted a result: %d", n)
+		}
+
+		claims["iat"], claims["exp"] = expiredAt.Unix(), expiredAt.Unix()+120
+		created := teamCreationSnapshot(t, renewedClient.call(claims, nil))
+		id := uuid.MustParse(created["id"])
+		if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_creation_requests WHERE actor_id=$1 AND request_id=$2 AND team_id=$3`, actor, requestID, id); n != 1 {
+			t.Fatalf("renewed create committed results=%d want=1", n)
+		}
+		teamCreationOutcome(t, pool, id, "granted")
+	})
 	// This activation is confined to the disposable test database.
 	rolloutExec(t, pool, `SELECT enable_canonical_promotion_identity('{"reference":"isolated provisioning test","all_writers_ready":true,"rollback_ready":true}')`)
 	t.Run("response loss replay isolation and tombstone", func(t *testing.T) {

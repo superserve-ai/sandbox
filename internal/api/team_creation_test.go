@@ -40,6 +40,13 @@ func signTeamCreationTestAssertion(t *testing.T, payload any, private ed25519.Pr
 	return message + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, []byte(message)))
 }
 
+func signTeamCreationRawAssertion(private ed25519.PrivateKey, headerJSON, payloadJSON string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(headerJSON))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(payloadJSON))
+	message := header + "." + payload
+	return message + "." + base64.RawURLEncoding.EncodeToString(ed25519.Sign(private, []byte(message)))
+}
+
 func TestTeamCreationAssertionAuthority(t *testing.T) {
 	seed := make([]byte, ed25519.SeedSize)
 	for i := range seed {
@@ -409,6 +416,64 @@ func TestTeamCreationExactAssertionSchema(t *testing.T) {
 			tc.change(claims)
 			if _, err := verifyTeamCreationAssertion(signTeamCreationTestAssertion(t, claims, private), keys, now); err == nil {
 				t.Fatal("accepted invalid assertion")
+			}
+		})
+	}
+	validPayload, err := json.Marshal(teamCreationTestClaims(now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicatePayload := func(key, value string) string {
+		needle := `"` + key + `":` + value
+		return strings.Replace(string(validPayload), needle, needle+","+needle, 1)
+	}
+	for _, tc := range []struct {
+		name       string
+		headerJSON string
+		payload    string
+	}{
+		{
+			name:       "duplicate header key",
+			headerJSON: `{"alg":"EdDSA","typ":"team-creation+jwt","kid":"test","kid":"other"}`,
+			payload:    string(validPayload),
+		},
+		{
+			name:       "duplicate top-level claim",
+			headerJSON: `{"alg":"EdDSA","typ":"team-creation+jwt","kid":"test"}`,
+			payload:    duplicatePayload("request_id", `"42140b1e-ac77-4ab0-9841-d9099ae8265a"`),
+		},
+		{
+			name:       "duplicate policy key",
+			headerJSON: `{"alg":"EdDSA","typ":"team-creation+jwt","kid":"test"}`,
+			payload:    strings.Replace(string(validPayload), `"captcha":"passed"`, `"captcha":"passed","captcha":"passed"`, 1),
+		},
+		{
+			name:       "duplicate identity key",
+			headerJSON: `{"alg":"EdDSA","typ":"team-creation+jwt","kid":"test"}`,
+			payload:    strings.Replace(string(validPayload), `"email":"user@example.com"`, `"email":"user@example.com","email":"user@example.com"`, 1),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertion := signTeamCreationRawAssertion(private, tc.headerJSON, tc.payload)
+			if _, err := verifyTeamCreationAssertion(assertion, keys, now); !errors.Is(err, errInvalidTeamAssertion) {
+				t.Fatalf("duplicate assertion error=%v", err)
+			}
+
+			t.Setenv("INTERNAL_API_TOKEN", "internal-test-token")
+			h := &Handlers{
+				Config: &config.Config{TeamCreationRegion: "use", TeamCreationKeys: keys},
+				Now:    func() time.Time { return now },
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			router := SetupRouter(ctx, h, nil)
+			req := httptest.NewRequest(http.MethodPost, "/internal/teams", strings.NewReader(`{"request_id":"42140b1e-ac77-4ab0-9841-d9099ae8265a","name":"Café ☃","region":"use"}`))
+			req.Header.Set("Authorization", "Bearer internal-test-token")
+			req.Header.Set("X-Team-Creation-Assertion", assertion)
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), `"invalid_assertion"`) {
+				t.Fatalf("duplicate assertion reached persistence: status=%d body=%s", w.Code, w.Body.String())
 			}
 		})
 	}
