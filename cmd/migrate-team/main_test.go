@@ -531,6 +531,70 @@ func (f *fixture) cfg(phase string) config {
 	}
 }
 
+func TestRetainedStorageCopyRetryClosesPreviousIntervals(t *testing.T) {
+	for _, owners := range []int{1, copyBatchSize + 1} {
+		t.Run(fmt.Sprintf("owners=%d", owners), func(t *testing.T) {
+			ctx := t.Context()
+			team := uuid.New()
+			base := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+			boundary := base.Add(5 * time.Minute)
+			for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+				mustExec(t, pool, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "retained-retry-"+team.String())
+			}
+			mustExec(t, srcPool, `INSERT INTO retained_storage_interval
+				(host_id,team_id,owner_kind,owner_id,generation,extents,started_at)
+				SELECT $1,$2,'sandbox',gen_random_uuid(),'initial',
+				'[{"device":"fs","start":0,"length":1048576}]',$3
+				FROM generate_series(1,$4::int)`, sourceHostID, team, base, owners)
+			spec, ok := tableByName("retained_storage_interval")
+			if !ok {
+				t.Fatal("retained storage is missing from the migration table list")
+			}
+			if copied, _, err := copyTable(ctx, srcPool, dstPool, spec, team, nil); err != nil || copied != int64(owners) {
+				t.Fatalf("initial copy: copied=%d err=%v", copied, err)
+			}
+			const idsQuery = `SELECT jsonb_object_agg(owner_id,id)::text FROM retained_storage_interval WHERE team_id=$1 AND started_at=$2`
+			initialIDs := scanString(t, dstPool, idsQuery, team, base)
+			mustExec(t, srcPool, `UPDATE retained_storage_interval SET ended_at=$2 WHERE team_id=$1`, team, boundary)
+			mustExec(t, srcPool, `INSERT INTO retained_storage_interval
+				(host_id,team_id,owner_kind,owner_id,generation,extents,started_at)
+				SELECT host_id,team_id,owner_kind,owner_id,'replacement',
+				'[{"device":"fs","start":0,"length":2097152}]',$2
+				FROM retained_storage_interval WHERE team_id=$1`, team, boundary)
+
+			// Force replacements ahead of closures unless the copy orders its
+			// source query; correctness must not depend on the source scan plan.
+			tx, err := srcPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx, `CREATE TEMP VIEW retained_storage_interval AS
+				SELECT * FROM public.retained_storage_interval ORDER BY started_at DESC`); err != nil {
+				t.Fatal(err)
+			}
+			var firstGeneration string
+			if err := tx.QueryRow(ctx, `SELECT generation FROM retained_storage_interval WHERE team_id=$1 LIMIT 1`, team).Scan(&firstGeneration); err != nil || firstGeneration != "replacement" {
+				t.Fatalf("source order premise: generation=%q err=%v", firstGeneration, err)
+			}
+			const historyQuery = `SELECT jsonb_agg(to_jsonb(i)-'id' ORDER BY owner_id,started_at)::text
+				FROM retained_storage_interval i WHERE team_id=$1`
+			wantHistory := scanString(t, srcPool, historyQuery, team)
+			for retry := 0; retry < 2; retry++ {
+				if copied, _, err := copyTable(ctx, tx, dstPool, spec, team, nil); err != nil || copied != int64(2*owners) {
+					t.Fatalf("retry %d: copied=%d err=%v", retry, copied, err)
+				}
+				if got := scanString(t, dstPool, historyQuery, team); got != wantHistory {
+					t.Fatalf("retry %d: destination history differs from source", retry)
+				}
+				if got := scanString(t, dstPool, idsQuery, team, base); got != initialIDs {
+					t.Fatalf("retry %d: destination interval identities changed", retry)
+				}
+			}
+		})
+	}
+}
+
 func TestTeamMigration(t *testing.T) {
 	ctx := context.Background()
 	f := seedFixture(t)

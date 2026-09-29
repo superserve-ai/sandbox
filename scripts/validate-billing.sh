@@ -36,7 +36,7 @@ else
   echo "FAIL: retained storage qualification requires Linux or the Docker route on macOS" >&2
   exit 1
 fi
-suite billing-integration-race go test -v -race -tags integration -count=1 -timeout 10m -run 'Billing|Incremental|StorageReportReceiptFencesSettlement|StripeAssociationMonitor' ./internal/integration
+suite billing-integration-race go test -v -race -tags integration -count=1 -timeout 10m -run 'Billing|Incremental|RetainedStorage|StorageReportReceiptFencesSettlement|StripeAssociationMonitor' ./internal/integration
 
 # Generate into a temporary directory so a failed drift check preserves the tree.
 sqlc_dir="$(mktemp -d)"

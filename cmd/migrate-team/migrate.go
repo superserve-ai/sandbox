@@ -1040,6 +1040,10 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 
 	// Interval IDs are cell-local identities; retries converge on the owner boundary.
 	if t.name == "retained_storage_interval" {
+		// Close previously copied intervals before inserting their replacements,
+		// both across batches and within each destination INSERT.
+		const intervalOrder = " ORDER BY (ended_at IS NULL), started_at, host_id, owner_kind, owner_id"
+		selectQ += intervalOrder
 		cols, err := allColumns(ctx, dst, t.name)
 		if err != nil {
 			return 0, 0, err
@@ -1051,7 +1055,7 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 			}
 		}
 		names := strings.Join(projected, ", ")
-		insertQ = fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM jsonb_populate_recordset(NULL::%s, $1::jsonb) %s`, t.name, names, names, t.name, conflict)
+		insertQ = fmt.Sprintf(`INSERT INTO %s (%s) SELECT %s FROM jsonb_populate_recordset(NULL::%s, $1::jsonb)%s %s`, t.name, names, names, t.name, intervalOrder, conflict)
 	}
 
 	rows, err := src.Query(ctx, selectQ, teamID)
