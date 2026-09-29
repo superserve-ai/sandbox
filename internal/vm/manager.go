@@ -467,8 +467,6 @@ type Manager struct {
 	// which is the only authority on whose staged copy the uploader
 	// will read; nil means no row is ever assumed.
 	backupLoad func(backup.Task) (backup.Task, bool, error)
-	// savedSnapshotBackupOn uploads committed saved snapshots' disks.
-	savedSnapshotBackupOn atomic.Bool
 	// backupReader and backupLister bring a lost pause back from the bucket
 	// so a resume can revive the sandbox from its disk.
 	backupRestoreOn   atomic.Bool

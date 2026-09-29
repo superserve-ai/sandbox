@@ -55,7 +55,6 @@ func savedBackupFixture(t *testing.T) (*Manager, *SavedSnapshotManifest, *[]back
 	m.backupCovered = func(task backup.Task) (bool, error) {
 		return done[task.SnapshotID+"/"+task.Generation], nil
 	}
-	m.SetSavedSnapshotBackup(true)
 	return m, man, &queued, done
 }
 
@@ -91,15 +90,16 @@ func TestSavedSnapshotQueuesItsDiskButNotItsMemory(t *testing.T) {
 	}
 }
 
-func TestSavedSnapshotBackupIsOffUntilEnabled(t *testing.T) {
-	m, man, queued, _ := savedBackupFixture(t)
-	m.SetSavedSnapshotBackup(false)
+// A host without a backup bucket queues nothing and writes no marker.
+func TestSavedSnapshotBackupIsOffWithoutABucket(t *testing.T) {
+	m, man, _, _ := savedBackupFixture(t)
+	m.backupEnqueue = nil
 	if m.backupSavedSnapshot(context.Background(), man, zerolog.Nop()) {
-		t.Fatal("queued while switched off")
+		t.Fatal("queued with backup disabled")
 	}
 	m.RecoverSavedSnapshotBackups(context.Background(), zerolog.Nop())
-	if len(*queued) != 0 {
-		t.Fatalf("queued %d tasks while switched off", len(*queued))
+	if _, err := os.Stat(filepath.Join(filepath.Dir(man.DiskPath), savedSnapshotBackupMarker)); !os.IsNotExist(err) {
+		t.Fatalf("marker written with backup disabled: err = %v", err)
 	}
 }
 

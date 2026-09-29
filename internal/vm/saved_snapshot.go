@@ -283,7 +283,7 @@ func (m *Manager) CreateSavedSnapshot(ctx context.Context, vmID, snapshotID stri
 		return nil, fmt.Errorf("fsync saved snapshot root: %w", err)
 	}
 	log.Info().Str("kind", string(kind)).Int64("size_bytes", man.SizeBytes).Msg("saved snapshot committed")
-	if m.savedSnapshotBackupOn.Load() {
+	if m.backupEnqueue != nil {
 		// Hashing the disk takes seconds per GiB: never on the capture's path.
 		go func() {
 			defer sentrylog.Recover("saved-snapshot-backup")

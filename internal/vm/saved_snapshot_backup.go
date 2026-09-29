@@ -21,16 +21,11 @@ const SavedSnapshotBackupSweep = 30 * time.Minute
 // pending or done without hashing the disk again.
 const savedSnapshotBackupMarker = "backup.generation"
 
-// SetSavedSnapshotBackup turns on uploading committed saved snapshots' disks.
-func (m *Manager) SetSavedSnapshotBackup(on bool) {
-	m.savedSnapshotBackupOn.Store(on)
-}
-
 // backupSavedSnapshot hashes a committed saved snapshot's disk, with the
 // block map saved beside it, and queues them for upload. Memory stays on the
 // host, as it does for pauses. Reports whether the disk is queued or backed up.
 func (m *Manager) backupSavedSnapshot(ctx context.Context, man *SavedSnapshotManifest, log zerolog.Logger) bool {
-	if m.backupEnqueue == nil || !m.savedSnapshotBackupOn.Load() {
+	if m.backupEnqueue == nil {
 		return false
 	}
 	files := make([]backup.TaskFile, 0, 2)
@@ -122,7 +117,7 @@ func (m *Manager) markSavedSnapshotBackup(ctx context.Context, snapshotID, gener
 // backup is neither pending nor done: one captured while backup was off, one
 // whose queued upload was abandoned, or one lost with the journal.
 func (m *Manager) RecoverSavedSnapshotBackups(ctx context.Context, log zerolog.Logger) {
-	if m.backupEnqueue == nil || !m.savedSnapshotBackupOn.Load() || m.cfg.SnapshotDir == "" {
+	if m.backupEnqueue == nil || m.cfg.SnapshotDir == "" {
 		return
 	}
 	root := filepath.Join(m.cfg.SnapshotDir, SavedSnapshotsDirName)

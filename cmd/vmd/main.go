@@ -1209,8 +1209,6 @@ func main() {
 			Metrics:     backupMetrics,
 		}
 		// backup_setup: metrics recorder, journal open, GCS storage.NewClient, uploader.
-		// Off by default: a host opts in to uploading its saved snapshots.
-		mgr.SetSavedSnapshotBackup(envOrDefault("BACKUP_SAVED_SNAPSHOTS", "false") == "true")
 		if envOrDefault("BACKUP_RESTORE_ON_RESUME", "false") == "true" {
 			// On from the first resume: wiring is local. The bucket probe
 			// runs after readiness and only ever withdraws the fallback, so
