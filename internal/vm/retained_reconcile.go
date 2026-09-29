@@ -53,7 +53,7 @@ type RetainedReconcileResult struct {
 // Bolt's process lock excludes VMD and its lifecycle writers for the entire
 // operation. Opening an existing DB directly avoids
 // startup recovery, index repair, and other daemon side effects.
-func ReconcileRetainedStorage(ctx context.Context, statePath, runDir, snapshotDir, hostID string, refs []RetainedCreationReference, apply bool) (RetainedReconcileResult, error) {
+func ReconcileRetainedStorage(ctx context.Context, statePath, runDir, snapshotDir, hostID string, refs []RetainedCreationReference, snapshotIDs []string, apply bool) (RetainedReconcileResult, error) {
 	db, err := bolt.Open(statePath, 0600, &bolt.Options{
 		ReadOnly: !apply, Timeout: time.Second,
 		OpenFile: func(name string, flags int, mode os.FileMode) (*os.File, error) {
@@ -73,13 +73,13 @@ func ReconcileRetainedStorage(ctx context.Context, statePath, runDir, snapshotDi
 		return RetainedReconcileResult{}, err
 	}
 	s := &StateStore{db: db}
-	return reconcileRetainedStorage(ctx, s, runDir, snapshotDir, hostID, refs, apply, retainedFileExtents)
+	return reconcileRetainedStorage(ctx, s, runDir, snapshotDir, hostID, refs, snapshotIDs, apply, retainedFileExtents)
 }
 
-func reconcileRetainedStorage(ctx context.Context, s *StateStore, runDir, snapshotDir, hostID string, refs []RetainedCreationReference, apply bool, measure func(*os.File, int) ([]retainedstorage.Extent, string, error)) (RetainedReconcileResult, error) {
+func reconcileRetainedStorage(ctx context.Context, s *StateStore, runDir, snapshotDir, hostID string, refs []RetainedCreationReference, snapshotIDs []string, apply bool, measure func(*os.File, int) ([]retainedstorage.Extent, string, error)) (RetainedReconcileResult, error) {
 	result := RetainedReconcileResult{Apply: apply, Receipts: []RetainedReconcileReceipt{}}
-	if hostID == "" || !filepath.IsAbs(runDir) || !filepath.IsAbs(snapshotDir) || len(refs) > retainedstorage.MaxOwners {
-		return result, fmt.Errorf("host, absolute artifact directories and bounded creation references required")
+	if hostID == "" || !filepath.IsAbs(runDir) || !filepath.IsAbs(snapshotDir) || len(refs)+len(snapshotIDs) > retainedstorage.MaxOwners {
+		return result, fmt.Errorf("host, absolute artifact directories and bounded owner references required")
 	}
 	for _, dir := range []string{runDir, snapshotDir} {
 		info, err := os.Stat(dir)
@@ -149,6 +149,20 @@ func reconcileRetainedStorage(ctx context.Context, s *StateStore, runDir, snapsh
 	inventoryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	result.Inventory, err = m.retainedStorageInventoryWithPersistence(inventoryCtx, measure, false)
+	if err == nil {
+		inventoriedSnapshots := make(map[string]bool)
+		for _, owner := range result.Inventory.Owners {
+			if owner.Kind == "snapshot" {
+				inventoriedSnapshots[owner.ID] = true
+			}
+		}
+		for _, id := range snapshotIDs {
+			if !inventoriedSnapshots[id] {
+				err = fmt.Errorf("control-plane snapshot %s missing from retained inventory", id)
+				break
+			}
+		}
+	}
 	if err != nil {
 		result.InventoryError = err.Error()
 	}

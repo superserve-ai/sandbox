@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,7 +87,7 @@ func TestRetainedReconcileFullPause(t *testing.T) {
 				return []retainedstorage.Extent{{Device: "fixture", Start: 4096, Length: 4096}}, "fixture-generation", nil
 			}
 			refs := []RetainedCreationReference{ref}
-			result, err := reconcileRetainedStorage(t.Context(), s, root, snapshots, ref.HostID, refs, false, measure)
+			result, err := reconcileRetainedStorage(t.Context(), s, root, snapshots, ref.HostID, refs, nil, false, measure)
 			if err != nil || result.HostReady || result.Receipts[0].Status != "would_update" || result.Receipts[0].Metadata == "" {
 				t.Fatalf("dry run: %+v %v", result, err)
 			}
@@ -95,7 +96,7 @@ func TestRetainedReconcileFullPause(t *testing.T) {
 				t.Fatal("dry run changed durable state")
 			}
 			write(filepath.Join(generation, buildMetaFilename), []byte(`{"snapshot_path":"/different-generation/vmstate.snap"}`))
-			result, err = reconcileRetainedStorage(t.Context(), s, root, snapshots, ref.HostID, refs, true, measure)
+			result, err = reconcileRetainedStorage(t.Context(), s, root, snapshots, ref.HostID, refs, nil, true, measure)
 			if err != nil || result.HostReady || result.Receipts[0].Status != "unresolved" {
 				t.Fatalf("bad provenance: %+v %v", result, err)
 			}
@@ -104,7 +105,7 @@ func TestRetainedReconcileFullPause(t *testing.T) {
 				t.Fatal("unresolved record changed")
 			}
 			write(filepath.Join(generation, buildMetaFilename), meta)
-			result, err = reconcileRetainedStorage(t.Context(), s, root, snapshots, ref.HostID, refs, true, measure)
+			result, err = reconcileRetainedStorage(t.Context(), s, root, snapshots, ref.HostID, refs, nil, true, measure)
 			if err != nil || !result.HostReady || result.Receipts[0].Status != "updated" {
 				t.Fatalf("apply: %+v %v", result, err)
 			}
@@ -142,7 +143,7 @@ func TestRetainedReconcileFullPause(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			result, err = reconcileRetainedStorage(t.Context(), s, root, snapshots, ref.HostID, refs, true, measure)
+			result, err = reconcileRetainedStorage(t.Context(), s, root, snapshots, ref.HostID, refs, nil, true, measure)
 			if err != nil || !result.HostReady || result.Receipts[0].Status != "unchanged" {
 				t.Fatalf("repeat: %+v %v", result, err)
 			}
@@ -158,7 +159,7 @@ func TestRetainedReconcileFullPause(t *testing.T) {
 			if err := os.Remove(wanted); err != nil {
 				t.Fatal(err)
 			}
-			result, err = reconcileRetainedStorage(t.Context(), s, root, snapshots, ref.HostID, refs, true, measure)
+			result, err = reconcileRetainedStorage(t.Context(), s, root, snapshots, ref.HostID, refs, nil, true, measure)
 			if err != nil || result.HostReady || result.InventoryError == "" {
 				t.Fatalf("missing inventory file: %+v %v", result, err)
 			}
@@ -166,10 +167,93 @@ func TestRetainedReconcileFullPause(t *testing.T) {
 	}
 }
 
+func TestRetainedReconcileExpectedSnapshots(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		directory        bool
+		manifest         bool
+		sandbox          bool
+		additionalID     bool
+		dryRun           bool
+		wantMissing      bool
+		wantInventoryErr bool
+		wantReady        bool
+	}{
+		{name: "missing saved snapshots directory", wantMissing: true, wantInventoryErr: true},
+		{name: "missing manifest", directory: true, wantInventoryErr: true},
+		{name: "complete snapshot", directory: true, manifest: true, wantReady: true},
+		{name: "one of two snapshots missing", directory: true, manifest: true, additionalID: true, wantMissing: true, wantInventoryErr: true},
+		{name: "sandbox with same ID is not a snapshot", sandbox: true, wantMissing: true, wantInventoryErr: true},
+		{name: "dry run remains unready", directory: true, manifest: true, dryRun: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			state, err := OpenStateStore(filepath.Join(root, "state.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer state.Close()
+			snapshotID := uuid.NewString()
+			snapshotDir := filepath.Join(root, SavedSnapshotsDirName, snapshotID)
+			if tc.directory {
+				if err := os.MkdirAll(snapshotDir, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			disk := filepath.Join(root, "rootfs.ext4")
+			if err := os.WriteFile(disk, []byte("retained disk"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.manifest {
+				manifest, err := json.Marshal(SavedSnapshotManifest{Version: savedSnapshotVersion, SnapshotID: snapshotID, Kind: SavedSnapshotFS, DiskPath: disk})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(snapshotDir, savedSnapshotManifestName), manifest, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var refs []RetainedCreationReference
+			if tc.sandbox {
+				if err := state.Put(VMRecord{ID: snapshotID, Status: StatusRunning, DiskPath: disk, RootfsPath: disk}); err != nil {
+					t.Fatal(err)
+				}
+				refs = []RetainedCreationReference{{ID: snapshotID, HostID: "example-host"}}
+			}
+			snapshotIDs := []string{snapshotID}
+			missingID := snapshotID
+			if tc.additionalID {
+				missingID = uuid.NewString()
+				snapshotIDs = append(snapshotIDs, missingID)
+			}
+			measure := func(*os.File, int) ([]retainedstorage.Extent, string, error) {
+				return []retainedstorage.Extent{{Device: "fixture", Start: 4096, Length: 4096}}, "fixture-generation", nil
+			}
+			result, err := reconcileRetainedStorage(t.Context(), state, root, root, "example-host", refs, snapshotIDs, !tc.dryRun, measure)
+			if err != nil || result.HostReady != tc.wantReady || (result.InventoryError != "") != tc.wantInventoryErr {
+				t.Fatalf("reconcile: %+v, error: %v", result, err)
+			}
+			if tc.wantMissing && !strings.Contains(result.InventoryError, "control-plane snapshot "+missingID+" missing from retained inventory") {
+				t.Fatalf("missing snapshot was not identified: %+v", result)
+			}
+		})
+	}
+}
+
+func TestRetainedReconcileOwnerBudget(t *testing.T) {
+	root := t.TempDir()
+	refs := []RetainedCreationReference{{ID: uuid.NewString(), HostID: "example-host"}}
+	snapshotIDs := make([]string, retainedstorage.MaxOwners)
+	result, err := reconcileRetainedStorage(t.Context(), nil, root, root, "example-host", refs, snapshotIDs, true, nil)
+	if err == nil || result.HostReady {
+		t.Fatalf("combined owner budget exceeded: %+v, error: %v", result, err)
+	}
+}
+
 func TestRetainedReconcileRequiresExclusiveState(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "state.db")
-	if _, err := ReconcileRetainedStorage(t.Context(), path, root, root, "example-host", nil, true); err == nil {
+	if _, err := ReconcileRetainedStorage(t.Context(), path, root, root, "example-host", nil, nil, true); err == nil {
 		t.Fatal("missing state accepted")
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -181,7 +265,7 @@ func TestRetainedReconcileRequiresExclusiveState(t *testing.T) {
 	}
 	defer s.Close()
 	for _, apply := range []bool{false, true} {
-		if _, err := ReconcileRetainedStorage(t.Context(), path, root, root, "example-host", nil, apply); err == nil {
+		if _, err := ReconcileRetainedStorage(t.Context(), path, root, root, "example-host", nil, nil, apply); err == nil {
 			t.Fatal("opened state while daemon holds it")
 		}
 	}
