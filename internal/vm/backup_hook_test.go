@@ -715,7 +715,7 @@ func TestBusyGuardStillPersistsNewerMarker(t *testing.T) {
 	m.pendingInFlight.Store("vm-1", struct{}{})
 
 	pb := newPendingBackup("vm-1", "/snap", "/disk", "", "tok-test")
-	m.rehashPendingBackup(context.Background(), pb, zerolog.Nop())
+	m.startPendingBackup(context.Background(), pb, zerolog.Nop())
 
 	pending, err := st.ListPendingBackups()
 	if err != nil {
