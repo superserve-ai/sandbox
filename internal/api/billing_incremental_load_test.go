@@ -1693,7 +1693,17 @@ func (s *precisionWorkerStripe) BucketedMeterUsage(ctx context.Context, event, c
 		}
 	}
 	if s.mode == "missing" {
-		return windows[:len(windows)-1], nil
+		// Empty intervals may be omitted, so remove a bucket with usage.
+		for i, window := range windows {
+			quantity, err := meterQuantity(window.Quantity)
+			if err != nil {
+				return nil, err
+			}
+			if quantity.Sign() > 0 {
+				return append(windows[:i], windows[i+1:]...), nil
+			}
+		}
+		return nil, fmt.Errorf("missing-bucket fixture requires nonzero usage")
 	}
 	if s.mode == "changing_bucket" && s.buckets%2 == 0 {
 		windows[0].Quantity = "1"
