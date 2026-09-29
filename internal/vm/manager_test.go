@@ -267,7 +267,7 @@ func TestResolveRestoreDisk_NonTemplate_NoExistingRootfs_Errors(t *testing.T) {
 		BaseRootfsPath: "/should/not/be/used.ext4",
 	}}
 
-	_, err := mgr.resolveRestoreDisk(context.Background(), "vm-abc", "/snapshots/not-a-template/vmstate.snap")
+	_, _, err := mgr.resolveRestoreDisk(context.Background(), "vm-abc", "/snapshots/not-a-template/vmstate.snap")
 	if err == nil {
 		t.Fatalf("expected error for non-template snapshot with no per-VM rootfs; got nil")
 	}
@@ -289,12 +289,15 @@ func TestResolveRestoreDisk_SandboxResume_UsesExistingPerVMRootfs(t *testing.T) 
 	}
 
 	mgr := &Manager{cfg: ManagerConfig{RunDir: runDir}}
-	got, err := mgr.resolveRestoreDisk(context.Background(), vmID, "/snapshots/sb-1/snap-1/vmstate.snap")
+	got, rootfs, err := mgr.resolveRestoreDisk(context.Background(), vmID, "/snapshots/sb-1/snap-1/vmstate.snap")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got != existing {
 		t.Errorf("got %q, want %q", got, existing)
+	}
+	if rootfs != "" {
+		t.Errorf("sandbox resume inferred a template rootfs: %q", rootfs)
 	}
 }
 

@@ -1107,22 +1107,22 @@ func planRestore(basePath, deltaDir string, fork, reuse bool) restorePlan {
 //
 // Anything else is an error: silently falling back to BaseRootfsPath would
 // put the wrong disk under the snapshot's memory view.
-func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath string) (string, error) {
+func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath string) (diskPath, rootfsPath string, err error) {
 	if src, srcErr := templateRootfsForSnapshot(m.cfg.RunDir, snapshotPath); srcErr == nil {
 		dst, err := m.copyRootfs(ctx, vmID, src)
 		if err != nil {
-			return "", fmt.Errorf("copy rootfs for restore: %w", err)
+			return "", "", fmt.Errorf("copy rootfs for restore: %w", err)
 		}
-		return dst, nil
+		return dst, src, nil
 	} else {
 		existing := filepath.Join(m.cfg.RunDir, vmID, "rootfs.ext4")
 		if _, statErr := os.Stat(existing); statErr != nil {
-			return "", fmt.Errorf(
+			return "", "", fmt.Errorf(
 				"resolve rootfs for vm %s: snapshot %q is not a template snapshot (%v) and per-VM rootfs %q is missing (%v)",
 				vmID, snapshotPath, srcErr, existing, statErr,
 			)
 		}
-		return existing, nil
+		return existing, "", nil
 	}
 }
 
@@ -3824,7 +3824,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			m.cleanupRunDir(vmID)
 		}
 	}
-	var diskPath string
+	var diskPath, templateRootfs string
 	var diskErr error
 	diskUntouched := false
 	switch plan.action {
@@ -3838,7 +3838,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			diskPath = existing
 		}
 	case restoreLegacyResolve:
-		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
+		diskPath, templateRootfs, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
 	case restoreMaterializeFork:
 		if (inPlace || priorRunDir) && stopErr != nil {
 			// A stop that did not confirm may leave a Firecracker that still
@@ -3944,6 +3944,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// so the in-memory view is consistent for concurrent readers.
 		inst.mu.Lock()
 		inst.DiskPath = diskPath
+		if templateRootfs != "" {
+			// A full pause replaces the memory anchors before inventory may run.
+			inst.Config.RootfsPath = templateRootfs
+		}
 		inst.IP = hostIP
 		inst.TAPDevice = tapDevice
 		inst.MACAddress = macAddr

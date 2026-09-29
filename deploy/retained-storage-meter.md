@@ -13,20 +13,24 @@ its report cursor. A host/team cuts over at its first accepted inventory's
 DB receipt time. Older overlay-only reports cannot overwrite that contribution.
 Overlay-only reports cannot update retained quantities after cutover; those
 quantities stay at their last accepted values until a compatible producer returns.
-On upgrade, background spool restoration moves the existing queue unchanged into
-`.storage-report-queue/state.json`. The directory at the old queue filename
-prevents older binaries from reading or replacing retained payloads. During a
-binary rollback, storage spool reads/writes fail and storage publication stops;
-heartbeat liveness continues. Restore a compatible producer with the same host
-incarnation to drain the preserved queue in order, then publish fresh inventory.
-Do not remove the directory or rewrite queued report identities to enable an old
-writer. Do not roll back the schema or billing readers after a cutover.
+On upgrade, background spool restoration imports the legacy regular-file spool
+`.storage-report-queue` into the separate `.storage-report-queue.v2` file.
+The legacy path remains writable by older binaries. During binary rollback,
+legacy overlay-only publication continues while the retained queue is preserved;
+post-cutover retained quantities remain frozen at their last accepted values.
+On re-upgrade with the same host incarnation, restoration merges rollback reports
+into the retained queue by immutable report identity, durably writes the merged
+queue, then clears the transferred pending entries from the legacy file. The
+compatible producer drains the queue and publishes fresh inventory. Preserve both
+queue files; do not delete them or rewrite queued report identities. Do not roll
+back the schema or billing readers after a cutover.
 
-An interrupted spool migration resumes from `.storage-report-queue.migrating`
-on restart. If migration fails, storage reporting stays disabled until the
-filesystem problem is resolved and the daemon restarts. Preserve both paths if
-a legacy queue and a staged queue coexist; automatic recovery refuses to
-overwrite either. Heartbeat liveness remains independent of this recovery.
+Recovery can import an interrupted migration's
+`.storage-report-queue.migrating/state.json` into the retained queue on restart.
+If spool preparation or transfer fails, storage reporting stays disabled until
+the filesystem problem is resolved and the daemon restarts. Preserve all queues
+if a legacy file and a staged queue coexist; automatic recovery refuses that
+ambiguous state. Heartbeat liveness remains independent of this recovery.
 
 On supported Linux XFS/ext4 filesystems, FIEMAP identifies physical data ranges.
 Their union is charged once per team, host and filesystem at each interval;

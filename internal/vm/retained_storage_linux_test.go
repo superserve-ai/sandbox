@@ -4,18 +4,121 @@ package vm
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/rs/zerolog"
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	"golang.org/x/sys/unix"
 )
+
+func TestRetainedFullCopyCreatePauseBeforeInventoryAndRestart(t *testing.T) {
+	useTempFloor(t)
+	origProbe := boxdHealthProbe
+	boxdHealthProbe = func(context.Context, string, time.Duration) error { return nil }
+	t.Cleanup(func() { boxdHealthProbe = origProbe })
+	root := t.TempDir()
+	statePath := filepath.Join(root, "state.db")
+	state, err := OpenStateStore(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { state.Close() })
+	templateID, id := uuid.NewString(), uuid.NewString()
+	runDir, snapshotDir := filepath.Join(root, "run"), filepath.Join(root, "snapshots")
+	rootfs := filepath.Join(runDir, TemplatesDirName, templateID, "rootfs.ext4")
+	templateSnapshot := filepath.Join(snapshotDir, TemplatesDirName, templateID, "vmstate.snap")
+	templateMemory := filepath.Join(filepath.Dir(templateSnapshot), "mem.snap")
+	for _, path := range []string{rootfs, templateSnapshot, templateMemory} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("retained"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fc := startSnapshotAPIFake(t, func(_, body string) (int, string) {
+		var req struct {
+			SnapshotPath string `json:"snapshot_path"`
+			MemFilePath  string `json:"mem_file_path"`
+			SnapshotType string `json:"snapshot_type"`
+		}
+		if err := json.Unmarshal([]byte(body), &req); err != nil || req.SnapshotType != "Full" {
+			t.Errorf("expected full pause: body=%s err=%v", body, err)
+			return http.StatusBadRequest, ""
+		}
+		for _, path := range []string{req.SnapshotPath, req.MemFilePath} {
+			if err := os.WriteFile(path, []byte("paused"), 0o600); err != nil {
+				t.Error(err)
+				return http.StatusInternalServerError, ""
+			}
+		}
+		return http.StatusNoContent, ""
+	})
+	m := &Manager{
+		log: zerolog.Nop(), state: state, netMgr: &fakeNetMgr{},
+		cfg: ManagerConfig{RunDir: runDir, SnapshotDir: snapshotDir},
+		vms: map[string]*VMInstance{}, restoreSem: make(chan struct{}, 1),
+		tplLastRestore: make(map[string]time.Time),
+	}
+	m.launchFirecrackerHook = func(context.Context, string, string, string, string, string, Supervision, bool, bool) (int, Supervision, error) {
+		return 4321, SupervisionCgroup, nil
+	}
+	m.restoreSnapshotHook = func(string, string, string, *bool) error { return nil }
+	inst, err := m.RestoreVMSnapshot(t.Context(), id, templateSnapshot, templateMemory, VMConfig{}, nil, "example-team", "example-owner", "", nil, 0)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	created, err := state.Get(id)
+	if err != nil || created == nil || created.RootfsPath != rootfs {
+		t.Fatalf("create did not persist template dependency: record=%+v err=%v", created, err)
+	}
+	inst.mu.Lock()
+	inst.SocketPath = fc.socketPath
+	inst.mu.Unlock()
+	// No inventory has run when the first full pause removes the memory anchors.
+	pausedSnapshot, pausedMemory, _, err := m.PauseVM(t.Context(), id, "", "")
+	if err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	if len(fc.snapshotBodies()) != 1 {
+		t.Fatalf("expected one full snapshot, got %v", fc.snapshotBodies())
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state, err = OpenStateStore(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := state.Get(id)
+	if err != nil || rec == nil || rec.Status != StatusPaused || rec.BaseMemPath != "" || rec.SnapshotPath != pausedSnapshot || rec.MemFilePath != pausedMemory || rec.RootfsPath != rootfs {
+		t.Fatalf("restart lost paused dependencies: record=%+v err=%v", rec, err)
+	}
+	restarted := &Manager{state: state, cfg: m.cfg, vms: map[string]*VMInstance{id: toInstance(*rec)}}
+	seen := map[string]bool{}
+	inv, err := restarted.retainedStorageInventory(t.Context(), func(f *os.File, _ int) ([]retainedstorage.Extent, string, error) {
+		seen[f.Name()] = true
+		return []retainedstorage.Extent{{Device: "fs", Start: int64(len(seen)) * 4096, Length: 4096}}, f.Name(), nil
+	})
+	if err != nil || inv == nil || len(inv.Owners) != 1 || len(seen) != 4 {
+		t.Fatalf("incomplete restarted inventory: paths=%v err=%v", seen, err)
+	}
+	for _, path := range []string{rec.DiskPath, rootfs, pausedSnapshot, pausedMemory} {
+		if !seen[path] {
+			t.Errorf("inventory omitted %q", path)
+		}
+	}
+}
 
 func TestRetainedFileMetadataIgnoresReadAccessTime(t *testing.T) {
 	before := syscall.Stat_t{Dev: 1, Ino: 2, Nlink: 1, Size: 4096, Blocks: 8,
