@@ -16,6 +16,10 @@ const (
 	MaxOwners       = 4096
 	MaxExtents      = 32768
 	MaxPayloadBytes = 8 << 20
+	// Manifest metadata is input to the bounded inventory scan.  Keep its
+	// cumulative budget below the report payload budget so a fleet-sized set of
+	// individually valid manifests cannot force gigabytes of reads.
+	MaxManifestBytes = 8 << 20
 )
 
 // Extent identifies physical bytes within one host filesystem. Metadata that

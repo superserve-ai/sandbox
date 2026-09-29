@@ -79,7 +79,7 @@ func TestRetainedStorageSeriesPreservesFractionalLegacyArtifacts(t *testing.T) {
 	}
 }
 
-func TestRetainedStorageLegacyArtifactPathKeepsHostAllocationsSeparate(t *testing.T) {
+func TestRetainedStorageLegacyArtifactPathPreservesHistoricalUnion(t *testing.T) {
 	f := newStorageReportFixture(t, "paused", false)
 	team := sandboxTeamID(t, f.sandboxID)
 	ctx := t.Context()
@@ -94,8 +94,8 @@ func TestRetainedStorageLegacyArtifactPathKeepsHostAllocationsSeparate(t *testin
 			t.Fatal(err)
 		}
 	}
-	// Both hosts retain the same path for the same duration. Their physical
-	// allocations must not be merged merely because the absolute path matches.
+	// Before cutover, preserve the legacy path union even across hosts so
+	// deploying the retained meter cannot rewrite finalized historical usage.
 	exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,base_path)
  VALUES($1,$2,'legacy-other-host','paused',$3,1,1024,8,$4,$5)`, otherSandbox, team, otherHost, start, path)
 	exec(`INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES
@@ -110,9 +110,9 @@ func TestRetainedStorageLegacyArtifactPathKeepsHostAllocationsSeparate(t *testin
 	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, start, end).Scan(&got); err != nil {
 		t.Fatal(err)
 	}
-	want := 2 * end.Sub(start).Seconds()
+	want := end.Sub(start).Seconds()
 	if math.Abs(got-want) > 0.0001 {
-		t.Fatalf("same-path legacy artifacts were merged across hosts: got %v want %v", got, want)
+		t.Fatalf("legacy path union changed historical usage: got %v want %v", got, want)
 	}
 }
 

@@ -1,12 +1,22 @@
 SET LOCAL lock_timeout = '250ms';
 
--- Keep physical domains separate when the same absolute path is reused on
--- different hosts. The allocation is still shared within one host/path
--- range, but a host transfer must not merge overlapping copies.
+-- A retained report can be the first authoritative observation on a new host
+-- after reassignment. End the old host's legacy interval at that receipt
+-- boundary without pretending the sandbox was destroyed.
+ALTER TABLE sandbox_storage_interval
+  DROP CONSTRAINT IF EXISTS sandbox_storage_interval_reason_valid;
+ALTER TABLE sandbox_storage_interval
+  ADD CONSTRAINT sandbox_storage_interval_reason_valid
+  CHECK (end_reason IS NULL OR end_reason IN ('deleted','measurement','reassigned'));
+
+-- Preserve the legacy path-union calculation for all pre-cutover history.
+-- Host reassignment is handled prospectively by closing the old legacy
+-- interval when the destination host is first observed.
 CREATE OR REPLACE FUNCTION storage_mib_seconds(p_team uuid,p_start timestamptz,p_end timestamptz,p_floor_legacy_artifacts boolean DEFAULT true)
 RETURNS numeric LANGUAGE sql STABLE AS $$
 WITH legacy_intervals AS MATERIALIZED (
-  SELECT i.sandbox_id,i.team_id,i.host_id,i.disk_mib,i.started_at,LEAST(i.ended_at,c.started_at) ended_at,
+  SELECT i.sandbox_id,i.team_id,i.host_id,i.disk_mib,i.started_at,
+   LEAST(i.ended_at,c.started_at) ended_at,
    LEAST(s.destroyed_at,c.started_at) artifact_retention_end
   FROM sandbox_storage_interval i
   JOIN sandbox s ON s.id=i.sandbox_id
@@ -20,12 +30,16 @@ WITH legacy_intervals AS MATERIALIZED (
   WHERE s.team_id=p_team AND i.started_at<LEAST(billing_request_now(),p_end)
     AND COALESCE(i.artifact_retention_end,billing_request_now())>p_start
 ), artifact_ranges AS (
-  SELECT s.interval_host_id,p.path,MAX(COALESCE(am.allocated_bytes,0))::numeric/1048576.0 artifact_mib,
+  SELECT p.path,MAX(COALESCE(am.allocated_bytes,0))::numeric/1048576.0 artifact_mib,
    range_agg(tstzrange(GREATEST(s.billing_started_at,p_start),LEAST(COALESCE(s.retention_end,billing_request_now()),p_end),'[)')) retained_ranges
   FROM artifact_bounds s LEFT JOIN template t ON t.id=s.template_id
   CROSS JOIN LATERAL unnest(ARRAY[s.base_path,s.delta_path,CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END]) p(path)
   LEFT JOIN artifact_manifest am ON (am.snapshot_id=s.snapshot_id OR am.template_id=t.id) AND am.path=p.path
-  WHERE p.path IS NOT NULL GROUP BY s.interval_host_id,p.path
+  WHERE p.path IS NOT NULL
+  -- Keep the legacy path-only union. Host reassignment is cut at the
+  -- prospective handoff in the receiver, so splitting this historical
+  -- calculation by host would change finalized quantities at deployment.
+  GROUP BY p.path
 ), artifacts AS (
   SELECT COALESCE(sum(artifact_mib*EXTRACT(epoch FROM(upper(r)-lower(r)))),0) amount
   FROM artifact_ranges CROSS JOIN LATERAL unnest(retained_ranges) ranges(r)

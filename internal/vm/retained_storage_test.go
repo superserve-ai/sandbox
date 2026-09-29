@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	bolt "go.etcd.io/bbolt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
+	bolt "go.etcd.io/bbolt"
 )
 
 func TestRetainedRecordPathsTrackFullAndLayeredGenerations(t *testing.T) {
@@ -33,6 +33,10 @@ func TestRetainedRecordPathsTrackFullAndLayeredGenerations(t *testing.T) {
 		t.Fatalf("layered dependencies: %v", paths)
 	}
 	old := rec.MemFilePath
+	oldBase := rec.BaseMemPath
+	if err := os.WriteFile(old+".base", []byte(oldBase+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	rec.MemFilePath = filepath.Join(root, "mem.snap")
 	rec.BaseMemPath = ""
 	rec.StrandedOverlays = []string{old}
@@ -40,7 +44,7 @@ func TestRetainedRecordPathsTrackFullAndLayeredGenerations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if paths[len(paths)-1] != old || paths[3] != rec.MemFilePath || paths[4] != "" {
+	if !slices.Contains(paths, old) || !slices.Contains(paths, old+".base") || paths[len(paths)-1] != oldBase || paths[3] != rec.MemFilePath || paths[4] != "" {
 		t.Fatalf("full transition dependencies: %v", paths)
 	}
 	rec.StrandedOverlays = nil
@@ -298,8 +302,8 @@ func TestRetainedInventorySpoolSurvivesLegacyRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The old daemon starts fresh on a read error, then tries to persist its
-	// overlay sample via a temporary file and rename over the legacy path.
+	// A downgraded daemon keeps its regular-file spool writable. The upgraded
+	// queue is a sibling, so rewriting the legacy file cannot clobber it.
 	var rollback legacySpoolState
 	if data, err := os.ReadFile(legacyPath); err == nil {
 		if err := json.Unmarshal(data, &rollback); err != nil {
@@ -314,16 +318,28 @@ func TestRetainedInventorySpoolSurvivesLegacyRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := persistStorageReportFile(legacyPath, data); err == nil {
-		t.Fatal("legacy writer replaced the protected queue")
+	if err := persistStorageReportFile(legacyPath, data); err != nil {
+		t.Fatalf("legacy writer could not persist its compatibility spool: %v", err)
 	}
 	after, err := os.ReadFile(cache.queuePath)
 	if err != nil || !bytes.Equal(before, after) {
 		t.Fatalf("legacy rewrite changed the durable queue: %v", err)
 	}
 	upgraded := newHeartbeatStorageCache(dir, zerolog.Nop(), incarnation)
-	if got := upgraded.pendingSnapshot(); !reflect.DeepEqual(got, want) {
-		t.Fatalf("re-upgrade changed report identity, order, or payload: %#v", got)
+	if got := upgraded.pendingSnapshot(); len(got) != 3 || !reflect.DeepEqual(got[:2], want) ||
+		got[2].reportID.String() != rollback.Pending[len(rollback.Pending)-1].ReportID || got[2].version <= got[1].version ||
+		got[2].measurements[0].SandboxID != rollback.Measurements[0].SandboxID || got[2].measurements[0].AllocatedBytes != 8192 {
+		t.Fatalf("re-upgrade lost report identity, payload, or ordering: %#v", got)
+	}
+	// Recover a crash after the merged queue landed but before its legacy
+	// source was cleared. Renumbered local versions must not duplicate IDs.
+	merged := upgraded.pendingSnapshot()
+	if err := persistStorageReportFile(legacyPath, data); err != nil {
+		t.Fatal(err)
+	}
+	upgraded = newHeartbeatStorageCache(dir, zerolog.Nop(), incarnation)
+	if got := upgraded.pendingSnapshot(); !reflect.DeepEqual(got, merged) {
+		t.Fatalf("interrupted transfer changed queued reports: %#v", got)
 	}
 	if err := upgraded.store([]heartbeatStorageMeasurement{{Retained: &retainedstorage.Inventory{
 		Version: retainedstorage.Version, Owners: []retainedstorage.Owner{},
@@ -331,7 +347,7 @@ func TestRetainedInventorySpoolSurvivesLegacyRewrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	want = upgraded.pendingSnapshot()
-	if len(want) != 3 {
+	if len(want) != 4 {
 		t.Fatalf("later inventory was not queued: %#v", want)
 	}
 	received := make(chan storageReportWire, len(want))
@@ -415,8 +431,12 @@ func TestRetainedInventorySpoolMigrationRecovery(t *testing.T) {
 				return
 			}
 			got, err := os.ReadFile(cache.queuePath)
-			if err != nil || !bytes.Equal(got, data) {
-				t.Fatalf("migration changed queue bytes: %v", err)
+			var migrated storageReportQueueState
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(got, &migrated); err != nil || !reflect.DeepEqual(migrated, state) {
+				t.Fatalf("migration changed queue state: %#v (%v)", migrated, err)
 			}
 			pending := cache.pendingSnapshot()
 			if len(pending) != 1 || pending[0].version != 42 || pending[0].reportID != uuid.Nil || !reflect.DeepEqual(pending[0].measurements, state.Pending[0].Measurements) {

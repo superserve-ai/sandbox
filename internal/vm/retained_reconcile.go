@@ -172,8 +172,8 @@ func reconcileRetainedStorage(ctx context.Context, s *StateStore, runDir, snapsh
 
 func reconcileRetainedRecord(rec VMRecord, ref RetainedCreationReference, runDir, snapshotDir string) (VMRecord, string, error) {
 	fail := func(reason string) (VMRecord, string, error) { return rec, "", fmt.Errorf("%s", reason) }
-	if rec.ID != ref.ID || rec.Status != StatusPaused || rec.CreatedAt.IsZero() || ref.CreatedAt.IsZero() || rec.SourceSnapshotID != "" || rec.RevivedDisk != "" || rec.BasePath != ref.BasePath {
-		return fail("creation identity, paused status or disk base does not match")
+	if rec.ID != ref.ID || rec.CreatedAt.IsZero() || ref.CreatedAt.IsZero() || rec.SourceSnapshotID != "" || rec.RevivedDisk != "" || rec.BasePath != ref.BasePath {
+		return fail("creation identity or disk base does not match")
 	}
 	// Only immutable build directories qualify. Legacy flat/reused locations
 	// need historical generation evidence; their current contents are not proof.

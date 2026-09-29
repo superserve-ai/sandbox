@@ -55,7 +55,7 @@ func newStorageLeaseFixture(t *testing.T) storageLeaseFixture {
 		CREATE TEMP TABLE sandbox (id uuid PRIMARY KEY, team_id uuid NOT NULL, host_id text NOT NULL, status text NOT NULL DEFAULT 'active', created_at timestamptz NOT NULL, destroyed_at timestamptz);
 		CREATE TEMP TABLE sandbox_storage_interval (
 			id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-			sandbox_id uuid NOT NULL, team_id uuid NOT NULL, disk_mib int NOT NULL,
+			sandbox_id uuid NOT NULL, team_id uuid NOT NULL, host_id text, disk_mib int NOT NULL,
 			started_at timestamptz NOT NULL, ended_at timestamptz, end_reason text);
 		CREATE UNIQUE INDEX storage_lease_open_interval ON sandbox_storage_interval(sandbox_id) WHERE ended_at IS NULL;
 		CREATE TEMP TABLE host_storage_report (
@@ -85,7 +85,7 @@ func newStorageLeaseFixture(t *testing.T) storageLeaseFixture {
 	}
 	exec(`INSERT INTO host VALUES ($1,$2)`, fixture.hostID, fixture.incarnationID)
 	exec(`INSERT INTO sandbox VALUES ($1,$2,$3,'active',$4,NULL)`, fixture.sandboxID, teamID, fixture.hostID, fixture.receivedAt.Add(-time.Hour))
-	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at) VALUES ($1,$2,8,$3)`, fixture.sandboxID, teamID, fixture.receivedAt.Add(-time.Minute))
+	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at) VALUES ($1,$2,$3,8,$4)`, fixture.sandboxID, teamID, fixture.hostID, fixture.receivedAt.Add(-time.Minute))
 	payload, err := json.Marshal(fixture.measurements)
 	if err != nil {
 		t.Fatal(err)

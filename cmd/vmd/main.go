@@ -1971,6 +1971,7 @@ func main() {
 				Token:             os.Getenv("INTERNAL_API_TOKEN"),
 				ProxyHealthURL:    proxyHealthURL,
 				RunDir:            cfg.RunDir,
+				SnapshotDir:       cfg.SnapshotDir,
 				VMDAddr:           vmdAddr,
 				ProxyAddr:         proxyAddr,
 				Region:            cfg.HostRegion,

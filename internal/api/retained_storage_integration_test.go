@@ -561,3 +561,55 @@ func TestIntegration_RetainedFailedFirstMeasurementBlocksSettlement(t *testing.T
 		})
 	}
 }
+
+func TestIntegration_RetainedSnapshotOnlySettlementWaitsForReport(t *testing.T) {
+	f := newStorageLeaseFixture(t)
+	ctx := t.Context()
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := f.pool.Exec(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var team uuid.UUID
+	if err := f.pool.QueryRow(ctx, `SELECT team_id FROM sandbox WHERE id=$1`, f.sandboxID).Scan(&team); err != nil {
+		t.Fatal(err)
+	}
+	// The source sandbox is gone; the saved snapshot is the only retained
+	// owner on this host. Settlement must wait for its pending report.
+	deleted := f.receivedAt.Add(-time.Second)
+	exec(`UPDATE sandbox SET destroyed_at=$2 WHERE id=$1`, f.sandboxID, deleted)
+	snapshotID := uuid.New()
+	exec(`INSERT INTO sandbox_snapshot(id,team_id,host_id,status,created_at,ready_at)
+ SELECT $1,team_id,host_id,'ready',$2,$2 FROM sandbox WHERE id=$3`, snapshotID, f.receivedAt.Add(-time.Minute), f.sandboxID)
+	owner := retainedstorage.Owner{Kind: "snapshot", ID: snapshotID.String(), Generation: strings.Repeat("a", 64), Extents: []retainedstorage.Extent{{Device: "fs", Start: 8192, Length: 8192}}}
+	measurements := []storageReportMeasurement{{Retained: &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{owner}}}}
+	payload, err := json.Marshal(measurements)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(`UPDATE host_storage_report SET state='processing',payload=$2,next_measurement_index=0 WHERE report_id=$1`, f.reportID, payload)
+	var complete bool
+	if err := f.pool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, f.receivedAt.Add(time.Minute)).Scan(&complete); err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("settlement passed while snapshot report was pending")
+	}
+	if err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, f.receivedAt, measurements, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.pool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, f.receivedAt.Add(time.Minute)).Scan(&complete); err != nil {
+		t.Fatal(err)
+	}
+	if !complete {
+		t.Fatal("settlement remained blocked after snapshot report processing")
+	}
+	var amount float64
+	if err := f.pool.QueryRow(ctx, `SELECT retained_storage_mib_seconds($1,$2,$3)`, team, f.receivedAt, f.receivedAt.Add(time.Minute)).Scan(&amount); err != nil {
+		t.Fatal(err)
+	}
+	if amount <= 0 {
+		t.Fatalf("snapshot-only retained storage = %v, want positive", amount)
+	}
+}

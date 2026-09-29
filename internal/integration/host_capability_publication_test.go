@@ -111,7 +111,14 @@ func TestIntegration_PublicationHeartbeatOverlap(t *testing.T) {
 				t.Fatal(err)
 			}
 			done := make(chan *httptest.ResponseRecorder, 1)
+			finished := make(chan struct{})
+			defer func() {
+				cancel()
+				_ = writer.Rollback(context.Background())
+				<-finished
+			}()
 			go func() {
+				defer close(finished)
 				req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/sandboxes/"+sid.String()+"/preview-ports", strings.NewReader(`{"port":4000,"access":"public"}`))
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("X-API-Key", key)

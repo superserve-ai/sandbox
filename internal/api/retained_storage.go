@@ -83,8 +83,10 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
 	err = tx.QueryRow(ctx, `WITH expected AS (
   SELECT 'sandbox' kind,s.id FROM sandbox s WHERE s.host_id=$1 AND s.created_at<=$2
    AND (s.status <> 'failed'
-    OR EXISTS(SELECT 1 FROM retained_storage_interval i WHERE i.owner_kind='sandbox' AND i.owner_id=s.id AND i.ended_at IS NULL)
-    OR EXISTS(SELECT 1 FROM sandbox_storage_interval i WHERE i.sandbox_id=s.id AND i.ended_at IS NULL))
+    OR EXISTS(SELECT 1 FROM retained_storage_interval i WHERE i.owner_kind='sandbox' AND i.owner_id=s.id
+      AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2))
+    OR EXISTS(SELECT 1 FROM sandbox_storage_interval i WHERE i.sandbox_id=s.id
+      AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)))
    AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
  UNION ALL
   SELECT 'snapshot',id FROM sandbox_snapshot WHERE host_id=$1 AND status IN ('ready','creating','deleting') AND created_at<=$2
@@ -112,7 +114,13 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
   UPDATE retained_storage_interval old SET ended_at=$2
   FROM eligible moved_owner
   WHERE moved_owner.id=old.owner_id AND moved_owner.kind=old.owner_kind
-   AND old.host_id<>$1 AND old.ended_at IS NULL AND old.started_at<$2
+   AND old.host_id IS DISTINCT FROM $1 AND old.ended_at IS NULL AND old.started_at<$2
+  RETURNING old.id
+ ), legacy_moved AS (
+  UPDATE sandbox_storage_interval old SET ended_at=$2,end_reason='reassigned'
+  FROM eligible moved_owner
+  WHERE moved_owner.kind='sandbox' AND moved_owner.id=old.sandbox_id
+   AND old.host_id IS DISTINCT FROM $1 AND old.ended_at IS NULL AND old.started_at<$2
   RETURNING old.id
  ), cutover AS (
   INSERT INTO retained_storage_cutover(host_id,team_id,started_at)

@@ -108,8 +108,14 @@ func resolveRetainedRecordPaths(rec VMRecord, runDir string) ([]string, VMRecord
 				// Legacy flat template generations predate build.meta.json.
 				// Only a pinned image in that layout identifies their rootfs.
 				if rec.BasePath == "" && filepath.Base(filepath.Dir(filepath.Dir(anchor))) == TemplatesDirName {
-					if _, err := os.Stat(inferredRootfs); err == nil {
-						rootfs, resolved = inferredRootfs, true
+					candidates := []string{inferredRootfs, filepath.Join(filepath.Dir(anchor), "rootfs.ext4")}
+					for _, candidate := range candidates {
+						if _, statErr := os.Stat(candidate); statErr == nil {
+							rootfs, resolved = candidate, true
+							break
+						}
+					}
+					if resolved {
 						break
 					}
 				}
@@ -160,6 +166,17 @@ func resolveRetainedRecordPaths(rec VMRecord, runDir string) ([]string, VMRecord
 	paths, err := appendRetainedCompanions(paths, rec.SnapshotPath, append([]string{rec.MemFilePath, baseMem}, rec.StrandedOverlays...)...)
 	if err != nil {
 		return nil, rec, err
+	}
+	// A stranded diff can still fault from its immutable base after a
+	// layered-to-full transition. Keep that base in the retained set; if the
+	// sidecar cannot resolve it, preserve the prior accepted quantity instead
+	// of retiring the contribution on an incomplete observation.
+	for _, stranded := range rec.StrandedOverlays {
+		if base, ok := readLayeredBase(stranded); ok {
+			paths = append(paths, base)
+		} else if isOverlayMemFile(stranded) {
+			return nil, rec, fmt.Errorf("stranded layered memory base is unknown")
+		}
 	}
 	// Preserve every recovered anchor, including a sidecar-derived memory base.
 	// These fields are intentionally metadata-only; lifecycle code continues to
@@ -399,6 +416,7 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 		if len(entries) > retainedstorage.MaxOwners {
 			return nil, fmt.Errorf("snapshot inventory budget exceeded")
 		}
+		manifestBytes := 0
 		for _, entry := range entries {
 			if _, err := uuid.Parse(entry.Name()); err != nil || !entry.IsDir() {
 				continue
@@ -408,15 +426,21 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 			if err != nil {
 				return nil, err
 			}
+			info, statErr := f.Stat()
+			if statErr != nil {
+				f.Close()
+				return nil, statErr
+			}
+			if info.Size() > 1<<20 || info.Size() < 0 || manifestBytes > retainedstorage.MaxManifestBytes-int(info.Size()) {
+				f.Close()
+				return nil, fmt.Errorf("saved snapshot manifest input budget exceeded")
+			}
+			manifestBytes += int(info.Size())
 			var man SavedSnapshotManifest
 			err = json.NewDecoder(io.LimitReader(f, 1<<20)).Decode(&man)
-			info, statErr := f.Stat()
 			f.Close()
 			if err != nil {
 				return nil, err
-			}
-			if statErr != nil {
-				return nil, statErr
 			}
 			if man.Version != savedSnapshotVersion || man.SnapshotID != entry.Name() || man.DiskPath == "" || (man.Kind != SavedSnapshotFS && man.Kind != SavedSnapshotMemFS) || (man.Kind == SavedSnapshotMemFS && (man.MemPath == "" || man.SnapshotPath == "")) {
 				return nil, fmt.Errorf("incomplete saved snapshot manifest")
@@ -439,7 +463,7 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 		if err != nil {
 			return nil, err
 		}
-		if !os.SameFile(o.info, info) || !reflect.DeepEqual(o.info.Sys(), info.Sys()) {
+		if !os.SameFile(o.info, info) || !sameRetainedFileMetadata(o.info.Sys(), info.Sys()) {
 			return nil, fmt.Errorf("retained artifact changed during inventory")
 		}
 	}

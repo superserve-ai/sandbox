@@ -31,6 +31,10 @@ const overlayStorageSampleInterval = 5 * time.Minute
 
 const storageReportVersionFilename = ".storage-report-version"
 const storageReportQueueFilename = ".storage-report-queue"
+
+// Keep the legacy spool path a regular file so an older VMD can be rolled
+// back without encountering EISDIR. New payloads use this sibling path.
+const storageReportQueueV2Filename = ".storage-report-queue.v2"
 const storageReportQueueStateFilename = "state.json"
 
 const (
@@ -59,6 +63,7 @@ type HeartbeatConfig struct {
 	Token             string
 	ProxyHealthURL    string
 	RunDir            string
+	SnapshotDir       string
 	Interval          time.Duration
 	VMDAddr           string
 	ProxyAddr         string
@@ -593,11 +598,11 @@ func newHeartbeatStorageCacheState(runDir string, log zerolog.Logger, incarnatio
 		return c
 	}
 	c.versionPath = filepath.Join(runDir, storageReportVersionFilename)
-	// Legacy heartbeats also need the spool: their compatibility handoff is
-	// acknowledged separately and must survive a VMD restart while it is
-	// waiting for durable acceptance.
+	// The dedicated queue is a sibling of the legacy regular-file spool. This
+	// keeps compatibility acknowledgements durable without changing the path an
+	// older VMD expects during rollback.
 	if runDir != "" {
-		c.queuePath = filepath.Join(runDir, storageReportQueueFilename, storageReportQueueStateFilename)
+		c.queuePath = filepath.Join(runDir, storageReportQueueV2Filename)
 	}
 	return c
 }
@@ -625,45 +630,54 @@ func (c *heartbeatStorageCache) restore() {
 	c.mu.Unlock()
 }
 
-// A directory at the legacy spool filename prevents old binaries from replacing
-// retained payloads with their lossy JSON representation. Move the whole legacy
-// file without decoding it, preserving report identities and queued data. The
-// staging directory also lets a restart finish an interrupted migration.
 func prepareStorageReportQueue(path string) error {
-	dir := filepath.Dir(path)
-	parent := filepath.Dir(dir)
-	staging := dir + ".migrating"
-	info, err := os.Stat(dir)
-	if err == nil && info.IsDir() {
-		return syncDir(parent)
-	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	parent := filepath.Dir(path)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(staging, 0o700); err != nil {
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return fmt.Errorf("storage report queue path is a directory")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	if info != nil {
-		target := filepath.Join(staging, storageReportQueueStateFilename)
-		if _, err := os.Stat(target); err == nil {
+	legacy := filepath.Join(parent, storageReportQueueFilename)
+	staging := legacy + ".migrating"
+	legacyInfo, legacyErr := os.Stat(legacy)
+	stagingState := filepath.Join(staging, storageReportQueueStateFilename)
+	if legacyErr == nil && legacyInfo.IsDir() {
+		return fmt.Errorf("legacy storage report queue is a directory")
+	}
+	if legacyErr != nil && !errors.Is(legacyErr, os.ErrNotExist) {
+		return legacyErr
+	}
+	if _, err := os.Stat(stagingState); err == nil {
+		if legacyErr == nil {
 			return fmt.Errorf("storage report migration has both legacy and staged queues")
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
 		}
-		if err := os.Rename(dir, target); err != nil {
-			return err
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			data, readErr := os.ReadFile(stagingState)
+			if readErr != nil {
+				return readErr
+			}
+			if err := persistStorageReportFile(path, data); err != nil {
+				return err
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if legacyErr == nil {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			data, readErr := os.ReadFile(legacy)
+			if readErr != nil {
+				return readErr
+			}
+			if err := persistStorageReportFile(path, data); err != nil {
+				return err
+			}
 		}
 	}
-	if err := syncDir(staging); err != nil {
-		return err
-	}
-	if err := syncDir(parent); err != nil {
-		return err
-	}
-	if err := os.Rename(staging, dir); err != nil {
-		return err
-	}
-	return syncDir(parent)
+	return nil
 }
 
 func (c *heartbeatStorageCache) restoreFromDisk() {
@@ -676,13 +690,89 @@ func (c *heartbeatStorageCache) restoreFromDisk() {
 		}
 		var data []byte
 		var err error
-		if info, statErr := os.Stat(c.queuePath); statErr == nil && info.Size() > storageReportQueueMaxBytes {
+		if info, statErr := os.Stat(c.queuePath); errors.Is(statErr, os.ErrNotExist) {
+			// Import, but never rename or replace, the legacy regular-file spool.
+			// This keeps the downgrade path writable while preserving queued
+			// reports for the upgraded daemon.
+			legacy := filepath.Join(filepath.Dir(c.queuePath), storageReportQueueFilename)
+			data, err = os.ReadFile(legacy)
+			if err == nil {
+				if persistErr := persistStorageReportFile(c.queuePath, data); persistErr != nil {
+					err = persistErr
+				}
+			} else if errors.Is(err, os.ErrNotExist) {
+				data, err = nil, nil
+			}
+		} else if statErr == nil && info.Size() > storageReportQueueMaxBytes {
 			c.log.Warn().Str("path", c.queuePath).Int64("bytes", info.Size()).
 				Int("max_bytes", storageReportQueueMaxBytes).
 				Msg("storage report queue exceeds spool limit; starting fresh")
 			data = nil
 		} else {
 			data, err = os.ReadFile(c.queuePath)
+		}
+		if err == nil {
+			// Transfer rollback reports before clearing the legacy queue. A crash
+			// between writes retries the merge by immutable report identity.
+			legacyPath := filepath.Join(filepath.Dir(c.queuePath), storageReportQueueFilename)
+			if legacyData, legacyErr := os.ReadFile(legacyPath); legacyErr == nil {
+				var current, legacy storageReportQueueState
+				if json.Unmarshal(data, &current) == nil && json.Unmarshal(legacyData, &legacy) == nil && legacy.IncarnationID == c.incarnationID && len(legacy.Pending) > 0 {
+					if current.IncarnationID != c.incarnationID {
+						current = storageReportQueueState{IncarnationID: c.incarnationID, Version: current.Version}
+					}
+					key := func(entry storageReportQueueEntry) string {
+						if id, err := uuid.Parse(entry.ReportID); err == nil && id != uuid.Nil {
+							return id.String()
+						}
+						return "version:" + strconv.FormatUint(entry.Version, 10)
+					}
+					seen := make(map[string]bool, len(current.Pending))
+					for _, entry := range current.Pending {
+						seen[key(entry)] = true
+						current.Version = max(current.Version, entry.Version)
+					}
+					for _, entry := range legacy.Pending {
+						identity := key(entry)
+						if seen[identity] {
+							continue
+						}
+						if entry.Version <= current.Version {
+							// Explicit IDs survive local queue renumbering. Legacy
+							// fallback IDs depend on the version and cannot change.
+							if strings.HasPrefix(identity, "version:") {
+								c.restoreErr = fmt.Errorf("legacy storage report version overlaps retained queue")
+								return
+							}
+							entry.Version = current.Version + 1
+						}
+						current.Pending = append(current.Pending, entry)
+						current.Version = entry.Version
+						seen[identity] = true
+					}
+					merged, mergeErr := json.Marshal(current)
+					if mergeErr == nil && (len(current.Pending) > storageReportQueueMaxEntries || len(merged)+1 > storageReportQueueMaxBytes) {
+						mergeErr = fmt.Errorf("merged storage report queue exceeds spool limit")
+					}
+					if mergeErr == nil {
+						mergeErr = persistStorageReportFile(c.queuePath, merged)
+					}
+					if mergeErr == nil {
+						legacy.Pending = nil
+						legacy.Measurements = nil
+						var cleared []byte
+						cleared, mergeErr = json.Marshal(legacy)
+						if mergeErr == nil {
+							mergeErr = persistStorageReportFile(legacyPath, cleared)
+						}
+					}
+					if mergeErr != nil {
+						c.restoreErr = fmt.Errorf("transfer legacy storage reports: %w", mergeErr)
+						return
+					}
+					data = merged
+				}
+			}
 		}
 		if err == nil {
 			var state storageReportQueueState

@@ -6,11 +6,27 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"syscall"
 	"unsafe"
 
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	"golang.org/x/sys/unix"
 )
+
+func sameRetainedFileMetadata(before, after any) bool {
+	a, ok := before.(*syscall.Stat_t)
+	if !ok || a == nil {
+		return false
+	}
+	b, ok := after.(*syscall.Stat_t)
+	if !ok || b == nil {
+		return false
+	}
+	left, right := *a, *b
+	// Reading a saved manifest can update atime without changing its generation.
+	left.Atim, right.Atim = syscall.Timespec{}, syscall.Timespec{}
+	return left == right
+}
 
 type storageFiemapExtent struct {
 	Logical, Physical, Length uint64

@@ -9,12 +9,41 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	"golang.org/x/sys/unix"
 )
+
+func TestRetainedFileMetadataIgnoresReadAccessTime(t *testing.T) {
+	before := syscall.Stat_t{Dev: 1, Ino: 2, Nlink: 1, Size: 4096, Blocks: 8,
+		Atim: syscall.Timespec{Sec: 1}, Mtim: syscall.Timespec{Sec: 2}, Ctim: syscall.Timespec{Sec: 2}}
+	for _, tc := range []struct {
+		name   string
+		change func(*syscall.Stat_t)
+		same   bool
+	}{
+		{"unchanged", func(*syscall.Stat_t) {}, true},
+		{"manifest read", func(s *syscall.Stat_t) { s.Atim.Sec++ }, true},
+		{"replacement", func(s *syscall.Stat_t) { s.Ino++ }, false},
+		{"device", func(s *syscall.Stat_t) { s.Dev++ }, false},
+		{"size", func(s *syscall.Stat_t) { s.Size++ }, false},
+		{"allocation", func(s *syscall.Stat_t) { s.Blocks++ }, false},
+		{"write", func(s *syscall.Stat_t) { s.Mtim.Nsec++ }, false},
+		{"write with restored mtime", func(s *syscall.Stat_t) { s.Ctim.Nsec++ }, false},
+		{"unlink", func(s *syscall.Stat_t) { s.Nlink = 0 }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			after := before
+			tc.change(&after)
+			if got := sameRetainedFileMetadata(&before, &after); got != tc.same {
+				t.Fatalf("same metadata = %v, want %v", got, tc.same)
+			}
+		})
+	}
+}
 
 func retainedTestUnion(extents ...[]retainedstorage.Extent) int64 {
 	all := []retainedstorage.Extent{}
