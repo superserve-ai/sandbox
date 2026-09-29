@@ -1142,6 +1142,13 @@ type PendingBackup struct {
 	// a binary that predates Enqueued wrote it, so whether its generation
 	// reached the journal is unknowable and it is never counted as a loss.
 	Version int `json:"version,omitempty"`
+
+	// unwritten marks a copy that may still owe the store its first
+	// write, and is deliberately not persisted: it is set when a pause
+	// mints the marker and cleared once a write lands. Only such a copy
+	// may create the record; any other worker would be resurrecting a
+	// marker some success has already retired.
+	unwritten bool
 }
 
 // PendingBackupVersion is stamped when a marker is minted, so the value a
@@ -1167,13 +1174,30 @@ func (s *StateStore) PutPendingBackup(p PendingBackup) error {
 // a failed initial write, and the newest pause always wins the slot
 // while a newer record is never overwritten by an older worker.
 func (s *StateStore) PutPendingBackupIfOwner(p PendingBackup) error {
+	return s.putPendingBackupIfOwner(p, true)
+}
+
+// RefreshPendingBackupIfOwner is PutPendingBackupIfOwner for a worker
+// holding a copy the store gave it: an empty slot means the pause was
+// retired or discarded while the worker ran, and re-creating the marker
+// would both re-hash an already-journaled pause and make its eventual
+// discard look like a loss.
+func (s *StateStore) RefreshPendingBackupIfOwner(p PendingBackup) error {
+	return s.putPendingBackupIfOwner(p, false)
+}
+
+func (s *StateStore) putPendingBackupIfOwner(p PendingBackup, create bool) error {
 	data, err := json.Marshal(p)
 	if err != nil {
 		return err
 	}
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(pendingBackupBucketName)
-		if v := b.Get([]byte(p.VMID)); v != nil {
+		v := b.Get([]byte(p.VMID))
+		if v == nil && !create {
+			return nil
+		}
+		if v != nil {
 			var cur PendingBackup
 			if json.Unmarshal(v, &cur) == nil {
 				if cur.Token > p.Token {

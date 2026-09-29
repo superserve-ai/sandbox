@@ -210,6 +210,10 @@ func TestDelayedSweepDoesNotReportAnEnqueuedPauseAsDropped(t *testing.T) {
 		name string
 		// succeed applies the ending the live worker reached.
 		succeed func(*testing.T, *Manager, PendingBackup)
+		// inconclusive runs a sweep while a resume has started the unit
+		// but not yet cleared the paused status, so the at-rest check
+		// can neither trust nor supersede the pause and keeps it.
+		inconclusive bool
 	}{
 		{
 			name: "marker kept for a staging upgrade",
@@ -221,13 +225,13 @@ func TestDelayedSweepDoesNotReportAnEnqueuedPauseAsDropped(t *testing.T) {
 			},
 		},
 		{
-			name: "marker retired",
-			succeed: func(t *testing.T, m *Manager, pb PendingBackup) {
-				m.clearEnqueuedMarker(pb, zerolog.Nop())
-				if got, found, err := m.state.GetPendingBackup(pb.VMID); err != nil || found {
-					t.Fatalf("marker not retired: %+v (%v)", got, err)
-				}
-			},
+			name:    "marker retired",
+			succeed: retireMarker,
+		},
+		{
+			name:         "marker retired, then a sweep finds the resume mid-flight",
+			succeed:      retireMarker,
+			inconclusive: true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -265,15 +269,34 @@ func TestDelayedSweepDoesNotReportAnEnqueuedPauseAsDropped(t *testing.T) {
 			if err := st.PutPendingBackup(pb); err != nil {
 				t.Fatal(err)
 			}
-			// What a sweep captured before the live worker got its verdict.
-			stale := pb
+			// What a sweep captured before the live worker got its
+			// verdict, read the way the sweep reads it.
+			captured, err := st.ListPendingBackups()
+			if err != nil || len(captured) != 1 {
+				t.Fatalf("capture = %+v (%v)", captured, err)
+			}
+			stale := captured[0]
 			tc.succeed(t, m, pb)
 
+			if tc.inconclusive {
+				m.vms = map[string]*VMInstance{pb.VMID: {Status: StatusPaused, SnapshotPath: snap}}
+				m.unitDead = func(context.Context, string) bool { return false }
+				m.rehashPendingBackup(context.Background(), stale, zerolog.Nop())
+				m.vms = map[string]*VMInstance{}
+				m.unitDead = func(context.Context, string) bool { return true }
+			}
 			m.rehashPendingBackup(context.Background(), stale, zerolog.Nop())
 
 			if got := pauseDropCount(t, reader); got != 0 {
 				t.Fatalf("a pause already in the journal was reported dropped %d times", got)
 			}
 		})
+	}
+}
+
+func retireMarker(t *testing.T, m *Manager, pb PendingBackup) {
+	m.clearEnqueuedMarker(pb, zerolog.Nop())
+	if got, found, err := m.state.GetPendingBackup(pb.VMID); err != nil || found {
+		t.Fatalf("marker not retired: %+v (%v)", got, err)
 	}
 }

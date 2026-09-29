@@ -290,7 +290,7 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 				prev.PauseToken = pauseToken
 				m.persistPendingBackup(prev, log)
 			}
-			go m.startPendingBackup(ctx, prev, log)
+			go m.rehashPendingBackup(ctx, prev, log)
 			return manifest
 		}
 		stageStart := time.Now()
@@ -327,22 +327,9 @@ func (m *Manager) backupPause(ctx context.Context, vmID, snapshotPath, diskPath,
 				Msg("packed disk exceeds inline staging budget; deferring to at-rest worker")
 		}
 	}
-	m.persistPendingBackup(pb, log)
-	go m.startPendingBackup(ctx, pb, log)
+	pb.unwritten = !m.persistPendingBackup(pb, log)
+	go m.rehashPendingBackup(ctx, pb, log)
 	return manifest
-}
-
-// startPendingBackup hands a pause's own marker to its worker, healing
-// the marker first: a pause whose initial persist failed, or one that
-// cannot run because an older worker holds the in-flight slot, would
-// otherwise be left with no durable record at all. Healing is
-// newest-wins, so the newest pause is recorded even when it cannot run
-// yet and the sweep picks it up later. Only the pause path may heal
-// this way; a sweep's record came from the store, where absence means
-// the pause finished and retired it.
-func (m *Manager) startPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger) {
-	m.healPendingBackup(pb, log)
-	m.rehashPendingBackup(ctx, pb, log)
 }
 
 // rehashPendingBackup is the detached owner of a pause's backup. For
@@ -366,6 +353,13 @@ func (m *Manager) rehashPendingBackup(ctx context.Context, pb PendingBackup, log
 	// find the same record while a worker is mid-hash, and a second
 	// concurrent hash of the same multi-GB artifacts buys nothing (the
 	// journal already dedupes the enqueue).
+	// Heal BEFORE the busy guard: a newer pause whose initial persist
+	// failed while an older worker holds the in-flight slot would
+	// otherwise exit here with neither a durable marker nor a worker.
+	// Healing is newest-wins, so this durably records the newest pause
+	// even when it cannot run yet; the sweep picks it up after the older
+	// worker's exact-token cleanup no-ops against it.
+	m.healPendingBackup(pb, log)
 	if _, busy := m.pendingInFlight.LoadOrStore(pb.VMID, struct{}{}); busy {
 		return "", false
 	}
@@ -1039,6 +1033,7 @@ func (m *Manager) BackfillPausedBackups(ctx context.Context, log zerolog.Logger)
 			writeFailed++
 			continue
 		}
+		pb.unwritten = false
 		if !wrote {
 			// A marker already owns this VM's coverage (a live pause's, or
 			// one retained on a transient failure); the sweep retries it on
@@ -1112,13 +1107,15 @@ func (m *Manager) retryEnqueue(pb PendingBackup, manifest []ManifestEntry, log z
 // persistPendingBackup and deletePendingBackup tolerate a nil state
 // store (tests, persistence disabled): the async retry still runs, it
 // just loses crash durability.
-func (m *Manager) persistPendingBackup(pb PendingBackup, log zerolog.Logger) {
+func (m *Manager) persistPendingBackup(pb PendingBackup, log zerolog.Logger) bool {
 	if m.state == nil {
-		return
+		return false
 	}
 	if err := m.state.PutPendingBackup(pb); err != nil {
 		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("persist pending backup failed")
+		return false
 	}
+	return true
 }
 
 // deletePendingBackupIf clears the record only while pb's token still
@@ -1168,11 +1165,19 @@ func (m *Manager) dropPendingBackup(ctx context.Context, pb PendingBackup, log z
 // the initial persist can fail (disk exhaustion, transient I/O), and a
 // keep decision without a durable record would evaporate with the
 // process. Owner-guarded, so a newer pause's record is never clobbered.
+// A missing slot is written only by a marker that never landed one;
+// for every other worker an empty slot means some success already
+// retired this pause, and recreating it would re-hash a journaled
+// pause and make its eventual discard look like a loss.
 func (m *Manager) healPendingBackup(pb PendingBackup, log zerolog.Logger) {
 	if m.state == nil {
 		return
 	}
-	if err := m.state.PutPendingBackupIfOwner(pb); err != nil {
+	heal := m.state.RefreshPendingBackupIfOwner
+	if pb.unwritten {
+		heal = m.state.PutPendingBackupIfOwner
+	}
+	if err := heal(pb); err != nil {
 		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("re-persist pending backup failed")
 	}
 }
@@ -1186,6 +1191,7 @@ func newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath, pauseToken str
 	pb := PendingBackup{
 		VMID: vmID, SnapshotPath: snapshotPath, DiskPath: diskPath, DiskBasePath: diskBasePath,
 		Token: newPendingToken(), PauseToken: pauseToken, Version: PendingBackupVersion,
+		unwritten: true,
 	}
 	if diskBasePath != "" {
 		if id, err := baseIdentity(diskBasePath); err == nil {

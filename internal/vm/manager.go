@@ -2220,8 +2220,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		// backup off until the unit is truly down, and the periodic
 		// sweep keeps retrying after the worker gives up.
 		pb := newPendingBackup(vmID, snapshotPath, diskPath, diskBasePath, pauseToken)
-		m.persistPendingBackup(pb, log)
-		go m.startPendingBackup(ctx, pb, log)
+		pb.unwritten = !m.persistPendingBackup(pb, log)
+		go m.rehashPendingBackup(ctx, pb, log)
 	}
 
 	log.Info().
