@@ -1029,15 +1029,31 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 				p := c["policy"].(map[string]any)
 				p["mode"], p["additional_team"] = "additional_team", "passed"
 			}},
-			{"additional mode missing authorization", func(c map[string]any) {
-				p := c["policy"].(map[string]any)
-				p["mode"], p["additional_team"] = "additional_team", "not_applicable"
-			}},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
 				claims := teamCreationClaims(actor, uuid.NewString(), "Rejected policy team")
 				tc.change(claims)
 				teamCreationStatus(t, client.call(claims, nil), http.StatusForbidden, "policy_not_satisfied")
+			})
+		}
+		for _, authorization := range []string{"not_applicable", "failed"} {
+			t.Run("additional mode authorization "+authorization, func(t *testing.T) {
+				actor := uuid.New()
+				claims := teamCreationClaims(actor, uuid.NewString(), "Rejected additional team")
+				policy := map[string]any{
+					"version": 1, "mode": "additional_team", "session": "passed",
+					"captcha": "not_applicable", "preauth": "not_applicable",
+					"google_onboarding": "not_applicable", "additional_team": "passed",
+				}
+				policy["additional_team"] = authorization
+				claims["policy"] = policy
+				teamCreationStatus(t, client.call(claims, nil), http.StatusForbidden, "policy_not_satisfied")
+				if n := teamCreationCount(t, pool, `SELECT count(*) FROM profile WHERE id=$1`, actor); n != 0 {
+					t.Fatal("rejection wrote profile")
+				}
+				if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_creation_requests WHERE actor_id=$1`, actor); n != 0 {
+					t.Fatal("rejection persisted request")
+				}
 			})
 		}
 		claims := teamCreationClaims(actor, uuid.NewString(), "Rejected team")
