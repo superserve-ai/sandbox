@@ -66,6 +66,16 @@ func (m *Manager) adoptBackupFork(vmID, snapshotID, generation string, rules *sa
 	if rules != nil && !m.applyAdoptedNetworkRules(vmID, rules) {
 		return nil, status.Errorf(codes.Unavailable, "fork adopted vm %s but could not reinstall its egress rules", vmID)
 	}
+	// DestroyVM bypasses the op lock but holds the record-owner lock for its
+	// whole run, so a destroy that finished during the checks above shows here.
+	unlockOwner := m.lockRecordOwner(vmID)
+	m.mu.RLock()
+	still := m.vms[vmID] == inst
+	m.mu.RUnlock()
+	unlockOwner()
+	if !still {
+		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while its retry was adopting it", vmID)
+	}
 	return inst, nil
 }
 

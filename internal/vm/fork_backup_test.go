@@ -213,6 +213,27 @@ func TestBackupForkRetryWaitsForTheBootItAdopts(t *testing.T) {
 	}
 }
 
+// A destroy that completes while a retry adopts the fork wins.
+func TestBackupForkAdoptionYieldsToACompletedDestroy(t *testing.T) {
+	m := newSavedTestManager(t)
+	m.netMgr = &fakeNetMgr{}
+	m.stopVMHook = func(context.Context, string, Supervision) error { return nil }
+	snapshotID := "5f0c2a9e-1b7d-4c3e-8a6f-0d9e2b4c7a13"
+	m.vms["fork-1"] = &VMInstance{ID: "fork-1", Status: StatusRunning, SourceSnapshotID: snapshotID, BackupGeneration: "gen-1", RunDirID: "fork-1"}
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(m *Manager, id string) bool {
+		if err := m.DestroyVM(context.Background(), id, true); err != nil {
+			t.Errorf("destroy: %v", err)
+		}
+		return false
+	}
+	defer func() { vmDeadForRetry = orig }()
+	req := &vmdpb.RestoreSnapshotRequest{VmId: "fork-1", SavedSnapshotId: snapshotID, BackupGeneration: "gen-1"}
+	if _, err := (&GRPCAdapter{mgr: m}).RestoreSnapshot(context.Background(), req); status.Code(err) != codes.Aborted {
+		t.Fatalf("err = %v, want Aborted after the destroy completed", err)
+	}
+}
+
 // A retry that does not name the backup is told to, even with restore off,
 // once this host booted the fork from it.
 func TestBackupForkRetryWithoutAGenerationIsSentBack(t *testing.T) {
