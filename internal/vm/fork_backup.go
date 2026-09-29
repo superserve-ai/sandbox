@@ -15,31 +15,12 @@ import (
 	"github.com/superserve-ai/sandbox/internal/vmdclient"
 )
 
-// savedSnapshotFilesMissing reports whether a fork of the saved snapshot
-// would fail on a file this host no longer has.
-func (m *Manager) savedSnapshotFilesMissing(snapshotID string) bool {
-	dir, err := m.savedSnapshotDir(snapshotID)
-	if err != nil {
-		return false
-	}
-	man, err := readSavedSnapshotManifest(dir)
-	if errors.Is(err, os.ErrNotExist) {
-		return true
-	}
-	if err != nil {
-		return false
-	}
+// savedSnapshotFilesMissing reports whether a fork of the snapshot man
+// describes would fail on a file this host no longer has.
+func savedSnapshotFilesMissing(man *SavedSnapshotManifest) bool {
 	missing := func(path string) bool { return path != "" && !statRegularFile(path) }
 	return !statRegularFile(man.DiskPath) || missing(man.BasePath) ||
 		(man.SnapshotPath != "" && (!statRegularFile(man.SnapshotPath) || !statRegularFile(man.MemPath) || missing(man.BaseMemPath)))
-}
-
-// forkAlreadyBooted reports a fork of the snapshot already running as vmID,
-// whose retry the ordinary restore adopts.
-func (m *Manager) forkAlreadyBooted(vmID, snapshotID string) bool {
-	m.lazyReattach(vmID)
-	existing, _ := m.retriedForkTarget(vmID, snapshotID)
-	return existing != nil
 }
 
 func savedSnapshotMissingErr(snapshotID string) error {

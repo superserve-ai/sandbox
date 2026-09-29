@@ -17,8 +17,8 @@ import (
 )
 
 func TestSavedSnapshotFilesMissing(t *testing.T) {
-	m, man, _, _ := savedBackupFixture(t)
-	if m.savedSnapshotFilesMissing(man.SnapshotID) {
+	_, man, _, _ := savedBackupFixture(t)
+	if savedSnapshotFilesMissing(man) {
 		t.Fatal("a snapshot with every file must not read as missing")
 	}
 	for _, file := range []func(*SavedSnapshotManifest) string{
@@ -30,12 +30,15 @@ func TestSavedSnapshotFilesMissing(t *testing.T) {
 		if err := os.Remove(path); err != nil {
 			t.Fatal(err)
 		}
-		if !m.savedSnapshotFilesMissing(man.SnapshotID) {
+		if !savedSnapshotFilesMissing(man) {
 			t.Fatalf("a snapshot without %s must read as missing", filepath.Base(path))
 		}
-	}
-	if !m.savedSnapshotFilesMissing("5f0c2a9e-1b7d-4c3e-8a6f-0d9e2b4c7a13") {
-		t.Fatal("a snapshot the host never had must read as missing")
+		// The fork's own read of the snapshot asks for the backup.
+		m.SetBackupRestore(&slowEmptyStore{}, &slowEmptyStore{}, filepath.Join(t.TempDir(), ".restore"), BackupRestoreOptions{Concurrency: 1})
+		cfg := VMConfig{SavedSnapshotID: man.SnapshotID}
+		if _, _, _, err := m.forkSource("fork-1", &cfg, "", ""); !vmdclient.IsSavedSnapshotMissing(err) {
+			t.Fatalf("fork without %s: err = %v, want the saved-snapshot-missing refusal", filepath.Base(path), err)
+		}
 	}
 }
 
