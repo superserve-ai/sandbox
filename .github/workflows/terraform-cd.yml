@@ -417,7 +417,6 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
-          # Resolve promotion rollout from Terraform's explicit template value.
           gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE_USW }} \
             --region ${{ vars.GCP_REGION_USW }} --project ${{ vars.GCP_PROJECT }} --format=json | \
             python3 .github/workflows/scripts/check_controlplane_identity.py \
@@ -650,7 +649,6 @@ jobs:
 
       - name: Deploy to Cloud Run
         run: |
-          # Resolve promotion rollout from Terraform's explicit template value.
           gcloud run services describe ${{ vars.CLOUD_RUN_SERVICE_USE4 }} \
             --region ${{ vars.GCP_REGION_USE4 }} --project ${{ vars.GCP_PROJECT }} --format=json | \
             python3 .github/workflows/scripts/check_controlplane_identity.py \
