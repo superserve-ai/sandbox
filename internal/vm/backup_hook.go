@@ -1116,21 +1116,18 @@ func (m *Manager) persistPendingBackup(pb PendingBackup, log zerolog.Logger) {
 }
 
 // deletePendingBackupIf clears the record only while pb's token still
-// owns it: async workers may outlive the pause that spawned them, and a
-// newer pause's record must survive an older worker's cleanup.
-// deletePendingBackupIf clears the marker, reporting whether this call
-// removed it and whether the store refused. False with no error means
-// there was nothing of ours to remove: the record is already gone, or a
-// newer pause owns it and owns its coverage too.
-func (m *Manager) deletePendingBackupIf(pb PendingBackup, log zerolog.Logger) (bool, error) {
+// owns it: async workers may outlive the pause that spawned them. False
+// with no error means there was nothing of ours to remove, which callers
+// must tell apart from a store that refused.
+func (m *Manager) deletePendingBackupIf(pb PendingBackup, log zerolog.Logger) (PendingBackup, bool, error) {
 	if m.state == nil {
-		return false, nil
+		return PendingBackup{}, false, nil
 	}
-	deleted, err := m.state.DeletePendingBackupIf(pb.VMID, pb.Token)
+	removed, deleted, err := m.state.DeletePendingBackupIf(pb.VMID, pb.Token)
 	if err != nil {
 		log.Error().Err(err).Str("vm_id", pb.VMID).Msg("clear pending backup failed")
 	}
-	return deleted, err
+	return removed, deleted, err
 }
 
 // clearEnqueuedMarker retires the marker of a pause whose generation is
@@ -1139,7 +1136,7 @@ func (m *Manager) deletePendingBackupIf(pb PendingBackup, log zerolog.Logger) (b
 // would later read a marker that looks uncovered and count a loss that
 // never happened.
 func (m *Manager) clearEnqueuedMarker(pb PendingBackup, log zerolog.Logger) {
-	if _, err := m.deletePendingBackupIf(pb, log); err == nil {
+	if _, _, err := m.deletePendingBackupIf(pb, log); err == nil {
 		return
 	}
 	pb.Enqueued = true
@@ -1152,8 +1149,10 @@ func (m *Manager) clearEnqueuedMarker(pb PendingBackup, log zerolog.Logger) {
 // whose generation already reached the journal is not a loss, however it is
 // later discarded.
 func (m *Manager) dropPendingBackup(ctx context.Context, pb PendingBackup, log zerolog.Logger, reason string) {
-	deleted, _ := m.deletePendingBackupIf(pb, log)
-	if !deleted || pb.Enqueued || pb.Version < PendingBackupVersion {
+	// The durable record, never the caller's copy: a worker can hold one
+	// captured before its own enqueue landed.
+	removed, deleted, _ := m.deletePendingBackupIf(pb, log)
+	if !deleted || removed.Enqueued || removed.Version < PendingBackupVersion {
 		return
 	}
 	m.backupMetrics.AddPauseBackupDropped(ctx, reason)

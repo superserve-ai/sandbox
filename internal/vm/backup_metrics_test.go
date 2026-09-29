@@ -183,19 +183,76 @@ func TestDeletePendingBackupIfReportsOnlyItsOwnRemoval(t *testing.T) {
 	}
 	defer st.Close()
 
-	if deleted, err := st.DeletePendingBackupIf("vm-absent", "tok"); err != nil || deleted {
+	if _, deleted, err := st.DeletePendingBackupIf("vm-absent", "tok"); err != nil || deleted {
 		t.Fatalf("absent record: deleted=%v err=%v", deleted, err)
 	}
 	if err := st.PutPendingBackup(PendingBackup{VMID: "vm-1", Token: "tok-new"}); err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := st.DeletePendingBackupIf("vm-1", "tok-old"); err != nil || deleted {
+	if _, deleted, err := st.DeletePendingBackupIf("vm-1", "tok-old"); err != nil || deleted {
 		t.Fatalf("a newer pause's record: deleted=%v err=%v", deleted, err)
 	}
 	if _, ok, err := st.GetPendingBackup("vm-1"); err != nil || !ok {
 		t.Fatalf("the newer pause's marker was removed: ok=%v err=%v", ok, err)
 	}
-	if deleted, err := st.DeletePendingBackupIf("vm-1", "tok-new"); err != nil || !deleted {
+	if _, deleted, err := st.DeletePendingBackupIf("vm-1", "tok-new"); err != nil || !deleted {
 		t.Fatalf("own record: deleted=%v err=%v", deleted, err)
+	}
+}
+
+// The interleaving a direct call cannot reach: a sweep captures the marker
+// list, the live worker enqueues and records it, then the sweep runs the
+// real rehash path with its pre-enqueue copy. Healing that stale copy must
+// not unlearn the coverage, and the eventual discard must not be counted.
+func TestDelayedSweepDoesNotReportAnEnqueuedPauseAsDropped(t *testing.T) {
+	dir := t.TempDir()
+	snap := filepath.Join(dir, "vmstate.snap")
+	disk := filepath.Join(dir, "rootfs.ext4")
+	for _, p := range []string{snap, disk} {
+		if err := os.WriteFile(p, []byte("bytes"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := OpenStateStore(filepath.Join(dir, "vmd.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() {
+		if err := provider.Shutdown(context.Background()); err != nil {
+			t.Errorf("shutdown meter provider: %v", err)
+		}
+	})
+	rec, err := telemetry.NewBackupRecorderWithProvider(provider, telemetry.BackupOTelConfig{HostID: "host-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No instance and a dead unit: the rehash sees the pause superseded,
+	// which is the branch that classifies a drop.
+	m := &Manager{state: st, vms: map[string]*VMInstance{}, unitDead: func(context.Context, string) bool { return true }}
+	m.SetBackupMetrics(rec)
+
+	pb := newPendingBackup("vm-1", snap, disk, "", "pause-tok")
+	if err := st.PutPendingBackup(pb); err != nil {
+		t.Fatal(err)
+	}
+	// What a sweep captured before the live worker got its verdict.
+	stale := pb
+
+	// The live worker journals the generation and records that on the
+	// marker it keeps for a later staging upgrade.
+	enqueued := pb
+	enqueued.Enqueued = true
+	if err := st.PutPendingBackupIfOwner(enqueued); err != nil {
+		t.Fatal(err)
+	}
+
+	m.rehashPendingBackup(context.Background(), stale, zerolog.Nop())
+
+	if got := pauseDropCount(t, reader); got != 0 {
+		t.Fatalf("a pause already in the journal was reported dropped %d times", got)
 	}
 }

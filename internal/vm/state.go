@@ -1175,8 +1175,19 @@ func (s *StateStore) PutPendingBackupIfOwner(p PendingBackup) error {
 		b := tx.Bucket(pendingBackupBucketName)
 		if v := b.Get([]byte(p.VMID)); v != nil {
 			var cur PendingBackup
-			if json.Unmarshal(v, &cur) == nil && cur.Token > p.Token {
-				return nil
+			if json.Unmarshal(v, &cur) == nil {
+				if cur.Token > p.Token {
+					return nil
+				}
+				// A worker may hold a copy captured before its own
+				// enqueue landed. Rewriting the record from that copy
+				// must not unlearn coverage this token already earned.
+				if cur.Token == p.Token && cur.Enqueued && !p.Enqueued {
+					p.Enqueued = true
+					if data, err = json.Marshal(p); err != nil {
+						return err
+					}
+				}
 			}
 		}
 		return b.Put([]byte(p.VMID), data)
@@ -1207,11 +1218,12 @@ func (s *StateStore) PutPendingBackupIfAbsent(p PendingBackup) (bool, error) {
 // DeletePendingBackupIf clears the marker only while the given token
 // still owns it: an older pause's async worker finishing late must not
 // erase the record a newer pause has since written over the same key.
-// DeletePendingBackupIf clears the marker only if token still owns it,
-// reporting whether this call is what removed it. An absent record and one
-// a newer pause owns both report false with no error: the caller has not
-// discarded anything, and callers distinguish that from a store failure.
-func (s *StateStore) DeletePendingBackupIf(vmID, token string) (bool, error) {
+// It reports whether this call is what removed it, and returns the
+// record removed: a worker's own copy can predate its own writes, so a
+// verdict about the pause belongs on the durable one. An absent record
+// and one a newer pause owns both report false with no error.
+func (s *StateStore) DeletePendingBackupIf(vmID, token string) (PendingBackup, bool, error) {
+	var removed PendingBackup
 	deleted := false
 	err := s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(pendingBackupBucketName)
@@ -1226,10 +1238,10 @@ func (s *StateStore) DeletePendingBackupIf(vmID, token string) (bool, error) {
 		if err := b.Delete([]byte(vmID)); err != nil {
 			return err
 		}
-		deleted = true
+		removed, deleted = cur, true
 		return nil
 	})
-	return deleted, err
+	return removed, deleted, err
 }
 
 // GetPendingBackup returns a VM's pending-backup marker, if any.
