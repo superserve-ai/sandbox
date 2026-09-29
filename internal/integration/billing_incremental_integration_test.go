@@ -1624,8 +1624,13 @@ func testIncrementalDisabledStorageRemainsReconcilable(t *testing.T, source stri
 		if w.Code != wantCode || billingPeriodStatus(t, p.TeamID, p.Start, p.End) != wantStatus {
 			t.Fatalf("%s close: %d %s", mode, w.Code, w.Body.String())
 		}
-		if storageReads != 1 {
-			t.Fatalf("%s storage summary reads = %d, want 1", mode, storageReads)
+		wantStorageReads := 1
+		if mode == "frozen" {
+			// Frozen recovery reconciles before delivery and refreshes evidence afterward.
+			wantStorageReads = 2
+		}
+		if storageReads != wantStorageReads {
+			t.Fatalf("%s storage summary reads = %d, want %d", mode, storageReads, wantStorageReads)
 		}
 		var local, reserved, submitted string
 		var counted, lastError *string

@@ -99,6 +99,7 @@ BEGIN
            (CASE WHEN date_trunc('minute',o.period_start)<o.period_start THEN interval '1 minute' ELSE interval '0' END)
        OR evidence.query_end <> date_trunc('minute',o.period_end)
        OR evidence.query_end <= evidence.query_start OR evidence.query_end-evidence.query_start>interval '32 days'
+       OR o.meter_id IS NULL OR evidence.meter_id <> o.meter_id
        OR evidence.local_quantity <> o.local_quantity OR evidence.reserved_quantity <> o.reserved_quantity
        OR evidence.submitted_quantity <> o.submitted_quantity OR evidence.provider_quantity <> o.counted_quantity
        OR evidence.local_quantity <> evidence.reserved_quantity OR evidence.submitted_quantity <> evidence.reserved_quantity

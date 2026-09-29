@@ -774,7 +774,10 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 		if err = h.submitIncrementalEvents(ctx, p, 2*len(h.billingResourceStates(storage))); err != nil {
 			return frozenResult, err
 		}
-		return frozenResult, nil
+		// Keep the pre-delivery reconciliation as the safety gate for pending
+		// events, then refresh it after delivery so a frozen correction cannot
+		// leave close evidence behind the now-submitted accounting snapshot.
+		return h.reconcileFrozenIncrementalPeriod(ctx, p)
 	}
 
 	var usage db.TeamBillingUsage
@@ -868,7 +871,7 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 		decisionItem.Quantity = cumulative
 		decision := h.assessMeterSummary(ctx, p, decisionItem, through, decisionReader, *account.StripeCustomerID, counted, totals, countErr)
 		if decision.Err != nil {
-			recordErr := h.recordMeterObservation(ctx, p, decisionItem, through, totals, counted, decision.Err, started, nil)
+			recordErr := h.recordMeterObservation(ctx, p, decisionItem, through, totals, counted, decision.Err, started, nil, meterReaderID(decisionReader))
 			return result, errors.Join(decision.Err, recordErr)
 		}
 		for part := 0; part < 2; part++ {
@@ -939,11 +942,23 @@ func (h *Handlers) observeIncrementalResource(ctx context.Context, p billing.Exp
 	reader = pinMeterSummaryReader(reader)
 	counted, countErr := reader.CountedMeterUsage(ctx, item.EventName, customer, p.Start, through)
 	decision := h.assessMeterSummary(ctx, p, item, through, reader, customer, counted, totals, countErr)
-	err = h.recordMeterObservation(ctx, p, item, through, totals, counted, decision.Err, started, decision.CloseEvidence)
+	err = h.recordMeterObservation(ctx, p, item, through, totals, counted, decision.Err, started, decision.CloseEvidence, meterReaderID(reader))
 	return totals, errors.Join(err, decision.Err)
 }
 
-func (h *Handlers) recordMeterObservation(ctx context.Context, p billing.ExportPeriod, item incrementalExportItem, through time.Time, totals billing.ExportTotals, counted string, decisionErr error, started time.Time, closeEvidence *meterCloseEvidence) error {
+func meterReaderID(reader stripeMeterSummaryReader) string {
+	if identity, ok := reader.(interface{ MeterID() string }); ok {
+		return identity.MeterID()
+	}
+	return ""
+}
+
+func (h *Handlers) recordMeterObservation(ctx context.Context, p billing.ExportPeriod, item incrementalExportItem, through time.Time, totals billing.ExportTotals, counted string, decisionErr error, started time.Time, closeEvidence *meterCloseEvidence, meterID string) error {
+	if closeEvidence != nil {
+		// The evidence carries the identity pinned for all provider reads in
+		// this decision; never persist a caller-supplied replacement identity.
+		meterID = closeEvidence.MeterID
+	}
 	previousAge, ageErr := (billing.ExportStore{Pool: h.Pool}).PreviousObservationAge(ctx, p, item.ResourceType)
 	if ageErr != nil {
 		log.Warn().Err(ageErr).Msg("billing observation freshness read failed")
@@ -994,12 +1009,12 @@ func (h *Handlers) recordMeterObservation(ctx context.Context, p billing.ExportP
 		}
 		exec = tx
 	}
-	_, err := exec.Exec(ctx, `INSERT INTO billing_export_observation(team_id,period_start,period_end,resource_type,local_quantity,submitted_quantity,reserved_quantity,counted_quantity,query_start,query_end,last_error)
-        VALUES($1,$2,$3,$4,$5::numeric,$6::numeric,$7::numeric,$8::numeric,$9,$10,$11)
-        ON CONFLICT(team_id,period_start,period_end,resource_type) DO UPDATE SET
-        local_quantity=EXCLUDED.local_quantity,submitted_quantity=EXCLUDED.submitted_quantity,reserved_quantity=EXCLUDED.reserved_quantity,
-        counted_quantity=EXCLUDED.counted_quantity,query_start=EXCLUDED.query_start,query_end=EXCLUDED.query_end,last_error=EXCLUDED.last_error,observed_at=now()`,
-		p.TeamID, p.Start, p.End, item.ResourceType, item.Quantity, totals.Submitted, totals.Reserved, countedValue, queryStart, queryEnd, message)
+	_, err := exec.Exec(ctx, `INSERT INTO billing_export_observation(team_id,period_start,period_end,resource_type,local_quantity,submitted_quantity,reserved_quantity,counted_quantity,query_start,query_end,last_error,meter_id)
+		VALUES($1,$2,$3,$4,$5::numeric,$6::numeric,$7::numeric,$8::numeric,$9,$10,$11,NULLIF($12,''))
+		ON CONFLICT(team_id,period_start,period_end,resource_type) DO UPDATE SET
+		local_quantity=EXCLUDED.local_quantity,submitted_quantity=EXCLUDED.submitted_quantity,reserved_quantity=EXCLUDED.reserved_quantity,
+		counted_quantity=EXCLUDED.counted_quantity,query_start=EXCLUDED.query_start,query_end=EXCLUDED.query_end,last_error=EXCLUDED.last_error,meter_id=EXCLUDED.meter_id,observed_at=now()`,
+		p.TeamID, p.Start, p.End, item.ResourceType, item.Quantity, totals.Submitted, totals.Reserved, countedValue, queryStart, queryEnd, message, meterID)
 	if err == nil && closeEvidence != nil {
 		err = persistMeterCloseEvidence(ctx, tx, p, item.ResourceType, *closeEvidence)
 		if err == nil {

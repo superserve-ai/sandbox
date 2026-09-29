@@ -428,6 +428,7 @@ type BillingExportObservation struct {
 	QueryStart        time.Time      `json:"query_start"`
 	QueryEnd          time.Time      `json:"query_end"`
 	LastError         *string        `json:"last_error"`
+	MeterID           *string        `json:"meter_id"`
 }
 
 type BillingExportUsage struct {

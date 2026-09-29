@@ -389,6 +389,12 @@ func TestMeterGrowingRepeatedDrift(t *testing.T) {
 					}
 				}
 				drift := big.NewRat(steps, 1_000_000_000_000)
+				if shape == "increasing" && i == 512 {
+					// A growing residual eventually leaves the documented one-ULP
+					// domain; do not let the repeated-export test stop below the
+					// rejection boundary.
+					drift = new(big.Rat).Mul(bound, big.NewRat(2, 1))
+				}
 				provider := new(big.Rat).Add(total, drift)
 				for read := 0; read < 2; read++ {
 					buckets := []meterUsageBucket{{Start: start, End: start.Add(24 * time.Hour), Quantity: total.FloatString(12)}}

@@ -2107,14 +2107,14 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 		t.Fatalf("collect close evidence: %+v", decision)
 	}
 	exec(`UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team.ID, "cus_changed_"+team.ID.String())
-	if err := h.recordMeterObservation(ctx, p, item, end, totals, counted, nil, time.Now(), decision.CloseEvidence); !errors.Is(err, billing.ErrExportRecoveryRequired) {
+	if err := h.recordMeterObservation(ctx, p, item, end, totals, counted, nil, time.Now(), decision.CloseEvidence, provider.MeterID()); !errors.Is(err, billing.ErrExportRecoveryRequired) {
 		t.Fatalf("concurrent scope change persisted stale evidence: %v", err)
 	}
 	exec(`UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team.ID, customer)
 
 	// Exercise the actual finalization transaction with bad evidence. Each
 	// mutation rolls back, so the original immutable history remains intact.
-	for _, mode := range []string{"missing", "stale", "wrong_scope", "wrong_snapshot", "wrong_policy", "wrong_window", "incomplete", "unstable", "excess", "provider_lag", "unresolved", "changed_accounting", "changed_customer", "old_writer", "boundary", "beyond_boundary"} {
+	for _, mode := range []string{"missing", "stale", "wrong_scope", "wrong_meter", "wrong_snapshot", "wrong_policy", "wrong_window", "incomplete", "unstable", "excess", "provider_lag", "unresolved", "changed_accounting", "changed_customer", "old_writer", "boundary", "beyond_boundary"} {
 		t.Run(mode, func(t *testing.T) {
 			tx, err := pool.Begin(ctx)
 			if err != nil {
@@ -2133,6 +2133,8 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 				mutation = `UPDATE billing_meter_reconciliation SET collected_at=now()-interval '3 hours' WHERE team_id=$1`
 			case "wrong_scope":
 				mutation = `UPDATE billing_meter_reconciliation SET customer_id='cus_wrong' WHERE team_id=$1`
+			case "wrong_meter":
+				mutation = `UPDATE billing_meter_reconciliation SET meter_id='mtr_old_precision' WHERE team_id=$1`
 			case "wrong_snapshot":
 				mutation = `UPDATE billing_meter_reconciliation SET accounting_snapshot='{}' WHERE team_id=$1`
 			case "wrong_policy":
@@ -2230,6 +2232,13 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 	}
 	if err := h.submitIncrementalEvents(ctx, second, 6); err != nil {
 		t.Fatal(err)
+	}
+	// The first period's evidence must not authorize a later period. Before
+	// collecting second-period evidence, the close trigger must reject an
+	// attempted export rather than selecting the retained prior history.
+	if _, err := pool.Exec(ctx, `UPDATE team_billing_period SET status='exported',exported_at=now()
+ WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, second.Start, second.End); err == nil {
+		t.Fatal("prior-period reconciliation evidence authorized second-period close")
 	}
 	beforeSecondClose := snapshot()
 	if _, err := h.exportIncrementalPeriod(ctx, second); err != nil {
