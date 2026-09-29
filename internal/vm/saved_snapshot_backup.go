@@ -18,21 +18,16 @@ import (
 // for a backup that was never queued, or was lost with the journal.
 const SavedSnapshotBackupSweep = 30 * time.Minute
 
-// savedSnapshotHashSlots bounds how many saved snapshots' disks are hashed at
-// once. Each hash reads a whole disk, so a burst of captures (or the first
-// sweep on a host) would otherwise saturate its disk. Separate from the pause
-// rehash slots, so snapshots never delay a pause's backup.
+// savedSnapshotHashSlots keeps a burst of captures from saturating the disk,
+// apart from the pause rehash slots so snapshots never delay a pause's backup.
 var savedSnapshotHashSlots = make(chan struct{}, 1)
 
 // SnapshotBackupCapability is the string a vmd that reads saved-snapshot
 // backup queue entries carries; the host guard greps the binary for it.
 const SnapshotBackupCapability = "snapshot-backup-1"
 
-// snapshotBackupEvidencePath records that this host has queued a saved
-// snapshot's backup. A vmd without SnapshotBackupCapability reads such an
-// entry with no owner and can neither finish nor clear it, so the evidence
-// is durable before the first one is queued and the host guard refuses such
-// a vmd from then on.
+// snapshotBackupEvidencePath is made durable before the first saved-snapshot
+// entry is queued; from then on the host guard refuses a vmd that cannot read one.
 var snapshotBackupEvidencePath = "/var/lib/sandbox/snapshot-backup-evidence"
 
 const snapshotBackupEvidenceNote = "this host has queued saved snapshot backups\n"

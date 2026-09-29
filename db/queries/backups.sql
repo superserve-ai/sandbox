@@ -65,21 +65,14 @@ WHERE excluded.completed_at > backup_generation.completed_at
    OR backup_generation.purge_claimed_at IS NOT NULL;
 
 -- name: RecordSnapshotBackupGeneration :execrows
--- Saved-snapshot variant of RecordSandboxBackupGeneration, with the same
--- idempotence and purge-reopen rules: a snapshot's upload can finish after
--- the snapshot was deleted and its backup purged.
+-- Saved-snapshot variant of RecordSandboxBackupGeneration, purge-reopen
+-- included: an upload can finish after its snapshot was deleted and purged.
 INSERT INTO backup_generation (snapshot_id, generation, bucket, completed_at, files)
 VALUES ($1, $2, $3, $4, $5)
 ON CONFLICT (snapshot_id, bucket, generation) WHERE snapshot_id IS NOT NULL
 DO UPDATE SET
-  -- A generation uploaded again after its purge (a host's queued upload
-  -- landing late) is purged again.
   purged_at = NULL,
   purge_claimed_at = NULL,
-  -- reported_at is the receive-instant freshness cap for skew-bounded
-  -- reads, so it moves only when a freshness arm fires: an
-  -- enrichment-only update re-describes the same verification and must
-  -- not advance when the control plane first learned of it.
   reported_at = CASE
     WHEN excluded.completed_at > backup_generation.completed_at
          OR (backup_generation.completed_at > now()
@@ -93,13 +86,6 @@ DO UPDATE SET
          AND excluded.completed_at < backup_generation.completed_at
       THEN excluded.completed_at
     ELSE backup_generation.completed_at END,
-  -- files, in order: a coverage-only report (empty files: the outbox
-  -- seed reconstructs no manifest) must never erase a recorded
-  -- manifest; a manifest that carries object paths is frozen (the
-  -- bucket manifest it mirrors is immutable, redeliveries carry the
-  -- identical set, and nothing conforming can legitimately rename a
-  -- generation's objects, so first-writer-wins is what keeps the paths
-  -- deletion-trustworthy for GC); anything richer refreshes.
   files = CASE
     WHEN jsonb_array_length(excluded.files) = 0
       THEN backup_generation.files
@@ -110,9 +96,6 @@ WHERE excluded.completed_at > backup_generation.completed_at
    OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
    OR (jsonb_path_exists(excluded.files, '$[*].object')
        AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'))
-   -- Any report for a purged or purge-claimed generation, an exact
-   -- redelivery included, comes from a host that holds its objects: the
-   -- purge must run again.
    OR backup_generation.purged_at IS NOT NULL
    OR backup_generation.purge_claimed_at IS NOT NULL;
 

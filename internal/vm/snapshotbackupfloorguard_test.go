@@ -8,9 +8,6 @@ import (
 	"testing"
 )
 
-// The snapshot-backup floor guard is safety-critical shell; these cases drive
-// deploy/vmd-snapshot-backup-floor-guard the way the staged-intent guard's
-// harness drives its guard.
 func TestSnapshotBackupFloorGuard(t *testing.T) {
 	src, err := os.ReadFile(filepath.Join("..", "..", "deploy", "vmd-snapshot-backup-floor-guard"))
 	if err != nil {
