@@ -120,13 +120,24 @@ func purgeManifestPrefix(ctx context.Context, store BlobAdmin, manifest string) 
 // the bucket, from one listing: for each sandbox id, its generations and
 // whether each is complete (carries a manifest).
 func SandboxGenerations(ctx context.Context, lister BlobLister) (map[string]map[string]bool, error) {
-	objects, err := lister.List(ctx, sandboxPrefix+"/")
+	return generationsUnder(ctx, lister, sandboxPrefix)
+}
+
+// SnapshotGenerations is SandboxGenerations for saved snapshots, whose
+// uploads can leave objects the database never heard of: a snapshot
+// deleted mid-upload is abandoned without a manifest or a report.
+func SnapshotGenerations(ctx context.Context, lister BlobLister) (map[string]map[string]bool, error) {
+	return generationsUnder(ctx, lister, snapshotPrefix)
+}
+
+func generationsUnder(ctx context.Context, lister BlobLister, prefix string) (map[string]map[string]bool, error) {
+	objects, err := lister.List(ctx, prefix+"/")
 	if err != nil {
 		return nil, err
 	}
 	out := map[string]map[string]bool{}
 	for _, obj := range objects {
-		rest := strings.TrimPrefix(obj.Name, sandboxPrefix+"/")
+		rest := strings.TrimPrefix(obj.Name, prefix+"/")
 		id, rest, ok := strings.Cut(rest, "/")
 		if !ok {
 			continue

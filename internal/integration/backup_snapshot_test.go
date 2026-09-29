@@ -4,12 +4,16 @@ package integration
 
 import (
 	"context"
+	"io"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/superserve-ai/sandbox/internal/api"
+	"github.com/superserve-ai/sandbox/internal/backup"
 	"github.com/superserve-ai/sandbox/internal/db"
 )
 
@@ -98,6 +102,56 @@ func TestIntegration_BackupGC_SnapshotBackupsFollowTheSnapshot(t *testing.T) {
 	recordSnapshotGeneration(t, gone, bucket, genGone)
 	if rows := claim(); len(rows) != 1 || rows[0].Generation != genGone {
 		t.Fatalf("a late report did not reopen the purge: %+v", rows)
+	}
+}
+
+// memAdmin is an in-memory bucket for the garbage collector.
+type memAdmin struct {
+	bucket  string
+	objects map[string]bool
+}
+
+func (m *memAdmin) Identity() string { return m.bucket }
+func (m *memAdmin) NewReader(context.Context, string) (io.ReadCloser, error) {
+	return nil, backup.ErrObjectNotFound
+}
+func (m *memAdmin) Delete(_ context.Context, object string) error {
+	delete(m.objects, object)
+	return nil
+}
+func (m *memAdmin) List(_ context.Context, prefix string) ([]backup.ObjectInfo, error) {
+	var out []backup.ObjectInfo
+	for name := range m.objects {
+		if strings.HasPrefix(name, prefix) {
+			out = append(out, backup.ObjectInfo{Name: name})
+		}
+	}
+	return out, nil
+}
+
+// An upload abandoned when its snapshot was deleted leaves objects with no
+// manifest and no database row; the daily walk removes them, and leaves a
+// live snapshot's backup alone.
+func TestIntegration_BackupGC_WalkPurgesADeletedSnapshotsLeftovers(t *testing.T) {
+	ctx := context.Background()
+	teamID, apiKey := seedTeamAndKey(t)
+	source := createAndDeleteSandbox(t, apiKey, false)
+	live := insertSavedSnapshot(t, teamID, source)
+	gone := insertSavedSnapshot(t, teamID, source)
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox_snapshot SET status = 'deleting', deleted_at = now() WHERE id = $1`, gone); err != nil {
+		t.Fatal(err)
+	}
+	liveObj := "snapshots/" + live.String() + "/gen-1/rootfs.ext4.p1"
+	store := &memAdmin{bucket: "walk-" + uuid.NewString(), objects: map[string]bool{
+		liveObj: true,
+		"snapshots/" + gone.String() + "/half-done/rootfs.ext4.p1": true,
+	}}
+	h := &api.Handlers{DB: testQueries, BackupGC: store}
+	if purged := h.WalkBucketBackups(ctx); purged != 1 {
+		t.Fatalf("walk purged %d generations, want the deleted snapshot's one", purged)
+	}
+	if len(store.objects) != 1 || !store.objects[liveObj] {
+		t.Fatalf("objects left = %v, want only the live snapshot's", store.objects)
 	}
 }
 

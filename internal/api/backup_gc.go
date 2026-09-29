@@ -143,9 +143,9 @@ func (h *Handlers) purgeClaimedGenerations(ctx context.Context, ownerKey string,
 }
 
 // WalkBucketBackups walks the bucket once a day, on whichever replica
-// claims the walk, from one listing, and purges every generation of a
-// sandbox the database says is deleted, row or no row. Ids the database
-// does not know are left alone.
+// claims the walk, from one listing per prefix, and purges every generation
+// of a sandbox or saved snapshot the database says is deleted, row or no
+// row. Ids the database does not know are left alone.
 func (h *Handlers) WalkBucketBackups(ctx context.Context) (purged int) {
 	bucket := h.BackupGC.Identity()
 	claimed, err := h.DB.ClaimBackupWalk(ctx, db.ClaimBackupWalkParams{Bucket: bucket, IntervalSeconds: bucketWalkInterval.Seconds()})
@@ -156,9 +156,26 @@ func (h *Handlers) WalkBucketBackups(ctx context.Context) (purged int) {
 	if claimed == 0 {
 		return 0
 	}
-	stored, err := backup.SandboxGenerations(ctx, h.BackupGC)
+	purged += h.walkOwnerPrefix(ctx, "sandbox_id", backup.SandboxGenerations, h.DB.DeletedSandboxIDs,
+		func(owner, generation string) (int, error) {
+			return backup.PurgeGeneration(ctx, h.BackupGC, owner, generation)
+		})
+	purged += h.walkOwnerPrefix(ctx, "snapshot_id", backup.SnapshotGenerations, h.DB.DeletedSavedSnapshotIDs,
+		func(owner, generation string) (int, error) {
+			return backup.PurgeSnapshotGeneration(ctx, h.BackupGC, owner, generation)
+		})
+	return purged
+}
+
+// walkOwnerPrefix lists one owner prefix and purges every generation of the
+// owners the database reports deleted.
+func (h *Handlers) walkOwnerPrefix(ctx context.Context, ownerKey string,
+	list func(context.Context, backup.BlobLister) (map[string]map[string]bool, error),
+	deletedIDs func(context.Context, []uuid.UUID) ([]uuid.UUID, error),
+	purge func(owner, generation string) (int, error)) (purged int) {
+	stored, err := list(ctx, h.BackupGC)
 	if err != nil {
-		log.Warn().Err(err).Msg("backup gc: bucket listing failed")
+		log.Warn().Err(err).Str("owner", ownerKey).Msg("backup gc: bucket listing failed")
 		return 0
 	}
 	ids := make([]uuid.UUID, 0, len(stored))
@@ -173,25 +190,25 @@ func (h *Handlers) WalkBucketBackups(ctx context.Context) (purged int) {
 		if ctx.Err() != nil {
 			return purged
 		}
-		deleted, err := h.DB.DeletedSandboxIDs(ctx, ids[start:min(start+batch, len(ids))])
+		deleted, err := deletedIDs(ctx, ids[start:min(start+batch, len(ids))])
 		if err != nil {
-			log.Warn().Err(err).Msg("backup gc: deleted sandbox lookup failed")
+			log.Warn().Err(err).Str("owner", ownerKey).Msg("backup gc: deleted owner lookup failed")
 			return purged
 		}
 		for _, id := range deleted {
-			sandboxID := id.String()
-			for generation := range stored[sandboxID] {
-				objects, err := backup.PurgeGeneration(ctx, h.BackupGC, sandboxID, generation)
+			owner := id.String()
+			for generation := range stored[owner] {
+				objects, err := purge(owner, generation)
 				if err != nil {
-					log.Warn().Err(err).Str("sandbox_id", sandboxID).Str("generation", generation).Msg("backup gc: orphan purge failed")
+					log.Warn().Err(err).Str(ownerKey, owner).Str("generation", generation).Msg("backup gc: orphan purge failed")
 					return purged
 				}
 				purged++
-				log.Info().Str("sandbox_id", sandboxID).Str("generation", generation).Int("objects", objects).
+				log.Info().Str(ownerKey, owner).Str("generation", generation).Int("objects", objects).
 					Msg("backup gc: orphan generation purged")
 			}
 		}
 	}
-	log.Info().Int("sandboxes", len(ids)).Int("orphans_purged", purged).Msg("backup gc: bucket walk complete")
+	log.Info().Str("owner", ownerKey).Int("owners", len(ids)).Int("orphans_purged", purged).Msg("backup gc: bucket walk complete")
 	return purged
 }

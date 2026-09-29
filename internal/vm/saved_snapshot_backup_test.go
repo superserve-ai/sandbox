@@ -134,6 +134,19 @@ func TestSavedSnapshotSweepQueuesOnlyWhatIsNotBackedUp(t *testing.T) {
 	}
 }
 
+// Only one snapshot disk hashes at a time; one waiting for its turn gives up
+// when cancelled, queuing nothing.
+func TestSavedSnapshotHashingWaitsItsTurn(t *testing.T) {
+	m, man, queued, _ := savedBackupFixture(t)
+	savedSnapshotHashSlots <- struct{}{}
+	defer func() { <-savedSnapshotHashSlots }()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if m.backupSavedSnapshot(ctx, man, zerolog.Nop()) || len(*queued) != 0 {
+		t.Fatal("a hash ran while another held the only slot")
+	}
+}
+
 // A snapshot deleted while its disk was hashing gets no marker written into
 // a directory that no longer exists.
 func TestSavedSnapshotMarkerSkipsADeletedSnapshot(t *testing.T) {

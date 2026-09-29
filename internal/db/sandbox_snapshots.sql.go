@@ -236,6 +236,32 @@ func (q *Queries) CreateSandboxSnapshot(ctx context.Context, arg CreateSandboxSn
 	return i, err
 }
 
+const deletedSavedSnapshotIDs = `-- name: DeletedSavedSnapshotIDs :many
+SELECT id FROM sandbox_snapshot WHERE id = ANY($1::uuid[]) AND deleted_at IS NOT NULL
+`
+
+// The subset of ids whose saved snapshot is deleted; an id the database does
+// not know is not one of them.
+func (q *Queries) DeletedSavedSnapshotIDs(ctx context.Context, ids []uuid.UUID) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, deletedSavedSnapshotIDs, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const getSandboxSnapshot = `-- name: GetSandboxSnapshot :one
 SELECT id, team_id, sandbox_id, template_id, kind, status, name, idempotency_key, host_id, vcpu_count, memory_mib, disk_mib, base_path, base_mem_path, snapshot_path, mem_path, overlay_path, size_bytes, timeout_seconds, network_config, secret_bindings, fc_build_sha, guest_kernel, snapshot_format, created_at, ready_at, deleted_at, sweep_after FROM sandbox_snapshot
 WHERE id = $1 AND team_id = $2 AND deleted_at IS NULL

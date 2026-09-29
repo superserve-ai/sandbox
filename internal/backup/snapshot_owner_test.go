@@ -63,6 +63,29 @@ func TestSeededCompletionKeepsTheSnapshotOwner(t *testing.T) {
 	}
 }
 
+// A snapshot's objects are listed from its own prefix, including a
+// generation abandoned before its manifest, and never a sandbox's.
+func TestSnapshotGenerationsListsOnlyTheSnapshotsPrefix(t *testing.T) {
+	store := newMemBlobs()
+	for _, name := range []string{
+		"snapshots/snap-a/gen-1/rootfs.ext4.p1",
+		"snapshots/snap-a/gen-1/" + ManifestObject,
+		"snapshots/snap-b/half-done/rootfs.ext4.p1",
+		"sandboxes/sb-1/gen-2/rootfs.ext4.p1",
+	} {
+		if _, err := store.Create(context.Background(), name, bytes.NewReader([]byte("x"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := SnapshotGenerations(context.Background(), store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || !got["snap-a"]["gen-1"] || got["snap-b"]["half-done"] {
+		t.Fatalf("generations = %v, want snap-a complete and snap-b's abandoned generation listed", got)
+	}
+}
+
 // After a snapshot's upload the uploader drops the snapshot's own files from
 // the page cache, never the shared base other generations read.
 func TestSnapshotUploadDropsItsFilesFromThePageCache(t *testing.T) {

@@ -16,6 +16,12 @@ import (
 // for a backup that was never queued, or was lost with the journal.
 const SavedSnapshotBackupSweep = 30 * time.Minute
 
+// savedSnapshotHashSlots bounds how many saved snapshots' disks are hashed at
+// once. Each hash reads a whole disk, so a burst of captures (or the first
+// sweep on a host) would otherwise saturate its disk. Separate from the pause
+// rehash slots, so snapshots never delay a pause's backup.
+var savedSnapshotHashSlots = make(chan struct{}, 1)
+
 // savedSnapshotBackupMarker records, in a saved snapshot's directory, the
 // generation its disk was queued as, so a sweep learns whether the backup is
 // pending or done without hashing the disk again.
@@ -26,6 +32,12 @@ const savedSnapshotBackupMarker = "backup.generation"
 // host, as it does for pauses. Reports whether the disk is queued or backed up.
 func (m *Manager) backupSavedSnapshot(ctx context.Context, man *SavedSnapshotManifest, log zerolog.Logger) bool {
 	if m.backupEnqueue == nil {
+		return false
+	}
+	select {
+	case savedSnapshotHashSlots <- struct{}{}:
+		defer func() { <-savedSnapshotHashSlots }()
+	case <-ctx.Done():
 		return false
 	}
 	files := make([]backup.TaskFile, 0, 2)
