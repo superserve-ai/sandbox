@@ -63,15 +63,15 @@ CREATE OR REPLACE FUNCTION activate_team_billing(p_team_id uuid, p_user_id uuid,
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE v_settled boolean; v_account team_billing_account;
 BEGIN
-    IF NULLIF(BTRIM(p_stripe_grant_id), '') IS NOT NULL AND p_user_id IS NULL THEN
-        RAISE EXCEPTION 'Stripe promotion activation requires a pinned actor reservation'
-            USING ERRCODE = 'object_not_in_prerequisite_state';
-    END IF;
     SELECT stripe_activation_credit_reserved_at IS NULL
         AND (NULLIF(stripe_activation_credit_grant_id, '') IS NOT NULL
              OR stripe_activation_credit_granted_at IS NOT NULL)
     INTO v_settled FROM team_billing_account WHERE team_id = p_team_id;
     IF NULLIF(BTRIM(p_stripe_grant_id), '') IS NOT NULL AND NOT COALESCE(v_settled, false) THEN
+        IF p_user_id IS NULL THEN
+            RAISE EXCEPTION 'Stripe promotion activation requires a pinned actor reservation'
+                USING ERRCODE = 'object_not_in_prerequisite_state';
+        END IF;
         PERFORM lock_stripe_promotion(p_team_id, p_user_id);
     END IF;
     SELECT * INTO v_account FROM team_billing_account WHERE team_id = p_team_id FOR UPDATE;
