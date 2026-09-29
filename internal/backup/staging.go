@@ -67,7 +67,7 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 		staged := filepath.Join(dir, f.Name)
 		if renewedExists(staged) {
 			task.Files[i].Path = staged
-		} else if err := snapshotFileMode(context.Background(), staged, f.Path, cloneOnly); err != nil {
+		} else if err := snapshotFileMode(context.Background(), staged, f.Path, autoOrClone(cloneOnly)); err != nil {
 			if cloneOnly {
 				all = false
 			} else {
@@ -101,12 +101,11 @@ func stageTask(root string, task *Task, cloneOnly bool) (bool, error) {
 	return all, nil
 }
 
-// inlineStageLimit bounds the packed bytes a pause may copy on the RPC
-// path. Sparse copies scale with REAL bytes, so a typical overlay (tens
-// of MB dirtied) stages in tens of milliseconds; a pathologically dense
-// overlay must not drag the pause RPC back into seconds, and falls back
-// to the marker-only worker path.
-const inlineStageLimit = 256 << 20
+// inlineStageLimit bounds the packed bytes one artifact may COPY on the
+// RPC path. Only the byte-copy fallback is charged: a reflink moves no
+// data, so its cost does not scale with the overlay. A var so tests need
+// no multi-hundred-megabyte fixture to reach it.
+var inlineStageLimit int64 = 256 << 20
 
 // ErrStageTooLarge reports a pause whose packed disk exceeds the inline
 // staging budget.
@@ -137,20 +136,6 @@ func StagePending(ctx context.Context, root, vmID, token, basePath string, files
 	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < 3*time.Second {
 		return "", nil, ErrStageTooLarge
 	}
-	if disk, ok := files["rootfs.ext4"]; ok {
-		f, err := os.Open(disk)
-		if err != nil {
-			return "", nil, err
-		}
-		extents, _, err := Extents(f)
-		f.Close()
-		if err != nil {
-			return "", nil, err
-		}
-		if PackedSize(extents) > inlineStageLimit {
-			return "", nil, ErrStageTooLarge
-		}
-	}
 	dir := filepath.Join(root, vmID, "pending-"+token)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", nil, err
@@ -165,13 +150,31 @@ func StagePending(ctx context.Context, root, vmID, token, basePath string, files
 		return "", nil, err
 	}
 	staged := make(map[string]string, len(files))
+	// A clone is attempted before the budget is consulted: the budget
+	// bounds bytes copied, and a reflink copies none.
 	for name, src := range files {
 		if err := ctx.Err(); err != nil {
 			_ = os.RemoveAll(dir)
 			return "", nil, err
 		}
 		dst := filepath.Join(dir, name)
-		if err := snapshotFileMode(ctx, dst, src, false); err != nil {
+		if err := snapshotFileMode(ctx, dst, src, stageClone); err == nil {
+			staged[name] = dst
+			continue
+		}
+		// A deadline reached mid-clone leaves the pause to the worker
+		// rather than starting a copy that has even less time.
+		if ctx.Err() != nil {
+			_ = os.RemoveAll(dir)
+			return "", nil, ErrStageTooLarge
+		}
+		// Only this artifact is known to need real bytes, so only it is
+		// charged; a sibling that already cloned stays staged.
+		if err := withinInlineBudget(src); err != nil {
+			_ = os.RemoveAll(dir)
+			return "", nil, err
+		}
+		if err := snapshotFileMode(ctx, dst, src, stageCopy); err != nil {
 			_ = os.RemoveAll(dir)
 			return "", nil, err
 		}
@@ -195,6 +198,31 @@ func StagePending(ctx context.Context, root, vmID, token, basePath string, files
 		return "", nil, err
 	}
 	return dir, staged, nil
+}
+
+// cloneInto reflinks src into dst. Indirected so tests can drive both the
+// reflink and the byte-copy path on a filesystem that only offers one.
+var cloneInto = cloneFile
+
+// withinInlineBudget reports whether byte-copying src fits the RPC path's
+// budget. Consulted only once a clone of src has failed.
+func withinInlineBudget(src string) error {
+	if src == "" {
+		return nil
+	}
+	f, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	extents, _, err := Extents(f)
+	f.Close()
+	if err != nil {
+		return err
+	}
+	if PackedSize(extents) > inlineStageLimit {
+		return ErrStageTooLarge
+	}
+	return nil
 }
 
 // FinishPendingStage renames a hashed pending directory to its
@@ -351,7 +379,7 @@ func StageSharedBase(root, basePath, baseSHA string, cloneOnly bool) (string, er
 	if renewedExists(stagedBase) {
 		return stagedBase, nil
 	}
-	if err := snapshotFileMode(context.Background(), stagedBase, basePath, cloneOnly); err != nil {
+	if err := snapshotFileMode(context.Background(), stagedBase, basePath, autoOrClone(cloneOnly)); err != nil {
 		return "", err
 	}
 	if err := syncDir(basesDir); err != nil {
@@ -424,22 +452,42 @@ func filesEqual(a, b string) bool {
 // file under a name that is never re-staged.
 var stagingFlights singleflight.Group
 
-// snapshotFileMode is snapshotFile with an optional clone-only mode
-// that fails fast instead of copying bytes.
-func snapshotFileMode(ctx context.Context, dst, src string, cloneOnly bool) error {
+// autoOrClone maps the worker paths' clone-only flag onto a mode.
+func autoOrClone(cloneOnly bool) stageMode {
+	if cloneOnly {
+		return stageClone
+	}
+	return stageAuto
+}
+
+// stageMode selects how one artifact is staged.
+type stageMode int
+
+const (
+	// stageAuto reflinks when the filesystem allows and copies otherwise.
+	stageAuto stageMode = iota
+	// stageClone reflinks or fails, never copying bytes.
+	stageClone
+	// stageCopy copies without attempting a reflink, for a caller whose
+	// clone already failed: retrying it would enter the same unbounded
+	// ioctl a second time.
+	stageCopy
+)
+
+func snapshotFileMode(ctx context.Context, dst, src string, mode stageMode) error {
 	_, err, _ := stagingFlights.Do(dst, func() (any, error) {
 		if _, err := os.Stat(dst); err == nil {
 			return nil, nil // a concurrent flight already published it
 		}
-		if cloneOnly {
-			return nil, snapshotClone(dst, src)
+		if mode == stageClone {
+			return nil, snapshotClone(ctx, dst, src)
 		}
-		return nil, snapshotFile(ctx, dst, src)
+		return nil, snapshotFile(ctx, dst, src, mode == stageAuto)
 	})
 	return err
 }
 
-func snapshotClone(dst, src string) error {
+func snapshotClone(ctx context.Context, dst, src string) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -450,12 +498,29 @@ func snapshotClone(dst, src string) error {
 		return err
 	}
 	tmp := out.Name()
-	if err := cloneFile(out, in); err != nil {
-		out.Close()
-		os.Remove(tmp)
-		return err
+	// FICLONE copies no data but does walk the extent map, so a dense or
+	// fragmented artifact is not free. The ioctl cannot be cancelled: on a
+	// deadline the caller is released and this goroutine owns the fd and
+	// the temp file until the kernel returns, so nothing races it.
+	clone := cloneInto
+	cloned := make(chan error, 1)
+	go func() { cloned <- clone(out, in) }()
+	select {
+	case err := <-cloned:
+		if err != nil {
+			out.Close()
+			os.Remove(tmp)
+			return err
+		}
+	case <-ctx.Done():
+		go func() {
+			<-cloned
+			out.Close()
+			os.Remove(tmp)
+		}()
+		return ctx.Err()
 	}
-	if err := out.Sync(); err != nil {
+	if err := syncWithContext(ctx, out); err != nil {
 		out.Close()
 		os.Remove(tmp)
 		return err
@@ -474,7 +539,7 @@ func snapshotClone(dst, src string) error {
 // snapshotFile copies src to dst preserving sparseness, via reflink
 // clone when available. Written to a temp name and renamed so a crash
 // mid-copy never leaves a plausible-looking partial staged file.
-func snapshotFile(ctx context.Context, dst, src string) error {
+func snapshotFile(ctx context.Context, dst, src string, tryClone bool) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -489,7 +554,11 @@ func snapshotFile(ctx context.Context, dst, src string) error {
 		return err
 	}
 	tmp := out.Name()
-	if err := cloneFile(out, in); err != nil {
+	cloned := false
+	if tryClone {
+		cloned = cloneInto(out, in) == nil
+	}
+	if !cloned {
 		extents, _, xerr := Extents(in)
 		if xerr != nil {
 			out.Close()

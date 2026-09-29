@@ -459,7 +459,7 @@ func TestOlderWorkerCannotDeleteNewerPendingRecord(t *testing.T) {
 	if err := st.PutPendingBackup(newer); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.DeletePendingBackupIf(older.VMID, older.Token); err != nil {
+	if _, err := st.DeletePendingBackupIf(older.VMID, older.Token); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := st.ListPendingBackups()
@@ -470,7 +470,7 @@ func TestOlderWorkerCannotDeleteNewerPendingRecord(t *testing.T) {
 		t.Fatalf("pending = %+v, want only the newer record", pending)
 	}
 	// The rightful owner still can.
-	if err := st.DeletePendingBackupIf(newer.VMID, newer.Token); err != nil {
+	if _, err := st.DeletePendingBackupIf(newer.VMID, newer.Token); err != nil {
 		t.Fatal(err)
 	}
 	pending, err = st.ListPendingBackups()
@@ -2013,7 +2013,7 @@ func TestMarkerReuseRotatesOwnershipWithPauseToken(t *testing.T) {
 	}
 
 	// The old worker's owner-guarded cleanup must no-op against it.
-	if err := m.state.DeletePendingBackupIf("vm-1", first.Token); err != nil {
+	if _, err := m.state.DeletePendingBackupIf("vm-1", first.Token); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, _ := m.state.GetPendingBackup("vm-1"); !ok {

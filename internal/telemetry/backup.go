@@ -18,6 +18,14 @@ const (
 	BackupUploadFailed    = "failed"    // attempt errored; task nacked for retry
 )
 
+// Why a pause's pending record was discarded without any generation being
+// enqueued. Bounded by safeDropReason.
+const (
+	BackupDropSuperseded      = "superseded"       // the sandbox resumed, was destroyed, or paused again
+	BackupDropBaseReplaced    = "base_replaced"    // the overlay's base is no longer the pause-time file
+	BackupDropArtifactMissing = "artifact_missing" // a pause artifact was gone before it could be hashed
+)
+
 // Journal priorities as metric label values. Bounded by construction: the
 // recorder only ever emits these three.
 const (
@@ -84,6 +92,7 @@ type BackupRecorder struct {
 	uploads           metric.Int64Counter
 	uploadBytes       metric.Int64Counter
 	notifyFailures    metric.Int64Counter
+	pauseDrops        metric.Int64Counter
 	hashDuration      metric.Float64Histogram
 	stageDuration     metric.Float64Histogram
 	uploadDuration    metric.Float64Histogram
@@ -163,6 +172,9 @@ func NewBackupRecorderWithProvider(provider *sdkmetric.MeterProvider, cfg Backup
 		return nil, err
 	}
 	if r.notifyFailures, err = meter.Int64Counter("backup_notify_failures_total"); err != nil {
+		return nil, err
+	}
+	if r.pauseDrops, err = meter.Int64Counter("backup_pause_dropped_total"); err != nil {
 		return nil, err
 	}
 	if r.hashDuration, err = meter.Float64Histogram("backup_hash_duration_seconds",
@@ -249,6 +261,17 @@ func (r *BackupRecorder) AddNotifyFailure(ctx context.Context) {
 	r.notifyFailures.Add(ctx, 1, metric.WithAttributes(r.attrs()...))
 }
 
+// AddPauseBackupDropped counts a pause whose pending record was discarded
+// without a generation ever being enqueued. Nothing else reports that a
+// pause produced no backup: the coverage gauge only sees sandboxes still
+// paused, and a resumed one leaves no trace but a log line.
+func (r *BackupRecorder) AddPauseBackupDropped(ctx context.Context, reason string) {
+	if r == nil {
+		return
+	}
+	r.pauseDrops.Add(ctx, 1, metric.WithAttributes(r.attrs(attribute.String("reason", safeDropReason(reason)))...))
+}
+
 // RecordSample emits the periodic gauge snapshot.
 func (r *BackupRecorder) RecordSample(ctx context.Context, s BackupSample) {
 	if r == nil {
@@ -300,6 +323,15 @@ func (r *BackupRecorder) attrs(extra ...attribute.KeyValue) []attribute.KeyValue
 		attribute.String("host_id", r.hostID),
 	}
 	return append(attrs, extra...)
+}
+
+func safeDropReason(v string) string {
+	switch v {
+	case BackupDropSuperseded, BackupDropBaseReplaced, BackupDropArtifactMissing:
+		return v
+	default:
+		return BackupDropSuperseded
+	}
 }
 
 func safeUploadResult(v string) string {
