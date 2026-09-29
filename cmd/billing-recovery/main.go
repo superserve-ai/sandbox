@@ -13,26 +13,35 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type billingAccount struct {
-	TeamID            uuid.UUID
-	CustomerID        *string
-	SubscriptionID    *string
-	Status            *string
-	EventAt           *time.Time
-	GrantID           *string
-	TrialEndedAt      *time.Time
-	CheckoutAt        *time.Time
-	CheckoutSessionID *string
-	UserPromotion     bool
+	TeamID                       uuid.UUID
+	CustomerID                   *string
+	SubscriptionID               *string
+	Status                       *string
+	EventAt                      *time.Time
+	GrantID                      *string
+	TrialEndedAt                 *time.Time
+	CheckoutAt                   *time.Time
+	CheckoutSessionID            *string
+	UserPromotion                bool
+	CancelAtPeriodEnd            bool
+	HistoricalCancellation       bool
+	RevocationPending            bool
+	RevocationComplete           bool
+	HistoricalCancellationOwned  bool
+	ActivationReserved           bool
+	ActivationAttempted          bool
+	ActivationUserID             pgtype.UUID
+	ActivationReservationEventID *string
 }
 
 type stripeSubscription struct {
@@ -240,29 +249,11 @@ func (c stripeClient) isVerifiedActivationGrant(grant stripeGrant, localGrantID,
 	return strings.TrimSpace(grant.Metadata[activationGrantIdentityMetadataKey]) == identity
 }
 
-func (c stripeClient) createGrant(ctx context.Context, customer, key, identity string) (string, error) {
-	form := url.Values{}
-	form.Set("customer", customer)
-	form.Set("category", "promotional")
-	form.Set("amount[type]", "monetary")
-	form.Set("amount[monetary][currency]", "usd")
-	form.Set("amount[monetary][value]", strconv.FormatInt(c.activationCreditCents(), 10))
-	form.Set("applicability_config[scope][price_type]", "metered")
-	form.Set("metadata["+activationGrantIdentityMetadataKey+"]", identity)
-	var grant stripeGrant
-	if err := c.request(ctx, http.MethodPost, "/v1/billing/credit_grants", form, &grant, key); err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(grant.ID) == "" {
-		return "", errors.New("Stripe credit grant response did not include an ID")
-	}
-	return grant.ID, nil
-}
-
 func main() {
 	var target string
 	var excluded string
 	var apply bool
+	var revokeActivation bool
 	var grantAmountCents int64
 	var databaseURL string
 	var stripeBaseURL string
@@ -270,6 +261,7 @@ func main() {
 	var batchSize int
 	flag.StringVar(&target, "team", "", "team UUID to audit; required with -apply")
 	flag.StringVar(&excluded, "exclude-team", "", "team UUID to report as excluded (repeat command for more exclusions)")
+	flag.BoolVar(&revokeActivation, "revoke-activation", false, "audit cancellation credit revocation without activation settlement")
 	flag.BoolVar(&apply, "apply", false, "apply one verified repair; default is dry-run")
 	flag.StringVar(&databaseURL, "database-url", os.Getenv("DATABASE_URL"), "Postgres URL (default DATABASE_URL)")
 	flag.StringVar(&stripeBaseURL, "stripe-api-base-url", envOr("STRIPE_API_BASE_URL", "https://api.stripe.com"), "Stripe API base URL")
@@ -279,6 +271,9 @@ func main() {
 	flag.Parse()
 	if grantAmountCents <= 0 || (grantAmountCents != 9500 && target == "") {
 		fatal("positive activation credit required; non-default amount requires -team")
+	}
+	if revokeActivation && grantAmountCents != 9500 {
+		fatal("revocation only supports the standard activation credit")
 	}
 	if databaseURL == "" {
 		fatal("database URL is required")
@@ -321,7 +316,11 @@ func main() {
 		loadCtx, cancelLoad := context.WithTimeout(ctx, billingRecoveryOperationTimeout)
 		var accounts []billingAccount
 		var err error
-		accounts, err = loadAccounts(loadCtx, pool, targetID, after, batchSize)
+		if revokeActivation {
+			accounts, err = loadRevocationAccounts(loadCtx, pool, targetID, after, batchSize)
+		} else {
+			accounts, err = loadAccounts(loadCtx, pool, targetID, after, batchSize)
+		}
 		cancelLoad()
 		if err != nil {
 			fatal(err.Error())
@@ -332,7 +331,11 @@ func main() {
 		for _, account := range accounts {
 			accountCtx, cancelAccount := context.WithTimeout(ctx, billingRecoveryOperationTimeout)
 			var outcome map[string]any
-			outcome = auditAccount(accountCtx, pool, stripe, account, excludedID, apply)
+			if revokeActivation {
+				outcome = auditRevocation(accountCtx, pool, stripe, account, excludedID, apply)
+			} else {
+				outcome = auditAccount(accountCtx, pool, stripe, account, excludedID, apply)
+			}
 			cancelAccount()
 			encoded, _ := json.Marshal(outcome)
 			fmt.Println(string(encoded))

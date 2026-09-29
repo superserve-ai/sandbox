@@ -62,3 +62,39 @@ To reconcile an existing custom credit, use `-team <team-uuid>
 The default remains 9500 cents. A custom amount cannot be used for a fleet scan.
 Existing grants must match the requested amount and established identity;
 unverified promotional USD grants leave recovery unresolved.
+
+## Revoke activation credit after cancellation
+
+Use `-revoke-activation` to audit canceled subscriptions, including cancellation
+scheduled for the end of the billing period. This mode is separate from the
+activation repair above and never creates credits or activates an account.
+Set `DATABASE_URL`, `STRIPE_SECRET_KEY`, and `STRIPE_API_VERSION` for the target
+environment, then run the read-only audit:
+
+```sh
+go run ./cmd/billing-recovery -revoke-activation
+```
+
+Review each candidate's team and grant identity. Audit one team and apply its
+verified revocation with:
+
+```sh
+go run ./cmd/billing-recovery -revoke-activation -team <team-uuid>
+go run ./cmd/billing-recovery -revoke-activation -team <team-uuid> -apply
+```
+
+Revocation supports only the standard $95 activation grant. It verifies the
+persisted grant ID or a unique team activation identity across Stripe's grant
+list; unrelated grants are untouched. Unused grants are voided, and grants
+already applied to invoices are expired so remaining or reinstated credit cannot
+be spent. Existing redemption history is preserved, including after reversal or
+resubscription. A proven unattempted reservation is released without creating a
+grant, while the team's cancellation marker prevents later redemption.
+
+An `unresolved` outcome requires investigating the reported ownership or Stripe
+error before retrying. Do not substitute an amount-only grant match. A
+`reconciled` outcome confirms completion; rerunning the same targeted command is
+safe. `-exclude-team <team-uuid>` skips the selected team. Apply both activation
+revocation migrations before using this mode. Historical revocation is an
+explicit operational action; deploying the webhook change alone does not scan
+previously canceled accounts.
