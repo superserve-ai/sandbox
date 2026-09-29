@@ -489,6 +489,17 @@ func TestIntegration_IncrementalWorkerLoad(t *testing.T) {
 			testOpenPeriodWorkerExports(t, pool, trace, cadence)
 		})
 	}
+	t.Run("precision-reconciliation", func(t *testing.T) {
+		exec(`UPDATE billing_export_work SET next_run_at='infinity',next_reconcile_at='infinity'`)
+		testMeterPrecisionWorker(t, pool)
+	})
+	t.Run("precision-growing-worker", func(t *testing.T) {
+		exec(`UPDATE billing_export_work SET next_run_at='infinity',next_reconcile_at='infinity'`)
+		testMeterGrowingDriftWorker(t, pool)
+	})
+	t.Run("precision-close", func(t *testing.T) {
+		testMeterPrecisionClose(t, pool)
+	})
 	t.Run("frozen-measurement-catchup", func(t *testing.T) {
 		testFrozenMeasurementCatchup(t, pool)
 	})
@@ -1592,4 +1603,1128 @@ func testBoundaryStorageEnablement(t *testing.T, pool *pgxpool.Pool) {
 			}
 		})
 	}
+}
+
+type precisionWorkerStripe struct {
+	openPeriodStripe
+	mode               string
+	drift              *big.Rat
+	activeMeter        string
+	mappingErr         error
+	attempts           []StripeReportMeterEventParams
+	buckets, summaries int
+	checkUnlocked      func(context.Context) error
+	changeLocal        func()
+}
+
+func (s *precisionWorkerStripe) MeterID() string {
+	if s.activeMeter != "" {
+		return s.activeMeter
+	}
+	return "mtr_example_precision"
+}
+
+func (s *precisionWorkerStripe) ActiveMeterID(ctx context.Context, event string) (string, error) {
+	if err := s.checkUnlocked(ctx); err != nil {
+		return "", err
+	}
+	if s.mappingErr != nil {
+		return "", s.mappingErr
+	}
+	return s.MeterID(), nil
+}
+
+func (s *precisionWorkerStripe) ReportMeterEvent(ctx context.Context, p StripeReportMeterEventParams) error {
+	s.attempts = append(s.attempts, p)
+	return s.openPeriodStripe.ReportMeterEvent(ctx, p)
+}
+
+func (s *precisionWorkerStripe) CountedMeterUsage(ctx context.Context, event, customer string, start, end time.Time) (string, error) {
+	s.summaries++
+	value, err := s.openPeriodStripe.CountedMeterUsage(ctx, event, customer, start, end)
+	if err != nil {
+		return "", err
+	}
+	total, _ := new(big.Rat).SetString(value)
+	if total.Sign() == 0 {
+		return value, nil
+	}
+	delta := big.NewRat(1, 1_000_000_000_000)
+	if s.drift != nil {
+		delta = new(big.Rat).Set(s.drift)
+	}
+	if s.mode == "exact" {
+		delta = new(big.Rat)
+	}
+	if s.mode == "excess" {
+		delta = big.NewRat(1, 1)
+	}
+	if s.mode == "changing_summary" && s.summaries%2 == 0 {
+		delta = big.NewRat(0, 1)
+	}
+	total.Add(total, delta)
+	if s.drift != nil {
+		return total.FloatString(18), nil
+	}
+	return total.FloatString(12), nil
+}
+
+func (s *precisionWorkerStripe) BucketedMeterUsage(ctx context.Context, event, customer string, start, end time.Time) ([]meterUsageBucket, error) {
+	s.buckets++
+	if err := s.checkUnlocked(ctx); err != nil {
+		return nil, err
+	}
+	if s.changeLocal != nil {
+		change := s.changeLocal
+		s.changeLocal = nil
+		change()
+	}
+	if s.mode == "outage" {
+		return nil, fmt.Errorf("example bucket outage")
+	}
+	windows, err := meterEvidenceWindows(start, end)
+	if err != nil {
+		return nil, err
+	}
+	for i := range windows {
+		windows[i].Quantity, err = s.openPeriodStripe.CountedMeterUsage(ctx, event, customer, windows[i].Start, windows[i].End)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if s.mode == "missing" {
+		// Empty intervals may be omitted, so remove a bucket with usage.
+		for i, window := range windows {
+			quantity, err := meterQuantity(window.Quantity)
+			if err != nil {
+				return nil, err
+			}
+			if quantity.Sign() > 0 {
+				return append(windows[:i], windows[i+1:]...), nil
+			}
+		}
+		return nil, fmt.Errorf("missing-bucket fixture requires nonzero usage")
+	}
+	if s.mode == "changing_bucket" && s.buckets%2 == 0 {
+		windows[0].Quantity = "1"
+	}
+	return windows, nil
+}
+
+func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
+	ctx := t.Context()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	start := now.Add(-72 * time.Hour).Add(2 * time.Minute)
+	end := start.AddDate(0, 1, 0)
+	provider := &precisionWorkerStripe{checkUnlocked: func(ctx context.Context) error {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		_, err = tx.Exec(ctx, `SELECT team_id FROM team_billing_period FOR UPDATE NOWAIT`)
+		return err
+	}}
+	h := &Handlers{Pool: pool, DB: db.New(pool), Stripe: provider, Now: func() time.Time { return now }}
+	team, err := h.DB.CreateTeam(ctx, "example-precision-worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	customer := "cus_example_" + team.ID.String()
+	p := billing.ExportPeriod{TeamID: team.ID, Start: start, End: end}
+	store := billing.ExportStore{Pool: pool}
+	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_status,commercial_billing_anchor)
+ VALUES($1,$2,'active',$3)`, team.ID, customer, start)
+	exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true),($1,'billing_storage_billing_enabled',true)
+ ON CONFLICT(team_id,key) DO UPDATE SET enabled=EXCLUDED.enabled`, team.ID)
+	exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open')`, team.ID, start, end)
+	if err := store.Enroll(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	resources := map[string]string{"cpu": "cpu_vcpu_hours", "memory": "memory_gib_hours", "storage": "storage_gib_hours"}
+	for resource, event := range resources {
+		for part := 0; part < 2; part++ {
+			_, err := store.Reserve(ctx, p, resource, "9712.454976049444", now.Add(-2*time.Hour), billing.ExportPayload{EventName: event, CustomerID: customer, Timestamp: now.Add(-2*time.Hour - time.Second).Unix()})
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := h.submitIncrementalEvents(ctx, p, 6); err != nil {
+		t.Fatal(err)
+	}
+	var historical []uuid.UUID
+	rows, err := pool.Query(ctx, `SELECT id FROM billing_export_event WHERE customer_id=$1`, customer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		historical = append(historical, id)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	snapshot := func() string {
+		t.Helper()
+		var value string
+		err := pool.QueryRow(ctx, `SELECT jsonb_agg(jsonb_build_array(e.id,e.identifier,e.idempotency_key,e.event_name,e.customer_id,e.quantity_payload,e.event_timestamp,
+ a.id,a.coverage_start,a.coverage_end,a.measured_through) ORDER BY e.id)::text
+ FROM billing_export_event e JOIN billing_export_allocation a ON a.id=e.allocation_id WHERE e.id=ANY($1)`, historical).Scan(&value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	before := snapshot()
+	exec(`INSERT INTO billing_export_usage(team_id,period_start,period_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds)
+ VALUES($1,$2,$3,9713.454976049444*3600,9713.454976049444*3686400,9713.454976049444*3686400)`, team.ID, start, end)
+	exec(`INSERT INTO billing_export_work(team_id,next_run_at,next_reconcile_at,seed_complete,next_correction_at)
+ VALUES($1,now()-interval '100 years','infinity',true,now()+interval '1 day')`, team.ID)
+	tick := func(t *testing.T, wantFailure bool) error {
+		t.Helper()
+		exec(`UPDATE billing_export_work SET next_run_at=now()-interval '100 years' WHERE team_id=$1`, team.ID)
+		worked, n, err := h.incrementalBillingTick(ctx, time.Hour)
+		if !worked || n != 0 || (err != nil) != wantFailure {
+			t.Fatalf("precision worker: worked=%v measured=%d error=%v", worked, n, err)
+		}
+		var recorded bool
+		if err := pool.QueryRow(ctx, `SELECT (last_error IS NOT NULL)=$2 AND lease_token IS NULL AND next_run_at>now() FROM billing_export_work WHERE team_id=$1`, team.ID, wantFailure).Scan(&recorded); err != nil || !recorded {
+			t.Fatalf("worker error/retry state: %v %v", recorded, err)
+		}
+		return err
+	}
+	initialCalls := len(provider.calls)
+	for _, mode := range []string{"excess", "missing", "outage", "changing_summary", "changing_bucket"} {
+		provider.mode = mode
+		provider.summaries = 0
+		provider.buckets = 0
+		tick(t, true)
+		if len(provider.calls) != initialCalls {
+			t.Fatalf("%s authorized export through incomplete evidence", mode)
+		}
+		var counted string
+		if err := pool.QueryRow(ctx, `SELECT counted_quantity::text FROM billing_export_observation WHERE team_id=$1 AND resource_type='cpu'`, team.ID).Scan(&counted); err != nil {
+			t.Fatal(err)
+		}
+		want := "9712.454976049445"
+		if mode == "excess" {
+			want = "9713.454976049444"
+		}
+		if counted != want {
+			t.Fatalf("decision snapshot replaced by later read: %s want %s", counted, want)
+		}
+		if provider.buckets > 2 {
+			t.Fatalf("fallback exceeded read budget: %d", provider.buckets)
+		}
+	}
+	provider.mode = "complete"
+	provider.buckets = 0
+	tick(t, false)
+	if len(provider.calls) != initialCalls+3 {
+		t.Fatalf("catch-up events=%d want=%d", len(provider.calls), initialCalls+3)
+	}
+	for _, call := range provider.calls[initialCalls:] {
+		if call.Value != "1.000000000000" {
+			t.Fatalf("catch-up replayed coverage: %+v", call)
+		}
+	}
+	if provider.buckets != 12 {
+		t.Fatalf("two bucket reads per gate/observation/resource: %d", provider.buckets)
+	}
+	tick(t, false)
+	if len(provider.calls) != initialCalls+3 {
+		t.Fatal("unchanged retry resubmitted usage")
+	}
+	now = now.Add(time.Hour)
+	exec(`UPDATE billing_export_usage SET vcpu_seconds=vcpu_seconds+3600,memory_mib_seconds=memory_mib_seconds+3686400,
+ storage_mib_seconds=storage_mib_seconds+3686400,updated_at=clock_timestamp() WHERE team_id=$1`, team.ID)
+	tick(t, false)
+	if len(provider.calls) != initialCalls+6 {
+		t.Fatal("later scheduled pass did not export exactly new usage")
+	}
+	for resource := range resources {
+		totals, err := store.Totals(ctx, p, resource)
+		if err != nil || totals.Reserved != "9714.454976049444" || totals.Submitted != totals.Reserved || totals.Pending != "0" {
+			t.Fatalf("%s accounting: %+v %v", resource, totals, err)
+		}
+	}
+	rows, err = pool.Query(ctx, `SELECT resource_type,local_quantity::text,submitted_quantity::text,
+ reserved_quantity::text,counted_quantity::text,last_error IS NULL
+ FROM billing_export_observation WHERE team_id=$1 ORDER BY resource_type`, team.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var observations int
+	for rows.Next() {
+		var resource, local, submitted, reserved, counted string
+		var clear bool
+		if err := rows.Scan(&resource, &local, &submitted, &reserved, &counted, &clear); err != nil {
+			t.Fatal(err)
+		}
+		observations++
+		if local != reserved || submitted != reserved || counted != "9714.454976049445" || !clear {
+			t.Fatalf("%s observation: local=%s submitted=%s reserved=%s counted=%s clear=%v", resource, local, submitted, reserved, counted, clear)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if observations != len(resources) {
+		t.Fatalf("observations=%d want=%d", observations, len(resources))
+	}
+	// A pending event whose reservation is now above measured usage must be
+	// rejected before retry delivery. The existing event identity and payload
+	// remain the only coverage; no replacement or provider call is allowed.
+	if _, err := store.Reserve(ctx, p, "cpu", "9715.454976049444", now, billing.ExportPayload{
+		EventName: resources["cpu"], CustomerID: customer, Timestamp: now.Add(-time.Second).Unix(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var pendingID, pendingPayload string
+	if err := pool.QueryRow(ctx, `SELECT e.id::text,e.quantity_payload FROM billing_export_event e
+ JOIN billing_export_allocation a ON a.id=e.allocation_id
+ WHERE a.team_id=$1 AND a.resource_type='cpu' AND e.status='pending'
+ ORDER BY e.created_at DESC LIMIT 1`, team.ID).Scan(&pendingID, &pendingPayload); err != nil {
+		t.Fatal(err)
+	}
+	exec(`UPDATE billing_export_usage SET vcpu_seconds=9714.454976049444*3600 WHERE team_id=$1`, team.ID)
+	provider.mode = "complete"
+	callsBeforeDownward := len(provider.calls)
+	tick(t, true)
+	if len(provider.calls) != callsBeforeDownward {
+		t.Fatal("downward correction delivered stale pending coverage")
+	}
+	var status, payload string
+	if err := pool.QueryRow(ctx, `SELECT status,quantity_payload FROM billing_export_event WHERE id=$1::uuid`, pendingID).Scan(&status, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if status != "pending" || payload != pendingPayload {
+		t.Fatalf("pending event changed during downward correction: status=%s payload=%s", status, payload)
+	}
+	exec(`UPDATE billing_export_usage SET vcpu_seconds=9715.454976049444*3600 WHERE team_id=$1`, team.ID)
+	tick(t, false)
+	if len(provider.calls) != callsBeforeDownward+1 || provider.calls[len(provider.calls)-1].Value != "1.000000000000" {
+		t.Fatalf("pending coverage was not retried after usage recovered: calls=%d", len(provider.calls)-callsBeforeDownward)
+	}
+	if snapshot() != before {
+		t.Fatal("precision recovery mutated historical payload or coverage")
+	}
+	for index, delivery := range []string{"pending", "uncertain"} {
+		t.Run("blocked-"+delivery, func(t *testing.T) {
+			target := fmt.Sprintf("%d.454976049444", 9715+index)
+			exec(`UPDATE billing_export_usage SET memory_mib_seconds=$2::numeric*3686400,updated_at=clock_timestamp() WHERE team_id=$1`, team.ID, target)
+			event, err := store.Reserve(ctx, p, "memory", target, now, billing.ExportPayload{
+				EventName: resources["memory"], CustomerID: customer, Timestamp: now.Add(-time.Second).Unix(),
+			})
+			if err != nil || event == nil {
+				t.Fatalf("reserve retry coverage: event=%+v err=%v", event, err)
+			}
+			wantCall := StripeReportMeterEventParams{Identifier: event.Identifier, IdempotencyKey: event.IdempotencyKey,
+				EventName: event.EventName, CustomerID: event.CustomerID, Value: event.Quantity, Timestamp: event.Timestamp}
+			provider.mode = "exact"
+			if delivery == "uncertain" {
+				provider.submit = func(context.Context) error { return errors.New("example delivery timeout") }
+				tick(t, false)
+				provider.submit = nil
+				if provider.attempts[len(provider.attempts)-1] != wantCall {
+					t.Fatal("uncertain attempt changed reserved payload")
+				}
+				// Make the persisted retry due without waiting for wall-clock backoff.
+				exec(`UPDATE billing_export_event SET next_attempt_at=now()-interval '1 second' WHERE id=$1`, event.ID)
+			}
+			reservedSnapshot := meterPrecisionHistorySnapshot(t, pool, team.ID)
+			attemptsBefore := len(provider.attempts)
+			callsBefore := len(provider.calls)
+			var retrySnapshot string
+			if err := pool.QueryRow(ctx, `SELECT jsonb_build_array(status,attempt_count,first_attempt_at,next_attempt_at)::text
+ FROM billing_export_event WHERE id=$1 AND status=$2`, event.ID, delivery).Scan(&retrySnapshot); err != nil {
+				t.Fatal(err)
+			}
+			for _, mode := range []string{"missing", "excess"} {
+				provider.mode = mode
+				for attempt := 0; attempt < 2; attempt++ {
+					provider.buckets, provider.summaries = 0, 0
+					if err := tick(t, true); !errors.Is(err, billing.ErrExportRecoveryRequired) {
+						t.Fatalf("%s did not block on reconciliation: %v", mode, err)
+					}
+					if len(provider.attempts) != attemptsBefore || len(provider.calls) != callsBefore || meterPrecisionHistorySnapshot(t, pool, team.ID) != reservedSnapshot {
+						t.Fatalf("%s changed or delivered %s coverage", mode, delivery)
+					}
+					if provider.buckets > 2 || provider.summaries > 2 || (mode == "missing" && provider.buckets != 1) {
+						t.Fatalf("%s evidence calls: buckets=%d summaries=%d", mode, provider.buckets, provider.summaries)
+					}
+					var unchanged, bounded bool
+					if err := pool.QueryRow(ctx, `SELECT jsonb_build_array(status,attempt_count,first_attempt_at,next_attempt_at)::text=$2
+ FROM billing_export_event WHERE id=$1`, event.ID, retrySnapshot).Scan(&unchanged); err != nil || !unchanged {
+						t.Fatalf("blocked retry state changed: %v %v", unchanged, err)
+					}
+					if err := pool.QueryRow(ctx, `SELECT next_run_at>now() AND next_run_at<=now()+interval '11 minutes'
+ AND lease_token IS NULL AND lease_until IS NULL AND last_error IS NOT NULL FROM billing_export_work WHERE team_id=$1`, team.ID).Scan(&bounded); err != nil || !bounded {
+						t.Fatalf("blocked retry not bounded/released: %v %v", bounded, err)
+					}
+					totals, err := store.Totals(ctx, p, "memory")
+					if err != nil || totals.Reserved != target || totals.Submitted != fmt.Sprintf("%d.454976049444", 9714+index) || totals.Pending != "1.000000000000" {
+						t.Fatalf("blocked reservation: %+v %v", totals, err)
+					}
+				}
+			}
+			provider.mode = "exact"
+			tick(t, false)
+			tick(t, false)
+			if len(provider.attempts) != attemptsBefore+1 || provider.attempts[attemptsBefore] != wantCall || len(provider.calls) != callsBefore+1 {
+				t.Fatal("recovery did not retry exactly the original event once")
+			}
+			var eventCount int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM billing_export_event WHERE customer_id=$1`, customer).Scan(&eventCount); err != nil || eventCount != callsBefore+1 {
+				t.Fatalf("replacement events: count=%d want=%d err=%v", eventCount, callsBefore+1, err)
+			}
+			totals, err := store.Totals(ctx, p, "memory")
+			if err != nil || totals.Reserved != target || totals.Submitted != target || totals.Pending != "0" || meterPrecisionHistorySnapshot(t, pool, team.ID) != reservedSnapshot {
+				t.Fatalf("recovered accounting/history: %+v %v", totals, err)
+			}
+		})
+	}
+	if snapshot() != before {
+		t.Fatal("blocked delivery recovery mutated historical payload or coverage")
+	}
+	provider.mode = "complete"
+	// Full-period observation uses the same evidence policy without changing
+	// events. The database independently checks close evidence applicability.
+	exec(`INSERT INTO team_billing_usage(team_id,period_start,period_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds)
+ SELECT team_id,period_start,period_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds FROM billing_export_usage WHERE team_id=$1`, team.ID)
+	callsBeforeFrozen := len(provider.calls)
+	if _, err := h.reconcileFrozenIncrementalPeriod(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.calls) != callsBeforeFrozen || snapshot() != before {
+		t.Fatal("frozen observation changed submitted history")
+	}
+	// A new local reservation during evidence collection must invalidate the
+	// snapshot, even if provider bucket quantities remain unchanged.
+	provider.changeLocal = func() {
+		event, err := store.Reserve(ctx, p, "cpu", "9716.454976049444", now, billing.ExportPayload{EventName: resources["cpu"], CustomerID: customer, Timestamp: now.Add(-time.Second).Unix()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if event == nil || event.Quantity != "1.000000000000" {
+			t.Fatalf("concurrent reservation did not create one unit of new coverage: %+v", event)
+		}
+	}
+	totals, err := store.Totals(ctx, p, "cpu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	counted, err := provider.CountedMeterUsage(ctx, resources["cpu"], customer, start, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := h.assessMeterSummary(ctx, p, incrementalExportItem{ResourceType: "cpu", EventName: resources["cpu"], Quantity: totals.Reserved}, now, provider, customer, counted, totals, nil)
+	if decision.Err == nil || !strings.Contains(decision.Err.Error(), "local evidence changed") {
+		t.Fatalf("concurrent reservation accepted: %+v", decision)
+	}
+	exec(`UPDATE billing_export_work SET next_run_at='infinity',next_reconcile_at='infinity' WHERE team_id=$1`, team.ID)
+}
+
+func testMeterGrowingDriftWorker(t *testing.T, pool *pgxpool.Pool) {
+	ctx := t.Context()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	start := now.Add(-72 * time.Hour)
+	end := start.AddDate(0, 1, 0)
+	provider := &precisionWorkerStripe{mode: "complete", checkUnlocked: func(ctx context.Context) error {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		_, err = tx.Exec(ctx, `SELECT team_id FROM team_billing_period FOR UPDATE NOWAIT`)
+		return err
+	}}
+	h := &Handlers{Pool: pool, DB: db.New(pool), Stripe: provider, Now: func() time.Time { return now }}
+	team, err := h.DB.CreateTeam(ctx, "example-growing-drift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	customer := "cus_example_" + team.ID.String()
+	p := billing.ExportPeriod{TeamID: team.ID, Start: start, End: end}
+	store := billing.ExportStore{Pool: pool}
+	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_status,commercial_billing_anchor)
+ VALUES($1,$2,'active',$3)`, team.ID, customer, start)
+	exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true),($1,'billing_storage_billing_enabled',true)
+ ON CONFLICT(team_id,key) DO UPDATE SET enabled=EXCLUDED.enabled`, team.ID)
+	exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'open')`, team.ID, start, end)
+	if err := store.Enroll(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	for resource, event := range map[string]string{"cpu": "cpu_vcpu_hours", "memory": "memory_gib_hours", "storage": "storage_gib_hours"} {
+		if _, err := store.Reserve(ctx, p, resource, "10000", now.Add(-time.Hour), billing.ExportPayload{
+			EventName: event, CustomerID: customer, Timestamp: now.Add(-time.Hour - time.Second).Unix(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.submitIncrementalEvents(ctx, p, 6); err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO billing_export_usage(team_id,period_start,period_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds)
+ VALUES($1,$2,$3,10000*3600::numeric,10000*3686400::numeric,10000*3686400::numeric)`, team.ID, start, end)
+	exec(`INSERT INTO billing_export_work(team_id,next_run_at,next_reconcile_at,seed_complete,next_correction_at)
+ VALUES($1,'infinity','infinity',true,now()+interval '1 day')`, team.ID)
+	state := func() string {
+		t.Helper()
+		var snapshot string
+		if err := pool.QueryRow(ctx, `SELECT jsonb_agg(jsonb_build_array(to_jsonb(a),to_jsonb(e)) ORDER BY a.id,e.id)::text
+ FROM billing_export_allocation a LEFT JOIN billing_export_event e ON e.allocation_id=a.id WHERE a.team_id=$1`, team.ID).Scan(&snapshot); err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
+	// Equal increments keep totals in one binade while a steadily growing
+	// residual crosses its exact bound on the fourth scheduled export.
+	for iteration := 1; iteration <= 4; iteration++ {
+		now = now.Add(time.Hour)
+		exec(`UPDATE billing_export_usage SET vcpu_seconds=vcpu_seconds+3600,memory_mib_seconds=memory_mib_seconds+3686400,
+ storage_mib_seconds=storage_mib_seconds+3686400,updated_at=clock_timestamp() WHERE team_id=$1`, team.ID)
+		provider.drift = big.NewRat(int64(iteration), 2_000_000_000_000)
+		bound, err := meterPrecisionBound(big.NewRat(int64(10000+iteration-1), 1))
+		if err != nil || (provider.drift.Cmp(bound) > 0) != (iteration == 4) {
+			t.Fatalf("fixture does not cross bound on fourth export: %v", err)
+		}
+		before := state()
+		attempts, calls := len(provider.attempts), len(provider.calls)
+		for reread := 0; reread < 2; reread++ {
+			provider.buckets = 0
+			exec(`UPDATE billing_export_work SET next_run_at=now()-interval '100 years' WHERE team_id=$1`, team.ID)
+			worked, measured, err := h.incrementalBillingTick(ctx, time.Hour)
+			if !worked || measured != 0 {
+				t.Fatalf("worker did not export persisted usage: worked=%v measured=%d", worked, measured)
+			}
+			if iteration == 4 {
+				if !errors.Is(err, billing.ErrExportRecoveryRequired) {
+					t.Fatalf("out-of-policy export did not require recovery: %v", err)
+				}
+				if state() != before || len(provider.attempts) != attempts || len(provider.calls) != calls {
+					t.Fatal("out-of-policy export allocated, submitted, or changed accounting/delivery state")
+				}
+				var failed bool
+				if err := pool.QueryRow(ctx, `SELECT last_error IS NOT NULL AND lease_token IS NULL AND next_run_at>now()
+ FROM billing_export_work WHERE team_id=$1`, team.ID).Scan(&failed); err != nil || !failed {
+					t.Fatalf("worker did not persist bounded recovery failure: %v %v", failed, err)
+				}
+			} else {
+				if err != nil || len(provider.calls) != calls+3 || provider.buckets != 12 {
+					t.Fatalf("corroborated iteration %d reread %d: calls=%d buckets=%d err=%v", iteration, reread, len(provider.calls)-calls, provider.buckets, err)
+				}
+				for _, call := range provider.calls[calls:] {
+					if call.Value != "1.000000000000" {
+						t.Fatalf("growing export replayed coverage: %+v", call)
+					}
+				}
+			}
+			want := fmt.Sprintf("%d.000000000000", 10000+min(iteration, 3))
+			for _, resource := range []string{"cpu", "memory", "storage"} {
+				totals, err := store.Totals(ctx, p, resource)
+				if err != nil || totals.Reserved != want || totals.Submitted != want || totals.Pending != "0" {
+					t.Fatalf("iteration %d %s accounting: %+v %v", iteration, resource, totals, err)
+				}
+			}
+		}
+	}
+	exec(`UPDATE billing_export_work SET next_run_at='infinity',next_reconcile_at='infinity' WHERE team_id=$1`, team.ID)
+}
+
+func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
+	ctx := t.Context()
+	for _, total := range []string{"0.000000000001", "1", "8191.999999999999", "8192", "9712.454976049444", "1000000000"} {
+		var value string
+		if err := pool.QueryRow(ctx, `SELECT billing_meter_precision_bound($1::numeric)::text`, total).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		local, _ := meterDecimal(total)
+		want, _ := meterPrecisionBound(local)
+		got, ok := new(big.Rat).SetString(value)
+		if !ok || got.Cmp(want) != 0 {
+			t.Fatalf("SQL bound for %s = %s, want %s", total, value, want)
+		}
+	}
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+	start := now.Add(-72*time.Hour).AddDate(0, -2, 0)
+	end := start.AddDate(0, 1, 0)
+	provider := &precisionWorkerStripe{mode: "complete", checkUnlocked: func(ctx context.Context) error {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback(ctx)
+		_, err = tx.Exec(ctx, `SELECT team_id FROM team_billing_period FOR UPDATE NOWAIT`)
+		return err
+	}}
+	h := &Handlers{Pool: pool, DB: db.New(pool), Stripe: provider, Now: func() time.Time { return now }}
+	team, err := h.DB.CreateTeam(ctx, "example-precision-close")
+	if err != nil {
+		t.Fatal(err)
+	}
+	customer := "cus_example_" + team.ID.String()
+	p := billing.ExportPeriod{TeamID: team.ID, Start: start, End: end}
+	store := billing.ExportStore{Pool: pool}
+	exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_status,commercial_billing_anchor)
+ VALUES($1,$2,'active',$3)`, team.ID, customer, start)
+	exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true),($1,'billing_storage_billing_enabled',true)
+ ON CONFLICT(team_id,key) DO UPDATE SET enabled=EXCLUDED.enabled`, team.ID)
+	exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'approved')`, team.ID, start, end)
+	if err := store.Enroll(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	sandbox := uuid.New()
+	exec(`INSERT INTO sandbox(id,team_id,name,status,vcpu_count,memory_mib,host_id)
+ VALUES($1,$2,'example-precision-close','deleted',100,102400,'default')`, sandbox, team.ID)
+	exec(`INSERT INTO sandbox_compute_billing_interval(sandbox_id,team_id,vcpu_count,memory_mib,started_at,ended_at,end_reason)
+ VALUES($1,$2,100,102400,$3,$4,'deleted')`, sandbox, team.ID, start, start.Add(100*time.Hour))
+	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason)
+ VALUES($1,$2,102400,$3,$4,'deleted')`, sandbox, team.ID, start, start.Add(100*time.Hour))
+	for resource, event := range map[string]string{"cpu": "cpu_vcpu_hours", "memory": "memory_gib_hours", "storage": "storage_gib_hours"} {
+		if _, err := store.Reserve(ctx, p, resource, "10000", end, billing.ExportPayload{
+			EventName: event, CustomerID: customer, Timestamp: end.Add(-time.Second).Unix(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.submitIncrementalEvents(ctx, p, 6); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := func() string { return meterPrecisionHistorySnapshot(t, pool, team.ID) }
+	before := snapshot()
+	assertHistory := func() {
+		t.Helper()
+		if snapshot() != before || len(provider.attempts) != 3 || len(provider.calls) != 3 {
+			t.Fatal("close changed historical events/coverage or duplicated delivery")
+		}
+		for _, resource := range []string{"cpu", "memory", "storage"} {
+			totals, err := store.Totals(ctx, p, resource)
+			if err != nil || totals.Reserved != "10000" || totals.Submitted != totals.Reserved || totals.Pending != "0" {
+				t.Fatalf("%s close accounting: %+v %v", resource, totals, err)
+			}
+		}
+	}
+	result, err := h.exportIncrementalPeriod(ctx, p)
+	if err != nil || result.Status != "exported" {
+		t.Fatalf("persistent drift close: %+v %v", result, err)
+	}
+	assertHistory()
+	var evidenceCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM billing_meter_reconciliation WHERE team_id=$1
+ AND local_quantity=10000 AND reserved_quantity=10000 AND submitted_quantity=10000
+ AND provider_quantity=10000.000000000001 AND difference=0.000000000001
+ AND query_start=$2 AND query_end=$3`, team.ID, start, end).Scan(&evidenceCount); err != nil || evidenceCount != 3 {
+		t.Fatalf("persistent raw residual history: count=%d err=%v", evidenceCount, err)
+	}
+
+	// A scope change after network evidence collection must also be rejected
+	// before it can replace the latest observation.
+	totals, err := store.Totals(ctx, p, "cpu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := incrementalExportItem{ResourceType: "cpu", EventName: "cpu_vcpu_hours", Quantity: "10000"}
+	counted, err := provider.CountedMeterUsage(ctx, item.EventName, customer, start, end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision := h.assessMeterSummary(ctx, p, item, end, provider, customer, counted, totals, nil)
+	if decision.Err != nil || decision.CloseEvidence == nil {
+		t.Fatalf("collect close evidence: %+v", decision)
+	}
+	exec(`UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team.ID, "cus_changed_"+team.ID.String())
+	if err := h.recordMeterObservation(ctx, p, item, end, totals, counted, nil, time.Now(), decision.CloseEvidence, provider.MeterID()); !errors.Is(err, billing.ErrExportRecoveryRequired) {
+		t.Fatalf("concurrent scope change persisted stale evidence: %v", err)
+	}
+	exec(`UPDATE team_billing_account SET stripe_customer_id=$2 WHERE team_id=$1`, team.ID, customer)
+
+	// Exercise the actual finalization transaction with bad evidence. Each
+	// mutation rolls back, so the original immutable history remains intact.
+	for _, mode := range []string{"missing", "stale", "wrong_scope", "wrong_meter", "wrong_snapshot", "wrong_policy", "wrong_window", "incomplete", "unstable", "excess", "provider_lag", "unresolved", "changed_accounting", "changed_customer", "old_writer", "boundary", "beyond_boundary", "mapping_missing", "mapping_expired"} {
+		t.Run(mode, func(t *testing.T) {
+			mapping, err := billing.RevalidateMeterCloseMapping(ctx, pool, p, h.ResolveActiveBillingMeter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if mode != "mapping_missing" {
+				if err := mapping.Bind(ctx, tx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Disable only the history immutability trigger for fixture corruption.
+			if _, err = tx.Exec(ctx, `ALTER TABLE billing_meter_reconciliation DISABLE TRIGGER billing_meter_reconciliation_immutable`); err != nil {
+				t.Fatal(err)
+			}
+			var mutation string
+			switch mode {
+			case "mapping_missing", "mapping_expired":
+				mutation = `SELECT $1::uuid`
+				if mode == "mapping_expired" {
+					if _, err := tx.Exec(ctx, `SELECT set_config('billing.close_meter_mapping',
+ jsonb_set(current_setting('billing.close_meter_mapping')::jsonb,'{checked_at}',to_jsonb(clock_timestamp()-interval '31 seconds'))::text,true)`); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "missing":
+				mutation = `DELETE FROM billing_meter_reconciliation WHERE team_id=$1`
+			case "stale":
+				mutation = `UPDATE billing_meter_reconciliation SET collected_at=now()-interval '3 hours' WHERE team_id=$1`
+			case "wrong_scope":
+				mutation = `UPDATE billing_meter_reconciliation SET customer_id='cus_wrong' WHERE team_id=$1`
+			case "wrong_meter":
+				mutation = `UPDATE billing_meter_reconciliation SET meter_id='mtr_old_precision' WHERE team_id=$1`
+			case "wrong_snapshot":
+				mutation = `UPDATE billing_meter_reconciliation SET accounting_snapshot='{}' WHERE team_id=$1`
+			case "wrong_policy":
+				mutation = `UPDATE billing_meter_reconciliation SET policy='unknown' WHERE team_id=$1`
+			case "wrong_window":
+				mutation = `UPDATE billing_meter_reconciliation SET query_start=query_start+interval '1 minute' WHERE team_id=$1`
+			case "incomplete":
+				mutation = `UPDATE billing_meter_reconciliation SET bucket_passes='[[],[]]' WHERE team_id=$1`
+			case "unstable":
+				mutation = `UPDATE billing_meter_reconciliation SET bucket_passes=jsonb_set(bucket_passes,'{1,0,quantity}','"1"') WHERE team_id=$1`
+			case "excess":
+				mutation = `UPDATE billing_export_observation SET counted_quantity=local_quantity+1 WHERE team_id=$1`
+			case "provider_lag":
+				mutation = `UPDATE billing_export_observation SET counted_quantity=local_quantity-0.000000000001 WHERE team_id=$1`
+			case "unresolved":
+				mutation = `UPDATE billing_export_event SET status='uncertain',updated_at=now() WHERE allocation_id IN (SELECT id FROM billing_export_allocation WHERE team_id=$1)`
+			case "changed_accounting":
+				mutation = `UPDATE billing_export_event SET updated_at=clock_timestamp() WHERE allocation_id IN (SELECT id FROM billing_export_allocation WHERE team_id=$1)`
+			case "changed_customer":
+				mutation = `UPDATE team_billing_account SET stripe_customer_id='cus_changed_precision' WHERE team_id=$1`
+			case "old_writer":
+				mutation = `UPDATE billing_export_observation SET observed_at=now() WHERE team_id=$1`
+			}
+			if mode == "boundary" || mode == "beyond_boundary" {
+				factor := 1
+				if mode == "beyond_boundary" {
+					factor = 2
+				}
+				if _, err = tx.Exec(ctx, `UPDATE billing_meter_reconciliation SET
+ difference=billing_meter_precision_bound(reserved_quantity)*$2,
+ provider_quantity=reserved_quantity+billing_meter_precision_bound(reserved_quantity)*$2 WHERE team_id=$1`, team.ID, factor); err != nil {
+					t.Fatal(err)
+				}
+				mutation = `UPDATE billing_export_observation o SET counted_quantity=e.provider_quantity
+ FROM billing_meter_reconciliation e WHERE o.team_id=$1 AND e.team_id=o.team_id
+ AND e.period_start=o.period_start AND e.period_end=o.period_end AND e.resource_type=o.resource_type AND e.observed_at=o.observed_at`
+			}
+			if _, err = tx.Exec(ctx, mutation, team.ID); err != nil {
+				t.Fatal(err)
+			}
+			_, err = tx.Exec(ctx, `UPDATE team_billing_period SET status='finalized',finalized_at=now(),
+ gross_charges_usd=0,credits_applied_usd=0,net_invoice_amount_usd=0
+ WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end)
+			if mode == "boundary" {
+				if err != nil {
+					t.Fatalf("exact inclusive precision boundary blocked: %v", err)
+				}
+			} else {
+				want := "incremental export requires fresh matching Stripe reconciliation"
+				if mode == "unresolved" {
+					want = "incremental export has unresolved events"
+				}
+				if err == nil || !strings.Contains(err.Error(), want) {
+					t.Fatalf("%s evidence did not fail at reconciliation guard: %v", mode, err)
+				}
+			}
+		})
+	}
+	// Mapping changes happen after evidence is stored, independently of both
+	// historical meter IDs. Neither missing readers nor outages may bypass it.
+	if _, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, pool, team.ID, start, end); !errors.Is(err, billing.ErrExportRecoveryRequired) {
+		t.Fatalf("missing current mapping reader authorized close: %v", err)
+	}
+	provider.mappingErr = errors.New("example mapping outage")
+	if _, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, pool, team.ID, start, end, h.ResolveActiveBillingMeter); !errors.Is(err, billing.ErrExportRecoveryRequired) {
+		t.Fatalf("mapping outage authorized close: %v", err)
+	}
+	provider.mappingErr = nil
+	var oldEvidence string
+	if err := pool.QueryRow(ctx, `SELECT jsonb_agg(to_jsonb(e) ORDER BY id)::text FROM billing_meter_reconciliation e WHERE team_id=$1`, team.ID).Scan(&oldEvidence); err != nil {
+		t.Fatal(err)
+	}
+	provider.activeMeter = "mtr_example_remapped"
+	if _, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, pool, team.ID, start, end, h.ResolveActiveBillingMeter); !errors.Is(err, billing.ErrExportRecoveryRequired) {
+		t.Fatalf("remap after evidence collection authorized finalization: %v", err)
+	}
+	var stillExported bool
+	if err := pool.QueryRow(ctx, `SELECT status='exported' AND finalized_at IS NULL FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end).Scan(&stillExported); err != nil || !stillExported {
+		t.Fatalf("blocked remap changed period: %v %v", stillExported, err)
+	}
+	assertHistory()
+	if _, err := h.reconcileFrozenIncrementalPeriod(ctx, p); err != nil {
+		t.Fatalf("fresh remapped evidence: %v", err)
+	}
+	var retainedEvidence string
+	if err := pool.QueryRow(ctx, `SELECT jsonb_agg(to_jsonb(e) ORDER BY id)::text FROM billing_meter_reconciliation e WHERE team_id=$1 AND meter_id='mtr_example_precision'`, team.ID).Scan(&retainedEvidence); err != nil || retainedEvidence != oldEvidence {
+		t.Fatalf("remap rewrote historical evidence: %v", err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, pool, team.ID, start, end, h.ResolveActiveBillingMeter); err != nil {
+			t.Fatalf("persistent drift finalization: %v", err)
+		}
+		assertHistory()
+	}
+	var finalized bool
+	if err := pool.QueryRow(ctx, `SELECT status='finalized' AND exported_at IS NOT NULL AND finalized_at IS NOT NULL
+ FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end).Scan(&finalized); err != nil || !finalized {
+		t.Fatalf("persistent drift finalized=%v err=%v", finalized, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE billing_meter_reconciliation SET policy=policy WHERE team_id=$1`, team.ID); err == nil {
+		t.Fatal("reconciliation history is mutable")
+	}
+	testMeterEvidenceEventBudgetDatabase(t, pool)
+
+	// The following commercial period starts from zero coverage, obtains its
+	// own evidence, and closes with its own persistent residual.
+	second := billing.ExportPeriod{TeamID: team.ID, Start: end, End: end.AddDate(0, 1, 0)}
+	exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'approved')`, team.ID, second.Start, second.End)
+	if err := store.Enroll(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	exec(`INSERT INTO sandbox_compute_billing_interval(sandbox_id,team_id,vcpu_count,memory_mib,started_at,ended_at,end_reason)
+ VALUES($1,$2,100,102400,$3,$4,'deleted')`, sandbox, team.ID, second.Start, second.Start.Add(200*time.Hour))
+	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason)
+ VALUES($1,$2,102400,$3,$4,'deleted')`, sandbox, team.ID, second.Start, second.Start.Add(200*time.Hour))
+	for resource, event := range map[string]string{"cpu": "cpu_vcpu_hours", "memory": "memory_gib_hours", "storage": "storage_gib_hours"} {
+		totals, err := store.Totals(ctx, second, resource)
+		if err != nil || totals.Reserved != "0" {
+			t.Fatalf("prior residual became opening coverage: %+v %v", totals, err)
+		}
+		if _, err := store.Reserve(ctx, second, resource, "20000", second.End, billing.ExportPayload{
+			EventName: event, CustomerID: customer, Timestamp: second.End.Add(-time.Second).Unix(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.submitIncrementalEvents(ctx, second, 6); err != nil {
+		t.Fatal(err)
+	}
+	// The first period's evidence must not authorize a later period. Before
+	// collecting second-period evidence, the close trigger must reject an
+	// attempted export rather than selecting the retained prior history.
+	if _, err := pool.Exec(ctx, `UPDATE team_billing_period SET status='exported',exported_at=now()
+ WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, second.Start, second.End); err == nil {
+		t.Fatal("prior-period reconciliation evidence authorized second-period close")
+	}
+	beforeSecondClose := snapshot()
+	if _, err := h.exportIncrementalPeriod(ctx, second); err != nil {
+		t.Fatalf("independent second close: %v", err)
+	}
+	if _, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, pool, team.ID, second.Start, second.End, h.ResolveActiveBillingMeter); err != nil {
+		t.Fatalf("independent second finalization: %v", err)
+	}
+	if beforeSecondClose != snapshot() || len(provider.attempts) != 6 {
+		t.Fatal("following period changed or replayed historical usage")
+	}
+	var retained, independent int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE period_start=$2 AND local_quantity=10000 AND difference=0.000000000001),
+ count(*) FILTER (WHERE period_start=$3 AND local_quantity=20000 AND difference=0.000000000001)
+ FROM billing_meter_reconciliation WHERE team_id=$1`, team.ID, start, second.Start).Scan(&retained, &independent); err != nil || retained != 6 || independent != 3 {
+		t.Fatalf("independent retained period evidence: first=%d second=%d err=%v", retained, independent, err)
+	}
+}
+
+func testMeterEvidenceEventBudgetDatabase(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	for _, count := range []int{4096, 4097} {
+		t.Run(fmt.Sprintf("event-budget-%d", count), func(t *testing.T) {
+			ctx := t.Context()
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, err := pool.Exec(ctx, sql, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			now := time.Now().UTC().Truncate(time.Hour)
+			start := now.Add(-72*time.Hour).AddDate(0, -2, 0)
+			end := start.AddDate(0, 1, 0)
+			team, err := db.New(pool).CreateTeam(ctx, fmt.Sprintf("example-meter-event-budget-%d", count))
+			if err != nil {
+				t.Fatal(err)
+			}
+			customer := "cus_example_" + team.ID.String()
+			exec(`INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_status,commercial_billing_anchor)
+ VALUES($1,$2,'active',$3)`, team.ID, customer, start)
+			exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)
+ ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, team.ID)
+			exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'approved')`, team.ID, start, end)
+			p := billing.ExportPeriod{TeamID: team.ID, Start: start, End: end}
+			store := billing.ExportStore{Pool: pool}
+			if err := store.Enroll(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+			// Start after measurement has frozen so a rejected export cannot
+			// legitimately change the period or its measurement snapshot.
+			exec(`INSERT INTO team_billing_usage(team_id,period_start,period_end,vcpu_seconds)
+ VALUES($1,$2,$3,$4::numeric*3600)`, team.ID, start, end, count)
+			exec(`UPDATE team_billing_period SET status='exporting' WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end)
+
+			timestamp := end.Add(-2 * time.Minute).Unix()
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err = tx.Exec(ctx, `ALTER TABLE billing_export_allocation DISABLE TRIGGER billing_export_allocation_validate`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(ctx, `INSERT INTO billing_export_allocation
+ (team_id,period_start,period_end,resource_type,coverage_start,coverage_end,measured_through)
+ SELECT $1,$2,$3,'cpu',(n-1)::numeric,n::numeric,$3
+ FROM generate_series(1,$4::integer) AS n`, team.ID, start, end, count); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(ctx, `ALTER TABLE billing_export_allocation ENABLE TRIGGER billing_export_allocation_validate`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err = tx.Exec(ctx, `INSERT INTO billing_export_event
+ (id,allocation_id,identifier,idempotency_key,event_name,customer_id,quantity,quantity_payload,
+  event_timestamp,source,status)
+ SELECT gen_random_uuid(),a.id,$5||a.coverage_start::text,
+        $5||a.coverage_start::text,'cpu_vcpu_hours',$2,1,'1',$6,'export','submitted'
+ FROM billing_export_allocation a
+ WHERE a.team_id=$1 AND a.period_start=$4 AND a.period_end=$3
+   AND a.resource_type='cpu' ORDER BY a.coverage_start`, team.ID, customer, end, start, "meter-budget-"+team.ID.String()+"-", timestamp); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			provider := &precisionWorkerStripe{
+				mode: "complete", drift: big.NewRat(1, 10_000_000_000_000),
+				checkUnlocked: func(context.Context) error { return nil },
+			}
+			for i := 0; i < count; i++ {
+				provider.calls = append(provider.calls, StripeReportMeterEventParams{
+					EventName: "cpu_vcpu_hours", CustomerID: customer, Value: "1", Timestamp: timestamp,
+				})
+			}
+			h := &Handlers{Pool: pool, DB: db.New(pool), Stripe: provider, Now: func() time.Time { return now }}
+			quantity := fmt.Sprint(count)
+			counted, err := provider.CountedMeterUsage(ctx, "cpu_vcpu_hours", customer, start, end)
+			if err != nil {
+				t.Fatal(err)
+			}
+			numeric, needsEvidence := compareMeterSummary(counted, quantity)
+			if !needsEvidence || numeric.Outcome != "incomplete" || numeric.Difference != provider.drift.RatString() {
+				t.Fatalf("fixture did not reach evidence gate: %+v", numeric)
+			}
+			var withinBound bool
+			if err := pool.QueryRow(ctx, `SELECT $1::numeric>0 AND $1::numeric<=billing_meter_precision_bound($2::numeric)`, "0.0000000000001", quantity).Scan(&withinBound); err != nil || !withinBound {
+				t.Fatalf("fixture residual exceeds SQL policy: %v %v", withinBound, err)
+			}
+			events, err := h.meterLocalEvidence(ctx, p, "cpu")
+			if count == 4096 {
+				if err != nil || len(events) != count {
+					t.Fatalf("at-limit local evidence: events=%d err=%v", len(events), err)
+				}
+			} else if err == nil || err.Error() != "local meter evidence exceeds event budget" || events != nil {
+				t.Fatalf("over-limit local evidence: events=%d err=%v", len(events), err)
+			}
+
+			// Seed complete evidence even for the over-limit inventory. This
+			// unbounded test-only snapshot differs from the production query
+			// solely in its inventory limit, so missing evidence cannot mask it.
+			var fullSnapshot string
+			var collected time.Time
+			if err := pool.QueryRow(ctx, `SELECT jsonb_build_object(
+ 'events',(SELECT jsonb_agg(jsonb_build_array(a.id,a.coverage_start,a.coverage_end,a.measured_through,a.correction_id,
+ e.id,e.accounting_sequence,e.active,e.status,e.event_name,e.customer_id,e.quantity_payload,
+ e.event_timestamp,e.updated_at,e.recovery_outcome,e.recovery_evidence) ORDER BY a.coverage_end,e.id)
+ FROM billing_export_allocation a LEFT JOIN billing_export_event e ON e.allocation_id=a.id
+ WHERE a.team_id=$1 AND a.period_start=$2 AND a.period_end=$3 AND a.resource_type='cpu'),
+ 'correction_version',(SELECT correction_version FROM billing_incremental_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3),
+ 'measurement',(SELECT jsonb_build_array(vcpu_seconds,memory_mib_seconds,storage_mib_seconds)
+ FROM team_billing_usage WHERE team_id=$1 AND period_start=$2 AND period_end=$3),
+ 'customer',(SELECT stripe_customer_id FROM team_billing_account WHERE team_id=$1))::text,clock_timestamp()`, team.ID, start, end).Scan(&fullSnapshot, &collected); err != nil {
+				t.Fatal(err)
+			}
+			var boundedSnapshot *string
+			if err := pool.QueryRow(ctx, `SELECT billing_meter_accounting_snapshot($1,$2,$3,'cpu')::text`, team.ID, start, end).Scan(&boundedSnapshot); err != nil {
+				t.Fatal(err)
+			}
+			if count == 4096 {
+				if boundedSnapshot == nil || *boundedSnapshot != fullSnapshot {
+					t.Fatal("at-limit SQL snapshot is incomplete or differs from full inventory")
+				}
+			} else if boundedSnapshot != nil {
+				t.Fatal("over-limit SQL snapshot is not NULL")
+			}
+			evidence := meterCloseEvidence{
+				MeterID: provider.MeterID(), EventName: "cpu_vcpu_hours", Customer: customer,
+				Snapshot: fullSnapshot, CollectedAt: collected,
+			}
+			for pass := 0; pass < 2; pass++ {
+				buckets, err := provider.BucketedMeterUsage(ctx, evidence.EventName, customer, start, end)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, bucket := range buckets {
+					want := new(big.Rat)
+					if timestamp >= bucket.Start.Unix() && timestamp < bucket.End.Unix() {
+						want.SetInt64(int64(count))
+					}
+					got, err := meterDecimal(bucket.Quantity)
+					if err != nil || got.Cmp(want) != 0 {
+						t.Fatalf("provider pass %d does not match persisted events: %+v %v", pass, bucket, err)
+					}
+				}
+				evidence.Passes = append(evidence.Passes, completeMeterBuckets(buckets, start, end))
+			}
+			item := incrementalExportItem{ResourceType: "cpu", EventName: evidence.EventName, Quantity: quantity}
+			totals, err := store.Totals(ctx, p, "cpu")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, through := range []time.Time{end.Add(-time.Minute), end} {
+				decision := h.assessMeterSummary(ctx, p, item, through, provider, customer, counted, totals, nil)
+				if count == 4096 {
+					if decision.Err != nil || decision.Outcome != "explained_precision" {
+						t.Fatalf("at-limit export decision: %+v", decision)
+					}
+				} else {
+					want := "local meter evidence exceeds event budget"
+					if through.Equal(end) {
+						want = "incomplete bounded accounting snapshot"
+					}
+					if !errors.Is(decision.Err, billing.ErrExportRecoveryRequired) || decision.Outcome != "incomplete" || !strings.Contains(decision.Err.Error(), want) || decision.CloseEvidence != nil {
+						t.Fatalf("over-limit export rejected for wrong reason: %+v", decision)
+					}
+				}
+			}
+			exec(`INSERT INTO billing_export_observation
+ (team_id,period_start,period_end,resource_type,local_quantity,submitted_quantity,reserved_quantity,
+ counted_quantity,query_start,query_end,meter_id)
+ VALUES($1,$2,$3,'cpu',$4,$4,$4,$5,$2,$3,$6)`, team.ID, start, end, quantity, counted, provider.MeterID())
+			tx, err = pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if err := persistMeterCloseEvidence(ctx, tx, p, "cpu", evidence); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			state := func() string {
+				t.Helper()
+				var value string
+				if err := pool.QueryRow(ctx, `SELECT jsonb_build_object(
+ 'allocations',(SELECT jsonb_agg(to_jsonb(a) ORDER BY a.id) FROM billing_export_allocation a WHERE team_id=$1),
+ 'events',(SELECT jsonb_agg(to_jsonb(e) ORDER BY e.id) FROM billing_export_event e
+ JOIN billing_export_allocation a ON a.id=e.allocation_id WHERE a.team_id=$1),
+ 'periods',(SELECT jsonb_agg(to_jsonb(p) ORDER BY period_start) FROM team_billing_period p WHERE team_id=$1),
+ 'incremental',(SELECT jsonb_agg(to_jsonb(p) ORDER BY period_start) FROM billing_incremental_period p WHERE team_id=$1),
+ 'usage',(SELECT jsonb_agg(to_jsonb(u) ORDER BY period_start) FROM team_billing_usage u WHERE team_id=$1),
+ 'export_usage',(SELECT jsonb_agg(to_jsonb(u) ORDER BY period_start) FROM billing_export_usage u WHERE team_id=$1),
+ 'history',(SELECT jsonb_agg(to_jsonb(r) ORDER BY id) FROM billing_meter_reconciliation r WHERE team_id=$1))::text`, team.ID).Scan(&value); err != nil {
+					t.Fatal(err)
+				}
+				return value
+			}
+			before := state()
+			mapping, err := billing.RevalidateMeterCloseMapping(ctx, pool, p, h.ResolveActiveBillingMeter)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err = pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if err := mapping.Bind(ctx, tx); err != nil {
+				t.Fatal(err)
+			}
+			var mapped bool
+			if err := tx.QueryRow(ctx, `SELECT count(*)=1 AND bool_and(
+ current_setting('billing.close_meter_mapping')::jsonb->'meters'->>r.id::text=r.meter_id)
+ FROM billing_meter_reconciliation r WHERE team_id=$1`, team.ID).Scan(&mapped); err != nil || !mapped {
+				t.Fatalf("close fixture lacks current evidence mapping: %v %v", mapped, err)
+			}
+			var matches bool
+			if err := tx.QueryRow(ctx, `SELECT billing_meter_close_evidence_matches(o) FROM billing_export_observation o
+ WHERE team_id=$1 AND resource_type='cpu'`, team.ID).Scan(&matches); err != nil || matches != (count == 4096) {
+				t.Fatalf("close evidence applicability: matches=%v err=%v", matches, err)
+			}
+			_, closeErr := tx.Exec(ctx, `UPDATE team_billing_period SET status='exported',exported_at=now()
+ WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end)
+			if count == 4096 {
+				if closeErr != nil {
+					t.Fatalf("at-limit database close: %v", closeErr)
+				}
+			} else if closeErr == nil || !strings.Contains(closeErr.Error(), "incremental export requires fresh matching Stripe reconciliation") {
+				t.Fatalf("over-limit close rejected for wrong reason: %v", closeErr)
+			}
+			if err := tx.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if state() != before {
+				t.Fatal("close attempt changed accounting, payloads, coverage, period or history")
+			}
+
+			result, exportErr := h.exportIncrementalPeriod(ctx, p)
+			if count == 4096 {
+				if exportErr != nil || result.Status != "exported" {
+					t.Fatalf("at-limit actual export/close: %+v %v", result, exportErr)
+				}
+			} else {
+				if !errors.Is(exportErr, billing.ErrExportRecoveryRequired) || !strings.Contains(exportErr.Error(), "incomplete bounded accounting snapshot") {
+					t.Fatalf("over-limit actual export rejected for wrong reason: %+v %v", result, exportErr)
+				}
+				if state() != before {
+					t.Fatal("rejected export changed accounting, payloads, coverage, period or history")
+				}
+			}
+			if len(provider.attempts) != 0 || len(provider.calls) != count {
+				t.Fatal("event-budget decision replayed historical usage")
+			}
+		})
+	}
+}
+
+func meterPrecisionHistorySnapshot(t *testing.T, pool *pgxpool.Pool, team uuid.UUID) string {
+	t.Helper()
+	var value string
+	if err := pool.QueryRow(t.Context(), `SELECT jsonb_agg(jsonb_build_array(e.id,e.identifier,e.idempotency_key,e.event_name,e.customer_id,e.quantity,e.quantity_payload,e.event_timestamp,
+ a.id,a.coverage_start,a.coverage_end,a.measured_through) ORDER BY e.id)::text
+ FROM billing_export_event e JOIN billing_export_allocation a ON a.id=e.allocation_id WHERE a.team_id=$1`, team).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	return value
 }

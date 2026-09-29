@@ -38,8 +38,9 @@ type FinalizeTeamBillingPeriodResult struct {
 }
 
 type BillingFinalizationConfig struct {
-	PollInterval time.Duration
-	BatchSize    int
+	PollInterval       time.Duration
+	BatchSize          int
+	ResolveActiveMeter ActiveMeterResolver
 }
 
 func DefaultBillingFinalizationConfig() BillingFinalizationConfig {
@@ -66,9 +67,19 @@ func FinalizeTeamBillingPeriodWithCredits(
 	teamID uuid.UUID,
 	periodStart time.Time,
 	periodEnd time.Time,
+	resolvers ...ActiveMeterResolver,
 ) (FinalizeTeamBillingPeriodResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, StorageReportSettlementTimeout)
 	defer cancel()
+	var resolve ActiveMeterResolver
+	if len(resolvers) > 0 {
+		resolve = resolvers[0]
+	}
+	mapping, err := RevalidateMeterCloseMapping(ctx, pool, ExportPeriod{TeamID: teamID, Start: periodStart, End: periodEnd}, resolve)
+	if err != nil {
+		return FinalizeTeamBillingPeriodResult{}, err
+	}
+
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return FinalizeTeamBillingPeriodResult{}, err
@@ -77,6 +88,9 @@ func FinalizeTeamBillingPeriodWithCredits(
 		_ = tx.Rollback(ctx)
 	}()
 
+	if err := mapping.Bind(ctx, tx); err != nil {
+		return FinalizeTeamBillingPeriodResult{}, err
+	}
 	q := db.New(tx)
 	period, err := lockBillingPeriodForFinalization(ctx, tx, teamID, periodStart, periodEnd)
 	if err != nil {
@@ -563,7 +577,7 @@ func validateSummaryPricingRatesForFinalization(rows []db.ListActivePricingRates
 	return validateSummaryPricingRatesCurrent(converted, storageBillingEnabled)
 }
 
-func FinalizeExportedBillingPeriods(ctx context.Context, pool *pgxpool.Pool, batchSize int) (int, error) {
+func FinalizeExportedBillingPeriods(ctx context.Context, pool *pgxpool.Pool, batchSize int, resolvers ...ActiveMeterResolver) (int, error) {
 	q := db.New(pool)
 	rows, err := q.ListExportedTeamBillingPeriods(ctx, int32(batchSize))
 	if err != nil {
@@ -573,7 +587,7 @@ func FinalizeExportedBillingPeriods(ctx context.Context, pool *pgxpool.Pool, bat
 	finalized := 0
 	var errs []error
 	for _, period := range rows {
-		if _, err := FinalizeTeamBillingPeriodWithCredits(ctx, pool, period.TeamID, period.PeriodStart, period.PeriodEnd); err != nil {
+		if _, err := FinalizeTeamBillingPeriodWithCredits(ctx, pool, period.TeamID, period.PeriodStart, period.PeriodEnd, resolvers...); err != nil {
 			errs = append(errs, fmt.Errorf("team %s period %s-%s: %w", period.TeamID, period.PeriodStart.Format(time.RFC3339), period.PeriodEnd.Format(time.RFC3339), err))
 			continue
 		}
@@ -600,7 +614,7 @@ func runBillingFinalizationLoop(ctx context.Context, pool *pgxpool.Pool, cfg Bil
 }
 
 func runBillingFinalizationTick(ctx context.Context, pool *pgxpool.Pool, cfg BillingFinalizationConfig, workerID string) {
-	finalized, err := FinalizeExportedBillingPeriods(ctx, pool, cfg.BatchSize)
+	finalized, err := FinalizeExportedBillingPeriods(ctx, pool, cfg.BatchSize, cfg.ResolveActiveMeter)
 	if err != nil {
 		log.Warn().Err(err).Str("worker_id", workerID).Msg("billing period finalization tick failed")
 		return
