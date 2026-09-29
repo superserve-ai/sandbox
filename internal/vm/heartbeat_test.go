@@ -1076,7 +1076,7 @@ func TestHeartbeatStorageQueueBoundsUnsentSnapshots(t *testing.T) {
 	if pending[0].version != 6 {
 		t.Fatalf("oldest retained report version = %d, want oldest snapshots discarded", pending[0].version)
 	}
-	info, err := os.Stat(filepath.Join(runDir, storageReportQueueFilename))
+	info, err := os.Stat(cache.queuePath)
 	if err != nil {
 		t.Fatalf("stat storage report queue: %v", err)
 	}

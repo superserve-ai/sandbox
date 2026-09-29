@@ -58,6 +58,18 @@ func TestHostStorageReportRejectsAllocatedBytesOverflowBeforeDB(t *testing.T) {
 	}
 }
 
+func TestHostStorageReportRejectsOverlayOnlyShapeForRetainedReport(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.POST("/internal/hosts/:host_id/storage-reports", (&Handlers{}).HostStorageReport)
+	body := `{"incarnation_id":"0f794b2e-f7a4-46eb-85b4-60f69e6cc831","report_id":"2f794b2e-f7a4-46eb-85b4-60f69e6cc831","measurements":[{"sandbox_id":"","allocated_bytes":0}]}`
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/internal/hosts/example-host/storage-reports", strings.NewReader(body)))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for a legacy reader that dropped retained data; body: %s", w.Code, w.Body.String())
+	}
+}
+
 func TestStorageReportsRejectDuplicateSandboxIDsBeforeDB(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	id := "3f794b2e-f7a4-46eb-85b4-60f69e6cc831"

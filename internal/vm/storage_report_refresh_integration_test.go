@@ -150,7 +150,12 @@ func storageRefreshPool(t *testing.T) *pgxpool.Pool {
 			t.Fatal(err)
 		}
 	}
-	// LIKE copies constraints and indexes but not the receipt's digest trigger.
+	// LIKE copies constraints and indexes but not the creation or digest triggers.
+	if _, err := pool.Exec(t.Context(), `CREATE TRIGGER fence_retained_storage_owner_creation
+		BEFORE INSERT ON sandbox FOR EACH ROW
+		EXECUTE FUNCTION public.fence_retained_storage_owner_creation()`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(t.Context(), `CREATE TRIGGER refresh_report_payload_hash
 		BEFORE INSERT OR UPDATE OF payload ON host_storage_report FOR EACH ROW
 		EXECUTE FUNCTION public.set_host_storage_report_payload_hash()`); err != nil {

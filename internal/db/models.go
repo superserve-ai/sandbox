@@ -846,6 +846,24 @@ type ReconcilerLog struct {
 	CreatedAt time.Time   `json:"created_at"`
 }
 
+type RetainedStorageCutover struct {
+	HostID    string    `json:"host_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	StartedAt time.Time `json:"started_at"`
+}
+
+type RetainedStorageInterval struct {
+	ID         int64              `json:"id"`
+	HostID     string             `json:"host_id"`
+	TeamID     uuid.UUID          `json:"team_id"`
+	OwnerKind  string             `json:"owner_kind"`
+	OwnerID    uuid.UUID          `json:"owner_id"`
+	Generation string             `json:"generation"`
+	Extents    []byte             `json:"extents"`
+	StartedAt  time.Time          `json:"started_at"`
+	EndedAt    pgtype.Timestamptz `json:"ended_at"`
+}
+
 type RevokedProxyToken struct {
 	SandboxID  uuid.UUID `json:"sandbox_id"`
 	ProxyToken string    `json:"proxy_token"`
@@ -1044,6 +1062,7 @@ type SandboxStorageInterval struct {
 	StartedAt time.Time          `json:"started_at"`
 	EndedAt   pgtype.Timestamptz `json:"ended_at"`
 	EndReason *string            `json:"end_reason"`
+	HostID    *string            `json:"host_id"`
 }
 
 // Host-side reclaim still owed for a deleted sandbox; removed when the VM and its artifacts are gone.

@@ -452,6 +452,8 @@ type ManagerConfig struct {
 
 // Manager orchestrates the lifecycle of Firecracker microVMs.
 type Manager struct {
+	storageEpoch     atomic.Uint64
+	storageMutations atomic.Int64
 	buildIncarnation string // immutable daemon identity for durable build reports
 
 	cfg         ManagerConfig
@@ -886,7 +888,8 @@ func (m *Manager) lockVMOp(ctx context.Context, vmID string) (func(), error) {
 			<-ch
 			return nil, err
 		}
-		return func() { <-ch }, nil
+		finishStorage := m.beginStorageMutation()
+		return func() { finishStorage(); <-ch }, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
@@ -898,7 +901,8 @@ func (m *Manager) tryLockVMOp(vmID string) (unlock func(), ok bool) {
 	ch := m.vmOpCh(vmID)
 	select {
 	case ch <- struct{}{}:
-		return func() { <-ch }, true
+		finishStorage := m.beginStorageMutation()
+		return func() { finishStorage(); <-ch }, true
 	default:
 		return nil, false
 	}
@@ -1105,22 +1109,22 @@ func planRestore(basePath, deltaDir string, fork, reuse bool) restorePlan {
 //
 // Anything else is an error: silently falling back to BaseRootfsPath would
 // put the wrong disk under the snapshot's memory view.
-func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath string) (string, error) {
+func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath string) (diskPath, rootfsPath string, err error) {
 	if src, srcErr := templateRootfsForSnapshot(m.cfg.RunDir, snapshotPath); srcErr == nil {
 		dst, err := m.copyRootfs(ctx, vmID, src)
 		if err != nil {
-			return "", fmt.Errorf("copy rootfs for restore: %w", err)
+			return "", "", fmt.Errorf("copy rootfs for restore: %w", err)
 		}
-		return dst, nil
+		return dst, src, nil
 	} else {
 		existing := filepath.Join(m.cfg.RunDir, vmID, "rootfs.ext4")
 		if _, statErr := os.Stat(existing); statErr != nil {
-			return "", fmt.Errorf(
+			return "", "", fmt.Errorf(
 				"resolve rootfs for vm %s: snapshot %q is not a template snapshot (%v) and per-VM rootfs %q is missing (%v)",
 				vmID, snapshotPath, srcErr, existing, statErr,
 			)
 		}
-		return existing, nil
+		return existing, "", nil
 	}
 }
 
@@ -1128,10 +1132,21 @@ func (m *Manager) resolveRestoreDisk(ctx context.Context, vmID, snapshotPath str
 // <runDir>/templates/<id>/rootfs.ext4. Lets vmd find the template's rootfs
 // without needing controlplane to pass it.
 func templateRootfsForSnapshot(runDir, snapshotPath string) (string, error) {
-	parent := filepath.Dir(snapshotPath) // .../templates/<templateID>
-	templateID := filepath.Base(parent)  // <templateID>
+	parent := filepath.Dir(snapshotPath)
+	templateID := filepath.Base(parent)
 	if filepath.Base(filepath.Dir(parent)) != TemplatesDirName {
-		return "", fmt.Errorf("snapshot path %q does not look like .../templates/<id>/<file>", snapshotPath)
+		// Build snapshots retain one additional build-id directory beneath the
+		// template. Walk only ancestors of the supplied path; never glob the
+		// templates tree or infer an unrelated artifact.
+		for p := parent; p != filepath.Dir(p); p = filepath.Dir(p) {
+			if filepath.Base(filepath.Dir(p)) == TemplatesDirName {
+				parent, templateID = p, filepath.Base(p)
+				break
+			}
+		}
+		if filepath.Base(filepath.Dir(parent)) != TemplatesDirName {
+			return "", fmt.Errorf("snapshot path %q does not look like .../templates/<id>/<file>", snapshotPath)
+		}
 	}
 	if templateID == "" || templateID == "." || templateID == string(filepath.Separator) {
 		return "", fmt.Errorf("snapshot path %q has an empty template id segment", snapshotPath)
@@ -3561,6 +3576,11 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		}
 		metaSnapshot, metaMem = fork.SnapshotPath, fork.MemPath
 	}
+	// Do not infer a template rootfs on the restore path. Overlay/build
+	// snapshots do not create the legacy path, and a synchronous filesystem
+	// probe here would both invent a dependency and add latency to resume.
+	// Reconciliation resolves legacy full-copy dependencies from build metadata
+	// before retained accounting accepts the generation.
 	// Failed restores return before the first-attempt success block below
 	// records the setup phases; emit whichever stages completed (elapsed for
 	// the in-flight one) so failed attempts — which can consume most of the
@@ -3806,7 +3826,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			m.cleanupRunDir(vmID)
 		}
 	}
-	var diskPath string
+	var diskPath, templateRootfs string
 	var diskErr error
 	diskUntouched := false
 	switch plan.action {
@@ -3820,7 +3840,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 			diskPath = existing
 		}
 	case restoreLegacyResolve:
-		diskPath, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
+		diskPath, templateRootfs, diskErr = m.resolveRestoreDisk(ctx, vmID, snapshotPath)
 	case restoreMaterializeFork:
 		if (inPlace || priorRunDir) && stopErr != nil {
 			// A stop that did not confirm may leave a Firecracker that still
@@ -3934,6 +3954,10 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		// so the in-memory view is consistent for concurrent readers.
 		inst.mu.Lock()
 		inst.DiskPath = diskPath
+		if templateRootfs != "" {
+			// A full pause replaces the memory anchors before inventory may run.
+			inst.Config.RootfsPath = templateRootfs
+		}
 		inst.IP = hostIP
 		inst.TAPDevice = tapDevice
 		inst.MACAddress = macAddr

@@ -22,6 +22,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 )
 
 // Keep the stale logical-size billing window short for overlays activated
@@ -30,6 +31,11 @@ const overlayStorageSampleInterval = 5 * time.Minute
 
 const storageReportVersionFilename = ".storage-report-version"
 const storageReportQueueFilename = ".storage-report-queue"
+
+// Keep the legacy spool path a regular file so an older VMD can be rolled
+// back without encountering EISDIR. New payloads use this sibling path.
+const storageReportQueueV2Filename = ".storage-report-queue.v2"
+const storageReportQueueStateFilename = "state.json"
 
 const (
 	storageReportRetryInitial = time.Second
@@ -44,6 +50,7 @@ const (
 )
 
 type HeartbeatConfig struct {
+	RetainedStorage    func(context.Context) (*retainedstorage.Inventory, error)
 	TemplateBuildReady func() bool
 
 	IncarnationID string
@@ -56,6 +63,7 @@ type HeartbeatConfig struct {
 	Token             string
 	ProxyHealthURL    string
 	RunDir            string
+	SnapshotDir       string
 	Interval          time.Duration
 	VMDAddr           string
 	ProxyAddr         string
@@ -200,7 +208,11 @@ func runHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger) 
 		case <-ctx.Done():
 			return
 		case <-storageReady:
-			runOverlayStorageSampler(ctx, runDir, overlayStorageSampleInterval, cache, log)
+			if cfg.RetainedStorage != nil && cfg.IncarnationID != "" {
+				runRetainedStorageSampler(ctx, cfg, cache, log)
+			} else {
+				runOverlayStorageSampler(ctx, runDir, overlayStorageSampleInterval, cache, log)
+			}
 		}
 	}()
 	for {
@@ -242,9 +254,12 @@ func runHeartbeat(ctx context.Context, cfg HeartbeatConfig, log zerolog.Logger) 
 	}
 }
 
+// Retained inventories use an empty sandbox ID; only the retained envelope
+// carries their ownership and allocation data.
 type heartbeatStorageMeasurement struct {
-	SandboxID      string `json:"sandbox_id"`
-	AllocatedBytes int64  `json:"allocated_bytes"`
+	Retained       *retainedstorage.Inventory `json:"retained,omitempty"`
+	SandboxID      string                     `json:"sandbox_id"`
+	AllocatedBytes int64                      `json:"allocated_bytes"`
 }
 
 // pressureLoop owns the pressure publisher's state and serializes its
@@ -548,6 +563,7 @@ type heartbeatStorageCache struct {
 	sentAt        time.Time
 	versionPath   string
 	queuePath     string
+	restoreErr    error
 	pending       []storagePublish
 	incarnationID string
 	log           zerolog.Logger
@@ -582,11 +598,11 @@ func newHeartbeatStorageCacheState(runDir string, log zerolog.Logger, incarnatio
 		return c
 	}
 	c.versionPath = filepath.Join(runDir, storageReportVersionFilename)
-	// Legacy heartbeats also need the spool: their compatibility handoff is
-	// acknowledged separately and must survive a VMD restart while it is
-	// waiting for durable acceptance.
+	// The dedicated queue is a sibling of the legacy regular-file spool. This
+	// keeps compatibility acknowledgements durable without changing the path an
+	// older VMD expects during rollback.
 	if runDir != "" {
-		c.queuePath = filepath.Join(runDir, storageReportQueueFilename)
+		c.queuePath = filepath.Join(runDir, storageReportQueueV2Filename)
 	}
 	return c
 }
@@ -610,21 +626,153 @@ func (c *heartbeatStorageCache) restore() {
 	c.sentVersion = state.sentVersion
 	c.sentAt = state.sentAt
 	c.pending = state.pending
+	c.restoreErr = state.restoreErr
 	c.mu.Unlock()
+}
+
+func prepareStorageReportQueue(path string) error {
+	parent := filepath.Dir(path)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return err
+	}
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return fmt.Errorf("storage report queue path is a directory")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	legacy := filepath.Join(parent, storageReportQueueFilename)
+	staging := legacy + ".migrating"
+	legacyInfo, legacyErr := os.Stat(legacy)
+	stagingState := filepath.Join(staging, storageReportQueueStateFilename)
+	if legacyErr == nil && legacyInfo.IsDir() {
+		return fmt.Errorf("legacy storage report queue is a directory")
+	}
+	if legacyErr != nil && !errors.Is(legacyErr, os.ErrNotExist) {
+		return legacyErr
+	}
+	if _, err := os.Stat(stagingState); err == nil {
+		if legacyErr == nil {
+			return fmt.Errorf("storage report migration has both legacy and staged queues")
+		}
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			data, readErr := os.ReadFile(stagingState)
+			if readErr != nil {
+				return readErr
+			}
+			if err := persistStorageReportFile(path, data); err != nil {
+				return err
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if legacyErr == nil {
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			data, readErr := os.ReadFile(legacy)
+			if readErr != nil {
+				return readErr
+			}
+			if err := persistStorageReportFile(path, data); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (c *heartbeatStorageCache) restoreFromDisk() {
 	incarnationReset := false
 	if c.queuePath != "" {
+		if err := prepareStorageReportQueue(c.queuePath); err != nil {
+			c.restoreErr = fmt.Errorf("prepare storage report queue: %w", err)
+			c.log.Error().Err(c.restoreErr).Msg("storage reporting disabled until spool recovery and daemon restart")
+			return
+		}
 		var data []byte
 		var err error
-		if info, statErr := os.Stat(c.queuePath); statErr == nil && info.Size() > storageReportQueueMaxBytes {
+		if info, statErr := os.Stat(c.queuePath); errors.Is(statErr, os.ErrNotExist) {
+			// Import, but never rename or replace, the legacy regular-file spool.
+			// This keeps the downgrade path writable while preserving queued
+			// reports for the upgraded daemon.
+			legacy := filepath.Join(filepath.Dir(c.queuePath), storageReportQueueFilename)
+			data, err = os.ReadFile(legacy)
+			if err == nil {
+				if persistErr := persistStorageReportFile(c.queuePath, data); persistErr != nil {
+					err = persistErr
+				}
+			} else if errors.Is(err, os.ErrNotExist) {
+				data, err = nil, nil
+			}
+		} else if statErr == nil && info.Size() > storageReportQueueMaxBytes {
 			c.log.Warn().Str("path", c.queuePath).Int64("bytes", info.Size()).
 				Int("max_bytes", storageReportQueueMaxBytes).
 				Msg("storage report queue exceeds spool limit; starting fresh")
 			data = nil
 		} else {
 			data, err = os.ReadFile(c.queuePath)
+		}
+		if err == nil {
+			// Transfer rollback reports before clearing the legacy queue. A crash
+			// between writes retries the merge by immutable report identity.
+			legacyPath := filepath.Join(filepath.Dir(c.queuePath), storageReportQueueFilename)
+			if legacyData, legacyErr := os.ReadFile(legacyPath); legacyErr == nil {
+				var current, legacy storageReportQueueState
+				if json.Unmarshal(data, &current) == nil && json.Unmarshal(legacyData, &legacy) == nil && legacy.IncarnationID == c.incarnationID && len(legacy.Pending) > 0 {
+					if current.IncarnationID != c.incarnationID {
+						current = storageReportQueueState{IncarnationID: c.incarnationID, Version: current.Version}
+					}
+					key := func(entry storageReportQueueEntry) string {
+						if id, err := uuid.Parse(entry.ReportID); err == nil && id != uuid.Nil {
+							return id.String()
+						}
+						return "version:" + strconv.FormatUint(entry.Version, 10)
+					}
+					seen := make(map[string]bool, len(current.Pending))
+					for _, entry := range current.Pending {
+						seen[key(entry)] = true
+						current.Version = max(current.Version, entry.Version)
+					}
+					for _, entry := range legacy.Pending {
+						identity := key(entry)
+						if seen[identity] {
+							continue
+						}
+						if entry.Version <= current.Version {
+							// Explicit IDs survive local queue renumbering. Legacy
+							// fallback IDs depend on the version and cannot change.
+							if strings.HasPrefix(identity, "version:") {
+								c.restoreErr = fmt.Errorf("legacy storage report version overlaps retained queue")
+								return
+							}
+							entry.Version = current.Version + 1
+						}
+						current.Pending = append(current.Pending, entry)
+						current.Version = entry.Version
+						seen[identity] = true
+					}
+					merged, mergeErr := json.Marshal(current)
+					if mergeErr == nil && (len(current.Pending) > storageReportQueueMaxEntries || len(merged)+1 > storageReportQueueMaxBytes) {
+						mergeErr = fmt.Errorf("merged storage report queue exceeds spool limit")
+					}
+					if mergeErr == nil {
+						mergeErr = persistStorageReportFile(c.queuePath, merged)
+					}
+					if mergeErr == nil {
+						legacy.Pending = nil
+						legacy.Measurements = nil
+						var cleared []byte
+						cleared, mergeErr = json.Marshal(legacy)
+						if mergeErr == nil {
+							mergeErr = persistStorageReportFile(legacyPath, cleared)
+						}
+					}
+					if mergeErr != nil {
+						c.restoreErr = fmt.Errorf("transfer legacy storage reports: %w", mergeErr)
+						return
+					}
+					data = merged
+				}
+			}
 		}
 		if err == nil {
 			var state storageReportQueueState
@@ -806,6 +954,10 @@ func (c *heartbeatStorageCache) updatePersistedState(update func(*heartbeatStora
 	c.persistMu.Lock()
 	defer c.persistMu.Unlock()
 	c.mu.RLock()
+	if c.restoreErr != nil {
+		c.mu.RUnlock()
+		return c.restoreErr
+	}
 	state := heartbeatStorageCache{
 		measurements: c.measurements, version: c.version, reportSpace: c.reportSpace,
 		sentVersion: c.sentVersion, sentAt: c.sentAt,

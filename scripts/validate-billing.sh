@@ -23,12 +23,18 @@ suite billing-controlplane-startup go test -v -race -short -count=1 -run '^TestC
 suite sentrylog-unit go test -v -count=1 ./internal/sentrylog
 suite billing-migrations go test -v -tags integration -count=1 -run '^$' ./internal/integration
 suite R16-billing-worker-load-race go test -v -race -tags integration -count=1 -timeout 5m -run '^TestIntegration_IncrementalWorkerLoad$' ./internal/api
+suite retained-storage-api-race go test -v -race -tags integration -count=1 -timeout 2m -run '^TestIntegration_Retained' ./internal/api
 suite storage-report-lease-race go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_StorageReport(Lease|Reclaim|ChunkTimeout)' ./internal/api
 suite storage-settlement-fence-race go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_Storage(ReceiptFence|Settlement)' ./internal/billing
 if [[ "$(go env GOOS)" == "linux" ]]; then
   suite storage-report-refresh-race go test -v -race -tags integration -count=1 -timeout 1m -run '^TestIntegration_StorageReportPeriodicRefresh$' ./internal/vm
+  : "${RETAINED_STORAGE_TEST_DIR:?Set RETAINED_STORAGE_TEST_DIR to disposable reflink-capable storage}"
+  suite retained-storage-physical-race go test -v -race -count=1 -timeout 5m -run '^TestRetainedPhysical' ./internal/vm
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+  suite retained-storage-linux-docker bash scripts/validate-retained-docker.sh
 else
-  echo "SKIP: storage-report-refresh-race (requires Linux)"
+  echo "FAIL: retained storage qualification requires Linux or the Docker route on macOS" >&2
+  exit 1
 fi
 suite billing-integration-race go test -v -race -tags integration -count=1 -timeout 10m -run 'Billing|Incremental|StorageReportReceiptFencesSettlement|StripeAssociationMonitor' ./internal/integration
 

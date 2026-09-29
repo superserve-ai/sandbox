@@ -283,57 +283,9 @@ compute_usage AS (
 	 AND COALESCE(i.ended_at, LEAST(sp.calculated_at, sp.period_end)) > sp.period_start
 	GROUP BY sp.team_id
 ),
-artifact_bounds AS (
-	SELECT
-		s.id,
-		s.team_id,
-		s.snapshot_id,
-		s.template_id,
-		s.base_path,
-		s.delta_path,
-		s.destroyed_at,
-		first_interval.started_at AS billing_started_at
-	FROM selected_plans sp
-	JOIN sandbox s ON s.team_id = sp.team_id
-	LEFT JOIN LATERAL (
-		SELECT MIN(i.started_at) AS started_at
-		FROM sandbox_storage_interval i
-		WHERE i.sandbox_id = s.id
-		  AND i.team_id = s.team_id
-	) first_interval ON true
-	WHERE first_interval.started_at IS NOT NULL
-	  AND first_interval.started_at < LEAST(sp.calculated_at, sp.period_end)
-	  AND s.created_at < LEAST(sp.calculated_at, sp.period_end)
-	  AND COALESCE(s.destroyed_at, LEAST(sp.calculated_at, sp.period_end)) > sp.period_start
-),
 storage_usage AS (
-	SELECT
-		sp.team_id,
-		COALESCE(SUM(
-			EXTRACT(EPOCH FROM (
-				LEAST(COALESCE(i.ended_at, sp.calculated_at), sp.period_end)
-				- GREATEST(i.started_at, sp.period_start)
-			)) * i.disk_mib
-		), 0)::numeric + COALESCE((SELECT FLOOR(SUM(ar.artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r))))) FROM (
-			SELECT p.path,
-				MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
-				range_agg(tstzrange(GREATEST(s.billing_started_at, sp.period_start), LEAST(COALESCE(s.destroyed_at, sp.calculated_at), sp.period_end), '[)')) AS retained_ranges
-			FROM artifact_bounds s
-			LEFT JOIN template t ON t.id = s.template_id
-			CROSS JOIN LATERAL unnest(ARRAY[s.base_path, s.delta_path, CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END]) AS p(path)
-			LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
-				AND am.path = p.path
-			WHERE s.team_id = sp.team_id
-  				AND p.path IS NOT NULL
-			GROUP BY p.path
-		) ar CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)), 0) AS storage_mib_seconds
-	FROM selected_plans sp
-	LEFT JOIN sandbox_storage_interval i
-	  ON i.team_id = sp.team_id
-	 AND sp.period_start < LEAST(sp.calculated_at, sp.period_end)
-	 AND i.started_at < LEAST(sp.calculated_at, sp.period_end)
-	 AND COALESCE(i.ended_at, LEAST(sp.calculated_at, sp.period_end)) > sp.period_start
-	GROUP BY sp.team_id, sp.calculated_at, sp.period_start, sp.period_end
+ SELECT sp.team_id,storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS storage_mib_seconds
+ FROM selected_plans sp
 ),
 credits AS (
 	SELECT
@@ -590,57 +542,9 @@ compute_usage AS (
 	 AND COALESCE(i.ended_at, LEAST(sp.calculated_at, sp.period_end)) > sp.period_start
 	GROUP BY sp.team_id
 ),
-artifact_bounds AS (
-	SELECT
-		s.id,
-		s.team_id,
-		s.snapshot_id,
-		s.template_id,
-		s.base_path,
-		s.delta_path,
-		s.destroyed_at,
-		first_interval.started_at AS billing_started_at
-	FROM selected_plans sp
-	JOIN sandbox s ON s.team_id = sp.team_id
-	LEFT JOIN LATERAL (
-		SELECT MIN(i.started_at) AS started_at
-		FROM sandbox_storage_interval i
-		WHERE i.sandbox_id = s.id
-		  AND i.team_id = s.team_id
-	) first_interval ON true
-	WHERE first_interval.started_at IS NOT NULL
-	  AND first_interval.started_at < LEAST(sp.calculated_at, sp.period_end)
-	  AND s.created_at < LEAST(sp.calculated_at, sp.period_end)
-	  AND COALESCE(s.destroyed_at, LEAST(sp.calculated_at, sp.period_end)) > sp.period_start
-),
 storage_usage AS (
-	SELECT
-		sp.team_id,
-		COALESCE(SUM(
-			EXTRACT(EPOCH FROM (
-				LEAST(COALESCE(i.ended_at, sp.calculated_at), sp.period_end)
-				- GREATEST(i.started_at, sp.period_start)
-			)) * i.disk_mib
-		), 0)::numeric + COALESCE((SELECT FLOOR(SUM(ar.artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r))))) FROM (
-			SELECT p.path,
-				MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
-				range_agg(tstzrange(GREATEST(s.billing_started_at, sp.period_start), LEAST(COALESCE(s.destroyed_at, sp.calculated_at), sp.period_end), '[)')) AS retained_ranges
-			FROM artifact_bounds s
-			LEFT JOIN template t ON t.id = s.template_id
-			CROSS JOIN LATERAL unnest(ARRAY[s.base_path, s.delta_path, CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END]) AS p(path)
-			LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
-				AND am.path = p.path
-			WHERE s.team_id = sp.team_id
-  				AND p.path IS NOT NULL
-			GROUP BY p.path
-		) ar CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)), 0) AS storage_mib_seconds
-	FROM selected_plans sp
-	LEFT JOIN sandbox_storage_interval i
-	  ON i.team_id = sp.team_id
-	 AND sp.period_start < LEAST(sp.calculated_at, sp.period_end)
-	 AND i.started_at < LEAST(sp.calculated_at, sp.period_end)
-	 AND COALESCE(i.ended_at, LEAST(sp.calculated_at, sp.period_end)) > sp.period_start
-	GROUP BY sp.team_id, sp.calculated_at, sp.period_start, sp.period_end
+ SELECT sp.team_id,storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS storage_mib_seconds
+ FROM selected_plans sp
 ),
 credits AS (
 	SELECT

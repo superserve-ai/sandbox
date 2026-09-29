@@ -274,12 +274,20 @@ func ageTeamPermEntry(s *Service, key teamPermCacheKey, expiry time.Time) {
 	s.cache.mu.Unlock()
 }
 
-func waitForCalls(t *testing.T, c *atomic.Int64, want int64) {
+func waitForTeamPermRefresh(t *testing.T, s *Service, key teamPermCacheKey) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
-	for c.Load() < want {
+	for {
+		// QueryRow increments the call count before the refresh updates the cache.
+		s.cache.mu.Lock()
+		e, exists := s.cache.m[key]
+		finished := !exists || !e.refreshing
+		s.cache.mu.Unlock()
+		if finished {
+			return
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %d calls, have %d", want, c.Load())
+			t.Fatal("timed out waiting for team permission refresh")
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
@@ -301,7 +309,10 @@ func TestCanTeamStaleServeRefreshesInBackground(t *testing.T) {
 		t.Fatalf("stale entry must be served: ok=%v err=%v", ok, err)
 	}
 	// The background refresh runs exactly one more query and re-freshens the entry.
-	waitForCalls(t, &store.calls, 2)
+	waitForTeamPermRefresh(t, s, key)
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("expected one background refresh query, got %d total calls", n)
+	}
 	s.cache.mu.Lock()
 	fresh := time.Now().Before(s.cache.m[key].expiry)
 	s.cache.mu.Unlock()
@@ -347,7 +358,10 @@ func TestCanTeamStaleDenialRefreshDropsEntry(t *testing.T) {
 	if ok, _ := s.CanTeam(context.Background(), user, team, "settings:write"); !ok {
 		t.Fatal("expected stale serve inside grace")
 	}
-	waitForCalls(t, &store.calls, 2)
+	waitForTeamPermRefresh(t, s, key)
+	if n := store.calls.Load(); n != 2 {
+		t.Fatalf("expected one background refresh query, got %d total calls", n)
+	}
 	// The refresh saw the denial and dropped the entry: no more stale serves.
 	if ok, _ := s.CanTeam(context.Background(), user, team, "settings:write"); ok {
 		t.Fatal("denial-refreshed entry must not be served")

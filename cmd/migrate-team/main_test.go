@@ -323,6 +323,20 @@ func seedFixture(t *testing.T) *fixture {
 			VALUES ($1, $2, 4096, $3)`, sb, f.team, base)
 	}
 
+	// Retained history uses cell-local IDs. Occupy a source ID at the
+	// destination with an unrelated team before copying populated history.
+	neighbor := uuid.New()
+	mustExec(t, dstPool, `INSERT INTO team(id,name) VALUES($1,'retained-neighbor')`, neighbor)
+	var localID int64
+	if err := dstPool.QueryRow(t.Context(), `INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
+ VALUES($1,$2,'sandbox',$3,'neighbor','[]',$4,$5) RETURNING id`, destHostID, neighbor, uuid.New(), base, base.Add(time.Hour)).Scan(&localID); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, srcPool, `INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, sourceHostID, f.team, base.Add(15*time.Minute))
+	mustExec(t, srcPool, `INSERT INTO retained_storage_interval(id,host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at) OVERRIDING SYSTEM VALUE
+ VALUES($1,$2,$3,'sandbox',$4,'retained','[{"device":"fs","start":0,"length":1048576}]',$5,$6)`, localID, sourceHostID, f.team, f.sb1, base.Add(15*time.Minute), base.Add(time.Hour))
+	mustExec(t, srcPool, `SELECT setval(pg_get_serial_sequence('retained_storage_interval','id'),(SELECT max(id) FROM retained_storage_interval))`)
+
 	// Billing rows with awkward numerics — the copy must not round them.
 	mustExec(t, srcPool, `
 		INSERT INTO team_billing_usage (team_id, period_start, period_end, vcpu_seconds, memory_mib_seconds, storage_mib_seconds)
@@ -470,6 +484,8 @@ func seedFixture(t *testing.T) *fixture {
 		"sandbox_active_interval":             2,
 		"sandbox_compute_billing_interval":    2,
 		"sandbox_storage_interval":            2,
+		"retained_storage_cutover":            1,
+		"retained_storage_interval":           1,
 		"team_billing_usage":                  1,
 		"team_billing_usage_hourly":           2,
 		"team_billing_period":                 1,
@@ -644,6 +660,18 @@ func TestTeamMigration(t *testing.T) {
 			if want := team == f.team; expired != want {
 				t.Errorf("dest expiration evidence for team %s: got %v, want %v", team, expired, want)
 			}
+		}
+
+		sourceUsage := scanString(t, srcPool, `SELECT storage_mib_seconds($1,'2026-07-01 10:00Z','2026-07-01 11:00Z')::text`, f.team)
+		destUsage := scanString(t, dstPool, `SELECT storage_mib_seconds($1,'2026-07-01 10:00Z','2026-07-01 11:00Z')::text`, f.team)
+		if sourceID, destID := scanString(t, srcPool, `SELECT id::text FROM retained_storage_interval WHERE team_id=$1`, f.team), scanString(t, dstPool, `SELECT id::text FROM retained_storage_interval WHERE team_id=$1`, f.team); sourceID == destID {
+			t.Fatal("retained history reused a colliding source identity")
+		}
+		if sourceUsage != destUsage {
+			t.Fatalf("retained migration usage: source=%s destination=%s", sourceUsage, destUsage)
+		}
+		if got := scanString(t, dstPool, `SELECT count(*)::text FROM retained_storage_interval WHERE generation='neighbor'`); got != "1" {
+			t.Fatal("migration overwrote another team's identity")
 		}
 
 		// The pre-existing dest profile is not clobbered; the source stays as-is.

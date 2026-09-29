@@ -1261,7 +1261,8 @@ func (m *Manager) lockSavedSnapshot(ctx context.Context, snapshotID string) (fun
 			release()
 			return nil, err
 		}
-		return func() { <-l.ch; release() }, nil
+		finishStorage := m.beginStorageMutation()
+		return func() { finishStorage(); <-l.ch; release() }, nil
 	case <-ctx.Done():
 		release()
 		return nil, ctx.Err()

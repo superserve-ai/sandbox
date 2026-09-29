@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 
 	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
@@ -34,8 +35,9 @@ var (
 )
 
 type storageReportMeasurement struct {
-	SandboxID      string `json:"sandbox_id"`
-	AllocatedBytes int64  `json:"allocated_bytes"`
+	Retained       *retainedstorage.Inventory `json:"retained,omitempty"`
+	SandboxID      string                     `json:"sandbox_id"`
+	AllocatedBytes int64                      `json:"allocated_bytes"`
 }
 
 type storageReportRequest struct {
@@ -110,6 +112,7 @@ func (h *Handlers) enqueueStorageReportWithRetry(ctx context.Context, hostID, in
 func (h *Handlers) HostStorageReport(c *gin.Context) {
 	hostID := c.Param("host_id")
 	var req storageReportRequest
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 32<<20)
 	if err := bindJSONStrict(c, &req); err != nil {
 		respondErrorMsg(c, "bad_request", "Invalid request body: "+err.Error(), http.StatusBadRequest)
 		return
@@ -130,6 +133,13 @@ func (h *Handlers) HostStorageReport(c *gin.Context) {
 	}
 	seen := make(map[uuid.UUID]struct{}, len(req.Measurements))
 	for _, m := range req.Measurements {
+		if m.Retained != nil {
+			if len(req.Measurements) != 1 || m.SandboxID != "" || m.AllocatedBytes != 0 || m.Retained.Validate() != nil {
+				respondErrorMsg(c, "bad_request", "invalid retained inventory", http.StatusBadRequest)
+				return
+			}
+			continue
+		}
 		sandboxID, err := uuid.Parse(m.SandboxID)
 		if err != nil || m.AllocatedBytes < 0 {
 			respondErrorMsg(c, "bad_request", "invalid storage measurement", http.StatusBadRequest)
@@ -516,6 +526,15 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 	ids := make([]uuid.UUID, 0, len(measurements))
 	disk := make([]int32, 0, len(measurements))
 	for _, m := range measurements {
+		if m.Retained != nil {
+			if len(measurements) != 1 || totalMeasurements != 1 || m.SandboxID != "" || m.AllocatedBytes != 0 {
+				return errStorageReportInvalidPayload
+			}
+			if err := applyRetainedStorage(ctx, tx, hostID, receivedAt, m.Retained); err != nil {
+				return err
+			}
+			continue
+		}
 		id, err := uuid.Parse(m.SandboxID)
 		if err != nil {
 			return fmt.Errorf("%w: sandbox_id %q: %v", errStorageReportInvalidPayload, m.SandboxID, err)
@@ -542,6 +561,7 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 			SELECT s.id, s.team_id, s.destroyed_at, m.disk_mib FROM measurements m
 			JOIN sandbox s ON s.id=m.sandbox_id
 			WHERE s.host_id=$3
+ AND NOT EXISTS(SELECT 1 FROM retained_storage_cutover c WHERE c.host_id=s.host_id AND c.team_id=s.team_id AND c.started_at<=$4)
 			  AND s.created_at <= $4::timestamptz
 			  -- A worker can lag sandbox destruction. Reports are eligible based
 			  -- on the sandbox lifetime at receipt, not processing time.
