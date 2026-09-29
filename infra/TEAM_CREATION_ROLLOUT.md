@@ -54,8 +54,10 @@ and a separate contract migration. This change performs no deployment or
 activation and does not remove a trigger.
 
 Publish each new public key to all receiving cells before Console signs with it.
-During rotation, retain the previous key for at least 150 seconds after the last
-old-key assertion, plus deployment propagation time. An empty/invalid key map
+During rotation, retain the previous key for at least 180 seconds after the last
+old-key assertion is signed, plus deployment propagation time. This covers
+30 seconds of future issuance skew, the 120-second assertion lifetime and
+30 seconds of expiration skew. An empty/invalid key map
 closes only this operation. Before switching callers, record each cell's API
 revision, migration versions, configured receiving region and accepted key IDs,
 then exercise legacy creation, API creation, lost-response recovery and rotation.
