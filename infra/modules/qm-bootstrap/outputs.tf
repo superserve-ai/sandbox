@@ -11,7 +11,13 @@ output "contract" {
       key   = google_tags_tag_key.protected.id
       value = google_tags_tag_value.protected.id
     }
+    # Retain the original output as a compatibility alias for infrastructure
+    # consumers; application deployment must use the keyed map below.
     workload_identity_provider = google_iam_workload_identity_pool_provider.github.name
+    workload_identity_providers = {
+      terraform     = google_iam_workload_identity_pool_provider.github.name
+      deploy_qm_api = google_iam_workload_identity_pool_provider.github_application.name
+    }
     github_environments = { for name in ["qm-infra", "qm-api-deployer", "qm-provisioner-deployer"] :
       name => "${var.project_id}-${name}"
     }

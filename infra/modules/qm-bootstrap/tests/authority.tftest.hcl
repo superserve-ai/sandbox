@@ -57,6 +57,43 @@ run "dormant_authority" {
   }
 }
 
+run "federation_workflow_identity_boundary" {
+  command = plan
+
+  override_resource {
+    target          = google_project.qm
+    override_during = plan
+    values          = { number = "123456789012" }
+  }
+
+  assert {
+    condition = (
+      google_iam_workload_identity_pool.deploy.workload_identity_pool_id == "qm-deploy" &&
+      google_iam_workload_identity_pool.application_deploy.workload_identity_pool_id == "qm-application-deploy" &&
+      google_iam_workload_identity_pool_provider.github.workload_identity_pool_id == google_iam_workload_identity_pool.deploy.workload_identity_pool_id &&
+      google_iam_workload_identity_pool_provider.github_application.workload_identity_pool_id == google_iam_workload_identity_pool.application_deploy.workload_identity_pool_id
+    )
+    error_message = "Infrastructure and application workflows must use separate workload identity pools."
+  }
+  assert {
+    condition = (
+      strcontains(google_iam_workload_identity_pool_provider.github.attribute_condition, "workflow_ref == 'example-team/example-repo/.github/workflows/terraform-cd.yml@refs/heads/main'") &&
+      !strcontains(google_iam_workload_identity_pool_provider.github.attribute_condition, "deploy-qm-api.yml") &&
+      strcontains(google_iam_workload_identity_pool_provider.github_application.attribute_condition, "workflow_ref == 'example-team/example-repo/.github/workflows/deploy-qm-api.yml@refs/heads/main'") &&
+      !strcontains(google_iam_workload_identity_pool_provider.github_application.attribute_condition, "terraform-cd.yml")
+    )
+    error_message = "Each WIF provider must admit only its intended GitHub workflow."
+  }
+  assert {
+    condition = (
+      google_service_account_iam_member.federation["qm-infra"].member == "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/qm-deploy/subject/repo:example-team/example-repo:environment:example-qm-dev-qm-infra" &&
+      google_service_account_iam_member.federation["qm-api-deployer"].member == "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/qm-application-deploy/subject/repo:example-team/example-repo:environment:example-qm-dev-qm-api-deployer" &&
+      google_service_account_iam_member.federation["qm-provisioner-deployer"].member == "principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/qm-application-deploy/subject/repo:example-team/example-repo:environment:example-qm-dev-qm-provisioner-deployer"
+    )
+    error_message = "Each deploy identity must bind to the pool for its intended workflow."
+  }
+}
+
 run "activation_requires_platform_services" {
   command = plan
   variables {

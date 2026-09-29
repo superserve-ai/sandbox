@@ -169,11 +169,17 @@ in staging using Google's [Direct VPC guidance](https://cloud.google.com/run/doc
 ## Consumer contract and readiness
 
 `bootstrap.contract` publishes version 1, paired project IDs/numbers, regions,
-identity emails, protected tag IDs, WIF provider, GitHub environment names,
-state location, registry readers and image format, platform secret IDs, and
-regional service names. `network.contract[region]` publishes VPC/subnet IDs,
+identity emails, protected tag IDs, workflow-specific WIF providers, GitHub
+environment names, state location, registry readers and image format, platform
+secret IDs, and regional service names. `network.contract[region]` publishes
+VPC/subnet IDs,
 ALL_TRAFFIC egress, capacity budget, cell tags/endpoints/ports/firewall IDs, and
 control denial CIDRs. No secret value is an output.
+
+The provider map keys are `terraform` and `deploy_qm_api`; use the key matching
+the workflow rather than reusing one provider for both release classes. The
+legacy `workload_identity_provider` field remains an infrastructure-provider
+alias for compatibility and must not be used by application deployment.
 
 Platform services are contract-only here: regional Cloud Run services `qm-api`
 and `qm-provisioner`, separate identities, immutable `@sha256:` images from the
@@ -184,14 +190,15 @@ Platform service Terraform owns configuration; subsequent image deployment must
 have one owner (for example Terraform ignores image changes owned by the release
 job). Provisioner and API deployments require their own protected environments.
 
-The WIF provider requires the numeric GitHub repository/owner IDs, `main`, and
-either `terraform-cd.yml` or `deploy-qm-api.yml` under `.github/workflows/` at
-`refs/heads/main`. Each identity also requires
-its exact output GitHub environment subject. Packet 2 consumes these exact
-workflow/identity/environment bindings for infrastructure and code-only releases;
-it cannot silently widen the provider condition. Routine jobs never authenticate
-as bootstrap. Pending/unconfigured deployment must report disabled/pending,
-not successful. Required gates are: bootstrap applied and audited, regional
+The WIF providers require the numeric GitHub repository/owner IDs and `main`.
+The `terraform` provider accepts only `terraform-cd.yml`; the `deploy_qm_api`
+provider accepts only `deploy-qm-api.yml`. Each identity also requires its
+exact output GitHub environment subject, and the IAM binding uses the matching
+workflow-specific pool. Packet 2 consumes these exact workflow/identity/environment
+bindings for infrastructure and code-only releases; it cannot silently widen a
+provider condition. Routine jobs never authenticate as bootstrap.
+Pending/unconfigured deployment must report disabled/pending, not successful.
+Required gates are: bootstrap applied and audited, regional
 networks and DB/edge dependencies ready, platform secret versions populated,
 immutable images available, registry pull grants verified, platform service
 shells created, then protective tags applied and verified. Only then may
