@@ -24,7 +24,7 @@ func TestIntegration_ActivationRevocationRedemptionGuardsUpgrade(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := strings.Index(string(previous), "CREATE FUNCTION stripe_promotion_eligible(")
-	end := strings.Index(string(previous), "CREATE OR REPLACE FUNCTION reserve_stripe_promotion_for_event_state(")
+	end := strings.Index(string(previous), "CREATE OR REPLACE FUNCTION reserve_stripe_promotion(p_team_id")
 	if start < 0 || end <= start {
 		t.Fatal("prior promotion function definitions not found")
 	}
@@ -55,9 +55,20 @@ func TestIntegration_ActivationRevocationRedemptionGuardsUpgrade(t *testing.T) {
 	if err := tx.QueryRow(ctx, `SELECT stripe_promotion_eligible($1,$2)`, teamID, userID).Scan(&eligible); err != nil || eligible {
 		t.Fatalf("upgraded eligibility: eligible=%v err=%v", eligible, err)
 	}
-	for _, eventID := range []string{"evt_reversed", "evt_replacement"} {
-		if err := tx.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, teamID, userID, eventID).Scan(&state); err != nil || state != "ineligible" {
-			t.Fatalf("upgraded reserve: %s %v", state, err)
+	for _, stage := range []string{"revocation", "device reconciliation"} {
+		if stage == "device reconciliation" {
+			migration, err := os.ReadFile("../../supabase/migrations/20260929050036_reconcile_stripe_device_reservation_guards.sql")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(ctx, string(migration)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, eventID := range []string{"evt_reversed", "evt_replacement"} {
+			if err := tx.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, teamID, userID, eventID).Scan(&state); err != nil || state != "ineligible" {
+				t.Fatalf("%s reserve: %s %v", stage, state, err)
+			}
 		}
 	}
 	var pending bool

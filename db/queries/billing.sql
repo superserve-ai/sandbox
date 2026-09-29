@@ -1629,4 +1629,3 @@ FROM account a
 WHERE r.team_id = a.team_id AND r.stripe_customer_id = sqlc.arg(customer_id)
   AND (r.stripe_grant_id IS NULL OR r.stripe_grant_id = sqlc.arg(grant_id))
 RETURNING r.team_id;
-

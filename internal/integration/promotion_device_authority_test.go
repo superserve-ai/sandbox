@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -459,6 +460,107 @@ func promotionOverlappingClaim(t *testing.T, ctx context.Context, region *pgxpoo
 	return result
 }
 
+func TestIntegration_PromotionGrantFunctionPrivileges(t *testing.T) {
+	ctx := context.Background()
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	rolloutExec(t, tx, `DO $$ DECLARE r text; BEGIN
+		FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r) THEN
+				EXECUTE format('CREATE ROLE %I NOLOGIN', r);
+			END IF;
+		END LOOP;
+	END $$;
+	ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO anon,authenticated`)
+	migration, err := os.ReadFile("../../supabase/migrations/20260929050028_enforce_promotion_device_grants.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		function, previous, start, end, revoke string
+	}{
+		{
+			"public.claim_team_signup_trial_with_device(uuid,uuid)",
+			"claim_team_signup_trial_with_device_acl_test_previous",
+			"CREATE OR REPLACE FUNCTION claim_team_signup_trial_with_device(p_team_id",
+			"CREATE OR REPLACE FUNCTION claim_team_signup_trial(p_team_id",
+			"REVOKE ALL ON FUNCTION claim_team_signup_trial_with_device(uuid,uuid) FROM PUBLIC;",
+		},
+		{
+			"public.claim_team_signup_trial(uuid,uuid)",
+			"claim_team_signup_trial_acl_test_previous",
+			"CREATE OR REPLACE FUNCTION claim_team_signup_trial(p_team_id",
+			"CREATE OR REPLACE FUNCTION create_team_with_signup_trial(",
+			"REVOKE ALL ON FUNCTION claim_team_signup_trial(uuid,uuid) FROM PUBLIC;",
+		},
+		{
+			"public.reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean)",
+			"reserve_stripe_promotion_with_device_acl_test_previous",
+			"CREATE OR REPLACE FUNCTION reserve_stripe_promotion_with_device(p_team_id",
+			"CREATE OR REPLACE FUNCTION reserve_stripe_promotion_for_subscription_event_state(\n",
+			"REVOKE ALL ON FUNCTION reserve_stripe_promotion_with_device(uuid,uuid,text,text,timestamptz,boolean) FROM PUBLIC;",
+		},
+		{
+			"public.reserve_stripe_promotion_for_subscription_event_state(uuid,uuid,text,text,timestamptz,boolean)",
+			"reserve_stripe_promotion_for_subscription_event_state_acl_test_previous",
+			"CREATE OR REPLACE FUNCTION reserve_stripe_promotion_for_subscription_event_state(\n",
+			"CREATE OR REPLACE FUNCTION finalize_stripe_promotion(",
+			"REVOKE ALL ON FUNCTION reserve_stripe_promotion_for_subscription_event_state(uuid,uuid,text,text,timestamptz,boolean) FROM PUBLIC;",
+		},
+	} {
+		start := strings.Index(string(migration), tc.start)
+		end := strings.Index(string(migration), tc.end)
+		if start < 0 || end <= start {
+			t.Fatalf("function migration segment missing: %s", tc.function)
+		}
+		segment := string(migration[start:end])
+		revoke := strings.Index(segment, tc.revoke)
+		if revoke < 0 {
+			t.Fatalf("function revocation missing: %s", tc.function)
+		}
+		rolloutExec(t, tx, "ALTER FUNCTION "+tc.function+" RENAME TO "+tc.previous)
+		rolloutExec(t, tx, segment[:revoke])
+		for _, role := range []string{"anon", "authenticated"} {
+			var directlyGranted bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (
+				SELECT 1 FROM pg_proc p,
+				LATERAL aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) privilege
+				WHERE p.oid = $1::regprocedure AND privilege.grantee = $2::regrole
+					AND privilege.privilege_type = 'EXECUTE'
+			)`, tc.function, role).Scan(&directlyGranted); err != nil {
+				t.Fatal(err)
+			}
+			if !directlyGranted {
+				t.Fatalf("default privileges did not grant %s execute on %s", role, tc.function)
+			}
+		}
+		rolloutExec(t, tx, segment[revoke:])
+		var publicExecute bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1 FROM pg_proc p,
+			LATERAL aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) privilege
+			WHERE p.oid = $1::regprocedure AND privilege.grantee = 0 AND privilege.privilege_type = 'EXECUTE'
+		)`, tc.function).Scan(&publicExecute); err != nil {
+			t.Fatal(err)
+		}
+		if publicExecute {
+			t.Errorf("PUBLIC can invoke promotion grant function %s", tc.function)
+		}
+		for _, role := range []string{"anon", "authenticated", "service_role"} {
+			var executable bool
+			if err := tx.QueryRow(ctx, `SELECT has_function_privilege($1, $2, 'EXECUTE')`, role, tc.function).Scan(&executable); err != nil {
+				t.Fatal(err)
+			}
+			if executable != (role == "service_role") {
+				t.Errorf("%s execute on %s = %t", role, tc.function, executable)
+			}
+		}
+	}
+}
+
 func TestIntegration_PromotionDeviceFirstRegionalOwner(t *testing.T) {
 	ctx := context.Background()
 	first, second := uuid.New(), uuid.New()
@@ -623,7 +725,11 @@ func TestIntegration_PromotionDeviceGateMatrix(t *testing.T) {
 					}
 					for retry := 0; retry < 2; retry++ {
 						if invalid {
-							localIdentityError(t, tx, "55000", `SELECT * FROM claim_team_signup_trial_with_device($1,$2)`, team, user)
+							var outcome, reason string
+							if err := tx.QueryRow(ctx, `SELECT outcome,reason FROM claim_team_signup_trial_with_device($1,$2)`,
+								team, user).Scan(&outcome, &reason); err != nil || outcome != "promotion_ineligible" || reason != "authority_unavailable" {
+								t.Fatalf("invalid-policy signup = %q %q: %v", outcome, reason, err)
+							}
 							localIdentityError(t, tx, "55000", `SELECT reserve_stripe_promotion_with_device($1,$2,$3,NULL,NULL,false)`, team, user, event)
 						} else {
 							wantOutcome, wantReason, wantReservation := "promotion_ineligible", actor.decision, actor.decision
@@ -745,6 +851,7 @@ func TestIntegration_PromotionDeviceGateFailuresDoNotConsumeCredit(t *testing.T)
 			user, team := uuid.New(), uuid.New()
 			rolloutExec(t, tx, `INSERT INTO profile(id,email) VALUES($1,$2)`, user, user.String()+"@example.com")
 			rolloutExec(t, tx, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "gate-"+team.String())
+			rolloutExec(t, tx, `INSERT INTO team_signup_trial_provenance(team_id) VALUES($1) ON CONFLICT DO NOTHING`, team)
 			rolloutExec(t, tx, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team)
 			assertUnchanged(t, tx, user, team, false)
 			switch tc.failure {
@@ -762,11 +869,19 @@ func TestIntegration_PromotionDeviceGateFailuresDoNotConsumeCredit(t *testing.T)
 				rolloutExec(t, tx, `DELETE FROM promotion_identity_enforcement WHERE singleton`)
 				rolloutExec(t, tx, `ALTER TABLE promotion_identity_enforcement ENABLE TRIGGER promotion_identity_enforcement_irreversible`)
 			}
-			localIdentityError(t, tx, tc.sqlState, `SELECT * FROM claim_team_signup_trial_with_device($1,$2)`, team, user)
-			assertUnchanged(t, tx, user, team, false)
 			localIdentityError(t, tx, tc.sqlState, `SELECT reserve_stripe_promotion_with_device($1,$2,$3,NULL,NULL,false)`,
 				team, user, "evt-"+uuid.NewString())
 			assertUnchanged(t, tx, user, team, false)
+			var outcome, reason string
+			if err := tx.QueryRow(ctx, `SELECT * FROM claim_team_signup_trial_with_device($1,$2)`, team, user).
+				Scan(&outcome, &reason); err != nil || outcome != "promotion_ineligible" || reason != "authority_unavailable" {
+				t.Fatalf("authority failure result = %q/%q: %v", outcome, reason, err)
+			}
+			assertUnchanged(t, tx, user, team, true)
+			if err := tx.QueryRow(ctx, `SELECT * FROM claim_team_signup_trial($1,$2)`, team, user).
+				Scan(&outcome, &reason); err != nil || outcome != "promotion_ineligible" || reason != "authority_unavailable" {
+				t.Fatalf("authority failure replay = %q/%q: %v", outcome, reason, err)
+			}
 		})
 	}
 	for _, tc := range []struct {

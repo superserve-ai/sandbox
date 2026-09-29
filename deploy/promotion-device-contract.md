@@ -3,8 +3,9 @@
 This is an additive server contract. Regional device enforcement ships off. The
 existing canonical identity rollout and Stripe reservation requirements in
 [promotion identity authority](promotion-identity-authority.md) still apply.
-This change does not switch the live grant callers; the Console producer and
-subsequent grant integration must use the operations below before activation.
+The grant integration routes the existing signup and Stripe writers through
+the regional device authority. Keep the policy off until the selected region's
+Console producer and all grant paths are ready.
 
 ## Original evidence source
 
@@ -14,8 +15,8 @@ The shared Auth PostgreSQL project owns `signup_device_attempt` and
 separately from each regional migration chain. The immutability script revokes
 Supabase's direct application-role table grants and guards accepted facts.
 This store is server only, independent of East or West promotion databases.
-Verified attempts
-and account bindings are retained indefinitely, including after account deletion;
+Verified attempts and account bindings are retained indefinitely, including after
+account deletion;
 unverified attempts may be purged only after their verification window closes.
 Database backups and migration rollback protection must retain the tables.
 
@@ -47,10 +48,11 @@ malformed or non-Ed25519 private keys withhold account requests before transport
 
 The adapter signs an EdDSA JWT with `iss: promotion-auth-adapter`,
 `aud: promotion-account`, `sub: <Auth user UUID>`, `iat`, `exp`, and
-`operation: bind|evidence|register`. Both times are required, expiry must be
+`operation: bind|evidence|register|signup-eligibility|create-team`. Both times are required, expiry must be
 later than issue time and at most five minutes after it, and future-issued or
 expired assertions reject. For `bind`, also sign `attempt_id` from the
-server-owned signup flow; for the other operations omit it. The control plane
+server-owned signup flow; `create-team` uses the separate creation binding
+described below. For evidence, registration and eligibility snapshots omit it. The control plane
 verifies the signature, issuer, audience, time bounds, operation and exact
 subject/body match, plus the attempt/body match for binding, before database
 access. `X-Actor-User-Id` is required and must equal that verified subject and
@@ -140,6 +142,16 @@ and account tokens different from each other and from `INTERNAL_API_TOKEN`; a
 missing or reused token rejects producer requests. A missing shared Auth
 connection or failed RPC returns `authority_unavailable` and withholds credit.
 
+In production, Terraform also writes the resolved switch to the Cloud Run
+template as `PROMOTION_EVIDENCE_ENABLED`. Both API deployment workflows read
+this explicit value when checking the deployed template: `true` requires all
+four cell-specific secret mappings; `false` permits their omission. Operator
+identity and token checks always apply, and any present promotion mappings must
+still reference the correct cell secrets. Missing or malformed rollout state
+blocks deployment until Terraform is applied; missing secrets never imply a
+disabled rollout. This template value is deployment metadata, not a device
+policy gate.
+
 Before enabling device enforcement in either production region, verify that
 each cell's serving revision has all four secret-backed environment variables,
 that both scoped credentials work only on their own routes, account assertions
@@ -163,6 +175,8 @@ registration request cannot provide a new event or Fingerprint. Requests are
 limited to 4 KiB and database work to three seconds; SQL errors are not
 interpreted as eligibility. Invoke the register route on the selected regional
 control plane before the grant decision, including delayed West entry.
+
+The control-plane routes above invoke the following shared Auth operations:
 
 1. `create_signup_device_attempt()` before Fingerprint capture. It returns an
    unpredictable attempt UUID and challenge UUID. Only the challenge is sent to
@@ -237,11 +251,42 @@ reservation replays through the original reservation function without applying
 a newly changed policy. `device_reservation_pending` withholds a new reservation
 while another account's grant on the same device remains unresolved. The reservation
 pins the original Fingerprint in the regional entitlement row; release
-allows a later retry. The later grant integration must record actual Stripe
-issuance in `promotion_device_grant` in the same regional finalization transaction
-by calling `record_stripe_promotion_device_grant(team_id, user_id)` and retain
+allows a later retry. Finalization records actual Stripe issuance in
+`promotion_device_grant` in the same regional transaction by calling
+`record_stripe_promotion_device_grant(team_id, user_id)` and retains
 the existing actor, evidence and checkout-generation pins. It must
 not contact Stripe before a durable reservation or release an uncertain attempt.
+
+The existing `claim_team_signup_trial` entry point now routes through the device
+claim. Explicit team creation and legacy completion triggers use the same
+decision. A promotion authority error completes an initial claim with
+`promotion_ineligible` and `authority_unavailable` without awarding credit or
+aborting team creation. Existing Stripe reservation signatures also route
+through the device reservation before external credit. A promotion authority
+error skips the credit while paid activation continues. Finalization records
+the device grant with the settled Stripe grant in one regional transaction.
+Recoverable or uncertain external attempts retain their reservation.
+An ambiguous database transport failure during reservation is retried because
+its commit state cannot be inferred from the lost response.
+For a completed paid activation with a promotion reservation denial, the webhook writes
+`stripe_promotion_outcome` in the same transaction as activation and webhook
+completion. The row is keyed by Stripe event ID and contains the team, actor,
+`promotion_ineligible`, and a safe reason: `ineligible`, `user_already_redeemed`, `owner_conflict`,
+`device_already_redeemed`, `evidence_missing`, `device_reservation_pending`, or
+`authority_unavailable`. A contended `blocked` reservation retries the webhook
+and has no completed outcome. `user_already_redeemed` comes from the atomic
+reservation check of the actor's settled entitlement. Missing canonical evidence
+and migration fences remain `ineligible`; they do not confirm prior redemption.
+
+`POST /internal/promotion/account/signup-eligibility` accepts `user_id` under
+the account credential and matching `X-Actor-User-Id` header. Call it in East
+after trusted account binding and regional registration, before the original
+signup notification. It returns `ownership` (`owner`, `another_owner`, or
+`evidence_missing`), a policy-aware `device_decision`, and `eligibility` with
+a safe `reason`. `eligibility=unknown` covers pending team checks and unresolved
+canonical evidence, including pre-confirmation identity. This snapshot creates
+no grant, claim, or reservation. The $5 claim rechecks authority atomically.
+The response contains no Fingerprint or other account identifier.
 
 The `promotion_device_policy` row starts with D=off and E=off. The canonical C
 gate remains the existing `promotion_identity_enforcement` authority. A
@@ -253,7 +298,110 @@ creates no owner. Policy changes never delete ownership, grants or pending
 reservations. Existing balances, claims and reservations are untouched, with
 no historical device reconstruction or cross-region financial reconciliation.
 
-Deploy the shared source, then both regional schemas, then the Console producer,
-then grant path integration. Verify initial East publication and later West
-publication independently. Keep enforcement off until canonical readiness,
-producer coverage, and both regional deployments have been verified.
+Deploy the shared source and each regional schema before its Console producer
+and grant path integration. Verify initial East publication and later West
+publication independently. Keep enforcement off in a region until its canonical
+readiness, producer coverage, and every local grant writer have been verified.
+
+## Atomic team creation after registration failure
+
+`POST /internal/promotion/account/create-team` is the trusted Console boundary
+for initial regional team creation. Call it after the registration attempt,
+including when registration or its authority evaluation fails. Do not create the
+team through a separate insert in that failure case: previously accepted regional
+evidence could otherwise authorize a grant.
+
+The route requires the account bearer credential, matching `X-Actor-User-Id`,
+and an EdDSA account assertion as specified above, with `operation=create-team`.
+In addition to `sub`, sign `attempt_id`, `team_id`, `home_region`, and the required
+boolean `authority_unavailable`. The selected backend verifies every signed field
+against the request and requires `home_region` to equal its `SANDBOX_ID_REGION`,
+with the existing East (`use`) default where tagged sandbox IDs are not enabled.
+Production home regions are `use` and `usw`. `attempt_id` is a new server-generated creation attempt UUID,
+separate from the original signup-evidence attempt; `team_id` is a new
+server-generated team UUID. Neither UUID can be repurposed after acceptance.
+
+Request body:
+
+```json
+{
+  "user_id": "<verified Auth user UUID>",
+  "attempt_id": "<server-generated creation attempt UUID>",
+  "team_id": "<server-generated team UUID>",
+  "name": "example-team",
+  "home_region": "use",
+  "authority_unavailable": true
+}
+```
+
+Console derives the actor from its trusted signup result or verified login,
+retains the attempt and team IDs across retries, and derives the boolean only
+from its server-side registration/authority result. Never accept a browser
+eligibility flag or forward browser promotion credentials. Sign `true` for an
+unavailable or ambiguous authority result, even if a previous registration
+succeeded. Missing evidence alone follows the evidence-required policy; confirmed
+ownership denial follows the ordinary regional claim checks. Sign `false` after
+successful registration, including `owner_conflict`; the claim still checks all
+canonical, user, team and device rules. The signed boolean can only withhold
+credit; `false` never authorizes a grant by itself.
+
+The backend calls the service-role-only SQL function:
+
+```sql
+create_team_with_promotion_attempt(
+  p_attempt_id uuid, p_team_id uuid, p_user_id uuid,
+  p_name text, p_home_region text, p_authority_unavailable boolean
+) RETURNS TABLE(team_id uuid, outcome text, reason text)
+```
+
+The binding, team insert, existing signup claim, and result commit in one regional
+transaction. A signed unavailable decision records `promotion_ineligible` /
+`authority_unavailable` before saved evidence can grant credit. It consumes no
+user, canonical or device entitlement. Success returns HTTP 200 with `team_id`,
+`outcome`, and `reason`; Console then continues its existing membership/owner
+provisioning using that team ID. This endpoint does not grant membership, bypass
+independent signup restrictions, or activate billing.
+
+Exact retries return the original result, including the original `granted`
+outcome, without another grant. Renew an expired assertion with the same binding
+and boolean. A changed actor, team, attempt, region, name or decision is rejected;
+a new attempt cannot adopt an existing team. Bindings and results have no expiry
+and survive account/team deletion; replay never recreates a deleted team. A
+previously unavailable attempt stays at zero credit after authority recovers.
+Unrelated database/provisioning failures abort the transaction and retain normal
+retry behavior; a lost response requires retrying the exact request. Do not
+switch to an ordinary team insert or generate a replacement attempt on error.
+
+`signup-eligibility` also requires a signed account assertion, with that exact
+operation and no attempt ID. It remains a non-issuing snapshot and does not
+replace the atomic creation boundary.
+
+### Integration reference and validation handoff
+
+The authentication and migration prerequisite consumed locally is
+`cc02819176cbd22941303d3a5a2520caea113805` from public PR #579, based on
+`c3b138e85abd6b26fab9e441d1de31b5fe6072d5`. Its promotion changes are integrated
+as a local content delta from the previously consumed revision, preserving the
+enforcement changes; the historical and squashed series are not both merged.
+The regional migration names follow that revision; the grant integration migrations follow the entire
+prerequisite chain. Do not apply both the superseded migration IDs and their
+renamed replacements. This is a pre-activation integration, not a deployed
+migration-history repair.
+
+The creation regression is `TestIntegration_TrustedTeamPromotionAttempt`, covering
+prior regional evidence plus a failed registration HTTP call, exact no-credit
+replay after registration recovers, successful registration/grant, forged or
+mismatched inputs, and retained results after team/account deletion.
+`TestPromotionAccountAssertions` covers signed creation bindings and rejects
+missing, expired, forged, or mismatched assertions before database access.
+`TestIntegration_PromotionPolicyContentionPreservesProvisioning` holds a real
+policy-row lock across explicit team creation and legacy owner assignment.
+`TestIntegration_TrustedTeamPromotionAttemptPrivilegesAndGrantFailure` checks
+RPC/table access and preservation of unrelated grant-error retries.
+
+Run these tests against the resulting backend revision before rollout. The
+existing Console fixture covers bind/evidence/register only; its pass does not
+prove the creation boundary works end to end. Console must also implement and
+verify the creation call sequence and signed fields above, including failure
+with prior evidence and replay after authority recovers. Enforcement stays off
+until that selected region's consumer and backend validation are recorded.

@@ -1104,6 +1104,15 @@ type StripePromotionMigrationFence struct {
 	FencedAt time.Time `json:"fenced_at"`
 }
 
+type StripePromotionOutcome struct {
+	EventID   string    `json:"event_id"`
+	TeamID    uuid.UUID `json:"team_id"`
+	UserID    uuid.UUID `json:"user_id"`
+	Outcome   string    `json:"outcome"`
+	Reason    string    `json:"reason"`
+	DecidedAt time.Time `json:"decided_at"`
+}
+
 type StripeWebhookEvent struct {
 	EventID     string             `json:"event_id"`
 	EventType   string             `json:"event_type"`
@@ -1278,6 +1287,18 @@ type TeamPricingPlan struct {
 	EffectiveTo   pgtype.Timestamptz `json:"effective_to"`
 	AssignedBy    pgtype.UUID        `json:"assigned_by"`
 	CreatedAt     time.Time          `json:"created_at"`
+}
+
+type TeamPromotionCreationAttempt struct {
+	AttemptID            uuid.UUID `json:"attempt_id"`
+	TeamID               uuid.UUID `json:"team_id"`
+	UserID               uuid.UUID `json:"user_id"`
+	Name                 string    `json:"name"`
+	HomeRegion           string    `json:"home_region"`
+	AuthorityUnavailable bool      `json:"authority_unavailable"`
+	Outcome              *string   `json:"outcome"`
+	Reason               *string   `json:"reason"`
+	CreatedAt            time.Time `json:"created_at"`
 }
 
 type TeamSandboxCounter struct {
