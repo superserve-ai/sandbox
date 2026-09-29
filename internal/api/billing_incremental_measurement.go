@@ -172,8 +172,10 @@ func (h *Handlers) consumeExportMeasurement(ctx context.Context, team uuid.UUID,
 	}
 	var end time.Time
 	var cpu, memory, storage pgtype.Numeric
-	err = tx.QueryRow(ctx, `SELECT hour_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds
-        FROM team_billing_usage_hourly WHERE team_id=$1 AND hour_start=$2`, team, hour).Scan(&end, &cpu, &memory, &storage)
+	var effective pgtype.Timestamptz
+	err = tx.QueryRow(ctx, `SELECT hour_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds,
+        (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)
+        FROM team_billing_usage_hourly WHERE team_id=$1 AND hour_start=$2`, team, hour).Scan(&end, &cpu, &memory, &storage, &effective)
 	if err != nil {
 		return false, err
 	}
@@ -196,28 +198,14 @@ func (h *Handlers) consumeExportMeasurement(ctx context.Context, team uuid.UUID,
 			until = periodEnd
 		}
 		c, m, s := cpu, memory, storage
-		if at.After(hour) || until.Before(end) {
-			enabled, err := h.billingStorageBillingEnabled(ctx, team)
-			if err != nil {
+		if at.After(hour) || until.Before(end) || effective.Valid && effective.Time.After(at) && effective.Time.Before(until) {
+			if err = tx.QueryRow(ctx, billingBoundaryUsageSQL, team, at, until).Scan(&c, &m, &s); err != nil {
 				return false, err
 			}
-
-			err = tx.QueryRow(ctx, `SELECT COALESCE(sum(EXTRACT(epoch FROM(least(COALESCE(ended_at,$3),$3)-greatest(started_at,$2)))*vcpu_count),0)::numeric,
-                COALESCE(sum(EXTRACT(epoch FROM(least(COALESCE(ended_at,$3),$3)-greatest(started_at,$2)))*memory_mib),0)::numeric
-                FROM sandbox_compute_billing_interval WHERE team_id=$1 AND started_at<$3 AND COALESCE(ended_at,$3)>$2`, team, at, until).Scan(&c, &m)
-			if err != nil {
-				return false, err
-			}
+		} else if !effective.Valid || !effective.Time.Before(until) {
 			_ = s.Scan("0")
-			if enabled {
-				if err = tx.QueryRow(ctx, billingBoundaryUsageSQL, team, at, until).Scan(&c, &m, &s); err != nil {
-					return false, err
-				}
-			} else {
-				// Keep omitted boundary storage discoverable when billing is enabled.
-				_ = storageSnapshot.Scan("0")
-			}
 		}
+
 		q := h.DB.WithTx(tx)
 		_, err = q.GetTeamBillingPeriodForUpdate(ctx, db.GetTeamBillingPeriodForUpdateParams{TeamID: team, PeriodStart: start, PeriodEnd: periodEnd})
 		if err == pgx.ErrNoRows {
@@ -233,6 +221,13 @@ func (h *Handlers) consumeExportMeasurement(ctx context.Context, team uuid.UUID,
 			return false, err
 		}
 		if immutable {
+			// Mutable caches are clipped by their trigger. Frozen caches bypass it,
+			// so compare exact storage here instead of the floored hourly rollup.
+			if effective.Valid && effective.Time.Before(until) {
+				if err = tx.QueryRow(ctx, `SELECT billable_storage_mib_seconds($1,$2,$3)`, team, at, until).Scan(&s); err != nil {
+					return false, err
+				}
+			}
 			// Hourly totals may lag the authoritative close snapshot. Compare the
 			// next measured total, preserving downward revisions as review evidence.
 			_, err = tx.Exec(ctx, `INSERT INTO billing_period_anomaly(team_id,period_start,period_end,severity,kind,details)

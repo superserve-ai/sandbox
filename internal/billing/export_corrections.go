@@ -104,7 +104,8 @@ func measureCorrection(ctx context.Context, tx pgx.Tx, p ExportPeriod, resource 
 	}
 	c.Baseline = c.Measured
 	if c.Frozen {
-		err = tx.QueryRow(ctx, `SELECT vcpu_seconds,memory_mib_seconds,storage_mib_seconds FROM team_billing_usage
+		err = tx.QueryRow(ctx, `SELECT vcpu_seconds,memory_mib_seconds,
+            CASE WHEN storage_billing_activated($1,$3) THEN storage_mib_seconds ELSE 0 END FROM team_billing_usage
             WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End).Scan(&cpu, &memory, &storage)
 		if err != nil {
 			return c, err
@@ -223,7 +224,7 @@ func (s ExportStore) ApplyCorrection(ctx context.Context, id uuid.UUID, actor uu
 		}
 	}
 	var enabled bool
-	err = tx.QueryRow(ctx, `SELECT feature_enabled('billing_export_enabled',$1) AND ($2<>'storage' OR feature_enabled('billing_storage_billing_enabled',$1))`, c.TeamID, c.Resource).Scan(&enabled)
+	err = tx.QueryRow(ctx, `SELECT feature_enabled('billing_export_enabled',$1) AND ($2<>'storage' OR storage_billing_activated($1,$3))`, c.TeamID, c.Resource, c.End).Scan(&enabled)
 	if err != nil {
 		return err
 	}
@@ -291,7 +292,7 @@ func (s ExportStore) ApplyCorrection(ctx context.Context, id uuid.UUID, actor uu
         WHERE a.team_id=$1 AND a.period_start=$2 AND a.period_end=$3 AND a.resolved_at IS NULL
         AND a.kind='usage_after_export_freeze' AND a.detected_at<=now()
         AND NOT EXISTS(SELECT 1 FROM unnest(ARRAY['cpu','memory','storage']) AS r(resource)
-            WHERE (r.resource<>'storage' OR feature_enabled('billing_storage_billing_enabled',$1))
+            WHERE (r.resource<>'storage' OR storage_billing_activated($1,$3))
             AND NOT EXISTS(SELECT 1 FROM billing_export_correction c WHERE c.team_id=a.team_id AND c.period_start=a.period_start
                 AND c.period_end=a.period_end AND c.resource_type=r.resource AND c.applied_at IS NOT NULL
                 AND c.created_at>=a.detected_at))`, c.TeamID, c.Start, c.End, actor)

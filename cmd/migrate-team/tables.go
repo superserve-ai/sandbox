@@ -75,6 +75,10 @@ var migratedTables = []tableSpec{
 	{"team", "id = $1"},
 	{"team_feature_flag", "team_id = $1"},
 	{"team_billing_account", "team_id = $1"},
+	// The cutoff is the authoritative, immutable activation boundary. It must
+	// move with the team so a cell migration cannot silently re-enable storage
+	// at a later timestamp.
+	{"team_storage_billing_activation", "team_id = $1"},
 	{"stripe_checkout_expiration_evidence", "team_id = $1"},
 	{"team_trial_eligibility_cache", "team_id = $1"},
 	{"team_member", "team_id = $1"},
