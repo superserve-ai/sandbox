@@ -916,7 +916,22 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 		return result, err
 	}
 	if closing {
-		if _, err = h.DB.MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{TeamID: p.TeamID, PeriodStart: p.Start, PeriodEnd: p.End}); err != nil {
+		mapping, err := billing.RevalidateMeterCloseMapping(ctx, h.Pool, p, h.ResolveActiveBillingMeter)
+		if err != nil {
+			return result, err
+		}
+		tx, err := h.Pool.Begin(ctx)
+		if err != nil {
+			return result, err
+		}
+		defer tx.Rollback(ctx)
+		if err := mapping.Bind(ctx, tx); err != nil {
+			return result, err
+		}
+		if _, err = h.DB.WithTx(tx).MarkTeamBillingPeriodExported(ctx, db.MarkTeamBillingPeriodExportedParams{TeamID: p.TeamID, PeriodStart: p.Start, PeriodEnd: p.End}); err != nil {
+			return result, err
+		}
+		if err := tx.Commit(ctx); err != nil {
 			return result, err
 		}
 		result.Status = "exported"

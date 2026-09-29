@@ -389,12 +389,7 @@ func TestMeterGrowingRepeatedDrift(t *testing.T) {
 					}
 				}
 				drift := big.NewRat(steps, 1_000_000_000_000)
-				if shape == "increasing" && i == 512 {
-					// A growing residual eventually leaves the documented one-ULP
-					// domain; do not let the repeated-export test stop below the
-					// rejection boundary.
-					drift = new(big.Rat).Mul(bound, big.NewRat(2, 1))
-				}
+
 				provider := new(big.Rat).Add(total, drift)
 				for read := 0; read < 2; read++ {
 					buckets := []meterUsageBucket{{Start: start, End: start.Add(24 * time.Hour), Quantity: total.FloatString(12)}}
@@ -536,11 +531,16 @@ func TestIncrementalDecisionPinsMeterAcrossProviderReads(t *testing.T) {
 	if lookups != 1 || summaries != 4 {
 		t.Fatal("changed event name reached the provider")
 	}
+	// Finalization resolves the active mapping independently of this decision.
+	h := &Handlers{Stripe: client}
+	if current, err := h.ResolveActiveBillingMeter(t.Context(), "cpu_hours"); err != nil || current != "mtr_replacement" || meterReaderID(reader) != "mtr_original" {
+		t.Fatalf("current mapping reused pinned identity: %q %v", current, err)
+	}
 	// A new decision resolves the current mapping; pinning is not a global cache.
 	if _, err := pinMeterSummaryReader(client).CountedMeterUsage(t.Context(), "cpu_hours", "cus_example", start, end); err != nil {
 		t.Fatal(err)
 	}
-	if lookups != 2 || summaries != 5 || meters[4] != "mtr_replacement" {
+	if lookups != 3 || summaries != 5 || meters[4] != "mtr_replacement" {
 		t.Fatalf("new decision retained stale mapping: lookups=%d meters=%v", lookups, meters)
 	}
 }

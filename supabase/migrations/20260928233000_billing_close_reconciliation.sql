@@ -76,6 +76,8 @@ CREATE FUNCTION billing_meter_close_evidence_matches(o billing_export_observatio
 RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE evidence billing_meter_reconciliation;
         snapshot jsonb;
+        mapping jsonb;
+        mapping_checked_at timestamptz;
         allowance numeric;
         pass jsonb;
         bucket jsonb;
@@ -90,6 +92,13 @@ BEGIN
       AND e.resource_type=o.resource_type AND e.observed_at=o.observed_at
     ORDER BY e.id LIMIT 1;
     IF NOT FOUND THEN RETURN false; END IF;
+    -- This transaction must supply a fresh independent active-mapping lookup.
+    -- Binding by evidence ID also rejects observations replaced during the read.
+    mapping := NULLIF(current_setting('billing.close_meter_mapping',true),'')::jsonb;
+    mapping_checked_at := (mapping->>'checked_at')::timestamptz;
+    IF mapping_checked_at IS NULL OR mapping_checked_at < clock_timestamp()-interval '30 seconds'
+       OR mapping_checked_at > clock_timestamp()
+       OR mapping->'meters'->>evidence.id::text IS DISTINCT FROM evidence.meter_id THEN RETURN false; END IF;
     allowance := billing_meter_precision_bound(o.reserved_quantity);
     IF allowance IS NULL OR evidence.policy <> 'exact-daily-one-ulp-v1'
        OR evidence.collected_at < statement_timestamp()-interval '2 hours'

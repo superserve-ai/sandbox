@@ -78,6 +78,20 @@ accounting/customer, policy bound and both exact bucket partitions. Subsequent
 periods reconcile independently from zero reserved coverage. Existing correction
 and disabled-resource semantics remain in place.
 
+Immediately before export completion and finalization, the application independently
+resolves each affected event name's current active meter. This has a total
+30-second deadline, at most three resources and five discovery pages per resource,
+and runs before acquiring period locks. The database requires the resulting
+transaction-local mapping check, bound to the exact immutable evidence IDs and
+aged at most 30 seconds at the gate. Missing readers, lookup failures, remaps,
+expired checks and replacement observations fail closed. A remap requires fresh
+applicable bucket evidence; the earlier evidence remains inspectable. Direct or
+old-writer status updates cannot reuse historical drift evidence without this check.
+
+This is current provider revalidation, not a provider transaction: a remote mapping
+change after the lookup cannot be made atomic with the local commit. The bounded
+check does not establish individual provider event identity or acceptance.
+
 Deploy the additive migration before the new binary. Equality behavior remains
 compatible. Older writers cannot create drift evidence; updating an observation
 does not refresh the collection time or bind it to old history. Rolling back the

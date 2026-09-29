@@ -71,3 +71,18 @@ func persistMeterCloseEvidence(ctx context.Context, tx pgx.Tx, p billing.ExportP
 		evidence.CollectedAt, meterPrecisionPolicy, evidence.Snapshot, passes)
 	return err
 }
+
+// ResolveActiveBillingMeter deliberately bypasses reconciliation's pinned reader.
+func (h *Handlers) ResolveActiveBillingMeter(ctx context.Context, event string) (string, error) {
+	reader, ok := h.Stripe.(interface {
+		ActiveMeterID(context.Context, string) (string, error)
+	})
+	if !ok {
+		return "", fmt.Errorf("current meter mapping is unavailable")
+	}
+	return reader.ActiveMeterID(ctx, event)
+}
+
+func (c *stripeHTTPClient) ActiveMeterID(ctx context.Context, event string) (string, error) {
+	return c.incrementalMeterID(ctx, event)
+}
