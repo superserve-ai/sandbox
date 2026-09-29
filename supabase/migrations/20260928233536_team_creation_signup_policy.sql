@@ -1,7 +1,8 @@
 BEGIN;
 
--- The signed creation mode can deny a grant even without a regional claim.
--- Existing overloads and legacy provisioning retain their eligibility rules.
+-- The signed creation mode authorizes the creation flow, but never decides
+-- promotion eligibility. The canonical claim authority remains the sole
+-- source of grant/no-grant outcomes for both creation modes.
 CREATE FUNCTION create_team_with_signup_trial(
     p_name text,
     p_user_id uuid,
@@ -19,25 +20,13 @@ BEGIN
     IF p_user_id IS NULL THEN
         RAISE EXCEPTION 'signup trial requires a creator' USING ERRCODE = '22023';
     END IF;
-    IF p_policy_mode = 'first_team' THEN
-        INSERT INTO team(name, home_region)
-        VALUES (p_name, p_home_region)
-        RETURNING * INTO created_team;
-        PERFORM claim_team_signup_trial_with_device(created_team.id, p_user_id);
-        DELETE FROM team_signup_trial_provenance WHERE team_id = created_team.id;
-        RETURN created_team;
-    END IF;
-    IF p_policy_mode IS DISTINCT FROM 'additional_team' THEN
+    IF p_policy_mode IS NULL OR p_policy_mode NOT IN ('first_team', 'additional_team') THEN
         RAISE EXCEPTION 'unsupported team creation policy' USING ERRCODE = '22023';
     END IF;
-
     INSERT INTO team(name, home_region)
     VALUES (p_name, p_home_region)
     RETURNING * INTO created_team;
-    INSERT INTO team_signup_trial_denial(team_id) VALUES(created_team.id);
-    INSERT INTO team_signup_promotion_outcome(team_id, user_id, outcome, reason)
-    VALUES(created_team.id, p_user_id, 'promotion_ineligible', 'additional_team');
-    -- Retire the pending legacy claim before membership/RBAC triggers run.
+    PERFORM claim_team_signup_trial_with_device(created_team.id, p_user_id);
     DELETE FROM team_signup_trial_provenance WHERE team_id = created_team.id;
     RETURN created_team;
 END;

@@ -364,7 +364,7 @@ func TestIntegration_TeamCreationServiceRoleCreateAndRecover(t *testing.T) {
 	}
 }
 
-func TestIntegration_TeamCreationAdditionalTeamWithoutRegionalClaim(t *testing.T) {
+func TestIntegration_TeamCreationAdditionalPolicyUsesPromotionAuthority(t *testing.T) {
 	pool := teamCreationDatabase(t)
 	client := newTeamCreationClient(t, pool)
 	ctx := context.Background()
@@ -373,7 +373,8 @@ func TestIntegration_TeamCreationAdditionalTeamWithoutRegionalClaim(t *testing.T
 			if canonical {
 				rolloutExec(t, pool, `SELECT enable_canonical_promotion_identity('{"reference":"isolated additional team test","all_writers_ready":true,"rollback_ready":true}')`)
 			}
-			// A fresh regional actor models a creator whose first team is in another cell.
+			// A fresh actor models a creator whose existing-team authorization is
+			// valid, but whose canonical promotion identity has not been claimed.
 			actor := uuid.New()
 			claims := teamCreationClaims(actor, uuid.NewString(), fmt.Sprintf("Regional additional team %t", canonical))
 			firstTeamPolicy := claims["policy"]
@@ -407,7 +408,7 @@ func TestIntegration_TeamCreationAdditionalTeamWithoutRegionalClaim(t *testing.T
 			teamCreationStatus(t, client.call(teamCreationRecover(claims), nil), http.StatusNotFound, "result_not_found")
 			created := client.call(claims, nil)
 			id := teamCreationID(t, created)
-			teamCreationOutcome(t, pool, id, "promotion_ineligible")
+			teamCreationOutcome(t, pool, id, "granted")
 			for _, query := range []string{
 				`SELECT count(*) FROM team_signup_trial_denial WHERE team_id=$1`,
 				`SELECT count(*) FROM team_signup_promotion_outcome WHERE team_id=$1 AND reason='additional_team'`,
@@ -416,21 +417,25 @@ func TestIntegration_TeamCreationAdditionalTeamWithoutRegionalClaim(t *testing.T
 				`SELECT count(*) FROM user_role_assignments a JOIN roles r ON r.id=a.role_id WHERE a.team_id=$1 AND a.revoked_at IS NULL AND r.name='team_owner'`,
 				`SELECT count(*) FROM team_creation_requests WHERE team_id=$1`,
 			} {
-				if n := teamCreationCount(t, pool, query, id); n != 1 {
-					t.Fatalf("incomplete additional creation: %s count=%d", query, n)
+				want := 1
+				if strings.Contains(query, "team_signup_trial_denial") || strings.Contains(query, "reason='additional_team'") {
+					want = 0
+				}
+				if n := teamCreationCount(t, pool, query, id); n != want {
+					t.Fatalf("incomplete additional creation: %s count=%d want=%d", query, n, want)
 				}
 			}
 			var eligible bool
-			if err := pool.QueryRow(ctx, `SELECT team_sandbox_billing_eligible($1)`, id).Scan(&eligible); err != nil || eligible {
+			if err := pool.QueryRow(ctx, `SELECT team_sandbox_billing_eligible($1)`, id).Scan(&eligible); err != nil || !eligible {
 				t.Fatalf("additional team billing eligible=%t err=%v", eligible, err)
 			}
-			// Legacy claim re-entry must preserve the explicit no-grant decision.
-			var outcome, reason string
-			if err := pool.QueryRow(ctx, `SELECT outcome, reason FROM claim_team_signup_trial($1,$2)`, id, actor).Scan(&outcome, &reason); err != nil || outcome != "promotion_ineligible" || reason != "additional_team" {
-				t.Fatalf("legacy re-entry outcome=%q reason=%q err=%v", outcome, reason, err)
+			// Legacy claim re-entry must preserve the authority-owned outcome.
+			var outcome string
+			if err := pool.QueryRow(ctx, `SELECT outcome FROM claim_team_signup_trial($1,$2)`, id, actor).Scan(&outcome); err != nil || outcome != "granted" {
+				t.Fatalf("legacy re-entry outcome=%q err=%v", outcome, err)
 			}
 			readClient := newTeamCreationClient(t, teamCreationReadOnlyPool(t, pool))
-			// A renewed first-team assertion cannot upgrade a completed no-grant intent.
+			// A renewed first-team assertion cannot change a completed result.
 			claims["policy"] = firstTeamPolicy
 			for _, replay := range []map[string]any{claims, teamCreationRecover(claims)} {
 				response := readClient.call(replay, nil)
@@ -439,14 +444,14 @@ func TestIntegration_TeamCreationAdditionalTeamWithoutRegionalClaim(t *testing.T
 					t.Fatal("additional team replay changed committed result")
 				}
 			}
-			teamCreationOutcome(t, pool, id, "promotion_ineligible")
+			teamCreationOutcome(t, pool, id, "granted")
 			for _, query := range []string{
 				`SELECT count(*) FROM user_signup_trial_claim WHERE user_id=$1`,
 				`SELECT count(*) FROM user_promotion_entitlement WHERE user_id=$1 AND signup_trial_claimed_at IS NOT NULL`,
 				`SELECT count(*) FROM promotion_identity_history WHERE user_id=$1 AND promotion='signup'`,
 			} {
-				if n := teamCreationCount(t, pool, query, actor); n != 0 {
-					t.Fatalf("additional creation consumed a signup claim: %s count=%d", query, n)
+				if n := teamCreationCount(t, pool, query, actor); n != 1 {
+					t.Fatalf("additional creation did not retain its signup claim: %s count=%d", query, n)
 				}
 			}
 		})
@@ -568,6 +573,13 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 		actor := uuid.New()
 		const name = "Cafe\u0301  ☃"
 		claims := teamCreationClaimsForRegion(actor, uuid.NewString(), name, "usw")
+		// Keep the Auth source revision and retrieval observation distinct so
+		// the transaction's argument order cannot be masked by equal values.
+		authUpdatedAt := time.Now().UTC().Add(-2 * time.Minute).Truncate(time.Microsecond)
+		observedAt := authUpdatedAt.Add(45 * time.Second)
+		identity := claims["identity"].(map[string]any)
+		identity["auth_updated_at"] = authUpdatedAt.Format("2006-01-02T15:04:05.000000Z")
+		identity["observed_at"] = observedAt.Format("2006-01-02T15:04:05.000000Z")
 		snapshot := teamCreationSnapshot(t, uswClient.call(claims, nil))
 		id := uuid.MustParse(snapshot["id"])
 		if snapshot["name"] != name || snapshot["region"] != "usw" {
@@ -586,9 +598,43 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 		if homeRegion != "usw" || cell != "usw" || durableRegion != "usw" {
 			t.Fatalf("non-default routing home=%q cell=%q durable_region=%q", homeRegion, cell, durableRegion)
 		}
+		var evidenceEmail string
+		var evidenceVerified bool
+		var evidenceAuthUpdatedAt, evidenceObservedAt time.Time
+		if err := pool.QueryRow(ctx, `SELECT email, email_verified, auth_updated_at, observed_at
+			FROM promotion_identity_evidence WHERE user_id=$1`, actor).
+			Scan(&evidenceEmail, &evidenceVerified, &evidenceAuthUpdatedAt, &evidenceObservedAt); err != nil {
+			t.Fatal(err)
+		}
+		if evidenceEmail != actor.String()+"@example.com" || !evidenceVerified ||
+			!evidenceAuthUpdatedAt.Equal(authUpdatedAt) || !evidenceObservedAt.Equal(observedAt) {
+			t.Fatalf("identity evidence=(%q,%t,%v,%v), want (%q,true,%v,%v)", evidenceEmail, evidenceVerified,
+				evidenceAuthUpdatedAt, evidenceObservedAt, actor.String()+"@example.com", authUpdatedAt, observedAt)
+		}
 		recovered := teamCreationSnapshot(t, uswClient.call(teamCreationRecover(claims), nil))
 		if recovered["id"] != snapshot["id"] || recovered["name"] != name || recovered["region"] != "usw" {
 			t.Fatalf("recovery changed non-default snapshot: create=%v recover=%v", snapshot, recovered)
+		}
+		// A replay with changed identity metadata must return the durable result
+		// without rewriting the authority-owned evidence row.
+		identity["email"] = "replacement@example.com"
+		identity["auth_updated_at"] = authUpdatedAt.Add(time.Second).Format("2006-01-02T15:04:05.000000Z")
+		identity["observed_at"] = observedAt.Add(time.Second).Format("2006-01-02T15:04:05.000000Z")
+		if replay := teamCreationSnapshot(t, uswClient.call(claims, nil)); replay["id"] != snapshot["id"] {
+			t.Fatalf("replay changed committed snapshot: create=%v replay=%v", snapshot, replay)
+		}
+		var replayEmail string
+		var replayVerified bool
+		var replayAuthUpdatedAt, replayObservedAt time.Time
+		if err := pool.QueryRow(ctx, `SELECT email, email_verified, auth_updated_at, observed_at
+			FROM promotion_identity_evidence WHERE user_id=$1`, actor).
+			Scan(&replayEmail, &replayVerified, &replayAuthUpdatedAt, &replayObservedAt); err != nil {
+			t.Fatal(err)
+		}
+		if replayEmail != evidenceEmail || replayVerified != evidenceVerified ||
+			!replayAuthUpdatedAt.Equal(evidenceAuthUpdatedAt) || !replayObservedAt.Equal(evidenceObservedAt) {
+			t.Fatalf("replay rewrote identity evidence=(%q,%t,%v,%v), original=(%q,%t,%v,%v)", replayEmail, replayVerified,
+				replayAuthUpdatedAt, replayObservedAt, evidenceEmail, evidenceVerified, evidenceAuthUpdatedAt, evidenceObservedAt)
 		}
 	})
 	// This activation is confined to the disposable test database.
@@ -782,7 +828,11 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 		claims[0]["request_id"] = uuid.NewString()
 		claims[0]["name"] = "Additional team"
 		claims[0]["policy"] = map[string]any{"version": 1, "mode": "additional_team", "session": "passed", "captcha": "not_applicable", "preauth": "not_applicable", "google_onboarding": "not_applicable", "additional_team": "passed"}
-		teamCreationOutcome(t, pool, teamCreationID(t, client.call(claims[0], nil)), "promotion_ineligible")
+		additionalID := teamCreationID(t, client.call(claims[0], nil))
+		teamCreationOutcome(t, pool, additionalID, "already_claimed")
+		if n := teamCreationCount(t, pool, `SELECT count(*) FROM team_credit_grant WHERE team_id=$1 AND reason='signup trial credit'`, additionalID); n != 0 {
+			t.Fatalf("additional team signup grants=%d", n)
+		}
 	})
 	t.Run("revision conflict and changed verification", func(t *testing.T) {
 		actor := uuid.New()
@@ -828,7 +878,15 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 		if n := teamCreationCount(t, pool, `SELECT count(*) FROM user_signup_trial_claim WHERE user_id=$1`, actor); n != 0 {
 			t.Fatal("joining consumed trial")
 		}
-		teamCreationOutcome(t, pool, teamCreationID(t, client.call(teamCreationClaims(actor, uuid.NewString(), "Joined actor team"), nil)), "granted")
+		joinedClaims := teamCreationClaims(actor, uuid.NewString(), "Joined actor team")
+		joinedClaims["policy"] = map[string]any{
+			"version": 1, "mode": "additional_team", "session": "passed",
+			"captcha": "not_applicable", "preauth": "not_applicable",
+			"google_onboarding": "not_applicable", "additional_team": "passed",
+		}
+		// Existing-team authorization is not a promotion decision: a joined,
+		// never-claimed actor remains eligible for the canonical first grant.
+		teamCreationOutcome(t, pool, teamCreationID(t, client.call(joinedClaims, nil)), "granted")
 	})
 	t.Run("recovery during in-flight creation is read-only", func(t *testing.T) {
 		const lockName = "team-creation-inflight-test"
@@ -954,6 +1012,34 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 	})
 	t.Run("registered route rejects before writes", func(t *testing.T) {
 		actor := uuid.New()
+		for _, tc := range []struct {
+			name   string
+			change func(map[string]any)
+		}{
+			{"failed session", func(c map[string]any) {
+				c["policy"].(map[string]any)["session"] = "failed"
+			}},
+			{"failed captcha", func(c map[string]any) {
+				c["policy"].(map[string]any)["captcha"] = "failed"
+			}},
+			{"failed Google onboarding", func(c map[string]any) {
+				c["policy"].(map[string]any)["google_onboarding"] = "failed"
+			}},
+			{"additional mode retains first-team checks", func(c map[string]any) {
+				p := c["policy"].(map[string]any)
+				p["mode"], p["additional_team"] = "additional_team", "passed"
+			}},
+			{"additional mode missing authorization", func(c map[string]any) {
+				p := c["policy"].(map[string]any)
+				p["mode"], p["additional_team"] = "additional_team", "not_applicable"
+			}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				claims := teamCreationClaims(actor, uuid.NewString(), "Rejected policy team")
+				tc.change(claims)
+				teamCreationStatus(t, client.call(claims, nil), http.StatusForbidden, "policy_not_satisfied")
+			})
+		}
 		claims := teamCreationClaims(actor, uuid.NewString(), "Rejected team")
 		for _, tc := range []struct {
 			name   string
