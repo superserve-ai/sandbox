@@ -364,14 +364,14 @@ func TestBackupFlightAdmissionIsBounded(t *testing.T) {
 	store := &slowEmptyStore{delay: 200 * time.Millisecond}
 	mgr := &Manager{log: zerolog.Nop(), vms: map[string]*VMInstance{}}
 	mgr.SetBackupRestore(store, store, t.TempDir(), BackupRestoreOptions{Concurrency: 1, MaxFlights: 1})
-	f, err := mgr.backupFlightFor("vm-1", "g")
+	f, err := mgr.backupFlightFor("vm-1", "vm-1", "g")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mgr.backupFlightFor("vm-1", "g"); err != nil {
+	if _, err := mgr.backupFlightFor("vm-1", "vm-1", "g"); err != nil {
 		t.Fatal("joining the same flight never counts against admission")
 	}
-	if _, err := mgr.backupFlightFor("vm-2", "g"); status.Code(err) != codes.ResourceExhausted {
+	if _, err := mgr.backupFlightFor("vm-2", "vm-2", "g"); status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("beyond the flight cap: err = %v, want ResourceExhausted", err)
 	}
 	<-f.done
@@ -429,7 +429,7 @@ func TestRealFlightOrderKeepsAReusedOldBaseThroughItsOwnSweep(t *testing.T) {
 	}
 	defer func() { fetchBackupGeneration = orig }()
 
-	f, err := mgr.backupFlightFor("vm-1", "g")
+	f, err := mgr.backupFlightFor("vm-1", "vm-1", "g")
 	if err != nil {
 		t.Fatal(err)
 	}

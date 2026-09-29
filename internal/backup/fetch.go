@@ -81,17 +81,18 @@ func RestoredDisk(dir string) (Restored, error) {
 // completed restore of that generation already in destDir is reused;
 // anything else there is discarded first. A generation the bucket no
 // longer holds complete fails closed rather than falling back to another.
-func FetchGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, progress ProgressFunc) (Restored, error) {
+// owner is a sandbox id or a SnapshotOwner.
+func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destDir string, progress ProgressFunc) (Restored, error) {
 	if generation == "" {
 		return Restored{}, ErrNoMatchingBackup
 	}
-	if done, err := RestoredDisk(destDir); err == nil && done.Manifest.Generation == generation {
+	if done, err := RestoredDisk(destDir); err == nil && done.Manifest.Generation == generation && manifestOwner(done.Manifest) == owner {
 		return done, nil
 	}
 	if err := os.RemoveAll(destDir); err != nil {
 		return Restored{}, fmt.Errorf("clear restore dir: %w", err)
 	}
-	m, err := fetchManifest(ctx, r, sandboxID, generation, func(string, ...any) {})
+	m, err := fetchManifest(ctx, r, owner, generation, func(string, ...any) {})
 	if err != nil {
 		if errors.Is(err, ErrGenerationIncomplete) {
 			return Restored{}, ErrNoMatchingBackup
@@ -99,7 +100,7 @@ func FetchGeneration(ctx context.Context, r BlobReader, sandboxID, generation, d
 		return Restored{}, err
 	}
 	skip := func(mf ManifestFile) bool { return isSharedEntry(mf) && hostHoldsBase(m, mf.SHA256) }
-	if _, err := restoreGeneration(ctx, r, sandboxID, generation, destDir, skip, progress); err != nil {
+	if _, err := restoreGeneration(ctx, r, owner, generation, destDir, skip, progress); err != nil {
 		return Restored{}, err
 	}
 	return RestoredDisk(destDir)

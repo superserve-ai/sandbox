@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -191,5 +192,27 @@ func TestSnapshotGenerationUploadsAndPurgesUnderItsOwnPrefix(t *testing.T) {
 	}
 	if got := objectNames(t, store, "bases/"); len(got) != 1 {
 		t.Fatalf("purge touched the shared base: %v", got)
+	}
+}
+
+// A saved snapshot's generation restores through its own owner, and a
+// sandbox of the same id cannot read it.
+func TestFetchGenerationRestoresASnapshotBackup(t *testing.T) {
+	store := newMemBlobs()
+	task := writePauseFixture(t, t.TempDir(), "saved")
+	task.SnapshotID, task.SandboxID = "3b1e6f2c-7d4a-4f0e-9a51-2c8d6e0b7f19", ""
+	uploadFixture(t, store, task)
+
+	dest := filepath.Join(t.TempDir(), "child")
+	got, err := FetchGeneration(context.Background(), store, SnapshotOwner(task.SnapshotID), task.Generation, dest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Manifest.SnapshotID != task.SnapshotID || got.Disk != filepath.Join(dest, "rootfs.ext4") {
+		t.Fatalf("restored = %+v", got)
+	}
+	// Not even through the snapshot's finished restore of that generation.
+	if _, err := FetchGeneration(context.Background(), store, task.SnapshotID, task.Generation, dest, nil); !errors.Is(err, ErrNoMatchingBackup) {
+		t.Fatalf("read as a sandbox: err = %v, want ErrNoMatchingBackup", err)
 	}
 }

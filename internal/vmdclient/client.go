@@ -19,6 +19,9 @@ type ResourceLimits struct {
 	// restore then passes no files of its own, and the sizes must be the
 	// snapshot's.
 	SavedSnapshotID string
+	// BackupGeneration is SavedSnapshotID's backup to cold boot from, once
+	// the host has refused with SavedSnapshotMissingReason.
+	BackupGeneration string
 	// Egress, when set, is installed before the guest runs; the restore
 	// reports whether it was.
 	Egress *EgressRules
@@ -281,14 +284,24 @@ type BuildStatusResult struct {
 // generation recorded as covering the pause.
 const PauseArtifactsMissingReason = "PAUSE_ARTIFACTS_MISSING"
 
+// SavedSnapshotMissingReason marks a fork the host refused because the saved
+// snapshot's files are gone from it; the caller may retry naming the
+// snapshot's backup generation.
+const SavedSnapshotMissingReason = "SAVED_SNAPSHOT_MISSING"
+
 // IsPauseArtifactsMissing reports whether err carries that mark.
-func IsPauseArtifactsMissing(err error) bool {
+func IsPauseArtifactsMissing(err error) bool { return hasReason(err, PauseArtifactsMissingReason) }
+
+// IsSavedSnapshotMissing reports whether err carries SavedSnapshotMissingReason.
+func IsSavedSnapshotMissing(err error) bool { return hasReason(err, SavedSnapshotMissingReason) }
+
+func hasReason(err error, reason string) bool {
 	st, ok := status.FromError(err)
 	if !ok {
 		return false
 	}
 	for _, d := range st.Details() {
-		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == PauseArtifactsMissingReason {
+		if info, ok := d.(*errdetails.ErrorInfo); ok && info.GetReason() == reason {
 			return true
 		}
 	}

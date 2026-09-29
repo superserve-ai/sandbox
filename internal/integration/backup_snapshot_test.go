@@ -4,12 +4,14 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/api"
@@ -91,6 +93,13 @@ func TestIntegration_BackupGC_SnapshotBackupsFollowTheSnapshot(t *testing.T) {
 	rows := claim()
 	if len(rows) != 1 || rows[0].SnapshotID.Bytes != gone || rows[0].Generation != genGone {
 		t.Fatalf("claimed %+v, want only the deleted snapshot's generation", rows)
+	}
+	// A fork restores from the live snapshot's backup, never one being purged.
+	if gen, err := testQueries.LatestSnapshotBackupGeneration(ctx, pgtype.UUID{Bytes: kept, Valid: true}); err != nil || gen != genKept {
+		t.Fatalf("live snapshot's generation = %q (err %v), want %s", gen, err, genKept)
+	}
+	if _, err := testQueries.LatestSnapshotBackupGeneration(ctx, pgtype.UUID{Bytes: gone, Valid: true}); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("a generation claimed for purge was offered: err = %v", err)
 	}
 	if n, err := testQueries.MarkBackupGenerationPurged(ctx, db.MarkBackupGenerationPurgedParams{ID: rows[0].ID, ClaimedAt: rows[0].ClaimedAt}); err != nil || n != 1 {
 		t.Fatalf("mark purged: n=%d err=%v", n, err)
