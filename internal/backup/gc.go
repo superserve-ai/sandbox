@@ -74,6 +74,20 @@ func PurgeGeneration(ctx context.Context, store BlobAdmin, sandboxID, generation
 	if err != nil {
 		return 0, err
 	}
+	return purgeManifestPrefix(ctx, store, manifest)
+}
+
+// PurgeSnapshotGeneration is PurgeGeneration for a saved snapshot's
+// generation.
+func PurgeSnapshotGeneration(ctx context.Context, store BlobAdmin, snapshotID, generation string) (int, error) {
+	manifest, err := SnapshotObject(snapshotID, generation, ManifestObject)
+	if err != nil {
+		return 0, err
+	}
+	return purgeManifestPrefix(ctx, store, manifest)
+}
+
+func purgeManifestPrefix(ctx context.Context, store BlobAdmin, manifest string) (int, error) {
 	prefix := strings.TrimSuffix(manifest, ManifestObject)
 	deleted := 0
 	for range purgeRounds {

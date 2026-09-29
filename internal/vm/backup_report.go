@@ -58,6 +58,7 @@ type backupReportBody struct {
 	TemplateRuntime  *backup.TemplateRuntime `json:"template_runtime,omitempty"`
 	BuildIncarnation string                  `json:"build_incarnation,omitempty"`
 	SandboxID        string                  `json:"sandbox_id,omitempty"`
+	SnapshotID       string                  `json:"snapshot_id,omitempty"`
 	TemplateID       string                  `json:"template_id,omitempty"`
 	BuildID          string                  `json:"build_id,omitempty"`
 	Generation       string                  `json:"generation"`
@@ -99,6 +100,7 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	body := backupReportBody{
 		TemplateRuntime: task.TemplateRuntime, BuildIncarnation: task.BuildIncarnation,
 		SandboxID:   task.SandboxID,
+		SnapshotID:  task.SnapshotID,
 		TemplateID:  task.TemplateID,
 		BuildID:     task.BuildID,
 		Generation:  task.Generation,
@@ -186,6 +188,7 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	if permanentReject(status) {
 		r.Log.Error().Str("generation", task.Generation).
 			Str("sandbox_id", task.SandboxID).Str("template_id", task.TemplateID).
+			Str("snapshot_id", task.SnapshotID).
 			Str("status", statusLine).Str("response", string(msg)).
 			Msg("backup report permanently rejected; dropping its coverage row")
 		return nil

@@ -1209,6 +1209,8 @@ func main() {
 			Metrics:     backupMetrics,
 		}
 		// backup_setup: metrics recorder, journal open, GCS storage.NewClient, uploader.
+		// Off by default: a host opts in to uploading its saved snapshots.
+		mgr.SetSavedSnapshotBackup(envOrDefault("BACKUP_SAVED_SNAPSHOTS", "false") == "true")
 		if envOrDefault("BACKUP_RESTORE_ON_RESUME", "false") == "true" {
 			// On from the first resume: wiring is local. The bucket probe
 			// runs after readiness and only ever withdraws the fallback, so
@@ -1784,6 +1786,17 @@ func main() {
 		// meta (both no-ops when backup is disabled).
 		mgr.RecoverPendingBackups(ctx, log)
 		mgr.RecoverTemplateBackups(ctx, log)
+		go func() {
+			defer sentrylog.Recover("saved snapshot backup sweep")
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(vm.SavedSnapshotBackupSweep):
+				}
+				mgr.RecoverSavedSnapshotBackups(ctx, log)
+			}
+		}()
 		// One-time coverage for sandboxes that paused before the uploader
 		// existed and will never pause again on their own. Off by default:
 		// the pass reads every paused snapshot once, so it's enabled per

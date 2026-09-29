@@ -91,6 +91,7 @@ type backupReport struct {
 	TemplateRuntime  *backup.TemplateRuntime `json:"template_runtime,omitempty"`
 	BuildIncarnation string                  `json:"build_incarnation,omitempty"`
 	SandboxID        string                  `json:"sandbox_id,omitempty"`
+	SnapshotID       string                  `json:"snapshot_id,omitempty"`
 	TemplateID       string                  `json:"template_id,omitempty"`
 	BuildID          string                  `json:"build_id,omitempty"`
 	Generation       string                  `json:"generation"`
@@ -120,9 +121,12 @@ func validateReportedObject(req backupReport, f backupFileReport) error {
 		prefix = backup.SharedBaseObject(f.SHA256, "")
 	} else {
 		var err error
-		if req.SandboxID != "" {
+		switch {
+		case req.SandboxID != "":
 			prefix, err = backup.SandboxObject(req.SandboxID, req.Generation, f.Name)
-		} else {
+		case req.SnapshotID != "":
+			prefix, err = backup.SnapshotObject(req.SnapshotID, req.Generation, f.Name)
+		default:
 			prefix, err = backup.TemplateObject(req.TemplateID, req.BuildID, req.Generation, f.Name)
 		}
 		if err != nil {
@@ -201,8 +205,14 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		respondErrorMsg(c, "bad_request", "object paths must cover every file or none", http.StatusBadRequest)
 		return
 	}
-	if (req.SandboxID == "") == (req.TemplateID == "") {
-		respondErrorMsg(c, "bad_request", "exactly one of sandbox_id or template_id is required", http.StatusBadRequest)
+	owners := 0
+	for _, id := range []string{req.SandboxID, req.TemplateID, req.SnapshotID} {
+		if id != "" {
+			owners++
+		}
+	}
+	if owners != 1 {
+		respondErrorMsg(c, "bad_request", "exactly one of sandbox_id, template_id or snapshot_id is required", http.StatusBadRequest)
 		return
 	}
 	if req.TemplateID != "" && req.BuildID == "" {
@@ -210,7 +220,7 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 		return
 	}
 
-	var sandboxID, templateID uuid.UUID
+	var sandboxID, templateID, snapshotID uuid.UUID
 	if req.SandboxID != "" {
 		id, err := uuid.Parse(req.SandboxID)
 		if err != nil {
@@ -218,6 +228,13 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 			return
 		}
 		sandboxID = id
+	} else if req.SnapshotID != "" {
+		id, err := uuid.Parse(req.SnapshotID)
+		if err != nil {
+			respondErrorMsg(c, "bad_request", "snapshot_id must be a uuid", http.StatusBadRequest)
+			return
+		}
+		snapshotID = id
 	} else {
 		id, err := uuid.Parse(req.TemplateID)
 		if err != nil {
@@ -263,7 +280,8 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 				return errFinalizeInFlight
 			}
 		}
-		if req.SandboxID != "" {
+		switch {
+		case req.SandboxID != "":
 			rows, err = q.RecordSandboxBackupGeneration(ctx, db.RecordSandboxBackupGenerationParams{
 				SandboxID:   pgtype.UUID{Bytes: sandboxID, Valid: true},
 				Generation:  req.Generation,
@@ -271,7 +289,15 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 				CompletedAt: req.CompletedAt.UTC(),
 				Files:       files,
 			})
-		} else {
+		case req.SnapshotID != "":
+			rows, err = q.RecordSnapshotBackupGeneration(ctx, db.RecordSnapshotBackupGenerationParams{
+				SnapshotID:  pgtype.UUID{Bytes: snapshotID, Valid: true},
+				Generation:  req.Generation,
+				Bucket:      req.Bucket,
+				CompletedAt: req.CompletedAt.UTC(),
+				Files:       files,
+			})
+		default:
 			rows, err = q.RecordTemplateBackupGeneration(ctx, db.RecordTemplateBackupGenerationParams{
 				TemplateID:  pgtype.UUID{Bytes: templateID, Valid: true},
 				BuildID:     &req.BuildID,
@@ -437,6 +463,7 @@ func (h *Handlers) ReportHostBackup(c *gin.Context) {
 			log.Warn().Str("host_id", c.Param("host_id")).
 				Str("generation", req.Generation).
 				Str("sandbox_id", req.SandboxID).Str("template_id", req.TemplateID).
+				Str("snapshot_id", req.SnapshotID).
 				Msg("backup report for unknown owner; recorded nothing")
 			c.JSON(http.StatusOK, gin.H{"recorded": false, "orphaned": true})
 			return

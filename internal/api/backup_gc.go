@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 
 	"github.com/superserve-ai/sandbox/internal/backup"
@@ -23,8 +24,8 @@ const (
 	bucketWalkInterval = 24 * time.Hour
 )
 
-// StartBackupGC removes deleted sandboxes' backups from the bucket on a
-// schedule. Every replica runs it; the database leases each generation,
+// StartBackupGC removes deleted sandboxes' and saved snapshots' backups
+// from the bucket on a schedule. Every replica runs it; the database leases each generation,
 // and the daily walk, to one of them. A nil BackupGC leaves the job off.
 // Shared base images are never deleted here: a base is content-addressed
 // and may be in use by a build the database has no record of.
@@ -43,6 +44,7 @@ func (h *Handlers) StartBackupGC(ctx context.Context) {
 			case <-ticker.C:
 				sentrylog.RunSafe("backup-gc", func() {
 					h.PurgeDeletedSandboxBackups(ctx)
+					h.PurgeDeletedSnapshotBackups(ctx)
 					h.WalkBucketBackups(ctx)
 				})
 			}
@@ -53,39 +55,81 @@ func (h *Handlers) StartBackupGC(ctx context.Context) {
 // PurgeDeletedSandboxBackups deletes the objects of every generation that
 // belongs to a deleted sandbox, in leased batches. A generation whose
 // deletion fails keeps its lease until it expires and is retried then.
-func (h *Handlers) PurgeDeletedSandboxBackups(ctx context.Context) (purged int) {
+func (h *Handlers) PurgeDeletedSandboxBackups(ctx context.Context) int {
 	bucket := h.BackupGC.Identity()
-	for ctx.Err() == nil {
+	return h.purgeClaimedGenerations(ctx, "sandbox_id", func() ([]claimedGeneration, error) {
 		rows, err := h.DB.ClaimBackupGenerationsToPurge(ctx, db.ClaimBackupGenerationsToPurgeParams{
 			Bucket: bucket, LeaseSeconds: backupGCLeaseSeconds, BatchSize: backupGCBatch,
 		})
+		claimed := make([]claimedGeneration, len(rows))
+		for i, r := range rows {
+			claimed[i] = claimedGeneration{r.ID, uuid.UUID(r.SandboxID.Bytes).String(), r.Generation, r.ClaimedAt}
+		}
+		return claimed, err
+	}, func(owner, generation string) (int, error) {
+		return backup.PurgeGeneration(ctx, h.BackupGC, owner, generation)
+	})
+}
+
+// PurgeDeletedSnapshotBackups is PurgeDeletedSandboxBackups for the
+// generations of deleted saved snapshots.
+func (h *Handlers) PurgeDeletedSnapshotBackups(ctx context.Context) int {
+	bucket := h.BackupGC.Identity()
+	return h.purgeClaimedGenerations(ctx, "snapshot_id", func() ([]claimedGeneration, error) {
+		rows, err := h.DB.ClaimSnapshotBackupGenerationsToPurge(ctx, db.ClaimSnapshotBackupGenerationsToPurgeParams{
+			Bucket: bucket, LeaseSeconds: backupGCLeaseSeconds, BatchSize: backupGCBatch,
+		})
+		claimed := make([]claimedGeneration, len(rows))
+		for i, r := range rows {
+			claimed[i] = claimedGeneration{r.ID, uuid.UUID(r.SnapshotID.Bytes).String(), r.Generation, r.ClaimedAt}
+		}
+		return claimed, err
+	}, func(owner, generation string) (int, error) {
+		return backup.PurgeSnapshotGeneration(ctx, h.BackupGC, owner, generation)
+	})
+}
+
+// claimedGeneration is one leased backup_generation row, whichever owner.
+type claimedGeneration struct {
+	id         uuid.UUID
+	owner      string
+	generation string
+	claimedAt  pgtype.Timestamptz
+}
+
+// purgeClaimedGenerations claims batches, deletes each generation's objects
+// and marks its row purged under the claim token, until a batch comes back
+// short or makes no progress.
+func (h *Handlers) purgeClaimedGenerations(ctx context.Context, ownerKey string,
+	claim func() ([]claimedGeneration, error), purge func(owner, generation string) (int, error)) (purged int) {
+	for ctx.Err() == nil {
+		rows, err := claim()
 		if err != nil {
 			log.Warn().Err(err).Msg("backup gc: claim failed")
 			return purged
 		}
 		done := 0
 		for _, row := range rows {
-			sandboxID := uuid.UUID(row.SandboxID.Bytes).String()
-			deleted, err := backup.PurgeGeneration(ctx, h.BackupGC, sandboxID, row.Generation)
+			deleted, err := purge(row.owner, row.generation)
 			if err != nil {
-				log.Warn().Err(err).Str("sandbox_id", sandboxID).Str("generation", row.Generation).
+				log.Warn().Err(err).Str(ownerKey, row.owner).Str("generation", row.generation).
 					Msg("backup gc: purge failed; will retry")
 				continue
 			}
-			marked, err := h.DB.MarkBackupGenerationPurged(ctx, db.MarkBackupGenerationPurgedParams{ID: row.ID, ClaimedAt: row.ClaimedAt})
+			marked, err := h.DB.MarkBackupGenerationPurged(ctx, db.MarkBackupGenerationPurgedParams{ID: row.id, ClaimedAt: row.claimedAt})
 			if err != nil {
-				log.Warn().Err(err).Str("generation", row.Generation).Msg("backup gc: mark purged failed")
+				log.Warn().Err(err).Str("generation", row.generation).Msg("backup gc: mark purged failed")
 				continue
 			}
 			if marked == 0 {
 				// A report landed during the purge: the generation was uploaded
 				// again and the next pass takes it.
-				log.Info().Str("sandbox_id", sandboxID).Str("generation", row.Generation).
+				log.Info().Str(ownerKey, row.owner).Str("generation", row.generation).
 					Msg("backup gc: generation re-uploaded during purge; left for the next pass")
 				continue
 			}
 			done++
-			log.Info().Str("sandbox_id", sandboxID).Str("generation", row.Generation).
+			log.Info().Str(ownerKey, row.owner).Str("generation", row.generation).
 				Int("objects", deleted).Msg("backup gc: generation purged")
 		}
 		purged += done
