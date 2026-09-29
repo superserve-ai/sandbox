@@ -32,10 +32,8 @@ func savedSnapshotMissingErr(snapshotID string) error {
 }
 
 // backupForkTracked reports a VM this host booted, or is booting, from the
-// snapshot's backup as vmID; its retry goes to forkFromBackup whether or not
-// backup restore is still on.
+// snapshot's backup as vmID. The caller has loaded the VM's record.
 func (m *Manager) backupForkTracked(vmID, snapshotID string) bool {
-	m.lazyReattach(vmID)
 	m.mu.RLock()
 	inst := m.vms[vmID]
 	m.mu.RUnlock()
@@ -93,16 +91,25 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 	if !m.BackupRestoreEnabled() {
 		return nil, status.Errorf(codes.Unavailable, "vm %s: backup restore is off on this host", vmID)
 	}
-	// Own teardowns keep the staged download for the retry, and are
-	// counted so only someone else's destroy, from here on, reads as one.
+	// Own teardowns release nothing until the VM is confirmed exited, since a
+	// stop can return while the unit is still deactivating. They keep the
+	// staged download for the retry and are counted, so only someone else's
+	// destroy, from here on, reads as one.
 	epoch := m.destroyEpoch(vmID)
 	selfDestroys := uint64(0)
 	teardown := func(c context.Context) error {
-		err := m.DestroyVM(context.WithValue(c, reviveTeardownCtxKey{}, true), vmID, true)
-		if err == nil {
-			selfDestroys++
+		c, cancel := context.WithTimeout(context.WithoutCancel(c), reviveTeardownBudget)
+		defer cancel()
+		if err := m.stopLeftoverLife(c, vmID); err != nil || !m.vmConfirmedAtRest(c, vmID) {
+			m.setStatus(vmID, StatusError)
+			m.vmStopUnconfirmed.Store(vmID, struct{}{})
+			return status.Errorf(codes.Unavailable, "vm %s is not confirmed stopped (%v); left for a forced destroy", vmID, err)
 		}
-		return err
+		if err := m.DestroyVM(context.WithValue(c, reviveTeardownCtxKey{}, true), vmID, true); err != nil {
+			return err
+		}
+		selfDestroys++
+		return nil
 	}
 	destroyed := func() error {
 		if m.destroyEpoch(vmID) != epoch+selfDestroys {
@@ -120,17 +127,8 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 		}
 	}
 	// What a failed attempt left behind. A life this daemon lost before
-	// recording it may still run on the disk the boot replaces, so it is
-	// stopped under either supervision first, as for any fork.
+	// recording it may still run on the disk the boot replaces.
 	if _, dirErr := os.Stat(filepath.Join(m.cfg.RunDir, vmID)); instErr == nil || !errors.Is(dirErr, os.ErrNotExist) {
-		if err := m.stopLeftoverLife(ctx, vmID); err != nil {
-			return nil, status.Errorf(codes.Unavailable, "vm %s: stop what a failed attempt left running: %v", vmID, err)
-		}
-		// A stop can return while the unit is still deactivating; nothing is
-		// released until both supervisors are terminally quiet.
-		if !m.vmConfirmedAtRest(ctx, vmID) {
-			return nil, status.Errorf(codes.Unavailable, "vm %s: what a failed attempt left running is not confirmed stopped", vmID)
-		}
 		if err := teardown(ctx); err != nil {
 			return nil, err
 		}
@@ -166,8 +164,10 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 		ip := inst.IP
 		inst.mu.RUnlock()
 		if werr := m.waitForBoxd(ctx, ip, reviveBoxdReadyBudget); werr != nil {
-			_ = teardown(context.WithoutCancel(ctx))
 			err = status.Errorf(codes.Unavailable, "guest did not become ready: %v", werr)
+			if terr := teardown(ctx); terr != nil {
+				err = status.Errorf(codes.Internal, "guest did not become ready (%v): %v", werr, terr)
+			}
 		}
 	}
 	m.recordPhases("restore", "backup", map[string]time.Duration{"backup_boot": time.Since(tBoot)})
@@ -192,13 +192,15 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 	_, destroying := m.destroying.Load(vmID)
 	if !tracked || destroying || destroyed() != nil {
 		unlockCommit()
-		_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
+		_ = teardown(ctx)
+		_ = os.RemoveAll(m.restoreStagingDir(vmID))
 		return nil, status.Errorf(codes.Aborted, "vm %s was destroyed while its fork was completing", vmID)
 	}
 	wrote := m.persistState(inst)
 	unlockCommit()
 	if !wrote {
-		_ = m.DestroyVM(context.WithoutCancel(ctx), vmID, true)
+		_ = teardown(ctx)
+		_ = os.RemoveAll(m.restoreStagingDir(vmID))
 		return nil, status.Error(codes.Internal, "forked VM could not be durably recorded; torn down for clean retry")
 	}
 	_ = os.RemoveAll(m.restoreStagingDir(vmID))

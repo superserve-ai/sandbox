@@ -1028,9 +1028,10 @@ func (m *Manager) forkSource(childID string, cfg *VMConfig, snapshotPath, memPat
 		return nil, "", "", err
 	}
 	man, err := readSavedSnapshotManifest(dir)
-	// A host that can boot the snapshot's backup says so, and the control
-	// plane retries naming it.
-	if m.BackupRestoreEnabled() && (errors.Is(err, os.ErrNotExist) || err == nil && savedSnapshotFilesMissing(man)) {
+	// A host that can boot the snapshot's backup, or already booted it as
+	// this VM, says so, and the control plane retries naming it.
+	if (m.BackupRestoreEnabled() || m.backupForkTracked(childID, cfg.SavedSnapshotID)) &&
+		(errors.Is(err, os.ErrNotExist) || err == nil && savedSnapshotFilesMissing(man)) {
 		return nil, "", "", savedSnapshotMissingErr(cfg.SavedSnapshotID)
 	}
 	if errors.Is(err, os.ErrNotExist) {

@@ -256,8 +256,8 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	var inst *VMInstance
 	id := vmCfg.SavedSnapshotID
 	// The ordinary restore finds a missing snapshot as it reads it; only a
-	// retry naming the backup, or of a boot from it, comes here.
-	if id != "" && (req.GetBackupGeneration() != "" || a.mgr.backupForkTracked(req.GetVmId(), id)) {
+	// retry naming the backup comes here.
+	if id != "" && req.GetBackupGeneration() != "" {
 		inst, err = a.mgr.forkFromBackup(ctx, req.GetVmId(), req.GetBackupGeneration(), vmCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
 	} else {
 		inst, err = a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())

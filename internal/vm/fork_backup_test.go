@@ -190,6 +190,18 @@ func TestBackupForkRetryWaitsForTheBootItAdopts(t *testing.T) {
 	}
 }
 
+// A retry that does not name the backup is told to, even with restore off,
+// once this host booted the fork from it.
+func TestBackupForkRetryWithoutAGenerationIsSentBack(t *testing.T) {
+	m := newSavedTestManager(t)
+	snapshotID := "5f0c2a9e-1b7d-4c3e-8a6f-0d9e2b4c7a13"
+	m.vms["fork-1"] = &VMInstance{ID: "fork-1", Status: StatusRunning, SourceSnapshotID: snapshotID, BackupGeneration: "gen-1"}
+	req := &vmdpb.RestoreSnapshotRequest{VmId: "fork-1", SavedSnapshotId: snapshotID, ResourceLimits: &vmdpb.ResourceLimits{VcpuCount: 1, MemoryMib: 512}}
+	if _, err := (&GRPCAdapter{mgr: m}).RestoreSnapshot(context.Background(), req); !vmdclient.IsSavedSnapshotMissing(err) {
+		t.Fatalf("err = %v, want the saved-snapshot-missing refusal", err)
+	}
+}
+
 // A fork booted from backup is adopted by its retry even once backup
 // restore is off.
 func TestBackupForkRetryIsAdoptedWithBackupRestoreOff(t *testing.T) {
