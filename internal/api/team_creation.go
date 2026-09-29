@@ -440,7 +440,7 @@ func (h *Handlers) createInternalTeam(c *gin.Context, now time.Time) {
 	}
 	defer controller.SetReadDeadline(time.Time{})
 	var input teamCreationInput
-	if decodeUniqueJSON(body, &input) != nil || input.Name == "" || input.Name != trimECMAScript(input.Name) ||
+	if decodeUniqueJSON(body, &input) != nil || input.Name == "" || strings.ContainsRune(input.Name, '\x00') || input.Name != trimECMAScript(input.Name) ||
 		(input.Region != "use" && input.Region != "usw") {
 		teamCreationError(c, "invalid_request", "Invalid request", http.StatusBadRequest)
 		return

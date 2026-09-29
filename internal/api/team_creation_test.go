@@ -152,6 +152,38 @@ func TestTeamCreationTrustBoundaryRejectionMatrix(t *testing.T) {
 	}
 }
 
+func TestTeamCreationRegisteredRouteRejectsNULName(t *testing.T) {
+	t.Setenv("INTERNAL_API_TOKEN", "internal-test-token")
+	now := time.Unix(1_800_000_000, 0)
+	private := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	// A nil pool ensures invalid names are rejected before database access.
+	h := &Handlers{
+		Config: &config.Config{TeamCreationRegion: "use", TeamCreationKeys: map[string]ed25519.PublicKey{"test": private.Public().(ed25519.PublicKey)}},
+		Now:    func() time.Time { return now },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	router := SetupRouter(ctx, h, nil)
+	claims := teamCreationTestClaims(now)
+	claims["name"] = "Example\x00team"
+	req := httptest.NewRequest(http.MethodPost, "/internal/teams", strings.NewReader(`{"request_id":"42140b1e-ac77-4ab0-9841-d9099ae8265a","name":"Example\u0000team","region":"use"}`))
+	req.Header.Set("Authorization", "Bearer internal-test-token")
+	req.Header.Set("X-Team-Creation-Assertion", signTeamCreationTestAssertion(t, claims, private))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("NUL name route status=%d body=%s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil || response.Error.Code != "invalid_request" {
+		t.Fatalf("NUL name error body=%s err=%v", w.Body.String(), err)
+	}
+}
+
 func TestTeamCreationMissingVerifierConfigurationOnlyDisablesNewRoute(t *testing.T) {
 	t.Setenv("INTERNAL_API_TOKEN", "internal-test-token")
 	for _, tc := range []struct {
