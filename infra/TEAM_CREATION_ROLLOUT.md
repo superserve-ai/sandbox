@@ -21,6 +21,8 @@ Apply the compatible promotion expansion migrations
 `20260927003610_atomic_stripe_device_decision.sql`,
 `20260927003611_serialize_signup_device_claim.sql`,
 `20260927003612_fence_legacy_stripe_device_reservations.sql`,
+`20260928035934_retain_stripe_promotion_device_attribution.sql`,
+`20260928043551_attribute_stripe_device_consumption_to_grant_actor.sql`,
 `20260928233535_team_creation_requests.sql` and
 `20260928233536_team_creation_signup_policy.sql` migrations, in that order,
 before enabling API creation. Apply the full device-authority correction chain:
@@ -28,6 +30,9 @@ the signup-claim serialization migration alone does not update
 `promotion_device_decision`. The late-evidence correction requires the preceding
 pending-reservation schema and prevents a signup grant recorded without a
 fingerprint from being missed when device evidence arrives later.
+The Stripe attribution corrections record the consuming actor and retain that
+fact after profile deletion, preventing a later duplicate grant to the shared
+device's owner.
 The signup-policy migration defines the
 four-argument `create_team_with_signup_trial` function required by the API.
 The API writes signed Auth evidence through
