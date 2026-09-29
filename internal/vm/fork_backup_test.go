@@ -119,6 +119,45 @@ func TestForkFromBackupStopsALeftoverLifeFirst(t *testing.T) {
 	}
 }
 
+// A stop that returns while the life may still run releases nothing, and a
+// destroy that lands during the cleanup wins.
+func TestForkFromBackupCleanupYieldsToAnUnconfirmedStopOrADestroy(t *testing.T) {
+	cfg := VMConfig{VCPU: 1, MemoryMiB: 512, SavedSnapshotID: "5f0c2a9e-1b7d-4c3e-8a6f-0d9e2b4c7a13"}
+	orig := fetchBackupGeneration
+	fetchBackupGeneration = func(context.Context, backup.BlobReader, string, string, string, backup.ProgressFunc) (backup.Restored, error) {
+		t.Fatal("fetched past a cleanup that should have stopped the fork")
+		return backup.Restored{}, nil
+	}
+	defer func() { fetchBackupGeneration = orig }()
+	for name, tc := range map[string]struct {
+		stop   func(*Manager) func(context.Context, string, Supervision) error
+		atRest bool
+		want   codes.Code
+	}{
+		"still_deactivating": {func(*Manager) func(context.Context, string, Supervision) error {
+			return func(context.Context, string, Supervision) error { return nil }
+		}, false, codes.Unavailable},
+		"destroyed_meanwhile": {func(m *Manager) func(context.Context, string, Supervision) error {
+			return func(_ context.Context, id string, _ Supervision) error { m.bumpDestroyEpoch(id); return nil }
+		}, true, codes.Aborted},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := newSavedTestManager(t)
+			m.netMgr = &fakeNetMgr{}
+			m.SetBackupRestore(&slowEmptyStore{}, &slowEmptyStore{}, filepath.Join(t.TempDir(), ".restore"), BackupRestoreOptions{Concurrency: 1})
+			overlay := touch(t, filepath.Join(m.cfg.RunDir, "fork-1", "overlay.ext4"))
+			m.stopVMHook = tc.stop(m)
+			m.unitDead = func(context.Context, string) bool { return tc.atRest }
+			if _, err := m.forkFromBackup(context.Background(), "fork-1", "gen-1", cfg, "team", "", "", nil, 0); status.Code(err) != tc.want {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			if _, err := os.Stat(overlay); tc.want == codes.Unavailable && err != nil {
+				t.Fatalf("the leftover's disk was released: %v", err)
+			}
+		})
+	}
+}
+
 // A retry adopts only once the attempt it repeats has committed.
 func TestBackupForkRetryWaitsForTheBootItAdopts(t *testing.T) {
 	m := newSavedTestManager(t)

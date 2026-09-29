@@ -113,7 +113,8 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 		return nil, status.Errorf(codes.Unavailable, "vm %s: backup restore is off on this host", vmID)
 	}
 	// Own teardowns keep the staged download for the retry, and are
-	// counted so only someone else's destroy reads as one.
+	// counted so only someone else's destroy, from here on, reads as one.
+	epoch := m.destroyEpoch(vmID)
 	selfDestroys := uint64(0)
 	teardown := func(c context.Context) error {
 		err := m.DestroyVM(context.WithValue(c, reviveTeardownCtxKey{}, true), vmID, true)
@@ -121,6 +122,12 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 			selfDestroys++
 		}
 		return err
+	}
+	destroyed := func() error {
+		if m.destroyEpoch(vmID) != epoch+selfDestroys {
+			return status.Errorf(codes.Aborted, "vm %s was destroyed while its fork was starting; the destroy is authoritative", vmID)
+		}
+		return nil
 	}
 	inst, instErr := m.getInstance(vmID)
 	if instErr == nil {
@@ -138,16 +145,17 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 		if err := m.stopLeftoverLife(ctx, vmID); err != nil {
 			return nil, status.Errorf(codes.Unavailable, "vm %s: stop what a failed attempt left running: %v", vmID, err)
 		}
+		// A stop can return while the unit is still deactivating; nothing is
+		// released until both supervisors are terminally quiet.
+		if !m.vmConfirmedAtRest(ctx, vmID) {
+			return nil, status.Errorf(codes.Unavailable, "vm %s: what a failed attempt left running is not confirmed stopped", vmID)
+		}
 		if err := teardown(ctx); err != nil {
 			return nil, err
 		}
 	}
-	epoch := m.destroyEpoch(vmID) - selfDestroys
-	destroyed := func() error {
-		if m.destroyEpoch(vmID) != epoch+selfDestroys {
-			return status.Errorf(codes.Aborted, "vm %s was destroyed while its fork was starting; the destroy is authoritative", vmID)
-		}
-		return nil
+	if err := destroyed(); err != nil {
+		return nil, err
 	}
 	r, release, err := m.fetchBackup(ctx, "restore", vmID, backup.SnapshotOwner(cfg.SavedSnapshotID), generation)
 	if err != nil {
