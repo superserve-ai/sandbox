@@ -28,6 +28,14 @@ import (
 func teamCreationDatabase(t *testing.T, beforeMigrations ...func(*pgxpool.Pool)) *pgxpool.Pool {
 	t.Helper()
 	ctx := context.Background()
+	// Ensure conditional production grants are present before migrations run.
+	rolloutExec(t, testPool, `DO $$ DECLARE r text; BEGIN
+		FOREACH r IN ARRAY ARRAY['anon','authenticated','service_role'] LOOP
+			IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname=r) THEN
+				EXECUTE format('CREATE ROLE %I NOLOGIN',r);
+			END IF;
+		END LOOP;
+	END $$`)
 	name := "team_creation_test_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	if _, err := testPool.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
 		t.Fatal(err)
@@ -87,6 +95,35 @@ func teamCreationReadOnlyPool(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {
 	t.Cleanup(readPool.Close)
 	return readPool
 }
+
+func teamCreationServiceRolePool(t *testing.T, pool *pgxpool.Pool) *pgxpool.Pool {
+	t.Helper()
+	ctx := context.Background()
+	var bypassRLS bool
+	if err := pool.QueryRow(ctx, `SELECT rolbypassrls FROM pg_roles WHERE rolname='service_role'`).Scan(&bypassRLS); err != nil {
+		t.Fatal(err)
+	}
+	rolloutExec(t, pool, `ALTER ROLE service_role BYPASSRLS`)
+	cfg := pool.Config().Copy()
+	cfg.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, `SET ROLE service_role`)
+		return err
+	}
+	servicePool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		servicePool.Close()
+		if bypassRLS {
+			rolloutExec(t, pool, `ALTER ROLE service_role BYPASSRLS`)
+		} else {
+			rolloutExec(t, pool, `ALTER ROLE service_role NOBYPASSRLS`)
+		}
+	})
+	return servicePool
+}
+
 func teamCreationClaims(actor uuid.UUID, requestID, name string) map[string]any {
 	return teamCreationClaimsForRegion(actor, requestID, name, "use")
 }
@@ -280,6 +317,50 @@ func TestIntegration_TeamCreationRequestPrivileges(t *testing.T) {
 			}
 			localIdentityError(t, tx, "42501", `TRUNCATE team_creation_requests`)
 		})
+	}
+}
+
+func TestIntegration_TeamCreationServiceRoleCreateAndRecover(t *testing.T) {
+	pool := teamCreationDatabase(t, func(pool *pgxpool.Pool) {
+		// Supabase supplies these defaults before migrations narrow individual ACLs.
+		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO service_role`)
+		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO service_role`)
+		rolloutExec(t, pool, `ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO service_role`)
+	})
+	servicePool := teamCreationServiceRolePool(t, pool)
+	client := newTeamCreationClient(t, servicePool)
+	ctx := context.Background()
+	actor := uuid.New()
+	claims := teamCreationClaims(actor, uuid.NewString(), "Service role team")
+
+	var currentRole string
+	if err := servicePool.QueryRow(ctx, `SELECT current_user`).Scan(&currentRole); err != nil || currentRole != "service_role" {
+		t.Fatalf("provisioning pool role=%q want=service_role err=%v", currentRole, err)
+	}
+	created := teamCreationSnapshot(t, client.call(claims, nil))
+	id := uuid.MustParse(created["id"])
+	teamCreationOutcome(t, pool, id, "granted")
+
+	for _, check := range []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{"profile", `SELECT count(*) FROM profile WHERE id=$1`, []any{actor}},
+		{"promotion evidence", `SELECT count(*) FROM promotion_identity_evidence WHERE user_id=$1`, []any{actor}},
+		{"owner membership", `SELECT count(*) FROM team_member WHERE team_id=$1 AND profile_id=$2 AND role='owner'`, []any{id, actor}},
+		{"active membership", `SELECT count(*) FROM team_memberships WHERE team_id=$1 AND user_id=$2 AND status='active'`, []any{id, actor}},
+		{"owner RBAC", `SELECT count(*) FROM user_role_assignments a JOIN roles r ON r.id=a.role_id WHERE a.team_id=$1 AND a.user_id=$2 AND a.revoked_at IS NULL AND r.name='team_owner'`, []any{id, actor}},
+		{"durable result", `SELECT count(*) FROM team_creation_requests WHERE actor_id=$1 AND cell=$2 AND request_id=$3 AND team_id=$4`, []any{actor, claims["region"], claims["request_id"], id}},
+	} {
+		if n := teamCreationCount(t, pool, check.query, check.args...); n != 1 {
+			t.Fatalf("%s count=%d want=1", check.name, n)
+		}
+	}
+
+	recovered := teamCreationSnapshot(t, client.call(teamCreationRecover(claims), nil))
+	if recovered["id"] != created["id"] || recovered["name"] != created["name"] || recovered["region"] != created["region"] {
+		t.Fatalf("recovery changed committed result: create=%v recover=%v", created, recovered)
 	}
 }
 
