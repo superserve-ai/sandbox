@@ -15,8 +15,11 @@ import (
 
 type promotionAccountClaims struct {
 	jwt.RegisteredClaims
-	Operation string `json:"operation"`
-	AttemptID string `json:"attempt_id,omitempty"`
+	Operation            string `json:"operation"`
+	AttemptID            string `json:"attempt_id,omitempty"`
+	TeamID               string `json:"team_id,omitempty"`
+	HomeRegion           string `json:"home_region,omitempty"`
+	AuthorityUnavailable *bool  `json:"authority_unavailable,omitempty"`
 }
 
 // PromotionAccountAuth verifies Console's server-derived assertions. Console
@@ -59,7 +62,21 @@ func PromotionAccountAuth() gin.HandlerFunc {
 				deny()
 				return
 			}
-		case "evidence", "register":
+		case "create-team":
+			region := sandboxIDRegionFromEnv()
+			if region == "" {
+				// East predates tagged sandbox IDs and remains the team default.
+				region = "use"
+			}
+			attempt, attemptErr := uuid.Parse(claims.AttemptID)
+			team, teamErr := uuid.Parse(claims.TeamID)
+			if attemptErr != nil || attempt == uuid.Nil || teamErr != nil || team == uuid.Nil ||
+				claims.AuthorityUnavailable == nil || claims.HomeRegion == "" ||
+				claims.HomeRegion != region {
+				deny()
+				return
+			}
+		case "evidence", "register", "signup-eligibility":
 			if claims.AttemptID != "" {
 				deny()
 				return

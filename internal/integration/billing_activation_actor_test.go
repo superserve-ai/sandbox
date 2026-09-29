@@ -13,6 +13,96 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestIntegration_StripeSettledPromotionAmbiguousOwnerAllowsPaidUpdates(t *testing.T) {
+	ctx := context.Background()
+	teamID, _, userID := seedTeamAndKeyWithRole(t, "team_owner")
+	otherUser := uuid.New()
+	rolloutExec(t, testPool, `INSERT INTO profile(id,email) VALUES($1,$2)`, otherUser, otherUser.String()+"@example.com")
+	rolloutExec(t, testPool, `INSERT INTO team_memberships(team_id,user_id,status) VALUES($1,$2,'active')`, teamID, otherUser)
+	rolloutExec(t, testPool, `INSERT INTO user_role_assignments(team_id,user_id,role_id,scope_type)
+		SELECT $1,$2,id,'team' FROM roles WHERE name='team_owner'`, teamID, otherUser)
+	customerID, subscriptionID := "cus_"+teamID.String(), "sub_"+teamID.String()
+	created := time.Now().UTC().Truncate(time.Second)
+	grantedAt := created.Add(-24 * time.Hour)
+	// Historical grants can lack activation provenance even when consumption is known.
+	rolloutExec(t, testPool, `INSERT INTO team_billing_account(team_id,stripe_customer_id,stripe_subscription_id,
+		stripe_subscription_status,stripe_activation_credit_grant_id,stripe_activation_credit_granted_at)
+		VALUES($1,$2,$3,'paused',$4,$5)`, teamID, customerID, subscriptionID, "credgrant_"+teamID.String(), grantedAt)
+	rolloutExec(t, testPool, `INSERT INTO team_credit_grant(team_id,amount_usd,remaining_usd,reason,created_by)
+		VALUES($1,95,17,'stripe promotional credit',$2)`, teamID, userID)
+	rolloutExec(t, testPool, `INSERT INTO user_promotion_entitlement(user_id,stripe_redemption_at,stripe_redemption_team_id)
+		VALUES($1,$2,$3)`, userID, grantedAt, teamID)
+	snapshot := func() string {
+		t.Helper()
+		var state string
+		if err := testPool.QueryRow(ctx, `SELECT jsonb_build_object(
+			'activation', (SELECT jsonb_object_agg(key,value) FROM jsonb_each(to_jsonb(a))
+				WHERE key LIKE 'stripe_activation_%'),
+			'credits', (SELECT jsonb_agg(to_jsonb(g) ORDER BY g.id) FROM team_credit_grant g WHERE g.team_id=$1),
+			'entitlements', (SELECT jsonb_agg(to_jsonb(e) ORDER BY e.user_id) FROM user_promotion_entitlement e
+				WHERE e.user_id IN ($2,$3)),
+			'device_grants', (SELECT jsonb_agg(to_jsonb(d) ORDER BY d.user_id,d.promotion) FROM promotion_device_grant d
+				WHERE d.team_id=$1 OR d.user_id IN ($2,$3)))::text
+			FROM team_billing_account a WHERE a.team_id=$1`, teamID, userID, otherUser).Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+	before := snapshot()
+	stripe := &fakeStripeClient{}
+	router := newBillingRouter(t, stripe)
+	for i, transition := range []struct{ eventType, status string }{
+		{"customer.subscription.updated", "active"},
+		{"customer.subscription.paused", "paused"},
+		{"customer.subscription.resumed", "active"},
+	} {
+		eventID := "evt_" + uuid.NewString()
+		eventAt := created.Add(time.Duration(i) * time.Second)
+		payload := stripeSubscriptionWebhookPayload(t, eventID, transition.eventType,
+			subscriptionID, customerID, transition.status, eventAt, created, created.AddDate(0, 1, 0))
+		for replay := 0; replay < 2; replay++ {
+			req := httptest.NewRequest("POST", "/stripe/webhook", strings.NewReader(string(payload)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Stripe-Signature", stripeSignature(t, payload, eventAt))
+			if response := doRequest(router, req); response.Code != http.StatusOK {
+				t.Fatalf("%s replay=%d: got %d: %s", transition.eventType, replay, response.Code, response.Body.String())
+			}
+			account, err := testQueries.GetTeamBillingAccount(ctx, teamID)
+			if err != nil || derefString(account.StripeSubscriptionStatus) != transition.status ||
+				!account.TrialEndedAt.Valid || !account.CurrentPeriodStart.Valid || !account.CurrentPeriodEnd.Valid {
+				t.Fatalf("paid transition not applied: account=%+v err=%v", account, err)
+			}
+			if snapshot() != before || len(stripe.creditGrantCalls) != 0 {
+				t.Fatal("paid transition changed historical promotion state or issued another grant")
+			}
+		}
+		var processed bool
+		if err := testPool.QueryRow(ctx, `SELECT processed_at IS NOT NULL FROM stripe_webhook_event WHERE event_id=$1`,
+			eventID).Scan(&processed); err != nil || !processed {
+			t.Fatalf("transition not processed: processed=%v err=%v", processed, err)
+		}
+	}
+}
+
+func TestIntegration_StripeUnsettledPromotionRequiresActor(t *testing.T) {
+	ctx := context.Background()
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	teamID := uuid.New()
+	rolloutExec(t, tx, `INSERT INTO team(id,name) VALUES($1,$2)`, teamID, "activation-"+teamID.String())
+	rolloutExec(t, tx, `INSERT INTO team_billing_account(team_id,stripe_subscription_status) VALUES($1,'active')`, teamID)
+	for _, query := range []string{
+		`SELECT activate_team_billing($1,NULL::uuid,'credgrant_unreserved')`,
+		`SELECT activate_team_billing($1,'credgrant_unreserved')`,
+		`SELECT finalize_stripe_promotion($1,NULL::uuid,'credgrant_unreserved')`,
+	} {
+		localIdentityError(t, tx, "55000", query, teamID)
+	}
+}
+
 func TestIntegration_StripeActivationRequiresUnambiguousOwnerFallback(t *testing.T) {
 	type member struct {
 		legacyOwner  bool
