@@ -350,6 +350,8 @@ BUNDLE_FILES = [
     "deploy/superserve-vmd-wake-floor-guard.conf",
     "deploy/vmd-staged-intent-floor-guard",
     "deploy/superserve-vmd-staged-intent-floor-guard.conf",
+    "deploy/vmd-snapshot-backup-floor-guard",
+    "deploy/superserve-vmd-snapshot-backup-floor-guard.conf",
     "deploy/superserve-vmd-start-generation.conf",
     "deploy/superserve-secretsproxy.service",
     "deploy/firecracker@.service",
@@ -744,6 +746,10 @@ def main() -> int:
             sudo install -d -m 0755 /etc/systemd/system/superserve-vmd.service.d
             sudo install -m 0755 {extract_dir}/deploy/vmd-staged-intent-floor-guard {install_dir}/vmd-staged-intent-floor-guard
             sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-staged-intent-floor-guard.conf /etc/systemd/system/superserve-vmd.service.d/31-staged-intent-floor-guard.conf
+            # Snapshot-backup floor, the same way: in and in effect before the
+            # binary that queues saved snapshot backups can run.
+            sudo install -m 0755 {extract_dir}/deploy/vmd-snapshot-backup-floor-guard {install_dir}/vmd-snapshot-backup-floor-guard
+            sudo install -m 0644 {extract_dir}/deploy/superserve-vmd-snapshot-backup-floor-guard.conf /etc/systemd/system/superserve-vmd.service.d/32-snapshot-backup-floor-guard.conf
             sudo systemctl daemon-reload
 
             # Install vmd + template-builder binaries.

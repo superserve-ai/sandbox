@@ -643,12 +643,14 @@ func main() {
 		case "capabilities":
 			// Advertised so rollback tooling can detect a downgrade to a binary
 			// that lacks cgroup supervision, the wake protocol frozen images
-			// depend on, or the staged intents a capture journals. Env-free by
-			// design; the literals are what the deploy guard greps the binary
-			// for, so they must stay verbatim.
+			// depend on, the staged intents a capture journals, or the saved
+			// snapshot backups it queues. Env-free by design; the literals are
+			// what the deploy guards grep the binary for, so they must stay
+			// verbatim.
 			fmt.Println("cgroup-supervision")
 			fmt.Println(vm.WakeProtocolCapability)
 			fmt.Println(vm.StagedIntentCapability)
+			fmt.Println(vm.SnapshotBackupCapability)
 			return
 		case "raise-wake-floor":
 			// Operator step before the first frozen image can exist anywhere:
@@ -1784,6 +1786,17 @@ func main() {
 		// meta (both no-ops when backup is disabled).
 		mgr.RecoverPendingBackups(ctx, log)
 		mgr.RecoverTemplateBackups(ctx, log)
+		go func() {
+			defer sentrylog.Recover("saved snapshot backup sweep")
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(vm.SavedSnapshotBackupSweep):
+				}
+				mgr.RecoverSavedSnapshotBackups(ctx, log)
+			}
+		}()
 		// One-time coverage for sandboxes that paused before the uploader
 		// existed and will never pause again on their own. Off by default:
 		// the pass reads every paused snapshot once, so it's enabled per

@@ -58,6 +58,7 @@ type backupReportBody struct {
 	TemplateRuntime  *backup.TemplateRuntime `json:"template_runtime,omitempty"`
 	BuildIncarnation string                  `json:"build_incarnation,omitempty"`
 	SandboxID        string                  `json:"sandbox_id,omitempty"`
+	SnapshotID       string                  `json:"snapshot_id,omitempty"`
 	TemplateID       string                  `json:"template_id,omitempty"`
 	BuildID          string                  `json:"build_id,omitempty"`
 	Generation       string                  `json:"generation"`
@@ -99,6 +100,7 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	body := backupReportBody{
 		TemplateRuntime: task.TemplateRuntime, BuildIncarnation: task.BuildIncarnation,
 		SandboxID:   task.SandboxID,
+		SnapshotID:  task.SnapshotID,
 		TemplateID:  task.TemplateID,
 		BuildID:     task.BuildID,
 		Generation:  task.Generation,
@@ -178,6 +180,12 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 			return nil
 		}
 	}
+	// A control plane older than saved-snapshot backups (vmd rolled out
+	// first, or the control plane rolled back) takes this report once it
+	// is current: keep it rather than lose the snapshot's coverage row.
+	if task.SnapshotID != "" && permanentReject(status) && isUnknownSnapshotField(msg) {
+		return fmt.Errorf("snapshot backup report deferred: %s: %w", statusLine, backup.ErrNotificationDeferred)
+	}
 	// A permanent rejection can never succeed on retry, and the flush
 	// stops at the first failure, so returning an error here would wedge
 	// every later report on this host behind one poisoned entry forever.
@@ -186,6 +194,7 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 	if permanentReject(status) {
 		r.Log.Error().Str("generation", task.Generation).
 			Str("sandbox_id", task.SandboxID).Str("template_id", task.TemplateID).
+			Str("snapshot_id", task.SnapshotID).
 			Str("status", statusLine).Str("response", string(msg)).
 			Msg("backup report permanently rejected; dropping its coverage row")
 		return nil
@@ -222,6 +231,11 @@ func permanentReject(status int) bool {
 func isUnknownPauseTokenField(msg []byte) bool {
 	return bytes.Contains(msg, []byte(`unknown field "pause_token"`)) ||
 		bytes.Contains(msg, []byte(`unknown field \"pause_token\"`))
+}
+
+func isUnknownSnapshotField(msg []byte) bool {
+	return bytes.Contains(msg, []byte(`unknown field "snapshot_id"`)) ||
+		bytes.Contains(msg, []byte(`unknown field \"snapshot_id\"`))
 }
 
 func isUnknownObjectField(msg []byte) bool {

@@ -316,6 +316,7 @@ type BackupGeneration struct {
 	CoveredSnapshotGeneration *int64             `json:"covered_snapshot_generation"`
 	PurgeClaimedAt            pgtype.Timestamptz `json:"purge_claimed_at"`
 	PurgedAt                  pgtype.Timestamptz `json:"purged_at"`
+	SnapshotID                pgtype.UUID        `json:"snapshot_id"`
 }
 
 type BackupWalk struct {

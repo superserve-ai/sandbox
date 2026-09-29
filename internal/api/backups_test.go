@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/superserve-ai/sandbox/internal/db"
 )
@@ -153,5 +155,45 @@ func TestReportHostBackupAcceptsReportsWithoutObjectPaths(t *testing.T) {
 	}
 	if strings.Contains(string(gotFiles), `"object"`) {
 		t.Fatalf("files jsonb = %s, want no object key for a pre-field report", gotFiles)
+	}
+}
+
+// A saved snapshot's report is recorded against the snapshot, with object
+// paths bound to its own snapshots/ prefix, and never touches a sandbox row.
+func TestReportHostBackupRecordsASnapshotOwner(t *testing.T) {
+	const sid = "7c2d9e4f-1a3b-4c5d-8e6f-9a0b1c2d3e4f"
+	gen := strings.Repeat("ab", 32)
+	sha := strings.Repeat("cd", 32)
+	var gotOwner string
+	var gotFiles []byte
+	h := &Handlers{DB: db.New(&mockDBTX{
+		execFn: func(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+			if !strings.Contains(sql, "-- name: RecordSnapshotBackupGeneration :execrows") {
+				return pgconn.CommandTag{}, fmt.Errorf("unexpected Exec: %s", sql)
+			}
+			gotOwner = uuid.UUID(args[0].(pgtype.UUID).Bytes).String()
+			gotFiles = args[4].([]byte)
+			return pgconn.NewCommandTag("INSERT 0 1"), nil
+		},
+	})}
+	report := func(owners, object string) string {
+		return fmt.Sprintf(`{%s,"generation":%q,"bucket":"cell-bucket",`+
+			`"completed_at":"2026-08-01T00:00:00Z","files":[`+
+			`{"name":"rootfs.ext4","size_bytes":4,"sha256":%q,"object":%q}]}`, owners, gen, sha, object)
+	}
+	object := "snapshots/" + sid + "/" + gen + "/rootfs.ext4.pabc123"
+	if w := postBackupReport(t, h, report(fmt.Sprintf(`"snapshot_id":%q`, sid), object)); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", w.Code, w.Body.String())
+	}
+	if gotOwner != sid || !strings.Contains(string(gotFiles), object) {
+		t.Fatalf("recorded owner %s files %s", gotOwner, gotFiles)
+	}
+
+	foreign := "sandboxes/" + sid + "/" + gen + "/rootfs.ext4.pabc123"
+	if w := postBackupReport(t, h, report(fmt.Sprintf(`"snapshot_id":%q`, sid), foreign)); w.Code != http.StatusBadRequest {
+		t.Fatalf("snapshot report under another owner's prefix: status = %d, want 400", w.Code)
+	}
+	if w := postBackupReport(t, h, report(fmt.Sprintf(`"snapshot_id":%q,"sandbox_id":%q`, sid, sid), object)); w.Code != http.StatusBadRequest {
+		t.Fatalf("two owners: status = %d, want 400", w.Code)
 	}
 }

@@ -30,6 +30,7 @@ import (
 type GenerationManifest struct {
 	TemplateRuntime *TemplateRuntime `json:"template_runtime,omitempty"`
 	SandboxID       string           `json:"sandbox_id,omitempty"`
+	SnapshotID      string           `json:"snapshot_id,omitempty"`
 	TemplateID      string           `json:"template_id,omitempty"`
 	BuildID         string           `json:"build_id,omitempty"`
 	Generation      string           `json:"generation"`
@@ -437,6 +438,14 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	if cleared {
 		removeStagedTask(u.StagingRoot, task)
 	}
+	if task.SnapshotID != "" {
+		// A saved snapshot's files stay on the host, unread until a fork
+		// copies them by reflink: the upload's pages go rather than evict
+		// pages in use. Shared bases stay cached, as in staging.
+		for _, f := range task.Files {
+			_ = dropStagingPages(f.Path)
+		}
+	}
 	result := telemetry.BackupUploadAbandoned
 	if completed {
 		result = telemetry.BackupUploadDeduped
@@ -620,6 +629,7 @@ func (u *Uploader) uploadTask(ctx context.Context, task *Task) (completed bool, 
 	gen := GenerationManifest{
 		TemplateRuntime: task.TemplateRuntime,
 		SandboxID:       task.SandboxID,
+		SnapshotID:      task.SnapshotID,
 		TemplateID:      task.TemplateID,
 		BuildID:         task.BuildID,
 		Generation:      task.Generation,
@@ -852,16 +862,22 @@ func (u *Uploader) sweepRetiredStaging() {
 // across rebuilds of a template, so the generation is what stops a rebuild
 // from deduping against a previous build's objects (see TemplateObject).
 func (t *Task) objectName(fileName string) (string, error) {
-	if t.TemplateID != "" {
+	switch {
+	case t.TemplateID != "":
 		return TemplateObject(t.TemplateID, t.BuildID, t.Generation, fileName)
+	case t.SnapshotID != "":
+		return SnapshotObject(t.SnapshotID, t.Generation, fileName)
 	}
 	return SandboxObject(t.SandboxID, t.Generation, fileName)
 }
 
 // logOwner stamps the task's owning identity onto a log event.
 func (t *Task) logOwner(e *zerolog.Event) *zerolog.Event {
-	if t.TemplateID != "" {
+	switch {
+	case t.TemplateID != "":
 		return e.Str("template_id", t.TemplateID).Str("build_id", t.BuildID)
+	case t.SnapshotID != "":
+		return e.Str("snapshot_id", t.SnapshotID)
 	}
 	return e.Str("sandbox_id", t.SandboxID)
 }
