@@ -403,7 +403,9 @@ func run() error {
 	} else {
 		billing.StartHourlyRollupService(ctx, dbPool, queries, billing.DefaultHourlyRollupConfig())
 	}
-	billing.StartBillingFinalizationService(ctx, dbPool, billing.DefaultBillingFinalizationConfig())
+	billingFinalizationConfig := billing.DefaultBillingFinalizationConfig()
+	billingFinalizationConfig.ResolveActiveMeter = handlers.ResolveActiveBillingMeter
+	billing.StartBillingFinalizationService(ctx, dbPool, billingFinalizationConfig)
 	handlers.StartIncrementalBillingService(ctx)
 	handlers.StartStripeCheckoutAssociationMonitor(ctx)
 

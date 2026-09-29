@@ -307,6 +307,8 @@ func TestIntegration_IncrementalAdoptionEndpoint(t *testing.T) {
 		{"boundary_before_event", http.StatusBadRequest},
 		{"boundary_outside_period", http.StatusBadRequest},
 		{"provider_total_mismatch", http.StatusConflict},
+		{"provider_tiny_excess", http.StatusConflict},
+		{"provider_tiny_lag", http.StatusConflict},
 		{"provider_unavailable", http.StatusConflict},
 		{"valid_repeated_adoption", http.StatusOK},
 		{"legacy_repeated_adoption", http.StatusOK},
@@ -381,6 +383,12 @@ func TestIntegration_IncrementalAdoptionEndpoint(t *testing.T) {
 				}
 				switch eventName {
 				case "cpu_vcpu_hours":
+					if tc.name == "provider_tiny_excess" {
+						return "1.250000000001", nil
+					}
+					if tc.name == "provider_tiny_lag" {
+						return "1.249999999999", nil
+					}
 					if tc.name == "provider_total_mismatch" {
 						return "1.5", nil
 					}
@@ -1616,8 +1624,13 @@ func testIncrementalDisabledStorageRemainsReconcilable(t *testing.T, source stri
 		if w.Code != wantCode || billingPeriodStatus(t, p.TeamID, p.Start, p.End) != wantStatus {
 			t.Fatalf("%s close: %d %s", mode, w.Code, w.Body.String())
 		}
-		if storageReads != 1 {
-			t.Fatalf("%s storage summary reads = %d, want 1", mode, storageReads)
+		wantStorageReads := 1
+		if mode == "frozen" {
+			// Frozen recovery reconciles before delivery and refreshes evidence afterward.
+			wantStorageReads = 2
+		}
+		if storageReads != wantStorageReads {
+			t.Fatalf("%s storage summary reads = %d, want %d", mode, storageReads, wantStorageReads)
 		}
 		var local, reserved, submitted string
 		var counted, lastError *string
