@@ -848,7 +848,7 @@ func TestIntegration_PromotionSameAccountRedeemsOncePerRegion(t *testing.T) {
 					t.Fatalf("signup result replay: %q, %v", replay, err)
 				}
 				reserve(team, replayEvent, "ineligible")
-				reserve(duplicateTeam, "evt-"+uuid.NewString(), "ineligible")
+				reserve(duplicateTeam, "evt-"+uuid.NewString(), "user_already_redeemed")
 				if w := sendStripeActivationWebhook(t, router, replayEvent, team, user, now); w.Code != http.StatusOK {
 					t.Fatalf("Stripe activation replay: %d %s", w.Code, w.Body.String())
 				}

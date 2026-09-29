@@ -345,9 +345,6 @@ func TestIntegration_BillingRecoveryCompletedCheckout(t *testing.T) {
 			stripe.mu.Lock()
 			stripe.checkouts[session] = map[string]any{"id": session, "status": tc.status, "customer": customer, "subscription": subscription, "client_reference_id": owner}
 			stripe.mu.Unlock()
-			if tc.grant {
-				stripe.setExistingGrant(team, subscription, int64(tc.amount))
-			}
 			args := []string{"-team", team.String(), "-activation-credit-cents", strconv.Itoa(tc.amount)}
 			dry := runBillingRecoveryCommand(t, stripe.server.URL, args...)
 			if tc.want == "repaired" && dry["outcome"] != "candidate" {
@@ -428,9 +425,6 @@ func TestIntegration_BillingRecoveryExpiredReservationAndMissingAssociation(t *t
 			stripe.mu.Lock()
 			stripe.checkouts[session] = map[string]any{"id": session, "status": status, "customer": customer, "subscription": subscription, "client_reference_id": team.String()}
 			stripe.mu.Unlock()
-			if !missing {
-				stripe.setExistingGrant(team, subscription, 9500)
-			}
 			result := runBillingRecoveryCommand(t, stripe.server.URL, "-team", team.String(), "-apply")
 			expected := "repaired"
 			if missing {
