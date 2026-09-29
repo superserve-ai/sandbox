@@ -253,7 +253,15 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 		return nil, status.Error(codes.InvalidArgument, "tokenized preview policy requires a positive preview_policy_revision")
 	}
 
-	inst, err := a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
+	var inst *VMInstance
+	if id := vmCfg.SavedSnapshotID; id != "" && a.mgr.BackupRestoreEnabled() && a.mgr.savedSnapshotFilesMissing(id) {
+		if req.GetBackupGeneration() == "" {
+			return nil, savedSnapshotMissingErr(id)
+		}
+		inst, err = a.mgr.forkFromBackup(ctx, req.GetVmId(), req.GetBackupGeneration(), vmCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
+	} else {
+		inst, err = a.mgr.RestoreVMSnapshot(ctx, req.GetVmId(), req.GetSnapshotPath(), req.GetMemFilePath(), vmCfg, netCfg, req.GetTeamId(), req.GetOwnerId(), req.GetPreviewAccess(), previewPorts, req.GetPreviewPolicyRevision())
+	}
 	if err != nil {
 		return nil, err
 	}

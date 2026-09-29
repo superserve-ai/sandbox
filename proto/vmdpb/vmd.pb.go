@@ -2114,8 +2114,12 @@ type RestoreSnapshotRequest struct {
 	// Egress rules installed before the guest runs: a VM created from a saved
 	// snapshot resumes the workload it was captured with.
 	SandboxNetwork *SandboxNetworkConfig `protobuf:"bytes,16,opt,name=sandbox_network,json=sandboxNetwork,proto3" json:"sandbox_network,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// The backup generation of saved_snapshot_id to cold boot from when the
+	// host no longer has the snapshot's files; sent after the daemon refuses
+	// with SAVED_SNAPSHOT_MISSING.
+	BackupGeneration string `protobuf:"bytes,17,opt,name=backup_generation,json=backupGeneration,proto3" json:"backup_generation,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RestoreSnapshotRequest) Reset() {
@@ -2251,6 +2255,13 @@ func (x *RestoreSnapshotRequest) GetSandboxNetwork() *SandboxNetworkConfig {
 		return x.SandboxNetwork
 	}
 	return nil
+}
+
+func (x *RestoreSnapshotRequest) GetBackupGeneration() string {
+	if x != nil {
+		return x.BackupGeneration
+	}
+	return ""
 }
 
 type PreviewPort struct {
@@ -4408,7 +4419,7 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
 	"\rmem_file_path\x18\x03 \x01(\tR\vmemFilePath\x12&\n" +
-	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xbe\x06\n" +
+	"\x0fcreated_at_unix\x18\x04 \x01(\x03R\rcreatedAtUnix\"\xeb\x06\n" +
 	"\x16RestoreSnapshotRequest\x12\x13\n" +
 	"\x05vm_id\x18\x01 \x01(\tR\x04vmId\x12#\n" +
 	"\rsnapshot_path\x18\x02 \x01(\tR\fsnapshotPath\x12\"\n" +
@@ -4425,7 +4436,8 @@ const file_proto_vmd_proto_rawDesc = "" +
 	"\rpreview_ports\x18\r \x03(\v2\x1e.superserve.vmd.v1.PreviewPortR\fpreviewPorts\x126\n" +
 	"\x17preview_policy_revision\x18\x0e \x01(\x03R\x15previewPolicyRevision\x12*\n" +
 	"\x11saved_snapshot_id\x18\x0f \x01(\tR\x0fsavedSnapshotId\x12P\n" +
-	"\x0fsandbox_network\x18\x10 \x01(\v2'.superserve.vmd.v1.SandboxNetworkConfigR\x0esandboxNetwork\x1a:\n" +
+	"\x0fsandbox_network\x18\x10 \x01(\v2'.superserve.vmd.v1.SandboxNetworkConfigR\x0esandboxNetwork\x12+\n" +
+	"\x11backup_generation\x18\x11 \x01(\tR\x10backupGeneration\x1a:\n" +
 	"\fEnvVarsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01J\x04\b\x04\x10\x05R\foverlay_path\"^\n" +

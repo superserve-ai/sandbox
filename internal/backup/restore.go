@@ -164,17 +164,17 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 
 // restoreGeneration is RestoreGeneration with entries skip reports as
 // already satisfied outside destDir, such as a shared base the host holds.
-func restoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, skip func(ManifestFile) bool, progress ProgressFunc) (*GenerationManifest, error) {
+func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, destDir string, skip func(ManifestFile) bool, progress ProgressFunc) (*GenerationManifest, error) {
 	report := func(format string, args ...any) {
 		if progress != nil {
 			progress(format, args...)
 		}
 	}
-	manifest, err := fetchManifest(ctx, r, sandboxID, generation, report)
+	manifest, err := fetchManifest(ctx, r, owner, generation, report)
 	if err != nil {
 		return nil, err
 	}
-	report("manifest %s/%s: %d files", sandboxID, generation, len(manifest.Files))
+	report("manifest %s/%s: %d files", owner, generation, len(manifest.Files))
 	root, err := openFreshDir(destDir)
 	if err != nil {
 		return nil, err
@@ -216,7 +216,7 @@ func restoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 			continue
 		}
 		report("restoring %s (%d bytes packed, %d apparent)", mf.Name, mf.PackedSize, mf.Size)
-		madeFile, publish, err := restoreFile(ctx, r, sandboxID, generation, mf, root)
+		madeFile, publish, err := restoreFile(ctx, r, owner, generation, mf, root)
 		if madeFile {
 			created = append(created, mf.Name)
 		}
@@ -383,15 +383,26 @@ func makeDirPortable(dir string) error {
 	return nil
 }
 
-func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation string, report ProgressFunc) (*GenerationManifest, error) {
-	object, err := SandboxObject(sandboxID, generation, ManifestObject)
+// SnapshotOwner names a saved snapshot's backup where a sandbox id would
+// otherwise name the owner.
+func SnapshotOwner(snapshotID string) string { return snapshotOwnerPrefix + snapshotID }
+
+func ownerObject(owner, generation, fileName string) (string, error) {
+	if id, ok := strings.CutPrefix(owner, snapshotOwnerPrefix); ok {
+		return SnapshotObject(id, generation, fileName)
+	}
+	return SandboxObject(owner, generation, fileName)
+}
+
+func fetchManifest(ctx context.Context, r BlobReader, owner, generation string, report ProgressFunc) (*GenerationManifest, error) {
+	object, err := ownerObject(owner, generation, ManifestObject)
 	if err != nil {
 		return nil, err
 	}
 	rc, err := r.NewReader(ctx, object)
 	if err != nil {
 		if errors.Is(err, ErrObjectNotFound) {
-			return nil, fmt.Errorf("%s/%s: %w", sandboxID, generation, ErrGenerationIncomplete)
+			return nil, fmt.Errorf("%s/%s: %w", owner, generation, ErrGenerationIncomplete)
 		}
 		return nil, err
 	}
@@ -405,9 +416,13 @@ func fetchManifest(ctx context.Context, r BlobReader, sandboxID, generation stri
 	// The manifest records its own identity; a manifest copied or misplaced
 	// under another prefix could otherwise restore a different sandbox's
 	// generation with every digest passing.
-	if manifest.SandboxID != sandboxID || manifest.Generation != generation {
+	recorded := manifest.SandboxID
+	if manifest.SnapshotID != "" {
+		recorded = SnapshotOwner(manifest.SnapshotID)
+	}
+	if recorded != owner || manifest.Generation != generation {
 		return nil, fmt.Errorf("manifest identity mismatch: %s records %s/%s, requested %s/%s",
-			object, manifest.SandboxID, manifest.Generation, sandboxID, generation)
+			object, recorded, manifest.Generation, owner, generation)
 	}
 	// The manifest must also be self-authenticating: the generation prefix
 	// is the content address GenerationKey derives from the enqueued file
@@ -543,7 +558,7 @@ func isSharedEntry(mf ManifestFile) bool {
 // (or a symlink planted in between) is never opened, truncated, or
 // followed. madeFile reports whether this call created the file, and only
 // then may the caller's failure cleanup remove it.
-func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string, mf ManifestFile, root *os.Root) (madeFile bool, publish func(bool) error, _ error) {
+func restoreFile(ctx context.Context, r BlobReader, owner, generation string, mf ManifestFile, root *os.Root) (madeFile bool, publish func(bool) error, _ error) {
 	if mf.Object == "" {
 		return false, nil, fmt.Errorf("manifest entry records no object name")
 	}
@@ -567,7 +582,7 @@ func restoreFile(ctx context.Context, r BlobReader, sandboxID, generation string
 			return false, nil, fmt.Errorf("manifest object name: %w", err)
 		}
 		var err error
-		object, err = SandboxObject(sandboxID, generation, mf.Object)
+		object, err = ownerObject(owner, generation, mf.Object)
 		if err != nil {
 			return false, nil, err
 		}

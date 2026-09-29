@@ -112,6 +112,7 @@ func (m *Manager) backupRevivedTarget(vmID, generation string) (target *VMInstan
 // claimed by exactly one resume, which then owns the staging, or dropped
 // by the cap or expiry, never both.
 type backupFlight struct {
+	owner      string
 	generation string
 	done       chan struct{}
 	dropped    chan struct{}
@@ -143,11 +144,11 @@ func (m *Manager) restoreStagingDir(vmID string) string {
 // backupFlightFor joins the flight already fetching the generation or
 // starts one, refusing outright when the host already carries as many
 // flights as it will queue.
-func (m *Manager) backupFlightFor(vmID, generation string) (*backupFlight, error) {
+func (m *Manager) backupFlightFor(vmID, owner, generation string) (*backupFlight, error) {
 	m.backupFlightsMu.Lock()
 	defer m.backupFlightsMu.Unlock()
 	if f := m.backupFlights[vmID]; f != nil {
-		if f.generation != generation {
+		if f.owner != owner || f.generation != generation {
 			return nil, status.Errorf(codes.Aborted, "vm %s: a restore of a different backup is in flight", vmID)
 		}
 		return f, nil
@@ -155,7 +156,7 @@ func (m *Manager) backupFlightFor(vmID, generation string) (*backupFlight, error
 	if len(m.backupFlights) >= m.backupRestore.MaxFlights {
 		return nil, status.Errorf(codes.ResourceExhausted, "vm %s: the host is restoring as many backups as it queues; retry later", vmID)
 	}
-	f := &backupFlight{generation: generation, done: make(chan struct{}), dropped: make(chan struct{})}
+	f := &backupFlight{owner: owner, generation: generation, done: make(chan struct{}), dropped: make(chan struct{})}
 	m.backupFlights[vmID] = f
 	go m.runBackupFlight(vmID, f)
 	return f, nil
@@ -185,7 +186,7 @@ func (m *Manager) runBackupFlight(vmID string, f *backupFlight) {
 		// Readers hold the cache lock shared; the prune below takes it
 		// exclusively, so nothing is deleted between discovery and open.
 		m.backupCacheMu.RLock()
-		f.restored, f.err = fetchBackupGeneration(ctx, m.backupBaseReader, vmID, f.generation, dest, func(format string, args ...any) {
+		f.restored, f.err = fetchBackupGeneration(ctx, m.backupBaseReader, f.owner, f.generation, dest, func(format string, args ...any) {
 			log.Debug().Msgf(format, args...)
 		})
 		if f.err == nil {
@@ -476,34 +477,12 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 	inst.mu.RLock()
 	teamID, ownerID, vcpu, memMiB := inst.TeamID, inst.OwnerID, inst.Config.VCPU, inst.Config.MemoryMiB
 	inst.mu.RUnlock()
-	if err := os.MkdirAll(m.restoreStagingRoot(), 0o700); err != nil {
-		return nil, status.Errorf(codes.Internal, "restore staging: %v", err)
-	}
-	tFetch := time.Now()
-	flight, err := m.backupFlightFor(vmID, generation)
+	r, release, err := m.fetchBackup(ctx, "resume", vmID, vmID, generation)
 	if err != nil {
 		return nil, err
 	}
-	select {
-	case <-flight.done:
-	case <-ctx.Done():
-		return nil, status.Errorf(codes.Unavailable, "vm %s: backup restore in progress; retry", vmID)
-	}
-	if !m.claimFlight(vmID, flight) {
-		return nil, status.Errorf(codes.Unavailable, "vm %s: the restored backup was dropped before this resume claimed it; retry", vmID)
-	}
-	defer m.releaseFlight(vmID, flight)
-	m.recordPhases("resume", "backup", map[string]time.Duration{"backup_fetch": time.Since(tFetch)})
-	if flight.err != nil {
-		_ = os.RemoveAll(m.restoreStagingDir(vmID))
-		if errors.Is(flight.err, backup.ErrNoMatchingBackup) {
-			return nil, status.Errorf(codes.FailedPrecondition, "vm %s: pause artifacts missing on host and the recorded backup is not in the bucket", vmID)
-		}
-		return nil, status.Errorf(codes.Unavailable, "vm %s: fetch backup: %v", vmID, flight.err)
-	}
-	r := flight.restored
-	log := m.log.With().Str("vm_id", vmID).Logger()
-	log.Info().Str("generation", generation).Dur("fetch", time.Since(tFetch)).
+	defer release()
+	m.log.Info().Str("vm_id", vmID).Str("generation", generation).
 		Msg("resume: pause artifacts missing on host; reviving from backup")
 	tBoot := time.Now()
 	revived, err := m.reviveVMLocked(ctx, vmID, r.Disk, r.Base, r.BlockMap, r.Standalone, false, teamID, ownerID, vcpu, memMiB, rules, generation)
@@ -521,4 +500,36 @@ func (m *Manager) resumeFromBackupLocked(ctx context.Context, vmID, generation s
 	}
 	_ = os.RemoveAll(m.restoreStagingDir(vmID))
 	return revived, nil
+}
+
+// fetchBackup waits for vmID's flight fetching owner's generation into its
+// staging, and claims the result; release ends the claim.
+func (m *Manager) fetchBackup(ctx context.Context, op, vmID, owner, generation string) (backup.Restored, func(), error) {
+	if err := os.MkdirAll(m.restoreStagingRoot(), 0o700); err != nil {
+		return backup.Restored{}, nil, status.Errorf(codes.Internal, "restore staging: %v", err)
+	}
+	tFetch := time.Now()
+	flight, err := m.backupFlightFor(vmID, owner, generation)
+	if err != nil {
+		return backup.Restored{}, nil, err
+	}
+	select {
+	case <-flight.done:
+	case <-ctx.Done():
+		return backup.Restored{}, nil, status.Errorf(codes.Unavailable, "vm %s: backup restore in progress; retry", vmID)
+	}
+	if !m.claimFlight(vmID, flight) {
+		return backup.Restored{}, nil, status.Errorf(codes.Unavailable, "vm %s: the restored backup was dropped before this request claimed it; retry", vmID)
+	}
+	release := func() { m.releaseFlight(vmID, flight) }
+	m.recordPhases(op, "backup", map[string]time.Duration{"backup_fetch": time.Since(tFetch)})
+	if flight.err != nil {
+		release()
+		_ = os.RemoveAll(m.restoreStagingDir(vmID))
+		if errors.Is(flight.err, backup.ErrNoMatchingBackup) {
+			return backup.Restored{}, nil, status.Errorf(codes.FailedPrecondition, "vm %s: the recorded backup is not in the bucket", vmID)
+		}
+		return backup.Restored{}, nil, status.Errorf(codes.Unavailable, "vm %s: fetch backup: %v", vmID, flight.err)
+	}
+	return flight.restored, release, nil
 }
