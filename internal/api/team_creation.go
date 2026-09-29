@@ -29,6 +29,10 @@ import (
 const teamCreationBodyLimit = 16 << 10
 const teamCreationAssertionLimit = 8 << 10
 
+// Keep names well below PostgreSQL's maximum B-tree index tuple size so an
+// otherwise valid request cannot become an unretryable index insertion error.
+const teamCreationNameMaxBytes = 2048
+
 type teamCreationInput struct {
 	RequestID string `json:"request_id"`
 	Name      string `json:"name"`
@@ -246,6 +250,11 @@ func trimECMAScript(raw string) string {
 	})
 }
 
+func validTeamCreationName(raw string) bool {
+	return raw != "" && utf8.ValidString(raw) && len([]byte(raw)) <= teamCreationNameMaxBytes &&
+		!strings.ContainsRune(raw, '\x00') && raw == trimECMAScript(raw)
+}
+
 func validTeamCreationPolicy(policy *teamCreationPolicy) bool {
 	if policy == nil || policy.Version != 1 || policy.Session != "passed" {
 		return false
@@ -440,7 +449,7 @@ func (h *Handlers) createInternalTeam(c *gin.Context, now time.Time) {
 	}
 	defer controller.SetReadDeadline(time.Time{})
 	var input teamCreationInput
-	if decodeUniqueJSON(body, &input) != nil || input.Name == "" || strings.ContainsRune(input.Name, '\x00') || input.Name != trimECMAScript(input.Name) ||
+	if decodeUniqueJSON(body, &input) != nil || !validTeamCreationName(input.Name) ||
 		(input.Region != "use" && input.Region != "usw") {
 		teamCreationError(c, "invalid_request", "Invalid request", http.StatusBadRequest)
 		return

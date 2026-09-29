@@ -757,8 +757,9 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 		for i := range claims {
 			claims[i] = teamCreationClaims(uuid.New(), uuid.NewString(), fmt.Sprintf("Alias %d", i))
 		}
-		claims[0]["identity"].(map[string]any)["email"] = alias + "@gmail.com"
-		claims[1]["identity"].(map[string]any)["email"] = alias[:5] + "." + alias[5:] + "+tag@googlemail.com"
+		promotionExampleProviderDomains(t, pool)
+		claims[0]["identity"].(map[string]any)["email"] = alias + "@mail.example.com"
+		claims[1]["identity"].(map[string]any)["email"] = alias[:5] + "." + alias[5:] + "+tag@alias.example.com"
 		var results [2]*httptest.ResponseRecorder
 		var wg sync.WaitGroup
 		for i := range claims {

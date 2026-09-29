@@ -184,6 +184,42 @@ func TestTeamCreationRegisteredRouteRejectsNULName(t *testing.T) {
 	}
 }
 
+func TestTeamCreationRegisteredRouteRejectsOversizedName(t *testing.T) {
+	t.Setenv("INTERNAL_API_TOKEN", "internal-test-token")
+	now := time.Unix(1_800_000_000, 0)
+	private := ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize))
+	h := &Handlers{
+		Config: &config.Config{TeamCreationRegion: "use", TeamCreationKeys: map[string]ed25519.PublicKey{"test": private.Public().(ed25519.PublicKey)}},
+		Now:    func() time.Time { return now },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	router := SetupRouter(ctx, h, nil)
+	name := strings.Repeat("a", teamCreationNameMaxBytes+1)
+	claims := teamCreationTestClaims(now)
+	claims["name"] = name
+	body, err := json.Marshal(teamCreationInput{RequestID: "42140b1e-ac77-4ab0-9841-d9099ae8265a", Name: name, Region: "use"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/internal/teams", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer internal-test-token")
+	req.Header.Set("X-Team-Creation-Assertion", signTeamCreationTestAssertion(t, claims, private))
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("oversized name route status=%d body=%s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil || response.Error.Code != "invalid_request" {
+		t.Fatalf("oversized name error body=%s err=%v", w.Body.String(), err)
+	}
+}
+
 func TestTeamCreationMissingVerifierConfigurationOnlyDisablesNewRoute(t *testing.T) {
 	t.Setenv("INTERNAL_API_TOKEN", "internal-test-token")
 	for _, tc := range []struct {
@@ -285,6 +321,14 @@ func TestTeamCreationStrictInput(t *testing.T) {
 	}
 	if trimECMAScript("Ca fé") != "Ca fé" {
 		t.Fatal("interior whitespace changed")
+	}
+	if !validTeamCreationName(strings.Repeat("a", teamCreationNameMaxBytes)) ||
+		validTeamCreationName(strings.Repeat("a", teamCreationNameMaxBytes+1)) {
+		t.Fatal("ASCII name byte boundary")
+	}
+	if !validTeamCreationName(strings.Repeat("☃", teamCreationNameMaxBytes/3)) ||
+		validTeamCreationName(strings.Repeat("☃", teamCreationNameMaxBytes/3+1)) {
+		t.Fatal("multibyte name byte boundary")
 	}
 	actor := uuid.MustParse("53ae930d-e4bd-478a-b64f-82f2b0d7e8e6")
 	if !validTeamCreationRequestID("onboarding-v1:"+actor.String()+":use", actor, "use") ||

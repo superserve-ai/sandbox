@@ -13,6 +13,8 @@ Apply the compatible promotion expansion migrations
 `20260925195213_promotion_redemption_limits.sql`,
 `20260925195235_canonical_promotion_identity.sql`, and
 `20260925195248_canonical_stripe_promotion_fences.sql`, plus the additive
+`20260927003551_regional_promotion_device_authority.sql`,
+`20260927003611_serialize_signup_device_claim.sql`,
 `20260928233535_team_creation_requests.sql` and
 `20260928233536_team_creation_signup_policy.sql` migrations, in that order,
 before enabling API creation. The signup-policy migration defines the
@@ -53,6 +55,9 @@ A name already used by another team returns HTTP 409 with
 The failed creation rolls back all writes and leaves no completed request result.
 Do not automatically retry this conflict unchanged. Choosing a different name is
 a new explicit intent with a fresh request ID and matching signed assertion.
+Names must be normalized using ECMAScript `String.trim` semantics and contain no
+more than 2048 UTF-8 bytes; this bound is enforced before provisioning so names
+cannot exceed the team-name index capacity.
 
 ## Signed identity timestamps and shared fixtures
 
