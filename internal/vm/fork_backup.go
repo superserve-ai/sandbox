@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"time"
 
 	"google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -49,9 +50,25 @@ func savedSnapshotMissingErr(snapshotID string) error {
 	return st.Err()
 }
 
+// backupForkTracked reports a VM this host booted, or is booting, from the
+// snapshot's backup as vmID; its retry goes to forkFromBackup whether or not
+// backup restore is still on.
+func (m *Manager) backupForkTracked(vmID, snapshotID string) bool {
+	m.lazyReattach(vmID)
+	m.mu.RLock()
+	inst := m.vms[vmID]
+	m.mu.RUnlock()
+	if inst == nil {
+		return false
+	}
+	inst.mu.RLock()
+	defer inst.mu.RUnlock()
+	return inst.SourceSnapshotID == snapshotID && inst.BackupGeneration != ""
+}
+
 // adoptBackupFork returns the live VM a fork from the snapshot's backup
-// already booted as vmID, with its egress rules reinstalled, so a retry
-// adopts it whether or not backup restore is still on. Nil when there is none.
+// already booted as vmID, with its egress rules reinstalled. Nil when there
+// is none. The caller holds the VM's op lock, so the boot has committed.
 func (m *Manager) adoptBackupFork(vmID, snapshotID, generation string, rules *sandboxNetworkRules) (*VMInstance, error) {
 	m.lazyReattach(vmID)
 	m.mu.RLock()
@@ -89,6 +106,12 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 	if inst, err := m.adoptBackupFork(vmID, cfg.SavedSnapshotID, generation, cfg.EgressRules); inst != nil || err != nil {
 		return inst, err
 	}
+	if generation == "" {
+		return nil, savedSnapshotMissingErr(cfg.SavedSnapshotID)
+	}
+	if !m.BackupRestoreEnabled() {
+		return nil, status.Errorf(codes.Unavailable, "vm %s: backup restore is off on this host", vmID)
+	}
 	// Own teardowns keep the staged download for the retry, and are
 	// counted so only someone else's destroy reads as one.
 	selfDestroys := uint64(0)
@@ -99,14 +122,22 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 		}
 		return err
 	}
-	if inst, err := m.getInstance(vmID); err == nil {
+	inst, instErr := m.getInstance(vmID)
+	if instErr == nil {
 		inst.mu.RLock()
 		running := inst.Status == StatusRunning && !inst.Unverified
 		inst.mu.RUnlock()
 		if running {
 			return nil, status.Errorf(codes.AlreadyExists, "vm %s is already running", vmID)
 		}
-		// What a failed attempt left behind.
+	}
+	// What a failed attempt left behind. A life this daemon lost before
+	// recording it may still run on the disk the boot replaces, so it is
+	// stopped under either supervision first, as for any fork.
+	if _, dirErr := os.Stat(filepath.Join(m.cfg.RunDir, vmID)); instErr == nil || !errors.Is(dirErr, os.ErrNotExist) {
+		if err := m.stopLeftoverLife(ctx, vmID); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "vm %s: stop what a failed attempt left running: %v", vmID, err)
+		}
 		if err := teardown(ctx); err != nil {
 			return nil, err
 		}
@@ -136,7 +167,7 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 		inst.PreviewPolicyRevision = previewPolicyRevision
 		inst.PreviewTokenPolicyRevision = inferPreviewTokenPolicyRevision(previewPorts, previewPolicyRevision)
 	}
-	var inst *VMInstance
+	inst = nil
 	err = destroyed()
 	if err == nil {
 		inst, err = m.coldBootFromRootfs(ctx, vmID, r.Disk, r.Base, r.BlockMap, cfg.EgressRules, seed, destroyed, true, SupervisionUnit, cfg.VCPU, cfg.MemoryMiB)

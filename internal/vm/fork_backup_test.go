@@ -2,9 +2,11 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -92,6 +94,57 @@ func TestForkFromBackupYieldsToADestroyDuringTheDownload(t *testing.T) {
 	}
 	if _, ok := m.vms["fork-1"]; ok {
 		t.Fatal("a destroyed fork was booted")
+	}
+}
+
+// A run dir no record accounts for may hold a live Firecracker on the disk
+// the boot would replace: until its stop is confirmed, nothing is fetched.
+func TestForkFromBackupStopsALeftoverLifeFirst(t *testing.T) {
+	m := newSavedTestManager(t)
+	m.SetBackupRestore(&slowEmptyStore{}, &slowEmptyStore{}, filepath.Join(t.TempDir(), ".restore"), BackupRestoreOptions{Concurrency: 1})
+	overlay := touch(t, filepath.Join(m.cfg.RunDir, "fork-1", "overlay.ext4"))
+	m.stopVMHook = func(context.Context, string, Supervision) error { return errors.New("unit still active") }
+	orig := fetchBackupGeneration
+	fetchBackupGeneration = func(context.Context, backup.BlobReader, string, string, string, backup.ProgressFunc) (backup.Restored, error) {
+		t.Fatal("fetched over a life that was not stopped")
+		return backup.Restored{}, nil
+	}
+	defer func() { fetchBackupGeneration = orig }()
+	cfg := VMConfig{VCPU: 1, MemoryMiB: 512, SavedSnapshotID: "5f0c2a9e-1b7d-4c3e-8a6f-0d9e2b4c7a13"}
+	if _, err := m.forkFromBackup(context.Background(), "fork-1", "gen-1", cfg, "team", "", "", nil, 0); status.Code(err) != codes.Unavailable {
+		t.Fatalf("err = %v, want Unavailable", err)
+	}
+	if _, err := os.Stat(overlay); err != nil {
+		t.Fatalf("the leftover's disk was touched: %v", err)
+	}
+}
+
+// A retry adopts only once the attempt it repeats has committed.
+func TestBackupForkRetryWaitsForTheBootItAdopts(t *testing.T) {
+	m := newSavedTestManager(t)
+	snapshotID := "5f0c2a9e-1b7d-4c3e-8a6f-0d9e2b4c7a13"
+	m.vms["fork-1"] = &VMInstance{ID: "fork-1", Status: StatusRunning, SourceSnapshotID: snapshotID, BackupGeneration: "gen-1"}
+	orig := vmDeadForRetry
+	vmDeadForRetry = func(*Manager, string) bool { return false }
+	defer func() { vmDeadForRetry = orig }()
+	unlock, err := m.lockVMOp(context.Background(), "fork-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		req := &vmdpb.RestoreSnapshotRequest{VmId: "fork-1", SavedSnapshotId: snapshotID, BackupGeneration: "gen-1"}
+		_, err := (&GRPCAdapter{mgr: m}).RestoreSnapshot(context.Background(), req)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("adopted while the boot still held the VM: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	unlock()
+	if err := <-done; err != nil {
+		t.Fatalf("retry after the commit: %v", err)
 	}
 }
 
