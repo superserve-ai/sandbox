@@ -87,6 +87,32 @@ resource "google_tags_tag_value" "protected" {
   }
 }
 
+// Service agents are Google-owned and do not inherit this project's tags.
+resource "google_tags_tag_key" "account_scope" {
+  parent     = "projects/${google_project.qm.number}"
+  short_name = "qm-account-scope"
+  depends_on = [google_project_service.enabled]
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_tags_tag_value" "account_scope" {
+  parent     = google_tags_tag_key.account_scope.id
+  short_name = "tenant-project"
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "google_tags_tag_binding" "account_scope" {
+  parent    = "//cloudresourcemanager.googleapis.com/projects/${google_project.qm.number}"
+  tag_value = google_tags_tag_value.account_scope.id
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
 locals {
   protected_accounts = merge(
     { for name, account in google_service_account.platform : name => account.email },

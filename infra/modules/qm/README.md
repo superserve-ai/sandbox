@@ -75,12 +75,15 @@ is granted. No routine identity may access another environment's state or roles.
 
 Cloud Run and service-account authorization use the bootstrap-owned
 `qm-protected=platform` resource tag. Provisioner lifecycle permissions require
-that tag to be absent. Every locally owned platform service/account and default account is tagged
-before activation. Google-owned service agents are not user-managed accounts:
-this module does not attempt to bind tags to them through a QM-project service
-account path. No grant on those external identities is made to the provisioner;
-actual-identity negative tests must confirm they cannot be attached/impersonated.
-See Google's [service-agent ownership documentation](https://cloud.google.com/compute/docs/access/service-accounts). The provisioner
+that tag to be absent. Account permissions additionally require
+`qm-account-scope=tenant-project`, attached only to the QM project by bootstrap.
+Locally owned accounts inherit this tag; Google-owned service agents and accounts
+in other projects do not. An absent protection tag alone cannot grant account
+access. Every locally owned platform service/account and default account is
+protected before activation. This module does not attempt to tag Google-owned
+service agents through a QM-project service-account path.
+See Google's [tag inheritance documentation](https://cloud.google.com/iam/docs/tags-access-control)
+and [service-agent ownership documentation](https://cloud.google.com/compute/docs/access/service-accounts). The provisioner
 cannot attach/remove tags, change service-account policies, create keys, mint
 service-account tokens, or mutate project/custom-role/federation policy. It may
 attach only an unprotected tenant identity to a tenant service. All unprotected
@@ -90,7 +93,14 @@ types, not an unsupported claim of name-based IAM enforcement.
 
 Service-account tags are currently a Google preview feature. This is a material
 rollout dependency: verify their conditional authorization for get/update/delete
-and `actAs` using actual identities before enabling provisioning. See Google's
+and `actAs` using actual identities before enabling provisioning. Confirm a newly
+created tenant account inherits the project scope tag and is usable, while
+protected platform/default accounts, the Cloud Run, Compute Engine and Google
+APIs service agents, and an account in the paired project are denied. Check each
+target's effective tags and `testIamPermissions`; exercise forbidden mutations
+only against disposable fixtures. Confirm attaching a service agent to a
+disposable tenant Cloud Run service is denied. Repeat for newly enabled APIs'
+service agents before restoring provisioning. See Google's
 [service-account tag documentation](https://cloud.google.com/iam/docs/service-accounts-tags)
 and [tag-based access controls](https://cloud.google.com/iam/docs/tags-access-control).
 Do not substitute unconditional account administration if verification fails.

@@ -61,7 +61,7 @@ resource "google_project_iam_member" "tenant_create" {
       error_message = "Create and protect every platform service before enabling tenant provisioning."
     }
   }
-  depends_on = [google_tags_tag_binding.account, google_tags_location_tag_binding.service, google_project_default_service_accounts.deprivilege]
+  depends_on = [google_tags_tag_binding.account_scope, google_tags_tag_binding.account, google_tags_location_tag_binding.service, google_project_default_service_accounts.deprivilege]
 }
 
 resource "google_project_iam_member" "tenant_untagged" {
@@ -70,8 +70,11 @@ resource "google_project_iam_member" "tenant_untagged" {
   role     = google_project_iam_custom_role.bounded[each.key].name
   member   = "serviceAccount:${google_service_account.platform["qm-provisioner"].email}"
   condition {
-    title      = "exclude-protected-platform"
-    expression = "!resource.matchTagId('${google_tags_tag_key.protected.id}', '${google_tags_tag_value.protected.id}')"
+    title = each.key == "tenant_accounts" ? "local-unprotected-accounts" : "exclude-protected-platform"
+    expression = each.key == "tenant_accounts" ? join(" && ", [
+      "resource.matchTagId('${google_tags_tag_key.account_scope.id}', '${google_tags_tag_value.account_scope.id}')",
+      "!resource.matchTagId('${google_tags_tag_key.protected.id}', '${google_tags_tag_value.protected.id}')",
+    ]) : "!resource.matchTagId('${google_tags_tag_key.protected.id}', '${google_tags_tag_value.protected.id}')"
   }
   depends_on = [google_project_iam_member.tenant_create]
 }

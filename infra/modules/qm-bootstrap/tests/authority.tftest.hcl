@@ -63,3 +63,65 @@ run "activation_requires_platform_services" {
   }
   expect_failures = [google_project_iam_member.tenant_create]
 }
+
+run "active_account_boundary" {
+  command = plan
+  variables {
+    provisioning_enabled    = true
+    platform_services_ready = true
+  }
+  override_resource {
+    target          = google_project.qm
+    override_during = plan
+    values          = { number = "123456789012" }
+  }
+  override_resource {
+    target          = google_tags_tag_key.account_scope
+    override_during = plan
+    values          = { id = "tagKeys/100" }
+  }
+  override_resource {
+    target          = google_tags_tag_value.account_scope
+    override_during = plan
+    values          = { id = "tagValues/101" }
+  }
+  override_resource {
+    target          = google_tags_tag_key.protected
+    override_during = plan
+    values          = { id = "tagKeys/200" }
+  }
+  override_resource {
+    target          = google_tags_tag_value.protected
+    override_during = plan
+    values          = { id = "tagValues/201" }
+  }
+  assert {
+    condition = (
+      google_tags_tag_binding.account_scope.parent == "//cloudresourcemanager.googleapis.com/projects/123456789012" &&
+      google_tags_tag_binding.account_scope.tag_value == "tagValues/101" &&
+      google_tags_tag_value.account_scope.parent == "tagKeys/100"
+    )
+    error_message = "The positive account scope must be inherited only from the QM project."
+  }
+  assert {
+    condition = (
+      google_project_iam_member.tenant_untagged["tenant_accounts"].condition[0].expression ==
+      "resource.matchTagId('tagKeys/100', 'tagValues/101') && !resource.matchTagId('tagKeys/200', 'tagValues/201')"
+    )
+    error_message = "Account access must reject service agents/foreign accounts without the project tag and local platform/default accounts with the protected tag."
+  }
+  assert {
+    condition = (
+      google_project_iam_member.tenant_untagged["tenant_services"].condition[0].expression ==
+      "!resource.matchTagId('tagKeys/200', 'tagValues/201')"
+    )
+    error_message = "Platform Cloud Run services must remain excluded from tenant lifecycle authority."
+  }
+  assert {
+    condition = alltrue([for name in ["tenant_create", "tenant_accounts", "tenant_services", "tenant_secrets", "tenant_buckets", "tenant_network"] : alltrue([
+      for permission in google_project_iam_custom_role.bounded[name].permissions :
+      !strcontains(lower(permission), "tag") && (name == "tenant_accounts" || permission != "iam.serviceAccounts.actAs")
+    ])])
+    error_message = "The provisioner must not change its tag boundary or receive actAs through another tenant role."
+  }
+}
