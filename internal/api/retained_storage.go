@@ -50,12 +50,28 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
  FOR NO KEY UPDATE`, hostID, at, payload); err != nil {
 		return err
 	}
-	// Creation holds the shared side until commit. Try only after owner row
-	// locks: snapshot/fork creation may already hold a source row shared.
-	// A separate statement below sees any creator that committed before this
-	// fence; an in-flight creator leaves this report retryable, without cutover.
+	// Try only after owner row locks: snapshot/fork creation may already hold
+	// a source row shared. Keep this fence for creators using the older trigger.
 	var creationFenced bool
 	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('retained-storage-owner:' || $1, 0))`, hostID).Scan(&creationFenced); err != nil {
+		return err
+	}
+	if !creationFenced {
+		return fmt.Errorf("retained owner creation is in progress")
+	}
+	// Inserts bypassing an earlier report's exclusive fence still hold a pending
+	// marker until commit/rollback. Inspect it without taking an exclusive lock
+	// that would delay creation. The next statement sees committed owners; any
+	// insert starting after this check is timestamped after the report receipt.
+	if err := tx.QueryRow(ctx, `WITH marker AS (
+ SELECT hashtextextended('retained-storage-owner-pending:' || $1, 0) key
+ ) SELECT NOT EXISTS (
+ SELECT 1 FROM pg_catalog.pg_locks l CROSS JOIN marker m
+ WHERE l.locktype='advisory' AND l.mode='ShareLock' AND l.granted
+   AND l.database=(SELECT oid FROM pg_catalog.pg_database WHERE datname=current_database())
+   AND l.classid=((m.key >> 32) & 4294967295)::oid
+   AND l.objid=(m.key & 4294967295)::oid AND l.objsubid=1
+ )`, hostID).Scan(&creationFenced); err != nil {
 		return err
 	}
 	if !creationFenced {

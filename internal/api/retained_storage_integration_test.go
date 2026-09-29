@@ -133,8 +133,11 @@ func TestIntegration_RetainedCutoverFencesOwnerCreation(t *testing.T) {
 }
 
 func TestIntegration_RetainedCutoverDoesNotBlockLaterOwnerInsert(t *testing.T) {
-	for _, kind := range []string{"sandbox", "snapshot"} {
-		t.Run(kind, func(t *testing.T) {
+	for _, tc := range []struct {
+		kind   string
+		commit bool
+	}{{"sandbox", true}, {"sandbox", false}, {"snapshot", true}, {"snapshot", false}} {
+		t.Run(fmt.Sprintf("%s/commit=%t", tc.kind, tc.commit), func(t *testing.T) {
 			f := newRetainedCreationFixture(t)
 			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 			defer cancel()
@@ -167,7 +170,7 @@ func TestIntegration_RetainedCutoverDoesNotBlockLaterOwnerInsert(t *testing.T) {
 				t.Fatal(err)
 			}
 			table, status := "sandbox", "paused"
-			if kind == "snapshot" {
+			if tc.kind == "snapshot" {
 				table, status = "sandbox_snapshot", "creating"
 			}
 			id := uuid.New()
@@ -178,8 +181,13 @@ func TestIntegration_RetainedCutoverDoesNotBlockLaterOwnerInsert(t *testing.T) {
 			if err != nil {
 				t.Fatalf("owner creation waited behind retained report: %v", err)
 			}
+			otherCreator, err := f.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer otherCreator.Rollback(context.Background())
 			otherCtx, stop := context.WithTimeout(ctx, 2*time.Second)
-			_, err = f.pool.Exec(otherCtx, `INSERT INTO `+table+`(id,team_id,host_id,status)
+			_, err = otherCreator.Exec(otherCtx, `INSERT INTO `+table+`(id,team_id,host_id,status)
  SELECT $1,team_id,'other-host',$2 FROM sandbox WHERE id=$3`, uuid.New(), status, f.sandboxID)
 			stop()
 			if err != nil {
@@ -195,8 +203,82 @@ func TestIntegration_RetainedCutoverDoesNotBlockLaterOwnerInsert(t *testing.T) {
 			if !created.After(at) {
 				t.Fatalf("later insert was backdated into inventory: created=%s receipt=%s transaction=%s", created, at, begun)
 			}
-			if err := creator.Commit(ctx); err != nil {
+			// Report A has released its exclusive fence, but the insert that
+			// bypassed it is still uncommitted when report B is received.
+			var laterReceipt time.Time
+			if err := f.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&laterReceipt); err != nil {
 				t.Fatal(err)
+			}
+			if !laterReceipt.After(created) {
+				t.Fatal("second report must be received after owner insertion")
+			}
+			if _, err := f.pool.Exec(ctx, `UPDATE host_storage_report SET received_at=$1,next_measurement_index=0`, laterReceipt); err != nil {
+				t.Fatal(err)
+			}
+			inv.Owners[0].Generation = strings.Repeat("b", 64)
+			inv.Owners[0].Extents[0].Length = 8192
+			apply := func() error {
+				return applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, laterReceipt,
+					[]storageReportMeasurement{{Retained: inv}}, 1, 1)
+			}
+			accounting := func() string {
+				t.Helper()
+				var rows string
+				if err := f.pool.QueryRow(ctx, `SELECT jsonb_build_array(
+ (SELECT jsonb_agg(to_jsonb(i) ORDER BY id) FROM retained_storage_interval i),
+ (SELECT jsonb_agg(to_jsonb(c) ORDER BY host_id,team_id) FROM retained_storage_cutover c))::text`).Scan(&rows); err != nil {
+					t.Fatal(err)
+				}
+				return rows
+			}
+			beforeReport, beforeAccounting := storageLeaseRow(t, f), accounting()
+			if err := apply(); err == nil || storageReportErrorIsTerminal(err) {
+				t.Fatalf("second report must retry while the bypassing insert is uncommitted: %v", err)
+			}
+			if storageLeaseRow(t, f) != beforeReport || accounting() != beforeAccounting {
+				t.Fatal("deferred second report changed progress or retained accounting")
+			}
+			if tc.commit {
+				if err := creator.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := apply(); !errors.Is(err, errStorageReportInvalidPayload) {
+					t.Fatalf("committed omitted owner must fail second-report completeness: %v", err)
+				}
+				if storageLeaseRow(t, f) != beforeReport || accounting() != beforeAccounting {
+					t.Fatal("incomplete second report changed progress or retained accounting")
+				}
+				inv.Owners = append(inv.Owners, retainedstorage.Owner{
+					Kind: tc.kind, ID: id.String(), Generation: strings.Repeat("a", 64),
+					Extents: []retainedstorage.Extent{{Device: "fs", Start: 4096, Length: 4096}},
+				})
+			} else if err := creator.Rollback(ctx); err != nil {
+				t.Fatal(err)
+			}
+			// The unrelated host's insert remains open and must not defer this
+			// report. Commit and rollback both release the same-host marker.
+			if err := apply(); err != nil {
+				t.Fatal(err)
+			}
+			var intervals, owners int
+			if err := f.pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE owner_id=$2)
+ FROM retained_storage_interval WHERE started_at=$1 AND ended_at IS NULL`, laterReceipt, id).Scan(&intervals, &owners); err != nil {
+				t.Fatal(err)
+			}
+			wantOwners := 0
+			if tc.commit {
+				wantOwners = 1
+			}
+			if intervals != 1+wantOwners || owners != wantOwners {
+				t.Fatalf("second report intervals=%d owners=%d, want %d and %d", intervals, owners, 1+wantOwners, wantOwners)
+			}
+			var state string
+			var cursor int
+			if err := f.pool.QueryRow(ctx, `SELECT state,next_measurement_index FROM host_storage_report`).Scan(&state, &cursor); err != nil {
+				t.Fatal(err)
+			}
+			if state != "processed" || cursor != 1 {
+				t.Fatalf("second report progress: state=%s cursor=%d", state, cursor)
 			}
 		})
 	}
