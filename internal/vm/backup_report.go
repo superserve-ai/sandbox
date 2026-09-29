@@ -180,6 +180,12 @@ func (r *BackupReporter) Deliver(task backup.Task) error {
 			return nil
 		}
 	}
+	// A control plane older than saved-snapshot backups (vmd rolled out
+	// first, or the control plane rolled back) takes this report once it
+	// is current: keep it rather than lose the snapshot's coverage row.
+	if task.SnapshotID != "" && permanentReject(status) && isUnknownSnapshotField(msg) {
+		return fmt.Errorf("snapshot backup report deferred: %s: %w", statusLine, backup.ErrNotificationDeferred)
+	}
 	// A permanent rejection can never succeed on retry, and the flush
 	// stops at the first failure, so returning an error here would wedge
 	// every later report on this host behind one poisoned entry forever.
@@ -225,6 +231,11 @@ func permanentReject(status int) bool {
 func isUnknownPauseTokenField(msg []byte) bool {
 	return bytes.Contains(msg, []byte(`unknown field "pause_token"`)) ||
 		bytes.Contains(msg, []byte(`unknown field \"pause_token\"`))
+}
+
+func isUnknownSnapshotField(msg []byte) bool {
+	return bytes.Contains(msg, []byte(`unknown field "snapshot_id"`)) ||
+		bytes.Contains(msg, []byte(`unknown field \"snapshot_id\"`))
 }
 
 func isUnknownObjectField(msg []byte) bool {

@@ -291,3 +291,27 @@ func TestBackupReporterDefersAnInFlightFinalize(t *testing.T) {
 		t.Fatalf("Deliver = %v, want the deferral sentinel", err)
 	}
 }
+
+// A control plane that predates saved-snapshot backups rejects the owner
+// field; the report is kept for a later delivery, not dropped with its
+// coverage row. Any other rejection of a snapshot report still drops.
+func TestBackupReporterKeepsSnapshotReportsForAnOlderControlPlane(t *testing.T) {
+	reject := `{"error":{"code":"bad_request","message":"Invalid request body: json: unknown field \"snapshot_id\""}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, reject, http.StatusBadRequest)
+	}))
+	defer srv.Close()
+	r := &BackupReporter{ControlPlaneURL: srv.URL, HostID: "h", Token: "t", Bucket: "b", Log: zerolog.Nop()}
+	task := backup.Task{SnapshotID: "snap", Generation: "g", FilesFinal: true,
+		Files: []backup.TaskFile{{Name: "rootfs.ext4", SHA256: "aa", Size: 4,
+			Object: "snapshots/snap/g/rootfs.ext4.pabc123"}}}
+
+	if err := r.Deliver(task); !errors.Is(err, backup.ErrNotificationDeferred) {
+		t.Fatalf("Deliver = %v, want the report kept for later", err)
+	}
+
+	reject = `{"error":{"code":"bad_request","message":"generation must be a sha256 hex key"}}`
+	if err := r.Deliver(task); err != nil {
+		t.Fatalf("Deliver = %v, want a content rejection dropped as before", err)
+	}
+}
