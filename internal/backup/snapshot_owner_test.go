@@ -63,6 +63,49 @@ func TestSeededCompletionKeepsTheSnapshotOwner(t *testing.T) {
 	}
 }
 
+// After a snapshot's upload the uploader drops the snapshot's own files from
+// the page cache, never the shared base other generations read.
+func TestSnapshotUploadDropsItsFilesFromThePageCache(t *testing.T) {
+	var dropped []string
+	prev := dropStagingPages
+	dropStagingPages = func(path string) error {
+		dropped = append(dropped, path)
+		return nil
+	}
+	t.Cleanup(func() { dropStagingPages = prev })
+
+	dir := t.TempDir()
+	baseData := bytes.Repeat([]byte{0x11}, 64<<10)
+	basePath := filepath.Join(dir, "base.ext4")
+	diskData := bytes.Repeat([]byte{0x22}, 32<<10)
+	disk := filepath.Join(dir, "overlay.ext4")
+	for p, d := range map[string][]byte{basePath: baseData, disk: diskData} {
+		if err := os.WriteFile(p, d, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	task := Task{
+		SnapshotID: "5b9c2e1a-0000-4000-8000-000000000002",
+		Priority:   PriorityCheckpoint,
+		Files: []TaskFile{{
+			Name: "rootfs.ext4", Path: disk, SHA256: digestOf(diskData), Size: int64(len(diskData)),
+			BasePath: basePath, BaseSHA256: digestOf(baseData),
+		}},
+	}
+	task.Generation = GenerationKey(task.Files)
+	j, _ := testJournal(t)
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	u := &Uploader{Journal: j, Store: newMemBlobs()}
+	if _, err := u.drainOne(context.Background(), time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if len(dropped) != 1 || dropped[0] != disk {
+		t.Fatalf("dropped %v, want only the snapshot's disk", dropped)
+	}
+}
+
 // A snapshot's disk uploads under its own prefix, with its overlay base as a
 // shared object, and a purge removes the generation but leaves the base.
 func TestSnapshotGenerationUploadsAndPurgesUnderItsOwnPrefix(t *testing.T) {

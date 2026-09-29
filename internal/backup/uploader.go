@@ -438,6 +438,14 @@ func (u *Uploader) drainOne(ctx context.Context, now time.Time) (bool, error) {
 	if cleared {
 		removeStagedTask(u.StagingRoot, task)
 	}
+	if task.SnapshotID != "" {
+		// A saved snapshot's files stay on the host, unread until a fork
+		// copies them by reflink: the upload's pages go rather than evict
+		// pages in use. Shared bases stay cached, as in staging.
+		for _, f := range task.Files {
+			_ = dropStagingPages(f.Path)
+		}
+	}
 	result := telemetry.BackupUploadAbandoned
 	if completed {
 		result = telemetry.BackupUploadDeduped

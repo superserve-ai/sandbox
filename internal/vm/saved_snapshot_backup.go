@@ -31,6 +31,9 @@ func (m *Manager) backupSavedSnapshot(ctx context.Context, man *SavedSnapshotMan
 	files := make([]backup.TaskFile, 0, 2)
 	add := func(name, path, basePath string) error {
 		sum, size, err := backup.HashFileApparent(ctx, path)
+		// A saved snapshot's files are next read only at upload; keeping
+		// them cached would evict pages paused sandboxes resume from.
+		_ = backup.DropPageCache(path)
 		if err != nil {
 			return err
 		}
