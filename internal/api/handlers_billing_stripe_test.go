@@ -666,6 +666,52 @@ func TestStripeMeterQuantityPreservesNormalizedUnits(t *testing.T) {
 	}
 }
 
+func TestBillingPreviewSubscriptionInclusion(t *testing.T) {
+	var raw pgtype.Numeric
+	if err := raw.Scan("3686400"); err != nil {
+		t.Fatal(err)
+	}
+	usage := db.TeamBillingUsage{VcpuSeconds: raw, MemoryMibSeconds: raw, StorageMibSeconds: raw}
+	enabled, disabled := true, false
+	for _, tc := range []struct {
+		name         string
+		checkout     bool
+		subscription *bool
+		billable     bool
+		wantCompute  bool
+	}{
+		{"legacy included", true, nil, true, true},
+		{"legacy excluded", false, nil, true, false},
+		{"explicit inclusion", false, &enabled, true, true},
+		{"explicit exclusion", true, &disabled, true, false},
+		{"nonbillable", true, &enabled, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, key := range []string{"vcpu", "memory_gib", "storage_gib"} {
+				t.Run(key, func(t *testing.T) {
+					items, err := billingPreviewItems(uuid.New(), time.Unix(0, 0), time.Unix(3600, 0), usage, []billingResourceState{{
+						BillingResourceConfig: config.BillingResourceConfig{
+							ResourceKey: key, StripeEventName: key + "_hours",
+							CheckoutEnabled: tc.checkout, SubscriptionEnabled: tc.subscription,
+						},
+						Billable: tc.billable,
+					}}, "cus_example")
+					if err != nil {
+						t.Fatal(err)
+					}
+					want := tc.wantCompute
+					if key == "storage_gib" {
+						want = tc.billable
+					}
+					if (len(items) == 1) != want || len(items) > 1 {
+						t.Fatalf("items = %+v, want included = %v", items, want)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestBillingPreviewExactSplitMatchesClose(t *testing.T) {
 	teamID := uuid.MustParse("b2f39952-e8ad-4cae-b634-5e250fd3a13a")
 	start, end := time.Unix(100, 0).UTC(), time.Unix(200, 0).UTC()

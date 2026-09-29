@@ -421,11 +421,25 @@ func (f warningTransportFunc) RoundTrip(r *http.Request) (*http.Response, error)
 // harness tests, while executing the real discovery and eligibility queries.
 type warningDispatchScope struct {
 	*pgxpool.Pool
-	team uuid.UUID
+	team     uuid.UUID
+	sampleAt time.Time
+}
+
+func (q warningDispatchScope) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if !q.sampleAt.IsZero() && strings.Contains(sql, "-- name: GetRecentTrialBurnSample") {
+		// Fix the sample endpoint so database/application clock skew cannot
+		// make an open interval appear to end in the future.
+		sql = strings.ReplaceAll(sql, "now()", "$2::timestamptz")
+		args = append(args, q.sampleAt)
+	}
+	return q.Pool.QueryRow(ctx, sql, args...)
 }
 
 func (q warningDispatchScope) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
-	if strings.Contains(sql, "-- name: ListTeamsWithActiveTrialSandboxes") || strings.Contains(sql, "-- name: ListTeamsWithActiveIneligibleSandboxes") {
+	if strings.Contains(sql, "-- name: ListTeamsWithTrialCredits") {
+		sql = strings.ReplaceAll(sql, "WHERE g.reason =", "WHERE g.team_id = '"+q.team.String()+"'::uuid AND g.reason =")
+	}
+	if strings.Contains(sql, "-- name: ListTeamsWithActiveIneligibleSandboxes") {
 		sql = strings.ReplaceAll(sql, "WHERE s.destroyed_at IS NULL", "WHERE s.team_id = '"+q.team.String()+"'::uuid AND s.destroyed_at IS NULL")
 	}
 	if strings.Contains(sql, "-- name: ListTrialCreditWarningTeams") {
@@ -528,7 +542,7 @@ func TestTrialWarningDispatchIncludesPausedStorageTeam(t *testing.T) {
 	team := seedWarningWorkerTeam(t)
 	for _, sql := range []string{
 		`UPDATE sandbox SET status='paused' WHERE team_id=$1`,
-		`INSERT INTO team_feature_flag (team_id, key, enabled) VALUES ($1, 'billing_storage_billing_enabled', true) ON CONFLICT (team_id, key) DO UPDATE SET enabled=true`,
+		`WITH enabled AS (INSERT INTO team_feature_flag (team_id, key, enabled) VALUES ($1, 'billing_storage_billing_enabled', true) ON CONFLICT (team_id, key) DO UPDATE SET enabled=true RETURNING team_id,enabled) INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) SELECT team_id,now()-interval '1 day',now()-interval '1 day' FROM enabled WHERE enabled ON CONFLICT DO NOTHING`,
 		`INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at) SELECT id, team_id, 1024, now()-interval '2 hours' FROM sandbox WHERE team_id=$1`,
 	} {
 		if _, err := testPool.Exec(ctx, sql, team); err != nil {
@@ -536,7 +550,7 @@ func TestTrialWarningDispatchIncludesPausedStorageTeam(t *testing.T) {
 		}
 	}
 	calls := 0
-	h := &api.Handlers{Pool: testPool, DB: db.New(warningDispatchScope{Pool: testPool, team: team}), TrialWarningSender: warningSenderFunc(func(_ context.Context, id uuid.UUID, remaining float64) error {
+	h := &api.Handlers{Pool: testPool, DB: db.New(warningDispatchScope{Pool: testPool, team: team, sampleAt: time.Now().Add(-time.Minute)}), TrialWarningSender: warningSenderFunc(func(_ context.Context, id uuid.UUID, remaining float64) error {
 		if id != team || remaining <= 0 {
 			t.Errorf("unexpected warning: team=%s remaining=%f", id, remaining)
 		}
@@ -572,7 +586,7 @@ func TestTrialWarningDiscoveryStorageEligibility(t *testing.T) {
 		{name: "active compute", status: "active", want: true},
 		{name: "disabled storage", status: "paused", disk: 1024},
 		{name: "closed storage", status: "paused", enabled: true, closed: true, disk: 1024},
-		{name: "empty storage", status: "paused", enabled: true},
+		{name: "empty overlay is a sampling candidate", status: "paused", enabled: true, want: true},
 		{name: "ended trial", status: "paused", enabled: true, disk: 1024, ended: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -586,7 +600,7 @@ func TestTrialWarningDiscoveryStorageEligibility(t *testing.T) {
 			if _, err := tx.Exec(ctx, `UPDATE sandbox SET status=$2 WHERE team_id=$1`, team, tc.status); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO team_feature_flag (team_id,key,enabled) VALUES ($1,'billing_storage_billing_enabled',$2) ON CONFLICT (team_id,key) DO UPDATE SET enabled=EXCLUDED.enabled`, team, tc.enabled); err != nil {
+			if _, err := tx.Exec(ctx, `WITH enabled AS (INSERT INTO team_feature_flag (team_id,key,enabled) VALUES ($1,'billing_storage_billing_enabled',$2) ON CONFLICT (team_id,key) DO UPDATE SET enabled=EXCLUDED.enabled RETURNING team_id,enabled) INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) SELECT team_id,now()-interval '1 day',now()-interval '1 day' FROM enabled WHERE enabled ON CONFLICT DO NOTHING`, team, tc.enabled); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := tx.Exec(ctx, `INSERT INTO sandbox_storage_interval (sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason) SELECT id,team_id,$2,now()-interval '2 hours',CASE WHEN $3 THEN now()-interval '1 minute' END,CASE WHEN $3 THEN 'deleted' END FROM sandbox WHERE team_id=$1`, team, tc.disk, tc.closed); err != nil {

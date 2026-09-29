@@ -375,16 +375,16 @@ costed AS (
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
 		((cu.memory_mib_seconds / 1024.0) * r.memory_rate) AS memory_usd,
 		CASE
-			WHEN feature_enabled('billing_storage_billing_enabled', sp.team_id)
-			THEN ((su.storage_mib_seconds / 1024.0) * r.storage_rate)
+			WHEN storage_billing_activated(sp.team_id)
+			THEN ((billable_storage_mib_seconds(sp.team_id, sp.period_start, LEAST(sp.calculated_at, sp.period_end)) / 1024.0) * r.storage_rate)
 			ELSE 0
 		END AS storage_usd,
 		CASE
 			WHEN COALESCE(r.required_rate_count, 0) <> 2
 			  OR r.vcpu_rate IS NULL
 			  OR r.memory_rate IS NULL
-			  OR (feature_enabled('billing_storage_billing_enabled', sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
-			  OR (feature_enabled('billing_storage_billing_enabled', sp.team_id) AND r.storage_rate IS NULL)
+			  OR (storage_billing_activated(sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
+			  OR (storage_billing_activated(sp.team_id) AND r.storage_rate IS NULL)
 			THEN 'pricing_unavailable'
 		END AS error_code
 	FROM selected_plans sp
@@ -682,16 +682,16 @@ costed AS (
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
 		((cu.memory_mib_seconds / 1024.0) * r.memory_rate) AS memory_usd,
 		CASE
-			WHEN feature_enabled('billing_storage_billing_enabled', sp.team_id)
-			THEN ((su.storage_mib_seconds / 1024.0) * r.storage_rate)
+			WHEN storage_billing_activated(sp.team_id)
+			THEN ((billable_storage_mib_seconds(sp.team_id, sp.period_start, LEAST(sp.calculated_at, sp.period_end)) / 1024.0) * r.storage_rate)
 			ELSE 0
 		END AS storage_usd,
 		CASE
 			WHEN COALESCE(r.required_rate_count, 0) <> 2
 			  OR r.vcpu_rate IS NULL
 			  OR r.memory_rate IS NULL
-			  OR (feature_enabled('billing_storage_billing_enabled', sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
-			  OR (feature_enabled('billing_storage_billing_enabled', sp.team_id) AND r.storage_rate IS NULL)
+			  OR (storage_billing_activated(sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
+			  OR (storage_billing_activated(sp.team_id) AND r.storage_rate IS NULL)
 			THEN 'pricing_unavailable'
 		END AS error_code
 	FROM selected_plans sp
