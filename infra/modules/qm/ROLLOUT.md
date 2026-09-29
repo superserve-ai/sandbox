@@ -271,9 +271,11 @@ WHERE datname = :'tenant_db'
   AND usename = :'tenant_user'
   AND pid <> pg_backend_pid();
 SQL
-psql "$CELL_ADMIN_DSN" -v tenant_db="$TENANT_DATABASE" -v tenant_user="$TENANT_DB_USER" -Atqc \
-  "SELECT count(*) FROM pg_stat_activity WHERE datname = :'tenant_db' AND usename = :'tenant_user'" \
-  | grep -Fx 0
+psql "$CELL_ADMIN_DSN" -Atq -v ON_ERROR_STOP=1 \
+  -v tenant_db="$TENANT_DATABASE" -v tenant_user="$TENANT_DB_USER" <<'SQL' | grep -Fx 0
+SELECT count(*) FROM pg_stat_activity
+WHERE datname = :'tenant_db' AND usename = :'tenant_user';
+SQL
 ```
 
 Verify that the runtime has no serving instances or new connection attempts,
