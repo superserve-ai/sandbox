@@ -292,9 +292,26 @@ func TestIntegration_BillingStorageTrialActivationDoesNotCreateSubscription(t *t
 		if err := testPool.QueryRow(t.Context(), `SELECT eligible FROM team_trial_eligibility_cache WHERE team_id=$1`, team.ID).Scan(&eligible); err != nil || !eligible {
 			t.Fatalf("activation did not refresh trial eligibility: %v %v", eligible, err)
 		}
-		if _, err := testPool.Exec(t.Context(), `UPDATE team_feature_flag SET enabled=false WHERE team_id=$1 AND key='billing_storage_billing_enabled'`, team.ID); err != nil {
-			t.Fatal(err)
-		}
+	}
+	storageExec(t, `UPDATE team_feature_flag SET enabled=false WHERE team_id=$1 AND key='billing_storage_billing_enabled'`, team.ID)
+	if active, err := testQueries.IsStorageBillingActivated(t.Context(), team.ID); err != nil || active {
+		t.Fatalf("future cutoff is active now: %v %v", active, err)
+	}
+	for _, tc := range []struct {
+		name   string
+		end    time.Time
+		active bool
+	}{
+		{"before cutoff", cutoff.Add(-time.Microsecond), false},
+		{"at cutoff", cutoff, false},
+		{"after cutoff", cutoff.Add(time.Microsecond), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			active, err := testQueries.IsStorageBillingActivatedForWindow(t.Context(), db.IsStorageBillingActivatedForWindowParams{TeamID: team.ID, PeriodEnd: tc.end})
+			if err != nil || active != tc.active {
+				t.Fatalf("explicit window activation: got %v want %v: %v", active, tc.active, err)
+			}
+		})
 	}
 	var untouched bool
 	if err := testPool.QueryRow(t.Context(), `SELECT stripe_customer_id IS NULL AND stripe_subscription_id IS NULL AND trial_ended_at IS NULL FROM team_billing_account WHERE team_id=$1`, team.ID).Scan(&untouched); err != nil || !untouched || stripe.creates != 0 || len(stripe.customerCalls) != 0 || len(stripe.checkoutCalls) != 0 {

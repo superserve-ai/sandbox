@@ -24,7 +24,7 @@ CREATE TRIGGER immutable_storage_billing_activation
 BEFORE UPDATE OR DELETE ON team_storage_billing_activation
 FOR EACH ROW EXECUTE FUNCTION protect_storage_billing_activation();
 
-CREATE FUNCTION storage_billing_activated(p_team_id uuid, p_end timestamptz DEFAULT 'infinity') RETURNS boolean
+CREATE FUNCTION storage_billing_activated(p_team_id uuid, p_end timestamptz DEFAULT now()) RETURNS boolean
 LANGUAGE sql STABLE AS $$
     SELECT EXISTS (SELECT 1 FROM team_storage_billing_activation WHERE team_id = p_team_id AND effective_at < p_end);
 $$;
