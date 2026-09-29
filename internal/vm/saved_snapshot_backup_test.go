@@ -13,10 +13,21 @@ import (
 	"github.com/superserve-ai/sandbox/internal/backup"
 )
 
+// isolateSnapshotBackupEvidence points the rollback floor's evidence at dir.
+func isolateSnapshotBackupEvidence(t *testing.T, dir string) string {
+	t.Helper()
+	orig := snapshotBackupEvidencePath
+	snapshotBackupEvidencePath = filepath.Join(dir, "snapshot-backup-evidence")
+	snapshotBackupEvidenceDurable.Store(false)
+	t.Cleanup(func() { snapshotBackupEvidencePath = orig; snapshotBackupEvidenceDurable.Store(false) })
+	return snapshotBackupEvidencePath
+}
+
 // savedBackupFixture commits a mem+fs saved snapshot whose disk is an overlay
 // over a template base, and wires a manager whose backup queue records tasks.
 func savedBackupFixture(t *testing.T) (*Manager, *SavedSnapshotManifest, *[]backup.Task, map[string]bool) {
 	t.Helper()
+	isolateSnapshotBackupEvidence(t, t.TempDir())
 	m := newSavedTestManager(t)
 	id := uuid.NewString()
 	dir, err := m.savedSnapshotDir(id)
@@ -87,6 +98,19 @@ func TestSavedSnapshotQueuesItsDiskButNotItsMemory(t *testing.T) {
 	marker, err := os.ReadFile(filepath.Join(filepath.Dir(man.DiskPath), savedSnapshotBackupMarker))
 	if err != nil || string(marker) != task.Generation {
 		t.Fatalf("marker = %q (err %v), want %s", marker, err, task.Generation)
+	}
+	if _, err := os.Stat(snapshotBackupEvidencePath); err != nil {
+		t.Fatalf("queued without raising the rollback floor: %v", err)
+	}
+}
+
+// Without the rollback floor's evidence, nothing is queued: an older vmd
+// could otherwise start over entries it cannot read.
+func TestSavedSnapshotBackupNeedsTheRollbackFloor(t *testing.T) {
+	m, man, queued, _ := savedBackupFixture(t)
+	isolateSnapshotBackupEvidence(t, filepath.Join(t.TempDir(), "missing-dir"))
+	if m.backupSavedSnapshot(context.Background(), man, zerolog.Nop()) || len(*queued) != 0 {
+		t.Fatal("queued a snapshot backup with no rollback floor raised")
 	}
 }
 

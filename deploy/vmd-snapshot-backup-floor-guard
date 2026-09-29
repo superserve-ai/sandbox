@@ -1,0 +1,36 @@
+#!/bin/sh
+# Host-resident snapshot-backup floor for superserve-vmd, invoked from its own
+# systemd drop-in at every service start. A guard of its own, for the same
+# reason as the staged-intent floor: an earlier revision reinstalls only the
+# guards it knows, and this file and drop-in are unknown to every one of them.
+#
+# A saved snapshot's disk is queued for backup as its own owner. A vmd without
+# the capability reads such a queue entry with no owner at all: it can neither
+# finish nor clear it, and retries it forever. The one witness is the evidence
+# file, which the daemon writes, durably, before the first such entry on this
+# host.
+set -u
+LC_ALL=C
+export LC_ALL
+BIN="${1:-/usr/local/bin/vmd}"
+SNAPSHOT_BACKUP_EVIDENCE=/var/lib/sandbox/snapshot-backup-evidence
+
+# One lookup. Only a lookup that says the file does not exist admits any vmd:
+# no snapshot backup has ever been queued here. A lookup that fails any other
+# way is not absence, and is treated as presence.
+lookup=$(stat -L "$SNAPSHOT_BACKUP_EVIDENCE" 2>&1 >/dev/null)
+if [ $? -ne 0 ]; then
+    case "$lookup" in
+        *"No such file or directory"*) exit 0 ;;
+        *) echo "vmd-snapshot-backup-floor-guard: cannot look up ${SNAPSHOT_BACKUP_EVIDENCE} (${lookup}); only a vmd that reads snapshot backups may start" >&2 ;;
+    esac
+fi
+
+# Evidence present, or unknowable: only a binary carrying the capability may
+# start. A grep that cannot run refuses.
+if grep -qa snapshot-backup-1 "$BIN" 2>/dev/null; then
+    exit 0
+fi
+echo "vmd-snapshot-backup-floor-guard: REFUSING to start a vmd without snapshot-backup-1: this host has queued saved snapshot backups (${SNAPSHOT_BACKUP_EVIDENCE})" >&2
+echo "vmd-snapshot-backup-floor-guard: deploy a build that reads them; the floor comes down only once no such queue entry can remain here" >&2
+exit 1

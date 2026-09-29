@@ -66,7 +66,8 @@ def check(candidate, bundle_dir, resident_dir=RESIDENT_DIR, dropin_dir=DROPIN_DI
         if re.fullmatch(GUARD_NAME, path.name)
     }
     # These ship with this installer; absence is a broken bundle, not a pass.
-    bundled.update(("vmd-rollback-guard", "vmd-wake-floor-guard", "vmd-staged-intent-floor-guard"))
+    bundled.update(("vmd-rollback-guard", "vmd-wake-floor-guard", "vmd-staged-intent-floor-guard",
+                    "vmd-snapshot-backup-floor-guard"))
     for name in sorted(bundled):
         guard = bundle_dir / name
         require_file(guard)

@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -21,6 +23,46 @@ const SavedSnapshotBackupSweep = 30 * time.Minute
 // sweep on a host) would otherwise saturate its disk. Separate from the pause
 // rehash slots, so snapshots never delay a pause's backup.
 var savedSnapshotHashSlots = make(chan struct{}, 1)
+
+// SnapshotBackupCapability is the string a vmd that reads saved-snapshot
+// backup queue entries carries; the host guard greps the binary for it.
+const SnapshotBackupCapability = "snapshot-backup-1"
+
+// snapshotBackupEvidencePath records that this host has queued a saved
+// snapshot's backup. A vmd without SnapshotBackupCapability reads such an
+// entry with no owner and can neither finish nor clear it, so the evidence
+// is durable before the first one is queued and the host guard refuses such
+// a vmd from then on.
+var snapshotBackupEvidencePath = "/var/lib/sandbox/snapshot-backup-evidence"
+
+const snapshotBackupEvidenceNote = "this host has queued saved snapshot backups\n"
+
+var (
+	snapshotBackupEvidenceDurable atomic.Bool
+	snapshotBackupEvidenceMu      sync.Mutex
+)
+
+// ensureSnapshotBackupFloor is durable once, then free.
+func ensureSnapshotBackupFloor() error {
+	if snapshotBackupEvidenceDurable.Load() {
+		return nil
+	}
+	snapshotBackupEvidenceMu.Lock()
+	defer snapshotBackupEvidenceMu.Unlock()
+	if snapshotBackupEvidenceDurable.Load() {
+		return nil
+	}
+	if _, err := os.Stat(snapshotBackupEvidencePath); err == nil {
+		// Visible, but not proven durable by this process.
+		if err := syncDir(filepath.Dir(snapshotBackupEvidencePath)); err != nil {
+			return err
+		}
+	} else if err := raiseEvidenceFile(snapshotBackupEvidencePath, snapshotBackupEvidenceNote); err != nil {
+		return err
+	}
+	snapshotBackupEvidenceDurable.Store(true)
+	return nil
+}
 
 // savedSnapshotBackupMarker records, in a saved snapshot's directory, the
 // generation its disk was queued as, so a sweep learns whether the backup is
@@ -84,6 +126,10 @@ func (m *Manager) backupSavedSnapshot(ctx context.Context, man *SavedSnapshotMan
 		Priority: backup.PriorityCheckpoint,
 	}
 	if !m.savedSnapshotBackupCovered(task) {
+		if err := ensureSnapshotBackupFloor(); err != nil {
+			log.Error().Err(err).Msg("saved snapshot backup: rollback floor not raised; not queued")
+			return false
+		}
 		if err := m.backupEnqueue(task); err != nil {
 			log.Error().Err(err).Msg("saved snapshot backup: enqueue failed")
 			return false
