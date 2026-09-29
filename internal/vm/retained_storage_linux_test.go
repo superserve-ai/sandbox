@@ -177,15 +177,14 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 	}
 	defer state.Close()
 	m := &Manager{state: state, cfg: ManagerConfig{RunDir: dir, SnapshotDir: filepath.Join(dir, "snapshots")}}
-	write := func(name string, pages int) string {
+	writeData := func(path string, data []byte) string {
 		t.Helper()
-		path := filepath.Join(dir, name)
 		f, err := os.Create(path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer f.Close()
-		if _, err := f.Write(bytes.Repeat([]byte{1}, pages*4096)); err != nil {
+		if _, err := f.Write(data); err != nil {
 			t.Fatal(err)
 		}
 		if err := f.Sync(); err != nil {
@@ -193,7 +192,12 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 		}
 		return path
 	}
+	write := func(name string, pages int) string {
+		t.Helper()
+		return writeData(filepath.Join(dir, name), bytes.Repeat([]byte{1}, pages*4096))
+	}
 	rec := VMRecord{ID: uuid.NewString(), Status: StatusPaused, DiskPath: write("overlay.ext4", 4), SnapshotPath: write("vmstate.snap", 1), MemFilePath: write("mem.snap", 8)}
+	write("mem.snap.wallclock", 1)
 	rec.RootfsPath = rec.DiskPath
 	save := func() {
 		t.Helper()
@@ -215,15 +219,19 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 		t.Fatal("sandbox missing")
 	}
 	fullBytes := retainedTestUnion(full.Owners[0].Extents)
-	t.Logf("full inventory reconciliation: allocated=%d expected=%d", fullBytes, 13*4096)
-	if fullBytes != 13*4096 {
+	t.Logf("full inventory reconciliation: allocated=%d expected=%d", fullBytes, 14*4096)
+	if fullBytes != 14*4096 {
 		t.Fatalf("full physical bytes=%d", fullBytes)
 	}
 	rec.BaseMemPath = rec.MemFilePath
 	rec.MemFilePath = write("mem.diff", 2)
+	for _, name := range []string{"vmstate.snap.overlay", "mem.diff.presence", "mem.diff.wallclock"} {
+		write(name, 1)
+	}
+	writeData(rec.MemFilePath+".base", []byte(rec.BaseMemPath))
 	save()
 	layered := sample()
-	if got := retainedTestUnion(layered.Owners[0].Extents); got != fullBytes+2*4096 {
+	if got := retainedTestUnion(layered.Owners[0].Extents); got != fullBytes+6*4096 {
 		t.Fatalf("layered allocation=%d", got)
 	}
 	rec.MemFilePath = write("replacement.snap", 3)
@@ -231,7 +239,7 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 	save()
 	replacement := sample()
 	t.Logf("layered/replacement reconciliation: layered=%d replacement=%d", retainedTestUnion(layered.Owners[0].Extents), retainedTestUnion(replacement.Owners[0].Extents))
-	if got := retainedTestUnion(replacement.Owners[0].Extents); got != 8*4096 {
+	if got := retainedTestUnion(replacement.Owners[0].Extents); got != 9*4096 {
 		t.Fatalf("superseded full/diff images still billable: %d", got)
 	}
 	rec.Status = StatusRunning
@@ -250,20 +258,12 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 	snapshotState := filepath.Join(snapshotDir, "vmstate.snap")
 	snapshotMem := filepath.Join(snapshotDir, "mem.diff")
 	snapshotBaseMem := filepath.Join(snapshotDir, "mem.base")
-	for _, path := range []string{snapshotState, snapshotMem, snapshotBaseMem} {
-		f, err := os.Create(path)
-		if err != nil {
-			t.Fatal(err)
+	for _, path := range []string{snapshotState, snapshotMem, snapshotBaseMem, snapshotState + ".overlay", snapshotMem + ".presence", snapshotMem + ".base", snapshotMem + ".wallclock", snapshotBaseMem + ".wallclock"} {
+		data := bytes.Repeat([]byte{7}, 4096)
+		if path == snapshotMem+".base" {
+			data = []byte(snapshotBaseMem)
 		}
-		if _, err := f.Write(bytes.Repeat([]byte{7}, 4096)); err != nil {
-			f.Close()
-			t.Fatal(err)
-		}
-		if err := f.Sync(); err != nil {
-			f.Close()
-			t.Fatal(err)
-		}
-		f.Close()
+		writeData(path, data)
 	}
 	src, err := os.Open(rec.DiskPath)
 	if err != nil {
@@ -288,9 +288,7 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(snapshotDir, savedSnapshotManifestName), man, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeData(filepath.Join(snapshotDir, savedSnapshotManifestName), man)
 	if got := sample(); len(got.Owners) != 2 {
 		t.Fatal("committed saved snapshot omitted")
 	}
@@ -300,7 +298,7 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 			snapshotOwner = owner
 		}
 	}
-	if got := retainedTestUnion(snapshotOwner.Extents); got < 4*4096 {
+	if got := retainedTestUnion(snapshotOwner.Extents); got != 13*4096 {
 		t.Fatalf("mem+fs snapshot omitted retained artifacts: %d", got)
 	}
 	if err := os.WriteFile(filepath.Join(snapshotDir, savedSnapshotManifestName), []byte(`{"version":1,"snapshot_id":"`+snapshotID+`","kind":"mem+fs"}`), 0o600); err != nil {
@@ -309,9 +307,7 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 	if _, err := m.RetainedStorageInventory(t.Context()); err == nil {
 		t.Fatal("incomplete snapshot manifest was accepted")
 	}
-	if err := os.WriteFile(filepath.Join(snapshotDir, savedSnapshotManifestName), man, 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeData(filepath.Join(snapshotDir, savedSnapshotManifestName), man)
 	if err := os.Remove(rec.MemFilePath); err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +321,7 @@ func TestRetainedPhysicalInventoryFullDiffAndMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshotOnly := sample()
-	if len(snapshotOnly.Owners) != 1 || snapshotOnly.Owners[0].Kind != "snapshot" || retainedTestUnion(snapshotOnly.Owners[0].Extents) < 4*4096 {
+	if len(snapshotOnly.Owners) != 1 || snapshotOnly.Owners[0].Kind != "snapshot" || retainedTestUnion(snapshotOnly.Owners[0].Extents) != 13*4096 {
 		t.Fatal("source deletion lost independently retained snapshot")
 	}
 

@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
+	"github.com/superserve-ai/sandbox/internal/presence"
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	bolt "go.etcd.io/bbolt"
 )
@@ -156,6 +157,10 @@ func resolveRetainedRecordPaths(rec VMRecord, runDir string) ([]string, VMRecord
 		paths = append(paths, delta)
 	}
 	paths = append(paths, rec.StrandedOverlays...)
+	paths, err := appendRetainedCompanions(paths, rec.SnapshotPath, append([]string{rec.MemFilePath, baseMem}, rec.StrandedOverlays...)...)
+	if err != nil {
+		return nil, rec, err
+	}
 	// Preserve every recovered anchor, including a sidecar-derived memory base.
 	// These fields are intentionally metadata-only; lifecycle code continues to
 	// use the current pause paths.
@@ -163,6 +168,29 @@ func resolveRetainedRecordPaths(rec VMRecord, runDir string) ([]string, VMRecord
 	rec.RootfsPath = rootfs
 	rec.DeltaDir = deltaDir
 	return paths, rec, nil
+}
+
+func appendRetainedCompanions(paths []string, snapshot string, memory ...string) ([]string, error) {
+	companions := make([]string, 0, 1+3*len(memory))
+	if snapshot != "" {
+		companions = append(companions, overlayBlockMapPath(snapshot))
+	}
+	for _, path := range memory {
+		if path != "" {
+			companions = append(companions, presence.SidecarPath(path), layeredBaseSidecarPath(path), WallClockMarkerPath(path))
+		}
+	}
+	for _, path := range companions {
+		// Legacy images may lack companions. An existing but unreadable or
+		// dangling companion must reach measurement and reject the inventory.
+		if _, err := os.Lstat(path); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		paths = append(paths, path)
+	}
+	return paths, nil
 }
 
 func retainedRecordPaths(rec VMRecord, runDir string) ([]string, error) {
@@ -394,7 +422,11 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 				return nil, fmt.Errorf("incomplete saved snapshot manifest")
 			}
 			observations = append(observations, retainedFileObservation{path, info})
-			if err := add("snapshot", man.SnapshotID, []string{man.DiskPath, man.BasePath, man.SnapshotPath, man.MemPath, man.BaseMemPath}); err != nil {
+			paths, err := appendRetainedCompanions([]string{path, man.DiskPath, man.BasePath, man.SnapshotPath, man.MemPath, man.BaseMemPath}, man.SnapshotPath, man.MemPath, man.BaseMemPath)
+			if err != nil {
+				return nil, err
+			}
+			if err := add("snapshot", man.SnapshotID, paths); err != nil {
 				return nil, err
 			}
 		}

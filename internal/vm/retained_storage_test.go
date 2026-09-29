@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	bolt "go.etcd.io/bbolt"
 	"net/http"
 	"net/http/httptest"
@@ -69,7 +70,7 @@ func TestRetainedRecordPathsResolvePinnedTemplateAndLayeredSidecar(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{rec.DiskPath, rec.BasePath, rec.SnapshotPath, rec.MemFilePath, base, rec.RootfsPath, filepath.Join(rec.DeltaDir, "rootfs.delta")}
+	want := []string{rec.DiskPath, rec.BasePath, rec.SnapshotPath, rec.MemFilePath, base, rec.RootfsPath, filepath.Join(rec.DeltaDir, "rootfs.delta"), mem + ".base"}
 	if !reflect.DeepEqual(paths, want) {
 		t.Fatalf("retained dependencies = %v, want %v", paths, want)
 	}
@@ -142,6 +143,88 @@ func TestRetainedInventoryRejectsIncompleteSavedSnapshotManifest(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("incomplete saved snapshot manifest was accepted")
+	}
+}
+
+func TestRetainedInventoryMeasuresCompanionsAndCommittedManifest(t *testing.T) {
+	root := t.TempDir()
+	state, err := OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	snapshotID := uuid.NewString()
+	snapshotDir := filepath.Join(root, SavedSnapshotsDirName, snapshotID)
+	if err := os.MkdirAll(snapshotDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rec := VMRecord{ID: uuid.NewString(), SourceSnapshotID: snapshotID, Status: StatusPaused,
+		DiskPath: filepath.Join(root, "overlay.ext4"), SnapshotPath: filepath.Join(root, "vmstate.snap"),
+		MemFilePath: filepath.Join(root, "mem.diff"), BaseMemPath: filepath.Join(root, "mem.snap")}
+	paths := []string{rec.DiskPath, rec.SnapshotPath, rec.MemFilePath, rec.BaseMemPath}
+	companions := []string{rec.SnapshotPath + ".overlay", rec.MemFilePath + ".presence", rec.MemFilePath + ".base", rec.MemFilePath + ".wallclock", rec.BaseMemPath + ".wallclock"}
+	for _, path := range append(paths, companions...) {
+		data := []byte("retained artifact")
+		if path == rec.MemFilePath+".base" {
+			data = []byte(rec.BaseMemPath)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := state.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	manifestPath := filepath.Join(snapshotDir, savedSnapshotManifestName)
+	man, err := json.Marshal(SavedSnapshotManifest{Version: savedSnapshotVersion, SnapshotID: snapshotID, Kind: SavedSnapshotMemFS,
+		DiskPath: rec.DiskPath, SnapshotPath: rec.SnapshotPath, MemPath: rec.MemFilePath, BaseMemPath: rec.BaseMemPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, man, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{state: state, cfg: ManagerConfig{RunDir: root, SnapshotDir: root}}
+	seen := map[string]int{}
+	inv, err := m.retainedStorageInventory(t.Context(), func(f *os.File, _ int) ([]retainedstorage.Extent, string, error) {
+		seen[f.Name()]++
+		return nil, "generation", nil
+	})
+	if err != nil || len(inv.Owners) != 2 {
+		t.Fatalf("inventory = %v, error = %v", inv, err)
+	}
+	for _, path := range append(paths, companions...) {
+		if seen[path] != 2 {
+			t.Fatalf("artifact %s measured %d times, want once for each owner", path, seen[path])
+		}
+	}
+	if seen[manifestPath] != 1 {
+		t.Fatal("committed manifest was not measured")
+	}
+	for _, path := range append(companions, manifestPath) {
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			failed := errors.New("allocation unavailable")
+			inv, err := m.retainedStorageInventory(t.Context(), func(f *os.File, _ int) ([]retainedstorage.Extent, string, error) {
+				if f.Name() == path {
+					return nil, "", failed
+				}
+				return nil, "generation", nil
+			})
+			if inv != nil || !errors.Is(err, failed) {
+				t.Fatalf("failed artifact measurement produced inventory=%v error=%v", inv, err)
+			}
+		})
+	}
+	if err := os.Remove(companions[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "missing"), companions[0]); err != nil {
+		t.Fatal(err)
+	}
+	if inv, err := m.retainedStorageInventory(t.Context(), func(*os.File, int) ([]retainedstorage.Extent, string, error) {
+		return nil, "generation", nil
+	}); err == nil || inv != nil {
+		t.Fatal("dangling companion was treated as absent")
 	}
 }
 
