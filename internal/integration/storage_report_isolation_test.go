@@ -348,11 +348,10 @@ func TestIntegration_DirectReportDrainsOlderLegacyReportsInReceiptOrder(t *testi
 	ctx := context.Background()
 	legacyID := uuid.New()
 	directID := uuid.New()
-	legacyReceivedAt := time.Now().UTC().Add(-time.Minute)
 	legacyPayload := fmt.Sprintf(`[{"sandbox_id":%q,"allocated_bytes":%d}]`, fixture.sandboxID, 8*1024*1024)
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO legacy_host_storage_report(host_id, report_id, received_at, payload)
-		VALUES ($1, $2, $3, $4::jsonb)`, fixture.hostID, legacyID, legacyReceivedAt, legacyPayload); err != nil {
+		VALUES ($1, $2, clock_timestamp() - interval '1 minute', $3::jsonb)`, fixture.hostID, legacyID, legacyPayload); err != nil {
 		t.Fatalf("insert legacy handoff: %v", err)
 	}
 
