@@ -157,6 +157,16 @@ func (m *Manager) forkFromBackup(ctx context.Context, vmID, generation string, c
 	inst = nil
 	err = destroyed()
 	if err == nil {
+		// A recovery wave boots within the host's restore limit, like any restore.
+		select {
+		case m.restoreSem <- struct{}{}:
+			defer func() { <-m.restoreSem }()
+		case <-ctx.Done():
+			m.retainStagingForRetry(vmID)
+			return nil, status.Errorf(codes.Unavailable, "vm %s: waiting for a restore slot: %v", vmID, ctx.Err())
+		}
+	}
+	if err == nil {
 		inst, err = m.coldBootFromRootfs(ctx, vmID, r.Disk, r.Base, r.BlockMap, cfg.EgressRules, seed, destroyed, true, SupervisionUnit, cfg.VCPU, cfg.MemoryMiB)
 	}
 	if err == nil {

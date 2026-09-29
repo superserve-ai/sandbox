@@ -100,6 +100,29 @@ func TestForkFromBackupYieldsToADestroyDuringTheDownload(t *testing.T) {
 	}
 }
 
+// A downloaded backup boots only within the host's restore limit.
+func TestForkFromBackupWaitsForARestoreSlot(t *testing.T) {
+	m := newSavedTestManager(t)
+	m.SetBackupRestore(&slowEmptyStore{}, &slowEmptyStore{}, filepath.Join(t.TempDir(), ".restore"), BackupRestoreOptions{Concurrency: 1})
+	m.restoreSem = make(chan struct{}, 1)
+	m.restoreSem <- struct{}{}
+	disk := touch(t, filepath.Join(t.TempDir(), "rootfs.ext4"))
+	orig := fetchBackupGeneration
+	fetchBackupGeneration = func(context.Context, backup.BlobReader, string, string, string, backup.ProgressFunc) (backup.Restored, error) {
+		return backup.Restored{Disk: disk, Standalone: true}, nil
+	}
+	defer func() { fetchBackupGeneration = orig }()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	cfg := VMConfig{VCPU: 1, MemoryMiB: 512, SavedSnapshotID: "5f0c2a9e-1b7d-4c3e-8a6f-0d9e2b4c7a13"}
+	if _, err := m.forkFromBackup(ctx, "fork-1", "gen-1", cfg, "team", "", "", nil, 0); status.Code(err) != codes.Unavailable {
+		t.Fatalf("err = %v, want Unavailable while every restore slot is taken", err)
+	}
+	if _, ok := m.vms["fork-1"]; ok {
+		t.Fatal("booted past the restore limit")
+	}
+}
+
 // A run dir no record accounts for may hold a live Firecracker on the disk
 // the boot would replace: until its stop is confirmed, nothing is fetched.
 func TestForkFromBackupStopsALeftoverLifeFirst(t *testing.T) {
