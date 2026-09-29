@@ -20,7 +20,12 @@ BEGIN
         RAISE EXCEPTION 'signup trial requires a creator' USING ERRCODE = '22023';
     END IF;
     IF p_policy_mode = 'first_team' THEN
-        RETURN create_team_with_signup_trial(p_name, p_user_id, p_home_region);
+        INSERT INTO team(name, home_region)
+        VALUES (p_name, p_home_region)
+        RETURNING * INTO created_team;
+        PERFORM claim_team_signup_trial_with_device(created_team.id, p_user_id);
+        DELETE FROM team_signup_trial_provenance WHERE team_id = created_team.id;
+        RETURN created_team;
     END IF;
     IF p_policy_mode IS DISTINCT FROM 'additional_team' THEN
         RAISE EXCEPTION 'unsupported team creation policy' USING ERRCODE = '22023';

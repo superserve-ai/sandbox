@@ -372,6 +372,99 @@ func TestIntegration_TeamCreationAdditionalTeamWithoutRegionalClaim(t *testing.T
 	}
 }
 
+func TestIntegration_TeamCreationDeviceAuthority(t *testing.T) {
+	pool := teamCreationDatabase(t)
+	client := newTeamCreationClient(t, pool)
+	ctx := context.Background()
+	register := func(t *testing.T, actor uuid.UUID, fingerprint, want string) {
+		t.Helper()
+		var result string
+		if err := pool.QueryRow(ctx, `SELECT register_promotion_signup_device($1,$2,$3,$4)`,
+			actor, uuid.New(), "event-"+uuid.NewString(), fingerprint).Scan(&result); err != nil || result != want {
+			t.Fatalf("device registration=%q want=%q err=%v", result, want, err)
+		}
+	}
+	owner, prior := uuid.New(), uuid.New()
+	fingerprint := "device-" + uuid.NewString()
+	register(t, owner, fingerprint, "owner")
+	register(t, prior, fingerprint, "owner_conflict")
+	// Expansion records device consumption without enforcing device eligibility.
+	priorID := teamCreationID(t, client.call(teamCreationClaims(prior, uuid.NewString(), "Expansion device team"), nil))
+	teamCreationOutcome(t, pool, priorID, "granted")
+	if n := teamCreationCount(t, pool, `SELECT count(*) FROM promotion_device_grant WHERE promotion='signup' AND user_id=$1 AND team_id=$2 AND fingerprint=$3`, prior, priorID, fingerprint); n != 1 {
+		t.Fatalf("expansion device grants=%d", n)
+	}
+	// Both gates are enabled only in this disposable database.
+	rolloutExec(t, pool, `SELECT enable_canonical_promotion_identity('{"reference":"isolated device provisioning test","all_writers_ready":true,"rollback_ready":true}')`)
+	rolloutExec(t, pool, `SELECT set_promotion_device_policy(true,true)`)
+	readClient := newTeamCreationClient(t, teamCreationReadOnlyPool(t, pool))
+	for _, tc := range []struct {
+		reason  string
+		actor   uuid.UUID
+		outcome string
+	}{
+		{"evidence_missing", uuid.New(), "promotion_ineligible"},
+		{"owner_conflict", uuid.New(), "promotion_ineligible"},
+		{"device_already_redeemed", owner, "promotion_ineligible"},
+		{"first_identity_claim", uuid.New(), "granted"},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			device := "device-" + uuid.NewString()
+			switch tc.reason {
+			case "owner_conflict":
+				register(t, tc.actor, fingerprint, "owner_conflict")
+			case "first_identity_claim":
+				register(t, tc.actor, device, "owner")
+			}
+			claims := teamCreationClaims(tc.actor, uuid.NewString(), "Device team "+tc.reason)
+			created := client.call(claims, nil)
+			id := teamCreationID(t, created)
+			teamCreationOutcome(t, pool, id, tc.outcome)
+			var reason string
+			if err := pool.QueryRow(ctx, `SELECT reason FROM team_signup_promotion_outcome WHERE team_id=$1`, id).Scan(&reason); err != nil || reason != tc.reason {
+				t.Fatalf("reason=%q want=%q err=%v", reason, tc.reason, err)
+			}
+			for _, query := range []string{
+				`SELECT count(*) FROM team_member WHERE team_id=$1 AND role='owner'`,
+				`SELECT count(*) FROM team_memberships WHERE team_id=$1 AND status='active'`,
+				`SELECT count(*) FROM user_role_assignments a JOIN roles r ON r.id=a.role_id WHERE a.team_id=$1 AND a.revoked_at IS NULL AND r.name='team_owner'`,
+				`SELECT count(*) FROM team_creation_requests WHERE team_id=$1`,
+			} {
+				if n := teamCreationCount(t, pool, query, id); n != 1 {
+					t.Fatalf("incomplete device-checked creation: %s count=%d", query, n)
+				}
+			}
+			if tc.reason == "evidence_missing" {
+				// Later evidence cannot upgrade the completed no-grant intent.
+				register(t, tc.actor, device, "owner")
+			}
+			for _, replay := range []map[string]any{claims, teamCreationRecover(claims)} {
+				response := readClient.call(replay, nil)
+				teamCreationStatus(t, response, http.StatusOK, "")
+				if response.Body.String() != created.Body.String() {
+					t.Fatal("device-checked replay changed committed result")
+				}
+			}
+			teamCreationOutcome(t, pool, id, tc.outcome)
+			wantGrants := 0
+			if tc.outcome == "granted" {
+				wantGrants = 1
+				if n := teamCreationCount(t, pool, `SELECT count(*) FROM promotion_device_grant WHERE promotion='signup' AND team_id=$1 AND user_id=$2 AND fingerprint=$3`, id, tc.actor, device); n != 1 {
+					t.Fatalf("eligible device grants=%d", n)
+				}
+			}
+			for _, query := range []string{
+				`SELECT count(*) FROM promotion_device_grant WHERE promotion='signup' AND user_id=$1`,
+				`SELECT count(*) FROM user_signup_trial_claim WHERE user_id=$1`,
+			} {
+				if n := teamCreationCount(t, pool, query, tc.actor); n != wantGrants {
+					t.Fatalf("device consumption: %s count=%d want=%d", query, n, wantGrants)
+				}
+			}
+		})
+	}
+}
+
 func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 	pool := teamCreationDatabase(t)
 	client := newTeamCreationClient(t, pool)
@@ -558,6 +651,7 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 					{`SELECT count(*) FROM user_promotion_entitlement WHERE user_id=$1`, actor},
 					{`SELECT count(*) FROM team_credit_grant WHERE created_by=$1`, actor},
 					{`SELECT count(*) FROM team_signup_promotion_outcome WHERE user_id=$1`, actor},
+					{`SELECT count(*) FROM promotion_device_grant WHERE user_id=$1`, actor},
 					{`SELECT count(*) FROM team_member WHERE profile_id=$1`, actor},
 					{`SELECT count(*) FROM team_memberships WHERE user_id=$1`, actor},
 					{`SELECT count(*) FROM user_role_assignments WHERE user_id=$1`, actor},
@@ -570,6 +664,9 @@ func TestIntegration_TeamCreationProductionAuthority(t *testing.T) {
 				teamCreationStatus(t, client.call(teamCreationRecover(claims), nil), 404, "result_not_found")
 				id := teamCreationID(t, client.call(claims, nil))
 				teamCreationOutcome(t, pool, id, "granted")
+				if n := teamCreationCount(t, pool, `SELECT count(*) FROM promotion_device_grant WHERE promotion='signup' AND user_id=$1 AND team_id=$2`, actor, id); n != 1 {
+					t.Fatalf("retry device grants=%d", n)
+				}
 			})
 		}
 	})
