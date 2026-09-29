@@ -28,14 +28,18 @@ def check(service, project, cell):
             or rollout[0].get('value') not in ('true', 'false')):
         raise ValueError('promotion evidence rollout state is missing or invalid')
     promotion_evidence_enabled = rollout[0]['value'] == 'true'
-    for name, secret in (
+    promotion_secrets = (
             ('PROMOTION_AUTH_DATABASE_URL', 'promotion-auth-database-url'),
             ('PROMOTION_CAPTURE_TOKEN', 'promotion-capture-token'),
             ('PROMOTION_ACCOUNT_TOKEN', 'promotion-account-token'),
-            ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion-account-public-key')):
+            ('PROMOTION_ACCOUNT_PUBLIC_KEY', 'promotion-account-public-key'))
+    promotion_configured = any(
+        env.get('name') == name for name, _ in promotion_secrets
+        for env in containers[0].get('env', []))
+    if not promotion_evidence_enabled and not promotion_configured:
+        return
+    for name, secret in promotion_secrets:
         matches = [env for env in containers[0].get('env', []) if env.get('name') == name]
-        if not matches and not promotion_evidence_enabled:
-            continue
         if len(matches) != 1:
             raise ValueError(f'{name} mapping is missing or duplicated')
         ref = matches[0].get('valueFrom', {}).get('secretKeyRef', {})

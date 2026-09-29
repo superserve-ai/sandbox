@@ -95,14 +95,16 @@ class ControlplaneIdentityTest(unittest.TestCase):
 
     def test_rejects_partial_promotion_configuration(self):
         for cell in ('use4', 'usw2'):
-            for mask in range(1, 15):
-                service = self.service(cell)
-                container = service['spec']['template']['spec']['containers'][0]
-                env = container['env']
-                container['env'] = env[:1] + [
-                    mapping for i, mapping in enumerate(env[1:5]) if mask & (1 << i)] + env[5:]
-                with self.subTest(cell=cell, mask=mask), self.assertRaises(ValueError):
-                    identity.check(service, 'example-project', cell)
+            for enabled in (False, True):
+                for mask in range(1, 15):
+                    service = self.service(cell)
+                    container = service['spec']['template']['spec']['containers'][0]
+                    env = container['env']
+                    env[-1]['value'] = str(enabled).lower()
+                    container['env'] = env[:1] + [
+                        mapping for i, mapping in enumerate(env[1:5]) if mask & (1 << i)] + env[5:]
+                    with self.subTest(cell=cell, enabled=enabled, mask=mask), self.assertRaises(ValueError):
+                        identity.check(service, 'example-project', cell)
 
     def test_rejects_malformed_promotion_secret_mappings(self):
         for cell in ('use4', 'usw2'):
