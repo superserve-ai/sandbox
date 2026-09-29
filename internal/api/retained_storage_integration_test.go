@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 )
 
@@ -358,6 +359,102 @@ func TestIntegration_RetainedReportOwnershipAndReceiptTransitions(t *testing.T) 
 	}
 	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval WHERE owner_id=$1 AND started_at >= $2`, snapshotA, end).Scan(&count); err != nil || count != 0 {
 		t.Fatalf("deleted owner resurrected: %d %v", count, err)
+	}
+}
+
+func TestIntegration_RetainedSnapshotStatusClosure(t *testing.T) {
+	for _, status := range []string{"failed", "ready", "deleting"} {
+		t.Run(status, func(t *testing.T) {
+			f := newStorageLeaseFixture(t)
+			ctx := t.Context()
+			exec := func(query string, args ...any) {
+				t.Helper()
+				if _, err := f.pool.Exec(ctx, query, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Copy the migrated trigger, including its event columns and WHEN
+			// condition, so a status-only update exercises the production wiring.
+			var trigger, table string
+			if err := f.pool.QueryRow(ctx, `SELECT pg_get_triggerdef(oid),tgrelid::regclass::text
+ FROM pg_trigger WHERE tgrelid='public.sandbox_snapshot'::regclass
+ AND tgname='close_snapshot_retained_storage'`).Scan(&trigger, &table); err != nil {
+				t.Fatal(err)
+			}
+			exec(strings.Replace(trigger, " ON "+table+" ", " ON pg_temp.sandbox_snapshot ", 1))
+			id := uuid.New()
+			at := f.receivedAt.Add(-time.Minute)
+			exec(`INSERT INTO sandbox_snapshot(id,team_id,host_id,status,created_at)
+ SELECT $1,team_id,host_id,'creating',created_at FROM sandbox WHERE id=$2`, id, f.sandboxID)
+			owner := func(kind string, id uuid.UUID) retainedstorage.Owner {
+				return retainedstorage.Owner{Kind: kind, ID: id.String(), Generation: strings.Repeat("a", 64),
+					Extents: []retainedstorage.Extent{{Device: "fs", Start: 4096, Length: 4096}}}
+			}
+			base, snapshot := owner("sandbox", f.sandboxID), owner("snapshot", id)
+			apply := func() {
+				t.Helper()
+				exec(`UPDATE host_storage_report SET state='processing',next_measurement_index=0`)
+				if err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, at,
+					[]storageReportMeasurement{{Retained: &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{base, snapshot}}}}, 1, 1); err != nil {
+					t.Fatal(err)
+				}
+			}
+			apply()
+			exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
+ SELECT host_id,team_id,'snapshot',$1,'previous','[]',$2,$3 FROM sandbox WHERE id=$4`, id, at.Add(-time.Minute), at, f.sandboxID)
+			var before, after time.Time
+			if err := f.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			if status == "failed" {
+				if n, err := db.New(f.pool).MarkSandboxSnapshotFailed(ctx, id); err != nil || n != 1 {
+					t.Fatalf("mark snapshot failed: rows=%d err=%v", n, err)
+				}
+			} else {
+				exec(`UPDATE sandbox_snapshot SET status=$2 WHERE id=$1`, id, status)
+			}
+			if err := f.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&after); err != nil {
+				t.Fatal(err)
+			}
+			var ended *time.Time
+			readEnd := func() {
+				t.Helper()
+				if err := f.pool.QueryRow(ctx, `SELECT ended_at FROM retained_storage_interval WHERE owner_id=$1 AND generation=$2`, id, snapshot.Generation).Scan(&ended); err != nil {
+					t.Fatal(err)
+				}
+			}
+			readEnd()
+			if status == "failed" {
+				if ended == nil || ended.Before(before) || ended.After(after) {
+					t.Fatalf("failed snapshot must close at database transition time: ended=%v bounds=[%s,%s]", ended, before, after)
+				}
+				boundary := *ended
+				// A delayed inventory cannot revive the failed snapshot, and a
+				// later cleanup must not move its already-closed interval.
+				apply()
+				exec(`UPDATE sandbox_snapshot SET status='deleting',deleted_at=$2 WHERE id=$1`, id, after)
+				readEnd()
+				if ended == nil || !ended.Equal(boundary) {
+					t.Fatalf("failed interval boundary changed: %v, want %s", ended, boundary)
+				}
+			} else {
+				if ended != nil {
+					t.Fatalf("retained status %s closed snapshot early: %s", status, ended)
+				}
+				exec(`UPDATE sandbox_snapshot SET status='deleting' WHERE id=$1`, id)
+				exec(`UPDATE sandbox_snapshot SET deleted_at=$2 WHERE id=$1`, id, after)
+				readEnd()
+				if ended == nil || !ended.Equal(after) {
+					t.Fatalf("confirmed deletion boundary: %v, want %s", ended, after)
+				}
+			}
+			var count int
+			if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval
+ WHERE (owner_kind='sandbox' AND owner_id=$1 AND ended_at IS NULL)
+ OR (owner_kind='snapshot' AND owner_id=$2 AND generation='previous' AND ended_at=$3)`, f.sandboxID, id, at).Scan(&count); err != nil || count != 2 {
+				t.Fatalf("snapshot closure changed surviving shared owner or historical interval: count=%d err=%v", count, err)
+			}
+		})
 	}
 }
 
