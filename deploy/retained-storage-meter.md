@@ -94,26 +94,80 @@ generation. Selecting the latest template, even the only one currently on disk,
 is not a valid recovery rule. Such a host remains blocked; rejecting its inventory
 preserves prior quantities but does not complete the upgrade.
 
-Before opt-in, reconcile a bounded batch of affected sandbox IDs with their
-control-plane creation references (`sandbox.snapshot_path`, `mem_path`,
-`base_path`, and `delta_path`) on the recorded host. Require a generation-pinned
-reference: a template ID or the current mutable template row is insufficient.
-For overlay records, verify the pinned `delta_path` names `rootfs.delta` and its
-build metadata agrees with the sandbox's recorded base. For full-copy records,
-resolve `RootfsPath` from the build metadata adjacent to the pinned creation
-snapshot (or its verified legacy flat-template layout). Do not put a template
-memory base back into a full pause's `BaseMemPath`.
+Use the one-time `cmd/retained-storage-reconcile` tool before opt-in. It reads
+creation references directly from the control-plane `sandbox` rows in a read-only
+transaction and verifies the installed host identity and database incarnation.
+It accepts immutable build directories whose `build.meta.json` matches all four
+creation paths. Overlay recovery verifies the pinned `rootfs.delta` and disk base;
+full-copy recovery uses the rootfs declared by that exact build. Flat or reusable
+build paths, missing metadata and inconsistent references are reported as
+unresolved and left unchanged. Recover authoritative historical generation
+references separately for those records; never choose the latest template.
 
-A migration must persist only the proven disk dependency fields, comparing the
-record's creation and current pause identity atomically, while coordinating with
-its lifecycle operation. Preserve status, pause artifacts, policy, and unknown
-fields. Re-read changed records and retry reconciliation against their new
-identity; do not write a captured whole record. Keep a per-owner receipt of the
-authoritative reference and verified dependency paths, then reopen durable state
-and require a complete inventory before enabling the producer. If those creation
-references are absent, reused, or not generation-pinned, recover the original
-per-sandbox build reference from an authoritative historical record first. There
-is no automatic control-plane-to-host migration for this case in the current
-producer; affected hosts must remain opted out until that reconciliation is
-implemented and its receipts are checked. Missing authority must not become zero
-or trigger a cutover.
+### One-time operator procedure
+
+Build `go build -o retained-storage-reconcile ./cmd/retained-storage-reconcile`
+from the qualified revision and copy the binary to the selected host. Keep
+`VMD_RETAINED_STORAGE_REPORTS` disabled. Schedule a short daemon maintenance
+window: suspend host admission and lifecycle requests, let active template
+builds finish, stop
+`superserve-vmd.socket` and `superserve-vmd.service`, and prevent automation from
+restarting them until reconciliation finishes. Leave `superserve-vms.service`
+and sandbox units running. The deployed VMD service uses `KillMode=process` and
+its shutdown preserves VMs; this procedure does not pause, wake or delete them.
+Use the configured VMD state, run and snapshot paths, not copies of state or
+inferred default directories. The tool refuses to open a missing state database
+or one held by VMD. Bolt's process lock excludes VMD lifecycle writers throughout each invocation, without adding work to lifecycle paths.
+
+With `DATABASE_URL` set to a read-only credential for the correct control-plane
+cell, capture a private dry-run receipt (it contains host paths and owner IDs):
+
+```sh
+umask 077
+./retained-storage-reconcile --host-id "$HOST_ID" \
+  --state "$VMD_STATE_PATH" --run-dir "$RUN_DIR" --snapshot-dir "$SNAPSHOT_DIR" \
+  > retained-plan.json
+```
+
+The default is read-only. Each receipt records the source creation row, local
+creation/pause identity, verified build metadata path, proposed dependencies and
+an `unchanged`, `would_update` or `unresolved` outcome. Review the receipt, then
+run the same command with `--apply`, writing a new receipt. Apply patches only
+verified disk dependency fields and preserves memory dependencies, pause files,
+status, policy and unknown fields. It compares the captured local generation
+again in the update transaction. Successful entries remain applied if another
+entry is unresolved; repeat runs safely leave completed entries unchanged.
+No billing rows or reports are written.
+
+Apply re-reads durable state in fresh transactions and runs the common complete
+physical inventory, including saved snapshots, before setting `host_ready`.
+Unresolved owners, control-plane/local owner mismatches and incomplete physical
+measurement keep readiness false and return exit status 2. Dry runs never claim
+readiness; their inventory can fail because proposed changes have not been
+applied. Check every receipt and `inventory_error`, then repeat apply after any
+authoritative repair. Do not opt in on the basis of a successful metadata patch
+alone. Restart the daemon/socket with the producer still disabled, verify normal
+reattachment, and use the rollout checks above before opting in. Running guests
+can change allocation during the offline scan; retry an unknown inventory rather
+than pausing them for this tool. A complete offline inventory is a point-in-time
+readiness check, not a guarantee about later allocations.
+
+### Runner-owned Linux qualification
+
+`scripts/validate-billing.sh` preserves the retained API regression selection.
+On macOS it invokes `scripts/validate-retained-docker.sh` using the unit-test
+route's `golang:1.26` image, repository mount and Go module cache. The runner must
+supply `CODEX_SANDBOX_DB_CONTAINER` (or `DB_CONTAINER`) for its disposable migrated
+PostgreSQL container and the corresponding local `DATABASE_URL`. The Linux test
+container shares that database's network namespace; suites execute serially.
+
+The Docker helper runs the refresh-race suite, then creates a disposable 1 GiB
+loop-backed XFS image with reflink enabled, records `findmnt`/`xfs_info`, and sets
+`RETAINED_STORAGE_TEST_DIR` for both physical tests. It requires privileged test
+containers, XFS/loop support in the existing Docker Linux VM, and package access
+for `xfsprogs`. Cleanup unmounts only its own image and detaches its loop device.
+On native Linux the runner supplies an already-qualified disposable directory.
+Missing prerequisites fail validation; there is no skip or substitute physical
+measurement. Preserve the individual test results and filesystem evidence in the
+canonical validation log. This validates disposable storage, not a production
+filesystem migration or production reconciliation.

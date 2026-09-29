@@ -276,6 +276,10 @@ func (m *Manager) rememberRetainedDependencies(original, resolved VMRecord) erro
 }
 
 func (m *Manager) retainedStorageInventory(ctx context.Context, measure func(*os.File, int) ([]retainedstorage.Extent, string, error)) (*retainedstorage.Inventory, error) {
+	return m.retainedStorageInventoryWithPersistence(ctx, measure, true)
+}
+
+func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, measure func(*os.File, int) ([]retainedstorage.Extent, string, error), persist bool) (*retainedstorage.Inventory, error) {
 	epoch := m.storageEpoch.Load()
 	if m.storageMutations.Load() != 0 || m.state == nil {
 		return nil, fmt.Errorf("retained inventory not ready")
@@ -415,6 +419,9 @@ func (m *Manager) retainedStorageInventory(ctx context.Context, measure func(*os
 		return nil, fmt.Errorf("retained generation changed during inventory")
 	}
 	for _, update := range dependencyUpdates {
+		if !persist {
+			return nil, fmt.Errorf("retained dependency metadata still requires persistence")
+		}
 		if err := m.rememberRetainedDependencies(update.original, update.resolved); err != nil {
 			return nil, err
 		}
