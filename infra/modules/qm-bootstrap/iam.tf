@@ -1,7 +1,7 @@
 locals {
   roles = {
     network = [
-      "compute.networks.create", "compute.networks.get", "compute.networks.updatePolicy", "compute.networks.delete",
+      "compute.networks.create", "compute.networks.get", "compute.networks.update", "compute.networks.updatePolicy", "compute.networks.delete",
       "compute.networks.use",
       "compute.subnetworks.create", "compute.subnetworks.get", "compute.subnetworks.update", "compute.subnetworks.delete",
       "compute.subnetworks.setPrivateIpGoogleAccess", "compute.subnetworks.use",
