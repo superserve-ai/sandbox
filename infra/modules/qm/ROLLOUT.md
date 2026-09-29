@@ -111,7 +111,8 @@ does not accept a condition flag. Its grant requires explicit removal on every
 exit path; record an administrator cleanup owner and deadline before granting it.
 Do not rely on the other grants' expiry to remove Billing Account User.
 
-The bootstrap providers use the paired project as their provider and quota
+Both bootstrap providers set `user_project_override = true` and
+`billing_project` to the paired project, explicitly selecting it as the quota
 project. Grant `roles/serviceusage.serviceUsageConsumer` only to the exact
 bootstrap identity for the expiring window above. Verify the binding before
 initialization and remove it during cleanup; without it, provider calls can

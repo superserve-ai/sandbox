@@ -31,10 +31,14 @@ locals {
 
 provider "google" {
   project                     = local.environment.paired_project_id
+  user_project_override       = true
+  billing_project             = local.environment.paired_project_id
   impersonate_service_account = var.bootstrap_service_account
 }
 provider "google-beta" {
   project                     = local.environment.paired_project_id
+  user_project_override       = true
+  billing_project             = local.environment.paired_project_id
   impersonate_service_account = var.bootstrap_service_account
 }
 
