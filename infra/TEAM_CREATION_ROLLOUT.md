@@ -13,7 +13,11 @@ Apply the compatible promotion expansion migrations
 `20260925195213_promotion_redemption_limits.sql`,
 `20260925195235_canonical_promotion_identity.sql`, and
 `20260925195248_canonical_stripe_promotion_fences.sql`, plus the additive
-`20260928184340_team_creation_requests.sql` migration. The API writes signed Auth evidence through
+`20260928184340_team_creation_requests.sql` and
+`20260928233536_team_creation_signup_policy.sql` migrations, in that order,
+before enabling API creation. The signup-policy migration defines the
+four-argument `create_team_with_signup_trial` function required by the API.
+The API writes signed Auth evidence through
 `upsert_profile_with_promotion_identity` in the same transaction as creation,
 claim, legacy membership, active membership, owner role and completed result.
 A missing authority or invalid/stale first-create evidence rolls everything back
