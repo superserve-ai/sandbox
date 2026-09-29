@@ -116,3 +116,8 @@ SELECT EXISTS (
   SELECT 1 FROM sandbox_snapshot
   WHERE sandbox_id = $1 AND status = 'creating' AND deleted_at IS NULL
 );
+
+-- name: DeletedSavedSnapshotIDs :many
+-- The subset of ids whose saved snapshot is deleted; an id the database does
+-- not know is not one of them.
+SELECT id FROM sandbox_snapshot WHERE id = ANY(@ids::uuid[]) AND deleted_at IS NOT NULL;

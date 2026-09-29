@@ -192,7 +192,7 @@ func TestIntegration_StaleAmbiguousPromotionReconcilesWithoutReactivating(t *tes
 	if _, err := testPool.Exec(ctx, `INSERT INTO team_billing_account(team_id) VALUES($1)`, otherTeam); err != nil {
 		t.Fatal(err)
 	}
-	if state, err := testQueries.ReserveStripePromotionForEventState(ctx, db.ReserveStripePromotionForEventStateParams{TeamID: otherTeam, UserID: userID, EventID: "evt_other_team"}); err != nil || state != "ineligible" {
+	if state, err := testQueries.ReserveStripePromotionForEventState(ctx, db.ReserveStripePromotionForEventStateParams{TeamID: otherTeam, UserID: userID, EventID: "evt_other_team"}); err != nil || state != "user_already_redeemed" {
 		t.Fatalf("reconciled user can redeem elsewhere: %s %v", state, err)
 	}
 }
@@ -224,5 +224,57 @@ func TestIntegration_StripeProcessingLeaseFencesSupersededWorkers(t *testing.T) 
 	}
 	if err := testQueries.ReleaseStripeWebhookProcessingLease(ctx, db.ReleaseStripeWebhookProcessingLeaseParams{CustomerID: customerID, Token: second}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestIntegration_StripeReservationDistinguishesUserRedemption(t *testing.T) {
+	region := promotionIsolatedDatabase(t, true)
+	for _, tc := range []struct {
+		name, want                                 string
+		redeemed, canonicalOff, unverified, fenced bool
+	}{
+		{name: "redeemed user", redeemed: true, want: "user_already_redeemed"},
+		{name: "redeemed user with canonical disabled", redeemed: true, canonicalOff: true, want: "user_already_redeemed"},
+		{name: "missing canonical evidence", unverified: true, want: "ineligible"},
+		{name: "migration fence", fenced: true, want: "ineligible"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tx, err := region.Begin(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(t.Context())
+			user, team := uuid.New(), uuid.New()
+			rolloutExec(t, tx, `SELECT * FROM upsert_profile_with_promotion_identity($1,$2,$3,clock_timestamp(),clock_timestamp())`,
+				user, user.String()+"@example.com", !tc.unverified)
+			rolloutExec(t, tx, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "example-team-"+team.String())
+			rolloutExec(t, tx, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team)
+			if tc.canonicalOff {
+				// Model the pre-activation state; production deliberately forbids reversing this gate.
+				rolloutExec(t, tx, `ALTER TABLE promotion_identity_enforcement DISABLE TRIGGER promotion_identity_enforcement_irreversible`)
+				rolloutExec(t, tx, `UPDATE promotion_identity_enforcement SET enabled=false,enabled_at=NULL,readiness_reference=NULL WHERE singleton`)
+				rolloutExec(t, tx, `ALTER TABLE promotion_identity_enforcement ENABLE TRIGGER promotion_identity_enforcement_irreversible`)
+			}
+			if tc.redeemed {
+				rolloutExec(t, tx, `INSERT INTO user_promotion_entitlement(user_id,stripe_redemption_at) VALUES($1,now())`, user)
+			}
+			if tc.fenced {
+				rolloutExec(t, tx, `INSERT INTO stripe_promotion_migration_fence(team_id) VALUES($1)`, team)
+			}
+			for _, query := range []string{
+				`SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`,
+				`SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,$3,NULL,NULL,false)`,
+			} {
+				var state string
+				if err := tx.QueryRow(t.Context(), query, team, user, "evt-"+uuid.NewString()).Scan(&state); err != nil || state != tc.want {
+					t.Fatalf("reservation reason = %q, want %q: %v", state, tc.want, err)
+				}
+			}
+			var reserved bool
+			if err := tx.QueryRow(t.Context(), `SELECT stripe_activation_credit_reserved_at IS NOT NULL FROM team_billing_account WHERE team_id=$1`, team).
+				Scan(&reserved); err != nil || reserved {
+				t.Fatalf("denial reserved credit: %t %v", reserved, err)
+			}
+		})
 	}
 }

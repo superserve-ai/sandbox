@@ -23,6 +23,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
@@ -2043,7 +2044,7 @@ func (h *Handlers) processRecordedStripeWebhook(ctx context.Context, event strip
 		return err
 	}
 
-	if err := h.lockStripeWebhookAccountForProcessing(ctx, q, event); err != nil {
+	if err := h.lockStripeWebhookAccountForProcessing(ctx, q, event, preReservation); err != nil {
 		h.rollbackAndPersistStripeWebhookFailure(ctx, conn, lease, processTx, event.ID, err, false)
 		return err
 	}
@@ -2248,11 +2249,26 @@ func (lease *stripeWebhookProcessingLease) lock(ctx context.Context, q *db.Queri
 // before any Stripe side effect. The subsequent processing transaction may
 // crash or roll back without reopening the entitlement to another team.
 type stripePromotionPreReservation struct {
-	EventID   string
-	TeamID    uuid.UUID
-	UserID    uuid.UUID
-	Reserved  bool
-	Retryable bool
+	EventID              string
+	TeamID               uuid.UUID
+	UserID               uuid.UUID
+	Reserved             bool
+	Retryable            bool
+	AuthorityUnavailable bool
+	DenialReason         string
+}
+
+func isStripePromotionAuthorityFailure(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	case "55000", "P0002", "P0003", "42P01", "42703", "42883", "42501":
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, queries *db.Queries, event stripeEventEnvelope) (*stripePromotionPreReservation, error) {
@@ -2349,16 +2365,50 @@ func (h *Handlers) reserveStripePromotionBeforeWebhook(ctx context.Context, quer
 			return nil, err
 		}
 	}
+	existingReservation := account.StripeActivationCreditReservedAt.Valid
+	existingAttempted := false
+	if existingReservation && userID != uuid.Nil {
+		existingAttempted, err = queries.StripePromotionWasAttempted(ctx, db.StripePromotionWasAttemptedParams{
+			TeamID: pgtype.UUID{Bytes: account.TeamID, Valid: true}, UserID: userID,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	state, err := queries.ReserveStripePromotionForSubscriptionEventState(ctx, stripePromotionSubscriptionReservationParams(account.TeamID, userID, event.ID, obj))
 	if err != nil {
-		return nil, err
+		// An attempted reservation is the durable recovery fence for an
+		// ambiguous Stripe call. Never turn a replay error into a paid-only
+		// completion, even when the policy read itself is unavailable.
+		if existingReservation && existingAttempted {
+			return nil, err
+		}
+		if !isStripePromotionAuthorityFailure(err) {
+			return nil, err
+		}
+		log.Error().Err(err).Str("event_id", event.ID).Msg("Stripe promotion authority unavailable; continue paid activation without credit")
+		return &stripePromotionPreReservation{EventID: event.ID, TeamID: account.TeamID, UserID: userID, AuthorityUnavailable: true, DenialReason: "authority_unavailable"}, nil
+	}
+	var denialReason string
+	switch state {
+	case "acquired", "existing", "blocked":
+	case "ineligible", "user_already_redeemed", "owner_conflict", "device_already_redeemed", "evidence_missing", "device_reservation_pending":
+		denialReason = state
+	case "authority_unavailable":
+		return &stripePromotionPreReservation{
+			EventID: event.ID, TeamID: account.TeamID, UserID: userID,
+			AuthorityUnavailable: true, DenialReason: state,
+		}, nil
+	default:
+		return nil, fmt.Errorf("unknown Stripe promotion reservation state %q", state)
 	}
 	return &stripePromotionPreReservation{
-		EventID:   event.ID,
-		TeamID:    account.TeamID,
-		UserID:    userID,
-		Reserved:  state == "acquired" || state == "existing",
-		Retryable: state == "blocked",
+		EventID:      event.ID,
+		TeamID:       account.TeamID,
+		UserID:       userID,
+		Reserved:     state == "acquired" || state == "existing",
+		Retryable:    state == "blocked",
+		DenialReason: denialReason,
 	}, nil
 }
 
@@ -2520,7 +2570,7 @@ func stripePromotionSubscriptionReservationParams(teamID, userID uuid.UUID, even
 // lockStripeWebhookAccountForProcessing establishes the lock order shared by
 // normal webhook delivery and checkout reconciliation: promotion locks precede
 // the team billing row, which precedes any webhook row.
-func (h *Handlers) lockStripeWebhookAccountForProcessing(ctx context.Context, q *db.Queries, event stripeEventEnvelope) error {
+func (h *Handlers) lockStripeWebhookAccountForProcessing(ctx context.Context, q *db.Queries, event stripeEventEnvelope, preReservation *stripePromotionPreReservation) error {
 	switch event.Type {
 	case "checkout.session.completed", "checkout.session.expired":
 		var obj stripeCheckoutCompletedObject
@@ -2542,14 +2592,52 @@ func (h *Handlers) lockStripeWebhookAccountForProcessing(ctx context.Context, q 
 		if err != nil {
 			return err
 		}
-		if account.StripeActivationUserID.Valid {
+		authorityUnavailable := preReservation != nil && preReservation.AuthorityUnavailable &&
+			preReservation.EventID == event.ID && preReservation.TeamID == account.TeamID
+		promotionSettled := !account.StripeActivationCreditReservedAt.Valid &&
+			(derefString(account.StripeActivationCreditGrantID) != "" || account.StripeActivationCreditGrantedAt.Valid)
+		if authorityUnavailable {
+			// Keep the user fence while allowing billing to proceed without a promotion.
+			if err := q.LockStripePromotionUserForPaidActivation(ctx, preReservation.UserID); err != nil {
+				return err
+			}
+		} else if !promotionSettled && account.StripeActivationUserID.Valid {
 			if err := q.LockStripePromotion(ctx, db.LockStripePromotionParams{
 				TeamID: account.TeamID, UserID: uuid.UUID(account.StripeActivationUserID.Bytes),
 			}); err != nil {
 				return err
 			}
 		}
-		_, err = q.LockTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
+		lockedAccount, err := q.LockTeamBillingAccountByStripeCustomerID(ctx, stringPtr(obj.Customer))
+		if err == nil && promotionSettled {
+			// Settled grants need no policy lookup, but a pending attempt still needs its promotion locks.
+			if lockedAccount.StripeActivationCreditReservedAt.Valid ||
+				(derefString(lockedAccount.StripeActivationCreditGrantID) == "" && !lockedAccount.StripeActivationCreditGrantedAt.Valid) {
+				return errors.New("Stripe promotion settlement changed before paid activation; retry webhook")
+			}
+		}
+		if err == nil && authorityUnavailable {
+			if account.StripeActivationCreditReservedAt.Valid != lockedAccount.StripeActivationCreditReservedAt.Valid ||
+				account.StripeActivationUserID != lockedAccount.StripeActivationUserID ||
+				derefString(account.StripeActivationCreditReservationEventID) != derefString(lockedAccount.StripeActivationCreditReservationEventID) {
+				return errors.New("Stripe promotion reservation changed before paid activation; retry webhook")
+			}
+			if lockedAccount.StripeActivationCreditReservedAt.Valid {
+				// A prior Stripe call may have issued credit; keep its event retryable.
+				attempted, lookupErr := q.StripePromotionWasAttempted(ctx, db.StripePromotionWasAttemptedParams{
+					TeamID: pgtype.UUID{Bytes: account.TeamID, Valid: true}, UserID: preReservation.UserID,
+				})
+				if lookupErr != nil {
+					return lookupErr
+				}
+				if attempted {
+					return errors.New("Stripe promotion attempt requires recovery; retry webhook")
+				}
+				if derefString(lockedAccount.StripeActivationCreditReservationEventID) == event.ID {
+					return errors.New("Stripe promotion reservation requires recovery; retry webhook")
+				}
+			}
+		}
 		return err
 	case "invoice.payment_failed", "invoice.payment_succeeded", "invoice.finalized":
 		var obj stripeInvoiceObject
@@ -2900,6 +2988,33 @@ func stripePromotionReplayWindowError(firstAttemptAt, now time.Time) error {
 	if firstAttemptAt.IsZero() || !now.Before(firstAttemptAt.Add(stripePromotionReplayWindow)) {
 		return errStripePromotionSettlementRequired
 	}
+	return nil
+}
+
+// Denials are committed before any provider cleanup/retry continuation. A
+// redelivered event must reuse that actor-bound decision instead of failing on
+// the event primary key and skipping the rest of webhook processing.
+func recordStripePromotionDenial(ctx context.Context, tx pgx.Tx, eventID string, teamID, userID uuid.UUID, reason string) error {
+	_, err := tx.Exec(ctx, `
+INSERT INTO stripe_promotion_outcome(event_id, team_id, user_id, outcome, reason)
+VALUES($1, $2, $3, 'promotion_ineligible', $4)
+ON CONFLICT (event_id) DO NOTHING`, eventID, teamID, userID, reason)
+	if err != nil {
+		return err
+	}
+	var existingTeam, existingUser uuid.UUID
+	var existingOutcome, existingReason string
+	if err := tx.QueryRow(ctx, `
+SELECT team_id, user_id, outcome, reason
+FROM stripe_promotion_outcome
+WHERE event_id = $1`, eventID).Scan(&existingTeam, &existingUser, &existingOutcome, &existingReason); err != nil {
+		return err
+	}
+	if existingTeam != teamID || existingUser != userID || existingOutcome != "promotion_ineligible" {
+		return fmt.Errorf("Stripe promotion denial outcome changed for event %s", eventID)
+	}
+	// The first committed reason is authoritative; a replay must not reinterpret
+	// it under a later policy toggle.
 	return nil
 }
 
@@ -3255,7 +3370,8 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 				}
 			}
 			if derefString(account.StripeActivationCreditGrantID) == "" && !account.StripeActivationCreditGrantedAt.Valid && activationUser.Valid {
-				if preReservation != nil && preReservation.EventID == event.ID && preReservation.Retryable {
+				if preReservation != nil && preReservation.EventID == event.ID && preReservation.Retryable &&
+					preReservation.DenialReason != "device_reservation_pending" {
 					return errors.New("Stripe promotion reservation is contended; retry webhook")
 				}
 				promotionReservationAttempted = true
@@ -3315,7 +3431,14 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 					if err := q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: account.TeamID, UserID: activationUser, StripeGrantID: ""}); err != nil {
 						return wrapPromotionReservationErr(err)
 					}
-					return q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)})
+					if err := q.FinishTeamBillingCheckoutForSubscription(ctx, db.FinishTeamBillingCheckoutForSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)}); err != nil {
+						return err
+					}
+					if preReservation != nil && preReservation.EventID == event.ID && preReservation.TeamID == account.TeamID &&
+						preReservation.UserID == uuid.UUID(activationUser.Bytes) && preReservation.DenialReason != "" {
+						return recordStripePromotionDenial(ctx, tx, event.ID, account.TeamID, preReservation.UserID, preReservation.DenialReason)
+					}
+					return nil
 				}
 				if err := q.ActivateTeamBilling(ctx, db.ActivateTeamBillingParams{TeamID: account.TeamID, UserID: activationUser, StripeGrantID: ""}); err != nil {
 					return wrapPromotionReservationErr(err)

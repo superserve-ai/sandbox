@@ -15,7 +15,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 HELPER = ROOT / "deploy/vmd-compatibility-preflight"
-BUNDLED_GUARDS = ("vmd-rollback-guard", "vmd-wake-floor-guard", "vmd-staged-intent-floor-guard")
+BUNDLED_GUARDS = ("vmd-rollback-guard", "vmd-wake-floor-guard", "vmd-staged-intent-floor-guard",
+                  "vmd-snapshot-backup-floor-guard")
 
 
 def load(name, path):
@@ -51,6 +52,9 @@ class CompatibilityTests(unittest.TestCase):
         (self.bundle / "superserve-vmd-staged-intent-floor-guard.conf").write_text(
             "[Service]\nExecStartPre=/usr/local/bin/vmd-staged-intent-floor-guard /usr/local/bin/vmd\n"
         )
+        (self.bundle / "superserve-vmd-snapshot-backup-floor-guard.conf").write_text(
+            "[Service]\nExecStartPre=/usr/local/bin/vmd-snapshot-backup-floor-guard /usr/local/bin/vmd\n"
+        )
 
     def guard(self, path, reject=False, mode=0o755):
         path.write_text(
@@ -83,7 +87,7 @@ class CompatibilityTests(unittest.TestCase):
         self.check()
         calls = self.calls.read_text()
         self.assertNotIn("vmd-start-generation", calls)
-        self.assertEqual(len(calls.splitlines()), 6)
+        self.assertEqual(len(calls.splitlines()), 3 + len(BUNDLED_GUARDS))
         self.assertTrue(all(line.endswith(str(self.candidate)) for line in calls.splitlines()))
         self.assertFalse(self.executed.exists())
 
@@ -92,7 +96,7 @@ class CompatibilityTests(unittest.TestCase):
         self.dropins.rmdir()
         self.check()
         self.assertFalse(self.executed.exists())
-        self.assertEqual(len(self.calls.read_text().splitlines()), 3)
+        self.assertEqual(len(self.calls.read_text().splitlines()), len(BUNDLED_GUARDS))
 
     def test_bundled_guard_rejection_and_missing_required_bundle_guard(self):
         for name in BUNDLED_GUARDS:
@@ -308,6 +312,10 @@ ss() {{ :; }}
                              (self.bundle / "vmd-staged-intent-floor-guard").read_bytes())
             self.assertEqual((self.dropins / "31-staged-intent-floor-guard.conf").read_bytes(),
                              (self.bundle / "superserve-vmd-staged-intent-floor-guard.conf").read_bytes())
+            self.assertEqual((self.resident / "vmd-snapshot-backup-floor-guard").read_bytes(),
+                             (self.bundle / "vmd-snapshot-backup-floor-guard").read_bytes())
+            self.assertEqual((self.dropins / "32-snapshot-backup-floor-guard.conf").read_bytes(),
+                             (self.bundle / "superserve-vmd-snapshot-backup-floor-guard.conf").read_bytes())
         else:
             for path, content in before.items():
                 self.assertEqual(Path(path).read_bytes(), content, path)

@@ -61,6 +61,15 @@ class DeployVmdBundleTests(unittest.TestCase):
         self.assertLess(guard, final_check)
         self.assertLess(SOURCE.index("systemctl daemon-reload", guard), final_check)
 
+    def test_snapshot_backup_floor_guard_has_its_own_paths(self):
+        self.assertIn("deploy/vmd-snapshot-backup-floor-guard", _bundle_files())
+        self.assertIn("deploy/superserve-vmd-snapshot-backup-floor-guard.conf", _bundle_files())
+        self.assertRegex(SOURCE, r"superserve-vmd\.service\.d/32-snapshot-backup-floor-guard\.conf")
+        # Installed and loaded before the binary that queues snapshot backups.
+        guard = SOURCE.index("{install_dir}/vmd-snapshot-backup-floor-guard")
+        final_check = SOURCE.rindex("deploy/vmd-compatibility-preflight {extract_dir}/bin/vmd")
+        self.assertLess(SOURCE.index("systemctl daemon-reload", guard), final_check)
+
     def test_downgrade_is_checked_before_the_binary_lands(self):
         # Preflight runs both retained and bundled guards before any live change.
         check = SOURCE.index("deploy/vmd-compatibility-preflight {extract_dir}/bin/vmd")

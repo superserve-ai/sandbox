@@ -74,11 +74,13 @@ type TaskFile struct {
 //
 // Exactly one owner is set: SandboxID for pause generations, TemplateID
 // (always with the BuildID that produced the artifacts) for template
-// builds. The owner picks the object prefix; see Task.objectName.
+// builds, SnapshotID for a saved snapshot's disk. The owner picks the
+// object prefix; see Task.objectName.
 type Task struct {
 	TemplateRuntime  *TemplateRuntime `json:"template_runtime,omitempty"`
 	BuildIncarnation string           `json:"build_incarnation,omitempty"`
 	SandboxID        string           `json:"sandbox_id,omitempty"`
+	SnapshotID       string           `json:"snapshot_id,omitempty"`
 	TemplateID       string           `json:"template_id,omitempty"`
 	BuildID          string           `json:"build_id,omitempty"`
 	Generation       string           `json:"generation"`
@@ -319,12 +321,21 @@ func (t *Task) readyAt() time.Time {
 	return t.EnqueuedAt
 }
 
+// snapshotOwnerPrefix marks a saved snapshot's owner identity. It holds
+// neither NUL (the template pair separator) nor "/" (the queue key
+// separator), and no sandbox id starts with it.
+const snapshotOwnerPrefix = "snapshot:"
+
 // owner is the task's full owner identity: the sandbox id for pause
-// generations, the template/build pair for template builds. NUL-joined so
-// the pair can never alias a sandbox id or another template's pair.
+// generations, the template/build pair for template builds, the prefixed
+// snapshot id for saved snapshots. NUL-joined so the pair can never alias
+// a sandbox id or another template's pair.
 func (t *Task) owner() string {
-	if t.TemplateID != "" {
+	switch {
+	case t.TemplateID != "":
 		return t.TemplateID + "\x00" + t.BuildID
+	case t.SnapshotID != "":
+		return snapshotOwnerPrefix + t.SnapshotID
 	}
 	return t.SandboxID
 }
@@ -359,8 +370,14 @@ func (j *Journal) Enqueue(task Task) error {
 	if task.Generation == "" {
 		return fmt.Errorf("task missing generation: %+v", task)
 	}
-	if (task.SandboxID == "") == (task.TemplateID == "") {
-		return fmt.Errorf("task must identify exactly one of sandbox or template: %+v", task)
+	owners := 0
+	for _, id := range []string{task.SandboxID, task.TemplateID, task.SnapshotID} {
+		if id != "" {
+			owners++
+		}
+	}
+	if owners != 1 {
+		return fmt.Errorf("task must identify exactly one of sandbox, template or snapshot: %+v", task)
 	}
 	if task.TemplateID != "" && task.BuildID == "" {
 		return fmt.Errorf("template task missing build id: %+v", task)
@@ -1336,6 +1353,8 @@ func (j *Journal) SeedOutboxFromCompletions() (bool, error) {
 			}
 			if sep := strings.IndexByte(owner, 0); sep >= 0 {
 				t.TemplateID, t.BuildID = owner[:sep], owner[sep+1:]
+			} else if id, ok := strings.CutPrefix(owner, snapshotOwnerPrefix); ok {
+				t.SnapshotID = id
 			} else {
 				t.SandboxID = owner
 			}

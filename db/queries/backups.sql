@@ -64,6 +64,41 @@ WHERE excluded.completed_at > backup_generation.completed_at
    OR backup_generation.purged_at IS NOT NULL
    OR backup_generation.purge_claimed_at IS NOT NULL;
 
+-- name: RecordSnapshotBackupGeneration :execrows
+-- Saved-snapshot variant of RecordSandboxBackupGeneration, purge-reopen
+-- included: an upload can finish after its snapshot was deleted and purged.
+INSERT INTO backup_generation (snapshot_id, generation, bucket, completed_at, files)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (snapshot_id, bucket, generation) WHERE snapshot_id IS NOT NULL
+DO UPDATE SET
+  purged_at = NULL,
+  purge_claimed_at = NULL,
+  reported_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+         OR (backup_generation.completed_at > now()
+             AND excluded.completed_at < backup_generation.completed_at)
+      THEN now()
+    ELSE backup_generation.reported_at END,
+  completed_at = CASE
+    WHEN excluded.completed_at > backup_generation.completed_at
+      THEN excluded.completed_at
+    WHEN backup_generation.completed_at > now()
+         AND excluded.completed_at < backup_generation.completed_at
+      THEN excluded.completed_at
+    ELSE backup_generation.completed_at END,
+  files = CASE
+    WHEN jsonb_array_length(excluded.files) = 0
+      THEN backup_generation.files
+    WHEN jsonb_path_exists(backup_generation.files, '$[*].object')
+      THEN backup_generation.files
+    ELSE excluded.files END
+WHERE excluded.completed_at > backup_generation.completed_at
+   OR (backup_generation.completed_at > now() AND excluded.completed_at < backup_generation.completed_at)
+   OR (jsonb_path_exists(excluded.files, '$[*].object')
+       AND NOT jsonb_path_exists(backup_generation.files, '$[*].object'))
+   OR backup_generation.purged_at IS NOT NULL
+   OR backup_generation.purge_claimed_at IS NOT NULL;
+
 -- name: RecordTemplateBackupGeneration :execrows
 -- Template variant of RecordSandboxBackupGeneration; the two exist
 -- because each conflict target must name its own partial unique index.
@@ -209,6 +244,28 @@ SET purge_claimed_at = clock_timestamp()
 FROM due
 WHERE bg.id = due.id
 RETURNING bg.id, bg.sandbox_id, bg.generation, bg.purge_claimed_at AS claimed_at;
+
+-- name: ClaimSnapshotBackupGenerationsToPurge :many
+-- ClaimBackupGenerationsToPurge for the generations of deleted saved
+-- snapshots. A snapshot counts as deleted once its host has removed it.
+WITH due AS (
+  SELECT bg.id
+  FROM backup_generation bg
+  JOIN sandbox_snapshot ss ON ss.id = bg.snapshot_id
+  WHERE bg.bucket = sqlc.arg(bucket)::text
+    AND ss.deleted_at IS NOT NULL
+    AND bg.purged_at IS NULL
+    AND (bg.purge_claimed_at IS NULL
+         OR bg.purge_claimed_at < now() - make_interval(secs => sqlc.arg(lease_seconds)::float8))
+  ORDER BY ss.deleted_at ASC
+  LIMIT sqlc.arg(batch_size)
+  FOR UPDATE OF bg SKIP LOCKED
+)
+UPDATE backup_generation bg
+SET purge_claimed_at = clock_timestamp()
+FROM due
+WHERE bg.id = due.id
+RETURNING bg.id, bg.snapshot_id, bg.generation, bg.purge_claimed_at AS claimed_at;
 
 -- name: MarkBackupGenerationPurged :execrows
 -- Zero rows means the claim was cleared by a report that landed during the
