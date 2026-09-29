@@ -178,6 +178,13 @@ type Handlers struct {
 	trialWarningAfter     uuid.UUID
 	trialWarningPending   map[uuid.UUID]struct{}
 
+	// trialEligibilityAfter advances one bounded eligibility page per sweep.
+	// Keeping the cursor on the handler prevents a large historical trial
+	// population from restarting at the UUID prefix every tick.
+	trialEligibilityMu         sync.Mutex
+	trialEligibilityAfter      uuid.UUID
+	trialEligibilityAfterValid bool
+
 	// asyncMu/asyncCond/asyncCount track fire-and-forget bookkeeping goroutines
 	// (ActivateSandbox, FinalizePause) so tests can wait for quiescence;
 	// production never waits. Not a sync.WaitGroup: concurrent requests Add

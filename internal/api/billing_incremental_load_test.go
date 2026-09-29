@@ -1361,6 +1361,9 @@ func testFrozenMeasurementCatchup(t *testing.T, pool *pgxpool.Pool) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				if resource == "storage_mib_seconds" {
+					exec(`INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) VALUES($1,$2,$2)`, team.ID, start)
+				}
 				exec(`INSERT INTO team_billing_period(team_id,period_start,period_end,status) VALUES($1,$2,$3,'approved')`, team.ID, start, end)
 				exec(`INSERT INTO billing_incremental_period(team_id,period_start,period_end) VALUES($1,$2,$3)`, team.ID, start, end)
 				exec(`INSERT INTO team_billing_usage_hourly(team_id,hour_start,hour_end,`+resource+`)
@@ -1455,8 +1458,8 @@ func testFrozenMeasurementCatchup(t *testing.T, pool *pgxpool.Pool) {
 }
 
 func testBoundaryStorageEnablement(t *testing.T, pool *pgxpool.Pool) {
-	for _, initial := range []bool{false, true} {
-		t.Run(fmt.Sprintf("initial-anchor=%v", initial), func(t *testing.T) {
+	for _, initial := range []bool{true, false} {
+		t.Run(fmt.Sprintf("prospective-initial-%v", initial), func(t *testing.T) {
 			ctx := t.Context()
 			exec := func(sql string, args ...any) {
 				t.Helper()
@@ -1465,130 +1468,97 @@ func testBoundaryStorageEnablement(t *testing.T, pool *pgxpool.Pool) {
 				}
 			}
 			anchor := time.Date(2026, 1, 1, 0, 30, 0, 0, time.UTC)
-			boundary := anchor.AddDate(0, 1, 0)
-			wantSlices := 2
-			if initial {
-				boundary = anchor
-				wantSlices = 1
+			boundary := anchor
+			if !initial {
+				boundary = anchor.AddDate(0, 1, 0)
 			}
 			hour := boundary.Truncate(time.Hour)
-			now := hour.Add(2 * time.Hour)
+			now := hour.Add(4 * time.Hour)
 			h := &Handlers{Pool: pool, DB: db.New(pool), Now: func() time.Time { return now }}
-			team, err := h.DB.CreateTeam(ctx, fmt.Sprintf("example-boundary-storage-%v", initial))
+			team, err := h.DB.CreateTeam(ctx, fmt.Sprintf("example-prospective-boundary-%v", initial))
 			if err != nil {
 				t.Fatal(err)
 			}
-			exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_storage_billing_enabled',false)`, team.ID)
 			exec(`INSERT INTO billing_export_work(team_id) VALUES($1)`, team.ID)
+			exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_storage_billing_enabled',false),($1,'billing_export_enabled',true)`, team.ID)
 			sandbox := uuid.New()
-			exec(`INSERT INTO sandbox(id,team_id,name,status,vcpu_count,memory_mib,host_id)
- VALUES($1,$2,'example-boundary-storage','deleted',1,1024,'default')`, sandbox, team.ID)
-			exec(`INSERT INTO sandbox_compute_billing_interval(sandbox_id,team_id,vcpu_count,memory_mib,started_at,ended_at,end_reason)
- VALUES($1,$2,1,1024,$3,$4,'deleted')`, sandbox, team.ID, hour, hour.Add(time.Hour))
-			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason)
- VALUES($1,$2,1024,$3,$4,'deleted')`, sandbox, team.ID, hour, hour.Add(time.Hour))
-			exec(`INSERT INTO team_billing_usage_hourly(team_id,hour_start,hour_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds)
- VALUES($1,$2,$3,3600,3686400,3686400)`, team.ID, hour, hour.Add(time.Hour))
+			exec(`INSERT INTO sandbox(id,team_id,name,status,vcpu_count,memory_mib,host_id) VALUES($1,$2,'example-storage','deleted',1,1024,'default')`, sandbox, team.ID)
+			exec(`INSERT INTO sandbox_compute_billing_interval(sandbox_id,team_id,vcpu_count,memory_mib,started_at,ended_at,end_reason) VALUES($1,$2,1,1024,$3,$4,'deleted')`, sandbox, team.ID, hour, hour.Add(time.Hour))
+			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason) VALUES($1,$2,1024,$3,$4,'deleted')`, sandbox, team.ID, hour, hour.Add(time.Hour))
+			exec(`INSERT INTO team_billing_usage_hourly(team_id,hour_start,hour_end,vcpu_seconds,memory_mib_seconds,storage_mib_seconds) VALUES($1,$2,$3,3600,3686400,3686400)`, team.ID, hour, hour.Add(time.Hour))
 			measure := func(want int) {
 				t.Helper()
-				if complete, err := h.seedExportMeasurements(ctx, team.ID, anchor); err != nil || !complete {
-					t.Fatalf("discovery: complete=%v err=%v", complete, err)
+				if _, err := h.seedExportMeasurements(ctx, team.ID, anchor); err != nil {
+					t.Fatal(err)
 				}
 				if n, err := h.consumeExportMeasurements(ctx, team.ID, anchor); err != nil || n != want {
-					t.Fatalf("consumption: n=%d want=%d err=%v", n, want, err)
-				}
-			}
-			check := func(storage, snapshot int) {
-				t.Helper()
-				var slices int
-				var exact, consumed bool
-				err := pool.QueryRow(ctx, `SELECT count(*),bool_and(vcpu_seconds=1800 AND memory_mib_seconds=1843200 AND storage_mib_seconds=$2)
- FROM billing_export_usage WHERE team_id=$1`, team.ID, storage).Scan(&slices, &exact)
-				if err != nil || slices != wantSlices || !exact {
-					t.Fatalf("period slices=%d want=%d exact=%v err=%v", slices, wantSlices, exact, err)
-				}
-				if err := pool.QueryRow(ctx, `SELECT NOT pending AND storage_mib_seconds=$2 FROM billing_export_measurement_queue
- WHERE team_id=$1 AND hour_start=$3`, team.ID, snapshot, hour).Scan(&consumed); err != nil || !consumed {
-					t.Fatalf("consumed snapshot: %v %v", consumed, err)
+					t.Fatalf("consumed=%d want=%d err=%v", n, want, err)
 				}
 			}
 			measure(1)
-			check(0, 0)
 			exec(`UPDATE team_feature_flag SET enabled=true WHERE team_id=$1 AND key='billing_storage_billing_enabled'`, team.ID)
-			// Revisit unchanged source values through the paced correction sweep.
 			now = now.Add(exportCorrectionPageInterval)
-			measure(1)
-			check(1843200, 3686400)
-			exec(`UPDATE billing_export_measurement_queue SET pending=true WHERE team_id=$1`, team.ID)
-			measure(1)
-			check(1843200, 3686400)
-			now = now.Add(exportCorrectionSweepInterval)
 			measure(0)
-			check(1843200, 3686400)
-
+			var empty bool
+			if err := pool.QueryRow(ctx, `SELECT bool_and(storage_mib_seconds=0 AND vcpu_seconds=1800 AND memory_mib_seconds=1843200) FROM billing_export_usage WHERE team_id=$1`, team.ID).Scan(&empty); err != nil || !empty {
+				t.Fatalf("flag imported historical usage: %v %v", empty, err)
+			}
+			cutoff := hour.Add(75 * time.Minute)
+			exec(`INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) VALUES($1,$2,$2)`, team.ID, cutoff)
+			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason) VALUES($1,$2,1024,$3,$4,'deleted'),($1,$2,2048,$4,$5,'deleted')`, sandbox, team.ID, hour.Add(time.Hour), hour.Add(90*time.Minute), hour.Add(2*time.Hour))
+			exec(`INSERT INTO team_billing_usage_hourly(team_id,hour_start,hour_end,storage_mib_seconds) VALUES($1,$2,$3,5529600)`, team.ID, hour.Add(time.Hour), hour.Add(2*time.Hour))
+			measure(1)
 			p := billing.ExportPeriod{TeamID: team.ID, Start: boundary, End: boundary.AddDate(0, 1, 0)}
+			usage := func() string {
+				t.Helper()
+				var quantity string
+				if err := pool.QueryRow(ctx, `SELECT (storage_mib_seconds/3686400)::text FROM billing_export_usage WHERE team_id=$1 AND period_start=$2`, team.ID, p.Start).Scan(&quantity); err != nil {
+					t.Fatal(err)
+				}
+				v, ok := new(big.Rat).SetString(quantity)
+				if !ok {
+					t.Fatal(quantity)
+				}
+				return v.FloatString(2)
+			}
+			if got := usage(); got != "1.25" {
+				t.Fatalf("partial changing quantity=%s", got)
+			}
 			store := billing.ExportStore{Pool: pool}
-			exec(`INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_export_enabled',true)`, team.ID)
 			if err := store.Enroll(ctx, p); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := store.Reserve(ctx, p, "storage", "0.5", hour.Add(time.Hour), billing.ExportPayload{
-				EventName: "storage_gib_hours", CustomerID: "cus_example", Timestamp: hour.Add(time.Hour).Add(-time.Second).Unix(),
-			}); err != nil {
+			payload := billing.ExportPayload{EventName: "storage_gib_hours", CustomerID: "cus_example", Timestamp: hour.Add(2 * time.Hour).Add(-time.Second).Unix()}
+			if _, err := store.Reserve(ctx, p, "storage", "1.25", hour.Add(2*time.Hour), payload); err != nil {
 				t.Fatal(err)
 			}
-			exec(`UPDATE team_feature_flag SET enabled=false WHERE team_id=$1 AND key='billing_storage_billing_enabled'`, team.ID)
-			exec(`INSERT INTO team_billing_usage_hourly(team_id,hour_start,hour_end,storage_mib_seconds)
- VALUES($1,$2,$3,3686400)`, team.ID, hour.Add(time.Hour), hour.Add(2*time.Hour))
-			exec(`INSERT INTO billing_export_measurement_queue(team_id,hour_start) VALUES($1,$2)`, team.ID, hour.Add(time.Hour))
-			if n, err := h.consumeExportMeasurements(ctx, team.ID, anchor); err != nil || n != 1 {
-				t.Fatalf("disabled full-hour consumption: n=%d err=%v", n, err)
+			accepted, err := store.Claim(ctx, p)
+			if err != nil || accepted == nil {
+				t.Fatalf("claim: %v %v", accepted, err)
 			}
-			var usage db.TeamBillingUsage
-			if err := pool.QueryRow(ctx, `SELECT vcpu_seconds,memory_mib_seconds,storage_mib_seconds FROM billing_export_usage
- WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, p.Start, p.End).Scan(&usage.VcpuSeconds, &usage.MemoryMibSeconds, &usage.StorageMibSeconds); err != nil {
+			if err := store.Acknowledge(ctx, *accepted, nil); err != nil {
 				t.Fatal(err)
 			}
-			quantity, err := billing.MeterUsageQuantity(usage.StorageMibSeconds, "storage_gib")
-			if err != nil || quantity != "1.500000000000" {
-				t.Fatalf("full-hour measured storage=%s err=%v", quantity, err)
+			exec(`UPDATE team_feature_flag SET enabled=false WHERE team_id=$1`, team.ID)
+			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason) VALUES($1,$2,1024,$3,$4,'deleted')`, sandbox, team.ID, hour.Add(2*time.Hour), hour.Add(3*time.Hour))
+			exec(`INSERT INTO team_billing_usage_hourly(team_id,hour_start,hour_end,storage_mib_seconds) VALUES($1,$2,$3,3686400)`, team.ID, hour.Add(2*time.Hour), hour.Add(3*time.Hour))
+			measure(1)
+			if got := usage(); got != "2.25" {
+				t.Fatalf("outage erased accrual=%s", got)
 			}
-			for _, mode := range []string{"unbillable", "checkout-disabled", "removed"} {
-				resources := h.billingResourceStates(true)
-				for i := range resources {
-					if resources[i].ResourceKey == "storage_gib" {
-						resources[i].Billable = mode == "checkout-disabled"
-						resources[i].CheckoutEnabled = mode != "checkout-disabled"
-						resources[i].StripeEventName = "renamed_storage_hours"
-					}
-				}
-				if mode == "removed" {
-					for i := range resources {
-						if resources[i].ResourceKey == "storage_gib" {
-							resources = append(resources[:i], resources[i+1:]...)
-							break
-						}
-					}
-				}
-				items, err := h.incrementalReconciliationItems(ctx, p, usage, resources)
-				if err != nil {
-					t.Fatal(err)
-				}
-				found := false
-				for _, item := range items {
-					if item.ResourceType == "storage" {
-						found = true
-						if _, err := h.observeIncrementalResource(ctx, p, item, hour.Add(2*time.Hour), pinnedMeterReader{t, "storage_gib_hours"}, "cus_example"); err != nil {
-							t.Fatal(err)
-						}
-						if item.Quantity != "0.500000000000" {
-							t.Fatalf("disabled storage target=%s, want reserved coverage", item.Quantity)
-						}
-					}
-				}
-				if !found {
-					t.Fatal("disabled storage reservation missing from reconciliation")
-				}
+			exec(`UPDATE team_feature_flag SET enabled=true WHERE team_id=$1 AND key='billing_export_enabled'`, team.ID)
+			payload.Timestamp = hour.Add(3 * time.Hour).Add(-time.Second).Unix()
+			if _, err := store.Reserve(ctx, p, "storage", "2.25", hour.Add(3*time.Hour), payload); err != nil {
+				t.Fatal(err)
+			}
+			next, err := store.Claim(ctx, p)
+			if err != nil || next == nil || next.Quantity != "1.000000000000" || next.Identifier == accepted.Identifier {
+				t.Fatalf("catch-up: %+v %v", next, err)
+			}
+			exec(`UPDATE billing_export_measurement_queue SET pending=true WHERE team_id=$1`, team.ID)
+			measure(3)
+			if got := usage(); got != "2.25" {
+				t.Fatalf("correction replay changed usage=%s", got)
 			}
 		})
 	}

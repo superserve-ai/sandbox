@@ -118,7 +118,7 @@ type incrementalExportItem struct {
 func incrementalExportItems(usage db.TeamBillingUsage, resources []billingResourceState) ([]incrementalExportItem, error) {
 	items := make([]incrementalExportItem, 0, len(resources))
 	for _, resource := range resources {
-		if !resource.Billable || !resource.CheckoutEnabled {
+		if !resource.Billable {
 			continue
 		}
 		var seconds pgtype.Numeric
@@ -257,7 +257,7 @@ func (h *Handlers) exportIncrementalPeriod(ctx context.Context, p billing.Export
 		return result, fmt.Errorf("Stripe reconciliation is not configured")
 	}
 	store := billing.ExportStore{Pool: h.Pool}
-	storage, err := h.billingStorageBillingEnabled(ctx, p.TeamID)
+	storage, err := h.billingStorageBillingEnabledForWindow(ctx, p.TeamID, p.End)
 	if err != nil {
 		return result, err
 	}
@@ -477,10 +477,21 @@ func (h *Handlers) submitIncrementalEvents(ctx context.Context, p billing.Export
 		}
 		started := time.Now()
 		submitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		submitErr := h.Stripe.ReportMeterEvent(submitCtx, StripeReportMeterEventParams{Identifier: event.Identifier, IdempotencyKey: event.IdempotencyKey,
+		var frozen bool
+		if err := h.Pool.QueryRow(ctx, `SELECT finalized_at IS NOT NULL OR exported_at IS NOT NULL OR status IN ('exporting','exported','finalized')
+            FROM team_billing_period WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End).Scan(&frozen); err != nil {
+			cancel()
+			return err
+		}
+		submitErr := h.reportBillingMeterEvent(submitCtx, p.TeamID, event.ResourceType, event.AllocationCreatedAt, event.MeasuredThrough, frozen, StripeReportMeterEventParams{Identifier: event.Identifier, IdempotencyKey: event.IdempotencyKey,
 			EventName: event.EventName, CustomerID: event.CustomerID, Value: event.Quantity, Timestamp: event.Timestamp})
 		cancel()
-		err = store.Acknowledge(ctx, *event, submitErr)
+		var readinessErr *storageReadinessError
+		if errors.As(submitErr, &readinessErr) {
+			err = store.Defer(ctx, *event, readinessErr)
+		} else {
+			err = store.Acknowledge(ctx, *event, submitErr)
+		}
 		currentBillingRecorder().RecordBillingWork(ctx, "submission", err != nil || submitErr != nil, time.Since(started), 1)
 		if err != nil {
 			return err
@@ -521,7 +532,7 @@ func (h *Handlers) reconcileIncrementalPeriod(ctx context.Context, p billing.Exp
 	if err != nil {
 		return result, err
 	}
-	storage, err := h.billingStorageBillingEnabled(ctx, p.TeamID)
+	storage, err := h.billingStorageBillingEnabledForWindow(ctx, p.TeamID, p.End)
 	if err != nil {
 		return result, err
 	}

@@ -895,7 +895,7 @@ func roleIDsByName(ctx context.Context, pool querier) (map[string]string, error)
 // per-cell projections of global identity shared across ALL of a user's
 // teams in that cell — the migration promises a member's profile EXISTS in
 // the dest, never that it overwrites what the user's other teams already
-// maintain there. Content checksums skip these for the same reason; count
+// maintain there. Their content checksums are separately exempted; count
 // parity over the member scope still applies.
 // validationExemptTables are copied for safety but never gated on:
 // sandbox_revocation and revoked_proxy_token rows self-expire, and the
@@ -909,8 +909,15 @@ var validationExemptTables = map[string]bool{
 	"revoked_proxy_token": true,
 }
 
+var checksumExemptTables = map[string]bool{
+	"profile": true,
+}
+
 var insertOnlyTables = map[string]bool{
 	"profile": true,
+	// Activation rows are immutable; retries must preserve the original
+	// timestamp and validation must detect any destination divergence.
+	"team_storage_billing_activation": true,
 }
 
 // allColumns lists a table's column names in attnum order.
@@ -1213,8 +1220,8 @@ func validateTeam(ctx context.Context, src, dst *pgxpool.Pool, cfg config) ([]st
 		return nil, err
 	}
 	for _, t := range migratedTables {
-		if insertOnlyTables[t.name] || validationExemptTables[t.name] {
-			continue // see insertOnlyTables / validationExemptTables.
+		if checksumExemptTables[t.name] || validationExemptTables[t.name] {
+			continue // see checksumExemptTables / validationExemptTables.
 		}
 		tf := transforms[t.name]
 		if t.name == "sandbox" {
@@ -1846,6 +1853,12 @@ func runPurge(ctx context.Context, src, dst *pgxpool.Pool, cfg config, teamName 
 		t := migratedTables[i]
 		if t.name == "profile" {
 			// Profiles are global (multi-team, shared with Auth); they stay.
+			continue
+		}
+		// Activation is immutable; let the team FK cascade remove it with the
+		// team instead of issuing a direct delete that the immutability trigger
+		// must reject.
+		if t.name == "team_storage_billing_activation" {
 			continue
 		}
 		tag, err := tx.Exec(ctx, fmt.Sprintf(`DELETE FROM %s WHERE %s`, t.name, t.scope), cfg.teamID)

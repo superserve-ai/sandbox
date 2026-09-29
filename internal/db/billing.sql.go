@@ -984,17 +984,42 @@ FROM recent_compute b
  CROSS JOIN rates
  WHERE b.started_at < now()
 ), recent_storage AS MATERIALIZED (
-  SELECT GREATEST(i.started_at, (SELECT started_at FROM sample_window)) AS started_at,
+  SELECT i.sandbox_id,
+         GREATEST(i.started_at, (SELECT started_at FROM sample_window), (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)) AS started_at,
          i.ended_at, disk_mib
   FROM (
-    (SELECT started_at, ended_at, disk_mib FROM sandbox_storage_interval
-     WHERE team_id = $1 AND ended_at IS NULL AND feature_enabled('billing_storage_billing_enabled', $1)
+    (SELECT sandbox_id, started_at, ended_at, disk_mib FROM sandbox_storage_interval
+     WHERE team_id = $1 AND ended_at IS NULL AND storage_billing_activated($1)
      LIMIT 1025)
     UNION ALL
-    (SELECT started_at, ended_at, disk_mib FROM sandbox_storage_interval
-     WHERE team_id = $1 AND ended_at > (SELECT started_at FROM sample_window) AND feature_enabled('billing_storage_billing_enabled', $1)
+    (SELECT sandbox_id, started_at, ended_at, disk_mib FROM sandbox_storage_interval
+     WHERE team_id = $1 AND ended_at > (SELECT started_at FROM sample_window) AND storage_billing_activated($1)
      LIMIT 1025)
   ) i
+), recent_artifact_ranges AS MATERIALIZED (
+  SELECT p.path,
+         MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
+         range_agg(tstzrange(
+           GREATEST(rs.started_at, (SELECT started_at FROM sample_window)),
+           LEAST(COALESCE(rs.ended_at, now()), COALESCE(s.destroyed_at, now()), now()), '[)'
+         )) AS retained_ranges
+  FROM recent_storage rs
+  JOIN sandbox s ON s.id = rs.sandbox_id AND s.team_id = $1
+  LEFT JOIN template t ON t.id = s.template_id
+  CROSS JOIN LATERAL unnest(ARRAY[
+    s.base_path,
+    s.delta_path,
+    CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END
+  ]) AS p(path)
+  LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
+    AND am.path = p.path
+  WHERE p.path IS NOT NULL
+    AND rs.started_at < LEAST(COALESCE(rs.ended_at, now()), COALESCE(s.destroyed_at, now()), now())
+  GROUP BY p.path
+), artifact_storage AS MATERIALIZED (
+  SELECT COALESCE(SUM(ar.artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0)::numeric AS mib_seconds
+  FROM recent_artifact_ranges ar
+  CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
 ), sample_bounds AS (
   SELECT MIN(started_at) AS started_at,
          MAX(LEAST(ended_at, now())) AS ended_at
@@ -1002,9 +1027,14 @@ FROM recent_compute b
     SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_compute WHERE started_at < now()
     UNION ALL
     SELECT started_at, COALESCE(ended_at, now()) AS ended_at FROM recent_storage WHERE started_at < now()
+    UNION ALL
+    SELECT lower(r), upper(r)
+    FROM recent_artifact_ranges ar
+    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
+    WHERE ar.artifact_mib > 0 AND lower(r) < upper(r)
   ) intervals
 )
-SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN feature_enabled('billing_storage_billing_enabled', $1) THEN COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(s.ended_at, now()), now()) - s.started_at)) * s.disk_mib / 1024.0 * rates.storage) FROM recent_storage s CROSS JOIN rates WHERE s.started_at < now()), 0) ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
+SELECT CASE WHEN (SELECT count(*) FROM recent_compute) > 1024 OR (SELECT count(*) FROM recent_storage) > 1024 THEN 0::numeric ELSE round((compute.amount + CASE WHEN storage_billing_activated($1) THEN COALESCE((SELECT SUM(EXTRACT(EPOCH FROM (LEAST(COALESCE(s.ended_at, now()), now()) - s.started_at)) * s.disk_mib / 1024.0 * rates.storage) FROM recent_storage s CROSS JOIN rates WHERE s.started_at < LEAST(COALESCE(s.ended_at, now()), now())), 0) + COALESCE((SELECT mib_seconds / 1024.0 * rates.storage FROM artifact_storage), 0) ELSE 0 END)::numeric, 6) END::numeric AS spent_usd,
        sample_bounds.started_at, sample_bounds.ended_at,
        EXTRACT(EPOCH FROM (sample_bounds.ended_at - sample_bounds.started_at))::numeric AS elapsed_seconds
 FROM compute, rates, sample_bounds
@@ -1464,7 +1494,8 @@ SELECT
     $3::timestamptz AS period_end,
     compute.vcpu_seconds,
     (compute.memory_mib_seconds / 1024.0)::numeric AS memory_gib_seconds,
-    (storage.storage_mib_seconds / 1024.0)::numeric AS storage_gib_seconds
+    (storage.storage_mib_seconds / 1024.0)::numeric AS storage_gib_seconds,
+    (billable_storage_mib_seconds($1,$2,$3)/1024.0)::numeric AS billable_storage_gib_seconds
 FROM compute, storage
 `
 
@@ -1475,12 +1506,13 @@ type GetTeamBillingUsageParams struct {
 }
 
 type GetTeamBillingUsageRow struct {
-	TeamID            uuid.UUID      `json:"team_id"`
-	PeriodStart       time.Time      `json:"period_start"`
-	PeriodEnd         time.Time      `json:"period_end"`
-	VcpuSeconds       pgtype.Numeric `json:"vcpu_seconds"`
-	MemoryGibSeconds  pgtype.Numeric `json:"memory_gib_seconds"`
-	StorageGibSeconds pgtype.Numeric `json:"storage_gib_seconds"`
+	TeamID                    uuid.UUID      `json:"team_id"`
+	PeriodStart               time.Time      `json:"period_start"`
+	PeriodEnd                 time.Time      `json:"period_end"`
+	VcpuSeconds               pgtype.Numeric `json:"vcpu_seconds"`
+	MemoryGibSeconds          pgtype.Numeric `json:"memory_gib_seconds"`
+	StorageGibSeconds         pgtype.Numeric `json:"storage_gib_seconds"`
+	BillableStorageGibSeconds pgtype.Numeric `json:"billable_storage_gib_seconds"`
 }
 
 // Allocated usage for one team clipped to [period_start, period_end).
@@ -1494,6 +1526,7 @@ func (q *Queries) GetTeamBillingUsage(ctx context.Context, arg GetTeamBillingUsa
 		&i.VcpuSeconds,
 		&i.MemoryGibSeconds,
 		&i.StorageGibSeconds,
+		&i.BillableStorageGibSeconds,
 	)
 	return i, err
 }
@@ -1573,7 +1606,7 @@ JOIN unnest($3::timestamptz[]) WITH ORDINALITY ends(bucket_end,n) USING (n)
   i.started_at < LEAST(now(),b.bucket_end) AND COALESCE(i.ended_at,LEAST(now(),b.bucket_end)) > b.bucket_start
  LEFT JOIN artifact_storage a ON a.bucket_start=b.bucket_start AND a.bucket_end=b.bucket_end GROUP BY b.bucket_start,b.bucket_end
 )
-SELECT $1::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds
+SELECT $1::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds,(billable_storage_mib_seconds($1,c.bucket_start,c.bucket_end)/1024.0)::numeric billable_storage_gib_seconds
 FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start
 `
 
@@ -1584,12 +1617,13 @@ type GetTeamBillingUsageSeriesParams struct {
 }
 
 type GetTeamBillingUsageSeriesRow struct {
-	TeamID            uuid.UUID      `json:"team_id"`
-	PeriodStart       interface{}    `json:"period_start"`
-	PeriodEnd         interface{}    `json:"period_end"`
-	VcpuSeconds       pgtype.Numeric `json:"vcpu_seconds"`
-	MemoryGibSeconds  pgtype.Numeric `json:"memory_gib_seconds"`
-	StorageGibSeconds pgtype.Numeric `json:"storage_gib_seconds"`
+	TeamID                    uuid.UUID      `json:"team_id"`
+	PeriodStart               interface{}    `json:"period_start"`
+	PeriodEnd                 interface{}    `json:"period_end"`
+	VcpuSeconds               pgtype.Numeric `json:"vcpu_seconds"`
+	MemoryGibSeconds          pgtype.Numeric `json:"memory_gib_seconds"`
+	StorageGibSeconds         pgtype.Numeric `json:"storage_gib_seconds"`
+	BillableStorageGibSeconds pgtype.Numeric `json:"billable_storage_gib_seconds"`
 }
 
 // Allocated usage for each requested bucket, clipped exactly to bucket bounds.
@@ -1609,6 +1643,7 @@ func (q *Queries) GetTeamBillingUsageSeries(ctx context.Context, arg GetTeamBill
 			&i.VcpuSeconds,
 			&i.MemoryGibSeconds,
 			&i.StorageGibSeconds,
+			&i.BillableStorageGibSeconds,
 		); err != nil {
 			return nil, err
 		}
@@ -1766,6 +1801,33 @@ func (q *Queries) IsFeatureEnabledForTeam(ctx context.Context, arg IsFeatureEnab
 	var enabled bool
 	err := row.Scan(&enabled)
 	return enabled, err
+}
+
+const isStorageBillingActivated = `-- name: IsStorageBillingActivated :one
+SELECT storage_billing_activated($1::uuid)::boolean
+`
+
+func (q *Queries) IsStorageBillingActivated(ctx context.Context, teamID uuid.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, isStorageBillingActivated, teamID)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const isStorageBillingActivatedForWindow = `-- name: IsStorageBillingActivatedForWindow :one
+SELECT storage_billing_activated($1::uuid, $2::timestamptz)::boolean
+`
+
+type IsStorageBillingActivatedForWindowParams struct {
+	TeamID    uuid.UUID `json:"team_id"`
+	PeriodEnd time.Time `json:"period_end"`
+}
+
+func (q *Queries) IsStorageBillingActivatedForWindow(ctx context.Context, arg IsStorageBillingActivatedForWindowParams) (bool, error) {
+	row := q.db.QueryRow(ctx, isStorageBillingActivatedForWindow, arg.TeamID, arg.PeriodEnd)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const isTeamSandboxBillingEligible = `-- name: IsTeamSandboxBillingEligible :one
@@ -2341,28 +2403,28 @@ func (q *Queries) ListTeamsWithActiveIneligibleSandboxes(ctx context.Context, ar
 	return items, nil
 }
 
-const listTeamsWithActiveTrialSandboxes = `-- name: ListTeamsWithActiveTrialSandboxes :many
-SELECT DISTINCT s.team_id
-FROM sandbox s
-JOIN team_credit_grant g
-  ON g.team_id = s.team_id
-  AND g.reason = 'signup trial credit'
-LEFT JOIN team_billing_account a ON a.team_id = s.team_id
-WHERE s.destroyed_at IS NULL
-  AND s.status = 'active'
+const listTeamsWithTrialCredits = `-- name: ListTeamsWithTrialCredits :many
+SELECT DISTINCT g.team_id
+FROM team_credit_grant g
+LEFT JOIN team_billing_account a ON a.team_id = g.team_id
+LEFT JOIN team_trial_eligibility_cache c ON c.team_id = g.team_id
+WHERE g.reason = 'signup trial credit'
   AND a.trial_ended_at IS NULL
-  AND s.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-ORDER BY s.team_id
+  -- A false verdict is stable until a newer grant arrives. Avoid rescanning
+  -- exhausted/expired historical trials while still picking up renewals.
+  AND (c.team_id IS NULL OR c.eligible OR g.created_at > c.updated_at)
+  AND g.team_id > COALESCE($1::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
+ORDER BY g.team_id
 LIMIT $2
 `
 
-type ListTeamsWithActiveTrialSandboxesParams struct {
+type ListTeamsWithTrialCreditsParams struct {
 	AfterTeamID pgtype.UUID `json:"after_team_id"`
 	BatchLimit  int32       `json:"batch_limit"`
 }
 
-func (q *Queries) ListTeamsWithActiveTrialSandboxes(ctx context.Context, arg ListTeamsWithActiveTrialSandboxesParams) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, listTeamsWithActiveTrialSandboxes, arg.AfterTeamID, arg.BatchLimit)
+func (q *Queries) ListTeamsWithTrialCredits(ctx context.Context, arg ListTeamsWithTrialCreditsParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listTeamsWithTrialCredits, arg.AfterTeamID, arg.BatchLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -2440,7 +2502,7 @@ WITH consuming_teams AS (
     FROM sandbox_storage_interval i
     WHERE i.ended_at IS NULL AND i.disk_mib > 0 AND i.started_at < now()
       AND i.team_id > COALESCE($2::uuid, '00000000-0000-0000-0000-000000000000'::uuid)
-      AND feature_enabled('billing_storage_billing_enabled', i.team_id)
+      AND storage_billing_activated(i.team_id)
 )
 SELECT c.team_id
 FROM consuming_teams c
@@ -3885,58 +3947,8 @@ WITH compute AS (
       AND i.started_at < LEAST(now(), $1)
       AND COALESCE(i.ended_at, LEAST(now(), $1)) > $2
 ),
-artifact_bounds AS (
-    SELECT
-        s.id,
-        s.team_id,
-        s.snapshot_id,
-        s.template_id,
-        s.base_path,
-        s.delta_path,
-        s.destroyed_at,
-        first_interval.started_at AS billing_started_at
-    FROM sandbox s
-    LEFT JOIN LATERAL (
-        SELECT MIN(i.started_at) AS started_at
-        FROM sandbox_storage_interval i
-        WHERE i.sandbox_id = s.id
-          AND i.team_id = s.team_id
-    ) first_interval ON true
-    WHERE s.team_id = $3
-      AND first_interval.started_at IS NOT NULL
-      AND first_interval.started_at < LEAST(now(), $1)
-      AND s.created_at < LEAST(now(), $1)
-      AND COALESCE(s.destroyed_at, LEAST(now(), $1)) > $2
-),
-artifact_storage AS (
-    SELECT FLOOR(COALESCE(SUM(ar.artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0))::numeric AS mib_seconds
-    FROM (
-        SELECT p.path,
-               MAX(COALESCE(NULLIF(am.allocated_bytes, 0), 0))::numeric / 1048576.0 AS artifact_mib,
-               range_agg(tstzrange(GREATEST(s.billing_started_at, $2), LEAST(COALESCE(s.destroyed_at, now()), $1), '[)')) AS retained_ranges
-        FROM artifact_bounds s
-        LEFT JOIN template t ON t.id = s.template_id
-        CROSS JOIN LATERAL unnest(ARRAY[s.base_path, s.delta_path, CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path END]) AS p(path)
-        LEFT JOIN artifact_manifest am ON (am.snapshot_id = s.snapshot_id OR am.template_id = t.id)
-          AND am.path = p.path
-        WHERE p.path IS NOT NULL
-        GROUP BY p.path
-    ) ar
-    CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
-),
 storage AS (
-    SELECT COALESCE(SUM(
-        EXTRACT(EPOCH FROM (
-            LEAST(COALESCE(i.ended_at, now()), $1)
-            - GREATEST(i.started_at, $2)
-        )) * i.disk_mib
-    ), 0)::numeric + COALESCE(MAX(artifact_storage.mib_seconds), 0) AS storage_mib_seconds
-    FROM artifact_storage
-    LEFT JOIN sandbox_storage_interval i ON
-      i.team_id = $3
-      AND $2 < LEAST(now(), $1)
-      AND i.started_at < LEAST(now(), $1)
-      AND COALESCE(i.ended_at, LEAST(now(), $1)) > $2
+    SELECT billable_storage_mib_seconds($3, $2, $1)::numeric AS storage_mib_seconds
 ),
 usage AS (
     SELECT

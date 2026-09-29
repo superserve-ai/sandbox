@@ -1509,15 +1509,15 @@ func TestIntegration_IncrementalExactReservationAndObservation(t *testing.T) {
 	}
 }
 
-func TestIntegration_IncrementalDisabledStorageRemainsReconcilable(t *testing.T) {
+func TestIntegration_IncrementalStorageAccruesAfterFlagDisablement(t *testing.T) {
 	for _, source := range []string{"submitted", "adopted"} {
 		t.Run(source, func(t *testing.T) {
-			testIncrementalDisabledStorageRemainsReconcilable(t, source)
+			testIncrementalStorageAccruesAfterFlagDisablement(t, source)
 		})
 	}
 }
 
-func testIncrementalDisabledStorageRemainsReconcilable(t *testing.T, source string) {
+func testIncrementalStorageAccruesAfterFlagDisablement(t *testing.T, source string) {
 	s, p := seedIncrementalPeriod(t)
 	if _, err := testPool.Exec(t.Context(), `UPDATE team_billing_account SET commercial_billing_anchor=$2 WHERE team_id=$1`, p.TeamID, p.Start); err != nil {
 		t.Fatal(err)
@@ -1530,6 +1530,7 @@ func testIncrementalDisabledStorageRemainsReconcilable(t *testing.T, source stri
 			t.Fatal(err)
 		}
 	}
+	seedStorageActivation(t, p.TeamID, p.Start)
 	setStorageEnabled(true)
 	original := billing.ExportPayload{
 		EventName: "storage_gib_hours", CustomerID: "cus_" + p.TeamID.String(), Timestamp: p.End.Add(-time.Second).Unix(),
@@ -1561,7 +1562,7 @@ func testIncrementalDisabledStorageRemainsReconcilable(t *testing.T, source stri
 		}
 	}
 	setStorageEnabled(false)
-	// Full-hour measurements can continue accumulating after billing is disabled.
+	// Activation remains authoritative after the enablement flag is removed.
 	if _, err := testPool.Exec(t.Context(), `UPDATE team_billing_usage SET storage_mib_seconds=3*3686400
         WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, p.TeamID, p.Start, p.End); err != nil {
 		t.Fatal(err)
@@ -1571,97 +1572,46 @@ func testIncrementalDisabledStorageRemainsReconcilable(t *testing.T, source stri
 		t.Fatal(err)
 	}
 
-	phase := "mismatch"
-	storageReads := 0
 	stripe := &summaryStripeClient{fakeStripeClient: &fakeStripeClient{}}
 	stripe.countedUsage = func(eventName, customer string, start, end time.Time) (string, error) {
-		if customer != original.CustomerID || !start.Equal(p.Start) || !end.Equal(p.End) {
-			t.Fatalf("unexpected summary scope: %s %s %s", customer, start, end)
-		}
+		total := new(big.Rat)
 		if eventName == "storage_gib_hours" {
-			storageReads++
-			switch phase {
-			case "outage":
-				return "", errors.New("storage summary unavailable")
-			case "mismatch":
-				return "0", nil
-			default:
-				return "1", nil
-			}
+			total.SetInt64(1)
 		}
 		for _, call := range stripe.reportCalls {
 			if call.EventName == eventName {
-				return "2", nil
+				v, ok := new(big.Rat).SetString(call.Value)
+				if !ok {
+					t.Fatal(call.Value)
+				}
+				total.Add(total, v)
 			}
 		}
-		return "0", nil
+		return total.FloatString(12), nil
 	}
 	r := newBillingRouter(t, stripe)
 	admin := seedPlatformAdminProfile(t)
 	path := "/internal/teams/" + p.TeamID.String() + "/billing/periods/" + apiPeriodID(p.Start, p.End) + "/export"
-	for _, mode := range []string{"mismatch", "outage", "matched", "frozen"} {
-		phase = mode
-		storageReads = 0
-		if mode == "frozen" {
-			if _, err := testPool.Exec(t.Context(), `UPDATE billing_export_observation SET observed_at=now()-interval '3 hours'
-                WHERE team_id=$1 AND resource_type='storage'`, p.TeamID); err != nil {
-				t.Fatal(err)
-			}
-		}
+	for i := 0; i < 2; i++ {
 		w := doInternal(r, "POST", path, admin.String(), "")
-		wantCode, wantStatus := http.StatusConflict, "exporting"
-		if mode == "matched" || mode == "frozen" {
-			wantCode, wantStatus = http.StatusOK, "exported"
-		}
-		if w.Code != wantCode || billingPeriodStatus(t, p.TeamID, p.Start, p.End) != wantStatus {
-			t.Fatalf("%s close: %d %s", mode, w.Code, w.Body.String())
-		}
-		if storageReads != 1 {
-			t.Fatalf("%s storage summary reads = %d, want 1", mode, storageReads)
-		}
-		var local, reserved, submitted string
-		var counted, lastError *string
-		var fresh bool
-		if err := testPool.QueryRow(t.Context(), `SELECT local_quantity::text,reserved_quantity::text,submitted_quantity::text,
-            counted_quantity::text,last_error,observed_at>now()-interval '1 minute'
-            FROM billing_export_observation WHERE team_id=$1 AND period_start=$2 AND period_end=$3 AND resource_type='storage'`,
-			p.TeamID, p.Start, p.End).Scan(&local, &reserved, &submitted, &counted, &lastError, &fresh); err != nil {
-			t.Fatal(err)
-		}
-		for _, quantity := range []string{local, reserved, submitted} {
-			value, ok := new(big.Rat).SetString(quantity)
-			if !ok || value.Cmp(big.NewRat(1, 1)) != 0 {
-				t.Fatalf("%s storage accounting: %s %s %s", mode, local, reserved, submitted)
-			}
-		}
-		if !fresh {
-			t.Fatalf("%s storage observation is stale", mode)
-		}
-		if mode == "outage" {
-			if counted != nil || lastError == nil || *lastError != "storage summary unavailable" {
-				t.Fatalf("storage outage lost: counted=%v error=%v", counted, lastError)
-			}
-		} else {
-			want := "1"
-			if mode == "mismatch" {
-				want = "0"
-			}
-			if counted == nil || *counted != want || lastError != nil {
-				t.Fatalf("%s storage evidence: counted=%v error=%v", mode, counted, lastError)
-			}
+		if w.Code != http.StatusOK {
+			t.Fatalf("catch-up: %d %s", w.Code, w.Body.String())
 		}
 	}
-	if len(stripe.reportCalls) != 2 {
-		t.Fatalf("submitted %d events, want CPU and memory only", len(stripe.reportCalls))
+	if len(stripe.reportCalls) != 3 {
+		t.Fatalf("catch-up submitted %d events", len(stripe.reportCalls))
 	}
+	found := false
 	for _, call := range stripe.reportCalls {
-		if call.EventName == original.EventName {
-			t.Fatal("disabled storage was resubmitted")
+		if call.EventName == "storage_gib_hours" {
+			found = true
+			if call.Value != "2.000000000000" {
+				t.Fatalf("catch-up quantity=%s", call.Value)
+			}
 		}
 	}
-	var allocations int
-	if err := testPool.QueryRow(t.Context(), `SELECT count(*) FROM billing_export_allocation WHERE team_id=$1 AND resource_type='storage'`, p.TeamID).Scan(&allocations); err != nil || allocations != 2 {
-		t.Fatalf("storage allocations = %d, want 2: %v", allocations, err)
+	if !found {
+		t.Fatal("storage flag change stopped accrual")
 	}
 
 	planKey := "storage-coverage-" + p.TeamID.String()
@@ -1681,22 +1631,22 @@ func testIncrementalDisabledStorageRemainsReconcilable(t *testing.T, source stri
 	for i := 0; i < 2; i++ {
 		result, err := billing.FinalizeTeamBillingPeriodWithCredits(t.Context(), testPool, p.TeamID, p.Start, p.End)
 		if err != nil {
-			t.Fatalf("finalize disabled storage: %v", err)
+			t.Fatalf("finalize continuously accrued storage: %v", err)
 		}
-		// Two CPU/memory hours plus one exported storage hour, not three measured hours.
-		assertFloatNear(t, numericFloat64(t, result.Period.GrossChargesUsd), 18)
-		assertFloatNear(t, numericFloat64(t, result.Period.CreditsAppliedUsd), 18)
+		// Two CPU/memory hours plus all three eligible storage hours consume the shared grant.
+		assertFloatNear(t, numericFloat64(t, result.Period.GrossChargesUsd), 25.2)
+		assertFloatNear(t, numericFloat64(t, result.Period.CreditsAppliedUsd), 25.2)
 		assertFloatNear(t, numericFloat64(t, result.Period.NetInvoiceAmountUsd), 0)
 		assertFloatNear(t, numericFloat64(t, result.Usage.StorageMibSeconds), 3*3686400)
 		if i == 0 {
-			assertFloatNear(t, result.Charges.Breakdown.StorageUSD, 3.6)
-			assertFloatNear(t, result.Charges.CreditsRemainingUSD, 82)
+			assertFloatNear(t, result.Charges.Breakdown.StorageUSD, 10.8)
+			assertFloatNear(t, result.Charges.CreditsRemainingUSD, 74.8)
 		}
 		var remaining float64
 		if err := testPool.QueryRow(t.Context(), `SELECT remaining_usd FROM team_credit_grant WHERE team_id=$1`, p.TeamID).Scan(&remaining); err != nil {
 			t.Fatal(err)
 		}
-		assertFloatNear(t, remaining, 82)
+		assertFloatNear(t, remaining, 74.8)
 	}
 }
 

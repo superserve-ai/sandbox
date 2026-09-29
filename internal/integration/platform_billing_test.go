@@ -193,6 +193,7 @@ func TestPlatformBillingUsesCurrentPeriodLedgerToReconstructOpeningBalance(t *te
 	`, teamID); err != nil {
 		t.Fatalf("enable storage billing: %v", err)
 	}
+	seedStorageActivation(t, teamID, periodStart)
 
 	var grantID uuid.UUID
 	if err := testPool.QueryRow(ctx, `
@@ -358,8 +359,8 @@ func TestPlatformBillingDeduplicatesSharedArtifactStorage(t *testing.T) {
 	}
 	// The sparse shared and derived artifacts are retained through the billing
 	// request and must be charged once by allocated bytes, in addition to overlays.
-	artifactSeconds := (sharedAllocatedBytes + deltaAllocatedBytes) * int64(time.Minute.Seconds()) / (1024 * 1024)
-	wantStorage := (float64(artifactSeconds+3*60) / 1024) * 0.00000003
+	artifactSeconds := float64(sharedAllocatedBytes+deltaAllocatedBytes) * time.Minute.Seconds() / (1024 * 1024)
+	wantStorage := ((artifactSeconds + 3*60) / 1024) * 0.00000003
 	if diff := math.Abs(metadataStorage - wantStorage); diff > 1e-12 {
 		t.Fatalf("storage charge = %v, want %v (diff %v)", metadataStorage, wantStorage, diff)
 	}
@@ -369,8 +370,10 @@ func TestPlatformBillingDeduplicatesSharedArtifactStorage(t *testing.T) {
 	if !ok {
 		t.Fatalf("storage_mib_seconds = %v, want numeric", body.Rows[0].Summary["storage_mib_seconds"])
 	}
-	if diff := math.Abs(gotStorageSeconds - float64(artifactSeconds+3*60)); diff > 1e-6 {
-		t.Fatalf("storage_mib_seconds = %v, want %v (diff %v)", gotStorageSeconds, artifactSeconds+3*60, diff)
+	// Raw usage retains its existing artifact rounding; payable charges retain fractions.
+	wantRawStorageSeconds := math.Floor(artifactSeconds) + 3*60
+	if diff := math.Abs(gotStorageSeconds - wantRawStorageSeconds); diff > 1e-6 {
+		t.Fatalf("storage_mib_seconds = %v, want %v (diff %v)", gotStorageSeconds, wantRawStorageSeconds, diff)
 	}
 }
 
@@ -400,6 +403,7 @@ func seedPlatformBillingRatesForTest(t *testing.T, ctx context.Context, teamID u
 	`, teamID); err != nil {
 		t.Fatalf("enable storage billing: %v", err)
 	}
+	seedStorageActivation(t, teamID, effectiveFrom)
 }
 
 func TestPlatformBillingUsesHalfOpenMonthBoundaryForUsage(t *testing.T) {

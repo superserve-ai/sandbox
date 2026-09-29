@@ -62,6 +62,10 @@ type fakeStripeClient struct {
 	nextPortalURL             string
 }
 
+func (f *fakeStripeClient) EnsureStorageSubscription(context.Context, api.StripeStorageSubscriptionParams) error {
+	return nil
+}
+
 func (f *fakeStripeClient) GetCustomerCreditBalance(_ context.Context, _ string) (api.StripeCreditBalance, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -598,6 +602,7 @@ func TestIntegration_ShadowBillingSkipsStripeCalls(t *testing.T) {
 
 func TestIntegration_LiveBillingSendsStripeEventsAndIsIdempotent(t *testing.T) {
 	teamID, periodID, periodStart, periodEnd := seedBillingPeriodForStripe(t, true, true)
+	seedStorageActivation(t, teamID, periodStart)
 	adminID := seedPlatformAdminProfile(t)
 	stripe := &fakeStripeClient{}
 	r := newBillingRouter(t, stripe)
@@ -740,7 +745,7 @@ func TestIntegration_CreateStripeCheckoutSessionUsesConfiguredPrice(t *testing.T
 	if got := len(stripe.checkoutCalls); got != 1 {
 		t.Fatalf("checkout calls = %d, want 1", got)
 	}
-	if got := stripe.checkoutCalls[0].PriceIDs; len(got) != 2 || got[0] != "price_cpu" || got[1] != "price_memory" {
+	if got := stripe.checkoutCalls[0].PriceIDs; len(got) != 3 || got[0] != "price_cpu" || got[1] != "price_memory" || got[2] != "price_storage" {
 		t.Fatalf("checkout price IDs = %v, want configured metered prices", got)
 	}
 	if got := stripe.checkoutCalls[0].ClientReferenceID; got != teamID.String() {
@@ -1592,6 +1597,7 @@ func TestIntegration_TeamBillingUsageReportsGiBBasedResources(t *testing.T) {
 	viewerKey := seedKeyForExistingTeamWithRole(t, teamID, "viewer")
 	periodStart := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 	periodEnd := periodStart.AddDate(0, 1, 0)
+	seedStorageActivation(t, teamID, periodStart)
 	cw := do(newRouter(t), "POST", "/sandboxes", ownerKey, `{"name":"billing-usage-units"}`)
 	if cw.Code != http.StatusCreated {
 		t.Fatalf("create sandbox: expected 201, got %d: %s", cw.Code, cw.Body.String())
