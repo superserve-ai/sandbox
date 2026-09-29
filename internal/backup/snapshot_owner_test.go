@@ -211,7 +211,8 @@ func TestFetchGenerationRestoresASnapshotBackup(t *testing.T) {
 	if got.Manifest.SnapshotID != task.SnapshotID || got.Disk != filepath.Join(dest, "rootfs.ext4") {
 		t.Fatalf("restored = %+v", got)
 	}
-	if _, err := FetchGeneration(context.Background(), store, task.SnapshotID, task.Generation, filepath.Join(t.TempDir(), "x"), nil); !errors.Is(err, ErrNoMatchingBackup) {
+	// Not even through the snapshot's finished restore of that generation.
+	if _, err := FetchGeneration(context.Background(), store, task.SnapshotID, task.Generation, dest, nil); !errors.Is(err, ErrNoMatchingBackup) {
 		t.Fatalf("read as a sandbox: err = %v, want ErrNoMatchingBackup", err)
 	}
 }

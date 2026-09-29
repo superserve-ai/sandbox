@@ -387,6 +387,13 @@ func makeDirPortable(dir string) error {
 // otherwise name the owner.
 func SnapshotOwner(snapshotID string) string { return snapshotOwnerPrefix + snapshotID }
 
+func manifestOwner(m *GenerationManifest) string {
+	if m.SnapshotID != "" {
+		return SnapshotOwner(m.SnapshotID)
+	}
+	return m.SandboxID
+}
+
 func ownerObject(owner, generation, fileName string) (string, error) {
 	if id, ok := strings.CutPrefix(owner, snapshotOwnerPrefix); ok {
 		return SnapshotObject(id, generation, fileName)
@@ -416,10 +423,7 @@ func fetchManifest(ctx context.Context, r BlobReader, owner, generation string, 
 	// The manifest records its own identity; a manifest copied or misplaced
 	// under another prefix could otherwise restore a different sandbox's
 	// generation with every digest passing.
-	recorded := manifest.SandboxID
-	if manifest.SnapshotID != "" {
-		recorded = SnapshotOwner(manifest.SnapshotID)
-	}
+	recorded := manifestOwner(&manifest)
 	if recorded != owner || manifest.Generation != generation {
 		return nil, fmt.Errorf("manifest identity mismatch: %s records %s/%s, requested %s/%s",
 			object, recorded, manifest.Generation, owner, generation)

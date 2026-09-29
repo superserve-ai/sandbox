@@ -254,7 +254,7 @@ func (a *GRPCAdapter) RestoreSnapshot(ctx context.Context, req *vmdpb.RestoreSna
 	}
 
 	var inst *VMInstance
-	if id := vmCfg.SavedSnapshotID; id != "" && a.mgr.BackupRestoreEnabled() && a.mgr.savedSnapshotFilesMissing(id) {
+	if id := vmCfg.SavedSnapshotID; id != "" && a.mgr.BackupRestoreEnabled() && a.mgr.savedSnapshotFilesMissing(id) && !a.mgr.forkAlreadyBooted(req.GetVmId(), id) {
 		if req.GetBackupGeneration() == "" {
 			return nil, savedSnapshotMissingErr(id)
 		}

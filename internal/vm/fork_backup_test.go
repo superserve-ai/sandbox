@@ -19,11 +19,18 @@ func TestSavedSnapshotFilesMissing(t *testing.T) {
 	if m.savedSnapshotFilesMissing(man.SnapshotID) {
 		t.Fatal("a snapshot with every file must not read as missing")
 	}
-	if err := os.Remove(man.MemPath); err != nil {
-		t.Fatal(err)
-	}
-	if !m.savedSnapshotFilesMissing(man.SnapshotID) {
-		t.Fatal("a snapshot without its memory must read as missing")
+	for _, file := range []func(*SavedSnapshotManifest) string{
+		func(s *SavedSnapshotManifest) string { return s.BasePath },
+		func(s *SavedSnapshotManifest) string { return s.MemPath },
+	} {
+		m, man, _, _ := savedBackupFixture(t)
+		path := file(man)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if !m.savedSnapshotFilesMissing(man.SnapshotID) {
+			t.Fatalf("a snapshot without %s must read as missing", filepath.Base(path))
+		}
 	}
 	if !m.savedSnapshotFilesMissing("5f0c2a9e-1b7d-4c3e-8a6f-0d9e2b4c7a13") {
 		t.Fatal("a snapshot the host never had must read as missing")

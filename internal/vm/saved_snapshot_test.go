@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/superserve-ai/sandbox/internal/presence"
+	"github.com/superserve-ai/sandbox/proto/vmdpb"
 )
 
 const testPage = 4096
@@ -853,6 +854,13 @@ func TestCompletedForkRetryOutlivesItsSource(t *testing.T) {
 	}
 	if got, err := m.restoreVMSnapshot(ctx, child, "", "", request, nil, "", "", "", nil, 0, ""); err != nil || got != existing {
 		t.Fatalf("retry after the snapshot was deleted: got %v, %v", got, err)
+	}
+	// A host that could boot the snapshot's backup still adopts the fork.
+	m.SetBackupRestore(&slowEmptyStore{}, &slowEmptyStore{}, filepath.Join(t.TempDir(), ".restore"), BackupRestoreOptions{Concurrency: 1})
+	a := &GRPCAdapter{mgr: m}
+	req := &vmdpb.RestoreSnapshotRequest{VmId: child, SavedSnapshotId: man.SnapshotID, ResourceLimits: &vmdpb.ResourceLimits{VcpuCount: 1, MemoryMib: 1024}}
+	if resp, err := a.RestoreSnapshot(ctx, req); err != nil || resp.GetVmId() != child {
+		t.Fatalf("retry with backup restore on: %v, %v", resp, err)
 	}
 	// The same child asked for from another snapshot is not this retry.
 	other := VMConfig{VCPU: 1, MemoryMiB: 1024, SavedSnapshotID: uuid.NewString()}

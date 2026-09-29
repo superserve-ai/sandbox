@@ -86,7 +86,7 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 	if generation == "" {
 		return Restored{}, ErrNoMatchingBackup
 	}
-	if done, err := RestoredDisk(destDir); err == nil && done.Manifest.Generation == generation {
+	if done, err := RestoredDisk(destDir); err == nil && done.Manifest.Generation == generation && manifestOwner(done.Manifest) == owner {
 		return done, nil
 	}
 	if err := os.RemoveAll(destDir); err != nil {

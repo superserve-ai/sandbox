@@ -28,8 +28,17 @@ func (m *Manager) savedSnapshotFilesMissing(snapshotID string) bool {
 	if err != nil {
 		return false
 	}
-	return !statRegularFile(man.DiskPath) ||
-		(man.SnapshotPath != "" && (!statRegularFile(man.SnapshotPath) || !statRegularFile(man.MemPath)))
+	missing := func(path string) bool { return path != "" && !statRegularFile(path) }
+	return !statRegularFile(man.DiskPath) || missing(man.BasePath) ||
+		(man.SnapshotPath != "" && (!statRegularFile(man.SnapshotPath) || !statRegularFile(man.MemPath) || missing(man.BaseMemPath)))
+}
+
+// forkAlreadyBooted reports a fork of the snapshot already running as vmID,
+// whose retry the ordinary restore adopts.
+func (m *Manager) forkAlreadyBooted(vmID, snapshotID string) bool {
+	m.lazyReattach(vmID)
+	existing, _ := m.retriedForkTarget(vmID, snapshotID)
+	return existing != nil
 }
 
 func savedSnapshotMissingErr(snapshotID string) error {
