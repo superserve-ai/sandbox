@@ -17,7 +17,12 @@ RETURNS numeric LANGUAGE sql STABLE AS $$
 WITH legacy_intervals AS MATERIALIZED (
   SELECT i.sandbox_id,i.team_id,i.host_id,i.disk_mib,i.started_at,
    LEAST(i.ended_at,c.started_at) ended_at,
-   LEAST(s.destroyed_at,c.started_at) artifact_retention_end
+   -- Measurement changes do not release artifacts, but the next handoff
+   -- ends this owner's entire legacy reference, including earlier samples.
+   LEAST(s.destroyed_at,c.started_at,
+    MIN(i.ended_at) FILTER (WHERE i.end_reason='reassigned') OVER (
+     PARTITION BY i.sandbox_id,i.team_id,i.host_id ORDER BY i.started_at
+     ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)) artifact_retention_end
   FROM sandbox_storage_interval i
   JOIN sandbox s ON s.id=i.sandbox_id
   LEFT JOIN retained_storage_cutover c ON c.host_id=i.host_id AND c.team_id=i.team_id
