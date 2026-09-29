@@ -31,7 +31,7 @@ $$;
 
 -- All payable readers share the same interval intersection. Raw hourly rollups
 -- remain observational and must not be used across the activation boundary.
-CREATE FUNCTION billable_storage_mib_seconds(p_team_id uuid, p_start timestamptz, p_end timestamptz, p_round_artifacts boolean DEFAULT true)
+CREATE FUNCTION billable_storage_mib_seconds(p_team_id uuid, p_start timestamptz, p_end timestamptz)
 RETURNS numeric LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_start timestamptz;
@@ -86,7 +86,9 @@ artifact_ranges AS (
     GROUP BY p.path
 ),
 artifact_storage AS (
-    SELECT CASE WHEN p_round_artifacts THEN FLOOR(COALESCE(SUM(artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0)) ELSE COALESCE(SUM(artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0) END::numeric AS mib_seconds
+    -- Keep fractional MiB-seconds additive across hourly and closing windows.
+    -- Quantization belongs to cumulative provider-unit conversion, not intervals.
+    SELECT COALESCE(SUM(artifact_mib * EXTRACT(EPOCH FROM (upper(r) - lower(r)))), 0)::numeric AS mib_seconds
     FROM artifact_ranges ar
     CROSS JOIN LATERAL unnest(ar.retained_ranges) AS ranges(r)
 ),
@@ -234,7 +236,7 @@ BEGIN
         RETURN NEW;
     END IF;
     IF TG_TABLE_NAME = 'billing_export_measurement' THEN
-        NEW.storage_mib_seconds := billable_storage_mib_seconds(NEW.team_id, GREATEST(NEW.hour_start, NEW.period_start), LEAST(NEW.hour_start + interval '1 hour', NEW.period_end), false);
+        NEW.storage_mib_seconds := billable_storage_mib_seconds(NEW.team_id, GREATEST(NEW.hour_start, NEW.period_start), LEAST(NEW.hour_start + interval '1 hour', NEW.period_end));
     ELSE
         -- Only consumed hour contributions belong in the accumulator. Recomputing
         -- raw usage through now() would exceed its completed-hour coverage.

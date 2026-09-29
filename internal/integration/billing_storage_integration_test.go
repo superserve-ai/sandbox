@@ -695,6 +695,133 @@ func testStorageCacheCoverage(t *testing.T, cutoff time.Duration) {
 	// The following unconsumed hour is deliberately absent from the accumulator.
 }
 
+func TestIntegration_BillingStorageFractionalArtifactSettlement(t *testing.T) {
+	for _, offset := range []time.Duration{0, 15 * time.Minute} {
+		t.Run(offset.String(), func(t *testing.T) {
+			store, p := seedIncrementalPeriod(t)
+			ctx := t.Context()
+			cutoff := p.Start.Add(offset)
+			retentionEnd := cutoff.Add(time.Hour)
+			seedStorageActivation(t, p.TeamID, cutoff)
+			storageExec(t, `UPDATE team_billing_account SET commercial_billing_anchor=$2 WHERE team_id=$1`, p.TeamID, p.Start)
+			storageExec(t, `INSERT INTO template(team_id,name,status,build_spec,vcpu,memory_mib,disk_mib,rootfs_path)
+                VALUES($1,'example-fractional','ready','{}',1,1024,1024,'/templates/'||$1::uuid::text||'/base.ext4')`, p.TeamID)
+			storageExec(t, `INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
+                SELECT id,'base.ext4',rootfs_path,1073745920,1073745920,repeat('0',64) FROM template WHERE team_id=$1`, p.TeamID)
+			storageExec(t, `UPDATE sandbox SET template_id=(SELECT id FROM template WHERE team_id=$1),created_at=$2,destroyed_at=NULL WHERE team_id=$1`, p.TeamID, p.Start)
+			storageExec(t, `UPDATE sandbox_storage_interval SET ended_at=NULL,end_reason=NULL WHERE team_id=$1`, p.TeamID)
+			payload := billing.ExportPayload{EventName: "storage_gib_hours", CustomerID: "cus_" + p.TeamID.String()}
+			accepted := new(big.Rat)
+			wantQuantity := "2.000003814697"
+			const wantMiBSeconds = 7372814.0625 // One GiB overlay plus one GiB + 4096-byte artifact, for one hour.
+			consume := func(hour time.Time) {
+				t.Helper()
+				storageExec(t, `INSERT INTO billing_export_measurement(team_id,period_start,period_end,hour_start,vcpu_seconds,memory_mib_seconds,storage_mib_seconds)
+                    VALUES($1,$2,$3,$4,0,0,0)`, p.TeamID, p.Start, p.End, hour)
+				storageExec(t, `INSERT INTO billing_export_usage(team_id,period_start,period_end,storage_mib_seconds)
+                    VALUES($1,$2,$3,0) ON CONFLICT(team_id,period_start,period_end) DO UPDATE SET storage_mib_seconds=0`, p.TeamID, p.Start, p.End)
+				var measured pgtype.Numeric
+				if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds FROM billing_export_usage WHERE team_id=$1 AND period_start=$2`, p.TeamID, p.Start).Scan(&measured); err != nil {
+					t.Fatal(err)
+				}
+				quantity, err := billing.MeterUsageQuantity(measured, "storage_gib")
+				if err != nil {
+					t.Fatal(err)
+				}
+				through := hour.Add(time.Hour)
+				payload.Timestamp = through.Add(-time.Second).Unix()
+				event, err := store.Reserve(ctx, p, "storage", quantity, through, payload)
+				if err != nil || event == nil {
+					t.Fatalf("incremental reservation: %+v %v", event, err)
+				}
+				event = acceptIncrement(t, store, p)
+				value, ok := new(big.Rat).SetString(event.Quantity)
+				if !ok {
+					t.Fatal(event.Quantity)
+				}
+				accepted.Add(accepted, value)
+			}
+			consume(p.Start)
+			// Retention ends after the first increment was accepted, well before close.
+			storageExec(t, `UPDATE sandbox SET destroyed_at=$2 WHERE team_id=$1`, p.TeamID, retentionEnd)
+			storageExec(t, `UPDATE sandbox_storage_interval SET ended_at=$2,end_reason='deleted' WHERE team_id=$1`, p.TeamID, retentionEnd)
+			if offset != 0 {
+				consume(p.Start.Add(time.Hour))
+			}
+			if accepted.FloatString(12) != wantQuantity {
+				t.Fatalf("incremental cumulative quantity=%s want %s", accepted.FloatString(12), wantQuantity)
+			}
+			usage, err := testQueries.UpsertTeamBillingUsage(ctx, db.UpsertTeamBillingUsageParams{TeamID: p.TeamID, PeriodStart: pgtype.Timestamptz{Time: p.Start, Valid: true}, PeriodEnd: pgtype.Timestamptz{Time: p.End, Valid: true}})
+			if err != nil || numericFloat64(t, usage.StorageMibSeconds) != wantMiBSeconds {
+				t.Fatalf("closing snapshot lost fractional usage: %+v %v", usage, err)
+			}
+			var cpu, memory, storage pgtype.Numeric
+			if err := testPool.QueryRow(ctx, billing.ExportRemeasurementSQL, p.TeamID, p.Start, p.End).Scan(&cpu, &memory, &storage); err != nil || numericFloat64(t, storage) != wantMiBSeconds {
+				t.Fatalf("correction remeasurement lost fractional usage: %+v %v", storage, err)
+			}
+			series, err := testQueries.GetTeamBillingUsageSeries(ctx, db.GetTeamBillingUsageSeriesParams{TeamID: p.TeamID, PeriodStarts: []time.Time{p.Start, p.Start.Add(time.Hour)}, PeriodEnds: []time.Time{p.Start.Add(time.Hour), p.End}})
+			if err != nil || len(series) != 2 {
+				t.Fatalf("usage series: %+v %v", series, err)
+			}
+			if got := numericFloat64(t, series[0].BillableStorageGibSeconds) + numericFloat64(t, series[1].BillableStorageGibSeconds); got != wantMiBSeconds/1024 {
+				t.Fatalf("partitioned usage=%v want %v", got, wantMiBSeconds/1024)
+			}
+			stripe := &summaryStripeClient{fakeStripeClient: &fakeStripeClient{}}
+			stripe.countedUsage = func(event, customer string, start, end time.Time) (string, error) {
+				total := new(big.Rat)
+				if event == payload.EventName {
+					total.Set(accepted)
+				}
+				for _, call := range stripe.reportCalls {
+					if call.EventName == event {
+						value, ok := new(big.Rat).SetString(call.Value)
+						if !ok {
+							t.Fatal(call.Value)
+						}
+						total.Add(total, value)
+					}
+				}
+				return total.FloatString(12), nil
+			}
+			admin := seedPlatformAdminProfile(t)
+			router := newBillingRouter(t, stripe)
+			path := "/internal/teams/" + p.TeamID.String() + "/billing/periods/" + apiPeriodID(p.Start, p.End) + "/export"
+			for i := 0; i < 2; i++ {
+				w := doInternal(router, "POST", path, admin.String(), "")
+				if w.Code != http.StatusOK {
+					t.Fatalf("closing export: %d %s", w.Code, w.Body.String())
+				}
+			}
+			for _, call := range stripe.reportCalls {
+				if call.EventName == payload.EventName {
+					t.Fatalf("closing export duplicated storage: %+v", call)
+				}
+			}
+			for i := 0; i < 2; i++ {
+				correction, err := store.MeasureCorrection(ctx, p, "storage")
+				if err != nil || !correction.Frozen || correction.Measured != wantQuantity || correction.Baseline != wantQuantity || correction.Target != wantQuantity {
+					t.Fatalf("closing/finalized correction: %+v %v", correction, err)
+				}
+				if err := store.ApplyCorrection(ctx, correction.ID, admin, "accept_usage", "unchanged fractional storage", payload); err != nil {
+					t.Fatal(err)
+				}
+				result, err := billing.FinalizeTeamBillingPeriodWithCredits(ctx, testPool, p.TeamID, p.Start, p.End)
+				if err != nil || !result.Period.FinalizedAt.Valid || numericFloat64(t, result.Usage.StorageMibSeconds) != wantMiBSeconds {
+					t.Fatalf("fractional storage finalization: %+v %v", result, err)
+				}
+			}
+			var allocations int
+			wantAllocations := 1
+			if offset != 0 {
+				wantAllocations = 2
+			}
+			if err := testPool.QueryRow(ctx, `SELECT count(*) FROM billing_export_allocation WHERE team_id=$1 AND resource_type='storage'`, p.TeamID).Scan(&allocations); err != nil || allocations != wantAllocations {
+				t.Fatalf("duplicate storage reservations: %d want %d: %v", allocations, wantAllocations, err)
+			}
+		})
+	}
+}
+
 func TestIntegration_BillingStorageCreditParity(t *testing.T) {
 	team, _, start, end := seedBillingPeriodForStripe(t, true, true)
 	key := seedKeyForExistingTeamWithRole(t, team, "viewer")

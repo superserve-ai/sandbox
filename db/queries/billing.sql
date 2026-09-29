@@ -1528,7 +1528,7 @@ JOIN unnest(sqlc.arg(period_ends)::timestamptz[]) WITH ORDINALITY ends(bucket_en
   i.started_at < LEAST(now(),b.bucket_end) AND COALESCE(i.ended_at,LEAST(now(),b.bucket_end)) > b.bucket_start
  LEFT JOIN artifact_storage a ON a.bucket_start=b.bucket_start AND a.bucket_end=b.bucket_end GROUP BY b.bucket_start,b.bucket_end
 )
-SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds,(billable_storage_mib_seconds(sqlc.arg(team_id),c.bucket_start,c.bucket_end,false)/1024.0)::numeric billable_storage_gib_seconds
+SELECT sqlc.arg(team_id)::uuid team_id,c.bucket_start period_start,c.bucket_end period_end,c.vcpu_seconds,(c.memory_mib_seconds/1024.0)::numeric memory_gib_seconds,(s.storage_mib_seconds/1024.0)::numeric storage_gib_seconds,(billable_storage_mib_seconds(sqlc.arg(team_id),c.bucket_start,c.bucket_end)/1024.0)::numeric billable_storage_gib_seconds
 FROM compute c JOIN storage s USING(bucket_start,bucket_end) ORDER BY c.bucket_start;
 
 

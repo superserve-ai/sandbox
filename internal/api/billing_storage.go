@@ -352,7 +352,7 @@ func (h *Handlers) ReconcileStorageBilling(c *gin.Context) {
 			// activation race with mixed-version workers without touching frozen
 			// history or reservation identities.
 			_, err = tx.Exec(ctx, `
-                UPDATE billing_export_measurement m SET storage_mib_seconds = billable_storage_mib_seconds(m.team_id,GREATEST(m.hour_start,m.period_start),LEAST(m.hour_start+interval '1 hour',m.period_end),false)
+                UPDATE billing_export_measurement m SET storage_mib_seconds = billable_storage_mib_seconds(m.team_id,GREATEST(m.hour_start,m.period_start),LEAST(m.hour_start+interval '1 hour',m.period_end))
                 WHERE m.team_id=$1 AND m.hour_start+interval '1 hour' > (SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1)
                   AND NOT EXISTS (SELECT 1 FROM team_billing_period bp WHERE bp.team_id=m.team_id AND bp.period_start=m.period_start AND bp.period_end=m.period_end
                     AND (bp.finalized_at IS NOT NULL OR bp.exported_at IS NOT NULL OR bp.status IN ('exporting','exported','finalized')))`, team)
