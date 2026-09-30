@@ -844,7 +844,7 @@ func TestIntegration_RetainedMixedHistoryFencesDelayedHandoff(t *testing.T) {
 			for attempt := 0; attempt < 2; attempt++ {
 				exec(`UPDATE host_storage_report SET state='processing',next_measurement_index=0 WHERE report_id=$1`, f.reportID)
 				err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, t1, measurements, 1, 1)
-				if delayedRetained && !errors.Is(err, errStorageReportInvalidPayload) {
+				if delayedRetained && !errors.Is(err, errStorageReportRetainedIncomplete) {
 					t.Fatalf("superseded retained report = %v", err)
 				}
 				if !delayedRetained && err != nil {
