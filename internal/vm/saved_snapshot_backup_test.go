@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -181,5 +182,20 @@ func TestSavedSnapshotMarkerSkipsADeletedSnapshot(t *testing.T) {
 	m.markSavedSnapshotBackup(context.Background(), man.SnapshotID, "gen", zerolog.Nop())
 	if _, err := os.Stat(filepath.Dir(man.DiskPath)); !os.IsNotExist(err) {
 		t.Fatalf("snapshot directory recreated: err = %v", err)
+	}
+}
+
+// A snapshot deleted before its backup was hashed is nothing to warn about.
+func TestSavedSnapshotBackupSkipsADeletedSnapshotQuietly(t *testing.T) {
+	m, man, queued, _ := savedBackupFixture(t)
+	if err := os.RemoveAll(filepath.Dir(man.DiskPath)); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if m.backupSavedSnapshot(context.Background(), man, zerolog.New(&buf)) || len(*queued) != 0 {
+		t.Fatal("queued a deleted snapshot")
+	}
+	if out := buf.String(); strings.Contains(out, `"level":"warn"`) || strings.Contains(out, `"level":"error"`) {
+		t.Fatalf("a deleted snapshot was logged as a failure:\n%s", out)
 	}
 }

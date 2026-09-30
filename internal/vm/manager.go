@@ -1822,7 +1822,7 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 		if ferr != nil {
 			// The guest may be frozen and could not be shown released: it
 			// must not be served as running. The intent keeps its token.
-			m.markUnservable(inst, log)
+			m.markUnservable(inst, ferr, log)
 			return "", "", nil, m.handleVMError(vmID, ferr)
 		}
 	}
@@ -1835,9 +1835,8 @@ func (m *Manager) PauseVM(ctx context.Context, vmID, snapshotDir, pauseToken str
 			if snapshotOK {
 				return
 			}
-			if terr := m.releaseFrozenGuest(ctx, socketPath, instIP, freezeToken); terr != nil {
-				log.Error().Err(terr).Msg("pause: snapshot failed and the guest workload could not be thawed")
-				m.markUnservable(inst, log)
+			if terr := m.releaseOrConfirmRunning(ctx, socketPath, instIP, freezeToken); terr != nil {
+				m.markUnservable(inst, fmt.Errorf("snapshot failed and the guest could not be released: %w", terr), log)
 			}
 		}()
 	}
@@ -3838,7 +3837,7 @@ func (m *Manager) restoreVMSnapshot(ctx context.Context, vmID, snapshotPath, mem
 		if diskUntouched {
 			// Nothing of the prior life was touched and its process may
 			// live: keep charging it behind the record until a confirmed stop.
-			m.markUnservable(inst, log)
+			m.markUnservable(inst, diskErr, log)
 			return nil, diskErr
 		}
 		// A run dir left behind makes the retry plan a reuse of the disk
@@ -8944,7 +8943,7 @@ func (m *Manager) failAfterSnapshot(inst *VMInstance, socketPath string, err err
 // markUnservable records, durably, that this guest's workload may be frozen
 // with no confirmed release: Error, so it is not served as running, with its
 // process, intent and artifacts kept for a release that still has the token.
-func (m *Manager) markUnservable(inst *VMInstance, log zerolog.Logger) {
+func (m *Manager) markUnservable(inst *VMInstance, cause error, log zerolog.Logger) {
 	// The process stays: capacity must keep charging it behind the Error
 	// record until a confirmed stop or the reconciler's reap clears this.
 	m.vmStopUnconfirmed.Store(inst.ID, struct{}{})
@@ -8954,7 +8953,7 @@ func (m *Manager) markUnservable(inst *VMInstance, log zerolog.Logger) {
 	if _, err := m.persistStateIfPresent(inst); err != nil {
 		log.Error().Err(err).Msg("pause: guest with an unconfirmed release could not be recorded as error")
 	}
-	log.Error().Msg("pause: guest workload may still be frozen and could not be released; recorded as error")
+	log.Error().Err(cause).Msg("pause: guest workload may still be frozen and could not be released; recorded as error")
 }
 
 // preWakeFailureStatus is the status a restore failure before the wake
@@ -9001,21 +9000,56 @@ func (m *Manager) mayBeFrozenAt(paths ...string) bool {
 	return false
 }
 
+// releaseThawBudget bounds one release's thaw attempts. A thaw that timed
+// out is asked again within it: the vCPUs may still be catching up on a
+// resume the API answered late, or the host may be mid-fsync.
+var releaseThawBudget = 8 * time.Second
+
 // releaseFrozenGuest thaws a workload a pause froze, after resuming the
 // vCPUs a snapshot may have paused so the guest can answer. The unpause is
-// best-effort; the thaw is the verdict.
+// best-effort; the thaw is the verdict: an answer from the guest is taken
+// at once, a thaw that never answered is asked again.
 func (m *Manager) releaseFrozenGuest(ctx context.Context, socketPath, ip, token string) error {
 	// Each step bounded on its own: a stuck Firecracker API must neither hang
 	// this caller nor eat the thaw's budget.
 	base := context.WithoutCancel(ctx)
+	var uerr error
 	if socketPath != "" {
 		uctx, cancel := context.WithTimeout(base, 2*time.Second)
-		_ = fcUnpauseVM(uctx, socketPath)
+		uerr = fcUnpauseVM(uctx, socketPath)
 		cancel()
 	}
-	tctx, cancel := context.WithTimeout(base, 2*time.Second)
-	defer cancel()
-	return boxdThawGuest(tctx, ip, token)
+	deadline := time.Now().Add(releaseThawBudget)
+	var terr error
+	for attempt := 0; ; attempt++ {
+		tctx, cancel := context.WithTimeout(base, 2*time.Second)
+		terr = boxdThawGuest(tctx, ip, token)
+		cancel()
+		if terr == nil {
+			if uerr != nil {
+				m.log.Warn().Err(uerr).Str("socket", socketPath).Msg("release: the unpause did not confirm, and the guest thawed regardless")
+			}
+			return nil
+		}
+		if !answerTimedOut(terr) || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+	}
+	if uerr != nil {
+		return fmt.Errorf("thaw: %w; unpause: %v", terr, uerr)
+	}
+	return terr
+}
+
+// answerTimedOut reports an answer that never came, as opposed to one that
+// came and refused.
+func answerTimedOut(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // resolveOutstandingFreeze releases, or confirms released, a workload an

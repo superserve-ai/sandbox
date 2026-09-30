@@ -396,7 +396,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		var ferr error
 		frozen, synced, ferr = m.freezeGuest(ctx, ip, token, kind == SavedSnapshotFS, log)
 		if ferr != nil {
-			m.markUnservable(inst, log)
+			m.markUnservable(inst, ferr, log)
 			return ferr
 		}
 		if kind == SavedSnapshotFS && !(frozen && synced) {
@@ -404,8 +404,8 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 			// disk would not be whole, so the source is let go and the
 			// capture refused.
 			if frozen {
-				if err := m.releaseFrozenGuest(ctx, "", ip, token); err != nil {
-					m.markUnservable(inst, log)
+				if err := m.releaseOrConfirmRunning(ctx, "", ip, token); err != nil {
+					m.markUnservable(inst, err, log)
 					return status.Errorf(codes.Unavailable, "source could not be released after a refused capture: %v", err)
 				}
 			}
@@ -456,7 +456,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	}
 	var releaseErr error
 	if frozen {
-		releaseErr = m.releaseFrozenGuest(ctx, socket, ip, token)
+		releaseErr = m.releaseOrConfirmRunning(ctx, socket, ip, token)
 	} else {
 		releaseErr = unpauseSourceWithProbe(ctx, socket)
 	}
@@ -474,7 +474,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	}
 	if releaseErr != nil {
 		// The intent, if any, keeps the token for recovery.
-		m.markUnservable(inst, log)
+		m.markUnservable(inst, errors.Join(captureErr, releaseErr), log)
 		return status.Errorf(codes.Unavailable, "source could not be resumed after capture: %v", errors.Join(captureErr, releaseErr))
 	}
 	if persistErr != nil {

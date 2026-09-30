@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,19 +99,26 @@ func (m *Manager) backupSavedSnapshot(ctx context.Context, man *SavedSnapshotMan
 		files = append(files, f)
 		return nil
 	}
+	hashFailed := func(what string, err error) bool {
+		if errors.Is(err, os.ErrNotExist) {
+			// Deleted while it waited its turn: nothing left to back up.
+			log.Info().Msg("saved snapshot backup: snapshot deleted before its " + what + " was hashed")
+		} else {
+			log.Warn().Err(err).Msg("saved snapshot backup: " + what + " hash failed; not queued")
+		}
+		return false
+	}
 	// A cold boot of an overlay trusts the block map saved with it.
 	if man.SnapshotPath != "" && man.BasePath != "" {
 		if p := overlayBlockMapPath(man.SnapshotPath); statRegularFile(p) {
 			if err := add(backup.BlockMapName, p, ""); err != nil {
-				log.Warn().Err(err).Msg("saved snapshot backup: block map hash failed; not queued")
-				return false
+				return hashFailed("block map", err)
 			}
 		}
 	}
 	// Restore reads the disk as rootfs.ext4, whatever the capture named it.
 	if err := add("rootfs.ext4", man.DiskPath, man.BasePath); err != nil {
-		log.Warn().Err(err).Msg("saved snapshot backup: disk hash failed; not queued")
-		return false
+		return hashFailed("disk", err)
 	}
 	task := backup.Task{
 		SnapshotID: man.SnapshotID,
