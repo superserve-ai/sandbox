@@ -659,6 +659,98 @@ func TestIntegration_RetainedFailedFirstMeasurementBlocksSettlement(t *testing.T
 	}
 }
 
+func TestIntegration_RetainedFailedSnapshotBlocksSettlement(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
+			f := newStorageLeaseFixture(t)
+			ctx := t.Context()
+			attachSnapshotRetentionTrigger(t, f)
+			exec := func(query string, args ...any) {
+				t.Helper()
+				if _, err := f.pool.Exec(ctx, query, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exec(`CREATE TEMP TABLE legacy_host_storage_report(host_id text,received_at timestamptz)`)
+			var team uuid.UUID
+			if err := f.pool.QueryRow(ctx, `SELECT team_id FROM sandbox WHERE id=$1`, f.sandboxID).Scan(&team); err != nil {
+				t.Fatal(err)
+			}
+			// Only the snapshot can associate this report with the team, and its
+			// first retained interval has not been applied yet.
+			exec(`UPDATE sandbox SET destroyed_at=$2 WHERE id=$1`, f.sandboxID, f.receivedAt.Add(-time.Second))
+			exec(`DELETE FROM sandbox_storage_interval`)
+			id := uuid.New()
+			exec(`INSERT INTO sandbox_snapshot(id,team_id,host_id,status,created_at)
+ SELECT $1,team_id,host_id,'creating',created_at FROM sandbox WHERE id=$2`, id, f.sandboxID)
+			owner := retainedstorage.Owner{Kind: "snapshot", ID: id.String(), Generation: strings.Repeat("a", 64),
+				Extents: []retainedstorage.Extent{{Device: "fs", Start: 8192, Length: 8192}}}
+			measurements := []storageReportMeasurement{{Retained: &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{owner}}}}
+			payload, err := json.Marshal(measurements)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec(`UPDATE host_storage_report SET state='pending',payload=$2,next_measurement_index=0 WHERE report_id=$1`, f.reportID, payload)
+			if legacy {
+				exec(`UPDATE host_storage_report SET state='terminal' WHERE report_id=$1`, f.reportID)
+				exec(`INSERT INTO legacy_host_storage_report VALUES($1,$2)`, f.hostID, f.receivedAt)
+			}
+			complete := func(want bool) {
+				t.Helper()
+				var got bool
+				if err := f.pool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,clock_timestamp()+interval '1 hour')`, team).Scan(&got); err != nil {
+					t.Fatal(err)
+				}
+				if got != want {
+					t.Fatalf("settlement complete=%v, want %v", got, want)
+				}
+			}
+			complete(false)
+			exec(`UPDATE sandbox_snapshot SET status='failed' WHERE id=$1`, id)
+			var boundary time.Time
+			if err := f.pool.QueryRow(ctx, `SELECT retention_ended_at FROM sandbox_snapshot WHERE id=$1`, id).Scan(&boundary); err != nil {
+				t.Fatal(err)
+			}
+			if !boundary.After(f.receivedAt) {
+				t.Fatalf("failure boundary %s must follow receipt %s", boundary, f.receivedAt)
+			}
+			for _, phase := range []string{"failed", "deleting", "deleted"} {
+				if phase == "deleting" {
+					exec(`UPDATE sandbox_snapshot SET status='deleting' WHERE id=$1`, id)
+				} else if phase == "deleted" {
+					exec(`UPDATE sandbox_snapshot SET deleted_at=$2 WHERE id=$1`, id, boundary.Add(time.Minute))
+				}
+				// Compare otherwise identical pending receipts around the retained
+				// lifetime's exclusive end, including during later cleanup.
+				for _, receipt := range []time.Time{f.receivedAt, boundary, boundary.Add(time.Microsecond)} {
+					if legacy {
+						exec(`UPDATE legacy_host_storage_report SET received_at=$1`, receipt)
+					} else {
+						exec(`UPDATE host_storage_report SET received_at=$2 WHERE report_id=$1`, f.reportID, receipt)
+					}
+					complete(!receipt.Before(boundary))
+				}
+			}
+			// Resolving a legacy receipt must preserve the fence until the durable
+			// processor has applied the bounded snapshot interval.
+			exec(`DELETE FROM legacy_host_storage_report`)
+			exec(`UPDATE host_storage_report SET state='processing',received_at=$2 WHERE report_id=$1`, f.reportID, f.receivedAt)
+			complete(false)
+			if err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, f.receivedAt, measurements, 1, 1); err != nil {
+				t.Fatal(err)
+			}
+			var started, ended time.Time
+			if err := f.pool.QueryRow(ctx, `SELECT started_at,ended_at FROM retained_storage_interval WHERE owner_id=$1`, id).Scan(&started, &ended); err != nil {
+				t.Fatal(err)
+			}
+			if !started.Equal(f.receivedAt) || !ended.Equal(boundary) {
+				t.Fatalf("snapshot interval [%s,%s), want [%s,%s)", started, ended, f.receivedAt, boundary)
+			}
+			complete(true)
+		})
+	}
+}
+
 func TestIntegration_RetainedSnapshotOnlySettlementWaitsForReport(t *testing.T) {
 	f := newStorageLeaseFixture(t)
 	ctx := t.Context()
