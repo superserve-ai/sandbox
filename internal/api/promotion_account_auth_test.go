@@ -32,7 +32,7 @@ func TestPromotionAccountAssertions(t *testing.T) {
 	t.Setenv("SANDBOX_ID_REGION", "use")
 	user, otherUser, attempt, team := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	now := time.Now()
-	for _, operation := range []string{"bind", "evidence", "register", "signup-eligibility", "create-team"} {
+	for _, operation := range []string{"bind", "evidence", "register", "signup-eligibility", "create-team", "prepare-team", "recover-team", "complete-team", "discover-team-creations"} {
 		t.Run(operation, func(t *testing.T) {
 			type assertionCase struct {
 				name   string
@@ -93,6 +93,30 @@ func TestPromotionAccountAssertions(t *testing.T) {
 					assertionCase{"changed decision", func(c *promotionAccountClaims, _ *promotionAccountRequest) { *c.AuthorityUnavailable = false }, http.StatusForbidden},
 				)
 			}
+			if operation == "prepare-team" || operation == "recover-team" || operation == "complete-team" || operation == "discover-team-creations" {
+				cases = append(cases,
+					assertionCase{"wrong region", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.HomeRegion = "usw" }, http.StatusForbidden},
+					assertionCase{"missing region", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.HomeRegion = "" }, http.StatusForbidden},
+				)
+				if operation == "discover-team-creations" {
+					cases = append(cases, assertionCase{"changed cursor", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.After = uuid.NewString() }, http.StatusForbidden})
+				} else {
+					cases = append(cases,
+						assertionCase{"missing locator", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.OperationID = "" }, http.StatusForbidden},
+						assertionCase{"changed locator", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.OperationID = uuid.NewString() }, http.StatusForbidden},
+					)
+				}
+				if operation == "prepare-team" || operation == "complete-team" {
+					cases = append(cases,
+						assertionCase{"changed name", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.Name = "other-team" }, http.StatusForbidden},
+						assertionCase{"missing decision", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.AuthorityUnavailable = nil }, http.StatusForbidden},
+						assertionCase{"changed decision", func(c *promotionAccountClaims, _ *promotionAccountRequest) { *c.AuthorityUnavailable = false }, http.StatusForbidden},
+					)
+				}
+				if operation == "complete-team" {
+					cases = append(cases, assertionCase{"changed team", func(c *promotionAccountClaims, _ *promotionAccountRequest) { c.TeamID = uuid.NewString() }, http.StatusForbidden})
+				}
+			}
 			for _, tc := range cases {
 				t.Run(tc.name, func(t *testing.T) {
 					claims := promotionAccountClaims{
@@ -112,6 +136,25 @@ func TestPromotionAccountAssertions(t *testing.T) {
 						unavailable := true
 						claims.TeamID, claims.HomeRegion = team.String(), "use"
 						claims.AuthorityUnavailable = &unavailable
+					}
+					var preparedBody *preparedTeamRequest
+					switch operation {
+					case "prepare-team", "recover-team", "complete-team", "discover-team-creations":
+						claims.HomeRegion = "use"
+						preparedBody = &preparedTeamRequest{HomeRegion: "use"}
+						if operation != "discover-team-creations" {
+							claims.OperationID = attempt.String()
+							preparedBody.OperationID = attempt
+						}
+						if operation == "prepare-team" || operation == "complete-team" {
+							unavailable, bodyUnavailable := true, true
+							claims.Name, claims.AuthorityUnavailable = "example-team", &unavailable
+							preparedBody.Name, preparedBody.AuthorityUnavailable = "example-team", &bodyUnavailable
+						}
+						if operation == "complete-team" {
+							claims.AttemptID, claims.TeamID = attempt.String(), team.String()
+							body.AttemptID, preparedBody.TeamID = attempt, team
+						}
 					}
 					if tc.mutate != nil {
 						tc.mutate(&claims, &body)
@@ -141,6 +184,10 @@ func TestPromotionAccountAssertions(t *testing.T) {
 							AuthorityUnavailable bool      `json:"authority_unavailable"`
 						}{body, team, "example-team", "use", true}
 					}
+					if preparedBody != nil {
+						preparedBody.promotionAccountRequest = body
+						requestBody = preparedBody
+					}
 					payload, err := json.Marshal(requestBody)
 					if err != nil {
 						t.Fatal(err)
@@ -153,6 +200,10 @@ func TestPromotionAccountAssertions(t *testing.T) {
 					account.POST("/register", h.RegisterPromotionSignupDevice)
 					account.POST("/signup-eligibility", h.EvaluateSignupPromotion)
 					account.POST("/create-team", h.CreateTeamWithPromotionAttempt)
+					account.POST("/prepare-team", h.PrepareTeamPromotionCreation)
+					account.POST("/recover-team", h.RecoverTeamPromotionCreation)
+					account.POST("/complete-team", h.CompleteTeamPromotionCreation)
+					account.POST("/discover-team-creations", h.DiscoverTeamPromotionCreations)
 					req := httptest.NewRequest(http.MethodPost, "/internal/promotion/account/"+operation, strings.NewReader(string(payload)))
 					// Matching caller-controlled fields must not override signed identity.
 					req.Header.Set("X-Actor-User-Id", body.UserID.String())

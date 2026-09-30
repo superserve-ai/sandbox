@@ -405,3 +405,187 @@ prove the creation boundary works end to end. Console must also implement and
 verify the creation call sequence and signed fields above, including failure
 with prior evidence and replay after authority recovers. Enforcement stays off
 until that selected region's consumer and backend validation are recorded.
+
+## Durable preparation and recovery of team creation
+
+New consumers use four POST routes under `/internal/promotion/account/`:
+`prepare-team`, `recover-team`, `complete-team`, and `discover-team-creations`.
+All require the existing account bearer token, `X-Actor-User-Id`, and
+`X-Promotion-Account-Assertion`. Sign with Ed25519 using the existing adapter
+key; issuer is `promotion-auth-adapter`, audience is `promotion-account`, subject
+is the verified actor UUID, and `iat`/`exp` must define a positive lifetime of at
+most five minutes. The actor header and body `user_id` must match the subject.
+Do not expose signing or bearer credentials to the browser. The local region
+must match `home_region` (`use` or `usw`, with the existing East fallback).
+
+The browser or trusted caller generates a random nonzero UUID `operation_id`
+**before sending prepare**. It is only an opaque locator, never eligibility or
+actor authority. Retain it in the initiating navigation/form state before
+sending the request; it need not live in a Console database or a response cookie.
+Initial signup creation and each explicit intentional creation get distinct
+locators, even for the same actor/name. Retries reuse the original locator.
+Never allocate a new one automatically because of timeout, restart, or conflict.
+The creation `attempt_id` is distinct from the original Fingerprint attempt.
+
+### Prepare
+
+`POST /internal/promotion/account/prepare-team` accepts exactly:
+
+```json
+{
+  "user_id": "<verified actor UUID>",
+  "operation_id": "<pre-request random UUID>",
+  "name": "example-team",
+  "home_region": "use",
+  "authority_unavailable": true
+}
+```
+
+The signed payload contains the standard claims above plus:
+
+```json
+{
+  "operation": "prepare-team",
+  "operation_id": "<same pre-request random UUID>",
+  "name": "example-team",
+  "home_region": "use",
+  "authority_unavailable": true
+}
+```
+
+The trusted server derives the decision from its registration/authority result
+using the rules in the atomic-creation section above. In particular, failed or
+ambiguous publication signs `true` even with prior accepted regional evidence;
+`false` does not authorize a grant. No new Fingerprint capture is involved.
+Name must be nonblank and at most 256 UTF-8 bytes. Prepare commits a regional
+private attempt row with new backend-generated attempt and team UUIDs, the
+actor, locator, exact name, region, and boolean. It creates no team or credit.
+An exact retry returns that same row; any changed durable binding conflicts.
+
+Prepare, recover, and complete return HTTP 200 with this common shape:
+
+```json
+{
+  "operation_id": "<original locator>",
+  "attempt_id": "<backend creation attempt UUID>",
+  "team_id": "<backend team UUID>",
+  "user_id": "<original actor UUID>",
+  "name": "example-team",
+  "home_region": "use",
+  "authority_unavailable": true,
+  "created_at": "<original database timestamp>",
+  "state": "prepared",
+  "outcome": null,
+  "reason": null
+}
+```
+
+`state` is `prepared` before dispatch, `completed` after committed creation,
+and `deleted` when a completed operation's team no longer exists. Completed and
+deleted responses retain the original `outcome`/`reason`, including `granted`
+where applicable; that is historical evidence, not a new grant. Rows have no
+expiry or deletion cascade. Recovery does not restore a deleted team.
+
+### Recover and dispatch
+
+`POST /internal/promotion/account/recover-team` accepts `user_id`, `operation_id`,
+and `home_region`. Sign `operation=recover-team`, `operation_id`, and
+`home_region` alongside the standard claims. It needs neither the original
+boolean nor any cookie/IDs from the prepare response. After an uncertain
+prepare response or process restart, recover first and use the stored decision.
+If no row exists, retry prepare with the original locator; do not dispatch until
+preparation succeeds. Repeating publication is not needed for a recovered row
+and must never replace its pinned decision.
+
+`POST /internal/promotion/account/complete-team` accepts `user_id`,
+`operation_id`, `attempt_id`, `team_id`, `name`, `home_region`, and
+`authority_unavailable`, exactly as recovered. Sign `operation=complete-team`
+and every listed field except `user_id` (which is bound by `sub`). The existing
+atomic creation RPC consumes the prepared row. All tuple changes conflict,
+including changes made with a freshly signed assertion. On `completed`, continue
+existing membership/owner provisioning with the recovered team ID. On `deleted`,
+report the retained deletion; do not provision or recreate that team.
+
+Prepare and dispatch are separate committed transactions. A failed dispatch
+rolls back its team/grant work but keeps preparation. A lost completion response
+is recovered or retried with the same tuple and renewed short-lived assertion.
+Authentication is renewable; durable identity and the decision are immutable.
+Concurrent calls for one locator share the same row lock and outcome. Distinct
+locators do not coalesce or introduce global actor locks beyond existing grant
+checks. No Stripe calls or sandbox startup/resume work are added.
+
+### Lost-locator discovery
+
+If all initiating state is lost, use
+`POST /internal/promotion/account/discover-team-creations` with `user_id` and
+`home_region`; optionally include `after` with the last response's `next_cursor`.
+Sign `operation=discover-team-creations`, `home_region`, and `after` if supplied.
+Do not send attempt/team IDs, a name, or a decision. Response:
+
+```json
+{
+  "state": "selection_required",
+  "operations": ["<up to 50 objects in the common response shape>"],
+  "next_cursor": "<UUID for the next page, or null>"
+}
+```
+
+Results are indexed by actor, region, and locator and ordered by locator UUID,
+not recency. Always require explicit operation selection; never infer identity
+from name or select the newest record. `selection_required` is returned even
+for zero or one candidate. Concurrent insertions before a pagination cursor may
+require restarting discovery from the first page. Discovery includes completed
+and deleted operations and excludes legacy rows without a locator. It cannot
+recover pre-migration legacy IDs; those callers retain their existing retry
+contract. It never dispatches a team or changes a credit decision.
+
+### Errors, RPC boundary, and rollout
+
+Malformed, unknown-field, or over-4096-byte bodies receive HTTP 400
+`invalid_request`. Missing/wrong bearer credentials receive 401. Invalid,
+expired, mismatched, or wrong-region signed provenance receives 403 `forbidden`.
+A missing locator on recover/complete receives 404 `creation_missing` (an
+operation UUID is still required in the request). A durable binding conflict
+receives 409 `creation_conflict`; the response reveals no stored tuple. An
+unavailable database or retryable transaction failure receives 503
+`authority_unavailable`. Do not interpret that transport error as permission to
+change a persisted boolean. Existing legacy route error semantics are unchanged.
+
+The API invokes these service-role-only security-definer RPCs:
+
+```sql
+prepare_team_promotion_creation(uuid, uuid, text, text, boolean) RETURNS jsonb
+-- operation_id, user_id, name, home_region, authority_unavailable
+recover_team_promotion_creation(uuid, uuid, text) RETURNS jsonb
+-- operation_id, user_id, home_region
+complete_team_promotion_creation(uuid, uuid, uuid, uuid, text, text, boolean) RETURNS jsonb
+-- operation_id, attempt_id, team_id, user_id, name, home_region, authority_unavailable
+discover_team_promotion_creations(uuid, text, uuid) RETURNS jsonb
+-- user_id, home_region, nullable after
+```
+
+RPC access is trusted server authority, not a substitute for the HTTP assertion
+boundary. Direct access to the private attempt table remains revoked for
+`anon`, `authenticated`, and `service_role`. Recover/complete return SQL NULL for
+an unknown locator; binding conflicts use SQLSTATE `23505`. Preparation input
+validation uses `22023`. Discovery returns only the requested actor/region.
+
+Apply `20260930000002_durable_team_creation_recovery.sql` in each regional
+schema before deploying the new API, then adopt the new consumer sequence. No
+shared Auth schema or new secret is required. The migration only adds a nullable
+unique locator, an indexed discovery path, and RPCs. It performs no historical
+reconstruction and changes no policy flags, grants, balances, evidence,
+reservations, Checkout generations, or old RPC signatures. Old API instances can
+still complete an exact prepared tuple through the existing creation RPC; new
+recovery reads its original result. New consumers must not silently fall back
+to allocating a legacy attempt when these routes are unavailable.
+
+The focused coverage is `TestPromotionAccountAssertions`,
+`TestIntegration_DurableTeamCreationRecovery`,
+`TestIntegration_DurableTeamCreationConcurrency`, and
+`TestIntegration_DurableTeamCreationRollbackAndPrivileges`, together with the
+existing trusted-attempt and promotion integration suites. Validation and an
+exact published backend revision must be recorded at release handoff before
+consumer adoption; this contract does not claim those tests ran or certify
+consumer readiness. Enforcement remains off. Checkout publication-failure
+fencing is a separate contract and is not supplied by these routes.

@@ -10,13 +10,16 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/api"
 )
 
@@ -293,5 +296,345 @@ func TestIntegration_TrustedTeamPromotionAttemptPrivilegesAndGrantFailure(t *tes
 	var outcome, reason string
 	if err := region.QueryRow(t.Context(), `SELECT * FROM create_team_with_promotion_attempt($1,$2,$3,$4,'use',false)`, attempt, team, user, "example-team-"+team.String()).Scan(&resultTeam, &outcome, &reason); err != nil || resultTeam != team || outcome != "granted" {
 		t.Fatalf("grant retry: %s/%s %v", outcome, reason, err)
+	}
+}
+
+func TestIntegration_DurableTeamCreationRecovery(t *testing.T) {
+	region := promotionIsolatedDatabase(t, true)
+	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
+	t.Setenv("PROMOTION_CAPTURE_TOKEN", "capture-example-token")
+	t.Setenv("PROMOTION_ACCOUNT_TOKEN", "account-example-token")
+	t.Setenv("INTERNAL_API_TOKEN", "internal-example-token")
+	t.Setenv("SANDBOX_ID_REGION", "use")
+	sign := promotionAssertionSigner(t)
+	user, otherUser := uuid.New(), uuid.New()
+	for _, actor := range []uuid.UUID{user, otherUser} {
+		rolloutExec(t, region, `INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com")
+		rolloutExec(t, region, `SELECT register_promotion_signup_device($1,$2,$3,$4)`, actor, uuid.New(), "event-"+uuid.NewString(), "visitor-"+uuid.NewString())
+	}
+	var previousPool *pgxpool.Pool
+	t.Cleanup(func() {
+		if previousPool != nil {
+			previousPool.Close()
+		}
+	})
+	newRouter := func() http.Handler {
+		// Discard the previous connection lifetime along with its handlers.
+		if previousPool != nil {
+			previousPool.Close()
+		}
+		pool, err := pgxpool.NewWithConfig(t.Context(), region.Config().Copy())
+		if err != nil {
+			t.Fatal(err)
+		}
+		previousPool = pool
+		return api.SetupRouter(t.Context(), &api.Handlers{Pool: pool}, nil)
+	}
+	request := func(router http.Handler, operation string, actor uuid.UUID, body map[string]any, status int) map[string]any {
+		t.Helper()
+		body["user_id"] = actor
+		payload, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/internal/promotion/account/"+operation, strings.NewReader(string(payload)))
+		req.Header.Set("Authorization", "Bearer account-example-token")
+		req.Header.Set("X-Actor-User-Id", actor.String())
+		req.Header.Set("X-Promotion-Account-Assertion", sign(operation, actor, body))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != status {
+			t.Fatalf("%s: %d %s", operation, w.Code, w.Body.String())
+		}
+		var result map[string]any
+		if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	locator := uuid.New()
+	prepare := map[string]any{"operation_id": locator, "name": "example-team", "home_region": "use", "authority_unavailable": true}
+	recoverBody := map[string]any{"operation_id": locator, "home_region": "use"}
+	request(newRouter(), "recover-team", user, recoverBody, http.StatusNotFound)
+	// Discard the preparation response completely; the locator predates dispatch.
+	request(newRouter(), "prepare-team", user, prepare, http.StatusOK)
+	recovered := request(newRouter(), "recover-team", user, recoverBody, http.StatusOK)
+	if recovered["state"] != "prepared" || recovered["authority_unavailable"] != true || recovered["name"] != "example-team" {
+		t.Fatalf("recovered: %v", recovered)
+	}
+	replayed := request(newRouter(), "prepare-team", user, prepare, http.StatusOK)
+	if !reflect.DeepEqual(recovered, replayed) {
+		t.Fatalf("prepare replay changed: %v / %v", recovered, replayed)
+	}
+	var teams, credits int
+	if err := region.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM team WHERE id=$1),
+        (SELECT count(*) FROM team_credit_grant WHERE team_id=$1)`, recovered["team_id"]).Scan(&teams, &credits); err != nil || teams != 0 || credits != 0 {
+		t.Fatalf("prepare dispatched value: teams=%d credits=%d err=%v", teams, credits, err)
+	}
+	request(newRouter(), "recover-team", otherUser, recoverBody, http.StatusConflict)
+	request(newRouter(), "prepare-team", otherUser, prepare, http.StatusConflict)
+	for _, field := range []string{"name", "authority_unavailable"} {
+		original := prepare[field]
+		if field == "name" {
+			prepare[field] = "changed-team"
+		} else {
+			prepare[field] = false
+		}
+		request(newRouter(), "prepare-team", user, prepare, http.StatusConflict)
+		prepare[field] = original
+	}
+	recoverBody["home_region"] = "usw"
+	request(newRouter(), "recover-team", user, recoverBody, http.StatusForbidden)
+	// A correctly signed request at another local region still cannot adopt the row.
+	t.Setenv("SANDBOX_ID_REGION", "usw")
+	request(newRouter(), "recover-team", user, recoverBody, http.StatusConflict)
+	t.Setenv("SANDBOX_ID_REGION", "use")
+	recoverBody["home_region"] = "use"
+	complete := map[string]any{}
+	for _, field := range []string{"operation_id", "attempt_id", "team_id", "name", "home_region", "authority_unavailable"} {
+		complete[field] = recovered[field]
+	}
+	for _, field := range []string{"attempt_id", "team_id", "name", "authority_unavailable"} {
+		original := complete[field]
+		switch field {
+		case "name":
+			complete[field] = "changed-team"
+		case "authority_unavailable":
+			complete[field] = false
+		default:
+			complete[field] = uuid.New()
+		}
+		request(newRouter(), "complete-team", user, complete, http.StatusConflict)
+		complete[field] = original
+	}
+	request(newRouter(), "complete-team", otherUser, complete, http.StatusConflict)
+	// Previously accepted evidence is present, and publication has recovered.
+	rolloutExec(t, region, `SELECT register_promotion_signup_device($1,source_attempt_id,source_event_id,fingerprint)
+        FROM promotion_signup_device_evidence WHERE user_id=$1`, user)
+	request(newRouter(), "complete-team", user, complete, http.StatusOK) // lose committed response
+	completed := request(newRouter(), "recover-team", user, recoverBody, http.StatusOK)
+	if completed["state"] != "completed" || completed["outcome"] != "promotion_ineligible" || completed["reason"] != "authority_unavailable" {
+		t.Fatalf("completed: %v", completed)
+	}
+	if got := request(newRouter(), "complete-team", user, complete, http.StatusOK); !reflect.DeepEqual(got, completed) {
+		t.Fatalf("completion replay: %v", got)
+	}
+	if err := region.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM team WHERE id=$1),
+        (SELECT count(*) FROM team_credit_grant WHERE team_id=$1)`, recovered["team_id"]).Scan(&teams, &credits); err != nil || teams != 1 || credits != 0 {
+		t.Fatalf("no-credit creation: teams=%d credits=%d err=%v", teams, credits, err)
+	}
+	// No locator or cookie is needed to discover candidates; selection is explicit.
+	list := request(newRouter(), "discover-team-creations", user, map[string]any{"home_region": "use"}, http.StatusOK)
+	if list["state"] != "selection_required" || len(list["operations"].([]any)) != 1 || list["operations"].([]any)[0].(map[string]any)["operation_id"] != locator.String() {
+		t.Fatalf("discovery: %v", list)
+	}
+	list = request(newRouter(), "discover-team-creations", otherUser, map[string]any{"home_region": "use"}, http.StatusOK)
+	if len(list["operations"].([]any)) != 0 {
+		t.Fatalf("cross-actor discovery: %v", list)
+	}
+	rolloutExec(t, region, `DELETE FROM team WHERE id=$1`, recovered["team_id"])
+	rolloutExec(t, region, `DELETE FROM profile WHERE id=$1`, user)
+	deleted := request(newRouter(), "complete-team", user, complete, http.StatusOK)
+	if deleted["state"] != "deleted" || deleted["outcome"] != completed["outcome"] || deleted["team_id"] != recovered["team_id"] {
+		t.Fatalf("deleted replay: %v", deleted)
+	}
+	if err := region.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM team WHERE id=$1),
+        (SELECT count(*) FROM team_credit_grant WHERE team_id=$1)`, recovered["team_id"]).Scan(&teams, &credits); err != nil || teams != 0 || credits != 0 {
+		t.Fatalf("deletion recreated value: %d/%d %v", teams, credits, err)
+	}
+}
+
+func TestIntegration_DurableTeamCreationConcurrency(t *testing.T) {
+	region := promotionIsolatedDatabase(t, true)
+	rolloutExec(t, region, `SELECT set_promotion_device_policy(true,true)`)
+	user := uuid.New()
+	rolloutExec(t, region, `INSERT INTO profile(id,email) VALUES($1,$2)`, user, user.String()+"@example.com")
+	rolloutExec(t, region, `SELECT register_promotion_signup_device($1,$2,$3,$4)`, user, uuid.New(), "event-"+uuid.NewString(), "visitor-"+uuid.NewString())
+	type operation struct {
+		OperationID uuid.UUID `json:"operation_id"`
+		AttemptID   uuid.UUID `json:"attempt_id"`
+		TeamID      uuid.UUID `json:"team_id"`
+		State       string    `json:"state"`
+		Outcome     string    `json:"outcome"`
+	}
+	locators := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+	results := make([]operation, 9)
+	errs := make([]error, len(results))
+	var wg sync.WaitGroup
+	for i := range results {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			var raw []byte
+			errs[i] = region.QueryRow(t.Context(), `SELECT prepare_team_promotion_creation($1,$2,'example-team','use',false)`, locators[i%3], user).Scan(&raw)
+			if errs[i] == nil {
+				errs[i] = json.Unmarshal(raw, &results[i])
+			}
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil || results[i].State != "prepared" || results[i].AttemptID == uuid.Nil || results[i].TeamID == uuid.Nil {
+			t.Fatalf("prepare %d: %+v %v", i, results[i], err)
+		}
+		if results[i] != results[i%3] {
+			t.Fatalf("duplicate prepare changed: %+v / %+v", results[i], results[i%3])
+		}
+	}
+	if results[0].TeamID == results[1].TeamID || results[1].TeamID == results[2].TeamID || results[0].TeamID == results[2].TeamID {
+		t.Fatal("distinct same-name operations coalesced")
+	}
+	// Concurrent retries for one operation must dispatch value only once.
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			op := results[0]
+			_, errs[i] = region.Exec(t.Context(), `SELECT complete_team_promotion_creation($1,$2,$3,$4,'example-team','use',false)`, op.OperationID, op.AttemptID, op.TeamID, user)
+		}(i)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, op := range results[1:3] {
+		_, err := region.Exec(t.Context(), `SELECT complete_team_promotion_creation($1,$2,$3,$4,'example-team','use',false)`, op.OperationID, op.AttemptID, op.TeamID, user)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23505" || pgErr.ConstraintName != "team_name_key" {
+			t.Fatalf("expected team name conflict: %v", err)
+		}
+		var raw []byte
+		if err := region.QueryRow(t.Context(), `SELECT recover_team_promotion_creation($1,$2,'use')`, op.OperationID, user).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var recovered operation
+		if err := json.Unmarshal(raw, &recovered); err != nil || recovered != op {
+			t.Fatalf("name conflict changed prepared operation: %+v / %+v %v", recovered, op, err)
+		}
+		// Free the unique team name without changing the prepared operation's tuple.
+		rolloutExec(t, region, `UPDATE team SET name=$2 WHERE id=$1`, results[i].TeamID, "example-team-"+results[i].TeamID.String())
+		rolloutExec(t, region, `SELECT complete_team_promotion_creation($1,$2,$3,$4,'example-team','use',false)`, op.OperationID, op.AttemptID, op.TeamID, user)
+	}
+	var attempts, teams, credits, devices, consumption int
+	err := region.QueryRow(t.Context(), `SELECT
+        (SELECT count(*) FROM team_promotion_creation_attempt WHERE user_id=$1),
+        (SELECT count(*) FROM team WHERE id IN (SELECT team_id FROM team_promotion_creation_attempt WHERE user_id=$1)),
+        (SELECT count(*) FROM team_credit_grant WHERE created_by=$1),
+        (SELECT count(*) FROM promotion_device_grant WHERE user_id=$1),
+        (SELECT count(*) FROM user_promotion_entitlement WHERE user_id=$1 AND signup_trial_claimed_at IS NOT NULL)`, user).
+		Scan(&attempts, &teams, &credits, &devices, &consumption)
+	if err != nil || attempts != 3 || teams != 3 || credits != 1 || devices != 1 || consumption != 1 {
+		t.Fatalf("conservation: %d/%d/%d/%d/%d %v", attempts, teams, credits, devices, consumption, err)
+	}
+	op := results[0]
+	rolloutExec(t, region, `DELETE FROM team_credit_grant WHERE team_id=$1`, op.TeamID)
+	rolloutExec(t, region, `DELETE FROM team WHERE id=$1`, op.TeamID)
+	var raw []byte
+	if err := region.QueryRow(t.Context(), `SELECT complete_team_promotion_creation($1,$2,$3,$4,'example-team','use',false)`, op.OperationID, op.AttemptID, op.TeamID, user).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var deleted operation
+	if err := json.Unmarshal(raw, &deleted); err != nil || deleted.State != "deleted" || deleted.Outcome != "granted" {
+		t.Fatalf("granted tombstone: %+v %v", deleted, err)
+	}
+	if err := region.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM team WHERE id=$1),
+        (SELECT count(*) FROM team_credit_grant WHERE team_id=$1)`, op.TeamID).Scan(&teams, &credits); err != nil || teams != 0 || credits != 0 {
+		t.Fatalf("granted replay recreated value: %d/%d %v", teams, credits, err)
+	}
+}
+
+func TestIntegration_DurableTeamCreationRollbackAndPrivileges(t *testing.T) {
+	region := promotionIsolatedDatabase(t, true)
+	for _, role := range []string{"anon", "authenticated", "service_role"} {
+		for _, function := range []string{
+			"prepare_team_promotion_creation(uuid,uuid,text,text,boolean)",
+			"recover_team_promotion_creation(uuid,uuid,text)",
+			"complete_team_promotion_creation(uuid,uuid,uuid,uuid,text,text,boolean)",
+			"discover_team_promotion_creations(uuid,text,uuid)",
+		} {
+			var execute, tableAccess bool
+			err := region.QueryRow(t.Context(), `SELECT has_function_privilege($1,$2,'EXECUTE'),
+                has_table_privilege($1,'team_promotion_creation_attempt','SELECT,INSERT,UPDATE,DELETE,TRUNCATE')`, role, function).Scan(&execute, &tableAccess)
+			if err != nil || execute != (role == "service_role") || tableAccess {
+				t.Fatalf("privileges %s %s: %t/%t %v", role, function, execute, tableAccess, err)
+			}
+		}
+	}
+	user, locator := uuid.New(), uuid.New()
+	rolloutExec(t, region, `INSERT INTO profile(id,email) VALUES($1,$2)`, user, user.String()+"@example.com")
+	rolloutExec(t, region, `SELECT register_promotion_signup_device($1,$2,$3,$4)`, user, uuid.New(), "event-"+uuid.NewString(), "visitor-"+uuid.NewString())
+	var raw []byte
+	if err := region.QueryRow(t.Context(), `SELECT prepare_team_promotion_creation($1,$2,'example-team','use',false)`, locator, user).Scan(&raw); err != nil {
+		t.Fatal(err)
+	}
+	var prepared struct {
+		AttemptID uuid.UUID `json:"attempt_id"`
+		TeamID    uuid.UUID `json:"team_id"`
+	}
+	if err := json.Unmarshal(raw, &prepared); err != nil {
+		t.Fatal(err)
+	}
+	rolloutExec(t, region, `CREATE FUNCTION fail_prepared_credit_grant() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'test grant contention' USING ERRCODE='55P03'; END $$;
+        CREATE TRIGGER fail_prepared_credit_grant BEFORE INSERT ON team_credit_grant FOR EACH ROW EXECUTE FUNCTION fail_prepared_credit_grant()`)
+	_, err := region.Exec(t.Context(), `SELECT complete_team_promotion_creation($1,$2,$3,$4,'example-team','use',false)`, locator, prepared.AttemptID, prepared.TeamID, user)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("expected grant failure: %v", err)
+	}
+	var attempts, teams int
+	if err := region.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM team_promotion_creation_attempt WHERE operation_id=$1 AND outcome IS NULL),
+        (SELECT count(*) FROM team WHERE id=$2)`, locator, prepared.TeamID).Scan(&attempts, &teams); err != nil || attempts != 1 || teams != 0 {
+		t.Fatalf("prepare lost on rollback: %d/%d %v", attempts, teams, err)
+	}
+	rolloutExec(t, region, `DROP TRIGGER fail_prepared_credit_grant ON team_credit_grant`)
+	// An old API process can safely dispatch an already prepared tuple.
+	var team uuid.UUID
+	var outcome, reason string
+	if err := region.QueryRow(t.Context(), `SELECT * FROM create_team_with_promotion_attempt($1,$2,$3,'example-team','use',false)`, prepared.AttemptID, prepared.TeamID, user).Scan(&team, &outcome, &reason); err != nil || team != prepared.TeamID || outcome != "granted" {
+		t.Fatalf("legacy dispatch: %s/%s %v", outcome, reason, err)
+	}
+	if err := region.QueryRow(t.Context(), `SELECT recover_team_promotion_creation($1,$2,'use')->>'outcome'`, locator, user).Scan(&outcome); err != nil || outcome != "granted" {
+		t.Fatalf("legacy result recovery: %s %v", outcome, err)
+	}
+	// Discovery is bounded and cursor-based even if all names are identical.
+	rolloutExec(t, region, `SELECT prepare_team_promotion_creation(gen_random_uuid(),$1,'example-team','use',true) FROM generate_series(1,54)`, user)
+	seen := map[string]bool{}
+	var cursor any
+	for page := 0; page < 2; page++ {
+		if err := region.QueryRow(t.Context(), `SELECT discover_team_promotion_creations($1,'use',$2)`, user, cursor).Scan(&raw); err != nil {
+			t.Fatal(err)
+		}
+		var result struct {
+			State      string `json:"state"`
+			Operations []struct {
+				ID string `json:"operation_id"`
+			} `json:"operations"`
+			Next *string `json:"next_cursor"`
+		}
+		if err := json.Unmarshal(raw, &result); err != nil {
+			t.Fatal(err)
+		}
+		want := 50
+		if page == 1 {
+			want = 5
+		}
+		if result.State != "selection_required" || len(result.Operations) != want || (result.Next == nil) != (page == 1) {
+			t.Fatalf("page %d: %+v", page, result)
+		}
+		for _, op := range result.Operations {
+			if seen[op.ID] {
+				t.Fatalf("duplicate page entry: %s", op.ID)
+			}
+			seen[op.ID] = true
+		}
+		if result.Next != nil {
+			cursor = *result.Next
+		}
+	}
+	if len(seen) != 55 {
+		t.Fatalf("discovered %d operations", len(seen))
 	}
 }
