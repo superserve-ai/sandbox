@@ -3430,7 +3430,11 @@ WHERE team_id = $1 AND stripe_customer_id = $2 AND stripe_grant_id IS NULL`, acc
 			}
 			return wrapStripePromotionReservationError(processErr, promotionReservationAttempted, account.TeamID, uuid.UUID(activationUser.Bytes))
 		}
-		if account.CheckoutCompletedAt.Valid && account.CheckoutSubscriptionID == nil {
+		// Completion alone does not prove that this lifecycle belongs to the
+		// open generation: the account may still project a different, older
+		// subscription. Require the signed Checkout generation before promoting
+		// this callback into the durable association.
+		if account.CheckoutCompletedAt.Valid && account.CheckoutSubscriptionID == nil && canAssociateStripeSubscription(account, obj) {
 			if err := q.AssociateCompletedTeamBillingCheckoutSubscription(ctx, db.AssociateCompletedTeamBillingCheckoutSubscriptionParams{TeamID: account.TeamID, SubscriptionID: stringPtr(obj.ID)}); err != nil {
 				return wrapPromotionReservationErr(err)
 			}

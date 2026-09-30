@@ -71,6 +71,13 @@ func lockSourcePromotionMigration(ctx context.Context, tx pgx.Tx, teamID uuid.UU
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext('stripe-promo-team:' || $1::uuid::text)::bigint)`, teamID); err != nil {
 		return fmt.Errorf("lock source promotion team: %w", err)
 	}
+	// Checkout begin, webhook projection, and the retention trigger all
+	// serialize through the billing-account row. Hold it for the copy
+	// transaction so the account and its immutable generation facts are a
+	// consistent snapshot before destination ownership becomes reachable.
+	if _, err := tx.Exec(ctx, `SELECT team_id FROM team_billing_account WHERE team_id = $1 FOR UPDATE`, teamID); err != nil {
+		return fmt.Errorf("lock source billing account: %w", err)
+	}
 	var currentActors []uuid.UUID
 	if err := tx.QueryRow(ctx, actorSQL, teamID).Scan(&currentActors); err != nil {
 		return fmt.Errorf("recheck source promotion actors: %w", err)

@@ -158,9 +158,17 @@ func TestIntegration_BillingCheckoutPublicationFailurePaidActivation(t *testing.
 		*account.StripeCustomerID, "sub_older_"+f.team.String(), "open", now))
 	var invoiceBound bool
 	if err := testPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stripe_checkout_publication_subscription
-        WHERE team_id=$1)`, f.team).Scan(&invoiceBound); err != nil || invoiceBound {
-		t.Fatalf("invoice customer match bound a generation: %t %v", invoiceBound, err)
+		WHERE team_id=$1 AND subscription_id=$2)`, f.team, "sub_older_"+f.team.String()).Scan(&invoiceBound); err != nil || !invoiceBound {
+		t.Fatalf("invoice subscription transition did not retain the failed generation: %t %v", invoiceBound, err)
 	}
+	// The invoice can establish the subscription projection before its
+	// lifecycle callback. That callback may omit Checkout metadata, but the
+	// first subscription-ID transition must already retain the failed
+	// generation's no-credit decision before reservation.
+	invoiceSubscription := "sub_older_" + f.team.String()
+	activeWithoutGeneration := stripeSubscriptionWebhookPayloadWithMetadata(t, "evt_invoice_active_"+f.team.String(), "customer.subscription.updated", invoiceSubscription,
+		*account.StripeCustomerID, "active", now, now, now.AddDate(0, 1, 0), map[string]string{"activation_user_id": f.actor.String()})
+	send(activeWithoutGeneration)
 	// An update can precede both creation and Checkout completion callbacks.
 	active := stripeSubscriptionWebhookPayloadWithMetadata(t, "evt_paid_"+f.team.String(), "customer.subscription.updated", subscription,
 		*account.StripeCustomerID, "active", now, now, now.AddDate(0, 1, 0), metadata)

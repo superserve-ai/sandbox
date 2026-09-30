@@ -23,6 +23,7 @@ const profileScope = `id IN (
 	UNION SELECT assigned_by FROM team_pricing_plan WHERE team_id = $1 AND assigned_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_grant WHERE team_id = $1 AND created_by IS NOT NULL
 	UNION SELECT created_by FROM team_credit_ledger WHERE team_id = $1 AND created_by IS NOT NULL
+	UNION SELECT user_id FROM stripe_checkout_publication_decision WHERE team_id = $1
 )`
 
 // sandboxScope covers tables keyed by sandbox_id without a team_id column.
@@ -75,6 +76,12 @@ var migratedTables = []tableSpec{
 	{"team", "id = $1"},
 	{"team_feature_flag", "team_id = $1"},
 	{"team_billing_account", "team_id = $1"},
+	// Checkout publication decisions and subscription associations are
+	// immutable financial authority. They must move with the account before
+	// destination ownership is published; otherwise a later webhook can treat
+	// a paid-only generation as legacy and issue credit.
+	{"stripe_checkout_publication_decision", "team_id = $1"},
+	{"stripe_checkout_publication_subscription", "team_id = $1"},
 	// The cutoff is the authoritative, immutable activation boundary. It must
 	// move with the team so a cell migration cannot silently re-enable storage
 	// at a later timestamp.

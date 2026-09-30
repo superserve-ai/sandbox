@@ -103,11 +103,14 @@ BEGIN
         SELECT 1 FROM stripe_checkout_publication_decision
         WHERE team_id=NEW.team_id AND checkout_generation=NEW.checkout_initializing_at) THEN RETURN NEW; END IF;
     v_subscription := NEW.checkout_subscription_id;
-    -- Invoice projections can carry an older subscription ID. Only an accepted
-    -- lifecycle projection or explicit Checkout association binds this decision.
-    IF v_subscription IS NULL AND NEW.stripe_subscription_event_at IS NOT NULL
-       AND (TG_OP='INSERT' OR NEW.stripe_subscription_event_at IS DISTINCT FROM OLD.stripe_subscription_event_at
-            OR NEW.stripe_subscription_status IS DISTINCT FROM OLD.stripe_subscription_status) THEN
+    -- A lifecycle watermark is not ownership proof: after a terminal
+    -- subscription, the same account can open a replacement Checkout while
+    -- Stripe continues delivering updates for the old subscription. Bind an
+    -- unannotated event only when this write establishes a new subscription
+    -- ID on the account (the invoice-first case); later status/timestamp
+    -- updates must use the retained association or explicit Checkout proof.
+    IF v_subscription IS NULL AND NEW.stripe_subscription_id IS NOT NULL
+       AND (TG_OP='INSERT' OR OLD.stripe_subscription_id IS DISTINCT FROM NEW.stripe_subscription_id) THEN
         v_subscription := NEW.stripe_subscription_id;
     END IF;
     IF v_subscription IS NOT NULL THEN
@@ -149,6 +152,10 @@ BEGIN
         WHERE d.team_id=p_team_id
           AND d.checkout_generation IN (
               SELECT p_checkout_generation WHERE p_has_checkout_generation
+              -- A subscription ID alone is not generation authority: the
+              -- mutable account projection may still name a prior
+              -- subscription while a replacement Checkout is open. Only the
+              -- append-only association can identify that generation.
               UNION ALL
               SELECT s.checkout_generation FROM stripe_checkout_publication_subscription s
                   WHERE s.team_id=p_team_id AND s.subscription_id=p_subscription_id
