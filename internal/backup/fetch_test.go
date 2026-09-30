@@ -147,7 +147,7 @@ func TestFetchGenerationOverlayWithBaseThroughLimiter(t *testing.T) {
 	if err := os.Remove(got.BlockMap); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RestoredDisk(dest); err == nil {
+	if _, err := RestoredDisk(context.Background(), dest); err == nil {
 		t.Fatal("a restore missing its block map must not pass as complete")
 	}
 }
@@ -240,5 +240,104 @@ func TestCacheTemporariesAreSweptAndCounted(t *testing.T) {
 	}
 	if _, err := os.Stat(spool); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("the stale temporary must be the first to go")
+	}
+}
+
+// A base rebuilt in place keeps its path, its size and its recorded
+// digest, and holds different bytes. Trusting the path would boot the
+// overlay over the wrong filesystem, so the object must be fetched.
+func TestFetchGenerationRefusesAHostBaseWhoseContentChanged(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		spoil func(*testing.T, string)
+	}{
+		{
+			name: "rebuilt in place",
+			spoil: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, bytes.Repeat([]byte{0x22}, 128<<10), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "left short by an interrupted fetch",
+			spoil: func(t *testing.T, path string) {
+				if err := os.Truncate(path, 64<<10); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newMemBlobs()
+			dir := t.TempDir()
+			baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+			basePath := filepath.Join(dir, "base.ext4")
+			if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			task := writePauseFixture(t, dir, "pause A")
+			task.Files[0].BasePath = basePath
+			task.Files[0].BaseSHA256 = digestOf(baseData)
+			task.Generation = GenerationKey(task.Files)
+			uploadFixture(t, store, task)
+
+			tc.spoil(t, basePath)
+
+			counter := &countingReader{inner: store}
+			dest := filepath.Join(t.TempDir(), task.SandboxID)
+			got, err := FetchGeneration(context.Background(), counter, task.SandboxID, task.Generation, dest, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Base == basePath {
+				t.Fatal("restore honoured the host base although its contents no longer match")
+			}
+			fetched := false
+			for object := range counter.reads {
+				if strings.HasPrefix(object, "bases/") {
+					fetched = true
+				}
+			}
+			if !fetched {
+				t.Fatal("the base was neither trusted nor downloaded")
+			}
+			restored, err := os.ReadFile(got.Base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(restored, baseData) {
+				t.Fatal("the downloaded base does not hold the bytes the pause recorded")
+			}
+		})
+	}
+}
+
+// The reuse fast path reads a completed restore back. A host base that
+// changed since must not be handed to the boot as if it still matched.
+func TestRestoredDiskRejectsAHostBaseWhoseContentChanged(t *testing.T) {
+	store := newMemBlobs()
+	dir := t.TempDir()
+	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+	basePath := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writePauseFixture(t, dir, "pause A")
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+
+	dest := filepath.Join(t.TempDir(), task.SandboxID)
+	if _, err := FetchGeneration(context.Background(), store, task.SandboxID, task.Generation, dest, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The restore left the base on the host, so the marker points at it.
+	if err := os.WriteFile(basePath, bytes.Repeat([]byte{0x22}, 128<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := RestoredDisk(context.Background(), dest); err == nil {
+		t.Fatalf("base = %s, want a refusal so the caller restores again", got.Base)
 	}
 }

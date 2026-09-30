@@ -229,7 +229,7 @@ func runMigrate(args []string) int {
 		if skip[id] {
 			continue
 		}
-		if _, err := restoredDisk(*root, id); err != nil {
+		if _, err := restoredDisk(ctx, *root, id); err != nil {
 			notRestored++
 			continue
 		}
@@ -766,7 +766,7 @@ func runMigrate(args []string) int {
 
 			handed := 0
 			for id, s := range shapes {
-				rd, err := restoredDisk(*root, id)
+				rd, err := restoredDisk(ctx, *root, id)
 				if err == nil && (len(s.recorded) == 0 || s.snapshotID == nil) {
 					mu.Lock()
 					unanchored++
@@ -984,8 +984,8 @@ type restored struct {
 	manifest   backup.GenerationManifest
 }
 
-func restoredDisk(root, id string) (restored, error) {
-	r, err := backup.RestoredDisk(filepath.Join(root, id))
+func restoredDisk(ctx context.Context, root, id string) (restored, error) {
+	r, err := backup.RestoredDisk(ctx, filepath.Join(root, id))
 	if err != nil {
 		return restored{}, err
 	}

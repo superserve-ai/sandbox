@@ -720,12 +720,18 @@ func verifyFile(ctx context.Context, root *os.Root, mf ManifestFile) error {
 	if apparent != mf.Size {
 		return fmt.Errorf("apparent size %d, manifest records %d", apparent, mf.Size)
 	}
+	return verifyDigest(ctx, f, extents, apparent, mf.SHA256)
+}
+
+// verifyDigest hashes a file's apparent content and compares it with the
+// digest recorded for those bytes.
+func verifyDigest(ctx context.Context, f *os.File, extents []Extent, apparent int64, sha string) error {
 	sum, err := hashApparent(ctx, f, extents, apparent)
 	if err != nil {
 		return err
 	}
-	if sum != mf.SHA256 {
-		return fmt.Errorf("sha256 mismatch: got %s, manifest records %s", sum, mf.SHA256)
+	if sum != sha {
+		return fmt.Errorf("sha256 mismatch: got %s, manifest records %s", sum, sha)
 	}
 	return nil
 }

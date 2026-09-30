@@ -30,8 +30,10 @@ type Restored struct {
 }
 
 // RestoredDisk reads the completion marker in dir and resolves the rootfs
-// and, for an overlay, the shared base beside it.
-func RestoredDisk(dir string) (Restored, error) {
+// and, for an overlay, the shared base beside it or on the host. Reading
+// the marker is cheap; honouring a host-held base is not, because its
+// contents are hashed, which is what ctx bounds.
+func RestoredDisk(ctx context.Context, dir string) (Restored, error) {
 	var r Restored
 	raw, err := os.ReadFile(filepath.Join(dir, ManifestObject))
 	if err != nil {
@@ -69,7 +71,7 @@ func RestoredDisk(dir string) (Restored, error) {
 		if _, err := os.Stat(r.Base); err == nil {
 			return r, nil
 		}
-		if r.Base = hostBaseFor(f); r.Base != "" {
+		if r.Base = hostBaseFor(ctx, f); r.Base != "" {
 			return r, nil
 		}
 		return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
@@ -86,7 +88,7 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 	if generation == "" {
 		return Restored{}, ErrNoMatchingBackup
 	}
-	if done, err := RestoredDisk(destDir); err == nil && done.Manifest.Generation == generation && manifestOwner(done.Manifest) == owner {
+	if done, err := RestoredDisk(ctx, destDir); err == nil && done.Manifest.Generation == generation && manifestOwner(done.Manifest) == owner {
 		return done, nil
 	}
 	if err := os.RemoveAll(destDir); err != nil {
@@ -99,29 +101,68 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 		}
 		return Restored{}, err
 	}
-	skip := func(mf ManifestFile) bool { return isSharedEntry(mf) && hostHoldsBase(m, mf.SHA256) }
+	// Honouring a host-held base hashes it, so the verdict is remembered
+	// for this restore: the restore loop and the verification loop each
+	// consult skip once per file.
+	held := map[string]bool{}
+	skip := func(mf ManifestFile) bool {
+		if !isSharedEntry(mf) {
+			return false
+		}
+		ok, seen := held[mf.SHA256]
+		if !seen {
+			ok = hostHoldsBase(ctx, m, mf.SHA256)
+			held[mf.SHA256] = ok
+		}
+		return ok
+	}
 	if _, err := restoreGeneration(ctx, r, owner, generation, destDir, skip, progress); err != nil {
 		return Restored{}, err
 	}
-	return RestoredDisk(destDir)
+	return RestoredDisk(ctx, destDir)
 }
 
 // hostBaseFor is the template base an overlay was paused over, when the
-// host still has it. Build directories are immutable and named by build,
-// so the recorded path identifies the content.
-func hostBaseFor(f ManifestFile) string {
-	if f.BasePath == "" {
+// host still holds exactly those bytes. The recorded path alone does not
+// establish that: a template rebuilt in place, or a base left short by an
+// interrupted fetch, occupies the same path with different contents, and
+// booting the overlay over it serves the wrong filesystem. So the file is
+// hashed against the digest the pause recorded, and a file that does not
+// match is no base at all — the caller then fetches the object, which is
+// the work the match was going to save. Hashing costs what the fetched
+// base costs anyway: every restored file, this base included, is hashed
+// by verifyFile before the restore is called complete.
+func hostBaseFor(ctx context.Context, f ManifestFile) string {
+	if f.BasePath == "" || f.BaseSHA256 == "" {
 		return ""
 	}
 	if info, err := os.Stat(f.BasePath); err != nil || !info.Mode().IsRegular() {
 		return ""
 	}
+	if err := verifyPath(ctx, f.BasePath, f.BaseSHA256); err != nil {
+		return ""
+	}
 	return f.BasePath
 }
 
-func hostHoldsBase(m *GenerationManifest, sha string) bool {
+// verifyPath hashes the file at path, which lives outside any restore
+// destination, against the digest recorded for its contents.
+func verifyPath(ctx context.Context, path, sha string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	extents, apparent, err := Extents(f)
+	if err != nil {
+		return fmt.Errorf("extents: %w", err)
+	}
+	return verifyDigest(ctx, f, extents, apparent, sha)
+}
+
+func hostHoldsBase(ctx context.Context, m *GenerationManifest, sha string) bool {
 	for _, f := range m.Files {
-		if f.BaseSHA256 == sha && hostBaseFor(f) != "" {
+		if f.BaseSHA256 == sha && hostBaseFor(ctx, f) != "" {
 			return true
 		}
 	}
