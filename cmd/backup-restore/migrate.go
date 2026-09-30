@@ -229,7 +229,11 @@ func runMigrate(args []string) int {
 		if skip[id] {
 			continue
 		}
-		if _, err := restoredDisk(ctx, *root, id); err != nil {
+		// Marker only: the inventory reports what would move, so it
+		// neither resolves a base (a multi-gigabyte read per row, over a
+		// handful of templates a fleet shares) nor puts a verified copy
+		// into a restore. The handoff below resolves the ones it takes.
+		if _, err := backup.RestoredGeneration(filepath.Join(*root, id)); err != nil {
 			notRestored++
 			continue
 		}

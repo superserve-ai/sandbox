@@ -28,20 +28,41 @@ type Restored struct {
 	Manifest *GenerationManifest
 }
 
-// RestoredDisk reads the completion marker in dir and resolves the rootfs
-// and, for an overlay, the shared base beside it or on the host. Reading
-// the marker is cheap; honouring a host-held base is not, because its
-// contents are hashed, which is what ctx bounds.
-func RestoredDisk(ctx context.Context, dir string) (Restored, error) {
-	var r Restored
+// RestoredGeneration reads a restore's completion marker and the rootfs
+// it names. No base is resolved, so no artifact is read or written:
+// enough to report that a restore is present.
+func RestoredGeneration(dir string) (*GenerationManifest, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, ManifestObject))
 	if err != nil {
-		return r, fmt.Errorf("not restored")
+		return nil, fmt.Errorf("not restored")
 	}
-	r.Manifest = &GenerationManifest{}
-	if err := json.Unmarshal(raw, r.Manifest); err != nil {
-		return r, fmt.Errorf("restore marker: %w", err)
+	m := &GenerationManifest{}
+	if err := json.Unmarshal(raw, m); err != nil {
+		return nil, fmt.Errorf("restore marker: %w", err)
 	}
+	for _, f := range m.Files {
+		if f.Name != "rootfs.ext4" {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, f.Name)); err != nil {
+			return nil, fmt.Errorf("restored without a rootfs")
+		}
+		return m, nil
+	}
+	return nil, fmt.Errorf("restore marker lists no rootfs")
+}
+
+// RestoredDisk reads the completion marker in dir and resolves the rootfs
+// and, for an overlay, the shared base: the copy beside it, or the host's
+// own template when the generation was restored without one. Resolving a
+// host template hashes it, which is what ctx bounds.
+func RestoredDisk(ctx context.Context, dir string) (Restored, error) {
+	var r Restored
+	m, err := RestoredGeneration(dir)
+	if err != nil {
+		return r, err
+	}
+	r.Manifest = m
 	blockMap := ""
 	for _, f := range r.Manifest.Files {
 		if f.Name == BlockMapName {
@@ -53,9 +74,6 @@ func RestoredDisk(ctx context.Context, dir string) (Restored, error) {
 			continue
 		}
 		r.Disk = filepath.Join(dir, f.Name)
-		if _, err := os.Stat(r.Disk); err != nil {
-			return r, fmt.Errorf("restored without a rootfs")
-		}
 		if f.BaseSHA256 == "" {
 			r.Standalone = true
 			return r, nil
@@ -70,15 +88,19 @@ func RestoredDisk(ctx context.Context, dir string) (Restored, error) {
 		if _, err := os.Stat(r.Base); err == nil {
 			return r, nil
 		}
-		base, err := hostBaseFor(ctx, f)
+		src := hostBasePath(r.Manifest, f.BaseSHA256)
+		if src == "" {
+			return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
+		}
+		base, err := hostBase(ctx, dir, f.BaseSHA256, src)
 		if err != nil {
 			return r, fmt.Errorf("restored base %s: %w", f.BaseSHA256, err)
 		}
-		if base != "" {
-			r.Base = pinHostBase(dir, f.BaseSHA256, base)
-			return r, nil
+		if base == "" {
+			return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
 		}
-		return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
+		r.Base = base
+		return r, nil
 	}
 	return r, fmt.Errorf("restore marker lists no rootfs")
 }
@@ -111,86 +133,121 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 		}
 		return Restored{}, err
 	}
-	// Honouring a host-held base hashes it, so the verdict is remembered
-	// for this restore: the restore loop and the verification loop each
-	// consult skip once per file.
-	held := map[string]bool{}
+	// A shared base the host still holds is put into the restore from the
+	// template instead of the bucket, and checked there. The verdict is
+	// remembered: the restore loop and the verification loop each consult
+	// skip once per file.
+	satisfied := map[string]bool{}
 	skip := func(mf ManifestFile) bool {
 		if !isSharedEntry(mf) {
 			return false
 		}
-		ok, seen := held[mf.SHA256]
+		ok, seen := satisfied[mf.Name]
 		if !seen {
-			ok = hostHoldsBase(ctx, m, mf.SHA256)
-			held[mf.SHA256] = ok
+			ok = satisfyFromHost(ctx, destDir, m, mf)
+			satisfied[mf.Name] = ok
 		}
 		return ok
 	}
 	if _, err := restoreGeneration(ctx, r, owner, generation, destDir, skip, progress); err != nil {
 		return Restored{}, err
 	}
-	// Pin what the skip decision already checked, so resolving the restore
-	// below does not read those bases a second time.
-	for _, mf := range m.Files {
-		if held[mf.BaseSHA256] && mf.BasePath != "" {
-			pinHostBase(destDir, mf.BaseSHA256, mf.BasePath)
-		}
-	}
 	return RestoredDisk(ctx, destDir)
 }
 
-// hostBaseFor is the template base an overlay was paused over, when the
-// host still holds exactly those bytes. The recorded path alone does not
-// establish that: a template rebuilt in place, or a base left short by an
-// interrupted fetch, occupies the same path with different contents, and
-// booting the overlay over it serves the wrong filesystem. So the file is
-// hashed against the digest the pause recorded, and a file that does not
-// match is no base at all — the caller then fetches the object, which is
-// the work the match was going to save. Hashing costs what the fetched
-// base costs anyway: every restored file, this base included, is hashed
-// by verifyFile before the restore is called complete.
-func hostBaseFor(ctx context.Context, f ManifestFile) (string, error) {
-	if f.BasePath == "" || f.BaseSHA256 == "" {
-		return "", nil
+// satisfyFromHost puts a shared base into the restore from the template
+// the pause recorded, so the object need not be fetched. Reports whether
+// the entry is now satisfied; a false sends it down the ordinary fetch
+// path, which is also what a template that no longer holds those bytes
+// gets.
+func satisfyFromHost(ctx context.Context, dir string, m *GenerationManifest, mf ManifestFile) bool {
+	src := hostBasePath(m, mf.SHA256)
+	if src == "" {
+		return false
 	}
-	info, err := os.Stat(f.BasePath)
-	if err != nil || !info.Mode().IsRegular() {
-		return "", nil
+	base, err := hostBase(ctx, dir, mf.SHA256, src)
+	return err == nil && base != ""
+}
+
+// hostBasePath is the template an overlay was paused over, when the host
+// still has a plain file at the recorded path. The path is a claim about
+// content, never proof of it: whatever is there is hashed before use.
+func hostBasePath(m *GenerationManifest, sha string) string {
+	for _, f := range m.Files {
+		if f.BaseSHA256 != sha || f.BasePath == "" {
+			continue
+		}
+		// Lstat, not Stat: a symlink's target can be repointed after the
+		// digest is read, so only a plain file is a candidate.
+		if info, err := os.Lstat(f.BasePath); err == nil && info.Mode().IsRegular() {
+			return f.BasePath
+		}
 	}
-	if err := verifyPath(ctx, f.BasePath, f.BaseSHA256); err != nil {
-		// A check that could not run is not a base worth replacing, and
-		// callers act on that difference: a cancelled hash must surface as
-		// cancellation, not as a missing base.
+	return ""
+}
+
+// hostBase resolves the path the boot should read for a shared base the
+// host claims to hold, or "" when the host cannot supply those bytes.
+//
+// A copy-on-write clone inside the restore is what makes this sound: the
+// bytes that were hashed are then the bytes that are read. Hashing the
+// template where it lies proves less — a rebuild that truncates and
+// rewrites it, or an inode swapped in after the digest was taken, changes
+// what the guest sees — so it is the fallback for filesystems that make
+// no clone possible, where it still catches a base that is already wrong.
+// A clone that fails its digest is removed, leaving the manifest's name
+// free for the fetch that follows. Only a check that could not run at all
+// is an error.
+func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
+	dst := filepath.Join(dir, SharedBaseName(sha))
+	if err := cloneToPath(dst, src); err == nil {
+		if err := verifyPath(ctx, dst, sha); err == nil {
+			return dst, nil
+		}
+		if rerr := os.Remove(dst); rerr != nil {
+			return "", fmt.Errorf("discard unverified base copy: %w", rerr)
+		}
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
 		return "", nil
 	}
-	return f.BasePath, nil
+	if err := verifyPath(ctx, src, sha); err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", nil
+	}
+	return src, nil
 }
 
-// pinHostBase gives the restore its own name for a host base whose
-// contents were just checked, by linking the very inode that was read.
-// Two things follow: this restore resolves again without reading the base
-// a second time, and a template rebuilt at that path afterwards cannot
-// change the bytes under a VM already booted on them. A link the
-// filesystem will not make (the base lives on another one) leaves the
-// recorded path in use, checked but unpinned, as it was before.
-func pinHostBase(dir, sha, hostPath string) string {
-	// Only the file itself can be pinned: linking a symlink would leave
-	// what the boot reads decided by whatever it points at later.
-	if info, err := os.Lstat(hostPath); err != nil || !info.Mode().IsRegular() {
-		return hostPath
+// cloneToPath reflinks src to a newly created dst, which must not exist.
+func cloneToPath(dst, src string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
 	}
-	pinned := filepath.Join(dir, SharedBaseName(sha))
-	if err := os.Link(hostPath, pinned); err != nil {
-		return hostPath
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
 	}
-	return pinned
+	defer out.Close()
+	if err := cloneInto(out, in); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	// The boot reads this copy, and a marker already calls the restore
+	// complete; page-cache-only bytes would not survive a power loss.
+	if err := out.Sync(); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	return nil
 }
 
-// verifyPath hashes the file at path, which lives outside any restore
-// destination, against the digest recorded for its contents.
+// verifyPath hashes the file at path against the digest recorded for its
+// contents.
 func verifyPath(ctx context.Context, path, sha string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -202,21 +259,6 @@ func verifyPath(ctx context.Context, path, sha string) error {
 		return fmt.Errorf("extents: %w", err)
 	}
 	return verifyDigest(ctx, f, extents, apparent, sha)
-}
-
-// hostHoldsBase drives the restore's skip. A check that could not run
-// reports false: the base is then fetched, which fails on a dead context
-// without anything having been discarded.
-func hostHoldsBase(ctx context.Context, m *GenerationManifest, sha string) bool {
-	for _, f := range m.Files {
-		if f.BaseSHA256 != sha {
-			continue
-		}
-		if base, err := hostBaseFor(ctx, f); err == nil && base != "" {
-			return true
-		}
-	}
-	return false
 }
 
 // LimitedReader caps the bytes per second streamed from a blob store.
