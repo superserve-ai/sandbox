@@ -33,16 +33,26 @@ func (s *StateStore) retainedRecords() ([]VMRecord, error) {
 	bytes := 0
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketName).ForEach(func(k, v []byte) error {
+			var rec VMRecord
+			if err := json.Unmarshal(v, &rec); err != nil {
+				return err
+			}
+			// Build and warm-pool records share the Bolt bucket with customer
+			// sandboxes but are not retained-storage owners. Filter them before
+			// applying inventory budgets so unrelated fleet state cannot freeze
+			// accounting for the customer set.
+			if isBuildVM(rec.ID) {
+				return nil
+			}
+			if _, err := uuid.Parse(rec.ID); err != nil {
+				return nil
+			}
 			if len(records) >= retainedstorage.MaxOwners {
 				return fmt.Errorf("retained owner budget exceeded")
 			}
 			bytes += len(k) + len(v)
 			if bytes > retainedstorage.MaxPayloadBytes {
 				return fmt.Errorf("retained record budget exceeded")
-			}
-			var rec VMRecord
-			if err := json.Unmarshal(v, &rec); err != nil {
-				return err
 			}
 			records = append(records, rec)
 			return nil

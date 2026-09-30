@@ -125,6 +125,40 @@ func TestRetainedInventoryRejectsLifecycleOverlap(t *testing.T) {
 	}
 }
 
+func TestRetainedInventoryBudgetsOnlyCustomerRecords(t *testing.T) {
+	root := t.TempDir()
+	state, err := OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	// Build and warm-pool records are deliberately numerous: they share the
+	// durable bucket but must not consume the customer inventory budget.
+	for i := 0; i <= retainedstorage.MaxOwners; i++ {
+		if err := state.Put(VMRecord{ID: "build-record-" + strconv.Itoa(i), Status: StatusRunning}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	disk := filepath.Join(root, "overlay.ext4")
+	if err := os.WriteFile(disk, []byte("retained"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	owner := VMRecord{ID: uuid.NewString(), Status: StatusRunning, DiskPath: disk, SourceSnapshotID: uuid.NewString()}
+	if err := state.Put(owner); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{state: state, cfg: ManagerConfig{RunDir: root, SnapshotDir: root}}
+	inv, err := m.retainedStorageInventory(t.Context(), func(*os.File, int) ([]retainedstorage.Extent, string, error) {
+		return []retainedstorage.Extent{{Device: "fixture", Start: 0, Length: 4096}}, "fixture", nil
+	})
+	if err != nil {
+		t.Fatalf("unrelated build records blocked inventory: %v", err)
+	}
+	if len(inv.Owners) != 1 || inv.Owners[0].ID != owner.ID {
+		t.Fatalf("retained owners = %#v, want only %s", inv.Owners, owner.ID)
+	}
+}
+
 func TestRetainedInventoryRejectsIncompleteSavedSnapshotManifest(t *testing.T) {
 	root := t.TempDir()
 	state, err := OpenStateStore(filepath.Join(root, "state.db"))
@@ -732,7 +766,7 @@ func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
 			}
 			t.Cleanup(func() { state.Close() })
 			id := uuid.NewString()
-			previous := VMRecord{ID: id, Status: StatusError}
+			previous := VMRecord{ID: id, Status: StatusError, BaseMemPath: filepath.Join(root, "missing-old-memory-base")}
 			salvage := filepath.Join(root, "salvaged.ext4")
 			if !legacy {
 				previous.RootfsPath = filepath.Join(root, "pinned-rootfs.ext4")
@@ -741,6 +775,9 @@ func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
 			// revival seed; the writable copy is a separate retained file.
 			inst := &VMInstance{ID: id, Status: StatusCreating, Config: VMConfig{RootfsPath: salvage}, RevivedDisk: salvage}
 			seedRevivedRetainedDependencies(inst, &previous)
+			if inst.BaseMemPath != "" {
+				t.Fatalf("cold-boot revival retained obsolete memory base %q", inst.BaseMemPath)
+			}
 			wantRootfs := previous.RootfsPath
 			if legacy {
 				wantRootfs = salvage

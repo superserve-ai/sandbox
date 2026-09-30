@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -79,7 +80,9 @@ func TestRetainedStorageSeriesPreservesFractionalLegacyArtifacts(t *testing.T) {
 	}
 }
 
-func TestRetainedStorageLegacyArtifactUnionUsesIntervalHost(t *testing.T) {
+func TestRetainedStorageLegacyArtifactUnionPreservesPreCutoverHistory(t *testing.T) {
+	// Legacy billing applies the maximum allocation per path to the entire
+	// union of reference lifetimes, including before the larger reference began.
 	for _, tc := range []struct {
 		name           string
 		separateHosts  bool
@@ -88,9 +91,9 @@ func TestRetainedStorageLegacyArtifactUnionUsesIntervalHost(t *testing.T) {
 		wantMiBSeconds float64
 	}{
 		{name: "same-host-shared-path", secondBytes: 1 << 20, wantMiBSeconds: 60},
-		{name: "different-hosts-same-path", separateHosts: true, secondBytes: 1 << 20, wantMiBSeconds: 80},
-		{name: "different-hosts-different-allocations", separateHosts: true, secondBytes: 2 << 20, wantMiBSeconds: 100},
-		{name: "reassigned-current-host", separateHosts: true, reassign: true, secondBytes: 2 << 20, wantMiBSeconds: 100},
+		{name: "different-hosts-same-path", separateHosts: true, secondBytes: 1 << 20, wantMiBSeconds: 60},
+		{name: "different-hosts-different-allocations", separateHosts: true, secondBytes: 2 << 20, wantMiBSeconds: 120},
+		{name: "reassigned-current-host", separateHosts: true, reassign: true, secondBytes: 2 << 20, wantMiBSeconds: 120},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newStorageReportFixture(t, "paused", false)
@@ -121,7 +124,7 @@ func TestRetainedStorageLegacyArtifactUnionUsesIntervalHost(t *testing.T) {
 			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason)
  VALUES($1,$3,0,$4,$6,'deleted'),($2,$3,0,$5,$6,'deleted')`, f.sandboxID, otherSandbox, team, start, mid, end)
 			if tc.reassign {
-				// Current host identity must not merge distinct historical allocations.
+				// Current host identity must not change the historical path union.
 				exec(`UPDATE sandbox SET host_id=$2 WHERE id=$1`, f.sandboxID, otherHost)
 			}
 			for _, floorArtifacts := range []bool{false, true} {
@@ -414,6 +417,124 @@ func TestRetainedStorageUnionSurvivesSnapshotAndSourceDeletion(t *testing.T) {
 	if !snapshotEnded.Equal(d2) {
 		t.Fatalf("snapshot interval ended at %v, want %v", snapshotEnded, d2)
 	}
+}
+
+func TestRetainedStorageUnionWithThreeForksAndDeletionOrders(t *testing.T) {
+	orders := []struct {
+		name  string
+		order []int
+	}{
+		{name: "source-first", order: []int{0, 1, 2, 3, 4}},
+		{name: "snapshot-first", order: []int{1, 0, 3, 4, 2}},
+		{name: "children-first", order: []int{2, 3, 4, 1, 0}},
+	}
+	for _, tc := range orders {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newStorageReportFixture(t, "paused", true)
+			team := sandboxTeamID(t, f.sandboxID)
+			ctx := t.Context()
+			start := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+			snapshot := uuid.New()
+			children := []uuid.UUID{uuid.New(), uuid.New(), uuid.New()}
+			exec := func(q string, args ...any) {
+				t.Helper()
+				if _, err := testPool.Exec(ctx, q, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exec(`UPDATE sandbox SET created_at=$2 WHERE id=$1`, f.sandboxID, start.Add(-time.Minute))
+			exec(`UPDATE sandbox_storage_interval SET started_at=$2 WHERE sandbox_id=$1`, f.sandboxID, start)
+			exec(`INSERT INTO sandbox_snapshot(id,team_id,sandbox_id,kind,status,host_id,vcpu_count,memory_mib,disk_mib,base_path,overlay_path,ready_at)
+ VALUES($1,$2,$3,'fs','ready',$4,1,1024,8,'/example/base.ext4','/example/overlay.ext4',$5)`, snapshot, team, f.sandboxID, f.hostID, start)
+			for i, child := range children {
+				exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at)
+ VALUES($1,$2,$3,'paused',$4,1,1024,8,$5)`, child, team, "fork-"+strconv.Itoa(i), f.hostID, start)
+			}
+			type retainedForkOwner struct {
+				kind string
+				id   uuid.UUID
+				priv int64
+			}
+			owners := []retainedForkOwner{
+				{kind: "sandbox", id: f.sandboxID, priv: -1},
+				{kind: "snapshot", id: snapshot, priv: 1},
+			}
+			for i, child := range children {
+				owners = append(owners, retainedForkOwner{kind: "sandbox", id: child, priv: int64(i + 2)})
+			}
+			for i, owner := range owners {
+				startBlock := int64(0)
+				if owner.priv >= 0 {
+					startBlock = owner.priv * (1 << 20)
+				}
+				extents := fmt.Sprintf(`[ {"device":"fs","start":0,"length":1048576} ]`)
+				if owner.priv >= 0 {
+					extents = fmt.Sprintf(`[{"device":"fs","start":0,"length":1048576},{"device":"fs","start":%d,"length":1048576}]`, startBlock)
+				}
+				exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at)
+ VALUES($1,$2,$3,$4,$5,$6::jsonb,$7)`, f.hostID, team, owner.kind, owner.id, fmt.Sprintf("generation-%d", i), extents, start)
+			}
+			active := make(map[int]bool, len(owners))
+			for i := range owners {
+				active[i] = true
+			}
+			var initial float64
+			if err := testPool.QueryRow(ctx, `SELECT retained_storage_mib_seconds($1,$2,$3)::float8`, team, start, start.Add(time.Minute)).Scan(&initial); err != nil {
+				t.Fatal(err)
+			}
+			if initial != 5*60 {
+				t.Fatalf("initial retained union = %v, want 300", initial)
+			}
+			deleteOwner := func(index int, at time.Time) {
+				o := owners[index]
+				if o.kind == "snapshot" {
+					exec(`UPDATE sandbox_snapshot SET status='deleting',deleted_at=$2 WHERE id=$1`, o.id, at)
+				} else {
+					exec(`UPDATE sandbox SET destroyed_at=$2 WHERE id=$1`, o.id, at)
+				}
+				delete(active, index)
+			}
+			for step, index := range append([]int(nil), tc.order...) {
+				at := start.Add(time.Duration(step+1) * time.Minute)
+				deleteOwner(index, at)
+				next := at.Add(time.Minute)
+				shared := len(active) > 0
+				private := 0
+				for i := range active {
+					if owners[i].priv >= 0 {
+						private++
+					}
+				}
+				want := float64(private)
+				if shared {
+					want++
+				}
+				var got float64
+				if err := testPool.QueryRow(ctx, `SELECT retained_storage_mib_seconds($1,$2,$3)::float8`, team, at, next).Scan(&got); err != nil {
+					t.Fatal(err)
+				}
+				if got != want*60 {
+					t.Fatalf("step %d retained union = %v, want %v", step, got, want*60)
+				}
+			}
+			var ended time.Time
+			if err := testPool.QueryRow(ctx, `SELECT ended_at FROM retained_storage_interval WHERE owner_kind='snapshot' AND owner_id=$1`, snapshot).Scan(&ended); err != nil {
+				t.Fatal(err)
+			}
+			if !ended.Equal(start.Add(time.Duration(indexOf(tc.order, 1)+1) * time.Minute)) {
+				t.Fatalf("snapshot interval ended at %v", ended)
+			}
+		})
+	}
+}
+
+func indexOf(values []int, want int) int {
+	for i, value := range values {
+		if value == want {
+			return i
+		}
+	}
+	return -1
 }
 
 func TestRetainedStorageConsumerParity(t *testing.T) {

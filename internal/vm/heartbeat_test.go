@@ -23,6 +23,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/preview"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 )
 
 func TestSendHeartbeatAdvertisesVerifiedPreviewCapabilities(t *testing.T) {
@@ -1275,6 +1276,71 @@ func TestStartHeartbeatRefreshesAcknowledgedLegacyStorageWithNewIdentity(t *test
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("acknowledged legacy sample was not refreshed")
+	}
+}
+
+func TestStartHeartbeatKeepsLivenessWhileRetainedInventoryBlocks(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var heartbeats atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/health":
+			_ = json.NewEncoder(w).Encode(proxyHealthResponse{})
+		case "/internal/hosts/host-a/heartbeat":
+			heartbeats.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case "/internal/hosts/host-a/storage-reports":
+			w.WriteHeader(http.StatusCreated)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	runDir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		waitForStorage := runHeartbeat(ctx, HeartbeatConfig{
+			ControlPlaneURL: server.URL,
+			ProxyHealthURL:  server.URL + "/health",
+			HostID:          "host-a",
+			IncarnationID:   uuid.NewString(),
+			RunDir:          runDir,
+			Interval:        10 * time.Millisecond,
+			LifecycleReady:  func() bool { return true },
+			RetainedStorage: func(context.Context) (*retainedstorage.Inventory, error) {
+				enteredOnce.Do(func() { close(entered) })
+				<-release
+				return &retainedstorage.Inventory{Version: retainedstorage.Version}, nil
+			},
+		}, zerolog.Nop())
+		waitForStorage()
+		close(done)
+	}()
+	defer func() {
+		close(release)
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("heartbeat did not stop")
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("retained inventory did not start")
+	}
+	deadline := time.After(500 * time.Millisecond)
+	for heartbeats.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("heartbeat count while inventory blocked = %d, want at least 2", heartbeats.Load())
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }
 
