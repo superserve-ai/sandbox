@@ -4651,7 +4651,9 @@ const machineConfigRecoveryWorkers = 4
 // live microVM.
 var machineConfigProbe = func(ctx context.Context, socketPath string) (vcpu, memoryMiB uint32, err error) {
 	params := operations.NewGetMachineConfigurationParamsWithContext(ctx)
-	resp, err := newFCClient(socketPath).Operations.GetMachineConfiguration(params)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
+	resp, err := fc.Operations.GetMachineConfiguration(params)
 	if err != nil {
 		return 0, 0, err
 	}
