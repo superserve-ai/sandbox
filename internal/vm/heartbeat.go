@@ -844,11 +844,11 @@ func storageReportID(hostID, incarnationID string, version uint64) uuid.UUID {
 	// This is retained for compatibility with queue entries written before
 	// reportSpace was persisted. New reports use the cache's durable namespace
 	// so a reset version cannot collide with an accepted report.
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("storage-report:"+hostID+":"+incarnationID+":"+strconv.FormatUint(version, 10)))
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("storage-report:v1:"+hostID+":"+incarnationID+":"+strconv.FormatUint(version, 10)))
 }
 
 func storageReportIDInSpace(reportSpace uuid.UUID, version uint64) uuid.UUID {
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("storage-report:"+reportSpace.String()+":"+strconv.FormatUint(version, 10)))
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("storage-report:v2:"+reportSpace.String()+":"+strconv.FormatUint(version, 10)))
 }
 
 func (c *heartbeatStorageCache) snapshot() (uint64, []heartbeatStorageMeasurement) {

@@ -877,6 +877,41 @@ func TestHeartbeatStorageQueueRetainsDistinctSamplesAcrossRestart(t *testing.T) 
 	}
 }
 
+func TestHeartbeatStorageReportNamespacesSurviveRollbackBetweenSpools(t *testing.T) {
+	runDir := t.TempDir()
+	incarnationID := "11111111-1111-4111-8111-111111111111"
+	// Simulate the legacy daemon's last acknowledged version and queue. The
+	// upgraded daemon writes its new sample to the sibling spool first; a
+	// rollback may then publish the same numeric version through the old path.
+	legacy := storageReportQueueState{
+		IncarnationID: incarnationID,
+		Version:       7,
+		Pending:       []storageReportQueueEntry{{Version: 7, Measurements: []heartbeatStorageMeasurement{{SandboxID: "sandbox-a", AllocatedBytes: 1}}}},
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, storageReportQueueFilename), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, storageReportVersionFilename), []byte("7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	upgraded := newHeartbeatStorageCache(runDir, zerolog.Nop(), incarnationID)
+	if err := upgraded.store([]heartbeatStorageMeasurement{{SandboxID: "sandbox-a", AllocatedBytes: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	newID := upgraded.pendingSnapshot()[1].reportID
+	legacyID := storageReportID("host-a", "", 8)
+	if newID == uuid.Nil || newID == legacyID {
+		t.Fatalf("rollback namespace collision: new=%s legacy=%s", newID, legacyID)
+	}
+	if got := upgraded.pendingSnapshot()[0].reportID; got != uuid.Nil && got == newID {
+		t.Fatalf("imported legacy report reused newly generated identity: %s", got)
+	}
+}
+
 func TestLegacyHeartbeatDrainsPendingStorageInVersionOrder(t *testing.T) {
 	cache := newHeartbeatStorageCache("", zerolog.Nop())
 	for _, bytes := range []int64{1, 2} {

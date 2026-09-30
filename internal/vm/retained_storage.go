@@ -33,6 +33,13 @@ func (s *StateStore) retainedRecords() ([]VMRecord, error) {
 	bytes := 0
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketName).ForEach(func(k, v []byte) error {
+			// The records bucket also contains build and warm-pool entries. Their
+			// values are not part of retained inventory, so reject non-UUID keys
+			// before decoding them; a large unrelated fleet must not consume the
+			// inventory's JSON/decode budget.
+			if _, err := uuid.Parse(string(k)); err != nil {
+				return nil
+			}
 			var rec VMRecord
 			if err := json.Unmarshal(v, &rec); err != nil {
 				return err
@@ -102,7 +109,7 @@ func resolveRetainedRecordPaths(rec VMRecord, runDir string) ([]string, VMRecord
 	// no template generation anchor survived the old record.  Its durable
 	// BasePath (when present) is still measured, but requiring an unrelated
 	// template delta would reject the whole host after a successful revival.
-	revivedWithoutTemplate := rec.RevivedDisk != "" && rec.BasePath != "" && deltaDir == ""
+	revivedWithoutTemplate := rec.RevivedDisk != "" && deltaDir == "" && rootfs == ""
 	if rec.SourceSnapshotID == "" && !revivedWithoutTemplate && ((rec.BasePath != "" && deltaDir == "") || (rec.BasePath == "" && rootfs == "")) {
 		resolved := false
 		for _, anchor := range []string{baseMem, rec.SnapshotPath} {

@@ -602,8 +602,8 @@ const reviveBoxdReadyBudget = 90 * time.Second
 // unbounded hold on the RPC and lifecycle lock.
 const reviveTeardownBudget = 60 * time.Second
 
-// seedRevivedRetainedDependencies preserves known generation anchors without
-// erasing the salvage rootfs established by coldBootFromRootfs for old records.
+// seedRevivedRetainedDependencies preserves known generation anchors while
+// keeping temporary revival inputs out of the retained dependency set.
 func seedRevivedRetainedDependencies(inst *VMInstance, previous *VMRecord) {
 	if previous == nil {
 		return
@@ -613,8 +613,10 @@ func seedRevivedRetainedDependencies(inst *VMInstance, previous *VMRecord) {
 	// remains recorded. Its base is not a dependency of the new generation.
 	inst.BaseMemPath = ""
 	inst.StrandedOverlays = append([]string(nil), previous.StrandedOverlays...)
-	if previous.RootfsPath != "" {
-		inst.Config.RootfsPath = previous.RootfsPath
-	}
+	// coldBootFromRootfs receives the temporary restore input separately. Do
+	// not persist that input as a retained dependency when the old record had
+	// no pinned template rootfs; backup resume removes the staging directory
+	// after the durable VM copy is complete.
+	inst.Config.RootfsPath = previous.RootfsPath
 	inst.Config.DeltaDir = previous.DeltaDir
 }

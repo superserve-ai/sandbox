@@ -1116,9 +1116,19 @@ FROM recent_compute b
      LIMIT 1025)
   ) i
 ), recent_retained AS MATERIALIZED (
- SELECT GREATEST(started_at,(SELECT started_at FROM sample_window)) started_at,ended_at
+ -- Retained spend is clipped at storage activation as well as the trial
+ -- sample window; otherwise storage-only trials get a pre-activation
+ -- denominator with no corresponding spend.
+ SELECT GREATEST(
+          started_at,
+          (SELECT started_at FROM sample_window),
+          COALESCE((SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id)), started_at)
+        ) started_at,ended_at
  FROM retained_storage_interval WHERE team_id=sqlc.arg(team_id)
- AND COALESCE(ended_at,now())>(SELECT started_at FROM sample_window)
+ AND COALESCE(ended_at,now())>GREATEST(
+       (SELECT started_at FROM sample_window),
+       COALESCE((SELECT effective_at FROM team_storage_billing_activation WHERE team_id=sqlc.arg(team_id)), (SELECT started_at FROM sample_window))
+     )
  AND storage_billing_activated(sqlc.arg(team_id)) LIMIT 1025
 ), sample_bounds AS (
   SELECT MIN(started_at) AS started_at,

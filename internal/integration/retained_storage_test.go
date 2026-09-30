@@ -240,6 +240,68 @@ func TestRetainedStorageReassignmentClosesLegacyArtifacts(t *testing.T) {
 	}
 }
 
+func TestRetainedStorageReassignmentToLegacyClosesSourceInterval(t *testing.T) {
+	f := newStorageReportFixture(t, "paused", false)
+	team := sandboxTeamID(t, f.sandboxID)
+	ctx := t.Context()
+	sourceHost := "retained-source-" + uuid.NewString()
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID: sourceHost, VmdAddr: "192.0.2.2:50051", ProxyAddr: "192.0.2.2:5007",
+		Region: "example-region", CapacityMemoryMib: 1024, CapacityVcpus: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `DELETE FROM retained_storage_interval WHERE host_id=$1`, sourceHost)
+		cleanupHost(t, sourceHost)
+	})
+	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	if _, err := testPool.Exec(ctx, `UPDATE sandbox SET host_id=$2,created_at=$3 WHERE id=$1`,
+		f.sandboxID, f.hostID, start); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at)
+		VALUES($1,$2,'sandbox',$3,'retained-source','[{"device":"fs","start":0,"length":1048576}]',$4)`,
+		sourceHost, team, f.sandboxID, start); err != nil {
+		t.Fatal(err)
+	}
+	reportID := uuid.New()
+	response := postStorageReport(t, f, reportID, 3<<20)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("legacy destination report: %d %s", response.Code, response.Body.String())
+	}
+	ack := decodeStorageReportAck(t, response)
+	waitStorageReportState(t, reportID, "processed")
+	var endedAt time.Time
+	if err := testPool.QueryRow(ctx, `SELECT ended_at FROM retained_storage_interval WHERE host_id=$1 AND owner_id=$2`, sourceHost, f.sandboxID).Scan(&endedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !endedAt.Equal(ack.ReceivedAt) {
+		t.Fatalf("source retained interval ended at %v, want receipt %v", endedAt, ack.ReceivedAt)
+	}
+	var activeLegacy int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM sandbox_storage_interval WHERE sandbox_id=$1 AND ended_at IS NULL`, f.sandboxID).Scan(&activeLegacy); err != nil {
+		t.Fatal(err)
+	}
+	if activeLegacy != 1 {
+		t.Fatalf("legacy destination intervals = %d, want one", activeLegacy)
+	}
+	// A separately retained snapshot/reference remains untouched by the
+	// sandbox handoff; only the moved owner's source interval is retired.
+	snapshot := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at) VALUES($1,$2,'snapshot',$3,'surviving','[{"device":"fs","start":0,"length":1048576}]',$4)`, sourceHost, team, snapshot, start); err != nil {
+		t.Fatal(err)
+	}
+	var snapshotActive int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval WHERE host_id=$1 AND owner_kind='snapshot' AND owner_id=$2 AND ended_at IS NULL`, sourceHost, snapshot).Scan(&snapshotActive); err != nil {
+		t.Fatal(err)
+	}
+	if snapshotActive != 1 {
+		t.Fatal("surviving retained reference was closed during sandbox handoff")
+	}
+}
+
 func TestRetainedStorageReceiptReplacementAndLegacyIsolation(t *testing.T) {
 	f := newStorageReportFixture(t, "paused", true)
 	team := sandboxTeamID(t, f.sandboxID)

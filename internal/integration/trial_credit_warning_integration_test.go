@@ -463,6 +463,50 @@ func TestRecentTrialBurnSampleIncludesRetainedArtifacts(t *testing.T) {
 	}
 }
 
+func TestRecentTrialBurnSampleClipsRetainedElapsedTimeToActivation(t *testing.T) {
+	ctx := context.Background()
+	teamID := mustCreateTeam(t, ctx, "trial-retained-activation-"+uuid.NewString()[:8])
+	now := time.Now().UTC()
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_credit_grant
+		(team_id, amount_usd, remaining_usd, reason, created_at)
+		VALUES ($1, 10, 10, 'signup trial credit', $2)`, teamID, now.Add(-6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	planKey := "trial-retained-activation-" + uuid.NewString()
+	if _, err := testPool.Exec(ctx, `INSERT INTO pricing_plan(key,name,currency,active) VALUES($1,'Retained activation pricing','USD',true)`, planKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO pricing_rate(plan_key,resource,unit,price_usd,effective_from) VALUES($1,'storage_gib','second',1,$2)`, planKey, now.Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_pricing_plan(team_id,plan_key,effective_from) VALUES($1,$2,$3)`, teamID, planKey, now.Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	activation := now.Add(-time.Hour)
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_storage_billing_enabled',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, teamID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO team_storage_billing_activation(team_id,effective_at,approved_cutoff) VALUES($1,$2,$2)`, teamID, activation); err != nil {
+		t.Fatal(err)
+	}
+	owner := uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at) VALUES($1,$2,'snapshot',$3,'activation-test',jsonb_build_array(jsonb_build_object('device','fs','start',0,'length',$4::bigint)),$5)`, testDefaultHostID, teamID, owner, int64(1<<30), now.Add(-6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	sample, err := testQueries.GetRecentTrialBurnSample(ctx, teamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed, err := sample.ElapsedSeconds.Float64Value()
+	if err != nil || !elapsed.Valid || elapsed.Float64 < 3500 || elapsed.Float64 > 3700 {
+		t.Fatalf("retained elapsed = %v (%v), want about one activated hour", elapsed, err)
+	}
+	spent, err := sample.SpentUsd.Float64Value()
+	if err != nil || !spent.Valid || spent.Float64 < 3500 || spent.Float64 > 3700 {
+		t.Fatalf("retained spend = %v (%v), want about 3600 USD", spent, err)
+	}
+}
+
 func TestListTeamsWithTrialCreditsSkipsStableIneligibleHistory(t *testing.T) {
 	ctx := context.Background()
 	stale := mustCreateTeam(t, ctx, "trial-refresh-stale-"+uuid.NewString()[:8])

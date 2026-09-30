@@ -159,6 +159,55 @@ func TestRetainedInventoryBudgetsOnlyCustomerRecords(t *testing.T) {
 	}
 }
 
+func TestRetainedRecordsSkipsMalformedUnrelatedEntriesBeforeDecode(t *testing.T) {
+	state, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	if err := state.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketName).Put([]byte("build-unrelated"), []byte("not-json"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	owner := VMRecord{ID: uuid.NewString(), Status: StatusRunning}
+	if err := state.Put(owner); err != nil {
+		t.Fatal(err)
+	}
+	records, err := state.retainedRecords()
+	if err != nil {
+		t.Fatalf("unrelated malformed record blocked inventory: %v", err)
+	}
+	if len(records) != 1 || records[0].ID != owner.ID {
+		t.Fatalf("retained records = %#v, want only %s", records, owner.ID)
+	}
+}
+
+func TestRetainedInventoryFencesSavedSnapshotLock(t *testing.T) {
+	root := t.TempDir()
+	state, err := OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	m := &Manager{state: state, cfg: ManagerConfig{RunDir: root, SnapshotDir: root}, savedIDLocks: map[string]*savedIDLock{}}
+	snapshotID := uuid.NewString()
+	unlock, err := m.lockSavedSnapshot(context.Background(), snapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.RetainedStorageInventory(context.Background()); err == nil {
+		t.Fatal("inventory ran while saved snapshot mutation lock was held")
+	}
+	// Once the lifecycle operation commits, the same inventory is allowed to
+	// proceed; this protects the lock/epoch contract without a timing-sensitive
+	// capture implementation in the test.
+	unlock()
+	if _, err := m.RetainedStorageInventory(context.Background()); err != nil {
+		t.Fatalf("inventory remained fenced after snapshot lock release: %v", err)
+	}
+}
+
 func TestRetainedInventoryRejectsIncompleteSavedSnapshotManifest(t *testing.T) {
 	root := t.TempDir()
 	state, err := OpenStateStore(filepath.Join(root, "state.db"))
@@ -784,6 +833,9 @@ func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
 				}
 			}
 			salvage := filepath.Join(root, "salvaged.ext4")
+			if err := os.WriteFile(salvage, []byte("salvaged"), 0600); err != nil {
+				t.Fatal(err)
+			}
 			if !tc.legacy {
 				previous.RootfsPath = filepath.Join(root, "pinned-rootfs.ext4")
 			}
@@ -795,9 +847,6 @@ func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
 				t.Fatalf("cold-boot revival retained obsolete memory base %q", inst.BaseMemPath)
 			}
 			wantRootfs := previous.RootfsPath
-			if tc.legacy {
-				wantRootfs = salvage
-			}
 			if inst.Config.RootfsPath != wantRootfs {
 				t.Fatalf("revival rootfs = %q, want %q", inst.Config.RootfsPath, wantRootfs)
 			}
@@ -807,7 +856,17 @@ func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
 				t.Fatal(err)
 			}
 			for _, path := range []string{wantRootfs, inst.DiskPath} {
+				if path == "" {
+					continue
+				}
 				if err := os.WriteFile(path, []byte("retained"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.legacy {
+				// Backup resume removes the restore staging input after the
+				// durable VM copy is persisted. It must not remain a dependency.
+				if err := os.Remove(salvage); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -833,17 +892,24 @@ func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
 					seen[f.Name()] = true
 					return []retainedstorage.Extent{{Device: "fs", Start: int64(len(seen)) * 4096, Length: 4096}}, f.Name(), nil
 				})
-				if err != nil || inv == nil || len(inv.Owners) != 1 || len(seen) != wantPaths || !seen[wantRootfs] || !seen[inst.DiskPath] || seen[previous.MemFilePath] {
+				if err != nil || inv == nil || len(inv.Owners) != 1 || len(seen) != wantPaths || (wantRootfs != "" && !seen[wantRootfs]) || !seen[inst.DiskPath] || seen[previous.MemFilePath] {
 					t.Fatalf("revived inventory lost dependencies: paths=%v err=%v", seen, err)
 				}
 			}
-			assertInventory(2)
+			if tc.legacy {
+				assertInventory(1)
+			} else {
+				assertInventory(2)
+			}
 			// Persist the full-pause transition, which replaces memory anchors.
 			inst.Status = StatusPaused
 			inst.SnapshotPath = filepath.Join(root, "vmstate.snap")
 			inst.MemFilePath = filepath.Join(root, "mem.snap")
 			inst.BaseMemPath = ""
 			for _, path := range []string{wantRootfs, inst.DiskPath, inst.SnapshotPath, inst.MemFilePath} {
+				if path == "" {
+					continue
+				}
 				if err := os.WriteFile(path, []byte("retained"), 0600); err != nil {
 					t.Fatal(err)
 				}
@@ -851,7 +917,11 @@ func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
 			if err := state.Put(toRecord(inst)); err != nil {
 				t.Fatal(err)
 			}
-			assertInventory(4)
+			if tc.legacy {
+				assertInventory(3)
+			} else {
+				assertInventory(4)
+			}
 		})
 	}
 }

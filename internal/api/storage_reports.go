@@ -557,11 +557,35 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 	_, err = tx.Exec(ctx, `
 		WITH measurements AS MATERIALIZED (
 			SELECT unnest($1::uuid[]) AS sandbox_id, unnest($2::int[]) AS disk_mib
+		), retained_handoff AS (
+			-- A sandbox can move from a retained-reporting host to a legacy
+			-- host. Close only the source-host retained interval before the
+			-- destination opens its legacy interval; otherwise both sources
+			-- remain billable indefinitely.
+			UPDATE retained_storage_interval old
+			SET ended_at=$4::timestamptz
+			FROM measurements m JOIN sandbox owner ON owner.id=m.sandbox_id
+			WHERE old.owner_kind='sandbox' AND old.owner_id=m.sandbox_id
+			  AND old.host_id IS DISTINCT FROM $3
+			  AND old.ended_at IS NULL AND old.started_at<=$4::timestamptz
+			  AND owner.host_id=$3 AND owner.created_at <= $4::timestamptz
+			  AND (owner.destroyed_at IS NULL OR owner.destroyed_at > $4::timestamptz)
+			  AND feature_enabled('billing_metrics_write',owner.team_id)
+			  AND NOT EXISTS (
+				SELECT 1 FROM sandbox_storage_interval future
+				WHERE future.sandbox_id=owner.id AND future.started_at>$4::timestamptz
+			  )
 		), eligible AS MATERIALIZED (
 			SELECT s.id, s.team_id, s.destroyed_at, m.disk_mib FROM measurements m
 			JOIN sandbox s ON s.id=m.sandbox_id
 			WHERE s.host_id=$3
- AND NOT EXISTS(SELECT 1 FROM retained_storage_cutover c WHERE c.host_id=s.host_id AND c.team_id=s.team_id AND c.started_at<=$4)
+			  AND NOT EXISTS (
+				SELECT 1 FROM retained_storage_interval retained
+				WHERE retained.host_id=s.host_id AND retained.team_id=s.team_id
+				  AND retained.owner_kind='sandbox' AND retained.owner_id=s.id
+				  AND retained.started_at<=$4::timestamptz
+				  AND (retained.ended_at IS NULL OR retained.ended_at>$4::timestamptz)
+			  )
 			  AND s.created_at <= $4::timestamptz
 			  -- A worker can lag sandbox destruction. Reports are eligible based
 			  -- on the sandbox lifetime at receipt, not processing time.
