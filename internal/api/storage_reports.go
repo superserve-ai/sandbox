@@ -576,6 +576,10 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 				SELECT 1 FROM sandbox_storage_interval future
 				WHERE future.sandbox_id=owner.id AND future.started_at>$4::timestamptz
 			  )
+			  AND NOT EXISTS (
+				SELECT 1 FROM retained_storage_interval future
+				WHERE future.owner_kind='sandbox' AND future.owner_id=owner.id AND future.started_at>$4::timestamptz
+			  )
 			), legacy_handoff AS (
 				-- A delayed legacy report must trim an already-closed source
 				-- interval at the receipt boundary. Also close only the source
@@ -594,6 +598,10 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 				  AND NOT EXISTS (
 					SELECT 1 FROM sandbox_storage_interval future
 					WHERE future.sandbox_id=owner.id AND future.started_at>$4::timestamptz
+				  )
+				  AND NOT EXISTS (
+					SELECT 1 FROM retained_storage_interval future
+					WHERE future.owner_kind='sandbox' AND future.owner_id=owner.id AND future.started_at>$4::timestamptz
 				  )
 			), eligible AS MATERIALIZED (
 			SELECT s.id, s.team_id, s.destroyed_at, m.disk_mib FROM measurements m
@@ -619,9 +627,14 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 				  AND future.team_id=s.team_id
 				  AND future.started_at > $4::timestamptz
 			)
+			  AND NOT EXISTS (
+				SELECT 1 FROM retained_storage_interval future
+				WHERE future.owner_kind='sandbox' AND future.owner_id=s.id AND future.started_at>$4::timestamptz
+			)
 		), current_intervals AS MATERIALIZED (
 			SELECT e.id, e.team_id, e.destroyed_at, e.disk_mib,
-			       i.id AS interval_id, i.disk_mib AS current_disk_mib
+			       i.id AS interval_id, i.disk_mib AS current_disk_mib,
+			       i.ended_at AS prior_end, i.end_reason AS prior_end_reason
 			FROM eligible e
 				LEFT JOIN sandbox_storage_interval i
 				  ON i.sandbox_id=e.id
@@ -637,8 +650,9 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 		)
 		INSERT INTO sandbox_storage_interval(sandbox_id, team_id, disk_mib, started_at, ended_at, end_reason)
 		SELECT e.id, e.team_id, e.disk_mib, $4::timestamptz,
-		       e.destroyed_at,
-		       CASE WHEN e.destroyed_at IS NULL THEN NULL ELSE 'deleted' END
+		       LEAST(e.destroyed_at,e.prior_end),
+		       CASE WHEN e.prior_end IS NOT NULL AND (e.destroyed_at IS NULL OR e.prior_end<e.destroyed_at)
+		         THEN e.prior_end_reason WHEN e.destroyed_at IS NOT NULL THEN 'deleted' END
 		FROM current_intervals e
 		LEFT JOIN closed c ON c.sandbox_id=e.id AND c.team_id=e.team_id
 		WHERE e.interval_id IS NULL OR e.current_disk_mib IS DISTINCT FROM e.disk_mib

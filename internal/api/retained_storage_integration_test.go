@@ -802,3 +802,101 @@ func TestIntegration_RetainedSnapshotOnlySettlementWaitsForReport(t *testing.T) 
 		t.Fatalf("snapshot-only retained storage = %v, want positive", amount)
 	}
 }
+
+func TestIntegration_RetainedMixedHistoryFencesDelayedHandoff(t *testing.T) {
+	for _, delayedRetained := range []bool{false, true} {
+		t.Run(fmt.Sprintf("delayed-retained-%t", delayedRetained), func(t *testing.T) {
+			f := newStorageLeaseFixture(t)
+			ctx := t.Context()
+			exec := func(q string, args ...any) {
+				t.Helper()
+				if _, err := f.pool.Exec(ctx, q, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t0, t1, t2 := f.receivedAt.Add(-time.Minute), f.receivedAt, f.receivedAt.Add(time.Minute)
+			exec(`DELETE FROM sandbox_storage_interval`)
+			legacyHost, retainedHost := f.hostID, "other-host"
+			legacyStart, legacyEnd, retainedStart, retainedEnd := t0, any(t2), t2, any(nil)
+			if delayedRetained {
+				legacyHost, retainedHost = retainedHost, legacyHost
+				legacyStart, legacyEnd, retainedStart, retainedEnd = t2, nil, t0, t2
+			}
+			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at,ended_at,end_reason)
+ SELECT id,team_id,$2,8,$3,$4,'reassigned' FROM sandbox WHERE id=$1`, f.sandboxID, legacyHost, legacyStart, legacyEnd)
+			exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
+ SELECT $2,team_id,'sandbox',id,$3,'[]',$4,$5 FROM sandbox WHERE id=$1`, f.sandboxID, retainedHost, strings.Repeat("a", 64), retainedStart, retainedEnd)
+			snapshot := func() string {
+				t.Helper()
+				var result string
+				if err := f.pool.QueryRow(ctx, `SELECT jsonb_build_array(
+ (SELECT jsonb_agg(to_jsonb(i) ORDER BY id) FROM sandbox_storage_interval i),
+ (SELECT jsonb_agg(to_jsonb(i) ORDER BY id) FROM retained_storage_interval i))::text`).Scan(&result); err != nil {
+					t.Fatal(err)
+				}
+				return result
+			}
+			before := snapshot()
+			measurements := f.measurements
+			if delayedRetained {
+				measurements = []storageReportMeasurement{{Retained: &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{{Kind: "sandbox", ID: f.sandboxID.String(), Generation: strings.Repeat("b", 64), Extents: []retainedstorage.Extent{}}}}}}
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				exec(`UPDATE host_storage_report SET state='processing',next_measurement_index=0 WHERE report_id=$1`, f.reportID)
+				err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, t1, measurements, 1, 1)
+				if delayedRetained && !errors.Is(err, errStorageReportInvalidPayload) {
+					t.Fatalf("superseded retained report = %v", err)
+				}
+				if !delayedRetained && err != nil {
+					t.Fatal(err)
+				}
+				if got := snapshot(); got != before {
+					t.Fatalf("delayed report changed handoff history: %s -> %s", before, got)
+				}
+			}
+		})
+	}
+}
+
+func TestIntegration_RetainedReplacementPreservesKnownEnd(t *testing.T) {
+	for _, retained := range []bool{false, true} {
+		for _, sameBoundary := range []bool{false, true} {
+			t.Run(fmt.Sprintf("retained-%t/same-boundary-%t", retained, sameBoundary), func(t *testing.T) {
+				f := newStorageLeaseFixture(t)
+				ctx := t.Context()
+				exec := func(q string, args ...any) {
+					t.Helper()
+					if _, err := f.pool.Exec(ctx, q, args...); err != nil {
+						t.Fatal(err)
+					}
+				}
+				start, end := f.receivedAt.Add(-time.Minute), f.receivedAt.Add(time.Minute)
+				at := f.receivedAt
+				if sameBoundary {
+					at = start
+				}
+				measurements := f.measurements
+				if retained {
+					exec(`DELETE FROM sandbox_storage_interval`)
+					exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
+ SELECT host_id,team_id,'sandbox',id,$2,'[]',$3,$4 FROM sandbox WHERE id=$1`, f.sandboxID, strings.Repeat("a", 64), start, end)
+					measurements = []storageReportMeasurement{{Retained: &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{{Kind: "sandbox", ID: f.sandboxID.String(), Generation: strings.Repeat("b", 64), Extents: []retainedstorage.Extent{}}}}}}
+				} else {
+					exec(`UPDATE sandbox_storage_interval SET ended_at=$1,end_reason='reassigned'`, end)
+				}
+				if err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, at, measurements, 1, 1); err != nil {
+					t.Fatal(err)
+				}
+				query := `SELECT ended_at,end_reason FROM sandbox_storage_interval WHERE disk_mib=16`
+				if retained {
+					query = `SELECT ended_at,'reassigned'::text FROM retained_storage_interval WHERE generation='` + strings.Repeat("b", 64) + `'`
+				}
+				var got time.Time
+				var reason string
+				if err := f.pool.QueryRow(ctx, query).Scan(&got, &reason); err != nil || !got.Equal(end) || reason != "reassigned" {
+					t.Fatalf("replacement lost handoff boundary: %v %s %v", got, reason, err)
+				}
+			})
+		}
+	}
+}

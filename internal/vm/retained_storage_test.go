@@ -970,3 +970,92 @@ func TestRetainedDependencyUpdateFencesConcurrentDurableWrite(t *testing.T) {
 		t.Fatalf("concurrent pause was overwritten: %+v %v", after, err)
 	}
 }
+
+func TestRetainedCleanupPreservesDiscoveryAtomically(t *testing.T) {
+	for _, path := range []string{"reconciler", "startup-dead", "startup-missing-socket", "request-error"} {
+		for _, failArchive := range []bool{false, true} {
+			t.Run(path+"/archive-failure="+strconv.FormatBool(failArchive), func(t *testing.T) {
+				statePath := filepath.Join(t.TempDir(), "state.db")
+				store, err := OpenStateStore(statePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = store.Close() }()
+				rec := VMRecord{ID: uuid.NewString(), Status: StatusError, DiskPath: "/example/overlay.ext4", BasePath: "/example/base.ext4", MemFilePath: "/example/mem.snap", SocketPath: filepath.Join(t.TempDir(), "missing.sock")}
+				if err := store.Put(rec); err != nil {
+					t.Fatal(err)
+				}
+				if failArchive {
+					// A bucket at the owner's key makes the archive write fail while
+					// the live record remains readable and writable.
+					if err := store.db.Update(func(tx *bolt.Tx) error {
+						b, err := tx.CreateBucketIfNotExists(retainedRecordBucketName)
+						if err != nil {
+							return err
+						}
+						_, err = b.CreateBucket([]byte(rec.ID))
+						return err
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				m := &Manager{log: zerolog.Nop(), state: store, vms: map[string]*VMInstance{}, netMgr: &fakeNetMgr{}}
+				oldDown, oldStop := vmUnitFullyDown, staleUnitStopConfirmed
+				vmUnitFullyDown = func(string) bool { return path != "startup-missing-socket" }
+				staleUnitStopConfirmed = func(context.Context, string) bool { return true }
+				t.Cleanup(func() { vmUnitFullyDown, staleUnitStopConfirmed = oldDown, oldStop })
+				switch path {
+				case "reconciler":
+					err = NewReconciler(m, DefaultReconcilerConfig()).markStale(rec.ID)
+					if (err != nil) != failArchive {
+						t.Fatalf("cleanup error = %v", err)
+					}
+				case "startup-dead", "startup-missing-socket":
+					m.reattachRecord(t.Context(), rec, true)
+				case "request-error":
+					bin := t.TempDir()
+					if err := os.WriteFile(filepath.Join(bin, "systemctl"), []byte("#!/bin/sh\nexit 3\n"), 0700); err != nil {
+						t.Fatal(err)
+					}
+					t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
+					m.vms[rec.ID] = toInstance(rec)
+					m.handleVMError(rec.ID, errors.New("connection lost"))
+				}
+				live, err := store.Get(rec.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if failArchive {
+					if live == nil || live.DiskPath != rec.DiskPath {
+						t.Fatal("failed preservation lost the live record")
+					}
+					return
+				}
+				if live != nil {
+					t.Fatal("dead owner remains in lifecycle discovery")
+				}
+				if err := store.Close(); err != nil {
+					t.Fatal(err)
+				}
+				store, err = OpenStateStore(statePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				records, err := store.retainedRecords()
+				if err != nil || len(records) != 1 || records[0].DiskPath != rec.DiskPath || records[0].MemFilePath != rec.MemFilePath {
+					t.Fatalf("restart lost retained dependencies: %+v %v", records, err)
+				}
+				liveRecords, err := store.All()
+				if err != nil || len(liveRecords) != 0 {
+					t.Fatalf("restart resurrected dead owner: %+v %v", liveRecords, err)
+				}
+				m.state = store
+				m.deleteState(rec.ID)
+				records, err = store.retainedRecords()
+				if err != nil || len(records) != 0 {
+					t.Fatalf("explicit destroy left retained metadata: %+v %v", records, err)
+				}
+			})
+		}
+	}
+}

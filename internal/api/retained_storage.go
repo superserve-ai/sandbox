@@ -102,6 +102,11 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
     SELECT 1 FROM retained_storage_interval i
     JOIN supplied o ON o.kind=i.owner_kind AND o.id=i.owner_id
     WHERE i.started_at>$2
+  )
+  AND NOT EXISTS(
+    SELECT 1 FROM sandbox_storage_interval i
+    JOIN supplied o ON o.kind='sandbox' AND o.id=i.sandbox_id
+    WHERE i.started_at>$2
   )`, hostID, at, payload, retainedstorage.MaxOwners).Scan(&complete)
 	if err != nil {
 		return err
@@ -138,7 +143,7 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
   INSERT INTO retained_storage_cutover(host_id,team_id,started_at)
   SELECT DISTINCT $1,team_id,$2 FROM eligible ON CONFLICT DO NOTHING
  ), current AS MATERIALIZED (
-  SELECT e.*,i.id interval_id,i.generation old_generation,i.extents old_extents,i.started_at old_started_at
+  SELECT e.*,i.id interval_id,i.generation old_generation,i.extents old_extents,i.started_at old_started_at,i.ended_at old_ended_at
  FROM eligible e LEFT JOIN retained_storage_interval i ON i.host_id=$1 AND i.owner_kind=e.kind AND i.owner_id=e.id
    AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)
  ), closed AS (
@@ -147,12 +152,12 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
    AND (c.old_generation IS DISTINCT FROM c.generation OR c.old_extents IS DISTINCT FROM c.extents)
   RETURNING i.id
  ), replaced AS (
-  UPDATE retained_storage_interval i SET generation=c.generation,extents=c.extents,ended_at=c.lifetime_end
+  UPDATE retained_storage_interval i SET generation=c.generation,extents=c.extents,ended_at=LEAST(c.lifetime_end,c.old_ended_at)
   FROM current c WHERE i.id=c.interval_id AND c.old_started_at=$2
    AND (c.old_generation IS DISTINCT FROM c.generation OR c.old_extents IS DISTINCT FROM c.extents)
   RETURNING i.id
  ) INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
- SELECT $1,c.team_id,c.kind,c.id,c.generation,c.extents,$2,c.lifetime_end FROM current c
+ SELECT $1,c.team_id,c.kind,c.id,c.generation,c.extents,$2,LEAST(c.lifetime_end,c.old_ended_at) FROM current c
  LEFT JOIN closed ON closed.id=c.interval_id
  WHERE c.interval_id IS NULL OR closed.id IS NOT NULL`, hostID, at, payload)
 	return err

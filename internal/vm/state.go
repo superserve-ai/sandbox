@@ -638,20 +638,28 @@ func (s *StateStore) Delete(vmID string) error {
 	})
 }
 
-// PutRetainedRecord archives artifact references for a failed owner after its
-// live lifecycle record is released. Keeping this projection separate prevents
-// startup from reattaching a dead VM while storage accounting remains complete.
-func (s *StateStore) PutRetainedRecord(rec VMRecord) error {
-	data, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
+// ReleaseRetainingStorage atomically moves the durable record out of lifecycle
+// discovery while preserving its artifact references for storage accounting.
+func (s *StateStore) ReleaseRetainingStorage(vmID string) error {
 	return s.db.Batch(func(tx *bolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists(retainedRecordBucketName)
-		if err != nil {
+		key := []byte(vmID)
+		live := tx.Bucket(bucketName)
+		if data := live.Get(key); data != nil {
+			archive, err := tx.CreateBucketIfNotExists(retainedRecordBucketName)
+			if err != nil {
+				return err
+			}
+			if err := archive.Put(key, data); err != nil {
+				return err
+			}
+		}
+		if err := live.Delete(key); err != nil {
 			return err
 		}
-		return bucket.Put([]byte(rec.ID), data)
+		if err := dropIndexEntries(tx, key); err != nil {
+			return err
+		}
+		return tx.Bucket(previewPolicyBucketName).Delete(key)
 	})
 }
 

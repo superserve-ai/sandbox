@@ -825,3 +825,75 @@ func TestRetainedStorageHistorySweepQualification(t *testing.T) {
 		})
 	}
 }
+
+func TestRetainedStorageRollbackOwnerBoundaries(t *testing.T) {
+	for _, reassigned := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reassigned-%t", reassigned), func(t *testing.T) {
+			f := newStorageReportFixture(t, "paused", false)
+			team := sandboxTeamID(t, f.sandboxID)
+			ctx := t.Context()
+			tx, err := testPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(context.Background())
+			exec := func(q string, args ...any) {
+				t.Helper()
+				if _, err := tx.Exec(ctx, q, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cutover := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+			start, secondStart, retainedStart, end := cutover.Add(10*time.Second), cutover.Add(20*time.Second), cutover.Add(40*time.Second), cutover.Add(time.Minute)
+			snapshot, second := uuid.New(), uuid.New()
+			const path = "/example/rollback-base.ext4"
+			exec(`INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES($1,$2,$3,$4,'pause')`, snapshot, f.sandboxID, team, path)
+			exec(`UPDATE sandbox SET created_at=$2,snapshot_id=$3,base_path=$4 WHERE id=$1`, f.sandboxID, start, snapshot, path)
+			exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,base_path,snapshot_id)
+ VALUES($1,$2,'example-rollback','paused',$3,1,1024,2,$4,$5,$6)`, second, team, f.hostID, secondStart, path, snapshot)
+			exec(`INSERT INTO artifact_manifest(snapshot_id,file_name,path,size_bytes,allocated_bytes,sha256)
+ VALUES($1,'rootfs.ext4',$2,1048576,1048576,$3)`, snapshot, path, strings.Repeat("0", 64))
+			exec(`INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, cutover)
+			if reassigned {
+				exec(`UPDATE sandbox SET created_at=$2 WHERE id=$1`, f.sandboxID, cutover.Add(-time.Minute))
+				// A prior stay on this host must not clip a later legacy stay.
+				exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
+ VALUES($1,$2,'sandbox',$3,$4,'[{"device":"fs","start":0,"length":1048576}]',$5,$6)`, f.hostID, team, f.sandboxID, strings.Repeat("a", 64), cutover, cutover.Add(5*time.Second))
+			}
+			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
+ VALUES($1,$3,$4,2,$5),($2,$3,$4,2,$6)`, f.sandboxID, second, team, f.hostID, start, secondStart)
+			assertUsage := func(from, to time.Time, want float64) {
+				t.Helper()
+				for _, floor := range []bool{false, true} {
+					var got float64
+					if err := tx.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,$4)::float8`, team, from, to, floor).Scan(&got); err != nil {
+						t.Fatal(err)
+					}
+					if got != want {
+						t.Fatalf("usage [%v,%v) floor=%t = %v, want %v", from, to, floor, got, want)
+					}
+				}
+			}
+			// Shared base is charged once; each owner's overlay is separate.
+			assertUsage(start, end, 30+40*5)
+			before := float64(0)
+			if reassigned {
+				before = 5
+			}
+			assertUsage(cutover.Add(-time.Second), end, before+230)
+			assertUsage(cutover.Add(-time.Second), start, before)
+			// Retained reporting resumes later. Legacy quantities stop exactly
+			// at each owner's first observation of this stay, not the host's
+			// old permanent cutover or an earlier visit by the same owner.
+			for i, id := range []uuid.UUID{f.sandboxID, second} {
+				extents := fmt.Sprintf(`[{"device":"fs","start":0,"length":1048576},{"device":"fs","start":%d,"length":1048576}]`, (i+1)*1048576)
+				exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
+ VALUES($1,$2,'sandbox',$3,$4,$5,$6,$7)`, f.hostID, team, id, strings.Repeat("b", 64), extents, retainedStart, end)
+			}
+			assertUsage(start, retainedStart, 30+20*5)
+			assertUsage(retainedStart, end, 20*3)
+			assertUsage(start, end, 190)
+			assertUsage(cutover.Add(-time.Second), end, before+190)
+		})
+	}
+}

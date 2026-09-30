@@ -5625,7 +5625,10 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 				sigkillPID(rec.PID, 500*time.Millisecond)
 				log.Info().Int("pid", rec.PID).Msg("killed orphan Firecracker process")
 			}
-			m.state.Delete(rec.ID)
+			if err := m.state.ReleaseRetainingStorage(rec.ID); err != nil {
+				log.Error().Err(err).Msg("failed to preserve stale storage metadata")
+				return nil, false
+			}
 			// Free this record's namespace/slot directly instead of a broad
 			// re-sweep (which would also delete the warm pool's netns).
 			m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
@@ -5693,7 +5696,7 @@ func (m *Manager) reattachRecord(ctx context.Context, rec VMRecord, cleanupStale
 					return m.returnInterruptedResumeToPaused(ctx, rec, cleanupStale, log)
 				}
 				if confirmed {
-					if derr := m.state.Delete(rec.ID); derr == nil {
+					if derr := m.state.ReleaseRetainingStorage(rec.ID); derr == nil {
 						m.netMgr.CleanupVMOrNamespace(rec.ID, rec.Namespace)
 						return nil, false
 					} else {
@@ -6233,8 +6236,11 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 
 	m.log.Warn().Str("vm_id", vmID).Err(origErr).
 		Msg("VM process is dead — cleaning up and returning NotFound")
-	m.persistState(inst)
-	m.deleteState(vmID)
+	if m.state != nil && !isBuildVM(vmID) {
+		if err := m.state.ReleaseRetainingStorage(vmID); err != nil {
+			m.log.Error().Err(err).Str("vm_id", vmID).Msg("failed to preserve dead VM storage metadata")
+		}
+	}
 	return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
 }
 
