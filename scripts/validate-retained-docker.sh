@@ -54,4 +54,10 @@ docker run --rm --privileged \
     echo "BEGIN: retained-storage-physical-race (disposable XFS, reflink=1)"
     go test -v -race -count=1 -timeout 5m -run "^TestRetainedPhysical" ./internal/vm
     echo "PASS: retained-storage-physical-race"
+    echo "BEGIN: retained-storage-filesystem-billing-race (Docker Linux, disposable XFS)"
+    billing_log=$(mktemp /tmp/retained-billing.XXXXXX)
+    go test -v -race -tags integration -count=1 -timeout 5m -run "^TestRetainedStorageRealFilesystemReachesBillingConsumer$" ./internal/integration | tee "$billing_log"
+    grep -q -- "--- PASS: TestRetainedStorageRealFilesystemReachesBillingConsumer " "$billing_log"
+    rm -f "$billing_log"
+    echo "PASS: retained-storage-filesystem-billing-race"
   '
