@@ -385,11 +385,8 @@ func runMigrate(args []string) int {
 		generation  int64 // the snapshot row is reused across pauses; its generation is what moves
 	}
 	type job struct {
-		id         string
-		s          shape
-		disk, base string
-		blockMap   string
-		standalone bool
+		id string
+		s  shape
 	}
 	// Boots run on a fixed pool fed a little at a time, so the poll below
 	// never waits on a whole batch: a sandbox the reaper has paused gets
@@ -417,7 +414,20 @@ func runMigrate(args []string) int {
 	defer close(jobs)
 
 	run = func(j job) {
-		id, s, disk, base, blockMap, standalone := j.id, j.s, j.disk, j.base, j.blockMap, j.standalone
+		id, s := j.id, j.s
+		// Resolving the restore materializes and hashes a base the
+		// destination does not hold yet, so it runs on this pool rather
+		// than in the loop that selects rows: serialized there, every boot
+		// would queue behind all of them. Before the claim, so a base that
+		// cannot be resolved leaves the row where it is.
+		rd, err := restoredDisk(ctx, *root, id)
+		if err != nil {
+			mu.Lock()
+			recordFailure(id, err.Error())
+			mu.Unlock()
+			return
+		}
+		disk, base, blockMap, standalone := rd.disk, rd.base, rd.blockMap, rd.standalone
 		{
 			{
 				{
@@ -770,7 +780,14 @@ func runMigrate(args []string) int {
 
 			handed := 0
 			for id, s := range shapes {
-				rd, err := restoredDisk(ctx, *root, id)
+				// Marker only: whether a restored copy is the current pause
+				// is a question about its manifest, and resolving its base
+				// belongs to the worker that boots it.
+				var rd restored
+				m, err := backup.RestoredGeneration(filepath.Join(*root, id))
+				if err == nil {
+					rd.manifest = *m
+				}
 				if err == nil && (len(s.recorded) == 0 || s.snapshotID == nil) {
 					mu.Lock()
 					unanchored++
@@ -802,7 +819,7 @@ func runMigrate(args []string) int {
 				booting++
 				mu.Unlock()
 				handed++
-				jobs <- job{id: id, s: s, disk: rd.disk, base: rd.base, blockMap: rd.blockMap, standalone: rd.standalone}
+				jobs <- job{id: id, s: s}
 			}
 			mu.Lock()
 			fmt.Printf("handed %d, booting %d, in flight %d, queued %d, moved %d, failed %d, %s elapsed\n",

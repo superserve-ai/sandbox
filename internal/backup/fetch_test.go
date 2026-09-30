@@ -489,3 +489,32 @@ func TestFetchGenerationReadsTheManifestOnce(t *testing.T) {
 		}
 	}
 }
+
+// A copy that fails its digest is never published under the name a later
+// resolution trusts on sight, and leaves nothing half-done behind.
+func TestHostBaseLeavesNothingBehindWhenTheCopyFailsItsDigest(t *testing.T) {
+	stubClone(t, copyClone)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(src, bytes.Repeat([]byte{0x11}, 64<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restore := t.TempDir()
+
+	// The digest of something else: what the template held at pause time.
+	base, err := hostBase(context.Background(), restore, digestOf(bytes.Repeat([]byte{0x22}, 64<<10)), src)
+	if err != nil || base != "" {
+		t.Fatalf("base = %q (%v), want no base and no error", base, err)
+	}
+	entries, err := os.ReadDir(restore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("left %v in the restore", names)
+	}
+}

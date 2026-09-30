@@ -201,21 +201,33 @@ func hostBasePath(m *GenerationManifest, sha string) string {
 // free for the fetch that follows. Only a check that could not run at all
 // is an error.
 func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
-	dst := filepath.Join(dir, SharedBaseName(sha))
-	if err := snapshotFileMode(ctx, dst, src, stageAuto); err != nil {
+	// Hashed under a name nothing resolves, and given the manifest's name
+	// only once it matches: published first, a crash in between would
+	// leave an unverified copy that the next resolution here trusts on
+	// sight.
+	staging := filepath.Join(dir, "."+SharedBaseName(sha)+".unverified")
+	if err := snapshotFileMode(ctx, staging, src, stageAuto); err != nil {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
 		return "", nil
 	}
-	if err := verifyPath(ctx, dst, sha); err != nil {
-		if rerr := os.Remove(dst); rerr != nil {
+	if err := verifyPath(ctx, staging, sha); err != nil {
+		if rerr := os.Remove(staging); rerr != nil {
 			return "", fmt.Errorf("discard unverified base copy: %w", rerr)
 		}
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
 		return "", nil
+	}
+	dst := filepath.Join(dir, SharedBaseName(sha))
+	if err := os.Rename(staging, dst); err != nil {
+		_ = os.Remove(staging)
+		return "", fmt.Errorf("publish verified base copy: %w", err)
+	}
+	if err := syncDir(dir); err != nil {
+		return "", fmt.Errorf("publish verified base copy: %w", err)
 	}
 	return dst, nil
 }
