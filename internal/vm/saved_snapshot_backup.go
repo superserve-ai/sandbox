@@ -99,9 +99,10 @@ func (m *Manager) backupSavedSnapshot(ctx context.Context, man *SavedSnapshotMan
 		files = append(files, f)
 		return nil
 	}
-	hashFailed := func(what string, err error) bool {
-		if errors.Is(err, os.ErrNotExist) {
-			// Deleted while it waited its turn: nothing left to back up.
+	hashFailed := func(what, path string, err error) bool {
+		// Only the snapshot's own file being gone means it was deleted while
+		// it waited its turn; a base gone from under it is a failure.
+		if _, serr := os.Stat(path); errors.Is(err, os.ErrNotExist) && errors.Is(serr, os.ErrNotExist) {
 			log.Info().Msg("saved snapshot backup: snapshot deleted before its " + what + " was hashed")
 		} else {
 			log.Warn().Err(err).Msg("saved snapshot backup: " + what + " hash failed; not queued")
@@ -112,13 +113,13 @@ func (m *Manager) backupSavedSnapshot(ctx context.Context, man *SavedSnapshotMan
 	if man.SnapshotPath != "" && man.BasePath != "" {
 		if p := overlayBlockMapPath(man.SnapshotPath); statRegularFile(p) {
 			if err := add(backup.BlockMapName, p, ""); err != nil {
-				return hashFailed("block map", err)
+				return hashFailed("block map", p, err)
 			}
 		}
 	}
 	// Restore reads the disk as rootfs.ext4, whatever the capture named it.
 	if err := add("rootfs.ext4", man.DiskPath, man.BasePath); err != nil {
-		return hashFailed("disk", err)
+		return hashFailed("disk", man.DiskPath, err)
 	}
 	task := backup.Task{
 		SnapshotID: man.SnapshotID,

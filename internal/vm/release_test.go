@@ -43,14 +43,14 @@ func TestReleaseOfAFrozenGuestRetriesOnlyAThawThatTimedOut(t *testing.T) {
 func TestReleaseOfAFrozenGuestGivesUpWithinItsBudget(t *testing.T) {
 	origUnpause, origThaw, origBudget := fcUnpauseVM, boxdThawGuest, releaseThawBudget
 	t.Cleanup(func() { fcUnpauseVM, boxdThawGuest, releaseThawBudget = origUnpause, origThaw, origBudget })
-	releaseThawBudget = 300 * time.Millisecond
+	releaseThawBudget = 500 * time.Millisecond
 	fcUnpauseVM = func(context.Context, string) error { return errors.New("unpause VM: status 500: busy") }
 	attempts := 0
 	boxdThawGuest = func(context.Context, string, string) error { attempts++; return context.DeadlineExceeded }
 	m := &Manager{log: zerolog.Nop()}
 	start := time.Now()
 	err := m.releaseFrozenGuest(context.Background(), "/run/vm.sock", "10.0.0.2", "tok")
-	if err == nil || attempts < 2 || time.Since(start) > 3*time.Second {
+	if err == nil || attempts < 2 || time.Since(start) > time.Second {
 		t.Fatalf("err=%v attempts=%d took=%v; want repeated thaws bounded by the budget", err, attempts, time.Since(start))
 	}
 	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "busy") {

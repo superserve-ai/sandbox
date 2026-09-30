@@ -9022,7 +9022,7 @@ func (m *Manager) releaseFrozenGuest(ctx context.Context, socketPath, ip, token 
 	deadline := time.Now().Add(releaseThawBudget)
 	var terr error
 	for attempt := 0; ; attempt++ {
-		tctx, cancel := context.WithTimeout(base, 2*time.Second)
+		tctx, cancel := context.WithTimeout(base, min(2*time.Second, time.Until(deadline)))
 		terr = boxdThawGuest(tctx, ip, token)
 		cancel()
 		if terr == nil {
@@ -9031,10 +9031,11 @@ func (m *Manager) releaseFrozenGuest(ctx context.Context, socketPath, ip, token 
 			}
 			return nil
 		}
-		if !answerTimedOut(terr) || !time.Now().Before(deadline) {
+		wait := time.Duration(attempt+1) * 100 * time.Millisecond
+		if !answerTimedOut(terr) || time.Until(deadline) <= wait {
 			break
 		}
-		time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
+		time.Sleep(wait)
 	}
 	if uerr != nil {
 		return fmt.Errorf("thaw: %w; unpause: %v", terr, uerr)

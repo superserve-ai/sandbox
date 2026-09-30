@@ -199,3 +199,19 @@ func TestSavedSnapshotBackupSkipsADeletedSnapshotQuietly(t *testing.T) {
 		t.Fatalf("a deleted snapshot was logged as a failure:\n%s", out)
 	}
 }
+
+// A base gone from under a snapshot that still exists is a failure, not a
+// deletion.
+func TestSavedSnapshotBackupWarnsWhenItsBaseIsMissing(t *testing.T) {
+	m, man, queued, _ := savedBackupFixture(t)
+	if err := os.Remove(man.BasePath); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if m.backupSavedSnapshot(context.Background(), man, zerolog.New(&buf)) || len(*queued) != 0 {
+		t.Fatal("queued a snapshot whose base is missing")
+	}
+	if !strings.Contains(buf.String(), `"level":"warn"`) {
+		t.Fatalf("a missing base was not logged as a failure:\n%s", buf.String())
+	}
+}

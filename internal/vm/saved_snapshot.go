@@ -455,11 +455,16 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		}
 	}
 	var releaseErr error
+	tRelease := time.Now()
 	if frozen {
 		releaseErr = m.releaseOrConfirmRunning(ctx, socket, ip, token)
 	} else {
 		releaseErr = unpauseSourceWithProbe(ctx, socket)
 	}
+	// Emitted whatever follows: a release that waited on the guest, or
+	// failed, is exactly what these phases must show.
+	releaseFor := time.Since(tRelease)
+	m.recordPhases("saved_snapshot", string(kind), map[string]time.Duration{"freeze": freezeFor, "frozen": frozenFor, "release": releaseFor})
 	// What a memory capture did to the record is made durable only now,
 	// with the guest released: a store write must not hold it paused. The
 	// chain advanced, or the baseline was spent by a full image or a write
@@ -486,8 +491,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	if captureErr != nil {
 		return captureErr
 	}
-	m.recordPhases("saved_snapshot", string(kind), map[string]time.Duration{"freeze": freezeFor, "frozen": frozenFor})
-	log.Info().Dur("freeze", freezeFor).Dur("frozen", frozenFor).Bool("workload_frozen", frozen).Bool("guest_flushed_stopped", synced).Msg("saved snapshot: source captured and released")
+	log.Info().Dur("freeze", freezeFor).Dur("frozen", frozenFor).Dur("release", releaseFor).Bool("workload_frozen", frozen).Bool("guest_flushed_stopped", synced).Msg("saved snapshot: source captured and released")
 	return nil
 }
 
