@@ -94,7 +94,7 @@ func reconcileRetainedStorage(ctx context.Context, s *StateStore, runDir, snapsh
 		}
 		byID[ref.ID] = ref
 	}
-	records, err := s.retainedRecords()
+	records, err := s.retainedRecordsContext(ctx)
 	if err != nil {
 		return result, err
 	}
@@ -117,6 +117,21 @@ func reconcileRetainedStorage(ctx context.Context, s *StateStore, runDir, snapsh
 		var resolveErr error
 		if !exists {
 			resolveErr = fmt.Errorf("no live sandbox creation row on this host")
+			// An archived record has no lifecycle worker left to converge it.
+			// Once the control-plane reference set authoritatively omits it,
+			// retire the archive so quarantined paths cannot poison future scans.
+			if apply {
+				live, getErr := s.Get(rec.ID)
+				if getErr != nil {
+					resolveErr = getErr
+				} else if live == nil {
+					if deleteErr := s.DeleteRetainedRecord(rec.ID); deleteErr != nil {
+						resolveErr = deleteErr
+					} else {
+						receipt.Status, receipt.Reason, resolveErr = "retired", "control-plane owner absent", nil
+					}
+				}
+			}
 		} else if rec.SourceSnapshotID == "" && rec.RevivedDisk == "" && ((rec.BasePath != "" && rec.DeltaDir == "") || (rec.BasePath == "" && rec.RootfsPath == "")) {
 			var resolved VMRecord
 			resolved, receipt.Metadata, resolveErr = reconcileRetainedRecord(rec, ref, runDir, snapshotDir)

@@ -297,6 +297,13 @@ INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
 SELECT a.id, a.team_id, a.disk_mib, now()
 FROM activated a
 WHERE feature_enabled('billing_metrics_write', a.team_id)
+  -- After retained physical reporting has cut over, activation.disk_mib is
+  -- provisioned capacity rather than a trusted measurement. The next durable
+  -- host report owns the quantity; do not charge the template baseline here.
+  AND NOT EXISTS (
+    SELECT 1 FROM retained_storage_cutover c
+    WHERE c.team_id = a.team_id AND c.started_at <= now()
+  )
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING;
 
 -- name: DestroySandbox :one

@@ -12,10 +12,12 @@ import (
 )
 
 const (
-	Version         = 1
-	MaxOwners       = 4096
-	MaxExtents      = 32768
-	MaxPayloadBytes = 8 << 20
+	Version   = 1
+	MaxOwners = 4096
+	// MaxVisitedEntries bounds excluded records in the shared Bolt bucket.
+	MaxVisitedEntries = MaxOwners * 8
+	MaxExtents        = 32768
+	MaxPayloadBytes   = 8 << 20
 	// Manifest metadata is input to the bounded inventory scan.  Keep its
 	// cumulative budget below the report payload budget so a fleet-sized set of
 	// individually valid manifests cannot force gigabytes of reads.

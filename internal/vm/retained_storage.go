@@ -29,10 +29,22 @@ func (m *Manager) beginStorageMutation() func() {
 }
 
 func (s *StateStore) retainedLiveRecords() ([]VMRecord, error) {
+	return s.retainedLiveRecordsContext(context.Background())
+}
+
+func (s *StateStore) retainedLiveRecordsContext(ctx context.Context) ([]VMRecord, error) {
 	records := make([]VMRecord, 0)
 	bytes := 0
+	visited := 0
 	err := s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketName).ForEach(func(k, v []byte) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			visited++
+			if visited > retainedstorage.MaxVisitedEntries {
+				return fmt.Errorf("retained record scan budget exceeded")
+			}
 			// The records bucket also contains build and warm-pool entries. Their
 			// values are not part of retained inventory, so reject non-UUID keys
 			// before decoding them; a large unrelated fleet must not consume the
@@ -71,11 +83,15 @@ func (s *StateStore) retainedLiveRecords() ([]VMRecord, error) {
 // retainedRecords combines live lifecycle records with archived failed-owner
 // metadata. A live record wins if an archive from an earlier cleanup remains.
 func (s *StateStore) retainedRecords() ([]VMRecord, error) {
-	live, err := s.retainedLiveRecords()
+	return s.retainedRecordsContext(context.Background())
+}
+
+func (s *StateStore) retainedRecordsContext(ctx context.Context) ([]VMRecord, error) {
+	live, err := s.retainedLiveRecordsContext(ctx)
 	if err != nil {
 		return nil, err
 	}
-	archived, err := s.retainedArchivedRecords()
+	archived, err := s.retainedArchivedRecordsContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -375,7 +391,7 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 	if m.storageMutations.Load() != 0 || m.state == nil {
 		return nil, fmt.Errorf("retained inventory not ready")
 	}
-	records, err := m.state.retainedRecords()
+	records, err := m.state.retainedRecordsContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -513,7 +529,7 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 			return nil, fmt.Errorf("retained artifact changed during inventory")
 		}
 	}
-	after, err := m.state.retainedRecords()
+	after, err := m.state.retainedRecordsContext(ctx)
 	if err != nil {
 		return nil, err
 	}

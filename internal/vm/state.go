@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -634,7 +635,17 @@ func (s *StateStore) Delete(vmID string) error {
 		if err := dropIndexEntries(tx, key); err != nil {
 			return err
 		}
-		return tx.Bucket(previewPolicyBucketName).Delete(key)
+		if err := tx.Bucket(previewPolicyBucketName).Delete(key); err != nil {
+			return err
+		}
+		// Live and archived metadata are one deletion unit. A failure or crash
+		// cannot expose an obsolete archive after the live record is removed.
+		if archive := tx.Bucket(retainedRecordBucketName); archive != nil {
+			if err := archive.Delete(key); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 
@@ -649,12 +660,50 @@ func (s *StateStore) ReleaseRetainingStorage(vmID string) error {
 			if err != nil {
 				return err
 			}
-			if err := archive.Put(key, data); err != nil {
+			var rec VMRecord
+			if err := json.Unmarshal(data, &rec); err != nil {
+				return err
+			}
+			// Process cleanup has been confirmed. Keep artifact paths, but do not
+			// leave a lifecycle marker that only live reconciliation can resolve.
+			rec.Unverified = false
+			rec.RevivalPending = false
+			rec.TeardownPending = ""
+			rec.WakePending = false
+			rec.WakeToken = ""
+			rec.WakeSnapshotPath = ""
+			rec.WakeMemPath = ""
+			rec.WakeOwedFromPaused = false
+			settled, err := json.Marshal(rec)
+			if err != nil {
+				return err
+			}
+			if err := archive.Put(key, settled); err != nil {
 				return err
 			}
 		}
 		if err := live.Delete(key); err != nil {
 			return err
+		}
+		if err := dropIndexEntries(tx, key); err != nil {
+			return err
+		}
+		return tx.Bucket(previewPolicyBucketName).Delete(key)
+	})
+}
+
+// RetireRetainingStorage removes a confirmed orphan without preserving an
+// inventory dependency whose owner no longer exists in the control plane.
+func (s *StateStore) RetireRetainingStorage(vmID string) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		key := []byte(vmID)
+		if err := tx.Bucket(bucketName).Delete(key); err != nil {
+			return err
+		}
+		if archive := tx.Bucket(retainedRecordBucketName); archive != nil {
+			if err := archive.Delete(key); err != nil {
+				return err
+			}
 		}
 		if err := dropIndexEntries(tx, key); err != nil {
 			return err
@@ -675,14 +724,26 @@ func (s *StateStore) DeleteRetainedRecord(vmID string) error {
 }
 
 func (s *StateStore) retainedArchivedRecords() ([]VMRecord, error) {
+	return s.retainedArchivedRecordsContext(context.Background())
+}
+
+func (s *StateStore) retainedArchivedRecordsContext(ctx context.Context) ([]VMRecord, error) {
 	var records []VMRecord
 	bytes := 0
+	visited := 0
 	err := s.db.View(func(tx *bolt.Tx) error {
 		bucket := tx.Bucket(retainedRecordBucketName)
 		if bucket == nil {
 			return nil
 		}
 		return bucket.ForEach(func(key, value []byte) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			visited++
+			if visited > retainedstorage.MaxVisitedEntries {
+				return fmt.Errorf("retained archive scan budget exceeded")
+			}
 			if len(records) >= retainedstorage.MaxOwners {
 				return fmt.Errorf("retained owner budget exceeded")
 			}

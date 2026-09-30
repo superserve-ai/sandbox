@@ -112,7 +112,7 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
 		return err
 	}
 	if !complete {
-		return fmt.Errorf("%w: retained inventory is incomplete or superseded", errStorageReportInvalidPayload)
+		return fmt.Errorf("%w: retained inventory is incomplete or superseded", errStorageReportRetainedIncomplete)
 	}
 	_, err = tx.Exec(ctx, `WITH supplied AS MATERIALIZED (
   SELECT * FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,generation text,extents jsonb)

@@ -32,6 +32,10 @@ const (
 var (
 	errStorageReportStaleIncarnation = errors.New("stale host incarnation")
 	errStorageReportInvalidPayload   = errors.New("invalid storage report payload")
+	// Valid JSON can still describe an incomplete or superseded retained
+	// inventory. Such a report remains retryable so settlement cannot treat an
+	// unmeasured first interval as an explicit zero.
+	errStorageReportRetainedIncomplete = errors.New("retained storage inventory incomplete")
 )
 
 type storageReportMeasurement struct {
@@ -552,6 +556,40 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 		SELECT id FROM sandbox
 		WHERE id=ANY($1::uuid[]) AND host_id=$2
 		ORDER BY id FOR NO KEY UPDATE`, ids, hostID); err != nil {
+		return err
+	}
+	// Close source-host intervals in their own statements before attempting the
+	// destination insert. Data-modifying CTEs that are not referenced by the
+	// final statement do not provide an execution-order guarantee, so relying on
+	// them can let the one-open-interval constraint discard the destination.
+	if _, err := tx.Exec(ctx, `
+		UPDATE retained_storage_interval old
+		SET ended_at=$4::timestamptz
+		FROM unnest($1::uuid[]) AS ids(sandbox_id) JOIN sandbox owner ON owner.id=ids.sandbox_id
+		WHERE old.owner_kind='sandbox' AND old.owner_id=ids.sandbox_id
+		  AND old.host_id IS DISTINCT FROM $3
+		  AND old.started_at<$4::timestamptz
+		  AND (old.ended_at IS NULL OR old.ended_at>$4::timestamptz)
+		  AND owner.host_id=$3 AND owner.created_at <= $4::timestamptz
+		  AND (owner.destroyed_at IS NULL OR owner.destroyed_at > $4::timestamptz)
+		  AND feature_enabled('billing_metrics_write',owner.team_id)
+		  AND NOT EXISTS (SELECT 1 FROM sandbox_storage_interval future WHERE future.sandbox_id=owner.id AND future.started_at>$4::timestamptz)
+		  AND NOT EXISTS (SELECT 1 FROM retained_storage_interval future WHERE future.owner_kind='sandbox' AND future.owner_id=owner.id AND future.started_at>$4::timestamptz)`, ids, disk, hostID, receivedAt); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE sandbox_storage_interval old
+		SET ended_at=$4::timestamptz, end_reason='reassigned'
+		FROM unnest($1::uuid[]) AS ids(sandbox_id) JOIN sandbox owner ON owner.id=ids.sandbox_id
+		WHERE old.sandbox_id=owner.id
+		  AND old.host_id IS DISTINCT FROM $3
+		  AND old.started_at<$4::timestamptz
+		  AND (old.ended_at IS NULL OR old.ended_at>$4::timestamptz)
+		  AND owner.host_id=$3 AND owner.created_at <= $4::timestamptz
+		  AND (owner.destroyed_at IS NULL OR owner.destroyed_at > $4::timestamptz)
+		  AND feature_enabled('billing_metrics_write',owner.team_id)
+		  AND NOT EXISTS (SELECT 1 FROM sandbox_storage_interval future WHERE future.sandbox_id=owner.id AND future.started_at>$4::timestamptz)
+		  AND NOT EXISTS (SELECT 1 FROM retained_storage_interval future WHERE future.owner_kind='sandbox' AND future.owner_id=owner.id AND future.started_at>$4::timestamptz)`, ids, disk, hostID, receivedAt); err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `
