@@ -52,6 +52,41 @@ func RestoredGeneration(dir string) (*GenerationManifest, error) {
 	return nil, fmt.Errorf("restore marker lists no rootfs")
 }
 
+// RestoredDependencies reports whether a restore names everything a boot
+// needs and can reach all of it without materializing anything: the
+// rootfs, a block map it lists, and either a base copy of its own or the
+// template the pause recorded. Nothing is hashed, so this says what would
+// move, not that the bytes are the right ones.
+func RestoredDependencies(dir string) error {
+	m, err := RestoredGeneration(dir)
+	if err != nil {
+		return err
+	}
+	listsBlockMap := false
+	for _, f := range m.Files {
+		if f.Name == BlockMapName {
+			listsBlockMap = true
+		}
+	}
+	for _, f := range m.Files {
+		if f.Name != "rootfs.ext4" || f.BaseSHA256 == "" {
+			continue
+		}
+		if listsBlockMap {
+			if _, err := os.Stat(filepath.Join(dir, BlockMapName)); err != nil {
+				return fmt.Errorf("restored without its block map")
+			}
+		}
+		if _, err := os.Stat(filepath.Join(dir, SharedBaseName(f.BaseSHA256))); err == nil {
+			return nil
+		}
+		if hostBasePath(m, f.BaseSHA256) == "" {
+			return fmt.Errorf("restored without its base %s", f.BaseSHA256)
+		}
+	}
+	return nil
+}
+
 // RestoredDisk reads the completion marker in dir and resolves the rootfs
 // and, for an overlay, the shared base: the copy beside it, or the host's
 // own template when the generation was restored without one. Resolving a
@@ -114,8 +149,13 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 	if generation == "" {
 		return Restored{}, ErrNoMatchingBackup
 	}
-	if done, err := RestoredDisk(ctx, destDir); err == nil && done.Manifest.Generation == generation && manifestOwner(done.Manifest) == owner {
-		return done, nil
+	// Identity before dependencies: resolving another generation's base
+	// would materialize and hash gigabytes inside the fetch budget, for a
+	// directory the clear below is about to remove.
+	if m, err := RestoredGeneration(destDir); err == nil && m.Generation == generation && manifestOwner(m) == owner {
+		if done, err := RestoredDisk(ctx, destDir); err == nil {
+			return done, nil
+		}
 	}
 	// A reuse check the context cut short establishes nothing about what
 	// is in place, and the clear below is not recoverable: a complete

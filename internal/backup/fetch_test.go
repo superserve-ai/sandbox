@@ -518,3 +518,89 @@ func TestHostBaseLeavesNothingBehindWhenTheCopyFailsItsDigest(t *testing.T) {
 		t.Fatalf("left %v in the restore", names)
 	}
 }
+
+// A restore of another generation is cleared, so resolving its base first
+// would materialize and hash gigabytes for nothing.
+func TestFetchGenerationDoesNotResolveAStaleRestoresBase(t *testing.T) {
+	clones := 0
+	stubClone(t, func(dst, src *os.File) error {
+		clones++
+		return copyClone(dst, src)
+	})
+	store := newMemBlobs()
+
+	// A completed restore of one generation, holding no copy of its base.
+	stale := t.TempDir()
+	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+	basePath := filepath.Join(stale, "base.ext4")
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := writePauseFixture(t, stale, "pause A")
+	old.Files[0].BasePath = basePath
+	old.Files[0].BaseSHA256 = digestOf(baseData)
+	old.Generation = GenerationKey(old.Files)
+	uploadFixture(t, store, old)
+	dest := filepath.Join(t.TempDir(), old.SandboxID)
+	if _, err := FetchGeneration(context.Background(), store, old.SandboxID, old.Generation, dest, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dest, SharedBaseName(old.Files[0].BaseSHA256))); err != nil {
+		t.Fatal(err)
+	}
+
+	// A newer generation of the same sandbox, depending on no base at all.
+	next := t.TempDir()
+	fresh := writePauseFixture(t, next, "pause B")
+	uploadFixture(t, store, fresh)
+	clones = 0
+
+	if _, err := FetchGeneration(context.Background(), store, fresh.SandboxID, fresh.Generation, dest, nil); err != nil {
+		t.Fatal(err)
+	}
+	if clones != 0 {
+		t.Fatalf("materialized %d base copies for a restore that was about to be cleared", clones)
+	}
+}
+
+// The inventory that previews a migration must report a restore whose
+// dependencies it cannot reach, rather than queueing it for a boot that
+// then rejects it.
+func TestRestoredDependenciesReportsAnUnreachableBase(t *testing.T) {
+	stubClone(t, copyClone)
+	store := newMemBlobs()
+	dir := t.TempDir()
+	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+	basePath := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writePauseFixture(t, dir, "pause A")
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+
+	dest := filepath.Join(t.TempDir(), task.SandboxID)
+	if _, err := FetchGeneration(context.Background(), store, task.SandboxID, task.Generation, dest, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Its own copy answers for it.
+	if err := RestoredDependencies(dest); err != nil {
+		t.Fatalf("a restore holding its base reported %v", err)
+	}
+	// Without that copy the recorded template answers for it.
+	if err := os.Remove(filepath.Join(dest, SharedBaseName(task.Files[0].BaseSHA256))); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoredDependencies(dest); err != nil {
+		t.Fatalf("a restore whose template is still there reported %v", err)
+	}
+	// With neither, there is nothing to boot over and the preview says so.
+	if err := os.Remove(basePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := RestoredDependencies(dest); err == nil {
+		t.Fatal("a restore with no reachable base was reported as movable")
+	}
+}

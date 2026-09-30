@@ -229,11 +229,12 @@ func runMigrate(args []string) int {
 		if skip[id] {
 			continue
 		}
-		// Marker only: the inventory reports what would move, so it
-		// neither resolves a base (a multi-gigabyte read per row, over a
-		// handful of templates a fleet shares) nor puts a verified copy
-		// into a restore. The handoff below resolves the ones it takes.
-		if _, err := backup.RestoredGeneration(filepath.Join(*root, id)); err != nil {
+		// Everything a boot needs must be reachable, but nothing is read
+		// or written to establish it: the inventory reports what would
+		// move, including under --dry-run, so it must not hash a base per
+		// row (a handful of templates serve the whole fleet) nor leave a
+		// copy in a restore it was only asked about.
+		if err := backup.RestoredDependencies(filepath.Join(*root, id)); err != nil {
 			notRestored++
 			continue
 		}
