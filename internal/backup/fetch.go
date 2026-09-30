@@ -5,13 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/time/rate"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-
-	"golang.org/x/time/rate"
 )
 
 // ErrNoMatchingBackup reports that the generation recorded for the pause is
@@ -71,7 +70,12 @@ func RestoredDisk(ctx context.Context, dir string) (Restored, error) {
 		if _, err := os.Stat(r.Base); err == nil {
 			return r, nil
 		}
-		if r.Base = hostBaseFor(ctx, f); r.Base != "" {
+		base, err := hostBaseFor(ctx, f)
+		if err != nil {
+			return r, fmt.Errorf("restored base %s: %w", f.BaseSHA256, err)
+		}
+		if base != "" {
+			r.Base = pinHostBase(dir, f.BaseSHA256, base)
 			return r, nil
 		}
 		return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
@@ -90,6 +94,12 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 	}
 	if done, err := RestoredDisk(ctx, destDir); err == nil && done.Manifest.Generation == generation && manifestOwner(done.Manifest) == owner {
 		return done, nil
+	}
+	// A reuse check the context cut short establishes nothing about what
+	// is in place, and the clear below is not recoverable: a complete
+	// restore would be discarded because the budget expired mid-hash.
+	if err := ctx.Err(); err != nil {
+		return Restored{}, err
 	}
 	if err := os.RemoveAll(destDir); err != nil {
 		return Restored{}, fmt.Errorf("clear restore dir: %w", err)
@@ -119,6 +129,13 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 	if _, err := restoreGeneration(ctx, r, owner, generation, destDir, skip, progress); err != nil {
 		return Restored{}, err
 	}
+	// Pin what the skip decision already checked, so resolving the restore
+	// below does not read those bases a second time.
+	for _, mf := range m.Files {
+		if held[mf.BaseSHA256] && mf.BasePath != "" {
+			pinHostBase(destDir, mf.BaseSHA256, mf.BasePath)
+		}
+	}
 	return RestoredDisk(ctx, destDir)
 }
 
@@ -132,17 +149,44 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 // the work the match was going to save. Hashing costs what the fetched
 // base costs anyway: every restored file, this base included, is hashed
 // by verifyFile before the restore is called complete.
-func hostBaseFor(ctx context.Context, f ManifestFile) string {
+func hostBaseFor(ctx context.Context, f ManifestFile) (string, error) {
 	if f.BasePath == "" || f.BaseSHA256 == "" {
-		return ""
+		return "", nil
 	}
-	if info, err := os.Stat(f.BasePath); err != nil || !info.Mode().IsRegular() {
-		return ""
+	info, err := os.Stat(f.BasePath)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", nil
 	}
 	if err := verifyPath(ctx, f.BasePath, f.BaseSHA256); err != nil {
-		return ""
+		// A check that could not run is not a base worth replacing, and
+		// callers act on that difference: a cancelled hash must surface as
+		// cancellation, not as a missing base.
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", nil
 	}
-	return f.BasePath
+	return f.BasePath, nil
+}
+
+// pinHostBase gives the restore its own name for a host base whose
+// contents were just checked, by linking the very inode that was read.
+// Two things follow: this restore resolves again without reading the base
+// a second time, and a template rebuilt at that path afterwards cannot
+// change the bytes under a VM already booted on them. A link the
+// filesystem will not make (the base lives on another one) leaves the
+// recorded path in use, checked but unpinned, as it was before.
+func pinHostBase(dir, sha, hostPath string) string {
+	// Only the file itself can be pinned: linking a symlink would leave
+	// what the boot reads decided by whatever it points at later.
+	if info, err := os.Lstat(hostPath); err != nil || !info.Mode().IsRegular() {
+		return hostPath
+	}
+	pinned := filepath.Join(dir, SharedBaseName(sha))
+	if err := os.Link(hostPath, pinned); err != nil {
+		return hostPath
+	}
+	return pinned
 }
 
 // verifyPath hashes the file at path, which lives outside any restore
@@ -160,9 +204,15 @@ func verifyPath(ctx context.Context, path, sha string) error {
 	return verifyDigest(ctx, f, extents, apparent, sha)
 }
 
+// hostHoldsBase drives the restore's skip. A check that could not run
+// reports false: the base is then fetched, which fails on a dead context
+// without anything having been discarded.
 func hostHoldsBase(ctx context.Context, m *GenerationManifest, sha string) bool {
 	for _, f := range m.Files {
-		if f.BaseSHA256 == sha && hostBaseFor(ctx, f) != "" {
+		if f.BaseSHA256 != sha {
+			continue
+		}
+		if base, err := hostBaseFor(ctx, f); err == nil && base != "" {
 			return true
 		}
 	}

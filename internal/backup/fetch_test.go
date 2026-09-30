@@ -201,8 +201,16 @@ func TestFetchGenerationUsesTheHostBaseWithoutDownloadingIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Base != basePath {
-		t.Fatalf("base = %s, want the host's %s", got.Base, basePath)
+	hostInfo, err := os.Stat(basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseInfo, err := os.Stat(got.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(hostInfo, baseInfo) {
+		t.Fatalf("base = %s, want the host's own %s", got.Base, basePath)
 	}
 	for object := range counter.reads {
 		if strings.HasPrefix(object, "bases/") {
@@ -333,11 +341,113 @@ func TestRestoredDiskRejectsAHostBaseWhoseContentChanged(t *testing.T) {
 	if _, err := FetchGeneration(context.Background(), store, task.SandboxID, task.Generation, dest, nil); err != nil {
 		t.Fatal(err)
 	}
-	// The restore left the base on the host, so the marker points at it.
+	// An unpinned restore, as every restore on a host predating the pin is:
+	// the marker's recorded path is all it has to go on.
+	if err := os.Remove(filepath.Join(dest, SharedBaseName(task.Files[0].BaseSHA256))); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(basePath, bytes.Repeat([]byte{0x22}, 128<<10), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := RestoredDisk(context.Background(), dest); err == nil {
 		t.Fatalf("base = %s, want a refusal so the caller restores again", got.Base)
+	}
+}
+
+// A checked host base is pinned by the restore, so resolving it again
+// reads nothing and a template rebuilt at that path afterwards cannot
+// change the bytes the VM is already running on.
+func TestRestorePinsAVerifiedHostBase(t *testing.T) {
+	store := newMemBlobs()
+	dir := t.TempDir()
+	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+	basePath := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writePauseFixture(t, dir, "pause A")
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+
+	dest := filepath.Join(t.TempDir(), task.SandboxID)
+	got, err := FetchGeneration(context.Background(), store, task.SandboxID, task.Generation, dest, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := filepath.Join(dest, SharedBaseName(task.Files[0].BaseSHA256))
+	if got.Base != pinned {
+		t.Fatalf("base = %s, want the restore's own %s", got.Base, pinned)
+	}
+	hostInfo, err := os.Stat(basePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinInfo, err := os.Stat(pinned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(hostInfo, pinInfo) {
+		t.Fatal("the pin is a copy, not the inode that was checked")
+	}
+
+	// The template is rebuilt in place, and the restore is unmoved by it.
+	if err := os.Remove(basePath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(basePath, bytes.Repeat([]byte{0x22}, 128<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	again, err := RestoredDisk(context.Background(), dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Base != pinned {
+		t.Fatalf("base = %s, want the pin %s", again.Base, pinned)
+	}
+	held, err := os.ReadFile(again.Base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(held, baseData) {
+		t.Fatal("the pinned base no longer holds the bytes the pause recorded")
+	}
+}
+
+// The reuse check clears the destination when it cannot reuse it, so a
+// check the context cut short must be reported rather than read as a
+// restore worth replacing.
+func TestFetchGenerationKeepsACompleteRestoreWhenTheReuseCheckIsCancelled(t *testing.T) {
+	store := newMemBlobs()
+	dir := t.TempDir()
+	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+	basePath := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writePauseFixture(t, dir, "pause A")
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+
+	dest := filepath.Join(t.TempDir(), task.SandboxID)
+	if _, err := FetchGeneration(context.Background(), store, task.SandboxID, task.Generation, dest, nil); err != nil {
+		t.Fatal(err)
+	}
+	// A restore dir written before bases were pinned: resolving it has to
+	// read the host base again, which is what the context cuts short.
+	if err := os.Remove(filepath.Join(dest, SharedBaseName(task.Files[0].BaseSHA256))); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := FetchGeneration(ctx, store, task.SandboxID, task.Generation, dest, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want the cancellation reported", err)
+	}
+	if _, err := os.Stat(filepath.Join(dest, ManifestObject)); err != nil {
+		t.Fatalf("the completed restore was discarded: %v", err)
 	}
 }
