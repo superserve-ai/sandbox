@@ -190,6 +190,14 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 		return ok
 	}
 	if _, err := restoreGeneration(ctx, r, owner, generation, destDir, m, skip, progress); err != nil {
+		// restoreGeneration cleans up only what it created itself, and
+		// nothing will ever boot from a failed restore: leaving a base
+		// behind costs real bytes on any host without reflink.
+		for name, ok := range satisfied {
+			if ok {
+				_ = os.Remove(filepath.Join(destDir, name))
+			}
+		}
 		return Restored{}, err
 	}
 	return RestoredDisk(ctx, destDir)
@@ -266,7 +274,10 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 		_ = os.Remove(staging)
 		return "", fmt.Errorf("publish verified base copy: %w", err)
 	}
-	if err := syncDir(dir); err != nil {
+	// Published and verified already, so cancellation here costs only
+	// this caller: what it leaves behind is a base a later resolution is
+	// right to trust.
+	if err := syncDirWithContext(ctx, dir); err != nil {
 		return "", fmt.Errorf("publish verified base copy: %w", err)
 	}
 	return dst, nil

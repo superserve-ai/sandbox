@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -602,5 +603,46 @@ func TestRestoredDependenciesReportsAnUnreachableBase(t *testing.T) {
 	}
 	if err := RestoredDependencies(dest); err == nil {
 		t.Fatal("a restore with no reachable base was reported as movable")
+	}
+}
+
+// breakingReader fails reads of one object, so a restore can be made to
+// abort after earlier entries have already been put in place.
+type breakingReader struct {
+	inner BlobReader
+	named string
+}
+
+func (b breakingReader) NewReader(ctx context.Context, object string) (io.ReadCloser, error) {
+	if strings.Contains(object, b.named) {
+		return nil, errors.New("object unavailable")
+	}
+	return b.inner.NewReader(ctx, object)
+}
+
+// Nothing boots from a failed restore, so a base it materialized from the
+// host must not be left occupying the disk.
+func TestFetchGenerationDiscardsAMaterializedBaseWhenTheRestoreFails(t *testing.T) {
+	stubClone(t, copyClone)
+	store := newMemBlobs()
+	dir := t.TempDir()
+	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+	basePath := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writePauseFixture(t, dir, "pause A")
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+
+	dest := filepath.Join(t.TempDir(), task.SandboxID)
+	broken := breakingReader{inner: store, named: "vmstate"}
+	if _, err := FetchGeneration(context.Background(), broken, task.SandboxID, task.Generation, dest, nil); err == nil {
+		t.Fatal("want the restore to fail on the unavailable artifact")
+	}
+	if _, err := os.Stat(filepath.Join(dest, SharedBaseName(task.Files[0].BaseSHA256))); err == nil {
+		t.Fatal("the failed restore kept the base it materialized")
 	}
 }

@@ -672,6 +672,18 @@ func syncDir(path string) error {
 	return d.Sync()
 }
 
+// syncDirWithContext is syncDir released on cancellation, so a stalled
+// filesystem cannot hold a restore past its budget or keep a migration
+// worker occupied; the fsync itself finishes in the background either way.
+func syncDirWithContext(ctx context.Context, path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return syncWithContext(ctx, d)
+}
+
 // removeStagedTask deletes a task's staging directory once the task is
 // finished (verified or abandoned). Only paths under root are touched.
 func removeStagedTask(root string, task Task) {
