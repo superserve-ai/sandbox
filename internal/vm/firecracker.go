@@ -168,6 +168,10 @@ func newFCClient(socketPath string) *fcclient.Firecracker {
 			}
 			return net.DialUnix("unix", nil, addr)
 		},
+		// Each call builds its own transport, so a kept-alive connection is
+		// never reused, only held: Firecracker's API admits ten at a time,
+		// and a VM's tenth call would leave every later one refused.
+		DisableKeepAlives: true,
 	}
 	c := fcclient.NewHTTPClient(strfmt.NewFormats())
 	c.SetTransport(transport)
