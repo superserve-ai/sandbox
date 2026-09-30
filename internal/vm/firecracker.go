@@ -158,9 +158,14 @@ type FirecrackerConfig struct {
 // ---------------------------------------------------------------------------
 
 // newFCClient creates a Firecracker API client that talks over the given Unix socket.
-func newFCClient(socketPath string) *fcclient.Firecracker {
+// newFCClient returns a client for one logical operation and the close the
+// caller owes it when done. The connection is reused across the operation's
+// calls and released at its end: Firecracker's API admits ten connections
+// per VM, and one held open by each operation would have a VM's later calls
+// refused.
+func newFCClient(socketPath string) (*fcclient.Firecracker, func()) {
 	transport := httptransport.New(fcclient.DefaultHost, fcclient.DefaultBasePath, fcclient.DefaultSchemes)
-	transport.Transport = &http.Transport{
+	tr := &http.Transport{
 		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 			addr, err := net.ResolveUnixAddr("unix", socketPath)
 			if err != nil {
@@ -169,9 +174,10 @@ func newFCClient(socketPath string) *fcclient.Firecracker {
 			return net.DialUnix("unix", nil, addr)
 		},
 	}
+	transport.Transport = tr
 	c := fcclient.NewHTTPClient(strfmt.NewFormats())
 	c.SetTransport(transport)
-	return c
+	return c, tr.CloseIdleConnections
 }
 
 func strPtr(s string) *string { return &s }
@@ -208,7 +214,8 @@ func shortID(s string) string {
 // ---------------------------------------------------------------------------
 
 func ConfigureMachine(socketPath string, cfg FirecrackerConfig) error {
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	ctx := context.Background()
 
 	bootArgs := cfg.KernelArgs
@@ -323,7 +330,8 @@ func ConfigureMachine(socketPath string, cfg FirecrackerConfig) error {
 // ---------------------------------------------------------------------------
 
 func StartInstance(socketPath string) error {
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	actionType := models.InstanceActionInfoActionTypeInstanceStart
 	if _, err := fc.Operations.CreateSyncAction(&operations.CreateSyncActionParams{
 		Context: context.Background(),
@@ -367,7 +375,8 @@ func CreateSnapshotContext(ctx context.Context, socketPath, snapshotPath, memPat
 	if mode == SnapshotFlatten && blockDeltaDir == "" {
 		return fmt.Errorf("SnapshotFlatten requires non-empty blockDeltaDir")
 	}
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 
 	// Pause the VM.
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
@@ -455,7 +464,8 @@ func CreateDiffSnapshot(socketPath, snapshotPath, memPath, expectedSessionID str
 
 // CreateDiffSnapshotContext is CreateDiffSnapshot bounded by ctx.
 func CreateDiffSnapshotContext(ctx context.Context, socketPath, snapshotPath, memPath, expectedSessionID string, expectedGeneration int64) error {
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
 		Context: ctx,
@@ -495,7 +505,8 @@ func CreateDiffSnapshotContext(ctx context.Context, socketPath, snapshotPath, me
 // UnpauseVM resumes a paused VM's vCPUs. Used after CreateSnapshot to make
 // snapshot creation non-destructive.
 func UnpauseVM(socketPath string) error {
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.PatchVM(&operations.PatchVMParams{
 		Context: context.Background(),
 		Body:    &models.VM{State: strPtr(models.VMStateResumed)},
@@ -545,7 +556,8 @@ func LoadSnapshotNoResume(socketPath, snapshotPath, memPath, ifaceID, tapDevice,
 	if tapDevice != "" {
 		overrides = []*models.NetworkOverride{{IfaceID: &ifaceID, HostDevName: &tapDevice}}
 	}
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: context.Background(),
 		Body: &models.SnapshotLoadParams{
@@ -570,7 +582,8 @@ func LoadSnapshotNoResume(socketPath, snapshotPath, memPath, ifaceID, tapDevice,
 // SnapshotPausedVM creates a Full snapshot of an already-paused VM (e.g. one
 // loaded via LoadSnapshotNoResume), issuing no pause first as CreateSnapshot does.
 func SnapshotPausedVM(socketPath, snapshotPath, memPath string) error {
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.CreateSnapshot(&operations.CreateSnapshotParams{
 		Context: context.Background(),
 		Body: &models.SnapshotCreateParams{
@@ -588,7 +601,8 @@ func SnapshotPausedVM(socketPath, snapshotPath, memPath string) error {
 // hydrates a fresh per-VM overlay from <dir>/<drive_id>.delta — pass empty
 // for in-place resume (existing overlay already carries state).
 func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, clockRealtime *bool) error {
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: context.Background(),
 		Body: &models.SnapshotLoadParams{
@@ -615,7 +629,8 @@ func RestoreSnapshot(socketPath, snapshotPath, memPath, blockDeltaDir string, cl
 // RestoreSnapshotWithOverrides loads a snapshot, overrides the network TAP
 // device, and resumes the VM. See RestoreSnapshot for blockDeltaDir semantics.
 func RestoreSnapshotWithOverrides(socketPath, snapshotPath, memPath, ifaceID, tapDevice, blockDeltaDir string, clockRealtime *bool) error {
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: context.Background(),
 		Body: &models.SnapshotLoadParams{
@@ -659,7 +674,8 @@ func RestoreSnapshotUffdInternalWithOverrides(
 	// Bound LoadSnapshot so a hung Firecracker doesn't wedge vmd.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	fc := newFCClient(socketPath)
+	fc, closeFC := newFCClient(socketPath)
+	defer closeFC()
 	if _, err := fc.Operations.LoadSnapshot(&operations.LoadSnapshotParams{
 		Context: ctx,
 		Body: &models.SnapshotLoadParams{
