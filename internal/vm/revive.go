@@ -609,15 +609,9 @@ func seedRevivedRetainedDependencies(inst *VMInstance, previous *VMRecord) {
 		return
 	}
 	inst.SourceSnapshotID = previous.SourceSnapshotID
-	// A salvage revival cold-boots without the paused memory image. Do not
-	// carry a stale layered base from a legacy record whose memory path is
-	// already absent: inventory would treat that obsolete dependency as a
-	// retained artifact and reject every subsequent host report when it is
-	// missing. A real memory image keeps its base for the normal layered case.
+	// Cold boot does not use the previous memory image, even if its path
+	// remains recorded. Its base is not a dependency of the new generation.
 	inst.BaseMemPath = ""
-	if previous.MemFilePath != "" {
-		inst.BaseMemPath = previous.BaseMemPath
-	}
 	inst.StrandedOverlays = append([]string(nil), previous.StrandedOverlays...)
 	if previous.RootfsPath != "" {
 		inst.Config.RootfsPath = previous.RootfsPath

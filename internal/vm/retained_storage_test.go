@@ -756,8 +756,17 @@ func TestRetainedDependencyUpdatePreservesCurrentFields(t *testing.T) {
 }
 
 func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
-	for _, legacy := range []bool{true, false} {
-		t.Run(strconv.FormatBool(legacy), func(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		legacy     bool
+		memoryPath bool
+	}{
+		{name: "legacy-empty-memory", legacy: true},
+		{name: "pinned-empty-memory"},
+		{name: "legacy-paused-memory", legacy: true, memoryPath: true},
+		{name: "pinned-paused-memory", memoryPath: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			statePath := filepath.Join(root, "state.db")
 			state, err := OpenStateStore(statePath)
@@ -767,8 +776,15 @@ func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
 			t.Cleanup(func() { state.Close() })
 			id := uuid.NewString()
 			previous := VMRecord{ID: id, Status: StatusError, BaseMemPath: filepath.Join(root, "missing-old-memory-base")}
+			if tc.memoryPath {
+				previous.Status = StatusPaused
+				previous.MemFilePath = filepath.Join(root, "old-mem.diff")
+				if err := os.WriteFile(previous.MemFilePath, []byte("obsolete memory"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
 			salvage := filepath.Join(root, "salvaged.ext4")
-			if !legacy {
+			if !tc.legacy {
 				previous.RootfsPath = filepath.Join(root, "pinned-rootfs.ext4")
 			}
 			// coldBootFromRootfs establishes this source before invoking the
@@ -779,7 +795,7 @@ func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
 				t.Fatalf("cold-boot revival retained obsolete memory base %q", inst.BaseMemPath)
 			}
 			wantRootfs := previous.RootfsPath
-			if legacy {
+			if tc.legacy {
 				wantRootfs = salvage
 			}
 			if inst.Config.RootfsPath != wantRootfs {
@@ -790,6 +806,38 @@ func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
 			if err := state.Put(toRecord(inst)); err != nil {
 				t.Fatal(err)
 			}
+			for _, path := range []string{wantRootfs, inst.DiskPath} {
+				if err := os.WriteFile(path, []byte("retained"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			assertInventory := func(wantPaths int) {
+				t.Helper()
+				if err := state.Close(); err != nil {
+					t.Fatal(err)
+				}
+				state, err = OpenStateStore(statePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rec, err := state.Get(id)
+				if err != nil || rec == nil {
+					t.Fatalf("restart lost record: %v", err)
+				}
+				if rec.BaseMemPath != "" {
+					t.Fatalf("restart retained obsolete memory base %q", rec.BaseMemPath)
+				}
+				m := &Manager{state: state, cfg: ManagerConfig{RunDir: root, SnapshotDir: filepath.Join(root, "snapshots")}, vms: map[string]*VMInstance{id: toInstance(*rec)}}
+				seen := map[string]bool{}
+				inv, err := m.retainedStorageInventory(t.Context(), func(f *os.File, _ int) ([]retainedstorage.Extent, string, error) {
+					seen[f.Name()] = true
+					return []retainedstorage.Extent{{Device: "fs", Start: int64(len(seen)) * 4096, Length: 4096}}, f.Name(), nil
+				})
+				if err != nil || inv == nil || len(inv.Owners) != 1 || len(seen) != wantPaths || !seen[wantRootfs] || !seen[inst.DiskPath] || seen[previous.MemFilePath] {
+					t.Fatalf("revived inventory lost dependencies: paths=%v err=%v", seen, err)
+				}
+			}
+			assertInventory(2)
 			// Persist the full-pause transition, which replaces memory anchors.
 			inst.Status = StatusPaused
 			inst.SnapshotPath = filepath.Join(root, "vmstate.snap")
@@ -803,26 +851,7 @@ func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {
 			if err := state.Put(toRecord(inst)); err != nil {
 				t.Fatal(err)
 			}
-			if err := state.Close(); err != nil {
-				t.Fatal(err)
-			}
-			state, err = OpenStateStore(statePath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			rec, err := state.Get(id)
-			if err != nil || rec == nil {
-				t.Fatalf("restart lost record: %v", err)
-			}
-			m := &Manager{state: state, cfg: ManagerConfig{RunDir: root, SnapshotDir: filepath.Join(root, "snapshots")}, vms: map[string]*VMInstance{id: toInstance(*rec)}}
-			seen := map[string]bool{}
-			inv, err := m.retainedStorageInventory(t.Context(), func(f *os.File, _ int) ([]retainedstorage.Extent, string, error) {
-				seen[f.Name()] = true
-				return []retainedstorage.Extent{{Device: "fs", Start: int64(len(seen)) * 4096, Length: 4096}}, f.Name(), nil
-			})
-			if err != nil || inv == nil || len(inv.Owners) != 1 || len(seen) != 4 || !seen[wantRootfs] {
-				t.Fatalf("revived inventory lost dependencies: paths=%v err=%v", seen, err)
-			}
+			assertInventory(4)
 		})
 	}
 }
