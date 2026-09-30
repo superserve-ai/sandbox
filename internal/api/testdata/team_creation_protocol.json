@@ -1,0 +1,277 @@
+{
+  "version": 1,
+  "now": 1800000000,
+  "signing_seed_hex": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+  "public_key_base64": "ebVWLo/mVPlAeLES6KmLp5AfhTrmlb7X4OORC60ElmQ=",
+  "next_signing_seed_hex": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+  "next_public_key_base64": "5/FioQvsVZr+oZXk3OhLaVaNXSywlj60RsBoXisX8vA=",
+  "identity_timestamp_format": "YYYY-MM-DDTHH:mm:ss.ffffffZ",
+  "requests": [
+    {
+      "case": "normalized_unicode_create",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.hlLiK3JkPjAM_o8NyU7QAb8ABQG742-z1AEz8i6cksemS347NDzXNGr_M8YJzDX8KWrQfCzEK0_X8sSkjakACA",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 503,
+      "prewrite_code": "provisioning_unavailable",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "read_only_recovery",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"recover\"}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJyZWNvdmVyIn0.-u1QNzKu96xiELmI_TGjuS56pmRueSnvEQ48UDtF2pBDDh9vFkXNSKoaMaxZzCVAOinkRSLi0C7B-NYtBRIuDw",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 503,
+      "prewrite_code": "provisioning_unavailable",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "rotation_overlap",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoibmV4dCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.ld13x6tPL2VPKTMGoRftqIMB_j8DrKGYQWfSysu9bBd7-NsVL7WL1nsGC7qc0EuRlVljCccSc9eFDzYqYHHHDw",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 503,
+      "prewrite_code": "provisioning_unavailable",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "unknown_key",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidW5rbm93biJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.pza42E6ubsHmCRcgPMCf5vTVnohKB39J0kcAxtDPsf0ZN0-nbP0QE7ww32BfSF7PRChl9NOP_yWzogjYoZWXAw",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 401,
+      "prewrite_code": "invalid_assertion",
+      "verifier_error": "invalid team creation assertion",
+      "tampered": false
+    },
+    {
+      "case": "bad_signature",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.h1LiK3JkPjAM_o8NyU7QAb8ABQG742-z1AEz8i6cksemS347NDzXNGr_M8YJzDX8KWrQfCzEK0_X8sSkjakACA",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 401,
+      "prewrite_code": "invalid_assertion",
+      "verifier_error": "invalid team creation assertion",
+      "tampered": true
+    },
+    {
+      "case": "expired",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1799999849,\"exp\":1799999969,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTc5OTk5OTg0OSwiZXhwIjoxNzk5OTk5OTY5LCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.qptvJnyb56zJdRqPhcqdOFbsjvjIX53KEOTYw7YYxQwEHZD4Y_vsy7gASaDOvbJpq0mPuU_HUDx_Q4sYn2kBCA",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 401,
+      "prewrite_code": "assertion_expired",
+      "verifier_error": "expired team creation assertion",
+      "tampered": false
+    },
+    {
+      "case": "overflow_lifetime",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":-9223372036854775808,\"exp\":9223372036854775807,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6LTkyMjMzNzIwMzY4NTQ3NzU4MDgsImV4cCI6OTIyMzM3MjAzNjg1NDc3NTgwNywicmVxdWVzdF9pZCI6IjQyMTQwYjFlLWFjNzctNGFiMC05ODQxLWQ5MDk5YWU4MjY1YSIsIm5hbWUiOiJDYWbDqSDimIMiLCJyZWdpb24iOiJ1c2UiLCJhdXRob3JpemF0aW9uIjoiY3JlYXRlIiwicG9saWN5Ijp7InZlcnNpb24iOjEsIm1vZGUiOiJmaXJzdF90ZWFtIiwic2Vzc2lvbiI6InBhc3NlZCIsImNhcHRjaGEiOiJwYXNzZWQiLCJwcmVhdXRoIjoicGFzc2VkIiwiZ29vZ2xlX29uYm9hcmRpbmciOiJwYXNzZWQiLCJhZGRpdGlvbmFsX3RlYW0iOiJub3RfYXBwbGljYWJsZSJ9LCJpZGVudGl0eSI6eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiYXV0aF91cGRhdGVkX2F0IjoiMjAyNy0wMS0xNVQwODowMDowMC4wMDAwMDBaIiwib2JzZXJ2ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoifX0.UytVhsqOMNe9ACFiV33URYclxhzZMvTOhrSsJJp18I5JjBft5guV2gUGprSy1PwjdPW3fIKt7QbWYVmkNUXBDg",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 401,
+      "prewrite_code": "invalid_assertion",
+      "verifier_error": "invalid team creation assertion",
+      "tampered": false
+    },
+    {
+      "case": "failed_policy",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"failed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJmYWlsZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.izNn5NVBFojbdh9Xwd8rSp_YLSnwBNaZcN1V4hA8X6khXMw3UHBpnTV9lQAnsWUzHL5oJ8GB7PSNAi3PcwTGAg",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 403,
+      "prewrite_code": "policy_not_satisfied",
+      "verifier_error": "team creation policy not satisfied",
+      "tampered": false
+    },
+    {
+      "case": "wrong_cell",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.hlLiK3JkPjAM_o8NyU7QAb8ABQG742-z1AEz8i6cksemS347NDzXNGr_M8YJzDX8KWrQfCzEK0_X8sSkjakACA",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "usw",
+      "prewrite_status": 409,
+      "prewrite_code": "wrong_region",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "body_substitution",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.hlLiK3JkPjAM_o8NyU7QAb8ABQG742-z1AEz8i6cksemS347NDzXNGr_M8YJzDX8KWrQfCzEK0_X8sSkjakACA",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Changed name\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 401,
+      "prewrite_code": "invalid_assertion",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "actor_request_substitution",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"6b74d27b-2a33-47e0-b7d2-d5761c1b1a56\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"onboarding-v1:53ae930d-e4bd-478a-b64f-82f2b0d7e8e6:use\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjZiNzRkMjdiLTJhMzMtNDdlMC1iN2QyLWQ1NzYxYzFiMWE1NiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoib25ib2FyZGluZy12MTo1M2FlOTMwZC1lNGJkLTQ3OGEtYjY0Zi04MmYyYjBkN2U4ZTY6dXNlIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.-Fvks15axKdB-jSy2rOn8RMRXCimXbTpzPA7sY5R8OeVPP5PkkpqlP1IYLhDKcMuSk7vBF-ieFKCzwsdpmApBg",
+      "body_json": "{\"request_id\":\"onboarding-v1:53ae930d-e4bd-478a-b64f-82f2b0d7e8e6:use\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 400,
+      "prewrite_code": "invalid_request",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "unnormalized_name",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.hlLiK3JkPjAM_o8NyU7QAb8ABQG742-z1AEz8i6cksemS347NDzXNGr_M8YJzDX8KWrQfCzEK0_X8sSkjakACA",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"﻿Café ☃ \",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 400,
+      "prewrite_code": "invalid_request",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "interior_whitespace",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Ca  fé ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhICBmw6kg4piDIiwicmVnaW9uIjoidXNlIiwiYXV0aG9yaXphdGlvbiI6ImNyZWF0ZSIsInBvbGljeSI6eyJ2ZXJzaW9uIjoxLCJtb2RlIjoiZmlyc3RfdGVhbSIsInNlc3Npb24iOiJwYXNzZWQiLCJjYXB0Y2hhIjoicGFzc2VkIiwicHJlYXV0aCI6InBhc3NlZCIsImdvb2dsZV9vbmJvYXJkaW5nIjoicGFzc2VkIiwiYWRkaXRpb25hbF90ZWFtIjoibm90X2FwcGxpY2FibGUifSwiaWRlbnRpdHkiOnsiZW1haWwiOiJ1c2VyQGV4YW1wbGUuY29tIiwiZW1haWxfdmVyaWZpZWQiOnRydWUsImF1dGhfdXBkYXRlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiIsIm9ic2VydmVkX2F0IjoiMjAyNy0wMS0xNVQwODowMDowMC4wMDAwMDBaIn19.efyEg8zuW10piGzpNb8jpjch3m0c0us3xj0wfMMN7P0OwcstG-Xh7DX8lL21Fml-g-VJ9Tm1U-PS-g_vqNhMCQ",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Ca  fé ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 503,
+      "prewrite_code": "provisioning_unavailable",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "absent_email",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":null,\"email_verified\":false,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjpudWxsLCJlbWFpbF92ZXJpZmllZCI6ZmFsc2UsImF1dGhfdXBkYXRlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiIsIm9ic2VydmVkX2F0IjoiMjAyNy0wMS0xNVQwODowMDowMC4wMDAwMDBaIn19.jiu2iBYZ79_sGxgWmjniej2HZ9EYiZXeSaxvznmlGduX3udSYTlE0ls821hzHSqG5k22qQ_-fR-tJH6DDdeECw",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 503,
+      "prewrite_code": "provisioning_unavailable",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "unverified_email",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":false,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjpmYWxzZSwiYXV0aF91cGRhdGVkX2F0IjoiMjAyNy0wMS0xNVQwODowMDowMC4wMDAwMDBaIiwib2JzZXJ2ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoifX0.EZGxrQ39Qr53iZ3wHIjfude8rN1zXnKtz1qn-mgAsxmSsIWLeY_VcbdI8zhPB_Z_RC5vdkSJRSKUeb-zpvXEAQ",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 503,
+      "prewrite_code": "provisioning_unavailable",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "microsecond_revision",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.123456Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjEyMzQ1NloiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.CkNs0U4eC4znLqmhgPze8QBDPf5fO39HvTNVrbVRK3-Qli4h7lr-_vMMQ5XLLx2J7Aqje40_FwCnSqJPlVkKCw",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 503,
+      "prewrite_code": "provisioning_unavailable",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "wrong_timestamp_precision",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.JZe_VClhFfXeLLbR5VpRGoEiIGNSgrF2-YRph9iOTFST7YZvnG_LiFYpjE2ansqGWgYKSQhDs-vWzga8p_wGBA",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 401,
+      "prewrite_code": "invalid_assertion",
+      "verifier_error": "invalid team creation assertion",
+      "tampered": false
+    },
+    {
+      "case": "case_collision",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"},\"Name\":\"replacement\"}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9LCJOYW1lIjoicmVwbGFjZW1lbnQifQ.MT9aewvmoQW8zMUy3x33OoXyJzuwI5tyOJlElyoMTCAW8GDSUxa98aeadm7Ip_B5wHFhpzzVr4hIf22_o4YGDw",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 401,
+      "prewrite_code": "invalid_assertion",
+      "verifier_error": "invalid team creation assertion",
+      "tampered": false
+    },
+    {
+      "case": "duplicate_key",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"},\"name\":\"replacement\"}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9LCJuYW1lIjoicmVwbGFjZW1lbnQifQ.DAoaMqPmrPYpY5uze523lqW9q5uJR2NmKwPT94BardHmTr-O7wlhurkmbdooVy0NgfUKRJyKi0tR3QaCQda4Cw",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 401,
+      "prewrite_code": "invalid_assertion",
+      "verifier_error": "invalid team creation assertion",
+      "tampered": false
+    },
+    {
+      "case": "null_time",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":null,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6bnVsbCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.xKR0vl5vP_siOm2pwJBQ2Ad6lZCXYn3EKgIA7YpoO0afldCs1MLHtAYOLaG4DBMuYf2evQZ1_GWHOR1ECnf5AA",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 401,
+      "prewrite_code": "invalid_assertion",
+      "verifier_error": "invalid team creation assertion",
+      "tampered": false
+    },
+    {
+      "case": "recover_with_evidence",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\",\"authorization\":\"recover\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6IkNhZsOpIOKYgyIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJyZWNvdmVyIiwicG9saWN5Ijp7InZlcnNpb24iOjEsIm1vZGUiOiJmaXJzdF90ZWFtIiwic2Vzc2lvbiI6InBhc3NlZCIsImNhcHRjaGEiOiJwYXNzZWQiLCJwcmVhdXRoIjoicGFzc2VkIiwiZ29vZ2xlX29uYm9hcmRpbmciOiJwYXNzZWQiLCJhZGRpdGlvbmFsX3RlYW0iOiJub3RfYXBwbGljYWJsZSJ9LCJpZGVudGl0eSI6eyJlbWFpbCI6InVzZXJAZXhhbXBsZS5jb20iLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiYXV0aF91cGRhdGVkX2F0IjoiMjAyNy0wMS0xNVQwODowMDowMC4wMDAwMDBaIiwib2JzZXJ2ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoifX0.DaSBZ9KqBwhlJTwGIAXL2AcsOwdDumGkWnRolr_HkwVFUK-Bs8IJ_1EM8OcsBgOxG5YJc312Qiq8vopQfYxFCw",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 401,
+      "prewrite_code": "invalid_assertion",
+      "verifier_error": "invalid team creation assertion",
+      "tampered": false
+    },
+    {
+      "case": "valid_unicode_surrogates",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"\\ud83d\\ude00\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6Ilx1ZDgzZFx1ZGUwMCIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.LtmpGWKbH7bLsgtEA5I4HvWj4OO4jw_MfbqdTbnJZ90TzVZiXGJTBLOdrIB1Z2Qc9TgY9o2hs4CnLqvKeJVrAA",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"😀\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 503,
+      "prewrite_code": "provisioning_unavailable",
+      "verifier_error": "",
+      "tampered": false
+    },
+    {
+      "case": "invalid_unicode_surrogate",
+      "claims_json": "{\"v\":1,\"iss\":\"superserve-console\",\"aud\":\"superserve-team-creation\",\"purpose\":\"team-creation\",\"sub\":\"53ae930d-e4bd-478a-b64f-82f2b0d7e8e6\",\"iat\":1800000000,\"exp\":1800000120,\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"\\ud800\",\"region\":\"use\",\"authorization\":\"create\",\"policy\":{\"version\":1,\"mode\":\"first_team\",\"session\":\"passed\",\"captcha\":\"passed\",\"preauth\":\"passed\",\"google_onboarding\":\"passed\",\"additional_team\":\"not_applicable\"},\"identity\":{\"email\":\"user@example.com\",\"email_verified\":true,\"auth_updated_at\":\"2027-01-15T08:00:00.000000Z\",\"observed_at\":\"2027-01-15T08:00:00.000000Z\"}}",
+      "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6InRlYW0tY3JlYXRpb24rand0Iiwia2lkIjoidGVzdCJ9.eyJ2IjoxLCJpc3MiOiJzdXBlcnNlcnZlLWNvbnNvbGUiLCJhdWQiOiJzdXBlcnNlcnZlLXRlYW0tY3JlYXRpb24iLCJwdXJwb3NlIjoidGVhbS1jcmVhdGlvbiIsInN1YiI6IjUzYWU5MzBkLWU0YmQtNDc4YS1iNjRmLTgyZjJiMGQ3ZThlNiIsImlhdCI6MTgwMDAwMDAwMCwiZXhwIjoxODAwMDAwMTIwLCJyZXF1ZXN0X2lkIjoiNDIxNDBiMWUtYWM3Ny00YWIwLTk4NDEtZDkwOTlhZTgyNjVhIiwibmFtZSI6Ilx1ZDgwMCIsInJlZ2lvbiI6InVzZSIsImF1dGhvcml6YXRpb24iOiJjcmVhdGUiLCJwb2xpY3kiOnsidmVyc2lvbiI6MSwibW9kZSI6ImZpcnN0X3RlYW0iLCJzZXNzaW9uIjoicGFzc2VkIiwiY2FwdGNoYSI6InBhc3NlZCIsInByZWF1dGgiOiJwYXNzZWQiLCJnb29nbGVfb25ib2FyZGluZyI6InBhc3NlZCIsImFkZGl0aW9uYWxfdGVhbSI6Im5vdF9hcHBsaWNhYmxlIn0sImlkZW50aXR5Ijp7ImVtYWlsIjoidXNlckBleGFtcGxlLmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdXRoX3VwZGF0ZWRfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwLjAwMDAwMFoiLCJvYnNlcnZlZF9hdCI6IjIwMjctMDEtMTVUMDg6MDA6MDAuMDAwMDAwWiJ9fQ.yXHxBjcioiGIFdSPcIcYmYMWpjE4-428u-5GzvTwSCyAwuuyPGg7EMeSGhrM3Wh48ff40vxQsaTRewxLXrmwAA",
+      "body_json": "{\"request_id\":\"42140b1e-ac77-4ab0-9841-d9099ae8265a\",\"name\":\"Café ☃\",\"region\":\"use\"}",
+      "receiving_cell": "use",
+      "prewrite_status": 401,
+      "prewrite_code": "invalid_assertion",
+      "verifier_error": "invalid team creation assertion",
+      "tampered": false
+    }
+  ],
+  "response_shapes": {
+    "success": {
+      "id": "17ab80ad-a02d-4f72-a7e1-20932b1fa0c1",
+      "name": "Café ☃",
+      "region": "use"
+    },
+    "error": {
+      "error": {
+        "code": "result_not_found",
+        "message": "No completed result exists"
+      }
+    }
+  }
+}
