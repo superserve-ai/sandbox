@@ -28,7 +28,7 @@ func (m *Manager) beginStorageMutation() func() {
 	return func() { m.storageEpoch.Add(1); m.storageMutations.Add(-1) }
 }
 
-func (s *StateStore) retainedRecords() ([]VMRecord, error) {
+func (s *StateStore) retainedLiveRecords() ([]VMRecord, error) {
 	records := make([]VMRecord, 0)
 	bytes := 0
 	err := s.db.View(func(tx *bolt.Tx) error {
@@ -66,6 +66,30 @@ func (s *StateStore) retainedRecords() ([]VMRecord, error) {
 		})
 	})
 	return records, err
+}
+
+// retainedRecords combines live lifecycle records with archived failed-owner
+// metadata. A live record wins if an archive from an earlier cleanup remains.
+func (s *StateStore) retainedRecords() ([]VMRecord, error) {
+	live, err := s.retainedLiveRecords()
+	if err != nil {
+		return nil, err
+	}
+	archived, err := s.retainedArchivedRecords()
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(live)+len(archived))
+	for _, rec := range live {
+		seen[rec.ID] = struct{}{}
+	}
+	for _, rec := range archived {
+		if _, ok := seen[rec.ID]; ok {
+			continue
+		}
+		live = append(live, rec)
+	}
+	return live, nil
 }
 
 // resolveRetainedRecordPaths returns both the files to measure and any
@@ -267,6 +291,11 @@ func (s *StateStore) updateRetainedDependencies(original, resolved VMRecord) err
 		records := tx.Bucket(bucketName)
 		key := []byte(original.ID)
 		raw := records.Get(key)
+		target := records
+		if raw == nil {
+			target = tx.Bucket(retainedRecordBucketName)
+			raw = target.Get(key)
+		}
 		if raw == nil {
 			return fmt.Errorf("retained owner was removed")
 		}
@@ -296,7 +325,7 @@ func (s *StateStore) updateRetainedDependencies(original, resolved VMRecord) err
 		if err != nil {
 			return err
 		}
-		return records.Put(key, updated)
+		return target.Put(key, updated)
 	})
 }
 

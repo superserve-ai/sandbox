@@ -20,7 +20,20 @@ WITH team_cutovers AS MATERIALIZED (
   FROM sandbox_storage_interval i
   JOIN sandbox s ON s.id=i.sandbox_id
   LEFT JOIN retained_storage_cutover c ON c.host_id=i.host_id AND c.team_id=i.team_id
-  WHERE i.team_id=p_team AND p_start<LEAST(p_end,billing_request_now()) AND i.started_at<COALESCE(c.started_at,'infinity')
+  WHERE i.team_id=p_team AND p_start<LEAST(p_end,billing_request_now())
+    AND (
+      i.started_at<COALESCE(c.started_at,'infinity')
+      -- During a producer rollback, a sandbox created or reassigned after
+      -- cutover has no retained interval yet. Keep its valid legacy samples
+      -- billable instead of treating the permanent cutover as a blanket
+      -- exclusion for every future owner.
+      OR c.started_at IS NULL
+      OR NOT EXISTS (
+        SELECT 1 FROM retained_storage_interval r
+        WHERE r.team_id=i.team_id AND r.owner_kind='sandbox'
+          AND r.owner_id=i.sandbox_id AND r.started_at>=c.started_at
+      )
+    )
 ), artifact_bounds AS (
   SELECT s.*,i.host_id interval_host_id,i.started_at billing_started_at,i.artifact_retention_end retention_end,
    tc.started_at team_cutover

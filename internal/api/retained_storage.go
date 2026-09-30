@@ -95,7 +95,14 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
  ), supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
  SELECT NOT EXISTS(SELECT 1 FROM expected e LEFT JOIN supplied s USING(kind,id) WHERE s.id IS NULL)
   AND (SELECT count(*) FROM expected)<=$4
-  AND NOT EXISTS(SELECT 1 FROM retained_storage_interval WHERE host_id=$1 AND started_at>$2)`, hostID, at, payload, retainedstorage.MaxOwners).Scan(&complete)
+  -- A delayed report is stale if this owner was observed on any host after
+  -- its receipt boundary. Checking only the reporting host lets an A→B→A
+  -- reassignment reopen history while B's interval remains current.
+  AND NOT EXISTS(
+    SELECT 1 FROM retained_storage_interval i
+    JOIN supplied o ON o.kind=i.owner_kind AND o.id=i.owner_id
+    WHERE i.started_at>$2
+  )`, hostID, at, payload, retainedstorage.MaxOwners).Scan(&complete)
 	if err != nil {
 		return err
 	}
@@ -117,13 +124,15 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
   UPDATE retained_storage_interval old SET ended_at=$2
   FROM eligible moved_owner
   WHERE moved_owner.id=old.owner_id AND moved_owner.kind=old.owner_kind
-   AND old.host_id IS DISTINCT FROM $1 AND old.ended_at IS NULL AND old.started_at<$2
+   AND old.host_id IS DISTINCT FROM $1 AND old.started_at<$2
+   AND (old.ended_at IS NULL OR old.ended_at>$2)
   RETURNING old.id
  ), legacy_moved AS (
   UPDATE sandbox_storage_interval old SET ended_at=$2,end_reason='reassigned'
   FROM eligible moved_owner
   WHERE moved_owner.kind='sandbox' AND moved_owner.id=old.sandbox_id
-   AND old.host_id IS DISTINCT FROM $1 AND old.ended_at IS NULL AND old.started_at<$2
+   AND old.host_id IS DISTINCT FROM $1 AND old.started_at<$2
+   AND (old.ended_at IS NULL OR old.ended_at>$2)
   RETURNING old.id
  ), cutover AS (
   INSERT INTO retained_storage_cutover(host_id,team_id,started_at)

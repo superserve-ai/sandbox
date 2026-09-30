@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	bolt "go.etcd.io/bbolt"
 )
 
@@ -18,8 +19,11 @@ import (
 // control plane.
 
 var (
-	bucketName              = []byte("vms")
-	previewPolicyBucketName = []byte("vm_preview_policies")
+	bucketName = []byte("vms")
+	// Artifact references for failed owners outlive the live VM record until
+	// the control-plane sandbox is explicitly destroyed.
+	retainedRecordBucketName = []byte("retained_storage_records")
+	previewPolicyBucketName  = []byte("vm_preview_policies")
 	// Derived, safety-critical startup indexes: sparse projections of the
 	// records bucket (cgroup-supervised membership; vmID→namespace for records
 	// holding a network slot), maintained inside the same transaction as every
@@ -461,6 +465,9 @@ func OpenStateStore(path string) (*StateStore, error) {
 		if _, err := tx.CreateBucketIfNotExists(backfillMarkBucketName); err != nil {
 			return err
 		}
+		if _, err := tx.CreateBucketIfNotExists(retainedRecordBucketName); err != nil {
+			return err
+		}
 		policies, err := tx.CreateBucketIfNotExists(previewPolicyBucketName)
 		if err != nil {
 			return err
@@ -629,6 +636,63 @@ func (s *StateStore) Delete(vmID string) error {
 		}
 		return tx.Bucket(previewPolicyBucketName).Delete(key)
 	})
+}
+
+// PutRetainedRecord archives artifact references for a failed owner after its
+// live lifecycle record is released. Keeping this projection separate prevents
+// startup from reattaching a dead VM while storage accounting remains complete.
+func (s *StateStore) PutRetainedRecord(rec VMRecord) error {
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists(retainedRecordBucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte(rec.ID), data)
+	})
+}
+
+// DeleteRetainedRecord removes archived metadata after an explicit destroy.
+func (s *StateStore) DeleteRetainedRecord(vmID string) error {
+	return s.db.Batch(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(retainedRecordBucketName)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.Delete([]byte(vmID))
+	})
+}
+
+func (s *StateStore) retainedArchivedRecords() ([]VMRecord, error) {
+	var records []VMRecord
+	bytes := 0
+	err := s.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(retainedRecordBucketName)
+		if bucket == nil {
+			return nil
+		}
+		return bucket.ForEach(func(key, value []byte) error {
+			if len(records) >= retainedstorage.MaxOwners {
+				return fmt.Errorf("retained owner budget exceeded")
+			}
+			bytes += len(key) + len(value)
+			if bytes > retainedstorage.MaxPayloadBytes {
+				return fmt.Errorf("retained record budget exceeded")
+			}
+			var rec VMRecord
+			if err := json.Unmarshal(value, &rec); err != nil {
+				return err
+			}
+			if rec.ID != "" {
+				records = append(records, rec)
+			}
+			return nil
+		})
+	})
+	return records, err
 }
 
 // maintainIndexes keeps the sparse startup indexes in sync with a record

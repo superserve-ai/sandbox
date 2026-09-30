@@ -96,8 +96,12 @@ func TestIntegration_StorageReportPeriodicRefresh(t *testing.T) {
 				return state == "processed"
 			})
 			var diskMiB int
-			if err := pool.QueryRow(ctx, `SELECT disk_mib FROM sandbox_storage_interval WHERE sandbox_id=$1 AND ended_at IS NULL`, sandboxID).Scan(&diskMiB); err != nil {
+			var intervalHost string
+			if err := pool.QueryRow(ctx, `SELECT disk_mib, host_id FROM sandbox_storage_interval WHERE sandbox_id=$1 AND ended_at IS NULL`, sandboxID).Scan(&diskMiB, &intervalHost); err != nil {
 				t.Fatal(err)
+			}
+			if intervalHost != hostID {
+				t.Fatalf("initial storage interval host = %q, want %q", intervalHost, hostID)
 			}
 			if diskMiB != 8 {
 				t.Fatalf("initial report should be skipped at %s boundary, got %d MiB", boundary, diskMiB)
@@ -117,7 +121,7 @@ func TestIntegration_StorageReportPeriodicRefresh(t *testing.T) {
 				if err := pool.QueryRow(ctx, `SELECT EXISTS (
 					SELECT 1 FROM host_storage_report r JOIN sandbox_storage_interval i ON i.started_at=r.received_at
 					WHERE r.host_id=$1 AND r.report_id<>$2 AND r.ingest_seq=2 AND r.state='processed'
-					  AND r.received_at>$3 AND i.sandbox_id=$4 AND i.ended_at IS NULL AND i.disk_mib=16
+					  AND r.received_at>$3 AND i.sandbox_id=$4 AND i.host_id=$1 AND i.ended_at IS NULL AND i.disk_mib=16
 				)`, hostID, first.reportID, receivedAt, sandboxID).Scan(&corrected); err != nil {
 					t.Fatal(err)
 				}
@@ -150,7 +154,12 @@ func storageRefreshPool(t *testing.T) *pgxpool.Pool {
 			t.Fatal(err)
 		}
 	}
-	// LIKE copies constraints and indexes but not the creation or digest triggers.
+	// LIKE copies constraints and indexes but not triggers.
+	if _, err := pool.Exec(t.Context(), `CREATE TRIGGER stamp_sandbox_storage_interval_host
+		BEFORE INSERT ON sandbox_storage_interval FOR EACH ROW
+		EXECUTE FUNCTION public.stamp_sandbox_storage_interval_host()`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := pool.Exec(t.Context(), `CREATE TRIGGER fence_retained_storage_owner_creation
 		BEFORE INSERT ON sandbox FOR EACH ROW
 		EXECUTE FUNCTION public.fence_retained_storage_owner_creation()`); err != nil {

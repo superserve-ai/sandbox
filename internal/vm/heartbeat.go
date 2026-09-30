@@ -841,10 +841,10 @@ func (c *heartbeatStorageCache) restoreFromDisk() {
 }
 
 func storageReportID(hostID, incarnationID string, version uint64) uuid.UUID {
-	// This is retained for compatibility with queue entries written before
-	// reportSpace was persisted. New reports use the cache's durable namespace
-	// so a reset version cannot collide with an accepted report.
-	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("storage-report:v1:"+hostID+":"+incarnationID+":"+strconv.FormatUint(version, 10)))
+	// This exact input predates reportSpace and is part of the on-disk queue
+	// contract. Imported entries without an explicit ID must keep it so a retry
+	// remains idempotent with a report accepted by an older daemon.
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("storage-report:"+hostID+":"+incarnationID+":"+strconv.FormatUint(version, 10)))
 }
 
 func storageReportIDInSpace(reportSpace uuid.UUID, version uint64) uuid.UUID {

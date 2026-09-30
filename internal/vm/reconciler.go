@@ -1730,6 +1730,11 @@ func (r *Reconciler) failEmptyShells(ctx context.Context, log zerolog.Logger, db
 			// behind a dead unit costs another grace+budget cycle via the
 			// dead-VM rule). Detach from the pass context, bounded.
 			persistCtx, persistCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			if rec, recErr := r.mgr.state.Get(id); recErr == nil && rec != nil {
+				if archiveErr := r.mgr.state.PutRetainedRecord(*rec); archiveErr != nil {
+					log.Error().Err(archiveErr).Str("vm_id", id).Msg("failed to preserve retained storage metadata")
+				}
+			}
 			flipped := r.markFailedInDB(persistCtx, id, db.SandboxStatusActive)
 			r.markStale(id)
 			if flipped {
@@ -1943,6 +1948,11 @@ func (r *Reconciler) reapDeadActiveVMs(ctx context.Context, log zerolog.Logger, 
 		}
 		log.Warn().Str("vm_id", id).Str("drift", "db_active_systemd_missing").
 			Msg("DB says active but VM is dead — marking failed")
+		if rec, recErr := r.mgr.state.Get(id); recErr == nil && rec != nil {
+			if archiveErr := r.mgr.state.PutRetainedRecord(*rec); archiveErr != nil {
+				log.Error().Err(archiveErr).Str("vm_id", id).Msg("failed to preserve retained storage metadata")
+			}
+		}
 		flipped := r.markFailed(ctx, id, db.SandboxStatusActive)
 		staleErr := r.markStale(id)
 		unlockOp()

@@ -567,7 +567,8 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 			FROM measurements m JOIN sandbox owner ON owner.id=m.sandbox_id
 			WHERE old.owner_kind='sandbox' AND old.owner_id=m.sandbox_id
 			  AND old.host_id IS DISTINCT FROM $3
-			  AND old.ended_at IS NULL AND old.started_at<=$4::timestamptz
+				AND old.started_at<$4::timestamptz
+				AND (old.ended_at IS NULL OR old.ended_at>$4::timestamptz)
 			  AND owner.host_id=$3 AND owner.created_at <= $4::timestamptz
 			  AND (owner.destroyed_at IS NULL OR owner.destroyed_at > $4::timestamptz)
 			  AND feature_enabled('billing_metrics_write',owner.team_id)
@@ -575,7 +576,26 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 				SELECT 1 FROM sandbox_storage_interval future
 				WHERE future.sandbox_id=owner.id AND future.started_at>$4::timestamptz
 			  )
-		), eligible AS MATERIALIZED (
+			), legacy_handoff AS (
+				-- A delayed legacy report must trim an already-closed source
+				-- interval at the receipt boundary. Also close only the source
+				-- host: the destination interval is inserted below even when its
+				-- quantity is unchanged.
+				UPDATE sandbox_storage_interval old
+				SET ended_at=$4::timestamptz, end_reason='reassigned'
+				FROM measurements m JOIN sandbox owner ON owner.id=m.sandbox_id
+				WHERE old.sandbox_id=owner.id
+				  AND old.host_id IS DISTINCT FROM $3
+				  AND old.started_at<$4::timestamptz
+				  AND (old.ended_at IS NULL OR old.ended_at>$4::timestamptz)
+				  AND owner.host_id=$3 AND owner.created_at <= $4::timestamptz
+				  AND (owner.destroyed_at IS NULL OR owner.destroyed_at > $4::timestamptz)
+				  AND feature_enabled('billing_metrics_write',owner.team_id)
+				  AND NOT EXISTS (
+					SELECT 1 FROM sandbox_storage_interval future
+					WHERE future.sandbox_id=owner.id AND future.started_at>$4::timestamptz
+				  )
+			), eligible AS MATERIALIZED (
 			SELECT s.id, s.team_id, s.destroyed_at, m.disk_mib FROM measurements m
 			JOIN sandbox s ON s.id=m.sandbox_id
 			WHERE s.host_id=$3
@@ -603,9 +623,10 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 			SELECT e.id, e.team_id, e.destroyed_at, e.disk_mib,
 			       i.id AS interval_id, i.disk_mib AS current_disk_mib
 			FROM eligible e
-			LEFT JOIN sandbox_storage_interval i
-			  ON i.sandbox_id=e.id
-			 AND i.team_id=e.team_id
+				LEFT JOIN sandbox_storage_interval i
+				  ON i.sandbox_id=e.id
+				 AND i.team_id=e.team_id
+				 AND i.host_id=$3
 			 AND i.started_at <= $4::timestamptz
 			 AND (i.ended_at IS NULL OR i.ended_at > $4::timestamptz)
 		), closed AS (
