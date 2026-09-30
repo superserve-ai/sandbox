@@ -23,6 +23,20 @@ type meterCloseEvidence struct {
 	Passes                                 [][]meterCloseBucket
 }
 
+func sameMeterBucketPass(a, b []meterCloseBucket) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		x, xerr := meterDecimal(a[i].Quantity)
+		y, yerr := meterDecimal(b[i].Quantity)
+		if a[i].Start != b[i].Start || a[i].End != b[i].End || xerr != nil || yerr != nil || x.Cmp(y) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // Missing provider intervals have already been proved to have zero local usage.
 // Persist the complete partition so the database can independently check coverage.
 func completeMeterBuckets(buckets []meterUsageBucket, start, end time.Time) []meterCloseBucket {

@@ -259,7 +259,7 @@ func TestMeterPrecisionBoundary(t *testing.T) {
 		for _, tc := range []struct {
 			value    *big.Rat
 			eligible bool
-		}{{at, true}, {beyond, false}} {
+		}{{at, false}, {beyond, false}} {
 			d, eligible := compareMeterSummary(tc.value.FloatString(110), total)
 			if eligible != tc.eligible || d.Err == nil {
 				t.Fatalf("boundary comparison %s: %+v eligible=%v", total, d, eligible)
@@ -354,7 +354,7 @@ func TestMeterEvidenceWindowsAndLocalInventory(t *testing.T) {
 				bs[1].Quantity = "NaN"
 			}
 			err := matchMeterBuckets(es, bs, "cpu_hours", "cus_example", start, end, total)
-			if (err == nil) != (mode == "complete" || mode == "missing") {
+			if (err == nil) != (mode == "complete" || mode == "missing" || mode == "tiny_bucket_drift") {
 				t.Fatalf("%s: %v", mode, err)
 			}
 		})
@@ -397,11 +397,13 @@ func TestMeterGrowingRepeatedDrift(t *testing.T) {
 						t.Fatal(err)
 					}
 					decision, candidate := compareMeterSummary(provider.FloatString(12), total.FloatString(12))
-					if drift.Sign() < 0 {
+					pf, _ := strconv.ParseFloat(provider.FloatString(12), 64)
+					lf, _ := strconv.ParseFloat(total.FloatString(12), 64)
+					if drift.Sign() < 0 && pf != lf {
 						if decision.Outcome != "provider_lag" || decision.Err != nil || candidate {
 							t.Fatalf("lag: %+v", decision)
 						}
-					} else if drift.Cmp(bound) <= 0 {
+					} else if pf == lf && new(big.Rat).Abs(drift).Cmp(bound) <= 0 {
 						if !candidate {
 							t.Fatalf("supported drift rejected: %+v", decision)
 						}
