@@ -142,7 +142,11 @@ func (h *Handlers) teamPromotionCreationOperation(c *gin.Context, operation stri
 	if err := h.Pool.QueryRow(ctx, query, args...).Scan(&result); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-			respondErrorMsg(c, "creation_conflict", "team creation binding conflict", http.StatusConflict)
+			message := "team creation binding conflict"
+			if pgErr.ConstraintName == "team_name_key" {
+				message = "team name already exists"
+			}
+			respondErrorMsg(c, "creation_conflict", message, http.StatusConflict)
 		} else {
 			promotionDBError(c, err)
 		}

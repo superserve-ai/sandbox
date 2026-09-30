@@ -546,8 +546,11 @@ Malformed, unknown-field, or over-4096-byte bodies receive HTTP 400
 expired, mismatched, or wrong-region signed provenance receives 403 `forbidden`.
 A missing locator on recover/complete receives 404 `creation_missing` (an
 operation UUID is still required in the request). A durable binding conflict
-receives 409 `creation_conflict`; the response reveals no stored tuple. An
-unavailable database or retryable transaction failure receives 503
+receives 409 `creation_conflict`; the response reveals no stored tuple. A team
+name collision also receives 409 `creation_conflict`, with message
+`team name already exists` instead of `team creation binding conflict`; the
+operation retains its prepared tuple. An unavailable database or retryable
+transaction failure receives 503
 `authority_unavailable`. Do not interpret that transport error as permission to
 change a persisted boolean. Existing legacy route error semantics are unchanged.
 

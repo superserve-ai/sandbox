@@ -352,6 +352,13 @@ func TestIntegration_DurableTeamCreationRecovery(t *testing.T) {
 		}
 		return result
 	}
+	assertConflict := func(result map[string]any, message string) {
+		t.Helper()
+		want := map[string]any{"error": map[string]any{"code": "creation_conflict", "message": message}}
+		if !reflect.DeepEqual(result, want) {
+			t.Fatalf("conflict response: got %v, want %v", result, want)
+		}
+	}
 	locator := uuid.New()
 	prepare := map[string]any{"operation_id": locator, "name": "example-team", "home_region": "use", "authority_unavailable": true}
 	recoverBody := map[string]any{"operation_id": locator, "home_region": "use"}
@@ -371,8 +378,8 @@ func TestIntegration_DurableTeamCreationRecovery(t *testing.T) {
         (SELECT count(*) FROM team_credit_grant WHERE team_id=$1)`, recovered["team_id"]).Scan(&teams, &credits); err != nil || teams != 0 || credits != 0 {
 		t.Fatalf("prepare dispatched value: teams=%d credits=%d err=%v", teams, credits, err)
 	}
-	request(newRouter(), "recover-team", otherUser, recoverBody, http.StatusConflict)
-	request(newRouter(), "prepare-team", otherUser, prepare, http.StatusConflict)
+	assertConflict(request(newRouter(), "recover-team", otherUser, recoverBody, http.StatusConflict), "team creation binding conflict")
+	assertConflict(request(newRouter(), "prepare-team", otherUser, prepare, http.StatusConflict), "team creation binding conflict")
 	for _, field := range []string{"name", "authority_unavailable"} {
 		original := prepare[field]
 		if field == "name" {
@@ -380,14 +387,14 @@ func TestIntegration_DurableTeamCreationRecovery(t *testing.T) {
 		} else {
 			prepare[field] = false
 		}
-		request(newRouter(), "prepare-team", user, prepare, http.StatusConflict)
+		assertConflict(request(newRouter(), "prepare-team", user, prepare, http.StatusConflict), "team creation binding conflict")
 		prepare[field] = original
 	}
 	recoverBody["home_region"] = "usw"
 	request(newRouter(), "recover-team", user, recoverBody, http.StatusForbidden)
 	// A correctly signed request at another local region still cannot adopt the row.
 	t.Setenv("SANDBOX_ID_REGION", "usw")
-	request(newRouter(), "recover-team", user, recoverBody, http.StatusConflict)
+	assertConflict(request(newRouter(), "recover-team", user, recoverBody, http.StatusConflict), "team creation binding conflict")
 	t.Setenv("SANDBOX_ID_REGION", "use")
 	recoverBody["home_region"] = "use"
 	complete := map[string]any{}
@@ -404,10 +411,10 @@ func TestIntegration_DurableTeamCreationRecovery(t *testing.T) {
 		default:
 			complete[field] = uuid.New()
 		}
-		request(newRouter(), "complete-team", user, complete, http.StatusConflict)
+		assertConflict(request(newRouter(), "complete-team", user, complete, http.StatusConflict), "team creation binding conflict")
 		complete[field] = original
 	}
-	request(newRouter(), "complete-team", otherUser, complete, http.StatusConflict)
+	assertConflict(request(newRouter(), "complete-team", otherUser, complete, http.StatusConflict), "team creation binding conflict")
 	// Previously accepted evidence is present, and publication has recovered.
 	rolloutExec(t, region, `SELECT register_promotion_signup_device($1,source_attempt_id,source_event_id,fingerprint)
         FROM promotion_signup_device_evidence WHERE user_id=$1`, user)
@@ -431,6 +438,21 @@ func TestIntegration_DurableTeamCreationRecovery(t *testing.T) {
 	list = request(newRouter(), "discover-team-creations", otherUser, map[string]any{"home_region": "use"}, http.StatusOK)
 	if len(list["operations"].([]any)) != 0 {
 		t.Fatalf("cross-actor discovery: %v", list)
+	}
+	// A distinct operation can prepare the same name, but cannot complete while it is in use.
+	second := request(newRouter(), "prepare-team", user, map[string]any{
+		"operation_id": uuid.New(), "name": "example-team", "home_region": "use", "authority_unavailable": true,
+	}, http.StatusOK)
+	secondComplete := map[string]any{}
+	for _, field := range []string{"operation_id", "attempt_id", "team_id", "name", "home_region", "authority_unavailable"} {
+		secondComplete[field] = second[field]
+	}
+	assertConflict(request(newRouter(), "complete-team", user, secondComplete, http.StatusConflict), "team name already exists")
+	secondRecovered := request(newRouter(), "recover-team", user, map[string]any{
+		"operation_id": second["operation_id"], "home_region": "use",
+	}, http.StatusOK)
+	if !reflect.DeepEqual(second, secondRecovered) {
+		t.Fatalf("name conflict changed prepared operation: %v / %v", second, secondRecovered)
 	}
 	rolloutExec(t, region, `DELETE FROM team WHERE id=$1`, recovered["team_id"])
 	rolloutExec(t, region, `DELETE FROM profile WHERE id=$1`, user)
