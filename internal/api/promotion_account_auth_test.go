@@ -252,3 +252,61 @@ func TestPromotionAccountAssertionKeyRequired(t *testing.T) {
 		})
 	}
 }
+
+func TestPromotionCheckoutAssertion(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PROMOTION_ACCOUNT_PUBLIC_KEY", base64.StdEncoding.EncodeToString(public))
+	t.Setenv("SANDBOX_ID_REGION", "use")
+	for _, tc := range []struct {
+		name   string
+		mutate func(*promotionAccountClaims)
+		status int
+	}{
+		{"no credit", nil, http.StatusNoContent},
+		{"standard", func(c *promotionAccountClaims) { c.Decision = "standard" }, http.StatusNoContent},
+		{"missing decision", func(c *promotionAccountClaims) { c.Decision = "" }, http.StatusForbidden},
+		{"browser eligibility", func(c *promotionAccountClaims) { c.Decision = "eligible" }, http.StatusForbidden},
+		{"wrong region", func(c *promotionAccountClaims) { c.HomeRegion = "usw" }, http.StatusForbidden},
+		{"missing intent", func(c *promotionAccountClaims) { c.OperationID = "" }, http.StatusForbidden},
+		{"nil intent", func(c *promotionAccountClaims) { c.OperationID = uuid.Nil.String() }, http.StatusForbidden},
+		{"nil team", func(c *promotionAccountClaims) { c.TeamID = uuid.Nil.String() }, http.StatusForbidden},
+		{"wrong operation", func(c *promotionAccountClaims) { c.Operation = "register" }, http.StatusForbidden},
+		{"unsigned redirect", func(c *promotionAccountClaims) { c.CancelURL = "" }, http.StatusForbidden},
+		{"expired", func(c *promotionAccountClaims) {
+			c.IssuedAt = jwt.NewNumericDate(time.Now().Add(-2 * time.Minute))
+			c.ExpiresAt = jwt.NewNumericDate(time.Now().Add(-time.Minute))
+		}, http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := promotionAccountClaims{RegisteredClaims: jwt.RegisteredClaims{
+				Issuer: "promotion-auth-adapter", Audience: jwt.ClaimStrings{"promotion-account"}, Subject: uuid.NewString(),
+				IssuedAt: jwt.NewNumericDate(time.Now().Add(-time.Second)), ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Minute)),
+			}, Operation: "checkout", OperationID: uuid.NewString(), TeamID: uuid.NewString(), HomeRegion: "use", Decision: "publication_failed",
+				SuccessURL: "https://example.com/success", CancelURL: "https://example.com/cancel"}
+			if tc.mutate != nil {
+				tc.mutate(&claims)
+			}
+			signed, err := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims).SignedString(private)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := gin.New()
+			r.POST("/stripe/checkout-session/publication-decision", PromotionAccountAuth(), func(c *gin.Context) {
+				if c.GetHeader("X-Promotion-Account-Assertion") != "" {
+					t.Error("assertion header retained")
+				}
+				c.Status(http.StatusNoContent)
+			})
+			req := httptest.NewRequest(http.MethodPost, "/stripe/checkout-session/publication-decision", nil)
+			req.Header.Set("X-Promotion-Account-Assertion", signed)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != tc.status {
+				t.Fatalf("assertion: %d %s, want %d", w.Code, w.Body.String(), tc.status)
+			}
+		})
+	}
+}

@@ -1617,3 +1617,12 @@ SELECT storage_billing_activated(sqlc.arg(team_id)::uuid)::boolean;
 
 -- name: IsStorageBillingActivatedForWindow :one
 SELECT storage_billing_activated(sqlc.arg(team_id)::uuid, sqlc.arg(period_end)::timestamptz)::boolean;
+
+-- name: BeginStripeCheckoutWithPublicationDecision :exec
+SELECT begin_stripe_checkout_with_publication_decision(
+    sqlc.arg(team_id)::uuid, sqlc.arg(user_id)::uuid, sqlc.arg(operation_id)::uuid,
+    sqlc.arg(home_region)::text, sqlc.arg(request_key)::text, sqlc.arg(decision)::text, sqlc.arg(attempt_id)::uuid);
+
+-- name: StripeCheckoutPublicationFailed :one
+SELECT stripe_checkout_publication_failed(sqlc.arg(team_id)::uuid,
+    sqlc.arg(generation)::timestamptz, sqlc.arg(user_id)::uuid)::boolean AS publication_failed;

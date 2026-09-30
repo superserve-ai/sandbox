@@ -237,6 +237,35 @@ func (q *Queries) AssociateTeamBillingCheckoutSubscription(ctx context.Context, 
 	return err
 }
 
+const beginStripeCheckoutWithPublicationDecision = `-- name: BeginStripeCheckoutWithPublicationDecision :exec
+SELECT begin_stripe_checkout_with_publication_decision(
+    $1::uuid, $2::uuid, $3::uuid,
+    $4::text, $5::text, $6::text, $7::uuid)
+`
+
+type BeginStripeCheckoutWithPublicationDecisionParams struct {
+	TeamID      uuid.UUID `json:"team_id"`
+	UserID      uuid.UUID `json:"user_id"`
+	OperationID uuid.UUID `json:"operation_id"`
+	HomeRegion  string    `json:"home_region"`
+	RequestKey  string    `json:"request_key"`
+	Decision    string    `json:"decision"`
+	AttemptID   uuid.UUID `json:"attempt_id"`
+}
+
+func (q *Queries) BeginStripeCheckoutWithPublicationDecision(ctx context.Context, arg BeginStripeCheckoutWithPublicationDecisionParams) error {
+	_, err := q.db.Exec(ctx, beginStripeCheckoutWithPublicationDecision,
+		arg.TeamID,
+		arg.UserID,
+		arg.OperationID,
+		arg.HomeRegion,
+		arg.RequestKey,
+		arg.Decision,
+		arg.AttemptID,
+	)
+	return err
+}
+
 const beginTeamBillingCheckout = `-- name: BeginTeamBillingCheckout :one
 WITH locks AS MATERIALIZED (
     SELECT lock_stripe_checkout_identity($3::uuid)
@@ -3552,6 +3581,24 @@ func (q *Queries) SetTeamFeatureFlag(ctx context.Context, arg SetTeamFeatureFlag
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const stripeCheckoutPublicationFailed = `-- name: StripeCheckoutPublicationFailed :one
+SELECT stripe_checkout_publication_failed($1::uuid,
+    $2::timestamptz, $3::uuid)::boolean AS publication_failed
+`
+
+type StripeCheckoutPublicationFailedParams struct {
+	TeamID     uuid.UUID `json:"team_id"`
+	Generation time.Time `json:"generation"`
+	UserID     uuid.UUID `json:"user_id"`
+}
+
+func (q *Queries) StripeCheckoutPublicationFailed(ctx context.Context, arg StripeCheckoutPublicationFailedParams) (bool, error) {
+	row := q.db.QueryRow(ctx, stripeCheckoutPublicationFailed, arg.TeamID, arg.Generation, arg.UserID)
+	var publication_failed bool
+	err := row.Scan(&publication_failed)
+	return publication_failed, err
 }
 
 const stripeCheckoutRecoveryEvidenceAvailable = `-- name: StripeCheckoutRecoveryEvidenceAvailable :one

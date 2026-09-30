@@ -433,6 +433,94 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /stripe/checkout-session/publication-decision:
+    post:
+      operationId: createStripeCheckoutSessionWithPublicationDecision
+      tags: [Billing]
+      summary: Create or retry Checkout with a trusted publication decision
+      description: |
+        Requires the customer credential's authenticated actor, billing:write,
+        live billing, and a server-signed publication assertion. The assertion
+        must use EdDSA, issuer promotion-auth-adapter, audience promotion-account,
+        operation checkout, and a positive lifetime of at most five minutes.
+        Its sub and team_id must match the customer credential, and its
+        operation_id, home_region, decision, success_url and cancel_url must
+        exactly match the body. The region must match the receiving cell.
+
+        The decision is committed with the fresh generation before Stripe
+        session creation. publication_failed preserves paid access without new
+        automatic promotion credit; standard uses existing eligibility checks.
+        Retry the same operation and body with a renewed assertion after a lost
+        response. Existing generations retain their original payer and decision.
+        A changed or retired operation conflicts; do not fall back to the legacy
+        creation route on an error or an older server's missing route.
+
+        Bodies over 4096 bytes and unknown fields are rejected. Redirects must
+        match the regional API's allowed billing redirect configuration.
+      security:
+        - apiKey: []
+          promotionAccountAssertion: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [operation_id, home_region, decision, success_url, cancel_url]
+              properties:
+                operation_id:
+                  type: string
+                  format: uuid
+                  description: Stable random operation locator generated before the first request.
+                home_region:
+                  type: string
+                  enum: [use, usw]
+                decision:
+                  type: string
+                  enum: [standard, publication_failed]
+                success_url:
+                  type: string
+                  format: uri
+                cancel_url:
+                  type: string
+                  format: uri
+      responses:
+        "200":
+          description: Checkout session created or original session returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BillingSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: conflict — changed or closed intent, existing generation, reservation or subscription
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          description: bad_gateway — Stripe creation failed; retain the original intent and uncertainty fence
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: service_unavailable — required billing configuration unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /stripe/checkout-session/recover:
     post:
       operationId: recoverStripeCheckoutSession
@@ -2683,6 +2771,11 @@ components:
       type: apiKey
       in: header
       name: X-API-Key
+    promotionAccountAssertion:
+      type: apiKey
+      in: header
+      name: X-Promotion-Account-Assertion
+      description: Server-only Ed25519 JWT binding the authenticated actor and team to the exact Checkout intent.
     accessToken:
       type: apiKey
       in: header

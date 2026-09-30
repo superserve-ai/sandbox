@@ -16,6 +16,9 @@ import (
 type promotionAccountClaims struct {
 	jwt.RegisteredClaims
 	Operation            string `json:"operation"`
+	Decision             string `json:"decision,omitempty"`
+	SuccessURL           string `json:"success_url,omitempty"`
+	CancelURL            string `json:"cancel_url,omitempty"`
 	OperationID          string `json:"operation_id,omitempty"`
 	Name                 string `json:"name,omitempty"`
 	After                string `json:"after,omitempty"`
@@ -50,6 +53,9 @@ func PromotionAccountAuth() gin.HandlerFunc {
 			jwt.WithExpirationRequired(), jwt.WithIssuedAt())
 		actor, actorErr := uuid.Parse(claims.Subject)
 		operation := strings.TrimPrefix(c.FullPath(), "/internal/promotion/account/")
+		if c.FullPath() == "/stripe/checkout-session/publication-decision" {
+			operation = "checkout"
+		}
 		if err != nil || actorErr != nil || actor == uuid.Nil ||
 			claims.IssuedAt == nil || claims.ExpiresAt == nil ||
 			!claims.ExpiresAt.After(claims.IssuedAt.Time) ||
@@ -59,6 +65,20 @@ func PromotionAccountAuth() gin.HandlerFunc {
 			return
 		}
 		switch operation {
+		case "checkout":
+			region := sandboxIDRegionFromEnv()
+			if region == "" {
+				region = "use"
+			}
+			intent, intentErr := uuid.Parse(claims.OperationID)
+			team, teamErr := uuid.Parse(claims.TeamID)
+			if intentErr != nil || intent == uuid.Nil || teamErr != nil || team == uuid.Nil ||
+				claims.HomeRegion != region || (claims.Decision != "standard" && claims.Decision != "publication_failed") ||
+				claims.SuccessURL == "" || claims.CancelURL == "" || claims.AttemptID != "" || claims.AuthorityUnavailable != nil {
+				deny()
+				return
+			}
+
 		case "bind":
 			attempt, err := uuid.Parse(claims.AttemptID)
 			if err != nil || attempt == uuid.Nil {

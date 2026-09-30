@@ -257,8 +257,11 @@ type billingExportAttemptRecord struct {
 }
 
 type billingCheckoutSessionRequest struct {
-	SuccessURL string `json:"success_url"`
-	CancelURL  string `json:"cancel_url"`
+	OperationID uuid.UUID `json:"operation_id,omitempty"`
+	Decision    string    `json:"decision,omitempty"`
+	HomeRegion  string    `json:"home_region,omitempty"`
+	SuccessURL  string    `json:"success_url"`
+	CancelURL   string    `json:"cancel_url"`
 }
 
 type billingPortalSessionRequest struct {
@@ -1591,8 +1594,32 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		return
 	}
 	var req billingCheckoutSessionRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	value, trusted := c.Get("promotion_account")
+	if trusted {
+		if h.Pool == nil {
+			respondErrorMsg(c, "service_unavailable", "billing transactions are not configured", http.StatusServiceUnavailable)
+			return
+		}
+		if !decodePromotionRequest(c, &req) {
+			return
+		}
+	} else if err := c.ShouldBindJSON(&req); err != nil {
 		respondErrorMsg(c, "bad_request", "invalid checkout session request", http.StatusBadRequest)
+		return
+	}
+	var claims *promotionAccountClaims
+	if trusted {
+		var ok bool
+		claims, ok = value.(*promotionAccountClaims)
+		if !ok || claims == nil || claims.Operation != "checkout" || claims.Subject != actorID.String() ||
+			claims.TeamID != teamID.String() || claims.OperationID != req.OperationID.String() ||
+			claims.HomeRegion != req.HomeRegion || claims.Decision != req.Decision ||
+			claims.SuccessURL != req.SuccessURL || claims.CancelURL != req.CancelURL {
+			respondErrorMsg(c, "forbidden", "checkout provenance mismatch", http.StatusForbidden)
+			return
+		}
+	} else if req.OperationID != uuid.Nil || req.Decision != "" || req.HomeRegion != "" || c.GetHeader("X-Promotion-Account-Assertion") != "" {
+		respondErrorMsg(c, "bad_request", "use the publication-decision checkout route", http.StatusBadRequest)
 		return
 	}
 	if strings.TrimSpace(req.SuccessURL) == "" || strings.TrimSpace(req.CancelURL) == "" {
@@ -1648,10 +1675,12 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 		respondErrorMsg(c, "service_unavailable", err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	if err := h.DB.PrepareStripeCheckoutIdentity(c.Request.Context(), db.PrepareStripeCheckoutIdentityParams{TeamID: teamID, UserID: actorID}); err != nil {
-		log.Error().Err(err).Str("team_id", teamID.String()).Msg("prepare Stripe checkout identity failed")
-		respondErrorMsg(c, "service_unavailable", "billing identity evidence is temporarily unavailable", http.StatusServiceUnavailable)
-		return
+	if !trusted {
+		if err := h.DB.PrepareStripeCheckoutIdentity(c.Request.Context(), db.PrepareStripeCheckoutIdentityParams{TeamID: teamID, UserID: actorID}); err != nil {
+			log.Error().Err(err).Str("team_id", teamID.String()).Msg("prepare Stripe checkout identity failed")
+			respondErrorMsg(c, "service_unavailable", "billing identity evidence is temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
 	}
 	customerID, err := h.ensureStripeCustomer(c.Request.Context(), teamID)
 	if err != nil {
@@ -1661,24 +1690,30 @@ func (h *Handlers) CreateStripeCheckoutSession(c *gin.Context) {
 	}
 	requestKey := checkoutSessionIdempotencyKey(teamID, customerID, successURL, cancelURL, priceIDs)
 	attemptID := uuid.New()
-	checkoutAccount, err := h.DB.BeginTeamBillingCheckout(c.Request.Context(), db.BeginTeamBillingCheckoutParams{
-		TeamID:     teamID,
-		ActorID:    pgtype.UUID{Bytes: actorID, Valid: true},
-		RequestKey: stringPtr(requestKey),
-		AttemptID:  attemptID,
-	})
-	resumed := errors.Is(err, pgx.ErrNoRows)
-	if resumed {
-		checkoutAccount, err = h.DB.ResumeTeamBillingCheckout(c.Request.Context(), db.ResumeTeamBillingCheckoutParams{
+	var checkoutAccount db.TeamBillingAccount
+	if trusted {
+		requestKey += ":intent:" + req.OperationID.String()
+		checkoutAccount, err = h.beginCheckoutWithPublicationDecision(c.Request.Context(), teamID, actorID, req, requestKey, attemptID)
+	} else {
+		checkoutAccount, err = h.DB.BeginTeamBillingCheckout(c.Request.Context(), db.BeginTeamBillingCheckoutParams{
 			TeamID:     teamID,
 			ActorID:    pgtype.UUID{Bytes: actorID, Valid: true},
 			RequestKey: stringPtr(requestKey),
 			AttemptID:  attemptID,
 		})
+		resumed := errors.Is(err, pgx.ErrNoRows)
+		if resumed {
+			checkoutAccount, err = h.DB.ResumeTeamBillingCheckout(c.Request.Context(), db.ResumeTeamBillingCheckoutParams{
+				TeamID:     teamID,
+				ActorID:    pgtype.UUID{Bytes: actorID, Valid: true},
+				RequestKey: stringPtr(requestKey),
+				AttemptID:  attemptID,
+			})
+		}
 	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			respondErrorMsg(c, "conflict", "another checkout is already in progress", http.StatusConflict)
+		if errors.Is(err, pgx.ErrNoRows) || isCheckoutPublicationConflict(err) {
+			respondErrorMsg(c, "conflict", "another checkout is already in progress or the intent is closed", http.StatusConflict)
 			return
 		}
 		log.Error().Err(err).Str("team_id", teamID.String()).Msg("begin Stripe checkout failed")
@@ -3778,6 +3813,15 @@ func (h *Handlers) ensureStripeCustomer(ctx context.Context, teamID uuid.UUID) (
 		TeamID:           teamID,
 		StripeCustomerID: stringPtr(customer.ID),
 	}); err != nil {
+		// Concurrent first inserts can conflict on the customer index before
+		// ON CONFLICT (team_id) handles the idempotent customer association.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "team_billing_account_stripe_customer_id_key" {
+			account, readErr := h.DB.GetTeamBillingAccount(ctx, teamID)
+			if readErr == nil && account.StripeCustomerID != nil && *account.StripeCustomerID == customer.ID {
+				return customer.ID, nil
+			}
+		}
 		return "", err
 	}
 	return customer.ID, nil
