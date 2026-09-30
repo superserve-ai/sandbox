@@ -159,20 +159,26 @@ type ProgressFunc func(format string, args ...any)
 // directory as restored. Artifact entries named manifest.json are
 // rejected up front so the marker can never collide.
 func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, progress ProgressFunc) (*GenerationManifest, error) {
-	return restoreGeneration(ctx, r, sandboxID, generation, destDir, nil, progress)
+	return restoreGeneration(ctx, r, sandboxID, generation, destDir, nil, nil, progress)
 }
 
 // restoreGeneration is RestoreGeneration with entries skip reports as
 // already satisfied outside destDir, such as a shared base the host holds.
-func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, destDir string, skip func(ManifestFile) bool, progress ProgressFunc) (*GenerationManifest, error) {
+// A manifest the caller has already read and validated is used as given,
+// so a restore costs one manifest request and cannot fail on a second
+// identical one.
+func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, destDir string, manifest *GenerationManifest, skip func(ManifestFile) bool, progress ProgressFunc) (*GenerationManifest, error) {
 	report := func(format string, args ...any) {
 		if progress != nil {
 			progress(format, args...)
 		}
 	}
-	manifest, err := fetchManifest(ctx, r, owner, generation, report)
-	if err != nil {
-		return nil, err
+	if manifest == nil {
+		fetched, err := fetchManifest(ctx, r, owner, generation, report)
+		if err != nil {
+			return nil, err
+		}
+		manifest = fetched
 	}
 	report("manifest %s/%s: %d files", owner, generation, len(manifest.Files))
 	root, err := openFreshDir(destDir)

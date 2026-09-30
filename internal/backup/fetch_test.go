@@ -182,42 +182,61 @@ func TestPruneBaseCacheDropsOldestCachedObjectsAndSparesPromotedBases(t *testing
 }
 
 func TestFetchGenerationUsesTheHostBaseWithoutDownloadingIt(t *testing.T) {
-	// No reflink here, so the template is used where it lies.
-	stubClone(t, noClone)
-	store := newMemBlobs()
-	dir := t.TempDir()
-	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
-	basePath := filepath.Join(dir, "base.ext4")
-	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	task := writePauseFixture(t, dir, "pause A")
-	task.Files[0].BasePath = basePath
-	task.Files[0].BaseSHA256 = digestOf(baseData)
-	task.Generation = GenerationKey(task.Files)
-	uploadFixture(t, store, task)
+	for _, clone := range []struct {
+		name string
+		fn   func(dst, src *os.File) error
+	}{{"reflink", copyClone}, {"no reflink", noClone}} {
+		t.Run(clone.name, func(t *testing.T) {
+			stubClone(t, clone.fn)
+			store := newMemBlobs()
+			dir := t.TempDir()
+			baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+			basePath := filepath.Join(dir, "base.ext4")
+			if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			task := writePauseFixture(t, dir, "pause A")
+			task.Files[0].BasePath = basePath
+			task.Files[0].BaseSHA256 = digestOf(baseData)
+			task.Generation = GenerationKey(task.Files)
+			uploadFixture(t, store, task)
 
-	counter := &countingReader{inner: store}
-	dest := filepath.Join(t.TempDir(), task.SandboxID)
-	got, err := FetchGeneration(context.Background(), counter, task.SandboxID, task.Generation, dest, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hostInfo, err := os.Stat(basePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	baseInfo, err := os.Stat(got.Base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !os.SameFile(hostInfo, baseInfo) {
-		t.Fatalf("base = %s, want the host's own %s", got.Base, basePath)
-	}
-	for object := range counter.reads {
-		if strings.HasPrefix(object, "bases/") {
-			t.Fatalf("downloaded %s although the host holds the base", object)
-		}
+			counter := &countingReader{inner: store}
+			dest := filepath.Join(t.TempDir(), task.SandboxID)
+			got, err := FetchGeneration(context.Background(), counter, task.SandboxID, task.Generation, dest, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for object := range counter.reads {
+				if strings.HasPrefix(object, "bases/") {
+					t.Fatalf("downloaded %s although the host holds the base", object)
+				}
+			}
+			own := filepath.Join(dest, SharedBaseName(task.Files[0].BaseSHA256))
+			if got.Base != own {
+				t.Fatalf("base = %s, want the restore's own %s", got.Base, own)
+			}
+
+			// The template is rebuilt in place, and the restore is unmoved
+			// by it: what was hashed is what the guest reads.
+			if err := os.WriteFile(basePath, bytes.Repeat([]byte{0x22}, 128<<10), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			again, err := RestoredDisk(context.Background(), dest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if again.Base != own {
+				t.Fatalf("base = %s, want %s", again.Base, own)
+			}
+			held, err := os.ReadFile(again.Base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(held, baseData) {
+				t.Fatal("the restore's base no longer holds the bytes the pause recorded")
+			}
+		})
 	}
 }
 
@@ -332,37 +351,6 @@ func TestFetchGenerationRefusesAHostBaseWhoseContentChanged(t *testing.T) {
 // The reuse fast path reads a completed restore back. A host base that
 // changed since must not be handed to the boot as if it still matched.
 func TestRestoredDiskRejectsAHostBaseWhoseContentChanged(t *testing.T) {
-	// No reflink, so the restore has only the recorded path to go on.
-	stubClone(t, noClone)
-	store := newMemBlobs()
-	dir := t.TempDir()
-	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
-	basePath := filepath.Join(dir, "base.ext4")
-	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	task := writePauseFixture(t, dir, "pause A")
-	task.Files[0].BasePath = basePath
-	task.Files[0].BaseSHA256 = digestOf(baseData)
-	task.Generation = GenerationKey(task.Files)
-	uploadFixture(t, store, task)
-
-	dest := filepath.Join(t.TempDir(), task.SandboxID)
-	if _, err := FetchGeneration(context.Background(), store, task.SandboxID, task.Generation, dest, nil); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(basePath, bytes.Repeat([]byte{0x22}, 128<<10), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := RestoredDisk(context.Background(), dest); err == nil {
-		t.Fatalf("base = %s, want a refusal so the caller restores again", got.Base)
-	}
-}
-
-// A checked host base is copied into the restore, so the bytes that were
-// hashed are the bytes the boot reads and a template rebuilt at that path
-// afterwards cannot change them under a running VM.
-func TestRestoreCopiesAVerifiedHostBaseIntoTheRestore(t *testing.T) {
 	stubClone(t, copyClone)
 	store := newMemBlobs()
 	dir := t.TempDir()
@@ -377,39 +365,20 @@ func TestRestoreCopiesAVerifiedHostBaseIntoTheRestore(t *testing.T) {
 	task.Generation = GenerationKey(task.Files)
 	uploadFixture(t, store, task)
 
-	counter := &countingReader{inner: store}
 	dest := filepath.Join(t.TempDir(), task.SandboxID)
-	got, err := FetchGeneration(context.Background(), counter, task.SandboxID, task.Generation, dest, nil)
-	if err != nil {
+	if _, err := FetchGeneration(context.Background(), store, task.SandboxID, task.Generation, dest, nil); err != nil {
 		t.Fatal(err)
 	}
-	own := filepath.Join(dest, SharedBaseName(task.Files[0].BaseSHA256))
-	if got.Base != own {
-		t.Fatalf("base = %s, want the restore's own %s", got.Base, own)
+	// A restore holding no copy of its base, as every restore made before
+	// this one does: the recorded template is all it has to go on.
+	if err := os.Remove(filepath.Join(dest, SharedBaseName(task.Files[0].BaseSHA256))); err != nil {
+		t.Fatal(err)
 	}
-	for object := range counter.reads {
-		if strings.HasPrefix(object, "bases/") {
-			t.Fatalf("downloaded %s although the host holds the base", object)
-		}
-	}
-
-	// The template is rebuilt in place, and the restore is unmoved by it.
 	if err := os.WriteFile(basePath, bytes.Repeat([]byte{0x22}, 128<<10), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	again, err := RestoredDisk(context.Background(), dest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if again.Base != own {
-		t.Fatalf("base = %s, want %s", again.Base, own)
-	}
-	held, err := os.ReadFile(again.Base)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(held, baseData) {
-		t.Fatal("the restore's base no longer holds the bytes the pause recorded")
+	if got, err := RestoredDisk(context.Background(), dest); err == nil {
+		t.Fatalf("base = %s, want a refusal so the caller restores again", got.Base)
 	}
 }
 
@@ -417,9 +386,7 @@ func TestRestoreCopiesAVerifiedHostBaseIntoTheRestore(t *testing.T) {
 // check the context cut short must be reported rather than read as a
 // restore worth replacing.
 func TestFetchGenerationKeepsACompleteRestoreWhenTheReuseCheckIsCancelled(t *testing.T) {
-	// No reflink, so resolving the restore has to read the host template,
-	// which is the read the context cuts short.
-	stubClone(t, noClone)
+	stubClone(t, copyClone)
 	store := newMemBlobs()
 	dir := t.TempDir()
 	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
@@ -438,6 +405,11 @@ func TestFetchGenerationKeepsACompleteRestoreWhenTheReuseCheckIsCancelled(t *tes
 		t.Fatal(err)
 	}
 
+	// Without its own copy, resolving the restore has to materialize and
+	// hash the base, which is the work the context cuts short.
+	if err := os.Remove(filepath.Join(dest, SharedBaseName(task.Files[0].BaseSHA256))); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := FetchGeneration(ctx, store, task.SandboxID, task.Generation, dest, nil); !errors.Is(err, context.Canceled) {
@@ -494,5 +466,26 @@ func TestRestoredGenerationReadsTheMarkerWithoutTouchingTheBase(t *testing.T) {
 	}
 	if len(after) != len(before) {
 		t.Fatalf("the restore gained %d entries from being listed", len(after)-len(before))
+	}
+}
+
+// One manifest request per restore: a second identical read would be an
+// extra round trip, and a transient failure of it would abort a restore
+// whose manifest had already arrived.
+func TestFetchGenerationReadsTheManifestOnce(t *testing.T) {
+	store := newMemBlobs()
+	dir := t.TempDir()
+	task := writePauseFixture(t, dir, "pause A")
+	uploadFixture(t, store, task)
+
+	counter := &countingReader{inner: store}
+	dest := filepath.Join(t.TempDir(), task.SandboxID)
+	if _, err := FetchGeneration(context.Background(), counter, task.SandboxID, task.Generation, dest, nil); err != nil {
+		t.Fatal(err)
+	}
+	for object, n := range counter.reads {
+		if strings.HasSuffix(object, ManifestObject) && n != 1 {
+			t.Fatalf("read %s %d times, want once", object, n)
+		}
 	}
 }

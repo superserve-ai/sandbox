@@ -149,7 +149,7 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 		}
 		return ok
 	}
-	if _, err := restoreGeneration(ctx, r, owner, generation, destDir, skip, progress); err != nil {
+	if _, err := restoreGeneration(ctx, r, owner, generation, destDir, m, skip, progress); err != nil {
 		return Restored{}, err
 	}
 	return RestoredDisk(ctx, destDir)
@@ -186,24 +186,29 @@ func hostBasePath(m *GenerationManifest, sha string) string {
 	return ""
 }
 
-// hostBase resolves the path the boot should read for a shared base the
-// host claims to hold, or "" when the host cannot supply those bytes.
+// hostBase materializes a shared base into the restore from the template
+// the pause recorded, and returns the path the boot should read, or ""
+// when the host cannot supply those bytes.
 //
-// A copy-on-write clone inside the restore is what makes this sound: the
-// bytes that were hashed are then the bytes that are read. Hashing the
-// template where it lies proves less — a rebuild that truncates and
-// rewrites it, or an inode swapped in after the digest was taken, changes
-// what the guest sees — so it is the fallback for filesystems that make
-// no clone possible, where it still catches a base that is already wrong.
-// A clone that fails its digest is removed, leaving the manifest's name
+// The copy is what makes this sound: the bytes that were hashed are then
+// the bytes that are read. Hashing the template where it lies proves
+// less — a rebuild that truncates and rewrites it, or an inode swapped in
+// after the digest was taken, changes what the guest sees for the whole
+// life of the VM — so the template is never handed to a boot directly. A
+// reflink costs no data copy where the filesystems allow one and a sparse
+// copy where they do not; either way the object need not be fetched. A
+// copy that fails its digest is removed, leaving the manifest's own name
 // free for the fetch that follows. Only a check that could not run at all
 // is an error.
 func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 	dst := filepath.Join(dir, SharedBaseName(sha))
-	if err := cloneToPath(dst, src); err == nil {
-		if err := verifyPath(ctx, dst, sha); err == nil {
-			return dst, nil
+	if err := snapshotFileMode(ctx, dst, src, stageAuto); err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
 		}
+		return "", nil
+	}
+	if err := verifyPath(ctx, dst, sha); err != nil {
 		if rerr := os.Remove(dst); rerr != nil {
 			return "", fmt.Errorf("discard unverified base copy: %w", rerr)
 		}
@@ -212,38 +217,7 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 		}
 		return "", nil
 	}
-	if err := verifyPath(ctx, src, sha); err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		return "", nil
-	}
-	return src, nil
-}
-
-// cloneToPath reflinks src to a newly created dst, which must not exist.
-func cloneToPath(dst, src string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	if err := cloneInto(out, in); err != nil {
-		_ = os.Remove(dst)
-		return err
-	}
-	// The boot reads this copy, and a marker already calls the restore
-	// complete; page-cache-only bytes would not survive a power loss.
-	if err := out.Sync(); err != nil {
-		_ = os.Remove(dst)
-		return err
-	}
-	return nil
+	return dst, nil
 }
 
 // verifyPath hashes the file at path against the digest recorded for its
