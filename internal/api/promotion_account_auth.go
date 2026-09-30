@@ -16,6 +16,9 @@ import (
 type promotionAccountClaims struct {
 	jwt.RegisteredClaims
 	Operation            string `json:"operation"`
+	OperationID          string `json:"operation_id,omitempty"`
+	Name                 string `json:"name,omitempty"`
+	After                string `json:"after,omitempty"`
 	AttemptID            string `json:"attempt_id,omitempty"`
 	TeamID               string `json:"team_id,omitempty"`
 	HomeRegion           string `json:"home_region,omitempty"`
@@ -59,6 +62,47 @@ func PromotionAccountAuth() gin.HandlerFunc {
 		case "bind":
 			attempt, err := uuid.Parse(claims.AttemptID)
 			if err != nil || attempt == uuid.Nil {
+				deny()
+				return
+			}
+		case "prepare-team", "recover-team", "complete-team", "discover-team-creations":
+			region := sandboxIDRegionFromEnv()
+			if region == "" {
+				region = "use"
+			}
+			if claims.HomeRegion != region {
+				deny()
+				return
+			}
+			if operation == "discover-team-creations" {
+				if claims.After != "" {
+					cursor, err := uuid.Parse(claims.After)
+					if err != nil || cursor == uuid.Nil {
+						deny()
+						return
+					}
+				}
+			} else {
+				locator, err := uuid.Parse(claims.OperationID)
+				if err != nil || locator == uuid.Nil {
+					deny()
+					return
+				}
+			}
+			if operation == "prepare-team" || operation == "complete-team" {
+				if claims.AuthorityUnavailable == nil || strings.TrimSpace(claims.Name) == "" || len(claims.Name) > 256 {
+					deny()
+					return
+				}
+			}
+			if operation == "complete-team" {
+				attempt, attemptErr := uuid.Parse(claims.AttemptID)
+				team, teamErr := uuid.Parse(claims.TeamID)
+				if attemptErr != nil || attempt == uuid.Nil || teamErr != nil || team == uuid.Nil {
+					deny()
+					return
+				}
+			} else if claims.AttemptID != "" || claims.TeamID != "" {
 				deny()
 				return
 			}
