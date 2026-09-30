@@ -45,7 +45,7 @@ func newStorageLeaseFixture(t *testing.T) storageLeaseFixture {
 	t.Cleanup(pool.Close)
 	_, err = pool.Exec(t.Context(), `
 		CREATE TEMP TABLE retained_storage_cutover(host_id text,team_id uuid,started_at timestamptz,PRIMARY KEY(host_id,team_id));
-        CREATE TEMP TABLE sandbox_snapshot(id uuid,host_id text,team_id uuid,status text NOT NULL DEFAULT 'ready',created_at timestamptz NOT NULL DEFAULT now(),ready_at timestamptz,deleted_at timestamptz);
+        CREATE TEMP TABLE sandbox_snapshot(id uuid,host_id text,team_id uuid,status text NOT NULL DEFAULT 'ready',created_at timestamptz NOT NULL DEFAULT now(),ready_at timestamptz,deleted_at timestamptz,retention_ended_at timestamptz);
         CREATE TEMP TABLE retained_storage_interval(
             id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,host_id text,team_id uuid,owner_kind text,owner_id uuid,
             generation text,extents jsonb,started_at timestamptz,ended_at timestamptz,

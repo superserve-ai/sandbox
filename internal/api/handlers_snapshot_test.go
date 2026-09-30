@@ -30,8 +30,8 @@ import (
 // generated queries (see internal/db/models.go).
 func sandboxSnapshotRow(s db.SandboxSnapshot) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
-		if len(dest) != 28 {
-			return fmt.Errorf("sandbox_snapshot scan wants 28 columns, got %d", len(dest))
+		if len(dest) != 29 {
+			return fmt.Errorf("sandbox_snapshot scan wants 29 columns, got %d", len(dest))
 		}
 		*dest[0].(*uuid.UUID) = s.ID
 		*dest[1].(*uuid.UUID) = s.TeamID
@@ -61,6 +61,7 @@ func sandboxSnapshotRow(s db.SandboxSnapshot) *mockRow {
 		*dest[25].(*pgtype.Timestamptz) = s.ReadyAt
 		*dest[26].(*pgtype.Timestamptz) = s.DeletedAt
 		*dest[27].(*pgtype.Timestamptz) = s.SweepAfter
+		*dest[28].(*pgtype.Timestamptz) = s.RetentionEndedAt
 		return nil
 	}}
 }

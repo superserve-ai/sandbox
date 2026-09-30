@@ -39,7 +39,8 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
 	}
 	if _, err := tx.Exec(ctx, `WITH supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
 	 SELECT s.id FROM sandbox_snapshot s JOIN supplied o ON o.kind='snapshot' AND o.id=s.id
-			 WHERE s.host_id=$1 AND s.status IN ('ready','creating','deleting') AND s.created_at<=$2 AND (s.deleted_at IS NULL OR s.deleted_at>$2)
+			 WHERE s.host_id=$1 AND (s.status IN ('ready','creating','deleting') OR s.retention_ended_at>$2)
+			   AND s.created_at<=$2 AND (LEAST(s.deleted_at,s.retention_ended_at) IS NULL OR LEAST(s.deleted_at,s.retention_ended_at)>$2)
 			   AND NOT EXISTS (
 				 SELECT 1 FROM retained_storage_interval i
 				 JOIN jsonb_to_recordset($3::jsonb) AS current(kind text,id uuid,generation text,extents jsonb)
@@ -89,8 +90,8 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
       AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)))
    AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
  UNION ALL
-  SELECT 'snapshot',id FROM sandbox_snapshot WHERE host_id=$1 AND status IN ('ready','creating','deleting') AND created_at<=$2
-   AND (deleted_at IS NULL OR deleted_at>$2)
+  SELECT 'snapshot',id FROM sandbox_snapshot WHERE host_id=$1 AND (status IN ('ready','creating','deleting') OR retention_ended_at>$2) AND created_at<=$2
+   AND (LEAST(deleted_at,retention_ended_at) IS NULL OR LEAST(deleted_at,retention_ended_at)>$2)
  ), supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
  SELECT NOT EXISTS(SELECT 1 FROM expected e LEFT JOIN supplied s USING(kind,id) WHERE s.id IS NULL)
   AND (SELECT count(*) FROM expected)<=$4
@@ -108,7 +109,9 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
   WHERE s.host_id=$1 AND s.created_at<=$2 AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
    AND feature_enabled('billing_metrics_write',s.team_id)
   UNION ALL
-  SELECT o.*,s.team_id,s.deleted_at FROM supplied o JOIN sandbox_snapshot s ON o.kind='snapshot' AND s.id=o.id AND s.host_id=$1 AND s.status IN ('ready','creating','deleting') AND s.created_at<=$2 AND (s.deleted_at IS NULL OR s.deleted_at>$2)
+  SELECT o.*,s.team_id,LEAST(s.deleted_at,s.retention_ended_at) FROM supplied o JOIN sandbox_snapshot s ON o.kind='snapshot' AND s.id=o.id
+  WHERE s.host_id=$1 AND (s.status IN ('ready','creating','deleting') OR s.retention_ended_at>$2)
+   AND s.created_at<=$2 AND (LEAST(s.deleted_at,s.retention_ended_at) IS NULL OR LEAST(s.deleted_at,s.retention_ended_at)>$2)
    AND feature_enabled('billing_metrics_write',s.team_id)
  ), moved AS (
   UPDATE retained_storage_interval old SET ended_at=$2

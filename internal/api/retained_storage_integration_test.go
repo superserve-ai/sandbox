@@ -362,6 +362,111 @@ func TestIntegration_RetainedReportOwnershipAndReceiptTransitions(t *testing.T) 
 	}
 }
 
+func attachSnapshotRetentionTrigger(t *testing.T, f storageLeaseFixture) {
+	t.Helper()
+	// Copy the migrated trigger, including its event columns and WHEN condition.
+	var trigger, table string
+	if err := f.pool.QueryRow(t.Context(), `SELECT pg_get_triggerdef(oid),tgrelid::regclass::text
+ FROM pg_trigger WHERE tgrelid='public.sandbox_snapshot'::regclass
+ AND tgname='close_snapshot_retained_storage'`).Scan(&trigger, &table); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(t.Context(), strings.Replace(trigger, " ON "+table+" ", " ON pg_temp.sandbox_snapshot ", 1)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegration_RetainedSnapshotFailureAfterReceipt(t *testing.T) {
+	for _, status := range []string{"creating", "ready", "deleting"} {
+		for _, replacement := range []bool{false, true} {
+			for _, cleanup := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/replacement=%t/cleanup=%t", status, replacement, cleanup), func(t *testing.T) {
+					f := newStorageLeaseFixture(t)
+					ctx := t.Context()
+					attachSnapshotRetentionTrigger(t, f)
+					exec := func(query string, args ...any) {
+						t.Helper()
+						if _, err := f.pool.Exec(ctx, query, args...); err != nil {
+							t.Fatal(err)
+						}
+					}
+					id := uuid.New()
+					exec(`INSERT INTO sandbox_snapshot(id,team_id,host_id,status,created_at)
+ SELECT $1,team_id,host_id,$2,created_at FROM sandbox WHERE id=$3`, id, status, f.sandboxID)
+					base := retainedstorage.Owner{Kind: "sandbox", ID: f.sandboxID.String(), Generation: strings.Repeat("a", 64),
+						Extents: []retainedstorage.Extent{{Device: "fs", Start: 4096, Length: 4096}}}
+					snapshot := retainedstorage.Owner{Kind: "snapshot", ID: id.String(), Generation: strings.Repeat("a", 64),
+						Extents: []retainedstorage.Extent{{Device: "fs", Start: 8192, Length: 4096}}}
+					apply := func(at time.Time, owners ...retainedstorage.Owner) error {
+						t.Helper()
+						exec(`UPDATE host_storage_report SET state='processing',next_measurement_index=0`)
+						return applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, at,
+							[]storageReportMeasurement{{Retained: &retainedstorage.Inventory{Version: 1, Owners: owners}}}, 1, 1)
+					}
+					at := f.receivedAt
+					if replacement {
+						if err := apply(at.Add(-time.Minute), base, snapshot); err != nil {
+							t.Fatal(err)
+						}
+						snapshot.Generation = strings.Repeat("b", 64)
+						snapshot.Extents[0].Length = 8192
+					}
+					exec(`UPDATE sandbox_snapshot SET status='failed' WHERE id=$1`, id)
+					var boundary time.Time
+					if err := f.pool.QueryRow(ctx, `SELECT retention_ended_at FROM sandbox_snapshot WHERE id=$1`, id).Scan(&boundary); err != nil {
+						t.Fatal(err)
+					}
+					if !boundary.After(at) {
+						t.Fatalf("failure boundary %s must follow receipt %s", boundary, at)
+					}
+					if cleanup {
+						exec(`UPDATE sandbox_snapshot SET status='deleting',deleted_at=clock_timestamp() WHERE id=$1`, id)
+					}
+					if err := apply(at, base); !errors.Is(err, errStorageReportInvalidPayload) {
+						t.Fatalf("omitted receipt-time snapshot allowed cutover: %v", err)
+					}
+					// The first application and replay must retain the same bounded interval.
+					for i := 0; i < 2; i++ {
+						if err := apply(at, base, snapshot); err != nil {
+							t.Fatal(err)
+						}
+					}
+					var started, ended time.Time
+					var length int64
+					if err := f.pool.QueryRow(ctx, `SELECT started_at,ended_at,(extents->0->>'length')::bigint
+ FROM retained_storage_interval WHERE owner_id=$1 AND generation=$2`, id, snapshot.Generation).Scan(&started, &ended, &length); err != nil {
+						t.Fatal(err)
+					}
+					if !started.Equal(at) || !ended.Equal(boundary) || length != snapshot.Extents[0].Length {
+						t.Fatalf("lagged snapshot interval: [%s,%s) bytes=%d, want [%s,%s) bytes=%d", started, ended, length, at, boundary, snapshot.Extents[0].Length)
+					}
+					if replacement {
+						if err := f.pool.QueryRow(ctx, `SELECT ended_at FROM retained_storage_interval WHERE owner_id=$1 AND generation=$2`, id, strings.Repeat("a", 64)).Scan(&ended); err != nil || !ended.Equal(at) {
+							t.Fatalf("previous generation did not end at receipt: %s, %v", ended, err)
+						}
+					}
+					// Reports at and after failure cannot reopen storage, including
+					// when cleanup has moved the row back to the deleting status.
+					if err := apply(boundary, base, snapshot); err != nil {
+						t.Fatal(err)
+					}
+					if err := apply(boundary.Add(time.Second), base); err != nil {
+						t.Fatal(err)
+					}
+					var count int
+					want := 1
+					if replacement {
+						want++
+					}
+					if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval WHERE owner_id=$1`, id).Scan(&count); err != nil || count != want {
+						t.Fatalf("snapshot interval count: %d, want %d, err=%v", count, want, err)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestIntegration_RetainedSnapshotStatusClosure(t *testing.T) {
 	for _, status := range []string{"failed", "ready", "deleting"} {
 		t.Run(status, func(t *testing.T) {
@@ -373,15 +478,7 @@ func TestIntegration_RetainedSnapshotStatusClosure(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			// Copy the migrated trigger, including its event columns and WHEN
-			// condition, so a status-only update exercises the production wiring.
-			var trigger, table string
-			if err := f.pool.QueryRow(ctx, `SELECT pg_get_triggerdef(oid),tgrelid::regclass::text
- FROM pg_trigger WHERE tgrelid='public.sandbox_snapshot'::regclass
- AND tgname='close_snapshot_retained_storage'`).Scan(&trigger, &table); err != nil {
-				t.Fatal(err)
-			}
-			exec(strings.Replace(trigger, " ON "+table+" ", " ON pg_temp.sandbox_snapshot ", 1))
+			attachSnapshotRetentionTrigger(t, f)
 			id := uuid.New()
 			at := f.receivedAt.Add(-time.Minute)
 			exec(`INSERT INTO sandbox_snapshot(id,team_id,host_id,status,created_at)

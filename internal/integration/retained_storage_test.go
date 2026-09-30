@@ -79,40 +79,61 @@ func TestRetainedStorageSeriesPreservesFractionalLegacyArtifacts(t *testing.T) {
 	}
 }
 
-func TestRetainedStorageLegacyArtifactPathPreservesHistoricalUnion(t *testing.T) {
-	f := newStorageReportFixture(t, "paused", false)
-	team := sandboxTeamID(t, f.sandboxID)
-	ctx := t.Context()
-	start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-	end := start.Add(60 * time.Second)
-	otherSandbox, firstSnapshot, secondSnapshot := uuid.New(), uuid.New(), uuid.New()
-	otherHost := "legacy-artifact-host-" + uuid.NewString()
-	const path = "/example/shared-rootfs.ext4"
-	exec := func(query string, args ...any) {
-		t.Helper()
-		if _, err := testPool.Exec(ctx, query, args...); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Before cutover, preserve the legacy path union even across hosts so
-	// deploying the retained meter cannot rewrite finalized historical usage.
-	exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,base_path)
- VALUES($1,$2,'legacy-other-host','paused',$3,1,1024,8,$4,$5)`, otherSandbox, team, otherHost, start, path)
-	exec(`INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES
+func TestRetainedStorageLegacyArtifactUnionUsesIntervalHost(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		separateHosts  bool
+		reassign       bool
+		secondBytes    int64
+		wantMiBSeconds float64
+	}{
+		{name: "same-host-shared-path", secondBytes: 1 << 20, wantMiBSeconds: 60},
+		{name: "different-hosts-same-path", separateHosts: true, secondBytes: 1 << 20, wantMiBSeconds: 80},
+		{name: "different-hosts-different-allocations", separateHosts: true, secondBytes: 2 << 20, wantMiBSeconds: 100},
+		{name: "reassigned-current-host", separateHosts: true, reassign: true, secondBytes: 2 << 20, wantMiBSeconds: 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newStorageReportFixture(t, "paused", false)
+			team := sandboxTeamID(t, f.sandboxID)
+			ctx := t.Context()
+			start := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+			mid, end := start.Add(40*time.Second), start.Add(60*time.Second)
+			otherSandbox, firstSnapshot, secondSnapshot := uuid.New(), uuid.New(), uuid.New()
+			otherHost := f.hostID
+			if tc.separateHosts {
+				otherHost = "legacy-artifact-host-" + uuid.NewString()
+			}
+			const path = "/example/shared-rootfs.ext4"
+			exec := func(query string, args ...any) {
+				t.Helper()
+				if _, err := testPool.Exec(ctx, query, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,base_path)
+ VALUES($1,$2,'legacy-reference','paused',$3,1,1024,8,$4,$5)`, otherSandbox, team, otherHost, mid, path)
+			exec(`INSERT INTO snapshot(id,sandbox_id,team_id,path,trigger) VALUES
  ($1,$2,$3,$4,'pause'),($5,$6,$3,$4,'pause')`, firstSnapshot, f.sandboxID, team, path, secondSnapshot, otherSandbox)
-	exec(`UPDATE sandbox SET created_at=$2,snapshot_id=$3,base_path=$4 WHERE id=$1`, f.sandboxID, start, firstSnapshot, path)
-	exec(`UPDATE sandbox SET snapshot_id=$2 WHERE id=$1`, otherSandbox, secondSnapshot)
-	exec(`INSERT INTO artifact_manifest(snapshot_id,file_name,path,size_bytes,allocated_bytes,sha256)
- VALUES($1,'rootfs.ext4',$3,1048576,1048576,$4),($2,'rootfs.ext4',$3,1048576,1048576,$4)`, firstSnapshot, secondSnapshot, path, strings.Repeat("0", 64))
-	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason)
- VALUES($1,$3,0,$4,$5,'deleted'),($2,$3,0,$4,$5,'deleted')`, f.sandboxID, otherSandbox, team, start, end)
-	var got float64
-	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, start, end).Scan(&got); err != nil {
-		t.Fatal(err)
-	}
-	want := end.Sub(start).Seconds()
-	if math.Abs(got-want) > 0.0001 {
-		t.Fatalf("legacy path union changed historical usage: got %v want %v", got, want)
+			exec(`UPDATE sandbox SET created_at=$2,snapshot_id=$3,base_path=$4 WHERE id=$1`, f.sandboxID, start, firstSnapshot, path)
+			exec(`UPDATE sandbox SET snapshot_id=$2 WHERE id=$1`, otherSandbox, secondSnapshot)
+			exec(`INSERT INTO artifact_manifest(snapshot_id,file_name,path,size_bytes,allocated_bytes,sha256)
+ VALUES($1,'rootfs.ext4',$3,1048576,1048576,$4),($2,'rootfs.ext4',$3,$5,$5,$4)`, firstSnapshot, secondSnapshot, path, strings.Repeat("0", 64), tc.secondBytes)
+			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,disk_mib,started_at,ended_at,end_reason)
+ VALUES($1,$3,0,$4,$6,'deleted'),($2,$3,0,$5,$6,'deleted')`, f.sandboxID, otherSandbox, team, start, mid, end)
+			if tc.reassign {
+				// Current host identity must not merge distinct historical allocations.
+				exec(`UPDATE sandbox SET host_id=$2 WHERE id=$1`, f.sandboxID, otherHost)
+			}
+			for _, floorArtifacts := range []bool{false, true} {
+				var got float64
+				if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,$4)::float8`, team, start, end, floorArtifacts).Scan(&got); err != nil {
+					t.Fatal(err)
+				}
+				if math.Abs(got-tc.wantMiBSeconds) > 0.0001 {
+					t.Fatalf("legacy artifact union (floor=%t): got %v want %v MiB-seconds", floorArtifacts, got, tc.wantMiBSeconds)
+				}
+			}
+		})
 	}
 }
 
