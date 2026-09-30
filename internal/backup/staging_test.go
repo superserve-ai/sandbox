@@ -206,3 +206,34 @@ func TestStagePendingAbandonsAClonePastTheDeadline(t *testing.T) {
 		t.Fatalf("err = %v, want the marker-only fallback", err)
 	}
 }
+
+// The reflink ioctl cannot be interrupted, so a stalled one must release
+// its caller rather than hold a pause or a restore past its deadline.
+func TestSnapshotFileReleasesTheCallerWhenTheCloneStalls(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	stubClone(t, func(dst, src *os.File) error {
+		entered <- struct{}{}
+		<-release
+		return nil
+	})
+	t.Cleanup(func() { close(release) })
+
+	dir := t.TempDir()
+	src := writeDisk(t, dir, "rootfs.ext4", 1<<20)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := snapshotFileMode(ctx, filepath.Join(dir, "staged.ext4"), src, stageAuto)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want the cancellation reported", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the clone was never attempted")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "staged.ext4")); err == nil {
+		t.Fatal("a cancelled clone published its destination")
+	}
+}

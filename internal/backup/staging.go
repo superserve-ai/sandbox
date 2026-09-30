@@ -533,7 +533,7 @@ func snapshotClone(ctx context.Context, dst, src string) error {
 		os.Remove(tmp)
 		return err
 	}
-	return syncDir(filepath.Dir(dst))
+	return syncDirWithContext(ctx, filepath.Dir(dst))
 }
 
 // snapshotFile copies src to dst preserving sparseness, via reflink
@@ -556,7 +556,24 @@ func snapshotFile(ctx context.Context, dst, src string, tryClone bool) error {
 	tmp := out.Name()
 	cloned := false
 	if tryClone {
-		cloned = cloneInto(out, in) == nil
+		// Same contract as snapshotClone's attempt: the ioctl walks the
+		// extent map and cannot be cancelled, so on a deadline the caller
+		// is released and this goroutine owns the fd and the temp file
+		// until the kernel returns.
+		clone := cloneInto
+		done := make(chan error, 1)
+		go func() { done <- clone(out, in) }()
+		select {
+		case err := <-done:
+			cloned = err == nil
+		case <-ctx.Done():
+			go func() {
+				<-done
+				out.Close()
+				os.Remove(tmp)
+			}()
+			return ctx.Err()
+		}
 	}
 	if !cloned {
 		extents, _, xerr := Extents(in)
@@ -618,7 +635,7 @@ func snapshotFile(ctx context.Context, dst, src string, tryClone bool) error {
 		os.Remove(tmp)
 		return err
 	}
-	return syncDir(filepath.Dir(dst))
+	return syncDirWithContext(ctx, filepath.Dir(dst))
 }
 
 // copyExtentChunk bounds a single context check's worth of copying, so
