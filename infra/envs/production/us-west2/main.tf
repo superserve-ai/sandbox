@@ -285,6 +285,7 @@ module "sandbox_host_b" {
   labels = merge(local.sandbox_host_labels, {
     component                  = "vmd"
     sandbox_role               = "vmd"
+    "goog-ops-agent-policy"    = "v2-template-1-7-0"
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
@@ -434,7 +435,44 @@ module "observability" {
     host_id        = local.active_host_name
     display_prefix = "Infrastructure / ${local.active_host_name}"
   }
+  host_logging_alerts = {
+    display_prefix = "Host logging / ${local.active_host_name}"
+    expected_hosts = {
+      sandbox_host_b = {
+        instance_name = module.sandbox_host_b.instance_name
+        instance_id   = module.sandbox_host_b.instance_id
+      }
+    }
+  }
   labels = local.common_labels
+}
+
+# One adopted zonal assignment owns the complete Ops Agent convergence for the
+# serving host and replacement host selected by the same Terraform labels.
+module "host_logging" {
+  source = "../../../modules/host-logging"
+
+  project_id      = local.project_id
+  zone            = local.zone
+  environment     = local.environment
+  region          = local.region
+  assignment_name = "goog-ops-agent-v2-template-1-7-0-us-west2-a"
+  selector_labels = {
+    application = "sandbox-host"
+    environment = local.environment
+    region      = local.region
+  }
+  enrolled_hosts = {
+    sandbox_host_b = {
+      instance_name         = module.sandbox_host_b.instance_name
+      instance_id           = module.sandbox_host_b.instance_id
+      host_id               = module.sandbox_host_b.instance_name
+      incarnation           = "${module.sandbox_host_b.instance_name}-${var.resource_suffix}"
+      service_account_email = google_service_account.vmd_runtime.email
+      proxy_units           = ["proxy.service", "proxy-generation.service"]
+    }
+  }
+  depends_on = [module.sandbox_host_b]
 }
 
 # Durability tier for the host's local-SSD artifacts (sandbox snapshots,

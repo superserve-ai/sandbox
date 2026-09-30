@@ -10,6 +10,9 @@ variables {
     host_maintenance  = "maintenance-page"
     vmd_launch        = "launch-page"
     vmd_network       = "network-page"
+    host_logging_export    = "host-logging-export-page"
+    host_logging_lag       = "host-logging-lag-page"
+    host_logging_heartbeat = "host-logging-heartbeat-page"
   }
 }
 

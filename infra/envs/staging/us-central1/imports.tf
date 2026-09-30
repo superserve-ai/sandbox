@@ -47,3 +47,8 @@ import {
   to = module.iam.google_project_iam_member.project_bindings["cd_network_admin"]
   id = "rayai-dev roles/compute.networkAdmin serviceAccount:superserve-github-actions@rayai-dev.iam.gserviceaccount.com"
 }
+
+import {
+  to = module.host_logging.google_os_config_os_policy_assignment.host_logging
+  id = "projects/rayai-dev/locations/us-central1-a/osPolicyAssignments/goog-ops-agent-v2-template-1-7-0-us-central1-a"
+}

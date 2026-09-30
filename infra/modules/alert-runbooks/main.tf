@@ -23,13 +23,16 @@ variable "runbook_ids" {
     host_maintenance  = "3e9743ab873381048279ce342d9373d5"
     vmd_launch        = "3e9743ab873381d999c8c439702a91e8"
     vmd_network       = "3e9743ab87338129b5f7fddcb51b638c"
+    host_logging_export    = "3e9743ab873381e0a4f9aa9b6e94100a1"
+    host_logging_lag       = "3e9743ab873381b1e0c0f7f2c36a2a02"
+    host_logging_heartbeat = "3e9743ab873381e47c4a3d7df4db9c16"
   }
 
   validation {
     condition = alltrue([
-      for key in ["lifecycle_latency", "lifecycle_failure", "backup_pipeline", "backup_coverage", "host_disk", "host_cpu", "host_maintenance", "vmd_launch", "vmd_network"] : contains(keys(var.runbook_ids), key)
+      for key in ["lifecycle_latency", "lifecycle_failure", "backup_pipeline", "backup_coverage", "host_disk", "host_cpu", "host_maintenance", "vmd_launch", "vmd_network", "host_logging_export", "host_logging_lag", "host_logging_heartbeat"] : contains(keys(var.runbook_ids), key)
     ])
-    error_message = "Configure a verified page ID for each of the nine alert procedures before deploying."
+    error_message = "Configure a verified page ID for each reviewed alert procedure before deploying."
   }
 
   validation {

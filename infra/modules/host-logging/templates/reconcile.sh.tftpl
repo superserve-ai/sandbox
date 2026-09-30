@@ -1,0 +1,56 @@
+#!/bin/bash
+set -euo pipefail
+
+config_path='${config_path}'
+candidate_config_path='${candidate_config_path}'
+journald_dropin='${journald_dropin}'
+
+# Validation is intentionally performed before activation. A failed candidate
+# leaves the last working file, journal, and Ops Agent checkpoint/buffer intact.
+if ! command -v google-cloud-ops-agent >/dev/null 2>&1; then
+  exit 100
+fi
+installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
+case "$installed_version" in
+  ${ops_agent_package_version}*) ;;
+  *) exit 1 ;;
+esac
+if ! test -s "$candidate_config_path"; then
+  exit 1
+fi
+if ! google-cloud-ops-agent diagnose --config="$candidate_config_path" >/dev/null 2>&1; then
+  exit 1
+fi
+
+install -d -m 0755 "$(dirname "$config_path")" "$(dirname "$journald_dropin")"
+if ! cmp -s "$candidate_config_path" "$config_path" 2>/dev/null; then
+  install -m 0644 "$candidate_config_path" "$config_path"
+  systemctl try-reload-or-restart google-cloud-ops-agent.service
+fi
+
+dropin_candidate=$(mktemp)
+trap 'rm -f "$dropin_candidate"' EXIT
+cat >"$dropin_candidate" <<'JOURNALD'
+[Journal]
+Storage=persistent
+SystemMaxUse=${journal_max_use_bytes}B
+SystemKeepFree=${journal_keep_free_bytes}B
+JOURNALD
+if ! cmp -s "$dropin_candidate" "$journald_dropin" 2>/dev/null; then
+  install -m 0644 "$dropin_candidate" "$journald_dropin"
+  systemctl try-reload-or-restart systemd-journald.service
+fi
+
+# Resource limits bound the agent's separate buffer/self-log footprint. They do
+# not change VMD units or erase delivery state, and are applied only through
+# this managed policy.
+mkdir -p /etc/systemd/system/google-cloud-ops-agent.service.d
+cat >/etc/systemd/system/google-cloud-ops-agent.service.d/30-superserve-resources.conf <<'RESOURCES'
+[Service]
+CPUQuota=${agent_cpu_limit_millicores / 10}%
+MemoryMax=${agent_memory_limit_mb}M
+Environment=GOOGLE_CLOUD_OPS_AGENT_BUFFER_MAX_BYTES=${agent_buffer_bytes}
+RESOURCES
+systemctl daemon-reload
+systemctl enable --now google-cloud-ops-agent.service
+exit 100

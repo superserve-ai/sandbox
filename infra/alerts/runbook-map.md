@@ -28,5 +28,8 @@ Workflows pass the shared variable as `TF_VAR_alert_runbook_base_url` for these 
 | `host_maintenance_events[each]` | `host_maintenance` | `host` | `host` | `maintenance` | — |
 | `ids_triage` | Cloud IDS investigation | `cloud_ids` | `vmd` | `security_finding` | — |
 | `ids_medium` (disabled) | Cloud IDS investigation | `cloud_ids` | `vmd` | `security_finding` | — |
+| `host_logging_export_failures[each]` | `host_logging_export` | `host_logging` | `host` | `export_failure` | — |
+| `host_logging_lag[each]` | `host_logging_lag` | `host_logging` | `host` | `delivery_lag` | — |
+| `host_logging_heartbeat[each]` | `host_logging_heartbeat` | `host_logging` | `host` | `missing_telemetry` | — |
 
-Each procedure has its own page under Operations / Runbooks. The nine newer destinations are skeletons awaiting procedure content and testing. Fill those pages in place to preserve the committed IDs; do not substitute a generic index. Configure the shared base URL before applying, then inspect rendered policy links and labels. When structured Monitoring notifications are ingested, inspect one representative payload for the labels.
+Each procedure has its own page under Operations / Runbooks. The newer destinations are skeletons awaiting procedure content and testing. Fill those pages in place to preserve the committed IDs; do not substitute a generic index. Configure the shared base URL before applying, then inspect rendered policy links and labels. When structured Monitoring notifications are ingested, inspect one representative payload for the labels.

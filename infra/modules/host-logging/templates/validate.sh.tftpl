@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+
+candidate_config_path='${candidate_config_path}'
+test -s "$candidate_config_path"
+installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
+case "$installed_version" in
+  ${ops_agent_package_version}*) ;;
+  *) exit 1 ;;
+esac
+command -v google-cloud-ops-agent >/dev/null
+google-cloud-ops-agent diagnose --config="$candidate_config_path" >/dev/null
+exit 100

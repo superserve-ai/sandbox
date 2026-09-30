@@ -80,3 +80,8 @@ import {
   to = module.network.google_compute_firewall.allow_iap_ssh[0]
   id = "projects/rayai-prod/global/firewalls/superserve-production-vpc-us-east4-allow-iap-ssh"
 }
+
+import {
+  to = module.host_logging.google_os_config_os_policy_assignment.host_logging
+  id = "projects/rayai-prod/locations/us-east4-a/osPolicyAssignments/goog-ops-agent-v2-template-1-7-0-us-east4-a"
+}

@@ -371,6 +371,7 @@ module "sandbox_host" {
   labels = merge(local.sandbox_host_labels, {
     component    = "vmd-staging-draining"
     sandbox_role = "vmd"
+    "goog-ops-agent-policy" = "v2-template-1-7-0"
   })
 
   service_account_email = module.iam.service_account_emails["superserve_api"]
@@ -380,6 +381,8 @@ module "sandbox_host" {
   can_ip_forward        = true
 
   metadata = {
+    enable-osconfig = "TRUE"
+    enable-oslogin  = "TRUE"
     startup-script = <<-EOT
       #!/bin/bash
       # Restore runtime and private configuration before admission.
@@ -440,6 +443,7 @@ module "sandbox_host_b" {
   labels = merge(local.sandbox_host_labels, {
     component    = "vmd"
     sandbox_role = "vmd"
+    "goog-ops-agent-policy" = "v2-template-1-7-0"
   })
 
   service_account_email     = google_service_account.vmd_runtime.email
@@ -454,6 +458,8 @@ module "sandbox_host_b" {
   can_ip_forward = true
 
   metadata = {
+    enable-osconfig = "TRUE"
+    enable-oslogin  = "TRUE"
     # cloud-init runs bootcmd on every boot before any service starts, so
     # the identity is already this host's own by the time vmd can launch.
     # A daemon that came up under another host's HOST_ID would heartbeat
@@ -607,8 +613,9 @@ module "observability" {
 
   runbook_urls = module.alert_runbooks.urls
 
-  project_id  = local.project_id
-  environment = local.environment
+  project_id               = local.project_id
+  environment              = local.environment
+  notification_channel_ids = var.notification_channel_ids
   # Backup pipeline alerts, same set as the production cells so staging
   # validates the queries before they matter. The disabled-host alert
   # stays off here: staging toggles BACKUP_BUCKET deliberately.
@@ -634,6 +641,19 @@ module "observability" {
   host_disk_alerts = {
     host_id        = module.sandbox_host_b.instance_name
     display_prefix = "Infrastructure / ${module.sandbox_host_b.instance_name}"
+  }
+  host_logging_alerts = {
+    display_prefix = "Host logging / staging"
+    expected_hosts = {
+      sandbox_host = {
+        instance_name = module.sandbox_host.instance_name
+        instance_id   = module.sandbox_host.instance_id
+      }
+      sandbox_host_b = {
+        instance_name = module.sandbox_host_b.instance_name
+        instance_id   = module.sandbox_host_b.instance_id
+      }
+    }
   }
   dashboards = {
     sandbox_operations = {
@@ -682,6 +702,43 @@ module "observability" {
     }
   }
   labels = local.common_labels
+}
+
+# One adopted zonal assignment owns Ops Agent installation and configuration
+# for both staging serving hosts. The standalone OTel collector remains the
+# application-metrics path.
+module "host_logging" {
+  source = "../../../modules/host-logging"
+
+  project_id      = local.project_id
+  zone            = local.zone
+  environment     = local.environment
+  region          = local.region
+  assignment_name = "goog-ops-agent-v2-template-1-7-0-us-central1-a"
+  selector_labels = {
+    application = "sandbox-host"
+    environment = local.environment
+    region      = local.region
+  }
+  enrolled_hosts = {
+    sandbox_host = {
+      instance_name         = module.sandbox_host.instance_name
+      instance_id           = module.sandbox_host.instance_id
+      host_id               = module.sandbox_host.instance_name
+      incarnation           = "${module.sandbox_host.instance_name}-${var.resource_suffix}"
+      service_account_email = module.iam.service_account_emails["superserve_api"]
+      proxy_units           = ["proxy.service", "proxy-generation.service"]
+    }
+    sandbox_host_b = {
+      instance_name         = module.sandbox_host_b.instance_name
+      instance_id           = module.sandbox_host_b.instance_id
+      host_id               = module.sandbox_host_b.instance_name
+      incarnation           = "${module.sandbox_host_b.instance_name}-${var.resource_suffix}"
+      service_account_email = google_service_account.vmd_runtime.email
+      proxy_units           = ["proxy.service", "proxy-generation.service"]
+    }
+  }
+  depends_on = [module.sandbox_host, module.sandbox_host_b]
 }
 
 # Durability tier for the host's local artifacts (sandbox snapshots, template

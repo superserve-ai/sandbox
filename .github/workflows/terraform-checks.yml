@@ -45,6 +45,12 @@ jobs:
       - name: Check alert triage labels
         run: python3 scripts/check-alert-triage-labels.py
 
+      - name: Check managed host logging contract
+        run: python3 scripts/verify-host-logging.py
+
+      - name: Test managed host logging configuration
+        run: python3 -m unittest scripts.test_host_logging_config scripts.test_verify_host_logging
+
       - name: Test alert contract validators
         run: python3 -m unittest discover -s scripts -p 'test_check_alert*.py'
 
@@ -68,6 +74,11 @@ jobs:
         run: |
           terraform -chdir=infra/modules/observability init -backend=false -input=false
           terraform -chdir=infra/modules/observability test
+
+      - name: Test managed host logging policy
+        run: |
+          terraform -chdir=infra/modules/host-logging init -backend=false -input=false
+          terraform -chdir=infra/modules/host-logging test
 
       - name: Test alert runbook URL construction
         run: |

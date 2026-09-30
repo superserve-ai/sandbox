@@ -6,3 +6,8 @@ import {
   to = module.api.google_cloud_run_v2_service_iam_member.public_invoker[0]
   id = "projects/rayai-prod/locations/us-west2/services/superserve-api-usw2 roles/run.invoker allUsers"
 }
+
+import {
+  to = module.host_logging.google_os_config_os_policy_assignment.host_logging
+  id = "projects/rayai-prod/locations/us-west2-a/osPolicyAssignments/goog-ops-agent-v2-template-1-7-0-us-west2-a"
+}

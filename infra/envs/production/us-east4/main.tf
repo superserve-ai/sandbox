@@ -521,7 +521,45 @@ module "observability" {
       instance_id   = module.sandbox_host_c.instance_id
     }
   }
+  host_logging_alerts = {
+    display_prefix = "Host logging / ${local.active_host_name}"
+    expected_hosts = {
+      sandbox_host_c = {
+        instance_name = module.sandbox_host_c.instance_name
+        instance_id   = module.sandbox_host_c.instance_id
+      }
+    }
+  }
   labels = local.common_labels
+}
+
+# One adopted zonal assignment owns Ops Agent installation/configuration for the
+# serving host and its replacements. East's existing enrollment label remains
+# unchanged while the common managed configuration is reconciled.
+module "host_logging" {
+  source = "../../../modules/host-logging"
+
+  project_id      = local.project_id
+  zone            = local.zone
+  environment     = local.environment
+  region          = local.region
+  assignment_name = "goog-ops-agent-v2-template-1-7-0-us-east4-a"
+  selector_labels = {
+    application = "sandbox-host"
+    environment = local.environment
+    region      = local.region
+  }
+  enrolled_hosts = {
+    sandbox_host_c = {
+      instance_name         = module.sandbox_host_c.instance_name
+      instance_id           = module.sandbox_host_c.instance_id
+      host_id               = module.sandbox_host_c.instance_name
+      incarnation           = "${module.sandbox_host_c.instance_name}-${var.resource_suffix}"
+      service_account_email = google_service_account.vmd_runtime.email
+      proxy_units           = ["proxy.service", "proxy-generation.service"]
+    }
+  }
+  depends_on = [module.sandbox_host_c]
 }
 
 # Durability tier for the host's local-SSD artifacts (sandbox snapshots,

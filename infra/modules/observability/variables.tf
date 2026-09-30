@@ -44,6 +44,25 @@ variable "host_maintenance_event_alerts" {
   default = {}
 }
 
+variable "host_logging_alerts" {
+  description = "Independent export failure, delivery lag, and serving-host heartbeat alerts."
+  type = object({
+    display_prefix        = string
+    lag_threshold_seconds = optional(number, 300)
+    heartbeat_duration    = optional(string, "600s")
+    expected_hosts = map(object({
+      instance_name = string
+      instance_id   = string
+    }))
+  })
+  default = null
+
+  validation {
+    condition     = var.host_logging_alerts == null ? true : var.host_logging_alerts.lag_threshold_seconds > 0
+    error_message = "host_logging_alerts.lag_threshold_seconds must be positive."
+  }
+}
+
 variable "log_buckets" {
   description = "Logging bucket definitions keyed by logical name."
   type = map(object({
