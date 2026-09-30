@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -98,19 +99,27 @@ func (m *Manager) backupSavedSnapshot(ctx context.Context, man *SavedSnapshotMan
 		files = append(files, f)
 		return nil
 	}
+	hashFailed := func(what, path string, err error) bool {
+		// Only the snapshot's own file being gone means it was deleted while
+		// it waited its turn; a base gone from under it is a failure.
+		if _, serr := os.Stat(path); errors.Is(err, os.ErrNotExist) && errors.Is(serr, os.ErrNotExist) {
+			log.Info().Msg("saved snapshot backup: snapshot deleted before its " + what + " was hashed")
+		} else {
+			log.Warn().Err(err).Msg("saved snapshot backup: " + what + " hash failed; not queued")
+		}
+		return false
+	}
 	// A cold boot of an overlay trusts the block map saved with it.
 	if man.SnapshotPath != "" && man.BasePath != "" {
 		if p := overlayBlockMapPath(man.SnapshotPath); statRegularFile(p) {
 			if err := add(backup.BlockMapName, p, ""); err != nil {
-				log.Warn().Err(err).Msg("saved snapshot backup: block map hash failed; not queued")
-				return false
+				return hashFailed("block map", p, err)
 			}
 		}
 	}
 	// Restore reads the disk as rootfs.ext4, whatever the capture named it.
 	if err := add("rootfs.ext4", man.DiskPath, man.BasePath); err != nil {
-		log.Warn().Err(err).Msg("saved snapshot backup: disk hash failed; not queued")
-		return false
+		return hashFailed("disk", man.DiskPath, err)
 	}
 	task := backup.Task{
 		SnapshotID: man.SnapshotID,
