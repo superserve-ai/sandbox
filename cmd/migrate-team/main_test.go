@@ -773,6 +773,124 @@ func TestRetainedStorageMigrationRetry(t *testing.T) {
 		t.Fatalf("obligation retry duplicated history: %s", got)
 	}
 
+	// Sequence repair must not rewind a value already reserved by an
+	// unrelated destination transaction. Exercise both commit orders against
+	// real PostgreSQL connections: migration-first leaves the writer pending,
+	// while writer-first holds the sequence lock until its commit.
+	for _, writerFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("concurrent destination identity commit-order-%t", writerFirst), func(t *testing.T) {
+			raceTeam, raceNeighbor, sourceSandbox := uuid.New(), uuid.New(), uuid.New()
+			for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+				mustExec(t, pool, `INSERT INTO team (id, name) VALUES ($1, $2), ($3, $4)`,
+					raceTeam, "migration-sequence-race-"+raceTeam.String(), raceNeighbor, "migration-sequence-neighbor-"+raceNeighbor.String())
+			}
+			base := time.Date(2026, 7, 1, 11, 0, 0, 0, time.UTC)
+			mustExec(t, srcPool, `
+				INSERT INTO sandbox_storage_baseline
+					(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+				VALUES ($1, $2, $3, '/srv/race/source.ext4', repeat('c', 64), 1048576, $4, $4, $4, $5)`,
+				sourceSandbox, raceTeam, sourceHostID, base, uuid.New())
+			var committedID int64
+			if err := dstPool.QueryRow(ctx, `
+				INSERT INTO sandbox_storage_baseline
+					(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+				VALUES ($1, $2, $3, '/srv/race/committed.ext4', repeat('d', 64), 2, $4, $4, $4, $5)
+				RETURNING id`, uuid.New(), raceNeighbor, destHostID, base, uuid.New()).Scan(&committedID); err != nil {
+				t.Fatal(err)
+			}
+			writerTx, err := dstPool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writerTx.Rollback(ctx)
+			var writerID int64
+			if err := writerTx.QueryRow(ctx, `
+				INSERT INTO sandbox_storage_baseline
+					(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+				VALUES ($1, $2, $3, '/srv/race/outstanding.ext4', repeat('e', 64), 3, $4, $4, $4, $5)
+				RETURNING id`, uuid.New(), raceNeighbor, destHostID, base.Add(time.Minute), uuid.New()).Scan(&writerID); err != nil {
+				t.Fatal(err)
+			}
+			if writerID <= committedID {
+				t.Fatalf("destination identity did not advance: committed=%d writer=%d", committedID, writerID)
+			}
+
+			if writerFirst {
+				sequence := scanString(t, dstPool, `
+					SELECT format('%I.%I', n.nspname, c.relname)
+					FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+					WHERE c.oid=pg_get_serial_sequence('sandbox_storage_baseline','id')::regclass`)
+				if _, err := writerTx.Exec(ctx, fmt.Sprintf(`LOCK TABLE %s IN ACCESS EXCLUSIVE MODE`, sequence)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			spec, ok := tableByName("sandbox_storage_baseline")
+			if !ok {
+				t.Fatal("sandbox baseline table is missing from migration table list")
+			}
+			done := make(chan error, 1)
+			go func() {
+				_, _, copyErr := copyTable(ctx, srcPool, dstPool, spec, raceTeam, nil)
+				done <- copyErr
+			}()
+			if writerFirst {
+				waited := false
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					var waiting bool
+					if err := dstPool.QueryRow(ctx, `SELECT EXISTS(
+						SELECT 1 FROM pg_stat_activity
+						WHERE wait_event_type='Lock' AND $1::integer=ANY(pg_blocking_pids(pid)))`, writerTx.Conn().PgConn().PID()).Scan(&waiting); err != nil {
+						t.Fatal(err)
+					}
+					if waiting {
+						waited = true
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				if !waited {
+					t.Fatal("migration copy did not wait for the destination sequence lock")
+				}
+			}
+
+			var copyErr error
+			if writerFirst {
+				if err := writerTx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+				copyErr = <-done
+			} else {
+				select {
+				case copyErr = <-done:
+				case <-time.After(5 * time.Second):
+					t.Fatal("migration copy did not commit before unrelated writer")
+				}
+				if err := writerTx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if copyErr != nil {
+				t.Fatalf("concurrent accounting copy: %v", copyErr)
+			}
+			var migratedID int64
+			if err := dstPool.QueryRow(ctx, `SELECT id FROM sandbox_storage_baseline WHERE team_id=$1`, raceTeam).Scan(&migratedID); err != nil {
+				t.Fatal(err)
+			}
+			if migratedID == writerID {
+				t.Fatalf("accounting copy reused outstanding destination identity %d", writerID)
+			}
+			if got := scanString(t, dstPool, `SELECT count(*)::text FROM sandbox_storage_baseline WHERE id=$1 AND team_id=$2`, writerID, raceNeighbor); got != "1" {
+				t.Fatalf("unrelated destination writer row was lost: %s", got)
+			}
+			mustExec(t, srcPool, `DELETE FROM sandbox_storage_baseline WHERE team_id=$1`, raceTeam)
+			mustExec(t, dstPool, `DELETE FROM sandbox_storage_baseline WHERE team_id IN ($1,$2)`, raceTeam, raceNeighbor)
+			mustExec(t, srcPool, `DELETE FROM team WHERE id IN ($1,$2)`, raceTeam, raceNeighbor)
+			mustExec(t, dstPool, `DELETE FROM team WHERE id IN ($1,$2)`, raceTeam, raceNeighbor)
+		})
+	}
+
 	// Reassigning the durable baseline key to another team must be rejected,
 	// rather than treated as a successful idempotent retry.
 	mustExec(t, dstPool, `UPDATE sandbox_storage_baseline SET team_id=$2 WHERE team_id=$1`, team, neighbor)

@@ -1143,6 +1143,7 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 
 	var total int64
 	batch := make([]json.RawMessage, 0, copyBatchSize)
+	identityRepaired := false
 	flush := func() error {
 		if len(batch) == 0 {
 			return nil
@@ -1154,8 +1155,11 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 		if err := assertAccountingIdentityOwnership(ctx, dst, t.name, payload); err != nil {
 			return err
 		}
-		if err := advanceAccountingIdentitySequence(ctx, dst, t.name); err != nil {
-			return err
+		if !identityRepaired {
+			if err := repairAccountingIdentitySequence(ctx, dst, t.name); err != nil {
+				return err
+			}
+			identityRepaired = true
 		}
 		tag, err := dst.Exec(ctx, insertQ, payload)
 		if err != nil {
@@ -1195,18 +1199,50 @@ func copyTable(ctx context.Context, src querier, dst *pgxpool.Pool, t tableSpec,
 }
 
 // A destination may contain an unrelated team's explicitly restored local id,
-// leaving the identity sequence behind it.  Resetting the sequence to the
-// current maximum immediately before an accounting batch makes the omitted-id
-// insert collision-safe while retaining every existing destination id.
-func advanceAccountingIdentitySequence(ctx context.Context, dst *pgxpool.Pool, table string) error {
+// leaving the identity sequence behind it. Repair that exceptional state only
+// by advancing the sequence, and synchronize the repair with nextval callers by
+// locking the sequence itself. In particular, never set the sequence backwards:
+// another transaction may already have reserved a value whose row is not yet
+// visible to the max(id) query.
+func repairAccountingIdentitySequence(ctx context.Context, dst *pgxpool.Pool, table string) error {
 	if table != "retained_storage_interval" && table != "sandbox_storage_baseline" && table != "retained_storage_measurement_obligation" {
 		return nil
 	}
-	q := fmt.Sprintf(`
-		SELECT setval(pg_get_serial_sequence('%s', 'id'),
-			COALESCE((SELECT max(id) FROM %s), 1), true)`, table, table)
-	if _, err := dst.Exec(ctx, q); err != nil {
-		return fmt.Errorf("advance %s identity sequence: %w", table, err)
+	tx, err := dst.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin %s identity repair: %w", table, err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Resolve and quote the sequence identifier through the catalog rather than
+	// interpolating a caller-provided name into LOCK/SELECT statements.
+	var sequence string
+	if err := tx.QueryRow(ctx, `
+		SELECT format('%I.%I', n.nspname, c.relname)
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.oid = pg_get_serial_sequence($1, 'id')::regclass`, table).Scan(&sequence); err != nil {
+		return fmt.Errorf("resolve %s identity sequence: %w", table, err)
+	}
+	if _, err := tx.Exec(ctx, fmt.Sprintf(`LOCK TABLE %s IN ACCESS EXCLUSIVE MODE`, sequence)); err != nil {
+		return fmt.Errorf("lock %s identity sequence: %w", table, err)
+	}
+	var lastValue int64
+	var isCalled bool
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT last_value, is_called FROM %s`, sequence)).Scan(&lastValue, &isCalled); err != nil {
+		return fmt.Errorf("read %s identity sequence: %w", table, err)
+	}
+	var maxID int64
+	if err := tx.QueryRow(ctx, fmt.Sprintf(`SELECT COALESCE(max(id), 0) FROM %s`, table)).Scan(&maxID); err != nil {
+		return fmt.Errorf("read %s maximum identity: %w", table, err)
+	}
+	if maxID > 0 && (!isCalled || maxID > lastValue) {
+		if _, err := tx.Exec(ctx, `SELECT setval($1::regclass, $2, true)`, sequence, maxID); err != nil {
+			return fmt.Errorf("advance %s identity sequence: %w", table, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit %s identity repair: %w", table, err)
 	}
 	return nil
 }
