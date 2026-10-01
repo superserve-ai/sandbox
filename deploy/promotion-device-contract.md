@@ -181,6 +181,40 @@ using `register`, including delayed West entry. Requests are limited to 4 KiB
 and database work to three seconds; SQL errors are not interpreted as
 eligibility.
 
+### Register-signup provenance, errors, and recovery
+
+The `register-signup` caller may sign only the account and attempt returned by
+the actual newly created Auth account, or by an independently authorized,
+durable continuation of that same original signup. A browser cookie, attempt
+ID, user ID, or other client locator is untrusted input. Ordinary login and a
+shared-Auth evidence lookup can validate a retained `(user, attempt)` pair,
+but neither can create signup provenance or authorize a new assertion. If the
+trusted continuation is unavailable, stop publication rather than minting an
+assertion from a replacement attempt or a later login. An uncertain bind must
+first recover the original bind; after that, retries may use only the original
+account/attempt tuple.
+
+The route returns `200 {"outcome":"owner"}` or
+`200 {"outcome":"owner_conflict"}` only after the East regional commit.
+It uses the shared error envelope: `400 invalid_request` or
+`400 invalid_evidence` for malformed input, `401` for scoped
+producer-credential failure, `403 forbidden` for signed/body/actor/region/
+provenance mismatch, `404 evidence_missing` when the retained binding is
+absent, `409 evidence_conflict` for immutable regional evidence conflict, and
+`503 authority_unavailable` for unavailable pools, timeouts, or database
+failure.
+Malformed requests, mismatches, and immutable conflicts are terminal for that
+tuple. A transport or `503` result may be retried only with the same trusted
+tuple; a successful commit whose response was lost is replayed idempotently.
+The route never creates a team, grant, entitlement, balance, or redemption.
+
+Deploy the additive backend and its public-key configuration before deploying
+the matching signup consumer. Before exposing the flow, consumer tests and
+separately authorized staging verification must demonstrate actual-new-account
+provenance, durable continuation and recovery of the original tuple, retry
+after response loss, rejection of ordinary-login substitution, and independent
+East/West behavior. Keep publication stopped until those checks pass.
+
 The control-plane routes above invoke the following shared Auth operations:
 
 1. `create_signup_device_attempt()` before Fingerprint capture. It returns an

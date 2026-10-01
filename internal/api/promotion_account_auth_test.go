@@ -247,6 +247,62 @@ func TestPromotionAccountAssertions(t *testing.T) {
 	}
 }
 
+func TestPromotionSignupAssertionRegionAndBodyConsistency(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PROMOTION_ACCOUNT_PUBLIC_KEY", base64.StdEncoding.EncodeToString(public))
+	t.Setenv("PROMOTION_CAPTURE_TOKEN", "capture-example-token")
+	t.Setenv("PROMOTION_ACCOUNT_TOKEN", "account-example-token")
+	t.Setenv("INTERNAL_API_TOKEN", "internal-example-token")
+	t.Setenv("SANDBOX_ID_REGION", "use")
+	user, attempt := uuid.New(), uuid.New()
+	now := time.Now()
+	for _, tc := range []struct {
+		name, signedRegion, bodyRegion string
+		bodyAttempt                    uuid.UUID
+		status                         int
+	}{
+		{"valid East tuple", "use", "use", attempt, http.StatusServiceUnavailable},
+		{"wrong signed region", "usw", "use", attempt, http.StatusForbidden},
+		{"wrong body region", "use", "usw", attempt, http.StatusForbidden},
+		{"signed and body attempt mismatch", "use", "use", uuid.New(), http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := promotionAccountClaims{
+				RegisteredClaims: jwt.RegisteredClaims{
+					Issuer: "promotion-auth-adapter", Audience: jwt.ClaimStrings{"promotion-account"},
+					Subject: user.String(), IssuedAt: jwt.NewNumericDate(now.Add(-time.Second)),
+					ExpiresAt: jwt.NewNumericDate(now.Add(time.Minute)),
+				},
+				Operation: "register-signup", AttemptID: attempt.String(), HomeRegion: tc.signedRegion,
+			}
+			assertion, err := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims).SignedString(private)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := json.Marshal(promotionSignupRegistrationRequest{UserID: user, AttemptID: tc.bodyAttempt, HomeRegion: tc.bodyRegion})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := gin.New()
+			h := new(Handlers)
+			account := r.Group("/internal/promotion/account", PromotionProducerAuth("PROMOTION_ACCOUNT_TOKEN"), PromotionAccountAuth())
+			account.POST("/register-signup", h.RegisterPromotionSignupAccount)
+			req := httptest.NewRequest(http.MethodPost, "/internal/promotion/account/register-signup", strings.NewReader(string(body)))
+			req.Header.Set("Authorization", "Bearer account-example-token")
+			req.Header.Set("X-Actor-User-Id", user.String())
+			req.Header.Set("X-Promotion-Account-Assertion", assertion)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != tc.status {
+				t.Fatalf("got %d, want %d: %s", w.Code, tc.status, w.Body.String())
+			}
+		})
+	}
+}
+
 func TestPromotionAccountAssertionKeyRequired(t *testing.T) {
 	for _, key := range []string{"", "invalid", base64.StdEncoding.EncodeToString(make([]byte, 31))} {
 		t.Run(key, func(t *testing.T) {

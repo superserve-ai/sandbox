@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,6 +39,7 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 	t.Setenv("PROMOTION_CAPTURE_TOKEN", "capture-example-token")
 	t.Setenv("PROMOTION_ACCOUNT_TOKEN", "account-example-token")
 	t.Setenv("INTERNAL_API_TOKEN", "internal-example-token")
+	t.Setenv("SANDBOX_ID_REGION", "use")
 	newRouter := func(source, region *pgxpool.Pool) http.Handler {
 		return api.SetupRouter(t.Context(), &api.Handlers{PromotionAuthPool: source, Pool: region}, region)
 	}
@@ -68,8 +70,11 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 				"iat": time.Now().Add(-time.Second).Unix(), "exp": time.Now().Add(time.Minute).Unix(),
 				"operation": operation,
 			}
-			if operation == "bind" {
+			if operation == "bind" || operation == "register-signup" {
 				claims["attempt_id"] = signedAttempt.String()
+			}
+			if operation == "register-signup" {
+				claims["home_region"] = "use"
 			}
 			assertion, err := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims).SignedString(private)
 			if err != nil {
@@ -122,6 +127,33 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 			body["attempt_id"] = attempt
 		}
 		return marshal(body)
+	}
+	signupBody := func(user, attempt uuid.UUID) string {
+		return marshal(map[string]any{"user_id": user, "attempt_id": attempt, "home_region": "use"})
+	}
+	// signupCall deliberately does not assert so concurrent callers can be
+	// joined before checking their committed outcomes.
+	signupCallRegion := func(router http.Handler, body string, user, signedAttempt uuid.UUID, signedRegion string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/internal/promotion/account/register-signup", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer account-example-token")
+		req.Header.Set("X-Actor-User-Id", user.String())
+		claims := jwt.MapClaims{
+			"iss": "promotion-auth-adapter", "aud": "promotion-account", "sub": user.String(),
+			"iat": time.Now().Add(-time.Second).Unix(), "exp": time.Now().Add(time.Minute).Unix(),
+			"operation": "register-signup", "attempt_id": signedAttempt.String(), "home_region": signedRegion,
+		}
+		assertion, err := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims).SignedString(private)
+		if err != nil {
+			t.Fatalf("sign register-signup assertion: %v", err)
+		}
+		req.Header.Set("X-Promotion-Account-Assertion", assertion)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	signupCall := func(router http.Handler, body string, user, attempt uuid.UUID) *httptest.ResponseRecorder {
+		return signupCallRegion(router, body, user, attempt, "use")
 	}
 
 	t.Run("durable evidence and independent regional registration", func(t *testing.T) {
@@ -191,6 +223,129 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 		}
 	})
 
+	t.Run("register-signup proves retained provenance and East ownership", func(t *testing.T) {
+		fingerprint := "Signup-Retained-" + uuid.NewString()
+		owner, conflict, missing := uuid.New(), uuid.New(), uuid.New()
+		ownerProof := promotionVerifiedSignup(t, auth, owner, fingerprint)
+		conflictProof := promotionVerifiedSignup(t, auth, conflict, fingerprint)
+
+		beforeEvidence, beforeOwners, beforeEntitlements, beforeGrants, beforeCreditGrants := 0, 0, 0, 0, 0
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM promotion_signup_device_evidence`).Scan(&beforeEvidence); err != nil {
+			t.Fatal(err)
+		}
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM promotion_device_owner`).Scan(&beforeOwners); err != nil {
+			t.Fatal(err)
+		}
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM user_promotion_entitlement`).Scan(&beforeEntitlements); err != nil {
+			t.Fatal(err)
+		}
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM promotion_device_grant`).Scan(&beforeGrants); err != nil {
+			t.Fatal(err)
+		}
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM team_credit_grant`).Scan(&beforeCreditGrants); err != nil {
+			t.Fatal(err)
+		}
+
+		request(t, eastRouter, "register-signup", signupBody(owner, ownerProof.attempt), owner, ownerProof.attempt, http.StatusOK, "owner")
+		// A response-loss retry is the same trusted tuple and remains idempotent.
+		request(t, eastRouter, "register-signup", signupBody(owner, ownerProof.attempt), owner, ownerProof.attempt, http.StatusOK, "owner")
+
+		// Signed and body attempts may agree with each other but not with the
+		// retained Auth binding; the regional database must not be touched.
+		wrongAttempt := uuid.New()
+		request(t, eastRouter, "register-signup", signupBody(owner, wrongAttempt), owner, wrongAttempt, http.StatusForbidden, "forbidden")
+		request(t, eastRouter, "register-signup", signupBody(owner, ownerProof.attempt), owner, wrongAttempt, http.StatusForbidden, "forbidden")
+		wrongBodyRegion := marshal(map[string]any{"user_id": owner, "attempt_id": ownerProof.attempt, "home_region": "usw"})
+		if response := signupCall(eastRouter, wrongBodyRegion, owner, ownerProof.attempt); response.Code != http.StatusForbidden {
+			t.Fatalf("wrong body region: status=%d body=%s", response.Code, response.Body.String())
+		}
+		if response := signupCallRegion(eastRouter, signupBody(owner, ownerProof.attempt), owner, ownerProof.attempt, "usw"); response.Code != http.StatusForbidden {
+			t.Fatalf("wrong signed region: status=%d body=%s", response.Code, response.Body.String())
+		}
+		request(t, eastRouter, "register-signup", signupBody(conflict, conflictProof.attempt), conflict, conflictProof.attempt, http.StatusOK, "owner_conflict")
+		missingAttempt := uuid.New()
+		request(t, eastRouter, "register-signup", signupBody(missing, missingAttempt), missing, missingAttempt, http.StatusNotFound, "evidence_missing")
+
+		// A regional authority outage is retryable only with the original tuple;
+		// once the East pool is restored the exact request commits successfully.
+		request(t, newRouter(proxy, nil), "register-signup", signupBody(conflict, conflictProof.attempt), conflict, conflictProof.attempt, http.StatusServiceUnavailable, "authority_unavailable")
+		request(t, eastRouter, "register-signup", signupBody(conflict, conflictProof.attempt), conflict, conflictProof.attempt, http.StatusOK, "owner_conflict")
+
+		// A valid assertion is still rejected by a West cell, before any West
+		// ownership row can be created.
+		var westBefore int
+		if err := west.QueryRow(t.Context(), `SELECT count(*) FROM promotion_signup_device_evidence`).Scan(&westBefore); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("SANDBOX_ID_REGION", "usw")
+		request(t, westRouter, "register-signup", signupBody(owner, ownerProof.attempt), owner, ownerProof.attempt, http.StatusForbidden, "forbidden")
+		t.Setenv("SANDBOX_ID_REGION", "use")
+		var westAfter int
+		if err := west.QueryRow(t.Context(), `SELECT count(*) FROM promotion_signup_device_evidence`).Scan(&westAfter); err != nil {
+			t.Fatal(err)
+		}
+		if westAfter != westBefore {
+			t.Fatalf("West register-signup changed regional evidence: %d -> %d", westBefore, westAfter)
+		}
+
+		var afterEvidence, afterOwners, afterEntitlements, afterGrants, afterCreditGrants int
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM promotion_signup_device_evidence`).Scan(&afterEvidence); err != nil {
+			t.Fatal(err)
+		}
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM promotion_device_owner`).Scan(&afterOwners); err != nil {
+			t.Fatal(err)
+		}
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM user_promotion_entitlement`).Scan(&afterEntitlements); err != nil {
+			t.Fatal(err)
+		}
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM promotion_device_grant`).Scan(&afterGrants); err != nil {
+			t.Fatal(err)
+		}
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM team_credit_grant`).Scan(&afterCreditGrants); err != nil {
+			t.Fatal(err)
+		}
+		if afterEvidence != beforeEvidence+2 || afterOwners != beforeOwners+1 || afterEntitlements != beforeEntitlements || afterGrants != beforeGrants || afterCreditGrants != beforeCreditGrants {
+			t.Fatalf("register-signup changed unexpected regional state: evidence %d->%d owners %d->%d entitlements %d->%d grants %d->%d credit_grants %d->%d", beforeEvidence, afterEvidence, beforeOwners, afterOwners, beforeEntitlements, afterEntitlements, beforeGrants, afterGrants, beforeCreditGrants, afterCreditGrants)
+		}
+	})
+
+	t.Run("register-signup serializes concurrent exact retries", func(t *testing.T) {
+		user := uuid.New()
+		proof := promotionVerifiedSignup(t, auth, user, "Concurrent-Signup-"+uuid.NewString())
+		body := signupBody(user, proof.attempt)
+		responses := make([]*httptest.ResponseRecorder, 8)
+		var wg sync.WaitGroup
+		for i := range responses {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				responses[i] = signupCall(eastRouter, body, user, proof.attempt)
+			}(i)
+		}
+		wg.Wait()
+		for i, response := range responses {
+			if response.Code != http.StatusOK {
+				t.Fatalf("concurrent request %d: status=%d body=%s", i, response.Code, response.Body.String())
+			}
+			var payload struct {
+				Outcome string `json:"outcome"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil || payload.Outcome != "owner" {
+				t.Fatalf("concurrent request %d: outcome=%q err=%v body=%s", i, payload.Outcome, err, response.Body.String())
+			}
+		}
+		var evidenceCount, ownerCount int
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM promotion_signup_device_evidence WHERE user_id=$1`, user).Scan(&evidenceCount); err != nil {
+			t.Fatal(err)
+		}
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM promotion_device_owner WHERE user_id=$1`, user).Scan(&ownerCount); err != nil {
+			t.Fatal(err)
+		}
+		if evidenceCount != 1 || ownerCount != 1 {
+			t.Fatalf("concurrent retries created duplicate ownership: evidence=%d owners=%d", evidenceCount, ownerCount)
+		}
+	})
+
 	t.Run("bounded and malformed input", func(t *testing.T) {
 		user := uuid.New()
 		attempt, challenge := create(t)
@@ -198,7 +353,7 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 		if err := auth.QueryRow(t.Context(), `SELECT count(*) FROM signup_device_attempt`).Scan(&before); err != nil {
 			t.Fatal(err)
 		}
-		for _, operation := range []string{"attempts", "verify", "bind", "evidence", "register"} {
+		for _, operation := range []string{"attempts", "verify", "bind", "evidence", "register", "register-signup"} {
 			valid := accountBody(user, uuid.Nil)
 			if operation == "bind" {
 				valid = accountBody(user, attempt)
@@ -206,6 +361,8 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 				valid = verifyBody(attempt, challenge, "event", "visitor", time.Now().UTC())
 			} else if operation == "attempts" {
 				valid = ""
+			} else if operation == "register-signup" {
+				valid = signupBody(user, attempt)
 			}
 			for _, tc := range []struct{ name, body string }{
 				{"malformed", "{"},
@@ -225,9 +382,13 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 				request(t, eastRouter, "verify", marshal(body), uuid.Nil, uuid.Nil, 400, "invalid_request")
 			}
 		}
-		for _, operation := range []string{"evidence", "register"} {
-			request(t, eastRouter, operation, accountBody(user, attempt), user, uuid.Nil, 400, "invalid_request")
-			request(t, eastRouter, operation, marshal(map[string]any{"user_id": user, "fingerprint": "forged"}), user, uuid.Nil, 400, "invalid_request")
+		for _, operation := range []string{"evidence", "register", "register-signup"} {
+			signedAttempt := uuid.Nil
+			if operation == "register-signup" {
+				signedAttempt = attempt
+			}
+			request(t, eastRouter, operation, accountBody(user, attempt), user, signedAttempt, 400, "invalid_request")
+			request(t, eastRouter, operation, marshal(map[string]any{"user_id": user, "fingerprint": "forged"}), user, signedAttempt, 400, "invalid_request")
 		}
 		var after, verified, bindings, regionalEvidence int
 		if err := auth.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM signup_device_attempt),
@@ -256,7 +417,7 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 		closed.Close()
 		for _, source := range []*pgxpool.Pool{nil, closed} {
 			router := newRouter(source, east)
-			for _, operation := range []string{"attempts", "verify", "bind", "evidence", "register"} {
+			for _, operation := range []string{"attempts", "verify", "bind", "evidence", "register", "register-signup"} {
 				body := accountBody(user, uuid.Nil)
 				if operation == "bind" {
 					body = accountBody(user, proof.attempt)
@@ -264,12 +425,15 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 					body = verifyBody(uuid.New(), uuid.New(), "event", "visitor", time.Now().UTC())
 				} else if operation == "attempts" {
 					body = ""
+				} else if operation == "register-signup" {
+					body = signupBody(user, proof.attempt)
 				}
 				request(t, router, operation, body, user, proof.attempt, 503, "authority_unavailable")
 			}
 		}
 		for _, region := range []*pgxpool.Pool{nil, closed} {
 			request(t, newRouter(proxy, region), "register", accountBody(user, uuid.Nil), user, uuid.Nil, 503, "authority_unavailable")
+			request(t, newRouter(proxy, region), "register-signup", signupBody(user, proof.attempt), user, proof.attempt, 503, "authority_unavailable")
 		}
 		missing := uuid.New()
 		for _, operation := range []string{"evidence", "register"} {
