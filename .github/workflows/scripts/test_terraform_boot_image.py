@@ -131,6 +131,30 @@ class ProvisionPlanTests(unittest.TestCase):
         provision.validate_plan(self.host_logging_plan(), 'sandbox_host_b',
                                 'opaque-image', 'replace', 'us-central1')
 
+    def test_create_rejects_host_logging_policy_and_iam_mutations(self):
+        for address in (
+                'module.host_logging.google_os_config_os_policy_assignment.host_logging',
+                'module.host_logging.google_project_iam_member.log_writer'):
+            with self.subTest(address=address):
+                plan = self.host_logging_plan()
+                plan['resource_changes'][0]['change'].update(actions=['create'], before=None)
+                item = plan['resource_changes'][-1]
+                item['address'] = address
+                item['change'].update(actions=['create'], before=None)
+                with self.assertRaisesRegex(ValueError, 'creation or replacement'):
+                    provision.validate_plan(plan, 'sandbox_host_b', 'opaque-image',
+                                            'create', 'us-central1')
+
+    def test_replacement_rejects_unknown_host_logging_content(self):
+        plan = self.host_logging_plan()
+        item = plan['resource_changes'][-1]
+        item['change']['before'] = {'content': 'instance_id=123456'}
+        item['change']['after'] = {'content': None}
+        item['change']['after_unknown'] = {'content': True}
+        with self.assertRaisesRegex(ValueError, 'unknown host logging field'):
+            provision.validate_plan(plan, 'sandbox_host_b', 'opaque-image',
+                                    'replace', 'us-central1')
+
     def test_host_logging_dependency_remains_narrowly_bound(self):
         for mutation in ('wrong_reference', 'wrong_resource', 'destructive',
                          'policy', 'selector', 'iam'):

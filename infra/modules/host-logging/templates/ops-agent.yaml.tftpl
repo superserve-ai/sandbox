@@ -163,9 +163,10 @@ logging:
     allowlisted_application_fields:
       # Parsed application JSON is not an export contract by itself: unknown
       # keys can contain credentials, request/file contents, or commands. Copy
-      # only stable diagnostic/correlation keys to labels, then remove the
-      # complete parsed payload below. Platform identity labels are populated
-      # separately and cannot be supplied by application JSON.
+      # only stable diagnostic/correlation keys to labels. Application payload
+      # is removed below; provenance-safe host/kernel bodies remain available
+      # for diagnosis. Platform identity labels are populated separately and
+      # cannot be supplied by application JSON.
       type: modify_fields
       fields:
         labels.request_id:
@@ -189,13 +190,14 @@ logging:
         labels.host_logging_heartbeat:
           copy_from: jsonPayload.host_logging_heartbeat
     drop_unallowlisted_payload:
-      # With no source, omit_if unsets the existing field. This is the
-      # positive allowlist boundary: arbitrary parsed keys and raw MESSAGE
-      # never reach Cloud Logging, including for secrets-proxy/systemd.
+      # Preserve the raw diagnostic body for provenance-safe host/kernel
+      # records. Application units remain behind the positive allowlist
+      # boundary, so their malformed/unknown body policy is not silently
+      # changed while the pending privacy decision is unresolved.
       type: modify_fields
       fields:
         jsonPayload:
-          omit_if: 'jsonPayload:*'
+          omit_if: 'jsonPayload:* AND jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?|(superserve-)?secretsproxy(-[^.]*)?)\.service$"'
     exclude_debug_after_parse:
       type: exclude_logs
       match_any:

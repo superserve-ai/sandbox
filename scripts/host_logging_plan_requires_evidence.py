@@ -32,26 +32,59 @@ _DEPLOYMENT_METADATA_KEYS = {
 _IDENTITY_LINE = re.compile(
     r"(?im)(\b(?:host_id|instance_id|incarnation|environment|region|host_logging_assignment|assignment_name)\b\s*[:=]\s*)([^,\s}\"']+)"
 )
+_HOST_DESCRIPTOR_LINE = re.compile(r"(?m)^# [^:\n]+: host_id=.*$\n?")
+_KNOWN_ENVIRONMENTS = {"staging", "production"}
+_KNOWN_REGIONS = {"us-central1", "us-west2", "us-east4"}
+_HOST_RESOURCE_ADDRESS = re.compile(r'(module\.host_logging\.[^\[]+|module\.observability\.[^\[]+)\["[^"]+"\]')
+_IDENTITY_KEYS = {
+    "host_id", "instance_id", "instance_name", "incarnation", "self_link",
+    "service_account_email",
+}
 
 
 def _normalize_artifact(text: str) -> str:
-    """Ignore only runtime identity substitutions between staging and prod."""
+    """Ignore only approved deployment substitutions in rendered artifacts."""
 
+    text = _HOST_DESCRIPTOR_LINE.sub("", text)
     return _IDENTITY_LINE.sub(r"\1<deployment-identity>", text)
 
 
-def _stable(value, *, artifact=False):
+def _stable(value, *, artifact=False, key=None, selector=False):
     if isinstance(value, dict):
+        if key == "enrolled_hosts":
+            # Host multiplicity and runtime identity are rollout metadata. The
+            # source allowlist/proxy-unit behavior remains part of the digest;
+            # duplicate equivalent host descriptors collapse below.
+            descriptors = []
+            for descriptor in value.values():
+                if not isinstance(descriptor, dict):
+                    continue
+                descriptors.append(_stable(descriptor, key="host_descriptor"))
+            return sorted({json.dumps(item, sort_keys=True) for item in descriptors})
         return {
             key: _stable(
                 child,
                 artifact=artifact or key in {"content", "filter", "query", "documentation"},
+                key=key,
+                selector=selector or key in {"instance_filter", "inclusion_labels", "labels"},
             )
             for key, child in sorted(value.items())
             if key not in _DEPLOYMENT_METADATA_KEYS | {"id", "etag", "self_link", "generation"}
         }
     if isinstance(value, list):
-        return [_stable(child, artifact=artifact) for child in value]
+        stable = [_stable(child, artifact=artifact, key=key, selector=selector) for child in value]
+        # for_each host resources are equivalent when their behavior is
+        # equivalent; retain order for every other list because order can be
+        # functional (processor/pipeline order, IAM conditions, etc.).
+        if key in {"enrolled_hosts", "host_descriptor"}:
+            return sorted({json.dumps(item, sort_keys=True) for item in stable})
+        return stable
+    if key in _IDENTITY_KEYS and not selector:
+        return "<deployment-identity>"
+    if key == "member" and isinstance(value, str) and value.startswith("serviceAccount:"):
+        return "serviceAccount:<deployment-identity>"
+    if key in {"environment", "region"} and str(value) in (_KNOWN_ENVIRONMENTS | _KNOWN_REGIONS):
+        return f"<deployment-{key}>"
     if artifact and isinstance(value, str):
         return _normalize_artifact(value)
     return value
@@ -73,7 +106,14 @@ def deployment_content_digest(plan: dict) -> str:
             continue
         after = (item.get("change") or {}).get("after")
         if after is not None:
-            manifest.append({"address": address, "after": _stable(after)})
+            canonical_address = _HOST_RESOURCE_ADDRESS.sub(r'\1["<host>"]', address)
+            canonical_after = _stable(after)
+            manifest.append({"address": canonical_address, "after": canonical_after})
+    # A staging plan can legitimately enumerate two equivalent serving hosts
+    # while a production plan enumerates one. Deduplicate only equivalent
+    # canonical resource entries; selector shape and all functional content
+    # remain represented in each entry.
+    manifest = sorted({json.dumps(item, sort_keys=True) for item in manifest})
     encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 

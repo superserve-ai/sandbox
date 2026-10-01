@@ -575,4 +575,96 @@ PY
   logger -t superserve-host-logging -p err "disposable retention cleanup incomplete or exceeded bounded deadline"
   exit 1
 fi
+
+# Activation is committed independently from storage compliance. Re-scan the
+# bounded stores after remediation: an oversized agent buffer or an incomplete
+# accounting pass is still noncompliant, but the exporter and its checkpoint /
+# pending-buffer state continue running and are never deleted by this script.
+storage_post_scan_deadline=$(( $(date +%s) + ${storage_scan_timeout_seconds} ))
+storage_post_scan_remaining() {
+  remaining=$((storage_post_scan_deadline - $(date +%s)))
+  [ "$remaining" -gt 0 ] || return 1
+  printf '%ss' "$remaining"
+}
+storage_post_scan_timeout=$(storage_post_scan_remaining) || {
+  logger -t superserve-host-logging -p err "storage accounting deadline expired during post-remediation compliance check"
+  exit 1
+}
+: >"$storage_scan_result"
+if ! timeout "$storage_post_scan_timeout" bash -c '
+  set -euo pipefail
+  buffer_dir="$1"; self_log_dir="$2"; max_entries="$3"; output="$4"
+  scan_store() {
+    kind="$1"; root="$2"
+    python3 - "$kind" "$root" "$max_entries" <<'PY'
+import os
+import sys
+
+kind, root, limit_text = sys.argv[1:]
+limit = int(limit_text)
+queue = [root]
+visited = 0
+bytes_total = 0
+capped = False
+while queue:
+    current = queue.pop(0)
+    try:
+        entries = os.scandir(current)
+    except OSError:
+        continue
+    with entries:
+        for entry in entries:
+            if visited >= limit + 1:
+                capped = True
+                break
+            visited += 1
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if kind != "syslog":
+                        queue.append(entry.path)
+                elif entry.is_file(follow_symlinks=False):
+                    if kind != "syslog" or entry.name == "syslog" or entry.name.startswith("syslog."):
+                        bytes_total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    if capped:
+        break
+print(kind, bytes_total, int(capped or visited > limit))
+PY
+  }
+  scan_store buffer "$buffer_dir"
+  scan_store self_log "$self_log_dir"
+  scan_store syslog /var/log
+' _ "$buffer_dir" "$self_log_dir" "${storage_scan_max_entries}" "$storage_scan_result" >"$storage_scan_result"; then
+  logger -t superserve-host-logging -p err "post-remediation storage accounting exceeded its bounded deadline"
+  exit 1
+fi
+storage_bytes=0; buffer_bytes=0; self_log_bytes=0; syslog_bytes=0
+storage_scan_capped=0
+while read -r kind size capped; do
+  test -n "$kind" || continue
+  storage_bytes=$((storage_bytes + size))
+  case "$kind" in
+    buffer) buffer_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
+    self_log) self_log_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
+    syslog) syslog_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
+  esac
+done < "$storage_scan_result"
+if [ "$storage_scan_capped" -ne 0 ]; then
+  logger -t superserve-host-logging -p err "post-remediation storage accounting is incomplete"
+  exit 1
+fi
+if [ "$buffer_bytes" -gt ${agent_buffer_bytes} ]; then
+  logger -t superserve-host-logging -p err "Ops Agent buffer remains above ${agent_buffer_bytes} byte budget; pending buffer state preserved"
+  exit 1
+fi
+if [ "$self_log_bytes" -gt ${agent_self_log_max_bytes} ] || [ "$syslog_bytes" -gt ${syslog_max_bytes} ]; then
+  logger -t superserve-host-logging -p err "disposable logging stores remain above their bounded size after remediation"
+  exit 1
+fi
+if [ $((journal_max_use_bytes + storage_bytes)) -gt ${journal_keep_free_bytes} ]; then
+  logger -t superserve-host-logging -p err "combined journal and auxiliary logging stores remain above the free-space objective"
+  exit 1
+fi
+logger -t superserve-host-logging -p info "configuration activation and post-remediation storage compliance succeeded"
 exit 100
