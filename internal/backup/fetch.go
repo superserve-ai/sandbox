@@ -310,7 +310,7 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 		// and losing it leaves the base simply absent next time, which
 		// materializes again. Reporting a failure instead would send the
 		// caller to fetch the object into a name this copy already holds.
-		if err := publishSync(ctx, dir); err != nil && ctx.Err() == nil {
+		if err := publishBaseSync(ctx, dir); err != nil && ctx.Err() == nil {
 			// Either a published base or none at all: left behind, this
 			// copy would collide with the fetch the caller must now make,
 			// and no cleanup owns a name this call never reported.
@@ -336,10 +336,10 @@ func sharedBaseIn(dir, sha string) (string, bool) {
 	return filepath.Join(dir, SharedBaseName(sha)), true
 }
 
-// publishSync makes a published base's directory entry durable.
-// Indirected so tests can drive the window where the copy is in place but
-// the entry is not yet durable.
-var publishSync = syncDirWithContext
+// publishBaseSync makes a published base's directory entry durable. A
+// seam of its own, not the staging helpers', so each publication point is
+// drivable on its own.
+var publishBaseSync = syncDirWithContext
 
 // verifyPath hashes the file at path against the digest recorded for its
 // contents.

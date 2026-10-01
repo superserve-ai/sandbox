@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -235,5 +236,35 @@ func TestSnapshotFileReleasesTheCallerWhenTheCloneStalls(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "staged.ext4")); err == nil {
 		t.Fatal("a cancelled clone published its destination")
+	}
+}
+
+// A staged file whose directory entry could not be made durable is not
+// left behind: the caller reports failure, so nothing owns the name.
+func TestSnapshotFileRemovesAPublishedFileWhenItsEntrySyncFails(t *testing.T) {
+	stubClone(t, copyClone)
+	prev := publishDirSync
+	publishDirSync = func(context.Context, string) error { return errors.New("input/output error") }
+	t.Cleanup(func() { publishDirSync = prev })
+
+	dir := t.TempDir()
+	src := writeDisk(t, dir, "rootfs.ext4", 1<<20)
+	dst := filepath.Join(dir, "staged.ext4")
+
+	if err := snapshotFileMode(context.Background(), dst, src, stageAuto); err == nil {
+		t.Fatal("want the sync failure reported")
+	}
+	if _, err := os.Stat(dst); err == nil {
+		t.Fatal("the staged file outlived the failure that was reported")
+	}
+	// Nor a temporary alongside it.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp") {
+			t.Fatalf("left %s behind", e.Name())
+		}
 	}
 }

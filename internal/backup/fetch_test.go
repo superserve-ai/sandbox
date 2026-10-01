@@ -771,12 +771,12 @@ func TestHostBaseKeepsAPublishedCopyWhenTheEntrySyncIsCancelled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	prev := publishSync
-	publishSync = func(context.Context, string) error {
+	prev := publishBaseSync
+	publishBaseSync = func(context.Context, string) error {
 		cancel()
 		return context.Canceled
 	}
-	t.Cleanup(func() { publishSync = prev })
+	t.Cleanup(func() { publishBaseSync = prev })
 
 	base, err := hostBase(ctx, restore, digestOf(data), src)
 	want := filepath.Join(restore, SharedBaseName(digestOf(data)))

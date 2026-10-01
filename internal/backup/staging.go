@@ -533,7 +533,14 @@ func snapshotClone(ctx context.Context, dst, src string) error {
 		os.Remove(tmp)
 		return err
 	}
-	return syncDirWithContext(ctx, filepath.Dir(dst))
+	if err := publishDirSync(ctx, filepath.Dir(dst)); err != nil {
+		// Every other failure here leaves nothing behind; a published
+		// file whose entry is not durable must not be the exception, or
+		// a caller that reports failure strands it.
+		_ = os.Remove(dst)
+		return err
+	}
+	return nil
 }
 
 // snapshotFile copies src to dst preserving sparseness, via reflink
@@ -635,7 +642,14 @@ func snapshotFile(ctx context.Context, dst, src string, tryClone bool) error {
 		os.Remove(tmp)
 		return err
 	}
-	return syncDirWithContext(ctx, filepath.Dir(dst))
+	if err := publishDirSync(ctx, filepath.Dir(dst)); err != nil {
+		// Every other failure here leaves nothing behind; a published
+		// file whose entry is not durable must not be the exception, or
+		// a caller that reports failure strands it.
+		_ = os.Remove(dst)
+		return err
+	}
+	return nil
 }
 
 // copyExtentChunk bounds a single context check's worth of copying, so
@@ -688,6 +702,11 @@ func syncDir(path string) error {
 	defer d.Close()
 	return d.Sync()
 }
+
+// publishDirSync makes a published file's directory entry durable.
+// Indirected so tests can drive the window where the file is in place but
+// its entry is not.
+var publishDirSync = syncDirWithContext
 
 // syncDirWithContext is syncDir released on cancellation, so a stalled
 // filesystem cannot hold a restore past its budget or keep a migration
