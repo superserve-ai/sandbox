@@ -335,19 +335,33 @@ func seedFixture(t *testing.T) *fixture {
 			strings.Repeat("a", 64), base, uuid.New())
 	}
 
-	// Retained history uses cell-local IDs. Occupy a source ID at the
-	// destination with an unrelated team before copying populated history.
+	// Retained history uses cell-local IDs. Pick one value that is demonstrably
+	// unused in both fixture databases, then use it for the unrelated
+	// destination row and the source history row. The sequence state is
+	// advanced after these committed explicit inserts; migration itself never
+	// rewinds or repairs destination identity sequences.
 	neighbor := uuid.New()
 	mustExec(t, dstPool, `INSERT INTO team(id,name) VALUES($1,'retained-neighbor')`, neighbor)
-	var localID int64
-	if err := dstPool.QueryRow(t.Context(), `INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
- VALUES($1,$2,'sandbox',$3,'neighbor','[]',$4,$5) RETURNING id`, destHostID, neighbor, uuid.New(), base, base.Add(time.Hour)).Scan(&localID); err != nil {
+	var sourceMax, destMax int64
+	if err := srcPool.QueryRow(t.Context(), `SELECT COALESCE(max(id), 0) FROM retained_storage_interval`).Scan(&sourceMax); err != nil {
 		t.Fatal(err)
 	}
+	if err := dstPool.QueryRow(t.Context(), `SELECT COALESCE(max(id), 0) FROM retained_storage_interval`).Scan(&destMax); err != nil {
+		t.Fatal(err)
+	}
+	localID := sourceMax
+	if destMax > localID {
+		localID = destMax
+	}
+	localID++
+	mustExec(t, dstPool, `INSERT INTO retained_storage_interval(id,host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at) OVERRIDING SYSTEM VALUE
+ VALUES($1,$2,$3,'sandbox',$4,'neighbor','[]',$5,$6)`, localID, destHostID, neighbor, uuid.New(), base, base.Add(time.Hour))
 	mustExec(t, srcPool, `INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, sourceHostID, f.team, base.Add(15*time.Minute))
 	mustExec(t, srcPool, `INSERT INTO retained_storage_interval(id,host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at,baseline_path,baseline_generation,baseline_allocated_bytes) OVERRIDING SYSTEM VALUE
  VALUES($1,$2,$3,'sandbox',$4,'retained','[{"device":"fs","start":0,"length":1048576}]',$5,$6,$7,repeat('a',64),1048576)`, localID, sourceHostID, f.team, f.sb1, base.Add(15*time.Minute), base.Add(time.Hour), "/srv/templates/"+f.tpl.String()+"/base.ext4")
-	mustExec(t, srcPool, `SELECT setval(pg_get_serial_sequence('retained_storage_interval','id'),(SELECT max(id) FROM retained_storage_interval))`)
+	for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+		mustExec(t, pool, `SELECT setval(pg_get_serial_sequence('retained_storage_interval','id'), GREATEST((SELECT last_value FROM retained_storage_interval_id_seq), (SELECT max(id) FROM retained_storage_interval)), true)`)
+	}
 
 	// Billing rows with awkward numerics — the copy must not round them.
 	mustExec(t, srcPool, `
@@ -738,6 +752,11 @@ func TestRetainedStorageMigrationRetry(t *testing.T) {
 		INSERT INTO retained_storage_measurement_obligation (id, team_id, owner_kind, owner_id, host_id, effective_at, ended_at, resolved_at, migration_identity)
 		OVERRIDING SYSTEM VALUE
 		VALUES ($1, $2, 'sandbox', $3, $4, $5, $5, $5, $6)`, obligationID, neighbor, uuid.New(), destHostID, base, uuid.New())
+	// These explicit restored IDs model a correctly prepared destination
+	// database. Advance, never reduce, the local generators before any writer
+	// or migration connection is allowed to allocate another row.
+	mustExec(t, dstPool, `SELECT setval(pg_get_serial_sequence('sandbox_storage_baseline','id'), GREATEST((SELECT last_value FROM sandbox_storage_baseline_id_seq), (SELECT max(id) FROM sandbox_storage_baseline)), true)`)
+	mustExec(t, dstPool, `SELECT setval(pg_get_serial_sequence('retained_storage_measurement_obligation','id'), GREATEST((SELECT last_value FROM retained_storage_measurement_obligation_id_seq), (SELECT max(id) FROM retained_storage_measurement_obligation)), true)`)
 
 	baselineSpec, _ := tableByName("sandbox_storage_baseline")
 	if _, _, err := copyTable(ctx, srcPool, dstPool, baselineSpec, team, nil); err != nil {
@@ -773,10 +792,10 @@ func TestRetainedStorageMigrationRetry(t *testing.T) {
 		t.Fatalf("obligation retry duplicated history: %s", got)
 	}
 
-	// Sequence repair must not rewind a value already reserved by an
-	// unrelated destination transaction. Exercise both commit orders against
-	// real PostgreSQL connections: migration-first leaves the writer pending,
-	// while writer-first holds the sequence lock until its commit.
+	// Generated destination identities must not be rewound around an unrelated
+	// transaction that has already reserved a value. Exercise both commit
+	// orders against real PostgreSQL connections: migration-first leaves the
+	// writer pending, while writer-first gates the retry upsert on a row lock.
 	for _, writerFirst := range []bool{false, true} {
 		t.Run(fmt.Sprintf("concurrent destination identity commit-order-%t", writerFirst), func(t *testing.T) {
 			raceTeam, raceNeighbor, sourceSandbox := uuid.New(), uuid.New(), uuid.New()
@@ -785,11 +804,12 @@ func TestRetainedStorageMigrationRetry(t *testing.T) {
 					raceTeam, "migration-sequence-race-"+raceTeam.String(), raceNeighbor, "migration-sequence-neighbor-"+raceNeighbor.String())
 			}
 			base := time.Date(2026, 7, 1, 11, 0, 0, 0, time.UTC)
+			sourceReceipt := uuid.New()
 			mustExec(t, srcPool, `
 				INSERT INTO sandbox_storage_baseline
 					(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
 				VALUES ($1, $2, $3, '/srv/race/source.ext4', repeat('c', 64), 1048576, $4, $4, $4, $5)`,
-				sourceSandbox, raceTeam, sourceHostID, base, uuid.New())
+				sourceSandbox, raceTeam, sourceHostID, base, sourceReceipt)
 			var committedID int64
 			if err := dstPool.QueryRow(ctx, `
 				INSERT INTO sandbox_storage_baseline
@@ -815,12 +835,21 @@ func TestRetainedStorageMigrationRetry(t *testing.T) {
 				t.Fatalf("destination identity did not advance: committed=%d writer=%d", committedID, writerID)
 			}
 
+			// Writer-first uses a committed matching natural-key row as a
+			// supported barrier. The unrelated writer owns its row lock while
+			// copyTable reaches the ON CONFLICT update, so the test observes a
+			// real destination wait without locking a sequence relation.
 			if writerFirst {
-				sequence := scanString(t, dstPool, `
-					SELECT format('%I.%I', n.nspname, c.relname)
-					FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-					WHERE c.oid=pg_get_serial_sequence('sandbox_storage_baseline','id')::regclass`)
-				if _, err := writerTx.Exec(ctx, fmt.Sprintf(`LOCK TABLE %s IN ACCESS EXCLUSIVE MODE`, sequence)); err != nil {
+				mustExec(t, dstPool, `
+					INSERT INTO sandbox_storage_baseline
+						(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+					VALUES ($1, $2, $3, '/srv/race/barrier.ext4', repeat('f', 64), 7, $4, $4, $4, $5)`,
+					sourceSandbox, raceTeam, sourceHostID, base, sourceReceipt)
+				var barrierID int64
+				if err := writerTx.QueryRow(ctx, `
+					SELECT id FROM sandbox_storage_baseline
+					WHERE sandbox_id=$1 AND host_id=$2 AND effective_at=$3 AND receipt_id=$4
+					FOR UPDATE`, sourceSandbox, sourceHostID, base, sourceReceipt).Scan(&barrierID); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -829,9 +858,11 @@ func TestRetainedStorageMigrationRetry(t *testing.T) {
 			if !ok {
 				t.Fatal("sandbox baseline table is missing from migration table list")
 			}
+			raceCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
 			done := make(chan error, 1)
 			go func() {
-				_, _, copyErr := copyTable(ctx, srcPool, dstPool, spec, raceTeam, nil)
+				_, _, copyErr := copyTable(raceCtx, srcPool, dstPool, spec, raceTeam, nil)
 				done <- copyErr
 			}()
 			if writerFirst {
@@ -839,7 +870,7 @@ func TestRetainedStorageMigrationRetry(t *testing.T) {
 				deadline := time.Now().Add(5 * time.Second)
 				for time.Now().Before(deadline) {
 					var waiting bool
-					if err := dstPool.QueryRow(ctx, `SELECT EXISTS(
+					if err := dstPool.QueryRow(raceCtx, `SELECT EXISTS(
 						SELECT 1 FROM pg_stat_activity
 						WHERE wait_event_type='Lock' AND $1::integer=ANY(pg_blocking_pids(pid)))`, writerTx.Conn().PgConn().PID()).Scan(&waiting); err != nil {
 						t.Fatal(err)
@@ -851,23 +882,27 @@ func TestRetainedStorageMigrationRetry(t *testing.T) {
 					time.Sleep(10 * time.Millisecond)
 				}
 				if !waited {
-					t.Fatal("migration copy did not wait for the destination sequence lock")
+					t.Fatal("migration copy did not wait for the destination barrier row lock")
 				}
 			}
 
 			var copyErr error
 			if writerFirst {
-				if err := writerTx.Commit(ctx); err != nil {
+				if err := writerTx.Commit(raceCtx); err != nil {
 					t.Fatal(err)
 				}
-				copyErr = <-done
+				select {
+				case copyErr = <-done:
+				case <-raceCtx.Done():
+					t.Fatalf("migration copy did not finish after barrier release: %v", raceCtx.Err())
+				}
 			} else {
 				select {
 				case copyErr = <-done:
-				case <-time.After(5 * time.Second):
+				case <-raceCtx.Done():
 					t.Fatal("migration copy did not commit before unrelated writer")
 				}
-				if err := writerTx.Commit(ctx); err != nil {
+				if err := writerTx.Commit(raceCtx); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -883,6 +918,17 @@ func TestRetainedStorageMigrationRetry(t *testing.T) {
 			}
 			if got := scanString(t, dstPool, `SELECT count(*)::text FROM sandbox_storage_baseline WHERE id=$1 AND team_id=$2`, writerID, raceNeighbor); got != "1" {
 				t.Fatalf("unrelated destination writer row was lost: %s", got)
+			}
+			var subsequentID int64
+			if err := dstPool.QueryRow(ctx, `
+				INSERT INTO sandbox_storage_baseline
+					(sandbox_id, team_id, host_id, path, generation, allocated_bytes, observed_at, effective_at, started_at, receipt_id)
+				VALUES ($1, $2, $3, '/srv/race/subsequent.ext4', repeat('1', 64), 4, $4, $4, $4, $5)
+				RETURNING id`, uuid.New(), raceNeighbor, destHostID, base.Add(2*time.Minute), uuid.New()).Scan(&subsequentID); err != nil {
+				t.Fatal(err)
+			}
+			if subsequentID == writerID || subsequentID == migratedID || subsequentID <= writerID {
+				t.Fatalf("ordinary generated insert reused or regressed identity: writer=%d migrated=%d subsequent=%d", writerID, migratedID, subsequentID)
 			}
 			mustExec(t, srcPool, `DELETE FROM sandbox_storage_baseline WHERE team_id=$1`, raceTeam)
 			mustExec(t, dstPool, `DELETE FROM sandbox_storage_baseline WHERE team_id IN ($1,$2)`, raceTeam, raceNeighbor)
