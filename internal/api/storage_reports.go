@@ -534,7 +534,7 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 			if len(measurements) != 1 || totalMeasurements != 1 || m.SandboxID != "" || m.AllocatedBytes != 0 {
 				return errStorageReportInvalidPayload
 			}
-			if err := applyRetainedStorage(ctx, tx, hostID, receivedAt, m.Retained); err != nil {
+			if err := applyRetainedStorage(ctx, tx, hostID, receivedAt, m.Retained, reportID); err != nil {
 				return err
 			}
 			continue

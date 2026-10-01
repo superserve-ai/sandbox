@@ -56,8 +56,17 @@ func newStorageLeaseFixture(t *testing.T) storageLeaseFixture {
             id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             sandbox_id uuid NOT NULL,team_id uuid NOT NULL,host_id text NOT NULL,
             path text NOT NULL,generation text NOT NULL,allocated_bytes bigint NOT NULL,
-            observed_at timestamptz NOT NULL DEFAULT now(),started_at timestamptz NOT NULL,ended_at timestamptz,
-            UNIQUE(sandbox_id,host_id,path,generation,started_at));
+            observed_at timestamptz NOT NULL DEFAULT now(),effective_at timestamptz NOT NULL,
+            started_at timestamptz NOT NULL,ended_at timestamptz,receipt_id uuid NOT NULL,
+            UNIQUE(sandbox_id,host_id,effective_at,receipt_id));
+        CREATE TEMP TABLE retained_storage_measurement_obligation(
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,team_id uuid NOT NULL,
+            owner_kind text NOT NULL,owner_id uuid NOT NULL,host_id text NOT NULL,
+            effective_at timestamptz NOT NULL,ended_at timestamptz,resolved_at timestamptz,
+            resolution_report_id uuid);
+        CREATE UNIQUE INDEX retained_storage_measurement_obligation_active
+            ON retained_storage_measurement_obligation(owner_kind,owner_id)
+            WHERE resolved_at IS NULL AND ended_at IS NULL;
  CREATE TEMP TABLE host (id text PRIMARY KEY, incarnation_id uuid);
         CREATE TEMP TABLE sandbox (id uuid PRIMARY KEY, team_id uuid NOT NULL, host_id text NOT NULL, status text NOT NULL DEFAULT 'active', created_at timestamptz NOT NULL, destroyed_at timestamptz, template_id uuid, base_path text);
 		CREATE TEMP TABLE sandbox_storage_interval (

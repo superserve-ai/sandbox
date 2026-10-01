@@ -33,7 +33,7 @@ func newRetainedCreationFixture(t *testing.T) storageLeaseFixture {
 			t.Error(err)
 		}
 	})
-	for _, table := range []string{"host", "sandbox", "sandbox_snapshot", "sandbox_storage_interval", "retained_storage_interval", "sandbox_storage_baseline", "retained_storage_cutover", "host_storage_report", "feature_flag", "team_feature_flag"} {
+	for _, table := range []string{"host", "sandbox", "sandbox_snapshot", "sandbox_storage_interval", "retained_storage_interval", "sandbox_storage_baseline", "retained_storage_measurement_obligation", "retained_storage_cutover", "host_storage_report", "feature_flag", "team_feature_flag"} {
 		query := fmt.Sprintf(`CREATE TABLE %[1]s.%[2]s (LIKE pg_temp.%[2]s INCLUDING ALL);
  INSERT INTO %[1]s.%[2]s OVERRIDING SYSTEM VALUE SELECT * FROM pg_temp.%[2]s;`, schema, table)
 		if _, err := source.Exec(t.Context(), query); err != nil {
@@ -656,6 +656,84 @@ func TestIntegration_RetainedFailedFirstMeasurementBlocksSettlement(t *testing.T
 			}
 			complete(true)
 		})
+	}
+}
+
+func TestIntegration_RetainedExpectedOwnerDiscoveryBound(t *testing.T) {
+	f := newStorageLeaseFixture(t)
+	ctx := t.Context()
+	var team uuid.UUID
+	if err := f.pool.QueryRow(ctx, `SELECT team_id FROM sandbox WHERE id=$1`, f.sandboxID).Scan(&team); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < retainedstorage.MaxOwners+1; i++ {
+		if _, err := f.pool.Exec(ctx, `INSERT INTO sandbox(id,team_id,host_id,status,created_at,destroyed_at)
+ VALUES($1,$2,$3,'paused',$4,NULL)`, uuid.New(), team, f.hostID, f.receivedAt.Add(-time.Duration(i+1)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	err = applyRetainedStorage(ctx, tx, f.hostID, f.receivedAt, &retainedstorage.Inventory{Version: 1})
+	if !errors.Is(err, errStorageReportRetainedIncomplete) {
+		t.Fatalf("expected bounded owner discovery to remain retryable, got %v", err)
+	}
+}
+
+func TestIntegration_RetainedExpectedOwnerDiscoveryPlan(t *testing.T) {
+	f := newStorageLeaseFixture(t)
+	ctx := t.Context()
+	var indexName string
+	if err := f.pool.QueryRow(ctx, `SELECT indexname FROM pg_indexes
+ WHERE schemaname='public' AND indexname='sandbox_retained_receiver_host_lifetime'`).Scan(&indexName); err != nil {
+		t.Fatal(err)
+	}
+	if indexName == "" {
+		t.Fatal("receiver host/lifetime index is missing")
+	}
+	var plan []byte
+	if err := f.pool.QueryRow(ctx, `EXPLAIN (FORMAT JSON)
+ SELECT id FROM sandbox WHERE host_id=$1 AND created_at<=$2
+   AND (destroyed_at IS NULL OR destroyed_at>$2)
+ ORDER BY created_at,id LIMIT $3`, f.hostID, f.receivedAt, retainedstorage.MaxOwners+1).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(plan), "Limit") {
+		t.Fatalf("bounded receiver plan omitted limit: %s", plan)
+	}
+}
+
+func TestIntegration_RetainedActivationReceiptAtomicity(t *testing.T) {
+	f := newStorageLeaseFixture(t)
+	ctx := t.Context()
+	var team uuid.UUID
+	if err := f.pool.QueryRow(ctx, `SELECT team_id FROM sandbox WHERE id=$1`, f.sandboxID).Scan(&team); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pool.Exec(ctx, `INSERT INTO retained_storage_measurement_obligation
+ (team_id,owner_kind,owner_id,host_id,effective_at) VALUES($1,'sandbox',$2,$3,$4)`, team, f.sandboxID, f.hostID, f.receivedAt.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := retainedstorage.Owner{Kind: "sandbox", ID: f.sandboxID.String(), Generation: strings.Repeat("a", 64), Extents: []retainedstorage.Extent{{Device: "fs", Start: 0, Length: 4096}}}
+	if err := applyRetainedStorage(ctx, tx, f.hostID, f.receivedAt, &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{owner}}, uuid.New()); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var resolvedAt *time.Time
+	if err := f.pool.QueryRow(ctx, `SELECT resolved_at FROM retained_storage_measurement_obligation WHERE owner_id=$1`, f.sandboxID).Scan(&resolvedAt); err != nil {
+		t.Fatal(err)
+	}
+	if resolvedAt != nil {
+		t.Fatalf("rolled-back receipt resolved activation obligation at %v", resolvedAt)
 	}
 }
 

@@ -907,8 +907,8 @@ func TestRetainedStorageRollbackOwnerBoundaries(t *testing.T) {
 		exec(`INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, cutover)
 		exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
  VALUES($1,$2,$3,2,$4),($5,$2,$3,2,$4)`, f.sandboxID, team, f.hostID, start, legacyOwner)
-		exec(`INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,started_at)
- VALUES($1,$2,$3,$4,$5,$6,$7)`, f.sandboxID, team, f.hostID, path, strings.Repeat("a", 64), 1048576, start)
+		exec(`INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,effective_at,started_at,receipt_id)
+ VALUES($1,$2,$3,$4,$5,$6,$7,$7,'00000000-0000-0000-0000-000000000000')`, f.sandboxID, team, f.hostID, path, strings.Repeat("a", 64), 1048576, start)
 		exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at,baseline_path,baseline_generation,baseline_allocated_bytes)
  VALUES($1,$2,'sandbox',$3,$4,'[{"device":"fs","start":0,"length":1048576}]',$5,$6,$7,$8,1048576)`, f.hostID, team, f.sandboxID, strings.Repeat("b", 64), retainedStart, end, path, strings.Repeat("a", 64))
 		var unknown bool
@@ -955,8 +955,8 @@ func TestRetainedStorageRollbackOwnerBoundaries(t *testing.T) {
 			}
 			exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
  VALUES($1,$3,$4,2,$5),($2,$3,$4,2,$6)`, f.sandboxID, second, team, f.hostID, start, secondStart)
-			exec(`INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,started_at)
- VALUES($1,$2,$3,$4,$5,1048576,$6),($7,$2,$3,$4,$5,1048576,$8)`, f.sandboxID, team, f.hostID, path, strings.Repeat("b", 64), start, second, secondStart)
+			exec(`INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,effective_at,started_at,receipt_id)
+ VALUES($1,$2,$3,$4,$5,1048576,$6,$6,'00000000-0000-0000-0000-000000000000'),($7,$2,$3,$4,$5,1048576,$8,$8,'00000000-0000-0000-0000-000000000000')`, f.sandboxID, team, f.hostID, path, strings.Repeat("b", 64), start, second, secondStart)
 			assertUsage := func(from, to time.Time, want float64) {
 				t.Helper()
 				for _, floor := range []bool{false, true} {
@@ -1029,8 +1029,8 @@ func TestRetainedStorageTemplateRebuildKeepsPersistedBaselineGeneration(t *testi
 	// The host report persists the exact full-copy roots it measured.  The
 	// runtime and snapshot directories are intentionally unrelated; no sibling
 	// path inference is valid here.
-	exec(`INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,started_at)
- VALUES($1,$2,$3,$4,$5,1048576,$6),($7,$2,$3,$8,$9,1048576,$10)`,
+	exec(`INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,effective_at,started_at,receipt_id)
+ VALUES($1,$2,$3,$4,$5,1048576,$6,$6,'00000000-0000-0000-0000-000000000000'),($7,$2,$3,$8,$9,1048576,$10,$10,'00000000-0000-0000-0000-000000000000')`,
 		f.sandboxID, team, f.hostID, oldRootfsPath, strings.Repeat("a", 64), start,
 		rollbackOwner, newRootfsPath, strings.Repeat("b", 64), start.Add(10*time.Second))
 	exec(`INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, cutover)

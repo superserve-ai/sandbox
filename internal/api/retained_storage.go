@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 )
@@ -13,7 +14,7 @@ import (
 // applyRetainedStorage runs within the durable report's cursor transaction.
 // A complete physical-address epoch is indivisible: splitting owners across
 // chunks could deduplicate a recycled address against an earlier allocation.
-func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time.Time, inv *retainedstorage.Inventory) error {
+func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time.Time, inv *retainedstorage.Inventory, reportIDs ...uuid.UUID) error {
 	if err := inv.Validate(); err != nil {
 		return fmt.Errorf("%w: %v", errStorageReportInvalidPayload, err)
 	}
@@ -101,17 +102,38 @@ SELECT EXISTS (
 	// Ownership comes exclusively from these rows. Host-supplied owner IDs are
 	// references, not authority for team attribution or retention lifetime.
 	var complete bool
-	err = tx.QueryRow(ctx, `WITH expected AS (
-  SELECT 'sandbox' kind,s.id FROM sandbox s WHERE s.host_id=$1 AND s.created_at<=$2
-   AND (s.status <> 'failed'
-    OR EXISTS(SELECT 1 FROM retained_storage_interval i WHERE i.owner_kind='sandbox' AND i.owner_id=s.id
-      AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2))
-    OR EXISTS(SELECT 1 FROM sandbox_storage_interval i WHERE i.sandbox_id=s.id
-      AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)))
-   AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
- UNION ALL
-  SELECT 'snapshot',id FROM sandbox_snapshot WHERE host_id=$1 AND (status IN ('ready','creating','deleting') OR retention_ended_at>$2) AND created_at<=$2
-   AND (LEAST(deleted_at,retention_ended_at) IS NULL OR LEAST(deleted_at,retention_ended_at)>$2)
+	err = tx.QueryRow(ctx, `WITH sandbox_candidates AS MATERIALIZED (
+  SELECT 'sandbox' kind,s.id FROM sandbox s
+  WHERE s.host_id=$1 AND s.created_at<=$2
+    AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
+    AND s.status <> 'failed'
+  ORDER BY s.created_at,s.id
+  LIMIT $4 + 1
+ ), failed_sandbox_candidates AS MATERIALIZED (
+  SELECT 'sandbox' kind,s.id FROM sandbox s
+  WHERE s.host_id=$1 AND s.created_at<=$2 AND s.status='failed'
+    AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
+    AND (EXISTS (SELECT 1 FROM retained_storage_interval i WHERE i.owner_kind='sandbox' AND i.owner_id=s.id
+           AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2))
+      OR EXISTS (SELECT 1 FROM sandbox_storage_interval i WHERE i.sandbox_id=s.id
+           AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2))
+      OR EXISTS (SELECT 1 FROM retained_storage_measurement_obligation o WHERE o.owner_kind='sandbox' AND o.owner_id=s.id
+           AND o.effective_at<=$2 AND (o.ended_at IS NULL OR o.ended_at>$2)))
+  ORDER BY s.created_at,s.id
+  LIMIT $4 + 1
+ ), snapshot_candidates AS MATERIALIZED (
+ SELECT 'snapshot' kind,s.id FROM sandbox_snapshot s
+  WHERE s.host_id=$1 AND s.created_at<=$2
+    AND (s.status IN ('ready','creating','deleting') OR s.retention_ended_at>$2)
+    AND (LEAST(s.deleted_at,s.retention_ended_at) IS NULL OR LEAST(s.deleted_at,s.retention_ended_at)>$2)
+  ORDER BY s.created_at,s.id
+  LIMIT $4 + 1
+ ), candidates AS (
+  SELECT * FROM sandbox_candidates
+  UNION ALL SELECT * FROM failed_sandbox_candidates
+  UNION ALL SELECT * FROM snapshot_candidates
+ ), expected AS MATERIALIZED (
+  SELECT c.kind,c.id FROM candidates c
  ), supplied AS (SELECT kind,id FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid))
  SELECT NOT EXISTS(SELECT 1 FROM expected e LEFT JOIN supplied s USING(kind,id) WHERE s.id IS NULL)
   AND (SELECT count(*) FROM expected)<=$4
@@ -127,7 +149,7 @@ SELECT EXISTS (
     SELECT 1 FROM sandbox_storage_interval i
     JOIN supplied o ON o.kind='sandbox' AND o.id=i.sandbox_id
     WHERE i.started_at>$2
-  )`, hostID, at, payload, retainedstorage.MaxOwners).Scan(&complete)
+	 )`, hostID, at, payload, retainedstorage.MaxOwners).Scan(&complete)
 	if err != nil {
 		return err
 	}
@@ -194,6 +216,27 @@ SELECT EXISTS (
 	if err != nil {
 		return err
 	}
+	// Resolve only obligations covered by this complete, compatible receipt. The
+	// report id is retained as immutable audit evidence when the processor has it;
+	// direct unit callers use the zero UUID sentinel without changing authority.
+	var reportID any = uuid.Nil
+	if len(reportIDs) > 0 && reportIDs[0] != uuid.Nil {
+		reportID = reportIDs[0]
+	}
+	if _, err = tx.Exec(ctx, `WITH supplied AS (
+	  SELECT o.kind,o.id,COALESCE(s.team_id,ss.team_id) team_id
+	  FROM jsonb_to_recordset($1::jsonb) AS o(kind text,id uuid)
+	  LEFT JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
+	  LEFT JOIN sandbox_snapshot ss ON o.kind='snapshot' AND ss.id=o.id
+	)
+UPDATE retained_storage_measurement_obligation o
+SET resolved_at=$2,resolution_report_id=$3
+FROM supplied s
+WHERE s.kind=o.owner_kind AND s.id=o.owner_id AND s.team_id=o.team_id AND o.host_id=$4
+  AND o.effective_at<=$2 AND (o.ended_at IS NULL OR o.ended_at>$2)
+  AND o.resolved_at IS NULL`, payload, at, reportID, hostID); err != nil {
+		return err
+	}
 	// Bind verified baseline evidence to every legacy stay that was active at
 	// this receipt. This is additive history; later template metadata cannot
 	// rewrite the mapping.
@@ -206,15 +249,21 @@ SELECT EXISTS (
 ), eligible AS (
   SELECT o.*,s.team_id,s.host_id FROM supplied o JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
   WHERE o.baseline_path IS NOT NULL AND s.host_id=$1 AND s.created_at<=$2
-), stays AS (
+), stays AS MATERIALIZED (
   SELECT i.sandbox_id,i.team_id,i.host_id,i.started_at,i.ended_at,e.baseline_path,e.baseline_generation,e.baseline_allocated_bytes
   FROM sandbox_storage_interval i JOIN eligible e ON e.id=i.sandbox_id AND e.team_id=i.team_id AND e.host_id=i.host_id
   WHERE i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)
+), closed AS (
+ UPDATE sandbox_storage_baseline b SET ended_at=$2
+ FROM stays s
+ WHERE b.sandbox_id=s.sandbox_id AND b.team_id=s.team_id AND b.host_id=s.host_id
+   AND b.effective_at<$2 AND (b.ended_at IS NULL OR b.ended_at>$2)
+ RETURNING b.id
 )
-INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,observed_at,started_at,ended_at)
-SELECT sandbox_id,team_id,host_id,baseline_path,baseline_generation,baseline_allocated_bytes,$2,started_at,ended_at
-FROM stays
-ON CONFLICT (sandbox_id,host_id,path,generation,started_at) DO UPDATE
- SET allocated_bytes=EXCLUDED.allocated_bytes,ended_at=EXCLUDED.ended_at`, hostID, at, payload)
+INSERT INTO sandbox_storage_baseline(sandbox_id,team_id,host_id,path,generation,allocated_bytes,observed_at,effective_at,started_at,ended_at,receipt_id)
+SELECT sandbox_id,team_id,host_id,baseline_path,baseline_generation,baseline_allocated_bytes,$2,$2,started_at,ended_at,$4
+FROM stays CROSS JOIN (SELECT count(*) FROM closed) fence
+ON CONFLICT (sandbox_id,host_id,effective_at,receipt_id) DO UPDATE
+ SET ended_at=EXCLUDED.ended_at`, hostID, at, payload, reportID)
 	return err
 }
