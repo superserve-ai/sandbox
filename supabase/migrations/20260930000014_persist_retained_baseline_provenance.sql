@@ -169,9 +169,18 @@ WITH bounds AS MATERIALIZED (
       SELECT 1 FROM artifact_refs WHERE range_end>range_start AND artifact_bytes IS NULL
     ) OR EXISTS (
       SELECT 1 FROM artifact_bounds a
-      WHERE a.unresolved_baseline
+      WHERE (
+        -- A full-copy owner has no legacy path-based fallback.  Its missing
+        -- baseline proof is unknown even when legacy_intervals was clipped at
+        -- cutover, so do not let the empty artifact union become numeric zero.
+        a.template_id IS NOT NULL AND a.base_path IS NULL AND a.baseline_path IS NULL
+      ) OR (
+        -- A path-backed owner remains compatible with pre-cutover history, but
+        -- an unproven contribution after cutover must fence settlement.
+        a.unresolved_baseline
         AND GREATEST(a.billing_started_at,a.team_cutover,p_start)
             < LEAST(COALESCE(a.retention_end,a.request_now),p_end)
+      )
     ) THEN NULL::numeric
     ELSE (CASE WHEN p_floor_legacy_artifacts THEN FLOOR(artifacts.amount) ELSE artifacts.amount END)
       +overlays.amount+retained_storage_mib_seconds(p_team,p_start,p_end) END amount
