@@ -23,6 +23,12 @@ type promotionAccountRequest struct {
 	AttemptID uuid.UUID `json:"attempt_id"`
 }
 
+type promotionSignupRegistrationRequest struct {
+	UserID     uuid.UUID `json:"user_id"`
+	AttemptID  uuid.UUID `json:"attempt_id"`
+	HomeRegion string    `json:"home_region"`
+}
+
 func decodePromotionRequest(c *gin.Context, dst any) bool {
 	if hub := sentrygin.GetHubFromContext(c); hub != nil {
 		hub.Scope().SetRequestBody(nil)
@@ -217,6 +223,48 @@ func (h *Handlers) RegisterPromotionSignupDevice(c *gin.Context) {
 	evidence, err := h.lookupPromotionEvidence(ctx, input.UserID)
 	if err != nil {
 		promotionDBError(c, err)
+		return
+	}
+	var outcome string
+	if err := h.Pool.QueryRow(ctx, "select register_promotion_signup_device($1,$2,$3,$4)", input.UserID, evidence.AttemptID, evidence.EventID, evidence.Fingerprint).Scan(&outcome); err != nil {
+		promotionDBError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"outcome": outcome})
+}
+
+// RegisterPromotionSignupAccount records retained signup evidence in East
+// before email confirmation. The signed attempt and retained shared-Auth
+// evidence are the authorities; request fields never carry event data.
+func (h *Handlers) RegisterPromotionSignupAccount(c *gin.Context) {
+	var input promotionSignupRegistrationRequest
+	if !decodePromotionRequest(c, &input) {
+		return
+	}
+	if input.UserID == uuid.Nil || input.AttemptID == uuid.Nil || input.HomeRegion == "" {
+		respondErrorMsg(c, "invalid_request", "invalid promotion request", http.StatusBadRequest)
+		return
+	}
+	value, _ := c.Get("promotion_account")
+	claims, ok := value.(*promotionAccountClaims)
+	actor, actorErr := uuid.Parse(c.GetHeader("X-Actor-User-Id"))
+	if !ok || claims == nil || claims.Operation != "register-signup" || actorErr != nil || actor != input.UserID ||
+		claims.Subject != input.UserID.String() || claims.AttemptID != input.AttemptID.String() || claims.HomeRegion != input.HomeRegion {
+		respondErrorMsg(c, "forbidden", "account provenance mismatch", http.StatusForbidden)
+		return
+	}
+	if !promotionSource(c, h.PromotionAuthPool) || !promotionSource(c, h.Pool) {
+		return
+	}
+	ctx, cancel := promotionContext(c)
+	defer cancel()
+	evidence, err := h.lookupPromotionEvidence(ctx, input.UserID)
+	if err != nil {
+		promotionDBError(c, err)
+		return
+	}
+	if evidence.AttemptID != input.AttemptID {
+		respondErrorMsg(c, "forbidden", "account provenance mismatch", http.StatusForbidden)
 		return
 	}
 	var outcome string

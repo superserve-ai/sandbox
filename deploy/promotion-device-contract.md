@@ -48,11 +48,13 @@ malformed or non-Ed25519 private keys withhold account requests before transport
 
 The adapter signs an EdDSA JWT with `iss: promotion-auth-adapter`,
 `aud: promotion-account`, `sub: <Auth user UUID>`, `iat`, `exp`, and
-`operation: bind|evidence|register|signup-eligibility|create-team`. Both times are required, expiry must be
+`operation: bind|evidence|register|register-signup|signup-eligibility|create-team`. Both times are required, expiry must be
 later than issue time and at most five minutes after it, and future-issued or
 expired assertions reject. For `bind`, also sign `attempt_id` from the
-server-owned signup flow; `create-team` uses the separate creation binding
-described below. For evidence, registration and eligibility snapshots omit it. The control plane
+server-owned signup flow; `register-signup` also signs that original attempt
+and fixed `home_region: "use"`; `create-team` uses the separate creation
+binding described below. For evidence, later registration and eligibility
+snapshots omit it. The control plane
 verifies the signature, issuer, audience, time bounds, operation and exact
 subject/body match, plus the attempt/body match for binding, before database
 access. `X-Actor-User-Id` is required and must equal that verified subject and
@@ -168,13 +170,16 @@ have passed.
 | Bind | `POST /internal/promotion/account/bind` | `user_id`, `attempt_id` | `bound`, `replayed`, or `first_evidence_retained` |
 | Retrieve | `POST /internal/promotion/account/evidence` | `user_id` | Original bound evidence; `evidence_missing` if absent |
 | Register locally | `POST /internal/promotion/account/register` | `user_id` | `owner` or `owner_conflict` |
+| Register signup | `POST /internal/promotion/account/register-signup` | `user_id`, `attempt_id`, `home_region: "use"` | `owner` or `owner_conflict` |
 
-The registration route reads the original binding from shared Auth itself and
-passes that exact evidence to the selected region's SQL function. A regional
-registration request cannot provide a new event or Fingerprint. Requests are
-limited to 4 KiB and database work to three seconds; SQL errors are not
-interpreted as eligibility. Invoke the register route on the selected regional
-control plane before the grant decision, including delayed West entry.
+The registration routes read the original binding from shared Auth itself and
+pass that exact evidence to the regional SQL function. A regional registration
+request cannot provide a new event or Fingerprint. `register-signup` is a
+separate East-only route for the server-owned actual-signup continuation and
+must be called before confirmation; later authenticated regional entry keeps
+using `register`, including delayed West entry. Requests are limited to 4 KiB
+and database work to three seconds; SQL errors are not interpreted as
+eligibility.
 
 The control-plane routes above invoke the following shared Auth operations:
 

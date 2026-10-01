@@ -32,7 +32,7 @@ func TestPromotionAccountAssertions(t *testing.T) {
 	t.Setenv("SANDBOX_ID_REGION", "use")
 	user, otherUser, attempt, team := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	now := time.Now()
-	for _, operation := range []string{"bind", "evidence", "register", "signup-eligibility", "create-team", "prepare-team", "recover-team", "complete-team", "discover-team-creations"} {
+	for _, operation := range []string{"bind", "evidence", "register", "register-signup", "signup-eligibility", "create-team", "prepare-team", "recover-team", "complete-team", "discover-team-creations"} {
 		t.Run(operation, func(t *testing.T) {
 			type assertionCase struct {
 				name   string
@@ -128,9 +128,12 @@ func TestPromotionAccountAssertions(t *testing.T) {
 						Operation: operation,
 					}
 					body := promotionAccountRequest{UserID: user}
-					if operation == "bind" || operation == "create-team" {
+					if operation == "bind" || operation == "register-signup" || operation == "create-team" {
 						claims.AttemptID = attempt.String()
 						body.AttemptID = attempt
+					}
+					if operation == "register-signup" {
+						claims.HomeRegion = "use"
 					}
 					if operation == "create-team" {
 						unavailable := true
@@ -175,6 +178,13 @@ func TestPromotionAccountAssertions(t *testing.T) {
 						t.Fatal(err)
 					}
 					var requestBody any = body
+					if operation == "register-signup" {
+						requestBody = struct {
+							UserID     uuid.UUID `json:"user_id"`
+							AttemptID  uuid.UUID `json:"attempt_id"`
+							HomeRegion string    `json:"home_region"`
+						}{body.UserID, body.AttemptID, "use"}
+					}
 					if operation == "create-team" {
 						requestBody = struct {
 							promotionAccountRequest
@@ -198,6 +208,7 @@ func TestPromotionAccountAssertions(t *testing.T) {
 					account.POST("/bind", h.BindPromotionSignupAccount)
 					account.POST("/evidence", h.GetPromotionSignupAccountEvidence)
 					account.POST("/register", h.RegisterPromotionSignupDevice)
+					account.POST("/register-signup", h.RegisterPromotionSignupAccount)
 					account.POST("/signup-eligibility", h.EvaluateSignupPromotion)
 					account.POST("/create-team", h.CreateTeamWithPromotionAttempt)
 					account.POST("/prepare-team", h.PrepareTeamPromotionCreation)
