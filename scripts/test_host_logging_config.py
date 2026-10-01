@@ -88,6 +88,51 @@ class HostLoggingConfigChecks(unittest.TestCase):
             check=False,
         )
 
+    def _run_storage_compliance(self, result_path, *, buffer_limit=10, self_log_limit=10,
+                                syslog_limit=10, journal_max=10, journal_keep_free=100):
+        """Run the validate template's storage-compliance fragment unchanged."""
+        start = self.validate.index(
+            "storage_bytes=0; buffer_bytes=0; self_log_bytes=0; syslog_bytes=0"
+        )
+        end = self.validate.index("\nexit 100", start) + len("\nexit 100")
+        fragment = self.validate[start:end]
+        substitutions = {
+            "agent_buffer_bytes": buffer_limit,
+            "agent_self_log_max_bytes": self_log_limit,
+            "syslog_max_bytes": syslog_limit,
+            "journal_max_use_bytes": journal_max,
+            "journal_keep_free_bytes": journal_keep_free,
+        }
+        for name, value in substitutions.items():
+            fragment = fragment.replace("${" + name + "}", str(value))
+        script = textwrap.dedent(
+            f"""
+            set -u
+            drift=0
+            journal_max_use_bytes={journal_max}
+            storage_scan_result="$1"
+            {fragment}
+            """
+        )
+        return subprocess.run(
+            ["bash", "-c", script, "storage-compliance", str(result_path)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+    def _scan_storage_stores(self, root, limit=100):
+        """Collect rows by executing each embedded scanner implementation."""
+        stores = (("buffer", root / "buffer"), ("self_log", root / "self-log"),
+                  ("syslog", root / "syslog"))
+        rows = []
+        for kind, path in stores:
+            scanned = self._run_embedded_scan(self.validate, kind, path, limit=limit)
+            self.assertEqual(scanned.returncode, 0, scanned.stderr)
+            rows.append(scanned.stdout.strip())
+        return "\n".join(rows) + "\n"
+
     def test_allowlist_and_single_journal_path(self):
         self.assertIn("systemd_journald", self.config)
         self.assertIn("proxy.service", self.config + self.reconcile)
@@ -253,7 +298,58 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertIn("journal_max_use_bytes + storage_bytes", self.validate)
         self.assertIn("journal_max_use_bytes + var.agent_buffer_bytes + var.agent_self_log_max_bytes + var.syslog_max_bytes", module)
         self.assertNotIn("Buffer_Max_Size", self.config + self.reconcile)
-        self.assertNotIn("storage_scan_capped=1", self.validate)
+        self.assertIn("storage_scan_capped=1", self.validate)
+        self.assertIn('[ "$storage_scan_capped" -eq 0 ] || drift=1', self.validate)
+        self.assertIn('if [ "$storage_scan_capped" -ne 0 ]; then', self.reconcile)
+        self.assertIn("pending buffer state preserved", self.reconcile)
+        self.assertIn("exporter and its checkpoint / pending-buffer state continue running", self.reconcile)
+        self.assertIn("activation_committed=1", self.reconcile)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for store in ("buffer", "self-log", "syslog"):
+                (root / store).mkdir()
+            (root / "buffer" / "chunk").write_bytes(b"buffer")
+            (root / "self-log" / "agent.log").write_bytes(b"self-log")
+            (root / "syslog" / "syslog").write_bytes(b"syslog")
+            result_path = root / "storage-scan-result"
+            checkpoint = root / "checkpoint"
+            exporter_state = root / "exporter-state"
+            checkpoint.write_text("pending checkpoint")
+            exporter_state.write_text("validated exporter draining")
+
+            result_path.write_text(self._scan_storage_stores(root))
+            compliant = self._run_storage_compliance(result_path)
+            self.assertEqual(compliant.returncode, 100, compliant.stderr)
+            self.assertEqual(checkpoint.read_text(), "pending checkpoint")
+            self.assertEqual(exporter_state.read_text(), "validated exporter draining")
+
+            (root / "buffer" / "chunk-2").write_bytes(b"buffer")
+            (root / "buffer" / "chunk-3").write_bytes(b"buffer")
+            result_path.write_text(self._scan_storage_stores(root, limit=1))
+            capped = self._run_storage_compliance(result_path)
+            self.assertEqual(capped.returncode, 101, capped.stderr)
+            self.assertEqual(checkpoint.read_text(), "pending checkpoint")
+            self.assertEqual(exporter_state.read_text(), "validated exporter draining")
+
+            unreadable = self._run_embedded_scan(
+                self.validate, "buffer", root / "buffer", failure="stat"
+            )
+            self.assertNotEqual(unreadable.returncode, 0)
+            self.assertEqual(checkpoint.read_text(), "pending checkpoint")
+            self.assertEqual(exporter_state.read_text(), "validated exporter draining")
+
+            result_path.write_text("buffer 1 0\nself_log 1 0\n")
+            incomplete = self._run_storage_compliance(result_path)
+            self.assertNotEqual(incomplete.returncode, 0)
+            self.assertEqual(checkpoint.read_text(), "pending checkpoint")
+            self.assertEqual(exporter_state.read_text(), "validated exporter draining")
+
+            result_path.write_text("buffer 11 0\nself_log 1 0\nsyslog 1 0\n")
+            over_budget = self._run_storage_compliance(result_path)
+            self.assertEqual(over_budget.returncode, 101, over_budget.stderr)
+            self.assertEqual(checkpoint.read_text(), "pending checkpoint")
+            self.assertEqual(exporter_state.read_text(), "validated exporter draining")
 
 
 if __name__ == "__main__":
