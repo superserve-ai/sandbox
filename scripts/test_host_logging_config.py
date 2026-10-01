@@ -119,7 +119,8 @@ class HostLoggingConfigChecks(unittest.TestCase):
             "-e", f"FIXTURE_UID={os.getuid()}", "-e", f"FIXTURE_GID={os.getgid()}",
             "-v", f"{fixture}:/fixture:rw", "-v", f"{cache}:/immutable-cache:rw",
             image, "bash", "-euo", "pipefail", "-c",
-            'trap \'chown -R "$FIXTURE_UID:$FIXTURE_GID" /fixture /immutable-cache\' EXIT\n' + script,
+            # Isolate fixture-specific traps so they cannot replace ownership cleanup.
+            'trap \'chown -R "$FIXTURE_UID:$FIXTURE_GID" /fixture /immutable-cache\' EXIT\n(\n' + script + '\n)\n',
         ]
         try:
             result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
