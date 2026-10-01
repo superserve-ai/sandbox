@@ -24,8 +24,15 @@ provenance is copied before JSON parsing so application payloads cannot replace
 the source identity used for filtering.
 
 The initial journal budget is 4 GiB with a 10 GiB free-space reserve. The
-Ops Agent 2.52.0 uses the documented built-in disk-buffer cap introduced in
-2.28; the managed logging and metrics subagents and the actual standalone
+Ops Agent 2.52.0 uses the documented built-in disk-buffer protection introduced
+in 2.28. The selected release documents that its buffer amount is
+platform-specific and does not expose a supported numeric configuration knob;
+`agent_buffer_bytes` is therefore a conservative accounting/enforcement
+threshold and not a claim about the agent's internal cap. Staging must record
+the generated configuration and observed aggregate buffer growth for this
+release before production activation. If the observed cap cannot meet the
+reserve, production activation is unsupported rather than silently treating a
+warning as a limit. The managed logging and metrics subagents and the actual standalone
 `superserve-otel-collector.service` receive explicit CPU/memory limits, with
 metrics receiving the smaller share so its existing queue/memory limiter sheds
 metrics before log export is constrained. Reconciliation manages explicit
@@ -84,5 +91,7 @@ through each exercise. Roll back by selecting the prior
 `assignment_revision`/template in version control and applying the same root;
 the reconciliation validates that candidate and leaves checkpoints and the
 last working configuration intact on failure. Production workflows require an
-accepted staging evidence document for the exact `assignment_revision` before
-they apply a host-logging revision; no evidence is fabricated by Terraform.
+accepted staging evidence document for the exact `assignment_revision` and
+immutable deployment-content digest before they apply a host-logging revision;
+expected staging/production identity substitutions are normalized narrowly by
+the gate, and no evidence is fabricated by Terraform.

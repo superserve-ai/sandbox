@@ -60,6 +60,10 @@ def verify(root: Path) -> list[str]:
         errors.append("heartbeat metric must extract the numeric resource instance identity")
     if "allowlisted_application_fields" not in config or "drop_unallowlisted_payload" not in config:
         errors.append("Ops Agent config must remove unallowlisted structured payload fields")
+    if ("ops_agent_self_log_files:" not in config or
+            "/var/log/google-cloud-ops-agent/subagents/logging-module.log" not in config or
+            "ops_agent_self_logs:" not in config):
+        errors.append("Ops Agent self-log receiver must map logging-module.log through its explicit pipeline")
     if ('log_id("ops_agent_self_log_files")' not in normalized_alerts or
             "jsonPayload.message =~" not in normalized_alerts or
             "severity>=ERROR OR jsonPayload.message" in normalized_alerts or

@@ -7,8 +7,9 @@
 # enrolled unit: ${unit}
 %{ endfor ~}
 # Ops Agent ${ops_agent_package_version} is selected by the OS policy. This
-# release uses its documented built-in disk buffer cap (introduced in 2.28);
-# no unsupported environment variable or generated Fluent Bit setting is used.
+# release has the documented platform-managed disk-buffer protection introduced
+# in 2.28, but no supported numeric cap setting. Terraform's buffer reservation
+# is accounting/enforcement evidence, not an invented agent configuration.
 global:
   # The built-in self-log pipeline is disabled only to avoid duplicate file
   # ingestion; self-log ingestion remains enabled through the explicit,
@@ -26,7 +27,9 @@ logging:
     ops_agent_self_log_files:
       # The logging subagent writes supported flush/drop diagnostics here.
       # An explicit receiver gives the alert a stable log ID without adding a
-      # second default pipeline for the same file.
+      # second default pipeline for the same file. In the selected 2.52.0
+      # generated config, the receiver ID is the Cloud Logging log ID and the
+      # file line is mapped to jsonPayload.message.
       type: files
       include_paths:
         - /var/log/google-cloud-ops-agent/subagents/logging-module.log

@@ -132,7 +132,8 @@ class ProvisionPlanTests(unittest.TestCase):
                                 'opaque-image', 'replace', 'us-central1')
 
     def test_host_logging_dependency_remains_narrowly_bound(self):
-        for mutation in ('wrong_reference', 'wrong_resource', 'destructive'):
+        for mutation in ('wrong_reference', 'wrong_resource', 'destructive',
+                         'policy', 'selector', 'iam'):
             with self.subTest(mutation=mutation):
                 plan = self.host_logging_plan()
                 item = plan['resource_changes'][-1]
@@ -141,6 +142,16 @@ class ProvisionPlanTests(unittest.TestCase):
                     item_config['expressions']['enrolled_hosts']['references'] = ['module.other.instance_id']
                 elif mutation == 'wrong_resource':
                     item['address'] = 'module.host_logging.google_compute_instance.unrelated'
+                elif mutation == 'policy':
+                    item['change']['before']['policy'] = 'stable'
+                    item['change']['after']['policy'] = 'changed'
+                elif mutation == 'selector':
+                    item['change']['before']['instance_filter'] = {'labels': {'component': 'vmd'}}
+                    item['change']['after']['instance_filter'] = {'labels': {'component': 'other'}}
+                elif mutation == 'iam':
+                    item['address'] = 'module.host_logging.google_project_iam_member.log_writer'
+                    item['change']['before']['member'] = 'serviceAccount:runtime@example.test'
+                    item['change']['after']['member'] = 'serviceAccount:other@example.test'
                 else:
                     item['change']['actions'] = ['delete', 'create']
                 with self.assertRaises(ValueError):

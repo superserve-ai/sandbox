@@ -70,7 +70,7 @@ variable "journal_keep_free_bytes" {
 }
 
 variable "agent_buffer_bytes" {
-  description = "Separate budget for the selected release's built-in Ops Agent buffer plus self-log and retained-syslog stores; disposable stores are reclaimed and an over-budget supported buffer fails closed."
+  description = "Conservative free-space reservation for the selected release's platform-managed Ops Agent buffer; the 2.52.0 release does not expose a configurable numeric cap, so this value is accounting/enforcement threshold rather than a claimed agent limit."
   type        = number
   default     = 1073741824
 
@@ -103,7 +103,7 @@ variable "syslog_max_bytes" {
 }
 
 variable "storage_scan_timeout_seconds" {
-  description = "Maximum wall-clock budget for one recursive buffer/self-log/syslog accounting pass."
+  description = "Maximum wall-clock budget for one bounded buffer/self-log/syslog accounting or remediation pass."
   type        = number
   default     = 5
 
@@ -114,7 +114,7 @@ variable "storage_scan_timeout_seconds" {
 }
 
 variable "storage_scan_max_entries" {
-  description = "Maximum number of rotated syslog entries included in one bounded storage accounting pass."
+  description = "Maximum number of filesystem entries (including directories) visited in one bounded storage accounting or remediation pass."
   type        = number
   default     = 32
 

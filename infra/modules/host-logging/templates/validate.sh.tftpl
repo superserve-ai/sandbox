@@ -132,30 +132,52 @@ systemctl is-active --quiet superserve-otel-collector.service || drift=1
 systemctl is-enabled --quiet superserve-host-logging-heartbeat.timer || drift=1
 systemctl is-active --quiet superserve-host-logging-heartbeat.timer || drift=1
 
-# The selected Ops Agent release owns the buffer cap. We do not pretend an
-# environment variable changes it; instead, policy fails closed when the
-# effective buffer, self-log, and retained syslog stores exceed the separately
-# budgeted threshold. This preserves metrics-first pressure handling and leaves
-# checkpoint files untouched for the next reconciliation.
+# Ops Agent 2.52.0 owns a platform-managed buffer with no supported numeric
+# configuration knob. Policy fails closed when observed buffer, self-log, and
+# retained syslog stores exceed the conservative reservation. This preserves
+# metrics-first pressure handling and leaves checkpoint files untouched for the
+# next reconciliation; it does not claim to configure the internal cap.
 storage_scan_result=$(mktemp)
 if ! timeout "${storage_scan_timeout_seconds}s" bash -c '
   set -euo pipefail
   buffer_dir="$1"; self_log_dir="$2"; max_entries="$3"; output="$4"
   scan_store() {
-    kind="$1"; root="$2"; count=0; bytes=0; capped=0; scan_limit=$((max_entries + 1))
-    [ -e "$root" ] || { printf "%s %s %s\n" "$kind" 0 0; return; }
-    if [ "$kind" = syslog ]; then
-      scan_command=(find "$root" -xdev -maxdepth 1 -type f \( -name syslog -o -name "syslog.*" \) -print0)
-    else
-      scan_command=(find "$root" -xdev -type f -print0)
-    fi
-    while IFS= read -r -d "" path; do
-      if [ "$count" -ge "$scan_limit" ]; then break; fi
-      size=$(stat -c "%s" -- "$path" 2>/dev/null || printf "0")
-      bytes=$((bytes + size)); count=$((count + 1))
-    done < <("$${scan_command[@]}" 2>/dev/null)
-    [ "$count" -gt "$max_entries" ] && capped=1
-    printf "%s %s %s\n" "$kind" "$bytes" "$capped"
+    kind="$1"; root="$2"; scan_limit=$((max_entries + 1))
+    python3 - "$kind" "$root" "$max_entries" <<'PY'
+import os
+import sys
+
+kind, root, limit_text = sys.argv[1:]
+limit = int(limit_text)
+queue = [root]
+visited = 0
+bytes_total = 0
+capped = False
+while queue:
+    current = queue.pop(0)
+    try:
+        entries = os.scandir(current)
+    except OSError:
+        continue
+    with entries:
+        for entry in entries:
+            if visited >= limit + 1:
+                capped = True
+                break
+            visited += 1
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if kind != "syslog":
+                        queue.append(entry.path)
+                elif entry.is_file(follow_symlinks=False):
+                    if kind != "syslog" or entry.name == "syslog" or entry.name.startswith("syslog."):
+                        bytes_total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    if capped:
+        break
+print(kind, bytes_total, int(capped or visited > limit))
+PY
   }
   scan_store buffer "$buffer_dir"
   scan_store self_log "$self_log_dir"

@@ -201,7 +201,7 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
 
     precondition {
       condition = var.journal_max_use_bytes + var.agent_buffer_bytes + var.agent_self_log_max_bytes + var.syslog_max_bytes <= var.journal_keep_free_bytes
-      error_message = "Combined journal, Ops Agent buffer, self-log, and syslog budgets must fit within the host free-space reserve."
+      error_message = "Combined journal, conservative Ops Agent buffer reservation, self-log, and syslog budgets must fit within the host free-space reserve; Ops Agent's platform-managed cap is not configurable in 2.52.0."
     }
   }
 

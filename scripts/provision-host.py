@@ -155,6 +155,56 @@ def _references(value):
     return found
 
 
+_IDENTITY_KEYS = {
+    'host_id', 'instance_id', 'instance_name', 'incarnation', 'self_link',
+}
+_DERIVED_METADATA_KEYS = _IDENTITY_KEYS | {'id', 'etag', 'generation'}
+
+
+def _identity_only_change(before, after, unknown, old_id, new_id=None, path=()):
+    """Reject functional host-logging changes during an identity replacement.
+
+    Terraform may recompute a selected VM identity and strings that embed it,
+    but a replacement must not smuggle a new selector, script, package, IAM
+    grant, or alert behavior through the same plan.
+    """
+    leaf = path[-1] if path else None
+    if unknown is True:
+        require(leaf in _DERIVED_METADATA_KEYS or old_id and old_id in str(before or ''),
+                'Unexpected unknown host logging field: ' + str(path))
+        return
+    if isinstance(before, dict) or isinstance(after, dict):
+        left = before if isinstance(before, dict) else {}
+        right = after if isinstance(after, dict) else {}
+        pending = unknown if isinstance(unknown, dict) else {}
+        for key in left.keys() | right.keys() | pending.keys():
+            _identity_only_change(left.get(key), right.get(key), pending.get(key), old_id,
+                                  new_id, path + (key,))
+        return
+    if isinstance(before, list) or isinstance(after, list):
+        left = before if isinstance(before, list) else []
+        right = after if isinstance(after, list) else []
+        pending = unknown if isinstance(unknown, list) else []
+        require(len(left) == len(right), 'Host logging list shape changed: ' + str(path))
+        for index, (old, new) in enumerate(zip(left, right)):
+            _identity_only_change(old, new, pending[index] if index < len(pending) else None,
+                                  old_id, new_id, path + (index,))
+        return
+    if before == after:
+        return
+    if leaf in _DERIVED_METADATA_KEYS:
+        if leaf == 'instance_id' and new_id is not None:
+            require(str(after) == str(new_id), 'Host logging identity does not follow the selected VM')
+        return
+    if isinstance(before, str) and isinstance(after, str) and old_id and old_id in before:
+        prefix, separator, suffix = before.partition(old_id)
+        expected = prefix + (str(new_id) if new_id is not None else after[len(prefix):len(after) - len(suffix) or None]) + suffix
+        require(separator and after == expected,
+                'Unrelated host logging content change: ' + str(path))
+        return
+    require(False, 'Unrelated host logging change during replacement: ' + str(path))
+
+
 def validate_host_logging_update(change, vm_change, config, host, region):
     """Allow only selected-host-bound logging dependencies in a VM plan.
 
@@ -180,6 +230,17 @@ def validate_host_logging_update(change, vm_change, config, host, region):
             'Host logging assignment references an unselected VM identity')
 
     actions = change['change']['actions']
+    if vm_change.get('actions') == ['delete', 'create']:
+        vm_before = (vm_change.get('before') or {}).get('instance_id')
+        vm_after = (vm_change.get('after') or {}).get('instance_id')
+        # A replacement may recompute only values derived from the old VM ID.
+        # IAM bindings and policy/configuration content must remain byte-for-byte
+        # stable; functional changes belong to a separately reviewed rollout.
+        _identity_only_change(change.get('change', {}).get('before'),
+                              change.get('change', {}).get('after'),
+                              change.get('change', {}).get('after_unknown'),
+                              str(vm_before) if vm_before is not None else None,
+                              str(vm_after) if vm_after is not None else None)
     if resource in {
         'google_project_iam_member.log_writer',
         'google_storage_bucket_iam_member.artifact_reader',

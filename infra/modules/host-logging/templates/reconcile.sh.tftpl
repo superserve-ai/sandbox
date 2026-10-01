@@ -143,20 +143,42 @@ if ! timeout "$storage_scan_timeout" bash -c '
   set -euo pipefail
   buffer_dir="$1"; self_log_dir="$2"; max_entries="$3"; output="$4"
   scan_store() {
-    kind="$1"; root="$2"; count=0; bytes=0; capped=0; scan_limit=$((max_entries + 1))
-    [ -e "$root" ] || { printf "%s %s %s\n" "$kind" 0 0; return; }
-    if [ "$kind" = syslog ]; then
-      scan_command=(find "$root" -xdev -maxdepth 1 -type f \( -name syslog -o -name 'syslog.*' \) -print0)
-    else
-      scan_command=(find "$root" -xdev -type f -print0)
-    fi
-    while IFS= read -r -d "" path; do
-      if [ "$count" -ge "$scan_limit" ]; then break; fi
-      size=$(stat -c "%s" -- "$path" 2>/dev/null || printf "0")
-      bytes=$((bytes + size)); count=$((count + 1))
-    done < <("$${scan_command[@]}" 2>/dev/null)
-    [ "$count" -gt "$max_entries" ] && capped=1
-    printf "%s %s %s\n" "$kind" "$bytes" "$capped"
+    kind="$1"; root="$2"; scan_limit=$((max_entries + 1))
+    python3 - "$kind" "$root" "$max_entries" <<'PY'
+import os
+import sys
+
+kind, root, limit_text = sys.argv[1:]
+limit = int(limit_text)
+queue = [root]
+visited = 0
+bytes_total = 0
+capped = False
+while queue:
+    current = queue.pop(0)
+    try:
+        entries = os.scandir(current)
+    except OSError:
+        continue
+    with entries:
+        for entry in entries:
+            if visited >= limit + 1:
+                capped = True
+                break
+            visited += 1
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if kind != "syslog":
+                        queue.append(entry.path)
+                elif entry.is_file(follow_symlinks=False):
+                    if kind != "syslog" or entry.name == "syslog" or entry.name.startswith("syslog."):
+                        bytes_total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    if capped:
+        break
+print(kind, bytes_total, int(capped or visited > limit))
+PY
   }
   scan_store buffer "$buffer_dir"
   scan_store self_log "$self_log_dir"
@@ -196,10 +218,11 @@ install -m 0644 "$journald_candidate_path" "$dropin_candidate"
 grep -Fq "SystemMaxUse=${journal_max_use_bytes}B" "$dropin_candidate"
 grep -Fq "SystemKeepFree=${journal_keep_free_bytes}B" "$dropin_candidate"
 
-# The Ops Agent's supported buffer cap is built into the selected release. The
-# systemd drop-in bounds the actual logging and metrics subagents together.
-# validate.sh accounts for the built-in buffer, self-log, and retained syslog
-# stores against this budget instead of relying on an undocumented setting.
+# Ops Agent 2.52.0 documents platform-managed buffer protection but no numeric
+# configuration knob. The systemd drop-in bounds the logging and metrics
+# subagents; validate.sh accounts for observed buffer, self-log, and retained
+# syslog stores against a conservative reservation without claiming to set the
+# internal cap.
 logging_resource_candidate=$(mktemp "$(dirname "$logging_resource_dropin")/.resources.XXXXXX")
 cat >"$logging_resource_candidate" <<'RESOURCES'
 [Service]
@@ -477,17 +500,51 @@ if ! timeout "$storage_remediation_timeout" bash -c '
   reclaim() {
     kind="$1"; root="$2"; limit="$3"; count=0; total=0; capped=0; scan_limit=$((max_entries + 1))
     files=(); sizes=()
-    if [ "$kind" = syslog ]; then
-      scan_command=(find "$root" -xdev -maxdepth 1 -type f \( -name syslog -o -name "syslog.*" \) -print0)
-    else
-      scan_command=(find "$root" -xdev -type f -name "*.log*" -print0)
-    fi
-    while IFS= read -r -d "" path; do
-      if [ "$count" -ge "$scan_limit" ]; then break; fi
-      size=$(stat -c "%s" -- "$path" 2>/dev/null || printf "0")
+    listing=$(mktemp)
+    python3 - "$kind" "$root" "$max_entries" >"$listing" <<'PY'
+import os
+import sys
+
+kind, root, limit_text = sys.argv[1:]
+limit = int(limit_text)
+queue = [root]
+visited = 0
+capped = False
+while queue:
+    current = queue.pop(0)
+    try:
+        entries = os.scandir(current)
+    except OSError:
+        continue
+    with entries:
+        for entry in entries:
+            if visited >= limit + 1:
+                capped = True
+                break
+            visited += 1
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    if kind != "syslog":
+                        queue.append(entry.path)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                selected = (kind != "syslog" and ".log" in entry.name)
+                selected = selected or (kind == "syslog" and (entry.name == "syslog" or entry.name.startswith("syslog.")))
+                if selected:
+                    print(entry.path, entry.stat(follow_symlinks=False).st_size, sep="\t")
+            except OSError:
+                continue
+    if capped:
+        break
+if capped or visited > limit:
+    print("__CAP__", 0, sep="\t")
+PY
+    while IFS="$(printf '\t')" read -r path size; do
+      if [ "$path" = __CAP__ ]; then capped=1; continue; fi
       files+=("$path"); sizes+=("$size"); total=$((total + size)); count=$((count + 1))
-    done < <("$${scan_command[@]}" 2>/dev/null)
-    [ "$count" -gt "$max_entries" ] && capped=1
+    done <"$listing"
+    rm -f "$listing"
     for i in "$${!files[@]}"; do
       [ "$total" -gt "$limit" ] || break
       path="$${files[$i]}"; size="$${sizes[$i]}"
