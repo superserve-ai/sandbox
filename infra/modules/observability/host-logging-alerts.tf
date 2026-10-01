@@ -1,9 +1,41 @@
 locals {
   host_logging_alerts_enabled = var.host_logging_alerts != null
+  active_host_logging_alerts = local.host_logging_alerts_enabled ? {
+    for key, host in var.host_logging_alerts.expected_hosts : key => host
+    if try(host.active, true)
+  } : {}
+}
+
+# A host-generated minute heartbeat is converted to a logs-based metric. The
+# metric point uses the journal entry timestamp, so replaying an old buffered
+# entry cannot satisfy the current freshness window. Terraform's expected-host
+# inventory scopes the metric to the current instance incarnation; replacement
+# and retirement therefore converge by changing/removing one map entry.
+resource "google_logging_metric" "host_logging_heartbeat" {
+  for_each = local.active_host_logging_alerts
+
+  project = var.project_id
+  name    = "superserve_host_logging_heartbeat_${each.key}"
+  filter  = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND jsonPayload.host_logging_heartbeat=true"
+
+  metric_descriptor {
+    metric_kind = "DELTA"
+    value_type  = "INT64"
+    unit        = "1"
+    labels {
+      key         = "collector_host_id"
+      value_type  = "STRING"
+      description = "Stable collector identity for the active host incarnation."
+    }
+  }
+
+  label_extractors = {
+    collector_host_id = "EXTRACT(labels.host_id)"
+  }
 }
 
 resource "google_monitoring_alert_policy" "host_logging_export_failures" {
-  for_each = local.host_logging_alerts_enabled ? var.host_logging_alerts.expected_hosts : {}
+  for_each = local.active_host_logging_alerts
 
   project               = var.project_id
   display_name          = "${var.host_logging_alerts.display_prefix} / ${each.value.instance_name} / export failure"
@@ -50,7 +82,7 @@ resource "google_monitoring_alert_policy" "host_logging_export_failures" {
 }
 
 resource "google_monitoring_alert_policy" "host_logging_lag" {
-  for_each = local.host_logging_alerts_enabled ? var.host_logging_alerts.expected_hosts : {}
+  for_each = local.active_host_logging_alerts
 
   project               = var.project_id
   display_name          = "${var.host_logging_alerts.display_prefix} / ${each.value.instance_name} / delivery lag"
@@ -67,11 +99,27 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
 
   conditions {
     display_name = "Ops Agent delivery lag on ${each.value.instance_name}"
-    condition_matched_log {
-      # The logging subagent documents these messages when its persistent
-      # buffer cannot flush. No synthetic lag field is invented; operators
-      # distinguish catch-up from a persistent gap using retained evidence.
-      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"google-cloud-ops-agent\") AND (textPayload =~ \"(?i)(failed to flush chunk|will retry|buffer)\" OR jsonPayload.MESSAGE =~ \"(?i)(failed to flush chunk|will retry|buffer)\")"
+    condition_absent {
+      filter   = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.host_logging_heartbeat[each.key].name}\" AND metric.labels.collector_host_id=\"${coalesce(each.value.collector_host_id, each.value.instance_name)}\""
+      duration = format("%ds", var.host_logging_alerts.lag_threshold_seconds)
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_SUM"
+      }
+    }
+    condition_threshold {
+      # A threshold condition with missing-data-as-active covers a host that
+      # has never emitted its first independent heartbeat series. Once the
+      # series exists, only a positive current uptime satisfies it.
+      filter                  = "metric.type=\"${var.host_logging_alerts.heartbeat_metric_type}\" AND metric.labels.collector_host_id=\"${coalesce(each.value.collector_host_id, each.value.instance_name)}\""
+      comparison              = "COMPARISON_LT"
+      threshold_value         = 1
+      duration                = var.host_logging_alerts.heartbeat_duration
+      evaluation_missing_data = "EVALUATION_MISSING_DATA_ACTIVE"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_MEAN"
+      }
     }
   }
 
@@ -99,7 +147,7 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
 # Agent/export path. A broken exporter therefore cannot make this absence
 # signal appear healthy.
 resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
-  for_each = local.host_logging_alerts_enabled ? var.host_logging_alerts.expected_hosts : {}
+  for_each = local.active_host_logging_alerts
 
   project               = var.project_id
   display_name          = "${var.host_logging_alerts.display_prefix} / ${each.value.instance_name} / missing heartbeat"
@@ -120,7 +168,7 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
       # GMP may use its prometheus_target monitored resource rather than a
       # GCE resource for this series, so scope by the stable metric label and
       # not by a resource type that would make never-seen hosts invisible.
-      filter   = "metric.type=\"${var.host_logging_alerts.heartbeat_metric_type}\" AND metric.labels.collector_host_id=\"${each.value.instance_name}\""
+      filter   = "metric.type=\"${var.host_logging_alerts.heartbeat_metric_type}\" AND metric.labels.collector_host_id=\"${coalesce(each.value.collector_host_id, each.value.instance_name)}\""
       duration = var.host_logging_alerts.heartbeat_duration
       aggregations {
         alignment_period   = "60s"

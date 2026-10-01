@@ -441,6 +441,7 @@ module "observability" {
       sandbox_host_b = {
         instance_name = module.sandbox_host_b.instance_name
         instance_id   = module.sandbox_host_b.instance_id
+        collector_host_id = module.sandbox_host_b.instance_name
       }
     }
   }

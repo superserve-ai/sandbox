@@ -20,7 +20,7 @@ logging:
     exclude_non_platform_sources:
       type: exclude_logs
       match_any:
-        - 'NOT (jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?|systemd-(journald|logind|udevd|networkd|resolved)|google-osconfig-agent|google-guest-agent|unbound|secretsproxy)\.service$" OR jsonPayload._TRANSPORT = "kernel")'
+        - 'NOT (jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?|systemd(-[^.]*)?|google-osconfig-agent|google-guest-agent|google-cloud-ops-agent(-[^.]*)?|superserve-otel-collector|unbound|(superserve-)?secretsproxy|superserve-host-logging-heartbeat)\.service$" OR jsonPayload._TRANSPORT = "kernel")'
     capture_journal_provenance:
       type: modify_fields
       fields:
@@ -39,7 +39,13 @@ logging:
       type: modify_fields
       fields:
         severity:
-          move_from: jsonPayload.severity
+          copy_from: jsonPayload.level
+    map_legacy_application_severity:
+      type: modify_fields
+      fields:
+        severity:
+          copy_from: jsonPayload.severity
+          omit_if: 'jsonPayload.severity == NULL OR severity != NULL'
     add_platform_context:
       type: modify_fields
       fields:
@@ -92,6 +98,41 @@ logging:
           omit_if: 'jsonPayload.file_contents != NULL'
         jsonPayload.command_payload:
           omit_if: 'jsonPayload.command_payload != NULL'
+        jsonPayload.body_snippet:
+          omit_if: 'jsonPayload.body_snippet != NULL'
+        jsonPayload.response_body:
+          omit_if: 'jsonPayload.response_body != NULL'
+        jsonPayload.response:
+          omit_if: 'jsonPayload.response != NULL'
+        jsonPayload.file:
+          omit_if: 'jsonPayload.file != NULL'
+        jsonPayload.file_path:
+          omit_if: 'jsonPayload.file_path != NULL'
+        jsonPayload.command:
+          omit_if: 'jsonPayload.command != NULL'
+        jsonPayload.payload:
+          omit_if: 'jsonPayload.payload != NULL'
+        jsonPayload.content:
+          omit_if: 'jsonPayload.content != NULL'
+        jsonPayload.data:
+          omit_if: 'jsonPayload.data != NULL'
+        jsonPayload.input:
+          omit_if: 'jsonPayload.input != NULL'
+        jsonPayload.output:
+          omit_if: 'jsonPayload.output != NULL'
+        jsonPayload.stdout:
+          omit_if: 'jsonPayload.stdout != NULL'
+        jsonPayload.stderr:
+          omit_if: 'jsonPayload.stderr != NULL'
+        jsonPayload.args:
+          omit_if: 'jsonPayload.args != NULL'
+        jsonPayload.argv:
+          omit_if: 'jsonPayload.argv != NULL'
+        jsonPayload.MESSAGE:
+          # Parsing failures retain the raw journal MESSAGE. Never export it
+          # for application units because it can contain request, response,
+          # file, or command content; trusted host units retain diagnostics.
+          omit_if: 'jsonPayload.MESSAGE != NULL AND jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?)\.service$"'
     exclude_debug_after_parse:
       type: exclude_logs
       match_any:
@@ -113,6 +154,7 @@ logging:
           - capture_journal_provenance
           - parse_application_json
           - map_application_severity
+          - map_legacy_application_severity
           - add_platform_context
           - redact_sensitive_fields
           - exclude_debug_after_parse

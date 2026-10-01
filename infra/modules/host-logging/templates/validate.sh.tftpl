@@ -4,8 +4,12 @@ set -euo pipefail
 candidate_config_path='${candidate_config_path}'
 config_path='/etc/google-cloud-ops-agent/config.yaml'
 journald_dropin='/etc/systemd/journald.conf.d/30-superserve-host-logging.conf'
+journald_candidate_path='${journald_candidate_path}'
 logging_resource_dropin='/etc/systemd/system/google-cloud-ops-agent-fluent-bit.service.d/30-superserve-resources.conf'
-metrics_resource_dropin='/etc/systemd/system/google-cloud-ops-agent-opentelemetry-collector.service.d/30-superserve-resources.conf'
+agent_metrics_resource_dropin='/etc/systemd/system/google-cloud-ops-agent-opentelemetry-collector.service.d/30-superserve-resources.conf'
+metrics_resource_dropin='/etc/systemd/system/superserve-otel-collector.service.d/30-superserve-resources.conf'
+heartbeat_service='/etc/systemd/system/superserve-host-logging-heartbeat.service'
+heartbeat_timer='/etc/systemd/system/superserve-host-logging-heartbeat.timer'
 identity_file='/etc/sandbox/host-identity.json'
 buffer_dir='/var/lib/google-cloud-ops-agent/fluent-bit/buffers'
 self_log_dir='/var/log/google-cloud-ops-agent'
@@ -43,12 +47,9 @@ if ! cmp -s "$rendered_config" "$config_path" 2>/dev/null; then drift=1; fi
 if [ -s "$config_path" ] && ! google-cloud-ops-agent diagnose --config="$config_path" >/dev/null 2>&1; then drift=1; fi
 expected_journald=$(mktemp)
 trap 'rm -f "$rendered_config" "$expected_journald"' EXIT
-cat >"$expected_journald" <<'JOURNALD'
-[Journal]
-Storage=persistent
-SystemMaxUse=${journal_max_use_bytes}B
-SystemKeepFree=${journal_keep_free_bytes}B
-JOURNALD
+install -m 0644 "$journald_candidate_path" "$expected_journald"
+grep -Fq "SystemMaxUse=${journal_max_use_bytes}B" "$expected_journald" || exit 1
+grep -Fq "SystemKeepFree=${journal_keep_free_bytes}B" "$expected_journald" || exit 1
 if ! cmp -s "$expected_journald" "$journald_dropin" 2>/dev/null; then drift=1; fi
 if ! systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -Fq "SystemMaxUse=${journal_max_use_bytes}B"; then drift=1; fi
 if ! systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -Fq "SystemKeepFree=${journal_keep_free_bytes}B"; then drift=1; fi
@@ -56,7 +57,8 @@ if ! systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -Fq "Sy
 expected_resource=$(mktemp)
 trap 'rm -f "$rendered_config" "$expected_journald" "$expected_resource"' EXIT
 expected_metrics_resource=$(mktemp)
-trap 'rm -f "$rendered_config" "$expected_journald" "$expected_resource" "$expected_metrics_resource"' EXIT
+expected_agent_metrics_resource=$(mktemp)
+trap 'rm -f "$rendered_config" "$expected_journald" "$expected_resource" "$expected_metrics_resource" "$expected_agent_metrics_resource"' EXIT
 cat >"$expected_resource" <<'RESOURCES'
 [Service]
 CPUQuota=${agent_cpu_limit_millicores / 10}%
@@ -64,16 +66,26 @@ MemoryMax=${agent_memory_limit_mb}M
 RESOURCES
 cat >"$expected_metrics_resource" <<'RESOURCES'
 [Service]
+# The standalone application-metrics collector owns GMP delivery.
+CPUQuota=${agent_cpu_limit_millicores / 20}%
+MemoryMax=${agent_memory_limit_mb / 2}M
+RESOURCES
+cat >"$expected_agent_metrics_resource" <<'RESOURCES'
+[Service]
 CPUQuota=${agent_cpu_limit_millicores / 20}%
 MemoryMax=${agent_memory_limit_mb / 2}M
 RESOURCES
 if ! cmp -s "$expected_resource" "$logging_resource_dropin" 2>/dev/null; then drift=1; fi
+if ! cmp -s "$expected_agent_metrics_resource" "$agent_metrics_resource_dropin" 2>/dev/null; then drift=1; fi
 if ! cmp -s "$expected_metrics_resource" "$metrics_resource_dropin" 2>/dev/null; then drift=1; fi
 
 systemctl is-enabled --quiet google-cloud-ops-agent.service || drift=1
 systemctl is-active --quiet google-cloud-ops-agent.service || drift=1
 systemctl is-active --quiet google-cloud-ops-agent-fluent-bit.service || drift=1
 systemctl is-active --quiet google-cloud-ops-agent-opentelemetry-collector.service || drift=1
+systemctl is-active --quiet superserve-otel-collector.service || drift=1
+systemctl is-enabled --quiet superserve-host-logging-heartbeat.timer || drift=1
+systemctl is-active --quiet superserve-host-logging-heartbeat.timer || drift=1
 
 # The selected Ops Agent release owns the buffer cap. We do not pretend an
 # environment variable changes it; instead, policy fails closed when the

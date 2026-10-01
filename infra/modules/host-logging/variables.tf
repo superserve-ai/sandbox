@@ -70,7 +70,7 @@ variable "journal_keep_free_bytes" {
 }
 
 variable "agent_buffer_bytes" {
-  description = "Separate budget for the Ops Agent built-in buffer plus self-log and retained-syslog stores; this is an accounting/compliance threshold, not an undocumented agent setting."
+  description = "Separate budget for the selected release's built-in Ops Agent buffer plus self-log and retained-syslog stores; disposable stores are reclaimed and an over-budget supported buffer fails closed."
   type        = number
   default     = 1073741824
 

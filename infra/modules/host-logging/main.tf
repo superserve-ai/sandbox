@@ -13,10 +13,11 @@ locals {
   config_path       = "/etc/google-cloud-ops-agent/config.yaml"
   candidate_config_path = "/var/lib/superserve/host-logging/config.yaml.candidate"
   journald_dropin   = "/etc/systemd/journald.conf.d/30-superserve-host-logging.conf"
+  journald_candidate_path = "/var/lib/superserve/host-logging/journald.conf.candidate"
   reconciliation_id = "${var.assignment_name}-${var.assignment_revision}"
   host_units = distinct(flatten([
     for host in values(var.enrolled_hosts) : concat(
-      ["superserve-vmd.service", "systemd-journald.service", "systemd-logind.service", "google-osconfig-agent.service", "google-guest-agent.service", "unbound.service", "secretsproxy.service", "proxy-*.service", "proxy-generation@.service"],
+      ["superserve-vmd.service", "systemd.service", "systemd-journald.service", "systemd-logind.service", "google-osconfig-agent.service", "google-guest-agent.service", "google-cloud-ops-agent.service", "superserve-otel-collector.service", "unbound.service", "secretsproxy.service", "superserve-secretsproxy.service", "superserve-host-logging-heartbeat.service", "proxy-*.service", "proxy-generation@.service"],
       host.proxy_units,
     )
   ]))
@@ -33,6 +34,7 @@ locals {
     config_path             = local.config_path
     candidate_config_path   = local.candidate_config_path
     journald_dropin         = local.journald_dropin
+    journald_candidate_path = local.journald_candidate_path
     ops_agent_config        = local.ops_agent_config
     journal_max_use_bytes   = var.journal_max_use_bytes
     journal_keep_free_bytes = var.journal_keep_free_bytes
@@ -43,6 +45,11 @@ locals {
   })
   validate_script = templatefile("${path.module}/templates/validate.sh.tftpl", {
     candidate_config_path     = local.candidate_config_path
+    journald_candidate_path   = local.journald_candidate_path
+    journal_max_use_bytes     = var.journal_max_use_bytes
+    journal_keep_free_bytes   = var.journal_keep_free_bytes
+    agent_cpu_limit_millicores = var.agent_cpu_limit_millicores
+    agent_memory_limit_mb     = var.agent_memory_limit_mb
     ops_agent_package_version = var.ops_agent_package_version
     agent_buffer_bytes        = var.agent_buffer_bytes
   })
@@ -109,7 +116,9 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
         file {
           desired_state = "PRESENT"
           file {
-            path        = local.journald_dropin
+            # Reconciliation owns activation and previous-state capture. OS
+            # Config must never overwrite the live drop-in before validation.
+            path        = local.journald_candidate_path
             content     = <<-EOT
               [Journal]
               Storage=persistent

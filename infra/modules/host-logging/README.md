@@ -7,9 +7,12 @@ grant, private versioned configuration artifacts, journald retention, and
 rollback revision.
 
 The supported `systemd_journald` receiver is paired with a processor allowlist
-(the receiver itself has no unit-filter option) for VMD/proxy and host/kernel
-records. JSON severity is parsed before DEBUG/TRACE exclusion;
-malformed records remain eligible host diagnostics. The default syslog-file
+(the receiver itself has no unit-filter option) for VMD/proxy, secrets-proxy,
+systemd-manager and host/kernel
+records. Zerolog `level` is mapped to Cloud Logging severity before
+DEBUG/TRACE exclusion. Application parse failures keep trusted journal
+metadata but do not export raw VMD/proxy messages, which can contain request,
+response, file, or command content. The default syslog-file
 pipeline is deliberately absent so each journal record has one steady-state
 collection path. Platform identity is rendered from the installed provider
 identity at reconciliation time; Terraform descriptors remain rollout/IAM
@@ -19,14 +22,20 @@ the source identity used for filtering.
 
 The initial journal budget is 4 GiB with a 10 GiB free-space reserve. The
 Ops Agent 2.52.0 uses the documented built-in disk-buffer cap introduced in
-2.28; the managed logging and metrics subagents receive explicit CPU/memory
-limits, with the metrics sidecar receiving the smaller share so its existing
-queue/memory limiter sheds metrics before log export is constrained. Validation
-accounts for buffer, self-log, and retained syslog bytes against a separate
-budget. Staging must measure combined growth before production.
-Candidate configuration is validated before atomic activation. A failed
-reconciliation keeps the last working configuration and delivery state. The
-policy never restarts VMD or mutates identity/admission files.
+2.28; the managed logging and metrics subagents and the actual standalone
+`superserve-otel-collector.service` receive explicit CPU/memory limits, with
+metrics receiving the smaller share so its existing queue/memory limiter sheds
+metrics before log export is constrained. Reconciliation vacuums journald and
+expires disposable self-log/syslog files before checking the combined buffer
+budget; it never deletes checkpoints and emits an independent error when the
+supported buffer itself remains over budget. Staging must measure combined
+growth before production.
+Candidate configuration and the journald drop-in are validated before atomic
+activation. A failed reconciliation keeps the last working configuration and
+delivery state. The policy never restarts VMD or mutates identity/admission
+files. A managed minute heartbeat supplies a timestamped log-based freshness
+signal; the standalone OTel uptime alert remains independent for exporter
+failure and never-seen/replacement-host detection.
 
 Each enrolled runtime identity receives only `roles/logging.logWriter` here;
 the existing metric-writer and workload grants remain owned by their roots.

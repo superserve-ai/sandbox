@@ -648,10 +648,12 @@ module "observability" {
       sandbox_host = {
         instance_name = module.sandbox_host.instance_name
         instance_id   = module.sandbox_host.instance_id
+        collector_host_id = module.sandbox_host.instance_name
       }
       sandbox_host_b = {
         instance_name = module.sandbox_host_b.instance_name
         instance_id   = module.sandbox_host_b.instance_id
+        collector_host_id = module.sandbox_host_b.instance_name
       }
     }
   }
