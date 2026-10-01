@@ -141,7 +141,11 @@ variable "otel_memory_limit_mb" {
 variable "otel_cpu_limit" {
   description = "Bounded OTel logs service CPU quota."
   type        = string
-  default     = "1000m"
+  default     = "100%"
+  validation {
+    condition     = can(regex("^([1-9][0-9]?|100)%$", var.otel_cpu_limit))
+    error_message = "otel_cpu_limit must use systemd percentage syntax from 1% through 100%."
+  }
 }
 
 variable "package_operation_timeout_seconds" {

@@ -7,7 +7,12 @@ extensions:
   file_storage/queue:
     directory: ${queue_dir}
     create_directory: true
-    compaction: true
+    # OTel Contrib 0.119.0 requires the structured compaction object. Keep
+    # temporary compaction files inside the queue-owned filesystem so they are
+    # accounted for by the same storage boundary and never share cursor state.
+    compaction:
+      on_start: true
+      directory: ${queue_dir}/compaction
 
 receivers:
   journald:
@@ -92,6 +97,7 @@ receivers:
           - attributes.journal.transport
           - attributes.journal.hostname
           - attributes.journal.pid
+          - attributes.journal.priority
           - attributes.journal.boot_id
           - attributes.journal.original_timestamp
           - attributes.host_logging.application_record
@@ -105,7 +111,7 @@ processors:
     error_mode: ignore
     logs:
       log_record:
-        - 'attributes["journal.unit"] != nil and not IsMatch(attributes["journal.unit"], "^(superserve-vmd|proxy(-[^.]*)?|systemd(-[^.]*)?|google-(osconfig|guest)-agent|superserve-otel-(collector|logs)|unbound|(superserve-)?secretsproxy|superserve-host-logging-heartbeat)\\.service$") and attributes["journal.transport"] != "kernel"'
+        - 'attributes["journal.transport"] != "kernel" and (attributes["journal.unit"] == nil or not IsMatch(attributes["journal.unit"], "^(superserve-vmd|proxy(-[^.]*)?|systemd(-[^.]*)?|google-(osconfig|guest)-agent|superserve-otel-(collector|logs)|unbound|(superserve-)?secretsproxy|superserve-host-logging-heartbeat)\\.service$"))'
   transform/trusted_payload:
     error_mode: ignore
     log_statements:

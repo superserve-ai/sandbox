@@ -77,8 +77,9 @@ run "host_logging_alerts_contract" {
   assert {
     condition = alltrue([
       for policy in values(google_monitoring_alert_policy.host_logging_heartbeat) :
-      strcontains(one(policy.conditions).condition_prometheus_query_language[0].query, "otelcol_process_uptime")
+      strcontains(one(policy.conditions).condition_prometheus_query_language[0].query, "logging_googleapis_com:user_") &&
+      strcontains(one(policy.conditions).condition_prometheus_query_language[0].query, "collector_host_id")
     ])
-    error_message = "Independent heartbeat must select the GMP-exported collector self metric."
+    error_message = "Independent heartbeat must select the Cloud Logging-derived heartbeat series and provider instance identity."
   }
 }

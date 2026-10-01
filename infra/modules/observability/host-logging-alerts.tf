@@ -12,14 +12,15 @@ locals {
 # A host-generated minute heartbeat is converted to a logs-based metric. The
 # metric point uses the journal entry timestamp, so replaying an old buffered
 # entry cannot satisfy the current freshness window. Terraform's expected-host
-# inventory scopes the metric to the current instance incarnation; replacement
-# and retirement therefore converge by changing/removing one map entry.
+# inventory scopes the metric to the current GCE instance ID. A replacement
+# receives a new provider instance ID, which is the authoritative identity
+# Terraform can know without guessing the UUID generated on the host.
 resource "google_logging_metric" "host_logging_heartbeat" {
   for_each = local.active_host_logging_alerts
 
   project = var.project_id
   name    = "superserve_host_logging_heartbeat_${each.key}"
-  filter  = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\" AND labels.incarnation=\"${local.active_host_logging_incarnations[each.key]}\""
+  filter  = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\""
 
   metric_descriptor {
     metric_kind = "DELTA"
@@ -191,13 +192,14 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
     display_name = "Serving host heartbeat absent on ${each.value.instance_name}"
     condition_prometheus_query_language {
       # PromQL absent() returns an explicit one-valued result when the expected
-      # log heartbeat series has never produced a point. The incarnation label
-      # prevents stale replay or a replacement host from satisfying this one.
+      # log heartbeat series has never produced a point. The provider instance
+      # ID prevents a replacement VM from satisfying the predecessor's series;
+      # the trusted incarnation remains available in the emitted record for
+      # investigations and collision-resistant correlation.
       query                     = <<-EOT
         absent({
           "__name__" = "logging_googleapis_com:user_${google_logging_metric.host_logging_heartbeat[each.key].name}",
-          "collector_host_id" = "${each.value.instance_id}",
-          "incarnation" = "${local.active_host_logging_incarnations[each.key]}"
+          "collector_host_id" = "${each.value.instance_id}"
         }) == 1
       EOT
       duration                  = var.host_logging_alerts.heartbeat_duration

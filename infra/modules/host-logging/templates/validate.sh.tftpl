@@ -29,6 +29,10 @@ mark_diverged() { diverged=1; }
 need_file() { [ -s "$1" ] || mark_diverged; }
 need_mode() {
   local mode
+  if [ ! -e "$1" ]; then
+    mark_diverged
+    return
+  fi
   mode=$(stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null) || { unreadable=1; return; }
   [ "$mode" = "$2" ] || mark_diverged
 }
@@ -69,7 +73,11 @@ grep -q '^Storage=persistent$' "$dropin" 2>/dev/null || mark_diverged
 grep -q '^SystemMaxUse=${journal_max_use_bytes}B$' "$dropin" 2>/dev/null || mark_diverged
 grep -q '^SystemKeepFree=${journal_keep_free_bytes}B$' "$dropin" 2>/dev/null || mark_diverged
 
-if [ -s "$identity_file" ] && [ -s "$identity_env" ]; then
+if [ ! -e "$identity_file" ] || [ ! -e "$identity_env" ]; then
+  mark_diverged
+elif [ ! -r "$identity_file" ] || [ ! -r "$identity_env" ]; then
+  unreadable=1
+elif [ -s "$identity_file" ] && [ -s "$identity_env" ]; then
   host_id=$(sed -n 's/.*"host_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
   instance_id=$(sed -n 's/.*"instance_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
   incarnation_id=$(sed -n 's/.*"incarnation_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
@@ -78,7 +86,7 @@ if [ -s "$identity_file" ] && [ -s "$identity_env" ]; then
   grep -Fqx "INSTANCE_ID=$instance_id" "$identity_env" || mark_diverged
   grep -Fqx "INCARNATION_ID=$incarnation_id" "$identity_env" || mark_diverged
 else
-  unreadable=1
+  mark_diverged
 fi
 
 systemctl is-enabled --quiet superserve-otel-logs.service 2>/dev/null || mark_diverged
