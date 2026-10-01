@@ -1132,8 +1132,9 @@ func (r *Reconciler) retireArchivedOrphans(ctx context.Context, now time.Time, d
 		func() {
 			defer unlockOp()
 			// Re-check all cheap authorities after taking the lock. The control
-			// plane snapshot is immutable for this pass, while the local live
-			// record catches a replacement that raced the archive scan.
+			// plane snapshot is immutable for this pass. The conditional archive
+			// transaction below atomically catches a live replacement, so do not
+			// add a per-archive read transaction here.
 			if _, ok := dbSandboxes[id]; ok || active[id] {
 				return
 			}
@@ -1143,15 +1144,6 @@ func (r *Reconciler) retireArchivedOrphans(ctx context.Context, now time.Time, d
 			if r.mgr.trackedInstance(id) != nil {
 				return
 			}
-			live, getErr := r.mgr.state.Get(id)
-			if getErr != nil {
-				log.Warn().Err(getErr).Str("vm_id", id).Msg("archived retained-owner recheck failed — leaving metadata for retry")
-				return
-			}
-			if live != nil {
-				return
-			}
-
 			// Do not retire metadata while an owner-private retained dependency is
 			// still present. Template and saved-snapshot generations are shared
 			// dependencies; their vmstate/memory paths may remain after this

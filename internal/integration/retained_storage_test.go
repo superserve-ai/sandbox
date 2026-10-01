@@ -897,3 +897,53 @@ func TestRetainedStorageRollbackOwnerBoundaries(t *testing.T) {
 		})
 	}
 }
+
+func TestRetainedStorageTemplateRebuildKeepsPersistedBaselineGeneration(t *testing.T) {
+	f := newStorageReportFixture(t, "paused", false)
+	team := sandboxTeamID(t, f.sandboxID)
+	ctx := t.Context()
+	tx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	exec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := tx.Exec(ctx, query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cutover := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	start, retainedStart, end := cutover.Add(10*time.Second), cutover.Add(40*time.Second), cutover.Add(time.Minute)
+	templateID, rollbackOwner := uuid.New(), uuid.New()
+	oldSnapshotPath := "/example/templates/base/build-a/vmstate.snap"
+	oldRootfsPath := "/example/templates/base/build-a/rootfs.ext4"
+	newSnapshotPath := "/example/templates/base/build-b/vmstate.snap"
+	newRootfsPath := "/example/templates/base/build-b/rootfs.ext4"
+	// The template row now points at build B, while each owner keeps the
+	// build-specific snapshot path it was created from.
+	exec(`INSERT INTO template(id,team_id,name,status,build_spec,rootfs_path,snapshot_path,mem_path,vcpu,memory_mib,disk_mib)
+ VALUES($1,$2,'example-template','ready','{}'::jsonb,$3,$4,$5,1,1024,2)`, templateID, team, newRootfsPath, newSnapshotPath, "/example/templates/base/build-b/mem.snap")
+	exec(`INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
+ VALUES($1,'rootfs.ext4',$2,1048576,1048576,$3),($1,'rootfs.ext4',$4,1048576,1048576,$3)`, templateID, oldRootfsPath, strings.Repeat("0", 64), newRootfsPath)
+	exec(`UPDATE sandbox SET created_at=$2,template_id=$3,snapshot_path=$4,base_path=NULL,delta_path=NULL WHERE id=$1`, f.sandboxID, start, templateID, oldSnapshotPath)
+	exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,template_id,snapshot_path)
+ VALUES($1,$2,'example-rollback-generation','paused',$3,1,1024,2,$4,$5,$6)`, rollbackOwner, team, f.hostID, start.Add(10*time.Second), templateID, newSnapshotPath)
+	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
+ VALUES($1,$2,$3,2,$4),($5,$2,$3,2,$6)`, f.sandboxID, team, f.hostID, start, rollbackOwner, start.Add(10*time.Second))
+	exec(`INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, cutover)
+	exec(`INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
+ VALUES($1,$2,'sandbox',$3,'generation-a','[{"device":"fs","start":0,"length":1048576}]',$4,$5)`, f.hostID, team, f.sandboxID, retainedStart, end)
+	var got float64
+	if err := tx.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, start, end).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	// Overlay usage is 120 + 100 MiB-seconds. Build A contributes its
+	// baseline for 30 seconds, build B for 50 seconds, and the retained
+	// generation contributes 20 seconds. A mutable template path would merge
+	// the two generations and undercount this result.
+	const want = 310.0
+	if got != want {
+		t.Fatalf("storage after template rebuild = %v, want %v", got, want)
+	}
+}
