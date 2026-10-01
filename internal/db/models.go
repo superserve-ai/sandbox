@@ -468,6 +468,45 @@ type BillingIncrementalPeriod struct {
 	LastReconcileAttemptAt pgtype.Timestamptz `json:"last_reconcile_attempt_at"`
 }
 
+type BillingInvoiceAccount struct {
+	TeamID              uuid.UUID          `json:"team_id"`
+	CustomerID          string             `json:"customer_id"`
+	SubscriptionID      string             `json:"subscription_id"`
+	AdjustmentPriceID   string             `json:"adjustment_price_id"`
+	AdjustmentEventName string             `json:"adjustment_event_name"`
+	AdjustmentMeterID   string             `json:"adjustment_meter_id"`
+	EnrolledAt          time.Time          `json:"enrolled_at"`
+	LastAttemptAt       pgtype.Timestamptz `json:"last_attempt_at"`
+	LastError           *string            `json:"last_error"`
+}
+
+type BillingInvoiceClose struct {
+	TeamID            uuid.UUID          `json:"team_id"`
+	PeriodStart       time.Time          `json:"period_start"`
+	PeriodEnd         time.Time          `json:"period_end"`
+	InvoiceID         string             `json:"invoice_id"`
+	Plan              []byte             `json:"plan"`
+	State             string             `json:"state"`
+	FirstAdjustmentAt pgtype.Timestamptz `json:"first_adjustment_at"`
+	FirstFinalizeAt   pgtype.Timestamptz `json:"first_finalize_at"`
+	VerifiedAt        pgtype.Timestamptz `json:"verified_at"`
+	FinalizedEvidence []byte             `json:"finalized_evidence"`
+	LastError         *string            `json:"last_error"`
+	UpdatedAt         time.Time          `json:"updated_at"`
+}
+
+type BillingInvoiceEnrollment struct {
+	TeamID         uuid.UUID          `json:"team_id"`
+	CustomerID     string             `json:"customer_id"`
+	SubscriptionID string             `json:"subscription_id"`
+	RequestedAt    time.Time          `json:"requested_at"`
+	StartedAt      pgtype.Timestamptz `json:"started_at"`
+	NextAttemptAt  time.Time          `json:"next_attempt_at"`
+	AttemptCount   int32              `json:"attempt_count"`
+	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+	LastError      *string            `json:"last_error"`
+}
+
 type BillingMeterReconciliation struct {
 	ID                 uuid.UUID      `json:"id"`
 	TeamID             uuid.UUID      `json:"team_id"`
