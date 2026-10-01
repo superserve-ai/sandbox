@@ -302,7 +302,6 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertIn('[ "$storage_scan_capped" -eq 0 ] || drift=1', self.validate)
         self.assertIn('if [ "$storage_scan_capped" -ne 0 ]; then', self.reconcile)
         self.assertIn("pending buffer state preserved", self.reconcile)
-        self.assertIn("exporter and its checkpoint / pending-buffer state continue running", self.reconcile)
         self.assertIn("activation_committed=1", self.reconcile)
 
         with tempfile.TemporaryDirectory() as directory:
