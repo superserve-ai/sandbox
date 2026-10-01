@@ -242,8 +242,13 @@ logging:
         receivers:
           - vmd_proxy_journald
         processors:
-          - exclude_non_platform_sources
+          # Capture receiver-provided journal provenance before evaluating the
+          # source filter. Incoming records do not yet contain the custom
+          # labels written by capture_journal_provenance.
           - capture_journal_provenance
+          # Reject unrelated journal traffic only after trusted provenance is
+          # present. Severity filtering still happens after JSON parsing.
+          - exclude_non_platform_sources
           - parse_application_json
           - map_application_severity
           - map_legacy_application_severity

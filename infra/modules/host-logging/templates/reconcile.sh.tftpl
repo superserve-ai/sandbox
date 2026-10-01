@@ -123,6 +123,7 @@ if [[ "$installed_version" == ${ops_agent_package_version}* ]] && command -v goo
   run_engine_validation /opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine "$rendered_config" || exit 1
 else
   package_stage_dir=$(mktemp -d /tmp/superserve-host-logging-package.XXXXXX)
+  # apt-get download is isolated from the active package before validation.
   if ! (cd "$package_stage_dir" && timeout "${package_operation_timeout_seconds}s" apt-get -o Acquire::Retries=2 download "google-cloud-ops-agent=${ops_agent_package_version}") >/dev/null 2>&1; then
     logger -t superserve-host-logging -p err "unable to stage Ops Agent ${ops_agent_package_version} for pre-activation validation"
     exit 1
