@@ -659,6 +659,52 @@ func TestIntegration_RetainedFailedFirstMeasurementBlocksSettlement(t *testing.T
 	}
 }
 
+func TestIntegration_RetainedBaselineProvenance(t *testing.T) {
+	f := newStorageLeaseFixture(t)
+	ctx := t.Context()
+	gen := strings.Repeat("d", 64)
+	owner := retainedstorage.Owner{Kind: "sandbox", ID: f.sandboxID.String(), Generation: gen,
+		Extents:  []retainedstorage.Extent{{Device: "fs", Start: 4096, Length: 8192}},
+		Baseline: &retainedstorage.Baseline{Path: "/example/pinned/rootfs.ext4", Generation: gen, AllocatedBytes: 8192}}
+	measurements := []storageReportMeasurement{{Retained: &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{owner}}}}
+	if err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, f.receivedAt, measurements, 1, 1); err != nil {
+		t.Fatal(err)
+	}
+	var path, generation string
+	var allocated int64
+	if err := f.pool.QueryRow(ctx, `SELECT baseline_path,baseline_generation,baseline_allocated_bytes
+ FROM retained_storage_interval WHERE owner_id=$1 AND ended_at IS NULL`, f.sandboxID).Scan(&path, &generation, &allocated); err != nil {
+		t.Fatal(err)
+	}
+	if path != owner.Baseline.Path || generation != gen || allocated != owner.Baseline.AllocatedBytes {
+		t.Fatalf("durable provenance = %q/%q/%d, want %q/%q/%d", path, generation, allocated, owner.Baseline.Path, gen, owner.Baseline.AllocatedBytes)
+	}
+	// Replay is idempotent and does not create a second interval.
+	if _, err := f.pool.Exec(ctx, `UPDATE host_storage_report SET state='processing',next_measurement_index=0 WHERE report_id=$1`, f.reportID); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, f.receivedAt, measurements, 1, 1); err != nil {
+		t.Fatalf("same provenance replay: %v", err)
+	}
+	// A report still in processing keeps the settlement fence even when its
+	// interval application already succeeded; the processor must finish the
+	// durable report before settlement can advance.
+	if _, err := f.pool.Exec(ctx, `UPDATE host_storage_report SET state='processing',next_measurement_index=0 WHERE report_id=$1`, f.reportID); err != nil {
+		t.Fatal(err)
+	}
+	var team uuid.UUID
+	if err := f.pool.QueryRow(ctx, `SELECT team_id FROM sandbox WHERE id=$1`, f.sandboxID).Scan(&team); err != nil {
+		t.Fatal(err)
+	}
+	var complete bool
+	if err := f.pool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, f.receivedAt.Add(time.Minute)).Scan(&complete); err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("settlement fence was cleared while report processing remained open")
+	}
+}
+
 func TestIntegration_RetainedFailedSnapshotBlocksSettlement(t *testing.T) {
 	for _, legacy := range []bool{false, true} {
 		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {

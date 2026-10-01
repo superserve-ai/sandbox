@@ -76,7 +76,13 @@ WITH bounds AS MATERIALIZED (
   SELECT s.id,s.template_id,s.snapshot_id,s.base_path,s.delta_path,
    i.host_id interval_host_id,i.started_at billing_started_at,
    i.artifact_retention_end retention_end,i.team_cutover,i.request_now,
-   b.path baseline_path,b.generation baseline_generation,
+   -- Legacy overlay rows already persist the exact base allocation in
+   -- sandbox.base_path.  That field is the creation-time authority for the
+   -- pre-cutover artifact union; a newer sandbox_storage_baseline row, when
+   -- present, adds the generation/physical-allocation proof used for
+   -- retained suppression.  Never consult mutable template metadata here.
+   COALESCE(b.path, s.base_path) baseline_path,
+   b.generation baseline_generation,
    b.allocated_bytes baseline_allocated_bytes,
    (s.template_id IS NOT NULL AND s.base_path IS NULL AND b.path IS NULL) unresolved_baseline
   FROM sandbox s

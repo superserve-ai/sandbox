@@ -159,6 +159,79 @@ func TestRetainedInventoryBudgetsOnlyCustomerRecords(t *testing.T) {
 	}
 }
 
+func TestRetainedBaselineProvenance(t *testing.T) {
+	root := t.TempDir()
+	statePath := filepath.Join(root, "state.db")
+	state, err := OpenStateStore(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	disk := filepath.Join(root, "overlay.ext4")
+	base := filepath.Join(root, "pinned-rootfs.ext4")
+	for _, path := range []string{disk, base} {
+		if err := os.WriteFile(path, []byte("retained generation"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rec := VMRecord{ID: uuid.NewString(), SourceSnapshotID: uuid.NewString(), Status: StatusRunning, DiskPath: disk, RootfsPath: base}
+	if err := state.Put(rec); err != nil {
+		t.Fatal(err)
+	}
+	measure := func(f *os.File, _ int) ([]retainedstorage.Extent, string, error) {
+		if filepath.Clean(f.Name()) == filepath.Clean(base) {
+			info, err := f.Stat()
+			if err != nil {
+				return nil, "", err
+			}
+			generation := "base-generation"
+			if info.Size() > int64(len("retained generation")) {
+				generation = "base-generation-new"
+			}
+			return []retainedstorage.Extent{{Device: "fs", Start: 1 << 20, Length: 1 << 20}}, generation, nil
+		}
+		return []retainedstorage.Extent{{Device: "fs", Start: 2 << 20, Length: 4096}}, "private-generation", nil
+	}
+	inventory := func(s *StateStore) *retainedstorage.Inventory {
+		t.Helper()
+		m := &Manager{state: s, cfg: ManagerConfig{RunDir: root, SnapshotDir: filepath.Join(root, "snapshots")}}
+		inv, err := m.retainedStorageInventory(t.Context(), measure)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(inv.Owners) != 1 || inv.Owners[0].Baseline == nil {
+			t.Fatalf("inventory owner = %#v, want one baseline-bearing owner", inv.Owners)
+		}
+		return inv
+	}
+	first := inventory(state)
+	baseline := first.Owners[0].Baseline
+	if baseline.Path != base || baseline.AllocatedBytes != 1<<20 || baseline.Generation != first.Owners[0].Generation {
+		t.Fatalf("baseline provenance = %#v, owner generation = %q", baseline, first.Owners[0].Generation)
+	}
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := OpenStateStore(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	second := inventory(reopened)
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("restart changed provenance inventory: before=%#v after=%#v", first, second)
+	}
+	// A new physical generation changes the owner identity; it must not reuse
+	// the prior baseline generation merely because the path is unchanged.
+	if err := os.WriteFile(base, []byte("replacement generation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	third := inventory(reopened)
+	if third.Owners[0].Generation == first.Owners[0].Generation {
+		t.Fatal("replacement allocation reused the prior retained generation")
+	}
+}
+
 func TestRetainedRecordsSkipsMalformedUnrelatedEntriesBeforeDecode(t *testing.T) {
 	state, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
@@ -543,6 +616,47 @@ func TestRetainedInventorySpoolMigrationRecovery(t *testing.T) {
 				t.Fatalf("migration changed legacy retry identity or payload: %#v", pending)
 			}
 		})
+	}
+}
+
+func TestRetainedBaselineProvenanceSpoolCompatibility(t *testing.T) {
+	dir := t.TempDir()
+	incarnation := uuid.NewString()
+	cache := newHeartbeatStorageCache(dir, zerolog.Nop(), incarnation)
+	owner := retainedstorage.Owner{Kind: "sandbox", ID: uuid.NewString(), Generation: strings.Repeat("e", 64),
+		Extents:  []retainedstorage.Extent{{Device: "fs", Start: 0, Length: 4096}},
+		Baseline: &retainedstorage.Baseline{Path: "/example/pinned/rootfs.ext4", Generation: strings.Repeat("f", 64), AllocatedBytes: 4096}}
+	if err := cache.store([]heartbeatStorageMeasurement{{Retained: &retainedstorage.Inventory{Version: retainedstorage.Version, Owners: []retainedstorage.Owner{owner}}}}); err != nil {
+		t.Fatal(err)
+	}
+	want := cache.pendingSnapshot()
+	if len(want) != 1 || want[0].measurements[0].Retained == nil {
+		t.Fatalf("queued provenance report = %#v", want)
+	}
+	// An older writer may rewrite only its legacy overlay spool during a
+	// rollback. The upgraded reader must retain the v2 report and its baseline
+	// dimensions rather than replacing it with the legacy envelope.
+	legacy := legacySpoolState{IncarnationID: incarnation, Version: 3,
+		Pending: []legacySpoolEntry{{Version: 3, Measurements: []legacySpoolMeasurement{{SandboxID: uuid.NewString(), AllocatedBytes: 1}}}}}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, storageReportQueueFilename), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restarted := newHeartbeatStorageCache(dir, zerolog.Nop(), incarnation)
+	pending := restarted.pendingSnapshot()
+	var retained *retainedstorage.Inventory
+	for _, report := range pending {
+		for _, measurement := range report.measurements {
+			if measurement.Retained != nil {
+				retained = measurement.Retained
+			}
+		}
+	}
+	if retained == nil || len(retained.Owners) != 1 || !reflect.DeepEqual(retained.Owners[0].Baseline, owner.Baseline) {
+		t.Fatalf("legacy spool rewrite lost retained provenance: %#v", pending)
 	}
 }
 

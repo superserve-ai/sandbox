@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"testing"
@@ -953,5 +954,121 @@ func TestRetainedStorageTemplateRebuildKeepsPersistedBaselineGeneration(t *testi
 	const want = 230.0
 	if got != want {
 		t.Fatalf("storage after template rebuild = %v, want %v", got, want)
+	}
+}
+
+func TestRetainedStorageBaselineProvenance(t *testing.T) {
+	f := newStorageReportFixture(t, "paused", false)
+	ctx := t.Context()
+	genA := strings.Repeat("a", 64)
+	genB := strings.Repeat("b", 64)
+	path := "/example/provenance/rootfs-a.ext4"
+	owner := retainedstorage.Owner{
+		Kind: "sandbox", ID: f.sandboxID.String(), Generation: genA,
+		Extents:  []retainedstorage.Extent{{Device: "fs", Start: 0, Length: 1 << 20}},
+		Baseline: &retainedstorage.Baseline{Path: path, Generation: genA, AllocatedBytes: 1 << 20},
+	}
+	post := func(id uuid.UUID, o retainedstorage.Owner) *httptest.ResponseRecorder {
+		t.Helper()
+		body, err := json.Marshal(map[string]any{
+			"incarnation_id": f.incarnation,
+			"report_id":      id,
+			"measurements": []any{{"sandbox_id": "", "allocated_bytes": 0,
+				"retained": retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{o}}}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return requestStorageReport(f.router, f.hostID, string(body))
+	}
+	first := uuid.New()
+	if response := post(first, owner); response.Code != http.StatusCreated {
+		t.Fatalf("provenance report: %d %s", response.Code, response.Body.String())
+	}
+	waitStorageReportState(t, first, "processed")
+	var gotPath, gotGeneration string
+	var gotBytes int64
+	if err := testPool.QueryRow(ctx, `SELECT baseline_path,baseline_generation,baseline_allocated_bytes
+ FROM retained_storage_interval WHERE owner_id=$1 AND ended_at IS NULL`, f.sandboxID).Scan(&gotPath, &gotGeneration, &gotBytes); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != path || gotGeneration != genA || gotBytes != 1<<20 {
+		t.Fatalf("persisted baseline = %q/%q/%d, want %q/%q/%d", gotPath, gotGeneration, gotBytes, path, genA, 1<<20)
+	}
+	// A same-ID payload change conflicts instead of rewriting the durable
+	// provenance or its already accepted interval.
+	changed := owner
+	changed.Baseline = &retainedstorage.Baseline{Path: "/example/provenance/other.ext4", Generation: genA, AllocatedBytes: 1 << 20}
+	if response := post(first, changed); response.Code != http.StatusConflict {
+		t.Fatalf("changed provenance retry status = %d, want 409", response.Code)
+	}
+	var stablePath string
+	if err := testPool.QueryRow(ctx, `SELECT baseline_path FROM retained_storage_interval WHERE owner_id=$1 AND ended_at IS NULL`, f.sandboxID).Scan(&stablePath); err != nil || stablePath != path {
+		t.Fatalf("conflicting retry changed baseline: %q (%v)", stablePath, err)
+	}
+	// A measured zero is represented explicitly and is not converted to
+	// unknown. The new generation closes the prior interval at the receipt.
+	zero := owner
+	zero.Generation, zero.Extents = genB, []retainedstorage.Extent{}
+	zero.Baseline = &retainedstorage.Baseline{Path: path, Generation: genB, AllocatedBytes: 0}
+	second := uuid.New()
+	if response := post(second, zero); response.Code != http.StatusCreated {
+		t.Fatalf("explicit-zero report: %d %s", response.Code, response.Body.String())
+	}
+	waitStorageReportState(t, second, "processed")
+	var zeroBytes int64
+	if err := testPool.QueryRow(ctx, `SELECT baseline_allocated_bytes FROM retained_storage_interval WHERE owner_id=$1 AND generation=$2`, f.sandboxID, genB).Scan(&zeroBytes); err != nil || zeroBytes != 0 {
+		t.Fatalf("explicit zero baseline = %d (%v), want zero", zeroBytes, err)
+	}
+
+	// A full-copy owner without a persisted baseline is unresolved, not zero.
+	missing := uuid.New()
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := testPool.Exec(ctx, q, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`INSERT INTO template(id,team_id,name,status,build_spec,rootfs_path,snapshot_path,mem_path,vcpu,memory_mib,disk_mib)
+ VALUES($1,(SELECT team_id FROM sandbox WHERE id=$2),'provenance-template','ready','{}'::jsonb,'/example/current/rootfs.ext4','/example/current/vmstate.snap','/example/current/mem.snap',1,1,1)`, missing, f.sandboxID)
+	exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,template_id)
+ SELECT $1,team_id,'missing-provenance','paused',host_id,1,1,0,created_at,$3 FROM sandbox WHERE id=$2`, missing, f.sandboxID, missing)
+	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
+ SELECT id,team_id,host_id,0,created_at FROM sandbox WHERE id=$1`, missing)
+	var unknown bool
+	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds((SELECT team_id FROM sandbox WHERE id=$1),now()-interval '1 hour',now(),false) IS NULL`, missing).Scan(&unknown); err != nil {
+		t.Fatal(err)
+	}
+	if !unknown {
+		t.Fatal("missing baseline provenance was treated as a numeric zero")
+	}
+}
+
+func TestRetainedStorageBaselineReconciliationPlan(t *testing.T) {
+	f := newStorageReportFixture(t, "paused", false)
+	ctx := t.Context()
+	team := sandboxTeamID(t, f.sandboxID)
+	start := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
+	end := start.Add(4 * time.Minute)
+	if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
+ VALUES($1,$2,'sandbox',$3,$4,'[{"device":"fs","start":0,"length":1048576}]',$5,$6)`, f.hostID, team, f.sandboxID, strings.Repeat("c", 64), start, end); err != nil {
+		t.Fatal(err)
+	}
+	var quantity float64
+	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, start, end).Scan(&quantity); err != nil {
+		t.Fatal(err)
+	}
+	want := end.Sub(start).Seconds()
+	if math.Abs(quantity-want) > 0.0001 {
+		t.Fatalf("reconciliation quantity = %v, want independent oracle %v", quantity, want)
+	}
+	var plan []byte
+	if err := testPool.QueryRow(ctx, `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+ SELECT storage_mib_seconds($1,$2,$3,false)`, team, start, end).Scan(&plan); err != nil {
+		t.Fatal(err)
+	}
+	planText := string(plan)
+	if !strings.Contains(planText, `"Plan"`) || !strings.Contains(planText, `"Actual Loops"`) || !strings.Contains(planText, `"Shared Read Blocks"`) {
+		t.Fatalf("canonical reconciliation plan omitted loop/buffer evidence: %s", planText)
 	}
 }
