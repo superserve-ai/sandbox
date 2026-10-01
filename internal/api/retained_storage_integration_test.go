@@ -33,7 +33,7 @@ func newRetainedCreationFixture(t *testing.T) storageLeaseFixture {
 			t.Error(err)
 		}
 	})
-	for _, table := range []string{"host", "sandbox", "sandbox_snapshot", "sandbox_storage_interval", "retained_storage_interval", "retained_storage_cutover", "host_storage_report", "feature_flag", "team_feature_flag"} {
+	for _, table := range []string{"host", "sandbox", "sandbox_snapshot", "sandbox_storage_interval", "retained_storage_interval", "sandbox_storage_baseline", "retained_storage_cutover", "host_storage_report", "feature_flag", "team_feature_flag"} {
 		query := fmt.Sprintf(`CREATE TABLE %[1]s.%[2]s (LIKE pg_temp.%[2]s INCLUDING ALL);
  INSERT INTO %[1]s.%[2]s OVERRIDING SYSTEM VALUE SELECT * FROM pg_temp.%[2]s;`, schema, table)
 		if _, err := source.Exec(t.Context(), query); err != nil {
