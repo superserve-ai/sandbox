@@ -1,7 +1,7 @@
 # Managed by Terraform/OS Config. The supported Ops Agent systemd_journald
 # receiver is the only log source; the standalone OTel collector remains the
-# application-metrics path. No syslog-file receiver is configured, preventing
-# duplicate ingestion of the same journal records.
+# application-metrics path. No file-based syslog receiver is configured,
+# preventing duplicate ingestion of the same journal records.
 # The processor allowlist includes proxy.service and generation-specific
 # proxy-*.service units; kernel/systemd transport fields are retained for
 # resource-exhaustion and lifecycle diagnostics.
