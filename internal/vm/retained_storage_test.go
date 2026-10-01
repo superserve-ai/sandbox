@@ -1284,9 +1284,14 @@ func TestRetainedCleanupPreservesDiscoveryAtomically(t *testing.T) {
 			})
 		}
 	}
+	t.Run("settled-transition-flags", testSettledRetainingStorageClearsTransitionFlagsForInventory)
 }
 
 func TestSettledRetainingStorageClearsTransitionFlagsForInventory(t *testing.T) {
+	testSettledRetainingStorageClearsTransitionFlagsForInventory(t)
+}
+
+func testSettledRetainingStorageClearsTransitionFlagsForInventory(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		set  func(*VMRecord)

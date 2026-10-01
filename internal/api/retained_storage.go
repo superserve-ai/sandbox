@@ -230,15 +230,42 @@ SELECT EXISTS (
 	if len(reportIDs) > 0 && reportIDs[0] != uuid.Nil {
 		reportID = reportIDs[0]
 	}
-	if _, err = tx.Exec(ctx, `WITH supplied AS (
-	  SELECT o.kind,o.id,COALESCE(s.team_id,ss.team_id) team_id
-	  FROM jsonb_to_recordset($1::jsonb) AS o(kind text,id uuid)
-	  LEFT JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
-	  LEFT JOIN sandbox_snapshot ss ON o.kind='snapshot' AND ss.id=o.id
-	)
+	if _, err = tx.Exec(ctx, `WITH supplied AS MATERIALIZED (
+	  SELECT o.kind,o.id,o.generation,o.extents,
+	         o.baseline->>'path' AS baseline_path,
+	         o.baseline->>'generation' AS baseline_generation,
+	         (o.baseline->>'allocated_bytes')::bigint AS baseline_allocated_bytes
+	  FROM jsonb_to_recordset($1::jsonb) AS o(kind text,id uuid,generation text,extents jsonb,baseline jsonb)
+ ), eligible AS MATERIALIZED (
+	  SELECT o.kind,o.id,s.team_id,o.generation,o.extents,
+	         o.baseline_path,o.baseline_generation,o.baseline_allocated_bytes
+	  FROM supplied o JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
+	  WHERE s.host_id=$4 AND s.created_at<=$2
+	    AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
+	    AND feature_enabled('billing_metrics_write',s.team_id)
+	  UNION ALL
+	  SELECT o.kind,o.id,s.team_id,o.generation,o.extents,
+	         o.baseline_path,o.baseline_generation,o.baseline_allocated_bytes
+	  FROM supplied o JOIN sandbox_snapshot s ON o.kind='snapshot' AND s.id=o.id
+	  WHERE s.host_id=$4
+	    AND (s.status IN ('ready','creating','deleting') OR s.retention_ended_at>$2)
+	    AND s.created_at<=$2
+	    AND (LEAST(s.deleted_at,s.retention_ended_at) IS NULL OR LEAST(s.deleted_at,s.retention_ended_at)>$2)
+	    AND feature_enabled('billing_metrics_write',s.team_id)
+ ), accepted AS MATERIALIZED (
+	  SELECT e.kind,e.id,e.team_id
+	  FROM eligible e
+	  JOIN retained_storage_interval i
+	    ON i.host_id=$4 AND i.owner_kind=e.kind AND i.owner_id=e.id
+	   AND i.started_at<=$2 AND (i.ended_at IS NULL OR i.ended_at>$2)
+	   AND i.generation=e.generation AND i.extents=e.extents
+	   AND i.baseline_path IS NOT DISTINCT FROM e.baseline_path
+	   AND i.baseline_generation IS NOT DISTINCT FROM e.baseline_generation
+	   AND i.baseline_allocated_bytes IS NOT DISTINCT FROM e.baseline_allocated_bytes
+ )
 UPDATE retained_storage_measurement_obligation o
 SET resolved_at=$2,resolution_report_id=$3
-FROM supplied s
+FROM accepted s
 WHERE s.kind=o.owner_kind AND s.id=o.owner_id AND s.team_id=o.team_id AND o.host_id=$4
   AND o.effective_at<=$2 AND (o.ended_at IS NULL OR o.ended_at>$2)
   AND o.resolved_at IS NULL`, payload, at, reportID, hostID); err != nil {

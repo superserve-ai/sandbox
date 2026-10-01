@@ -795,6 +795,121 @@ func TestIntegration_RetainedActivationReceiptAtomicity(t *testing.T) {
 	if resolvedAt != nil {
 		t.Fatalf("rolled-back receipt resolved activation obligation at %v", resolvedAt)
 	}
+
+	t.Run("delayed-source-host-report-does-not-resolve-reassigned-owner", func(t *testing.T) {
+		f := newStorageLeaseFixture(t)
+		ctx := t.Context()
+		if _, err := f.pool.Exec(ctx, `CREATE TEMP TABLE legacy_host_storage_report(host_id text,received_at timestamptz)`); err != nil {
+			t.Fatal(err)
+		}
+		var team uuid.UUID
+		if err := f.pool.QueryRow(ctx, `SELECT team_id FROM sandbox WHERE id=$1`, f.sandboxID).Scan(&team); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.pool.Exec(ctx, `INSERT INTO retained_storage_measurement_obligation
+ (team_id,owner_kind,owner_id,host_id,effective_at) VALUES($1,'sandbox',$2,$3,$4)`, team, f.sandboxID, f.hostID, f.receivedAt); err != nil {
+			t.Fatal(err)
+		}
+		owner := retainedstorage.Owner{Kind: "sandbox", ID: f.sandboxID.String(), Generation: strings.Repeat("b", 64), Extents: []retainedstorage.Extent{{Device: "fs", Start: 4096, Length: 4096}}}
+		measurements := []storageReportMeasurement{{Retained: &retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{owner}}}}
+		payload, err := json.Marshal(measurements)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The report was received from the original host, but the owner moved
+		// before processing. There is no destination-host measurement yet.
+		destinationHost := "delayed-destination-host"
+		if _, err := f.pool.Exec(ctx, `UPDATE sandbox SET host_id=$2 WHERE id=$1`, f.sandboxID, destinationHost); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.pool.Exec(ctx, `UPDATE host_storage_report
+ SET state='pending',payload=$2,next_measurement_index=0,attempts=0,next_attempt_at=now()
+ WHERE report_id=$1`, f.reportID, payload); err != nil {
+			t.Fatal(err)
+		}
+		if !processOneStorageReport(ctx, f.pool) {
+			t.Fatal("processor did not apply delayed source-host report")
+		}
+		var resolvedAt *time.Time
+		var resolutionReportID *uuid.UUID
+		if err := f.pool.QueryRow(ctx, `SELECT resolved_at,resolution_report_id
+ FROM retained_storage_measurement_obligation WHERE owner_id=$1`, f.sandboxID).Scan(&resolvedAt, &resolutionReportID); err != nil {
+			t.Fatal(err)
+		}
+		if resolvedAt != nil || resolutionReportID != nil {
+			t.Fatalf("excluded source-host report resolved obligation: resolved_at=%v report_id=%v", resolvedAt, resolutionReportID)
+		}
+		var intervals int
+		if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval WHERE owner_id=$1`, f.sandboxID).Scan(&intervals); err != nil {
+			t.Fatal(err)
+		}
+		if intervals != 0 {
+			t.Fatalf("excluded source-host report wrote %d retained intervals", intervals)
+		}
+		var complete bool
+		if err := f.pool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, f.receivedAt.Add(time.Minute)).Scan(&complete); err != nil {
+			t.Fatal(err)
+		}
+		if complete {
+			t.Fatal("settlement fence was released by excluded source-host report")
+		}
+
+		// A later compatible receipt on the authoritative host supplies the
+		// accepted interval and is the only event allowed to resolve the fence.
+		if _, err := f.pool.Exec(ctx, `UPDATE sandbox SET host_id=$2 WHERE id=$1`, f.sandboxID, f.hostID); err != nil {
+			t.Fatal(err)
+		}
+		laterReportID := uuid.New()
+		later := f.receivedAt.Add(time.Minute)
+		if _, err := f.pool.Exec(ctx, `INSERT INTO host_storage_report
+ (host_id,incarnation_id,report_id,ingest_seq,received_at,payload,state,next_measurement_index,processing_generation)
+ VALUES($1,$2,$3,2,$4,$5,'pending',0,0)`, f.hostID, f.incarnationID, laterReportID, later, payload); err != nil {
+			t.Fatal(err)
+		}
+		if !processOneStorageReport(ctx, f.pool) {
+			t.Fatal("processor did not apply later compatible receipt")
+		}
+		if err := f.pool.QueryRow(ctx, `SELECT resolved_at,resolution_report_id
+ FROM retained_storage_measurement_obligation WHERE owner_id=$1`, f.sandboxID).Scan(&resolvedAt, &resolutionReportID); err != nil {
+			t.Fatal(err)
+		}
+		if resolvedAt == nil || resolutionReportID == nil || *resolutionReportID != laterReportID {
+			t.Fatalf("later compatible receipt did not resolve obligation: resolved_at=%v report_id=%v", resolvedAt, resolutionReportID)
+		}
+		if err := f.pool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, later.Add(time.Minute)).Scan(&complete); err != nil {
+			t.Fatal(err)
+		}
+		if !complete {
+			t.Fatal("settlement fence remained after accepted compatible receipt")
+		}
+	})
+
+	t.Run("legacy-handoff-closes-source-before-destination", func(t *testing.T) {
+		f := newStorageLeaseFixture(t)
+		ctx := t.Context()
+		receipt := f.receivedAt
+		if _, err := f.pool.Exec(ctx, `UPDATE sandbox_storage_interval SET host_id='source-legacy-host'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.pool.Exec(ctx, `UPDATE host_storage_report SET state='processing',next_measurement_index=0 WHERE report_id=$1`, f.reportID); err != nil {
+			t.Fatal(err)
+		}
+		if err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, receipt, f.measurements, 1, 1); err != nil {
+			t.Fatal(err)
+		}
+		var sourceEnded, destinationStarted time.Time
+		if err := f.pool.QueryRow(ctx, `SELECT ended_at FROM sandbox_storage_interval
+ WHERE sandbox_id=$1 AND host_id='source-legacy-host'`, f.sandboxID).Scan(&sourceEnded); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.pool.QueryRow(ctx, `SELECT started_at FROM sandbox_storage_interval
+ WHERE sandbox_id=$1 AND host_id=$2 AND ended_at IS NULL`, f.sandboxID, f.hostID).Scan(&destinationStarted); err != nil {
+			t.Fatal(err)
+		}
+		if !sourceEnded.Equal(receipt) || !destinationStarted.Equal(receipt) {
+			t.Fatalf("legacy handoff boundaries: source ended=%s destination started=%s receipt=%s", sourceEnded, destinationStarted, receipt)
+		}
+	})
 }
 
 func TestIntegration_RetainedBaselineProvenance(t *testing.T) {
