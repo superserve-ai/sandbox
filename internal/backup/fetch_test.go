@@ -969,3 +969,68 @@ func TestFetchGenerationWritesTheHostBaseInsideThePinnedDestination(t *testing.T
 		t.Fatalf("wrote %v outside the pinned destination", names)
 	}
 }
+
+// A clone abandoned on cancellation finishes after its caller has gone,
+// by when the root it was created through may be closed. Its name must
+// already be free, or the next resolution of the same restore hits the
+// leftover and reports a base it could have had.
+func TestHostBaseRetriesAfterACancelledCloneIsAbandoned(t *testing.T) {
+	var once sync.Once
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	stubClone(t, func(dst, src *os.File) error {
+		held := false
+		once.Do(func() { held = true })
+		if held {
+			entered <- struct{}{}
+			<-release
+		}
+		return copyClone(dst, src)
+	})
+
+	parent := t.TempDir()
+	data := bytes.Repeat([]byte{0x11}, 128<<10)
+	src := filepath.Join(parent, "base.ext4")
+	if err := os.WriteFile(src, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restore := filepath.Join(parent, "restore")
+	if err := os.MkdirAll(restore, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// The first resolution is cancelled while its clone is still running,
+	// and its root goes with it, as RestoredDisk's does.
+	ctx, cancel := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() {
+		root, err := os.OpenRoot(restore)
+		if err != nil {
+			first <- err
+			return
+		}
+		defer root.Close()
+		_, err = hostBase(ctx, root, digestOf(data), src)
+		first <- err
+	}()
+	<-entered
+	cancel()
+	if err := <-first; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first resolution = %v, want the cancellation", err)
+	}
+	close(release)
+
+	// The template never changed, so a retry must still get its base.
+	root := rootOf(t, restore)
+	base, err := hostBase(context.Background(), root, digestOf(data), src)
+	if err != nil || base == "" {
+		t.Fatalf("retry after the abandoned clone = %q (%v), want the base the template still holds", base, err)
+	}
+	held, err := os.ReadFile(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(held, data) {
+		t.Fatal("the base does not hold the bytes the pause recorded")
+	}
+}

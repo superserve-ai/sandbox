@@ -356,15 +356,16 @@ func hostBaseInto(ctx context.Context, root *os.Root, name, src string) error {
 	if err != nil {
 		return err
 	}
-	discard := func() {
-		out.Close()
-		_ = root.Remove(name)
-	}
-	if err := copyOrClone(ctx, out, in, fi.Size(), true, discard); err != nil {
+	// The removal rides the caller's root, which is alive now and may not
+	// be when an abandoned clone finishes; copyOrClone unlinks before it
+	// returns for exactly that reason.
+	unlink := func() { _ = root.Remove(name) }
+	if err := copyOrClone(ctx, out, in, fi.Size(), true, unlink); err != nil {
 		return err
 	}
 	if err := syncWithContext(ctx, out); err != nil {
-		discard()
+		unlink()
+		out.Close()
 		return err
 	}
 	return out.Close()

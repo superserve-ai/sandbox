@@ -604,18 +604,27 @@ func snapshotFile(ctx context.Context, dst, src string, tryClone bool) error {
 
 // copyOrClone fills out with in's contents up to size, reflinking when
 // the caller allows it and the filesystem can, and otherwise copying each
-// data extent. Both are bounded by ctx. The destination is the caller's —
-// a temporary beside its final name, or a file created inside a pinned
-// root — so only the caller knows how to discard it, and discard is what
-// this calls on every failure: once it returns an error the destination is
-// gone or will be, and the caller must not touch it again.
-func copyOrClone(ctx context.Context, out, in *os.File, size int64, tryClone bool, discard func()) error {
+// data extent. Both are bounded by ctx.
+//
+// Only the caller knows how its destination is named — a temporary beside
+// its final name, or a file inside a pinned root — so unlink is what
+// removes that name, and this calls it on every failure BEFORE returning.
+// Synchronously even when an abandoned clone still holds the file open:
+// the name has to be free for a retry at once, and on a handle the caller
+// is about to release. The data goes when the kernel releases the fd,
+// which this closes. Once an error is returned the destination is the
+// caller's no longer.
+func copyOrClone(ctx context.Context, out, in *os.File, size int64, tryClone bool, unlink func()) error {
+	fail := func(err error) error {
+		unlink()
+		out.Close()
+		return err
+	}
 	if tryClone {
 		// FICLONE copies no data but does walk the extent map, so a dense
 		// or fragmented artifact is not free. The ioctl cannot be
 		// cancelled: on a deadline the caller is released and this
-		// goroutine owns the fd until the kernel returns, which is why
-		// discard runs there rather than here.
+		// goroutine owns the fd until the kernel returns.
 		clone := cloneInto
 		done := make(chan error, 1)
 		go func() { done <- clone(out, in) }()
@@ -625,17 +634,17 @@ func copyOrClone(ctx context.Context, out, in *os.File, size int64, tryClone boo
 				return nil
 			}
 		case <-ctx.Done():
+			unlink()
 			go func() {
 				<-done
-				discard()
+				out.Close()
 			}()
 			return ctx.Err()
 		}
 	}
 	extents, _, err := Extents(in)
 	if err != nil {
-		discard()
-		return err
+		return fail(err)
 	}
 	for _, e := range extents {
 		// Reflink is unavailable on this filesystem, so the fallback pays
@@ -645,21 +654,17 @@ func copyOrClone(ctx context.Context, out, in *os.File, size int64, tryClone boo
 		// the RPC path's pause lock past its deadline the way the size
 		// threshold alone cannot.
 		if err := ctx.Err(); err != nil {
-			discard()
-			return err
+			return fail(err)
 		}
 		if _, err := out.Seek(e.Offset, io.SeekStart); err != nil {
-			discard()
-			return err
+			return fail(err)
 		}
 		if _, err := copyExtentContext(ctx, out, io.NewSectionReader(in, e.Offset, e.Length)); err != nil {
-			discard()
-			return err
+			return fail(err)
 		}
 	}
 	if err := out.Truncate(size); err != nil {
-		discard()
-		return err
+		return fail(err)
 	}
 	return nil
 }
