@@ -57,7 +57,7 @@ func VerifyRoutingHint(seed []byte, token, sandboxID string, audiences []string,
 		return hint, false
 	}
 	data, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil || json.Unmarshal(data, &hint) != nil || hint.SandboxID != sandboxID || hint.HostID == "" || hint.Version <= 0 || hint.Expires <= now.Unix() || hint.Expires > now.Add(RoutingHintTTL).Unix() {
+	if err != nil || json.Unmarshal(data, &hint) != nil || hint.SandboxID != sandboxID || hint.HostID == "" || hint.Version <= 0 || hint.Expires <= now.Unix() || hint.Expires > now.Add(RoutingHintTTL+RoutingHintClockSkew).Unix() {
 		return RoutingHint{}, false
 	}
 	for _, audience := range audiences {

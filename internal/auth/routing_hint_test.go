@@ -38,6 +38,36 @@ func TestRoutingHintBindings(t *testing.T) {
 	}
 }
 
+func TestRoutingHintVerificationClockSkew(t *testing.T) {
+	seed := []byte(strings.Repeat("k", 32))
+	observed := time.Now().Truncate(time.Second).Add(30 * time.Second)
+	token := SignRoutingHint(seed, "sandbox", "owner", "sandbox.example.com", observed, 1)
+	if token == "" {
+		t.Fatal("issuance rejected allowed database skew")
+	}
+	for _, tc := range []struct {
+		name  string
+		now   time.Time
+		valid bool
+	}{
+		{"thirty seconds behind database", observed.Add(-30 * time.Second), true},
+		{"maximum skew", observed.Add(-RoutingHintClockSkew), true},
+		{"beyond maximum skew", observed.Add(-RoutingHintClockSkew - time.Second), false},
+		{"before signed expiry", observed.Add(RoutingHintTTL - time.Second), true},
+		{"at signed expiry", observed.Add(RoutingHintTTL), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hint, valid := VerifyRoutingHint(seed, token, "sandbox", []string{"sandbox.example.com"}, tc.now)
+			if valid != tc.valid {
+				t.Fatalf("valid=%v want %v", valid, tc.valid)
+			}
+			if valid && hint.Expires != observed.Add(RoutingHintTTL).Unix() {
+				t.Fatal("verification extended signed expiry")
+			}
+		})
+	}
+}
+
 func BenchmarkSignRoutingHint(b *testing.B) {
 	seed := []byte(strings.Repeat("k", 32))
 	now := time.Now()
