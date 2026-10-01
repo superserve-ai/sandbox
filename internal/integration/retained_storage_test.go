@@ -477,23 +477,6 @@ func TestRetainedStoragePostCutoverActivationUnknown(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, cutover); err != nil {
 		t.Fatal(err)
 	}
-	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: otherID, TeamID: team, VcpuCount: 1, MemoryMib: 1024}); err != nil {
-		t.Fatal(err)
-	}
-	var legacyDisk int
-	if err := testPool.QueryRow(ctx, `SELECT disk_mib FROM sandbox_storage_interval WHERE sandbox_id=$1 AND ended_at IS NULL`, otherID).Scan(&legacyDisk); err != nil {
-		t.Fatal(err)
-	}
-	if legacyDisk != 8 {
-		t.Fatalf("cross-host activation lost its legacy accounting: disk_mib=%d", legacyDisk)
-	}
-	var crossHostObligations int
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_measurement_obligation WHERE owner_id=$1`, otherID).Scan(&crossHostObligations); err != nil {
-		t.Fatal(err)
-	}
-	if crossHostObligations != 0 {
-		t.Fatalf("cross-host activation incorrectly created a retained obligation: %d", crossHostObligations)
-	}
 	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: f.sandboxID, TeamID: team, VcpuCount: 1, MemoryMib: 1024}); err != nil {
 		t.Fatal(err)
 	}
@@ -536,12 +519,52 @@ func TestRetainedStoragePostCutoverActivationUnknown(t *testing.T) {
 	if resolved == nil {
 		t.Fatal("compatible retained receipt did not resolve activation obligation")
 	}
+	var firstReceipt time.Time
+	if err := testPool.QueryRow(ctx, `SELECT received_at FROM host_storage_report WHERE report_id=$1`, validID).Scan(&firstReceipt); err != nil {
+		t.Fatal(err)
+	}
+	if !firstReceipt.After(effective) {
+		t.Fatalf("first compatible receipt %s did not follow activation boundary %s", firstReceipt, effective)
+	}
 	var initialGap float64
-	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, effective.Add(-time.Minute), effective).Scan(&initialGap); err != nil {
+	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, effective, firstReceipt).Scan(&initialGap); err != nil {
 		t.Fatal(err)
 	}
 	if initialGap != 0 {
 		t.Fatalf("initial retained measurement gap was billed: %v MiB-seconds", initialGap)
+	}
+	var postReceiptEnd time.Time
+	if err := testPool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&postReceiptEnd); err != nil {
+		t.Fatal(err)
+	}
+	if !postReceiptEnd.After(firstReceipt) {
+		t.Fatalf("post-receipt endpoint %s did not follow first receipt %s", postReceiptEnd, firstReceipt)
+	}
+	var postReceiptUsage float64
+	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, firstReceipt, postReceiptEnd).Scan(&postReceiptUsage); err != nil {
+		t.Fatal(err)
+	}
+	if postReceiptUsage <= 0 {
+		t.Fatalf("retained storage after first receipt was not billed: %v MiB-seconds", postReceiptUsage)
+	}
+	// Keep the cross-host legacy interval out of the prospective window above;
+	// its valid provisioned quantity is asserted separately after that window.
+	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: otherID, TeamID: team, VcpuCount: 1, MemoryMib: 1024}); err != nil {
+		t.Fatal(err)
+	}
+	var legacyDisk int
+	if err := testPool.QueryRow(ctx, `SELECT disk_mib FROM sandbox_storage_interval WHERE sandbox_id=$1 AND ended_at IS NULL`, otherID).Scan(&legacyDisk); err != nil {
+		t.Fatal(err)
+	}
+	if legacyDisk != 8 {
+		t.Fatalf("cross-host activation lost its legacy accounting: disk_mib=%d", legacyDisk)
+	}
+	var crossHostObligations int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_measurement_obligation WHERE owner_id=$1`, otherID).Scan(&crossHostObligations); err != nil {
+		t.Fatal(err)
+	}
+	if crossHostObligations != 0 {
+		t.Fatalf("cross-host activation incorrectly created a retained obligation: %d", crossHostObligations)
 	}
 	// A later structurally valid but incomplete processor payload is retryable
 	// and keeps its immutable payload. The product decision about any
