@@ -540,6 +540,10 @@ type Manager struct {
 	restoreForResumeHook func(socketPath, snapshotPath, memPath, basePath string, netInfo *network.VMNetInfo) (dirtyTracked bool, trackingSessionID string, err error)
 	// restoreSnapshotHook is the restore path's.
 	restoreSnapshotHook func(socketPath, snapshotPath, memPath string, clockRealtime *bool) error
+	// These hooks are test seams for the retained-dependency lock-order
+	// regression; nil in production.
+	retainedDependencyLockHook   func(string)
+	handleVMErrorManagerLockHook func(string)
 	// pausedNetworkControllerState bounds pause-network reclamation cadence.
 	pausedNetworkControllerMu      sync.Mutex
 	pausedNetworkControllerLastRun time.Time
@@ -6226,6 +6230,9 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 		m.mu.Unlock()
 		// Already cleaned up by another goroutine.
 		return status.Errorf(codes.NotFound, "vm %s is no longer running", vmID)
+	}
+	if hook := m.handleVMErrorManagerLockHook; hook != nil {
+		hook(vmID)
 	}
 	inst.mu.Lock()
 	inst.Status = StatusStopped

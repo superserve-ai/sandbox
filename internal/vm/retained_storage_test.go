@@ -232,6 +232,7 @@ func TestRetainedBaselineProvenance(t *testing.T) {
 	}
 	t.Run("private-owner-changes", testRetainedBaselineGenerationIgnoresPrivateOwnerChanges)
 	t.Run("dependency-persistence-batches-and-fences", testRetainedDependencyPersistenceBatchesAndFences)
+	t.Run("dependency-persistence-lock-order", testRetainedDependencyPersistenceLockOrder)
 }
 
 func testRetainedBaselineGenerationIgnoresPrivateOwnerChanges(t *testing.T) {
@@ -1107,6 +1108,92 @@ func testRetainedDependencyPersistenceBatchesAndFences(t *testing.T) {
 			t.Fatalf("failed batch partially persisted: rec=%+v err=%v", rec, getErr)
 		}
 	})
+}
+
+func testRetainedDependencyPersistenceLockOrder(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	firstID, secondID := uuid.NewString(), uuid.NewString()
+	first := VMRecord{ID: firstID, Status: StatusRunning, Supervision: SupervisionCgroup}
+	second := VMRecord{ID: secondID, Status: StatusRunning, Supervision: SupervisionCgroup}
+	for _, rec := range []VMRecord{first, second} {
+		if err := store.Put(rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstResolved, secondResolved := first, second
+	firstResolved.RootfsPath = "/example/templates/first/rootfs.ext4"
+	secondResolved.RootfsPath = "/example/templates/second/rootfs.ext4"
+	firstInst, secondInst := toInstance(first), toInstance(second)
+
+	// The empty cgroup is the real liveness oracle used by handleVMError; no
+	// test-only cleanup shortcut is involved.
+	cgroups := &cgroupTree{vms: t.TempDir()}
+	if err := os.MkdirAll(cgroups.vmCgroupDir(firstID), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroups.vmCgroupDir(firstID), "cgroup.events"), []byte("populated 0\nfrozen 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{
+		log:     zerolog.Nop(),
+		state:   store,
+		cgroups: cgroups,
+		vms:     map[string]*VMInstance{firstID: firstInst, secondID: secondInst},
+	}
+	firstLocked := make(chan struct{})
+	allowSampler := make(chan struct{})
+	cleanupManagerLocked := make(chan struct{})
+	allowCleanup := make(chan struct{})
+	m.retainedDependencyLockHook = func(id string) {
+		if id != firstID {
+			return
+		}
+		close(firstLocked)
+		<-allowSampler
+	}
+	m.handleVMErrorManagerLockHook = func(id string) {
+		if id != firstID {
+			return
+		}
+		close(cleanupManagerLocked)
+		<-allowCleanup
+	}
+
+	updates := []retainedDependencyUpdate{
+		{original: first, resolved: firstResolved},
+		{original: second, resolved: secondResolved},
+	}
+	persisted := make(chan error, 1)
+	go func() { persisted <- m.persistRetainedDependencies(t.Context(), updates) }()
+	<-firstLocked
+
+	cleaned := make(chan error, 1)
+	go func() { cleaned <- m.handleVMError(firstID, errors.New("connection lost")) }()
+	<-cleanupManagerLocked
+	// cleanup now owns m.mu and waits for firstInst.mu. The sampler must be
+	// able to finish without reacquiring m.mu while it holds firstInst.mu.
+	close(allowSampler)
+	if err := <-persisted; err != nil {
+		t.Fatalf("dependency persistence blocked by cleanup lock order: %v", err)
+	}
+	close(allowCleanup)
+	if err := <-cleaned; err == nil {
+		t.Fatal("handleVMError unexpectedly succeeded for a cleaned-up VM")
+	}
+
+	if _, ok := m.vms[firstID]; ok {
+		t.Fatal("cleanup left the dead owner tracked")
+	}
+	retained, err := store.retainedRecords()
+	if err != nil || len(retained) != 1 || retained[0].ID != firstID {
+		t.Fatalf("cleanup did not preserve the retained record: %+v %v", retained, err)
+	}
 }
 
 func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {

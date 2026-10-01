@@ -455,6 +455,22 @@ func (m *Manager) persistRetainedDependencies(ctx context.Context, updates []ret
 		}
 		end := min(start+retainedDependencyBatchSize, len(updates))
 		batch := updates[start:end]
+		// Capture the tracked pointers as one bounded manager-lock read before
+		// taking any instance mutex. Lifecycle cleanup takes m.mu before the
+		// instance mutex; reacquiring m.mu for the next owner while holding an
+		// earlier instance mutex would invert that order and deadlock cleanup.
+		tracked := make(map[string]*VMInstance, len(batch))
+		m.mu.RLock()
+		for _, update := range batch {
+			if _, seen := tracked[update.original.ID]; seen {
+				continue
+			}
+			tracked[update.original.ID] = m.vms[update.original.ID]
+		}
+		m.mu.RUnlock()
+		// A captured pointer may be removed or replaced before the Bolt write;
+		// updateRetainedDependenciesTx rechecks the durable generation, so the
+		// pointer snapshot never authorizes an anchor for a newer lifecycle.
 		locked := make([]*VMInstance, 0, len(batch))
 		lockedByID := make(map[string]*VMInstance, len(batch))
 		// Lock only tracked instances, in capture order. Lifecycle writers take
@@ -467,9 +483,7 @@ func (m *Manager) persistRetainedDependencies(ctx context.Context, updates []ret
 				}
 				return err
 			}
-			m.mu.RLock()
-			inst := m.vms[update.original.ID]
-			m.mu.RUnlock()
+			inst := tracked[update.original.ID]
 			if inst == nil {
 				continue
 			}
@@ -484,6 +498,9 @@ func (m *Manager) persistRetainedDependencies(ctx context.Context, updates []ret
 			}
 			lockedByID[update.original.ID] = inst
 			locked = append(locked, inst)
+			if hook := m.retainedDependencyLockHook; hook != nil {
+				hook(inst.ID)
+			}
 		}
 		err := m.state.updateRetainedDependenciesBatch(ctx, batch)
 		if err == nil {
