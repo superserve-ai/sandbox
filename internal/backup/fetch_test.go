@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -788,5 +789,58 @@ func TestHostBaseKeepsAPublishedCopyWhenTheEntrySyncIsCancelled(t *testing.T) {
 	}
 	if !bytes.Equal(held, data) {
 		t.Fatal("the published base does not hold the bytes the pause recorded")
+	}
+}
+
+// A manifest is bucket content, so the digest it records for a base must
+// be a digest before it is allowed to name a file: a crafted one would
+// otherwise steer a copy of the host template out of the restore.
+func TestRestoredDiskRefusesABaseDigestThatIsNotADigest(t *testing.T) {
+	stubClone(t, copyClone)
+	parent := t.TempDir()
+	dest := filepath.Join(parent, "restore")
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte{0x11}, 64<<10)
+	template := filepath.Join(parent, "base.ext4")
+	if err := os.WriteFile(template, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, "rootfs.ext4"), []byte("overlay"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	escape := "../escaped"
+	m := GenerationManifest{
+		SandboxID:  "sb-fetch",
+		Generation: "g1",
+		Files: []ManifestFile{{
+			Name: "rootfs.ext4", Object: "rootfs.ext4", SHA256: digestOf([]byte("overlay")),
+			Size: 7, BasePath: template, BaseSHA256: escape,
+		}},
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dest, ManifestObject), raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := RestoredDisk(context.Background(), dest); err == nil {
+		t.Fatal("a base digest that is not a digest was accepted")
+	}
+	if err := RestoredDependencies(dest); err == nil {
+		t.Fatal("the dependency check accepted it")
+	}
+	// Nothing may have been written outside the restore.
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), "escaped") {
+			t.Fatalf("wrote %s outside the restore", e.Name())
+		}
 	}
 }

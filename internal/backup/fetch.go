@@ -77,7 +77,11 @@ func RestoredDependencies(dir string) error {
 				return fmt.Errorf("restored without its block map")
 			}
 		}
-		if _, err := os.Stat(filepath.Join(dir, SharedBaseName(f.BaseSHA256))); err == nil {
+		base, ok := sharedBaseIn(dir, f.BaseSHA256)
+		if !ok {
+			return fmt.Errorf("restored base digest %q is not a sha256", f.BaseSHA256)
+		}
+		if _, err := os.Stat(base); err == nil {
 			return nil
 		}
 		if hostBasePath(m, f.BaseSHA256) == "" {
@@ -119,7 +123,11 @@ func RestoredDisk(ctx context.Context, dir string) (Restored, error) {
 			}
 			r.BlockMap = blockMap
 		}
-		r.Base = filepath.Join(dir, SharedBaseName(f.BaseSHA256))
+		base, ok := sharedBaseIn(dir, f.BaseSHA256)
+		if !ok {
+			return r, fmt.Errorf("restored base digest %q is not a sha256", f.BaseSHA256)
+		}
+		r.Base = base
 		if _, err := os.Stat(r.Base); err == nil {
 			return r, nil
 		}
@@ -127,14 +135,14 @@ func RestoredDisk(ctx context.Context, dir string) (Restored, error) {
 		if src == "" {
 			return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
 		}
-		base, err := hostBase(ctx, dir, f.BaseSHA256, src)
+		resolved, err := hostBase(ctx, dir, f.BaseSHA256, src)
 		if err != nil {
 			return r, fmt.Errorf("restored base %s: %w", f.BaseSHA256, err)
 		}
-		if base == "" {
+		if resolved == "" {
 			return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
 		}
-		r.Base = base
+		r.Base = resolved
 		return r, nil
 	}
 	return r, fmt.Errorf("restore marker lists no rootfs")
@@ -258,7 +266,10 @@ func hostBasePath(m *GenerationManifest, sha string) string {
 // free for the fetch that follows. Only a check that could not run at all
 // is an error.
 func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
-	dst := filepath.Join(dir, SharedBaseName(sha))
+	dst, ok := sharedBaseIn(dir, sha)
+	if !ok {
+		return "", fmt.Errorf("base digest %q is not a sha256", sha)
+	}
 	// One materialization per destination, verification and publication
 	// included: two resolutions of the same restore would otherwise each
 	// hash the copy and then race to rename it, and the loser's failure
@@ -274,7 +285,7 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 		// name only once it matches: published first, a crash in between
 		// would leave an unverified copy that the next resolution here
 		// trusts on sight.
-		staging := filepath.Join(dir, "."+SharedBaseName(sha)+".unverified")
+		staging := dst + ".unverified"
 		if err := snapshotFileMode(ctx, staging, src, stageAuto); err != nil {
 			if ctx.Err() != nil {
 				return "", ctx.Err()
@@ -300,6 +311,10 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 		// materializes again. Reporting a failure instead would send the
 		// caller to fetch the object into a name this copy already holds.
 		if err := publishSync(ctx, dir); err != nil && ctx.Err() == nil {
+			// Either a published base or none at all: left behind, this
+			// copy would collide with the fetch the caller must now make,
+			// and no cleanup owns a name this call never reported.
+			_ = os.Remove(dst)
 			return "", fmt.Errorf("publish verified base copy: %w", err)
 		}
 		return dst, nil
@@ -308,6 +323,17 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 		return "", err
 	}
 	return v.(string), nil
+}
+
+// sharedBaseIn names a shared base inside a restore. The digest comes
+// from a manifest, which is bucket content, so it must be exactly a
+// lowercase hex sha256 before it becomes a path component: anything else
+// would let a crafted entry steer this copy out of the restore.
+func sharedBaseIn(dir, sha string) (string, bool) {
+	if !isHexDigest(sha) {
+		return "", false
+	}
+	return filepath.Join(dir, SharedBaseName(sha)), true
 }
 
 // publishSync makes a published base's directory entry durable.
