@@ -419,15 +419,31 @@ if __name__ == "__main__":
         try:
             result = subprocess.run(argv, text=True, capture_output=True,
                                     timeout=timeout, cwd=cwd, check=False)
-        except subprocess.TimeoutExpired:
-            self.fail(f"fixture preparation timed out after {timeout}s: {' '.join(argv)}")
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+            stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+            detail = "\n".join(("stdout:\n" + stdout[-4000:], "stderr:\n" + stderr[-4000:])).strip()
+            self.fail(f"fixture preparation timed out after {timeout}s: {' '.join(argv)}\n{detail}")
         if result.returncode:
-            detail = (result.stderr or result.stdout).strip()[-4000:]
+            # Keep both streams useful when a bounded probe emits a large
+            # package manifest.  Discovery diagnostics are emitted last by
+            # the probe, so the tail retains the actionable missing paths.
+            def head_tail(value, limit=4000):
+                value = value or ""
+                if len(value) <= limit:
+                    return value
+                half = (limit - 80) // 2
+                return value[:half] + "\n... <bounded output omitted> ...\n" + value[-half:]
+
+            detail = "\n".join((
+                "stdout:\n" + head_tail(result.stdout),
+                "stderr:\n" + head_tail(result.stderr),
+            )).strip()
             self.fail(f"fixture preparation failed ({result.returncode}): {' '.join(argv)}\n{detail}")
         return result.stdout.strip()
 
-    def _valid_cached_fixture(self, metadata_path):
-        """Return immutable package/image metadata only when its provenance is complete."""
+    def _valid_cached_image(self, metadata_path):
+        """Return package-image provenance, even when binary discovery is incomplete."""
         try:
             metadata = json.loads(metadata_path.read_text())
         except (OSError, ValueError):
@@ -444,12 +460,24 @@ if __name__ == "__main__":
             return None
         if str(metadata.get("package_version", "")).split("~", 1)[0] != self.selected_release:
             return None
-        for key in ("package_sha256", "generator_sha256", "fluent_bit_sha256",
-                    "repository_setup_sha256", "authenticated_packages_metadata_sha256"):
+        for key in ("package_sha256", "repository_setup_sha256",
+                    "authenticated_packages_metadata_sha256"):
             if not re.fullmatch(r"[0-9a-f]{64}", str(metadata.get(key, ""))):
                 return None
         if not re.search(r"@sha256:[0-9a-f]{64}$", str(metadata.get("image", ""))):
             return None
+        if not metadata.get("runtime_image"):
+            return None
+        return metadata
+
+    def _valid_cached_fixture(self, metadata_path):
+        """Return immutable package/image metadata only when its provenance is complete."""
+        metadata = self._valid_cached_image(metadata_path)
+        if metadata is None:
+            return None
+        for key in ("generator_sha256", "fluent_bit_sha256"):
+            if not re.fullmatch(r"[0-9a-f]{64}", str(metadata.get(key, ""))):
+                return None
         if (not metadata.get("runtime_image") or not metadata.get("engine_path") or
                 not str(metadata.get("fluent_bit_path", "")).endswith("fluent-bit") or
                 not str(metadata.get("journal_remote_path", "")).endswith("systemd-journal-remote")):
@@ -481,12 +509,19 @@ if __name__ == "__main__":
             # volatile apt indexes and fixture source are never cache identity.
             image_meta = None
             metadata = None
+            discovered = False
             candidates = [cache / "image.json"] + sorted(cache.glob("*/image.json"))
             for candidate in candidates:
                 cached = self._valid_cached_fixture(candidate)
                 if cached is not None:
-                    image_meta, metadata = candidate, cached
+                    image_meta, metadata, discovered = candidate, cached, True
                     break
+                cached = self._valid_cached_image(candidate)
+                if cached is not None and image_meta is None:
+                    # A prior discovery failure leaves only immutable package
+                    # evidence.  Reuse that image and retry discovery without
+                    # treating the failed evidence as a passing manifest.
+                    image_meta, metadata = candidate, cached
             if image_meta is None:
                 build = Path(tempfile.mkdtemp(prefix="build-", dir=cache))
                 try:
@@ -522,7 +557,7 @@ printf '%s %s %s\n' "$version" "$setup_sha" "$metadata"
                         ARG OPS_VERSION
                         ARG SETUP_SHA
                         ENV DEBIAN_FRONTEND=noninteractive
-                        RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg python3 systemd logrotate bash && \\
+                        RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg python3 systemd systemd-journal-remote logrotate bash && \\
                             curl -fsSL https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh -o /tmp/add-repo.sh && \\
                             echo "$SETUP_SHA  /tmp/add-repo.sh" | sha256sum -c - && bash /tmp/add-repo.sh && apt-get update && \\
                             apt-get download google-cloud-ops-agent="$OPS_VERSION" && \\
@@ -539,85 +574,189 @@ printf '%s %s %s\n' "$version" "$setup_sha" "$metadata"
                     image_id = self._run_bounded([docker, "image", "inspect", tag,
                                                   "--format", "{{.Id}}"])
                     image = f"{tag}@sha256:{image_id.removeprefix('sha256:')}"
-                    inspect_script = r'''set -eu
-manifest=$(dpkg-query -L google-cloud-ops-agent 2>/dev/null || true)
-unit_manifest=$(for unit in /lib/systemd/system/google-cloud-ops-agent*.service /usr/lib/systemd/system/google-cloud-ops-agent*.service; do
-  [ -f "$unit" ] && cat "$unit"
-done)
-find_from_manifest() {
-  name="$1"
-  printf '%s\n' "$manifest" | awk -v n="$name" '$0 ~ ("/" n "$") {print; exit}'
-}
-engine=$(find_from_manifest google_cloud_ops_agent_engine)
-if [ -z "$engine" ]; then
-  engine=$(printf '%s\n' "$unit_manifest" | sed -n 's/.*ExecStart=\([^ ]*google[^ ]*engine\).*/\1/p' | head -n1)
-fi
-fluent=$(find_from_manifest fluent-bit)
-if [ -z "$fluent" ]; then
-  fluent=$(printf '%s\n' "$unit_manifest" | sed -n 's/.*ExecStart=\([^ ]*fluent[^ ]*\).*/\1/p' | head -n1)
-fi
-remote=$(for package in systemd-journal-remote systemd; do
-  dpkg-query -L "$package" 2>/dev/null || true
-done | awk '/\/systemd-journal-remote$/ {print; exit}')
-remote=${remote:-$(command -v systemd-journal-remote || true)}
-missing=0
-for required in engine fluent remote; do
-  path=$(eval "printf '%s' \"\${$required}\"")
-  if [ -z "$path" ] || [ ! -x "$path" ]; then
-    echo "missing executable: $required=$path" >&2
-    echo "Ops Agent package manifest:" >&2
-    printf '%s\n' "$manifest" >&2
-    echo "service-unit ExecStart entries:" >&2
-    printf '%s\n' "$unit_manifest" >&2
-    missing=1
-  fi
-done
-test "$missing" -eq 0
-printf '%s\n' "$engine" "$fluent" "$remote"
-installed_version=$(dpkg-query -W -f='${Version}\n' google-cloud-ops-agent)
-test -n "$installed_version"
-case "$installed_version" in
-  2.71.0*) ;;
-  *) echo "unexpected installed Ops Agent version: $installed_version" >&2; exit 1 ;;
-esac
-printf 'version=%s\n' "$installed_version"
-sha256sum /opt/fixture-metadata/google-cloud-ops-agent_*.deb "$engine" "$fluent"
-cat /opt/fixture-metadata/apt-metadata.sha256
-'''
-                    inspected = self._run_bounded(
-                        [docker, "run", "--rm", "--platform", "linux/amd64", tag,
-                         "/bin/bash", "-ceu", inspect_script], timeout=60)
-                    lines = inspected.splitlines()
-                    engine_path, fluent_path, remote_path = lines[:3]
-                    package_version = next(line.split("=", 1)[1] for line in lines if line.startswith("version="))
-                    hashes = [line.split()[0] for line in lines if re.match(r"^[0-9a-f]{64}  ", line)]
-                    package_sha, generator_sha, fluent_sha = hashes[:3]
-                    metadata_sha = lines[-1].strip()
                     key = hashlib.sha256(
                         f"{self.selected_release}|ubuntu-24.04|amd64|{base_digest}".encode()
                     ).hexdigest()[:32]
                     image_meta = cache / key / "image.json"
                     image_meta.parent.mkdir(mode=0o700, exist_ok=True)
+                    package_probe = r'''set -eu
+package_file=$(find /opt/fixture-metadata -maxdepth 1 -type f -name '*.deb' -print -quit)
+test -n "$package_file" && test -f "$package_file"
+installed_version=$(dpkg-query -W -f='${Version}\n' google-cloud-ops-agent)
+case "$installed_version" in
+  2.71.0*) ;;
+  *) echo "unexpected installed Ops Agent version: $installed_version" >&2; exit 1 ;;
+esac
+package_sha=$(sha256sum "$package_file" | awk '{print $1}')
+test -s /opt/fixture-metadata/package.sha256
+test "$package_sha" = "$(awk '{print $1}' /opt/fixture-metadata/package.sha256)"
+metadata_sha=$(cat /opt/fixture-metadata/apt-metadata.sha256)
+printf 'package_version=%s\npackage_sha=%s\nmetadata_sha=%s\n' "$installed_version" "$package_sha" "$metadata_sha"
+'''
+                    package_probe_out = self._run_bounded(
+                        [docker, "run", "--rm", "--platform", "linux/amd64", tag,
+                         "/bin/bash", "-ceu", package_probe], timeout=60)
+                    package_lines = dict(
+                        line.split("=", 1) for line in package_probe_out.splitlines() if "=" in line
+                    )
+                    package_version = package_lines["package_version"]
+                    package_sha = package_lines["package_sha"]
+                    metadata_sha = package_lines["metadata_sha"]
                     metadata = {
                         "image": image, "runtime_image": tag, "release": self.selected_release,
                         "source_revision": self.selected_release_commit, "package_version": package_version,
-                        "package_sha256": package_sha, "generator_sha256": generator_sha,
-                        "fluent_bit_sha256": fluent_sha,
+                        "package_sha256": package_sha,
                         "base_image_digest": base_digest, "architecture": "amd64",
                         "distribution": "ubuntu-24.04",
                         "repository_setup_url": "https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh",
                         "repository_setup_sha256": setup_sha,
                         "authenticated_packages_metadata_sha256": metadata_sha,
                         "fixture_adaptations": ["bounded journal-export records are materialized with systemd-journal-remote and read by Fluent Bit's systemd input"],
-                        "engine_path": engine_path, "fluent_bit_path": fluent_path,
-                        "journal_remote_path": remote_path,
-                        "runner_script": "/usr/local/bin/host-logging-fixture-runner",
                     }
+                    # Persist only immutable, package-validated evidence.  A
+                    # later discovery failure must not produce a usable
+                    # manifest, but it can reuse this image on retry.
                     image_meta.write_text(json.dumps(metadata, sort_keys=True, indent=2))
                 finally:
                     shutil.rmtree(build, ignore_errors=True)
             if metadata is None:
                 metadata = json.loads(image_meta.read_text())
+            if not discovered:
+                # Discover from both package manifests and actual service
+                # command lines.  Manifest directories can precede executable
+                # children, so every candidate must be a regular executable.
+                inspect_script = r'''set -eu
+manifest=$(dpkg-query -L google-cloud-ops-agent 2>/dev/null || true)
+unit_manifest=$(for unit in /lib/systemd/system/google-cloud-ops-agent*.service /usr/lib/systemd/system/google-cloud-ops-agent*.service; do
+  [ -f "$unit" ] && cat "$unit"
+done)
+service_paths() {
+  printf '%s\n' "$unit_manifest" | awk '
+    /ExecStart(Pre)?=/ {
+      line=$0
+      sub(/^[^=]*=/, "", line)
+      count=split(line, argv, /[[:space:]]+/)
+      for (i = 1; i <= count; i++) {
+        gsub(/^[-+@!]+/, "", argv[i])
+        if (argv[i] ~ /^\//) print argv[i]
+      }
+    }'
+}
+candidate_paths() {
+  required="$1"
+  case "$required" in
+    engine) pattern='*/google_cloud_ops_agent_engine'; sources="$(service_paths; printf '%s\n' "$manifest")" ;;
+    fluent) pattern='*/fluent-bit'; sources="$(service_paths; printf '%s\n' "$manifest")" ;;
+    remote) pattern='*/systemd-journal-remote'; sources="$(service_paths; for package in systemd-journal-remote systemd; do dpkg-query -L "$package" 2>/dev/null || true; done; command -v systemd-journal-remote || true)" ;;
+  esac
+  printf '%s\n' "$sources" | while IFS= read -r candidate; do
+    case "$candidate" in
+      $pattern) printf '%s\n' "$candidate" ;;
+    esac
+  done | awk 'NF && !seen[$0]++'
+}
+is_executable_file() {
+  [ -n "$1" ] && [ -f "$1" ] && [ -x "$1" ]
+}
+resolve_candidate() {
+  candidates=$(candidate_paths "$1")
+  while IFS= read -r candidate; do
+    if is_executable_file "$candidate"; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done <<EOF
+$candidates
+EOF
+  return 0
+}
+candidate_mode() {
+  if [ -n "$1" ]; then
+    stat -c '%A %a' -- "$1" 2>/dev/null || printf '<missing>'
+  else
+    printf '<none>'
+  fi
+}
+candidate_owner() {
+  if [ -n "$1" ]; then
+    owner=$(dpkg-query -S -- "$1" 2>/dev/null | head -n1 || true)
+    printf '%s\n' "${owner:-<unknown>}"
+  else
+    printf '<unknown>'
+  fi
+}
+describe_candidates() {
+  required="$1"
+  candidates=$(candidate_paths "$required")
+  if [ -z "$candidates" ]; then
+    printf 'candidate required=%s path=<none> mode=<none> owner=<unknown>\n' "$required"
+    return 0
+  fi
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    printf 'candidate required=%s path=%s mode=%s owner=%s\n' "$required" "$candidate" \
+      "$(candidate_mode "$candidate")" "$(candidate_owner "$candidate")"
+  done <<EOF
+$candidates
+EOF
+}
+engine=$(resolve_candidate engine)
+fluent=$(resolve_candidate fluent)
+remote=$(resolve_candidate remote)
+missing=0
+is_executable_file "$engine" || missing=1
+is_executable_file "$fluent" || missing=1
+is_executable_file "$remote" || missing=1
+if [ "$missing" -ne 0 ]; then
+  echo "Ops Agent package manifest:" >&2
+  printf '%s\n' "$manifest" >&2
+  echo "service-unit ExecStart entries:" >&2
+  printf '%s\n' "$unit_manifest" >&2
+  echo "missing executable diagnostics:" >&2
+  describe_candidates engine >&2
+  describe_candidates fluent >&2
+  describe_candidates remote >&2
+  printf 'missing executable: engine path=%s mode=%s owner=%s\n' "$engine" \
+    "$(candidate_mode "$engine")" "$(candidate_owner "$engine")" >&2
+  printf 'missing executable: fluent path=%s mode=%s owner=%s\n' "$fluent" \
+    "$(candidate_mode "$fluent")" "$(candidate_owner "$fluent")" >&2
+  printf 'missing executable: remote path=%s mode=%s owner=%s\n' "$remote" \
+    "$(candidate_mode "$remote")" "$(candidate_owner "$remote")" >&2
+  exit 1
+fi
+package_file=$(find /opt/fixture-metadata -maxdepth 1 -type f -name '*.deb' -print -quit)
+package_sha=$(sha256sum "$package_file" | awk '{print $1}')
+test "$package_sha" = "$EXPECTED_PACKAGE_SHA256"
+installed_version=$(dpkg-query -W -f='${Version}\n' google-cloud-ops-agent)
+case "$installed_version" in
+  2.71.0*) ;;
+  *) echo "unexpected installed Ops Agent version: $installed_version" >&2; exit 1 ;;
+esac
+printf '%s\n' "$engine" "$fluent" "$remote"
+printf 'version=%s\n' "$installed_version"
+printf 'package_sha=%s\n' "$package_sha"
+sha256sum "$engine" "$fluent"
+'''
+                inspected = self._run_bounded(
+                    [docker, "run", "--rm", "--platform", "linux/amd64",
+                     "-e", f"EXPECTED_PACKAGE_SHA256={metadata['package_sha256']}",
+                     metadata["runtime_image"], "/bin/bash", "-ceu", inspect_script], timeout=60)
+                lines = inspected.splitlines()
+                engine_path, fluent_path, remote_path = lines[:3]
+                package_version = next(line.split("=", 1)[1] for line in lines if line.startswith("version="))
+                package_sha = next(line.split("=", 1)[1] for line in lines if line.startswith("package_sha="))
+                hashes = [line.split()[0] for line in lines if re.match(r"^[0-9a-f]{64}  ", line)]
+                generator_sha, fluent_sha = hashes[-2:]
+                metadata.update({
+                    "package_version": package_version,
+                    "package_sha256": package_sha,
+                    "generator_sha256": generator_sha,
+                    "fluent_bit_sha256": fluent_sha,
+                    "engine_path": engine_path,
+                    "fluent_bit_path": fluent_path,
+                    "journal_remote_path": remote_path,
+                })
+                image_meta.write_text(json.dumps(metadata, sort_keys=True, indent=2))
             run_dir = cache / "runs" / uuid.uuid4().hex
             run_dir.mkdir(mode=0o700, parents=True)
             runner = run_dir / "fixture-runner.py"
@@ -929,6 +1068,44 @@ cat /opt/fixture-metadata/apt-metadata.sha256
         self.assertIn("storage_scan_result", self.validate)
         self.assertIn("ops_agent_self_log_files", self.config)
         self.assertIn("ops_agent_self_logs", self.config)
+
+    def test_fixture_discovery_directory_before_file(self):
+        # Keep this deterministic and Docker-free: the assertion is against
+        # the exact embedded discovery probe used by the selected-agent tests.
+        source = Path(__file__).read_text()
+        self.assertIn("candidate_paths()", source)
+        self.assertIn("pattern='*/fluent-bit'", source)
+        self.assertIn("[ -f \"$1\" ] && [ -x \"$1\" ]", source)
+
+    def test_fixture_discovery_missing_executable_diagnostics(self):
+        # The probe prints full manifests before concise path/mode/owner rows;
+        # this ordering keeps the actionable rows in bounded failure tails.
+        source = Path(__file__).read_text()
+        self.assertIn("owner=$(dpkg-query -S -- \"$1\"", source)
+        self.assertNotIn("eval \"printf", source)
+        self.assertLess(source.index("Ops Agent package manifest:"),
+                        source.index("missing executable diagnostics:"))
+        self.assertIn("missing executable: fluent path=%s mode=%s owner=%s", source)
+
+    def test_fixture_discovery_reuses_only_immutable_image_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metadata_path = Path(directory) / "image.json"
+            immutable = {
+                "release": self.selected_release,
+                "source_revision": self.selected_release_commit,
+                "distribution": "ubuntu-24.04",
+                "architecture": "amd64",
+                "base_image_digest": "sha256:" + "a" * 64,
+                "package_version": self.selected_release,
+                "package_sha256": "b" * 64,
+                "repository_setup_sha256": "c" * 64,
+                "authenticated_packages_metadata_sha256": "d" * 64,
+                "image": "fixture@sha256:" + "e" * 64,
+                "runtime_image": "fixture:cached",
+            }
+            metadata_path.write_text(json.dumps(immutable))
+            self.assertIsNotNone(self._valid_cached_image(metadata_path))
+            self.assertIsNone(self._valid_cached_fixture(metadata_path))
 
     def test_storage_scans_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
