@@ -260,19 +260,24 @@ func TestPromotionSignupAssertionRegionAndBodyConsistency(t *testing.T) {
 	user, attempt := uuid.New(), uuid.New()
 	now := time.Now()
 	for _, tc := range []struct {
-		name, signedRegion, bodyRegion string
-		bodyAttempt                    uuid.UUID
-		status                         int
+		name, signedRegion, bodyRegion, envRegion string
+		bodyAttempt                               uuid.UUID
+		status                                    int
 	}{
 		{
-			name: "valid East tuple", signedRegion: "use", bodyRegion: "use",
+			name: "valid East tuple", signedRegion: "use", bodyRegion: "use", envRegion: "use",
 			bodyAttempt: attempt, status: http.StatusServiceUnavailable,
 		},
-		{"wrong signed region", "usw", "use", attempt, http.StatusForbidden},
-		{"wrong body region", "use", "usw", attempt, http.StatusForbidden},
-		{"signed and body attempt mismatch", "use", "use", uuid.New(), http.StatusForbidden},
+		{
+			name: "valid legacy East tuple", signedRegion: "use", bodyRegion: "use", envRegion: "",
+			bodyAttempt: attempt, status: http.StatusServiceUnavailable,
+		},
+		{"wrong signed region", "usw", "use", "use", attempt, http.StatusForbidden},
+		{"wrong body region", "use", "usw", "use", attempt, http.StatusForbidden},
+		{"signed and body attempt mismatch", "use", "use", "use", uuid.New(), http.StatusForbidden},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SANDBOX_ID_REGION", tc.envRegion)
 			claims := promotionAccountClaims{
 				RegisteredClaims: jwt.RegisteredClaims{
 					Issuer: "promotion-auth-adapter", Audience: jwt.ClaimStrings{"promotion-account"},

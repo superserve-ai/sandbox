@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -19,6 +20,22 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/api"
 )
+
+// promotionResponseLossWriter accepts the committed status but drops the
+// response body, modelling a client disconnect after the regional transaction
+// has committed and before the caller receives its outcome.
+type promotionResponseLossWriter struct {
+	header http.Header
+	status int
+}
+
+func (w *promotionResponseLossWriter) Header() http.Header { return w.header }
+
+func (w *promotionResponseLossWriter) WriteHeader(status int) { w.status = status }
+
+func (w *promotionResponseLossWriter) Write([]byte) (int, error) {
+	return 0, errors.New("simulated response loss")
+}
 
 func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 	auth := promotionIsolatedDatabase(t, false)
@@ -131,9 +148,8 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 	signupBody := func(user, attempt uuid.UUID) string {
 		return marshal(map[string]any{"user_id": user, "attempt_id": attempt, "home_region": "use"})
 	}
-	// signupCall deliberately does not assert so concurrent callers can be
-	// joined before checking their committed outcomes.
-	signupCallRegion := func(router http.Handler, body string, user, signedAttempt uuid.UUID, signedRegion string) *httptest.ResponseRecorder {
+	signupRequest := func(body string, user, signedAttempt uuid.UUID, signedRegion string) *http.Request {
+		t.Helper()
 		req := httptest.NewRequest(http.MethodPost, "/internal/promotion/account/register-signup", strings.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer account-example-token")
@@ -148,8 +164,16 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 			t.Fatalf("sign register-signup assertion: %v", err)
 		}
 		req.Header.Set("X-Promotion-Account-Assertion", assertion)
+		return req
+	}
+	// signupCall deliberately does not assert so concurrent callers can be
+	// joined before checking their committed outcomes.
+	signupServe := func(router http.Handler, body string, user, signedAttempt uuid.UUID, signedRegion string, writer http.ResponseWriter) {
+		router.ServeHTTP(writer, signupRequest(body, user, signedAttempt, signedRegion))
+	}
+	signupCallRegion := func(router http.Handler, body string, user, signedAttempt uuid.UUID, signedRegion string) *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
+		signupServe(router, body, user, signedAttempt, signedRegion, w)
 		return w
 	}
 	signupCall := func(router http.Handler, body string, user, attempt uuid.UUID) *httptest.ResponseRecorder {
@@ -247,7 +271,7 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 		}
 
 		request(t, eastRouter, "register-signup", signupBody(owner, ownerProof.attempt), owner, ownerProof.attempt, http.StatusOK, "owner")
-		// A response-loss retry is the same trusted tuple and remains idempotent.
+		// An exact replay remains idempotent after the regional commit.
 		request(t, eastRouter, "register-signup", signupBody(owner, ownerProof.attempt), owner, ownerProof.attempt, http.StatusOK, "owner")
 
 		// Signed and body attempts may agree with each other but not with the
@@ -266,10 +290,28 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 		missingAttempt := uuid.New()
 		request(t, eastRouter, "register-signup", signupBody(missing, missingAttempt), missing, missingAttempt, http.StatusNotFound, "evidence_missing")
 
-		// A regional authority outage is retryable only with the original tuple;
-		// once the East pool is restored the exact request commits successfully.
-		request(t, newRouter(proxy, nil), "register-signup", signupBody(conflict, conflictProof.attempt), conflict, conflictProof.attempt, http.StatusServiceUnavailable, "authority_unavailable")
-		request(t, eastRouter, "register-signup", signupBody(conflict, conflictProof.attempt), conflict, conflictProof.attempt, http.StatusOK, "owner_conflict")
+		// A newly bound account can retry the exact tuple after a regional
+		// authority outage; the first successful attempt still becomes owner.
+		retryUser := uuid.New()
+		retryProof := promotionVerifiedSignup(t, auth, retryUser, "Signup-Retry-"+uuid.NewString())
+		request(t, newRouter(proxy, nil), "register-signup", signupBody(retryUser, retryProof.attempt), retryUser, retryProof.attempt, http.StatusServiceUnavailable, "authority_unavailable")
+		request(t, eastRouter, "register-signup", signupBody(retryUser, retryProof.attempt), retryUser, retryProof.attempt, http.StatusOK, "owner")
+
+		// The regional commit can succeed even when the client loses the
+		// response. Retrying the same trusted tuple must discover that commit.
+		lossUser := uuid.New()
+		lossFingerprint := "Signup-Response-Loss-" + uuid.NewString()
+		lossProof := promotionVerifiedSignup(t, auth, lossUser, lossFingerprint)
+		lost := &promotionResponseLossWriter{header: make(http.Header)}
+		signupServe(eastRouter, signupBody(lossUser, lossProof.attempt), lossUser, lossProof.attempt, "use", lost)
+		if lost.status != http.StatusOK {
+			t.Fatalf("response-loss simulation status=%d, want %d", lost.status, http.StatusOK)
+		}
+		var committedOwner uuid.UUID
+		if err := east.QueryRow(t.Context(), `SELECT user_id FROM promotion_device_owner WHERE fingerprint=$1`, lossFingerprint).Scan(&committedOwner); err != nil || committedOwner != lossUser {
+			t.Fatalf("response-loss simulation did not commit owner: owner=%v err=%v", committedOwner, err)
+		}
+		request(t, eastRouter, "register-signup", signupBody(lossUser, lossProof.attempt), lossUser, lossProof.attempt, http.StatusOK, "owner")
 
 		// A valid assertion is still rejected by a West cell, before any West
 		// ownership row can be created.
@@ -304,8 +346,80 @@ func TestIntegration_PromotionEvidenceHandlers(t *testing.T) {
 		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM team_credit_grant`).Scan(&afterCreditGrants); err != nil {
 			t.Fatal(err)
 		}
-		if afterEvidence != beforeEvidence+2 || afterOwners != beforeOwners+1 || afterEntitlements != beforeEntitlements || afterGrants != beforeGrants || afterCreditGrants != beforeCreditGrants {
+		if afterEvidence != beforeEvidence+4 || afterOwners != beforeOwners+3 || afterEntitlements != beforeEntitlements || afterGrants != beforeGrants || afterCreditGrants != beforeCreditGrants {
 			t.Fatalf("register-signup changed unexpected regional state: evidence %d->%d owners %d->%d entitlements %d->%d grants %d->%d credit_grants %d->%d", beforeEvidence, afterEvidence, beforeOwners, afterOwners, beforeEntitlements, afterEntitlements, beforeGrants, afterGrants, beforeCreditGrants, afterCreditGrants)
+		}
+	})
+
+	t.Run("register-signup serializes concurrent competing owners", func(t *testing.T) {
+		fingerprint := "Concurrent-Competing-" + uuid.NewString()
+		users := []uuid.UUID{uuid.New(), uuid.New()}
+		proofs := []originalSignupEvidence{
+			promotionVerifiedSignup(t, auth, users[0], fingerprint),
+			promotionVerifiedSignup(t, auth, users[1], fingerprint),
+		}
+		responses := make([]*httptest.ResponseRecorder, len(users))
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range users {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				responses[i] = signupCall(eastRouter, signupBody(users[i], proofs[i].attempt), users[i], proofs[i].attempt)
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		outcomes := map[string]int{}
+		for i, response := range responses {
+			if response.Code != http.StatusOK {
+				t.Fatalf("concurrent competing request %d: status=%d body=%s", i, response.Code, response.Body.String())
+			}
+			var payload struct {
+				Outcome string `json:"outcome"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("concurrent competing request %d: decode: %v", i, err)
+			}
+			outcomes[payload.Outcome]++
+		}
+		if outcomes["owner"] != 1 || outcomes["owner_conflict"] != 1 {
+			t.Fatalf("concurrent competing outcomes=%v, want one owner and one owner_conflict", outcomes)
+		}
+		var owner uuid.UUID
+		if err := east.QueryRow(t.Context(), `SELECT user_id FROM promotion_device_owner WHERE fingerprint=$1`, fingerprint).Scan(&owner); err != nil {
+			t.Fatal(err)
+		}
+		if owner != users[0] && owner != users[1] {
+			t.Fatalf("concurrent competing owner=%v is not one of claimants %v", owner, users)
+		}
+		loser := users[0]
+		if loser == owner {
+			loser = users[1]
+		}
+		loserIndex := 0
+		if users[1] == loser {
+			loserIndex = 1
+		}
+		request(t, eastRouter, "register-signup", signupBody(loser, proofs[loserIndex].attempt), loser, proofs[loserIndex].attempt, http.StatusOK, "owner_conflict")
+		var ownerAfterReplay uuid.UUID
+		if err := east.QueryRow(t.Context(), `SELECT user_id FROM promotion_device_owner WHERE fingerprint=$1`, fingerprint).Scan(&ownerAfterReplay); err != nil {
+			t.Fatal(err)
+		}
+		if ownerAfterReplay != owner {
+			t.Fatalf("loser replay replaced immutable owner: before=%v after=%v", owner, ownerAfterReplay)
+		}
+		var ownerRows, evidenceRows int
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM promotion_device_owner WHERE fingerprint=$1`, fingerprint).Scan(&ownerRows); err != nil {
+			t.Fatal(err)
+		}
+		if err := east.QueryRow(t.Context(), `SELECT count(*) FROM promotion_signup_device_evidence WHERE fingerprint=$1`, fingerprint).Scan(&evidenceRows); err != nil {
+			t.Fatal(err)
+		}
+		if ownerRows != 1 || evidenceRows != len(users) {
+			t.Fatalf("concurrent competing rows: owners=%d evidence=%d, want 1 and %d", ownerRows, evidenceRows, len(users))
 		}
 	})
 
