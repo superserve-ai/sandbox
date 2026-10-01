@@ -973,7 +973,7 @@ func TestRetainedStorageBaselineProvenance(t *testing.T) {
 		body, err := json.Marshal(map[string]any{
 			"incarnation_id": f.incarnation,
 			"report_id":      id,
-			"measurements": []any{{"sandbox_id": "", "allocated_bytes": 0,
+			"measurements": []any{map[string]any{"sandbox_id": "", "allocated_bytes": 0,
 				"retained": retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{o}}}},
 		})
 		if err != nil {
