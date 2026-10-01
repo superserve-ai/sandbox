@@ -423,8 +423,13 @@ func runMigrate(args []string) int {
 		// cannot be resolved leaves the row where it is.
 		rd, err := restoredDisk(ctx, *root, id)
 		if err != nil {
+			// Retryable, not a boot failure: nothing has been claimed yet,
+			// and a template mid-rebuild or a transient read error is
+			// exactly what a later run may not see again. Recorded as a
+			// failure it would enter the skip file and be excluded from
+			// every run after this one, repaired or not.
 			mu.Lock()
-			recordFailure(id, err.Error())
+			recordRetry(id, err.Error())
 			mu.Unlock()
 			return
 		}
