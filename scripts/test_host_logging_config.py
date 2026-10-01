@@ -1,3 +1,8 @@
+import re
+import subprocess
+import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -10,6 +15,78 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.config = (ROOT / "infra/modules/host-logging/templates/ops-agent.yaml.tftpl").read_text()
         self.reconcile = (ROOT / "infra/modules/host-logging/templates/reconcile.sh.tftpl").read_text()
         self.validate = (ROOT / "infra/modules/host-logging/templates/validate.sh.tftpl").read_text()
+
+    def _run_embedded_scan(self, template, kind, root, limit=100, failure=None, occurrence=0):
+        """Run the exact Python traversal embedded in a rendered script.
+
+        Keeping the source extraction tied to the template prevents this test
+        from quietly becoming an independent storage-accounting model.
+        """
+        matches = list(re.finditer(
+            r'python3 - "\$kind" "\$root" "\$max_entries"(?:\s+>\s*"?\$listing"?)?\s+<<\'PY\'\n(.*?)\nPY',
+            template,
+            re.DOTALL,
+        ))
+        self.assertTrue(matches, "storage scanner heredoc missing")
+        self.assertLess(occurrence, len(matches), "storage scanner occurrence missing")
+        scanner = matches[occurrence].group(1)
+        wrapper = textwrap.dedent(
+            """
+            import os
+            import sys
+
+            failure = sys.argv.pop(1)
+            original_scandir = os.scandir
+
+            class Entry:
+                def __init__(self, entry):
+                    self._entry = entry
+                    self.name = entry.name
+                    self.path = entry.path
+
+                def is_dir(self, follow_symlinks=False):
+                    return self._entry.is_dir(follow_symlinks=follow_symlinks)
+
+                def is_file(self, follow_symlinks=False):
+                    return self._entry.is_file(follow_symlinks=follow_symlinks)
+
+                def stat(self, follow_symlinks=False):
+                    if failure == "stat":
+                        raise OSError("injected stat failure")
+                    return self._entry.stat(follow_symlinks=follow_symlinks)
+
+            class Entries:
+                def __init__(self, path):
+                    self.path = path
+
+                def __enter__(self):
+                    if failure == "open":
+                        raise OSError("injected scandir open failure")
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def __iter__(self):
+                    if failure == "iteration":
+                        raise OSError("injected scandir iteration failure")
+                    for entry in original_scandir(self.path):
+                        yield Entry(entry)
+
+            def scandir(path):
+                return Entries(path)
+
+            os.scandir = scandir
+            exec(compile(%r, "embedded-storage-scanner", "exec"), {"__name__": "__main__"})
+            """
+        ) % scanner
+        return subprocess.run(
+            [sys.executable, "-c", wrapper, failure or "none", kind, str(root), str(limit)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
 
     def test_allowlist_and_single_journal_path(self):
         self.assertIn("systemd_journald", self.config)
@@ -88,6 +165,95 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertIn("storage_scan_result", self.validate)
         self.assertIn("ops_agent_self_log_files", self.config)
         self.assertIn("ops_agent_self_logs", self.config)
+
+    def test_storage_scans_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "buffer").mkdir()
+            (root / "self-log").mkdir()
+            (root / "syslog").mkdir()
+            (root / "self-log" / "logging-module.log").write_bytes(b"agent")
+            (root / "syslog" / "syslog").write_bytes(b"journal")
+
+            for template in (self.validate, self.reconcile):
+                with self.subTest(template="validate" if template is self.validate else "reconcile"):
+                    scanner_count = 3 if template is self.reconcile else 1
+                    for occurrence in range(scanner_count):
+                        valid = self._run_embedded_scan(template, "syslog", root / "syslog", occurrence=occurrence)
+                        self.assertEqual(valid.returncode, 0, valid.stderr)
+                        if occurrence != 1 or template is self.validate:
+                            self.assertIn("syslog", valid.stdout)
+                        for failure in ("open", "iteration", "stat"):
+                            failed = self._run_embedded_scan(
+                                template, "syslog", root / "syslog", failure=failure, occurrence=occurrence)
+                            self.assertNotEqual(failed.returncode, 0, failure)
+
+                    missing = self._run_embedded_scan(template, "buffer", root / "never-created")
+                    self.assertEqual(missing.returncode, 0, missing.stderr)
+                    self.assertEqual(missing.stdout.strip(), "buffer 0 0")
+
+            for index in range(3):
+                (root / "buffer" / f"chunk-{index}").write_bytes(b"x")
+            capped = self._run_embedded_scan(self.validate, "buffer", root / "buffer", limit=1)
+            self.assertEqual(capped.returncode, 0, capped.stderr)
+            self.assertEqual(capped.stdout.strip(), "buffer 2 1")
+            self.assertIn('[ "$storage_scan_capped" -eq 0 ]', self.validate)
+
+    def test_storage_failure_preserves_activation_and_delivery_state(self):
+        for template in (self.validate, self.reconcile):
+            with self.subTest(template="validate" if template is self.validate else "reconcile"):
+                self.assertIn('test -n "$kind" || exit 1', template)
+                self.assertIn('[ "$seen_buffer" -eq 1 ] && [ "$seen_self_log" -eq 1 ] && [ "$seen_syslog" -eq 1 ] || exit 1', template)
+        self.assertIn('if [ "$status" -ne 0 ] && [ "$activation_committed" -eq 0 ]', self.reconcile)
+        self.assertIn('rollback || true', self.reconcile)
+        self.assertIn('activation_committed=0', self.reconcile)
+        self.assertIn('activation_committed=1', self.reconcile)
+        self.assertIn('exit 101', self.validate)
+        self.assertIn('checkpoint', self.reconcile.lower())
+        self.assertIn('buffer', self.reconcile.lower())
+
+    def test_selected_agent_export_boundary(self):
+        order = [
+            "capture_journal_provenance",
+            "parse_application_json",
+            "reset_promoted_special_fields",
+            "add_platform_context",
+            "redact_sensitive_fields",
+            "allowlisted_application_fields",
+            "drop_unallowlisted_payload",
+            "exclude_debug_after_parse",
+        ]
+        positions = [self.config.index(name) for name in order]
+        self.assertEqual(positions, sorted(positions))
+        for promoted in ("labels:", "httpRequest:", "operation:", "sourceLocation:",
+                         "spanId:", "trace:", "traceSampled:", "insertId:"):
+            self.assertIn(promoted, self.config)
+        for trusted in ("labels.host_id", "labels.incarnation", "labels.instance_id",
+                        "labels.environment", "labels.region", "labels.unit"):
+            self.assertIn(trusted, self.config)
+        for untrusted in ("jsonPayload.authorization", "jsonPayload.request_body",
+                          "jsonPayload.file_contents", "jsonPayload.command_payload",
+                          "jsonPayload.MESSAGE"):
+            self.assertIn(untrusted, self.config)
+        self.assertIn("metadata only", self.config)
+        self.assertIn("jsonPayload.level", self.config)
+        self.assertIn("labels.host_logging_heartbeat", self.config)
+
+    def test_selected_agent_buffer_budget(self):
+        variables = (ROOT / "infra/modules/host-logging/variables.tf").read_text()
+        module = (ROOT / "infra/modules/host-logging/main.tf").read_text()
+        readme = (ROOT / "infra/modules/host-logging/README.md").read_text()
+        self.assertIn('default     = "2.52.0"', variables)
+        self.assertIn("platform-managed", variables + readme + self.reconcile)
+        self.assertIn("disk-buffer", variables + readme + self.reconcile)
+        self.assertIn("accounting/compliance threshold", self.config + self.validate + self.reconcile)
+        self.assertIn("agent_buffer_bytes", module)
+        self.assertIn("agent_self_log_max_bytes", module)
+        self.assertIn("syslog_max_bytes", module)
+        self.assertIn("journal_max_use_bytes + storage_bytes", self.validate)
+        self.assertIn("journal_max_use_bytes + var.agent_buffer_bytes + var.agent_self_log_max_bytes + var.syslog_max_bytes", module)
+        self.assertNotIn("Buffer_Max_Size", self.config + self.reconcile)
+        self.assertNotIn("storage_scan_capped=1", self.validate)
 
 
 if __name__ == "__main__":

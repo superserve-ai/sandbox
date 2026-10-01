@@ -99,8 +99,21 @@ def _canonical_after(address, after):
                 for key in ("host_id", "instance_id", "incarnation", "instance_name"):
                     if key in descriptor:
                         descriptor[key] = "<deployment-identity>"
-    # Resource-level deployment operands are explicit schema fields; nested
-    # selector labels and arbitrary content are intentionally untouched.
+    # Selector values are deployment coordinates, but the selector structure
+    # itself is functional: retain its keys, list shape, and any unrelated
+    # labels while normalizing only the explicit environment/region operands.
+    instance_filter = copied.get("instance_filter")
+    if isinstance(instance_filter, dict):
+        inclusion_labels = instance_filter.get("inclusion_labels")
+        if isinstance(inclusion_labels, list):
+            for selector in inclusion_labels:
+                labels = selector.get("labels") if isinstance(selector, dict) else None
+                if isinstance(labels, dict):
+                    for key in ("environment", "region"):
+                        if key in labels and str(labels[key]) in (_KNOWN_ENVIRONMENTS | _KNOWN_REGIONS):
+                            labels[key] = f"<deployment-{key}>"
+    # Resource-level deployment operands are explicit schema fields; arbitrary
+    # selector labels and content remain untouched.
     for key in ("environment", "region", "zone"):
         if key in copied and str(copied[key]) in (_KNOWN_ENVIRONMENTS | _KNOWN_REGIONS):
             copied[key] = f"<deployment-{key}>"
@@ -161,6 +174,8 @@ def deployment_content_digest(plan: dict) -> str:
     # canonical resource entries; selector shape and all functional content
     # remain represented in each entry.
     manifest = sorted({json.dumps(item, sort_keys=True) for item in manifest})
+    if not manifest:
+        raise ValueError("host-logging content digest unavailable")
     encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 

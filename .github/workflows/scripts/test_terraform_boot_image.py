@@ -131,6 +131,27 @@ class ProvisionPlanTests(unittest.TestCase):
         provision.validate_plan(self.host_logging_plan(), 'sandbox_host_b',
                                 'opaque-image', 'replace', 'us-central1')
 
+    def test_create_allows_selected_host_logging_dependencies(self):
+        """A recovered create may update only the selected host's policy inputs."""
+        plan = self.host_logging_plan()
+        vm_change = plan['resource_changes'][0]['change']
+        vm_change.update(actions=['create'], before=None)
+        provision.validate_plan(plan, 'sandbox_host_b', 'opaque-image', 'create', 'us-central1')
+
+        # The VM being created is the sole identity authority.  A dependency
+        # that claims an unrelated module must still be rejected even though
+        # the new provider ID is unknown during planning.
+        invalid = copy.deepcopy(plan)
+        invalid['configuration']['root_module']['module_calls']['host_logging']['expressions'][
+            'enrolled_hosts']['references'] = ['module.sandbox_host.instance_id']
+        with self.assertRaisesRegex(ValueError, 'selected VM identity'):
+            provision.validate_plan(invalid, 'sandbox_host_b', 'opaque-image', 'create', 'us-central1')
+
+        unknown = copy.deepcopy(plan)
+        unknown['resource_changes'][-1]['change']['after_unknown'] = {'policy': True}
+        with self.assertRaisesRegex(ValueError, 'Unexpected unknown host logging field'):
+            provision.validate_plan(unknown, 'sandbox_host_b', 'opaque-image', 'create', 'us-central1')
+
     def test_create_rejects_host_logging_policy_and_iam_mutations(self):
         for address in (
                 'module.host_logging.google_os_config_os_policy_assignment.host_logging',
