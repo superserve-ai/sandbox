@@ -459,7 +459,10 @@ func TestRetainedStoragePostCutoverActivationUnknown(t *testing.T) {
 	f := newStorageReportFixture(t, "paused", false)
 	ctx := t.Context()
 	team := sandboxTeamID(t, f.sandboxID)
-	cutover := time.Now().UTC().Add(-time.Minute)
+	var cutover time.Time
+	if err := testPool.QueryRow(ctx, `SELECT clock_timestamp() - interval '1 minute'`).Scan(&cutover); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, cutover); err != nil {
 		t.Fatal(err)
 	}
@@ -481,7 +484,7 @@ func TestRetainedStoragePostCutoverActivationUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	if complete {
-		t.Fatal("unresolved activation obligation released settlement")
+		t.Fatalf("unresolved activation obligation released settlement: effective_at=%s queried_boundary=%s", effective, effective.Add(time.Minute))
 	}
 
 	validID := uuid.New()
@@ -534,7 +537,10 @@ func TestRetainedStorageActivationSettlementRace(t *testing.T) {
 	f := newStorageReportFixture(t, "paused", false)
 	ctx := t.Context()
 	team := sandboxTeamID(t, f.sandboxID)
-	boundary := time.Now().UTC().Add(-time.Second)
+	var boundary time.Time
+	if err := testPool.QueryRow(ctx, `SELECT clock_timestamp() - interval '1 second'`).Scan(&boundary); err != nil {
+		t.Fatal(err)
+	}
 	var complete bool
 	if err := testPool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, boundary).Scan(&complete); err != nil {
 		t.Fatal(err)
@@ -548,11 +554,16 @@ func TestRetainedStorageActivationSettlementRace(t *testing.T) {
 	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: f.sandboxID, TeamID: team, VcpuCount: 1, MemoryMib: 1024}); err != nil {
 		t.Fatal(err)
 	}
-	if err := testPool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, time.Now().UTC().Add(time.Minute)).Scan(&complete); err != nil {
+	var effective time.Time
+	if err := testPool.QueryRow(ctx, `SELECT effective_at FROM retained_storage_measurement_obligation WHERE owner_kind='sandbox' AND owner_id=$1`, f.sandboxID).Scan(&effective); err != nil {
+		t.Fatal(err)
+	}
+	boundary = effective.Add(time.Minute)
+	if err := testPool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, boundary).Scan(&complete); err != nil {
 		t.Fatal(err)
 	}
 	if complete {
-		t.Fatal("committed activation was invisible to settlement")
+		t.Fatalf("committed activation was invisible to settlement: effective_at=%s queried_boundary=%s", effective, boundary)
 	}
 }
 
