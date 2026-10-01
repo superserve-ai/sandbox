@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 func TestPromotionProducerCredentialsAreScoped(t *testing.T) {
@@ -82,5 +84,64 @@ func TestPromotionProducerRejectsMissingPeerOrInternalCredential(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRegisterPromotionSignupAccountRejectsMalformedBeforeAuthority(t *testing.T) {
+	r := gin.New()
+	r.POST("/register-signup", (&Handlers{}).RegisterPromotionSignupAccount)
+	req := httptest.NewRequest(http.MethodPost, "/register-signup", strings.NewReader(`{"user_id":`))
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want %d: %s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+}
+
+func TestRegisterPromotionSignupAccountRejectsNonEastBodyBeforeAuthority(t *testing.T) {
+	user, attempt := uuid.New(), uuid.New()
+	claims := &promotionAccountClaims{
+		RegisteredClaims: jwt.RegisteredClaims{Subject: user.String()},
+		Operation:        "register-signup",
+		AttemptID:        attempt.String(),
+		HomeRegion:       "use",
+	}
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("promotion_account", claims)
+		c.Next()
+	})
+	r.POST("/register-signup", (&Handlers{}).RegisterPromotionSignupAccount)
+	body := `{"user_id":"` + user.String() + `","attempt_id":"` + attempt.String() + `","home_region":"usw"}`
+	req := httptest.NewRequest(http.MethodPost, "/register-signup", strings.NewReader(body))
+	req.Header.Set("X-Actor-User-Id", user.String())
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("got %d, want %d: %s", w.Code, http.StatusForbidden, w.Body.String())
+	}
+}
+
+func TestRegisterPromotionSignupAccountReturnsUnavailableWhenAuthorityPoolMissing(t *testing.T) {
+	user, attempt := uuid.New(), uuid.New()
+	claims := &promotionAccountClaims{
+		RegisteredClaims: jwt.RegisteredClaims{Subject: user.String()},
+		Operation:        "register-signup",
+		AttemptID:        attempt.String(),
+		HomeRegion:       "use",
+	}
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("promotion_account", claims)
+		c.Next()
+	})
+	r.POST("/register-signup", (&Handlers{}).RegisterPromotionSignupAccount)
+	body := `{"user_id":"` + user.String() + `","attempt_id":"` + attempt.String() + `","home_region":"use"}`
+	req := httptest.NewRequest(http.MethodPost, "/register-signup", strings.NewReader(body))
+	req.Header.Set("X-Actor-User-Id", user.String())
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("got %d, want %d: %s", w.Code, http.StatusServiceUnavailable, w.Body.String())
 	}
 }

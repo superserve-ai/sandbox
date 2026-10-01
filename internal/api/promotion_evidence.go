@@ -249,7 +249,8 @@ func (h *Handlers) RegisterPromotionSignupAccount(c *gin.Context) {
 	claims, ok := value.(*promotionAccountClaims)
 	actor, actorErr := uuid.Parse(c.GetHeader("X-Actor-User-Id"))
 	if !ok || claims == nil || claims.Operation != "register-signup" || actorErr != nil || actor != input.UserID ||
-		claims.Subject != input.UserID.String() || claims.AttemptID != input.AttemptID.String() || claims.HomeRegion != input.HomeRegion {
+		input.HomeRegion != "use" || claims.Subject != input.UserID.String() || claims.AttemptID != input.AttemptID.String() ||
+		claims.HomeRegion != "use" || claims.HomeRegion != input.HomeRegion {
 		respondErrorMsg(c, "forbidden", "account provenance mismatch", http.StatusForbidden)
 		return
 	}
