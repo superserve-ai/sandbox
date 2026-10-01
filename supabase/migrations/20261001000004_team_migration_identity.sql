@@ -7,4 +7,11 @@ ALTER TABLE retained_storage_measurement_obligation
 CREATE UNIQUE INDEX retained_storage_measurement_obligation_migration_identity
   ON retained_storage_measurement_obligation(migration_identity);
 
-GRANT SELECT, INSERT, UPDATE ON retained_storage_measurement_obligation TO service_role;
+-- Supabase supplies service_role in production. The disposable Postgres
+-- databases used by integration tests intentionally do not, so keep the
+-- migration portable without changing the production grant.
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+    GRANT SELECT, INSERT, UPDATE ON retained_storage_measurement_obligation TO service_role;
+  END IF;
+END $$;
