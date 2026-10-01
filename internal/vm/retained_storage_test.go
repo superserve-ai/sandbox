@@ -164,6 +164,24 @@ func TestRetainedInventoryBudgetsOnlyCustomerRecords(t *testing.T) {
 	}
 }
 
+func TestRetainedInventoryCancelledEmptyStoreRemainsUnknown(t *testing.T) {
+	state, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+
+	m := &Manager{state: state, cfg: ManagerConfig{RunDir: t.TempDir(), SnapshotDir: t.TempDir()}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := m.retainedStorageInventory(ctx, func(*os.File, int) ([]retainedstorage.Extent, string, error) {
+		t.Fatal("cancelled inventory attempted allocation measurement")
+		return nil, "", nil
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled empty inventory error = %v, want context.Canceled", err)
+	}
+}
+
 func TestRetainedBaselineProvenance(t *testing.T) {
 	root := t.TempDir()
 	statePath := filepath.Join(root, "state.db")

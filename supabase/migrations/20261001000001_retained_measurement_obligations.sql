@@ -195,7 +195,7 @@ WITH bounds AS MATERIALIZED (
 SELECT CASE WHEN p_start>=(SELECT period_end FROM bounds) THEN 0::numeric ELSE amount END FROM final_value
 $$;
 
-CREATE FUNCTION storage_mib_seconds(p_team uuid,p_start timestamptz,p_end timestamptz,p_floor_legacy_artifacts boolean DEFAULT true)
+CREATE OR REPLACE FUNCTION storage_mib_seconds(p_team uuid,p_start timestamptz,p_end timestamptz,p_floor_legacy_artifacts boolean DEFAULT true)
 RETURNS numeric LANGUAGE sql STABLE AS $$
  SELECT CASE WHEN EXISTS (
    SELECT 1 FROM retained_storage_measurement_obligation o

@@ -771,6 +771,9 @@ func (s *StateStore) retainedArchivedRecords() ([]VMRecord, error) {
 }
 
 func (s *StateStore) retainedArchivedRecordsContext(ctx context.Context) ([]VMRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	budget := retainedScanBudget{}
 	return s.retainedArchivedRecordsWithBudget(ctx, &budget)
 }

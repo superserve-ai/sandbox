@@ -34,6 +34,9 @@ func (s *StateStore) retainedLiveRecords() ([]VMRecord, error) {
 }
 
 func (s *StateStore) retainedLiveRecordsContext(ctx context.Context) ([]VMRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	budget := retainedScanBudget{}
 	return s.retainedLiveRecordsWithBudget(ctx, &budget)
 }
@@ -125,6 +128,9 @@ func (s *StateStore) retainedRecords() ([]VMRecord, error) {
 }
 
 func (s *StateStore) retainedRecordsContext(ctx context.Context) ([]VMRecord, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	budget := retainedScanBudget{}
 	live, err := s.retainedLiveRecordsWithBudget(ctx, &budget)
 	if err != nil {
@@ -139,6 +145,9 @@ func (s *StateStore) retainedRecordsContext(ctx context.Context) ([]VMRecord, er
 		seen[rec.ID] = struct{}{}
 	}
 	for _, rec := range archived {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if _, ok := seen[rec.ID]; ok {
 			continue
 		}
@@ -533,12 +542,21 @@ func (m *Manager) retainedStorageInventory(ctx context.Context, measure func(*os
 }
 
 func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, measure func(*os.File, int) ([]retainedstorage.Extent, string, error), persist bool) (*retainedstorage.Inventory, error) {
+	// A cancelled sampler must never publish an empty (and therefore seemingly
+	// complete) inventory.  Empty Bolt buckets do not invoke the traversal
+	// callback, so retainedRecordsContext cannot observe cancellation by itself.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	epoch := m.storageEpoch.Load()
 	if m.storageMutations.Load() != 0 || m.state == nil {
 		return nil, fmt.Errorf("retained inventory not ready")
 	}
 	records, err := m.state.retainedRecordsContext(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	inv := &retainedstorage.Inventory{Version: retainedstorage.Version, Owners: make([]retainedstorage.Owner, 0)}
@@ -719,6 +737,9 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 	}
 	if m.storageMutations.Load() != 0 || m.storageEpoch.Load() != epoch {
 		return nil, fmt.Errorf("retained generation changed while persisting dependency anchors")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	sort.Slice(inv.Owners, func(i, j int) bool { return inv.Owners[i].Kind+inv.Owners[i].ID < inv.Owners[j].Kind+inv.Owners[j].ID })
 	return inv, inv.Validate()
