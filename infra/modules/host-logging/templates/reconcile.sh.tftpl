@@ -145,6 +145,22 @@ heartbeat_active=0
 systemctl is-active --quiet superserve-host-logging-heartbeat.timer && heartbeat_active=1 || true
 journal_changed=0
 cmp -s "$attempt/journald.conf" "$dropin" || journal_changed=1
+metrics_runtime_properties=()
+metrics_runtime_changed=0
+if systemctl is-active --quiet superserve-otel-collector.service; then
+  properties=$(systemctl show superserve-otel-collector.service --property=CPUWeight --property=IOWeight --property=MemoryHigh --property=MemoryMax)
+  while IFS='=' read -r key value; do
+    case "$key" in
+      CPUWeight|IOWeight)
+        if [ "$value" = 18446744073709551615 ]; then value=; else [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 1 ] && [ "$value" -le 10000 ]; fi
+        ;;
+      MemoryHigh|MemoryMax) [[ "$value" =~ ^[0-9]+$|^infinity$ ]] ;;
+      *) exit 1 ;;
+    esac
+    metrics_runtime_properties+=("$key=$value")
+  done <<< "$properties"
+  [ "$${#metrics_runtime_properties[@]}" -eq 4 ]
+fi
 activation_started=0
 activation_committed=0
 changed_targets=()
@@ -162,6 +178,9 @@ rollback() {
       else rm -f "$${targets[$i]}"; fi
     done
     systemctl daemon-reload || true
+    if [ "$metrics_runtime_changed" -eq 1 ]; then
+      systemctl set-property --runtime superserve-otel-collector.service "$${metrics_runtime_properties[@]}" || true
+    fi
     if [ "$activation_started" -eq 1 ]; then
       if [ "$was_active" -eq 1 ]; then systemctl restart superserve-otel-logs.service || true; else systemctl disable --now superserve-otel-logs.service || true; fi
       if [ "$heartbeat_active" -eq 0 ]; then systemctl disable --now superserve-host-logging-heartbeat.timer || true; fi
@@ -196,13 +215,14 @@ fi
 systemctl enable --now superserve-host-logging-heartbeat.timer
 systemctl enable superserve-otel-logs.service
 systemctl restart superserve-otel-logs.service
-# Apply relative pressure priority without restarting the independent metrics service.
-if systemctl is-active --quiet superserve-otel-collector.service; then
-  systemctl set-property --runtime superserve-otel-collector.service CPUWeight=1 IOWeight=1 MemoryHigh=192M MemoryMax=256M
-fi
 sleep 2
 systemctl is-active --quiet superserve-otel-logs.service
 systemctl is-active --quiet superserve-host-logging-heartbeat.timer
+# Restore the previous runtime properties if this or the legacy cutover fails.
+if [ "$${#metrics_runtime_properties[@]}" -eq 4 ]; then
+  metrics_runtime_changed=1
+  systemctl set-property --runtime superserve-otel-collector.service CPUWeight=1 IOWeight=1 MemoryHigh=192M MemoryMax=256M
+fi
 if [ "$legacy_enabled" -eq 1 ]; then
   python3 "$legacy_helper" --enforce && rc=0 || rc=$?
   [ "$rc" -eq 100 ]

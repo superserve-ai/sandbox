@@ -96,7 +96,7 @@ class HostLoggingDigestTests(unittest.TestCase):
             elif mutation == "role":
                 resource(changed, "google_project_iam_member.telemetry_consumer")["after"]["role"] = "roles/owner"
             elif mutation == "threshold":
-                resource(changed, "google_monitoring_alert_policy.host_logging_lag")["after"]["conditions"][0]["condition_threshold"][0]["threshold_value"] = 600
+                resource(changed, "google_monitoring_alert_policy.host_logging_lag")["after"]["conditions"][0]["condition_prometheus_query_language"][0]["duration"] = "600s"
             elif mutation == "query":
                 resource(changed, "google_monitoring_alert_policy.host_logging_heartbeat")["after"]["conditions"][0]["condition_prometheus_query_language"][0]["query"] = "vector(1)"
             elif mutation == "routing":

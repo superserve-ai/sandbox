@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 spec = importlib.util.spec_from_file_location('migration', Path(__file__).with_name('host_logging_legacy_migration.py'))
 migration = importlib.util.module_from_spec(spec)
@@ -71,7 +71,9 @@ class LegacyMigrationTests(unittest.TestCase):
     def test_retire_preserves_metrics_and_rollback_restores_exact_baseline(self):
         self.run_action('--enforce')
         self.target['phase'] = 'retire'
-        self.assertEqual(self.run_action('--enforce'), 100)
+        with patch.object(migration, 'assert_exporter_healthy') as health:
+            self.assertEqual(self.run_action('--enforce'), 100)
+        health.assert_called_once_with()
         retired = json.loads(migration.CONFIG.read_text())
         self.assertEqual(retired['metrics'], json.loads(self.baseline)['metrics'])
         self.assertEqual(retired['logging']['service']['pipelines']['extra'], {'receivers': []})
@@ -122,6 +124,107 @@ class LegacyMigrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_action('--enforce')
         self.assertFalse(migration.CONFIG.exists())
+
+    def test_rollback_starts_inactive_legacy_before_stopping_otel(self):
+        for config in (self.baseline, self.target['retired']):
+            with self.subTest(config=config):
+                self.running = {migration.LOGS, migration.HEARTBEAT}
+                migration.CONFIG.write_text(config)
+                self.calls.clear()
+                self.target['phase'] = 'rollback'
+                self.assertEqual(self.run_action('--check'), 101)
+                self.assertEqual(self.run_action('--guard'), 0)
+                self.assertEqual(self.run_action('--enforce'), 100)
+                self.assertIn(migration.OPS, self.running)
+                self.assertNotIn(migration.LOGS, self.running)
+                self.assertEqual(migration.CONFIG.read_text(), self.baseline)
+                start = self.calls.index(('restart', migration.OPS))
+                stop = self.calls.index(('disable', '--now', migration.LOGS, migration.HEARTBEAT))
+                self.assertLess(start, stop)
+                self.assertEqual(self.run_action('--guard'), 1)
+
+    def test_rollback_start_failure_leaves_otel_and_its_restart_path_available(self):
+        real_control = migration.control
+        def fail_restart(*args, check=True):
+            if args == ('restart', migration.OPS):
+                return True  # Starting may return success before the unit fails.
+            return real_control(*args, check=check)
+        for config in (self.baseline, self.target['retired']):
+            with self.subTest(config=config):
+                self.running = {migration.LOGS, migration.HEARTBEAT}
+                migration.CONFIG.write_text(config)
+                self.calls.clear()
+                self.target['phase'] = 'rollback'
+                with patch.object(migration, 'control', side_effect=fail_restart):
+                    with self.assertRaises(ValueError):
+                        self.run_action('--enforce')
+                    self.assertEqual(self.run_action('--guard'), 0)
+                self.assertIn(migration.LOGS, self.running)
+                self.assertIn(migration.HEARTBEAT, self.running)
+                self.assertFalse(any(call[0] == 'disable' for call in self.calls))
+
+    def test_rollback_is_not_converged_with_both_writers_stopped(self):
+        self.target['phase'] = 'rollback'
+        self.running.clear()
+        self.assertEqual(self.run_action('--check'), 101)
+        self.assertEqual(self.run_action('--enforce'), 100)
+        self.assertEqual(self.running, {migration.OPS})
+
+    def test_unhealthy_exporter_keeps_legacy_configuration(self):
+        self.run_action('--enforce')
+        self.target['phase'] = 'retire'
+        with patch.object(migration, 'assert_exporter_healthy', side_effect=ValueError('outage')):
+            with self.assertRaises(ValueError):
+                self.run_action('--enforce')
+        self.assertEqual(migration.CONFIG.read_text(), self.baseline)
+        self.assertFalse((migration.STATE / 'legacy-retired.json').exists())
+        self.assertIn(migration.OPS, self.running)
+
+    def test_retire_guard_requires_new_success_and_empty_queue(self):
+        initial = {'sent': 12, 'failed': 0, 'rejected': 0, 'queued': 1, 'capacity': 100, 'inflight': 0}
+        pending = dict(initial, sent=13, queued=0, inflight=1)
+        success = dict(pending, inflight=0)
+        with patch.object(migration, 'read_export_metrics', side_effect=[initial, pending, success]) as read, patch.object(migration, 'collector_invocation', return_value='a' * 32), patch.object(migration.subprocess, 'run') as command, patch.object(migration.time, 'sleep'):
+            migration.assert_exporter_healthy()
+        self.assertEqual(read.call_count, 3)
+        command.assert_called_once()
+        self.assertIn('superserve-host-logging-heartbeat.service', command.call_args.args[0])
+
+    def test_retire_guard_rejects_queue_pressure_export_errors_and_restart(self):
+        initial = {'sent': 12, 'failed': 0, 'rejected': 0, 'queued': 0, 'capacity': 100, 'inflight': 0}
+        for changed in [dict(initial, failed=1), dict(initial, rejected=1), dict(initial, sent=0)]:
+            with patch.object(migration, 'read_export_metrics', side_effect=[initial, changed]), patch.object(migration, 'collector_invocation', return_value='a' * 32), patch.object(migration.subprocess, 'run'), patch.object(migration.time, 'sleep'):
+                with self.assertRaises(ValueError):
+                    migration.assert_exporter_healthy()
+        with patch.object(migration, 'read_export_metrics', return_value=dict(initial, queued=100)), patch.object(migration, 'collector_invocation', return_value='a' * 32), patch.object(migration.subprocess, 'run') as command:
+            with self.assertRaises(ValueError):
+                migration.assert_exporter_healthy()
+            command.assert_not_called()
+        with patch.object(migration, 'read_export_metrics', side_effect=[initial, dict(initial, sent=13)]), patch.object(migration, 'collector_invocation', side_effect=['a' * 32, 'b' * 32]), patch.object(migration.subprocess, 'run'), patch.object(migration.time, 'sleep'):
+            with self.assertRaises(ValueError):
+                migration.assert_exporter_healthy()
+
+    def test_retire_guard_times_out_without_success(self):
+        initial = {'sent': 12, 'failed': 0, 'rejected': 0, 'queued': 0, 'capacity': 100, 'inflight': 0}
+        with patch.object(migration, 'read_export_metrics', return_value=initial), patch.object(migration, 'collector_invocation', return_value='a' * 32), patch.object(migration.subprocess, 'run'), patch.object(migration.time, 'monotonic', side_effect=[0, 21]):
+            with self.assertRaises(ValueError):
+                migration.assert_exporter_healthy()
+
+    def test_metric_reader_selects_only_expected_exporter_and_fails_closed(self):
+        raw = b'\n'.join([
+            b'otelcol_exporter_sent_log_records_total{exporter="other"} 999',
+            b'otelcol_exporter_sent_log_records_total{exporter="otlp_http/cloud",service_name="otelcol"} 4',
+            b'otelcol_exporter_queue_size{exporter="otlp_http/cloud"} 0',
+            b'otelcol_exporter_queue_capacity{exporter="otlp_http/cloud"} 100',
+            b'otelcol_exporter_in_flight_requests{exporter="otlp_http/cloud"} 0',
+        ])
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = raw
+        with patch.object(migration.urllib.request, 'urlopen', return_value=response):
+            self.assertEqual(migration.read_export_metrics(), {'sent': 4, 'failed': 0, 'rejected': 0, 'queued': 0, 'capacity': 100, 'inflight': 0})
+            response.__enter__.return_value.read.return_value = b'no exporter metrics'
+            with self.assertRaises(ValueError):
+                migration.read_export_metrics()
 
     def test_agent_restart_failure_restores_previous_config(self):
         with patch.object(migration, 'control', side_effect=[False, False, True]):

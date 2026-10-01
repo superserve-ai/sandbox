@@ -308,7 +308,6 @@ RUN apt-get update \\
             self.assertEqual(attributes["provider_instance_id"], "fixture-instance")
             if attributes.get("journal_unit") == "superserve-host-logging-heartbeat.service":
                 self.assertEqual(attributes["host_logging_heartbeat"], "true")
-                self.assertGreater(int(attributes["host_logging_retained_history_lag_seconds"]), 300)
                 self.assertLess(int(record["timeUnixNano"]) / 1e9, time.time() - 300)
             else:
                 self.assertNotIn("host_logging_heartbeat", attributes)
@@ -398,7 +397,7 @@ RUN apt-get update \\
         with tempfile.TemporaryDirectory(prefix="host-logging-reconcile-") as directory:
             fixture = Path(directory)
             (fixture / "reconcile.sh").write_text(rendered["reconcile"])
-            script = textwrap.dedent(f"""
+            script = textwrap.dedent(rf"""
                 mkdir -p /fixture/bin /var/lib/superserve/host-logging /etc/superserve/host-logging /etc/systemd/system /etc/systemd/journald.conf.d /etc/sandbox /opt/superserve/otelcol-contrib/bin /var/lib/superserve/host-logging/cursor /var/lib/superserve/host-logging/export-queue
                 cat > /fixture/bin/systemctl <<'EOF'
                 #!/bin/sh
@@ -465,8 +464,10 @@ RUN apt-get update \\
                 cmp /etc/systemd/system/superserve-otel-logs.service <(printf 'active-service\n')
                 test "$(cat /var/lib/superserve/host-logging/cursor/state)" = old-cursor
                 test "$(cat /var/lib/superserve/host-logging/export-queue/state)" = old-queue
+                touch /fixture/reconcile-failure-complete
             """)
             self._docker(f"superserve-host-logging-reconcile-{mode}", fixture, script, timeout=180)
+            self.assertTrue((fixture / "reconcile-failure-complete").is_file())
 
     def test_reconcile_converges_and_is_idempotent(self):
         self._exercise_reconciliation(False)
@@ -474,7 +475,10 @@ RUN apt-get update \\
     def test_post_activation_failure_restores_active_state(self):
         self._exercise_reconciliation(True)
 
-    def _exercise_reconciliation(self, activation_failure):
+    def test_partial_metrics_limit_failure_restores_runtime_properties(self):
+        self._exercise_reconciliation(True, metrics_failure=True)
+
+    def _exercise_reconciliation(self, activation_failure, metrics_failure=False):
         with tempfile.TemporaryDirectory(prefix="host-logging-render-") as directory:
             rendered = self._render_templates(Path(directory))
             with tempfile.TemporaryDirectory(prefix="host-logging-converged-") as work:
@@ -483,7 +487,9 @@ RUN apt-get update \\
                     (fixture / name).write_text(content)
                 if activation_failure:
                     (fixture / "test-rollback").touch()
-                script = self._acquire_release(fixture) + textwrap.dedent("""
+                if metrics_failure:
+                    (fixture / "test-metrics-failure").touch()
+                script = self._acquire_release(fixture) + textwrap.dedent(r"""
                     mkdir -p /var/lib/superserve/host-logging /etc/sandbox /opt/superserve/otelcol-contrib/bin
                     cp /fixture/bin/otelcol-contrib /opt/superserve/otelcol-contrib/bin/otelcol-contrib
                     cp /fixture/config /var/lib/superserve/host-logging/otel-logs.yaml.candidate
@@ -492,6 +498,16 @@ RUN apt-get update \\
                     printf '{"host_id":"fixture-host","instance_id":"123","incarnation_id":"fixture-incarnation"}\n' > /etc/sandbox/host-identity.json
                     cat > /fixture/bin/systemctl <<'EOF'
                     #!/bin/bash
+                    if [ "$1" = show ]; then
+                      if [ -e /fixture/metrics.properties ]; then cat /fixture/metrics.properties; else printf 'CPUWeight=100\nIOWeight=100\nMemoryHigh=infinity\nMemoryMax=infinity\n'; fi
+                      exit 0
+                    fi
+                    if [ "$1" = set-property ]; then
+                      printf '%s\n' "${@:4}" > /fixture/metrics.properties
+                      printf '%s\n' "$*" >> /fixture/systemctl.calls
+                      if [ -e /fixture/fail-metrics ]; then rm /fixture/fail-metrics; exit 1; fi
+                      exit 0
+                    fi
                     if [ "$1 $2" = 'restart superserve-otel-logs.service' ] && [ -e /fixture/fail-activation ]; then
                       rm /fixture/fail-activation
                       printf 'injected activation failure\n' >&2
@@ -538,18 +554,31 @@ RUN apt-get update \\
                     if [ -e /fixture/test-rollback ]; then
                       printf '\n# changed candidate\n' >> /var/lib/superserve/host-logging/otel-logs.yaml.candidate
                       : > /fixture/systemctl.calls
-                      touch /fixture/fail-activation
+                      if [ -e /fixture/test-metrics-failure ]; then
+                        printf 'CPUWeight=123\nIOWeight=234\nMemoryHigh=500000000\nMemoryMax=600000000\n' > /fixture/metrics.properties
+                        cp /fixture/metrics.properties /fixture/metrics.before
+                        touch /fixture/fail-metrics
+                      else
+                        touch /fixture/fail-activation
+                      fi
                       result 1 bash /fixture/reconcile
                       find /etc/superserve/host-logging /etc/sandbox /etc/systemd/system /etc/systemd/journald.conf.d /opt/superserve/otelcol-contrib/bin /var/lib/superserve/host-logging/cursor /var/lib/superserve/host-logging/export-queue -type f -exec sha256sum {} + > /fixture/files.rollback
                       cmp /fixture/files.before /fixture/files.rollback
                       grep -q '^restart superserve-otel-logs.service$' /fixture/systemctl.calls
-                      ! grep -q 'superserve-otel-collector.service' /fixture/systemctl.calls
+                      if [ -e /fixture/test-metrics-failure ]; then
+                        cmp /fixture/metrics.before /fixture/metrics.properties
+                        test "$(grep -c '^set-property ' /fixture/systemctl.calls)" -eq 2
+                      else
+                        ! grep -q 'superserve-otel-collector.service' /fixture/systemctl.calls
+                      fi
                       test -e /fixture/active
                     fi
                     rm /etc/sandbox/host-identity.json
                     result 1 bash /fixture/validate
+                    touch /fixture/reconcile-complete
                 """)
                 self._docker("host-logging-converged", fixture, script)
+                self.assertTrue((fixture / "reconcile-complete").is_file())
 
     def test_candidate_validation_and_failure_preservation(self):
         with tempfile.TemporaryDirectory(prefix="host-logging-render-") as directory:
@@ -575,7 +604,7 @@ RUN apt-get update \\
                 fixture = Path(fixture_dir)
                 (fixture / "validate.sh").write_text(validate)
                 (fixture / "reconcile.sh").write_text(reconcile)
-                script = textwrap.dedent("""
+                script = textwrap.dedent(r"""
                     mkdir -p /fixture/bin /var/lib/superserve/host-logging
                     cp /fixture/reconcile.sh /var/lib/superserve/host-logging/reconcile.sh
                     cat > /fixture/bin/systemctl <<'EOF'
@@ -600,8 +629,10 @@ RUN apt-get update \\
                     invalid=$?
                     set -e
                     test "$invalid" -eq 1
+                    touch /fixture/validate-fresh-complete
                 """)
                 self._docker("superserve-host-logging-validate-fresh", fixture, script, timeout=120)
+                self.assertTrue((fixture / "validate-fresh-complete").is_file())
             for mode in ("config", "checksum", "storage"):
                 self._assert_reconcile_failure_preserves_state(rendered, mode)
 

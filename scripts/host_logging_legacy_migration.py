@@ -3,6 +3,10 @@
 import datetime
 import fcntl
 import json
+import math
+import re
+import time
+import urllib.request
 import os
 from pathlib import Path
 import subprocess
@@ -72,7 +76,7 @@ def verify(target):
             raise ValueError('legacy configuration differs from the audited baseline')
     elif phase not in {'overlap', 'rollback'} or instance not in target.get('initialize_instance_ids', []):
         raise ValueError('missing legacy configuration requires explicit instance initialization')
-    if not active(OPS):
+    if phase != 'rollback' and not active(OPS):
         raise ValueError('legacy agent must be healthy before migration')
     if phase in {'overlap', 'verify', 'drain'} and expired(target):
         raise ValueError('overlap expired; use rollback or retire with evidence')
@@ -96,7 +100,7 @@ def converged(target):
     phase = target['phase']
     if phase in {'preserve', 'rollback'}:
         stopped = not active(LOGS) and not active(HEARTBEAT) and not active(EXPIRY)
-        return stopped and (phase == 'preserve' or (CONFIG.read_text() if CONFIG.exists() else '') == target['baseline'])
+        return stopped and (phase == 'preserve' or ((CONFIG.read_text() if CONFIG.exists() else '') == target['baseline'] and active(OPS)))
     if phase == 'retire':
         return CONFIG.exists() and CONFIG.read_text() == target['retired'] and not active(EXPIRY)
     return (CONFIG.read_text() if CONFIG.exists() else '') == target['baseline'] and active(EXPIRY) and all(p.exists() and p.read_text() == content for p, content in deadline_files(target).items())
@@ -129,6 +133,68 @@ def set_legacy_config(content):
         raise
 
 
+def collector_invocation():
+    result = subprocess.run(['systemctl', 'show', LOGS, '--property=InvocationID', '--value'], check=True, capture_output=True, text=True, timeout=2)
+    value = result.stdout.strip()
+    if not re.fullmatch(r'[0-9a-f]{32}', value):
+        raise ValueError('collector invocation identity unavailable')
+    return value
+
+
+def read_export_metrics():
+    names = {
+        'otelcol_exporter_sent_log_records': 'sent',
+        'otelcol_exporter_send_failed_log_records': 'failed',
+        'otelcol_exporter_enqueue_failed_log_records': 'rejected',
+        'otelcol_exporter_queue_size': 'queued',
+        'otelcol_exporter_queue_capacity': 'capacity',
+        'otelcol_exporter_in_flight_requests': 'inflight',
+    }
+    with urllib.request.urlopen('http://127.0.0.1:18888/metrics', timeout=2) as response:
+        raw = response.read(1048577)
+    if len(raw) > 1048576:
+        raise ValueError('collector self-metrics exceed bound')
+    values = {'failed': 0.0, 'rejected': 0.0}
+    for line in raw.decode('utf-8').splitlines():
+        match = re.fullmatch(r'(otelcol_exporter_[a-z_]+)\{([^}]+)\}\s+([0-9.eE+-]+)(?:\s+[0-9]+)?', line)
+        if not match or not re.search(r'(?:^|,)\s*exporter="otlp_http/cloud"(?:,|$)', match[2]):
+            continue
+        name = match[1].removesuffix('_total')
+        if name not in names:
+            continue
+        value = float(match[3])
+        if not math.isfinite(value) or value < 0:
+            raise ValueError('invalid collector metric')
+        key = names[name]
+        if key in values and key not in {'failed', 'rejected'}:
+            raise ValueError('ambiguous collector metric')
+        values[key] = value
+    if not {'sent', 'queued', 'capacity', 'inflight'} <= values.keys() or values['capacity'] <= 0:
+        raise ValueError('collector export metrics unavailable')
+    return values
+
+
+def assert_exporter_healthy():
+    # Receipt evidence authorizes the change; this fresh check catches an outage
+    # or saturated queue arising between evidence collection and host activation.
+    invocation = collector_invocation()
+    before = read_export_metrics()
+    if before['queued'] >= before['capacity']:
+        raise ValueError('collector export queue is full')
+    subprocess.run(['systemctl', 'start', 'superserve-host-logging-heartbeat.service'], check=True, capture_output=True, timeout=2)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        time.sleep(1)
+        current = read_export_metrics()
+        if current['failed'] != before['failed'] or current['rejected'] != before['rejected'] or current['sent'] < before['sent']:
+            raise ValueError('collector export failed during cutover check')
+        if collector_invocation() != invocation or not active(LOGS):
+            raise ValueError('collector restarted during cutover check')
+        if current['sent'] > before['sent'] and current['queued'] == 0 and current['inflight'] == 0:
+            return
+    raise ValueError('collector did not acknowledge fresh logs before cutover')
+
+
 def enforce(target):
     phase = target['phase']
     if phase == 'preserve':
@@ -138,12 +204,17 @@ def enforce(target):
     if phase == 'rollback':
         # Restore legacy first so rollback never deliberately removes both writers.
         set_legacy_config(target['baseline'])
+        if not active(OPS):
+            control('restart', OPS)
+        if not active(OPS):
+            raise ValueError('legacy agent must be healthy before stopping OTel')
         stop_logs()
         (STATE / 'legacy-retired.json').unlink(missing_ok=True)
         (STATE / 'legacy-baseline.json').unlink(missing_ok=True)
     elif phase == 'retire':
         if not active(LOGS):
             raise ValueError('OTel must be healthy before retiring legacy logging')
+        assert_exporter_healthy()
         atomic(STATE / 'legacy-retired.json', json.dumps({'baseline': target['baseline']}))
         set_legacy_config(target['retired'])
     else:
@@ -178,8 +249,11 @@ def reconcile():
                 raise ValueError('unable to stop expired overlap')
         return 0
     if action == '--guard':
-        if target['phase'] in {'preserve', 'rollback'}:
+        if target['phase'] == 'preserve':
             return 1
+        if target['phase'] == 'rollback':
+            restored = CONFIG.exists() and CONFIG.read_text() == target['baseline'] and active(OPS)
+            return 1 if restored else 0
         if target['phase'] in {'overlap', 'verify', 'drain'} and expired(target):
             return 1
         return 0

@@ -63,8 +63,8 @@ def verify(root: Path) -> list[str]:
         errors.append("selected OTel release must carry a pinned SHA-256 digest")
     if "log_id(\"superserve_host_logs\")" not in normalized_alerts:
         errors.append("export failure alert must consume the OTel host-log stream")
-    if "or vector(0)" not in normalized_alerts or "ALIGN_PERCENTILE_99" not in normalized_alerts:
-        errors.append("alerts must cover never-seen hosts and retained-history lag")
+    if "or vector(0)" not in normalized_alerts or "ceil(var.host_logging_alerts.lag_threshold_seconds)" not in normalized_alerts:
+        errors.append("alerts must cover never-seen hosts and source-timestamp freshness")
     if "otelcol_process_uptime" not in alerts and "heartbeat_metric_type" not in alerts:
         errors.append("missing-heartbeat alert must remain independent of log export")
     if "storage: file_storage/cursor" not in validate or "storage: file_storage/queue" not in validate:

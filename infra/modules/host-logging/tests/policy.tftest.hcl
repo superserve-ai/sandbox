@@ -46,3 +46,23 @@ run "host_logging_contract" {
   }
 
 }
+
+run "host_logging_deployment_plan" {
+  command = plan
+  variables {
+    project_id      = "example-project"
+    zone            = "us-central1-a"
+    environment     = "staging"
+    region          = "us-central1"
+    assignment_name = "example-host-logging"
+    enrolled_hosts = {
+      pilot = {
+        instance_name         = "example-vmd-1"
+        instance_id           = "123"
+        host_id               = "example-vmd-1"
+        incarnation           = "incarnation-a"
+        service_account_email = "vmd@example-project.iam.gserviceaccount.com"
+      }
+    }
+  }
+}

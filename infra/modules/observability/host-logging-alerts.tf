@@ -109,28 +109,27 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
     }
   }
 
-  # Delivery lag is sampled once per host heartbeat, bounding metric volume
-  # independently of application log volume. It is intentionally independent from the heartbeat absence policy
-  # below: an exporter that is stopped or has never emitted a heartbeat cannot
-  # manufacture a lag sample, and is handled by the separate absence alert.
+  # Cloud Logging log-based metric points use the source log timestamp. A
+  # heartbeat that sat in the local exporter queue therefore lands in its old
+  # source interval and cannot satisfy this recent-window query. This keeps the
+  # signal bounded to one existing heartbeat metric per host and detects both
+  # queued stale heartbeats and a stopped/never-seen exporter.
   conditions {
-    display_name = "OTel logs delivery lag on ${each.value.instance_name}"
-    condition_threshold {
-      filter          = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND metric.type=\"logging.googleapis.com/user/${google_logging_metric.host_logging_delivery_lag[each.key].name}\""
-      comparison      = "COMPARISON_GT"
-      threshold_value = var.host_logging_alerts.lag_threshold_seconds
-      duration        = "300s"
-      aggregations {
-        alignment_period   = "60s"
-        per_series_aligner = "ALIGN_PERCENTILE_99"
-      }
+    display_name = "OTel logs freshness gap on ${each.value.instance_name}"
+    condition_prometheus_query_language {
+      query                     = <<-EOT
+        (sum(sum_over_time({
+          "__name__" = "logging_googleapis_com:user_${google_logging_metric.host_logging_heartbeat[each.key].name}",
+          "collector_host_id" = "${each.value.instance_id}"${each.value.incarnation == null ? "" : ",\n          \"incarnation\" = \"${each.value.incarnation}\""}
+        }[${ceil(var.host_logging_alerts.lag_threshold_seconds)}s])) or vector(0)) == 0
+      EOT
+      duration                  = "300s"
+      evaluation_interval       = "60s"
+      disable_metric_validation = true
     }
   }
-
-
-
   documentation {
-    content   = "Retained host logs are arriving later than the configured ${var.host_logging_alerts.lag_threshold_seconds}s threshold on ${each.value.instance_name}. Distinguish outage catch-up from a persistent gap and account for journal/queue expiry.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_lag", "")}"
+    content   = "No current OTel host-log heartbeat has reached Cloud Logging within the configured ${var.host_logging_alerts.lag_threshold_seconds}s freshness window on ${each.value.instance_name}. A heartbeat delayed in the local queue retains its older source timestamp and does not satisfy this signal; a fresh heartbeat clears it. Account for Cloud Logging's eventual metric processing and journal/queue expiry.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_lag", "")}"
     mime_type = "text/markdown"
   }
 
@@ -142,28 +141,6 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
     instance_name             = each.value.instance_name
     managed_by                = "terraform"
   })
-}
-
-resource "google_logging_metric" "host_logging_delivery_lag" {
-  for_each = local.active_host_logging_alerts
-
-  project         = var.project_id
-  name            = "superserve_host_logging_delivery_lag_${each.key}"
-  filter          = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\" AND labels.host_logging_retained_history_lag_seconds:*"
-  value_extractor = "EXTRACT(labels.host_logging_retained_history_lag_seconds)"
-
-  metric_descriptor {
-    metric_kind = "DELTA"
-    value_type  = "DISTRIBUTION"
-    unit        = "s"
-  }
-  bucket_options {
-    exponential_buckets {
-      num_finite_buckets = 20
-      growth_factor      = 2
-      scale              = 1
-    }
-  }
 }
 
 # This policy is driven by the logs-based heartbeat metric above, not the

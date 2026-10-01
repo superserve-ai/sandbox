@@ -15,7 +15,8 @@ run "host_logging_alerts_contract" {
     }
     notification_channel_ids = ["projects/example-project/notificationChannels/123"]
     host_logging_alerts = {
-      display_prefix = "Host logging / example"
+      display_prefix        = "Host logging / example"
+      lag_threshold_seconds = 600
       expected_hosts = {
         pilot = {
           instance_name = "example-vmd-1"
@@ -51,11 +52,14 @@ run "host_logging_alerts_contract" {
     condition = alltrue([
       for policy in values(google_monitoring_alert_policy.host_logging_lag) :
       alltrue([for condition in policy.conditions : (
-        (length(condition.condition_threshold) == 1 &&
-        one(condition.condition_threshold).comparison == "COMPARISON_GT")
+        length(condition.condition_prometheus_query_language) == 1 &&
+        strcontains(one(condition.condition_prometheus_query_language).query, "logging_googleapis_com:user_") &&
+        strcontains(one(condition.condition_prometheus_query_language).query, "sum_over_time") &&
+        strcontains(one(condition.condition_prometheus_query_language).query, "[600s]") &&
+        one(condition.condition_prometheus_query_language).duration == "300s"
       )])
     ])
-    error_message = "Each Monitoring condition block must contain exactly one supported condition type."
+    error_message = "Freshness must use the existing heartbeat metric and a bounded recent source-timestamp window."
   }
 
   assert {
