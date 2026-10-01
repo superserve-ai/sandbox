@@ -7,9 +7,10 @@
 # enrolled unit: ${unit}
 %{ endfor ~}
 # Ops Agent ${ops_agent_package_version} is selected by the OS policy. This
-# release has the documented platform-managed disk-buffer protection introduced
-# in 2.28, but no supported numeric cap setting. Terraform's buffer reservation
-# is accounting/enforcement evidence, not an invented agent configuration.
+# release uses the documented platform-managed disk-buffer protection. The
+# Terraform reservation below is accounting/compliance evidence, not a claim
+# that this release exposes or enforces that numeric value as a configuration
+# knob; selected-release generator/package evidence is recorded with rollout.
 global:
   # The built-in self-log pipeline is disabled only to avoid duplicate file
   # ingestion; self-log ingestion remains enabled through the explicit,
@@ -34,26 +35,21 @@ logging:
       include_paths:
         - /var/log/google-cloud-ops-agent/subagents/logging-module.log
   processors:
-    # This is a provenance filter, not an application-data filter. The
-    # _SYSTEMD_UNIT and _TRANSPORT fields are journal-managed and cannot be
-    # selected by a client-controlled identifier field.
+    # This is a provenance filter, not an application-data filter. Capture the
+    # journal-managed fields into resource labels before parsing. Resource
+    # labels are outside the application JSON merge, so spoofed labels and
+    # _SYSTEMD_UNIT values cannot change source attribution.
     exclude_non_platform_sources:
       type: exclude_logs
       match_any:
-        - 'NOT (jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?|systemd(-[^.]*)?|google-osconfig-agent|google-guest-agent|google-cloud-ops-agent(-[^.]*)?|superserve-otel-collector|unbound|(superserve-)?secretsproxy|superserve-host-logging-heartbeat)\.service$" OR jsonPayload._TRANSPORT = "kernel")'
+        - 'NOT (resource.labels._superserve_journal_unit =~ "^(superserve-vmd|proxy(-[^.]*)?|systemd(-[^.]*)?|google-osconfig-agent|google-guest-agent|google-cloud-ops-agent(-[^.]*)?|superserve-otel-collector|unbound|(superserve-)?secretsproxy|superserve-host-logging-heartbeat)\.service$" OR resource.labels._superserve_journal_transport = "kernel")'
     capture_journal_provenance:
       type: modify_fields
       fields:
-        labels.journal_unit:
+        resource.labels._superserve_journal_unit:
           copy_from: jsonPayload._SYSTEMD_UNIT
-        labels.journal_transport:
+        resource.labels._superserve_journal_transport:
           copy_from: jsonPayload._TRANSPORT
-        labels.journal_priority:
-          copy_from: jsonPayload.PRIORITY
-        labels.syslog_identifier:
-          copy_from: jsonPayload.SYSLOG_IDENTIFIER
-        labels.process_id:
-          copy_from: jsonPayload._PID
     parse_application_json:
       type: parse_json
       # parse_json consumes the receiver's MESSAGE field; field is not a
@@ -75,6 +71,28 @@ logging:
           # The double-equals NULL form is rejected by the pinned Ops Agent
           # configuration validator.
           omit_if: 'NOT jsonPayload.severity:* OR severity:*'
+    reset_promoted_special_fields:
+      # parse_json can promote labels/httpRequest and other Cloud Logging
+      # special fields. Remove the complete application-controlled set before
+      # rebuilding the positive allowlist and trusted platform labels.
+      type: modify_fields
+      fields:
+        labels:
+          omit_if: 'labels:*'
+        httpRequest:
+          omit_if: 'httpRequest:*'
+        operation:
+          omit_if: 'operation:*'
+        sourceLocation:
+          omit_if: 'sourceLocation:*'
+        spanId:
+          omit_if: 'spanId:*'
+        trace:
+          omit_if: 'trace:*'
+        traceSampled:
+          omit_if: 'traceSampled:*'
+        insertId:
+          omit_if: 'insertId:*'
     add_platform_context:
       type: modify_fields
       fields:
@@ -93,7 +111,11 @@ logging:
         labels.instance_id:
           copy_from: resource.labels.instance_id
         labels.unit:
-          copy_from: labels.journal_unit
+          copy_from: resource.labels._superserve_journal_unit
+        labels.journal_unit:
+          copy_from: resource.labels._superserve_journal_unit
+        labels.journal_transport:
+          copy_from: resource.labels._superserve_journal_transport
     redact_sensitive_fields:
       type: modify_fields
       fields:
@@ -159,7 +181,7 @@ logging:
           # Parsing failures must not retain a raw application MESSAGE; it can
           # contain request, response, file, or command content. The positive
           # payload allowlist below also removes MESSAGE for host units.
-          omit_if: 'jsonPayload.MESSAGE:* AND jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?)\.service$"'
+          omit_if: 'jsonPayload.MESSAGE:* AND resource.labels._superserve_journal_unit =~ "^(superserve-vmd|proxy(-[^.]*)?)\.service$"'
     allowlisted_application_fields:
       # Parsed application JSON is not an export contract by itself: unknown
       # keys can contain credentials, request/file contents, or commands. Copy
@@ -187,17 +209,21 @@ logging:
           copy_from: jsonPayload.error_code
         labels.status:
           copy_from: jsonPayload.status
-        labels.host_logging_heartbeat:
-          copy_from: jsonPayload.host_logging_heartbeat
     drop_unallowlisted_payload:
-      # Preserve the raw diagnostic body for provenance-safe host/kernel
-      # records. Application units remain behind the positive allowlist
-      # boundary, so their malformed/unknown body policy is not silently
-      # changed while the pending privacy decision is unresolved.
+      # Malformed application records export trusted metadata only. Their raw
+      # journal records remain available locally within existing retention; no
+      # unparsed application body is uploaded. Provenance-safe host/kernel
+      # diagnostics retain their bounded body.
       type: modify_fields
       fields:
         jsonPayload:
-          omit_if: 'jsonPayload:* AND jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?|(superserve-)?secretsproxy(-[^.]*)?)\.service$"'
+          omit_if: 'jsonPayload:* AND resource.labels._superserve_journal_unit =~ "^(superserve-vmd|proxy(-[^.]*)?|(superserve-)?secretsproxy(-[^.]*)?)\.service$"'
+    allowlisted_heartbeat:
+      type: modify_fields
+      fields:
+        labels.host_logging_heartbeat:
+          copy_from: jsonPayload.host_logging_heartbeat
+          omit_if: 'NOT resource.labels._superserve_journal_unit = "superserve-host-logging-heartbeat.service"'
     exclude_debug_after_parse:
       type: exclude_logs
       match_any:
@@ -220,9 +246,11 @@ logging:
           - parse_application_json
           - map_application_severity
           - map_legacy_application_severity
+          - reset_promoted_special_fields
           - add_platform_context
           - redact_sensitive_fields
           - allowlisted_application_fields
+          - allowlisted_heartbeat
           - drop_unallowlisted_payload
           - exclude_debug_after_parse
       ops_agent_self_logs:
@@ -240,12 +268,10 @@ metrics:
           - hostmetrics
         processors: []
 
-# ${length(enrolled_hosts)} serving host descriptor(s) are Terraform inputs for
-# rollout and IAM. The installed identity file is authoritative at runtime;
-# application JSON cannot overwrite platform labels.
-%{ for name, host in enrolled_hosts ~}
-# ${name}: host_id=${host.host_id} incarnation=${host.incarnation} instance_id=${host.instance_id}
-%{ endfor ~}
+# Enrolled host descriptors remain Terraform rollout/IAM inputs. Per-host
+# identity values are deliberately not rendered into this artifact: the
+# installed identity file and resource labels are authoritative at runtime, so
+# an unknown replacement VM ID cannot make functional content unresolved.
 # The built-in checkpoint/retry path and disk buffer are used; no custom spool
 # or per-entry namespace/mount is introduced. Reconciliation accounts for the
 # buffer, self-log, and retained syslog stores independently of journald.

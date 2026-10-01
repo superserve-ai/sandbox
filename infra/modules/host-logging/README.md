@@ -11,7 +11,8 @@ The supported `systemd_journald` receiver is paired with a processor allowlist
 systemd-manager and host/kernel
 records. Zerolog `level` is mapped to Cloud Logging severity before
 DEBUG/TRACE exclusion. Application parse failures keep trusted journal
-metadata but do not export raw messages. Parsed JSON is reduced to the explicit
+metadata but export trusted metadata only; the raw record remains locally
+available within journal retention and is never uploaded. Parsed JSON is reduced to the explicit
 diagnostic/correlation allowlist (`request_id`, `sandbox_id`, proxy
 generation/revision, service, component, event, error code, and status); the
 remaining payload, including secrets-proxy/systemd `MESSAGE`, is removed

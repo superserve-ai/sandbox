@@ -169,12 +169,12 @@ variable "agent_cpu_limit_millicores" {
 }
 
 variable "ops_agent_package_version" {
-  description = "Pinned Ops Agent package version selected after staging verification; must include the supported built-in buffer cap introduced in 2.28."
+  description = "Pinned Ops Agent package version selected after staging verification; its supported buffer semantics and generator output must be recorded before rollout."
   type        = string
   default     = "2.52.0"
 
   validation {
     condition     = can(regex("^2\\.(2[89]|[3-9][0-9]|[1-9][0-9]{2,})", var.ops_agent_package_version))
-    error_message = "ops_agent_package_version must be Ops Agent 2.28.0 or newer so the documented built-in disk buffer cap is present."
+    error_message = "ops_agent_package_version must be Ops Agent 2.28.0 or newer so the documented platform-managed buffer protection is available; numeric limits require release evidence."
   }
 }

@@ -197,8 +197,13 @@ def _identity_only_change(before, after, unknown, old_id, new_id=None, path=()):
     if before == after:
         return
     if leaf in _DERIVED_METADATA_KEYS:
-        if leaf == 'instance_id' and new_id is not None:
-            require(str(after) == str(new_id), 'Host logging identity does not follow the selected VM')
+        # A dependency may only carry the identity selected by the VM change.
+        # Do not accept an arbitrary identity-looking value from an artifact;
+        # an unknown replacement ID remains unknown until the provider resolves
+        # the selected VM itself.
+        if before != after:
+            require(new_id is not None and str(after) == str(new_id),
+                    'Host logging identity does not follow the selected VM')
         return
     if (isinstance(before, str) and isinstance(after, str)
             and leaf in _IDENTITY_SUBSTITUTION_KEYS and old_id and old_id in before):
@@ -208,25 +213,6 @@ def _identity_only_change(before, after, unknown, old_id, new_id=None, path=()):
                 'Unrelated host logging content change: ' + str(path))
         return
     require(False, 'Unrelated host logging change during replacement: ' + str(path))
-
-
-def _first_identity(value):
-    """Return one explicit prior/current identity used for content substitution."""
-    if isinstance(value, dict):
-        for key in ('instance_id', 'host_id', 'incarnation', 'instance_name'):
-            candidate = value.get(key)
-            if candidate not in (None, '') and not isinstance(candidate, (dict, list)):
-                return str(candidate)
-        for child in value.values():
-            candidate = _first_identity(child)
-            if candidate:
-                return candidate
-    elif isinstance(value, list):
-        for child in value:
-            candidate = _first_identity(child)
-            if candidate:
-                return candidate
-    return None
 
 
 def validate_host_logging_update(change, vm_change, config, host, region):
@@ -263,8 +249,15 @@ def validate_host_logging_update(change, vm_change, config, host, region):
             'Host logging policy/artifact creation or replacement is unsupported during provisioning')
     before = change['change'].get('before')
     after = change['change'].get('after')
-    old_id = _first_identity(before)
-    new_id = _first_identity(after)
+    # Identity authority comes from the selected VM change, never from the
+    # first identity-looking field found in a rendered artifact.  On create
+    # recovery the retained identity adapter is independently validated by the
+    # provisioning guard; host-logging content must therefore already be
+    # equivalent unless it contains an explicitly VM-bound identity path.
+    vm_before = vm_change.get('before') or {}
+    vm_after = vm_change.get('after') or {}
+    old_id = vm_before.get('instance_id')
+    new_id = vm_after.get('instance_id')
     _identity_only_change(before, after, change['change'].get('after_unknown'),
                           old_id, new_id)
     if resource in {

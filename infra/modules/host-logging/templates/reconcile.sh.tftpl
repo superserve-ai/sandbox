@@ -156,25 +156,25 @@ bytes_total = 0
 capped = False
 while queue:
     current = queue.pop(0)
+    if not os.path.lexists(root):
+        if kind in {"buffer", "self_log"}:
+            continue
+        raise SystemExit(2)
     try:
-        entries = os.scandir(current)
-    except OSError:
-        continue
-    with entries:
-        for entry in entries:
-            if visited >= limit + 1:
-                capped = True
-                break
-            visited += 1
-            try:
+        with os.scandir(current) as entries:
+            for entry in entries:
+                if visited >= limit + 1:
+                    capped = True
+                    break
+                visited += 1
                 if entry.is_dir(follow_symlinks=False):
                     if kind != "syslog":
                         queue.append(entry.path)
                 elif entry.is_file(follow_symlinks=False):
                     if kind != "syslog" or entry.name == "syslog" or entry.name.startswith("syslog."):
                         bytes_total += entry.stat(follow_symlinks=False).st_size
-            except OSError:
-                continue
+    except OSError:
+        raise SystemExit(2)
     if capped:
         break
 print(kind, bytes_total, int(capped or visited > limit))
@@ -189,15 +189,20 @@ PY
 fi
 storage_bytes=0; buffer_bytes=0; self_log_bytes=0; syslog_bytes=0
 storage_scan_capped=0
+seen_buffer=0; seen_self_log=0; seen_syslog=0
 while read -r kind size capped; do
-  test -n "$kind" || continue
+  test -n "$kind" || exit 1
+  case "$size" in (''|*[!0-9]*) exit 1 ;; esac
+  case "$capped" in (0) ;; (1) storage_scan_capped=1 ;; (*) exit 1 ;; esac
   storage_bytes=$((storage_bytes + size))
   case "$kind" in
-    buffer) buffer_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
-    self_log) self_log_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
-    syslog) syslog_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
+    buffer) [ "$seen_buffer" -eq 0 ] || exit 1; seen_buffer=1; buffer_bytes=$size ;;
+    self_log) [ "$seen_self_log" -eq 0 ] || exit 1; seen_self_log=1; self_log_bytes=$size ;;
+    syslog) [ "$seen_syslog" -eq 0 ] || exit 1; seen_syslog=1; syslog_bytes=$size ;;
+    *) exit 1 ;;
   esac
 done < "$storage_scan_result"
+[ "$seen_buffer" -eq 1 ] && [ "$seen_self_log" -eq 1 ] && [ "$seen_syslog" -eq 1 ] || exit 1
 [ "$storage_scan_capped" -eq 0 ] || logger -t superserve-host-logging -p warning "storage accounting reached its bounded entry cap; reconciliation will reclaim disposable files after activation"
 if [ "$self_log_bytes" -gt ${agent_self_log_max_bytes} ]; then
   logger -t superserve-host-logging -p warning "Ops Agent self-log store exceeds ${agent_self_log_max_bytes} byte bound; disposable retention will be reclaimed after activation"
@@ -501,7 +506,7 @@ if ! timeout "$storage_remediation_timeout" bash -c '
     kind="$1"; root="$2"; limit="$3"; count=0; total=0; capped=0; scan_limit=$((max_entries + 1))
     files=(); sizes=()
     listing=$(mktemp)
-    python3 - "$kind" "$root" "$max_entries" >"$listing" <<'PY'
+    if ! python3 - "$kind" "$root" "$max_entries" >"$listing" <<'PY'
 import os
 import sys
 
@@ -512,17 +517,17 @@ visited = 0
 capped = False
 while queue:
     current = queue.pop(0)
+    if not os.path.lexists(root):
+        if kind == "self_log":
+            raise SystemExit(0)
+        raise SystemExit(2)
     try:
-        entries = os.scandir(current)
-    except OSError:
-        continue
-    with entries:
-        for entry in entries:
-            if visited >= limit + 1:
-                capped = True
-                break
-            visited += 1
-            try:
+        with os.scandir(current) as entries:
+            for entry in entries:
+                if visited >= limit + 1:
+                    capped = True
+                    break
+                visited += 1
                 if entry.is_dir(follow_symlinks=False):
                     if kind != "syslog":
                         queue.append(entry.path)
@@ -533,13 +538,18 @@ while queue:
                 selected = selected or (kind == "syslog" and (entry.name == "syslog" or entry.name.startswith("syslog.")))
                 if selected:
                     print(entry.path, entry.stat(follow_symlinks=False).st_size, sep="\t")
-            except OSError:
-                continue
+    except OSError:
+        raise SystemExit(2)
     if capped:
         break
 if capped or visited > limit:
     print("__CAP__", 0, sep="\t")
 PY
+    then
+      rm -f "$listing"
+      cleanup_failed=1
+      return
+    fi
     while IFS="$(printf '\t')" read -r path size; do
       if [ "$path" = __CAP__ ]; then capped=1; continue; fi
       files+=("$path"); sizes+=("$size"); total=$((total + size)); count=$((count + 1))
@@ -608,25 +618,25 @@ bytes_total = 0
 capped = False
 while queue:
     current = queue.pop(0)
+    if not os.path.lexists(root):
+        if kind in {"buffer", "self_log"}:
+            continue
+        raise SystemExit(2)
     try:
-        entries = os.scandir(current)
-    except OSError:
-        continue
-    with entries:
-        for entry in entries:
-            if visited >= limit + 1:
-                capped = True
-                break
-            visited += 1
-            try:
+        with os.scandir(current) as entries:
+            for entry in entries:
+                if visited >= limit + 1:
+                    capped = True
+                    break
+                visited += 1
                 if entry.is_dir(follow_symlinks=False):
                     if kind != "syslog":
                         queue.append(entry.path)
                 elif entry.is_file(follow_symlinks=False):
                     if kind != "syslog" or entry.name == "syslog" or entry.name.startswith("syslog."):
                         bytes_total += entry.stat(follow_symlinks=False).st_size
-            except OSError:
-                continue
+    except OSError:
+        raise SystemExit(2)
     if capped:
         break
 print(kind, bytes_total, int(capped or visited > limit))
@@ -641,15 +651,20 @@ PY
 fi
 storage_bytes=0; buffer_bytes=0; self_log_bytes=0; syslog_bytes=0
 storage_scan_capped=0
+seen_buffer=0; seen_self_log=0; seen_syslog=0
 while read -r kind size capped; do
-  test -n "$kind" || continue
+  test -n "$kind" || exit 1
+  case "$size" in (''|*[!0-9]*) exit 1 ;; esac
+  case "$capped" in (0) ;; (1) storage_scan_capped=1 ;; (*) exit 1 ;; esac
   storage_bytes=$((storage_bytes + size))
   case "$kind" in
-    buffer) buffer_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
-    self_log) self_log_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
-    syslog) syslog_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
+    buffer) [ "$seen_buffer" -eq 0 ] || exit 1; seen_buffer=1; buffer_bytes=$size ;;
+    self_log) [ "$seen_self_log" -eq 0 ] || exit 1; seen_self_log=1; self_log_bytes=$size ;;
+    syslog) [ "$seen_syslog" -eq 0 ] || exit 1; seen_syslog=1; syslog_bytes=$size ;;
+    *) exit 1 ;;
   esac
 done < "$storage_scan_result"
+[ "$seen_buffer" -eq 1 ] && [ "$seen_self_log" -eq 1 ] && [ "$seen_syslog" -eq 1 ] || exit 1
 if [ "$storage_scan_capped" -ne 0 ]; then
   logger -t superserve-host-logging -p err "post-remediation storage accounting is incomplete"
   exit 1
