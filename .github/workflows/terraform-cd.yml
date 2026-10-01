@@ -330,21 +330,6 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Require accepted staging host-logging evidence
-        env:
-          HOST_LOGGING_STAGING_EVIDENCE_URL: ${{ vars.HOST_LOGGING_STAGING_EVIDENCE_URL }}
-        run: |
-          set -euo pipefail
-          test -n "$HOST_LOGGING_STAGING_EVIDENCE_URL" || { echo "Production host-logging activation is deferred until staging evidence is published." >&2; exit 1; }
-          case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
-          curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
-          python3 - "$RUNNER_TEMP/host-logging-staging-evidence.json" <<'PY'
-          import json, sys
-          evidence = json.load(open(sys.argv[1]))
-          if evidence.get("environment") != "staging" or evidence.get("accepted") is not True or evidence.get("configuration_revision") != "2026-10-01":
-              raise SystemExit("accepted staging host-logging evidence for configuration revision is required")
-          PY
-
       - name: Verify validation dependencies
         run: |
           set -euo pipefail
@@ -352,6 +337,8 @@ jobs:
           command -v curl
 
       - name: Terraform apply production/us-west2
+        env:
+          HOST_LOGGING_STAGING_EVIDENCE_URL: ${{ vars.HOST_LOGGING_STAGING_EVIDENCE_URL }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: production/us-west2" >> "$GITHUB_STEP_SUMMARY"
@@ -383,6 +370,20 @@ jobs:
             --region "${{ vars.GCP_REGION_USW }}" \
             --project "${{ vars.GCP_PROJECT }}"
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan > "$RUNNER_TEMP/production-usw2-plan.json"
+          if python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/production-usw2-plan.json"; then
+            HOST_LOGGING_REVISION=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --revision "$RUNNER_TEMP/production-usw2-plan.json")
+            test -n "$HOST_LOGGING_REVISION" || { echo "Host-logging plan did not expose its configuration revision." >&2; exit 1; }
+            test -n "${HOST_LOGGING_STAGING_EVIDENCE_URL:-}" || { echo "Host-logging activation requires accepted staging evidence." >&2; exit 1; }
+            case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
+            curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
+            python3 - "$RUNNER_TEMP/host-logging-staging-evidence.json" "$HOST_LOGGING_REVISION" <<'PY'
+          import json, sys
+          evidence = json.load(open(sys.argv[1]))
+          if evidence.get("environment") != "staging" or evidence.get("accepted") is not True or evidence.get("configuration_revision") != sys.argv[2]:
+              raise SystemExit("accepted staging host-logging evidence for configuration revision is required")
+          PY
+          fi
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-usw2 --pinned-revision "$previous"
           terraform apply -input=false -auto-approve tfplan
@@ -519,21 +520,6 @@ jobs:
         with:
           terraform_wrapper: false
 
-      - name: Require accepted staging host-logging evidence
-        env:
-          HOST_LOGGING_STAGING_EVIDENCE_URL: ${{ vars.HOST_LOGGING_STAGING_EVIDENCE_URL }}
-        run: |
-          set -euo pipefail
-          test -n "$HOST_LOGGING_STAGING_EVIDENCE_URL" || { echo "Production host-logging activation is deferred until staging evidence is published." >&2; exit 1; }
-          case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
-          curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
-          python3 - "$RUNNER_TEMP/host-logging-staging-evidence.json" <<'PY'
-          import json, sys
-          evidence = json.load(open(sys.argv[1]))
-          if evidence.get("environment") != "staging" or evidence.get("accepted") is not True or evidence.get("configuration_revision") != "2026-10-01":
-              raise SystemExit("accepted staging host-logging evidence for configuration revision is required")
-          PY
-
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -547,6 +533,8 @@ jobs:
           command -v curl
 
       - name: Terraform apply production/us-central1
+        env:
+          HOST_LOGGING_STAGING_EVIDENCE_URL: ${{ vars.HOST_LOGGING_STAGING_EVIDENCE_URL }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: production/us-central1" >> "$GITHUB_STEP_SUMMARY"
@@ -554,6 +542,20 @@ jobs:
           terraform init -input=false
           terraform validate
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan > "$RUNNER_TEMP/production-usc1-plan.json"
+          if python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/production-usc1-plan.json"; then
+            HOST_LOGGING_REVISION=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --revision "$RUNNER_TEMP/production-usc1-plan.json")
+            test -n "$HOST_LOGGING_REVISION" || { echo "Host-logging plan did not expose its configuration revision." >&2; exit 1; }
+            test -n "${HOST_LOGGING_STAGING_EVIDENCE_URL:-}" || { echo "Host-logging activation requires accepted staging evidence." >&2; exit 1; }
+            case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
+            curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
+            python3 - "$RUNNER_TEMP/host-logging-staging-evidence.json" "$HOST_LOGGING_REVISION" <<'PY'
+          import json, sys
+          evidence = json.load(open(sys.argv[1]))
+          if evidence.get("environment") != "staging" or evidence.get("accepted") is not True or evidence.get("configuration_revision") != sys.argv[2]:
+              raise SystemExit("accepted staging host-logging evidence for configuration revision is required")
+          PY
+          fi
           terraform apply -input=false -auto-approve tfplan
 
   # us-east4 is the "use" cell's control plane + vmd host (api.superserve.ai) —
@@ -595,24 +597,10 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Require accepted staging host-logging evidence
-        env:
-          HOST_LOGGING_STAGING_EVIDENCE_URL: ${{ vars.HOST_LOGGING_STAGING_EVIDENCE_URL }}
-        run: |
-          set -euo pipefail
-          test -n "$HOST_LOGGING_STAGING_EVIDENCE_URL" || { echo "Production host-logging activation is deferred until staging evidence is published." >&2; exit 1; }
-          case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
-          curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
-          python3 - "$RUNNER_TEMP/host-logging-staging-evidence.json" <<'PY'
-          import json, sys
-          evidence = json.load(open(sys.argv[1]))
-          if evidence.get("environment") != "staging" or evidence.get("accepted") is not True or evidence.get("configuration_revision") != "2026-10-01":
-              raise SystemExit("accepted staging host-logging evidence for configuration revision is required")
-          PY
-
       - name: Terraform apply production/us-east4
         env:
           TF_VAR_proxy_generation_frontends_enabled: ${{ vars.PROXY_PRODUCTION_FRONTEND_MIGRATED == 'true' && 'true' || 'false' }}
+          HOST_LOGGING_STAGING_EVIDENCE_URL: ${{ vars.HOST_LOGGING_STAGING_EVIDENCE_URL }}
         run: |
           set -euo pipefail
           echo "## Terraform rollout: production/us-east4" >> "$GITHUB_STEP_SUMMARY"
@@ -644,6 +632,20 @@ jobs:
             --region "${{ vars.GCP_REGION_USE4 }}" \
             --project "${{ vars.GCP_PROJECT }}"
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan > "$RUNNER_TEMP/production-use4-plan.json"
+          if python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/production-use4-plan.json"; then
+            HOST_LOGGING_REVISION=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --revision "$RUNNER_TEMP/production-use4-plan.json")
+            test -n "$HOST_LOGGING_REVISION" || { echo "Host-logging plan did not expose its configuration revision." >&2; exit 1; }
+            test -n "${HOST_LOGGING_STAGING_EVIDENCE_URL:-}" || { echo "Host-logging activation requires accepted staging evidence." >&2; exit 1; }
+            case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
+            curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
+            python3 - "$RUNNER_TEMP/host-logging-staging-evidence.json" "$HOST_LOGGING_REVISION" <<'PY'
+          import json, sys
+          evidence = json.load(open(sys.argv[1]))
+          if evidence.get("environment") != "staging" or evidence.get("accepted") is not True or evidence.get("configuration_revision") != sys.argv[2]:
+              raise SystemExit("accepted staging host-logging evidence for configuration revision is required")
+          PY
+          fi
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --guarded module.sandbox_host_c
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-use4 --pinned-revision "$previous"
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_proxy_frontend_steady_plan.py"

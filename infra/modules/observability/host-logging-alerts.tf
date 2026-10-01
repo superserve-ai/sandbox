@@ -16,7 +16,7 @@ resource "google_logging_metric" "host_logging_heartbeat" {
 
   project = var.project_id
   name    = "superserve_host_logging_heartbeat_${each.key}"
-  filter  = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND jsonPayload.host_logging_heartbeat=true"
+  filter  = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\""
 
   metric_descriptor {
     metric_kind = "DELTA"
@@ -34,7 +34,7 @@ resource "google_logging_metric" "host_logging_heartbeat" {
     # does not provide instance_name. Use the numeric instance identity for
     # producer, metric, inventory, and alert matching. Runtime host_id,
     # instance name, and incarnation remain separate log labels.
-    collector_host_id = "EXTRACT(labels.instance_id)"
+    collector_host_id = "EXTRACT(resource.labels.instance_id)"
   }
 }
 
@@ -61,7 +61,7 @@ resource "google_monitoring_alert_policy" "host_logging_export_failures" {
   conditions {
     display_name = "Ops Agent export errors on ${each.value.instance_name}"
     condition_matched_log {
-      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"ops_agent_self_logs\") AND (severity>=ERROR OR textPayload =~ \"(?i)(failed to flush chunk|exporting failed|permission denied|drop|dropped)\" OR jsonPayload.MESSAGE =~ \"(?i)(failed to flush chunk|exporting failed|permission denied|drop|dropped)\")"
+      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"ops_agent_self_log_files\") AND (severity>=ERROR OR jsonPayload.message =~ \"(?i)(failed to flush chunk|exporting failed|permission denied|drop|dropped)\")"
     }
   }
 

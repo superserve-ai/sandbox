@@ -20,6 +20,7 @@ class HostLoggingConfigChecks(unittest.TestCase):
 
     def test_parse_before_filter_and_platform_context(self):
         self.assertLess(self.config.index("parse_application_json"), self.config.index("exclude_debug_after_parse"))
+        self.assertLess(self.config.index("capture_journal_provenance"), self.config.index("parse_application_json"))
         self.assertIn("labels.environment", self.config)
         self.assertIn("labels.region", self.config)
         self.assertIn("labels.host_id", self.config)
@@ -29,6 +30,11 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertIn("jsonPayload.level", self.config)
         self.assertIn("jsonPayload.body_snippet", self.config)
         self.assertIn("jsonPayload.MESSAGE", self.config)
+        self.assertIn("allowlisted_application_fields", self.config)
+        self.assertIn("drop_unallowlisted_payload", self.config)
+        self.assertIn("jsonPayload:*", self.config)
+        self.assertIn("labels.host_logging_heartbeat", self.config)
+        self.assertNotIn("jsonPayload.severity == NULL", self.config)
         self.assertIn("default_pipeline:", self.config)
 
     def test_durable_retention_and_safe_activation(self):

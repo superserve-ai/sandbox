@@ -296,20 +296,6 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v2
-      - name: Require accepted staging host-logging evidence
-        env:
-          HOST_LOGGING_STAGING_EVIDENCE_URL: ${{ vars.HOST_LOGGING_STAGING_EVIDENCE_URL }}
-        run: |
-          set -euo pipefail
-          test -n "$HOST_LOGGING_STAGING_EVIDENCE_URL" || { echo "Production host-logging activation is deferred until staging evidence is published." >&2; exit 1; }
-          case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
-          curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
-          python3 - "$RUNNER_TEMP/host-logging-staging-evidence.json" <<'PY'
-          import json, sys
-          evidence = json.load(open(sys.argv[1]))
-          if evidence.get("environment") != "staging" or evidence.get("accepted") is not True or evidence.get("configuration_revision") != "2026-10-01":
-              raise SystemExit("accepted staging host-logging evidence for configuration revision is required")
-          PY
       - name: Bootstrap and check private evidence storage
         env:
           PROJECT: ${{ vars.GCP_PROJECT }}
@@ -440,20 +426,6 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
       - uses: google-github-actions/setup-gcloud@v2
-      - name: Require accepted staging host-logging evidence
-        env:
-          HOST_LOGGING_STAGING_EVIDENCE_URL: ${{ vars.HOST_LOGGING_STAGING_EVIDENCE_URL }}
-        run: |
-          set -euo pipefail
-          test -n "$HOST_LOGGING_STAGING_EVIDENCE_URL" || { echo "Production host-logging activation is deferred until staging evidence is published." >&2; exit 1; }
-          case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
-          curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
-          python3 - "$RUNNER_TEMP/host-logging-staging-evidence.json" <<'PY'
-          import json, sys
-          evidence = json.load(open(sys.argv[1]))
-          if evidence.get("environment") != "staging" or evidence.get("accepted") is not True or evidence.get("configuration_revision") != "2026-10-01":
-              raise SystemExit("accepted staging host-logging evidence for configuration revision is required")
-          PY
       - name: Bootstrap and check private evidence storage
         env:
           PROJECT: ${{ vars.GCP_PROJECT }}

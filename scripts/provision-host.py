@@ -131,6 +131,71 @@ def validate_identity_replacement(change, vm_change, references, host):
     unchanged(before, after, unknown)
 
 
+HOST_LOGGING_RESOURCES = {
+    'google_os_config_os_policy_assignment.host_logging',
+    'google_project_iam_member.log_writer',
+    'google_storage_bucket_iam_member.artifact_reader',
+    'google_storage_bucket_object.ops_agent_config',
+    'google_storage_bucket_object.reconcile_script',
+    'google_storage_bucket_object.validate_script',
+}
+
+
+def _references(value):
+    """Collect Terraform expression references without trusting values."""
+    found = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == 'references' and isinstance(child, list):
+                found.extend(item for item in child if isinstance(item, str))
+            found.extend(_references(child))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(_references(child))
+    return found
+
+
+def validate_host_logging_update(change, vm_change, config, host, region):
+    """Allow only selected-host-bound logging dependencies in a VM plan.
+
+    Host replacement changes the instance identity embedded in the rendered
+    Ops Agent artifacts and assignment. Keep those updates inside the
+    Terraform-owned host-logging module, require the selected host reference,
+    and retain the existing rejection of every unrelated resource.
+    """
+    address = change.get('address', '')
+    prefix = 'module.host_logging.'
+    require(address.startswith(prefix), 'Host logging dependency escaped its module')
+    resource = address[len(prefix):].split('[', 1)[0]
+    require(resource in HOST_LOGGING_RESOURCES,
+            'Unexpected host logging dependency: ' + address)
+    calls = config.get('module_calls', {}).get('host_logging', {})
+    references = _references(calls.get('expressions', {}))
+    identity_refs = {reference for reference in references
+                     if re.fullmatch(r'module\.sandbox_host(?:_b|_c)?\.instance_id', reference)}
+    require(f'module.{host}.instance_id' in identity_refs,
+            'Host logging assignment must follow the selected VM identity')
+    permitted = {f'module.{candidate}.instance_id' for candidate in HOSTS[region]}
+    require(identity_refs.issubset(permitted),
+            'Host logging assignment references an unselected VM identity')
+
+    actions = change['change']['actions']
+    if resource in {
+        'google_project_iam_member.log_writer',
+        'google_storage_bucket_iam_member.artifact_reader',
+    }:
+        # Runtime identities are stable across replacement. A bare delete
+        # would remove access for an unrelated principal; only an in-place
+        # update or creation of the selected host-bound binding is allowed.
+        require(actions in (['no-op'], ['read'], ['update'], ['create']),
+                'Host logging identity binding has an unsupported mutation')
+    else:
+        # Assignment and versioned artifacts must update in place. A destroy
+        # would discard the last working delivery policy during replacement.
+        require(actions in (['no-op'], ['read'], ['update']),
+                'Host logging policy/artifact replacement is destructive')
+
+
 def validate_plan(plan, host, image, operation, region, run_id=None):
     """Reject mutations outside the selected host and its validated dependencies."""
     require(plan.get('errored') is not True, 'Terraform plan errored')
@@ -201,6 +266,9 @@ def validate_plan(plan, host, image, operation, region, run_id=None):
                     'expressions', {}).get(variable, {}).get('references', [])
                 validate_monitoring_update(item['change'], change, references, host, condition_type)
                 continue
+        if addr.startswith('module.host_logging.'):
+            validate_host_logging_update(item, change, config, host, region)
+            continue
         raise ValueError(f'Unrelated mutation in full plan: {addr}: {actions}')
     inline = after.get('attached_disk') or []
     require(any((d.get('source') or '').split('/')[-1] == disk['name'] for d in inline) or

@@ -41,8 +41,13 @@ def verify(root: Path) -> list[str]:
         errors.append("package diagnosis/install operations must have an explicit timeout")
     if "activation_committed=1" not in reconcile or "trap on_exit EXIT" not in reconcile:
         errors.append("activation must retain rollback state until commit")
-    if "EXTRACT(labels.instance_name)" in alerts or "EXTRACT(labels.instance_id)" not in alerts:
-        errors.append("heartbeat metric must use the available numeric instance identity")
+    if ("EXTRACT(labels.instance_name)" in alerts or
+            "EXTRACT(resource.labels.instance_id)" not in alerts):
+        errors.append("heartbeat metric must extract the numeric resource instance identity")
+    if "allowlisted_application_fields" not in config or "drop_unallowlisted_payload" not in config:
+        errors.append("Ops Agent config must remove unallowlisted structured payload fields")
+    if 'log_id("ops_agent_self_log_files")' not in alerts or "jsonPayload.message" not in alerts:
+        errors.append("export failure alert must match the explicit self-log receiver payload")
     return errors
 
 

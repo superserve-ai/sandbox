@@ -45,6 +45,12 @@ logging:
           copy_from: jsonPayload._SYSTEMD_UNIT
         labels.journal_transport:
           copy_from: jsonPayload._TRANSPORT
+        labels.journal_priority:
+          copy_from: jsonPayload.PRIORITY
+        labels.syslog_identifier:
+          copy_from: jsonPayload.SYSLOG_IDENTIFIER
+        labels.process_id:
+          copy_from: jsonPayload._PID
     parse_application_json:
       type: parse_json
       # parse_json consumes the receiver's MESSAGE field; field is not a
@@ -62,7 +68,10 @@ logging:
       fields:
         severity:
           copy_from: jsonPayload.severity
-          omit_if: 'jsonPayload.severity == NULL OR severity != NULL'
+          # Cloud Logging filters use the documented :* presence operator.
+          # The double-equals NULL form is rejected by the pinned Ops Agent
+          # configuration validator.
+          omit_if: 'NOT jsonPayload.severity:* OR severity:*'
     add_platform_context:
       type: modify_fields
       fields:
@@ -86,68 +95,104 @@ logging:
       type: modify_fields
       fields:
         jsonPayload.authorization:
-          omit_if: 'jsonPayload.authorization != NULL'
+          omit_if: 'jsonPayload.authorization:*'
         jsonPayload.authorization_header:
-          omit_if: 'jsonPayload.authorization_header != NULL'
+          omit_if: 'jsonPayload.authorization_header:*'
         jsonPayload.cookie:
-          omit_if: 'jsonPayload.cookie != NULL'
+          omit_if: 'jsonPayload.cookie:*'
         jsonPayload.headers:
-          omit_if: 'jsonPayload.headers != NULL'
+          omit_if: 'jsonPayload.headers:*'
         jsonPayload.password:
-          omit_if: 'jsonPayload.password != NULL'
+          omit_if: 'jsonPayload.password:*'
         jsonPayload.secret:
-          omit_if: 'jsonPayload.secret != NULL'
+          omit_if: 'jsonPayload.secret:*'
         jsonPayload.token:
-          omit_if: 'jsonPayload.token != NULL'
+          omit_if: 'jsonPayload.token:*'
         jsonPayload.HOST_ID:
-          omit_if: 'jsonPayload.HOST_ID != NULL'
+          omit_if: 'jsonPayload.HOST_ID:*'
         jsonPayload.host_id:
-          omit_if: 'jsonPayload.host_id != NULL'
+          omit_if: 'jsonPayload.host_id:*'
         jsonPayload.incarnation:
-          omit_if: 'jsonPayload.incarnation != NULL'
+          omit_if: 'jsonPayload.incarnation:*'
         jsonPayload.request:
-          omit_if: 'jsonPayload.request != NULL'
+          omit_if: 'jsonPayload.request:*'
         jsonPayload.request_body:
-          omit_if: 'jsonPayload.request_body != NULL'
+          omit_if: 'jsonPayload.request_body:*'
         jsonPayload.file_contents:
-          omit_if: 'jsonPayload.file_contents != NULL'
+          omit_if: 'jsonPayload.file_contents:*'
         jsonPayload.command_payload:
-          omit_if: 'jsonPayload.command_payload != NULL'
+          omit_if: 'jsonPayload.command_payload:*'
         jsonPayload.body_snippet:
-          omit_if: 'jsonPayload.body_snippet != NULL'
+          omit_if: 'jsonPayload.body_snippet:*'
         jsonPayload.response_body:
-          omit_if: 'jsonPayload.response_body != NULL'
+          omit_if: 'jsonPayload.response_body:*'
         jsonPayload.response:
-          omit_if: 'jsonPayload.response != NULL'
+          omit_if: 'jsonPayload.response:*'
         jsonPayload.file:
-          omit_if: 'jsonPayload.file != NULL'
+          omit_if: 'jsonPayload.file:*'
         jsonPayload.file_path:
-          omit_if: 'jsonPayload.file_path != NULL'
+          omit_if: 'jsonPayload.file_path:*'
         jsonPayload.command:
-          omit_if: 'jsonPayload.command != NULL'
+          omit_if: 'jsonPayload.command:*'
         jsonPayload.payload:
-          omit_if: 'jsonPayload.payload != NULL'
+          omit_if: 'jsonPayload.payload:*'
         jsonPayload.content:
-          omit_if: 'jsonPayload.content != NULL'
+          omit_if: 'jsonPayload.content:*'
         jsonPayload.data:
-          omit_if: 'jsonPayload.data != NULL'
+          omit_if: 'jsonPayload.data:*'
         jsonPayload.input:
-          omit_if: 'jsonPayload.input != NULL'
+          omit_if: 'jsonPayload.input:*'
         jsonPayload.output:
-          omit_if: 'jsonPayload.output != NULL'
+          omit_if: 'jsonPayload.output:*'
         jsonPayload.stdout:
-          omit_if: 'jsonPayload.stdout != NULL'
+          omit_if: 'jsonPayload.stdout:*'
         jsonPayload.stderr:
-          omit_if: 'jsonPayload.stderr != NULL'
+          omit_if: 'jsonPayload.stderr:*'
         jsonPayload.args:
-          omit_if: 'jsonPayload.args != NULL'
+          omit_if: 'jsonPayload.args:*'
         jsonPayload.argv:
-          omit_if: 'jsonPayload.argv != NULL'
+          omit_if: 'jsonPayload.argv:*'
         jsonPayload.MESSAGE:
-          # Parsing failures retain the raw journal MESSAGE. Never export it
-          # for application units because it can contain request, response,
-          # file, or command content; trusted host units retain diagnostics.
-          omit_if: 'jsonPayload.MESSAGE != NULL AND jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?)\.service$"'
+          # Parsing failures must not retain a raw application MESSAGE; it can
+          # contain request, response, file, or command content. The positive
+          # payload allowlist below also removes MESSAGE for host units.
+          omit_if: 'jsonPayload.MESSAGE:* AND jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?)\.service$"'
+    allowlisted_application_fields:
+      # Parsed application JSON is not an export contract by itself: unknown
+      # keys can contain credentials, request/file contents, or commands. Copy
+      # only stable diagnostic/correlation keys to labels, then remove the
+      # complete parsed payload below. Platform identity labels are populated
+      # separately and cannot be supplied by application JSON.
+      type: modify_fields
+      fields:
+        labels.request_id:
+          copy_from: jsonPayload.request_id
+        labels.sandbox_id:
+          copy_from: jsonPayload.sandbox_id
+        labels.proxy_generation:
+          copy_from: jsonPayload.proxy_generation
+        labels.proxy_revision:
+          copy_from: jsonPayload.proxy_revision
+        labels.service:
+          copy_from: jsonPayload.service
+        labels.component:
+          copy_from: jsonPayload.component
+        labels.event:
+          copy_from: jsonPayload.event
+        labels.error_code:
+          copy_from: jsonPayload.error_code
+        labels.status:
+          copy_from: jsonPayload.status
+        labels.host_logging_heartbeat:
+          copy_from: jsonPayload.host_logging_heartbeat
+    drop_unallowlisted_payload:
+      # With no source, omit_if unsets the existing field. This is the
+      # positive allowlist boundary: arbitrary parsed keys and raw MESSAGE
+      # never reach Cloud Logging, including for secrets-proxy/systemd.
+      type: modify_fields
+      fields:
+        jsonPayload:
+          omit_if: 'jsonPayload:*'
     exclude_debug_after_parse:
       type: exclude_logs
       match_any:
@@ -172,6 +217,8 @@ logging:
           - map_legacy_application_severity
           - add_platform_context
           - redact_sensitive_fields
+          - allowlisted_application_fields
+          - drop_unallowlisted_payload
           - exclude_debug_after_parse
       ops_agent_self_logs:
         receivers:

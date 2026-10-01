@@ -115,6 +115,38 @@ class ProvisionPlanTests(unittest.TestCase):
                 provision.validate_plan(self.identity_plan(region), 'sandbox_host_b',
                                         'opaque-image', 'replace', region)
 
+    def host_logging_plan(self, region='us-central1', host='sandbox_host_b'):
+        plan = fixture(region=region, host=host)
+        plan['resource_changes'].append(dict(
+            address='module.host_logging.google_os_config_os_policy_assignment.host_logging',
+            change=dict(actions=['update'], before={'name': 'host-logging'},
+                        after={'name': 'host-logging'})))
+        plan['configuration'] = {'root_module': {'module_calls': {
+            'host_logging': {'expressions': {
+                'enrolled_hosts': {'references': [f'module.{host}.instance_id']}
+            }}}}}
+        return plan
+
+    def test_replacement_allows_selected_host_logging_dependencies(self):
+        provision.validate_plan(self.host_logging_plan(), 'sandbox_host_b',
+                                'opaque-image', 'replace', 'us-central1')
+
+    def test_host_logging_dependency_remains_narrowly_bound(self):
+        for mutation in ('wrong_reference', 'wrong_resource', 'destructive'):
+            with self.subTest(mutation=mutation):
+                plan = self.host_logging_plan()
+                item = plan['resource_changes'][-1]
+                if mutation == 'wrong_reference':
+                    item_config = plan['configuration']['root_module']['module_calls']['host_logging']
+                    item_config['expressions']['enrolled_hosts']['references'] = ['module.other.instance_id']
+                elif mutation == 'wrong_resource':
+                    item['address'] = 'module.host_logging.google_compute_instance.unrelated'
+                else:
+                    item['change']['actions'] = ['delete', 'create']
+                with self.assertRaises(ValueError):
+                    provision.validate_plan(plan, 'sandbox_host_b', 'opaque-image',
+                                           'replace', 'us-central1')
+
     def test_identity_replacement_rejects_changed_or_unknown_inputs(self):
         fields = self.identity_plan('us-central1')['resource_changes'][-1]['change'][
             'before']['triggers_replace'][0].keys() - {'instance_id'}

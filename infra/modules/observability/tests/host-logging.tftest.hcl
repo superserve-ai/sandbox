@@ -31,9 +31,17 @@ run "host_logging_alerts_contract" {
   assert {
     condition = alltrue([
       for metric in values(google_logging_metric.host_logging_heartbeat) :
-      metric.label_extractors["collector_host_id"] == "EXTRACT(labels.instance_id)"
+      metric.label_extractors["collector_host_id"] == "EXTRACT(resource.labels.instance_id)"
     ])
     error_message = "Heartbeat producer must use the stable VM identity, not runtime host_id."
+  }
+
+  assert {
+    condition = alltrue([
+      for metric in values(google_logging_metric.host_logging_heartbeat) :
+      strcontains(metric.filter, "labels.journal_unit=\"superserve-host-logging-heartbeat.service\"")
+    ])
+    error_message = "Heartbeat metric must accept only the managed heartbeat unit."
   }
 
   assert {
@@ -61,7 +69,7 @@ run "host_logging_alerts_contract" {
   assert {
     condition = alltrue([
       for policy in values(google_monitoring_alert_policy.host_logging_export_failures) :
-      strcontains(one(policy.conditions).condition_matched_log.filter, "log_id(\"ops_agent_self_logs\")")
+      strcontains(one(policy.conditions).condition_matched_log.filter, "log_id(\"ops_agent_self_log_files\")")
     ])
     error_message = "Export failure alert must consume the explicit bounded Ops Agent self-log receiver."
   }
