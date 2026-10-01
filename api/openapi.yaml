@@ -3613,6 +3613,14 @@ components:
         - $ref: "#/components/schemas/SandboxListItem"
         - type: object
           properties:
+            routing_hint:
+              type: string
+              description: |
+                Optional signed logical-owner routing hint. Send on data-plane
+                requests as X-Superserve-Routing-Hint, or as a route.<hint>
+                WebSocket subprotocol alongside the unchanged access token.
+                Refresh after resume/activate; absent or invalid hints retain
+                ownership lookup fallback. This does not authorize access.
             access_token:
               type: string
               description: |
@@ -3726,6 +3734,9 @@ components:
         status:
           type: string
           enum: [active]
+        routing_hint:
+          type: string
+          description: Fresh optional routing hint; replaces the hint from create.
         access_token:
           type: string
           description: Fresh access token; use this instead of the one from create.

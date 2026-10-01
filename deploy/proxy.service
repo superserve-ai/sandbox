@@ -16,7 +16,7 @@ Environment=PROXY_REDIRECT_ADDR=:5008
 # identity bootstrap. Outbound clients use credentials even without ingress.
 Environment=PEER_PROXY_LISTEN_ADDR=
 Environment=PEER_PROXY_TARGET_ADDR=127.0.0.1:5010
-Environment=PEER_PROXY_MAX_STREAMS=128
+Environment=PEER_PROXY_MAX_STREAMS=1024
 Environment=PEER_PROXY_CERT_FILE=/etc/superserve/peer/tls.crt
 Environment=PEER_PROXY_KEY_FILE=/etc/superserve/peer/tls.key
 Environment=PEER_PROXY_CA_FILE=/etc/superserve/peer/ca.crt

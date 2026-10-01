@@ -37,7 +37,7 @@ func startRoutingTestPeer(t *testing.T, target string, limits ...int64) (PeerTra
 	go func() {
 		done <- ServePeerListenerWithRecorder(ctx, listener, tlsConfig, target, zerolog.Nop(), nil, limit)
 	}()
-	peers := NewPeerTransport(PeerPoolConfig{Dial: GRPCPeerDialer(cfg.LoadClient)})
+	peers := NewPeerTransport(PeerPoolConfig{Dial: GRPCPeerDialer(cfg.LoadClient), MaxConnections: 4, StreamsPerConnection: 256})
 	t.Cleanup(func() {
 		peers.Close()
 		cancel()

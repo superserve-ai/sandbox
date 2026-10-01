@@ -65,6 +65,7 @@ const (
 // connect-rpc routes, and anything future boxd grows internally
 // without our knowledge.
 func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instanceID string) {
+	scrubRoutingHint(r)
 	if !h.sandboxConns.acquire(instanceID) {
 		http.Error(w, "too many connections to sandbox", http.StatusTooManyRequests)
 		return
@@ -72,11 +73,15 @@ func (h *Handler) serveBoxdPort(w http.ResponseWriter, r *http.Request, instance
 	defer h.sandboxConns.release(instanceID)
 
 	clientIP := clientAddr(r)
-	if !h.ipConns.acquire(clientIP) {
+	limiter := h.ipConns
+	if h.canRouteBoxdRequest(r, instanceID) {
+		limiter = h.authenticatedConns
+	}
+	if !limiter.acquire(clientIP) {
 		http.Error(w, "too many connections from this IP", http.StatusTooManyRequests)
 		return
 	}
-	defer h.ipConns.release(clientIP)
+	defer limiter.release(clientIP)
 
 	switch r.URL.Path {
 	case filesPath:
@@ -123,7 +128,7 @@ func (h *Handler) serveFiles(w http.ResponseWriter, r *http.Request, instanceID 
 		if h.originAllowed(origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", "X-Access-Token, X-Superserve-Routing-Hint, Content-Type")
 			w.Header().Set("Access-Control-Expose-Headers", "Content-Disposition")
 			w.Header().Set("Access-Control-Max-Age", "3600")
 		}

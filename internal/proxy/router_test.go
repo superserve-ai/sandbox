@@ -426,10 +426,12 @@ type lookupRecorder struct {
 	lookup   telemetry.OwnershipLookup
 	count    int
 	outcomes int
+	routes   []telemetry.RoutingOutcome
 }
 
-func (r *lookupRecorder) RecordRoutingOutcome(context.Context, telemetry.RoutingOutcome) {
+func (r *lookupRecorder) RecordRoutingOutcome(_ context.Context, outcome telemetry.RoutingOutcome) {
 	r.outcomes++
+	r.routes = append(r.routes, outcome)
 }
 func (r *lookupRecorder) RecordOwnershipLookup(_ context.Context, lookup telemetry.OwnershipLookup) {
 	r.lookup = lookup

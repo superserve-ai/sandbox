@@ -44,7 +44,7 @@ func (c diagnosticTransportCredentials) Clone() credentials.TransportCredentials
 const peerShutdownGrace = DefaultDrainGrace
 
 // Bound local connections across all peer transports, not just one HTTP/2 connection.
-const maxPeerStreams = 128
+const maxPeerStreams = 1024
 
 // Include idle and handshaking transports, which never reach stream admission.
 const maxPeerConnections = 128

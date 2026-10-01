@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -197,14 +198,31 @@ func run() error {
 		}
 		defer peers.Close()
 	}
+	var routingReady func() bool
 	router := proxy.NewRoutingHandler(domains, localHostID, ownership, peers, proxyHandler, log, routingRecorder)
+	if dbPool != nil {
+		directory := &proxy.HostDirectory{}
+		backgroundConfig := dbPool.Config()
+		backgroundConfig.MaxConns = 1
+		backgroundConfig.MinConns = 0
+		backgroundConfig.MinIdleConns = 0
+		backgroundPool, err := pgxpool.NewWithConfig(workCtx, backgroundConfig)
+		if err != nil {
+			log.Fatal().Err(err).Msg("routing hint background pool")
+		}
+		defer func() { finishWork(); backgroundPool.Close() }()
+		revocations := &proxy.RoutingRevocations{}
+		revocations.Start(workCtx, backgroundPool, directory, log)
+		router.WithRoutingHints(directory, revocations)
+		routingReady = routingBootstrapGate(func() bool { return directory.Ready() && revocations.Ready() }, time.Second)
+	}
 	log.Info().Bool("enabled", routingEnabled == "1").Msg("peer ownership routing configured")
 	mux, localMux := newDataPlaneMuxes(proxyHandler, router, routingEnabled == "1")
 	if dbPool != nil {
-		mux = newProxyMuxWithReadiness(proxyHandler, router, func(ctx context.Context) bool {
+		mux = newProxyMuxWithReadiness(proxyHandler, withRoutingBootstrap(router, routingReady), func(ctx context.Context) bool {
 			ctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 			defer cancel()
-			return dbPool.Ping(ctx) == nil
+			return routingReady() && dbPool.Ping(ctx) == nil
 		})
 	}
 	var localSrv *http.Server
@@ -218,7 +236,7 @@ func run() error {
 		if err != nil {
 			log.Fatal().Err(err).Msg("peer TLS setup failed")
 		}
-		streamLimit, err := strconv.ParseInt(envOrDefault("PEER_PROXY_MAX_STREAMS", "128"), 10, 32)
+		streamLimit, err := strconv.ParseInt(envOrDefault("PEER_PROXY_MAX_STREAMS", "1024"), 10, 32)
 		if err != nil || streamLimit <= 0 {
 			log.Fatal().Msg("PEER_PROXY_MAX_STREAMS must be a positive 32-bit integer")
 		}
@@ -480,6 +498,35 @@ func newProxyMuxWithHandler(proxyHandler *proxy.Handler, dataPlane http.Handler)
 	return newProxyMuxWithReadiness(proxyHandler, dataPlane, nil)
 }
 
+// Give routing state a bounded warmup. Overflow or refresh failure must not
+// prevent replacement proxies from serving the bounded ownership fallback.
+func routingBootstrapGate(fresh func() bool, warmup time.Duration) func() bool {
+	var initialized atomic.Bool
+	deadline := time.Now().Add(warmup)
+	return func() bool {
+		if initialized.Load() {
+			return true
+		}
+		if fresh() || !time.Now().Before(deadline) {
+			initialized.Store(true)
+			return true
+		}
+		return false
+	}
+}
+
+func withRoutingBootstrap(next http.Handler, ready func() bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !ready() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":{"code":"sandbox_unavailable","message":"proxy is warming routing state"}}`))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func newProxyMuxWithReadiness(proxyHandler *proxy.Handler, dataPlane http.Handler, dependencies func(context.Context) bool) *http.ServeMux {
 	generation := os.Getenv("PROXY_GENERATION")
 	mux := http.NewServeMux()
@@ -544,5 +591,5 @@ func newOutboundPeerTransport(log zerolog.Logger, recorder proxy.PeerPoolTelemet
 	if _, err := cfg.LoadClient(); err != nil {
 		return cfg, nil, err
 	}
-	return cfg, proxy.NewPeerTransport(proxy.PeerPoolConfig{Dial: proxy.GRPCPeerDialer(cfg.LoadClient), Telemetry: recorder, MaxConnections: 4, StreamsPerConnection: 32}), nil
+	return cfg, proxy.NewPeerTransport(proxy.PeerPoolConfig{Dial: proxy.GRPCPeerDialer(cfg.LoadClient), Telemetry: recorder, MaxConnections: 4, StreamsPerConnection: 256}), nil
 }
