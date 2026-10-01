@@ -1122,11 +1122,13 @@ func (r *Reconciler) retireArchivedOrphans(ctx context.Context, now time.Time, d
 		if !r.gracePeriodElapsed("archived-orphan:"+id, now) {
 			continue
 		}
-		// Do not retire metadata while a retained dependency is still present.
-		// Successful quarantine (or prior deletion) makes every durable path
-		// absent; inspection failures remain retryable and preserve the archive.
-		paths := []string{rec.DiskPath, rec.BasePath, rec.SnapshotPath, rec.MemFilePath,
-			rec.BaseMemPath, rec.RootfsPath}
+		// Do not retire metadata while an owner-specific retained dependency is
+		// still present. BasePath, BaseMemPath, and RootfsPath are shared
+		// template generations: disk reclamation quarantines only the owner's
+		// UUID directory and must not wait for a surviving owner's shared files
+		// to disappear. Inspection failures remain retryable and preserve the
+		// archive.
+		paths := []string{rec.DiskPath, rec.SnapshotPath, rec.MemFilePath}
 		paths = append(paths, rec.StrandedOverlays...)
 		present, inspectFailed := false, false
 		for _, path := range paths {

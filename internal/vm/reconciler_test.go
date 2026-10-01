@@ -17,6 +17,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/superserve-ai/sandbox/internal/db"
+	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 )
 
 const (
@@ -326,6 +327,118 @@ func TestReclaimDiskOrphans_StopsOnCancel(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(runDir, trashDirName)); !os.IsNotExist(err) {
 		t.Error("no .trash should be created when ctx is cancelled")
+	}
+}
+
+// An archived orphan's private directory can be quarantined while its
+// template/base remains referenced by another sandbox. Retirement must use
+// the authoritative owner termination plus the private cleanup, and must not
+// wait for shared artifacts to disappear. The state reopen and inventory at
+// the end model the restart that previously left the survivor unmeasurable.
+func TestRetireArchivedOrphanAfterQuarantinePreservesSharedBase(t *testing.T) {
+	root := t.TempDir()
+	runDir := filepath.Join(root, "run")
+	snapshotDir := filepath.Join(root, "snapshots")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	state, err := OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if state != nil {
+			_ = state.Close()
+		}
+	}()
+
+	sharedBase := filepath.Join(root, "templates", "base.ext4")
+	if err := os.MkdirAll(filepath.Dir(sharedBase), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sharedBase, []byte("shared base"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orphanID := uuid.NewString()
+	orphanDir := filepath.Join(runDir, orphanID)
+	if err := os.MkdirAll(orphanDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	orphan := VMRecord{
+		ID: orphanID, Status: StatusPaused,
+		DiskPath:     filepath.Join(orphanDir, "overlay.ext4"),
+		SnapshotPath: filepath.Join(orphanDir, "vmstate.snap"),
+		MemFilePath:  filepath.Join(orphanDir, "mem.snap"),
+		BasePath:     sharedBase,
+	}
+	for _, path := range []string{orphan.DiskPath, orphan.SnapshotPath, orphan.MemFilePath} {
+		if err := os.WriteFile(path, []byte("orphan"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := state.Put(orphan); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.ReleaseRetainingStorage(orphanID); err != nil {
+		t.Fatal(err)
+	}
+	if err := quarantineDir(orphanDir, "2026-10-01"); err != nil {
+		t.Fatal(err)
+	}
+
+	survivorID := uuid.NewString()
+	survivorDir := filepath.Join(runDir, survivorID)
+	if err := os.MkdirAll(survivorDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	survivor := VMRecord{
+		ID: survivorID, Status: StatusRunning,
+		DiskPath: filepath.Join(survivorDir, "overlay.ext4"),
+		BasePath: sharedBase, SourceSnapshotID: uuid.NewString(),
+	}
+	if err := os.WriteFile(survivor.DiskPath, []byte("survivor"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Put(survivor); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := &Manager{state: state, cfg: ManagerConfig{RunDir: runDir, SnapshotDir: snapshotDir}, log: zerolog.Nop()}
+	r := NewReconciler(mgr, ReconcilerConfig{GracePeriod: 0})
+	dbSandboxes := map[string]db.ListSandboxesByHostRow{}
+	now := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+	r.retireArchivedOrphans(context.Background(), now, dbSandboxes, nil, nil, zerolog.Nop())
+	r.retireArchivedOrphans(context.Background(), now.Add(time.Second), dbSandboxes, nil, nil, zerolog.Nop())
+	archived, err := state.retainedArchivedRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archived) != 0 {
+		t.Fatalf("quarantined orphan archive remains: %+v", archived)
+	}
+	if _, err := os.Stat(sharedBase); err != nil {
+		t.Fatalf("shared base was removed while survivor retained it: %v", err)
+	}
+
+	if err := state.Close(); err != nil {
+		t.Fatal(err)
+	}
+	state, err = OpenStateStore(filepath.Join(root, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.state = state
+	inv, err := mgr.retainedStorageInventoryWithPersistence(context.Background(), func(*os.File, int) ([]retainedstorage.Extent, string, error) {
+		return []retainedstorage.Extent{{Device: "fixture", Start: 0, Length: 4096}}, "fixture", nil
+	}, false)
+	if err != nil {
+		t.Fatalf("survivor inventory failed after restart: %v", err)
+	}
+	if len(inv.Owners) != 1 || inv.Owners[0].ID != survivorID {
+		t.Fatalf("inventory owners = %+v, want survivor %s", inv.Owners, survivorID)
 	}
 }
 
