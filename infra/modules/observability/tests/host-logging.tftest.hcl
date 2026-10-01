@@ -1,3 +1,5 @@
+mock_provider "google" {}
+
 run "host_logging_alerts_contract" {
   command = plan
 
@@ -39,7 +41,8 @@ run "host_logging_alerts_contract" {
   assert {
     condition = alltrue([
       for metric in values(google_logging_metric.host_logging_heartbeat) :
-      strcontains(metric.filter, "labels.journal_unit=\"superserve-host-logging-heartbeat.service\"")
+      strcontains(metric.filter, "labels.journal_unit=\"superserve-host-logging-heartbeat.service\"") &&
+      strcontains(metric.filter, "labels.incarnation=\"incarnation-a\"")
     ])
     error_message = "Heartbeat metric must accept only the managed heartbeat unit."
   }
@@ -48,9 +51,8 @@ run "host_logging_alerts_contract" {
     condition = alltrue([
       for policy in values(google_monitoring_alert_policy.host_logging_lag) :
       alltrue([for condition in policy.conditions : (
-        (length(condition.condition_prometheus_query_language) == 1 &&
-        strcontains(one(condition.condition_prometheus_query_language).query, "max_over_time(") &&
-        one(condition.condition_prometheus_query_language).disable_metric_validation)
+        (length(condition.condition_threshold) == 1 &&
+        one(condition.condition_threshold).comparison == "COMPARISON_GT")
       )])
     ])
     error_message = "Each Monitoring condition block must contain exactly one supported condition type."
@@ -60,7 +62,8 @@ run "host_logging_alerts_contract" {
     condition = alltrue([
       for policy in values(google_monitoring_alert_policy.host_logging_heartbeat) :
       length(one(policy.conditions).condition_prometheus_query_language) == 1 &&
-      strcontains(one(policy.conditions).condition_prometheus_query_language[0].query, "absent(") &&
+      strcontains(one(policy.conditions).condition_prometheus_query_language[0].query, "or vector(0)") &&
+      strcontains(one(policy.conditions).condition_prometheus_query_language[0].query, "\"incarnation\" = \"incarnation-a\"") &&
       one(policy.conditions).condition_prometheus_query_language[0].disable_metric_validation
     ])
     error_message = "Heartbeat absence must alert on an empty expected-host series, including never-seen replacements."
@@ -69,7 +72,7 @@ run "host_logging_alerts_contract" {
   assert {
     condition = alltrue([
       for policy in values(google_monitoring_alert_policy.host_logging_export_failures) :
-      strcontains(one(policy.conditions).condition_matched_log.filter, "log_id(\"superserve_host_logs\")")
+      strcontains(one(one(policy.conditions).condition_matched_log).filter, "log_id(\"superserve_host_logs\")")
     ])
     error_message = "Export failure alert must consume the dedicated OTel host-log stream."
   }
@@ -81,5 +84,40 @@ run "host_logging_alerts_contract" {
       strcontains(one(policy.conditions).condition_prometheus_query_language[0].query, "collector_host_id")
     ])
     error_message = "Independent heartbeat must select the Cloud Logging-derived heartbeat series and provider instance identity."
+  }
+}
+
+run "replacement_and_retired_hosts" {
+  command = plan
+  variables {
+    project_id               = "example-project"
+    environment              = "staging"
+    notification_channel_ids = ["projects/example-project/notificationChannels/123"]
+    runbook_urls = {
+      host_cpu               = "https://example.invalid/host-cpu"
+      host_maintenance       = "https://example.invalid/host-maintenance"
+      host_logging_export    = "https://example.invalid/export"
+      host_logging_lag       = "https://example.invalid/lag"
+      host_logging_heartbeat = "https://example.invalid/heartbeat"
+    }
+    host_logging_alerts = {
+      display_prefix = "Example"
+      expected_hosts = {
+        retired     = { instance_name = "example-old", instance_id = "123", active = false }
+        replacement = { instance_name = "example-new", instance_id = "456" }
+      }
+    }
+  }
+  assert {
+    condition     = keys(google_logging_metric.host_logging_heartbeat) == ["replacement"] && keys(google_monitoring_alert_policy.host_logging_heartbeat) == ["replacement"]
+    error_message = "Only the active replacement must have a heartbeat metric and absence alert."
+  }
+  assert {
+    condition     = strcontains(google_logging_metric.host_logging_heartbeat["replacement"].filter, "instance_id=\"456\"") && !strcontains(google_logging_metric.host_logging_heartbeat["replacement"].filter, "123")
+    error_message = "The predecessor must not satisfy the replacement's heartbeat metric."
+  }
+  assert {
+    condition     = strcontains(one(google_monitoring_alert_policy.host_logging_heartbeat["replacement"].conditions).condition_prometheus_query_language[0].query, "\"456\"")
+    error_message = "The absence query must select the replacement identity."
   }
 }

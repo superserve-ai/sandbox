@@ -340,7 +340,8 @@ jobs:
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_proxy_frontend_steady_plan.py"
           terraform show -json tfplan > "$RUNNER_TEMP/control-plane-identity/use4/plan.json"
-          if python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/control-plane-identity/use4/plan.json"; then
+          HOST_LOGGING_EVIDENCE_REQUIRED=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/control-plane-identity/use4/plan.json")
+          if [ "$HOST_LOGGING_EVIDENCE_REQUIRED" = true ]; then
             echo "This control-plane identity rollout path does not carry the host-logging staging evidence gate; reject logging mutations here." >&2
             exit 1
           fi
@@ -473,7 +474,8 @@ jobs:
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
           terraform show -json tfplan > "$RUNNER_TEMP/control-plane-identity/usw2/plan.json"
-          if python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/control-plane-identity/usw2/plan.json"; then
+          HOST_LOGGING_EVIDENCE_REQUIRED=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/control-plane-identity/usw2/plan.json")
+          if [ "$HOST_LOGGING_EVIDENCE_REQUIRED" = true ]; then
             echo "This control-plane identity rollout path does not carry the host-logging staging evidence gate; reject logging mutations here." >&2
             exit 1
           fi

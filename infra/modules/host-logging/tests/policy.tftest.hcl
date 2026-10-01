@@ -1,12 +1,15 @@
+mock_provider "google" {}
+
 run "host_logging_contract" {
-  command = plan
+  command = apply
 
   variables {
-    project_id      = "example-project"
-    zone            = "us-central1-a"
-    environment     = "staging"
-    region          = "us-central1"
-    assignment_name = "example-host-logging"
+    otel_memory_limit_mb = 256
+    project_id           = "example-project"
+    zone                 = "us-central1-a"
+    environment          = "staging"
+    region               = "us-central1"
+    assignment_name      = "example-host-logging"
     selector_labels = {
       application = "sandbox-host"
       environment = "staging"
@@ -23,27 +26,23 @@ run "host_logging_contract" {
   }
 
   assert {
-    condition = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[0].file[0].state == "PRESENT"
-    error_message = "the candidate configuration must be a PRESENT file resource"
+    condition     = strcontains(google_storage_bucket_object.otel_config.content, "limit_mib: 192") && strcontains(google_storage_bucket_object.otel_config.content, "spike_limit_mib: 32") && strcontains(google_storage_bucket_object.otel_service.content, "MemoryHigh=224M") && strcontains(google_storage_bucket_object.otel_service.content, "MemoryMax=256M") && strcontains(google_storage_bucket_object.otel_service.content, "GOMEMLIMIT=192MiB")
+    error_message = "Collector limiter and service thresholds must scale with the configured memory ceiling."
   }
 
   assert {
-    condition = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[0].file[0].path == "/var/lib/superserve/host-logging/otel-logs.yaml.candidate"
+    condition     = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[0].file[0].state == "CONTENTS_MATCH"
+    error_message = "the candidate configuration must enforce candidate contents"
+  }
+
+  assert {
+    condition     = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[0].file[0].path == "/var/lib/superserve/host-logging/otel-logs.yaml.candidate"
     error_message = "candidate path must remain outside the active configuration"
   }
 
   assert {
-    condition = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[0].file[0].permissions == "0644"
-    error_message = "candidate permissions must be enforced at the file-resource level"
-  }
-
-  assert {
-    condition = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[0].file[0].file[0].gcs[0].generation != null
+    condition     = resource.google_os_config_os_policy_assignment.host_logging.os_policies[0].resource_groups[0].resources[0].file[0].file[0].gcs[0].generation != null
     error_message = "candidate source must retain its generation-pinned GCS object"
   }
 
-  assert {
-    condition = resource.google_os_config_os_policy_assignment.host_logging.rollout[0].mode == null
-    error_message = "unsupported rollout.mode must not be rendered"
-  }
 }

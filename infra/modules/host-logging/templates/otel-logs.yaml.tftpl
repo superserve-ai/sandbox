@@ -1,218 +1,163 @@
-# Managed by Terraform/OS Config. OTel Contrib ${release_version}; the logs
-# process has independent cursor and queue state from the metrics collector.
+# Terraform owns this dedicated logs pipeline and its independent durable state.
 extensions:
+  googleclientauth:
+    project: ${project_id}
+    quota_project: ${project_id}
   file_storage/cursor:
     directory: ${cursor_dir}
     create_directory: true
+    fsync: true
+    max_size: 16777216
   file_storage/queue:
     directory: ${queue_dir}
     create_directory: true
-    # OTel Contrib 0.119.0 requires the structured compaction object. Keep
-    # temporary compaction files inside the queue-owned filesystem so they are
-    # accounted for by the same storage boundary and never share cursor state.
+    fsync: true
+    max_size: ${queue_max_bytes}
+    # Disable compaction: one bounded database, no temporary second copy.
     compaction:
-      on_start: true
-      directory: ${queue_dir}/compaction
+      on_start: false
+      on_rebound: false
 
 receivers:
   journald:
     directory: /var/log/journal
-    start_at: end
+    start_at: beginning
     storage: file_storage/cursor
-    # Do not pass a glob here: journald unit selectors are exact names. The
-    # approved_sources processor below performs prefix/regex selection so
-    # dynamically generated proxy units are collected as well.
-    operators:
-      # Copy only bounded, trusted journal provenance. The receiver's complete
-      # metadata map is never moved to a resource or sent to Cloud Logging.
-      - id: copy_trusted_unit
-        type: copy
-        from: attributes["_SYSTEMD_UNIT"]
-        to: attributes["journal.unit"]
-      - id: copy_trusted_transport
-        type: copy
-        from: attributes["_TRANSPORT"]
-        to: attributes["journal.transport"]
-      - id: copy_trusted_hostname
-        type: copy
-        from: attributes["_HOSTNAME"]
-        to: attributes["journal.hostname"]
-      - id: copy_trusted_pid
-        type: copy
-        from: attributes["_PID"]
-        to: attributes["journal.pid"]
-      - id: copy_trusted_priority
-        type: copy
-        from: attributes["PRIORITY"]
-        to: attributes["journal.priority"]
-      - id: copy_trusted_boot
-        type: copy
-        from: attributes["_BOOT_ID"]
-        to: attributes["journal.boot_id"]
-      - id: copy_trusted_timestamp
-        type: copy
-        from: attributes["__REALTIME_TIMESTAMP"]
-        to: attributes["journal.original_timestamp"]
-      - id: classify_application_unit
-        type: add
-        field: attributes["host_logging.application_record"]
-        value: true
-        if: 'IsMatch(attributes["journal.unit"], "^(superserve-vmd|proxy(-[^.]*)?)\\.service$")'
-      - id: preserve_message_for_parse
-        type: copy
-        from: body
-        to: attributes["journal.original_message"]
-      - id: parse_application_message
-        type: json_parser
-        parse_from: attributes["journal.original_message"]
-        parse_to: attributes["application"]
-        on_error: send
-      - id: mark_parse_failure
-        type: add
-        field: attributes["host_logging.parse_outcome"]
-        value: failure
-        if: 'attributes["host_logging.application_record"] == true and attributes["application"] == nil'
-      - id: mark_parse_success
-        type: add
-        field: attributes["host_logging.parse_outcome"]
-        value: success
-        if: 'attributes["host_logging.application_record"] == true and attributes["application"] != nil'
-      - id: mark_export_failure
-        type: add
-        field: attributes["host_logging_export_error"]
-        value: "true"
-        if: 'attributes["journal.unit"] == "superserve-otel-logs.service" and IsMatch(attributes["journal.original_message"], "(?i)(export failed|permission denied|drop|dropped)")'
-      # This named step is intentionally a move into a short-lived private
-      # field. The transform processor below restores only approved diagnostic
-      # text for non-application records and removes the field before export.
-      - id: clear_untrusted_body
-        type: move
-        from: body
-        to: attributes["host_logging.raw_body_discarded"]
-      - id: retain_bounded_journal_fields
-        type: retain
-        fields:
-          - body
-          - attributes.journal.unit
-          - attributes.journal.transport
-          - attributes.journal.hostname
-          - attributes.journal.pid
-          - attributes.journal.priority
-          - attributes.journal.boot_id
-          - attributes.journal.original_timestamp
-          - attributes.host_logging.application_record
-          - attributes.host_logging.parse_outcome
-          - attributes.host_logging.raw_body_discarded
-          - attributes.host_logging_export_error
-          - attributes.application
+    retry_on_failure:
+      enabled: true
+      max_elapsed_time: 0s
 
 processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: ${floor(memory_limit_mb * 0.75)}
+    spike_limit_mib: ${floor(memory_limit_mb * 0.125)}
   filter/approved_sources:
-    error_mode: ignore
+    error_mode: propagate
     logs:
       log_record:
-        - 'attributes["journal.transport"] != "kernel" and (attributes["journal.unit"] == nil or not IsMatch(attributes["journal.unit"], "^(superserve-vmd|proxy(-[^.]*)?|systemd(-[^.]*)?|google-(osconfig|guest)-agent|superserve-otel-(collector|logs)|unbound|(superserve-)?secretsproxy|superserve-host-logging-heartbeat)\\.service$"))'
+        - 'body["_TRANSPORT"] != "kernel" and (body["_SYSTEMD_UNIT"] == nil or not IsMatch(body["_SYSTEMD_UNIT"], "^(superserve-vmd|proxy(-[^.]*)?|systemd(-[^.]*)?|google-(osconfig|guest)-agent|superserve-otel-(collector|logs)|unbound|(superserve-)?secretsproxy|superserve-host-logging-heartbeat)\\.service$")) and not (body["_PID"] == "1" and body["UNIT"] != nil and IsMatch(body["UNIT"], "^(superserve-vmd|proxy(-[^.]*)?)\\.service$"))'
   transform/trusted_payload:
-    error_mode: ignore
+    # Parse failures must never write the input record into collector self-logs.
+    error_mode: silent
     log_statements:
       - context: log
         statements:
-          # Never restore an untrusted journal body. Host diagnostics are
-          # represented by a bounded classification; application records are
-          # reconstructed from approved scalar fields below.
-          - set(body, "host diagnostic event") where attributes["host_logging.application_record"] != true
-          - set(body, "application parse failure") where attributes["host_logging.parse_outcome"] == "failure"
-          - set(body, "collector export failure") where attributes["host_logging_export_error"] == "true"
-          - set(severity_text, attributes["application"]["level"]) where attributes["host_logging.application_record"] == true and IsString(attributes["application"]["level"])
-          - set(severity_text, attributes["application"]["severity"]) where severity_text == "" and attributes["host_logging.application_record"] == true and IsString(attributes["application"]["severity"])
-          - set(severity_number, SEVERITY_NUMBER_DEBUG) where severity_text == "debug" or severity_text == "DEBUG"
-          - set(severity_number, SEVERITY_NUMBER_INFO) where severity_text == "info" or severity_text == "INFO"
-          - set(severity_number, SEVERITY_NUMBER_WARN) where severity_text == "warn" or severity_text == "warning" or severity_text == "WARN"
-          - set(severity_number, SEVERITY_NUMBER_ERROR) where severity_text == "error" or severity_text == "ERROR"
-          - set(severity_number, SEVERITY_NUMBER_FATAL) where severity_text == "fatal" or severity_text == "FATAL"
-          # Non-application diagnostics use trusted journald PRIORITY; this
-          # keeps INFO+ host/kernel records while still shedding app DEBUG
-          # whose journald priority is commonly mislabeled as INFO.
-          - set(severity_number, SEVERITY_NUMBER_DEBUG) where attributes["host_logging.application_record"] != true and attributes["journal.priority"] == 7
-          - set(severity_number, SEVERITY_NUMBER_INFO) where attributes["host_logging.application_record"] != true and (attributes["journal.priority"] == 5 or attributes["journal.priority"] == 6)
-          - set(severity_number, SEVERITY_NUMBER_WARN) where attributes["host_logging.application_record"] != true and attributes["journal.priority"] == 4
-          - set(severity_number, SEVERITY_NUMBER_ERROR) where attributes["host_logging.application_record"] != true and attributes["journal.priority"] == 3
-          - set(severity_number, SEVERITY_NUMBER_FATAL) where attributes["host_logging.application_record"] != true and attributes["journal.priority"] <= 2
-          - set(attributes["host_logging.parse_outcome"], "failure") where attributes["host_logging.application_record"] == true and attributes["host_logging.parse_outcome"] == nil
-          - set(resource.attributes["host_id"], "$${env:HOST_ID}")
-          - set(resource.attributes["provider_instance_id"], "$${env:INSTANCE_ID}")
-          - set(resource.attributes["incarnation"], "$${env:INCARNATION_ID}")
-          - set(resource.attributes["environment"], "${environment}")
-          - set(resource.attributes["region"], "${region}")
-          - set(attributes["unit"], attributes["journal.unit"])
-          - set(attributes["source"], attributes["journal.transport"])
-          - set(attributes["generation"], attributes["journal.unit"]) where IsMatch(attributes["journal.unit"], "^proxy-")
-          - set(attributes["request_id"], attributes["application"]["request_id"]) where attributes["host_logging.parse_outcome"] == "success" and IsString(attributes["application"]["request_id"])
-          - set(attributes["sandbox_id"], attributes["application"]["sandbox_id"]) where attributes["host_logging.parse_outcome"] == "success" and IsString(attributes["application"]["sandbox_id"])
-          - set(attributes["event"], attributes["application"]["event"]) where attributes["host_logging.parse_outcome"] == "success" and IsString(attributes["application"]["event"])
-          - set(attributes["message"], attributes["application"]["message"]) where attributes["host_logging.parse_outcome"] == "success" and IsString(attributes["application"]["message"])
-          - set(body, attributes["event"]) where attributes["event"] != nil
-          - set(body, attributes["message"]) where attributes["event"] == nil and attributes["message"] != nil
-          # googlecloud maps scalar log attributes to Cloud Logging labels;
-          # keep these names flat so consumers query the actual schema.
-          - set(attributes["journal_unit"], attributes["journal.unit"])
-          - set(attributes["host_logging_heartbeat"], true) where attributes["journal.unit"] == "superserve-host-logging-heartbeat.service"
-          # This is a delivery-age sample relative to the retained journal
-          # timestamp, not a heartbeat/absence signal. Cloud Monitoring uses
-          # it only for the retained-history lag policy below.
-          - set(attributes["host_logging_retained_history_lag_seconds"], (UnixNano(Now()) - time_unix_nano) / 1000000000) where time_unix_nano < UnixNano(Now())
-          # Explicitly reject nested/special application keys and all raw
-          # application maps. Only the scalar fields above cross the boundary.
-          - delete_key(attributes["application"], "host_id")
-          - delete_key(attributes["application"], "instance_id")
-          - delete_key(attributes["application"], "incarnation")
-          - delete_key(attributes["application"], "generation")
-          - delete_key(attributes["application"], "labels")
-          - delete_key(attributes["application"], "parse_outcome")
-          - delete_key(attributes["application"], "httpRequest")
-          - delete_key(attributes["application"], "trace")
-          - delete_key(attributes["application"], "authorization")
-          - delete_key(attributes, "application")
-          - delete_key(attributes, "journal.original_message")
-          - delete_key(attributes, "host_logging.raw_body_discarded")
-          # Malformed application records have no body; trusted metadata and
-          # the real failure marker remain. Valid records keep approved text.
-
+          - set(cache["journal"], {})
+          - set(cache["journal"]["MESSAGE"], body["MESSAGE"]) where IsString(body["MESSAGE"]) and Len(body["MESSAGE"]) <= 65536
+          - set(cache["journal"]["_SYSTEMD_UNIT"], body["_SYSTEMD_UNIT"]) where IsString(body["_SYSTEMD_UNIT"]) and Len(body["_SYSTEMD_UNIT"]) <= 256
+          - set(cache["journal"]["_TRANSPORT"], body["_TRANSPORT"]) where IsString(body["_TRANSPORT"]) and Len(body["_TRANSPORT"]) <= 256
+          - set(cache["journal"]["_PID"], body["_PID"]) where IsString(body["_PID"]) and Len(body["_PID"]) <= 256
+          - set(cache["journal"]["_BOOT_ID"], body["_BOOT_ID"]) where IsString(body["_BOOT_ID"]) and Len(body["_BOOT_ID"]) <= 256
+          - set(cache["journal"]["UNIT"], body["UNIT"]) where IsString(body["UNIT"]) and Len(body["UNIT"]) <= 256
+          - set(cache["journal"]["PRIORITY"], body["PRIORITY"]) where IsString(body["PRIORITY"]) and Len(body["PRIORITY"]) <= 256
+          - set(cache["application"], IsMatch(body["_SYSTEMD_UNIT"], "^(superserve-vmd|proxy(-[^.]*)?)\\.service$")) where IsString(body["_SYSTEMD_UNIT"])
+          - set(cache["parsed"], ParseJSON(body["MESSAGE"])) where cache["application"] == true and IsString(body["MESSAGE"]) and Len(body["MESSAGE"]) <= 65536
+          - set(body, {})
+          - keep_keys(attributes, [])
+          - keep_keys(resource.attributes, [])
+          - set(attributes["journal_unit"], cache["journal"]["_SYSTEMD_UNIT"])
+          - set(attributes["unit"], cache["journal"]["UNIT"]) where cache["journal"]["_PID"] == "1"
+          - set(attributes["source"], cache["journal"]["_TRANSPORT"])
+          - set(attributes["boot_id"], cache["journal"]["_BOOT_ID"])
+          - set(attributes["pid"], cache["journal"]["_PID"])
+          - set(attributes["host_id"], "$${env:HOST_ID}")
+          - set(attributes["provider_instance_id"], "$${env:INSTANCE_ID}")
+          - set(attributes["incarnation"], "$${env:INCARNATION_ID}")
+          - set(attributes["environment"], "${environment}")
+          - set(attributes["region"], "${region}")
+          - set(attributes["generation"], attributes["journal_unit"]) where IsMatch(attributes["journal_unit"], "^proxy-")
+          - set(attributes["log.name"], "superserve_host_logs")
+          - set(resource.attributes["cloud.platform"], "gcp_compute_engine")
+          - set(resource.attributes["gcp.project_id"], "${project_id}")
+          - set(resource.attributes["host.id"], "$${env:INSTANCE_ID}")
+          - set(resource.attributes["cloud.availability_zone"], "${zone}")
+          - set(severity_number, SEVERITY_NUMBER_INFO)
+          - set(severity_number, SEVERITY_NUMBER_WARN) where Int(cache["journal"]["PRIORITY"]) == 4
+          - set(severity_number, SEVERITY_NUMBER_ERROR) where Int(cache["journal"]["PRIORITY"]) <= 3
+          - set(severity_number, SEVERITY_NUMBER_DEBUG) where Int(cache["journal"]["PRIORITY"]) == 7
+          - set(attributes["parse_outcome"], "failure") where cache["application"] == true
+          - set(attributes["parse_outcome"], "success") where cache["application"] == true and IsMap(cache["parsed"])
+          - set(severity_text, ConvertCase(cache["parsed"]["level"], "lower")) where IsString(cache["parsed"]["level"])
+          - set(severity_text, ConvertCase(cache["parsed"]["severity"], "lower")) where severity_text == "" and IsString(cache["parsed"]["severity"])
+          - set(severity_number, SEVERITY_NUMBER_DEBUG) where severity_text == "debug" or severity_text == "trace"
+          - set(severity_number, SEVERITY_NUMBER_INFO) where severity_text == "info"
+          - set(severity_number, SEVERITY_NUMBER_WARN) where severity_text == "warn" or severity_text == "warning"
+          - set(severity_number, SEVERITY_NUMBER_ERROR) where severity_text == "error"
+          - set(severity_number, SEVERITY_NUMBER_FATAL) where severity_text == "fatal" or severity_text == "panic"
+          - set(attributes["_private"], cache)
+  transform/approved_fields:
+    error_mode: silent
+    log_statements:
+      - context: log
+        statements:
+          - set(body["message"], attributes["_private"]["parsed"]["message"]) where IsString(attributes["_private"]["parsed"]["message"]) and Len(attributes["_private"]["parsed"]["message"]) <= 2048 and not IsMatch(attributes["_private"]["parsed"]["message"], "(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])")
+          - set(body["msg"], attributes["_private"]["parsed"]["msg"]) where IsString(attributes["_private"]["parsed"]["msg"]) and Len(attributes["_private"]["parsed"]["msg"]) <= 2048 and not IsMatch(attributes["_private"]["parsed"]["msg"], "(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])")
+          - set(body["event"], attributes["_private"]["parsed"]["event"]) where IsString(attributes["_private"]["parsed"]["event"]) and Len(attributes["_private"]["parsed"]["event"]) <= 2048 and not IsMatch(attributes["_private"]["parsed"]["event"], "(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])")
+          - set(body["request_id"], attributes["_private"]["parsed"]["request_id"]) where IsString(attributes["_private"]["parsed"]["request_id"]) and Len(attributes["_private"]["parsed"]["request_id"]) <= 2048 and not IsMatch(attributes["_private"]["parsed"]["request_id"], "(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])")
+          - set(body["sandbox_id"], attributes["_private"]["parsed"]["sandbox_id"]) where IsString(attributes["_private"]["parsed"]["sandbox_id"]) and Len(attributes["_private"]["parsed"]["sandbox_id"]) <= 2048 and not IsMatch(attributes["_private"]["parsed"]["sandbox_id"], "(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])")
+          - set(body["vm_id"], attributes["_private"]["parsed"]["vm_id"]) where IsString(attributes["_private"]["parsed"]["vm_id"]) and Len(attributes["_private"]["parsed"]["vm_id"]) <= 2048 and not IsMatch(attributes["_private"]["parsed"]["vm_id"], "(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])")
+          - set(body["operation"], attributes["_private"]["parsed"]["operation"]) where IsString(attributes["_private"]["parsed"]["operation"]) and Len(attributes["_private"]["parsed"]["operation"]) <= 2048 and not IsMatch(attributes["_private"]["parsed"]["operation"], "(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])")
+          - set(body["component"], attributes["_private"]["parsed"]["component"]) where IsString(attributes["_private"]["parsed"]["component"]) and Len(attributes["_private"]["parsed"]["component"]) <= 2048 and not IsMatch(attributes["_private"]["parsed"]["component"], "(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])")
+          - set(body["error_code"], attributes["_private"]["parsed"]["error_code"]) where IsString(attributes["_private"]["parsed"]["error_code"]) and Len(attributes["_private"]["parsed"]["error_code"]) <= 2048 and not IsMatch(attributes["_private"]["parsed"]["error_code"], "(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])")
+          - set(body["status"], attributes["_private"]["parsed"]["status"]) where IsString(attributes["_private"]["parsed"]["status"]) and Len(attributes["_private"]["parsed"]["status"]) <= 2048 and not IsMatch(attributes["_private"]["parsed"]["status"], "(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])")
+          - set(body["duration_ms"], attributes["_private"]["parsed"]["duration_ms"]) where IsString(attributes["_private"]["parsed"]["duration_ms"]) and Len(attributes["_private"]["parsed"]["duration_ms"]) <= 2048 and not IsMatch(attributes["_private"]["parsed"]["duration_ms"], "(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])")
+          # Keep useful host diagnostics without copying arbitrary command or tenant text.
+          - set(body["diagnostic"], "host service event") where attributes["_private"]["application"] != true
+          - set(body["diagnostic"], "out of memory") where attributes["_private"]["application"] != true and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "(?i)(out of memory|oom.kill|memory cgroup out)")
+          - set(body["diagnostic"], "no space left on device") where attributes["_private"]["application"] != true and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "(?i)no space left on device")
+          - set(body["diagnostic"], "file descriptor exhaustion") where attributes["_private"]["application"] != true and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "(?i)(too many open files|file-max limit)")
+          - set(body["diagnostic"], "network or namespace resource exhaustion") where attributes["_private"]["application"] != true and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "(?i)(conntrack.*full|namespace.*(fail|limit)|veth.*fail)")
+          - set(body["diagnostic"], "mount resource exhaustion") where attributes["_private"]["application"] != true and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "(?i)mount.*(fail|limit|space)")
+          - set(body["diagnostic"], "service failed") where attributes["_private"]["journal"]["_PID"] == "1" and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "(?i)(failed|failure)")
+          - set(body["diagnostic"], "service started") where attributes["_private"]["journal"]["_PID"] == "1" and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "^Started ")
+          - set(body["diagnostic"], "service stopped") where attributes["_private"]["journal"]["_PID"] == "1" and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "^Stopped ")
+          - set(attributes["host_logging_export_error"], "true") where attributes["journal_unit"] == "superserve-otel-logs.service" and IsMatch(attributes["_private"]["journal"]["MESSAGE"], "(?i)(export.*fail|permission denied|drop|storage.*full|queue.*full|cursor.*(fail|invalid))")
+          - set(attributes["host_logging_heartbeat"], "true") where attributes["journal_unit"] == "superserve-host-logging-heartbeat.service"
+          - set(attributes["host_logging_retained_history_lag_seconds"], (UnixNano(Now()) - time_unix_nano) / 1000000000) where attributes["host_logging_heartbeat"] == "true"
+          - delete_key(attributes, "_private")
   filter/info_plus:
-    error_mode: ignore
+    error_mode: propagate
     logs:
       log_record:
         - 'severity_number < SEVERITY_NUMBER_INFO'
 
 exporters:
-  googlecloud:
-    log:
-      default_log_name: superserve_host_logs
+  otlp_http/cloud:
+    endpoint: https://telemetry.googleapis.com
+    encoding: json
+    compression: gzip
+    auth:
+      authenticator: googleclientauth
+    timeout: 15s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 0s
     sending_queue:
       enabled: true
       storage: file_storage/queue
-      # queue_size bounds records. Physical storage is isolated and monitored
-      # by the Terraform-managed guard without recursively scanning the queue
-      # or stopping the only drainer.
-      queue_size: 4096
+      sizer: bytes
+      queue_size: ${queue_capacity_bytes}
       num_consumers: 2
-    # The googlecloud exporter in the pinned 0.119.0 release rejects the
-    # generic retry_on_failure block. This queue persists records accepted by
-    # the exporter helper, but the release-specific ownership and duration of
-    # transient retry remain unresolved until outage/restart and queue-
-    # exhaustion staging evidence; this config must not be treated as proof of
-    # indefinite retry equivalence.
+      batch:
+        sizer: bytes
+        min_size: 65536
+        max_size: 262144
+        flush_timeout: 1s
 
 service:
-  extensions: [file_storage/cursor, file_storage/queue]
+  extensions: [googleclientauth, file_storage/cursor, file_storage/queue]
   pipelines:
     logs:
       receivers: [journald]
-      # There is intentionally no asynchronous batch processor before the
-      # persistent exporter queue. Receiver acceptance is handed directly to
-      # the queue so a crash cannot strand an acknowledged batch in memory.
-      processors: [filter/approved_sources, transform/trusted_payload, filter/info_plus]
-      exporters: [googlecloud]
+      # Batch only after durable acceptance into the exporter queue.
+      processors: [memory_limiter, filter/approved_sources, transform/trusted_payload, filter/info_plus, transform/approved_fields]
+      exporters: [otlp_http/cloud]
   telemetry:
     logs:
       level: info
+      encoding: json
+    metrics:
+      level: none

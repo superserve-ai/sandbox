@@ -12,7 +12,10 @@ import re
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
+import uuid
+import shutil
 from pathlib import Path
 
 
@@ -21,7 +24,7 @@ MODULE = ROOT / "infra/modules/host-logging"
 IMAGE = os.environ.get("SUPER_SERVE_OTEL_FIXTURE_IMAGE", "ubuntu:24.04")
 FIXTURE_PLATFORM = os.environ.get("SUPER_SERVE_OTEL_FIXTURE_PLATFORM", "linux/amd64")
 FIXTURE_IMAGE_TAG = os.environ.get(
-    "SUPER_SERVE_OTEL_FIXTURE_IMAGE_TAG", "superserve-host-logging-fixture:ubuntu-24.04-v1"
+    "SUPER_SERVE_OTEL_FIXTURE_IMAGE_TAG", "superserve-host-logging-fixture:ubuntu-24.04-v2"
 )
 
 
@@ -39,18 +42,15 @@ class HostLoggingConfigChecks(unittest.TestCase):
     def _render_templates(self, root):
         """Render every artifact through Terraform's real templatefile()."""
         values = {
+            "legacy_enabled": 0,
+            "project_id": "example-project",
+            "zone": "us-central1-a",
+            "queue_capacity_bytes": 536870912,
             "environment": "fixture",
             "region": "us-central1",
             "assignment_name": "fixture-host-logging",
             "assignment_revision": "fixture-revision",
             "release_version": self.release,
-            "host_units": [
-                "superserve-vmd.service", "proxy.service", "proxy-generation.service",
-                "systemd-journald.service", "systemd-logind.service",
-                "google-osconfig-agent.service", "google-guest-agent.service",
-                "superserve-otel-logs.service", "unbound.service", "secretsproxy.service",
-                "superserve-host-logging-heartbeat.service",
-            ],
             "cursor_dir": "/var/lib/superserve/host-logging/cursor",
             "queue_dir": "/var/lib/superserve/host-logging/export-queue",
             "binary_path": "/opt/superserve/otelcol-contrib/bin/otelcol-contrib",
@@ -107,6 +107,7 @@ class HostLoggingConfigChecks(unittest.TestCase):
 
     def _docker(self, name, fixture, script, timeout=300):
         """Run one named, self-cleaning Linux fixture with a bounded mount."""
+        name = name + "-" + uuid.uuid4().hex[:10]
         probe = subprocess.run(["docker", "info"], text=True, capture_output=True, timeout=20)
         if probe.returncode:
             self.fail("Docker daemon is required for the host-logging Linux fixture: docker info failed")
@@ -115,8 +116,10 @@ class HostLoggingConfigChecks(unittest.TestCase):
         cache.mkdir(mode=0o700, parents=True, exist_ok=True)
         cmd = [
             "docker", "run", "--rm", "--platform", FIXTURE_PLATFORM, "--name", name,
-            "-v", f"{fixture}:/fixture:rw", "-v", f"{cache}:/fixture/immutable-cache:rw",
-            image, "bash", "-euo", "pipefail", "-c", script,
+            "-e", f"FIXTURE_UID={os.getuid()}", "-e", f"FIXTURE_GID={os.getgid()}",
+            "-v", f"{fixture}:/fixture:rw", "-v", f"{cache}:/immutable-cache:rw",
+            image, "bash", "-euo", "pipefail", "-c",
+            'trap \'chown -R "$FIXTURE_UID:$FIXTURE_GID" /fixture /immutable-cache\' EXIT\n' + script,
         ]
         try:
             result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
@@ -150,7 +153,7 @@ class HostLoggingConfigChecks(unittest.TestCase):
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \\
-    && apt-get install -y --no-install-recommends ca-certificates curl gzip tar systemd systemd-journal-remote \\
+    && apt-get install -y --no-install-recommends ca-certificates curl gzip tar python3 systemd systemd-journal-remote \\
     && rm -rf /var/lib/apt/lists/*
 """
         build = subprocess.run(
@@ -171,9 +174,9 @@ RUN apt-get update \\
         # name; the shorter legacy name is not present on current releases.
         checksums = "opentelemetry-collector-releases_otelcol-contrib_checksums.txt"
         return textwrap.dedent(f"""
-            mkdir -p /fixture/immutable-cache /fixture/bin
-            archive=/fixture/immutable-cache/{archive}
-            checksums=/fixture/immutable-cache/{checksums}
+            mkdir -p /immutable-cache /fixture/bin
+            archive=/immutable-cache/{archive}
+            checksums=/immutable-cache/{checksums}
             archive_url='https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v{self.release}/{archive}'
             checksums_url='https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v{self.release}/{checksums}'
             fetch() {{
@@ -191,7 +194,7 @@ RUN apt-get update \\
               fetch "$checksums_url" "$checksums"
             fi
             grep -E '[[:space:]]{archive}$' "$checksums" > /tmp/otel-checksum-line
-            (cd /fixture/immutable-cache && sha256sum -c /tmp/otel-checksum-line)
+            (cd /immutable-cache && sha256sum -c /tmp/otel-checksum-line)
             test "$(sha256sum "$archive" | awk '{{print $1}}')" = '{self.digest}'
             tar -xzf "$archive" -C /fixture/bin
             test -x /fixture/bin/otelcol-contrib
@@ -199,39 +202,45 @@ RUN apt-get update \\
             /fixture/bin/otelcol-contrib components | grep -E 'journald|file_storage|googlecloud|transform|filter'
         """).strip()
 
-    def _run_collector_fixture(self, rendered):
+    def _run_collector_fixture(self, rendered, outage=False, queue_pressure=False):
         with tempfile.TemporaryDirectory(prefix="host-logging-otel-") as directory:
             fixture = Path(directory)
             (fixture / "config.yaml").write_text(rendered["config"])
-            # Local output is an explicit debug-exporter substitute. The
-            # exact rendered googlecloud mapping is validated before this
-            # substitution; no labels or records are fabricated after capture.
-            runtime = re.sub(
-                r"(?ms)^exporters:\n.*?^service:\n",
-                "exporters:\n  debug:\n    verbosity: detailed\n\nservice:\n",
-                rendered["config"],
-            ).replace("exporters: [googlecloud]", "exporters: [debug]")
-            if "googlecloud:" not in rendered["config"] or "exporters: [debug]" not in runtime:
-                self.fail("runtime fixture did not preserve the rendered exporter mapping before explicit capture substitution")
+            # Keep the real OTLP exporter, queue, encoding and retry settings.
+            # Only authentication and destination change for the local endpoint.
+            runtime = rendered["config"].replace(
+                "endpoint: https://telemetry.googleapis.com", "endpoint: http://127.0.0.1:4318"
+            ).replace("    auth:\n      authenticator: googleclientauth\n", "")
+            runtime = re.sub(r"(?m)^  googleclientauth:\n(?:    .*\n)+", "", runtime)
+            runtime = runtime.replace("[googleclientauth, file_storage", "[file_storage")
+            shutil.copy(ROOT / "scripts/fixtures/host_logging_endpoint.py", fixture / "endpoint.py")
+            if outage:
+                capacity = 2048 if queue_pressure else 131072
+                runtime = runtime.replace("queue_size: 536870912", f"queue_size: {capacity}").replace("max_size: 2147483648", "max_size: 1048576").replace("min_size: 65536", "min_size: 1024").replace("max_size: 262144\n        flush", "max_size: 2048\n        flush")
+                (fixture / "unavailable").touch()
+            (fixture / "requests.jsonl").touch()
             (fixture / "runtime.yaml").write_text(runtime)
             script = self._acquire_release(fixture) + textwrap.dedent("""
+                trap 'rc=$?; if [ "$rc" -ne 0 ] && [ -f /fixture/collector.log ]; then cat /fixture/collector.log >&2; fi' EXIT
                 mkdir -p /var/lib/superserve/host-logging/cursor /var/lib/superserve/host-logging/export-queue /var/log/journal
                 export HOST_ID=fixture-host INSTANCE_ID=fixture-instance INCARNATION_ID=fixture-incarnation
-                timeout 25s /fixture/bin/otelcol-contrib --config /fixture/runtime.yaml > /fixture/collector.log 2>&1 &
-                collector=$!
-                sleep 3
-                now=$(date +%s)000000
+                python3 /fixture/endpoint.py > /fixture/endpoint.log 2>&1 &
+                endpoint=$!
+                now=1700000000123456
                 emit() {
                   unit="$1"; transport="$2"; priority="$3"; message="$4"
                   { printf '__REALTIME_TIMESTAMP=%s\\n' "$now"; printf '_BOOT_ID=11111111111111111111111111111111\\n'; printf '_HOSTNAME=fixture-host\\n'; printf '_PID=42\\n'; printf 'PRIORITY=%s\\n' "$priority"; [ -z "$unit" ] || printf '_SYSTEMD_UNIT=%s\\n' "$unit"; printf '_TRANSPORT=%s\\n' "$transport"; printf 'MESSAGE=%s\\n\\n' "$message"; }
                 }
                 : > /fixture/journal.export
-                emit superserve-vmd.service journal 6 '{"level":"INFO","message":"safe-info","request_id":"req-1","host_id":"evil-host","labels":{"authorization":"SECRET_NESTED"}}' >> /fixture/journal.export
+                emit superserve-vmd.service journal 6 '{"level":"INFO","message":"safe-info","request_id":"req-1","host_id":"evil-host","incarnation":"evil-incarnation","provider_instance_id":"evil-instance","parse_outcome":"failure","journal_unit":"evil.service","source":"evil-source","host_logging_heartbeat":"true","host_logging_export_error":"true","severity_number":1,"resource":{"host.id":"evil-resource"},"attributes":{"log.name":"evil-log"},"labels":{"authorization":"SECRET_NESTED"}}' >> /fixture/journal.export
                 emit superserve-vmd.service journal 6 '{"level":"DEBUG","message":"debug-only"}' >> /fixture/journal.export
                 emit proxy-generation.service journal 6 '{"level":"INFO","message":"proxy-safe","sandbox_id":"sandbox-1"}' >> /fixture/journal.export
+                emit superserve-vmd.service journal 6 '{"level":"WARN","message":"safe-warn"}' >> /fixture/journal.export
+                emit superserve-vmd.service journal 6 '{"level":"ERROR","message":"safe-error"}' >> /fixture/journal.export
                 emit proxy.service journal 6 'malformed SECRET_SENTINEL authorization=Bearer-SECRET' >> /fixture/journal.export
                 emit systemd-journald.service journal 5 'trusted-systemd-diagnostic' >> /fixture/journal.export
                 emit '' kernel 5 'trusted-kernel-diagnostic' >> /fixture/journal.export
+                emit superserve-host-logging-heartbeat.service journal 6 'host-logging-heartbeat' >> /fixture/journal.export
                 emit other.service journal 6 'drop-me' >> /fixture/journal.export
                 emit '' journal 6 'missing-unit-drop' >> /fixture/journal.export
                 # Ubuntu's package installs this helper outside PATH in some
@@ -243,70 +252,135 @@ RUN apt-get update \\
                 fi
                 test -n "$journal_remote" && test -x "$journal_remote"
                 "$journal_remote" --output=/var/log/journal/fixture.journal - < /fixture/journal.export
-                sleep 10
+                /fixture/bin/otelcol-contrib --config /fixture/runtime.yaml > /fixture/collector.log 2>&1 &
+                collector=$!
+                sleep 8
+                if [ -e /fixture/unavailable ]; then
+                  test -n "$(find /var/lib/superserve/host-logging/cursor -type f -size +0c -print -quit)"
+                  test -n "$(find /var/lib/superserve/host-logging/export-queue -type f -size +0c -print -quit)"
+                  kill -KILL "$collector"
+                  wait "$collector" 2>/dev/null || true
+                  /fixture/bin/otelcol-contrib --config /fixture/runtime.yaml >> /fixture/collector.log 2>&1 &
+                  collector=$!
+                  sleep 3
+                  rm /fixture/unavailable
+                  sleep 12
+                  find /var/lib/superserve/host-logging/export-queue -type f -printf '%s\n' > /fixture/queue-sizes
+                  while read -r size; do test "$size" -le 1048576; done < /fixture/queue-sizes
+                fi
                 kill -TERM "$collector" 2>/dev/null || true
                 wait "$collector" || true
                 test -s /fixture/collector.log
+                cat /fixture/requests.jsonl
+                printf "\nSELFLOGS\n"
                 cat /fixture/collector.log
+                kill "$endpoint"
             """)
             return self._docker("superserve-host-logging-runtime", fixture, script, timeout=360)
 
-    def test_allowlist_and_single_journal_path(self):
-        with tempfile.TemporaryDirectory(prefix="host-logging-render-") as directory:
-            rendered = self._render_templates(Path(directory))
-            config = rendered["config"]
-            self.assertIn("journald:", config)
-            self.assertIn("filter/approved_sources:", config)
-            self.assertIn("filter/info_plus:", config)
-            self.assertIn("parse_application_message", config)
-            self.assertIn("clear_untrusted_body", config)
-            self.assertIn("host_logging.parse_outcome", config)
-            self.assertNotIn("filelog/", config)
-            self.assertNotIn("ops-agent", config.lower())
-            self.assertEqual(config.count("receivers: [journald]"), 1)
-            self.assertIn("googlecloud:", config)
-            self.assertIn("journal.priority", config)
-            self.assertIn('attributes["journal.unit"] == nil', config)
-            self._run_collector_fixture(rendered)
-
     def test_trusted_metadata_and_collision_resistance_contract(self):
         with tempfile.TemporaryDirectory(prefix="host-logging-render-") as directory:
-            rendered = self._render_templates(Path(directory))
-            config = rendered["config"]
-            for field in ("host_id", "provider_instance_id", "incarnation", "environment", "region", "unit", "generation"):
-                self.assertIn(field, config)
-            for field in (
-                'delete_key(attributes["application"], "host_id")',
-                'delete_key(attributes["application"], "labels")',
-                'delete_key(attributes["application"], "parse_outcome")',
-                'delete_key(attributes["application"], "httpRequest")',
-            ):
-                self.assertIn(field, config)
-            self.assertIn("raw_body_discarded", config)
-            output = self._run_collector_fixture(rendered)
-            self.assertIn("safe-info", output)
-            self.assertIn("proxy-safe", output)
-            self.assertIn("application parse failure", output)
-            self.assertNotIn("debug-only", output)
-            self.assertNotIn("drop-me", output)
-            self.assertNotIn("missing-unit-drop", output)
-            self.assertNotIn("SECRET_SENTINEL", output)
-            self.assertNotIn("SECRET_NESTED", output)
-            self.assertNotIn("evil-host", output)
-            self.assertIn("fixture-host", output)
-            self.assertIn("fixture-incarnation", output)
+            output = self._run_collector_fixture(self._render_templates(Path(directory)))
+        requests, self_logs = output.split("SELFLOGS", 1)
+        records = []
+        resources = []
+        for line in requests.splitlines():
+            if not line.startswith('{'):
+                continue
+            for resource in json.loads(line)["resourceLogs"]:
+                resources.append(self._attributes(resource["resource"].get("attributes", [])))
+                for scope in resource["scopeLogs"]:
+                    records.extend(scope["logRecords"])
+        self.assertEqual(len(records), 8, output)
+        bodies = [self._value(record.get("body", {})) for record in records]
+        self.assertIn({"message": "safe-info", "request_id": "req-1"}, bodies)
+        self.assertIn({"message": "proxy-safe", "sandbox_id": "sandbox-1"}, bodies)
+        self.assertIn({"message": "safe-warn"}, bodies)
+        self.assertIn({"message": "safe-error"}, bodies)
+        self.assertIn({}, bodies)
+        for record in records:
+            attributes = self._attributes(record["attributes"])
+            self.assertEqual(attributes["host_id"], "fixture-host")
+            self.assertEqual(attributes["incarnation"], "fixture-incarnation")
+            self.assertEqual(attributes["log.name"], "superserve_host_logs")
+            self.assertEqual(int(record["timeUnixNano"]), 1700000000123456000)
+            self.assertEqual(attributes["provider_instance_id"], "fixture-instance")
+            if attributes.get("journal_unit") == "superserve-host-logging-heartbeat.service":
+                self.assertEqual(attributes["host_logging_heartbeat"], "true")
+                self.assertGreater(int(attributes["host_logging_retained_history_lag_seconds"]), 300)
+                self.assertLess(int(record["timeUnixNano"]) / 1e9, time.time() - 300)
+            else:
+                self.assertNotIn("host_logging_heartbeat", attributes)
+                self.assertNotIn("host_logging_retained_history_lag_seconds", attributes)
+            self.assertNotIn("host_logging_export_error", attributes)
+            if attributes.get("journal_unit") == "superserve-vmd.service":
+                self.assertEqual(attributes["parse_outcome"], "success")
+                self.assertEqual(attributes["source"], "journal")
+                self.assertEqual(record["severityNumber"], {"safe-info": 9, "safe-warn": 13, "safe-error": 17}[self._value(record["body"])["message"]])
+            if attributes.get("journal_unit") == "proxy.service":
+                self.assertEqual(attributes["parse_outcome"], "failure")
+                self.assertEqual(self._value(record["body"]), {})
+        for resource in resources:
+            self.assertEqual(resource["cloud.platform"], "gcp_compute_engine")
+            self.assertEqual(resource["host.id"], "fixture-instance")
+            self.assertEqual(resource["gcp.project_id"], "example-project")
+        for forbidden in ["debug-only", "drop-me", "missing-unit-drop", "SECRET_SENTINEL", "SECRET_NESTED", "evil-host", "evil-incarnation", "evil-instance", "evil.service", "evil-source", "evil-resource", "evil-log"]:
+            self.assertNotIn(forbidden, output)
+        shutdown_seen = False
+        for line in self_logs.splitlines():
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if entry.get("msg") == "Received signal from OS":
+                self.assertEqual(entry.get("signal"), "terminated")
+                shutdown_seen = True
+            if entry.get("level") == "error":
+                self.assertTrue(shutdown_seen, entry)
+                self.assertEqual(entry.get("otelcol.component.id"), "journald", entry)
+                self.assertEqual(entry.get("msg"), "journalctl command exited", entry)
+                self.assertIn(entry.get("error"), ("signal: terminated", "signal: killed"), entry)
+        self.assertTrue(shutdown_seen)
+
+    def test_accepted_queue_records_survive_outage_restart(self):
+        with tempfile.TemporaryDirectory(prefix="host-logging-render-") as directory:
+            output = self._run_collector_fixture(self._render_templates(Path(directory)), outage=True)
+        requests, self_logs = output.split("SELFLOGS", 1)
+        messages = []
+        for line in requests.splitlines():
+            if not line.startswith('{'):
+                continue
+            for resource in json.loads(line)["resourceLogs"]:
+                for scope in resource["scopeLogs"]:
+                    messages.extend(self._value(record["body"]) for record in scope["logRecords"])
+        self.assertIn({"message": "safe-info", "request_id": "req-1"}, messages)
+        self.assertIn({"message": "proxy-safe", "sandbox_id": "sandbox-1"}, messages)
+        self.assertIn({}, messages)
+        self.assertGreaterEqual(len(messages), 8)
+        self.assertLessEqual(len(messages), 16)
+        self.assertIn("503", self_logs)
+        self.assertNotIn("SECRET_SENTINEL", output)
+
+    @classmethod
+    def _value(cls, value):
+        if "kvlistValue" in value:
+            return cls._attributes(value["kvlistValue"].get("values", []))
+        return next(iter(value.values()), None)
+
+    @classmethod
+    def _attributes(cls, values):
+        return {item["key"]: cls._value(item["value"]) for item in values}
 
     def test_release_and_state_are_pinned_and_separate(self):
         self.assertRegex(self.variables, r'otel_release_version[^\n]+')
-        self.assertRegex(self.variables, r'default\s+=\s+"0\.119\.0"')
+        self.assertRegex(self.variables, r'default\s+=\s+"0\.156\.0"')
         self.assertRegex(self.variables, r'default\s+=\s+"[0-9a-f]{64}"')
         with tempfile.TemporaryDirectory(prefix="host-logging-render-") as directory:
             rendered = self._render_templates(Path(directory))
             config = rendered["config"]
             self.assertIn("file_storage/cursor", config)
             self.assertIn("file_storage/queue", config)
-            self.assertIn("on_start: true", config)
-            self.assertIn("directory: /var/lib/superserve/host-logging/export-queue/compaction", config)
+            self.assertIn("max_size: 2147483648", config)
+            self.assertIn("max_elapsed_time: 0s", config)
             self.assertIn("/var/lib/superserve/host-logging/cursor", rendered["service"])
             self.assertIn("/var/lib/superserve/host-logging/export-queue", rendered["service"])
             self.assertNotIn("superserve-otel-collector.service", rendered["service"])
@@ -345,6 +419,7 @@ RUN apt-get update \\
                   [ "$1" = -o ] && {{ shift; out="$1"; }}
                   shift
                 done
+                touch /fixture/checksum-attempted
                 printf 'intentionally-invalid-archive' > "$out"
                 EOF
                   chmod +x /fixture/bin/curl
@@ -366,11 +441,11 @@ RUN apt-get update \\
                 printf 'old-queue' > /var/lib/superserve/host-logging/export-queue/state
                 printf '{{"host_id":"fixture-host","instance_id":"fixture-instance","incarnation_id":"fixture-incarnation"}}\n' > /etc/sandbox/host-identity.json
                 printf 'HOST_ID=fixture-host\nINSTANCE_ID=fixture-instance\nINCARNATION_ID=fixture-incarnation\n' > /etc/sandbox/host-logging-identity.env
-                if [ "{mode}" != storage ]; then
+                if [ "{mode}" = config ]; then
                   cat > /opt/superserve/otelcol-contrib/bin/otelcol-contrib <<'EOF'
                 #!/bin/sh
                 [ "$1" = --version ] && echo 'otelcol-contrib version {self.release}' && exit 0
-                [ "$1" = validate ] && [ "{mode}" = config ] && exit 1
+                [ "$1" = validate ] && touch /fixture/config-validation-attempted && exit 1
                 [ "$1" = validate ] && exit 0
                 EOF
                   chmod +x /opt/superserve/otelcol-contrib/bin/otelcol-contrib
@@ -380,12 +455,100 @@ RUN apt-get update \\
                 rc=$?
                 set -e
                 test "$rc" -ne 0
+                case "{mode}" in
+                  checksum) test -e /fixture/checksum-attempted;;
+                  config) test -e /fixture/config-validation-attempted;;
+                esac
+                test ! -e /fixture/systemctl.calls
                 cmp /etc/superserve/host-logging/otel-logs.yaml <(printf 'active\n')
                 cmp /etc/systemd/system/superserve-otel-logs.service <(printf 'active-service\n')
                 test "$(cat /var/lib/superserve/host-logging/cursor/state)" = old-cursor
                 test "$(cat /var/lib/superserve/host-logging/export-queue/state)" = old-queue
             """)
             self._docker(f"superserve-host-logging-reconcile-{mode}", fixture, script, timeout=180)
+
+    def test_reconcile_converges_and_is_idempotent(self):
+        self._exercise_reconciliation(False)
+
+    def test_post_activation_failure_restores_active_state(self):
+        self._exercise_reconciliation(True)
+
+    def _exercise_reconciliation(self, activation_failure):
+        with tempfile.TemporaryDirectory(prefix="host-logging-render-") as directory:
+            rendered = self._render_templates(Path(directory))
+            with tempfile.TemporaryDirectory(prefix="host-logging-converged-") as work:
+                fixture = Path(work)
+                for name, content in rendered.items():
+                    (fixture / name).write_text(content)
+                if activation_failure:
+                    (fixture / "test-rollback").touch()
+                script = self._acquire_release(fixture) + textwrap.dedent("""
+                    mkdir -p /var/lib/superserve/host-logging /etc/sandbox /opt/superserve/otelcol-contrib/bin
+                    cp /fixture/bin/otelcol-contrib /opt/superserve/otelcol-contrib/bin/otelcol-contrib
+                    cp /fixture/config /var/lib/superserve/host-logging/otel-logs.yaml.candidate
+                    cp /fixture/service /var/lib/superserve/host-logging/otel-logs.service.candidate
+                    cp /fixture/reconcile /var/lib/superserve/host-logging/reconcile.sh
+                    printf '{"host_id":"fixture-host","instance_id":"123","incarnation_id":"fixture-incarnation"}\n' > /etc/sandbox/host-identity.json
+                    cat > /fixture/bin/systemctl <<'EOF'
+                    #!/bin/bash
+                    if [ "$1 $2" = 'restart superserve-otel-logs.service' ] && [ -e /fixture/fail-activation ]; then
+                      rm /fixture/fail-activation
+                      printf 'injected activation failure\n' >&2
+                      exit 1
+                    fi
+                    case "$1" in
+                      is-active|is-enabled) test -e /fixture/active; exit $?;;
+                      *) printf '%s\n' "$*" >> /fixture/systemctl.calls; touch /fixture/active; exit 0;;
+                    esac
+                    EOF
+                    cat > /fixture/bin/df <<'EOF'
+                    #!/bin/sh
+                    echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+                    echo 'fixture 1 1 999999999 1% /'
+                    EOF
+                    cat > /fixture/bin/journalctl <<'EOF'
+                    #!/bin/sh
+                    test "$1" = --flush
+                    EOF
+                    chmod +x /fixture/bin/systemctl /fixture/bin/df /fixture/bin/journalctl
+                    export PATH=/fixture/bin:$PATH
+                    result() {
+                      expected="$1"; shift
+                      set +e
+                      "$@"
+                      rc=$?
+                      set -e
+                      [ "$rc" -eq "$expected" ] || { echo "expected=$expected actual=$rc" >&2; exit 1; }
+                    }
+                    result 101 bash /fixture/validate
+                    mkdir /var/lib/superserve/host-logging/.attempt.interrupted
+                    printf 'orphan candidate' > /var/lib/superserve/host-logging/.attempt.interrupted/release.tar.gz
+                    result 100 bash /fixture/reconcile
+                    test ! -e /var/lib/superserve/host-logging/.attempt.interrupted
+                    printf 'cursor-sentinel' > /var/lib/superserve/host-logging/cursor/sentinel
+                    printf 'queue-sentinel' > /var/lib/superserve/host-logging/export-queue/sentinel
+                    cp /fixture/systemctl.calls /fixture/calls.before
+                    find /etc/superserve/host-logging /etc/sandbox /etc/systemd/system /etc/systemd/journald.conf.d /opt/superserve/otelcol-contrib/bin /var/lib/superserve/host-logging/cursor /var/lib/superserve/host-logging/export-queue -type f -exec sha256sum {} + > /fixture/files.before
+                    result 100 bash /fixture/validate
+                    result 100 bash /fixture/reconcile
+                    cmp /fixture/calls.before /fixture/systemctl.calls
+                    find /etc/superserve/host-logging /etc/sandbox /etc/systemd/system /etc/systemd/journald.conf.d /opt/superserve/otelcol-contrib/bin /var/lib/superserve/host-logging/cursor /var/lib/superserve/host-logging/export-queue -type f -exec sha256sum {} + > /fixture/files.after
+                    cmp /fixture/files.before /fixture/files.after
+                    if [ -e /fixture/test-rollback ]; then
+                      printf '\n# changed candidate\n' >> /var/lib/superserve/host-logging/otel-logs.yaml.candidate
+                      : > /fixture/systemctl.calls
+                      touch /fixture/fail-activation
+                      result 1 bash /fixture/reconcile
+                      find /etc/superserve/host-logging /etc/sandbox /etc/systemd/system /etc/systemd/journald.conf.d /opt/superserve/otelcol-contrib/bin /var/lib/superserve/host-logging/cursor /var/lib/superserve/host-logging/export-queue -type f -exec sha256sum {} + > /fixture/files.rollback
+                      cmp /fixture/files.before /fixture/files.rollback
+                      grep -q '^restart superserve-otel-logs.service$' /fixture/systemctl.calls
+                      ! grep -q 'superserve-otel-collector.service' /fixture/systemctl.calls
+                      test -e /fixture/active
+                    fi
+                    rm /etc/sandbox/host-identity.json
+                    result 1 bash /fixture/validate
+                """)
+                self._docker("host-logging-converged", fixture, script)
 
     def test_candidate_validation_and_failure_preservation(self):
         with tempfile.TemporaryDirectory(prefix="host-logging-render-") as directory:
@@ -410,8 +573,10 @@ RUN apt-get update \\
             with tempfile.TemporaryDirectory(prefix="host-logging-validate-") as fixture_dir:
                 fixture = Path(fixture_dir)
                 (fixture / "validate.sh").write_text(validate)
+                (fixture / "reconcile.sh").write_text(reconcile)
                 script = textwrap.dedent("""
-                    mkdir -p /fixture/bin
+                    mkdir -p /fixture/bin /var/lib/superserve/host-logging
+                    cp /fixture/reconcile.sh /var/lib/superserve/host-logging/reconcile.sh
                     cat > /fixture/bin/systemctl <<'EOF'
                     #!/bin/sh
                     exit 0

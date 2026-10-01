@@ -59,7 +59,6 @@ variable "enrolled_hosts" {
     host_id               = string
     incarnation           = string
     service_account_email = string
-    proxy_units           = optional(list(string), ["proxy.service"])
   }))
 }
 
@@ -89,7 +88,7 @@ variable "otel_release_version" {
   # Logs are pinned independently from the existing metrics collector. This
   # release is selected for the journald, transform, file-storage, and
   # Cloud-Logging components used by this module.
-  default = "0.119.0"
+  default = "0.156.0"
   validation {
     condition     = can(regex("^0\\.[0-9]+\\.[0-9]+$", var.otel_release_version))
     error_message = "otel_release_version must be a pinned semantic release."
@@ -99,7 +98,7 @@ variable "otel_release_version" {
 variable "otel_release_url" {
   description = "Authenticated package URL for the selected amd64 OTel Contrib release."
   type        = string
-  default     = "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.119.0/otelcol-contrib_0.119.0_linux_amd64.tar.gz"
+  default     = "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.156.0/otelcol-contrib_0.156.0_linux_amd64.tar.gz"
   validation {
     condition     = can(regex("^https://", var.otel_release_url))
     error_message = "otel_release_url must use HTTPS."
@@ -111,7 +110,7 @@ variable "otel_release_sha256" {
   type        = string
   # This immutable value is replaced only by a reviewed release manifest;
   # staging must reject an archive whose bytes do not match it.
-  default = "4ee77545daaad658f7282bff98704bc1f31107890e2a2e1d4b1fc31da4648111"
+  default = "ee70d7b1221be8a9cc4700f48bf985c04b1ab8aaeef24409fe79623849e2f9f2"
   validation {
     condition     = can(regex("^[0-9a-f]{64}$", var.otel_release_sha256))
     error_message = "otel_release_sha256 must be a reviewed 64-character hexadecimal digest."
@@ -133,15 +132,15 @@ variable "otel_memory_limit_mb" {
   type        = number
   default     = 512
   validation {
-    condition     = var.otel_memory_limit_mb > 0
-    error_message = "otel_memory_limit_mb must be positive."
+    condition     = var.otel_memory_limit_mb >= 128 && floor(var.otel_memory_limit_mb) == var.otel_memory_limit_mb
+    error_message = "otel_memory_limit_mb must be an integer of at least 128 MiB."
   }
 }
 
 variable "otel_cpu_limit" {
   description = "Bounded OTel logs service CPU quota."
   type        = string
-  default     = "100%"
+  default     = "25%"
   validation {
     condition     = can(regex("^([1-9][0-9]?|100)%$", var.otel_cpu_limit))
     error_message = "otel_cpu_limit must use systemd percentage syntax from 1% through 100%."
@@ -173,7 +172,19 @@ variable "otel_queue_max_bytes" {
   type        = number
   default     = 2147483648
   validation {
-    condition     = var.otel_queue_max_bytes > 0
-    error_message = "otel_queue_max_bytes must be positive."
+    condition     = var.otel_queue_max_bytes >= 16777216 && var.otel_queue_max_bytes <= 2147483648
+    error_message = "otel_queue_max_bytes must be between 16 MiB and 2 GiB."
   }
+}
+
+variable "legacy_migration" {
+  description = "Audited legacy user config and instance-bound receipt/drain evidence. Null preserves the legacy writer without enabling OTel."
+  type = object({
+    initialize_instance_ids = optional(set(string), [])
+    baseline_user_config    = string
+    overlap_deadline        = string
+    verified_instance_ids   = set(string)
+    drained_instance_ids    = set(string)
+  })
+  default = null
 }

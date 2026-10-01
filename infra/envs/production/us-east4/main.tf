@@ -525,6 +525,7 @@ module "observability" {
     display_prefix = "Host logging / ${local.active_host_name}"
     expected_hosts = {
       sandbox_host_c = {
+        active            = !contains(["preserve", "rollback"], var.host_logging_legacy_transition)
         instance_name     = module.sandbox_host_c.instance_name
         instance_id       = module.sandbox_host_c.instance_id
         collector_host_id = module.sandbox_host_c.instance_name
@@ -547,8 +548,9 @@ module "host_logging" {
   assignment_name = "superserve-otel-host-logging-us-east4-a"
   # Keep the existing zonal Ops Agent policy as an explicit legacy writer
   # until staged OTel receipt, drain, and rollback evidence authorizes retire.
-  legacy_policy_name = "goog-ops-agent-v2-template-1-7-0-us-east4-a"
-  legacy_transition  = "preserve"
+  legacy_policy_name = "goog-ops-agent-v2-template-1-7-0-us-east4-c"
+  legacy_transition  = var.host_logging_legacy_transition
+  legacy_migration   = var.host_logging_legacy_migration
   selector_labels = {
     application = "sandbox-host"
     environment = local.environment
@@ -561,7 +563,6 @@ module "host_logging" {
       host_id               = var.host_c_host_id
       incarnation           = "installed-host-identity"
       service_account_email = google_service_account.vmd_runtime.email
-      proxy_units           = ["proxy.service", "proxy-generation.service"]
     }
   }
   depends_on = [module.sandbox_host_c]

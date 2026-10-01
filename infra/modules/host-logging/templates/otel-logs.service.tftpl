@@ -7,19 +7,29 @@ After=network-online.target systemd-journald.service
 Type=simple
 User=root
 Group=root
-EnvironmentFile=-/etc/sandbox/host-identity.env
-EnvironmentFile=-/etc/sandbox/host-logging-identity.env
-Environment=OTEL_QUEUE_MAX_BYTES=${queue_max_bytes}
+EnvironmentFile=/etc/sandbox/host-logging-identity.env
+Environment=GOMEMLIMIT=${floor(memory_limit_mb * 0.75)}MiB
 ExecStart=${binary_path} --config ${config_path}
 Restart=on-failure
 RestartSec=5s
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${cursor_dir} ${queue_dir} /var/log/journal
+ReadWritePaths=${cursor_dir} ${queue_dir}
 MemoryMax=${memory_limit_mb}M
 CPUQuota=${cpu_limit}
-LimitNOFILE=65536
+MemoryHigh=${floor(memory_limit_mb * 0.875)}M
+CPUWeight=20
+IOWeight=20
+IOReadBandwidthMax=/var/log/journal 8M
+IOWriteBandwidthMax=${queue_dir} 8M
+Nice=10
+OOMScoreAdjust=200
+TasksMax=32
+UMask=0077
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100
+LimitNOFILE=256
 
 [Install]
 WantedBy=multi-user.target

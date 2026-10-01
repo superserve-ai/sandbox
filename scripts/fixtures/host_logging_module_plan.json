@@ -1,0 +1,1499 @@
+{
+  "format_version": "1.2",
+  "resource_changes": [
+    {
+      "address": "module.host_logging.google_os_config_os_policy_assignment.host_logging",
+      "mode": "managed",
+      "type": "google_os_config_os_policy_assignment",
+      "name": "host_logging",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "description": null,
+          "instance_filter": [
+            {
+              "all": false,
+              "exclusion_labels": [],
+              "inclusion_labels": [
+                {
+                  "labels": {
+                    "application": "sandbox-host",
+                    "environment": "staging"
+                  }
+                }
+              ],
+              "inventories": []
+            }
+          ],
+          "location": "us-central1-a",
+          "name": "example-host-logging",
+          "os_policies": [
+            {
+              "allow_no_resource_group_match": null,
+              "description": null,
+              "id": "superserve-otel-host-logging",
+              "mode": "ENFORCEMENT",
+              "resource_groups": [
+                {
+                  "inventory_filters": [
+                    {
+                      "os_short_name": "ubuntu",
+                      "os_version": null
+                    }
+                  ],
+                  "resources": [
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "content": null,
+                          "file": [
+                            {
+                              "allow_insecure": null,
+                              "gcs": [
+                                {
+                                  "bucket": "superserve-host-logging-staging-uscentral1",
+                                  "object": "example-host-logging/2026-10-01-otel-1/otel-logs.yaml"
+                                }
+                              ],
+                              "local_path": null,
+                              "remote": []
+                            }
+                          ],
+                          "path": "/var/lib/superserve/host-logging/otel-logs.yaml.candidate",
+                          "state": "CONTENTS_MATCH"
+                        }
+                      ],
+                      "id": "otel-logs-config",
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "content": null,
+                          "file": [
+                            {
+                              "allow_insecure": null,
+                              "gcs": [
+                                {
+                                  "bucket": "superserve-host-logging-staging-uscentral1",
+                                  "object": "example-host-logging/2026-10-01-otel-1/otel-logs.service"
+                                }
+                              ],
+                              "local_path": null,
+                              "remote": []
+                            }
+                          ],
+                          "path": "/var/lib/superserve/host-logging/otel-logs.service.candidate",
+                          "state": "CONTENTS_MATCH"
+                        }
+                      ],
+                      "id": "otel-logs-service",
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "content": "[Journal]\nStorage=persistent\nSystemMaxUse=4294967296B\nSystemKeepFree=10737418240B\n",
+                          "file": [],
+                          "path": "/var/lib/superserve/host-logging/journald.conf.candidate",
+                          "state": "CONTENTS_MATCH"
+                        }
+                      ],
+                      "id": "journald-retention",
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "content": null,
+                          "file": [
+                            {
+                              "allow_insecure": null,
+                              "gcs": [
+                                {
+                                  "bucket": "superserve-host-logging-staging-uscentral1",
+                                  "object": "example-host-logging/2026-10-01-otel-1/validate.sh"
+                                }
+                              ],
+                              "local_path": null,
+                              "remote": []
+                            }
+                          ],
+                          "path": "/var/lib/superserve/host-logging/validate.sh",
+                          "state": "CONTENTS_MATCH"
+                        }
+                      ],
+                      "id": "validate-script",
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "content": null,
+                          "file": [
+                            {
+                              "allow_insecure": null,
+                              "gcs": [
+                                {
+                                  "bucket": "superserve-host-logging-staging-uscentral1",
+                                  "object": "example-host-logging/2026-10-01-otel-1/reconcile.sh"
+                                }
+                              ],
+                              "local_path": null,
+                              "remote": []
+                            }
+                          ],
+                          "path": "/var/lib/superserve/host-logging/reconcile.sh",
+                          "state": "CONTENTS_MATCH"
+                        }
+                      ],
+                      "id": "reconcile-script",
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [
+                        {
+                          "enforce": [
+                            {
+                              "args": null,
+                              "file": [
+                                {
+                                  "allow_insecure": null,
+                                  "gcs": [],
+                                  "local_path": "/var/lib/superserve/host-logging/reconcile.sh",
+                                  "remote": []
+                                }
+                              ],
+                              "interpreter": "SHELL",
+                              "output_file_path": null,
+                              "script": null
+                            }
+                          ],
+                          "validate": [
+                            {
+                              "args": null,
+                              "file": [
+                                {
+                                  "allow_insecure": null,
+                                  "gcs": [],
+                                  "local_path": "/var/lib/superserve/host-logging/validate.sh",
+                                  "remote": []
+                                }
+                              ],
+                              "interpreter": "SHELL",
+                              "output_file_path": null,
+                              "script": null
+                            }
+                          ]
+                        }
+                      ],
+                      "file": [],
+                      "id": "reconcile-and-validate",
+                      "pkg": [],
+                      "repository": []
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "project": "example-project",
+          "rollout": [
+            {
+              "disruption_budget": [
+                {
+                  "fixed": 1,
+                  "percent": null
+                }
+              ],
+              "min_wait_duration": "60s"
+            }
+          ],
+          "skip_await_rollout": null,
+          "timeouts": null
+        },
+        "after_unknown": {
+          "baseline": true,
+          "deleted": true,
+          "deletion_policy": true,
+          "etag": true,
+          "id": true,
+          "instance_filter": [
+            {
+              "exclusion_labels": [],
+              "inclusion_labels": [
+                {
+                  "labels": {}
+                }
+              ],
+              "inventories": []
+            }
+          ],
+          "os_policies": [
+            {
+              "resource_groups": [
+                {
+                  "inventory_filters": [
+                    {}
+                  ],
+                  "resources": [
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "file": [
+                            {
+                              "gcs": [
+                                {
+                                  "generation": true
+                                }
+                              ],
+                              "remote": []
+                            }
+                          ],
+                          "permissions": true
+                        }
+                      ],
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "file": [
+                            {
+                              "gcs": [
+                                {
+                                  "generation": true
+                                }
+                              ],
+                              "remote": []
+                            }
+                          ],
+                          "permissions": true
+                        }
+                      ],
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "file": [],
+                          "permissions": true
+                        }
+                      ],
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "file": [
+                            {
+                              "gcs": [
+                                {
+                                  "generation": true
+                                }
+                              ],
+                              "remote": []
+                            }
+                          ],
+                          "permissions": true
+                        }
+                      ],
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "file": [
+                            {
+                              "gcs": [
+                                {
+                                  "generation": true
+                                }
+                              ],
+                              "remote": []
+                            }
+                          ],
+                          "permissions": true
+                        }
+                      ],
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [
+                        {
+                          "enforce": [
+                            {
+                              "file": [
+                                {
+                                  "gcs": [],
+                                  "remote": []
+                                }
+                              ]
+                            }
+                          ],
+                          "validate": [
+                            {
+                              "file": [
+                                {
+                                  "gcs": [],
+                                  "remote": []
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ],
+                      "file": [],
+                      "pkg": [],
+                      "repository": []
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "reconciling": true,
+          "revision_create_time": true,
+          "revision_id": true,
+          "rollout": [
+            {
+              "disruption_budget": [
+                {}
+              ]
+            }
+          ],
+          "rollout_state": true,
+          "uid": true
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "instance_filter": [
+            {
+              "exclusion_labels": [],
+              "inclusion_labels": [
+                {
+                  "labels": {}
+                }
+              ],
+              "inventories": []
+            }
+          ],
+          "os_policies": [
+            {
+              "resource_groups": [
+                {
+                  "inventory_filters": [
+                    {}
+                  ],
+                  "resources": [
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "file": [
+                            {
+                              "gcs": [
+                                {}
+                              ],
+                              "remote": []
+                            }
+                          ]
+                        }
+                      ],
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "file": [
+                            {
+                              "gcs": [
+                                {}
+                              ],
+                              "remote": []
+                            }
+                          ]
+                        }
+                      ],
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "file": []
+                        }
+                      ],
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "file": [
+                            {
+                              "gcs": [
+                                {}
+                              ],
+                              "remote": []
+                            }
+                          ]
+                        }
+                      ],
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [],
+                      "file": [
+                        {
+                          "file": [
+                            {
+                              "gcs": [
+                                {}
+                              ],
+                              "remote": []
+                            }
+                          ]
+                        }
+                      ],
+                      "pkg": [],
+                      "repository": []
+                    },
+                    {
+                      "exec": [
+                        {
+                          "enforce": [
+                            {
+                              "file": [
+                                {
+                                  "gcs": [],
+                                  "remote": []
+                                }
+                              ]
+                            }
+                          ],
+                          "validate": [
+                            {
+                              "file": [
+                                {
+                                  "gcs": [],
+                                  "remote": []
+                                }
+                              ]
+                            }
+                          ]
+                        }
+                      ],
+                      "file": [],
+                      "pkg": [],
+                      "repository": []
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "rollout": [
+            {
+              "disruption_budget": [
+                {}
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "address": "module.host_logging.google_project_iam_member.log_writer[\"vmd@example-project.iam.gserviceaccount.com\"]",
+      "mode": "managed",
+      "type": "google_project_iam_member",
+      "name": "log_writer",
+      "index": "vmd@example-project.iam.gserviceaccount.com",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "condition": [],
+          "member": "serviceAccount:vmd@example-project.iam.gserviceaccount.com",
+          "project": "example-project",
+          "role": "roles/logging.logWriter"
+        },
+        "after_unknown": {
+          "condition": [],
+          "etag": true,
+          "id": true
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "condition": []
+        }
+      }
+    },
+    {
+      "address": "module.host_logging.google_project_iam_member.telemetry_consumer[\"vmd@example-project.iam.gserviceaccount.com\"]",
+      "mode": "managed",
+      "type": "google_project_iam_member",
+      "name": "telemetry_consumer",
+      "index": "vmd@example-project.iam.gserviceaccount.com",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "condition": [],
+          "member": "serviceAccount:vmd@example-project.iam.gserviceaccount.com",
+          "project": "example-project",
+          "role": "roles/serviceusage.serviceUsageConsumer"
+        },
+        "after_unknown": {
+          "condition": [],
+          "etag": true,
+          "id": true
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "condition": []
+        }
+      }
+    },
+    {
+      "address": "module.host_logging.google_storage_bucket.host_logging_artifacts",
+      "mode": "managed",
+      "type": "google_storage_bucket",
+      "name": "host_logging_artifacts",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "autoclass": [],
+          "cors": [],
+          "custom_placement_config": [],
+          "default_event_based_hold": null,
+          "enable_object_retention": null,
+          "encryption": [],
+          "force_destroy": null,
+          "hierarchical_namespace": [],
+          "ip_filter": [],
+          "labels": null,
+          "lifecycle_rule": [],
+          "location": "us-central1",
+          "logging": [],
+          "name": "superserve-host-logging-staging-uscentral1",
+          "project": "example-project",
+          "requester_pays": null,
+          "retention_policy": [],
+          "soft_delete_policy": [],
+          "storage_class": null,
+          "timeouts": null,
+          "uniform_bucket_level_access": true,
+          "versioning": [
+            {
+              "enabled": true
+            }
+          ],
+          "website": []
+        },
+        "after_unknown": {
+          "autoclass": [],
+          "cors": [],
+          "custom_placement_config": [],
+          "deletion_policy": true,
+          "effective_labels": true,
+          "encryption": [],
+          "hierarchical_namespace": [],
+          "id": true,
+          "ip_filter": [],
+          "lifecycle_rule": [],
+          "logging": [],
+          "project_number": true,
+          "public_access_prevention": true,
+          "retention_policy": [],
+          "rpo": true,
+          "self_link": true,
+          "soft_delete_policy": [],
+          "terraform_labels": true,
+          "time_created": true,
+          "updated": true,
+          "url": true,
+          "versioning": [
+            {}
+          ],
+          "website": []
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "autoclass": [],
+          "cors": [],
+          "custom_placement_config": [],
+          "effective_labels": {},
+          "encryption": [],
+          "hierarchical_namespace": [],
+          "ip_filter": [],
+          "lifecycle_rule": [],
+          "logging": [],
+          "retention_policy": [],
+          "soft_delete_policy": [],
+          "terraform_labels": {},
+          "versioning": [
+            {}
+          ],
+          "website": []
+        }
+      }
+    },
+    {
+      "address": "module.host_logging.google_storage_bucket_iam_member.artifact_reader[\"vmd@example-project.iam.gserviceaccount.com\"]",
+      "mode": "managed",
+      "type": "google_storage_bucket_iam_member",
+      "name": "artifact_reader",
+      "index": "vmd@example-project.iam.gserviceaccount.com",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "bucket": "superserve-host-logging-staging-uscentral1",
+          "condition": [],
+          "member": "serviceAccount:vmd@example-project.iam.gserviceaccount.com",
+          "role": "roles/storage.objectViewer",
+          "timeouts": null
+        },
+        "after_unknown": {
+          "condition": [],
+          "etag": true,
+          "id": true
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "condition": []
+        }
+      }
+    },
+    {
+      "address": "module.host_logging.google_storage_bucket_object.otel_config",
+      "mode": "managed",
+      "type": "google_storage_bucket_object",
+      "name": "otel_config",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "bucket": "superserve-host-logging-staging-uscentral1",
+          "cache_control": null,
+          "content": "# Terraform owns this dedicated logs pipeline and its independent durable state.\nextensions:\n  googleclientauth:\n    project: example-project\n    quota_project: example-project\n  file_storage/cursor:\n    directory: /var/lib/superserve/host-logging/cursor\n    create_directory: true\n    fsync: true\n    max_size: 16777216\n  file_storage/queue:\n    directory: /var/lib/superserve/host-logging/export-queue\n    create_directory: true\n    fsync: true\n    max_size: 2147483648\n    # Disable compaction: one bounded database, no temporary second copy.\n    compaction:\n      on_start: false\n      on_rebound: false\n\nreceivers:\n  journald:\n    directory: /var/log/journal\n    start_at: beginning\n    storage: file_storage/cursor\n    retry_on_failure:\n      enabled: true\n      max_elapsed_time: 0s\n\nprocessors:\n  memory_limiter:\n    check_interval: 1s\n    limit_mib: 192\n    spike_limit_mib: 32\n  filter/approved_sources:\n    error_mode: propagate\n    logs:\n      log_record:\n        - 'body[\"_TRANSPORT\"] != \"kernel\" and (body[\"_SYSTEMD_UNIT\"] == nil or not IsMatch(body[\"_SYSTEMD_UNIT\"], \"^(superserve-vmd|proxy(-[^.]*)?|systemd(-[^.]*)?|google-(osconfig|guest)-agent|superserve-otel-(collector|logs)|unbound|(superserve-)?secretsproxy|superserve-host-logging-heartbeat)\\\\.service$\")) and not (body[\"_PID\"] == \"1\" and body[\"UNIT\"] != nil and IsMatch(body[\"UNIT\"], \"^(superserve-vmd|proxy(-[^.]*)?)\\\\.service$\"))'\n  transform/trusted_payload:\n    # Parse failures must never write the input record into collector self-logs.\n    error_mode: silent\n    log_statements:\n      - context: log\n        statements:\n          - set(cache[\"journal\"], {})\n          - set(cache[\"journal\"][\"MESSAGE\"], body[\"MESSAGE\"]) where IsString(body[\"MESSAGE\"]) and Len(body[\"MESSAGE\"]) <= 65536\n          - set(cache[\"journal\"][\"_SYSTEMD_UNIT\"], body[\"_SYSTEMD_UNIT\"]) where IsString(body[\"_SYSTEMD_UNIT\"]) and Len(body[\"_SYSTEMD_UNIT\"]) <= 256\n          - set(cache[\"journal\"][\"_TRANSPORT\"], body[\"_TRANSPORT\"]) where IsString(body[\"_TRANSPORT\"]) and Len(body[\"_TRANSPORT\"]) <= 256\n          - set(cache[\"journal\"][\"_PID\"], body[\"_PID\"]) where IsString(body[\"_PID\"]) and Len(body[\"_PID\"]) <= 256\n          - set(cache[\"journal\"][\"_BOOT_ID\"], body[\"_BOOT_ID\"]) where IsString(body[\"_BOOT_ID\"]) and Len(body[\"_BOOT_ID\"]) <= 256\n          - set(cache[\"journal\"][\"UNIT\"], body[\"UNIT\"]) where IsString(body[\"UNIT\"]) and Len(body[\"UNIT\"]) <= 256\n          - set(cache[\"journal\"][\"PRIORITY\"], body[\"PRIORITY\"]) where IsString(body[\"PRIORITY\"]) and Len(body[\"PRIORITY\"]) <= 256\n          - set(cache[\"application\"], IsMatch(body[\"_SYSTEMD_UNIT\"], \"^(superserve-vmd|proxy(-[^.]*)?)\\\\.service$\")) where IsString(body[\"_SYSTEMD_UNIT\"])\n          - set(cache[\"parsed\"], ParseJSON(body[\"MESSAGE\"])) where cache[\"application\"] == true and IsString(body[\"MESSAGE\"]) and Len(body[\"MESSAGE\"]) <= 65536\n          - set(body, {})\n          - keep_keys(attributes, [])\n          - keep_keys(resource.attributes, [])\n          - set(attributes[\"journal_unit\"], cache[\"journal\"][\"_SYSTEMD_UNIT\"])\n          - set(attributes[\"unit\"], cache[\"journal\"][\"UNIT\"]) where cache[\"journal\"][\"_PID\"] == \"1\"\n          - set(attributes[\"source\"], cache[\"journal\"][\"_TRANSPORT\"])\n          - set(attributes[\"boot_id\"], cache[\"journal\"][\"_BOOT_ID\"])\n          - set(attributes[\"pid\"], cache[\"journal\"][\"_PID\"])\n          - set(attributes[\"host_id\"], \"${env:HOST_ID}\")\n          - set(attributes[\"provider_instance_id\"], \"${env:INSTANCE_ID}\")\n          - set(attributes[\"incarnation\"], \"${env:INCARNATION_ID}\")\n          - set(attributes[\"environment\"], \"staging\")\n          - set(attributes[\"region\"], \"us-central1\")\n          - set(attributes[\"generation\"], attributes[\"journal_unit\"]) where IsMatch(attributes[\"journal_unit\"], \"^proxy-\")\n          - set(attributes[\"log.name\"], \"superserve_host_logs\")\n          - set(resource.attributes[\"cloud.platform\"], \"gcp_compute_engine\")\n          - set(resource.attributes[\"gcp.project_id\"], \"example-project\")\n          - set(resource.attributes[\"host.id\"], \"${env:INSTANCE_ID}\")\n          - set(resource.attributes[\"cloud.availability_zone\"], \"us-central1-a\")\n          - set(severity_number, SEVERITY_NUMBER_INFO)\n          - set(severity_number, SEVERITY_NUMBER_WARN) where Int(cache[\"journal\"][\"PRIORITY\"]) == 4\n          - set(severity_number, SEVERITY_NUMBER_ERROR) where Int(cache[\"journal\"][\"PRIORITY\"]) <= 3\n          - set(severity_number, SEVERITY_NUMBER_DEBUG) where Int(cache[\"journal\"][\"PRIORITY\"]) == 7\n          - set(attributes[\"parse_outcome\"], \"failure\") where cache[\"application\"] == true\n          - set(attributes[\"parse_outcome\"], \"success\") where cache[\"application\"] == true and IsMap(cache[\"parsed\"])\n          - set(severity_text, ConvertCase(cache[\"parsed\"][\"level\"], \"lower\")) where IsString(cache[\"parsed\"][\"level\"])\n          - set(severity_text, ConvertCase(cache[\"parsed\"][\"severity\"], \"lower\")) where severity_text == \"\" and IsString(cache[\"parsed\"][\"severity\"])\n          - set(severity_number, SEVERITY_NUMBER_DEBUG) where severity_text == \"debug\" or severity_text == \"trace\"\n          - set(severity_number, SEVERITY_NUMBER_INFO) where severity_text == \"info\"\n          - set(severity_number, SEVERITY_NUMBER_WARN) where severity_text == \"warn\" or severity_text == \"warning\"\n          - set(severity_number, SEVERITY_NUMBER_ERROR) where severity_text == \"error\"\n          - set(severity_number, SEVERITY_NUMBER_FATAL) where severity_text == \"fatal\" or severity_text == \"panic\"\n          - set(attributes[\"_private\"], cache)\n  transform/approved_fields:\n    error_mode: silent\n    log_statements:\n      - context: log\n        statements:\n          - set(body[\"message\"], attributes[\"_private\"][\"parsed\"][\"message\"]) where IsString(attributes[\"_private\"][\"parsed\"][\"message\"]) and Len(attributes[\"_private\"][\"parsed\"][\"message\"]) <= 2048 and not IsMatch(attributes[\"_private\"][\"parsed\"][\"message\"], \"(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])\")\n          - set(body[\"msg\"], attributes[\"_private\"][\"parsed\"][\"msg\"]) where IsString(attributes[\"_private\"][\"parsed\"][\"msg\"]) and Len(attributes[\"_private\"][\"parsed\"][\"msg\"]) <= 2048 and not IsMatch(attributes[\"_private\"][\"parsed\"][\"msg\"], \"(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])\")\n          - set(body[\"event\"], attributes[\"_private\"][\"parsed\"][\"event\"]) where IsString(attributes[\"_private\"][\"parsed\"][\"event\"]) and Len(attributes[\"_private\"][\"parsed\"][\"event\"]) <= 2048 and not IsMatch(attributes[\"_private\"][\"parsed\"][\"event\"], \"(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])\")\n          - set(body[\"request_id\"], attributes[\"_private\"][\"parsed\"][\"request_id\"]) where IsString(attributes[\"_private\"][\"parsed\"][\"request_id\"]) and Len(attributes[\"_private\"][\"parsed\"][\"request_id\"]) <= 2048 and not IsMatch(attributes[\"_private\"][\"parsed\"][\"request_id\"], \"(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])\")\n          - set(body[\"sandbox_id\"], attributes[\"_private\"][\"parsed\"][\"sandbox_id\"]) where IsString(attributes[\"_private\"][\"parsed\"][\"sandbox_id\"]) and Len(attributes[\"_private\"][\"parsed\"][\"sandbox_id\"]) <= 2048 and not IsMatch(attributes[\"_private\"][\"parsed\"][\"sandbox_id\"], \"(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])\")\n          - set(body[\"vm_id\"], attributes[\"_private\"][\"parsed\"][\"vm_id\"]) where IsString(attributes[\"_private\"][\"parsed\"][\"vm_id\"]) and Len(attributes[\"_private\"][\"parsed\"][\"vm_id\"]) <= 2048 and not IsMatch(attributes[\"_private\"][\"parsed\"][\"vm_id\"], \"(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])\")\n          - set(body[\"operation\"], attributes[\"_private\"][\"parsed\"][\"operation\"]) where IsString(attributes[\"_private\"][\"parsed\"][\"operation\"]) and Len(attributes[\"_private\"][\"parsed\"][\"operation\"]) <= 2048 and not IsMatch(attributes[\"_private\"][\"parsed\"][\"operation\"], \"(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])\")\n          - set(body[\"component\"], attributes[\"_private\"][\"parsed\"][\"component\"]) where IsString(attributes[\"_private\"][\"parsed\"][\"component\"]) and Len(attributes[\"_private\"][\"parsed\"][\"component\"]) <= 2048 and not IsMatch(attributes[\"_private\"][\"parsed\"][\"component\"], \"(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])\")\n          - set(body[\"error_code\"], attributes[\"_private\"][\"parsed\"][\"error_code\"]) where IsString(attributes[\"_private\"][\"parsed\"][\"error_code\"]) and Len(attributes[\"_private\"][\"parsed\"][\"error_code\"]) <= 2048 and not IsMatch(attributes[\"_private\"][\"parsed\"][\"error_code\"], \"(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])\")\n          - set(body[\"status\"], attributes[\"_private\"][\"parsed\"][\"status\"]) where IsString(attributes[\"_private\"][\"parsed\"][\"status\"]) and Len(attributes[\"_private\"][\"parsed\"][\"status\"]) <= 2048 and not IsMatch(attributes[\"_private\"][\"parsed\"][\"status\"], \"(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])\")\n          - set(body[\"duration_ms\"], attributes[\"_private\"][\"parsed\"][\"duration_ms\"]) where IsString(attributes[\"_private\"][\"parsed\"][\"duration_ms\"]) and Len(attributes[\"_private\"][\"parsed\"][\"duration_ms\"]) <= 2048 and not IsMatch(attributes[\"_private\"][\"parsed\"][\"duration_ms\"], \"(?i)(authorization|bearer |password|secret|token[=:]|-----BEGIN|command[=:])\")\n          # Keep useful host diagnostics without copying arbitrary command or tenant text.\n          - set(body[\"diagnostic\"], \"host service event\") where attributes[\"_private\"][\"application\"] != true\n          - set(body[\"diagnostic\"], \"out of memory\") where attributes[\"_private\"][\"application\"] != true and IsMatch(attributes[\"_private\"][\"journal\"][\"MESSAGE\"], \"(?i)(out of memory|oom.kill|memory cgroup out)\")\n          - set(body[\"diagnostic\"], \"no space left on device\") where attributes[\"_private\"][\"application\"] != true and IsMatch(attributes[\"_private\"][\"journal\"][\"MESSAGE\"], \"(?i)no space left on device\")\n          - set(body[\"diagnostic\"], \"file descriptor exhaustion\") where attributes[\"_private\"][\"application\"] != true and IsMatch(attributes[\"_private\"][\"journal\"][\"MESSAGE\"], \"(?i)(too many open files|file-max limit)\")\n          - set(body[\"diagnostic\"], \"network or namespace resource exhaustion\") where attributes[\"_private\"][\"application\"] != true and IsMatch(attributes[\"_private\"][\"journal\"][\"MESSAGE\"], \"(?i)(conntrack.*full|namespace.*(fail|limit)|veth.*fail)\")\n          - set(body[\"diagnostic\"], \"mount resource exhaustion\") where attributes[\"_private\"][\"application\"] != true and IsMatch(attributes[\"_private\"][\"journal\"][\"MESSAGE\"], \"(?i)mount.*(fail|limit|space)\")\n          - set(body[\"diagnostic\"], \"service failed\") where attributes[\"_private\"][\"journal\"][\"_PID\"] == \"1\" and IsMatch(attributes[\"_private\"][\"journal\"][\"MESSAGE\"], \"(?i)(failed|failure)\")\n          - set(body[\"diagnostic\"], \"service started\") where attributes[\"_private\"][\"journal\"][\"_PID\"] == \"1\" and IsMatch(attributes[\"_private\"][\"journal\"][\"MESSAGE\"], \"^Started \")\n          - set(body[\"diagnostic\"], \"service stopped\") where attributes[\"_private\"][\"journal\"][\"_PID\"] == \"1\" and IsMatch(attributes[\"_private\"][\"journal\"][\"MESSAGE\"], \"^Stopped \")\n          - set(attributes[\"host_logging_export_error\"], \"true\") where attributes[\"journal_unit\"] == \"superserve-otel-logs.service\" and IsMatch(attributes[\"_private\"][\"journal\"][\"MESSAGE\"], \"(?i)(export.*fail|permission denied|drop|storage.*full|queue.*full|cursor.*(fail|invalid))\")\n          - set(attributes[\"host_logging_heartbeat\"], \"true\") where attributes[\"journal_unit\"] == \"superserve-host-logging-heartbeat.service\"\n          - set(attributes[\"host_logging_retained_history_lag_seconds\"], (UnixNano(Now()) - time_unix_nano) / 1000000000) where attributes[\"host_logging_heartbeat\"] == \"true\"\n          - delete_key(attributes, \"_private\")\n  filter/info_plus:\n    error_mode: propagate\n    logs:\n      log_record:\n        - 'severity_number < SEVERITY_NUMBER_INFO'\n\nexporters:\n  otlp_http/cloud:\n    endpoint: https://telemetry.googleapis.com\n    encoding: json\n    compression: gzip\n    auth:\n      authenticator: googleclientauth\n    timeout: 15s\n    retry_on_failure:\n      enabled: true\n      initial_interval: 1s\n      max_interval: 30s\n      max_elapsed_time: 0s\n    sending_queue:\n      enabled: true\n      storage: file_storage/queue\n      sizer: bytes\n      queue_size: 536870912\n      num_consumers: 2\n      batch:\n        sizer: bytes\n        min_size: 65536\n        max_size: 262144\n        flush_timeout: 1s\n\nservice:\n  extensions: [googleclientauth, file_storage/cursor, file_storage/queue]\n  pipelines:\n    logs:\n      receivers: [journald]\n      # Batch only after durable acceptance into the exporter queue.\n      processors: [memory_limiter, filter/approved_sources, transform/trusted_payload, filter/info_plus, transform/approved_fields]\n      exporters: [otlp_http/cloud]\n  telemetry:\n    logs:\n      level: info\n      encoding: json\n    metrics:\n      level: none\n",
+          "content_disposition": null,
+          "content_encoding": null,
+          "content_language": null,
+          "contexts": [],
+          "customer_encryption": [],
+          "detect_md5hash": null,
+          "event_based_hold": null,
+          "force_empty_content_type": null,
+          "metadata": null,
+          "name": "example-host-logging/2026-10-01-otel-1/otel-logs.yaml",
+          "retention": [],
+          "source": null,
+          "source_md5hash": null,
+          "temporary_hold": null,
+          "timeouts": null
+        },
+        "after_unknown": {
+          "content_type": true,
+          "contexts": [],
+          "crc32c": true,
+          "customer_encryption": [],
+          "deletion_policy": true,
+          "generation": true,
+          "id": true,
+          "kms_key_name": true,
+          "md5hash": true,
+          "md5hexhash": true,
+          "media_link": true,
+          "output_name": true,
+          "retention": [],
+          "self_link": true,
+          "storage_class": true
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "content": true,
+          "contexts": [],
+          "customer_encryption": [],
+          "retention": []
+        }
+      }
+    },
+    {
+      "address": "module.host_logging.google_storage_bucket_object.otel_service",
+      "mode": "managed",
+      "type": "google_storage_bucket_object",
+      "name": "otel_service",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "bucket": "superserve-host-logging-staging-uscentral1",
+          "cache_control": null,
+          "content": "[Unit]\nDescription=Superserve OpenTelemetry host logs collector\nWants=network-online.target\nAfter=network-online.target systemd-journald.service\n\n[Service]\nType=simple\nUser=root\nGroup=root\nEnvironmentFile=/etc/sandbox/host-logging-identity.env\nEnvironment=GOMEMLIMIT=192MiB\nExecStart=/opt/superserve/otelcol-contrib/bin/otelcol-contrib --config /etc/superserve/host-logging/otel-logs.yaml\nRestart=on-failure\nRestartSec=5s\nNoNewPrivileges=true\nProtectSystem=strict\nProtectHome=true\nReadWritePaths=/var/lib/superserve/host-logging/cursor /var/lib/superserve/host-logging/export-queue\nMemoryMax=256M\nCPUQuota=25%\nMemoryHigh=224M\nCPUWeight=20\nIOWeight=20\nIOReadBandwidthMax=/var/log/journal 8M\nIOWriteBandwidthMax=/var/lib/superserve/host-logging/export-queue 8M\nNice=10\nOOMScoreAdjust=200\nTasksMax=32\nUMask=0077\nLogRateLimitIntervalSec=30s\nLogRateLimitBurst=100\nLimitNOFILE=256\n\n[Install]\nWantedBy=multi-user.target\n",
+          "content_disposition": null,
+          "content_encoding": null,
+          "content_language": null,
+          "contexts": [],
+          "customer_encryption": [],
+          "detect_md5hash": null,
+          "event_based_hold": null,
+          "force_empty_content_type": null,
+          "metadata": null,
+          "name": "example-host-logging/2026-10-01-otel-1/otel-logs.service",
+          "retention": [],
+          "source": null,
+          "source_md5hash": null,
+          "temporary_hold": null,
+          "timeouts": null
+        },
+        "after_unknown": {
+          "content_type": true,
+          "contexts": [],
+          "crc32c": true,
+          "customer_encryption": [],
+          "deletion_policy": true,
+          "generation": true,
+          "id": true,
+          "kms_key_name": true,
+          "md5hash": true,
+          "md5hexhash": true,
+          "media_link": true,
+          "output_name": true,
+          "retention": [],
+          "self_link": true,
+          "storage_class": true
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "content": true,
+          "contexts": [],
+          "customer_encryption": [],
+          "retention": []
+        }
+      }
+    },
+    {
+      "address": "module.host_logging.google_storage_bucket_object.reconcile_script",
+      "mode": "managed",
+      "type": "google_storage_bucket_object",
+      "name": "reconcile_script",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "bucket": "superserve-host-logging-staging-uscentral1",
+          "cache_control": null,
+          "content": "#!/usr/bin/env bash\nset -euo pipefail\nstate_dir='/var/lib/superserve/host-logging'\ncandidate='/var/lib/superserve/host-logging/otel-logs.yaml.candidate'\nservice_candidate='/var/lib/superserve/host-logging/otel-logs.service.candidate'\nactive_config=/etc/superserve/host-logging/otel-logs.yaml\nactive_service=/etc/systemd/system/superserve-otel-logs.service\nidentity_file=/etc/sandbox/host-identity.json\nidentity_env=/etc/sandbox/host-logging-identity.env\nbinary='/opt/superserve/otelcol-contrib/bin/otelcol-contrib'\ncursor='/var/lib/superserve/host-logging/cursor'\nqueue='/var/lib/superserve/host-logging/export-queue'\ndropin=/etc/systemd/journald.conf.d/30-superserve-host-logging.conf\nheartbeat_service=/etc/systemd/system/superserve-host-logging-heartbeat.service\nheartbeat_timer=/etc/systemd/system/superserve-host-logging-heartbeat.timer\nmetrics_dropin=/etc/systemd/system/superserve-otel-collector.service.d/30-host-logging-priority.conf\ncheck=0\n[ \"${1:-}\" != --check ] || check=1\n\n# A missing or corrupt authoritative identity is an error, never a new identity.\nidentity=$(python3 - \"$identity_file\" <<'PY'\nimport json, re, sys\nwith open(sys.argv[1]) as f:\n    data = json.load(f)\nfor name, key in [('HOST_ID','host_id'), ('INSTANCE_ID','instance_id'), ('INCARNATION_ID','incarnation_id')]:\n    value = data.get(key)\n    if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', value):\n        raise SystemExit('invalid host identity')\n    print(f'{name}={value}')\nPY\n) || exit 1\nif [ \"$check\" -eq 1 ] && [ ! -d \"$state_dir\" ]; then exit 101; fi\nmkdir -p \"$state_dir\"\nchmod 0700 \"$state_dir\"\nexec 9>\"$state_dir/reconcile.lock\"\nflock -n 9 || exit 1\n# Interrupted attempts contain only candidate archives and backups, never delivery state.\nif [ \"$check\" -eq 0 ]; then\n  find \"$state_dir\" -mindepth 1 -maxdepth 1 -type d -name '.attempt.*' -exec rm -rf -- {} +\nfi\nattempt=$(mktemp -d \"$state_dir/.attempt.XXXXXX\")\ntrap 'rm -rf -- \"$attempt\"' EXIT\nprintf '%s\\n' \"$identity\" > \"$attempt/identity.env\"\nset -a\n. \"$attempt/identity.env\"\nset +a\n\ncat > \"$attempt/journald.conf\" <<'EOF'\n[Journal]\nStorage=persistent\nSystemMaxUse=4294967296B\nSystemKeepFree=10737418240B\nEOF\ncat > \"$attempt/heartbeat.service\" <<'EOF'\n[Unit]\nDescription=Superserve host logging heartbeat\n[Service]\nType=oneshot\nExecStart=/bin/echo host-logging-heartbeat\nStandardOutput=journal\nEOF\ncat > \"$attempt/heartbeat.timer\" <<'EOF'\n[Unit]\nDescription=Superserve host logging heartbeat timer\n[Timer]\nOnBootSec=60s\nOnUnitActiveSec=60s\nUnit=superserve-host-logging-heartbeat.service\n[Install]\nWantedBy=timers.target\nEOF\ncat > \"$attempt/metrics.conf\" <<'EOF'\n[Service]\nCPUWeight=1\nIOWeight=1\nOOMScoreAdjust=800\nMemoryHigh=192M\nMemoryMax=256M\nEOF\n\nsources=(\"$candidate\" \"$service_candidate\" \"$attempt/identity.env\" \"$attempt/journald.conf\" \"$attempt/heartbeat.service\" \"$attempt/heartbeat.timer\" \"$attempt/metrics.conf\")\ntargets=(\"$active_config\" \"$active_service\" \"$identity_env\" \"$dropin\" \"$heartbeat_service\" \"$heartbeat_timer\" \"$metrics_dropin\")\nmodes=(644 644 600 644 644 644 644)\nchanged=0\nfor i in \"${!targets[@]}\"; do\n  cmp -s \"${sources[$i]}\" \"${targets[$i]}\" || changed=1\n  [ \"$(stat -c '%a' \"${targets[$i]}\" 2>/dev/null || true)\" = \"${modes[$i]}\" ] || changed=1\ndone\nbinary_current=0\nif [ -x \"$binary\" ] && [ \"$(\"$binary\" --version)\" = 'otelcol-contrib version 0.156.0' ]; then binary_current=1; fi\n[ \"$binary_current\" -eq 1 ] || changed=1\nfor directory in \"$cursor\" \"$queue\"; do\n  [ \"$(stat -c '%a' \"$directory\" 2>/dev/null || true)\" = 700 ] || changed=1\ndone\nfor unit in superserve-otel-logs.service superserve-host-logging-heartbeat.timer; do\n  systemctl is-enabled --quiet \"$unit\" && systemctl is-active --quiet \"$unit\" || changed=1\ndone\nif [ \"$check\" -eq 1 ]; then\n  [ \"$changed\" -eq 0 ] || exit 101\n  \"$binary\" validate --config \"$active_config\" >/dev/null 2>&1 || exit 101\n  exit 100\nfi\n[ \"$changed\" -ne 0 ] || exit 100\n\n# Budget the archive, extracted binary, rollback backup, and atomic install copy.\n# The durable database cap is enforced by file_storage, not this preflight.\nfree=$(df -Pk \"$state_dir\" | awk 'NR==2 {printf \"%.0f\", $4 * 1024}')\nreserve=$(( 10737418240 + 2147483648 + 2147483648 ))\n[ -n \"$free\" ] && [ \"$free\" -ge \"$reserve\" ]\nstaged_binary=\"$binary\"\nif [ \"$binary_current\" -eq 0 ]; then\n  timeout '120s' curl --fail --location --silent --show-error --max-filesize 536870912 --proto '=https' --tlsv1.2 'https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.156.0/otelcol-contrib_0.156.0_linux_amd64.tar.gz' -o \"$attempt/release.tar.gz\"\n  echo 'ee70d7b1221be8a9cc4700f48bf985c04b1ab8aaeef24409fe79623849e2f9f2  '\"$attempt/release.tar.gz\" | sha256sum -c - >/dev/null\n  mkdir \"$attempt/release\"\n  tar -xzf \"$attempt/release.tar.gz\" -C \"$attempt/release\" otelcol-contrib\n  staged_binary=\"$attempt/release/otelcol-contrib\"\nfi\n\"$staged_binary\" validate --config \"$candidate\"\nsed \"s|^ExecStart=$binary |ExecStart=$staged_binary |\" \"$service_candidate\" > \"$attempt/superserve-otel-logs.service\"\nsystemd-analyze verify \"$attempt/superserve-otel-logs.service\" \"$attempt/heartbeat.service\" \"$attempt/heartbeat.timer\"\n\n# Capture service state and every activation target before changing any file.\nsources+=(\"$staged_binary\")\ntargets+=(\"$binary\")\nmodes+=(755)\nwas_active=0\nsystemctl is-active --quiet superserve-otel-logs.service && was_active=1 || true\nheartbeat_active=0\nsystemctl is-active --quiet superserve-host-logging-heartbeat.timer && heartbeat_active=1 || true\njournal_changed=0\ncmp -s \"$attempt/journald.conf\" \"$dropin\" || journal_changed=1\nactivation_started=0\nactivation_committed=0\nchanged_targets=()\nfor i in \"${!targets[@]}\"; do\n  if [ -e \"${targets[$i]}\" ]; then cp -a \"${targets[$i]}\" \"$attempt/backup.$i\"; fi\ndone\nrollback() {\n  rc=$?\n  trap - EXIT INT TERM\n  if [ \"$activation_committed\" -ne 1 ]; then\n    for i in \"${changed_targets[@]}\"; do\n      if [ -e \"$attempt/backup.$i\" ]; then\n        cp -a \"$attempt/backup.$i\" \"${targets[$i]}.rollback\"\n        mv -f \"${targets[$i]}.rollback\" \"${targets[$i]}\"\n      else rm -f \"${targets[$i]}\"; fi\n    done\n    systemctl daemon-reload || true\n    if [ \"$activation_started\" -eq 1 ]; then\n      if [ \"$was_active\" -eq 1 ]; then systemctl restart superserve-otel-logs.service || true; else systemctl disable --now superserve-otel-logs.service || true; fi\n      if [ \"$heartbeat_active\" -eq 0 ]; then systemctl disable --now superserve-host-logging-heartbeat.timer || true; fi\n      if [ \"$journal_changed\" -eq 1 ]; then systemctl restart systemd-journald.service || true; fi\n    fi\n  fi\n  rm -rf -- \"$attempt\"\n  exit \"$rc\"\n}\ntrap rollback EXIT\ntrap 'exit 1' INT TERM\nmkdir -p \"$cursor\" \"$queue\"\nchmod 0700 \"$cursor\" \"$queue\"\nfor i in \"${!targets[@]}\"; do\n  if ! cmp -s \"${sources[$i]}\" \"${targets[$i]}\" || [ \"$(stat -c '%a' \"${targets[$i]}\" 2>/dev/null || true)\" != \"${modes[$i]}\" ]; then\n    mkdir -p \"$(dirname \"${targets[$i]}\")\"\n    install -m \"${modes[$i]}\" \"${sources[$i]}\" \"${targets[$i]}.candidate\"\n    changed_targets+=(\"$i\")\n    mv -f \"${targets[$i]}.candidate\" \"${targets[$i]}\"\n  fi\ndone\nsystemctl daemon-reload\nactivation_started=1\nif [ \"$journal_changed\" -eq 1 ]; then\n  systemctl restart systemd-journald.service\n  journalctl --flush\nfi\nsystemctl enable --now superserve-host-logging-heartbeat.timer\nsystemctl enable superserve-otel-logs.service\nsystemctl restart superserve-otel-logs.service\n# Apply relative pressure priority without restarting the independent metrics service.\nif systemctl is-active --quiet superserve-otel-collector.service; then\n  systemctl set-property --runtime superserve-otel-collector.service CPUWeight=1 IOWeight=1 MemoryHigh=192M MemoryMax=256M\nfi\nsleep 2\nsystemctl is-active --quiet superserve-otel-logs.service\nsystemctl is-active --quiet superserve-host-logging-heartbeat.timer\nactivation_committed=1\nexit 100\n",
+          "content_disposition": null,
+          "content_encoding": null,
+          "content_language": null,
+          "contexts": [],
+          "customer_encryption": [],
+          "detect_md5hash": null,
+          "event_based_hold": null,
+          "force_empty_content_type": null,
+          "metadata": null,
+          "name": "example-host-logging/2026-10-01-otel-1/reconcile.sh",
+          "retention": [],
+          "source": null,
+          "source_md5hash": null,
+          "temporary_hold": null,
+          "timeouts": null
+        },
+        "after_unknown": {
+          "content_type": true,
+          "contexts": [],
+          "crc32c": true,
+          "customer_encryption": [],
+          "deletion_policy": true,
+          "generation": true,
+          "id": true,
+          "kms_key_name": true,
+          "md5hash": true,
+          "md5hexhash": true,
+          "media_link": true,
+          "output_name": true,
+          "retention": [],
+          "self_link": true,
+          "storage_class": true
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "content": true,
+          "contexts": [],
+          "customer_encryption": [],
+          "retention": []
+        }
+      }
+    },
+    {
+      "address": "module.host_logging.google_storage_bucket_object.validate_script",
+      "mode": "managed",
+      "type": "google_storage_bucket_object",
+      "name": "validate_script",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "bucket": "superserve-host-logging-staging-uscentral1",
+          "cache_control": null,
+          "content": "#!/usr/bin/env bash\n# The same desired-state renderer handles compliance and activation.\n# --check does not modify services, delivery state, or active files.\n# Persisted stores: storage: file_storage/cursor and storage: file_storage/queue.\nexec bash /var/lib/superserve/host-logging/reconcile.sh --check\n",
+          "content_disposition": null,
+          "content_encoding": null,
+          "content_language": null,
+          "contexts": [],
+          "customer_encryption": [],
+          "detect_md5hash": null,
+          "event_based_hold": null,
+          "force_empty_content_type": null,
+          "metadata": null,
+          "name": "example-host-logging/2026-10-01-otel-1/validate.sh",
+          "retention": [],
+          "source": null,
+          "source_md5hash": null,
+          "temporary_hold": null,
+          "timeouts": null
+        },
+        "after_unknown": {
+          "content_type": true,
+          "contexts": [],
+          "crc32c": true,
+          "customer_encryption": [],
+          "deletion_policy": true,
+          "generation": true,
+          "id": true,
+          "kms_key_name": true,
+          "md5hash": true,
+          "md5hexhash": true,
+          "media_link": true,
+          "output_name": true,
+          "retention": [],
+          "self_link": true,
+          "storage_class": true
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "content": true,
+          "contexts": [],
+          "customer_encryption": [],
+          "retention": []
+        }
+      }
+    },
+    {
+      "address": "module.observability.google_logging_metric.host_logging_delivery_lag[\"pilot\"]",
+      "mode": "managed",
+      "type": "google_logging_metric",
+      "name": "host_logging_delivery_lag",
+      "index": "pilot",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "bucket_name": null,
+          "bucket_options": [
+            {
+              "explicit_buckets": [],
+              "exponential_buckets": [
+                {
+                  "growth_factor": 2,
+                  "num_finite_buckets": 20,
+                  "scale": 1
+                }
+              ],
+              "linear_buckets": []
+            }
+          ],
+          "description": null,
+          "disabled": null,
+          "filter": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123\" AND log_id(\"superserve_host_logs\") AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\" AND labels.host_logging_retained_history_lag_seconds:*",
+          "label_extractors": null,
+          "metric_descriptor": [
+            {
+              "display_name": null,
+              "labels": [],
+              "metric_kind": "DELTA",
+              "unit": "s",
+              "value_type": "DISTRIBUTION"
+            }
+          ],
+          "name": "superserve_host_logging_delivery_lag_pilot",
+          "project": "example-project",
+          "timeouts": null,
+          "value_extractor": "EXTRACT(labels.host_logging_retained_history_lag_seconds)"
+        },
+        "after_unknown": {
+          "bucket_options": [
+            {
+              "explicit_buckets": [],
+              "exponential_buckets": [
+                {}
+              ],
+              "linear_buckets": []
+            }
+          ],
+          "deletion_policy": true,
+          "id": true,
+          "metric_descriptor": [
+            {
+              "labels": []
+            }
+          ]
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "bucket_options": [
+            {
+              "explicit_buckets": [],
+              "exponential_buckets": [
+                {}
+              ],
+              "linear_buckets": []
+            }
+          ],
+          "metric_descriptor": [
+            {
+              "labels": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "address": "module.observability.google_logging_metric.host_logging_heartbeat[\"pilot\"]",
+      "mode": "managed",
+      "type": "google_logging_metric",
+      "name": "host_logging_heartbeat",
+      "index": "pilot",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "bucket_name": null,
+          "bucket_options": [],
+          "description": null,
+          "disabled": null,
+          "filter": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123\" AND log_id(\"superserve_host_logs\") AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\" AND labels.incarnation=\"incarnation-a\"",
+          "label_extractors": {
+            "collector_host_id": "EXTRACT(resource.labels.instance_id)",
+            "incarnation": "EXTRACT(labels.incarnation)"
+          },
+          "metric_descriptor": [
+            {
+              "display_name": null,
+              "labels": [
+                {
+                  "description": "Expected serving-host incarnation from the trusted log payload.",
+                  "key": "incarnation",
+                  "value_type": "STRING"
+                },
+                {
+                  "description": "Stable VM identity for the active host incarnation.",
+                  "key": "collector_host_id",
+                  "value_type": "STRING"
+                }
+              ],
+              "metric_kind": "DELTA",
+              "unit": "1",
+              "value_type": "INT64"
+            }
+          ],
+          "name": "superserve_host_logging_heartbeat_pilot",
+          "project": "example-project",
+          "timeouts": null,
+          "value_extractor": null
+        },
+        "after_unknown": {
+          "bucket_options": [],
+          "deletion_policy": true,
+          "id": true,
+          "label_extractors": {},
+          "metric_descriptor": [
+            {
+              "labels": [
+                {},
+                {}
+              ]
+            }
+          ]
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "bucket_options": [],
+          "label_extractors": {},
+          "metric_descriptor": [
+            {
+              "labels": [
+                {},
+                {}
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "address": "module.observability.google_monitoring_alert_policy.host_logging_export_failures[\"pilot\"]",
+      "mode": "managed",
+      "type": "google_monitoring_alert_policy",
+      "name": "host_logging_export_failures",
+      "index": "pilot",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "alert_strategy": [
+            {
+              "auto_close": "1800s",
+              "notification_channel_strategy": [],
+              "notification_prompts": null,
+              "notification_rate_limit": [
+                {
+                  "period": "300s"
+                }
+              ]
+            }
+          ],
+          "combiner": "OR",
+          "conditions": [
+            {
+              "condition_absent": [],
+              "condition_matched_log": [
+                {
+                  "filter": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123\" AND log_id(\"superserve_host_logs\") AND (labels.host_logging_export_error=\"true\" OR labels.message =~ \"(?i)(export failed|permission denied|\\bdrop\\b|\\bdropped\\b)\" OR textPayload =~ \"(?i)(export failed|permission denied|\\bdrop\\b|\\bdropped\\b)\")",
+                  "label_extractors": null
+                }
+              ],
+              "condition_monitoring_query_language": [],
+              "condition_prometheus_query_language": [],
+              "condition_sql": [],
+              "condition_threshold": [],
+              "display_name": "OTel logs export errors on example-vmd-1"
+            }
+          ],
+          "display_name": "Host logging / example / example-vmd-1 / export failure",
+          "documentation": [
+            {
+              "content": "The dedicated OTel logs collector reported an export error on example-vmd-1. Check collector health, Cloud Logging permissions, network egress, and retained journal/queue growth before restarting anything.\n\nRunbook: https://example.invalid/runbooks/host-logging-export",
+              "links": [],
+              "mime_type": "text/markdown",
+              "subject": null
+            }
+          ],
+          "enabled": true,
+          "notification_channels": [
+            "projects/example-project/notificationChannels/123"
+          ],
+          "project": "example-project",
+          "severity": null,
+          "timeouts": null,
+          "user_labels": {
+            "alert_type": "host_logging_export_failure",
+            "instance_name": "example-vmd-1",
+            "managed_by": "terraform",
+            "superserve_component": "host",
+            "superserve_failure_family": "export_failure",
+            "superserve_family": "host_logging"
+          }
+        },
+        "after_unknown": {
+          "alert_strategy": [
+            {
+              "notification_channel_strategy": [],
+              "notification_rate_limit": [
+                {}
+              ]
+            }
+          ],
+          "conditions": [
+            {
+              "condition_absent": [],
+              "condition_matched_log": [
+                {}
+              ],
+              "condition_monitoring_query_language": [],
+              "condition_prometheus_query_language": [],
+              "condition_sql": [],
+              "condition_threshold": [],
+              "name": true
+            }
+          ],
+          "creation_record": true,
+          "deletion_policy": true,
+          "documentation": [
+            {
+              "links": []
+            }
+          ],
+          "id": true,
+          "name": true,
+          "notification_channels": [
+            false
+          ],
+          "user_labels": {}
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "alert_strategy": [
+            {
+              "notification_channel_strategy": [],
+              "notification_rate_limit": [
+                {}
+              ]
+            }
+          ],
+          "conditions": [
+            {
+              "condition_absent": [],
+              "condition_matched_log": [
+                {}
+              ],
+              "condition_monitoring_query_language": [],
+              "condition_prometheus_query_language": [],
+              "condition_sql": [],
+              "condition_threshold": []
+            }
+          ],
+          "creation_record": [],
+          "documentation": [
+            {
+              "content": true,
+              "links": []
+            }
+          ],
+          "notification_channels": [
+            false
+          ],
+          "user_labels": {}
+        }
+      }
+    },
+    {
+      "address": "module.observability.google_monitoring_alert_policy.host_logging_heartbeat[\"pilot\"]",
+      "mode": "managed",
+      "type": "google_monitoring_alert_policy",
+      "name": "host_logging_heartbeat",
+      "index": "pilot",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "alert_strategy": [],
+          "combiner": "OR",
+          "conditions": [
+            {
+              "condition_absent": [],
+              "condition_matched_log": [],
+              "condition_monitoring_query_language": [],
+              "condition_prometheus_query_language": [
+                {
+                  "alert_rule": null,
+                  "disable_metric_validation": true,
+                  "duration": "600s",
+                  "evaluation_interval": "60s",
+                  "labels": null,
+                  "query": "(sum(sum_over_time({\n  \"__name__\" = \"logging_googleapis_com:user_superserve_host_logging_heartbeat_pilot\",\n  \"collector_host_id\" = \"123\",\n          \"incarnation\" = \"incarnation-a\"\n}[5m])) or vector(0)) == 0\n",
+                  "rule_group": null
+                }
+              ],
+              "condition_sql": [],
+              "condition_threshold": [],
+              "display_name": "Serving host heartbeat absent on example-vmd-1"
+            }
+          ],
+          "display_name": "Host logging / example / example-vmd-1 / missing heartbeat",
+          "documentation": [
+            {
+              "content": "The expected OTel host-log heartbeat for example-vmd-1 was absent or stale. This signal is derived from Cloud Logging receipt and remains independent of the application-metrics collector.\n\nRunbook: https://example.invalid/runbooks/host-logging-heartbeat",
+              "links": [],
+              "mime_type": "text/markdown",
+              "subject": null
+            }
+          ],
+          "enabled": true,
+          "notification_channels": [
+            "projects/example-project/notificationChannels/123"
+          ],
+          "project": "example-project",
+          "severity": null,
+          "timeouts": null,
+          "user_labels": {
+            "alert_type": "host_logging_heartbeat_absent",
+            "instance_name": "example-vmd-1",
+            "managed_by": "terraform",
+            "superserve_component": "host",
+            "superserve_failure_family": "missing_telemetry",
+            "superserve_family": "host_logging"
+          }
+        },
+        "after_unknown": {
+          "alert_strategy": [],
+          "conditions": [
+            {
+              "condition_absent": [],
+              "condition_matched_log": [],
+              "condition_monitoring_query_language": [],
+              "condition_prometheus_query_language": [
+                {}
+              ],
+              "condition_sql": [],
+              "condition_threshold": [],
+              "name": true
+            }
+          ],
+          "creation_record": true,
+          "deletion_policy": true,
+          "documentation": [
+            {
+              "links": []
+            }
+          ],
+          "id": true,
+          "name": true,
+          "notification_channels": [
+            false
+          ],
+          "user_labels": {}
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "alert_strategy": [],
+          "conditions": [
+            {
+              "condition_absent": [],
+              "condition_matched_log": [],
+              "condition_monitoring_query_language": [],
+              "condition_prometheus_query_language": [
+                {}
+              ],
+              "condition_sql": [],
+              "condition_threshold": []
+            }
+          ],
+          "creation_record": [],
+          "documentation": [
+            {
+              "content": true,
+              "links": []
+            }
+          ],
+          "notification_channels": [
+            false
+          ],
+          "user_labels": {}
+        }
+      }
+    },
+    {
+      "address": "module.observability.google_monitoring_alert_policy.host_logging_lag[\"pilot\"]",
+      "mode": "managed",
+      "type": "google_monitoring_alert_policy",
+      "name": "host_logging_lag",
+      "index": "pilot",
+      "provider_name": "registry.terraform.io/hashicorp/google",
+      "change": {
+        "actions": [
+          "create"
+        ],
+        "before": null,
+        "after": {
+          "alert_strategy": [],
+          "combiner": "OR",
+          "conditions": [
+            {
+              "condition_absent": [],
+              "condition_matched_log": [],
+              "condition_monitoring_query_language": [],
+              "condition_prometheus_query_language": [],
+              "condition_sql": [],
+              "condition_threshold": [
+                {
+                  "aggregations": [
+                    {
+                      "alignment_period": "60s",
+                      "cross_series_reducer": null,
+                      "group_by_fields": null,
+                      "per_series_aligner": "ALIGN_PERCENTILE_99"
+                    }
+                  ],
+                  "comparison": "COMPARISON_GT",
+                  "denominator_aggregations": [],
+                  "denominator_filter": null,
+                  "duration": "300s",
+                  "evaluation_missing_data": null,
+                  "filter": "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"123\" AND metric.type=\"logging.googleapis.com/user/superserve_host_logging_delivery_lag_pilot\"",
+                  "forecast_options": [],
+                  "threshold_value": 300,
+                  "trigger": []
+                }
+              ],
+              "display_name": "OTel logs delivery lag on example-vmd-1"
+            }
+          ],
+          "display_name": "Host logging / example / example-vmd-1 / delivery lag",
+          "documentation": [
+            {
+              "content": "Retained host logs are arriving later than the configured 300s threshold on example-vmd-1. Distinguish outage catch-up from a persistent gap and account for journal/queue expiry.\n\nRunbook: https://example.invalid/runbooks/host-logging-lag",
+              "links": [],
+              "mime_type": "text/markdown",
+              "subject": null
+            }
+          ],
+          "enabled": true,
+          "notification_channels": [
+            "projects/example-project/notificationChannels/123"
+          ],
+          "project": "example-project",
+          "severity": null,
+          "timeouts": null,
+          "user_labels": {
+            "alert_type": "host_logging_delivery_lag",
+            "instance_name": "example-vmd-1",
+            "managed_by": "terraform",
+            "superserve_component": "host",
+            "superserve_failure_family": "delivery_lag",
+            "superserve_family": "host_logging"
+          }
+        },
+        "after_unknown": {
+          "alert_strategy": [],
+          "conditions": [
+            {
+              "condition_absent": [],
+              "condition_matched_log": [],
+              "condition_monitoring_query_language": [],
+              "condition_prometheus_query_language": [],
+              "condition_sql": [],
+              "condition_threshold": [
+                {
+                  "aggregations": [
+                    {}
+                  ],
+                  "denominator_aggregations": [],
+                  "forecast_options": [],
+                  "trigger": []
+                }
+              ],
+              "name": true
+            }
+          ],
+          "creation_record": true,
+          "deletion_policy": true,
+          "documentation": [
+            {
+              "links": []
+            }
+          ],
+          "id": true,
+          "name": true,
+          "notification_channels": [
+            false
+          ],
+          "user_labels": {}
+        },
+        "before_sensitive": false,
+        "after_sensitive": {
+          "alert_strategy": [],
+          "conditions": [
+            {
+              "condition_absent": [],
+              "condition_matched_log": [],
+              "condition_monitoring_query_language": [],
+              "condition_prometheus_query_language": [],
+              "condition_sql": [],
+              "condition_threshold": [
+                {
+                  "aggregations": [
+                    {}
+                  ],
+                  "denominator_aggregations": [],
+                  "forecast_options": [],
+                  "trigger": []
+                }
+              ]
+            }
+          ],
+          "creation_record": [],
+          "documentation": [
+            {
+              "content": true,
+              "links": []
+            }
+          ],
+          "notification_channels": [
+            false
+          ],
+          "user_labels": {}
+        }
+      }
+    }
+  ]
+}

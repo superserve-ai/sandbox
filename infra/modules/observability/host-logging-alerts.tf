@@ -4,9 +4,7 @@ locals {
     for key, host in var.host_logging_alerts.expected_hosts : key => host
     if try(host.active, true)
   } : {}
-  active_host_logging_incarnations = {
-    for key, host in local.active_host_logging_alerts : key => coalesce(host.incarnation, "unknown")
-  }
+
 }
 
 # A host-generated minute heartbeat is converted to a logs-based metric. The
@@ -20,7 +18,7 @@ resource "google_logging_metric" "host_logging_heartbeat" {
 
   project = var.project_id
   name    = "superserve_host_logging_heartbeat_${each.key}"
-  filter  = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\""
+  filter  = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\"${each.value.incarnation == null ? "" : " AND labels.incarnation=\"${each.value.incarnation}\""}"
 
   metric_descriptor {
     metric_kind = "DELTA"
@@ -111,31 +109,25 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
     }
   }
 
-  # Delivery lag is a retained-history age sample emitted with each accepted
-  # record. It is intentionally independent from the heartbeat absence policy
+  # Delivery lag is sampled once per host heartbeat, bounding metric volume
+  # independently of application log volume. It is intentionally independent from the heartbeat absence policy
   # below: an exporter that is stopped or has never emitted a heartbeat cannot
   # manufacture a lag sample, and is handled by the separate absence alert.
   conditions {
     display_name = "OTel logs delivery lag on ${each.value.instance_name}"
-    condition_prometheus_query_language {
-      query                     = <<-EOT
-        max_over_time({
-          "__name__" = "logging_googleapis_com:user_${google_logging_metric.host_logging_delivery_lag[each.key].name}",
-          "collector_host_id" = "${each.value.instance_id}",
-          "monitored_resource" = "gce_instance"
-        }[${var.host_logging_alerts.lag_threshold_seconds}s]) > ${var.host_logging_alerts.lag_threshold_seconds}
-      EOT
-      duration                  = "0s"
-      evaluation_interval       = "60s"
-      disable_metric_validation = true
+    condition_threshold {
+      filter          = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND metric.type=\"logging.googleapis.com/user/${google_logging_metric.host_logging_delivery_lag[each.key].name}\""
+      comparison      = "COMPARISON_GT"
+      threshold_value = var.host_logging_alerts.lag_threshold_seconds
+      duration        = "300s"
+      aggregations {
+        alignment_period   = "60s"
+        per_series_aligner = "ALIGN_PERCENTILE_99"
+      }
     }
   }
 
 
-  alert_strategy {
-    notification_rate_limit { period = "900s" }
-    auto_close = "3600s"
-  }
 
   documentation {
     content   = "Retained host logs are arriving later than the configured ${var.host_logging_alerts.lag_threshold_seconds}s threshold on ${each.value.instance_name}. Distinguish outage catch-up from a persistent gap and account for journal/queue expiry.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_lag", "")}"
@@ -157,13 +149,20 @@ resource "google_logging_metric" "host_logging_delivery_lag" {
 
   project         = var.project_id
   name            = "superserve_host_logging_delivery_lag_${each.key}"
-  filter          = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND labels.host_logging_retained_history_lag_seconds:*"
+  filter          = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND labels.journal_unit=\"superserve-host-logging-heartbeat.service\" AND labels.host_logging_heartbeat=\"true\" AND labels.host_logging_retained_history_lag_seconds:*"
   value_extractor = "EXTRACT(labels.host_logging_retained_history_lag_seconds)"
 
   metric_descriptor {
-    metric_kind = "GAUGE"
-    value_type  = "DOUBLE"
+    metric_kind = "DELTA"
+    value_type  = "DISTRIBUTION"
     unit        = "s"
+  }
+  bucket_options {
+    exponential_buckets {
+      num_finite_buckets = 20
+      growth_factor      = 2
+      scale              = 1
+    }
   }
 }
 
@@ -191,16 +190,16 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
   conditions {
     display_name = "Serving host heartbeat absent on ${each.value.instance_name}"
     condition_prometheus_query_language {
-      # PromQL absent() returns an explicit one-valued result when the expected
-      # log heartbeat series has never produced a point. The provider instance
+      # The zero fallback covers never-seen series as well as present series
+      # containing only zero-valued points. The provider instance
       # ID prevents a replacement VM from satisfying the predecessor's series;
       # the trusted incarnation remains available in the emitted record for
       # investigations and collision-resistant correlation.
       query                     = <<-EOT
-        absent({
+        (sum(sum_over_time({
           "__name__" = "logging_googleapis_com:user_${google_logging_metric.host_logging_heartbeat[each.key].name}",
-          "collector_host_id" = "${each.value.instance_id}"
-        }) == 1
+          "collector_host_id" = "${each.value.instance_id}"${each.value.incarnation == null ? "" : ",\n          \"incarnation\" = \"${each.value.incarnation}\""}
+        }[5m])) or vector(0)) == 0
       EOT
       duration                  = var.host_logging_alerts.heartbeat_duration
       evaluation_interval       = "60s"

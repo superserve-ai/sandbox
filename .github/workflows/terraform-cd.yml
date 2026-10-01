@@ -371,22 +371,12 @@ jobs:
             --project "${{ vars.GCP_PROJECT }}"
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan > "$RUNNER_TEMP/production-usw2-plan.json"
-          if python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/production-usw2-plan.json"; then
-            HOST_LOGGING_REVISION=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --revision "$RUNNER_TEMP/production-usw2-plan.json")
-            HOST_LOGGING_DIGEST=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --digest "$RUNNER_TEMP/production-usw2-plan.json")
-            test -n "$HOST_LOGGING_REVISION" || { echo "Host-logging plan did not expose its configuration revision." >&2; exit 1; }
-            test -n "$HOST_LOGGING_DIGEST" || { echo "Host-logging plan did not expose immutable deployment content." >&2; exit 1; }
+          HOST_LOGGING_EVIDENCE_REQUIRED=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --needs-evidence "$RUNNER_TEMP/production-usw2-plan.json")
+          if [ "$HOST_LOGGING_EVIDENCE_REQUIRED" = true ]; then
             test -n "${HOST_LOGGING_STAGING_EVIDENCE_URL:-}" || { echo "Host-logging activation requires accepted staging evidence." >&2; exit 1; }
             case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
             curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
-            python3 - "$RUNNER_TEMP/host-logging-staging-evidence.json" "$HOST_LOGGING_REVISION" "$HOST_LOGGING_DIGEST" <<'PY'
-          import json, sys
-          evidence = json.load(open(sys.argv[1]))
-          if (evidence.get("environment") != "staging" or evidence.get("accepted") is not True
-                  or evidence.get("configuration_revision") != sys.argv[2]
-                  or evidence.get("deployment_content_digest") != sys.argv[3]):
-              raise SystemExit("accepted staging host-logging evidence for immutable deployment content is required")
-          PY
+            python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --check "$RUNNER_TEMP/production-usw2-plan.json" "$RUNNER_TEMP/host-logging-staging-evidence.json"
           fi
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py"
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-usw2 --pinned-revision "$previous"
@@ -547,22 +537,12 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan > "$RUNNER_TEMP/production-usc1-plan.json"
-          if python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/production-usc1-plan.json"; then
-            HOST_LOGGING_REVISION=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --revision "$RUNNER_TEMP/production-usc1-plan.json")
-            HOST_LOGGING_DIGEST=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --digest "$RUNNER_TEMP/production-usc1-plan.json")
-            test -n "$HOST_LOGGING_REVISION" || { echo "Host-logging plan did not expose its configuration revision." >&2; exit 1; }
-            test -n "$HOST_LOGGING_DIGEST" || { echo "Host-logging plan did not expose immutable deployment content." >&2; exit 1; }
+          HOST_LOGGING_EVIDENCE_REQUIRED=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --needs-evidence "$RUNNER_TEMP/production-usc1-plan.json")
+          if [ "$HOST_LOGGING_EVIDENCE_REQUIRED" = true ]; then
             test -n "${HOST_LOGGING_STAGING_EVIDENCE_URL:-}" || { echo "Host-logging activation requires accepted staging evidence." >&2; exit 1; }
             case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
             curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
-            python3 - "$RUNNER_TEMP/host-logging-staging-evidence.json" "$HOST_LOGGING_REVISION" "$HOST_LOGGING_DIGEST" <<'PY'
-          import json, sys
-          evidence = json.load(open(sys.argv[1]))
-          if (evidence.get("environment") != "staging" or evidence.get("accepted") is not True
-                  or evidence.get("configuration_revision") != sys.argv[2]
-                  or evidence.get("deployment_content_digest") != sys.argv[3]):
-              raise SystemExit("accepted staging host-logging evidence for immutable deployment content is required")
-          PY
+            python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --check "$RUNNER_TEMP/production-usc1-plan.json" "$RUNNER_TEMP/host-logging-staging-evidence.json"
           fi
           terraform apply -input=false -auto-approve tfplan
 
@@ -641,22 +621,12 @@ jobs:
             --project "${{ vars.GCP_PROJECT }}"
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan > "$RUNNER_TEMP/production-use4-plan.json"
-          if python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/production-use4-plan.json"; then
-            HOST_LOGGING_REVISION=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --revision "$RUNNER_TEMP/production-use4-plan.json")
-            HOST_LOGGING_DIGEST=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --digest "$RUNNER_TEMP/production-use4-plan.json")
-            test -n "$HOST_LOGGING_REVISION" || { echo "Host-logging plan did not expose its configuration revision." >&2; exit 1; }
-            test -n "$HOST_LOGGING_DIGEST" || { echo "Host-logging plan did not expose immutable deployment content." >&2; exit 1; }
+          HOST_LOGGING_EVIDENCE_REQUIRED=$(python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --needs-evidence "$RUNNER_TEMP/production-use4-plan.json")
+          if [ "$HOST_LOGGING_EVIDENCE_REQUIRED" = true ]; then
             test -n "${HOST_LOGGING_STAGING_EVIDENCE_URL:-}" || { echo "Host-logging activation requires accepted staging evidence." >&2; exit 1; }
             case "$HOST_LOGGING_STAGING_EVIDENCE_URL" in https://*) ;; *) echo "Staging evidence must use HTTPS." >&2; exit 1 ;; esac
             curl --fail --location --silent --show-error "$HOST_LOGGING_STAGING_EVIDENCE_URL" -o "$RUNNER_TEMP/host-logging-staging-evidence.json"
-            python3 - "$RUNNER_TEMP/host-logging-staging-evidence.json" "$HOST_LOGGING_REVISION" "$HOST_LOGGING_DIGEST" <<'PY'
-          import json, sys
-          evidence = json.load(open(sys.argv[1]))
-          if (evidence.get("environment") != "staging" or evidence.get("accepted") is not True
-                  or evidence.get("configuration_revision") != sys.argv[2]
-                  or evidence.get("deployment_content_digest") != sys.argv[3]):
-              raise SystemExit("accepted staging host-logging evidence for immutable deployment content is required")
-          PY
+            python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" --check "$RUNNER_TEMP/production-use4-plan.json" "$RUNNER_TEMP/host-logging-staging-evidence.json"
           fi
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --guarded module.sandbox_host_c
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_control_plane_identity_plan.py" --cell production-use4 --pinned-revision "$previous"

@@ -731,7 +731,6 @@ module "host_logging" {
       host_id               = "deferred-to-installed-identity"
       incarnation           = "deferred-to-installed-identity"
       service_account_email = module.iam.service_account_emails["superserve_api"]
-      proxy_units           = ["proxy.service", "proxy-generation.service"]
     }
     sandbox_host_b = {
       instance_name         = module.sandbox_host_b.instance_name
@@ -739,7 +738,6 @@ module "host_logging" {
       host_id               = var.build_host_id
       incarnation           = "installed-host-identity"
       service_account_email = google_service_account.vmd_runtime.email
-      proxy_units           = ["proxy.service", "proxy-generation.service"]
     }
   }
   depends_on = [module.sandbox_host, module.sandbox_host_b]
@@ -781,4 +779,10 @@ resource "google_service_account_iam_member" "controlplane_backup_gc" {
   service_account_id = "projects/${local.project_id}/serviceAccounts/${module.backup_storage.gc_service_account_email}"
   role               = "roles/iam.serviceAccountTokenCreator"
   member             = "serviceAccount:${google_service_account.controlplane_runtime.email}"
+}
+
+resource "google_project_service" "host_log_telemetry" {
+  project            = local.project_id
+  service            = "telemetry.googleapis.com"
+  disable_on_destroy = false
 }

@@ -4,7 +4,7 @@ terraform {
   required_providers {
     google = {
       source  = "hashicorp/google"
-      version = ">= 6.0"
+      version = ">= 6.0, < 8.0"
     }
   }
 }
@@ -18,33 +18,19 @@ locals {
   cursor_dir             = "${local.state_dir}/cursor"
   queue_dir              = "${local.state_dir}/export-queue"
 
-  host_units = distinct(flatten([
-    for host in values(var.enrolled_hosts) : concat([
-      "superserve-vmd.service",
-      "systemd-journald.service",
-      "systemd-logind.service",
-      "google-osconfig-agent.service",
-      "google-guest-agent.service",
-      "superserve-otel-collector.service",
-      "superserve-otel-logs.service",
-      "unbound.service",
-      "secretsproxy.service",
-      "superserve-secretsproxy.service",
-      "superserve-host-logging-heartbeat.service",
-      "proxy.service",
-      "proxy-generation.service",
-    ], host.proxy_units)
-  ]))
-
   otel_config = templatefile("${path.module}/templates/otel-logs.yaml.tftpl", {
-    environment         = var.environment
-    region              = var.region
-    assignment_name     = var.assignment_name
-    assignment_revision = var.assignment_revision
-    release_version     = var.otel_release_version
-    host_units          = local.host_units
-    cursor_dir          = local.cursor_dir
-    queue_dir           = local.queue_dir
+    project_id           = var.project_id
+    zone                 = var.zone
+    memory_limit_mb      = var.otel_memory_limit_mb
+    queue_max_bytes      = var.otel_queue_max_bytes
+    queue_capacity_bytes = floor(var.otel_queue_max_bytes / 4)
+    environment          = var.environment
+    region               = var.region
+    assignment_name      = var.assignment_name
+    assignment_revision  = var.assignment_revision
+    release_version      = var.otel_release_version
+    cursor_dir           = local.cursor_dir
+    queue_dir            = local.queue_dir
   })
   otel_service = templatefile("${path.module}/templates/otel-logs.service.tftpl", {
     binary_path     = var.otel_binary_path
@@ -56,6 +42,7 @@ locals {
     cpu_limit       = var.otel_cpu_limit
   })
   reconcile_script = templatefile("${path.module}/templates/reconcile.sh.tftpl", {
+    legacy_enabled                    = var.legacy_policy_name != null ? 1 : 0
     candidate_config_path             = local.candidate_config_path
     candidate_service_path            = local.candidate_service_path
     journald_dropin                   = local.journald_dropin
@@ -111,9 +98,8 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "otel-logs-config"
         file {
-          state       = "PRESENT"
-          path        = local.candidate_config_path
-          permissions = "0644"
+          state = "CONTENTS_MATCH"
+          path  = local.candidate_config_path
           file {
             gcs {
               bucket     = google_storage_bucket.host_logging_artifacts.name
@@ -127,9 +113,8 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "otel-logs-service"
         file {
-          state       = "PRESENT"
-          path        = local.candidate_service_path
-          permissions = "0644"
+          state = "CONTENTS_MATCH"
+          path  = local.candidate_service_path
           file {
             gcs {
               bucket     = google_storage_bucket.host_logging_artifacts.name
@@ -143,10 +128,9 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "journald-retention"
         file {
-          state       = "CONTENTS_MATCH"
-          path        = local.journald_candidate
-          permissions = "0644"
-          content     = <<-EOT
+          state   = "CONTENTS_MATCH"
+          path    = local.journald_candidate
+          content = <<-EOT
             [Journal]
             Storage=persistent
             SystemMaxUse=${var.journal_max_use_bytes}B
@@ -158,9 +142,8 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "validate-script"
         file {
-          state       = "PRESENT"
-          path        = "${local.state_dir}/validate.sh"
-          permissions = "0755"
+          state = "CONTENTS_MATCH"
+          path  = "${local.state_dir}/validate.sh"
           file {
             gcs {
               bucket     = google_storage_bucket.host_logging_artifacts.name
@@ -174,14 +157,34 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "reconcile-script"
         file {
-          state       = "PRESENT"
-          path        = "${local.state_dir}/reconcile.sh"
-          permissions = "0755"
+          state = "CONTENTS_MATCH"
+          path  = "${local.state_dir}/reconcile.sh"
           file {
             gcs {
               bucket     = google_storage_bucket.host_logging_artifacts.name
               object     = google_storage_bucket_object.reconcile_script.name
               generation = tostring(google_storage_bucket_object.reconcile_script.generation)
+            }
+          }
+        }
+      }
+
+      dynamic "resources" {
+        for_each = var.legacy_policy_name == null ? {} : {
+          "script" = { object = google_storage_bucket_object.legacy_migration_script[0].name, generation = google_storage_bucket_object.legacy_migration_script[0].generation, path = "${local.state_dir}/legacy-migration.py" }
+          "target" = { object = google_storage_bucket_object.legacy_migration_target[0].name, generation = google_storage_bucket_object.legacy_migration_target[0].generation, path = "${local.state_dir}/legacy-migration.json" }
+        }
+        content {
+          id = "legacy-migration-${resources.key}"
+          file {
+            state = "CONTENTS_MATCH"
+            path  = resources.value.path
+            file {
+              gcs {
+                bucket     = google_storage_bucket.host_logging_artifacts.name
+                object     = resources.value.object
+                generation = tostring(resources.value.generation)
+              }
             }
           }
         }
@@ -276,4 +279,12 @@ output "assignment_name" {
 
 output "legacy_transition" {
   value = var.legacy_transition
+}
+
+# The native OTLP endpoint needs quota consumption in addition to logWriter.
+resource "google_project_iam_member" "telemetry_consumer" {
+  for_each = toset([for host in values(var.enrolled_hosts) : host.service_account_email])
+  project  = var.project_id
+  role     = "roles/serviceusage.serviceUsageConsumer"
+  member   = "serviceAccount:${each.value}"
 }

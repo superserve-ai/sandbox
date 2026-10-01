@@ -452,13 +452,12 @@ module "observability" {
 module "host_logging" {
   source = "../../../modules/host-logging"
 
-  project_id         = local.project_id
-  zone               = local.zone
-  environment        = local.environment
-  region             = local.region
-  assignment_name    = "superserve-otel-host-logging-us-west2-a"
-  legacy_policy_name = "goog-ops-agent-v2-template-1-7-0-us-west2-a"
-  legacy_transition  = "preserve"
+  project_id        = local.project_id
+  zone              = local.zone
+  environment       = local.environment
+  region            = local.region
+  assignment_name   = "superserve-otel-host-logging-us-west2-a"
+  legacy_transition = "preserve"
   selector_labels = {
     application = "sandbox-host"
     environment = local.environment
@@ -471,7 +470,6 @@ module "host_logging" {
       host_id               = var.standby_host_id
       incarnation           = "installed-host-identity"
       service_account_email = google_service_account.vmd_runtime.email
-      proxy_units           = ["proxy.service", "proxy-generation.service"]
     }
   }
   depends_on = [module.sandbox_host_b]
@@ -530,4 +528,10 @@ module "cloud_ids" {
   notification_channel_ids   = var.notification_channel_ids
   runbook_base_url           = var.cloud_ids_runbook_base_url
   labels                     = local.common_labels
+}
+
+resource "google_project_service" "host_log_telemetry" {
+  project            = local.project_id
+  service            = "telemetry.googleapis.com"
+  disable_on_destroy = false
 }

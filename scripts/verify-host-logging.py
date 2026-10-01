@@ -42,9 +42,8 @@ def verify(root: Path) -> list[str]:
     alerts = (root / REQUIRED_FILES[6]).read_text() if (root / REQUIRED_FILES[6]).exists() else ""
     normalized_alerts = alerts.replace(r'\"', '"')
 
-    for required in ("journald:", "file_storage/cursor", "file_storage/queue", "googlecloud:",
-                     "parse_application_message", "filter/info_plus", "host_logging.parse_outcome",
-                     "retain_bounded_journal_fields", "processors: [filter/approved_sources"):
+    for required in ("journald:", "file_storage/cursor", "file_storage/queue", "otlp_http/cloud:",
+                     "ParseJSON", "filter/info_plus", "parse_outcome", "max_size:", "fsync: true"):
         if required not in config:
             errors.append(f"OTel config missing {required} contract")
     for required in ("google_os_config_os_policy_assignment", "roles/logging.logWriter",
@@ -52,8 +51,8 @@ def verify(root: Path) -> list[str]:
         if required not in module and required not in service:
             errors.append(f"Terraform host logging module missing {required}")
     for required in ("otelcol-contrib", "sha256sum", "validate --config", "activation_committed=1",
-                     "trap rollback EXIT", "superserve-otel-logs.service", "queue_full",
-                     "mktemp -d", "snapshot config", "restore_one"):
+                     "trap rollback EXIT", "superserve-otel-logs.service",
+                     "mktemp -d", "changed_targets", "backup.$i"):
         if required not in reconcile:
             errors.append(f"reconciliation missing {required}")
     if "superserve-otel-collector.service" in service:
@@ -64,13 +63,13 @@ def verify(root: Path) -> list[str]:
         errors.append("selected OTel release must carry a pinned SHA-256 digest")
     if "log_id(\"superserve_host_logs\")" not in normalized_alerts:
         errors.append("export failure alert must consume the OTel host-log stream")
-    if "absent(" not in normalized_alerts or "max_over_time(" not in normalized_alerts:
+    if "or vector(0)" not in normalized_alerts or "ALIGN_PERCENTILE_99" not in normalized_alerts:
         errors.append("alerts must cover never-seen hosts and retained-history lag")
     if "otelcol_process_uptime" not in alerts and "heartbeat_metric_type" not in alerts:
         errors.append("missing-heartbeat alert must remain independent of log export")
     if "storage: file_storage/cursor" not in validate or "storage: file_storage/queue" not in validate:
         errors.append("validation must check persistent cursor and queue state")
-    if "exit 100" not in validate or "exit 101" not in validate:
+    if "exit 100" not in reconcile or "exit 101" not in reconcile:
         errors.append("OS Config validation must distinguish compliant 100 from repairable 101")
     if "exit 100" not in reconcile:
         errors.append("reconciliation must return OS Config compliant status 100 after active verification")
