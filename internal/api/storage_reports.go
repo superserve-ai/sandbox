@@ -599,53 +599,7 @@ func applyStorageReport(ctx context.Context, pool *pgxpool.Pool, hostID string, 
 	_, err = tx.Exec(ctx, `
 		WITH measurements AS MATERIALIZED (
 			SELECT unnest($1::uuid[]) AS sandbox_id, unnest($2::int[]) AS disk_mib
-		), retained_handoff AS (
-			-- A sandbox can move from a retained-reporting host to a legacy
-			-- host. Close only the source-host retained interval before the
-			-- destination opens its legacy interval; otherwise both sources
-			-- remain billable indefinitely.
-			UPDATE retained_storage_interval old
-			SET ended_at=$4::timestamptz
-			FROM measurements m JOIN sandbox owner ON owner.id=m.sandbox_id
-			WHERE old.owner_kind='sandbox' AND old.owner_id=m.sandbox_id
-			  AND old.host_id IS DISTINCT FROM $3
-				AND old.started_at<$4::timestamptz
-				AND (old.ended_at IS NULL OR old.ended_at>$4::timestamptz)
-			  AND owner.host_id=$3 AND owner.created_at <= $4::timestamptz
-			  AND (owner.destroyed_at IS NULL OR owner.destroyed_at > $4::timestamptz)
-			  AND feature_enabled('billing_metrics_write',owner.team_id)
-			  AND NOT EXISTS (
-				SELECT 1 FROM sandbox_storage_interval future
-				WHERE future.sandbox_id=owner.id AND future.started_at>$4::timestamptz
-			  )
-			  AND NOT EXISTS (
-				SELECT 1 FROM retained_storage_interval future
-				WHERE future.owner_kind='sandbox' AND future.owner_id=owner.id AND future.started_at>$4::timestamptz
-			  )
-			), legacy_handoff AS (
-				-- A delayed legacy report must trim an already-closed source
-				-- interval at the receipt boundary. Also close only the source
-				-- host: the destination interval is inserted below even when its
-				-- quantity is unchanged.
-				UPDATE sandbox_storage_interval old
-				SET ended_at=$4::timestamptz, end_reason='reassigned'
-				FROM measurements m JOIN sandbox owner ON owner.id=m.sandbox_id
-				WHERE old.sandbox_id=owner.id
-				  AND old.host_id IS DISTINCT FROM $3
-				  AND old.started_at<$4::timestamptz
-				  AND (old.ended_at IS NULL OR old.ended_at>$4::timestamptz)
-				  AND owner.host_id=$3 AND owner.created_at <= $4::timestamptz
-				  AND (owner.destroyed_at IS NULL OR owner.destroyed_at > $4::timestamptz)
-				  AND feature_enabled('billing_metrics_write',owner.team_id)
-				  AND NOT EXISTS (
-					SELECT 1 FROM sandbox_storage_interval future
-					WHERE future.sandbox_id=owner.id AND future.started_at>$4::timestamptz
-				  )
-				  AND NOT EXISTS (
-					SELECT 1 FROM retained_storage_interval future
-					WHERE future.owner_kind='sandbox' AND future.owner_id=owner.id AND future.started_at>$4::timestamptz
-				  )
-			), eligible AS MATERIALIZED (
+		), eligible AS MATERIALIZED (
 			SELECT s.id, s.team_id, s.destroyed_at, m.disk_mib FROM measurements m
 			JOIN sandbox s ON s.id=m.sandbox_id
 			WHERE s.host_id=$3

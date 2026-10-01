@@ -888,6 +888,17 @@ func TestIntegration_RetainedActivationReceiptAtomicity(t *testing.T) {
 		f := newStorageLeaseFixture(t)
 		ctx := t.Context()
 		receipt := f.receivedAt
+		var team uuid.UUID
+		if err := f.pool.QueryRow(ctx, `SELECT team_id FROM sandbox WHERE id=$1`, f.sandboxID).Scan(&team); err != nil {
+			t.Fatal(err)
+		}
+		// Keep this handoff fixture explicitly enabled at the team boundary. The
+		// production receiver gates both source closure and destination insertion
+		// on this flag, so the regression must exercise the eligible path rather
+		// than rely on a database-global default.
+		if _, err := f.pool.Exec(ctx, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_metrics_write',true)`, team); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := f.pool.Exec(ctx, `UPDATE sandbox_storage_interval SET host_id='source-legacy-host'`); err != nil {
 			t.Fatal(err)
 		}
