@@ -61,6 +61,22 @@ trap 'rm -f "$rendered_config" "$dropin_candidate" "$logging_resource_candidate"
 sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
   "$candidate_config_path" >"$rendered_config"
 chmod 0644 "$rendered_config"
+
+# Keep the Terraform-rendered source inventory aligned with the journald
+# allowlist before the candidate can replace the working configuration. These
+# representative platform records cover the in-host proxy identity and the
+# systemd lifecycle stream without treating application payload as provenance.
+required_source_units=(
+  "superserve-secretsproxy.service"
+  "systemd.service"
+)
+for unit in "$${required_source_units[@]}"; do
+  if ! grep -Fq "# enrolled unit: $unit" "$rendered_config"; then
+    logger -t superserve-host-logging -p err "required journald source inventory missing: $unit"
+    exit 1
+  fi
+done
+
 if ! google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1; then
   exit 1
 fi
