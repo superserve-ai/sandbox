@@ -48,11 +48,13 @@ malformed or non-Ed25519 private keys withhold account requests before transport
 
 The adapter signs an EdDSA JWT with `iss: promotion-auth-adapter`,
 `aud: promotion-account`, `sub: <Auth user UUID>`, `iat`, `exp`, and
-`operation: bind|evidence|register|signup-eligibility|create-team`. Both times are required, expiry must be
+`operation: bind|evidence|register|register-signup|signup-eligibility|create-team`. Both times are required, expiry must be
 later than issue time and at most five minutes after it, and future-issued or
 expired assertions reject. For `bind`, also sign `attempt_id` from the
-server-owned signup flow; `create-team` uses the separate creation binding
-described below. For evidence, registration and eligibility snapshots omit it. The control plane
+server-owned signup flow; `register-signup` also signs that original attempt
+and fixed `home_region: "use"`; `create-team` uses the separate creation
+binding described below. For evidence, later registration and eligibility
+snapshots omit it. The control plane
 verifies the signature, issuer, audience, time bounds, operation and exact
 subject/body match, plus the attempt/body match for binding, before database
 access. `X-Actor-User-Id` is required and must equal that verified subject and
@@ -118,8 +120,10 @@ For signer interoperability, the Console producer test can write fresh request
 fixtures to `PROMOTION_ASSERTION_FIXTURE_OUT`. Run
 `TestPromotionAccountConsoleInterop` with `PROMOTION_ASSERTION_FIXTURE_IN` pointing
 to that file within five minutes. It passes the actual Console assertions through
-the backend middleware and handler identity checks for all three operations,
-including matching forged actor/body IDs. The fixture contains a generated test
+the backend middleware and handler identity checks for all four operations:
+bind, evidence, register, and create-team. Three-operation fixtures are rejected.
+Checks include forged actor headers and matching forged actor/body IDs, plus
+mutated creation attempt, team, region, and decision fields. The fixture contains a generated test
 public key and assertions, never a private key or real account evidence. This
 test skips without the fixture; an ordinary backend suite pass is not evidence
 that the cross-runtime check ran. Record both producer and verifier execution.
@@ -168,13 +172,55 @@ have passed.
 | Bind | `POST /internal/promotion/account/bind` | `user_id`, `attempt_id` | `bound`, `replayed`, or `first_evidence_retained` |
 | Retrieve | `POST /internal/promotion/account/evidence` | `user_id` | Original bound evidence; `evidence_missing` if absent |
 | Register locally | `POST /internal/promotion/account/register` | `user_id` | `owner` or `owner_conflict` |
+| Register signup | `POST /internal/promotion/account/register-signup` | `user_id`, `attempt_id`, `home_region: "use"` | `owner` or `owner_conflict` |
 
-The registration route reads the original binding from shared Auth itself and
-passes that exact evidence to the selected region's SQL function. A regional
-registration request cannot provide a new event or Fingerprint. Requests are
-limited to 4 KiB and database work to three seconds; SQL errors are not
-interpreted as eligibility. Invoke the register route on the selected regional
-control plane before the grant decision, including delayed West entry.
+The registration routes read the original binding from shared Auth itself and
+pass that exact evidence to the regional SQL function. A regional registration
+request cannot provide a new event or Fingerprint. `register-signup` is a
+separate East-only route for the server-owned actual-signup continuation and
+must be called before confirmation; later authenticated regional entry keeps
+using `register`, including delayed West entry. Requests are limited to 4 KiB
+and database work to three seconds; SQL errors are not interpreted as
+eligibility.
+
+### Register-signup provenance, errors, and recovery
+
+The `register-signup` caller may sign only the account and attempt returned by
+the actual newly created Auth account while the original trusted signup
+context remains available. A browser cookie, attempt ID, user ID, or other
+client locator is untrusted input. Ordinary login and a shared-Auth evidence
+lookup can validate a retained `(user, attempt)` pair, but neither can create
+signup provenance or authorize a new assertion. If the trusted signup context
+is unavailable, stop publication rather than minting an assertion from a
+replacement attempt or a later login. An uncertain bind must first recover
+the original bind; after that, retries may use only the original
+account/attempt tuple. If association fails or its outcome cannot be safely
+established after context loss, preserve the account and normal paid access
+and withhold promotional credit; no durable continuation or recovery workflow
+is required.
+
+The route returns `200 {"outcome":"owner"}` or
+`200 {"outcome":"owner_conflict"}` only after the East regional commit.
+It uses the shared error envelope: `400 invalid_request` or
+`400 invalid_evidence` for malformed input, `401` for scoped
+producer-credential failure, `403 forbidden` for signed/body/actor/region/
+provenance mismatch, `404 evidence_missing` when the retained binding is
+absent, `409 evidence_conflict` for immutable regional evidence conflict, and
+`503 authority_unavailable` for unavailable pools, timeouts, or database
+failure.
+Malformed requests, mismatches, and immutable conflicts are terminal for that
+tuple. A transport or `503` result may be retried only with the same trusted
+tuple; a successful commit whose response was lost is replayed idempotently.
+The route never creates a team, grant, entitlement, balance, or redemption.
+
+Deploy the additive backend and its public-key configuration before deploying
+the matching signup consumer. Before exposing the flow, consumer tests and
+separately authorized staging verification must demonstrate actual-new-account
+provenance, exact-tuple retry while trusted context remains, response-loss
+handling, rejection of ordinary-login substitution, fail-closed behavior after
+context loss, and independent East/West behavior. No durable continuation or
+recovery workflow is required. Keep publication stopped until those checks
+pass.
 
 The control-plane routes above invoke the following shared Auth operations:
 
@@ -400,8 +446,9 @@ policy-row lock across explicit team creation and legacy owner assignment.
 RPC/table access and preservation of unrelated grant-error retries.
 
 Run these tests against the resulting backend revision before rollout. The
-existing Console fixture covers bind/evidence/register only; its pass does not
-prove the creation boundary works end to end. Console must also implement and
+historical bind/evidence/register-only fixtures do not prove the creation
+boundary works end to end. The interoperability verifier now requires the
+signed create-team fixture above. Console must also implement and
 verify the creation call sequence and signed fields above, including failure
 with prior evidence and replay after authority recovers. Enforcement stays off
 until that selected region's consumer and backend validation are recorded.

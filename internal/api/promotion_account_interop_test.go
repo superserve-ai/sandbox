@@ -26,30 +26,44 @@ func TestPromotionAccountConsoleInterop(t *testing.T) {
 	var fixture struct {
 		PublicKey string `json:"public_key"`
 		Requests  []struct {
-			Operation string                  `json:"operation"`
-			Assertion string                  `json:"assertion"`
-			Body      promotionAccountRequest `json:"body"`
-			Actor     string                  `json:"actor"`
+			Operation string          `json:"operation"`
+			Assertion string          `json:"assertion"`
+			Body      json.RawMessage `json:"body"`
+			Actor     string          `json:"actor"`
 		} `json:"requests"`
 	}
 	if err := json.Unmarshal(data, &fixture); err != nil {
 		t.Fatal(err)
 	}
-	if len(fixture.Requests) != 3 {
-		t.Fatal("Console fixture must cover bind, evidence and register")
+	if len(fixture.Requests) != 4 {
+		t.Fatal("Console fixture must cover bind, evidence, register and create-team")
 	}
 	t.Setenv("PROMOTION_ACCOUNT_PUBLIC_KEY", fixture.PublicKey)
 	t.Setenv("PROMOTION_CAPTURE_TOKEN", "capture-test-token")
 	t.Setenv("INTERNAL_API_TOKEN", "internal-test-token")
 	seen := make(map[string]bool)
 	for _, request := range fixture.Requests {
-		if seen[request.Operation] || (request.Operation != "bind" && request.Operation != "evidence" && request.Operation != "register") {
+		if seen[request.Operation] || (request.Operation != "bind" && request.Operation != "evidence" && request.Operation != "register" && request.Operation != "create-team") {
 			t.Fatal("duplicate or unknown Console operation")
 		}
 		seen[request.Operation] = true
 		t.Run(request.Operation, func(t *testing.T) {
+			region := "use"
+			if request.Operation == "create-team" {
+				var creation struct {
+					HomeRegion string `json:"home_region"`
+				}
+				if err := json.Unmarshal(request.Body, &creation); err != nil {
+					t.Fatal(err)
+				}
+				if creation.HomeRegion != "use" && creation.HomeRegion != "usw" {
+					t.Fatal("creation fixture requires home_region use or usw")
+				}
+				region = creation.HomeRegion
+			}
+			t.Setenv("SANDBOX_ID_REGION", region)
 			token := "account-test-token"
-			if request.Operation == "register" {
+			if request.Operation == "register" || region == "usw" {
 				token = "west-account-test-token"
 			}
 			t.Setenv("PROMOTION_ACCOUNT_TOKEN", token)
@@ -59,13 +73,42 @@ func TestPromotionAccountConsoleInterop(t *testing.T) {
 			account.POST("/bind", h.BindPromotionSignupAccount)
 			account.POST("/evidence", h.GetPromotionSignupAccountEvidence)
 			account.POST("/register", h.RegisterPromotionSignupDevice)
-			for _, spoof := range []bool{false, true} {
-				body, actor := request.Body, request.Actor
+			account.POST("/create-team", h.CreateTeamWithPromotionAttempt)
+			mutations := []string{"original", "actor", "actor-and-body"}
+			if request.Operation == "create-team" {
+				mutations = append(mutations, "attempt_id", "team_id", "home_region", "authority_unavailable", "missing-decision")
+			}
+			for _, mutation := range mutations {
+				var body map[string]any
+				if err := json.Unmarshal(request.Body, &body); err != nil {
+					t.Fatal(err)
+				}
+				actor := request.Actor
 				want := http.StatusServiceUnavailable
-				if spoof {
-					body.UserID = uuid.New()
-					actor = body.UserID.String()
+				if mutation != "original" {
 					want = http.StatusForbidden
+				}
+				switch mutation {
+				case "actor":
+					actor = uuid.NewString()
+				case "actor-and-body":
+					actor = uuid.NewString()
+					body["user_id"] = actor
+				case "attempt_id", "team_id":
+					body[mutation] = uuid.NewString()
+				case "home_region":
+					body[mutation] = "usw"
+					if region == "usw" {
+						body[mutation] = "use"
+					}
+				case "authority_unavailable":
+					decision, ok := body[mutation].(bool)
+					if !ok {
+						t.Fatal("creation fixture requires boolean authority_unavailable")
+					}
+					body[mutation] = !decision
+				case "missing-decision":
+					delete(body, "authority_unavailable")
 				}
 				payload, err := json.Marshal(body)
 				if err != nil {
@@ -79,7 +122,7 @@ func TestPromotionAccountConsoleInterop(t *testing.T) {
 				r.ServeHTTP(w, req)
 				// Only the unmodified producer request may reach the unavailable DB.
 				if w.Code != want {
-					t.Fatalf("spoof=%v: got %d, want %d: %s", spoof, w.Code, want, w.Body.String())
+					t.Fatalf("mutation=%s: got %d, want %d: %s", mutation, w.Code, want, w.Body.String())
 				}
 			}
 		})
