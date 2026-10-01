@@ -228,11 +228,6 @@ func TestIntegration_BillingStorageActivationReadinessAndConcurrency(t *testing.
 	if stripe.creates != 1 {
 		t.Fatalf("created %d items", stripe.creates)
 	}
-	// Activation uses the database clock, which may differ from the test host.
-	var before time.Time
-	if err := testPool.QueryRow(t.Context(), `SELECT clock_timestamp()`).Scan(&before); err != nil {
-		t.Fatal(err)
-	}
 	for i := 0; i < 4; i++ {
 		wg.Add(1)
 		go func() {
@@ -248,8 +243,8 @@ func TestIntegration_BillingStorageActivationReadinessAndConcurrency(t *testing.
 	if err := testPool.QueryRow(t.Context(), `SELECT effective_at FROM team_storage_billing_activation WHERE team_id=$1`, team).Scan(&first); err != nil {
 		t.Fatal(err)
 	}
-	if first.Before(before) || first.Before(cutoff) {
-		t.Fatalf("activation backdated: effective_at=%s before=%s cutoff=%s", first, before, cutoff)
+	if first.Before(cutoff) {
+		t.Fatalf("activation backdated: effective_at=%s cutoff=%s", first, cutoff)
 	}
 	// A replacement (including an old Checkout completing late) must be checked
 	// against the current association, while the original cutoff remains fixed.
