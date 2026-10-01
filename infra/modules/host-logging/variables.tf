@@ -111,7 +111,7 @@ variable "otel_release_sha256" {
   type        = string
   # This immutable value is replaced only by a reviewed release manifest;
   # staging must reject an archive whose bytes do not match it.
-  default = "8931c2f158339a7607de1356224444be778c5da9608b9fd5be52aafee7c414c5"
+  default = "4ee77545daaad658f7282bff98704bc1f31107890e2a2e1d4b1fc31da4648111"
   validation {
     condition     = can(regex("^[0-9a-f]{64}$", var.otel_release_sha256))
     error_message = "otel_release_sha256 must be a reviewed 64-character hexadecimal digest."

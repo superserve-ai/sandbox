@@ -19,6 +19,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MODULE = ROOT / "infra/modules/host-logging"
 IMAGE = os.environ.get("SUPER_SERVE_OTEL_FIXTURE_IMAGE", "ubuntu:24.04")
+FIXTURE_PLATFORM = os.environ.get("SUPER_SERVE_OTEL_FIXTURE_PLATFORM", "linux/amd64")
+FIXTURE_IMAGE_TAG = os.environ.get(
+    "SUPER_SERVE_OTEL_FIXTURE_IMAGE_TAG", "superserve-host-logging-fixture:ubuntu-24.04-v1"
+)
 
 
 class HostLoggingConfigChecks(unittest.TestCase):
@@ -106,9 +110,13 @@ class HostLoggingConfigChecks(unittest.TestCase):
         probe = subprocess.run(["docker", "info"], text=True, capture_output=True, timeout=20)
         if probe.returncode:
             self.fail("Docker daemon is required for the host-logging Linux fixture: docker info failed")
+        image = self._fixture_image()
+        cache = self._release_cache()
+        cache.mkdir(mode=0o700, parents=True, exist_ok=True)
         cmd = [
-            "docker", "run", "--rm", "--name", name,
-            "-v", f"{fixture}:/fixture:rw", IMAGE, "bash", "-euo", "pipefail", "-c", script,
+            "docker", "run", "--rm", "--platform", FIXTURE_PLATFORM, "--name", name,
+            "-v", f"{fixture}:/fixture:rw", "-v", f"{cache}:/fixture/immutable-cache:rw",
+            image, "bash", "-euo", "pipefail", "-c", script,
         ]
         try:
             result = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
@@ -118,20 +126,70 @@ class HostLoggingConfigChecks(unittest.TestCase):
             self.fail(f"Linux fixture {name} failed (exit {result.returncode}):\n{result.stdout}\n{result.stderr}")
         return result.stdout
 
+    def _release_cache(self):
+        """Use one host cache for the authenticated release across selectors/processes."""
+        cache_root = os.environ.get("SUPER_SERVE_OTEL_FIXTURE_CACHE")
+        if cache_root:
+            return Path(cache_root)
+        return Path(tempfile.gettempdir()) / f"superserve-otel-cache-{self.release}-{self.digest}"
+
+    def _fixture_image(self):
+        """Build the tool-complete fixture image once, then reuse Docker's immutable layer cache."""
+        if os.environ.get("SUPER_SERVE_OTEL_FIXTURE_IMAGE"):
+            return IMAGE
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", "--platform", FIXTURE_PLATFORM, FIXTURE_IMAGE_TAG],
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if inspect.returncode == 0:
+            return FIXTURE_IMAGE_TAG
+        dockerfile = """\
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends ca-certificates curl gzip tar systemd systemd-journal-remote \\
+    && rm -rf /var/lib/apt/lists/*
+"""
+        build = subprocess.run(
+            ["docker", "build", "--platform", FIXTURE_PLATFORM, "-t", FIXTURE_IMAGE_TAG, "-"],
+            input=dockerfile,
+            text=True,
+            capture_output=True,
+            timeout=300,
+            check=False,
+        )
+        if build.returncode:
+            self.fail(f"Linux fixture image build failed:\n{build.stdout}\n{build.stderr}")
+        return FIXTURE_IMAGE_TAG
+
     def _acquire_release(self, fixture):
         archive = f"otelcol-contrib_{self.release}_linux_amd64.tar.gz"
-        checksums = f"otelcol-contrib_{self.release}_checksums.txt"
+        # Goreleaser publishes the manifest under the distribution-qualified
+        # name; the shorter legacy name is not present on current releases.
+        checksums = "opentelemetry-collector-releases_otelcol-contrib_checksums.txt"
         return textwrap.dedent(f"""
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update >/dev/null
-            apt-get install -y --no-install-recommends ca-certificates curl gzip tar systemd systemd-journal-remote >/dev/null
             mkdir -p /fixture/immutable-cache /fixture/bin
             archive=/fixture/immutable-cache/{archive}
             checksums=/fixture/immutable-cache/{checksums}
-            test -s "$archive" || curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \\
-              'https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v{self.release}/{archive}' -o "$archive"
-            test -s "$checksums" || curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \\
-              'https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v{self.release}/{checksums}' -o "$checksums"
+            archive_url='https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v{self.release}/{archive}'
+            checksums_url='https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v{self.release}/{checksums}'
+            fetch() {{
+              url="$1"; destination="$2"
+              printf 'acquiring pinned OTel fixture asset: %s\\n' "$url" >&2
+              tmp="$destination.tmp.$$"
+              curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 "$url" -o "$tmp"
+              test -s "$tmp"
+              mv -f "$tmp" "$destination"
+            }}
+            if [ ! -s "$archive" ] || [ "$(sha256sum "$archive" | awk '{{print $1}}')" != '{self.digest}' ]; then
+              fetch "$archive_url" "$archive"
+            fi
+            if [ ! -s "$checksums" ] || ! grep -Eq '[[:space:]]{archive}$' "$checksums"; then
+              fetch "$checksums_url" "$checksums"
+            fi
             grep -E '[[:space:]]{archive}$' "$checksums" > /tmp/otel-checksum-line
             (cd /fixture/immutable-cache && sha256sum -c /tmp/otel-checksum-line)
             test "$(sha256sum "$archive" | awk '{{print $1}}')" = '{self.digest}'
@@ -310,7 +368,7 @@ class HostLoggingConfigChecks(unittest.TestCase):
                   chmod +x /opt/superserve/otelcol-contrib/bin/otelcol-contrib
                 fi
                 set +e
-                /fixture/reconcile.sh
+                bash /fixture/reconcile.sh
                 rc=$?
                 set -e
                 test "$rc" -ne 0
@@ -353,14 +411,14 @@ class HostLoggingConfigChecks(unittest.TestCase):
                     chmod +x /fixture/bin/systemctl
                     export PATH=/fixture/bin:$PATH
                     set +e
-                    /fixture/validate.sh
+                    bash /fixture/validate.sh
                     fresh=$?
                     set -e
                     test "$fresh" -eq 101
                     mkdir -p /etc/sandbox
                     printf '{"host_id":' > /etc/sandbox/host-identity.json
                     set +e
-                    /fixture/validate.sh
+                    bash /fixture/validate.sh
                     invalid=$?
                     set -e
                     test "$invalid" -eq 1
