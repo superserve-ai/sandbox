@@ -196,11 +196,12 @@ exporters:
       # or stopping the only drainer.
       queue_size: 4096
       num_consumers: 2
-    retry_on_failure:
-      enabled: true
-      initial_interval: 1s
-      max_interval: 30s
-      max_elapsed_time: 0s
+    # The googlecloud exporter in the pinned 0.119.0 release rejects the
+    # generic retry_on_failure block. This queue persists records accepted by
+    # the exporter helper, but the release-specific ownership and duration of
+    # transient retry remain unresolved until outage/restart and queue-
+    # exhaustion staging evidence; this config must not be treated as proof of
+    # indefinite retry equivalence.
 
 service:
   extensions: [file_storage/cursor, file_storage/queue]

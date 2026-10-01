@@ -23,9 +23,17 @@ identity_env=/etc/sandbox/host-logging-identity.env
 mkdir -p "$state_dir" /etc/systemd/journald.conf.d
 chmod 0700 "$state_dir"
 attempt=$(mktemp -d "$state_dir/.attempt.XXXXXX")
-cleanup() { rm -rf -- "$attempt"; }
+stage_name=bootstrap
+cleanup() {
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'host-logging reconcile failed stage=%s exit=%s\n' "$stage_name" "$rc" >&2
+  fi
+  rm -rf -- "$attempt"
+}
 trap cleanup EXIT
 
+stage_name=preflight
 test -s "$candidate" && test -s "$service_candidate"
 test -s "$identity_file"
 test -r "$candidate" && test -r "$service_candidate"
@@ -75,6 +83,9 @@ systemctl is-active --quiet superserve-host-logging-queue-guard.service 2>/dev/n
 
 rollback() {
   local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'host-logging reconcile failed stage=%s exit=%s\n' "$stage_name" "$rc" >&2
+  fi
   [ "$${activation_committed:-0}" -eq 1 ] && { cleanup; exit "$rc"; }
   if [ "$${changed_binary:-0}" -eq 1 ]; then restore_one binary "$binary"; fi
   if [ "$${changed_config:-0}" -eq 1 ]; then restore_one config "$active_config"; fi
@@ -120,11 +131,13 @@ activation_started=0
 # Admission is enforced by the bounded persistent exporter queue and the
 # host filesystem free-space reserve; avoid an unbounded recursive queue scan
 # in reconciliation.
+stage_name=storage_admission
 free=$(df -Pk "$state_dir" 2>/dev/null | awk 'NR==2 {print $4 * 1024}')
 queue_reserve=$(( ${journal_keep_free_bytes} + ${otel_queue_max_bytes} ))
 test -n "$free" && test "$free" -ge "$queue_reserve"
 
 # Validate the candidate with the exact release before changing active state.
+stage_name=validate_candidate
 stage="$attempt/stage"
 mkdir -p "$stage"
 staged_binary=''
@@ -140,6 +153,7 @@ else
 fi
 "$staged_binary" validate --config "$candidate"
 
+stage_name=prepare_activation
 cat > "$attempt/journald.conf" <<'EOF'
 [Journal]
 Storage=persistent
@@ -232,6 +246,7 @@ if ! cmp -s "$attempt/queue-guard.service.new" "$queue_guard_service" 2>/dev/nul
 fi
 
 systemctl daemon-reload
+stage_name=activate_services
 systemctl enable superserve-otel-logs.service >/dev/null
 systemctl enable superserve-host-logging-heartbeat.timer >/dev/null
 systemctl enable superserve-host-logging-queue-guard.service >/dev/null
@@ -246,6 +261,7 @@ systemctl is-active --quiet superserve-host-logging-heartbeat.timer
 systemctl is-active --quiet superserve-host-logging-queue-guard.service
 
 # Verify active state after enforcement; a successful command is not enough.
+stage_name=verify_activation
 cmp -s "$candidate" "$active_config"
 cmp -s "$service_candidate" "$active_service"
 "$binary" --version 2>/dev/null | grep -F '${otel_release_version}' >/dev/null

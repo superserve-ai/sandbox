@@ -234,7 +234,15 @@ RUN apt-get update \\
                 emit '' kernel 5 'trusted-kernel-diagnostic' >> /fixture/journal.export
                 emit other.service journal 6 'drop-me' >> /fixture/journal.export
                 emit '' journal 6 'missing-unit-drop' >> /fixture/journal.export
-                systemd-journal-remote --output=/var/log/journal/fixture.journal - < /fixture/journal.export
+                # Ubuntu's package installs this helper outside PATH in some
+                # releases. Resolve the installed package path instead of
+                # substituting a text fixture for the journal binary format.
+                journal_remote=$(command -v systemd-journal-remote || true)
+                if [ -z "$journal_remote" ]; then
+                  journal_remote=$(find /usr/lib /lib -type f -name systemd-journal-remote -perm -u+x -print -quit 2>/dev/null || true)
+                fi
+                test -n "$journal_remote" && test -x "$journal_remote"
+                "$journal_remote" --output=/var/log/journal/fixture.journal - < /fixture/journal.export
                 sleep 10
                 kill -TERM "$collector" 2>/dev/null || true
                 wait "$collector" || true
@@ -410,12 +418,16 @@ RUN apt-get update \\
                     EOF
                     chmod +x /fixture/bin/systemctl
                     export PATH=/fixture/bin:$PATH
+                    # A valid authoritative identity is required even on a
+                    # fresh host; only collector-owned outputs are absent.
+                    mkdir -p /etc/sandbox
+                    printf '{"host_id":"fixture-host","instance_id":"fixture-instance","incarnation_id":"fixture-incarnation"}\n' > /etc/sandbox/host-identity.json
+                    printf 'HOST_ID=fixture-host\nINSTANCE_ID=fixture-instance\nINCARNATION_ID=fixture-incarnation\n' > /etc/sandbox/host-logging-identity.env
                     set +e
                     bash /fixture/validate.sh
                     fresh=$?
                     set -e
                     test "$fresh" -eq 101
-                    mkdir -p /etc/sandbox
                     printf '{"host_id":' > /etc/sandbox/host-identity.json
                     set +e
                     bash /fixture/validate.sh
