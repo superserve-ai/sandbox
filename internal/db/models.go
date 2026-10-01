@@ -1170,6 +1170,29 @@ type StripeCheckoutExpirationEvidence struct {
 	ExpiredAt          time.Time `json:"expired_at"`
 }
 
+type StripeCheckoutGenerationAuthority struct {
+	TeamID                  uuid.UUID   `json:"team_id"`
+	CheckoutGeneration      time.Time   `json:"checkout_generation"`
+	UserID                  uuid.UUID   `json:"user_id"`
+	IdentityEvidenceVersion pgtype.UUID `json:"identity_evidence_version"`
+}
+
+type StripeCheckoutPublicationDecision struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	CheckoutGeneration time.Time `json:"checkout_generation"`
+	UserID             uuid.UUID `json:"user_id"`
+	OperationID        uuid.UUID `json:"operation_id"`
+	HomeRegion         string    `json:"home_region"`
+	RequestKey         string    `json:"request_key"`
+	Decision           string    `json:"decision"`
+}
+
+type StripeCheckoutPublicationSubscription struct {
+	TeamID             uuid.UUID `json:"team_id"`
+	SubscriptionID     string    `json:"subscription_id"`
+	CheckoutGeneration time.Time `json:"checkout_generation"`
+}
+
 type StripePromotionMigrationFence struct {
 	TeamID   uuid.UUID `json:"team_id"`
 	FencedAt time.Time `json:"fenced_at"`
