@@ -9,110 +9,142 @@ active_config="$active_dir/otel-logs.yaml"
 active_service=/etc/systemd/system/superserve-otel-logs.service
 heartbeat_service=/etc/systemd/system/superserve-host-logging-heartbeat.service
 heartbeat_timer=/etc/systemd/system/superserve-host-logging-heartbeat.timer
+queue_guard_service=/etc/systemd/system/superserve-host-logging-queue-guard.service
 binary='${otel_binary_path}'
 cursor='${cursor_dir}'
 queue='${queue_dir}'
-dropin='${journald_dropin}'
-dropin_candidate='${journald_candidate_path}'
-archive_dir="$state_dir/releases"
-package_dir="$state_dir/package"
-activation_committed=0
-working_config=''
-working_service=''
-working_dropin=''
-working_binary=''
-working_heartbeat_service=''
-working_heartbeat_timer=''
-had_config=0
-had_service=0
-had_dropin=0
-had_binary=0
-had_heartbeat_service=0
-had_heartbeat_timer=0
-binary_changed=0
-service_was_active=0
-
-rollback() {
-  [ "$activation_committed" -eq 1 ] && return 0
-  if [ -n "$working_config" ] && [ -f "$working_config" ]; then install -m 0644 "$working_config" "$active_config"; fi
-  if [ "$had_config" -eq 0 ]; then rm -f "$active_config"; fi
-  if [ -n "$working_service" ] && [ -f "$working_service" ]; then install -m 0644 "$working_service" "$active_service"; fi
-  if [ "$had_service" -eq 0 ]; then rm -f "$active_service"; fi
-  if [ -n "$working_dropin" ] && [ -f "$working_dropin" ]; then install -m 0644 "$working_dropin" "$dropin"; fi
-  if [ "$had_dropin" -eq 0 ]; then rm -f "$dropin"; fi
-  if [ -n "$working_binary" ] && [ -f "$working_binary" ]; then install -m 0755 "$working_binary" "$binary"; fi
-  if [ "$had_binary" -eq 0 ]; then rm -f "$binary"; fi
-  if [ -n "$working_heartbeat_service" ] && [ -f "$working_heartbeat_service" ]; then install -m 0644 "$working_heartbeat_service" "$heartbeat_service"; fi
-  if [ "$had_heartbeat_service" -eq 0 ]; then rm -f "$heartbeat_service"; fi
-  if [ -n "$working_heartbeat_timer" ] && [ -f "$working_heartbeat_timer" ]; then install -m 0644 "$working_heartbeat_timer" "$heartbeat_timer"; fi
-  if [ "$had_heartbeat_timer" -eq 0 ]; then rm -f "$heartbeat_timer"; fi
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  if [ "$service_was_active" -eq 1 ]; then systemctl restart superserve-otel-logs.service >/dev/null 2>&1 || true; fi
-}
-trap rollback EXIT
-
-mkdir -p "$state_dir" "$active_dir" "$archive_dir" "$cursor" "$queue" /etc/systemd/journald.conf.d
-chmod 0700 "$cursor" "$queue"
-test -s "$candidate" && test -s "$service_candidate"
-test "$(du -sb "$queue" | awk '{print $1}')" -le '${otel_queue_max_bytes}'
-systemctl is-active --quiet superserve-otel-logs.service && service_was_active=1 || true
-
-# Identity is an input, never an output. A replacement host is not activated
-# until the provisioner has installed its authoritative identity document.
+dropin=/etc/systemd/journald.conf.d/30-superserve-host-logging.conf
 identity_file=/etc/sandbox/host-identity.json
 identity_env=/etc/sandbox/host-logging-identity.env
-test -s "$identity_file" || { logger -t superserve-otel-logs -p warning "host identity is not provisioned; deferring activation"; exit 1; }
+
+# Every attempt owns one bounded staging directory. It is removed on success,
+# pre-activation failure, activation failure, and interruption. No archive
+# backup is retained indefinitely and no cursor/queue state is ever removed.
+mkdir -p "$state_dir" /etc/systemd/journald.conf.d
+chmod 0700 "$state_dir"
+attempt=$(mktemp -d "$state_dir/.attempt.XXXXXX")
+cleanup() { rm -rf -- "$attempt"; }
+trap cleanup EXIT
+
+test -s "$candidate" && test -s "$service_candidate"
+test -s "$identity_file"
+test -r "$candidate" && test -r "$service_candidate"
+
 instance_id=$(sed -n 's/.*"instance_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
 incarnation_id=$(sed -n 's/.*"incarnation_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
 host_id=$(sed -n 's/.*"host_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
 test -n "$instance_id" && test -n "$incarnation_id" && test -n "$host_id"
-printf 'HOST_ID=%s\nINSTANCE_ID=%s\nINCARNATION_ID=%s\n' "$host_id" "$instance_id" "$incarnation_id" > "$identity_env.new"
-install -m 0600 "$identity_env.new" "$identity_env"
-rm -f "$identity_env.new"
 
-if [ -f "$binary" ]; then cp -a "$binary" "$archive_dir/active-binary.$$.bak"; working_binary="$archive_dir/active-binary.$$.bak"; had_binary=1; fi
-if [ -f "$heartbeat_service" ]; then cp -a "$heartbeat_service" "$archive_dir/active-heartbeat-service.$$.bak"; working_heartbeat_service="$archive_dir/active-heartbeat-service.$$.bak"; had_heartbeat_service=1; fi
-if [ -f "$heartbeat_timer" ]; then cp -a "$heartbeat_timer" "$archive_dir/active-heartbeat-timer.$$.bak"; working_heartbeat_timer="$archive_dir/active-heartbeat-timer.$$.bak"; had_heartbeat_timer=1; fi
+# Snapshot all mutable activation targets before any target is changed. A
+# missing marker means this attempt owns creation and may remove only that file
+# during rollback; unrelated pre-existing files are never guessed at.
+snapshot() {
+  local key="$1" target="$2"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    cp -a -- "$target" "$attempt/$key"
+    printf 'present\n' > "$attempt/$key.present"
+  else
+    : > "$attempt/$key.absent"
+  fi
+}
+restore_one() {
+  local key="$1" target="$2"
+  if [ -f "$attempt/$key.present" ]; then
+    rm -f -- "$target"
+    mkdir -p "$(dirname "$target")"
+    cp -a -- "$attempt/$key" "$target"
+  elif [ -f "$attempt/$key.absent" ]; then
+    rm -f -- "$target"
+  fi
+}
+snapshot config "$active_config"
+snapshot service "$active_service"
+snapshot dropin "$dropin"
+snapshot binary "$binary"
+snapshot identity_env "$identity_env"
+snapshot heartbeat_service "$heartbeat_service"
+snapshot heartbeat_timer "$heartbeat_timer"
+snapshot queue_guard_service "$queue_guard_service"
 
-# Stage and verify the exact release before touching the active binary. The
-# checksum is the release authority; no package manager or manual SSH path is
-# used for activation.
-if [ ! -x "$binary" ] || ! "$binary" --version 2>/dev/null | grep -F '${otel_release_version}' >/dev/null; then
-  mkdir -p "$package_dir"
-  archive="$package_dir/otelcol-contrib-${otel_release_version}.tar.gz"
+service_was_active=0
+timer_was_active=0
+guard_was_active=0
+systemctl is-active --quiet superserve-otel-logs.service 2>/dev/null && service_was_active=1 || true
+systemctl is-active --quiet superserve-host-logging-heartbeat.timer 2>/dev/null && timer_was_active=1 || true
+systemctl is-active --quiet superserve-host-logging-queue-guard.service 2>/dev/null && guard_was_active=1 || true
+
+rollback() {
+  local rc=$?
+  [ "${activation_committed:-0}" -eq 1 ] && { cleanup; exit "$rc"; }
+  if [ "${changed_binary:-0}" -eq 1 ]; then restore_one binary "$binary"; fi
+  if [ "${changed_config:-0}" -eq 1 ]; then restore_one config "$active_config"; fi
+  if [ "${changed_service:-0}" -eq 1 ]; then restore_one service "$active_service"; fi
+  if [ "${changed_dropin:-0}" -eq 1 ]; then restore_one dropin "$dropin"; fi
+  if [ "${changed_identity_env:-0}" -eq 1 ]; then restore_one identity_env "$identity_env"; fi
+  if [ "${changed_heartbeat_service:-0}" -eq 1 ]; then restore_one heartbeat_service "$heartbeat_service"; fi
+  if [ "${changed_heartbeat_timer:-0}" -eq 1 ]; then restore_one heartbeat_timer "$heartbeat_timer"; fi
+  if [ "${changed_queue_guard_service:-0}" -eq 1 ]; then restore_one queue_guard_service "$queue_guard_service"; fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [ "$service_was_active" -eq 1 ]; then
+    systemctl restart superserve-otel-logs.service >/dev/null 2>&1 || true
+  else
+    systemctl stop superserve-otel-logs.service >/dev/null 2>&1 || true
+  fi
+  if [ "$timer_was_active" -eq 1 ]; then
+    systemctl start superserve-host-logging-heartbeat.timer >/dev/null 2>&1 || true
+  else
+    systemctl stop superserve-host-logging-heartbeat.timer >/dev/null 2>&1 || true
+  fi
+  if [ "$guard_was_active" -eq 1 ]; then
+    systemctl start superserve-host-logging-queue-guard.service >/dev/null 2>&1 || true
+  else
+    systemctl stop superserve-host-logging-queue-guard.service >/dev/null 2>&1 || true
+  fi
+  cleanup
+  exit "$rc"
+}
+
+# Trap is armed only after the complete pre-state has been recorded.
+trap rollback EXIT INT TERM
+activation_committed=0
+changed_binary=0
+changed_config=0
+changed_service=0
+changed_dropin=0
+changed_identity_env=0
+changed_heartbeat_service=0
+changed_heartbeat_timer=0
+changed_queue_guard_service=0
+
+used=$(du -sb "$queue" "$cursor" 2>/dev/null | awk '{total += $1} END {print total + 0}') || used=0
+allowance=$((used + used / 10 + 65536))
+test "$allowance" -le '${otel_queue_max_bytes}'
+free=$(df -Pk "$state_dir" 2>/dev/null | awk 'NR==2 {print $4 * 1024}')
+test -n "$free" && test "$free" -ge '${journal_keep_free_bytes}'
+
+# Validate the candidate with the exact release before changing active state.
+stage="$attempt/stage"
+mkdir -p "$stage"
+staged_binary=''
+if [ -x "$binary" ] && "$binary" --version 2>/dev/null | grep -F '${otel_release_version}' >/dev/null; then
+  staged_binary="$binary"
+else
+  archive="$attempt/otelcol-contrib-${otel_release_version}.tar.gz"
   timeout '${package_operation_timeout_seconds}s' curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 '${otel_release_url}' -o "$archive"
   echo '${otel_release_sha256}  '"$archive" | sha256sum -c - >/dev/null
-  stage="$package_dir/stage"
-  rm -rf "$stage"
-  mkdir -p "$stage"
   tar -xzf "$archive" -C "$stage"
-  staged=$(find "$stage" -type f -name otelcol-contrib -perm -u+x -print -quit)
-  test -n "$staged"
-  install -D -m 0755 "$staged" "$binary.new"
-  "$binary.new" validate --config "$candidate"
-  install -D -m 0755 "$binary.new" "$binary"
-  binary_changed=1
-else
-  "$binary" validate --config "$candidate"
+  staged_binary=$(find "$stage" -type f -name otelcol-contrib -perm -u+x -print -quit)
+  test -n "$staged_binary"
 fi
+"$staged_binary" validate --config "$candidate"
 
-if [ -f "$active_config" ]; then cp -a "$active_config" "$archive_dir/active-config.$$.bak"; had_config=1; fi
-if [ -f "$active_service" ]; then cp -a "$active_service" "$archive_dir/active-service.$$.bak"; had_service=1; fi
-if [ -f "$dropin" ]; then cp -a "$dropin" "$archive_dir/active-journald.$$.bak"; had_dropin=1; fi
-working_config="$archive_dir/active-config.$$.bak"
-working_service="$archive_dir/active-service.$$.bak"
-working_dropin="$archive_dir/active-journald.$$.bak"
-
-cat > "$dropin_candidate" <<'EOF'
+cat > "$attempt/journald.conf" <<'EOF'
 [Journal]
 Storage=persistent
 SystemMaxUse=${journal_max_use_bytes}B
 SystemKeepFree=${journal_keep_free_bytes}B
 EOF
-install -m 0644 "$dropin_candidate" "$dropin.new"
-systemd-analyze verify "$dropin.new" >/dev/null 2>&1 || true
-
-cat > "$state_dir/heartbeat.service.candidate" <<'EOF'
+cat > "$attempt/heartbeat.service" <<'EOF'
 [Unit]
 Description=Superserve host logging heartbeat
 
@@ -120,7 +152,7 @@ Description=Superserve host logging heartbeat
 Type=oneshot
 ExecStart=/bin/sh -c 'printf "{\\"host_logging_heartbeat\\":true,\\"heartbeat_epoch\\":%s}\\n" "$(date +%s)" | systemd-cat -t superserve-host-logging-heartbeat -p info'
 EOF
-cat > "$state_dir/heartbeat.timer.candidate" <<'EOF'
+cat > "$attempt/heartbeat.timer" <<'EOF'
 [Unit]
 Description=Superserve host logging heartbeat timer
 
@@ -132,34 +164,86 @@ Unit=superserve-host-logging-heartbeat.service
 [Install]
 WantedBy=timers.target
 EOF
-install -m 0644 "$state_dir/heartbeat.service.candidate" "$heartbeat_service.new"
-install -m 0644 "$state_dir/heartbeat.timer.candidate" "$heartbeat_timer.new"
+cat > "$attempt/queue-guard.service" <<EOF
+[Unit]
+Description=Bound Superserve OTel logs queue storage
+After=superserve-otel-logs.service
 
-changed=0
-cmp -s "$candidate" "$active_config" || changed=1
-cmp -s "$service_candidate" "$active_service" || changed=1
-cmp -s "$dropin.new" "$dropin" || changed=1
-cmp -s "$state_dir/heartbeat.service.candidate" "$heartbeat_service" || changed=1
-cmp -s "$state_dir/heartbeat.timer.candidate" "$heartbeat_timer" || changed=1
-if [ "$changed" -eq 1 ] || [ "$binary_changed" -eq 1 ]; then
-  install -m 0644 "$candidate" "$active_config.new"
-  install -m 0644 "$service_candidate" "$active_service.new"
-  install -m 0644 "$heartbeat_service.new" "$heartbeat_service"
-  install -m 0644 "$heartbeat_timer.new" "$heartbeat_timer"
-  install -m 0644 "$dropin.new" "$dropin"
-  mv -f "$active_config.new" "$active_config"
-  mv -f "$active_service.new" "$active_service"
-  systemctl daemon-reload
-  systemctl enable superserve-otel-logs.service >/dev/null
-  systemctl restart superserve-otel-logs.service
-  systemctl is-active --quiet superserve-otel-logs.service
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'while :; do used=\$(du -sb "$queue" "$cursor" 2>/dev/null | awk "{t += \\\$1} END {print t + 0}"); allowance=\$((used + used / 10 + 65536)); if [ "\$allowance" -gt ${otel_queue_max_bytes} ]; then logger -t superserve-otel-logs -p warning "queue_full retained_bytes=\$used budget=${otel_queue_max_bytes}"; systemctl stop superserve-otel-logs.service; exit 1; fi; sleep 2; done'
+Restart=always
+RestartSec=2s
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=${cursor} ${queue}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+install -m 0644 "$attempt/journald.conf" "$attempt/dropin.new"
+install -m 0644 "$attempt/heartbeat.service" "$attempt/heartbeat.service.new"
+install -m 0644 "$attempt/heartbeat.timer" "$attempt/heartbeat.timer.new"
+install -m 0644 "$attempt/queue-guard.service" "$attempt/queue-guard.service.new"
+systemd-analyze verify "$attempt/queue-guard.service.new" >/dev/null 2>&1
+
+printf 'HOST_ID=%s\nINSTANCE_ID=%s\nINCARNATION_ID=%s\n' "$host_id" "$instance_id" "$incarnation_id" > "$attempt/identity.env"
+chmod 0600 "$attempt/identity.env"
+
+mkdir -p "$cursor" "$queue"
+chmod 0700 "$cursor" "$queue"
+if [ "$staged_binary" != "$binary" ]; then
+  install -D -m 0755 "$staged_binary" "$binary"
+  changed_binary=1
+fi
+if ! cmp -s "$candidate" "$active_config" 2>/dev/null; then
+  install -D -m 0644 "$candidate" "$active_config"
+  changed_config=1
+fi
+if ! cmp -s "$service_candidate" "$active_service" 2>/dev/null; then
+  install -D -m 0644 "$service_candidate" "$active_service"
+  changed_service=1
+fi
+if ! cmp -s "$attempt/dropin.new" "$dropin" 2>/dev/null; then
+  install -D -m 0644 "$attempt/dropin.new" "$dropin"
+  changed_dropin=1
+fi
+if ! cmp -s "$attempt/identity.env" "$identity_env" 2>/dev/null; then
+  install -D -m 0600 "$attempt/identity.env" "$identity_env"
+  changed_identity_env=1
+fi
+if ! cmp -s "$attempt/heartbeat.service.new" "$heartbeat_service" 2>/dev/null; then
+  install -D -m 0644 "$attempt/heartbeat.service.new" "$heartbeat_service"
+  changed_heartbeat_service=1
+fi
+if ! cmp -s "$attempt/heartbeat.timer.new" "$heartbeat_timer" 2>/dev/null; then
+  install -D -m 0644 "$attempt/heartbeat.timer.new" "$heartbeat_timer"
+  changed_heartbeat_timer=1
+fi
+if ! cmp -s "$attempt/queue-guard.service.new" "$queue_guard_service" 2>/dev/null; then
+  install -D -m 0644 "$attempt/queue-guard.service.new" "$queue_guard_service"
+  changed_queue_guard_service=1
 fi
 
-systemctl enable superserve-otel-logs.service >/dev/null
-systemctl is-active --quiet superserve-otel-logs.service
 systemctl daemon-reload
+systemctl enable superserve-otel-logs.service >/dev/null
+systemctl enable superserve-host-logging-heartbeat.timer >/dev/null
+systemctl enable superserve-host-logging-queue-guard.service >/dev/null
+if [ "$changed_binary" -eq 1 ] || [ "$changed_config" -eq 1 ] || [ "$changed_service" -eq 1 ] || [ "$service_was_active" -eq 0 ]; then
+  systemctl restart superserve-otel-logs.service
+fi
+systemctl is-active --quiet superserve-otel-logs.service
 systemctl enable --now superserve-host-logging-heartbeat.timer >/dev/null
+systemctl enable --now superserve-host-logging-queue-guard.service >/dev/null
 systemctl is-active --quiet superserve-host-logging-heartbeat.timer
+systemctl is-active --quiet superserve-host-logging-queue-guard.service
+
+# Verify active state after enforcement; a successful command is not enough.
+cmp -s "$candidate" "$active_config"
+cmp -s "$service_candidate" "$active_service"
+"$binary" --version 2>/dev/null | grep -F '${otel_release_version}' >/dev/null
+"$binary" validate --config "$active_config" >/dev/null
 activation_committed=1
-rm -f "$archive_dir"/active-config.*.bak "$archive_dir"/active-service.*.bak "$archive_dir"/active-journald.*.bak "$archive_dir"/active-binary.*.bak "$archive_dir"/active-heartbeat-service.*.bak "$archive_dir"/active-heartbeat-timer.*.bak
-exit 0
+trap - EXIT INT TERM
+rm -rf -- "$attempt"
+exit 100

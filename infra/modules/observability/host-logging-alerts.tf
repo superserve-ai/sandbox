@@ -101,20 +101,19 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
     }
   }
 
-  # Monitoring conditions are typed one-per-block. Use PromQL absent_over_time
-  # over the logs-based metric so a never-seen host produces an explicit
-  # unhealthy result; condition_absent only evaluates series that already
-  # exist. The metric name is the Cloud Monitoring PromQL form of the
-  # logging.googleapis.com/user/... type.
+  # Delivery lag is a retained-history age sample emitted with each accepted
+  # record. It is intentionally independent from the heartbeat absence policy
+  # below: an exporter that is stopped or has never emitted a heartbeat cannot
+  # manufacture a lag sample, and is handled by the separate absence alert.
   conditions {
     display_name = "OTel logs delivery lag on ${each.value.instance_name}"
     condition_prometheus_query_language {
       query                     = <<-EOT
-        absent_over_time({
-          "__name__" = "logging_googleapis_com:user_${google_logging_metric.host_logging_heartbeat[each.key].name}",
+        max_over_time({
+          "__name__" = "logging_googleapis_com:user_${google_logging_metric.host_logging_delivery_lag[each.key].name}",
           "collector_host_id" = "${each.value.instance_id}",
           "monitored_resource" = "gce_instance"
-        }[${var.host_logging_alerts.lag_threshold_seconds}s]) == 1
+        }[${var.host_logging_alerts.lag_threshold_seconds}s]) > ${var.host_logging_alerts.lag_threshold_seconds}
       EOT
       duration                  = "0s"
       evaluation_interval       = "60s"
@@ -141,6 +140,21 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
     instance_name             = each.value.instance_name
     managed_by                = "terraform"
   })
+}
+
+resource "google_logging_metric" "host_logging_delivery_lag" {
+  for_each = local.active_host_logging_alerts
+
+  project         = var.project_id
+  name            = "superserve_host_logging_delivery_lag_${each.key}"
+  filter          = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"superserve_host_logs\") AND jsonPayload.host_logging_retained_history_lag_seconds:*"
+  value_extractor = "EXTRACT(jsonPayload.host_logging_retained_history_lag_seconds)"
+
+  metric_descriptor {
+    metric_kind = "GAUGE"
+    value_type  = "DOUBLE"
+    unit        = "s"
+  }
 }
 
 # The standalone metrics collector's self metric is independent of the OTel

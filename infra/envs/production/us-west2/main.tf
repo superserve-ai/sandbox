@@ -285,7 +285,6 @@ module "sandbox_host_b" {
   labels = merge(local.sandbox_host_labels, {
     component                  = "vmd"
     sandbox_role               = "vmd"
-    "goog-ops-agent-policy"    = "v2-template-1-7-0"
     "vanta-contains-user-data" = "true"
     "vanta-user-data-stored"   = "customer_sandbox_files_and_runtime_data"
   })
@@ -453,11 +452,13 @@ module "observability" {
 module "host_logging" {
   source = "../../../modules/host-logging"
 
-  project_id      = local.project_id
-  zone            = local.zone
-  environment     = local.environment
-  region          = local.region
-  assignment_name = "superserve-otel-host-logging-us-west2-a"
+  project_id         = local.project_id
+  zone               = local.zone
+  environment        = local.environment
+  region             = local.region
+  assignment_name    = "superserve-otel-host-logging-us-west2-a"
+  legacy_policy_name = "goog-ops-agent-v2-template-1-7-0-us-west2-a"
+  legacy_transition  = "preserve"
   selector_labels = {
     application = "sandbox-host"
     environment = local.environment

@@ -1,39 +1,101 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -u
 
+# OS Config ExecResource uses 100 for compliant, 101 for a repairable
+# divergence, and any other status for an evaluation error. This script is
+# read-only; reconciliation is the only operation that creates stores.
+# The active configuration is required to contain storage: file_storage/cursor
+# and storage: file_storage/queue; those references are verified by the
+# collector's validate command below without creating either store.
 state_dir=/var/lib/superserve/host-logging
 candidate='${candidate_config_path}'
 service_candidate="$state_dir/otel-logs.service.candidate"
+active_dir=/etc/superserve/host-logging
+active_config="$active_dir/otel-logs.yaml"
+active_service=/etc/systemd/system/superserve-otel-logs.service
+heartbeat_service=/etc/systemd/system/superserve-host-logging-heartbeat.service
+heartbeat_timer=/etc/systemd/system/superserve-host-logging-heartbeat.timer
+queue_guard_service=/etc/systemd/system/superserve-host-logging-queue-guard.service
+dropin=/etc/systemd/journald.conf.d/30-superserve-host-logging.conf
+identity_file=/etc/sandbox/host-identity.json
+identity_env=/etc/sandbox/host-logging-identity.env
 binary='${otel_binary_path}'
 cursor='${cursor_dir}'
 queue='${queue_dir}'
 
-test -s "$candidate"
-test -s "$service_candidate"
-test -s /etc/sandbox/host-identity.json
-grep -q '^receivers:' "$candidate"
-grep -q '^  journald:' "$candidate"
-grep -q 'storage: file_storage/cursor' "$candidate"
-grep -q 'storage: file_storage/queue' "$candidate"
-grep -q 'googlecloud:' "$candidate"
-grep -q 'filter/info_plus:' "$candidate"
-grep -q 'parse_application_message' "$candidate"
-grep -q 'clear_untrusted_body' "$candidate"
-grep -q 'host_logging.parse_outcome' "$candidate"
-grep -q 'ProtectSystem=strict' "$service_candidate"
+diverged=0
+unreadable=0
+mark_diverged() { diverged=1; }
+need_file() { [ -s "$1" ] || mark_diverged; }
+need_mode() {
+  local mode
+  mode=$(stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null) || { unreadable=1; return; }
+  [ "$mode" = "$2" ] || mark_diverged
+}
 
-test "$(stat -c '%a' "$candidate" 2>/dev/null || stat -f '%Lp' "$candidate")" = "644"
-test "$(stat -c '%a' "$service_candidate" 2>/dev/null || stat -f '%Lp' "$service_candidate")" = "644"
+need_file "$candidate"
+need_file "$service_candidate"
+need_file "$identity_file"
+need_file "$active_config"
+need_file "$active_service"
+need_file "$dropin"
+need_file "$heartbeat_service"
+need_file "$heartbeat_timer"
+need_file "$queue_guard_service"
+[ -x "$binary" ] || mark_diverged
+[ -d "$cursor" ] || mark_diverged
+[ -d "$queue" ] || mark_diverged
+need_mode "$candidate" 644
+need_mode "$service_candidate" 644
+need_mode "$active_config" 644
+need_mode "$active_service" 644
+need_mode "$dropin" 644
+need_mode "$cursor" 700
+need_mode "$queue" 700
 
-# The archive digest and release are checked by reconcile before activation;
-# this check only validates an already installed candidate without changing it.
-if [ -x "$binary" ]; then
-  "$binary" --version 2>/dev/null | grep -F '${otel_release_version}' >/dev/null
+if [ "$unreadable" -eq 0 ] && [ -x "$binary" ]; then
+  "$binary" --version 2>/dev/null | grep -F '${otel_release_version}' >/dev/null || mark_diverged
+  "$binary" validate --config "$active_config" >/dev/null 2>&1 || mark_diverged
 fi
 
-mkdir -p "$cursor" "$queue"
-chmod 0700 "$cursor" "$queue"
-test "${journal_max_use_bytes}" -gt 0
-test "${journal_keep_free_bytes}" -gt 0
-test "$(du -sb "$queue" | awk '{print $1}')" -le "${otel_queue_max_bytes}"
-exit 0
+cmp -s "$candidate" "$active_config" 2>/dev/null || mark_diverged
+cmp -s "$service_candidate" "$active_service" 2>/dev/null || mark_diverged
+grep -q '^ProtectSystem=strict$' "$active_service" 2>/dev/null || mark_diverged
+grep -q '^MemoryMax=' "$active_service" 2>/dev/null || mark_diverged
+grep -q '^CPUQuota=' "$active_service" 2>/dev/null || mark_diverged
+grep -q '^ReadWritePaths=.*${cursor_dir}.*${queue_dir}' "$active_service" 2>/dev/null || mark_diverged
+grep -q 'EnvironmentFile=-/etc/sandbox/host-logging-identity.env' "$active_service" 2>/dev/null || mark_diverged
+grep -q '^Storage=persistent$' "$dropin" 2>/dev/null || mark_diverged
+grep -q '^SystemMaxUse=${journal_max_use_bytes}B$' "$dropin" 2>/dev/null || mark_diverged
+grep -q '^SystemKeepFree=${journal_keep_free_bytes}B$' "$dropin" 2>/dev/null || mark_diverged
+
+if [ -s "$identity_file" ] && [ -s "$identity_env" ]; then
+  host_id=$(sed -n 's/.*"host_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
+  instance_id=$(sed -n 's/.*"instance_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
+  incarnation_id=$(sed -n 's/.*"incarnation_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$identity_file")
+  [ -n "$host_id" ] && [ -n "$instance_id" ] && [ -n "$incarnation_id" ] || unreadable=1
+  grep -Fqx "HOST_ID=$host_id" "$identity_env" || mark_diverged
+  grep -Fqx "INSTANCE_ID=$instance_id" "$identity_env" || mark_diverged
+  grep -Fqx "INCARNATION_ID=$incarnation_id" "$identity_env" || mark_diverged
+else
+  unreadable=1
+fi
+
+systemctl is-enabled --quiet superserve-otel-logs.service 2>/dev/null || mark_diverged
+systemctl is-active --quiet superserve-otel-logs.service 2>/dev/null || mark_diverged
+systemctl is-active --quiet superserve-host-logging-heartbeat.timer 2>/dev/null || mark_diverged
+systemctl is-active --quiet superserve-host-logging-queue-guard.service 2>/dev/null || mark_diverged
+
+# Include queue database, cursor/checkpoint files, compaction margin, and
+# collector bookkeeping. Validation never creates or repairs these paths.
+if [ -d "$queue" ] && [ -d "$cursor" ]; then
+  used=$(du -sb "$queue" "$cursor" 2>/dev/null | awk '{total += $1} END {print total + 0}') || unreadable=1
+  allowance=$((used + used / 10 + 65536))
+  [ "$allowance" -le '${otel_queue_max_bytes}' ] || mark_diverged
+  free=$(df -Pk "$state_dir" 2>/dev/null | awk 'NR==2 {print $4 * 1024}') || unreadable=1
+  [ -n "${free:-}" ] && [ "$free" -ge '${journal_keep_free_bytes}' ] || mark_diverged
+fi
+
+[ "$unreadable" -eq 0 ] || exit 1
+[ "$diverged" -eq 0 ] && exit 100
+exit 101

@@ -39,7 +39,7 @@ class HostLoggingConfigChecks(unittest.TestCase):
 
     def test_release_and_state_are_pinned_and_separate(self):
         self.assertRegex(self.variables, r'otel_release_version[^\n]+')
-        self.assertRegex(self.variables, r'default\s+=\s+"0\.104\.0"')
+        self.assertRegex(self.variables, r'default\s+=\s+"0\.119\.0"')
         self.assertRegex(self.variables, r'default\s+=\s+"[0-9a-f]{64}"')
         self.assertIn("file_storage/cursor", self.config)
         self.assertIn("file_storage/queue", self.config)

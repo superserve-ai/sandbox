@@ -545,6 +545,10 @@ module "host_logging" {
   environment     = local.environment
   region          = local.region
   assignment_name = "superserve-otel-host-logging-us-east4-a"
+  # Keep the existing zonal Ops Agent policy as an explicit legacy writer
+  # until staged OTel receipt, drain, and rollback evidence authorizes retire.
+  legacy_policy_name = "goog-ops-agent-v2-template-1-7-0-us-east4-a"
+  legacy_transition  = "preserve"
   selector_labels = {
     application = "sandbox-host"
     environment = local.environment

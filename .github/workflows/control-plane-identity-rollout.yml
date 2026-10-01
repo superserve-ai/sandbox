@@ -339,6 +339,11 @@ jobs:
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_proxy_frontend_steady_plan.py"
+          terraform show -json tfplan > "$RUNNER_TEMP/control-plane-identity/use4/plan.json"
+          if python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/control-plane-identity/use4/plan.json"; then
+            echo "This control-plane identity rollout path does not carry the host-logging staging evidence gate; reject logging mutations here." >&2
+            exit 1
+          fi
           identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/use4-contract.json"
@@ -467,6 +472,11 @@ jobs:
           terraform validate
           terraform plan -input=false -out=tfplan
           terraform show -json tfplan | python3 "$GITHUB_WORKSPACE/scripts/check_host2_migration_plan.py" --all-hosts
+          terraform show -json tfplan > "$RUNNER_TEMP/control-plane-identity/usw2/plan.json"
+          if python3 "$GITHUB_WORKSPACE/scripts/host_logging_plan_requires_evidence.py" "$RUNNER_TEMP/control-plane-identity/usw2/plan.json"; then
+            echo "This control-plane identity rollout path does not carry the host-logging staging evidence gate; reject logging mutations here." >&2
+            exit 1
+          fi
           identity_apply_started=true
           terraform apply -input=false -auto-approve tfplan
           terraform output -json controlplane_identity_contract > "$GITHUB_WORKSPACE/usw2-contract.json"

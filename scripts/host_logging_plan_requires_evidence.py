@@ -22,6 +22,7 @@ _CONTENT_RESOURCES = (
 )
 _ALERT_RESOURCES = (
     "google_logging_metric.host_logging_heartbeat",
+    "google_logging_metric.host_logging_delivery_lag",
     "google_monitoring_alert_policy.host_logging_export_failures",
     "google_monitoring_alert_policy.host_logging_lag",
     "google_monitoring_alert_policy.host_logging_heartbeat",
@@ -132,7 +133,8 @@ def _canonical_after(address, after):
             content = re.sub(r"(?m)^(labels\.region:\s*).*$", r"\1<deployment-region>", content)
             content = re.sub(r"(?m)^# [^:\n]+: host_id=\S+\s*$", "", content)
             copied["content"] = content
-    if ".google_monitoring_alert_policy.host_logging_" in address:
+    if (".google_monitoring_alert_policy.host_logging_" in address or
+            ".google_logging_metric.host_logging_" in address):
         def normalize_filter(value, key=None):
             if key == "filter" and isinstance(value, str):
                 for operand in ("instance_id", "project_id", "location", "zone"):
@@ -199,11 +201,16 @@ def requires_evidence(plan: dict) -> bool:
 
 def configuration_revision(plan: dict) -> str:
     for item in (plan.get("resource_changes") or []):
-        if item.get("address") != "module.host_logging.google_storage_bucket_object.otel_config":
+        address = item.get("address", "")
+        if not (address == "module.host_logging.google_storage_bucket_object.otel_config" or
+                address.startswith("module.host_logging.google_storage_bucket_object.otel_config[")):
             continue
         name = ((item.get("change") or {}).get("after") or {}).get("name", "")
         parts = name.split("/")
-        if len(parts) >= 2 and parts[-1] == "config.yaml":
+        # The module emits the OTel configuration under this exact object
+        # name. Keep the revision tied to the rendered artifact rather than
+        # accepting an obsolete generic config.yaml basename.
+        if len(parts) >= 2 and parts[-1] == "otel-logs.yaml":
             return parts[-2]
     return ""
 

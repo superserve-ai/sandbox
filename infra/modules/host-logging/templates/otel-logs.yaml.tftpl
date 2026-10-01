@@ -1,5 +1,5 @@
-# Managed by Terraform/OS Config. OTel Contrib ${release_version}; logs state is separate from the
-# existing metrics collector and from any legacy collector state.
+# Managed by Terraform/OS Config. OTel Contrib ${release_version}; the logs
+# process has independent cursor and queue state from the metrics collector.
 extensions:
   file_storage/cursor:
     directory: ${cursor_dir}
@@ -19,44 +19,83 @@ receivers:
       - ${unit}
 %{ endfor ~}
     operators:
-      # Journal fields are captured before MESSAGE is parsed. They are the
-      # authoritative source for host provenance and source selection.
-      - id: preserve_journal_metadata
-        type: move
-        from: attributes
-        to: resource.attributes["journal.metadata"]
+      # Copy only bounded, trusted journal provenance. The receiver's complete
+      # metadata map is never moved to a resource or sent to Cloud Logging.
+      - id: copy_trusted_unit
+        type: copy
+        from: attributes["_SYSTEMD_UNIT"]
+        to: attributes["journal.unit"]
+      - id: copy_trusted_transport
+        type: copy
+        from: attributes["_TRANSPORT"]
+        to: attributes["journal.transport"]
+      - id: copy_trusted_hostname
+        type: copy
+        from: attributes["_HOSTNAME"]
+        to: attributes["journal.hostname"]
+      - id: copy_trusted_pid
+        type: copy
+        from: attributes["_PID"]
+        to: attributes["journal.pid"]
+      - id: copy_trusted_boot
+        type: copy
+        from: attributes["_BOOT_ID"]
+        to: attributes["journal.boot_id"]
+      - id: copy_trusted_timestamp
+        type: copy
+        from: attributes["__REALTIME_TIMESTAMP"]
+        to: attributes["journal.original_timestamp"]
+      - id: classify_application_unit
+        type: add
+        field: attributes["host_logging.application_record"]
+        value: true
+        if: 'IsMatch(attributes["journal.unit"], "^(superserve-vmd|proxy(-[^.]*)?)\\.service$")'
+      - id: preserve_message_for_parse
+        type: copy
+        from: body
+        to: attributes["journal.original_message"]
       - id: parse_application_message
         type: json_parser
-        parse_from: body
+        parse_from: attributes["journal.original_message"]
         parse_to: attributes["application"]
         on_error: send
       - id: mark_parse_failure
         type: add
         field: attributes["host_logging.parse_outcome"]
         value: failure
-        if: 'attributes["application"] == nil'
-      - id: mark_export_failure
-        type: add
-        field: attributes["host_logging_export_error"]
-        value: "true"
-        if: 'resource.attributes["journal.metadata"]["_SYSTEMD_UNIT"] == "superserve-otel-logs.service" and IsMatch(body, "(?i)(export failed|permission denied|drop|dropped)")'
+        if: 'attributes["host_logging.application_record"] == true and attributes["application"] == nil'
       - id: mark_parse_success
         type: add
         field: attributes["host_logging.parse_outcome"]
         value: success
-        if: 'attributes["application"] != nil'
+        if: 'attributes["host_logging.application_record"] == true and attributes["application"] != nil'
+      - id: mark_export_failure
+        type: add
+        field: attributes["host_logging_export_error"]
+        value: "true"
+        if: 'attributes["journal.unit"] == "superserve-otel-logs.service" and IsMatch(attributes["journal.original_message"], "(?i)(export failed|permission denied|drop|dropped)")'
+      # This named step is intentionally a move into a short-lived private
+      # field. The transform processor below restores only approved diagnostic
+      # text for non-application records and removes the field before export.
       - id: clear_untrusted_body
         type: move
         from: body
         to: attributes["host_logging.raw_body_discarded"]
-      - id: set_trusted_unit
-        type: copy
-        from: resource.attributes["journal.metadata"]["_SYSTEMD_UNIT"]
-        to: attributes["journal.unit"]
-      - id: set_trusted_transport
-        type: copy
-        from: resource.attributes["journal.metadata"]["_TRANSPORT"]
-        to: attributes["journal.transport"]
+      - id: retain_bounded_journal_fields
+        type: retain
+        fields:
+          - body
+          - attributes.journal.unit
+          - attributes.journal.transport
+          - attributes.journal.hostname
+          - attributes.journal.pid
+          - attributes.journal.boot_id
+          - attributes.journal.original_timestamp
+          - attributes.host_logging.application_record
+          - attributes.host_logging.parse_outcome
+          - attributes.host_logging.raw_body_discarded
+          - attributes.host_logging_export_error
+          - attributes.application
 
 processors:
   filter/approved_sources:
@@ -69,31 +108,42 @@ processors:
     log_statements:
       - context: log
         statements:
-          # The journald receiver's time is authoritative and is intentionally
-          # left unchanged, preserving the original event timestamp.
-          # Severity is parsed from application data before INFO+ filtering;
-          # journal priority is not trusted for application DEBUG records.
-          - set(severity_text, attributes["application"]["level"]) where attributes["application"]["level"] != nil
-          - set(severity_text, attributes["application"]["severity"]) where severity_text == "" and attributes["application"]["severity"] != nil
+          # Restore useful selected systemd/kernel diagnostics, but only from
+          # the isolated journal message and never from application JSON.
+          - set(body, attributes["host_logging.raw_body_discarded"]) where attributes["host_logging.application_record"] != true
+          - set(body, "collector export failure") where attributes["host_logging_export_error"] == "true"
+          - set(severity_text, attributes["application"]["level"]) where attributes["host_logging.application_record"] == true and IsString(attributes["application"]["level"])
+          - set(severity_text, attributes["application"]["severity"]) where severity_text == "" and attributes["host_logging.application_record"] == true and IsString(attributes["application"]["severity"])
           - set(severity_number, SEVERITY_NUMBER_DEBUG) where severity_text == "debug" or severity_text == "DEBUG"
           - set(severity_number, SEVERITY_NUMBER_INFO) where severity_text == "info" or severity_text == "INFO"
           - set(severity_number, SEVERITY_NUMBER_WARN) where severity_text == "warn" or severity_text == "warning" or severity_text == "WARN"
           - set(severity_number, SEVERITY_NUMBER_ERROR) where severity_text == "error" or severity_text == "ERROR"
           - set(severity_number, SEVERITY_NUMBER_FATAL) where severity_text == "fatal" or severity_text == "FATAL"
-          - set(attributes["host_logging.parse_outcome"], "failure") where attributes["host_logging.parse_outcome"] == nil
+          - set(attributes["host_logging.parse_outcome"], "failure") where attributes["host_logging.application_record"] == true and attributes["host_logging.parse_outcome"] == nil
           - set(resource.attributes["host_id"], "$${env:HOST_ID}")
           - set(resource.attributes["provider_instance_id"], "$${env:INSTANCE_ID}")
           - set(resource.attributes["incarnation"], "$${env:INCARNATION_ID}")
           - set(resource.attributes["environment"], "${environment}")
           - set(resource.attributes["region"], "${region}")
           - set(attributes["unit"], attributes["journal.unit"])
-          - set(attributes["labels"], {}) where attributes["labels"] == nil
+          - set(attributes["source"], attributes["journal.transport"])
+          - set(attributes["generation"], attributes["journal.unit"]) where IsMatch(attributes["journal.unit"], "^proxy-")
+          - set(attributes["request_id"], attributes["application"]["request_id"]) where attributes["host_logging.parse_outcome"] == "success" and IsString(attributes["application"]["request_id"])
+          - set(attributes["sandbox_id"], attributes["application"]["sandbox_id"]) where attributes["host_logging.parse_outcome"] == "success" and IsString(attributes["application"]["sandbox_id"])
+          - set(attributes["event"], attributes["application"]["event"]) where attributes["host_logging.parse_outcome"] == "success" and IsString(attributes["application"]["event"])
+          - set(attributes["message"], attributes["application"]["message"]) where attributes["host_logging.parse_outcome"] == "success" and IsString(attributes["application"]["message"])
+          - set(body, attributes["event"]) where attributes["event"] != nil
+          - set(body, attributes["message"]) where attributes["event"] == nil and attributes["message"] != nil
+          - set(attributes["labels"], {})
           - set(attributes["labels"]["journal_unit"], attributes["journal.unit"])
           - set(attributes["labels"]["host_logging_heartbeat"], true) where attributes["journal.unit"] == "superserve-host-logging-heartbeat.service"
-          - set(attributes["generation"], attributes["journal.unit"]) where IsMatch(attributes["journal.unit"], "^proxy-")
-          - set(attributes["request_id"], attributes["application"]["request_id"]) where attributes["application"]["request_id"] != nil
-          - set(attributes["sandbox_id"], attributes["application"]["sandbox_id"]) where attributes["application"]["sandbox_id"] != nil
           - set(attributes["heartbeat"], true) where attributes["journal.unit"] == "superserve-host-logging-heartbeat.service"
+          # This is a delivery-age sample relative to the retained journal
+          # timestamp, not a heartbeat/absence signal. Cloud Monitoring uses
+          # it only for the retained-history lag policy below.
+          - set(attributes["host_logging_retained_history_lag_seconds"], (UnixNano(Now()) - time_unix_nano) / 1000000000) where time_unix_nano < UnixNano(Now())
+          # Explicitly reject nested/special application keys and all raw
+          # application maps. Only the scalar fields above cross the boundary.
           - delete_key(attributes["application"], "host_id")
           - delete_key(attributes["application"], "instance_id")
           - delete_key(attributes["application"], "incarnation")
@@ -103,17 +153,17 @@ processors:
           - delete_key(attributes["application"], "httpRequest")
           - delete_key(attributes["application"], "trace")
           - delete_key(attributes["application"], "authorization")
-          - set(body, attributes["application"]["event"]) where attributes["host_logging.parse_outcome"] == "success" and attributes["application"]["event"] != nil
           - delete_key(attributes, "application")
+          - delete_key(attributes, "journal.original_message")
           - delete_key(attributes, "host_logging.raw_body_discarded")
+          # Malformed application records have no body; trusted metadata and
+          # the real failure marker remain. Valid records keep approved text.
+
   filter/info_plus:
     error_mode: ignore
     logs:
       log_record:
         - 'severity_number < SEVERITY_NUMBER_INFO'
-  batch:
-    timeout: 2s
-    send_batch_size: 256
 
 exporters:
   googlecloud:
@@ -122,8 +172,9 @@ exporters:
     sending_queue:
       enabled: true
       storage: file_storage/queue
-      # Record count bounds batching; the reconciliation/validation contract
-      # separately enforces the Terraform queue byte budget.
+      # queue_size bounds records; the Terraform-managed queue-guard service
+      # bounds bytes including the database, cursor, compaction margin, and
+      # checkpoint overhead and stops the exporter before physical exhaustion.
       queue_size: 4096
       num_consumers: 2
     retry_on_failure:
@@ -137,7 +188,10 @@ service:
   pipelines:
     logs:
       receivers: [journald]
-      processors: [filter/approved_sources, transform/trusted_payload, filter/info_plus, batch]
+      # There is intentionally no asynchronous batch processor before the
+      # persistent exporter queue. Receiver acceptance is handed directly to
+      # the queue so a crash cannot strand an acknowledged batch in memory.
+      processors: [filter/approved_sources, transform/trusted_payload, filter/info_plus]
       exporters: [googlecloud]
   telemetry:
     logs:

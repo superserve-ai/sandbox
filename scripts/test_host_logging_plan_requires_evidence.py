@@ -52,6 +52,17 @@ def plan(environment, region, hosts):
 
 
 class HostLoggingDigestTests(unittest.TestCase):
+    def test_configuration_revision_uses_emitted_otel_artifact(self):
+        rendered = {
+            "resource_changes": [{
+                "address": 'module.host_logging.google_storage_bucket_object.otel_config["host"]',
+                "change": {"after": {"name": "assignment/rev/otel-logs.yaml"}},
+            }]
+        }
+        self.assertEqual(MODULE.configuration_revision(rendered), "rev")
+        rendered["resource_changes"][0]["change"]["after"]["name"] = "assignment/rev/config.yaml"
+        self.assertEqual(MODULE.configuration_revision(rendered), "")
+
     def test_equivalent_environment_and_host_substitutions_share_digest(self):
         staging = plan("staging", "us-central1", ["sandbox_host", "sandbox_host_b"])
         production = plan("production", "us-west2", ["sandbox_host_b"])

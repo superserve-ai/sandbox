@@ -9,6 +9,7 @@ User=root
 Group=root
 EnvironmentFile=-/etc/sandbox/host-identity.env
 EnvironmentFile=-/etc/sandbox/host-logging-identity.env
+Environment=OTEL_QUEUE_MAX_BYTES=${queue_max_bytes}
 ExecStart=${binary_path} --config ${config_path}
 Restart=on-failure
 RestartSec=5s

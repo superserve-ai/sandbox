@@ -369,9 +369,8 @@ module "sandbox_host" {
   tags        = ["superserve-vmd"]
 
   labels = merge(local.sandbox_host_labels, {
-    component               = "vmd-staging-draining"
-    sandbox_role            = "vmd"
-    "goog-ops-agent-policy" = "v2-template-1-7-0"
+    component    = "vmd-staging-draining"
+    sandbox_role = "vmd"
   })
 
   service_account_email = module.iam.service_account_emails["superserve_api"]
@@ -441,9 +440,8 @@ module "sandbox_host_b" {
   tags        = ["superserve-vmd"]
 
   labels = merge(local.sandbox_host_labels, {
-    component               = "vmd"
-    sandbox_role            = "vmd"
-    "goog-ops-agent-policy" = "v2-template-1-7-0"
+    component    = "vmd"
+    sandbox_role = "vmd"
   })
 
   service_account_email     = google_service_account.vmd_runtime.email
@@ -712,11 +710,12 @@ module "observability" {
 module "host_logging" {
   source = "../../../modules/host-logging"
 
-  project_id      = local.project_id
-  zone            = local.zone
-  environment     = local.environment
-  region          = local.region
-  assignment_name = "superserve-otel-host-logging-us-central1-a"
+  project_id        = local.project_id
+  zone              = local.zone
+  environment       = local.environment
+  region            = local.region
+  assignment_name   = "superserve-otel-host-logging-us-central1-a"
+  legacy_transition = "preserve"
   selector_labels = {
     application = "sandbox-host"
     environment = local.environment

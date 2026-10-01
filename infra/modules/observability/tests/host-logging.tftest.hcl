@@ -49,7 +49,7 @@ run "host_logging_alerts_contract" {
       for policy in values(google_monitoring_alert_policy.host_logging_lag) :
       alltrue([for condition in policy.conditions : (
         (length(condition.condition_prometheus_query_language) == 1 &&
-          strcontains(one(condition.condition_prometheus_query_language).query, "absent_over_time(") &&
+        strcontains(one(condition.condition_prometheus_query_language).query, "max_over_time(") &&
         one(condition.condition_prometheus_query_language).disable_metric_validation)
       )])
     ])

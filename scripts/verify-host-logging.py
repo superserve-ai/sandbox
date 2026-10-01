@@ -14,6 +14,8 @@ REQUIRED_FILES = (
     "infra/modules/host-logging/templates/reconcile.sh.tftpl",
     "infra/modules/host-logging/templates/validate.sh.tftpl",
     "infra/modules/observability/host-logging-alerts.tf",
+    ".github/workflows/control-plane-identity-rollout.yml",
+    "scripts/host_logging_plan_requires_evidence.py",
 )
 
 EXPORT_FAILURE_MESSAGE_PATTERN = re.compile(
@@ -41,7 +43,8 @@ def verify(root: Path) -> list[str]:
     normalized_alerts = alerts.replace(r'\"', '"')
 
     for required in ("journald:", "file_storage/cursor", "file_storage/queue", "googlecloud:",
-                     "parse_application_message", "filter/info_plus", "host_logging.parse_outcome"):
+                     "parse_application_message", "filter/info_plus", "host_logging.parse_outcome",
+                     "retain_bounded_journal_fields", "processors: [filter/approved_sources"):
         if required not in config:
             errors.append(f"OTel config missing {required} contract")
     for required in ("google_os_config_os_policy_assignment", "roles/logging.logWriter",
@@ -49,7 +52,8 @@ def verify(root: Path) -> list[str]:
         if required not in module and required not in service:
             errors.append(f"Terraform host logging module missing {required}")
     for required in ("otelcol-contrib", "sha256sum", "validate --config", "activation_committed=1",
-                     "trap rollback EXIT", "superserve-otel-logs.service"):
+                     "trap rollback EXIT", "superserve-otel-logs.service", "queue_full",
+                     "mktemp -d", "snapshot config", "restore_one"):
         if required not in reconcile:
             errors.append(f"reconciliation missing {required}")
     if "superserve-otel-collector.service" in service:
@@ -60,12 +64,22 @@ def verify(root: Path) -> list[str]:
         errors.append("selected OTel release must carry a pinned SHA-256 digest")
     if "log_id(\"superserve_host_logs\")" not in normalized_alerts:
         errors.append("export failure alert must consume the OTel host-log stream")
-    if "absent(" not in normalized_alerts or "absent_over_time(" not in normalized_alerts:
+    if "absent(" not in normalized_alerts or "max_over_time(" not in normalized_alerts:
         errors.append("alerts must cover never-seen hosts and retained-history lag")
     if "otelcol_process_uptime" not in alerts and "heartbeat_metric_type" not in alerts:
         errors.append("missing-heartbeat alert must remain independent of log export")
     if "storage: file_storage/cursor" not in validate or "storage: file_storage/queue" not in validate:
         errors.append("validation must check persistent cursor and queue state")
+    if "exit 100" not in validate or "exit 101" not in validate:
+        errors.append("OS Config validation must distinguish compliant 100 from repairable 101")
+    if "exit 100" not in reconcile:
+        errors.append("reconciliation must return OS Config compliant status 100 after active verification")
+    rollout = (root / ".github/workflows/control-plane-identity-rollout.yml").read_text()
+    if rollout.count("host_logging_plan_requires_evidence.py") < 2:
+        errors.append("both identity rollout production paths must reject ungated host-logging mutations")
+    revision = (root / "scripts/host_logging_plan_requires_evidence.py").read_text()
+    if 'parts[-1] == "otel-logs.yaml"' not in revision:
+        errors.append("promotion revision extraction must use the emitted otel-logs.yaml artifact")
     return errors
 
 

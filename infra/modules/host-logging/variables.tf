@@ -29,6 +29,22 @@ variable "assignment_revision" {
   default     = "2026-10-01-otel-1"
 }
 
+variable "legacy_policy_name" {
+  description = "Existing legacy log-policy identity retained during an explicit Terraform-owned migration; null means preserve it outside this module."
+  type        = string
+  default     = null
+}
+
+variable "legacy_transition" {
+  description = "Guarded legacy-policy transition state; no state silently replaces or retires a legacy writer."
+  type        = string
+  default     = "preserve"
+  validation {
+    condition     = contains(["preserve", "verify", "overlap", "drain", "retire", "rollback"], var.legacy_transition)
+    error_message = "legacy_transition must be an explicit preserve, verify, overlap, drain, retire, or rollback state."
+  }
+}
+
 variable "selector_labels" {
   description = "Narrow labels selecting only intended serving hosts."
   type        = map(string)
@@ -70,7 +86,10 @@ variable "journal_keep_free_bytes" {
 variable "otel_release_version" {
   description = "Pinned released OpenTelemetry Collector Contrib version."
   type        = string
-  default     = "0.104.0"
+  # Logs are pinned independently from the existing metrics collector. This
+  # release is selected for the journald, transform, file-storage, and
+  # Cloud-Logging components used by this module.
+  default = "0.119.0"
   validation {
     condition     = can(regex("^0\\.[0-9]+\\.[0-9]+$", var.otel_release_version))
     error_message = "otel_release_version must be a pinned semantic release."
@@ -80,7 +99,7 @@ variable "otel_release_version" {
 variable "otel_release_url" {
   description = "Authenticated package URL for the selected amd64 OTel Contrib release."
   type        = string
-  default     = "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.104.0/otelcol-contrib_0.104.0_linux_amd64.tar.gz"
+  default     = "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.119.0/otelcol-contrib_0.119.0_linux_amd64.tar.gz"
   validation {
     condition     = can(regex("^https://", var.otel_release_url))
     error_message = "otel_release_url must use HTTPS."

@@ -52,6 +52,7 @@ locals {
     config_path     = "/etc/superserve/host-logging/otel-logs.yaml"
     cursor_dir      = local.cursor_dir
     queue_dir       = local.queue_dir
+    queue_max_bytes = var.otel_queue_max_bytes
     memory_limit_mb = var.otel_memory_limit_mb
     cpu_limit       = var.otel_cpu_limit
   })
@@ -211,6 +212,10 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
   lifecycle {
     prevent_destroy = true
     precondition {
+      condition     = var.legacy_policy_name == null || var.legacy_policy_name != var.assignment_name
+      error_message = "The dedicated OTel assignment must not reuse the legacy policy identity."
+    }
+    precondition {
       condition     = var.journal_max_use_bytes > 0 && var.journal_keep_free_bytes > 0
       error_message = "Journald limits must be positive."
     }
@@ -268,4 +273,8 @@ resource "google_storage_bucket_iam_member" "artifact_reader" {
 
 output "assignment_name" {
   value = google_os_config_os_policy_assignment.host_logging.name
+}
+
+output "legacy_transition" {
+  value = var.legacy_transition
 }
