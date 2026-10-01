@@ -89,9 +89,6 @@ func creationReferences(ctx context.Context, identity hostidentity.Identity) ([]
 	rows, err := tx.Query(ctx, `SELECT s.id::text, s.host_id, s.created_at,
 		COALESCE(snapshot_path,''), COALESCE(mem_path,''), COALESCE(base_path,''), COALESCE(delta_path,'')
 		FROM sandbox s WHERE s.host_id=$1 AND s.destroyed_at IS NULL
-		  AND (s.status <> 'failed'
-		    OR EXISTS (SELECT 1 FROM retained_storage_interval i WHERE i.owner_kind='sandbox' AND i.owner_id=s.id AND i.ended_at IS NULL)
-		    OR EXISTS (SELECT 1 FROM sandbox_storage_interval i WHERE i.sandbox_id=s.id AND i.ended_at IS NULL))
 		ORDER BY s.id LIMIT $2`, host, retainedstorage.MaxOwners+1)
 	if err != nil {
 		return nil, nil, err

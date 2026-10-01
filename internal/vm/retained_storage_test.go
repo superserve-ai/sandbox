@@ -183,6 +183,23 @@ func TestRetainedRecordsSkipsMalformedUnrelatedEntriesBeforeDecode(t *testing.T)
 	}
 }
 
+func TestRetainedLiveRecordsRejectsOversizedEncodedInputBeforeDecode(t *testing.T) {
+	state, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	ownerID := uuid.NewString()
+	if err := state.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketName).Put([]byte(ownerID), bytes.Repeat([]byte{'x'}, retainedstorage.MaxPayloadBytes+1))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.retainedLiveRecordsContext(context.Background()); err == nil {
+		t.Fatal("oversized encoded record was decoded instead of rejected")
+	}
+}
+
 func TestRetainedInventoryFencesSavedSnapshotLock(t *testing.T) {
 	root := t.TempDir()
 	state, err := OpenStateStore(filepath.Join(root, "state.db"))

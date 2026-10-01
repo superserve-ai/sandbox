@@ -1046,12 +1046,14 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 	}
 
 	if len(onDisk) == 0 {
+		r.retireArchivedOrphans(ctx, snapshotTime, dbSandboxes, active, recent, log)
 		return
 	}
 
 	orphans := selectOrphanDirs(onDisk, keep, cutoff)
 	if len(orphans) == 0 {
 		log.Info().Int("on_disk", len(onDisk)).Msg("disk scan: no orphan dirs")
+		r.retireArchivedOrphans(ctx, snapshotTime, dbSandboxes, active, recent, log)
 		return
 	}
 
@@ -1080,6 +1082,74 @@ func (r *Reconciler) detectDiskOrphans(ctx context.Context, snapshotTime time.Ti
 
 	if r.cfg.DiskReclaimEnabled {
 		r.reclaimDiskOrphans(ctx, snapshotTime, orphans, onDisk, dbSandboxes)
+	}
+	// Re-scan after quarantine so newly invalidated archived paths can be
+	// retired in the same bounded background pass. Existing archives whose
+	// paths were quarantined on an earlier pass are handled by the same helper.
+	r.retireArchivedOrphans(ctx, snapshotTime, dbSandboxes, active, recent, log)
+}
+
+// retireArchivedOrphans removes retained metadata whose control-plane owner
+// has authoritatively ended. This runs in the normal reconciler, rather than
+// only in the stopped-daemon maintenance command, so quarantine cannot leave
+// an archived path poisoning every later inventory. Failed/non-destroyed
+// owners remain protected by dbSandboxes; recently destroyed and active IDs
+// are protected independently as well.
+func (r *Reconciler) retireArchivedOrphans(ctx context.Context, now time.Time, dbSandboxes map[string]db.ListSandboxesByHostRow, active map[string]bool, recent []uuid.UUID, log zerolog.Logger) {
+	recentSet := make(map[string]struct{}, len(recent))
+	for _, id := range recent {
+		recentSet[id.String()] = struct{}{}
+	}
+	records, err := r.mgr.state.retainedArchivedRecordsContext(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("archived retained-owner scan failed — leaving metadata for retry")
+		return
+	}
+	for _, rec := range records {
+		if ctx.Err() != nil {
+			return
+		}
+		id := rec.ID
+		if _, ok := dbSandboxes[id]; ok {
+			continue
+		}
+		if active[id] {
+			continue
+		}
+		if _, ok := recentSet[id]; ok {
+			continue
+		}
+		if !r.gracePeriodElapsed("archived-orphan:"+id, now) {
+			continue
+		}
+		// Do not retire metadata while a retained dependency is still present.
+		// Successful quarantine (or prior deletion) makes every durable path
+		// absent; inspection failures remain retryable and preserve the archive.
+		paths := []string{rec.DiskPath, rec.BasePath, rec.SnapshotPath, rec.MemFilePath,
+			rec.BaseMemPath, rec.RootfsPath}
+		paths = append(paths, rec.StrandedOverlays...)
+		present, inspectFailed := false, false
+		for _, path := range paths {
+			if path == "" {
+				continue
+			}
+			_, statErr := os.Lstat(path)
+			switch {
+			case statErr == nil:
+				present = true
+			case !os.IsNotExist(statErr):
+				inspectFailed = true
+			}
+		}
+		if present || inspectFailed {
+			continue
+		}
+		if err := r.mgr.state.RetireRetainingStorage(id); err != nil {
+			log.Warn().Err(err).Str("vm_id", id).Msg("archived retained-owner retirement failed — retrying")
+			continue
+		}
+		r.clearDrift("archived-orphan:" + id)
+		log.Warn().Str("vm_id", id).Msg("retired archived retained owner after authoritative orphan confirmation")
 	}
 }
 

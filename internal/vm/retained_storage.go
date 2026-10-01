@@ -45,6 +45,14 @@ func (s *StateStore) retainedLiveRecordsContext(ctx context.Context) ([]VMRecord
 			if visited > retainedstorage.MaxVisitedEntries {
 				return fmt.Errorf("retained record scan budget exceeded")
 			}
+			// Charge encoded input before any key filtering or JSON decode. A
+			// UUID-keyed oversized record must not allocate an unbounded decode
+			// buffer inside the Bolt read transaction, and excluded records still
+			// consume the scan's independent input budget.
+			bytes += len(k) + len(v)
+			if bytes > retainedstorage.MaxPayloadBytes {
+				return fmt.Errorf("retained record budget exceeded")
+			}
 			// The records bucket also contains build and warm-pool entries. Their
 			// values are not part of retained inventory, so reject non-UUID keys
 			// before decoding them; a large unrelated fleet must not consume the
@@ -68,10 +76,6 @@ func (s *StateStore) retainedLiveRecordsContext(ctx context.Context) ([]VMRecord
 			}
 			if len(records) >= retainedstorage.MaxOwners {
 				return fmt.Errorf("retained owner budget exceeded")
-			}
-			bytes += len(k) + len(v)
-			if bytes > retainedstorage.MaxPayloadBytes {
-				return fmt.Errorf("retained record budget exceeded")
 			}
 			records = append(records, rec)
 			return nil

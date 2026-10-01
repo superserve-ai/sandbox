@@ -35,6 +35,12 @@ WITH team_cutovers AS MATERIALIZED (
 ), artifact_refs AS (
   SELECT s.interval_host_id,s.team_cutover,p.path,
    CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path ELSE s.base_path END baseline_path,
+   CASE
+     WHEN p.path=CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path ELSE s.base_path END
+       THEN CASE WHEN t.id IS NOT NULL THEN 'template:'||t.id::text
+                 WHEN s.snapshot_id IS NOT NULL THEN 'snapshot:'||s.snapshot_id::text END
+     ELSE 'private:'||s.sandbox_id::text||':'||p.path
+   END allocation_identity,
    MAX(COALESCE(am.allocated_bytes,0))::numeric/1048576.0 artifact_mib,
    GREATEST(s.billing_started_at,p_start) range_start,
    LEAST(COALESCE(s.retention_end,billing_request_now()),p_end) range_end
@@ -44,6 +50,12 @@ WITH team_cutovers AS MATERIALIZED (
   WHERE p.path IS NOT NULL
   GROUP BY s.interval_host_id,s.team_cutover,p.path,
    CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path ELSE s.base_path END,
+   CASE
+     WHEN p.path=CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path ELSE s.base_path END
+       THEN CASE WHEN t.id IS NOT NULL THEN 'template:'||t.id::text
+                 WHEN s.snapshot_id IS NOT NULL THEN 'snapshot:'||s.snapshot_id::text END
+     ELSE 'private:'||s.sandbox_id::text||':'||p.path
+   END,
    s.billing_started_at,s.retention_end
 ), pre_ranges AS (
   SELECT path,MAX(artifact_mib) artifact_mib,
@@ -51,22 +63,74 @@ WITH team_cutovers AS MATERIALIZED (
   FROM artifact_refs
   WHERE range_end>range_start AND (team_cutover IS NULL OR range_start<team_cutover)
   GROUP BY path
+), retained_baselines AS (
+  -- A retained interval suppresses a legacy artifact only when its baseline
+  -- identity is established by the same template/snapshot generation. Host
+  -- and time remain part of the match; an unrelated retained owner must not
+  -- erase a legacy baseline merely because it shares a machine.
+  SELECT r.host_id,r.team_id,
+   CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path ELSE s.base_path END baseline_path,
+   CASE WHEN t.id IS NOT NULL THEN 'template:'||t.id::text
+        WHEN s.snapshot_id IS NOT NULL THEN 'snapshot:'||s.snapshot_id::text END allocation_identity,
+   r.started_at,r.ended_at
+  FROM retained_storage_interval r
+  JOIN sandbox s ON s.id=r.owner_id AND r.owner_kind='sandbox'
+  LEFT JOIN template t ON t.id=s.template_id
+  WHERE r.team_id=p_team
+  UNION ALL
+  SELECT r.host_id,r.team_id,ss.base_path,
+   CASE WHEN ss.template_id IS NOT NULL THEN 'template:'||ss.template_id::text END,
+   r.started_at,r.ended_at
+  FROM retained_storage_interval r
+  JOIN sandbox_snapshot ss ON ss.id=r.owner_id AND r.owner_kind='snapshot'
+  WHERE r.team_id=p_team
 ), post_ranges AS (
-  SELECT ar.interval_host_id,ar.path,MAX(ar.artifact_mib) artifact_mib,
-   range_agg(tstzrange(GREATEST(ar.range_start,ar.team_cutover),ar.range_end,'[)')) retained_ranges
-  FROM artifact_refs ar
-  WHERE ar.team_cutover IS NOT NULL AND ar.range_end>GREATEST(ar.range_start,ar.team_cutover)
-    -- Keep private deltas billable; only the shared baseline is owned by the
-    -- retained extent union.
-    AND ar.path=ar.baseline_path
+  SELECT seg.interval_host_id,seg.path,seg.allocation_identity,
+   MAX(seg.artifact_mib) artifact_mib,
+   range_agg(tstzrange(seg.boundary,seg.next_boundary,'[)')) retained_ranges
+  FROM (
+    SELECT ar.interval_host_id,ar.path,ar.allocation_identity,ar.artifact_mib,
+     ar.range_start,ar.range_end,ar.team_cutover,b.boundary,
+     lead(b.boundary) OVER (
+       PARTITION BY ar.interval_host_id,ar.path,ar.allocation_identity,ar.range_start,ar.range_end
+       ORDER BY b.boundary) next_boundary
+    FROM artifact_refs ar
+    CROSS JOIN LATERAL (
+      SELECT ar.range_start boundary
+      UNION SELECT ar.range_end
+      UNION SELECT GREATEST(rb.started_at,ar.range_start)
+      FROM retained_baselines rb
+      WHERE rb.host_id=ar.interval_host_id AND rb.team_id=p_team
+        AND rb.baseline_path=ar.path
+        AND rb.allocation_identity IS NOT NULL
+        AND rb.allocation_identity=ar.allocation_identity
+        AND rb.started_at<ar.range_end
+        AND COALESCE(rb.ended_at,billing_request_now())>ar.range_start
+      UNION SELECT LEAST(COALESCE(rb.ended_at,billing_request_now()),ar.range_end)
+      FROM retained_baselines rb
+      WHERE rb.host_id=ar.interval_host_id AND rb.team_id=p_team
+        AND rb.baseline_path=ar.path
+        AND rb.allocation_identity IS NOT NULL
+        AND rb.allocation_identity=ar.allocation_identity
+        AND rb.started_at<ar.range_end
+        AND COALESCE(rb.ended_at,billing_request_now())>ar.range_start
+    ) b
+    WHERE ar.team_cutover IS NOT NULL
+      AND ar.range_end>GREATEST(ar.range_start,ar.team_cutover)
+      AND b.boundary>=GREATEST(ar.range_start,ar.team_cutover)
+      AND b.boundary<=ar.range_end
+  ) seg
+  WHERE seg.next_boundary>seg.boundary
     AND NOT EXISTS (
-      SELECT 1 FROM retained_storage_interval r
-      WHERE r.host_id=ar.interval_host_id
-        AND r.team_id=p_team
-        AND r.started_at<ar.range_end
-        AND COALESCE(r.ended_at,billing_request_now())>GREATEST(ar.range_start,ar.team_cutover)
+      SELECT 1 FROM retained_baselines rb
+      WHERE rb.host_id=seg.interval_host_id AND rb.team_id=p_team
+        AND rb.baseline_path=seg.path
+        AND rb.allocation_identity IS NOT NULL
+        AND rb.allocation_identity=seg.allocation_identity
+        AND rb.started_at<=seg.boundary
+        AND COALESCE(rb.ended_at,billing_request_now())>seg.boundary
     )
-  GROUP BY ar.interval_host_id,ar.path
+  GROUP BY seg.interval_host_id,seg.path,seg.allocation_identity
 ), artifact_ranges AS (
   SELECT path,artifact_mib,retained_ranges FROM pre_ranges
   UNION ALL
