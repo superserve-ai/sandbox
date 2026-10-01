@@ -441,3 +441,150 @@ func TestIntegration_BillingCheckoutPublicationRejectsExplicitUnmatchedGeneratio
 		t.Fatalf("explicit unmatched generation fell through to legacy credit lookup: %s", state)
 	}
 }
+
+func TestIntegration_BillingCheckoutPublicationCrossActorReservationFence(t *testing.T) {
+	ctx := context.Background()
+	setup := localIdentityTransaction(t, false)
+	actorA, actorB, team := uuid.New(), uuid.New(), uuid.New()
+	for _, actor := range []uuid.UUID{actorA, actorB} {
+		rolloutExec(t, setup, `INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com")
+	}
+	rolloutExec(t, setup, `INSERT INTO team(id,name) VALUES($1,$2)`, team, "cross-actor-"+team.String())
+	rolloutExec(t, setup, `INSERT INTO team_billing_account(team_id) VALUES($1)`, team)
+	if err := setup.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the policy row so actor A pauses after the wrapper's initial history
+	// inspection, inside promotion_device_decision. Actor B can still commit a
+	// publication decision because it takes the team account lock later.
+	blocker, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Rollback(ctx)
+	var policyLocked bool
+	if err := blocker.QueryRow(ctx, `SELECT singleton FROM promotion_device_policy WHERE singleton FOR UPDATE`).Scan(&policyLocked); err != nil || !policyLocked {
+		t.Fatalf("policy barrier: %v", err)
+	}
+	blockerPID := blocker.Conn().PgConn().PID()
+
+	actorConn, err := testPool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer actorConn.Release()
+	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	type reservationResult struct {
+		state string
+		err   error
+	}
+	resultCh := make(chan reservationResult, 1)
+	actorPID := actorConn.Conn().PgConn().PID()
+	go func() {
+		var result reservationResult
+		result.err = actorConn.QueryRow(callCtx,
+			`SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, team, actorA, "event-cross-actor").Scan(&result.state)
+		resultCh <- result
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var blocked bool
+		if err := testPool.QueryRow(ctx, `SELECT $1::int = ANY(pg_blocking_pids($2::int))`, blockerPID, actorPID).Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		select {
+		case result := <-resultCh:
+			t.Fatalf("actor A did not pause in promotion_device_decision: %q %v", result.state, result.err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("actor A did not reach the policy-row barrier")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	writer, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(ctx,
+		`SELECT begin_stripe_checkout_with_publication_decision($1,$2,$3,'use','cross-actor-request','publication_failed',$4)`,
+		team, actorB, uuid.New(), uuid.New()); err != nil {
+		writer.Rollback(ctx)
+		t.Fatalf("actor B publication decision: %v", err)
+	}
+	if err := writer.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var historyCount int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM stripe_checkout_publication_decision WHERE team_id=$1`, team).Scan(&historyCount); err != nil || historyCount != 1 {
+		t.Fatalf("actor B decision did not commit: %d %v", historyCount, err)
+	}
+	if err := blocker.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	result := <-resultCh
+	if result.err != nil || result.state != "authority_unavailable" {
+		t.Fatalf("actor A acquired credit after actor B publication failure: %q %v", result.state, result.err)
+	}
+	var noReservation bool
+	if err := testPool.QueryRow(ctx, `SELECT
+		stripe_activation_credit_reserved_at IS NULL
+		AND stripe_activation_user_id IS NULL
+		AND stripe_activation_identity_key IS NULL
+		AND stripe_activation_identity_evidence_version IS NULL
+		AND stripe_activation_credit_reservation_event_id IS NULL
+		AND NOT EXISTS (SELECT 1 FROM user_promotion_entitlement WHERE user_id=$2 AND stripe_redemption_reserved_team_id=$1)
+		AND NOT EXISTS (SELECT 1 FROM promotion_identity WHERE identity_key='legacy:'||$2::text AND stripe_reserved_team_id=$1)
+		FROM team_billing_account WHERE team_id=$1`, team, actorA).Scan(&noReservation); err != nil || !noReservation {
+		t.Fatalf("denied callback left reservation state: %t %v", noReservation, err)
+	}
+
+	// Lease cleanup plus a mutable prior subscription projection does not create
+	// immutable generation ownership. Both metadata-free callback forms remain
+	// fenced by the retained publication history.
+	rolloutExec(t, testPool, `UPDATE team_billing_account SET
+		checkout_initializing_at=NULL, checkout_request_key=NULL, checkout_pending_attempt_ids='{}',
+		checkout_may_exist=false, checkout_session_id=NULL, checkout_subscription_id=NULL,
+		checkout_completed_at=NULL, stripe_checkout_actor_id=NULL,
+		stripe_checkout_actor_claimed_at=NULL, stripe_checkout_identity_evidence_version=NULL,
+		stripe_subscription_id='sub_prior_projection', stripe_subscription_status='active', updated_at=now()
+		WHERE team_id=$1`, team)
+	var state string
+	if err := testPool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,$3,$4,NULL,false)`,
+		team, actorA, "event-prior-subscription", "sub_prior_projection").Scan(&state); err != nil || state != "authority_unavailable" {
+		t.Fatalf("prior subscription projection bypassed retained history: %s %v", state, err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, team, actorA, "event-after-cleanup").Scan(&state); err != nil || state != "authority_unavailable" {
+		t.Fatalf("event-only callback bypassed retained history: %s %v", state, err)
+	}
+
+	// Controls: without retained history, legacy acquisition remains valid;
+	// matching replay remains the sole existing-reservation authority, while
+	// changed events and actors cannot reuse it.
+	legacyTeam, legacyActor, otherActor := uuid.New(), uuid.New(), uuid.New()
+	for _, actor := range []uuid.UUID{legacyActor, otherActor} {
+		rolloutExec(t, testPool, `INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com")
+	}
+	rolloutExec(t, testPool, `INSERT INTO team(id,name) VALUES($1,$2)`, legacyTeam, "legacy-control-"+legacyTeam.String())
+	rolloutExec(t, testPool, `INSERT INTO team_billing_account(team_id) VALUES($1)`, legacyTeam)
+	if err := testPool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, legacyActor, "legacy-event").Scan(&state); err != nil || state != "acquired" {
+		t.Fatalf("legacy acquisition unexpectedly fenced: %s %v", state, err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, legacyActor, "legacy-event").Scan(&state); err != nil || state != "existing" {
+		t.Fatalf("matching reservation replay changed authority: %s %v", state, err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, legacyActor, "legacy-other-event").Scan(&state); err != nil || state != "blocked" {
+		t.Fatalf("mismatched event replay was accepted: %s %v", state, err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, otherActor, "legacy-event").Scan(&state); err != nil || state != "blocked" {
+		t.Fatalf("mismatched actor replay was accepted: %s %v", state, err)
+	}
+}
