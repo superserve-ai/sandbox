@@ -710,14 +710,28 @@ var publishDirSync = syncDirWithContext
 
 // syncDirWithContext is syncDir released on cancellation, so a stalled
 // filesystem cannot hold a restore past its budget or keep a migration
-// worker occupied; the fsync itself finishes in the background either way.
+// worker occupied. The fsync has no cancellation of its own, so this
+// goroutine owns the handle until the kernel returns and closes it there:
+// closed by the caller instead, the sync still to run would fail on a
+// closed descriptor, and the entry this call reports as attempted would
+// never have been made durable at all.
 func syncDirWithContext(ctx context.Context, path string) error {
 	d, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	defer d.Close()
-	return syncWithContext(ctx, d)
+	done := make(chan error, 1)
+	go func() {
+		err := d.Sync()
+		d.Close()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // removeStagedTask deletes a task's staging directory once the task is
