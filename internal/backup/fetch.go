@@ -294,10 +294,12 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 			_ = os.Remove(staging)
 			return "", fmt.Errorf("publish verified base copy: %w", err)
 		}
-		// Published and verified already, so cancellation here costs only
-		// this caller: what it leaves behind is a base a later resolution
-		// is right to trust.
-		if err := syncDirWithContext(ctx, dir); err != nil {
+		// Verified and in place, so cancellation here unmakes nothing:
+		// the fsync only keeps the directory entry across a power loss,
+		// and losing it leaves the base simply absent next time, which
+		// materializes again. Reporting a failure instead would send the
+		// caller to fetch the object into a name this copy already holds.
+		if err := publishSync(ctx, dir); err != nil && ctx.Err() == nil {
 			return "", fmt.Errorf("publish verified base copy: %w", err)
 		}
 		return dst, nil
@@ -307,6 +309,11 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 	}
 	return v.(string), nil
 }
+
+// publishSync makes a published base's directory entry durable.
+// Indirected so tests can drive the window where the copy is in place but
+// the entry is not yet durable.
+var publishSync = syncDirWithContext
 
 // verifyPath hashes the file at path against the digest recorded for its
 // contents.

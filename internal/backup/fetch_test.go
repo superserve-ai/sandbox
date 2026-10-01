@@ -754,3 +754,39 @@ func TestFetchGenerationKeepsARestoreWhenAnotherCallersResolutionIsCancelled(t *
 		t.Fatalf("the complete restore was discarded: %v", err)
 	}
 }
+
+// The window where a verified base is in place but its directory entry is
+// not yet durable: the copy stands, because sending the caller to fetch
+// the object would collide with the name this copy already holds.
+func TestHostBaseKeepsAPublishedCopyWhenTheEntrySyncIsCancelled(t *testing.T) {
+	stubClone(t, copyClone)
+	dir := t.TempDir()
+	data := bytes.Repeat([]byte{0x11}, 64<<10)
+	src := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(src, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restore := t.TempDir()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	prev := publishSync
+	publishSync = func(context.Context, string) error {
+		cancel()
+		return context.Canceled
+	}
+	t.Cleanup(func() { publishSync = prev })
+
+	base, err := hostBase(ctx, restore, digestOf(data), src)
+	want := filepath.Join(restore, SharedBaseName(digestOf(data)))
+	if err != nil || base != want {
+		t.Fatalf("base = %q (%v), want %q", base, err, want)
+	}
+	held, err := os.ReadFile(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(held, data) {
+		t.Fatal("the published base does not hold the bytes the pause recorded")
+	}
+}
