@@ -16,6 +16,9 @@ import (
 type promotionAccountClaims struct {
 	jwt.RegisteredClaims
 	Operation            string `json:"operation"`
+	OperationID          string `json:"operation_id,omitempty"`
+	Name                 string `json:"name,omitempty"`
+	After                string `json:"after,omitempty"`
 	AttemptID            string `json:"attempt_id,omitempty"`
 	TeamID               string `json:"team_id,omitempty"`
 	HomeRegion           string `json:"home_region,omitempty"`
@@ -23,8 +26,9 @@ type promotionAccountClaims struct {
 }
 
 // PromotionAccountAuth verifies Console's server-derived assertions. Console
-// verifies the existing Auth login for evidence/register; bind instead uses
-// trusted signup provenance, which is available before email confirmation.
+// verifies the existing Auth login for evidence/register; bind and
+// register-signup instead use trusted signup provenance, which is available
+// before email confirmation.
 func PromotionAccountAuth() gin.HandlerFunc {
 	key, err := base64.StdEncoding.DecodeString(os.Getenv("PROMOTION_ACCOUNT_PUBLIC_KEY"))
 	configured := err == nil && len(key) == ed25519.PublicKeySize
@@ -59,6 +63,61 @@ func PromotionAccountAuth() gin.HandlerFunc {
 		case "bind":
 			attempt, err := uuid.Parse(claims.AttemptID)
 			if err != nil || attempt == uuid.Nil {
+				deny()
+				return
+			}
+		case "register-signup":
+			// Signup registration is deliberately East-only. An unset region is
+			// the legacy East deployment; tagged non-East cells must not accept
+			// an otherwise valid signup assertion.
+			region := sandboxIDRegionFromEnv()
+			if region == "" {
+				region = "use"
+			}
+			attempt, err := uuid.Parse(claims.AttemptID)
+			if err != nil || attempt == uuid.Nil || claims.HomeRegion != "use" || region != "use" ||
+				claims.OperationID != "" || claims.Name != "" || claims.After != "" || claims.TeamID != "" || claims.AuthorityUnavailable != nil {
+				deny()
+				return
+			}
+		case "prepare-team", "recover-team", "complete-team", "discover-team-creations":
+			region := sandboxIDRegionFromEnv()
+			if region == "" {
+				region = "use"
+			}
+			if claims.HomeRegion != region {
+				deny()
+				return
+			}
+			if operation == "discover-team-creations" {
+				if claims.After != "" {
+					cursor, err := uuid.Parse(claims.After)
+					if err != nil || cursor == uuid.Nil {
+						deny()
+						return
+					}
+				}
+			} else {
+				locator, err := uuid.Parse(claims.OperationID)
+				if err != nil || locator == uuid.Nil {
+					deny()
+					return
+				}
+			}
+			if operation == "prepare-team" || operation == "complete-team" {
+				if claims.AuthorityUnavailable == nil || strings.TrimSpace(claims.Name) == "" || len(claims.Name) > 256 {
+					deny()
+					return
+				}
+			}
+			if operation == "complete-team" {
+				attempt, attemptErr := uuid.Parse(claims.AttemptID)
+				team, teamErr := uuid.Parse(claims.TeamID)
+				if attemptErr != nil || attempt == uuid.Nil || teamErr != nil || team == uuid.Nil {
+					deny()
+					return
+				}
+			} else if claims.AttemptID != "" || claims.TeamID != "" {
 				deny()
 				return
 			}

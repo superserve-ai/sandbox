@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -5510,51 +5511,54 @@ func pauseMocks(sb db.Sandbox, finalizes *int32) *mockDBTX {
 // more: the response goes out, the reclaim is deferred with its error, and
 // the host's other pending reclaims are held with it.
 func TestDeleteSandbox_SlowHostCostsOnlyTheBudget(t *testing.T) {
-	sandboxID := uuid.New()
-	teamID := uuid.New()
-	sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive, HostID: "host-slow"}
-	vmd := &stubVMD{destroyFn: func(ctx context.Context, _ string, _ bool) error {
-		<-ctx.Done()
-		return ctx.Err()
-	}}
-	var deferred, heldHost, completed int32
-	mock := &mockDBTX{
-		queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
-			switch {
-			case strings.Contains(sql, "FROM destroyed"):
-				return destroyedRow(sandboxID, "host-slow", nil, pgtype.UUID{})
-			case strings.Contains(sql, "FROM sandbox"):
-				return sandboxRow(sb)
-			default:
-				return activityRow()
-			}
-		},
-		execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
-			switch {
-			case strings.Contains(sql, "DELETE FROM sandbox_teardown"):
-				atomic.AddInt32(&completed, 1)
-			case strings.Contains(sql, "WHERE host_id"):
-				atomic.AddInt32(&heldHost, 1)
-			case strings.Contains(sql, "UPDATE sandbox_teardown"):
-				atomic.AddInt32(&deferred, 1)
-			}
-			return pgconn.NewCommandTag("UPDATE 1"), nil
-		},
-	}
-	h := &Handlers{VMD: vmd, DB: db.New(mock), TeardownInlineBudget: 50 * time.Millisecond}
-	w := httptest.NewRecorder()
-	start := time.Now()
-	setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
-	h.WaitAsyncBookkeeping()
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
-	}
-	if took := time.Since(start); took > 2*time.Second {
-		t.Fatalf("response took %s against a host that never answers", took)
-	}
-	if deferred != 1 || heldHost != 1 || completed != 0 {
-		t.Fatalf("deferred = %d, host held = %d, completed = %d; want 1, 1, 0", deferred, heldHost, completed)
-	}
+	// Virtual time preserves the settle reserve even under scheduler contention.
+	synctest.Test(t, func(t *testing.T) {
+		sandboxID := uuid.New()
+		teamID := uuid.New()
+		sb := db.Sandbox{ID: sandboxID, TeamID: teamID, Name: "test-sb", Status: db.SandboxStatusActive, HostID: "host-slow"}
+		vmd := &stubVMD{destroyFn: func(ctx context.Context, _ string, _ bool) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+		var deferred, heldHost, completed int32
+		mock := &mockDBTX{
+			queryRowFn: func(_ context.Context, sql string, _ ...any) pgx.Row {
+				switch {
+				case strings.Contains(sql, "FROM destroyed"):
+					return destroyedRow(sandboxID, "host-slow", nil, pgtype.UUID{})
+				case strings.Contains(sql, "FROM sandbox"):
+					return sandboxRow(sb)
+				default:
+					return activityRow()
+				}
+			},
+			execFn: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+				switch {
+				case strings.Contains(sql, "DELETE FROM sandbox_teardown"):
+					atomic.AddInt32(&completed, 1)
+				case strings.Contains(sql, "WHERE host_id"):
+					atomic.AddInt32(&heldHost, 1)
+				case strings.Contains(sql, "UPDATE sandbox_teardown"):
+					atomic.AddInt32(&deferred, 1)
+				}
+				return pgconn.NewCommandTag("UPDATE 1"), nil
+			},
+		}
+		h := &Handlers{VMD: vmd, DB: db.New(mock), TeardownInlineBudget: 50 * time.Millisecond}
+		w := httptest.NewRecorder()
+		start := time.Now()
+		setupTestRouter(h, teamID.String()).ServeHTTP(w, deleteRequest(sandboxID.String()))
+		h.WaitAsyncBookkeeping()
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusNoContent, w.Body.String())
+		}
+		if took := time.Since(start); took > h.TeardownInlineBudget {
+			t.Fatalf("response took %s against a host that never answers", took)
+		}
+		if deferred != 1 || heldHost != 1 || completed != 0 {
+			t.Fatalf("deferred = %d, host held = %d, completed = %d; want 1, 1, 0", deferred, heldHost, completed)
+		}
+	})
 }
 
 // With the replica's inline limiter full, a delete answers at once, touching

@@ -132,8 +132,11 @@ func isDirNotFound(err error) bool {
 // vmdErrorMessage returns the gRPC message from a vmd error, stripping
 // gRPC/transport framing so the string is safe to surface to API callers.
 func vmdErrorMessage(err error) string {
-	if s, ok := status.FromError(err); ok {
-		return s.Message()
+	// The daemon's own words: the client wraps them with the RPC name, which
+	// is not for the caller.
+	var st interface{ GRPCStatus() *status.Status }
+	if errors.As(err, &st) {
+		return st.GRPCStatus().Message()
 	}
 	return err.Error()
 }

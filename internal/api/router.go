@@ -19,6 +19,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// (unauthenticated flood protection), logging, panic recovery.
 	r.Use(
 		SecurityHeaders(),
+		TeamCreationReadDeadline(),
 		RateLimit(ctx, DefaultIPRateLimitConfig()),
 		RequestLogger(),
 		ErrorHandler(),
@@ -115,6 +116,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	// Public pricing is intentionally unauthenticated so the marketing site can render current PAYG rates from the same source as billing.
 	r.GET("/billing/pricing/public", h.GetPublicBillingPricing)
 	r.POST("/stripe/webhook", h.HandleStripeWebhook)
+	r.POST("/internal/teams", TeamCreationPrivacy(), TeamCreationInternalAuth(), h.CreateInternalTeam)
 
 	promotionCapture := r.Group("/internal/promotion/signup")
 	promotionCapture.Use(PromotionProducerAuth("PROMOTION_CAPTURE_TOKEN"))
@@ -126,8 +128,13 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	promotionAccount.POST("/bind", h.BindPromotionSignupAccount)
 	promotionAccount.POST("/evidence", h.GetPromotionSignupAccountEvidence)
 	promotionAccount.POST("/register", h.RegisterPromotionSignupDevice)
+	promotionAccount.POST("/register-signup", h.RegisterPromotionSignupAccount)
 	promotionAccount.POST("/signup-eligibility", h.EvaluateSignupPromotion)
 	promotionAccount.POST("/create-team", h.CreateTeamWithPromotionAttempt)
+	promotionAccount.POST("/prepare-team", h.PrepareTeamPromotionCreation)
+	promotionAccount.POST("/recover-team", h.RecoverTeamPromotionCreation)
+	promotionAccount.POST("/complete-team", h.CompleteTeamPromotionCreation)
+	promotionAccount.POST("/discover-team-creations", h.DiscoverTeamPromotionCreations)
 
 	// Operator endpoints — authenticated via OPERATOR_API_TOKEN, a separate
 	// credential from the infra-internal token that every vmd host holds

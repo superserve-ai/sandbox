@@ -7,24 +7,26 @@ inventory equality.
 
 ## Quantity policy
 
-`exact-daily-one-ulp-v1` allows a positive whole-window residual only when:
+`binary64-equivalent-v2` applies the same comparison to CPU, memory and storage,
+for each daily/partial-edge bucket and the whole-window total. Exact equality
+still passes. A nonzero signed residual requires all of the following:
 
-- The exact reserved quantity is between `1e-12` and `1e9`, inclusive.
-- The residual is at most `2^(floor(log2(reserved))-52)`, computed with rational
-  arithmetic. The bound includes equality; any amount above it fails closed.
-  Zero reservations have no positive allowance.
-- Two complete provider bucket passes exactly match submitted/adopted local
-  quantities over their persisted event timestamps. Pending, uncertain,
-  rejected, missing, or out-of-window events cannot establish this evidence.
-- An ungrouped reread is unchanged and the local inventory is unchanged.
+- The exact local quantity is between `1e-12` and `1e9`, inclusive, and both
+  quantities are positive. Zero local usage requires exact provider zero.
+- The absolute residual is at most `2^(floor(log2(local))-52)`, computed with
+  rational arithmetic, and both exact decimals round to the same binary64 value
+  (nearest, ties to even). Magnitude alone never establishes equivalence.
+- Two complete provider bucket passes match the submitted/adopted local sums at
+  that precision and exactly agree with each other numerically. Pending,
+  uncertain, rejected, missing, or out-of-window events cannot establish proof.
+- An ungrouped reread and the local inventory remain unchanged.
 
-For `9712.454976049444`, the bound is `2^-39` (approximately
-`1.8189894035458565e-12`), so `9712.454976049445` is a candidate for corroboration.
-No positive residual passes on magnitude alone. The allowance is recomputed
-from each independent exact period total; it is never added to an earlier
-allowance or residual. Repeated reads neither accumulate error nor guarantee
-convergence. Buckets that themselves differ fail closed, however small the
-difference.
+For example, `24695.364339748334` and `24695.364339748336` map to the same
+binary64 value. A neighboring binary64 value fails even if within one spacing.
+Neither provider conversion nor the accepted residual changes local accounting.
+Each comparison starts from the exact cumulative local sum; earlier residuals
+never increase the allowance. A new period is reconciled independently, and
+prior-period residual history remains retained.
 
 This is a deliberately narrow acceptance policy, not a bound guaranteed by
 Stripe. Stripe documents double-precision aggregation loss but does not provide
@@ -33,7 +35,9 @@ event identity or acceptance. See [Stripe's precision documentation](https://doc
 
 Exact equality and provider lag remain allowed for ordinary exports outside this
 residual policy range, with the normal quantity validation and reservation guards.
-Lag cannot authorize closing or speculative resubmission. Unexplained excess,
+If a negative residual lacks complete precision evidence it remains provider
+lag, preserving ordinary delivery retries without authorizing closing or
+speculative resubmission. Unexplained excess,
 unsupported magnitudes, malformed responses and exhausted evidence budgets require
 reconciliation/operator recovery; the system never widens the allowance.
 
@@ -72,9 +76,10 @@ guard. History survives observation refresh and commercial-period rollover.
 
 The existing close/finalization trigger retains its exact local
 measured-target/reserved/submitted, unresolved-delivery and freshness guards.
-For positive drift it additionally checks the history tied to that precise
+For either sign of explained drift it additionally checks the history tied to that precise
 observation, a collection age of at most two hours, full-period window, current
-accounting/customer, policy bound and both exact bucket partitions. Subsequent
+accounting/customer, policy equivalence and both complete, stable bucket partitions. Coverage is
+checked using exact local bucket sums, not sums of rounded provider values. Subsequent
 periods reconcile independently from zero reserved coverage. Existing correction
 and disabled-resource semantics remain in place.
 
@@ -93,7 +98,10 @@ change after the lookup cannot be made atomic with the local commit. The bounded
 check does not establish individual provider event identity or acceptance.
 
 Deploy the additive migration before the new binary. Equality behavior remains
-compatible. Older writers cannot create drift evidence; updating an observation
+compatible. The database continues to validate historical `exact-daily-one-ulp-v1`
+evidence using its original positive whole-window bound and exact daily sums;
+new writers only produce v2 evidence. Older writers cannot produce v2 evidence.
+Updating an observation
 does not refresh the collection time or bind it to old history. Rolling back the
 binary may block drift closing but does not rewrite usage or delete evidence.
 The existing finalization transaction invokes the database guard before committing

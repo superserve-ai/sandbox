@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1657,6 +1658,8 @@ type precisionWorkerStripe struct {
 	mappingErr         error
 	attempts           []StripeReportMeterEventParams
 	buckets, summaries int
+	roundBuckets       bool
+	changingEquivalent bool
 	checkUnlocked      func(context.Context) error
 	changeLocal        func()
 }
@@ -1800,6 +1803,16 @@ func (s *precisionWorkerStripe) BucketedMeterUsage(ctx context.Context, event, c
 			return nil, err
 		}
 	}
+	if s.roundBuckets {
+		for i := range windows {
+			q, _ := new(big.Rat).SetString(windows[i].Quantity)
+			f, _ := q.Float64()
+			windows[i].Quantity = strconv.FormatFloat(f, 'f', -1, 64)
+			if s.changingEquivalent && s.buckets%2 == 0 && q.Sign() > 0 {
+				windows[i].Quantity = q.FloatString(12)
+			}
+		}
+	}
 	if s.mode == "missing" {
 		// Empty intervals may be omitted, so remove a bucket with usage.
 		for i, window := range windows {
@@ -1830,7 +1843,7 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 	now := time.Now().UTC().Truncate(time.Hour)
 	start := now.Add(-72 * time.Hour).Add(2 * time.Minute)
 	end := start.AddDate(0, 1, 0)
-	provider := &precisionWorkerStripe{checkUnlocked: func(ctx context.Context) error {
+	provider := &precisionWorkerStripe{roundBuckets: true, checkUnlocked: func(ctx context.Context) error {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			return err
@@ -1915,8 +1928,9 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 		return err
 	}
 	initialCalls := len(provider.calls)
-	for _, mode := range []string{"excess", "missing", "outage", "changing_summary", "changing_bucket"} {
+	for _, mode := range []string{"excess", "missing", "outage", "changing_summary", "changing_bucket", "changing_equivalent"} {
 		provider.mode = mode
+		provider.changingEquivalent = mode == "changing_equivalent"
 		provider.summaries = 0
 		provider.buckets = 0
 		tick(t, true)
@@ -1939,6 +1953,7 @@ func testMeterPrecisionWorker(t *testing.T, pool *pgxpool.Pool) {
 		}
 	}
 	provider.mode = "complete"
+	provider.changingEquivalent = false
 	provider.buckets = 0
 	tick(t, false)
 	if len(provider.calls) != initialCalls+3 {
@@ -2210,16 +2225,17 @@ func testMeterGrowingDriftWorker(t *testing.T, pool *pgxpool.Pool) {
 		return snapshot
 	}
 	// Equal increments keep totals in one binade while a steadily growing
-	// residual crosses its exact bound on the fourth scheduled export.
+	// residual crosses its binary64 rounding boundary on the fourth scheduled export.
 	for iteration := 1; iteration <= 4; iteration++ {
 		now = now.Add(time.Hour)
 		setPrecisionStorageUsage(t, pool, p, start, fmt.Sprint(10000+iteration))
 		exec(`UPDATE billing_export_usage SET vcpu_seconds=vcpu_seconds+3600,memory_mib_seconds=memory_mib_seconds+3686400,
  storage_mib_seconds=storage_mib_seconds+3686400,updated_at=clock_timestamp() WHERE team_id=$1`, team.ID)
-		provider.drift = big.NewRat(int64(iteration), 2_000_000_000_000)
-		bound, err := meterPrecisionBound(big.NewRat(int64(10000+iteration-1), 1))
-		if err != nil || (provider.drift.Cmp(bound) > 0) != (iteration == 4) {
-			t.Fatalf("fixture does not cross bound on fourth export: %v", err)
+		provider.drift = big.NewRat(int64(iteration), 4_000_000_000_000)
+		local := big.NewRat(int64(10000+iteration-1), 1)
+		f, _ := new(big.Rat).Add(local, provider.drift).Float64()
+		if (f != float64(10000+iteration-1)) != (iteration == 4) {
+			t.Fatal("fixture does not cross representation boundary on fourth export")
 		}
 		before := state()
 		attempts, calls := len(provider.attempts), len(provider.calls)
@@ -2266,6 +2282,18 @@ func testMeterGrowingDriftWorker(t *testing.T, pool *pgxpool.Pool) {
 
 func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 	ctx := t.Context()
+	for _, tc := range meterRepresentationCases {
+		var equivalent bool
+		if err := pool.QueryRow(ctx, `SELECT billing_meter_precision_equivalent($1::numeric,$2::numeric)`, tc.provider, tc.local).Scan(&equivalent); err != nil || equivalent != tc.want {
+			t.Fatalf("SQL representation %s/%s: got=%v want=%v err=%v", tc.provider, tc.local, equivalent, tc.want, err)
+		}
+	}
+	for _, invalid := range []string{"NaN", "Infinity", "-Infinity"} {
+		var equivalent bool
+		if err := pool.QueryRow(ctx, `SELECT billing_meter_precision_equivalent($1::numeric,$1::numeric)`, invalid).Scan(&equivalent); err != nil || equivalent {
+			t.Fatalf("invalid SQL quantity accepted: %s %v", invalid, err)
+		}
+	}
 	for _, total := range []string{"0.000000000001", "1", "8191.999999999999", "8192", "9712.454976049444", "1000000000"} {
 		var value string
 		if err := pool.QueryRow(ctx, `SELECT billing_meter_precision_bound($1::numeric)::text`, total).Scan(&value); err != nil {
@@ -2287,7 +2315,7 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 	now := time.Now().UTC().Truncate(time.Hour)
 	start := now.Add(-72*time.Hour).AddDate(0, -2, 0)
 	end := start.AddDate(0, 1, 0)
-	provider := &precisionWorkerStripe{mode: "complete", checkUnlocked: func(ctx context.Context) error {
+	provider := &precisionWorkerStripe{mode: "complete", drift: big.NewRat(1, 2_000_000_000_000), checkUnlocked: func(ctx context.Context) error {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			return err
@@ -2352,7 +2380,7 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 	var evidenceCount int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM billing_meter_reconciliation WHERE team_id=$1
  AND local_quantity=10000 AND reserved_quantity=10000 AND submitted_quantity=10000
- AND provider_quantity=10000.000000000001 AND difference=0.000000000001
+ AND provider_quantity=10000.0000000000005 AND difference=0.0000000000005
  AND query_start=$2 AND query_end=$3`, team.ID, start, end).Scan(&evidenceCount); err != nil || evidenceCount != 3 {
 		t.Fatalf("persistent raw residual history: count=%d err=%v", evidenceCount, err)
 	}
@@ -2380,7 +2408,7 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 
 	// Exercise the actual finalization transaction with bad evidence. Each
 	// mutation rolls back, so the original immutable history remains intact.
-	for _, mode := range []string{"missing", "stale", "wrong_scope", "wrong_meter", "wrong_snapshot", "wrong_policy", "wrong_window", "incomplete", "unstable", "excess", "provider_lag", "unresolved", "changed_accounting", "changed_customer", "old_writer", "boundary", "beyond_boundary", "mapping_missing", "mapping_expired"} {
+	for _, mode := range []string{"rounded_buckets", "changing_equivalent_bucket", "negative_precision", "missing", "stale", "wrong_scope", "wrong_meter", "wrong_snapshot", "wrong_policy", "wrong_window", "incomplete", "unstable", "excess", "provider_lag", "unresolved", "changed_accounting", "changed_customer", "old_writer", "boundary", "beyond_boundary", "mapping_missing", "mapping_expired"} {
 		t.Run(mode, func(t *testing.T) {
 			mapping, err := billing.RevalidateMeterCloseMapping(ctx, pool, p, h.ResolveActiveBillingMeter)
 			if err != nil {
@@ -2410,6 +2438,26 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 						t.Fatal(err)
 					}
 				}
+			case "rounded_buckets", "changing_equivalent_bucket":
+				mutation = `UPDATE billing_meter_reconciliation SET bucket_passes=(
+ SELECT jsonb_agg((SELECT jsonb_agg(CASE WHEN (b->>'quantity')::numeric>0 THEN
+ jsonb_set(b,'{quantity}',to_jsonb('10000.0000000000005'::text)) ELSE b END ORDER BY bi)
+ FROM jsonb_array_elements(p) WITH ORDINALITY AS buckets(b,bi)) ORDER BY pi)
+ FROM jsonb_array_elements(bucket_passes) WITH ORDINALITY AS passes(p,pi)) WHERE team_id=$1`
+				if mode == "changing_equivalent_bucket" {
+					mutation = `UPDATE billing_meter_reconciliation SET bucket_passes=jsonb_set(bucket_passes,'{1}',(
+ SELECT jsonb_agg(CASE WHEN (b->>'quantity')::numeric>0 THEN
+ jsonb_set(b,'{quantity}',to_jsonb('10000.0000000000005'::text)) ELSE b END ORDER BY bi)
+ FROM jsonb_array_elements(bucket_passes->1) WITH ORDINALITY AS buckets(b,bi))) WHERE team_id=$1`
+				}
+			case "negative_precision":
+				if _, err = tx.Exec(ctx, `UPDATE billing_meter_reconciliation SET difference=-difference,
+ provider_quantity=reserved_quantity-difference WHERE team_id=$1`, team.ID); err != nil {
+					t.Fatal(err)
+				}
+				mutation = `UPDATE billing_export_observation o SET counted_quantity=e.provider_quantity
+ FROM billing_meter_reconciliation e WHERE o.team_id=$1 AND e.team_id=o.team_id
+ AND e.period_start=o.period_start AND e.period_end=o.period_end AND e.resource_type=o.resource_type AND e.observed_at=o.observed_at`
 			case "missing":
 				mutation = `DELETE FROM billing_meter_reconciliation WHERE team_id=$1`
 			case "stale":
@@ -2447,7 +2495,7 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 					factor = 2
 				}
 				if _, err = tx.Exec(ctx, `UPDATE billing_meter_reconciliation SET
- difference=billing_meter_precision_bound(reserved_quantity)*$2,
+ policy='exact-daily-one-ulp-v1', difference=billing_meter_precision_bound(reserved_quantity)*$2,
  provider_quantity=reserved_quantity+billing_meter_precision_bound(reserved_quantity)*$2 WHERE team_id=$1`, team.ID, factor); err != nil {
 					t.Fatal(err)
 				}
@@ -2461,7 +2509,7 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 			_, err = tx.Exec(ctx, `UPDATE team_billing_period SET status='finalized',finalized_at=now(),
  gross_charges_usd=0,credits_applied_usd=0,net_invoice_amount_usd=0
  WHERE team_id=$1 AND period_start=$2 AND period_end=$3`, team.ID, start, end)
-			if mode == "boundary" {
+			if mode == "boundary" || mode == "rounded_buckets" || mode == "negative_precision" {
 				if err != nil {
 					t.Fatalf("exact inclusive precision boundary blocked: %v", err)
 				}
@@ -2600,8 +2648,8 @@ func testMeterPrecisionClose(t *testing.T, pool *pgxpool.Pool) {
 		t.Fatal("following period changed or replayed historical usage")
 	}
 	var retained, independent int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE period_start=$2 AND local_quantity=10000 AND difference=0.000000000001),
- count(*) FILTER (WHERE period_start=$3 AND local_quantity=20000 AND difference=0.000000000001)
+	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE period_start=$2 AND local_quantity=10000 AND difference=0.0000000000005),
+ count(*) FILTER (WHERE period_start=$3 AND local_quantity=20000 AND difference=0.0000000000005)
  FROM billing_meter_reconciliation WHERE team_id=$1`, team.ID, start, second.Start).Scan(&retained, &independent); err != nil || retained != 9 || independent != 3 {
 		t.Fatalf("independent retained period evidence: first=%d second=%d err=%v", retained, independent, err)
 	}

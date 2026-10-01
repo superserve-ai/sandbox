@@ -170,10 +170,9 @@ func (c *stripeHTTPClient) incrementalMeterID(ctx context.Context, eventName str
 	return meterID, nil
 }
 
-// Precision reconciliation is deliberately narrower than Stripe's possible
-// aggregation error: exact daily evidence plus at most one binary64 spacing.
-// It is not an event acceptance oracle and never changes reserved coverage.
-const meterPrecisionPolicy = "exact-daily-one-ulp-v1"
+// Provider representations may differ from exact decimal sums. This policy
+// does not establish event acceptance and never changes reserved coverage.
+const meterPrecisionPolicy = "binary64-equivalent-v2"
 const meterEvidenceLimit = 4096
 
 var errMeterBucketMismatch = errors.New("provider bucket differs from submitted quantity")
@@ -193,15 +192,12 @@ func meterDecimal(value string) (*big.Rat, error) {
 
 // meterQuantity validates a provider or local quantity without applying the
 // narrower residual precision policy. Equality and provider lag remain valid
-// at any supported cumulative magnitude; the precision range is checked only
-// when a positive excess is being considered for an explained-drift bypass.
+// at any supported cumulative magnitude.
 func meterQuantity(value string) (*big.Rat, error) {
 	return meterDecimal(value)
 }
 
-// meterPrecisionBound is consulted only for a positive provider excess. The
-// exact comparison path intentionally permits equality and provider lag at
-// cumulative magnitudes outside this residual policy range.
+// Exact equality and ordinary provider lag remain valid outside this range.
 func meterPrecisionBound(local *big.Rat) (*big.Rat, error) {
 	if local.Sign() == 0 {
 		return new(big.Rat), nil
@@ -220,6 +216,28 @@ func meterPrecisionBound(local *big.Rat) (*big.Rat, error) {
 		exponent--
 	}
 	return power(exponent - 52), nil
+}
+
+// Both conversions round the exact rationals directly to nearest, ties to even.
+// The range and rational bound exclude zero, underflow, and overflow from
+// residual acceptance. Repeated comparisons never enlarge the allowance.
+func meterPrecisionEquivalent(provider, local *big.Rat) bool {
+	if provider.Sign() < 0 || local.Sign() < 0 {
+		return false
+	}
+	if provider.Cmp(local) == 0 {
+		return true
+	}
+	bound, err := meterPrecisionBound(local)
+	if err != nil || local.Sign() <= 0 || provider.Sign() <= 0 {
+		return false
+	}
+	if new(big.Rat).Abs(new(big.Rat).Sub(provider, local)).Cmp(bound) > 0 {
+		return false
+	}
+	p, _ := provider.Float64()
+	l, _ := local.Float64()
+	return p == l
 }
 
 type meterUsageBucket struct {
@@ -432,7 +450,7 @@ func matchMeterBuckets(events []meterLocalEvent, buckets []meterUsageBucket, eve
 		if err != nil {
 			return err
 		}
-		if quantity.Cmp(totals[i]) != 0 {
+		if !meterPrecisionEquivalent(quantity, totals[i]) {
 			return fmt.Errorf("%w at %s", errMeterBucketMismatch, b.Start.Format(time.RFC3339))
 		}
 	}
@@ -455,11 +473,12 @@ func compareMeterSummary(counted, reservedValue string) (decision meterReconcili
 	}
 	difference := new(big.Rat).Sub(provider, reserved)
 	decision.Difference = difference.RatString()
-	if difference.Sign() <= 0 {
+	if difference.Sign() == 0 {
 		decision.Outcome = "equal"
-		if difference.Sign() < 0 {
-			decision.Outcome = "provider_lag"
-		}
+		return
+	}
+	if difference.Sign() < 0 && !meterPrecisionEquivalent(provider, reserved) {
+		decision.Outcome = "provider_lag"
 		return
 	}
 	decision.Outcome = "unexplained_excess"
@@ -469,7 +488,7 @@ func compareMeterSummary(counted, reservedValue string) (decision meterReconcili
 		return
 	}
 	decision.Bound = bound.RatString()
-	if difference.Cmp(bound) > 0 {
+	if !meterPrecisionEquivalent(provider, reserved) {
 		decision.Err = billing.ErrExportRecoveryRequired
 		return
 	}
@@ -513,6 +532,13 @@ func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPerio
 	}
 	provider, _ := meterDecimal(counted)
 	reserved, _ := meterDecimal(totals.Reserved)
+	// A failed precision proof must not turn ordinary provider lag into an
+	// export hold. It still cannot supply evidence for closing or resubmission.
+	defer func() {
+		if provider.Cmp(reserved) < 0 && decision.Err != nil {
+			decision.Outcome, decision.Err, decision.CloseEvidence = "provider_lag", nil, nil
+		}
+	}()
 	bucketReader, ok := reader.(stripeMeterBucketReader)
 	if !ok {
 		decision.Err = fmt.Errorf("%w: bucket reader unavailable", decision.Err)
@@ -555,13 +581,19 @@ func (h *Handlers) assessMeterSummary(ctx context.Context, p billing.ExportPerio
 	}
 	events, err := h.meterLocalEvidence(ctx, p, item.ResourceType)
 	if err == nil {
+		var firstPass []meterCloseBucket
 		for pass := 0; pass < 2; pass++ {
 			var buckets []meterUsageBucket
 			buckets, err = bucketReader.BucketedMeterUsage(ctx, item.EventName, customer, start, end)
 			if err == nil {
 				err = matchMeterBuckets(events, buckets, item.EventName, customer, start, end, reserved)
+				complete := completeMeterBuckets(buckets, start, end)
+				if err == nil && pass == 1 && !sameMeterBucketPass(firstPass, complete) {
+					err = fmt.Errorf("provider buckets changed during reconciliation")
+				}
+				firstPass = complete
 				if err == nil && closeEvidence != nil {
-					closeEvidence.Passes = append(closeEvidence.Passes, completeMeterBuckets(buckets, start, end))
+					closeEvidence.Passes = append(closeEvidence.Passes, complete)
 				}
 			}
 			if err != nil {

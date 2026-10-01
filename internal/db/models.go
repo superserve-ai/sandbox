@@ -1256,6 +1256,17 @@ type TeamBillingUsageHourly struct {
 	UpdatedAt         time.Time      `json:"updated_at"`
 }
 
+type TeamCreationRequest struct {
+	ActorID   uuid.UUID          `json:"actor_id"`
+	Cell      string             `json:"cell"`
+	RequestID string             `json:"request_id"`
+	Name      string             `json:"name"`
+	Region    string             `json:"region"`
+	TeamID    uuid.UUID          `json:"team_id"`
+	CreatedAt time.Time          `json:"created_at"`
+	DeletedAt pgtype.Timestamptz `json:"deleted_at"`
+}
+
 type TeamCreditGrant struct {
 	ID           uuid.UUID          `json:"id"`
 	TeamID       uuid.UUID          `json:"team_id"`
@@ -1315,15 +1326,16 @@ type TeamPricingPlan struct {
 }
 
 type TeamPromotionCreationAttempt struct {
-	AttemptID            uuid.UUID `json:"attempt_id"`
-	TeamID               uuid.UUID `json:"team_id"`
-	UserID               uuid.UUID `json:"user_id"`
-	Name                 string    `json:"name"`
-	HomeRegion           string    `json:"home_region"`
-	AuthorityUnavailable bool      `json:"authority_unavailable"`
-	Outcome              *string   `json:"outcome"`
-	Reason               *string   `json:"reason"`
-	CreatedAt            time.Time `json:"created_at"`
+	AttemptID            uuid.UUID   `json:"attempt_id"`
+	TeamID               uuid.UUID   `json:"team_id"`
+	UserID               uuid.UUID   `json:"user_id"`
+	Name                 string      `json:"name"`
+	HomeRegion           string      `json:"home_region"`
+	AuthorityUnavailable bool        `json:"authority_unavailable"`
+	Outcome              *string     `json:"outcome"`
+	Reason               *string     `json:"reason"`
+	CreatedAt            time.Time   `json:"created_at"`
+	OperationID          pgtype.UUID `json:"operation_id"`
 }
 
 type TeamSandboxCounter struct {

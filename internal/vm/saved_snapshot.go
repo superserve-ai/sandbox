@@ -39,9 +39,12 @@ const (
 	savedTombstoneTTL          = 24 * time.Hour
 	savedTombstoneReapInterval = time.Hour
 	savedSnapshotVersion       = 1
-	defaultSavedCaptures       = 2
-	savedCaptureHeadroom       = 256 << 20
-	savedUnpauseAttempts       = 3
+	// What bounds captures on the fleet's local NVMe is not the disk but the
+	// memory each running capture reserves and the page cache its writes
+	// churn, which resumes depend on; 16 keeps both small against a host.
+	defaultSavedCaptures = 16
+	savedCaptureHeadroom = 256 << 20
+	savedUnpauseAttempts = 3
 	// A capture's budget: a base for the request itself, plus the time a
 	// full memory image takes at the slowest write rate the capture waits
 	// for before it treats Firecracker as stuck.
@@ -396,7 +399,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		var ferr error
 		frozen, synced, ferr = m.freezeGuest(ctx, ip, token, kind == SavedSnapshotFS, log)
 		if ferr != nil {
-			m.markUnservable(inst, log)
+			m.markUnservable(inst, ferr, log)
 			return ferr
 		}
 		if kind == SavedSnapshotFS && !(frozen && synced) {
@@ -404,8 +407,8 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 			// disk would not be whole, so the source is let go and the
 			// capture refused.
 			if frozen {
-				if err := m.releaseFrozenGuest(ctx, "", ip, token); err != nil {
-					m.markUnservable(inst, log)
+				if err := m.releaseOrConfirmRunning(ctx, "", ip, token); err != nil {
+					m.markUnservable(inst, err, log)
 					return status.Errorf(codes.Unavailable, "source could not be released after a refused capture: %v", err)
 				}
 			}
@@ -455,11 +458,16 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 		}
 	}
 	var releaseErr error
+	tRelease := time.Now()
 	if frozen {
-		releaseErr = m.releaseFrozenGuest(ctx, socket, ip, token)
+		releaseErr = m.releaseOrConfirmRunning(ctx, socket, ip, token)
 	} else {
 		releaseErr = unpauseSourceWithProbe(ctx, socket)
 	}
+	// Emitted whatever follows: a release that waited on the guest, or
+	// failed, is exactly what these phases must show.
+	releaseFor := time.Since(tRelease)
+	m.recordPhases("saved_snapshot", string(kind), map[string]time.Duration{"freeze": freezeFor, "frozen": frozenFor, "release": releaseFor})
 	// What a memory capture did to the record is made durable only now,
 	// with the guest released: a store write must not hold it paused. The
 	// chain advanced, or the baseline was spent by a full image or a write
@@ -474,7 +482,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	}
 	if releaseErr != nil {
 		// The intent, if any, keeps the token for recovery.
-		m.markUnservable(inst, log)
+		m.markUnservable(inst, errors.Join(captureErr, releaseErr), log)
 		return status.Errorf(codes.Unavailable, "source could not be resumed after capture: %v", errors.Join(captureErr, releaseErr))
 	}
 	if persistErr != nil {
@@ -486,8 +494,7 @@ func (m *Manager) captureRunningSaved(ctx context.Context, inst *VMInstance, tmp
 	if captureErr != nil {
 		return captureErr
 	}
-	m.recordPhases("saved_snapshot", string(kind), map[string]time.Duration{"freeze": freezeFor, "frozen": frozenFor})
-	log.Info().Dur("freeze", freezeFor).Dur("frozen", frozenFor).Bool("workload_frozen", frozen).Bool("guest_flushed_stopped", synced).Msg("saved snapshot: source captured and released")
+	log.Info().Dur("freeze", freezeFor).Dur("frozen", frozenFor).Dur("release", releaseFor).Bool("workload_frozen", frozen).Bool("guest_flushed_stopped", synced).Msg("saved snapshot: source captured and released")
 	return nil
 }
 
