@@ -5,14 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime/pprof"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +23,8 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	bolt "go.etcd.io/bbolt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestRetainedRecordPathsTrackFullAndLayeredGenerations(t *testing.T) {
@@ -1115,7 +1120,58 @@ func testRetainedDependencyPersistenceLockOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+
+	// Every wait below is bounded. If a future change recreates a real mutex
+	// cycle, the failure includes all goroutine stacks and cleanup does not
+	// leave workers using the store after the test has returned.
+	const waitBudget = 2 * time.Second
+	var cleanupOnce sync.Once
+	var persistedStarted, cleanedStarted bool
+	var persistErr, cleanupErr error
+	persisted := make(chan error, 1)
+	cleaned := make(chan error, 1)
+	var cleanupFailure string
+	stackDump := func() string {
+		var stacks bytes.Buffer
+		if err := pprof.Lookup("goroutine").WriteTo(&stacks, 2); err != nil {
+			return fmt.Sprintf("goroutine dump failed: %v", err)
+		}
+		return stacks.String()
+	}
+	join := func(label string, ch <-chan error, started bool, result *error) {
+		if !started || *result != nil {
+			return
+		}
+		timer := time.NewTimer(waitBudget)
+		defer timer.Stop()
+		select {
+		case err := <-ch:
+			*result = err
+		case <-timer.C:
+			if cleanupFailure == "" {
+				cleanupFailure = fmt.Sprintf("%s did not finish within %s\n%s", label, waitBudget, stackDump())
+			}
+		}
+	}
+	var releaseCleanup, releaseSampler sync.Once
+	allowCleanup := make(chan struct{})
+	allowSampler := make(chan struct{})
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			releaseCleanup.Do(func() { close(allowCleanup) })
+			releaseSampler.Do(func() { close(allowSampler) })
+			if persistedStarted {
+				// The persistence context is cancelled by the caller through
+				// persistCancel before this join runs.
+				join("dependency persistence", persisted, true, &persistErr)
+			}
+			join("VM cleanup", cleaned, cleanedStarted, &cleanupErr)
+		})
+	}
+	t.Cleanup(func() {
+		cleanup()
+		_ = store.Close()
+	})
 
 	firstID, secondID := uuid.NewString(), uuid.NewString()
 	first := VMRecord{ID: firstID, Status: StatusRunning, Supervision: SupervisionCgroup}
@@ -1147,52 +1203,130 @@ func testRetainedDependencyPersistenceLockOrder(t *testing.T) {
 		vms:     map[string]*VMInstance{firstID: firstInst, secondID: secondInst},
 	}
 	firstLocked := make(chan struct{})
-	allowSampler := make(chan struct{})
+	cleanupPreflight := make(chan struct{})
 	cleanupManagerLocked := make(chan struct{})
-	allowCleanup := make(chan struct{})
+	var notifyFirstLocked, notifyCleanupPreflight, notifyCleanupManager sync.Once
 	m.retainedDependencyLockHook = func(id string) {
 		if id != firstID {
 			return
 		}
-		close(firstLocked)
+		notifyFirstLocked.Do(func() { close(firstLocked) })
 		<-allowSampler
+	}
+	m.handleVMErrorPreManagerLockHook = func(id string) {
+		if id != firstID {
+			return
+		}
+		notifyCleanupPreflight.Do(func() { close(cleanupPreflight) })
+		<-allowCleanup
 	}
 	m.handleVMErrorManagerLockHook = func(id string) {
 		if id != firstID {
 			return
 		}
-		close(cleanupManagerLocked)
-		<-allowCleanup
+		// This is only an acquisition notification. Blocking here would hold
+		// m.mu and turn the test into a teardown barrier rather than exercising
+		// the real manager/instance lock ordering.
+		notifyCleanupManager.Do(func() { close(cleanupManagerLocked) })
 	}
 
 	updates := []retainedDependencyUpdate{
 		{original: first, resolved: firstResolved},
 		{original: second, resolved: secondResolved},
 	}
-	persisted := make(chan error, 1)
-	go func() { persisted <- m.persistRetainedDependencies(t.Context(), updates) }()
-	<-firstLocked
-
-	cleaned := make(chan error, 1)
+	persistCtx, persistCancel := context.WithCancel(t.Context())
+	t.Cleanup(persistCancel)
+	cleanedStarted = true
 	go func() { cleaned <- m.handleVMError(firstID, errors.New("connection lost")) }()
-	<-cleanupManagerLocked
-	// cleanup now owns m.mu and waits for firstInst.mu. The sampler must be
-	// able to finish without reacquiring m.mu while it holds firstInst.mu.
-	close(allowSampler)
-	if err := <-persisted; err != nil {
-		t.Fatalf("dependency persistence blocked by cleanup lock order: %v", err)
+	if !waitSignal(t, "cleanup definitive-death preflight", cleanupPreflight, waitBudget, stackDump, &cleanupFailure) {
+		cleanup()
+		t.Fatal(cleanupFailure)
 	}
-	close(allowCleanup)
-	if err := <-cleaned; err == nil {
-		t.Fatal("handleVMError unexpectedly succeeded for a cleaned-up VM")
+	persistedStarted = true
+	go func() { persisted <- m.persistRetainedDependencies(persistCtx, updates) }()
+	if !waitSignal(t, "persistence first-instance lock", firstLocked, waitBudget, stackDump, &cleanupFailure) {
+		persistCancel()
+		cleanup()
+		t.Fatal(cleanupFailure)
+	}
+	// Cleanup has completed the real liveness oracle and is parked before m.mu.
+	// Let it acquire m.mu, observe that acquisition, then release persistence's
+	// first instance lock. This is the schedule that would deadlock if the
+	// sampler reacquired m.mu while holding that instance lock.
+	releaseCleanup.Do(func() { close(allowCleanup) })
+	if !waitSignal(t, "cleanup manager-lock acquisition", cleanupManagerLocked, waitBudget, stackDump, &cleanupFailure) {
+		persistCancel()
+		cleanup()
+		t.Fatal(cleanupFailure)
+	}
+	releaseSampler.Do(func() { close(allowSampler) })
+	cleanup()
+	if cleanupFailure != "" {
+		t.Fatal(cleanupFailure)
+	}
+	if persistErr != nil {
+		t.Fatalf("dependency persistence blocked by cleanup lock order: %v", persistErr)
+	}
+	if status.Code(cleanupErr) != codes.NotFound {
+		t.Fatalf("handleVMError = %v, want codes.NotFound", cleanupErr)
 	}
 
 	if _, ok := m.vms[firstID]; ok {
 		t.Fatal("cleanup left the dead owner tracked")
 	}
+	firstLive, err := store.Get(firstID)
+	if err != nil || firstLive != nil {
+		t.Fatalf("cleanup left a live durable owner: %+v (%v)", firstLive, err)
+	}
+	secondLive, ok := m.vms[secondID]
+	if !ok {
+		t.Fatal("cleanup removed the surviving tracked owner")
+	}
+	secondLiveRecord := toRecord(secondLive)
+	if secondLiveRecord.RootfsPath != secondResolved.RootfsPath {
+		t.Fatalf("live second owner dependency = %q, want %q", secondLiveRecord.RootfsPath, secondResolved.RootfsPath)
+	}
+	secondDurable, err := store.Get(secondID)
+	if err != nil || secondDurable == nil || secondDurable.RootfsPath != secondResolved.RootfsPath {
+		t.Fatalf("durable second owner dependency = %+v (%v), want %q", secondDurable, err, secondResolved.RootfsPath)
+	}
+	archived, err := store.retainedArchivedRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstArchived *VMRecord
+	for i := range archived {
+		if archived[i].ID == firstID {
+			firstArchived = &archived[i]
+			break
+		}
+	}
+	if firstArchived == nil || firstArchived.RootfsPath != firstResolved.RootfsPath {
+		t.Fatalf("archived first owner dependency = %+v, want %q", firstArchived, firstResolved.RootfsPath)
+	}
 	retained, err := store.retainedRecords()
-	if err != nil || len(retained) != 1 || retained[0].ID != firstID {
-		t.Fatalf("cleanup did not preserve the retained record: %+v %v", retained, err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedIDs := make(map[string]bool, len(retained))
+	for _, rec := range retained {
+		retainedIDs[rec.ID] = true
+	}
+	if len(retained) != 2 || !retainedIDs[firstID] || !retainedIDs[secondID] {
+		t.Fatalf("retained owners = %#v, want both tracked IDs %s and %s", retained, firstID, secondID)
+	}
+}
+
+func waitSignal(t *testing.T, label string, ch <-chan struct{}, budget time.Duration, dump func() string, failure *string) bool {
+	t.Helper()
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		*failure = fmt.Sprintf("%s did not complete within %s\n%s", label, budget, dump())
+		return false
 	}
 }
 

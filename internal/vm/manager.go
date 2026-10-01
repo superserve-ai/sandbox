@@ -542,8 +542,9 @@ type Manager struct {
 	restoreSnapshotHook func(socketPath, snapshotPath, memPath string, clockRealtime *bool) error
 	// These hooks are test seams for the retained-dependency lock-order
 	// regression; nil in production.
-	retainedDependencyLockHook   func(string)
-	handleVMErrorManagerLockHook func(string)
+	retainedDependencyLockHook      func(string)
+	handleVMErrorPreManagerLockHook func(string)
+	handleVMErrorManagerLockHook    func(string)
 	// pausedNetworkControllerState bounds pause-network reclamation cadence.
 	pausedNetworkControllerMu      sync.Mutex
 	pausedNetworkControllerLastRun time.Time
@@ -6220,6 +6221,13 @@ func (m *Manager) handleVMError(vmID string, origErr error) error {
 	// inconclusive answer as alive.
 	if !m.vmDefinitelyDead(checkCtx, vmID, m.supervisionForVM(vmID)) {
 		return origErr
+	}
+	// Test-only coordination point after the definitive-death preflight. The
+	// hook is nil in production and deliberately runs before m.mu is acquired,
+	// so lock-order tests can schedule cleanup without holding either manager or
+	// instance mutex.
+	if hook := m.handleVMErrorPreManagerLockHook; hook != nil {
+		hook(vmID)
 	}
 
 	// Single lock acquisition for both status update and removal so
