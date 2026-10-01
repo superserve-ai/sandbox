@@ -264,7 +264,10 @@ func TestPromotionSignupAssertionRegionAndBodyConsistency(t *testing.T) {
 		bodyAttempt                    uuid.UUID
 		status                         int
 	}{
-		{"valid East tuple", "use", "use", attempt, http.StatusServiceUnavailable},
+		{
+			name: "valid East tuple", signedRegion: "use", bodyRegion: "use",
+			bodyAttempt: attempt, status: http.StatusServiceUnavailable,
+		},
 		{"wrong signed region", "usw", "use", attempt, http.StatusForbidden},
 		{"wrong body region", "use", "usw", attempt, http.StatusForbidden},
 		{"signed and body attempt mismatch", "use", "use", uuid.New(), http.StatusForbidden},
