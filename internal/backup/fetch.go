@@ -77,11 +77,10 @@ func RestoredDependencies(dir string) error {
 				return fmt.Errorf("restored without its block map")
 			}
 		}
-		base, ok := sharedBaseIn(dir, f.BaseSHA256)
-		if !ok {
+		if !isHexDigest(f.BaseSHA256) {
 			return fmt.Errorf("restored base digest %q is not a sha256", f.BaseSHA256)
 		}
-		if _, err := os.Stat(base); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, SharedBaseName(f.BaseSHA256))); err == nil {
 			return nil
 		}
 		if hostBasePath(m, f.BaseSHA256) == "" {
@@ -123,11 +122,10 @@ func RestoredDisk(ctx context.Context, dir string) (Restored, error) {
 			}
 			r.BlockMap = blockMap
 		}
-		base, ok := sharedBaseIn(dir, f.BaseSHA256)
-		if !ok {
+		if !isHexDigest(f.BaseSHA256) {
 			return r, fmt.Errorf("restored base digest %q is not a sha256", f.BaseSHA256)
 		}
-		r.Base = base
+		r.Base = filepath.Join(dir, SharedBaseName(f.BaseSHA256))
 		if _, err := os.Stat(r.Base); err == nil {
 			return r, nil
 		}
@@ -135,7 +133,15 @@ func RestoredDisk(ctx context.Context, dir string) (Restored, error) {
 		if src == "" {
 			return r, fmt.Errorf("restored without its base %s", f.BaseSHA256)
 		}
-		resolved, err := hostBase(ctx, dir, f.BaseSHA256, src)
+		// Pinned for the same reason a restore pins its destination: the
+		// copy must land in this directory, not in whatever the path
+		// resolves to by the time it is written.
+		root, err := os.OpenRoot(dir)
+		if err != nil {
+			return r, fmt.Errorf("restored base %s: %w", f.BaseSHA256, err)
+		}
+		defer root.Close()
+		resolved, err := hostBase(ctx, root, f.BaseSHA256, src)
 		if err != nil {
 			return r, fmt.Errorf("restored base %s: %w", f.BaseSHA256, err)
 		}
@@ -195,13 +201,13 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 	// remembered: the restore loop and the verification loop each consult
 	// skip once per file.
 	satisfied := map[string]bool{}
-	skip := func(mf ManifestFile) bool {
+	skip := func(mf ManifestFile, root *os.Root) bool {
 		if !isSharedEntry(mf) {
 			return false
 		}
 		ok, seen := satisfied[mf.Name]
 		if !seen {
-			ok = satisfyFromHost(ctx, destDir, m, mf)
+			ok = satisfyFromHost(ctx, root, m, mf)
 			satisfied[mf.Name] = ok
 		}
 		return ok
@@ -225,12 +231,12 @@ func FetchGeneration(ctx context.Context, r BlobReader, owner, generation, destD
 // the entry is now satisfied; a false sends it down the ordinary fetch
 // path, which is also what a template that no longer holds those bytes
 // gets.
-func satisfyFromHost(ctx context.Context, dir string, m *GenerationManifest, mf ManifestFile) bool {
+func satisfyFromHost(ctx context.Context, root *os.Root, m *GenerationManifest, mf ManifestFile) bool {
 	src := hostBasePath(m, mf.SHA256)
 	if src == "" {
 		return false
 	}
-	base, err := hostBase(ctx, dir, mf.SHA256, src)
+	base, err := hostBase(ctx, root, mf.SHA256, src)
 	return err == nil && base != ""
 }
 
@@ -265,11 +271,12 @@ func hostBasePath(m *GenerationManifest, sha string) string {
 // copy that fails its digest is removed, leaving the manifest's own name
 // free for the fetch that follows. Only a check that could not run at all
 // is an error.
-func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
-	dst, ok := sharedBaseIn(dir, sha)
-	if !ok {
+func hostBase(ctx context.Context, root *os.Root, sha, src string) (string, error) {
+	if !isHexDigest(sha) {
 		return "", fmt.Errorf("base digest %q is not a sha256", sha)
 	}
+	name := SharedBaseName(sha)
+	dst := filepath.Join(root.Name(), name)
 	// One materialization per destination, verification and publication
 	// included: two resolutions of the same restore would otherwise each
 	// hash the copy and then race to rename it, and the loser's failure
@@ -278,22 +285,28 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 		// This name is given out only after a digest check, here or by the
 		// restore that fetched the object, so finding it is the same proof
 		// this call would have earned.
-		if _, err := os.Stat(dst); err == nil {
+		if _, err := root.Stat(name); err == nil {
 			return dst, nil
 		}
+		// Every step goes through the pinned root, the same handle the
+		// rest of the restore is written through: a destination renamed
+		// and replaced by a symlink mid-restore would otherwise take this
+		// copy outside the directory the restore is actually in, and the
+		// entry would be reported satisfied while absent from it.
+		//
 		// Hashed under a name nothing resolves, and given the manifest's
 		// name only once it matches: published first, a crash in between
 		// would leave an unverified copy that the next resolution here
 		// trusts on sight.
-		staging := dst + ".unverified"
-		if err := snapshotFileMode(ctx, staging, src, stageAuto); err != nil {
+		staging := "." + name + ".unverified"
+		if err := hostBaseInto(ctx, root, staging, src); err != nil {
 			if ctx.Err() != nil {
 				return "", ctx.Err()
 			}
 			return "", nil
 		}
-		if err := verifyPath(ctx, staging, sha); err != nil {
-			if rerr := os.Remove(staging); rerr != nil {
+		if err := verifyRootPath(ctx, root, staging, sha); err != nil {
+			if rerr := root.Remove(staging); rerr != nil {
 				return "", fmt.Errorf("discard unverified base copy: %w", rerr)
 			}
 			if ctx.Err() != nil {
@@ -301,8 +314,8 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 			}
 			return "", nil
 		}
-		if err := os.Rename(staging, dst); err != nil {
-			_ = os.Remove(staging)
+		if err := root.Rename(staging, name); err != nil {
+			_ = root.Remove(staging)
 			return "", fmt.Errorf("publish verified base copy: %w", err)
 		}
 		// Verified and in place, so cancellation here unmakes nothing:
@@ -310,11 +323,11 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 		// and losing it leaves the base simply absent next time, which
 		// materializes again. Reporting a failure instead would send the
 		// caller to fetch the object into a name this copy already holds.
-		if err := publishBaseSync(ctx, dir); err != nil && ctx.Err() == nil {
+		if err := publishBaseSync(ctx, root); err != nil && ctx.Err() == nil {
 			// Either a published base or none at all: left behind, this
 			// copy would collide with the fetch the caller must now make,
 			// and no cleanup owns a name this call never reported.
-			_ = os.Remove(dst)
+			_ = root.Remove(name)
 			return "", fmt.Errorf("publish verified base copy: %w", err)
 		}
 		return dst, nil
@@ -325,26 +338,42 @@ func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
 	return v.(string), nil
 }
 
-// sharedBaseIn names a shared base inside a restore. The digest comes
-// from a manifest, which is bucket content, so it must be exactly a
-// lowercase hex sha256 before it becomes a path component: anything else
-// would let a crafted entry steer this copy out of the restore.
-func sharedBaseIn(dir, sha string) (string, bool) {
-	if !isHexDigest(sha) {
-		return "", false
+// hostBaseInto materializes the host template into name inside the root,
+// reflinking where the filesystem allows and copying its data extents
+// otherwise. The destination is created exclusively, so a name planted in
+// between is never opened or followed.
+func hostBaseInto(ctx context.Context, root *os.Root, name, src string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
 	}
-	return filepath.Join(dir, SharedBaseName(sha)), true
+	defer in.Close()
+	fi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	discard := func() {
+		out.Close()
+		_ = root.Remove(name)
+	}
+	if err := copyOrClone(ctx, out, in, fi.Size(), true, discard); err != nil {
+		return err
+	}
+	if err := syncWithContext(ctx, out); err != nil {
+		discard()
+		return err
+	}
+	return out.Close()
 }
 
-// publishBaseSync makes a published base's directory entry durable. A
-// seam of its own, not the staging helpers', so each publication point is
-// drivable on its own.
-var publishBaseSync = syncDirWithContext
-
-// verifyPath hashes the file at path against the digest recorded for its
-// contents.
-func verifyPath(ctx context.Context, path, sha string) error {
-	f, err := os.Open(path)
+// verifyRootPath hashes a file inside the root against the digest
+// recorded for its contents.
+func verifyRootPath(ctx context.Context, root *os.Root, name, sha string) error {
+	f, err := root.Open(name)
 	if err != nil {
 		return err
 	}
@@ -354,6 +383,33 @@ func verifyPath(ctx context.Context, path, sha string) error {
 		return fmt.Errorf("extents: %w", err)
 	}
 	return verifyDigest(ctx, f, extents, apparent, sha)
+}
+
+// publishBaseSync makes a published base's directory entry durable. A
+// seam of its own, not the staging helpers', so each publication point is
+// drivable on its own.
+var publishBaseSync = syncRootDirWithContext
+
+// syncRootDirWithContext makes a pinned directory's entries durable,
+// releasing the caller on cancellation while the fsync keeps its own
+// handle until the kernel returns.
+func syncRootDirWithContext(ctx context.Context, root *os.Root) error {
+	d, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() {
+		err := d.Sync()
+		d.Close()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // LimitedReader caps the bytes per second streamed from a blob store.

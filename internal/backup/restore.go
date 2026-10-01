@@ -163,11 +163,14 @@ func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation,
 }
 
 // restoreGeneration is RestoreGeneration with entries skip reports as
-// already satisfied outside destDir, such as a shared base the host holds.
+// already satisfied. skip is handed the pinned destination root: an entry
+// it satisfies by materializing something must write it there, through
+// the same handle every other artifact goes through, or a destination
+// swapped for a symlink mid-restore would take that write outside.
 // A manifest the caller has already read and validated is used as given,
 // so a restore costs one manifest request and cannot fail on a second
 // identical one.
-func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, destDir string, manifest *GenerationManifest, skip func(ManifestFile) bool, progress ProgressFunc) (*GenerationManifest, error) {
+func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, destDir string, manifest *GenerationManifest, skip func(ManifestFile, *os.Root) bool, progress ProgressFunc) (*GenerationManifest, error) {
 	report := func(format string, args ...any) {
 		if progress != nil {
 			progress(format, args...)
@@ -217,7 +220,7 @@ func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, des
 		if err := validSegment(mf.Name); err != nil {
 			return fail(fmt.Errorf("manifest file name: %w", err))
 		}
-		if skip != nil && skip(mf) {
+		if skip != nil && skip(mf, root) {
 			report("skipping %s: satisfied on the host", mf.Name)
 			continue
 		}
@@ -237,7 +240,7 @@ func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, des
 	// verification cannot leave earlier files implicitly blessed: either
 	// the whole set passes or the whole set is gone.
 	for _, mf := range manifest.Files {
-		if skip != nil && skip(mf) {
+		if skip != nil && skip(mf, root) {
 			continue
 		}
 		err := verifyFile(ctx, root, mf)

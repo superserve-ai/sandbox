@@ -561,62 +561,12 @@ func snapshotFile(ctx context.Context, dst, src string, tryClone bool) error {
 		return err
 	}
 	tmp := out.Name()
-	cloned := false
-	if tryClone {
-		// Same contract as snapshotClone's attempt: the ioctl walks the
-		// extent map and cannot be cancelled, so on a deadline the caller
-		// is released and this goroutine owns the fd and the temp file
-		// until the kernel returns.
-		clone := cloneInto
-		done := make(chan error, 1)
-		go func() { done <- clone(out, in) }()
-		select {
-		case err := <-done:
-			cloned = err == nil
-		case <-ctx.Done():
-			go func() {
-				<-done
-				out.Close()
-				os.Remove(tmp)
-			}()
-			return ctx.Err()
-		}
+	discard := func() {
+		out.Close()
+		os.Remove(tmp)
 	}
-	if !cloned {
-		extents, _, xerr := Extents(in)
-		if xerr != nil {
-			out.Close()
-			os.Remove(tmp)
-			return xerr
-		}
-		for _, e := range extents {
-			// Reflink is unavailable on this filesystem, so the fallback
-			// pays a real read+write per extent; a single extent can span
-			// the whole inline-staging budget, and only a context check
-			// between extents (not one before the whole file) keeps a
-			// slow disk from pinning the RPC path's pause lock past its
-			// deadline the way the size threshold alone cannot.
-			if err := ctx.Err(); err != nil {
-				out.Close()
-				os.Remove(tmp)
-				return err
-			}
-			if _, err := out.Seek(e.Offset, io.SeekStart); err != nil {
-				out.Close()
-				os.Remove(tmp)
-				return err
-			}
-			if _, err := copyExtentContext(ctx, out, io.NewSectionReader(in, e.Offset, e.Length)); err != nil {
-				out.Close()
-				os.Remove(tmp)
-				return err
-			}
-		}
-		if err := out.Truncate(fi.Size()); err != nil {
-			out.Close()
-			os.Remove(tmp)
-			return err
-		}
+	if err := copyOrClone(ctx, out, in, fi.Size(), tryClone, discard); err != nil {
+		return err
 	}
 	// The journal enqueue that will reference this path is fsynced by
 	// BoltDB; the staged bytes and their directory entry must be durable
@@ -647,6 +597,68 @@ func snapshotFile(ctx context.Context, dst, src string, tryClone bool) error {
 		// file whose entry is not durable must not be the exception, or
 		// a caller that reports failure strands it.
 		_ = os.Remove(dst)
+		return err
+	}
+	return nil
+}
+
+// copyOrClone fills out with in's contents up to size, reflinking when
+// the caller allows it and the filesystem can, and otherwise copying each
+// data extent. Both are bounded by ctx. The destination is the caller's —
+// a temporary beside its final name, or a file created inside a pinned
+// root — so only the caller knows how to discard it, and discard is what
+// this calls on every failure: once it returns an error the destination is
+// gone or will be, and the caller must not touch it again.
+func copyOrClone(ctx context.Context, out, in *os.File, size int64, tryClone bool, discard func()) error {
+	if tryClone {
+		// FICLONE copies no data but does walk the extent map, so a dense
+		// or fragmented artifact is not free. The ioctl cannot be
+		// cancelled: on a deadline the caller is released and this
+		// goroutine owns the fd until the kernel returns, which is why
+		// discard runs there rather than here.
+		clone := cloneInto
+		done := make(chan error, 1)
+		go func() { done <- clone(out, in) }()
+		select {
+		case err := <-done:
+			if err == nil {
+				return nil
+			}
+		case <-ctx.Done():
+			go func() {
+				<-done
+				discard()
+			}()
+			return ctx.Err()
+		}
+	}
+	extents, _, err := Extents(in)
+	if err != nil {
+		discard()
+		return err
+	}
+	for _, e := range extents {
+		// Reflink is unavailable on this filesystem, so the fallback pays
+		// a real read+write per extent; a single extent can span the whole
+		// inline-staging budget, and only a context check between extents
+		// (not one before the whole file) keeps a slow disk from pinning
+		// the RPC path's pause lock past its deadline the way the size
+		// threshold alone cannot.
+		if err := ctx.Err(); err != nil {
+			discard()
+			return err
+		}
+		if _, err := out.Seek(e.Offset, io.SeekStart); err != nil {
+			discard()
+			return err
+		}
+		if _, err := copyExtentContext(ctx, out, io.NewSectionReader(in, e.Offset, e.Length)); err != nil {
+			discard()
+			return err
+		}
+	}
+	if err := out.Truncate(size); err != nil {
+		discard()
 		return err
 	}
 	return nil

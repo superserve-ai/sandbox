@@ -505,7 +505,7 @@ func TestHostBaseLeavesNothingBehindWhenTheCopyFailsItsDigest(t *testing.T) {
 	restore := t.TempDir()
 
 	// The digest of something else: what the template held at pause time.
-	base, err := hostBase(context.Background(), restore, digestOf(bytes.Repeat([]byte{0x22}, 64<<10)), src)
+	base, err := hostBase(context.Background(), rootOf(t, restore), digestOf(bytes.Repeat([]byte{0x22}, 64<<10)), src)
 	if err != nil || base != "" {
 		t.Fatalf("base = %q (%v), want no base and no error", base, err)
 	}
@@ -669,6 +669,7 @@ func TestHostBaseResolvesOnceUnderConcurrentCallers(t *testing.T) {
 		t.Fatal(err)
 	}
 	restore := t.TempDir()
+	root := rootOf(t, restore)
 	want := filepath.Join(restore, SharedBaseName(digestOf(data)))
 
 	var wg sync.WaitGroup
@@ -678,7 +679,7 @@ func TestHostBaseResolvesOnceUnderConcurrentCallers(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			got[i], errs[i] = hostBase(context.Background(), restore, digestOf(data), src)
+			got[i], errs[i] = hostBase(context.Background(), root, digestOf(data), src)
 		}(i)
 	}
 	wg.Wait()
@@ -772,13 +773,13 @@ func TestHostBaseKeepsAPublishedCopyWhenTheEntrySyncIsCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	prev := publishBaseSync
-	publishBaseSync = func(context.Context, string) error {
+	publishBaseSync = func(context.Context, *os.Root) error {
 		cancel()
 		return context.Canceled
 	}
 	t.Cleanup(func() { publishBaseSync = prev })
 
-	base, err := hostBase(ctx, restore, digestOf(data), src)
+	base, err := hostBase(ctx, rootOf(t, restore), digestOf(data), src)
 	want := filepath.Join(restore, SharedBaseName(digestOf(data)))
 	if err != nil || base != want {
 		t.Fatalf("base = %q (%v), want %q", base, err, want)
@@ -842,5 +843,129 @@ func TestRestoredDiskRefusesABaseDigestThatIsNotADigest(t *testing.T) {
 		if strings.Contains(e.Name(), "escaped") {
 			t.Fatalf("wrote %s outside the restore", e.Name())
 		}
+	}
+}
+
+// The destination is pinned before any artifact is written, and the host
+// base must be written through that same pin: swapped for a symlink after
+// the pin, a pathname-based copy lands outside the directory the restore
+// is actually in, while being reported as satisfied within it.
+func TestHostBaseWritesInsideThePinnedDestination(t *testing.T) {
+	stubClone(t, copyClone)
+	parent := t.TempDir()
+	data := bytes.Repeat([]byte{0x11}, 128<<10)
+	src := filepath.Join(parent, "base.ext4")
+	if err := os.WriteFile(src, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(parent, "restore")
+	if err := os.MkdirAll(dest, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	root := rootOf(t, dest)
+	// The destination is renamed away and a symlink left in its place, as
+	// openFreshDir's pin exists to survive.
+	moved := filepath.Join(parent, "moved")
+	if err := os.Rename(dest, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, dest); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := hostBase(context.Background(), root, digestOf(data), src); err != nil {
+		t.Fatal(err)
+	}
+
+	if entries, err := os.ReadDir(outside); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("wrote %v outside the pinned destination", names)
+	}
+	// It is in the directory that was pinned, wherever that now lives.
+	held, err := os.ReadFile(filepath.Join(moved, SharedBaseName(digestOf(data))))
+	if err != nil {
+		t.Fatalf("the base is not in the pinned destination: %v", err)
+	}
+	if !bytes.Equal(held, data) {
+		t.Fatal("the base does not hold the bytes the pause recorded")
+	}
+}
+
+func rootOf(t *testing.T, dir string) *os.Root {
+	t.Helper()
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { root.Close() })
+	return root
+}
+
+// The destination is pinned before any artifact is written, and the host
+// base must be written through that same pin: swapped for a symlink
+// mid-restore, a pathname-based copy would land outside the directory the
+// restore is actually in, and be reported satisfied while absent from it.
+func TestFetchGenerationWritesTheHostBaseInsideThePinnedDestination(t *testing.T) {
+	stubClone(t, copyClone)
+	store := newMemBlobs()
+	dir := t.TempDir()
+	baseData := bytes.Repeat([]byte{0x11}, 128<<10)
+	basePath := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(basePath, baseData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := writePauseFixture(t, dir, "pause A")
+	task.Files[0].BasePath = basePath
+	task.Files[0].BaseSHA256 = digestOf(baseData)
+	task.Generation = GenerationKey(task.Files)
+	uploadFixture(t, store, task)
+
+	parent := t.TempDir()
+	dest := filepath.Join(parent, task.SandboxID)
+	outside := filepath.Join(parent, "outside")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Swap the destination for a symlink once the restore has pinned it,
+	// which the first progress report marks.
+	swapped := false
+	progress := func(format string, _ ...any) {
+		// The first artifact going in proves the destination is pinned.
+		if swapped || !strings.HasPrefix(format, "restoring ") {
+			return
+		}
+		swapped = true
+		if err := os.Rename(dest, filepath.Join(parent, "moved")); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Symlink(outside, dest); err != nil {
+			t.Error(err)
+		}
+	}
+	// The restore itself may fail; what matters is where it wrote.
+	_, _ = FetchGeneration(context.Background(), store, task.SandboxID, task.Generation, dest, progress)
+
+	entries, err := os.ReadDir(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("wrote %v outside the pinned destination", names)
 	}
 }
