@@ -37,7 +37,7 @@ var checksumExclusions = map[string]map[string]bool{
 // sides of the comparison.
 func rowChecksums(
 	ctx context.Context,
-	pool *pgxpool.Pool,
+	pool querier,
 	t tableSpec,
 	teamID uuid.UUID,
 	transform rowTransform,

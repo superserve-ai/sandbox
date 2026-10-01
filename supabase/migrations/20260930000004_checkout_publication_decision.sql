@@ -103,16 +103,8 @@ BEGIN
         SELECT 1 FROM stripe_checkout_publication_decision
         WHERE team_id=NEW.team_id AND checkout_generation=NEW.checkout_initializing_at) THEN RETURN NEW; END IF;
     v_subscription := NEW.checkout_subscription_id;
-    -- A lifecycle watermark is not ownership proof: after a terminal
-    -- subscription, the same account can open a replacement Checkout while
-    -- Stripe continues delivering updates for the old subscription. Bind an
-    -- unannotated event only when this write establishes a new subscription
-    -- ID on the account (the invoice-first case); later status/timestamp
-    -- updates must use the retained association or explicit Checkout proof.
-    IF v_subscription IS NULL AND NEW.stripe_subscription_id IS NOT NULL
-       AND (TG_OP='INSERT' OR OLD.stripe_subscription_id IS DISTINCT FROM NEW.stripe_subscription_id) THEN
-        v_subscription := NEW.stripe_subscription_id;
-    END IF;
+    -- Only the verified Checkout association proves generation ownership.
+    -- Invoice projection can introduce an older subscription on this customer.
     IF v_subscription IS NOT NULL THEN
         INSERT INTO stripe_checkout_publication_subscription(team_id,subscription_id,checkout_generation)
         VALUES(NEW.team_id,v_subscription,NEW.checkout_initializing_at) ON CONFLICT DO NOTHING;
@@ -177,6 +169,19 @@ BEGIN
         RETURN 'authority_unavailable';
     END IF;
     IF v_actor_conflict THEN RETURN 'ineligible'; END IF;
+    IF NOT p_has_checkout_generation AND p_subscription_id IS NOT NULL
+       AND EXISTS (SELECT 1 FROM stripe_checkout_publication_decision WHERE team_id=p_team_id)
+       AND NOT EXISTS (SELECT 1 FROM stripe_checkout_publication_subscription
+           WHERE team_id=p_team_id AND subscription_id=p_subscription_id) THEN
+        -- Do not infer ownership from customer routing or the open generation,
+        -- even with enforcement off. Paid activation can proceed while Checkout
+        -- proof is pending; existing reservation obligations remain fenced.
+        IF EXISTS (SELECT 1 FROM team_billing_account
+            WHERE team_id=p_team_id AND stripe_activation_credit_reserved_at IS NOT NULL) THEN
+            RETURN 'blocked';
+        END IF;
+        RETURN 'authority_unavailable';
+    END IF;
     BEGIN
         -- A policy-row lock timeout is a promotion-only authority failure.
         -- Financial reservation contention must still propagate and retry.

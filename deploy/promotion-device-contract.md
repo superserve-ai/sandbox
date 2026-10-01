@@ -118,11 +118,45 @@ For signer interoperability, the Console producer test can write fresh request
 fixtures to `PROMOTION_ASSERTION_FIXTURE_OUT`. Run
 `TestPromotionAccountConsoleInterop` with `PROMOTION_ASSERTION_FIXTURE_IN` pointing
 to that file within five minutes. It passes the actual Console assertions through
-the backend middleware and handler identity checks for all three operations,
-including matching forged actor/body IDs. The fixture contains a generated test
+the backend middleware and handler identity checks for all four operations:
+bind, evidence, register, and create-team. Three-operation fixtures are rejected.
+Checks include forged actor headers and matching forged actor/body IDs, plus
+mutated creation attempt, team, region, and decision fields. The fixture contains a generated test
 public key and assertions, never a private key or real account evidence. This
 test skips without the fixture; an ordinary backend suite pass is not evidence
 that the cross-runtime check ran. Record both producer and verifier execution.
+
+The fixture JSON has `public_key` (base64 Ed25519 public key) and `requests`
+(exactly one entry per operation). Each entry has `operation`, `assertion`
+(fresh EdDSA JWT), `actor` (the verified user UUID), and `body` (the exact JSON
+request). The create-team entry uses this shape with generated test UUIDs:
+
+```json
+{
+  "operation": "create-team",
+  "assertion": "<fresh signed JWT>",
+  "actor": "6a70c7ad-9304-4517-a125-9b633502df08",
+  "body": {
+    "user_id": "6a70c7ad-9304-4517-a125-9b633502df08",
+    "attempt_id": "f9ff68c6-43cc-4fab-97fb-c23481ec3058",
+    "team_id": "958253b4-558f-4ce4-89b7-c752ff4fb748",
+    "name": "example-team",
+    "home_region": "use",
+    "authority_unavailable": true
+  }
+}
+```
+
+Sign `sub=actor`, `operation=create-team`, `attempt_id`, `team_id`,
+`home_region`, and `authority_unavailable`, with the issuer/audience above,
+current `iat`, and `exp` no more than 300 seconds later. The legacy create-team
+operation does not sign `name`; durable prepare/complete operations bind it as
+documented below. The verifier selects the creation fixture's `use` or `usw`
+region and corresponding existing account test bearer. All four assertions must
+use the same generated test key. Generate assertions with the real Console
+signer immediately before verification; stored assertions are not reusable
+validation evidence. The valid request reaches the unavailable database (503);
+each signed-field mutation must fail authentication or provenance checks (403).
 
 The staging, production East, and production West Terraform roots each create
 four cell-specific Secret Manager secrets. `promotion_evidence_enabled` defaults
@@ -400,8 +434,9 @@ policy-row lock across explicit team creation and legacy owner assignment.
 RPC/table access and preservation of unrelated grant-error retries.
 
 Run these tests against the resulting backend revision before rollout. The
-existing Console fixture covers bind/evidence/register only; its pass does not
-prove the creation boundary works end to end. Console must also implement and
+historical bind/evidence/register-only fixture does not prove the creation
+boundary works end to end. The interoperability verifier now requires the signed
+create-team fixture above. Console must also implement and
 verify the creation call sequence and signed fields above, including failure
 with prior evidence and replay after authority recovers. Enforcement stays off
 until that selected region's consumer and backend validation are recorded.
@@ -719,6 +754,13 @@ cannot upgrade that generation. The retained decision table distinguishes
 publication failure from other authority failures for trusted database operators.
 Existing matching reservations replay before the new denial check; other pending
 financial obligations remain retryable and are never released by this decision.
+An invoice or subscription-ID projection does not establish generation ownership.
+Only verified Checkout association writes populate the retained subscription
+table. For teams with publication decisions, subscription callbacks without
+generation metadata or a retained association defer credit with
+`authority_unavailable` while preserving paid activation and existing obligations.
+Migration copies and verifies both immutable tables before exposing the billing
+account's customer routing, including during interrupted copies and retries.
 
 Trusted service-role RPCs are:
 

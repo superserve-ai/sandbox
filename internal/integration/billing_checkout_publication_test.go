@@ -158,17 +158,24 @@ func TestIntegration_BillingCheckoutPublicationFailurePaidActivation(t *testing.
 		*account.StripeCustomerID, "sub_older_"+f.team.String(), "open", now))
 	var invoiceBound bool
 	if err := testPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stripe_checkout_publication_subscription
-		WHERE team_id=$1 AND subscription_id=$2)`, f.team, "sub_older_"+f.team.String()).Scan(&invoiceBound); err != nil || !invoiceBound {
-		t.Fatalf("invoice subscription transition did not retain the failed generation: %t %v", invoiceBound, err)
+		WHERE team_id=$1 AND subscription_id=$2)`, f.team, "sub_older_"+f.team.String()).Scan(&invoiceBound); err != nil || invoiceBound {
+		t.Fatalf("invoice inferred generation ownership: %t %v", invoiceBound, err)
 	}
-	// The invoice can establish the subscription projection before its
-	// lifecycle callback. That callback may omit Checkout metadata, but the
-	// first subscription-ID transition must already retain the failed
-	// generation's no-credit decision before reservation.
+	// A delayed invoice can project a previously unseen older subscription.
+	// Neither it nor its replay proves ownership of the open generation.
 	invoiceSubscription := "sub_older_" + f.team.String()
 	activeWithoutGeneration := stripeSubscriptionWebhookPayloadWithMetadata(t, "evt_invoice_active_"+f.team.String(), "customer.subscription.updated", invoiceSubscription,
 		*account.StripeCustomerID, "active", now, now, now.AddDate(0, 1, 0), map[string]string{"activation_user_id": f.actor.String()})
 	send(activeWithoutGeneration)
+	send(activeWithoutGeneration)
+	if err := testPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stripe_checkout_publication_subscription
+		WHERE team_id=$1)`, f.team).Scan(&invoiceBound); err != nil || invoiceBound {
+		t.Fatalf("ambiguous activation inferred generation ownership: %t %v", invoiceBound, err)
+	}
+	ambiguous, err := testQueries.GetTeamBillingCheckoutForRecovery(ctx, f.team)
+	if err != nil || !ambiguous.TrialEndedAt.Valid || ambiguous.StripeActivationCreditReservedAt.Valid || ambiguous.StripeActivationCreditGrantedAt.Valid {
+		t.Fatalf("ambiguous subscription did not retain paid-only access: %+v %v", ambiguous, err)
+	}
 	// An update can precede both creation and Checkout completion callbacks.
 	active := stripeSubscriptionWebhookPayloadWithMetadata(t, "evt_paid_"+f.team.String(), "customer.subscription.updated", subscription,
 		*account.StripeCustomerID, "active", now, now, now.AddDate(0, 1, 0), metadata)
@@ -181,6 +188,11 @@ func TestIntegration_BillingCheckoutPublicationFailurePaidActivation(t *testing.
 	}
 	send(completion)
 	send(active)
+	var associations int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM stripe_checkout_publication_subscription
+		WHERE team_id=$1`, f.team).Scan(&associations); err != nil || associations != 1 {
+		t.Fatalf("only verified subscription should be retained: %d %v", associations, err)
+	}
 	// Fresh evidence and a later event without generation metadata cannot upgrade
 	// the retained subscription decision after the mutable lease is cleared.
 	rolloutExec(t, testPool, `SELECT * FROM upsert_profile_with_promotion_identity($1,$2,true,clock_timestamp(),clock_timestamp())`, f.actor, f.actor.String()+"@example.com")
@@ -204,6 +216,61 @@ func TestIntegration_BillingCheckoutPublicationFailurePaidActivation(t *testing.
         AND NOT EXISTS(SELECT 1 FROM promotion_device_grant WHERE user_id=$1 AND promotion='stripe')
         AND NOT EXISTS(SELECT 1 FROM user_promotion_entitlement WHERE user_id=$1 AND stripe_redemption_at IS NOT NULL)`, f.actor).Scan(&preserved); err != nil || !preserved {
 		t.Fatalf("original evidence or consumption changed: %t %v", preserved, err)
+	}
+}
+
+func TestIntegration_BillingCheckoutPublicationRequiresSubscriptionProof(t *testing.T) {
+	f := newPublicationCheckoutFixture(t)
+	ctx := context.Background()
+	if w := f.request(t, f.body("standard"), f.actor, f.key, nil); w.Code != http.StatusOK {
+		t.Fatalf("checkout: %d %s", w.Code, w.Body.String())
+	}
+	tx := localIdentityTransaction(t, false)
+	queries := testQueries.WithTx(tx)
+	reserve := func(subscription, event string) string {
+		t.Helper()
+		var state string
+		if err := tx.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_subscription_event_state($1,$2,$3,$4,NULL,false)`,
+			f.team, f.actor, event, subscription).Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		return state
+	}
+	for _, subscription := range []string{"sub_delayed_first", "sub_delayed_second"} {
+		// Invoice projection and repeated reservation attempts cannot turn
+		// customer ownership into immutable generation authority.
+		rolloutExec(t, tx, `UPDATE team_billing_account SET stripe_subscription_id=$2 WHERE team_id=$1`, f.team, subscription)
+		for i := 0; i < 2; i++ {
+			if state := reserve(subscription, "evt_"+subscription); state != "authority_unavailable" {
+				t.Fatalf("unproven subscription reservation: %s", state)
+			}
+		}
+	}
+	var count int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM stripe_checkout_publication_subscription WHERE team_id=$1`, f.team).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("projection created immutable associations: %d %v", count, err)
+	}
+	// The trusted completion path supplies the association before replay.
+	subscription := "sub_verified_" + f.team.String()
+	if err := queries.AssociateTeamBillingCheckoutSubscription(ctx, db.AssociateTeamBillingCheckoutSubscriptionParams{
+		TeamID: f.team, SubscriptionID: &subscription,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	event := "evt_verified_" + f.team.String()
+	if state := reserve(subscription, event); state != "acquired" {
+		t.Fatalf("verified standard generation lost eligibility: %s", state)
+	}
+	if _, err := queries.MarkStripePromotionAttempt(ctx, db.MarkStripePromotionAttemptParams{
+		TeamID: pgtype.UUID{Bytes: f.team, Valid: true}, UserID: f.actor, EventID: &event,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if state := reserve("sub_delayed_first", "evt_delayed_again"); state != "blocked" {
+		t.Fatalf("ambiguous event bypassed existing obligation: %s", state)
+	}
+	if state := reserve(subscription, event); state != "existing" {
+		t.Fatalf("verified obligation cannot replay: %s", state)
 	}
 }
 

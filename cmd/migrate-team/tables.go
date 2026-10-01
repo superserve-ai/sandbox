@@ -75,13 +75,12 @@ var migratedTables = []tableSpec{
 	{"profile", profileScope},
 	{"team", "id = $1"},
 	{"team_feature_flag", "team_id = $1"},
-	{"team_billing_account", "team_id = $1"},
 	// Checkout publication decisions and subscription associations are
-	// immutable financial authority. They must move with the account before
-	// destination ownership is published; otherwise a later webhook can treat
-	// a paid-only generation as legacy and issue credit.
+	// immutable financial authority. Copy and verify them before the account
+	// exposes customer routing to destination webhooks.
 	{"stripe_checkout_publication_decision", "team_id = $1"},
 	{"stripe_checkout_publication_subscription", "team_id = $1"},
+	{"team_billing_account", "team_id = $1"},
 	// The cutoff is the authoritative, immutable activation boundary. It must
 	// move with the team so a cell migration cannot silently re-enable storage
 	// at a later timestamp.

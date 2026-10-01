@@ -4,8 +4,12 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,10 +18,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/superserve-ai/sandbox/internal/api"
+	appconfig "github.com/superserve-ai/sandbox/internal/config"
 	"github.com/superserve-ai/sandbox/internal/db"
 	"github.com/superserve-ai/sandbox/internal/promotiontest"
 )
@@ -1559,6 +1565,113 @@ func TestStripeEntitlementMigration(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 		t.Fatal("expected operation to wait on the source promotion lock")
+	}
+	t.Run("interrupted publication copy preserves paid-only activation", func(t *testing.T) {
+		cfg, actor := newFixture()
+		customer, subscription := "cus_"+cfg.teamID.String(), "sub_"+cfg.teamID.String()
+		mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,$2)`, cfg.teamID, customer)
+		mustExec(t, srcPool, `SELECT begin_stripe_checkout_with_publication_decision($1,$2,$3,'use','request','publication_failed',$4)`, cfg.teamID, actor, uuid.New(), uuid.New())
+		mustExec(t, srcPool, `UPDATE team_billing_account SET checkout_subscription_id=$2,
+			stripe_subscription_id=$2,stripe_subscription_status='incomplete' WHERE team_id=$1`, cfg.teamID, subscription)
+		mustExec(t, srcPool, `UPDATE team_billing_account SET checkout_initializing_at=NULL,
+			checkout_pending_attempt_ids='{}',checkout_request_key=NULL WHERE team_id=$1`, cfg.teamID)
+		// Fail the first membership copy, after customer routing has committed.
+		mustExec(t, dstPool, `CREATE FUNCTION test_interrupt_publication_copy() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN RAISE EXCEPTION 'interrupted publication copy'; END $$`)
+		mustExec(t, dstPool, `CREATE TRIGGER test_interrupt_publication_copy BEFORE INSERT ON team_member
+			FOR EACH STATEMENT EXECUTE FUNCTION test_interrupt_publication_copy()`)
+		// Also interrupt authority copied after routing, so an account-first
+		// regression cannot hide the unsafe window by finishing both tables.
+		mustExec(t, dstPool, `CREATE FUNCTION test_interrupt_late_publication() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				IF EXISTS(SELECT 1 FROM team_billing_account WHERE team_id=NEW.team_id) THEN
+					RAISE EXCEPTION 'interrupted publication copy';
+				END IF;
+				RETURN NEW;
+			END $$`)
+		mustExec(t, dstPool, `CREATE TRIGGER test_interrupt_late_publication BEFORE INSERT ON stripe_checkout_publication_decision
+			FOR EACH ROW EXECUTE FUNCTION test_interrupt_late_publication()`)
+		t.Cleanup(func() {
+			mustExec(t, dstPool, `DROP TRIGGER IF EXISTS test_interrupt_publication_copy ON team_member`)
+			mustExec(t, dstPool, `DROP FUNCTION test_interrupt_publication_copy()`)
+			mustExec(t, dstPool, `DROP TRIGGER IF EXISTS test_interrupt_late_publication ON stripe_checkout_publication_decision`)
+			mustExec(t, dstPool, `DROP FUNCTION test_interrupt_late_publication()`)
+		})
+		if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "interrupted publication copy") {
+			t.Fatalf("expected interruption after customer publication: %v", err)
+		}
+		if got := scanString(t, dstPool, `SELECT count(*)::text FROM team_member WHERE team_id=$1`, cfg.teamID); got != "0" {
+			t.Fatal("membership unexpectedly published")
+		}
+		const secret = "example-webhook-secret"
+		h := api.NewHandlers(nil, db.New(dstPool), &appconfig.Config{StripeWebhookSecret: secret})
+		h.Pool = dstPool
+		router := gin.New()
+		router.POST("/stripe/webhook", h.HandleStripeWebhook)
+		activate := func(eventID string) {
+			t.Helper()
+			now := time.Now().Unix()
+			payload, err := json.Marshal(map[string]any{"id": eventID, "type": "customer.subscription.updated", "created": now,
+				"data": map[string]any{"object": map[string]any{"id": subscription, "customer": customer, "status": "active",
+					"current_period_start": now, "current_period_end": now + 86400*30,
+					"metadata": map[string]string{"activation_user_id": actor.String()}}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mac := hmac.New(sha256.New, []byte(secret))
+			fmt.Fprintf(mac, "%d.%s", now, payload)
+			req := httptest.NewRequest(http.MethodPost, "/stripe/webhook", strings.NewReader(string(payload)))
+			req.Header.Set("Stripe-Signature", fmt.Sprintf("t=%d,v1=%x", now, mac.Sum(nil)))
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("destination activation: %d %s", w.Code, w.Body.String())
+			}
+			var paidOnly bool
+			if err := dstPool.QueryRow(ctx, `SELECT trial_ended_at IS NOT NULL AND stripe_subscription_status='active'
+				AND stripe_activation_credit_reserved_at IS NULL AND stripe_activation_credit_granted_at IS NULL
+				FROM team_billing_account WHERE team_id=$1`, cfg.teamID).Scan(&paidOnly); err != nil || !paidOnly {
+				t.Fatalf("interrupted copy lost paid-only authority: %t %v", paidOnly, err)
+			}
+			if got := scanString(t, dstPool, `SELECT reason FROM stripe_promotion_outcome WHERE event_id=$1`, eventID); got != "authority_unavailable" {
+				t.Fatalf("destination promotion outcome: %s", got)
+			}
+		}
+		activate("evt_interrupted_" + cfg.teamID.String())
+		mustExec(t, dstPool, `DROP TRIGGER test_interrupt_publication_copy ON team_member`)
+		mustExec(t, dstPool, `DROP TRIGGER test_interrupt_late_publication ON stripe_checkout_publication_decision`)
+		if err := run(ctx, cfg); err != nil {
+			t.Fatalf("resume copy: %v", err)
+		}
+		activate("evt_resumed_" + cfg.teamID.String())
+	})
+	for _, conflict := range []string{"decision", "subscription"} {
+		t.Run("conflicting publication "+conflict+" blocks customer routing", func(t *testing.T) {
+			cfg, actor := newFixture()
+			generation := time.Now().UTC().Truncate(time.Microsecond)
+			for _, pool := range []*pgxpool.Pool{srcPool, dstPool} {
+				decision := "publication_failed"
+				if conflict == "decision" && pool == dstPool {
+					decision = "standard"
+				}
+				mustExec(t, pool, `INSERT INTO stripe_checkout_publication_decision
+					(team_id,checkout_generation,user_id,operation_id,home_region,request_key,decision)
+					VALUES($1,$2,$3,$1,'use','request',$4)`, cfg.teamID, generation, actor, decision)
+			}
+			mustExec(t, srcPool, `INSERT INTO stripe_checkout_publication_subscription VALUES($1,'sub_source',$2)`, cfg.teamID, generation)
+			if conflict == "subscription" {
+				mustExec(t, dstPool, `INSERT INTO stripe_checkout_publication_subscription VALUES($1,'sub_unproven',$2)`, cfg.teamID, generation)
+			}
+			mustExec(t, srcPool, `INSERT INTO team_billing_account(team_id,stripe_customer_id) VALUES($1,$2)`, cfg.teamID, "cus_"+cfg.teamID.String())
+			for i := 0; i < 2; i++ {
+				if err := run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "content drift before billing account publication") {
+					t.Fatalf("conflicting authority must stop copy and retry: %v", err)
+				}
+				if got := scanString(t, dstPool, `SELECT count(*)::text FROM team_billing_account WHERE team_id=$1`, cfg.teamID); got != "0" {
+					t.Fatal("conflicting authority published customer routing")
+				}
+			}
+		})
 	}
 	t.Run("uncommitted reservation is observed before ownership copy", func(t *testing.T) {
 		cfg, actor := newFixture()
