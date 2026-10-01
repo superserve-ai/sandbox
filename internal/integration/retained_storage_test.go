@@ -622,7 +622,7 @@ func TestRetainedStorageConsumerParity(t *testing.T) {
 		exec(t, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_hourly_rollups',true),($1,'tenant_usage_dashboard',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, team)
 		first, second := uuid.New(), uuid.New()
 		insert := func(id uuid.UUID, a, b time.Time, extents string) {
-			exec(t, `INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at) VALUES($1,$2,'sandbox',$3,'fixture',$4::jsonb,$5,$6)`, host, team, id, extents, a, b)
+			exec(t, `INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at) VALUES($1,$2,'sandbox',$3,$4,$5::jsonb,$6,$7)`, host, team, id, strings.Repeat("f", 64), extents, a, b)
 		}
 		// Both teams occupy identical host/device/extent coordinates. The
 		// second team keeps the same allocation instead of growing at mid.
@@ -757,11 +757,11 @@ func TestRetainedStorageConsumerParity(t *testing.T) {
 	}
 	templateID, unknownSandbox := uuid.New(), uuid.New()
 	if _, err := testPool.Exec(ctx, `INSERT INTO template(id,team_id,name,status,build_spec,rootfs_path,snapshot_path,mem_path,vcpu,memory_mib,disk_mib)
- VALUES($1,$2,'unknown-baseline','ready','{}'::jsonb,'/example/unknown/rootfs.ext4','/example/unknown/vmstate.snap','/example/unknown/mem.snap',1,1024,1)`, templateID, unknownTeam); err != nil {
+	 VALUES($1,$2,'unknown-baseline','ready','{}'::jsonb,'/example/unknown/rootfs.ext4','/example/unknown/vmstate.snap','/example/unknown/mem.snap',1,1024,1024)`, templateID, unknownTeam); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := testPool.Exec(ctx, `INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,template_id)
- VALUES($1,$2,'unknown-baseline','paused',$3,1,1024,1,$4,$5)`, unknownSandbox, unknownTeam, host, start, templateID); err != nil {
+	 VALUES($1,$2,'unknown-baseline','paused',$3,1,1024,1024,$4,$5)`, unknownSandbox, unknownTeam, host, start, templateID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := testPool.Exec(ctx, `INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
@@ -1124,7 +1124,7 @@ func TestRetainedStorageBaselineProvenance(t *testing.T) {
 	exec(`INSERT INTO template(id,team_id,name,status,build_spec,rootfs_path,snapshot_path,mem_path,vcpu,memory_mib,disk_mib)
 	 VALUES($1,(SELECT team_id FROM sandbox WHERE id=$2),'provenance-template','ready','{}'::jsonb,'/example/current/rootfs.ext4','/example/current/vmstate.snap','/example/current/mem.snap',1,1024,1024)`, missing, f.sandboxID)
 	exec(`INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,template_id)
-	 SELECT $1,team_id,'missing-provenance','paused',host_id,1,1,1,created_at,$3 FROM sandbox WHERE id=$2`, missing, f.sandboxID, missing)
+	 SELECT $1,team_id,'missing-provenance','paused',host_id,1,1,1024,created_at,$3 FROM sandbox WHERE id=$2`, missing, f.sandboxID, missing)
 	exec(`INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
  SELECT id,team_id,host_id,0,created_at FROM sandbox WHERE id=$1`, missing)
 	var unknown bool
