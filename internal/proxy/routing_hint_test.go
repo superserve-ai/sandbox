@@ -17,7 +17,6 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/superserve-ai/sandbox/internal/auth"
 	"github.com/superserve-ai/sandbox/internal/db"
-	"github.com/superserve-ai/sandbox/internal/telemetry"
 )
 
 type hintHosts map[string]SandboxRoute
@@ -42,11 +41,12 @@ func TestHintRoutingFallbackAndAuthorization(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
+			recorder := &lookupRecorder{}
 			local := NewHandler([]string{"sandbox.test"}, &stubResolver{err: ErrInstanceNotFound}, zerolog.Nop()).WithAuth(seed).WithExec()
 			router := NewRoutingHandler([]string{"sandbox.test"}, "local", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
 				calls++
 				return SandboxRoute{HostID: "local"}, nil
-			}), nil, local, zerolog.Nop()).WithRoutingHints(hintHosts{"local": {HostID: "local"}}, freshTestRevocations())
+			}), nil, local, zerolog.Nop(), recorder).WithRoutingHints(hintHosts{"local": {HostID: "local"}}, freshTestRevocations())
 			if tc.name == "revoked" {
 				router.revocations = &RoutingRevocations{expires: time.Now().Add(time.Second), revoked: map[routeVersion]struct{}{{id, 1}: {}}}
 			}
@@ -60,6 +60,9 @@ func TestHintRoutingFallbackAndAuthorization(t *testing.T) {
 			router.ServeHTTP(w, req)
 			if calls != tc.lookups {
 				t.Fatalf("lookups=%d want %d", calls, tc.lookups)
+			}
+			if recorder.count != tc.lookups {
+				t.Fatalf("lookup metrics=%d want %d", recorder.count, tc.lookups)
 			}
 			if tc.name == "unauthorized" {
 				if w.Code != 401 {
@@ -267,15 +270,18 @@ func TestHintedRemoteExecAndPreDispatchFallback(t *testing.T) {
 
 func TestHintedPeerOpenFailureRecoversBeforeExecution(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		lookupErr  error
-		status     int
-		outcome    string
-		executions int32
+		name         string
+		lookupErr    error
+		status       int
+		outcome      string
+		executions   int32
+		lookupResult string
 	}{
-		{"local", nil, http.StatusOK, "local", 1},
-		{"missing", ErrInstanceNotFound, http.StatusNotFound, "not_found", 0},
-		{"lookup unavailable", errors.New("database unavailable"), http.StatusBadGateway, "peer_error", 0},
+		{"local", nil, http.StatusOK, "local", 1, "success"},
+		{"missing", ErrInstanceNotFound, http.StatusNotFound, "not_found", 0, "error"},
+		{"lookup unavailable", errors.New("database unavailable"), http.StatusBadGateway, "peer_error", 0, "error"},
+		{"lookup timeout", context.DeadlineExceeded, http.StatusBadGateway, "peer_error", 0, "timeout"},
+		{"lookup canceled", context.Canceled, http.StatusBadGateway, "peer_error", 0, "canceled"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := newExecTestEnv(t)
@@ -289,16 +295,14 @@ func TestHintedPeerOpenFailureRecoversBeforeExecution(t *testing.T) {
 				upstream.ServeHTTP(w, r)
 			})
 			lookups, opens := 0, 0
-			var outcomes []string
+			recorder := &lookupRecorder{}
 			router := NewRoutingHandler([]string{env.domain}, "local", RouteLookupFunc(func(context.Context, string) (SandboxRoute, error) {
 				lookups++
 				return SandboxRoute{HostID: "local"}, tc.lookupErr
 			}), routePeerFunc(func(context.Context, string, PeerEndpoint) (PeerStream, error) {
 				opens++
 				return nil, errors.New("failed before request bytes")
-			}), env.handler, zerolog.Nop(), routingOutcomeRecorderFunc(func(_ context.Context, outcome telemetry.RoutingOutcome) {
-				outcomes = append(outcomes, outcome.Outcome)
-			})).WithRoutingHints(hintHosts{"former-owner": {HostID: "former-owner", ProxyAddr: "10.0.0.2:5009", Generation: 1}}, freshTestRevocations())
+			}), env.handler, zerolog.Nop(), recorder).WithRoutingHints(hintHosts{"former-owner": {HostID: "former-owner", ProxyAddr: "10.0.0.2:5009", Generation: 1}}, freshTestRevocations())
 			req := httptest.NewRequest(http.MethodPost, "http://boxd-"+id+"."+env.domain+"/exec", strings.NewReader(`{"command":"echo"}`))
 			req.Header.Set(accessTokenHeader, env.validToken())
 			req.Header.Set(routingHintHeader, auth.SignRoutingHint(env.seedKey, id, "former-owner", env.domain, time.Now(), 1))
@@ -307,8 +311,11 @@ func TestHintedPeerOpenFailureRecoversBeforeExecution(t *testing.T) {
 			if w.Code != tc.status || executions.Load() != tc.executions || lookups != 1 || opens != 1 {
 				t.Fatalf("status=%d body=%s executions=%d lookups=%d opens=%d", w.Code, w.Body, executions.Load(), lookups, opens)
 			}
-			if len(outcomes) != 1 || outcomes[0] != tc.outcome {
-				t.Fatalf("outcomes=%v", outcomes)
+			if len(recorder.routes) != 1 || recorder.routes[0].Outcome != tc.outcome {
+				t.Fatalf("outcomes=%v", recorder.routes)
+			}
+			if recorder.count != 1 || recorder.lookup.Duration <= 0 || recorder.lookup.Result != tc.lookupResult {
+				t.Fatalf("lookup count=%d measurement=%+v", recorder.count, recorder.lookup)
 			}
 			if tc.name == "missing" && (w.Header().Get("Content-Type") != "application/json" || !strings.Contains(w.Body.String(), `"sandbox_route_stale"`)) {
 				t.Fatalf("missing stale-route signal: %s", w.Body)

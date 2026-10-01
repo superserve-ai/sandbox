@@ -48,6 +48,24 @@ func (h *RoutingHandler) record(ctx context.Context, outcome, hostID string) {
 	}
 }
 
+func (h *RoutingHandler) resolveSandbox(ctx context.Context, id string) (SandboxRoute, error) {
+	started := time.Now()
+	route, err := h.ownership.ResolveSandbox(ctx, id)
+	if recorder, ok := h.recorder.(telemetry.OwnershipLookupRecorder); ok {
+		result := "success"
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			result = "timeout"
+		case errors.Is(err, context.Canceled):
+			result = "canceled"
+		case err != nil:
+			result = "error"
+		}
+		recorder.RecordOwnershipLookup(ctx, telemetry.OwnershipLookup{Duration: time.Since(started), Result: result})
+	}
+	return route, err
+}
+
 func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	port, id, err := ParseRequest(r.Host, r.Header, h.domains)
 	if err != nil {
@@ -69,25 +87,12 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	started := time.Now()
 	route, hinted := SandboxRoute{}, false
 	if port == boxdPort {
 		route, hinted = h.hintedRoute(r, id)
 	}
 	if !hinted {
-		route, err = h.ownership.ResolveSandbox(r.Context(), id)
-	}
-	if recorder, ok := h.recorder.(telemetry.OwnershipLookupRecorder); ok && !hinted {
-		result := "success"
-		switch {
-		case errors.Is(err, context.DeadlineExceeded):
-			result = "timeout"
-		case errors.Is(err, context.Canceled):
-			result = "canceled"
-		case err != nil:
-			result = "error"
-		}
-		recorder.RecordOwnershipLookup(r.Context(), telemetry.OwnershipLookup{Duration: time.Since(started), Result: result})
+		route, err = h.resolveSandbox(r.Context(), id)
 	}
 	if errors.Is(err, ErrInstanceNotFound) {
 		h.record(r.Context(), "not_found", "")
@@ -127,7 +132,7 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	stream, err := h.peers.OpenStream(r.Context(), route.HostID, PeerEndpoint{Address: route.ProxyAddr, Generation: route.Generation})
 	if err != nil && hinted {
 		hinted = false
-		fresh, resolveErr := h.ownership.ResolveSandbox(r.Context(), id)
+		fresh, resolveErr := h.resolveSandbox(r.Context(), id)
 		if errors.Is(resolveErr, ErrInstanceNotFound) {
 			h.record(r.Context(), "not_found", "")
 			(&authzFailure{Status: http.StatusNotFound, Message: "sandbox not found", Code: "sandbox_route_stale"}).write(w)
