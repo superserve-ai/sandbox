@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -644,5 +645,51 @@ func TestFetchGenerationDiscardsAMaterializedBaseWhenTheRestoreFails(t *testing.
 	}
 	if _, err := os.Stat(filepath.Join(dest, SharedBaseName(task.Files[0].BaseSHA256))); err == nil {
 		t.Fatal("the failed restore kept the base it materialized")
+	}
+}
+
+// Concurrent resolutions of one restore materialize its base once, and
+// none of them reports a failure the caller would read as a restore worth
+// clearing.
+func TestHostBaseResolvesOnceUnderConcurrentCallers(t *testing.T) {
+	var mu sync.Mutex
+	clones := 0
+	stubClone(t, func(dst, src *os.File) error {
+		mu.Lock()
+		clones++
+		mu.Unlock()
+		return copyClone(dst, src)
+	})
+
+	dir := t.TempDir()
+	data := bytes.Repeat([]byte{0x11}, 128<<10)
+	src := filepath.Join(dir, "base.ext4")
+	if err := os.WriteFile(src, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	restore := t.TempDir()
+	want := filepath.Join(restore, SharedBaseName(digestOf(data)))
+
+	var wg sync.WaitGroup
+	got := make([]string, 8)
+	errs := make([]error, 8)
+	for i := range got {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			got[i], errs[i] = hostBase(context.Background(), restore, digestOf(data), src)
+		}(i)
+	}
+	wg.Wait()
+
+	for i := range got {
+		if errs[i] != nil || got[i] != want {
+			t.Fatalf("caller %d got %q (%v), want %q", i, got[i], errs[i], want)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if clones != 1 {
+		t.Fatalf("materialized the base %d times, want once", clones)
 	}
 }

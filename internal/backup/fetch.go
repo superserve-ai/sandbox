@@ -249,38 +249,54 @@ func hostBasePath(m *GenerationManifest, sha string) string {
 // free for the fetch that follows. Only a check that could not run at all
 // is an error.
 func hostBase(ctx context.Context, dir, sha, src string) (string, error) {
-	// Hashed under a name nothing resolves, and given the manifest's name
-	// only once it matches: published first, a crash in between would
-	// leave an unverified copy that the next resolution here trusts on
-	// sight.
-	staging := filepath.Join(dir, "."+SharedBaseName(sha)+".unverified")
-	if err := snapshotFileMode(ctx, staging, src, stageAuto); err != nil {
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		return "", nil
-	}
-	if err := verifyPath(ctx, staging, sha); err != nil {
-		if rerr := os.Remove(staging); rerr != nil {
-			return "", fmt.Errorf("discard unverified base copy: %w", rerr)
-		}
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		return "", nil
-	}
 	dst := filepath.Join(dir, SharedBaseName(sha))
-	if err := os.Rename(staging, dst); err != nil {
-		_ = os.Remove(staging)
-		return "", fmt.Errorf("publish verified base copy: %w", err)
+	// One materialization per destination, verification and publication
+	// included: two resolutions of the same restore would otherwise each
+	// hash the copy and then race to rename it, and the loser's failure
+	// reads to its caller as a restore worth clearing.
+	v, err, _ := stagingFlights.Do(dst, func() (any, error) {
+		// This name is given out only after a digest check, here or by the
+		// restore that fetched the object, so finding it is the same proof
+		// this call would have earned.
+		if _, err := os.Stat(dst); err == nil {
+			return dst, nil
+		}
+		// Hashed under a name nothing resolves, and given the manifest's
+		// name only once it matches: published first, a crash in between
+		// would leave an unverified copy that the next resolution here
+		// trusts on sight.
+		staging := filepath.Join(dir, "."+SharedBaseName(sha)+".unverified")
+		if err := snapshotFileMode(ctx, staging, src, stageAuto); err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			return "", nil
+		}
+		if err := verifyPath(ctx, staging, sha); err != nil {
+			if rerr := os.Remove(staging); rerr != nil {
+				return "", fmt.Errorf("discard unverified base copy: %w", rerr)
+			}
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			return "", nil
+		}
+		if err := os.Rename(staging, dst); err != nil {
+			_ = os.Remove(staging)
+			return "", fmt.Errorf("publish verified base copy: %w", err)
+		}
+		// Published and verified already, so cancellation here costs only
+		// this caller: what it leaves behind is a base a later resolution
+		// is right to trust.
+		if err := syncDirWithContext(ctx, dir); err != nil {
+			return "", fmt.Errorf("publish verified base copy: %w", err)
+		}
+		return dst, nil
+	})
+	if err != nil {
+		return "", err
 	}
-	// Published and verified already, so cancellation here costs only
-	// this caller: what it leaves behind is a base a later resolution is
-	// right to trust.
-	if err := syncDirWithContext(ctx, dir); err != nil {
-		return "", fmt.Errorf("publish verified base copy: %w", err)
-	}
-	return dst, nil
+	return v.(string), nil
 }
 
 // verifyPath hashes the file at path against the digest recorded for its
