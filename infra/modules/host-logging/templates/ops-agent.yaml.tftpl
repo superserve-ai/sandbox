@@ -87,10 +87,30 @@ logging:
           omit_if: 'spanId:*'
         trace:
           omit_if: 'trace:*'
-        traceSampled:
-          omit_if: 'traceSampled:*'
-        insertId:
-          omit_if: 'insertId:*'
+        # Ops Agent 2.71.0 exposes neither traceSampled nor insertId as
+        # mutable LogEntry record fields.  When supplied by application JSON
+        # they remain in jsonPayload and are removed by the payload allowlist
+        # below; referencing the unsupported top-level fields makes the
+        # selected-release generator reject the whole configuration.
+        jsonPayload.traceSampled:
+          omit_if: 'jsonPayload.traceSampled:*'
+        jsonPayload.insertId:
+          omit_if: 'jsonPayload.insertId:*'
+        # Plain application keys stay in jsonPayload on releases that do not
+        # promote them.  Remove those copies too so a host-unit record cannot
+        # bypass the same special-field boundary used for promoted fields.
+        jsonPayload.httpRequest:
+          omit_if: 'jsonPayload.httpRequest:*'
+        jsonPayload.labels:
+          omit_if: 'jsonPayload.labels:*'
+        jsonPayload.operation:
+          omit_if: 'jsonPayload.operation:*'
+        jsonPayload.sourceLocation:
+          omit_if: 'jsonPayload.sourceLocation:*'
+        jsonPayload.spanId:
+          omit_if: 'jsonPayload.spanId:*'
+        jsonPayload.trace:
+          omit_if: 'jsonPayload.trace:*'
     mark_parse_failure:
       # The selected agent has no parse_failure_field option. A malformed
       # MESSAGE remains present after parse_json; mark that condition using a
@@ -116,7 +136,11 @@ logging:
         labels.incarnation:
           static_value: __INCARNATION_ID__
         labels.instance_id:
-          copy_from: resource.labels.instance_id
+          # The monitored resource is created by the exporter and is not an
+          # input field to modify_fields.  Use the provider-bound instance ID
+          # rendered from /etc/sandbox/host-identity.json instead of copying a
+          # resource path the selected generator cannot resolve.
+          static_value: "__INSTANCE_ID__"
         labels.unit:
           copy_from: labels.journal_unit
     redact_sensitive_fields:
@@ -275,10 +299,10 @@ metrics:
           - hostmetrics
         processors: []
 
-# Enrolled host descriptors remain Terraform rollout/IAM inputs. Per-host
-# identity values are deliberately not rendered into this artifact: the
-# installed identity file and resource labels are authoritative at runtime, so
-# an unknown replacement VM ID cannot make functional content unresolved.
+# Enrolled host descriptors remain Terraform rollout/IAM inputs. The
+# provider-bound instance ID is rendered on-host from the installed identity
+# record; the exporter-owned monitored resource remains authoritative for
+# resource labels and is not rewritten by application JSON.
 # The built-in checkpoint/retry path and disk buffer are used; no custom spool
 # or per-entry namespace/mount is introduced. Reconciliation accounts for the
 # buffer, self-log, and retained syslog stores independently of journald.

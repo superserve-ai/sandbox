@@ -68,8 +68,10 @@ test -s "$candidate_config_path"
 test -s "$identity_file"
 host_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["host_id"])' "$identity_file")
 incarnation_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["incarnation_id"])' "$identity_file")
+instance_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["instance_id"])' "$identity_file")
 test -n "$host_id"
 test -n "$incarnation_id"
+test -n "$instance_id"
 
 config_dir=$(dirname "$config_path")
 install -d -m 0755 "$config_dir" "$(dirname "$journald_dropin")" \
@@ -83,6 +85,7 @@ cleanup() {
 trap 'exit 143' INT TERM
 trap 'status=$?; cleanup; exit "$status"' EXIT
 sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
+  -e "s|__INSTANCE_ID__|$instance_id|g" \
   "$candidate_config_path" >"$rendered_config"
 chmod 0644 "$rendered_config"
 

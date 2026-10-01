@@ -47,7 +47,8 @@ test -s "$candidate_config_path" || exit 1
 test -s "$identity_file" || exit 101
 host_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["host_id"])' "$identity_file")
 incarnation_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["incarnation_id"])' "$identity_file")
-test -n "$host_id" && test -n "$incarnation_id" || exit 101
+instance_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["instance_id"])' "$identity_file")
+test -n "$host_id" && test -n "$incarnation_id" && test -n "$instance_id" || exit 101
 
 installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
 case "$installed_version" in
@@ -70,8 +71,9 @@ run_engine_validation() {
 
 rendered_config=$(mktemp)
 sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
+  -e "s|__INSTANCE_ID__|$instance_id|g" \
   "$candidate_config_path" >"$rendered_config"
-if grep -qE '__HOST_ID__|__INCARNATION_ID__' "$rendered_config"; then
+if grep -qE '__HOST_ID__|__INCARNATION_ID__|__INSTANCE_ID__' "$rendered_config"; then
   exit 101
 fi
 if ! run_engine_validation "$rendered_config"; then

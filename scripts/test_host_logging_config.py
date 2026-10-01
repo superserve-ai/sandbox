@@ -205,7 +205,8 @@ def run_scripts(args, scenario):
     for path in paths:
         pathlib.Path(path).mkdir(parents=True, exist_ok=True)
     pathlib.Path("/etc/sandbox/host-identity.json").write_text(
-        json.dumps({"host_id": "fixture-host", "incarnation_id": "fixture-incarnation"}))
+        json.dumps({"host_id": "fixture-host", "instance_id": "fixture-instance",
+                    "incarnation_id": "fixture-incarnation"}))
     candidate = pathlib.Path("/var/lib/superserve/host-logging/config.yaml.candidate")
     candidate.write_text(pathlib.Path(args.rendered).read_text())
     pathlib.Path("/var/lib/superserve/host-logging/journald.conf.candidate").write_text(
@@ -402,7 +403,8 @@ if __name__ == "__main__":
         template = template.replace("$${", "${")
         if config:
             template = template.replace("__HOST_ID__", "fixture-host").replace(
-                "__INCARNATION_ID__", "fixture-incarnation")
+                "__INCARNATION_ID__", "fixture-incarnation").replace(
+                "__INSTANCE_ID__", "fixture-instance")
         return template
 
     def _docker(self):
