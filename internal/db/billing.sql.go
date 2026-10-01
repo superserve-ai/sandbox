@@ -3399,6 +3399,7 @@ WHERE team_id = $2
   AND stripe_checkout_actor_id = $3
   AND checkout_request_key = $4
   AND NOT ($1::uuid = ANY(checkout_pending_attempt_ids))
+  AND cardinality(checkout_pending_attempt_ids) < 32
   AND checkout_completed_at IS NULL
   -- Keep replays within Stripe's idempotency retention and leave at least
   -- 30 minutes before expires_at, even if request validation runs again.

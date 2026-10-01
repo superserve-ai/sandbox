@@ -402,6 +402,13 @@ func TestIntegration_BillingCheckoutPublicationWithoutEvidence(t *testing.T) {
 			if err := tx.QueryRow(context.Background(), `SELECT reserve_stripe_promotion_for_event_state($1,$2,'event')`, team, actor).Scan(&state); err != nil || state != "authority_unavailable" {
 				t.Fatalf("legacy reservation denial: %s %v", state, err)
 			}
+			// Lease cleanup clears the mutable generation and subscription
+			// projection, but the immutable publication history must still fence
+			// event-only callbacks that carry no generation metadata.
+			rolloutExec(t, tx, `UPDATE team_billing_account SET checkout_initializing_at=NULL, checkout_request_key=NULL, checkout_pending_attempt_ids='{}', checkout_may_exist=false, checkout_session_id=NULL, checkout_subscription_id=NULL, checkout_completed_at=NULL, stripe_checkout_actor_id=NULL, stripe_checkout_actor_claimed_at=NULL, stripe_checkout_identity_evidence_version=NULL, updated_at=now() WHERE team_id=$1`, team)
+			if err := tx.QueryRow(context.Background(), `SELECT reserve_stripe_promotion_for_event_state($1,$2,'post-cleanup-event')`, team, actor).Scan(&state); err != nil || state != "authority_unavailable" {
+				t.Fatalf("post-cleanup event-only callback bypassed history fence: %s %v", state, err)
+			}
 			rolloutExec(t, tx, `UPDATE team_billing_account SET stripe_subscription_status='active' WHERE team_id=$1`, team)
 			rolloutExec(t, tx, `SELECT activate_team_billing($1,$2,'')`, team, actor)
 			var paidOnly bool

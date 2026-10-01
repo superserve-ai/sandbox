@@ -17,6 +17,9 @@ CREATE TABLE stripe_checkout_publication_subscription (
     FOREIGN KEY (team_id, checkout_generation)
         REFERENCES stripe_checkout_publication_decision(team_id, checkout_generation)
 );
+-- Bound concurrent retry bookkeeping so authenticated retry storms cannot
+-- grow the account row without limit. In-flight attempts remain addressable;
+-- settled attempts are removed by the existing settlement paths.
 ALTER TABLE stripe_checkout_publication_decision ENABLE ROW LEVEL SECURITY;
 ALTER TABLE stripe_checkout_publication_subscription ENABLE ROW LEVEL SECURITY;
 CREATE TRIGGER stripe_checkout_publication_decision_immutable BEFORE UPDATE OR DELETE OR TRUNCATE
@@ -61,6 +64,10 @@ BEGIN
            OR a.checkout_completed_at IS NOT NULL
            OR a.checkout_initializing_at <= now() - interval '23 hours' THEN
             RAISE EXCEPTION 'Checkout intent conflict or closed generation' USING ERRCODE='23505';
+        END IF;
+        IF p_attempt_id <> ALL(a.checkout_pending_attempt_ids)
+           AND cardinality(a.checkout_pending_attempt_ids) >= 32 THEN
+            RAISE EXCEPTION 'Checkout retry limit reached' USING ERRCODE='23505';
         END IF;
         UPDATE team_billing_account SET checkout_pending_attempt_ids =
             CASE WHEN p_attempt_id=ANY(checkout_pending_attempt_ids) THEN checkout_pending_attempt_ids
@@ -171,6 +178,18 @@ BEGIN
                     ON s.team_id=a.team_id AND s.subscription_id=a.stripe_subscription_id
                   WHERE a.team_id=p_team_id AND NOT p_has_checkout_generation AND p_subscription_id IS NULL
           );
+    -- Event-only callbacks lose mutable checkout metadata after lease cleanup.
+    -- Retained publication history remains authoritative and must fence the
+    -- callback before device eligibility is consulted.
+    IF NOT p_has_checkout_generation AND p_subscription_id IS NULL
+       AND EXISTS (SELECT 1 FROM stripe_checkout_publication_decision
+           WHERE team_id=p_team_id) THEN
+        IF EXISTS (SELECT 1 FROM team_billing_account
+            WHERE team_id=p_team_id AND stripe_activation_credit_reserved_at IS NOT NULL) THEN
+            RETURN 'blocked';
+        END IF;
+        RETURN 'authority_unavailable';
+    END IF;
     IF v_publication_failed THEN
         IF EXISTS (SELECT 1 FROM team_billing_account
             WHERE team_id=p_team_id AND stripe_activation_credit_reserved_at IS NOT NULL) THEN
