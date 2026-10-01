@@ -229,7 +229,12 @@ func runMigrate(args []string) int {
 		if skip[id] {
 			continue
 		}
-		if _, err := restoredDisk(*root, id); err != nil {
+		// Everything a boot needs must be reachable, but nothing is read
+		// or written to establish it: the inventory reports what would
+		// move, including under --dry-run, so it must not hash a base per
+		// row (a handful of templates serve the whole fleet) nor leave a
+		// copy in a restore it was only asked about.
+		if err := backup.RestoredDependencies(filepath.Join(*root, id)); err != nil {
 			notRestored++
 			continue
 		}
@@ -381,11 +386,8 @@ func runMigrate(args []string) int {
 		generation  int64 // the snapshot row is reused across pauses; its generation is what moves
 	}
 	type job struct {
-		id         string
-		s          shape
-		disk, base string
-		blockMap   string
-		standalone bool
+		id string
+		s  shape
 	}
 	// Boots run on a fixed pool fed a little at a time, so the poll below
 	// never waits on a whole batch: a sandbox the reaper has paused gets
@@ -413,7 +415,25 @@ func runMigrate(args []string) int {
 	defer close(jobs)
 
 	run = func(j job) {
-		id, s, disk, base, blockMap, standalone := j.id, j.s, j.disk, j.base, j.blockMap, j.standalone
+		id, s := j.id, j.s
+		// Resolving the restore materializes and hashes a base the
+		// destination does not hold yet, so it runs on this pool rather
+		// than in the loop that selects rows: serialized there, every boot
+		// would queue behind all of them. Before the claim, so a base that
+		// cannot be resolved leaves the row where it is.
+		rd, err := restoredDisk(ctx, *root, id)
+		if err != nil {
+			// Retryable, not a boot failure: nothing has been claimed yet,
+			// and a template mid-rebuild or a transient read error is
+			// exactly what a later run may not see again. Recorded as a
+			// failure it would enter the skip file and be excluded from
+			// every run after this one, repaired or not.
+			mu.Lock()
+			recordRetry(id, err.Error())
+			mu.Unlock()
+			return
+		}
+		disk, base, blockMap, standalone := rd.disk, rd.base, rd.blockMap, rd.standalone
 		{
 			{
 				{
@@ -766,7 +786,14 @@ func runMigrate(args []string) int {
 
 			handed := 0
 			for id, s := range shapes {
-				rd, err := restoredDisk(*root, id)
+				// Marker only: whether a restored copy is the current pause
+				// is a question about its manifest, and resolving its base
+				// belongs to the worker that boots it.
+				var rd restored
+				m, err := backup.RestoredGeneration(filepath.Join(*root, id))
+				if err == nil {
+					rd.manifest = *m
+				}
 				if err == nil && (len(s.recorded) == 0 || s.snapshotID == nil) {
 					mu.Lock()
 					unanchored++
@@ -798,7 +825,7 @@ func runMigrate(args []string) int {
 				booting++
 				mu.Unlock()
 				handed++
-				jobs <- job{id: id, s: s, disk: rd.disk, base: rd.base, blockMap: rd.blockMap, standalone: rd.standalone}
+				jobs <- job{id: id, s: s}
 			}
 			mu.Lock()
 			fmt.Printf("handed %d, booting %d, in flight %d, queued %d, moved %d, failed %d, %s elapsed\n",
@@ -984,8 +1011,8 @@ type restored struct {
 	manifest   backup.GenerationManifest
 }
 
-func restoredDisk(root, id string) (restored, error) {
-	r, err := backup.RestoredDisk(filepath.Join(root, id))
+func restoredDisk(ctx context.Context, root, id string) (restored, error) {
+	r, err := backup.RestoredDisk(ctx, filepath.Join(root, id))
 	if err != nil {
 		return restored{}, err
 	}

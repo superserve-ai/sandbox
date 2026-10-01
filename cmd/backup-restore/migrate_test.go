@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -29,25 +30,25 @@ func TestRestoredDiskFollowsTheRestoreMarker(t *testing.T) {
 			}
 		}
 	}
-	if _, err := restoredDisk(root, "none"); err == nil {
+	if _, err := restoredDisk(context.Background(), root, "none"); err == nil {
 		t.Fatal("missing restore accepted")
 	}
 	write("overlay", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "rootfs.ext4", BaseSHA256: sha}}}, "rootfs.ext4")
-	if _, err := restoredDisk(root, "overlay"); err == nil {
+	if _, err := restoredDisk(context.Background(), root, "overlay"); err == nil {
 		t.Fatal("overlay without its base accepted")
 	}
 	write("overlay", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "rootfs.ext4", BaseSHA256: sha}}}, "rootfs.ext4", backup.SharedBaseName(sha))
-	r, err := restoredDisk(root, "overlay")
+	r, err := restoredDisk(context.Background(), root, "overlay")
 	if err != nil || r.standalone || filepath.Base(r.disk) != "rootfs.ext4" || filepath.Base(r.base) != backup.SharedBaseName(sha) {
 		t.Fatalf("overlay: %+v %v", r, err)
 	}
 	write("full", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "rootfs.ext4"}}}, "rootfs.ext4")
-	r, err = restoredDisk(root, "full")
+	r, err = restoredDisk(context.Background(), root, "full")
 	if err != nil || !r.standalone || r.base != "" || filepath.Base(r.disk) != "rootfs.ext4" {
 		t.Fatalf("full image: %+v %v", r, err)
 	}
 	write("norootfs", backup.GenerationManifest{Files: []backup.ManifestFile{{Name: "vmstate.snap"}}}, "vmstate.snap")
-	if _, err := restoredDisk(root, "norootfs"); err == nil {
+	if _, err := restoredDisk(context.Background(), root, "norootfs"); err == nil {
 		t.Fatal("marker without a rootfs accepted")
 	}
 }

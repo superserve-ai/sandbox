@@ -533,7 +533,14 @@ func snapshotClone(ctx context.Context, dst, src string) error {
 		os.Remove(tmp)
 		return err
 	}
-	return syncDir(filepath.Dir(dst))
+	if err := publishDirSync(ctx, filepath.Dir(dst)); err != nil {
+		// Every other failure here leaves nothing behind; a published
+		// file whose entry is not durable must not be the exception, or
+		// a caller that reports failure strands it.
+		_ = os.Remove(dst)
+		return err
+	}
+	return nil
 }
 
 // snapshotFile copies src to dst preserving sparseness, via reflink
@@ -554,45 +561,12 @@ func snapshotFile(ctx context.Context, dst, src string, tryClone bool) error {
 		return err
 	}
 	tmp := out.Name()
-	cloned := false
-	if tryClone {
-		cloned = cloneInto(out, in) == nil
+	discard := func() {
+		out.Close()
+		os.Remove(tmp)
 	}
-	if !cloned {
-		extents, _, xerr := Extents(in)
-		if xerr != nil {
-			out.Close()
-			os.Remove(tmp)
-			return xerr
-		}
-		for _, e := range extents {
-			// Reflink is unavailable on this filesystem, so the fallback
-			// pays a real read+write per extent; a single extent can span
-			// the whole inline-staging budget, and only a context check
-			// between extents (not one before the whole file) keeps a
-			// slow disk from pinning the RPC path's pause lock past its
-			// deadline the way the size threshold alone cannot.
-			if err := ctx.Err(); err != nil {
-				out.Close()
-				os.Remove(tmp)
-				return err
-			}
-			if _, err := out.Seek(e.Offset, io.SeekStart); err != nil {
-				out.Close()
-				os.Remove(tmp)
-				return err
-			}
-			if _, err := copyExtentContext(ctx, out, io.NewSectionReader(in, e.Offset, e.Length)); err != nil {
-				out.Close()
-				os.Remove(tmp)
-				return err
-			}
-		}
-		if err := out.Truncate(fi.Size()); err != nil {
-			out.Close()
-			os.Remove(tmp)
-			return err
-		}
+	if err := copyOrClone(ctx, out, in, fi.Size(), tryClone, discard); err != nil {
+		return err
 	}
 	// The journal enqueue that will reference this path is fsynced by
 	// BoltDB; the staged bytes and their directory entry must be durable
@@ -618,7 +592,81 @@ func snapshotFile(ctx context.Context, dst, src string, tryClone bool) error {
 		os.Remove(tmp)
 		return err
 	}
-	return syncDir(filepath.Dir(dst))
+	if err := publishDirSync(ctx, filepath.Dir(dst)); err != nil {
+		// Every other failure here leaves nothing behind; a published
+		// file whose entry is not durable must not be the exception, or
+		// a caller that reports failure strands it.
+		_ = os.Remove(dst)
+		return err
+	}
+	return nil
+}
+
+// copyOrClone fills out with in's contents up to size, reflinking when
+// the caller allows it and the filesystem can, and otherwise copying each
+// data extent. Both are bounded by ctx.
+//
+// Only the caller knows how its destination is named — a temporary beside
+// its final name, or a file inside a pinned root — so unlink is what
+// removes that name, and this calls it on every failure BEFORE returning.
+// Synchronously even when an abandoned clone still holds the file open:
+// the name has to be free for a retry at once, and on a handle the caller
+// is about to release. The data goes when the kernel releases the fd,
+// which this closes. Once an error is returned the destination is the
+// caller's no longer.
+func copyOrClone(ctx context.Context, out, in *os.File, size int64, tryClone bool, unlink func()) error {
+	fail := func(err error) error {
+		unlink()
+		out.Close()
+		return err
+	}
+	if tryClone {
+		// FICLONE copies no data but does walk the extent map, so a dense
+		// or fragmented artifact is not free. The ioctl cannot be
+		// cancelled: on a deadline the caller is released and this
+		// goroutine owns the fd until the kernel returns.
+		clone := cloneInto
+		done := make(chan error, 1)
+		go func() { done <- clone(out, in) }()
+		select {
+		case err := <-done:
+			if err == nil {
+				return nil
+			}
+		case <-ctx.Done():
+			unlink()
+			go func() {
+				<-done
+				out.Close()
+			}()
+			return ctx.Err()
+		}
+	}
+	extents, _, err := Extents(in)
+	if err != nil {
+		return fail(err)
+	}
+	for _, e := range extents {
+		// Reflink is unavailable on this filesystem, so the fallback pays
+		// a real read+write per extent; a single extent can span the whole
+		// inline-staging budget, and only a context check between extents
+		// (not one before the whole file) keeps a slow disk from pinning
+		// the RPC path's pause lock past its deadline the way the size
+		// threshold alone cannot.
+		if err := ctx.Err(); err != nil {
+			return fail(err)
+		}
+		if _, err := out.Seek(e.Offset, io.SeekStart); err != nil {
+			return fail(err)
+		}
+		if _, err := copyExtentContext(ctx, out, io.NewSectionReader(in, e.Offset, e.Length)); err != nil {
+			return fail(err)
+		}
+	}
+	if err := out.Truncate(size); err != nil {
+		return fail(err)
+	}
+	return nil
 }
 
 // copyExtentChunk bounds a single context check's worth of copying, so
@@ -670,6 +718,37 @@ func syncDir(path string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// publishDirSync makes a published file's directory entry durable.
+// Indirected so tests can drive the window where the file is in place but
+// its entry is not.
+var publishDirSync = syncDirWithContext
+
+// syncDirWithContext is syncDir released on cancellation, so a stalled
+// filesystem cannot hold a restore past its budget or keep a migration
+// worker occupied. The fsync has no cancellation of its own, so this
+// goroutine owns the handle until the kernel returns and closes it there:
+// closed by the caller instead, the sync still to run would fail on a
+// closed descriptor, and the entry this call reports as attempted would
+// never have been made durable at all.
+func syncDirWithContext(ctx context.Context, path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() {
+		err := d.Sync()
+		d.Close()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // removeStagedTask deletes a task's staging directory once the task is
