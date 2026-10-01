@@ -777,9 +777,13 @@ conflicts as SQLSTATE `23505`, invalid inputs as `22023`, and retries a live exa
 intent without recapturing evidence. Direct table privileges are revoked for
 `anon`, `authenticated`, and `service_role`; no browser RPC access is granted.
 
-Apply `20260930000004_checkout_publication_decision.sql` in both regional schemas,
-then deploy the API, then adopt the signed consumer route. The migration adds no
-historical decisions and changes no balances, evidence, ownership, consumption,
+Apply `20260930000004_checkout_publication_decision.sql` and then
+`20261001000001_checkout_publication_reservation_fence.sql` in both regional
+schemas before deploying the API; only then adopt the signed consumer route. The
+first migration stores the immutable generation decision and subscription
+association, while the second installs the locked reservation recheck that
+enforces those records for webhook and recovery paths. Together they add no
+historical decisions and change no balances, evidence, ownership, consumption,
 existing reservations, policy switches, or old RPC signatures. Legacy generations
 have no decision row and retain their behavior. Database reservation enforcement
 and subscription retention also protect new generations processed by old webhook

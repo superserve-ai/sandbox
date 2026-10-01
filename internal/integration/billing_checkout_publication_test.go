@@ -444,6 +444,27 @@ func TestIntegration_BillingCheckoutPublicationRejectsExplicitUnmatchedGeneratio
 
 func TestIntegration_BillingCheckoutPublicationCrossActorReservationFence(t *testing.T) {
 	ctx := context.Background()
+	var enabled bool
+	var enabledAt pgtype.Timestamptz
+	var readiness *string
+	if err := testPool.QueryRow(ctx, `SELECT enabled, enabled_at, readiness_reference FROM promotion_identity_enforcement WHERE singleton`).Scan(&enabled, &enabledAt, &readiness); err != nil {
+		t.Fatal(err)
+	}
+	// The concurrency fixture must commit its disabled gate for other connections
+	// to see it; localIdentityTransaction's rollback cannot restore a committed row.
+	t.Cleanup(func() {
+		tx, err := testPool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		rolloutExec(t, tx, `ALTER TABLE promotion_identity_enforcement DISABLE TRIGGER promotion_identity_enforcement_irreversible`)
+		rolloutExec(t, tx, `UPDATE promotion_identity_enforcement SET enabled=$1, enabled_at=$2, readiness_reference=$3 WHERE singleton`, enabled, enabledAt, readiness)
+		rolloutExec(t, tx, `ALTER TABLE promotion_identity_enforcement ENABLE TRIGGER promotion_identity_enforcement_irreversible`)
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
 	setup := localIdentityTransaction(t, false)
 	actorA, actorB, team := uuid.New(), uuid.New(), uuid.New()
 	for _, actor := range []uuid.UUID{actorA, actorB} {
@@ -569,22 +590,29 @@ func TestIntegration_BillingCheckoutPublicationCrossActorReservationFence(t *tes
 	// Controls: without retained history, legacy acquisition remains valid;
 	// matching replay remains the sole existing-reservation authority, while
 	// changed events and actors cannot reuse it.
+	// Roll back the pending legacy history before restoring canonical enforcement,
+	// since unreconciled history blocks reservations across the whole suite.
+	legacyTx, err := testPool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legacyTx.Rollback(ctx)
 	legacyTeam, legacyActor, otherActor := uuid.New(), uuid.New(), uuid.New()
 	for _, actor := range []uuid.UUID{legacyActor, otherActor} {
-		rolloutExec(t, testPool, `INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com")
+		rolloutExec(t, legacyTx, `INSERT INTO profile(id,email) VALUES($1,$2)`, actor, actor.String()+"@example.com")
 	}
-	rolloutExec(t, testPool, `INSERT INTO team(id,name) VALUES($1,$2)`, legacyTeam, "legacy-control-"+legacyTeam.String())
-	rolloutExec(t, testPool, `INSERT INTO team_billing_account(team_id) VALUES($1)`, legacyTeam)
-	if err := testPool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, legacyActor, "legacy-event").Scan(&state); err != nil || state != "acquired" {
+	rolloutExec(t, legacyTx, `INSERT INTO team(id,name) VALUES($1,$2)`, legacyTeam, "legacy-control-"+legacyTeam.String())
+	rolloutExec(t, legacyTx, `INSERT INTO team_billing_account(team_id) VALUES($1)`, legacyTeam)
+	if err := legacyTx.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, legacyActor, "legacy-event").Scan(&state); err != nil || state != "acquired" {
 		t.Fatalf("legacy acquisition unexpectedly fenced: %s %v", state, err)
 	}
-	if err := testPool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, legacyActor, "legacy-event").Scan(&state); err != nil || state != "existing" {
+	if err := legacyTx.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, legacyActor, "legacy-event").Scan(&state); err != nil || state != "existing" {
 		t.Fatalf("matching reservation replay changed authority: %s %v", state, err)
 	}
-	if err := testPool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, legacyActor, "legacy-other-event").Scan(&state); err != nil || state != "blocked" {
+	if err := legacyTx.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, legacyActor, "legacy-other-event").Scan(&state); err != nil || state != "blocked" {
 		t.Fatalf("mismatched event replay was accepted: %s %v", state, err)
 	}
-	if err := testPool.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, otherActor, "legacy-event").Scan(&state); err != nil || state != "blocked" {
+	if err := legacyTx.QueryRow(ctx, `SELECT reserve_stripe_promotion_for_event_state($1,$2,$3)`, legacyTeam, otherActor, "legacy-event").Scan(&state); err != nil || state != "blocked" {
 		t.Fatalf("mismatched actor replay was accepted: %s %v", state, err)
 	}
 }
