@@ -18,7 +18,7 @@ WITH ins AS (
   SELECT ins.id, sqlc.arg(preview_access)::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.* FROM ins
+SELECT ins.*, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: CreateSandboxFromTemplate :one
@@ -41,7 +41,7 @@ WITH tpl AS (
   SELECT ins.id, sqlc.arg(preview_access)::text, 0 FROM ins
   RETURNING sandbox_id
 )
-SELECT ins.* FROM ins
+SELECT ins.*, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: CreateSandboxWithSecrets :one
@@ -63,7 +63,7 @@ WITH ins AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.* FROM ins
+SELECT ins.*, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: CreateSandboxFromTemplateWithSecrets :one
@@ -90,7 +90,7 @@ WITH tpl AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.*
+SELECT ins.*, statement_timestamp()::timestamptz AS routing_observed_at
 FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
@@ -125,7 +125,7 @@ WITH src AS (
   SELECT ins.id, (@secret_ids::uuid[])[i], (@env_keys::text[])[i], (@proxy_tokens::text[])[i]
   FROM ins, generate_subscripts(@secret_ids::uuid[], 1) AS g(i)
 )
-SELECT ins.* FROM ins
+SELECT ins.*, statement_timestamp()::timestamptz AS routing_observed_at FROM ins
 JOIN preview_policy ON preview_policy.sandbox_id = ins.id;
 
 -- name: GetSandbox :one
@@ -633,7 +633,7 @@ RETURNING sqlc.embed(sandbox),
           x.snap_path, x.snap_mem_path, x.snap_created_at,
           x.access, x.wire_access, x.revision,
           x.port_numbers, x.port_accesses, x.port_token_versions,
-          x.template_base_path;
+          x.template_base_path, statement_timestamp()::timestamptz AS routing_observed_at;
 
 -- name: ResumePostBootCheck :one
 -- The two reads a resume makes after the boot, in one statement: the

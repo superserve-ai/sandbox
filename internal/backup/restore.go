@@ -159,20 +159,29 @@ type ProgressFunc func(format string, args ...any)
 // directory as restored. Artifact entries named manifest.json are
 // rejected up front so the marker can never collide.
 func RestoreGeneration(ctx context.Context, r BlobReader, sandboxID, generation, destDir string, progress ProgressFunc) (*GenerationManifest, error) {
-	return restoreGeneration(ctx, r, sandboxID, generation, destDir, nil, progress)
+	return restoreGeneration(ctx, r, sandboxID, generation, destDir, nil, nil, progress)
 }
 
 // restoreGeneration is RestoreGeneration with entries skip reports as
-// already satisfied outside destDir, such as a shared base the host holds.
-func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, destDir string, skip func(ManifestFile) bool, progress ProgressFunc) (*GenerationManifest, error) {
+// already satisfied. skip is handed the pinned destination root: an entry
+// it satisfies by materializing something must write it there, through
+// the same handle every other artifact goes through, or a destination
+// swapped for a symlink mid-restore would take that write outside.
+// A manifest the caller has already read and validated is used as given,
+// so a restore costs one manifest request and cannot fail on a second
+// identical one.
+func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, destDir string, manifest *GenerationManifest, skip func(ManifestFile, *os.Root) bool, progress ProgressFunc) (*GenerationManifest, error) {
 	report := func(format string, args ...any) {
 		if progress != nil {
 			progress(format, args...)
 		}
 	}
-	manifest, err := fetchManifest(ctx, r, owner, generation, report)
-	if err != nil {
-		return nil, err
+	if manifest == nil {
+		fetched, err := fetchManifest(ctx, r, owner, generation, report)
+		if err != nil {
+			return nil, err
+		}
+		manifest = fetched
 	}
 	report("manifest %s/%s: %d files", owner, generation, len(manifest.Files))
 	root, err := openFreshDir(destDir)
@@ -211,7 +220,7 @@ func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, des
 		if err := validSegment(mf.Name); err != nil {
 			return fail(fmt.Errorf("manifest file name: %w", err))
 		}
-		if skip != nil && skip(mf) {
+		if skip != nil && skip(mf, root) {
 			report("skipping %s: satisfied on the host", mf.Name)
 			continue
 		}
@@ -231,7 +240,7 @@ func restoreGeneration(ctx context.Context, r BlobReader, owner, generation, des
 	// verification cannot leave earlier files implicitly blessed: either
 	// the whole set passes or the whole set is gone.
 	for _, mf := range manifest.Files {
-		if skip != nil && skip(mf) {
+		if skip != nil && skip(mf, root) {
 			continue
 		}
 		err := verifyFile(ctx, root, mf)
@@ -720,12 +729,18 @@ func verifyFile(ctx context.Context, root *os.Root, mf ManifestFile) error {
 	if apparent != mf.Size {
 		return fmt.Errorf("apparent size %d, manifest records %d", apparent, mf.Size)
 	}
+	return verifyDigest(ctx, f, extents, apparent, mf.SHA256)
+}
+
+// verifyDigest hashes a file's apparent content and compares it with the
+// digest recorded for those bytes.
+func verifyDigest(ctx context.Context, f *os.File, extents []Extent, apparent int64, sha string) error {
 	sum, err := hashApparent(ctx, f, extents, apparent)
 	if err != nil {
 		return err
 	}
-	if sum != mf.SHA256 {
-		return fmt.Errorf("sha256 mismatch: got %s, manifest records %s", sum, mf.SHA256)
+	if sum != sha {
+		return fmt.Errorf("sha256 mismatch: got %s, manifest records %s", sum, sha)
 	}
 	return nil
 }

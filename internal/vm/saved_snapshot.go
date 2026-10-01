@@ -39,9 +39,12 @@ const (
 	savedTombstoneTTL          = 24 * time.Hour
 	savedTombstoneReapInterval = time.Hour
 	savedSnapshotVersion       = 1
-	defaultSavedCaptures       = 2
-	savedCaptureHeadroom       = 256 << 20
-	savedUnpauseAttempts       = 3
+	// What bounds captures on the fleet's local NVMe is not the disk but the
+	// memory each running capture reserves and the page cache its writes
+	// churn, which resumes depend on; 16 keeps both small against a host.
+	defaultSavedCaptures = 16
+	savedCaptureHeadroom = 256 << 20
+	savedUnpauseAttempts = 3
 	// A capture's budget: a base for the request itself, plus the time a
 	// full memory image takes at the slowest write rate the capture waits
 	// for before it treats Firecracker as stuck.

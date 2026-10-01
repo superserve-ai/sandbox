@@ -769,7 +769,7 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 	}
 	deadline := time.Now().Add(activateSettleWindow)
 	for {
-		row, err := h.DB.GetSandboxWithPreviewPolicy(c.Request.Context(), db.GetSandboxWithPreviewPolicyParams{
+		row, err := h.DB.GetSandboxWithPreviewPolicyForRouting(c.Request.Context(), db.GetSandboxWithPreviewPolicyForRoutingParams{
 			ID:     sandboxID,
 			TeamID: teamID,
 		})
@@ -783,6 +783,7 @@ func (h *Handlers) loadActiveOrResumeSandbox(c *gin.Context) (*db.Sandbox, strin
 			return nil, ""
 		}
 		sandbox := row.Sandbox
+		c.Set("routing_observed_at", row.RoutingObservedAt)
 		switch sandbox.Status {
 		case db.SandboxStatusActive:
 			return &sandbox, row.Access
@@ -932,6 +933,7 @@ func (h *Handlers) resumePausedSandbox(c *gin.Context, sandbox *db.Sandbox, team
 		return "", false
 	}
 	*sandbox = claimed.Sandbox
+	c.Set("routing_observed_at", claimed.RoutingObservedAt)
 	l = sandboxLogger(sandboxID.String(), sandbox.HostID)
 	SetTelemetryHostID(c, sandbox.HostID)
 
@@ -1507,7 +1509,7 @@ func (h *Handlers) ActivateSandbox(c *gin.Context) {
 	if sandbox == nil {
 		return
 	}
-	resp := h.sandboxToResponseWithToken(*sandbox)
+	resp := h.sandboxToResponseWithToken(*sandbox, c.GetTime("routing_observed_at"))
 	resp.PreviewAccess = previewAccess
 	c.JSON(http.StatusOK, resp)
 }
@@ -1655,6 +1657,7 @@ func (h *Handlers) ResumeSandbox(c *gin.Context) {
 		// The token HMAC stays keyed on the bare UUID: the proxy normalizes
 		// public IDs before verification.
 		resp["access_token"] = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, sandboxID.String())
+		resp["routing_hint"] = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, sandboxID.String(), sandbox.HostID, h.Config.EdgeProxyDomain, c.GetTime("routing_observed_at"), sandbox.RoutingVersion)
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -2228,6 +2231,7 @@ type sandboxResponse struct {
 	VcpuCount         int32      `json:"vcpu_count"`
 	MemoryMib         int32      `json:"memory_mib"`
 	AccessToken       string     `json:"access_token,omitempty"`
+	RoutingHint       string     `json:"routing_hint,omitempty"`
 	SnapshotID        *uuid.UUID `json:"snapshot_id,omitempty"`
 	SourceSnapshotID  *uuid.UUID `json:"source_snapshot_id,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
@@ -2316,10 +2320,11 @@ func decodeNetworkConfig(raw []byte) *networkConfigRequest {
 // attaches the per-sandbox access token. Used on create/get/resume where the
 // client needs to authenticate subsequent calls; list responses omit it so
 // we don't leak many tokens in one response.
-func (h *Handlers) sandboxToResponseWithToken(s db.Sandbox) sandboxResponse {
+func (h *Handlers) sandboxToResponseWithToken(s db.Sandbox, observedAt time.Time) sandboxResponse {
 	resp := h.sandboxToResponse(s)
 	if h.Config != nil && h.Config.SandboxAccessTokenSeed != nil {
 		resp.AccessToken = auth.ComputeAccessToken(h.Config.SandboxAccessTokenSeed, s.ID.String())
+		resp.RoutingHint = auth.SignRoutingHint(h.Config.SandboxAccessTokenSeed, s.ID.String(), s.HostID, h.Config.EdgeProxyDomain, observedAt, s.RoutingVersion)
 	}
 	return resp
 }
@@ -2553,7 +2558,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 
-	row, err := h.DB.GetSandboxWithPreviewPolicy(c.Request.Context(), db.GetSandboxWithPreviewPolicyParams{
+	row, err := h.DB.GetSandboxWithPreviewPolicyForRouting(c.Request.Context(), db.GetSandboxWithPreviewPolicyForRoutingParams{
 		ID:     sandboxID,
 		TeamID: teamID,
 	})
@@ -2567,6 +2572,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 		return
 	}
 	sandbox := row.Sandbox
+	c.Set("routing_observed_at", row.RoutingObservedAt)
 
 	resp := h.sandboxToResponse(sandbox)
 	resp.PreviewAccess = row.Access
@@ -2578,7 +2584,7 @@ func (h *Handlers) GetSandboxByID(c *gin.Context) {
 			Str("sandbox_id", sandboxID.String()).
 			Msg("RBAC sandbox token permission check failed")
 	} else if canWrite {
-		resp = h.sandboxToResponseWithToken(sandbox)
+		resp = h.sandboxToResponseWithToken(sandbox, c.GetTime("routing_observed_at"))
 		resp.PreviewAccess = row.Access
 	}
 	if !isConsoleImpersonation(c) {
@@ -3057,6 +3063,7 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 		h.Shadow.Offer(requiredCapabilities, insertMemMiB, insertVcpu, hostID)
 	}
 
+	var routingObservedAt time.Time
 	type insertResult struct {
 		sandbox db.Sandbox
 		err     error
@@ -3091,7 +3098,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				DeltaPath:         nullableStr(deltaPath),
 				PreviewAccess:     previewAccess,
 			})
-			return db.Sandbox(row), err
+			routingObservedAt = row.RoutingObservedAt
+			return db.RoutingSandbox(row).Sandbox(), err
 		}
 		row, err := q.CreateSandbox(insertCtx, db.CreateSandboxParams{
 			ID:                sandboxID,
@@ -3111,7 +3119,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			DeltaPath:         nil,
 			PreviewAccess:     previewAccess,
 		})
-		return db.Sandbox(row), err
+		routingObservedAt = row.RoutingObservedAt
+		return db.RoutingSandbox(row).Sandbox(), err
 	}
 	// insertWithBindings writes the sandbox row, its strict preview policy, and
 	// any secret bindings in one statement. That keeps the legacy-public
@@ -3146,7 +3155,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				ProxyTokens:       proxyTokens,
 				NetworkConfig:     forkNetworkConfig,
 			})
-			return db.Sandbox(row), err
+			routingObservedAt = row.RoutingObservedAt
+			return db.RoutingSandbox(row).Sandbox(), err
 		}
 		if templateID.Valid {
 			row, err := h.DB.CreateSandboxFromTemplateWithSecrets(insertCtx, db.CreateSandboxFromTemplateWithSecretsParams{
@@ -3171,7 +3181,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 				EnvKeys:           envKeys,
 				ProxyTokens:       proxyTokens,
 			})
-			return db.Sandbox(row), err
+			routingObservedAt = row.RoutingObservedAt
+			return db.RoutingSandbox(row).Sandbox(), err
 		}
 		row, err := h.DB.CreateSandboxWithSecrets(insertCtx, db.CreateSandboxWithSecretsParams{
 			ID:                sandboxID,
@@ -3190,7 +3201,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 			EnvKeys:           envKeys,
 			ProxyTokens:       proxyTokens,
 		})
-		return db.Sandbox(row), err
+		routingObservedAt = row.RoutingObservedAt
+		return db.RoutingSandbox(row).Sandbox(), err
 	}
 
 	go func() {
@@ -3680,7 +3692,8 @@ func (h *Handlers) CreateSandbox(c *gin.Context) {
 	})
 
 	sandbox.Status = db.SandboxStatusActive
-	resp := h.sandboxToResponseWithToken(sandbox)
+	c.Set("routing_observed_at", routingObservedAt)
+	resp := h.sandboxToResponseWithToken(sandbox, c.GetTime("routing_observed_at"))
 	resp.PreviewAccess = previewAccess
 	if req.Network != nil && (len(req.Network.AllowOut) > 0 || len(req.Network.DenyOut) > 0) {
 		// Echo the normalized rules, not the raw request, so the create

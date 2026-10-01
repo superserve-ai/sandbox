@@ -38,7 +38,7 @@ func TestIntegration_ProxyRoutingRoleMigration(t *testing.T) {
 		t.Run(state, func(t *testing.T) {
 			exec(t, "SAVEPOINT role_state")
 			defer exec(t, "ROLLBACK TO SAVEPOINT role_state")
-			wantLimit := 32
+			wantLimit := 64
 			if state == "role_attributes" {
 				exec(t, `ALTER ROLE sandbox_proxy_router NOLOGIN INHERIT SUPERUSER CREATEDB
                     CREATEROLE REPLICATION BYPASSRLS CONNECTION LIMIT 64`)

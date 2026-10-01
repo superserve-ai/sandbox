@@ -350,6 +350,17 @@ func run() error {
 	}
 	handlers.StartTeardownSweeper(ctx)
 	handlers.StartLogRetention(ctx)
+	retentionConfig := dbPool.Config()
+	retentionConfig.MaxConns = 1
+	retentionConfig.MinConns = 0
+	retentionConfig.MinIdleConns = 0
+	retentionConfig.ConnConfig.RuntimeParams["statement_timeout"] = "1000"
+	retentionPool, err := pgxpool.NewWithConfig(ctx, retentionConfig)
+	if err != nil {
+		return fmt.Errorf("routing retention pool: %w", err)
+	}
+	defer retentionPool.Close()
+	api.StartRoutingRevocationRetention(ctx, dbq.New(retentionPool))
 	if cfg.BackupGCServiceAccount != "" {
 		admin, err := backup.NewGCSAdmin(ctx, cfg.TemplateBackupBucket, cfg.BackupGCServiceAccount)
 		if err != nil {
@@ -407,6 +418,8 @@ func run() error {
 	billingFinalizationConfig.ResolveActiveMeter = handlers.ResolveActiveBillingMeter
 	billing.StartBillingFinalizationService(ctx, dbPool, billingFinalizationConfig)
 	handlers.StartIncrementalBillingService(ctx)
+	handlers.StartInvoiceEnrollmentService(ctx)
+	handlers.StartInvoiceReconciliationService(ctx)
 	handlers.StartStripeCheckoutAssociationMonitor(ctx)
 
 	// Quota watcher: alerts when a team crosses 80% of a resource limit. Fans out

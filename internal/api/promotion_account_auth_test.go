@@ -32,7 +32,7 @@ func TestPromotionAccountAssertions(t *testing.T) {
 	t.Setenv("SANDBOX_ID_REGION", "use")
 	user, otherUser, attempt, team := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	now := time.Now()
-	for _, operation := range []string{"bind", "evidence", "register", "signup-eligibility", "create-team", "prepare-team", "recover-team", "complete-team", "discover-team-creations"} {
+	for _, operation := range []string{"bind", "evidence", "register", "register-signup", "signup-eligibility", "create-team", "prepare-team", "recover-team", "complete-team", "discover-team-creations"} {
 		t.Run(operation, func(t *testing.T) {
 			type assertionCase struct {
 				name   string
@@ -128,9 +128,12 @@ func TestPromotionAccountAssertions(t *testing.T) {
 						Operation: operation,
 					}
 					body := promotionAccountRequest{UserID: user}
-					if operation == "bind" || operation == "create-team" {
+					if operation == "bind" || operation == "register-signup" || operation == "create-team" {
 						claims.AttemptID = attempt.String()
 						body.AttemptID = attempt
+					}
+					if operation == "register-signup" {
+						claims.HomeRegion = "use"
 					}
 					if operation == "create-team" {
 						unavailable := true
@@ -175,6 +178,13 @@ func TestPromotionAccountAssertions(t *testing.T) {
 						t.Fatal(err)
 					}
 					var requestBody any = body
+					if operation == "register-signup" {
+						requestBody = struct {
+							UserID     uuid.UUID `json:"user_id"`
+							AttemptID  uuid.UUID `json:"attempt_id"`
+							HomeRegion string    `json:"home_region"`
+						}{body.UserID, body.AttemptID, "use"}
+					}
 					if operation == "create-team" {
 						requestBody = struct {
 							promotionAccountRequest
@@ -198,6 +208,7 @@ func TestPromotionAccountAssertions(t *testing.T) {
 					account.POST("/bind", h.BindPromotionSignupAccount)
 					account.POST("/evidence", h.GetPromotionSignupAccountEvidence)
 					account.POST("/register", h.RegisterPromotionSignupDevice)
+					account.POST("/register-signup", h.RegisterPromotionSignupAccount)
 					account.POST("/signup-eligibility", h.EvaluateSignupPromotion)
 					account.POST("/create-team", h.CreateTeamWithPromotionAttempt)
 					account.POST("/prepare-team", h.PrepareTeamPromotionCreation)
@@ -231,6 +242,70 @@ func TestPromotionAccountAssertions(t *testing.T) {
 						t.Fatalf("got %d, want %d: %s", w.Code, tc.status, w.Body.String())
 					}
 				})
+			}
+		})
+	}
+}
+
+func TestPromotionSignupAssertionRegionAndBodyConsistency(t *testing.T) {
+	public, private, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PROMOTION_ACCOUNT_PUBLIC_KEY", base64.StdEncoding.EncodeToString(public))
+	t.Setenv("PROMOTION_CAPTURE_TOKEN", "capture-example-token")
+	t.Setenv("PROMOTION_ACCOUNT_TOKEN", "account-example-token")
+	t.Setenv("INTERNAL_API_TOKEN", "internal-example-token")
+	t.Setenv("SANDBOX_ID_REGION", "use")
+	user, attempt := uuid.New(), uuid.New()
+	now := time.Now()
+	for _, tc := range []struct {
+		name, signedRegion, bodyRegion, envRegion string
+		bodyAttempt                               uuid.UUID
+		status                                    int
+	}{
+		{
+			name: "valid East tuple", signedRegion: "use", bodyRegion: "use", envRegion: "use",
+			bodyAttempt: attempt, status: http.StatusServiceUnavailable,
+		},
+		{
+			name: "valid legacy East tuple", signedRegion: "use", bodyRegion: "use", envRegion: "",
+			bodyAttempt: attempt, status: http.StatusServiceUnavailable,
+		},
+		{"wrong signed region", "usw", "use", "use", attempt, http.StatusForbidden},
+		{"wrong body region", "use", "usw", "use", attempt, http.StatusForbidden},
+		{"signed and body attempt mismatch", "use", "use", "use", uuid.New(), http.StatusForbidden},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SANDBOX_ID_REGION", tc.envRegion)
+			claims := promotionAccountClaims{
+				RegisteredClaims: jwt.RegisteredClaims{
+					Issuer: "promotion-auth-adapter", Audience: jwt.ClaimStrings{"promotion-account"},
+					Subject: user.String(), IssuedAt: jwt.NewNumericDate(now.Add(-time.Second)),
+					ExpiresAt: jwt.NewNumericDate(now.Add(time.Minute)),
+				},
+				Operation: "register-signup", AttemptID: attempt.String(), HomeRegion: tc.signedRegion,
+			}
+			assertion, err := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims).SignedString(private)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := json.Marshal(promotionSignupRegistrationRequest{UserID: user, AttemptID: tc.bodyAttempt, HomeRegion: tc.bodyRegion})
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := gin.New()
+			h := new(Handlers)
+			account := r.Group("/internal/promotion/account", PromotionProducerAuth("PROMOTION_ACCOUNT_TOKEN"), PromotionAccountAuth())
+			account.POST("/register-signup", h.RegisterPromotionSignupAccount)
+			req := httptest.NewRequest(http.MethodPost, "/internal/promotion/account/register-signup", strings.NewReader(string(body)))
+			req.Header.Set("Authorization", "Bearer account-example-token")
+			req.Header.Set("X-Actor-User-Id", user.String())
+			req.Header.Set("X-Promotion-Account-Assertion", assertion)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != tc.status {
+				t.Fatalf("got %d, want %d: %s", w.Code, tc.status, w.Body.String())
 			}
 		})
 	}

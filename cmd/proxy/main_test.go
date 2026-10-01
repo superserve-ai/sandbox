@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -304,6 +305,40 @@ func TestPeerListenerRejectsPublicAndRedirectPorts(t *testing.T) {
 		if err := validatePeerListener(tc.peer, tc.public, tc.redirect); (err != nil) != tc.wantError {
 			t.Errorf("validatePeerListener(%q, %q, %q) = %v", tc.peer, tc.public, tc.redirect, err)
 		}
+	}
+}
+
+func TestRoutingBootstrapGate(t *testing.T) {
+	fresh := false
+	ready := routingBootstrapGate(func() bool { return fresh }, time.Hour)
+	if ready() {
+		t.Fatal("cold routing state accepted traffic")
+	}
+	fresh = true
+	if !ready() {
+		t.Fatal("fresh routing state did not become ready")
+	}
+	fresh = false
+	if !ready() {
+		t.Fatal("snapshot failure disabled healthy ownership fallback")
+	}
+	if !routingBootstrapGate(func() bool { return false }, 0)() {
+		t.Fatal("bootstrap deadline prevented ownership fallback")
+	}
+}
+
+func TestRoutingBootstrapGatesDataPlane(t *testing.T) {
+	ready, dispatched := false, false
+	gate := withRoutingBootstrap(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { dispatched = true }), func() bool { return ready })
+	w := httptest.NewRecorder()
+	gate.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/exec", nil))
+	if dispatched || w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), `"sandbox_unavailable"`) {
+		t.Fatalf("cold request dispatched=%v status=%d body=%s", dispatched, w.Code, w.Body)
+	}
+	ready = true
+	gate.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/exec", nil))
+	if !dispatched {
+		t.Fatal("warm request was not dispatched")
 	}
 }
 

@@ -768,7 +768,7 @@ func safeTeardownResult(v string) string {
 
 func safeRoutingOutcome(v string) string {
 	switch v {
-	case "local", "remote", "ownership_error", "peer_error", "not_found":
+	case "local", "remote", "hint_local", "hint_remote", "ownership_error", "peer_error", "not_found":
 		return v
 	default:
 		return "ownership_error"

@@ -128,6 +128,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	promotionAccount.POST("/bind", h.BindPromotionSignupAccount)
 	promotionAccount.POST("/evidence", h.GetPromotionSignupAccountEvidence)
 	promotionAccount.POST("/register", h.RegisterPromotionSignupDevice)
+	promotionAccount.POST("/register-signup", h.RegisterPromotionSignupAccount)
 	promotionAccount.POST("/signup-eligibility", h.EvaluateSignupPromotion)
 	promotionAccount.POST("/create-team", h.CreateTeamWithPromotionAttempt)
 	promotionAccount.POST("/prepare-team", h.PrepareTeamPromotionCreation)
@@ -144,6 +145,7 @@ func SetupRouter(ctx context.Context, h *Handlers, pool *pgxpool.Pool) *gin.Engi
 	{
 		// Billing recovery requires a credential unavailable to VMD hosts.
 		operator.POST("/teams/:team_id/billing/storage", h.ReconcileStorageBilling)
+		operator.POST("/teams/:team_id/billing/invoice-reconciliation", h.EnrollInvoiceReconciliation)
 		operator.POST("/teams/:team_id/billing/periods/:period_id/adopt-exports", h.AdoptBillingExports)
 		operator.POST("/billing/export-events/:event_id/recover", h.RecoverBillingExport)
 		operator.POST("/teams/:team_id/billing/periods/:period_id/measure-correction", h.MeasureBillingCorrection)
