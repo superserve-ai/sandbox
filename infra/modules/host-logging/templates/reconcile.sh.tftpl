@@ -11,6 +11,8 @@ agent_metrics_resource_dropin="$resource_dir/google-cloud-ops-agent-opentelemetr
 metrics_resource_dropin="$resource_dir/superserve-otel-collector.service.d/30-superserve-resources.conf"
 heartbeat_service="$resource_dir/superserve-host-logging-heartbeat.service"
 heartbeat_timer="$resource_dir/superserve-host-logging-heartbeat.timer"
+agent_logrotate='/etc/logrotate.d/superserve-google-cloud-ops-agent'
+syslog_logrotate='/etc/logrotate.d/superserve-host-syslog'
 identity_file='/etc/sandbox/host-identity.json'
 buffer_dir='/var/lib/google-cloud-ops-agent/fluent-bit/buffers'
 self_log_dir='/var/log/google-cloud-ops-agent'
@@ -20,6 +22,8 @@ metrics_resource_candidate=''
 agent_metrics_resource_candidate=''
 heartbeat_service_candidate=''
 heartbeat_timer_candidate=''
+agent_logrotate_candidate=''
+syslog_logrotate_candidate=''
 old_config=''
 old_dropin=''
 old_logging_resource=''
@@ -27,6 +31,12 @@ old_metrics_resource=''
 old_agent_metrics_resource=''
 old_heartbeat_service=''
 old_heartbeat_timer=''
+old_agent_logrotate=''
+old_syslog_logrotate=''
+old_package_version=''
+package_change_attempted=0
+package_stage_dir=''
+staged_agent=''
 
 # OS Config runs this script only after validate returned 101.  The candidate
 # is rendered with the provider-bound identity on the host, then diagnosed
@@ -38,26 +48,12 @@ incarnation_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))
 test -n "$host_id"
 test -n "$incarnation_id"
 
-installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
-case "$installed_version" in
-  ${ops_agent_package_version}*) ;;
-  *)
-    # The OS Config apt resource guarantees installation but has no version
-    # selector. Pin the reviewed package release here, still inside the
-    # Terraform-owned OS Config enforcement path.
-    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "google-cloud-ops-agent=${ops_agent_package_version}"; then
-      exit 1
-    fi
-    ;;
-esac
-command -v google-cloud-ops-agent >/dev/null 2>&1
-
 config_dir=$(dirname "$config_path")
 install -d -m 0755 "$config_dir" "$(dirname "$journald_dropin")" \
   "$(dirname "$logging_resource_dropin")" "$(dirname "$agent_metrics_resource_dropin")" \
   "$(dirname "$metrics_resource_dropin")"
 rendered_config=$(mktemp "$config_dir/.config.yaml.XXXXXX")
-trap 'rm -f "$rendered_config" "$dropin_candidate" "$logging_resource_candidate" "$agent_metrics_resource_candidate" "$metrics_resource_candidate" "$heartbeat_service_candidate" "$heartbeat_timer_candidate" "$old_config" "$old_dropin" "$old_logging_resource" "$old_agent_metrics_resource" "$old_metrics_resource" "$old_heartbeat_service" "$old_heartbeat_timer"' EXIT
+trap 'rm -f "$rendered_config" "$dropin_candidate" "$logging_resource_candidate" "$agent_metrics_resource_candidate" "$metrics_resource_candidate" "$heartbeat_service_candidate" "$heartbeat_timer_candidate" "$agent_logrotate_candidate" "$syslog_logrotate_candidate" "$old_config" "$old_dropin" "$old_logging_resource" "$old_agent_metrics_resource" "$old_metrics_resource" "$old_heartbeat_service" "$old_heartbeat_timer" "$old_agent_logrotate" "$old_syslog_logrotate"; rm -rf "$package_stage_dir"' EXIT
 sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
   "$candidate_config_path" >"$rendered_config"
 chmod 0644 "$rendered_config"
@@ -77,26 +73,73 @@ for unit in "$${required_source_units[@]}"; do
   fi
 done
 
-if ! google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1; then
-  exit 1
+# Validate with the selected release before changing an already-running
+# package.  When the selected version is not installed, download and extract
+# that package into a private staging directory and run its diagnose command;
+# the active package and its delivery state remain untouched during this test.
+installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
+if [[ "$installed_version" == ${ops_agent_package_version}* ]] && command -v google-cloud-ops-agent >/dev/null 2>&1; then
+  google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1 || exit 1
+else
+  package_stage_dir=$(mktemp -d /tmp/superserve-host-logging-package.XXXXXX)
+  if ! (cd "$package_stage_dir" && apt-get download "google-cloud-ops-agent=${ops_agent_package_version}") >/dev/null 2>&1; then
+    logger -t superserve-host-logging -p err "unable to stage Ops Agent ${ops_agent_package_version} for pre-activation validation"
+    exit 1
+  fi
+  package_deb=$(find "$package_stage_dir" -maxdepth 1 -type f -name 'google-cloud-ops-agent_*.deb' -print -quit)
+  test -n "$package_deb"
+  dpkg-deb --extract "$package_deb" "$package_stage_dir/root"
+  staged_agent=$(find "$package_stage_dir/root" -name google-cloud-ops-agent -perm -u+x -print -quit)
+  test -n "$staged_agent"
+  "$staged_agent" diagnose --config="$rendered_config" >/dev/null 2>&1 || exit 1
 fi
 
-# Reclaim only disposable retention stores before activation. Checkpoint and
-# buffer files are never deleted: if the selected release's supported buffer
-# remains over budget after reclaiming journals/self-logs/syslog, surface one
-# actionable failure instead of repeatedly restarting a healthy agent.
-journalctl --vacuum-size=${journal_max_use_bytes}B >/dev/null 2>&1 || true
-find "$self_log_dir" -type f -name '*.log*' -mtime +7 -delete 2>/dev/null || true
-find /var/log -maxdepth 1 -type f -name 'syslog.*' -mtime +7 -delete 2>/dev/null || true
+# Check retained stores before activation. Checkpoint and buffer files are
+# never deleted. Disposable retention cleanup runs only after the new policy
+# is healthy so a failed package/configuration transition cannot discard the
+# last working delivery history.
 storage_bytes=0
+# SystemMaxUse is the supported journal bound; use it as the conservative
+# contribution to the combined free-space objective without recursively
+# walking the journal tree on every OS Config cycle.
+journal_bytes=${journal_max_use_bytes}
+storage_scan_started=$SECONDS
+storage_scan_timeout=${storage_scan_timeout_seconds}
 for path in "$buffer_dir" "$self_log_dir" /var/log/syslog /var/log/syslog.*; do
   if [ -e "$path" ]; then
-    size=$(du -sb "$path" 2>/dev/null | awk 'NR == 1 {print $1}')
-    storage_bytes=$((storage_bytes + $${size:-0}))
+    # Bound recursive accounting so a large retained tree cannot hold the OS
+    # Config executor or amplify retries indefinitely. A timeout is a visible
+    # failure; it never deletes checkpoint or buffer state.
+    size=$(timeout "$${storage_scan_timeout}s" du -sx --block-size=1 "$path" 2>/dev/null | awk 'NR == 1 {print $1}') || exit 1
+    test -n "$size"
+    case "$path" in
+      "$self_log_dir")
+        if [ "$size" -gt ${agent_self_log_max_bytes} ]; then
+          logger -t superserve-host-logging -p err "Ops Agent self-log store exceeded ${agent_self_log_max_bytes} byte bound"
+          exit 1
+        fi
+        ;;
+      /var/log/syslog*)
+        if [ "$size" -gt ${syslog_max_bytes} ]; then
+          logger -t superserve-host-logging -p err "retained syslog store exceeded ${syslog_max_bytes} byte bound"
+          exit 1
+        fi
+        ;;
+    esac
+    storage_bytes=$((storage_bytes + size))
   fi
 done
+storage_scan_elapsed=$((SECONDS - storage_scan_started))
+if [ "$storage_scan_elapsed" -gt "$storage_scan_timeout" ]; then
+  logger -t superserve-host-logging -p err "storage accounting exceeded $${storage_scan_timeout}s scan budget"
+  exit 1
+fi
 if [ "$storage_bytes" -gt ${agent_buffer_bytes} ]; then
   logger -t superserve-host-logging -p err "storage budget exceeded: $${storage_bytes} bytes > ${agent_buffer_bytes}; retained Ops Agent buffer was not deleted"
+  exit 1
+fi
+if [ $((journal_bytes + storage_bytes)) -gt ${journal_keep_free_bytes} ]; then
+  logger -t superserve-host-logging -p err "combined journal and auxiliary logging stores exceeded ${journal_keep_free_bytes} byte free-space objective"
   exit 1
 fi
 
@@ -147,12 +190,35 @@ Description=Emit the host logging freshness heartbeat every minute
 
 [Timer]
 OnBootSec=1min
-OnUnitActiveSec=1min
+OnUnitActiveSec=${heartbeat_interval_seconds}s
 Unit=superserve-host-logging-heartbeat.service
 
 [Install]
 WantedBy=timers.target
 HEARTBEAT
+
+agent_logrotate_candidate=$(mktemp "$(dirname "$agent_logrotate")/.superserve-agent.XXXXXX")
+cat >"$agent_logrotate_candidate" <<'ROTATE'
+/var/log/google-cloud-ops-agent/*.log /var/log/google-cloud-ops-agent/subagents/*.log {
+  size ${ceil(agent_self_log_max_bytes / 2 / 1048576)}M
+  rotate 1
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+ROTATE
+syslog_logrotate_candidate=$(mktemp "$(dirname "$syslog_logrotate")/.superserve-syslog.XXXXXX")
+cat >"$syslog_logrotate_candidate" <<'ROTATE'
+/var/log/syslog {
+  size ${ceil(syslog_max_bytes / 3 / 1048576)}M
+  rotate 2
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+ROTATE
 
 old_config=$(mktemp)
 old_dropin=$(mktemp)
@@ -161,6 +227,9 @@ old_agent_metrics_resource=$(mktemp)
 old_metrics_resource=$(mktemp)
 old_heartbeat_service=$(mktemp)
 old_heartbeat_timer=$(mktemp)
+old_agent_logrotate=$(mktemp)
+old_syslog_logrotate=$(mktemp)
+old_package_version="$installed_version"
 had_config=0
 had_dropin=0
 had_logging_resource=0
@@ -175,6 +244,10 @@ if [ -f "$agent_metrics_resource_dropin" ]; then cp -p "$agent_metrics_resource_
 if [ -f "$metrics_resource_dropin" ]; then cp -p "$metrics_resource_dropin" "$old_metrics_resource"; had_metrics_resource=1; fi
 if [ -f "$heartbeat_service" ]; then cp -p "$heartbeat_service" "$old_heartbeat_service"; had_heartbeat_service=1; fi
 if [ -f "$heartbeat_timer" ]; then cp -p "$heartbeat_timer" "$old_heartbeat_timer"; had_heartbeat_timer=1; fi
+had_agent_logrotate=0
+had_syslog_logrotate=0
+if [ -f "$agent_logrotate" ]; then cp -p "$agent_logrotate" "$old_agent_logrotate"; had_agent_logrotate=1; fi
+if [ -f "$syslog_logrotate" ]; then cp -p "$syslog_logrotate" "$old_syslog_logrotate"; had_syslog_logrotate=1; fi
 agent_was_enabled=0
 agent_was_active=0
 logging_was_active=0
@@ -191,6 +264,13 @@ systemctl is-active --quiet systemd-journald.service && journald_was_active=1 ||
 systemctl is-active --quiet superserve-host-logging-heartbeat.timer && heartbeat_timer_was_active=1 || true
 
 rollback() {
+  if [ "$package_change_attempted" -eq 1 ]; then
+    if [ -n "$old_package_version" ]; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "google-cloud-ops-agent=$old_package_version" >/dev/null 2>&1 || true
+    else
+      DEBIAN_FRONTEND=noninteractive apt-get remove -y google-cloud-ops-agent >/dev/null 2>&1 || true
+    fi
+  fi
   if [ "$had_config" -eq 1 ]; then install -m 0644 "$old_config" "$config_path"; else rm -f "$config_path"; fi
   if [ "$had_dropin" -eq 1 ]; then install -m 0644 "$old_dropin" "$journald_dropin"; else rm -f "$journald_dropin"; fi
   if [ "$had_logging_resource" -eq 1 ]; then install -m 0644 "$old_logging_resource" "$logging_resource_dropin"; else rm -f "$logging_resource_dropin"; fi
@@ -198,6 +278,8 @@ rollback() {
   if [ "$had_metrics_resource" -eq 1 ]; then install -m 0644 "$old_metrics_resource" "$metrics_resource_dropin"; else rm -f "$metrics_resource_dropin"; fi
   if [ "$had_heartbeat_service" -eq 1 ]; then install -m 0644 "$old_heartbeat_service" "$heartbeat_service"; else rm -f "$heartbeat_service"; fi
   if [ "$had_heartbeat_timer" -eq 1 ]; then install -m 0644 "$old_heartbeat_timer" "$heartbeat_timer"; else rm -f "$heartbeat_timer"; fi
+  if [ "$had_agent_logrotate" -eq 1 ]; then install -m 0644 "$old_agent_logrotate" "$agent_logrotate"; else rm -f "$agent_logrotate"; fi
+  if [ "$had_syslog_logrotate" -eq 1 ]; then install -m 0644 "$old_syslog_logrotate" "$syslog_logrotate"; else rm -f "$syslog_logrotate"; fi
   systemctl daemon-reload || true
   if [ "$logging_was_active" -eq 1 ]; then systemctl restart google-cloud-ops-agent-fluent-bit.service || true; else systemctl stop google-cloud-ops-agent-fluent-bit.service || true; fi
   if [ "$metrics_was_active" -eq 1 ]; then systemctl restart google-cloud-ops-agent-opentelemetry-collector.service || true; else systemctl stop google-cloud-ops-agent-opentelemetry-collector.service || true; fi
@@ -207,6 +289,32 @@ rollback() {
   if [ "$agent_was_active" -eq 1 ]; then systemctl start google-cloud-ops-agent.service || true; else systemctl stop google-cloud-ops-agent.service || true; fi
   if [ "$agent_was_enabled" -eq 1 ]; then systemctl enable google-cloud-ops-agent.service || true; else systemctl disable google-cloud-ops-agent.service || true; fi
 }
+
+# The package resource only guarantees presence, not the reviewed release.
+# Snapshot service/configuration state above, then make the version change as
+# part of the same transaction so any activation failure can restore both the
+# previous package and its delivery state.
+if [[ "$installed_version" != ${ops_agent_package_version}* ]]; then
+  package_change_attempted=1
+  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "google-cloud-ops-agent=${ops_agent_package_version}"; then
+    rollback
+    exit 1
+  fi
+  if ! google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1; then
+    rollback
+    exit 1
+  fi
+fi
+
+for pair in "$agent_logrotate_candidate:$agent_logrotate" "$syslog_logrotate_candidate:$syslog_logrotate"; do
+  candidate=$${pair%%:*}
+  destination=$${pair#*:}
+  if ! cmp -s "$candidate" "$destination" 2>/dev/null; then
+    staged_rotation=$(mktemp "$(dirname "$destination")/.active-rotation.XXXXXX")
+    install -m 0644 "$candidate" "$staged_rotation"
+    mv -f "$staged_rotation" "$destination"
+  fi
+done
 
 # All renames stay on their destination filesystems. A failed restart restores
 # the previous config and drop-ins; Ops Agent checkpoint/buffer directories are
@@ -277,4 +385,10 @@ for service in google-cloud-ops-agent-fluent-bit.service google-cloud-ops-agent-
 done
 if ! systemctl enable --now superserve-host-logging-heartbeat.timer; then rollback; exit 1; fi
 systemctl is-active --quiet superserve-host-logging-heartbeat.timer || { rollback; exit 1; }
+
+# Reclaim only disposable retention stores after successful activation. The
+# selected release's checkpoint/buffer state is never copied or deleted.
+journalctl --vacuum-size=${journal_max_use_bytes}B >/dev/null 2>&1 || true
+find "$self_log_dir" -type f -name '*.log*' -mtime +7 -delete 2>/dev/null || true
+find /var/log -maxdepth 1 -type f -name 'syslog.*' -mtime +7 -delete 2>/dev/null || true
 exit 0

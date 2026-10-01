@@ -25,17 +25,29 @@ Ops Agent 2.52.0 uses the documented built-in disk-buffer cap introduced in
 2.28; the managed logging and metrics subagents and the actual standalone
 `superserve-otel-collector.service` receive explicit CPU/memory limits, with
 metrics receiving the smaller share so its existing queue/memory limiter sheds
-metrics before log export is constrained. Reconciliation vacuums journald and
-expires disposable self-log/syslog files before checking the combined buffer
-budget; it never deletes checkpoints and emits an independent error when the
-supported buffer itself remains over budget. Staging must measure combined
-growth before production.
+metrics before log export is constrained. Reconciliation manages explicit
+logrotate bounds for the disposable self-log and legacy syslog stores and
+checks the combined buffer budget before activation; successful activation
+then vacuums journald. It never deletes
+checkpoints and emits an independent error when a store or the supported
+buffer itself remains over budget. Recursive accounting is bounded by a
+five-second scan budget so an oversized tree fails visibly instead of
+amplifying OS Config retries. Staging must measure combined growth before
+production. The configured 4 GiB journal maximum is counted conservatively in
+the combined free-space precondition without adding a second recursive
+journal walk.
+Each host emits one independent heartbeat per configured 60-second period;
+the policy performs no fleet-sized heartbeat loop, so monitoring work is
+linear in the expected-host inventory and constant per host.
 Candidate configuration and the journald drop-in are validated before atomic
-activation. A failed reconciliation keeps the last working configuration and
-delivery state. The policy never restarts VMD or mutates identity/admission
-files. A managed minute heartbeat supplies a timestamped log-based freshness
-signal; the standalone OTel uptime alert remains independent for exporter
-failure and never-seen/replacement-host detection.
+activation. A package upgrade is diagnosed from a staged selected-release
+artifact before installation; a failed reconciliation restores the previous
+package, service/configuration state, and delivery state. The policy never
+restarts VMD or mutates identity/admission files. A managed minute heartbeat
+supplies a timestamped log-based freshness signal keyed by the stable VM
+identity, while runtime host ID and incarnation remain distinct; the
+standalone OTel uptime alert remains independent for exporter failure and
+never-seen/replacement-host detection.
 
 Each enrolled runtime identity receives only `roles/logging.logWriter` here;
 the existing metric-writer and workload grants remain owned by their roots.

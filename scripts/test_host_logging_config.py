@@ -22,6 +22,8 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertLess(self.config.index("parse_application_json"), self.config.index("exclude_debug_after_parse"))
         self.assertIn("labels.environment", self.config)
         self.assertIn("labels.region", self.config)
+        self.assertIn("labels.host_id", self.config)
+        self.assertIn("labels.instance_name", self.config)
         self.assertIn("redact_sensitive_fields", self.config)
         self.assertIn("jsonPayload.level", self.config)
         self.assertIn("jsonPayload.body_snippet", self.config)
@@ -36,6 +38,26 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertIn("cmp -s", self.reconcile)
         self.assertIn("diagnose", self.reconcile)
         self.assertIn("exit 100", self.validate)
+
+    def test_reconciliation_bounds_package_and_storage_transitions(self):
+        # The selected package is diagnosed before activation, while the
+        # previous package and service/configuration state are captured for
+        # rollback if installation or activation fails.
+        self.assertIn("apt-get download", self.reconcile)
+        self.assertIn("staged_agent", self.reconcile)
+        self.assertIn("old_package_version", self.reconcile)
+        self.assertIn("package_change_attempted", self.reconcile)
+        self.assertIn("apt-get install -y --no-install-recommends", self.reconcile)
+        self.assertIn("storage_scan_timeout_seconds", self.reconcile)
+        self.assertIn("storage_scan_timeout_seconds", self.validate)
+        self.assertIn("agent_self_log_max_bytes", self.reconcile)
+        self.assertIn("syslog_max_bytes", self.reconcile)
+        self.assertIn("heartbeat_interval_seconds", self.reconcile)
+
+    def test_validation_and_enforcement_render_identical_metrics_dropin(self):
+        expected_comment = "# Keep the standalone application-metrics collector below the logging"
+        self.assertIn(expected_comment, self.reconcile)
+        self.assertIn(expected_comment, self.validate)
 
 
 if __name__ == "__main__":

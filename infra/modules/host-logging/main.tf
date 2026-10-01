@@ -41,6 +41,10 @@ locals {
     agent_memory_limit_mb   = var.agent_memory_limit_mb
     agent_cpu_limit_millicores = var.agent_cpu_limit_millicores
     agent_buffer_bytes      = var.agent_buffer_bytes
+    agent_self_log_max_bytes = var.agent_self_log_max_bytes
+    syslog_max_bytes        = var.syslog_max_bytes
+    storage_scan_timeout_seconds = var.storage_scan_timeout_seconds
+    heartbeat_interval_seconds = var.heartbeat_interval_seconds
     ops_agent_package_version = var.ops_agent_package_version
   })
   validate_script = templatefile("${path.module}/templates/validate.sh.tftpl", {
@@ -52,6 +56,10 @@ locals {
     agent_memory_limit_mb     = var.agent_memory_limit_mb
     ops_agent_package_version = var.ops_agent_package_version
     agent_buffer_bytes        = var.agent_buffer_bytes
+    agent_self_log_max_bytes = var.agent_self_log_max_bytes
+    syslog_max_bytes        = var.syslog_max_bytes
+    storage_scan_timeout_seconds = var.storage_scan_timeout_seconds
+    heartbeat_interval_seconds = var.heartbeat_interval_seconds
   })
 }
 
@@ -192,6 +200,11 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
 
   lifecycle {
     prevent_destroy = true
+
+    precondition {
+      condition = var.journal_max_use_bytes + var.agent_buffer_bytes + var.agent_self_log_max_bytes + var.syslog_max_bytes <= var.journal_keep_free_bytes
+      error_message = "Combined journal, Ops Agent buffer, self-log, and syslog budgets must fit within the host free-space reserve."
+    }
   }
 
   depends_on = [google_storage_bucket_iam_member.artifact_reader]

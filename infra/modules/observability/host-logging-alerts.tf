@@ -25,12 +25,16 @@ resource "google_logging_metric" "host_logging_heartbeat" {
     labels {
       key         = "collector_host_id"
       value_type  = "STRING"
-      description = "Stable collector identity for the active host incarnation."
+      description = "Stable VM identity for the active host incarnation."
     }
   }
 
   label_extractors = {
-    collector_host_id = "EXTRACT(labels.host_id)"
+    # Heartbeat alerts key on the stable VM identity supplied by the expected
+    # host inventory.  Runtime host_id and incarnation remain separate labels
+    # for log attribution; extracting labels.host_id here would make a valid
+    # heartbeat invisible whenever provisioning assigns a different runtime ID.
+    collector_host_id = "EXTRACT(labels.instance_name)"
   }
 }
 
@@ -97,6 +101,9 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
     }
   }
 
+  # Monitoring conditions are typed one-per-block.  Keep the retained-log
+  # absence signal and the independent never-seen heartbeat threshold as
+  # separate blocks so the provider can represent both valid condition types.
   conditions {
     display_name = "Ops Agent delivery lag on ${each.value.instance_name}"
     condition_absent {
@@ -107,6 +114,10 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
         per_series_aligner = "ALIGN_SUM"
       }
     }
+  }
+
+  conditions {
+    display_name = "No independent heartbeat for ${each.value.instance_name}"
     condition_threshold {
       # A threshold condition with missing-data-as-active covers a host that
       # has never emitted its first independent heartbeat series. Once the

@@ -80,6 +80,50 @@ variable "agent_buffer_bytes" {
   }
 }
 
+variable "agent_self_log_max_bytes" {
+  description = "Per-file size bound used by the host log rotation policy for Ops Agent self-logs."
+  type        = number
+  default     = 268435456
+
+  validation {
+    condition     = var.agent_self_log_max_bytes > 0
+    error_message = "agent_self_log_max_bytes must be positive."
+  }
+}
+
+variable "syslog_max_bytes" {
+  description = "Size bound used by the host log rotation policy for retained syslog files."
+  type        = number
+  default     = 268435456
+
+  validation {
+    condition     = var.syslog_max_bytes > 0
+    error_message = "syslog_max_bytes must be positive."
+  }
+}
+
+variable "storage_scan_timeout_seconds" {
+  description = "Maximum wall-clock budget for one recursive buffer/self-log/syslog accounting pass."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.storage_scan_timeout_seconds >= 1
+    error_message = "storage_scan_timeout_seconds must be at least one second."
+  }
+}
+
+variable "heartbeat_interval_seconds" {
+  description = "Per-host heartbeat period; reconciliation performs no fleet-sized heartbeat loop."
+  type        = number
+  default     = 60
+
+  validation {
+    condition     = var.heartbeat_interval_seconds >= 30
+    error_message = "heartbeat_interval_seconds must be at least 30 seconds."
+  }
+}
+
 variable "agent_memory_limit_mb" {
   description = "Bounded Ops Agent memory budget in MiB."
   type        = number
