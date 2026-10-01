@@ -106,6 +106,13 @@ type Task struct {
 	// the uploader-owned staging tree; the dedupe upgrade in Enqueue is
 	// one-way toward staged.
 	Staged bool `json:"staged,omitempty"`
+	// Immutable records that this task's own artifacts are never written
+	// again after capture, so the upload need not re-read them to prove
+	// they still match. Distinct from Staged: these are not copies the
+	// uploader owns but originals nothing writes any more, and a shared
+	// base entry is excluded because it still names the host's live
+	// template (see immutableSource).
+	Immutable bool `json:"immutable,omitempty"`
 	// ClaimToken fences resolution against lease steals: Next stamps the
 	// claim's token here, and Ack/Nack refuse to touch a row whose live
 	// claim carries a different token (the lease expired and another
@@ -580,6 +587,41 @@ func (j *Journal) Next(now time.Time) (Task, bool, error) {
 		task.ClaimToken = j.claimSeq
 	}
 	return task, found, nil
+}
+
+// claimRenewEvery is how often a streaming upload re-stamps its lease.
+// A third of the TTL leaves two missed renewals of headroom before a
+// task that really is wedged becomes claimable again.
+const claimRenewEvery = claimTTL / 3
+
+// RenewClaim re-stamps the caller's lease while the caller still owns it,
+// so an upload slower than claimTTL is not stolen mid-stream and started
+// again from zero, forever, burning the bandwidth the rest of the queue
+// needs. Reports whether the lease is still the caller's; a false means
+// another worker holds the task and this attempt's Ack or Nack will be
+// refused anyway.
+//
+// Renewal belongs to callers that are making progress, never to a timer
+// alone: the TTL exists to recover a wedged worker, and a lease renewed
+// regardless of progress would never let that happen.
+func (j *Journal) RenewClaim(task Task, now time.Time) bool {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	renewed := false
+	_ = j.db.View(func(tx *bolt.Tx) error {
+		qk := currentKey(tx, &task)
+		if tx.Bucket(journalBucket).Get(qk) == nil {
+			return nil
+		}
+		c, held := j.claims[string(qk)]
+		if !held || c.token != task.ClaimToken {
+			return nil
+		}
+		j.claims[string(qk)] = claim{until: now.Add(claimTTL), token: c.token}
+		renewed = true
+		return nil
+	})
+	return renewed
 }
 
 // errClaimStolen reports a resolution refused because the caller's lease

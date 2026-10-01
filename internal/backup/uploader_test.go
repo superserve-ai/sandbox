@@ -3420,3 +3420,150 @@ func TestDeferredPageDoesNotHideLaterNotifications(t *testing.T) {
 		t.Fatalf("outbox = %d entries (err %v), want the %d deferred ones retained", len(pending), err, notifyFlushBatch)
 	}
 }
+
+// Hashing before the stream exists to abort early on a source a resume
+// mutated. Nothing can mutate a copy the uploader owns, nor an artifact
+// written once at capture — except a shared base entry, which still names
+// the host's live template.
+func TestImmutableSourceSkipsThePreStreamHashOnlyWhenNothingCanWrite(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		task Task
+		file TaskFile
+		want bool
+	}{
+		{"staged copies", Task{Staged: true}, TaskFile{}, true},
+		{"staged base copy", Task{Staged: true}, TaskFile{Shared: true}, true},
+		{"captured snapshot", Task{Immutable: true}, TaskFile{}, true},
+		{"captured snapshot's live template", Task{Immutable: true}, TaskFile{Shared: true}, false},
+		{"live pause paths", Task{}, TaskFile{}, false},
+		{"live pause base", Task{}, TaskFile{Shared: true}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := immutableSource(&tc.task, tc.file); got != tc.want {
+				t.Fatalf("immutableSource = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// Skipping the pre-stream hash must not weaken what it guarded: the
+// stream hasher digests what actually ships, so a source mutated mid
+// upload is still abandoned without a manifest.
+func TestImmutableSourceStillAbandonsAMutatedStream(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	// Staged, so the pre-stream hash is skipped for every file in it.
+	task.Staged = true
+	store := &midStreamMutator{
+		memStore: newMemStore(),
+		target:   "sandboxes/sb-1/gen-abc/" + packedName(t, task.Files[0].Path, "overlay.ext4"),
+		hook: func() {
+			if err := os.WriteFile(task.Files[0].Path, []byte("diskMUTA"), 0o644); err != nil {
+				t.Error(err)
+			}
+		},
+	}
+	u := &Uploader{Journal: j, Store: store, Log: zerolog.Nop()}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := store.objects["sandboxes/sb-1/gen-abc/manifest.json"]; ok {
+		t.Fatal("a generation was completed over bytes that changed mid-stream")
+	}
+}
+
+// Good bytes thrown away must page. A dedupe against an object this host
+// cannot vouch for abandons a staged generation whose artifacts existed,
+// which is the one abandonment that means real loss — and it used to log
+// at warn, below the level alerting forwards.
+func TestUnverifiableDedupeOfAStagedGenerationLogsAsLoss(t *testing.T) {
+	store := newMemStore()
+	dir := t.TempDir()
+
+	// One host uploads the generation, so the objects exist.
+	first := writeTask(t, dir)
+	first.Staged = true
+	j1, _ := testJournal(t)
+	if err := j1.Enqueue(first); err != nil {
+		t.Fatal(err)
+	}
+	u1 := &Uploader{Journal: j1, Store: store, Log: zerolog.Nop()}
+	if completed, _, _, err := u1.uploadTask(context.Background(), &first); err != nil || !completed {
+		t.Fatalf("seed upload: completed=%v err=%v", completed, err)
+	}
+
+	// A host with no history of those objects meets them as a dedupe.
+	var logged bytes.Buffer
+	second := writeTask(t, dir)
+	second.Staged = true
+	j2, _ := testJournal(t)
+	if err := j2.Enqueue(second); err != nil {
+		t.Fatal(err)
+	}
+	u2 := &Uploader{Journal: j2, Store: store, Log: zerolog.New(&logged)}
+	if completed, _, _, err := u2.uploadTask(context.Background(), &second); completed {
+		t.Fatalf("completed over objects nothing can vouch for (err %v)", err)
+	}
+
+	level, found := logLevelOf(t, logged.String(), "no verification history")
+	if !found {
+		t.Fatalf("the abandonment was not reported: %s", logged.String())
+	}
+	if level != "error" {
+		t.Fatalf("reported at %q, below the level alerting forwards", level)
+	}
+}
+
+// logLevelOf returns the level of the one logged record whose message
+// contains want. Asserting on the whole buffer would be satisfied by any
+// other record that happens to carry the level being looked for.
+func logLevelOf(t *testing.T, out, want string) (string, bool) {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		var rec struct {
+			Level   string `json:"level"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(line), &rec) != nil {
+			continue
+		}
+		if strings.Contains(rec.Message, want) {
+			return rec.Level, true
+		}
+	}
+	return "", false
+}
+
+// The skip has to be wired, not merely decided: with the pre-stream hash
+// in place a source already mutated before the upload aborts before any
+// bytes ship, so an immutable task reaching the stream's own verdict
+// instead is what proves the second read is gone.
+func TestImmutableSourceSkipsThePreStreamHashInUploadFile(t *testing.T) {
+	j, _ := testJournal(t)
+	task := writeTask(t, t.TempDir())
+	task.Staged = true
+	// Mutated before the upload begins: the pre-stream hash, if it ran,
+	// would catch this and abandon without shipping anything.
+	if err := os.WriteFile(task.Files[0].Path, []byte("diskMUTA"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var logged bytes.Buffer
+	u := &Uploader{Journal: j, Store: newMemStore(), Log: zerolog.New(&logged)}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.drainOne(context.Background(), task.EnqueuedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	out := logged.String()
+	if _, found := logLevelOf(t, out, "changed since pause"); found {
+		t.Fatalf("the pre-stream hash still read an immutable source: %s", out)
+	}
+	if _, found := logLevelOf(t, out, "changed during upload"); !found {
+		t.Fatalf("the stream's own verdict did not abandon the generation: %s", out)
+	}
+}

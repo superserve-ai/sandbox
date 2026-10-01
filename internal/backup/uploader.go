@@ -926,6 +926,34 @@ func (u *Uploader) verifiedHere(task *Task, object string) (bool, error) {
 	return u.Journal.WasVerified(u.verificationKey(object), u.clock())
 }
 
+// renewClaim keeps this attempt's lease alive while it streams. Failure
+// needs no handling here: a lease already lost means Ack and Nack refuse
+// this attempt anyway, and the worker that took the task is the one whose
+// resolution counts.
+func (u *Uploader) renewClaim(task *Task) {
+	if u.Journal == nil {
+		return
+	}
+	u.Journal.RenewClaim(*task, u.clock())
+}
+
+// immutableSource reports whether this entry's bytes cannot change while
+// the upload runs, so reading them twice proves nothing the stream hash
+// does not.
+//
+// A staged task owns every path it names, bases included: those are
+// copies the uploader made, and nothing else writes them. A task marked
+// immutable names artifacts that are never written again after capture,
+// which covers its own files but NOT a shared base — that entry still
+// points at the host's live template, which a rebuild can replace, and
+// the pre-check is what catches it before bytes ship.
+func immutableSource(task *Task, file TaskFile) bool {
+	if task.Staged {
+		return true
+	}
+	return task.Immutable && !file.Shared
+}
+
 // uploadFile ships one artifact object. objectPath is the exact bucket
 // object the artifact lives under (the same value handed to the store),
 // returned so completion bookkeeping records the path actually written
@@ -1009,14 +1037,22 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 	// before any bytes ship: a cheap early abort for the common mutation
 	// case (the sandbox resumed before the drain). After the shared skip
 	// above, so an already-verified base is never re-read at all.
-	sum, err := hashApparent(ctx, f, extents, apparent)
-	if err != nil {
-		return ManifestFile{}, "", 0, fmt.Errorf("verify %s: %w", file.Path, err)
-	}
-	if sum != file.SHA256 {
-		task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
-			Msg("backup source changed since pause; abandoning generation")
-		return ManifestFile{}, "", 0, errSourceChanged
+	//
+	// Skipped when nothing can change the source under us: the abort it
+	// exists for cannot fire, and the stream hasher below digests the same
+	// bytes again anyway, so it is a second full read of a multi-GB
+	// artifact — on the array serving live VM disk I/O, with the staging
+	// pages already dropped, so both passes reach the platters.
+	if !immutableSource(task, file) {
+		sum, err := hashApparent(ctx, f, extents, apparent)
+		if err != nil {
+			return ManifestFile{}, "", 0, fmt.Errorf("verify %s: %w", file.Path, err)
+		}
+		if sum != file.SHA256 {
+			task.logOwner(u.lossEvent(task).Str("path", file.Path).Str("want", file.SHA256).Str("got", sum)).
+				Msg("backup source changed since pause; abandoning generation")
+			return ManifestFile{}, "", 0, errSourceChanged
+		}
 	}
 	// The stream hasher digests the apparent content of what is ACTUALLY
 	// shipped (packed bytes as streamed, zeros for the holes), closing the
@@ -1026,7 +1062,15 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 	// object is written, and a generation without its completion marker is
 	// never restored from; the orphaned artifact object is inert.
 	hasher := newApparentStreamHasher(NewPackedReader(f, extents), extents, apparent)
-	reader := &limitedReader{r: hasher, limiter: u.Limiter, ctx: ctx}
+	reader := &limitedReader{
+		r: hasher, limiter: u.Limiter, ctx: ctx,
+		// A bandwidth-capped multi-GB artifact can outrun the claim TTL;
+		// without this the lease expires mid-stream, a sibling worker
+		// takes the task, and the upload restarts from zero every time.
+		progress: func() { u.renewClaim(task) },
+		every:    claimRenewEvery,
+		last:     u.clock(),
+	}
 	created, err := u.Store.Create(ctx, object, reader)
 	if err != nil {
 		return ManifestFile{}, "", 0, storeError{err}
@@ -1113,7 +1157,10 @@ func (u *Uploader) uploadFile(ctx context.Context, task *Task, file TaskFile) (_
 		// discriminator, and without it the generation is abandoned
 		// rather than completed over bytes nothing can vouch for (this
 		// identity cannot read them back).
-		task.logOwner(u.Log.Warn().Str("object", object)).
+		// Through lossEvent like every sibling abandonment: for a staged
+		// task these bytes existed and nothing can vouch for them any
+		// more, which is an error an alert has to see, not a warning.
+		task.logOwner(u.lossEvent(task).Str("object", object)).
 			Msg("deduped object has no verification history; abandoning generation")
 		return ManifestFile{}, "", 0, errSourceChanged
 	} else {
@@ -1234,6 +1281,13 @@ type limitedReader struct {
 	r       io.Reader
 	limiter *rate.Limiter
 	ctx     context.Context
+	// progress is called while bytes are actually flowing, at most once
+	// per every. Tying it to the stream rather than to a timer is what
+	// keeps a lease renewal honest: a stalled upload stops renewing and
+	// is correctly taken over.
+	progress func()
+	every    time.Duration
+	last     time.Time
 }
 
 func (l *limitedReader) Read(p []byte) (int, error) {
@@ -1244,6 +1298,12 @@ func (l *limitedReader) Read(p []byte) (int, error) {
 		}
 	}
 	n, err := l.r.Read(p)
+	if n > 0 && l.progress != nil {
+		if now := time.Now(); now.Sub(l.last) >= l.every {
+			l.last = now
+			l.progress()
+		}
+	}
 	if n > 0 && l.limiter != nil {
 		if werr := l.limiter.WaitN(l.ctx, n); werr != nil {
 			return n, werr

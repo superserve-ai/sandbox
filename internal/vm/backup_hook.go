@@ -647,7 +647,8 @@ func (m *Manager) enqueueStagedPending(ctx context.Context, pb PendingBackup, lo
 	for _, e := range entries {
 		files = append(files, backup.TaskFile{
 			Name: e.FileName, Path: e.Path, SHA256: e.SHA256, Size: e.SizeBytes,
-			BasePath: e.BasePath, BaseSHA256: e.BaseSHA256,
+			AllocatedBytes: e.AllocatedBytes,
+			BasePath:       e.BasePath, BaseSHA256: e.BaseSHA256,
 		})
 	}
 	// The base joins the staging tree too (immutable, identity-pinned
@@ -1342,6 +1343,7 @@ func (m *Manager) enqueueBackup(vmID string, manifest []ManifestEntry, prio back
 			Path:           e.Path,
 			SHA256:         e.SHA256,
 			Size:           e.SizeBytes,
+			AllocatedBytes: e.AllocatedBytes,
 			BasePath:       e.BasePath,
 			BaseStagedPath: e.BaseStagedPath,
 			BaseSHA256:     e.BaseSHA256,
@@ -1457,6 +1459,7 @@ func rebuildTask(vmID string, manifest []ManifestEntry, prio backup.Priority, pa
 			Path:           e.Path,
 			SHA256:         e.SHA256,
 			Size:           e.SizeBytes,
+			AllocatedBytes: e.AllocatedBytes,
 			BasePath:       e.BasePath,
 			BaseStagedPath: e.BaseStagedPath,
 			BaseSHA256:     e.BaseSHA256,

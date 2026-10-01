@@ -889,3 +889,44 @@ func TestStagingRootsRecordIsIdempotentAndRemoveDrops(t *testing.T) {
 		t.Fatalf("StagingRoots after removing one = %v, want only the other", roots)
 	}
 }
+
+// An upload slower than the lease must keep its task, or a sibling worker
+// steals it and the transfer starts again from zero, forever.
+func TestRenewClaimKeepsAStreamingTaskClaimed(t *testing.T) {
+	j, _ := testJournal(t)
+	now := time.Unix(1000, 0)
+	task := Task{SandboxID: "sb-slow", Generation: "gen", EnqueuedAt: now,
+		Files: []TaskFile{{Name: "rootfs.ext4", Path: "/disk", SHA256: "d", Size: 1}}}
+	if err := j.Enqueue(task); err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := j.Next(now)
+	if err != nil || !ok {
+		t.Fatalf("claim = %v (%v)", ok, err)
+	}
+
+	// Still streaming at half the lease, so the lease moves with it.
+	if !j.RenewClaim(claimed, now.Add(claimTTL/2)) {
+		t.Fatal("the owner could not renew its own lease")
+	}
+	if _, ok, err := j.Next(now.Add(claimTTL + time.Minute)); err != nil || ok {
+		t.Fatal("the task was handed to another worker while its upload was still running")
+	}
+
+	// Past the renewed lease it is claimable again: a wedged worker must
+	// still be recoverable.
+	stolen, ok, err := j.Next(now.Add(claimTTL/2 + claimTTL + time.Minute))
+	if err != nil || !ok {
+		t.Fatalf("after the renewed lease expired: %v (%v)", ok, err)
+	}
+	// And the superseded attempt can no longer renew or resolve.
+	if j.RenewClaim(claimed, now.Add(claimTTL)) {
+		t.Fatal("a superseded attempt renewed a lease it no longer holds")
+	}
+	if err := j.Nack(claimed, now.Add(claimTTL)); !errors.Is(err, errClaimStolen) {
+		t.Fatalf("superseded Nack = %v, want the steal reported", err)
+	}
+	if err := j.Nack(stolen, now.Add(claimTTL)); err != nil {
+		t.Fatal(err)
+	}
+}
