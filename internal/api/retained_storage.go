@@ -21,12 +21,16 @@ func applyRetainedStorage(ctx context.Context, tx pgx.Tx, hostID string, at time
 	if err != nil {
 		return err
 	}
+	// Owner.Baseline is an additive nested envelope field. The SQL projections
+	// below extract it explicitly so nullable legacy owners remain compatible
+	// without dropping verified provenance from new reports.
 	// A full-copy template owner has a required shared baseline.  Without the
 	// verified path/generation object the observation is incomplete, not zero;
 	// keep the durable report retryable so settlement retains its fence.
 	var missingBaseline bool
 	if err := tx.QueryRow(ctx, `WITH supplied AS (
-  SELECT * FROM jsonb_to_recordset($1::jsonb) AS o(kind text,id uuid,baseline_path text)
+  SELECT o.kind,o.id,o.baseline->>'path' AS baseline_path
+  FROM jsonb_to_recordset($1::jsonb) AS o(kind text,id uuid,baseline jsonb)
 )
 SELECT EXISTS (
   SELECT 1 FROM supplied o JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
@@ -131,7 +135,11 @@ SELECT EXISTS (
 		return fmt.Errorf("%w: retained inventory is incomplete or superseded", errStorageReportRetainedIncomplete)
 	}
 	_, err = tx.Exec(ctx, `WITH supplied AS MATERIALIZED (
-  SELECT * FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,generation text,extents jsonb,baseline_path text,baseline_generation text,baseline_allocated_bytes bigint)
+  SELECT o.kind,o.id,o.generation,o.extents,
+         o.baseline->>'path' AS baseline_path,
+         o.baseline->>'generation' AS baseline_generation,
+         (o.baseline->>'allocated_bytes')::bigint AS baseline_allocated_bytes
+  FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,generation text,extents jsonb,baseline jsonb)
  ), eligible AS MATERIALIZED (
   SELECT o.*,s.team_id,s.destroyed_at lifetime_end FROM supplied o JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
   WHERE s.host_id=$1 AND s.created_at<=$2 AND (s.destroyed_at IS NULL OR s.destroyed_at>$2)
@@ -190,7 +198,11 @@ SELECT EXISTS (
 	// this receipt. This is additive history; later template metadata cannot
 	// rewrite the mapping.
 	_, err = tx.Exec(ctx, `WITH supplied AS MATERIALIZED (
-  SELECT * FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,generation text,extents jsonb,baseline_path text,baseline_generation text,baseline_allocated_bytes bigint)
+  SELECT o.kind,o.id,o.generation,o.extents,
+         o.baseline->>'path' AS baseline_path,
+         o.baseline->>'generation' AS baseline_generation,
+         (o.baseline->>'allocated_bytes')::bigint AS baseline_allocated_bytes
+  FROM jsonb_to_recordset($3::jsonb) AS o(kind text,id uuid,generation text,extents jsonb,baseline jsonb)
 ), eligible AS (
   SELECT o.*,s.team_id,s.host_id FROM supplied o JOIN sandbox s ON o.kind='sandbox' AND s.id=o.id
   WHERE o.baseline_path IS NOT NULL AND s.host_id=$1 AND s.created_at<=$2
