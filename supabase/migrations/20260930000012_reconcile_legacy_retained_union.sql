@@ -39,7 +39,7 @@ WITH team_cutovers AS MATERIALIZED (
      WHEN p.path=CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path ELSE s.base_path END
        THEN CASE WHEN t.id IS NOT NULL THEN 'template:'||t.id::text
                  WHEN s.snapshot_id IS NOT NULL THEN 'snapshot:'||s.snapshot_id::text END
-     ELSE 'private:'||s.sandbox_id::text||':'||p.path
+     ELSE 'private:'||s.id::text||':'||p.path
    END allocation_identity,
    MAX(COALESCE(am.allocated_bytes,0))::numeric/1048576.0 artifact_mib,
    GREATEST(s.billing_started_at,p_start) range_start,
@@ -54,7 +54,7 @@ WITH team_cutovers AS MATERIALIZED (
      WHEN p.path=CASE WHEN s.base_path IS NULL AND s.delta_path IS NULL THEN t.rootfs_path ELSE s.base_path END
        THEN CASE WHEN t.id IS NOT NULL THEN 'template:'||t.id::text
                  WHEN s.snapshot_id IS NOT NULL THEN 'snapshot:'||s.snapshot_id::text END
-     ELSE 'private:'||s.sandbox_id::text||':'||p.path
+     ELSE 'private:'||s.id::text||':'||p.path
    END,
    s.billing_started_at,s.retention_end
 ), pre_ranges AS (
