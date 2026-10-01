@@ -56,7 +56,7 @@ func TestSafeTeardownLabelsBoundValues(t *testing.T) {
 }
 
 func TestSafeRoutingOutcomeBoundsValues(t *testing.T) {
-	for _, outcome := range []string{"local", "remote", "ownership_error", "peer_error"} {
+	for _, outcome := range []string{"local", "remote", "hint_local", "hint_remote", "ownership_error", "peer_error"} {
 		if got := safeRoutingOutcome(outcome); got != outcome {
 			t.Fatalf("safeRoutingOutcome(%q) = %q", outcome, got)
 		}

@@ -8,6 +8,43 @@ import unittest
 
 
 class ProxyRevisionTests(unittest.TestCase):
+    def test_schema_gate_waits_for_successful_same_release_migration(self):
+        workflow = Path(__file__).parents[1].joinpath('deploy-proxy.yml').read_text()
+        step = workflow.split('      - name: Wait for same-SHA CD Migrate to succeed\n', 1)[1].split('\n  deploy-staging:', 1)[0]
+        script = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        substitutions = {'github.event_name': 'push', 'github.event.before': 'before',
+                         'github.sha': 'release', 'github.repository': 'example/repo',
+                         'steps.revision.outputs.revision': 'release'}
+        for key, value in substitutions.items():
+            script = script.replace('${{ ' + key + ' }}', value)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, body in {
+                'git': 'case "$1" in diff) printf "%s\\n" "$CHANGED_PATH";; checkout) test "$3" = release;; esac',
+                'gh': 'case "$2" in *head_sha=release*) printf "%s\\n" "$MIGRATION_RESULT";; *) exit 9;; esac',
+                'sleep': 'exit 0',
+            }.items():
+                path = root / name
+                path.write_text('#!/bin/sh\n' + body + '\n')
+                path.chmod(0o755)
+            env = dict(os.environ, PATH=str(root) + ':' + os.environ['PATH'],
+                       CHANGED_PATH='supabase/migrations/test.sql', MIGRATION_RESULT='completed success')
+            for result, success in [('completed success', True), ('completed failure', False),
+                                    ('completed cancelled', False), ('in_progress pending', False),
+                                    ('absent absent', False)]:
+                with self.subTest(result=result):
+                    proc = subprocess.run(['bash', '-c', script], env=dict(env, MIGRATION_RESULT=result),
+                                          capture_output=True, text=True)
+                    self.assertEqual(proc.returncode == 0, success, proc.stderr)
+            proc = subprocess.run(['bash', '-c', script], env=dict(env, CHANGED_PATH='internal/proxy/router.go',
+                                  MIGRATION_RESULT='completed failure'), capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            manual = script.replace('if [ "push" != "push" ]', 'if [ "workflow_dispatch" != "push" ]')
+            proc = subprocess.run(['bash', '-c', manual], env=dict(env, MIGRATION_RESULT='completed failure'),
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("      - 'supabase/migrations/**'", workflow)
+
     def test_revision_gate_accepts_only_main_history_and_matching_original_run(self):
         workflow = Path(__file__).parents[1].joinpath('deploy-proxy.yml').read_text()
         step = workflow.split('      - name: Validate deployment revision\n', 1)[1].split('      - name:', 1)[0]

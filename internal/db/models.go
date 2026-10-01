@@ -918,6 +918,7 @@ type Sandbox struct {
 	PauseOpTrigger *string `json:"pause_op_trigger"`
 	// Who asked for the pause in flight; NULL for automatic pauses. Kept so a reconciled pause is attributed to them.
 	PauseOpActorID pgtype.UUID `json:"pause_op_actor_id"`
+	RoutingVersion int64       `json:"routing_version"`
 	// Snapshot this sandbox was created from; NULL when created from a template.
 	SourceSnapshotID pgtype.UUID `json:"source_snapshot_id"`
 }
@@ -982,6 +983,12 @@ type SandboxRevocation struct {
 	SandboxID uuid.UUID `json:"sandbox_id"`
 	RevokedAt time.Time `json:"revoked_at"`
 	ExpiresAt time.Time `json:"expires_at"`
+}
+
+type SandboxRoutingRevocation struct {
+	SandboxID      uuid.UUID          `json:"sandbox_id"`
+	RoutingVersion int64              `json:"routing_version"`
+	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
 }
 
 type SandboxSecret struct {

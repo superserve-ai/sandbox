@@ -478,10 +478,18 @@ func sandboxRow(s db.Sandbox) *mockRow {
 		*dest[34].(*pgtype.Timestamptz) = s.PauseOpAttentionAt
 		*dest[35].(**string) = s.PauseOpTrigger
 		*dest[36].(*pgtype.UUID) = s.PauseOpActorID
-		*dest[37].(*pgtype.UUID) = s.SourceSnapshotID
-		if len(dest) == 39 {
-			// GetSandboxWithPreviewPolicy: trailing COALESCE'd effective access.
-			*dest[38].(*string) = "legacy_public"
+		*dest[37].(*int64) = s.RoutingVersion
+		if s.RoutingVersion == 0 {
+			*dest[37].(*int64) = 1
+		}
+		*dest[38].(*pgtype.UUID) = s.SourceSnapshotID
+		for _, target := range dest[39:] {
+			switch v := target.(type) {
+			case *time.Time:
+				*v = time.Now()
+			case *string:
+				*v = "legacy_public"
+			}
 		}
 		return nil
 	}}
@@ -1221,7 +1229,7 @@ func snapshotRow(s db.Snapshot) *mockRow {
 // missing snapshot row.
 func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision int64, ports ...publishedPortResponse) *mockRow {
 	return &mockRow{scanFn: func(dest ...any) error {
-		if err := sandboxRow(sb).scanFn(dest[:38]...); err != nil {
+		if err := sandboxRow(sb).scanFn(dest[:39]...); err != nil {
 			return err
 		}
 		var snapPath, snapMemPath *string
@@ -1231,15 +1239,15 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			snapPath, snapMemPath = &p, snap.MemPath
 			snapCreatedAt = pgtype.Timestamptz{Time: snap.CreatedAt, Valid: true}
 		}
-		*dest[38].(**string) = snapPath
-		*dest[39].(**string) = snapMemPath
-		*dest[40].(*pgtype.Timestamptz) = snapCreatedAt
+		*dest[39].(**string) = snapPath
+		*dest[40].(**string) = snapMemPath
+		*dest[41].(*pgtype.Timestamptz) = snapCreatedAt
 		if access == "" {
 			access = preview.AccessLegacyPublic
 		}
-		*dest[41].(*string) = access
 		*dest[42].(*string) = access
-		*dest[43].(*int64) = revision
+		*dest[43].(*string) = access
+		*dest[44].(*int64) = revision
 		numbers, accesses, versions := []int32{}, []string{}, []int64{}
 		for _, port := range ports {
 			version := port.TokenVersion
@@ -1250,10 +1258,11 @@ func claimResumeRow(sb db.Sandbox, snap *db.Snapshot, access string, revision in
 			accesses = append(accesses, port.Access)
 			versions = append(versions, version)
 		}
-		*dest[44].(*[]int32) = numbers
-		*dest[45].(*[]string) = accesses
-		*dest[46].(*[]int64) = versions
-		*dest[47].(**string) = nil
+		*dest[45].(*[]int32) = numbers
+		*dest[46].(*[]string) = accesses
+		*dest[47].(*[]int64) = versions
+		*dest[48].(**string) = nil
+		*dest[49].(*time.Time) = time.Now()
 		return nil
 	}}
 }
@@ -1305,7 +1314,7 @@ func pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID uuid.UUID) db.Sandb
 }
 
 func TestResumeSandbox_LegacyPolicyToleratesOldVMD(t *testing.T) {
-	testResumeSandboxLegacyPolicyToleratesOldVMD(t, nil)
+	testResumeSandboxLegacyPolicyToleratesOldVMD(t, func(h *Handlers, _ uuid.UUID) { h.Config = routingHintTestConfig() })
 }
 
 func testResumeSandboxLegacyPolicyToleratesOldVMD(t *testing.T, configure func(*Handlers, uuid.UUID)) {
@@ -1314,6 +1323,7 @@ func testResumeSandboxLegacyPolicyToleratesOldVMD(t *testing.T, configure func(*
 	teamID := uuid.New()
 	snapshotID := uuid.New()
 	sb := pausedSandboxWithSnapshot(sandboxID, teamID, snapshotID)
+	sb.HostID = "owner"
 	snap := db.Snapshot{
 		ID:        snapshotID,
 		SandboxID: sandboxID,
@@ -1383,7 +1393,11 @@ func testResumeSandboxLegacyPolicyToleratesOldVMD(t *testing.T, configure func(*
 		t.Error("resume did not attempt final policy reconciliation")
 	}
 
-	// Resume returns the minimal {id, status, access_token} shape, not the
+	if h.Config != nil && len(h.Config.SandboxAccessTokenSeed) >= 32 {
+		assertResponseRoutingHint(t, parseJSON(t, w), h.Config, sandboxID.String(), "owner")
+	}
+
+	// Resume returns the minimal lifecycle shape, not the
 	// full sandbox response.
 	body := parseJSON(t, w)
 	if body["status"] != "active" {
@@ -2283,7 +2297,7 @@ func TestActivateSandbox_AlreadyActive_200WithSandboxResponse(t *testing.T) {
 	teamID := uuid.New()
 	sb := db.Sandbox{
 		ID: sandboxID, TeamID: teamID, Name: "sb", Status: db.SandboxStatusActive,
-		VcpuCount: 2, MemoryMib: 1024,
+		VcpuCount: 2, MemoryMib: 1024, HostID: "owner",
 	}
 
 	mock := &mockDBTX{
@@ -2294,7 +2308,7 @@ func TestActivateSandbox_AlreadyActive_200WithSandboxResponse(t *testing.T) {
 	h := &Handlers{
 		VMD:    vmd,
 		DB:     db.New(mock),
-		Config: &config.Config{SandboxAccessTokenSeed: []byte("test-seed-for-hmac-32-bytes-min!!")},
+		Config: routingHintTestConfig(),
 	}
 	w := httptest.NewRecorder()
 	setupTestRouter(h, teamID.String()).ServeHTTP(w, activateRequest(sandboxID.String()))
@@ -2303,6 +2317,7 @@ func TestActivateSandbox_AlreadyActive_200WithSandboxResponse(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body: %s", w.Code, http.StatusOK, w.Body.String())
 	}
 	body := parseJSON(t, w)
+	assertResponseRoutingHint(t, body, h.Config, sandboxID.String(), "owner")
 	if body["status"] != "active" {
 		t.Errorf("status = %q, want active", body["status"])
 	}
@@ -2528,7 +2543,7 @@ func createSandboxReq(body string) *http.Request {
 }
 
 func TestCreateSandbox_Success(t *testing.T) {
-	testCreateSandboxSuccess(t, nil)
+	testCreateSandboxSuccess(t, func(h *Handlers, _ uuid.UUID) { h.Config = routingHintTestConfig() })
 }
 
 func testCreateSandboxSuccess(t *testing.T, configure func(*Handlers, uuid.UUID)) {
@@ -2573,7 +2588,7 @@ func testCreateSandboxSuccess(t *testing.T, configure func(*Handlers, uuid.UUID)
 				return sandboxRow(db.Sandbox{
 					ID: sandboxID, TeamID: teamID, Name: "my-sandbox",
 					Status: db.SandboxStatusStarting, VcpuCount: 2, MemoryMib: 512,
-					CreatedAt: time.Now(),
+					CreatedAt: time.Now(), HostID: "public-host",
 				})
 			}
 			if strings.Contains(sql, "FROM template") {
@@ -2599,6 +2614,9 @@ func testCreateSandboxSuccess(t *testing.T, configure func(*Handlers, uuid.UUID)
 
 	// Creation is synchronous — sandbox is active on return.
 	body := parseJSON(t, w)
+	if h.Config != nil && len(h.Config.SandboxAccessTokenSeed) >= 32 {
+		assertResponseRoutingHint(t, body, h.Config, sandboxID.String(), "public-host")
+	}
 	if body["name"] != "my-sandbox" {
 		t.Errorf("name = %q, want %q", body["name"], "my-sandbox")
 	}

@@ -70,8 +70,8 @@ use its latency distribution and ownership-error outcomes during staged rollout.
 
 ## Peer capacity
 
-The edge opens at most four connections with 32 streams each per destination
-(128 total). Ingress defaults to 128 active streams globally across connections;
+The edge opens at most four connections with 256 streams each per destination
+(1,024 total). Ingress defaults to 1,024 active streams globally across connections;
 `PEER_PROXY_MAX_STREAMS` still controls the active limit. Up to 128 additional
 streams can wait globally for at most 500 ms. Waiting streams do not dial the
 local proxy or consume request frames. Releasing capacity wakes waiters;
@@ -124,3 +124,80 @@ also acknowledge removal of an endpoint. The database fallback accepts only a
 fresh, matching heartbeat for the running VMD’s explicit `HOST_ID` when that host
 is unbound (including named legacy hosts); it cannot
 substitute for a missing acknowledgement on a bound host.
+
+## Signed SDK routing hints
+
+Create, get/activate and resume responses include an optional `routing_hint`.
+HTTP clients send it as `X-Superserve-Routing-Hint`; WebSocket clients add
+`route.<hint>` to their subprotocols. `X-Access-Token` and `token.<access-token>`
+are unchanged and remain required. Preview traffic does not use hints.
+
+Version 1 binds sandbox UUID, logical host, ownership version and edge-domain audience for one hour.
+Expiration is anchored to database statement time returned by the existing
+lifecycle query, so delayed responses cannot renew an old route.
+A domain-separated HMAC uses the existing cell access-token seed; the hint is
+never usable as an access token. Seed changes invalidate old hints, which retain
+lookup fallback; no additional signing secret or per-request secret fetch is
+required. Different blue/green processes using the same cell seed accept the
+same hint and select the current serving endpoint independently.
+
+Each routing proxy refreshes a bounded host directory every five seconds using
+only the existing read-only discovery column grants. Snapshots expire after
+15 seconds; missing, malformed, expired hints or unavailable directory entries
+use the existing bounded ownership lookup. No host-directory query runs on
+create/resume or in response to an SDK request.
+
+Database triggers record each deleted or superseded ownership version atomically,
+including changes made by older servers and hard deletes. Movement increments the
+version even when returning to an earlier host. Proxies accept hints only while
+holding a complete revocation snapshot less than one second old, measured from
+before its query. Snapshots poll every 500ms and cap at 65,536 entries; overflow,
+query errors, startup, replica connections, or clock skew over one minute disable
+hint bypass. The existing bounded ownership lookup remains the fallback.
+
+A PostgreSQL notification adds only the revoked ownership version to the local
+denied set without renewing snapshot freshness. Lost notifications are covered by polling. Host discovery, LISTEN, and
+revocation reads share one dedicated database session per process, separate from
+the four ownership connections. Initial readiness and public data-plane dispatch
+wait for fresh host and revocation snapshots, for at most one second. After that
+bounded warmup, unavailable snapshots use ownership fallback so overflow cannot
+prevent replacement proxies from serving. Later snapshot failures use fallback while
+the normal database readiness check remains in effect. `PROXY_DATABASE_URL` must use a primary database
+with direct or session-pooled connections (not transaction pooling). Budget five
+connections per proxy process, including both generations during blue/green.
+The migration raises the original role limit of 32 to 64 and preserves other
+configured limits; larger fleets must provision a matching role/database budget.
+
+Revocation records survive sandbox removal. Background control-plane maintenance
+first observes committed records, then assigns a two-hour retention window in
+bounded batches on a dedicated one-connection maintenance pool with a one-second
+statement timeout. Until observed, records have no expiration. This protects long
+transactions as well as delayed responses. Maintenance failure retains records;
+if the snapshot cap is reached, hints safely use ownership lookup. Keep database
+API and proxy clocks synchronized within one minute. Issuance suppresses future-dated
+hints and retention refuses to prune when database and API time differ by more
+than one minute. Destination access-token and
+VMD checks remain in force, and already-dispatched operations are not replayed.
+
+If opening a peer stream fails before forwarding request bytes, the proxy may
+resolve ownership and open once more. After forwarding begins, it never replays.
+A destination's pre-execution missing-sandbox response has code
+`sandbox_route_stale`; SDKs activate once to refresh ownership and retry. Deletion
+therefore fails at activate. Clients refresh expired hints before their next
+operation. They must never treat an ambiguous network failure as safe to replay.
+
+Apply the schema migration before deploying new API/proxy binaries, then deploy SDKs. Older clients and old proxies keep the
+lookup path; rollback does not require a token migration. Explicit
+`PEER_PROXY_MAX_STREAMS` overrides still win: set each participating host to at
+least 1024 for the 1000-concurrent-request acceptance run. Authenticated boxd
+traffic permits 1024 concurrent requests per source IP, including peer-local
+traffic; preview/unauthenticated limits and the 200-per-sandbox bound remain.
+
+Validate a controlled burst across distinct sandboxes on local and cross-host
+routes. Record route outcomes `hint_local`/`hint_remote`, ownership lookups, capacity rejections,
+proxy-added p50/p95/p99, and create/resume latency. A local benchmark is not
+production proof; capture deployed results before declaring the target met.
+
+Automatic proxy deployment waits for the same-release schema migration workflow
+when a push includes migrations. Manual dispatch requires the operator to apply
+migrations before deploying, matching the API deployment contract.

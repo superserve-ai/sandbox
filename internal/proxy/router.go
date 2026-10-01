@@ -25,6 +25,8 @@ type RoutingHandler struct {
 	domains              []string
 	localHostID          string
 	ownership            OwnershipResolver
+	hosts                hostDirectory
+	revocations          interface{ Allows(string, int64) bool }
 	peers                PeerTransport
 	local                http.Handler
 	log                  zerolog.Logger
@@ -68,8 +70,14 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	started := time.Now()
-	route, err := h.ownership.ResolveSandbox(r.Context(), id)
-	if recorder, ok := h.recorder.(telemetry.OwnershipLookupRecorder); ok {
+	route, hinted := SandboxRoute{}, false
+	if port == boxdPort {
+		route, hinted = h.hintedRoute(r, id)
+	}
+	if !hinted {
+		route, err = h.ownership.ResolveSandbox(r.Context(), id)
+	}
+	if recorder, ok := h.recorder.(telemetry.OwnershipLookupRecorder); ok && !hinted {
 		result := "success"
 		switch {
 		case errors.Is(err, context.DeadlineExceeded):
@@ -94,7 +102,11 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	route.HostID = strings.TrimSpace(route.HostID)
 	if h.localHostID != "" && route.HostID == h.localHostID {
-		h.record(r.Context(), "local", route.HostID)
+		outcome := "local"
+		if hinted {
+			outcome = "hint_local"
+		}
+		h.record(r.Context(), outcome, route.HostID)
 		h.log.Debug().Str("route", "local").Str("route_outcome", "local").Str("host_id", route.HostID).Msg("sandbox routed locally")
 		h.local.ServeHTTP(w, r)
 		return
@@ -113,6 +125,20 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	stream, err := h.peers.OpenStream(r.Context(), route.HostID, PeerEndpoint{Address: route.ProxyAddr, Generation: route.Generation})
+	if err != nil && hinted {
+		hinted = false
+		fresh, resolveErr := h.ownership.ResolveSandbox(r.Context(), id)
+		if resolveErr == nil {
+			if fresh.HostID == h.localHostID {
+				h.local.ServeHTTP(w, r)
+				return
+			}
+			if fresh, resolveErr = NormalizeSandboxRoute(fresh); resolveErr == nil {
+				route = fresh
+				stream, err = h.peers.OpenStream(r.Context(), route.HostID, PeerEndpoint{Address: route.ProxyAddr, Generation: route.Generation})
+			}
+		}
+	}
 	if err != nil {
 		h.record(r.Context(), "peer_error", route.HostID)
 		h.log.Warn().Str("route_outcome", "peer_forward_error").Err(err).Msg("peer forwarding failed")
@@ -126,7 +152,11 @@ func (h *RoutingHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn().Str("route_outcome", "peer_stream_error").Err(err).Msg("peer stream failed")
 		return
 	}
-	h.record(r.Context(), "remote", route.HostID)
+	outcome := "remote"
+	if hinted {
+		outcome = "hint_remote"
+	}
+	h.record(r.Context(), outcome, route.HostID)
 }
 
 // Serialize the fallback response with the response pump. A partial response
