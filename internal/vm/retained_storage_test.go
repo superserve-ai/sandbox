@@ -231,6 +231,7 @@ func TestRetainedBaselineProvenance(t *testing.T) {
 		t.Fatal("replacement allocation reused the prior retained generation")
 	}
 	t.Run("private-owner-changes", testRetainedBaselineGenerationIgnoresPrivateOwnerChanges)
+	t.Run("dependency-persistence-batches-and-fences", testRetainedDependencyPersistenceBatchesAndFences)
 }
 
 func testRetainedBaselineGenerationIgnoresPrivateOwnerChanges(t *testing.T) {
@@ -1028,6 +1029,84 @@ func TestRetainedDependencyUpdatePreservesCurrentFields(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testRetainedDependencyPersistenceBatchesAndFences(t *testing.T) {
+	store, err := OpenStateStore(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	mgr := &Manager{state: store, vms: map[string]*VMInstance{}}
+
+	updates := make([]retainedDependencyUpdate, 0, retainedDependencyBatchSize+1)
+	for i := 0; i < retainedDependencyBatchSize+1; i++ {
+		id := uuid.NewString()
+		original := VMRecord{ID: id, Status: StatusRunning, DiskPath: "/example/overlay.ext4"}
+		if err := store.Put(original); err != nil {
+			t.Fatal(err)
+		}
+		resolved := original
+		resolved.RootfsPath = filepath.Join("/example/templates", id, "rootfs.ext4")
+		updates = append(updates, retainedDependencyUpdate{original: original, resolved: resolved})
+	}
+	if err := mgr.persistRetainedDependencies(t.Context(), updates); err != nil {
+		t.Fatalf("batched dependency persistence: %v", err)
+	}
+	for _, update := range updates {
+		rec, err := store.Get(update.original.ID)
+		if err != nil || rec == nil || rec.RootfsPath != update.resolved.RootfsPath {
+			t.Fatalf("dependency %s not persisted: rec=%+v err=%v", update.original.ID, rec, err)
+		}
+	}
+
+	t.Run("cancelled before next transaction", func(t *testing.T) {
+		id := uuid.NewString()
+		original := VMRecord{ID: id, Status: StatusRunning}
+		if err := store.Put(original); err != nil {
+			t.Fatal(err)
+		}
+		resolved := original
+		resolved.RootfsPath = "/example/templates/cancelled/rootfs.ext4"
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		if err := mgr.persistRetainedDependencies(ctx, []retainedDependencyUpdate{{original: original, resolved: resolved}}); err == nil {
+			t.Fatal("cancelled dependency persistence succeeded")
+		}
+		rec, err := store.Get(id)
+		if err != nil || rec == nil || rec.RootfsPath != "" {
+			t.Fatalf("cancelled persistence changed record: rec=%+v err=%v", rec, err)
+		}
+	})
+
+	t.Run("stale generation rejects whole batch", func(t *testing.T) {
+		first := VMRecord{ID: uuid.NewString(), Status: StatusRunning}
+		second := VMRecord{ID: uuid.NewString(), Status: StatusRunning}
+		for _, rec := range []VMRecord{first, second} {
+			if err := store.Put(rec); err != nil {
+				t.Fatal(err)
+			}
+		}
+		newer := second
+		newer.Status = StatusPaused
+		if err := store.Put(newer); err != nil {
+			t.Fatal(err)
+		}
+		firstResolved, secondResolved := first, second
+		firstResolved.RootfsPath = "/example/templates/first/rootfs.ext4"
+		secondResolved.RootfsPath = "/example/templates/second/rootfs.ext4"
+		err := mgr.persistRetainedDependencies(t.Context(), []retainedDependencyUpdate{
+			{original: first, resolved: firstResolved},
+			{original: second, resolved: secondResolved},
+		})
+		if err == nil {
+			t.Fatal("stale generation accepted")
+		}
+		rec, getErr := store.Get(first.ID)
+		if getErr != nil || rec == nil || rec.RootfsPath != "" {
+			t.Fatalf("failed batch partially persisted: rec=%+v err=%v", rec, getErr)
+		}
+	})
 }
 
 func TestRetainedRevivedFullCopySurvivesPauseAndRestart(t *testing.T) {

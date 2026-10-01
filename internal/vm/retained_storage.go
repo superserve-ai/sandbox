@@ -343,56 +343,90 @@ func sameRetainedGeneration(a, b VMRecord) bool {
 // unrelated lifecycle/policy state must survive this background write.
 func (s *StateStore) updateRetainedDependencies(original, resolved VMRecord) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		records := tx.Bucket(bucketName)
-		key := []byte(original.ID)
-		raw := records.Get(key)
-		target := records
-		if raw == nil {
-			target = tx.Bucket(retainedRecordBucketName)
-			raw = target.Get(key)
-		}
-		if raw == nil {
-			return fmt.Errorf("retained owner was removed")
-		}
-		var current VMRecord
-		if err := json.Unmarshal(raw, &current); err != nil {
-			return err
-		}
-		if !sameRetainedGeneration(original, current) {
-			return fmt.Errorf("retained generation changed before dependency update")
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &fields); err != nil {
-			return err
-		}
-		for key, value := range map[string]string{
-			"base_mem_path": resolved.BaseMemPath,
-			"rootfs_path":   resolved.RootfsPath,
-			"delta_dir":     resolved.DeltaDir,
-		} {
-			encoded, err := json.Marshal(value)
-			if err != nil {
+		return updateRetainedDependenciesTx(tx, original, resolved)
+	})
+}
+
+// retainedDependencyUpdate is a metadata-only repair captured by one
+// inventory pass. It is generation-fenced when persisted so replacement or
+// deletion cannot receive anchors from an older sample.
+type retainedDependencyUpdate struct {
+	original VMRecord
+	resolved VMRecord
+}
+
+// updateRetainedDependenciesBatch applies a bounded set of repairs in one
+// Bolt transaction. Callers split larger sets into bounded batches and check
+// cancellation between records and transactions; a failed batch leaves that
+// batch untouched while earlier committed batches remain retryable.
+func (s *StateStore) updateRetainedDependenciesBatch(ctx context.Context, updates []retainedDependencyUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		for _, update := range updates {
+			if err := ctx.Err(); err != nil {
 				return err
 			}
-			fields[key] = encoded
+			if err := updateRetainedDependenciesTx(tx, update.original, update.resolved); err != nil {
+				return err
+			}
 		}
-		updated, err := json.Marshal(fields)
+		return nil
+	})
+}
+
+func updateRetainedDependenciesTx(tx *bolt.Tx, original, resolved VMRecord) error {
+	records := tx.Bucket(bucketName)
+	key := []byte(original.ID)
+	raw := records.Get(key)
+	target := records
+	if raw == nil {
+		target = tx.Bucket(retainedRecordBucketName)
+		raw = target.Get(key)
+	}
+	if raw == nil {
+		return fmt.Errorf("retained owner was removed")
+	}
+	var current VMRecord
+	if err := json.Unmarshal(raw, &current); err != nil {
+		return err
+	}
+	if !sameRetainedGeneration(original, current) {
+		return fmt.Errorf("retained generation changed before dependency update")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	for field, value := range map[string]string{
+		"base_mem_path": resolved.BaseMemPath,
+		"rootfs_path":   resolved.RootfsPath,
+		"delta_dir":     resolved.DeltaDir,
+	} {
+		encoded, err := json.Marshal(value)
 		if err != nil {
 			return err
 		}
-		return target.Put(key, updated)
-	})
+		fields[field] = encoded
+	}
+	updated, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	return target.Put(key, updated)
 }
 
 func (m *Manager) rememberRetainedDependencies(original, resolved VMRecord) error {
 	if original.BaseMemPath == resolved.BaseMemPath && original.RootfsPath == resolved.RootfsPath && original.DeltaDir == resolved.DeltaDir {
 		return nil
 	}
-	if m.state == nil {
-		return nil
-	}
-	// Serialize with pause/resume even for untracked records. This metadata-only
-	// update does not change the sampled artifacts or advance the inventory epoch.
+	// Preserve the single-owner helper's lifecycle exclusion for callers outside
+	// the sampler. The inventory path below uses bounded batches and deliberately
+	// does not acquire one vm-op lock per owner.
 	ch := m.vmOpCh(original.ID)
 	select {
 	case ch <- struct{}{}:
@@ -400,23 +434,79 @@ func (m *Manager) rememberRetainedDependencies(original, resolved VMRecord) erro
 	default:
 		return fmt.Errorf("retained owner lifecycle operation in progress")
 	}
-	m.mu.RLock()
-	inst := m.vms[original.ID]
-	m.mu.RUnlock()
-	if inst != nil {
-		inst.mu.Lock()
-		defer inst.mu.Unlock()
-		if !sameRetainedGeneration(original, toRecordLocked(inst)) {
-			return fmt.Errorf("retained instance changed before dependency update")
+	return m.persistRetainedDependencies(context.Background(), []retainedDependencyUpdate{{original: original, resolved: resolved}})
+}
+
+const retainedDependencyBatchSize = 64
+
+// persistRetainedDependencies commits dependency anchors in bounded batches.
+// It deliberately avoids vmOpCh: acquiring one lifecycle lock per owner can
+// turn a background inventory into thousands of contended operations. Tracked
+// instances use their short-lived state mutex while the corresponding batch is
+// committed, and durable generation checks remain authoritative for untracked
+// or concurrently replaced records.
+func (m *Manager) persistRetainedDependencies(ctx context.Context, updates []retainedDependencyUpdate) error {
+	if m.state == nil || len(updates) == 0 {
+		return nil
+	}
+	for start := 0; start < len(updates); start += retainedDependencyBatchSize {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-	}
-	if err := m.state.updateRetainedDependencies(original, resolved); err != nil {
-		return err
-	}
-	if inst != nil {
-		inst.BaseMemPath = resolved.BaseMemPath
-		inst.Config.RootfsPath = resolved.RootfsPath
-		inst.Config.DeltaDir = resolved.DeltaDir
+		end := min(start+retainedDependencyBatchSize, len(updates))
+		batch := updates[start:end]
+		locked := make([]*VMInstance, 0, len(batch))
+		lockedByID := make(map[string]*VMInstance, len(batch))
+		// Lock only tracked instances, in capture order. Lifecycle writers take
+		// the same instance mutex before persisting their record, so they cannot
+		// overwrite a successful batch with stale dependency fields.
+		for _, update := range batch {
+			if err := ctx.Err(); err != nil {
+				for _, held := range locked {
+					held.mu.Unlock()
+				}
+				return err
+			}
+			m.mu.RLock()
+			inst := m.vms[update.original.ID]
+			m.mu.RUnlock()
+			if inst == nil {
+				continue
+			}
+			if _, ok := lockedByID[update.original.ID]; ok {
+				continue
+			}
+			if !inst.mu.TryLock() {
+				for _, held := range locked {
+					held.mu.Unlock()
+				}
+				return fmt.Errorf("retained instance lifecycle operation in progress")
+			}
+			lockedByID[update.original.ID] = inst
+			locked = append(locked, inst)
+		}
+		err := m.state.updateRetainedDependenciesBatch(ctx, batch)
+		if err == nil {
+			for _, update := range batch {
+				inst := lockedByID[update.original.ID]
+				if inst == nil {
+					continue
+				}
+				if !sameRetainedGeneration(update.original, toRecordLocked(inst)) {
+					err = fmt.Errorf("retained instance changed before dependency update")
+					break
+				}
+				inst.BaseMemPath = update.resolved.BaseMemPath
+				inst.Config.RootfsPath = update.resolved.RootfsPath
+				inst.Config.DeltaDir = update.resolved.DeltaDir
+			}
+		}
+		for _, held := range locked {
+			held.mu.Unlock()
+		}
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -436,7 +526,7 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 	}
 	inv := &retainedstorage.Inventory{Version: retainedstorage.Version, Owners: make([]retainedstorage.Owner, 0)}
 	observations := make([]retainedFileObservation, 0)
-	dependencyUpdates := make([]struct{ original, resolved VMRecord }, 0)
+	dependencyUpdates := make([]retainedDependencyUpdate, 0)
 	remaining := retainedstorage.MaxExtents
 	add := func(kind, id string, paths []string, baselinePath string) error {
 		if len(inv.Owners) >= retainedstorage.MaxOwners {
@@ -520,7 +610,7 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 			return nil, err
 		}
 		if rec.BaseMemPath != resolved.BaseMemPath || rec.RootfsPath != resolved.RootfsPath || rec.DeltaDir != resolved.DeltaDir {
-			dependencyUpdates = append(dependencyUpdates, struct{ original, resolved VMRecord }{rec, resolved})
+			dependencyUpdates = append(dependencyUpdates, retainedDependencyUpdate{original: rec, resolved: resolved})
 		}
 		baselinePath := resolved.RootfsPath
 		if baselinePath == "" {
@@ -602,11 +692,11 @@ func (m *Manager) retainedStorageInventoryWithPersistence(ctx context.Context, m
 	if !reflect.DeepEqual(records, after) || m.storageMutations.Load() != 0 || m.storageEpoch.Load() != epoch {
 		return nil, fmt.Errorf("retained generation changed during inventory")
 	}
-	for _, update := range dependencyUpdates {
+	if len(dependencyUpdates) > 0 {
 		if !persist {
 			return nil, fmt.Errorf("retained dependency metadata still requires persistence")
 		}
-		if err := m.rememberRetainedDependencies(update.original, update.resolved); err != nil {
+		if err := m.persistRetainedDependencies(ctx, dependencyUpdates); err != nil {
 			return nil, err
 		}
 	}
