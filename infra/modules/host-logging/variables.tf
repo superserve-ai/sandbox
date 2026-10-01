@@ -70,7 +70,7 @@ variable "journal_keep_free_bytes" {
 }
 
 variable "agent_buffer_bytes" {
-  description = "Separate Ops Agent disk-buffer budget; it is accounted for independently of journald."
+  description = "Separate budget for the Ops Agent built-in buffer plus self-log and retained-syslog stores; this is an accounting/compliance threshold, not an undocumented agent setting."
   type        = number
   default     = 1073741824
 
@@ -103,7 +103,12 @@ variable "agent_cpu_limit_millicores" {
 }
 
 variable "ops_agent_package_version" {
-  description = "Pinned Ops Agent package version selected after staging verification."
+  description = "Pinned Ops Agent package version selected after staging verification; must include the supported built-in buffer cap introduced in 2.28."
   type        = string
   default     = "2.52.0"
+
+  validation {
+    condition     = can(regex("^2\\.(2[89]|[3-9][0-9]|[1-9][0-9]{2,})", var.ops_agent_package_version))
+    error_message = "ops_agent_package_version must be Ops Agent 2.28.0 or newer so the documented built-in disk buffer cap is present."
+  }
 }

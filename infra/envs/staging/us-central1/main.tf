@@ -724,16 +724,19 @@ module "host_logging" {
     sandbox_host = {
       instance_name         = module.sandbox_host.instance_name
       instance_id           = module.sandbox_host.instance_id
-      host_id               = module.sandbox_host.instance_name
-      incarnation           = "${module.sandbox_host.instance_name}-${var.resource_suffix}"
+      # This legacy host's provider identity is not available in Terraform;
+      # reconciliation defers to its installed identity file rather than
+      # fabricating one from the VM name.
+      host_id               = "deferred-to-installed-identity"
+      incarnation           = "deferred-to-installed-identity"
       service_account_email = module.iam.service_account_emails["superserve_api"]
       proxy_units           = ["proxy.service", "proxy-generation.service"]
     }
     sandbox_host_b = {
       instance_name         = module.sandbox_host_b.instance_name
       instance_id           = module.sandbox_host_b.instance_id
-      host_id               = module.sandbox_host_b.instance_name
-      incarnation           = "${module.sandbox_host_b.instance_name}-${var.resource_suffix}"
+      host_id               = var.build_host_id
+      incarnation           = "installed-host-identity"
       service_account_email = google_service_account.vmd_runtime.email
       proxy_units           = ["proxy.service", "proxy-generation.service"]
     }

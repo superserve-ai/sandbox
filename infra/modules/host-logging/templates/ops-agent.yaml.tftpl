@@ -1,24 +1,45 @@
-# Managed by Terraform/OS Config. The supported Ops Agent systemd_journald
-# receiver is the only log source; the standalone OTel collector remains the
-# application-metrics path. No file-based syslog receiver is configured,
-# preventing duplicate ingestion of the same journal records.
-# The processor allowlist includes proxy.service and generation-specific
-# proxy-*.service units; kernel/systemd transport fields are retained for
-# resource-exhaustion and lifecycle diagnostics.
+# Managed by Terraform/OS Config. The systemd_journald receiver is the only
+# host-log source; the standalone OTel collector remains the application
+# metrics path. The default file-based syslog pipeline is explicitly empty so
+# each journal record has one steady-state collection path.
+# The allowlist covers proxy.service and generation-specific proxy units.
 %{ for unit in host_units ~}
 # enrolled unit: ${unit}
 %{ endfor ~}
-# Tested package release selected by the rollout: ${ops_agent_package_version}.
+# Ops Agent ${ops_agent_package_version} is selected by the OS policy. This
+# release uses its documented built-in disk buffer cap (introduced in 2.28);
+# no unsupported environment variable or generated Fluent Bit setting is used.
 logging:
   receivers:
     vmd_proxy_journald:
       type: systemd_journald
   processors:
+    # This is a provenance filter, not an application-data filter. The
+    # _SYSTEMD_UNIT and _TRANSPORT fields are journal-managed and cannot be
+    # selected by a client-controlled identifier field.
+    exclude_non_platform_sources:
+      type: exclude_logs
+      match_any:
+        - 'NOT (jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy(-[^.]*)?|systemd-(journald|logind|udevd|networkd|resolved)|google-osconfig-agent|google-guest-agent|unbound|secretsproxy)\.service$" OR jsonPayload._TRANSPORT = "kernel")'
+    capture_journal_provenance:
+      type: modify_fields
+      fields:
+        labels.journal_unit:
+          copy_from: jsonPayload._SYSTEMD_UNIT
+        labels.journal_transport:
+          copy_from: jsonPayload._TRANSPORT
     parse_application_json:
       type: parse_json
-      field: jsonPayload.MESSAGE
+      # parse_json consumes the receiver's MESSAGE field; field is not a
+      # supported parse_json option. The application timestamp uses strptime
+      # syntax rather than a language-specific timestamp name.
       time_key: timestamp
-      time_format: RFC3339Nano
+      time_format: "%Y-%m-%dT%H:%M:%S.%L%Z"
+    map_application_severity:
+      type: modify_fields
+      fields:
+        severity:
+          move_from: jsonPayload.severity
     add_platform_context:
       type: modify_fields
       fields:
@@ -30,32 +51,41 @@ logging:
           static_value: ${assignment_name}
         labels.host_logging_revision:
           static_value: ${assignment_revision}
+        labels.host_id:
+          static_value: __HOST_ID__
+        labels.incarnation:
+          static_value: __INCARNATION_ID__
         labels.instance_id:
           copy_from: resource.labels.instance_id
-        labels.host_id:
-          copy_from: jsonPayload.HOST_ID
         labels.instance_name:
           copy_from: resource.labels.instance_name
         labels.unit:
-          copy_from: jsonPayload._SYSTEMD_UNIT
-        labels.proxy_generation:
-          copy_from: jsonPayload.proxy_generation
-        labels.incarnation:
-          copy_from: jsonPayload.incarnation
-    map_application_severity:
-      type: modify_fields
-      fields:
-        severity:
-          move_from: jsonPayload.severity
-    exclude_non_platform_sources:
-      type: exclude_logs
-      match_any:
-        - 'NOT (jsonPayload._SYSTEMD_UNIT =~ "^(superserve-vmd|proxy|proxy-generation|google-osconfig-agent|google-guest-agent|unbound|secretsproxy).*\\.service$" OR jsonPayload._TRANSPORT = "kernel" OR jsonPayload.SYSLOG_IDENTIFIER =~ "^(systemd|kernel|superserve-vmd|proxy)")'
+          copy_from: labels.journal_unit
     redact_sensitive_fields:
       type: modify_fields
       fields:
         jsonPayload.authorization:
           omit_if: 'jsonPayload.authorization != NULL'
+        jsonPayload.authorization_header:
+          omit_if: 'jsonPayload.authorization_header != NULL'
+        jsonPayload.cookie:
+          omit_if: 'jsonPayload.cookie != NULL'
+        jsonPayload.headers:
+          omit_if: 'jsonPayload.headers != NULL'
+        jsonPayload.password:
+          omit_if: 'jsonPayload.password != NULL'
+        jsonPayload.secret:
+          omit_if: 'jsonPayload.secret != NULL'
+        jsonPayload.token:
+          omit_if: 'jsonPayload.token != NULL'
+        jsonPayload.HOST_ID:
+          omit_if: 'jsonPayload.HOST_ID != NULL'
+        jsonPayload.host_id:
+          omit_if: 'jsonPayload.host_id != NULL'
+        jsonPayload.incarnation:
+          omit_if: 'jsonPayload.incarnation != NULL'
+        jsonPayload.request:
+          omit_if: 'jsonPayload.request != NULL'
         jsonPayload.request_body:
           omit_if: 'jsonPayload.request_body != NULL'
         jsonPayload.file_contents:
@@ -77,8 +107,11 @@ logging:
         receivers:
           - vmd_proxy_journald
         processors:
-          - parse_application_json
+          # Reject unrelated journal traffic before parsing JSON. Severity
+          # filtering still happens after parsing for allowlisted sources.
           - exclude_non_platform_sources
+          - capture_journal_provenance
+          - parse_application_json
           - map_application_severity
           - add_platform_context
           - redact_sensitive_fields
@@ -95,12 +128,12 @@ metrics:
           - hostmetrics
         processors: []
 
-# ${length(enrolled_hosts)} serving host descriptor(s) are authoritative for
-# identity mapping. Application JSON cannot overwrite these platform labels;
-# request/sandbox correlation fields remain subordinate searchable fields.
+# ${length(enrolled_hosts)} serving host descriptor(s) are Terraform inputs for
+# rollout and IAM. The installed identity file is authoritative at runtime;
+# application JSON cannot overwrite platform labels.
 %{ for name, host in enrolled_hosts ~}
 # ${name}: host_id=${host.host_id} incarnation=${host.incarnation} instance_id=${host.instance_id}
 %{ endfor ~}
 # The built-in checkpoint/retry path and disk buffer are used; no custom spool
-# or per-entry namespace/mount is introduced. Buffer sizing is verified during
-# staging rollout and is independent of the 4 GiB journal budget.
+# or per-entry namespace/mount is introduced. Reconciliation accounts for the
+# buffer, self-log, and retained syslog stores independently of journald.

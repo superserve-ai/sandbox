@@ -4,53 +4,161 @@ set -euo pipefail
 config_path='${config_path}'
 candidate_config_path='${candidate_config_path}'
 journald_dropin='${journald_dropin}'
+resource_dir='/etc/systemd/system'
+logging_resource_dropin="$resource_dir/google-cloud-ops-agent-fluent-bit.service.d/30-superserve-resources.conf"
+metrics_resource_dropin="$resource_dir/google-cloud-ops-agent-opentelemetry-collector.service.d/30-superserve-resources.conf"
+identity_file='/etc/sandbox/host-identity.json'
+buffer_dir='/var/lib/google-cloud-ops-agent/fluent-bit/buffers'
+self_log_dir='/var/log/google-cloud-ops-agent'
+dropin_candidate=''
+logging_resource_candidate=''
+metrics_resource_candidate=''
+old_config=''
+old_dropin=''
+old_logging_resource=''
+old_metrics_resource=''
 
-# Validation is intentionally performed before activation. A failed candidate
-# leaves the last working file, journal, and Ops Agent checkpoint/buffer intact.
-if ! command -v google-cloud-ops-agent >/dev/null 2>&1; then
-  exit 100
-fi
+# OS Config runs this script only after validate returned 101.  The candidate
+# is rendered with the provider-bound identity on the host, then diagnosed
+# before any working file is touched.
+test -s "$candidate_config_path"
+test -s "$identity_file"
+host_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["host_id"])' "$identity_file")
+incarnation_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["incarnation_id"])' "$identity_file")
+test -n "$host_id"
+test -n "$incarnation_id"
+
 installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
 case "$installed_version" in
   ${ops_agent_package_version}*) ;;
-  *) exit 1 ;;
+  *)
+    # The OS Config apt resource guarantees installation but has no version
+    # selector. Pin the reviewed package release here, still inside the
+    # Terraform-owned OS Config enforcement path.
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "google-cloud-ops-agent=${ops_agent_package_version}"; then
+      exit 1
+    fi
+    ;;
 esac
-if ! test -s "$candidate_config_path"; then
-  exit 1
-fi
-if ! google-cloud-ops-agent diagnose --config="$candidate_config_path" >/dev/null 2>&1; then
+command -v google-cloud-ops-agent >/dev/null 2>&1
+
+config_dir=$(dirname "$config_path")
+install -d -m 0755 "$config_dir" "$(dirname "$journald_dropin")" \
+  "$(dirname "$logging_resource_dropin")" "$(dirname "$metrics_resource_dropin")"
+rendered_config=$(mktemp "$config_dir/.config.yaml.XXXXXX")
+trap 'rm -f "$rendered_config" "$dropin_candidate" "$logging_resource_candidate" "$metrics_resource_candidate" "$old_config" "$old_dropin" "$old_logging_resource" "$old_metrics_resource"' EXIT
+sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
+  "$candidate_config_path" >"$rendered_config"
+chmod 0644 "$rendered_config"
+if ! google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1; then
   exit 1
 fi
 
-install -d -m 0755 "$(dirname "$config_path")" "$(dirname "$journald_dropin")"
-if ! cmp -s "$candidate_config_path" "$config_path" 2>/dev/null; then
-  install -m 0644 "$candidate_config_path" "$config_path"
-  systemctl try-reload-or-restart google-cloud-ops-agent.service
-fi
-
-dropin_candidate=$(mktemp)
-trap 'rm -f "$dropin_candidate"' EXIT
+dropin_candidate=$(mktemp "$(dirname "$journald_dropin")/.journald.XXXXXX")
 cat >"$dropin_candidate" <<'JOURNALD'
 [Journal]
 Storage=persistent
 SystemMaxUse=${journal_max_use_bytes}B
 SystemKeepFree=${journal_keep_free_bytes}B
 JOURNALD
-if ! cmp -s "$dropin_candidate" "$journald_dropin" 2>/dev/null; then
-  install -m 0644 "$dropin_candidate" "$journald_dropin"
-  systemctl try-reload-or-restart systemd-journald.service
-fi
 
-# Resource limits bound the agent's separate buffer/self-log footprint. They do
-# not change VMD units or erase delivery state, and are applied only through
-# this managed policy.
-mkdir -p /etc/systemd/system/google-cloud-ops-agent.service.d
-cat >/etc/systemd/system/google-cloud-ops-agent.service.d/30-superserve-resources.conf <<'RESOURCES'
+# The Ops Agent's supported buffer cap is built into the selected release. The
+# systemd drop-in bounds the actual logging and metrics subagents together.
+# validate.sh accounts for the built-in buffer, self-log, and retained syslog
+# stores against this budget instead of relying on an undocumented setting.
+logging_resource_candidate=$(mktemp "$(dirname "$logging_resource_dropin")/.resources.XXXXXX")
+cat >"$logging_resource_candidate" <<'RESOURCES'
 [Service]
 CPUQuota=${agent_cpu_limit_millicores / 10}%
 MemoryMax=${agent_memory_limit_mb}M
-Environment=GOOGLE_CLOUD_OPS_AGENT_BUFFER_MAX_BYTES=${agent_buffer_bytes}
 RESOURCES
-systemctl daemon-reload
-systemctl enable --now google-cloud-ops-agent.service
-exit 100
+metrics_resource_candidate=$(mktemp "$(dirname "$metrics_resource_dropin")/.resources.XXXXXX")
+cat >"$metrics_resource_candidate" <<'RESOURCES'
+[Service]
+# Keep the application-metrics sidecar below the logging subagent under host
+# pressure; its existing queue/memory-limiter can shed metrics first.
+CPUQuota=${agent_cpu_limit_millicores / 20}%
+MemoryMax=${agent_memory_limit_mb / 2}M
+RESOURCES
+
+old_config=$(mktemp)
+old_dropin=$(mktemp)
+old_logging_resource=$(mktemp)
+old_metrics_resource=$(mktemp)
+had_config=0
+had_dropin=0
+had_logging_resource=0
+had_metrics_resource=0
+if [ -f "$config_path" ]; then cp -p "$config_path" "$old_config"; had_config=1; fi
+if [ -f "$journald_dropin" ]; then cp -p "$journald_dropin" "$old_dropin"; had_dropin=1; fi
+if [ -f "$logging_resource_dropin" ]; then cp -p "$logging_resource_dropin" "$old_logging_resource"; had_logging_resource=1; fi
+if [ -f "$metrics_resource_dropin" ]; then cp -p "$metrics_resource_dropin" "$old_metrics_resource"; had_metrics_resource=1; fi
+agent_was_enabled=0
+agent_was_active=0
+logging_was_active=0
+metrics_was_active=0
+journald_was_active=0
+systemctl is-enabled --quiet google-cloud-ops-agent.service && agent_was_enabled=1 || true
+systemctl is-active --quiet google-cloud-ops-agent.service && agent_was_active=1 || true
+systemctl is-active --quiet google-cloud-ops-agent-fluent-bit.service && logging_was_active=1 || true
+systemctl is-active --quiet google-cloud-ops-agent-opentelemetry-collector.service && metrics_was_active=1 || true
+systemctl is-active --quiet systemd-journald.service && journald_was_active=1 || true
+
+rollback() {
+  if [ "$had_config" -eq 1 ]; then install -m 0644 "$old_config" "$config_path"; else rm -f "$config_path"; fi
+  if [ "$had_dropin" -eq 1 ]; then install -m 0644 "$old_dropin" "$journald_dropin"; else rm -f "$journald_dropin"; fi
+  if [ "$had_logging_resource" -eq 1 ]; then install -m 0644 "$old_logging_resource" "$logging_resource_dropin"; else rm -f "$logging_resource_dropin"; fi
+  if [ "$had_metrics_resource" -eq 1 ]; then install -m 0644 "$old_metrics_resource" "$metrics_resource_dropin"; else rm -f "$metrics_resource_dropin"; fi
+  systemctl daemon-reload || true
+  if [ "$logging_was_active" -eq 1 ]; then systemctl restart google-cloud-ops-agent-fluent-bit.service || true; else systemctl stop google-cloud-ops-agent-fluent-bit.service || true; fi
+  if [ "$metrics_was_active" -eq 1 ]; then systemctl restart google-cloud-ops-agent-opentelemetry-collector.service || true; else systemctl stop google-cloud-ops-agent-opentelemetry-collector.service || true; fi
+  if [ "$journald_was_active" -eq 1 ]; then systemctl try-reload-or-restart systemd-journald.service || true; else systemctl stop systemd-journald.service || true; fi
+  if [ "$agent_was_active" -eq 1 ]; then systemctl start google-cloud-ops-agent.service || true; else systemctl stop google-cloud-ops-agent.service || true; fi
+  if [ "$agent_was_enabled" -eq 1 ]; then systemctl enable google-cloud-ops-agent.service || true; else systemctl disable google-cloud-ops-agent.service || true; fi
+}
+
+# All renames stay on their destination filesystems. A failed restart restores
+# the previous config and drop-ins; Ops Agent checkpoint/buffer directories are
+# never copied, deleted, or reset.
+if ! cmp -s "$rendered_config" "$config_path" 2>/dev/null; then
+  staged_config=$(mktemp "$config_dir/.active-config.XXXXXX")
+  install -m 0644 "$rendered_config" "$staged_config"
+  mv -f "$staged_config" "$config_path"
+  config_changed=1
+else
+  config_changed=0
+fi
+if ! cmp -s "$dropin_candidate" "$journald_dropin" 2>/dev/null; then
+  staged_dropin=$(mktemp "$(dirname "$journald_dropin")/.active-journald.XXXXXX")
+  install -m 0644 "$dropin_candidate" "$staged_dropin"
+  mv -f "$staged_dropin" "$journald_dropin"
+  journal_changed=1
+else
+  journal_changed=0
+fi
+resource_changed=0
+for pair in "$logging_resource_candidate:$logging_resource_dropin" "$metrics_resource_candidate:$metrics_resource_dropin"; do
+  candidate=$${pair%%:*}
+  destination=$${pair#*:}
+  if ! cmp -s "$candidate" "$destination" 2>/dev/null; then
+    staged_resource=$(mktemp "$(dirname "$destination")/.active-resource.XXXXXX")
+    install -m 0644 "$candidate" "$staged_resource"
+    mv -f "$staged_resource" "$destination"
+    resource_changed=1
+  fi
+done
+
+if ! systemctl daemon-reload; then rollback; exit 1; fi
+if [ "$config_changed" -eq 1 ] || [ "$resource_changed" -eq 1 ]; then
+  if ! systemctl restart google-cloud-ops-agent-fluent-bit.service google-cloud-ops-agent-opentelemetry-collector.service; then rollback; exit 1; fi
+fi
+if [ "$journal_changed" -eq 1 ]; then
+  if ! systemctl try-reload-or-restart systemd-journald.service; then rollback; exit 1; fi
+fi
+if ! systemctl is-enabled --quiet google-cloud-ops-agent.service; then
+  if ! systemctl enable google-cloud-ops-agent.service; then rollback; exit 1; fi
+fi
+if ! systemctl is-active --quiet google-cloud-ops-agent.service; then
+  if ! systemctl start google-cloud-ops-agent.service; then rollback; exit 1; fi
+fi
+exit 0

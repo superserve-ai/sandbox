@@ -11,13 +11,19 @@ The supported `systemd_journald` receiver is paired with a processor allowlist
 records. JSON severity is parsed before DEBUG/TRACE exclusion;
 malformed records remain eligible host diagnostics. The default syslog-file
 pipeline is deliberately absent so each journal record has one steady-state
-collection path. Platform identity comes from Terraform host descriptors and
-installed host identity, while application fields remain subordinate.
+collection path. Platform identity is rendered from the installed provider
+identity at reconciliation time; Terraform descriptors remain rollout/IAM
+inputs, and application fields remain subordinate. Journal unit/transport
+provenance is copied before JSON parsing so application payloads cannot replace
+the source identity used for filtering.
 
 The initial journal budget is 4 GiB with a 10 GiB free-space reserve. The
-Ops Agent's built-in checkpoint/retry and disk buffer are separate and bounded
-by the managed service resource settings; staging must measure their combined
-growth with agent self-logs and retained syslog files before production.
+Ops Agent 2.52.0 uses the documented built-in disk-buffer cap introduced in
+2.28; the managed logging and metrics subagents receive explicit CPU/memory
+limits, with the metrics sidecar receiving the smaller share so its existing
+queue/memory limiter sheds metrics before log export is constrained. Validation
+accounts for buffer, self-log, and retained syslog bytes against a separate
+budget. Staging must measure combined growth before production.
 Candidate configuration is validated before atomic activation. A failed
 reconciliation keeps the last working configuration and delivery state. The
 policy never restarts VMD or mutates identity/admission files.

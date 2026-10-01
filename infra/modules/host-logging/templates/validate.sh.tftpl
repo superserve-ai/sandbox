@@ -2,12 +2,94 @@
 set -euo pipefail
 
 candidate_config_path='${candidate_config_path}'
-test -s "$candidate_config_path"
+config_path='/etc/google-cloud-ops-agent/config.yaml'
+journald_dropin='/etc/systemd/journald.conf.d/30-superserve-host-logging.conf'
+logging_resource_dropin='/etc/systemd/system/google-cloud-ops-agent-fluent-bit.service.d/30-superserve-resources.conf'
+metrics_resource_dropin='/etc/systemd/system/google-cloud-ops-agent-opentelemetry-collector.service.d/30-superserve-resources.conf'
+identity_file='/etc/sandbox/host-identity.json'
+buffer_dir='/var/lib/google-cloud-ops-agent/fluent-bit/buffers'
+self_log_dir='/var/log/google-cloud-ops-agent'
+
+# 100 means fully compliant; 101 asks OS Config to run enforce. Any invalid
+# candidate is an error and must not be treated as repairable drift.
+test -s "$candidate_config_path" || exit 1
+test -s "$identity_file" || exit 101
+host_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["host_id"])' "$identity_file")
+incarnation_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["incarnation_id"])' "$identity_file")
+test -n "$host_id" && test -n "$incarnation_id" || exit 101
+
 installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
 case "$installed_version" in
   ${ops_agent_package_version}*) ;;
-  *) exit 1 ;;
+  *) exit 101 ;;
 esac
-command -v google-cloud-ops-agent >/dev/null
-google-cloud-ops-agent diagnose --config="$candidate_config_path" >/dev/null
+command -v google-cloud-ops-agent >/dev/null 2>&1 || exit 101
+
+rendered_config=$(mktemp)
+trap 'rm -f "$rendered_config"' EXIT
+sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
+  "$candidate_config_path" >"$rendered_config"
+if grep -qE '__HOST_ID__|__INCARNATION_ID__' "$rendered_config"; then
+  exit 101
+fi
+if ! google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1; then
+  # The candidate itself is invalid, so OS Config must surface an error rather
+  # than repeatedly re-running enforce against a broken revision.
+  exit 1
+fi
+
+drift=0
+if ! cmp -s "$rendered_config" "$config_path" 2>/dev/null; then drift=1; fi
+if [ -s "$config_path" ] && ! google-cloud-ops-agent diagnose --config="$config_path" >/dev/null 2>&1; then drift=1; fi
+expected_journald=$(mktemp)
+trap 'rm -f "$rendered_config" "$expected_journald"' EXIT
+cat >"$expected_journald" <<'JOURNALD'
+[Journal]
+Storage=persistent
+SystemMaxUse=${journal_max_use_bytes}B
+SystemKeepFree=${journal_keep_free_bytes}B
+JOURNALD
+if ! cmp -s "$expected_journald" "$journald_dropin" 2>/dev/null; then drift=1; fi
+if ! systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -Fq "SystemMaxUse=${journal_max_use_bytes}B"; then drift=1; fi
+if ! systemd-analyze cat-config systemd/journald.conf 2>/dev/null | grep -Fq "SystemKeepFree=${journal_keep_free_bytes}B"; then drift=1; fi
+
+expected_resource=$(mktemp)
+trap 'rm -f "$rendered_config" "$expected_journald" "$expected_resource"' EXIT
+expected_metrics_resource=$(mktemp)
+trap 'rm -f "$rendered_config" "$expected_journald" "$expected_resource" "$expected_metrics_resource"' EXIT
+cat >"$expected_resource" <<'RESOURCES'
+[Service]
+CPUQuota=${agent_cpu_limit_millicores / 10}%
+MemoryMax=${agent_memory_limit_mb}M
+RESOURCES
+cat >"$expected_metrics_resource" <<'RESOURCES'
+[Service]
+CPUQuota=${agent_cpu_limit_millicores / 20}%
+MemoryMax=${agent_memory_limit_mb / 2}M
+RESOURCES
+if ! cmp -s "$expected_resource" "$logging_resource_dropin" 2>/dev/null; then drift=1; fi
+if ! cmp -s "$expected_metrics_resource" "$metrics_resource_dropin" 2>/dev/null; then drift=1; fi
+
+systemctl is-enabled --quiet google-cloud-ops-agent.service || drift=1
+systemctl is-active --quiet google-cloud-ops-agent.service || drift=1
+systemctl is-active --quiet google-cloud-ops-agent-fluent-bit.service || drift=1
+systemctl is-active --quiet google-cloud-ops-agent-opentelemetry-collector.service || drift=1
+
+# The selected Ops Agent release owns the buffer cap. We do not pretend an
+# environment variable changes it; instead, policy fails closed when the
+# effective buffer, self-log, and retained syslog stores exceed the separately
+# budgeted threshold. This preserves metrics-first pressure handling and leaves
+# checkpoint files untouched for the next reconciliation.
+storage_bytes=0
+for path in "$buffer_dir" "$self_log_dir" /var/log/syslog /var/log/syslog.*; do
+  if [ -e "$path" ]; then
+    size=$(du -sb "$path" 2>/dev/null | awk 'NR == 1 {print $1}')
+    storage_bytes=$((storage_bytes + $${size:-0}))
+  fi
+done
+if [ "$storage_bytes" -gt ${agent_buffer_bytes} ]; then drift=1; fi
+
+if [ "$drift" -ne 0 ]; then
+  exit 101
+fi
 exit 100

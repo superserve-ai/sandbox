@@ -45,11 +45,12 @@ variable "host_maintenance_event_alerts" {
 }
 
 variable "host_logging_alerts" {
-  description = "Independent export failure, delivery lag, and serving-host heartbeat alerts."
+  description = "Ops Agent failure/lag alerts plus an independent OTel collector heartbeat for every expected serving host."
   type = object({
     display_prefix        = string
     lag_threshold_seconds = optional(number, 300)
     heartbeat_duration    = optional(string, "600s")
+    heartbeat_metric_type = optional(string, "workload.googleapis.com/otelcol_process_uptime")
     expected_hosts = map(object({
       instance_name = string
       instance_id   = string

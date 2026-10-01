@@ -25,7 +25,7 @@ resource "google_monitoring_alert_policy" "host_logging_export_failures" {
   conditions {
     display_name = "Ops Agent export errors on ${each.value.instance_name}"
     condition_matched_log {
-      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"google-cloud-ops-agent\") AND severity>=ERROR"
+      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"google-cloud-ops-agent\") AND (severity>=ERROR OR textPayload =~ \"(?i)(failed to flush chunk|exporting failed|permission denied)\" OR jsonPayload.MESSAGE =~ \"(?i)(failed to flush chunk|exporting failed|permission denied)\")"
     }
   }
 
@@ -68,7 +68,10 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
   conditions {
     display_name = "Ops Agent delivery lag on ${each.value.instance_name}"
     condition_matched_log {
-      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND jsonPayload.host_logging_lag_seconds>${var.host_logging_alerts.lag_threshold_seconds}"
+      # The logging subagent documents these messages when its persistent
+      # buffer cannot flush. No synthetic lag field is invented; operators
+      # distinguish catch-up from a persistent gap using retained evidence.
+      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"google-cloud-ops-agent\") AND (textPayload =~ \"(?i)(failed to flush chunk|will retry|buffer)\" OR jsonPayload.MESSAGE =~ \"(?i)(failed to flush chunk|will retry|buffer)\")"
     }
   }
 
@@ -92,8 +95,9 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
   })
 }
 
-# Compute Engine uptime is independent of the Ops Agent/export path. A broken
-# exporter therefore cannot make this absence signal appear healthy.
+# The standalone OTel collector's self metric is independent of the Ops
+# Agent/export path. A broken exporter therefore cannot make this absence
+# signal appear healthy.
 resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
   for_each = local.host_logging_alerts_enabled ? var.host_logging_alerts.expected_hosts : {}
 
@@ -113,7 +117,10 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
   conditions {
     display_name = "Serving host heartbeat absent on ${each.value.instance_name}"
     condition_absent {
-      filter   = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND metric.type=\"compute.googleapis.com/instance/uptime\""
+      # GMP may use its prometheus_target monitored resource rather than a
+      # GCE resource for this series, so scope by the stable metric label and
+      # not by a resource type that would make never-seen hosts invisible.
+      filter   = "metric.type=\"${var.host_logging_alerts.heartbeat_metric_type}\" AND metric.labels.collector_host_id=\"${each.value.instance_name}\""
       duration = var.host_logging_alerts.heartbeat_duration
       aggregations {
         alignment_period   = "60s"
@@ -123,7 +130,7 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
   }
 
   documentation {
-    content   = "The independent Compute Engine uptime signal for ${each.value.instance_name} was absent. This is evaluated separately from Ops Agent log delivery, so it can expose a never-seen or stopped host.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_heartbeat", "")}"
+    content   = "The standalone OTel collector heartbeat for ${each.value.instance_name} was absent. This metric is delivered on the existing application-metrics path, separately from Ops Agent log export, so a broken exporter cannot satisfy the expected-host signal.\n\nRunbook: ${lookup(var.runbook_urls, "host_logging_heartbeat", "")}"
     mime_type = "text/markdown"
   }
 

@@ -27,7 +27,6 @@ locals {
     assignment_revision = var.assignment_revision
     host_units        = local.host_units
     enrolled_hosts    = var.enrolled_hosts
-    agent_buffer_bytes = var.agent_buffer_bytes
     ops_agent_package_version = var.ops_agent_package_version
   })
   reconcile_script = templatefile("${path.module}/templates/reconcile.sh.tftpl", {
@@ -45,6 +44,7 @@ locals {
   validate_script = templatefile("${path.module}/templates/validate.sh.tftpl", {
     candidate_config_path     = local.candidate_config_path
     ops_agent_package_version = var.ops_agent_package_version
+    agent_buffer_bytes        = var.agent_buffer_bytes
   })
 }
 
@@ -70,7 +70,10 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
 
     resource_groups {
       inventory_filters {
-        os_short_name = "debian"
+        # All managed serving images are Ubuntu 22.04/24.04.  Keeping the
+        # filter aligned with the image family is required for the assignment
+        # to converge on both existing and replacement hosts.
+        os_short_name = "ubuntu"
       }
 
       resources {

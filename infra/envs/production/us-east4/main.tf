@@ -553,8 +553,8 @@ module "host_logging" {
     sandbox_host_c = {
       instance_name         = module.sandbox_host_c.instance_name
       instance_id           = module.sandbox_host_c.instance_id
-      host_id               = module.sandbox_host_c.instance_name
-      incarnation           = "${module.sandbox_host_c.instance_name}-${var.resource_suffix}"
+      host_id               = var.host_c_host_id
+      incarnation           = "installed-host-identity"
       service_account_email = google_service_account.vmd_runtime.email
       proxy_units           = ["proxy.service", "proxy-generation.service"]
     }
