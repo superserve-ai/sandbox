@@ -136,6 +136,16 @@ func FinalizeTeamBillingPeriodWithCredits(
 	if err != nil {
 		return FinalizeTeamBillingPeriodResult{}, err
 	}
+	if verified, enrolled, invoiceErr := finalizeVerifiedInvoice(ctx, tx, ExportPeriod{TeamID: teamID, Start: periodStart, End: periodEnd}, usage); enrolled || invoiceErr != nil {
+		if invoiceErr != nil {
+			return FinalizeTeamBillingPeriodResult{}, invoiceErr
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return FinalizeTeamBillingPeriodResult{}, err
+		}
+		return verified, nil
+	}
+
 	exportRows, err := q.ListBillingUsageExportsForPeriod(ctx, db.ListBillingUsageExportsForPeriodParams{
 		TeamID:      teamID,
 		PeriodStart: periodStart,

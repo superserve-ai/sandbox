@@ -418,6 +418,8 @@ func run() error {
 	billingFinalizationConfig.ResolveActiveMeter = handlers.ResolveActiveBillingMeter
 	billing.StartBillingFinalizationService(ctx, dbPool, billingFinalizationConfig)
 	handlers.StartIncrementalBillingService(ctx)
+	handlers.StartInvoiceEnrollmentService(ctx)
+	handlers.StartInvoiceReconciliationService(ctx)
 	handlers.StartStripeCheckoutAssociationMonitor(ctx)
 
 	// Quota watcher: alerts when a team crosses 80% of a resource limit. Fans out
