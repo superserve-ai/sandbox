@@ -22,6 +22,9 @@ buffer_dir='/var/lib/google-cloud-ops-agent/fluent-bit/buffers'
 self_log_dir='/var/log/google-cloud-ops-agent'
 rendered_config=''
 storage_scan_result=''
+generated_dir=''
+fixture_logs=''
+fixture_state=''
 expected_journald=''
 expected_resource=''
 expected_metrics_resource=''
@@ -34,6 +37,7 @@ cleanup() {
   rm -f "$rendered_config" "$storage_scan_result" "$expected_journald" \
     "$expected_resource" "$expected_metrics_resource" "$expected_agent_metrics_resource" \
     "$expected_agent_logrotate" "$expected_syslog_logrotate" 2>/dev/null || true
+  rm -rf "$generated_dir" "$fixture_logs" "$fixture_state" 2>/dev/null || true
 }
 trap 'status=$?; cleanup; exit "$status"' EXIT
 
@@ -50,7 +54,19 @@ case "$installed_version" in
   ${ops_agent_package_version}*) ;;
   *) exit 101 ;;
 esac
-command -v google-cloud-ops-agent >/dev/null 2>&1 || exit 101
+engine='/opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine'
+test -x "$engine" || exit 101
+
+run_engine_validation() {
+  input="$1"
+  rm -rf "$generated_dir" "$fixture_logs" "$fixture_state" 2>/dev/null || true
+  generated_dir=$(mktemp -d)
+  fixture_logs=$(mktemp -d)
+  fixture_state=$(mktemp -d)
+  timeout "${package_operation_timeout_seconds}s" "$engine" \
+    -in "$input" -service fluentbit -out "$generated_dir" \
+    -logs "$fixture_logs" -state "$fixture_state" >/dev/null 2>&1
+}
 
 rendered_config=$(mktemp)
 sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
@@ -58,7 +74,7 @@ sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
 if grep -qE '__HOST_ID__|__INCARNATION_ID__' "$rendered_config"; then
   exit 101
 fi
-if ! timeout "${package_operation_timeout_seconds}s" google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1; then
+if ! run_engine_validation "$rendered_config"; then
   # The candidate itself is invalid, so OS Config must surface an error rather
   # than repeatedly re-running enforce against a broken revision.
   exit 1
@@ -66,7 +82,7 @@ fi
 
 drift=0
 if ! cmp -s "$rendered_config" "$config_path" 2>/dev/null; then drift=1; fi
-if [ -s "$config_path" ] && ! timeout "${package_operation_timeout_seconds}s" google-cloud-ops-agent diagnose --config="$config_path" >/dev/null 2>&1; then drift=1; fi
+if [ -s "$config_path" ] && ! run_engine_validation "$config_path"; then drift=1; fi
 expected_journald=$(mktemp)
 install -m 0644 "$journald_candidate_path" "$expected_journald"
 grep -Fq "SystemMaxUse=${journal_max_use_bytes}B" "$expected_journald" || exit 1
@@ -138,6 +154,11 @@ systemctl is-active --quiet superserve-host-logging-heartbeat.timer || drift=1
 # fail closed; only never-created optional stores on first install count as
 # empty.
 storage_scan_result=$(mktemp)
+if [ -z "$installed_version" ] && [ ! -e "$config_path" ] && [ ! -e "$buffer_dir" ] && [ ! -e "$self_log_dir" ]; then
+  export SUPER_SERVE_FIRST_INSTALL=1
+else
+  unset SUPER_SERVE_FIRST_INSTALL
+fi
 if ! timeout "${storage_scan_timeout_seconds}s" bash -c '
   set -euo pipefail
   buffer_dir="$1"; self_log_dir="$2"; max_entries="$3"; output="$4"
@@ -153,11 +174,21 @@ queue = [root]
 visited = 0
 bytes_total = 0
 capped = False
+allow_missing_first_install = kind in {"buffer", "self_log"} and os.environ.get("SUPER_SERVE_FIRST_INSTALL") == "1"
+try:
+    os.stat(root)
+except FileNotFoundError:
+    if allow_missing_first_install:
+        print(kind, 0, 0)
+        raise SystemExit(0)
+    raise SystemExit(2)
+except OSError:
+    raise SystemExit(2)
 while queue:
     current = queue.pop(0)
-    if not os.path.lexists(root):
-        if kind in {"buffer", "self_log"}:
-            continue
+    try:
+        os.stat(root)
+    except OSError:
         raise SystemExit(2)
     try:
         with os.scandir(current) as entries:

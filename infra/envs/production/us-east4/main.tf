@@ -525,8 +525,8 @@ module "observability" {
     display_prefix = "Host logging / ${local.active_host_name}"
     expected_hosts = {
       sandbox_host_c = {
-        instance_name = module.sandbox_host_c.instance_name
-        instance_id   = module.sandbox_host_c.instance_id
+        instance_name     = module.sandbox_host_c.instance_name
+        instance_id       = module.sandbox_host_c.instance_id
         collector_host_id = module.sandbox_host_c.instance_name
       }
     }

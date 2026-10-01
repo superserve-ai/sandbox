@@ -20,7 +20,7 @@ global:
 logging:
   receivers:
     vmd_proxy_journald:
-      # The supported 2.52 systemd_journald receiver has no unit/include
+      # The selected systemd_journald receiver has no unit/include
       # selector; allowlisting therefore remains an exclude_logs processor.
       # Reconciliation bounds the journald source and logging subagent with
       # persistent journal/free-space limits and a systemd CPU/memory quota.
@@ -28,7 +28,7 @@ logging:
     ops_agent_self_log_files:
       # The logging subagent writes supported flush/drop diagnostics here.
       # An explicit receiver gives the alert a stable log ID without adding a
-      # second default pipeline for the same file. In the selected 2.52.0
+      # second default pipeline for the same file. In the selected release
       # generated config, the receiver ID is the Cloud Logging log ID and the
       # file line is mapped to jsonPayload.message.
       type: files
@@ -52,11 +52,23 @@ logging:
           copy_from: jsonPayload._TRANSPORT
     parse_application_json:
       type: parse_json
-      # parse_json consumes the receiver's MESSAGE field; field is not a
-      # supported parse_json option. The application timestamp uses strptime
-      # syntax rather than a language-specific timestamp name.
+      # The selected release supports an explicit journald MESSAGE source;
+      # keeping this explicit makes the parser outcome observable in the
+      # generated Fluent Bit configuration. The application timestamp uses
+      # strptime syntax rather than a language-specific timestamp name.
+      field: MESSAGE
       time_key: timestamp
       time_format: "%Y-%m-%dT%H:%M:%S.%L%Z"
+      # Ops Agent 2.71 exposes the parser outcome as a field that can be
+      # copied by a following modify_fields processor.  The marker is kept in
+      # trusted resource labels and is never read from application JSON.
+      parse_failure_field: resource.labels._superserve_parse_failure
+    mark_parse_failure:
+      type: modify_fields
+      fields:
+        labels.parse_failure:
+          copy_from: resource.labels._superserve_parse_failure
+          omit_if: 'NOT resource.labels._superserve_parse_failure:*'
     map_application_severity:
       type: modify_fields
       fields:
@@ -239,10 +251,13 @@ logging:
         receivers:
           - vmd_proxy_journald
         processors:
-          # Reject unrelated journal traffic before parsing JSON. Severity
-          # filtering still happens after parsing for allowlisted sources.
-          - exclude_non_platform_sources
+          # Capture receiver-provided journal provenance before evaluating the
+          # source filter. Incoming records do not yet contain the custom
+          # labels written by capture_journal_provenance.
           - capture_journal_provenance
+          # Reject unrelated journal traffic only after trusted provenance is
+          # present. Severity filtering still happens after JSON parsing.
+          - exclude_non_platform_sources
           - parse_application_json
           - map_application_severity
           - map_legacy_application_severity
@@ -251,6 +266,7 @@ logging:
           - redact_sensitive_fields
           - allowlisted_application_fields
           - allowlisted_heartbeat
+          - mark_parse_failure
           - drop_unallowlisted_payload
           - exclude_debug_after_parse
       ops_agent_self_logs:

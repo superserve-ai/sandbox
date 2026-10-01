@@ -11,7 +11,7 @@ The supported `systemd_journald` receiver is paired with a processor allowlist
 systemd-manager and host/kernel
 records. Zerolog `level` is mapped to Cloud Logging severity before
 DEBUG/TRACE exclusion. Application parse failures keep trusted journal
-metadata but export trusted metadata only; the raw record remains locally
+metadata and a parser-derived `labels.parse_failure` marker but export trusted metadata only; the raw record remains locally
 available within journal retention and is never uploaded. Parsed JSON is reduced to the explicit
 diagnostic/correlation allowlist (`request_id`, `sandbox_id`, proxy
 generation/revision, service, component, event, error code, and status); the
@@ -25,7 +25,7 @@ provenance is copied before JSON parsing so application payloads cannot replace
 the source identity used for filtering.
 
 The initial journal budget is 4 GiB with a 10 GiB free-space reserve. The
-Ops Agent 2.52.0 uses the documented built-in disk-buffer protection introduced
+Ops Agent 2.71.0 uses the documented built-in disk-buffer protection introduced
 in 2.28. The selected release documents that its buffer amount is
 platform-specific and does not expose a supported numeric configuration knob;
 `agent_buffer_bytes` is therefore a conservative accounting/enforcement
@@ -54,7 +54,7 @@ Each host emits one independent heartbeat per configured 60-second period;
 the policy performs no fleet-sized heartbeat loop, so monitoring work is
 linear in the expected-host inventory and constant per host.
 Candidate configuration and the journald drop-in are validated before atomic
-activation. A package upgrade is diagnosed from a staged selected-release
+activation. A package upgrade is validated by the staged selected-release
 artifact before installation, with the installed package staged for rollback;
 a failed reconciliation restores the previous package, service/configuration
 state, and delivery state. The policy never
@@ -73,7 +73,8 @@ Historical permission-denied reports are retained as incident evidence, not
 treated as proof of the current exporter failure cause; staging must verify the
 active identity and absence of new permission errors.
 
-The selected package release is pinned in `ops_agent_package_version`; rollout
+The selected package release is pinned in `ops_agent_package_version` (2.71.0;
+upstream generator revision `81e4d60b1eb8b6ada14598bee0378532a90ade8c`); rollout
 must record the tested release, first-install backfill/cursor behavior, outage
 replay/duplicate boundaries, and 72-hour sizing evidence.
 

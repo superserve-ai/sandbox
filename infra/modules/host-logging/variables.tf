@@ -42,7 +42,7 @@ variable "enrolled_hosts" {
     instance_id           = string
     host_id               = string
     incarnation           = string
-    service_account_email  = string
+    service_account_email = string
     proxy_units           = optional(list(string), ["proxy.service"])
   }))
 }
@@ -70,7 +70,7 @@ variable "journal_keep_free_bytes" {
 }
 
 variable "agent_buffer_bytes" {
-  description = "Conservative free-space reservation for the selected release's platform-managed Ops Agent buffer; the 2.52.0 release does not expose a configurable numeric cap, so this value is accounting/enforcement threshold rather than a claimed agent limit."
+  description = "Conservative free-space reservation for the selected release's platform-managed Ops Agent buffer; the selected release does not expose a configurable numeric cap, so this value is an accounting/enforcement threshold rather than a claimed agent limit."
   type        = number
   default     = 1073741824
 
@@ -171,7 +171,7 @@ variable "agent_cpu_limit_millicores" {
 variable "ops_agent_package_version" {
   description = "Pinned Ops Agent package version selected after staging verification; its supported buffer semantics and generator output must be recorded before rollout."
   type        = string
-  default     = "2.52.0"
+  default     = "2.71.0"
 
   validation {
     condition     = can(regex("^2\\.(2[89]|[3-9][0-9]|[1-9][0-9]{2,})", var.ops_agent_package_version))

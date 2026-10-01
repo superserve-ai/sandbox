@@ -65,7 +65,7 @@ variable "host_logging_alerts" {
       # state is closed.
       collector_host_id = optional(string)
       incarnation       = optional(string)
-      active             = optional(bool, true)
+      active            = optional(bool, true)
     }))
   })
   default = null

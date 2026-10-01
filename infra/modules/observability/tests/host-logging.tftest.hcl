@@ -5,10 +5,10 @@ run "host_logging_alerts_contract" {
     project_id  = "example-project"
     environment = "staging"
     runbook_urls = {
-      host_cpu              = "https://example.invalid/runbooks/host-cpu"
-      host_maintenance      = "https://example.invalid/runbooks/host-maintenance"
-      host_logging_export   = "https://example.invalid/runbooks/host-logging-export"
-      host_logging_lag      = "https://example.invalid/runbooks/host-logging-lag"
+      host_cpu               = "https://example.invalid/runbooks/host-cpu"
+      host_maintenance       = "https://example.invalid/runbooks/host-maintenance"
+      host_logging_export    = "https://example.invalid/runbooks/host-logging-export"
+      host_logging_lag       = "https://example.invalid/runbooks/host-logging-lag"
       host_logging_heartbeat = "https://example.invalid/runbooks/host-logging-heartbeat"
     }
     notification_channel_ids = ["projects/example-project/notificationChannels/123"]
@@ -50,7 +50,7 @@ run "host_logging_alerts_contract" {
       alltrue([for condition in policy.conditions : (
         (length(condition.condition_prometheus_query_language) == 1 &&
           strcontains(one(condition.condition_prometheus_query_language).query, "absent_over_time(") &&
-          one(condition.condition_prometheus_query_language).disable_metric_validation)
+        one(condition.condition_prometheus_query_language).disable_metric_validation)
       )])
     ])
     error_message = "Each Monitoring condition block must contain exactly one supported condition type."

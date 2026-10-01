@@ -369,8 +369,8 @@ module "sandbox_host" {
   tags        = ["superserve-vmd"]
 
   labels = merge(local.sandbox_host_labels, {
-    component    = "vmd-staging-draining"
-    sandbox_role = "vmd"
+    component               = "vmd-staging-draining"
+    sandbox_role            = "vmd"
     "goog-ops-agent-policy" = "v2-template-1-7-0"
   })
 
@@ -383,7 +383,7 @@ module "sandbox_host" {
   metadata = {
     enable-osconfig = "TRUE"
     enable-oslogin  = "TRUE"
-    startup-script = <<-EOT
+    startup-script  = <<-EOT
       #!/bin/bash
       # Restore runtime and private configuration before admission.
       # Identity-gated units prevent activation until identity is installed.
@@ -441,8 +441,8 @@ module "sandbox_host_b" {
   tags        = ["superserve-vmd"]
 
   labels = merge(local.sandbox_host_labels, {
-    component    = "vmd"
-    sandbox_role = "vmd"
+    component               = "vmd"
+    sandbox_role            = "vmd"
     "goog-ops-agent-policy" = "v2-template-1-7-0"
   })
 
@@ -646,13 +646,13 @@ module "observability" {
     display_prefix = "Host logging / staging"
     expected_hosts = {
       sandbox_host = {
-        instance_name = module.sandbox_host.instance_name
-        instance_id   = module.sandbox_host.instance_id
+        instance_name     = module.sandbox_host.instance_name
+        instance_id       = module.sandbox_host.instance_id
         collector_host_id = module.sandbox_host.instance_name
       }
       sandbox_host_b = {
-        instance_name = module.sandbox_host_b.instance_name
-        instance_id   = module.sandbox_host_b.instance_id
+        instance_name     = module.sandbox_host_b.instance_name
+        instance_id       = module.sandbox_host_b.instance_id
         collector_host_id = module.sandbox_host_b.instance_name
       }
     }
@@ -724,8 +724,8 @@ module "host_logging" {
   }
   enrolled_hosts = {
     sandbox_host = {
-      instance_name         = module.sandbox_host.instance_name
-      instance_id           = module.sandbox_host.instance_id
+      instance_name = module.sandbox_host.instance_name
+      instance_id   = module.sandbox_host.instance_id
       # This legacy host's provider identity is not available in Terraform;
       # reconciliation defers to its installed identity file rather than
       # fabricating one from the VM name.

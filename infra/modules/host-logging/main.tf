@@ -10,11 +10,11 @@ terraform {
 }
 
 locals {
-  config_path       = "/etc/google-cloud-ops-agent/config.yaml"
-  candidate_config_path = "/var/lib/superserve/host-logging/config.yaml.candidate"
-  journald_dropin   = "/etc/systemd/journald.conf.d/30-superserve-host-logging.conf"
+  config_path             = "/etc/google-cloud-ops-agent/config.yaml"
+  candidate_config_path   = "/var/lib/superserve/host-logging/config.yaml.candidate"
+  journald_dropin         = "/etc/systemd/journald.conf.d/30-superserve-host-logging.conf"
   journald_candidate_path = "/var/lib/superserve/host-logging/journald.conf.candidate"
-  reconciliation_id = "${var.assignment_name}-${var.assignment_revision}"
+  reconciliation_id       = "${var.assignment_name}-${var.assignment_revision}"
   host_units = distinct(flatten([
     for host in values(var.enrolled_hosts) : concat(
       ["superserve-vmd.service", "systemd.service", "systemd-journald.service", "systemd-logind.service", "google-osconfig-agent.service", "google-guest-agent.service", "google-cloud-ops-agent.service", "superserve-otel-collector.service", "unbound.service", "secretsproxy.service", "superserve-secretsproxy.service", "superserve-host-logging-heartbeat.service", "proxy-*.service", "proxy-generation@.service"],
@@ -22,48 +22,48 @@ locals {
     )
   ]))
   ops_agent_config = templatefile("${path.module}/templates/ops-agent.yaml.tftpl", {
-    environment       = var.environment
-    region            = var.region
-    assignment_name   = var.assignment_name
-    assignment_revision = var.assignment_revision
-    host_units        = local.host_units
-    enrolled_hosts    = var.enrolled_hosts
+    environment               = var.environment
+    region                    = var.region
+    assignment_name           = var.assignment_name
+    assignment_revision       = var.assignment_revision
+    host_units                = local.host_units
+    enrolled_hosts            = var.enrolled_hosts
     ops_agent_package_version = var.ops_agent_package_version
   })
   reconcile_script = templatefile("${path.module}/templates/reconcile.sh.tftpl", {
-    config_path             = local.config_path
-    candidate_config_path   = local.candidate_config_path
-    journald_dropin         = local.journald_dropin
-    journald_candidate_path = local.journald_candidate_path
-    ops_agent_config        = local.ops_agent_config
-    journal_max_use_bytes   = var.journal_max_use_bytes
-    journal_keep_free_bytes = var.journal_keep_free_bytes
-    agent_memory_limit_mb   = var.agent_memory_limit_mb
-    agent_cpu_limit_millicores = var.agent_cpu_limit_millicores
-    agent_buffer_bytes      = var.agent_buffer_bytes
-    agent_self_log_max_bytes = var.agent_self_log_max_bytes
-    syslog_max_bytes        = var.syslog_max_bytes
-    storage_scan_timeout_seconds = var.storage_scan_timeout_seconds
-    storage_scan_max_entries = var.storage_scan_max_entries
+    config_path                       = local.config_path
+    candidate_config_path             = local.candidate_config_path
+    journald_dropin                   = local.journald_dropin
+    journald_candidate_path           = local.journald_candidate_path
+    ops_agent_config                  = local.ops_agent_config
+    journal_max_use_bytes             = var.journal_max_use_bytes
+    journal_keep_free_bytes           = var.journal_keep_free_bytes
+    agent_memory_limit_mb             = var.agent_memory_limit_mb
+    agent_cpu_limit_millicores        = var.agent_cpu_limit_millicores
+    agent_buffer_bytes                = var.agent_buffer_bytes
+    agent_self_log_max_bytes          = var.agent_self_log_max_bytes
+    syslog_max_bytes                  = var.syslog_max_bytes
+    storage_scan_timeout_seconds      = var.storage_scan_timeout_seconds
+    storage_scan_max_entries          = var.storage_scan_max_entries
     package_operation_timeout_seconds = var.package_operation_timeout_seconds
-    heartbeat_interval_seconds = var.heartbeat_interval_seconds
-    ops_agent_package_version = var.ops_agent_package_version
+    heartbeat_interval_seconds        = var.heartbeat_interval_seconds
+    ops_agent_package_version         = var.ops_agent_package_version
   })
   validate_script = templatefile("${path.module}/templates/validate.sh.tftpl", {
-    candidate_config_path     = local.candidate_config_path
-    journald_candidate_path   = local.journald_candidate_path
-    journal_max_use_bytes     = var.journal_max_use_bytes
-    journal_keep_free_bytes   = var.journal_keep_free_bytes
-    agent_cpu_limit_millicores = var.agent_cpu_limit_millicores
-    agent_memory_limit_mb     = var.agent_memory_limit_mb
-    ops_agent_package_version = var.ops_agent_package_version
-    agent_buffer_bytes        = var.agent_buffer_bytes
-    agent_self_log_max_bytes = var.agent_self_log_max_bytes
-    syslog_max_bytes        = var.syslog_max_bytes
-    storage_scan_timeout_seconds = var.storage_scan_timeout_seconds
-    storage_scan_max_entries = var.storage_scan_max_entries
+    candidate_config_path             = local.candidate_config_path
+    journald_candidate_path           = local.journald_candidate_path
+    journal_max_use_bytes             = var.journal_max_use_bytes
+    journal_keep_free_bytes           = var.journal_keep_free_bytes
+    agent_cpu_limit_millicores        = var.agent_cpu_limit_millicores
+    agent_memory_limit_mb             = var.agent_memory_limit_mb
+    ops_agent_package_version         = var.ops_agent_package_version
+    agent_buffer_bytes                = var.agent_buffer_bytes
+    agent_self_log_max_bytes          = var.agent_self_log_max_bytes
+    syslog_max_bytes                  = var.syslog_max_bytes
+    storage_scan_timeout_seconds      = var.storage_scan_timeout_seconds
+    storage_scan_max_entries          = var.storage_scan_max_entries
     package_operation_timeout_seconds = var.package_operation_timeout_seconds
-    heartbeat_interval_seconds = var.heartbeat_interval_seconds
+    heartbeat_interval_seconds        = var.heartbeat_interval_seconds
   })
 }
 
@@ -102,17 +102,18 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "ops-agent-config"
         file {
-          desired_state = "PRESENT"
+          state         = "PRESENT"
+          path          = local.candidate_config_path
+          permissions   = "0644"
           file {
-            # OS Config writes a candidate outside the active path. The
-            # reconciliation exec validates it and atomically activates it.
-            path        = local.candidate_config_path
+            # The nested source block contains only the authenticated remote
+            # object. Path, desired state, and permissions belong to the
+            # FileResource itself in the locked Google provider schema.
             gcs {
               bucket     = google_storage_bucket.host_logging_artifacts.name
               object     = google_storage_bucket_object.ops_agent_config.name
               generation = tostring(google_storage_bucket_object.ops_agent_config.generation)
             }
-            permissions = "0644"
           }
         }
       }
@@ -120,34 +121,30 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "journald-retention"
         file {
-          desired_state = "PRESENT"
-          file {
-            # Reconciliation owns activation and previous-state capture. OS
-            # Config must never overwrite the live drop-in before validation.
-            path        = local.journald_candidate_path
-            content     = <<-EOT
-              [Journal]
-              Storage=persistent
-              SystemMaxUse=${var.journal_max_use_bytes}B
-              SystemKeepFree=${var.journal_keep_free_bytes}B
-              EOT
-            permissions = "0644"
-          }
+          state         = "CONTENTS_MATCH"
+          path          = local.journald_candidate_path
+          permissions   = "0644"
+          content       = <<-EOT
+            [Journal]
+            Storage=persistent
+            SystemMaxUse=${var.journal_max_use_bytes}B
+            SystemKeepFree=${var.journal_keep_free_bytes}B
+            EOT
         }
       }
 
       resources {
         id = "validate-script"
         file {
-          desired_state = "PRESENT"
+          state         = "PRESENT"
+          path          = "/var/lib/superserve/host-logging/validate.sh"
+          permissions   = "0755"
           file {
-            path = "/var/lib/superserve/host-logging/validate.sh"
             gcs {
               bucket     = google_storage_bucket.host_logging_artifacts.name
               object     = google_storage_bucket_object.validate_script.name
               generation = tostring(google_storage_bucket_object.validate_script.generation)
             }
-            permissions = "0755"
           }
         }
       }
@@ -155,15 +152,15 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       resources {
         id = "reconcile-script"
         file {
-          desired_state = "PRESENT"
+          state         = "PRESENT"
+          path          = "/var/lib/superserve/host-logging/reconcile.sh"
+          permissions   = "0755"
           file {
-            path = "/var/lib/superserve/host-logging/reconcile.sh"
             gcs {
               bucket     = google_storage_bucket.host_logging_artifacts.name
               object     = google_storage_bucket_object.reconcile_script.name
               generation = tostring(google_storage_bucket_object.reconcile_script.generation)
             }
-            permissions = "0755"
           }
         }
       }
@@ -193,14 +190,13 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
       fixed = 1
     }
     min_wait_duration = "60s"
-    mode              = "ZONE"
   }
 
   lifecycle {
     prevent_destroy = true
 
     precondition {
-      condition = var.journal_max_use_bytes + var.agent_buffer_bytes + var.agent_self_log_max_bytes + var.syslog_max_bytes <= var.journal_keep_free_bytes
+      condition     = var.journal_max_use_bytes + var.agent_buffer_bytes + var.agent_self_log_max_bytes + var.syslog_max_bytes <= var.journal_keep_free_bytes
       error_message = "Combined journal, conservative Ops Agent buffer reservation, self-log, and syslog budgets must fit within the host free-space reserve; the reservation is accounting evidence, not an asserted Ops Agent cap."
     }
   }

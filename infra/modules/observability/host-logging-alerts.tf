@@ -109,7 +109,7 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
   conditions {
     display_name = "Ops Agent delivery lag on ${each.value.instance_name}"
     condition_prometheus_query_language {
-      query = <<-EOT
+      query                     = <<-EOT
         absent_over_time({
           "__name__" = "logging_googleapis_com:user_${google_logging_metric.host_logging_heartbeat[each.key].name}",
           "collector_host_id" = "${each.value.instance_id}",
@@ -170,7 +170,7 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
       # missing-data policies cannot create that initial series. The selector
       # uses the standalone collector's independent identity, so Ops Agent
       # export failure cannot satisfy or silence this condition.
-      query = <<-EOT
+      query                     = <<-EOT
         absent({
           "__name__" = "${var.host_logging_alerts.heartbeat_metric_type}",
           "collector_host_id" = "${coalesce(each.value.collector_host_id, each.value.instance_name)}"

@@ -1,4 +1,8 @@
+import hashlib
+import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,12 +15,122 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class HostLoggingConfigChecks(unittest.TestCase):
+    fixture_manifest_env = "HOST_LOGGING_AGENT_FIXTURE_MANIFEST"
+    selected_release = "2.71.0"
+    selected_release_commit = "81e4d60b1eb8b6ada14598bee0378532a90ade8c"
+
     def setUp(self):
         self.config = (ROOT / "infra/modules/host-logging/templates/ops-agent.yaml.tftpl").read_text()
         self.reconcile = (ROOT / "infra/modules/host-logging/templates/reconcile.sh.tftpl").read_text()
         self.validate = (ROOT / "infra/modules/host-logging/templates/validate.sh.tftpl").read_text()
 
-    def _run_embedded_scan(self, template, kind, root, limit=100, failure=None, occurrence=0):
+    def _selected_agent_manifest(self):
+        """Load the runner-prepared, digest-bound Linux fixture contract.
+
+        Acquisition is intentionally outside the 120/180-second behavioral
+        selectors.  The outer executor installs the signed repository, pins
+        the package checksum, and writes this manifest before invoking these
+        tests.  A missing or mutable fixture is an explicit prerequisite
+        failure, never a skipped PASS.
+        """
+        manifest_name = os.environ.get(self.fixture_manifest_env)
+        if not manifest_name:
+            self.fail(
+                f"{self.fixture_manifest_env} is required; prepare a digest-bound "
+                "Ubuntu linux/amd64 Ops Agent fixture with the authorized Docker executor"
+            )
+        manifest_path = Path(manifest_name)
+        if not manifest_path.is_file():
+            self.fail(f"fixture manifest does not exist: {manifest_path}")
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (OSError, ValueError) as exc:
+            self.fail(f"fixture manifest is unreadable: {exc}")
+        required = {
+            "image",
+            "release",
+            "source_revision",
+            "package_version",
+            "package_sha256",
+            "generator_sha256",
+            "fluent_bit_sha256",
+            "rendered_input_sha256",
+            "generated_artifact_sha256",
+            "base_image_digest",
+            "architecture",
+            "repository_setup_url",
+            "authenticated_packages_metadata_sha256",
+            "fixture_adaptations",
+            "engine_path",
+            "fluent_bit_path",
+            "journal_remote_path",
+            "runner_script",
+        }
+        missing = sorted(required - manifest.keys())
+        self.assertFalse(missing, f"fixture manifest missing immutable provenance: {missing}")
+        self.assertEqual(manifest["release"], self.selected_release)
+        self.assertEqual(manifest["source_revision"], self.selected_release_commit)
+        self.assertRegex(manifest["image"], r"@sha256:[0-9a-f]{64}$")
+        for key in ("package_sha256", "generator_sha256", "fluent_bit_sha256",
+                    "rendered_input_sha256", "generated_artifact_sha256"):
+            self.assertRegex(manifest[key], r"^[0-9a-f]{64}$", key)
+        self.assertEqual(manifest["package_version"].split("~", 1)[0], self.selected_release)
+        self.assertEqual(manifest["architecture"], "amd64")
+        self.assertTrue(manifest["journal_remote_path"].endswith("systemd-journal-remote"))
+        self.assertRegex(manifest["base_image_digest"], r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(
+            manifest["repository_setup_url"],
+            "https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh",
+        )
+        self.assertTrue(manifest["authenticated_packages_metadata_sha256"])
+        self.assertIsInstance(manifest["fixture_adaptations"], list)
+        rendered_input = manifest_path.parent / "rendered.yaml"
+        if rendered_input.is_file():
+            digest = hashlib.sha256(rendered_input.read_bytes()).hexdigest()
+            self.assertEqual(digest, manifest["rendered_input_sha256"])
+        else:
+            self.fail(f"fixture rendered input is missing: {rendered_input}")
+        return manifest_path, manifest
+
+    def _run_selected_agent_fixture(self, scenario):
+        """Execute the packaged engine and Fluent Bit in the prepared container."""
+        manifest_path, manifest = self._selected_agent_manifest()
+        docker = shutil.which("docker")
+        if not docker:
+            self.fail("docker is required for the selected-agent fixture executor")
+        fixture_dir = manifest_path.parent.resolve()
+        command = [
+            docker, "run", "--rm", "--platform", "linux/amd64", "--network", "none",
+            "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev", "--tmpfs", "/run:rw,nosuid,nodev",
+            "-v", f"{fixture_dir}:/fixture:ro", manifest["image"],
+            "/bin/bash", "-ceu",
+            "engine=\"$1\"; fluent=\"$2\"; runner=\"$3\"; scenario=\"$4\"; "
+            "mkdir -p /tmp/ops-agent-generated /tmp/ops-agent-logs /tmp/ops-agent-state; "
+            "\"$engine\" -in /fixture/rendered.yaml -service fluentbit "
+            "-out /tmp/ops-agent-generated -logs /tmp/ops-agent-logs "
+            "-state /tmp/ops-agent-state; "
+            "\"$runner\" --generated /tmp/ops-agent-generated --scenario \"$scenario\" "
+            "--fluent-bit \"$fluent\" --journal-remote \"$5\"",
+            "fixture", manifest["engine_path"], manifest["fluent_bit_path"],
+            manifest["runner_script"], scenario, manifest["journal_remote_path"],
+        ]
+        result = subprocess.run(command, text=True, capture_output=True,
+                                timeout=170, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = []
+        for line in result.stdout.splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+        self.assertTrue(records, f"selected-agent fixture emitted no records: {result.stdout!r}")
+        for record in records:
+            if "generator_sha256" in record:
+                self.assertEqual(record["generator_sha256"], manifest["generator_sha256"])
+            if "fluent_bit_sha256" in record:
+                self.assertEqual(record["fluent_bit_sha256"], manifest["fluent_bit_sha256"])
+        return records
+
+    def _run_embedded_scan(self, template, kind, root, limit=100, failure=None,
+                           occurrence=0, first_install=False):
         """Run the exact Python traversal embedded in a rendered script.
 
         Keeping the source extraction tied to the template prevents this test
@@ -37,6 +151,8 @@ class HostLoggingConfigChecks(unittest.TestCase):
 
             failure = sys.argv.pop(1)
             original_scandir = os.scandir
+            original_stat = os.stat
+            stat_calls = [0]
 
             class Entry:
                 def __init__(self, entry):
@@ -76,10 +192,21 @@ class HostLoggingConfigChecks(unittest.TestCase):
             def scandir(path):
                 return Entries(path)
 
+            def stat(path, *args, **kwargs):
+                stat_calls[0] += 1
+                if failure == "root-stat" and path == sys.argv[2]:
+                    raise OSError("injected root stat failure")
+                if failure == "disappear" and path == sys.argv[2] and stat_calls[0] > 1:
+                    raise FileNotFoundError(path)
+                return original_stat(path, *args, **kwargs)
+
             os.scandir = scandir
+            os.stat = stat
+            if %r:
+                os.environ["SUPER_SERVE_FIRST_INSTALL"] = "1"
             exec(compile(%r, "embedded-storage-scanner", "exec"), {"__name__": "__main__"})
             """
-        ) % scanner
+        ) % (first_install, scanner)
         return subprocess.run(
             [sys.executable, "-c", wrapper, failure or "none", kind, str(root), str(limit)],
             text=True,
@@ -143,6 +270,9 @@ class HostLoggingConfigChecks(unittest.TestCase):
     def test_parse_before_filter_and_platform_context(self):
         self.assertLess(self.config.index("parse_application_json"), self.config.index("exclude_debug_after_parse"))
         self.assertLess(self.config.index("capture_journal_provenance"), self.config.index("parse_application_json"))
+        pipeline = self.config[self.config.index("host_logs:"):]
+        self.assertLess(pipeline.index("capture_journal_provenance"), pipeline.index("exclude_non_platform_sources"))
+        self.assertLess(pipeline.index("exclude_non_platform_sources"), pipeline.index("parse_application_json"))
         self.assertIn("labels.environment", self.config)
         self.assertIn("labels.region", self.config)
         self.assertIn("labels.host_id", self.config)
@@ -156,6 +286,8 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertIn("drop_unallowlisted_payload", self.config)
         self.assertIn("jsonPayload:*", self.config)
         self.assertIn("labels.host_logging_heartbeat", self.config)
+        self.assertIn("parse_failure_field", self.config)
+        self.assertIn("labels.parse_failure", self.config)
         self.assertNotIn("jsonPayload.severity == NULL", self.config)
         self.assertIn("default_pipeline:", self.config)
 
@@ -165,11 +297,11 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertIn("journald_candidate_path", self.reconcile)
         self.assertIn("superserve-otel-collector.service", self.reconcile)
         self.assertIn("cmp -s", self.reconcile)
-        self.assertIn("diagnose", self.reconcile)
+        self.assertIn("google_cloud_ops_agent_engine", self.reconcile)
         self.assertIn("exit 100", self.validate)
 
     def test_reconciliation_bounds_package_and_storage_transitions(self):
-        # The selected package is diagnosed before activation, while the
+        # The selected package is validated before activation, while the
         # previous package and service/configuration state are captured for
         # rollback if installation or activation fails.
         self.assertIn("apt-get download", self.reconcile)
@@ -233,9 +365,21 @@ class HostLoggingConfigChecks(unittest.TestCase):
                                 template, "syslog", root / "syslog", failure=failure, occurrence=occurrence)
                             self.assertNotEqual(failed.returncode, 0, failure)
 
-                    missing = self._run_embedded_scan(template, "buffer", root / "never-created")
-                    self.assertEqual(missing.returncode, 0, missing.stderr)
-                    self.assertEqual(missing.stdout.strip(), "buffer 0 0")
+                    if not (template is self.reconcile and occurrence == 1):
+                        for missing_kind, suffix in (("buffer", "buffer"), ("self_log", "self-log")):
+                            missing = self._run_embedded_scan(
+                                template, missing_kind, root / f"never-created-{suffix}",
+                                first_install=True, occurrence=occurrence
+                            )
+                            self.assertEqual(missing.returncode, 0, missing.stderr)
+                            self.assertEqual(missing.stdout.strip(), f"{missing_kind} 0 0")
+
+                    for failure in ("disappear", "root-stat"):
+                        established = self._run_embedded_scan(
+                            template, "buffer", root / "buffer", failure=failure,
+                            occurrence=occurrence
+                        )
+                        self.assertNotEqual(established.returncode, 0, failure)
 
             for index in range(3):
                 (root / "buffer" / f"chunk-{index}").write_bytes(b"x")
@@ -245,6 +389,32 @@ class HostLoggingConfigChecks(unittest.TestCase):
             self.assertIn('[ "$storage_scan_capped" -eq 0 ]', self.validate)
 
     def test_storage_failure_preserves_activation_and_delivery_state(self):
+        for scenario in (
+            "invalid_candidate_before_activation",
+            "child_failure_before_activation",
+            "activation_restart_failure_rollback",
+            "cleanup_failure_after_activation",
+            "post_activation_storage_violation",
+            "idempotent_repetition",
+        ):
+            records = self._run_selected_agent_fixture(scenario)
+            self.assertEqual(len(records), 1, records)
+            report = records[0]
+            self.assertEqual(report.get("fixture_scenario"), scenario)
+            self.assertIn(report.get("os_config_exit"), (0, 100, 101, 1))
+            self.assertTrue(report.get("committed_config_preserved"))
+            self.assertTrue(report.get("pending_delivery_state_preserved"))
+            if scenario == "idempotent_repetition":
+                self.assertTrue(report.get("second_run_compliant"))
+            if scenario in {
+                "invalid_candidate_before_activation",
+                "child_failure_before_activation",
+                "activation_restart_failure_rollback",
+            }:
+                self.assertFalse(report.get("activation_committed"))
+            if scenario in {"cleanup_failure_after_activation", "post_activation_storage_violation"}:
+                self.assertTrue(report.get("activation_committed"))
+
         for template in (self.validate, self.reconcile):
             with self.subTest(template="validate" if template is self.validate else "reconcile"):
                 self.assertIn('test -n "$kind" || exit 1', template)
@@ -258,51 +428,54 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertIn('buffer', self.reconcile.lower())
 
     def test_selected_agent_export_boundary(self):
-        order = [
-            "capture_journal_provenance",
-            "parse_application_json",
-            "reset_promoted_special_fields",
-            "add_platform_context",
-            "redact_sensitive_fields",
-            "allowlisted_application_fields",
-            "drop_unallowlisted_payload",
-            "exclude_debug_after_parse",
-        ]
-        positions = [self.config.index(name) for name in order]
-        self.assertEqual(positions, sorted(positions))
-        for promoted in ("labels:", "httpRequest:", "operation:", "sourceLocation:",
-                         "spanId:", "trace:", "traceSampled:", "insertId:"):
-            self.assertIn(promoted, self.config)
-        for trusted in ("labels.host_id", "labels.incarnation", "labels.instance_id",
-                        "labels.environment", "labels.region", "labels.unit"):
-            self.assertIn(trusted, self.config)
-        for untrusted in ("jsonPayload.authorization", "jsonPayload.request_body",
-                          "jsonPayload.file_contents", "jsonPayload.command_payload",
-                          "jsonPayload.MESSAGE"):
-            self.assertIn(untrusted, self.config)
-        self.assertIn("metadata only", self.config)
-        self.assertIn("jsonPayload.level", self.config)
-        self.assertIn("labels.host_logging_heartbeat", self.config)
+        records = []
+        for scenario in (
+            "allowed_sources", "excluded_sources", "severity_filter",
+            "promoted_special_fields", "provenance_collision", "heartbeat_spoof",
+            "malformed_metadata_only", "valid_colliding_json", "approved_correlations",
+        ):
+            records.extend(self._run_selected_agent_fixture(scenario))
+
+        by_scenario = {record.get("fixture_scenario"): record for record in records}
+        self.assertIn("allowed_sources", by_scenario)
+        self.assertIn("malformed_metadata_only", by_scenario)
+        self.assertIn("excluded_sources", by_scenario)
+        malformed = by_scenario["malformed_metadata_only"]
+        labels = malformed.get("labels", {})
+        self.assertTrue(labels.get("parse_failure"), malformed)
+        self.assertIn("host_id", labels)
+        self.assertIn("incarnation", labels)
+        self.assertIn("journal_unit", labels)
+        self.assertNotIn("MESSAGE", malformed.get("jsonPayload", {}))
+        self.assertNotIn("raw_body", malformed)
+
+        self.assertEqual(by_scenario["excluded_sources"].get("exported"), False)
+        self.assertNotEqual(by_scenario["allowed_sources"].get("severity"), "DEBUG")
+        self.assertNotEqual(by_scenario["allowed_sources"].get("severity"), "TRACE")
+        for scenario in ("promoted_special_fields", "provenance_collision", "heartbeat_spoof"):
+            record = by_scenario[scenario]
+            self.assertNotIn("httpRequest", record)
+            self.assertNotIn("traceSampled", record)
+            self.assertNotIn("insertId", record)
+            self.assertNotEqual(record.get("labels", {}).get("host_id"), "spoofed")
 
     def test_selected_agent_buffer_budget(self):
-        variables = (ROOT / "infra/modules/host-logging/variables.tf").read_text()
-        module = (ROOT / "infra/modules/host-logging/main.tf").read_text()
-        readme = (ROOT / "infra/modules/host-logging/README.md").read_text()
-        self.assertIn('default     = "2.52.0"', variables)
-        self.assertIn("platform-managed", variables + readme + self.reconcile)
-        self.assertIn("disk-buffer", variables + readme + self.reconcile)
-        self.assertIn("accounting/compliance threshold", self.config + self.validate + self.reconcile)
-        self.assertIn("agent_buffer_bytes", module)
-        self.assertIn("agent_self_log_max_bytes", module)
-        self.assertIn("syslog_max_bytes", module)
-        self.assertIn("journal_max_use_bytes + storage_bytes", self.validate)
-        self.assertIn("journal_max_use_bytes + var.agent_buffer_bytes + var.agent_self_log_max_bytes + var.syslog_max_bytes", module)
-        self.assertNotIn("Buffer_Max_Size", self.config + self.reconcile)
-        self.assertIn("storage_scan_capped=1", self.validate)
-        self.assertIn('[ "$storage_scan_capped" -eq 0 ] || drift=1', self.validate)
-        self.assertIn('if [ "$storage_scan_capped" -ne 0 ]; then', self.reconcile)
-        self.assertIn("pending buffer state preserved", self.reconcile)
-        self.assertIn("activation_committed=1", self.reconcile)
+        records = self._run_selected_agent_fixture("buffer_budget")
+        self.assertEqual(len(records), 1, records)
+        report = records[0]
+        self.assertEqual(report.get("fixture_scenario"), "buffer_budget")
+        self.assertEqual(report.get("release"), self.selected_release)
+        self.assertGreater(report.get("active_output_count", 0), 0)
+        self.assertIn("logging", report.get("active_outputs", []))
+        self.assertIn("self_log", report.get("active_outputs", []))
+        self.assertIn("checkpoint", report.get("state_paths", []))
+        self.assertIn("retry", report.get("delivery_settings", {}))
+        self.assertNotIn("accounting_threshold", report.get("enforced_limits", {}))
+        limits = report.get("enforced_limits", {})
+        self.assertGreater(limits.get("aggregate_bytes", 0), 0)
+        self.assertGreaterEqual(report.get("terraform_reservation_bytes", 0),
+                                limits["aggregate_bytes"])
+        self.assertEqual(report.get("generator_sha256"), self._selected_agent_manifest()[1]["generator_sha256"])
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

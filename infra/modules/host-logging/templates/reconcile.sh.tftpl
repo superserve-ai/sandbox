@@ -42,7 +42,17 @@ old_package_version=''
 package_change_attempted=0
 package_stage_dir=''
 staged_agent=''
+staged_engine=''
+engine_generated_dir=''
+engine_fixture_logs=''
+engine_fixture_state=''
 storage_scan_result=''
+pretransition_installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
+if [ -z "$pretransition_installed_version" ] && [ ! -e "$config_path" ] && [ ! -e "$buffer_dir" ] && [ ! -e "$self_log_dir" ]; then
+  export SUPER_SERVE_FIRST_INSTALL=1
+else
+  unset SUPER_SERVE_FIRST_INSTALL
+fi
 rollback_package_dir=''
 rollback_package_deb=''
 activation_committed=0
@@ -51,7 +61,8 @@ rollback_in_progress=0
 journal_max_use_bytes=${journal_max_use_bytes}
 
 # OS Config runs this script only after validate returned 101.  The candidate
-# is rendered with the provider-bound identity on the host, then diagnosed
+# is rendered with the provider-bound identity on the host, then validated by
+# the packaged generation engine
 # before any working file is touched.
 test -s "$candidate_config_path"
 test -s "$identity_file"
@@ -67,7 +78,7 @@ install -d -m 0755 "$config_dir" "$(dirname "$journald_dropin")" \
 rendered_config=$(mktemp "$config_dir/.config.yaml.XXXXXX")
 cleanup() {
   rm -f "$rendered_config" "$dropin_candidate" "$logging_resource_candidate" "$agent_metrics_resource_candidate" "$metrics_resource_candidate" "$heartbeat_service_candidate" "$heartbeat_timer_candidate" "$agent_logrotate_candidate" "$syslog_logrotate_candidate" "$old_config" "$old_dropin" "$old_logging_resource" "$old_agent_metrics_resource" "$old_metrics_resource" "$old_heartbeat_service" "$old_heartbeat_timer" "$old_agent_logrotate" "$old_syslog_logrotate" "$storage_scan_result" 2>/dev/null || true
-  rm -rf "$package_stage_dir" "$rollback_package_dir" 2>/dev/null || true
+  rm -rf "$package_stage_dir" "$rollback_package_dir" "$engine_generated_dir" "$engine_fixture_logs" "$engine_fixture_state" 2>/dev/null || true
 }
 trap 'exit 143' INT TERM
 trap 'status=$?; cleanup; exit "$status"' EXIT
@@ -92,11 +103,24 @@ done
 
 # Validate with the selected release before changing an already-running
 # package.  When the selected version is not installed, download and extract
-# that package into a private staging directory and run its diagnose command;
+# that package into a private staging directory and run its packaged engine;
 # the active package and its delivery state remain untouched during this test.
+run_engine_validation() {
+  engine="$1"
+  input="$2"
+  rm -rf "$engine_generated_dir" "$engine_fixture_logs" "$engine_fixture_state" 2>/dev/null || true
+  engine_generated_dir=$(mktemp -d)
+  engine_fixture_logs=$(mktemp -d)
+  engine_fixture_state=$(mktemp -d)
+  timeout "${package_operation_timeout_seconds}s" "$engine" \
+    -in "$input" -service fluentbit -out "$engine_generated_dir" \
+    -logs "$engine_fixture_logs" -state "$engine_fixture_state" >/dev/null 2>&1
+}
+
 installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
 if [[ "$installed_version" == ${ops_agent_package_version}* ]] && command -v google-cloud-ops-agent >/dev/null 2>&1; then
-  timeout "${package_operation_timeout_seconds}s" google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1 || exit 1
+  test -x /opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine
+  run_engine_validation /opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine "$rendered_config" || exit 1
 else
   package_stage_dir=$(mktemp -d /tmp/superserve-host-logging-package.XXXXXX)
   if ! (cd "$package_stage_dir" && timeout "${package_operation_timeout_seconds}s" apt-get -o Acquire::Retries=2 download "google-cloud-ops-agent=${ops_agent_package_version}") >/dev/null 2>&1; then
@@ -107,8 +131,9 @@ else
   test -n "$package_deb"
   timeout "${package_operation_timeout_seconds}s" dpkg-deb --extract "$package_deb" "$package_stage_dir/root"
   staged_agent=$(find "$package_stage_dir/root" -name google-cloud-ops-agent -perm -u+x -print -quit)
-  test -n "$staged_agent"
-  timeout "${package_operation_timeout_seconds}s" "$staged_agent" diagnose --config="$rendered_config" >/dev/null 2>&1 || exit 1
+  staged_engine=$(find "$package_stage_dir/root" -name google_cloud_ops_agent_engine -perm -u+x -print -quit)
+  test -n "$staged_agent" -a -n "$staged_engine"
+  run_engine_validation "$staged_engine" "$rendered_config" || exit 1
 fi
 
 # Keep a local copy of the previously installed package before any dpkg
@@ -154,11 +179,20 @@ queue = [root]
 visited = 0
 bytes_total = 0
 capped = False
+allow_missing_first_install = kind in {"buffer", "self_log"} and os.environ.get("SUPER_SERVE_FIRST_INSTALL") == "1"
+try:
+    os.stat(root)
+except FileNotFoundError:
+    if allow_missing_first_install:
+        raise SystemExit(0)
+    raise SystemExit(2)
+except OSError:
+    raise SystemExit(2)
 while queue:
     current = queue.pop(0)
-    if not os.path.lexists(root):
-        if kind in {"buffer", "self_log"}:
-            continue
+    try:
+        os.stat(root)
+    except OSError:
         raise SystemExit(2)
     try:
         with os.scandir(current) as entries:
@@ -203,7 +237,10 @@ while read -r kind size capped; do
   esac
 done < "$storage_scan_result"
 [ "$seen_buffer" -eq 1 ] && [ "$seen_self_log" -eq 1 ] && [ "$seen_syslog" -eq 1 ] || exit 1
-[ "$storage_scan_capped" -eq 0 ] || logger -t superserve-host-logging -p warning "storage accounting reached its bounded entry cap; reconciliation will reclaim disposable files after activation"
+[ "$storage_scan_capped" -eq 0 ] || {
+  logger -t superserve-host-logging -p err "storage accounting is incomplete at the entry bound"
+  exit 1
+}
 if [ "$self_log_bytes" -gt ${agent_self_log_max_bytes} ]; then
   logger -t superserve-host-logging -p warning "Ops Agent self-log store exceeds ${agent_self_log_max_bytes} byte bound; disposable retention will be reclaimed after activation"
 fi
@@ -223,7 +260,7 @@ install -m 0644 "$journald_candidate_path" "$dropin_candidate"
 grep -Fq "SystemMaxUse=${journal_max_use_bytes}B" "$dropin_candidate"
 grep -Fq "SystemKeepFree=${journal_keep_free_bytes}B" "$dropin_candidate"
 
-# Ops Agent 2.52.0 documents platform-managed buffer protection but no numeric
+# The selected Ops Agent release documents platform-managed buffer protection but no numeric
 # configuration knob. The systemd drop-in bounds the logging and metrics
 # subagents; validate.sh accounts for observed buffer, self-log, and retained
 # syslog stores against a conservative reservation without claiming to set the
@@ -382,7 +419,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-# The package is staged and diagnosed before this transaction. Snapshot
+# The package is staged and validated before this transaction. Snapshot
 # service/configuration state above, then make the version change as
 # part of the same transaction so any activation failure can restore both the
 # previous package and its delivery state.
@@ -391,7 +428,7 @@ if [[ "$installed_version" != ${ops_agent_package_version}* ]] || ! command -v g
   if ! timeout "${package_operation_timeout_seconds}s" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o DPkg::Lock::Timeout=30 -o Acquire::Retries=2 "google-cloud-ops-agent=${ops_agent_package_version}"; then
     exit 1
   fi
-  if ! timeout "${package_operation_timeout_seconds}s" google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1; then
+  if ! run_engine_validation /opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine "$rendered_config"; then
     exit 1
   fi
 fi
@@ -515,11 +552,21 @@ limit = int(limit_text)
 queue = [root]
 visited = 0
 capped = False
+allow_missing_first_install = kind == "self_log" and os.environ.get("SUPER_SERVE_FIRST_INSTALL") == "1"
+try:
+    os.stat(root)
+except FileNotFoundError:
+    if allow_missing_first_install:
+        print(kind, 0, 0)
+        raise SystemExit(0)
+    raise SystemExit(2)
+except OSError:
+    raise SystemExit(2)
 while queue:
     current = queue.pop(0)
-    if not os.path.lexists(root):
-        if kind == "self_log":
-            raise SystemExit(0)
+    try:
+        os.stat(root)
+    except OSError:
         raise SystemExit(2)
     try:
         with os.scandir(current) as entries:
@@ -616,11 +663,21 @@ queue = [root]
 visited = 0
 bytes_total = 0
 capped = False
+allow_missing_first_install = kind in {"buffer", "self_log"} and os.environ.get("SUPER_SERVE_FIRST_INSTALL") == "1"
+try:
+    os.stat(root)
+except FileNotFoundError:
+    if allow_missing_first_install:
+        print(kind, 0, 0)
+        raise SystemExit(0)
+    raise SystemExit(2)
+except OSError:
+    raise SystemExit(2)
 while queue:
     current = queue.pop(0)
-    if not os.path.lexists(root):
-        if kind in {"buffer", "self_log"}:
-            continue
+    try:
+        os.stat(root)
+    except OSError:
         raise SystemExit(2)
     try:
         with os.scandir(current) as entries:
