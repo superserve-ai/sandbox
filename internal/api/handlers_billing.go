@@ -597,10 +597,18 @@ func (h *Handlers) GetBillingUsageSeries(c *gin.Context) {
 	}
 	for i, b := range buckets {
 		u := usageRows[i]
-		cpu, _ := numericFloat64(u.VcpuSeconds)
-		mem, _ := numericFloat64(u.MemoryGibSeconds)
-		storage, _ := numericFloat64(u.StorageGibSeconds)
-		payableStorage, _ := numericFloat64(u.BillableStorageGibSeconds)
+		cpu, cpuErr := numericFloat64(u.VcpuSeconds)
+		mem, memErr := numericFloat64(u.MemoryGibSeconds)
+		storage, storageErr := numericFloat64(u.StorageGibSeconds)
+		payableStorage, payableStorageErr := numericFloat64(u.BillableStorageGibSeconds)
+		if cpuErr != nil || memErr != nil {
+			respondError(c, ErrInternal)
+			return
+		}
+		if storageErr != nil || payableStorageErr != nil {
+			respondErrorMsg(c, "storage_unavailable", "Storage usage is temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		cpuState, cpuOK := resourceState["vcpu"]
 		memoryState, memoryOK := resourceState["memory_gib"]
 		storageState, storageOK := resourceState["storage_gib"]

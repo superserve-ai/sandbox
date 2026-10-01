@@ -284,7 +284,9 @@ compute_usage AS (
 	GROUP BY sp.team_id
 ),
 storage_usage AS (
- SELECT sp.team_id,storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS storage_mib_seconds
+ SELECT sp.team_id,
+        storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS storage_mib_seconds,
+        billable_storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS billable_storage_mib_seconds
  FROM selected_plans sp
 ),
 credits AS (
@@ -323,6 +325,7 @@ costed AS (
 		r.plan_name,
 		r.currency,
 		su.storage_mib_seconds,
+		su.billable_storage_mib_seconds,
 		ac.available_usd,
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
 		((cu.memory_mib_seconds / 1024.0) * r.memory_rate) AS memory_usd,
@@ -338,6 +341,9 @@ costed AS (
 			  OR (storage_billing_activated(sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
 			  OR (storage_billing_activated(sp.team_id) AND r.storage_rate IS NULL)
 			THEN 'pricing_unavailable'
+			WHEN su.storage_mib_seconds IS NULL
+			  OR (storage_billing_activated(sp.team_id) AND su.billable_storage_mib_seconds IS NULL)
+			THEN 'storage_unavailable'
 		END AS error_code
 	FROM selected_plans sp
 	LEFT JOIN rates r ON r.team_id = sp.team_id
@@ -407,7 +413,9 @@ response_rows AS (
 			) END,
 			'error', CASE WHEN error_code IS NOT NULL THEN jsonb_build_object(
 				'code', error_code,
-				'message', 'Billing pricing is not available for this team'
+				'message', CASE WHEN error_code = 'storage_unavailable'
+					THEN 'Storage usage is temporarily unavailable'
+					ELSE 'Billing pricing is not available for this team' END
 			) END
 		) AS value
 	FROM paged
@@ -543,7 +551,9 @@ compute_usage AS (
 	GROUP BY sp.team_id
 ),
 storage_usage AS (
- SELECT sp.team_id,storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS storage_mib_seconds
+ SELECT sp.team_id,
+        storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS storage_mib_seconds,
+        billable_storage_mib_seconds(sp.team_id,sp.period_start,LEAST(sp.calculated_at,sp.period_end)) AS billable_storage_mib_seconds
  FROM selected_plans sp
 ),
 credits AS (
@@ -582,6 +592,7 @@ costed AS (
 		r.plan_name,
 		r.currency,
 		su.storage_mib_seconds,
+		su.billable_storage_mib_seconds,
 		ac.available_usd,
 		(cu.vcpu_seconds * r.vcpu_rate) AS compute_usd,
 		((cu.memory_mib_seconds / 1024.0) * r.memory_rate) AS memory_usd,
@@ -597,6 +608,9 @@ costed AS (
 			  OR (storage_billing_activated(sp.team_id) AND COALESCE(r.storage_rate_count, 0) <> 1)
 			  OR (storage_billing_activated(sp.team_id) AND r.storage_rate IS NULL)
 			THEN 'pricing_unavailable'
+			WHEN su.storage_mib_seconds IS NULL
+			  OR (storage_billing_activated(sp.team_id) AND su.billable_storage_mib_seconds IS NULL)
+			THEN 'storage_unavailable'
 		END AS error_code
 	FROM selected_plans sp
 	LEFT JOIN rates r ON r.team_id = sp.team_id
@@ -659,7 +673,9 @@ response_rows AS (
 			) END,
 			'error', CASE WHEN error_code IS NOT NULL THEN jsonb_build_object(
 				'code', error_code,
-				'message', 'Billing pricing is not available for this team'
+				'message', CASE WHEN error_code = 'storage_unavailable'
+					THEN 'Storage usage is temporarily unavailable'
+					ELSE 'Billing pricing is not available for this team' END
 			) END
 		) AS value
 	FROM paged

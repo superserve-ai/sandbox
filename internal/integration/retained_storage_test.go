@@ -633,6 +633,10 @@ func TestRetainedStorageConsumerParity(t *testing.T) {
 			insert(first, mid, end, `[{"device":"fs","start":0,"length":1073741824}]`)
 		}
 		insert(second, start, end, `[{"device":"fs","start":0,"length":1073741824},{"device":"fs","start":2147483648,"length":536870912}]`)
+		// An accepted empty extent set is an explicit measured zero, not an
+		// unresolved observation. It must not turn the surrounding numeric
+		// consumer results into unknown.
+		insert(uuid.New(), start, end, `[]`)
 	}
 	for i, tc := range []struct {
 		want, secondBucket float64
@@ -737,6 +741,46 @@ func TestRetainedStorageConsumerParity(t *testing.T) {
 				}
 			}
 		})
+	}
+
+	// Exercise the real tenant and platform consumers with an unresolved
+	// full-copy baseline. Both must preserve unknown rather than emitting a
+	// successful numeric zero; the measured-zero controls above remain valid.
+	unknownTeam, unknownKey := seedTeamAndKey(t)
+	seedPlatformBillingRatesForTest(t, ctx, unknownTeam, "retained-unknown-"+uuid.NewString(), start.Add(-time.Hour))
+	exec(t, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'tenant_usage_dashboard',true) ON CONFLICT(team_id,key) DO UPDATE SET enabled=true`, unknownTeam)
+	if _, err := testQueries.CreateHost(ctx, db.CreateHostParams{
+		ID: host, VmdAddr: "192.0.2.2:50051", ProxyAddr: "192.0.2.2:5007",
+		Region: "example-region", CapacityMemoryMib: 1024, CapacityVcpus: 2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	templateID, unknownSandbox := uuid.New(), uuid.New()
+	if _, err := testPool.Exec(ctx, `INSERT INTO template(id,team_id,name,status,build_spec,rootfs_path,snapshot_path,mem_path,vcpu,memory_mib,disk_mib)
+ VALUES($1,$2,'unknown-baseline','ready','{}'::jsonb,'/example/unknown/rootfs.ext4','/example/unknown/vmstate.snap','/example/unknown/mem.snap',1,1024,1)`, templateID, unknownTeam); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at,template_id)
+ VALUES($1,$2,'unknown-baseline','paused',$3,1,1024,1,$4,$5)`, unknownSandbox, unknownTeam, host, start, templateID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at)
+ VALUES($1,$2,$3,0,$4)`, unknownSandbox, unknownTeam, host, start); err != nil {
+		t.Fatal(err)
+	}
+	router := newBillingRouter(t, nil)
+	seriesResponse := do(router, http.MethodGet, "/billing/usage-series?start="+start.Format(time.RFC3339)+"&end="+end.Format(time.RFC3339)+"&granularity=hour&timezone=UTC", unknownKey, "")
+	if seriesResponse.Code != http.StatusServiceUnavailable || !strings.Contains(seriesResponse.Body.String(), "storage_unavailable") {
+		t.Fatalf("unknown storage series response = %d %s, want storage_unavailable", seriesResponse.Code, seriesResponse.Body.String())
+	}
+	admin := seedPlatformAdminProfile(t)
+	platformResponse := doInternal(newInternalRouterWithNow(t, func() time.Time { return end }), http.MethodGet, "/internal/billing?search="+unknownTeam.String(), admin.String(), "")
+	if platformResponse.Code != http.StatusOK {
+		t.Fatalf("unknown storage platform response = %d %s", platformResponse.Code, platformResponse.Body.String())
+	}
+	platformBody := decodePlatformBilling(t, platformResponse.Body.Bytes())
+	if len(platformBody.Rows) != 1 || platformBody.Rows[0].Error == nil || platformBody.Rows[0].Error.Code != "storage_unavailable" {
+		t.Fatalf("unknown storage platform row = %+v, want storage_unavailable error", platformBody.Rows)
 	}
 }
 
@@ -1093,30 +1137,72 @@ func TestRetainedStorageBaselineProvenance(t *testing.T) {
 }
 
 func TestRetainedStorageBaselineReconciliationPlan(t *testing.T) {
-	f := newStorageReportFixture(t, "paused", false)
-	ctx := t.Context()
-	team := sandboxTeamID(t, f.sandboxID)
-	start := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
-	end := start.Add(4 * time.Minute)
-	if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_interval(host_id,team_id,owner_kind,owner_id,generation,extents,started_at,ended_at)
- VALUES($1,$2,'sandbox',$3,$4,'[{"device":"fs","start":0,"length":1048576}]',$5,$6)`, f.hostID, team, f.sandboxID, strings.Repeat("c", 64), start, end); err != nil {
-		t.Fatal(err)
-	}
-	var quantity float64
-	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, start, end).Scan(&quantity); err != nil {
-		t.Fatal(err)
-	}
-	want := end.Sub(start).Seconds()
-	if math.Abs(quantity-want) > 0.0001 {
-		t.Fatalf("reconciliation quantity = %v, want independent oracle %v", quantity, want)
-	}
-	var plan []byte
-	if err := testPool.QueryRow(ctx, `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
- SELECT storage_mib_seconds($1,$2,$3,false)`, team, start, end).Scan(&plan); err != nil {
-		t.Fatal(err)
-	}
-	planText := string(plan)
-	if !strings.Contains(planText, `"Plan"`) || !strings.Contains(planText, `"Actual Loops"`) || !strings.Contains(planText, `"Shared Read Blocks"`) {
-		t.Fatalf("canonical reconciliation plan omitted loop/buffer evidence: %s", planText)
+	for _, scale := range []int{1, 4} {
+		t.Run(fmt.Sprintf("owners-%d", scale), func(t *testing.T) {
+			f := newStorageReportFixture(t, "paused", false)
+			ctx := t.Context()
+			team := sandboxTeamID(t, f.sandboxID)
+			start := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
+			first := start.Add(60 * time.Second)
+			second := start.Add(120 * time.Second)
+			end := start.Add(180 * time.Second)
+			gen := func(ch byte) string { return strings.Repeat(string(ch), 64) }
+			insertRetained := func(host string, owner uuid.UUID, generation, path string, from, to time.Time, device string, offset, length int64) {
+				t.Helper()
+				if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_interval
+ (host_id,team_id,owner_kind,owner_id,generation,extents,baseline_path,baseline_generation,baseline_allocated_bytes,started_at,ended_at)
+ VALUES($1,$2,'sandbox',$3,$4,$5::jsonb,$6,$7,$8,$9,$10)`, host, team, owner, generation,
+					fmt.Sprintf(`[{"device":%q,"start":%d,"length":%d}]`, device, offset, length), path, generation, length, from, to); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A and B share one physical baseline; C is a distinct generation on
+			// the same host; D is a separate host. The private rows scale the
+			// input cardinality without changing the shared-reference semantics.
+			insertRetained(f.hostID, uuid.New(), gen('a'), "/example/baseline-a", start, end, "fs", 0, 1<<20)
+			insertRetained(f.hostID, uuid.New(), gen('b'), "/example/baseline-a", first, end, "fs", 0, 1<<20)
+			insertRetained(f.hostID, uuid.New(), gen('c'), "/example/baseline-c", first, second, "fs", 2<<20, 1<<20)
+			insertRetained(f.hostID+"-other", uuid.New(), gen('d'), "/example/baseline-d", start, end, "fs", 0, 512<<10)
+			for i := 0; i < scale; i++ {
+				insertRetained(f.hostID, uuid.New(), fmt.Sprintf("%064x", i+100), fmt.Sprintf("/example/private-%d", i), first, second, fmt.Sprintf("private-%d", i), 0, 1<<20)
+			}
+			// Legacy overlay rows exercise the mixed-source bridge. Their expected
+			// contribution is independent of the retained extent union below.
+			legacyOwner := uuid.New()
+			if _, err := testPool.Exec(ctx, `INSERT INTO sandbox(id,team_id,name,status,host_id,vcpu_count,memory_mib,disk_mib,created_at)
+ VALUES($1,$2,$3,'paused',$4,1,1024,3,$5)`, legacyOwner, team, "legacy-baseline", f.hostID, start); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := testPool.Exec(ctx, `INSERT INTO sandbox_storage_interval(sandbox_id,team_id,host_id,disk_mib,started_at,ended_at,end_reason)
+ VALUES($1,$2,$3,2,$4,$5,'deleted'),($6,$2,$3,3,$4,$5,'deleted')`, f.sandboxID, team, f.hostID, start, end, legacyOwner); err != nil {
+				t.Fatal(err)
+			}
+			var quantity float64
+			if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, start, end).Scan(&quantity); err != nil {
+				t.Fatal(err)
+			}
+			// Legacy overlays: (2+3) MiB * 180s. Retained union: host one
+			// contributes 1 MiB * 180s + 1 MiB * 60s plus scale private MiB *
+			// 60s; the second host contributes 0.5 MiB * 180s.
+			want := 5*180 + 180 + 60 + float64(scale)*60 + 0.5*180
+			if math.Abs(quantity-want) > 0.0001 {
+				t.Fatalf("reconciliation quantity = %v, want independent oracle %v", quantity, want)
+			}
+
+			var plan []byte
+			if err := testPool.QueryRow(ctx, `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+ SELECT host_id, count(*) AS interval_count,
+        sum(jsonb_array_length(extents)) AS extent_count
+ FROM retained_storage_interval
+ WHERE team_id=$1 AND started_at<$3 AND COALESCE(ended_at,$3)>$2
+ GROUP BY host_id`, team, start, end).Scan(&plan); err != nil {
+				t.Fatal(err)
+			}
+			planText := string(plan)
+			if !strings.Contains(planText, `"Plan"`) || !strings.Contains(planText, `"Actual Rows"`) || !strings.Contains(planText, `"Actual Loops"`) || !strings.Contains(planText, `"Shared Read Blocks"`) {
+				t.Fatalf("reconciliation input plan omitted cardinality/loop/buffer evidence: %s", planText)
+			}
+			t.Logf("reconciliation scale=%d expected_mib_seconds=%.2f plan=%s", scale, want, planText)
+		})
 	}
 }
