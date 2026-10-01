@@ -120,8 +120,10 @@ For signer interoperability, the Console producer test can write fresh request
 fixtures to `PROMOTION_ASSERTION_FIXTURE_OUT`. Run
 `TestPromotionAccountConsoleInterop` with `PROMOTION_ASSERTION_FIXTURE_IN` pointing
 to that file within five minutes. It passes the actual Console assertions through
-the backend middleware and handler identity checks for all three operations,
-including matching forged actor/body IDs. The fixture contains a generated test
+the backend middleware and handler identity checks for all four operations:
+bind, evidence, register, and create-team. Three-operation fixtures are rejected.
+Checks include forged actor headers and matching forged actor/body IDs, plus
+mutated creation attempt, team, region, and decision fields. The fixture contains a generated test
 public key and assertions, never a private key or real account evidence. This
 test skips without the fixture; an ordinary backend suite pass is not evidence
 that the cross-runtime check ran. Record both producer and verifier execution.
@@ -184,15 +186,18 @@ eligibility.
 ### Register-signup provenance, errors, and recovery
 
 The `register-signup` caller may sign only the account and attempt returned by
-the actual newly created Auth account, or by an independently authorized,
-durable continuation of that same original signup. A browser cookie, attempt
-ID, user ID, or other client locator is untrusted input. Ordinary login and a
-shared-Auth evidence lookup can validate a retained `(user, attempt)` pair,
-but neither can create signup provenance or authorize a new assertion. If the
-trusted continuation is unavailable, stop publication rather than minting an
-assertion from a replacement attempt or a later login. An uncertain bind must
-first recover the original bind; after that, retries may use only the original
-account/attempt tuple.
+the actual newly created Auth account while the original trusted signup
+context remains available. A browser cookie, attempt ID, user ID, or other
+client locator is untrusted input. Ordinary login and a shared-Auth evidence
+lookup can validate a retained `(user, attempt)` pair, but neither can create
+signup provenance or authorize a new assertion. If the trusted signup context
+is unavailable, stop publication rather than minting an assertion from a
+replacement attempt or a later login. An uncertain bind must first recover
+the original bind; after that, retries may use only the original
+account/attempt tuple. If association fails or its outcome cannot be safely
+established after context loss, preserve the account and normal paid access
+and withhold promotional credit; no durable continuation or recovery workflow
+is required.
 
 The route returns `200 {"outcome":"owner"}` or
 `200 {"outcome":"owner_conflict"}` only after the East regional commit.
@@ -211,9 +216,11 @@ The route never creates a team, grant, entitlement, balance, or redemption.
 Deploy the additive backend and its public-key configuration before deploying
 the matching signup consumer. Before exposing the flow, consumer tests and
 separately authorized staging verification must demonstrate actual-new-account
-provenance, durable continuation and recovery of the original tuple, retry
-after response loss, rejection of ordinary-login substitution, and independent
-East/West behavior. Keep publication stopped until those checks pass.
+provenance, exact-tuple retry while trusted context remains, response-loss
+handling, rejection of ordinary-login substitution, fail-closed behavior after
+context loss, and independent East/West behavior. No durable continuation or
+recovery workflow is required. Keep publication stopped until those checks
+pass.
 
 The control-plane routes above invoke the following shared Auth operations:
 
@@ -439,8 +446,9 @@ policy-row lock across explicit team creation and legacy owner assignment.
 RPC/table access and preservation of unrelated grant-error retries.
 
 Run these tests against the resulting backend revision before rollout. The
-existing Console fixture covers bind/evidence/register only; its pass does not
-prove the creation boundary works end to end. Console must also implement and
+historical bind/evidence/register-only fixtures do not prove the creation
+boundary works end to end. The interoperability verifier now requires the
+signed create-team fixture above. Console must also implement and
 verify the creation call sequence and signed fields above, including failure
 with prior evidence and replay after authority recovers. Enforcement stays off
 until that selected region's consumer and backend validation are recorded.
