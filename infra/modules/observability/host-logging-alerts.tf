@@ -61,7 +61,7 @@ resource "google_monitoring_alert_policy" "host_logging_export_failures" {
   conditions {
     display_name = "Ops Agent export errors on ${each.value.instance_name}"
     condition_matched_log {
-      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"ops_agent_self_log_files\") AND (severity>=ERROR OR jsonPayload.message =~ \"(?i)(failed to flush chunk|exporting failed|permission denied|drop|dropped)\")"
+      filter = "resource.type=\"gce_instance\" AND resource.labels.instance_id=\"${each.value.instance_id}\" AND log_id(\"ops_agent_self_log_files\") AND jsonPayload.message =~ \"(?i)(failed to flush chunk|exporting failed|permission denied|\\bdrop\\b|\\bdropped\\b)\""
     }
   }
 
