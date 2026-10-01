@@ -1122,37 +1122,135 @@ func (r *Reconciler) retireArchivedOrphans(ctx context.Context, now time.Time, d
 		if !r.gracePeriodElapsed("archived-orphan:"+id, now) {
 			continue
 		}
-		// Do not retire metadata while an owner-specific retained dependency is
-		// still present. BasePath, BaseMemPath, and RootfsPath are shared
-		// template generations: disk reclamation quarantines only the owner's
-		// UUID directory and must not wait for a surviving owner's shared files
-		// to disappear. Inspection failures remain retryable and preserve the
-		// archive.
-		paths := []string{rec.DiskPath, rec.SnapshotPath, rec.MemFilePath}
-		paths = append(paths, rec.StrandedOverlays...)
-		present, inspectFailed := false, false
-		for _, path := range paths {
-			if path == "" {
-				continue
-			}
-			_, statErr := os.Lstat(path)
-			switch {
-			case statErr == nil:
-				present = true
-			case !os.IsNotExist(statErr):
-				inspectFailed = true
-			}
-		}
-		if present || inspectFailed {
+		// Lifecycle operations and this cleanup use the same per-owner lock. A
+		// pass-level archive snapshot is not sufficient: a replacement can be
+		// persisted after the scan and before retirement.
+		unlockOp, ok := r.mgr.tryLockVMOp(id)
+		if !ok {
 			continue
 		}
-		if err := r.mgr.state.RetireRetainingStorage(id); err != nil {
-			log.Warn().Err(err).Str("vm_id", id).Msg("archived retained-owner retirement failed — retrying")
-			continue
-		}
-		r.clearDrift("archived-orphan:" + id)
-		log.Warn().Str("vm_id", id).Msg("retired archived retained owner after authoritative orphan confirmation")
+		func() {
+			defer unlockOp()
+			// Re-check all cheap authorities after taking the lock. The control
+			// plane snapshot is immutable for this pass, while the local live
+			// record catches a replacement that raced the archive scan.
+			if _, ok := dbSandboxes[id]; ok || active[id] {
+				return
+			}
+			if _, ok := recentSet[id]; ok {
+				return
+			}
+			if r.mgr.trackedInstance(id) != nil {
+				return
+			}
+			live, getErr := r.mgr.state.Get(id)
+			if getErr != nil {
+				log.Warn().Err(getErr).Str("vm_id", id).Msg("archived retained-owner recheck failed — leaving metadata for retry")
+				return
+			}
+			if live != nil {
+				return
+			}
+
+			// Do not retire metadata while an owner-private retained dependency is
+			// still present. Template and saved-snapshot generations are shared
+			// dependencies; their vmstate/memory paths may remain after this
+			// owner is gone and must not hold the archive indefinitely. Unknown
+			// paths are treated conservatively as private dependencies.
+			paths := r.archivedOwnerPrivatePaths(rec)
+			present, inspectFailed := false, false
+			for _, path := range paths {
+				if path == "" {
+					continue
+				}
+				_, statErr := os.Lstat(path)
+				switch {
+				case statErr == nil:
+					present = true
+				case !os.IsNotExist(statErr):
+					inspectFailed = true
+				}
+			}
+			if present || inspectFailed {
+				return
+			}
+			retired, retireErr := r.mgr.state.RetireArchivedRecordIfUnchanged(rec)
+			if retireErr != nil {
+				log.Warn().Err(retireErr).Str("vm_id", id).Msg("archived retained-owner retirement failed — retrying")
+				return
+			}
+			if !retired {
+				// A concurrent replacement or an already-completed retry won the
+				// conditional transaction. Leave all live projections intact.
+				return
+			}
+			r.clearDrift("archived-orphan:" + id)
+			log.Warn().Str("vm_id", id).Msg("retired archived retained owner after authoritative orphan confirmation")
+		}()
 	}
+}
+
+// archivedOwnerPrivatePaths returns only dependencies whose path provenance
+// identifies this owner's managed directory. Template and saved-snapshot
+// roots are shared generations, so their snapshot/vmstate and memory files do
+// not prevent retirement after the owner's private directory is quarantined.
+func (r *Reconciler) archivedOwnerPrivatePaths(rec VMRecord) []string {
+	owner := rec.RunDirID
+	if owner == "" {
+		owner = rec.ID
+	}
+	if !isLeafName(owner) || isReservedRunDirName(owner) || !isLeafName(rec.ID) {
+		return []string{rec.DiskPath, rec.SnapshotPath, rec.MemFilePath}
+	}
+	privateRoots := []string{
+		filepath.Join(r.mgr.cfg.RunDir, owner),
+		filepath.Join(r.mgr.cfg.SnapshotDir, rec.ID),
+	}
+	sharedRoots := []string{
+		filepath.Join(r.mgr.cfg.RunDir, templateDirName),
+		filepath.Join(r.mgr.cfg.RunDir, TemplatesDirName),
+		filepath.Join(r.mgr.cfg.SnapshotDir, TemplatesDirName),
+		filepath.Join(r.mgr.cfg.SnapshotDir, SavedSnapshotsDirName),
+	}
+	candidates := append([]string{rec.DiskPath, rec.SnapshotPath, rec.MemFilePath}, rec.StrandedOverlays...)
+	paths := make([]string, 0, len(candidates))
+	for _, path := range candidates {
+		if path == "" {
+			continue
+		}
+		private := false
+		for _, root := range privateRoots {
+			if pathWithinManagedRoot(path, root) {
+				private = true
+				break
+			}
+		}
+		if private {
+			paths = append(paths, path)
+			continue
+		}
+		shared := false
+		for _, root := range sharedRoots {
+			if pathWithinManagedRoot(path, root) {
+				shared = true
+				break
+			}
+		}
+		if !shared {
+			// A path outside a validated managed root has no trustworthy shared
+			// provenance. Keep the cleanup fail-closed for that dependency.
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
+func pathWithinManagedRoot(path, root string) bool {
+	if path == "" || root == "" || !filepath.IsAbs(path) || !filepath.IsAbs(root) {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // reclaimDiskOrphans quarantine-moves orphan dirs to <root>/.trash/<date>/<uuid>

@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,8 @@ import (
 	"github.com/superserve-ai/sandbox/internal/retainedstorage"
 	bolt "go.etcd.io/bbolt"
 )
+
+var errRetainedArchiveChanged = errors.New("retained archive changed before retirement")
 
 // State provides durable local persistence for VM instance metadata.
 // It is a cache — systemd is the ground truth for liveness, the control
@@ -721,6 +724,46 @@ func (s *StateStore) DeleteRetainedRecord(vmID string) error {
 		}
 		return bucket.Delete([]byte(vmID))
 	})
+}
+
+// RetireArchivedRecordIfUnchanged removes only an archived dependency after
+// the caller has confirmed authoritative owner termination. The archive is
+// compared inside the same Bolt transaction that checks for a live record, so
+// a replacement generation cannot be removed by a stale reconciliation pass.
+// Live indexes and preview policy are deliberately untouched: a live record
+// wins discovery and owns those projections.
+func (s *StateStore) RetireArchivedRecordIfUnchanged(expected VMRecord) (bool, error) {
+	retired := false
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		key := []byte(expected.ID)
+		if live := tx.Bucket(bucketName); live != nil && live.Get(key) != nil {
+			return errRetainedArchiveChanged
+		}
+		archive := tx.Bucket(retainedRecordBucketName)
+		if archive == nil {
+			return nil
+		}
+		data := archive.Get(key)
+		if data == nil {
+			return nil
+		}
+		var current VMRecord
+		if err := json.Unmarshal(data, &current); err != nil {
+			return err
+		}
+		if !sameRetainedGeneration(expected, current) {
+			return errRetainedArchiveChanged
+		}
+		if err := archive.Delete(key); err != nil {
+			return err
+		}
+		retired = true
+		return nil
+	})
+	if errors.Is(err, errRetainedArchiveChanged) {
+		return false, nil
+	}
+	return retired, err
 }
 
 func (s *StateStore) retainedArchivedRecords() ([]VMRecord, error) {
