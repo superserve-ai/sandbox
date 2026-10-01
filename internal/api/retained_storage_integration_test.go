@@ -899,8 +899,46 @@ func TestIntegration_RetainedActivationReceiptAtomicity(t *testing.T) {
 		if _, err := f.pool.Exec(ctx, `INSERT INTO team_feature_flag(team_id,key,enabled) VALUES($1,'billing_metrics_write',true)`, team); err != nil {
 			t.Fatal(err)
 		}
+		// The production migration stamps sandbox_storage_interval.host_id in a
+		// BEFORE INSERT trigger. Temporary tables do not inherit that trigger, so
+		// attach the migrated function here to exercise the real handoff path.
+		if _, err := f.pool.Exec(ctx, `CREATE TRIGGER stamp_sandbox_storage_interval_host
+			BEFORE INSERT ON pg_temp.sandbox_storage_interval FOR EACH ROW
+			EXECUTE FUNCTION public.stamp_sandbox_storage_interval_host()`); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := f.pool.Exec(ctx, `UPDATE sandbox_storage_interval SET host_id='source-legacy-host'`); err != nil {
 			t.Fatal(err)
+		}
+		var sourceOpen, retained, cutovers, obligations, future int
+		var ownerHost string
+		var createdAt, destroyedAt *time.Time
+		if err := f.pool.QueryRow(ctx, `
+			SELECT
+			 (SELECT count(*) FROM sandbox_storage_interval WHERE sandbox_id=$1 AND host_id='source-legacy-host' AND ended_at IS NULL),
+			 (SELECT count(*) FROM retained_storage_interval),
+			 (SELECT count(*) FROM retained_storage_cutover),
+			 (SELECT count(*) FROM retained_storage_measurement_obligation),
+			 (SELECT count(*) FROM sandbox_storage_interval WHERE sandbox_id=$1 AND started_at>$2),
+			 (SELECT host_id FROM sandbox WHERE id=$1),
+			 (SELECT created_at FROM sandbox WHERE id=$1),
+			 (SELECT destroyed_at FROM sandbox WHERE id=$1)`, f.sandboxID, receipt).Scan(
+			&sourceOpen, &retained, &cutovers, &obligations, &future,
+			&ownerHost, &createdAt, &destroyedAt); err != nil {
+			t.Fatal(err)
+		}
+		if sourceOpen != 1 || retained != 0 || cutovers != 0 || obligations != 0 || future != 0 {
+			t.Fatalf("invalid isolated legacy handoff state: source_open=%d retained=%d cutovers=%d obligations=%d future=%d", sourceOpen, retained, cutovers, obligations, future)
+		}
+		if ownerHost != f.hostID || createdAt == nil || createdAt.After(receipt) || destroyedAt != nil {
+			t.Fatalf("destination owner is not receipt-time eligible: host=%q created_at=%v destroyed_at=%v", ownerHost, createdAt, destroyedAt)
+		}
+		var gate bool
+		if err := f.pool.QueryRow(ctx, `SELECT enabled FROM team_feature_flag WHERE team_id=$1 AND key='billing_metrics_write'`, team).Scan(&gate); err != nil {
+			t.Fatal(err)
+		}
+		if !gate {
+			t.Fatal("legacy handoff feature gate is disabled")
 		}
 		if _, err := f.pool.Exec(ctx, `UPDATE host_storage_report SET state='processing',next_measurement_index=0 WHERE report_id=$1`, f.reportID); err != nil {
 			t.Fatal(err)
@@ -908,17 +946,41 @@ func TestIntegration_RetainedActivationReceiptAtomicity(t *testing.T) {
 		if err := applyStorageReport(ctx, f.pool, f.hostID, f.incarnationID, f.reportID, 2, receipt, f.measurements, 1, 1); err != nil {
 			t.Fatal(err)
 		}
-		var sourceEnded, destinationStarted time.Time
-		if err := f.pool.QueryRow(ctx, `SELECT ended_at FROM sandbox_storage_interval
- WHERE sandbox_id=$1 AND host_id='source-legacy-host'`, f.sandboxID).Scan(&sourceEnded); err != nil {
+		var rows int
+		if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM sandbox_storage_interval WHERE sandbox_id=$1`, f.sandboxID).Scan(&rows); err != nil {
 			t.Fatal(err)
 		}
-		if err := f.pool.QueryRow(ctx, `SELECT started_at FROM sandbox_storage_interval
- WHERE sandbox_id=$1 AND host_id=$2 AND ended_at IS NULL`, f.sandboxID, f.hostID).Scan(&destinationStarted); err != nil {
+		if rows != 2 {
+			t.Fatalf("legacy handoff wrote %d rows, want exactly two", rows)
+		}
+		var sourceEnded time.Time
+		var sourceDisk int
+		var sourceReason string
+		if err := f.pool.QueryRow(ctx, `SELECT ended_at,disk_mib,end_reason FROM sandbox_storage_interval
+		 WHERE sandbox_id=$1 AND host_id='source-legacy-host'`, f.sandboxID).Scan(&sourceEnded, &sourceDisk, &sourceReason); err != nil {
 			t.Fatal(err)
 		}
-		if !sourceEnded.Equal(receipt) || !destinationStarted.Equal(receipt) {
-			t.Fatalf("legacy handoff boundaries: source ended=%s destination started=%s receipt=%s", sourceEnded, destinationStarted, receipt)
+		if sourceDisk != 8 || sourceReason != "reassigned" || !sourceEnded.Equal(receipt) {
+			t.Fatalf("legacy source boundary: disk=%d ended=%s reason=%q receipt=%s", sourceDisk, sourceEnded, sourceReason, receipt)
+		}
+		var destinationStarted time.Time
+		var destinationHost string
+		var destinationTeam uuid.UUID
+		var destinationDisk int
+		if err := f.pool.QueryRow(ctx, `SELECT started_at,host_id,team_id,disk_mib FROM sandbox_storage_interval
+			WHERE sandbox_id=$1 AND host_id=$2 AND ended_at IS NULL`, f.sandboxID, f.hostID).Scan(&destinationStarted, &destinationHost, &destinationTeam, &destinationDisk); err != nil {
+			t.Fatal(err)
+		}
+		if destinationHost != f.hostID || destinationTeam != team || destinationDisk != 16 || !destinationStarted.Equal(receipt) {
+			t.Fatalf("legacy destination: host=%q team=%s disk=%d started=%s receipt=%s", destinationHost, destinationTeam, destinationDisk, destinationStarted, receipt)
+		}
+		var state string
+		var cursor int
+		if err := f.pool.QueryRow(ctx, `SELECT state,next_measurement_index FROM host_storage_report WHERE report_id=$1`, f.reportID).Scan(&state, &cursor); err != nil {
+			t.Fatal(err)
+		}
+		if state != "processed" || cursor != 1 {
+			t.Fatalf("legacy handoff report completion: state=%q cursor=%d", state, cursor)
 		}
 	})
 }
