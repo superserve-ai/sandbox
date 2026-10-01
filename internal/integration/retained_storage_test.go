@@ -356,47 +356,7 @@ func TestRetainedStorageReceiptReplacementAndLegacyIsolation(t *testing.T) {
 		t.Fatalf("legacy receipt: %d", w.Code)
 	}
 	waitStorageReportState(t, legacy, "processed")
-	missing := uuid.New()
-	post(missing, []retainedstorage.Owner{}, http.StatusCreated)
-	waitStorageReportState(t, missing, "pending", "retry_exhausted")
-	var missingState string
-	var retainedPayload []byte
-	if err := testPool.QueryRow(ctx, `SELECT state,payload FROM host_storage_report WHERE report_id=$1`, missing).Scan(&missingState, &retainedPayload); err != nil {
-		t.Fatal(err)
-	}
-	if missingState != "pending" && missingState != "retry_exhausted" {
-		t.Fatalf("incomplete retained report became terminal: %q", missingState)
-	}
-	if len(retainedPayload) == 0 {
-		t.Fatal("retryable incomplete retained report discarded its payload")
-	}
-	// Retry exhaustion is still an unresolved durable fence, not a successful
-	// zero. Simulate the bounded backoff reaching its terminal retry marker
-	// without mutating the immutable payload.
-	if _, err := testPool.Exec(ctx, `UPDATE host_storage_report SET state='retry_exhausted' WHERE report_id=$1`, missing); err != nil {
-		t.Fatal(err)
-	}
-	var complete bool
-	if err := testPool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, b.Add(time.Minute)).Scan(&complete); err != nil {
-		t.Fatal(err)
-	}
-	if complete {
-		t.Fatal("retry-exhausted incomplete retained report released settlement fence")
-	}
-	var retainedPayloadAfter []byte
-	if err := testPool.QueryRow(ctx, `SELECT payload FROM host_storage_report WHERE report_id=$1`, missing).Scan(&retainedPayloadAfter); err != nil {
-		t.Fatal(err)
-	}
-	if string(retainedPayloadAfter) != string(retainedPayload) {
-		t.Fatal("retry-exhausted retained report payload changed")
-	}
 	var active int
-	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval WHERE owner_id=$1 AND ended_at IS NULL AND generation=$2`, f.sandboxID, owner.Generation).Scan(&active); err != nil {
-		t.Fatal(err)
-	}
-	if active != 1 {
-		t.Fatal("legacy or incomplete observation changed retained allocation")
-	}
 	var cpu, memory, storage float64
 	if err := testPool.QueryRow(ctx, billing.ExportRemeasurementSQL, team, a, b).Scan(&cpu, &memory, &storage); err != nil {
 		t.Fatal(err)
@@ -432,6 +392,49 @@ func TestRetainedStorageReceiptReplacementAndLegacyIsolation(t *testing.T) {
 	}
 	if zeroGeneration != owner.Generation || string(zeroExtents) != "[]" {
 		t.Fatalf("explicit zero interval = generation %q extents %s", zeroGeneration, zeroExtents)
+	}
+	// Keep the intentionally incomplete report after the valid replacement. The
+	// processor preserves receipt order, so placing it first would correctly
+	// fence the later zero rather than expose a supersession policy in the test.
+	missing := uuid.New()
+	post(missing, []retainedstorage.Owner{}, http.StatusCreated)
+	waitStorageReportState(t, missing, "pending", "retry_exhausted")
+	var missingState string
+	var retainedPayload []byte
+	if err := testPool.QueryRow(ctx, `SELECT state,payload FROM host_storage_report WHERE report_id=$1`, missing).Scan(&missingState, &retainedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if missingState != "pending" && missingState != "retry_exhausted" {
+		t.Fatalf("incomplete retained report became terminal: %q", missingState)
+	}
+	if len(retainedPayload) == 0 {
+		t.Fatal("retryable incomplete retained report discarded its payload")
+	}
+	// Retry exhaustion is still an unresolved durable fence, not a successful
+	// zero. Simulate the bounded backoff reaching its terminal retry marker
+	// without mutating the immutable payload.
+	if _, err := testPool.Exec(ctx, `UPDATE host_storage_report SET state='retry_exhausted' WHERE report_id=$1`, missing); err != nil {
+		t.Fatal(err)
+	}
+	var complete bool
+	if err := testPool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, b.Add(time.Minute)).Scan(&complete); err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("retry-exhausted incomplete retained report released settlement fence")
+	}
+	var retainedPayloadAfter []byte
+	if err := testPool.QueryRow(ctx, `SELECT payload FROM host_storage_report WHERE report_id=$1`, missing).Scan(&retainedPayloadAfter); err != nil {
+		t.Fatal(err)
+	}
+	if string(retainedPayloadAfter) != string(retainedPayload) {
+		t.Fatal("retry-exhausted retained report payload changed")
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval WHERE owner_id=$1 AND ended_at IS NULL AND generation=$2`, f.sandboxID, owner.Generation).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 1 {
+		t.Fatal("legacy or incomplete observation changed retained allocation")
 	}
 	if _, err := testQueries.DestroySandbox(ctx, storageRaceDestroyParams(t, f)); err != nil {
 		t.Fatal(err)

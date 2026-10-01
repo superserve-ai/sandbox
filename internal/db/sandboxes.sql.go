@@ -25,7 +25,11 @@ WITH activated AS (
       ip_address = $4,
       updated_at = now()
   WHERE sandbox.id = $1 AND sandbox.team_id = $5 AND sandbox.destroyed_at IS NULL
-  RETURNING id, team_id, vcpu_count, memory_mib, disk_mib
+  RETURNING id, team_id, host_id, vcpu_count, memory_mib, disk_mib
+),
+retained_fence AS (
+  SELECT pg_advisory_xact_lock_shared(hashtextextended('retained-storage-owner-pending:' || a.host_id, 0))
+  FROM activated a
 ),
 opened_compute AS (
   INSERT INTO sandbox_active_interval (sandbox_id, team_id, actor_id, started_at)
@@ -43,14 +47,37 @@ opened_billing_compute AS (
   WHERE feature_enabled('billing_metrics_write', a.team_id)
   ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
   RETURNING sandbox_id
+),
+opened_measurement_obligation AS (
+  INSERT INTO retained_storage_measurement_obligation (
+    team_id, owner_kind, owner_id, host_id, effective_at
+  )
+  SELECT a.team_id, 'sandbox', a.id, a.host_id, clock_timestamp()
+  FROM activated a
+  CROSS JOIN retained_fence f
+  WHERE feature_enabled('billing_metrics_write', a.team_id)
+    AND EXISTS (
+      SELECT 1 FROM retained_storage_cutover c
+      WHERE c.team_id = a.team_id AND c.host_id = a.host_id AND c.started_at <= clock_timestamp()
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM retained_storage_interval i
+      WHERE i.team_id = a.team_id AND i.host_id = a.host_id
+        AND i.owner_kind = 'sandbox' AND i.owner_id = a.id
+        AND i.started_at <= clock_timestamp()
+        AND (i.ended_at IS NULL OR i.ended_at > clock_timestamp())
+    )
+  ON CONFLICT (owner_kind, owner_id) WHERE resolved_at IS NULL AND ended_at IS NULL DO NOTHING
+  RETURNING owner_id
 )
 INSERT INTO sandbox_storage_interval (sandbox_id, team_id, disk_mib, started_at)
 SELECT a.id, a.team_id, a.disk_mib, now()
 FROM activated a
+CROSS JOIN (SELECT count(*) FROM opened_measurement_obligation) obligation_fence
 WHERE feature_enabled('billing_metrics_write', a.team_id)
   AND NOT EXISTS (
     SELECT 1 FROM retained_storage_cutover c
-    WHERE c.team_id = a.team_id AND c.started_at <= now()
+      WHERE c.team_id = a.team_id AND c.started_at <= now()
   )
 ON CONFLICT (sandbox_id) WHERE ended_at IS NULL DO NOTHING
 `

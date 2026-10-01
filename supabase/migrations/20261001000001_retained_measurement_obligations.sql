@@ -49,6 +49,11 @@ ALTER TABLE sandbox_storage_baseline
   ALTER COLUMN receipt_id SET NOT NULL;
 ALTER TABLE sandbox_storage_baseline
   DROP CONSTRAINT IF EXISTS sandbox_storage_baseline_sandbox_id_host_id_path_generation_started_at_key;
+-- Older databases created this UNIQUE constraint before the legacy-stay
+-- boundary was added to its name.  Remove either historical spelling so
+-- immutable effective segments can coexist for one owner/path/generation.
+ALTER TABLE sandbox_storage_baseline
+  DROP CONSTRAINT IF EXISTS sandbox_storage_baseline_sandbox_id_host_id_path_generation_key;
 ALTER TABLE sandbox_storage_baseline
   ADD CONSTRAINT sandbox_storage_baseline_effective_order_unique
   UNIQUE (sandbox_id,host_id,effective_at,receipt_id);
@@ -140,12 +145,16 @@ WITH bounds AS MATERIALIZED (
  LEFT JOIN artifact_manifest am_template ON am_template.snapshot_id IS NULL AND am_template.template_id=a.template_id AND am_template.path=p.path
  WHERE p.path IS NOT NULL
 ), pre_ranges AS (
- SELECT path,allocation_identity,artifact_bytes::numeric/1048576.0 artifact_mib,
+ -- Pre-cutover history retains the legacy path-union semantics: references
+ -- sharing a path are one allocation, and the largest observed allocation
+ -- applies over the complete reference-lifetime union.  Retained generation
+ -- identities are intentionally introduced only at the prospective cutover.
+ SELECT path,MAX(artifact_bytes)::numeric/1048576.0 artifact_mib,
  range_agg(tstzrange(range_start,LEAST(range_end,COALESCE(team_cutover,range_end)),'[)')) retained_ranges
  FROM artifact_refs
  WHERE artifact_bytes IS NOT NULL AND range_end>range_start
    AND (team_cutover IS NULL OR range_start<team_cutover)
- GROUP BY path,allocation_identity,artifact_bytes
+ GROUP BY path
 ), retained_baselines AS MATERIALIZED (
  SELECT r.host_id,r.team_id,r.baseline_path,'baseline:'||r.baseline_path||':'||COALESCE(r.baseline_generation,'') allocation_identity,
   r.started_at,r.ended_at FROM retained_storage_interval r
