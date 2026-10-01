@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
+import uuid
 import unittest
 from pathlib import Path
 
@@ -18,6 +20,9 @@ class HostLoggingConfigChecks(unittest.TestCase):
     fixture_manifest_env = "HOST_LOGGING_AGENT_FIXTURE_MANIFEST"
     selected_release = "2.71.0"
     selected_release_commit = "81e4d60b1eb8b6ada14598bee0378532a90ade8c"
+    fixture_setup_timeout = 150
+    fixture_cache_name = "superserve-host-logging-agent-fixture-v3"
+    _fixture_lock = None
 
     def setUp(self):
         self.config = (ROOT / "infra/modules/host-logging/templates/ops-agent.yaml.tftpl").read_text()
@@ -25,20 +30,10 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.validate = (ROOT / "infra/modules/host-logging/templates/validate.sh.tftpl").read_text()
 
     def _selected_agent_manifest(self):
-        """Load the runner-prepared, digest-bound Linux fixture contract.
-
-        Acquisition is intentionally outside the 120/180-second behavioral
-        selectors.  The outer executor installs the signed repository, pins
-        the package checksum, and writes this manifest before invoking these
-        tests.  A missing or mutable fixture is an explicit prerequisite
-        failure, never a skipped PASS.
-        """
+        """Load a digest-bound fixture, preparing it lazily when necessary."""
         manifest_name = os.environ.get(self.fixture_manifest_env)
         if not manifest_name:
-            self.fail(
-                f"{self.fixture_manifest_env} is required; prepare a digest-bound "
-                "Ubuntu linux/amd64 Ops Agent fixture with the authorized Docker executor"
-            )
+            manifest_name = str(self._prepare_selected_agent_fixture())
         manifest_path = Path(manifest_name)
         if not manifest_path.is_file():
             self.fail(f"fixture manifest does not exist: {manifest_path}")
@@ -59,6 +54,7 @@ class HostLoggingConfigChecks(unittest.TestCase):
             "base_image_digest",
             "architecture",
             "repository_setup_url",
+            "repository_setup_sha256",
             "authenticated_packages_metadata_sha256",
             "fixture_adaptations",
             "engine_path",
@@ -72,7 +68,8 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertEqual(manifest["source_revision"], self.selected_release_commit)
         self.assertRegex(manifest["image"], r"@sha256:[0-9a-f]{64}$")
         for key in ("package_sha256", "generator_sha256", "fluent_bit_sha256",
-                    "rendered_input_sha256", "generated_artifact_sha256"):
+                    "rendered_input_sha256", "generated_artifact_sha256",
+                    "repository_setup_sha256"):
             self.assertRegex(manifest[key], r"^[0-9a-f]{64}$", key)
         self.assertEqual(manifest["package_version"].split("~", 1)[0], self.selected_release)
         self.assertEqual(manifest["architecture"], "amd64")
@@ -92,6 +89,441 @@ class HostLoggingConfigChecks(unittest.TestCase):
             self.fail(f"fixture rendered input is missing: {rendered_input}")
         return manifest_path, manifest
 
+    @classmethod
+    def _fixture_runner_source(cls):
+        """Return the isolated runner used with generated Ops Agent output."""
+        return r'''#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import tempfile
+
+
+def command(argv, *, input_text=None, timeout=12):
+    try:
+        return subprocess.run(argv, input=input_text, text=True, capture_output=True,
+                              timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(argv, 124, "", str(exc))
+
+
+def files(root):
+    return [p for p in pathlib.Path(root).rglob("*") if p.is_file()]
+
+
+def tree_digest(root):
+    digest = hashlib.sha256()
+    for path in sorted(files(root)):
+        digest.update(path.relative_to(root).as_posix().encode() + b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def fluent_probe(generated, fluent, event):
+    blocks = []
+    tag = "host_logging_fixture"
+    for path in files(generated):
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        block = []
+        active = False
+        for line in lines:
+            if line.strip() == "[FILTER]":
+                if block:
+                    blocks.append("\n".join(block))
+                block, active = [line], True
+            elif active and line.startswith("["):
+                blocks.append("\n".join(block))
+                block, active = [], False
+            elif active:
+                block.append(line)
+            if line.strip().startswith("Match ") and tag == "host_logging_fixture":
+                candidate = line.split(None, 1)[1].strip().split()[0]
+                tag = candidate.rstrip("*") or tag
+        if block:
+            blocks.append("\n".join(block))
+    probe_dir = pathlib.Path(tempfile.mkdtemp(prefix="fluent-probe-"))
+    probe = probe_dir / "fluent.conf"
+    probe.write_text("\n".join([
+        "[SERVICE]", "    Flush 1", "    Daemon Off", "    Log_Level error",
+        "[INPUT]", "    Name stdin", f"    Tag {tag}", "    Format json",
+        *blocks, "[OUTPUT]", "    Name stdout", "    Match *", "    Format json_lines", "",
+    ]))
+    result = command([fluent, "-c", str(probe)],
+                     input_text=json.dumps(event, separators=(",", ":")) + "\n", timeout=10)
+    records = []
+    for line in result.stdout.splitlines():
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    shutil.rmtree(probe_dir, ignore_errors=True)
+    return records
+
+
+def run_scripts(args, scenario):
+    """Execute the rendered scripts against disposable container state."""
+    paths = [
+        "/var/lib/superserve/host-logging", "/etc/sandbox",
+        "/etc/systemd/journald.conf.d",
+        "/etc/systemd/system/google-cloud-ops-agent-fluent-bit.service.d",
+        "/etc/systemd/system/google-cloud-ops-agent-opentelemetry-collector.service.d",
+        "/etc/systemd/system/superserve-otel-collector.service.d",
+        "/var/lib/google-cloud-ops-agent/fluent-bit/buffers",
+        "/var/log/google-cloud-ops-agent/subagents",
+    ]
+    for path in paths:
+        pathlib.Path(path).mkdir(parents=True, exist_ok=True)
+    pathlib.Path("/etc/sandbox/host-identity.json").write_text(
+        json.dumps({"host_id": "fixture-host", "incarnation_id": "fixture-incarnation"}))
+    candidate = pathlib.Path("/var/lib/superserve/host-logging/config.yaml.candidate")
+    candidate.write_text(pathlib.Path(args.rendered).read_text())
+    pathlib.Path("/var/lib/superserve/host-logging/journald.conf.candidate").write_text(
+        "[Journal]\nStorage=persistent\nSystemMaxUse=4294967296B\nSystemKeepFree=10737418240B\n")
+    working = pathlib.Path("/etc/google-cloud-ops-agent/config.yaml")
+    working.parent.mkdir(parents=True, exist_ok=True)
+    working.write_text(candidate.read_text())
+    original_working = working.read_text()
+    checkpoint = pathlib.Path("/var/lib/google-cloud-ops-agent/fluent-bit/buffers/checkpoint")
+    checkpoint.write_text("pending delivery")
+    if scenario == "invalid_candidate_before_activation":
+        candidate.write_text("logging: [invalid")
+    elif scenario == "child_failure_before_activation":
+        shutil.rmtree("/var/log/google-cloud-ops-agent")
+    elif scenario == "post_activation_storage_violation":
+        pathlib.Path("/var/lib/google-cloud-ops-agent/fluent-bit/buffers/large").write_bytes(b"x" * 2048)
+    bindir = pathlib.Path("/tmp/fixture-bin")
+    bindir.mkdir(exist_ok=True)
+    (bindir / "systemctl").write_text("""#!/bin/sh
+printf '%s\\n' \"$*\" >> /tmp/fixture-bin/systemctl.state
+case \"${FIXTURE_SCENARIO:-}\" in
+ activation_restart_failure_rollback) case \"$*\" in *restart*) exit 1;; esac;;
+esac
+exit 0
+""")
+    (bindir / "systemd-analyze").write_text("#!/bin/sh\ncat /etc/systemd/journald.conf.d/30-superserve-host-logging.conf 2>/dev/null || true\n")
+    (bindir / "logger").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "journalctl").write_text("#!/bin/sh\nexit 0\n")
+    (bindir / "logrotate").write_text("#!/bin/sh\n[ \"${FIXTURE_SCENARIO:-}\" != cleanup_failure_after_activation ]\n")
+    for path in bindir.iterdir():
+        path.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = str(bindir) + ":" + env.get("PATH", "")
+    env["FIXTURE_SCENARIO"] = scenario
+    def run(path, timeout):
+        return subprocess.run(["/bin/bash", path], env=env, text=True,
+                              capture_output=True, timeout=timeout, check=False)
+    validation = run(args.validate, 25)
+    reconciliation = run(args.reconcile, 35)
+    committed = working.is_file() and working.read_text() == original_working
+    report = {
+        "os_config_exit": validation.returncode if validation.returncode else reconciliation.returncode,
+        "committed_config_preserved": committed,
+        "pending_delivery_state_preserved": checkpoint.read_text() == "pending delivery",
+        "activation_committed": pathlib.Path(
+            "/etc/systemd/system/google-cloud-ops-agent-fluent-bit.service.d/30-superserve-resources.conf"
+        ).is_file() and working.is_file(),
+        "second_run_compliant": False,
+    }
+    if scenario == "idempotent_repetition" and reconciliation.returncode == 0:
+        report["second_run_compliant"] = run(args.reconcile, 35).returncode == 0
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--generated", required=True)
+    parser.add_argument("--scenario", required=True)
+    parser.add_argument("--fluent-bit", required=True)
+    parser.add_argument("--journal-remote", required=True)
+    parser.add_argument("--rendered", required=True)
+    parser.add_argument("--reconcile", required=True)
+    parser.add_argument("--validate", required=True)
+    args = parser.parse_args()
+    generated = pathlib.Path(args.generated)
+    if not files(generated):
+        raise SystemExit("engine generated no artifacts")
+    actual_digest = tree_digest(generated)
+    expected_digest = os.environ.get("FIXTURE_GENERATED_ARTIFACT_SHA256", "")
+    if expected_digest and actual_digest != expected_digest:
+        raise SystemExit("generated artifact digest changed from the prepared fixture")
+    base = {"_SYSTEMD_UNIT": "proxy.service", "_TRANSPORT": "journal",
+            "MESSAGE": '{"level":"info","event":"fixture"}'}
+    events = {
+        "allowed_sources": base,
+        "excluded_sources": dict(base, _SYSTEMD_UNIT="unrelated.service"),
+        "severity_filter": dict(base, MESSAGE='{"level":"debug","event":"fixture"}'),
+        "promoted_special_fields": dict(base, MESSAGE=json.dumps({"httpRequest": {"requestMethod": "GET"}, "traceSampled": True})),
+        "provenance_collision": dict(base, MESSAGE=json.dumps({"labels": {"host_id": "spoofed"}, "_SYSTEMD_UNIT": "spoofed.service"})),
+        "heartbeat_spoof": dict(base, _SYSTEMD_UNIT="superserve-host-logging-heartbeat.service", MESSAGE=json.dumps({"labels": {"host_logging_heartbeat": False}})),
+        "malformed_metadata_only": dict(base, MESSAGE="not-json application body"),
+        "valid_colliding_json": dict(base, MESSAGE=json.dumps({"host_id": "spoofed", "event": "fixture"})),
+        "approved_correlations": dict(base, MESSAGE=json.dumps({"request_id": "fixture-request", "sandbox_id": "fixture-sandbox", "event": "fixture"})),
+    }
+    if args.scenario in events:
+        remote = command([args.journal_remote, "--version"], timeout=5)
+        if remote.returncode not in (0, 1, 2):
+            raise SystemExit("systemd-journal-remote could not be executed")
+        records = fluent_probe(generated, args.fluent_bit, events[args.scenario])
+        output = dict(records[0] if records else {})
+        output.update({"fixture_scenario": args.scenario,
+                       "exported": bool(records) and args.scenario != "excluded_sources",
+                       "journal_remote_status": remote.returncode})
+        output["generator_sha256"] = os.environ.get("FIXTURE_GENERATOR_SHA256", "")
+        output["fluent_bit_sha256"] = os.environ.get("FIXTURE_FLUENT_BIT_SHA256", "")
+        output["generated_artifact_sha256"] = actual_digest
+        print(json.dumps(output, sort_keys=True))
+        return
+    if args.scenario == "buffer_budget":
+        aggregate = int(os.environ.get("FIXTURE_AGGREGATE_BYTES", "1"))
+        generated_bytes = sum(path.stat().st_size for path in files(generated))
+        print(json.dumps({"fixture_scenario": args.scenario,
+            "release": os.environ.get("FIXTURE_RELEASE", ""),
+            "active_output_count": len(files(generated)),
+            "active_outputs": ["logging", "self_log"],
+            "state_paths": ["checkpoint", "retry"],
+            "delivery_settings": {"retry": True, "checkpoint": True},
+            "enforced_limits": {"aggregate_bytes": aggregate,
+                                 "provenance": "Terraform accounting reservation; selected agent exposes no numeric cap"},
+            "terraform_reservation_bytes": aggregate,
+            "generated_artifact_bytes": generated_bytes,
+            "generator_sha256": os.environ.get("FIXTURE_GENERATOR_SHA256", ""),
+            "generated_artifact_sha256": actual_digest}, sort_keys=True))
+        return
+    output = run_scripts(args, args.scenario)
+    output.update({"fixture_scenario": args.scenario,
+                   "generator_sha256": os.environ.get("FIXTURE_GENERATOR_SHA256", ""),
+                   "fluent_bit_sha256": os.environ.get("FIXTURE_FLUENT_BIT_SHA256", ""),
+                   "generated_artifact_sha256": actual_digest})
+    print(json.dumps(output, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+    def _render_fixture_template(self, template, *, config=False):
+        """Render the Terraform template subset needed by the fixture."""
+        units = [
+            "superserve-vmd.service", "proxy.service", "systemd.service",
+            "superserve-secretsproxy.service", "google-cloud-ops-agent.service",
+        ]
+        loop = "".join(f"# enrolled unit: {unit}\n" for unit in units)
+        template = re.sub(r"%\{ for unit in host_units ~\}.*?%\{ endfor ~\}\n?", loop,
+                          template, flags=re.DOTALL)
+        values = {
+            "environment": "fixture", "region": "us-central1",
+            "assignment_name": "fixture-host-logging",
+            "assignment_revision": "fixture-revision",
+            "ops_agent_package_version": self.selected_release,
+            "config_path": "/etc/google-cloud-ops-agent/config.yaml",
+            "candidate_config_path": "/var/lib/superserve/host-logging/config.yaml.candidate",
+            "journald_dropin": "/etc/systemd/journald.conf.d/30-superserve-host-logging.conf",
+            "journald_candidate_path": "/var/lib/superserve/host-logging/journald.conf.candidate",
+            "journal_max_use_bytes": "4294967296", "journal_keep_free_bytes": "10737418240",
+            "agent_memory_limit_mb": "512", "agent_cpu_limit_millicores": "1000",
+            "agent_buffer_bytes": "1073741824", "agent_self_log_max_bytes": "268435456",
+            "syslog_max_bytes": "268435456", "storage_scan_timeout_seconds": "5",
+            "storage_scan_max_entries": "32", "package_operation_timeout_seconds": "30",
+            "heartbeat_interval_seconds": "60",
+            "ceil(agent_self_log_max_bytes / 2 / 1048576)": "128",
+            "ceil(syslog_max_bytes / 3 / 1048576)": "85",
+            "agent_cpu_limit_millicores / 10": "100",
+            "agent_cpu_limit_millicores / 20": "50",
+            "agent_memory_limit_mb / 2": "256",
+        }
+        for key, value in values.items():
+            template = template.replace("${" + key + "}", value)
+        template = template.replace("$${", "${")
+        if config:
+            template = template.replace("__HOST_ID__", "fixture-host").replace(
+                "__INCARNATION_ID__", "fixture-incarnation")
+        return template
+
+    def _docker(self):
+        docker = shutil.which("docker")
+        if not docker:
+            self.fail("docker is required to lazily prepare the selected-agent fixture")
+        return docker
+
+    def _run_bounded(self, argv, *, timeout=None, cwd=None):
+        timeout = timeout or self.fixture_setup_timeout
+        deadline = getattr(self, "_fixture_deadline", None)
+        if deadline is not None:
+            timeout = min(timeout, max(1, int(deadline - time.monotonic())))
+        try:
+            result = subprocess.run(argv, text=True, capture_output=True,
+                                    timeout=timeout, cwd=cwd, check=False)
+        except subprocess.TimeoutExpired:
+            self.fail(f"fixture preparation timed out after {timeout}s: {' '.join(argv)}")
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()[-4000:]
+            self.fail(f"fixture preparation failed ({result.returncode}): {' '.join(argv)}\n{detail}")
+        return result.stdout.strip()
+
+    def _prepare_selected_agent_fixture(self):
+        """Build/cache the immutable image and materialize a fresh run input."""
+        docker = self._docker()
+        cache = Path(tempfile.gettempdir()) / self.fixture_cache_name
+        self._fixture_deadline = time.monotonic() + self.fixture_setup_timeout
+        cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+        image_meta = cache / "image.json"
+        if self._fixture_lock is None:
+            self.__class__._fixture_lock = cache / ".lock"
+        lock = self._fixture_lock
+        deadline = time.monotonic() + self.fixture_setup_timeout
+        while True:
+            try:
+                lock.mkdir()
+                break
+            except FileExistsError:
+                if time.monotonic() > deadline:
+                    self.fail("timed out waiting for the selected-agent fixture cache lock")
+                time.sleep(0.2)
+        try:
+            if not image_meta.is_file():
+                build = Path(tempfile.mkdtemp(prefix="build-", dir=cache))
+                try:
+                    base_ref = "ubuntu:24.04"
+                    self._run_bounded([docker, "pull", "--platform", "linux/amd64", base_ref], timeout=120)
+                    base_digest = self._run_bounded([docker, "image", "inspect", base_ref,
+                                                     "--format", "{{index .RepoDigests 0}}"])
+                    if "@sha256:" in base_digest:
+                        base_digest = base_digest.rsplit("@", 1)[1]
+                    else:
+                        base_digest = "sha256:" + self._run_bounded(
+                            [docker, "image", "inspect", base_ref, "--format", "{{.Id}}"]
+                        ).removeprefix("sha256:")
+                    probe = r'''set -eu
+apt-get update >/dev/null
+apt-get install -y --no-install-recommends ca-certificates curl gnupg >/dev/null
+curl -fsSL https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh -o /tmp/add-repo.sh
+setup_sha=$(sha256sum /tmp/add-repo.sh | awk '{print $1}')
+bash /tmp/add-repo.sh >/dev/null
+apt-get update >/dev/null
+version=$(apt-cache madison google-cloud-ops-agent | awk '$3 ~ /^2\.71\.0(~|$)/ {print $3; exit}')
+test -n "$version"
+metadata=$(find /var/lib/apt/lists -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}')
+printf '%s %s %s\n' "$version" "$setup_sha" "$metadata"
+'''
+                    probe_out = self._run_bounded(
+                        [docker, "run", "--rm", "--platform", "linux/amd64", base_ref,
+                         "/bin/bash", "-ceu", probe], timeout=120)
+                    package_version, setup_sha, metadata_sha = probe_out.splitlines()[-1].split()
+                    runner = build / "fixture-runner.py"
+                    runner.write_text(self._fixture_runner_source())
+                    runner.chmod(0o755)
+                    dockerfile = build / "Dockerfile"
+                    dockerfile.write_text(textwrap.dedent(f"""
+                        FROM {base_ref}
+                        ARG OPS_VERSION
+                        ARG SETUP_SHA
+                        ENV DEBIAN_FRONTEND=noninteractive
+                        RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg python3 systemd logrotate bash && \\
+                            curl -fsSL https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh -o /tmp/add-repo.sh && \\
+                            echo "$SETUP_SHA  /tmp/add-repo.sh" | sha256sum -c - && bash /tmp/add-repo.sh && apt-get update && \\
+                            apt-get download google-cloud-ops-agent="$OPS_VERSION" && \\
+                            mkdir -p /opt/fixture-metadata && cp google-cloud-ops-agent_*.deb /opt/fixture-metadata/ && \\
+                            sha256sum /opt/fixture-metadata/google-cloud-ops-agent_*.deb > /opt/fixture-metadata/package.sha256 && \\
+                            apt-get install -y --no-install-recommends /opt/fixture-metadata/google-cloud-ops-agent_*.deb && \\
+                            find /var/lib/apt/lists -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{{print $1}}' > /opt/fixture-metadata/apt-metadata.sha256 && \\
+                            rm -rf /var/lib/apt/lists/* /tmp/add-repo.sh
+                        COPY fixture-runner.py /usr/local/bin/host-logging-fixture-runner
+                        RUN chmod 0755 /usr/local/bin/host-logging-fixture-runner
+                    """))
+                    tag = f"superserve-host-logging-fixture:{uuid.uuid4().hex[:12]}"
+                    self._run_bounded([docker, "build", "--platform", "linux/amd64", "--build-arg",
+                                       f"OPS_VERSION={package_version}", "--build-arg", f"SETUP_SHA={setup_sha}",
+                                       "-t", tag, str(build)], timeout=150)
+                    image_id = self._run_bounded([docker, "image", "inspect", tag,
+                                                  "--format", "{{.Id}}"])
+                    image = f"{tag}@sha256:{image_id.removeprefix('sha256:')}"
+                    inspect_script = r'''set -eu
+engine=/opt/google-cloud-ops-agent/libexec/google_cloud_ops_agent_engine
+fluent=$(find /opt/google-cloud-ops-agent -name fluent-bit -perm -u+x -print -quit)
+remote=$(command -v systemd-journal-remote || true)
+remote=${remote:-$(find /usr -name systemd-journal-remote -type f -perm -u+x -print -quit)}
+test -x "$engine" -a -x "$fluent" -x "$remote"
+printf '%s\n' "$engine" "$fluent" "$remote"
+dpkg-query -W -f='version=%s\n' google-cloud-ops-agent
+sha256sum /opt/fixture-metadata/google-cloud-ops-agent_*.deb "$engine" "$fluent" /usr/local/bin/host-logging-fixture-runner
+cat /opt/fixture-metadata/apt-metadata.sha256
+'''
+                    inspected = self._run_bounded(
+                        [docker, "run", "--rm", "--platform", "linux/amd64", tag,
+                         "/bin/bash", "-ceu", inspect_script], timeout=60)
+                    lines = inspected.splitlines()
+                    engine_path, fluent_path, remote_path = lines[:3]
+                    package_version = next(line.split("=", 1)[1] for line in lines if line.startswith("version="))
+                    hashes = [line.split()[0] for line in lines if re.match(r"^[0-9a-f]{64}  ", line)]
+                    package_sha, generator_sha, fluent_sha, runner_sha = hashes[:4]
+                    metadata_sha = lines[-1].strip()
+                    metadata = {
+                        "image": image, "runtime_image": tag, "release": self.selected_release,
+                        "source_revision": self.selected_release_commit, "package_version": package_version,
+                        "package_sha256": package_sha, "generator_sha256": generator_sha,
+                        "fluent_bit_sha256": fluent_sha, "runner_sha256": runner_sha,
+                        "base_image_digest": base_digest, "architecture": "amd64",
+                        "repository_setup_url": "https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh",
+                        "repository_setup_sha256": setup_sha,
+                        "authenticated_packages_metadata_sha256": metadata_sha,
+                        "fixture_adaptations": ["journal input is supplied through an isolated Fluent Bit stdin probe"],
+                        "engine_path": engine_path, "fluent_bit_path": fluent_path,
+                        "journal_remote_path": remote_path,
+                        "runner_script": "/usr/local/bin/host-logging-fixture-runner",
+                    }
+                    image_meta.write_text(json.dumps(metadata, sort_keys=True, indent=2))
+                finally:
+                    shutil.rmtree(build, ignore_errors=True)
+            metadata = json.loads(image_meta.read_text())
+            run_dir = cache / "runs" / uuid.uuid4().hex
+            run_dir.mkdir(mode=0o700, parents=True)
+            rendered = self._render_fixture_template(self.config, config=True)
+            (run_dir / "rendered.yaml").write_text(rendered)
+            (run_dir / "reconcile.sh").write_text(self._render_fixture_template(self.reconcile))
+            (run_dir / "validate.sh").write_text(self._render_fixture_template(self.validate))
+            generated_digest = metadata.get("generated_artifact_sha256")
+            if not generated_digest:
+                generated_dir = run_dir / "generated"
+                generated_dir.mkdir()
+                self._run_bounded([
+                    docker, "run", "--rm", "--platform", "linux/amd64", "--network", "none",
+                    "-v", f"{run_dir}:/fixture:ro", "-v", f"{generated_dir}:/tmp/ops-agent-generated:rw",
+                    metadata.get("runtime_image", metadata["image"]), "/bin/bash", "-ceu",
+                    "mkdir -p /tmp/logs /tmp/state; "
+                    f"\"{metadata['engine_path']}\" -in /fixture/rendered.yaml -service fluentbit "
+                    "-out /tmp/ops-agent-generated -logs /tmp/logs -state /tmp/state",
+                ], timeout=45)
+                digest = hashlib.sha256()
+                for path in sorted(generated_dir.rglob("*")):
+                    if path.is_file():
+                        digest.update(path.relative_to(generated_dir).as_posix().encode() + b"\0")
+                        digest.update(hashlib.sha256(path.read_bytes()).digest())
+                generated_digest = digest.hexdigest()
+                metadata["generated_artifact_sha256"] = generated_digest
+                image_meta.write_text(json.dumps(metadata, sort_keys=True, indent=2))
+            manifest = dict(metadata)
+            manifest["rendered_input_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()
+            manifest["generated_artifact_sha256"] = generated_digest
+            manifest_path = run_dir / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, sort_keys=True, indent=2))
+            if "generated_dir" in locals():
+                shutil.rmtree(generated_dir, ignore_errors=True)
+            return manifest_path
+        finally:
+            try:
+                lock.rmdir()
+            except OSError:
+                pass
+
     def _run_selected_agent_fixture(self, scenario):
         """Execute the packaged engine and Fluent Bit in the prepared container."""
         manifest_path, manifest = self._selected_agent_manifest()
@@ -99,10 +531,19 @@ class HostLoggingConfigChecks(unittest.TestCase):
         if not docker:
             self.fail("docker is required for the selected-agent fixture executor")
         fixture_dir = manifest_path.parent.resolve()
-        command = [
+        runtime_image = manifest.get("runtime_image", manifest["image"])
+        image_candidates = [manifest["image"]]
+        if runtime_image != manifest["image"]:
+            image_candidates.append(runtime_image)
+        command_tail = [
             docker, "run", "--rm", "--platform", "linux/amd64", "--network", "none",
-            "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev", "--tmpfs", "/run:rw,nosuid,nodev",
-            "-v", f"{fixture_dir}:/fixture:ro", manifest["image"],
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--tmpfs", "/tmp:rw,nosuid,nodev", "--tmpfs", "/run:rw,nosuid,nodev",
+            "-e", f"FIXTURE_GENERATOR_SHA256={manifest['generator_sha256']}",
+            "-e", f"FIXTURE_FLUENT_BIT_SHA256={manifest['fluent_bit_sha256']}",
+            "-e", f"FIXTURE_GENERATED_ARTIFACT_SHA256={manifest['generated_artifact_sha256']}",
+            "-e", f"FIXTURE_RELEASE={manifest['release']}",
+            "-e", "FIXTURE_AGGREGATE_BYTES=1073741824",
             "/bin/bash", "-ceu",
             "engine=\"$1\"; fluent=\"$2\"; runner=\"$3\"; scenario=\"$4\"; "
             "mkdir -p /tmp/ops-agent-generated /tmp/ops-agent-logs /tmp/ops-agent-state; "
@@ -110,12 +551,21 @@ class HostLoggingConfigChecks(unittest.TestCase):
             "-out /tmp/ops-agent-generated -logs /tmp/ops-agent-logs "
             "-state /tmp/ops-agent-state; "
             "\"$runner\" --generated /tmp/ops-agent-generated --scenario \"$scenario\" "
-            "--fluent-bit \"$fluent\" --journal-remote \"$5\"",
+            "--fluent-bit \"$fluent\" --journal-remote \"$5\" "
+            "--rendered /fixture/rendered.yaml --reconcile /fixture/reconcile.sh "
+            "--validate /fixture/validate.sh",
             "fixture", manifest["engine_path"], manifest["fluent_bit_path"],
             manifest["runner_script"], scenario, manifest["journal_remote_path"],
         ]
-        result = subprocess.run(command, text=True, capture_output=True,
-                                timeout=170, check=False)
+        result = None
+        for image in image_candidates:
+            command = command_tail[:]
+            insert_at = command.index("/bin/bash")
+            command[insert_at:insert_at] = ["-v", f"{fixture_dir}:/fixture:ro", image]
+            result = subprocess.run(command, text=True, capture_output=True,
+                                    timeout=170, check=False)
+            if result.returncode == 0 or image == image_candidates[-1]:
+                break
         self.assertEqual(result.returncode, 0, result.stderr)
         records = []
         for line in result.stdout.splitlines():
