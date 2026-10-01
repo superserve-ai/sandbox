@@ -925,7 +925,7 @@ func TestRetainedStorageTemplateRebuildKeepsPersistedBaselineGeneration(t *testi
 	// The template row now points at build B, while each owner keeps the
 	// build-specific snapshot path it was created from.
 	exec(`INSERT INTO template(id,team_id,name,status,build_spec,rootfs_path,snapshot_path,mem_path,vcpu,memory_mib,disk_mib)
- VALUES($1,$2,'example-template','ready','{}'::jsonb,$3,$4,$5,1,1024,2)`, templateID, team, newRootfsPath, newSnapshotPath, "/example/templates/base/build-b/mem.snap")
+ VALUES($1,$2,'example-template','ready','{}'::jsonb,$3,$4,$5,1,1024,1024)`, templateID, team, newRootfsPath, newSnapshotPath, "/example/templates/base/build-b/mem.snap")
 	exec(`INSERT INTO artifact_manifest(template_id,file_name,path,size_bytes,allocated_bytes,sha256)
  VALUES($1,'rootfs.ext4',$2,1048576,1048576,$3),($1,'rootfs.ext4',$4,1048576,1048576,$3)`, templateID, oldRootfsPath, strings.Repeat("0", 64), newRootfsPath)
 	exec(`UPDATE sandbox SET created_at=$2,template_id=$3,snapshot_path=$4,base_path=NULL,delta_path=NULL WHERE id=$1`, f.sandboxID, start, templateID, oldSnapshotPath)
