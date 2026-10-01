@@ -104,9 +104,16 @@ WITH bounds AS MATERIALIZED (
  SELECT s.id,s.template_id,s.snapshot_id,s.base_path,s.delta_path,
   i.host_id interval_host_id,i.started_at billing_started_at,
   LEAST(COALESCE(i.artifact_retention_end,i.request_now),COALESCE(first_segment.first_effective,i.request_now)) retention_end,
-  i.team_cutover,i.request_now,NULL::text baseline_path,NULL::text baseline_generation,NULL::bigint baseline_allocated_bytes,
+  i.team_cutover,i.request_now,
+  -- Before the retained cutover, legacy artifact accounting is still
+  -- path-based. Preserve that union even when no retained provenance row has
+  -- arrived yet; after cutover the same absence is an unknown contribution.
+  CASE WHEN i.team_cutover IS NULL OR i.started_at<i.team_cutover
+       THEN s.base_path END baseline_path,
+  NULL::text baseline_generation,NULL::bigint baseline_allocated_bytes,
   ((s.template_id IS NOT NULL AND s.base_path IS NULL)
-   OR (i.team_cutover IS NOT NULL AND s.base_path IS NOT NULL)) unresolved_baseline
+   OR (i.team_cutover IS NOT NULL AND s.base_path IS NOT NULL
+       AND i.started_at>=i.team_cutover)) unresolved_baseline
  FROM sandbox s JOIN legacy_intervals i ON i.sandbox_id=s.id
  LEFT JOIN LATERAL (
    SELECT MIN(x.effective_at) first_effective FROM sandbox_storage_baseline x

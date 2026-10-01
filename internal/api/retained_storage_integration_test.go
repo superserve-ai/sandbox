@@ -666,20 +666,54 @@ func TestIntegration_RetainedExpectedOwnerDiscoveryBound(t *testing.T) {
 	if err := f.pool.QueryRow(ctx, `SELECT team_id FROM sandbox WHERE id=$1`, f.sandboxID).Scan(&team); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < retainedstorage.MaxOwners+1; i++ {
+	owners := []retainedstorage.Owner{{Kind: "sandbox", ID: f.sandboxID.String(), Generation: strings.Repeat("a", 64), Extents: []retainedstorage.Extent{{Device: "fs", Start: 0, Length: 4096}}}}
+	for i := 1; i < retainedstorage.MaxOwners; i++ {
+		id := uuid.New()
 		if _, err := f.pool.Exec(ctx, `INSERT INTO sandbox(id,team_id,host_id,status,created_at,destroyed_at)
- VALUES($1,$2,$3,'paused',$4,NULL)`, uuid.New(), team, f.hostID, f.receivedAt.Add(-time.Duration(i+1)*time.Second)); err != nil {
+ VALUES($1,$2,$3,'paused',$4,NULL)`, id, team, f.hostID, f.receivedAt.Add(-time.Duration(i+1)*time.Second)); err != nil {
 			t.Fatal(err)
 		}
+		owners = append(owners, retainedstorage.Owner{Kind: "sandbox", ID: id.String(), Generation: strings.Repeat("a", 64), Extents: []retainedstorage.Extent{{Device: "fs", Start: int64(i+1) * 4096, Length: 4096}}})
 	}
+	// Exactly the receiver bound is a complete, schema-valid inventory.
 	tx, err := f.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer tx.Rollback(ctx)
-	err = applyRetainedStorage(ctx, tx, f.hostID, f.receivedAt, &retainedstorage.Inventory{Version: 1})
+	if err := applyRetainedStorage(ctx, tx, f.hostID, f.receivedAt, &retainedstorage.Inventory{Version: 1, Owners: owners}); err != nil {
+		t.Fatalf("exact owner bound rejected a valid inventory: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var before int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	// A mixed-kind sentinel over the bound must remain retryable. The payload
+	// itself stays valid; overflow is discovered from authoritative rows.
+	snapshotID := uuid.New()
+	if _, err := f.pool.Exec(ctx, `INSERT INTO sandbox_snapshot(id,team_id,host_id,status,created_at)
+ VALUES($1,$2,$3,'ready',$4)`, snapshotID, team, f.hostID, f.receivedAt.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = applyRetainedStorage(ctx, tx, f.hostID, f.receivedAt, &retainedstorage.Inventory{Version: 1, Owners: owners})
 	if !errors.Is(err, errStorageReportRetainedIncomplete) {
 		t.Fatalf("expected bounded owner discovery to remain retryable, got %v", err)
+	}
+	if rollbackErr := tx.Rollback(ctx); rollbackErr != nil {
+		t.Fatal(rollbackErr)
+	}
+	var after int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("overflow changed retained accounting: before=%d after=%d", before, after)
 	}
 }
 

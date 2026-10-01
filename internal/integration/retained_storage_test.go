@@ -358,7 +358,38 @@ func TestRetainedStorageReceiptReplacementAndLegacyIsolation(t *testing.T) {
 	waitStorageReportState(t, legacy, "processed")
 	missing := uuid.New()
 	post(missing, []retainedstorage.Owner{}, http.StatusCreated)
-	waitStorageReportState(t, missing, "terminal")
+	waitStorageReportState(t, missing, "pending", "retry_exhausted")
+	var missingState string
+	var retainedPayload []byte
+	if err := testPool.QueryRow(ctx, `SELECT state,payload FROM host_storage_report WHERE report_id=$1`, missing).Scan(&missingState, &retainedPayload); err != nil {
+		t.Fatal(err)
+	}
+	if missingState != "pending" && missingState != "retry_exhausted" {
+		t.Fatalf("incomplete retained report became terminal: %q", missingState)
+	}
+	if len(retainedPayload) == 0 {
+		t.Fatal("retryable incomplete retained report discarded its payload")
+	}
+	// Retry exhaustion is still an unresolved durable fence, not a successful
+	// zero. Simulate the bounded backoff reaching its terminal retry marker
+	// without mutating the immutable payload.
+	if _, err := testPool.Exec(ctx, `UPDATE host_storage_report SET state='retry_exhausted' WHERE report_id=$1`, missing); err != nil {
+		t.Fatal(err)
+	}
+	var complete bool
+	if err := testPool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, b.Add(time.Minute)).Scan(&complete); err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("retry-exhausted incomplete retained report released settlement fence")
+	}
+	var retainedPayloadAfter []byte
+	if err := testPool.QueryRow(ctx, `SELECT payload FROM host_storage_report WHERE report_id=$1`, missing).Scan(&retainedPayloadAfter); err != nil {
+		t.Fatal(err)
+	}
+	if string(retainedPayloadAfter) != string(retainedPayload) {
+		t.Fatal("retry-exhausted retained report payload changed")
+	}
 	var active int
 	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM retained_storage_interval WHERE owner_id=$1 AND ended_at IS NULL AND generation=$2`, f.sandboxID, owner.Generation).Scan(&active); err != nil {
 		t.Fatal(err)
@@ -419,6 +450,192 @@ func TestRetainedStorageReceiptReplacementAndLegacyIsolation(t *testing.T) {
 		t.Fatal("replacement/deletion rewrote prior storage history")
 	}
 
+}
+
+func TestRetainedStoragePostCutoverActivationUnknown(t *testing.T) {
+	f := newStorageReportFixture(t, "paused", false)
+	ctx := t.Context()
+	team := sandboxTeamID(t, f.sandboxID)
+	cutover := time.Now().UTC().Add(-time.Minute)
+	if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, cutover); err != nil {
+		t.Fatal(err)
+	}
+	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: f.sandboxID, TeamID: team, VcpuCount: 1, MemoryMib: 1024}); err != nil {
+		t.Fatal(err)
+	}
+	var effective time.Time
+	if err := testPool.QueryRow(ctx, `SELECT effective_at FROM retained_storage_measurement_obligation WHERE owner_kind='sandbox' AND owner_id=$1`, f.sandboxID).Scan(&effective); err != nil {
+		t.Fatal(err)
+	}
+	var unknown, complete bool
+	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false) IS NULL`, team, effective.Add(-time.Second), effective.Add(time.Minute)).Scan(&unknown); err != nil {
+		t.Fatal(err)
+	}
+	if !unknown {
+		t.Fatal("post-cutover activation exposed provisioned storage before a valid receipt")
+	}
+	if err := testPool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, effective.Add(time.Minute)).Scan(&complete); err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("unresolved activation obligation released settlement")
+	}
+
+	validID := uuid.New()
+	owner := retainedstorage.Owner{Kind: "sandbox", ID: f.sandboxID.String(), Generation: strings.Repeat("a", 64), Extents: []retainedstorage.Extent{{Device: "fs", Start: 0, Length: 1 << 20}}}
+	validBody, err := json.Marshal(map[string]any{
+		"incarnation_id": f.incarnation, "report_id": validID,
+		"measurements": []map[string]any{{"sandbox_id": "", "allocated_bytes": 0,
+			"retained": retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{owner}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := requestStorageReport(f.router, f.hostID, string(validBody)); response.Code != http.StatusCreated {
+		t.Fatalf("valid receipt: %d %s", response.Code, response.Body.String())
+	}
+	waitStorageReportState(t, validID, "processed")
+	var resolved *time.Time
+	if err := testPool.QueryRow(ctx, `SELECT resolved_at FROM retained_storage_measurement_obligation WHERE owner_kind='sandbox' AND owner_id=$1`, f.sandboxID).Scan(&resolved); err != nil {
+		t.Fatal(err)
+	}
+	if resolved == nil {
+		t.Fatal("compatible retained receipt did not resolve activation obligation")
+	}
+	// A later structurally valid but incomplete processor payload is retryable
+	// and keeps its immutable payload. The product decision about any
+	// retrospective pre-receipt gap is intentionally not asserted here.
+	failedID := uuid.New()
+	failedBody, err := json.Marshal(map[string]any{
+		"incarnation_id": f.incarnation, "report_id": failedID,
+		"measurements": []map[string]any{{"sandbox_id": "", "allocated_bytes": 0,
+			"retained": retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response := requestStorageReport(f.router, f.hostID, string(failedBody)); response.Code != http.StatusCreated {
+		t.Fatalf("incomplete receipt: %d %s", response.Code, response.Body.String())
+	}
+	waitStorageReportState(t, failedID, "pending", "retry_exhausted")
+	var payload []byte
+	if err := testPool.QueryRow(ctx, `SELECT payload FROM host_storage_report WHERE report_id=$1`, failedID).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload) == 0 {
+		t.Fatal("processor failure discarded the immutable retained payload")
+	}
+}
+
+func TestRetainedStorageActivationSettlementRace(t *testing.T) {
+	f := newStorageReportFixture(t, "paused", false)
+	ctx := t.Context()
+	team := sandboxTeamID(t, f.sandboxID)
+	boundary := time.Now().UTC().Add(-time.Second)
+	var complete bool
+	if err := testPool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, boundary).Scan(&complete); err != nil {
+		t.Fatal(err)
+	}
+	if !complete {
+		t.Fatal("settlement was fenced before the activation transaction existed")
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO retained_storage_cutover(host_id,team_id,started_at) VALUES($1,$2,$3)`, f.hostID, team, boundary.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := testQueries.ActivateSandbox(ctx, db.ActivateSandboxParams{ID: f.sandboxID, TeamID: team, VcpuCount: 1, MemoryMib: 1024}); err != nil {
+		t.Fatal(err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT storage_reports_complete_through($1,$2)`, team, time.Now().UTC().Add(time.Minute)).Scan(&complete); err != nil {
+		t.Fatal(err)
+	}
+	if complete {
+		t.Fatal("committed activation was invisible to settlement")
+	}
+}
+
+func TestRetainedStorageBaselineReplacementPreservesLegacyHistory(t *testing.T) {
+	f := newStorageReportFixture(t, "paused", false)
+	ctx := t.Context()
+	team := sandboxTeamID(t, f.sandboxID)
+	legacyID := uuid.New()
+	if response := postStorageReport(t, f, legacyID, 16<<20); response.Code != http.StatusCreated {
+		t.Fatalf("legacy report: %d %s", response.Code, response.Body.String())
+	}
+	waitStorageReportState(t, legacyID, "processed")
+	var t0 time.Time
+	if err := testPool.QueryRow(ctx, `SELECT received_at FROM host_storage_report WHERE report_id=$1`, legacyID).Scan(&t0); err != nil {
+		t.Fatal(err)
+	}
+	postRetained := func(id uuid.UUID, generation, path string, bytes int64, extent int64) time.Time {
+		t.Helper()
+		owner := retainedstorage.Owner{Kind: "sandbox", ID: f.sandboxID.String(), Generation: generation,
+			Extents:  []retainedstorage.Extent{{Device: "fs", Start: 0, Length: extent}},
+			Baseline: &retainedstorage.Baseline{Path: path, Generation: generation, AllocatedBytes: bytes}}
+		body, err := json.Marshal(map[string]any{"incarnation_id": f.incarnation, "report_id": id,
+			"measurements": []map[string]any{{"sandbox_id": "", "allocated_bytes": 0,
+				"retained": retainedstorage.Inventory{Version: 1, Owners: []retainedstorage.Owner{owner}}}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response := requestStorageReport(f.router, f.hostID, string(body)); response.Code != http.StatusCreated {
+			t.Fatalf("retained report: %d %s", response.Code, response.Body.String())
+		}
+		waitStorageReportState(t, id, "processed")
+		var received time.Time
+		if err := testPool.QueryRow(ctx, `SELECT received_at FROM host_storage_report WHERE report_id=$1`, id).Scan(&received); err != nil {
+			t.Fatal(err)
+		}
+		return received
+	}
+	genA, genB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	pathA, pathB := "/example/baseline-a.ext4", "/example/baseline-b.ext4"
+	t1 := postRetained(uuid.New(), genA, pathA, 1<<20, 1<<20)
+	t2 := postRetained(uuid.New(), genB, pathB, 2<<20, 2<<20)
+	if !t2.After(t1) || !t1.After(t0) {
+		t.Fatalf("receipt boundaries are not ordered: %s %s %s", t0, t1, t2)
+	}
+	var before, after float64
+	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, t0, t1).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if want := 16 * t1.Sub(t0).Seconds(); math.Abs(before-want) > 0.0001 {
+		t.Fatalf("accepted legacy prefix = %v want %v", before, want)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT storage_mib_seconds($1,$2,$3,false)::float8`, team, t0, t1).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatal("later baseline replacement rewrote accepted legacy history")
+	}
+	var endedAt time.Time
+	if err := testPool.QueryRow(ctx, `SELECT ended_at FROM retained_storage_interval WHERE owner_id=$1 AND generation=$2`, f.sandboxID, genA).Scan(&endedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !endedAt.Equal(t2) {
+		t.Fatalf("baseline A ended at %s, want receipt B %s", endedAt, t2)
+	}
+	seedStorageActivation(t, team, t0)
+	var beforeCPU, beforeMemory, beforeStorage float64
+	if err := testPool.QueryRow(ctx, billing.ExportRemeasurementSQL, team, t0, t1).Scan(&beforeCPU, &beforeMemory, &beforeStorage); err != nil {
+		t.Fatal(err)
+	}
+	// Same-generation quantity changes are a new effective segment and do not
+	// mutate either earlier accepted segment.
+	t3 := postRetained(uuid.New(), genB, pathB, 3<<20, 3<<20)
+	var priorEnd time.Time
+	if err := testPool.QueryRow(ctx, `SELECT ended_at FROM retained_storage_interval WHERE owner_id=$1 AND generation=$2 AND ended_at IS NOT NULL ORDER BY started_at DESC LIMIT 1`, f.sandboxID, genB).Scan(&priorEnd); err != nil {
+		t.Fatal(err)
+	}
+	if !priorEnd.Equal(t3) {
+		t.Fatalf("quantity-change segment ended at %s, want %s", priorEnd, t3)
+	}
+	var afterCPU, afterMemory, afterStorage float64
+	if err := testPool.QueryRow(ctx, billing.ExportRemeasurementSQL, team, t0, t1).Scan(&afterCPU, &afterMemory, &afterStorage); err != nil {
+		t.Fatal(err)
+	}
+	if beforeCPU != afterCPU || beforeMemory != afterMemory || beforeStorage != afterStorage {
+		t.Fatalf("finalized legacy export changed after replacement: before=%v/%v/%v after=%v/%v/%v", beforeCPU, beforeMemory, beforeStorage, afterCPU, afterMemory, afterStorage)
+	}
 }
 
 func TestRetainedStorageUnionSurvivesSnapshotAndSourceDeletion(t *testing.T) {
