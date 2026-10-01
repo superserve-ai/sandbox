@@ -63,8 +63,6 @@ logging:
           static_value: __INCARNATION_ID__
         labels.instance_id:
           copy_from: resource.labels.instance_id
-        labels.instance_name:
-          copy_from: resource.labels.instance_name
         labels.unit:
           copy_from: labels.journal_unit
     redact_sensitive_fields:

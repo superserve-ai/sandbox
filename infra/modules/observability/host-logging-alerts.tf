@@ -30,11 +30,11 @@ resource "google_logging_metric" "host_logging_heartbeat" {
   }
 
   label_extractors = {
-    # Heartbeat alerts key on the stable VM identity supplied by the expected
-    # host inventory.  Runtime host_id and incarnation remain separate labels
-    # for log attribution; extracting labels.host_id here would make a valid
-    # heartbeat invisible whenever provisioning assigns a different runtime ID.
-    collector_host_id = "EXTRACT(labels.instance_name)"
+    # GCE's monitored resource provides instance_id, project_id, and zone; it
+    # does not provide instance_name. Use the numeric instance identity for
+    # producer, metric, inventory, and alert matching. Runtime host_id,
+    # instance name, and incarnation remain separate log labels.
+    collector_host_id = "EXTRACT(labels.instance_id)"
   }
 }
 
@@ -107,7 +107,7 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
   conditions {
     display_name = "Ops Agent delivery lag on ${each.value.instance_name}"
     condition_absent {
-      filter   = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.host_logging_heartbeat[each.key].name}\" AND metric.labels.collector_host_id=\"${coalesce(each.value.collector_host_id, each.value.instance_name)}\""
+      filter   = "metric.type=\"logging.googleapis.com/user/${google_logging_metric.host_logging_heartbeat[each.key].name}\" AND metric.labels.collector_host_id=\"${each.value.instance_id}\""
       duration = format("%ds", var.host_logging_alerts.lag_threshold_seconds)
       aggregations {
         alignment_period   = "60s"

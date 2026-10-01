@@ -44,6 +44,8 @@ locals {
     agent_self_log_max_bytes = var.agent_self_log_max_bytes
     syslog_max_bytes        = var.syslog_max_bytes
     storage_scan_timeout_seconds = var.storage_scan_timeout_seconds
+    storage_scan_max_entries = var.storage_scan_max_entries
+    package_operation_timeout_seconds = var.package_operation_timeout_seconds
     heartbeat_interval_seconds = var.heartbeat_interval_seconds
     ops_agent_package_version = var.ops_agent_package_version
   })
@@ -59,6 +61,8 @@ locals {
     agent_self_log_max_bytes = var.agent_self_log_max_bytes
     syslog_max_bytes        = var.syslog_max_bytes
     storage_scan_timeout_seconds = var.storage_scan_timeout_seconds
+    storage_scan_max_entries = var.storage_scan_max_entries
+    package_operation_timeout_seconds = var.package_operation_timeout_seconds
     heartbeat_interval_seconds = var.heartbeat_interval_seconds
   })
 }
@@ -91,16 +95,10 @@ resource "google_os_config_os_policy_assignment" "host_logging" {
         os_short_name = "ubuntu"
       }
 
-      resources {
-        id = "ops-agent-package"
-        pkg {
-          desired_state = "INSTALLED"
-          apt {
-            name = "google-cloud-ops-agent"
-          }
-        }
-      }
-
+      # Package installation is intentionally owned by reconcile.sh after the
+      # selected artifact and candidate configuration pass diagnosis. An
+      # independent apt resource would mutate the active package before that
+      # transaction can capture rollback state.
       resources {
         id = "ops-agent-config"
         file {

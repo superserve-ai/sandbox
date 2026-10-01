@@ -54,9 +54,10 @@ variable "host_logging_alerts" {
     expected_hosts = map(object({
       instance_name = string
       instance_id   = string
-      # The stable VM identity is explicit so replacements cannot inherit a
-      # predecessor's heartbeat series. It matches the producer's
-      # labels.instance_name; runtime host_id and incarnation stay separate.
+      # The stable numeric VM identity is explicit so replacements cannot
+      # inherit a predecessor's heartbeat series. The Ops Agent log heartbeat
+      # matches resource.labels.instance_id; runtime host_id, VM name, and
+      # incarnation stay separate.
       # Retired hosts remain in inventory with active=false until their alert
       # state is closed.
       collector_host_id = optional(string)

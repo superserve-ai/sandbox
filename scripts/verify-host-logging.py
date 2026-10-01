@@ -23,6 +23,8 @@ def verify(root: Path) -> list[str]:
 
     config = (root / REQUIRED_FILES[2]).read_text() if (root / REQUIRED_FILES[2]).exists() else ""
     module = (root / REQUIRED_FILES[0]).read_text() if (root / REQUIRED_FILES[0]).exists() else ""
+    reconcile = (root / REQUIRED_FILES[3]).read_text() if (root / REQUIRED_FILES[3]).exists() else ""
+    alerts = (root / REQUIRED_FILES[5]).read_text() if (root / REQUIRED_FILES[5]).exists() else ""
     if "systemd_journald" not in config:
         errors.append("Ops Agent config must use systemd_journald")
     if "syslog" in config and "syslog-file" in config:
@@ -33,6 +35,14 @@ def verify(root: Path) -> list[str]:
     for required in ("google_os_config_os_policy_assignment", "roles/logging.logWriter", "SystemMaxUse", "SystemKeepFree"):
         if required not in module and required not in (root / REQUIRED_FILES[3]).read_text():
             errors.append(f"Terraform host logging module missing {required}")
+    if 'id = "ops-agent-package"' in module:
+        errors.append("Ops Agent package must not mutate before staged validation")
+    if "timeout \"${package_operation_timeout_seconds}s\"" not in reconcile:
+        errors.append("package diagnosis/install operations must have an explicit timeout")
+    if "activation_committed=1" not in reconcile or "trap on_exit EXIT" not in reconcile:
+        errors.append("activation must retain rollback state until commit")
+    if "EXTRACT(labels.instance_name)" in alerts or "EXTRACT(labels.instance_id)" not in alerts:
+        errors.append("heartbeat metric must use the available numeric instance identity")
     return errors
 
 

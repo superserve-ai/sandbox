@@ -18,8 +18,9 @@ run "host_logging_alerts_contract" {
         pilot = {
           instance_name = "example-vmd-1"
           instance_id   = "123"
-          # The runtime host_id is intentionally different and is not used by
-          # this heartbeat consumer; the producer extracts instance_name.
+          # The runtime host_id and VM name are intentionally different and are
+          # not used by this heartbeat consumer; the producer extracts the
+          # numeric instance identity.
           collector_host_id = "example-vmd-1"
           incarnation       = "incarnation-a"
         }
@@ -30,7 +31,7 @@ run "host_logging_alerts_contract" {
   assert {
     condition = alltrue([
       for metric in values(google_logging_metric.host_logging_heartbeat) :
-      metric.label_extractors["collector_host_id"] == "EXTRACT(labels.instance_name)"
+      metric.label_extractors["collector_host_id"] == "EXTRACT(labels.instance_id)"
     ])
     error_message = "Heartbeat producer must use the stable VM identity, not runtime host_id."
   }

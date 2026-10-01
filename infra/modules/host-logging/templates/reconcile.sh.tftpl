@@ -37,6 +37,12 @@ old_package_version=''
 package_change_attempted=0
 package_stage_dir=''
 staged_agent=''
+storage_scan_result=''
+rollback_package_dir=''
+rollback_package_deb=''
+activation_committed=0
+rollback_completed=0
+rollback_in_progress=0
 
 # OS Config runs this script only after validate returned 101.  The candidate
 # is rendered with the provider-bound identity on the host, then diagnosed
@@ -53,7 +59,12 @@ install -d -m 0755 "$config_dir" "$(dirname "$journald_dropin")" \
   "$(dirname "$logging_resource_dropin")" "$(dirname "$agent_metrics_resource_dropin")" \
   "$(dirname "$metrics_resource_dropin")"
 rendered_config=$(mktemp "$config_dir/.config.yaml.XXXXXX")
-trap 'rm -f "$rendered_config" "$dropin_candidate" "$logging_resource_candidate" "$agent_metrics_resource_candidate" "$metrics_resource_candidate" "$heartbeat_service_candidate" "$heartbeat_timer_candidate" "$agent_logrotate_candidate" "$syslog_logrotate_candidate" "$old_config" "$old_dropin" "$old_logging_resource" "$old_agent_metrics_resource" "$old_metrics_resource" "$old_heartbeat_service" "$old_heartbeat_timer" "$old_agent_logrotate" "$old_syslog_logrotate"; rm -rf "$package_stage_dir"' EXIT
+cleanup() {
+  rm -f "$rendered_config" "$dropin_candidate" "$logging_resource_candidate" "$agent_metrics_resource_candidate" "$metrics_resource_candidate" "$heartbeat_service_candidate" "$heartbeat_timer_candidate" "$agent_logrotate_candidate" "$syslog_logrotate_candidate" "$old_config" "$old_dropin" "$old_logging_resource" "$old_agent_metrics_resource" "$old_metrics_resource" "$old_heartbeat_service" "$old_heartbeat_timer" "$old_agent_logrotate" "$old_syslog_logrotate" "$storage_scan_result" 2>/dev/null || true
+  rm -rf "$package_stage_dir" "$rollback_package_dir" 2>/dev/null || true
+}
+trap 'exit 143' INT TERM
+trap 'status=$?; cleanup; exit "$status"' EXIT
 sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
   "$candidate_config_path" >"$rendered_config"
 chmod 0644 "$rendered_config"
@@ -79,68 +90,77 @@ done
 # the active package and its delivery state remain untouched during this test.
 installed_version=$(dpkg-query -W -f='$${Version}' google-cloud-ops-agent 2>/dev/null || true)
 if [[ "$installed_version" == ${ops_agent_package_version}* ]] && command -v google-cloud-ops-agent >/dev/null 2>&1; then
-  google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1 || exit 1
+  timeout "${package_operation_timeout_seconds}s" google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1 || exit 1
 else
   package_stage_dir=$(mktemp -d /tmp/superserve-host-logging-package.XXXXXX)
-  if ! (cd "$package_stage_dir" && apt-get download "google-cloud-ops-agent=${ops_agent_package_version}") >/dev/null 2>&1; then
+  if ! (cd "$package_stage_dir" && timeout "${package_operation_timeout_seconds}s" apt-get -o Acquire::Retries=2 download "google-cloud-ops-agent=${ops_agent_package_version}") >/dev/null 2>&1; then
     logger -t superserve-host-logging -p err "unable to stage Ops Agent ${ops_agent_package_version} for pre-activation validation"
     exit 1
   fi
   package_deb=$(find "$package_stage_dir" -maxdepth 1 -type f -name 'google-cloud-ops-agent_*.deb' -print -quit)
   test -n "$package_deb"
-  dpkg-deb --extract "$package_deb" "$package_stage_dir/root"
+  timeout "${package_operation_timeout_seconds}s" dpkg-deb --extract "$package_deb" "$package_stage_dir/root"
   staged_agent=$(find "$package_stage_dir/root" -name google-cloud-ops-agent -perm -u+x -print -quit)
   test -n "$staged_agent"
-  "$staged_agent" diagnose --config="$rendered_config" >/dev/null 2>&1 || exit 1
+  timeout "${package_operation_timeout_seconds}s" "$staged_agent" diagnose --config="$rendered_config" >/dev/null 2>&1 || exit 1
+fi
+
+# Keep a local copy of the previously installed package before any dpkg
+# mutation. Rollback must not depend on the repository still serving an older
+# revision after a later activation failure.
+if [ -n "$installed_version" ] && [[ "$installed_version" != ${ops_agent_package_version}* ]]; then
+  rollback_package_dir=$(mktemp -d /tmp/superserve-host-logging-rollback.XXXXXX)
+  if ! (cd "$rollback_package_dir" && timeout "${package_operation_timeout_seconds}s" apt-get -o Acquire::Retries=2 download "google-cloud-ops-agent=$installed_version") >/dev/null 2>&1; then
+    logger -t superserve-host-logging -p err "unable to stage installed Ops Agent ${installed_version} for rollback"
+    exit 1
+  fi
+  rollback_package_deb=$(find "$rollback_package_dir" -maxdepth 1 -type f -name 'google-cloud-ops-agent_*.deb' -print -quit)
+  test -n "$rollback_package_deb"
 fi
 
 # Check retained stores before activation. Checkpoint and buffer files are
 # never deleted. Disposable retention cleanup runs only after the new policy
 # is healthy so a failed package/configuration transition cannot discard the
 # last working delivery history.
+storage_scan_result=$(mktemp)
+if ! timeout "${storage_scan_timeout_seconds}s" bash -c '
+  set -euo pipefail
+  buffer_dir="$1"; self_log_dir="$2"; max_syslog_files="$3"; output="$4"
+  paths=()
+  [ -e "$buffer_dir" ] && paths+=("$buffer_dir")
+  [ -e "$self_log_dir" ] && paths+=("$self_log_dir")
+  while IFS= read -r path; do paths+=("$path"); done < <(
+    { find /var/log -maxdepth 1 -type f \( -name "syslog" -o -name "syslog.*" \) -print | sort | head -n "$max_syslog_files"; } || :
+  )
+  if [ "$${#paths[@]}" -gt 0 ]; then du -sx --block-size=1 "$${paths[@]}" >"$output"; else :; fi
+' _ "$buffer_dir" "$self_log_dir" "${storage_scan_max_entries}" "$storage_scan_result"; then
+  logger -t superserve-host-logging -p err "storage accounting exceeded ${storage_scan_timeout_seconds}s bounded scan budget"
+  exit 1
+fi
 storage_bytes=0
-# SystemMaxUse is the supported journal bound; use it as the conservative
-# contribution to the combined free-space objective without recursively
-# walking the journal tree on every OS Config cycle.
-journal_bytes=${journal_max_use_bytes}
-storage_scan_started=$SECONDS
-storage_scan_timeout=${storage_scan_timeout_seconds}
-for path in "$buffer_dir" "$self_log_dir" /var/log/syslog /var/log/syslog.*; do
-  if [ -e "$path" ]; then
-    # Bound recursive accounting so a large retained tree cannot hold the OS
-    # Config executor or amplify retries indefinitely. A timeout is a visible
-    # failure; it never deletes checkpoint or buffer state.
-    size=$(timeout "$${storage_scan_timeout}s" du -sx --block-size=1 "$path" 2>/dev/null | awk 'NR == 1 {print $1}') || exit 1
-    test -n "$size"
-    case "$path" in
-      "$self_log_dir")
-        if [ "$size" -gt ${agent_self_log_max_bytes} ]; then
-          logger -t superserve-host-logging -p err "Ops Agent self-log store exceeded ${agent_self_log_max_bytes} byte bound"
-          exit 1
-        fi
-        ;;
-      /var/log/syslog*)
-        if [ "$size" -gt ${syslog_max_bytes} ]; then
-          logger -t superserve-host-logging -p err "retained syslog store exceeded ${syslog_max_bytes} byte bound"
-          exit 1
-        fi
-        ;;
-    esac
-    storage_bytes=$((storage_bytes + size))
-  fi
-done
-storage_scan_elapsed=$((SECONDS - storage_scan_started))
-if [ "$storage_scan_elapsed" -gt "$storage_scan_timeout" ]; then
-  logger -t superserve-host-logging -p err "storage accounting exceeded $${storage_scan_timeout}s scan budget"
-  exit 1
+buffer_bytes=0
+self_log_bytes=0
+syslog_bytes=0
+while read -r size path; do
+  test -n "$size" || continue
+  storage_bytes=$((storage_bytes + size))
+  case "$path" in
+    "$buffer_dir"*) buffer_bytes=$((buffer_bytes + size)) ;;
+    "$self_log_dir"*) self_log_bytes=$((self_log_bytes + size)) ;;
+    /var/log/syslog*) syslog_bytes=$((syslog_bytes + size)) ;;
+  esac
+done < "$storage_scan_result"
+if [ "$self_log_bytes" -gt ${agent_self_log_max_bytes} ]; then
+  logger -t superserve-host-logging -p warning "Ops Agent self-log store exceeds ${agent_self_log_max_bytes} byte bound; disposable retention will be reclaimed after activation"
 fi
-if [ "$storage_bytes" -gt ${agent_buffer_bytes} ]; then
-  logger -t superserve-host-logging -p err "storage budget exceeded: $${storage_bytes} bytes > ${agent_buffer_bytes}; retained Ops Agent buffer was not deleted"
-  exit 1
+if [ "$syslog_bytes" -gt ${syslog_max_bytes} ]; then
+  logger -t superserve-host-logging -p warning "retained syslog store exceeds ${syslog_max_bytes} byte bound; disposable retention will be reclaimed after activation"
 fi
-if [ $((journal_bytes + storage_bytes)) -gt ${journal_keep_free_bytes} ]; then
-  logger -t superserve-host-logging -p err "combined journal and auxiliary logging stores exceeded ${journal_keep_free_bytes} byte free-space objective"
-  exit 1
+if [ "$buffer_bytes" -gt ${agent_buffer_bytes} ]; then
+  logger -t superserve-host-logging -p warning "Ops Agent buffer exceeds ${agent_buffer_bytes} byte budget; checkpoint and pending buffer state will be preserved"
+fi
+if [ $((journal_max_use_bytes + storage_bytes)) -gt ${journal_keep_free_bytes} ]; then
+  logger -t superserve-host-logging -p warning "combined journal and auxiliary logging stores exceed ${journal_keep_free_bytes} byte free-space objective; disposable retention will be reclaimed after activation"
 fi
 
 test -s "$journald_candidate_path"
@@ -264,11 +284,15 @@ systemctl is-active --quiet systemd-journald.service && journald_was_active=1 ||
 systemctl is-active --quiet superserve-host-logging-heartbeat.timer && heartbeat_timer_was_active=1 || true
 
 rollback() {
+  rollback_in_progress=1
+  set +e
   if [ "$package_change_attempted" -eq 1 ]; then
-    if [ -n "$old_package_version" ]; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "google-cloud-ops-agent=$old_package_version" >/dev/null 2>&1 || true
+    if [ -n "$rollback_package_deb" ]; then
+      timeout "${package_operation_timeout_seconds}s" dpkg -i "$rollback_package_deb" >/dev/null 2>&1 || true
+    elif [ -n "$old_package_version" ]; then
+      timeout "${package_operation_timeout_seconds}s" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o DPkg::Lock::Timeout=30 "google-cloud-ops-agent=$old_package_version" >/dev/null 2>&1 || true
     else
-      DEBIAN_FRONTEND=noninteractive apt-get remove -y google-cloud-ops-agent >/dev/null 2>&1 || true
+      timeout "${package_operation_timeout_seconds}s" env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=30 -y remove google-cloud-ops-agent >/dev/null 2>&1 || true
     fi
   fi
   if [ "$had_config" -eq 1 ]; then install -m 0644 "$old_config" "$config_path"; else rm -f "$config_path"; fi
@@ -288,20 +312,31 @@ rollback() {
   if [ "$journald_was_active" -eq 1 ]; then systemctl try-reload-or-restart systemd-journald.service || true; else systemctl stop systemd-journald.service || true; fi
   if [ "$agent_was_active" -eq 1 ]; then systemctl start google-cloud-ops-agent.service || true; else systemctl stop google-cloud-ops-agent.service || true; fi
   if [ "$agent_was_enabled" -eq 1 ]; then systemctl enable google-cloud-ops-agent.service || true; else systemctl disable google-cloud-ops-agent.service || true; fi
+  rollback_completed=1
+  rollback_in_progress=0
+  set -e
 }
 
-# The package resource only guarantees presence, not the reviewed release.
-# Snapshot service/configuration state above, then make the version change as
+on_exit() {
+  status=$?
+  if [ "$status" -ne 0 ] && [ "$activation_committed" -eq 0 ] && [ "$rollback_completed" -eq 0 ] && [ "$rollback_in_progress" -eq 0 ]; then
+    rollback || true
+  fi
+  cleanup
+  exit "$status"
+}
+trap on_exit EXIT
+
+# The package is staged and diagnosed before this transaction. Snapshot
+# service/configuration state above, then make the version change as
 # part of the same transaction so any activation failure can restore both the
 # previous package and its delivery state.
-if [[ "$installed_version" != ${ops_agent_package_version}* ]]; then
+if [[ "$installed_version" != ${ops_agent_package_version}* ]] || ! command -v google-cloud-ops-agent >/dev/null 2>&1; then
   package_change_attempted=1
-  if ! DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "google-cloud-ops-agent=${ops_agent_package_version}"; then
-    rollback
+  if ! timeout "${package_operation_timeout_seconds}s" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -o DPkg::Lock::Timeout=30 -o Acquire::Retries=2 "google-cloud-ops-agent=${ops_agent_package_version}"; then
     exit 1
   fi
-  if ! google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1; then
-    rollback
+  if ! timeout "${package_operation_timeout_seconds}s" google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1; then
     exit 1
   fi
 fi
@@ -386,9 +421,21 @@ done
 if ! systemctl enable --now superserve-host-logging-heartbeat.timer; then rollback; exit 1; fi
 systemctl is-active --quiet superserve-host-logging-heartbeat.timer || { rollback; exit 1; }
 
+# No subsequent operation mutates managed configuration. Recovery snapshots can
+# now be discarded by the exit handler; checkpoint and pending buffer state is
+# never part of the snapshot or cleanup set.
+activation_committed=1
+
 # Reclaim only disposable retention stores after successful activation. The
 # selected release's checkpoint/buffer state is never copied or deleted.
-journalctl --vacuum-size=${journal_max_use_bytes}B >/dev/null 2>&1 || true
-find "$self_log_dir" -type f -name '*.log*' -mtime +7 -delete 2>/dev/null || true
-find /var/log -maxdepth 1 -type f -name 'syslog.*' -mtime +7 -delete 2>/dev/null || true
+timeout "${storage_scan_timeout_seconds}s" journalctl --vacuum-size=${journal_max_use_bytes}B >/dev/null 2>&1 || true
+timeout "${storage_scan_timeout_seconds}s" bash -c '
+  set +e
+  self_log_dir="$1"; max_entries="$2"
+  for pattern in "*.log*" "syslog.*"; do
+    root="$self_log_dir"
+    [ "$pattern" = "syslog.*" ] && root=/var/log
+    find "$root" -maxdepth 1 -type f -name "$pattern" -mtime +7 -print 2>/dev/null | sort | head -n "$max_entries" | while IFS= read -r path; do rm -f -- "$path"; done || true
+  done
+' _ "$self_log_dir" "${storage_scan_max_entries}" || logger -t superserve-host-logging -p warning "disposable retention cleanup exceeded bounded scan budget"
 exit 0

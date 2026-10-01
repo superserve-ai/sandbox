@@ -113,6 +113,28 @@ variable "storage_scan_timeout_seconds" {
   }
 }
 
+variable "storage_scan_max_entries" {
+  description = "Maximum number of rotated syslog entries included in one bounded storage accounting pass."
+  type        = number
+  default     = 32
+
+  validation {
+    condition     = var.storage_scan_max_entries >= 1
+    error_message = "storage_scan_max_entries must be at least one."
+  }
+}
+
+variable "package_operation_timeout_seconds" {
+  description = "Wall-clock bound for each staged or active Ops Agent package operation, including rollback."
+  type        = number
+  default     = 120
+
+  validation {
+    condition     = var.package_operation_timeout_seconds >= 30
+    error_message = "package_operation_timeout_seconds must be at least 30 seconds."
+  }
+}
+
 variable "heartbeat_interval_seconds" {
   description = "Per-host heartbeat period; reconciliation performs no fleet-sized heartbeat loop."
   type        = number

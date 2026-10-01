@@ -2,7 +2,7 @@
 
 This module adopts one zonal OS Config policy assignment per environment and
 reconciles the Google Ops Agent on existing and replacement serving hosts.
-Terraform owns the assignment, package/file/service resources, runtime logging
+Terraform owns the assignment, staged package/file/service reconciliation, runtime logging
 grant, private versioned configuration artifacts, journald retention, and
 rollback revision.
 
@@ -28,11 +28,12 @@ metrics receiving the smaller share so its existing queue/memory limiter sheds
 metrics before log export is constrained. Reconciliation manages explicit
 logrotate bounds for the disposable self-log and legacy syslog stores and
 checks the combined buffer budget before activation; successful activation
-then vacuums journald. It never deletes
-checkpoints and emits an independent error when a store or the supported
-buffer itself remains over budget. Recursive accounting is bounded by a
-five-second scan budget so an oversized tree fails visibly instead of
-amplifying OS Config retries. Staging must measure combined growth before
+then vacuums journald. It never deletes checkpoints or pending buffers; an
+oversized disposable store is reported and reclaimed in a bounded post-commit
+pass, while an oversized supported buffer is reported without blocking
+exporter recovery. Recursive accounting uses one bounded scan deadline and a
+fixed enumeration cap so rotated-file growth cannot amplify OS Config retries.
+Staging must measure combined growth before
 production. The configured 4 GiB journal maximum is counted conservatively in
 the combined free-space precondition without adding a second recursive
 journal walk.
@@ -41,8 +42,9 @@ the policy performs no fleet-sized heartbeat loop, so monitoring work is
 linear in the expected-host inventory and constant per host.
 Candidate configuration and the journald drop-in are validated before atomic
 activation. A package upgrade is diagnosed from a staged selected-release
-artifact before installation; a failed reconciliation restores the previous
-package, service/configuration state, and delivery state. The policy never
+artifact before installation, with the installed package staged for rollback;
+a failed reconciliation restores the previous package, service/configuration
+state, and delivery state. The policy never
 restarts VMD or mutates identity/admission files. A managed minute heartbeat
 supplies a timestamped log-based freshness signal keyed by the stable VM
 identity, while runtime host ID and incarnation remain distinct; the

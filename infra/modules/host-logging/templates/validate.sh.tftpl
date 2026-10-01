@@ -15,6 +15,7 @@ syslog_logrotate='/etc/logrotate.d/superserve-host-syslog'
 identity_file='/etc/sandbox/host-identity.json'
 buffer_dir='/var/lib/google-cloud-ops-agent/fluent-bit/buffers'
 self_log_dir='/var/log/google-cloud-ops-agent'
+storage_scan_result=''
 
 # 100 means fully compliant; 101 asks OS Config to run enforce. Any invalid
 # candidate is an error and must not be treated as repairable drift.
@@ -32,13 +33,13 @@ esac
 command -v google-cloud-ops-agent >/dev/null 2>&1 || exit 101
 
 rendered_config=$(mktemp)
-trap 'rm -f "$rendered_config"' EXIT
+trap 'rm -f "$rendered_config" "$storage_scan_result"' EXIT
 sed -e "s|__HOST_ID__|$host_id|g" -e "s|__INCARNATION_ID__|$incarnation_id|g" \
   "$candidate_config_path" >"$rendered_config"
 if grep -qE '__HOST_ID__|__INCARNATION_ID__' "$rendered_config"; then
   exit 101
 fi
-if ! google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1; then
+if ! timeout "${package_operation_timeout_seconds}s" google-cloud-ops-agent diagnose --config="$rendered_config" >/dev/null 2>&1; then
   # The candidate itself is invalid, so OS Config must surface an error rather
   # than repeatedly re-running enforce against a broken revision.
   exit 1
@@ -46,7 +47,7 @@ fi
 
 drift=0
 if ! cmp -s "$rendered_config" "$config_path" 2>/dev/null; then drift=1; fi
-if [ -s "$config_path" ] && ! google-cloud-ops-agent diagnose --config="$config_path" >/dev/null 2>&1; then drift=1; fi
+if [ -s "$config_path" ] && ! timeout "${package_operation_timeout_seconds}s" google-cloud-ops-agent diagnose --config="$config_path" >/dev/null 2>&1; then drift=1; fi
 expected_journald=$(mktemp)
 trap 'rm -f "$rendered_config" "$expected_journald"' EXIT
 install -m 0644 "$journald_candidate_path" "$expected_journald"
@@ -121,35 +122,37 @@ systemctl is-active --quiet superserve-host-logging-heartbeat.timer || drift=1
 # effective buffer, self-log, and retained syslog stores exceed the separately
 # budgeted threshold. This preserves metrics-first pressure handling and leaves
 # checkpoint files untouched for the next reconciliation.
+storage_scan_result=$(mktemp)
+if ! timeout "${storage_scan_timeout_seconds}s" bash -c '
+  set -euo pipefail
+  buffer_dir="$1"; self_log_dir="$2"; max_syslog_files="$3"; output="$4"
+  paths=()
+  [ -e "$buffer_dir" ] && paths+=("$buffer_dir")
+  [ -e "$self_log_dir" ] && paths+=("$self_log_dir")
+  while IFS= read -r path; do paths+=("$path"); done < <(
+    { find /var/log -maxdepth 1 -type f \( -name "syslog" -o -name "syslog.*" \) -print | sort | head -n "$max_syslog_files"; } || :
+  )
+  if [ "$${#paths[@]}" -gt 0 ]; then du -sx --block-size=1 "$${paths[@]}" >"$output"; else :; fi
+' _ "$buffer_dir" "$self_log_dir" "${storage_scan_max_entries}" "$storage_scan_result"; then
+  exit 1
+fi
 storage_bytes=0
-# SystemMaxUse is the supported journal bound; use it as the conservative
-# contribution to the combined free-space objective without recursively
-# walking the journal tree on every OS Config cycle.
-journal_bytes=${journal_max_use_bytes}
-storage_scan_started=$SECONDS
-storage_scan_timeout=${storage_scan_timeout_seconds}
-for path in "$buffer_dir" "$self_log_dir" /var/log/syslog /var/log/syslog.*; do
-  if [ -e "$path" ]; then
-    # du is recursive for the agent buffer and self-log trees.  Bound each
-    # scan so a large retained tree cannot hold the OS Config executor or
-    # amplify retries indefinitely; a timeout is a visible validation error.
-    size=$(timeout "$${storage_scan_timeout}s" du -sx --block-size=1 "$path" 2>/dev/null | awk 'NR == 1 {print $1}') || exit 1
-    test -n "$size" || exit 1
-    case "$path" in
-      "$self_log_dir")
-        [ "$size" -le ${agent_self_log_max_bytes} ] || drift=1
-        ;;
-      /var/log/syslog*)
-        [ "$size" -le ${syslog_max_bytes} ] || drift=1
-        ;;
-    esac
-    storage_bytes=$((storage_bytes + size))
-  fi
-done
-storage_scan_elapsed=$((SECONDS - storage_scan_started))
-if [ "$storage_scan_elapsed" -gt "$storage_scan_timeout" ]; then exit 1; fi
-if [ "$storage_bytes" -gt ${agent_buffer_bytes} ]; then drift=1; fi
-if [ $((journal_bytes + storage_bytes)) -gt ${journal_keep_free_bytes} ]; then drift=1; fi
+buffer_bytes=0
+self_log_bytes=0
+syslog_bytes=0
+while read -r size path; do
+  test -n "$size" || continue
+  storage_bytes=$((storage_bytes + size))
+  case "$path" in
+    "$buffer_dir"*) buffer_bytes=$((buffer_bytes + size)) ;;
+    "$self_log_dir"*) self_log_bytes=$((self_log_bytes + size)) ;;
+    /var/log/syslog*) syslog_bytes=$((syslog_bytes + size)) ;;
+  esac
+done < "$storage_scan_result"
+[ "$self_log_bytes" -le ${agent_self_log_max_bytes} ] || drift=1
+[ "$syslog_bytes" -le ${syslog_max_bytes} ] || drift=1
+[ "$buffer_bytes" -le ${agent_buffer_bytes} ] || drift=1
+[ $((journal_max_use_bytes + storage_bytes)) -le ${journal_keep_free_bytes} ] || drift=1
 
 if [ "$drift" -ne 0 ]; then
   exit 101
