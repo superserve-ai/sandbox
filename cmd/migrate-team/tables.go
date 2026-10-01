@@ -144,6 +144,7 @@ var skippedTables = []struct{ name, reason string }{
 	{"reconciler_log", "audit of the source cell's hosts; meaningless in the dest cell"},
 	{"device_code", "ephemeral per-user login flow; global Auth re-issues on next login"},
 	{"host", "cell-local infrastructure"},
+	{"sandbox_routing_revocation", "cell-local ownership fences; retained by each cell independently"},
 	{"roles, permissions, role_permissions", "migration-seeded per cell; assignments are remapped by role name"},
 	{"feature_flag, pricing_plan, pricing_rate", "migration-seeded per cell"},
 	{"billing_rollup_scheduler_lease, billing_rollup_backfill_state", "global scheduler state, not team-scoped"},

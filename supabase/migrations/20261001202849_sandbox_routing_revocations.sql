@@ -11,7 +11,15 @@ CREATE TABLE public.sandbox_routing_revocation (
 );
 CREATE INDEX sandbox_routing_revocation_expiry ON public.sandbox_routing_revocation (expires_at);
 ALTER TABLE public.sandbox_routing_revocation ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON public.sandbox_routing_revocation FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON public.sandbox_routing_revocation FROM PUBLIC;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
+        REVOKE ALL ON public.sandbox_routing_revocation FROM anon;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
+        REVOKE ALL ON public.sandbox_routing_revocation FROM authenticated;
+    END IF;
+END $$;
 GRANT SELECT ON public.sandbox_routing_revocation TO sandbox_proxy_router;
 CREATE POLICY routing_revocation_reader ON public.sandbox_routing_revocation FOR SELECT TO sandbox_proxy_router USING (true);
 
@@ -67,8 +75,12 @@ BEGIN
     );
 END $$;
 REVOKE ALL ON FUNCTION routing_private.prune_revocations(timestamptz) FROM PUBLIC;
-GRANT USAGE ON SCHEMA routing_private TO service_role;
-GRANT EXECUTE ON FUNCTION routing_private.prune_revocations(timestamptz) TO service_role;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
+        GRANT USAGE ON SCHEMA routing_private TO service_role;
+        GRANT EXECUTE ON FUNCTION routing_private.prune_revocations(timestamptz) TO service_role;
+    END IF;
+END $$;
 
 -- Four ownership sessions plus one background session per proxy. The default
 -- supports six hosts with both serving generations present; keep custom limits.

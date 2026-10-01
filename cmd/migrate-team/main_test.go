@@ -518,6 +518,11 @@ func (f *fixture) cfg(phase string) config {
 func TestTeamMigration(t *testing.T) {
 	ctx := context.Background()
 	f := seedFixture(t)
+	mustExec(t, srcPool, `UPDATE sandbox SET host_id = 'previous-owner' WHERE id = $1`, f.sb1)
+	mustExec(t, srcPool, `UPDATE sandbox SET host_id = $2 WHERE id = $1`, f.sb1, sourceHostID)
+	if got := scanString(t, srcPool, `SELECT routing_version::text FROM sandbox WHERE id = $1`, f.sb1); got != "3" {
+		t.Fatalf("source ownership history version=%s, want 3", got)
+	}
 
 	// Sanity: the fixture's expected-count map covers exactly the migrated set.
 	if len(f.expectedCounts) != len(migratedTables) {
@@ -628,6 +633,9 @@ func TestTeamMigration(t *testing.T) {
 	t.Run("copy round-trip", func(t *testing.T) {
 		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
 			t.Fatalf("copy: %v", err)
+		}
+		if got := scanString(t, dstPool, `SELECT routing_version::text FROM sandbox WHERE id = $1`, f.sb1); got != "1" {
+			t.Fatalf("new destination ownership version=%s, want 1", got)
 		}
 
 		for _, spec := range migratedTables {
@@ -802,6 +810,25 @@ func TestTeamMigration(t *testing.T) {
 		}
 		if got := scanString(t, dstPool, `SELECT snapshot_id::text FROM sandbox WHERE id = $1`, f.sb1); got != f.snap1.String() {
 			t.Errorf("re-copy broke sb1.snapshot_id: %s", got)
+		}
+	})
+
+	t.Run("re-copy preserves destination ownership fences", func(t *testing.T) {
+		for i := 0; i < 2; i++ {
+			mustExec(t, dstPool, `UPDATE sandbox SET host_id = 'temporary-owner' WHERE id = $1`, f.sb1)
+			mustExec(t, dstPool, `UPDATE sandbox SET host_id = $2 WHERE id = $1`, f.sb1, destHostID)
+		}
+		if err := run(ctx, f.cfg(phaseCopy)); err != nil {
+			t.Fatal(err)
+		}
+		if got := scanString(t, dstPool, `SELECT routing_version::text FROM sandbox WHERE id = $1`, f.sb1); got != "5" {
+			t.Fatalf("re-copy reset destination ownership version=%s, want 5", got)
+		}
+		if got := scanString(t, dstPool, `SELECT count(*)::text FROM sandbox_routing_revocation WHERE sandbox_id = $1 AND routing_version BETWEEN 1 AND 4`, f.sb1); got != "4" {
+			t.Fatalf("re-copy lost destination fences: %s", got)
+		}
+		if err := run(ctx, f.cfg(phaseValidate)); err != nil {
+			t.Fatal(err)
 		}
 	})
 

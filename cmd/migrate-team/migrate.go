@@ -774,6 +774,9 @@ func buildTransforms(ctx context.Context, src, dst querier, cfg config) (map[str
 		},
 		"sandbox": func(row map[string]any) error {
 			row["host_id"] = cfg.destHostID
+			// A new destination row starts its own ownership history. On
+			// re-copy, the trigger preserves the existing destination fence.
+			row["routing_version"] = 1
 			// Break the sandbox.snapshot_id ↔ snapshot.sandbox_id cycle:
 			// insert with NULL, relink after snapshots are in.
 			row["snapshot_id"] = nil
