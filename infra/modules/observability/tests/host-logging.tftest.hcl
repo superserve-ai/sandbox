@@ -46,4 +46,14 @@ run "host_logging_alerts_contract" {
     ])
     error_message = "Each Monitoring condition block must contain exactly one supported condition type."
   }
+
+  assert {
+    condition = alltrue([
+      for policy in values(google_monitoring_alert_policy.host_logging_heartbeat) :
+      length(one(policy.conditions).condition_prometheus_query_language) == 1 &&
+      strcontains(one(policy.conditions).condition_prometheus_query_language[0].query, "absent(") &&
+      one(policy.conditions).condition_prometheus_query_language[0].disable_metric_validation
+    ])
+    error_message = "Heartbeat absence must alert on an empty expected-host series, including never-seen replacements."
+  }
 }

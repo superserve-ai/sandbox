@@ -9,9 +9,19 @@
 # Ops Agent ${ops_agent_package_version} is selected by the OS policy. This
 # release uses its documented built-in disk buffer cap (introduced in 2.28);
 # no unsupported environment variable or generated Fluent Bit setting is used.
+global:
+  # Ops Agent 2.52 supports disabling its own Fluent Bit self-log ingestion;
+  # this keeps the managed journald path from feeding a second high-volume
+  # self-log stream while nested self-logs remain locally rotatable.
+  default_self_log_file_collection: false
+
 logging:
   receivers:
     vmd_proxy_journald:
+      # The supported 2.52 systemd_journald receiver has no unit/include
+      # selector; allowlisting therefore remains an exclude_logs processor.
+      # Reconciliation bounds the journald source and logging subagent with
+      # persistent journal/free-space limits and a systemd CPU/memory quota.
       type: systemd_journald
   processors:
     # This is a provenance filter, not an application-data filter. The

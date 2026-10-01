@@ -64,6 +64,16 @@ class HostLoggingConfigChecks(unittest.TestCase):
         self.assertIn(expected_comment, self.reconcile)
         self.assertIn(expected_comment, self.validate)
 
+    def test_os_config_shell_reexec_and_bounded_storage_contract(self):
+        for script in (self.reconcile, self.validate):
+            self.assertIn('exec /bin/bash "$0" "$@"', script)
+            self.assertIn("scan_limit=$((max_entries + 1))", script)
+            self.assertNotIn("find /var/log -maxdepth 1", script)
+            self.assertNotIn("| sort | head", script)
+        self.assertIn("exit 100", self.reconcile)
+        self.assertIn("storage_scan_deadline", self.reconcile)
+        self.assertIn("logrotate -f", self.reconcile)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -101,9 +101,8 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
     }
   }
 
-  # Monitoring conditions are typed one-per-block.  Keep the retained-log
-  # absence signal and the independent never-seen heartbeat threshold as
-  # separate blocks so the provider can represent both valid condition types.
+  # Monitoring conditions are typed one-per-block. The retained-log absence
+  # signal remains separate from the independent expected-host evaluation.
   conditions {
     display_name = "Ops Agent delivery lag on ${each.value.instance_name}"
     condition_absent {
@@ -116,23 +115,6 @@ resource "google_monitoring_alert_policy" "host_logging_lag" {
     }
   }
 
-  conditions {
-    display_name = "No independent heartbeat for ${each.value.instance_name}"
-    condition_threshold {
-      # A threshold condition with missing-data-as-active covers a host that
-      # has never emitted its first independent heartbeat series. Once the
-      # series exists, only a positive current uptime satisfies it.
-      filter                  = "metric.type=\"${var.host_logging_alerts.heartbeat_metric_type}\" AND metric.labels.collector_host_id=\"${coalesce(each.value.collector_host_id, each.value.instance_name)}\""
-      comparison              = "COMPARISON_LT"
-      threshold_value         = 1
-      duration                = var.host_logging_alerts.heartbeat_duration
-      evaluation_missing_data = "EVALUATION_MISSING_DATA_ACTIVE"
-      aggregations {
-        alignment_period   = "60s"
-        per_series_aligner = "ALIGN_MEAN"
-      }
-    }
-  }
 
   alert_strategy {
     notification_rate_limit { period = "900s" }
@@ -175,16 +157,21 @@ resource "google_monitoring_alert_policy" "host_logging_heartbeat" {
 
   conditions {
     display_name = "Serving host heartbeat absent on ${each.value.instance_name}"
-    condition_absent {
-      # GMP may use its prometheus_target monitored resource rather than a
-      # GCE resource for this series, so scope by the stable metric label and
-      # not by a resource type that would make never-seen hosts invisible.
-      filter   = "metric.type=\"${var.host_logging_alerts.heartbeat_metric_type}\" AND metric.labels.collector_host_id=\"${coalesce(each.value.collector_host_id, each.value.instance_name)}\""
-      duration = var.host_logging_alerts.heartbeat_duration
-      aggregations {
-        alignment_period   = "60s"
-        per_series_aligner = "ALIGN_MEAN"
-      }
+    condition_prometheus_query_language {
+      # PromQL absent() returns an explicit one-valued result when the
+      # expected label set has never produced a series. Metric-absence and
+      # missing-data policies cannot create that initial series. The selector
+      # uses the standalone collector's independent identity, so Ops Agent
+      # export failure cannot satisfy or silence this condition.
+      query = <<-EOT
+        absent({
+          "__name__" = "${var.host_logging_alerts.heartbeat_metric_type}",
+          "collector_host_id" = "${coalesce(each.value.collector_host_id, each.value.instance_name)}"
+        }) == 1
+      EOT
+      duration                  = var.host_logging_alerts.heartbeat_duration
+      evaluation_interval       = "60s"
+      disable_metric_validation = true
     }
   }
 

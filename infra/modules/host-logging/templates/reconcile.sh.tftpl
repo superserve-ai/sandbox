@@ -1,4 +1,9 @@
-#!/bin/bash
+#!/bin/sh
+# OS Config's SHELL interpreter invokes /bin/sh. Re-exec through Bash before
+# using arrays, process substitution, or pipefail on supported Ubuntu images.
+if [ -z "$${BASH_VERSION:-}" ]; then
+  exec /bin/bash "$0" "$@"
+fi
 set -euo pipefail
 
 config_path='${config_path}'
@@ -43,6 +48,7 @@ rollback_package_deb=''
 activation_committed=0
 rollback_completed=0
 rollback_in_progress=0
+journal_max_use_bytes=${journal_max_use_bytes}
 
 # OS Config runs this script only after validate returned 101.  The candidate
 # is rendered with the provider-bound identity on the host, then diagnosed
@@ -111,7 +117,7 @@ fi
 if [ -n "$installed_version" ] && [[ "$installed_version" != ${ops_agent_package_version}* ]]; then
   rollback_package_dir=$(mktemp -d /tmp/superserve-host-logging-rollback.XXXXXX)
   if ! (cd "$rollback_package_dir" && timeout "${package_operation_timeout_seconds}s" apt-get -o Acquire::Retries=2 download "google-cloud-ops-agent=$installed_version") >/dev/null 2>&1; then
-    logger -t superserve-host-logging -p err "unable to stage installed Ops Agent ${installed_version} for rollback"
+    logger -t superserve-host-logging -p err "unable to stage installed Ops Agent $${installed_version} for rollback"
     exit 1
   fi
   rollback_package_deb=$(find "$rollback_package_dir" -maxdepth 1 -type f -name 'google-cloud-ops-agent_*.deb' -print -quit)
@@ -123,33 +129,54 @@ fi
 # is healthy so a failed package/configuration transition cannot discard the
 # last working delivery history.
 storage_scan_result=$(mktemp)
-if ! timeout "${storage_scan_timeout_seconds}s" bash -c '
+storage_scan_deadline=$(( $(date +%s) + ${storage_scan_timeout_seconds} ))
+storage_scan_remaining() {
+  remaining=$((storage_scan_deadline - $(date +%s)))
+  [ "$remaining" -gt 0 ] || return 1
+  printf '%ss' "$remaining"
+}
+storage_scan_timeout=$(storage_scan_remaining) || {
+  logger -t superserve-host-logging -p err "storage accounting deadline expired before scan"
+  exit 1
+}
+if ! timeout "$storage_scan_timeout" bash -c '
   set -euo pipefail
-  buffer_dir="$1"; self_log_dir="$2"; max_syslog_files="$3"; output="$4"
-  paths=()
-  [ -e "$buffer_dir" ] && paths+=("$buffer_dir")
-  [ -e "$self_log_dir" ] && paths+=("$self_log_dir")
-  while IFS= read -r path; do paths+=("$path"); done < <(
-    { find /var/log -maxdepth 1 -type f \( -name "syslog" -o -name "syslog.*" \) -print | sort | head -n "$max_syslog_files"; } || :
-  )
-  if [ "$${#paths[@]}" -gt 0 ]; then du -sx --block-size=1 "$${paths[@]}" >"$output"; else :; fi
-' _ "$buffer_dir" "$self_log_dir" "${storage_scan_max_entries}" "$storage_scan_result"; then
+  buffer_dir="$1"; self_log_dir="$2"; max_entries="$3"; output="$4"
+  scan_store() {
+    kind="$1"; root="$2"; count=0; bytes=0; capped=0; scan_limit=$((max_entries + 1))
+    [ -e "$root" ] || { printf "%s %s %s\n" "$kind" 0 0; return; }
+    if [ "$kind" = syslog ]; then
+      scan_command=(find "$root" -xdev -maxdepth 1 -type f \( -name syslog -o -name 'syslog.*' \) -print0)
+    else
+      scan_command=(find "$root" -xdev -type f -print0)
+    fi
+    while IFS= read -r -d "" path; do
+      if [ "$count" -ge "$scan_limit" ]; then break; fi
+      size=$(stat -c "%s" -- "$path" 2>/dev/null || printf "0")
+      bytes=$((bytes + size)); count=$((count + 1))
+    done < <("$${scan_command[@]}" 2>/dev/null)
+    [ "$count" -gt "$max_entries" ] && capped=1
+    printf "%s %s %s\n" "$kind" "$bytes" "$capped"
+  }
+  scan_store buffer "$buffer_dir"
+  scan_store self_log "$self_log_dir"
+  scan_store syslog /var/log
+' _ "$buffer_dir" "$self_log_dir" "${storage_scan_max_entries}" "$storage_scan_result" >"$storage_scan_result"; then
   logger -t superserve-host-logging -p err "storage accounting exceeded ${storage_scan_timeout_seconds}s bounded scan budget"
   exit 1
 fi
-storage_bytes=0
-buffer_bytes=0
-self_log_bytes=0
-syslog_bytes=0
-while read -r size path; do
-  test -n "$size" || continue
+storage_bytes=0; buffer_bytes=0; self_log_bytes=0; syslog_bytes=0
+storage_scan_capped=0
+while read -r kind size capped; do
+  test -n "$kind" || continue
   storage_bytes=$((storage_bytes + size))
-  case "$path" in
-    "$buffer_dir"*) buffer_bytes=$((buffer_bytes + size)) ;;
-    "$self_log_dir"*) self_log_bytes=$((self_log_bytes + size)) ;;
-    /var/log/syslog*) syslog_bytes=$((syslog_bytes + size)) ;;
+  case "$kind" in
+    buffer) buffer_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
+    self_log) self_log_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
+    syslog) syslog_bytes=$size; [ "$capped" -eq 1 ] && storage_scan_capped=1 ;;
   esac
 done < "$storage_scan_result"
+[ "$storage_scan_capped" -eq 0 ] || logger -t superserve-host-logging -p warning "storage accounting reached its bounded entry cap; reconciliation will reclaim disposable files after activation"
 if [ "$self_log_bytes" -gt ${agent_self_log_max_bytes} ]; then
   logger -t superserve-host-logging -p warning "Ops Agent self-log store exceeds ${agent_self_log_max_bytes} byte bound; disposable retention will be reclaimed after activation"
 fi
@@ -427,15 +454,52 @@ systemctl is-active --quiet superserve-host-logging-heartbeat.timer || { rollbac
 activation_committed=1
 
 # Reclaim only disposable retention stores after successful activation. The
-# selected release's checkpoint/buffer state is never copied or deleted.
-timeout "${storage_scan_timeout_seconds}s" journalctl --vacuum-size=${journal_max_use_bytes}B >/dev/null 2>&1 || true
-timeout "${storage_scan_timeout_seconds}s" bash -c '
+# selected release's checkpoint/buffer state is never copied or deleted. One
+# deadline covers journal vacuum, explicit rotation, and bounded store passes.
+storage_scan_timeout=$(storage_scan_remaining) || {
+  logger -t superserve-host-logging -p warning "disposable retention cleanup skipped after storage deadline"
+  exit 100
+}
+if ! timeout "$storage_scan_timeout" bash -c '
   set +e
-  self_log_dir="$1"; max_entries="$2"
-  for pattern in "*.log*" "syslog.*"; do
-    root="$self_log_dir"
-    [ "$pattern" = "syslog.*" ] && root=/var/log
-    find "$root" -maxdepth 1 -type f -name "$pattern" -mtime +7 -print 2>/dev/null | sort | head -n "$max_entries" | while IFS= read -r path; do rm -f -- "$path"; done || true
-  done
-' _ "$self_log_dir" "${storage_scan_max_entries}" || logger -t superserve-host-logging -p warning "disposable retention cleanup exceeded bounded scan budget"
-exit 0
+  journal_max="$1"; self_log_dir="$2"; self_limit="$3"; syslog_limit="$4"; max_entries="$5"
+  journalctl --vacuum-size="$${journal_max}B" >/dev/null 2>&1 || true
+  logrotate -f /etc/logrotate.d/superserve-google-cloud-ops-agent >/dev/null 2>&1 || true
+  logrotate -f /etc/logrotate.d/superserve-host-syslog >/dev/null 2>&1 || true
+  reclaim() {
+    kind="$1"; root="$2"; limit="$3"; count=0; total=0; capped=0; scan_limit=$((max_entries + 1))
+    files=(); sizes=()
+    if [ "$kind" = syslog ]; then
+      scan_command=(find "$root" -xdev -maxdepth 1 -type f \( -name syslog -o -name "syslog.*" \) -print0)
+    else
+      scan_command=(find "$root" -xdev -type f -name "*.log*" -print0)
+    fi
+    while IFS= read -r -d "" path; do
+      if [ "$count" -ge "$scan_limit" ]; then break; fi
+      size=$(stat -c "%s" -- "$path" 2>/dev/null || printf "0")
+      files+=("$path"); sizes+=("$size"); total=$((total + size)); count=$((count + 1))
+    done < <("$${scan_command[@]}" 2>/dev/null)
+    [ "$count" -gt "$max_entries" ] && capped=1
+    for i in "$${!files[@]}"; do
+      [ "$total" -gt "$limit" ] || break
+      path="$${files[$i]}"; size="$${sizes[$i]}"
+      case "$path" in
+        *.log.*|/var/log/syslog.*) rm -f -- "$path" && total=$((total - size)) ;;
+      esac
+    done
+    for i in "$${!files[@]}"; do
+      [ "$total" -gt "$limit" ] || break
+      path="$${files[$i]}"
+      case "$path" in
+        *.log|/var/log/syslog) size="$${sizes[$i]}"; : >"$path" && total=$((total - size)) ;;
+      esac
+    done
+    [ "$capped" -eq 0 ] || logger -t superserve-host-logging -p warning "$${kind} cleanup reached its bounded entry cap"
+    [ "$total" -le "$limit" ] || logger -t superserve-host-logging -p warning "$${kind} disposable store remains above its bounded size after cleanup"
+  }
+  reclaim self_log "$self_log_dir" "$self_limit"
+  reclaim syslog /var/log "$syslog_limit"
+' _ "$journal_max_use_bytes" "$self_log_dir" "${agent_self_log_max_bytes}" "${syslog_max_bytes}" "${storage_scan_max_entries}"; then
+  logger -t superserve-host-logging -p warning "disposable retention cleanup exceeded bounded deadline"
+fi
+exit 100
